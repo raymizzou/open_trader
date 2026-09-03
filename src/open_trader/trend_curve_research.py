@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import csv
 import json
 import os
 import shutil
@@ -17,12 +18,33 @@ from tempfile import TemporaryDirectory
 from typing import Callable, Mapping, NamedTuple, Sequence
 from zoneinfo import ZoneInfo
 
+from .futu_symbols import from_trend_animals_symbol, to_futu_symbol
+
 
 MINI_PROGRAM_APP_ID = "wx64e4edbab5e14356"
 DEFAULT_MMKV_HELPER = Path("~/.local/bin/open-trader-mmkv-dump").expanduser()
+DEFAULT_MAPPINGS_ROOT = Path("data/trend_animals/cache/symbol_mappings")
 CURVE_ENDPOINT = "https://www.trendtrader.cn/mall4cloud_breed/breed/getVarietyCurve_V3"
 CURVE_WINDOW = 0
 CURVE_AES_KEY = "AFD3044276988A80"
+CURVE_ASSET_ID = 10002
+CURVE_GROUP_IDS = {
+    "A股": 303121,
+    "ETF基金": 377042,
+    "港股": 329480,
+    "香港ETF": 705189,
+    "美股": 332171,
+    "美国ETF": 704988,
+}
+CURVE_CURRENCY_IDS = {"CNY": 100, "USD": 101, "HKD": 104}
+PORTFOLIO_MARKETS = frozenset({"CN", "HK", "US"})
+PORTFOLIO_CURRENCIES = {"CN": "CNY", "HK": "HKD", "US": "USD"}
+CURVE_ASSETS_BY_MARKET = {
+    "CN": frozenset({"A股", "ETF基金"}),
+    "HK": frozenset({"港股", "香港ETF"}),
+    "US": frozenset({"美股", "美国ETF"}),
+}
+TREND_SYMBOL_MAPPING_SCHEMA = "open_trader.trend_symbol_mapping.v1"
 TEMPERATURES = frozenset({"冻", "寒", "凉", "平", "温", "热", "沸"})
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
@@ -151,8 +173,10 @@ def _credentials_from_dump(output: str) -> WechatMiniCredentials:
 
 
 def collect_trend_curves(
-    watchlist: Path | str,
+    watchlist: Path | str | None = None,
     *,
+    portfolio: Path | str | None = None,
+    mappings_root: Path | str | None = None,
     database: Path | str | None = None,
     credentials: WechatMiniCredentials | tuple[object, object] | None = None,
     transport: CurveTransport | None = None,
@@ -161,7 +185,16 @@ def collect_trend_curves(
     storage_root: Path | str | None = None,
 ) -> CollectionResult:
     target_database = Path(database or "data/trend_curve/history.sqlite3").expanduser()
-    targets = _load_watchlist(watchlist)
+    if (watchlist is None) == (portfolio is None):
+        raise ValueError("exactly one of watchlist or portfolio is required")
+    if portfolio is not None:
+        targets = _load_portfolio_targets(
+            portfolio,
+            Path(mappings_root or DEFAULT_MAPPINGS_ROOT).expanduser(),
+        )
+    else:
+        assert watchlist is not None
+        targets = _load_watchlist(watchlist)
     if credentials is None:
         credentials = read_wechat_mini_credentials(
             mmkv_path,
@@ -239,6 +272,181 @@ def collect_trend_curves(
     except (OSError, sqlite3.Error) as exc:
         raise ValueError("趋势曲线数据库写入失败") from exc
     return CollectionResult(target_database, len(targets), point_count)
+
+
+def _load_portfolio_targets(
+    portfolio: Path | str,
+    mappings_root: Path,
+) -> list[dict[str, object]]:
+    if not isinstance(portfolio, (str, Path)):
+        raise ValueError("portfolio must be a CSV path")
+    selected: dict[tuple[str, str], str] = {}
+    invalid_currency: set[str] = set()
+    try:
+        with Path(portfolio).expanduser().open(
+            encoding="utf-8-sig", newline=""
+        ) as handle:
+            for row in csv.DictReader(handle):
+                market = str(row.get("market") or "").strip().upper()
+                if market not in PORTFOLIO_MARKETS:
+                    continue
+                if str(row.get("ai_eligible") or "").strip().lower() != "true":
+                    continue
+                symbol = str(
+                    row.get("analysis_symbol") or row.get("symbol") or ""
+                ).strip().upper()
+                identity = f"{market}.{symbol or '<blank>'}"
+                if not symbol:
+                    invalid_currency.add(identity)
+                    continue
+                currency = str(row.get("currency") or "").strip().upper()
+                expected_currency = PORTFOLIO_CURRENCIES[market]
+                if currency and currency not in CURVE_CURRENCY_IDS:
+                    invalid_currency.add(identity)
+                    continue
+                if currency and currency != expected_currency:
+                    invalid_currency.add(identity)
+                    continue
+                selected.setdefault((market, symbol), expected_currency)
+    except (OSError, UnicodeError, csv.Error) as exc:
+        raise ValueError("portfolio is unreadable or malformed") from exc
+    if invalid_currency:
+        values = ", ".join(sorted(invalid_currency))
+        raise ValueError(f"portfolio currency or symbol unsupported: {values}")
+
+    mappings = _load_symbol_mappings(mappings_root)
+    targets: list[dict[str, object]] = []
+    unavailable: list[str] = []
+    unsupported_assets: list[str] = []
+    for (market, symbol), currency in sorted(selected.items()):
+        matches = _matching_symbol_mappings(mappings, market, symbol)
+        identity = f"{market}.{symbol}"
+        if len(matches) != 1:
+            unavailable.append(identity)
+            continue
+        mapping = matches[0]
+        asset = mapping["asset"]
+        if asset not in CURVE_GROUP_IDS or asset not in CURVE_ASSETS_BY_MARKET[market]:
+            unsupported_assets.append(identity)
+            continue
+        targets.append(
+            {
+                "market": market,
+                "symbol": symbol,
+                "asset_id": CURVE_ASSET_ID,
+                "group_id": CURVE_GROUP_IDS[asset],
+                "tm_id": mapping["trend_animals_tm_id"],
+                "ccy_id": CURVE_CURRENCY_IDS[currency],
+            }
+        )
+    if unavailable:
+        values = ", ".join(sorted(unavailable))
+        raise ValueError(f"portfolio mapping unavailable: {values}")
+    if unsupported_assets:
+        values = ", ".join(sorted(unsupported_assets))
+        raise ValueError(f"portfolio mapping asset unsupported: {values}")
+    if not targets:
+        raise ValueError("portfolio has no eligible CN/HK/US holdings")
+    return targets
+
+
+def _load_symbol_mappings(mappings_root: Path) -> list[dict[str, object]]:
+    mappings: list[dict[str, object]] = []
+    by_futu: dict[tuple[str, str], dict[str, object]] = {}
+    by_trend: dict[tuple[str, str], dict[str, object]] = {}
+    by_tm_id: dict[tuple[str, int], dict[str, object]] = {}
+    required = {
+        "asset",
+        "futu_symbol",
+        "market",
+        "schema_version",
+        "trend_animals_symbol",
+        "trend_animals_tm_id",
+    }
+    for market in sorted(PORTFOLIO_MARKETS):
+        for path in sorted((mappings_root / market).glob("*.json")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise ValueError("symbol mapping cache is unreadable or malformed") from exc
+            if not isinstance(payload, dict) or not required.issubset(payload):
+                raise ValueError("symbol mapping cache is malformed")
+            futu_symbol = payload.get("futu_symbol")
+            mapping_market = payload.get("market")
+            asset = payload.get("asset")
+            trend_symbol = payload.get("trend_animals_symbol")
+            tm_id = payload.get("trend_animals_tm_id")
+            try:
+                canonical_futu = to_futu_symbol(market, futu_symbol)
+                trend_futu = from_trend_animals_symbol(market, trend_symbol)
+            except (AttributeError, ValueError):
+                raise ValueError("symbol mapping cache is malformed") from None
+            same_security = (
+                canonical_futu.split(".", 1)[1] == trend_futu.split(".", 1)[1]
+                if market == "CN"
+                else canonical_futu == trend_futu
+            )
+            if (
+                payload.get("schema_version") != TREND_SYMBOL_MAPPING_SCHEMA
+                or mapping_market != market
+                or not isinstance(futu_symbol, str)
+                or not futu_symbol.strip()
+                or path.stem != futu_symbol
+                or not isinstance(trend_symbol, str)
+                or not trend_symbol.strip()
+                or not isinstance(asset, str)
+                or isinstance(tm_id, bool)
+                or not isinstance(tm_id, int)
+                or tm_id <= 0
+                or canonical_futu != futu_symbol
+                or not same_security
+            ):
+                raise ValueError("symbol mapping cache is malformed")
+            indexes = (
+                (by_futu, (market, futu_symbol)),
+                (by_trend, (market, trend_symbol)),
+                (by_tm_id, (market, tm_id)),
+            )
+            mapping_identity = (futu_symbol, trend_symbol, tm_id, asset)
+            for index, key in indexes:
+                previous = index.get(key)
+                if previous is not None and (
+                    previous["futu_symbol"],
+                    previous["trend_animals_symbol"],
+                    previous["trend_animals_tm_id"],
+                    previous["asset"],
+                ) != mapping_identity:
+                    raise ValueError("symbol mapping conflict")
+            for index, key in indexes:
+                index[key] = payload
+            mappings.append(payload)
+    return mappings
+
+
+def _matching_symbol_mappings(
+    mappings: Sequence[dict[str, object]], market: str, symbol: str
+) -> list[dict[str, object]]:
+    normalized = symbol.strip().upper()
+    if "." in normalized and normalized.split(".", 1)[0] in {
+        "CN",
+        "HK",
+        "US",
+        "SH",
+        "SZ",
+        "BJ",
+    }:
+        return [
+            mapping
+            for mapping in mappings
+            if mapping["market"] == market and mapping["futu_symbol"] == normalized
+        ]
+    return [
+        mapping
+        for mapping in mappings
+        if mapping["market"] == market
+        and isinstance(mapping["futu_symbol"], str)
+        and mapping["futu_symbol"].split(".", 1)[1] == normalized
+    ]
 
 
 def _load_watchlist(watchlist: Path | str) -> list[dict[str, object]]:
@@ -349,12 +557,13 @@ def _validated_curve_points(payload: object) -> list[dict[str, object]]:
     if not isinstance(payload, Mapping) or payload.get("code") != "00000":
         raise ValueError("curve response payload was unsuccessful")
     data = payload.get("data")
+    if not isinstance(data, list) or len(data) not in {4, 5}:
+        raise ValueError("Trend Animals curve payload is malformed")
     history = None
-    if isinstance(data, list) and len(data) == 5:
-        if isinstance(data[2], list):
-            history = data[2]
-        elif isinstance(data[2], Mapping):
-            history = data[2].get("touchDetail")
+    if isinstance(data[2], list):
+        history = data[2]
+    elif isinstance(data[2], Mapping):
+        history = data[2].get("touchDetail")
     if not isinstance(history, list) or not history:
         raise ValueError("curve response history is empty")
     points: list[dict[str, object]] = []

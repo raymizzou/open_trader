@@ -143,7 +143,7 @@ OPEN_TRADER_FUTU_PORT=11111
 
 ## 趋势动物曲线采集（手动）
 
-这是独立的手动采集命令，不接入 Dashboard、后台服务、调度、日报、Feishu、控制器或任何交易链路。
+这是独立的手动采集命令，不接入 Dashboard、后台服务、调度、日报、控制器或任何交易链路；只有显式使用 `--notify-failure` 时才向配置中的 Feishu 渠道发送失败通知。
 采集前需准备可执行的 MMKV 解码 helper，默认位置为
 `~/.local/bin/open-trader-mmkv-dump`，也可以用 `--mmkv-helper` 指定；程序只把微信小程序
 MMKV 快照的临时副本交给 helper，凭据仅在内存中使用。
@@ -169,6 +169,21 @@ watchlist 使用市场、标的和 Trend Animals 业务标识：
   --mmkv-path copied/wx64e4edbab5e14356 \
   --mmkv-helper ~/.local/bin/open-trader-mmkv-dump
 ```
+
+也可以直接从当前组合中采集全部 `ai_eligible=true` 的中/港/美持仓；必须在
+`--watchlist` 与 `--portfolio` 中二选一：
+
+```bash
+.venv/bin/python -m open_trader trend-curve collect \
+  --portfolio data/latest/portfolio.csv \
+  --mappings-root data/trend_animals/cache/symbol_mappings
+```
+
+`--mappings-root` 默认值为 `data/trend_animals/cache/symbol_mappings`，只使用其中按市场保存的
+本地 Trend Animals 符号映射。需要在采集失败时发飞书时，可追加
+`--notify-failure --config config/daily_premarket.env`；该选项只通知配置中的 `feishu`/
+`feishu_app` 渠道，并保留采集失败退出码。此命令仍是独立的手动 CLI，也可由外部调度器调用；
+本项目不因此创建或安装调度任务，也不接入 Dashboard、后台、日报或交易链路。
 
 `--mmkv-path` 可指向手动复制的 MMKV 文件；同目录必须同时保留同名的 `.crc` 兄弟文件。
 请求的 `selected=0` 固定选择实测验证的近一年按日历史窗口。

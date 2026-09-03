@@ -5,6 +5,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-03
 
+- 扩展手动 `trend-curve collect` 支持从 `portfolio.csv` 读取全部 `ai_eligible=true` 的 CN/HK/US
+  持仓并通过本地符号映射构建曲线请求，新增失败时 Feishu-only 通知选项；兼容四段曲线响应。
+  聚焦验证：`make test-trend-curve`。
+
 - 新增手动 `trend-curve collect`：使用 MMKV helper 读取临时凭据，将 Trend Animals 曲线以
   `(market, symbol, curve_date)` 单行键写入 SQLite，重复采集幂等、提供方修订只覆盖匹配日期；与 UI、后台、调度和交易链路隔离。聚焦验证：6 passed。
 

@@ -7,9 +7,18 @@ from pathlib import Path
 import pytest
 
 from open_trader import trend_curve_research
+from open_trader.futu_symbols import from_trend_animals_symbol, to_futu_symbol
 from open_trader.trend_curve_research import (
     collect_trend_curves,
     read_wechat_mini_credentials,
+)
+
+
+FOUR_SECTION_ENCRYPTED = (
+    "ehtRChN4vTYXmnU0XeI1jROyn46BO1bnfGp5zD3cGvgQuIY7Z/UlaEGb/heZWgb2OTBwAywGoxu/W9hc3m6wlEqU08aJongByGXl1KgrWW269RssHjerZRumWavSRvAVptahDUKx6yqrYkkDpjcCqg=="
+)
+THREE_SECTION_ENCRYPTED = (
+    "ehtRChN4vTYXmnU0XeI1jROyn46BO1bnfGp5zD3cGvgQuIY7Z/UlaEGb/heZWgb2OTBwAywGoxu/W9hc3m6wlEqU08aJongByGXl1KgrWW269RssHjerZRumWavSRvAV9Iz+b7bj5CCzRqIuXlT8og=="
 )
 
 
@@ -96,6 +105,331 @@ def test_collect_stores_curve_rows_for_future_database_use(
     captured = capsys.readouterr()
     assert "fake-token-123" not in captured.out
     assert "998877665544" not in captured.out
+
+
+def test_collect_stores_four_section_curve_history(tmp_path: Path) -> None:
+    watchlist = tmp_path / "watchlist.json"
+    watchlist.write_text(
+        json.dumps(
+            [
+                {
+                    "market": "US",
+                    "symbol": "ESTC",
+                    "asset_id": 10002,
+                    "group_id": 332171,
+                    "tm_id": 334101,
+                    "ccy_id": 101,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    database = tmp_path / "history.sqlite3"
+
+    def transport(
+        _url: str, _body: bytes, _headers: dict[str, str]
+    ) -> dict[str, object]:
+        return {
+            "success": True,
+            "code": "00000",
+            "data": {"encryptedData": FOUR_SECTION_ENCRYPTED},
+        }
+
+    result = collect_trend_curves(
+        watchlist,
+        database=database,
+        credentials=("fake-token", 123456789),
+        transport=transport,
+    )
+
+    with sqlite3.connect(database) as connection:
+        rows = connection.execute(
+            "SELECT market, symbol, curve_date, price, temperature, strength, "
+            "asset_id, group_id, tm_id, ccy_id FROM trend_curve_points"
+        ).fetchall()
+    assert (result.target_count, result.point_count, rows) == (
+        1,
+        1,
+        [("US", "ESTC", "2026-09-02", "0.22", "凉", "13.2", 10002, 332171, 334101, 101)],
+    )
+
+
+def test_collect_portfolio_uses_every_eligible_holding_and_local_mapping(
+    tmp_path: Path,
+) -> None:
+    portfolio = tmp_path / "portfolio.csv"
+    portfolio.write_text(
+        "market,asset_class,symbol,analysis_symbol,ai_eligible\n"
+        "US,stock,ESTC,ESTC,true\n"
+        "CN,etf,515450,,true\n"
+        "US,cash,CASH,,false\n"
+        "US,fund,MONEY,,false\n",
+        encoding="utf-8",
+    )
+    mappings_root = tmp_path / "symbol_mappings"
+    (mappings_root / "US").mkdir(parents=True)
+    (mappings_root / "CN").mkdir(parents=True)
+    (mappings_root / "US" / "US.ESTC.json").write_text(
+        json.dumps(
+            {
+                "asset": "美股",
+                "futu_symbol": "US.ESTC",
+                "market": "US",
+                "schema_version": "open_trader.trend_symbol_mapping.v1",
+                "trend_animals_symbol": "ESTC",
+                "trend_animals_tm_id": 334101,
+                "provenance": "local-cache",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (mappings_root / "CN" / "SH.515450.json").write_text(
+        json.dumps(
+            {
+                "asset": "ETF基金",
+                "futu_symbol": "SH.515450",
+                "market": "CN",
+                "schema_version": "open_trader.trend_symbol_mapping.v1",
+                "trend_animals_symbol": "515450.SH",
+                "trend_animals_tm_id": 328879,
+            }
+        ),
+        encoding="utf-8",
+    )
+    requests: list[dict[str, object]] = []
+
+    def transport(
+        _url: str, body: bytes, _headers: dict[str, str]
+    ) -> dict[str, object]:
+        requests.append(json.loads(body))
+        return {
+            "success": True,
+            "code": "00000",
+            "data": {"encryptedData": FOUR_SECTION_ENCRYPTED},
+        }
+
+    result = collect_trend_curves(
+        portfolio=portfolio,
+        mappings_root=mappings_root,
+        database=tmp_path / "history.sqlite3",
+        credentials=("fake-token", 123456789),
+        transport=transport,
+    )
+
+    assert (result.target_count, requests) == (
+        2,
+        [
+            {
+                "assetId": 10002,
+                "groupId": 377042,
+                "id": 328879,
+                "userId": 123456789,
+                "selected": 0,
+                "ccyId": 100,
+                "code": "123456789",
+            },
+            {
+                "assetId": 10002,
+                "groupId": 332171,
+                "id": 334101,
+                "userId": 123456789,
+                "selected": 0,
+                "ccyId": 101,
+                "code": "123456789",
+            },
+        ],
+    )
+
+
+def test_collect_portfolio_rejects_mismatched_mapping_before_network(
+    tmp_path: Path,
+) -> None:
+    portfolio = tmp_path / "portfolio.csv"
+    portfolio.write_text(
+        "market,asset_class,symbol,analysis_symbol,ai_eligible\n"
+        "US,stock,ESTC,ESTC,true\n",
+        encoding="utf-8",
+    )
+    mappings_root = tmp_path / "symbol_mappings"
+    mapping_directory = mappings_root / "US"
+    mapping_directory.mkdir(parents=True)
+    (mapping_directory / "US.ESTC.json").write_text(
+        json.dumps(
+            {
+                "asset": "美股",
+                "futu_symbol": "US.ESTC",
+                "market": "US",
+                "schema_version": "open_trader.trend_symbol_mapping.v1",
+                "trend_animals_symbol": "MSFT",
+                "trend_animals_tm_id": 334101,
+            }
+        ),
+        encoding="utf-8",
+    )
+    expected_futu = to_futu_symbol("US", "US.ESTC")
+    assert from_trend_animals_symbol("US", "MSFT") != expected_futu
+    requests: list[bytes] = []
+
+    def transport(
+        _url: str, body: bytes, _headers: dict[str, str]
+    ) -> dict[str, object]:
+        requests.append(body)
+        return {
+            "success": True,
+            "code": "00000",
+            "data": {"encryptedData": FOUR_SECTION_ENCRYPTED},
+        }
+
+    database = tmp_path / "history.sqlite3"
+    with pytest.raises(ValueError) as raised:
+        collect_trend_curves(
+            portfolio=portfolio,
+            mappings_root=mappings_root,
+            database=database,
+            credentials=("fake-token", 123456789),
+            transport=transport,
+        )
+
+    assert (str(raised.value), requests, database.exists()) == (
+        "symbol mapping cache is malformed",
+        [],
+        False,
+    )
+
+
+def test_collect_portfolio_rejects_conflicting_mapping_ids_before_network(
+    tmp_path: Path,
+) -> None:
+    portfolio = tmp_path / "portfolio.csv"
+    portfolio.write_text(
+        "market,asset_class,symbol,analysis_symbol,ai_eligible\n"
+        "US,stock,ESTC,ESTC,true\n",
+        encoding="utf-8",
+    )
+    mappings_root = tmp_path / "symbol_mappings"
+    mapping_directory = mappings_root / "US"
+    mapping_directory.mkdir(parents=True)
+    for futu_symbol, trend_symbol in (("US.ESTC", "ESTC"), ("US.MSFT", "MSFT")):
+        (mapping_directory / f"{futu_symbol}.json").write_text(
+            json.dumps(
+                {
+                    "asset": "美股",
+                    "futu_symbol": futu_symbol,
+                    "market": "US",
+                    "schema_version": "open_trader.trend_symbol_mapping.v1",
+                    "trend_animals_symbol": trend_symbol,
+                    "trend_animals_tm_id": 334101,
+                }
+            ),
+            encoding="utf-8",
+        )
+    requests: list[bytes] = []
+
+    def transport(
+        _url: str, body: bytes, _headers: dict[str, str]
+    ) -> dict[str, object]:
+        requests.append(body)
+        return {
+            "success": True,
+            "code": "00000",
+            "data": {"encryptedData": FOUR_SECTION_ENCRYPTED},
+        }
+
+    database = tmp_path / "history.sqlite3"
+    with pytest.raises(ValueError) as raised:
+        collect_trend_curves(
+            portfolio=portfolio,
+            mappings_root=mappings_root,
+            database=database,
+            credentials=("fake-token", 123456789),
+            transport=transport,
+        )
+
+    assert (str(raised.value), requests, database.exists()) == (
+        "symbol mapping conflict",
+        [],
+        False,
+    )
+
+
+def test_collect_rejects_unapproved_curve_section_count(tmp_path: Path) -> None:
+    watchlist = tmp_path / "watchlist.json"
+    watchlist.write_text(
+        json.dumps(
+            [
+                {
+                    "market": "US",
+                    "symbol": "ESTC",
+                    "asset_id": 10002,
+                    "group_id": 332171,
+                    "tm_id": 334101,
+                    "ccy_id": 101,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    database = tmp_path / "history.sqlite3"
+
+    def transport(
+        _url: str, _body: bytes, _headers: dict[str, str]
+    ) -> dict[str, object]:
+        return {
+            "success": True,
+            "code": "00000",
+            "data": {"encryptedData": THREE_SECTION_ENCRYPTED},
+        }
+
+    with pytest.raises(ValueError) as raised:
+        collect_trend_curves(
+            watchlist,
+            database=database,
+            credentials=("fake-token", 123456789),
+            transport=transport,
+        )
+
+    with sqlite3.connect(database) as connection:
+        point_count = connection.execute(
+            "SELECT COUNT(*) FROM trend_curve_points"
+        ).fetchone()[0]
+    assert (str(raised.value), point_count) == (
+        "Trend Animals curve payload is malformed",
+        0,
+    )
+
+
+def test_collect_portfolio_fails_closed_before_network_when_mapping_missing(
+    tmp_path: Path,
+) -> None:
+    portfolio = tmp_path / "portfolio.csv"
+    portfolio.write_text(
+        "market,asset_class,symbol,analysis_symbol,ai_eligible\n"
+        "US,stock,ESTC,ESTC,true\n",
+        encoding="utf-8",
+    )
+    database = tmp_path / "history.sqlite3"
+    calls: list[bytes] = []
+
+    def transport(
+        _url: str, body: bytes, _headers: dict[str, str]
+    ) -> dict[str, object]:
+        calls.append(body)
+        raise AssertionError("transport must not be called")
+
+    with pytest.raises(ValueError) as raised:
+        collect_trend_curves(
+            portfolio=portfolio,
+            mappings_root=tmp_path / "empty-mappings",
+            database=database,
+            credentials=("fake-token", 123456789),
+            transport=transport,
+        )
+
+    assert (str(raised.value), calls, database.exists()) == (
+        "portfolio mapping unavailable: US.ESTC",
+        [],
+        False,
+    )
 
 
 def test_collect_stores_current_direct_curve_history(tmp_path: Path) -> None:

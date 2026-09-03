@@ -524,12 +524,25 @@ def build_parser() -> argparse.ArgumentParser:
     trend_curve_collect_parser = trend_curve_commands.add_parser(
         "collect", help="Collect Trend Animals temperature curves"
     )
-    trend_curve_collect_parser.add_argument("--watchlist", type=Path, required=True)
+    trend_curve_target = trend_curve_collect_parser.add_mutually_exclusive_group(
+        required=True
+    )
+    trend_curve_target.add_argument("--watchlist", type=Path)
+    trend_curve_target.add_argument("--portfolio", type=Path)
     trend_curve_collect_parser.add_argument(
         "--database", type=Path, default=Path("data/trend_curve/history.sqlite3")
     )
+    trend_curve_collect_parser.add_argument(
+        "--mappings-root",
+        type=Path,
+        default=Path("data/trend_animals/cache/symbol_mappings"),
+    )
     trend_curve_collect_parser.add_argument("--mmkv-path", type=Path)
     trend_curve_collect_parser.add_argument("--mmkv-helper", type=Path)
+    trend_curve_collect_parser.add_argument("--notify-failure", action="store_true")
+    trend_curve_collect_parser.add_argument(
+        "--config", type=Path, default=Path("config/daily_premarket.env")
+    )
 
     test_notification_parser = subparsers.add_parser(
         "test-notification",
@@ -2256,11 +2269,43 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 result = collect_trend_curves(
                     watchlist=args.watchlist,
+                    portfolio=args.portfolio,
+                    mappings_root=args.mappings_root,
                     database=args.database,
                     mmkv_path=args.mmkv_path,
                     mmkv_helper=args.mmkv_helper,
                 )
             except (FileNotFoundError, OSError, ValueError, RuntimeError) as exc:
+                if args.notify_failure:
+                    try:
+                        config = load_env_config(args.config, dry_run=False)
+                        channels = {"feishu", "feishu_app"}
+                        filtered_config = replace(
+                            config,
+                            notifiers=tuple(
+                                name
+                                for name in config.notifiers
+                                if name in channels
+                            ),
+                        )
+                        attempts = send_notification_with_results(
+                            build_notifier(filtered_config),
+                            "趋势曲线采集失败",
+                            f"trend-curve collect 失败：{exc}",
+                            channels=channels,
+                        )
+                        for attempt in attempts:
+                            if not attempt.success:
+                                print(
+                                    f"趋势曲线失败通知失败：{attempt.channel} "
+                                    f"{attempt.error_type}: {attempt.error}",
+                                    file=sys.stderr,
+                                )
+                    except Exception as notify_exc:
+                        print(
+                            f"趋势曲线失败通知失败：{notify_exc}",
+                            file=sys.stderr,
+                        )
                 parser.error(str(exc))
             print(f"database: {result.database_path}")
             print(f"targets: {result.target_count}")
