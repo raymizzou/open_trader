@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 MINI_PROGRAM_APP_ID = "wx64e4edbab5e14356"
 DEFAULT_MMKV_HELPER = Path("~/.local/bin/open-trader-mmkv-dump").expanduser()
 CURVE_ENDPOINT = "https://www.trendtrader.cn/mall4cloud_breed/breed/getVarietyCurve_V3"
-CURVE_WINDOW = 5
+CURVE_WINDOW = 0
 CURVE_AES_KEY = "AFD3044276988A80"
 TEMPERATURES = frozenset({"冻", "寒", "凉", "平", "温", "热", "沸"})
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -123,6 +123,12 @@ def _credentials_from_dump(output: str) -> WechatMiniCredentials:
         payload: object = json.loads(vuex_values[0])
         if isinstance(payload, str):
             payload = json.loads(payload)
+        if (
+            isinstance(payload, dict)
+            and set(payload) == {"data", "dataType"}
+            and payload.get("dataType") == "String"
+        ):
+            payload = json.loads(payload["data"])
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError("MMKV vuex record is malformed") from exc
     if not isinstance(payload, dict):
@@ -343,7 +349,12 @@ def _validated_curve_points(payload: object) -> list[dict[str, object]]:
     if not isinstance(payload, Mapping) or payload.get("code") != "00000":
         raise ValueError("curve response payload was unsuccessful")
     data = payload.get("data")
-    history = data[2].get("touchDetail") if isinstance(data, list) and len(data) == 5 and isinstance(data[2], Mapping) else None
+    history = None
+    if isinstance(data, list) and len(data) == 5:
+        if isinstance(data[2], list):
+            history = data[2]
+        elif isinstance(data[2], Mapping):
+            history = data[2].get("touchDetail")
     if not isinstance(history, list) or not history:
         raise ValueError("curve response history is empty")
     points: list[dict[str, object]] = []

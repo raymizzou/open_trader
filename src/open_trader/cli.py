@@ -528,6 +528,7 @@ def build_parser() -> argparse.ArgumentParser:
     trend_curve_collect_parser.add_argument(
         "--database", type=Path, default=Path("data/trend_curve/history.sqlite3")
     )
+    trend_curve_collect_parser.add_argument("--mmkv-path", type=Path)
     trend_curve_collect_parser.add_argument("--mmkv-helper", type=Path)
 
     test_notification_parser = subparsers.add_parser(
@@ -2256,6 +2257,7 @@ def main(argv: list[str] | None = None) -> int:
                 result = collect_trend_curves(
                     watchlist=args.watchlist,
                     database=args.database,
+                    mmkv_path=args.mmkv_path,
                     mmkv_helper=args.mmkv_helper,
                 )
             except (FileNotFoundError, OSError, ValueError, RuntimeError) as exc:

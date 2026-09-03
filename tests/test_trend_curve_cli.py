@@ -35,3 +35,25 @@ def test_trend_curve_cli_exposes_collect_only() -> None:
             ]
         )
     assert exc_info.value.code == 2
+
+
+def test_trend_curve_cli_accepts_explicit_mmkv_snapshot() -> None:
+    parser = build_parser()
+    explicit_args = parser.parse_args(
+        [
+            "trend-curve",
+            "collect",
+            "--watchlist",
+            "watchlist.json",
+            "--mmkv-path",
+            "copied/wx64e4edbab5e14356",
+        ]
+    )
+    default_args = parser.parse_args(
+        ["trend-curve", "collect", "--watchlist", "watchlist.json"]
+    )
+
+    assert (explicit_args.mmkv_path, default_args.mmkv_path) == (
+        Path("copied/wx64e4edbab5e14356"),
+        None,
+    )

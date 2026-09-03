@@ -1,4 +1,4 @@
-.PHONY: acceptance candidate-acceptance test test-pressure host-readiness browser-test production-smoke prediction-solver-envs prediction-solver-quick prediction-solver-full-macos prediction-solver-full-linux prediction-solver-report prediction-solver-verify-report
+.PHONY: acceptance candidate-acceptance test test-trend-curve test-pressure host-readiness browser-test production-smoke prediction-solver-envs prediction-solver-quick prediction-solver-full-macos prediction-solver-full-linux prediction-solver-report prediction-solver-verify-report
 
 WORKTREE_ROOT := $(CURDIR)
 REPOSITORY_ROOT := $(shell git rev-parse --path-format=absolute --git-common-dir)/..
@@ -28,6 +28,9 @@ PRE_DEPLOY_SUBMISSION_BASELINE ?=
 test:
 	$(DOCKER_BUILD)
 	$(DOCKER_RUN) $(BACKEND_PYTEST) $(TEST)
+
+test-trend-curve:
+	$(MAKE) test TEST='tests/test_trend_curve_research.py tests/test_trend_curve_cli.py'
 
 candidate-acceptance:
 	@status=0; \

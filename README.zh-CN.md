@@ -166,9 +166,12 @@ watchlist 使用市场、标的和 Trend Animals 业务标识：
 .venv/bin/python -m open_trader trend-curve collect \
   --watchlist data/trend_curve/watchlist.json \
   --database data/trend_curve/history.sqlite3 \
+  --mmkv-path copied/wx64e4edbab5e14356 \
   --mmkv-helper ~/.local/bin/open-trader-mmkv-dump
 ```
 
+`--mmkv-path` 可指向手动复制的 MMKV 文件；同目录必须同时保留同名的 `.crc` 兄弟文件。
+请求的 `selected=0` 固定选择实测验证的近一年按日历史窗口。
 默认 SQLite 路径为 `data/trend_curve/history.sqlite3`。每个
 `(market, symbol, curve_date)` 只有一行；相同采集不会重复，提供方修订只覆盖匹配日期的当前值。
 

@@ -70,7 +70,7 @@ def test_collect_stores_curve_rows_for_future_database_use(
                 "groupId": 332171,
                 "id": 337127,
                 "userId": 998877665544,
-                "selected": 5,
+                "selected": 0,
                 "ccyId": 101,
                 "code": "998877665544",
             },
@@ -96,6 +96,51 @@ def test_collect_stores_curve_rows_for_future_database_use(
     captured = capsys.readouterr()
     assert "fake-token-123" not in captured.out
     assert "998877665544" not in captured.out
+
+
+def test_collect_stores_current_direct_curve_history(tmp_path: Path) -> None:
+    encrypted = (
+        "ehtRChN4vTYXmnU0XeI1jaN2N5o2ThNiIfS+zXGJzox7bRvAZYuv9MUA387xXPpIjQhnGOmqz3UhuXUsXaQcGGh4WhOZ41GlxnOMl75iigfXh5PagA1P1WsFVK6u40mtBXgXDTsY3WweVDJUwEIYLEI2Cc9IY5A0/qGhtK9W2Oe7syGf5m0TDbnSOMiiLX9QbDrkgfWb//Fthrz4Yhp8f2HQLuLubZlG/Nov6V4MjXcNwcWzRtBl3SjX1ClgR8Cr"
+    )
+    watchlist = tmp_path / "watchlist.json"
+    watchlist.write_text(
+        json.dumps(
+            [
+                {
+                    "market": "US",
+                    "symbol": "SLB",
+                    "asset_id": 10002,
+                    "group_id": 332171,
+                    "tm_id": 337127,
+                    "ccy_id": 101,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    database = tmp_path / "history.sqlite3"
+
+    def transport(
+        _url: str, _body: bytes, _headers: dict[str, str]
+    ) -> dict[str, object]:
+        return {"success": True, "code": "00000", "data": {"encryptedData": encrypted}}
+
+    result = collect_trend_curves(
+        watchlist,
+        database=database,
+        credentials=("fake-token", 123456789),
+        transport=transport,
+    )
+
+    assert result.point_count == 2
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT curve_date, price, temperature, strength FROM trend_curve_points "
+            "ORDER BY curve_date"
+        ).fetchall() == [
+            ("2026-09-01", "53.21", "平", "71.1"),
+            ("2026-09-02", "54.32", "温", "82.2"),
+        ]
 
 
 def test_collecting_same_curve_twice_is_idempotent(tmp_path: Path) -> None:
@@ -312,3 +357,29 @@ def test_wechat_auth_reader_uses_temporary_snapshot_and_returns_credentials_only
     assert "fake-token-123" not in captured.out
     assert "456789" not in captured.out
     assert "fake-token-123" not in seen.read_text(encoding="utf-8")
+
+
+def test_wechat_auth_reader_accepts_current_wrapped_vuex_record(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    mmkv = tmp_path / "wx64e4edbab5e14356"
+    Path(f"{mmkv}.crc").write_bytes(b"crc-bytes")
+    mmkv.write_bytes(b"encrypted-mmkv-bytes")
+    helper = tmp_path / "open-trader-mmkv-dump"
+    helper.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        "print('vuex\\t' + json.dumps({'data': json.dumps({'user': {'token': 'wrapped-token-456', 'info': {'id': 789012}}}), 'dataType': 'String'}))\n",
+        encoding="utf-8",
+    )
+    helper.chmod(helper.stat().st_mode | 0o111)
+
+    credentials = read_wechat_mini_credentials(mmkv, helper_path=helper)
+
+    assert credentials.token == "wrapped-token-456"
+    assert credentials.user_id == 789012
+    captured = capsys.readouterr()
+    assert "wrapped-token-456" not in captured.out
+    assert "789012" not in captured.out
+    assert "wrapped-token-456" not in captured.err
+    assert "789012" not in captured.err

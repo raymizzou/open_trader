@@ -33,6 +33,12 @@ Production Smoke prerequisite; normal development and Candidate Acceptance have
 zero browser cost. Do not add dependencies or weaken existing skips/xfails. Pure
 docs/config changes do not run `make test`.
 
+Changes confined to the standalone trend-curve collector/CLI/storage and their dedicated
+tests use `make test-trend-curve`; they do not require full `make test`, Candidate
+Acceptance, Host Readiness, or Production Smoke. If shared modules/dependencies,
+Dashboard/backend runtime, reports, trading behavior, or wider production paths are
+touched, the normal gates still apply.
+
 The four gates are separate: Docker dev; `make candidate-acceptance` ending
 `Candidate Acceptance: PASS`/`FAIL` (backend-only, with `pressure` and `browser`
 tests excluded and only `LIVE-*` scenarios excluded from the portable prediction
