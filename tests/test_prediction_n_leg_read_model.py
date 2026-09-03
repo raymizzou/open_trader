@@ -920,6 +920,56 @@ def test_projection_fee_veto_precedes_the_scope_block() -> None:
     assert item["execution"]["reason"] == FEE_UNKNOWN
 
 
+def test_projection_fee_block_is_passed_through_to_market_fields() -> None:
+    # #119: the resolver's frozen fee block rides the projection's market
+    # fields verbatim so the dashboard opportunity card can render the fee
+    # pill; nothing about the qualification gate changes.
+    market = _market()
+    fee = {
+        "status": "fee_charging",
+        "charging_contracts": ["cond-a"],
+        "unknown_contracts": [],
+        "modeled": True,
+        "taker_fee_rate_bps": 500,
+        "taker_fee_units": 240000,
+    }
+    item = project_n_leg_solution(
+        market=market,
+        execution=_execution(market),
+        scope=_manual_canary_scope(),
+        max_total_unsettled_capital_units=1000,
+        fee=fee,
+    )
+
+    assert item is not None
+    assert item["market"]["fee"] == {
+        "status": "fee_charging",
+        "charging_contracts": ["cond-a"],
+        "unknown_contracts": [],
+        "modeled": True,
+        "taker_fee_rate_bps": 500,
+        "taker_fee_units": 240000,
+    }
+
+
+def test_projection_missing_fee_block_projects_none_and_stays_fee_unknown() -> None:
+    # #119: an absent fee block projects as None (never fabricated) while the
+    # defensive fee_unknown qualification behavior is unchanged.
+    market = _market()
+    item = project_n_leg_solution(
+        market=market,
+        execution=_execution(market),
+        scope=_manual_canary_scope(),
+        max_total_unsettled_capital_units=1000,
+        fee=None,
+    )
+
+    assert item is not None
+    assert item["market"]["fee"] is None
+    checks = {row["key"]: row for row in item["qualification"]["checks"]}
+    assert checks["fee_status"]["value"] == "fee_unknown"
+
+
 def test_projection_unknown_proof_requires_proof() -> None:
     market = _market()
     item = project_n_leg_solution(

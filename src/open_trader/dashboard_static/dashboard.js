@@ -2589,6 +2589,15 @@ function predictionUnifiedOpportunityCard(row, mode, legacyRetired) {
   const episodePill = episodeId
     ? `<span class="pm-pill episode${episodeOngoing ? " live" : ""}">${episodeOngoing ? '<span class="dot"></span>' : ""}${escapeHtml(episodeLabel)}</span>`
     : "";
+  // #119: fee pill rides the tag row (same zero-shape pattern as the
+  // episode pill) — charging+modeled shows rate+total, free shows 免费,
+  // missing/unknown shows nothing.
+  const feeBlock = nLegSolution?.market?.fee && typeof nLegSolution.market.fee === "object" ? nLegSolution.market.fee : null;
+  const feePill = feeBlock && feeBlock.status === "fee_charging" && feeBlock.modeled === true
+    ? `<span class="pm-pill">taker 费 ${escapeHtml(predictionNLegUnitsMoney(feeBlock.taker_fee_units))} · 费率 ${Number(feeBlock.taker_fee_rate_bps) / 100}%</span>`
+    : feeBlock && feeBlock.status === "fee_free"
+    ? `<span class="pm-pill">免费市场</span>`
+    : "";
   const plainTagLabels = [
     opportunity.relation_type,
     opportunity.discovery_source,
@@ -2599,6 +2608,7 @@ function predictionUnifiedOpportunityCard(row, mode, legacyRetired) {
   // no extra line in the title block, layout stays the #105 shape.
   const tags = [
     episodePill,
+    feePill,
     ...plainTagLabels.map((tag, index) => `<span class="pm-pill${index === 0 ? " blue" : ""}">${escapeHtml(String(tag))}</span>`),
   ].filter(Boolean).join("");
   const metrics = [
@@ -2763,8 +2773,7 @@ function predictionReadinessStrip(payload, strategy = "yes_no") {
       const detail = venue.reason
         ? `<small>原因：${escapeHtml(predictionFailureReasonLabel({failure_reason: venue.reason}))}</small>`
         : venue.last_success ? `<small>最近成功 ${escapeHtml(predictionValue(venue.last_success))}</small>` : "";
-      // Issue #120: the Polymarket venue card carries the subscription-share
-      // counts (#114 monitor diagnostics) so the watch list is eyeballable.
+      // #120: the Polymarket card carries the subscription-share counts.
       const subscription = !isPredict && payload?.monitor_subscription && typeof payload.monitor_subscription === "object" ? payload.monitor_subscription : null;
       const subLine = subscription
         ? `<small>盘口订阅 ${escapeHtml(predictionNumber(subscription.cross_venue_token_count, "0"))} · 套利监测 ${escapeHtml(predictionNumber(subscription.n_leg_cross_venue_token_count, "0"))}</small>`

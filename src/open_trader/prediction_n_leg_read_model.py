@@ -525,6 +525,8 @@ def project_n_leg_solution(
         "verification_fingerprint": market.get("verification_fingerprint"),
         "global_search_closed": market.get("global_search_closed"),
         "legs": market_legs,
+        # #119: pass the frozen fee block through for the card fee line.
+        "fee": dict(fee) if isinstance(fee, Mapping) else None,
     }
     qualification = _qualification_projection(
         market,
