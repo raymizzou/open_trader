@@ -1775,6 +1775,21 @@ def prediction_state_payload(
     snapshot = _prediction_monitor_snapshot(monitor)
     cross_venue = _prediction_cross_snapshot(cross_venue_monitor)
     safe_snapshot = _prediction_safe_value(snapshot)
+    # #120: surface the subscription-share counts (#114 diagnostics).
+    monitor_diagnostics = safe_snapshot.get("diagnostics")
+    monitor_subscription = None
+    if isinstance(monitor_diagnostics, Mapping):
+        try:
+            monitor_subscription = {
+                "cross_venue_token_count": int(
+                    monitor_diagnostics["cross_venue_token_count"]
+                ),
+                "n_leg_cross_venue_token_count": int(
+                    monitor_diagnostics["n_leg_cross_venue_token_count"]
+                ),
+            }
+        except (KeyError, TypeError, ValueError):
+            monitor_subscription = None
     if not isinstance(safe_snapshot, Mapping):
         safe_snapshot = {}
     readiness = safe_snapshot.get("readiness")
@@ -2169,6 +2184,8 @@ def prediction_state_payload(
         },
         "csrf_token": csrf_token,
     }
+    if monitor_subscription is not None:
+        result["monitor_subscription"] = monitor_subscription
     if n_leg_projections:
         result["n_leg_solutions"] = n_leg_projections
     if isinstance(n_leg_metrics, Mapping):

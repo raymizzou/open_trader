@@ -2763,7 +2763,13 @@ function predictionReadinessStrip(payload, strategy = "yes_no") {
       const detail = venue.reason
         ? `<small>原因：${escapeHtml(predictionFailureReasonLabel({failure_reason: venue.reason}))}</small>`
         : venue.last_success ? `<small>最近成功 ${escapeHtml(predictionValue(venue.last_success))}</small>` : "";
-      return `<article class="pm-readiness-item pm-venue-card"><div class="pm-venue-card-title"><strong>${venueName}</strong><span class="pm-pill ${predictionTone(venue.mode)}">${escapeHtml(predictionValue(venue.mode, "只读"))}</span></div><div class="pm-venue-states"><span>REST：${escapeHtml(healthLabel(rest))}</span><span>WebSocket：${escapeHtml(healthLabel(ws))}</span></div><small>钱包 ${escapeHtml(wallet)}</small><small>可用余额 ${escapeHtml(amount)} ${escapeHtml(asset)}${balanceReason}</small>${allowanceLine}${isPredict && balanceReason ? "" : detail}</article>`;
+      // Issue #120: the Polymarket venue card carries the subscription-share
+      // counts (#114 monitor diagnostics) so the watch list is eyeballable.
+      const subscription = !isPredict && payload?.monitor_subscription && typeof payload.monitor_subscription === "object" ? payload.monitor_subscription : null;
+      const subLine = subscription
+        ? `<small>盘口订阅 ${escapeHtml(predictionNumber(subscription.cross_venue_token_count, "0"))} · 套利监测 ${escapeHtml(predictionNumber(subscription.n_leg_cross_venue_token_count, "0"))}</small>`
+        : "";
+      return `<article class="pm-readiness-item pm-venue-card"><div class="pm-venue-card-title"><strong>${venueName}</strong><span class="pm-pill ${predictionTone(venue.mode)}">${escapeHtml(predictionValue(venue.mode, "只读"))}</span></div><div class="pm-venue-states"><span>REST：${escapeHtml(healthLabel(rest))}</span><span>WebSocket：${escapeHtml(healthLabel(ws))}</span></div>${subLine}<small>钱包 ${escapeHtml(wallet)}</small><small>可用余额 ${escapeHtml(amount)} ${escapeHtml(asset)}${balanceReason}</small>${allowanceLine}${isPredict && balanceReason ? "" : detail}</article>`;
     });
     const signer = payload?.privy_signer || payload?.signer;
     if (signer && typeof signer === "object") {

@@ -465,6 +465,36 @@ def test_state_payload_exposes_monitor_thread_snapshot_additively() -> None:
     assert plain["thread"] == {}
 
 
+def test_state_payload_exposes_monitor_subscription_counts_additively() -> None:
+    class _SubscribedMonitor(_Monitor):
+        def snapshot(self) -> dict[str, object]:
+            payload = dict(super().snapshot())
+            payload["diagnostics"] = {
+                "cross_venue_token_count": 37,
+                "n_leg_cross_venue_token_count": 12,
+            }
+            return payload
+
+    subscribed = prediction_state_payload(
+        store=_Store(),
+        monitor=_SubscribedMonitor(),
+        execution=_Execution(),
+        csrf_token="fixed-csrf",
+    )
+    assert subscribed["monitor_subscription"] == {
+        "cross_venue_token_count": 37,
+        "n_leg_cross_venue_token_count": 12,
+    }
+
+    plain = prediction_state_payload(
+        store=_Store(),
+        monitor=_Monitor(),
+        execution=_Execution(),
+        csrf_token="fixed-csrf",
+    )
+    assert "monitor_subscription" not in plain
+
+
 def _nleg_cross_row(**overrides: object) -> dict[str, object]:
     row: dict[str, object] = {
         "opportunity_id": "cross-verified-1",
