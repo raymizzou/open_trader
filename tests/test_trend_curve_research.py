@@ -241,6 +241,74 @@ def test_collect_portfolio_uses_every_eligible_holding_and_local_mapping(
     )
 
 
+def test_collect_portfolio_excludes_blacklisted_holding_before_mapping(
+    tmp_path: Path,
+) -> None:
+    portfolio = tmp_path / "portfolio.csv"
+    portfolio.write_text(
+        "market,asset_class,symbol,analysis_symbol,ai_eligible\n"
+        "US,stock,ESTC,ESTC,true\n"
+        "US,stock,AGRZ,AGRZ,true\n",
+        encoding="utf-8",
+    )
+    mappings_root = tmp_path / "symbol_mappings"
+    mapping_directory = mappings_root / "US"
+    mapping_directory.mkdir(parents=True)
+    (mapping_directory / "US.ESTC.json").write_text(
+        json.dumps(
+            {
+                "asset": "美股",
+                "futu_symbol": "US.ESTC",
+                "market": "US",
+                "schema_version": "open_trader.trend_symbol_mapping.v1",
+                "trend_animals_symbol": "ESTC",
+                "trend_animals_tm_id": 334101,
+            }
+        ),
+        encoding="utf-8",
+    )
+    requests: list[dict[str, object]] = []
+
+    def transport(
+        _url: str, body: bytes, _headers: dict[str, str]
+    ) -> dict[str, object]:
+        requests.append(json.loads(body))
+        return {
+            "success": True,
+            "code": "00000",
+            "data": {"encryptedData": FOUR_SECTION_ENCRYPTED},
+        }
+
+    database = tmp_path / "history.sqlite3"
+    result = collect_trend_curves(
+        portfolio=portfolio,
+        mappings_root=mappings_root,
+        database=database,
+        credentials=("fake-token", 123456789),
+        transport=transport,
+    )
+
+    with sqlite3.connect(database) as connection:
+        rows = connection.execute(
+            "SELECT market, symbol, curve_date FROM trend_curve_points"
+        ).fetchall()
+    assert (result.target_count, requests, rows) == (
+        1,
+        [
+            {
+                "assetId": 10002,
+                "groupId": 332171,
+                "id": 334101,
+                "userId": 123456789,
+                "selected": 0,
+                "ccyId": 101,
+                "code": "123456789",
+            }
+        ],
+        [("US", "ESTC", "2026-09-02")],
+    )
+
+
 def test_collect_portfolio_rejects_mismatched_mapping_before_network(
     tmp_path: Path,
 ) -> None:

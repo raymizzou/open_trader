@@ -39,6 +39,7 @@ CURVE_GROUP_IDS = {
 CURVE_CURRENCY_IDS = {"CNY": 100, "USD": 101, "HKD": 104}
 PORTFOLIO_MARKETS = frozenset({"CN", "HK", "US"})
 PORTFOLIO_CURRENCIES = {"CN": "CNY", "HK": "HKD", "US": "USD"}
+PORTFOLIO_TREND_CURVE_EXCLUSIONS = frozenset({("US", "AGRZ")})
 CURVE_ASSETS_BY_MARKET = {
     "CN": frozenset({"A股", "ETF基金"}),
     "HK": frozenset({"港股", "香港ETF"}),
@@ -298,6 +299,8 @@ def _load_portfolio_targets(
                 identity = f"{market}.{symbol or '<blank>'}"
                 if not symbol:
                     invalid_currency.add(identity)
+                    continue
+                if (market, symbol) in PORTFOLIO_TREND_CURVE_EXCLUSIONS:
                     continue
                 currency = str(row.get("currency") or "").strip().upper()
                 expected_currency = PORTFOLIO_CURRENCIES[market]
