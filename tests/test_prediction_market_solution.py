@@ -306,6 +306,114 @@ def test_cost_slices_from_book_asks_bids_and_depth_truncation(book_cls) -> None:
     assert pms.cost_slices_from_book(yes, book_cls()) == ()
 
 
+# --------------------------------------------------------------------------
+# Issue #117 (Seam A): charging-market taker fees enter the per-lot cost
+# slice. Per-share fee = rate x p x (1-p) with p the bounded fill price
+# (peaks at 50 cents); every number below is hand-computed with
+# price_units_per_quote_unit = 1,000,000 and exactly 1 share per lot, so all
+# values are exact integers with no carry drift.
+# --------------------------------------------------------------------------
+
+
+def fee_book(asks=(), bids=(), taker_fee_bps=None):
+    return LegBook(
+        bids=tuple(bids),
+        asks=tuple(asks),
+        taker_fee_bps=taker_fee_bps,
+        available=True,
+    )
+
+
+def test_cost_slices_price_in_the_charging_taker_fee_per_level() -> None:
+    """A1 (#117): BUY leg over asks [(0.48, 100)] with taker_fee_bps=400.
+
+    Independent hand math (PU=1,000,000, 1 share/lot): protected =
+    ceil(0.48 x 1e6) = 480,000 <= 500,000, so the per-share fee is
+    0.04 x 480,000 x 520,000 / 1e6 = 9,984 units = $0.009984; at exactly
+    1 share per lot the per-lot fee is 9,984 with no carry drift, so the
+    per-lot incremental cost = price term 480,000 + fee 9,984 = 489,984.
+    """
+    yes = action(
+        "a-yes", "a", ActionSide.BUY_YES, (ExecutableCostSlice(1, 1, 489_984),)
+    )
+    slices = pms.cost_slices_from_book(
+        yes,
+        fee_book(asks=(book_level("0.48", "100"),), taker_fee_bps=Decimal("400")),
+        price_units_per_quote_unit=1_000_000,
+    )
+    assert slices == (ExecutableCostSlice(1, 1, 489_984),)
+
+
+def test_cost_slices_zero_fee_and_missing_fee_are_byte_identical(book_cls) -> None:
+    """A2 (#117/D7): taker_fee_bps=0 and taker_fee_bps=None (and a book
+    without the attribute at all) produce exactly equal slices -- the
+    fee-free output stays byte-identical to the pre-#117 baseline."""
+    yes = action(
+        "a-yes", "a", ActionSide.BUY_YES, (ExecutableCostSlice(1, 1, 480_000),)
+    )
+    zero = pms.cost_slices_from_book(
+        yes,
+        fee_book(asks=(book_level("0.48", "100"),), taker_fee_bps=Decimal("0")),
+        price_units_per_quote_unit=1_000_000,
+    )
+    missing_attr = pms.cost_slices_from_book(
+        yes,
+        book_cls(asks=(book_level("0.48", "100"),)),
+        price_units_per_quote_unit=1_000_000,
+    )
+    none_fee = pms.cost_slices_from_book(
+        yes,
+        fee_book(asks=(book_level("0.48", "100"),), taker_fee_bps=None),
+        price_units_per_quote_unit=1_000_000,
+    )
+    baseline = (ExecutableCostSlice(1, 1, 480_000),)
+    assert zero == baseline
+    assert zero == missing_attr
+    assert zero == none_fee
+
+
+def test_cost_slices_taker_fee_follows_the_parabola_with_a_fifty_cent_peak() -> None:
+    """A3 (#117): the r x p x (1-p) shape at 400 bps, hand-computed:
+    0.10 -> 0.04 x 100,000 x 900,000 / 1e6 = 3,600 units
+    0.90 -> 0.04 x 900,000 x 100,000 / 1e6 = 3,600 units (mirror)
+    0.50 -> 0.04 x 500,000 x 500,000 / 1e6 = 10,000 units (the peak)
+    Each level's unit cost is its price term plus its fee."""
+    yes = action(
+        "a-yes", "a", ActionSide.BUY_YES, (ExecutableCostSlice(1, 3, 910_000),)
+    )
+    slices = pms.cost_slices_from_book(
+        yes,
+        fee_book(
+            asks=(
+                book_level("0.10", "1"),
+                book_level("0.50", "1"),
+                book_level("0.90", "1"),
+            ),
+            taker_fee_bps=Decimal("400"),
+        ),
+        price_units_per_quote_unit=1_000_000,
+    )
+    assert [s.incremental_cost_upper_bound_units for s in slices] == [
+        103_600,  # 100,000 price + 3,600 fee
+        510_000,  # 500,000 price + 10,000 fee (50c peak)
+        903_600,  # 900,000 price + 3,600 fee (mirror of 0.10)
+    ]
+
+
+def test_cost_slices_no_leg_bids_also_price_in_the_taker_fee() -> None:
+    """A4 (#117): BUY_NO legs walk the bids; the 400 bps fee enters each
+    level's cost the same way (hand math as A1: 480,000 + 9,984)."""
+    no = action(
+        "a-no", "a", ActionSide.BUY_NO, (ExecutableCostSlice(1, 1, 489_984),)
+    )
+    slices = pms.cost_slices_from_book(
+        no,
+        fee_book(bids=(book_level("0.48", "100"),), taker_fee_bps=Decimal("400")),
+        price_units_per_quote_unit=1_000_000,
+    )
+    assert slices == (ExecutableCostSlice(1, 1, 489_984),)
+
+
 def test_structure_fingerprint_ignores_prices_but_binds_structure() -> None:
     base = qualified_problem(yes_cost=60, no_cost=30)
     repriced = qualified_problem(yes_cost=55, no_cost=25)

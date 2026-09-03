@@ -19,14 +19,17 @@ Expected values are hand-computed from the locked defaults in
 min net margin 0.01, min annualized return 0.15, max capital release 30 days)
 and the exact cross-multiplication gates in
 ``prediction_n_leg_read_model._qualification_projection``. 1 USD =
-1,000,000 micro-units. Fee/tick stay hardwired 0 in the live chain (ponytail
-in ``prediction_live_resolver._snapshot_for``); fee rate 0 is a KNOWN value, so
-it never blocks qualification — the fee-unknown fail-closed case below covers
-the cost-missing half of that pairing.
+1,000,000 micro-units. Since #117 the live chain models the catalog fee
+facts into the leg books and cost slices: the fixtures below state
+``fees_enabled=False`` (proven fee-free, 0 bps) unless a case says
+otherwise, a charging market is priced into the slices and decided on
+post-fee numbers, and a market whose rate is missing/unparseable/conflicting
+is unmodelable and its whole component is skipped before it can present.
 """
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from concurrent.futures import Future
 from decimal import Decimal
@@ -484,13 +487,16 @@ def test_b4_capital_release_exactly_thirty_days_passes_and_thirty_one_fails(
 
 
 def test_a4_missing_bounded_cost_qualification_is_unknown(tmp_path: Path) -> None:
-    """Fee/cost unknown fails closed: the live chain hardwires the taker fee
-    at a KNOWN 0 (``prediction_live_resolver._snapshot_for`` builds every leg
-    book with ``taker_fee_bps=Decimal("0")`` and ``build_solve_request`` keeps
-    fee_ppm=0), so a fee number always exists there and the fail-closed half
-    of the fee pair is a missing worst-case cost: with ``bounded_cost_units``
-    absent the projection cannot know the worst-case cost, every presentable
-    number would be invented, and the qualification must be UNKNOWN — never
+    """Fee/cost unknown fails closed: since #117 the live chain models the
+    catalog fee facts (``prediction_live_resolver._snapshot_for`` stamps each
+    leg book with the contract's fee fact -- 0 bps when proven fee-free, the
+    rate in bps priced into the cost slices when charging -- and a market
+    whose rate is missing/unparseable/conflicting is unmodelable, skipping
+    the whole component before it could present), so a presented live row
+    always has a known fee. The fail-closed half shown here is therefore a
+    missing worst-case cost: with ``bounded_cost_units`` absent the
+    projection cannot know the worst-case cost, every presentable number
+    would be invented, and the qualification must be UNKNOWN — never
     silently qualified. All ratio gates stay decidable here (profit $2,
     margin 0.02, annualized 0.365, release 20d), so only the missing cost
     forces the UNKNOWN.
@@ -1096,10 +1102,13 @@ def _build_live_resolver(
     server: _RealSolverServer,
     *,
     execution: object | None = None,
+    portfolio: tuple[ActionQuantity, ...] = (),
 ) -> tuple[PredictionLiveResolver, list[str]]:
     """Seed the #77 selection exactly like the no-submit validation harness:
     one component per compiled relation group with its structural
-    fingerprints, then the resolver over the real catalog object."""
+    fingerprints, then the resolver over the real catalog object. The
+    optional ``portfolio`` seeds the selected quantities (the #117 frozen
+    fee units are computed over them at request-build time)."""
     rows = catalog.current_generation()
     problem, components = relation_generation_problem(rows)
     assert problem is not None and components
@@ -1113,7 +1122,7 @@ def _build_live_resolver(
             constraint_ids=component.constraint_ids,
             action_ids=component.action_ids,
             admission_score=0,
-            portfolio=(),
+            portfolio=portfolio,
             relation_fingerprint=fingerprint(
                 {"constraint_model": sub.constraint_model}
             ),
@@ -1248,8 +1257,9 @@ def test_c1_live_chain_solves_every_n_without_leg_hardcoding(
     annualized return, 20 capital-release days, QUALIFIED_VERIFIED — and the
     fail-closed presentation: order_ready stays False with SCOPE_OBSERVE_ONLY
     because live solutions carry no scope_id, so the capability falls back to
-    observe-only (src/open_trader/prediction_n_leg_read_model.py). The chain
-    runs on the hardwired KNOWN fee 0 (see module docstring), which qualifies. """
+    observe-only (src/open_trader/prediction_n_leg_read_model.py). The
+    chain's markets are all proven fee-free (see module docstring), which
+    qualifies. """
     contract_ids = [f"c{index}" for index in range(n)]
     release = datetime.now(UTC) + timedelta(days=20)
     payload = _exactly_one_payload(contract_ids, list(prices), release_at=release)
@@ -1329,6 +1339,29 @@ def _codec_identity(tmp_path: Path, row: object) -> str:
     return str(catalog.ingest_mechanical_relation(row)["identity"])
 
 
+def _fee_free_group_relation(n: int = 4) -> object:
+    """The real negRisk codec fixture pinned to proven fee-free markets.
+
+    Since #117 a component whose contracts carry no modelable fee fact is
+    skipped whole before the solve; pinning the fixture to
+    ``fees_enabled=False`` keeps this test's void-conservative semantics
+    (the dispatch must actually happen) instead of skipping it."""
+    relation = group_relation(n)
+    return replace(
+        relation,
+        markets=tuple(
+            replace(market, fees_enabled=False) for market in relation.markets
+        ),
+    )
+
+
+def _fee_free_complement_relation() -> object:
+    """The real complement codec fixture pinned to proven fee-free (see
+    ``_fee_free_group_relation``)."""
+    relation = complement_relation()
+    return replace(relation, market=replace(relation.market, fees_enabled=False))
+
+
 def _assert_no_qualified_row(state: dict[str, object]) -> None:
     for row in state["opportunities"]:
         assert row["qualification"]["status"] != "QUALIFIED_VERIFIED"
@@ -1346,7 +1379,7 @@ def test_c2_negrisk_n4_real_codec_group_never_surfaces_a_qualified_row(
     (void/refund/split scenarios pay zero), so /state must not present any
     qualified or orderable row for the group."""
     catalog = RelationCatalog(tmp_path / "catalog")
-    result = catalog.ingest_mechanical_relation(group_relation(4))
+    result = catalog.ingest_mechanical_relation(_fee_free_group_relation(4))
     approved = catalog.approve(
         result["version_id"],
         {"version_id": result["version_id"]},
@@ -1458,7 +1491,7 @@ def test_c3_complement_n2_real_codec_pair_never_surfaces_a_qualified_row(
     closes stays unqualified — /state must not present a qualified or orderable
     row for the pair."""
     catalog = RelationCatalog(tmp_path / "catalog")
-    result = catalog.ingest_mechanical_relation(complement_relation())
+    result = catalog.ingest_mechanical_relation(_fee_free_complement_relation())
     approved = catalog.approve(
         result["version_id"],
         {"version_id": result["version_id"]},
@@ -1547,8 +1580,8 @@ def test_c3_complement_n2_hand_math_on_the_binary_settlement_view(
 def test_a7_fully_qualified_live_row_stays_observe_only(tmp_path: Path) -> None:
     """Every qualification gate passes for this N=2 live row (asks
     0.40+0.40, 20 lots per leg: profit 4,000,000 / payout 20,000,000 / cost
-    16,000,000; margin 0.2; annualized 3.65; release 20d; the chain's
-    hardwired KNOWN taker fee 0 — see A4 — does not block). Even so the row
+    16,000,000; margin 0.2; annualized 3.65; release 20d; the chain's proven
+    fee-free markets — see A4 — do not block). Even so the row
     must stay order_ready=False with reason SCOPE_OBSERVE_ONLY: live
     solutions carry no scope_id, so the projection's capability falls back
     to observe-only; would_submit stays a pure qualification+execution
@@ -1881,10 +1914,12 @@ def test_a3_solver_timeout_withdraws_the_presented_row(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------
-# Issue #112 (S5): the fee fail-closed acceptance cases, locked through the
+# Issue #112→#117 (S5): the fee acceptance cases, locked through the
 # production assembly (create_prediction_server → GET /state). Case A proves
-# the fee-free path keeps the #107 locked values byte-identical; B/C/D lock
-# the charging, unknown, and missing-fee-block fail-closed presentations.
+# the fee-free path keeps the #107 locked values byte-identical (with the
+# #117 block fields); B locks a charging market solved on post-fee numbers
+# (modeled block), C locks the unmodelable-rate whole-component skip, and D
+# locks the missing-fee-block fail-closed presentation.
 # --------------------------------------------------------------------------
 
 
@@ -1930,6 +1965,9 @@ def test_fee_a_all_markets_fee_free_keep_the_issue_107_locked_values(
             "status": "fee_free",
             "charging_contracts": [],
             "unknown_contracts": [],
+            "modeled": True,
+            "taker_fee_rate_bps": 0,
+            "taker_fee_units": 0,
         }
         assert raw["market"]["guaranteed_profit_units"] == 4_000_000
         assert raw["market"]["bounded_cost_units"] == 16_000_000
@@ -1950,14 +1988,19 @@ def test_fee_a_all_markets_fee_free_keep_the_issue_107_locked_values(
         resolver.stop()
 
 
-def test_fee_b_single_charging_market_blocks_the_component_unknown(
+def test_fee_b_single_charging_market_solves_on_post_fee_numbers(
     tmp_path: Path,
 ) -> None:
-    """Case B (charging): the same fixture with exactly one market flipped to
-    fees_enabled=True + fee_rate "0.05". The component containing that market
-    must present qualification UNKNOWN with a fee_status check whose passed is
-    None, would_submit False, execution order_ready False, and the exact
-    FEE_CHARGING_UNMODELED reason."""
+    """Case B (#117 flip of the #112 charging-unknown case): exactly one
+    market flipped to fees_enabled=True + fee_rate "0.05" is modelable now,
+    so the component solves with the fee priced into that leg's slices and
+    the block freezes {fee_charging, modeled=True, 500 bps}. Hand math (asks
+    0.40+0.40, 20 lots/leg, N=2, only leg fee-a charging: per-lot fee
+    0.05 x 400,000 x 600,000 / 1e6 = 12,000 units, 20 lots -> 240,000):
+    profit 4,000,000 - 240,000 = 3,760,000; margin 0.188; annualized 3.431
+    -> QUALIFIED_VERIFIED with the fee check itself passing (True,
+    value fee_charging) and order-ready blocked only by the observe-only
+    capability fallback."""
     contract_ids = ["fee-a", "fee-b"]
     status, state, resolver = _fee_live_state(
         tmp_path,
@@ -1970,26 +2013,36 @@ def test_fee_b_single_charging_market_blocks_the_component_unknown(
     )
     try:
         assert status == 200
-        row = _opportunity_row(state, "component:" + ":".join(contract_ids))
-        assert row["qualification"]["status"] == "UNKNOWN"
+        row = _opportunity_row(state, "component:" + ":".join(sorted(contract_ids)))
+        raw = resolver.solutions()[0]
+        assert raw["fee"]["status"] == "fee_charging"
+        assert raw["fee"]["charging_contracts"] == ["fee-a"]
+        assert raw["fee"]["unknown_contracts"] == []
+        assert raw["fee"]["modeled"] is True
+        assert raw["fee"]["taker_fee_rate_bps"] == 500
+        assert raw["market"]["guaranteed_profit_units"] == 3_760_000
         checks = _qualification_checks(row)
-        assert checks["fee_status"]["key"] == "fee_status"
-        assert checks["fee_status"]["passed"] is None
+        assert checks["fee_status"]["passed"] is True
+        assert checks["fee_status"]["value"] == "fee_charging"
+        assert checks["fee_status"]["threshold"] == "fee_free"
+        assert row["qualification"]["status"] == "QUALIFIED_VERIFIED"
         projection = row["n_leg_solution"]
-        assert projection["execution"]["would_submit"] is False
-        assert projection["execution"]["order_ready"] is False
+        assert projection["execution"]["would_submit"] is True
         assert row["order_ready"] is False
-        assert row["reason"] == "FEE_CHARGING_UNMODELED"
+        assert row["reason"] == "SCOPE_OBSERVE_ONLY"
     finally:
         resolver.stop()
 
 
-def test_fee_c_missing_fee_field_fails_closed_as_fee_unknown(
+def test_fee_c_unmodelable_rate_skips_the_component_entirely(
     tmp_path: Path,
 ) -> None:
-    """Case C (unknown): the same fixture with fees_enabled missing on exactly
-    one market. Same fail-closed presentation as case B, but with the
-    FEE_UNKNOWN reason."""
+    """Case C (#117 flip of the #112 fee-unknown case): fees_enabled missing
+    on exactly one market is unmodelable -- there is no fee number to price,
+    so the whole component is skipped like a book miss: no solve, no
+    solutions() entry, and no row on /state at all (stricter than the #112
+    presented-fee_unknown row, which required blocking an economics that no
+    longer exists)."""
     contract_ids = ["fee-a", "fee-b"]
     status, state, resolver = _fee_live_state(
         tmp_path,
@@ -1999,16 +2052,9 @@ def test_fee_c_missing_fee_field_fails_closed_as_fee_unknown(
     )
     try:
         assert status == 200
-        row = _opportunity_row(state, "component:" + ":".join(contract_ids))
-        assert row["qualification"]["status"] == "UNKNOWN"
-        checks = _qualification_checks(row)
-        assert checks["fee_status"]["key"] == "fee_status"
-        assert checks["fee_status"]["passed"] is None
-        projection = row["n_leg_solution"]
-        assert projection["execution"]["would_submit"] is False
-        assert projection["execution"]["order_ready"] is False
-        assert row["order_ready"] is False
-        assert row["reason"] == "FEE_UNKNOWN"
+        assert state["opportunities"] == []
+        assert "n_leg_solutions" not in state
+        assert resolver.solutions() == []
     finally:
         resolver.stop()
 
@@ -2044,3 +2090,146 @@ def test_fee_d_seeded_row_without_fee_block_fails_closed(tmp_path: Path) -> None
     assert projection["execution"]["order_ready"] is False
     assert row["order_ready"] is False
     assert row["reason"] == "FEE_UNKNOWN"
+
+
+# --------------------------------------------------------------------------
+# Issue #117 (S6): the full-chain taker-fee economics on a complementary
+# pair (EXACTLY_ONE over two markets == the YES/NO complement shape), 100
+# shares per leg, catalog rate 0.04 on both markets, 1 share/lot and
+# PU=1e6 -- every hand number below is an exact integer (per-lot fees
+# 9,984 at $0.48 and 9,996 at $0.49 divide cleanly, no carry drift).
+# --------------------------------------------------------------------------
+
+SEAM_D_QUANTITY = 100
+
+
+def _seam_d_live_state(
+    tmp_path: Path,
+    contract_ids: list[str],
+    prices: list[str],
+) -> tuple[int, dict[str, object], PredictionLiveResolver]:
+    """Seam D harness: the real live chain over a two-market EXACTLY_ONE
+    group with catalog rate 0.04 on both markets and books at the given
+    prices; the #77 selection carries the 100-lot portfolio so the frozen
+    fee units describe the same opportunity the solver picks (the cap)."""
+    release = datetime.now(UTC) + timedelta(days=20)
+    payload = _exactly_one_payload(
+        contract_ids,
+        prices,
+        release_at=release,
+        quantity_cap=SEAM_D_QUANTITY,
+        fee_fields=[
+            {"fees_enabled": True, "fee_rate": "0.04"},
+            {"fees_enabled": True, "fee_rate": "0.04"},
+        ],
+    )
+    catalog, _ = _activate_relation(tmp_path, payload)
+    monitor = _LiveBooksMonitor(
+        {
+            contract: _live_book(contract, price, depth=SEAM_D_QUANTITY)
+            for contract, price in zip(contract_ids, prices)
+        }
+    )
+    server = _RealSolverServer()
+    portfolio = tuple(
+        ActionQuantity(f"polymarket:{contract}", SEAM_D_QUANTITY)
+        for contract in contract_ids
+    )
+    resolver, _components = _build_live_resolver(
+        tmp_path / "run",
+        catalog,
+        monitor,
+        server,
+        portfolio=portfolio,
+    )
+    resolver._tick()
+    resolver._tick()
+    runtime = _LiveHttpRuntime(resolver=resolver, catalog=catalog, monitor=monitor)
+    try:
+        with _serve(runtime) as base:
+            status, state = _get_state(base)
+    except BaseException:
+        resolver.stop()
+        raise
+    return status, state, resolver
+
+
+def test_d1_complement_pair_at_forty_eight_cents_qualifies_post_fee(
+    tmp_path: Path,
+) -> None:
+    """D1 (#117): both legs ask $0.48, both markets charging 0.04, 100
+    shares per leg at 1 share/lot, PU=1e6. Hand math (all exact integers):
+
+    payout = 100 x $1                      = $100.00  (100,000,000 units)
+    cost   = 2 x 100 x $0.48               = $96.00   (96,000,000 units)
+    fee    = 2 x 100 x 0.04 x 0.48 x 0.52  = $1.9968  (1,996,800 units;
+             per lot per leg 0.04 x 480,000 x 520,000 / 1e6 = 9,984, exact)
+    profit = 100,000,000 - 96,000,000 - 1,996,800 = 2,003,200 ($2.0032);
+    margin 0.020032, annualized 0.365584, release 20d, min profit $2.0032
+    -> QUALIFIED_VERIFIED on post-fee numbers, with the frozen fee block
+    charging / modeled / 400 bps / 1,996,800 units. Under #112 semantics
+    this charging group was qualification UNKNOWN; #117 decides it."""
+    contract_ids = ["d1-a", "d1-b"]
+    status, state, resolver = _seam_d_live_state(tmp_path, contract_ids, ["0.48", "0.48"])
+    try:
+        assert status == 200
+        row = _opportunity_row(state, "component:" + ":".join(sorted(contract_ids)))
+        raw = resolver.solutions()[0]
+        assert raw["market"]["guaranteed_profit_units"] == 2_003_200
+        assert raw["market"]["bounded_cost_units"] == 97_996_800
+        assert raw["market"]["bounded_payout_units"] == 100_000_000
+        assert raw["fee"] == {
+            "status": "fee_charging",
+            "charging_contracts": sorted(contract_ids),
+            "unknown_contracts": [],
+            "modeled": True,
+            "taker_fee_rate_bps": 400,
+            "taker_fee_units": 1_996_800,
+        }
+        qualification = row["qualification"]
+        assert qualification["status"] == "QUALIFIED_VERIFIED"
+        checks = _qualification_checks(row)
+        assert checks["fee_status"]["passed"] is True
+        assert checks["fee_status"]["value"] == "fee_charging"
+        assert checks["min_profit"]["passed"] is True
+        assert row["order_ready"] is False
+        assert row["reason"] == "SCOPE_OBSERVE_ONLY"
+    finally:
+        resolver.stop()
+
+
+def test_d2_complement_pair_at_forty_nine_cents_not_qualified_post_fee(
+    tmp_path: Path,
+) -> None:
+    """D2 (#117), adjacent to D1 (AC#3 contrast): both legs ask $0.49, same
+    catalog rate 0.04. Hand math (exact integers):
+
+    fee    = 2 x 100 x 0.04 x 0.49 x 0.51 = $1.9992 (1,999,200 units;
+             per lot per leg 0.04 x 490,000 x 510,000 / 1e6 = 9,996, exact)
+    cost   = 2 x 100 x $0.49              = $98.00  (98,000,000 units)
+    profit = 100,000,000 - 98,000,000 - 1,999,200 = 800 ($0.0008)
+
+    The fee check itself passes (charging+modeled) and the post-fee
+    min_profit check fails -> NOT_QUALIFIED, never UNKNOWN. Under #112
+    semantics this group was UNKNOWN (fee unmodeled); the "before" half of
+    that contrast is locked by the flipped Seam C read-model cases."""
+    contract_ids = ["d2-a", "d2-b"]
+    status, state, resolver = _seam_d_live_state(tmp_path, contract_ids, ["0.49", "0.49"])
+    try:
+        assert status == 200
+        row = _opportunity_row(state, "component:" + ":".join(sorted(contract_ids)))
+        raw = resolver.solutions()[0]
+        assert raw["market"]["guaranteed_profit_units"] == 800
+        assert raw["market"]["bounded_cost_units"] == 99_999_200
+        assert raw["market"]["bounded_payout_units"] == 100_000_000
+        assert raw["fee"]["status"] == "fee_charging"
+        assert raw["fee"]["modeled"] is True
+        assert raw["fee"]["taker_fee_rate_bps"] == 400
+        assert raw["fee"]["taker_fee_units"] == 1_999_200
+        checks = _qualification_checks(row)
+        assert checks["fee_status"]["passed"] is True
+        assert checks["min_profit"]["passed"] is False
+        assert row["qualification"]["status"] == "NOT_QUALIFIED"
+        assert row["order_ready"] is False
+    finally:
+        resolver.stop()

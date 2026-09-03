@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
+from fractions import Fraction
 
 from open_trader.prediction_n_leg import (
     PROBLEM_SCHEMA_V1,
@@ -125,14 +126,29 @@ def cost_slices_from_book(
     Buy legs walk the asks best-first; NO legs walk the bids best-first.
     Each lot's upper bound is price x lot_step plus fee plus slippage/safety
     margin (tick + haircut), rounded the same way as the #51 quote pipeline.
-    Consecutive levels with the same unit cost merge into one slice; depth
-    only covers executable lots, so an exhausted book truncates.
+    Issue #117: a book carrying finite positive ``taker_fee_bps`` prices the
+    Polymarket taker fee into every level's bound (per-share fee
+    ``rate x p x (1-p)``, peaking at 50 cents); ``None``/``0`` books keep the
+    fee-free output byte-identical to the pre-#117 slices. Consecutive levels
+    with the same unit cost merge into one slice; depth only covers
+    executable lots, so an exhausted book truncates.
     """
     if not isinstance(action, CandidateAction):
         raise ValueError("action must be a CandidateAction")
     levels = getattr(book, "bids" if action.side == ActionSide.BUY_NO else "asks", ())
     if common_units_per_dollar is None:
         common_units_per_dollar = price_units_per_quote_unit
+    # #117: only a finite positive Decimal bps figure models a charging
+    # market; None/0 (or anything else) keeps the fee term at exactly 0 so
+    # the fee-free slices stay byte-identical (D7).
+    book_fee_bps = getattr(book, "taker_fee_bps", None)
+    fee_rate: Fraction | None = None
+    if (
+        isinstance(book_fee_bps, Decimal)
+        and book_fee_bps.is_finite()
+        and book_fee_bps > 0
+    ):
+        fee_rate = Fraction(book_fee_bps) / 10_000
     slices: list[ExecutableCostSlice] = []
     first = 1
     for level in levels:
@@ -160,8 +176,30 @@ def cost_slices_from_book(
         venue_cost = _ceil_div(protected * action.lot_step_units, action.quantity_scale)
         common_cost = _ceil_div(venue_cost * common_units_per_dollar, price_units_per_quote_unit)
         fee = _ceil_div(common_cost * fee_ppm, _PPM)
-        haircut = _ceil_div((common_cost + fee) * haircut_ppm, _PPM)
-        unit_cost = common_cost + fee + haircut
+        if fee_rate is None:
+            taker_fee = 0
+        else:
+            # #117 upper-bound argument: the per-share total
+            # p + rate*p*(1-p) is strictly increasing in p for rate <= 1, so
+            # evaluating the fee-rate term at this level's highest possible
+            # fill price (``protected`` price units) bounds every actual
+            # fill at or below that price; rate*p*(1-p) itself peaks at
+            # p = 0.5, which is why the fee is largest at 50 cents. The
+            # rate term must never be linearized into a
+            # fee_ppm*(1-p)-style factor: that would understate the fee on
+            # both ends of the book. Exact rational arithmetic throughout;
+            # one final ceiling per level.
+            taker_fee = _ceil_fraction(
+                fee_rate
+                * protected
+                * (price_units_per_quote_unit - protected)
+                / price_units_per_quote_unit
+                * Fraction(action.lot_step_units, action.quantity_scale)
+                * common_units_per_dollar
+                / price_units_per_quote_unit
+            )
+        haircut = _ceil_div((common_cost + fee + taker_fee) * haircut_ppm, _PPM)
+        unit_cost = common_cost + fee + taker_fee + haircut
         last = min(action.max_quantity_lots, first + lots - 1)
         if (
             slices
@@ -473,3 +511,7 @@ def _qualification_fingerprint(problem: ArbitrageProblem) -> str:
 
 def _ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
+
+
+def _ceil_fraction(value: Fraction) -> int:
+    return -(-value.numerator // value.denominator)

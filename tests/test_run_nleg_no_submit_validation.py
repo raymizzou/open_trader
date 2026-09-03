@@ -53,7 +53,12 @@ def clean_contract_registry():
 
 
 def neg_risk_event(*, event_id: str = "event-n3", market_count: int = 3) -> dict:
-    """One official Polymarket negRisk snapshot event (flat SDK-style keys)."""
+    """One official Polymarket negRisk snapshot event (flat SDK-style keys).
+
+    #117: the markets carry the proven fee-free fact -- a component whose
+    contracts have no modelable fee fact is skipped whole by the live
+    resolver before the solve, and these tests exercise the solve itself.
+    """
 
     markets = []
     for index in range(market_count):
@@ -66,6 +71,7 @@ def neg_risk_event(*, event_id: str = "event-n3", market_count: int = 3) -> dict
                 "resolutionSource": "Binance",
                 "endDate": "2026-12-31T17:00:00Z",
                 "outcomes": '["Yes", "No"]',
+                "trading": {"feesEnabled": False},
                 "clobTokenIds": json.dumps(
                     [f"yes-{index}", f"no-{index}"]
                 ),
@@ -242,8 +248,14 @@ def seed_active_n3_relation(replica: Path) -> None:
     )
     payload = {
         "relation_type": "EXACTLY_ONE",
+        # #117: proven fee-free facts so the live resolver dispatches the
+        # component instead of skipping it for missing fee facts.
         "endpoints": [
-            {"venue": "polymarket", "contract_id": contract}
+            {
+                "venue": "polymarket",
+                "contract_id": contract,
+                "fees_enabled": False,
+            }
             for contract in ("a", "b", "c")
         ],
         "model": {
@@ -1166,8 +1178,14 @@ def seed_pending_n3_relation(replica: Path) -> None:
     )
     payload = {
         "relation_type": "EXACTLY_ONE",
+        # #117: proven fee-free facts so the live resolver dispatches the
+        # component instead of skipping it for missing fee facts.
         "endpoints": [
-            {"venue": "polymarket", "contract_id": contract}
+            {
+                "venue": "polymarket",
+                "contract_id": contract,
+                "fees_enabled": False,
+            }
             for contract in ("a", "b", "c")
         ],
         "model": {

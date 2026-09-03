@@ -67,8 +67,14 @@ def relation_payload(*, qualification: bool = False) -> dict[str, object]:
         ]
     return {
         "relation_type": "EXACTLY_ONE",
+        # #117: proven fee-free facts so the live resolver dispatches the
+        # component instead of skipping it for missing fee facts.
         "endpoints": [
-            {"venue": "polymarket", "contract_id": contract}
+            {
+                "venue": "polymarket",
+                "contract_id": contract,
+                "fees_enabled": False,
+            }
             for contract in ("a", "b", "c")
         ],
         "model": {

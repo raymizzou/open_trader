@@ -146,13 +146,20 @@ def raw_problem(
 
 
 def row(identity: str, compiled: ArbitrageProblem) -> dict[str, object]:
+    # #117: rows carry proven fee-free endpoint facts for their contracts --
+    # a component whose contracts have no fee fact at all is unmodelable and
+    # is skipped whole, so every non-fee fixture states its fee facts.
+    contracts = sorted({action.market_contract_id for action in compiled.actions})
     return {
         "identity": identity,
         "version_id": f"v-{identity}",
         "fingerprint": f"fp-{identity}",
         "activation": "ACTIVE",
         "relation_type": "IMPLIES",
-        "endpoints": [],
+        "endpoints": [
+            {"venue": "polymarket", "contract_id": contract, "fees_enabled": False}
+            for contract in contracts
+        ],
         "model": {
             "terminal_states": ["NORMAL_YES", "NORMAL_NO", "VOID"],
             "payouts": {},
@@ -387,10 +394,13 @@ def test_normalize_problem_maps_micro_units_and_payouts() -> None:
 
 
 # --------------------------------------------------------------------------
-# Issue #112 (S3): the resolver aggregates per-contract fee states from the
-# catalog generation endpoints and reports a per-solution "fee" block; fees
-# stay out of the solver cost slice (taker_fee_bps stays 0), the gate lives in
-# the qualification layer.
+# Issue #117 (S3): the resolver aggregates per-contract fee FACTS (state +
+# rate) from the catalog generation endpoints, models the charging-market
+# taker fee into the snapshot legs' taker_fee_bps (the cost slices are built
+# from those books), and freezes a per-solution fee block at request-build
+# time. A market whose rate is missing/unparseable/conflicting is
+# unmodelable and the whole component is skipped -- no snapshot, no solve,
+# no solutions() entry -- exactly like a book miss.
 # --------------------------------------------------------------------------
 
 
@@ -434,6 +444,9 @@ def token_row(
             "contract_id": contract_id,
             "yes_token_id": yes_token_id,
             "no_token_id": no_token_id,
+            # #117: proven fee-free fact so the resolver dispatches the
+            # component (token mapping alone does not make a fee fact).
+            "fees_enabled": False,
         }
     ]
     return base
@@ -485,58 +498,324 @@ def resolved_solutions(
     return instance.solutions()
 
 
+def skipped_component(
+    tmp_path: Path, rows: dict[str, object]
+) -> tuple[PredictionLiveResolver, FakeServer, SelectedComponent]:
+    """Reconcile a single-component selection whose fee facts are
+    unmodelable; the caller asserts the whole-component skip."""
+    instance, server, _ = resolver(
+        tmp_path,
+        rows=rows,
+        monitor=FakeMonitor({"contract-a": live_book("contract-a")}),
+    )
+    valid = valid_selected(rows)
+    instance._selection_store.save({valid.component_id: valid})
+    instance._reconcile()
+    return instance, server, valid
+
+
 def test_solutions_report_fee_free_from_endpoint_facts(tmp_path: Path) -> None:
+    """B4 (#117): fees_enabled=False is proven fee-free -- legs carry
+    taker_fee_bps=Decimal("0"), the block is fully modeled with zero rate and
+    zero units, and the economics equal the pre-#117 numbers."""
     rows = {
         "r:a": fee_row(
             "r:a",
             [fee_endpoint("contract-a", fees_enabled=False)],
         )
     }
+    instance, server, _ = resolver(
+        tmp_path,
+        rows=rows,
+        monitor=FakeMonitor({"contract-a": live_book("contract-a")}),
+        execution=FakeExecution(AccountView(1_000_000, 1_000_000, 0)),
+    )
+    valid = valid_selected(rows)
+    instance._selection_store.save({valid.component_id: valid})
+    instance._reconcile()
+    snapshot = instance._snapshot_for(valid)
+    assert snapshot is not None
+    assert all(leg.book.taker_fee_bps == Decimal("0") for leg in snapshot.legs)
+    instance._tick()
+    request = server.requests[0]
+    server.futures[0].set_result(
+        worker_outcome(request, worker_evidence(request.request.problem))
+    )
+    instance._tick()
 
-    (entry,) = resolved_solutions(tmp_path, rows)
+    (entry,) = instance.solutions()
 
     assert entry["fee"] == {
         "status": "fee_free",
         "charging_contracts": [],
         "unknown_contracts": [],
+        "modeled": True,
+        "taker_fee_rate_bps": 0,
+        "taker_fee_units": 0,
     }
+    assert entry["market"]["guaranteed_profit_units"] == 20_000
 
 
 def test_solutions_report_fee_charging_when_enabled_or_rate_positive(
     tmp_path: Path,
 ) -> None:
-    enabled = {
+    """B1 (#117): a modelable charging market (fees_enabled=True + rate, or
+    fees_enabled=False with a positive rate) solves with the fee priced into
+    the slices: snapshot legs carry taker_fee_bps=Decimal("400") and the
+    frozen block is {fee_charging, modeled=True, 400 bps, units>0}."""
+    for endpoints in (
+        [fee_endpoint("contract-a", fees_enabled=True, fee_rate="0.04")],
+        [fee_endpoint("contract-a", fees_enabled=False, fee_rate="0.04")],
+    ):
+        rows = {"r:a": fee_row("r:a", endpoints)}
+        instance, server, _ = resolver(
+            tmp_path,
+            rows=rows,
+            monitor=FakeMonitor({"contract-a": live_book("contract-a")}),
+            execution=FakeExecution(AccountView(1_000_000, 1_000_000, 0)),
+        )
+        valid = valid_selected(rows)
+        instance._selection_store.save({valid.component_id: valid})
+        instance._reconcile()
+        snapshot = instance._snapshot_for(valid)
+        assert snapshot is not None
+        assert all(leg.book.taker_fee_bps == Decimal("400") for leg in snapshot.legs)
+        instance._tick()
+        request = server.requests[0]
+        # price 0.49 -> price term 490,000 + fee 0.04 x 490,000 x 510,000/1e6
+        # = 9,996 -> 499,996 per lot (hand math, 1 share/lot).
+        assert (
+            request.request.problem.actions[0]
+            .cost_slices[0]
+            .incremental_cost_upper_bound_units
+            == 499_996
+        )
+        server.futures[0].set_result(
+            worker_outcome(request, worker_evidence(request.request.problem))
+        )
+        instance._tick()
+
+        (entry,) = instance.solutions()
+        assert entry["fee"]["status"] == "fee_charging"
+        assert entry["fee"]["charging_contracts"] == ["contract-a"]
+        assert entry["fee"]["unknown_contracts"] == []
+        assert entry["fee"]["modeled"] is True
+        assert entry["fee"]["taker_fee_rate_bps"] == 400
+        assert entry["fee"]["taker_fee_units"] > 0
+
+
+def test_unmodelable_rate_skips_the_whole_component(tmp_path: Path) -> None:
+    """B2 (#117): fees_enabled=True with a missing fee_rate is unmodelable
+    (the #112 gate read it as charging; #117 cannot bound the fee), so the
+    component is skipped like a book miss: no snapshot, no dispatch, and no
+    solutions() entry."""
+    rows = {
+        "r:a": fee_row("r:a", [fee_endpoint("contract-a", fees_enabled=True)])
+    }
+    instance, server, valid = skipped_component(tmp_path, rows)
+    assert instance._snapshot_for(valid) is None
+    instance._tick()
+    assert server.requests == []
+    assert instance.solutions() == []
+
+
+def test_conflicting_rates_skip_the_component(tmp_path: Path) -> None:
+    """B3 (#117): two endpoints for one contract quoting rates 0.04 vs 0.05
+    disagree on the fee fact -> unmodelable -> skipped, no solve."""
+    rows = {
+        "r:a": fee_row(
+            "r:a",
+            [
+                fee_endpoint("contract-a", fees_enabled=True, fee_rate="0.04"),
+                fee_endpoint("contract-a", fees_enabled=True, fee_rate="0.05"),
+            ],
+        )
+    }
+    instance, server, valid = skipped_component(tmp_path, rows)
+    assert instance._snapshot_for(valid) is None
+    instance._tick()
+    assert server.requests == []
+    assert instance.solutions() == []
+
+
+def test_solution_fee_block_stays_frozen_across_catalog_rotation(
+    tmp_path: Path,
+) -> None:
+    """B5 (#117/Q3): after a solution exists, a new catalog batch moving the
+    rate to 0.05 reconciles into a new generation; solutions() must keep
+    replaying the frozen request-time fee block (400 bps) instead of
+    recomputing it from the current facts."""
+    rows = {
         "r:a": fee_row(
             "r:a",
             [fee_endpoint("contract-a", fees_enabled=True, fee_rate="0.04")],
         )
     }
-    (entry,) = resolved_solutions(tmp_path, enabled)
-    assert entry["fee"]["status"] == "fee_charging"
-    assert entry["fee"]["charging_contracts"] == ["contract-a"]
-    assert entry["fee"]["unknown_contracts"] == []
+    instance, server, catalog = resolver(
+        tmp_path,
+        rows=rows,
+        monitor=FakeMonitor({"contract-a": live_book("contract-a")}),
+        execution=FakeExecution(AccountView(1_000_000, 1_000_000, 0)),
+    )
+    valid = valid_selected(rows)
+    instance._selection_store.save({valid.component_id: valid})
+    instance._tick()
+    request = server.requests[0]
+    server.futures[0].set_result(
+        worker_outcome(request, worker_evidence(request.request.problem))
+    )
+    instance._tick()
+    frozen = instance.solutions()[0]["fee"]
+    assert frozen["taker_fee_rate_bps"] == 400
 
-    positive_rate = {
+    catalog.rows = {
         "r:a": fee_row(
             "r:a",
-            [fee_endpoint("contract-a", fees_enabled=False, fee_rate="0.04")],
+            [fee_endpoint("contract-a", fees_enabled=True, fee_rate="0.05")],
         )
     }
-    (entry,) = resolved_solutions(tmp_path, positive_rate)
-    assert entry["fee"]["status"] == "fee_charging"
-    assert entry["fee"]["charging_contracts"] == ["contract-a"]
+    catalog.generation = 2
+    instance._tick()
+
+    assert instance.solutions()[0]["fee"] == frozen
+    assert instance.solutions()[0]["fee"]["taker_fee_rate_bps"] == 400
 
 
-def test_solutions_fail_closed_fee_unknown_when_missing_or_unparseable(
+def stale_pending_block_after_rotation(
+    tmp_path: Path,
+    *,
+    rows: dict[str, object],
+    rotated_rows: dict[str, object],
+) -> tuple[PredictionLiveResolver, FakeServer, object]:
+    """Pin the snapshot->dispatch window (#117/D3): R1 dispatches, a newer
+    book parks a stale-stamped pending snapshot in the scheduler, the
+    resolver loop then reconciles a fee-rotated catalog generation (a bare
+    ``_reconcile`` -- no scheduler refresh, exactly the loop interleave
+    between snapshot stamping and request build), and R1's completion
+    dispatches the stale snapshot as R2. Returns the resolver, server, and
+    the dispatched R2, whose fee block must follow the STAMPED legs."""
+    monitor = FakeMonitor({"contract-a": live_book("contract-a")})
+    instance, server, catalog = resolver(tmp_path, rows=rows, monitor=monitor)
+    valid = valid_selected(rows)
+    instance._selection_store.save({valid.component_id: valid})
+    instance._tick()
+    first = server.requests[0]
+    assert len(server.requests) == 1
+    # A newer book changes the economic fingerprint: the scheduler parks the
+    # newest snapshot as pending behind the in-flight solve -- stamped with
+    # the PRE-rotation fee facts.
+    monitor.books["contract-a"] = live_book("contract-a", price="0.50")
+    instance._tick()
+    assert len(server.requests) == 1
+    # The loop reconciles a fee rotation between the pending stamp and its
+    # dispatch: only the facts map turns over, the parked snapshot does not.
+    catalog.rows = rotated_rows
+    catalog.generation = 2
+    instance._reconcile()
+    server.futures[0].set_result(
+        worker_outcome(first, worker_evidence(first.request.problem))
+    )
+    dispatched = server.requests[1]
+    return instance, server, dispatched
+
+
+def test_fee_block_follows_stale_snapshot_legs_when_facts_rotate_to_charging(
     tmp_path: Path,
 ) -> None:
+    """R2a (#117/D3): a component stamped fee-free (snapshot legs at 0 bps)
+    keeps narrating fee_free even when the catalog facts rotate to charging
+    between the snapshot stamp and the pending dispatch -- the frozen block
+    comes from the same stamped legs as the slices, never fee_charging."""
+    rows = {
+        "r:a": fee_row(
+            "r:a",
+            [fee_endpoint("contract-a", fees_enabled=False)],
+        )
+    }
+    rotated = {
+        "r:a": fee_row(
+            "r:a",
+            [fee_endpoint("contract-a", fees_enabled=True, fee_rate="0.04")],
+        )
+    }
+    instance, _, dispatched = stale_pending_block_after_rotation(
+        tmp_path, rows=rows, rotated_rows=rotated
+    )
+
+    # the slices follow the STAMPED (fee-free) legs: 0.50, no fee term
+    assert (
+        dispatched.request.problem.actions[0]
+        .cost_slices[0]
+        .incremental_cost_upper_bound_units
+        == 500_000
+    )
+    # so the block must follow the same legs -- consistent, never fee_charging
+    assert instance._request_components[dispatched.request_id][2] == {
+        "status": "fee_free",
+        "charging_contracts": [],
+        "unknown_contracts": [],
+        "modeled": True,
+        "taker_fee_rate_bps": 0,
+        "taker_fee_units": 0,
+    }
+
+
+def test_fee_block_follows_stale_snapshot_legs_when_facts_rotate_to_free(
+    tmp_path: Path,
+) -> None:
+    """R2b (#117/D3, inverse): legs stamped charging at 400 bps keep the
+    block fee_charging with the stamped rate and units after the catalog
+    facts rotate to fees_enabled=False -- block and slices agree on the OLD
+    economics until the next solve refreshes both."""
+    rows = {
+        "r:a": fee_row(
+            "r:a",
+            [fee_endpoint("contract-a", fees_enabled=True, fee_rate="0.04")],
+        )
+    }
+    rotated = {
+        "r:a": fee_row(
+            "r:a",
+            [fee_endpoint("contract-a", fees_enabled=False)],
+        )
+    }
+    instance, _, dispatched = stale_pending_block_after_rotation(
+        tmp_path, rows=rows, rotated_rows=rotated
+    )
+
+    # the slices follow the STAMPED (charging) legs: 0.50 + 0.04 x 0.5 x 0.5
+    assert (
+        dispatched.request.problem.actions[0]
+        .cost_slices[0]
+        .incremental_cost_upper_bound_units
+        == 510_000
+    )
+    assert instance._request_components[dispatched.request_id][2] == {
+        "status": "fee_charging",
+        "charging_contracts": ["contract-a"],
+        "unknown_contracts": [],
+        "modeled": True,
+        "taker_fee_rate_bps": 400,
+        # both legs stamped charging: 2 x 0.04 x 0.5 x 0.5 x 1e6 per lot
+        "taker_fee_units": 20_000,
+    }
+
+
+def test_unmodelable_fee_facts_skip_instead_of_presenting_unknown(
+    tmp_path: Path,
+) -> None:
+    """#117 flip of the #112 fail-closed cases: a missing fees_enabled key,
+    an unparseable rate, and a contract absent from the generation endpoints
+    are all unmodelable -- the component no longer solves and presents a
+    fee_unknown row; it is skipped whole (no dispatch, no solution)."""
     missing = {
         "r:a": fee_row("r:a", [fee_endpoint("contract-a", include_fees=False)])
     }
-    (entry,) = resolved_solutions(tmp_path, missing)
-    assert entry["fee"]["status"] == "fee_unknown"
-    assert entry["fee"]["unknown_contracts"] == ["contract-a"]
-    assert entry["fee"]["charging_contracts"] == []
+    instance, server, valid = skipped_component(tmp_path, missing)
+    assert instance._snapshot_for(valid) is None
+    instance._tick()
+    assert server.requests == []
+    assert instance.solutions() == []
 
     unparseable = {
         "r:a": fee_row(
@@ -544,24 +823,30 @@ def test_solutions_fail_closed_fee_unknown_when_missing_or_unparseable(
             [fee_endpoint("contract-a", fees_enabled=False, fee_rate="abc")],
         )
     }
-    (entry,) = resolved_solutions(tmp_path, unparseable)
-    assert entry["fee"]["status"] == "fee_unknown"
-    assert entry["fee"]["unknown_contracts"] == ["contract-a"]
+    instance, server, valid = skipped_component(tmp_path, unparseable)
+    assert instance._snapshot_for(valid) is None
+    instance._tick()
+    assert server.requests == []
+    assert instance.solutions() == []
 
-    # a component contract absent from the generation endpoints never maps to
-    # fee_free: the block fails closed instead
+    # a component contract absent from the generation endpoints has no fee
+    # fact at all: the component is skipped, never solved as fee-free
     foreign = {
         "r:a": fee_row(
             "r:a",
             [fee_endpoint("contract-other", fees_enabled=False)],
         )
     }
-    (entry,) = resolved_solutions(tmp_path, foreign)
-    assert entry["fee"]["status"] == "fee_unknown"
-    assert entry["fee"]["unknown_contracts"] == ["contract-a"]
+    instance, server, valid = skipped_component(tmp_path, foreign)
+    assert instance._snapshot_for(valid) is None
+    instance._tick()
+    assert server.requests == []
+    assert instance.solutions() == []
 
 
-def test_conflicting_fee_facts_merge_to_fee_unknown(tmp_path: Path) -> None:
+def test_conflicting_fee_states_skip_the_component(tmp_path: Path) -> None:
+    """#117 flip: one contract whose endpoints disagree on fees_enabled
+    (False vs True) is unmodelable -> skipped whole, no solve."""
     rows = {
         "r:a": fee_row(
             "r:a", [fee_endpoint("contract-a", fees_enabled=False)]
@@ -570,11 +855,11 @@ def test_conflicting_fee_facts_merge_to_fee_unknown(tmp_path: Path) -> None:
             "r:b", [fee_endpoint("contract-a", fees_enabled=True)]
         ),
     }
-
-    (entry,) = resolved_solutions(tmp_path, rows)
-
-    assert entry["fee"]["status"] == "fee_unknown"
-    assert entry["fee"]["unknown_contracts"] == ["contract-a"]
+    instance, server, valid = skipped_component(tmp_path, rows)
+    assert instance._snapshot_for(valid) is None
+    instance._tick()
+    assert server.requests == []
+    assert instance.solutions() == []
 
 
 def test_snapshot_assembly_and_missing_leg_fail_closed(tmp_path: Path) -> None:
@@ -589,6 +874,8 @@ def test_snapshot_assembly_and_missing_leg_fail_closed(tmp_path: Path) -> None:
     snapshot = instance._snapshot_for(valid_selected(rows))
     assert snapshot is not None
     assert {leg.leg_id for leg in snapshot.legs} == {"a-yes", "a-no"}
+    # #117 fee-aware: the row's proven fee-free endpoint facts put 0 bps on
+    # every leg book (unmodelable facts would have skipped the component).
     assert all(leg.book.available and leg.book.taker_fee_bps == Decimal("0") for leg in snapshot.legs)
     assert all(leg.received_at is not None and leg.sequence is not None for leg in snapshot.legs)
 
@@ -620,6 +907,37 @@ def test_snapshot_resolves_leg_tokens_by_action_direction(tmp_path: Path) -> Non
     assert requested == {"yes-token-a", "no-token-a"}
     prices = {leg.leg_id: leg.book.asks[0].price for leg in snapshot.legs}
     assert prices == {"a-yes": Decimal("0.49"), "a-no": Decimal("0.61")}
+
+
+def test_snapshot_combines_direction_tokens_with_charging_fee_facts(
+    tmp_path: Path,
+) -> None:
+    """#114+#117 composition: each leg's book is read by its direction-resolved
+    CLOB token while the 400 bps fee fact is found by contract id."""
+    charging = {
+        "venue": "polymarket",
+        "contract_id": "contract-a",
+        "yes_token_id": "yes-token-a",
+        "no_token_id": "no-token-a",
+        "fees_enabled": True,
+        "fee_rate": "0.04",
+    }
+    base = row("r:a", raw_problem())
+    base["endpoints"] = [charging]
+    rows = {"r:a": base}
+    monitor = RecordingMonitor({
+        "yes-token-a": live_book("yes-token-a", price="0.48"),
+        "no-token-a": live_book("no-token-a", price="0.52"),
+    })
+    instance, _, _ = resolver(tmp_path, rows=rows, monitor=monitor)
+    instance._reconcile()
+
+    snapshot = instance._snapshot_for(valid_selected(rows))
+
+    assert snapshot is not None
+    requested = {token for call in monitor.requested for token in call}
+    assert requested == {"yes-token-a", "no-token-a"}
+    assert all(leg.book.taker_fee_bps == Decimal("400") for leg in snapshot.legs)
 
 
 def test_snapshot_without_leg_map_fails_closed_for_implies(tmp_path: Path) -> None:

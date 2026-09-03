@@ -12,7 +12,6 @@ from open_trader.prediction_market_solution import (
 from open_trader.prediction_n_leg import ActionQuantity, canonical_payload, fingerprint
 from open_trader.prediction_n_leg_read_model import (
     EXECUTION_FINGERPRINT_MISMATCH,
-    FEE_CHARGING_UNMODELED,
     FEE_UNKNOWN,
     PARTIAL_FILL_PROOF_REQUIRED,
     SCOPE_OBSERVE_ONLY,
@@ -667,16 +666,123 @@ def test_projection_scope_ready_false_keeps_execution_reason() -> None:
 
 
 # --------------------------------------------------------------------------
-# Issue #112 (S4): the fail-closed fee gate. The fee state rides the solution
-# entry's "fee" block; a missing block (or one without a status) is treated as
-# fee_unknown forever, a charging/unknown component is qualification UNKNOWN
-# and never order-ready, and fee_free keeps the existing chain byte-identical.
+# Issue #117 (S4): the fee gate after fee modeling. The resolver freezes
+# modeled=True plus the fee numbers into every dispatched solution's "fee"
+# block, so charging+modeled economics are post-fee and qualify on their own
+# numbers; a missing block, an unknown fee state, or a charging block without
+# the modeled invariant is qualification UNKNOWN and never order-ready
+# (reason FEE_UNKNOWN). fee_free keeps the existing chain byte-identical.
 # --------------------------------------------------------------------------
 
 
-def test_projection_fee_constants_carry_exact_reason_values() -> None:
-    assert FEE_CHARGING_UNMODELED == "FEE_CHARGING_UNMODELED"
-    assert FEE_UNKNOWN == "FEE_UNKNOWN"
+def test_projection_charging_and_modeled_qualifies_on_post_fee_numbers() -> None:
+    """C1 (#117): a charging block with modeled=True passes the fee check
+    (value stays fee_charging against the fee_free threshold display) and the
+    post-fee numbers decide: QUALIFIED_VERIFIED, and the usual order-ready
+    chain proceeds."""
+    market = _market(
+        profit_units=2_000_000,
+        cost_units=95_000_000,
+        payout_units=100_000_000,
+        capital_release_at=_NOW + timedelta(days=20),
+        global_search_closed=True,
+    )
+    item = project_n_leg_solution(
+        market=market,
+        execution=_execution(market),
+        scope=_manual_canary_scope(),
+        max_total_unsettled_capital_units=1000,
+        now=_NOW,
+        fee={
+            "status": "fee_charging",
+            "modeled": True,
+            "taker_fee_rate_bps": 400,
+            "taker_fee_units": 19_992,
+        },
+    )
+
+    assert item is not None
+    checks = {row["key"]: row for row in item["qualification"]["checks"]}
+    assert checks["fee_status"]["passed"] is True
+    assert checks["fee_status"]["value"] == "fee_charging"
+    assert checks["fee_status"]["threshold"] == "fee_free"
+    assert item["qualification"]["status"] == "QUALIFIED_VERIFIED"
+    assert item["execution"]["would_submit"] is True
+    assert item["execution"]["order_ready"] is True
+    assert item["execution"]["reason"] == "MANUAL_CANARY"
+
+
+def test_projection_charging_and_modeled_fails_on_profit_not_fee() -> None:
+    """C2 (#117): charging+modeled with post-fee numbers below the minimum
+    profit -> NOT_QUALIFIED; the fee check itself passes (True) and the
+    min_profit check is the failing one."""
+    market = _market(
+        profit_units=500_000,
+        cost_units=99_500_000,
+        payout_units=100_000_000,
+        capital_release_at=_NOW + timedelta(days=20),
+        global_search_closed=True,
+    )
+    item = project_n_leg_solution(
+        market=market,
+        execution=_execution(market),
+        scope=_manual_canary_scope(),
+        max_total_unsettled_capital_units=1000,
+        now=_NOW,
+        fee={
+            "status": "fee_charging",
+            "modeled": True,
+            "taker_fee_rate_bps": 400,
+            "taker_fee_units": 19_992,
+        },
+    )
+
+    assert item is not None
+    checks = {row["key"]: row for row in item["qualification"]["checks"]}
+    assert checks["fee_status"]["passed"] is True
+    assert checks["min_profit"]["passed"] is False
+    assert item["qualification"]["status"] == "NOT_QUALIFIED"
+    assert item["execution"]["would_submit"] is False
+
+
+def test_projection_charging_with_modeled_false_is_fee_unknown() -> None:
+    """C3 (#117): an explicit modeled=False charging block is not provably
+    fee-modeled -> qualification UNKNOWN, never order-ready, reason
+    FEE_UNKNOWN (the modeled-missing variant is locked by
+    test_projection_fee_charging_is_unknown_and_never_order_ready)."""
+    market = _market(
+        profit_units=2_000_000,
+        cost_units=95_000_000,
+        payout_units=100_000_000,
+        capital_release_at=_NOW + timedelta(days=20),
+        global_search_closed=True,
+    )
+    item = project_n_leg_solution(
+        market=market,
+        execution=_execution(market),
+        scope=_manual_canary_scope(),
+        max_total_unsettled_capital_units=1000,
+        now=_NOW,
+        fee={
+            "status": "fee_charging",
+            "modeled": False,
+            "taker_fee_rate_bps": 400,
+            "charging_contracts": ["cond-a"],
+            "unknown_contracts": [],
+        },
+    )
+
+    assert item is not None
+    checks = {row["key"]: row for row in item["qualification"]["checks"]}
+    assert checks["fee_status"]["passed"] is None
+    assert checks["fee_status"]["value"] == "fee_charging"
+    assert checks["fee_status"]["threshold"] == "fee_free"
+    for key in ("min_profit", "net_margin", "annualized_return", "capital_release"):
+        assert checks[key]["passed"] is True, key
+    assert item["qualification"]["status"] == "UNKNOWN"
+    assert item["execution"]["would_submit"] is False
+    assert item["execution"]["order_ready"] is False
+    assert item["execution"]["reason"] == FEE_UNKNOWN
 
 
 def test_projection_without_fee_block_defaults_to_fee_unknown_and_blocks() -> None:
@@ -715,6 +821,11 @@ def test_projection_fee_block_without_status_is_fee_unknown() -> None:
 
 
 def test_projection_fee_charging_is_unknown_and_never_order_ready() -> None:
+    # #117 flip of the #112 gate: a charging block without the modeled
+    # invariant stays qualification UNKNOWN (every other check passes here),
+    # never order-ready -- and the blocked reason is FEE_UNKNOWN now that
+    # the separate charging-unmodeled reason is gone (charging+modeled would
+    # proceed).
     market = _market(
         profit_units=2_000_000,
         cost_units=95_000_000,
@@ -745,7 +856,7 @@ def test_projection_fee_charging_is_unknown_and_never_order_ready() -> None:
     assert item["qualification"]["status"] == "UNKNOWN"
     assert item["execution"]["would_submit"] is False
     assert item["execution"]["order_ready"] is False
-    assert item["execution"]["reason"] == FEE_CHARGING_UNMODELED
+    assert item["execution"]["reason"] == FEE_UNKNOWN
 
 
 def test_projection_fee_unknown_reason_for_unknown_status() -> None:

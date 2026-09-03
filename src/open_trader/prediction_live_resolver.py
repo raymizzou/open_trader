@@ -33,6 +33,7 @@ from open_trader.prediction_market_solution import (
     ExecutionSolution,
     MarketSolution,
     build_solve_request,
+    cost_slices_from_book,
     execution_solution_from_market,
     resolution_from_verification,
 )
@@ -46,6 +47,7 @@ from open_trader.prediction_n_leg import (
     ActionPayout,
     ActionSide,
     ArbitrageProblem,
+    ExecutableCostSlice,
     OracleBudget,
     TerminalAtom,
     canonical_payload,
@@ -160,12 +162,12 @@ def _normalize_atom(atom: TerminalAtom) -> TerminalAtom:
     return replace(atom, payouts=tuple(payouts))
 
 
-# Issue #112: per-contract fee states aggregated from the catalog generation
-# endpoints (state vocabulary lives in prediction_n_leg_read_model, which also
-# owns the fail-closed gate). Anything that is not a proven fee-free market --
-# a charging market, a missing/unparseable fee fact, or conflicting facts for
-# one contract -- fails closed; the fee gate itself lives in the qualification
-# layer, not in the solver cost slice.
+# Issue #112/#117: per-contract fee facts aggregated from the catalog
+# generation endpoints (state vocabulary lives in prediction_n_leg_read_model,
+# which also owns the fail-closed gate). Since #117 the charging-market taker
+# fee is modeled into the solver cost slices; a market whose rate is missing,
+# unparseable, or conflicting for one contract is unmodelable and the whole
+# component is skipped (no snapshot, no solve), exactly like a book miss.
 
 
 def _fee_rate_value(value: object) -> Decimal | None:
@@ -178,33 +180,45 @@ def _fee_rate_value(value: object) -> Decimal | None:
     return rate if rate.is_finite() else None
 
 
-def _endpoint_fee_state(endpoint: object) -> str:
-    """Fee state of one catalog endpoint; unknown unless proven fee-free."""
+def _endpoint_fee_fact(endpoint: object) -> tuple[str, Decimal | None]:
+    """Fee fact (state, rate) of one catalog endpoint.
+
+    ``fees_enabled=True`` is charging only when the rate parses to a finite
+    Decimal: a charging market without a usable rate is unmodelable (#117),
+    not merely charging (#112), because the cost slice needs the number.
+    """
     if not isinstance(endpoint, Mapping):
-        return FEE_STATE_UNKNOWN
+        return (FEE_STATE_UNKNOWN, None)
     fees_enabled = endpoint.get("fees_enabled")
     if fees_enabled is True:
-        return FEE_STATE_CHARGING
+        rate = _fee_rate_value(endpoint.get("fee_rate"))
+        if rate is None:
+            return (FEE_STATE_UNKNOWN, None)
+        return (FEE_STATE_CHARGING, rate)
     if fees_enabled is not False:
-        return FEE_STATE_UNKNOWN
+        return (FEE_STATE_UNKNOWN, None)
     rate_raw = endpoint.get("fee_rate")
     if rate_raw is None:
-        return FEE_STATE_FREE
+        return (FEE_STATE_FREE, Decimal("0"))
     rate = _fee_rate_value(rate_raw)
     if rate is None:
-        return FEE_STATE_UNKNOWN
+        return (FEE_STATE_UNKNOWN, None)
     if rate > 0:
-        return FEE_STATE_CHARGING
+        return (FEE_STATE_CHARGING, rate)
     if rate == 0:
-        return FEE_STATE_FREE
-    return FEE_STATE_UNKNOWN
+        return (FEE_STATE_FREE, Decimal("0"))
+    return (FEE_STATE_UNKNOWN, None)
 
 
-def _fee_state_by_contract(
+def _fee_facts_by_contract(
     rows: Mapping[str, Mapping[str, object]],
-) -> dict[str, str]:
-    """Contract -> fee state over one generation batch, conflicting -> unknown."""
-    states: dict[str, str] = {}
+) -> dict[str, tuple[str, Decimal | None]]:
+    """Contract -> (fee state, rate) over one generation batch.
+
+    Any state OR rate disagreement between endpoints of one contract fails
+    closed to unmodelable.
+    """
+    facts: dict[str, tuple[str, Decimal | None]] = {}
     for row in rows.values():
         endpoints = row.get("endpoints")
         if not isinstance(endpoints, Sequence):
@@ -215,11 +229,11 @@ def _fee_state_by_contract(
             contract_id = str(endpoint.get("contract_id") or "")
             if not contract_id:
                 continue
-            state = _endpoint_fee_state(endpoint)
-            existing = states.setdefault(contract_id, state)
-            if existing != state:
-                states[contract_id] = FEE_STATE_UNKNOWN
-    return states
+            fact = _endpoint_fee_fact(endpoint)
+            existing = facts.setdefault(contract_id, fact)
+            if existing != fact:
+                facts[contract_id] = (FEE_STATE_UNKNOWN, None)
+    return facts
 
 
 # Issue #114: per-contract YES/NO CLOB token maps aggregated from the catalog
@@ -276,37 +290,17 @@ def resolve_leg_token(action: object, leg_token_map: Mapping[str, Mapping[str, o
     return contract_id
 
 
-def _fee_block(
-    selected: SelectedComponent | None,
-    fee_by_contract: Mapping[str, str],
-) -> dict[str, object]:
-    """Per-solution fee summary: the worst state over the component contracts.
-
-    A contract missing from the generation map (or a component with no
-    contracts at all) counts as unknown, never as fee-free.
-    """
-    contracts = sorted(selected.contract_ids) if selected is not None else []
-    charging: list[str] = []
-    unknown: list[str] = []
-    for contract_id in contracts:
-        state = fee_by_contract.get(contract_id, FEE_STATE_UNKNOWN)
-        if state == FEE_STATE_CHARGING:
-            charging.append(contract_id)
-        elif state != FEE_STATE_FREE:
-            unknown.append(contract_id)
-    if unknown:
-        status: str = FEE_STATE_UNKNOWN
-    elif charging:
-        status = FEE_STATE_CHARGING
-    elif contracts:
-        status = FEE_STATE_FREE
-    else:
-        status = FEE_STATE_UNKNOWN
-    return {
-        "status": status,
-        "charging_contracts": charging,
-        "unknown_contracts": unknown,
-    }
+def _covered_cost(slices: tuple[ExecutableCostSlice, ...], lots: int) -> int:
+    """Cost upper bound for the first ``lots`` lots of a slice ladder."""
+    total = 0
+    remaining = lots
+    for slice_ in slices:
+        if remaining <= 0:
+            break
+        take = min(remaining, slice_.last_lot - slice_.first_lot + 1)
+        total += take * slice_.incremental_cost_upper_bound_units
+        remaining -= take
+    return total
 
 
 class _OutcomeTrackingServer:
@@ -436,8 +430,9 @@ class PredictionLiveResolver:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._problem_map: dict[str, ArbitrageProblem] = {}
-        # Issue #112: contract -> fee state from the last reconciled batch.
-        self._fee_by_contract: dict[str, str] = {}
+        # Issue #112/#117: contract -> (fee state, rate) from the last
+        # reconciled batch.
+        self._fee_facts_by_contract: dict[str, tuple[str, Decimal | None]] = {}
         # Issue #114: contract -> {"yes_token_id", "no_token_id"} used to key
         # book reads by action direction (generation rows win over injection).
         self._injected_leg_tokens: dict[str, dict[str, object]] = {
@@ -447,12 +442,17 @@ class PredictionLiveResolver:
         }
         self._leg_tokens: dict[str, dict[str, object]] = {}
         self._selection: dict[str, SelectedComponent] = {}
+        # #117: each stored solution carries the fee block frozen at its
+        # request-build time; solutions() replays it verbatim.
         self._solutions: dict[
-            str, tuple[MarketSolution, ExecutionSolution | None]
+            str,
+            tuple[MarketSolution, ExecutionSolution | None, dict[str, object]],
         ] = {}
         self._resolutions: dict[str, ComponentResolution] = {}
         self._verifications: dict[str, VerificationResult] = {}
-        self._request_components: dict[str, tuple[str, str]] = {}
+        self._request_components: dict[
+            str, tuple[str, str, dict[str, object]]
+        ] = {}
         # #74: synchronous partial-fill proofs, keyed by the stable adversary
         # fingerprint (fixed execution solution + cap config). UNKNOWN results
         # are cached too, so a timed-out snapshot fingerprint is never retried.
@@ -509,7 +509,6 @@ class PredictionLiveResolver:
         with self._lock:
             selection = dict(self._selection)
             solutions = dict(self._solutions)
-            fee_by_contract = dict(self._fee_by_contract)
         ordered = sorted(
             solutions,
             key=lambda component_id: (
@@ -521,6 +520,9 @@ class PredictionLiveResolver:
                 component_id,
             ),
         )
+        # #117: the fee block was frozen when the solve request was built;
+        # replaying it (never recomputing from the current generation) keeps
+        # the block and the solved cost slices consistent across rotations.
         return [
             {
                 "component_id": component_id,
@@ -530,12 +532,10 @@ class PredictionLiveResolver:
                     if execution is not None
                     else None
                 ),
-                "fee": _fee_block(
-                    selection.get(component_id), fee_by_contract
-                ),
+                "fee": dict(fee_block),
             }
             for component_id in ordered
-            for market, execution in (solutions[component_id],)
+            for market, execution, fee_block in (solutions[component_id],)
         ]
 
     def latest_resolution(self, component_id: str) -> ComponentResolution | None:
@@ -627,9 +627,10 @@ class PredictionLiveResolver:
                 component.lineage_id
             )
         self._lineage_by_component = lineage_map
-        # Issue #112: the fee map is built from the same generation batch as
-        # the problem compilation and stored under the solutions lock.
-        fee_by_contract = _fee_state_by_contract(rows)
+        # Issue #112/#117: the fee facts are built from the same generation
+        # batch as the problem compilation and stored under the solutions
+        # lock.
+        fee_facts = _fee_facts_by_contract(rows)
         # Issue #114: the direction token map comes from the same batch; the
         # injected map only fills gaps because generation rows win per key.
         leg_tokens: dict[str, dict[str, object]] = {
@@ -674,7 +675,7 @@ class PredictionLiveResolver:
                         component_id, now=now
                     )
             with self._lock:
-                self._fee_by_contract = fee_by_contract
+                self._fee_facts_by_contract = fee_facts
                 self._leg_tokens = leg_tokens
             self._problem_map = problem_map
             self._selection = kept
@@ -737,6 +738,8 @@ class PredictionLiveResolver:
         if problem is None:
             return None
         leg_tokens = self._leg_tokens
+        with self._lock:
+            fee_facts = dict(self._fee_facts_by_contract)
         legs: list[SnapshotLeg] = []
         for action in problem.actions:
             if action.venue_id != "polymarket":
@@ -746,13 +749,26 @@ class PredictionLiveResolver:
             if book is None:
                 return None
             meta = self._monitor.cross_venue_book_meta(token)
+            # #117: a contract with no fee fact or an unmodelable one skips
+            # the whole component (same path as a book miss); free legs carry
+            # 0 bps and charging legs carry the modeled rate as bps. The fee
+            # facts are keyed by contract id -- NOT by the #114 direction
+            # token the book read resolves to.
+            fact = fee_facts.get(action.market_contract_id)
+            if fact is None or fact[0] == FEE_STATE_UNKNOWN:
+                return None
+            state, rate = fact
+            if state == FEE_STATE_CHARGING:
+                taker_fee_bps = Decimal(rate) * Decimal(10000)
+            else:
+                taker_fee_bps = Decimal("0")
             legs.append(
                 SnapshotLeg(
                     leg_id=action.action_id,
                     book=LegBook(
                         bids=tuple(book.bids),
                         asks=tuple(book.asks),
-                        taker_fee_bps=Decimal("0"),
+                        taker_fee_bps=taker_fee_bps,
                         available=True,
                     ),
                     received_at=book.confirmed_at,
@@ -770,9 +786,9 @@ class PredictionLiveResolver:
         problem = self._problem_map.get(selected.component_id)
         if problem is None:
             raise ValueError(f"no live problem for component {selected.component_id}")
-        # ponytail: fee stays 0 in the cost slice (#117 owns fee-aware
-        # economics); since #112 charging/unknown fees are gated at the
-        # qualification layer, and tick/haircut policy remains #74/#85.
+        # #117: the cost slices carry the modeled taker fee (from the same
+        # fee facts that stamped the snapshot legs); tick/haircut policy
+        # remains #74/#85.
         request = build_solve_request(
             problem,
             snapshot,
@@ -780,12 +796,122 @@ class PredictionLiveResolver:
             limits=self._limits,
             price_units_per_quote_unit=USD_UNITS_PER_DOLLAR,
         )
+        # #117/D3: the whole fee block is frozen at request-build time from
+        # ONE source -- the snapshot-stamped leg books the slices above were
+        # built from -- so a catalog rotation reconciled between snapshot
+        # stamping and request build can never split the block from the
+        # solved economics.
+        fee_block = self._freeze_fee_block(selected, problem, snapshot)
         with self._lock:
             self._request_components[request.request_id] = (
                 selected.component_id,
                 model_fingerprint(problem),
+                fee_block,
             )
         return request
+
+    def _freeze_fee_block(
+        self,
+        selected: SelectedComponent,
+        problem: ArbitrageProblem,
+        snapshot: ComponentSnapshot,
+    ) -> dict[str, object]:
+        """#117/D2+D3: the per-solution fee summary, frozen at request build.
+
+        The whole block derives from ONE source: the snapshot legs the cost
+        slices were built from (D3). A leg stamped with a positive finite
+        bps is a charging contract, a zero bps a free one, and anything else
+        unknown (defensive -- ``_snapshot_for`` already skips unmodelable
+        facts); a selected contract with no stamped leg has no priced slice
+        and stays fail-closed as unknown. ``status`` is the worst state over
+        the component contracts (unknown > charging > free); ``modeled`` is
+        the build invariant -- every dispatched solve prices its fee into
+        the slices, free included; ``taker_fee_rate_bps`` is the maximum leg
+        bps and ``taker_fee_units`` the total taker fee over the selected
+        quantities (D5).
+        """
+        legs = {leg.leg_id: leg for leg in snapshot.legs}
+        charging: set[str] = set()
+        free: set[str] = set()
+        unknown: set[str] = set()
+        for action in problem.actions:
+            contract_id = action.market_contract_id
+            leg = legs.get(action.action_id)
+            bps = leg.book.taker_fee_bps if leg is not None else None
+            if isinstance(bps, Decimal) and bps.is_finite() and bps >= 0:
+                if bps > 0:
+                    charging.add(contract_id)
+                else:
+                    free.add(contract_id)
+            else:
+                unknown.add(contract_id)
+        # a selected contract no action covers has no priced slice: keep it
+        # fail-closed as unknown (the old missing-fact semantics).
+        covered = charging | free | unknown
+        unknown.update(
+            contract_id
+            for contract_id in selected.contract_ids
+            if contract_id not in covered
+        )
+        charging_contracts = sorted(charging)
+        unknown_contracts = sorted(unknown)
+        if unknown_contracts:
+            status: str = FEE_STATE_UNKNOWN
+        elif charging_contracts:
+            status = FEE_STATE_CHARGING
+        elif free:
+            status = FEE_STATE_FREE
+        else:
+            status = FEE_STATE_UNKNOWN
+        return {
+            "status": status,
+            "charging_contracts": charging_contracts,
+            "unknown_contracts": unknown_contracts,
+            "modeled": True,
+            "taker_fee_rate_bps": max(
+                (
+                    int(leg.book.taker_fee_bps)
+                    for leg in snapshot.legs
+                    if isinstance(leg.book.taker_fee_bps, Decimal)
+                    and leg.book.taker_fee_bps > 0
+                ),
+                default=0,
+            ),
+            "taker_fee_units": self._taker_fee_units(selected, problem, snapshot),
+        }
+
+    def _taker_fee_units(
+        self,
+        selected: SelectedComponent,
+        problem: ArbitrageProblem,
+        snapshot: ComponentSnapshot,
+    ) -> int:
+        """#117/D5: total taker fee for the opportunity, in USD units.
+
+        Per leg of the selected quantity: the fee-carrying slice cost minus
+        the fee-free slice cost, summed over legs. Integer math on the same
+        slice accounting as the dispatched request.
+        """
+        legs = {leg.leg_id: leg for leg in snapshot.legs}
+        actions = {action.action_id: action for action in problem.actions}
+        total = 0
+        for quantity in selected.portfolio:
+            action = actions.get(quantity.action_id)
+            leg = legs.get(quantity.action_id)
+            if action is None or leg is None or quantity.quantity_lots <= 0:
+                continue
+            with_fee = cost_slices_from_book(
+                action, leg.book, price_units_per_quote_unit=USD_UNITS_PER_DOLLAR
+            )
+            without_fee = cost_slices_from_book(
+                action,
+                replace(leg.book, taker_fee_bps=Decimal("0")),
+                price_units_per_quote_unit=USD_UNITS_PER_DOLLAR,
+            )
+            total += _covered_cost(with_fee, quantity.quantity_lots) - _covered_cost(
+                without_fee, quantity.quantity_lots
+            )
+        return total
 
     def _handle_outcome(
         self, request: WorkerRequest, outcome: WorkerOutcome | None
@@ -793,7 +919,7 @@ class PredictionLiveResolver:
         entry = self._request_components.pop(request.request_id, None)
         if entry is None:
             return
-        component_id, dispatched_fingerprint = entry
+        component_id, dispatched_fingerprint, fee_block = entry
         problem = request.request.problem
         if (
             outcome is None
@@ -869,7 +995,7 @@ class PredictionLiveResolver:
             return
         execution = self._execution_solution(component_id, market, problem)
         with self._lock:
-            self._solutions[component_id] = (market, execution)
+            self._solutions[component_id] = (market, execution, fee_block)
         self._report_episode_outcome(
             component_id, resolution, verification, execution=execution
         )
