@@ -16919,6 +16919,18 @@ console.log(JSON.stringify({
     assert "下单队列" not in rendered["none"]
 
 
+def test_issue65_empty_queue_line_renders_kong_fallback() -> None:
+    output = run_dashboard_js(r'''
+const payload = {
+  n_leg_metrics: {selection_pending: 0},
+  n_leg_orders: {queue: [], caps: null},
+};
+console.log(JSON.stringify({metrics: predictionNLegMetrics(payload)}));
+''')
+    rendered = json.loads(output)
+    assert "下单队列 0 · 空 · 四上限未确认" in rendered["metrics"]
+
+
 def test_issue64_incident_panel_flips_queue_line_and_cards() -> None:
     output = run_dashboard_js(r'''
 const incident = {
@@ -17035,3 +17047,116 @@ console.log(JSON.stringify({fetchCount, busyDuringSecondCall}));
     rendered = json.loads(output)
     assert rendered["fetchCount"] == 1
     assert rendered["busyDuringSecondCall"] is True
+
+
+def test_issue65_queue_line_renders_report_entry_badge_in_both_states() -> None:
+    output = run_dashboard_js(r'''
+const metrics = {selection_pending: 0};
+const normal = {
+  n_leg_metrics: metrics,
+  n_leg_orders: {
+    queue: [{position: 1, component_id: "component:a:b", state: "PENDING", enqueued_at: "2026-09-04T08:05:00Z"}],
+    caps: {configured: true, acknowledged_version: 3, safety_config_version: 3, values: {}},
+  },
+};
+const incident = {
+  n_leg_metrics: metrics,
+  n_leg_incident: {
+    execution_batch_id: "nleg-b-64a1", reason: "PARTIAL_FILL",
+    happened_at: "2026-09-04T09:41:00Z", paid_cash_units: 8120000, legs: [],
+  },
+  n_leg_orders: {queue: [], caps: null},
+};
+console.log(JSON.stringify({
+  normal: predictionNLegMetrics(normal),
+  incident: predictionNLegMetrics(incident),
+}));
+''')
+    rendered = json.loads(output)
+    # The entry badge rides the TAIL of the queue line in the normal state.
+    assert "下单队列 1" in rendered["normal"]
+    assert rendered["normal"].count('data-action="open-nleg-report"') == 1
+    assert 'data-action="open-nleg-report">执行报告</button></p></section>' in rendered["normal"]
+    # …and in the incident state the same badge replaces the cleared queue.
+    assert "事故处理中（批次 nleg-b-64a1）" in rendered["incident"]
+    assert rendered["incident"].count('data-action="open-nleg-report"') == 1
+    assert 'data-action="open-nleg-report">执行报告</button></p></section>' in rendered["incident"]
+
+
+def test_issue65_report_drawer_renders_fixture_report_facts() -> None:
+    # Fixture follows build_canary_report's schema with the approved
+    # real-link economics: 20 lots x $0.40 per leg, proven guaranteed bound
+    # 3,999,960 units (+$4.00), $16.00 paid, actual profit UNSETTLED.
+    output = run_dashboard_js(r'''
+const report = {
+  schema: "open_trader.prediction_n_leg.canary_report.v1",
+  generated_at: "2026-09-04T08:30:00+00:00",
+  ledger: {total_unsettled_capital_units: 16000040, active_execution_batch_id: "nleg-b-canary-complete-0001", mode: "MANUAL", breaker_open: false},
+  queue: {pending: [], counts: {PENDING: 1, ABANDONED: 1}, requests: [
+    {request_id: "req-1", fifo_index: 1, component_id: "component:alive", state: "PENDING", abandon_reason: null, created_at: "2026-09-04T08:00:00+00:00"},
+    {request_id: "req-2", fifo_index: 2, component_id: "component:gone", state: "ABANDONED", abandon_reason: "UNSETTLED_CAP", created_at: "2026-09-04T08:05:00+00:00"},
+  ]},
+  batches: [
+    {
+      execution_batch_id: "nleg-b-canary-complete-0001",
+      state: "RECONCILED_FULL",
+      trigger_source: "MANUAL_CONFIRM",
+      updated_at: "2026-09-04T08:10:00+00:00",
+      opportunity_episode_id: "episode-9f3ac2d4e5",
+      paid_cash_units: 16000000,
+      paid_fee_units: 0,
+      legs: [
+        {action_id: "action:contract-a:BUY_YES", side: "BUY_YES", submitted_quantity: 20, filled_quantity: 20, paid_cash_units: 8000000, paid_fee_units: 0, state: "FILLED"},
+        {action_id: "action:contract-b:BUY_NO", side: "BUY_NO", submitted_quantity: 20, filled_quantity: 20, paid_cash_units: 8000000, paid_fee_units: 0, state: "FILLED"},
+      ],
+      conservation: {reserved_units: 16000040, position_units: 16000040, equal: true},
+      profit: {guaranteed_profit_units: 3999960, paid_cash_units: 16000000, paid_fee_units: 0, actual_profit: "UNSETTLED"},
+    },
+    {
+      execution_batch_id: "nleg-b-canary-incident-0001",
+      state: "INCIDENT",
+      trigger_source: "MANUAL_CONFIRM",
+      updated_at: "2026-09-04T08:20:00+00:00",
+      opportunity_episode_id: "episode-aa11bb22cc",
+      paid_cash_units: 510,
+      paid_fee_units: 0,
+      legs: [
+        {action_id: "action:contract-a:BUY_YES", side: "BUY_YES", submitted_quantity: 20, filled_quantity: 20, paid_cash_units: 510, paid_fee_units: 0, state: "FILLED"},
+        {action_id: "action:contract-b:BUY_NO", side: "BUY_NO", submitted_quantity: 20, filled_quantity: 0, paid_cash_units: 0, paid_fee_units: 0, state: "REJECTED"},
+      ],
+      conservation: {reserved_units: 510, position_units: 510, equal: true},
+      profit: {guaranteed_profit_units: null, paid_cash_units: 510, paid_fee_units: 0, actual_profit: "UNSETTLED"},
+      incident: {reason: "MIXED_TERMINAL_FILL", execution_batch_id: "nleg-b-canary-incident-0001", happened_at: "2026-09-04T08:19:00+00:00", paid_cash_units: 510, paid_fee_units: 0},
+      repair_authorization: {max_partial_fill_loss_units: 100, max_auto_repair_loss_units: 10, estimate_label: "完整修复终点估算、非最坏界"},
+    },
+  ],
+  audit: {}, proofs: [], episodes: [],
+};
+state.predictionMarket.nlegReport = {open: true, data: report, error: null};
+console.log(JSON.stringify({drawer: nlegReportDrawer()}));
+''')
+    drawer = json.loads(output)["drawer"]
+    # The drawer rides the pm-relation-drawer idiom.
+    assert 'class="pm-relation-drawer pm-n-leg-report-drawer"' in drawer
+    # Three-part profit rows: proven bound, paid cash/fees, actual UNSETTLED.
+    assert "保证利润（冻结已证下界）" in drawer
+    assert "+$4.00" in drawer
+    assert "已付现金 / 费用" in drawer
+    assert "$16.00 / $0.00" in drawer
+    assert "实际利润" in drawer
+    assert "未结算 · 结算后重跑补算" in drawer
+    # Conservation row.
+    assert "资金守恒" in drawer
+    assert "预留 $16.00 = 仓位 $16.00 · 一致" in drawer
+    # Legs table: direction driven by the leg's side.
+    assert "腿 · 方向" in drawer
+    assert "contract-a · 买 YES" in drawer
+    assert "contract-b · 买 NO" in drawer
+    assert "20/20 份" in drawer
+    # Incident section with the mandated repair-estimate label.
+    assert "执行事故 MIXED_TERMINAL_FILL" in drawer
+    assert "完整修复终点估算、非最坏界" in drawer
+    # The ABANDONED queue request renders as a monitoring-only row.
+    assert "已离队 · UNSETTLED_CAP · 仅监控" in drawer
+    # Footer generation time (second-precision, T collapsed).
+    assert "生成时间 2026-09-04 08:30:00" in drawer

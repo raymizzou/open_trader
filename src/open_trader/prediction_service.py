@@ -27,6 +27,7 @@ from .prediction_read_model import (
     prediction_history_payload,
     prediction_state_payload,
 )
+from .prediction_n_leg_canary_report import build_canary_report
 from .prediction_n_leg_confirm import NLegConfirmRejected, confirm_enqueue
 from .prediction_n_leg_mode import NLegVersionConflict
 from .prediction_release import load_prediction_release_manifest
@@ -449,6 +450,7 @@ def create_prediction_server(
                 "/api/prediction-arbitrage/state",
                 "/api/prediction-arbitrage/history",
                 "/api/prediction-arbitrage/n-leg/mode",
+                "/api/prediction-arbitrage/n-leg/report",
             }:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return
@@ -492,6 +494,22 @@ def create_prediction_server(
                     self._send_json(HTTPStatus.OK, execution.n_leg_mode_contract())
                 except ValueError as exc:
                     self._send_error(HTTPStatus.BAD_REQUEST, exc)
+                except (sqlite3.Error, OSError, RuntimeError) as exc:
+                    self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+                return
+            if parsed.path == "/api/prediction-arbitrage/n-leg/report":
+                # Issue #65: read-only canary fact report over the EXISTING
+                # N-leg tables. The builder opens the store file mode=ro and
+                # injects no clock, so generated_at is the real request time.
+                store = getattr(runtime, "store", None)
+                if store is None:
+                    self._send_json(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        {"error": "prediction store is unavailable"},
+                    )
+                    return
+                try:
+                    self._send_json(HTTPStatus.OK, build_canary_report(store))
                 except (sqlite3.Error, OSError, RuntimeError) as exc:
                     self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
                 return

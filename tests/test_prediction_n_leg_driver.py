@@ -24,6 +24,218 @@ from test_prediction_n_leg_confirm import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Issue #65 A2 drills: observation tests over existing behavior, all through
+# the public driver seam with fake clients/fixtures. No behavior change.
+# ---------------------------------------------------------------------------
+
+
+def _active_batch_count(tmp_path: Path) -> int:
+    """Read-only count of batches in an active lifecycle state."""
+    import sqlite3
+
+    from test_prediction_n_leg_confirm import _e2e_db
+
+    with sqlite3.connect(_e2e_db(tmp_path)) as connection:
+        return connection.execute(
+            "SELECT COUNT(*) FROM n_leg_batches"
+            " WHERE state IN ('ACTIVE', 'AWAITING_RECONCILIATION', 'INCIDENT')"
+        ).fetchone()[0]
+
+
+def test_d1_post_submit_crash_real_restart_reconciles_single_batch(
+    tmp_path: Path,
+) -> None:
+    import sqlite3
+
+    from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+    from test_prediction_n_leg_confirm import _e2e_db
+
+    # Legs submitted and filled, receipts folded, reconciliation NOT yet
+    # run (the drill's crash point): the batch is AWAITING_RECONCILIATION.
+    store, row, base_source = _enqueued_e2e_store(tmp_path)
+    filled = {"state": "FILLED", "error_code": None, "cost_units": 400}
+    trading = _FakeTrading([filled, filled])
+    driver = _e2e_driver(store, trading, base_source, recon=False)
+
+    first = driver.tick(now=AS_OF)
+
+    batch_id = str(first["submitted"])
+    assert store.n_leg_batch(batch_id)["state"] == "AWAITING_RECONCILIATION"
+    assert _active_batch_count(tmp_path) == 1
+
+    # TRUE restart: the store holds no open sqlite connection between
+    # actions, so dropping the objects closes every connection; disk
+    # durability is proven by a raw read, then everything is re-constructed
+    # from the SAME database file with zero shared in-memory state.
+    with sqlite3.connect(_e2e_db(tmp_path)) as connection:
+        assert connection.execute(
+            "SELECT state FROM n_leg_batches WHERE execution_batch_id=?",
+            (batch_id,),
+        ).fetchone()[0] == "AWAITING_RECONCILIATION"
+    del store, driver
+
+    store2 = PredictionArbitrageStore(tmp_path / "data")
+
+    # The restarted store sees the batch state (:33 semantics).
+    assert store2.n_leg_batch(batch_id)["state"] == "AWAITING_RECONCILIATION"
+    assert _active_batch_count(tmp_path) == 1
+
+    # Within the window the restarted watch reports the ordinary visible
+    # batch-active skip, still owning exactly one active batch.
+    watch = _e2e_driver(store2, _FakeTrading([]), base_source, recon=False)
+    assert watch.tick(now=AS_OF + timedelta(seconds=30)) == {
+        "skipped": "EXECUTION_BATCH_ACTIVE"
+    }
+    assert _active_batch_count(tmp_path) == 1
+
+    # The production reconciliation factory completes the batch after the
+    # restart: RECONCILED_FULL, ownership released, exactly one batch ever.
+    from open_trader.prediction_n_leg_driver import (
+        trading_reconciliation_context_factory,
+    )
+
+    venue = _VenueAccount(
+        positions=(
+            {"token_id": "action-a", "size": "10"},
+            {"token_id": "action-b", "size": "10"},
+        )
+    )
+    closer = _watch_driver(
+        store2,
+        _FakeTrading([]),
+        base_source,
+        trading_reconciliation_context_factory(store2, venue),
+    )
+    assert closer.tick(now=AS_OF + timedelta(seconds=31)) == {
+        "reconciled": batch_id
+    }
+    assert str(store2.n_leg_batch(batch_id)["state"]).startswith("RECONCILED")
+    assert _active_batch_count(tmp_path) == 0
+    assert store2.n_leg_control()["active_batch_id"] is None
+    assert store2.n_leg_control()["total_unsettled_capital_units"] == 1020
+    stored = next(
+        r
+        for r in store2.n_leg_requests()
+        if r["request_id"] == row["request_id"]
+    )
+    assert stored["state"] == "SUBMITTED"
+
+
+def test_d2_two_component_fifo_head_leaves_and_second_batch_waits_for_gate(
+    tmp_path: Path,
+) -> None:
+    from open_trader.prediction_n_leg_driver import NLegOrderQueueDriver
+    from open_trader.prediction_n_leg_driver import (
+        trading_reconciliation_context_factory,
+    )
+    from test_prediction_n_leg_canary_report import _bound_proof
+    from test_prediction_n_leg_confirm import (
+        COMPONENT_ID,
+        _confirm,
+        _solution_entry,
+    )
+
+    # Two components enqueue cross-component FIFO: the fixture family is the
+    # head, another family waits behind it.
+    store, _row, base_source = _enqueued_e2e_store(tmp_path)
+    entry_b = _solution_entry(component_id="component:other")
+    _confirm(
+        store,
+        [entry_b],
+        component_id="component:other",
+        idempotency_key="d2-b",
+        partial_fill_proof=_bound_proof(store, entry_b, base_source),
+    )
+    pending = [r for r in store.n_leg_requests() if r["state"] == "PENDING"]
+    assert [r["component_id"] for r in pending] == [
+        COMPONENT_ID,
+        "component:other",
+    ]
+
+    def books(cid):
+        # The head component rotated out of qualification: no current plan.
+        return None if cid == COMPONENT_ID else _fixture_books_snapshot(AS_OF)
+
+    untouched = _FakeTrading([])
+    driver = NLegOrderQueueDriver(
+        store,
+        books_provider=books,
+        source_factory=_e2e_source_factory(base_source),
+        trading=untouched,
+    )
+
+    # The invalid head leaves the queue fail-closed with zero side effects.
+    first = driver.tick(now=AS_OF)
+    assert first["abandoned"] == "BOOK_UNAVAILABLE"
+    assert untouched.calls == []
+    remaining = [
+        r["component_id"]
+        for r in store.n_leg_requests()
+        if r["state"] == "PENDING"
+    ]
+    assert remaining == ["component:other"]
+    assert store.n_leg_request_head()["component_id"] == "component:other"
+
+    # A third family enqueues while the execution gate is free.
+    entry_c = _solution_entry(component_id="component:third")
+    _confirm(
+        store,
+        [entry_c],
+        component_id="component:third",
+        idempotency_key="d2-c",
+        partial_fill_proof=_bound_proof(store, entry_c, base_source),
+    )
+
+    # The second family's batch is admitted and submitted; the gate closes.
+    filled = {"state": "FILLED", "error_code": None, "cost_units": 400}
+    trading = _FakeTrading([dict(filled), dict(filled), dict(filled), dict(filled)])
+    driver = NLegOrderQueueDriver(
+        store,
+        books_provider=lambda cid: _fixture_books_snapshot(AS_OF),
+        source_factory=_e2e_source_factory(base_source),
+        trading=trading,
+    )
+    second = driver.tick(now=AS_OF + timedelta(seconds=1))
+    batch_b = str(second["submitted"])
+    assert store.n_leg_batch(batch_b)["state"] == "AWAITING_RECONCILIATION"
+    assert store.n_leg_control()["active_batch_id"] == batch_b
+    assert _active_batch_count(tmp_path) == 1
+
+    # The third family's admission MUST WAIT for the first batch's gate:
+    # a single active execution batch is the whole admission surface.
+    waiting = driver.tick(now=AS_OF + timedelta(seconds=2))
+    assert waiting == {"skipped": "EXECUTION_BATCH_ACTIVE"}
+    assert store.n_leg_control()["active_batch_id"] == batch_b
+    assert _active_batch_count(tmp_path) == 1
+
+    # The gate releases with the reconciliation factory completing batch B.
+    venue = _VenueAccount(
+        positions=(
+            {"token_id": "action-a", "size": "10"},
+            {"token_id": "action-b", "size": "10"},
+        )
+    )
+    closer = _watch_driver(
+        store,
+        _FakeTrading([]),
+        base_source,
+        trading_reconciliation_context_factory(store, venue),
+    )
+    assert closer.tick(now=AS_OF + timedelta(seconds=3)) == {
+        "reconciled": batch_b
+    }
+    assert store.n_leg_control()["active_batch_id"] is None
+
+    # Only now is the next family's batch admitted — at most one active
+    # batch through the whole drill.
+    third = driver.tick(now=AS_OF + timedelta(seconds=4))
+    batch_c = str(third["submitted"])
+    assert batch_c != batch_b
+    assert store.n_leg_control()["active_batch_id"] == batch_c
+    assert _active_batch_count(tmp_path) == 1
+
+
 # P1 (review round 2): without a reconciliation factory the driver must never
 # skip an all-filled batch silently forever — after
 # ``reconciliation_timeout_seconds`` (default 60) the queue row and the tick

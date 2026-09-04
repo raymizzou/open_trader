@@ -6617,3 +6617,24 @@ button { cursor: pointer; }
   color: var(--muted, #8a8177);
   font-size: 12px;
 }
+
+/* #65 execution-report drawer (approved-mock styles) */
+.pm-n-leg-report-entry { margin: 0 0 0 10px; min-height: 0; padding: 2px 10px; font-size: 12px; vertical-align: middle; }
+.pm-n-leg-report-drawer .pm-relation-drawer-body { display: block; }
+.pm-n-leg-report-ledger { display: flex; flex-wrap: wrap; gap: 8px 16px; padding: 10px 2px 12px; border-bottom: 1px solid var(--line); }
+.pm-n-leg-report-ledger span { font-size: 12px; color: #8a7f72; }
+.pm-n-leg-report-ledger strong { color: #3d3226; margin-left: 4px; }
+.pm-n-leg-report-batches { padding: 4px 0; }
+.pm-n-leg-report-batch { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; margin: 12px 0; padding: 12px 14px; }
+.pm-n-leg-report-batch header { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; border-bottom: 1px dashed var(--line); padding-bottom: 8px; margin-bottom: 8px; }
+.pm-n-leg-report-batch header span { font-size: 12px; color: #8a7f72; }
+.pm-n-leg-report-legs { border-collapse: collapse; margin-top: 10px; width: 100%; font-size: 12px; }
+.pm-n-leg-report-legs th, .pm-n-leg-report-legs td { border: 1px solid var(--line); padding: 4px 8px; text-align: left; }
+.pm-n-leg-report-legs th { background: #f3ede5; font-weight: 700; }
+.pm-n-leg-report-incident { border: 1px solid #e4b6b6; background: #fdf3f3; border-radius: 8px; margin-top: 10px; padding: 8px 12px; font-size: 12px; }
+.pm-n-leg-report-repair { color: #7a4b4b; margin-top: 6px; }
+.pm-n-leg-report-queue { border-top: 1px solid var(--line); margin-top: 8px; padding-top: 10px; }
+.pm-n-leg-report-queue h3 { font-size: 13px; margin: 0 0 8px; }
+.pm-n-leg-report-request { font-size: 12px; margin: 4px 0; color: #3d3226; }
+.pm-n-leg-report-footer { border-top: 1px solid var(--line); color: #8a7f72; font-size: 12px; margin-top: 10px; padding-top: 8px; }
+.pm-n-leg-report-error { color: #a33; }

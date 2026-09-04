@@ -2715,9 +2715,9 @@ function predictionNLegMetrics(payload) {
     : "四上限未确认";
   const incident = payload?.n_leg_incident && typeof payload.n_leg_incident === "object" ? payload.n_leg_incident : null;
   const queueLine = incident
-    ? `<p class="pm-n-leg-order-queue">事故处理中（批次 ${escapeHtml(predictionValue(incident.execution_batch_id))}）· 下单队列已清空 · 解除后恢复</p>`
+    ? `<p class="pm-n-leg-order-queue">事故处理中（批次 ${escapeHtml(predictionValue(incident.execution_batch_id))}）· 下单队列已清空 · 解除后恢复 <button type="button" class="pm-relation-badge pm-n-leg-report-entry" data-action="open-nleg-report">执行报告</button></p>`
     : ordersPayload
-    ? `<p class="pm-n-leg-order-queue">下单队列 ${queueRows.length} · ${queueRows.map((row, index) => `#${index + 1} ${row.state === "PENDING" ? "等待发单预检" : escapeHtml(String(row.state))}`).join(" · ")} · ${capsState}</p>`
+    ? `<p class="pm-n-leg-order-queue">下单队列 ${queueRows.length} · ${queueRows.map((row, index) => `#${index + 1} ${row.state === "PENDING" ? "等待发单预检" : escapeHtml(String(row.state))}`).join(" · ") || "空"} · ${capsState} <button type="button" class="pm-relation-badge pm-n-leg-report-entry" data-action="open-nleg-report">执行报告</button></p>`
     : "";
   return `<section class="pm-metrics pm-n-leg-metrics-overview" aria-label="N_LEG 性能指标">${cards}${queueLine}</section>`;
 }
@@ -2768,7 +2768,7 @@ function predictionNLegIncidentPanel(payload) {
 function predictionUnifiedPage(payload, filter) {
   const viewPayload = payload || {status: "loading", events: [], opportunities: []};
   const filterState = state.predictionMarket.filter || {engine: "all", kind: "all", legs: null, scope: null};
-  return `${predictionUnifiedPageHeader(viewPayload)}${predictionModeBar(viewPayload)}${predictionNLegIncidentPanel(viewPayload)}${predictionNLegMetrics(viewPayload)}${predictionReadinessStrip(viewPayload)}${predictionCapitalUsage(viewPayload)}${predictionUnifiedOpportunityList(viewPayload, filterState)}${predictionRelationReview(viewPayload)}${predictionErrorAlert()}${predictionExecutionAlert(viewPayload)}${relationReviewDrawer()}`;
+  return `${predictionUnifiedPageHeader(viewPayload)}${predictionModeBar(viewPayload)}${predictionNLegIncidentPanel(viewPayload)}${predictionNLegMetrics(viewPayload)}${predictionReadinessStrip(viewPayload)}${predictionCapitalUsage(viewPayload)}${predictionUnifiedOpportunityList(viewPayload, filterState)}${predictionRelationReview(viewPayload)}${predictionErrorAlert()}${predictionExecutionAlert(viewPayload)}${relationReviewDrawer()}${nlegReportDrawer()}`;
 }
 
 function predictionAnnualizedPercent(value, digits = 1) {
@@ -4273,6 +4273,76 @@ function relationReviewDrawer() {
   return `<aside class="pm-relation-drawer" aria-label="关系审核" role="dialog" aria-modal="true"><header><div><h2>关系审核</h2><p>只审核系统发现的关系事实；不展示价格、利润或机会排序。</p></div><button type="button" class="pm-relation-close" data-action="close-relation-review" aria-label="关闭关系审核">关闭</button></header><nav class="pm-relation-tabs" aria-label="关系审核视图">${tabs}</nav><div class="pm-relation-drawer-body"><section class="pm-relation-list">${list}</section>${pager}</div></aside>`;
 }
 
+const NLEG_REPORT_RECEIPT_LABELS = { FILLED: "已成交", REJECTED: "全拒（FOK 撤销）", UNKNOWN: "未知回执", UNSUBMITTED: "未提交" };
+const NLEG_REPORT_BATCH_LABELS = { ACTIVE: "执行中", INCIDENT: "事故中" };
+const NLEG_REPORT_REQUEST_LABELS = { PENDING: "等待发单预检", ADMITTED: "已准入", SUBMITTED: "已提交" };
+function nlegReportShortId(value, head = 16, tail = 4) {
+  const text = String(value ?? "");
+  return text.length > head + tail + 1 ? `${text.slice(0, head)}…${text.slice(-tail)}` : text;
+}
+function nlegReportBatchStateLabel(state) {
+  const text = String(state ?? "");
+  if (text.startsWith("RECONCILED")) return `已对账（${text}）`;
+  return NLEG_REPORT_BATCH_LABELS[text] || text;
+}
+function nlegReportTriggerLabel(trigger) {
+  if (trigger === "MANUAL_CONFIRM") return "人工确认";
+  return String(trigger ?? "-");
+}
+function nlegReportDirectionLabel(leg) {
+  const parts = String(leg?.action_id ?? "").split(":");
+  const contract = parts[1] || String(leg?.action_id ?? "-");
+  const tail = parts.slice(2).join(":");
+  const side = String(leg?.side ?? tail ?? "");
+  const direction = side === "BUY_YES" ? "买 YES" : side === "BUY_NO" ? "买 NO" : side === "BUY" ? "买入" : side === "SELL" ? "卖出" : "";
+  return direction ? `${escapeHtml(contract)} · ${escapeHtml(direction)}` : escapeHtml(contract);
+}
+function nlegReportBatchArticle(batch) {
+  const profit = batch?.profit && typeof batch.profit === "object" ? batch.profit : {};
+  const conservation = batch?.conservation && typeof batch.conservation === "object" ? batch.conservation : {};
+  const guaranteed = Number(profit.guaranteed_profit_units);
+  const guaranteedText = Number.isFinite(guaranteed) ? `${guaranteed > 0 ? "+" : ""}${escapeHtml(predictionNLegUnitsMoney(profit.guaranteed_profit_units))}` : "-";
+  const actualText = profit.actual_profit === "UNSETTLED" || profit.actual_profit == null ? "未结算 · 结算后重跑补算" : escapeHtml(predictionNLegUnitsMoney(profit.actual_profit));
+  const conservationText = `预留 ${escapeHtml(predictionNLegUnitsMoney(conservation.reserved_units))} = 仓位 ${escapeHtml(predictionNLegUnitsMoney(conservation.position_units))} · ${conservation.equal === true ? "一致" : "不一致"}`;
+  const legs = Array.isArray(batch?.legs) ? batch.legs : [];
+  const legRows = legs.map((leg) => `<tr><td>${nlegReportDirectionLabel(leg)}</td><td>${Number(leg.filled_quantity)}/${Number(leg.submitted_quantity)} 份</td><td>${escapeHtml(predictionNLegUnitsMoney(leg.paid_cash_units))}</td><td>${escapeHtml(predictionNLegUnitsMoney(leg.paid_fee_units))}</td><td>${escapeHtml(NLEG_REPORT_RECEIPT_LABELS[leg.state] || String(leg.state ?? "-"))}</td></tr>`).join("");
+  const incident = batch?.incident && typeof batch.incident === "object" ? batch.incident : null;
+  const repair = batch?.repair_authorization && typeof batch.repair_authorization === "object" ? batch.repair_authorization : null;
+  const incidentBlock = incident ? `<div class="pm-n-leg-report-incident"><strong>执行事故 ${escapeHtml(predictionValue(incident.reason))}</strong><p>已付现金 ${escapeHtml(predictionNLegUnitsMoney(incident.paid_cash_units))} · 系统外处置后对账解锁</p>${repair ? `<p class="pm-n-leg-report-repair">修复授权基准：部分成交损失上限 ${escapeHtml(predictionNLegUnitsMoney(repair.max_partial_fill_loss_units))} · 自动修复损失上限 ${escapeHtml(predictionNLegUnitsMoney(repair.max_auto_repair_loss_units))} — 上限数字为完整修复终点估算、非最坏界</p>` : ""}</div>` : "";
+  return `<article class="pm-n-leg-report-batch"><header><strong>批次 ${escapeHtml(nlegReportShortId(batch?.execution_batch_id))}</strong><span>${escapeHtml(nlegReportBatchStateLabel(batch?.state))} · ${escapeHtml(String(batch?.updated_at ?? "").slice(0, 16).replace("T", " "))}</span></header><div class="pm-check"><span>保证利润（冻结已证下界）</span><strong>${guaranteedText}</strong></div><div class="pm-check"><span>已付现金 / 费用</span><strong>${escapeHtml(predictionNLegUnitsMoney(batch?.paid_cash_units))} / ${escapeHtml(predictionNLegUnitsMoney(batch?.paid_fee_units))}</strong></div><div class="pm-check"><span>实际利润</span><strong>${actualText}</strong></div><div class="pm-check"><span>资金守恒</span><strong>${conservationText}</strong></div><div class="pm-check"><span>触发来源 / Episode</span><strong>${escapeHtml(nlegReportTriggerLabel(batch?.trigger_source))} · ${escapeHtml(nlegReportShortId(batch?.opportunity_episode_id, 10, 4))}</strong></div>${legRows ? `<table class="pm-n-leg-report-legs"><thead><tr><th>腿 · 方向</th><th>成交/委托</th><th>已付现金</th><th>费用</th><th>回执</th></tr></thead><tbody>${legRows}</tbody></table>` : ""}${incidentBlock}</article>`;
+}
+function nlegReportDrawer() {
+  const reportState = state.predictionMarket?.nlegReport;
+  if (!reportState || reportState.open !== true) return "";
+  const base = `<aside class="pm-relation-drawer pm-n-leg-report-drawer" aria-label="执行报告" role="dialog" aria-modal="true"><header><div><h2>执行报告</h2><p>N_LEG 批次事实 · 只列事实，不含建议 · 实际利润未结算时如实标注</p></div><button type="button" class="pm-relation-close" data-action="close-nleg-report" aria-label="关闭执行报告">关闭</button></header><div class="pm-relation-drawer-body">`;
+  if (reportState.error) return `${base}<p class="pm-n-leg-report-error">执行报告加载失败：${escapeHtml(String(reportState.error))}</p></div></aside>`;
+  const report = reportState.data;
+  if (!report) return `${base}<p class="pm-n-leg-report-loading">正在生成执行报告…</p></div></aside>`;
+  const ledger = report.ledger && typeof report.ledger === "object" ? report.ledger : {};
+  const batches = Array.isArray(report.batches) ? report.batches : [];
+  const requests = report.queue && Array.isArray(report.queue.requests) ? report.queue.requests : [];
+  const requestRows = requests.length ? requests.map((row) => {
+    const stateText = row.state === "ABANDONED" ? `已离队 · ${escapeHtml(predictionValue(row.abandon_reason))} · 仅监控` : escapeHtml(NLEG_REPORT_REQUEST_LABELS[row.state] || String(row.state ?? "-"));
+    return `<p class="pm-n-leg-report-request">#${Number(row.fifo_index)} · ${escapeHtml(String(row.component_id ?? "").replace(/^component:/, ""))} · ${stateText} · ${escapeHtml(String(row.created_at ?? "").slice(0, 16).replace("T", " "))}</p>`;
+  }).join("") : `<p class="pm-n-leg-report-request pm-relation-empty">队内请求为空。</p>`;
+  return `${base}<div class="pm-n-leg-report-ledger"><span>总未结算资本 <strong>${escapeHtml(predictionNLegUnitsMoney(ledger.total_unsettled_capital_units))}</strong></span><span>活跃批次 <strong>${ledger.active_execution_batch_id ? escapeHtml(nlegReportShortId(ledger.active_execution_batch_id)) : "无"}</strong></span><span>模式 <strong>${escapeHtml(predictionValue(ledger.mode))}</strong></span><span>熔断 <strong>${ledger.breaker_open === true ? "开" : "关"}</strong></span></div><section class="pm-n-leg-report-batches">${batches.length ? batches.map(nlegReportBatchArticle).join("") : `<p class="pm-relation-empty">尚无批次。首笔真实订单确认后，这里逐批列出事实。</p>`}</section><section class="pm-n-leg-report-queue"><h3>队内请求</h3>${requestRows}</section><footer class="pm-n-leg-report-footer">只读事实快照 · 生成时间 ${escapeHtml(String(report.generated_at ?? "").slice(0, 19).replace("T", " "))} · CLI 导出 reports/n_leg_canary/</footer></div></aside>`;
+}
+async function loadNLegReport() {
+  if (!state.predictionMarket.nlegReport) state.predictionMarket.nlegReport = { open: false, data: null, error: null };
+  state.predictionMarket.nlegReport.open = true;
+  state.predictionMarket.nlegReport.data = null;
+  state.predictionMarket.nlegReport.error = null;
+  renderPredictionMarket();
+  try {
+    const response = await fetch(predictionRequestUrl("/api/prediction-arbitrage/n-leg/report"), { cache: "no-store", credentials: "same-origin" });
+    if (!response.ok) throw new Error(`执行报告 ${response.status}`);
+    state.predictionMarket.nlegReport.data = await response.json();
+  } catch (error) {
+    state.predictionMarket.nlegReport.error = String(error?.message || error);
+  }
+  renderPredictionMarket();
+}
+
 async function loadRelationReview(view = state.predictionMarket.relationReview.view, offset = 0) {
   const review = state.predictionMarket.relationReview;
   const fetchPage = async (pageOffset) => {
@@ -4345,6 +4415,8 @@ async function handlePredictionMarketClick(event) {
   }
   if (event.target.closest("[data-action='open-relation-review']")) { state.predictionMarket.relationReview.open = true; await loadRelationReview("pending_approval", 0); return; }
   if (event.target.closest("[data-action='close-relation-review']")) { state.predictionMarket.relationReview.open = false; state.predictionMarket.relationReview.detail = null; renderPredictionMarket(); return; }
+  if (event.target.closest("[data-action='open-nleg-report']")) { await loadNLegReport(); return; }
+  if (event.target.closest("[data-action='close-nleg-report']")) { state.predictionMarket.nlegReport = { open: false, data: null, error: null }; renderPredictionMarket(); return; }
   const openRelationView = event.target.closest("[data-open-relation-view]");
   if (openRelationView) { state.predictionMarket.relationReview.open = true; await loadRelationReview(openRelationView.dataset.openRelationView || "pending_approval", 0); return; }
   const relationView = event.target.closest("[data-relation-view]");

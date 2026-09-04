@@ -339,6 +339,27 @@ def test_t4_would_submit_accumulates_on_transitions_and_close() -> None:
     assert closed.would_submit_ready_since is None
 
 
+def test_t2b_negative_close_exact_boundary_299_ongoing_300_closed() -> None:
+    # The exact 4:59/5:00 boundary pair (issue #65 D4): t2 exercises 240s and
+    # 300s after the window starts, never the one-second-short edge itself.
+    instance = EpisodeTracker()
+    qualified(instance, "component:x:y", BASE, "12.40")
+    window_start = BASE + timedelta(seconds=60)
+    negative(instance, "component:x:y", window_start)
+
+    negative(
+        instance, "component:x:y", window_start + timedelta(seconds=299)
+    )
+    assert instance.episode("component:x:y").status == "ONGOING"
+
+    close_at = window_start + timedelta(seconds=300)
+    negative(instance, "component:x:y", close_at)
+    closed = instance.episode("component:x:y")
+    assert closed.status == "CLOSED"
+    assert closed.close_reason == CLOSE_NO_QUALIFIED_OPPORTUNITY
+    assert closed.closed_at == close_at
+
+
 def test_t3_unknown_resets_the_negative_close_timer() -> None:
     instance = EpisodeTracker()
     qualified(instance, "component:x:y", BASE, "12.40")
