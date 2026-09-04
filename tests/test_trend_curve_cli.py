@@ -66,6 +66,25 @@ def _write_cli_inputs(database: Path, prices: Path) -> None:
         )
 
 
+def _write_portfolio_cli_inputs(
+    database: Path,
+    prices_dir: Path,
+    portfolio: Path,
+    exclusions: Path,
+) -> None:
+    prices_dir.mkdir()
+    _write_cli_inputs(database, prices_dir / "TEST.csv")
+    portfolio.write_text(
+        "market,asset_class,symbol,analysis_symbol,name,market_value_hkd,ai_eligible\n"
+        "US,stock,TEST,TEST,测试标的,100,true\n"
+        "US,stock,SKIP,SKIP,排除标的,100,true\n",
+        encoding="utf-8",
+    )
+    exclusions.write_text(
+        json.dumps({"US.SKIP": "configured exclusion"}), encoding="utf-8"
+    )
+
+
 def test_trend_curve_cli_exposes_collect_only() -> None:
     parser = build_parser()
     collect_args = parser.parse_args(
@@ -568,4 +587,99 @@ def test_trend_curve_backtest_cli_emits_versioned_json(
         "commission_bps": "10",
         "slippage_bps": "5",
         "sections_present": True,
+    }
+
+
+def test_trend_curve_portfolio_backtest_cli_emits_one_versioned_json_document(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "history.sqlite3"
+    prices_dir = tmp_path / "prices"
+    portfolio = tmp_path / "portfolio.csv"
+    exclusions = tmp_path / "exclusions.json"
+    _write_portfolio_cli_inputs(database, prices_dir, portfolio, exclusions)
+    before_files = {
+        path.relative_to(tmp_path)
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+
+    exit_code = cli.main(
+        [
+            "trend-curve",
+            "portfolio-backtest",
+            "--database",
+            str(database),
+            "--prices-dir",
+            str(prices_dir),
+            "--portfolio",
+            str(portfolio),
+            "--exclusions",
+            str(exclusions),
+            "--start-date",
+            "2026-01-01",
+            "--end-date",
+            "2026-01-02",
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    after_files = {
+        path.relative_to(tmp_path)
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+    per_symbol = payload["per_symbol"]
+    fixed_sections = (
+        "schema",
+        "strategy_id",
+        "requested_range",
+        "assumptions",
+        "preflight",
+        "weights",
+        "strategy",
+        "buy_and_hold",
+        "per_symbol",
+        "source_hashes",
+    )
+
+    assert {
+        "exit_code": exit_code,
+        "stderr": captured.err,
+        "stdout_line_count": len(captured.out.strip().splitlines()),
+        "schema": payload["schema"],
+        "strategy_id": payload["strategy_id"],
+        "requested_range": payload["requested_range"],
+        "initial_cash": payload["assumptions"]["initial_cash"],
+        "caveats": payload["caveats"],
+        "symbol": per_symbol[0]["symbol"],
+        "name_zh": per_symbol[0]["name_zh"],
+        "source_hashes": payload["source_hashes"],
+        "sections_present": all(key in payload for key in fixed_sections),
+        "files_unchanged": after_files == before_files,
+    } == {
+        "exit_code": 0,
+        "stderr": "",
+        "stdout_line_count": 1,
+        "schema": "open_trader.trend_curve_portfolio_backtest.v1",
+        "strategy_id": "trend_curve_warm_to_hot_flat_exit/US/v1",
+        "requested_range": {"start": "2026-01-01", "end": "2026-01-02"},
+        "initial_cash": "1000000",
+        "caveats": [
+            "Current holdings and weights are applied retrospectively, so results include survivorship and lookahead bias and do not reconstruct the historical account."
+        ],
+        "symbol": "TEST",
+        "name_zh": "测试标的",
+        "source_hashes": {
+            "portfolio_csv": hashlib.sha256(portfolio.read_bytes()).hexdigest(),
+            "exclusions_json": hashlib.sha256(exclusions.read_bytes()).hexdigest(),
+            "trend_curve_database": hashlib.sha256(database.read_bytes()).hexdigest(),
+            "ohlc_csvs": {
+                "TEST": hashlib.sha256(
+                    (prices_dir / "TEST.csv").read_bytes()
+                ).hexdigest()
+            },
+        },
+        "sections_present": True,
+        "files_unchanged": True,
     }

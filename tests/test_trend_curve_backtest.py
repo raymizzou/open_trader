@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
 import sqlite3
+from datetime import date, timedelta
 from decimal import Decimal, ROUND_DOWN, ROUND_UP, localcontext
 from pathlib import Path
 
 import pytest
 
-from open_trader.trend_curve_backtest import run_trend_curve_backtest
+from open_trader.trend_curve_backtest import (
+    run_trend_curve_backtest,
+    run_trend_curve_portfolio_backtest,
+)
 
 
 def _write_curve_database(path: Path, temperatures: list[tuple[str, str]]) -> None:
@@ -70,6 +76,330 @@ def _write_ohlc(path: Path) -> None:
         writer = csv.DictWriter(handle, fieldnames=("date", "open", "high", "low", "close"))
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _write_portfolio_curve_database(
+    path: Path, rows: list[tuple[str, str, str]]
+) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE trend_curve_points (
+                market TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                curve_date TEXT NOT NULL,
+                price TEXT NOT NULL,
+                temperature TEXT NOT NULL,
+                strength TEXT NOT NULL,
+                mom TEXT,
+                yoy TEXT,
+                bar TEXT,
+                asset_id INTEGER NOT NULL,
+                group_id INTEGER NOT NULL,
+                tm_id INTEGER NOT NULL,
+                ccy_id INTEGER NOT NULL,
+                PRIMARY KEY (market, symbol, curve_date)
+            )
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO trend_curve_points
+            (market, symbol, curve_date, price, temperature, strength,
+             mom, yoy, bar, asset_id, group_id, tm_id, ccy_id)
+            VALUES ('US', ?, ?, '10', ?, '80', NULL, NULL, NULL,
+                    1, 2, 3, 4)
+            """,
+            rows,
+        )
+
+
+def _write_portfolio_ohlc(
+    path: Path, symbol: str, dates: list[str]
+) -> None:
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle, fieldnames=("date", "open", "high", "low", "close")
+        )
+        writer.writeheader()
+        for trading_date in ["2024-12-31", *dates, "2026-01-02"]:
+            if symbol == "B" and trading_date == "2025-01-04":
+                continue
+            if symbol == "A":
+                values = {
+                    "2024-12-31": ("100", "100"),
+                    "2025-01-04": ("3", "4"),
+                    "2025-01-05": ("3.4", "3.4"),
+                    "2025-01-06": ("3.4", "3"),
+                    "2026-01-02": ("1", "1"),
+                }.get(trading_date, ("3", "3"))
+            else:
+                values = {
+                    "2024-12-31": ("20", "20"),
+                    "2026-01-02": ("5", "5"),
+                }.get(trading_date, ("10", "10"))
+            opening, closing = values
+            writer.writerow(
+                {
+                    "date": trading_date,
+                    "open": opening,
+                    "high": max(opening, closing),
+                    "low": min(opening, closing),
+                    "close": closing,
+                }
+            )
+
+
+def test_portfolio_backtest_preflights_boundaries_renormalizes_fixed_sleeves_and_reports_metrics(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "history.sqlite3"
+    prices_dir = tmp_path / "prices"
+    prices_dir.mkdir()
+    portfolio = tmp_path / "portfolio.csv"
+    exclusions = tmp_path / "exclusions.json"
+    portfolio.write_text(
+        "market,asset_class,symbol,analysis_symbol,name,market_value_hkd,ai_eligible\n"
+        "US,stock,A,A,甲,60,true\n"
+        "US,stock,B,B,乙,40,true\n"
+        "US,stock,C,C,丙,100,true\n"
+        "US,stock,D,D,丁,200,true\n",
+        encoding="utf-8",
+    )
+    exclusions.write_text(
+        json.dumps({"US.D": "configured exclusion"}), encoding="utf-8"
+    )
+    dates = [
+        (date(2025, 1, 1) + timedelta(days=offset)).isoformat()
+        for offset in range(366)
+    ]
+    _write_portfolio_curve_database(
+        database,
+        [
+            ("A", "2025-01-01", "温"),
+            ("A", "2025-01-03", "热"),
+            ("A", "2025-01-05", "平"),
+            ("A", "2026-01-01", "平"),
+            ("B", "2025-01-01", "平"),
+            ("B", "2026-01-01", "平"),
+            ("C", "2025-01-01", "平"),
+        ],
+    )
+    _write_portfolio_ohlc(prices_dir / "A.csv", "A", dates)
+    _write_portfolio_ohlc(prices_dir / "B.csv", "B", dates)
+    _write_portfolio_ohlc(prices_dir / "C.csv", "C", dates)
+
+    result = run_trend_curve_portfolio_backtest(
+        database=database,
+        prices_dir=prices_dir,
+        portfolio=portfolio,
+        exclusions=exclusions,
+        start_date="2025-01-01",
+        end_date="2026-01-01",
+        initial_cash=Decimal("100"),
+        commission_bps=Decimal("0"),
+        slippage_bps=Decimal("0"),
+    )
+
+    included = {row["symbol"]: row for row in result["preflight"]["included"]}
+    excluded = {row["symbol"]: row for row in result["preflight"]["excluded"]}
+    per_symbol = {row["symbol"]: row for row in result["per_symbol"]}
+    strategy_metrics = result["strategy"]["metrics"]
+    buy_and_hold_metrics = result["buy_and_hold"]["metrics"]
+    assert {
+        "included": [(symbol, included[symbol]["name_zh"]) for symbol in sorted(included)],
+        "excluded": {
+            symbol: (row["name_zh"], row["reason"])
+            for symbol, row in sorted(excluded.items())
+        },
+        "weights": result["weights"],
+        "allocated_cash": {
+            symbol: row["allocated_cash"] for symbol, row in per_symbol.items()
+        },
+        "strategy_equity_at_b_gap": [
+            (row["date"], row["equity"])
+            for row in result["strategy"]["equity_curve"]
+            if row["date"] == "2025-01-04"
+        ],
+        "a_trades": [
+            (trade["action"], trade["date"])
+            for trade in per_symbol["A"]["result"]["trades"]
+        ],
+        "strategy_metrics": {
+            key: strategy_metrics[key]
+            for key in (
+                "final_equity",
+                "total_return_pct",
+                "annualized_return_pct",
+                "max_drawdown_pct",
+                "sharpe_ratio",
+                "calmar_ratio",
+                "completed_round_count",
+                "win_rate",
+                "payoff_ratio_status",
+            )
+        },
+        "buy_and_hold_metrics": {
+            key: buy_and_hold_metrics[key]
+            for key in (
+                "final_equity",
+                "total_return_pct",
+                "annualized_return_pct",
+                "max_drawdown_pct",
+                "sharpe_ratio",
+                "calmar_ratio",
+            )
+        },
+        "source_hashes": result["source_hashes"],
+    } == {
+        "included": [("A", "甲"), ("B", "乙")],
+        "excluded": {
+            "C": ("丙", "missing_trend_curve_end"),
+            "D": ("丁", "configured exclusion"),
+        },
+        "weights": {"A": "0.6", "B": "0.4"},
+        "allocated_cash": {"A": "60", "B": "40"},
+        "strategy_equity_at_b_gap": [("2025-01-04", "120")],
+        "a_trades": [("BUY", "2025-01-04"), ("EXIT", "2025-01-06")],
+        "strategy_metrics": {
+            "final_equity": "108",
+            "total_return_pct": "8",
+            "annualized_return_pct": "8",
+            "max_drawdown_pct": "10",
+                "sharpe_ratio": "0.3716959708375140636603190558",
+            "calmar_ratio": "0.8",
+            "completed_round_count": 1,
+            "win_rate": "1",
+            "payoff_ratio_status": "no_losses",
+        },
+        "buy_and_hold_metrics": {
+            "final_equity": "100",
+            "total_return_pct": "0",
+            "annualized_return_pct": "0",
+            "max_drawdown_pct": "16.66666666666666666666666667",
+            "sharpe_ratio": "0.09145339284257147718054561494",
+            "calmar_ratio": "0",
+        },
+        "source_hashes": {
+            "portfolio_csv": hashlib.sha256(portfolio.read_bytes()).hexdigest(),
+            "exclusions_json": hashlib.sha256(exclusions.read_bytes()).hexdigest(),
+            "trend_curve_database": hashlib.sha256(database.read_bytes()).hexdigest(),
+            "ohlc_csvs": {
+                symbol: hashlib.sha256(
+                    (prices_dir / f"{symbol}.csv").read_bytes()
+                ).hexdigest()
+                for symbol in ("A", "B")
+            },
+        },
+    }
+
+
+def test_portfolio_backtest_ignores_pre_start_curve_state_and_defaults_cash(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "history.sqlite3"
+    prices_dir = tmp_path / "prices"
+    prices_dir.mkdir()
+    portfolio = tmp_path / "portfolio.csv"
+    exclusions = tmp_path / "exclusions.json"
+    portfolio.write_text(
+        "market,asset_class,symbol,analysis_symbol,name,market_value_hkd,ai_eligible\n"
+        "US,stock,A,A,甲,100,true\n",
+        encoding="utf-8",
+    )
+    exclusions.write_text("{}", encoding="utf-8")
+    _write_portfolio_curve_database(
+        database,
+        [
+            ("A", "2025-12-31", "温"),
+            ("A", "2026-01-01", "热"),
+            ("A", "2026-01-02", "热"),
+        ],
+    )
+    _write_portfolio_ohlc(
+        prices_dir / "A.csv", "A", ["2026-01-01", "2026-01-02"]
+    )
+
+    result = run_trend_curve_portfolio_backtest(
+        database=database,
+        prices_dir=prices_dir,
+        portfolio=portfolio,
+        exclusions=exclusions,
+        start_date="2026-01-01",
+        end_date="2026-01-02",
+        commission_bps=Decimal("0"),
+        slippage_bps=Decimal("0"),
+    )
+
+    assert {
+        "trades": result["strategy"]["trades"],
+        "completed_rounds": result["strategy"]["completed_rounds"],
+        "final_equity": result["strategy"]["metrics"]["final_equity"],
+        "initial_cash": result["assumptions"]["initial_cash"],
+    } == {
+        "trades": [],
+        "completed_rounds": [],
+        "final_equity": "1000000",
+        "initial_cash": "1000000",
+    }
+
+
+def test_portfolio_buy_and_hold_drawdown_starts_from_initial_cash(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "history.sqlite3"
+    prices_dir = tmp_path / "prices"
+    prices_dir.mkdir()
+    portfolio = tmp_path / "portfolio.csv"
+    exclusions = tmp_path / "exclusions.json"
+    portfolio.write_text(
+        "market,asset_class,symbol,analysis_symbol,name,market_value_hkd,ai_eligible\n"
+        "US,stock,A,A,甲,100,true\n",
+        encoding="utf-8",
+    )
+    exclusions.write_text("{}", encoding="utf-8")
+    _write_portfolio_curve_database(
+        database, [("A", "2026-01-01", "平")]
+    )
+    with (prices_dir / "A.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle, fieldnames=("date", "open", "high", "low", "close")
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "date": "2026-01-01",
+                "open": "100",
+                "high": "100",
+                "low": "100",
+                "close": "100",
+            }
+        )
+
+    result = run_trend_curve_portfolio_backtest(
+        database=database,
+        prices_dir=prices_dir,
+        portfolio=portfolio,
+        exclusions=exclusions,
+        start_date="2026-01-01",
+        end_date="2026-01-01",
+        initial_cash=Decimal("1000"),
+        commission_bps=Decimal("10"),
+        slippage_bps=Decimal("5"),
+    )
+    metrics = result["buy_and_hold"]["metrics"]
+
+    assert {
+        "final_equity": metrics["final_equity"],
+        "total_return_pct": metrics["total_return_pct"],
+        "max_drawdown_pct": metrics["max_drawdown_pct"],
+        "calmar_ratio": metrics["calmar_ratio"],
+    } == {
+        "final_equity": "997.3",
+        "total_return_pct": "-0.27",
+        "max_drawdown_pct": "0.27",
+        "calmar_ratio": "-1",
+    }
 
 
 def test_backtest_strict_warm_to_hot_rounds_use_next_open_and_trend_metric_semantics(

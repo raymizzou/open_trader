@@ -549,6 +549,23 @@ It buys only on exact `温→热`, exits on `温/热/沸→平`, executes at the
 OHLC open, closes an open position at the final close, and emits one versioned
 JSON document without network access or result-database writes.
 
+Run the fixed-sleeve portfolio backtest with supplied holdings, exclusions, and
+one OHLC CSV per eligible US symbol:
+
+```bash
+.venv/bin/python -m open_trader trend-curve portfolio-backtest \
+  --database data/trend_curve/history.sqlite3 \
+  --prices-dir data/prices/US \
+  --portfolio data/latest/portfolio.csv \
+  --exclusions config/trend_curve_portfolio_exclusions.json \
+  --start-date 2026-01-01 --end-date 2026-09-03 \
+  --initial-cash 100000
+```
+
+The command renormalizes positive market-value weights after deterministic
+preflight exclusions, keeps independent whole-share sleeves fixed, and emits
+one versioned JSON document without writing a result file.
+
 These standard-strategy results are research-only. Custom strategy editing and
 automatic execution are explicitly out of scope; the dashboard does not place
 orders.

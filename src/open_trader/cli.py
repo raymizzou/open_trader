@@ -155,7 +155,10 @@ from .trend_curve_research import (
     collect_trend_curves,
     reconcile_trend_curves,
 )
-from .trend_curve_backtest import run_trend_curve_backtest
+from .trend_curve_backtest import (
+    run_trend_curve_backtest,
+    run_trend_curve_portfolio_backtest,
+)
 from .strategy_drawdown import manual_unlock_strategy_drawdown
 from .drawdown_preflight import (
     DrawdownMarketInput,
@@ -573,6 +576,34 @@ def build_parser() -> argparse.ArgumentParser:
         "--commission-bps", type=non_negative_decimal, default=Decimal("10")
     )
     trend_curve_backtest_parser.add_argument(
+        "--slippage-bps", type=non_negative_decimal, default=Decimal("5")
+    )
+    trend_curve_portfolio_parser = trend_curve_commands.add_parser(
+        "portfolio-backtest", help="Backtest an offline US trend-curve portfolio"
+    )
+    trend_curve_portfolio_parser.add_argument("--database", type=Path, required=True)
+    trend_curve_portfolio_parser.add_argument(
+        "--prices-dir", type=Path, required=True
+    )
+    trend_curve_portfolio_parser.add_argument(
+        "--portfolio", type=Path, required=True
+    )
+    trend_curve_portfolio_parser.add_argument(
+        "--exclusions", type=Path, required=True
+    )
+    trend_curve_portfolio_parser.add_argument(
+        "--start-date", "--start", dest="start_date", type=canonical_date, required=True
+    )
+    trend_curve_portfolio_parser.add_argument(
+        "--end-date", "--end", dest="end_date", type=canonical_date, required=True
+    )
+    trend_curve_portfolio_parser.add_argument(
+        "--initial-cash", type=positive_decimal, default=Decimal("1000000")
+    )
+    trend_curve_portfolio_parser.add_argument(
+        "--commission-bps", type=non_negative_decimal, default=Decimal("10")
+    )
+    trend_curve_portfolio_parser.add_argument(
         "--slippage-bps", type=non_negative_decimal, default=Decimal("5")
     )
 
@@ -2410,6 +2441,23 @@ def main(argv: list[str] | None = None) -> int:
                     ohlc_csv=args.prices,
                     market=args.market,
                     symbol=args.symbol,
+                    start_date=args.start_date,
+                    end_date=args.end_date,
+                    initial_cash=args.initial_cash,
+                    commission_bps=args.commission_bps,
+                    slippage_bps=args.slippage_bps,
+                )
+            except (FileNotFoundError, OSError, ValueError, RuntimeError) as exc:
+                parser.error(str(exc))
+            print(json.dumps(result, ensure_ascii=False))
+            return 0
+        if args.trend_curve_command == "portfolio-backtest":
+            try:
+                result = run_trend_curve_portfolio_backtest(
+                    database=args.database,
+                    prices_dir=args.prices_dir,
+                    portfolio=args.portfolio,
+                    exclusions=args.exclusions,
                     start_date=args.start_date,
                     end_date=args.end_date,
                     initial_cash=args.initial_cash,
