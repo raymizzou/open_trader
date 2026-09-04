@@ -150,7 +150,11 @@ from .trend_allocation import (
     load_trend_allocation_status,
     run_trend_allocation_controller,
 )
-from .trend_curve_research import collect_trend_curves
+from .trend_curve_research import (
+    TrendCurveReconciliationError,
+    collect_trend_curves,
+    reconcile_trend_curves,
+)
 from .trend_curve_backtest import run_trend_curve_backtest
 from .strategy_drawdown import manual_unlock_strategy_drawdown
 from .drawdown_preflight import (
@@ -541,6 +545,9 @@ def build_parser() -> argparse.ArgumentParser:
     trend_curve_collect_parser.add_argument("--mmkv-path", type=Path)
     trend_curve_collect_parser.add_argument("--mmkv-helper", type=Path)
     trend_curve_collect_parser.add_argument("--notify-failure", action="store_true")
+    trend_curve_collect_parser.add_argument(
+        "--reconcile-and-notify", action="store_true"
+    )
     trend_curve_collect_parser.add_argument(
         "--config", type=Path, default=Path("config/daily_premarket.env")
     )
@@ -2291,6 +2298,31 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "trend-curve":
         if args.trend_curve_command == "collect":
+            reconcile_config = None
+            reconcile_notifier = None
+            if args.reconcile_and_notify:
+                try:
+                    reconcile_config = load_env_config(args.config, dry_run=False)
+                    if not reconcile_config.trend_animals_api_key.strip():
+                        raise ValueError("TREND_ANIMALS_API_KEY is required")
+                    channels = {"feishu", "feishu_app"} & set(
+                        reconcile_config.notifiers
+                    )
+                    if not channels:
+                        raise ValueError(
+                            "--reconcile-and-notify requires a configured Feishu channel"
+                        )
+                    filtered_config = replace(
+                        reconcile_config,
+                        notifiers=tuple(
+                            name
+                            for name in reconcile_config.notifiers
+                            if name in channels
+                        ),
+                    )
+                    reconcile_notifier = build_notifier(filtered_config)
+                except (FileNotFoundError, OSError, ValueError, RuntimeError) as exc:
+                    parser.error(str(exc))
             try:
                 result = collect_trend_curves(
                     watchlist=args.watchlist,
@@ -2300,23 +2332,58 @@ def main(argv: list[str] | None = None) -> int:
                     mmkv_path=args.mmkv_path,
                     mmkv_helper=args.mmkv_helper,
                 )
+                if args.reconcile_and_notify:
+                    assert reconcile_config is not None
+                    assert reconcile_notifier is not None
+                    title, message = reconcile_trend_curves(
+                        result.database_path,
+                        result.targets,
+                        api_key=reconcile_config.trend_animals_api_key,
+                    )
+                    attempts = send_notification_with_results(
+                        reconcile_notifier,
+                        title,
+                        message,
+                        channels={"feishu", "feishu_app"},
+                    )
+                    for attempt in attempts:
+                        if not attempt.success:
+                            print(
+                                f"趋势曲线对账通知失败：{attempt.channel} "
+                                f"{attempt.error_type}: {attempt.error}",
+                                file=sys.stderr,
+                            )
+                    if any(not attempt.success for attempt in attempts):
+                        return 1
             except (FileNotFoundError, OSError, ValueError, RuntimeError) as exc:
-                if args.notify_failure:
+                if args.notify_failure or args.reconcile_and_notify:
                     try:
-                        config = load_env_config(args.config, dry_run=False)
-                        channels = {"feishu", "feishu_app"}
-                        filtered_config = replace(
-                            config,
-                            notifiers=tuple(
-                                name
-                                for name in config.notifiers
-                                if name in channels
-                            ),
-                        )
+                        if reconcile_notifier is None:
+                            config = load_env_config(args.config, dry_run=False)
+                            channels = {"feishu", "feishu_app"}
+                            filtered_config = replace(
+                                config,
+                                notifiers=tuple(
+                                    name
+                                    for name in config.notifiers
+                                    if name in channels
+                                ),
+                            )
+                            reconcile_notifier = build_notifier(filtered_config)
+                        else:
+                            channels = {"feishu", "feishu_app"}
                         attempts = send_notification_with_results(
-                            build_notifier(filtered_config),
-                            "趋势曲线采集失败",
-                            f"trend-curve collect 失败：{exc}",
+                            reconcile_notifier,
+                            (
+                                "趋势曲线采集对账异常"
+                                if args.reconcile_and_notify
+                                else "趋势曲线采集失败"
+                            ),
+                            (
+                                str(exc)
+                                if isinstance(exc, TrendCurveReconciliationError)
+                                else f"trend-curve collect 失败：{exc}"
+                            ),
                             channels=channels,
                         )
                         for attempt in attempts:

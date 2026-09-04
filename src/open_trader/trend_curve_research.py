@@ -19,6 +19,7 @@ from typing import Callable, Mapping, NamedTuple, Sequence
 from zoneinfo import ZoneInfo
 
 from .futu_symbols import from_trend_animals_symbol, to_futu_symbol
+from .trend_animals import TrendAnimalsClient
 
 
 MINI_PROGRAM_APP_ID = "wx64e4edbab5e14356"
@@ -59,11 +60,16 @@ class WechatMiniCredentials(NamedTuple):
     user_id: int | str
 
 
+class TrendCurveReconciliationError(ValueError):
+    pass
+
+
 @dataclass(frozen=True)
 class CollectionResult:
     database_path: Path
     target_count: int
     point_count: int
+    targets: tuple[dict[str, object], ...] = ()
 
 
 def read_wechat_mini_credentials(
@@ -274,7 +280,182 @@ def collect_trend_curves(
         raise
     except (OSError, sqlite3.Error) as exc:
         raise ValueError("趋势曲线数据库写入失败") from exc
-    return CollectionResult(target_database, len(targets), point_count)
+    return CollectionResult(
+        target_database,
+        len(targets),
+        point_count,
+        tuple(dict(target) for target in targets),
+    )
+
+
+def reconcile_trend_curves(
+    database: Path | str,
+    targets: Sequence[Mapping[str, object]],
+    *,
+    api_key: str,
+) -> tuple[str, str]:
+    local_rows: list[dict[str, object]] = []
+    with sqlite3.connect(Path(database).expanduser()) as connection:
+        for target in targets:
+            rows = connection.execute(
+                """
+                SELECT curve_date, temperature, strength
+                FROM trend_curve_points
+                WHERE market = ? AND symbol = ? AND tm_id = ?
+                ORDER BY curve_date DESC
+                LIMIT 2
+                """,
+                (target["market"], target["symbol"], target["tm_id"]),
+            ).fetchall()
+            if len(rows) < 2:
+                raise ValueError(
+                    f"{target['market']}.{target['symbol']} curve history is incomplete"
+                )
+            latest, previous = rows[0], rows[1]
+            local_rows.append(
+                {
+                    "market": target["market"],
+                    "symbol": target["symbol"],
+                    "tm_id": target["tm_id"],
+                    "curve_date": latest[0],
+                    "previous_temperature": previous[1],
+                    "current_temperature": latest[1],
+                    "current_strength": latest[2],
+                }
+            )
+
+    fields = (
+        "tmId",
+        "asOfDate",
+        "trendTemperaturePrev",
+        "trendTemperatureCurr",
+        "trendStrengthLocalCurr",
+    )
+    snapshots_by_date: dict[str, list[dict[str, object]]] = {}
+    issues: list[str] = []
+    with TemporaryDirectory(prefix="open-trader-trend-reconcile-") as temporary_cache:
+        client = TrendAnimalsClient(
+            api_key=api_key,
+            cache_dir=Path(temporary_cache),
+        )
+        for curve_date in sorted({row["curve_date"] for row in local_rows}):
+            date_rows = [
+                row for row in local_rows if row["curve_date"] == curve_date
+            ]
+            try:
+                snapshots_by_date[curve_date] = client.get_snapshots(
+                    tm_ids=[row["tm_id"] for row in date_rows],
+                    fields=fields,
+                    expected_date=curve_date,
+                )
+            except Exception as exc:
+                issues.extend(
+                    f"{row['market']}.{row['symbol']} {curve_date}：API 快照请求失败：{exc}"
+                    for row in date_rows
+                )
+
+    missing_value = object()
+
+    def shown(value: object) -> str:
+        return "缺失" if value is missing_value else str(value)
+
+    for curve_date in sorted({row["curve_date"] for row in local_rows}):
+        snapshots = snapshots_by_date.get(curve_date)
+        if snapshots is None:
+            continue
+        date_rows = [row for row in local_rows if row["curve_date"] == curve_date]
+        expected_tm_ids = {row["tm_id"] for row in date_rows}
+        rows_by_tm_id: dict[int, list[dict[str, object]]] = {}
+        for snapshot in snapshots:
+            snapshot_tm_id = snapshot.get("tmId", missing_value)
+            if (
+                isinstance(snapshot_tm_id, bool)
+                or not isinstance(snapshot_tm_id, int)
+                or snapshot_tm_id <= 0
+            ):
+                issues.append(
+                    f"{curve_date}：API 快照 tmId 无效={shown(snapshot_tm_id)}"
+                )
+                continue
+            if snapshot_tm_id not in expected_tm_ids:
+                issues.append(
+                    f"{curve_date}：API 快照意外标的 tmId={snapshot_tm_id}"
+                )
+                continue
+            rows_by_tm_id.setdefault(snapshot_tm_id, []).append(snapshot)
+
+        for row in date_rows:
+            identity = f"{row['market']}.{row['symbol']} {curve_date}"
+            matched_rows = rows_by_tm_id.get(row["tm_id"], [])
+            if not matched_rows:
+                issues.append(f"{identity}：API 快照缺失")
+                continue
+            if len(matched_rows) != 1:
+                issues.append(
+                    f"{identity}：API 快照重复 tmId={row['tm_id']}"
+                )
+                continue
+            snapshot = matched_rows[0]
+            if snapshot.get("asOfDate", missing_value) != curve_date:
+                issues.append(
+                    f"{identity}：API 日期={shown(snapshot.get('asOfDate', missing_value))}"
+                )
+                continue
+
+            if snapshot.get("trendTemperaturePrev", missing_value) != row[
+                "previous_temperature"
+            ]:
+                issues.append(
+                    f"{identity} 前一温度：曲线={row['previous_temperature']}，"
+                    f"API={shown(snapshot.get('trendTemperaturePrev', missing_value))}"
+                )
+            if snapshot.get("trendTemperatureCurr", missing_value) != row[
+                "current_temperature"
+            ]:
+                issues.append(
+                    f"{identity} 当前温度：曲线={row['current_temperature']}，"
+                    f"API={shown(snapshot.get('trendTemperatureCurr', missing_value))}"
+                )
+
+            actual_strength = snapshot.get("trendStrengthLocalCurr", missing_value)
+            try:
+                parsed_strength = (
+                    None
+                    if isinstance(actual_strength, bool)
+                    else Decimal(str(actual_strength))
+                )
+            except (InvalidOperation, TypeError, ValueError):
+                parsed_strength = None
+            if (
+                parsed_strength is None
+                or not parsed_strength.is_finite()
+                or parsed_strength != Decimal(str(row["current_strength"]))
+            ):
+                issues.append(
+                    f"{identity} 当前本地强度：曲线={row['current_strength']}，"
+                    f"API={shown(actual_strength)}"
+                )
+
+    if issues:
+        raise TrendCurveReconciliationError("\n".join(issues))
+
+    dates = ", ".join(
+        f"{market} {curve_date}"
+        for market, curve_date in sorted(
+            {(row["market"], row["curve_date"]) for row in local_rows}
+        )
+    )
+    return (
+        "趋势曲线采集对账一致",
+        "\n".join(
+            (
+                f"数据日期：{dates}",
+                f"标的：{len(local_rows)}/{len(local_rows)}",
+                "对账字段：前一温度、当前温度、当前本地强度",
+                "结果：全部一致",
+            )
+        ),
+    )
 
 
 def _load_portfolio_targets(

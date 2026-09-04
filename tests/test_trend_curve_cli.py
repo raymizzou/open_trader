@@ -6,12 +6,20 @@ import json
 import sqlite3
 import sys
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
+import open_trader.trend_animals as trend_animals
 import open_trader.cli as cli
 import open_trader.notifications as notifications
+import open_trader.trend_curve_research as trend_curve_research
 from open_trader.cli import build_parser
+
+
+SLB_CURVE_ENCRYPTED = (
+    "ehtRChN4vTYXmnU0XeI1jUK90sU2F7krL05NDT98YL8UTnyA+ZPzfFhGtc16tZucbQiHicdZb6zASL09TNBfXk9jMxyga1yBUjoxwZmQV9f6VhEKsU0ASQEFlmLlF9Drr5Dhe3ZG0O3JuK/ZhV319o/zMC9iziANRRZEbU3zeZltSCoRpfm/2nkUUxlYReMvaHhaE5njUaXGc4yXvmKKB/DB+3KE/phKeRKYP/zZ2mB7dEvRW7nppyiVRq35neeyP0EMKv28Jvjf5VVzhukl+JrtrR6YsHnyPcDOTcf3qT+vPyEvieKpK9oVsMc0dcvRHmRw5vxii3b0k0L5VaXOPd4II3UiPVt8hIeQwSE5BvTLaqbOYAZgIdb8VFR0sVfGUR0b8XqS9i1f1LUB7XEaSmB/OknT2hbVGtJcsN96W0GYUMgCwgxHQxmJspmlFlZ9zJ2DCMGc0XKeQL/ztER2WCvYidySWZe7Il/lPCsc6UPgwHQw2n+SVAG7E0zG7UoqK8FPcneVJd77KoFVcj8vx8woK3cTAbqZEzmyNPg9t6SdN01c0qONGzC6qFBivXyw6R0OEGWI9UYbPc4r3WcbmTiBKYdVxn+31ioLr1lG8w3NElYsMBArmln2uBWUonOzeme6spz0p3d1qgAfGsyve6Ixu/sMagxMIXR6ZUizW+UmgKmbEQVx8b3hiGK4JFp6"
+)
 
 
 def _write_cli_inputs(database: Path, prices: Path) -> None:
@@ -107,6 +115,314 @@ def test_trend_curve_cli_accepts_explicit_mmkv_snapshot() -> None:
     assert (explicit_args.mmkv_path, default_args.mmkv_path) == (
         Path("copied/wx64e4edbab5e14356"),
         None,
+    )
+
+
+def _prepare_reconcile_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    paid_rows: list[dict[str, object]],
+) -> tuple[list[str], list[tuple[str, float]], list[tuple[str, dict[str, object], float]], Path]:
+    watchlist = tmp_path / "watchlist.json"
+    watchlist.write_text(
+        json.dumps(
+            [
+                {
+                    "market": "US",
+                    "symbol": "SLB",
+                    "asset_id": 10002,
+                    "group_id": 332171,
+                    "tm_id": 337127,
+                    "ccy_id": 101,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    mmkv_path = tmp_path / "wx64e4edbab5e14356"
+    mmkv_path.write_bytes(b"snapshot")
+    Path(f"{mmkv_path}.crc").write_bytes(b"crc")
+    mmkv_helper = tmp_path / "open-trader-mmkv-dump"
+    mmkv_helper.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\t%s\\n' other ignored\n"
+        "printf '%s\\t%s\\n' vuex '{\"user\":{\"token\":\"mini-token\",\"info\":{\"id\":456789}}}'\n",
+        encoding="utf-8",
+    )
+    mmkv_helper.chmod(mmkv_helper.stat().st_mode | 0o111)
+    config_path = tmp_path / "daily.env"
+    config_path.write_text(
+        "\n".join(
+            (
+                f"OPEN_TRADER_REPO={tmp_path}",
+                f"OPEN_TRADER_PYTHON={sys.executable}",
+                "OPEN_TRADER_TIMEZONE=Asia/Shanghai",
+                "OPEN_TRADER_DEADLINE=23:59",
+                "OPEN_TRADER_FUTU_HOST=127.0.0.1",
+                "OPEN_TRADER_FUTU_PORT=11111",
+                "DEEPSEEK_API_KEY=test-key",
+                "TREND_ANIMALS_API_KEY=paid-key",
+                "OPEN_TRADER_NOTIFIERS=feishu",
+                "OPEN_TRADER_FEISHU_WEBHOOK_URL=https://example.invalid/hook",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    def curve_transport(
+        _url: str, _body: bytes, _headers: dict[str, str]
+    ) -> dict[str, object]:
+        return {
+            "success": True,
+            "code": "00000",
+            "data": {"encryptedData": SLB_CURVE_ENCRYPTED},
+        }
+
+    monkeypatch.setattr(trend_curve_research, "_default_curve_transport", curve_transport)
+    paid_requests: list[tuple[str, float]] = []
+
+    class PaidResponse:
+        def __enter__(self) -> "PaidResponse":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {"success": True, "code": "00000", "data": paid_rows}
+            ).encode("utf-8")
+
+    def paid_transport(url: str, timeout: float) -> PaidResponse:
+        paid_requests.append((url, timeout))
+        return PaidResponse()
+
+    monkeypatch.setattr(trend_animals, "urlopen", paid_transport)
+    deliveries: list[tuple[str, dict[str, object], float]] = []
+
+    def feishu_transport(
+        url: str, payload: dict[str, object], timeout: float
+    ) -> dict[str, object]:
+        deliveries.append((url, payload, timeout))
+        return {"code": 0}
+
+    monkeypatch.setattr(notifications, "_post_json", feishu_transport)
+    database = tmp_path / "history.sqlite3"
+    command = [
+        "trend-curve",
+        "collect",
+        "--watchlist",
+        str(watchlist),
+        "--database",
+        str(database),
+        "--mmkv-path",
+        str(mmkv_path),
+        "--mmkv-helper",
+        str(mmkv_helper),
+        "--reconcile-and-notify",
+        "--config",
+        str(config_path),
+    ]
+    return command, paid_requests, deliveries, database
+
+
+def test_trend_curve_collect_reconciles_same_day_snapshot_and_notifies_match(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (
+        command,
+        paid_requests,
+        deliveries,
+        _database,
+    ) = _prepare_reconcile_cli(
+        monkeypatch,
+        tmp_path,
+        [
+            {
+                "tmId": 337127,
+                "asOfDate": "2026-09-02",
+                "trendTemperaturePrev": "温",
+                "trendTemperatureCurr": "温",
+                "trendStrengthLocalCurr": "90.8",
+            }
+        ],
+    )
+    exit_code = cli.main(command)
+
+    captured = capsys.readouterr()
+    message = deliveries[0][1]["content"]["text"]
+    requested_fields = parse_qs(
+        urlparse(paid_requests[0][0]).query
+    )["fields"][0].split(",")
+    assert (
+        exit_code,
+        captured.err,
+        "database:" in captured.out,
+        "targets: 1" in captured.out,
+        "points: 7" in captured.out,
+        len(paid_requests),
+        tuple(sorted(requested_fields)),
+        len(deliveries),
+        "趋势曲线采集对账一致" in message,
+        "数据日期：US 2026-09-02" in message,
+        "标的：1/1" in message,
+        "对账字段：前一温度、当前温度、当前本地强度" in message,
+        "结果：全部一致" in message,
+    ) == (
+        0,
+        "",
+        True,
+        True,
+        True,
+        1,
+        (
+            "asOfDate",
+            "tmId",
+            "trendStrengthLocalCurr",
+            "trendTemperatureCurr",
+            "trendTemperaturePrev",
+        ),
+        1,
+        True,
+        True,
+        True,
+        True,
+        True,
+    )
+
+
+def test_trend_curve_collect_reconciles_fresh_paid_snapshot_on_repeat(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    paid_rows = [
+        {
+            "tmId": 337127,
+            "asOfDate": "2026-09-02",
+            "trendTemperaturePrev": "温",
+            "trendTemperatureCurr": "温",
+            "trendStrengthLocalCurr": "90.8",
+        }
+    ]
+    command, paid_requests, deliveries, database = _prepare_reconcile_cli(
+        monkeypatch, tmp_path, paid_rows
+    )
+
+    first_exit = cli.main(command)
+    paid_rows[0]["trendTemperatureCurr"] = "热"
+    try:
+        second_exit = cli.main(command)
+    except SystemExit as exc:
+        second_exit = exc.code
+
+    with sqlite3.connect(database) as connection:
+        curve_rows = connection.execute(
+            """
+            SELECT market, symbol, curve_date, COUNT(*)
+            FROM trend_curve_points
+            WHERE market = 'US' AND symbol = 'SLB' AND curve_date = '2026-09-02'
+            GROUP BY market, symbol, curve_date
+            """
+        ).fetchall()
+    first_message = deliveries[0][1]["content"]["text"]
+    second_message = deliveries[1][1]["content"]["text"]
+    assert (
+        first_exit,
+        "趋势曲线采集对账一致" in first_message,
+        second_exit != 0,
+        "趋势曲线采集对账异常" in second_message,
+        "US.SLB 2026-09-02 当前温度：曲线=温，API=热" in second_message,
+        len(paid_requests),
+        curve_rows,
+    ) == (
+        0,
+        True,
+        True,
+        True,
+        True,
+        2,
+        [("US", "SLB", "2026-09-02", 1)],
+    )
+
+
+def test_trend_curve_collect_notifies_field_mismatch_and_returns_nonzero(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    command, _paid_requests, deliveries, database = _prepare_reconcile_cli(
+        monkeypatch,
+        tmp_path,
+        [
+            {
+                "tmId": 337127,
+                "asOfDate": "2026-09-02",
+                "trendTemperaturePrev": "温",
+                "trendTemperatureCurr": "热",
+                "trendStrengthLocalCurr": "90.8",
+            }
+        ],
+    )
+
+    try:
+        exit_code = cli.main(command)
+    except SystemExit as exc:
+        exit_code = exc.code
+
+    with sqlite3.connect(database) as connection:
+        curve_rows = connection.execute(
+            """
+            SELECT market, symbol, curve_date
+            FROM trend_curve_points
+            WHERE market = 'US' AND symbol = 'SLB' AND curve_date = '2026-09-02'
+            """
+        ).fetchall()
+    message = deliveries[0][1]["content"]["text"]
+    assert (
+        exit_code != 0,
+        curve_rows,
+        len(deliveries),
+        "趋势曲线采集对账异常" in message,
+        "US.SLB 2026-09-02 当前温度：曲线=温，API=热" in message,
+    ) == (
+        True,
+        [("US", "SLB", "2026-09-02")],
+        1,
+        True,
+        True,
+    )
+
+
+def test_trend_curve_collect_notifies_missing_paid_snapshot_and_returns_nonzero(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    command, _paid_requests, deliveries, database = _prepare_reconcile_cli(
+        monkeypatch, tmp_path, []
+    )
+
+    try:
+        exit_code = cli.main(command)
+    except SystemExit as exc:
+        exit_code = exc.code
+
+    with sqlite3.connect(database) as connection:
+        curve_rows = connection.execute(
+            """
+            SELECT market, symbol, curve_date
+            FROM trend_curve_points
+            WHERE market = 'US' AND symbol = 'SLB' AND curve_date = '2026-09-02'
+            """
+        ).fetchall()
+    message = deliveries[0][1]["content"]["text"]
+    assert (
+        exit_code != 0,
+        curve_rows,
+        len(deliveries),
+        "趋势曲线采集对账异常" in message,
+        "US.SLB 2026-09-02：API 快照缺失" in message,
+    ) == (
+        True,
+        [("US", "SLB", "2026-09-02")],
+        1,
+        True,
+        True,
     )
 
 

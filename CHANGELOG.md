@@ -6,6 +6,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 ## 2026-09-04
 
 - 修复离线 `trend-curve backtest` 对合法非交易日曲线观测的对齐：信号在首个后续 OHLC 开盘执行；较新平/非 `{热, 沸}` 观测会在执行前取消排队 BUY，避免过期买入。专用验证：`make test-trend-curve`（26 passed）。
+- 新增手动 `trend-curve collect --reconcile-and-notify`：曲线写入 SQLite 后按最新数据日期直接请求五字段 Trend Animals 快照，仅对账三项温度/强度字段并发送 Feishu 一致或异常结果；失败保留已提交曲线行且不接入趋势报告。专用验证：`make test-trend-curve`。
 
 ## 2026-09-03
 

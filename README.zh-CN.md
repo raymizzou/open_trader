@@ -187,6 +187,11 @@ watchlist 使用市场、标的和 Trend Animals 业务标识：
 `feishu_app` 渠道，并保留采集失败退出码。此命令仍是独立的手动 CLI，也可由外部调度器调用；
 本项目不因此创建或安装调度任务，也不接入 Dashboard、后台、日报或交易链路。
 
+追加 `--reconcile-and-notify --config config/daily_premarket.env` 会在 SQLite 采集提交后，
+再按最新曲线数据日期请求付费快照；只对账前一温度、当前温度和当前本地强度（强度按数值比较）。
+全部一致时发送「趋势曲线采集对账一致」，缺失、重复、日期或字段异常时发送「趋势曲线采集对账异常」，
+并保留已提交的曲线行与非零退出码。此阶段趋势报告不会读取该 SQLite 数据。
+
 `--mmkv-path` 可指向手动复制的 MMKV 文件；同目录必须同时保留同名的 `.crc` 兄弟文件。
 请求的 `selected=0` 固定选择实测验证的近一年按日历史窗口。
 默认 SQLite 路径为 `data/trend_curve/history.sqlite3`。每个

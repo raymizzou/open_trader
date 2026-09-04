@@ -513,6 +513,25 @@ The run writes a manifest, signals, trades, equity curves, metrics, and report
 under `data/backtests/<run_id>/` and `reports/backtests/` without changing the
 portfolio, trading plan, or order state.
 
+### Collect and Reconcile a Trend Curve
+
+Run the standalone collector with `--reconcile-and-notify` to commit the
+validated curve rows first, then request a paid snapshot for each newest curve
+data date. The paid request contains only `tmId`, `asOfDate`,
+`trendTemperaturePrev`, `trendTemperatureCurr`, and `trendStrengthLocalCurr`;
+reconciliation compares only the previous temperature, current temperature,
+and current local strength (numeric equality). A successful run sends one
+Feishu result titled `趋势曲线采集对账一致`; missing, duplicate, date, field, or
+API failures send `趋势曲线采集对账异常` and keep the command nonzero.
+
+```bash
+.venv/bin/python -m open_trader trend-curve collect \
+  --watchlist data/trend_curve/watchlist.json \
+  --reconcile-and-notify --config config/daily_premarket.env
+```
+
+This phase is manual and isolated: trend reports do not read this SQLite data.
+
 ### Backtest a Trend Curve
 
 Run the standalone offline US temperature-transition backtest:
