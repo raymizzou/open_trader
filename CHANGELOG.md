@@ -3,6 +3,10 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-09-05
+
+- Dashboard「持仓与策略」新增只读行业分布（Variant A）：实盘按历史趋势持仓、模拟盘按可见模拟持仓，覆盖美股/港股/A股并以两位小数精确港元市值归一化，缺失/冲突行业归入「其他/未知」，尾部折叠并支持移动端单列；原持仓表与交易路径保持不变。验证：四个 Dashboard 用例逐条红→绿。
+
 ## 2026-09-04
 
 - #65 金丝雀事实报告与执行报告抽屉（用户批准 mock 逐字节落地）：① 修复 #64 遗留空队列措辞——队列行中间段空数组兜底「空」，对齐已批准 mock（`下单队列 0 · 空 · 四上限未确认`）。② 新增只读报告构建器 `prediction_n_leg_canary_report`：`build_canary_report(store, now=)` 从既有表（队列/批次/审计流/证明/Episode/未清资本账本）组装确定性 JSON——逐腿请求/回执/成交/费用/已付现金/方向（side）、每批前后总未清资本与「预留=仓位」守恒、利润三段式（保证利润=冻结已证下界 / 已付现金与费用 / 实际利润未结算明示，结算后补算归 #121）、触发来源列 `MANUAL_CONFIRM`（#66 共用面预留）、修复授权段标注「完整修复终点估算、非最坏界」且事故块现金与费用分列（评审 P3 修复：现金不再并入费用）、无建议性结论；同库同钟两次构建字节一致。③ 新增只读 CLI `scripts/run_nleg_canary_report.py`（`mode=ro` 打开，源库 sha256/mtime 前后不变），导出 `reports/n_leg_canary/<UTC时间戳>.json/.md`（中文 Markdown、每行一个事实、金额人性化）。④ 新增只读端点 `GET /api/prediction-arbitrage/n-leg/report`（白名单+可用性门沿用既有 n-leg 端点模式，返回构建器输出，错误 503 fail-closed）。⑤ UI「执行报告」抽屉（预测工作区，与 #66 共用面）：入口徽标骑队列行（普通/事故两态）、pm-relation-drawer 惯用法、账本条（总未结算/活跃批次/模式/熔断）、批次卡（三段式利润/守恒/触发来源与 Episode/腿表 side→买 YES·买 NO）、事故+修复授权段、队内请求（ABANDONED·原因·仅监控）、footer 生成时间；dashboard.js/css 与批准 mock `diff -q` 逐字节一致。⑥ 事故演练用例（全部假客户端、只观察既有行为）：提交后真关闭重开 SQLite 的崩溃重启（全程 ≤1 活跃批次、生产对账工厂收口）、跨组件 FIFO 队首失效离队/队次顶上/第二批准入等首批 Gate 释放、连续 Episode 累计触顶只监控（admission 级既有 d2 + 报告级新用例双证据）、Episode 299s 不关闭/300s 关闭精确边界。⑦ 演练勘察发现既有限制（本轮未修、待用户裁决）：组件拆分/合并后继获得新图谱 lineage，且 confirm 冻结 `lineage:{component_id}`、准入仅精确匹配冻结值——已执行锁不跨拆分/合并后继继承，与 #64/#65 票面「组件拆分/合并后也不能绕过」不符；同组件重复执行仍被既有谱系锁拦截。验证：切片全部红→绿；评审 R1 全项通过（1×P3 已修）→R2 增量 No findings→S4 抽屉→R3 终审 No findings（含与批准 mock `diff -q` 逐字节核验）；全量 Docker `make test` 终态 **7993 passed / 0 failed**（main 基线 7976 + 本票净增 17）。

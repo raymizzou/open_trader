@@ -1344,6 +1344,80 @@ table {
   min-width: 0;
 }
 
+.account-industry-distribution {
+  border-top: 1px solid var(--line);
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(0, 1fr);
+  margin: 14px 12px 0;
+  min-width: 0;
+  padding: 14px 0 0;
+}
+
+.account-industry-distribution-header {
+  align-items: baseline;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+}
+
+.account-industry-distribution-header h3 {
+  font-size: 1rem;
+  margin: 0;
+}
+
+.account-industry-distribution-header span {
+  color: var(--muted);
+}
+
+.account-industry-distribution-body {
+  align-items: center;
+  display: grid;
+  gap: 18px;
+  grid-template-columns: minmax(140px, .6fr) minmax(0, 1.4fr);
+}
+
+.account-industry-pie {
+  aspect-ratio: 1;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  max-width: 180px;
+  width: 100%;
+}
+
+.account-industry-detail {
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.account-industry-table {
+  background: var(--surface);
+  border-collapse: collapse;
+  min-width: 280px;
+  width: 100%;
+}
+
+.account-industry-table caption {
+  color: var(--muted);
+  padding: 0 0 8px;
+  text-align: left;
+}
+
+.account-industry-table th,
+.account-industry-table td {
+  padding: 8px 10px;
+}
+
+.account-industry-swatch {
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  display: inline-block;
+  height: 12px;
+  margin-right: 6px;
+  vertical-align: -1px;
+  width: 12px;
+}
+
 .holding-origin-section {
   padding: 14px 0 0;
 }
@@ -5964,6 +6038,10 @@ table {
   .account-view-panel > .trend-review,
   .trend-history-panel {
     padding: 12px;
+  }
+
+  .account-industry-distribution-body {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .statement-upload {

@@ -10703,6 +10703,187 @@ console.log(JSON.stringify({html,unavailable}));
     assert "<h3>趋势持仓</h3>" not in unavailable and "<h3>非趋势持仓</h3>" not in unavailable
 
 
+def test_dashboard_account_real_industry_distribution_uses_hkd_value_across_us_hk_cn_trend_accounts() -> None:
+    output = run_dashboard_js(r'''
+const scenarios = [
+  {broker:"futu",market:"US",first:"AAPL",second:"MSFT"},
+  {broker:"phillips",market:"HK",first:"00005",second:"00006"},
+  {broker:"eastmoney",market:"CN",first:"600001",second:"600002"},
+];
+const row = (broker, market, symbol, value, index) => ({
+  key:`${broker}:${market}:${symbol}:${index}`,broker,
+  holding:{market,symbol,...(market === "CN" ? {} : {futu_symbol:`${market}.${symbol}`})},
+  display:{market,symbol,name:symbol,market_value_hkd:String(value)},index,
+});
+const action = (market, symbol, industry) => ({
+  market,symbol,industry,
+  ...(market === "CN" ? {futu_symbol:`SH.${symbol}`} : {}),
+});
+const rendered = scenarios.map(({broker,market,first,second}) => {
+  state.dashboard={trend_reports:{[broker]:{
+    market,real_position_actions:[
+      action(market,first,"科技"),
+      action(market,second,"金融"),
+    ],
+    historical_buy_plan_membership:{available:true,symbols:[`${market}.${first}`,`${market}.${second}`]},
+  }}};
+  const html=renderAccountViewPanel({broker,rows:[
+    row(broker,market,first,600,0),
+    row(broker,market,second,400,1),
+    row(broker,market,"OUTSIDE",900,2),
+  ]});
+  return {broker,html};
+});
+console.log(JSON.stringify(rendered));
+''')
+    rendered = json.loads(output)
+    assert {item["broker"] for item in rendered} == {"futu", "phillips", "eastmoney"}
+    for item in rendered:
+        html = item["html"]
+        trend_heading = html.index("<h3>趋势持仓")
+        distribution = html[:trend_heading]
+        assert distribution.index("行业分布") < trend_heading
+        assert "HKD 1,000" in distribution
+        assert "科技" in distribution and "金融" in distribution
+        assert "60%" in distribution and "40%" in distribution
+        assert "HKD 900" not in distribution
+        assert html.count('class="account-holdings-table"') == 2
+
+
+def test_dashboard_account_simulated_industry_distribution_uses_hkd_value_across_us_hk_cn() -> None:
+    output = run_dashboard_js(r'''
+const scenarios = [
+  {broker:"futu",market:"US",first:"AAPL",second:"MSFT",labels:["美股科技","美股金融"]},
+  {broker:"phillips",market:"HK",first:"00005",second:"00006",labels:["港股科技","港股金融"]},
+  {broker:"eastmoney",market:"CN",first:"600001",second:"600002",labels:["A股科技","A股金融"]},
+];
+const action = (market, symbol, industry) => ({
+  market,symbol,industry,
+  ...(market === "CN" ? {futu_symbol:`SH.${symbol}`} : {}),
+});
+const rendered = scenarios.map(({broker,market,first,second,labels}) => {
+  state.dashboard={trend_reports:{[broker]:{
+    market,hold_actions:[
+      action(market,first,labels[0]),
+      action(market,second,labels[1]),
+    ],
+  }}};
+  state.trendSimulatePositions[broker]={available:true,broker,positions:[
+    {broker,market,symbol:first,name:first,quantity:"1",market_value_hkd:"750"},
+    {broker,market,symbol:second,name:second,quantity:"1",market_value_hkd:"250"},
+  ]};
+  return {broker,html:renderSimulatedAccountView(broker)};
+});
+console.log(JSON.stringify(rendered));
+''')
+    rendered = json.loads(output)
+    labels = {"futu": ("美股科技", "美股金融"), "phillips": ("港股科技", "港股金融"), "eastmoney": ("A股科技", "A股金融")}
+    all_labels = {label for pair in labels.values() for label in pair}
+    for item in rendered:
+        html = item["html"]
+        own_labels = labels[item["broker"]]
+        assert "行业分布" in html
+        assert "HKD 1,000" in html
+        assert "75%" in html and "25%" in html
+        assert all(label in html for label in own_labels)
+        assert not any(label in html for label in all_labels - set(own_labels))
+        assert html.count('class="account-holdings-table"') == 1
+        assert html.count("account-holding-row") == 2
+
+
+def test_dashboard_account_industry_distribution_groups_tail_and_unknown() -> None:
+    output = run_dashboard_js(r'''
+const named = [
+  ["A",50,"行业一"], ["B",20,"行业二"], ["C",10,"行业三"],
+  ["D",8,"行业四"], ["E",6,"行业五"], ["F",4,"行业六"],
+];
+const report = {
+  market:"US",
+  real_position_actions:named.map(([symbol,,industry])=>({market:"US",symbol,industry})),
+  historical_buy_plan_membership:{available:true,symbols:named.map(([symbol])=>`US.${symbol}`).concat("US.UNKNOWN")},
+};
+state.dashboard={trend_reports:{futu:report}};
+const rows=named.map(([symbol,value],index)=>({key:`futu:US:${symbol}:${index}`,broker:"futu",
+  holding:{market:"US",symbol,futu_symbol:`US.${symbol}`},
+  display:{market:"US",symbol,name:symbol,market_value_hkd:String(value)},index}));
+rows.push({key:"futu:US:UNKNOWN:6",broker:"futu",
+  holding:{market:"US",symbol:"UNKNOWN",futu_symbol:"US.UNKNOWN"},
+  display:{market:"US",symbol:"UNKNOWN",name:"UNKNOWN",market_value_hkd:"2"},index:6});
+const tail = renderAccountViewPanel({broker:"futu",rows});
+const tieNamed = [
+  ["L1", "50", "大行业一"], ["L2", "45", "大行业二"],
+  ["L3", "40", "大行业三"], ["L4", "35", "大行业四"],
+  ["A1", "10.10", "A行业"], ["A2", "20.20", "A行业"],
+  ["B", "30.30", "B行业"],
+];
+const tieReport = {
+  market:"US",
+  real_position_actions:tieNamed.map(([symbol,,industry])=>({market:"US",symbol,industry})),
+  historical_buy_plan_membership:{available:true,symbols:tieNamed.map(([symbol])=>`US.${symbol}`)},
+};
+state.dashboard={trend_reports:{futu:tieReport}};
+const tieRows=tieNamed.map(([symbol,value],index)=>({key:`futu:US:${symbol}:${index}`,broker:"futu",
+  holding:{market:"US",symbol,futu_symbol:`US.${symbol}`},
+  display:{market:"US",symbol,name:symbol,market_value_hkd:value},index}));
+const tie = renderAccountViewPanel({broker:"futu",rows:tieRows});
+console.log(JSON.stringify({tail,tie}));
+''')
+    rendered = json.loads(output)
+    html = rendered["tail"]
+    distribution = html[:html.index("<h3>趋势持仓")]
+    for industry in ("行业一", "行业二", "行业三", "行业四", "行业五"):
+        assert industry in distribution
+    assert "行业六" not in distribution
+    assert "其他/未知" in distribution
+    assert "HKD 100" in distribution
+    assert "HKD 6" in distribution
+    assert "6%" in distribution
+    swatch_colors = re.findall(
+        r'<span class="account-industry-swatch"[^>]*style="background: ([^"]+)"',
+        distribution,
+    )
+    assert len(swatch_colors) == 6 and len(set(swatch_colors)) == 6
+    tie_distribution = rendered["tie"][:rendered["tie"].index("<h3>趋势持仓")]
+    assert "A行业" in tie_distribution
+    assert "B行业" not in tie_distribution
+    assert "其他/未知" in tie_distribution
+
+
+def test_dashboard_account_industry_distribution_has_honest_empty_and_responsive_states() -> None:
+    output = run_dashboard_js(r'''
+const row = (symbol, value, index) => ({key:`futu:US:${symbol}:${index}`,broker:"futu",
+  holding:{market:"US",symbol,futu_symbol:`US.${symbol}`},
+  display:{market:"US",symbol,name:symbol,market_value_hkd:value},index});
+const report = {market:"US",real_position_actions:[],historical_buy_plan_membership:{
+  available:true,symbols:["US.MISSING","US.ZERO","US.NEGATIVE","US.TEXT","US.UNKNOWN"],
+}};
+state.dashboard={trend_reports:{futu:report}};
+const unavailable=renderAccountViewPanel({broker:"futu",rows:[
+  row("MISSING","",0),row("ZERO","0",1),row("NEGATIVE","-3",2),row("TEXT","not-a-number",3),
+]});
+const unknown=renderAccountViewPanel({broker:"futu",rows:[row("UNKNOWN","100",0)]});
+console.log(JSON.stringify({unavailable,unknown}));
+''')
+    rendered = json.loads(output)
+    unavailable = rendered["unavailable"]
+    assert "行业分布暂无可用市值" in unavailable
+    assert "4 条未计入" in unavailable
+    assert 'role="img"' not in unavailable
+    unknown = rendered["unknown"]
+    assert "其他/未知" in unknown
+    assert "HKD 100" in unknown
+    assert "100%" in unknown
+
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    desktop = css.split(".account-industry-distribution-body {", 1)[1].split("}", 1)[0]
+    mobile = css.split("@media (max-width: 760px) {", 1)[1]
+    assert "grid-template-columns: minmax(140px, .6fr) minmax(0, 1.4fr);" in desktop
+    assert ".account-industry-distribution-body" in mobile
+    assert "grid-template-columns: minmax(0, 1fr);" in mobile.split(".account-industry-distribution-body", 1)[1].split("}", 1)[0]
+    assert "overflow-x: auto;" in css.split(".account-industry-detail {", 1)[1].split("}", 1)[0]
+    assert "min-width: 0;" in css.split(".account-industry-distribution {", 1)[1].split("}", 1)[0]
+
+
 def test_dashboard_splits_only_real_trend_report_holdings_by_historical_origin() -> None:
     output = run_dashboard_js(r'''
 const report={market:"US",real_position_status:"available",historical_buy_plan_membership:{available:true,symbols:["US.ADP"],reason:""}};
