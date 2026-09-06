@@ -791,6 +791,18 @@ class PredictionLiveResolver:
                 # Review round 2 (#64 P3): the solve-request's per-leg
                 # sequence baselines, frozen at dispatch time.
                 "sequences": dict(sequences),
+                # Issue #122 (R4): the entry's graph lineage so the confirm
+                # freeze records the real family identity. A component the
+                # graph cannot map — the oracle's grouping (settlement-
+                # observation identity joins) is broader than the graph's
+                # relation-endpoint partition — keeps the pre-#122 legacy
+                # claim-key shape ``lineage:{component_id}``: confirm freezes
+                # it, the R5 precheck and the admission frozen-string
+                # fallback exact-match it, so pre-#122 claim rows still
+                # block the family and no new key shape is invented.
+                "lineage_id": self._lineage_by_component.get(
+                    component_id, f"lineage:{component_id}"
+                ),
             }
             for component_id in ordered
             for market, execution, fee_block, sequences in (

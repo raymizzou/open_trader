@@ -635,3 +635,133 @@ def test_s4_report_endpoint_returns_builder_output(tmp_path: Path) -> None:
     body.pop("generated_at")
     expected.pop("generated_at")
     assert body == expected
+
+
+# ---------------------------------------------------------------------------
+# Issue #122 (approved case 10): the report's lineage facts are read-only
+# passthroughs of the stored rows, so after a real rotation's re-armed
+# successor admits, the claim key it shows is the successor's own graph
+# lineage truth — never a synthetic display string.
+# ---------------------------------------------------------------------------
+
+
+def test_case10_report_claim_key_is_graph_lineage_truth(tmp_path: Path) -> None:
+    import sqlite3
+    from datetime import datetime, timedelta
+    from decimal import Decimal
+
+    from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+    from open_trader.prediction_n_leg_canary_report import build_canary_report
+    from open_trader.prediction_n_leg_episodes import EpisodeStore, EpisodeTracker
+    from open_trader.prediction_runtime_graph import RuntimeGraphStore
+    from test_prediction_runtime_graph import chain_generation, make_graph, row
+
+    store = PredictionArbitrageStore(tmp_path)
+    graph, state, meta = make_graph(tmp_path, chain_generation("v1"))
+    graph.refresh()
+    family = next(iter(graph.components().values()))
+    store.n_leg_create_batch(
+        {
+            "execution_batch_id": "batch-family",
+            "opportunity_episode_id": "episode-family",
+            "episode_lineage_id": f"lineage:{family.component_id}",
+            "mode": "MANUAL",
+            "state": "ACTIVE",
+            "entry_fingerprint": "entry-family",
+            "execution_solution_fingerprint": "solution-family",
+            "total_unsettled_capital_units": 1,
+            "component_id": family.component_id,
+        }
+    )
+    with sqlite3.connect(
+        tmp_path / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
+    ) as connection:
+        connection.execute("UPDATE n_leg_controls SET active_batch_id=NULL")
+
+    # Real rotation: one generation advance splits the family in two.
+    state.clear()
+    state.update(
+        {
+            "IMPLIES|polymarket:ca|polymarket:cb": row(
+                "v2", [("polymarket", "ca"), ("polymarket", "cb")]
+            ),
+            "IMPLIES|polymarket:cc|polymarket:cd": row(
+                "v3", [("polymarket", "cc"), ("polymarket", "cd")]
+            ),
+        }
+    )
+    meta["generation"] += 1
+    graph.refresh()
+    successor = sorted(
+        graph.components().values(), key=lambda component: component.component_id
+    )[0]
+    truth = {
+        component_id: component.lineage_id
+        for component_id, component in RuntimeGraphStore(tmp_path).load()[2].items()
+        if component.status == "ACTIVE"
+    }
+    assert successor.lineage_id == truth[successor.component_id]
+    assert family.lineage_id in successor.predecessor_lineage_ids
+
+    # The successor re-arms through its own real negative-proof close.
+    with sqlite3.connect(
+        tmp_path / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
+    ) as connection:
+        created_at = connection.execute(
+            "SELECT created_at FROM n_leg_lineage_claims"
+        ).fetchone()[0]
+    claim_at = datetime.fromisoformat(str(created_at))
+    tracker = EpisodeTracker(store=EpisodeStore(tmp_path))
+    fingerprints = {
+        "component_generation": 1,
+        "model_fingerprint": "model-1",
+        "quote_fingerprint": "quote-1",
+        "qualification_fingerprint": "qual-1",
+        "qualification_policy_version": "1",
+    }
+    tracker.observe_qualified(
+        successor.component_id,
+        successor.lineage_id,
+        Decimal("1"),
+        False,
+        None,
+        fingerprints,
+        claim_at + timedelta(hours=1),
+    )
+    for offset in (0, 300):
+        tracker.observe_negative(
+            successor.component_id,
+            proof_fingerprint=f"proof-{offset}",
+            generation=1,
+            model_fingerprint="model-1",
+            quote_fingerprint="quote-1",
+            qualification_fingerprint="qual-1",
+            binding_matches=True,
+            quote_fresh=True,
+            gap_seconds=300,
+            now=claim_at + timedelta(hours=1, seconds=offset),
+            qualification_policy_version="1",
+        )
+
+    store.n_leg_create_batch(
+        {
+            "execution_batch_id": "batch-rearmed",
+            "opportunity_episode_id": "episode-rearmed",
+            "episode_lineage_id": f"lineage:{successor.component_id}",
+            "mode": "MANUAL",
+            "state": "ACTIVE",
+            "entry_fingerprint": "entry-rearmed",
+            "execution_solution_fingerprint": "solution-rearmed",
+            "total_unsettled_capital_units": 1,
+            "component_id": successor.component_id,
+        }
+    )
+
+    report = build_canary_report(store, now=REPORT_NOW)
+    batch = next(
+        b
+        for b in report["batches"]
+        if b["execution_batch_id"] == "batch-rearmed"
+    )
+    # The claim key the report shows is the successor's own graph lineage.
+    assert batch["episode_lineage_id"] == truth[successor.component_id]

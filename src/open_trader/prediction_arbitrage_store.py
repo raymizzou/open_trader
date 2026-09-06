@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 from open_trader.llm_providers import DEFAULT_PROVIDER, PROVIDER_IDS
 from open_trader.prediction_arbitrage import MAX_CROSS_UNSETTLED_PRINCIPAL
 from open_trader.prediction_n_leg import fingerprint as canonical_fingerprint
+from open_trader.prediction_n_leg_episodes import CLOSE_NO_QUALIFIED_OPPORTUNITY
 
 StoreHistoryKind = Literal["signals", "executions", "incidents"]
 SignalHistoryWindow = Literal["24h", "7d", "30d", "all"]
@@ -2804,6 +2805,224 @@ class PredictionArbitrageStore:
             ).fetchone()
         return None if row is None else _load_payload(str(row["payload"]))
 
+    # -- issue #122: the inherited N_LEG executed-lock -----------------------
+
+    @staticmethod
+    def _n_leg_lineage_ancestors(
+        connection: sqlite3.Connection, lineage_id: str
+    ) -> set[str]:
+        """The lineage closure over ``predecessor_lineage_ids`` (R2): read
+        live from the graph rows, CLOSED predecessors included, any status."""
+        ancestors: set[str] = set()
+        frontier = [lineage_id]
+        while frontier:
+            placeholders = ",".join("?" for _ in frontier)
+            rows = connection.execute(
+                "SELECT predecessor_lineage_ids FROM n_leg_episode_lineage"
+                f" WHERE lineage_id IN ({placeholders})",
+                tuple(frontier),
+            ).fetchall()
+            frontier = []
+            for row in rows:
+                for predecessor in json.loads(str(row["predecessor_lineage_ids"])):
+                    predecessor = str(predecessor)
+                    if predecessor not in ancestors:
+                        ancestors.add(predecessor)
+                        frontier.append(predecessor)
+        ancestors.discard(lineage_id)
+        return ancestors
+
+    def _n_leg_lineage_rearm_evidence(
+        self,
+        connection: sqlite3.Connection,
+        current_lineage: str,
+        claimed_at: str,
+    ) -> bool:
+        """R3: the successor re-arms only through its OWN graph lineage's
+        ``NO_QUALIFIED_OPPORTUNITY`` episode close, stamped after the newest
+        hit ancestor claim. COMPONENT_RETIRED closes never count, and both
+        timestamp families are parsed (never string-compared)."""
+        boundary = _parse_timestamp(claimed_at)
+        # The episodes table belongs to the EpisodeStore DDL and may not exist
+        # yet in a store that never recorded an episode: no table means no
+        # re-arm evidence (fail-closed), not a migration.
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table'"
+            " AND name='opportunity_episodes'"
+        ).fetchone()
+        if table is None:
+            return False
+        rows = connection.execute(
+            "SELECT closed_at FROM opportunity_episodes"
+            " WHERE episode_lineage_id=? AND close_reason=?"
+            " AND closed_at IS NOT NULL",
+            (current_lineage, CLOSE_NO_QUALIFIED_OPPORTUNITY),
+        ).fetchall()
+        for row in rows:
+            if _parse_timestamp(row["closed_at"]) > boundary:
+                return True
+        return False
+
+    def _n_leg_lineage_lock_decision(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        component_id: object,
+        frozen_lineage_id: object,
+    ) -> tuple[str | None, str | None]:
+        """Resolve the batch's component in the runtime graph and enforce the
+        executed-lock over the whole family (issue #122 R1-R4).
+
+        Returns ``(claim_lineage, reason)``: ``claim_lineage`` is the resolved
+        graph lineage the batch must claim (the caller records it as the
+        claim key and overwrites the stored payload's display field), or None
+        to keep the legacy frozen-string behavior; ``reason`` is a stable
+        rejection literal. The frozen payload string is never trusted as the
+        identity: when the payload carries a ``component_id`` the graph row
+        for it decides, and an unresolvable identity fails closed.
+        """
+        # The graph tables belong to the RuntimeGraphStore DDL and may not
+        # exist yet in a store that never built the runtime graph: an
+        # explicit component identity then fails closed, while callers that
+        # freeze only a display string keep the legacy behavior.
+        graph_available = (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table'"
+                " AND name='n_leg_episode_lineage'"
+            ).fetchone()
+            is not None
+        )
+        has_component_id = isinstance(component_id, str) and bool(component_id)
+        row = None
+        if has_component_id:
+            if not graph_available:
+                return None, "N_LEG_LINEAGE_UNKNOWN"
+            row = connection.execute(
+                "SELECT component_id, lineage_id FROM n_leg_episode_lineage"
+                " WHERE component_id=?",
+                (component_id,),
+            ).fetchone()
+            if row is None:
+                return None, "N_LEG_LINEAGE_UNKNOWN"
+            identity = component_id
+        elif graph_available:
+            # Callers that freeze only the display lineage string (the queue
+            # path) are still resolved through the GRAPH, never trusted: a
+            # legacy ``lineage:{component_id}`` string resolves that component
+            # row, any other string resolves the row currently carrying it as
+            # its lineage. Unresolvable strings keep the legacy behavior.
+            if isinstance(frozen_lineage_id, str) and frozen_lineage_id:
+                if frozen_lineage_id.startswith("lineage:"):
+                    legacy_component_id = frozen_lineage_id[len("lineage:") :]
+                    if legacy_component_id:
+                        row = connection.execute(
+                            "SELECT component_id, lineage_id"
+                            " FROM n_leg_episode_lineage WHERE component_id=?",
+                            (legacy_component_id,),
+                        ).fetchone()
+                else:
+                    row = connection.execute(
+                        "SELECT component_id, lineage_id FROM n_leg_episode_lineage"
+                        " WHERE lineage_id=?"
+                        " ORDER BY (status='ACTIVE') DESC, generation DESC LIMIT 1",
+                        (frozen_lineage_id,),
+                    ).fetchone()
+            if row is None:
+                return None, None
+            identity = str(row["component_id"])
+        else:
+            return None, None
+        current_lineage = str(row["lineage_id"])
+        blocked = {current_lineage}
+        blocked |= self._n_leg_lineage_ancestors(connection, current_lineage)
+        # Legacy-format claim rows (``lineage:{component_id}``) written
+        # before #122 keep blocking their resolved families; an unknown
+        # legacy component id falls back to the exact component-string
+        # comparison (no weaker than the pre-#122 behavior).
+        legacy_exact: set[str] = set()
+        for claim_row in connection.execute(
+            "SELECT episode_lineage_id FROM n_leg_lineage_claims"
+            " WHERE episode_lineage_id LIKE 'lineage:%'"
+        ).fetchall():
+            legacy_component_id = str(claim_row["episode_lineage_id"])[
+                len("lineage:") :
+            ]
+            legacy_row = connection.execute(
+                "SELECT lineage_id FROM n_leg_episode_lineage WHERE component_id=?",
+                (legacy_component_id,),
+            ).fetchone()
+            if legacy_row is None:
+                legacy_exact.add(legacy_component_id)
+            else:
+                blocked.add(str(legacy_row["lineage_id"]))
+        placeholders = ",".join("?" for _ in blocked)
+        hits = {
+            str(hit["episode_lineage_id"]): str(hit["created_at"])
+            for hit in connection.execute(
+                "SELECT episode_lineage_id, created_at FROM n_leg_lineage_claims"
+                f" WHERE episode_lineage_id IN ({placeholders})",
+                tuple(sorted(blocked)),
+            ).fetchall()
+        }
+        if current_lineage in hits or identity in legacy_exact:
+            return None, "N_LEG_LINEAGE_ALREADY_CLAIMED"
+        if hits:
+            newest_claim = max(hits.values())
+            if not self._n_leg_lineage_rearm_evidence(
+                connection, current_lineage, newest_claim
+            ):
+                return None, "N_LEG_LINEAGE_INHERITED_CLAIMED"
+        return current_lineage, None
+
+    def n_leg_lineage_admission_check(self, component_id: str) -> dict[str, object]:
+        """Read-only executed-lock precheck for one frozen lineage identity
+        (issue #122 R5).
+
+        ``component_id`` is the frozen lineage identity the confirm seam is
+        about to freeze — the resolver entry's graph lineage (digest), the
+        legacy ``lineage:{component}`` form, or a bare component string. It is
+        decided exactly like the admission transaction decides a queue
+        payload's frozen string (``component_id=None`` path), so the graph's
+        digest-keyed rows block through it whatever literal the caller holds.
+        When the graph cannot resolve the string, the precheck mirrors the
+        admission caller's fallback: an exact ``n_leg_lineage_claims`` hit on
+        the string itself blocks with ``N_LEG_LINEAGE_ALREADY_CLAIMED`` (a
+        pre-#122 claim row keeps blocking its family). Returns
+        ``{"lineage", "blocked", "reason"}``; the transactional check stays
+        the authority. A store whose graph tables were never built has no
+        lineage to precheck — the authoritative admission check still fails
+        unknown identities closed.
+        """
+        identity = str(component_id)
+        with self._read_connection() as connection:
+            # The graph tables belong to the RuntimeGraphStore DDL and may not
+            # exist yet in a store that never built the runtime graph; there
+            # is no lineage to precheck then, and the authoritative admission
+            # check still fails unknown identities closed.
+            table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table'"
+                " AND name='n_leg_episode_lineage'"
+            ).fetchone()
+            if table is None:
+                return {"lineage": None, "blocked": False, "reason": None}
+            claim_lineage, reason = self._n_leg_lineage_lock_decision(
+                connection, component_id=None, frozen_lineage_id=identity
+            )
+            if claim_lineage is None and reason is None:
+                # The string is unresolvable for the graph (an unknown
+                # family): mirror the admission caller's exact-match fallback
+                # so a pre-#122 claim on this very string still blocks.
+                if connection.execute(
+                    "SELECT 1 FROM n_leg_lineage_claims WHERE episode_lineage_id=?",
+                    (identity,),
+                ).fetchone() is not None:
+                    reason = "N_LEG_LINEAGE_ALREADY_CLAIMED"
+            return {
+                "lineage": claim_lineage,
+                "blocked": reason is not None,
+                "reason": reason,
+            }
+
     def n_leg_create_batch(
         self,
         payload: Mapping[str, object],
@@ -2852,10 +3071,21 @@ class PredictionArbitrageStore:
                 raise ValueError("N_LEG_BREAKER_OPEN")
             if control["active_batch_id"] is not None:
                 raise ValueError("N_LEG_ACTIVE_BATCH_EXISTS")
-            if connection.execute(
-                "SELECT 1 FROM n_leg_lineage_claims WHERE episode_lineage_id=?", (lineage_id,)
-            ).fetchone() is not None:
-                raise ValueError("N_LEG_LINEAGE_ALREADY_CLAIMED")
+            claim_lineage, lineage_reason = self._n_leg_lineage_lock_decision(
+                connection,
+                component_id=payload.get("component_id"),
+                frozen_lineage_id=lineage_id,
+            )
+            if lineage_reason is not None:
+                raise ValueError(lineage_reason)
+            if claim_lineage is None:
+                if connection.execute(
+                    "SELECT 1 FROM n_leg_lineage_claims WHERE episode_lineage_id=?",
+                    (lineage_id,),
+                ).fetchone() is not None:
+                    raise ValueError("N_LEG_LINEAGE_ALREADY_CLAIMED")
+            else:
+                lineage_id = claim_lineage
             if expected_versions is not None and self._admission_version_mismatch(
                 connection, control, payload, expected_versions
             ):
@@ -2869,6 +3099,10 @@ class PredictionArbitrageStore:
                 raise ValueError("N_LEG_ADMISSION_UNSETTLED_CAP")
             stored_payload = dict(payload)
             stored_payload["prior_unsettled_capital_units"] = int(control["total_unsettled_capital_units"])
+            if claim_lineage is not None:
+                # R4: the stored lineage identity is the graph's resolved
+                # current lineage, never the frozen confirm display string.
+                stored_payload["episode_lineage_id"] = lineage_id
             encoded = _dump_execution_payload(stored_payload)
             connection.execute(
                 "INSERT INTO n_leg_lineage_claims(episode_lineage_id, opportunity_episode_id, execution_batch_id, created_at) VALUES (?, ?, ?, ?)",

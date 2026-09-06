@@ -2634,3 +2634,283 @@ def test_issue64_real_resolver_chain_confirm_admit_submit_complete(
         assert control["total_unsettled_capital_units"] == 16_000_040
     finally:
         resolver.stop()
+
+
+# --------------------------------------------------------------------------
+# Issue #122 (approved case 9): the executed lock survives real SPLIT and
+# MERGE rotations end to end. A real RuntimeRelationGraph rotates inside the
+# SAME prediction SQLite as the caps-configured confirm store; the public
+# HTTP confirm endpoint rejects the successor with the inherited-claim
+# literal before the family re-arm and confirms it after the successor's own
+# real EpisodeTracker negative-proof close (stamped after the ancestor
+# claim).
+# --------------------------------------------------------------------------
+
+
+def _issue122_rotation_store(tmp_path: Path, generation: dict[str, object]):
+    """A caps-configured confirm store plus a real runtime graph over the
+    SAME prediction SQLite, refreshed once on the given catalog generation."""
+    from test_prediction_n_leg_confirm import _caps_store
+    from test_prediction_runtime_graph import make_graph
+
+    store = _caps_store(tmp_path)
+    graph, state, meta = make_graph(tmp_path / "data", generation)
+    graph.refresh()
+    return store, graph, state, meta
+
+
+def _issue122_claim_family(store, tmp_path: Path, component_id: str) -> None:
+    """Execute one family through the real admission seam, then free the
+    single-active-batch gate (not under test) with the approved controls idiom."""
+    import sqlite3
+
+    store.n_leg_create_batch(
+        {
+            "execution_batch_id": "batch-family",
+            "opportunity_episode_id": "episode-family",
+            "episode_lineage_id": f"lineage:{component_id}",
+            "mode": "MANUAL",
+            "state": "ACTIVE",
+            "entry_fingerprint": "entry-family",
+            "execution_solution_fingerprint": "solution-family",
+            "total_unsettled_capital_units": 1,
+            "component_id": component_id,
+        }
+    )
+    with sqlite3.connect(
+        tmp_path / "data" / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
+    ) as connection:
+        connection.execute("UPDATE n_leg_controls SET active_batch_id=NULL")
+
+
+def _issue122_claim_created_at(tmp_path: Path) -> datetime:
+    import sqlite3
+
+    with sqlite3.connect(
+        tmp_path / "data" / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
+    ) as connection:
+        created_at = connection.execute(
+            "SELECT created_at FROM n_leg_lineage_claims"
+        ).fetchone()[0]
+    return datetime.fromisoformat(str(created_at))
+
+
+def _issue122_rearm_successor(
+    tmp_path: Path, component_id: str, lineage_id: str, *, after: datetime
+) -> None:
+    """The successor's own complete negative proof, driven through the real
+    EpisodeTracker with a controlled clock, closing strictly after ``after``."""
+    from decimal import Decimal
+
+    from open_trader.prediction_n_leg_episodes import EpisodeStore, EpisodeTracker
+
+    tracker = EpisodeTracker(store=EpisodeStore(tmp_path / "data"))
+    fingerprints = {
+        "component_generation": 1,
+        "model_fingerprint": "model-1",
+        "quote_fingerprint": "quote-1",
+        "qualification_fingerprint": "qual-1",
+        "qualification_policy_version": "1",
+    }
+    tracker.observe_qualified(
+        component_id,
+        lineage_id,
+        Decimal("1"),
+        False,
+        None,
+        fingerprints,
+        after + timedelta(hours=1),
+    )
+    for offset in (0, 300):
+        tracker.observe_negative(
+            component_id,
+            proof_fingerprint=f"proof-{offset}",
+            generation=1,
+            model_fingerprint="model-1",
+            quote_fingerprint="quote-1",
+            qualification_fingerprint="qual-1",
+            binding_matches=True,
+            quote_fresh=True,
+            gap_seconds=300,
+            now=after + timedelta(hours=1, seconds=offset),
+            qualification_policy_version="1",
+        )
+
+
+def _issue122_confirm_via_http(store, entry, idempotency_key: str):
+    """One POST through the production confirm endpoint; HTTP errors come
+    back as (status, body-text)."""
+    import urllib.error
+
+    from open_trader.prediction_service import create_prediction_server
+    from test_prediction_api_contract import _json_response, _post, _serve
+    from test_prediction_n_leg_confirm import _ConfirmRuntime, _shared_runtime_store
+
+    runtime = _ConfirmRuntime(store, [entry])
+    _shared_runtime_store.clear()
+    _shared_runtime_store.append(store)
+    server = create_prediction_server(
+        runtime=runtime,  # type: ignore[arg-type]
+        port=0,
+        session_token="session-token",
+        csrf_token="csrf-token",
+        runtime_metadata={"git_sha": "abc123"},
+    )
+    with _serve(server) as base:
+        request = {
+            "component_id": entry["component_id"],
+            "displayed_fingerprint": "sha256:displayed",
+            "idempotency_key": idempotency_key,
+        }
+        try:
+            status, _headers, body = _json_response(
+                _post(
+                    base,
+                    "/api/prediction-arbitrage/n-leg/orders/confirm",
+                    request,
+                )
+            )
+            return status, body
+        except urllib.error.HTTPError as error:
+            return error.code, error.read().decode("utf-8")
+
+
+def test_case9_split_rotation_lock_and_rearm_end_to_end(tmp_path: Path) -> None:
+    from test_prediction_n_leg_confirm import _solution_entry
+    from test_prediction_runtime_graph import row
+
+    store, graph, state, meta = _issue122_rotation_store(
+        tmp_path,
+        {
+            "IMPLIES|polymarket:ca|polymarket:cb": row(
+                "v1", [("polymarket", "ca"), ("polymarket", "cb")]
+            ),
+            "IMPLIES|polymarket:cb|polymarket:cc": row(
+                "v2", [("polymarket", "cb"), ("polymarket", "cc")]
+            ),
+        },
+    )
+    family = next(iter(graph.components().values()))
+    _issue122_claim_family(store, tmp_path, family.component_id)
+
+    # Real rotation: one generation advance splits the family in two.
+    state.clear()
+    state.update(
+        {
+            "IMPLIES|polymarket:ca|polymarket:cb": row(
+                "v3", [("polymarket", "ca"), ("polymarket", "cb")]
+            ),
+            "IMPLIES|polymarket:cc|polymarket:cd": row(
+                "v4", [("polymarket", "cc"), ("polymarket", "cd")]
+            ),
+        }
+    )
+    meta["generation"] += 1
+    graph.refresh()
+    successors = sorted(
+        graph.components().values(), key=lambda component: component.component_id
+    )
+    assert len(successors) == 2
+    successor = successors[0]
+    assert family.lineage_id in successor.predecessor_lineage_ids
+
+    def successor_entry() -> dict[str, object]:
+        # The HTTP handler confirms against real wall-clock time, so the
+        # fixture release must be future-dated relative to now (the approved
+        # endpoint-test idiom).
+        entry = _solution_entry(
+            component_id=successor.component_id,
+            release_at=(datetime.now(UTC) + timedelta(days=20)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
+        )
+        entry["lineage_id"] = successor.lineage_id
+        return entry
+
+    # Before the re-arm: the public confirm endpoint rejects with the literal.
+    status, body = _issue122_confirm_via_http(
+        store, successor_entry(), "issue122-split-blocked"
+    )
+    assert status == 409
+    assert "N_LEG_LINEAGE_INHERITED_CLAIMED" in body
+
+    # The successor's own negative-proof close, stamped after the claim.
+    _issue122_rearm_successor(
+        tmp_path,
+        successor.component_id,
+        successor.lineage_id,
+        after=_issue122_claim_created_at(tmp_path),
+    )
+
+    # After the re-arm: the same endpoint confirms the successor, and the
+    # frozen identity is the successor's own graph lineage truth.
+    status, body = _issue122_confirm_via_http(
+        store, successor_entry(), "issue122-split-rearmed"
+    )
+    assert status == 200, body
+    stored = store.n_leg_requests()[0]
+    assert stored["state"] == "PENDING"
+    assert stored["payload"]["episode_lineage_id"] == successor.lineage_id
+
+
+def test_case9_merge_rotation_lock_and_rearm_end_to_end(tmp_path: Path) -> None:
+    from test_prediction_n_leg_confirm import _solution_entry
+    from test_prediction_runtime_graph import row
+
+    store, graph, state, meta = _issue122_rotation_store(
+        tmp_path,
+        {
+            "IMPLIES|polymarket:ca|polymarket:cb": row(
+                "v1", [("polymarket", "ca"), ("polymarket", "cb")]
+            ),
+            "IMPLIES|polymarket:cd|polymarket:ce": row(
+                "v2", [("polymarket", "cd"), ("polymarket", "ce")]
+            ),
+        },
+    )
+    executed, _spared = sorted(
+        graph.components().values(), key=lambda component: component.component_id
+    )
+    _issue122_claim_family(store, tmp_path, executed.component_id)
+
+    # Real rotation: the bridge relation merges both families into one.
+    state["IMPLIES|polymarket:cb|polymarket:cd"] = row(
+        "v3", [("polymarket", "cb"), ("polymarket", "cd")]
+    )
+    meta["generation"] += 1
+    graph.refresh()
+    merged = list(graph.components().values())
+    assert len(merged) == 1 and merged[0].change_kind == "MERGE"
+    successor = merged[0]
+    assert executed.lineage_id in successor.predecessor_lineage_ids
+
+    # The HTTP handler confirms against real wall-clock time, so the fixture
+    # release must be future-dated relative to now (the endpoint-test idiom).
+    entry = _solution_entry(
+        component_id=successor.component_id,
+        release_at=(datetime.now(UTC) + timedelta(days=20)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        ),
+    )
+    entry["lineage_id"] = successor.lineage_id
+
+    status, body = _issue122_confirm_via_http(
+        store, entry, "issue122-merge-blocked"
+    )
+    assert status == 409
+    assert "N_LEG_LINEAGE_INHERITED_CLAIMED" in body
+
+    _issue122_rearm_successor(
+        tmp_path,
+        successor.component_id,
+        successor.lineage_id,
+        after=_issue122_claim_created_at(tmp_path),
+    )
+
+    status, body = _issue122_confirm_via_http(
+        store, entry, "issue122-merge-rearmed"
+    )
+    assert status == 200, body
+    stored = store.n_leg_requests()[0]
+    assert stored["state"] == "PENDING"
+    assert stored["payload"]["episode_lineage_id"] == successor.lineage_id

@@ -245,6 +245,21 @@ def confirm_enqueue(
     if max_unsettled > 0 and projected_units + unsettled > max_unsettled:
         raise NLegConfirmRejected("UNSETTLED_CAP_EXCEEDED")
 
+    # Issue #122 (R5): the executed-lock precheck runs the same decision the
+    # admission transaction enforces, so a claimed family rejects back to
+    # monitoring before anything is frozen. The precheck identity is the
+    # frozen lineage string below (the resolver entry's graph lineage, or the
+    # legacy synthetic form): the graph's rows are digest-keyed, so the
+    # caller-facing oracle component id can never match them. The
+    # transactional admission check stays the authority; this seam only
+    # surfaces its literal early.
+    frozen_lineage_id = str(entry.get("lineage_id") or f"lineage:{component_id}")
+    lineage_check = store.n_leg_lineage_admission_check(frozen_lineage_id)
+    if lineage_check.get("blocked"):
+        raise NLegConfirmRejected(
+            str(lineage_check.get("reason") or "N_LEG_LINEAGE_UNKNOWN")
+        )
+
     # 6. Freeze the current solution and enqueue (ruling 2 audit block).
     # The frozen payloads are the admission-grade heavy #51 ones when the
     # resolver retained them (the queue-head re-decode consumes exactly
@@ -320,9 +335,13 @@ def confirm_enqueue(
         "enqueued_at": now.isoformat(),
         # FIFO handoff facts for the queue-head driver (Slice 5): stable
         # family lineage (one real batch per opportunity family) and the
-        # bound proof record for admission re-binding.
+        # bound proof record for admission re-binding. Issue #122 (R4): the
+        # frozen lineage identity is the resolver entry's graph lineage; the
+        # legacy synthetic form only survives for entries without one, and
+        # the admission transaction never trusts either — it re-resolves the
+        # lineage from the graph inside its own transaction.
         "opportunity_episode_id": f"episode:{component_id}:{bound_fingerprint[-12:]}",
-        "episode_lineage_id": f"lineage:{component_id}",
+        "episode_lineage_id": frozen_lineage_id,
         "execution_batch_id": f"nleg-b-{now.strftime('%Y%m%d%H%M%S')}-{abs(hash(idempotency_key)) % 10**8:08d}",
     }
     if partial_fill_proof is not None:

@@ -1082,3 +1082,174 @@ def test_f5_light_path_same_generation_keeps_exact_block_shape(
         "bound_fingerprint": fingerprint(entry["execution"]),
         "rotated": False,
     }
+
+
+# ---------------------------------------------------------------------------
+# Issue #122: the confirm seam runs the same executed-lock decision the
+# admission transaction enforces (R5 precheck), and the frozen lineage
+# identity is the resolver entry's graph lineage, never a synthetic string.
+# ---------------------------------------------------------------------------
+
+
+def _merge_rotation_graph(tmp_path: Path):
+    """A real runtime graph over the confirm store's own SQLite: two disjoint
+    NEW families that one bridge relation later merges into one successor."""
+    from test_prediction_runtime_graph import make_graph, row
+
+    graph, state, meta = make_graph(
+        tmp_path / "data",
+        {
+            "IMPLIES|polymarket:ca|polymarket:cb": row(
+                "v1", [("polymarket", "ca"), ("polymarket", "cb")]
+            ),
+            "IMPLIES|polymarket:cd|polymarket:ce": row(
+                "v2", [("polymarket", "cd"), ("polymarket", "ce")]
+            ),
+        },
+    )
+    graph.refresh()
+    return graph, state, meta
+
+
+def _claim_family(
+    store: PredictionArbitrageStore, tmp_path: Path, component_id: str
+) -> None:
+    """Record the executed-family claim through the real admission seam, then
+    free the single-active-batch gate (not under test) with the approved
+    controls-seam idiom."""
+    import sqlite3
+
+    store.n_leg_create_batch(
+        {
+            "execution_batch_id": "batch-family",
+            "opportunity_episode_id": "episode-family",
+            "episode_lineage_id": f"lineage:{component_id}",
+            "mode": "MANUAL",
+            "state": "ACTIVE",
+            "entry_fingerprint": "entry-family",
+            "execution_solution_fingerprint": "solution-family",
+            "total_unsettled_capital_units": 1,
+            "component_id": component_id,
+        }
+    )
+    with sqlite3.connect(
+        tmp_path / "data" / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
+    ) as connection:
+        connection.execute("UPDATE n_leg_controls SET active_batch_id=NULL")
+
+
+def test_issue122_confirm_precheck_rejects_inherited_claim_without_queue_row(
+    tmp_path: Path,
+) -> None:
+    store = _caps_store(tmp_path)
+    graph, state, meta = _merge_rotation_graph(tmp_path)
+    components = graph.components()
+    executed, _spared = sorted(
+        components.values(), key=lambda component: component.component_id
+    )
+    _claim_family(store, tmp_path, executed.component_id)
+
+    # Real rotation: the bridge relation merges both families into one.
+    from test_prediction_runtime_graph import row
+
+    state["IMPLIES|polymarket:cb|polymarket:cd"] = row(
+        "v3", [("polymarket", "cb"), ("polymarket", "cd")]
+    )
+    meta["generation"] += 1
+    graph.refresh()
+    merged = list(graph.components().values())
+    assert len(merged) == 1 and merged[0].change_kind == "MERGE"
+    successor = merged[0]
+    assert executed.lineage_id in successor.predecessor_lineage_ids
+
+    entry = _solution_entry(component_id=successor.component_id)
+    entry["lineage_id"] = successor.lineage_id
+
+    with pytest.raises(NLegConfirmRejected) as excinfo:
+        _confirm(
+            store,
+            [entry],
+            component_id=successor.component_id,
+            idempotency_key="issue122-precheck",
+        )
+
+    assert excinfo.value.reason == "N_LEG_LINEAGE_INHERITED_CLAIMED"
+    assert store.n_leg_requests() == []
+
+
+def test_issue122_confirm_freezes_resolver_lineage_identity(
+    tmp_path: Path,
+) -> None:
+    store = _caps_store(tmp_path)
+    graph, _state, _meta = _merge_rotation_graph(tmp_path)
+    components = graph.components()
+    assert len(components) == 2
+    component = next(iter(components.values()))
+
+    entry = _solution_entry(component_id=component.component_id)
+    entry["lineage_id"] = component.lineage_id
+
+    result = _confirm(
+        store,
+        [entry],
+        component_id=component.component_id,
+        idempotency_key="issue122-freeze",
+    )
+
+    assert result["state"] == "PENDING"
+    payload = store.n_leg_requests()[0]["payload"]
+    # The frozen identity is the graph lineage truth, read from the graph.
+    assert payload["episode_lineage_id"] == component.lineage_id
+
+
+def test_issue122_confirm_precheck_blocks_oracle_format_component_id(
+    tmp_path: Path,
+) -> None:
+    """The production confirm identity is the oracle component id
+    (``component:<contracts>``), never the graph's sha256 digest: the R5
+    precheck must therefore run on the frozen lineage string the resolver's
+    ``_lineage_by_component`` mapping carries (``prediction_live_resolver.
+    _reconcile``), or a claimed family's successor is never rejected before
+    anything is enqueued."""
+    store = _caps_store(tmp_path)
+    graph, state, meta = _merge_rotation_graph(tmp_path)
+    components = graph.components()
+    executed, _spared = sorted(
+        components.values(), key=lambda component: component.component_id
+    )
+    _claim_family(store, tmp_path, executed.component_id)
+
+    # Real rotation: the bridge relation merges both families into one.
+    from test_prediction_runtime_graph import row
+
+    state["IMPLIES|polymarket:cb|polymarket:cd"] = row(
+        "v3", [("polymarket", "cb"), ("polymarket", "cd")]
+    )
+    meta["generation"] += 1
+    graph.refresh()
+    merged = list(graph.components().values())
+    assert len(merged) == 1 and merged[0].change_kind == "MERGE"
+    successor = merged[0]
+    assert executed.lineage_id in successor.predecessor_lineage_ids
+
+    # Production identity shape: the oracle component id is rebuilt from the
+    # successor's venue-qualified contracts exactly as the resolver's
+    # lineage map does (contract ids stripped of the venue prefix).
+    raw_contracts = sorted(
+        contract.split(":", 1)[1] if ":" in contract else contract
+        for contract in successor.contract_ids
+    )
+    oracle_component_id = f"component:{':'.join(raw_contracts)}"
+    entry = _solution_entry(component_id=oracle_component_id)
+    entry["lineage_id"] = successor.lineage_id
+
+    with pytest.raises(NLegConfirmRejected) as excinfo:
+        _confirm(
+            store,
+            [entry],
+            component_id=oracle_component_id,
+            idempotency_key="issue122-oracle-precheck",
+        )
+
+    assert excinfo.value.reason == "N_LEG_LINEAGE_INHERITED_CLAIMED"
+    assert store.n_leg_requests() == []

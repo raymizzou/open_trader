@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 import time
 from concurrent.futures import Future
 from dataclasses import replace
@@ -53,6 +54,7 @@ from open_trader.prediction_n_leg_episodes import (
     EpisodeTracker,
 )
 from open_trader.prediction_n_leg_oracle import evaluate_fixed_portfolio
+from open_trader.prediction_runtime_graph import RuntimeGraphStore
 from open_trader.prediction_solver import (
     ObjectiveBounds,
     PortfolioCandidate,
@@ -1743,3 +1745,246 @@ def test_start_survives_startup_reconcile_conflict(
     instance.stop()
     assert instance._thread is None
     assert server.requests == []
+
+
+# ---------------------------------------------------------------------------
+# Issue #122 (finding P2): a family the runtime graph has no row for — the
+# oracle's settlement-observation identity join is broader than the graph's
+# relation-endpoint partition — must keep the pre-#122 legacy claim-key shape
+# ``lineage:{component_id}``. Confirm freezes it, the R5 precheck decides on
+# it, and the admission frozen-string fallback exact-matches it, so pre-#122
+# claim rows keep blocking the family (the review repro slipped past both
+# with a bare component id) and claim-less families behave exactly as they
+# did before #122.
+# ---------------------------------------------------------------------------
+
+
+def _identity_joined_rows() -> dict[str, object]:
+    """Two contract families sharing one settlement observation: the oracle's
+    identity join merges them into one component while the graph's endpoint
+    partition keeps two single-contract families, so the merged oracle
+    component id has no graph row and ``_lineage_by_component`` misses."""
+    shared = observation("contract-a")
+
+    def shared_action(
+        action_id: str, contract_id: str, side: ActionSide
+    ) -> CandidateAction:
+        return CandidateAction(
+            action_id=action_id,
+            venue_id="polymarket",
+            account_id="test-account",
+            chain_id="test-chain",
+            market_contract_id=contract_id,
+            settlement_observation_key=shared,
+            side=side,
+            lot_step_units=1,
+            quantity_scale=1,
+            min_quantity_lots=1,
+            max_quantity_lots=2,
+            settlement_asset_id="usd-cents",
+            valuation_unit_id="usd-cents",
+            asset_valuation_rule_id="usd-cents-v1",
+            cost_slices=(ExecutableCostSlice(1, 2, 1),),
+        )
+
+    def shared_state(contract_id: str, yes_id: str, no_id: str) -> TerminalStateSet:
+        return TerminalStateSet(
+            contract_id,
+            shared,
+            "v1",
+            (
+                TerminalAtom(
+                    f"{contract_id}:yes",
+                    TerminalKind.NORMAL_YES,
+                    "v1",
+                    (ActionPayout(yes_id, 1), ActionPayout(no_id, 0)),
+                    AS_OF,
+                ),
+                TerminalAtom(
+                    f"{contract_id}:no",
+                    TerminalKind.NORMAL_NO,
+                    "v1",
+                    (ActionPayout(yes_id, 0), ActionPayout(no_id, 1)),
+                    AS_OF,
+                ),
+            ),
+        )
+
+    def shared_problem(contract: str, yes_id: str, no_id: str) -> ArbitrageProblem:
+        return ArbitrageProblem(
+            PROBLEM_SCHEMA_V1,
+            "live-test",
+            AS_OF,
+            "usd-cents",
+            (
+                shared_action(yes_id, contract, ActionSide.BUY_YES),
+                shared_action(no_id, contract, ActionSide.BUY_NO),
+            ),
+            (shared_state(contract, yes_id, no_id),),
+            ConstraintModel((), ()),
+            (),
+        )
+
+    return {
+        "r:a": row("r:a", shared_problem("contract-a", "a-yes", "a-no")),
+        "r:b": row("r:b", shared_problem("contract-b", "b-yes", "b-no")),
+    }
+
+
+def test_issue122_graph_unknown_family_lineage_keeps_legacy_claim_key(
+    tmp_path: Path,
+) -> None:
+    rows = _identity_joined_rows()
+    # The merged component spans two contracts, so the worker budget must
+    # cover their joint states.
+    budget = OracleBudget(
+        max_quantity_vectors=16, max_joint_states=8, max_support_rechecks=1
+    )
+    server = FakeServer()
+    instance = PredictionLiveResolver(
+        data_dir=tmp_path,
+        relation_catalog=FakeCatalog(rows),
+        monitor=FakeMonitor(
+            {
+                "contract-a": live_book("contract-a"),
+                "contract-b": live_book("contract-b"),
+            }
+        ),
+        solver_server=server,
+        selection_store=MonitorSelectionStore(tmp_path),
+        store=FakeStore(),
+        execution=FakeExecution(AccountView(1_000_000, 1_000_000, 0)),
+        poll_interval=0.01,
+        budget=budget,
+    )
+    valid = valid_selected(
+        rows,
+        contract_ids=("contract-a", "contract-b"),
+        action_ids=("a-yes", "a-no"),
+    )
+    instance._selection_store.save({valid.component_id: valid})
+    instance._tick()
+    request = server.requests[0]
+
+    def evidence(problem: ArbitrageProblem) -> dict[str, object]:
+        # The solved portfolio stays inside one contract: a single-contract
+        # portfolio is connected, so the identity-joined component holds a
+        # real market solution even though no relation spans its contracts.
+        quantities = tuple(
+            ActionQuantity(action_id, 1) for action_id in ("a-yes", "a-no")
+        )
+        evaluation = evaluate_fixed_portfolio(problem, quantities, budget)
+        solver_evidence = SolverEvidence(
+            native_status="FEASIBLE",
+            candidate=PortfolioCandidate(
+                quantities, evaluation.guaranteed_profit_units
+            ),
+            objective_bounds=ObjectiveBounds(
+                evaluation.guaranteed_profit_units, None, None, False
+            ),
+            worst_scenario=evaluation.worst_scenario,
+            payout_lower_bound_units=evaluation.payout_lower_bound_units,
+            cost_upper_bound_units=evaluation.cost_upper_bound_units,
+            guaranteed_profit_units=evaluation.guaranteed_profit_units,
+            conservative_capital_release_at=(
+                evaluation.conservative_capital_release_at
+            ),
+            fixed_portfolio_closed=True,
+            global_search_closed=False,
+            master_rounds=0,
+            adversary_rounds=0,
+            cuts=(evaluation.worst_state_cut,),
+            certificate=None,
+        )
+        return canonical_payload(solver_evidence)
+
+    server.futures[0].set_result(
+        worker_outcome(request, evidence(request.request.problem))
+    )
+    instance._tick()
+
+    # Graph truth: two single-contract families — nothing maps the merged
+    # oracle component id, so ``_lineage_by_component`` really misses.
+    _generation, _fingerprint, graph_components = RuntimeGraphStore(tmp_path).load()
+    assert {
+        component.contract_ids
+        for component in graph_components.values()
+        if component.status == "ACTIVE"
+    } == {
+        ("polymarket:contract-a",),
+        ("polymarket:contract-b",),
+    }
+
+    (entry,) = instance.solutions()
+    oracle_id = str(entry["component_id"])
+    assert oracle_id == "component:contract-a:contract-b"
+    lineage_id = str(entry["lineage_id"])
+    # The pre-#122 legacy claim-key shape, never the bare component id.
+    assert lineage_id == f"lineage:{oracle_id}"
+
+    # The pre-#122 claim row shape (what confirm froze and admission claimed
+    # before #122), pre-inserted as the history of an executed family.
+    legacy_key = f"lineage:{oracle_id}"
+    db_path = tmp_path / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
+    store = PredictionArbitrageStore(tmp_path)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "INSERT INTO n_leg_lineage_claims"
+            "(episode_lineage_id, opportunity_episode_id, execution_batch_id,"
+            " created_at) VALUES (?, 'episode-pre122', 'batch-pre122', ?)",
+            (legacy_key, "2026-08-01T00:00:00+00:00"),
+        )
+
+    # The R5 precheck seam — the store call confirm makes with the frozen
+    # string — blocks the family off the pre-#122 claim.
+    assert store.n_leg_lineage_admission_check(lineage_id) == {
+        "lineage": None,
+        "blocked": True,
+        "reason": "N_LEG_LINEAGE_ALREADY_CLAIMED",
+    }
+
+    # The admission transaction's frozen-string path (the queue-head driver
+    # enters batches without a component_id) rejects the second execution
+    # and leaves no batch row.
+    payload = {
+        "execution_batch_id": "batch-successor",
+        "opportunity_episode_id": "episode-successor",
+        "episode_lineage_id": lineage_id,
+        "mode": "MANUAL",
+        "state": "ACTIVE",
+        "entry_fingerprint": "entry-successor",
+        "execution_solution_fingerprint": "solution-successor",
+        "total_unsettled_capital_units": 1,
+    }
+    with pytest.raises(ValueError, match="N_LEG_LINEAGE_ALREADY_CLAIMED"):
+        store.n_leg_create_batch(payload)
+    with sqlite3.connect(db_path) as connection:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM n_leg_lineage_claims").fetchone()[0]
+            == 1
+        )
+        assert (
+            connection.execute("SELECT COUNT(*) FROM n_leg_batches").fetchone()[0] == 0
+        )
+
+    # Without the pre-#122 claim the family behaves exactly as before #122:
+    # the precheck does not misblock, and admission claims the frozen string.
+    RuntimeGraphStore(tmp_path / "clean")
+    clean_store = PredictionArbitrageStore(tmp_path / "clean")
+    assert (
+        clean_store.n_leg_lineage_admission_check(lineage_id)["blocked"] is False
+    )
+    clean_store.n_leg_create_batch(
+        dict(
+            payload,
+            execution_batch_id="batch-clean",
+            opportunity_episode_id="episode-clean",
+        )
+    )
+    with sqlite3.connect(
+        tmp_path / "clean" / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
+    ) as connection:
+        claim_key = connection.execute(
+            "SELECT episode_lineage_id FROM n_leg_lineage_claims"
+        ).fetchone()[0]
+    assert claim_key == lineage_id
