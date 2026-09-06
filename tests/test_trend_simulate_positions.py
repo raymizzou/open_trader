@@ -150,14 +150,20 @@ def test_action_events_sort_aware_timestamps_by_actual_instant(
 
 
 class FakeClient:
-    def __init__(self, positions: list[dict[str, str]]) -> None:
+    def __init__(
+        self,
+        positions: list[dict[str, str]],
+        *,
+        net_value: str = "10000",
+    ) -> None:
         self.positions = positions
+        self.net_value = net_value
         self.closed = False
 
     def account_snapshot(self) -> dict[str, Any]:
         return {
             "acc_id": 102,
-            "net_value": "10000",
+            "net_value": self.net_value,
             "cash": "6659.20",
             "positions": self.positions,
         }
@@ -167,8 +173,14 @@ class FakeClient:
 
 
 class FakeClientFactory:
-    def __init__(self, positions: list[dict[str, str]]) -> None:
+    def __init__(
+        self,
+        positions: list[dict[str, str]],
+        *,
+        net_values: dict[int, str] | None = None,
+    ) -> None:
         self.positions = positions
+        self.net_values = {} if net_values is None else dict(net_values)
         self.calls: list[dict[str, Any]] = []
         self.clients: list[FakeClient] = []
 
@@ -184,7 +196,10 @@ class FakeClientFactory:
         self.calls.append(
             {"market": trd_market, "simulate_acc_id": simulate_acc_id}
         )
-        client = FakeClient(self.positions)
+        client = FakeClient(
+            self.positions,
+            net_value=self.net_values.get(simulate_acc_id, "10000"),
+        )
         self.clients.append(client)
         return client
 
@@ -348,6 +363,28 @@ def test_simulated_positions_route_each_broker_account(
     assert clients.calls == [{"market": market, "simulate_acc_id": account_id}]
     assert payload["broker"] == broker
     assert payload["market"] == market
+
+
+def test_simulated_positions_publish_account_total_hkd_for_each_broker(
+    tmp_path: Path,
+) -> None:
+    clients = FakeClientFactory(
+        positions=[],
+        net_values={102: "10000", 103: "12000", 101: "9000"},
+    )
+    payloads = {
+        broker: _service(tmp_path, clients).load(broker)
+        for broker in ("futu", "phillips", "eastmoney")
+    }
+
+    assert {
+        broker: payload["portfolio_value_hkd"]
+        for broker, payload in payloads.items()
+    } == {
+        "futu": "78000.00",
+        "phillips": "12000.00",
+        "eastmoney": "9720.00",
+    }
 
 
 def test_simulated_positions_reuse_fresh_cached_snapshot(tmp_path: Path) -> None:

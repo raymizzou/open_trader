@@ -3,6 +3,10 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-09-06
+
+- Dashboard「持仓与策略」资产与行业分布改按各账户总资产港元值归一化，现金及其他资产单列；完整展示所有已知行业，空白分类单独归为行业未知，多重命名匹配分拆且市值守恒，模拟账户同步发布港元总资产。验证：聚焦 6 passed、全量 Docker 7999 passed、Candidate Acceptance PASS。
+
 ## 2026-09-05
 
 - Dashboard「持仓与策略」新增只读行业分布（Variant A）：实盘按历史趋势持仓、模拟盘按可见模拟持仓，覆盖美股/港股/A股并以两位小数精确港元市值归一化，缺失/冲突行业归入「其他/未知」，尾部折叠并支持移动端单列；原持仓表与交易路径保持不变。验证：四个 Dashboard 用例逐条红→绿。

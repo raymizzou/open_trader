@@ -10703,7 +10703,7 @@ console.log(JSON.stringify({html,unavailable}));
     assert "<h3>趋势持仓</h3>" not in unavailable and "<h3>非趋势持仓</h3>" not in unavailable
 
 
-def test_dashboard_account_real_industry_distribution_uses_hkd_value_across_us_hk_cn_trend_accounts() -> None:
+def test_dashboard_account_real_asset_industry_distribution_uses_account_total_across_us_hk_cn() -> None:
     output = run_dashboard_js(r'''
 const scenarios = [
   {broker:"futu",market:"US",first:"AAPL",second:"MSFT"},
@@ -10727,11 +10727,13 @@ const rendered = scenarios.map(({broker,market,first,second}) => {
     ],
     historical_buy_plan_membership:{available:true,symbols:[`${market}.${first}`,`${market}.${second}`]},
   }}};
-  const html=renderAccountViewPanel({broker,rows:[
+  const completeRows=[
     row(broker,market,first,600,0),
     row(broker,market,second,400,1),
     row(broker,market,"OUTSIDE",900,2),
-  ]});
+  ];
+  const html=renderAccountViewPanel({broker,rows:[completeRows[0],completeRows[2]],allRows:completeRows,
+    summary:{portfolio_value_hkd:"2000"}});
   return {broker,html};
 });
 console.log(JSON.stringify(rendered));
@@ -10742,15 +10744,18 @@ console.log(JSON.stringify(rendered));
         html = item["html"]
         trend_heading = html.index("<h3>趋势持仓")
         distribution = html[:trend_heading]
-        assert distribution.index("行业分布") < trend_heading
-        assert "HKD 1,000" in distribution
-        assert "科技" in distribution and "金融" in distribution
-        assert "60%" in distribution and "40%" in distribution
-        assert "HKD 900" not in distribution
+        assert "资产与行业分布" in distribution
+        assert "总资产 HKD 2,000" in distribution
+        assert "科技" in distribution and "HKD 600" in distribution and "30%" in distribution
+        assert "金融" in distribution and "HKD 400" in distribution and "20%" in distribution
+        assert "现金及其他资产" in distribution and "HKD 1,000" in distribution and "50%" in distribution
+        assert "非趋势资产及现金类资产" in distribution
+        assert "HKD 900" in html[html.index("非趋势持仓"):]
+        assert "OUTSIDE" in html[html.index("非趋势持仓"):]
         assert html.count('class="account-holdings-table"') == 2
 
 
-def test_dashboard_account_simulated_industry_distribution_uses_hkd_value_across_us_hk_cn() -> None:
+def test_dashboard_account_simulated_asset_industry_distribution_uses_account_total_and_keeps_cash_only_visible() -> None:
     output = run_dashboard_js(r'''
 const scenarios = [
   {broker:"futu",market:"US",first:"AAPL",second:"MSFT",labels:["美股科技","美股金融"]},
@@ -10768,111 +10773,193 @@ const rendered = scenarios.map(({broker,market,first,second,labels}) => {
       action(market,second,labels[1]),
     ],
   }}};
-  state.trendSimulatePositions[broker]={available:true,broker,positions:[
+  state.trendSimulatePositions[broker]={available:true,broker,portfolio_value_hkd:"4000",positions:[
     {broker,market,symbol:first,name:first,quantity:"1",market_value_hkd:"750"},
     {broker,market,symbol:second,name:second,quantity:"1",market_value_hkd:"250"},
   ]};
   return {broker,html:renderSimulatedAccountView(broker)};
 });
-console.log(JSON.stringify(rendered));
+state.accountSnapshot={summary:{portfolio_value_hkd:"99999",cash_like_value_hkd:"99999"}};
+state.trendSimulatePositions.futu={available:true,broker:"futu",portfolio_value_hkd:"4000",positions:[]};
+const cashOnly=renderSimulatedAccountView("futu");
+console.log(JSON.stringify({rendered,cashOnly}));
 ''')
-    rendered = json.loads(output)
+    payload = json.loads(output)
+    rendered = payload["rendered"]
     labels = {"futu": ("美股科技", "美股金融"), "phillips": ("港股科技", "港股金融"), "eastmoney": ("A股科技", "A股金融")}
     all_labels = {label for pair in labels.values() for label in pair}
     for item in rendered:
         html = item["html"]
         own_labels = labels[item["broker"]]
         assert "行业分布" in html
-        assert "HKD 1,000" in html
-        assert "75%" in html and "25%" in html
+        assert "资产与行业分布" in html
+        assert "总资产 HKD 4,000" in html
+        assert "18.75%" in html and "6.25%" in html
+        assert "现金及其他资产" in html and "HKD 3,000" in html and "75%" in html
         assert all(label in html for label in own_labels)
         assert not any(label in html for label in all_labels - set(own_labels))
         assert html.count('class="account-holdings-table"') == 1
         assert html.count("account-holding-row") == 2
+    cash_only = payload["cashOnly"]
+    assert "总资产 HKD 4,000" in cash_only
+    assert "现金及其他资产" in cash_only and "HKD 4,000" in cash_only and "100%" in cash_only
+    assert "当前无模拟盘持仓" in cash_only
+    assert "HKD 99,999" not in cash_only
 
 
-def test_dashboard_account_industry_distribution_groups_tail_and_unknown() -> None:
+def test_dashboard_account_asset_industry_distribution_keeps_every_distinct_industry_and_separates_unknown() -> None:
     output = run_dashboard_js(r'''
 const named = [
-  ["A",50,"行业一"], ["B",20,"行业二"], ["C",10,"行业三"],
-  ["D",8,"行业四"], ["E",6,"行业五"], ["F",4,"行业六"],
+  ["A",90,"行业一"], ["B",80,"行业二"], ["C",70,"行业三"],
+  ["D",60,"行业四"], ["E",50,"行业五"], ["F",40,"行业六"],
+  ["G",30,"行业七"], ["H",20,"行业八"], ["I",10,"行业九"],
 ];
 const report = {
   market:"US",
-  real_position_actions:named.map(([symbol,,industry])=>({market:"US",symbol,industry})),
-  historical_buy_plan_membership:{available:true,symbols:named.map(([symbol])=>`US.${symbol}`).concat("US.UNKNOWN")},
+  real_position_actions:named.map(([symbol,,industry])=>({market:"US",symbol,industry})).concat([
+    {market:"US",symbol:"A2",industry:"行业一"},
+    {market:"US",symbol:"UNKNOWN",industry:"冲突A"},
+    {market:"US",symbol:"UNKNOWN",industry:"冲突B"},
+    {market:"US",symbol:"UNKNOWN",industry:""},
+    {market:"US",symbol:"UNKNOWN2",industry:""},
+  ]),
+  historical_buy_plan_membership:{available:true,symbols:named.map(([symbol])=>`US.${symbol}`).concat(["US.A2","US.UNKNOWN","US.UNKNOWN2"])},
 };
 state.dashboard={trend_reports:{futu:report}};
 const rows=named.map(([symbol,value],index)=>({key:`futu:US:${symbol}:${index}`,broker:"futu",
   holding:{market:"US",symbol,futu_symbol:`US.${symbol}`},
   display:{market:"US",symbol,name:symbol,market_value_hkd:String(value)},index}));
-rows.push({key:"futu:US:UNKNOWN:6",broker:"futu",
+rows.push({key:"futu:US:A2:9",broker:"futu",
+  holding:{market:"US",symbol:"A2",futu_symbol:"US.A2"},
+  display:{market:"US",symbol:"A2",name:"A2",market_value_hkd:"5"},index:9});
+rows.push({key:"futu:US:UNKNOWN:10",broker:"futu",
   holding:{market:"US",symbol:"UNKNOWN",futu_symbol:"US.UNKNOWN"},
-  display:{market:"US",symbol:"UNKNOWN",name:"UNKNOWN",market_value_hkd:"2"},index:6});
-const tail = renderAccountViewPanel({broker:"futu",rows});
-const tieNamed = [
-  ["L1", "50", "大行业一"], ["L2", "45", "大行业二"],
-  ["L3", "40", "大行业三"], ["L4", "35", "大行业四"],
-  ["A1", "10.10", "A行业"], ["A2", "20.20", "A行业"],
-  ["B", "30.30", "B行业"],
-];
-const tieReport = {
-  market:"US",
-  real_position_actions:tieNamed.map(([symbol,,industry])=>({market:"US",symbol,industry})),
-  historical_buy_plan_membership:{available:true,symbols:tieNamed.map(([symbol])=>`US.${symbol}`)},
-};
-state.dashboard={trend_reports:{futu:tieReport}};
-const tieRows=tieNamed.map(([symbol,value],index)=>({key:`futu:US:${symbol}:${index}`,broker:"futu",
-  holding:{market:"US",symbol,futu_symbol:`US.${symbol}`},
-  display:{market:"US",symbol,name:symbol,market_value_hkd:value},index}));
-const tie = renderAccountViewPanel({broker:"futu",rows:tieRows});
-console.log(JSON.stringify({tail,tie}));
+  display:{market:"US",symbol:"UNKNOWN",name:"UNKNOWN",market_value_hkd:"25.01"},index:10});
+rows.push({key:"futu:US:UNKNOWN2:11",broker:"futu",
+  holding:{market:"US",symbol:"UNKNOWN2",futu_symbol:"US.UNKNOWN2"},
+  display:{market:"US",symbol:"UNKNOWN2",name:"UNKNOWN2",market_value_hkd:"25"},index:11});
+const html = renderAccountViewPanel({broker:"futu",rows,summary:{portfolio_value_hkd:"625"}});
+const repeat = renderAccountViewPanel({broker:"futu",rows,summary:{portfolio_value_hkd:"625"}});
+console.log(JSON.stringify({html,repeat}));
 ''')
     rendered = json.loads(output)
-    html = rendered["tail"]
+    html = rendered["html"]
     distribution = html[:html.index("<h3>趋势持仓")]
-    for industry in ("行业一", "行业二", "行业三", "行业四", "行业五"):
+    for industry in ("行业一", "行业二", "行业三", "行业四", "行业五", "行业六", "行业七", "行业八", "行业九"):
         assert industry in distribution
-    assert "行业六" not in distribution
-    assert "其他/未知" in distribution
-    assert "HKD 100" in distribution
-    assert "HKD 6" in distribution
-    assert "6%" in distribution
+    assert "其他行业" not in distribution and "其他/未知" not in distribution
+    assert "行业未知" in distribution and "HKD 25" in distribution and "4%" in distribution
+    assert "现金及其他资产" in distribution and "HKD 119.99" in distribution and "19.2%" in distribution
+    assert "行业一" in distribution and "HKD 95" in distribution and "15.2%" in distribution
+    assert re.search(r">冲突A</th><td>HKD 12\.51</td><td>2%</td>", distribution)
+    assert re.search(r">冲突B</th><td>HKD 12\.5</td><td>2%</td>", distribution)
+    assert re.search(r">行业未知</th><td>HKD 25</td><td>4%</td>", distribution)
+    assert re.search(r">现金及其他资产</th><td>HKD 119\.99</td><td>19\.2%</td>", distribution)
+    assert re.search(r">行业一</th><td>HKD 95</td><td>15\.2%</td>", distribution)
     swatch_colors = re.findall(
         r'<span class="account-industry-swatch"[^>]*style="background: ([^"]+)"',
         distribution,
     )
-    assert len(swatch_colors) == 6 and len(set(swatch_colors)) == 6
-    tie_distribution = rendered["tie"][:rendered["tie"].index("<h3>趋势持仓")]
-    assert "A行业" in tie_distribution
-    assert "B行业" not in tie_distribution
-    assert "其他/未知" in tie_distribution
+    assert len(swatch_colors) == 13 and len(set(swatch_colors)) == 13
+    assert swatch_colors == re.findall(
+        r'<span class="account-industry-swatch"[^>]*style="background: ([^"]+)"',
+        rendered["repeat"][:rendered["repeat"].index("<h3>趋势持仓")],
+    )
+    amounts = re.findall(r"<td>(HKD [^<]+)</td>", distribution)
+    assert sum(
+        (Decimal(amount.removeprefix("HKD ").replace(",", "")) for amount in amounts),
+        Decimal("0"),
+    ) == Decimal("625.00")
+    aria = re.search(r'<div class="account-industry-pie" role="img" aria-label="([^"]+)"', distribution).group(1)
+    for industry in ("行业一", "行业二", "行业三", "行业四", "行业五", "行业六", "行业七", "行业八", "行业九", "冲突A", "冲突B", "行业未知", "现金及其他资产"):
+        assert industry in aria
 
 
-def test_dashboard_account_industry_distribution_has_honest_empty_and_responsive_states() -> None:
+def test_dashboard_account_asset_industry_distribution_separates_reserved_industry_names_from_synthetic_categories() -> None:
+    output = run_dashboard_js(r'''
+const report = {market:"US",real_position_actions:[
+  {market:"US",symbol:"CASHIND",industry:"现金及其他资产"},
+  {market:"US",symbol:"UNKNOWNIND",industry:"行业未知"},
+  {market:"US",symbol:"BLANK",industry:""},
+],historical_buy_plan_membership:{available:true,symbols:["US.CASHIND","US.UNKNOWNIND","US.BLANK"]}};
+state.dashboard={trend_reports:{futu:report}};
+const rows = [
+  ["CASHIND", "50"], ["UNKNOWNIND", "20"], ["BLANK", "10"],
+].map(([symbol,value],index)=>({key:`futu:US:${symbol}:${index}`,broker:"futu",
+  holding:{market:"US",symbol,futu_symbol:`US.${symbol}`},
+  display:{market:"US",symbol,name:symbol,market_value_hkd:value},index}));
+const html = renderAccountViewPanel({broker:"futu",rows,summary:{portfolio_value_hkd:"100"}});
+console.log(JSON.stringify({html}));
+''')
+    html = json.loads(output)["html"]
+    distribution = html[:html.index("<h3>趋势持仓")]
+    expected_rows = (
+        ("现金及其他资产（行业）", "HKD 50", "50%"),
+        ("行业未知（行业）", "HKD 20", "20%"),
+        ("现金及其他资产", "HKD 20", "20%"),
+        ("行业未知", "HKD 10", "10%"),
+    )
+    for industry, amount, percentage in expected_rows:
+        assert re.search(
+            rf">{re.escape(industry)}</th><td>{re.escape(amount)}</td><td>{re.escape(percentage)}</td>",
+            distribution,
+        )
+    tbody = re.search(r"<tbody>(.*?)</tbody>", distribution, re.DOTALL).group(1)
+    assert tbody.count("<tr>") == 4
+    amounts = re.findall(r"<td>(HKD [^<]+)</td>", tbody)
+    assert sum(
+        (Decimal(amount.removeprefix("HKD ").replace(",", "")) for amount in amounts),
+        Decimal("0"),
+    ) == Decimal("100")
+    aria = re.search(r'<div class="account-industry-pie" role="img" aria-label="([^"]+)"', distribution).group(1)
+    for industry, _, _ in expected_rows:
+        assert industry in aria
+
+
+def test_dashboard_account_real_asset_industry_distribution_keeps_cash_only_visible_and_falls_back_on_unreconciled_total() -> None:
     output = run_dashboard_js(r'''
 const row = (symbol, value, index) => ({key:`futu:US:${symbol}:${index}`,broker:"futu",
   holding:{market:"US",symbol,futu_symbol:`US.${symbol}`},
   display:{market:"US",symbol,name:symbol,market_value_hkd:value},index});
-const report = {market:"US",real_position_actions:[],historical_buy_plan_membership:{
-  available:true,symbols:["US.MISSING","US.ZERO","US.NEGATIVE","US.TEXT","US.UNKNOWN"],
+const emptyReport = {market:"US",real_position_actions:[],historical_buy_plan_membership:{
+  available:true,symbols:[],
+}};
+state.dashboard={trend_reports:{futu:emptyReport}};
+const cashOnly=renderAccountViewPanel({broker:"futu",rows:[],summary:{portfolio_value_hkd:"2000"}});
+const report = {market:"US",real_position_actions:[{market:"US",symbol:"TREND",industry:"科技"}],historical_buy_plan_membership:{
+  available:true,symbols:["US.TREND"],
 }};
 state.dashboard={trend_reports:{futu:report}};
-const unavailable=renderAccountViewPanel({broker:"futu",rows:[
-  row("MISSING","",0),row("ZERO","0",1),row("NEGATIVE","-3",2),row("TEXT","not-a-number",3),
-]});
-const unknown=renderAccountViewPanel({broker:"futu",rows:[row("UNKNOWN","100",0)]});
-console.log(JSON.stringify({unavailable,unknown}));
+const fallbackSummaries = [
+  {},
+  {portfolio_value_hkd:"invalid"},
+  {portfolio_value_hkd:"0"},
+  {portfolio_value_hkd:"90"},
+];
+const fallbacks = fallbackSummaries.map((summary) => renderAccountViewPanel({
+  broker:"futu",rows:[row("TREND","100",0)],summary,
+}));
+console.log(JSON.stringify({cashOnly,fallbacks}));
 ''')
     rendered = json.loads(output)
-    unavailable = rendered["unavailable"]
-    assert "行业分布暂无可用市值" in unavailable
-    assert "4 条未计入" in unavailable
-    assert 'role="img"' not in unavailable
-    unknown = rendered["unknown"]
-    assert "其他/未知" in unknown
-    assert "HKD 100" in unknown
-    assert "100%" in unknown
+    cash_only = rendered["cashOnly"]
+    assert "资产与行业分布" in cash_only
+    assert "总资产 HKD 2,000" in cash_only
+    assert "现金及其他资产" in cash_only and "HKD 2,000" in cash_only and "100%" in cash_only
+    assert 'role="img"' in cash_only
+    assert "当前筛选下没有持仓" in cash_only
+    for index, fallback in enumerate(rendered["fallbacks"]):
+        assert "资产与行业分布" in fallback
+        assert "趋势持仓合计 HKD 100" in fallback
+        assert "科技" in fallback and "HKD 100" in fallback and "100%" in fallback
+        assert "现金及其他资产" not in fallback
+        assert 'aria-label="资产与行业分布：总资产 HKD 100' not in fallback
+        assert "资产与行业分布明细（趋势持仓合计 HKD 100）" in fallback
+        if index == 0:
+            assert "按趋势持仓港元市值" in fallback
+            assert "账户总资产暂不可核对，仅按趋势持仓港元市值" not in fallback
+        else:
+            assert "账户总资产暂不可核对，仅按趋势持仓港元市值" in fallback
 
     css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
     desktop = css.split(".account-industry-distribution-body {", 1)[1].split("}", 1)[0]

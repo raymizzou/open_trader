@@ -120,11 +120,14 @@ class TrendSimulatePositionService:
                     market=market,
                 ),
             )
+            net_value, _ = _required_decimal(snapshot.get("net_value"), "simulate net value")
+            fx = self.fx_to_hkd[currency]
             return {
                 "available": True,
                 "broker": broker,
                 "market": market,
                 "synced_at": synced_at,
+                "portfolio_value_hkd": _money(net_value * fx),
                 "positions": positions,
                 "error": "",
             }

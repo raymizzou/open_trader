@@ -7198,7 +7198,7 @@ function renderAccountViewPanelOnly(broker) {
   if (elements["visible-count"]) {
     elements["visible-count"].textContent = `${formatDisplayNumber(visibleRows.length)} 条`;
   }
-  panel.innerHTML = renderAccountViewPanel({...group, rows});
+  panel.innerHTML = renderAccountViewPanel({...group, rows, allRows: group.rows});
   panel.setAttribute("aria-labelledby", `account-${broker}-view-${view}`);
   restoreAccountDisclosureState(container, broker, view, disclosureSnapshot);
   container.querySelectorAll?.(`#account-${broker} [data-account-view]`).forEach((tab) => {
@@ -7222,7 +7222,7 @@ function renderAccountHoldings() {
     const groups = accountHoldingGroups();
     const active = groups.find((group) => group.broker === state.brokerFilter) || groups[0];
     container.innerHTML = active
-      ? renderAccountSection({...active, rows: []})
+      ? renderAccountSection({...active, rows: [], allRows: active.rows})
       : `<div class="empty-state">${escapeHtml(accountSnapshotStatusText())}</div>`;
     return;
   }
@@ -7248,7 +7248,7 @@ function renderAccountHoldings() {
     : null;
   elements["visible-count"].textContent = `${formatDisplayNumber(visibleRows.length)} 条`;
   container.innerHTML = active
-    ? renderAccountSection({...active, rows})
+    ? renderAccountSection({...active, rows, allRows: active.rows})
     : '<div class="empty-state">暂无券商账户</div>';
   if (active) {
     restoreAccountDisclosureState(
@@ -7327,16 +7327,31 @@ function renderAccountViewPanel(group) {
   const view = state.accountViews[group.broker] || "real";
   if (view === "simulate") return renderSimulatedAccountView(group.broker);
   if (view === "report") return renderEmbeddedTrendReport(group.broker);
-  if (!group.rows.length) return '<p class="account-empty">当前筛选下没有持仓</p>';
+  const completeRows = Array.isArray(group.allRows) ? group.allRows : group.rows;
+  if (!group.rows.length && !completeRows.length) {
+    const accountTotal = accountIndustryMoneyMinor(group.summary?.portfolio_value_hkd);
+    if (accountTotal === null || accountTotal <= 0n) return '<p class="account-empty">当前筛选下没有持仓</p>';
+    const report = state.dashboard?.trend_reports?.[group.broker];
+    const distribution = renderAccountIndustryDistribution(
+      [],
+      report,
+      report?.real_position_actions,
+      group.summary?.portfolio_value_hkd,
+    );
+    return `${distribution}<p class="account-empty">当前筛选下没有持仓</p>`;
+  }
   const report = state.dashboard?.trend_reports?.[group.broker];
-  const split = splitHistoricalTrendHoldings(group.rows, report);
-  if (!split) return `${renderHistoricalTrendHoldingWarning()}${renderAccountTable(group.rows)}`;
+  const split = splitHistoricalTrendHoldings(completeRows, report);
+  const visibleSplit = splitHistoricalTrendHoldings(group.rows, report);
+  if (!split || !visibleSplit) return `${renderHistoricalTrendHoldingWarning()}${renderAccountTable(group.rows)}`;
   const distribution = renderAccountIndustryDistribution(
     split.trend,
     report,
     report?.real_position_actions,
+    group.summary?.portfolio_value_hkd,
   );
-  return `${distribution}${renderHoldingOriginSection("趋势持仓", split.trend, renderAccountTable(split.trend))}${renderHoldingOriginSection("非趋势持仓", split.nonTrend, renderAccountTable(split.nonTrend))}`;
+  if (!group.rows.length) return `${distribution}<p class="account-empty">当前筛选下没有持仓</p>`;
+  return `${distribution}${renderHoldingOriginSection("趋势持仓", visibleSplit.trend, renderAccountTable(visibleSplit.trend))}${renderHoldingOriginSection("非趋势持仓", visibleSplit.nonTrend, renderAccountTable(visibleSplit.nonTrend))}`;
 }
 
 function accountIndustryKeys(value, report) {
@@ -7390,19 +7405,19 @@ function accountIndustryPercentText(minor, total) {
   return `${integer}${fraction ? `.${fraction}` : ""}`;
 }
 
-function renderAccountIndustryDistribution(rows, report, actions) {
+function renderAccountIndustryDistribution(rows, report, actions, accountTotalValue) {
   const byKey = new Map();
   (Array.isArray(actions) ? actions : []).forEach((action) => {
     const keys = accountIndustryKeys(action, report);
     const industry = String(action?.industry || "").trim();
     keys.forEach((key) => {
-      const entry = byKey.get(key) || {labels: new Set(), missing: false};
+      const entry = byKey.get(key) || {labels: new Set()};
       if (industry) entry.labels.add(industry);
-      else entry.missing = true;
       byKey.set(key, entry);
     });
   });
-  const byIndustry = new Map();
+  const namedByIndustry = new Map();
+  let unknownValue = 0n;
   let excludedCount = 0;
   rows.forEach((row) => {
     const value = accountIndustryMoneyMinor(row?.display?.market_value_hkd);
@@ -7414,48 +7429,76 @@ function renderAccountIndustryDistribution(rows, report, actions) {
       .map((key) => byKey.get(key))
       .filter(Boolean);
     const labels = new Set();
-    const missing = entries.some((entry) => {
+    entries.forEach((entry) => {
       entry.labels.forEach((label) => labels.add(label));
-      return entry.missing;
     });
-    const industry = entries.length && !missing && labels.size === 1
-      ? Array.from(labels)[0] : "其他/未知";
-    byIndustry.set(industry, (byIndustry.get(industry) || 0n) + value);
+    const industries = Array.from(labels).sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
+    if (!industries.length) {
+      unknownValue += value;
+      return;
+    }
+    const divisor = BigInt(industries.length);
+    const allocation = value / divisor;
+    let remainder = value % divisor;
+    industries.forEach((industry) => {
+      const share = allocation + (remainder > 0n ? 1n : 0n);
+      if (remainder > 0n) remainder -= 1n;
+      namedByIndustry.set(industry, (namedByIndustry.get(industry) || 0n) + share);
+    });
   });
-  const total = Array.from(byIndustry.values()).reduce((sum, value) => sum + value, 0n);
+  const holdingsTotal = Array.from(namedByIndustry.values()).reduce((sum, value) => sum + value, unknownValue);
+  const accountTotal = accountIndustryMoneyMinor(accountTotalValue);
+  const reconciled = accountTotal !== null && accountTotal > 0n && accountTotal >= holdingsTotal;
+  const total = reconciled ? accountTotal : holdingsTotal;
+  const cashValue = reconciled && accountTotal > holdingsTotal ? accountTotal - holdingsTotal : 0n;
   const excludedText = excludedCount ? ` · ${formatDisplayNumber(excludedCount)} 条未计入` : "";
+  const basisText = reconciled
+    ? "按账户总资产港元市值；现金及其他资产含非趋势资产及现金类资产及行业分布外账户价值"
+    : accountTotalValue !== undefined
+      ? "账户总资产暂不可核对，仅按趋势持仓港元市值"
+      : "按趋势持仓港元市值";
+  const totalLabel = reconciled ? "总资产" : "趋势持仓合计";
   if (total <= 0n) {
     return `<section class="account-industry-distribution" aria-labelledby="account-industry-distribution-title">
-      <header class="account-industry-distribution-header"><h3 id="account-industry-distribution-title">行业分布</h3><span>按趋势持仓港元市值${escapeHtml(excludedText)}</span></header>
+      <header class="account-industry-distribution-header"><h3 id="account-industry-distribution-title">资产与行业分布</h3><span>${escapeHtml(`${basisText}${excludedText}`)}</span></header>
       <p class="account-empty">行业分布暂无可用市值${excludedCount ? `（${escapeHtml(formatDisplayNumber(excludedCount))} 条未计入）` : ""}</p>
     </section>`;
   }
-  const named = Array.from(byIndustry, ([industry, value]) => ({industry, value}))
-    .filter(({industry}) => industry !== "其他/未知")
+  const displayName = (industry) => ["现金及其他资产", "行业未知"].includes(industry)
+    ? `${industry}（行业）` : industry;
+  const named = Array.from(namedByIndustry, ([industry, value]) => ({
+    kind: "named", industry, display: displayName(industry), value,
+  }))
     .sort((left, right) => right.value === left.value
       ? left.industry.localeCompare(right.industry)
       : right.value > left.value ? 1 : -1);
-  const entries = named.slice(0, 5);
-  const otherValue = (byIndustry.get("其他/未知") || 0n)
-    + named.slice(5).reduce((sum, entry) => sum + entry.value, 0n);
-  if (otherValue > 0n) entries.push({industry: "其他/未知", value: otherValue});
+  const entries = [...named];
+  if (cashValue > 0n) entries.push({kind: "cash", industry: "现金及其他资产", display: "现金及其他资产", value: cashValue});
+  if (unknownValue > 0n) entries.push({kind: "unknown", industry: "行业未知", display: "行业未知", value: unknownValue});
+  entries.sort((left, right) => right.value === left.value
+    ? left.display.localeCompare(right.display)
+    : right.value > left.value ? 1 : -1);
   const share = (value) => `${accountIndustryPercentText(value, total)}%`;
-  const facts = entries.map(({industry, value}) => `${industry} ${accountIndustryMoneyText(value)}，占 ${share(value)}`);
-  const colors = ["var(--trend-info)", "var(--trend-hold)", "var(--accent)", "var(--success)", "var(--danger)", "var(--primary)"];
+  const facts = entries.map(({display, value}) => `${display} ${accountIndustryMoneyText(value)}，占 ${share(value)}`);
+  const colors = ["var(--trend-info)", "var(--trend-hold)", "var(--accent)", "var(--success)", "var(--danger)", "var(--primary)", "#2f6f8f", "#9a6b2f", "#0f766e", "#c2410c", "#6b4ca5", "#475569"];
+  const specialColors = {"现金及其他资产": "#5b6472", "行业未知": "#7c3aed"};
+  const colorFor = (entry, index) => entry.kind === "cash" ? specialColors["现金及其他资产"]
+    : entry.kind === "unknown" ? specialColors["行业未知"]
+      : colors[index % colors.length];
   const ariaExcluded = excludedCount ? `；${formatDisplayNumber(excludedCount)} 条未计入` : "";
   let offset = 0n;
   const gradient = entries.map(({value}, index) => {
     const start = accountIndustryPercentText(offset, total);
     offset += value;
     const end = accountIndustryPercentText(offset, total);
-    return `${colors[index % colors.length]} ${start}% ${end}%`;
+    return `${colorFor(entries[index], index)} ${start}% ${end}%`;
   }).join(", ");
-  const rowsHtml = entries.map(({industry, value}, index) => `<tr><th scope="row"><span class="account-industry-swatch" style="background: ${colors[index % colors.length]}" aria-hidden="true"></span>${escapeHtml(industry)}</th><td>${escapeHtml(accountIndustryMoneyText(value))}</td><td>${escapeHtml(share(value))}</td></tr>`).join("");
+  const rowsHtml = entries.map((entry, index) => `<tr><th scope="row"><span class="account-industry-swatch" style="background: ${colorFor(entry, index)}" aria-hidden="true"></span>${escapeHtml(entry.display)}</th><td>${escapeHtml(accountIndustryMoneyText(entry.value))}</td><td>${escapeHtml(share(entry.value))}</td></tr>`).join("");
   return `<section class="account-industry-distribution" aria-labelledby="account-industry-distribution-title">
-    <header class="account-industry-distribution-header"><h3 id="account-industry-distribution-title">行业分布</h3><span>按趋势持仓港元市值${escapeHtml(excludedText)}</span></header>
+    <header class="account-industry-distribution-header"><h3 id="account-industry-distribution-title">资产与行业分布</h3><span>${escapeHtml(`${basisText}${excludedText}`)}</span></header>
     <div class="account-industry-distribution-body">
-      <div class="account-industry-pie" role="img" aria-label="${escapeHtml(`行业分布：总市值 ${accountIndustryMoneyText(total)}；${facts.join("；")}${ariaExcluded}`)}" style="background: conic-gradient(${gradient})"></div>
-      <div class="account-industry-detail"><table class="account-industry-table"><caption>行业分布明细（总市值 ${escapeHtml(accountIndustryMoneyText(total))}）</caption><thead><tr><th scope="col">行业</th><th scope="col">港元市值</th><th scope="col">占比</th></tr></thead><tbody>${rowsHtml}</tbody></table></div>
+      <div class="account-industry-pie" role="img" aria-label="${escapeHtml(`资产与行业分布：${totalLabel} ${accountIndustryMoneyText(total)}；${facts.join("；")}${ariaExcluded}`)}" style="background: conic-gradient(${gradient})"></div>
+      <div class="account-industry-detail"><table class="account-industry-table"><caption>资产与行业分布明细（${totalLabel} ${escapeHtml(accountIndustryMoneyText(total))}）</caption><thead><tr><th scope="col">行业</th><th scope="col">港元市值</th><th scope="col">占比</th></tr></thead><tbody>${rowsHtml}</tbody></table></div>
     </div>
   </section>`;
 }
@@ -7539,11 +7582,18 @@ function renderSimulatedAccountView(broker) {
   if (!payload.available) {
     return `<p class="account-empty missing-text">${escapeHtml(formatPlain(payload.error || "模拟盘持仓不可用"))}</p>`;
   }
-  const rows = filterAccountRows(simulatedAccountRows(broker));
+  const allRows = simulatedAccountRows(broker);
+  const rows = filterAccountRows(allRows);
   const report = state.dashboard?.trend_reports?.[broker] || {};
-  return rows.length
-    ? `${renderAccountIndustryDistribution(rows, report, report.hold_actions)}${renderAccountTable(rows, {simulated: true})}`
-    : '<p class="account-empty">当前无模拟盘持仓</p>';
+  const distribution = renderAccountIndustryDistribution(
+    allRows,
+    report,
+    report.hold_actions,
+    payload.portfolio_value_hkd,
+  );
+  return `${distribution}${rows.length
+    ? renderAccountTable(rows, {simulated: true})
+    : '<p class="account-empty">当前无模拟盘持仓</p>'}`;
 }
 
 function renderEmbeddedTrendReport(broker) {
