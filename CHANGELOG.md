@@ -8,6 +8,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 - Shortened the always-read agent instructions and moved detailed verification
   and delivery gates to `docs/operations/agent-verification.md`. Documentation
   only; reviewed by diff/link inspection with no trading or runtime change.
+- Added production-only loopback staging for confirmed Phillips/Eastmoney holding snapshots with immutable, idempotent generations; the account worker selects the newest manual or statement facts without changing statement trade generations, reports, or Dashboard files. Verification: all original and reviewer account/import selectors, three existing invariants, corrected affected-file group (174 passed), Docker `make test` (8036 passed, 5 skipped, 9 deselected, 1 warning), and final Candidate Acceptance PASS with portable 61 passed.
 
 ## 2026-09-06
 

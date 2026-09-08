@@ -116,7 +116,7 @@ class StatementImportService:
                 "content_sha256": content_sha256,
                 "candidate_sha256": candidate_sha256,
                 "trade_facts_sha256": trade_facts_sha256,
-                "staged_at": staged_at.isoformat(timespec="seconds"),
+                "staged_at": staged_at.isoformat(timespec="microseconds"),
                 "trade_facts_cutoff_at": _statement_cutoff(
                     statement_date, broker, staged_at, facts
                 ),
@@ -242,12 +242,22 @@ def _staged_response(
 def load_staged_statement_candidate(
     data_dir: Path, broker: str
 ) -> tuple[BrokerAccountCandidate, str] | None:
+    metadata = load_staged_statement_metadata(data_dir, broker)
+    if metadata is None:
+        return None
+    candidate, generation, _staged_at = metadata
+    return candidate, generation
+
+
+def load_staged_statement_metadata(
+    data_dir: Path, broker: str
+) -> tuple[BrokerAccountCandidate, str, str] | None:
     if broker not in STATEMENT_BROKERS:
         raise ValueError(f"unsupported statement broker: {broker}")
     generations = data_dir / "account_statements/generations" / broker
     if not generations.is_dir():
         return None
-    candidates: list[tuple[str, str, int, BrokerAccountCandidate, str]] = []
+    candidates: list[tuple[str, str, str, BrokerAccountCandidate, str]] = []
     for root in generations.iterdir():
         if not root.is_dir() or root.name.startswith(".stage-"):
             continue
@@ -255,17 +265,16 @@ def load_staged_statement_candidate(
         manifest, candidate, _facts = _load_statement_generation(
             root, broker, generation
         )
-        period = manifest.get("statement_period")
         staged_at = manifest.get("staged_at")
-        if not isinstance(period, str) or not isinstance(staged_at, str):
+        if not isinstance(staged_at, str):
             raise ValueError(f"invalid statement generation: {root.name}")
         candidates.append(
-            (period, staged_at, root.stat().st_mtime_ns, candidate, generation)
+            (candidate.data_as_of, staged_at, generation, candidate, generation)
         )
     if not candidates:
         return None
     selected = max(candidates, key=lambda item: item[:3])
-    return selected[3], selected[4]
+    return selected[3], selected[4], selected[1]
 
 
 def load_statement_trade_facts(

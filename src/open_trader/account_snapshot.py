@@ -481,6 +481,15 @@ def _build_snapshot(
             }).items()
         )
     }
+    accepted_holding_generation = {
+        broker: str(generation)
+        for broker, generation in sorted(
+            dict(account.get("accepted_holding_generation") or {
+                "phillips": "",
+                "eastmoney": "",
+            }).items()
+        )
+    }
     account_generation = _sha256({
         "summary": summary,
         "broker_summaries": broker_summaries,
@@ -491,11 +500,13 @@ def _build_snapshot(
             broker: brokers[broker]["data_as_of"] for broker in sorted(REQUIRED_BROKERS)
         },
         "accepted_statement_generation": accepted_statement_generation,
+        "accepted_holding_generation": accepted_holding_generation,
     })
     payload_without_snapshot_generation = {
         "schema_version": 1,
         "account_generation": account_generation,
         "accepted_statement_generation": accepted_statement_generation,
+        "accepted_holding_generation": accepted_holding_generation,
         "generated_at": projection["generated_at"],
         "quote_as_of": quote_as_of,
         "status": "stale" if stale else "healthy",

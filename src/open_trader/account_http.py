@@ -21,7 +21,7 @@ _SNAPSHOT_FIELDS = frozenset({
     "schema_version", "snapshot_generation", "account_generation", "generated_at",
     "quote_as_of", "status", "stale", "sources", "release", "summary",
     "broker_summaries", "positions", "cash_balances", "errors",
-    "accepted_statement_generation",
+    "accepted_statement_generation", "accepted_holding_generation",
 })
 _STATEMENT_FACTS_FIELDS = frozenset({
     "schema_version", "broker", "statement_generation", "statement_period",
@@ -118,12 +118,19 @@ def _is_valid_snapshot(payload: Mapping[str, object]) -> bool:
     ):
         return False
     generations = payload.get("accepted_statement_generation")
+    holding_generations = payload.get("accepted_holding_generation")
     return (
         isinstance(generations, Mapping)
         and set(generations) == set(STATEMENT_BROKERS)
         and all(
             generation == "" or statement_generation_digest(generation) is not None
             for generation in generations.values()
+        )
+        and isinstance(holding_generations, Mapping)
+        and set(holding_generations) == set(STATEMENT_BROKERS)
+        and all(
+            generation == "" or statement_generation_digest(generation) is not None
+            for generation in holding_generations.values()
         )
     )
 

@@ -64,6 +64,7 @@ def _snapshot(*, status: str = "healthy") -> dict[str, object]:
         "cash_balances": [],
         "errors": [],
         "accepted_statement_generation": {"phillips": "", "eastmoney": ""},
+        "accepted_holding_generation": {"phillips": "", "eastmoney": ""},
     }
 
 

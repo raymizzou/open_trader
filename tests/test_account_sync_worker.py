@@ -26,6 +26,9 @@ from open_trader.account_sync_worker import (
 from open_trader.dashboard_quotes import DashboardQuoteService
 from open_trader.futu_quote import FutuQuoteError
 from open_trader.models import AssetClass, Market, Position
+from open_trader.holding_snapshot_import import HoldingSnapshotImportService
+from open_trader.models import CashBalance
+from open_trader.parsers.base import ParseResult
 
 
 class StopLoop(Exception):
@@ -246,6 +249,435 @@ def test_worker_promotes_staged_statement_generation_with_account_state(
         "eastmoney": "",
     }
     assert state["brokers"]["phillips"]["positions"][0]["symbol"] == "PROMOTED0"
+
+
+def test_worker_promotes_newer_manual_snapshot_without_changing_statement_trade_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.account_sync_worker as worker_module
+
+    data_dir = tmp_path / "data"
+    portfolio_path = data_dir / "latest/portfolio.csv"
+    statement_generation = "sha256:" + "b" * 64
+    statement = replace(
+        _candidate("phillips", 1, "STATEMENT"),
+        cash=(
+            CashBalance(
+                statement_id="2026-07-30-phillips",
+                broker="phillips",
+                account_alias="phillips_main",
+                currency="HKD",
+                cash_balance=Decimal("1000"),
+                available_balance=Decimal("900"),
+                confidence="high",
+                notes="statement-cash",
+            ),
+        ),
+    )
+    candidates = {
+        broker: _candidate(broker, 1, broker.upper())
+        for broker in ("futu", "tiger", "eastmoney")
+    }
+    candidates["phillips"] = statement
+    state = load_account_sync_state(data_dir / "latest/account_sync_state.json")
+    for broker, candidate in candidates.items():
+        state = accept_candidate(
+            state,
+            candidate,
+            attempted_at="2026-07-30T11:00:00+08:00",
+            statement_generation=statement_generation if broker == "phillips" else None,
+        )
+    write_json_atomic(data_dir / "latest/account_sync_state.json", state)
+    before = load_account_sync_state(data_dir / "latest/account_sync_state.json")
+
+    staged = HoldingSnapshotImportService(data_dir=data_dir).stage_snapshot(
+        "phillips",
+        {
+            "data_as_of": "2026-09-07",
+            "confirmed": True,
+            "complete": True,
+            "positions": [
+                {
+                    "symbol": "700",
+                    "name": "腾讯控股",
+                    "quantity": "10",
+                    "cost_price": "400",
+                }
+            ],
+            "cash": {"policy": "preserve"},
+        },
+    )
+    manual_generation = staged["holding_generation"]
+    _configure_sources(monkeypatch, worker_module)
+
+    worker = AccountSyncWorker(
+        _config(data_dir, portfolio_path),
+        now_text=lambda: "2026-09-07T12:00:00+08:00",
+    )
+    result = worker.sync_accounts_once()
+
+    published = load_account_sync_state(data_dir / "latest/account_sync_state.json")
+    assert result["brokers"]["phillips"] == {"status": "ok"}
+    assert published["brokers"]["phillips"]["positions"][0]["symbol"] == "00700"
+    assert published["brokers"]["phillips"]["positions"][0]["quantity"] == "10"
+    assert published["brokers"]["phillips"]["cash"] == before["brokers"]["phillips"]["cash"]
+    assert published["brokers"]["eastmoney"]["positions"] == before["brokers"]["eastmoney"]["positions"]
+    assert published["brokers"]["eastmoney"]["cash"] == before["brokers"]["eastmoney"]["cash"]
+    assert published["brokers"]["phillips"]["source_kind"] == "manual"
+    assert published["accepted_holding_generation"]["phillips"] == manual_generation
+    assert published["accepted_statement_generation"]["phillips"] == statement_generation
+
+
+def test_worker_promotes_newer_eastmoney_snapshot_with_replacement_cash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.account_sync_worker as worker_module
+
+    data_dir = tmp_path / "data"
+    portfolio_path = data_dir / "latest/portfolio.csv"
+    statement_generation = "sha256:" + "a" * 64
+    candidates = {
+        broker: _candidate(broker, 1, broker.upper())
+        for broker in ("futu", "tiger", "phillips", "eastmoney")
+    }
+    state = load_account_sync_state(data_dir / "latest/account_sync_state.json")
+    for broker, candidate in candidates.items():
+        state = accept_candidate(
+            state,
+            candidate,
+            attempted_at="2026-07-30T11:00:00+08:00",
+            statement_generation=(
+                statement_generation if broker == "eastmoney" else None
+            ),
+        )
+    write_json_atomic(data_dir / "latest/account_sync_state.json", state)
+    before = load_account_sync_state(data_dir / "latest/account_sync_state.json")
+
+    staged = HoldingSnapshotImportService(data_dir=data_dir).stage_snapshot(
+        "eastmoney",
+        {
+            "data_as_of": "2026-09-07",
+            "confirmed": True,
+            "complete": True,
+            "positions": [
+                {
+                    "symbol": "603259",
+                    "name": "药明康德",
+                    "quantity": "200",
+                    "cost_price": "144.516",
+                }
+            ],
+            "cash": {
+                "policy": "replace",
+                "currency": "CNY",
+                "balance": "350426.75",
+                "available_balance": "350426.75",
+            },
+        },
+    )
+    _configure_sources(monkeypatch, worker_module)
+
+    result = AccountSyncWorker(
+        _config(data_dir, portfolio_path),
+        now_text=lambda: "2026-09-07T12:00:00+08:00",
+    ).sync_accounts_once()
+
+    published = load_account_sync_state(data_dir / "latest/account_sync_state.json")
+    eastmoney = published["brokers"]["eastmoney"]
+    eastmoney_cash = [
+        row for row in eastmoney["cash"] if row["currency"] == "CNY"
+    ]
+    assert result["brokers"]["eastmoney"] == {"status": "ok"}
+    assert eastmoney["source_kind"] == "manual"
+    assert eastmoney["positions"][0]["symbol"] == "603259"
+    assert eastmoney["positions"][0]["quantity"] == "200"
+    assert eastmoney["positions"][0]["cost_price"] == "144.516"
+    assert len(eastmoney_cash) == 1
+    assert eastmoney_cash[0]["cash_balance"] == "350426.75"
+    assert eastmoney_cash[0]["available_balance"] == "350426.75"
+    assert published["accepted_holding_generation"]["eastmoney"] == staged[
+        "holding_generation"
+    ]
+    assert published["accepted_statement_generation"]["eastmoney"] == statement_generation
+    for broker in ("phillips", "futu", "tiger"):
+        assert published["brokers"][broker]["positions"] == before["brokers"][broker]["positions"]
+
+
+def test_worker_prefers_later_manual_snapshot_on_same_data_date(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.account_sync_worker as worker_module
+    import open_trader.statement_import as statement_import
+
+    class OfficialParser:
+        broker = "phillips"
+        parser_version = "test-official"
+
+        def statement_date(self, _path: Path) -> str:
+            return "2026-09-07"
+
+        def parse(self, _path: Path, period: str) -> ParseResult:
+            statement_id = f"{period}-phillips"
+            return ParseResult(
+                statement_id=statement_id,
+                broker="phillips",
+                positions=[
+                    Position(
+                        statement_id=statement_id,
+                        broker="phillips",
+                        account_alias="phillips_main",
+                        market=Market.HK,
+                        asset_class=AssetClass.STOCK,
+                        symbol="00700",
+                        name="Tencent",
+                        currency="HKD",
+                        quantity=Decimal("1"),
+                        cost_price=Decimal("500"),
+                        last_price=Decimal("510"),
+                        market_value=Decimal("510"),
+                        cost_value=Decimal("500"),
+                        unrealized_pnl=Decimal("10"),
+                        confidence="high",
+                        notes="official",
+                    )
+                ],
+                cash_balances=[
+                    CashBalance(
+                        statement_id=statement_id,
+                        broker="phillips",
+                        account_alias="phillips_main",
+                        currency="HKD",
+                        cash_balance=Decimal("90"),
+                        available_balance=Decimal("90"),
+                        confidence="high",
+                        notes="official",
+                    )
+                ],
+            )
+
+    data_dir = tmp_path / "data"
+    portfolio_path = data_dir / "latest/portfolio.csv"
+    _seed_state(
+        data_dir,
+        {
+            broker: _candidate(broker, 1, broker.upper())
+            for broker in ("futu", "tiger", "phillips", "eastmoney")
+        },
+    )
+    monkeypatch.setattr(statement_import, "PhillipsStatementParser", OfficialParser)
+    official = statement_import.StatementImportService(
+        data_dir=data_dir,
+        eastmoney_password="secret",
+    ).stage_pdf("phillips", b"%PDF-1.7\nofficial")
+    official_metadata = statement_import.load_staged_statement_metadata(
+        data_dir, "phillips"
+    )
+    assert official_metadata is not None
+    _official_candidate, _official_generation, official_staged_at = official_metadata
+    accepted = load_account_sync_state(data_dir / "latest/account_sync_state.json")
+    accepted["accepted_statement_generation"]["phillips"] = official[
+        "statement_generation"
+    ]
+    write_json_atomic(data_dir / "latest/account_sync_state.json", accepted)
+
+    manual = HoldingSnapshotImportService(data_dir=data_dir).stage_snapshot(
+        "phillips",
+        {
+            "data_as_of": "2026-09-07",
+            "confirmed": True,
+            "complete": True,
+            "positions": [
+                {
+                    "symbol": "700",
+                    "name": "腾讯控股",
+                    "quantity": "10",
+                    "cost_price": "400",
+                }
+            ],
+            "cash": {"policy": "preserve"},
+        },
+    )
+    assert datetime.fromisoformat(str(manual["staged_at"])) > datetime.fromisoformat(
+        official_staged_at
+    )
+
+    _configure_sources(monkeypatch, worker_module)
+    result = AccountSyncWorker(
+        _config(data_dir, portfolio_path),
+        now_text=lambda: "2026-09-07T12:00:00+08:00",
+    ).sync_accounts_once()
+
+    published = load_account_sync_state(data_dir / "latest/account_sync_state.json")
+    assert result["brokers"]["phillips"] == {"status": "ok"}
+    assert published["brokers"]["phillips"]["positions"][0]["symbol"] == "00700"
+    assert published["accepted_holding_generation"]["phillips"] == manual[
+        "holding_generation"
+    ]
+    assert published["accepted_statement_generation"]["phillips"] == official[
+        "statement_generation"
+    ]
+
+
+def test_worker_prefers_newer_statement_over_older_manual_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.account_sync_worker as worker_module
+    import open_trader.statement_import as statement_import
+
+    class OfficialParser:
+        broker = "phillips"
+        parser_version = "test-official"
+
+        def statement_date(self, _path: Path) -> str:
+            return "2026-07-30"
+
+        def parse(self, _path: Path, period: str) -> ParseResult:
+            statement_id = f"{period}-phillips"
+            return ParseResult(
+                statement_id=statement_id,
+                broker="phillips",
+                positions=[
+                    Position(
+                        statement_id=statement_id,
+                        broker="phillips",
+                        account_alias="phillips_main",
+                        market=Market.HK,
+                        asset_class=AssetClass.STOCK,
+                        symbol="00700",
+                        name="Tencent official",
+                        currency="HKD",
+                        quantity=Decimal("2"),
+                        cost_price=Decimal("500"),
+                        last_price=Decimal("510"),
+                        market_value=Decimal("1020"),
+                        cost_value=Decimal("1000"),
+                        unrealized_pnl=Decimal("20"),
+                        confidence="high",
+                        notes="official",
+                    )
+                ],
+                cash_balances=[
+                    CashBalance(
+                        statement_id=statement_id,
+                        broker="phillips",
+                        account_alias="phillips_main",
+                        currency="HKD",
+                        cash_balance=Decimal("2000"),
+                        available_balance=Decimal("1900"),
+                        confidence="high",
+                        notes="official-cash",
+                    )
+                ],
+            )
+
+    data_dir = tmp_path / "data"
+    portfolio_path = data_dir / "latest/portfolio.csv"
+    old_statement_generation = "sha256:" + "d" * 64
+    candidates = {
+        broker: _candidate(broker, 1, broker.upper())
+        for broker in ("futu", "tiger", "eastmoney", "phillips")
+    }
+    state = load_account_sync_state(data_dir / "latest/account_sync_state.json")
+    for broker, candidate in candidates.items():
+        state = accept_candidate(
+            state,
+            candidate,
+            attempted_at="2026-07-30T11:00:00+08:00",
+            statement_generation=old_statement_generation if broker == "phillips" else None,
+        )
+    write_json_atomic(data_dir / "latest/account_sync_state.json", state)
+    HoldingSnapshotImportService(data_dir=data_dir).stage_snapshot(
+        "phillips",
+        {
+            "data_as_of": "2026-07-01",
+            "confirmed": True,
+            "complete": True,
+            "positions": [
+                {
+                    "symbol": "700",
+                    "name": "腾讯控股",
+                    "quantity": "10",
+                    "cost_price": "400",
+                }
+            ],
+            "cash": {"policy": "preserve"},
+        },
+    )
+    monkeypatch.setattr(
+        statement_import, "PhillipsStatementParser", OfficialParser
+    )
+    official = statement_import.StatementImportService(
+        data_dir=data_dir,
+        eastmoney_password="secret",
+    ).stage_pdf("phillips", b"%PDF-1.7\nofficial")
+    official_generation = official["statement_generation"]
+    _configure_sources(monkeypatch, worker_module)
+
+    result = AccountSyncWorker(
+        _config(data_dir, portfolio_path),
+        now_text=lambda: "2026-09-07T12:00:00+08:00",
+    ).sync_accounts_once()
+
+    published = load_account_sync_state(data_dir / "latest/account_sync_state.json")
+    assert result["brokers"]["phillips"] == {"status": "ok"}
+    assert published["brokers"]["phillips"]["source_kind"] == "statement"
+    assert published["brokers"]["phillips"]["positions"][0]["quantity"] == "2"
+    assert published["brokers"]["phillips"]["cash"][0]["cash_balance"] == "2000"
+    assert published["accepted_holding_generation"]["phillips"] == official_generation
+
+
+def test_worker_clears_stale_manual_holding_generation_for_legacy_statement_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.account_sync_worker as worker_module
+
+    data_dir = tmp_path / "data"
+    portfolio_path = data_dir / "latest/portfolio.csv"
+    manual_generation = "sha256:" + "f" * 64
+    manual = replace(_candidate("phillips", 1, "MANUAL"), source_kind="manual")
+    state = load_account_sync_state(data_dir / "latest/account_sync_state.json")
+    for broker, candidate in {
+        "futu": _candidate("futu", 1, "FUTU"),
+        "tiger": _candidate("tiger", 1, "TIGER"),
+        "eastmoney": _candidate("eastmoney", 1, "EAST"),
+        "phillips": manual,
+    }.items():
+        state = accept_candidate(
+            state,
+            candidate,
+            attempted_at="2026-07-30T11:00:00+08:00",
+            holding_generation=manual_generation if broker == "phillips" else None,
+        )
+    write_json_atomic(data_dir / "latest/account_sync_state.json", state)
+    HoldingSnapshotImportService(data_dir=data_dir).stage_snapshot(
+        "phillips",
+        {
+            "data_as_of": "2026-07-01",
+            "confirmed": True,
+            "complete": True,
+            "positions": [
+                {
+                    "symbol": "700",
+                    "name": "腾讯控股",
+                    "quantity": "10",
+                    "cost_price": "400",
+                }
+            ],
+            "cash": {"policy": "preserve"},
+        },
+    )
+    _configure_sources(monkeypatch, worker_module)
+
+    result = AccountSyncWorker(
+        _config(data_dir, portfolio_path),
+        now_text=lambda: "2026-09-07T12:00:00+08:00",
+    ).sync_accounts_once()
+
+    published = load_account_sync_state(data_dir / "latest/account_sync_state.json")
+    assert result["brokers"]["phillips"] == {"status": "ok"}
+    assert published["brokers"]["phillips"]["source_kind"] == "statement"
+    assert published["brokers"]["phillips"]["positions"][0]["symbol"] == "PHILLIPS0"
+    assert published["accepted_holding_generation"]["phillips"] == ""
 
 
 def test_statement_promotion_failure_keeps_generation_unaccepted(

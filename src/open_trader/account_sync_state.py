@@ -89,6 +89,10 @@ def _source_kind_for_broker(broker: str) -> str:
     return "live" if broker in LIVE_BROKERS else "statement"
 
 
+def _source_kinds_for_broker(broker: str) -> set[str]:
+    return {"live"} if broker in LIVE_BROKERS else {"statement", "manual"}
+
+
 def _empty_source(broker: str) -> dict[str, object]:
     return {
         "source_kind": _source_kind_for_broker(broker),
@@ -112,6 +116,9 @@ def empty_account_sync_state() -> dict[str, object]:
         "accepted_statement_generation": {
             broker: "" for broker in STATEMENT_BROKERS
         },
+        "accepted_holding_generation": {
+            broker: "" for broker in STATEMENT_BROKERS
+        },
         "brokers": {broker: _empty_source(broker) for broker in REQUIRED_BROKERS},
         "dashboard_projection": {},
     }
@@ -127,6 +134,10 @@ def load_account_sync_state(path: Path) -> dict[str, object]:
     normalized = deepcopy(payload)
     normalized.setdefault(
         "accepted_statement_generation",
+        {broker: "" for broker in STATEMENT_BROKERS},
+    )
+    normalized.setdefault(
+        "accepted_holding_generation",
         {broker: "" for broker in STATEMENT_BROKERS},
     )
     normalized["dashboard_projection"] = dashboard_projection_from_state(payload) or {}
@@ -222,16 +233,23 @@ def accept_candidate(
     *,
     attempted_at: str,
     statement_generation: str | None = None,
+    holding_generation: str | None = None,
+    preserve_cash: bool = False,
 ) -> dict[str, object]:
     if candidate.broker not in REQUIRED_BROKERS:
         raise ValueError(f"unknown broker: {candidate.broker}")
-    if candidate.source_kind != _source_kind_for_broker(candidate.broker):
+    if candidate.source_kind not in _source_kinds_for_broker(candidate.broker):
         raise ValueError(f"invalid source_kind: {candidate.source_kind}")
     if statement_generation is not None and (
         candidate.broker not in STATEMENT_BROKERS
         or statement_generation_digest(statement_generation) is None
     ):
         raise ValueError("invalid statement generation")
+    if holding_generation not in {None, ""} and (
+        candidate.broker not in STATEMENT_BROKERS
+        or statement_generation_digest(holding_generation) is None
+    ):
+        raise ValueError("invalid holding generation")
     accepted = deepcopy(state) if _is_valid_state(state) else empty_account_sync_state()
     accepted.setdefault(
         "accepted_statement_generation",
@@ -239,6 +257,8 @@ def accept_candidate(
     )
     brokers = accepted["brokers"]
     assert isinstance(brokers, dict)
+    previous = brokers[candidate.broker]
+    assert isinstance(previous, dict)
     brokers[candidate.broker] = {
         "source_kind": candidate.source_kind,
         "status": "ok",
@@ -248,7 +268,11 @@ def accept_candidate(
         "period": candidate.period,
         "message": "",
         "positions": [_serialize_dataclass(item) for item in candidate.positions],
-        "cash": [_serialize_dataclass(item) for item in candidate.cash],
+        "cash": (
+            deepcopy(previous["cash"])
+            if preserve_cash
+            else [_serialize_dataclass(item) for item in candidate.cash]
+        ),
         "fx_rates": [dict(item) for item in candidate.fx_rates],
         "summary": deepcopy(candidate.summary),
     }
@@ -256,6 +280,13 @@ def accept_candidate(
     if statement_generation is not None:
         accepted["accepted_statement_generation"][candidate.broker] = (
             statement_generation
+        )
+        accepted["accepted_holding_generation"][candidate.broker] = (
+            statement_generation
+        )
+    elif holding_generation is not None:
+        accepted["accepted_holding_generation"][candidate.broker] = (
+            holding_generation
         )
     return accepted
 
@@ -336,9 +367,9 @@ def effective_source_status(
     if status != "ok":
         return str(status)
     source_kind = source.get("source_kind")
-    if source_kind not in {"live", "statement"}:
+    if source_kind not in {"live", "statement", "manual"}:
         return "unknown"
-    if source_kind == "statement":
+    if source_kind in {"statement", "manual"}:
         return "ok"
     last_success = _parse_aware_datetime(source.get("last_success_at"))
     if last_success is None:
@@ -481,7 +512,12 @@ def build_dashboard_projection(
             cash = _cash_from_row(row)
             cash_details.append(_dashboard_cash_row(cash, source, source_rates))
     summaries = [
-        _dashboard_broker_summary(broker, positions, cash_details)
+        _dashboard_broker_summary(
+            broker,
+            str(brokers[broker]["source_kind"]),
+            positions,
+            cash_details,
+        )
         for broker in REQUIRED_BROKERS
     ]
     summary = _dashboard_summary(positions, cash_details, summaries)
@@ -622,7 +658,7 @@ def _dashboard_usd_to_hkd(
     rate = source_rates.get((position.account_alias, "USD"))
     if rate is not None:
         return rate
-    if source["source_kind"] == "statement":
+    if source["source_kind"] in {"statement", "manual"}:
         return _STATEMENT_FX_TO_HKD["USD"]
     raise PortfolioBuildError(
         f"live USD FX missing for {position.broker}.{position.account_alias}"
@@ -660,7 +696,7 @@ def _dashboard_fx_rate(
     rate = source_rates.get((value.account_alias, currency))
     if rate is not None:
         return rate
-    if source["source_kind"] == "statement" and currency in _STATEMENT_FX_TO_HKD:
+    if source["source_kind"] in {"statement", "manual"} and currency in _STATEMENT_FX_TO_HKD:
         return _STATEMENT_FX_TO_HKD[currency]
     raise PortfolioBuildError(f"live FX missing for {value.broker}.{value.account_alias}.{currency}")
 
@@ -690,6 +726,7 @@ def _is_dashboard_cash_like(row: Mapping[str, str]) -> bool:
 
 def _dashboard_broker_summary(
     broker: str,
+    source_kind: str,
     positions: Sequence[Mapping[str, str]],
     cash_details: Sequence[Mapping[str, str]],
 ) -> dict[str, object]:
@@ -707,7 +744,7 @@ def _dashboard_broker_summary(
     return {
         "broker": broker,
         "label": _BROKER_LABELS[broker],
-        "source_kind": _source_kind_for_broker(broker),
+        "source_kind": source_kind,
         "detail_available": bool(broker_positions or broker_cash),
         "holding_value_hkd": money(holding_value),
         "cash_like_value_hkd": money(cash_like_value),
@@ -1048,7 +1085,7 @@ def _is_valid_dashboard_broker_summary(value: object, broker: str) -> bool:
         return False
     if value.get("broker") != broker or not isinstance(value.get("label"), str):
         return False
-    if value.get("source_kind") != _source_kind_for_broker(broker):
+    if value.get("source_kind") not in _source_kinds_for_broker(broker):
         return False
     if not isinstance(value.get("detail_available"), bool):
         return False
@@ -1151,6 +1188,20 @@ def _is_valid_state(value: object) -> bool:
         )
     ):
         return False
+    holding_generations = value.get("accepted_holding_generation")
+    if holding_generations is not None and (
+        not isinstance(holding_generations, dict)
+        or set(holding_generations) != set(STATEMENT_BROKERS)
+        or any(
+            not isinstance(holding_generations[broker], str)
+            or (
+                bool(holding_generations[broker])
+                and statement_generation_digest(holding_generations[broker]) is None
+            )
+            for broker in STATEMENT_BROKERS
+        )
+    ):
+        return False
     brokers = value.get("brokers")
     if not isinstance(brokers, dict) or set(brokers) != set(REQUIRED_BROKERS):
         return False
@@ -1186,7 +1237,7 @@ def _is_valid_source(value: object, broker: str) -> bool:
     }
     if any(not isinstance(value.get(field), str) for field in required_strings):
         return False
-    if value["source_kind"] != _source_kind_for_broker(broker):
+    if value["source_kind"] not in _source_kinds_for_broker(broker):
         return False
     if not (
         value["status"] in {"ok", "failed", "unknown"}

@@ -38,6 +38,7 @@ from open_trader.account_sync_state import (
     write_json_atomic,
 )
 from open_trader.models import AssetClass, CashBalance, Market, Position
+from open_trader.holding_snapshot_import import HoldingSnapshotImportService
 
 
 SHA = "0123456789abcdef0123456789abcdef01234567"
@@ -177,6 +178,171 @@ def _set_accepted_statement_generation(
     state = json.loads(path.read_text(encoding="utf-8"))
     state["accepted_statement_generation"][broker] = generation
     write_json_atomic(path, state)
+
+
+def test_account_api_stages_confirmed_holding_snapshot_with_202(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    latest = data_dir / "latest"
+    report = tmp_path / "reports" / "2026-09-07.md"
+    latest.mkdir(parents=True)
+    report.parent.mkdir(parents=True)
+    (latest / "sentinel").write_bytes(b"latest-before")
+    report.write_bytes(b"report-before")
+    service = HoldingSnapshotImportService(data_dir=data_dir)
+    server = account_api.create_account_api(
+        data_dir,
+        host="127.0.0.1",
+        port=0,
+        mode="production",
+        holding_snapshot_service=service,
+    )
+    payload = {
+        "data_as_of": "2026-09-07",
+        "confirmed": True,
+        "complete": True,
+        "positions": [
+            {
+                "symbol": "700",
+                "name": "腾讯控股",
+                "quantity": "10",
+                "cost_price": "400",
+            }
+        ],
+        "cash": {
+            "policy": "replace",
+            "currency": "HKD",
+            "balance": "1000",
+            "available_balance": "1000",
+        },
+    }
+
+    with _running(server):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_address[1]}"
+            "/api/v1/account/holding-snapshots/phillips",
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body)),
+            },
+        )
+        with urllib.request.urlopen(request) as response:
+            assert response.status == HTTPStatus.ACCEPTED
+            staged = json.load(response)
+
+    assert staged["schema_version"] == "open_trader.account.holding_generation.v1"
+    assert isinstance(staged["holding_generation"], str)
+    assert staged["holding_generation"].startswith("sha256:")
+    assert (latest / "sentinel").read_bytes() == b"latest-before"
+    assert report.read_bytes() == b"report-before"
+
+
+def test_account_api_rejects_unconfirmed_holding_snapshot_without_artifacts(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    service = HoldingSnapshotImportService(data_dir=data_dir)
+    server = account_api.create_account_api(
+        data_dir,
+        host="127.0.0.1",
+        port=0,
+        mode="production",
+        holding_snapshot_service=service,
+    )
+    payload = {
+        "data_as_of": "2026-09-07",
+        "confirmed": False,
+        "complete": True,
+        "positions": [
+            {
+                "symbol": "700",
+                "name": "腾讯控股",
+                "quantity": "10",
+                "cost_price": "400",
+            }
+        ],
+        "cash": {
+            "policy": "replace",
+            "currency": "HKD",
+            "balance": "1000",
+            "available_balance": "1000",
+        },
+    }
+
+    with _running(server):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_address[1]}"
+            "/api/v1/account/holding-snapshots/phillips",
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body)),
+            },
+        )
+        with pytest.raises(urllib.error.HTTPError) as rejected:
+            urllib.request.urlopen(request)
+
+    assert rejected.value.code == HTTPStatus.BAD_REQUEST
+    assert json.load(rejected.value)["code"] == "holding_snapshot_rejected"
+    generations = data_dir / "account_holdings/generations/phillips"
+    assert not generations.exists() or not list(generations.iterdir())
+
+
+def test_account_api_rejects_holding_snapshot_in_shadow_mode_without_artifacts(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    service = HoldingSnapshotImportService(data_dir=data_dir)
+    server = account_api.create_account_api(
+        data_dir,
+        host="127.0.0.1",
+        port=0,
+        mode="shadow",
+        holding_snapshot_service=service,
+    )
+    payload = {
+        "data_as_of": "2026-09-07",
+        "confirmed": True,
+        "complete": True,
+        "positions": [
+            {
+                "symbol": "700",
+                "name": "腾讯控股",
+                "quantity": "10",
+                "cost_price": "400",
+            }
+        ],
+        "cash": {
+            "policy": "replace",
+            "currency": "HKD",
+            "balance": "1000",
+            "available_balance": "1000",
+        },
+    }
+
+    with _running(server):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_address[1]}"
+            "/api/v1/account/holding-snapshots/phillips",
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body)),
+            },
+        )
+        with pytest.raises(urllib.error.HTTPError) as rejected:
+            urllib.request.urlopen(request)
+
+    assert rejected.value.code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert json.load(rejected.value)["code"] == "account_api_shadow_only"
+    generations = data_dir / "account_holdings/generations/phillips"
+    assert not generations.exists() or not list(generations.iterdir())
 
 
 def test_account_api_health_snapshot_etag_and_not_found(tmp_path: Path) -> None:
@@ -916,6 +1082,37 @@ def test_snapshot_exposes_accepted_statement_generations_as_account_identity(
     assert result.payload["account_generation"] != before.payload["account_generation"]
 
 
+def test_snapshot_exposes_accepted_holding_generation_as_account_identity(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    state_path = data_dir / "latest/account_sync_state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    holding_generations = {
+        "phillips": "sha256:" + "1" * 64,
+        "eastmoney": "sha256:" + "2" * 64,
+    }
+    state["accepted_holding_generation"] = holding_generations
+    write_json_atomic(state_path, state)
+    first = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+
+    state["accepted_holding_generation"] = {
+        "phillips": "sha256:" + "3" * 64,
+        "eastmoney": "sha256:" + "4" * 64,
+    }
+    write_json_atomic(state_path, state)
+    second = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+
+    assert first.payload["accepted_holding_generation"] == holding_generations
+    assert second.payload["accepted_holding_generation"] == {
+        "phillips": "sha256:" + "3" * 64,
+        "eastmoney": "sha256:" + "4" * 64,
+    }
+    assert first.payload["account_generation"] != second.payload["account_generation"]
+    assert first.payload["snapshot_generation"] != second.payload["snapshot_generation"]
+
+
 def test_live_parity_passes_against_raw_publication(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     _write_publication(data_dir, quote_price_time="2026-08-03 04:18:41.889")
@@ -941,6 +1138,55 @@ def test_live_parity_passes_against_raw_publication(tmp_path: Path) -> None:
     assert result.reason == "ok"
     assert result.account_generation.startswith("sha256:")
     assert result.quote_as_of == "2026-08-03T12:00:04+08:00"
+
+
+def test_manual_source_survives_public_snapshot_and_parity(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    state_path = data_dir / "latest/account_sync_state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    holding_generation = "sha256:" + "c" * 64
+    state["brokers"]["phillips"]["source_kind"] = "manual"
+    state["accepted_holding_generation"]["phillips"] = holding_generation
+    quotes = json.loads(
+        (data_dir / "latest/quotes.json").read_text(encoding="utf-8")
+    )
+    state = with_dashboard_projection(
+        state,
+        quotes,
+        generated_at=quotes["last_success_at"],
+    )
+    write_json_atomic(state_path, state)
+    server = account_api.create_account_api(
+        data_dir,
+        host="127.0.0.1",
+        port=0,
+        mode="production",
+        runtime_metadata={
+            "pid": 1,
+            "started_at": NOW.isoformat(),
+            "cwd": str(tmp_path),
+            "api_git_sha": SHA,
+        },
+    )
+
+    with _running(server):
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        with urllib.request.urlopen(base + "/api/v1/account/snapshot") as response:
+            payload = json.load(response)
+        parity = account_api.check_account_api_parity(data_dir, base_url=base)
+
+    phillips_source = payload["sources"]["account"]["brokers"]["phillips"]
+    phillips_summary = next(
+        summary
+        for summary in payload["broker_summaries"]
+        if summary["broker"] == "phillips"
+    )
+    assert phillips_source["source_kind"] == "manual"
+    assert phillips_summary["source_kind"] == "manual"
+    assert payload["accepted_holding_generation"]["phillips"] == holding_generation
+    assert parity.status == "PASS"
+    assert parity.reason == "ok"
 
 
 def test_live_parity_fails_on_wrong_opaque_id(
@@ -1258,6 +1504,9 @@ def test_snapshot_maps_current_publication_to_frozen_v1_contract(tmp_path: Path)
         },
         "accepted_statement_generation": result.payload[
             "accepted_statement_generation"
+        ],
+        "accepted_holding_generation": result.payload[
+            "accepted_holding_generation"
         ],
     }
     assert result.payload["account_generation"] == _contract_sha(account_input)

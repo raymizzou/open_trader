@@ -70,7 +70,7 @@ _SNAPSHOT_FIELDS = frozenset({
     "schema_version", "snapshot_generation", "account_generation", "generated_at",
     "quote_as_of", "status", "stale", "sources", "release", "summary",
     "broker_summaries", "positions", "cash_balances", "errors",
-    "accepted_statement_generation",
+    "accepted_statement_generation", "accepted_holding_generation",
 })
 
 
@@ -90,6 +90,7 @@ def create_account_api(
     runtime_metadata: Mapping[str, object] | None = None,
     mode: AccountApiMode = "shadow",
     statement_service: object | None = None,
+    holding_snapshot_service: object | None = None,
     eastmoney_password: str = "",
 ) -> ThreadingHTTPServer:
     if mode not in ("shadow", "production"):
@@ -107,6 +108,10 @@ def create_account_api(
             data_dir=data_dir,
             eastmoney_password=eastmoney_password,
         )
+    if mode == "production" and holding_snapshot_service is None:
+        from .holding_snapshot_import import HoldingSnapshotImportService
+
+        holding_snapshot_service = HoldingSnapshotImportService(data_dir=data_dir)
 
     class AccountApiHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -274,6 +279,57 @@ def create_account_api(
 
         def do_POST(self) -> None:
             path = urlsplit(self.path).path
+            holding_prefix = "/api/v1/account/holding-snapshots/"
+            if path.startswith(holding_prefix):
+                broker = path.removeprefix(holding_prefix)
+                if not broker or "/" in broker:
+                    self._send_json(
+                        {
+                            "schema_version": "open_trader.account_api.error.v1",
+                            "code": "not_found",
+                            "message": "Not found",
+                        },
+                        HTTPStatus.NOT_FOUND,
+                    )
+                    return
+                if mode != "production":
+                    self._send_json(
+                        {
+                            "schema_version": "open_trader.account_api.error.v1",
+                            "code": "account_api_shadow_only",
+                            "message": "Account API is running in shadow mode",
+                        },
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                    )
+                    return
+                if self.headers.get_content_type() != "application/json":
+                    self._send_json(
+                        {
+                            "schema_version": "open_trader.account_api.error.v1",
+                            "code": "invalid_holding_snapshot_content_type",
+                            "message": "请求正文必须是 JSON",
+                        },
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+                try:
+                    payload = self._read_holding_snapshot_body()
+                    if holding_snapshot_service is None:
+                        raise ValueError("holding snapshot service is unavailable")
+                    stage_snapshot = getattr(holding_snapshot_service, "stage_snapshot")
+                    staged = stage_snapshot(broker, payload)
+                except ValueError as error:
+                    self._send_json(
+                        {
+                            "schema_version": "open_trader.account_api.error.v1",
+                            "code": "holding_snapshot_rejected",
+                            "message": str(error),
+                        },
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+                self._send_json(staged, HTTPStatus.ACCEPTED)
+                return
             prefix = "/api/v1/account/statements/"
             broker = path.removeprefix(prefix)
             if not path.startswith(prefix) or not broker or "/" in broker:
@@ -340,6 +396,24 @@ def create_account_api(
             if len(body) != length:
                 raise ValueError("请求正文不完整")
             return body
+
+        def _read_holding_snapshot_body(self) -> dict[str, object]:
+            raw_lengths = self.headers.get_all("Content-Length", [])
+            if len(raw_lengths) != 1 or not raw_lengths[0].isdigit():
+                raise ValueError("Content-Length 必须是非负整数")
+            length = int(raw_lengths[0])
+            if length > 1024 * 1024:
+                raise ValueError("持仓快照不能超过 1 MiB")
+            body = self.rfile.read(length)
+            if len(body) != length:
+                raise ValueError("请求正文不完整")
+            try:
+                payload = json.loads(body)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ValueError("请求正文必须是有效 JSON") from error
+            if not isinstance(payload, dict):
+                raise ValueError("holding snapshot must be an object")
+            return payload
 
         def _send_json(
             self,
@@ -593,6 +667,18 @@ def _raw_parity_projection(
             )
         ):
             return None
+        accepted_holding_generation = dict(
+            account.get("accepted_holding_generation")
+            or {"phillips": "", "eastmoney": ""}
+        )
+        if (
+            set(accepted_holding_generation) != {"phillips", "eastmoney"}
+            or any(
+                not isinstance(value, str)
+                for value in accepted_holding_generation.values()
+            )
+        ):
+            return None
     except (KeyError, TypeError, ValueError):
         return None
     account_generation = _parity_sha({
@@ -606,6 +692,7 @@ def _raw_parity_projection(
             for broker in sorted(source_brokers)
         },
         "accepted_statement_generation": accepted_statement_generation,
+        "accepted_holding_generation": accepted_holding_generation,
     })
     broker_stale: dict[str, bool] = {}
     for broker in REQUIRED_BROKERS:
@@ -667,6 +754,7 @@ def _raw_parity_projection(
         "source_brokers": source_brokers,
         "account_generation": account_generation,
         "accepted_statement_generation": accepted_statement_generation,
+        "accepted_holding_generation": accepted_holding_generation,
         "status": "stale" if stale else "healthy",
         "stale": stale,
         "sources": sources,
@@ -689,7 +777,7 @@ def _parity_broker_stale(source: object, *, now: datetime) -> bool | None:
     if status != "ok":
         return None
     source_kind = source.get("source_kind")
-    if source_kind == "statement":
+    if source_kind in {"statement", "manual"}:
         return False
     if source_kind != "live":
         return None
@@ -800,6 +888,7 @@ def _compare_parity_payload(
         "broker_summaries",
         "cash_balances",
         "accepted_statement_generation",
+        "accepted_holding_generation",
     ):
         expected_value = expected[field]
         observed = payload.get(field)

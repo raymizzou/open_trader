@@ -29,7 +29,15 @@ from .dashboard_quotes import DashboardQuoteService, load_published_quotes
 from .futu_account import FutuAccountClient, build_futu_account_candidate
 from .futu_universe import build_account_quote_universe
 from .fx import DEFAULT_RATES_TO_HKD
-from .statement_import import load_staged_statement_candidate
+from .holding_snapshot_import import (
+    SUPPORTED_BROKERS,
+    load_staged_holding_snapshot,
+)
+from .models import AssetClass, CashBalance, Market, Position
+from .statement_import import (
+    load_staged_statement_candidate,
+    load_staged_statement_metadata,
+)
 from .tiger_account import (
     TigerAccountClient,
     build_tiger_account_candidate,
@@ -103,7 +111,12 @@ class AccountSyncWorker:
         results: dict[str, object] = {}
         for broker in REQUIRED_BROKERS:
             try:
-                candidate, statement_generation = self._candidate_for(
+                (
+                    candidate,
+                    statement_generation,
+                    holding_generation,
+                    preserve_cash,
+                ) = self._candidate_for(
                     broker, attempted_at
                 )
                 self._write_diagnostic_candidate(attempted_at, candidate)
@@ -112,6 +125,8 @@ class AccountSyncWorker:
                     candidate,
                     attempted_at=attempted_at,
                     statement_generation=statement_generation,
+                    holding_generation=holding_generation,
+                    preserve_cash=preserve_cash,
                 )
                 portfolio_rows = accepted_portfolio_rows(next_state)
             except Exception as exc:
@@ -280,15 +295,51 @@ class AccountSyncWorker:
 
     def _candidate_for(
         self, broker: str, attempted_at: str
-    ) -> tuple[BrokerAccountCandidate, str | None]:
+    ) -> tuple[BrokerAccountCandidate, str | None, str | None, bool]:
         if broker in {"phillips", "eastmoney"}:
-            staged = load_staged_statement_candidate(self.config.data_dir, broker)
+            manual = load_staged_holding_snapshot(self.config.data_dir, broker)
+            staged = _staged_statement_for_worker(self.config.data_dir, broker)
             if staged is not None:
-                return staged
-            candidate = load_latest_statement_candidate(self.config.data_dir, broker)
-            if candidate is None:
+                (
+                    statement_candidate,
+                    statement_generation,
+                    statement_staged_at,
+                ) = staged
+            else:
+                statement_candidate = load_latest_statement_candidate(
+                    self.config.data_dir, broker
+                )
+                statement_generation = None
+                statement_staged_at = None
+            manual_is_newer = False
+            if manual is not None:
+                manual_is_newer = statement_candidate is None or str(
+                    manual["data_as_of"]
+                ) > statement_candidate.data_as_of
+                if (
+                    not manual_is_newer
+                    and statement_candidate is not None
+                    and str(manual["data_as_of"]) == statement_candidate.data_as_of
+                    and statement_staged_at is not None
+                ):
+                    manual_is_newer = _staged_at(manual) > _staged_at(
+                        {"staged_at": statement_staged_at}
+                    )
+            if manual is not None and manual_is_newer:
+                return (
+                    _holding_candidate(manual),
+                    None,
+                    str(manual["holding_generation"]),
+                    manual["cash"] == {"policy": "preserve"},
+                )
+            if statement_candidate is None:
                 raise ValueError(f"no valid {broker} statement candidate")
-            return candidate, None
+            return (
+                statement_candidate,
+                statement_generation,
+                statement_generation or "",
+                False,
+            )
         if broker == "futu":
             client = FutuAccountClient(
                 host=self.config.futu_host,
@@ -300,7 +351,7 @@ class AccountSyncWorker:
                     run_date=attempted_at[:10],
                     data_as_of=attempted_at,
                     fallback_fx_to_hkd=DEFAULT_RATES_TO_HKD,
-                ), None
+                ), None, None, False
             finally:
                 client.close()
         tiger_config = load_tiger_account_config(
@@ -314,7 +365,7 @@ class AccountSyncWorker:
                 client.fetch_snapshot(),
                 run_date=attempted_at[:10],
                 data_as_of=attempted_at,
-            ), None
+            ), None, None, False
         finally:
             client.close()
 
@@ -329,6 +380,102 @@ class AccountSyncWorker:
             self.config.data_dir / "account_sync" / "runs" / generation / f"{candidate.broker}.json",
             _diagnostic_value(asdict(candidate)),
         )
+
+
+def _holding_candidate(snapshot: dict[str, object]) -> BrokerAccountCandidate:
+    broker = snapshot["broker"]
+    if not isinstance(broker, str):
+        raise ValueError("invalid holding snapshot broker")
+    market_code, currency = SUPPORTED_BROKERS[broker]
+    data_as_of = snapshot["data_as_of"]
+    raw_positions = snapshot["positions"]
+    raw_cash = snapshot["cash"]
+    if not isinstance(data_as_of, str) or not isinstance(raw_positions, list):
+        raise ValueError("invalid holding snapshot")
+    positions = []
+    for raw_position in raw_positions:
+        if not isinstance(raw_position, dict):
+            raise ValueError("invalid holding position")
+        quantity = Decimal(str(raw_position["quantity"]))
+        cost_price = Decimal(str(raw_position["cost_price"]))
+        market_value = quantity * cost_price
+        positions.append(
+            Position(
+                statement_id="",
+                broker=broker,
+                account_alias=f"{broker}_manual",
+                market=Market(market_code),
+                asset_class=AssetClass.STOCK,
+                symbol=str(raw_position["symbol"]),
+                name=str(raw_position["name"]),
+                currency=currency,
+                quantity=quantity,
+                cost_price=cost_price,
+                last_price=cost_price,
+                market_value=market_value,
+                cost_value=market_value,
+                unrealized_pnl=Decimal("0"),
+                confidence="high",
+                notes="manual holding snapshot",
+            )
+        )
+    cash: tuple[CashBalance, ...] = ()
+    if raw_cash == {"policy": "replace"}:
+        raise ValueError("invalid holding snapshot cash")
+    if isinstance(raw_cash, dict) and raw_cash.get("policy") == "replace":
+        balance = Decimal(str(raw_cash["balance"]))
+        available = Decimal(str(raw_cash["available_balance"]))
+        cash = (
+            CashBalance(
+                statement_id="",
+                broker=broker,
+                account_alias=f"{broker}_manual",
+                currency=currency,
+                cash_balance=balance,
+                available_balance=available,
+                confidence="high",
+                notes="manual holding snapshot",
+            ),
+        )
+    elif raw_cash != {"policy": "preserve"}:
+        raise ValueError("invalid holding snapshot cash")
+    return BrokerAccountCandidate(
+        broker=broker,
+        source_kind="manual",
+        data_as_of=data_as_of,
+        period=data_as_of,
+        positions=tuple(positions),
+        cash=cash,
+        fx_rates=(),
+        summary={
+            "position_count": len(positions),
+            "cash_count": len(cash),
+            "is_real_time": False,
+        },
+    )
+
+
+def _staged_at(value: dict[str, object]) -> datetime:
+    staged_at = value.get("staged_at")
+    if not isinstance(staged_at, str):
+        raise ValueError("invalid holding generation")
+    try:
+        return datetime.fromisoformat(staged_at)
+    except ValueError as error:
+        raise ValueError("invalid holding generation") from error
+
+
+def _staged_statement_for_worker(
+    data_dir: Path, broker: str
+) -> tuple[BrokerAccountCandidate, str, str | None] | None:
+    staged = load_staged_statement_candidate(data_dir, broker)
+    if staged is None:
+        return None
+    metadata = load_staged_statement_metadata(data_dir, broker)
+    if metadata is None:
+        candidate, generation = staged
+        return candidate, generation, None
+    return metadata
 
 
 def _now_text() -> str:

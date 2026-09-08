@@ -22,6 +22,7 @@ from open_trader.account_sync_state import (
     load_latest_statement_candidate,
     project_account_sync_health,
     record_source_failure,
+    with_dashboard_projection,
     write_json_atomic,
     write_portfolio_atomic,
 )
@@ -597,6 +598,81 @@ def test_dashboard_projection_publishes_current_valuation_for_every_quoteable_br
     }
     assert eastmoney["market_value_hkd"] == "1296.00"
     assert eastmoney["current_valuation"]["market_value_usd"] == "166.15"
+
+
+def test_manual_source_is_valid_and_projects_current_quotes(tmp_path: Path) -> None:
+    state = _projection_state(tmp_path)
+    manual = replace(
+        _projection_candidate(
+            broker="phillips",
+            market=Market.HK,
+            symbol="00200",
+            currency="HKD",
+            quantity="522",
+            market_value="1973.16",
+            cost_value="1800",
+            fx_rate="1",
+        ),
+        source_kind="manual",
+    )
+    state = accept_candidate(
+        state,
+        manual,
+        attempted_at="2026-07-31T08:00:00+08:00",
+    )
+    quotes = {
+        "status": "ok",
+        "last_success_at": "2026-07-31T08:30:05+08:00",
+        "stale": False,
+        "quotes": {
+            symbol: {
+                "market": market,
+                "symbol": symbol,
+                "status": "ok",
+                "last_price": price,
+                "price_session": "regular" if market == "US" else "",
+                "price_time": "2026-07-31T08:30:05+08:00",
+                "fetched_at": "2026-07-31T08:30:05+08:00",
+            }
+            for market, symbol, price in (
+                ("US", "AAPL", "180"),
+                ("US", "ADP", "280"),
+                ("HK", "00200", "4"),
+                ("CN", "000001", "12"),
+            )
+        },
+    }
+    projected = with_dashboard_projection(
+        state,
+        quotes,
+        generated_at="2026-07-31T08:30:05+08:00",
+    )
+    path = tmp_path / "account_sync_state.json"
+    write_json_atomic(path, projected)
+    loaded = load_account_sync_state(path)
+
+    source = loaded["brokers"]["phillips"]
+    projection = loaded["dashboard_projection"]
+    rows = {
+        (row["broker"], row["symbol"]): row
+        for row in projection["broker_positions"]
+    }
+    health = project_account_sync_health(
+        loaded,
+        _controller_status(datetime.fromisoformat("2026-07-31T08:00:05+08:00")),
+        quotes,
+        now=datetime.fromisoformat("2026-07-31T08:00:05+08:00"),
+    )
+
+    assert source["source_kind"] == "manual"
+    assert health["status"] == "ok"
+    assert rows[("phillips", "00200")]["last_price"] == "4"
+    assert rows[("phillips", "00200")]["market_value_hkd"] == "2088.00"
+    assert next(
+        summary
+        for summary in projection["broker_summaries"]
+        if summary["broker"] == "phillips"
+    )["source_kind"] == "manual"
 
 
 def test_dashboard_projection_rejects_partial_or_mismatched_current_valuation(

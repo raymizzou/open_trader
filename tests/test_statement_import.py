@@ -265,6 +265,91 @@ def test_stage_pdf_requires_eastmoney_password_and_uses_month_period(
     assert FakeEastmoneyParser.passwords == ["local-secret"]
 
 
+def test_eastmoney_metadata_prefers_later_data_as_of_within_same_month(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.statement_import as statement_import
+
+    class DateAwareEastmoneyParser:
+        broker = "eastmoney"
+        parser_version = "test-1"
+
+        def __init__(self, _password: str) -> None:
+            self.detected_date = "2026-09-20"
+
+        def statement_date(self, _path: Path) -> str:
+            return self.detected_date
+
+        def parse(self, _path: Path, period: str) -> ParseResult:
+            is_later = self.detected_date == "2026-09-20"
+            value = Decimal("200") if is_later else Decimal("100")
+            symbol = "600020" if is_later else "600010"
+            statement_id = f"{period}-eastmoney"
+            return ParseResult(
+                statement_id=statement_id,
+                broker="eastmoney",
+                positions=[
+                    Position(
+                        statement_id=statement_id,
+                        broker="eastmoney",
+                        account_alias="eastmoney_main",
+                        market=Market.CN,
+                        asset_class=AssetClass.STOCK,
+                        symbol=symbol,
+                        name="Date-specific holding",
+                        currency="CNY",
+                        quantity=Decimal("1"),
+                        cost_price=value,
+                        last_price=value,
+                        market_value=value,
+                        cost_value=value,
+                        unrealized_pnl=Decimal("0"),
+                        confidence="high",
+                        notes="",
+                    )
+                ],
+                cash_balances=[
+                    CashBalance(
+                        statement_id=statement_id,
+                        broker="eastmoney",
+                        account_alias="eastmoney_main",
+                        currency="CNY",
+                        cash_balance=value,
+                        available_balance=value,
+                        confidence="high",
+                        notes="",
+                    )
+                ],
+            )
+
+    parser = DateAwareEastmoneyParser("secret")
+    monkeypatch.setattr(
+        statement_import, "EastmoneyStatementParser", lambda _password: parser
+    )
+    data_dir = tmp_path / "data"
+    service = statement_import.StatementImportService(
+        data_dir=data_dir,
+        eastmoney_password="secret",
+    )
+
+    later_date = service.stage_pdf(
+        "eastmoney", b"%PDF-1.7\neastmoney later data date"
+    )
+    parser.detected_date = "2026-09-10"
+    older_date = service.stage_pdf(
+        "eastmoney", b"%PDF-1.7\neastmoney older data date"
+    )
+
+    assert older_date["staged_at"] > later_date["staged_at"]
+    candidate, generation, _staged_at = (
+        statement_import.load_staged_statement_metadata(data_dir, "eastmoney")
+    )
+    assert candidate.data_as_of == "2026-09-20"
+    assert generation == later_date["statement_generation"]
+    assert candidate.positions[0].symbol == "600020"
+    assert candidate.cash[0].cash_balance == Decimal("200")
+
+
 def test_worker_validation_rejects_tampered_generation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
