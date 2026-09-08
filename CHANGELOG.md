@@ -3,6 +3,12 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-09-07
+
+- Shortened the always-read agent instructions and moved detailed verification
+  and delivery gates to `docs/operations/agent-verification.md`. Documentation
+  only; reviewed by diff/link inspection with no trading or runtime change.
+
 ## 2026-09-06
 
 - #122 N_LEG 已执行锁跨图谱后继继承（首单硬前置，修 #65 演练 D5 发现的绕行缺口）：凡有前身的后继（EXTEND/SPLIT/MERGE）一律继承已执行锁，仅零前身 NEW 不拦。① 准入事务内（`n_leg_create_batch`）以单一判定 helper 递归展开 `n_leg_episode_lineage` 祖先谱系闭包（含 CLOSED 行）比对 `n_leg_lineage_claims`：同组件/同谱系命中 `N_LEG_LINEAGE_ALREADY_CLAIMED`（行为不变），祖先命中默认新字面量 `N_LEG_LINEAGE_INHERITED_CLAIMED`，图谱查无组件行 fail-closed `N_LEG_LINEAGE_UNKNOWN`；② 重新武装三规则：仅 `close_reason=NO_QUALIFIED_OPPORTUNITY`（COMPONENT_RETIRED 不算）且 `closed_at` 晚于命中祖先 claim 最新创建时间且必须当前组件自己的谱系（时间戳解析比较、不做字符串比较）；③ 身份统一：claim 键改记图谱 lineage（准入事务内按组件解析，绝不信任 payload 冻结串，冻结串仅供展示/审计；旧格式 `lineage:{cid}` 行经图谱兜底解析纳入拦截，图谱无行退回原精确匹配——不比现状更差）；④ confirm 入队新增同判定预检（R5，明确拒绝理由、不留队列行），冻结 `episode_lineage_id` 改用 resolver 图谱真姓；⑤ `solutions()` 条目带 `lineage_id`，Canary 事实报告 claim 键呈现图谱真姓。零 schema 迁移（三表同库现成）、claims 只添不删（尝试即锁死，零成交不放行）、无人工 reset、不动 Episode 语义与 #66 AUTO 路径。评审修复轮 1（P1/P2）：confirm 预检身份改为冻结 lineage 串（生产 oracle 组件 id 恒与图谱摘要主键不匹配，原实现预检生产不可达），图谱未知家族的冻结串保持 pre-#122 `lineage:{cid}` 形状（旧 claim 精确匹配不失效、不比现状更差），新增生产格式回归测试 2 例。验证：11 个 TDD 纵切片红→绿（split/merge 真实图谱轮转驱动、时间卫兵、退役不算、NEW 无假阳性、e2e split+merge 经 HTTP confirm 端点、报告真姓）；聚焦全绿；全量 Docker `make test` **8014 passed / 0 failed**（基线 7999 + 净增 15，5 个 skip 全为既有环境性；主会话修复前独立复跑 8012 亦全绿）。
