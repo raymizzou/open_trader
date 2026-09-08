@@ -46,6 +46,11 @@ def fetch_account_snapshot(
     timeout_seconds: float = DEFAULT_ACCOUNT_TIMEOUT_SECONDS,
 ) -> dict[str, object]:
     payload = _get_json(f"{base_url.rstrip('/')}/api/v1/account/snapshot", timeout_seconds)
+    if "accepted_holding_generation" not in payload:
+        payload = payload.copy()
+        payload["accepted_holding_generation"] = {
+            broker: "" for broker in STATEMENT_BROKERS
+        }
     if not _is_valid_snapshot(payload):
         raise AccountHttpError("account_contract_invalid")
     return payload

@@ -101,6 +101,23 @@ def test_fetch_snapshot_sends_production_marker_and_validates_v1_envelope(
     assert timeout == 1.25
 
 
+def test_fetch_snapshot_defaults_missing_holding_generation_for_pre_upgrade_v1(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from open_trader.account_http import fetch_account_snapshot
+
+    payload = _snapshot()
+    payload.pop("accepted_holding_generation")
+    monkeypatch.setattr(
+        "open_trader.account_http.urllib.request.urlopen",
+        lambda *_args, **_kwargs: _Response(payload),
+    )
+
+    assert fetch_account_snapshot("http://account", 1)[
+        "accepted_holding_generation"
+    ] == {"phillips": "", "eastmoney": ""}
+
+
 @pytest.mark.parametrize("status", [201, 202])
 def test_fetch_snapshot_rejects_non_200_even_with_valid_envelope(
     monkeypatch: pytest.MonkeyPatch, status: int
