@@ -27,6 +27,14 @@ operator-facing: what changed, which workflow is affected, and what was verified
   the operator recovery guide. Final focused verification: 137 passed with
   one existing websockets deprecation warning in 595.68s. No deployment or
   production mutation was performed.
+- Repaired the follow-up release blockers: installer teardown now waits within
+  its existing configured readiness bound, candidate readiness rechecks cwd
+  and listener after health, and candidate failure diagnostics retain the
+  primary reason while reporting cleanup failure separately with only safe
+  identity fields. Added regressions for the launchd grace window, post-health
+  listener observation, and primary-failure preservation; tests were written
+  but not run at the user's request. Only shell syntax and diff checks were
+  performed; no deployment or production mutation was performed.
 
 ## 2026-09-07
 

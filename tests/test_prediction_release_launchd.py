@@ -80,7 +80,17 @@ if command == "launchctl":
                 while not release.exists():
                     time.sleep(0.01)
                 state = json.loads(state_path.read_text(encoding="utf-8"))
-        view = observation_state()
+        grace_remaining = int(state.get("label_absence_grace_polls", 0))
+        if grace_remaining > 0:
+            state["label_absence_grace_polls"] = grace_remaining - 1
+            save()
+            view = {
+                **state,
+                "loaded": True,
+                "pid": state.get("label_absence_grace_pid", state.get("pid", 0)),
+            }
+        else:
+            view = observation_state()
         if view["loaded"]:
             print(f"path = {view['plist']}")
             print(f"working directory = {view.get('label_cwd', view['cwd'])}")
@@ -100,10 +110,16 @@ if command == "launchctl":
         case = state["case"]
         old_pid = state["pid"]
         state.setdefault("bootout_pids", []).append(old_pid)
+        grace_polls = int(state.get("bootout_grace_polls", 0))
         state.update(loaded=False, pid=0, cwd="", listener=False,
                      owner_available=True, health={}, bootout_seen=True,
                      lock_owner_pid=0, lock_owner_pids=[], arguments=[],
                      process_cwd="", label_cwd="")
+        if grace_polls > 0:
+            state.update(
+                label_absence_grace_polls=grace_polls,
+                label_absence_grace_pid=old_pid,
+            )
         if case in {"pid_still_present", "keepalive_restart_survivor"}:
             state["pid"] = old_pid
         if case == "listener_still_present":
@@ -155,7 +171,8 @@ if command == "launchctl":
                 health["git_sha"] = "wrong"
             if state["case"] == "wrong_health_generation":
                 health["reader_generation"] += 1
-            state.update(loaded=True, pid=pid, cwd=health["cwd"], listener=True,
+            listener = state["case"] != "listener_after_health"
+            state.update(loaded=True, pid=pid, cwd=health["cwd"], listener=listener,
                          owner_available=False, health=health,
                          plist=sys.argv[-1],
                          process_cwd=health["cwd"], label_cwd=health["cwd"],
@@ -172,6 +189,8 @@ if command == "launchctl":
                          stdout_log=state["stdout_log"] or os.environ["FAKE_STDOUT_LOG"],
                          stderr_log=state["stderr_log"] or os.environ["FAKE_STDERR_LOG"],
                          max_pids=max(int(state["max_pids"]), 1))
+            if state["case"] == "listener_after_health":
+                state["listener_after_health"] = True
         save()
         if state["case"] == "record_write_failure":
             record_path = Path(os.environ["FAKE_RECORD_PATH"])
@@ -243,6 +262,14 @@ if command == "curl":
     view = observation_state()
     if view["health"]:
         health = view["health"]
+        if state.get("listener_after_health"):
+            state.update(
+                listener=True,
+                listener_after_health=False,
+                lock_owner_pid=health["pid"],
+                lock_owner_pids=[health["pid"]],
+            )
+            save()
         if view["case"] in {"keepalive_restart", "keepalive_restart_survivor"}:
             restarted_pid = 4243
             state.update(
@@ -402,7 +429,7 @@ class ReleaseHarness:
         dry_run: bool = False, expected_sha: str | None = None,
         release_manifest: Path | None = None, check: bool = False,
         preflight: bool = False, owner_probe: bool = True,
-        runtime_root: Path | None = None,
+        runtime_root: Path | None = None, wait_seconds: int = 1,
     ) -> subprocess.CompletedProcess[str]:
         checkout = self.candidate if checkout is None else checkout
         runtime_root = self.runtime_root if runtime_root is None else runtime_root
@@ -415,7 +442,7 @@ class ReleaseHarness:
             "--mode", mode, "--repo-root", str(checkout.path),
             "--runtime-root", str(runtime_root), "--python", sys.executable,
             "--config", str(self.root / "prediction.json"),
-            "--launch-agents-dir", str(self.agents), "--wait-seconds", "1",
+            "--launch-agents-dir", str(self.agents), "--wait-seconds", str(wait_seconds),
             "--release-manifest", str(release_manifest),
         ]
         if dry_run:
@@ -781,6 +808,71 @@ def test_keepalive_restarted_survivor_fails_pid_absence_proof(
     assert record is not None
     assert record["state"] == "failed"
     assert record["failure_reason"] == "candidate_cleanup_not_proven"
+
+
+@pytest.mark.parametrize("operation", ["upgrade", "uninstall"])
+def test_installer_waits_past_launchd_exit_grace(
+    release_harness: ReleaseHarness, operation: str,
+) -> None:
+    old = release_harness.candidate
+    release_harness.install(old, check=True)
+    state = release_harness.state
+    state["bootout_grace_polls"] = 5
+    release_harness.state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    if operation == "upgrade":
+        target = release_harness.make_checkout("grace-upgrade")
+        result = release_harness.install(target, wait_seconds=7)
+        assert result.returncode == 0, result.stderr
+        record = release_harness.runtime_record
+        assert record is not None
+        assert record["state"] == "ready"
+        assert record["candidate"]["git_sha"] == target.sha
+    else:
+        result = release_harness.uninstall()
+        assert result.returncode == 0, result.stderr
+        record = release_harness.runtime_record
+        assert record is not None
+        assert record["state"] == "stopped"
+
+    assert release_harness.state["label_absence_grace_polls"] == 0
+
+
+def test_candidate_ready_reobserves_listener_after_health(
+    release_harness: ReleaseHarness,
+) -> None:
+    release_harness.configure("listener_after_health")
+
+    result = release_harness.install(mode="production")
+
+    assert result.returncode == 0, result.stderr
+    record = release_harness.runtime_record
+    assert record is not None
+    assert record["state"] == "ready"
+    assert record["ready"]["pid"] == release_harness.pid
+    assert record["ready"]["listener"] == "127.0.0.1:8769"
+
+
+def test_candidate_primary_failure_survives_cleanup_failure(
+    release_harness: ReleaseHarness,
+) -> None:
+    state = release_harness.state
+    state.update(case="wrong_health_sha", ps_inspection_error=True)
+    release_harness.state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    result = release_harness.install(mode="production")
+
+    assert result.returncode == 1
+    assert "candidate primary failure: wrong_health_identity" in result.stderr
+    assert "candidate readiness diagnostic:" in result.stderr
+    assert '"health_pid":4242' in result.stderr
+    assert '"health_cwd":' in result.stderr
+    assert "candidate cleanup failure: candidate_cleanup_not_proven" in result.stderr
+    record = release_harness.runtime_record
+    assert record is not None
+    assert record["state"] == "failed"
+    assert record["failure_reason"] == "candidate_cleanup_not_proven"
+    assert "ready" not in record
 
 
 def test_upgrade_refuses_old_pid_inspection_error_before_bootstrap(

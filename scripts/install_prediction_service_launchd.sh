@@ -320,7 +320,7 @@ lint_plist() {
 
 wait_agent_absent() {
   local attempt output status
-  for attempt in 1 2 3 4 5; do
+  for ((attempt = 1; attempt <= WAIT_SECONDS; attempt++)); do
     if output="$("$LAUNCHCTL_BIN" print "gui/$UID/$LABEL" 2>&1)"; then
       status=0
     else
@@ -334,7 +334,7 @@ wait_agent_absent() {
       printf '%s\n' "$output" >&2
       return 1
     fi
-    [[ "$attempt" -lt 5 ]] && sleep 1
+    [[ "$attempt" -lt "$WAIT_SECONDS" ]] && sleep 1
   done
   echo "launchd job is still loaded: $LABEL" >&2
   return 1
@@ -1193,6 +1193,11 @@ FAILURE_REASON="candidate_timeout"
 CANDIDATE_PID=""
 CLEANUP_PID=""
 READY_JSON=""
+CANDIDATE_CWD=""
+CANDIDATE_LISTENER=""
+CANDIDATE_HEALTH_FACTS='{}'
+CANDIDATE_STDOUT=""
+CANDIDATE_STDERR=""
 
 ready_evidence() {
   PYTHONPATH="$MANAGER_SRC" "$PYTHON_BIN" - "$1" "$2" "$3" "$4" "$ACTUAL_SHA" "$MANIFEST_JSON" \
@@ -1277,6 +1282,40 @@ bootstrap_and_wait_for_exact_ready() {
         | awk '$1 ~ /^n/ { print substr($1, 2); exit }' || true)"
       health="$("$CURL_BIN" -fsS http://127.0.0.1:8769/healthz 2>/dev/null || true)"
       if [[ -n "$health" ]]; then
+        # Health is the first positive server observation. Re-read the
+        # process cwd and listener after it so readiness uses one coherent,
+        # current identity rather than a pre-health startup sample.
+        cwd="$("$LSOF_BIN" -a -p "$CANDIDATE_PID" -d cwd -Fn 2>/dev/null \
+          | awk '$1 ~ /^n/ { print substr($1, 2); exit }' || true)"
+        listener="$("$LSOF_BIN" -nP -a -p "$CANDIDATE_PID" -iTCP:8769 -sTCP:LISTEN -Fn 2>/dev/null \
+          | awk '$1 ~ /^n/ { print substr($1, 2); exit }' || true)"
+        CANDIDATE_CWD="$cwd"
+        CANDIDATE_LISTENER="$listener"
+        CANDIDATE_STDOUT="$observed_stdout"
+        CANDIDATE_STDERR="$observed_stderr"
+        CANDIDATE_HEALTH_FACTS="$("$PYTHON_BIN" - "$health" <<'PY'
+import json
+import sys
+
+try:
+    health = json.loads(sys.argv[1])
+except (TypeError, ValueError, json.JSONDecodeError):
+    health = {}
+if not isinstance(health, dict):
+    health = {}
+print(json.dumps({
+    "pid": health.get("pid"),
+    "cwd": health.get("cwd"),
+    "git_sha": health.get("git_sha"),
+    "schema_version": health.get("schema_version"),
+    "release_schema_version": health.get("release_schema_version"),
+    "mode": health.get("mode"),
+    "reader_generation": health.get("reader_generation"),
+    "contract_generation": health.get("contract_generation"),
+    "status": health.get("status"),
+}, separators=(",", ":")))
+PY
+)"
         if [[ "$cwd" != "$REPO_ROOT" || "$listener" != "127.0.0.1:8769" ]]; then
           FAILURE_REASON="wrong_health_identity"
           return 1
@@ -1357,12 +1396,54 @@ candidate_absent() {
 }
 
 finish_candidate_failure() {
-  local reason="$1" cleanup_ok=1
+  local reason="$1" cleanup_ok=1 cleanup_checks=()
   FAILURE_REASON="$reason"
-  cleanup_verified_candidate || cleanup_ok=0
-  candidate_absent || cleanup_ok=0
-  remove_managed_plist || cleanup_ok=0
+  echo "candidate primary failure: $reason" >&2
+  "$PYTHON_BIN" - "$reason" "$CANDIDATE_PID" "$CANDIDATE_CWD" \
+    "$CANDIDATE_LISTENER" "$CANDIDATE_HEALTH_FACTS" "$CANDIDATE_STDOUT" \
+    "$CANDIDATE_STDERR" <<'PY' >&2
+import json
+import sys
+
+reason, pid, cwd, listener, health_raw, stdout, stderr = sys.argv[1:]
+try:
+    health = json.loads(health_raw)
+except (TypeError, ValueError, json.JSONDecodeError):
+    health = {}
+if not isinstance(health, dict):
+    health = {}
+facts = {
+    "primary_reason": reason,
+    "pid": int(pid) if pid.isdigit() else None,
+    "cwd": cwd,
+    "listener": listener,
+    "health_pid": health.get("pid"),
+    "health_cwd": health.get("cwd"),
+    "git_sha": health.get("git_sha"),
+    "schema_version": health.get("schema_version"),
+    "release_schema_version": health.get("release_schema_version"),
+    "mode": health.get("mode"),
+    "reader_generation": health.get("reader_generation"),
+    "contract_generation": health.get("contract_generation"),
+    "status": health.get("status"),
+    "logs": {"stdout": stdout, "stderr": stderr},
+}
+print("candidate readiness diagnostic: " + json.dumps(facts, separators=(",", ":")))
+PY
+  if ! cleanup_verified_candidate; then
+    cleanup_ok=0
+    cleanup_checks+=("cleanup_verified_candidate")
+  fi
+  if ! candidate_absent; then
+    cleanup_ok=0
+    cleanup_checks+=("candidate_absent")
+  fi
+  if ! remove_managed_plist; then
+    cleanup_ok=0
+    cleanup_checks+=("remove_managed_plist")
+  fi
   if [[ "$cleanup_ok" -ne 1 ]]; then
+    echo "candidate cleanup failure: candidate_cleanup_not_proven; checks=${cleanup_checks[*]}" >&2
     FAILURE_REASON="candidate_cleanup_not_proven"
   fi
   record_failed_and_exit "$FAILURE_REASON"

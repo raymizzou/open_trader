@@ -58,11 +58,28 @@ another installer, uninstaller, or shadow operation must stop with
 first operation exits. A leftover lock file is not proof of an active
 operation; only a kernel-held advisory lock blocks a retry.
 
+Teardown polling is bounded but must cover launchd's normal SIGTERM grace:
+installer label-absence checks use the existing --wait-seconds bound (the same
+bound used for readiness). The uninstaller retains its existing cleanup
+reserve, which also covers the grace window. A label that remains loaded, or
+an inspection that is unknown, remains a fail-closed error; do not remove the
+plist or force-kill a process to make the check pass.
+
+Candidate readiness samples the process cwd and listener again after a
+nonempty health response. A pre-health startup sample is not sufficient
+evidence for the final identity check.
+
 Before handing off a verified running service, the scripts re-read the
 authoritative runtime record and live identity. If those observations change,
 the operation stops without booting out the changed owner or overwriting the
 new record. Failed or interrupted transitions remain visible in the runtime
 record; do not fabricate a ready/deployed claim.
+
+When a candidate fails, stderr first records the primary rejection and a
+sanitized readiness diagnostic (PID/cwd/listener, SHA/schema/mode/generations,
+status, and observed log paths). Cleanup checks are reported separately. If
+cleanup cannot be proven, the compatible runtime-record failure_reason remains
+candidate_cleanup_not_proven; it does not erase the primary stderr diagnostic.
 
 Shadow mode shares the launchd label and therefore cannot be used to manage a
 live production service. A shadow command must be refused before touching the
