@@ -117,7 +117,7 @@ from open_trader.prediction_solver_worker import WorkerOutcome, WorkerRequest
 logger = logging.getLogger(__name__)
 
 LIVE_BUDGET = OracleBudget(
-    max_quantity_vectors=9, max_joint_states=2, max_support_rechecks=1
+    max_quantity_vectors=16, max_joint_states=25, max_support_rechecks=1
 )
 LIVE_LIMITS = BenchmarkLimits(
     soft_time_limit_ms=1_000,
@@ -384,8 +384,8 @@ class PredictionLiveResolver:
         poll_interval: float = 0.25,
         account_freshness_seconds: float = 60.0,
         code_version: str = "issue-52",
-        # Seam: the issue-71 validation harness must exercise this chain with
-        # its N>=3 budget (8 joint states) instead of the 2-leg LIVE_BUDGET.
+        # Seam: the issue-71 validation harness injects its own budget
+        # independently of the bounded live defaults.
         budget: OracleBudget = LIVE_BUDGET,
         limits: BenchmarkLimits = LIVE_LIMITS,
         proof_time_limit_ms: int = LIVE_PROOF_TIME_LIMIT_MS,

@@ -5,6 +5,20 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-09
 
+- #115 bounded the live solver oracle budget at `(16, 25, 1)` for quantity
+  vectors, raw joint states, and support rechecks. Two-contract candidate and
+  negative-proof regressions now close at `QUALIFIED_VERIFIED` and
+  `NO_QUALIFIED_OPPORTUNITY`; native complement 25-state and n=5/6 large-
+  component boundaries remain fail-closed. The Docker focused budget checks
+  pass; the required full Docker `make test` also passes with 8,125 passed,
+  5 skipped, 9 deselected, and 1 warning (Candidate Acceptance not run).
+- #115 test verification now restores the process environment after each daily
+  premarket test, keeping intentional `OPEN_TRADER_PYTHON` mutations observable
+  within a test without contaminating later launchd-uninstaller checks. The
+  eleven daily-runner tests that use the summary client now declare a dummy
+  `DEEPSEEK_API_KEY` through per-test monkeypatching. The affected module,
+  three launchd-uninstaller checks, and four budget checks pass in Docker
+  (`173 passed`); the required full Docker rerun then passed with no failures.
 - Review blocker repairs for the Hermes holdings workflow: all workflow requests now use an
   explicit no-proxy/no-redirect transport, staged POST responses share the bounded 16 MiB
   response cap with Dashboard reads, stale aggregate account state no longer hides a healthy

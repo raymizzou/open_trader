@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import plistlib
 import shutil
 import subprocess
@@ -11,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -45,6 +47,12 @@ from open_trader.trading_plan import (
     TRADING_PLAN_FIELDNAMES,
     TradingPlanBuildResult,
 )
+
+
+@pytest.fixture(autouse=True)
+def restore_process_environment():
+    with patch.dict(os.environ):
+        yield
 
 
 def test_load_env_config_parses_required_values_and_executor_host(
@@ -2552,6 +2560,8 @@ def test_daily_runner_keeps_partial_status_when_blocker_rendering_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+
     def raise_blocker_render_error(**kwargs: object) -> str:
         raise RuntimeError("blocker render failed")
 
@@ -2680,7 +2690,9 @@ def test_daily_runner_keeps_success_status_when_order_review_rendering_fails(
 
 def test_daily_runner_skips_daily_notification_when_report_notify_disabled(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
     config = DailyPremarketConfig(
         repo=tmp_path,
         python=tmp_path / ".venv/bin/python",
@@ -2716,7 +2728,11 @@ def test_daily_runner_skips_daily_notification_when_report_notify_disabled(
     assert notifier.calls == []
 
 
-def test_daily_runner_skips_daily_notification_in_dry_run(tmp_path: Path) -> None:
+def test_daily_runner_skips_daily_notification_in_dry_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
     config = DailyPremarketConfig(
         repo=tmp_path,
         python=tmp_path / ".venv/bin/python",
@@ -2860,6 +2876,8 @@ def test_daily_runner_deadline_uses_requested_run_date(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+
     class FixedDatetime(datetime):
         @classmethod
         def now(cls, tz=None):
@@ -2988,7 +3006,11 @@ def test_daily_runner_defers_latest_promotion_until_final_success(
     )
 
 
-def test_daily_runner_promotes_decision_facts(tmp_path: Path) -> None:
+def test_daily_runner_promotes_decision_facts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
     config = DailyPremarketConfig(
         repo=tmp_path,
         python=tmp_path / ".venv/bin/python",
@@ -3158,6 +3180,7 @@ def test_daily_runner_rolls_back_latest_set_when_grouped_promotion_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
     config = DailyPremarketConfig(
         repo=tmp_path,
         python=tmp_path / ".venv/bin/python",
@@ -3413,6 +3436,7 @@ def test_daily_runner_does_not_promote_latest_when_report_write_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
     config = DailyPremarketConfig(
         repo=tmp_path,
         python=tmp_path / ".venv/bin/python",
@@ -3550,7 +3574,11 @@ def test_daily_runner_returns_failed_when_failure_reporting_writes_fail(
     )
 
 
-def test_daily_runner_does_not_promote_latest_in_dry_run(tmp_path: Path) -> None:
+def test_daily_runner_does_not_promote_latest_in_dry_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
     config = DailyPremarketConfig(
         repo=tmp_path,
         python=tmp_path / ".venv/bin/python",
@@ -3612,7 +3640,9 @@ def test_daily_runner_does_not_promote_latest_in_dry_run(tmp_path: Path) -> None
 
 def test_daily_runner_dry_run_argument_overrides_config(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
     config = DailyPremarketConfig(
         repo=tmp_path,
         python=tmp_path / ".venv/bin/python",
@@ -3933,7 +3963,9 @@ class MissingQuoteClient:
 
 def test_daily_runner_marks_partial_when_futu_quote_is_missing(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
     config = DailyPremarketConfig(
         repo=tmp_path,
         python=tmp_path / ".venv/bin/python",
@@ -4011,7 +4043,11 @@ def test_daily_runner_marks_missing_quote_as_review_required(
     assert "缺失 1 个标的行情" in diagnostic["next_step"]
 
 
-def test_daily_runner_ignores_quote_client_close_failure(tmp_path: Path) -> None:
+def test_daily_runner_ignores_quote_client_close_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
     config = DailyPremarketConfig(
         repo=tmp_path,
         python=tmp_path / ".venv/bin/python",
