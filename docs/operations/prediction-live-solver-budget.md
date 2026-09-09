@@ -47,6 +47,14 @@ launchd-uninstaller regressions pass together in Docker (`173 passed in
 41.63s`) on the working tree based on `75c4cf7b0b7523f1a1b3b585cb8195619b77a50c`.
 The daily premarket tests restore the process environment after each case and
 declare their own dummy `DEEPSEEK_API_KEY` where the summary client is part of
-the intended path. The required full Docker `make test` then passed with
-8,125 passed, 5 skipped, 9 deselected, and 1 warning in 983.94s; Candidate
-Acceptance was not run.
+the intended path. Implementation-stage full Docker verification on that
+working tree passed with 8,125 passed, 5 skipped, 9 deselected, and 1 warning
+in 983.94s.
+
+After the rebase, development `make test` on
+`e0c74990425e8b6c02291324cf76ebedbe2be1f7` passed with 8,157 passed, 5
+skipped, 9 deselected, and 1 warning in 976.34s. Host Readiness was READY
+for that SHA. Candidate Acceptance remains pending because Docker API
+requests became unresponsive after Resource Saver resumed; this is interrupted
+evidence, not a product test failure. This documentation correction does not
+claim Candidate Acceptance or deployment for its eventual new SHA.

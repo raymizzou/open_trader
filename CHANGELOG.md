@@ -10,8 +10,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
   negative-proof regressions now close at `QUALIFIED_VERIFIED` and
   `NO_QUALIFIED_OPPORTUNITY`; native complement 25-state and n=5/6 large-
   component boundaries remain fail-closed. The Docker focused budget checks
-  pass; the required full Docker `make test` also passes with 8,125 passed,
-  5 skipped, 9 deselected, and 1 warning (Candidate Acceptance not run).
+  pass; implementation-stage working-tree verification on
+  `75c4cf7b0b7523f1a1b3b585cb8195619b77a50c` passed the full Docker
+  `make test` with 8,125 passed, 5 skipped, 9 deselected, and 1 warning.
 - #115 test verification now restores the process environment after each daily
   premarket test, keeping intentional `OPEN_TRADER_PYTHON` mutations observable
   within a test without contaminating later launchd-uninstaller checks. The
@@ -19,6 +20,11 @@ operator-facing: what changed, which workflow is affected, and what was verified
   `DEEPSEEK_API_KEY` through per-test monkeypatching. The affected module,
   three launchd-uninstaller checks, and four budget checks pass in Docker
   (`173 passed`); the required full Docker rerun then passed with no failures.
+- After the rebase onto the current development baseline, Docker
+  `make test` on `e0c74990425e8b6c02291324cf76ebedbe2be1f7` passed with
+  8,157 passed, 5 skipped, 9 deselected, and 1 warning in 976.34s. Host
+  Readiness was READY for that SHA; Candidate Acceptance remains pending
+  after its Docker API became unresponsive during the interrupted build.
 - Review blocker repairs for the Hermes holdings workflow: all workflow requests now use an
   explicit no-proxy/no-redirect transport, staged POST responses share the bounded 16 MiB
   response cap with Dashboard reads, stale aggregate account state no longer hides a healthy
