@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 import hashlib
@@ -8,6 +9,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Lock
 from typing import Mapping
+from zoneinfo import ZoneInfo
 
 from .futu_symbols import to_futu_symbol
 
@@ -20,8 +22,14 @@ SUPPORTED_BROKERS = {
 
 
 class HoldingSnapshotImportService:
-    def __init__(self, *, data_dir: Path) -> None:
+    def __init__(
+        self,
+        *,
+        data_dir: Path,
+        business_date: Callable[[], date] | None = None,
+    ) -> None:
         self.data_dir = data_dir
+        self._business_date = business_date or _shanghai_business_date
         self._stage_lock = Lock()
 
     def stage_snapshot(
@@ -29,6 +37,10 @@ class HoldingSnapshotImportService:
     ) -> dict[str, object]:
         with self._stage_lock:
             canonical = _canonical_snapshot(broker, payload)
+            data_as_of = canonical["data_as_of"]
+            assert isinstance(data_as_of, str)
+            if date.fromisoformat(data_as_of) > self._business_date():
+                raise ValueError(f"future data_as_of: {data_as_of}")
             generation = _content_sha256(canonical)
             generations = self.data_dir / "account_holdings/generations" / broker
             destination = generations / generation.removeprefix("sha256:")
@@ -61,6 +73,10 @@ class HoldingSnapshotImportService:
             staged = _load_manifest(destination)
             _validate_staged_manifest(staged, destination, broker)
             return staged
+
+
+def _shanghai_business_date() -> date:
+    return datetime.now(ZoneInfo("Asia/Shanghai")).date()
 
 
 def load_staged_holding_snapshot(

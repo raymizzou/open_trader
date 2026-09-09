@@ -3356,6 +3356,19 @@ def load_real_holding_input(
         ),
         "read_only_text": "只读，不自动下单",
     }
+    accepted_holding_generations = account_snapshot.get(
+        "accepted_holding_generation"
+    )
+    holding_generation = (
+        accepted_holding_generations.get(broker)
+        if isinstance(accepted_holding_generations, Mapping)
+        else None
+    )
+    if (
+        isinstance(holding_generation, str)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", holding_generation)
+    ):
+        source["holding_generation"] = holding_generation
     try:
         prior_state = load_protection_state(state_path)
         events = load_watch_events(state_path.with_name("real_watch_events.jsonl"))

@@ -473,11 +473,14 @@ def test_worker_prefers_later_manual_snapshot_on_same_data_date(
         data_dir, "phillips"
     )
     assert official_metadata is not None
-    _official_candidate, _official_generation, official_staged_at = official_metadata
+    official_candidate, _official_generation, official_staged_at = official_metadata
     accepted = load_account_sync_state(data_dir / "latest/account_sync_state.json")
-    accepted["accepted_statement_generation"]["phillips"] = official[
-        "statement_generation"
-    ]
+    accepted = accept_candidate(
+        accepted,
+        official_candidate,
+        attempted_at="2026-09-07T11:00:00+08:00",
+        statement_generation=official["statement_generation"],
+    )
     write_json_atomic(data_dir / "latest/account_sync_state.json", accepted)
 
     manual = HoldingSnapshotImportService(data_dir=data_dir).stage_snapshot(
@@ -510,6 +513,18 @@ def test_worker_prefers_later_manual_snapshot_on_same_data_date(
     published = load_account_sync_state(data_dir / "latest/account_sync_state.json")
     assert result["brokers"]["phillips"] == {"status": "ok"}
     assert published["brokers"]["phillips"]["positions"][0]["symbol"] == "00700"
+    assert published["brokers"]["phillips"]["cash"] == [
+        {
+            "statement_id": "2026-09-07-phillips",
+            "broker": "phillips",
+            "account_alias": "phillips_main",
+            "currency": "HKD",
+            "cash_balance": "90",
+            "available_balance": "90",
+            "confidence": "high",
+            "notes": "official",
+        }
+    ]
     assert published["accepted_holding_generation"]["phillips"] == manual[
         "holding_generation"
     ]

@@ -10591,6 +10591,180 @@ console.log("ok");
     assert "background: var(--surface-soft);" in css
 
 
+def test_current_report_distinguishes_latest_and_frozen_holdings() -> None:
+    output = run_dashboard_js(r'''
+const frozenGeneration = "sha256:" + "a".repeat(64);
+const latestGeneration = "sha256:" + "b".repeat(64);
+const report = {
+  available:true, market:"HK", broker:"phillips", broker_label:"辉立", market_label:"港股",
+  report_date:"2026-09-08", data_date:"2026-09-07", generated_at:"2026-09-07T20:00:00+08:00",
+  account_status:"已更新", counts:{}, sell_actions:[], buy_actions:[], hold_actions:[], review_actions:[], audit:{},
+  real_position_status:"available",
+  real_position_source:{
+    broker_label:"辉立", snapshot_period:"2026-09-07", source_kind:"live_account",
+    holding_generation:frozenGeneration, freshness_text:"只读快照", read_only_text:"只读，不自动下单",
+  },
+};
+state.accountError = null;
+state.accountSnapshot = {
+  status:"healthy", stale:false,
+  accepted_holding_generation:{phillips:latestGeneration, eastmoney:""},
+  sources:{account:{brokers:{phillips:{status:"ok", data_as_of:"2026-09-08"}}}},
+};
+const before = JSON.stringify(report);
+const html = renderTrendReportWorkspace(report);
+const matched = renderTrendReportWorkspace({
+  ...report,
+  data_date:"2026-09-08",
+  real_position_source:{...report.real_position_source, snapshot_period:"2026-09-08", holding_generation:latestGeneration},
+});
+const sameDateDifferent = renderTrendReportWorkspace({
+  ...report,
+  data_date:"2026-09-08",
+  real_position_source:{...report.real_position_source, snapshot_period:"2026-09-08", holding_generation:"sha256:" + "c".repeat(64)},
+});
+const {holding_generation: _legacyGeneration, ...legacySource} = report.real_position_source;
+const legacy = renderTrendReportWorkspace({
+  ...report,
+  data_date:"2026-09-08",
+  real_position_source:{...legacySource, snapshot_period:"2026-09-08"},
+});
+state.accountError = new Error("offline");
+const accountError = renderTrendReportWorkspace(report);
+state.accountError = null;
+state.accountSnapshot.accepted_holding_generation.eastmoney = "sha256:" + "d".repeat(64);
+state.accountSnapshot.sources.account.brokers.eastmoney = {status:"ok", data_as_of:"2026-09-08"};
+const historical = renderTrendReportWorkspace(report, true, true);
+const cn = renderTrendReportWorkspace({
+  ...report,
+  broker:"eastmoney", broker_label:"东方财富", market:"CN", market_label:"A股",
+  real_position_source:{...report.real_position_source, broker_label:"东方财富", holding_generation:"sha256:" + "d".repeat(64)},
+});
+console.log(JSON.stringify({
+  html, unchanged:JSON.stringify(report) === before, matched, sameDateDifferent, legacy,
+  accountError, historical, cn,
+}));
+''')
+    rendered = json.loads(output)
+    assert "最新持仓 2026-09-08" in rendered["html"]
+    assert "报告持仓 2026-09-07" in rendered["html"]
+    assert "新持仓已到账，报告待更新" in rendered["html"]
+    assert "sha256:" not in rendered["html"]
+    assert rendered["unchanged"] is True
+    assert "本报告已采用当前持仓" in rendered["matched"]
+    assert "新持仓已到账，报告待更新" in rendered["sameDateDifferent"]
+    assert "本报告未记录持仓版本，暂无法核对" in rendered["legacy"]
+    assert "最新持仓状态暂不可核对" in rendered["accountError"]
+    assert "本报告已采用当前持仓" not in rendered["historical"]
+    assert "最新持仓" not in rendered["historical"]
+    assert "本报告已采用当前持仓" in rendered["cn"]
+
+
+def test_current_report_lineage_ignores_unrelated_account_degradation() -> None:
+    output = run_dashboard_js(r'''
+const generationA = "sha256:" + "a".repeat(64);
+const generationB = "sha256:" + "b".repeat(64);
+const report = {
+  available:true, market:"HK", broker:"phillips", broker_label:"辉立", market_label:"港股",
+  report_date:"2026-09-08", data_date:"2026-09-08", generated_at:"2026-09-08T20:00:00+08:00",
+  account_status:"已更新", counts:{}, sell_actions:[], buy_actions:[], hold_actions:[], review_actions:[], audit:{},
+  real_position_status:"available",
+  real_position_source:{broker_label:"辉立", snapshot_period:"2026-09-08", source_kind:"live_account", holding_generation:generationA},
+};
+state.accountError = null;
+state.accountSnapshot = {
+  status:"stale", stale:true,
+  accepted_holding_generation:{phillips:generationA, eastmoney:""},
+  sources:{account:{brokers:{
+    phillips:{status:"healthy", data_as_of:"2026-09-08"},
+    eastmoney:{status:"unavailable", data_as_of:"2026-09-07"},
+  }}, quotes:{status:"stale"}},
+};
+const matched = renderTrendReportWorkspace(report);
+state.accountSnapshot.accepted_holding_generation.phillips = generationB;
+const pending = renderTrendReportWorkspace(report);
+state.accountSnapshot.sources.account.brokers.phillips = {status:"unavailable", data_as_of:"2026-09-08"};
+const unavailable = renderTrendReportWorkspace(report);
+console.log(JSON.stringify({matched, pending, unavailable}));
+''')
+    rendered = json.loads(output)
+    assert "本报告已采用当前持仓" in rendered["matched"]
+    assert "新持仓已到账，报告待更新" in rendered["pending"]
+    assert "最新持仓状态暂不可核对" in rendered["unavailable"]
+
+
+def test_current_report_holding_note_updates_without_replacing_report() -> None:
+    output = run_dashboard_js(r'''
+const frozenGeneration = "sha256:" + "a".repeat(64);
+const newerGeneration = "sha256:" + "b".repeat(64);
+const report = {
+  available:true, market:"HK", broker:"phillips", broker_label:"辉立", market_label:"港股",
+  report_date:"2026-09-08", data_date:"2026-09-07", generated_at:"2026-09-07T20:00:00+08:00",
+  account_status:"已更新", counts:{}, sell_actions:[], buy_actions:[], hold_actions:[], review_actions:[], audit:{},
+  real_position_status:"available",
+  real_position_source:{broker_label:"辉立", snapshot_period:"2026-09-07", source_kind:"live_account", holding_generation:frozenGeneration},
+};
+state.dashboard = {trend_reports:{phillips:report}};
+state.accountError = null;
+state.accountSnapshot = {
+  status:"healthy", stale:false,
+  accepted_holding_generation:{phillips:newerGeneration},
+  sources:{account:{brokers:{phillips:{status:"ok", data_as_of:"2026-09-08"}}}},
+};
+const note = {dataset:{broker:"phillips"}, textContent:"旧持仓状态"};
+const selectedTab = {value:"real"};
+const expanded = {value:true};
+const workspace = {
+  innerHTML:"<article>frozen report</article>",
+  querySelector(selector) {
+    return selector === "[data-current-trend-holding-note]" ? note : null;
+  },
+};
+elements["trend-report-workspace"] = workspace;
+const beforeHtml = workspace.innerHTML;
+updateCurrentTrendHoldingNote();
+const pending = note.textContent;
+state.accountSnapshot.accepted_holding_generation.phillips = frozenGeneration;
+updateCurrentTrendHoldingNote();
+console.log(JSON.stringify({
+  pending,
+  matched:note.textContent,
+  reportHtmlUnchanged:workspace.innerHTML === beforeHtml,
+  selectedTab:selectedTab.value,
+  expanded:expanded.value,
+}));
+''')
+    rendered = json.loads(output)
+    assert "新持仓已到账，报告待更新" in rendered["pending"]
+    assert "本报告已采用当前持仓" in rendered["matched"]
+    assert rendered["reportHtmlUnchanged"] is True
+    assert rendered["selectedTab"] == "real"
+    assert rendered["expanded"] is True
+
+
+def test_trend_holding_source_labels_manual_snapshot() -> None:
+    output = run_dashboard_js(r'''
+const source = (source_kind) => renderTrendHoldingSource({
+  real_position_status:"available",
+  real_position_source:{broker_label:"辉立", snapshot_period:"2026-09-08", source_kind},
+});
+console.log(JSON.stringify({
+  manual:source("manual"),
+  live:source("live"),
+  liveAccount:source("live_account"),
+  statement:source("statement"),
+  unknown:source("future_source"),
+}));
+''')
+    rendered = json.loads(output)
+    assert "手工快照" in rendered["manual"]
+    assert "结单" not in rendered["manual"]
+    assert "账户" in rendered["live"]
+    assert "账户" in rendered["liveAccount"]
+    assert "结单" in rendered["statement"]
+    assert "持仓快照" in rendered["unknown"]
+
+
 def test_dashboard_shared_historical_trend_holding_split_preserves_rows_and_normalizes_keys() -> None:
     account_rows = [
         {"holding": {"market": "US", "symbol": "ADP"}, "display": {"market": "US", "symbol": "ADP", "market_value_hkd": "10"}},

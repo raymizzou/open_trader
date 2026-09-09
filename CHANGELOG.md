@@ -3,6 +3,24 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-09-09
+
+- Review blocker repairs for the Hermes holdings workflow: all workflow requests now use an
+  explicit no-proxy/no-redirect transport, staged POST responses share the bounded 16 MiB
+  response cap with Dashboard reads, stale aggregate account state no longer hides a healthy
+  selected-broker lineage, and nonblocking readonly controllers remain informational. Focused
+  RED/GREEN evidence and the affected-file check are complete; no full suite, Candidate,
+  activation, live request, merge, push, or deployment was run.
+- Hardened the Hermes holdings workflow with future-date and initial-preserved-cash guards,
+  generation-confirmed submit receipts, and a stable read-only checker that reports frozen
+  report lineage and actionable per-broker controller facts while account snapshots retain
+  current `source_kind`/notes.
+  Added a READY-TO-CONFIGURE native Hermes monitor template with changed-output suppression;
+  bounded first Futu trade-context initialization preserves the SDK's existing reconnect
+  semantics and documents its wait limitation. Regression coverage includes the workflow file
+  (`9 passed`) plus targeted date/cash, source-label, and adapter checks; rollout, monitor
+  activation, full-suite, and Candidate Acceptance remain separate and are not claimed here.
+
 ## 2026-09-07
 
 - Shortened the always-read agent instructions and moved detailed verification

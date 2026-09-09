@@ -259,6 +259,11 @@ def accept_candidate(
     assert isinstance(brokers, dict)
     previous = brokers[candidate.broker]
     assert isinstance(previous, dict)
+    if preserve_cash and not previous["cash"]:
+        raise ValueError(
+            f"cannot preserve cash for {candidate.broker}: "
+            "no previously accepted cash"
+        )
     brokers[candidate.broker] = {
         "source_kind": candidate.source_kind,
         "status": "ok",

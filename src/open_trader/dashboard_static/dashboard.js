@@ -1007,6 +1007,7 @@ async function loadAccountSnapshot() {
     renderConnectionPanel();
     renderHoldings();
     if (state.workspaceView === "standard_backtest") renderStandardBacktest();
+    updateCurrentTrendHoldingNote();
     state.accountValuationUpdates.clear();
   }
 }
@@ -5740,6 +5741,85 @@ function trendRealHoldingSource(report) {
   return source && typeof source === "object" ? source : {};
 }
 
+function validTrendHoldingGeneration(value) {
+  return typeof value === "string" && /^sha256:[0-9a-f]{64}$/.test(value);
+}
+
+function validTrendHoldingDate(value) {
+  return typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
+
+function trendHoldingFreshnessNoteText(report) {
+  const broker = brokerKey(report?.broker);
+  const reportSource = trendRealHoldingSource(report);
+  const accountSource = state.accountSnapshot?.sources?.account?.brokers?.[broker];
+  const latestDate = firstPresent(accountSource?.data_as_of, accountSource?.as_of);
+  const reportDate = firstPresent(reportSource.snapshot_period, reportSource.data_as_of);
+  const latestGeneration = state.accountSnapshot?.accepted_holding_generation?.[broker];
+  const reportGeneration = reportSource.holding_generation;
+  const sourceStatus = String(accountSource?.status || "").trim().toLowerCase();
+  const accountAvailable = Boolean(state.accountSnapshot)
+    && !state.accountError
+    && ["healthy", "ok"].includes(sourceStatus);
+  let status = "最新持仓状态暂不可核对";
+  if (accountAvailable) {
+    const hasLatestGeneration = validTrendHoldingGeneration(latestGeneration);
+    const hasReportGeneration = validTrendHoldingGeneration(reportGeneration);
+    if (hasLatestGeneration && hasReportGeneration) {
+      status = latestGeneration === reportGeneration
+        ? "本报告已采用当前持仓"
+        : "新持仓已到账，报告待更新";
+    } else if (
+      validTrendHoldingDate(latestDate)
+      && validTrendHoldingDate(reportDate)
+      && latestDate > reportDate
+    ) {
+      status = "新持仓已到账，报告待更新";
+    } else {
+      status = "本报告未记录持仓版本，暂无法核对";
+    }
+  }
+  return `最新持仓 ${formatPlain(latestDate)} · 报告持仓 ${formatPlain(reportDate)} · ${status}`;
+}
+
+function renderTrendHoldingFreshnessNote(report, historical = false) {
+  const broker = brokerKey(report?.broker);
+  if (
+    historical
+    || !["phillips", "eastmoney"].includes(broker)
+    || !report
+  ) {
+    return "";
+  }
+  return `<p class="cn-trend-price-sources trend-report-holding-note" data-current-trend-holding-note data-broker="${escapeHtml(broker)}">${escapeHtml(trendHoldingFreshnessNoteText(report))}</p>`;
+}
+
+function updateCurrentTrendHoldingNote() {
+  const notes = [];
+  const addNotes = (container) => {
+    if (!container) return;
+    if (typeof container.querySelectorAll === "function") {
+      notes.push(...Array.from(container.querySelectorAll("[data-current-trend-holding-note]")));
+    } else if (typeof container.querySelector === "function") {
+      const note = container.querySelector("[data-current-trend-holding-note]");
+      if (note) notes.push(note);
+    }
+  };
+  addNotes(typeof document !== "undefined" ? document : null);
+  addNotes(elements["trend-report-workspace"]);
+  addNotes(elements["account-holdings"]);
+  const seen = new Set();
+  notes.forEach((note) => {
+    if (!note || seen.has(note)) return;
+    seen.add(note);
+    const broker = brokerKey(note.dataset?.broker);
+    const report = state.dashboard?.trend_reports?.[broker];
+    if (report && typeof note.textContent !== "undefined") {
+      note.textContent = trendHoldingFreshnessNoteText(report);
+    }
+  });
+}
+
 function trendHoldingCarriedForwardClass(item, report) {
   const signalDate = formatPlain(item?.signal_as_of_date);
   const reportDate = formatPlain(report?.data_date || report?.as_of_date);
@@ -5827,7 +5907,12 @@ function renderTrendHoldingSource(report) {
   const source = trendRealHoldingSource(report);
   const broker = source.broker_label || report?.broker_label || "数据源";
   const period = source.snapshot_period || "数据未提供";
-  const kind = source.source_kind === "live_account" ? "账户" : "结单";
+  const kind = {
+    manual: "手工快照",
+    live: "账户",
+    live_account: "账户",
+    statement: "结单",
+  }[String(source.source_kind || "").trim().toLowerCase()] || "持仓快照";
   const freshness = source.freshness_text || "数据未提供";
   const readOnly = source.read_only_text || "只读，不自动下单";
   return `<p class="cn-trend-price-sources">${escapeHtml(formatPlain(`${broker} · ${kind} ${period} · ${freshness} · ${readOnly}`))}</p>${renderTrendAccountExceptions(source)}`;
@@ -6742,6 +6827,7 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
         <span>状态 ${escapeHtml(formatPlain(report.status_text || report.data_status || report.account_status || "数据未提供"))}</span>
         <span class="trend-report-cost">${escapeHtml(trendReportCostLabel(report))}</span>
       </div>
+      ${renderTrendHoldingFreshnessNote(report, historical)}
     </header>
     ${readinessBanner}
     ${renderTrendKellyObservation(report.kelly_observation, report)}

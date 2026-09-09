@@ -44,8 +44,12 @@ class AccountHttpError(Exception):
 def fetch_account_snapshot(
     base_url: str = DEFAULT_ACCOUNT_API_URL,
     timeout_seconds: float = DEFAULT_ACCOUNT_TIMEOUT_SECONDS,
+    *,
+    opener: urllib.request.OpenerDirector | None = None,
 ) -> dict[str, object]:
-    payload = _get_json(f"{base_url.rstrip('/')}/api/v1/account/snapshot", timeout_seconds)
+    payload = _get_json(
+        f"{base_url.rstrip('/')}/api/v1/account/snapshot", timeout_seconds, opener=opener
+    )
     if "accepted_holding_generation" not in payload:
         payload = payload.copy()
         payload["accepted_holding_generation"] = {
@@ -74,7 +78,12 @@ def fetch_statement_trade_facts(
     return payload
 
 
-def _get_json(url: str, timeout_seconds: float) -> dict[str, object]:
+def _get_json(
+    url: str,
+    timeout_seconds: float,
+    *,
+    opener: urllib.request.OpenerDirector | None = None,
+) -> dict[str, object]:
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be positive")
     request = urllib.request.Request(
@@ -83,7 +92,8 @@ def _get_json(url: str, timeout_seconds: float) -> dict[str, object]:
     error_code: str | None = None
     payload: object = None
     try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+        transport = opener.open if opener is not None else urllib.request.urlopen
+        with transport(request, timeout=timeout_seconds) as response:
             if getattr(response, "status", None) != 200:
                 error_code = "account_unavailable"
             else:

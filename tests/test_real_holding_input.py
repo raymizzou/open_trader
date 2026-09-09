@@ -111,6 +111,57 @@ def test_real_input_projects_only_the_market_trend_broker(
     }
 
 
+def test_real_input_freezes_broker_holding_generation(tmp_path: Path) -> None:
+    snapshot = account_snapshot()
+    snapshot["sources"]["account"]["brokers"]["phillips"]["source_kind"] = "manual"  # type: ignore[index]
+    generations = {
+        "phillips": "sha256:" + "c" * 64,
+        "eastmoney": "sha256:" + "d" * 64,
+    }
+    snapshot["accepted_holding_generation"] = dict(generations)
+    original_positions = deepcopy(snapshot["positions"])
+    original_cash = deepcopy(snapshot["cash_balances"])
+
+    loaded = load_real_holding_input(
+        snapshot,
+        "HK",
+        state_path=tmp_path / "real_protection_state.json",
+    )
+    snapshot["accepted_holding_generation"]["phillips"] = "sha256:" + "e" * 64  # type: ignore[index]
+
+    assert loaded.source["holding_generation"] == generations["phillips"]
+    assert snapshot["positions"] == original_positions
+    assert snapshot["cash_balances"] == original_cash
+    assert loaded.positions[0].quantity == 100
+    assert loaded.available_cash == 10
+
+
+def test_real_input_uses_own_generation_and_keeps_legacy_snapshots_available(
+    tmp_path: Path,
+) -> None:
+    snapshot = account_snapshot()
+    snapshot["accepted_holding_generation"] = {
+        "phillips": "sha256:" + "c" * 64,
+        "eastmoney": "sha256:" + "d" * 64,
+    }
+
+    cn = load_real_holding_input(
+        snapshot,
+        "CN",
+        state_path=tmp_path / "cn-real_protection_state.json",
+    )
+    assert cn.source["holding_generation"] == "sha256:" + "d" * 64
+
+    snapshot.pop("accepted_holding_generation")
+    legacy = load_real_holding_input(
+        snapshot,
+        "HK",
+        state_path=tmp_path / "legacy-real_protection_state.json",
+    )
+    assert legacy.status == "available"
+    assert "holding_generation" not in legacy.source
+
+
 @pytest.mark.parametrize(
     ("field", "value", "reason"),
     [

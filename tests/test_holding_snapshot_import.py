@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -65,6 +66,89 @@ def test_stage_confirmed_snapshot_deduplicates_identical_rows_and_is_idempotent(
     assert len(generations) == 1
     assert (latest / "sentinel").read_bytes() == b"latest-before"
     assert report.read_bytes() == b"report-before"
+
+
+def test_stage_snapshot_rejects_future_date_without_artifacts(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    latest = data_dir / "latest"
+    report = tmp_path / "reports" / "2026-09-09.md"
+    latest.mkdir(parents=True)
+    report.parent.mkdir(parents=True)
+    (latest / "sentinel").write_bytes(b"latest-before")
+    report.write_bytes(b"report-before")
+    payload = {
+        "data_as_of": "9999-12-31",
+        "confirmed": True,
+        "complete": True,
+        "positions": [
+            {
+                "symbol": "00700",
+                "name": "腾讯控股",
+                "quantity": "10",
+                "cost_price": "400",
+            }
+        ],
+        "cash": {
+            "policy": "replace",
+            "currency": "HKD",
+            "balance": "1000",
+            "available_balance": "1000",
+        },
+    }
+
+    service = HoldingSnapshotImportService(data_dir=data_dir)
+    with pytest.raises(ValueError, match="future data_as_of"):
+        service.stage_snapshot("phillips", payload)
+
+    generations = data_dir / "account_holdings/generations/phillips"
+    assert not generations.exists() or not list(generations.iterdir())
+    assert (latest / "sentinel").read_bytes() == b"latest-before"
+    assert report.read_bytes() == b"report-before"
+
+
+def test_stage_snapshot_uses_injected_business_date_for_boundaries_and_retry(
+    tmp_path: Path,
+) -> None:
+    for data_as_of in ("2026-09-09", "2026-09-08", "2026-09-10"):
+        data_dir = tmp_path / data_as_of
+        payload = {
+            "data_as_of": data_as_of,
+            "confirmed": True,
+            "complete": True,
+            "positions": [
+                {
+                    "symbol": "00700",
+                    "name": "腾讯控股",
+                    "quantity": "10",
+                    "cost_price": "400",
+                }
+            ],
+            "cash": {
+                "policy": "replace",
+                "currency": "HKD",
+                "balance": "1000",
+                "available_balance": "1000",
+            },
+        }
+        service = HoldingSnapshotImportService(
+            data_dir=data_dir,
+            business_date=lambda: date(2026, 9, 9),
+        )
+
+        if data_as_of == "2026-09-10":
+            with pytest.raises(ValueError, match="future data_as_of: 2026-09-10"):
+                service.stage_snapshot("phillips", payload)
+            generations = data_dir / "account_holdings/generations/phillips"
+            assert not generations.exists() or not list(generations.iterdir())
+            continue
+
+        first = service.stage_snapshot("phillips", payload)
+        retry = HoldingSnapshotImportService(
+            data_dir=data_dir,
+            business_date=lambda: date(2026, 9, 9),
+        )
+        second = retry.stage_snapshot("phillips", payload)
+        assert first["holding_generation"] == second["holding_generation"]
 
 
 def test_stage_snapshot_rejects_conflicting_normalized_duplicate_without_artifacts(

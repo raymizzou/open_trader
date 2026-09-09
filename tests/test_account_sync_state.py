@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -145,6 +146,125 @@ def test_accepted_candidate_round_trips_normalized_detail_rows(tmp_path) -> None
     assert source["summary"] == {"position_count": 1, "cash_count": 1}
     assert "account_id" not in source["positions"][0]
     assert "account_id" not in source["cash"][0]
+
+
+def test_preserve_cash_rejects_without_previously_accepted_cash(tmp_path: Path) -> None:
+    state = load_account_sync_state(tmp_path / "missing.json")
+    before = deepcopy(state)
+    candidate = replace(
+        _projection_candidate(
+            broker="phillips",
+            market=Market.HK,
+            symbol="00700",
+            currency="HKD",
+            quantity="1",
+            market_value="400",
+            cost_value="400",
+        ),
+        cash=(),
+        summary={"position_count": 1, "cash_count": 0},
+    )
+
+    with pytest.raises(ValueError, match="previously accepted cash"):
+        accept_candidate(
+            state,
+            candidate,
+            attempted_at="2026-09-09T08:00:00+08:00",
+            holding_generation="sha256:" + "0" * 64,
+            preserve_cash=True,
+        )
+
+    assert state == before
+    assert state["generation"] == ""
+    assert not state["brokers"]["phillips"]["positions"]
+    assert not state["brokers"]["phillips"]["cash"]
+
+
+def test_preserve_cash_rejects_manual_candidate_without_previously_accepted_cash(
+    tmp_path: Path,
+) -> None:
+    state = load_account_sync_state(tmp_path / "missing.json")
+    before = deepcopy(state)
+    candidate = replace(
+        _projection_candidate(
+            broker="phillips",
+            market=Market.HK,
+            symbol="00700",
+            currency="HKD",
+            quantity="1",
+            market_value="400",
+            cost_value="400",
+        ),
+        source_kind="manual",
+        cash=(),
+        summary={"position_count": 1, "cash_count": 0},
+    )
+
+    with pytest.raises(ValueError, match="previously accepted cash"):
+        accept_candidate(
+            state,
+            candidate,
+            attempted_at="2026-09-09T08:00:00+08:00",
+            holding_generation="sha256:" + "0" * 64,
+            preserve_cash=True,
+        )
+
+    assert state == before
+
+
+def test_preserve_cash_keeps_accepted_zero_cash_for_manual_replacement(
+    tmp_path: Path,
+) -> None:
+    base = _projection_candidate(
+        broker="phillips",
+        market=Market.HK,
+        symbol="00700",
+        currency="HKD",
+        quantity="1",
+        market_value="400",
+        cost_value="400",
+    )
+    zero_cash = replace(
+        base.cash[0],
+        cash_balance=Decimal("0"),
+        available_balance=Decimal("0"),
+    )
+    accepted = accept_candidate(
+        load_account_sync_state(tmp_path / "missing.json"),
+        replace(base, cash=(zero_cash,)),
+        attempted_at="2026-09-09T08:00:00+08:00",
+    )
+    generation = "sha256:" + "1" * 64
+    manual = replace(
+        _projection_candidate(
+            broker="phillips",
+            market=Market.HK,
+            symbol="00939",
+            currency="HKD",
+            quantity="2",
+            market_value="800",
+            cost_value="700",
+        ),
+        source_kind="manual",
+        cash=(),
+        summary={"position_count": 1, "cash_count": 0},
+    )
+
+    updated = accept_candidate(
+        accepted,
+        manual,
+        attempted_at="2026-09-09T09:00:00+08:00",
+        holding_generation=generation,
+        preserve_cash=True,
+    )
+
+    source = updated["brokers"]["phillips"]
+    assert source["source_kind"] == "manual"
+    assert source["positions"][0]["symbol"] == "00939"
+    assert len(source["cash"]) == 1
+    assert source["cash"][0]["cash_balance"] == "0"
+    assert source["cash"][0]["available_balance"] == "0"
+    assert updated["accepted_holding_generation"]["phillips"] == generation
 
 
 def test_load_rejects_unknown_versions_and_invalid_broker_payloads(tmp_path) -> None:

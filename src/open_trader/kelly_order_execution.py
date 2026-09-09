@@ -643,17 +643,22 @@ def _can_connect_to_opend(host: str, port: int) -> bool:
 
 def _default_trade_context_factory(*, host: str, port: int, trd_market: str = "HK") -> Any:
     try:
-        from futu import OpenSecTradeContext
+        from .futu_trade_context import (
+            FutuTradeContextError,
+            create_futu_trade_context,
+        )
+        return create_futu_trade_context(
+            host=host,
+            port=port,
+            filter_trdmarket=_futu_trd_market(trd_market),
+        )
     except ImportError as exc:
         raise FutuOrderExecutionError(
             "futu-api is not installed. Install it with: .venv/bin/python -m pip install futu-api",
             error_type="trade_context_failed",
         ) from exc
-    return OpenSecTradeContext(
-        host=host,
-        port=port,
-        filter_trdmarket=_futu_trd_market(trd_market),
-    )
+    except FutuTradeContextError as exc:
+        raise FutuOrderExecutionError(str(exc), error_type="trade_context_failed") from exc
 
 
 def _futu_trade_side(side: str) -> str:
