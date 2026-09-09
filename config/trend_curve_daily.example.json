@@ -1,0 +1,12 @@
+{
+  "description": "Compatibility-only cached mapping scope; edit local paths and the absolute Hermes executable; not full-market and not live-ready.",
+  "coverage": "cached",
+  "database": "data/trend_curve/history.sqlite3",
+  "mappings_root": "data/trend_animals/cache/symbol_mappings",
+  "mmkv_helper": "~/.local/bin/open-trader-mmkv-dump",
+  "request_interval_seconds": 1.0,
+  "request_limit": 100,
+  "max_duration_seconds": 3600.0,
+  "hermes_timeout_seconds": 30.0,
+  "hermes_executable": "/absolute/path/to/hermes"
+}

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from getpass import getpass
+import math
 import os
 import re
 import socket
@@ -151,9 +152,16 @@ from .trend_allocation import (
     run_trend_allocation_controller,
 )
 from .trend_curve_research import (
+    DAILY_HERMES_TIMEOUT_MAX_SECONDS,
+    DAILY_MAX_DURATION_MAX_SECONDS,
+    DAILY_REQUEST_INTERVAL_MAX_SECONDS,
+    DAILY_REQUEST_LIMIT_MAX,
     TrendCurveReconciliationError,
     collect_trend_curves,
+    pause_daily_trend_curve,
     reconcile_trend_curves,
+    resume_daily_trend_curve,
+    run_daily_trend_curve,
 )
 from .trend_curve_backtest import (
     run_trend_curve_backtest,
@@ -176,6 +184,10 @@ def _drawdown_unlock_now(timezone: str) -> datetime:
 
 def _drawdown_preflight_now() -> datetime:
     return datetime.now().astimezone()
+
+
+def _trend_curve_daily_now() -> datetime:
+    return datetime.now(ZoneInfo("Asia/Shanghai"))
 
 
 class _LazyFutuQuote:
@@ -319,6 +331,83 @@ def _load_optional_json(path: Path) -> dict[str, Any] | None:
     with path.open(encoding="utf-8") as handle:
         payload = json.load(handle)
     return payload if isinstance(payload, dict) else None
+
+
+def _load_trend_curve_daily_config(path: Path) -> dict[str, object]:
+    try:
+        payload = json.loads(path.expanduser().read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("trend-curve daily config is unreadable or malformed") from exc
+    if not isinstance(payload, dict) or payload.get("coverage") != "cached":
+        raise ValueError("trend-curve daily config requires coverage=cached")
+
+    def configured_path(name: str, default: Path) -> Path:
+        value = payload.get(name)
+        if value is None:
+            return default
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"trend-curve daily config field {name} is malformed")
+        return Path(value).expanduser()
+
+    def optional_path(name: str) -> Path | None:
+        value = payload.get(name)
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"trend-curve daily config field {name} is malformed")
+        return Path(value).expanduser()
+
+    def positive_finite(name: str, *, maximum: float | None = None) -> float:
+        value = payload.get(name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or value <= 0
+            or (maximum is not None and value > maximum)
+        ):
+            raise ValueError(f"trend-curve daily config field {name} is malformed")
+        return float(value)
+
+    request_limit = payload.get("request_limit")
+    if (
+        isinstance(request_limit, bool)
+        or not isinstance(request_limit, int)
+        or request_limit <= 0
+        or request_limit > DAILY_REQUEST_LIMIT_MAX
+    ):
+        raise ValueError("trend-curve daily config field request_limit is malformed")
+    hermes_executable_value = payload.get("hermes_executable")
+    if not isinstance(hermes_executable_value, str) or not hermes_executable_value.strip():
+        raise ValueError("trend-curve daily config field hermes_executable is malformed")
+    hermes_executable = Path(hermes_executable_value).expanduser()
+    if (
+        not hermes_executable.is_absolute()
+        or not hermes_executable.is_file()
+        or not os.access(hermes_executable, os.X_OK)
+    ):
+        raise ValueError("trend-curve daily config field hermes_executable is malformed")
+
+    return {
+        "database": configured_path(name="database", default=Path("data/trend_curve/history.sqlite3")),
+        "mappings_root": configured_path(
+            name="mappings_root", default=Path("data/trend_animals/cache/symbol_mappings")
+        ),
+        "mmkv_path": optional_path("mmkv_path"),
+        "mmkv_helper": optional_path("mmkv_helper"),
+        "storage_root": optional_path("storage_root"),
+        "request_interval_seconds": positive_finite(
+            "request_interval_seconds", maximum=DAILY_REQUEST_INTERVAL_MAX_SECONDS
+        ),
+        "request_limit": request_limit,
+        "max_duration_seconds": positive_finite(
+            "max_duration_seconds", maximum=DAILY_MAX_DURATION_MAX_SECONDS
+        ),
+        "hermes_timeout_seconds": positive_finite(
+            "hermes_timeout_seconds", maximum=DAILY_HERMES_TIMEOUT_MAX_SECONDS
+        ),
+        "hermes_executable": hermes_executable,
+    }
 
 
 def _parse_key_value_options(values: list[str], *, option_name: str) -> dict[str, str]:
@@ -547,6 +636,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     trend_curve_collect_parser.add_argument("--mmkv-path", type=Path)
     trend_curve_collect_parser.add_argument("--mmkv-helper", type=Path)
+    trend_curve_collect_parser.add_argument("--batch-id")
+    trend_curve_collect_parser.add_argument("--require-snapshot", action="store_true")
+    trend_curve_collect_parser.add_argument(
+        "--expected-date",
+        action="append",
+        default=[],
+        metavar="MARKET[.SYMBOL]=YYYY-MM-DD",
+    )
     trend_curve_collect_parser.add_argument("--notify-failure", action="store_true")
     trend_curve_collect_parser.add_argument(
         "--reconcile-and-notify", action="store_true"
@@ -554,6 +651,21 @@ def build_parser() -> argparse.ArgumentParser:
     trend_curve_collect_parser.add_argument(
         "--config", type=Path, default=Path("config/daily_premarket.env")
     )
+    trend_curve_daily_parser = trend_curve_commands.add_parser(
+        "daily", help="Run one cached-scope daily Trend Animals collection"
+    )
+    trend_curve_daily_parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Run only when the Asia/Shanghai daily schedule is due",
+    )
+    trend_curve_daily_parser.add_argument("--daily-config", type=Path, required=True)
+    for control_command in ("pause", "resume"):
+        control_parser = trend_curve_commands.add_parser(
+            control_command,
+            help=f"{control_command.capitalize()} cached-scope daily Trend Animals collection",
+        )
+        control_parser.add_argument("--daily-config", type=Path, required=True)
     trend_curve_backtest_parser = trend_curve_commands.add_parser(
         "backtest", help="Backtest one US Trend Animals temperature curve"
     )
@@ -2328,7 +2440,52 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "trend-curve":
+        if args.trend_curve_command in {"pause", "resume"}:
+            try:
+                daily_config = _load_trend_curve_daily_config(args.daily_config)
+                control = (
+                    pause_daily_trend_curve
+                    if args.trend_curve_command == "pause"
+                    else resume_daily_trend_curve
+                )
+                result = control(daily_config["database"])
+            except (FileNotFoundError, OSError, ValueError, RuntimeError) as exc:
+                parser.error(str(exc))
+            print(json.dumps(result, ensure_ascii=False))
+            return 0
+        if args.trend_curve_command == "daily":
+            try:
+                daily_config = _load_trend_curve_daily_config(args.daily_config)
+                result = run_daily_trend_curve(
+                    mappings_root=daily_config["mappings_root"],
+                    database=daily_config["database"],
+                    mmkv_path=daily_config["mmkv_path"],
+                    mmkv_helper=daily_config["mmkv_helper"],
+                    storage_root=daily_config["storage_root"],
+                    request_interval_seconds=daily_config["request_interval_seconds"],
+                    request_limit=daily_config["request_limit"],
+                    max_duration_seconds=daily_config["max_duration_seconds"],
+                    hermes_timeout_seconds=daily_config["hermes_timeout_seconds"],
+                    hermes_executable=daily_config["hermes_executable"],
+                    check=args.check,
+                    now=_trend_curve_daily_now(),
+                )
+            except (FileNotFoundError, OSError, ValueError, RuntimeError) as exc:
+                parser.error(str(exc))
+            print(json.dumps(result, ensure_ascii=False))
+            if args.check and result["status"] in {"not_due", "paused"}:
+                return 0
+            return 0 if (
+                result["status"] == "complete"
+                and result.get("delivery_status") in {"accepted", "not_run"}
+            ) else 1
         if args.trend_curve_command == "collect":
+            try:
+                expected_dates = _parse_key_value_options(
+                    args.expected_date, option_name="--expected-date"
+                )
+            except ValueError as exc:
+                parser.error(str(exc))
             reconcile_config = None
             reconcile_notifier = None
             if args.reconcile_and_notify:
@@ -2362,6 +2519,9 @@ def main(argv: list[str] | None = None) -> int:
                     database=args.database,
                     mmkv_path=args.mmkv_path,
                     mmkv_helper=args.mmkv_helper,
+                    batch_id=args.batch_id,
+                    require_snapshot=args.require_snapshot,
+                    expected_dates=expected_dates or None,
                 )
                 if args.reconcile_and_notify:
                     assert reconcile_config is not None
@@ -2433,7 +2593,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"database: {result.database_path}")
             print(f"targets: {result.target_count}")
             print(f"points: {result.point_count}")
-            return 0
+            if result.batch_id is None:
+                return 0
+            print(f"batch_id: {result.batch_id}")
+            print(f"status: {result.status}")
+            print(f"completed: {result.completed_count}")
+            print(f"pending: {result.pending_count}")
+            print(f"stop_reason: {result.stop_reason or ''}")
+            print(json.dumps({"issues": list(result.issues)}, ensure_ascii=False))
+            return 0 if result.status == "complete" and result.pending_count == 0 else 1
         if args.trend_curve_command == "backtest":
             try:
                 result = run_trend_curve_backtest(

@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
+from queue import Empty
+import subprocess
 import sqlite3
+from datetime import datetime, timezone
+from base64 import b64encode
 from pathlib import Path
 
 import pytest
@@ -20,6 +25,1534 @@ FOUR_SECTION_ENCRYPTED = (
 THREE_SECTION_ENCRYPTED = (
     "ehtRChN4vTYXmnU0XeI1jROyn46BO1bnfGp5zD3cGvgQuIY7Z/UlaEGb/heZWgb2OTBwAywGoxu/W9hc3m6wlEqU08aJongByGXl1KgrWW269RssHjerZRumWavSRvAV9Iz+b7bj5CCzRqIuXlT8og=="
 )
+
+
+def _encrypted_curve_payload(payload: dict[str, object]) -> str:
+    completed = subprocess.run(
+        [
+            "openssl",
+            "enc",
+            "-aes-128-ecb",
+            "-K",
+            "41464433303434323736393838413830",
+            "-nosalt",
+        ],
+        input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        capture_output=True,
+        check=True,
+    )
+    return b64encode(completed.stdout).decode("ascii")
+
+
+def _supplier_timestamp(value: str) -> int:
+    return int(
+        datetime.fromisoformat(f"{value}T00:00:00+08:00")
+        .astimezone(timezone.utc)
+        .timestamp()
+        * 1000
+    )
+
+
+def _supplier_payload(
+    *,
+    labels: list[str] | None = None,
+    snapshot_date: str = "2026-09-02",
+    trend: str = "立秋\n右侧第7天",
+    include_snapshot: bool = True,
+    history: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    points = history or [
+        {
+            "rq": _supplier_timestamp("2026-09-01"),
+            "px": "1.11",
+            "rps": "11.1",
+            "temperature": "温",
+            "mom": "1",
+            "yoy": "2",
+            "bar": "3",
+            "momDelta": "u",
+            "yoyDelta": "d",
+            "yield": "0.031",
+        },
+        {
+            "rq": _supplier_timestamp("2026-09-02"),
+            "px": "1.22",
+            "rps": "12.2",
+            "temperature": "热",
+            "mom": "4",
+            "yoy": "5",
+            "bar": "6",
+            "momDelta": "u",
+            "yoyDelta": "d",
+            "yield": "0.031",
+        },
+    ]
+    if not include_snapshot:
+        return {"code": "00000", "data": [{}, {}, points, {}]}
+    return {
+        "code": "00000",
+        "data": [
+            [
+                {"labelName": value}
+                for value in (
+                    ["开香槟", "危险信号", "右侧启动", "温转热"]
+                    if labels is None
+                    else labels
+                )
+            ],
+            [{"rq": _supplier_timestamp(snapshot_date), "下行趋势": trend}],
+            points,
+            {},
+        ],
+    }
+
+
+def _run_blocking_collection(
+    watchlist: str,
+    database: str,
+    batch_id: str,
+    release_connection: object,
+    events: object,
+    response: str,
+) -> None:
+    def transport(
+        _url: str, body: bytes, _headers: dict[str, str]
+    ) -> dict[str, object]:
+        target_id = json.loads(body)["id"]
+        events.put(("request", target_id))
+        if target_id == 102:
+            events.put(("blocked", target_id))
+            release_connection.recv()  # type: ignore[attr-defined]
+        return {
+            "success": True,
+            "code": "00000",
+            "data": {"encryptedData": response},
+        }
+
+    result = collect_trend_curves(
+        watchlist,
+        database=database,
+        credentials=("fake-token", 123456789),
+        transport=transport,
+        batch_id=batch_id,
+        require_snapshot=True,
+        expected_dates={"US": "2026-09-02"},
+    )
+    events.put(("result", result.status, result.completed_count, result.pending_count))
+
+
+def test_collect_migrates_and_preserves_supplier_fields(tmp_path: Path) -> None:
+    watchlist = tmp_path / "watchlist.json"
+    watchlist.write_text(
+        json.dumps(
+            [
+                {
+                    "market": "US",
+                    "symbol": "ESTC",
+                    "asset_id": 10002,
+                    "group_id": 332171,
+                    "tm_id": 334101,
+                    "ccy_id": 101,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+    database = tmp_path / "history.sqlite3"
+    old_row = (
+        "US",
+        "ESTC",
+        "2026-08-31",
+        "9.75",
+        "温",
+        "89.1",
+        "1.2",
+        "-0.3",
+        "0.04",
+        10002,
+        332171,
+        334101,
+        101,
+        "keep-me",
+    )
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            CREATE TABLE trend_curve_points (
+                market TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                curve_date TEXT NOT NULL,
+                price TEXT NOT NULL,
+                temperature TEXT NOT NULL,
+                strength TEXT NOT NULL,
+                mom TEXT,
+                yoy TEXT,
+                bar TEXT,
+                asset_id INTEGER NOT NULL,
+                group_id INTEGER NOT NULL,
+                tm_id INTEGER NOT NULL,
+                ccy_id INTEGER NOT NULL,
+                user_extension TEXT,
+                PRIMARY KEY (market, symbol, curve_date)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO trend_curve_points
+            (market, symbol, curve_date, price, temperature, strength, mom, yoy, bar,
+             asset_id, group_id, tm_id, ccy_id, user_extension)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            old_row,
+        )
+
+    response = _encrypted_curve_payload(_supplier_payload())
+
+    result = collect_trend_curves(
+        watchlist,
+        database=database,
+        credentials=("fake-token", 123456789),
+        transport=lambda *_args: {
+            "success": True,
+            "code": "00000",
+            "data": {"encryptedData": response},
+        },
+    )
+
+    with sqlite3.connect(database) as connection:
+        old_row_after = connection.execute(
+            """
+            SELECT market, symbol, curve_date, price, temperature, strength, mom, yoy, bar,
+                   asset_id, group_id, tm_id, ccy_id, user_extension
+            FROM trend_curve_points WHERE curve_date = '2026-08-31'
+            """
+        ).fetchone()
+        new_row = connection.execute(
+            """
+            SELECT curve_date, mom_delta, yoy_delta, yield_value
+            FROM trend_curve_points WHERE curve_date = '2026-09-02'
+            """
+        ).fetchone()
+        snapshot = connection.execute(
+            """
+            SELECT market, symbol, snapshot_date, solar_term, right_side_day,
+                   right_side_state, labels_json
+            FROM trend_curve_daily_snapshots
+            """
+        ).fetchone()
+        table_names = [
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+            )
+        ]
+
+    assert (
+        result.snapshot_count,
+        old_row_after,
+        new_row,
+        snapshot,
+        table_names,
+    ) == (
+        1,
+        old_row,
+        ("2026-09-02", "u", "d", "0.031"),
+        (
+            "US",
+            "ESTC",
+            "2026-09-02",
+            "立秋",
+            7,
+            None,
+            '["开香槟","危险信号","右侧启动"]',
+        ),
+        [
+            "trend_curve_batch_items",
+            "trend_curve_batches",
+            "trend_curve_daily_snapshots",
+            "trend_curve_points",
+        ],
+    )
+
+
+def test_collect_checkpoints_survive_auth_failure(tmp_path: Path) -> None:
+    targets = [
+        {
+            "market": "US",
+            "symbol": symbol,
+            "asset_id": 10002,
+            "group_id": 332171,
+            "tm_id": tm_id,
+            "ccy_id": 101,
+        }
+        for symbol, tm_id in (("A", 101), ("B", 102), ("C", 103))
+    ]
+    watchlist = tmp_path / "watchlist.json"
+    watchlist.write_text(json.dumps(targets), encoding="utf-8")
+    success = _encrypted_curve_payload(_supplier_payload())
+    inner_auth = _encrypted_curve_payload({"code": "A00004"})
+    requests: list[int] = []
+
+    def transport(
+        _url: str, body: bytes, _headers: dict[str, str]
+    ) -> dict[str, object]:
+        target_id = json.loads(body)["id"]
+        requests.append(target_id)
+        encrypted = success if target_id == 101 else inner_auth
+        return {
+            "success": True,
+            "code": "00000",
+            "data": {"encryptedData": encrypted},
+        }
+
+    database = tmp_path / "history.sqlite3"
+    result = collect_trend_curves(
+        watchlist,
+        database=database,
+        credentials=("fake-token", 123456789),
+        transport=transport,
+        batch_id="batch-auth",
+        require_snapshot=True,
+        expected_dates={"US": "2026-09-02"},
+        observed_at=datetime(2026, 9, 2, 8, tzinfo=timezone.utc),
+    )
+
+    with sqlite3.connect(database) as connection:
+        point_count = connection.execute(
+            "SELECT COUNT(*) FROM trend_curve_points"
+        ).fetchone()[0]
+        snapshot_count = connection.execute(
+            "SELECT COUNT(*) FROM trend_curve_daily_snapshots"
+        ).fetchone()[0]
+        completed = connection.execute(
+            "SELECT market, symbol FROM trend_curve_batch_items "
+            "WHERE batch_id = ? AND completed_at IS NOT NULL ORDER BY symbol",
+            ("batch-auth",),
+        ).fetchall()
+        database_bytes = database.read_bytes()
+
+    assert (
+        requests,
+        result.batch_id,
+        result.status,
+        result.point_count,
+        result.snapshot_count,
+        result.completed_count,
+        result.pending_count,
+        [(issue["market"], issue["symbol"], issue["reason"]) for issue in result.issues],
+        point_count,
+        snapshot_count,
+        completed,
+        b"fake-token" in database_bytes,
+        b"123456789" in database_bytes,
+    ) == (
+        [101, 102],
+        "batch-auth",
+        "auth_blocked",
+        2,
+        1,
+        1,
+        2,
+        [("US", "B", "auth_blocked")],
+        2,
+        1,
+        [("US", "A")],
+        False,
+        False,
+    )
+
+    outer_requests: list[int] = []
+
+    def outer_auth_transport(
+        _url: str, body: bytes, _headers: dict[str, str]
+    ) -> dict[str, object]:
+        target_id = json.loads(body)["id"]
+        outer_requests.append(target_id)
+        if target_id == 101:
+            return {
+                "success": True,
+                "code": "00000",
+                "data": {"encryptedData": success},
+            }
+        return {"success": False, "code": "A00004", "data": None}
+
+    outer_database = tmp_path / "outer-auth.sqlite3"
+    outer_result = collect_trend_curves(
+        watchlist,
+        database=outer_database,
+        credentials=("fake-token", 123456789),
+        transport=outer_auth_transport,
+        batch_id="batch-outer-auth",
+        require_snapshot=True,
+        expected_dates={"US": "2026-09-02"},
+    )
+    assert (
+        outer_requests,
+        outer_result.status,
+        outer_result.completed_count,
+        outer_result.pending_count,
+    ) == ([101, 102], "auth_blocked", 1, 2)
+
+
+def test_collect_resumes_only_unfinished_targets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    targets = [
+        {
+            "market": "US",
+            "symbol": symbol,
+            "asset_id": 10002,
+            "group_id": 332171,
+            "tm_id": tm_id,
+            "ccy_id": 101,
+        }
+        for symbol, tm_id in (("A", 101), ("B", 102), ("C", 103))
+    ]
+    watchlist = tmp_path / "watchlist.json"
+    watchlist.write_text(json.dumps(targets), encoding="utf-8")
+    success = _encrypted_curve_payload(_supplier_payload())
+    auth = _encrypted_curve_payload({"code": "A00004"})
+    database = tmp_path / "history.sqlite3"
+    first_requests: list[int] = []
+
+    def first_transport(
+        _url: str, body: bytes, _headers: dict[str, str]
+    ) -> dict[str, object]:
+        target_id = json.loads(body)["id"]
+        first_requests.append(target_id)
+        return {
+            "success": True,
+            "code": "00000",
+            "data": {"encryptedData": success if target_id == 101 else auth},
+        }
+
+    collect_trend_curves(
+        watchlist,
+        database=database,
+        credentials=("fake-token", 123456789),
+        transport=first_transport,
+        batch_id="batch-resume",
+        require_snapshot=True,
+        expected_dates={"US": "2026-09-02"},
+    )
+
+    resumed_requests: list[int] = []
+
+    def healthy_transport(
+        _url: str, body: bytes, _headers: dict[str, str]
+    ) -> dict[str, object]:
+        resumed_requests.append(json.loads(body)["id"])
+        return {
+            "success": True,
+            "code": "00000",
+            "data": {"encryptedData": success},
+        }
+
+    resumed = collect_trend_curves(
+        watchlist,
+        database=database,
+        credentials=("fake-token", 123456789),
+        transport=healthy_transport,
+        batch_id="batch-resume",
+        require_snapshot=True,
+        expected_dates={"US": "2026-09-02"},
+    )
+    assert (first_requests, resumed_requests, resumed.status, resumed.completed_count, resumed.pending_count) == (
+        [101, 102],
+        [102, 103],
+        "complete",
+        3,
+        0,
+    )
+
+    def no_credentials() -> object:
+        raise AssertionError("completed batch must not read credentials")
+
+    monkeypatch.setattr(trend_curve_research, "read_wechat_mini_credentials", no_credentials)
+
+    def no_transport(*_args: object) -> object:
+        raise AssertionError("completed batch must not request HTTP")
+
+    completed = collect_trend_curves(
+        watchlist,
+        database=database,
+        credentials=None,
+        transport=no_transport,
+        batch_id="batch-resume",
+        require_snapshot=True,
+        expected_dates={"US": "2026-09-02"},
+    )
+    assert (completed.status, completed.completed_count, completed.pending_count) == (
+        "complete",
+        3,
+        0,
+    )
+
+    new_batch_requests: list[int] = []
+
+    def new_batch_transport(
+        _url: str, body: bytes, _headers: dict[str, str]
+    ) -> dict[str, object]:
+        new_batch_requests.append(json.loads(body)["id"])
+        return {
+            "success": True,
+            "code": "00000",
+            "data": {"encryptedData": success},
+        }
+
+    new_batch = collect_trend_curves(
+        watchlist,
+        database=database,
+        credentials=("new-token", 123456789),
+        transport=new_batch_transport,
+        batch_id="batch-new",
+        require_snapshot=True,
+        expected_dates={"US": "2026-09-02"},
+    )
+    assert (new_batch_requests, new_batch.status, new_batch.completed_count) == (
+        [101, 102, 103],
+        "complete",
+        3,
+    )
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "DELETE FROM trend_curve_points WHERE market = 'US' AND symbol = 'A'"
+        )
+
+    repaired_requests: list[int] = []
+
+    def repair_transport(
+        _url: str, body: bytes, _headers: dict[str, str]
+    ) -> dict[str, object]:
+        repaired_requests.append(json.loads(body)["id"])
+        return {
+            "success": True,
+            "code": "00000",
+            "data": {"encryptedData": success},
+        }
+
+    repaired = collect_trend_curves(
+        watchlist,
+        database=database,
+        credentials=("fake-token", 123456789),
+        transport=repair_transport,
+        batch_id="batch-resume",
+        require_snapshot=True,
+        expected_dates={"US": "2026-09-02"},
+    )
+    with sqlite3.connect(database) as connection:
+        counts = connection.execute(
+            "SELECT COUNT(*) FROM trend_curve_points"
+        ).fetchone()[0]
+        snapshots = connection.execute(
+            "SELECT COUNT(*) FROM trend_curve_daily_snapshots"
+        ).fetchone()[0]
+    assert (
+        repaired_requests,
+        repaired.status,
+        repaired.completed_count,
+        repaired.pending_count,
+        counts,
+        snapshots,
+    ) == ([101], "complete", 3, 0, 6, 3)
+
+
+def test_collect_write_failure_rolls_back_only_current_target(tmp_path: Path) -> None:
+    targets = [
+        {
+            "market": "US",
+            "symbol": symbol,
+            "asset_id": 10002,
+            "group_id": 332171,
+            "tm_id": tm_id,
+            "ccy_id": 101,
+        }
+        for symbol, tm_id in (("A", 101), ("B", 102), ("C", 103))
+    ]
+    watchlist = tmp_path / "watchlist.json"
+    watchlist.write_text(json.dumps(targets), encoding="utf-8")
+    response = _encrypted_curve_payload(_supplier_payload())
+    requests: list[int] = []
+    database = tmp_path / "history.sqlite3"
+
+    def transport(
+        _url: str, body: bytes, _headers: dict[str, str]
+    ) -> dict[str, object]:
+        target_id = json.loads(body)["id"]
+        requests.append(target_id)
+        if target_id == 102:
+            with sqlite3.connect(database) as trigger_connection:
+                trigger_connection.execute(
+                    """
+                    CREATE TRIGGER reject_b_snapshot
+                    BEFORE INSERT ON trend_curve_daily_snapshots
+                    WHEN NEW.symbol = 'B'
+                    BEGIN
+                        SELECT RAISE(ABORT, 'reject B snapshot');
+                    END
+                    """
+                )
+        return {
+            "success": True,
+            "code": "00000",
+            "data": {"encryptedData": response},
+        }
+
+    result = collect_trend_curves(
+        watchlist,
+        database=database,
+        credentials=("fake-token", 123456789),
+        transport=transport,
+        batch_id="batch-write-failure",
+        require_snapshot=True,
+        expected_dates={"US": "2026-09-02"},
+    )
+
+    with sqlite3.connect(database) as connection:
+        rows = connection.execute(
+            "SELECT market, symbol, curve_date FROM trend_curve_points "
+            "ORDER BY symbol, curve_date"
+        ).fetchall()
+        snapshots = connection.execute(
+            "SELECT market, symbol, snapshot_date FROM trend_curve_daily_snapshots"
+        ).fetchall()
+        items = connection.execute(
+            "SELECT symbol, completed_at, issue_reason FROM trend_curve_batch_items "
+            "WHERE batch_id = ? ORDER BY symbol",
+            ("batch-write-failure",),
+        ).fetchall()
+        database_bytes = database.read_bytes()
+
+    assert (
+        requests,
+        result.status,
+        result.point_count,
+        result.snapshot_count,
+        result.completed_count,
+        result.pending_count,
+        [(issue["symbol"], issue["reason"]) for issue in result.issues],
+        rows,
+        snapshots,
+        [(symbol, completed_at is not None, issue_reason) for symbol, completed_at, issue_reason in items],
+        b"fake-token" in database_bytes,
+        b"123456789" in database_bytes,
+    ) == (
+        [101, 102],
+        "partial",
+        2,
+        1,
+        1,
+        2,
+        [("B", "persistence_failed")],
+        [
+            ("US", "A", "2026-09-01"),
+            ("US", "A", "2026-09-02"),
+        ],
+        [("US", "A", "2026-09-02")],
+        [("A", True, None), ("B", False, None), ("C", False, None)],
+        False,
+        False,
+    )
+
+
+def test_collect_resume_rejects_changed_frozen_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    targets = [
+        {
+            "market": "US",
+            "symbol": symbol,
+            "asset_id": 10002,
+            "group_id": 332171,
+            "tm_id": tm_id,
+            "ccy_id": 101,
+        }
+        for symbol, tm_id in (("A", 101), ("B", 102))
+    ]
+    watchlist = tmp_path / "watchlist.json"
+    watchlist.write_text(json.dumps(targets), encoding="utf-8")
+    response = _encrypted_curve_payload(_supplier_payload())
+    database = tmp_path / "history.sqlite3"
+
+    def transport(
+        _url: str, _body: bytes, _headers: dict[str, str]
+    ) -> dict[str, object]:
+        return {
+            "success": True,
+            "code": "00000",
+            "data": {"encryptedData": response},
+        }
+
+    collect_trend_curves(
+        watchlist,
+        database=database,
+        credentials=("fake-token", 123456789),
+        transport=transport,
+        batch_id="frozen-batch",
+        require_snapshot=True,
+        expected_dates={"US": "2026-09-02"},
+    )
+    baseline = database.read_bytes()
+
+    def no_credentials() -> object:
+        raise AssertionError("frozen request mismatch must precede credentials")
+
+    monkeypatch.setattr(trend_curve_research, "read_wechat_mini_credentials", no_credentials)
+
+    def no_transport(*_args: object) -> object:
+        raise AssertionError("frozen request mismatch must precede HTTP")
+
+    variants = [
+        (
+            "target-set",
+            [targets[0]],
+            True,
+            {"US": "2026-09-02"},
+        ),
+        (
+            "provider-id",
+            [{**target, "tm_id": target["tm_id"] + 1000} for target in targets],
+            True,
+            {"US": "2026-09-02"},
+        ),
+        (
+            "currency",
+            [{**target, "ccy_id": 104} for target in targets],
+            True,
+            {"US": "2026-09-02"},
+        ),
+        (
+            "snapshot-mode",
+            targets,
+            False,
+            {"US": "2026-09-02"},
+        ),
+        (
+            "expected-date",
+            targets,
+            True,
+            {"US": "2026-09-03"},
+        ),
+    ]
+    for name, changed_targets, mode, dates in variants:
+        changed = tmp_path / f"{name}.json"
+        changed.write_text(json.dumps(changed_targets), encoding="utf-8")
+        with pytest.raises(ValueError):
+            collect_trend_curves(
+                changed,
+                database=database,
+                credentials=None,
+                transport=no_transport,
+                batch_id="frozen-batch",
+                require_snapshot=mode,
+                expected_dates=dates,
+            )
+        assert database.read_bytes() == baseline
+
+    reordered = tmp_path / "reordered.json"
+    reordered.write_text(json.dumps(list(reversed(targets))), encoding="utf-8")
+    allowed = collect_trend_curves(
+        reordered,
+        database=database,
+        credentials=None,
+        transport=no_transport,
+        batch_id="frozen-batch",
+        require_snapshot=True,
+        expected_dates={"US": "2026-09-02"},
+    )
+    assert (allowed.status, allowed.completed_count, allowed.pending_count) == (
+        "complete",
+        2,
+        0,
+    )
+
+    duplicate = tmp_path / "duplicate.json"
+    duplicate.write_text(json.dumps([targets[0], targets[0]]), encoding="utf-8")
+    with pytest.raises(ValueError):
+        collect_trend_curves(
+            duplicate,
+            database=database,
+            credentials=None,
+            transport=no_transport,
+            batch_id="duplicate-batch",
+            expected_dates={"US": "2026-09-02"},
+        )
+    assert database.read_bytes() == baseline
+
+    for suffix, supplied_dates in (
+        ("missing-date", {"CN": "2026-09-02"}),
+        ("invalid-date", {"US": "2026-9-2"}),
+    ):
+        invalid = tmp_path / f"{suffix}.json"
+        invalid.write_text(json.dumps(targets), encoding="utf-8")
+        with pytest.raises(ValueError):
+            collect_trend_curves(
+                invalid,
+                database=database,
+                credentials=None,
+                transport=no_transport,
+                batch_id=f"{suffix}-batch",
+                expected_dates=supplied_dates,
+            )
+        assert database.read_bytes() == baseline
+
+
+def test_daily_collection_keeps_successes_and_reports_signal_gaps(tmp_path: Path) -> None:
+    targets = [
+        {
+            "market": market,
+            "symbol": symbol,
+            "asset_id": 10002,
+            "group_id": group_id,
+            "tm_id": tm_id,
+            "ccy_id": ccy_id,
+        }
+        for market, symbol, group_id, tm_id, ccy_id in (
+            ("CN", "A", 303121, 101, 100),
+            ("HK", "B", 329480, 102, 104),
+            ("US", "C", 332171, 103, 101),
+        )
+    ]
+    watchlist = tmp_path / "watchlist.json"
+    watchlist.write_text(json.dumps(targets), encoding="utf-8")
+    expected_dates = {
+        "CN": "2026-09-02",
+        "HK": "2026-09-02",
+        "US": "2026-09-03",
+    }
+    observed_at = datetime(2026, 9, 3, 8, 30, tzinfo=timezone.utc)
+
+    scenarios = (
+        ("missing", None, "snapshot_missing"),
+        (
+            "wrong-day",
+            _supplier_payload(
+                snapshot_date="2026-09-03",
+                history=[
+                    {
+                        "rq": _supplier_timestamp("2026-09-02"),
+                        "px": "1.11",
+                        "rps": "11.1",
+                        "temperature": "温",
+                    },
+                    {
+                        "rq": _supplier_timestamp("2026-09-03"),
+                        "px": "1.22",
+                        "rps": "12.2",
+                        "temperature": "热",
+                    }
+                ],
+            ),
+            "snapshot_date_mismatch",
+        ),
+        ("malformed", {"code": "00000", "data": [{}, {}, [], {}]}, "data_gap"),
+    )
+
+    for scenario, b_payload, expected_reason in scenarios:
+        database = tmp_path / f"{scenario}.sqlite3"
+        a_response = _encrypted_curve_payload(
+            _supplier_payload(labels=[])
+        )
+        c_response = _encrypted_curve_payload(
+            _supplier_payload(
+                snapshot_date="2026-09-03",
+                history=[
+                    {
+                        "rq": _supplier_timestamp("2026-09-02"),
+                        "px": "1.11",
+                        "rps": "11.1",
+                        "temperature": "温",
+                    },
+                    {
+                        "rq": _supplier_timestamp("2026-09-03"),
+                        "px": "1.22",
+                        "rps": "12.2",
+                        "temperature": "热",
+                    },
+                ],
+            )
+        )
+        b_response = (
+            _encrypted_curve_payload({"code": "00000", "data": [{}, {}, [], {}]})
+            if scenario == "malformed"
+            else (
+                _encrypted_curve_payload(_supplier_payload(include_snapshot=False))
+                if b_payload is None
+                else _encrypted_curve_payload(b_payload)
+            )
+        )
+        requests: list[int] = []
+
+        def transport(
+            _url: str, body: bytes, _headers: dict[str, str]
+        ) -> dict[str, object]:
+            target_id = json.loads(body)["id"]
+            requests.append(target_id)
+            response_by_id = {101: a_response, 102: b_response, 103: c_response}
+            return {
+                "success": True,
+                "code": "00000",
+                "data": {"encryptedData": response_by_id[target_id]},
+            }
+
+        result = collect_trend_curves(
+            watchlist,
+            database=database,
+            credentials=("fake-token", 123456789),
+            transport=transport,
+            batch_id=f"daily-{scenario}",
+            require_snapshot=True,
+            expected_dates=expected_dates,
+            observed_at=observed_at,
+        )
+
+        with sqlite3.connect(database) as connection:
+            point_counts = connection.execute(
+                "SELECT market, symbol, COUNT(*) FROM trend_curve_points "
+                "GROUP BY market, symbol ORDER BY market"
+            ).fetchall()
+            snapshots = connection.execute(
+                "SELECT market, symbol, snapshot_date, labels_json, observed_at "
+                "FROM trend_curve_daily_snapshots ORDER BY market"
+            ).fetchall()
+            items = connection.execute(
+                "SELECT market, symbol, expected_date, completed_at, observed_at "
+                "FROM trend_curve_batch_items WHERE batch_id = ? ORDER BY market",
+                (f"daily-{scenario}",),
+            ).fetchall()
+
+        assert requests == [101, 102, 103]
+        assert (
+            result.status,
+            result.completed_count,
+            result.pending_count,
+            [(issue["symbol"], issue["reason"]) for issue in result.issues],
+            point_counts,
+        ) == (
+            "partial",
+            2,
+            1,
+            [("B", expected_reason)],
+            [
+                ("CN", "A", 2),
+                ("US", "C", 2),
+            ]
+            if scenario == "malformed"
+            else [
+                ("CN", "A", 2),
+                ("HK", "B", 2),
+                ("US", "C", 2),
+            ],
+        )
+        assert [(market, symbol, expected_date) for market, symbol, expected_date, *_ in items] == [
+            ("CN", "A", "2026-09-02"),
+            ("HK", "B", "2026-09-02"),
+            ("US", "C", "2026-09-03"),
+        ]
+        assert all(
+            observed == observed_at.isoformat()
+            for _, _, _, completed, observed in items
+            if completed is not None
+        )
+        assert snapshots[0][3] == "[]"
+        assert all(snapshot[4] == observed_at.isoformat() for snapshot in snapshots)
+        if scenario == "missing":
+            assert [(row[0], row[1], row[2]) for row in snapshots] == [
+                ("CN", "A", "2026-09-02"),
+                ("US", "C", "2026-09-03"),
+            ]
+        elif scenario == "wrong-day":
+            assert ("HK", "B", "2026-09-02") not in [
+                (row[0], row[1], row[2]) for row in snapshots
+            ]
+            assert ("HK", "B", "2026-09-03") in [
+                (row[0], row[1], row[2]) for row in snapshots
+            ]
+
+
+def test_collect_process_restart_releases_lock_and_resumes(tmp_path: Path) -> None:
+    targets = [
+        {
+            "market": "US",
+            "symbol": symbol,
+            "asset_id": 10002,
+            "group_id": 332171,
+            "tm_id": tm_id,
+            "ccy_id": 101,
+        }
+        for symbol, tm_id in (("A", 101), ("B", 102))
+    ]
+    watchlist = tmp_path / "watchlist.json"
+    watchlist.write_text(json.dumps(targets), encoding="utf-8")
+    database = tmp_path / "history.sqlite3"
+    response = _encrypted_curve_payload(_supplier_payload())
+    release_parent, release_child = multiprocessing.Pipe()
+    events = multiprocessing.Queue()
+    child = multiprocessing.get_context("fork").Process(
+        target=_run_blocking_collection,
+        args=(
+            str(watchlist),
+            str(database),
+            "restart-batch",
+            release_child,
+            events,
+            response,
+        ),
+    )
+    child.start()
+    try:
+        assert events.get(timeout=5) == ("request", 101)
+        assert events.get(timeout=5) == ("request", 102)
+        assert events.get(timeout=5) == ("blocked", 102)
+
+        with sqlite3.connect(database) as connection:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM trend_curve_points WHERE symbol = 'A'"
+            ).fetchone()[0] == 2
+
+        second_requests: list[int] = []
+
+        def concurrent_transport(
+            _url: str, body: bytes, _headers: dict[str, str]
+        ) -> dict[str, object]:
+            second_requests.append(json.loads(body)["id"])
+            raise AssertionError("concurrent collector must fail before HTTP")
+
+        with pytest.raises(ValueError, match="already running"):
+            collect_trend_curves(
+                watchlist,
+                database=database,
+                credentials=("fake-token", 123456789),
+                transport=concurrent_transport,
+                batch_id="restart-batch",
+                require_snapshot=True,
+                expected_dates={"US": "2026-09-02"},
+            )
+        assert second_requests == []
+    finally:
+        child.terminate()
+        child.join(timeout=5)
+        release_parent.close()
+        release_child.close()
+        events.close()
+        events.join_thread()
+
+    assert not child.is_alive()
+    resumed_requests: list[int] = []
+
+    def resumed_transport(
+        _url: str, body: bytes, _headers: dict[str, str]
+    ) -> dict[str, object]:
+        resumed_requests.append(json.loads(body)["id"])
+        return {
+            "success": True,
+            "code": "00000",
+            "data": {"encryptedData": response},
+        }
+
+    result = collect_trend_curves(
+        watchlist,
+        database=database,
+        credentials=("fake-token", 123456789),
+        transport=resumed_transport,
+        batch_id="restart-batch",
+        require_snapshot=True,
+        expected_dates={"US": "2026-09-02"},
+    )
+    with sqlite3.connect(database) as connection:
+        counts = connection.execute(
+            "SELECT symbol, COUNT(*) FROM trend_curve_points GROUP BY symbol ORDER BY symbol"
+        ).fetchall()
+        snapshots = connection.execute(
+            "SELECT symbol, COUNT(*) FROM trend_curve_daily_snapshots GROUP BY symbol ORDER BY symbol"
+        ).fetchall()
+    assert (
+        resumed_requests,
+        result.status,
+        result.completed_count,
+        result.pending_count,
+        counts,
+        snapshots,
+    ) == ([102], "complete", 2, 0, [("A", 2), ("B", 2)], [("A", 1), ("B", 1)])
+
+
+def test_collect_damaged_completion_stays_pending_after_failed_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    targets = [
+        {
+            "market": "US",
+            "symbol": symbol,
+            "asset_id": 10002,
+            "group_id": 332171,
+            "tm_id": tm_id,
+            "ccy_id": 101,
+        }
+        for symbol, tm_id in (("A", 101), ("B", 102), ("C", 103))
+    ]
+    watchlist = tmp_path / "watchlist.json"
+    watchlist.write_text(json.dumps(targets), encoding="utf-8")
+    response = _encrypted_curve_payload(_supplier_payload())
+    auth_response = _encrypted_curve_payload({"code": "A00004"})
+
+    def successful_transport(
+        _url: str, _body: bytes, _headers: dict[str, str]
+    ) -> dict[str, object]:
+        return {
+            "success": True,
+            "code": "00000",
+            "data": {"encryptedData": response},
+        }
+
+    def no_credentials(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("verified batch must not read credentials")
+
+    monkeypatch.setattr(
+        trend_curve_research, "read_wechat_mini_credentials", no_credentials
+    )
+
+    for variant in ("corrupt-point", "missing-item"):
+        database = tmp_path / f"{variant}.sqlite3"
+        batch_id = f"damaged-{variant}"
+        collect_trend_curves(
+            watchlist,
+            database=database,
+            credentials=("fake-token", 123456789),
+            transport=successful_transport,
+            batch_id=batch_id,
+            require_snapshot=True,
+            expected_dates={"US": "2026-09-02"},
+        )
+        with sqlite3.connect(database) as connection:
+            bc_rows_before = connection.execute(
+                "SELECT market, symbol, curve_date, price, temperature, strength "
+                "FROM trend_curve_points WHERE symbol IN ('B', 'C') "
+                "ORDER BY symbol, curve_date"
+            ).fetchall()
+            if variant == "corrupt-point":
+                connection.execute(
+                    "UPDATE trend_curve_points SET price = 'corrupted' "
+                    "WHERE market = 'US' AND symbol = 'A' AND curve_date = '2026-09-01'"
+                )
+            else:
+                connection.execute(
+                    "DELETE FROM trend_curve_batch_items "
+                    "WHERE batch_id = ? AND market = 'US' AND symbol = 'A'",
+                    (batch_id,),
+                )
+
+        auth_requests: list[int] = []
+
+        def auth_transport(
+            _url: str, body: bytes, _headers: dict[str, str]
+        ) -> dict[str, object]:
+            target_id = json.loads(body)["id"]
+            auth_requests.append(target_id)
+            return {
+                "success": True,
+                "code": "00000",
+                "data": {"encryptedData": auth_response},
+            }
+
+        blocked = collect_trend_curves(
+            watchlist,
+            database=database,
+            credentials=("fake-token", 123456789),
+            transport=auth_transport,
+            batch_id=batch_id,
+            require_snapshot=True,
+            expected_dates={"US": "2026-09-02"},
+        )
+        with sqlite3.connect(database) as connection:
+            bc_rows_after_block = connection.execute(
+                "SELECT market, symbol, curve_date, price, temperature, strength "
+                "FROM trend_curve_points WHERE symbol IN ('B', 'C') "
+                "ORDER BY symbol, curve_date"
+            ).fetchall()
+        assert (
+            auth_requests,
+            blocked.status,
+            blocked.target_count,
+            blocked.completed_count,
+            blocked.pending_count,
+            [(issue["symbol"], issue["reason"]) for issue in blocked.issues],
+            bc_rows_after_block,
+        ) == (
+            [101],
+            "auth_blocked",
+            3,
+            2,
+            1,
+            [("A", "auth_blocked")],
+            bc_rows_before,
+        )
+
+        repaired_requests: list[int] = []
+
+        def repair_transport(
+            _url: str, body: bytes, _headers: dict[str, str]
+        ) -> dict[str, object]:
+            repaired_requests.append(json.loads(body)["id"])
+            return {
+                "success": True,
+                "code": "00000",
+                "data": {"encryptedData": response},
+            }
+
+        repaired = collect_trend_curves(
+            watchlist,
+            database=database,
+            credentials=("fake-token", 123456789),
+            transport=repair_transport,
+            batch_id=batch_id,
+            require_snapshot=True,
+            expected_dates={"US": "2026-09-02"},
+        )
+        with sqlite3.connect(database) as connection:
+            item_count = connection.execute(
+                "SELECT COUNT(*) FROM trend_curve_batch_items WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()[0]
+            repaired_a = connection.execute(
+                "SELECT price FROM trend_curve_points "
+                "WHERE market = 'US' AND symbol = 'A' AND curve_date = '2026-09-01'"
+            ).fetchone()[0]
+            bc_rows_after_repair = connection.execute(
+                "SELECT market, symbol, curve_date, price, temperature, strength "
+                "FROM trend_curve_points WHERE symbol IN ('B', 'C') "
+                "ORDER BY symbol, curve_date"
+            ).fetchall()
+        assert (
+            repaired_requests,
+            repaired.status,
+            repaired.completed_count,
+            repaired.pending_count,
+            item_count,
+            repaired_a,
+            bc_rows_after_repair,
+        ) == ([101], "complete", 3, 0, 3, "1.11", bc_rows_before)
+
+        def no_transport(*_args: object) -> object:
+            raise AssertionError("verified batch must not request HTTP")
+
+        completed = collect_trend_curves(
+            watchlist,
+            database=database,
+            credentials=None,
+            transport=no_transport,
+            batch_id=batch_id,
+            require_snapshot=True,
+            expected_dates={"US": "2026-09-02"},
+        )
+        assert (completed.status, completed.completed_count, completed.pending_count) == (
+            "complete",
+            3,
+            0,
+        )
+        database_bytes = database.read_bytes()
+        captured = capsys.readouterr()
+        assert not any(
+            secret in database_bytes
+            for secret in (b"fake-token", b"123456789", b"A00004")
+        )
+        assert all(
+            secret not in captured.out
+            for secret in ("fake-token", "123456789", "A00004")
+        )
+
+
+def test_collect_old_batch_ignores_later_unrelated_curve_dates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = {
+        "market": "US",
+        "symbol": "A",
+        "asset_id": 10002,
+        "group_id": 332171,
+        "tm_id": 101,
+        "ccy_id": 101,
+    }
+    watchlist = tmp_path / "watchlist.json"
+    watchlist.write_text(json.dumps([target]), encoding="utf-8")
+    old_history = [
+        {
+            "rq": _supplier_timestamp("2026-09-01"),
+            "px": "1.11",
+            "rps": "11.1",
+            "temperature": "温",
+            "mom": "1",
+            "yoy": "2",
+            "bar": "3",
+            "momDelta": "u",
+            "yoyDelta": "d",
+            "yield": "0.031",
+        },
+        {
+            "rq": _supplier_timestamp("2026-09-02"),
+            "px": "1.22",
+            "rps": "12.2",
+            "temperature": "热",
+            "mom": "4",
+            "yoy": "5",
+            "bar": "6",
+            "momDelta": "u",
+            "yoyDelta": "d",
+            "yield": "0.031",
+        },
+    ]
+    later_history = [
+        dict(old_history[1]),
+        {
+            "rq": _supplier_timestamp("2026-09-03"),
+            "px": "1.33",
+            "rps": "13.3",
+            "temperature": "平",
+            "mom": "7",
+            "yoy": "8",
+            "bar": "9",
+            "momDelta": "d",
+            "yoyDelta": "u",
+            "yield": "0.032",
+        },
+    ]
+    old_response = _encrypted_curve_payload(
+        _supplier_payload(history=old_history, snapshot_date="2026-09-02")
+    )
+    later_response = _encrypted_curve_payload(
+        _supplier_payload(history=later_history, snapshot_date="2026-09-03")
+    )
+    database = tmp_path / "history.sqlite3"
+
+    def collect_response(response: str):
+        def transport(
+            _url: str, _body: bytes, _headers: dict[str, str]
+        ) -> dict[str, object]:
+            return {
+                "success": True,
+                "code": "00000",
+                "data": {"encryptedData": response},
+            }
+
+        return transport
+
+    collect_trend_curves(
+        watchlist,
+        database=database,
+        credentials=("old-token", 123456789),
+        transport=collect_response(old_response),
+        batch_id="old-batch",
+        require_snapshot=True,
+        expected_dates={"US": "2026-09-02"},
+    )
+    collect_trend_curves(
+        watchlist,
+        database=database,
+        credentials=("later-token", 123456789),
+        transport=collect_response(later_response),
+        batch_id="later-batch",
+        require_snapshot=True,
+        expected_dates={"US": "2026-09-03"},
+    )
+    before_replay = database.read_bytes()
+
+    def no_credentials(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("intact old batch must not read credentials")
+
+    monkeypatch.setattr(
+        trend_curve_research, "read_wechat_mini_credentials", no_credentials
+    )
+
+    def no_transport(*_args: object) -> object:
+        raise AssertionError("intact old batch must not request HTTP")
+
+    replayed = collect_trend_curves(
+        watchlist,
+        database=database,
+        credentials=None,
+        transport=no_transport,
+        batch_id="old-batch",
+        require_snapshot=True,
+        expected_dates={"US": "2026-09-02"},
+    )
+    with sqlite3.connect(database) as connection:
+        point_dates = connection.execute(
+            "SELECT curve_date FROM trend_curve_points "
+            "WHERE market = 'US' AND symbol = 'A' ORDER BY curve_date"
+        ).fetchall()
+        snapshot_dates = connection.execute(
+            "SELECT snapshot_date FROM trend_curve_daily_snapshots "
+            "WHERE market = 'US' AND symbol = 'A' ORDER BY snapshot_date"
+        ).fetchall()
+    assert (
+        replayed.status,
+        replayed.completed_count,
+        replayed.pending_count,
+        point_dates,
+        snapshot_dates,
+        database.read_bytes() == before_replay,
+    ) == (
+        "complete",
+        1,
+        0,
+        [("2026-09-01",), ("2026-09-02",), ("2026-09-03",)],
+        [("2026-09-02",), ("2026-09-03",)],
+        True,
+    )
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE trend_curve_points SET price = 'corrupted' "
+            "WHERE market = 'US' AND symbol = 'A' AND curve_date = '2026-09-01'"
+        )
+    repair_requests: list[int] = []
+
+    def repair_transport(
+        _url: str, body: bytes, _headers: dict[str, str]
+    ) -> dict[str, object]:
+        repair_requests.append(json.loads(body)["id"])
+        return {
+            "success": True,
+            "code": "00000",
+            "data": {"encryptedData": old_response},
+        }
+
+    repaired = collect_trend_curves(
+        watchlist,
+        database=database,
+        credentials=("old-token", 123456789),
+        transport=repair_transport,
+        batch_id="old-batch",
+        require_snapshot=True,
+        expected_dates={"US": "2026-09-02"},
+    )
+    with sqlite3.connect(database) as connection:
+        rows = connection.execute(
+            "SELECT curve_date, price FROM trend_curve_points "
+            "WHERE market = 'US' AND symbol = 'A' ORDER BY curve_date"
+        ).fetchall()
+        snapshot_dates_after_repair = connection.execute(
+            "SELECT snapshot_date FROM trend_curve_daily_snapshots "
+            "WHERE market = 'US' AND symbol = 'A' ORDER BY snapshot_date"
+        ).fetchall()
+    assert (
+        repair_requests,
+        repaired.status,
+        repaired.completed_count,
+        repaired.pending_count,
+        rows,
+        snapshot_dates_after_repair,
+    ) == (
+        [101],
+        "complete",
+        1,
+        0,
+        [("2026-09-01", "1.11"), ("2026-09-02", "1.22"), ("2026-09-03", "1.33")],
+        [("2026-09-02",), ("2026-09-03",)],
+    )
+
+
+def test_collect_requires_snapshot_without_batch(tmp_path: Path) -> None:
+    targets = [
+        {
+            "market": "US",
+            "symbol": symbol,
+            "asset_id": 10002,
+            "group_id": 332171,
+            "tm_id": tm_id,
+            "ccy_id": 101,
+        }
+        for symbol, tm_id in (("A", 101), ("B", 102))
+    ]
+    watchlist = tmp_path / "watchlist.json"
+    watchlist.write_text(json.dumps(targets), encoding="utf-8")
+    response_a = _encrypted_curve_payload(_supplier_payload())
+    response_missing = _encrypted_curve_payload(
+        _supplier_payload(include_snapshot=False)
+    )
+    response_wrong_day = _encrypted_curve_payload(
+        _supplier_payload(
+            history=[
+                {
+                    "rq": _supplier_timestamp("2026-09-02"),
+                    "px": "1.22",
+                    "rps": "12.2",
+                    "temperature": "热",
+                    "mom": "4",
+                    "yoy": "5",
+                    "bar": "6",
+                    "momDelta": "u",
+                    "yoyDelta": "d",
+                    "yield": "0.031",
+                },
+                {
+                    "rq": _supplier_timestamp("2026-09-03"),
+                    "px": "1.33",
+                    "rps": "13.3",
+                    "temperature": "平",
+                    "mom": "7",
+                    "yoy": "8",
+                    "bar": "9",
+                    "momDelta": "d",
+                    "yoyDelta": "u",
+                    "yield": "0.032",
+                },
+            ],
+            snapshot_date="2026-09-03",
+        )
+    )
+
+    for variant, response_b in (
+        ("missing", response_missing),
+        ("wrong-day", response_wrong_day),
+    ):
+        database = tmp_path / f"no-batch-{variant}.sqlite3"
+        requests: list[int] = []
+
+        def transport(
+            _url: str, body: bytes, _headers: dict[str, str]
+        ) -> dict[str, object]:
+            target_id = json.loads(body)["id"]
+            requests.append(target_id)
+            response = response_a if target_id == 101 else response_b
+            return {
+                "success": True,
+                "code": "00000",
+                "data": {"encryptedData": response},
+            }
+
+        with pytest.raises(ValueError, match="snapshot"):
+            collect_trend_curves(
+                watchlist,
+                database=database,
+                credentials=("fake-token", 123456789),
+                transport=transport,
+                require_snapshot=True,
+                expected_dates={"US": "2026-09-02"},
+            )
+
+        with sqlite3.connect(database) as connection:
+            a_points = connection.execute(
+                "SELECT COUNT(*) FROM trend_curve_points "
+                "WHERE market = 'US' AND symbol = 'A'"
+            ).fetchone()[0]
+            a_snapshot = connection.execute(
+                "SELECT snapshot_date FROM trend_curve_daily_snapshots "
+                "WHERE market = 'US' AND symbol = 'A'"
+            ).fetchone()
+            b_expected_snapshot = connection.execute(
+                "SELECT COUNT(*) FROM trend_curve_daily_snapshots "
+                "WHERE market = 'US' AND symbol = 'B' AND snapshot_date = '2026-09-02'"
+            ).fetchone()[0]
+        assert (requests, a_points, a_snapshot, b_expected_snapshot) == (
+            [101, 102],
+            2,
+            ("2026-09-02",),
+            0,
+        )
 
 
 def test_collect_stores_curve_rows_for_future_database_use(
@@ -90,6 +1623,7 @@ def test_collect_stores_curve_rows_for_future_database_use(
         assert [row[1] for row in connection.execute("PRAGMA table_info(trend_curve_points)")] == [
             "market", "symbol", "curve_date", "price", "temperature", "strength",
             "mom", "yoy", "bar", "asset_id", "group_id", "tm_id", "ccy_id",
+            "mom_delta", "yoy_delta", "yield_value",
         ]
         assert connection.execute(
             "SELECT market, symbol, curve_date, price, temperature, strength, mom, yoy, bar, "
@@ -98,7 +1632,12 @@ def test_collect_stores_curve_rows_for_future_database_use(
         ).fetchall() == expected_rows
         assert connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
-        ).fetchall() == [("trend_curve_points",)]
+        ).fetchall() == [
+            ("trend_curve_batch_items",),
+            ("trend_curve_batches",),
+            ("trend_curve_daily_snapshots",),
+            ("trend_curve_points",),
+        ]
     database_bytes = database.read_bytes()
     assert b"fake-token-123" not in database_bytes
     assert b"998877665544" not in database_bytes

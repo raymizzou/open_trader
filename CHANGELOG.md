@@ -35,6 +35,54 @@ operator-facing: what changed, which workflow is affected, and what was verified
   listener observation, and primary-failure preservation; tests were written
   but not run at the user's request. Only shell syntax and diff checks were
   performed; no deployment or production mutation was performed.
+- Trend-curve collection now preserves supplier extensions and daily signal
+  snapshots, with per-target SQLite commits, resumable frozen batches,
+  fail-closed authentication stops, gap reporting, damaged-record repair,
+  batch-owned completion evidence, and an OS-released single-writer lock. The
+  new daily CLI adds an Asia/Shanghai observation-day wrapper over the explicit
+  `coverage: cached` mapping compatibility scope, with provider-date reporting
+  and redacted credential-fingerprint waits that remain effective across
+  observation days; current-day counts are preserved and the originating auth
+  block remains available as provenance. C10 adds positive bounded request and
+  runtime budgets, per-target progress, one sanitized Hermes summary per real
+  collection run, durable gap files, and strict accepted/failed/unknown
+  delivery evidence; complete/auth-blocked local no-ops do not resend. It is
+  not full-market or live-ready. Full-market discovery remains follow-up work;
+  the LaunchAgent renderer is implemented but remains uninstalled and
+  not enabled unless separately authorized. Verification: `make test-trend-curve`
+  (48 passed).
+- Extended the cached-scope daily workflow with resumable CLI batch reporting,
+  Asia/Shanghai noon catch-up, latest-earlier-incomplete-batch gap
+  prioritization across missed observation dates, explicit
+  manual pause/resume state, and an own-label LaunchAgent renderer whose
+  install/uninstall actions are explicit and dry-run is the default. Daily
+  checks preserve committed rows when another collector is running; the
+  scheduler helper is isolated and was not installed or enabled. Verification:
+  `make test-trend-curve` (55 passed), including a fresh-process pause check and
+  the existing collector-lock rejection path.
+- Archived the 45-line manual Swift foreground diagnostic as
+  `scripts/trend_mini_click.swift` without changing bytes or behavior. The
+  original and archived copy both passed the no-event self-test
+  (`coordinate guards: PASS (no UI events)`, exit 0) with identical SHA-256;
+  event mode remains explicitly manual and is not called by daily.
+- Review repairs R1–R11 now reject contradictory Hermes receipts, persist
+  conservative `unknown` delivery before an interruptible send, wait after an
+  unchanged same-day non-auth failure while retaining automatic budget
+  continuation, prioritize the latest earlier incomplete frozen batch, and
+  keep notification details bounded to counts plus the complete gap-file path.
+  The installer binds the selected src root, fixed independent stdout/stderr
+  logs, and owned-plist/path safety checks; it remains uninstalled. R10 corrected
+  preflight test inputs GREEN-only, and R11 corrected a malformed mapping
+  fixture GREEN-only; neither is production RED evidence. Verification:
+  `make test-trend-curve` (65 passed in 38.07s). This remains cached-scope,
+  manually disabled behavior with no full-market, live, or integration
+  readiness claim.
+
+- Corrected daily gap prioritization to assess each prior batch against its
+  own frozen target scope before intersecting today's scope; newly added
+  targets no longer mask historical gaps, and a latest pending batch outside
+  today's scope does not cause fallback to an older batch. Verification:
+  `test_daily_prioritizes_gaps_using_each_prior_frozen_scope` (focused RED/GREEN).
 
 ## 2026-09-07
 

@@ -532,6 +532,175 @@ API failures send `趋势曲线采集对账异常` and keep the command nonzero.
 
 This phase is manual and isolated: trend reports do not read this SQLite data.
 
+For a resumable batch, call the same public collector with an explicit
+`batch_id` and freeze the effective request inputs:
+
+```python
+from datetime import datetime, timezone
+
+from open_trader.trend_curve_research import collect_trend_curves
+
+result = collect_trend_curves(
+    "data/trend_curve/watchlist.json",
+    database="data/trend_curve/history.sqlite3",
+    batch_id="2026-09-09-us",
+    require_snapshot=True,
+    expected_dates={"US": "2026-09-02"},
+    observed_at=datetime.now(timezone.utc),
+)
+```
+
+Each target's curve, available daily snapshot, observation time, and
+completion evidence are committed together. Repeating the same frozen request
+skips verified completed targets and retries only unfinished or damaged ones;
+completion evidence is scoped to the dates collected by that batch, so later
+history does not invalidate an intact older batch;
+`result.status` is `complete`, `partial`, or `auth_blocked`, and
+`result.issues` contains redacted target/reason codes. A missing or wrong-day
+snapshot leaves valid curve rows usable but keeps that target pending. An
+outer or decrypted `A00004` stops the batch after earlier commits. Damaged
+completion records are reconciled before retry, including restoring a missing
+batch-item row. In legacy no-batch mode, a required missing or wrong-day
+snapshot raises `ValueError` after earlier target commits. A sidecar lock
+permits one writer while ordinary SQLite readers remain available, and the
+lock is released by the operating system if the process exits. This API does
+not add full-market discovery, Hermes notification, or a scheduler.
+
+For the automatic observation-day wrapper, copy the credential-free example
+and edit only the local paths:
+
+```bash
+cp config/trend_curve_daily.example.json config/trend_curve_daily.json
+# Edit the copied file: set local paths and an absolute executable Hermes path.
+.venv/bin/python -m open_trader trend-curve daily \
+  --daily-config config/trend_curve_daily.json
+```
+
+The daily command derives a stable batch ID from the current Asia/Shanghai
+observation day, loads the supported CN/HK/US stock and ETF records from the
+configured local mapping cache, and resumes unfinished targets on the same
+day. Set the positive `request_interval_seconds`, integer `request_limit`, and
+positive `max_duration_seconds` budget fields, plus a finite bounded
+`hermes_timeout_seconds` and an absolute executable `hermes_executable` path.
+Its JSON result reports `coverage: cached`, the actual provider date range, and
+`freshness: unknown` when no independently verified expected date is configured.
+A complete batch with accepted delivery exits `0`; a partial or
+authentication-blocked batch, or a failed/unknown Hermes delivery, exits `1`;
+invalid configuration exits `2`. Each collection run writes one sanitized
+summary below the database directory and invokes Hermes once with the summary
+file; `delivery_status` is `accepted`, `failed`, or `unknown` for a sent
+summary and `not_run` for a local no-op. A request budget
+or deadline stop preserves committed targets and writes a durable pending-target
+gap file. An already-complete same-day check and an unchanged credential
+fingerprint after an authentication block are local no-ops and do not send
+another summary. A changed fingerprint validates only the first unfinished
+target before continuing. The unchanged-credential block remains effective
+after the observation date changes: `auth_blocked_batch_id` identifies the
+originating block, while `batch_id` and the counts describe the current
+observation day. With `--check`, an unchanged non-auth data/transport failure
+waits for an explicit manual retry or a new observation day instead of
+repeating the same failed requests. A pure request-limit or elapsed-deadline
+stop remains automatically resumable from committed progress. Manual pause
+and the unchanged-credential authentication block are separate controls: pause
+wins until `resume`, while a changed credential can explicitly retry an auth
+block. Credentials, user IDs, and raw Hermes output are never written to the
+config, output, summary, or persisted daily state.
+
+When a new observation day starts, pending targets from the latest earlier
+incomplete frozen daily batch are prioritized before the remaining targets,
+even when one or more dates were missed; the earlier batch's target list and
+committed progress remain unchanged. Each notification summary keeps the
+scope/counts, finite issue-reason counts, and an absolute `gap_file` path, while
+the gap file retains every pending identity and reason. The notification does
+not include an unbounded per-target issue list. Hermes accepts a receipt only
+when it is an exit-0 Feishu success with a nonempty message ID and neither an
+error nor `skipped: true`; contradictory receipts are failed. The summary is
+persisted with `delivery_status: unknown` before Hermes starts, and an
+interruption or timeout remains `unknown` without an outer resend.
+
+Use the public pause/resume commands for an intentional local stop. The pause
+sidecar is read before due, wake, or credential-change checks, so independently
+restarted daily processes remain paused until an explicit resume:
+
+```bash
+.venv/bin/python -m open_trader trend-curve pause \
+  --daily-config config/trend_curve_daily.json
+.venv/bin/python -m open_trader trend-curve resume \
+  --daily-config config/trend_curve_daily.json
+```
+
+The standalone LaunchAgent helper is dry-run by default. It manages only the
+own label `com.open-trader.trend-curve-daily`; `--install` and `--uninstall`
+are explicit, and neither action is performed by tests or by the daily command.
+The generated job uses a 60-second wake check plus a 12:00 calendar hint; the
+application independently evaluates Asia/Shanghai time and has no `KeepAlive`.
+The selected code path must be a valid src-layout root containing
+`src/open_trader/__init__.py`; the regular config, interpreter, and output
+paths are validated before any startup-directory write. The plist binds that
+source root explicitly and uses fixed independent logs under
+`<daily-config-parent>/trend_curve_daily/launchd.stdout.log` and
+`<daily-config-parent>/trend_curve_daily/launchd.stderr.log`. Dry-run rejects
+outputs inside the configured or standard `LaunchAgents` directories,
+including resolving `..` and symlink aliases. Explicit install and uninstall
+reject a foreign, malformed, or label-less plist at the helper's own filename.
+An explicit install creates the log directory; uninstall removes only the owned
+job and retains its logs and database. No live installation is performed by
+this workflow.
+Render and inspect a plist before any separately authorized installation:
+
+```bash
+.venv/bin/python scripts/install_trend_curve_launchd.py \
+  --code-path "$PWD" \
+  --interpreter "$PWD/.venv/bin/python" \
+  --daily-config "$PWD/config/trend_curve_daily.json" \
+  --plist-output /tmp/open-trader-trend-curve-daily.plist
+```
+
+Only after a separate explicit installation authorization, use the same paths
+with `--install`; remove only this job with `--uninstall`:
+
+```bash
+.venv/bin/python scripts/install_trend_curve_launchd.py \
+  --code-path "$PWD" \
+  --interpreter "$PWD/.venv/bin/python" \
+  --daily-config "$PWD/config/trend_curve_daily.json" \
+  --install
+.venv/bin/python scripts/install_trend_curve_launchd.py \
+  --code-path "$PWD" \
+  --interpreter "$PWD/.venv/bin/python" \
+  --daily-config "$PWD/config/trend_curve_daily.json" \
+  --uninstall
+```
+
+Installation is not live-readiness or full-market coverage; use the exact
+absolute code, interpreter, and config paths and keep installation/uninstallation
+as a separately authorized operator action.
+
+`coverage: cached` is an explicitly limited compatibility scope, not a
+full-market or live-ready configuration. The command does not discover a full
+exchange universe, call the paid snapshot/reconciliation endpoint, or
+automatically install or enable the implemented LaunchAgent helper; it remains
+dry-run by default and separately authorized. Full-market discovery remains a
+separate follow-up, and the helper's existence does not establish readiness.
+A configured Hermes executable is still required for the isolated summary-
+delivery step; this does not prove full-market coverage or real-world delivery.
+
+### Run the Manual Foreground Diagnostic Self-Test
+
+The archived Swift helper has a no-event self-test that checks its coordinate
+guards without activating an app or posting UI events:
+
+```bash
+/usr/bin/swift scripts/trend_mini_click.swift --self-test
+```
+
+Event mode is a single manually authorized foreground diagnostic only. It
+requires a currently observed exact WeChat owner/title/window ID, relative
+coordinates inside that window, event permission, and post-action inspection;
+it may activate the target app, sends one bounded click, and never retries.
+The helper is never called by the daily collector and performs no search or
+login automation.
+
 ### Backtest a Trend Curve
 
 Run the standalone offline US temperature-transition backtest:
