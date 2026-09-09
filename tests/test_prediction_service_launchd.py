@@ -121,6 +121,7 @@ def test_installer_restarts_only_its_label_and_checks_exact_shadow_health(tmp_pa
     assert f"installed launchd agent: {LABEL}" in result.stdout
     domain = f"gui/{os.getuid()}"
     assert calls.read_text(encoding="utf-8").splitlines() == [
+        f"print {domain}/{LABEL}", "-fsS http://127.0.0.1:8769/healthz",
         f"bootout {domain}/{LABEL}", f"print {domain}/{LABEL}", f"bootstrap {domain} {agents / f'{LABEL}.plist'}", f"print {domain}/{LABEL}",
         "-a -p 4242 -d cwd -Fn", "-nP -a -p 4242 -iTCP:8769 -sTCP:LISTEN -Fn", "-fsS http://127.0.0.1:8769/healthz",
     ]

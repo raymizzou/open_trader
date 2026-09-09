@@ -20,6 +20,13 @@ operator-facing: what changed, which workflow is affected, and what was verified
   semantics and documents its wait limitation. Regression coverage includes the workflow file
   (`9 passed`) plus targeted date/cash, source-label, and adapter checks; rollout, monitor
   activation, full-suite, and Candidate Acceptance remain separate and are not claimed here.
+- Hardened Prediction Service launchd release recovery: same-label operations
+  are advisory-exclusive, preflight remains read-only and machine-readable,
+  restart/stale-record recovery rechecks live identity and the runtime record
+  before handoff, and helper imports are bound to the manager checkout. Added
+  the operator recovery guide. Final focused verification: 137 passed with
+  one existing websockets deprecation warning in 595.68s. No deployment or
+  production mutation was performed.
 
 ## 2026-09-07
 
