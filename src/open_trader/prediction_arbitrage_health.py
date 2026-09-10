@@ -7,12 +7,14 @@ import json
 import os
 import sys
 import time
+from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time as datetime_time, timedelta
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 from .daily_premarket import build_notifier, load_env_config
 from .notifications import NullNotifier, beijing_clock
@@ -21,6 +23,15 @@ from .notifications import NullNotifier, beijing_clock
 HEARTBEAT_MAX_SECONDS = 60.0
 UNIVERSE_MAX_SECONDS = 300.0
 DEFAULT_INTERVAL_SECONDS = 7200.0
+TRANSPORT_RETRY_ATTEMPTS = 3
+TRANSPORT_RETRY_DELAY_SECONDS = 30.0
+RECOVERY_MIN_SECONDS = 30 * 60
+REMIND_AFTER_SECONDS = 24 * 3600
+FLAPPING_WINDOW_SECONDS = 60 * 60
+FLAPPING_MAX_CHANGE_SENDS = 2
+DAILY_SUMMARY_AFTER_CLOCK = datetime_time(9, 30)
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
+_SUMMARY_STATUS_ZH = {"PASS": "正常", "WARN": "有警告", "FAIL": "异常"}
 _STATE_PATH = "api/prediction-arbitrage/state"
 _HEALTHZ_PATH = "healthz"
 PREDICTION_SERVICE_HEALTH_SCHEMA = "open_trader.prediction_service.health.v1"
@@ -91,6 +102,7 @@ class HealthReport:
     summary: dict[str, object]
     checked_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     url: str = ""
+    dashboard_url: str = ""
 
 
 def _mapping(value: object) -> dict[str, object]:
@@ -131,6 +143,28 @@ def _fetch_healthz(url: str, timeout: float) -> Mapping[str, object]:
     if not isinstance(payload, Mapping):
         raise ValueError("health payload must be an object")
     return payload
+
+
+def _fetch_with_retry(
+    fetch: Callable[[str, float], Mapping[str, object]],
+    url: str,
+    timeout: float,
+    *,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    attempts: int = TRANSPORT_RETRY_ATTEMPTS,
+    delay_seconds: float = TRANSPORT_RETRY_DELAY_SECONDS,
+) -> Mapping[str, object]:
+    """Retry a transport-level fetch, waiting between attempts."""
+
+    last_exc: Exception = RuntimeError("unreachable")
+    for attempt in range(attempts):
+        try:
+            return fetch(url, timeout)
+        except Exception as exc:
+            last_exc = exc
+            if attempt + 1 < attempts:
+                sleep_fn(delay_seconds)
+    raise last_exc
 
 
 def validate_prediction_service_health(payload: object) -> tuple[bool, str]:
@@ -187,6 +221,8 @@ def run_health_check(
     fetch_healthz: Callable[[str, float], Mapping[str, object]] = _fetch_healthz,
     timeout: float = 10.0,
     notify_configured: bool = True,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    dashboard_url: str = "",
 ) -> HealthReport:
     """Run every component check and aggregate to PASS/WARN/FAIL."""
 
@@ -196,7 +232,7 @@ def run_health_check(
         checks.append(Check(name=name, status=status, value=value, reason=reason))
 
     try:
-        payload = fetch_state(url, timeout)
+        payload = _fetch_with_retry(fetch_state, url, timeout, sleep_fn=sleep_fn)
     except Exception as exc:
         payload = {}
         add("endpoint", "FAIL", value=url, reason=f"{type(exc).__name__}: {exc}")
@@ -218,7 +254,9 @@ def run_health_check(
     else:
         add("thread", "FAIL", reason="监控线程状态缺失")
     try:
-        healthz_payload = fetch_healthz(url, timeout)
+        healthz_payload = _fetch_with_retry(
+            fetch_healthz, url, timeout, sleep_fn=sleep_fn
+        )
     except Exception:
         healthz_payload = {}
     healthz = _mapping(healthz_payload)
@@ -363,6 +401,7 @@ def run_health_check(
         status=status,
         checks=tuple(checks),
         url=url,
+        dashboard_url=dashboard_url,
         summary={
             "heartbeat_age": heartbeat,
             "universe_age": universe,
@@ -418,9 +457,11 @@ def format_report(report: HealthReport) -> str:
             lines.append(_format_check_line(check))
         passed = sum(1 for check in report.checks if check.status == "PASS")
         lines.append(f"其余 {passed} 项通过（心跳 {human_age(heartbeat_age)}）")
-        lines.append(
-            f"Dashboard：{report.url} · PID {summary.get('pid')} · 版本 {_sha7(summary.get('sha'))}"
-        )
+        summary_line = f"PID {summary.get('pid')} · 版本 {_sha7(summary.get('sha'))}"
+        if report.dashboard_url:
+            lines.append(f"Dashboard：{report.dashboard_url} · {summary_line}")
+        else:
+            lines.append(summary_line)
         return "\n".join(lines)
     for check in report.checks:
         if check.status != "WARN":
@@ -441,8 +482,24 @@ def _format_check_line(check: Check) -> str:
 
 def send_report(notifier: object, report: HealthReport) -> bool:
     clock = beijing_clock(report.checked_at) or "未知"
+    summary = report.summary
     if report.status == "PASS":
         title = f"✅ 预测套利正常（{clock}）"
+    elif _endpoint_failed(report):
+        # The state endpoint itself is unreachable: fold the notification to
+        # the root cause instead of enumerating the dependent check failures.
+        title = f"❌ 预测套利：服务不可达（{clock}）"
+        body = "\n".join(
+            (
+                _endpoint_failure_reason(report),
+                f"PID {summary.get('pid')} · 版本 {_sha7(summary.get('sha'))}",
+            )
+        )
+        try:
+            notifier.notify(title, body)
+            return True
+        except Exception:
+            return False
     elif report.status == "FAIL":
         failed = sum(1 for check in report.checks if check.status == "FAIL")
         title = f"❌ 预测套利异常：{failed} 项失败需处理（{clock}）"
@@ -457,8 +514,36 @@ def send_report(notifier: object, report: HealthReport) -> bool:
         return False
 
 
+def _endpoint_failed(report: HealthReport) -> bool:
+    return any(
+        check.name == "endpoint" and check.status == "FAIL"
+        for check in report.checks
+    )
+
+
+def _endpoint_failure_reason(report: HealthReport) -> str:
+    return next(
+        (
+            check.reason
+            for check in report.checks
+            if check.name == "endpoint" and check.status == "FAIL"
+        ),
+        "",
+    )
+
+
 def _log(message: str) -> None:
     print(f"{datetime.now(UTC).isoformat(timespec='seconds')} pid={os.getpid()} {message}", flush=True)
+
+
+def _report_signature(report: HealthReport) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
+    """Fingerprint of a report: status plus sorted FAIL/WARN check names."""
+
+    return (
+        report.status,
+        tuple(sorted(check.name for check in report.checks if check.status == "FAIL")),
+        tuple(sorted(check.name for check in report.checks if check.status == "WARN")),
+    )
 
 
 def run_service(
@@ -468,26 +553,167 @@ def run_service(
     interval_seconds: float,
     once: bool = False,
     notify: bool = True,
+    dashboard_url: str = "",
+    fetch_state: Callable[[str, float], Mapping[str, object]] = _fetch_state,
+    fetch_healthz: Callable[[str, float], Mapping[str, object]] = _fetch_healthz,
+    timeout: float = 10.0,
+    now_fn: Callable[[], datetime] = lambda: datetime.now(UTC),
+    sleep_fn: Callable[[float], None] = time.sleep,
 ) -> int:
     notify_configured = notify and not isinstance(notifier, NullNotifier)
     if not once:
-        first = datetime.now(UTC).timestamp() + interval_seconds
+        first = now_fn().timestamp() + interval_seconds
         _log(
             f"health service started interval={interval_seconds:.0f}s "
             f"first_check_at={datetime.fromtimestamp(first, UTC).isoformat(timespec='seconds')}"
         )
-        time.sleep(interval_seconds)
+        sleep_fn(interval_seconds)
+    last_signature: tuple[str, tuple[str, ...], tuple[str, ...]] | None = None
+    last_sent_status: str | None = None
+    last_sent_at: datetime | None = None
+    non_pass_since: datetime | None = None
+    recovery_pending = False
+    change_send_times: list[datetime] = []
+    check_history: deque[tuple[datetime, bool]] = deque()
+    summary_sent_on: str | None = None
     while True:
         report = run_health_check(
             url=url,
+            fetch_state=fetch_state,
+            fetch_healthz=fetch_healthz,
+            timeout=timeout,
             notify_configured=notify_configured,
+            sleep_fn=sleep_fn,
+            dashboard_url=dashboard_url,
         )
         _log(format_report(report).replace("\n", " | "))
-        if notify_configured and not send_report(notifier, report):
-            _log(f"feishu delivery failed status={report.status}")
+        moment = now_fn()
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=UTC)
+        moment = moment.astimezone(UTC)
+        if notify_configured:
+            if once:
+                if not send_report(notifier, report):
+                    _log(f"feishu delivery failed status={report.status}")
+            else:
+                check_history.append((moment, report.status != "PASS"))
+                while (
+                    check_history
+                    and moment - check_history[0][0]
+                    >= timedelta(seconds=REMIND_AFTER_SECONDS)
+                ):
+                    check_history.popleft()
+                beijing = moment.astimezone(_SHANGHAI)
+                beijing_date = beijing.date().isoformat()
+                if (
+                    beijing.time() >= DAILY_SUMMARY_AFTER_CLOCK
+                    and summary_sent_on != beijing_date
+                ):
+                    abnormal = sum(
+                        1 for _, non_pass in check_history if non_pass
+                    )
+                    summary_title = (
+                        f"📋 预测套利日报（{beijing_date}）：近24h "
+                        f"检查 {len(check_history)} 次 · 异常 {abnormal} 次"
+                        f" · 当前 {_SUMMARY_STATUS_ZH.get(report.status, report.status)}"
+                    )
+                    if not _deliver(
+                        notifier,
+                        summary_title,
+                        (
+                            f"PID {report.summary.get('pid')} · 版本 "
+                            f"{_sha7(report.summary.get('sha'))}"
+                        ),
+                    ):
+                        _log("feishu delivery failed status=daily-summary")
+                    else:
+                        summary_sent_on = beijing_date
+                signature = _report_signature(report)
+                if report.status == "PASS":
+                    if (
+                        last_sent_status is not None
+                        and last_sent_status != "PASS"
+                        and non_pass_since is not None
+                        and moment - non_pass_since
+                        >= timedelta(seconds=RECOVERY_MIN_SECONDS)
+                    ):
+                        clock = beijing_clock(moment) or "未知"
+                        if _deliver(
+                            notifier,
+                            f"✅ 预测套利已恢复（{clock}）",
+                            "\n".join(
+                                (
+                                    "当前状态：正常 · "
+                                    f"心跳 {human_age(report.summary.get('heartbeat_age'))}",
+                                    "PID "
+                                    f"{report.summary.get('pid')} · 版本 "
+                                    f"{_sha7(report.summary.get('sha'))}",
+                                )
+                            ),
+                        ):
+                            last_signature = signature
+                            last_sent_status = report.status
+                            last_sent_at = moment
+                            non_pass_since = None
+                            recovery_pending = False
+                        else:
+                            # Keep non_pass_since so the next PASS cycle
+                            # retries the recovery delivery.
+                            _log("feishu delivery failed status=recovery")
+                            recovery_pending = True
+                    elif not recovery_pending:
+                        non_pass_since = None
+                else:
+                    if recovery_pending:
+                        # A newer non-PASS stretch started before the pending
+                        # recovery notice was delivered: measure persistence
+                        # from this stretch so the retained timestamp cannot
+                        # satisfy the 30-minute check early.
+                        non_pass_since = moment
+                        recovery_pending = False
+                    elif non_pass_since is None:
+                        non_pass_since = moment
+                    if signature != last_signature:
+                        change_send_times = [
+                            sent
+                            for sent in change_send_times
+                            if moment - sent
+                            < timedelta(seconds=FLAPPING_WINDOW_SECONDS)
+                        ]
+                        if len(change_send_times) >= FLAPPING_MAX_CHANGE_SENDS:
+                            # Flapping: fold into the daily summary history
+                            # instead of sending another change notification.
+                            _log(
+                                "feishu change notification suppressed "
+                                f"status={report.status}"
+                            )
+                        elif send_report(notifier, report):
+                            change_send_times.append(moment)
+                            last_signature = signature
+                            last_sent_status = report.status
+                            last_sent_at = moment
+                        else:
+                            _log(f"feishu delivery failed status={report.status}")
+                    elif (
+                        last_sent_at is not None
+                        and moment - last_sent_at
+                        >= timedelta(seconds=REMIND_AFTER_SECONDS)
+                    ):
+                        if not send_report(notifier, report):
+                            _log(f"feishu delivery failed status={report.status}")
+                        else:
+                            last_sent_at = moment
         if once:
             return 0 if report.status == "PASS" else (1 if report.status == "WARN" else 2)
-        time.sleep(interval_seconds)
+        sleep_fn(interval_seconds)
+
+
+def _deliver(notifier: object, title: str, message: str) -> bool:
+    try:
+        notifier.notify(title, message)
+        return True
+    except Exception:
+        return False
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -509,6 +735,7 @@ def main(argv: list[str] | None = None) -> int:
         report = run_health_check(
             url=args.url,
             notify_configured=not args.no_notify and not isinstance(notifier, NullNotifier),
+            dashboard_url=config.health_dashboard_url,
         )
         if args.json:
             print(json.dumps(report_to_dict(report), ensure_ascii=False))
@@ -523,4 +750,5 @@ def main(argv: list[str] | None = None) -> int:
         url=args.url,
         interval_seconds=args.interval,
         notify=not args.no_notify,
+        dashboard_url=config.health_dashboard_url,
     )

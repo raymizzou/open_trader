@@ -39,7 +39,7 @@ DORMANT_MATCH_COUNTS = {
 }
 
 DORMANT_FINGERPRINTS = {
-    "daily_premarket.py": "795e8f3d0063c3597286a83b0e6d123616f6f3c0bd2b7f3ae7c4c2c2c47e74b3",
+    "daily_premarket.py": "10f982fe8b814cfa55b88cae4025ee80b2ef54523323151c2629d52f385c03e0",
     "t_signal_runner.py": "7a13bd36418a23af4f61955a87f69a08483b313437041f9de152206d1a0fc222",
 }
 

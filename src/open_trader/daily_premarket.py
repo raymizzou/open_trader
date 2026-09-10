@@ -113,6 +113,7 @@ class DailyPremarketConfig:
     trend_review_us_simulate_acc_id: int = 0
     trend_review_hk_simulate_acc_id: int = 0
     trend_executor_host: str = ""
+    health_dashboard_url: str = ""
 
 
 @dataclass(frozen=True)
@@ -311,6 +312,7 @@ def load_env_config(path: Path, *, dry_run: bool = False) -> DailyPremarketConfi
         trend_review_us_simulate_acc_id=review_account_ids["US"],
         trend_review_hk_simulate_acc_id=review_account_ids["HK"],
         trend_executor_host=values.get("OPEN_TRADER_TREND_EXECUTOR_HOST", ""),
+        health_dashboard_url=values.get("OPEN_TRADER_HEALTH_DASHBOARD_URL", ""),
     )
 
 

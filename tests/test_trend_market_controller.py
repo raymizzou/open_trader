@@ -13989,3 +13989,385 @@ def test_scheduled_confirm_submitted_does_not_complete_execution(
         "uncertain",
         1,
     )
+
+
+def test_allocation_not_ready_waits_silently_then_generates_when_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(controller_config(tmp_path), trend_animals_api_key="test-key")
+    patch_cycle(monkeypatch, active_cn_cycle())
+    feishu = FlakyFeishu(failures=0)
+    monkeypatch.setattr(
+        controller, "build_notifier", lambda _config: CompositeNotifier([feishu])
+    )
+    monkeypatch.setattr(
+        controller,
+        "allocation_reference_for_report",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            controller.AllocationNotReady(
+                "allocation has not made a terminal attempt for this cycle"
+            )
+        ),
+    )
+    generated: list[object] = []
+    monkeypatch.setattr(
+        controller, "_generate_report", lambda *_args: generated.append(_args[-1])
+    )
+
+    first = run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+
+    assert feishu.attempt_count == 0
+    assert generated == []
+    assert first["phase"] != "blocked"
+    assert first["blocker"] is None
+    assert not list(
+        (config.data_dir / "trend_controller/CN/notifications").glob("**/*.json")
+    )
+
+    reference = {
+        "daily_path": "data/trend_allocation/daily/2026-07-17.json",
+        "sha256": "a" * 64,
+    }
+    monkeypatch.setattr(
+        controller,
+        "allocation_reference_for_report",
+        lambda *_args, **_kwargs: reference,
+    )
+
+    run_trend_market_controller(
+        config, "CN", once=True, now_fn=lambda: NOW + timedelta(seconds=10)
+    )
+
+    assert generated == [reference]
+    assert feishu.attempt_count == 0
+
+
+def test_corrupt_allocation_status_keeps_controller_failure_notification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_notify_once = controller._notify_once
+    config = replace(controller_config(tmp_path), trend_animals_api_key="test-key")
+    patch_cycle(monkeypatch, active_cn_cycle())
+    monkeypatch.setattr(controller, "_notify_once", real_notify_once)
+    feishu = FlakyFeishu(failures=0)
+    monkeypatch.setattr(
+        controller, "build_notifier", lambda _config: CompositeNotifier([feishu])
+    )
+    status_path = config.data_dir / "trend_allocation/controller_status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text("not json", encoding="utf-8")
+
+    result = run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+
+    assert feishu.attempt_count == 1
+    assert result["phase"] == "blocked"
+    assert "status is invalid" in str(result["blocker"])
+
+
+def test_allocation_not_ready_valve_sends_exactly_once_after_18_15(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(controller_config(tmp_path), trend_animals_api_key="test-key")
+    patch_cycle(monkeypatch, active_cn_cycle())
+    feishu = FlakyFeishu(failures=0)
+    monkeypatch.setattr(
+        controller, "build_notifier", lambda _config: CompositeNotifier([feishu])
+    )
+    monkeypatch.setattr(
+        controller,
+        "allocation_reference_for_report",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            controller.AllocationNotReady(
+                "allocation has not made a terminal attempt for this cycle"
+            )
+        ),
+    )
+    generated: list[object] = []
+    monkeypatch.setattr(
+        controller, "_generate_report", lambda *_args: generated.append(object())
+    )
+    late = datetime.fromisoformat("2026-07-20T18:20:00+08:00")
+
+    result = run_trend_market_controller(
+        config, "CN", once=True, now_fn=lambda: late
+    )
+    run_trend_market_controller(
+        config, "CN", once=True, now_fn=lambda: late + timedelta(minutes=5)
+    )
+
+    assert feishu.attempt_count == 1
+    assert generated == []
+    assert result["phase"] != "blocked"
+    state_paths = list(
+        (config.data_dir / "trend_controller/CN/notifications").glob("**/*.json")
+    )
+    assert len(state_paths) == 1
+    state = json.loads(state_paths[0].read_text(encoding="utf-8"))
+    assert state["action"] == "allocation_not_ready_late"
+    assert "收盘后配置快照仍未就绪（已过 18:15）" in state["feishu_message"]
+    assert "下一周期报告延迟" in state["feishu_message"]
+    assert "检查 trend-allocation 服务状态与日志" in state["feishu_message"]
+
+
+def test_allocation_not_ready_before_18_15_or_recovered_sends_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(controller_config(tmp_path), trend_animals_api_key="test-key")
+    patch_cycle(monkeypatch, active_cn_cycle())
+    feishu = FlakyFeishu(failures=0)
+    monkeypatch.setattr(
+        controller, "build_notifier", lambda _config: CompositeNotifier([feishu])
+    )
+    monkeypatch.setattr(
+        controller,
+        "allocation_reference_for_report",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            controller.AllocationNotReady(
+                "allocation has not made a terminal attempt for this cycle"
+            )
+        ),
+    )
+    generated: list[object] = []
+    monkeypatch.setattr(
+        controller, "_generate_report", lambda *_args: generated.append(_args[-1])
+    )
+    early = datetime.fromisoformat("2026-07-20T18:00:00+08:00")
+
+    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: early)
+
+    assert feishu.attempt_count == 0
+    assert not list(
+        (config.data_dir / "trend_controller/CN/notifications").glob("**/*.json")
+    )
+
+    reference = {
+        "daily_path": "data/trend_allocation/daily/2026-07-17.json",
+        "sha256": "a" * 64,
+    }
+    monkeypatch.setattr(
+        controller,
+        "allocation_reference_for_report",
+        lambda *_args, **_kwargs: reference,
+    )
+    run_trend_market_controller(
+        config, "CN", once=True, now_fn=lambda: early + timedelta(minutes=5)
+    )
+
+    assert feishu.attempt_count == 0
+    assert generated == [reference]
+
+
+def test_allocation_not_ready_wait_throttles_calendar_calls_until_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(controller_config(tmp_path), trend_animals_api_key="test-key")
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    cycle = active_cn_cycle()
+    monkeypatch.setattr(
+        controller,
+        "_derive_cycle",
+        lambda _config, _market, _now, **_kwargs: cycle,
+    )
+    monkeypatch.setattr(
+        controller,
+        "_run_protection_pass",
+        lambda *_args, **_kwargs: protection_success(),
+    )
+    monkeypatch.setattr(
+        controller, "_record_status", lambda *_args, **kwargs: kwargs
+    )
+    monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
+    monkeypatch.setattr(
+        controller,
+        "consume_accepted_statement_facts",
+        lambda **_kwargs: {"status": "skipped"},
+    )
+    monkeypatch.setattr(
+        controller,
+        "_run_cycle_statistics",
+        lambda *_args, **_kwargs: {"status": "completed"},
+    )
+    monkeypatch.setattr(
+        controller,
+        "_run_cycle_long_term_benchmark",
+        lambda *_args, **_kwargs: {"status": "completed"},
+    )
+    monkeypatch.setattr(controller, "_close_completed", lambda *_args: True)
+    monkeypatch.setattr(
+        controller, "_trend_review_projection_current", lambda *_args: True
+    )
+    feishu = FlakyFeishu(failures=0)
+    monkeypatch.setattr(
+        controller, "build_notifier", lambda _config: CompositeNotifier([feishu])
+    )
+
+    clock = {"now": NOW}
+    calendar_calls: list[tuple[datetime, object]] = []
+
+    class CountingQuote:
+        def get_trading_days(self, **kwargs: object) -> list[str]:
+            calendar_calls.append((clock["now"], kwargs))
+            return ["2026-06-15", "2026-07-17", "2026-07-20", "2026-07-21"]
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        controller, "FutuQuoteClient", lambda **_kwargs: CountingQuote()
+    )
+
+    ready_at = NOW + timedelta(minutes=30)
+    reference = {
+        "daily_path": "data/trend_allocation/daily/2026-07-17.json",
+        "sha256": "a" * 64,
+    }
+
+    def allocation_reference(
+        *_args: object, **_kwargs: object
+    ) -> dict[str, str]:
+        if clock["now"] < ready_at:
+            raise controller.AllocationNotReady(
+                "allocation has not made a terminal attempt for this cycle"
+            )
+        return reference
+
+    monkeypatch.setattr(
+        controller, "allocation_reference_for_report", allocation_reference
+    )
+
+    generated: list[object] = []
+
+    def generate_report(*args: object) -> None:
+        generated.append(args[-1])
+        write_report(config)
+
+    monkeypatch.setattr(controller, "_generate_report", generate_report)
+
+    class StopLoop(RuntimeError):
+        pass
+
+    end_at = ready_at + timedelta(minutes=6)
+
+    def advance_clock(seconds: float) -> None:
+        clock["now"] += timedelta(seconds=seconds)
+        if clock["now"] > end_at:
+            raise StopLoop
+
+    with pytest.raises(StopLoop):
+        run_trend_market_controller(
+            config, "CN", now_fn=lambda: clock["now"], sleep_fn=advance_clock
+        )
+
+    # One calendar call per 5-minute throttle gate during the 30-minute
+    # wait, then the first loop after the gate expires following readiness
+    # (instead of one call per 5-second loop, ~360 in total).
+    assert [
+        moment.strftime("%H:%M") for moment, _call in calendar_calls
+    ] == [
+        "09:31",
+        "09:36",
+        "09:41",
+        "09:46",
+        "09:51",
+        "09:56",
+        "10:01",
+    ]
+    assert len(calendar_calls) <= 7
+    assert generated == [reference]
+    assert feishu.attempt_count == 0
+    assert not list(
+        (config.data_dir / "trend_controller/CN/notifications").glob("**/*.json")
+    )
+
+
+def _abnormal_protection() -> SimpleNamespace:
+    return SimpleNamespace(
+        status="abnormal", exception_count=1, unknown_quote_count=2
+    )
+
+
+def _patch_abnormal_protection(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        controller, "_run_protection_pass", lambda *_args, **_kwargs: _abnormal_protection()
+    )
+
+
+@pytest.mark.parametrize(
+    ("market", "now_text"),
+    [
+        ("CN", "2026-07-20T09:31:00+08:00"),
+        ("HK", "2026-07-20T09:31:00+08:00"),
+        ("US", "2026-07-20T21:31:00+08:00"),
+    ],
+)
+def test_protection_opening_buffer_suppresses_feishu_and_writes_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, market: str, now_text: str,
+) -> None:
+    config = controller_config(tmp_path)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    _patch_abnormal_protection(monkeypatch)
+    feishu = FlakyFeishu(failures=0)
+    monkeypatch.setattr(
+        controller, "build_notifier", lambda _config: CompositeNotifier([feishu])
+    )
+    now = datetime.fromisoformat(now_text)
+
+    run_trend_market_controller(config, market, once=True, now_fn=lambda: now)
+
+    assert feishu.attempt_count == 0
+    assert not list(
+        (config.data_dir / f"trend_controller/{market}/notifications").glob("**/*.json")
+    )
+    diagnostics = (
+        config.data_dir
+        / f"trend_controller/{market}/protection_diagnostics/2026-07-20.jsonl"
+    )
+    lines = diagnostics.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    payload = json.loads(lines[0])
+    assert payload["status"] == "abnormal"
+    assert payload["exception_count"] == 1
+    assert payload["unknown_quote_count"] == 2
+    assert payload["blocker"] == (
+        "protection pass abnormal: status=abnormal, exceptions=1, unknown_quotes=2"
+    )
+    assert payload["occurred_at"].startswith("2026-07-20T")
+
+
+def test_protection_abnormal_after_buffer_notifies_and_records_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    _patch_abnormal_protection(monkeypatch)
+    feishu = FlakyFeishu(failures=0)
+    monkeypatch.setattr(
+        controller, "build_notifier", lambda _config: CompositeNotifier([feishu])
+    )
+    now = datetime.fromisoformat("2026-07-20T09:41:00+08:00")
+
+    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: now)
+
+    assert feishu.attempt_count == 1
+    diagnostics = (
+        config.data_dir
+        / "trend_controller/CN/protection_diagnostics/2026-07-20.jsonl"
+    )
+    assert len(diagnostics.read_text(encoding="utf-8").strip().splitlines()) == 1
+
+
+def test_protection_abnormal_intraday_notifies_immediately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    _patch_abnormal_protection(monkeypatch)
+    feishu = FlakyFeishu(failures=0)
+    monkeypatch.setattr(
+        controller, "build_notifier", lambda _config: CompositeNotifier([feishu])
+    )
+    now = datetime.fromisoformat("2026-07-20T10:30:00+08:00")
+
+    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: now)
+
+    assert feishu.attempt_count == 1

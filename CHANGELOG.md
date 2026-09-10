@@ -3,6 +3,29 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-09-10
+
+- 飞书通知降噪：预测套利健康检查从「每 2 小时必发」改为「状态变化才告警 +
+  每日一条摘要」。PASS 静默；同一指纹 24 小时至多提醒 1 条；非 PASS 持续
+  ≥30 分钟后恢复才补发一条恢复消息；60 分钟窗口内第 3 次起抑制指纹横跳。
+  服务不可达（state 取数 30 秒×3 次重试仍失败）只发一条折叠的根因通知，
+  不再枚举 8 项级联失败；瞬时超时由重试吸收。正常一天从约 20 条降到
+  约 4 条（3 条趋势日报 + 1 条健康摘要）。健康服务新增可选配置键
+  `OPEN_TRADER_HEALTH_DASHBOARD_URL`：未配置时飞书不再显示不可达的
+  `127.0.0.1` Dashboard 行；检查目标仍由 `--url` 控制。`--once` 手动模式
+  仍无论结果必发一条。
+- 收盘趋势控制器误报消除：allocation 守护进程 17:45 前出终态属设计内时序，
+  三市场收盘时不再各发一条「趋势控制器阻塞」——未就绪时静默跳过本轮报告
+  调度，终态就绪后报告照常生成；仅当上海时间过 18:15（17:45+30 分钟）
+  仍无快照才每市场每天发一条「收盘配置快照未就绪」。损坏的状态文件仍按
+  真故障路径立即告警。
+- 开盘保护监控缓冲：开盘首 10 分钟内（CN/HK 09:30、美股 21:30 北京）行情
+  未就绪导致的保护检查异常不再发「保护监控阻塞·已禁止新买入」，改为追加
+  一行 JSON 诊断到 `data/trend_controller/{market}/protection_diagnostics/
+  {date}.jsonl`（含 occurred_at/status/exception_count/unknown_quote_count/
+  blocker）；缓冲期后或盘中新出现的异常仍照常告警（每市场每天一条语义
+  不变），保护检查执行与买入拦截语义未改动。
+
 ## 2026-09-09
 
 - #115 bounded the live solver oracle budget at `(16, 25, 1)` for quantity

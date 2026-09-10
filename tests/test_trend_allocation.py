@@ -683,3 +683,67 @@ def test_recovery_aggregates_outstanding_failure_markers_into_one_alert(
     assert "2026-08-01" in calls[0][2]
     assert "2026-08-02" in calls[0][2]
     assert all(json.loads(marker.read_text())["recovered"] is True for marker in markers)
+
+
+def _reference_config(tmp_path: Path) -> DailyPremarketConfig:
+    return DailyPremarketConfig(
+        repo=tmp_path, python=tmp_path / "python", timezone="Asia/Shanghai",
+        deadline="21:10", futu_host="127.0.0.1", futu_port=11111,
+        data_dir=tmp_path / "data", reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs", portfolio=tmp_path / "data/latest/portfolio.csv",
+        trend_executor_host="executor",
+    )
+
+
+def test_allocation_not_ready_subclasses_trend_animals_error() -> None:
+    assert issubclass(trend_allocation.AllocationNotReady, TrendAnimalsError)
+
+
+def test_missing_or_unterminal_status_raises_allocation_not_ready(
+    tmp_path: Path,
+) -> None:
+    config = _reference_config(tmp_path)
+
+    with pytest.raises(trend_allocation.AllocationNotReady, match="terminal"):
+        trend_allocation.allocation_reference_for_report(
+            config, allocation_date="2026-08-03", a_trading_days=["2026-08-03"]
+        )
+
+    status_path = config.data_dir / "trend_allocation/controller_status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps({
+        "schema_version": trend_allocation.ALLOCATION_STATUS_SCHEMA,
+        "phase": "waiting",
+        "attempted_for": "2026-08-03",
+    }), encoding="utf-8")
+    with pytest.raises(trend_allocation.AllocationNotReady, match="terminal"):
+        trend_allocation.allocation_reference_for_report(
+            config, allocation_date="2026-08-03", a_trading_days=["2026-08-03"]
+        )
+
+    status_path.write_text(json.dumps({
+        "schema_version": trend_allocation.ALLOCATION_STATUS_SCHEMA,
+        "phase": "ready",
+        "attempted_for": "2026-08-02",
+    }), encoding="utf-8")
+    with pytest.raises(trend_allocation.AllocationNotReady, match="terminal"):
+        trend_allocation.allocation_reference_for_report(
+            config, allocation_date="2026-08-03", a_trading_days=["2026-08-03"]
+        )
+
+
+@pytest.mark.parametrize("payload", ["not json", "{}"])
+def test_corrupt_status_file_raises_plain_trend_animals_error(
+    tmp_path: Path, payload: str,
+) -> None:
+    config = _reference_config(tmp_path)
+    status_path = config.data_dir / "trend_allocation/controller_status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(payload, encoding="utf-8")
+
+    with pytest.raises(TrendAnimalsError, match="status is invalid") as exc_info:
+        trend_allocation.allocation_reference_for_report(
+            config, allocation_date="2026-08-03", a_trading_days=["2026-08-03"]
+        )
+
+    assert type(exc_info.value) is TrendAnimalsError

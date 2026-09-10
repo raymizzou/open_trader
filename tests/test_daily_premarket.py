@@ -154,6 +154,33 @@ def test_load_env_config_defaults_missing_reits_pool_to_official_id(
     assert config.trend_animals_reits_tm_id == 622482
 
 
+def test_load_env_config_health_dashboard_url_is_optional(tmp_path: Path) -> None:
+    base = [
+        f"OPEN_TRADER_REPO={tmp_path}",
+        f"OPEN_TRADER_PYTHON={tmp_path / '.venv/bin/python'}",
+        "OPEN_TRADER_TIMEZONE=Asia/Shanghai",
+        "OPEN_TRADER_DEADLINE=21:10",
+        "OPEN_TRADER_FUTU_HOST=127.0.0.1",
+        "OPEN_TRADER_FUTU_PORT=11111",
+        "DEEPSEEK_API_KEY=secret",
+    ]
+    env = tmp_path / "daily.env"
+    env.write_text("\n".join(base), encoding="utf-8")
+
+    assert load_env_config(env).health_dashboard_url == ""
+
+    env.write_text(
+        "\n".join(
+            [*base, "OPEN_TRADER_HEALTH_DASHBOARD_URL=https://example.test/d"]
+        ),
+        encoding="utf-8",
+    )
+
+    assert (
+        load_env_config(env).health_dashboard_url == "https://example.test/d"
+    )
+
+
 def test_load_env_config_defaults_executor_host_to_empty(tmp_path: Path) -> None:
     env = tmp_path / "daily.env"
     env.write_text(

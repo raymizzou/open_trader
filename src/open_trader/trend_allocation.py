@@ -26,6 +26,10 @@ from .futu_quote import FutuQuoteClient
 from .trend_animals import TrendAnimalsClient, TrendAnimalsError
 
 
+class AllocationNotReady(TrendAnimalsError):
+    """The allocation daemon has not reached a terminal decision for this cycle."""
+
+
 ROOT_ASSETS = {
     "CN": ("A股", "ETF基金"),
     "HK": ("港股", "香港ETF"),
@@ -45,6 +49,10 @@ ALLOCATION_STATUS_SCHEMA = "open_trader.trend_allocation.status.v1"
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _ATTEMPT_AT = time(16, 20)
 _FALLBACK_AT = time(17, 45)
+# Past _FALLBACK_AT (17:45 Shanghai terminal fallback) plus a 30 minute margin,
+# a still-missing allocation snapshot means the allocation daemon is truly
+# stuck rather than waiting by design.
+ALLOCATION_NOT_READY_LATE_AT = time(18, 15)
 _STATUS_FAILURE_REASON_UNSET = object()
 
 
@@ -195,10 +203,10 @@ def allocation_reference_for_report(
 ) -> dict[str, object] | None:
     """Return the shared allocation only after that cycle made a terminal decision."""
     if not _allocation_status_path(config.data_dir).exists():
-        raise TrendAnimalsError("allocation has not made a terminal attempt for this cycle")
+        raise AllocationNotReady("allocation has not made a terminal attempt for this cycle")
     status = _read_allocation_status(config.data_dir)
     if status.get("attempted_for") != _date_text(allocation_date, "allocation_date") or status.get("phase") not in {"ready", "fallback", "holiday"}:
-        raise TrendAnimalsError("allocation has not made a terminal attempt for this cycle")
+        raise AllocationNotReady("allocation has not made a terminal attempt for this cycle")
     phase = status["phase"]
     blocker = status.get("blocker")
     if (

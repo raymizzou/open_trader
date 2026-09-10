@@ -49,7 +49,11 @@ from .kelly_order_execution import (
     FutuSimulateOrderExecutionClient,
 )
 from .market_trend import market_paths, run_market_trend_report
-from .trend_allocation import allocation_reference_for_report
+from .trend_allocation import (
+    ALLOCATION_NOT_READY_LATE_AT,
+    AllocationNotReady,
+    allocation_reference_for_report,
+)
 from .market_trend_watch import (
     MARKET_TIMEZONES,
     market_session,
@@ -1765,6 +1769,61 @@ def _protection_blocker(result: object) -> str | None:
             f"unknown_quotes={unknown_quotes}"
         )
     return None
+
+
+# Session opens routinely read quotes as not-yet-ready in the first minutes;
+# abnormal passes inside this window are recorded but do not alert.
+_PROTECTION_OPEN_BUFFER = timedelta(minutes=10)
+_PROTECTION_SESSION_STARTS = {
+    "morning": time(9, 30),
+    "afternoon": time(13, 0),
+    "open": time(9, 30),
+}
+
+
+def _protection_buffer_active(local: datetime, market: str) -> bool:
+    """True within the first minutes of the market's current trading session."""
+
+    session = cn_session(local) if market == "CN" else market_session(local, market)
+    start = _PROTECTION_SESSION_STARTS.get(session)
+    if start is None:
+        return False
+    session_start = local.replace(
+        hour=start.hour, minute=start.minute, second=0, microsecond=0
+    )
+    return (
+        timedelta(0) <= local - session_start < _PROTECTION_OPEN_BUFFER
+    )
+
+
+def _record_protection_diagnostics(
+    config: DailyPremarketConfig,
+    market: str,
+    execution_date: str,
+    result: object,
+    blocker: str,
+    occurred_at: datetime,
+) -> None:
+    path = (
+        config.data_dir
+        / "trend_controller"
+        / market
+        / "protection_diagnostics"
+        / f"{execution_date}.jsonl"
+    )
+    payload = {
+        "occurred_at": occurred_at.isoformat(timespec="seconds"),
+        "status": str(getattr(result, "status", "") or ("error" if result is None else "")),
+        "exception_count": getattr(result, "exception_count", None),
+        "unknown_quote_count": getattr(result, "unknown_quote_count", None),
+        "blocker": blocker,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
 
 
 def _execute_locked_report(
@@ -3600,6 +3659,35 @@ def _notify_protection_blocker(
     )
 
 
+def _notify_allocation_not_ready_late(
+    config: DailyPremarketConfig,
+    market: str,
+    shanghai_now: datetime,
+    error: BaseException,
+) -> bool:
+    title, message = render_attention(
+        BROKER_LABELS[market],
+        f"{MARKET_LABELS[market]}收盘配置快照未就绪",
+        shanghai_now.date().isoformat(),
+        happened="收盘后配置快照仍未就绪（已过 18:15）",
+        impact=f"{MARKET_LABELS[market]}下一周期报告延迟",
+        action="检查 trend-allocation 服务状态与日志",
+        detail=str(error),
+    )
+    return _notify_feishu_once(
+        title,
+        message,
+        (
+            config,
+            market,
+            shanghai_now.date().isoformat(),
+            "allocation_not_ready_late",
+            "allocation_snapshot_missing",
+            shanghai_now.isoformat(timespec="seconds"),
+        ),
+    )
+
+
 def _revision_paths(
     config: DailyPremarketConfig, market: str, as_of_date: str
 ) -> tuple[Path, Path]:
@@ -4855,6 +4943,7 @@ def run_trend_market_controller(
     report_retry_after: datetime | None = None
     report_blocker: str | None = None
     report_waiting: str | None = None
+    allocation_retry_after: datetime | None = None
     review_failures = 0
     review_retry_after: datetime | None = None
     operation_failures = 0
@@ -5016,29 +5105,38 @@ def run_trend_market_controller(
                 else market_session(local, market)
             )
             protection_error: str | None = None
+            protection_result: object | None = None
             if local_session in {"morning", "afternoon", "open"}:
                 try:
-                    protection_error = _protection_blocker(
-                        _run_protection_pass(
-                            config,
-                            market,
-                            local.date().isoformat(),
-                            quote_client=shared_quote(),
-                            account_loader=load_account,
-                        )
+                    protection_result = _run_protection_pass(
+                        config,
+                        market,
+                        local.date().isoformat(),
+                        quote_client=shared_quote(),
+                        account_loader=load_account,
                     )
+                    protection_error = _protection_blocker(protection_result)
                 except Exception as exc:
                     if isinstance(exc, FutuQuoteError):
                         reset_quote()
                     protection_error = f"protection pass failed: {exc}"
             if protection_error is not None:
-                _notify_protection_blocker(
+                _record_protection_diagnostics(
                     config,
                     market,
                     local.date().isoformat(),
+                    protection_result,
                     protection_error,
-                    now.isoformat(timespec="seconds"),
+                    now,
                 )
+                if not _protection_buffer_active(local, market):
+                    _notify_protection_blocker(
+                        config,
+                        market,
+                        local.date().isoformat(),
+                        protection_error,
+                        now.isoformat(timespec="seconds"),
+                    )
             if cycle_retry_after is not None and now < cycle_retry_after:
                 status_payload = _record_status(
                     config,
@@ -5253,6 +5351,10 @@ def run_trend_market_controller(
                 if (
                     future is None
                     and can_start
+                    and (
+                        allocation_retry_after is None
+                        or now >= allocation_retry_after
+                    )
                     and (latest is None or recovery_revision is not None)
                 ):
                     generator_revision = (
@@ -5260,23 +5362,42 @@ def run_trend_market_controller(
                         if recovery_revision is not None
                         else revision_pending
                     )
-                    allocation_reference = _allocation_reference_for_cycle(
-                        config, now=now, quote_client=shared_quote()
-                    )
-                    report_args: tuple[object, ...] = (
-                        config,
-                        market,
-                        work_cycle.report_run_date,
-                        generator_revision,
-                    )
-                    if config.trend_animals_api_key:
-                        report_args += (allocation_reference,)
-                    future = pool.submit(_generate_report, *report_args)
-                    report_target = ReportTask(
-                        cycle=work_cycle,
-                        completes_revision_request=revision_pending,
-                        allocation_reference=allocation_reference,
-                    )
+                    try:
+                        allocation_reference = _allocation_reference_for_cycle(
+                            config, now=now, quote_client=shared_quote()
+                        )
+                    except AllocationNotReady as exc:
+                        # The allocation daemon has not reached a terminal
+                        # decision yet. Skip report scheduling for this loop
+                        # without persisting any once state; the dependency
+                        # loop retries at most once every 5 minutes (each
+                        # attempt queries the OpenD calendar, so an unthrottled
+                        # retry would hammer OpenD for hours). Only past the
+                        # late valve (18:15 Shanghai) escalate once per day.
+                        allocation_retry_after = now + timedelta(minutes=5)
+                        shanghai_now = now.astimezone(
+                            ZoneInfo("Asia/Shanghai")
+                        )
+                        if shanghai_now.time() >= ALLOCATION_NOT_READY_LATE_AT:
+                            _notify_allocation_not_ready_late(
+                                config, market, shanghai_now, exc
+                            )
+                    else:
+                        allocation_retry_after = None
+                        report_args: tuple[object, ...] = (
+                            config,
+                            market,
+                            work_cycle.report_run_date,
+                            generator_revision,
+                        )
+                        if config.trend_animals_api_key:
+                            report_args += (allocation_reference,)
+                        future = pool.submit(_generate_report, *report_args)
+                        report_target = ReportTask(
+                            cycle=work_cycle,
+                            completes_revision_request=revision_pending,
+                            allocation_reference=allocation_reference,
+                        )
 
                 if future is not None and (future.done() or once):
                     report_cycle = report_target.cycle if report_target else cycle
