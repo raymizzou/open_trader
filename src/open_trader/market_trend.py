@@ -105,7 +105,7 @@ from .strategy_drawdown import observe_strategy_equity
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 MARKET_SETTINGS = {
     "US": {"broker": "futu", "currency": "HKD", "asset": "美股", "deadline": time(19)},
-    "HK": {"broker": "phillips", "currency": "HKD", "asset": "港股", "deadline": time(19)},
+    "HK": {"broker": "phillips", "currency": "HKD", "asset": "港股", "deadline": time(22)},
 }
 MARKET_UPDATE_ASSETS = {
     "US": ("美股", "美国ETF"),

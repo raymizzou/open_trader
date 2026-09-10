@@ -859,6 +859,87 @@ def test_market_report_failure_carries_waiting_gap_at_deadline(
     assert result.waiting_reason == "美股 2026-07-14 → 2026-07-15"
 
 
+def test_hk_report_keeps_waiting_after_2100_before_2200_deadline(
+    tmp_path: Path,
+) -> None:
+    attempts = iter([
+        AShareTrendRunResult("waiting", None, None),
+        AShareTrendRunResult("waiting", None, None),
+        AShareTrendRunResult("generated", Path("report.md"), Path("report.json")),
+    ])
+    times = iter([
+        datetime(2026, 7, 15, 21, 30, tzinfo=SHANGHAI),
+        datetime(2026, 7, 15, 21, 45, tzinfo=SHANGHAI),
+    ])
+    sleeps: list[float] = []
+    notifier = RecordingFeishu()
+
+    result = run_market_trend_report(
+        config=config(tmp_path),
+        market="HK",
+        run_date="2026-07-15",
+        notifier=notifier,
+        attempt_fn=lambda **kwargs: next(attempts),
+        now_fn=lambda: next(times),
+        sleep_fn=sleeps.append,
+    )
+
+    assert result.status != "failed"
+    assert result.status == "generated"
+    assert sleeps == [600.0, 600.0]
+    assert all("港股趋势报告生成失败" not in title for title, _ in notifier.messages)
+
+
+def test_hk_report_failure_owns_day_at_inclusive_2200_deadline(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 7, 15, 22, 0, tzinfo=SHANGHAI)
+    cfg = config(tmp_path)
+    notifier = RecordingFeishu()
+    result = run_market_trend_report(
+        config=cfg,
+        market="HK",
+        run_date="2026-07-15",
+        notifier=notifier,
+        attempt_fn=lambda **kwargs: AShareTrendRunResult("waiting", None, None),
+        now_fn=lambda: now,
+        sleep_fn=lambda seconds: None,
+    )
+
+    assert result.status == "failed"
+    assert notifier.messages == [
+        (
+            "【需处理｜辉立｜港股趋势报告生成失败｜2026-07-15】",
+            "发生：趋势报告未生成\n"
+            "影响：不能依据旧报告交易\n"
+            "现在做：确认 Trend Animals 与辉立日结单状态后手动重跑辉立报告\n"
+            "原因：趋势数据在截止时间前仍未更新",
+        )
+    ]
+    ledger = (
+        market_paths(cfg.data_dir, cfg.reports_dir, "HK").root
+        / "daily_delivery/2026-07-15.json"
+    )
+    assert json.loads(ledger.read_text(encoding="utf-8"))["status"] == "sent"
+
+
+def test_us_report_failure_still_owns_day_at_1900_shanghai_deadline(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 7, 15, 19, 0, tzinfo=SHANGHAI)
+    result = run_market_trend_report(
+        config=config(tmp_path),
+        market="US",
+        run_date="2026-07-15",
+        notifier=NullNotifier(),
+        attempt_fn=lambda **kwargs: AShareTrendRunResult("waiting", None, None),
+        now_fn=lambda: now,
+        sleep_fn=lambda seconds: None,
+    )
+
+    assert result.status == "failed"
+
+
 @pytest.mark.parametrize(
     "missing_fact", ["positive_price", "lot_size", "symbol_mapping"]
 )
@@ -1039,7 +1120,7 @@ def test_current_version_report_is_atomic_when_any_buy_quantity_input_is_missing
         api_factory=Api,
         quote_factory=Quote,
         account_factory=Account,
-        now_fn=lambda: datetime(2026, 7, 15, 19, tzinfo=SHANGHAI),
+        now_fn=lambda: datetime(2026, 7, 15, 22, tzinfo=SHANGHAI),
         sleep_fn=lambda _seconds: None,
     )
 
@@ -1600,7 +1681,7 @@ def test_market_planning_crash_retry_publishes_frozen_components(
         api_factory=Api,
         quote_factory=Quote,
         account_factory=account_factory,
-        now_fn=lambda: datetime(2026, 7, 15, 19, tzinfo=SHANGHAI),
+        now_fn=lambda: datetime(2026, 7, 15, 22, tzinfo=SHANGHAI),
         sleep_fn=lambda _seconds: None,
     )
     assert first.status == "failed", first.waiting_reason
@@ -1849,7 +1930,7 @@ def _run_market_crash_retry(
         api_factory=Api,
         quote_factory=Quote,
         account_factory=account_factory,
-        now_fn=lambda: datetime(2026, 7, 15, 19, tzinfo=SHANGHAI),
+        now_fn=lambda: datetime(2026, 7, 15, 22, tzinfo=SHANGHAI),
         sleep_fn=lambda _seconds: None,
     )
     assert first.status == "failed", first.waiting_reason

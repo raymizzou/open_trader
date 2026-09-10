@@ -14243,7 +14243,7 @@ def test_a_share_report_failure_carries_waiting_gap_at_deadline(
     result = run_a_share_trend_report(
         config=trend_config(tmp_path),
         run_date="2026-07-14",
-        now_fn=lambda: datetime(2026, 7, 14, 19, tzinfo=SHANGHAI),
+        now_fn=lambda: datetime(2026, 7, 14, 22, tzinfo=SHANGHAI),
         sleep_fn=lambda _seconds: None,
     )
     assert result.status == "failed"
@@ -14953,7 +14953,7 @@ def test_missing_industry_row_excludes_only_affected_candidate(
 def test_industry_snapshot_failure_blocks_report(tmp_path: Path) -> None:
     result = run_a_share_trend_report(
         config=trend_config(tmp_path), run_date="2026-07-14",
-        now_fn=lambda: datetime(2026, 7, 14, 21, 10, tzinfo=SHANGHAI),
+        now_fn=lambda: datetime(2026, 7, 14, 22, 0, tzinfo=SHANGHAI),
         api_factory=lambda **kwargs: ReadyApi(
             [], industry_error=TrendAnimalsError("industry unavailable")
         ),
@@ -15940,7 +15940,7 @@ def test_cn_legacy_allocation_v1_revision_uses_legacy_fallback(
         run_date="2026-07-14",
         revision=True,
         quote_factory=LegacyQuote,
-        now_fn=lambda: datetime(2026, 7, 14, 19, 0, tzinfo=SHANGHAI),
+        now_fn=lambda: datetime(2026, 7, 14, 22, 0, tzinfo=SHANGHAI),
         notifier=RecordingFeishu(),
     )
 
@@ -16532,7 +16532,7 @@ def test_report_runner_waits_once_then_retries_until_ready(tmp_path: Path) -> No
     assert calls[:4] == ["futu.calendar", "api.update_status", "futu.calendar", "api.update_status"]
 
 
-def test_report_runner_failure_owns_day_at_inclusive_1900_deadline(tmp_path: Path) -> None:
+def test_report_runner_failure_owns_day_at_inclusive_2200_deadline(tmp_path: Path) -> None:
     calls: list[str] = []
     sleeps: list[float] = []
     feishu = RecordingFeishu()
@@ -16550,7 +16550,7 @@ def test_report_runner_failure_owns_day_at_inclusive_1900_deadline(tmp_path: Pat
 
     times = iter([
         datetime(2026, 7, 14, 17, 50, tzinfo=SHANGHAI),
-        datetime(2026, 7, 14, 19, 0, tzinfo=SHANGHAI),
+        datetime(2026, 7, 14, 22, 0, tzinfo=SHANGHAI),
     ])
     result = run_a_share_trend_report(
         config=config, run_date="2026-07-14", now_fn=lambda: next(times),
@@ -16576,11 +16576,85 @@ def test_report_runner_failure_owns_day_at_inclusive_1900_deadline(tmp_path: Pat
     assert not list((tmp_path / "reports").rglob("*.json"))
 
 
+def test_report_runner_keeps_waiting_after_2100_before_2200_deadline(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    sleeps: list[float] = []
+    feishu = RecordingFeishu()
+    macos = RecordingMacOS()
+    notifier = CompositeNotifier([feishu, macos])
+    config = trend_config(tmp_path)
+
+    attempts = iter([False, True])
+    times = iter([
+        datetime(2026, 7, 14, 21, 30, tzinfo=SHANGHAI),
+        datetime(2026, 7, 14, 21, 45, tzinfo=SHANGHAI),
+    ])
+    result = run_a_share_trend_report(
+        config=config, run_date="2026-07-14", now_fn=lambda: next(times),
+        sleep_fn=sleeps.append,
+        api_factory=lambda **kwargs: ReadyApi(calls, ready=next(attempts)),
+        quote_factory=lambda **kwargs: ReadyQuote(calls), notifier=notifier,
+    )
+    assert result.status != "failed"
+    assert result.status == "generated"
+    assert sleeps == [600.0]
+    macos_titles = [title for title, _ in macos.messages]
+    assert "A股趋势数据等待中" in macos_titles
+    assert "A股趋势计划失败" not in macos_titles
+    assert all("A股趋势报告生成失败" not in title for title, _ in feishu.messages)
+
+
+def test_report_runner_fails_at_2200_deadline_with_failure_notice(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    sleeps: list[float] = []
+    feishu = RecordingFeishu()
+    macos = RecordingMacOS()
+    notifier = CompositeNotifier([feishu, macos])
+    config = trend_config(tmp_path)
+
+    class StaleMarketApi(ReadyApi):
+        def get_update_status(self) -> list[dict[str, object]]:
+            return [
+                {"asset": "A股", "asOfDate": "2026-07-13"},
+                {"asset": "ETF基金", "asOfDate": "2026-07-13"},
+                {"asset": "REITs", "asOfDate": "2026-07-14"},
+            ]
+
+    times = iter([
+        datetime(2026, 7, 14, 21, 30, tzinfo=SHANGHAI),
+        datetime(2026, 7, 14, 22, 0, tzinfo=SHANGHAI),
+    ])
+    result = run_a_share_trend_report(
+        config=config, run_date="2026-07-14", now_fn=lambda: next(times),
+        sleep_fn=sleeps.append, api_factory=lambda **kwargs: StaleMarketApi(calls),
+        quote_factory=lambda **kwargs: ReadyQuote(calls), notifier=notifier,
+    )
+    assert result.status == "failed"
+    assert result.waiting_reason == "A股 2026-07-13 → 2026-07-14，ETF基金 2026-07-13 → 2026-07-14"
+    assert sleeps == [600.0]
+    assert [title for title, _ in macos.messages] == ["A股趋势数据等待中", "A股趋势计划失败"]
+    assert feishu.messages == [
+        (
+            "【需处理｜东方财富｜A股趋势报告生成失败｜2026-07-14】",
+            "发生：趋势报告未生成\n"
+            "影响：不能依据旧报告交易\n"
+            "现在做：确认 Trend Animals 数据状态后手动重跑东方财富报告\n"
+            "原因：趋势数据在截止时间前仍未更新",
+        )
+    ]
+    ledger = config.data_dir / "trend_a_share/daily_delivery/2026-07-14.json"
+    assert json.loads(ledger.read_text(encoding="utf-8"))["status"] == "sent"
+
+
 def test_report_runner_retries_systemic_futu_failure_through_deadline(tmp_path: Path) -> None:
     calls: list[str] = []
     times = iter([
         datetime(2026, 7, 14, 17, 50, tzinfo=SHANGHAI),
-        datetime(2026, 7, 14, 19, 0, tzinfo=SHANGHAI),
+        datetime(2026, 7, 14, 22, 0, tzinfo=SHANGHAI),
     ])
     result = run_a_share_trend_report(
         config=trend_config(tmp_path), run_date="2026-07-14", now_fn=lambda: next(times),
@@ -17739,7 +17813,7 @@ def test_report_runner_degrades_beijing_holding_kline_value_error(
 def test_report_runner_snapshot_date_mismatch_uses_deadline_contract(tmp_path: Path) -> None:
     result = run_a_share_trend_report(
         config=trend_config(tmp_path), run_date="2026-07-14",
-        now_fn=lambda: datetime(2026, 7, 14, 21, 10, tzinfo=SHANGHAI),
+        now_fn=lambda: datetime(2026, 7, 14, 22, 0, tzinfo=SHANGHAI),
         api_factory=lambda **kwargs: ReadyApi([], snapshot_date="2026-07-13"),
         quote_factory=lambda **kwargs: ReadyQuote([]), notifier=RecordingMacOS(),
     )
@@ -17757,7 +17831,7 @@ def test_report_runner_rejects_snapshot_tm_id_integrity_failures(
 ) -> None:
     result = run_a_share_trend_report(
         config=trend_config(tmp_path), run_date="2026-07-14",
-        now_fn=lambda: datetime(2026, 7, 14, 21, 10, tzinfo=SHANGHAI),
+        now_fn=lambda: datetime(2026, 7, 14, 22, 0, tzinfo=SHANGHAI),
         api_factory=lambda **kwargs: ReadyApi([], snapshot_ids=snapshot_ids),
         quote_factory=lambda **kwargs: ReadyQuote([]), notifier=RecordingMacOS(),
     )
@@ -17769,7 +17843,7 @@ def test_report_runner_retries_systemic_kline_outage_without_formal_report(tmp_p
     outage = FutuQuoteError("network down", error_type="quote_server_interrupted")
     result = run_a_share_trend_report(
         config=trend_config(tmp_path), run_date="2026-07-14",
-        now_fn=lambda: datetime(2026, 7, 14, 21, 10, tzinfo=SHANGHAI),
+        now_fn=lambda: datetime(2026, 7, 14, 22, 0, tzinfo=SHANGHAI),
         api_factory=lambda **kwargs: ReadyApi([]),
         quote_factory=lambda **kwargs: ReadyQuote(
             [], failed_klines={"SH.000001"}, kline_error=outage
@@ -17783,7 +17857,7 @@ def test_report_runner_retries_systemic_kline_outage_without_formal_report(tmp_p
 def test_report_runner_rejects_invalid_live_billing_price(tmp_path: Path) -> None:
     result = run_a_share_trend_report(
         config=trend_config(tmp_path), run_date="2026-07-14",
-        now_fn=lambda: datetime(2026, 7, 14, 21, 10, tzinfo=SHANGHAI),
+        now_fn=lambda: datetime(2026, 7, 14, 22, 0, tzinfo=SHANGHAI),
         api_factory=lambda **kwargs: ReadyApi([], invalid_billing=True),
         quote_factory=lambda **kwargs: ReadyQuote([]), notifier=RecordingMacOS(),
     )
@@ -17798,7 +17872,7 @@ def test_report_runner_rejects_catalog_cost_drift_before_paid_snapshots(
     result = run_a_share_trend_report(
         config=trend_config(tmp_path),
         run_date="2026-07-14",
-        now_fn=lambda: datetime(2026, 7, 14, 21, 10, tzinfo=SHANGHAI),
+        now_fn=lambda: datetime(2026, 7, 14, 22, 0, tzinfo=SHANGHAI),
         api_factory=lambda **kwargs: ReadyApi(
             calls, catalog_unit_cost="0.072"
         ),
@@ -17968,7 +18042,7 @@ def test_report_runner_redacts_api_key_from_all_outputs(tmp_path: Path) -> None:
 
     result = run_a_share_trend_report(
         config=config, run_date="2026-07-14",
-        now_fn=lambda: datetime(2026, 7, 14, 21, 10, tzinfo=SHANGHAI),
+        now_fn=lambda: datetime(2026, 7, 14, 22, 0, tzinfo=SHANGHAI),
         api_factory=lambda **kwargs: SecretApi([]),
         quote_factory=lambda **kwargs: ReadyQuote([]), notifier=notifier,
     )
@@ -18277,7 +18351,7 @@ def test_cn_v17_report_rejects_stale_only_reits_pool(tmp_path: Path) -> None:
     result = run_a_share_trend_report(
         config=config,
         run_date="2026-07-14",
-        now_fn=lambda: datetime(2026, 7, 14, 19, 0, tzinfo=SHANGHAI),
+        now_fn=lambda: datetime(2026, 7, 14, 22, 0, tzinfo=SHANGHAI),
         allocation_reference=allocation,
         api_factory=lambda **_kwargs: StaleOnlyReitsApi([]),
         quote_factory=lambda **_kwargs: ReadyQuote([]),
@@ -18477,7 +18551,7 @@ def test_cn_runner_reports_reit_update_gap_at_deadline(tmp_path: Path) -> None:
     now_values = iter(
         (
             datetime(2026, 7, 14, 17, 50, tzinfo=SHANGHAI),
-            datetime(2026, 7, 14, 19, 0, tzinfo=SHANGHAI),
+            datetime(2026, 7, 14, 22, 0, tzinfo=SHANGHAI),
         )
     )
     sleeps: list[float] = []

@@ -4341,6 +4341,105 @@ def test_controller_attempts_statistics_then_always_generates_report(
     assert calls[:2] == ["statistics", "report"]
 
 
+def evening_cn_cycle() -> ControllerCycle:
+    return ControllerCycle(
+        market="CN",
+        as_of_date="2026-07-20",
+        execution_date="2026-07-21",
+        report_run_date="2026-07-20",
+        session="closed",
+        market_open=False,
+        next_check_at=datetime.fromisoformat("2026-07-20T21:00:05+08:00"),
+    )
+
+
+def write_evening_cn_report(config: DailyPremarketConfig) -> None:
+    path = config.reports_dir / "trend_a_share" / "2026-07-20.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            valid_cn_report(as_of_date="2026-07-20", execution_date="2026-07-21")
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_cn_report_generation_waits_until_2100_same_day(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    patch_cycle(monkeypatch, evening_cn_cycle())
+    calls: list[str] = []
+    monkeypatch.setattr(
+        controller,
+        "_generate_report",
+        lambda *_args, **_kwargs: calls.append("report")
+        or write_evening_cn_report(config),
+    )
+    monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
+
+    result = run_trend_market_controller(
+        config,
+        "CN",
+        once=True,
+        now_fn=lambda: datetime.fromisoformat("2026-07-20T20:59:00+08:00"),
+    )
+
+    assert calls == []
+    assert result["phase"] != "blocked"
+
+
+def test_cn_report_generation_submits_at_2100_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    patch_cycle(monkeypatch, evening_cn_cycle())
+    calls: list[str] = []
+    monkeypatch.setattr(
+        controller,
+        "_generate_report",
+        lambda *_args, **_kwargs: calls.append("report")
+        or write_evening_cn_report(config),
+    )
+    monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
+
+    result = run_trend_market_controller(
+        config,
+        "CN",
+        once=True,
+        now_fn=lambda: datetime.fromisoformat("2026-07-20T21:00:00+08:00"),
+    )
+
+    assert calls == ["report"]
+    assert result["phase"] != "blocked"
+
+
+def test_us_report_generation_is_not_gated_before_2100(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    patch_cycle(
+        monkeypatch,
+        replace(active_cn_cycle(), market="US", report_run_date="2026-07-20"),
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(
+        controller,
+        "_generate_report",
+        lambda *_args, **_kwargs: calls.append("report") or write_report(config),
+    )
+    monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
+
+    run_trend_market_controller(
+        config,
+        "US",
+        once=True,
+        now_fn=lambda: datetime.fromisoformat("2026-07-20T16:30:00-04:00"),
+    )
+
+    assert calls == ["report"]
+
+
 def test_statistics_failure_does_not_become_report_or_controller_blocker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5698,7 +5797,7 @@ def test_failed_report_retry_uses_current_cycle_after_cycle_advances(
         lambda *_args, **_kwargs: {"status": "completed"},
     )
     before_close = datetime.fromisoformat("2026-07-20T14:59:00+08:00")
-    after_close = datetime.fromisoformat("2026-07-20T15:01:00+08:00")
+    after_close = datetime.fromisoformat("2026-07-20T21:01:00+08:00")
     times = iter((before_close, before_close, after_close, after_close))
     calls: list[str] = []
     failed = threading.Event()
@@ -6326,7 +6425,7 @@ def test_report_future_crossing_cycle_never_executes_old_report(
 
     monkeypatch.setattr(controller, "FutuQuoteClient", Quote)
     before_close = datetime.fromisoformat("2026-07-20T14:59:00+08:00")
-    after_close = datetime.fromisoformat("2026-07-20T15:01:00+08:00")
+    after_close = datetime.fromisoformat("2026-07-20T21:01:00+08:00")
     execution_open = datetime.fromisoformat("2026-07-21T09:31:00+08:00")
     times = iter(
         (before_close, before_close, after_close, execution_open, execution_open)

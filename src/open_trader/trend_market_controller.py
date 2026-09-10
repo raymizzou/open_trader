@@ -121,6 +121,9 @@ BUY_WINDOWS = {
     "US": (time(9, 30), time(16, 0)),
 }
 TIMEZONES = {"CN": ZoneInfo("Asia/Shanghai"), **MARKET_TIMEZONES}
+# CN/HK 报告改为不早于当天 21:00 生成（当晚 19:00 持仓录入后采用）；
+# US 不设闸门。隔天 catch-up 不受限制。
+_REPORT_GENERATION_NOT_BEFORE = {"CN": time(21, 0), "HK": time(21, 0)}
 
 
 @dataclass(frozen=True)
@@ -5348,9 +5351,15 @@ def run_trend_market_controller(
                 can_start = (
                     report_retry_after is None or now >= report_retry_after
                 )
+                not_before = _REPORT_GENERATION_NOT_BEFORE.get(market)
+                report_generation_deferred = not_before is not None and (
+                    work_cycle.report_run_date == local.date().isoformat()
+                    and local.time() < not_before
+                )
                 if (
                     future is None
                     and can_start
+                    and not report_generation_deferred
                     and (
                         allocation_retry_after is None
                         or now >= allocation_retry_after
