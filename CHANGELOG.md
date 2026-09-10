@@ -5,6 +5,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-10
 
+- 修复 `trend-drawdown-unlock` 对 allocation 时代策略的解析缺陷：官方人工解锁命令
+  不再自行解析策略版本（allocation 时代会解析到老代策略，导致对现行策略永远报
+  「需要已存在的暂停记录」而无法解锁），改为读取该市场最新已发布趋势报告 JSON 中
+  记录的 strategy_id / strategy_version——解锁语义即「解锁最新报告实际在用的策略」；
+  无可用报告时明确报错退出（fail-closed），不回退老代解析。账户净值加载、审计
+  事件与 rebase 语义不变。
 - 飞书通知降噪：预测套利健康检查从「每 2 小时必发」改为「状态变化才告警 +
   每日一条摘要」。PASS 静默；同一指纹 24 小时至多提醒 1 条；非 PASS 持续
   ≥30 分钟后恢复才补发一条恢复消息；60 分钟窗口内第 3 次起抑制指纹横跳。

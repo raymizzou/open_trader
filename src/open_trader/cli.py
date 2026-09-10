@@ -186,6 +186,56 @@ def _drawdown_preflight_now() -> datetime:
     return datetime.now().astimezone()
 
 
+_TREND_REPORT_DIRECTORIES = {
+    "CN": "trend_a_share",
+    "HK": "trend_hk_phillips",
+    "US": "trend_us_futu",
+}
+_TREND_REPORT_STEM = re.compile(
+    r"^(?P<date>\d{4}-\d{2}-\d{2})(?:-r(?P<revision>\d+))?$"
+)
+
+
+def _latest_trend_report(reports_dir: Path, market: str) -> Path:
+    directory = reports_dir / _TREND_REPORT_DIRECTORIES[market]
+    candidates: list[tuple[tuple[str, int], Path]] = []
+    if directory.is_dir():
+        for path in directory.glob("*.json"):
+            match = _TREND_REPORT_STEM.fullmatch(path.stem)
+            if match is not None:
+                candidates.append(
+                    ((match.group("date"), int(match.group("revision") or 0)), path)
+                )
+    if not candidates:
+        raise ValueError(
+            f"no trend report found for market {market} under {directory}"
+        )
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def _latest_report_strategy_key(reports_dir: Path, market: str) -> tuple[str, str]:
+    path = _latest_trend_report(reports_dir, market)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"unreadable trend report for market {market}: {path}"
+        ) from exc
+    snapshot = payload.get("strategy_snapshot") if isinstance(payload, dict) else None
+    strategy_id = snapshot.get("strategy_id") if isinstance(snapshot, dict) else None
+    strategy_version = (
+        snapshot.get("strategy_version") if isinstance(snapshot, dict) else None
+    )
+    if not (
+        isinstance(strategy_id, str) and strategy_id
+        and isinstance(strategy_version, str) and strategy_version
+    ):
+        raise ValueError(
+            f"trend report for market {market} records no strategy keys: {path}"
+        )
+    return strategy_id, strategy_version
+
+
 def _trend_curve_daily_now() -> datetime:
     return datetime.now(ZoneInfo("Asia/Shanghai"))
 
@@ -2328,25 +2378,14 @@ def main(argv: list[str] | None = None) -> int:
                 market=args.market,
                 expected_date=expected_date,
             )
-            pool_ids = {
-                "CN": (
-                    config.trend_animals_a_share_tm_id,
-                    config.trend_animals_etf_tm_id,
-                ),
-                "US": config.trend_animals_us_tm_ids,
-                "HK": config.trend_animals_hk_tm_ids,
-            }[args.market]
-            strategy = live_trend_strategy_snapshot(
-                args.market,
-                _process_version(config.repo),
-                pool_ids,
-                execution_date=expected_date,
+            strategy_id, strategy_version = _latest_report_strategy_key(
+                config.reports_dir, args.market
             )
             result = manual_unlock_strategy_drawdown(
                 config.data_dir,
                 market=args.market,
-                strategy_id=strategy["strategy_id"],
-                strategy_version=strategy["strategy_version"],
+                strategy_id=strategy_id,
+                strategy_version=strategy_version,
                 current_equity=account.net_value,
                 occurred_at=occurred_at,
                 event_id=args.event_id,

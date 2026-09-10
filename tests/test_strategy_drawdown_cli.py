@@ -23,6 +23,7 @@ def test_trend_drawdown_unlock_cli_writes_and_prints_audited_rebase(
     config_path = tmp_path / "daily.env"
     config = SimpleNamespace(
         data_dir=data_dir,
+        reports_dir=tmp_path / "reports",
         futu_host="127.0.0.1",
         futu_port=11111,
         repo=tmp_path,
@@ -33,10 +34,18 @@ def test_trend_drawdown_unlock_cli_writes_and_prints_audited_rebase(
         trend_animals_hk_tm_ids=(622494,),
     )
     account_calls: list[dict[str, object]] = []
-    strategy_calls: list[tuple[str, str, tuple[int, ...]]] = []
-    strategy_execution_dates: list[str | None] = []
     clock = ["2026-07-20T09:30:00+08:00"]
     account_equity = ["95000"]
+
+    cn_report = config.reports_dir / "trend_a_share" / "2026-07-17.json"
+    cn_report.parent.mkdir(parents=True)
+    cn_report.write_text(json.dumps({
+        "metadata": {"market": "CN"},
+        "strategy_snapshot": {
+            "strategy_id": "trend_animals_warm_to_hot/CN/v4",
+            "strategy_version": "v4",
+        },
+    }), encoding="utf-8")
 
     monkeypatch.setattr(cli, "load_env_config", lambda path, dry_run: config)
     monkeypatch.setattr(cli, "require_trend_review_config", lambda cfg, market: 101)
@@ -51,18 +60,15 @@ def test_trend_drawdown_unlock_cli_writes_and_prints_audited_rebase(
         account_calls.append(kwargs)
         return SimpleNamespace(net_value=Decimal(account_equity[0]))
 
-    def strategy_snapshot(
-        market: str, process_version: str, pool_ids: tuple[int, ...], **kwargs: object
+    def unexpected_strategy_snapshot(
+        market: str, process_version: str, pool_ids: object, **kwargs: object
     ) -> dict[str, object]:
-        strategy_calls.append((market, process_version, pool_ids))
-        strategy_execution_dates.append(kwargs.get("execution_date"))
-        return {
-            "strategy_id": "trend_animals_warm_to_hot/CN/v4",
-            "strategy_version": "v4",
-        }
+        raise AssertionError("unlock must not resolve the strategy via a live snapshot")
 
     monkeypatch.setattr(cli, "load_futu_simulate_trend_account", load_account)
-    monkeypatch.setattr(cli, "live_trend_strategy_snapshot", strategy_snapshot)
+    monkeypatch.setattr(
+        cli, "live_trend_strategy_snapshot", unexpected_strategy_snapshot
+    )
 
     automatic_bootstrap_strategy_drawdown(
         data_dir,
@@ -107,10 +113,6 @@ def test_trend_drawdown_unlock_cli_writes_and_prints_audited_rebase(
         "market": "CN",
         "expected_date": "2026-07-20",
     }]
-    assert strategy_calls == [
-        ("CN", "accepted-sha", (622466, 697199)),
-    ]
-    assert strategy_execution_dates == ["2026-07-20"]
     state = json.loads(
         (data_dir / "trend_drawdown" / "state.json").read_text(encoding="utf-8")
     )
@@ -129,6 +131,287 @@ def test_trend_drawdown_unlock_cli_writes_and_prints_audited_rebase(
     assert retry_output["high_water_mark"] == "95000"
     assert state_path.read_bytes() == state_before_retry
     assert account_calls[-1]["expected_date"] == "2026-07-21"
+
+
+def test_trend_drawdown_unlock_cli_fails_closed_without_any_trend_report(
+    tmp_path: Path, capsys, monkeypatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    config_path = tmp_path / "daily.env"
+    config = SimpleNamespace(
+        data_dir=data_dir,
+        reports_dir=tmp_path / "reports",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        repo=tmp_path,
+        timezone="Asia/Shanghai",
+        trend_animals_a_share_tm_id=622466,
+        trend_animals_etf_tm_id=697199,
+        trend_animals_us_tm_ids=(622460,),
+        trend_animals_hk_tm_ids=(622494,),
+    )
+    strategy_calls: list[str] = []
+    clock = ["2026-09-09T21:30:00+08:00"]
+
+    monkeypatch.setattr(cli, "load_env_config", lambda path, dry_run: config)
+    monkeypatch.setattr(cli, "require_trend_review_config", lambda cfg, market: 101)
+    monkeypatch.setattr(cli, "_process_version", lambda repo: "accepted-sha")
+    monkeypatch.setattr(
+        cli,
+        "_drawdown_unlock_now",
+        lambda timezone: datetime.fromisoformat(clock[0]),
+    )
+
+    def load_account(**kwargs: object) -> object:
+        return SimpleNamespace(net_value=Decimal("95000"))
+
+    def strategy_snapshot(
+        market: str, process_version: str, pool_ids: object, **kwargs: object
+    ) -> dict[str, object]:
+        strategy_calls.append(str(market))
+        return {
+            "strategy_id": "trend_animals_warm_to_hot/US/v14",
+            "strategy_version": "v14",
+        }
+
+    monkeypatch.setattr(cli, "load_futu_simulate_trend_account", load_account)
+    monkeypatch.setattr(cli, "live_trend_strategy_snapshot", strategy_snapshot)
+
+    automatic_bootstrap_strategy_drawdown(
+        data_dir,
+        market="US",
+        strategy_id="trend_animals_warm_to_hot/US/v14",
+        strategy_version="v14",
+        parameters={"drawdown_limit": "0.05"},
+        baseline_equity=Decimal("100000"),
+        source_date="2026-09-04",
+        accepted_git_sha="a" * 40,
+        actor="deployment",
+        occurred_at="2026-09-09T08:00:00+08:00",
+        reason="first_activation",
+        entry_eligible_from="2026-09-09",
+    )
+    observe_strategy_equity(
+        data_dir,
+        market="US",
+        strategy_id="trend_animals_warm_to_hot/US/v14",
+        strategy_version="v14",
+        current_equity=Decimal("90000"),
+        observed_at="2026-09-09T09:00:00+08:00",
+    )
+
+    state_path = data_dir / "trend_drawdown" / "state.json"
+    state_before = state_path.read_bytes()
+    argv = [
+        "trend-drawdown-unlock",
+        "--config", str(config_path),
+        "--market", "US",
+        "--event-id", "unlock-us-v14-fail-closed",
+        "--actor", "ray",
+    ]
+
+    assert cli.main(argv) == 1
+    captured = capsys.readouterr()
+    assert str(config.reports_dir / "trend_us_futu") in captured.err
+    assert strategy_calls == []
+    assert state_path.read_bytes() == state_before
+
+
+def test_trend_drawdown_unlock_cli_unlocks_strategy_recorded_by_latest_report(
+    tmp_path: Path, capsys, monkeypatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    config_path = tmp_path / "daily.env"
+    config = SimpleNamespace(
+        data_dir=data_dir,
+        reports_dir=tmp_path / "reports",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        repo=tmp_path,
+        timezone="Asia/Shanghai",
+        trend_animals_a_share_tm_id=622466,
+        trend_animals_etf_tm_id=697199,
+        trend_animals_us_tm_ids=(622460,),
+        trend_animals_hk_tm_ids=(622494,),
+    )
+    strategy_calls: list[str] = []
+    clock = ["2026-09-09T21:30:00+08:00"]
+
+    monkeypatch.setattr(cli, "load_env_config", lambda path, dry_run: config)
+    monkeypatch.setattr(cli, "require_trend_review_config", lambda cfg, market: 101)
+    monkeypatch.setattr(cli, "_process_version", lambda repo: "accepted-sha")
+    monkeypatch.setattr(
+        cli,
+        "_drawdown_unlock_now",
+        lambda timezone: datetime.fromisoformat(clock[0]),
+    )
+
+    def load_account(**kwargs: object) -> object:
+        return SimpleNamespace(net_value=Decimal("95000"))
+
+    def strategy_snapshot(
+        market: str, process_version: str, pool_ids: object, **kwargs: object
+    ) -> dict[str, object]:
+        strategy_calls.append(str(market))
+        return {
+            "strategy_id": "trend_animals_warm_to_hot/US/v8",
+            "strategy_version": "v8",
+        }
+
+    monkeypatch.setattr(cli, "load_futu_simulate_trend_account", load_account)
+    monkeypatch.setattr(cli, "live_trend_strategy_snapshot", strategy_snapshot)
+
+    us_report = config.reports_dir / "trend_us_futu" / "2026-09-09.json"
+    us_report.parent.mkdir(parents=True)
+    us_report.write_text(json.dumps({
+        "metadata": {"market": "US"},
+        "strategy_snapshot": {
+            "strategy_id": "trend_animals_warm_to_hot/US/v14",
+            "strategy_version": "v14",
+        },
+    }), encoding="utf-8")
+
+    automatic_bootstrap_strategy_drawdown(
+        data_dir,
+        market="US",
+        strategy_id="trend_animals_warm_to_hot/US/v14",
+        strategy_version="v14",
+        parameters={"drawdown_limit": "0.05"},
+        baseline_equity=Decimal("100000"),
+        source_date="2026-09-04",
+        accepted_git_sha="a" * 40,
+        actor="deployment",
+        occurred_at="2026-09-09T08:00:00+08:00",
+        reason="first_activation",
+        entry_eligible_from="2026-09-09",
+    )
+    observe_strategy_equity(
+        data_dir,
+        market="US",
+        strategy_id="trend_animals_warm_to_hot/US/v14",
+        strategy_version="v14",
+        current_equity=Decimal("90000"),
+        observed_at="2026-09-09T09:00:00+08:00",
+    )
+
+    result = cli.main([
+        "trend-drawdown-unlock",
+        "--config", str(config_path),
+        "--market", "US",
+        "--event-id", "unlock-us-v14-001",
+        "--actor", "ray",
+    ])
+
+    assert result == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["entry_allowed"] is True
+    assert output["high_water_mark"] == "95000"
+    assert output["pause_reason"] == ""
+    assert strategy_calls == []
+    state = json.loads(
+        (data_dir / "trend_drawdown" / "state.json").read_text(encoding="utf-8")
+    )
+    unlock_event = next(
+        event for event in state["audit_events"]
+        if event["event_type"] == "manual_unlock"
+    )
+    assert unlock_event["strategy_id"] == "trend_animals_warm_to_hot/US/v14"
+    assert unlock_event["strategy_version"] == "v14"
+    assert unlock_event["rebased_high_water_mark"] == "95000"
+
+
+def test_trend_drawdown_unlock_cli_prefers_latest_report_revision(
+    tmp_path: Path, capsys, monkeypatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    config_path = tmp_path / "daily.env"
+    config = SimpleNamespace(
+        data_dir=data_dir,
+        reports_dir=tmp_path / "reports",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        repo=tmp_path,
+        timezone="Asia/Shanghai",
+        trend_animals_a_share_tm_id=622466,
+        trend_animals_etf_tm_id=697199,
+        trend_animals_us_tm_ids=(622460,),
+        trend_animals_hk_tm_ids=(622494,),
+    )
+    clock = ["2026-09-09T21:30:00+08:00"]
+
+    monkeypatch.setattr(cli, "load_env_config", lambda path, dry_run: config)
+    monkeypatch.setattr(cli, "require_trend_review_config", lambda cfg, market: 101)
+    monkeypatch.setattr(cli, "_process_version", lambda repo: "accepted-sha")
+    monkeypatch.setattr(
+        cli,
+        "_drawdown_unlock_now",
+        lambda timezone: datetime.fromisoformat(clock[0]),
+    )
+    monkeypatch.setattr(
+        cli,
+        "load_futu_simulate_trend_account",
+        lambda **kwargs: SimpleNamespace(net_value=Decimal("95000")),
+    )
+    monkeypatch.setattr(
+        cli,
+        "live_trend_strategy_snapshot",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("unlock must not resolve the strategy via a live snapshot")
+        ),
+    )
+
+    us_dir = config.reports_dir / "trend_us_futu"
+    us_dir.mkdir(parents=True)
+    for name, version in (("2026-09-09.json", "v13"), ("2026-09-09-r1.json", "v14")):
+        (us_dir / name).write_text(json.dumps({
+            "metadata": {"market": "US"},
+            "strategy_snapshot": {
+                "strategy_id": f"trend_animals_warm_to_hot/US/{version}",
+                "strategy_version": version,
+            },
+        }), encoding="utf-8")
+
+    automatic_bootstrap_strategy_drawdown(
+        data_dir,
+        market="US",
+        strategy_id="trend_animals_warm_to_hot/US/v14",
+        strategy_version="v14",
+        parameters={"drawdown_limit": "0.05"},
+        baseline_equity=Decimal("100000"),
+        source_date="2026-09-04",
+        accepted_git_sha="a" * 40,
+        actor="deployment",
+        occurred_at="2026-09-09T08:00:00+08:00",
+        reason="first_activation",
+        entry_eligible_from="2026-09-09",
+    )
+    observe_strategy_equity(
+        data_dir,
+        market="US",
+        strategy_id="trend_animals_warm_to_hot/US/v14",
+        strategy_version="v14",
+        current_equity=Decimal("90000"),
+        observed_at="2026-09-09T09:00:00+08:00",
+    )
+
+    assert cli.main([
+        "trend-drawdown-unlock",
+        "--config", str(config_path),
+        "--market", "US",
+        "--event-id", "unlock-us-v14-r1",
+        "--actor", "ray",
+    ]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["strategy_version"] == "v14"
+    state = json.loads(
+        (data_dir / "trend_drawdown" / "state.json").read_text(encoding="utf-8")
+    )
+    unlock_event = next(
+        event for event in state["audit_events"]
+        if event["event_type"] == "manual_unlock"
+    )
+    assert unlock_event["strategy_id"] == "trend_animals_warm_to_hot/US/v14"
+    assert unlock_event["strategy_version"] == "v14"
 
 
 @pytest.mark.parametrize(
