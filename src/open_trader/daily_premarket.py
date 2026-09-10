@@ -109,6 +109,9 @@ class DailyPremarketConfig:
     trend_animals_hk_tm_ids: tuple[int, ...] = ()
     trend_us_symbols: tuple[str, ...] = ()
     trend_hk_symbols: tuple[str, ...] = ()
+    trend_us_excluded_symbols: tuple[str, ...] = ()
+    trend_hk_excluded_symbols: tuple[str, ...] = ()
+    trend_a_share_excluded_symbols: tuple[str, ...] = ()
     trend_review_cn_simulate_acc_id: int = 0
     trend_review_us_simulate_acc_id: int = 0
     trend_review_hk_simulate_acc_id: int = 0
@@ -307,6 +310,15 @@ def load_env_config(path: Path, *, dry_run: bool = False) -> DailyPremarketConfi
         ),
         trend_hk_symbols=_symbol_config(
             values.get("OPEN_TRADER_TREND_HK_SYMBOLS", "")
+        ),
+        trend_us_excluded_symbols=_symbol_config(
+            values.get("OPEN_TRADER_TREND_US_EXCLUDED_SYMBOLS", "")
+        ),
+        trend_hk_excluded_symbols=_symbol_config(
+            values.get("OPEN_TRADER_TREND_HK_EXCLUDED_SYMBOLS", "")
+        ),
+        trend_a_share_excluded_symbols=_symbol_config(
+            values.get("OPEN_TRADER_TREND_A_SHARE_EXCLUDED_SYMBOLS", "")
         ),
         trend_review_cn_simulate_acc_id=review_account_ids["CN"],
         trend_review_us_simulate_acc_id=review_account_ids["US"],

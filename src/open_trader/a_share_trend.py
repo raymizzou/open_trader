@@ -3894,6 +3894,42 @@ def load_futu_simulate_trend_account(
     )
 
 
+def exclude_blacklist_holdings(
+    account: AccountSnapshot,
+    excluded_symbols: Sequence[str],
+) -> tuple[AccountSnapshot, tuple[AccountPosition, ...]]:
+    """Drop blacklist (delisted/suspended) simulated positions from decisions.
+
+    Net value and available cash stay the real account values; only the
+    position rows (and the derived seat count) lose the excluded symbols so
+    they never enter symbol resolution, snapshot requests, holding decisions,
+    portfolio risk, or seat counting.
+    """
+    excluded = {symbol.strip().upper() for symbol in excluded_symbols}
+    if not excluded:
+        return account, ()
+    removed = tuple(
+        position for position in account.positions if position.symbol in excluded
+    )
+    if not removed:
+        return account, ()
+    kept = tuple(
+        position
+        for position in account.positions
+        if position.symbol not in excluded
+    )
+    return (
+        replace(
+            account,
+            positions=kept,
+            position_count=(
+                len(kept) if account.position_count is not None else None
+            ),
+        ),
+        removed,
+    )
+
+
 def atr14(bars: Sequence[DailyKlineBar]) -> Decimal | None:
     valid = [bar for bar in bars if None not in (bar.high, bar.low)]
     if len(valid) < 15:
@@ -8797,6 +8833,23 @@ def render_markdown(report: TrendReport) -> str:
         f"数据日期：{report.as_of_date}｜生成时间：{report.generated_at}｜账户：{freshness}",
         "｜".join(summary_counts),
     ]
+    blacklist_rows = report.metadata.get("trend_blacklist_excluded")
+    blacklist_lines = [
+        (
+            f"黑名单持仓（不参与决策）：{row['symbol']} "
+            f"{format(Decimal(str(row['quantity'])), 'f')} 股"
+        )
+        for row in (
+            blacklist_rows
+            if isinstance(blacklist_rows, Sequence)
+            and not isinstance(blacklist_rows, (str, bytes))
+            else ()
+        )
+        if isinstance(row, Mapping) and row.get("symbol")
+    ]
+    if blacklist_lines:
+        lines.append("")
+        lines.extend(blacklist_lines)
     simulated_plan = report.plan_availability.get("simulated_account")
     if isinstance(simulated_plan, Mapping) and simulated_plan.get("status") == "unavailable":
         lines.extend([
@@ -11021,6 +11074,25 @@ def _reuse_planning_revision(
         except (FutuQuoteError, OSError, RuntimeError, ValueError):
             account = None
         if account is not None:
+            account, excluded_blacklist_positions = exclude_blacklist_holdings(
+                account, config.trend_a_share_excluded_symbols,
+            )
+            if excluded_blacklist_positions:
+                frozen_metadata = inputs.get("metadata")
+                inputs["metadata"] = {
+                    **(
+                        frozen_metadata
+                        if isinstance(frozen_metadata, Mapping)
+                        else {}
+                    ),
+                    "trend_blacklist_excluded": [
+                        {
+                            "symbol": position.symbol,
+                            "quantity": format(position.quantity, "f"),
+                        }
+                        for position in excluded_blacklist_positions
+                    ],
+                }
             serialized_account = _json_value(asdict(account))
             inputs["account"] = serialized_account
             evidence["account"] = serialized_account
@@ -11893,6 +11965,9 @@ def _attempt_report(
                 source_date=run_date,
                 reason=f"模拟盘账户事实不可用：{exc}",
             )
+        account, excluded_blacklist_positions = exclude_blacklist_holdings(
+            account, config.trend_a_share_excluded_symbols,
+        )
         real_holdings = load_real_holding_input(
             account_snapshot,
             "CN",
@@ -12372,6 +12447,19 @@ def _attempt_report(
                     "artifact_sha256": kelly_evidence.artifact_sha256,
                     "statistics_cutoff_at": kelly_evidence.statistics_cutoff_at,
                 },
+                **(
+                    {
+                        "trend_blacklist_excluded": [
+                            {
+                                "symbol": position.symbol,
+                                "quantity": format(position.quantity, "f"),
+                            }
+                            for position in excluded_blacklist_positions
+                        ],
+                    }
+                    if excluded_blacklist_positions
+                    else {}
+                ),
                 **(
                     {"symbol_mapping_schema": TREND_SYMBOL_MAPPING_SCHEMA}
                     if _supports_symbol_mapping_contract(api)

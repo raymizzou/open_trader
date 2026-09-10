@@ -327,6 +327,100 @@ def test_once_market_watcher_returns_abnormal_when_snapshot_fails(
     assert quote.closed is True
 
 
+def test_once_market_watcher_skips_blacklisted_unquotable_holding(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "state.json"
+    write_protection_state(state_path, {
+        "schema_version": 1,
+        "positions": {
+            "CRNX": {"active_line": "11"},
+            "NVDA": {"active_line": "11"},
+        },
+    })
+
+    class Quote:
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            return ["2026-07-16"]
+
+        def get_snapshots(self, symbols: list[str]) -> dict[str, QuoteSnapshot]:
+            assert symbols == ["US.NVDA"]
+            return {"US.NVDA": QuoteSnapshot("US.NVDA", Decimal("12"))}
+
+        def close(self) -> None:
+            pass
+
+    now = datetime(2026, 7, 16, 21, 30, tzinfo=SHANGHAI)
+
+    result = watch_market_protection(
+        market="US",
+        data_dir=tmp_path / "data",
+        portfolio_path=tmp_path / "unused.csv",
+        state_path=state_path,
+        events_path=tmp_path / "events.jsonl",
+        report_lock_path=tmp_path / "report.lock",
+        quote_client=Quote(),
+        notifier=NullNotifier(),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        once=True,
+        excluded_symbols=("CRNX",),
+        now_fn=lambda: now,
+        sleep_fn=lambda _seconds: pytest.fail("once market watcher slept"),
+    )
+
+    assert result.status == "completed"
+    assert result.exception_count == 0
+    assert result.unknown_quote_count == 0
+
+
+def test_once_market_watcher_without_blacklist_stays_abnormal_on_unquotable(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "state.json"
+    write_protection_state(state_path, {
+        "schema_version": 1,
+        "positions": {
+            "CRNX": {"active_line": "11"},
+            "NVDA": {"active_line": "11"},
+        },
+    })
+
+    class Quote:
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            return ["2026-07-16"]
+
+        def get_snapshots(
+            self, _symbols: list[str],
+        ) -> dict[str, QuoteSnapshot]:
+            # CRNX is delisted: no row is ever returned for it.
+            return {"US.NVDA": QuoteSnapshot("US.NVDA", Decimal("12"))}
+
+        def close(self) -> None:
+            pass
+
+    now = datetime(2026, 7, 16, 21, 30, tzinfo=SHANGHAI)
+
+    result = watch_market_protection(
+        market="US",
+        data_dir=tmp_path / "data",
+        portfolio_path=tmp_path / "unused.csv",
+        state_path=state_path,
+        events_path=tmp_path / "events.jsonl",
+        report_lock_path=tmp_path / "report.lock",
+        quote_client=Quote(),
+        notifier=NullNotifier(),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        once=True,
+        now_fn=lambda: now,
+        sleep_fn=lambda _seconds: pytest.fail("once market watcher slept"),
+    )
+
+    assert result.status == "abnormal"
+    assert result.unknown_quote_count == 1
+
+
 def test_once_market_watcher_recovers_after_snapshot_outage_ends(
     tmp_path: Path,
 ) -> None:

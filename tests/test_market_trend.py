@@ -2459,6 +2459,408 @@ def test_market_report_generates_with_one_stale_simulated_holding(
     )
 
 
+def blacklisted_holding_fixtures(
+    held_symbols: tuple[str, ...],
+    *,
+    qty_by_symbol: dict[str, str] | None = None,
+    missing_rows: tuple[str, ...] = (),
+) -> tuple[dict[str, int], type, type, type]:
+    """Api/Quote/AccountClient triples mirroring the stale-holding test.
+
+    ``missing_rows`` names held symbols whose getTickerSnapshot row is absent
+    entirely, like a delisted ticker returning no row at all.
+    """
+    as_of_date = "2026-07-14"
+    execution_date = "2026-07-15"
+    quantities = qty_by_symbol or {}
+    tm_ids = {symbol: index + 2 for index, symbol in enumerate(held_symbols)}
+    symbols_by_tm_id = {tm_id: symbol for symbol, tm_id in tm_ids.items()}
+    omitted_tm_ids = {tm_ids[symbol] for symbol in missing_rows}
+
+    def holding_row(tm_id: int) -> dict[str, object]:
+        symbol = symbols_by_tm_id[tm_id]
+        return {
+            "tmId": tm_id,
+            "tickerName": f"持仓{symbol}",
+            "tickerSymbol": f"{symbol}.US",
+            "asset": "美股",
+            "asOfDate": as_of_date,
+            "tradableFlag": True,
+            "industryName": "科技",
+            "industryTmId": 700001,
+            "priceIndex": "10",
+            "marketCap": "200",
+            "amount1d": "3",
+            "isTrendRightSide": True,
+            "daysSinceTrendEntry": 3,
+            "trendStrengthLocalCurr": "96",
+            "trendTemperaturePrev": "温",
+            "trendTemperatureCurr": "热",
+            "trendPhaseCurr": "立夏",
+            "stopwinFlagByDangerSignal": False,
+            "stopwinFlagByBoilingTemperature": False,
+            "stopwinFlagByPopChampagne": False,
+        }
+
+    class AccountClient(DefaultSimAccountClient):
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                **super().account_snapshot(),
+                "positions": [
+                    {
+                        "code": f"US.{symbol}",
+                        "stock_name": symbol,
+                        "qty": quantities.get(symbol, "100"),
+                        "cost_price": "10",
+                        "market_val": "1000",
+                    }
+                    for symbol in held_symbols
+                ],
+            }
+
+    class Api:
+        ignored_stale_components: tuple[object, ...] = ()
+        searched: list[str] = []
+        snapshot_requests: list[list[int]] = []
+
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def get_update_status(self) -> list[dict[str, object]]:
+            return [
+                {"asset": asset, "asOfDate": as_of_date}
+                for asset in MARKET_UPDATE_ASSETS["US"]
+            ]
+
+        def get_account_balance(self) -> dict[str, object]:
+            return {"balance": "100"}
+
+        def get_components(
+            self, *, tm_id: int, expected_date: str,
+        ) -> list[dict[str, object]]:
+            return []
+
+        def get_favorites_tickers(self) -> list[dict[str, object]]:
+            return []
+
+        def search_exact_symbol(
+            self, symbol: str, *, market: str, expected_date: str,
+        ) -> int:
+            assert (market, expected_date) == ("US", as_of_date)
+            self.searched.append(symbol)
+            return tm_ids[symbol]
+
+        def get_snapshot_billing(self) -> list[dict[str, object]]:
+            return [
+                {
+                    "field": field,
+                    "priceCost": "0.071" if field == "tickerName" else "0",
+                }
+                for field in UNIFIED_TREND_FIELDS + A_SHARE_INDUSTRY_FIELDS
+            ]
+
+        def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
+            fields = tuple(kwargs["fields"])
+            requested = [int(item) for item in kwargs["tm_ids"]]  # type: ignore[union-attr]
+            if fields == A_SHARE_INDUSTRY_FIELDS:
+                return [
+                    {
+                        "tmId": tm_id,
+                        "asOfDate": str(kwargs["expected_date"]),
+                        "trendTemperatureCurr": "热",
+                    }
+                    for tm_id in requested
+                ]
+            if fields == INDUSTRY_STATE_FIELDS:
+                return [
+                    {
+                        "tmId": tm_id,
+                        "asOfDate": str(kwargs["expected_date"]),
+                        "trendTemperatureCurr": "热",
+                        "trendStrengthLocalCurr": "92",
+                        "TrendRightSideCountRatio": "0.191",
+                        "TrendRightSideMktCapRatio": "0.650",
+                    }
+                    for tm_id in requested
+                ]
+            self.snapshot_requests.append(requested)
+            # Delisted tickers return no row at all.
+            return [
+                holding_row(tm_id)
+                for tm_id in requested
+                if tm_id not in omitted_tm_ids
+            ]
+
+        def remember_symbol_row(self, **_kwargs: object) -> None:
+            pass
+
+        def symbol_mapping(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+    class Quote:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            return [as_of_date, execution_date]
+
+        def get_daily_kline(
+            self, _symbol: str, **_kwargs: object,
+        ) -> list[DailyKlineBar]:
+            end = datetime.fromisoformat(as_of_date)
+            return [
+                DailyKlineBar(
+                    date=(end - timedelta(days=14 - index)).date().isoformat(),
+                    open=10,
+                    high=10.1,
+                    low=9.9,
+                    close=10,
+                    volume=100,
+                )
+                for index in range(15)
+            ]
+
+        def get_lot_sizes(self, symbols: list[str]) -> dict[str, int]:
+            return {item: 100 for item in symbols}
+
+        def close(self) -> None:
+            pass
+
+    return tm_ids, Api, Quote, AccountClient
+
+
+def test_market_report_generates_with_blacklisted_missing_holding(
+    tmp_path: Path,
+) -> None:
+    cfg = replace(config(tmp_path), trend_us_excluded_symbols=("CRNX",))
+    unlock_live_drawdown(cfg.data_dir, "US")
+    held_symbols = ("CRNX", *(f"HOLD{index:02d}" for index in range(1, 16)))
+    tm_ids, Api, Quote, AccountClient = blacklisted_holding_fixtures(
+        held_symbols,
+        qty_by_symbol={"CRNX": "717"},
+        missing_rows=("CRNX",),
+    )
+    api = Api()
+    result = run_market_trend_report(
+        config=cfg,
+        market="US",
+        run_date="2026-07-15",
+        notifier=RecordingFeishu(),
+        api_factory=lambda **kwargs: api,
+        quote_factory=Quote,
+        account_factory=AccountClient,
+    )
+
+    assert result.status == "generated", result.waiting_reason
+    assert result.report_path is not None
+    assert result.json_path is not None
+    markdown = result.report_path.read_text(encoding="utf-8")
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    judgments = payload["strategy_judgments"]
+    decisions = judgments["holding_decisions"]
+    assert "黑名单持仓（不参与决策）：CRNX 717 股" in markdown
+    assert markdown.count("CRNX") == 1
+    assert "组合剩余风险不可用" not in markdown
+    assert all(
+        item["symbol"] != "CRNX"
+        for item in (
+            decisions
+            + judgments["formal_actions"]
+            + judgments["top10_candidates"]
+            + judgments.get("risk_skips", [])
+        )
+    )
+    assert "CRNX" not in json.dumps(payload["protection_state"])
+    held_decision = next(
+        item for item in decisions if item["symbol"] == "HOLD01"
+    )
+    assert (held_decision["action"], held_decision["reason"]) == (
+        "HOLD", "trend_intact",
+    )
+    assert all(
+        item["symbol"] != "CRNX"
+        for item in payload["account"]["positions"]
+    )
+    assert payload["account"]["position_count"] == 15
+    assert "CRNX" not in api.searched
+    assert all(
+        tm_ids["CRNX"] not in requested
+        for requested in api.snapshot_requests
+    )
+    assert payload["metadata"]["trend_blacklist_excluded"] == [
+        {"symbol": "CRNX", "quantity": "717"},
+    ]
+
+
+def test_market_report_without_blacklist_still_fails_on_missing_holding_row(
+    tmp_path: Path,
+) -> None:
+    cfg = config(tmp_path)
+    unlock_live_drawdown(cfg.data_dir, "US")
+    held_symbols = ("CRNX", *(f"HOLD{index:02d}" for index in range(1, 16)))
+    _tm_ids, Api, Quote, AccountClient = blacklisted_holding_fixtures(
+        held_symbols,
+        missing_rows=("CRNX",),
+    )
+    result = run_market_trend_report(
+        config=cfg,
+        market="US",
+        run_date="2026-07-15",
+        notifier=RecordingFeishu(),
+        api_factory=Api,
+        quote_factory=Quote,
+        account_factory=AccountClient,
+        now_fn=lambda: datetime(2026, 7, 15, 20, tzinfo=SHANGHAI),
+    )
+
+    assert result.status == "failed"
+    assert "getTickerSnapshot returned mismatched tmIds" in (
+        result.waiting_reason or ""
+    )
+
+
+def test_market_report_blacklist_without_holding_is_inert(
+    tmp_path: Path,
+) -> None:
+    cfg = replace(config(tmp_path), trend_us_excluded_symbols=("CRNX",))
+    unlock_live_drawdown(cfg.data_dir, "US")
+    held_symbols = tuple(f"HOLD{index:02d}" for index in range(1, 16))
+    _tm_ids, Api, Quote, AccountClient = blacklisted_holding_fixtures(
+        held_symbols,
+    )
+    result = run_market_trend_report(
+        config=cfg,
+        market="US",
+        run_date="2026-07-15",
+        notifier=RecordingFeishu(),
+        api_factory=Api,
+        quote_factory=Quote,
+        account_factory=AccountClient,
+    )
+
+    assert result.status == "generated", result.waiting_reason
+    assert result.report_path is not None
+    assert result.json_path is not None
+    markdown = result.report_path.read_text(encoding="utf-8")
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    assert "黑名单持仓（不参与决策）" not in markdown
+    assert "CRNX" not in markdown
+    assert "trend_blacklist_excluded" not in payload["metadata"]
+
+
+def test_market_revision_applies_blacklist_to_reloaded_account(
+    tmp_path: Path,
+) -> None:
+    cfg = replace(config(tmp_path), trend_us_excluded_symbols=("CRNX",))
+    paths = market_paths(cfg.data_dir, cfg.reports_dir, "US")
+    unlock_live_drawdown(cfg.data_dir, "US")
+    held_symbols = ("CRNX", *(f"HOLD{index:02d}" for index in range(1, 16)))
+    _tm_ids, Api, Quote, _AccountClient = blacklisted_holding_fixtures(
+        held_symbols,
+        qty_by_symbol={"CRNX": "717"},
+        missing_rows=("CRNX",),
+    )
+
+    class RevisionSourceApi(Api):
+        # Mirrors the revision-reuse fixtures: no symbol-mapping contract, so
+        # the frozen planning snapshot carries no symbol_mapping_schema.
+        symbol_mapping = None
+        remember_symbol_row = None
+
+    account_calls = 0
+
+    class SimulationAccount:
+        def __init__(self, **kwargs: object) -> None:
+            nonlocal account_calls
+            account_calls += 1
+            self.acc_id = int(kwargs["simulate_acc_id"])
+
+        def account_snapshot(self) -> dict[str, object]:
+            if account_calls == 1:
+                raise RuntimeError("simulation account offline")
+            return {
+                "acc_id": self.acc_id,
+                "net_value": "100000",
+                "cash": "100000",
+                "positions": [
+                    {
+                        "code": f"US.{symbol}",
+                        "stock_name": symbol,
+                        "qty": "717" if symbol == "CRNX" else "100",
+                        "cost_price": "10",
+                        "market_val": "1000",
+                    }
+                    for symbol in held_symbols
+                ],
+            }
+
+        def close(self) -> None:
+            pass
+
+    first = run_market_trend_report(
+        config=cfg,
+        market="US",
+        run_date="2026-07-15",
+        notifier=NullNotifier(),
+        api_factory=RevisionSourceApi,
+        quote_factory=Quote,
+        account_factory=SimulationAccount,
+        now_fn=lambda: datetime(2026, 7, 15, 19, tzinfo=SHANGHAI),
+    )
+
+    assert first.status == "generated", first.waiting_reason
+    assert first.json_path is not None
+    first_payload = json.loads(first.json_path.read_text(encoding="utf-8"))
+    assert first_payload["plan_availability"]["simulated_account"] == {
+        "status": "unavailable",
+        "reason": "模拟盘账户事实不可用：simulation account offline",
+        "executable": False,
+    }
+    paths.state.unlink(missing_ok=True)
+
+    def forbidden(**_kwargs: object) -> object:
+        raise AssertionError("target-day revision must reuse frozen components")
+
+    revised = run_market_trend_report(
+        config=cfg,
+        market="US",
+        run_date="2026-07-15",
+        revision=True,
+        notifier=NullNotifier(),
+        api_factory=forbidden,
+        quote_factory=forbidden,
+        account_factory=SimulationAccount,
+    )
+
+    assert revised.status == "generated"
+    assert revised.report_path is not None
+    assert revised.json_path is not None
+    markdown = revised.report_path.read_text(encoding="utf-8")
+    payload = json.loads(revised.json_path.read_text(encoding="utf-8"))
+    judgments = payload["strategy_judgments"]
+    decisions = judgments["holding_decisions"]
+    assert "黑名单持仓（不参与决策）：CRNX 717 股" in markdown
+    assert markdown.count("CRNX") == 1
+    assert "组合剩余风险不可用" not in markdown
+    assert all(item["symbol"] != "CRNX" for item in decisions)
+    assert all(
+        item["symbol"] != "CRNX"
+        for item in decisions
+        if item["action"] == "MANUAL_REVIEW"
+    )
+    assert payload["account"]["position_count"] == 15
+    assert all(
+        item["symbol"] != "CRNX" for item in payload["account"]["positions"]
+    )
+    assert payload["metadata"]["trend_blacklist_excluded"] == [
+        {"symbol": "CRNX", "quantity": "717"},
+    ]
+    assert "CRNX" not in json.dumps(payload["protection_state"])
+    assert "CRNX" not in json.dumps(
+        trend_module.load_protection_state(paths.state)
+    )
+
+
 @pytest.mark.parametrize(
     ("lookup_fails", "returned_symbol"),
     [

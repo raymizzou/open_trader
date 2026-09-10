@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time as time_module
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, time
@@ -127,7 +127,9 @@ def watch_a_share_protection(
     on_session_open: Callable[[str], None] | None = None,
     on_protection_trigger: Callable[[Mapping[str, object]], None] | None = None,
     send_trigger_feishu: bool = True,
+    excluded_symbols: Collection[str] = (),
 ) -> AShareWatchResult:
+    excluded = {symbol.strip().upper() for symbol in excluded_symbols}
     client = quote_client
     if quote_client_factory is None and client is not None:
         host = getattr(client, "host", None)
@@ -393,6 +395,8 @@ def watch_a_share_protection(
 
             comparable: dict[str, tuple[str, Decimal]] = {}
             for symbol in sorted(positions):
+                if symbol in excluded:
+                    continue
                 active_line = active_lines.get(symbol)
                 if active_line is None:
                     if symbol not in reported_lines:

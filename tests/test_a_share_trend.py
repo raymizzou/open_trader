@@ -2069,6 +2069,53 @@ def test_rotation_cash_does_not_count_signal_sale_twice(tmp_path: Path) -> None:
     ) == ("SELL_ALL", 1, True, "600999", 400)
 
 
+def test_a_share_report_excludes_blacklisted_holding_row_absent(
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        trend_config(tmp_path),
+        trend_a_share_excluded_symbols=("600016",),
+    )
+    unlock_live_drawdown(config.data_dir, strategy_version="v8")
+    calls: list[str] = []
+    api = ReadyApi(calls, snapshot_ids=[1, 2, 600001])
+    result = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: api,
+        quote_factory=lambda **kwargs: ReadyQuote(calls),
+        account_factory=simulation_account_with_positions(
+            "SH.600016", "SH.600001", cash="50000"
+        ),
+        notifier=RecordingFeishu(),
+        now_fn=lambda: datetime(2026, 7, 14, 20, tzinfo=SHANGHAI),
+        sleep_fn=lambda _seconds: None,
+    )
+
+    assert result.status == "generated", result.waiting_reason
+    assert result.report_path is not None
+    assert result.json_path is not None
+    markdown = result.report_path.read_text(encoding="utf-8")
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    judgments = payload["strategy_judgments"]
+    assert "黑名单持仓（不参与决策）：600016 100 股" in markdown
+    assert markdown.count("600016") == 1
+    assert "组合剩余风险不可用" not in markdown
+    assert all(
+        item["symbol"] != "600016"
+        for item in judgments["holding_decisions"]
+    )
+    assert all(
+        item["symbol"] != "600016"
+        for item in judgments["formal_actions"]
+    )
+    assert "api.search.600016" not in calls
+    assert payload["account"]["position_count"] == 1
+    assert payload["metadata"]["trend_blacklist_excluded"] == [
+        {"symbol": "600016", "quantity": "100"},
+    ]
+
+
 def test_real_rotation_sizing_uses_net_value_when_cash_is_negative() -> None:
     simulated_symbols = tuple(f"10{index:04d}" for index in range(10))
     real_symbols = tuple(f"30{index:04d}" for index in range(10))

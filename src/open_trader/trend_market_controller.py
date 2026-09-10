@@ -1611,8 +1611,14 @@ def _run_protection_pass(
             account_loader=account_loader,
             on_protection_trigger=callback,
             send_trigger_feishu=False,
+            excluded_symbols=config.trend_a_share_excluded_symbols,
         )
     paths = market_paths(config.data_dir, config.reports_dir, market)
+    market_excluded_symbols = (
+        config.trend_us_excluded_symbols
+        if market == "US"
+        else config.trend_hk_excluded_symbols
+    )
     simulated_result = watch_market_protection(
         market=market,
         data_dir=config.data_dir,
@@ -1630,6 +1636,7 @@ def _run_protection_pass(
         once=True,
         on_protection_trigger=callback,
         send_trigger_feishu=False,
+        excluded_symbols=market_excluded_symbols,
     )
     if market != "US":
         return simulated_result
@@ -1703,6 +1710,7 @@ def _run_protection_pass(
         once=True,
         on_protection_trigger=None,
         send_trigger_feishu=True,
+        excluded_symbols=market_excluded_symbols,
     )
     return _combine_protection_results(
         (simulated_result, real_result), events_path=paths.events

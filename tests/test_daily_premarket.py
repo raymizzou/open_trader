@@ -201,6 +201,44 @@ def test_load_env_config_defaults_executor_host_to_empty(tmp_path: Path) -> None
     assert load_env_config(env).trend_executor_host == ""
 
 
+def test_load_env_config_parses_trend_excluded_symbols(tmp_path: Path) -> None:
+    base = [
+        f"OPEN_TRADER_REPO={tmp_path}",
+        f"OPEN_TRADER_PYTHON={tmp_path / '.venv/bin/python'}",
+        "OPEN_TRADER_TIMEZONE=Asia/Shanghai",
+        "OPEN_TRADER_DEADLINE=21:10",
+        "OPEN_TRADER_FUTU_HOST=127.0.0.1",
+        "OPEN_TRADER_FUTU_PORT=11111",
+        "DEEPSEEK_API_KEY=secret",
+    ]
+    env = tmp_path / "daily.env"
+    env.write_text("\n".join(base), encoding="utf-8")
+
+    config = load_env_config(env)
+
+    assert config.trend_us_excluded_symbols == ()
+    assert config.trend_hk_excluded_symbols == ()
+    assert config.trend_a_share_excluded_symbols == ()
+
+    env.write_text(
+        "\n".join(
+            [
+                *base,
+                "OPEN_TRADER_TREND_US_EXCLUDED_SYMBOLS=CRNX,ESTC",
+                "OPEN_TRADER_TREND_HK_EXCLUDED_SYMBOLS=00700, 02800",
+                "OPEN_TRADER_TREND_A_SHARE_EXCLUDED_SYMBOLS=600001",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_env_config(env)
+
+    assert config.trend_us_excluded_symbols == ("CRNX", "ESTC")
+    assert config.trend_hk_excluded_symbols == ("00700", "02800")
+    assert config.trend_a_share_excluded_symbols == ("600001",)
+
+
 def test_shared_env_loader_accepts_other_positive_a_share_pool_ids(
     tmp_path: Path,
 ) -> None:

@@ -58,6 +58,7 @@ from .a_share_trend import (
     collect_industry_contexts,
     enrich_real_holding_input,
     evaluate_candidate,
+    exclude_blacklist_holdings,
     fetch_staged_candidates,
     favorite_candidate_ids,
     freeze_report_rotation_pairs,
@@ -866,6 +867,30 @@ def _reuse_market_planning_revision(
         except (FutuQuoteError, OSError, RuntimeError, ValueError):
             account = None
         if account is not None:
+            account, excluded_blacklist_positions = exclude_blacklist_holdings(
+                account,
+                (
+                    config.trend_us_excluded_symbols
+                    if market == "US"
+                    else config.trend_hk_excluded_symbols
+                ),
+            )
+            if excluded_blacklist_positions:
+                frozen_metadata = inputs.get("metadata")
+                inputs["metadata"] = {
+                    **(
+                        frozen_metadata
+                        if isinstance(frozen_metadata, Mapping)
+                        else {}
+                    ),
+                    "trend_blacklist_excluded": [
+                        {
+                            "symbol": position.symbol,
+                            "quantity": format(position.quantity, "f"),
+                        }
+                        for position in excluded_blacklist_positions
+                    ],
+                }
             serialized_account = _json_value(asdict(account))
             inputs["account"] = serialized_account
             evidence["account"] = serialized_account
@@ -1294,6 +1319,14 @@ def _attempt_market_report(
                 source_date=as_of_date,
                 reason=f"模拟盘账户事实不可用：{exc}",
             )
+        account, excluded_blacklist_positions = exclude_blacklist_holdings(
+            account,
+            (
+                config.trend_us_excluded_symbols
+                if market == "US"
+                else config.trend_hk_excluded_symbols
+            ),
+        )
         real_holdings = load_real_holding_input(
             account_snapshot,
             market,
@@ -1862,6 +1895,19 @@ def _attempt_market_report(
                     "artifact_sha256": kelly_evidence.artifact_sha256,
                     "statistics_cutoff_at": kelly_evidence.statistics_cutoff_at,
                 },
+                **(
+                    {
+                        "trend_blacklist_excluded": [
+                            {
+                                "symbol": position.symbol,
+                                "quantity": format(position.quantity, "f"),
+                            }
+                            for position in excluded_blacklist_positions
+                        ],
+                    }
+                    if excluded_blacklist_positions
+                    else {}
+                ),
                 **(
                     {"symbol_mapping_schema": TREND_SYMBOL_MAPPING_SCHEMA}
                     if _supports_symbol_mapping_contract(api)

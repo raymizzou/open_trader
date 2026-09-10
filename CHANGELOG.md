@@ -18,6 +18,26 @@ operator-facing: what changed, which workflow is affected, and what was verified
   到期仍未就绪才走失败通知（日报顺延到约 21:05 是闸门的自然结果）。
   US 报告生成时序与 19:00 截止完全不变；隔天早上的补产/恢复报告不受
   21:00 闸门限制，明早执行不受影响。
+- 趋势报告新增持仓黑名单，修复退市持仓导致的美股全日报告失败：富途模拟盘
+  持有已退市且停牌的 CRNX（717 股）时，Trend Animals 对其不返回快照行，
+  快照集合校验 fail-closed，三市场趋势报告全天重试至截止仍失败。现在可在
+  `daily_premarket.env` 按市场配置 `OPEN_TRADER_TREND_US_EXCLUDED_SYMBOLS` /
+  `OPEN_TRADER_TREND_HK_EXCLUDED_SYMBOLS` /
+  `OPEN_TRADER_TREND_A_SHARE_EXCLUDED_SYMBOLS`（逗号分隔，去市场前缀符号，
+  模板见 `config/daily_premarket.env.example`）：黑名单持仓不做符号解析、
+  不进快照请求、不参与买卖/人工复核决策、不进持仓状态更新，不占持仓席位、
+  不计组合剩余风险（不会触发「组合剩余风险不可用」降级）；报告正文仅保留
+  一行「黑名单持仓（不参与决策）：符号 数量 股」，JSON metadata 记录排除
+  清单。黑名单同步作用于盘中保护监控：`watch_market_protection` /
+  `watch_a_share_protection` 新增 `excluded_symbols`（控制器按市场传入），
+  黑名单符号不再逐只检查行情，退市持仓不再触发「保护监控阻塞/已禁止新买入」
+  告警；未列黑名单的行情缺失仍按原样 abnormal（fail-closed 不变）。黑名单
+  同样作用于同日修订补全路径：原报告因模拟盘账户不可用生成后，修订时重载的
+  账户先按黑名单过滤再进判定/席位/风险/保护状态，修订正文同样渲染黑名单行。
+  非黑名单持仓缺行仍按原样硬失败（`getTickerSnapshot returned mismatched tmIds`
+  守卫不变）。已验证：配置解析、US 事故复现（黑名单生成成功 + 空黑名单仍
+  硬失败 + 黑名单未持仓时不生效）、CN 镜像用例、watch 侧黑名单过滤与负向
+  守卫用例、修订补全路径黑名单用例及全量 Docker `make test`。
 - 飞书通知降噪：预测套利健康检查从「每 2 小时必发」改为「状态变化才告警 +
   每日一条摘要」。PASS 静默；同一指纹 24 小时至多提醒 1 条；非 PASS 持续
   ≥30 分钟后恢复才补发一条恢复消息；60 分钟窗口内第 3 次起抑制指纹横跳。
