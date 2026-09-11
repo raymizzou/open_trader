@@ -19,6 +19,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
   与宿主墙钟彻底解耦并断言未读真实墙钟；生产 `age < 0` 的 fail-closed 语义
   保持不变，生产代码零改动。
   已验证：`make test` 全绿。
+- 保护线触发提醒正文统一：飞书/macOS/音箱三渠道正文改为只由 `render_protection_alert`
+  一处生成（数字两位小数），修复小爱音箱整串朗读 ATR 长小数（26 位）保护线的问题；
+  音箱朗读该正文并在前面保留「名称」一行，macOS 横幅（非重放）改用同一正文，
+  重放提示措辞不变、数字两位化；小爱朗读渲染器改按行解析、纯读取不做取整。
+  已验证：全量 `make test` 8206 通过 0 失败；`make candidate-acceptance` PASS
+  （首跑单点失败为控制器线程时序用例假失败，与本次改动无交集，聚焦复跑与整轮重跑均通过）。
 
 ## 2026-09-10
 

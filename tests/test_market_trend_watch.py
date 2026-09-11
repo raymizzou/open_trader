@@ -828,7 +828,7 @@ def test_market_watcher_uses_hk_account_and_triggers_once(tmp_path: Path) -> Non
     assert voice.messages == [
         (
             "港股保护线触发 · 00700",
-            "名称：腾讯\n最新价 10 <= 活动保护线 11\n建议动作：全部卖出（人工执行）",
+            "名称：腾讯\n最新价：10.00\n活动保护线：11.00\n现在做：人工确认并全部卖出",
         )
     ]
 
@@ -1317,7 +1317,7 @@ def test_market_watcher_uses_us_account_and_queues_voice(tmp_path: Path) -> None
 
     assert result.status == "completed"
     assert voice.messages[0][0] == "美股保护线触发 · NVDA"
-    assert voice.messages[0][1].startswith("名称：NVIDIA\n最新价 ")
+    assert voice.messages[0][1] == "名称：NVIDIA\n最新价：150.00\n活动保护线：151.00\n现在做：人工确认并全部卖出"
 
 
 def test_us_watcher_ignores_unmanaged_futu_holdings_without_protection_seed(

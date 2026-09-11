@@ -970,9 +970,12 @@ def test_feishu_policy_keeps_only_b1_and_preserves_other_channels(tmp_path: Path
     )]
     assert macos.messages == [(
         "A股保护线触发 · 600900",
-        "最新价 27.30 <= 活动保护线 27.31\n建议动作：全部卖出（人工执行）",
+        "最新价：27.30\n活动保护线：27.31\n现在做：人工确认并全部卖出",
     )]
-    assert voice.messages[0][0] == "A股保护线触发 · 600900"
+    assert voice.messages == [(
+        "A股保护线触发 · 600900",
+        "名称：长江电力\n最新价：27.30\n活动保护线：27.31\n现在做：人工确认并全部卖出",
+    )]
 
 
 def test_trigger_queues_one_voice_alert_with_name(tmp_path: Path) -> None:
@@ -989,10 +992,61 @@ def test_trigger_queues_one_voice_alert_with_name(tmp_path: Path) -> None:
     assert voice.messages == [
         (
             "A股保护线触发 · 600900",
-            "名称：长江电力\n最新价 27.30 <= 活动保护线 27.31\n建议动作：全部卖出（人工执行）",
+            "名称：长江电力\n最新价：27.30\n活动保护线：27.31\n现在做：人工确认并全部卖出",
         )
     ]
     assert read_events(events_path)[-1]["event_type"].endswith("queued_xiaoai")
+
+
+def test_trigger_notification_body_shared_across_channels(tmp_path: Path) -> None:
+    feishu = RecordingNotifier()
+    macos = RecordingMacOSNotifier()
+    voice = RecordingXiaoaiNotifier()
+    _deliver_trigger_notification(
+        events_path=tmp_path / "events.jsonl",
+        notifier=CompositeNotifier([feishu, macos, voice]),
+        trading_date="2026-09-11",
+        now=datetime.fromisoformat("2026-09-11T10:00:00+08:00"),
+        symbol="000301",
+        position_name="佛山照明",
+        last_price=Decimal("13.36"),
+        active_line=Decimal("13.36714285714285714285714286"),
+        delivered_feishu=set(),
+        delivered_macos=set(),
+        replay=False,
+        market_label="A股",
+        broker_label="东方财富",
+    )
+    body = "最新价：13.36\n活动保护线：13.37\n现在做：人工确认并全部卖出"
+    assert feishu.messages == [("【紧急｜东方财富｜A股保护线触发｜000301】", body)]
+    assert macos.messages == [("A股保护线触发 · 000301", body)]
+    assert voice.messages == [("A股保护线触发 · 000301", f"名称：佛山照明\n{body}")]
+
+
+def test_voice_reads_feishu_body_when_feishu_channel_suppressed(tmp_path: Path) -> None:
+    feishu = RecordingNotifier()
+    voice = RecordingXiaoaiNotifier()
+    _deliver_trigger_notification(
+        events_path=tmp_path / "events.jsonl",
+        notifier=CompositeNotifier([feishu, voice]),
+        trading_date="2026-09-11",
+        now=datetime.fromisoformat("2026-09-11T10:00:00+08:00"),
+        symbol="000301",
+        position_name="佛山照明",
+        last_price=Decimal("13.36"),
+        active_line=Decimal("13.36714285714285714285714286"),
+        delivered_feishu=set(),
+        delivered_macos=set(),
+        replay=False,
+        send_feishu=False,
+        market_label="A股",
+        broker_label="东方财富",
+    )
+    assert feishu.messages == []
+    assert voice.messages == [(
+        "A股保护线触发 · 000301",
+        "名称：佛山照明\n最新价：13.36\n活动保护线：13.37\n现在做：人工确认并全部卖出",
+    )]
 
 
 def test_voice_failure_is_terminal_without_feishu_follow_up(tmp_path: Path) -> None:

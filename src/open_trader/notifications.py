@@ -188,8 +188,9 @@ def render_xiaoai_voice_notification(title: str, message: str) -> str | None:
     match = re.fullmatch(r"(A股|港股|美股)保护线触发 · ([^·]+)", title)
     if match is None:
         return None
-    prices = re.search(r"最新价\s+([^\s]+)\s*<=\s*活动保护线\s+([^\s]+)", message)
-    if prices is None:
+    last_price = _voice_field(message, "最新价")
+    active_line = _voice_field(message, "活动保护线")
+    if not last_price or not active_line:
         raise NotificationError("Xiaozhi protection voice fields missing")
     market, symbol = match.groups()
     name = _voice_field(message, "名称")
@@ -198,7 +199,6 @@ def render_xiaoai_voice_notification(title: str, message: str) -> str | None:
         if name
         else f"{market}代码{symbol.strip()}"
     )
-    last_price, active_line = prices.groups()
     return (
         f"Open Trader 紧急提醒：{subject}，最新价{last_price}，"
         f"已触及活动保护线{active_line}。建议全部卖出，"

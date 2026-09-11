@@ -18,6 +18,7 @@ from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_symbols import to_futu_symbol
 from .notification_policy import (
     BROKER_LABELS,
+    _numeric_detail,
     brief_zh_detail,
     group_order_alerts,
     render_attention,
@@ -1016,28 +1017,30 @@ def _deliver_trigger_notification(
     market_label: str = "A股",
     broker_label: str = "东方财富",
 ) -> None:
+    alert_title, alert_body = render_protection_alert(
+        broker_label,
+        market_label,
+        symbol,
+        last_price=last_price,
+        active_line=active_line,
+    )
     if replay:
+        line_text = (
+            _numeric_detail(active_line) if active_line is not None else "未知"
+        )
         message = (
-            f"今日已触发活动保护线 {active_line if active_line is not None else '未知'}；"
+            f"今日已触发活动保护线 {line_text}；"
             "此前提醒未完整送达，建议动作：全部卖出（人工执行）"
         )
     else:
-        message = (
-            f"最新价 {last_price} <= 活动保护线 {active_line}\n"
-            "建议动作：全部卖出（人工执行）"
-        )
+        message = alert_body
     trigger_notifications = (
         (
             {"feishu", "feishu_app"},
             "protection_triggered_notification_delivered_feishu",
             delivered_feishu,
-            *render_protection_alert(
-                broker_label,
-                market_label,
-                symbol,
-                last_price=last_price,
-                active_line=active_line,
-            ),
+            alert_title,
+            alert_body,
         ),
     ) if send_feishu else ()
     for channels, event_type, delivered, title, body in (
@@ -1073,17 +1076,13 @@ def _deliver_trigger_notification(
     if replay or not _has_xiaoai_notifier(notifier):
         return
 
-    voice_message = "\n".join(
-        [
-            f"名称：{position_name}",
-            f"最新价 {last_price} <= 活动保护线 {active_line}",
-            "建议动作：全部卖出（人工执行）",
-        ]
+    voice_body = (
+        f"名称：{position_name}\n{alert_body}" if position_name else alert_body
     )
     attempts = send_notification_with_results(
         notifier,
         f"{market_label}保护线触发 · {symbol}",
-        voice_message,
+        voice_body,
         channels={"xiaoai"},
     )
     if not attempts:
