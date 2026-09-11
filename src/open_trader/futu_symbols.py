@@ -92,7 +92,7 @@ def from_trend_animals_symbol(market: str, symbol: str) -> str:
         suffix = normalized_symbol.rsplit(".", 1)[-1]
         if suffix == "US":
             normalized_symbol = normalized_symbol[:-3]
-        elif suffix in KNOWN_PREFIXES:
+        elif "." in normalized_symbol and suffix in KNOWN_PREFIXES:
             raise ValueError(f"invalid US Trend Animals symbol: {symbol}")
         return to_futu_symbol("US", normalized_symbol.replace("_", "."))
     raise ValueError(f"unsupported Futu market: {market}")

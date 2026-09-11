@@ -230,6 +230,27 @@ def test_trend_animals_symbol_accepts_explicit_us_suffix() -> None:
     assert from_trend_animals_symbol("US", "ARWR.US") == "US.ARWR"
 
 
+def test_trend_animals_symbol_accepts_bare_us_prefix_code() -> None:
+    # "SH" is a real US ticker (ProShares Short S&P500 ETF, tmId 711009);
+    # only dotted exchange prefixes must be rejected.
+    assert from_trend_animals_symbol("US", "SH") == "US.SH"
+    assert to_trend_animals_symbol("US", "US.SH") == "SH"
+
+
+def test_trend_animals_symbol_still_rejects_dotted_cn_prefix_for_us() -> None:
+    with pytest.raises(ValueError):
+        from_trend_animals_symbol("US", "600519.SH")
+
+
+def test_trend_animals_symbol_accepts_explicit_us_suffix_for_bare_prefix_code() -> None:
+    assert from_trend_animals_symbol("US", "SH.US") == "US.SH"
+
+
+def test_trend_animals_symbol_still_rejects_bare_us_market_prefix() -> None:
+    with pytest.raises(ValueError):
+        from_trend_animals_symbol("US", "US")
+
+
 def test_trend_animals_symbol_rejects_hk_code_without_futu_padding_zero() -> None:
     with pytest.raises(ValueError):
         to_trend_animals_symbol("HK", "HK.80000")

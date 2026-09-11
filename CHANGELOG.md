@@ -5,6 +5,14 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-11
 
+- 修复美股趋势报告整报失败：温转热池成分里的 `SH` 是真实美股 ETF
+  （ProShares 做空标普500，tmId 711009），却被 `from_trend_animals_symbol`
+  当成上交所前缀误判为非法美股符号，导致当晚美股报告全部失败。现在只有
+  带点号且尾段是交易所前缀（如 `600519.SH`）才拒绝，裸前缀代码（`SH`、
+  `SZ` 等）按美股代码放行；跨市场防呆与显式 `.US` 后缀剥离行为不变。
+  已验证：全量 `make test` 8211 通过 0 失败；`make candidate-acceptance`
+  PASS。宿主 venv 直跑曾见 3 个 prediction_service_launchd 卸载器用例失败，
+  经 Docker 权威门禁排除为宿主环境假失败，与本次改动无关。
 - 修复趋势报告重放崩溃：重放/再生成老 v2 报告（模拟盘账户不可用）且报告带符号
   映射契约（`symbol_mapping_schema`）时，`build_report` 在符号映射过滤段引用
   `use_final_plan_semantics` 触发 `UnboundLocalError`，导致 v2 历史报告无法重放

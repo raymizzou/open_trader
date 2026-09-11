@@ -2692,6 +2692,210 @@ def test_market_report_generates_with_blacklisted_missing_holding(
     ]
 
 
+def test_market_report_generates_with_us_bare_prefix_pool_component_sh(
+    tmp_path: Path,
+) -> None:
+    """Incident repro: US pool component "SH" is a real US ETF, not a CN prefix.
+
+    Production facts (2026-09-11): the US warm-to-hot pool configured in the
+    test config (tmId 622460) returned getComponentTicker rows containing the
+    bare prefix code "SH" (ProShares Short S&P500 ETF, tmId 711009). The whole
+    report must still generate.
+    """
+    cfg = config(tmp_path)
+    unlock_live_drawdown(cfg.data_dir, "US")
+    as_of_date = "2026-07-14"
+    execution_date = "2026-07-15"
+    pool_id = 622460
+
+    pool_rows: list[dict[str, object]] = [
+        {
+            "tmId": 711009,
+            "tickerSymbol": "SH",
+            "tickerName": "ProShares做空标普500ETF",
+            "asset": "美国ETF",
+            "asOfDate": as_of_date,
+        },
+        {
+            "tmId": 710666,
+            "tickerSymbol": "DBMF",
+            "asset": "美国ETF",
+            "asOfDate": as_of_date,
+        },
+    ]
+    ticker_symbols_by_tm_id = {711009: "SH", 710666: "DBMF", 2: "VIXY.US"}
+
+    def component_row(tm_id: int) -> dict[str, object]:
+        return {
+            "tmId": tm_id,
+            "tickerName": "成分股" if tm_id != 2 else "持仓VIXY",
+            "tickerSymbol": ticker_symbols_by_tm_id[tm_id],
+            "asset": "美国ETF" if tm_id != 2 else "美股",
+            "asOfDate": as_of_date,
+            "tradableFlag": True,
+            "industryName": "科技",
+            "industryTmId": 700001,
+            "priceIndex": "10",
+            "marketCap": "200",
+            "amount1d": "3",
+            "isTrendRightSide": True,
+            "daysSinceTrendEntry": 3,
+            "trendStrengthLocalCurr": "96",
+            "trendTemperaturePrev": "温",
+            "trendTemperatureCurr": "热",
+            "trendPhaseCurr": "立夏",
+            "stopwinFlagByDangerSignal": False,
+            "stopwinFlagByBoilingTemperature": False,
+            "stopwinFlagByPopChampagne": False,
+        }
+
+    class AccountClient(DefaultSimAccountClient):
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                **super().account_snapshot(),
+                "positions": [
+                    {
+                        "code": "US.VIXY",
+                        "stock_name": "VIXY",
+                        "qty": "100",
+                        "cost_price": "10",
+                        "market_val": "1000",
+                    }
+                ],
+            }
+
+    class Api:
+        ignored_stale_components: tuple[object, ...] = ()
+        pool_component_requests: list[int] = []
+
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def get_update_status(self) -> list[dict[str, object]]:
+            return [
+                {"asset": asset, "asOfDate": as_of_date}
+                for asset in MARKET_UPDATE_ASSETS["US"]
+            ]
+
+        def get_account_balance(self) -> dict[str, object]:
+            return {"balance": "100"}
+
+        def get_components(
+            self, *, tm_id: int, expected_date: str,
+        ) -> list[dict[str, object]]:
+            assert expected_date == as_of_date
+            if tm_id == pool_id:
+                self.pool_component_requests.append(tm_id)
+                return pool_rows
+            return []
+
+        def get_favorites_tickers(self) -> list[dict[str, object]]:
+            return []
+
+        def search_exact_symbol(
+            self, symbol: str, *, market: str, expected_date: str,
+        ) -> int:
+            assert (market, expected_date) == ("US", as_of_date)
+            assert symbol == "VIXY"
+            return 2
+
+        def get_snapshot_billing(self) -> list[dict[str, object]]:
+            return [
+                {
+                    "field": field,
+                    "priceCost": "0.071" if field == "tickerName" else "0",
+                }
+                for field in UNIFIED_TREND_FIELDS + A_SHARE_INDUSTRY_FIELDS
+            ]
+
+        def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
+            fields = tuple(kwargs["fields"])
+            requested = [int(item) for item in kwargs["tm_ids"]]  # type: ignore[union-attr]
+            if fields == A_SHARE_INDUSTRY_FIELDS:
+                return [
+                    {
+                        "tmId": tm_id,
+                        "asOfDate": str(kwargs["expected_date"]),
+                        "trendTemperatureCurr": "热",
+                    }
+                    for tm_id in requested
+                ]
+            if fields == INDUSTRY_STATE_FIELDS:
+                return [
+                    {
+                        "tmId": tm_id,
+                        "asOfDate": str(kwargs["expected_date"]),
+                        "trendTemperatureCurr": "热",
+                        "trendStrengthLocalCurr": "92",
+                        "TrendRightSideCountRatio": "0.191",
+                        "TrendRightSideMktCapRatio": "0.650",
+                    }
+                    for tm_id in requested
+                ]
+            return [component_row(tm_id) for tm_id in requested]
+
+        def remember_symbol_row(self, **_kwargs: object) -> None:
+            pass
+
+        def symbol_mapping(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+    class Quote:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            return [as_of_date, execution_date]
+
+        def get_daily_kline(
+            self, _symbol: str, **_kwargs: object,
+        ) -> list[DailyKlineBar]:
+            end = datetime.fromisoformat(as_of_date)
+            return [
+                DailyKlineBar(
+                    date=(end - timedelta(days=14 - index)).date().isoformat(),
+                    open=10,
+                    high=10.1,
+                    low=9.9,
+                    close=10,
+                    volume=100,
+                )
+                for index in range(15)
+            ]
+
+        def get_lot_sizes(self, symbols: list[str]) -> dict[str, int]:
+            return {item: 100 for item in symbols}
+
+        def close(self) -> None:
+            pass
+
+    api = Api()
+    result = run_market_trend_report(
+        config=cfg,
+        market="US",
+        run_date="2026-07-15",
+        notifier=RecordingFeishu(),
+        api_factory=lambda **kwargs: api,
+        quote_factory=Quote,
+        account_factory=AccountClient,
+    )
+
+    assert api.pool_component_requests == [pool_id]
+    assert result.status == "generated", result.waiting_reason
+    assert result.report_path is not None
+    assert result.json_path is not None
+    markdown = result.report_path.read_text(encoding="utf-8")
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    assert "invalid US Trend Animals symbol" not in markdown
+    decisions = payload["strategy_judgments"]["holding_decisions"]
+    held_decision = next(
+        item for item in decisions if item["symbol"] == "VIXY"
+    )
+    assert (held_decision["action"], held_decision["reason"]) == (
+        "HOLD", "trend_intact",
+    )
+
+
 def test_market_report_without_blacklist_still_fails_on_missing_holding_row(
     tmp_path: Path,
 ) -> None:
