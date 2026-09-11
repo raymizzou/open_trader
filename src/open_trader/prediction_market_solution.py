@@ -35,7 +35,12 @@ from open_trader.prediction_n_leg import (
     fingerprint,
 )
 from open_trader.prediction_n_leg_oracle import cost_upper_bound, evaluate_fixed_portfolio
-from open_trader.prediction_snapshot_scheduler import ComponentSnapshot, economic_fingerprint
+from open_trader.prediction_snapshot_scheduler import (
+    GENERIC_BOOK_CONVENTION,
+    OUTCOME_TOKEN_BOOK_CONVENTION,
+    ComponentSnapshot,
+    economic_fingerprint,
+)
 from open_trader.prediction_solver import (
     BenchmarkLimits,
     ObjectiveBounds,
@@ -123,7 +128,8 @@ def cost_slices_from_book(
 ) -> tuple[ExecutableCostSlice, ...]:
     """Build executable cost slices from a live book (口径沿用 #51).
 
-    Buy legs walk the asks best-first; NO legs walk the bids best-first.
+    Outcome-token buy legs (including BUY_NO) walk the asks best-first;
+    generic BUY_NO keeps the legacy bids convention.
     Each lot's upper bound is price x lot_step plus fee plus slippage/safety
     margin (tick + haircut), rounded the same way as the #51 quote pipeline.
     Issue #117: a book carrying finite positive ``taker_fee_bps`` prices the
@@ -135,7 +141,13 @@ def cost_slices_from_book(
     """
     if not isinstance(action, CandidateAction):
         raise ValueError("action must be a CandidateAction")
-    levels = getattr(book, "bids" if action.side == ActionSide.BUY_NO else "asks", ())
+    book_convention = getattr(book, "book_convention", GENERIC_BOOK_CONVENTION)
+    if book_convention == OUTCOME_TOKEN_BOOK_CONVENTION:
+        levels = getattr(book, "asks", ())
+    elif book_convention == GENERIC_BOOK_CONVENTION:
+        levels = getattr(book, "bids" if action.side == ActionSide.BUY_NO else "asks", ())
+    else:
+        raise ValueError(f"unsupported book convention: {book_convention}")
     if common_units_per_dollar is None:
         common_units_per_dollar = price_units_per_quote_unit
     # #117: only a finite positive Decimal bps figure models a charging

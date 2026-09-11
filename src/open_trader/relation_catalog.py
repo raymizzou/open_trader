@@ -64,6 +64,13 @@ _ACTIVATION_BLOCKED = frozenset({
 })
 _GROUP_BUDGET = 10
 
+# Polymarket's native binary market pays one dollar across the complete
+# outcome-token pair.  Keep the native compiler's amounts in the same integer
+# micro-dollar unit used by the live quote path; legacy relation codecs retain
+# their historical USD unit and are normalized at the merge boundary.
+_NATIVE_COMPLEMENT_PROFILE = "polymarket-native-complement-v2"
+_USD_MICRO_UNITS_PER_DOLLAR = 1_000_000
+
 #: The six-state review vocabulary shared by the catalog views, counts, and UI.
 REVIEW_STATES = (
     "PENDING_APPROVAL",
@@ -623,9 +630,23 @@ def _mechanical_complete_model(relation: object) -> dict[str, object] | None:
         release_dates = [_utc(fact[4]) for fact in facts]
     except (TypeError, ValueError):
         return None
+    is_native_complement = relation_type == "NATIVE_COMPLEMENT"
+    valuation_unit_id = "usd-micro" if is_native_complement else "USD"
     actions: list[CandidateAction] = []
     states: list[TerminalStateSet] = []
     payouts: dict[str, dict[str, int]] = {}
+    native_kinds = (
+        (TerminalKind.NORMAL_YES, "NORMAL_YES"),
+        (TerminalKind.NORMAL_NO, "NORMAL_NO"),
+        (TerminalKind.SPLIT, "SPLIT"),
+    )
+    legacy_kinds = (
+        (TerminalKind.NORMAL_YES, "NORMAL_YES"),
+        (TerminalKind.NORMAL_NO, "NORMAL_NO"),
+        (TerminalKind.VOID, "VOID"),
+        (TerminalKind.REFUND, "REFUND"),
+        (TerminalKind.SPLIT, "SPLIT"),
+    )
     for (contract_id, condition_id, side, source, end_date, rules_hash), release_at in zip(
         facts, release_dates, strict=True
     ):
@@ -651,55 +672,73 @@ def _mechanical_complete_model(relation: object) -> dict[str, object] | None:
             quantity_scale=1,
             min_quantity_lots=1,
             max_quantity_lots=1,
-            settlement_asset_id="USD",
-            valuation_unit_id="USD",
-            asset_valuation_rule_id="usd-1:1-v1",
-            cost_slices=(ExecutableCostSlice(1, 1, 0),),
-        ))
-        # Token-level contract semantics: NORMAL_YES on an endpoint means that
-        # endpoint's own contract settles (pays one lot) and NORMAL_NO pays
-        # zero, identically for the YES token and the NO token of a complement
-        # pair.  Every real settlement state of the pair then pays exactly one
-        # lot in total (one lot per token).  The negRisk group endpoints are
-        # all BUY_YES and keep the same mapping.
-        yes_payout = 1
-        no_payout = 0
-        payouts[contract_id] = {
-            "NORMAL_YES": yes_payout,
-            "NORMAL_NO": no_payout,
-            "VOID": 0,
-            "REFUND": 0,
-            "SPLIT": 0,
-        }
-        states.append(TerminalStateSet(
-            contract_id,
-            key,
-            rules_hash,
-            (
-                TerminalAtom(
-                    f"{contract_id}:NORMAL_YES", TerminalKind.NORMAL_YES, rules_hash,
-                    (ActionPayout(action_id, yes_payout),), release_at,
-                ),
-                TerminalAtom(
-                    f"{contract_id}:NORMAL_NO", TerminalKind.NORMAL_NO, rules_hash,
-                    (ActionPayout(action_id, no_payout),), release_at,
-                ),
-                TerminalAtom(
-                    f"{contract_id}:VOID", TerminalKind.VOID, rules_hash,
-                    (ActionPayout(action_id, 0),), release_at,
-                ),
-                TerminalAtom(
-                    f"{contract_id}:REFUND", TerminalKind.REFUND, rules_hash,
-                    (ActionPayout(action_id, 0),), release_at,
-                ),
-                TerminalAtom(
-                    f"{contract_id}:SPLIT", TerminalKind.SPLIT, rules_hash,
-                    (ActionPayout(action_id, 0),), release_at,
+            settlement_asset_id=valuation_unit_id,
+            valuation_unit_id=valuation_unit_id,
+            asset_valuation_rule_id=(
+                "usd-micro-v1" if is_native_complement else "usd-1:1-v1"
+            ),
+            cost_slices=(
+                ExecutableCostSlice(
+                    1,
+                    1,
+                    0,
                 ),
             ),
         ))
+        # Token-level contract semantics: NORMAL_YES on an endpoint means that
+        # endpoint's own contract settles (pays one lot) and NORMAL_NO pays
+        # zero. A native YES/NO pair shares one condition, so the joint model
+        # admits the two normal outcomes and the official 50/50 split.
+        yes_payout = _USD_MICRO_UNITS_PER_DOLLAR if is_native_complement else 1
+        no_payout = 0
+        split_payout = (
+            _USD_MICRO_UNITS_PER_DOLLAR // 2 if is_native_complement else 0
+        )
+        payouts[contract_id] = {
+            kind_name: (
+                yes_payout
+                if kind is TerminalKind.NORMAL_YES
+                else split_payout
+                if kind is TerminalKind.SPLIT
+                else no_payout
+            )
+            for kind, kind_name in (native_kinds if is_native_complement else legacy_kinds)
+        }
+        rule_version = (
+            _NATIVE_COMPLEMENT_PROFILE
+            if is_native_complement
+            else rules_hash
+        )
+        terminal_kinds = native_kinds if is_native_complement else legacy_kinds
+        states.append(
+            TerminalStateSet(
+                contract_id,
+                key,
+                rule_version,
+                tuple(
+                    TerminalAtom(
+                        f"{contract_id}:{kind_name}",
+                        kind,
+                        rule_version,
+                        (
+                            ActionPayout(
+                                action_id,
+                                yes_payout
+                                if kind is TerminalKind.NORMAL_YES
+                                else split_payout
+                                if kind is TerminalKind.SPLIT
+                                else no_payout,
+                            ),
+                        ),
+                        release_at,
+                    )
+                    for kind, kind_name in terminal_kinds
+                ),
+            )
+        )
     rule_digest = _digest({
         "relation_type": relation_type,
+        "profile": _NATIVE_COMPLEMENT_PROFILE if is_native_complement else None,
         "event_id": event_id,
         "contracts": [
             (fact[0], fact[1], fact[3], fact[4], fact[5]) for fact in facts
@@ -710,14 +749,18 @@ def _mechanical_complete_model(relation: object) -> dict[str, object] | None:
         PROBLEM_SCHEMA_V1,
         f"mechanical:{rule_digest}",
         min(release_dates),
-        "USD",
+        valuation_unit_id,
         tuple(actions),
         tuple(states),
         ConstraintModel(
             (
                 RelationConstraint(
-                    f"exactly-one:{':'.join(sorted_contracts)}",
-                    RelationKind.EXACTLY_ONE,
+                    f"native-complement:{':'.join(sorted_contracts)}"
+                    if is_native_complement
+                    else f"exactly-one:{':'.join(sorted_contracts)}",
+                    RelationKind.NATIVE_COMPLEMENT
+                    if is_native_complement
+                    else RelationKind.EXACTLY_ONE,
                     tuple(sorted_contracts),
                     rule_digest,
                 ),
@@ -729,7 +772,9 @@ def _mechanical_complete_model(relation: object) -> dict[str, object] | None:
     capital_release = max(release_dates)
     return {
         "completeness": "COMPLETE",
-        "terminal_states": ["NORMAL_YES", "NORMAL_NO", "VOID", "REFUND", "SPLIT"],
+        "terminal_states": [
+            kind_name for _, kind_name in (native_kinds if is_native_complement else legacy_kinds)
+        ],
         "payouts": payouts,
         "capital_release": capital_release.isoformat(timespec="microseconds").replace("+00:00", "Z"),
         "problem": canonical_payload(problem),

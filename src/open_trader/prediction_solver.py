@@ -609,6 +609,27 @@ def _compile_terminal_model(
         if active_constraint_ids is not None and relation.constraint_id not in active_constraint_ids:
             continue
         states = tuple(states_by_contract[contract_id] for contract_id in relation.contract_ids)
+        if relation.kind == RelationKind.NATIVE_COMPLEMENT:
+            left_state, right_state = states
+            left_atoms = {atom.kind: atom for atom in left_state.atoms}
+            right_atoms = {atom.kind: atom for atom in right_state.atoms}
+            for left_kind, right_kind, suffix in (
+                (TerminalKind.NORMAL_YES, TerminalKind.NORMAL_NO, "yes-no"),
+                (TerminalKind.NORMAL_NO, TerminalKind.NORMAL_YES, "no-yes"),
+                (TerminalKind.SPLIT, TerminalKind.SPLIT, "split-split"),
+            ):
+                constraints.append(
+                    LinearConstraint(
+                        f"relation:{relation.constraint_id}:{suffix}",
+                        (
+                            (f"z:{left_atoms[left_kind].atom_id}", 1),
+                            (f"z:{right_atoms[right_kind].atom_id}", -1),
+                        ),
+                        0,
+                        0,
+                    )
+                )
+            continue
         yes_terms = tuple(
             (f"z:{atom.atom_id}", 1)
             for state in states

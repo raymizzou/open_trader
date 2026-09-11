@@ -57,6 +57,7 @@ from open_trader.prediction_n_leg import (
     canonical_payload,
     canonicalize_directional_actions,
     fingerprint,
+    normalize_problem,
     problem_from_payload,
 )
 from open_trader.prediction_n_leg_oracle import (
@@ -158,9 +159,8 @@ def _member_problems(rows: tuple[Mapping[str, object], ...]) -> list[ArbitragePr
                 f"COMPLETE relation {row.get('identity', '?')} has no compiled "
                 "problem payload; threshold enrichment must attach model.problem"
             )
-        problems.append(
-            canonicalize_directional_actions(problem_from_payload(payload))
-        )
+        decoded = canonicalize_directional_actions(problem_from_payload(payload))
+        problems.append(normalize_problem(decoded))
     return problems
 
 

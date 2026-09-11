@@ -79,6 +79,7 @@ from open_trader.prediction_n_leg_oracle import (
     cut_from_scenario,
     derive_selected_support_graph,
     evaluate_fixed_portfolio,
+    enumerate_allowed_scenarios,
     find_qualified,
     solve_optimal,
     split_disconnected_solution,
@@ -754,6 +755,103 @@ def terminal_problem(
         ConstraintModel(relations, forbidden),
         (),
     )
+
+
+def native_complement_terminal_problem() -> ArbitrageProblem:
+    base = terminal_problem(
+        ("yes-token", "no-token"),
+        relations=(
+            RelationConstraint(
+                "native-relation",
+                RelationKind.NATIVE_COMPLEMENT,
+                ("yes-token", "no-token"),
+                "native-v1",
+            ),
+        ),
+    )
+    observation = replace(
+        base.actions[0].settlement_observation_key,
+        oracle_id="native-oracle",
+        indicator_id="native-condition",
+        rule_version="native-v1",
+    )
+    actions = (
+        replace(base.actions[0], settlement_observation_key=observation, side=ActionSide.BUY_YES),
+        replace(base.actions[1], settlement_observation_key=observation, side=ActionSide.BUY_NO),
+    )
+    states = []
+    for state, action in zip(base.terminal_state_sets, actions, strict=True):
+        states.append(
+            replace(
+                state,
+                settlement_observation_key=observation,
+                rule_version="native-v1",
+                atoms=(
+                    replace(state.atoms[0], rule_version="native-v1", payouts=(ActionPayout(action.action_id, 1),)),
+                    replace(state.atoms[1], rule_version="native-v1", payouts=(ActionPayout(action.action_id, 0),)),
+                    replace(state.atoms[2], atom_id=f"{state.market_contract_id}-split", kind=TerminalKind.SPLIT, rule_version="native-v1", payouts=(ActionPayout(action.action_id, 0),)),
+                ),
+            )
+        )
+    return replace(base, actions=actions, terminal_state_sets=tuple(states))
+
+
+def test_native_complement_terminal_model_matches_oracle() -> None:
+    problem = native_complement_terminal_problem()
+    enumeration = enumerate_allowed_scenarios(problem, OracleBudget(1, 9, 1))
+    assert enumeration.unknown_reason is None
+    assert enumeration.raw_joint_state_count == 9
+    allowed = {
+        tuple(
+            next(
+                atom.kind for atom in state.atoms if atom.atom_id == selected.atom_id
+            )
+            for state in problem.terminal_state_sets
+            for selected in scenario.atoms
+            if selected.market_contract_id == state.market_contract_id
+        )
+        for scenario in enumeration.scenarios or ()
+    }
+    assert allowed == {
+        (TerminalKind.NORMAL_YES, TerminalKind.NORMAL_NO),
+        (TerminalKind.NORMAL_NO, TerminalKind.NORMAL_YES),
+        (TerminalKind.SPLIT, TerminalKind.SPLIT),
+    }
+
+    model = compile_terminal_model(problem)
+    native_rows = [
+        constraint
+        for constraint in model.constraints
+        if constraint.name.startswith("relation:native-relation")
+    ]
+    assert native_rows
+    assert all("native-relation" in constraint.name for constraint in native_rows)
+    assert not any(constraint.name.startswith("forbidden:") for constraint in model.constraints)
+    atoms_by_contract_and_kind = {
+        state.market_contract_id: {atom.kind: atom.atom_id for atom in state.atoms}
+        for state in problem.terminal_state_sets
+    }
+    expected = {
+        (TerminalKind.NORMAL_YES, TerminalKind.NORMAL_NO): NativeSolveStatus.OPTIMAL,
+        (TerminalKind.NORMAL_NO, TerminalKind.NORMAL_YES): NativeSolveStatus.OPTIMAL,
+        (TerminalKind.SPLIT, TerminalKind.SPLIT): NativeSolveStatus.OPTIMAL,
+    }
+    for left_kind in (TerminalKind.NORMAL_YES, TerminalKind.NORMAL_NO, TerminalKind.SPLIT):
+        for right_kind in (TerminalKind.NORMAL_YES, TerminalKind.NORMAL_NO, TerminalKind.SPLIT):
+            result = BruteForceBackend().solve(
+                with_fixed_atoms(
+                    model,
+                    {
+                        atoms_by_contract_and_kind["yes-token"][left_kind]: 1,
+                        atoms_by_contract_and_kind["no-token"][right_kind]: 1,
+                    },
+                ),
+                time_limit_ms=1,
+            )
+            assert result.status == expected.get(
+                (left_kind, right_kind),
+                NativeSolveStatus.INFEASIBLE,
+            )
 
 
 def with_fixed_atoms(model: LinearModel, atom_values: dict[str, int]) -> LinearModel:

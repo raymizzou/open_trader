@@ -13,6 +13,11 @@ from pathlib import Path
 
 import pytest
 
+from open_trader.polymarket_relation_discovery import (
+    NativeComplementMarket,
+    NativeComplementRelation,
+)
+from open_trader.relation_catalog import RelationCatalog
 from open_trader.prediction_arbitrage import BookLevel, ThresholdOrderBook
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 from open_trader.prediction_live_resolver import (
@@ -26,8 +31,11 @@ from open_trader.prediction_monitor_selection import (
     SelectedComponent,
     problem_for_component,
     relation_generation_problem,
+    resolve_background_candidate,
+    select_monitor_components,
 )
 from open_trader.prediction_n_leg import (
+    BusinessStatus,
     OBSERVATION_SCHEMA_V1,
     PROBLEM_SCHEMA_V1,
     ActionPayout,
@@ -39,8 +47,11 @@ from open_trader.prediction_n_leg import (
     ConstraintModel,
     ExecutableCostSlice,
     OracleBudget,
+    OracleRequest,
     QualificationConstraint,
     QualificationMetric,
+    REQUEST_SCHEMA_V1,
+    SearchMode,
     SettlementObservationKey,
     TerminalAtom,
     TerminalKind,
@@ -53,7 +64,7 @@ from open_trader.prediction_n_leg_episodes import (
     CLOSE_NO_QUALIFIED_OPPORTUNITY,
     EpisodeTracker,
 )
-from open_trader.prediction_n_leg_oracle import evaluate_fixed_portfolio
+from open_trader.prediction_n_leg_oracle import evaluate_fixed_portfolio, find_qualified
 from open_trader.prediction_runtime_graph import RuntimeGraphStore
 from open_trader.prediction_solver import (
     ObjectiveBounds,
@@ -61,6 +72,13 @@ from open_trader.prediction_solver import (
     SolverEvidence,
 )
 from open_trader.prediction_solver_worker import WorkerOutcome, WorkerResponse
+from open_trader.prediction_solver_verified import (
+    PROOF_REQUEST_SCHEMA_V1,
+    ProofInput,
+    candidate_evidence_from_payload,
+    quote_fingerprint,
+    solve,
+)
 
 
 AS_OF = datetime(2026, 8, 16, tzinfo=UTC)
@@ -393,6 +411,156 @@ def test_normalize_problem_maps_micro_units_and_payouts() -> None:
     ):
         payouts[payout.action_id].add(payout.payout_lower_bound_per_lot_units)
     assert payouts == {"a-yes": {1_000_000, 0}, "a-no": {0, 1_000_000}}
+
+
+def test_normalize_problem_preserves_half_units_and_is_idempotent() -> None:
+    raw = raw_problem()
+    dollar = replace(
+        raw,
+        valuation_unit_id="USD",
+        actions=tuple(
+            replace(
+                action,
+                settlement_asset_id="USD",
+                valuation_unit_id="USD",
+                asset_valuation_rule_id="usd-1:1-v1",
+                cost_slices=(ExecutableCostSlice(1, 2, 1),),
+            )
+            for action in raw.actions
+        ),
+    )
+
+    normalized = normalize_problem(dollar)
+    assert normalize_problem(normalized) == normalized
+    assert normalized.valuation_unit_id == "usd-micro"
+    assert {
+        cost_slice.incremental_cost_upper_bound_units
+        for action in normalized.actions
+        for cost_slice in action.cost_slices
+    } == {1_000_000}
+
+    micro = replace(
+        normalized,
+        actions=tuple(
+            replace(
+                action,
+                cost_slices=(ExecutableCostSlice(1, 2, 500_000),),
+            )
+            for action in normalized.actions
+        ),
+        terminal_state_sets=tuple(
+            replace(
+                state,
+                atoms=tuple(
+                    replace(
+                        atom,
+                        payouts=tuple(
+                            ActionPayout(
+                                payout.action_id,
+                                500_000
+                                if payout.payout_lower_bound_per_lot_units
+                                else 0,
+                            )
+                            for payout in atom.payouts
+                        ),
+                    )
+                    for atom in state.atoms
+                ),
+            )
+            for state in normalized.terminal_state_sets
+        ),
+    )
+    assert normalize_problem(micro) == micro
+    assert {
+        payout.payout_lower_bound_per_lot_units
+        for state in micro.terminal_state_sets
+        for atom in state.atoms
+        for payout in atom.payouts
+    } == {0, 500_000}
+
+
+def test_normalize_problem_preserves_profit_qualification_units() -> None:
+    raw = raw_problem()
+    dollar = replace(
+        raw,
+        valuation_unit_id="USD",
+        actions=tuple(
+            replace(
+                action,
+                max_quantity_lots=1,
+                settlement_asset_id="USD",
+                valuation_unit_id="USD",
+                asset_valuation_rule_id="usd-1:1-v1",
+                cost_slices=(ExecutableCostSlice(1, 1, 0),),
+            )
+            for action in raw.actions
+        ),
+        qualification_constraints=(
+            QualificationConstraint(
+                "minimum-profit",
+                "v1",
+                QualificationMetric.GUARANTEED_PROFIT_UNITS,
+                Comparison.GREATER_THAN_OR_EQUAL,
+                2,
+                1,
+            ),
+            QualificationConstraint(
+                "minimum-margin",
+                "v1",
+                QualificationMetric.NET_MARGIN_PPM,
+                Comparison.GREATER_THAN_OR_EQUAL,
+                100_000,
+                1,
+            ),
+            QualificationConstraint(
+                "release-window",
+                "v1",
+                QualificationMetric.MAX_CAPITAL_RELEASE_DELAY_SECONDS,
+                Comparison.LESS_THAN_OR_EQUAL,
+                3_600,
+                1,
+            ),
+        ),
+    )
+
+    normalized = normalize_problem(dollar)
+    assert normalize_problem(normalized) == normalized
+    constraints = {
+        constraint.constraint_id: constraint
+        for constraint in normalized.qualification_constraints
+    }
+    assert constraints["minimum-profit"].threshold_numerator == 2_000_000
+    assert constraints["minimum-profit"].threshold_denominator == 1
+    assert constraints["minimum-margin"].threshold_numerator == 100_000
+    assert constraints["minimum-margin"].threshold_denominator == 1
+    assert constraints["release-window"].threshold_numerator == 3_600
+    assert constraints["release-window"].threshold_denominator == 1
+    assert {
+        payout.payout_lower_bound_per_lot_units
+        for state in normalized.terminal_state_sets
+        for atom in state.atoms
+        for payout in atom.payouts
+    } == {0, 1_000_000}
+
+    quantities = tuple(ActionQuantity(action.action_id, 1) for action in normalized.actions)
+    evaluation = evaluate_fixed_portfolio(
+        normalized,
+        quantities,
+        OracleBudget(4, 2, 1),
+    )
+    assert evaluation.payout_lower_bound_units == 1_000_000
+    assert evaluation.cost_upper_bound_units == 0
+    assert evaluation.guaranteed_profit_units == 1_000_000
+
+    result = find_qualified(
+        OracleRequest(
+            REQUEST_SCHEMA_V1,
+            SearchMode.ADMISSION,
+            normalized,
+            OracleBudget(4, 2, 1),
+        )
+    )
+    assert result.business_status == BusinessStatus.NO_QUALIFIED_OPPORTUNITY
 
 
 # --------------------------------------------------------------------------
@@ -909,6 +1077,175 @@ def test_snapshot_resolves_leg_tokens_by_action_direction(tmp_path: Path) -> Non
     assert requested == {"yes-token-a", "no-token-a"}
     prices = {leg.leg_id: leg.book.asks[0].price for leg in snapshot.legs}
     assert prices == {"a-yes": Decimal("0.49"), "a-no": Decimal("0.61")}
+
+
+def test_native_candidate_reaches_quote_evaluation(tmp_path: Path) -> None:
+    """A catalog-native pair reaches live quote verification through public seams.
+
+    The catalog's zero-cost admission placeholder must be replaced by the
+    current outcome-token asks. The worker evidence is produced by the real
+    solver codec so the assertions cover the public resolver/verifier chain.
+    """
+    for case, no_ask, expected_profit, qualified in (
+        ("positive", "0.52", 50_000, True),
+        ("negative", "0.58", -10_000, False),
+    ):
+        run_dir = tmp_path / case
+        catalog = RelationCatalog(run_dir / "catalog")
+        relation = NativeComplementRelation(
+            event_id="event-native-live",
+            market=NativeComplementMarket(
+                event_id="event-native-live",
+                market_id="market-native-live",
+                condition_id="condition-native-live",
+                question="Will the native candidate resolve YES?",
+                rules="official binary resolution",
+                resolution_source="official source",
+                end_date="2026-12-31T17:00:00Z",
+                yes_token_id="yes-native-live",
+                no_token_id="no-native-live",
+                rules_hash="native-rules-v1",
+                fees_enabled=False,
+            ),
+        )
+        ingested = catalog.ingest_mechanical_relation(relation)
+        catalog.approve(
+            ingested["version_id"],
+            {"version_id": ingested["version_id"]},
+            actor="test",
+            git_sha="test",
+        )
+
+        compiled, components = relation_generation_problem(
+            catalog.current_generation()
+        )
+        assert compiled is not None and len(components) == 1
+        component = components[0]
+        # The catalog's zero-cost slice is an unpriced admission placeholder;
+        # the resolver must overwrite it from the two live asks below.
+        admission_problem = compiled
+        admission = resolve_background_candidate(
+            problem_for_component(admission_problem, component),
+            budget=OracleBudget(16, 25, 1),
+            limits=LIVE_LIMITS,
+            generation=1,
+            code_version="issue-52",
+        )
+        assert admission.initial_verified_profit == 1_000_000
+        selected = select_monitor_components(
+            {component.component_id: admission},
+            {},
+            problem=admission_problem,
+            components={component.component_id: component},
+        )
+        assert set(selected) == {component.component_id}
+
+        yes_book = ThresholdOrderBook(
+            "yes-native-live",
+            (BookLevel(Decimal("0.43"), Decimal("1")),),
+            (BookLevel(Decimal("0.31"), Decimal("1")),),
+            datetime.now(UTC),
+        )
+        no_book = ThresholdOrderBook(
+            "no-native-live",
+            (BookLevel(Decimal(no_ask), Decimal("1")),),
+            (BookLevel(Decimal("0.17"), Decimal("1")),),
+            datetime.now(UTC),
+        )
+        monitor = RecordingMonitor(
+            {"yes-native-live": yes_book, "no-native-live": no_book}
+        )
+        server = FakeServer()
+        selection_store = MonitorSelectionStore(run_dir)
+        selection_store.save(selected)
+        instance = PredictionLiveResolver(
+            data_dir=run_dir,
+            relation_catalog=catalog,
+            monitor=monitor,
+            solver_server=server,
+            selection_store=selection_store,
+            store=FakeStore(),
+            execution=FakeExecution(AccountView(2_000_000, 2_000_000, 0)),
+            poll_interval=0.01,
+            budget=OracleBudget(16, 25, 1),
+        )
+        try:
+            instance.start()
+            deadline = time.monotonic() + 5
+            while not server.requests and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert server.requests
+            request = server.requests[0]
+            costs = {
+                action.action_id: action.cost_slices[0].incremental_cost_upper_bound_units
+                for action in request.request.problem.actions
+            }
+            assert costs == {
+                "polymarket:yes-native-live": 430_000,
+                "polymarket:no-native-live": int(Decimal(no_ask) * 1_000_000),
+            }
+            assert request.request.problem.valuation_unit_id == "usd-micro"
+
+            proof_input = ProofInput(
+                PROOF_REQUEST_SCHEMA_V1,
+                request.request,
+                request.limits,
+                quote_fingerprint(request.request.problem),
+                int(catalog.generation_meta()["generation"]),
+                "issue-52",
+            )
+            candidate = candidate_evidence_from_payload(
+                solve(canonical_payload(proof_input))
+            )
+            server.futures[0].set_result(
+                worker_outcome(
+                    request, canonical_payload(candidate.solver_evidence)
+                )
+            )
+            deadline = time.monotonic() + 5
+            while (
+                instance.latest_resolution(component.component_id) is None
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+
+            resolution = instance.latest_resolution(component.component_id)
+            assert resolution is not None
+            if qualified:
+                assert resolution.status.value == "QUALIFIED_VERIFIED"
+                deadline = time.monotonic() + 5
+                while not instance.solutions() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                (entry,) = instance.solutions()
+                assert entry["market"]["guaranteed_profit_units"] == expected_profit
+            else:
+                # The solver/verifier still returns the real fixed-portfolio
+                # proof.  Bind that proof and the public result so UNKNOWN or
+                # an empty solution list cannot satisfy this case vacuously.
+                verification = instance.latest_verification(component.component_id)
+                assert verification is not None
+                if resolution.status.value == "QUALIFIED_VERIFIED":
+                    assert verification.solution is not None
+                    proof = verification.solution.payout_proof
+                    deadline = time.monotonic() + 5
+                    while not instance.solutions() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    (entry,) = instance.solutions()
+                    assert entry["market"]["guaranteed_profit_units"] == -10_000
+                    assert entry["market"]["guaranteed_profit_units"] <= 0
+                elif resolution.status.value == "NO_QUALIFIED_OPPORTUNITY":
+                    assert verification.negative_proof is not None
+                    proof = verification.negative_proof
+                    assert instance.solutions() == []
+                else:
+                    raise AssertionError(
+                        f"negative quote did not produce a bound result: {resolution.status}"
+                    )
+                assert proof.cost_upper_bound_units == 1_010_000
+                assert proof.guaranteed_profit_units == -10_000
+                assert proof.guaranteed_profit_units == expected_profit
+        finally:
+            instance.stop()
 
 
 def test_snapshot_combines_direction_tokens_with_charging_fee_facts(

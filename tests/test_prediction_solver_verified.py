@@ -241,7 +241,7 @@ def native_complement_proof_input(tmp_path: Path) -> ProofInput:
     problem = replace(
         compiled,
         actions=tuple(
-            replace(action, cost_slices=(ExecutableCostSlice(1, 1, 1),))
+            replace(action, cost_slices=(ExecutableCostSlice(1, 1, 600_000),))
             for action in compiled.actions
         ),
         qualification_constraints=(
@@ -371,25 +371,24 @@ def test_live_budget_closes_dual_action_negative_proof() -> None:
     assert payload["status"] == "NO_QUALIFIED_OPPORTUNITY"
 
 
-def test_live_budget_verifies_native_complement_25_states(tmp_path: Path) -> None:
+def test_live_budget_verifies_native_complement_9_states(tmp_path: Path) -> None:
     input_ = native_complement_proof_input(tmp_path)
     problem = input_.request.problem
 
     assert {atom.kind for state in problem.terminal_state_sets for atom in state.atoms} == {
         TerminalKind.NORMAL_YES,
         TerminalKind.NORMAL_NO,
-        TerminalKind.VOID,
-        TerminalKind.REFUND,
         TerminalKind.SPLIT,
     }
     assert quantity_vector_count(problem) == 4
     assert len(problem.terminal_state_sets) == 2
-    assert len(problem.terminal_state_sets[0].atoms) * len(problem.terminal_state_sets[1].atoms) == 25
+    assert len(problem.terminal_state_sets[0].atoms) * len(problem.terminal_state_sets[1].atoms) == 9
 
     payload = verify(canonical_payload(input_))
 
     assert payload["status"] == "NO_QUALIFIED_OPPORTUNITY"
     assert payload["negative_proof"]["proof_method"] == "EXHAUSTIVE_ORACLE_V1"
+    assert payload["negative_proof"]["joint_states_per_vector"] == 9
 
 
 @pytest.mark.parametrize(("contract_count", "expected_vectors"), ((5, 1_024), (6, 4_096)))

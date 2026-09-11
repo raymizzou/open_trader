@@ -12,6 +12,9 @@ REQUEST_SCHEMA_V1 = "open_trader.prediction_n_leg.request.v1"
 PROBLEM_SCHEMA_V1 = "open_trader.prediction_n_leg.problem.v1"
 OBSERVATION_SCHEMA_V1 = "open_trader.prediction_n_leg.observation.v1"
 PAYOUT_PROOF_SCHEMA_V1 = "open_trader.prediction_n_leg.payout_proof.v1"
+USD_UNITS_PER_DOLLAR = 1_000_000
+_LEGACY_VALUATION_UNITS = frozenset({"USD", "usd-cents"})
+_MICRO_VALUATION_UNIT = "usd-micro"
 
 
 class ActionSide(StrEnum):
@@ -31,6 +34,7 @@ class RelationKind(StrEnum):
     IMPLIES = "IMPLIES"
     MUTUALLY_EXCLUSIVE = "MUTUALLY_EXCLUSIVE"
     EXACTLY_ONE = "EXACTLY_ONE"
+    NATIVE_COMPLEMENT = "NATIVE_COMPLEMENT"
 
 
 class QualificationMetric(StrEnum):
@@ -194,6 +198,86 @@ class ArbitrageProblem:
     terminal_state_sets: tuple[TerminalStateSet, ...]
     constraint_model: ConstraintModel
     qualification_constraints: tuple[QualificationConstraint, ...]
+
+
+def normalize_problem(problem: ArbitrageProblem) -> ArbitrageProblem:
+    """Normalize supported legacy valuation amounts to integer micro-dollars.
+
+    Newly compiled native models already use ``usd-micro`` and are returned
+    unchanged. Stored legacy USD and usd-cents models represent whole-dollar
+    integer amounts, so both their executable costs and terminal payouts are
+    scaled together before relation members are merged, including monetary
+    qualification thresholds. Unknown units and non-integral legacy payout
+    scales fail closed.
+    """
+    if not isinstance(problem, ArbitrageProblem):
+        raise ValueError("problem must be an ArbitrageProblem")
+    unit = problem.valuation_unit_id
+    if unit == _MICRO_VALUATION_UNIT:
+        return problem
+    if unit not in _LEGACY_VALUATION_UNITS:
+        raise ValueError(f"unsupported valuation unit: {unit}")
+
+    actions = tuple(
+        replace(
+            action,
+            settlement_asset_id=_MICRO_VALUATION_UNIT,
+            valuation_unit_id=_MICRO_VALUATION_UNIT,
+            asset_valuation_rule_id="usd-micro-v1",
+            cost_slices=tuple(
+                replace(
+                    cost_slice,
+                    incremental_cost_upper_bound_units=(
+                        cost_slice.incremental_cost_upper_bound_units
+                        * USD_UNITS_PER_DOLLAR
+                    ),
+                )
+                for cost_slice in action.cost_slices
+            ),
+        )
+        for action in problem.actions
+    )
+    states = tuple(
+        replace(
+            state,
+            atoms=tuple(
+                _normalize_legacy_atom(atom) for atom in state.atoms
+            ),
+        )
+        for state in problem.terminal_state_sets
+    )
+    qualification_constraints = tuple(
+        replace(
+            constraint,
+            threshold_numerator=(
+                constraint.threshold_numerator * USD_UNITS_PER_DOLLAR
+                if constraint.metric == QualificationMetric.GUARANTEED_PROFIT_UNITS
+                else constraint.threshold_numerator
+            ),
+        )
+        for constraint in problem.qualification_constraints
+    )
+    return replace(
+        problem,
+        valuation_unit_id=_MICRO_VALUATION_UNIT,
+        actions=actions,
+        terminal_state_sets=states,
+        qualification_constraints=qualification_constraints,
+    )
+
+
+def _normalize_legacy_atom(atom: TerminalAtom) -> TerminalAtom:
+    payouts: list[ActionPayout] = []
+    for payout in atom.payouts:
+        value = payout.payout_lower_bound_per_lot_units
+        if value == 0:
+            scaled = 0
+        elif value == 1:
+            scaled = USD_UNITS_PER_DOLLAR
+        else:
+            raise ValueError(f"unsupported payout scale: {value}")
+        payouts.append(ActionPayout(payout.action_id, scaled))
+    return replace(atom, payouts=tuple(payouts))
 
 
 @dataclass(frozen=True, slots=True)
@@ -626,12 +710,71 @@ def validate_problem(problem: ArbitrageProblem) -> tuple[ModelIssue, ...]:
         contract_references = _nodes(issues, relation.contract_ids, "INVALID_CONTRACT_REFERENCE_CONTAINER", f"{path}.contract_ids")
         if relation.kind == RelationKind.IMPLIES and len(contract_references) != 2:
             _issue(issues, "INVALID_RELATION_ARITY", f"{path}.contract_ids", "IMPLIES requires ordered antecedent and consequent")
-        if relation.kind != RelationKind.IMPLIES and len(contract_references) < 2:
+        if relation.kind == RelationKind.NATIVE_COMPLEMENT and len(contract_references) != 2:
+            _issue(issues, "INVALID_RELATION_ARITY", f"{path}.contract_ids", "NATIVE_COMPLEMENT requires exactly two contracts")
+        elif relation.kind not in {RelationKind.IMPLIES, RelationKind.NATIVE_COMPLEMENT} and len(contract_references) < 2:
             _issue(issues, "INVALID_RELATION_ARITY", f"{path}.contract_ids", "relation requires at least two contracts")
         for reference_index, contract_id in enumerate(contract_references):
             contract_id = _identifier(issues, contract_id, f"{path}.contract_ids[{reference_index}]")
             if contract_id is not None and contract_id not in contract_ids:
                 _issue(issues, "UNKNOWN_CONTRACT_REFERENCE", f"{path}.contract_ids", "must reference a terminal contract")
+        if relation.kind == RelationKind.NATIVE_COMPLEMENT and len(contract_references) == 2:
+            left_contract, right_contract = contract_references
+            if left_contract == right_contract:
+                _issue(
+                    issues,
+                    "NATIVE_COMPLEMENT_CONTRACTS_NOT_DISTINCT",
+                    f"{path}.contract_ids",
+                    "NATIVE_COMPLEMENT requires two distinct contracts",
+                )
+            left_actions = actions_by_contract.get(left_contract, ())
+            right_actions = actions_by_contract.get(right_contract, ())
+            if len(left_actions) != 1 or len(right_actions) != 1:
+                _issue(
+                    issues,
+                    "NATIVE_COMPLEMENT_ACTION_ARITY",
+                    f"{path}.contract_ids",
+                    "NATIVE_COMPLEMENT requires one action per contract",
+                )
+            elif {left_actions[0].side, right_actions[0].side} != {
+                ActionSide.BUY_YES,
+                ActionSide.BUY_NO,
+            }:
+                _issue(
+                    issues,
+                    "NATIVE_COMPLEMENT_ACTION_SIDES",
+                    f"{path}.contract_ids",
+                    "NATIVE_COMPLEMENT requires one BUY_YES and one BUY_NO action",
+                )
+            left_state = next(
+                (state for state in problem.terminal_state_sets if state.market_contract_id == left_contract),
+                None,
+            )
+            right_state = next(
+                (state for state in problem.terminal_state_sets if state.market_contract_id == right_contract),
+                None,
+            )
+            if left_state is not None and right_state is not None:
+                if left_state.settlement_observation_key != right_state.settlement_observation_key:
+                    _issue(
+                        issues,
+                        "NATIVE_COMPLEMENT_OBSERVATION_MISMATCH",
+                        f"{path}.contract_ids",
+                        "NATIVE_COMPLEMENT contracts must share settlement observation identity",
+                    )
+                native_kinds = {TerminalKind.NORMAL_YES, TerminalKind.NORMAL_NO, TerminalKind.SPLIT}
+                if (
+                    len(left_state.atoms) != 3
+                    or len(right_state.atoms) != 3
+                    or {atom.kind for atom in left_state.atoms} != native_kinds
+                    or {atom.kind for atom in right_state.atoms} != native_kinds
+                ):
+                    _issue(
+                        issues,
+                        "NATIVE_COMPLEMENT_TERMINAL_KINDS",
+                        f"{path}.contract_ids",
+                        "NATIVE_COMPLEMENT requires NORMAL_YES, NORMAL_NO, and SPLIT atoms per contract",
+                    )
     for forbidden_index, forbidden in enumerate(forbidden_combinations):
         path = f"constraint_model.forbidden_atom_combinations[{forbidden_index}]"
         if not isinstance(forbidden, ForbiddenAtomCombination):

@@ -13,6 +13,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
   已验证：全量 `make test` 8211 通过 0 失败；`make candidate-acceptance`
   PASS。宿主 venv 直跑曾见 3 个 prediction_service_launchd 卸载器用例失败，
   经 Docker 权威门禁排除为宿主环境假失败，与本次改动无关。
+- 原生 YES/NO 结算报价链路改用一个 `NATIVE_COMPLEMENT` 联合关系，固定
+  `NORMAL_YES/NORMAL_NO`、`NORMAL_NO/NORMAL_YES`、`SPLIT/SPLIT` 三种联合终态，
+  并保持两腿金额及保证利润门槛统一为 `usd-micro`；Polymarket outcome-token 的 YES/NO 买入
+  均读取各自 token 的 asks，盘口约定进入经济指纹。现有持久化模型版本不会被
+  代码更新静默转换，必须按匹配的代码版本重新生成；原生验证、联合支付、实时
+  正负报价和聚焦回归已在 Docker 中验证。
 - 修复趋势报告重放崩溃：重放/再生成老 v2 报告（模拟盘账户不可用）且报告带符号
   映射契约（`symbol_mapping_schema`）时，`build_report` 在符号映射过滤段引用
   `use_final_plan_semantics` 触发 `UnboundLocalError`，导致 v2 历史报告无法重放

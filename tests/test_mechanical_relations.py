@@ -1,5 +1,4 @@
-"""Issue #103: mechanical relation codecs (official YES/NO complement pair and
-NegRisk exhaustive groups) compiled to EXACTLY_ONE terminal-state models."""
+"""Mechanical relation codecs for native complements and NegRisk groups."""
 
 from __future__ import annotations
 
@@ -12,12 +11,17 @@ import pytest
 
 from open_trader.relation_catalog import RelationCatalog
 from open_trader.prediction_n_leg import (
+    ActionQuantity,
     RelationKind,
     TerminalKind,
     problem_from_payload,
     validate_problem,
 )
-from open_trader.prediction_n_leg_oracle import OracleBudget, enumerate_allowed_scenarios
+from open_trader.prediction_n_leg_oracle import (
+    OracleBudget,
+    enumerate_allowed_scenarios,
+    evaluate_fixed_portfolio,
+)
 from open_trader.polymarket_relation_discovery import (
     NativeComplementMarket,
     NativeComplementRelation,
@@ -119,12 +123,11 @@ def complement_relation() -> NativeComplementRelation:
     )
 
 
-# Slice 2 (A1+A3): the mechanical codec compiles the YES/NO token pair to an
-# EXACTLY_ONE terminal-state model with five kinds per contract; the oracle
-# allows 25 - 4 + 2 = 23 joint scenarios, of which exactly 2 are all-normal,
-# and single-contract VOID scenarios are not pruned.
+# Slice 2: the native codec compiles the YES/NO token pair to one native
+# relation with three terminal kinds per contract and exactly three joint
+# scenarios.
 
-def test_complement_codec_allows_23_scenarios_with_2_normal_and_void_unpruned(
+def test_complement_codec_allows_three_native_scenarios(
     tmp_path: Path,
 ) -> None:
     catalog = RelationCatalog(tmp_path)
@@ -133,7 +136,7 @@ def test_complement_codec_allows_23_scenarios_with_2_normal_and_void_unpruned(
 
     (row,) = catalog.review_rows()
     assert row["model"]["terminal_states"] == [
-        "NORMAL_YES", "NORMAL_NO", "VOID", "REFUND", "SPLIT",
+        "NORMAL_YES", "NORMAL_NO", "SPLIT",
     ]
     problem = problem_from_payload(row["model"]["problem"])
     assert validate_problem(problem) == ()
@@ -146,19 +149,17 @@ def test_complement_codec_allows_23_scenarios_with_2_normal_and_void_unpruned(
         assert {atom.kind for atom in state.atoms} == {
             TerminalKind.NORMAL_YES,
             TerminalKind.NORMAL_NO,
-            TerminalKind.VOID,
-            TerminalKind.REFUND,
             TerminalKind.SPLIT,
         }
 
     (constraint,) = problem.constraint_model.relations
-    assert constraint.kind == RelationKind.EXACTLY_ONE
+    assert constraint.kind == RelationKind.NATIVE_COMPLEMENT
     assert set(constraint.contract_ids) == {"yes-1", "no-1"}
 
-    enumeration = enumerate_allowed_scenarios(problem, OracleBudget(1, 25, 1))
+    enumeration = enumerate_allowed_scenarios(problem, OracleBudget(1, 9, 1))
     assert enumeration.unknown_reason is None
-    assert enumeration.raw_joint_state_count == 25
-    assert len(enumeration.scenarios) == 23
+    assert enumeration.raw_joint_state_count == 9
+    assert len(enumeration.scenarios) == 3
     kind_by_atom = {
         atom.atom_id: atom.kind
         for state in problem.terminal_state_sets
@@ -173,14 +174,14 @@ def test_complement_codec_allows_23_scenarios_with_2_normal_and_void_unpruned(
         )
     ]
     assert len(normal) == 2
-    void_joint = [
+    split_joint = [
         scenario for scenario in enumeration.scenarios
         if any(
-            kind_by_atom[selected.atom_id] == TerminalKind.VOID
+            kind_by_atom[selected.atom_id] == TerminalKind.SPLIT
             for selected in scenario.atoms
         )
     ]
-    assert void_joint
+    assert len(split_joint) == 1
 
 
 def test_complement_normal_scenarios_each_pay_exactly_one_lot(tmp_path: Path) -> None:
@@ -195,7 +196,7 @@ def test_complement_normal_scenarios_each_pay_exactly_one_lot(tmp_path: Path) ->
     problem = problem_from_payload(row["model"]["problem"])
     assert validate_problem(problem) == ()
 
-    enumeration = enumerate_allowed_scenarios(problem, OracleBudget(1, 25, 1))
+    enumeration = enumerate_allowed_scenarios(problem, OracleBudget(1, 9, 1))
     assert enumeration.unknown_reason is None
     atom_by_id = {
         atom.atom_id: atom
@@ -217,7 +218,58 @@ def test_complement_normal_scenarios_each_pay_exactly_one_lot(tmp_path: Path) ->
             for selected in scenario.atoms
             for payout in atom_by_id[selected.atom_id].payouts
         )
-        assert payout_total == 1
+        assert payout_total == 1_000_000
+
+
+def test_native_complement_joint_settlement_payouts(tmp_path: Path) -> None:
+    catalog = RelationCatalog(tmp_path)
+    catalog.ingest_mechanical_relation(complement_relation())
+    (row,) = catalog.review_rows()
+    problem = problem_from_payload(row["model"]["problem"])
+
+    enumeration = enumerate_allowed_scenarios(problem, OracleBudget(1, 9, 1))
+    assert enumeration.unknown_reason is None
+    assert enumeration.raw_joint_state_count == 9
+    assert enumeration.scenarios is not None
+    assert len(enumeration.scenarios) == 3
+
+    atom_by_id = {
+        atom.atom_id: atom
+        for state in problem.terminal_state_sets
+        for atom in state.atoms
+    }
+    payouts = set()
+    for scenario in enumeration.scenarios:
+        by_action = {action_id: 0 for action_id in (
+            "polymarket:yes-1", "polymarket:no-1"
+        )}
+        for selected in scenario.atoms:
+            for payout in atom_by_id[selected.atom_id].payouts:
+                by_action[payout.action_id] += payout.payout_lower_bound_per_lot_units
+        payouts.add((by_action["polymarket:yes-1"], by_action["polymarket:no-1"]))
+
+    assert payouts == {
+        (1_000_000, 0),
+        (0, 1_000_000),
+        (500_000, 500_000),
+    }
+
+    full = evaluate_fixed_portfolio(
+        problem,
+        (
+            ActionQuantity("polymarket:yes-1", 1),
+            ActionQuantity("polymarket:no-1", 1),
+        ),
+        OracleBudget(1, 9, 1),
+    )
+    assert full.payout_lower_bound_units == 1_000_000
+    for action_id in ("polymarket:yes-1", "polymarket:no-1"):
+        single = evaluate_fixed_portfolio(
+            problem,
+            (ActionQuantity(action_id, 1),),
+            OracleBudget(1, 9, 1),
+        )
+        assert single.payout_lower_bound_units == 0
 
 
 def group_relation(n: int = 4) -> NegriskGroupRelation:
@@ -424,6 +476,39 @@ def test_mechanical_catalog_skips_market_without_tokens() -> None:
     ])
     assert result.complements == ()
     assert result.rejection_counts["complement_unparseable"] == 1
+
+
+def test_native_complement_missing_facts_stay_incomplete(tmp_path: Path) -> None:
+    # The public venue-metadata entrance must drop a market whenever the
+    # outcome-token pair, condition identity, settlement rules, or source is
+    # incomplete. A repeated token pair may leave the first distinct market,
+    # but never admits the duplicate endpoint as a second complete model.
+    incomplete_markets = [
+        mechanical_market("missing-yes", yes_token=None, no_token="no-1"),
+        mechanical_market("missing-no", yes_token="yes-1", no_token=None),
+        mechanical_market("missing-condition"),
+        mechanical_market("missing-rules", rules=""),
+        mechanical_market("missing-source", source=""),
+    ]
+    incomplete_markets[2]["conditionId"] = ""
+    for market in incomplete_markets:
+        result = discover_mechanical_relation_catalog([
+            mechanical_event(market),
+        ])
+        assert result.complements == ()
+        assert result.rejection_counts["complement_unparseable"] == 1
+        catalog = RelationCatalog(tmp_path / str(market["id"]))
+        assert catalog.current_generation() == {}
+
+    duplicate = discover_mechanical_relation_catalog([
+        mechanical_event(
+            mechanical_market("first", yes_token="yes-1", no_token="no-1"),
+            mechanical_market("duplicate", yes_token="yes-1", no_token="no-1"),
+        )
+    ])
+    assert len(duplicate.complements) == 1
+    assert duplicate.complements[0].market.market_id == "first"
+    assert duplicate.rejection_counts["duplicate_token"] == 1
 
 
 def test_mechanical_catalog_rejects_complement_with_unparseable_end_date() -> None:

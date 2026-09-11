@@ -12,6 +12,7 @@ import pytest
 from open_trader.prediction_arbitrage import BookLevel
 from open_trader.prediction_monitor_selection import SelectedComponent
 from open_trader.prediction_snapshot_scheduler import (
+    OUTCOME_TOKEN_BOOK_CONVENTION,
     ComponentSnapshot,
     LegBook,
     SnapshotLeg,
@@ -167,6 +168,24 @@ def test_economic_fingerprint_ignores_timing_fields() -> None:
         ),
     )
     assert economic_fingerprint(base) != economic_fingerprint(moved)
+
+
+def test_economic_fingerprint_binds_book_convention() -> None:
+    base = snapshot()
+    outcome_token = replace(
+        base,
+        legs=tuple(
+            replace(
+                leg,
+                book=replace(
+                    leg.book,
+                    book_convention=OUTCOME_TOKEN_BOOK_CONVENTION,
+                ),
+            )
+            for leg in base.legs
+        ),
+    )
+    assert economic_fingerprint(base) != economic_fingerprint(outcome_token)
 
 
 def test_same_fingerprint_is_deduped_and_only_refreshes_freshness() -> None:

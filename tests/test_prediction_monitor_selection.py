@@ -2,16 +2,25 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from open_trader.polymarket_relation_discovery import (
+    NativeComplementMarket,
+    NativeComplementRelation,
+)
+from open_trader.relation_catalog import RelationCatalog
+from open_trader.prediction_live_resolver import LIVE_BUDGET, LIVE_LIMITS
 from open_trader.prediction_monitor_selection import (
     BackgroundResolution,
     MonitorSelectionStore,
     SelectedComponent,
     idle_capacity,
+    problem_for_component,
+    relation_generation_problem,
     relation_generation_components,
     resolve_background_candidate,
     run_discovery,
@@ -99,7 +108,7 @@ def state(contract_id: str, key: SettlementObservationKey) -> TerminalStateSet:
                 f"{contract_id}:yes",
                 TerminalKind.NORMAL_YES,
                 "v1",
-                (ActionPayout(contract_id, 2),),
+                (ActionPayout(contract_id, 1),),
                 AS_OF,
             ),
             TerminalAtom(
@@ -222,6 +231,119 @@ def test_overlapping_relations_merge_into_one_component() -> None:
     )
 
 
+def test_native_and_legacy_models_share_valuation_before_selection(
+    tmp_path: Path,
+) -> None:
+    native_catalog = RelationCatalog(tmp_path / "native-catalog")
+    native_relation = NativeComplementRelation(
+        event_id="event-native-mixed",
+        market=NativeComplementMarket(
+            event_id="event-native-mixed",
+            market_id="market-native-mixed",
+            condition_id="condition-native-mixed",
+            question="Will the native mixed candidate resolve YES?",
+            rules="official binary resolution",
+            resolution_source="official source",
+            end_date="2026-12-31T17:00:00Z",
+            yes_token_id="native-yes",
+            no_token_id="native-no",
+            rules_hash="native-mixed-rules-v1",
+            fees_enabled=False,
+        ),
+    )
+    ingested = native_catalog.ingest_mechanical_relation(native_relation)
+    native_catalog.approve(
+        ingested["version_id"],
+        {"version_id": ingested["version_id"]},
+        actor="test",
+        git_sha="test",
+    )
+    native_identity, native_row = next(
+        iter(native_catalog.current_generation().items())
+    )
+
+    legacy_key = observation("legacy")
+    legacy_action = replace(
+        action("legacy", legacy_key),
+        settlement_asset_id="USD",
+        valuation_unit_id="USD",
+        asset_valuation_rule_id="usd-1:1-v1",
+        cost_slices=(ExecutableCostSlice(1, 1, 1),),
+    )
+    legacy = ArbitrageProblem(
+        PROBLEM_SCHEMA_V1,
+        "legacy",
+        AS_OF,
+        "USD",
+        (legacy_action,),
+        (
+            TerminalStateSet(
+                "legacy",
+                legacy_key,
+                "legacy-v1",
+                (
+                    TerminalAtom(
+                        "legacy:yes",
+                        TerminalKind.NORMAL_YES,
+                        "legacy-v1",
+                        (ActionPayout("legacy", 1),),
+                        AS_OF,
+                    ),
+                ),
+            ),
+        ),
+        ConstraintModel((), ()),
+        (),
+    )
+    generation = {
+        native_identity: native_row,
+        "legacy": row("legacy", compiled_problem=compiled(legacy)),
+    }
+
+    merged, components = relation_generation_problem(generation)
+    assert merged is not None
+    assert merged.valuation_unit_id == "usd-micro"
+    assert {
+        action.action_id: action.cost_slices[0].incremental_cost_upper_bound_units
+        for action in merged.actions
+    } == {
+        "legacy": 1_000_000,
+        "polymarket:native-yes": 0,
+        "polymarket:native-no": 0,
+    }
+    by_contract = {
+        state.market_contract_id: state for state in merged.terminal_state_sets
+    }
+    assert by_contract["native-yes"].rule_version == "polymarket-native-complement-v2"
+    assert by_contract["legacy"].rule_version == "legacy-v1"
+    assert by_contract["legacy"].atoms[0].payouts[0].payout_lower_bound_per_lot_units == 1_000_000
+
+    native_component = next(
+        component
+        for component in components
+        if component.component_id == "component:native-no:native-yes"
+    )
+    native_subproblem = problem_for_component(merged, native_component)
+    assert native_subproblem.constraint_model.forbidden_atom_combinations == ()
+    (native_relation_constraint,) = native_subproblem.constraint_model.relations
+    assert native_relation_constraint.kind == RelationKind.NATIVE_COMPLEMENT
+    budget = LIVE_BUDGET
+    resolution = resolve_background_candidate(
+        native_subproblem,
+        budget=budget,
+        limits=LIVE_LIMITS,
+    )
+    assert resolution is not None
+    assert resolution.status == VerificationStatus.QUALIFIED_VERIFIED
+    selected = select_monitor_components(
+        {native_component.component_id: resolution},
+        {},
+        problem=merged,
+        components={component.component_id: component for component in components},
+    )
+    assert set(selected) == {native_component.component_id}
+
+
 def test_disjoint_relations_form_separate_components() -> None:
     key_a = observation("a")
     key_b = observation("b")
@@ -238,7 +360,7 @@ def test_disjoint_relations_form_separate_components() -> None:
 def test_conflicting_shared_contract_models_fail_closed() -> None:
     key = observation()
     lower = replace_payout(relation_problem("contract-a", "contract-b", key), "contract-b", 1)
-    higher = replace_payout(relation_problem("contract-b", "contract-c", key), "contract-b", 2)
+    higher = replace_payout(relation_problem("contract-b", "contract-c", key), "contract-b", 0)
     generation = {
         "r:ab": row("r:ab", compiled_problem=compiled(lower)),
         "r:bc": row("r:bc", compiled_problem=compiled(higher)),

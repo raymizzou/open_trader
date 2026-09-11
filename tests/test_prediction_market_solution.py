@@ -48,7 +48,12 @@ from open_trader.prediction_n_leg_oracle import (
     derive_selected_support_graph,
     evaluate_fixed_portfolio,
 )
-from open_trader.prediction_snapshot_scheduler import ComponentSnapshot, LegBook, SnapshotLeg
+from open_trader.prediction_snapshot_scheduler import (
+    OUTCOME_TOKEN_BOOK_CONVENTION,
+    ComponentSnapshot,
+    LegBook,
+    SnapshotLeg,
+)
 from open_trader.prediction_solver import BenchmarkLimits, ObjectiveBounds, SolverEvidence
 from open_trader.prediction_solver_verified import (
     CANDIDATE_EVIDENCE_SCHEMA_V1,
@@ -304,6 +309,39 @@ def test_cost_slices_from_book_asks_bids_and_depth_truncation(book_cls) -> None:
         ExecutableCostSlice(3, 3, 20),
     )
     assert pms.cost_slices_from_book(yes, book_cls()) == ()
+
+
+def test_outcome_token_buy_uses_asks() -> None:
+    no = action(
+        "a-no", "a", ActionSide.BUY_NO, (ExecutableCostSlice(1, 1, 520_000),)
+    )
+    yes = action(
+        "a-yes", "a", ActionSide.BUY_YES, (ExecutableCostSlice(1, 1, 520_000),)
+    )
+    book = LegBook(
+        bids=(book_level("0.49", "1"),),
+        asks=(book_level("0.52", "1"),),
+        taker_fee_bps=Decimal("0"),
+        available=True,
+        book_convention=OUTCOME_TOKEN_BOOK_CONVENTION,
+    )
+    expected = (ExecutableCostSlice(1, 1, 520_000),)
+    assert pms.cost_slices_from_book(
+        no, book, price_units_per_quote_unit=1_000_000
+    ) == expected
+    assert pms.cost_slices_from_book(
+        yes, book, price_units_per_quote_unit=1_000_000
+    ) == expected
+
+    generic_no = LegBook(
+        bids=book.bids,
+        asks=book.asks,
+        taker_fee_bps=Decimal("0"),
+        available=True,
+    )
+    assert pms.cost_slices_from_book(
+        no, generic_no, price_units_per_quote_unit=1_000_000
+    ) == (ExecutableCostSlice(1, 1, 490_000),)
 
 
 # --------------------------------------------------------------------------

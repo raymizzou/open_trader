@@ -24,6 +24,8 @@ from open_trader.prediction_n_leg import (
     OracleBudget,
     OracleRequest,
     OracleResult,
+    OBSERVATION_SCHEMA_V1,
+    PROBLEM_SCHEMA_V1,
     PayoutProof,
     PortfolioCandidate,
     PortfolioSolution,
@@ -156,6 +158,177 @@ def sample_problem() -> ArbitrageProblem:
             ),
         ),
     )
+
+
+def native_complement_problem() -> ArbitrageProblem:
+    release_at = AS_OF + timedelta(days=1)
+    observation = SettlementObservationKey(
+        OBSERVATION_SCHEMA_V1,
+        "oracle-native",
+        "condition-native",
+        AS_OF,
+        AS_OF,
+        "UTC",
+        "native-rules-v1",
+    )
+    actions = (
+        CandidateAction(
+            "yes-action",
+            "polymarket",
+            "test-account",
+            "polygon",
+            "yes-token",
+            observation,
+            ActionSide.BUY_YES,
+            1,
+            1,
+            1,
+            1,
+            "usd-micro",
+            "usd-micro",
+            "usd-micro-v1",
+            (ExecutableCostSlice(1, 1, 430_000),),
+        ),
+        CandidateAction(
+            "no-action",
+            "polymarket",
+            "test-account",
+            "polygon",
+            "no-token",
+            observation,
+            ActionSide.BUY_NO,
+            1,
+            1,
+            1,
+            1,
+            "usd-micro",
+            "usd-micro",
+            "usd-micro-v1",
+            (ExecutableCostSlice(1, 1, 520_000),),
+        ),
+    )
+    states = tuple(
+        TerminalStateSet(
+            action.market_contract_id,
+            observation,
+            "native-rules-v1",
+            tuple(
+                TerminalAtom(
+                    f"{action.market_contract_id}:{kind.value}",
+                    kind,
+                    "native-rules-v1",
+                    (
+                        ActionPayout(
+                            action.action_id,
+                            payout,
+                        ),
+                    ),
+                    release_at,
+                )
+                for kind, payout in (
+                    (TerminalKind.NORMAL_YES, 1_000_000),
+                    (TerminalKind.NORMAL_NO, 0),
+                    (TerminalKind.SPLIT, 500_000),
+                )
+            ),
+        )
+        for action in actions
+    )
+    return ArbitrageProblem(
+        PROBLEM_SCHEMA_V1,
+        "native-complement-test",
+        AS_OF,
+        "usd-micro",
+        actions,
+        states,
+        ConstraintModel(
+            (
+                RelationConstraint(
+                    "native-relation",
+                    RelationKind.NATIVE_COMPLEMENT,
+                    ("yes-token", "no-token"),
+                    "native-rules-v1",
+                ),
+            ),
+            (),
+        ),
+        (),
+    )
+
+
+def test_native_complement_relation_validation() -> None:
+    problem = native_complement_problem()
+    assert validate_problem(problem) == ()
+    decoded = problem_from_payload(canonical_payload(problem))
+    assert canonical_payload(decoded) == canonical_payload(problem)
+
+    malformed = (
+        (
+            replace(
+                problem,
+                constraint_model=replace(
+                    problem.constraint_model,
+                    relations=(replace(problem.constraint_model.relations[0], contract_ids=("yes-token",)),),
+                ),
+            ),
+            "INVALID_RELATION_ARITY",
+        ),
+        (
+            replace(
+                problem,
+                constraint_model=replace(
+                    problem.constraint_model,
+                    relations=(replace(problem.constraint_model.relations[0], contract_ids=("yes-token", "yes-token")),),
+                ),
+            ),
+            "NATIVE_COMPLEMENT_CONTRACTS_NOT_DISTINCT",
+        ),
+        (
+            replace(
+                problem,
+                actions=(
+                    problem.actions[0],
+                    replace(
+                        problem.actions[1],
+                        settlement_observation_key=replace(
+                            problem.actions[1].settlement_observation_key,
+                            indicator_id="different-condition",
+                        ),
+                    ),
+                ),
+                terminal_state_sets=(
+                    problem.terminal_state_sets[0],
+                    replace(
+                        problem.terminal_state_sets[1],
+                        settlement_observation_key=replace(
+                            problem.terminal_state_sets[1].settlement_observation_key,
+                            indicator_id="different-condition",
+                        ),
+                    ),
+                ),
+            ),
+            "NATIVE_COMPLEMENT_OBSERVATION_MISMATCH",
+        ),
+        (
+            replace(
+                problem,
+                terminal_state_sets=(
+                    replace(
+                        problem.terminal_state_sets[0],
+                        atoms=tuple(
+                            atom
+                            for atom in problem.terminal_state_sets[0].atoms
+                            if atom.kind != TerminalKind.SPLIT
+                        ),
+                    ),
+                    problem.terminal_state_sets[1],
+                ),
+            ),
+            "NATIVE_COMPLEMENT_TERMINAL_KINDS",
+        ),
+    )
+    for candidate, expected_code in malformed:
+        assert expected_code in {issue.code for issue in validate_problem(candidate)}
 
 
 def test_canonical_contract_separates_master_adversary_and_result_statuses() -> None:

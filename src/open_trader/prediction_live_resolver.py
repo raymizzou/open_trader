@@ -55,14 +55,14 @@ from open_trader.prediction_monitor_selection import (
     relation_generation_problem,
 )
 from open_trader.prediction_n_leg import (
-    ActionPayout,
     ActionSide,
     ArbitrageProblem,
     ExecutableCostSlice,
     OracleBudget,
-    TerminalAtom,
+    USD_UNITS_PER_DOLLAR,
     canonical_payload,
     fingerprint,
+    normalize_problem,
 )
 from open_trader.prediction_n_leg_episodes import (
     EpisodeTracker,
@@ -92,6 +92,7 @@ from open_trader.prediction_partial_fill import (
 from open_trader.prediction_runtime_graph import RuntimeRelationGraph
 from open_trader.prediction_snapshot_scheduler import (
     ComponentSnapshot,
+    OUTCOME_TOKEN_BOOK_CONVENTION,
     LegBook,
     SnapshotLeg,
     SnapshotScheduler,
@@ -129,54 +130,11 @@ LIVE_LIMITS = BenchmarkLimits(
 # proof; a timeout yields a cached UNKNOWN proof for the same snapshot
 # fingerprint and never retries within this process.
 LIVE_PROOF_TIME_LIMIT_MS = 1_000
-USD_UNITS_PER_DOLLAR = 1_000_000
 # #83/#106: shared snapshot freshness for scheduler qualification and the
 # episode tick-level quote check.
 SNAPSHOT_FRESHNESS = timedelta(seconds=30)
 
 
-def normalize_problem(problem: ArbitrageProblem) -> ArbitrageProblem:
-    """Normalize one compiled problem to integer micro-USDC units."""
-    actions = tuple(
-        replace(
-            action,
-            settlement_asset_id="usd-micro",
-            valuation_unit_id="usd-micro",
-            asset_valuation_rule_id="usd-micro-v1",
-        )
-        for action in problem.actions
-    )
-    states = tuple(
-        replace(
-            state,
-            atoms=tuple(_normalize_atom(atom) for atom in state.atoms),
-        )
-        for state in problem.terminal_state_sets
-    )
-    return replace(
-        problem,
-        valuation_unit_id="usd-micro",
-        actions=actions,
-        terminal_state_sets=states,
-    )
-
-
-def _normalize_atom(atom: TerminalAtom) -> TerminalAtom:
-    payouts: list[ActionPayout] = []
-    for payout in atom.payouts:
-        value = payout.payout_lower_bound_per_lot_units
-        if value == 0:
-            scaled = 0
-        elif value == 1:
-            scaled = USD_UNITS_PER_DOLLAR
-        elif value > 0 and value % (USD_UNITS_PER_DOLLAR // 2) == 0:
-            # Supported micro-USDC scales: 0, 500_000 (half dollar), and any
-            # whole-dollar multiple. Anything else is an unknown payout scale.
-            scaled = value
-        else:
-            raise ValueError(f"unsupported payout scale: {value}")
-        payouts.append(ActionPayout(payout.action_id, scaled))
-    return replace(atom, payouts=tuple(payouts))
 
 
 # Issue #112/#117: per-contract fee facts aggregated from the catalog
@@ -1052,6 +1010,7 @@ class PredictionLiveResolver:
                         asks=tuple(book.asks),
                         taker_fee_bps=taker_fee_bps,
                         available=True,
+                        book_convention=OUTCOME_TOKEN_BOOK_CONVENTION,
                     ),
                     received_at=book.confirmed_at,
                     exchange_time=meta.get("exchange_time"),

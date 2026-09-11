@@ -304,6 +304,14 @@ def _violates_normal_relation(problem: ArbitrageProblem, atoms_by_contract: dict
     normal_kinds = {TerminalKind.NORMAL_YES, TerminalKind.NORMAL_NO}
     for relation in problem.constraint_model.relations:
         atoms = tuple(atoms_by_contract[contract_id] for contract_id in relation.contract_ids)
+        if relation.kind == RelationKind.NATIVE_COMPLEMENT:
+            if tuple(atom.kind for atom in atoms) not in {
+                (TerminalKind.NORMAL_YES, TerminalKind.NORMAL_NO),
+                (TerminalKind.NORMAL_NO, TerminalKind.NORMAL_YES),
+                (TerminalKind.SPLIT, TerminalKind.SPLIT),
+            }:
+                return True
+            continue
         if any(atom.kind not in normal_kinds for atom in atoms):
             continue
         yes_count = sum(atom.kind == TerminalKind.NORMAL_YES for atom in atoms)

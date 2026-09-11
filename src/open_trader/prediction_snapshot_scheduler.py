@@ -30,6 +30,9 @@ SolveRequestBuilder = Callable[
     [SelectedComponent, "ComponentSnapshot"], WorkerRequest
 ]
 
+GENERIC_BOOK_CONVENTION = "generic"
+OUTCOME_TOKEN_BOOK_CONVENTION = "outcome-token"
+
 
 @dataclass(frozen=True, slots=True)
 class LegBook:
@@ -39,6 +42,7 @@ class LegBook:
     asks: tuple[BookLevel, ...]
     taker_fee_bps: Decimal | None
     available: bool
+    book_convention: str = GENERIC_BOOK_CONVENTION
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +91,7 @@ def economic_fingerprint(snapshot: ComponentSnapshot) -> str:
                         else format(leg.book.taker_fee_bps, "f")
                     ),
                     "available": leg.book.available,
+                    "book_convention": leg.book.book_convention,
                 }
                 for leg in snapshot.legs
             ),
