@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import json
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -1395,6 +1397,127 @@ def test_refresh_reads_only_official_first_page(tmp_path: Path) -> None:
     assert monitor.snapshot()["events"][0]["event_id"] == "event-00"
     assert PagePaginator.first_page_calls == 1
     assert PagePaginator.iter_calls == 0
+
+
+def test_regular_refresh_prepares_distinct_three_way_groups(tmp_path: Path) -> None:
+    fixture_path = Path(__file__).parent / "fixtures" / "polymarket_three_way_football.json"
+    fixture = json.loads(fixture_path.read_text())
+
+    def raw_event(event_id: str, *, extra_member: bool = False) -> dict[str, object]:
+        result = copy.deepcopy(fixture)
+        result["id"] = event_id
+        result["slug"] = f"{event_id}-slug"
+        for raw_market in result["markets"]:
+            raw_market["id"] = f"{event_id}-{raw_market['id']}"
+            raw_market["slug"] = f"{event_id}-{raw_market['slug']}"
+            raw_market["conditionId"] = f"{event_id}-{raw_market['conditionId']}"
+            token_ids = json.loads(raw_market["clobTokenIds"])
+            token_ids = [f"{event_id}-{token_id}" for token_id in token_ids]
+            raw_market["clobTokenIds"] = json.dumps(token_ids)
+            raw_market["outcomes"] = [
+                {"label": "Yes", "token_id": token_ids[0]},
+                {"label": "No", "token_id": token_ids[1]},
+            ]
+        if extra_member:
+            extra = copy.deepcopy(result["markets"][0])
+            extra["id"] = f"{event_id}-extra"
+            extra["conditionId"] = f"{event_id}-extra-condition"
+            extra.pop("slug")
+            extra_tokens = json.loads(extra["clobTokenIds"])
+            extra_tokens = [f"{event_id}-extra-{token_id}" for token_id in extra_tokens]
+            extra["clobTokenIds"] = json.dumps(extra_tokens)
+            extra["outcomes"] = [
+                {"label": "Yes", "token_id": extra_tokens[0]},
+                {"label": "No", "token_id": extra_tokens[1]},
+            ]
+            result["markets"].append(extra)
+        return result
+
+    def set_raw_events(rows: list[dict[str, object]]) -> None:
+        FakePublicClient.events = rows
+        FakePublicClient.books = {
+            outcome["token_id"]: order_book(outcome["token_id"])
+            for row in rows
+            for raw_market in row["markets"]
+            for outcome in raw_market.get("outcomes", ())
+        }
+
+    setup_public([])
+    dropped_event = raw_event("football-00-dropped")
+    dropped_event.pop("volume24hr")
+    first_event = raw_event("football-one")
+    bad_event = raw_event("football-bad", extra_member=True)
+    second_event = raw_event("football-two")
+    set_raw_events([dropped_event, first_event, bad_event])
+    catalog = RelationCatalog(tmp_path / "catalog")
+    monitor = PolymarketMonitor(
+        store=PredictionArbitrageStore(tmp_path / "data"),
+        trading=FakeTrading(),
+        public_client_factory=FakePublicClient,
+        clock=lambda: NOW,
+        relation_discovery=discover_threshold_relation_catalog,
+        relation_catalog=catalog,
+    )
+
+    first_snapshot = monitor.refresh_once()
+    assert first_snapshot["status"] == "healthy"
+    assert all(
+        event_row["event_id"] != "football-00-dropped"
+        for event_row in first_snapshot["events"]
+    )
+    first_rows = catalog.review_rows()
+    assert len(first_rows) == 1
+    assert first_rows[0]["relation_type"] == "EXACTLY_ONE"
+    prepared_event_ids = {
+        endpoint["event_identity_basis"] for endpoint in first_rows[0]["endpoints"]
+    }
+    assert "football-00-dropped" not in prepared_event_ids
+    assert prepared_event_ids == {"football-one"}
+    assert len(FakePublicClient.list_events_calls) == 1
+    assert len(FakePublicClient.book_calls) == 6
+
+    set_raw_events([first_event, second_event])
+    second_snapshot = monitor.refresh_once()
+    assert second_snapshot["status"] == "healthy"
+    rows = catalog.review_rows()
+    assert len(rows) == 2
+    assert {row["relation_type"] for row in rows} == {"EXACTLY_ONE"}
+    assert {
+        endpoint["event_identity_basis"]
+        for row in rows
+        for endpoint in row["endpoints"]
+    } == {"football-one", "football-two"}
+    assert len(FakePublicClient.list_events_calls) == 2
+    assert len(FakePublicClient.book_calls) == 12
+
+    class FailingCatalog:
+        def prepared_relation_identities(self) -> set[str]:
+            return set()
+
+        def mechanical_relation_identity(self, relation: object) -> str:
+            return catalog.mechanical_relation_identity(relation)
+
+        def ingest_mechanical_relation(self, relation: object) -> dict[str, object]:
+            del relation
+            raise RuntimeError("sentinel preparation failure")
+
+    set_raw_events([first_event])
+    failing_monitor = PolymarketMonitor(
+        store=PredictionArbitrageStore(tmp_path / "failure-data"),
+        trading=FakeTrading(),
+        public_client_factory=FakePublicClient,
+        clock=lambda: NOW,
+        relation_discovery=discover_threshold_relation_catalog,
+        relation_catalog=FailingCatalog(),
+    )
+    failed_preparation_snapshot = failing_monitor.refresh_once()
+    assert failed_preparation_snapshot["status"] == "healthy"
+    assert failed_preparation_snapshot["universe_refreshed_at"] == NOW
+    assert any(
+        entry.get("phase") == "mechanical_candidate_prepared"
+        and entry.get("status") == "failed"
+        for entry in failing_monitor._relation_scan_logs
+    )
 
 
 def setup_threshold_books(

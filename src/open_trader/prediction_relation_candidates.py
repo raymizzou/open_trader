@@ -252,22 +252,31 @@ def prepare_mechanical_relation_candidates(
     derive = getattr(catalog, "prepared_relation_identities", None)
     if catalog is not None and callable(derive):
         prepared_identities = set(derive())
-    ordered: list[tuple[str, object]] = [
-        (str(getattr(relation, "relation_type")), relation)
-        for relation in complements
-    ]
-    ordered.extend(
-        (str(getattr(relation, "relation_type")), relation) for relation in groups
-    )
-    ordered.sort(key=lambda item: str(getattr(item[1], "event_id")))
-    prepared: list[dict[str, object]] = []
-    skipped = 0
-    for relation_type, relation in ordered:
+    ordered: list[tuple[int, str, str, str, object]] = []
+    for relation in (*complements, *groups):
+        relation_type = str(getattr(relation, "relation_type"))
         identity = (
             str(catalog.mechanical_relation_identity(relation))
             if catalog is not None
             else ""
         )
+        ordered.append(
+            (
+                0
+                if relation_type == "EXACTLY_ONE"
+                and str(getattr(relation, "template", ""))
+                == "FOOTBALL_REGULAR_TIME_3WAY_V1"
+                else 1,
+                str(getattr(relation, "event_id")),
+                identity,
+                relation_type,
+                relation,
+            )
+        )
+    ordered.sort(key=lambda item: item[:3])
+    prepared: list[dict[str, object]] = []
+    skipped = 0
+    for _, _, identity, relation_type, relation in ordered:
         if prepared_identities is not None and identity in prepared_identities:
             skipped += 1
             continue

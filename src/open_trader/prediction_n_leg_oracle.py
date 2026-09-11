@@ -95,8 +95,9 @@ class PortfolioEvaluation:
     guaranteed_profit_units: int
     worst_scenario: SettlementScenario
     worst_state_cut: WorstStateCut
-    conservative_capital_release_at: datetime
+    conservative_capital_release_at: datetime | None
     failed_qualification_ids: tuple[str, ...]
+    time_qualification: str = "KNOWN"
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,7 +268,20 @@ def build_relation_components(
 
 
 def enumerate_allowed_scenarios(problem: ArbitrageProblem, budget: OracleBudget) -> ScenarioEnumeration:
-    if validate_problem(problem):
+    return _enumerate_allowed_scenarios(problem, budget)
+
+
+def _enumerate_allowed_scenarios(
+    problem: ArbitrageProblem,
+    budget: OracleBudget,
+    *,
+    allow_unknown_release: bool = False,
+) -> ScenarioEnumeration:
+    issues = validate_problem(problem)
+    if issues and not (
+        allow_unknown_release
+        and all(issue.code == "MISSING_CAPITAL_RELEASE_AT" for issue in issues)
+    ):
         return ScenarioEnumeration(None, 0, UnknownReason.INVALID_MODEL)
     state_sets = tuple(sorted(problem.terminal_state_sets, key=lambda state: state.market_contract_id))
     raw_joint_state_count = 1
@@ -326,6 +340,10 @@ def _violates_normal_relation(problem: ArbitrageProblem, atoms_by_contract: dict
 
 def cut_from_scenario(problem: ArbitrageProblem, scenario: SettlementScenario) -> WorstStateCut:
     _require_valid(problem)
+    return _cut_from_scenario(problem, scenario)
+
+
+def _cut_from_scenario(problem: ArbitrageProblem, scenario: SettlementScenario) -> WorstStateCut:
     selected_atom_ids = {selected.market_contract_id: selected.atom_id for selected in scenario.atoms}
     if len(selected_atom_ids) != len(scenario.atoms):
         raise ValueError("scenario selects a contract more than once")
@@ -435,7 +453,10 @@ def _qualification_passes(problem: ArbitrageProblem, constraint: QualificationCo
 
 
 def _release_delay_seconds(problem: ArbitrageProblem, evaluation: PortfolioEvaluation) -> int:
-    delay = evaluation.conservative_capital_release_at - problem.as_of
+    release_at = evaluation.conservative_capital_release_at
+    if release_at is None:
+        raise ValueError("capital release time is unknown")
+    delay = release_at - problem.as_of
     whole_seconds = _checked_add(_checked_multiply(delay.days, 24 * 60 * 60), delay.seconds)
     return _checked_add(whole_seconds, int(bool(delay.microseconds)))
 
@@ -445,23 +466,32 @@ def _occupied_days(problem: ArbitrageProblem, evaluation: PortfolioEvaluation) -
     return max(1, _checked_add(seconds, 86_399) // 86_400)
 
 
-def evaluate_fixed_portfolio(
+def _evaluate_portfolio(
     problem: ArbitrageProblem,
     quantities: tuple[ActionQuantity, ...],
     budget: OracleBudget,
+    *,
+    allow_unknown_release: bool,
 ) -> PortfolioEvaluation:
-    _require_valid(problem)
+    issues = validate_problem(problem)
+    if issues and not (
+        allow_unknown_release
+        and all(issue.code == "MISSING_CAPITAL_RELEASE_AT" for issue in issues)
+    ):
+        raise ValueError("invalid problem: " + "; ".join(issue.code for issue in issues))
     selected = _selected_quantities(problem, quantities)
     if not selected:
         raise ValueError("fixed portfolio must select at least one action")
-    enumeration = enumerate_allowed_scenarios(problem, budget)
+    enumeration = _enumerate_allowed_scenarios(
+        problem, budget, allow_unknown_release=allow_unknown_release
+    )
     if enumeration.scenarios is None:
         raise ValueError(enumeration.unknown_reason.value if enumeration.unknown_reason is not None else "scenario enumeration failed")
     quantities_by_action = {quantity.action_id: quantity.quantity_lots for quantity in selected}
 
     def payout(scenario: SettlementScenario) -> int:
         total = 0
-        for payout in cut_from_scenario(problem, scenario).payout_per_lot:
+        for payout in _cut_from_scenario(problem, scenario).payout_per_lot:
             total = _checked_add(
                 total,
                 _checked_multiply(
@@ -481,11 +511,16 @@ def evaluate_fixed_portfolio(
         state.market_contract_id: {atom.atom_id: atom for atom in state.atoms}
         for state in problem.terminal_state_sets
     }
-    conservative_capital_release_at = max(
+    selected_releases = tuple(
         atoms_by_contract[selected_atom.market_contract_id][selected_atom.atom_id].capital_release_at
         for scenario in enumeration.scenarios
         for selected_atom in scenario.atoms
         if selected_atom.market_contract_id in selected_contract_ids
+    )
+    conservative_capital_release_at = (
+        None
+        if any(release_at is None for release_at in selected_releases)
+        else max(selected_releases)
     )
     cost_upper_bound_units = _cost_upper_bound_for_selected(problem, selected)
     provisional = PortfolioEvaluation(
@@ -494,16 +529,51 @@ def evaluate_fixed_portfolio(
         cost_upper_bound_units,
         _checked_subtract(payout_lower_bound_units, cost_upper_bound_units),
         worst_scenario,
-        cut_from_scenario(problem, worst_scenario),
+        _cut_from_scenario(problem, worst_scenario),
         conservative_capital_release_at,
         (),
+        "UNKNOWN" if conservative_capital_release_at is None else "KNOWN",
     )
     failed_qualification_ids = tuple(
         constraint.constraint_id
         for constraint in sorted(problem.qualification_constraints, key=lambda constraint: constraint.constraint_id)
+        if not (
+            conservative_capital_release_at is None
+            and constraint.metric
+            in {
+                QualificationMetric.ANNUALIZED_RETURN_PPM,
+                QualificationMetric.MAX_CAPITAL_RELEASE_DELAY_SECONDS,
+            }
+        )
         if not _qualification_passes(problem, constraint, provisional)
     )
     return replace(provisional, failed_qualification_ids=failed_qualification_ids)
+
+
+def evaluate_fixed_portfolio(
+    problem: ArbitrageProblem,
+    quantities: tuple[ActionQuantity, ...],
+    budget: OracleBudget,
+) -> PortfolioEvaluation:
+    return _evaluate_portfolio(
+        problem, quantities, budget, allow_unknown_release=False
+    )
+
+
+def evaluate_paper_portfolio(
+    problem: ArbitrageProblem,
+    quantities: tuple[ActionQuantity, ...],
+    budget: OracleBudget,
+) -> PortfolioEvaluation:
+    """Evaluate a fixed portfolio while keeping only release time unknown.
+
+    Paper analysis may calculate payout economics without inventing a release
+    timestamp. Every other model defect remains a hard rejection, and the
+    returned evaluation has no formal proof shape.
+    """
+    return _evaluate_portfolio(
+        problem, quantities, budget, allow_unknown_release=True
+    )
 
 
 def evaluate_fill_adversary(

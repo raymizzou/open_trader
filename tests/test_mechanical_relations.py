@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from dataclasses import replace
 from decimal import Decimal
+from itertools import product
 from pathlib import Path
 
 import pytest
@@ -436,6 +438,320 @@ def mechanical_event(
         "negRisk": neg_risk,
         "markets": list(markets),
     }
+
+
+THREE_WAY_FIXTURE = Path(__file__).with_name("fixtures") / "polymarket_three_way_football.json"
+
+
+def three_way_event() -> dict[str, object]:
+    """Return the small public-source football fixture used by the new codec."""
+
+    payload = json.loads(THREE_WAY_FIXTURE.read_text(encoding="utf-8"))
+    event = payload[0] if isinstance(payload, list) else payload
+    assert isinstance(event, dict)
+    event = deepcopy(event)
+    draw = event["markets"][1]
+    labels = json.loads(draw["outcomes"])
+    token_ids = json.loads(draw["clobTokenIds"])
+    by_label = dict(zip(labels, token_ids, strict=True))
+    draw["outcomes"] = json.dumps(["No", "Yes"])
+    draw["clobTokenIds"] = json.dumps([by_label["No"], by_label["Yes"]])
+    return event
+
+
+@pytest.mark.parametrize("as_sdk", [False, True], ids=["json", "sdk"])
+def test_three_way_discovery_preserves_complete_identity(
+    tmp_path: Path, as_sdk: bool
+) -> None:
+    event = three_way_event()
+    if as_sdk:
+        from polymarket.models.gamma.event import Event
+
+        raw_event: object = Event.model_validate(event)
+    else:
+        raw_event = event
+
+    result = discover_mechanical_relation_catalog([raw_event])
+
+    assert len(result.groups) == 1
+    group = result.groups[0]
+    assert group.group_id == event["negRiskMarketID"]
+    assert group.member_count == 3
+    assert group.template == "FOOTBALL_REGULAR_TIME_3WAY_V1"
+    assert group.neg_risk_augmented is False
+    assert group.neg_risk_other is (None if as_sdk else False)
+    assert {market.condition_id for market in group.markets} == {
+        market["conditionId"] for market in event["markets"]
+    }
+    assert len({market.yes_token_id for market in group.markets}) == 3
+    assert len({market.no_token_id for market in group.markets}) == 3
+    draw = next(market for market in group.markets if "draw" in market.question.casefold())
+    assert draw.yes_token_id == json.loads(event["markets"][1]["clobTokenIds"])[1]
+    assert draw.no_token_id == json.loads(event["markets"][1]["clobTokenIds"])[0]
+
+    catalog = RelationCatalog(tmp_path)
+    ingested = catalog.ingest_mechanical_relation(group)
+    (row,) = catalog.review_rows()
+    assert ingested["identity"] == "EXACTLY_ONE|" + "|".join(
+        f"polymarket:{condition_id}"
+        for condition_id in sorted(
+            market["conditionId"] for market in event["markets"]
+        )
+    )
+    assert row["model"]["group_id"] == event["negRiskMarketID"]
+    assert row["model"]["member_count"] == 3
+    assert row["model"]["template"] == "FOOTBALL_REGULAR_TIME_3WAY_V1"
+    by_condition = {
+        endpoint["contract_id"]: endpoint for endpoint in row["endpoints"]
+    }
+    for market in event["markets"]:
+        endpoint = by_condition[market["conditionId"]]
+        assert endpoint["settlement_rules"] == market["description"]
+        assert endpoint["yes_token_id"] == (
+            json.loads(market["clobTokenIds"])[
+                json.loads(market["outcomes"]).index("Yes")
+            ]
+        )
+        assert endpoint["no_token_id"] == (
+            json.loads(market["clobTokenIds"])[
+                json.loads(market["outcomes"]).index("No")
+            ]
+        )
+
+    missing_leg = deepcopy(event)
+    missing_leg["markets"] = missing_leg["markets"][:2]
+    assert discover_mechanical_relation_catalog([missing_leg]).groups == ()
+
+    conflict = deepcopy(event)
+    conflict["markets"][2]["negRiskMarketID"] = "different-group"
+    assert discover_mechanical_relation_catalog([conflict]).groups == ()
+
+
+@pytest.mark.parametrize("as_sdk", [False, True], ids=["json", "sdk"])
+def test_football_title_drift_does_not_fall_back_to_generic_group(
+    tmp_path: Path, as_sdk: bool
+) -> None:
+    event = three_way_event()
+    event["title"] = str(event["title"]).replace(" vs. ", " against ")
+    if as_sdk:
+        from polymarket.models.gamma.event import Event
+
+        raw_event: object = Event.model_validate(event)
+    else:
+        raw_event = event
+
+    result = discover_mechanical_relation_catalog([raw_event])
+
+    assert result.groups == ()
+    assert result.rejection_counts["group_three_way_unsupported"] == 1
+    catalog = RelationCatalog(tmp_path)
+    for group in result.groups:
+        catalog.ingest_mechanical_relation(group)
+    assert catalog.review_rows() == []
+
+
+@pytest.mark.parametrize("duplicate_kind", ["distinct", "identical"])
+def test_three_way_discovery_rejects_duplicate_raw_members(
+    duplicate_kind: str,
+) -> None:
+    event = three_way_event()
+    draw = deepcopy(event["markets"][1])
+    if duplicate_kind == "distinct":
+        draw["id"] = "duplicate-draw-market"
+        draw["clobTokenIds"] = json.dumps(["duplicate-draw-yes", "duplicate-draw-no"])
+        # Keep the malformed duplicate inside the SDK's three-index identity
+        # set so the regression exercises the member-association boundary,
+        # rather than only the question-id count check.
+        draw["questionID"] = event["markets"][2]["questionID"]
+    event["markets"].insert(1, draw)
+
+    result = discover_mechanical_relation_catalog([event])
+
+    assert result.groups == ()
+    assert (
+        result.rejection_counts["group_identity_conflict"]
+        + result.rejection_counts["group_three_way_incomplete"]
+        + result.rejection_counts["group_three_way_unsupported"]
+    ) >= 1
+
+
+def test_generic_negrisk_draw_word_is_not_a_football_template() -> None:
+    event = mechanical_event(
+        mechanical_market("m0"),
+        mechanical_market("m1"),
+        event_id="generic-draw-group",
+        neg_risk=True,
+    )
+    event["negRiskMarketID"] = "generic-group"
+    event["markets"][0]["question"] = "Will the draw word appear?"
+
+    result = discover_mechanical_relation_catalog([event])
+
+    assert len(result.groups) == 1
+    group = result.groups[0]
+    assert group.template is None
+    assert result.rejection_counts["group_three_way_incomplete"] == 0
+
+
+@pytest.mark.parametrize(
+    ("home", "away", "date", "pretty_date", "event_id"),
+    [
+        ("Lille OSC", "AS Monaco", "2026-10-04", "October 4, 2026", "event-lille"),
+        ("RC Lens", "OGC Nice", "2026-10-18", "October 18, 2026", "event-lens"),
+    ],
+)
+def test_supported_three_way_template_preserves_joint_payouts(
+    tmp_path: Path,
+    home: str,
+    away: str,
+    date: str,
+    pretty_date: str,
+    event_id: str,
+) -> None:
+    event = three_way_event()
+    event["id"] = event_id
+    event["title"] = f"{home} vs. {away}"
+    for market in event["markets"]:
+        market["question"] = (
+            str(market["question"])
+            .replace("Stade Rennais FC 1901", home)
+            .replace("Olympique de Marseille", away)
+            .replace("2026-09-11", date)
+        )
+        market["description"] = (
+            str(market["description"])
+            .replace("Stade Rennais FC 1901", home)
+            .replace("Olympique de Marseille", away)
+            .replace("September 11, 2026", pretty_date)
+        )
+
+    result = discover_mechanical_relation_catalog([event])
+    (group,) = result.groups
+    catalog = RelationCatalog(tmp_path)
+    catalog.ingest_mechanical_relation(group)
+    (row,) = catalog.review_rows()
+
+    model = row["model"]
+    assert model["incomplete_reasons"] == ["MISSING_CAPITAL_RELEASE_AT"]
+    assert model["capital_release"] is None
+    expected_directions = {
+        market["conditionId"]: (
+            "DRAW"
+            if "draw" in str(market["question"]).casefold()
+            else "HOME_WIN"
+            if home in str(market["question"])
+            else "AWAY_WIN"
+        )
+        for market in event["markets"]
+    }
+    assert model["directions"] == expected_directions
+    assert model["fee_facts"] == {
+        market["conditionId"]: {"exponent": 1, "taker_only": True}
+        for market in event["markets"]
+    }
+
+    directions = model["directions"]
+    payouts = model["payouts"]
+    assert set(directions.values()) == {"HOME_WIN", "DRAW", "AWAY_WIN"}
+    assert all(payout == {"NORMAL_YES": 1, "NORMAL_NO": 0} for payout in payouts.values())
+
+    problem = problem_from_payload(model["problem"], allow_unknown_data=True)
+    assert {
+        issue.code for issue in validate_problem(problem)
+    } == {"MISSING_CAPITAL_RELEASE_AT"}
+    (constraint,) = problem.constraint_model.relations
+    assert constraint.kind == RelationKind.EXACTLY_ONE
+    assert set(constraint.contract_ids) == set(directions)
+    states = tuple(sorted(problem.terminal_state_sets, key=lambda item: item.market_contract_id))
+    all_vectors = tuple(product(*(state.atoms for state in states)))
+    assert len(all_vectors) == 8
+    states_by_role = {
+        directions[state.market_contract_id]: state for state in states
+    }
+
+    def payout(role: str, kind: TerminalKind) -> int:
+        atom = next(
+            atom for atom in states_by_role[role].atoms if atom.kind == kind
+        )
+        return sum(item.payout_lower_bound_per_lot_units for item in atom.payouts)
+
+    actual_vectors = {
+        result: tuple(
+            payout(role, TerminalKind.NORMAL_YES if role == result else TerminalKind.NORMAL_NO)
+            for role in ("HOME_WIN", "DRAW", "AWAY_WIN")
+        )
+        for result in ("HOME_WIN", "DRAW", "AWAY_WIN")
+    }
+    # Cancellation is explicitly the same payout vector as DRAW in this
+    # template; a postponed match has no release timestamp to invent.
+    actual_vectors["CANCELLED"] = tuple(
+        payout(role, TerminalKind.NORMAL_YES if role == "DRAW" else TerminalKind.NORMAL_NO)
+        for role in ("HOME_WIN", "DRAW", "AWAY_WIN")
+    )
+    assert actual_vectors == {
+        "HOME_WIN": (1, 0, 0),
+        "DRAW": (0, 1, 0),
+        "AWAY_WIN": (0, 0, 1),
+        "CANCELLED": (0, 1, 0),
+    }
+    allowed_vectors = {
+        tuple(int(atom.kind == TerminalKind.NORMAL_YES) for atom in atoms)
+        for atoms in all_vectors
+        if sum(atom.kind == TerminalKind.NORMAL_YES for atom in atoms) == 1
+    }
+    assert allowed_vectors == {(1, 0, 0), (0, 1, 0), (0, 0, 1)}
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "unknown-cancel-rule",
+        "augmented-event",
+        "explicit-other",
+        "missing-member",
+        "conflicting-member-group",
+        "conflicting-draw-question",
+        "conflicting-home-date",
+    ],
+)
+def test_three_way_unknown_rules_do_not_gain_qualification(
+    tmp_path: Path, mutation: str
+) -> None:
+    baseline = three_way_event()
+    baseline_result = discover_mechanical_relation_catalog([baseline])
+    assert len(baseline_result.groups) == 1
+    baseline_catalog = RelationCatalog(tmp_path / "baseline")
+    baseline_catalog.ingest_mechanical_relation(baseline_result.groups[0])
+    (baseline_row,) = baseline_catalog.review_rows()
+    assert baseline_row["model"]["template"] == "FOOTBALL_REGULAR_TIME_3WAY_V1"
+
+    event = deepcopy(baseline)
+    if mutation == "unknown-cancel-rule":
+        draw = next(market for market in event["markets"] if "draw" in market["question"].casefold())
+        draw["description"] = draw["description"].replace(
+            "with no make-up game", "with a make-up game"
+        )
+    elif mutation == "augmented-event":
+        event["negRiskAugmented"] = True
+    elif mutation == "explicit-other":
+        event["negRiskOther"] = True
+    elif mutation == "missing-member":
+        event["markets"] = event["markets"][:2]
+    elif mutation == "conflicting-member-group":
+        event["markets"][2]["negRiskMarketID"] = "different-group"
+    elif mutation == "conflicting-draw-question":
+        draw = next(market for market in event["markets"] if "draw" in market["question"].casefold())
+        draw["question"] = "Will Chelsea vs. Arsenal end in a draw?"
+    elif mutation == "conflicting-home-date":
+        home = next(market for market in event["markets"] if "Stade Rennais" in market["question"])
+        home["question"] = home["question"].replace("2026-09-11", "2026-09-12")
+    else:
+        raise AssertionError(f"unknown test mutation: {mutation}")
+
+    result = discover_mechanical_relation_catalog([event])
+    assert result.groups == ()
+    rejected = RelationCatalog(tmp_path / mutation).review_rows()
+    assert rejected == []
 
 
 # Slice 6 (B1/B3 complement): the mechanical catalog derives one

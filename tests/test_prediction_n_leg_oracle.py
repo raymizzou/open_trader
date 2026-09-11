@@ -47,6 +47,7 @@ from open_trader.prediction_n_leg import (
     canonical_payload,
     canonicalize_directional_actions,
     fingerprint,
+    payout_proof_from_payload,
     request_from_payload,
     result_from_payload,
     validate_problem,
@@ -62,11 +63,13 @@ from open_trader.prediction_n_leg_oracle import (
     derive_selected_support_graph,
     enumerate_allowed_scenarios,
     evaluate_fixed_portfolio,
+    evaluate_paper_portfolio,
     split_disconnected_solution,
 )
 
 
 AS_OF = datetime(2026, 8, 12, tzinfo=UTC)
+KNOWN_RELEASE = AS_OF + timedelta(days=2)
 
 
 ORACLE_CORPUS_PATH = Path(__file__).with_name("fixtures") / "prediction_n_leg_v1.json"
@@ -1136,6 +1139,117 @@ def test_solution_builder_does_not_reenumerate_a_huge_bounded_evaluation() -> No
     solution = build_portfolio_solution(built, evaluation, support)
 
     assert solution.quantities == quantities
+
+
+def _paper_three_way_problem(*, releases_known: bool = False) -> ArbitrageProblem:
+    keys = tuple(observation(name) for name in ("home", "draw", "away"))
+    costs = (30, 30, 35)
+    actions = tuple(
+        action(
+            role,
+            f"action-{role}",
+            key,
+            (ExecutableCostSlice(1, 5, cost),),
+        )
+        for role, key, cost in zip(("home", "draw", "away"), keys, costs, strict=True)
+    )
+    states = tuple(
+        state(
+            role,
+            key,
+            f"action-{role}",
+            ((f"{role}-yes", TerminalKind.NORMAL_YES, 100), (f"{role}-no", TerminalKind.NORMAL_NO, 0)),
+            KNOWN_RELEASE if releases_known else None,
+        )
+        for role, key in zip(("home", "draw", "away"), keys, strict=True)
+    )
+    return problem(
+        actions,
+        states,
+        (RelationConstraint("three-way", RelationKind.EXACTLY_ONE, ("home", "draw", "away"), "v1"),),
+    )
+
+
+def test_paper_evaluation_keeps_unknown_release_out_of_formal_proof() -> None:
+    quantities = tuple(
+        ActionQuantity(f"action-{role}", 5)
+        for role in ("home", "draw", "away")
+    )
+    budget = OracleBudget(16, 8, 2)
+    built = _paper_three_way_problem()
+
+    paper = evaluate_paper_portfolio(built, quantities, budget)
+
+    assert paper.payout_lower_bound_units == 500
+    assert paper.cost_upper_bound_units == 475
+    assert paper.guaranteed_profit_units == 25
+    assert paper.conservative_capital_release_at is None
+    assert paper.time_qualification == "UNKNOWN"
+    with pytest.raises(ModelDecodeError):
+        payout_proof_from_payload(canonical_payload(paper))
+
+    timed = replace(
+        built,
+        qualification_constraints=(
+            QualificationConstraint(
+                "annual-unknown",
+                "v1",
+                QualificationMetric.ANNUALIZED_RETURN_PPM,
+                Comparison.GREATER_THAN_OR_EQUAL,
+                10_000_000_000,
+                1,
+            ),
+            QualificationConstraint(
+                "release-unknown",
+                "v1",
+                QualificationMetric.MAX_CAPITAL_RELEASE_DELAY_SECONDS,
+                Comparison.LESS_THAN_OR_EQUAL,
+                -1,
+                1,
+            ),
+        ),
+    )
+    timed_paper = evaluate_paper_portfolio(timed, quantities, budget)
+    assert timed_paper.failed_qualification_ids == ()
+    assert timed_paper.time_qualification == "UNKNOWN"
+
+    formal = oracle.find_qualified(
+        OracleRequest(REQUEST_SCHEMA_V1, SearchMode.ADMISSION, built, budget)
+    )
+    assert formal.business_status == BusinessStatus.UNKNOWN
+    assert formal.unknown_reason == UnknownReason.UNKNOWN_TERMINAL_DATA
+
+    known = evaluate_fixed_portfolio(
+        _paper_three_way_problem(releases_known=True), quantities, budget
+    )
+    assert known.payout_lower_bound_units == 500
+    assert known.cost_upper_bound_units == 475
+    assert known.guaranteed_profit_units == 25
+    assert known.conservative_capital_release_at == KNOWN_RELEASE
+    assert known.time_qualification == "KNOWN"
+
+
+@pytest.mark.parametrize(
+    ("missing", "expected_code"),
+    (("payout", "MISSING_ACTION_PAYOUT"), ("rule_version", "MISSING_TERMINAL_RULE_IDENTITY")),
+    ids=("payout", "rule_version"),
+)
+def test_paper_evaluation_rejects_unknown_payout_or_rules(missing: str, expected_code: str) -> None:
+    built = _paper_three_way_problem()
+    state_set = built.terminal_state_sets[0]
+    atom = state_set.atoms[0]
+    changed = replace(atom, payouts=()) if missing == "payout" else replace(atom, rule_version=None)
+    broken = replace(
+        built,
+        terminal_state_sets=(replace(state_set, atoms=(changed, *state_set.atoms[1:])), *built.terminal_state_sets[1:]),
+    )
+
+    with pytest.raises(ValueError, match=expected_code):
+        evaluate_paper_portfolio(
+            broken,
+            tuple(ActionQuantity(f"action-{role}", 5) for role in ("home", "draw", "away")),
+            OracleBudget(16, 8, 2),
+        )
 
 
 def _admission_request(built: ArbitrageProblem, budget: OracleBudget) -> OracleRequest:

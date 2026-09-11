@@ -26,6 +26,7 @@ from open_trader.prediction_arbitrage_store import (
 )
 from open_trader.prediction_relation_candidates import (
     group_relation_candidates,
+    prepare_mechanical_relation_candidates,
     prepare_relation_candidates,
 )
 from open_trader.relation_catalog import RelationCatalog
@@ -448,3 +449,173 @@ def test_cli_relation_candidates_dry_run_readonly_database(
         assert report["version_ids"] == []
     finally:
         db.chmod(0o644)
+
+
+def test_preparation_prioritizes_supported_three_way_without_duplicates(
+    tmp_path: Path,
+) -> None:
+    fixture_path = Path(__file__).parent / "fixtures" / "polymarket_three_way_football.json"
+    fixture = json.loads(fixture_path.read_text())
+    discovered = discover_mechanical_relation_catalog([fixture])
+    (group,) = discovered.groups
+
+    second_group_id = "second-group"
+    second_group = replace(
+        group,
+        event_id="second-event",
+        group_id=second_group_id,
+        markets=tuple(
+            replace(
+                market,
+                event_id="second-event",
+                market_id=f"second-{market.market_id}",
+                condition_id=f"second-{market.condition_id}",
+                yes_token_id=f"second-{market.yes_token_id}",
+                no_token_id=f"second-{market.no_token_id}",
+                group_id=second_group_id,
+            )
+            for market in group.markets
+        ),
+    )
+    catalog = RelationCatalog(tmp_path)
+
+    first = prepare_mechanical_relation_candidates(
+        catalog,
+        discovered.complements,
+        (second_group, group),
+    )
+    assert first["status"] == "PREPARED"
+    assert first["prepared"] == 1
+    assert first["components"][0]["relation_type"] == "EXACTLY_ONE"
+    assert first["components"][0]["event_id"] == group.event_id
+    assert catalog.pending_count() == 1
+
+    (row,) = catalog.review_rows()
+    assert row["relation_type"] == "EXACTLY_ONE"
+    assert row["status"] == "PENDING"
+    assert row["activation"] == "PENDING"
+    assert row["model"]["template"] == "FOOTBALL_REGULAR_TIME_3WAY_V1"
+    assert row["model"]["member_count"] == 3
+    assert row["model"]["incomplete_reasons"] == ["MISSING_CAPITAL_RELEASE_AT"]
+    assert row["model"]["capital_release"] is None
+    assert row["model"]["tokens"] == {
+        market.condition_id: {
+            "YES": market.yes_token_id,
+            "NO": market.no_token_id,
+        }
+        for market in group.markets
+    }
+
+    second = prepare_mechanical_relation_candidates(
+        catalog,
+        discovered.complements,
+        (second_group, group),
+    )
+    assert second["status"] == "PREPARED"
+    assert second["prepared"] == 1
+    assert second["skipped"] >= 1
+    assert second["components"][0]["event_id"] == second_group.event_id
+    assert catalog.pending_count() == 2
+
+    third = prepare_mechanical_relation_candidates(catalog, (), (group,))
+    assert third["status"] == "SKIPPED"
+    assert third["prepared"] == 0
+    assert catalog.pending_count() == 2
+
+
+@pytest.mark.parametrize("terminal_status", ["REVOKED", "EXPIRED"])
+def test_supported_three_way_rediscovery_preserves_terminal_identities(
+    tmp_path: Path, terminal_status: str
+) -> None:
+    fixture_path = Path(__file__).parent / "fixtures" / "polymarket_three_way_football.json"
+    fixture = json.loads(fixture_path.read_text())
+    discovered = discover_mechanical_relation_catalog([fixture])
+    (group,) = discovered.groups
+
+    second_group_id = "second-group"
+    second_group = replace(
+        group,
+        event_id="second-event",
+        group_id=second_group_id,
+        markets=tuple(
+            replace(
+                market,
+                event_id="second-event",
+                market_id=f"second-{market.market_id}",
+                condition_id=f"second-{market.condition_id}",
+                yes_token_id=f"second-{market.yes_token_id}",
+                no_token_id=f"second-{market.no_token_id}",
+                group_id=second_group_id,
+            )
+            for market in group.markets
+        ),
+    )
+    catalog = RelationCatalog(tmp_path)
+
+    legacy_group = replace(group, template=None)
+    terminal_identity = catalog.mechanical_relation_identity(group)
+    assert catalog.mechanical_relation_identity(legacy_group) == terminal_identity
+    seeded = catalog.ingest_mechanical_relation(legacy_group)
+    terminal_version_id = str(seeded["version_id"])
+    catalog.approve(
+        terminal_version_id,
+        {"version_id": terminal_version_id},
+        actor="test",
+        git_sha="test",
+    )
+    if terminal_status == "REVOKED":
+        catalog.revoke(
+            terminal_version_id,
+            {"version_id": terminal_version_id},
+            reason="rules_changed",
+            actor="test",
+            git_sha="test",
+        )
+    else:
+        catalog.expire_stale_members(
+            now="2027-01-01T00:00:00Z",
+            actor="test",
+            git_sha="test",
+        )
+
+    terminal_before = [
+        row for row in catalog.review_rows() if row["identity"] == terminal_identity
+    ]
+    assert len(terminal_before) == 1
+    assert terminal_before[0]["version_id"] == terminal_version_id
+    assert terminal_before[0]["status"] == terminal_status
+    assert terminal_before[0]["occurrence_count"] == 1
+    assert len(catalog.list("history")) == 1
+    assert catalog.pending_count() == 0
+
+    first = prepare_mechanical_relation_candidates(
+        catalog,
+        (),
+        (group, second_group),
+    )
+    assert first["status"] == "PREPARED"
+    assert first["prepared"] == 1
+    assert first["skipped"] == 1
+    assert first["components"][0]["event_id"] == second_group.event_id
+
+    terminal_after = [
+        row for row in catalog.review_rows() if row["identity"] == terminal_identity
+    ]
+    assert len(terminal_after) == 1
+    assert terminal_after[0]["version_id"] == terminal_version_id
+    assert terminal_after[0]["status"] == terminal_status
+    assert terminal_after[0]["occurrence_count"] == 1
+    assert len(catalog.list("history")) == 1
+    assert catalog.pending_count() == 1
+
+    second = prepare_mechanical_relation_candidates(
+        catalog,
+        (),
+        (group, second_group),
+    )
+    assert second["status"] == "SKIPPED"
+    assert second["prepared"] == 0
+    assert second["skipped"] == 2
+    assert len(catalog.review_rows()) == 2
+    assert len(catalog.list("history")) == 1
+    assert catalog.pending_count() == 1

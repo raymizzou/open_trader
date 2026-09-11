@@ -1658,6 +1658,48 @@ class PolymarketMonitor:
             market_id = str(previous.get("market_id", opportunity_id.split(":", 1)[-1]))
             self._close_signal(market_id, "opportunity_closed")
         self._sync_event_rows()
+        if self._relation_catalog is not None:
+            try:
+                from .polymarket_relation_discovery import (
+                    discover_mechanical_relation_catalog,
+                )
+                from .prediction_relation_candidates import (
+                    prepare_mechanical_relation_candidates,
+                )
+
+                eligible_event_ids = {
+                    str(event_row["event_id"]) for event_row in normalized
+                }
+                eligible_rows = tuple(
+                    row
+                    for row in rows
+                    if str(
+                        _value(row, "id", "event_id", "eventId", default="")
+                    )
+                    in eligible_event_ids
+                )
+                mechanical_result = discover_mechanical_relation_catalog(eligible_rows)
+                mechanical_report = prepare_mechanical_relation_candidates(
+                    self._relation_catalog,
+                    mechanical_result.complements,
+                    mechanical_result.groups,
+                    max_components=1,
+                )
+                self._log_relation_scan(
+                    phase="mechanical_candidate_prepared",
+                    status=str(mechanical_report.get("status")),
+                    scope="refresh",
+                    prepared=int(mechanical_report.get("prepared", 0)),
+                    skipped=int(mechanical_report.get("skipped", 0)),
+                    fingerprint=mechanical_report.get("fingerprint"),
+                )
+            except Exception as exc:
+                self._log_relation_scan(
+                    phase="mechanical_candidate_prepared",
+                    status="failed",
+                    scope="refresh",
+                    reason=type(exc).__name__,
+                )
         self._write_runtime(force=True)
 
     def _log_relation_scan(self, **fields: object) -> None:

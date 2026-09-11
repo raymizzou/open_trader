@@ -9,7 +9,7 @@ import os
 import re
 import time
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -316,6 +316,29 @@ class NegriskGroupMarket:
     rules_hash: str
     fees_enabled: bool | None = None
     fee_rate: Decimal | None = None
+    yes_token_id: str | None = None
+    no_token_id: str | None = None
+    outcome_role: str | None = None
+    group_id: str | None = None
+    fee_exponent: int | None = None
+    taker_only: bool | None = None
+
+    @property
+    def tokens(self) -> dict[str, str]:
+        """The outcome-labelled CLOB token ids, when discovered."""
+
+        result: dict[str, str] = {}
+        if self.yes_token_id:
+            result["YES"] = self.yes_token_id
+        if self.no_token_id:
+            result["NO"] = self.no_token_id
+        return result
+
+    @property
+    def direction(self) -> str | None:
+        """The supported three-way result represented by this market."""
+
+        return self.outcome_role
 
 
 @dataclass(frozen=True, slots=True)
@@ -325,6 +348,27 @@ class NegriskGroupRelation:
     event_id: str
     markets: tuple[NegriskGroupMarket, ...]
     relation_type: str = "EXACTLY_ONE"
+    group_id: str | None = None
+    member_count: int | None = None
+    template: str | None = None
+    neg_risk_augmented: bool | None = None
+    neg_risk_other: bool | None = None
+
+    @property
+    def neg_risk_market_id(self) -> str | None:
+        """Official Polymarket spelling for the common group identity."""
+
+        return self.group_id
+
+    @property
+    def directions(self) -> dict[str, str]:
+        """Condition id to recognized three-way outcome role."""
+
+        return {
+            market.condition_id: market.outcome_role
+            for market in self.markets
+            if market.outcome_role is not None
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -902,6 +946,316 @@ def _mechanical_fee_fields(market: object) -> tuple[bool | None, Decimal | None]
     return fees_enabled, fee_rate
 
 
+def _mechanical_fee_model_fields(market: object) -> tuple[int | None, bool | None]:
+    """Return the fee formula facts needed to price a supported paper leg."""
+
+    schedule = _nested(market, "trading", "feeSchedule", "fee_schedule", default=None)
+    exponent = _value(schedule, "exponent", default=None)
+    if type(exponent) is not int:
+        exponent = None
+    taker_only = _value(schedule, "takerOnly", "taker_only", default=None)
+    if type(taker_only) is not bool:
+        taker_only = None
+    return exponent, taker_only
+
+
+THREE_WAY_FOOTBALL_TEMPLATE = "FOOTBALL_REGULAR_TIME_3WAY_V1"
+_THREE_WAY_RULE_FOOTER = _normalized(
+    """
+    The primary resolution source for this market is the official statistics of
+    the event as recognized by the governing body or event organizers. However,
+    if the governing body or event organizers have not published final match
+    statistics within 2 hours after the event's conclusion, data from
+    Flashscore may be used; if Flashscore data is unavailable, data from
+    Sofascore may be used; if neither is available, a consensus of credible
+    reporting may be used instead. All markets will settle based on the
+    official final result as recognized by the governing body or event
+    organizers. Revisions to officially declared final scores made after
+    market resolution will not be accounted for in determining the outcome.
+    """
+)
+
+
+def _mechanical_flag(value: object, *names: str) -> bool | None:
+    if type(value) is bool:
+        return value
+    flag = _value(value, *names, default=None)
+    return flag if type(flag) is bool else None
+
+
+def _football_team_sides(title: str) -> tuple[str, str] | None:
+    match = re.fullmatch(r"(.+?)\s+vs\.?\s+(.+)", _normalized(title))
+    if match is None:
+        return None
+    home, away = (part.strip() for part in match.groups())
+    return (home, away) if home and away and home != away else None
+
+
+def _football_market_role(
+    market: NegriskGroupMarket, event_title: str
+) -> tuple[str, str] | None:
+    """Recognize the one approved regular-time football rule shape.
+
+    The complete normalized rule string is compared against the template. This
+    keeps an unrecognized clause from silently inheriting the three-way payout
+    mapping.
+    """
+
+    question = _normalized(market.question)
+    rules = _normalized(market.rules)
+    prefix = "in the upcoming game, scheduled for "
+    if not rules.startswith(prefix):
+        return None
+    remaining = rules[len(prefix) :]
+    separator = remaining.find(" if ")
+    if separator <= 0:
+        return None
+    scheduled_for = remaining[:separator].strip()
+    if re.fullmatch(r"[a-z]+ \d{1,2}, \d{4}", scheduled_for) is None:
+        return None
+
+    body = remaining[separator + 1 :]
+    postponed = (
+        'if the game is postponed, this market will remain open until the game '
+        'has been completed.'
+    )
+    cancellation_marker = (
+        " if the game is canceled entirely, with no make-up game, this market "
+        "will resolve"
+    )
+    regular_time = (
+        " this market refers only to the outcome within the first 90 minutes "
+        "of regular play plus stoppage time."
+    )
+    footer_marker = " " + _THREE_WAY_RULE_FOOTER
+    if f" {postponed}" not in body:
+        return None
+    postponed_at = body.index(f" {postponed}")
+    if cancellation_marker not in body[postponed_at + len(postponed) + 1 :]:
+        return None
+    cancellation_at = body.index(cancellation_marker, postponed_at + len(postponed) + 1)
+    if regular_time not in body[cancellation_at:]:
+        return None
+    regular_at = body.index(regular_time, cancellation_at)
+    if not body.endswith(footer_marker):
+        return None
+    footer_at = len(body) - len(footer_marker)
+    if footer_at < regular_at + len(regular_time):
+        return None
+
+    normal_clause = body[:postponed_at].strip()
+    cancel_clause = body[cancellation_at + 1 : regular_at].strip()
+    sides = _football_team_sides(event_title)
+    if sides is None:
+        return None
+    if "draw" in question and "win" not in question:
+        role = "DRAW"
+        question_match = re.fullmatch(
+            r"will (.+?)\s+vs\.?\s+(.+?) end in a draw\?", question
+        )
+        if question_match is None or tuple(
+            _normalized(part) for part in question_match.groups()
+        ) != tuple(_normalized(part) for part in sides):
+            return None
+        if normal_clause != (
+            'if the game ends in a draw, this market will resolve to "yes". '
+            'otherwise, this market will resolve to "no".'
+        ):
+            return None
+        expected_cancel = (
+            'if the game is canceled entirely, with no make-up game, this market '
+            'will resolve to "yes".'
+        )
+        if cancel_clause != expected_cancel:
+            return None
+    else:
+        question_match = re.fullmatch(
+            r"will (.+?) win on (\d{4}-\d{2}-\d{2})\?", question
+        )
+        normal_match = re.fullmatch(
+            r'if (.+?) wins, this market will resolve to "(yes|no)"\. '
+            r'otherwise, this market will resolve to "(yes|no)"\.',
+            normal_clause,
+        )
+        if question_match is None or normal_match is None:
+            return None
+        team, question_date = question_match.groups()
+        normal_team, yes_value, no_value = normal_match.groups()
+        if yes_value != "yes" or no_value != "no":
+            return None
+        if _normalized(team) != _normalized(normal_team):
+            return None
+        try:
+            scheduled_date = datetime.strptime(scheduled_for, "%B %d, %Y").date()
+        except ValueError:
+            return None
+        if question_date != scheduled_date.isoformat():
+            return None
+        if team == sides[0]:
+            role = "HOME_WIN"
+        elif team == sides[1]:
+            role = "AWAY_WIN"
+        else:
+            return None
+        expected_cancel = (
+            'if the game is canceled entirely, with no make-up game, this market '
+            'will resolve "no".'
+        )
+        if cancel_clause != expected_cancel:
+            return None
+    if role == "DRAW":
+        normal_expected = (
+            'if the game ends in a draw, this market will resolve to "yes". '
+            'otherwise, this market will resolve to "no".'
+        )
+        cancel_expected = (
+            'if the game is canceled entirely, with no make-up game, this market '
+            'will resolve to "yes".'
+        )
+    else:
+        normal_expected = (
+            f'if {team} wins, this market will resolve to "yes". '
+            'otherwise, this market will resolve to "no".'
+        )
+        cancel_expected = (
+            'if the game is canceled entirely, with no make-up game, this market '
+            'will resolve "no".'
+        )
+    expected = (
+        f"in the upcoming game, scheduled for {scheduled_for} {normal_expected} "
+        f"{postponed} {cancel_expected} {regular_time.strip()} {_THREE_WAY_RULE_FOOTER}"
+    )
+    if rules != expected:
+        return None
+    return role, scheduled_for
+
+
+def _football_like_group(
+    markets: Sequence[NegriskGroupMarket], event_title: str
+) -> bool:
+    """Identify candidates that must pass the explicit football template.
+
+    The gate follows the approved template's concrete question/rule shapes;
+    ordinary prose containing ``draw`` or ``wins`` remains a generic group.
+    """
+
+    if any(
+        "first 90 minutes of regular play plus stoppage time"
+        in _normalized(market.rules)
+        for market in markets
+    ):
+        return True
+    sides = _football_team_sides(event_title)
+    if sides is None:
+        return False
+    normalized_sides = tuple(_normalized(side) for side in sides)
+    for market in markets:
+        question = _normalized(market.question)
+        draw_match = re.fullmatch(
+            r"will (.+?)\s+vs\.?\s+(.+?) end in a draw\?", question
+        )
+        if draw_match is not None and tuple(
+            _normalized(part) for part in draw_match.groups()
+        ) == normalized_sides:
+            return True
+        win_match = re.fullmatch(r"will (.+?) win on \d{4}-\d{2}-\d{2}\?", question)
+        if win_match is not None and _normalized(win_match.group(1)) in normalized_sides:
+            return True
+    return False
+
+
+def _question_id(value: object) -> str:
+    direct = _text(_value(value, "questionID", "question_id", "questionId", default=""))
+    if direct:
+        return direct
+    return _text(
+        _value(
+            _value(value, "resolution", default=None),
+            "questionID",
+            "question_id",
+            "questionId",
+            default="",
+        )
+    )
+
+
+def _sdk_question_ids_match_group(
+    group_id: str, question_ids: Sequence[str]
+) -> bool:
+    """Validate the official SDK's QuestionId -> MarketId encoding."""
+
+    if len(question_ids) != 3:
+        return False
+    if re.fullmatch(r"0x[0-9a-fA-F]{64}", group_id) is None:
+        return False
+    market_id = int(group_id, 16)
+    if market_id & 0xFF:
+        return False
+    indices: list[int] = []
+    for question_id in question_ids:
+        if re.fullmatch(r"0x[0-9a-fA-F]{64}", question_id) is None:
+            return False
+        question_value = int(question_id, 16)
+        if question_value & ~0xFF != market_id:
+            return False
+        indices.append(question_value & 0xFF)
+    return set(indices) == {0, 1, 2}
+
+
+def _supported_three_way_group(
+    event: object,
+    markets: Sequence[NegriskGroupMarket],
+    *,
+    group_id: str,
+    neg_risk_augmented: bool | None,
+    neg_risk_other: bool | None,
+) -> NegriskGroupRelation | None:
+    if (
+        len(markets) != 3
+        or not group_id
+        or neg_risk_augmented is not False
+        or neg_risk_other is True
+    ):
+        return None
+    event_title = _text(_value(event, "title", default=""))
+    classified: list[NegriskGroupMarket] = []
+    schedules: set[str] = set()
+    roles: set[str] = set()
+    tokens: set[str] = set()
+    conditions: set[str] = set()
+    for market in markets:
+        if (
+            not market.market_id
+            or not market.yes_token_id
+            or not market.no_token_id
+            or market.yes_token_id == market.no_token_id
+            or market.group_id != group_id
+        ):
+            return None
+        role_and_schedule = _football_market_role(market, event_title)
+        if role_and_schedule is None:
+            return None
+        role, scheduled_for = role_and_schedule
+        if role in roles or market.condition_id in conditions:
+            return None
+        roles.add(role)
+        conditions.add(market.condition_id)
+        schedules.add(scheduled_for)
+        tokens.update((market.yes_token_id, market.no_token_id))
+        classified.append(replace(market, outcome_role=role))
+    if roles != {"HOME_WIN", "DRAW", "AWAY_WIN"} or len(tokens) != 6 or len(schedules) != 1:
+        return None
+    return NegriskGroupRelation(
+        event_id=_text(_value(event, "id", "event_id", "eventId", default="")),
+        markets=tuple(sorted(classified, key=lambda item: item.condition_id)),
+        group_id=group_id,
+        member_count=len(classified),
+        template=THREE_WAY_FOOTBALL_TEMPLATE,
+        neg_risk_augmented=neg_risk_augmented,
+        neg_risk_other=neg_risk_other,
+    )
+
+
 def discover_mechanical_relation_catalog(
     events: Sequence[object],
 ) -> MechanicalRelationDiscoveryResult:
@@ -929,6 +1283,9 @@ def discover_mechanical_relation_catalog(
         "group_ineligible": 0,
         "group_member_unparseable": 0,
         "group_too_large": 0,
+        "group_three_way_unsupported": 0,
+        "group_three_way_incomplete": 0,
+        "group_identity_conflict": 0,
     }
     for raw_event in events:
         events_seen += 1
@@ -1021,6 +1378,7 @@ def discover_mechanical_relation_catalog(
             continue
         group_markets: list[NegriskGroupMarket] = []
         group_conditions: set[str] = set()
+        group_duplicate_condition = False
         group_unparseable = False
         for raw_market in raw_markets:
             market = _json_model(raw_market)
@@ -1055,9 +1413,11 @@ def discover_mechanical_relation_catalog(
                 continue
             if condition_id in group_conditions:
                 rejection_counts["duplicate_condition"] += 1
+                group_duplicate_condition = True
                 continue
             group_conditions.add(condition_id)
             fees_enabled, fee_rate = _mechanical_fee_fields(market)
+            fee_exponent, taker_only = _mechanical_fee_model_fields(market)
             group_markets.append(
                 NegriskGroupMarket(
                     event_id=event_id,
@@ -1072,6 +1432,8 @@ def discover_mechanical_relation_catalog(
                     rules_hash=_hash(_normalized(rules)),
                     fees_enabled=fees_enabled,
                     fee_rate=fee_rate,
+                    fee_exponent=fee_exponent,
+                    taker_only=taker_only,
                 )
             )
         if group_unparseable:
@@ -1079,6 +1441,143 @@ def discover_mechanical_relation_catalog(
             # the whole negRisk event set, so an event with an unparseable
             # member must not yield a group over the remaining subset (which
             # would also let dropped members bypass the group budget).
+            continue
+        event_group_id = _text(
+            _nested(
+                event,
+                "trading",
+                "negRiskMarketID",
+                "neg_risk_market_id",
+                "group_id",
+                default="",
+            )
+        )
+        event_neg_risk_augmented = _mechanical_flag(
+            _nested(
+                event,
+                "trading",
+                "negRiskAugmented",
+                "neg_risk_augmented",
+                default=None,
+            ),
+            "negRiskAugmented",
+            "neg_risk_augmented",
+        )
+        event_neg_risk_other = _mechanical_flag(
+            event, "negRiskOther", "neg_risk_other"
+        )
+        raw_member_other_facts = tuple(
+            _mechanical_flag(
+                _json_model(raw_market), "negRiskOther", "neg_risk_other"
+            )
+            for raw_market in raw_markets
+        )
+        supported_neg_risk_other = (
+            True
+            if event_neg_risk_other is True
+            or any(value is True for value in raw_member_other_facts)
+            else False
+            if raw_member_other_facts
+            and all(value is False for value in raw_member_other_facts)
+            else None
+        )
+        event_title = _text(_value(event, "title", default=""))
+        football_like = _football_like_group(group_markets, event_title)
+        if event_group_id and football_like and (
+            len(group_markets) != 3
+            or group_duplicate_condition
+            or len(raw_markets) != 3
+        ):
+            rejection_counts["group_three_way_incomplete"] += 1
+            continue
+        if len(group_markets) == 3 and football_like:
+            supported_markets: list[NegriskGroupMarket] = []
+            identity_conflict = False
+            question_ids: list[str] = []
+            raw_markets_by_condition: dict[str, object] = {}
+            for raw_market in raw_markets:
+                market = _json_model(raw_market)
+                condition_id = _text(
+                    _value(market, "conditionId", "condition_id", default="")
+                )
+                if not condition_id or condition_id in raw_markets_by_condition:
+                    identity_conflict = True
+                    break
+                raw_markets_by_condition[condition_id] = market
+            for group_market in group_markets:
+                market = raw_markets_by_condition.get(group_market.condition_id)
+                if market is None:
+                    identity_conflict = True
+                    break
+                market_group_id = _text(
+                    _value(
+                        market,
+                        "negRiskMarketID",
+                        "neg_risk_market_id",
+                        "group_id",
+                        default="",
+                    )
+                )
+                question_id = _question_id(market)
+                if market_group_id:
+                    if question_id:
+                        question_ids.append(question_id)
+                elif question_id:
+                    market_group_id = event_group_id
+                    question_ids.append(question_id)
+                market_neg_risk_augmented = _mechanical_flag(
+                    market, "negRiskAugmented", "neg_risk_augmented"
+                )
+                market_neg_risk_other = _mechanical_flag(
+                    market, "negRiskOther", "neg_risk_other"
+                )
+                tokens = _outcome_tokens(market)
+                if (
+                    not market_group_id
+                    or market_group_id != event_group_id
+                    or market_neg_risk_augmented is True
+                    or market_neg_risk_other is True
+                    or _nested(
+                        market,
+                        "state",
+                        "negRisk",
+                        "neg_risk",
+                        default=False,
+                    ) is not True
+                    or tokens is None
+                    or _text(
+                        _value(market, "id", "market_id", "marketId", default="")
+                    )
+                    != group_market.market_id
+                ):
+                    identity_conflict = True
+                    break
+                supported_markets.append(
+                    replace(
+                        group_market,
+                        yes_token_id=tokens["yes"],
+                        no_token_id=tokens["no"],
+                        group_id=market_group_id,
+                    )
+                )
+            if question_ids and not _sdk_question_ids_match_group(
+                event_group_id, question_ids
+            ):
+                identity_conflict = True
+            if identity_conflict:
+                rejection_counts["group_identity_conflict"] += 1
+                continue
+            group = _supported_three_way_group(
+                event,
+                supported_markets,
+                group_id=event_group_id,
+                neg_risk_augmented=event_neg_risk_augmented,
+                neg_risk_other=supported_neg_risk_other,
+            )
+            if group is None:
+                rejection_counts["group_three_way_unsupported"] += 1
+                continue
+            groups.append(group)
             continue
         if len(group_markets) > _MECHANICAL_GROUP_BUDGET:
             rejection_counts["group_too_large"] += 1

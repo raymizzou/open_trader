@@ -6,7 +6,8 @@ import json
 import threading
 import time
 from concurrent.futures import Future
-from datetime import UTC, datetime
+from copy import deepcopy
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -21,12 +22,15 @@ from open_trader.prediction_n_leg_validation import (
     build_report,
     frozen_snapshot_from_file,
     readonly_v2_relations,
+    run_paper_three_way,
     run_live,
     run_replay,
 )
 from open_trader.prediction_solver import solve_with_constraint_generation
 from open_trader.prediction_solver_backends import CpSatBackend
 from open_trader.prediction_solver_worker import WorkerOutcome, WorkerResponse
+from open_trader.polymarket_relation_discovery import discover_mechanical_relation_catalog
+from open_trader.relation_catalog import RelationCatalog
 from open_trader.relation_catalog_v2 import RelationCatalogV2, SqliteCatalogStore
 
 
@@ -86,6 +90,119 @@ def relation_payload(*, qualification: bool = False) -> dict[str, object]:
     }
 
 
+def paper_three_way_rows(
+    *,
+    fees_enabled: bool | None = False,
+    fee_rate: str | None = None,
+    fee_exponent: int | None = None,
+    taker_only: bool | None = None,
+) -> dict[str, dict[str, object]]:
+    """One supported paper row with release time deliberately unknown."""
+
+    fixture = load_fixture()
+    problem = deepcopy(fixture["problem"])
+    assert isinstance(problem, dict)
+    for state in problem["terminal_state_sets"]:
+        for atom in state["atoms"]:
+            atom["capital_release_at"] = None
+    contracts = ("a", "b", "c")
+    tokens = {contract: f"paper-token-{contract}" for contract in contracts}
+    endpoints = [
+        {
+            "venue": "polymarket",
+            "contract_id": contract,
+            "yes_token_id": tokens[contract],
+            "fees_enabled": fees_enabled,
+            "fee_rate": fee_rate,
+            "fee_exponent": fee_exponent,
+            "taker_only": taker_only,
+            "settlement_rules": "known supported football rule",
+        }
+        for contract in contracts
+    ]
+    model = {
+        "template": "FOOTBALL_REGULAR_TIME_3WAY_V1",
+        "group_id": "paper-group",
+        "member_count": 3,
+        "directions": {"a": "HOME_WIN", "b": "DRAW", "c": "AWAY_WIN"},
+        "rules": {contract: "known supported football rule" for contract in contracts},
+        "tokens": {
+            contract: {"YES": tokens[contract], "NO": f"paper-no-{contract}"}
+            for contract in contracts
+        },
+        "terminal_states": ["NORMAL_YES", "NORMAL_NO"],
+        "payouts": {
+            contract: {"NORMAL_YES": 1, "NORMAL_NO": 0}
+            for contract in contracts
+        },
+        "capital_release": None,
+        "incomplete_reasons": ["MISSING_CAPITAL_RELEASE_AT"],
+        "problem": problem,
+    }
+    return {
+        "paper-three": {
+            "version_id": "paper-version",
+            "status": "PENDING",
+            "activation": "PENDING",
+            "endpoints": endpoints,
+            "model": model,
+        }
+    }
+
+
+def paper_books(
+    prices: tuple[str, str, str],
+    *,
+    now: datetime,
+    minima: tuple[str, str, str] = ("2", "5", "3"),
+    minimum_notionals: tuple[str | None, str | None, str | None] = (
+        None,
+        None,
+        None,
+    ),
+    depth: str = "10",
+    omit_rules_for: str | None = None,
+    descending: bool = False,
+) -> dict[str, dict[str, object]]:
+    return {
+        f"paper-token-{contract}": {
+            "token_id": f"paper-token-{contract}",
+            "asks": (
+                [
+                    {"price": str(Decimal(price) + Decimal("0.10")), "size": "3"},
+                    {"price": price, "size": "7"},
+                ]
+                if descending
+                else [{"price": price, "size": depth}]
+            ),
+            "bids": [],
+            "confirmed_at": now,
+            **(
+                {}
+                if contract == omit_rules_for
+                else {
+                    "minimum_order_size": minimum,
+                    "tick_size": "0.01",
+                    **(
+                        {"minimum_order_notional": minimum_notional}
+                        if minimum_notional is not None
+                        else {}
+                    ),
+                }
+            ),
+        }
+        for contract, price, minimum, minimum_notional in zip(
+            ("a", "b", "c"), prices, minima, minimum_notionals, strict=True
+        )
+    }
+
+
+def assert_paper_no_side_effects(report: dict[str, object]) -> None:
+    assert report["order_ready"] is False
+    assert report["zero_side_effects"]["submitted_orders"] == 0
+    assert report["zero_side_effects"]["mutation_attempts"] == 0
+
+
 def seed_catalog(
     db_path: Path, *, activate: bool, qualification: bool = False
 ) -> None:
@@ -132,6 +249,302 @@ class FakeSolverServer:
             worker_outcome(request, canonical_payload(evidence))
         )
         return future
+
+
+def test_three_way_paper_report_prices_legal_equal_lots(tmp_path: Path) -> None:
+    now = datetime.now(UTC)
+    rows = paper_three_way_rows()
+    requested: list[tuple[str, ...]] = []
+
+    def source(token_ids: tuple[str, ...]) -> dict[str, dict[str, object]]:
+        requested.append(tuple(token_ids))
+        return paper_books(
+            ("0.30", "0.32", "0.33"), now=now, descending=True
+        )
+
+    positive = run_paper_three_way(
+        rows,
+        book_source=source,
+        data_dir=tmp_path / "positive",
+        as_of=now,
+    )
+
+    assert positive["status"] == "PASS"
+    assert positive["component_id"] == "component:a:b:c"
+    assert positive["qualification_status"] == "UNKNOWN"
+    assert positive["economics"] == {
+        "quantity_lots": 5,
+        "payout_lower_bound_units": 5_000_000,
+        "cost_upper_bound_units": 4_750_000,
+        "guaranteed_profit_units": 250_000,
+        "payout_lower_bound": "5",
+        "cost_upper_bound": "4.75",
+        "guaranteed_profit": "0.25",
+        "economic_decision": "PROFITABLE",
+    }
+    assert [leg["quantity_lots"] for leg in positive["legs"]] == [5, 5, 5]
+    assert positive["quantity_domain"] == [0, 5]
+    assert positive["capital_release_at"] is None
+    assert positive["evaluated_at"] == now.isoformat()
+    assert len(requested) == 1
+    assert_paper_no_side_effects(positive)
+
+    minimum_notional = run_paper_three_way(
+        rows,
+        book_source=lambda token_ids: paper_books(
+            ("0.30", "0.32", "0.33"),
+            now=now,
+            minimum_notionals=("2", None, None),
+        ),
+        data_dir=tmp_path / "minimum-notional",
+    )
+    assert minimum_notional["status"] == "PASS"
+    assert minimum_notional["economics"] == {
+        "quantity_lots": 7,
+        "payout_lower_bound_units": 7_000_000,
+        "cost_upper_bound_units": 6_650_000,
+        "guaranteed_profit_units": 350_000,
+        "payout_lower_bound": "7",
+        "cost_upper_bound": "6.65",
+        "guaranteed_profit": "0.35",
+        "economic_decision": "PROFITABLE",
+    }
+    assert minimum_notional["order_rules"]["status"] == "UNKNOWN_MINIMUM_NOTIONAL"
+    assert minimum_notional["legs"][0]["minimum_order_notional"] == "2"
+    assert_paper_no_side_effects(minimum_notional)
+
+    negative = run_paper_three_way(
+        rows,
+        book_source=lambda token_ids: paper_books(
+            ("0.35", "0.35", "0.35"), now=now
+        ),
+        data_dir=tmp_path / "negative",
+    )
+    assert negative["status"] == "PASS"
+    assert negative["economics"]["cost_upper_bound_units"] == 5_250_000
+    assert negative["economics"]["guaranteed_profit_units"] == -250_000
+    assert negative["economics"]["economic_decision"] == "REJECTED"
+    assert_paper_no_side_effects(negative)
+
+    charging = run_paper_three_way(
+        paper_three_way_rows(
+            fees_enabled=True,
+            fee_rate="0.04",
+            fee_exponent=1,
+            taker_only=True,
+        ),
+        book_source=lambda token_ids: paper_books(
+            ("0.33", "0.33", "0.33"), now=now
+        ),
+        data_dir=tmp_path / "charging",
+    )
+    assert charging["status"] == "PASS"
+    assert charging["economics"]["cost_upper_bound_units"] == 5_082_660
+    assert charging["economics"]["guaranteed_profit_units"] == -82_660
+    assert charging["fees"]["status"] == "CHARGING"
+    assert charging["fees"]["rate"] == "0.04"
+    assert_paper_no_side_effects(charging)
+
+    blocked_cases = (
+        ("UNKNOWN_FEE_FACTS", paper_three_way_rows(fees_enabled=None)),
+        (
+            "UNKNOWN_FEE_FACTS",
+            paper_three_way_rows(
+                fees_enabled=True,
+                fee_rate="0.04",
+                fee_exponent=None,
+                taker_only=True,
+            ),
+        ),
+        ("STALE_BOOK", rows),
+        ("INSUFFICIENT_DEPTH", rows),
+        ("UNKNOWN_ORDER_RULES", rows),
+    )
+    for reason, case_rows in blocked_cases:
+        if reason == "STALE_BOOK":
+            case_books = lambda token_ids: paper_books(
+                ("0.30", "0.32", "0.33"),
+                now=now - timedelta(seconds=11),
+            )
+        elif reason == "INSUFFICIENT_DEPTH":
+            case_books = lambda token_ids: paper_books(
+                ("0.30", "0.32", "0.33"), now=now, depth="4"
+            )
+        elif reason == "UNKNOWN_ORDER_RULES":
+            case_books = lambda token_ids: paper_books(
+                ("0.30", "0.32", "0.33"), now=now, omit_rules_for="b"
+            )
+        else:
+            case_books = source
+        blocked = run_paper_three_way(
+            case_rows,
+            book_source=case_books,
+            data_dir=tmp_path / reason.lower(),
+        )
+        assert blocked["status"] == "BLOCKED"
+        assert blocked["reason"] == reason
+        assert_paper_no_side_effects(blocked)
+
+
+def test_three_way_paper_normalizes_catalog_dollar_payouts(tmp_path: Path) -> None:
+    fixture = Path(__file__).parent / "fixtures" / "polymarket_three_way_football.json"
+    event = json.loads(fixture.read_text(encoding="utf-8"))
+    draw = event["markets"][1]
+    labels = json.loads(draw["outcomes"])
+    token_ids = json.loads(draw["clobTokenIds"])
+    by_label = dict(zip(labels, token_ids, strict=True))
+    draw["outcomes"] = json.dumps(["No", "Yes"])
+    draw["clobTokenIds"] = json.dumps([by_label["No"], by_label["Yes"]])
+
+    discovered = discover_mechanical_relation_catalog([event])
+    assert len(discovered.groups) == 1
+    catalog = RelationCatalog(tmp_path / "catalog")
+    catalog.ingest_mechanical_relation(discovered.groups[0])
+    rows = catalog.review_rows()
+    row = rows[0]
+    assert row["model"]["problem"]["valuation_unit_id"] == "USD"
+    assert row["model"]["problem"]["terminal_state_sets"][0]["atoms"][1][
+        "payouts"
+    ][0]["payout_lower_bound_per_lot_units"] == 1
+    assert all(
+        fact == {"exponent": 1, "taker_only": True}
+        for fact in row["model"]["fee_facts"].values()
+    )
+
+    now = datetime.now(UTC)
+    prices = ("0.30", "0.32", "0.33")
+
+    def source(token_ids: tuple[str, ...]) -> dict[str, dict[str, object]]:
+        return {
+            token_id: {
+                "token_id": token_id,
+                "asks": [{"price": price, "size": "10"}],
+                "bids": [],
+                "confirmed_at": now,
+                "minimum_order_size": minimum,
+                "tick_size": "0.01",
+            }
+            for token_id, price, minimum in zip(
+                token_ids, prices, ("2", "5", "3"), strict=True
+            )
+        }
+
+    report = run_paper_three_way(
+        rows,
+        book_source=source,
+        data_dir=tmp_path / "paper",
+    )
+
+    assert report["status"] == "PASS"
+    assert report["economics"] == {
+        "quantity_lots": 5,
+        "payout_lower_bound_units": 5_000_000,
+        "cost_upper_bound_units": 4_912_175,
+        "guaranteed_profit_units": 87_825,
+        "payout_lower_bound": "5",
+        "cost_upper_bound": "4.912175",
+        "guaranteed_profit": "0.087825",
+        "economic_decision": "PROFITABLE",
+    }
+    assert report["order_ready"] is False
+    assert_paper_no_side_effects(report)
+
+
+def test_three_way_paper_rejects_future_books(tmp_path: Path) -> None:
+    rows = paper_three_way_rows()
+    as_of = datetime(2026, 8, 16, 2, 0, tzinfo=UTC)
+
+    future = run_paper_three_way(
+        rows,
+        book_source=lambda token_ids: paper_books(
+            ("0.30", "0.32", "0.33"),
+            now=as_of + timedelta(hours=1),
+        ),
+        data_dir=tmp_path / "future",
+        as_of=as_of,
+    )
+    assert future["status"] == "BLOCKED"
+    assert future["reason"] == "FUTURE_BOOK"
+    assert "economics" not in future
+    assert "legs" not in future
+    assert_paper_no_side_effects(future)
+
+    same_time = run_paper_three_way(
+        rows,
+        book_source=lambda token_ids: paper_books(
+            ("0.30", "0.32", "0.33"),
+            now=as_of,
+        ),
+        data_dir=tmp_path / "same-time",
+        as_of=as_of,
+    )
+    assert same_time["status"] == "PASS"
+    assert_paper_no_side_effects(same_time)
+
+    old = run_paper_three_way(
+        rows,
+        book_source=lambda token_ids: paper_books(
+            ("0.30", "0.32", "0.33"),
+            now=as_of - timedelta(seconds=11),
+        ),
+        data_dir=tmp_path / "old",
+        as_of=as_of,
+    )
+    assert old["status"] == "BLOCKED"
+    assert old["reason"] == "STALE_BOOK"
+    assert_paper_no_side_effects(old)
+
+    started = datetime.now(UTC)
+    received: list[datetime] = []
+
+    def source_after_start(token_ids: tuple[str, ...]) -> dict[str, dict[str, object]]:
+        received_at = datetime.now(UTC)
+        received.append(received_at)
+        return paper_books(
+            ("0.30", "0.32", "0.33"),
+            now=received_at,
+        )
+
+    default_clock = run_paper_three_way(
+        rows,
+        book_source=source_after_start,
+        data_dir=tmp_path / "default-clock",
+    )
+    assert received and received[0] >= started
+    assert default_clock["status"] == "PASS"
+    assert_paper_no_side_effects(default_clock)
+
+
+def test_three_way_paper_rejects_off_tick_prices(tmp_path: Path) -> None:
+    rows = paper_three_way_rows()
+    now = datetime(2026, 8, 16, 2, 0, tzinfo=UTC)
+
+    off_tick = run_paper_three_way(
+        rows,
+        book_source=lambda token_ids: paper_books(
+            ("0.465", "0.465", "0.465"),
+            now=now,
+        ),
+        data_dir=tmp_path / "off-tick",
+        as_of=now,
+    )
+    assert off_tick["status"] == "BLOCKED"
+    assert off_tick["reason"] == "OFF_TICK_PRICE"
+    assert "economics" not in off_tick
+    assert "legs" not in off_tick
+    assert_paper_no_side_effects(off_tick)
+
+    aligned = run_paper_three_way(
+        rows,
+        book_source=lambda token_ids: paper_books(
+            ("0.46", "0.46", "0.46"),
+            now=now,
+        ),
+        data_dir=tmp_path / "aligned",
+        as_of=now,
+    )
+    assert aligned["status"] == "PASS"
+    assert_paper_no_side_effects(aligned)
 
 
 def test_replay_n3_happy_path() -> None:

@@ -3,6 +3,12 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-09-12
+
+- Restored the `outcome-token` convention on paper CLOB books after native
+  settlement fingerprint integration; the order-facts case and four paper
+  validation regressions pass in Docker.
+
 ## 2026-09-11
 
 - 修复美股趋势报告整报失败：温转热池成分里的 `SH` 是真实美股 ETF
@@ -19,6 +25,22 @@ operator-facing: what changed, which workflow is affected, and what was verified
   均读取各自 token 的 asks，盘口约定进入经济指纹。现有持久化模型版本不会被
   代码更新静默转换，必须按匹配的代码版本重新生成；原生验证、联合支付、实时
   正负报价和聚焦回归已在 Docker 中验证。
+- Added the read-only football three-way paper validation path: supported
+  catalog rows retain official fee formula facts, paper books preserve receipt
+  time and order constraints, normalize whole-USD payout models to USD
+  micro-units, and sort raw asks before pricing. Duplicate raw members now
+  reject at the identity boundary, generic draw prose stays generic, omitted
+  SDK `Other` facts remain unknown, default replay time is sampled after the
+  book read, future books are blocked, and consumed prices must align to the
+  exact tick. Reports expose fixed-size economics, per-leg price/fee/order
+  facts, unknown release timing, and zero side effects; the module CLI accepts
+  `--paper-three-way --book-source
+  open_trader.prediction_n_leg_validation_books:paper_live_books` and remains
+  non-executable. Verified with the six
+  blocker regressions and the affected four-file regression (115 passed).
+  Explicit football rule-shaped events with malformed titles now route to
+  strict template rejection instead of a generic formal relation; verified
+  with raw JSON and SDK discovery cases plus the affected two-file regression.
 - 修复趋势报告重放崩溃：重放/再生成老 v2 报告（模拟盘账户不可用）且报告带符号
   映射契约（`symbol_mapping_schema`）时，`build_report` 在符号映射过滤段引用
   `use_final_plan_semantics` 触发 `UnboundLocalError`，导致 v2 历史报告无法重放

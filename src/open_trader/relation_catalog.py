@@ -364,7 +364,12 @@ def _normalise_discovery(value: Mapping[str, object]) -> dict[str, object]:
         }
         # Issue #112: the per-market fee facts ride alongside the required
         # fields (absent on legacy rows, which decode to a fee-unknown gate).
-        fee_fields = {"fees_enabled", "fee_rate"}
+        fee_fields = {
+            "fees_enabled",
+            "fee_rate",
+            "fee_exponent",
+            "taker_only",
+        }
         # Issue #114: the per-market YES/NO CLOB token ids ride the same way
         # (absent on legacy rows, which decode to the contract-id fallback).
         token_fields = {"yes_token_id", "no_token_id"}
@@ -381,6 +386,20 @@ def _normalise_discovery(value: Mapping[str, object]) -> dict[str, object]:
             raise ValueError("market.fee_rate must be a string or null")
         clean["fees_enabled"] = fees_enabled
         clean["fee_rate"] = fee_rate
+        fee_exponent = market.get("fee_exponent")
+        if fee_exponent is not None and (
+            type(fee_exponent) is not int or fee_exponent < 0
+        ):
+            raise ValueError("market.fee_exponent must be a nonnegative integer or null")
+        taker_only = market.get("taker_only")
+        if taker_only is not None and type(taker_only) is not bool:
+            raise ValueError("market.taker_only must be a boolean or null")
+        for name, item in (
+            ("fee_exponent", fee_exponent),
+            ("taker_only", taker_only),
+        ):
+            if name in market:
+                clean[name] = item
         # Issue #114: optional CLOB token ids (str). Unlike the fee pair they
         # are pass-through only: absent/null stays absent so legacy normalized
         # markets keep their exact pre-#114 key set.
@@ -610,6 +629,12 @@ def _mechanical_complete_model(relation: object) -> dict[str, object] | None:
             )
             for token, side in zip(tokens, sides, strict=True)
         ]
+    elif (
+        relation_type == "EXACTLY_ONE"
+        and str(getattr(relation, "template", ""))
+        == "FOOTBALL_REGULAR_TIME_3WAY_V1"
+    ):
+        return _three_way_complete_model(relation, event_id)
     elif relation_type == "EXACTLY_ONE":
         facts = [
             (
@@ -781,6 +806,178 @@ def _mechanical_complete_model(relation: object) -> dict[str, object] | None:
     }
 
 
+def _three_way_complete_model(
+    relation: object, event_id: str
+) -> dict[str, object] | None:
+    """Compile the supported football three-result payout facts.
+
+    The payout mapping is known, but Polymarket does not promise a settlement
+    timestamp for a postponed match.  The model therefore remains available to
+    paper analysis while its formal completeness stays INCOMPLETE.
+    """
+
+    markets = tuple(getattr(relation, "markets", ()))
+    if len(markets) != 3:
+        return None
+    group_id = str(getattr(relation, "group_id", "") or "").strip()
+    roles = {"HOME_WIN", "DRAW", "AWAY_WIN"}
+    if not group_id or str(getattr(relation, "template", "")) != "FOOTBALL_REGULAR_TIME_3WAY_V1":
+        return None
+    if getattr(relation, "member_count", None) != 3:
+        return None
+    facts: list[tuple[str, str, str, str, str, str]] = []
+    rules: dict[str, str] = {}
+    tokens: dict[str, dict[str, str]] = {}
+    directions: dict[str, str] = {}
+    fee_facts: dict[str, dict[str, object]] = {}
+    seen_conditions: set[str] = set()
+    seen_tokens: set[str] = set()
+    for market in markets:
+        condition_id = str(getattr(market, "condition_id", "") or "").strip()
+        yes_token_id = str(getattr(market, "yes_token_id", "") or "").strip()
+        no_token_id = str(getattr(market, "no_token_id", "") or "").strip()
+        role = str(getattr(market, "outcome_role", "") or "").strip()
+        source = str(getattr(market, "resolution_source", "") or "").strip()
+        end_date = str(getattr(market, "end_date", "") or "").strip()
+        rules_hash = str(getattr(market, "rules_hash", "") or "").strip()
+        if (
+            not condition_id
+            or condition_id in seen_conditions
+            or not yes_token_id
+            or not no_token_id
+            or yes_token_id == no_token_id
+            or yes_token_id in seen_tokens
+            or no_token_id in seen_tokens
+            or role not in roles
+            or role in directions.values()
+            or not source
+            or not end_date
+            or not rules_hash
+        ):
+            return None
+        seen_conditions.add(condition_id)
+        seen_tokens.update((yes_token_id, no_token_id))
+        rules[condition_id] = str(getattr(market, "rules"))
+        tokens[condition_id] = {"YES": yes_token_id, "NO": no_token_id}
+        directions[condition_id] = role
+        fee_exponent = getattr(market, "fee_exponent", None)
+        taker_only = getattr(market, "taker_only", None)
+        if fee_exponent is not None or taker_only is not None:
+            fee_facts[condition_id] = {
+                "exponent": fee_exponent,
+                "taker_only": taker_only,
+            }
+        facts.append((condition_id, condition_id, "BUY_YES", source, end_date, rules_hash))
+    if set(directions.values()) != roles:
+        return None
+    try:
+        release_dates = [_utc(fact[4]) for fact in facts]
+    except (TypeError, ValueError):
+        return None
+    actions: list[CandidateAction] = []
+    states: list[TerminalStateSet] = []
+    payouts: dict[str, dict[str, int]] = {}
+    for (contract_id, condition_id, side, source, end_date, rules_hash), observation_window in zip(
+        facts, release_dates, strict=True
+    ):
+        key = SettlementObservationKey(
+            OBSERVATION_SCHEMA_V1,
+            source,
+            condition_id,
+            observation_window,
+            observation_window,
+            "UTC",
+            rules_hash,
+        )
+        action_id = f"polymarket:{contract_id}"
+        actions.append(CandidateAction(
+            action_id,
+            venue_id="polymarket",
+            account_id="catalog-v2",
+            chain_id="polymarket",
+            market_contract_id=condition_id,
+            settlement_observation_key=key,
+            side=ActionSide.BUY_YES,
+            lot_step_units=1,
+            quantity_scale=1,
+            min_quantity_lots=1,
+            max_quantity_lots=1,
+            settlement_asset_id="USD",
+            valuation_unit_id="USD",
+            asset_valuation_rule_id="usd-1:1-v1",
+            cost_slices=(ExecutableCostSlice(1, 1, 0),),
+        ))
+        payouts[condition_id] = {"NORMAL_YES": 1, "NORMAL_NO": 0}
+        states.append(TerminalStateSet(
+            condition_id,
+            key,
+            rules_hash,
+            (
+                TerminalAtom(
+                    f"{condition_id}:NORMAL_YES",
+                    TerminalKind.NORMAL_YES,
+                    rules_hash,
+                    (ActionPayout(action_id, 1),),
+                    None,
+                ),
+                TerminalAtom(
+                    f"{condition_id}:NORMAL_NO",
+                    TerminalKind.NORMAL_NO,
+                    rules_hash,
+                    (ActionPayout(action_id, 0),),
+                    None,
+                ),
+            ),
+        ))
+    rule_digest = _digest({
+        "template": "FOOTBALL_REGULAR_TIME_3WAY_V1",
+        "event_id": event_id,
+        "group_id": group_id,
+        "member_count": 3,
+        "facts": facts,
+        "rules": rules,
+        "tokens": tokens,
+        "directions": directions,
+        "fee_facts": fee_facts,
+    })
+    sorted_contracts = sorted(condition_id for condition_id, *_ in facts)
+    problem = ArbitrageProblem(
+        PROBLEM_SCHEMA_V1,
+        f"mechanical:{rule_digest}",
+        min(release_dates),
+        "USD",
+        tuple(actions),
+        tuple(states),
+        ConstraintModel(
+            (
+                RelationConstraint(
+                    f"exactly-one:{':'.join(sorted_contracts)}",
+                    RelationKind.EXACTLY_ONE,
+                    tuple(sorted_contracts),
+                    rule_digest,
+                ),
+            ),
+            (),
+        ),
+        (),
+    )
+    return {
+        "completeness": "INCOMPLETE",
+        "incomplete_reasons": ["MISSING_CAPITAL_RELEASE_AT"],
+        "template": "FOOTBALL_REGULAR_TIME_3WAY_V1",
+        "group_id": group_id,
+        "member_count": 3,
+        "rules": rules,
+        "tokens": tokens,
+        "directions": directions,
+        **({"fee_facts": fee_facts} if fee_facts else {}),
+        "terminal_states": ["NORMAL_YES", "NORMAL_NO"],
+        "payouts": payouts,
+        "capital_release": None,
+        "problem": canonical_payload(problem),
+    }
+
+
 def _mechanical_discovery_payload(
     relation: object, model: dict[str, object]
 ) -> dict[str, object]:
@@ -848,6 +1045,11 @@ def _mechanical_discovery_payload(
                 "yes_token_id": getattr(market, "yes_token_id", None),
                 "no_token_id": getattr(market, "no_token_id", None),
             }
+            if str(model.get("template", "")) == "FOOTBALL_REGULAR_TIME_3WAY_V1":
+                if getattr(market, "fee_exponent", None) is not None:
+                    entry["fee_exponent"] = getattr(market, "fee_exponent")
+                if getattr(market, "taker_only", None) is not None:
+                    entry["taker_only"] = getattr(market, "taker_only")
             markets.append(entry)
     else:
         raise ValueError("mechanical relation_type is invalid")
@@ -895,6 +1097,9 @@ class RelationCatalog:
                 "fees_enabled": market.get("fees_enabled"),
                 "fee_rate": market.get("fee_rate"),
             }
+            for name in ("fee_exponent", "taker_only"):
+                if name in market:
+                    endpoint[name] = market[name]
             # Issue #114: pass-through only — NATIVE_COMPLEMENT endpoints
             # (contract id == token id) keep their exact pre-#114 key set.
             for name in ("yes_token_id", "no_token_id"):
@@ -917,12 +1122,25 @@ class RelationCatalog:
             "statement": str(payload["semantics"].get("statement", "")),
         }
         model = payload.get("model", {})
-        if isinstance(model, Mapping) and model.get("completeness") == "COMPLETE":
-            converted["terminal_states"] = model.get("terminal_states", [])
-            converted["payouts"] = model.get("payouts", {})
-            converted["capital_release"] = model.get("capital_release")
-            if model.get("problem") is not None:
-                converted["problem"] = model["problem"]
+        if isinstance(model, Mapping):
+            if model.get("completeness") == "COMPLETE" or model.get("template") == "FOOTBALL_REGULAR_TIME_3WAY_V1":
+                converted["terminal_states"] = model.get("terminal_states", [])
+                converted["payouts"] = model.get("payouts", {})
+                converted["capital_release"] = model.get("capital_release")
+                if model.get("problem") is not None:
+                    converted["problem"] = model["problem"]
+            for name in (
+                "incomplete_reasons",
+                "template",
+                "group_id",
+                "member_count",
+                "rules",
+                "tokens",
+                "directions",
+                "fee_facts",
+            ):
+                if name in model:
+                    converted[name] = model[name]
         return converted
 
 
@@ -1066,6 +1284,18 @@ class RelationCatalog:
             "payouts": payload.get("payouts", {}),
             "capital_release": payload.get("capital_release"),
         }
+        for name in (
+            "incomplete_reasons",
+            "template",
+            "group_id",
+            "member_count",
+            "rules",
+            "tokens",
+            "directions",
+            "fee_facts",
+        ):
+            if name in payload:
+                model[name] = payload[name]
         if include_problem:
             model["problem"] = payload.get("problem")
         endpoints, roles = _row_endpoints_and_roles(payload)
