@@ -8113,6 +8113,96 @@ def test_frozen_v2_snapshot_does_not_enable_kelly() -> None:
     assert "kelly_phase" not in built.risk_summary
 
 
+def test_v2_replay_with_symbol_mapping_metadata_builds_report() -> None:
+    snapshot = trend_module.trend_strategy_snapshot("US", "abc123", (622460,))
+    snapshot["strategy_id"] = "trend_animals_warm_to_hot/US/v2"
+    snapshot["strategy_version"] = "v2"
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=False,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+            reason="stale futu account",
+        ),
+        candidates=[replace(candidate("600001"), exchange="US", close=Decimal("100"))],
+        holding_snapshots={},
+        bars_by_symbol={},
+        market="US",
+        metadata={
+            "market": "US",
+            "broker": "tiger",
+            "symbol_mapping_schema": trend_module.TREND_SYMBOL_MAPPING_SCHEMA,
+        },
+        strategy_snapshot=snapshot,
+    )
+
+    assert built.as_of_date == "2026-07-14"
+    assert built.metadata["symbol_mapping_schema"] == (
+        trend_module.TREND_SYMBOL_MAPPING_SCHEMA
+    )
+    assert built.buy_actions == ()
+
+
+def test_v2_replay_without_symbol_mapping_metadata_is_unchanged() -> None:
+    """Pin the no-mapping v2 replay output so the hoist stays semantics-neutral.
+
+    Every literal below was captured from the pre-fix build_report output for
+    this exact input; the assignment hoist must not move any of them.
+    """
+
+    snapshot = trend_module.trend_strategy_snapshot("US", "abc123", (622460,))
+    snapshot["strategy_id"] = "trend_animals_warm_to_hot/US/v2"
+    snapshot["strategy_version"] = "v2"
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=False,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+            reason="stale futu account",
+        ),
+        candidates=[replace(candidate("600001"), exchange="US", close=Decimal("100"))],
+        holding_snapshots={},
+        bars_by_symbol={},
+        market="US",
+        metadata={"market": "US", "broker": "tiger"},
+        strategy_snapshot=snapshot,
+    )
+
+    assert built.buy_actions == ()
+    assert built.risk_skips == ()
+    assert built.holdings == ()
+    assert built.simulate_rotation_pairs == ()
+    assert built.real_rotation_pairs == ()
+    assert built.plan_availability == {
+        "simulated_account": {
+            "status": "unavailable",
+            "reason": "stale futu account",
+            "executable": False,
+        },
+        "real_account": {
+            "status": "unavailable",
+            "reason": "",
+            "executable": False,
+        },
+    }
+    assert built.risk_summary == {
+        "status": "unavailable",
+        "status_label": "模拟盘计划不可用",
+        "reason": "stale futu account",
+        "normal_cost_rate": Decimal("0.001"),
+    }
+
+
 def test_v3_payload_and_compact_report_freeze_kelly_facts() -> None:
     built = _us_kelly_report(
         _trend_kelly_rounds(*(["0.10"] * 15), *(["-0.099"] * 15))

@@ -1719,6 +1719,57 @@ class FakePublicClient:
         )
 
 
+class RemediationClock(datetime):
+    """``datetime`` stand-in whose ``now`` serves one frozen real instant.
+
+    Remediation collaborators stamp order books at request time and the
+    production freshness gate re-reads the clock afterwards; a host wall-clock
+    rollback between the two reads turns ``age < 0`` into a false staleness
+    rejection of a fresh book.  Subclassing keeps the production module's
+    ``isinstance`` checks and ``fromtimestamp`` / ``fromisoformat`` working
+    unchanged, while ``now`` serves one frozen real ``datetime`` instance so
+    every timestamp on the tested path is identical and independent of the
+    host clock.
+    """
+
+    frozen_instant: datetime
+    now_calls = 0
+
+    @classmethod
+    def now(cls, tz: object = None) -> datetime:
+        cls.now_calls += 1
+        return cls._from_moment(cls.frozen_instant)
+
+    @classmethod
+    def _from_moment(cls, moment: datetime) -> "RemediationClock":
+        return cls(
+            moment.year,
+            moment.month,
+            moment.day,
+            moment.hour,
+            moment.minute,
+            moment.second,
+            moment.microsecond,
+            tzinfo=moment.tzinfo,
+        )
+
+
+def freeze_remediation_clock(monkeypatch: pytest.MonkeyPatch) -> type[RemediationClock]:
+    """Route the remediation path's clock reads through one frozen instant.
+
+    Patches both the production module and this test module so the ``since``
+    computation, the fake collaborators' request-time stamps, and
+    ``open_trader.polymarket_trading`` all observe the same clock.
+    """
+
+    clock = RemediationClock
+    clock.frozen_instant = datetime(2026, 9, 11, 8, 0, 0, tzinfo=UTC)
+    clock.now_calls = 0
+    monkeypatch.setattr(polymarket_trading, "datetime", clock)
+    monkeypatch.setattr(sys.modules[__name__], "datetime", clock)
+    return clock
+
+
 class FakeRemediationPublicClient(FakePublicClient):
     def get_order_book(self, *, token_id: str) -> object:
         price = Decimal("0.12" if token_id == "no-token" else "0.15")
@@ -1807,7 +1858,10 @@ def test_preflight_report_discovers_standard_fee_free_probe_without_post(
     assert fake.post_calls == []
 
 
-def test_remediation_options_are_fresh_bounded_and_exact_quantity() -> None:
+def test_remediation_options_are_fresh_bounded_and_exact_quantity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = freeze_remediation_clock(monkeypatch)
     adapter, fake = make_adapter()
     fake.position_rows = [
         {"condition_id": "condition-1", "token_id": "yes-token", "size": Decimal("10")}
@@ -1829,6 +1883,7 @@ def test_remediation_options_are_fresh_bounded_and_exact_quantity() -> None:
     )
 
     assert result["fresh"] is True
+    assert clock.now_calls > 0
     complete = result["complete"]
     assert complete["leg"] == "NO"
     assert complete["side"] == "BUY"
@@ -1838,7 +1893,10 @@ def test_remediation_options_are_fresh_bounded_and_exact_quantity() -> None:
     assert fake.post_calls == []
 
 
-def test_cross_remediation_options_bind_a_fresh_book_to_the_exact_leg() -> None:
+def test_cross_remediation_options_bind_a_fresh_book_to_the_exact_leg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = freeze_remediation_clock(monkeypatch)
     adapter, fake = make_adapter()
     fake.position_rows = [
         {"condition_id": "condition-cross", "token_id": "cross-no-token", "size": Decimal("5")}
@@ -1865,6 +1923,7 @@ def test_cross_remediation_options_bind_a_fresh_book_to_the_exact_leg() -> None:
     assert buy["option"]["max_spend"] == Decimal("0.95")
     assert sell["fresh"] is True
     assert sell["option"]["min_price"] == Decimal("0.82")
+    assert clock.now_calls > 0
     assert fake.post_calls == []
 
 
@@ -1879,7 +1938,9 @@ def test_cross_remediation_options_bind_a_fresh_book_to_the_exact_leg() -> None:
 )
 def test_remediation_options_reject_stale_or_invalid_book_timestamps(
     public_factory: type[object],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    clock = freeze_remediation_clock(monkeypatch)
     adapter, fake = make_adapter()
     fake.position_rows = [
         {"condition_id": "condition-1", "token_id": "yes-token", "size": Decimal("10")}
@@ -1901,10 +1962,14 @@ def test_remediation_options_reject_stale_or_invalid_book_timestamps(
     )
 
     assert result == {"fresh": False}
+    assert clock.now_calls > 0
     assert fake.post_calls == []
 
 
-def test_remediation_options_accepts_fresh_numeric_string_book_timestamps() -> None:
+def test_remediation_options_accepts_fresh_numeric_string_book_timestamps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = freeze_remediation_clock(monkeypatch)
     adapter, fake = make_adapter()
     fake.position_rows = [
         {"condition_id": "condition-1", "token_id": "yes-token", "size": Decimal("10")}
@@ -1926,7 +1991,9 @@ def test_remediation_options_accepts_fresh_numeric_string_book_timestamps() -> N
     )
 
     assert result["fresh"] is True
+    assert clock.now_calls > 0
     assert isinstance(result["checked_at"], datetime)
+    assert result["checked_at"] == clock.frozen_instant
     assert (datetime.now(UTC) - result["checked_at"]).total_seconds() < 10
     assert fake.post_calls == []
 

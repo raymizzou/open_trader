@@ -3,6 +3,23 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-09-11
+
+- 修复趋势报告重放崩溃：重放/再生成老 v2 报告（模拟盘账户不可用）且报告带符号
+  映射契约（`symbol_mapping_schema`）时，`build_report` 在符号映射过滤段引用
+  `use_final_plan_semantics` 触发 `UnboundLocalError`，导致 v2 历史报告无法重放
+  或再生成（现行 v10+ 市场日常不可达，故仅影响历史重放路径）。修复只把该赋值
+  上提到版本分支之前统一计算，v1/v2 分支不消费该值、v3+ 及实盘/rotation 语义
+  不变（无 mapping 元数据的 v2 重放产出与修复前逐字段一致，已用钉住基准验证）。
+- 测试加固：定性两次 Candidate Acceptance 假失败为宿主 Docker 虚拟机时钟回拨
+  ——Polymarket remediation 用例的假客户端在请求时刻用真实墙钟打订单簿时间戳，
+  生产侧稍后再读墙钟算账龄，两读之间时钟回拨令 `age < 0` 走 fail-closed 误判
+  新鲜账簿为过期。现在 remediation 新鲜度族用例（含数字字符串时间戳、cross
+  venue、拒绝陈旧/非法时间戳参数组）统一注入冻结的 `datetime` 子类时钟，测试
+  与宿主墙钟彻底解耦并断言未读真实墙钟；生产 `age < 0` 的 fail-closed 语义
+  保持不变，生产代码零改动。
+  已验证：`make test` 全绿。
+
 ## 2026-09-10
 
 - 修复 `trend-drawdown-unlock` 对 allocation 时代策略的解析缺陷：官方人工解锁命令

@@ -7290,6 +7290,10 @@ def build_report(
         - len(sell_symbols),
     )
     planning_position_limit = max(position_limit, pre_sell_position_count)
+    # Computed before the version branches: the symbol-mapping block below
+    # consumes it for any non-v1 snapshot, including v2 replays whose account
+    # snapshot is unavailable (historically an UnboundLocalError there).
+    use_final_plan_semantics = _uses_final_plan_trend(market, snapshot_version)
     if not account_available:
         buy_actions = []
         risk_skips = []
@@ -7314,7 +7318,6 @@ def build_report(
         risk_skips: list[dict[str, object]] = []
         risk_summary: dict[str, object] = {}
     else:
-        use_final_plan_semantics = _uses_final_plan_trend(market, snapshot_version)
         (
             existing_planned_risk,
             inferred_critical_data_reason,
