@@ -5,6 +5,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-12
 
+- Put market names, net return and result freshness first in the read-only
+  observation table. Pool members are the default view, waiting candidates
+  have a separate filter, and excluded rows remain counts only. Technical
+  metadata moves into details, with historical and missing economics labelled
+  explicitly and the key fields kept readable on desktop and mobile; all 11
+  prediction-page browser regressions pass, including the three new cases.
 - Added a persistent read-only observation pool for native YES/NO and
   supported football three-way candidates. Membership now survives restart,
   source and book freshness are revalidated, and the Dashboard shows cached

@@ -59,7 +59,7 @@ test.describe('unified N_LEG opportunity page', () => {
     await expect(coverage).toContainText(/新鲜\s*2/);
     await expect(coverage).toContainText(/正收益\s*1/);
     await expect(coverage).toContainText(/非正收益\s*1/);
-    await expect(coverage).toContainText('净 ROI');
+    await expect(coverage).toContainText('净收益率');
     await expect(coverage.locator('button')).toHaveCount(0);
   });
 
@@ -89,11 +89,18 @@ test.describe('unified N_LEG opportunity page', () => {
     }
     await openPrediction(page, 'ready');
     const coverage = page.locator('[aria-label="观测覆盖"]');
-    for (const label of ['来源范围', '待准备', '排除', '原生', '三腿', '已订阅 token', '全部腿已订阅组', '最旧盘口', '最近尝试', '最近成功', '数量', '含费成本', '最低赔付', '净额', '阻断原因']) {
+    for (const label of ['来源范围', '待准备', '排除', '原生', '三腿', '已订阅 token', '全部腿已订阅组', '净收益率', '净收益', '当前状态', '含费成本', '最低赔付']) {
       await expect(coverage).toContainText(label);
     }
-    await expect(coverage.locator('table[aria-label="观测结果"] thead th')).toHaveCount(16);
-    await expect(coverage.locator('details[data-observation-details]').first()).toBeVisible();
+    await expect(coverage.locator('table[aria-label="观测结果"] thead th')).toHaveText([
+      '标的名称', '净收益率', '净收益', '当前状态', '预计结束时间', '含费成本', '最低赔付',
+    ]);
+    const details = coverage.locator('details[data-observation-details]').first();
+    await expect(details).toBeVisible();
+    await details.locator('summary').click();
+    for (const label of ['类型', '版本', '审批', '数量', '最近尝试', '最近成功', '资本释放', '释放状态', '来源范围']) {
+      await expect(details).toContainText(label);
+    }
     await coverage.locator('[data-observation-filter]').selectOption('blocked');
     await expect(coverage.locator('table[aria-label="观测结果"] tbody tr')).toHaveCount(0);
     expect(methods.every((method) => method === 'GET')).toBe(true);
@@ -118,8 +125,197 @@ test.describe('unified N_LEG opportunity page', () => {
     await expect(coverage).toContainText('同条件 YES/NO 观察市场');
     await expect(coverage).toContainText('资本释放');
     await expect(coverage).toContainText('已超过预计结束时间');
-    await expect(coverage).toContainText('未知');
+    await expect(coverage).toContainText('状态读取失败');
     await expect(coverage.locator('button')).toHaveCount(0);
+  });
+
+  test('observation table prioritizes market titles and economics without overflow', async ({ page }) => {
+    for (const viewport of [{ width: 1440, height: 1100 }, { width: 375, height: 812 }]) {
+      await page.setViewportSize(viewport);
+      await openPrediction(page, 'observation-table-titles');
+      const coverage = page.locator('[aria-label="观测覆盖"]');
+      const table = coverage.locator('table[aria-label="观测结果"]');
+      await expect(table.locator('thead th')).toHaveText([
+        '标的名称', '净收益率', '净收益', '当前状态', '预计结束时间', '含费成本', '最低赔付',
+      ]);
+      await expect(table.locator('tbody tr')).toHaveCount(2);
+      await expect(table).toContainText('Will Aurora win the full game?');
+      await expect(table).toContainText('Will Aurora win the first half?');
+      await expect(table).toContainText('+2.04%');
+      await expect(table).toContainText('+$0.10');
+      await expect(table).toContainText('$4.90');
+      await expect(table).toContainText('$5.00');
+      const visibleTableText = await table.evaluate((element) => (element as HTMLElement).innerText);
+      expect(visibleTableText).not.toContain('version-' + 'x'.repeat(180));
+      expect(visibleTableText).not.toContain('APPROVED');
+      const details = table.locator('details[data-observation-details]').first();
+      await expect(details.locator('dl')).toBeHidden();
+      const closedGeometry = await page.evaluate(() => {
+        const row = document.querySelector('[aria-label="观测结果"] tbody tr');
+        const name = row?.querySelector('td[data-label="标的名称"] strong') as HTMLElement | null;
+        const roi = row?.querySelector('td[data-label="净收益率"] strong') as HTMLElement | null;
+        return {
+          viewport: window.innerWidth,
+          rowHeight: row?.getBoundingClientRect().height ?? 0,
+          nameWidth: name?.getBoundingClientRect().width ?? 0,
+          roiWidth: roi?.getBoundingClientRect().width ?? 0,
+          captionWidth: (document.querySelector('[aria-label="观测结果"] caption') as HTMLElement | null)?.getBoundingClientRect().width ?? 0,
+          captionHeight: (document.querySelector('[aria-label="观测结果"] caption') as HTMLElement | null)?.getBoundingClientRect().height ?? 0,
+        };
+      });
+      expect(closedGeometry.nameWidth).toBeGreaterThan(closedGeometry.viewport === 375 ? 180 : 250);
+      expect(closedGeometry.roiWidth).toBeGreaterThan(40);
+      expect(closedGeometry.captionWidth).toBeGreaterThan(closedGeometry.viewport === 375 ? 180 : 250);
+      expect(closedGeometry.captionHeight).toBeLessThan(60);
+      expect(closedGeometry.rowHeight).toBeLessThan(closedGeometry.viewport === 375 ? 700 : 500);
+      const closedOverflow = await page.evaluate(() => {
+        const observation = document.querySelector('[aria-label="观测覆盖"]') as HTMLElement | null;
+        return {
+          page: document.documentElement.scrollWidth <= window.innerWidth && document.body.scrollWidth <= window.innerWidth,
+          observation: Boolean(observation) && observation.scrollWidth <= observation.clientWidth,
+        };
+      });
+      expect(closedOverflow).toEqual({ page: true, observation: true });
+      await details.getByText('详情').click();
+      await expect(details.locator('dl')).toBeVisible();
+      await expect(details).toContainText('version-' + 'x'.repeat(180));
+      await expect(details).toContainText('APPROVED');
+      const geometry = await page.evaluate(() => {
+        const row = document.querySelector('[aria-label="观测结果"] tbody tr');
+        const name = row?.querySelector('td[data-label="标的名称"] strong') as HTMLElement | null;
+        const roi = row?.querySelector('td[data-label="净收益率"] strong') as HTMLElement | null;
+        return {
+          viewport: window.innerWidth,
+          rowHeight: row?.getBoundingClientRect().height ?? 0,
+          nameWidth: name?.getBoundingClientRect().width ?? 0,
+          nameHeight: name?.getBoundingClientRect().height ?? 0,
+          roiWidth: roi?.getBoundingClientRect().width ?? 0,
+          roiHeight: roi?.getBoundingClientRect().height ?? 0,
+          captionWidth: (document.querySelector('[aria-label="观测结果"] caption') as HTMLElement | null)?.getBoundingClientRect().width ?? 0,
+          captionHeight: (document.querySelector('[aria-label="观测结果"] caption') as HTMLElement | null)?.getBoundingClientRect().height ?? 0,
+        };
+      });
+      expect(geometry.nameWidth).toBeGreaterThan(closedGeometry.viewport === 375 ? 180 : 250);
+      expect(geometry.roiWidth).toBeGreaterThan(40);
+      expect(geometry.captionWidth).toBeGreaterThan(closedGeometry.viewport === 375 ? 180 : 250);
+      expect(geometry.captionHeight).toBeLessThan(60);
+      expect(geometry.rowHeight).toBeLessThan(closedGeometry.viewport === 375 ? 1800 : 800);
+      const overflow = await page.evaluate(() => {
+        const observation = document.querySelector('[aria-label="观测覆盖"]') as HTMLElement | null;
+        return {
+          page: document.documentElement.scrollWidth <= window.innerWidth && document.body.scrollWidth <= window.innerWidth,
+          observation: Boolean(observation) && observation.scrollWidth <= observation.clientWidth,
+        };
+      });
+      expect(overflow).toEqual({ page: true, observation: true });
+      await page.screenshot({
+        path: `test-results/observation-table-${geometry.viewport === 375 ? 'mobile' : 'desktop'}-expanded.png`,
+        fullPage: true,
+      });
+    }
+  });
+
+  test('observation table shows pool members and separates waiting without excluded rows', async ({ page }) => {
+    const methods: string[] = [];
+    page.on('request', (request) => {
+      if (request.url().includes('/api/prediction-arbitrage/')) methods.push(request.method());
+    });
+    await openPrediction(page, 'observation-table-membership');
+    const coverage = page.locator('[aria-label="观测覆盖"]');
+    const table = coverage.locator('table[aria-label="观测结果"]');
+    const filter = coverage.locator('[data-observation-filter]');
+    await expect(filter.locator('option')).toHaveText(['全部（池内）', '当前有效', '阻断 / 陈旧', '等待入池']);
+    await expect(filter).toHaveValue('all');
+    await expect(coverage).toContainText(/排除\s*2/);
+    await expect(table.locator('tbody tr')).toHaveCount(3);
+    for (const title of ['Pool positive market', 'Pool negative market', 'Pool blocked market']) {
+      await expect(table).toContainText(title);
+    }
+    for (const title of ['Waiting market', 'Excluded current must stay hidden', 'Rejected stale must stay hidden']) {
+      await expect(table).not.toContainText(title);
+    }
+    const positiveDetails = table.locator('tbody tr', { hasText: 'Pool positive market' }).locator('details[data-observation-details]');
+    await positiveDetails.locator('summary').click();
+    await expect(positiveDetails.locator('dl')).toContainText('订阅 token');
+    await expect(positiveDetails.locator('dl')).toContainText('2');
+
+    await filter.selectOption('waiting');
+    await expect(table.locator('tbody tr')).toHaveCount(1);
+    await expect(table).toContainText('Waiting market');
+    await expect(table).not.toContainText('Pool positive market');
+
+    await filter.selectOption('current');
+    await expect(table.locator('tbody tr')).toHaveCount(2);
+    await expect(table).toContainText('Pool positive market');
+    await expect(table).toContainText('Pool negative market');
+    await expect(table).not.toContainText('Waiting market');
+    await expect(table).not.toContainText('Excluded current must stay hidden');
+
+    await filter.selectOption('blocked');
+    await expect(table.locator('tbody tr')).toHaveCount(1);
+    await expect(table).toContainText('Pool blocked market');
+    await expect(table).not.toContainText('Rejected stale must stay hidden');
+
+    await openPrediction(page, 'observation-table-pending-quote');
+    const pendingTable = page.locator('[aria-label="观测覆盖"] table[aria-label="观测结果"]');
+    const pendingFilter = page.locator('[aria-label="观测覆盖"] [data-observation-filter]');
+    await expect(pendingTable.locator('tbody tr')).toHaveCount(1);
+    await expect(pendingTable).toContainText('Pending quote pool member');
+    await pendingFilter.selectOption('current');
+    await expect(pendingTable.locator('tbody tr')).toHaveCount(0);
+    await pendingFilter.selectOption('waiting');
+    await expect(pendingTable.locator('tbody tr')).toHaveCount(0);
+    await pendingFilter.selectOption('blocked');
+    await expect(pendingTable.locator('tbody tr')).toHaveCount(0);
+
+    await openPrediction(page, 'observation-table-identity-fallback');
+    const identityTable = page.locator('[aria-label="观测覆盖"] table[aria-label="观测结果"]');
+    await expect(identityTable.locator('tbody tr')).toHaveCount(1);
+    await expect(identityTable).toContainText('关系 ID：relation-only-fallback');
+    await expect(identityTable).not.toContainText('事件 ID：relation-only-fallback');
+    expect(methods.every((method) => method === 'GET')).toBe(true);
+  });
+
+  test('observation table distinguishes historical and unavailable economics', async ({ page }) => {
+    await openPrediction(page, 'observation-table-history');
+    const table = page.locator('[aria-label="观测覆盖"] table[aria-label="观测结果"]');
+    const current = table.locator('tbody tr', { hasText: 'Current positive market' });
+    const stale = table.locator('tbody tr', { hasText: 'Stale previous positive market' });
+    const unavailable = table.locator('tbody tr', { hasText: 'Blocked never computed market' });
+    await expect(current).toHaveCount(1);
+    await expect(current).not.toContainText('上次结果');
+    await expect(current.locator('[data-label="净收益率"]')).toContainText('+2.04%');
+    await expect(current.locator('[data-label="净收益"]')).toContainText('+$0.10');
+    await expect(current.locator('[data-label="当前状态"]')).toContainText('当前有效');
+    await expect(stale).toContainText('上次结果');
+    await expect(stale).toContainText('+2.04%');
+    await expect(stale.locator('[data-label="当前状态"]')).toContainText('已阻断');
+    await expect(unavailable.locator('[data-label="净收益率"]')).toHaveText('—');
+    await expect(unavailable.locator('[data-label="净收益"]')).toHaveText('—');
+    await expect(unavailable.locator('[data-label="含费成本"]')).toHaveText('—');
+    await expect(unavailable.locator('[data-label="最低赔付"]')).toHaveText('—');
+    await expect(unavailable).not.toContainText('上次结果');
+    await expect(unavailable.locator('[data-label="当前状态"]')).toContainText('已阻断');
+    await unavailable.locator('summary').click();
+    await expect(unavailable.locator('dl')).toContainText('UNKNOWN_MODEL_FACTS');
+
+    await openPrediction(page, 'observation-error');
+    const errorTable = page.locator('[aria-label="观测覆盖"] table[aria-label="观测结果"]');
+    await expect(errorTable.locator('tbody tr')).toHaveCount(2);
+    await expect(errorTable.locator('tbody tr').first()).toContainText('上次结果');
+    await expect(errorTable.locator('tbody tr').first().locator('[data-label="当前状态"]')).toContainText('读取失败');
+
+    await openPrediction(page, 'observation-fetch-error');
+    const fetchErrorCoverage = page.locator('[aria-label="观测覆盖"]');
+    const fetchErrorTable = fetchErrorCoverage.locator('table[aria-label="观测结果"]');
+    await expect(fetchErrorTable.locator('tbody tr')).toHaveCount(2);
+    await page.evaluate(async () => {
+      await fetchPredictionState();
+    });
+    await expect(fetchErrorCoverage.locator('[data-observation-status]')).toHaveText('读取失败');
+    await expect(fetchErrorTable.locator('tbody tr')).toHaveCount(2);
+    await expect(fetchErrorTable.locator('tbody tr').first()).toContainText('上次结果');
+    await expect(fetchErrorTable.locator('tbody tr').first().locator('[data-label="当前状态"]')).toContainText('读取失败');
   });
 
   test('MANUAL confirm opens the existing cross-venue confirmation modal', async ({ page }) => {
