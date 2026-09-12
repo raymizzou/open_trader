@@ -12,7 +12,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
   changes, missing source fee facts and catalog reads fail closed, bounded
   recovery, durable membership failures, historical result retention, truthful
   reserved capacity and subscription coverage, and cached GET-only reads are
-  covered by the repair regressions and local Chromium contract.
+  covered by the repair regressions and local Chromium contract. Observation
+  detail text on the approved soft surface now meets the AA contrast contract.
 - Restored the `outcome-token` convention on paper CLOB books after native
   settlement fingerprint integration; the order-facts case and four paper
   validation regressions pass in Docker.

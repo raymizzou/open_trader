@@ -5462,6 +5462,7 @@ tbody tr.active-row,
 .trend-kelly-observation-status,
 .trend-kelly-observation-metrics article,
 .trend-kelly-observation-table th,
+.pm-observation-table dl,
 .pm-relation-chip,
 .pm-relation-tag {
   --muted: var(--text);
