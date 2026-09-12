@@ -17,7 +17,10 @@ from .prediction_arbitrage import (
 from .prediction_arbitrage_store import PredictionArbitrageStore
 from .prediction_n_leg_mode import n_leg_order_readiness
 from .relation_catalog import REVIEW_STATES
-from .prediction_n_leg_read_model import project_n_leg_solution
+from .prediction_n_leg_read_model import (
+    project_n_leg_solution,
+    project_observation_coverage,
+)
 from .prediction_title_translation import cached_prediction_title_zh
 
 
@@ -1768,6 +1771,7 @@ def prediction_state_payload(
     n_leg_solutions: Sequence[Mapping[str, object]] = (),
     n_leg_episodes: Mapping[str, Mapping[str, object]] | None = None,
     n_leg_metrics: object = None,
+    observation_snapshot: Mapping[str, object] | None = None,
     legacy_retired: bool = False,
 ) -> dict[str, object]:
     if monitor is None and store is None and execution is None:
@@ -2192,6 +2196,24 @@ def prediction_state_payload(
         safe_metrics = _prediction_safe_value(n_leg_metrics)
         if isinstance(safe_metrics, Mapping):
             result["n_leg_metrics"] = dict(safe_metrics)
+    if isinstance(observation_snapshot, Mapping):
+        coverage = observation_snapshot.get("coverage")
+        if isinstance(coverage, Mapping):
+            result["n_leg_coverage"] = dict(
+                _prediction_safe_value(coverage)
+                if isinstance(_prediction_safe_value(coverage), Mapping)
+                else {}
+            )
+        else:
+            latest = observation_snapshot.get("latest")
+            if isinstance(latest, (Mapping, list, tuple)):
+                projected = project_observation_coverage(latest=latest)
+                safe_projected = _prediction_safe_value(projected)
+                if isinstance(safe_projected, Mapping):
+                    result["n_leg_coverage"] = dict(safe_projected)
+        safe_observation = _prediction_safe_value(observation_snapshot)
+        if isinstance(safe_observation, Mapping):
+            result["n_leg_observation"] = dict(safe_observation)
     if shadow_summary["monitoring"]:
         result["n_leg_shadow"] = shadow_summary
     result["relation_review"] = _prediction_relation_review(relation_catalog)

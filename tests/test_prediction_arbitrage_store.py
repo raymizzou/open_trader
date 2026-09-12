@@ -243,6 +243,7 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
         "n_leg_execution_scopes",
         "n_leg_execution_requests",
         "partial_fill_proofs",
+        "observation_pool_members",
     }
     assert "signals_market_started_at" in indexes
     assert "signals_started_at" in indexes

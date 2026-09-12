@@ -580,6 +580,9 @@ def test_disabled_n_leg_background_skips_resolver_and_driver(
         def __init__(self, *_: object, **__: object) -> None:
             pass
 
+        def observation_snapshot(self) -> dict[str, object]:
+            return {}
+
         def apply_safety_policy(
             self, _policy: object, *, git_sha: str
         ) -> dict[str, object]:
@@ -873,7 +876,11 @@ def test_runtime_owns_one_shared_solver_server_for_its_start_stop_lifetime(
             events.append("solver.close")
 
     monkeypatch.setattr(runtime_module, "PredictionArbitrageStore", FakeStore)
-    monkeypatch.setattr(runtime_module, "RelationCatalog", lambda _path: object())
+    monkeypatch.setattr(
+        runtime_module,
+        "RelationCatalog",
+        lambda _path: SimpleNamespace(observation_snapshot=lambda: {}),
+    )
     monkeypatch.setattr(runtime_module, "load_trading_config", lambda _path: object())
     monkeypatch.setattr(runtime_module, "PolymarketTradingClient", SimpleNamespace(from_keychain=lambda _config: FakeTrading()))
     monkeypatch.setattr(runtime_module, "PredictTradingClient", SimpleNamespace(from_keychain=lambda _config: None))

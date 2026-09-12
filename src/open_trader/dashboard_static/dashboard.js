@@ -68,6 +68,7 @@ const state = {
     llmSwitchInFlight: "",
     activeExecutionId: "",
     filter: {engine: "all", kind: "all", legs: null, scope: null},
+    observationFilter: "all",
     relationReview: {open: false, view: "pending_approval", offset: 0, items: [], total: 0, pendingCount: 0, detail: null, loading: false},
   },
 };
@@ -266,6 +267,12 @@ function bindEvents() {
     setWorkspaceView(workspace);
   });
   elements["prediction-market-root"].addEventListener("click", handlePredictionMarketClick);
+  elements["prediction-market-root"].addEventListener("change", (event) => {
+    const filter = event.target.closest?.("[data-observation-filter]");
+    if (!filter) return;
+    state.predictionMarket.observationFilter = String(filter.value || "all");
+    renderPredictionMarket();
+  });
   elements["prediction-market-modal-root"].addEventListener("click", handlePredictionModalClick);
   document.addEventListener("keydown", handlePredictionModalKeydown);
   if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
@@ -2662,6 +2669,127 @@ function predictionCapitalUsage(payload) {
   return `<section class="pm-readiness" aria-label="资金占用"><div class="pm-readiness-item"><span>max_total_unsettled_capital</span><strong>${escapeHtml(predictionMoney(set ? usage.max_total_unsettled_capital : "0.00"))}</strong><small>${set ? "显式设置" : "首次 Canary 前需显式设置"}</small></div><div class="pm-readiness-item"><span>当前保守占用</span><strong>${escapeHtml(predictionMoney(usage.current_conservative))}</strong><small>active batch 预留 ${escapeHtml(predictionMoney(usage.active_batch_reserved))}</small></div><div class="pm-readiness-item"><span>剩余额度</span><strong>${escapeHtml(predictionMoney(usage.remaining))}</strong><small>只投影服务端账本</small></div></section>`;
 }
 
+function predictionObservationCoverage(payload) {
+  const coverage = payload?.n_leg_coverage && typeof payload.n_leg_coverage === "object"
+    ? payload.n_leg_coverage
+    : null;
+  const observation = payload?.n_leg_observation && typeof payload.n_leg_observation === "object"
+    ? payload.n_leg_observation
+    : null;
+  if (!coverage && !observation) return "";
+  const display = (value, fallback = "—") => predictionHasValue(value) ? String(value) : fallback;
+  const count = (...keys) => {
+    for (const key of keys) {
+      if (predictionHasValue(coverage?.[key])) return String(coverage[key]);
+      if (predictionHasValue(observation?.[key])) return String(observation[key]);
+    }
+    return "—";
+  };
+  const poolCount = count("pool_count");
+  const poolLimit = count("pool_limit");
+  const capacity = predictionHasValue(coverage?.capacity)
+    ? String(coverage.capacity)
+    : poolCount !== "—" && poolLimit !== "—" ? `${poolCount}/${poolLimit}` : "—";
+  const latestCount = count("latest_count");
+  const freshCount = count("fresh_count");
+  const positiveCount = count("positive_count");
+  const nonPositiveCount = count("non_positive_count");
+  const blockedCount = count("blocked_count");
+  const statusKey = String(observation?.status || coverage?.status || "UNKNOWN").toUpperCase();
+  const statusLabels = {
+    READY: "已就绪",
+    EMPTY: "明确为空",
+    STALE: "数据过期",
+    ERROR: "读取失败",
+    UNKNOWN: "未知",
+  };
+  const statusLabel = statusLabels[statusKey] || statusKey || "未知";
+  const sourceScope = display(
+    coverage?.source_scope || observation?.source_scope || "官方来源范围未返回",
+  );
+  const generation = display(coverage?.generation ?? observation?.generation);
+  const updatedAt = coverage?.updated_at || observation?.updated_at;
+  const latest = Array.isArray(observation?.latest) ? observation.latest : [];
+  const results = Array.isArray(observation?.results) ? observation.results : [];
+  const rowsByIdentity = new Map();
+  for (const row of results) {
+    const identity = String(row?.identity || "");
+    if (identity) rowsByIdentity.set(identity, {...(latest.find((item) => String(item?.identity || "") === identity) || {}), ...row});
+  }
+  for (const row of latest) {
+    const identity = String(row?.identity || "");
+    if (identity && !rowsByIdentity.has(identity)) rowsByIdentity.set(identity, row);
+  }
+  const filter = state.predictionMarket.observationFilter || "all";
+  const filteredRows = [...rowsByIdentity.values()].filter((row) => {
+    const result = row?.result && typeof row.result === "object" ? row.result : null;
+    const rowStage = String(row?.stage || "").toUpperCase();
+    if (filter === "current") return result?.current === true && result?.status === "PASS";
+    if (filter === "blocked") return result?.current === false || ["BLOCKED", "ERROR"].includes(String(result?.status || "").toUpperCase());
+    if (filter === "waiting") return ["WAITING", "PENDING", "PENDING_QUOTE", "CANDIDATE"].includes(rowStage);
+    if (filter === "excluded") return ["EXCLUDED", "REJECTED", "INVALID"].includes(rowStage);
+    return true;
+  });
+  const observationMoney = (result, directKeys, unitKeys) => {
+    for (const key of directKeys) {
+      if (predictionHasValue(result?.[key])) return predictionMoney(result[key], "—");
+    }
+    for (const key of unitKeys) {
+      if (predictionHasValue(result?.[key])) return predictionNLegUnitsMoney(result[key], "—");
+    }
+    return "—";
+  };
+  const observationRoi = (result) => {
+    const value = Number(result?.net_roi);
+    return Number.isFinite(value) ? `${(value * 100).toFixed(2)}%` : "—";
+  };
+  const stageLabel = (row, result) => {
+    const stage = String(row?.stage || "").toUpperCase();
+    const labels = {OBSERVING: "观测中", WAITING: "等待入池", PENDING: "等待入池", PENDING_QUOTE: "等待报价", EXCLUDED: "已排除", REJECTED: "已排除", INVALID: "已排除"};
+    const overdue = row?.overdue === true ? " · 已超过预计结束时间" : "";
+    const status = result?.status && result.status !== "PASS" ? ` · ${result.status}` : "";
+    return `${labels[stage] || display(row?.stage, "未知")}${status}${overdue}`;
+  };
+  const rowHtml = filteredRows.slice(0, 30).map((row) => {
+    const result = row?.result && typeof row.result === "object" ? row.result : {};
+    const event = row?.event || row?.event_title || row?.title || row?.question || row?.identity;
+    const type = row?.relation_type || row?.type;
+    const endDate = row?.end_date || row?.expected_end_date;
+    const version = row?.version_id || result?.version_id;
+    const approval = row?.approval_status || row?.approval;
+    const oldestBook = row?.oldest_book_at || result?.oldest_book_at;
+    const attempt = row?.last_attempt_at || result?.last_attempt_at;
+    const success = row?.last_success_at || result?.last_success_at;
+    const capitalReleaseAt = row?.capital_release_at || result?.capital_release_at;
+    const capitalReleaseStatus = row?.capital_release_status || result?.capital_release_status;
+    const reason = result?.reason || row?.reason || result?.detail || "";
+    const current = result?.current === true && result?.status === "PASS";
+    const details = [
+      ["来源范围", row?.source_scope || sourceScope],
+      ["当前状态", current ? "当前有效" : display(result?.status, "未计算")],
+      ["版本指纹", row?.version_fingerprint || result?.version_fingerprint],
+      ["订阅 token", row?.tokens ? row.tokens.length : null],
+      ["预计结束", endDate],
+      ["资本释放", capitalReleaseAt || capitalReleaseStatus],
+      ["释放状态", capitalReleaseStatus],
+      ["是否逾期", row?.overdue === true ? "已超过预计结束时间" : "否"],
+    ].filter(([, value]) => predictionHasValue(value));
+    return `<tr data-observation-stage="${escapeHtml(String(row?.stage || ""))}" data-observation-current="${current ? "true" : "false"}"><td data-label="事件"><strong>${escapeHtml(display(event, "未命名"))}</strong><details data-observation-details><summary>详情</summary><dl>${details.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(display(value))}</dd></div>`).join("")}</dl></details></td><td data-label="类型">${escapeHtml(display(type, "结构未知"))}</td><td data-label="预计结束时间">${escapeHtml(endDate ? predictionHktTimestamp(endDate) : "—")}</td><td data-label="版本">${escapeHtml(display(version))}</td><td data-label="审批">${escapeHtml(display(approval))}</td><td data-label="阶段">${escapeHtml(stageLabel(row, result))}</td><td data-label="最旧盘口">${escapeHtml(oldestBook ? predictionHktTimestamp(oldestBook) : "—")}</td><td data-label="最近尝试">${escapeHtml(attempt ? predictionHktTimestamp(attempt) : "—")}</td><td data-label="最近成功">${escapeHtml(success ? predictionHktTimestamp(success) : "—")}</td><td data-label="数量">${escapeHtml(display(result?.quantity ?? result?.quantity_lots))}</td><td data-label="含费成本">${escapeHtml(observationMoney(result, ["cost"], ["cost_upper_bound_units", "bounded_cost_units"]))}</td><td data-label="最低赔付">${escapeHtml(observationMoney(result, ["payout", "minimum_payout"], ["payout_lower_bound_units", "bounded_payout_units"]))}</td><td data-label="净额">${escapeHtml(observationMoney(result, ["net_amount", "profit"], ["guaranteed_profit_units"]))}</td><td data-label="净 ROI">${escapeHtml(observationRoi(result))}</td><td data-label="资本释放">${escapeHtml(capitalReleaseAt ? predictionHktTimestamp(capitalReleaseAt) : display(capitalReleaseStatus, "未知"))}</td><td data-label="阻断原因">${escapeHtml(display(reason))}</td></tr>`;
+  }).join("");
+  const emptyNotice = filteredRows.length
+    ? ""
+    : statusKey === "UNKNOWN"
+      ? `<p class="pm-observation-empty">当前状态未知，尚未取得可确认的观测快照；不会显示为零。</p>`
+      : statusKey === "EMPTY"
+        ? `<p class="pm-observation-empty">当前已确认没有候选。</p>`
+        : `<p class="pm-observation-empty">当前筛选没有可显示的候选。</p>`;
+  const table = rowHtml
+    ? `<div class="pm-observation-table-wrap" tabindex="0"><table class="pm-observation-table" aria-label="观测结果"><caption>持续观测结果（只读）</caption><thead><tr>${["事件", "类型", "预计结束时间", "版本", "审批", "阶段", "最旧盘口", "最近尝试", "最近成功", "数量", "含费成本", "最低赔付", "净额", "净 ROI", "资本释放", "阻断原因"].map((label) => `<th scope="col">${label}</th>`).join("")}</tr></thead><tbody>${rowHtml}</tbody></table></div>`
+    : "";
+  const filterOptions = [["all", "全部"], ["current", "当前有效"], ["blocked", "阻断 / 陈旧"], ["waiting", "等待入池"], ["excluded", "已排除"]];
+  return `<section class="pm-panel pm-observation-coverage" aria-label="观测覆盖"><header class="pm-panel-heading"><div><h2>持续观测池</h2><p>按预计结束时间入池，池内按净收益率排序；仅供观察。</p><p class="pm-observation-source">来源范围：${escapeHtml(sourceScope)} · 代数 ${escapeHtml(generation)}${updatedAt ? ` · 更新 ${escapeHtml(predictionHktTimestamp(updatedAt))}` : ""}</p></div><div class="pm-observation-header-actions"><span class="pm-pill" data-observation-status>${escapeHtml(statusLabel)}</span><label>筛选 <select data-observation-filter aria-label="观测结果筛选">${filterOptions.map(([value, label]) => `<option value="${value}"${filter === value ? " selected" : ""}>${label}</option>`).join("")}</select></label></div></header><div class="pm-observation-metrics"><div><span>池内</span><strong>${escapeHtml(capacity)}</strong></div><div><span>最新</span><strong>${escapeHtml(latestCount)}</strong></div><div><span>待入池</span><strong>${escapeHtml(count("waiting_count"))}</strong></div><div><span>来源待准备</span><strong>${escapeHtml(count("pending_preparation_count"))}</strong></div><div><span>排除</span><strong>${escapeHtml(count("excluded_count"))}</strong></div><div><span>原生</span><strong>${escapeHtml(count("native_count"))}</strong></div><div><span>三腿</span><strong>${escapeHtml(count("three_way_count"))}</strong></div><div><span>已订阅 token</span><strong>${escapeHtml(count("subscribed_tokens"))}</strong></div><div><span>全部腿已订阅组</span><strong>${escapeHtml(count("all_leg_subscribed_count"))}</strong></div><div><span>新鲜</span><strong>${escapeHtml(freshCount)}</strong></div><div><span>已计算</span><strong>${escapeHtml(count("computed_count"))}</strong></div><div><span>阻断</span><strong>${escapeHtml(blockedCount)}</strong></div><div><span>正收益</span><strong class="pm-positive">${escapeHtml(positiveCount)}</strong></div><div><span>非正收益</span><strong>${escapeHtml(nonPositiveCount)}</strong></div></div>${table}${emptyNotice}</section>`;
+}
+
 function predictionNLegMetrics(payload) {
   const metrics = payload?.n_leg_metrics && typeof payload.n_leg_metrics === "object" ? payload.n_leg_metrics : null;
   if (!metrics) return "";
@@ -2769,7 +2897,7 @@ function predictionNLegIncidentPanel(payload) {
 function predictionUnifiedPage(payload, filter) {
   const viewPayload = payload || {status: "loading", events: [], opportunities: []};
   const filterState = state.predictionMarket.filter || {engine: "all", kind: "all", legs: null, scope: null};
-  return `${predictionUnifiedPageHeader(viewPayload)}${predictionModeBar(viewPayload)}${predictionNLegIncidentPanel(viewPayload)}${predictionNLegMetrics(viewPayload)}${predictionReadinessStrip(viewPayload)}${predictionCapitalUsage(viewPayload)}${predictionUnifiedOpportunityList(viewPayload, filterState)}${predictionRelationReview(viewPayload)}${predictionErrorAlert()}${predictionExecutionAlert(viewPayload)}${relationReviewDrawer()}${nlegReportDrawer()}`;
+  return `${predictionUnifiedPageHeader(viewPayload)}${predictionModeBar(viewPayload)}${predictionNLegIncidentPanel(viewPayload)}${predictionNLegMetrics(viewPayload)}${predictionReadinessStrip(viewPayload)}${predictionCapitalUsage(viewPayload)}${predictionObservationCoverage(viewPayload)}${predictionUnifiedOpportunityList(viewPayload, filterState)}${predictionRelationReview(viewPayload)}${predictionErrorAlert()}${predictionExecutionAlert(viewPayload)}${relationReviewDrawer()}${nlegReportDrawer()}`;
 }
 
 function predictionAnnualizedPercent(value, digits = 1) {
@@ -3846,7 +3974,59 @@ async function fetchPredictionState() {
   } catch (error) {
     state.predictionMarket.error = error instanceof Error ? error.message : String(error);
     if (state.predictionMarket.payload) {
-      state.predictionMarket.payload = {...state.predictionMarket.payload, stale: true};
+      const payload = state.predictionMarket.payload;
+      const observation = payload.n_leg_observation && typeof payload.n_leg_observation === "object"
+        ? payload.n_leg_observation
+        : {};
+      const markStale = (row) => {
+        if (!row || typeof row !== "object") return row;
+        const result = row.result && typeof row.result === "object" ? row.result : null;
+        if (!result) return row;
+        return {
+          ...row,
+          result: {
+            ...result,
+            status: result.status === "PASS" ? "BLOCKED" : result.status,
+            current: false,
+            reason: "STATE_FETCH_FAILED",
+          },
+        };
+      };
+      const staleLatest = Array.isArray(observation.latest)
+        ? observation.latest.map(markStale)
+        : observation.latest;
+      const staleResults = Array.isArray(observation.results)
+        ? observation.results.map(markStale)
+        : observation.results;
+      const oldCoverage = payload.n_leg_coverage && typeof payload.n_leg_coverage === "object"
+        ? payload.n_leg_coverage
+        : {};
+      const staleResultCount = Array.isArray(staleResults)
+        ? staleResults.filter((row) => row && typeof row.result === "object").length
+        : 0;
+      state.predictionMarket.payload = {
+        ...payload,
+        stale: true,
+        n_leg_coverage: {
+          ...oldCoverage,
+          status: "ERROR",
+          status_reason: "STATE_FETCH_FAILED",
+          fresh: 0,
+          fresh_count: 0,
+          positive: 0,
+          positive_count: 0,
+          non_positive: 0,
+          non_positive_count: 0,
+          blocked_count: staleResultCount,
+        },
+        n_leg_observation: {
+          ...observation,
+          status: "ERROR",
+          status_reason: "STATE_FETCH_FAILED",
+          latest: staleLatest,
+          results: staleResults,
+        },
+      };
     } else {
       state.predictionMarket.payload = {status: "unavailable", stale: true, readiness: {status: "unavailable"}, events: [], opportunities: [], breaker: {open: true}};
     }

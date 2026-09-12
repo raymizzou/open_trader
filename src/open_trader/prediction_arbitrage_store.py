@@ -491,6 +491,18 @@ class PredictionArbitrageStore:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS observation_pool_members (
+                identity TEXT PRIMARY KEY,
+                relation_type TEXT NOT NULL,
+                version_id TEXT NOT NULL,
+                version_fingerprint TEXT NOT NULL,
+                rules_fingerprint TEXT NOT NULL,
+                entered_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS observation_pool_members_entered_at
+            ON observation_pool_members(entered_at, identity);
+
             CREATE TABLE IF NOT EXISTS relation_scan_runs (
                 scan_id TEXT PRIMARY KEY,
                 scope TEXT NOT NULL CHECK (scope IN ('full', 'event', 'activity')),
@@ -879,6 +891,89 @@ class PredictionArbitrageStore:
                 "SELECT payload FROM relation_state WHERE singleton=1"
             ).fetchone()
         return None if row is None else _load_payload(str(row["payload"]))
+
+    def load_observation_pool_members(self) -> dict[str, dict[str, str]]:
+        """Read the small durable observation membership set."""
+
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                "SELECT identity, relation_type, version_id, "
+                "version_fingerprint, rules_fingerprint, entered_at "
+                "FROM observation_pool_members ORDER BY identity"
+            ).fetchall()
+        return {
+            str(row["identity"]): {
+                "identity": str(row["identity"]),
+                "relation_type": str(row["relation_type"]),
+                "version_id": str(row["version_id"]),
+                "version_fingerprint": str(row["version_fingerprint"]),
+                "rules_fingerprint": str(row["rules_fingerprint"]),
+                "entered_at": str(row["entered_at"]),
+            }
+            for row in rows
+        }
+
+    def save_observation_pool_members(
+        self, members: Mapping[str, Mapping[str, object]]
+    ) -> None:
+        """Atomically replace observation membership metadata.
+
+        The observation component stores identities and input fingerprints only;
+        quotes and result history deliberately stay in its in-memory snapshot.
+        """
+
+        normalized: list[tuple[str, str, str, str, str, str]] = []
+        for identity, member in members.items():
+            if not isinstance(member, Mapping):
+                raise ValueError("observation member must be a mapping")
+            key = str(identity).strip()
+            if not key:
+                raise ValueError("observation member identity is required")
+            values = (
+                key,
+                str(member.get("relation_type") or "").strip(),
+                str(member.get("version_id") or "").strip(),
+                str(member.get("version_fingerprint") or "").strip(),
+                str(member.get("rules_fingerprint") or "").strip(),
+                _canonical_timestamp(member.get("entered_at")),
+            )
+            if not all(values[:5]):
+                raise ValueError("observation member metadata is incomplete")
+            normalized.append(values)
+        if len(normalized) > 10:
+            raise ValueError("observation pool cannot exceed ten members")
+        with self._transaction() as connection:
+            identities = {row[0] for row in normalized}
+            existing = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT identity FROM observation_pool_members"
+                )
+            }
+            removed = existing - identities
+            if removed:
+                placeholders = ",".join("?" for _ in removed)
+                connection.execute(
+                    "DELETE FROM observation_pool_members WHERE identity IN ("
+                    + placeholders
+                    + ")",
+                    tuple(sorted(removed)),
+                )
+            connection.executemany(
+                """
+                INSERT INTO observation_pool_members(
+                    identity, relation_type, version_id, version_fingerprint,
+                    rules_fingerprint, entered_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(identity) DO UPDATE SET
+                    relation_type=excluded.relation_type,
+                    version_id=excluded.version_id,
+                    version_fingerprint=excluded.version_fingerprint,
+                    rules_fingerprint=excluded.rules_fingerprint,
+                    entered_at=excluded.entered_at
+                """,
+                normalized,
+            )
 
     def record_relation_scan(
         self,

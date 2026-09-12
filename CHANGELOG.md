@@ -5,6 +5,14 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-12
 
+- Added a persistent read-only observation pool for native YES/NO and
+  supported football three-way candidates. Membership now survives restart,
+  source and book freshness are revalidated, and the Dashboard shows cached
+  positive and non-positive economics with coverage details. Source fee/rule
+  changes, missing source fee facts and catalog reads fail closed, bounded
+  recovery, durable membership failures, historical result retention, truthful
+  reserved capacity and subscription coverage, and cached GET-only reads are
+  covered by the repair regressions and local Chromium contract.
 - Restored the `outcome-token` convention on paper CLOB books after native
   settlement fingerprint integration; the order-facts case and four paper
   validation regressions pass in Docker.

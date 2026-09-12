@@ -14,6 +14,173 @@ STATIC_DIR = ROOT / "src" / "open_trader" / "dashboard_static"
 FIXTURE_PATH = Path(__file__).with_name("fixtures") / "kelly-dashboard.json"
 
 
+def _observation_fixture(scenario: str) -> dict[str, object]:
+    """Return coherent read-only observation states for the local browser fixture."""
+
+    state = {
+        "observation-empty": "empty",
+        "observation-stale": "stale",
+        "observation-error": "error",
+        "observation-unknown": "unknown",
+    }.get(scenario, "normal")
+    if state == "empty":
+        return {
+            "n_leg_coverage": {
+                "source_scope": "官方来源 · 已发现范围",
+                "latest_count": 0,
+                "pool_count": 0,
+                "pool_limit": 10,
+                "capacity": "0/10",
+                "waiting_count": 0,
+                "pending_preparation_count": 0,
+                "excluded_count": 0,
+                "native_count": 0,
+                "three_way_count": 0,
+                "subscribed_tokens": 0,
+                "all_leg_subscribed_count": 0,
+                "fresh_count": 0,
+                "computed_count": 0,
+                "positive_count": 0,
+                "non_positive_count": 0,
+                "blocked_count": 0,
+                "generation": 2,
+                "updated_at": "2026-08-03T15:41:00Z",
+            },
+            "n_leg_observation": {
+                "status": "EMPTY",
+                "status_reason": "NO_CANDIDATES",
+                "latest": [],
+                "results": [],
+            },
+        }
+    if state == "unknown":
+        return {
+            "n_leg_coverage": {
+                "source_scope": "官方来源 · 已发现范围",
+                "pool_limit": 10,
+                "status_reason": "SOURCE_UNKNOWN",
+                "generation": None,
+                "updated_at": None,
+            },
+            "n_leg_observation": {
+                "status": "UNKNOWN",
+                "status_reason": "SOURCE_UNKNOWN",
+                "latest": None,
+                "results": [],
+            },
+        }
+
+    is_stale = state == "stale"
+    is_error = state == "error"
+    result_status = "ERROR" if is_error else "BLOCKED" if is_stale else "PASS"
+    result_reason = "CATALOG_ERROR" if is_error else "STALE_BOOK" if is_stale else None
+    current = not (is_stale or is_error)
+    common_result = {
+        "status": result_status,
+        "current": current,
+        "reason": result_reason,
+        "quantity": "5",
+        "cost": "4.75",
+        "payout": "5.00",
+        "net_amount": "0.25",
+        "net_roi": "0.0526315789",
+        "last_attempt_at": "2026-08-03T15:40:02Z",
+        "last_success_at": "2026-08-03T15:40:01Z",
+    }
+    second_result = {
+        **common_result,
+        "quantity": "25",
+        "cost": "26.25",
+        "payout": "25.00",
+        "net_amount": "-1.25",
+        "net_roi": "-0.0476190476",
+        "last_attempt_at": "2026-08-03T15:40:03Z",
+        "last_success_at": "2026-08-03T15:40:02Z",
+    }
+    latest = [
+        {
+            "identity": "observe-a",
+            "event": "同条件 YES/NO 观察市场",
+            "relation_type": "NATIVE_COMPLEMENT",
+            "stage": "OBSERVING",
+            "version_id": "v-a-7",
+            "approval_status": "PENDING",
+            "end_date": "2026-08-18T00:00:00Z",
+            "capital_release_status": "UNKNOWN",
+            "overdue": True,
+            "tokens": ["observe-a-yes", "observe-a-no"],
+            "oldest_book_at": "2026-08-03T15:40:01Z",
+            "last_attempt_at": common_result["last_attempt_at"],
+            "last_success_at": common_result["last_success_at"],
+            "result": common_result,
+        },
+        {
+            "identity": "observe-b",
+            "event": "足球常规时间三结果",
+            "relation_type": "EXACTLY_ONE",
+            "stage": "OBSERVING",
+            "version_id": "v-b-3",
+            "approval_status": "APPROVED",
+            "end_date": "2026-08-19T00:00:00Z",
+            "capital_release_status": "UNKNOWN",
+            "overdue": False,
+            "tokens": ["observe-b-yes", "observe-b-no", "observe-b-draw"],
+            "oldest_book_at": "2026-08-03T15:39:58Z",
+            "last_attempt_at": second_result["last_attempt_at"],
+            "last_success_at": second_result["last_success_at"],
+            "result": second_result,
+        },
+        {
+            "identity": "observe-c",
+            "event": "日期不明候选",
+            "relation_type": "NATIVE_COMPLEMENT",
+            "stage": "EXCLUDED",
+            "version_id": "v-c-1",
+            "approval_status": "PENDING",
+            "end_date": None,
+            "reason": "INVALID_END_DATE",
+        },
+    ]
+    if is_stale or is_error:
+        for row in latest:
+            if row["stage"] == "OBSERVING":
+                row["result"] = dict(row["result"])
+                row["result"]["status"] = result_status
+                row["result"]["current"] = False
+                row["result"]["reason"] = result_reason
+    results = [row for row in latest if row["stage"] == "OBSERVING"]
+    return {
+        "n_leg_coverage": {
+            "source_scope": "官方来源 · 已发现范围",
+            "latest_count": 3,
+            "pool_count": 2,
+            "pool_limit": 10,
+            "capacity": "2/10",
+            "waiting_count": 0,
+            "pending_preparation_count": 0,
+            "excluded_count": 1,
+            "native_count": 1,
+            "three_way_count": 1,
+            "subscribed_tokens": 5,
+            "all_leg_subscribed_count": 2,
+            "fresh_count": 0 if (is_stale or is_error) else 2,
+            "computed_count": 2,
+            "positive_count": 1 if not (is_stale or is_error) else 0,
+            "non_positive_count": 1 if not (is_stale or is_error) else 0,
+            "blocked_count": 2 if (is_stale or is_error) else 0,
+            "generation": 1,
+            "updated_at": "2026-08-03T15:40:03Z",
+            "status_reason": result_reason,
+        },
+        "n_leg_observation": {
+            "status": "STALE" if is_stale else "ERROR" if is_error else "READY",
+            "status_reason": result_reason,
+            "latest": latest,
+            "results": results,
+        },
+    }
+
+
 def _prediction_payload(scenario: str) -> dict[str, object]:
     if scenario == "preview-rejected":
         scenario = "ready"
@@ -268,6 +435,7 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
             "batch_active": False,
         },
     }
+    payload.update(_observation_fixture(scenario))
     if scenario == "ready-zero-allowance":
         payload["venues"][1] = {**payload["venues"][1], "allowance": {"asset": "USDT", "value": "0", "spender": "0xSpender…C0DE"}, "mode": "可以交易"}
     if scenario in {"signer-bnb-low", "cross-signal-bnb-low"}:
@@ -618,6 +786,7 @@ def _relation_review_fixture() -> dict[str, object]:
 
 class Handler(BaseHTTPRequestHandler):
     prediction_scenario = os.environ.get("PREDICTION_FIXTURE_SCENARIO", "ready")
+    prediction_state_calls = 0
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -627,6 +796,7 @@ class Handler(BaseHTTPRequestHandler):
             requested_scenario = str(query.get("prediction_state", [""])[0] or "").strip()
             if requested_scenario:
                 type(self).prediction_scenario = requested_scenario
+                type(self).prediction_state_calls = 0
             self._send_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
             return
         if path == "/static/dashboard.css":
@@ -654,6 +824,12 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         if path == "/api/prediction-arbitrage/state":
+            if type(self).prediction_scenario == "observation-fetch-error":
+                type(self).prediction_state_calls += 1
+                if type(self).prediction_state_calls > 1:
+                    self.send_response(HTTPStatus.SERVICE_UNAVAILABLE)
+                    self.end_headers()
+                    return
             payload = _prediction_payload(type(self).prediction_scenario)
             self._send_json(payload)
             return

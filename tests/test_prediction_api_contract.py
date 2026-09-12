@@ -378,6 +378,108 @@ def _prediction_server() -> Iterator[str]:
         yield base
 
 
+def test_state_reads_cached_coverage_without_evaluation(tmp_path: Path) -> None:
+    from open_trader.prediction_observation_monitor import PredictionObservationMonitor
+    from test_prediction_observation_monitor import NOW, dated_rows, paper_books
+
+    source_entered = threading.Event()
+    release_source = threading.Event()
+    blocked = [False]
+    source_calls = [0]
+    catalog_calls = [0]
+    rows = dated_rows()
+    observation_store = PredictionArbitrageStore(tmp_path / "observation")
+
+    def candidates() -> dict[str, object]:
+        catalog_calls[0] += 1
+        return {"generation": 1, "generation_fingerprint": "g1", "rows": rows}
+
+    def books(token_ids: tuple[str, ...]) -> dict[str, dict[str, object]]:
+        source_calls[0] += 1
+        if blocked[0]:
+            source_entered.set()
+            assert release_source.wait(5)
+        return paper_books(("0.30", "0.32", "0.33"), now=NOW)
+
+    observation = PredictionObservationMonitor(
+        catalog={},
+        candidate_source=candidates,
+        store=observation_store,
+        book_source=books,
+        clock=lambda: NOW,
+    )
+    observation.refresh_once()
+    blocked[0] = True
+
+    class BoundaryExecution(_Execution):
+        def __init__(self) -> None:
+            self.preview_calls = 0
+            self.confirm_calls = 0
+
+        def preview(self, opportunity_id: str) -> dict[str, object]:
+            self.preview_calls += 1
+            return super().preview(opportunity_id)
+
+        def confirm(
+            self, preview_id: str, idempotency_key: str
+        ) -> dict[str, object]:
+            self.confirm_calls += 1
+            return super().confirm(preview_id, idempotency_key)
+
+    class CachedRuntime(_ProductionRuntime):
+        def observation_snapshot(self) -> dict[str, object]:
+            return observation.snapshot()
+
+    runtime = CachedRuntime()
+    runtime.store = observation_store
+    runtime.execution = BoundaryExecution()
+    observation.start()
+    assert source_entered.wait(5)
+    calls_while_blocked = (catalog_calls[0], source_calls[0])
+    server = create_prediction_server(
+        runtime=runtime,  # type: ignore[arg-type]
+        port=0,
+        session_token="session-token",
+        csrf_token="csrf-token",
+        runtime_metadata={"git_sha": "abc123"},
+    )
+    read_connection = sqlite3.connect(
+        observation_store.path, isolation_level=None
+    )
+
+    def sqlite_state() -> tuple[int, list[tuple[object, ...]]]:
+        data_version = int(
+            read_connection.execute("PRAGMA data_version").fetchone()[0]
+        )
+        records = [
+            tuple(row)
+            for row in read_connection.execute(
+                "SELECT identity, relation_type, version_id, "
+                "version_fingerprint, rules_fingerprint, entered_at "
+                "FROM observation_pool_members ORDER BY identity"
+            ).fetchall()
+        ]
+        return data_version, records
+
+    try:
+        with _serve(server) as base:
+            before_sqlite = sqlite_state()
+            first_status, _, first = _json_response(base + "/api/prediction-arbitrage/state")
+            second_status, _, second = _json_response(base + "/api/prediction-arbitrage/state")
+            after_sqlite = sqlite_state()
+    finally:
+        read_connection.close()
+        release_source.set()
+        observation.stop()
+    assert first_status == second_status == 200
+    assert first["n_leg_coverage"]["latest_count"] == 1
+    assert first["n_leg_coverage"] == second["n_leg_coverage"]
+    assert (catalog_calls[0], source_calls[0]) == calls_while_blocked
+    assert after_sqlite == before_sqlite
+    assert runtime.execution.preview_calls == 0
+    assert runtime.execution.confirm_calls == 0
+
+
 def _json_response(request: str | urllib.request.Request) -> tuple[int, object, object]:
     with urllib.request.urlopen(request, timeout=5) as response:
         return (

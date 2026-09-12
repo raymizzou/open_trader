@@ -26,6 +26,7 @@ from open_trader.polymarket_relation_discovery import (
 )
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 from open_trader.polymarket_monitor import (
+    PUBLIC_REFRESH_TIMEOUT_SECONDS,
     RELATION_VALIDATION_RETRY_SECONDS,
     PolymarketMonitor,
     _relation_fingerprint,
@@ -51,6 +52,7 @@ def market(
     *,
     yes: str = "yes-1",
     no: str = "no-1",
+    condition_id: str | None = None,
     volume: str = "1000",
     fees_enabled: bool | None = False,
     neg_risk: bool = False,
@@ -64,7 +66,7 @@ def market(
         id=market_id,
         slug=f"slug-{market_id}",
         question=f"Question {market_id}",
-        condition_id=f"condition-{market_id}",
+        condition_id=condition_id or f"condition-{market_id}",
         end_date=end_date,
         state=ns(
             active=active,
@@ -221,10 +223,15 @@ class FakePublicClient:
     book_calls: list[list[str]] = []
     subscribe_specs: list[object] = []
     get_event_calls: list[str] = []
+    market_status_rows: list[object] = []
+    list_markets_calls: list[dict[str, object]] = []
     page_mode = False
     fail_list_events = False
     fail_get_event = False
     fail_get_order_books = False
+    fail_list_markets = False
+    block_list_markets: threading.Event | None = None
+    list_markets_started: threading.Event | None = None
 
     def __init__(self) -> None:
         self.stream = self.streams.pop(0) if self.streams else FakeStream()
@@ -249,6 +256,28 @@ class FakePublicClient:
         if self.fail_get_event:
             raise ConnectionError("sentinel event failure")
         return next(row for row in self.events if str(getattr(row, "id", "")) == id)
+
+    async def list_markets(self, **kwargs: object) -> list[object]:
+        self.list_markets_calls.append(dict(kwargs))
+        if self.fail_list_markets:
+            raise ConnectionError("sentinel market status failure")
+        if self.block_list_markets is not None:
+            if self.list_markets_started is not None:
+                self.list_markets_started.set()
+            await asyncio.to_thread(self.block_list_markets.wait, 5)
+        condition_ids = {
+            str(condition)
+            for condition in kwargs.get("condition_ids", ())
+        }
+        requested_closed = kwargs.get("closed") is True
+        result: list[object] = []
+        for row in self.market_status_rows:
+            condition = str(getattr(row, "condition_id", ""))
+            state = getattr(row, "state", None)
+            is_closed = getattr(state, "closed", getattr(row, "closed", None))
+            if condition in condition_ids and is_closed is requested_closed:
+                result.append(row)
+        return result
 
     def subscribe(self, spec: object) -> FakeStream:
         self.subscribe_specs.append(spec)
@@ -423,10 +452,15 @@ def setup_public(event_rows: list[object]) -> None:
     FakePublicClient.book_calls = []
     FakePublicClient.subscribe_specs = []
     FakePublicClient.get_event_calls = []
+    FakePublicClient.market_status_rows = []
+    FakePublicClient.list_markets_calls = []
     FakePublicClient.page_mode = False
     FakePublicClient.fail_list_events = False
     FakePublicClient.fail_get_event = False
     FakePublicClient.fail_get_order_books = False
+    FakePublicClient.fail_list_markets = False
+    FakePublicClient.block_list_markets = None
+    FakePublicClient.list_markets_started = None
     PagePaginator.first_page_calls = 0
     PagePaginator.iter_calls = 0
 
@@ -647,6 +681,625 @@ def test_cross_venue_tokens_join_existing_subscription_and_refresh_once(
     websocket = monitor.snapshot()["relation_discovery"]["websocket"]
     assert websocket["standard_subscribed_tokens"] == 1
     assert websocket["subscribed_tokens"] == 4
+
+
+def test_observation_share_preserves_other_consumers(tmp_path: Path) -> None:
+    setup_public([])
+    clock = [NOW]
+    FakePublicClient.books.update({
+        token: ns(
+            asset_id=token,
+            token_id=token,
+            timestamp=NOW,
+            asks=[ns(price=Decimal("0.40"), size=Decimal("50"))],
+            bids=[ns(price=Decimal("0.39"), size=Decimal("50"))],
+            min_order_size=Decimal("5"),
+            tick_size=Decimal("0.01"),
+        )
+        for token in ("formal-a", "formal-b", "cross-b", "obs-c", "overlap")
+    })
+    monitor = make_monitor(tmp_path, relation_discovery=None, clock=lambda: clock[0])
+    monitor.set_n_leg_tokens(("formal-a", "overlap"))
+    monitor.set_cross_venue_tokens(("cross-b", "overlap"))
+    monitor.set_observation_tokens(("obs-c", "overlap"))
+    FakePublicClient.market_status_rows = [
+        market(
+            "observation-market",
+            condition_id="condition-c",
+            yes="obs-c",
+            no="obs-c-no",
+        )
+    ]
+    monitor.set_observation_conditions(("condition-c",))
+
+    first = monitor.refresh_once()
+    assert first["observation"]["tokens"] == ["obs-c", "overlap"]
+    assert set(FakePublicClient.subscribe_specs[-1].token_ids) == {
+        "formal-a", "cross-b", "obs-c", "overlap",
+    }
+    book = monitor.observation_books()["obs-c"]
+    assert book["minimum_order_size"] == Decimal("5")
+    assert book["tick_size"] == Decimal("0.01")
+    assert book["asks"][0].price == Decimal("0.40")
+    assert book["fresh"] is True
+    assert [call["closed"] for call in FakePublicClient.list_markets_calls] == [
+        False,
+        True,
+    ], first["observation"]["source_status_error"]
+    assert all(call["page_size"] == 1 for call in FakePublicClient.list_markets_calls)
+    assert monitor.observation_status(condition_id="condition-c")["status"] == "OPEN"
+
+    missing_book = FakePublicClient.books.pop("obs-c")
+    monitor.set_observation_tokens(("obs-c",))
+    monitor.set_observation_tokens(("obs-c", "overlap"))
+    monitor.refresh_once()
+    missing = monitor.observation_books()["obs-c"]
+    assert missing["fresh"] is False
+    assert missing["status"] == "STALE"
+    FakePublicClient.books["obs-c"] = missing_book
+
+    blocking_monitor = make_monitor(
+        tmp_path / "blocking", relation_discovery=None, clock=lambda: clock[0]
+    )
+    blocking_monitor.set_n_leg_tokens(("formal-a", "overlap"))
+    blocking_monitor.set_cross_venue_tokens(("cross-b", "overlap"))
+    blocking_monitor.set_observation_tokens(("obs-c", "overlap"))
+    # Establish a valid public REST snapshot before delaying the next source
+    # status pass.  The bounded background pass intentionally checks status
+    # before replenishing books, so a blocked source must not prevent the
+    # stream from consuming the terminal event or erase an existing book.
+    FakePublicClient.block_list_markets = None
+    FakePublicClient.list_markets_started = None
+    blocking_monitor.set_observation_conditions(("condition-c",))
+    blocking_monitor.refresh_once()
+    blocking_monitor.set_observation_conditions(("condition-c", "condition-new"))
+    FakePublicClient.streams = [FakeStream([
+        ns(
+            type="price_change",
+            payload=ns(
+                timestamp=NOW + timedelta(seconds=1),
+                price_changes=(
+                    ns(asset_id="obs-c", side="SELL", price="0.44", size="12"),
+                    ns(asset_id="obs-c", side="BUY", price="0.43", size="11"),
+                ),
+            ),
+        ),
+        ns(
+            type="price_change",
+            payload=ns(
+                timestamp=NOW + timedelta(seconds=2),
+                price_changes=(
+                    ns(asset_id="obs-c", side="INVALID", price="0.45", size="1"),
+                ),
+            ),
+        ),
+        ns(
+            type="market_resolved",
+            payload=ns(
+                market=ns(condition_id="condition-c"),
+                token_ids=("obs-c",),
+                winning_token_id="obs-c",
+                timestamp=NOW + timedelta(seconds=3),
+            ),
+        ),
+    ])]
+    source_started = threading.Event()
+    release_source = threading.Event()
+    FakePublicClient.list_markets_started = source_started
+    FakePublicClient.block_list_markets = release_source
+    blocking_monitor.start()
+    deadline = time.monotonic() + 2
+    assert source_started.wait(2)
+    while time.monotonic() < deadline:
+        status = blocking_monitor.observation_status(condition_id="condition-c")
+        if status is not None and status.get("status") == "TERMINAL":
+            break
+        time.sleep(0.01)
+    assert blocking_monitor.observation_status(condition_id="condition-c")["status"] == "TERMINAL"
+    release_source.set()
+    blocking_monitor.stop()
+
+    updated = blocking_monitor.observation_books()["obs-c"]
+    assert updated["minimum_order_size"] == Decimal("5")
+    assert updated["tick_size"] == Decimal("0.01")
+    assert updated["fresh"] is False
+    assert blocking_monitor.observation_status(condition_id="condition-c")["status"] == "TERMINAL"
+    assert blocking_monitor.observation_status(token_id="obs-c")["winning_token_id"] == "obs-c"
+
+    clock[0] = NOW + timedelta(seconds=11)
+    stale = monitor.observation_books()["obs-c"]
+    assert stale["fresh"] is False
+    monitor.set_observation_tokens(())
+    monitor.refresh_once()
+    assert monitor.observation_books() == {}
+    assert set(FakePublicClient.subscribe_specs[-1].token_ids) == {
+        "formal-a", "cross-b", "overlap",
+    }
+    assert set(monitor.cross_venue_books(("formal-a", "cross-b", "overlap"))) == {
+        "formal-a", "cross-b", "overlap",
+    }
+
+
+def test_observation_replenishment_is_bounded_and_keeps_stream_live(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Observation REST recovery stays bounded and cannot pause WS delivery."""
+
+    clock = [NOW]
+    assert PUBLIC_REFRESH_TIMEOUT_SECONDS == 30.0
+
+    class LiveStream:
+        def __init__(self) -> None:
+            self.messages: list[object] = []
+            self.lock = threading.Lock()
+            self.closed = False
+
+        def push(self, message: object) -> None:
+            with self.lock:
+                self.messages.append(message)
+
+        def __aiter__(self) -> "LiveStream":
+            return self
+
+        async def __anext__(self) -> object:
+            while not self.closed:
+                with self.lock:
+                    if self.messages:
+                        return self.messages.pop(0)
+                await asyncio.sleep(0.01)
+            raise StopAsyncIteration
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class BoundedClient:
+        def __init__(self) -> None:
+            self.stream = LiveStream()
+            self.subscribe_started = threading.Event()
+            self.book_refresh_started = threading.Event()
+            self.block_books = threading.Event()
+            self.release_books = threading.Event()
+            self.omit_observation_token = "obs-29"
+            self.source_tick = Decimal("0.01")
+            self.book_tick = Decimal("0.01")
+            self.book_lock = threading.Lock()
+            self.active_observation_books = 0
+            self.max_active_observation_books = 0
+            self.book_calls: list[tuple[float, tuple[str, ...]]] = []
+            self.status_calls: list[dict[str, object]] = []
+            self.status_rows = {
+                f"condition-{index}": market(
+                    f"observation-{index}",
+                    condition_id=f"condition-{index}",
+                    yes=f"obs-{index}-yes",
+                    no=f"obs-{index}-no",
+                )
+                for index in range(31)
+            }
+
+        async def list_events(self, **kwargs: object) -> list[object]:
+            del kwargs
+            return [
+                event(
+                    "formal-event",
+                    markets=(market("formal-market", yes="formal-a", no="formal-b"),),
+                )
+            ]
+
+        async def list_markets(self, **kwargs: object) -> list[object]:
+            self.status_calls.append(dict(kwargs))
+            requested = {str(value) for value in kwargs.get("condition_ids", ())}
+            if kwargs.get("closed") is True:
+                return []
+            for row in self.status_rows.values():
+                row.trading.minimum_tick_size = self.source_tick
+            return [self.status_rows[key] for key in sorted(requested) if key in self.status_rows]
+
+        async def get_order_books(self, *, token_ids: list[str]) -> list[object]:
+            call = (time.monotonic(), tuple(token_ids))
+            self.book_calls.append(call)
+            observation_call = any(token.startswith("obs-") for token in token_ids)
+            if observation_call:
+                with self.book_lock:
+                    self.active_observation_books += 1
+                    self.max_active_observation_books = max(
+                        self.max_active_observation_books,
+                        self.active_observation_books,
+                    )
+            try:
+                if len(self.book_calls) > 1 and self.block_books.is_set() and observation_call:
+                    self.book_refresh_started.set()
+                    while not self.release_books.is_set():
+                        await asyncio.sleep(0.01)
+                return [
+                    ns(
+                        asset_id=token,
+                        token_id=token,
+                        timestamp=clock[0],
+                        asks=[ns(price=Decimal("0.40"), size=Decimal("50"))],
+                        bids=[ns(price=Decimal("0.39"), size=Decimal("50"))],
+                        min_order_size=Decimal("5"),
+                        minimum_order_size=Decimal("5"),
+                        tick_size=self.book_tick,
+                        minimum_tick_size=self.book_tick,
+                    )
+                    for token in token_ids
+                    if token != self.omit_observation_token
+                ]
+            finally:
+                if observation_call:
+                    with self.book_lock:
+                        self.active_observation_books -= 1
+
+        def subscribe(self, _spec: object) -> LiveStream:
+            self.subscribe_started.set()
+            return self.stream
+
+    client = BoundedClient()
+    monitor = PolymarketMonitor(
+        store=PredictionArbitrageStore(tmp_path / "data"),
+        trading=FakeTrading(),
+        public_client_factory=lambda: client,
+        clock=lambda: clock[0],
+        relation_discovery=None,
+    )
+    observation_tokens = tuple(
+        f"obs-{index}" for index in range(31)
+    )
+    observation_conditions = tuple(f"condition-{index}" for index in range(31))
+    monitor.set_n_leg_tokens(("formal-a", "formal-b"))
+    monitor.set_cross_venue_tokens(("cross-b", "overlap"))
+    monitor.set_observation_tokens(observation_tokens)
+    monitor.set_observation_conditions(observation_conditions)
+    monitor.start()
+    stopped = False
+    try:
+        assert client.subscribe_started.wait(2)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not client.book_calls:
+            time.sleep(0.01)
+        assert client.book_calls
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            subscription = monitor.observation_subscription_snapshot()
+            if subscription["status"] == "READY":
+                break
+            time.sleep(0.01)
+        subscription = monitor.observation_subscription_snapshot()
+        assert subscription["requested_tokens"] == 30
+        assert subscription["subscribed_tokens"] == 30
+        initial = monitor.observation_books(("obs-0",))
+        assert initial["obs-0"]["minimum_order_size"] == Decimal("5")
+        assert initial["obs-0"]["tick_size"] == Decimal("0.01")
+        assert "obs-29" not in monitor.observation_books()
+        assert len(monitor.snapshot()["observation"]["tokens"]) <= 30
+        assert all(
+            len(call.get("condition_ids", ())) <= 30
+            for call in client.status_calls
+        )
+
+        # A valid WS quote updates prices while retaining REST order rules.
+        clock[0] = NOW + timedelta(seconds=1)
+        client.stream.push(
+            ns(
+                type="price_change",
+                payload=ns(
+                    timestamp=clock[0],
+                    price_changes=(
+                        ns(asset_id="obs-0", side="SELL", price="0.44", size="12"),
+                        ns(asset_id="obs-0", side="BUY", price="0.38", size="11"),
+                    ),
+                ),
+            )
+        )
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            current = monitor.observation_books(("obs-0",)).get("obs-0")
+            if current and any(
+                level.price == Decimal("0.44") for level in current["asks"]
+            ):
+                break
+            time.sleep(0.01)
+        current = monitor.observation_books(("obs-0",))["obs-0"]
+        assert any(
+            level.price == Decimal("0.44") for level in current["asks"]
+        )
+        assert current["minimum_order_size"] == Decimal("5")
+        assert current["tick_size"] == Decimal("0.01")
+
+        # The next pass combines a missing book retry, a quiet quote expiry,
+        # and changed source/order-rule facts.  Keep that one bounded request
+        # blocked while an invalid WS update and terminal event arrive on the
+        # same live stream.
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            initial_observation_calls = [
+                tokens
+                for _, tokens in client.book_calls
+                if any(token.startswith("obs-") for token in tokens)
+            ]
+            if initial_observation_calls and "obs-29" not in monitor.observation_books():
+                break
+            time.sleep(0.01)
+        client.omit_observation_token = None
+        client.source_tick = Decimal("0.02")
+        client.book_tick = Decimal("0.02")
+        clock[0] = NOW + timedelta(seconds=301)
+        client.block_books.set()
+        time.sleep(5.1)
+        client.stream.push(
+            ns(
+                type="price_change",
+                payload=ns(
+                    timestamp=clock[0],
+                    price_changes=(
+                        ns(asset_id="obs-0", side="INVALID", price="0.45", size="1"),
+                    ),
+                ),
+            )
+        )
+        assert client.book_refresh_started.wait(2)
+        client.stream.push(
+            ns(
+                type="market_resolved",
+                payload=ns(
+                    market=ns(condition_id="condition-0"),
+                    token_ids=("obs-0",),
+                    winning_token_id="obs-0",
+                    timestamp=clock[0],
+                ),
+            )
+        )
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            status = monitor.observation_status(condition_id="condition-0")
+            if isinstance(status, Mapping) and status.get("status") == "TERMINAL":
+                break
+            time.sleep(0.01)
+        status = monitor.observation_status(condition_id="condition-0")
+        assert isinstance(status, Mapping)
+        assert status["status"] == "TERMINAL"
+        client.release_books.set()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            restored = monitor.observation_books()
+            if (
+                "obs-29" in restored
+                and restored["obs-0"]["tick_size"] == Decimal("0.02")
+                and restored["obs-0"]["fresh"]
+            ):
+                break
+            time.sleep(0.01)
+        restored = monitor.observation_books()
+        assert "obs-29" in restored
+        assert restored["obs-0"]["tick_size"] == Decimal("0.02")
+        assert restored["obs-0"]["fresh"] is True
+
+        # A blocked external refresh is bounded by the public deadline.  The
+        # stream remains installed while that one task times out, and a later
+        # setter-triggered refresh cannot create a second in-flight batch.
+        time.sleep(5.1)
+        monkeypatch.setattr(
+            "open_trader.polymarket_monitor.PUBLIC_REFRESH_TIMEOUT_SECONDS", 0.1
+        )
+        client.book_refresh_started.clear()
+        client.release_books.clear()
+        changed_observation_tokens = tuple(
+            f"obs-{index}" for index in range(29)
+        ) + ("obs-new",)
+        monitor.set_observation_tokens(changed_observation_tokens)
+        client.block_books.set()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if (
+                client.book_refresh_started.is_set()
+                and monitor.snapshot()["observation"]["source_status_error"]
+            ):
+                break
+            time.sleep(0.01)
+        assert client.book_refresh_started.is_set()
+        assert monitor.snapshot()["observation"]["source_status_error"]
+        assert client.max_active_observation_books <= 1
+        monkeypatch.setattr(
+            "open_trader.polymarket_monitor.PUBLIC_REFRESH_TIMEOUT_SECONDS", 30.0
+        )
+        client.release_books.set()
+
+        # A later quiet-expiry request is deliberately left blocked.  stop()
+        # must cancel the single in-flight task and return without waiting for
+        # the external REST call to finish.
+        client.book_refresh_started.clear()
+        client.release_books.clear()
+        time.sleep(5.1)
+        clock[0] = NOW + timedelta(seconds=320)
+        assert client.book_refresh_started.wait(2)
+        stopped_at = time.monotonic()
+        monitor.stop()
+        stopped = True
+        assert time.monotonic() - stopped_at < 4
+    finally:
+        client.release_books.set()
+        if not stopped:
+            monitor.stop()
+
+    observation_calls = [
+        (started, tokens)
+        for started, tokens in client.book_calls
+        if any(token.startswith("obs-") for token in tokens)
+    ]
+    assert len(observation_calls) <= 4
+    assert len(client.status_calls) <= 4
+    assert len(client.status_calls) % 2 == 0
+    for offset in range(0, len(client.status_calls), 2):
+        assert {
+            client.status_calls[offset].get("closed"),
+            client.status_calls[offset + 1].get("closed"),
+        } == {False, True}
+    assert client.max_active_observation_books <= 1
+    assert all(
+        len({token for token in tokens if token.startswith("obs-")}) <= 30
+        for _, tokens in observation_calls
+    )
+    assert all(
+        later - earlier >= 5.0
+        for (earlier, _), (later, _) in zip(observation_calls, observation_calls[1:])
+    )
+    assert monitor.snapshot()["thread"]["status"] in {"running", "stopped"}
+
+
+def test_observation_replenishment_timeout_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A blocked public SDK batch times out without stopping the WS loop."""
+
+    clock = [NOW]
+
+    class LiveStream:
+        def __init__(self) -> None:
+            self.closed = asyncio.Event()
+
+        def __aiter__(self) -> "LiveStream":
+            return self
+
+        async def __anext__(self) -> object:
+            await self.closed.wait()
+            raise StopAsyncIteration
+
+        async def close(self) -> None:
+            self.closed.set()
+
+    class TimeoutClient:
+        def __init__(self) -> None:
+            self.stream = LiveStream()
+            self.book_started = threading.Event()
+            self.status_calls: list[dict[str, object]] = []
+            self.active_books = 0
+            self.max_active_books = 0
+
+        async def list_events(self, **kwargs: object) -> list[object]:
+            del kwargs
+            return []
+
+        async def list_markets(self, **kwargs: object) -> list[object]:
+            self.status_calls.append(dict(kwargs))
+            return []
+
+        async def get_order_books(self, *, token_ids: list[str]) -> list[object]:
+            del token_ids
+            self.book_started.set()
+            self.active_books += 1
+            self.max_active_books = max(self.max_active_books, self.active_books)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.active_books -= 1
+            return []
+
+        def subscribe(self, _spec: object) -> LiveStream:
+            return self.stream
+
+    client = TimeoutClient()
+    monitor = PolymarketMonitor(
+        store=PredictionArbitrageStore(tmp_path / "timeout"),
+        trading=FakeTrading(),
+        public_client_factory=lambda: client,
+        clock=lambda: clock[0],
+        relation_discovery=None,
+    )
+    monitor.set_observation_tokens(("obs-timeout-a", "obs-timeout-b"))
+    monitor.set_observation_conditions(("condition-timeout",))
+    monkeypatch.setattr(
+        "open_trader.polymarket_monitor.PUBLIC_REFRESH_TIMEOUT_SECONDS", 0.1
+    )
+    monitor.start()
+    stopped_at: float | None = None
+    try:
+        assert client.book_started.wait(2)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if monitor.snapshot()["observation"]["source_status_error"]:
+                break
+            time.sleep(0.01)
+        elapsed = time.monotonic() - (deadline - 2)
+        assert monitor.snapshot()["observation"]["source_status_error"]
+        assert elapsed < 1.0
+        subscription = monitor.observation_subscription_snapshot()
+        assert subscription["requested_tokens"] == 2
+        assert subscription["subscribed_tokens"] == 2
+        assert {call["closed"] for call in client.status_calls} == {False, True}
+        assert len(client.status_calls) == 2
+        assert client.max_active_books == 1
+    finally:
+        stopped_at = time.monotonic()
+        monitor.stop()
+    assert stopped_at is not None
+    assert time.monotonic() - stopped_at < 4
+
+
+def test_observation_rejects_future_exchange_book_timestamp(tmp_path: Path) -> None:
+    """A future exchange timestamp cannot be made fresh by local receipt time."""
+
+    clock = [NOW]
+
+    class EmptyStream:
+        def __aiter__(self) -> "EmptyStream":
+            return self
+
+        async def __anext__(self) -> object:
+            raise StopAsyncIteration
+
+        async def close(self) -> None:
+            return None
+
+    class TimestampClient:
+        def __init__(self) -> None:
+            self.future = True
+
+        async def list_events(self, **kwargs: object) -> list[object]:
+            del kwargs
+            return []
+
+        async def get_order_books(self, *, token_ids: list[str]) -> list[object]:
+            timestamp = NOW + timedelta(seconds=60) if self.future else clock[0]
+            return [
+                ns(
+                    asset_id=token,
+                    token_id=token,
+                    timestamp=timestamp,
+                    asks=[ns(price=Decimal("0.40"), size=Decimal("20"))],
+                    bids=[ns(price=Decimal("0.39"), size=Decimal("20"))],
+                    minimum_order_size=Decimal("1"),
+                    minimum_tick_size=Decimal("0.01"),
+                )
+                for token in token_ids
+            ]
+
+        def subscribe(self, _spec: object) -> EmptyStream:
+            return EmptyStream()
+
+    client = TimestampClient()
+    monitor = PolymarketMonitor(
+        store=PredictionArbitrageStore(tmp_path / "store"),
+        trading=FakeTrading(),
+        public_client_factory=lambda: client,
+        clock=lambda: clock[0],
+        relation_discovery=None,
+    )
+    monitor.set_observation_tokens(("future-token",))
+    monitor.refresh_once()
+
+    future = monitor.observation_books(("future-token",))["future-token"]
+    assert future["fresh"] is False
+    assert future["status"] == "FUTURE_TIMESTAMP"
+    assert future["exchange_time"] == NOW + timedelta(seconds=60)
+
+    client.future = False
+    clock[0] = NOW + timedelta(seconds=1)
+    monitor.refresh_once()
+    current = monitor.observation_books(("future-token",))["future-token"]
+    assert current["fresh"] is True
+    assert current["status"] == "FRESH"
+    assert current["exchange_time"] == clock[0]
 
 
 def test_failed_subscription_replacement_reports_installed_tokens(
@@ -1728,9 +2381,12 @@ def test_background_monitor_prioritizes_top_twenty_before_bulk_scans(
     calls: list[str] = []
 
     async def refresh_universe(
-        client: object, *, subscribe: bool = True,
+        client: object,
+        *,
+        subscribe: bool = True,
+        block_observation_status: bool = True,
     ) -> None:
-        del client, subscribe
+        del client, subscribe, block_observation_status
         calls.append("universe")
         monitor._universe_at = NOW
 
@@ -1773,9 +2429,12 @@ def test_run_forever_runs_legacy_validation_migration_once(
     calls: list[str] = []
 
     async def refresh_universe(
-        client: object, *, subscribe: bool = True,
+        client: object,
+        *,
+        subscribe: bool = True,
+        block_observation_status: bool = True,
     ) -> None:
-        del client, subscribe
+        del client, subscribe, block_observation_status
         calls.append("universe")
         monitor._universe_at = NOW
 
@@ -1831,9 +2490,12 @@ def test_run_forever_survives_legacy_validation_migration_failure(
     calls: list[str] = []
 
     async def refresh_universe(
-        client: object, *, subscribe: bool = True,
+        client: object,
+        *,
+        subscribe: bool = True,
+        block_observation_status: bool = True,
     ) -> None:
-        del client, subscribe
+        del client, subscribe, block_observation_status
         calls.append("universe")
         monitor._universe_at = NOW
 
@@ -1994,9 +2656,12 @@ def test_background_monitor_refreshes_top_twenty_while_bulk_scan_is_running(
     calls: list[str] = []
 
     async def refresh_universe(
-        client: object, *, subscribe: bool = True,
+        client: object,
+        *,
+        subscribe: bool = True,
+        block_observation_status: bool = True,
     ) -> None:
-        del client, subscribe
+        del client, subscribe, block_observation_status
         calls.append("universe")
         monitor._universe_at = NOW
 
@@ -4925,7 +5590,10 @@ def test_universe_retry_attempts_schedule_and_latch(
     class TransportError(RuntimeError):
         pass
 
-    async def fail_refresh(_client: object) -> None:
+    async def fail_refresh(
+        _client: object, *, block_observation_status: bool = True,
+    ) -> None:
+        del block_observation_status
         nonlocal refresh_calls
         refresh_calls += 1
         raise TransportError("temporary failure")
@@ -4969,7 +5637,10 @@ def test_universe_retry_success_resets_attempts_and_restores_cadence(
     monitor = make_monitor(tmp_path, relation_discovery=None, relation_validator=None)
     calls = 0
 
-    async def refresh(_client: object) -> None:
+    async def refresh(
+        _client: object, *, block_observation_status: bool = True,
+    ) -> None:
+        del block_observation_status
         nonlocal calls
         calls += 1
         if calls < 4:
@@ -5023,7 +5694,10 @@ def test_universe_failure_observer_is_scheduled_once_on_attempt_five(
     class TransportError(RuntimeError):
         pass
 
-    async def fail_refresh(_client: object) -> None:
+    async def fail_refresh(
+        _client: object, *, block_observation_status: bool = True,
+    ) -> None:
+        del block_observation_status
         raise TransportError("temporary failure")
 
     monitor._refresh_universe_bounded = fail_refresh  # type: ignore[method-assign]

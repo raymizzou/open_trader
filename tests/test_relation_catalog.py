@@ -1945,6 +1945,36 @@ def test_negrisk_exactly_one_ingest_persists_yes_and_no_tokens_per_market(
         assert endpoints[f"condition-{index}"]["no_token_id"] == f"no-{index}"
 
 
+def test_observation_snapshot_uses_latest_lifecycle(tmp_path: Path) -> None:
+    relation = threshold_relation()
+    replacement = replace(
+        relation,
+        market_a=replace(relation.market_a, end_date="2027-02-01T00:00:00Z"),
+    )
+    catalog = RelationCatalog(tmp_path)
+    first = catalog.ingest_threshold_relation(relation)
+    latest = catalog.ingest_threshold_relation(replacement)
+    before_meta = catalog.generation_meta()
+    before_rows = json.dumps(catalog.review_rows(), sort_keys=True, default=str)
+
+    snapshot = catalog.observation_snapshot()
+
+    assert snapshot["generation"] == before_meta["generation"]
+    assert catalog.generation_meta() == before_meta
+    assert json.dumps(catalog.review_rows(), sort_keys=True, default=str) == before_rows
+    assert snapshot["latest"] == {latest["identity"]: latest["version_id"]}
+    assert set(snapshot["rows"]) == {latest["identity"]}
+    row = snapshot["rows"][latest["identity"]]
+    assert row["version_id"] == latest["version_id"]
+    assert row["version_id"] != first["version_id"]
+    assert row["lifecycle"] == "PENDING"
+    assert row["approval_status"] == "PENDING"
+    assert {endpoint["end_date"] for endpoint in row["endpoints"]} == {
+        "2027-02-01T00:00:00.000000Z",
+        "2027-01-01T00:00:00.000000Z",
+    }
+
+
 def test_native_complement_ingest_keeps_contract_as_token_invariant(
     tmp_path: Path,
 ) -> None:

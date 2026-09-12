@@ -495,6 +495,104 @@ class SqliteCatalogStore(MutableMapping):
         ).fetchone()
         return int(row[0])
 
+    def observation_latest(self) -> dict[str, object]:
+        """Read the latest catalog rows without materialising catalog history.
+
+        Observation is a read-only consumer of the catalog.  Its snapshot
+        needs the latest version for each identity and the current generation
+        metadata, while loading older versions would make every refresh grow
+        with the audit history.  Keep this query deliberately scoped to the
+        ``latest`` join; callers that need the full catalog continue to use
+        ``begin_read`` and ``_load_state``.
+        """
+        conn = self._connection()
+        conn.execute("BEGIN")
+        try:
+            latest = {
+                str(identity): str(version_id)
+                for identity, version_id in conn.execute(
+                    "SELECT identity, version_id FROM catalog_v2_latest"
+                )
+            }
+            records: dict[str, dict[str, object]] = {}
+            if latest:
+                placeholders = ",".join("?" for _ in latest)
+                for (
+                    version_id,
+                    identity,
+                    version_fp,
+                    payload,
+                    status,
+                    occurrence_count,
+                    activation_status,
+                    activation_diagnostic,
+                    meta,
+                ) in conn.execute(
+                    "SELECT version_id, identity, version_fp, payload, status, "
+                    "occurrence_count, activation_status, activation_diagnostic, meta "
+                    "FROM catalog_v2_versions WHERE version_id IN ("
+                    + placeholders
+                    + ")",
+                    tuple(latest.values()),
+                ):
+                    record: dict[str, object] = {
+                        "payload": json.loads(payload),
+                        "identity": identity,
+                        "version_fp": version_fp,
+                        "status": status,
+                        "occurrence_count": occurrence_count,
+                        **json.loads(meta),
+                    }
+                    if activation_status is not None:
+                        record["activation_status"] = activation_status
+                    if activation_diagnostic is not None:
+                        record["activation_diagnostic"] = activation_diagnostic
+                    records[str(version_id)] = record
+            generation, _ = self._scan_generation(conn)
+            meta_row = conn.execute(
+                "SELECT generation_number FROM catalog_v2_meta WHERE singleton=1"
+            ).fetchone()
+            generation_number = int(meta_row[0]) if meta_row else 0
+            conn.execute("COMMIT")
+            return {
+                "latest": latest,
+                "records": records,
+                "generation": generation,
+                "generation_number": generation_number,
+            }
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+
+    def observation_latest_meta(self) -> dict[str, object]:
+        """Read latest identities and generation without decoding payloads."""
+
+        conn = self._connection()
+        conn.execute("BEGIN")
+        try:
+            latest = {
+                str(identity): str(version_id)
+                for identity, version_id in conn.execute(
+                    "SELECT identity, version_id FROM catalog_v2_latest"
+                )
+            }
+            meta_row = conn.execute(
+                "SELECT generation_number FROM catalog_v2_meta WHERE singleton=1"
+            ).fetchone()
+            generation = int(meta_row[0]) if meta_row else 0
+            latest_fingerprint = hashlib.sha256(
+                json.dumps(sorted(latest.items()), separators=(",", ":")).encode()
+            ).hexdigest()
+            conn.execute("COMMIT")
+            return {
+                "generation": generation,
+                "generation_fingerprint": latest_fingerprint,
+                "latest": latest,
+            }
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+
     # -- state materialization --------------------------------------------
 
     def _state(self) -> dict[str, dict]:

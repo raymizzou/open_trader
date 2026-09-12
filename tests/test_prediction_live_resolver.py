@@ -25,6 +25,7 @@ from open_trader.prediction_live_resolver import (
     PredictionLiveResolver,
     normalize_problem,
 )
+from open_trader.prediction_n_leg_validation import price_observation
 from open_trader.prediction_market_solution import AccountView
 from open_trader.prediction_monitor_selection import (
     MonitorSelectionStore,
@@ -1467,6 +1468,44 @@ def test_completed_evidence_becomes_market_and_execution_solution(
     assert proof["max_partial_fill_loss"] == 0
     assert proof["cap_config_version"] == "caps-v1"
     assert instance.latest_execution(valid.component_id) is not None
+
+
+def test_monitoring_snapshot_retains_rejected_outcomes(tmp_path: Path) -> None:
+    """Formal rejection stays visible while observation pricing is independent."""
+    rows = {"r:n": row("r:n", negative_raw_problem())}
+    instance, server, _ = resolver(
+        tmp_path,
+        rows=rows,
+        monitor=FakeMonitor({"contract-n": live_book("contract-n")}),
+    )
+    selected = valid_selected(rows, contract_ids=("contract-n",))
+    instance._selection_store.save({selected.component_id: selected})
+    instance._tick()
+    request = server.requests[0]
+    server.futures[0].set_result(
+        worker_outcome(request, negative_evidence(request.request.problem))
+    )
+    instance._tick()
+
+    formal = instance.monitoring_snapshot()["formal"][0]
+    assert formal["stage"] == "REJECTED"
+    assert formal["status"] == "NO_QUALIFIED_OPPORTUNITY"
+    assert formal["reason"] == "NO_QUALIFIED_OPPORTUNITY"
+    assert formal["guaranteed_profit_units"] is None
+    assert instance.solutions() == []
+
+    # The observation seam prices a non-positive paper result directly; the
+    # formal initial-profit gate is not consulted by this read-only path.
+    from test_prediction_n_leg_validation import paper_books, paper_three_way_rows
+
+    observation = price_observation(
+        paper_three_way_rows(),
+        paper_books(("0.35", "0.35", "0.35"), now=AS_OF),
+        as_of=AS_OF,
+    )
+    assert observation["status"] == "PASS"
+    assert observation["guaranteed_profit_units"] == -250_000
+    assert observation["order_ready"] is False
 
 
 def test_proof_persists_to_real_store_and_replays_without_resolve(

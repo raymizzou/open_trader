@@ -6426,6 +6426,38 @@ button { cursor: pointer; }
 .pm-metric .pm-metric-hint:hover, .pm-metric .pm-metric-hint:focus-visible { border-color: var(--accent); color: var(--accent); }
 .pm-metric .pm-metric-tip { background: var(--primary); border-radius: 8px; box-shadow: var(--shadow); color: var(--on-primary); display: none; font-size: 12px; font-weight: 500; left: 0; line-height: 1.6; max-width: 300px; padding: 10px 12px; position: absolute; top: auto; bottom: calc(100% + 8px); width: max-content; z-index: 40; }
 .pm-metric .pm-metric-hint:hover .pm-metric-tip, .pm-metric .pm-metric-hint:focus-visible .pm-metric-tip { display: block; }
+.pm-observation-coverage { margin-bottom: 10px; }
+.pm-observation-header-actions { align-items: end; display: grid; gap: 8px; justify-items: end; }
+.pm-observation-header-actions label { align-items: center; color: var(--muted); display: inline-flex; gap: 6px; font-size: 12px; }
+.pm-observation-header-actions select { background: var(--surface); border: 1px solid var(--line); border-radius: 5px; color: var(--ink); font: inherit; min-height: 30px; padding: 3px 7px; }
+.pm-observation-source { font-size: 12px; }
+.pm-observation-metrics { display: grid; gap: 8px; grid-template-columns: repeat(6, minmax(0, 1fr)); margin-bottom: 12px; }
+.pm-observation-metrics > div { background: #f2eee7; border-radius: 6px; min-width: 0; padding: 9px 10px; }
+.pm-observation-metrics span, .pm-observation-row small { color: var(--muted); display: block; font-size: 11px; }
+.pm-observation-metrics strong { display: block; font-size: 16px; margin-top: 4px; overflow-wrap: anywhere; }
+.pm-observation-results { border-top: 1px solid var(--line); display: grid; gap: 7px; padding-top: 10px; }
+.pm-observation-results h3 { font-size: 12px; margin: 0; }
+.pm-observation-row { align-items: baseline; display: grid; gap: 6px 12px; grid-template-columns: minmax(0, 1fr) auto auto; min-width: 0; }
+.pm-observation-row > span { overflow-wrap: anywhere; }
+.pm-observation-row strong { font-size: 13px; white-space: nowrap; }
+.pm-observation-table-wrap { border-top: 1px solid var(--line); margin-top: 2px; overflow-x: auto; }
+.pm-observation-table-wrap:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.pm-observation-table { border-collapse: collapse; min-width: 1360px; width: 100%; }
+.pm-observation-table caption { color: var(--muted); font-size: 12px; padding: 9px 0; text-align: left; }
+.pm-observation-table th, .pm-observation-table td { border-bottom: 1px solid var(--line); padding: 9px 8px; text-align: left; vertical-align: top; }
+.pm-observation-table th { color: var(--muted); font-size: 11px; white-space: nowrap; }
+.pm-observation-table td { font-size: 12px; min-width: 88px; }
+.pm-observation-table td:nth-child(1) { min-width: 190px; }
+.pm-observation-table td:nth-child(15) { color: var(--danger); min-width: 150px; }
+.pm-observation-table tr:last-child td { border-bottom: 0; }
+.pm-observation-table strong { display: block; line-height: 1.35; }
+.pm-observation-table details { margin-top: 5px; }
+.pm-observation-table summary { color: var(--accent-strong); cursor: pointer; font-size: 11px; }
+.pm-observation-table dl { background: var(--surface-soft); border: 1px solid var(--line); border-radius: 5px; display: grid; gap: 4px; margin: 5px 0 0; padding: 6px 8px; }
+.pm-observation-table dl div { display: grid; gap: 4px; grid-template-columns: 72px minmax(0, 1fr); }
+.pm-observation-table dt { color: var(--muted); }
+.pm-observation-table dd { margin: 0; overflow-wrap: anywhere; }
+.pm-observation-empty { border-top: 1px solid var(--line); color: var(--muted); margin: 0; padding-top: 10px; }
 .pm-event-title { font-weight: 750; line-height: 1.35; min-width: 0; }
 .pm-event-title .pm-title-zh { font-weight: 800; }
 .pm-event-title .pm-title-en { color: var(--muted); font-size: 12px; margin-top: 3px; }
@@ -6650,6 +6682,9 @@ button { cursor: pointer; }
   .pm-funnel-grid-catalog, .pm-funnel-grid-activity, .pm-cross-venue-funnel-grid, .pm-relation-summary-grid { grid-template-columns: 1fr; }
   .pm-funnel-meta { align-items: stretch; display: grid; }
   .pm-progress { grid-template-columns: 1fr 1fr; }
+  .pm-observation-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .pm-observation-row { grid-template-columns: minmax(0, 1fr) auto; }
+  .pm-observation-row small { grid-column: 1 / -1; }
   .pm-panel-heading, .pm-opportunity-title, .pm-opportunity-action, .pm-alert { align-items: stretch; display: grid; }
   .pm-panel-heading-actions { align-items: stretch; justify-items: stretch; }
   .pm-clock { justify-content: flex-start; }

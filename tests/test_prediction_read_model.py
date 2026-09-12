@@ -8,6 +8,7 @@ import pytest
 
 from open_trader.prediction_market_solution import MarketSolution
 from open_trader.prediction_n_leg import ActionQuantity, canonical_payload, fingerprint
+from open_trader.prediction_n_leg_read_model import project_observation_coverage
 from open_trader.prediction_read_model import (
     prediction_history_payload,
     prediction_state_payload,
@@ -1286,3 +1287,137 @@ def test_t19_retired_row_title_prefers_catalog_and_never_empty() -> None:
         fallback_state["opportunities"][0]["title"]
         == "unmatched-1 × unmatched-2"
     )
+
+
+def test_coverage_counts_and_qualification_are_separate() -> None:
+    latest = [
+        {
+            "identity": "pool-positive",
+            "stage": "OBSERVING",
+            "relation_type": "NATIVE_COMPLEMENT",
+            "tokens": ["token-1", "token-2"],
+            "result": {
+                "status": "PASS",
+                "current": True,
+                "guaranteed_profit_units": 200_000,
+                "cost_upper_bound_units": 1_000_000,
+                "net_roi": Decimal("0.20"),
+                "qualification_status": "UNKNOWN",
+            },
+        },
+        {
+            "identity": "pool-non-positive",
+            "stage": "OBSERVING",
+            "relation_type": "EXACTLY_ONE",
+            "tokens": ["token-3", "token-4", "token-5"],
+            "result": {
+                "status": "PASS",
+                "current": True,
+                "guaranteed_profit_units": -250_000,
+                "cost_upper_bound_units": 4_750_000,
+                "net_roi": -Decimal("0.25") / Decimal("4.75"),
+                "qualification_status": "UNKNOWN",
+            },
+        },
+        {
+            "identity": "pool-stale",
+            "stage": "OBSERVING",
+            "relation_type": "NATIVE_COMPLEMENT",
+            "result": {
+                "status": "BLOCKED",
+                "current": False,
+                "reason": "STALE_BOOK",
+                "qualification_status": "UNKNOWN",
+            },
+        },
+        {
+            "identity": "pool-no-fee",
+            "stage": "OBSERVING",
+            "relation_type": "EXACTLY_ONE",
+            "result": {
+                "status": "BLOCKED",
+                "current": False,
+                "reason": "UNKNOWN_FEE_FACTS",
+                "qualification_status": "UNKNOWN",
+            },
+        },
+        {"identity": "waiting-a", "stage": "WAITING", "relation_type": "NATIVE_COMPLEMENT"},
+        {"identity": "waiting-b", "stage": "WAITING", "relation_type": "EXACTLY_ONE"},
+        {"identity": "excluded-a", "stage": "EXCLUDED", "relation_type": "NATIVE_COMPLEMENT"},
+        {"identity": "excluded-b", "stage": "EXCLUDED", "relation_type": "EXACTLY_ONE"},
+    ]
+
+    coverage = project_observation_coverage(
+        latest=latest,
+        pool_limit=4,
+        subscription={
+            "requested_token_ids": [
+                "token-1", "token-2", "token-3", "token-4", "token-5"
+            ],
+            "subscribed_token_ids": [],
+            "pending_preparation_count": None,
+        },
+    )
+    assert coverage["latest_count"] == 8
+    assert coverage["pool_count"] == 4
+    assert coverage["waiting_count"] == 2
+    assert coverage["excluded_count"] == 2
+    assert coverage["fresh_count"] == 2
+    assert coverage["blocked_count"] == 2
+    assert coverage["positive_count"] == 1
+    assert coverage["non_positive_count"] == 1
+    assert coverage["qualified_count"] == 0
+    assert coverage["subscribed_tokens"] == 0
+    assert coverage["all_leg_subscribed_count"] == 0
+    assert coverage["pending_preparation_count"] is None
+    assert [row["identity"] for row in coverage["ranking"]] == [
+        "pool-positive",
+        "pool-non-positive",
+    ]
+
+    ranking = project_observation_coverage(
+        latest=[
+            {
+                "identity": "roi-high",
+                "stage": "OBSERVING",
+                "result": {
+                    "status": "PASS",
+                    "current": True,
+                    "guaranteed_profit_units": 200_000,
+                    "cost_upper_bound_units": 1_000_000,
+                },
+            },
+            {
+                "identity": "roi-low",
+                "stage": "OBSERVING",
+                "result": {
+                    "status": "PASS",
+                    "current": True,
+                    "guaranteed_profit_units": 250_000,
+                    "cost_upper_bound_units": 4_750_000,
+                },
+            },
+        ]
+    )
+    assert [row["identity"] for row in ranking["ranking"]] == [
+        "roi-high",
+        "roi-low",
+    ]
+    assert ranking["ranking"][0]["net_roi"] == Decimal("0.20")
+    assert ranking["ranking"][1]["net_roi"] == Decimal("0.25") / Decimal("4.75")
+
+    installed = project_observation_coverage(
+        latest=latest,
+        pool_limit=4,
+        subscription={
+            "requested_token_ids": [
+                "token-1", "token-2", "token-3", "token-4", "token-5"
+            ],
+            "subscribed_token_ids": [
+                "token-1", "token-2", "token-3", "token-4", "token-5"
+            ],
+            "pending_preparation_count": None,
+        },
+    )
+    assert installed["subscribed_tokens"] == 5
+    assert installed["all_leg_subscribed_count"] == 2

@@ -48,6 +48,80 @@ test.describe('unified N_LEG opportunity page', () => {
     await expect(page.locator('.pm-opportunity')).toHaveCount(1);
   });
 
+  test('renders the read-only observation coverage and ROI projection', async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 1100 });
+    await openPrediction(page);
+    const coverage = page.locator('[aria-label="观测覆盖"]');
+    await expect(coverage).toBeVisible();
+    await expect(coverage).toContainText('持续观测池');
+    await expect(coverage).toContainText(/池内\s*2\s*\/\s*10/);
+    await expect(coverage).toContainText(/最新\s*3/);
+    await expect(coverage).toContainText(/新鲜\s*2/);
+    await expect(coverage).toContainText(/正收益\s*1/);
+    await expect(coverage).toContainText(/非正收益\s*1/);
+    await expect(coverage).toContainText('净 ROI');
+    await expect(coverage.locator('button')).toHaveCount(0);
+  });
+
+  test('observation coverage shows five cached states and read-only details', async ({ page }) => {
+    const states = [
+      ['ready', '已就绪', '2 / 10', '3'],
+      ['observation-empty', '明确为空', '0 / 10', '0'],
+      ['observation-stale', '数据过期', '2 / 10', '3'],
+      ['observation-error', '读取失败', '2 / 10', '3'],
+      ['observation-unknown', '未知', '—', '—'],
+    ] as const;
+    const methods: string[] = [];
+    page.on('request', (request) => {
+      if (request.url().includes('/api/prediction-arbitrage/')) methods.push(request.method());
+    });
+    for (const viewport of [{ width: 1440, height: 1100 }, { width: 375, height: 812 }]) {
+      await page.setViewportSize(viewport);
+      for (const [scenario, status, capacity, latest] of states) {
+        await openPrediction(page, scenario);
+        const coverage = page.locator('[aria-label="观测覆盖"]');
+        await expect(coverage).toBeVisible();
+        await expect(coverage.locator('[data-observation-status]')).toHaveText(status);
+        await expect(coverage).toContainText(`池内${capacity.replace(/\s/g, '')}`);
+        await expect(coverage).toContainText(`最新${latest}`);
+        await expect(coverage.locator('button')).toHaveCount(0);
+      }
+    }
+    await openPrediction(page, 'ready');
+    const coverage = page.locator('[aria-label="观测覆盖"]');
+    for (const label of ['来源范围', '待准备', '排除', '原生', '三腿', '已订阅 token', '全部腿已订阅组', '最旧盘口', '最近尝试', '最近成功', '数量', '含费成本', '最低赔付', '净额', '阻断原因']) {
+      await expect(coverage).toContainText(label);
+    }
+    await expect(coverage.locator('table[aria-label="观测结果"] thead th')).toHaveCount(16);
+    await expect(coverage.locator('details[data-observation-details]').first()).toBeVisible();
+    await coverage.locator('[data-observation-filter]').selectOption('blocked');
+    await expect(coverage.locator('table[aria-label="观测结果"] tbody tr')).toHaveCount(0);
+    expect(methods.every((method) => method === 'GET')).toBe(true);
+  });
+
+  test('observation coverage retains rows after a failed state fetch as stale and not current', async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 1100 });
+    await openPrediction(page, 'observation-fetch-error');
+    const coverage = page.locator('[aria-label="观测覆盖"]');
+    await expect(coverage.locator('[data-observation-status]')).toHaveText('已就绪');
+    await expect(coverage).toContainText(/新鲜\s*2/);
+    await expect(coverage).toContainText('同条件 YES/NO 观察市场');
+
+    await page.evaluate(async () => {
+      await fetchPredictionState();
+    });
+
+    await expect(coverage.locator('[data-observation-status]')).toHaveText('读取失败');
+    await expect(coverage).toContainText(/新鲜\s*0/);
+    await expect(coverage).toContainText(/正收益\s*0/);
+    await expect(coverage).toContainText(/非正收益\s*0/);
+    await expect(coverage).toContainText('同条件 YES/NO 观察市场');
+    await expect(coverage).toContainText('资本释放');
+    await expect(coverage).toContainText('已超过预计结束时间');
+    await expect(coverage).toContainText('未知');
+    await expect(coverage.locator('button')).toHaveCount(0);
+  });
+
   test('MANUAL confirm opens the existing cross-venue confirmation modal', async ({ page }) => {
     const previewRequests: string[] = [];
     const confirmRequests: string[] = [];
@@ -99,7 +173,7 @@ test.describe('unified N_LEG opportunity page', () => {
     await expect(page.locator('.pm-opportunity')).toContainText('24.5%');
     await expect(page.locator('.pm-opportunity')).toContainText('28.4%');
     await expect(page.locator('.pm-opportunity')).toContainText('12 天');
-    await expect(page.locator('.pm-opportunity')).toContainText('-$0.80');
+    await expect(page.locator('.pm-opportunity')).not.toContainText('极端风险');
     await page.screenshot({ path: 'test-results/prediction-unified.png', fullPage: true });
   });
 });

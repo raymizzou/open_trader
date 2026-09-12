@@ -64,6 +64,232 @@ OPTIMAL = "OPTIMAL"
 QUALIFIED_FEASIBLE = "QUALIFIED_FEASIBLE"
 
 
+def project_observation_coverage(
+    *,
+    latest: Mapping[str, object] | Sequence[Mapping[str, object]],
+    pool_limit: int = 10,
+    subscription: Mapping[str, object] | None = None,
+    reserved_pool_count: int | None = None,
+    pool_members: Sequence[Mapping[str, object]] | None = None,
+) -> dict[str, object]:
+    """Project one published observation batch into coverage and rankings.
+
+    This is a pure read-model operation.  It never fetches books, walks a
+    catalog, or applies the formal selection/qualification gate.  Only a
+    current, fresh paper result participates in the ROI ranking.
+    """
+
+    if isinstance(latest, Mapping):
+        rows = [dict(value) for value in latest.values() if isinstance(value, Mapping)]
+    else:
+        rows = [dict(value) for value in latest if isinstance(value, Mapping)]
+    latest_pool_rows: list[dict[str, object]] = []
+    waiting_count = 0
+    excluded_count = 0
+    for row in rows:
+        stage = str(row.get("stage") or "").upper()
+        in_pool = row.get("in_pool") is True or stage in {
+            "OBSERVING",
+            "IN_POOL",
+            "POOL",
+        }
+        if in_pool:
+            latest_pool_rows.append(row)
+        elif stage in {"WAITING", "PENDING", "CANDIDATE"}:
+            waiting_count += 1
+        elif stage in {"EXCLUDED", "REJECTED", "INVALID"}:
+            excluded_count += 1
+
+    # The latest catalog is the source of current candidate counts, while the
+    # durable member list is the source of reserved-pool coverage.  Overlay a
+    # matching latest row onto each reserved member so a temporarily missing
+    # row still contributes its blocked result and relation type without
+    # duplicating it when the latest row is present.
+    if pool_members is None:
+        pool_rows = latest_pool_rows
+    else:
+        latest_by_identity = {
+            str(row.get("identity")): row
+            for row in latest_pool_rows
+            if row.get("identity") not in (None, "")
+        }
+        pool_rows = []
+        for member in pool_members:
+            if not isinstance(member, Mapping):
+                continue
+            identity = member.get("identity")
+            merged = dict(member)
+            if identity not in (None, ""):
+                latest_row = latest_by_identity.get(str(identity))
+                if latest_row is not None:
+                    merged.update(latest_row)
+            pool_rows.append(merged)
+
+    def result_for(row: Mapping[str, object]) -> Mapping[str, object] | None:
+        result = row.get("result")
+        return result if isinstance(result, Mapping) else None
+
+    fresh_rows: list[dict[str, object]] = []
+    blocked_count = 0
+    positive_count = 0
+    non_positive_count = 0
+    qualified_count = 0
+    unknown_count = 0
+    for row in pool_rows:
+        result = result_for(row)
+        if result is None:
+            continue
+        is_current = result.get("current") is True
+        if is_current and str(result.get("status") or "") == "PASS":
+            fresh_rows.append(row)
+            profit = _units_or_none(
+                result.get("guaranteed_profit_units")
+            )
+            if profit is None and isinstance(result.get("economics"), Mapping):
+                profit = _units_or_none(result["economics"].get("guaranteed_profit_units"))
+            if profit is not None:
+                if profit > 0:
+                    positive_count += 1
+                else:
+                    non_positive_count += 1
+            qualification = str(result.get("qualification_status") or "UNKNOWN")
+            if qualification == QUALIFIED_VERIFIED:
+                qualified_count += 1
+            elif qualification == QUALIFICATION_UNKNOWN:
+                unknown_count += 1
+        elif str(result.get("status") or "") in {"BLOCKED", "ERROR"} or result.get("current") is False:
+            blocked_count += 1
+
+    def roi(row: Mapping[str, object]) -> Decimal | None:
+        result = result_for(row)
+        if result is None:
+            return None
+        supplied = result.get("net_roi")
+        if isinstance(supplied, Decimal) and supplied.is_finite():
+            return supplied
+        if isinstance(supplied, str):
+            try:
+                parsed = Decimal(supplied)
+                if parsed.is_finite():
+                    return parsed
+            except InvalidOperation:
+                pass
+        profit = _units_or_none(result.get("guaranteed_profit_units"))
+        cost = _units_or_none(result.get("cost_upper_bound_units"))
+        if isinstance(result.get("economics"), Mapping):
+            profit = profit if profit is not None else _units_or_none(
+                result["economics"].get("guaranteed_profit_units")
+            )
+            cost = cost if cost is not None else _units_or_none(
+                result["economics"].get("cost_upper_bound_units")
+            )
+        if profit is None or cost is None or cost <= 0:
+            return None
+        return Decimal(profit) / Decimal(cost)
+
+    ranking = sorted(
+        (
+            {
+                **row,
+                "net_roi": roi(row),
+            }
+            for row in fresh_rows
+            if roi(row) is not None
+        ),
+        key=lambda row: (-row["net_roi"], str(row.get("identity") or "")),
+    )
+    native_count = sum(
+        1
+        for row in pool_rows
+        if str(row.get("relation_type") or "").upper() == "NATIVE_COMPLEMENT"
+    )
+    three_way_count = sum(
+        1
+        for row in pool_rows
+        if str(row.get("relation_type") or "").upper()
+        in {"EXACTLY_ONE", "PAPER_THREE_WAY"}
+    )
+
+    def token_ids(value: object) -> set[str] | None:
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+            return None
+        return {
+            str(token).strip()
+            for token in value
+            if isinstance(token, str) and token.strip()
+        }
+
+    subscribed_tokens: int | None = None
+    all_leg_subscribed_count: int | None = None
+    pending_preparation_count: int | None = None
+    if isinstance(subscription, Mapping):
+        requested_ids = token_ids(subscription.get("requested_token_ids"))
+        installed_ids = token_ids(subscription.get("subscribed_token_ids"))
+        if installed_ids is not None:
+            if requested_ids is not None:
+                installed_ids &= requested_ids
+            subscribed_tokens = len(installed_ids)
+            all_leg_subscribed_count = sum(
+                1
+                for row in pool_rows
+                if installed_ids
+                and isinstance(row.get("tokens"), Sequence)
+                and not isinstance(row.get("tokens"), (str, bytes))
+                and {
+                    str(token).strip()
+                    for token in row["tokens"]
+                    if isinstance(token, str) and token.strip()
+                }
+                and {
+                    str(token).strip()
+                    for token in row["tokens"]
+                    if isinstance(token, str) and token.strip()
+                }.issubset(installed_ids)
+            )
+        elif type(subscription.get("subscribed_tokens")) is int:
+            subscribed_tokens = max(0, int(subscription["subscribed_tokens"]))
+        if type(subscription.get("all_leg_subscribed_count")) is int:
+            all_leg_subscribed_count = max(
+                0, int(subscription["all_leg_subscribed_count"])
+            )
+        if type(subscription.get("pending_preparation_count")) is int:
+            pending_preparation_count = max(
+                0, int(subscription["pending_preparation_count"])
+            )
+    pool_count = (
+        len(pool_rows)
+        if reserved_pool_count is None
+        else max(0, min(int(reserved_pool_count), pool_limit))
+    )
+    return {
+        "latest_count": len(rows),
+        "pool_count": pool_count,
+        "pool_limit": pool_limit,
+        "capacity": f"{pool_count}/{pool_limit}",
+        "waiting_count": waiting_count,
+        "pending_preparation_count": pending_preparation_count,
+        "excluded_count": excluded_count,
+        "fresh": len(fresh_rows),
+        "fresh_count": len(fresh_rows),
+        # Computed/current candidate counts remain latest-only.  Historical
+        # blocked results stay visible for audit, but do not count as a
+        # current computation.
+        "computed_count": len(fresh_rows),
+        "blocked_count": blocked_count,
+        "positive_count": positive_count,
+        "positive": positive_count,
+        "non_positive_count": non_positive_count,
+        "non_positive": non_positive_count,
+        "native_count": native_count,
+        "three_way_count": three_way_count,
+        "qualified_count": qualified_count,
+        "unknown_count": unknown_count,
+        "subscribed_tokens": subscribed_tokens,
+        "all_leg_subscribed_count": all_leg_subscribed_count,
+        "ranking": ranking,
+    }
+
+
 def _fee_state(fee: Mapping[str, object] | None) -> str:
     """Fee state of one solution entry; unknown unless proven fee-free."""
     if not isinstance(fee, Mapping):

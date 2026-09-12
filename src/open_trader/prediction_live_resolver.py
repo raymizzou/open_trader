@@ -768,6 +768,65 @@ class PredictionLiveResolver:
             )
         ]
 
+    def monitoring_snapshot(self) -> dict[str, object]:
+        """Expose the formal chain's latest outcome without changing it.
+
+        A rejected or unknown component remains visible with its bound reason,
+        while a prior positive solution is removed by the existing outcome
+        lifecycle.  The observation pool uses its own paper result stream and
+        is intentionally not folded into this formal selection projection.
+        """
+
+        with self._lock:
+            selected = dict(self._selection)
+            resolutions = dict(self._resolutions)
+            verifications = dict(self._verifications)
+            solutions = dict(self._solutions)
+        entries: list[dict[str, object]] = []
+        for component_id in sorted(selected):
+            resolution = resolutions.get(component_id)
+            verification = verifications.get(component_id)
+            solution_entry = solutions.get(component_id)
+            if resolution is None:
+                entries.append(
+                    {
+                        "component_id": component_id,
+                        "stage": "PENDING",
+                        "status": "PENDING",
+                        "reason": None,
+                        "guaranteed_profit_units": None,
+                    }
+                )
+                continue
+            status = resolution.status.value
+            reason = resolution.reason
+            if reason is None and verification is not None:
+                reason = verification.unknown_reason
+            if reason is None and status == "NO_QUALIFIED_OPPORTUNITY":
+                reason = status
+            market = None
+            profit: int | None = None
+            if solution_entry is not None:
+                market = canonical_payload(solution_entry[0])
+                raw_profit = market.get("guaranteed_profit_units")
+                if isinstance(raw_profit, int):
+                    profit = raw_profit
+            entries.append(
+                {
+                    "component_id": component_id,
+                    "stage": (
+                        "REJECTED"
+                        if status in {"NO_QUALIFIED_OPPORTUNITY", "NOT_QUALIFIED"}
+                        else status
+                    ),
+                    "status": status,
+                    "reason": reason,
+                    "guaranteed_profit_units": profit,
+                    "market": market,
+                }
+            )
+        return {"formal": entries}
+
     def latest_resolution(self, component_id: str) -> ComponentResolution | None:
         with self._lock:
             return self._resolutions.get(component_id)

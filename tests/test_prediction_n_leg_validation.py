@@ -7,6 +7,7 @@ import threading
 import time
 from concurrent.futures import Future
 from copy import deepcopy
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -22,6 +23,7 @@ from open_trader.prediction_n_leg_validation import (
     build_report,
     frozen_snapshot_from_file,
     readonly_v2_relations,
+    price_observation,
     run_paper_three_way,
     run_live,
     run_replay,
@@ -32,6 +34,7 @@ from open_trader.prediction_solver_worker import WorkerOutcome, WorkerResponse
 from open_trader.polymarket_relation_discovery import discover_mechanical_relation_catalog
 from open_trader.relation_catalog import RelationCatalog
 from open_trader.relation_catalog_v2 import RelationCatalogV2, SqliteCatalogStore
+from test_mechanical_relations import complement_relation
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "prediction_n_leg_validation_frozen_n3.json"
@@ -289,6 +292,7 @@ def test_three_way_paper_report_prices_legal_equal_lots(tmp_path: Path) -> None:
     assert len(requested) == 1
     assert_paper_no_side_effects(positive)
 
+
     minimum_notional = run_paper_three_way(
         rows,
         book_source=lambda token_ids: paper_books(
@@ -384,6 +388,116 @@ def test_three_way_paper_report_prices_legal_equal_lots(tmp_path: Path) -> None:
         assert blocked["status"] == "BLOCKED"
         assert blocked["reason"] == reason
         assert_paper_no_side_effects(blocked)
+
+
+def test_observation_pricing_preserves_fixed_economics(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 16, 2, 0, tzinfo=UTC)
+    relation = complement_relation()
+    relation = replace(
+        relation,
+        market=replace(relation.market, fees_enabled=False, fee_rate=Decimal("0")),
+    )
+    catalog = RelationCatalog(tmp_path / "catalog")
+    catalog.ingest_mechanical_relation(relation)
+    native_row = catalog.review_rows()[0]
+    native = price_observation(
+        native_row,
+        {
+            "yes-1": {
+                "token_id": "yes-1",
+                "asks": [{"price": "0.40", "size": "5"}],
+                "confirmed_at": now,
+                "minimum_order_size": "5",
+                "tick_size": "0.01",
+            },
+            "no-1": {
+                "token_id": "no-1",
+                "asks": [{"price": "0.55", "size": "5"}],
+                "confirmed_at": now,
+                "minimum_order_size": "5",
+                "tick_size": "0.01",
+            },
+        },
+        as_of=now,
+    )
+    assert native["quantity_lots"] == 5
+    assert native["cost_upper_bound_units"] == 4_750_000
+    assert native["payout_lower_bound_units"] == 5_000_000
+    assert native["guaranteed_profit_units"] == 250_000
+    assert native["net_roi"] == Decimal("0.25") / Decimal("4.75")
+    assert native["order_ready"] is False
+    assert native["execution_calls"] == 0
+
+    three_way = price_observation(
+        paper_three_way_rows(),
+        paper_books(("0.30", "0.32", "0.33"), now=now),
+        as_of=now,
+    )
+    assert three_way["cost_upper_bound_units"] == 4_750_000
+    assert three_way["guaranteed_profit_units"] == 250_000
+
+    charging = price_observation(
+        paper_three_way_rows(
+            fees_enabled=True,
+            fee_rate="0.04",
+            fee_exponent=1,
+            taker_only=True,
+        ),
+        paper_books(("0.33", "0.33", "0.33"), now=now),
+        as_of=now,
+    )
+    assert charging["cost_upper_bound_units"] == 5_082_660
+    assert charging["guaranteed_profit_units"] == -82_660
+
+    isolated = tmp_path / "isolated"
+    (isolated / "prediction_arbitrage").mkdir(parents=True)
+    (isolated / "prediction_arbitrage" / "prediction_arbitrage.sqlite3").touch()
+    rejected = run_paper_three_way(
+        paper_three_way_rows(),
+        book_source=lambda token_ids: paper_books(
+            ("0.30", "0.32", "0.33"), now=now
+        ),
+        data_dir=isolated,
+        as_of=now,
+    )
+    assert rejected["status"] == "BLOCKED"
+    assert rejected["reason"] == "NON_ISOLATED_DATA_DIR"
+
+
+def test_native_observation_honors_minimum_notional(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 16, 2, 0, tzinfo=UTC)
+    relation = complement_relation()
+    relation = replace(
+        relation,
+        market=replace(relation.market, fees_enabled=False, fee_rate=Decimal("0")),
+    )
+    catalog = RelationCatalog(tmp_path / "catalog")
+    catalog.ingest_mechanical_relation(relation)
+    row = catalog.review_rows()[0]
+
+    def books(minimum_notional: object) -> dict[str, dict[str, object]]:
+        return {
+            token: {
+                "token_id": token,
+                "asks": [{"price": price, "size": "50"}],
+                "confirmed_at": now,
+                "minimum_order_size": "5",
+                "minimum_order_notional": minimum_notional,
+                "tick_size": "0.01",
+            }
+            for token, price in (("yes-1", "0.40"), ("no-1", "0.55"))
+        }
+
+    priced = price_observation(row, books("10"), as_of=now)
+    assert priced["quantity_lots"] == 25
+    assert priced["cost_upper_bound_units"] == 23_750_000
+    assert priced["payout_lower_bound_units"] == 25_000_000
+    assert priced["guaranteed_profit_units"] == 1_250_000
+    assert priced["order_ready"] is False
+
+    invalid = price_observation(row, books("0"), as_of=now)
+    assert invalid["status"] == "BLOCKED"
+    assert invalid["reason"] == "UNKNOWN_ORDER_RULES"
 
 
 def test_three_way_paper_normalizes_catalog_dollar_payouts(tmp_path: Path) -> None:

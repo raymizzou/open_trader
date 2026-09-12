@@ -51,6 +51,7 @@ from .relation_auto_confirm import (
     run_relation_lifecycle,
 )
 from .prediction_live_resolver import PredictionLiveResolver
+from .prediction_observation_monitor import PredictionObservationMonitor
 from .prediction_monitor_selection import MonitorSelectionStore
 from .prediction_monitor_selection_driver import PredictionMonitorSelectionDriver
 from .prediction_n_leg_episodes import EpisodeStore, EpisodeTracker
@@ -402,6 +403,7 @@ class PredictionRuntime:
         self._cross_runtime: _CrossVenueRuntime | None = None
         self.store: PredictionArbitrageStore | None = None
         self.monitor: PolymarketMonitor | None = None
+        self.observation_monitor: PredictionObservationMonitor | None = None
         self.cross_venue_monitor: object | None = None
         self.execution: PredictionExecutionService | None = None
         self.relation_catalog: RelationCatalog | None = None
@@ -581,6 +583,11 @@ class PredictionRuntime:
                 title_translator=title_translator,
                 relation_catalog=self.relation_catalog,
             )
+            self.observation_monitor = PredictionObservationMonitor(
+                catalog=self.relation_catalog,
+                store=self.store,
+                monitor=self.monitor,
+            )
             self._wire_relation_lifecycle()
             self.execution = PredictionExecutionService(
                 store=self.store,
@@ -663,6 +670,8 @@ class PredictionRuntime:
 
         try:
             self.monitor.start()
+            if self.observation_monitor is not None:
+                self.observation_monitor.start()
             if self._cross_runtime is not None:
                 try:
                     self._cross_runtime.start()
@@ -806,6 +815,11 @@ class PredictionRuntime:
                 relation_validator=self._relation_validator,
                 title_translator=LlmTitleTranslator(self.store),
             )
+            self.observation_monitor = PredictionObservationMonitor(
+                catalog={},
+                store=self.store,
+                monitor=self.monitor,
+            )
             self.execution = PredictionExecutionService(
                 store=self.store,
                 monitor=self.monitor,
@@ -860,6 +874,8 @@ class PredictionRuntime:
 
         try:
             self.monitor.start()
+            if self.observation_monitor is not None:
+                self.observation_monitor.start()
             if self._cross_runtime is not None:
                 self._cross_runtime.start()
             if self._predict_trading is not None and callable(
@@ -924,6 +940,12 @@ class PredictionRuntime:
     def n_leg_solutions(self) -> list[dict[str, object]]:
         resolver = self.live_resolver
         return [] if resolver is None else resolver.solutions()
+
+    def observation_snapshot(self) -> dict[str, object] | None:
+        monitor = self.observation_monitor
+        if monitor is None:
+            return None
+        return monitor.snapshot()
 
     def n_leg_execution_source(
         self, component_id: str
@@ -1001,6 +1023,13 @@ class PredictionRuntime:
             finally:
                 if not self._cross_runtime.thread_alive:
                     self._cross_runtime = None
+        if self.observation_monitor is not None:
+            try:
+                self.observation_monitor.stop()
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                self.observation_monitor = None
         if self.monitor is not None:
             try:
                 self.monitor.stop()

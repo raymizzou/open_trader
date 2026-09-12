@@ -10,6 +10,7 @@ or written.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from datetime import UTC, datetime
@@ -1276,8 +1277,9 @@ class RelationCatalog:
         occurrences: int = 0,
         *,
         include_problem: bool = True,
+        record: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
-        record = self._versions()[version_id]
+        record = record if record is not None else self._versions()[version_id]
         payload = record["payload"]
         model: dict[str, object] = {
             "terminal_states": payload.get("terminal_states", []),
@@ -2444,3 +2446,105 @@ class RelationCatalog:
             ).encode()
         ).hexdigest()
         return {"generation": generation_number, "fingerprint": fingerprint}
+
+    def observation_generation_meta(self) -> dict[str, object]:
+        """Lightweight latest-version watermark for observation revalidation."""
+
+        reader = getattr(self._store, "observation_latest_meta", None)
+        if callable(reader):
+            return dict(reader())
+        latest = {
+            str(identity): str(version_id)
+            for identity, version_id in self._store.get("latest", {}).items()
+        }
+        return {
+            "generation": int(self._store.get("generation_number", 0)),
+            "generation_fingerprint": hashlib.sha256(
+                json.dumps(sorted(latest.items()), separators=(",", ":")).encode()
+            ).hexdigest(),
+            "latest": latest,
+        }
+
+    def observation_snapshot(self) -> dict[str, object]:
+        """Read the latest version of every identity in one catalog snapshot.
+
+        Observation admission needs lifecycle and source facts even when a
+        version is still pending or has been rejected.  Keep this read
+        independent from the formal ACTIVE generation and return copies so a
+        dashboard/monitor cannot mutate catalog state accidentally.
+        """
+        read_latest = getattr(self._store, "observation_latest", None)
+        if callable(read_latest):
+            state = read_latest()
+            latest = state["latest"]
+            versions = state["records"]
+            generation = int(state["generation_number"])
+            active = state["generation"]
+        else:
+            with self._catalog._read():
+                latest = {
+                    str(identity): str(version_id)
+                    for identity, version_id in self._store.get("latest", {}).items()
+                }
+                versions = self._versions()
+                generation = int(self._store.get("generation_number", 0))
+                active = self._store.get("generation", {})
+
+        rows: dict[str, dict[str, object]] = {}
+        for identity, version_id in latest.items():
+            record = versions.get(version_id)
+            if not isinstance(record, Mapping):
+                continue
+            row = self._row(version_id, record=record)
+            endpoints: list[dict[str, object]] = []
+            end_dates: list[datetime] = []
+            invalid_end_date = False
+            for endpoint in row.get("endpoints", ()):
+                if not isinstance(endpoint, Mapping):
+                    invalid_end_date = True
+                    continue
+                copied = dict(endpoint)
+                end_date = copied.get("expires_at") or copied.get("market_date")
+                if end_date is not None:
+                    copied["end_date"] = end_date
+                    try:
+                        end_dates.append(_utc(end_date))
+                    except ValueError:
+                        invalid_end_date = True
+                else:
+                    invalid_end_date = True
+                endpoints.append(copied)
+            row["endpoints"] = endpoints
+            row["lifecycle"] = str(record.get("status") or "UNKNOWN")
+            row["approval_status"] = str(record.get("status") or "UNKNOWN")
+            row["activation_status"] = str(
+                record.get("activation_status") or "PENDING"
+            )
+            row["version_fingerprint"] = str(record.get("version_fp") or "")
+            # A multi-leg candidate is date-valid only when every leg carries
+            # a timezone-aware, parseable date.  Keep the row visible for
+            # diagnostics, while exposing no admission date for the monitor.
+            row["end_date"] = (
+                max(end_dates).isoformat()
+                if end_dates and not invalid_end_date
+                else None
+            )
+            rows[identity] = copy.deepcopy(row)
+
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                sorted(
+                    (str(identity), str(entry.get("version_id")))
+                    for identity, entry in active.items()
+                    if isinstance(entry, Mapping)
+                ),
+                sort_keys=True,
+                default=str,
+            ).encode()
+        ).hexdigest()
+        return {
+            "generation": generation,
+            "generation_fingerprint": fingerprint,
+            "latest": latest,
+            "rows": rows,
+        }

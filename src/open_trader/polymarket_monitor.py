@@ -186,6 +186,15 @@ def _decimal(value: object) -> Decimal | None:
     return result if result.is_finite() else None
 
 
+def _status(value: object) -> str:
+    return str(value or "").strip().upper()
+
+
+def _source_fingerprint(value: object) -> str:
+    encoded = json.dumps(value, sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def _timestamp(value: object, *, fallback: datetime) -> datetime:
     parsed = _timestamp_or_none(value)
     return fallback if parsed is None else parsed
@@ -381,10 +390,26 @@ class PolymarketMonitor:
         # the effective cross-venue token set is the union of both shares;
         # neither writer ever evicts the other's tokens or cached books.
         self._n_leg_tokens: set[str] = set()
+        # The persistent observation pool has a third consumer share.  Keep
+        # it independent so removing an observation member cannot evict a
+        # formal N-leg or cross-venue subscription that happens to overlap.
+        self._observation_tokens: set[str] = set()
         self._cross_venue_books: dict[str, ThresholdOrderBook] = {}
         self._cross_venue_book_timestamps: dict[str, datetime] = {}
+        self._observation_books: dict[str, dict[str, object]] = {}
         self._cross_venue_refresh_required = False
+        self._observation_refresh_required = False
         self._cross_venue_generation = 0
+        self._observation_terminal_by_condition: dict[str, dict[str, object]] = {}
+        self._observation_terminal_by_token: dict[str, dict[str, object]] = {}
+        self._observation_condition_ids: set[str] = set()
+        self._observation_source_status: dict[str, dict[str, object]] = {}
+        self._observation_source_status_refresh_at: datetime | None = None
+        self._observation_source_status_pending = True
+        self._observation_source_status_error: str | None = None
+        self._observation_subscription_error: str | None = None
+        self._observation_source_status_task: asyncio.Task[None] | None = None
+        self._observation_source_status_next_allowed = 0.0
         self._relation_volumes: dict[str, Decimal] = {}
         self._relation_rule_verifications: dict[str, tuple[datetime, str]] = {}
         self._relation_rule_failures: set[str] = set()
@@ -530,9 +555,9 @@ class PolymarketMonitor:
             return
 
     def _cross_venue_effective_tokens(self) -> set[str]:
-        """Union of both shares (callers hold ``self._lock``); #114 P1."""
+        """Union of all public consumers (callers hold ``self._lock``)."""
 
-        return self._cross_venue_tokens | self._n_leg_tokens
+        return self._cross_venue_tokens | self._n_leg_tokens | self._observation_tokens
 
     def set_cross_venue_tokens(self, token_ids: Sequence[str]) -> None:
         """Replace the cross-venue engine's share and force a fresh subscription.
@@ -572,7 +597,665 @@ class PolymarketMonitor:
             self._n_leg_tokens = requested
             self._prune_cross_venue_books()
 
-    def _prune_cross_venue_books(self) -> None:
+    def set_observation_tokens(self, token_ids: Sequence[str]) -> None:
+        """Replace the persistent observation consumer's token share.
+
+        Subscription and cached-book pruning always use the union of the
+        formal, cross-venue, and observation shares.  This method is the only
+        observation writer; it never changes relation selection state.
+        """
+
+        requested = {
+            token.strip()
+            for token in token_ids
+            if isinstance(token, str) and token.strip()
+        }
+        bounded = set(sorted(requested)[:30])
+        with self._lock:
+            if bounded == self._observation_tokens:
+                return
+            self._cross_venue_generation += 1
+            self._observation_tokens = bounded
+            self._observation_refresh_required = True
+            self._prune_cross_venue_books()
+
+    def set_observation_conditions(self, condition_ids: Sequence[str]) -> None:
+        """Set the bounded source-status identities for observation members."""
+
+        requested = {
+            condition.strip()
+            for condition in condition_ids
+            if isinstance(condition, str) and condition.strip()
+        }
+        bounded = set(sorted(requested)[:30])
+        with self._lock:
+            if bounded == self._observation_condition_ids:
+                return
+            self._observation_condition_ids = bounded
+            self._observation_source_status_pending = True
+            self._observation_refresh_required = True
+            self._subscription_dirty = True
+
+    def observation_status(
+        self, *, condition_id: str | None = None, token_id: str | None = None
+    ) -> dict[str, object] | None:
+        """Return an explicit terminal source status, if one was observed."""
+
+        with self._lock:
+            if condition_id is not None:
+                status = self._observation_terminal_by_condition.get(str(condition_id))
+                if status is None:
+                    status = self._observation_source_status.get(str(condition_id))
+            elif token_id is not None:
+                status = self._observation_terminal_by_token.get(str(token_id))
+            else:
+                return None
+            return copy.deepcopy(status) if status is not None else None
+
+    def observation_source_metadata(
+        self, *, condition_id: str | None = None, token_id: str | None = None
+    ) -> dict[str, object] | None:
+        """Return the latest immutable source facts for one observation market."""
+
+        status = self.observation_status(condition_id=condition_id, token_id=token_id)
+        if not isinstance(status, Mapping):
+            return None
+        facts = status.get("source_facts")
+        if not isinstance(facts, Mapping):
+            return None
+        return {
+            "condition_id": status.get("condition_id"),
+            "status": status.get("status"),
+            "source_facts": copy.deepcopy(dict(facts)),
+            "source_fingerprint": status.get("source_fingerprint"),
+            "observed_at": status.get("observed_at"),
+        }
+
+    def observation_books(
+        self, token_ids: Sequence[str] | None = None
+    ) -> dict[str, dict[str, object]]:
+        """Return observation books with REST order facts and freshness."""
+
+        with self._lock:
+            requested = (
+                set(self._observation_tokens)
+                if token_ids is None
+                else {str(token) for token in token_ids}
+            )
+            now = self._now()
+            result: dict[str, dict[str, object]] = {}
+            for token in sorted(requested & self._observation_tokens):
+                book = self._observation_books.get(token)
+                if book is None:
+                    continue
+                value = copy.deepcopy(book)
+                confirmed_at = value.get("confirmed_at")
+                age = (
+                    (now - confirmed_at).total_seconds()
+                    if isinstance(confirmed_at, datetime)
+                    else float("inf")
+                )
+                valid_age = 0 <= age <= BOOK_FRESHNESS_SECONDS
+                value["fresh"] = bool(value.get("available", True)) and valid_age
+                value["status"] = (
+                    "FRESH"
+                    if value["fresh"]
+                    else str(value.get("status") or "STALE")
+                )
+                value["age_seconds"] = age
+                result[token] = value
+            return result
+
+    def observation_subscription_snapshot(self) -> dict[str, object]:
+        """Report the observation share installed on the live stream.
+
+        The requested observation token set is separate from the stream's
+        successfully installed token set.  Consumers must use the latter for
+        coverage claims; cached books do not imply a subscription.
+        """
+
+        with self._lock:
+            requested = set(self._observation_tokens)
+            installed = requested & self._stream_token_ids
+            if not requested:
+                status = "EMPTY"
+            elif self._observation_subscription_error is not None:
+                status = "ERROR"
+            elif self._stream_handle is not None and installed == requested:
+                status = "READY"
+            else:
+                status = "PENDING"
+            return {
+                "status": status,
+                "requested_token_ids": sorted(requested),
+                "subscribed_token_ids": sorted(installed),
+                "requested_tokens": len(requested),
+                "subscribed_tokens": len(installed),
+                "subscription_error": self._observation_subscription_error,
+                # No per-candidate preparation count exists at this seam; the
+                # absence is intentional and lets the read model show it as
+                # unknown rather than aliasing capacity waiting.
+                "pending_preparation_count": None,
+                "source_status_pending": bool(
+                    self._observation_source_status_pending
+                    or (
+                        self._observation_source_status_task is not None
+                        and not self._observation_source_status_task.done()
+                    )
+                ),
+            }
+
+    def _record_observation_resolution(self, payload: object) -> None:
+        """Record the SDK's explicit market-resolved payload before routing."""
+
+        market = _value(payload, "market", default=None)
+        condition_id = _value(
+            market if market is not None else payload,
+            "condition_id",
+            "conditionId",
+            default=None,
+        )
+        if not isinstance(condition_id, str) or not condition_id.strip():
+            return
+        token_ids = tuple(
+            sorted(
+                {
+                    str(token)
+                    for token in _items(
+                        _value(payload, "token_ids", "assets_ids", "assetsIds", default=())
+                    )
+                    if isinstance(token, str) and token.strip()
+                }
+            )
+        )
+        winning_token_id = _value(
+            payload, "winning_token_id", "winningTokenId", default=None
+        )
+        timestamp = _timestamp_or_none(_value(payload, "timestamp", default=None))
+        status = {
+            "condition_id": condition_id,
+            "token_ids": token_ids,
+            "winning_token_id": (
+                str(winning_token_id)
+                if isinstance(winning_token_id, str) and winning_token_id.strip()
+                else None
+            ),
+            "timestamp": timestamp,
+            "status": "TERMINAL",
+        }
+        with self._lock:
+            self._observation_terminal_by_condition[condition_id] = copy.deepcopy(status)
+            for token in token_ids:
+                self._observation_terminal_by_token[token] = copy.deepcopy(status)
+
+    @staticmethod
+    def _observation_market_tokens(value: object) -> tuple[str, ...]:
+        outcomes = _value(value, "outcomes", default=None)
+        pairs = _outcome_pairs(outcomes)
+        if pairs is not None:
+            return tuple(sorted(set(pairs.values())))
+        tokens: set[str] = set()
+        for name in ("token_ids", "tokenIds", "assets_ids", "assetsIds"):
+            for token in _items(_value(value, name, default=())):
+                if isinstance(token, str) and token.strip():
+                    tokens.add(token.strip())
+        return tuple(sorted(tokens))
+
+    @classmethod
+    def _observation_market_status(
+        cls, value: object, *, requested_closed: bool
+    ) -> tuple[str, tuple[str, ...], dict[str, object]] | None:
+        state = _value(value, "state", default=None)
+        condition_id = _value(
+            value, "condition_id", "conditionId", "condition", default=None
+        )
+        if not isinstance(condition_id, str) or not condition_id.strip():
+            return None
+        tokens = cls._observation_market_tokens(value)
+        raw_status = _status(
+            _value(value, "status", "market_status", "resolution_status", default="")
+        )
+        invalid = _value(
+            value,
+            "invalid",
+            "is_invalid",
+            "isInvalid",
+            "voided",
+            default=None,
+        )
+        resolved = _value(
+            value,
+            "resolved",
+            "is_resolved",
+            "isResolved",
+            "settled",
+            default=None,
+        )
+        closed = _state_flag(
+            state, "closed", default=_value(value, "closed", default=None)
+        )
+        active = _state_flag(
+            state, "active", default=_value(value, "active", default=None)
+        )
+        source_facts = cls._observation_market_source_facts(value)
+        if invalid is True or raw_status in {"INVALID", "VOID", "VOIDED"}:
+            return "INVALID", tokens, source_facts
+        if resolved is True or raw_status in {"RESOLVED", "FINAL", "SETTLED"}:
+            return "RESOLVED", tokens, source_facts
+        if closed is True or raw_status == "CLOSED":
+            return "CLOSED", tokens, source_facts
+        if active is True or closed is False:
+            return "OPEN", tokens, source_facts
+        # A filtered closed=True response is itself a bounded closure fact
+        # only when the payload did not provide a contradictory lifecycle
+        # flag.  An explicit closed=False/active=True row must remain OPEN
+        # even if a provider echoes it in both filtered requests.
+        if requested_closed:
+            return "CLOSED", tokens, source_facts
+        return None
+
+    @staticmethod
+    def _observation_market_source_facts(value: object) -> dict[str, object]:
+        """Extract source-owned fee/order/rule facts without mutating catalog rows."""
+
+        state = _value(value, "state", default=None)
+        trading = _value(value, "trading", default=None)
+        fee_schedule = _value(
+            trading, "fee_schedule", "feeSchedule", default=None
+        )
+        facts: dict[str, object] = {}
+        fields = (
+            (
+                "fee_rate",
+                ("rate", "fee_rate", "feeRate"),
+                fee_schedule,
+                trading,
+                value,
+            ),
+            (
+                "fee_exponent",
+                ("exponent", "fee_exponent", "feeExponent"),
+                fee_schedule,
+                trading,
+                value,
+            ),
+            (
+                "taker_only",
+                ("taker_only", "takerOnly"),
+                fee_schedule,
+                trading,
+                value,
+            ),
+            (
+                "minimum_order_size",
+                ("minimum_order_size", "minimumOrderSize", "orderMinSize"),
+                trading,
+                value,
+            ),
+            (
+                "tick_size",
+                (
+                    "minimum_tick_size",
+                    "minimumTickSize",
+                    "orderPriceMinTickSize",
+                    "tick_size",
+                    "tickSize",
+                ),
+                trading,
+                value,
+            ),
+            ("minimum_order_notional", ("minimum_order_notional", "minOrderNotional", "min_order_notional"), trading, value),
+        )
+        for name, names, *sources in fields:
+            raw = None
+            for source in sources:
+                raw = _value(source, *names, default=None)
+                if raw is not None:
+                    break
+            if raw is None:
+                continue
+            if name in {
+                "fee_rate",
+                "minimum_order_size",
+                "tick_size",
+                "minimum_order_notional",
+            }:
+                parsed = _decimal(raw)
+                if parsed is not None:
+                    facts[name] = format(parsed, "f")
+            else:
+                facts[name] = raw
+        fee_flag_missing = object()
+        fee_flag = _value(
+            trading,
+            "fees_enabled",
+            "feesEnabled",
+            default=fee_flag_missing,
+        )
+        if fee_flag is fee_flag_missing:
+            fee_flag = _value(
+                value,
+                "fees_enabled",
+                "feesEnabled",
+                default=fee_flag_missing,
+            )
+        if type(fee_flag) is bool:
+            facts["fees_enabled"] = fee_flag
+        else:
+            facts["fee_facts_status"] = "UNKNOWN"
+        for name, names in (
+            ("neg_risk", ("neg_risk", "negRisk")),
+            ("active", ("active",)),
+            ("closed", ("closed",)),
+        ):
+            raw = _state_flag(state, name, default=_value(value, *names, default=None))
+            if raw is not None:
+                facts[name] = raw
+        # An explicit charging flag without the complete schedule is an
+        # unknown fee fact.  Keep that uncertainty in the immutable source
+        # snapshot so an older catalog schedule cannot be reused by an
+        # observation pass.
+        fee_rate = _decimal(facts.get("fee_rate"))
+        if facts.get("fees_enabled") is True and (
+            fee_rate is None
+            or fee_rate < 0
+            or fee_rate > 1
+            or type(facts.get("fee_exponent")) is not int
+            or facts.get("fee_exponent") != 1
+            or facts.get("taker_only") is not True
+        ):
+            facts["fee_facts_status"] = "UNKNOWN"
+        for name in ("rules", "settlement_rules", "description", "resolution_source", "rules_hash"):
+            raw = _value(value, name, _camel(name), default=None)
+            if isinstance(raw, str) and raw.strip():
+                facts[name] = raw.strip()
+        description = facts.get("description")
+        if isinstance(description, str):
+            facts.setdefault("settlement_rules", description)
+        return facts
+
+    def _record_observation_source_status(
+        self,
+        condition_id: str,
+        status: str,
+        *,
+        token_ids: Sequence[str] = (),
+        reason: str | None = None,
+        source_facts: Mapping[str, object] | None = None,
+    ) -> None:
+        observed = {
+            "condition_id": str(condition_id),
+            "status": str(status),
+            "token_ids": tuple(sorted(set(str(token) for token in token_ids))),
+            "observed_at": self._now(),
+        }
+        if reason is not None:
+            observed["reason"] = str(reason)
+        if source_facts:
+            facts = copy.deepcopy(dict(source_facts))
+            observed["source_facts"] = facts
+            observed["source_fingerprint"] = _source_fingerprint(facts)
+        with self._lock:
+            prior = self._observation_source_status.get(str(condition_id))
+            self._observation_source_status[str(condition_id)] = copy.deepcopy(observed)
+            if (
+                prior is not None
+                and prior.get("source_fingerprint")
+                != observed.get("source_fingerprint")
+            ):
+                self._observation_refresh_required = True
+            if str(status) in {"RESOLVED", "CLOSED", "INVALID", "TERMINAL", "FINAL"}:
+                self._observation_terminal_by_condition[str(condition_id)] = copy.deepcopy(
+                    observed
+                )
+                for token in observed["token_ids"]:
+                    self._observation_terminal_by_token[str(token)] = copy.deepcopy(
+                        observed
+                    )
+
+    async def _refresh_observation_source_status_once(
+        self, client: object, condition_ids: Sequence[str]
+    ) -> None:
+        list_markets = getattr(client, "list_markets", None)
+        if not callable(list_markets):
+            raise RuntimeError("public client has no filtered market status read")
+        requested = {str(condition) for condition in condition_ids if str(condition)}
+        if not requested:
+            return
+        found: dict[str, list[tuple[str, tuple[str, ...], dict[str, object]]]] = {
+            condition: [] for condition in requested
+        }
+        page_size = min(30, len(requested))
+        for closed in (False, True):
+            raw_page = await _call(
+                list_markets,
+                condition_ids=sorted(requested),
+                closed=closed,
+                page_size=page_size,
+            )
+            for raw_market in await _collect_first_page(raw_page):
+                condition_id = _value(
+                    raw_market,
+                    "condition_id",
+                    "conditionId",
+                    "condition",
+                    default=None,
+                )
+                if not isinstance(condition_id, str) or condition_id not in requested:
+                    continue
+                status = self._observation_market_status(
+                    raw_market, requested_closed=closed
+                )
+                if status is not None:
+                    found[condition_id].append(status)
+        for condition_id, statuses in found.items():
+            terminal = next(
+                (
+                    item
+                    for item in statuses
+                    if item[0]
+                    in {"RESOLVED", "CLOSED", "INVALID", "TERMINAL", "FINAL"}
+                ),
+                None,
+            )
+            if terminal is not None:
+                self._record_observation_source_status(
+                    condition_id,
+                    terminal[0],
+                    token_ids=terminal[1],
+                    source_facts=terminal[2],
+                )
+                continue
+            open_status = next((item for item in statuses if item[0] == "OPEN"), None)
+            if open_status is not None:
+                self._record_observation_source_status(
+                    condition_id,
+                    "OPEN",
+                    token_ids=open_status[1],
+                    source_facts=open_status[2],
+                )
+            else:
+                self._record_observation_source_status(
+                    condition_id,
+                    "UNKNOWN",
+                    reason="SOURCE_STATUS_MISSING_OR_MISMATCHED",
+                )
+
+    async def _refresh_observation_source_status_if_due(
+        self, client: object, *, force: bool = False, bounded: bool = True
+    ) -> None:
+        now = self._now()
+        with self._lock:
+            condition_ids = tuple(sorted(self._observation_condition_ids))
+            last = self._observation_source_status_refresh_at
+            pending = self._observation_source_status_pending
+            if not condition_ids or (
+                not force
+                and not pending
+                and last is not None
+                and (now - last).total_seconds() < UNIVERSE_REFRESH_SECONDS
+            ):
+                return
+            self._observation_source_status_pending = False
+            self._observation_source_status_refresh_at = now
+            self._observation_source_status_error = None
+        try:
+            operation = self._refresh_observation_source_status_once(
+                client, condition_ids
+            )
+            if bounded:
+                await asyncio.wait_for(
+                    operation,
+                    timeout=PUBLIC_REFRESH_TIMEOUT_SECONDS,
+                )
+            else:
+                await operation
+        except Exception as exc:
+            with self._lock:
+                self._observation_source_status_error = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+                self._observation_source_status_pending = False
+            for condition_id in condition_ids:
+                with self._lock:
+                    prior = self._observation_terminal_by_condition.get(condition_id)
+                if prior is None:
+                    self._record_observation_source_status(
+                        condition_id,
+                        "UNKNOWN",
+                        reason=type(exc).__name__,
+                    )
+
+    def _observation_books_need_refresh(self, now: datetime | None = None) -> bool:
+        with self._lock:
+            if self._observation_refresh_required:
+                return bool(self._observation_tokens)
+            if not self._observation_tokens:
+                return False
+            current = now or self._now()
+            for token in self._observation_tokens:
+                book = self._observation_books.get(token)
+                if not isinstance(book, Mapping):
+                    return True
+                if book.get("available") is False:
+                    return True
+                confirmed_at = book.get("confirmed_at")
+                if not isinstance(confirmed_at, datetime):
+                    return True
+                age = (current - confirmed_at).total_seconds()
+                if age < 0 or age > BOOK_FRESHNESS_SECONDS:
+                    return True
+            return False
+
+    async def _refresh_observation_books_once(
+        self, client: object
+    ) -> None:
+        with self._lock:
+            token_ids = tuple(sorted(self._observation_tokens))[:30]
+        if not token_ids:
+            with self._lock:
+                self._observation_refresh_required = False
+            return
+        books, _timestamps, _received = await self._fetch_threshold_books(
+            client, token_ids
+        )
+        missing = set(token_ids) - set(books)
+        # The observation pass owns the shared cache entries for its bounded
+        # token share as well.  Keeping the exchange watermark beside the
+        # parsed book lets subsequent WS deltas validate against the REST
+        # snapshot even when this token is not a cross-venue consumer.
+        with self._lock:
+            for token in token_ids:
+                if token in books:
+                    self._cross_venue_books[token] = books[token]
+                    timestamp = _timestamps.get(token)
+                    if timestamp is not None:
+                        self._cross_venue_book_timestamps[token] = timestamp
+                    else:
+                        self._cross_venue_book_timestamps[token] = _received[token]
+                else:
+                    self._cross_venue_books.pop(token, None)
+                    self._cross_venue_book_timestamps.pop(token, None)
+        self._invalidate_observation_books(tuple(sorted(missing)), "MISSING_BOOK")
+        with self._lock:
+            self._observation_refresh_required = bool(missing)
+
+    async def _refresh_observation_network_once(
+        self, client: object, *, force: bool = False
+    ) -> None:
+        now = self._now()
+        with self._lock:
+            condition_ids = tuple(sorted(self._observation_condition_ids))
+            last = self._observation_source_status_refresh_at
+            pending = self._observation_source_status_pending
+            status_due = bool(condition_ids) and (
+                force
+                or pending
+                or last is None
+                or (now - last).total_seconds() >= UNIVERSE_REFRESH_SECONDS
+            )
+        if status_due:
+            await self._refresh_observation_source_status_if_due(
+                client, force=force, bounded=False
+            )
+        if self._observation_books_need_refresh(self._now()):
+            await self._refresh_observation_books_once(client)
+
+    async def _refresh_observation_network_bounded(
+        self, client: object, *, force: bool = False
+    ) -> None:
+        try:
+            await asyncio.wait_for(
+                self._refresh_observation_network_once(client, force=force),
+                timeout=PUBLIC_REFRESH_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            with self._lock:
+                self._observation_source_status_error = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+                self._observation_refresh_required = bool(self._observation_tokens)
+            self._invalidate_observation_books(
+                tuple(sorted(self._observation_tokens)), "STALE"
+            )
+
+    def _schedule_observation_source_status(
+        self, client: object, *, force: bool = False
+    ) -> None:
+        """Run one bounded status pass without pausing stream consumption."""
+
+        task = self._observation_source_status_task
+        if task is not None and not task.done():
+            return
+        if not force and not self._observation_books_need_refresh(self._now()):
+            with self._lock:
+                condition_ids = tuple(self._observation_condition_ids)
+                last = self._observation_source_status_refresh_at
+                pending = self._observation_source_status_pending
+            if not condition_ids or (
+                not pending
+                and last is not None
+                and (self._now() - last).total_seconds() < UNIVERSE_REFRESH_SECONDS
+            ):
+                return
+        now = self._monotonic()
+        if not force and now < self._observation_source_status_next_allowed:
+            return
+        self._observation_source_status_next_allowed = now + 5.0
+        task = asyncio.create_task(
+            self._refresh_observation_network_bounded(client, force=force)
+        )
+        self._observation_source_status_task = task
+
+        def clear(completed: asyncio.Task[None]) -> None:
+            if self._observation_source_status_task is completed:
+                self._observation_source_status_task = None
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                completed.result()
+
+        task.add_done_callback(clear)
+
+    def _prune_cross_venue_books(self, *, refresh_cross_venue: bool = True) -> None:
         """Prune cached books/timestamps to the union of both shares."""
 
         keep = self._cross_venue_effective_tokens()
@@ -586,7 +1269,13 @@ class PolymarketMonitor:
             for token, timestamp in self._cross_venue_book_timestamps.items()
             if token in keep
         }
-        self._cross_venue_refresh_required = True
+        self._observation_books = {
+            token: book
+            for token, book in self._observation_books.items()
+            if token in self._observation_tokens
+        }
+        if refresh_cross_venue:
+            self._cross_venue_refresh_required = True
         self._subscription_dirty = True
 
     def cross_venue_books(
@@ -750,6 +1439,20 @@ class PolymarketMonitor:
                         self._cross_venue_effective_tokens()
                     ),
                     "n_leg_cross_venue_token_count": len(self._n_leg_tokens),
+                    "observation_token_count": len(self._observation_tokens),
+                },
+                "observation": {
+                    "tokens": sorted(self._observation_tokens),
+                    "condition_ids": sorted(self._observation_condition_ids),
+                    "source_status": copy.deepcopy(self._observation_source_status),
+                    "source_status_refresh_at": self._observation_source_status_refresh_at,
+                    "source_status_error": self._observation_source_status_error,
+                    "terminal_markets": copy.deepcopy(
+                        self._observation_terminal_by_condition
+                    ),
+                    "terminal_tokens": copy.deepcopy(
+                        self._observation_terminal_by_token
+                    ),
                 },
                 "heartbeat_at": self._heartbeat_at,
                 "universe_refreshed_at": self._universe_at,
@@ -976,7 +1679,9 @@ class PolymarketMonitor:
             self._client = client
         try:
             await self._refresh_universe_bounded(
-                client, subscribe=self._relation_discovery is None
+                client,
+                subscribe=self._relation_discovery is None,
+                block_observation_status=True,
             )
             if self._relation_discovery is not None:
                 if (
@@ -1173,6 +1878,7 @@ class PolymarketMonitor:
             "_llm_failure_notification_task",
             "_title_translation_task",
             "_auto_eat_task",
+            "_observation_source_status_task",
         ):
             setattr(self, task_name, None)
         self._codex_relation_id = None
@@ -1222,6 +1928,11 @@ class PolymarketMonitor:
                 if self._universe_at is not None:
                     self._maybe_schedule_full_scan(client)
                     self._maybe_schedule_activity_scan(client)
+                # Observation source/book recovery is deliberately launched
+                # as the single bounded background task.  Keep this on every
+                # event-loop pass so stale, missing, or invalidated quotes are
+                # replenished without holding up stream consumption.
+                self._schedule_observation_source_status(client)
                 try:
                     await self._refresh_subscription_if_dirty(client)
                 except Exception as exc:
@@ -1268,6 +1979,7 @@ class PolymarketMonitor:
                 "_llm_failure_notification_task",
                 "_title_translation_task",
                 "_auto_eat_task",
+                "_observation_source_status_task",
             ):
                 task = getattr(self, task_name)
                 setattr(self, task_name, None)
@@ -1281,10 +1993,18 @@ class PolymarketMonitor:
             self._client = None
 
     async def _refresh_universe_bounded(
-        self, client: object, *, subscribe: bool = True
+        self,
+        client: object,
+        *,
+        subscribe: bool = True,
+        block_observation_status: bool = True,
     ) -> None:
         await asyncio.wait_for(
-            self._refresh_universe(client, subscribe=subscribe),
+            self._refresh_universe(
+                client,
+                subscribe=subscribe,
+                block_observation_status=block_observation_status,
+            ),
             timeout=PUBLIC_REFRESH_TIMEOUT_SECONDS,
         )
 
@@ -1298,7 +2018,9 @@ class PolymarketMonitor:
         if self._universe_retry_exhausted or current < next_refresh:
             return next_refresh, False
         try:
-            await self._refresh_universe_bounded(client)
+            await self._refresh_universe_bounded(
+                client, block_observation_status=False
+            )
         except Exception as exc:
             self._record_error(exc, "universe")
             self._universe_refresh_attempts = min(
@@ -1446,6 +2168,12 @@ class PolymarketMonitor:
         # The handle is closed by the next event-loop pass.  We deliberately do
         # not retain stream messages in the store.
         self._stream_handle = None
+        with self._lock:
+            self._observation_subscription_error = (
+                f"{type(exc).__name__}: {exc}"
+            )
+            self._observation_source_status_pending = True
+            self._observation_refresh_required = bool(self._observation_tokens)
         self._maintain_open_signals()
 
     async def _subscribe(self, client: object) -> None:
@@ -1456,7 +2184,9 @@ class PolymarketMonitor:
                 | self._cross_venue_effective_tokens()
             )
             refresh_cross_venue = self._cross_venue_refresh_required
-            cross_venue_tokens = tuple(sorted(self._cross_venue_effective_tokens()))
+            cross_venue_tokens = tuple(
+                sorted(self._cross_venue_tokens | self._n_leg_tokens)
+            )
             cross_venue_generation = self._cross_venue_generation
         if not token_ids:
             await self._close_stream()
@@ -1487,6 +2217,18 @@ class PolymarketMonitor:
                 with self._lock:
                     if cross_venue_generation == self._cross_venue_generation:
                         self._invalidate_cross_venue_books(cross_venue_tokens)
+                        self._invalidate_observation_books(
+                            tuple(
+                                token
+                                for token in cross_venue_tokens
+                                if token in self._observation_tokens
+                            ),
+                            "STALE",
+                        )
+        else:
+            self._schedule_observation_source_status(client)
+        if refresh_cross_venue:
+            self._schedule_observation_source_status(client)
         with self._lock:
             current_tokens = (
                 set(self._market_by_token)
@@ -1503,9 +2245,12 @@ class PolymarketMonitor:
             handle = await _call(
                 subscribe, specs[0] if len(specs) == 1 else specs
             )
-        except Exception:
+        except Exception as exc:
             with self._lock:
                 self._subscription_dirty = True
+                self._observation_subscription_error = (
+                    f"{type(exc).__name__}: {exc}"
+                )
             raise
         with self._lock:
             subscription_changed = (
@@ -1520,6 +2265,7 @@ class PolymarketMonitor:
             if not subscription_changed:
                 self._stream_handle = handle
                 self._stream_token_ids = set(token_ids)
+                self._observation_subscription_error = None
                 self._subscription_dirty = False
                 if refresh_cross_venue:
                     self._cross_venue_refresh_required = False
@@ -1547,7 +2293,11 @@ class PolymarketMonitor:
         await self._subscribe(client)
 
     async def _refresh_universe(
-        self, client: object, *, subscribe: bool = True
+        self,
+        client: object,
+        *,
+        subscribe: bool = True,
+        block_observation_status: bool = True,
     ) -> None:
         list_events = getattr(client, "list_events", None)
         if not callable(list_events):
@@ -1641,6 +2391,10 @@ class PolymarketMonitor:
         for opportunity in confirmed:
             if opportunity is not None:
                 current_opportunities[str(opportunity["opportunity_id"])] = opportunity
+        if block_observation_status:
+            await self._refresh_observation_network_bounded(client)
+        else:
+            self._schedule_observation_source_status(client)
         if subscribe:
             await self._refresh_subscription_if_dirty(client)
         with self._lock:
@@ -2553,12 +3307,59 @@ class PolymarketMonitor:
                         )
                     )
                     received[token] = received_at
+                    timestamp = timestamps[token]
+                    timestamp_error = (
+                        "INVALID_TIMESTAMP"
+                        if timestamp is None
+                        else (
+                            "FUTURE_TIMESTAMP"
+                            if timestamp > received_at
+                            else None
+                        )
+                    )
                     result[token] = ThresholdOrderBook(
                         token_id=token,
                         asks=asks,
                         bids=bids,
                         confirmed_at=received_at,
                     )
+                    with self._lock:
+                        if token in self._observation_tokens:
+                            self._observation_books[token] = {
+                                "token_id": token,
+                                "asks": asks,
+                                "bids": bids,
+                                "confirmed_at": received_at,
+                                "exchange_time": timestamps[token],
+                                "minimum_order_size": _decimal(
+                                    _value(
+                                        raw_book,
+                                        "minimum_order_size",
+                                        "min_order_size",
+                                        "orderMinSize",
+                                        default=None,
+                                    )
+                                ),
+                                "tick_size": _decimal(
+                                    _value(
+                                        raw_book,
+                                        "tick_size",
+                                        "minimum_tick_size",
+                                        "orderPriceMinTickSize",
+                                        default=None,
+                                    )
+                                ),
+                                "minimum_order_notional": _decimal(
+                                    _value(
+                                        raw_book,
+                                        "minimum_order_notional",
+                                        "min_order_notional",
+                                        default=None,
+                                    )
+                                ),
+                                "available": timestamp_error is None,
+                                "status": timestamp_error or "FRESH",
+                            }
                 return result, timestamps, received
 
         fetched = await asyncio.gather(*(fetch(chunk) for chunk in chunks))
@@ -2591,10 +3392,26 @@ class PolymarketMonitor:
                 or set(tokens) != self._cross_venue_effective_tokens()
             ):
                 return False
-            self._cross_venue_books = books
-            self._cross_venue_book_timestamps = {
-                token: timestamps.get(token) or received[token] for token in books
-            }
+            missing_observation = (
+                set(tokens)
+                & self._observation_tokens
+            ) - set(books)
+            self._invalidate_observation_books(
+                tuple(sorted(missing_observation)), "MISSING_BOOK"
+            )
+            # This pass owns only the requested cross/N-leg share.  Merge its
+            # result so a concurrent bounded observation pass cannot have its
+            # own books silently replaced by the other consumer's response.
+            for token in tokens:
+                self._cross_venue_books.pop(token, None)
+                self._cross_venue_book_timestamps.pop(token, None)
+            self._cross_venue_books.update(books)
+            self._cross_venue_book_timestamps.update(
+                {
+                    token: timestamps.get(token) or received[token]
+                    for token in books
+                }
+            )
             return True
 
     async def _confirm_cross_venue_books(
@@ -3958,6 +4775,8 @@ class PolymarketMonitor:
         message_type = _value(message, "type", "event_type", default="")
         payload = _value(message, "payload", default=message)
         if message_type in {"new_market", "market_resolved"}:
+            if message_type == "market_resolved":
+                self._record_observation_resolution(payload)
             event_message = _value(payload, "event_message", "eventMessage", default=None)
             event_id = _event_id(event_message)
             if event_id is None:
@@ -4025,6 +4844,7 @@ class PolymarketMonitor:
             timestamp = _timestamp_or_none(_value(payload, "timestamp", default=None))
             if timestamp is None:
                 self._invalidate_cross_venue_books(affected)
+                self._invalidate_observation_books(affected, "INVALID_TIMESTAMP")
                 return
             if message_type == "book":
                 token = next(iter(affected))
@@ -4036,11 +4856,15 @@ class PolymarketMonitor:
                     or timestamp <= self._cross_venue_book_timestamps.get(token, timestamp)
                 ):
                     self._invalidate_cross_venue_books(affected)
+                    self._invalidate_observation_books(affected, "INVALID_BOOK")
                     return
                 self._cross_venue_books[token] = ThresholdOrderBook(
                     token_id=token, asks=asks, bids=bids, confirmed_at=self._now()
                 )
                 self._cross_venue_book_timestamps[token] = timestamp
+                self._update_observation_stream_book(
+                    token, asks, bids, timestamp, self._now()
+                )
                 return
             if message_type != "price_change":
                 return
@@ -4056,12 +4880,57 @@ class PolymarketMonitor:
             }
             for token, token_changes in by_token.items():
                 current = self._cross_venue_books.get(token)
+                if current is None:
+                    # An observation-only REST pass populates the public
+                    # observation view before its shared-cache merge can run.
+                    # Reuse that parsed baseline for a concurrent WS delta;
+                    # otherwise the first valid delta would be discarded as
+                    # an invalid update solely because of task interleaving.
+                    observation = self._observation_books.get(token)
+                    asks = (
+                        observation.get("asks")
+                        if isinstance(observation, Mapping)
+                        else None
+                    )
+                    bids = (
+                        observation.get("bids")
+                        if isinstance(observation, Mapping)
+                        else None
+                    )
+                    confirmed_at = (
+                        observation.get("confirmed_at")
+                        if isinstance(observation, Mapping)
+                        else None
+                    )
+                    exchange_time = (
+                        observation.get("exchange_time")
+                        if isinstance(observation, Mapping)
+                        else None
+                    )
+                    if (
+                        isinstance(asks, tuple)
+                        and isinstance(bids, tuple)
+                        and isinstance(confirmed_at, datetime)
+                    ):
+                        current = ThresholdOrderBook(
+                            token_id=token,
+                            asks=asks,
+                            bids=bids,
+                            confirmed_at=confirmed_at,
+                        )
+                        self._cross_venue_books[token] = current
+                        self._cross_venue_book_timestamps[token] = (
+                            exchange_time
+                            if isinstance(exchange_time, datetime)
+                            else confirmed_at
+                        )
                 if (
                     current is None
                     or not token_changes
                     or timestamp <= self._cross_venue_book_timestamps.get(token, timestamp)
                 ):
                     self._invalidate_cross_venue_books((token,))
+                    self._invalidate_observation_books((token,), "INVALID_DELTA")
                     continue
                 asks = {level.price: level.size for level in current.asks}
                 bids = {level.price: level.size for level in current.bids}
@@ -4080,6 +4949,7 @@ class PolymarketMonitor:
                         levels[price] = size
                 if not valid or not asks or not bids:
                     self._invalidate_cross_venue_books((token,))
+                    self._invalidate_observation_books((token,), "INVALID_DELTA")
                     continue
                 self._cross_venue_books[token] = ThresholdOrderBook(
                     token_id=token,
@@ -4090,12 +4960,53 @@ class PolymarketMonitor:
                     confirmed_at=self._now(),
                 )
                 self._cross_venue_book_timestamps[token] = timestamp
+                self._update_observation_stream_book(
+                    token,
+                    tuple(BookLevel(price, asks[price]) for price in sorted(asks)),
+                    tuple(
+                        BookLevel(price, bids[price])
+                        for price in sorted(bids, reverse=True)
+                    ),
+                    timestamp,
+                    self._now(),
+                )
 
     def _invalidate_cross_venue_books(self, token_ids: Sequence[str]) -> None:
         with self._lock:
             for token in token_ids:
                 self._cross_venue_books.pop(token, None)
                 self._cross_venue_book_timestamps.pop(token, None)
+
+    def _invalidate_observation_books(
+        self, token_ids: Sequence[str], reason: str = "STALE"
+    ) -> None:
+        for token in token_ids:
+            book = self._observation_books.get(str(token))
+            if book is not None:
+                book["available"] = False
+                book["status"] = reason
+
+    def _update_observation_stream_book(
+        self,
+        token: str,
+        asks: Sequence[BookLevel],
+        bids: Sequence[BookLevel],
+        timestamp: datetime,
+        received_at: datetime,
+    ) -> None:
+        book = self._observation_books.get(token)
+        if book is None:
+            return
+        book.update(
+            {
+                "asks": tuple(asks),
+                "bids": tuple(bids),
+                "confirmed_at": received_at,
+                "exchange_time": timestamp,
+                "available": True,
+                "status": "FRESH",
+            }
+        )
 
     def _update_stream_book(self, market_id: str, token: str, payload: object) -> None:
         asks = _asks(_value(payload, "asks", default=()))

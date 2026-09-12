@@ -481,6 +481,9 @@ def create_prediction_server(
                         n_leg_metrics=getattr(
                             runtime, "n_leg_metrics", lambda: {}
                         )(),
+                        observation_snapshot=getattr(
+                            runtime, "observation_snapshot", lambda: None
+                        )(),
                         legacy_retired=getattr(runtime, "legacy_retired", False) is True,
                     ),
                     set_session=mode == "production",

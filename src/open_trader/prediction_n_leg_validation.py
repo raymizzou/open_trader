@@ -70,7 +70,9 @@ from open_trader.prediction_n_leg import (
     ActionSide,
     OracleBudget,
     OracleRequest,
+    RelationKind,
     SearchMode,
+    TerminalKind,
     canonical_payload,
     fingerprint,
     problem_from_payload,
@@ -986,7 +988,312 @@ def _paper_consumed_prices_on_tick(
     return False
 
 
-def run_paper_three_way(
+def _observation_blocked(reason: str, detail: str) -> dict[str, object]:
+    """Return the small, side-effect-free result shape used by observation."""
+
+    return {
+        "status": "BLOCKED",
+        "reason": reason,
+        "detail": detail,
+        "qualification_status": "UNKNOWN",
+        "order_ready": False,
+        "execution_calls": 0,
+        "zero_side_effects": {
+            "submitted_orders": 0,
+            "mutation_attempts": 0,
+            "catalog_read_only": True,
+        },
+    }
+
+
+def _observation_projection(report: Mapping[str, object]) -> dict[str, object]:
+    """Project the existing paper report to the monitor's immutable result."""
+
+    result = dict(report)
+    economics = report.get("economics")
+    if isinstance(economics, Mapping):
+        result.update(
+            {
+                "quantity_lots": economics.get("quantity_lots"),
+                "payout_lower_bound_units": economics.get("payout_lower_bound_units"),
+                "cost_upper_bound_units": economics.get("cost_upper_bound_units"),
+                "guaranteed_profit_units": economics.get("guaranteed_profit_units"),
+            }
+        )
+        cost = economics.get("cost_upper_bound_units")
+        profit = economics.get("guaranteed_profit_units")
+        if isinstance(cost, int) and cost > 0 and isinstance(profit, int):
+            result["net_roi"] = Decimal(profit) / Decimal(cost)
+        else:
+            result["net_roi"] = None
+    result.setdefault("execution_calls", 0)
+    result.setdefault("order_ready", False)
+    return result
+
+
+def _native_observation(
+    row: Mapping[str, object],
+    books_payload: Mapping[str, object],
+    *,
+    as_of: datetime | None,
+    budget: OracleBudget,
+) -> dict[str, object]:
+    """Price one complete native YES/NO pair from fresh token asks."""
+
+    model = _paper_mapping(row.get("model"))
+    problem_payload = _paper_mapping(model.get("problem")) if model else None
+    if model is None or problem_payload is None:
+        return _observation_blocked("UNKNOWN_MODEL_FACTS", "native row has no compiled problem")
+    try:
+        problem = normalize_problem(
+            problem_from_payload(problem_payload, allow_unknown_data=True)
+        )
+    except (TypeError, ValueError) as exc:
+        return _observation_blocked("UNKNOWN_MODEL_FACTS", f"invalid native problem: {exc}")
+    if (
+        row.get("relation_type") != "NATIVE_COMPLEMENT"
+        or len(problem.actions) != 2
+        or {action.side for action in problem.actions}
+        != {ActionSide.BUY_YES, ActionSide.BUY_NO}
+    ):
+        return _observation_blocked("UNSUPPORTED_STRUCTURE", "observation supports one native YES/NO pair")
+    endpoints = {
+        str(endpoint.get("contract_id")): endpoint
+        for endpoint in row.get("endpoints", ())
+        if isinstance(endpoint, Mapping) and isinstance(endpoint.get("contract_id"), str)
+    }
+    contracts = {action.market_contract_id for action in problem.actions}
+    if set(endpoints) != contracts:
+        return _observation_blocked("UNKNOWN_MODEL_FACTS", "native endpoints do not cover both actions")
+    relations = tuple(problem.constraint_model.relations)
+    states = tuple(problem.terminal_state_sets)
+    if (
+        len(relations) != 1
+        or relations[0].kind != RelationKind.NATIVE_COMPLEMENT
+        or set(relations[0].contract_ids) != contracts
+        or {state.market_contract_id for state in states} != contracts
+        or any(
+            {atom.kind for atom in state.atoms}
+            != {TerminalKind.NORMAL_YES, TerminalKind.NORMAL_NO, TerminalKind.SPLIT}
+            for state in states
+        )
+        or len({state.settlement_observation_key.indicator_id for state in states}) != 1
+    ):
+        return _observation_blocked(
+            "UNSUPPORTED_STRUCTURE",
+            "native observation requires a same-condition complement model",
+        )
+    evaluated_at = as_of
+    if evaluated_at is not None:
+        if (
+            not isinstance(evaluated_at, datetime)
+            or evaluated_at.tzinfo is None
+            or evaluated_at.utcoffset() != UTC.utcoffset(evaluated_at)
+        ):
+            return _observation_blocked("INVALID_AS_OF", "as_of must be a UTC-aware datetime")
+        evaluated_at = evaluated_at.astimezone(UTC)
+    if evaluated_at is None:
+        evaluated_at = datetime.now(UTC)
+
+    fee_bps_by_contract: dict[str, Decimal] = {}
+    fee_reports: dict[str, dict[str, object]] = {}
+    for contract in sorted(contracts):
+        fee_bps, fee_report, fee_reason = _paper_fee_facts(
+            endpoints[contract], model, contract
+        )
+        if fee_reason is not None:
+            return _observation_blocked(
+                fee_reason, f"fee facts unavailable or unsupported for {contract}"
+            )
+        fee_bps_by_contract[contract] = fee_bps
+        fee_reports[contract] = fee_report
+
+    books: dict[str, PaperBook] = {}
+    for contract in sorted(contracts):
+        if contract not in books_payload:
+            return _observation_blocked("MISSING_BOOKS", f"book missing for token {contract}")
+        try:
+            books[contract] = paper_book_from_payload(
+                books_payload[contract],
+                token_id=contract,
+                taker_fee_bps=fee_bps_by_contract[contract],
+            )
+        except ValueError as exc:
+            reason = str(exc) if str(exc) in {"TOKEN_ID_MISMATCH", "MISSING_BOOKS"} else "MISSING_BOOKS"
+            return _observation_blocked(reason, f"invalid book for token {contract}: {exc}")
+
+    minimum_lots: dict[str, int] = {}
+    depth_lots: dict[str, int] = {}
+    for action in problem.actions:
+        contract = action.market_contract_id
+        book = books[contract]
+        if not book.available or not book.asks:
+            return _observation_blocked("MISSING_BOOKS", f"book for {contract} is unavailable")
+        if (
+            book.minimum_order_size is None
+            or not book.minimum_order_size.is_finite()
+            or book.minimum_order_size <= 0
+            or book.tick_size is None
+            or not book.tick_size.is_finite()
+            or book.tick_size <= 0
+        ):
+            return _observation_blocked("UNKNOWN_ORDER_RULES", f"minimum size or tick is unknown for {contract}")
+        if action.lot_step_units != 1 or action.quantity_scale != 1:
+            return _observation_blocked("UNKNOWN_ORDER_RULES", "native observation sizing requires unit lots")
+        minimum_notional = book.minimum_order_notional
+        if minimum_notional is not None and (
+            not minimum_notional.is_finite() or minimum_notional <= 0
+        ):
+            return _observation_blocked(
+                "UNKNOWN_ORDER_RULES",
+                f"minimum order notional is invalid for {contract}",
+            )
+        if book.confirmed_at > evaluated_at:
+            return _observation_blocked("FUTURE_BOOK", f"book for {contract} is newer than evaluation time")
+        if evaluated_at - book.confirmed_at > PAPER_BOOK_FRESHNESS:
+            return _observation_blocked("STALE_BOOK", f"book for {contract} is older than 10s")
+        legal_lots = max(
+            action.min_quantity_lots,
+            int((book.minimum_order_size).to_integral_value(rounding=ROUND_CEILING)),
+            (
+                int(
+                    (minimum_notional / book.asks[0].price).to_integral_value(
+                        rounding=ROUND_CEILING
+                    )
+                )
+                if minimum_notional is not None
+                else 1
+            ),
+        )
+        available_lots = int(
+            sum(level.size for level in book.asks).to_integral_value(rounding=ROUND_FLOOR)
+        )
+        minimum_lots[contract] = legal_lots
+        depth_lots[contract] = available_lots
+        if available_lots < legal_lots:
+            return _observation_blocked("INSUFFICIENT_DEPTH", f"book for {contract} cannot fill its minimum legal size")
+
+    quantity_lots = max(minimum_lots.values())
+    if any(depth < quantity_lots for depth in depth_lots.values()):
+        return _observation_blocked("INSUFFICIENT_DEPTH", f"native pair cannot fill common quantity {quantity_lots}")
+    for action in problem.actions:
+        if not _paper_consumed_prices_on_tick(books[action.market_contract_id], action, quantity_lots):
+            return _observation_blocked("OFF_TICK_PRICE", f"consumed ask price for {action.market_contract_id} is not aligned to its tick")
+    prepared_actions = tuple(
+        replace(action, min_quantity_lots=quantity_lots, max_quantity_lots=quantity_lots)
+        for action in problem.actions
+    )
+    prepared_problem = replace(problem, actions=prepared_actions)
+    component_id = f"native:{':'.join(sorted(contracts))}"
+    snapshot = ComponentSnapshot(
+        component_id,
+        tuple(
+            SnapshotLeg(
+                action.action_id,
+                books[action.market_contract_id],
+                books[action.market_contract_id].confirmed_at,
+                books[action.market_contract_id].confirmed_at,
+                None,
+            )
+            for action in prepared_actions
+        ),
+    )
+    try:
+        request = build_solve_request(
+            prepared_problem,
+            snapshot,
+            budget=budget,
+            limits=VALIDATION_LIMITS,
+            price_units_per_quote_unit=USD_UNITS_PER_DOLLAR,
+        )
+        priced_problem = request.request.problem
+        quantities = tuple(
+            ActionQuantity(action.action_id, quantity_lots)
+            for action in priced_problem.actions
+        )
+        evaluation = evaluate_paper_portfolio(priced_problem, quantities, budget)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return _observation_blocked("UNKNOWN_MODEL_FACTS", f"native model could not be evaluated: {exc}")
+    cost = evaluation.cost_upper_bound_units
+    profit = evaluation.guaranteed_profit_units
+    charging = any(report.get("status") == "CHARGING" for report in fee_reports.values())
+    return {
+        "status": "PASS",
+        "reason": None,
+        "component_id": component_id,
+        "relation_type": "NATIVE_COMPLEMENT",
+        "quantity_lots": quantity_lots,
+        "payout_lower_bound_units": evaluation.payout_lower_bound_units,
+        "cost_upper_bound_units": cost,
+        "guaranteed_profit_units": profit,
+        "net_roi": Decimal(profit) / Decimal(cost) if cost > 0 else None,
+        "qualification_status": evaluation.time_qualification,
+        "evaluated_at": evaluated_at.isoformat(),
+        "fees": {"status": "CHARGING" if charging else "FREE", "legs": fee_reports},
+        "order_ready": False,
+        "execution_calls": 0,
+        "zero_side_effects": {
+            "submitted_orders": 0,
+            "mutation_attempts": 0,
+            "catalog_read_only": True,
+        },
+    }
+
+
+def price_observation(
+    candidate: object,
+    books: Mapping[str, object],
+    *,
+    as_of: datetime | None = None,
+    budget: OracleBudget = VALIDATION_BUDGET,
+) -> dict[str, object]:
+    """Price one supported observation candidate with bounded fresh asks.
+
+    The existing three-way paper path remains the source of truth for its
+    fixed equal-lot economics.  Native pairs use the same book adapter,
+    integer cost slices, and paper oracle, with BUY_NO reading the NO token's
+    asks.  This seam never creates an execution solution or performs a write.
+    """
+
+    if not isinstance(books, Mapping):
+        return _observation_blocked("MISSING_BOOKS", "observation books must be a token mapping")
+    if isinstance(candidate, Mapping) and any(
+        name in candidate for name in ("relation_type", "endpoints", "model")
+    ):
+        selected = (
+            str(candidate.get("identity") or candidate.get("version_id") or "observation"),
+            candidate,
+        )
+    else:
+        try:
+            rows = _paper_row_items(candidate)
+        except ValueError:
+            return _observation_blocked("INVALID_CATALOG_ROWS", "candidate must be a catalog row or row mapping")
+        selected = next(
+            ((identity, row) for identity, row in sorted(rows, key=lambda item: item[0])
+             if isinstance(row, Mapping)),
+            None,
+        )
+    if selected is None:
+        return _observation_blocked("NO_SUPPORTED_CANDIDATE", "no candidate row was supplied")
+    _, row = selected
+    if row.get("relation_type") == "NATIVE_COMPLEMENT":
+        return _native_observation(row, books, as_of=as_of, budget=budget)
+    if row.get("model", {}).get("template") == PAPER_THREE_WAY_TEMPLATE if isinstance(row.get("model"), Mapping) else False:
+        # The shared core validates all three-way model, fee, order-rule,
+        # depth, freshness, and unknown-release facts without touching disk.
+        report = _price_three_way_core(
+            {str(selected[0]): row},
+            book_source=lambda _token_ids: books,
+            data_dir=Path(),
+            budget=budget,
+            as_of=as_of,
+        )
+        return _observation_projection(report)
+    return _observation_blocked("UNSUPPORTED_STRUCTURE", "observation supports native pairs and football three-way rows")
+
+
+def _price_three_way_core(
     catalog_rows: object,
     *,
     book_source: Callable[[tuple[str, ...]], Mapping[str, object]] | None,
@@ -1017,13 +1324,6 @@ def run_paper_three_way(
                 "as_of must be a UTC-aware datetime",
             )
         evaluated_at = evaluated_at.astimezone(UTC)
-    if (data_dir / "prediction_arbitrage" / "prediction_arbitrage.sqlite3").exists():
-        return _paper_blocked(
-            "NON_ISOLATED_DATA_DIR",
-            data_dir,
-            "refusing to use an existing prediction_arbitrage.sqlite3",
-            evaluated_at=evaluated_at,
-        )
     try:
         rows = _paper_row_items(catalog_rows)
     except ValueError as exc:
@@ -1458,6 +1758,48 @@ def run_paper_three_way(
             "books": economic_fingerprint(snapshot),
         },
     }
+
+
+def run_paper_three_way(
+    catalog_rows: object,
+    *,
+    book_source: Callable[[tuple[str, ...]], Mapping[str, object]] | None,
+    data_dir: str | Path,
+    budget: OracleBudget = VALIDATION_BUDGET,
+    catalog: Mapping[str, object] | None = None,
+    as_of: datetime | None = None,
+) -> dict[str, object]:
+    """Apply the CLI paper-mode isolation guard around the shared core."""
+
+    data_dir = Path(data_dir)
+    evaluated_at = as_of
+    if evaluated_at is not None:
+        if (
+            not isinstance(evaluated_at, datetime)
+            or evaluated_at.tzinfo is None
+            or evaluated_at.utcoffset() != UTC.utcoffset(evaluated_at)
+        ):
+            return _paper_blocked(
+                "INVALID_AS_OF",
+                data_dir,
+                "as_of must be a UTC-aware datetime",
+            )
+        evaluated_at = evaluated_at.astimezone(UTC)
+    if (data_dir / "prediction_arbitrage" / "prediction_arbitrage.sqlite3").exists():
+        return _paper_blocked(
+            "NON_ISOLATED_DATA_DIR",
+            data_dir,
+            "refusing to use an existing prediction_arbitrage.sqlite3",
+            evaluated_at=evaluated_at,
+        )
+    return _price_three_way_core(
+        catalog_rows,
+        book_source=book_source,
+        data_dir=data_dir,
+        budget=budget,
+        catalog=catalog,
+        as_of=as_of,
+    )
 
 
 class _ReadonlyCatalogAdapter:
