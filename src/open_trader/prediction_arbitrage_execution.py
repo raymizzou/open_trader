@@ -262,11 +262,16 @@ class PredictionExecutionService:
         dashboard_url: str = "http://127.0.0.1:8766/",
         predict_trading: object | None = None,
         legacy_retired: bool = False,
+        lp: object | None = None,
     ) -> None:
         self._store = store
         self._monitor = monitor
         self._trading = trading
         self._predict_trading = predict_trading
+        # The LP session uses the same durable store and process/file mutex as
+        # the existing execution path.  Keep the collaborator optional so
+        # shadow and legacy test fixtures retain their read-only surface.
+        self._lp = lp
         self._cross_venue_monitor: object | None = None
         self._notifier = notifier
         self._lock_path = Path(lock_path)
@@ -281,12 +286,122 @@ class PredictionExecutionService:
         self._breaker_open = True
         self._cross_breaker_open = False
         self._first_live_order_verified = False
+        set_lp_guard = getattr(self._lp, "set_mutation_guard", None)
+        if callable(set_lp_guard):
+            set_lp_guard(self.lp_mutation_allowed)
         self._threads: dict[str, threading.Thread] = {}
         self._clock = time.monotonic
         self._sleep = time.sleep
         self._predict_snapshot_lock = threading.RLock()
         self._predict_snapshot_cache: dict[str, object] | None = None
         self._last_zero_landing_summary: dict[str, object] | None = None
+
+    def lp_preview(self, request: Mapping[str, object]) -> dict[str, object]:
+        """Run the LP read-only preflight through the production collaborator."""
+
+        service = self._lp
+        preview = getattr(service, "preview", None)
+        if not callable(preview):
+            return {"state": "rejected", "reason": "lp_unavailable"}
+        return preview(request)
+
+    def lp_status(self, session_id: str | None = None) -> dict[str, object]:
+        service = self._lp
+        status = getattr(service, "status", None)
+        if not callable(status):
+            return {"state": "none", "session_id": None, "reason": "lp_unavailable"}
+        return status(session_id)
+
+    def lp_start(self, preview_id: str, idempotency_key: str) -> dict[str, object]:
+        """Start one LP session under the shared execution mutex."""
+
+        service = self._lp
+        start = getattr(service, "start", None)
+        if not callable(start):
+            return {"state": "rejected", "reason": "lp_unavailable"}
+        key = str(idempotency_key).strip()
+        if not key:
+            return {"state": "rejected", "reason": "idempotency_key_required"}
+        existing = self._store.lp_session_by_idempotency(key)
+        if existing is not None:
+            return self.lp_status(str(existing["session_id"]))
+        if self._breaker_is_open():
+            return {"state": "locked", "reason": "circuit_breaker_open"}
+        active_lp = self._store.lp_active_session()
+        if active_lp is not None:
+            return {
+                "state": "busy",
+                "reason": "active_lp_session",
+                "session_id": active_lp.get("session_id"),
+            }
+        active = self._store.active_execution()
+        if active is not None:
+            return {
+                "state": "busy",
+                "reason": "active_execution",
+                "execution_id": active.get("execution_id"),
+            }
+        lock = self._acquire_global_lock()
+        if lock is None:
+            active_lp = self._store.lp_active_session()
+            if active_lp is not None:
+                return {
+                    "state": "busy",
+                    "reason": "active_lp_session",
+                    "session_id": active_lp.get("session_id"),
+                }
+            return {"state": "busy", "reason": "execution_lock"}
+        try:
+            existing = self._store.lp_session_by_idempotency(key)
+            if existing is not None:
+                return self.lp_status(str(existing["session_id"]))
+            active_lp = self._store.lp_active_session()
+            if active_lp is not None:
+                return {
+                    "state": "busy",
+                    "reason": "active_lp_session",
+                    "session_id": active_lp.get("session_id"),
+                }
+            active = self._store.active_execution()
+            if active is not None:
+                return {
+                    "state": "busy",
+                    "reason": "active_execution",
+                    "execution_id": active.get("execution_id"),
+                }
+            return start(str(preview_id), key)
+        finally:
+            self._release_global_lock(lock)
+
+    def lp_stop(self, session_id: str | None = None) -> dict[str, object]:
+        """Cancel only this LP session's open orders under the shared mutex."""
+
+        service = self._lp
+        stop = getattr(service, "stop", None)
+        if not callable(stop):
+            return {"state": "none", "session_id": None, "reason": "lp_unavailable"}
+        lock = self._acquire_global_lock()
+        if lock is None:
+            return {"state": "busy", "reason": "execution_lock"}
+        try:
+            return stop(session_id)
+        finally:
+            self._release_global_lock(lock)
+
+    def lp_tick(self) -> dict[str, object]:
+        """Run one LP reconciliation iteration under the shared mutex."""
+
+        service = self._lp
+        tick = getattr(service, "tick", None)
+        if not callable(tick):
+            return {"state": "none", "session_id": None, "reason": "lp_unavailable"}
+        lock = self._acquire_global_lock()
+        if lock is None:
+            return {"state": "busy", "reason": "execution_lock"}
+        try:
+            return tick()
+        finally:
+            self._release_global_lock(lock)
 
     def set_cross_venue_monitor(self, monitor: object) -> None:
         self._cross_venue_monitor = monitor
@@ -1580,6 +1695,14 @@ class PredictionExecutionService:
             if existing is not None:
                 return existing
             return {"state": "locked", "reason": "circuit_breaker_open"}
+        lp_active_reader = getattr(self._store, "lp_active_session", None)
+        lp_active = lp_active_reader() if callable(lp_active_reader) else None
+        if lp_active is not None:
+            return {
+                "state": "busy",
+                "reason": "active_lp_session",
+                "session_id": lp_active.get("session_id"),
+            }
         active = self._store.active_execution()
         if active is not None:
             return {
@@ -1590,6 +1713,14 @@ class PredictionExecutionService:
         lock = self._acquire_global_lock()
         if lock is None:
             active = self._store.active_execution()
+            lp_active_reader = getattr(self._store, "lp_active_session", None)
+            lp_active = lp_active_reader() if callable(lp_active_reader) else None
+            if lp_active is not None:
+                return {
+                    "state": "busy",
+                    "reason": "active_lp_session",
+                    "session_id": lp_active.get("session_id"),
+                }
             if active is not None:
                 if str(active.get("idempotency_key", "")) == key:
                     return self._decorate_execution(active)
@@ -1608,6 +1739,15 @@ class PredictionExecutionService:
                 self._release_global_lock(lock)
                 return existing
             active = self._store.active_execution()
+            lp_active_reader = getattr(self._store, "lp_active_session", None)
+            lp_active = lp_active_reader() if callable(lp_active_reader) else None
+            if lp_active is not None:
+                self._release_global_lock(lock)
+                return {
+                    "state": "busy",
+                    "reason": "active_lp_session",
+                    "session_id": lp_active.get("session_id"),
+                }
             if active is not None:
                 self._release_global_lock(lock)
                 if str(active.get("idempotency_key", "")) == key:
@@ -1941,6 +2081,53 @@ class PredictionExecutionService:
             return {"state": "locked", "reason": "account_unavailable"}
         if self._store.unacknowledged_incident() is not None:
             return {"state": "locked", "reason": "unacknowledged_incident"}
+
+        # An LP session owns its target order and inventory across process
+        # restarts.  Reconcile it before the legacy startup cleanup below so
+        # a still-live LP order is never mistaken for a foreign order and
+        # canceled by the pair-execution recovery path.
+        lp_active_reader = getattr(self._store, "lp_active_session", None)
+        lp_active = lp_active_reader() if callable(lp_active_reader) else None
+        if lp_active is not None:
+            lp_tick = getattr(self._lp, "tick", None)
+            if not callable(lp_tick):
+                return {
+                    "state": "locked",
+                    "reason": "active_lp_service_unavailable",
+                    "session_id": lp_active.get("session_id"),
+                }
+            try:
+                lp_result = lp_tick()
+            except Exception:
+                return {
+                    "state": "locked",
+                    "reason": "active_lp_reconciliation_failed",
+                    "session_id": lp_active.get("session_id"),
+                }
+            refreshed_lp = lp_active_reader() if callable(lp_active_reader) else lp_active
+            lp_state = str((refreshed_lp or lp_result).get("state", ""))
+            if lp_state not in {"complete", "entry_rejected"}:
+                if not self._relayer_ready():
+                    return {"state": "locked", "reason": "readiness_unavailable"}
+                if not self._notification_channels_ready():
+                    return {
+                        "state": "locked",
+                        "reason": "notification_config_unavailable",
+                    }
+                self._breaker_open = False
+                self._store.write_runtime(
+                    {
+                        "prediction_arbitrage": "ready",
+                        "reconciled_at": _timestamp(_utc_now()),
+                        "readiness": "lp_active",
+                        "lp_session_id": lp_active.get("session_id"),
+                    }
+                )
+                return {
+                    "state": "ready",
+                    "readiness": "lp_active",
+                    "lp": lp_result,
+                }
 
         active = self._store.active_execution()
         active_id = str(active.get("execution_id", "")) if active else ""
@@ -6747,6 +6934,12 @@ class PredictionExecutionService:
         if self._breaker_open:
             return True
         return self._store.unacknowledged_incident() is not None
+
+    def lp_mutation_allowed(self, action: str = "submit") -> bool:
+        """Expose the existing execution breaker to LP exchange writes."""
+
+        del action
+        return not self._breaker_is_open()
 
     def _acquire_global_lock(self) -> tuple[threading.Lock, Any] | None:
         if not self._process_lock.acquire(False):

@@ -5461,6 +5461,53 @@ const sandbox = { document: { addEventListener() {} }, console, URLSearchParams 
     return result.stdout
 
 
+def test_lp_card_shows_market_scoring_and_residual() -> None:
+    output = run_dashboard_js(r'''
+const base = {
+  market_title: "Will it happen?", outcome: "YES", state: "review",
+  entry_order_id: "buy-1", passive_exit_order_id: "sell-1",
+  buy_filled_quantity: "15", quantity: "20", sold_quantity: "3",
+  sold_revenue: "0.93", residual_quantity: "12", residual_exit_value: "3.24",
+  stop_loss_latched: false, opening_loss: "1.20", trade_pnl: "-0.37",
+  reward_status: "unknown", reward_amount: null, total_pnl: null,
+  review_at: "2026-09-15T00:00:00Z",
+};
+const cards = {
+  true: predictionLpCard({lp_session: {...base, scoring_status: "true", scoring_checked_at: "2026-09-14T12:01:00Z"}}),
+  false: predictionLpCard({lp_session: {...base, scoring_status: "false", scoring_checked_at: "2026-09-14T12:02:00Z"}}),
+  unknown: predictionLpCard({lp_session: {...base, scoring_status: "unknown", scoring_checked_at: "2026-09-14T12:03:00Z"}}),
+};
+console.log(JSON.stringify({
+  market: cards.unknown.includes("Will it happen?") && cards.unknown.includes("YES"),
+  stage: cards.unknown.includes("待复盘"),
+  trueScoring: cards.true.includes("计分中"),
+  falseScoring: cards.false.includes("未计分"),
+  unknownScoring: cards.unknown.includes("UNKNOWN"),
+  checkedTime: cards.unknown.includes("2026"),
+  entryRole: cards.unknown.includes("BUY · buy-1"),
+  exitRole: cards.unknown.includes("SELL · sell-1"),
+  inventory: ["15", "3", "12"].every((value) => cards.unknown.includes(value)),
+  pnl: cards.unknown.includes("0.37"),
+  review: cards.unknown.includes("复盘时间"),
+  residualStillVisible: !cards.unknown.includes("已完成"),
+}));
+''')
+    assert json.loads(output) == {
+        "market": True,
+        "stage": True,
+        "trueScoring": True,
+        "falseScoring": True,
+        "unknownScoring": True,
+        "checkedTime": True,
+        "entryRole": True,
+        "exitRole": True,
+        "inventory": True,
+        "pnl": True,
+        "review": True,
+        "residualStillVisible": True,
+    }
+
+
 def test_dashboard_display_number_formats_numeric_text_only() -> None:
     output = run_dashboard_js(r'''
 console.log(JSON.stringify({

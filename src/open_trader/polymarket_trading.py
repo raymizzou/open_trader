@@ -488,6 +488,160 @@ def _model_dict(value: object) -> Mapping[str, object] | None:
     return None
 
 
+def _lp_decimal(value: object) -> Decimal | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def _lp_level(value: object) -> dict[str, object] | None:
+    row = _model_dict(value)
+    if row is None:
+        return None
+    price = _lp_decimal(row.get("price"))
+    size = _lp_decimal(row.get("size"))
+    if price is None or size is None:
+        return None
+    return {"price": price, "size": size}
+
+
+def _lp_book(value: object) -> dict[str, object] | None:
+    row = _model_dict(value)
+    if row is None:
+        return None
+    bids: dict[Decimal, Decimal] = {}
+    asks: dict[Decimal, Decimal] = {}
+    for field, target in (("bids", bids), ("asks", asks)):
+        raw_levels = row.get(field)
+        if not isinstance(raw_levels, Sequence) or isinstance(raw_levels, (str, bytes)):
+            return None
+        for raw_level in raw_levels:
+            level = _lp_level(raw_level)
+            if level is None:
+                continue
+            price = cast(Decimal, level["price"])
+            size = cast(Decimal, level["size"])
+            if price <= 0 or size <= 0:
+                continue
+            target[price] = target.get(price, Decimal("0")) + size
+    timestamp = _venue_timestamp(row.get("timestamp"))
+    return {
+        "market": row.get("condition_id", row.get("market")),
+        "condition_id": row.get("condition_id", row.get("market")),
+        "token_id": row.get("token_id", row.get("asset_id")),
+        "timestamp": timestamp,
+        "bids": [
+            {"price": price, "size": size}
+            for price, size in sorted(bids.items())
+        ],
+        "asks": [
+            {"price": price, "size": size}
+            for price, size in sorted(asks.items())
+        ],
+        "min_order_size": _lp_decimal(row.get("min_order_size")),
+        "tick_size": _lp_decimal(row.get("tick_size")),
+        "neg_risk": row.get("neg_risk"),
+        "last_trade_price": _lp_decimal(row.get("last_trade_price")),
+        "hash": row.get("hash"),
+    }
+
+
+def _lp_order(value: object) -> dict[str, object] | None:
+    row = _model_dict(value)
+    if row is None:
+        return None
+    order_id = row.get("id", row.get("order_id"))
+    token_id = row.get("token_id", row.get("asset_id"))
+    if order_id in (None, "") or token_id in (None, ""):
+        return None
+    original_size = _lp_decimal(row.get("original_size", row.get("size")))
+    matched = _lp_decimal(row.get("size_matched", row.get("matched_amount")))
+    if original_size is None:
+        original_size = Decimal("0")
+    if matched is None:
+        matched = Decimal("0")
+    return {
+        "id": str(order_id),
+        "order_id": str(order_id),
+        "market": row.get("condition_id", row.get("market")),
+        "condition_id": row.get("condition_id", row.get("market")),
+        "token_id": str(token_id),
+        "asset_id": str(token_id),
+        "side": str(row.get("side", "")).upper(),
+        "price": _lp_decimal(row.get("price")),
+        "original_size": original_size,
+        "size_matched": matched,
+        "remaining_size": max(Decimal("0"), original_size - matched),
+        "size": max(Decimal("0"), original_size - matched),
+        "outcome": row.get("outcome"),
+        "order_type": row.get("order_type"),
+        "status": str(row.get("status", "")).upper(),
+        "expiration": row.get("expiration", row.get("expires_at")),
+        "created_at": _venue_timestamp(row.get("created_at")),
+    }
+
+
+def _lp_maker_order(value: object) -> dict[str, object] | None:
+    row = _model_dict(value)
+    if row is None:
+        return None
+    order_id = row.get("order_id", row.get("id"))
+    token_id = row.get("token_id", row.get("asset_id"))
+    if order_id in (None, "") or token_id in (None, ""):
+        return None
+    return {
+        "order_id": str(order_id),
+        "token_id": str(token_id),
+        "asset_id": str(token_id),
+        "side": str(row.get("side", "")).upper(),
+        "price": _lp_decimal(row.get("price")),
+        "matched_amount": _lp_decimal(row.get("matched_amount", row.get("size"))),
+        "fee_rate_bps": _lp_decimal(row.get("fee_rate_bps")),
+    }
+
+
+def _lp_trade(value: object) -> dict[str, object] | None:
+    row = _model_dict(value)
+    if row is None:
+        return None
+    trade_id = row.get("id", row.get("trade_id"))
+    token_id = row.get("token_id", row.get("asset_id"))
+    if trade_id in (None, "") or token_id in (None, ""):
+        return None
+    makers: list[dict[str, object]] = []
+    raw_makers = row.get("maker_orders", ())
+    if isinstance(raw_makers, Sequence) and not isinstance(raw_makers, (str, bytes)):
+        for maker in raw_makers:
+            normalized = _lp_maker_order(maker)
+            if normalized is not None:
+                makers.append(normalized)
+    status = str(row.get("status", "")).upper()
+    if status.startswith("TRADE_STATUS_"):
+        status = status[len("TRADE_STATUS_") :]
+    return {
+        "id": str(trade_id),
+        "trade_id": str(trade_id),
+        "market": row.get("condition_id", row.get("market")),
+        "condition_id": row.get("condition_id", row.get("market")),
+        "token_id": str(token_id),
+        "asset_id": str(token_id),
+        "taker_order_id": str(row.get("taker_order_id", "")),
+        "side": str(row.get("side", "")).upper(),
+        "trader_side": str(row.get("trader_side", "")).upper(),
+        "price": _lp_decimal(row.get("price")),
+        "size": _lp_decimal(row.get("size")),
+        "status": status,
+        "fee_rate_bps": _lp_decimal(row.get("fee_rate_bps")),
+        "maker_orders": makers,
+        "matched_at": _trade_timestamp(row),
+        "updated_at": _venue_timestamp(row.get("updated_at", row.get("last_update"))),
+    }
+
+
 def _venue_timestamp(value: object) -> datetime | None:
     if isinstance(value, datetime):
         moment = value
@@ -652,6 +806,226 @@ class PolymarketTradingClient:
             code = _safe_error_code(exc)
             del exc
             raise PolymarketTradingError(code) from None
+
+    def lp_snapshot(self, request: Mapping[str, object]) -> dict[str, object]:
+        """Read the authenticated and public facts used by one LP session.
+
+        This adapter deliberately returns order, trade, position, market and
+        book facts rather than a precomputed LP result.  The LP service owns
+        attribution and risk arithmetic after these facts have been read.
+        """
+
+        market_id = str(request.get("market_id") or "")
+        condition_id = str(request.get("condition_id") or "")
+        token_id = str(request.get("token_id") or "")
+        if not market_id or not condition_id or not token_id:
+            raise ValueError("external_snapshot_unknown")
+        try:
+            account = self.account_snapshot()
+            open_orders = tuple(_collect(self._client.list_open_orders()))
+            trades = tuple(
+                _collect(
+                    self._client.list_account_trades(
+                        token_id=token_id,
+                        market=condition_id,
+                    )
+                )
+            )
+            order_facts: list[object] = list(open_orders)
+            known_ids = {
+                str(_field(order, "id", _field(order, "order_id", "")))
+                for order in order_facts
+            }
+            for key in ("entry_order_id", "passive_exit_order_id", "protected_exit_order_id"):
+                order_id = str(request.get(key) or "")
+                if not order_id or order_id in known_ids:
+                    continue
+                get_order = getattr(self._client, "get_order", None)
+                if not callable(get_order):
+                    continue
+                try:
+                    order = get_order(order_id=order_id)
+                except Exception:
+                    continue
+                order_facts.append(order)
+                known_ids.add(order_id)
+
+            public = self._public_client_factory()
+            try:
+                market_model = public.get_market(id=market_id)
+                book_model = public.get_order_book(token_id=token_id)
+                # Capture local receipt time at the successful REST boundary;
+                # the venue timestamp remains source metadata on the book.
+                book_received_at = datetime.now(UTC)
+            finally:
+                close = getattr(public, "close", None)
+                if callable(close):
+                    close()
+            market = _model_dict(market_model)
+            book = _lp_book(book_model)
+            if market is None or book is None:
+                raise ValueError("external_snapshot_unknown")
+            book["received_at"] = book_received_at
+            state = _model_dict(market.get("state")) or {}
+            outcomes = _model_dict(market.get("outcomes")) or {}
+            selected = str(request.get("outcome") or "").lower()
+            selected_outcome = _model_dict(outcomes.get(selected)) or {}
+            trading = _model_dict(market.get("trading")) or {}
+            rewards = _model_dict(market.get("rewards")) or {}
+            fee_schedule = _model_dict(trading.get("fee_schedule")) or {}
+            fees_enabled = trading.get("fees_enabled")
+            reward_min = rewards.get("rewards_min_size")
+            reward_spread = rewards.get("rewards_max_spread")
+            if reward_min is None or reward_spread is None:
+                reward_reader = getattr(self._client, "list_market_rewards", None)
+                if callable(reward_reader):
+                    reward_rows = tuple(_collect(reward_reader(condition_id=condition_id)))
+                    if reward_rows:
+                        reward = _model_dict(reward_rows[0]) or {}
+                        reward_min = reward.get("rewards_min_size")
+                        reward_spread = reward.get("rewards_max_spread")
+            tick_size = book.get("tick_size", trading.get("minimum_tick_size"))
+            minimum_order_size = book.get("min_order_size", trading.get("minimum_order_size"))
+            taker_rate = fee_schedule.get("rate")
+            if taker_rate is None:
+                taker_rate = market.get("taker_fee_rate")
+            if taker_rate is None and fees_enabled is not False:
+                raise ValueError("fee_rate_unknown")
+            raw_reward_spread = _lp_decimal(reward_spread)
+            normalized_reward_spread = (
+                None
+                if raw_reward_spread is None
+                else raw_reward_spread / Decimal("100")
+            )
+            fee_value: Decimal | None
+            if fees_enabled is False or fee_schedule.get("taker_only") is True:
+                fee_value = Decimal("0")
+            else:
+                fee_value = None
+            market_facts = {
+                "market_id": market.get("id"),
+                "condition_id": market.get("condition_id"),
+                "token_id": selected_outcome.get("token_id"),
+                "outcome": str(
+                    selected_outcome.get("label") or request.get("outcome") or ""
+                ).upper(),
+                "accepting_orders": state.get("accepting_orders"),
+                "exchange_type": "CLOB",
+                "tick_size": _lp_decimal(tick_size),
+                "minimum_order_size": _lp_decimal(minimum_order_size),
+                "fee": fee_value,
+                "fees_enabled": fees_enabled,
+                "fee_exponent": _lp_decimal(fee_schedule.get("exponent", 1)),
+                "taker_fee_rate": _lp_decimal(taker_rate),
+                "reward_min_size": _lp_decimal(reward_min),
+                "reward_max_spread": normalized_reward_spread,
+            }
+            account_facts = {
+                "authenticated": True,
+                "balance": account.p_usd_balance,
+                "allowance": account.p_usd_allowance,
+                "positions": list(account.positions),
+                "open_orders": [
+                    normalized
+                    for order in order_facts
+                    if (normalized := _lp_order(order)) is not None
+                ],
+                "checked_at": account.checked_at,
+            }
+            order_rows = [
+                normalized
+                for order in order_facts
+                if (normalized := _lp_order(order)) is not None
+            ]
+            order_ids = {
+                str(request.get(key) or "")
+                for key in ("entry_order_id", "passive_exit_order_id", "protected_exit_order_id")
+            } - {""}
+            order_statuses = {
+                str(_field(order, "id", _field(order, "order_id", ""))): str(
+                    _field(order, "status", "")
+                ).upper()
+                for order in order_rows
+            }
+            orders_terminal = not order_ids or all(
+                order_statuses.get(order_id) in {
+                    "FILLED",
+                    "MATCHED",
+                    "CANCELED",
+                    "CANCELLED",
+                    "REJECTED",
+                    "EXPIRED",
+                    "FAILED",
+                }
+                for order_id in order_ids
+            )
+            trade_rows = [
+                normalized
+                for trade in trades
+                if (normalized := _lp_trade(trade)) is not None
+            ]
+            result: dict[str, object] = {
+                "account": account_facts,
+                "market": market_facts,
+                "book": book,
+                "orders": order_rows,
+                "trades": trade_rows,
+                "orders_terminal": orders_terminal,
+                "position_flat": not any(
+                    str(_field(position, "token_id", _field(position, "asset_id", "")))
+                    == token_id
+                    and (_decimal(_field(position, "size", 0)) > 0)
+                    for position in account.positions
+                ),
+                "account_checked_at": account.checked_at,
+                "book_checked_at": book.get("received_at"),
+            }
+            return result
+        except PolymarketTradingError:
+            raise ValueError("external_snapshot_unknown") from None
+        except ValueError:
+            raise
+        except Exception:
+            raise ValueError("external_snapshot_unknown") from None
+
+    def lp_create_limit_order(self, **kwargs: object) -> object:
+        """Create one explicit post-only GTD signed LP order."""
+
+        expiration = kwargs.get("expiration")
+        post_only = kwargs.get("post_only")
+        signed = self._client.create_limit_order(
+            token_id=str(kwargs["token_id"]),
+            price=cast(Decimal, kwargs["price"]),
+            size=cast(Decimal, kwargs["quantity"]),
+            side=cast(str, kwargs["side"]),
+            post_only=post_only is True,
+            expiration=cast(int | None, expiration),
+        )
+        if post_only is not True or expiration is None:
+            raise PolymarketTradingError("order_shape_mismatch")
+        if _field(signed, "post_only") is not True or str(_field(signed, "order_type", "")).upper() != "GTD":
+            raise PolymarketTradingError("order_shape_mismatch")
+        return signed
+
+    def lp_post_order(self, signed_order: object) -> object:
+        return self._client.post_order(signed_order)
+
+    def get_order_scoring(self, order_id: str) -> bool:
+        return self._client.get_order_scoring(order_id=order_id) is True
+
+    def submit_protected_sell(
+        self, *, token_id: str, quantity: Decimal, min_price: Decimal
+    ) -> object:
+        if min_price <= 0 or quantity <= 0:
+            raise ValueError("protected_exit_floor_invalid")
+        signed = self._client.create_market_order(
+            token_id=token_id,
+            side="SELL",
+            shares=quantity,
+            min_price=min_price,
+            order_type="FOK",
+        )
+        return self._client.post_order(signed)
 
     def _collateral_balance_allowance(self) -> tuple[Decimal, Decimal]:
         balance = self._client.get_balance_allowance(asset_type="COLLATERAL")

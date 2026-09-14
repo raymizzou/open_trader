@@ -451,6 +451,7 @@ def create_prediction_server(
                 "/api/prediction-arbitrage/history",
                 "/api/prediction-arbitrage/n-leg/mode",
                 "/api/prediction-arbitrage/n-leg/report",
+                "/api/prediction-arbitrage/lp/sessions/current",
             }:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return
@@ -463,31 +464,67 @@ def create_prediction_server(
                 self._send_unavailable()
                 return
             if parsed.path == "/api/prediction-arbitrage/state":
+                state_payload = prediction_state_payload(
+                    store=getattr(runtime, "store", None),
+                    monitor=getattr(runtime, "monitor", None),
+                    execution=getattr(runtime, "execution", None),
+                    csrf_token="" if mode == "shadow" else prediction_csrf,
+                    cross_venue_monitor=getattr(runtime, "cross_venue_monitor", None),
+                    relation_catalog=getattr(runtime, "relation_catalog", None),
+                    n_leg_solutions=getattr(
+                        runtime, "n_leg_solutions", lambda: []
+                    )(),
+                    n_leg_episodes=getattr(
+                        runtime, "n_leg_episodes", lambda: {}
+                    )(),
+                    n_leg_metrics=getattr(
+                        runtime, "n_leg_metrics", lambda: {}
+                    )(),
+                    observation_snapshot=getattr(
+                        runtime, "observation_snapshot", lambda: None
+                    )(),
+                    legacy_retired=getattr(runtime, "legacy_retired", False) is True,
+                )
+                execution = getattr(runtime, "execution", None)
+                lp_status = getattr(execution, "lp_status", None)
+                if callable(lp_status):
+                    try:
+                        status_payload = lp_status()
+                    except Exception as exc:
+                        status_payload = {
+                            "state": "error",
+                            "error": type(exc).__name__,
+                        }
+                    if isinstance(status_payload, Mapping):
+                        safe_status_payload = _prediction_safe_value(status_payload)
+                        if not isinstance(safe_status_payload, Mapping):
+                            safe_status_payload = {"state": "error"}
+                        state_payload = {
+                            **state_payload,
+                            "lp_session": dict(safe_status_payload),
+                        }
                 self._send_json(
                     HTTPStatus.OK,
-                    prediction_state_payload(
-                        store=getattr(runtime, "store", None),
-                        monitor=getattr(runtime, "monitor", None),
-                        execution=getattr(runtime, "execution", None),
-                        csrf_token="" if mode == "shadow" else prediction_csrf,
-                        cross_venue_monitor=getattr(runtime, "cross_venue_monitor", None),
-                        relation_catalog=getattr(runtime, "relation_catalog", None),
-                        n_leg_solutions=getattr(
-                            runtime, "n_leg_solutions", lambda: []
-                        )(),
-                        n_leg_episodes=getattr(
-                            runtime, "n_leg_episodes", lambda: {}
-                        )(),
-                        n_leg_metrics=getattr(
-                            runtime, "n_leg_metrics", lambda: {}
-                        )(),
-                        observation_snapshot=getattr(
-                            runtime, "observation_snapshot", lambda: None
-                        )(),
-                        legacy_retired=getattr(runtime, "legacy_retired", False) is True,
-                    ),
+                    state_payload,
                     set_session=mode == "production",
                 )
+                return
+            if parsed.path == "/api/prediction-arbitrage/lp/sessions/current":
+                execution = getattr(runtime, "execution", None)
+                if execution is None or not callable(getattr(execution, "lp_status", None)):
+                    self._send_json(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        {"error": "LP execution service is unavailable"},
+                    )
+                    return
+                try:
+                    result = execution.lp_status()
+                    safe_result = _prediction_safe_value(result)
+                    if not isinstance(safe_result, Mapping):
+                        raise RuntimeError("LP status result is invalid")
+                    self._send_json(HTTPStatus.OK, safe_result)
+                except (sqlite3.Error, OSError, RuntimeError) as exc:
+                    self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
                 return
             if parsed.path == "/api/prediction-arbitrage/n-leg/mode":
                 try:
@@ -676,6 +713,14 @@ def create_prediction_server(
                 except (sqlite3.Error, OSError, RuntimeError) as exc:
                     self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
                 return
+            lp_preview_path = "/api/prediction-arbitrage/lp/preview"
+            lp_sessions_prefix = "/api/prediction-arbitrage/lp/sessions/"
+            lp_start_path = "/api/prediction-arbitrage/lp/sessions"
+            lp_stop_session: str | None = None
+            if path.startswith(lp_sessions_prefix) and path.endswith("/stop"):
+                candidate = path[len(lp_sessions_prefix) : -len("/stop")]
+                if candidate and "/" not in candidate:
+                    lp_stop_session = candidate
             execution_mutation = path in {
                 "/api/prediction-arbitrage/preview",
                 "/api/prediction-arbitrage/executions",
@@ -694,7 +739,9 @@ def create_prediction_server(
                 "/api/prediction-arbitrage/n-leg/incidents/acknowledge",
                 "/api/prediction-arbitrage/n-leg/circuit-breaker/reset",
                 "/api/prediction-arbitrage/llm-provider",
-            }:
+                lp_preview_path,
+                lp_start_path,
+            } and lp_stop_session is None:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return
             try:
@@ -726,6 +773,31 @@ def create_prediction_server(
                     )
                     self._send_json(HTTPStatus.OK, _llm_provider_payload(runtime))
                     return
+                elif path == lp_preview_path:
+                    request_payload: Mapping[str, object]
+                    if set(payload) == {"request"} and isinstance(payload.get("request"), Mapping):
+                        request_payload = payload["request"]  # type: ignore[assignment]
+                    else:
+                        request_payload = payload
+                    lp_preview = getattr(execution, "lp_preview", None)
+                    if not callable(lp_preview):
+                        raise RuntimeError("LP execution service is unavailable")
+                    result = lp_preview(request_payload)
+                elif path == lp_start_path:
+                    self._require_schema(payload, {"preview_id", "idempotency_key"})
+                    lp_start = getattr(execution, "lp_start", None)
+                    if not callable(lp_start):
+                        raise RuntimeError("LP execution service is unavailable")
+                    result = lp_start(
+                        self._required_string(payload, "preview_id"),
+                        self._required_string(payload, "idempotency_key"),
+                    )
+                elif lp_stop_session is not None:
+                    self._require_schema(payload, set())
+                    lp_stop = getattr(execution, "lp_stop", None)
+                    if not callable(lp_stop):
+                        raise RuntimeError("LP execution service is unavailable")
+                    result = lp_stop(lp_stop_session)
                 elif path.endswith("/preview"):
                     self._require_schema(payload, {"opportunity_id"})
                     result = execution.preview(

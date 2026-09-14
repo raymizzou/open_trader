@@ -3,6 +3,30 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-09-14
+
+- Reconciled latched LP exits against the current protected order's confirmed
+  fills and actual position before issuing another FOK, while retaining the
+  latch through review with partial depth. Durable unresolved BUY/SELL submit
+  intents now block completion and cross-role retries across restart. Verified
+  with the four W9 lifecycle cases and the focused LP regression; no live
+  orders or runtime deployment were performed.
+- Tightened LP recovery and completion handling: latched stop exits never
+  reopen passive quotes, uncertain submissions and cancellation acknowledgements
+  remain actionable for reconciliation, scoring follows the current order and
+  bounded freshness, and a flat session can complete while unknown fees keep
+  trading and net economics `UNKNOWN`. Verified with the W8 LP regressions and
+  focused Docker checks; no live orders or runtime deployment were performed.
+- Added the single-market Polymarket LP session lifecycle: fixed post-only GTD
+  entry, scoring and fill reconciliation, passive or latched `$5` stop-loss
+  exits, cancel-and-review at an absolute review time, durable restart state,
+  and idempotent preview/start/stop API routes. The read-only Dashboard card
+  shows market, outcome, order role, scoring freshness, inventory, exit state,
+  and known versus unknown economics. LP and N_LEG admissions now share one
+  SQLite active slot, including real concurrent store coverage. Focused LP,
+  adapter, store, execution, service, runtime, read-only, and Dashboard tests
+  pass; no live orders or runtime deployment were performed.
+
 ## 2026-09-12
 
 - Put market names, net return and result freshness first in the read-only

@@ -335,6 +335,108 @@ def test_runtime_owner_lock_rejects_a_second_owner_until_release(
     second.release()
 
 
+def test_lp_restart_owns_one_session_and_preserves_monitoring(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A restart resumes the durable session without starting a second loop."""
+
+    import open_trader.prediction_runtime as runtime_module
+
+    store = PredictionArbitrageStore(tmp_path)
+    store.lp_create_session(
+        "lp-session",
+        "lp-key",
+        state="entry_open",
+        payload={
+            "market_id": "market-1",
+            "token_id": "token-1",
+            "outcome": "YES",
+            "quantity": Decimal("10"),
+            "residual_quantity": Decimal("5"),
+            "review_at": "2026-09-15T00:00:00Z",
+            "scoring_status": "unknown",
+        },
+    )
+
+    class FakeLP:
+        def __init__(self) -> None:
+            self.tick_calls = 0
+            self.session_ids: list[str] = []
+            self.tick_seen = threading.Event()
+
+        def tick(self) -> dict[str, object]:
+            active = store.lp_active_session()
+            assert active is not None
+            self.tick_calls += 1
+            self.session_ids.append(str(active["session_id"]))
+            self.tick_seen.set()
+            return {"state": str(active["state"]), "session_id": active["session_id"]}
+
+    class FakeExecution:
+        def __init__(self, lp: FakeLP) -> None:
+            self.lp = lp
+
+        def lp_tick(self) -> dict[str, object]:
+            return self.lp.tick()
+
+    first = PredictionRuntime(
+        data_dir=tmp_path,
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+    )
+    second = PredictionRuntime(
+        data_dir=tmp_path,
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+    )
+    first_lp = FakeLP()
+    second_lp = FakeLP()
+    first.store = store
+    first.lp = first_lp  # type: ignore[assignment]
+    first.execution = FakeExecution(first_lp)  # type: ignore[assignment]
+    second.store = store
+    second.lp = second_lp  # type: ignore[assignment]
+    second.execution = FakeExecution(second_lp)  # type: ignore[assignment]
+    monkeypatch.setattr(runtime_module, "_LP_TICK_SECONDS", 0.01)
+
+    try:
+        first._owner.acquire()
+        first._start_lp_monitor()
+        first_thread = first._lp_thread
+        assert first_thread is not None
+        assert first_lp.tick_seen.wait(timeout=2)
+        first._start_lp_monitor()
+        assert first._lp_thread is first_thread
+        assert first_lp.session_ids == ["lp-session"]
+        assert store.lp_active_session()["session_id"] == "lp-session"  # type: ignore[index]
+
+        with pytest.raises(PredictionRuntimeOwnershipError):
+            second._owner.acquire()
+        assert store.lp_active_session()["session_id"] == "lp-session"  # type: ignore[index]
+
+        first._lp_stop_event.set()
+        first_thread.join(timeout=2)
+        assert not first_thread.is_alive()
+        first._lp_thread = None
+        first._owner.release()
+
+        second._owner.acquire()
+        second._start_lp_monitor()
+        second_thread = second._lp_thread
+        assert second_thread is not None
+        assert second_lp.tick_seen.wait(timeout=2)
+        assert second_lp.session_ids == ["lp-session"]
+        assert store.lp_active_session()["session_id"] == "lp-session"  # type: ignore[index]
+    finally:
+        for runtime in (first, second):
+            runtime._lp_stop_event.set()
+            thread = runtime._lp_thread
+            if thread is not None:
+                thread.join(timeout=2)
+                runtime._lp_thread = None
+            runtime._owner.release()
+
+
 def test_runtime_owner_lock_excludes_a_real_second_process(tmp_path: Path) -> None:
     context = multiprocessing.get_context("spawn")
     path = tmp_path / "prediction_arbitrage" / "runtime.lock"

@@ -3022,7 +3022,61 @@ function predictionNLegIncidentPanel(payload) {
 function predictionUnifiedPage(payload, filter) {
   const viewPayload = payload || {status: "loading", events: [], opportunities: []};
   const filterState = state.predictionMarket.filter || {engine: "all", kind: "all", legs: null, scope: null};
-  return `${predictionUnifiedPageHeader(viewPayload)}${predictionModeBar(viewPayload)}${predictionNLegIncidentPanel(viewPayload)}${predictionNLegMetrics(viewPayload)}${predictionReadinessStrip(viewPayload)}${predictionCapitalUsage(viewPayload)}${predictionObservationCoverage(viewPayload)}${predictionUnifiedOpportunityList(viewPayload, filterState)}${predictionRelationReview(viewPayload)}${predictionErrorAlert()}${predictionExecutionAlert(viewPayload)}${relationReviewDrawer()}${nlegReportDrawer()}`;
+  return `${predictionUnifiedPageHeader(viewPayload)}${predictionLpCard(viewPayload)}${predictionModeBar(viewPayload)}${predictionNLegIncidentPanel(viewPayload)}${predictionNLegMetrics(viewPayload)}${predictionReadinessStrip(viewPayload)}${predictionCapitalUsage(viewPayload)}${predictionObservationCoverage(viewPayload)}${predictionUnifiedOpportunityList(viewPayload, filterState)}${predictionRelationReview(viewPayload)}${predictionErrorAlert()}${predictionExecutionAlert(viewPayload)}${relationReviewDrawer()}${nlegReportDrawer()}`;
+}
+
+function predictionLpCard(payload) {
+  const source = payload?.lp_session && typeof payload.lp_session === "object"
+    ? payload.lp_session
+    : payload?.lp && typeof payload.lp === "object"
+      ? payload.lp
+      : null;
+  const queryError = payload?.lp_error || source?.error;
+  if (queryError) {
+    return `<section class="pm-panel pm-lp-card" aria-label="LP 会话"><header class="pm-panel-heading"><div><h2>流动性提供试验</h2><p>单市场 · 单次开仓</p></div><span class="pm-pill pm-tone-danger">查询错误</span></header><div class="pm-alert danger" role="alert"><div class="pm-alert-body"><strong>LP 状态暂不可用</strong><p>${escapeHtml(predictionValue(queryError, "数据未返回"))}</p></div></div></section>`;
+  }
+  if (!source || String(source.state || "").toLowerCase() === "none") {
+    return `<section class="pm-panel pm-lp-card" aria-label="LP 会话"><header class="pm-panel-heading"><div><h2>流动性提供试验</h2><p>单市场 · 单次开仓</p></div><span class="pm-pill watch">空闲</span></header><div class="pm-empty compact"><strong>当前没有进行中的 LP 会话</strong><p>预检查和启动一次固定价格订单后，会在这里显示订单角色、计分、库存与复盘状态。</p></div></section>`;
+  }
+  const stateLabels = {
+    entry_submit_pending: "入场提交中",
+    entry_open: "入场挂单中",
+    passive_exit: "被动退出中",
+    stop_loss_exit: "止损退出中",
+    review: "待复盘",
+    needs_attention: "需要核对",
+    complete: "已完成",
+    entry_rejected: "入场被拒",
+  };
+  const scoringLabels = {true: "计分中", false: "未计分", unknown: "UNKNOWN"};
+  const rawState = String(source.state || "").trim();
+  const stage = stateLabels[rawState] || predictionValue(rawState, "UNKNOWN");
+  const scoring = scoringLabels[String(source.scoring_status || "unknown").toLowerCase()] || "UNKNOWN";
+  const scoringTone = scoring === "计分中" ? "pm-tone-ok" : scoring === "UNKNOWN" ? "pm-tone-warning" : "pm-tone-danger";
+  const market = source.market_title || source.market || source.question || source.title || "市场未返回";
+  const outcome = predictionValue(source.outcome, "结果未返回");
+  const entryOrder = source.entry_order_id ? `BUY · ${source.entry_order_id}` : "BUY · 未绑定订单";
+  const passiveOrder = source.passive_exit_order_id ? `SELL · ${source.passive_exit_order_id}` : "未挂被动卖单";
+  const protectedOrder = source.protected_exit_order_id ? `FOK SELL · ${source.protected_exit_order_id}` : "未提交主动卖单";
+  const scoringTime = source.scoring_checked_at
+    ? predictionClock("查询时间", source.scoring_checked_at)
+    : "查询时间：UNKNOWN";
+  const loss = predictionHasValue(source.opening_loss)
+    ? predictionSignedMoney(source.opening_loss)
+    : "UNKNOWN";
+  const tradePnl = predictionHasValue(source.trade_pnl)
+    ? predictionSignedMoney(source.trade_pnl)
+    : "UNKNOWN";
+  const reward = predictionHasValue(source.reward_amount) && String(source.reward_status || "").toLowerCase() === "known"
+    ? predictionMoney(source.reward_amount)
+    : "UNKNOWN";
+  const total = predictionHasValue(source.total_pnl)
+    ? predictionSignedMoney(source.total_pnl)
+    : "UNKNOWN";
+  const exitStatus = source.stop_loss_latched === true
+    ? `止损已锁定 · ${protectedOrder}`
+    : `${stage} · ${passiveOrder}`;
+  return `<section class="pm-panel pm-lp-card" aria-label="LP 会话"><header class="pm-panel-heading"><div><h2>${escapeHtml(String(market))} · ${escapeHtml(String(outcome))}</h2><p>单市场 LP · ${escapeHtml(stage)}</p></div><span class="pm-pill ${predictionTone(stage)}">${escapeHtml(stage)}</span></header><div class="pm-relation-summary"><span>入场角色 <strong>BUY · post-only GTD</strong></span><span>订单 ${escapeHtml(entryOrder)}</span><span class="${scoringTone}">计分 <strong>${escapeHtml(scoring)}</strong></span><span>${scoringTime}</span></div><div class="pm-metrics pm-lp-metrics"><article class="pm-metric"><span>已买</span><strong>${escapeHtml(predictionValue(source.buy_filled_quantity, "UNKNOWN"))}</strong><small>目标 ${escapeHtml(predictionValue(source.quantity, "UNKNOWN"))} 份</small></article><article class="pm-metric"><span>已卖</span><strong>${escapeHtml(predictionValue(source.sold_quantity, "UNKNOWN"))}</strong><small>成交回款 ${escapeHtml(predictionMoney(source.sold_revenue, "UNKNOWN"))}</small></article><article class="pm-metric"><span>剩余</span><strong>${escapeHtml(predictionValue(source.residual_quantity, "UNKNOWN"))}</strong><small>按账户持仓核对</small></article><article class="pm-metric"><span>退出状态</span><strong>${escapeHtml(exitStatus)}</strong><small>开仓盈亏 ${escapeHtml(loss)}</small></article></div><div class="pm-relation-summary"><span>已实现交易 P&amp;L <strong>${escapeHtml(tradePnl)}</strong></span><span>奖励 <strong>${escapeHtml(reward)}</strong></span><span>总净额 <strong>${escapeHtml(total)}</strong></span><span>复盘时间 <strong>${escapeHtml(source.review_at ? predictionHktTimestamp(source.review_at) : "UNKNOWN")}</strong></span></div></section>`;
 }
 
 function predictionAnnualizedPercent(value, digits = 1) {

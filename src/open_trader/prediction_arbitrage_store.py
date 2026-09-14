@@ -712,6 +712,34 @@ class PredictionArbitrageStore:
 
             CREATE INDEX IF NOT EXISTS n_leg_execution_requests_state
             ON n_leg_execution_requests(state, fifo_index);
+
+            CREATE TABLE IF NOT EXISTS lp_sessions (
+                session_id TEXT PRIMARY KEY,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            DROP INDEX IF EXISTS one_active_lp_session;
+
+            CREATE UNIQUE INDEX IF NOT EXISTS one_active_lp_session
+            ON lp_sessions((1))
+            WHERE state NOT IN ('complete', 'entry_rejected');
+
+            CREATE TABLE IF NOT EXISTS lp_actions (
+                action_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES lp_sessions(session_id),
+                action_key TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS lp_actions_session
+            ON lp_actions(session_id, created_at, action_id);
             """
         )
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
@@ -2411,9 +2439,15 @@ class PredictionArbitrageStore:
             counts["cache_hits"] = count
         return result
 
-    def create_preview(self, payload: Mapping[str, object], *, expires_at: str) -> str:
+    def create_preview(
+        self,
+        payload: Mapping[str, object],
+        *,
+        expires_at: str,
+        created_at: str | None = None,
+    ) -> str:
         encoded = _dump_execution_payload(payload)
-        created = _parse_timestamp(_utc_now())
+        created = _parse_timestamp(created_at or _utc_now())
         requested_expiry = _parse_timestamp(expires_at)
         # The caller supplies the displayed deadline; cap accidental longer
         # lifetimes so every preview is at most the fixed ten-second window.
@@ -2425,6 +2459,201 @@ class PredictionArbitrageStore:
                 (preview_id, encoded, _canonical_timestamp(created), _canonical_timestamp(expiry)),
             )
         return preview_id
+
+    def lp_preview(self, preview_id: str) -> dict[str, object] | None:
+        """Load one LP preview without consuming it."""
+
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM previews WHERE preview_id=?", (str(preview_id),)
+            ).fetchone()
+        if row is None:
+            return None
+        payload = _load_payload(str(row["payload"]))
+        payload.update(
+            {
+                "preview_id": str(row["preview_id"]),
+                "created_at": str(row["created_at"]),
+                "expires_at": str(row["expires_at"]),
+                "consumed_at": row["consumed_at"],
+            }
+        )
+        return payload
+
+    def consume_lp_preview(self, preview_id: str) -> None:
+        now = _utc_now()
+        with self._transaction() as connection:
+            updated = connection.execute(
+                "UPDATE previews SET consumed_at=? WHERE preview_id=? AND consumed_at IS NULL",
+                (now, str(preview_id)),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("preview_consumed")
+
+    @staticmethod
+    def _lp_row_result(row: sqlite3.Row) -> dict[str, object]:
+        payload = _load_payload(str(row["payload"]))
+        payload.update(
+            {
+                "session_id": str(row["session_id"]),
+                "idempotency_key": str(row["idempotency_key"]),
+                "state": str(row["state"]),
+                "created_at": str(row["created_at"]),
+                "updated_at": str(row["updated_at"]),
+            }
+        )
+        return payload
+
+    def lp_session_by_idempotency(self, idempotency_key: str) -> dict[str, object] | None:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM lp_sessions WHERE idempotency_key=?",
+                (str(idempotency_key),),
+            ).fetchone()
+        return None if row is None else self._lp_row_result(row)
+
+    def lp_session(self, session_id: str) -> dict[str, object] | None:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM lp_sessions WHERE session_id=?", (str(session_id),)
+            ).fetchone()
+        return None if row is None else self._lp_row_result(row)
+
+    def lp_active_session(self) -> dict[str, object] | None:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM lp_sessions WHERE state NOT IN ('complete','entry_rejected') ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+        return None if row is None else self._lp_row_result(row)
+
+    def lp_latest_session(self) -> dict[str, object] | None:
+        """Return the most recently created LP session for read-only status."""
+
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM lp_sessions ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+        return None if row is None else self._lp_row_result(row)
+
+    def lp_create_session(
+        self,
+        session_id: str,
+        idempotency_key: str,
+        *,
+        state: str,
+        payload: Mapping[str, object],
+    ) -> dict[str, object]:
+        encoded = _dump_execution_payload(payload)
+        now = _utc_now()
+        with self._transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM lp_sessions WHERE idempotency_key=?",
+                (str(idempotency_key),),
+            ).fetchone()
+            if existing is not None:
+                return self._lp_row_result(existing)
+            n_leg_control = connection.execute(
+                "SELECT active_batch_id FROM n_leg_controls WHERE singleton=1"
+            ).fetchone()
+            if n_leg_control is not None and n_leg_control["active_batch_id"] is not None:
+                raise ValueError("active_n_leg_batch")
+            try:
+                connection.execute(
+                    "INSERT INTO lp_sessions(session_id,idempotency_key,state,payload,created_at,updated_at) VALUES (?,?,?,?,?,?)",
+                    (str(session_id), str(idempotency_key), str(state), encoded, now, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                if "one_active_lp_session" in str(exc):
+                    raise ValueError("active_lp_session") from exc
+                raise
+            row = connection.execute(
+                "SELECT * FROM lp_sessions WHERE session_id=?", (str(session_id),)
+            ).fetchone()
+            assert row is not None
+            return self._lp_row_result(row)
+
+    def lp_update_session(
+        self,
+        session_id: str,
+        *,
+        state: str | None = None,
+        patch: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        now = _utc_now()
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM lp_sessions WHERE session_id=?", (str(session_id),)
+            ).fetchone()
+            if row is None:
+                raise ValueError("lp_session_not_found")
+            payload = _load_payload(str(row["payload"]))
+            if patch:
+                payload.update(patch)
+            next_state = str(state or row["state"])
+            connection.execute(
+                "UPDATE lp_sessions SET state=?,payload=?,updated_at=? WHERE session_id=?",
+                (next_state, _dump_execution_payload(payload), now, str(session_id)),
+            )
+            updated = connection.execute(
+                "SELECT * FROM lp_sessions WHERE session_id=?", (str(session_id),)
+            ).fetchone()
+            assert updated is not None
+            return self._lp_row_result(updated)
+
+    def lp_upsert_action(
+        self,
+        session_id: str,
+        action_key: str,
+        *,
+        state: str,
+        payload: Mapping[str, object],
+    ) -> dict[str, object]:
+        encoded = _dump_execution_payload(payload)
+        now = _utc_now()
+        action_id = _new_id()
+        with self._transaction() as connection:
+            connection.execute(
+                "INSERT INTO lp_actions(action_id,session_id,action_key,state,payload,created_at,updated_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(action_key) DO UPDATE SET state=excluded.state,payload=excluded.payload,updated_at=excluded.updated_at",
+                (action_id, str(session_id), str(action_key), str(state), encoded, now, now),
+            )
+            row = connection.execute(
+                "SELECT * FROM lp_actions WHERE action_key=?", (str(action_key),)
+            ).fetchone()
+        assert row is not None
+        result = _load_payload(str(row["payload"]))
+        result.update(
+            {
+                "action_id": str(row["action_id"]),
+                "session_id": str(row["session_id"]),
+                "action_key": str(row["action_key"]),
+                "state": str(row["state"]),
+                "created_at": str(row["created_at"]),
+                "updated_at": str(row["updated_at"]),
+            }
+        )
+        return result
+
+    def lp_actions(self, session_id: str) -> list[dict[str, object]]:
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM lp_actions WHERE session_id=? ORDER BY created_at,action_id",
+                (str(session_id),),
+            ).fetchall()
+        result = []
+        for row in rows:
+            payload = _load_payload(str(row["payload"]))
+            payload.update(
+                {
+                    "action_id": str(row["action_id"]),
+                    "session_id": str(row["session_id"]),
+                    "action_key": str(row["action_key"]),
+                    "state": str(row["state"]),
+                    "created_at": str(row["created_at"]),
+                    "updated_at": str(row["updated_at"]),
+                }
+            )
+            result.append(payload)
+        return result
 
     # N-leg execution owns separate tables: legacy execution rows deliberately
     # remain untouched while the future Adapter and this no-submit state machine
@@ -3159,6 +3388,11 @@ class PredictionArbitrageStore:
                 if result.get("entry_fingerprint") != payload.get("entry_fingerprint"):
                     raise ValueError("N_LEG_BATCH_ID_CONFLICT")
                 return result
+            active_lp = connection.execute(
+                "SELECT 1 FROM lp_sessions WHERE state NOT IN ('complete','entry_rejected') LIMIT 1"
+            ).fetchone()
+            if active_lp is not None:
+                raise ValueError("N_LEG_ACTIVE_LP_SESSION")
             control = self._n_leg_control_row(
                 connection.execute("SELECT * FROM n_leg_controls WHERE singleton=1").fetchone()
             )

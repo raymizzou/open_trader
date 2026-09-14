@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 import json
 import os
 from pathlib import Path
@@ -14,6 +16,7 @@ import sys
 import threading
 import time
 from typing import Iterator, Mapping
+from types import SimpleNamespace
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
@@ -23,7 +26,10 @@ import pytest
 import open_trader
 import open_trader.prediction_service as prediction_service
 from open_trader.llm_providers import PROVIDER_IDS, resolve_provider
+from open_trader.notifications import NullNotifier
+from open_trader.polymarket_lp import PolymarketLPService
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+from open_trader.prediction_arbitrage_execution import PredictionExecutionService
 from open_trader.prediction_read_model import (
     _prediction_relation_safe_value,
     _prediction_safe_value,
@@ -1036,6 +1042,239 @@ def test_production_exposes_prediction_preview_and_confirmation() -> None:
             {},
         ),
     ]
+
+
+def test_lp_routes_preserve_guard_and_idempotency(tmp_path: Path) -> None:
+    """The HTTP seam keeps LP writes guarded and exposes durable risk reads."""
+
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    condition_id = "0x" + "c" * 64
+    token_id = "0x" + "1" * 64
+
+    class Exchange:
+        def __init__(self) -> None:
+            self.posts: list[dict[str, object]] = []
+            self.cancels: list[str] = []
+            self.snapshot = {
+                "account": {
+                    "authenticated": True,
+                    "balance": Decimal("100"),
+                    "allowance": Decimal("100"),
+                    "positions": [],
+                    "open_orders": [],
+                },
+                "market": {
+                    "market_id": "market-1",
+                    "condition_id": condition_id,
+                    "token_id": token_id,
+                    "outcome": "YES",
+                    "accepting_orders": True,
+                    "exchange_type": "CLOB",
+                    "tick_size": Decimal("0.01"),
+                    "minimum_order_size": Decimal("1"),
+                    "fee": Decimal("0"),
+                    "fees_enabled": False,
+                    "reward_min_size": Decimal("1"),
+                    "reward_max_spread": Decimal("0.10"),
+                },
+                "book": {
+                    "timestamp": now,
+                    "received_at": now,
+                    "asks": [{"price": Decimal("0.31"), "size": Decimal("100")}],
+                    "bids": [{"price": Decimal("0.29"), "size": Decimal("100")}],
+                },
+                "trades": [],
+                "orders": [],
+                "orders_terminal": True,
+            }
+
+        def lp_snapshot(self, _request: Mapping[str, object]) -> dict[str, object]:
+            return self.snapshot
+
+        def create_limit_order(self, **kwargs: object) -> dict[str, object]:
+            return dict(kwargs)
+
+        def post_order(self, signed: dict[str, object]) -> dict[str, object]:
+            self.posts.append(dict(signed))
+            return {**signed, "order_id": "lp-order-1", "status": "LIVE"}
+
+        def cancel_order(self, order_id: str) -> dict[str, object]:
+            self.cancels.append(order_id)
+            return {"status": "CANCELED", "order_id": order_id}
+
+    exchange = Exchange()
+    store = PredictionArbitrageStore(tmp_path)
+    lp = PolymarketLPService(store, exchange, clock=lambda: now)
+    execution = PredictionExecutionService(
+        store=store,
+        monitor=_Monitor(),
+        trading=exchange,
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "prediction_arbitrage" / "execution.lock",
+        lp=lp,
+    )
+    execution._breaker_open = False
+
+    production_runtime = SimpleNamespace(
+        mode="production",
+        state="RUNNING",
+        production_owner=True,
+        store=store,
+        monitor=_Monitor(),
+        execution=execution,
+        cross_venue_monitor=None,
+    )
+
+    request = {
+        "market_id": "market-1",
+        "condition_id": condition_id,
+        "token_id": token_id,
+        "outcome": "YES",
+        "question": "Will it happen?",
+        "price": "0.30",
+        "quantity": "10",
+        "review_at": (now + timedelta(minutes=10)).isoformat(),
+    }
+    body = json.dumps(request).encode("utf-8")
+
+    with _running_server(
+        production_runtime,
+        session_token="session-token",
+        csrf_token="csrf-token",
+        runtime_metadata={"git_sha": "abc123"},
+    ) as (base, _server_instance):
+        current_status, current = _response(
+            base + "/api/prediction-arbitrage/lp/sessions/current"
+        )
+        preview_status, preview = _response(
+            _production_request(
+                base, "/api/prediction-arbitrage/lp/preview", data=body
+            )
+        )
+        assert preview_status == 200
+        assert preview["state"] == "previewed"
+        assert exchange.posts == []
+        start_body = json.dumps(
+            {
+                "preview_id": preview["preview_id"],
+                "idempotency_key": "lp-api-1",
+            }
+        ).encode("utf-8")
+        first_status, first = _response(
+            _production_request(
+                base, "/api/prediction-arbitrage/lp/sessions", data=start_body
+            )
+        )
+        repeat_status, repeat = _response(
+            _production_request(
+                base, "/api/prediction-arbitrage/lp/sessions", data=start_body
+            )
+        )
+        current_after_start_status, current_after_start = _response(
+            base + "/api/prediction-arbitrage/lp/sessions/current"
+        )
+        stop_path = (
+            "/api/prediction-arbitrage/lp/sessions/"
+            f"{first['session_id']}/stop"
+        )
+        stop_status, stopped = _response(
+            _production_request(base, stop_path, data=b"{}")
+        )
+        repeat_stop_status, repeat_stopped = _response(
+            _production_request(base, stop_path, data=b"{}")
+        )
+
+        assert current_status == 200
+        assert current["state"] == "none"
+        assert "residual_quantity" not in current
+        assert first_status == repeat_status == 200
+        assert first["state"] == repeat["state"] == "entry_open"
+        assert first["session_id"] == repeat["session_id"]
+        assert len(exchange.posts) == 1
+        assert current_after_start_status == 200
+        assert current_after_start["state"] == "entry_open"
+        assert stop_status == repeat_stop_status == 200
+        assert stopped["state"] == repeat_stopped["state"] == "review"
+        assert exchange.cancels == ["lp-order-1"]
+        assert stopped["session_id"] == first["session_id"]
+
+        # A breaker opened after preview prevents consuming it or writing an
+        # order, while the already persisted session remains readable.
+        execution._breaker_open = True
+        locked_preview_status, locked_preview = _response(
+            _production_request(
+                base, "/api/prediction-arbitrage/lp/preview", data=body
+            )
+        )
+        locked_start_status, locked_start = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/sessions",
+                data=json.dumps(
+                    {
+                        "preview_id": locked_preview["preview_id"],
+                        "idempotency_key": "lp-api-2",
+                    }
+                ).encode("utf-8"),
+            )
+        )
+        assert locked_preview_status == 200
+        assert locked_start_status == 200
+        assert locked_start == {
+            "state": "locked",
+            "reason": "circuit_breaker_open",
+        }
+        assert len(exchange.posts) == 1
+
+        store.lp_update_session(
+            str(first["session_id"]),
+            patch={
+                "buy_filled_quantity": Decimal("5"),
+                "residual_quantity": Decimal("5"),
+                "residual_exit_value": Decimal("1.20"),
+                "position_reconciled": True,
+                "scoring_status": "unknown",
+                "scoring_checked_at": now - timedelta(seconds=20),
+            },
+        )
+
+    shadow_runtime = SimpleNamespace(
+        mode="shadow",
+        state="RUNNING",
+        production_owner=False,
+        store=store,
+        monitor=_Monitor(),
+        execution=execution,
+        cross_venue_monitor=None,
+        shadow_evidence={
+            "mode": "shadow",
+            "guard_attempts": [],
+            "first_violation": None,
+            "codex": {"relation": {"calls": 0, "successes": 0}},
+        },
+    )
+
+    with _server(shadow_runtime) as shadow_base:
+        shadow_current_status, shadow_current = _response(
+            shadow_base + "/api/prediction-arbitrage/lp/sessions/current"
+        )
+        shadow_state_status, shadow_state = _response(
+            shadow_base + "/api/prediction-arbitrage/state"
+        )
+        shadow_post_status, _shadow_post = _response(
+            _production_request(
+                shadow_base, "/api/prediction-arbitrage/lp/preview", data=body
+            )
+        )
+
+    assert shadow_current_status == shadow_state_status == 200
+    assert shadow_current["state"] == "review"
+    assert shadow_current["residual_quantity"] == "5"
+    assert shadow_current["scoring_status"] == "unknown"
+    assert shadow_state["lp_session"]["residual_quantity"] == "5"
+    assert shadow_state["lp_session"]["state"] == "review"
+    assert shadow_post_status == 403
+    assert len(exchange.posts) == 1
 
 
 def test_production_http_confirmation_preserves_execution_idempotency(

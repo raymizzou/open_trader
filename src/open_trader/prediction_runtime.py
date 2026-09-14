@@ -14,6 +14,7 @@ from typing import Callable, Literal
 
 from .notifications import NullNotifier
 from .polymarket_monitor import PolymarketMonitor
+from .polymarket_lp import PolymarketLPService
 from .polymarket_relation_discovery import (
     LlmRelationValidator,
     discover_threshold_relation_catalog,
@@ -75,6 +76,7 @@ from .relation_catalog import RelationCatalog
 logger = logging.getLogger(__name__)
 _CROSS_VENUE_START_TIMEOUT = 5
 _DEFAULT_HOLDING_RECONCILER = object()
+_LP_TICK_SECONDS = 1.0
 
 # Keep the old spelling available for the existing Dashboard test seam.
 discover_threshold_relations = discover_threshold_relation_catalog
@@ -403,6 +405,7 @@ class PredictionRuntime:
         self._cross_runtime: _CrossVenueRuntime | None = None
         self.store: PredictionArbitrageStore | None = None
         self.monitor: PolymarketMonitor | None = None
+        self.lp: PolymarketLPService | None = None
         self.observation_monitor: PredictionObservationMonitor | None = None
         self.cross_venue_monitor: object | None = None
         self.execution: PredictionExecutionService | None = None
@@ -419,6 +422,8 @@ class PredictionRuntime:
         self._shadow_attempts: list[dict[str, object]] = []
         self._relation_validator: object | None = None
         self._cross_validator: object | None = None
+        self._lp_stop_event = threading.Event()
+        self._lp_thread: threading.Thread | None = None
 
     @property
     def state(self) -> str:
@@ -567,6 +572,11 @@ class PredictionRuntime:
             self._prediction_trading = PolymarketTradingClient.from_keychain(
                 trading_config
             )
+            self.lp = PolymarketLPService(
+                self.store,
+                self._prediction_trading,
+                owner_lock=self._owner,
+            )
             try:
                 self._predict_trading = PredictTradingClient.from_keychain(
                     trading_config
@@ -600,7 +610,12 @@ class PredictionRuntime:
                 dashboard_url=self._dashboard_url,
                 predict_trading=self._predict_trading,
                 legacy_retired=self.legacy_retired,
+                lp=self.lp,
             )
+            set_mutation_guard = getattr(self.lp, "set_mutation_guard", None)
+            lp_mutation_allowed = getattr(self.execution, "lp_mutation_allowed", None)
+            if callable(set_mutation_guard) and callable(lp_mutation_allowed):
+                set_mutation_guard(lp_mutation_allowed)
             if not self.legacy_retired:
                 # Issue #109: legacy ready/observation alerts retire with the
                 # legacy engine at the N_LEG fence; the monitor keeps both
@@ -780,6 +795,7 @@ class PredictionRuntime:
                     reconciliation_context_factory=reconciliation_factory,
                 )
                 self.n_leg_order_queue_driver.start()
+            self._start_lp_monitor()
             self._state = "RUNNING"
             logger.info(
                 "prediction_runtime_state state=RUNNING pid=%s data_dir=%s",
@@ -791,6 +807,36 @@ class PredictionRuntime:
             self._cleanup_resources()
             raise
 
+    def _start_lp_monitor(self) -> None:
+        """Keep one active LP session reconciled by the owned runtime."""
+
+        if self.lp is None or self.execution is None or self._lp_thread is not None:
+            return
+        self._lp_stop_event.clear()
+
+        def run() -> None:
+            while not self._lp_stop_event.wait(_LP_TICK_SECONDS):
+                execution = self.execution
+                if execution is None:
+                    return
+                lp_tick = getattr(execution, "lp_tick", None)
+                if not callable(lp_tick):
+                    return
+                try:
+                    lp_tick()
+                except Exception:
+                    # The durable session remains active and visible; the
+                    # next iteration retries through the same reconciliation
+                    # and idempotency path.
+                    logger.exception("prediction_lp_tick_failed")
+
+        self._lp_thread = threading.Thread(
+            target=run,
+            name="prediction-lp-monitor",
+            daemon=True,
+        )
+        self._lp_thread.start()
+
     def _start_shadow(self) -> None:
         try:
             self._owner.acquire()
@@ -799,6 +845,16 @@ class PredictionRuntime:
             trading_config = load_trading_config(self._prediction_config_path)
             self._prediction_trading = PolymarketTradingClient.from_keychain(
                 trading_config
+            )
+            # Keep the durable LP read model available in shadow mode.  The
+            # service rejects every LP POST before dispatch, and shadow never
+            # starts the LP monitor, so this collaborator is read-only in
+            # practice while persisted residual risk remains visible after a
+            # mode switch or restart.
+            self.lp = PolymarketLPService(
+                self.store,
+                self._prediction_trading,
+                owner_lock=self._owner,
             )
             try:
                 self._predict_trading = PredictTradingClient.from_keychain(trading_config)
@@ -828,6 +884,7 @@ class PredictionRuntime:
                 lock_path=self._data_dir / "prediction_arbitrage" / "execution.lock",
                 dashboard_url=self._dashboard_url,
                 predict_trading=self._predict_trading,
+                lp=self.lp,
             )
             self.monitor.set_ready_observer(self.execution.notify_ready_opportunity)
             self.monitor.set_observation_observer(self.execution.notify_observation)
@@ -986,6 +1043,15 @@ class PredictionRuntime:
     def _cleanup_resources(self) -> list[BaseException]:
         errors: list[BaseException] = []
         uncertain_thread = False
+        self._lp_stop_event.set()
+        lp_thread = self._lp_thread
+        if lp_thread is not None:
+            lp_thread.join(timeout=5)
+            if lp_thread.is_alive():
+                errors.append(RuntimeError("prediction LP monitor thread did not stop"))
+                uncertain_thread = True
+            else:
+                self._lp_thread = None
         if self.monitor_selection_driver is not None:
             try:
                 self.monitor_selection_driver.stop()
@@ -1054,6 +1120,7 @@ class PredictionRuntime:
             ("n_leg_shadow", self.n_leg_shadow),
             ("solver_server", self.solver_server),
             ("execution", self.execution),
+            ("lp", self.lp),
             ("_prediction_trading", self._prediction_trading),
             ("_predict_trading", self._predict_trading),
             ("store", self.store),

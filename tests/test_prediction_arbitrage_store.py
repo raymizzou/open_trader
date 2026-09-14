@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from threading import Barrier
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -244,6 +245,8 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
         "n_leg_execution_requests",
         "partial_fill_proofs",
         "observation_pool_members",
+        "lp_sessions",
+        "lp_actions",
     }
     assert "signals_market_started_at" in indexes
     assert "signals_started_at" in indexes
@@ -2659,3 +2662,102 @@ def test_load_llm_cache_entries_empty_and_whitespace(tmp_path: Path) -> None:
     db.save_llm_cache("a", {"x": 1})
     result = db.load_llm_cache_entries(["  a  ", "  a  ", "b"])
     assert set(result.keys()) == {"a"}
+
+
+def _admission_batch_payload() -> dict[str, object]:
+    return {
+        "execution_batch_id": "batch-a",
+        "opportunity_episode_id": "episode-a",
+        "episode_lineage_id": "lineage-a",
+        "mode": "MANUAL",
+        "total_unsettled_capital_units": 0,
+        "state": "CREATED",
+        "entry_fingerprint": "entry-a",
+    }
+
+
+def test_lp_and_n_leg_admission_share_one_active_slot(tmp_path: Path) -> None:
+    lp_payload = {"market_id": "market-a", "outcome": "YES"}
+    n_leg_payload = _admission_batch_payload()
+
+    lp_first = store(tmp_path / "lp-first")
+    created_lp = lp_first.lp_create_session(
+        "lp-a", "lp-key-a", state="needs_attention", payload=lp_payload
+    )
+    assert lp_first.lp_active_session() == created_lp
+    with pytest.raises(ValueError, match="N_LEG_ACTIVE_LP_SESSION"):
+        lp_first.n_leg_create_batch(n_leg_payload)
+    assert lp_first.n_leg_batch("batch-a") is None
+    assert lp_first.n_leg_control()["active_batch_id"] is None
+    assert lp_first.n_leg_control()["total_unsettled_capital_units"] == 0
+    assert (
+        lp_first.lp_create_session(
+            "lp-a", "lp-key-a", state="needs_attention", payload=lp_payload
+        )
+        == created_lp
+    )
+    lp_first.lp_update_session("lp-a", state="complete")
+    admitted_n_leg = lp_first.n_leg_create_batch(n_leg_payload)
+    assert admitted_n_leg["execution_batch_id"] == "batch-a"
+
+    n_leg_first = store(tmp_path / "n-leg-first")
+    admitted_n_leg = n_leg_first.n_leg_create_batch(n_leg_payload)
+    control_before_lp = n_leg_first.n_leg_control()
+    with pytest.raises(ValueError, match="active_n_leg_batch"):
+        n_leg_first.lp_create_session(
+            "lp-b", "lp-key-b", state="needs_attention", payload=lp_payload
+        )
+    assert n_leg_first.lp_session("lp-b") is None
+    assert n_leg_first.lp_active_session() is None
+    assert n_leg_first.n_leg_batch("batch-a") == admitted_n_leg
+    assert n_leg_first.n_leg_control() == control_before_lp
+    assert n_leg_first.n_leg_create_batch(n_leg_payload) == admitted_n_leg
+
+    concurrent_root = tmp_path / "concurrent"
+    lp_store = store(concurrent_root)
+    n_leg_store = PredictionArbitrageStore(concurrent_root / "data")
+    barrier = Barrier(2)
+
+    def admit_lp() -> str:
+        barrier.wait()
+        try:
+            lp_store.lp_create_session(
+                "lp-concurrent",
+                "lp-key-concurrent",
+                state="needs_attention",
+                payload=lp_payload,
+            )
+            return "lp-ok"
+        except ValueError as exc:
+            return str(exc)
+
+    def admit_n_leg() -> str:
+        barrier.wait()
+        try:
+            n_leg_store.n_leg_create_batch(
+                {
+                    **n_leg_payload,
+                    "execution_batch_id": "batch-concurrent",
+                    "opportunity_episode_id": "episode-concurrent",
+                    "episode_lineage_id": "lineage-concurrent",
+                    "entry_fingerprint": "entry-concurrent",
+                }
+            )
+            return "n-leg-ok"
+        except ValueError as exc:
+            return str(exc)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(lambda fn: fn(), (admit_lp, admit_n_leg)))
+
+    assert len([outcome for outcome in outcomes if outcome.endswith("-ok")]) == 1
+    assert set(outcomes) <= {
+        "lp-ok",
+        "n-leg-ok",
+        "N_LEG_ACTIVE_LP_SESSION",
+        "active_n_leg_batch",
+    }
+    assert not (
+        lp_store.lp_active_session()
+        and n_leg_store.n_leg_control()["active_batch_id"]
+    )
