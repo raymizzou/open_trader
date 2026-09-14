@@ -577,6 +577,84 @@ def test_shadow_state_and_history_use_the_shared_read_model() -> None:
     assert history == expected_history
 
 
+def test_lp_state_exposes_reward_threshold_without_paid_profit(tmp_path: Path) -> None:
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+
+    class RewardExchange:
+        def __init__(self) -> None:
+            self.reads = 0
+
+        def lp_reward_snapshot(
+            self, reward_date: str, condition_id: str
+        ) -> dict[str, object]:
+            self.reads += 1
+            assert reward_date == "2026-09-14"
+            assert condition_id == "condition-1"
+            return {
+                "state": "known",
+                "reward_date": reward_date,
+                "condition_id": condition_id,
+                "market_amount": Decimal("0.80"),
+                "account_amount": Decimal("1.10"),
+            }
+
+    store = PredictionArbitrageStore(tmp_path)
+    store.lp_create_session(
+        "service-reward-session",
+        "service-reward-idempotency",
+        state="complete",
+        payload={
+            "condition_id": "condition-1",
+            "reward_date": "2026-09-14",
+            "paid_rewards": Decimal("0"),
+            "trade_pnl": Decimal("0.10"),
+            "total_pnl": None,
+        },
+    )
+    exchange = RewardExchange()
+    lp = PolymarketLPService(store, exchange, clock=lambda: now)
+    observed = lp.refresh_rewards()
+    assert observed["reward_observation"]["status"] == "met"
+    assert exchange.reads == 1
+
+    class RewardExecution(_Execution):
+        def __init__(self) -> None:
+            self.status_calls = 0
+            self.write_calls = 0
+
+        def lp_status(self) -> dict[str, object]:
+            self.status_calls += 1
+            return lp.status()
+
+        def lp_preview(self, _request: object) -> dict[str, object]:
+            self.write_calls += 1
+            raise AssertionError("state read must not submit an LP order")
+
+    runtime = _Runtime()
+    execution = RewardExecution()
+    runtime.store = store  # type: ignore[assignment]
+    runtime.execution = execution
+
+    with _server(runtime) as base:
+        status, payload = _response(base + "/api/prediction-arbitrage/state")
+
+    assert status == 200
+    observation = payload["lp_session"]["reward_observation"]
+    assert observation["status"] == "met"
+    assert observation["threshold_status"] == "met"
+    assert observation["reward_date"] == "2026-09-14"
+    assert observation["market_amount"] == "0.80"
+    assert observation["account_amount"] == "1.10"
+    assert observation["gap"] == "0"
+    assert observation["checked_at"] == "2026-09-14T12:00:00.000000Z"
+    assert observation["paid"] is False
+    assert payload["lp_session"]["paid_rewards"] == "0"
+    assert payload["lp_session"]["trade_pnl"] == "0.10"
+    assert "total_pnl" not in payload["lp_session"]
+    assert execution.status_calls == 1
+    assert execution.write_calls == 0
+
+
 def test_history_single_flight_reuses_identical_inflight_requests(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -20,6 +20,8 @@ GTD_REVIEW_BUFFER_SECONDS = 60
 SDK_MIN_EXPIRATION_SECONDS = 180
 PREVIEW_TTL_SECONDS = 10
 BOOK_FRESHNESS_SECONDS = Decimal("10")
+REWARD_THRESHOLD = Decimal("1")
+REWARD_STALE_SECONDS = Decimal("180")
 TERMINAL_ORDER_STATES = frozenset(
     {"FILLED", "MATCHED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "FAILED"}
 )
@@ -138,6 +140,7 @@ class PolymarketLPService:
         self.owner_lock = owner_lock
         self._mutation_guard = mutation_guard
         self._mutex = threading.RLock()
+        self._reward_refresh_lock = threading.Lock()
 
     def set_mutation_guard(self, guard: Callable[..., bool] | None) -> None:
         """Attach the existing execution breaker to exchange writes."""
@@ -237,6 +240,7 @@ class PolymarketLPService:
                 expiration = expiration_for_review(
                     _timestamp(request["review_at"], name="review_at"), now=self._now()
                 )
+                reward_date = self._now().date().isoformat()
             except ValueError as exc:
                 return {"state": "rejected", "reason": str(exc)}
             try:
@@ -284,6 +288,7 @@ class PolymarketLPService:
                 "owned_order_ids": [],
                 "order_history": {},
                 "orders_terminal": False,
+                "reward_date": reward_date,
                 "reward_status": "unknown",
                 "trade_pnl": None,
                 "total_pnl": None,
@@ -401,6 +406,185 @@ class PolymarketLPService:
                 },
             )
             return self._status_payload(session)
+
+    def refresh_rewards(
+        self,
+        session_id: str | None = None,
+        *,
+        stop_event: threading.Event | None = None,
+    ) -> dict[str, object]:
+        """Refresh the persisted platform-earnings observation for one session."""
+
+        with self._reward_refresh_lock:
+            session = self._reward_session(session_id)
+            if session is None:
+                return {"state": "none", "session_id": None}
+            now = self._now()
+            if self._reward_after_review(session, now):
+                return self._status_payload(session)
+            reward_date = self._session_reward_date(session)
+            condition_id = _text(session.get("condition_id"))
+            previous = session.get("reward_observation")
+            previous_observation = (
+                dict(previous) if isinstance(previous, Mapping) else {}
+            )
+            try:
+                if reward_date is None or condition_id is None:
+                    raise ValueError("reward_identity_unknown")
+                reader = getattr(self.exchange, "lp_reward_snapshot", None)
+                if not callable(reader):
+                    raise ValueError("reward_reader_unavailable")
+                if stop_event is None:
+                    snapshot = reader(reward_date, condition_id)
+                else:
+                    snapshot = reader(
+                        reward_date,
+                        condition_id,
+                        stop_event=stop_event,
+                    )
+                observation = self._known_reward_observation(
+                    snapshot,
+                    reward_date=reward_date,
+                    condition_id=condition_id,
+                    checked_at=now,
+                )
+            except Exception as exc:
+                observation = self._unknown_reward_observation(
+                    previous_observation,
+                    reward_date=reward_date,
+                    condition_id=condition_id,
+                    attempted_at=now,
+                    reason=type(exc).__name__,
+                )
+            with self._mutex:
+                current = self.store.lp_session(str(session["session_id"]))
+                if current is None:
+                    return {"state": "none", "session_id": session.get("session_id")}
+                updated = self.store.lp_update_session(
+                    str(session["session_id"]),
+                    patch={"reward_observation": observation},
+                )
+            return self._status_payload(updated)
+
+    @staticmethod
+    def _reward_after_review(session: Mapping[str, object], now: datetime) -> bool:
+        review_at = session.get("review_at")
+        if review_at is None:
+            return False
+        try:
+            review_boundary = _timestamp(review_at, name="review_at")
+        except ValueError:
+            return False
+        if now < review_boundary:
+            return False
+        previous = session.get("reward_observation")
+        if not isinstance(previous, Mapping):
+            return False
+        last_attempt_at = previous.get("last_attempt_at")
+        if last_attempt_at is None:
+            return False
+        try:
+            return _timestamp(last_attempt_at, name="last_attempt_at") >= review_boundary
+        except ValueError:
+            return False
+
+    def _reward_session(self, session_id: str | None) -> dict[str, object] | None:
+        if session_id:
+            return self.store.lp_session(session_id)
+        session = self.store.lp_active_session()
+        if session is not None:
+            return session
+        latest = getattr(self.store, "lp_latest_session", None)
+        return latest() if callable(latest) else None
+
+    @staticmethod
+    def _session_reward_date(session: Mapping[str, object]) -> str | None:
+        value = _text(session.get("reward_date"))
+        if value is not None:
+            try:
+                return datetime.fromisoformat(value).date().isoformat()
+            except ValueError:
+                pass
+        created_at = session.get("created_at")
+        try:
+            return _timestamp(created_at, name="created_at").date().isoformat()
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _known_reward_observation(
+        snapshot: object,
+        *,
+        reward_date: str,
+        condition_id: str,
+        checked_at: datetime,
+    ) -> dict[str, object]:
+        if not isinstance(snapshot, Mapping) or snapshot.get("state") != "known":
+            raise ValueError("reward_snapshot_unknown")
+        if str(snapshot.get("reward_date") or "") != reward_date:
+            raise ValueError("reward_date_mismatch")
+        if str(snapshot.get("condition_id") or "") != condition_id:
+            raise ValueError("reward_condition_mismatch")
+        account_amount = _maybe_decimal(snapshot.get("account_amount"))
+        market_amount = _maybe_decimal(snapshot.get("market_amount"))
+        if (
+            account_amount is None
+            or market_amount is None
+            or account_amount < 0
+            or market_amount < 0
+        ):
+            raise ValueError("reward_amount_unknown")
+        gap = max(Decimal("0"), REWARD_THRESHOLD - account_amount)
+        status = "met" if account_amount >= REWARD_THRESHOLD else "below"
+        checked = _iso(checked_at)
+        return {
+            "status": status,
+            "threshold_status": status,
+            "reward_date": reward_date,
+            "condition_id": condition_id,
+            "market_amount": market_amount,
+            "account_amount": account_amount,
+            "gap": gap,
+            "checked_at": checked,
+            "last_success_at": checked,
+            "last_attempt_at": checked,
+            "stale": False,
+            "source": "platform_earnings",
+            "currency": "USD",
+            "paid": False,
+        }
+
+    @staticmethod
+    def _unknown_reward_observation(
+        previous: Mapping[str, object],
+        *,
+        reward_date: str | None,
+        condition_id: str | None,
+        attempted_at: datetime,
+        reason: str,
+    ) -> dict[str, object]:
+        same_session = (
+            previous.get("reward_date") == reward_date
+            and previous.get("condition_id") == condition_id
+        )
+        retained = previous if same_session else {}
+        return {
+            "status": "unknown",
+            "threshold_status": "unknown",
+            "reward_date": reward_date,
+            "condition_id": condition_id,
+            "market_amount": retained.get("market_amount"),
+            "account_amount": retained.get("account_amount"),
+            "gap": retained.get("gap"),
+            "checked_at": retained.get("checked_at"),
+            "last_success_at": retained.get("last_success_at"),
+            "last_attempt_at": _iso(attempted_at),
+            "stale": True,
+            "source": "platform_earnings",
+            "currency": "USD",
+            "paid": False,
+            "error": reason,
+        }
 
     def status(self, session_id: str | None = None) -> dict[str, object]:
         with self._mutex:
@@ -2301,6 +2485,7 @@ class PolymarketLPService:
     def _status_payload(self, session: Mapping[str, object]) -> dict[str, object]:
         result = dict(session)
         result.setdefault("session_id", session.get("session_id"))
+        result["reward_observation"] = self._reward_status_payload(session)
         for key in (
             "price",
             "quantity",
@@ -2312,6 +2497,7 @@ class PolymarketLPService:
             "residual_exit_value",
             "fees",
             "opening_loss",
+            "paid_rewards",
             "trade_pnl",
             "total_pnl",
         ):
@@ -2321,6 +2507,39 @@ class PolymarketLPService:
                 if parsed is not None:
                     result[key] = parsed
         return result
+
+    def _reward_status_payload(self, session: Mapping[str, object]) -> dict[str, object]:
+        raw = session.get("reward_observation")
+        if isinstance(raw, Mapping):
+            observation = dict(raw)
+        else:
+            observation = {
+                "status": "unknown",
+                "threshold_status": "unknown",
+                "reward_date": self._session_reward_date(session),
+                "condition_id": _text(session.get("condition_id")),
+                "source": "platform_earnings",
+                "currency": "USD",
+                "paid": False,
+            }
+        for key in ("market_amount", "account_amount", "gap"):
+            value = observation.get(key)
+            if isinstance(value, str):
+                parsed = _maybe_decimal(value)
+                if parsed is not None:
+                    observation[key] = parsed
+        status = str(observation.get("status") or "unknown").lower()
+        checked_at = observation.get("last_success_at", observation.get("checked_at"))
+        if status in {"below", "met"} and checked_at is not None:
+            try:
+                age = (self._now() - _timestamp(checked_at, name="reward_checked_at")).total_seconds()
+            except ValueError:
+                age = float("inf")
+            if age < 0 or age > float(REWARD_STALE_SECONDS):
+                observation["status"] = "unknown"
+                observation["threshold_status"] = "unknown"
+                observation["stale"] = True
+        return observation
 
 
 __all__ = [

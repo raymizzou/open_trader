@@ -1,7 +1,7 @@
 # Polymarket 流动性奖励人工试验 SOP
 
-版本：v2.1
-日期：2026-09-14
+版本：v2.2
+日期：2026-09-15
 状态：软件路径已实现；首次真实启动仍需独立授权和当次新鲜预检查
 
 本文描述一次由用户亲自确认的单市场、单结果 LP 试验。它不授权入金、真实下单、候选激活、自动做市、部署或连续无人值守运行。软件的 preview、start、status、stop 接口和只读状态卡用于记录与跟踪；真实启动仍须按本文重新核对事实并取得相应授权。
@@ -38,6 +38,16 @@
 4. 记录官方 scoring 查询的 `true`、`false`、错误和过期状态及查询时间。`true` 只证明该时刻符合计分条件；奖励资格、分配、到账、成交、退出和净收益是独立事实。
 
 计分持续失效时，按服务的连续失效窗口撤销未成交 BUY 余量并记录原因。单次查询失败不停止库存或止损核对；超过新鲜度阈值显示 `UNKNOWN`。不为凑最小尺寸或恢复 scoring 增加仓位。
+
+### 3.1 平台累计奖励观察（只读）
+
+服务每 60 秒读取一次官方平台 earnings，并把本次会话首次开仓对应的 UTC 计奖日固定在会话中。账户合计使用官方 `sponsored=true` 的日合计；市场合计分别读取原生和 sponsored 结果并按目标 condition、maker 和日期核对。刷新是快照替换，不在本地累加；未四舍五入的 Decimal 账户合计达到 `>= $1` 才显示“已达门槛”。账户合计不能代表本市场或本次开仓已赚到 `$1`。
+
+当前只把官方已核实的 pUSD 和 Polygon USDC.e 地址、且 `asset_rate == 1` 的 earnings 按名义 USD 观察。官方资料没有把 `asset_rate` 定义为通用美元汇率，因此非单位或未知资产／汇率保持 `UNKNOWN`，不推导汇率模型。
+
+奖励读取失败或成功记录超过 180 秒未更新时，状态为 `UNKNOWN`，并保留上一份金额、差额和上次成功时间作为旧记录；这不会清零交易状态、库存、止损或已实现交易盈亏。显示的 earnings 是平台累计，到账未核实，不写入 `paid_rewards` 或净额。会话提前完成后仍观察到原定 `review_at`；在复盘边界允许对原 UTC 日期做一次最后读取，之后保留结果并停止新查询，不滚动到下一天。
+
+运行时停止会先向只读奖励读取传递协作停止信号；当前有界 HTTP 请求返回后不再发起后续总计或分页读取。若读取线程仍未收敛，服务先执行既有后台监控的停止调用，再保留它所依赖的 LP、交易、store 和 owner，不从线程下方关闭资源，后续停止操作再完成清理。运行中的新会话沿用现有 60 秒轮询周期，首次观察可能等待最多一个周期；不保证会话创建时立即读取。此 MVP 仍限于单市场、单次开仓和复盘收尾，不启动重叠会话或重复开仓。
 
 ## 4. 成交、退出与止损
 
@@ -96,3 +106,5 @@
 - [Polymarket Prices & Orderbook](https://docs.polymarket.com/concepts/prices-orderbook)：价格、中点、bid/ask 和深度。
 - [Polymarket Market Making](https://docs.polymarket.com/trading/market-making)：限价单、库存和撤单管理。
 - [Polymarket Fees](https://docs.polymarket.com/trading/fees)：费用适用范围与计算事实。
+- [Polymarket Contracts](https://docs.polymarket.com/resources/contracts)：官方合约地址，包括 pUSD。
+- [Polymarket pUSD](https://docs.polymarket.com/concepts/pusd)：pUSD 与 USDC.e 支持关系。

@@ -5470,12 +5470,20 @@ const base = {
   sold_revenue: "0.93", residual_quantity: "12", residual_exit_value: "3.24",
   stop_loss_latched: false, opening_loss: "1.20", trade_pnl: "-0.37",
   reward_status: "unknown", reward_amount: null, total_pnl: null,
+  reward_observation: {
+    status: "below", threshold_status: "below", reward_date: "2026-09-14",
+    market_amount: "0.62", account_amount: "0.99999", gap: "0.00001",
+    last_success_at: "2026-09-14T12:03:00Z", last_attempt_at: "2026-09-14T12:03:00Z",
+    currency: "USD", paid: false,
+  },
   review_at: "2026-09-15T00:00:00Z",
 };
 const cards = {
   true: predictionLpCard({lp_session: {...base, scoring_status: "true", scoring_checked_at: "2026-09-14T12:01:00Z"}}),
   false: predictionLpCard({lp_session: {...base, scoring_status: "false", scoring_checked_at: "2026-09-14T12:02:00Z"}}),
   unknown: predictionLpCard({lp_session: {...base, scoring_status: "unknown", scoring_checked_at: "2026-09-14T12:03:00Z"}}),
+  met: predictionLpCard({lp_session: {...base, reward_observation: {...base.reward_observation, status: "met", threshold_status: "met", account_amount: "1.10", gap: "0"}}}),
+  retainedUnknown: predictionLpCard({lp_session: {...base, reward_observation: {...base.reward_observation, status: "unknown", threshold_status: "unknown", account_amount: "1.10", gap: "0", last_success_at: "2026-09-14T12:03:00Z", last_attempt_at: "2026-09-14T12:04:00Z"}}}),
 };
 console.log(JSON.stringify({
   market: cards.unknown.includes("Will it happen?") && cards.unknown.includes("YES"),
@@ -5490,6 +5498,9 @@ console.log(JSON.stringify({
   pnl: cards.unknown.includes("0.37"),
   review: cards.unknown.includes("复盘时间"),
   residualStillVisible: !cards.unknown.includes("已完成"),
+  rewardBelow: cards.unknown.includes("0.99999") && cards.unknown.includes("0.00001") && cards.unknown.includes("未达标") && cards.unknown.includes("平台累计，未核实到账") && cards.unknown.includes("计奖日（UTC）"),
+  rewardMet: cards.met.includes("1.10") && cards.met.includes("已达门槛") && cards.met.includes("距 $1 还差"),
+  rewardUnknownRetainsAmount: cards.retainedUnknown.includes("1.10") && cards.retainedUnknown.includes("UNKNOWN") && cards.retainedUnknown.includes("（保留值）") && cards.retainedUnknown.includes("上次成功") && cards.retainedUnknown.includes("20:03:00") && cards.retainedUnknown.includes("最后尝试") && cards.retainedUnknown.includes("20:04:00"),
 }));
 ''')
     assert json.loads(output) == {
@@ -5505,6 +5516,9 @@ console.log(JSON.stringify({
         "pnl": True,
         "review": True,
         "residualStillVisible": True,
+        "rewardBelow": True,
+        "rewardMet": True,
+        "rewardUnknownRetainsAmount": True,
     }
 
 

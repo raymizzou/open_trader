@@ -17,7 +17,7 @@ from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date as Date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from pathlib import Path
 from typing import Callable, Literal, cast
@@ -25,6 +25,7 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 from polymarket import BuilderApiKey, PRODUCTION, PublicClient, SecureClient
+from polymarket._internal.wallet import signature_type_for
 
 from .prediction_arbitrage import (
     MAX_NORMAL_COST,
@@ -53,6 +54,14 @@ GEOBLOCK_URL = "https://polymarket.com/api/geoblock"
 GEOBLOCK_TIMEOUT_SECONDS = 5.0
 MERGE_WAIT_TIMEOUT_SECONDS = 60.0
 REMEDIATION_BOOK_FRESHNESS_SECONDS = 10.0
+LP_REWARD_ASSET_USD_ADDRESSES = frozenset(
+    {
+        # Both contracts are identified by the official Polymarket contracts
+        # and pUSD migration docs; arbitrary reward assets remain UNKNOWN.
+        "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb",
+        "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",
+    }
+)
 COLLATERAL_BASE_UNITS = Decimal("1000000")
 DEFAULT_TICK_SIZE = Decimal("0.01")
 CENT = Decimal("0.01")
@@ -86,6 +95,10 @@ class PolymarketTradingError(RuntimeError):
         safe_code = error_code if error_code in _SAFE_ERROR_CODES else "sdk_error"
         self.error_code = safe_code
         super().__init__(f"polymarket trading error: {safe_code}")
+
+
+class _RewardReadCancelled(RuntimeError):
+    """Cooperative stop requested between bounded reward reads."""
 
 
 #: Issue #64: the N-leg unit scale (units per $1.00) shared with the #117
@@ -498,6 +511,39 @@ def _lp_decimal(value: object) -> Decimal | None:
     return parsed if parsed.is_finite() else None
 
 
+def _reward_date(value: object) -> Date | None:
+    if isinstance(value, datetime):
+        return value.astimezone(UTC).date()
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if "T" in text:
+        text = text.split("T", 1)[0]
+    try:
+        return Date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _reward_usd_value(row: Mapping[str, object]) -> Decimal | None:
+    asset = row.get("asset_address")
+    if not isinstance(asset, str) or asset.strip().lower() not in LP_REWARD_ASSET_USD_ADDRESSES:
+        return None
+    earnings = _lp_decimal(row.get("earnings"))
+    asset_rate = _lp_decimal(row.get("asset_rate"))
+    # The official reward docs identify the supported pUSD/USDC.e assets, but
+    # do not define asset_rate as a general USD FX rate.  Only a unit rate is
+    # safe to treat as nominal USD; every other valuation remains UNKNOWN.
+    if (
+        earnings is None
+        or asset_rate is None
+        or earnings < 0
+        or asset_rate != Decimal("1")
+    ):
+        return None
+    return earnings
+
+
 def _lp_level(value: object) -> dict[str, object] | None:
     row = _model_dict(value)
     if row is None:
@@ -697,6 +743,45 @@ def _string_refs(value: object) -> set[str]:
     return set()
 
 
+def _reward_total_rows(payload: object) -> tuple[Mapping[str, object], ...]:
+    if not isinstance(payload, Sequence) or isinstance(payload, (str, bytes, Mapping)):
+        raise ValueError("reward_total_shape_unknown")
+    rows: list[Mapping[str, object]] = []
+    for row in payload:
+        if not isinstance(row, Mapping):
+            raise ValueError("reward_row_unknown")
+        rows.append(row)
+    return tuple(rows)
+
+
+def _reward_amount(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    parsed_date: Date,
+    maker: str,
+    condition_id: str | None = None,
+) -> Decimal | None:
+    total = Decimal("0")
+    maker_folded = maker.casefold()
+    for row in rows:
+        if _reward_date(row.get("date")) != parsed_date:
+            return None
+        row_maker = row.get("maker_address")
+        if not isinstance(row_maker, str) or row_maker.casefold() != maker_folded:
+            return None
+        if condition_id is not None:
+            row_condition = row.get("condition_id")
+            if not isinstance(row_condition, str):
+                return None
+            if row_condition != condition_id:
+                continue
+        value = _reward_usd_value(row)
+        if value is None:
+            return None
+        total += value
+    return total
+
+
 class PolymarketTradingClient:
     """A narrow, redacted wrapper around the official synchronous SDK."""
 
@@ -806,6 +891,149 @@ class PolymarketTradingClient:
             code = _safe_error_code(exc)
             del exc
             raise PolymarketTradingError(code) from None
+
+    def lp_reward_snapshot(
+        self,
+        reward_date: str,
+        condition_id: str,
+        *,
+        stop_event: threading.Event | None = None,
+    ) -> dict[str, object]:
+        """Read one day's current platform reward record without trading.
+
+        The SDK version in use does not expose the ``sponsored`` query for
+        user earnings.  Keep its authenticated transport and add only those
+        query parameters here; the endpoint's combined total is used once so
+        native earnings cannot be counted a second time.
+        """
+
+        unknown = {
+            "state": "unknown",
+            "reward_date": reward_date,
+            "condition_id": condition_id,
+            "maker_address": self.config.wallet_address,
+        }
+        try:
+            if stop_event is not None and stop_event.is_set():
+                raise _RewardReadCancelled
+            parsed_date = Date.fromisoformat(str(reward_date))
+            if not condition_id:
+                raise ValueError("condition_id_required")
+            context = getattr(self._client, "_ctx", None)
+            transport = getattr(context, "secure_clob", None)
+            get_json = getattr(transport, "get_json", None)
+            if not callable(get_json):
+                raise ValueError("reward_transport_unknown")
+            wallet_type = getattr(context, "wallet_type", None)
+            signature_type = signature_type_for(wallet_type)
+            maker = self.config.wallet_address
+            total_payload = get_json(
+                "/rewards/user/total",
+                params={
+                    "date": parsed_date.isoformat(),
+                    "signature_type": signature_type,
+                    "maker_address": maker,
+                    "sponsored": True,
+                },
+            )
+            if stop_event is not None and stop_event.is_set():
+                raise _RewardReadCancelled
+            total_rows = _reward_total_rows(total_payload)
+            account_amount = _reward_amount(
+                total_rows, parsed_date=parsed_date, maker=maker
+            )
+            if account_amount is None:
+                raise ValueError("reward_total_unknown")
+
+            market_rows: list[Mapping[str, object]] = []
+            for sponsored in (False, True):
+                market_rows.extend(
+                    self._lp_reward_market_rows(
+                        parsed_date=parsed_date,
+                        maker=maker,
+                        condition_id=condition_id,
+                        signature_type=signature_type,
+                        sponsored=sponsored,
+                        get_json=get_json,
+                        stop_event=stop_event,
+                    )
+                )
+            market_amount = _reward_amount(
+                market_rows,
+                parsed_date=parsed_date,
+                maker=maker,
+                condition_id=condition_id,
+            )
+            if market_amount is None:
+                raise ValueError("reward_market_unknown")
+            return {
+                "state": "known",
+                "reward_date": parsed_date.isoformat(),
+                "condition_id": condition_id,
+                "maker_address": maker,
+                "account_amount": account_amount,
+                "market_amount": market_amount,
+                "account_reward": account_amount,
+                "market_reward": market_amount,
+                "currency": "USD",
+                "conversion_basis": (
+                    "earnings at unit asset_rate for verified pUSD/USDC.e assets; "
+                    "non-unit valuations UNKNOWN"
+                ),
+            }
+        except _RewardReadCancelled:
+            unknown["reason"] = "cancelled"
+            return unknown
+        except Exception as exc:
+            del exc
+            return unknown
+
+    @staticmethod
+    def _lp_reward_market_rows(
+        *,
+        parsed_date: Date,
+        maker: str,
+        condition_id: str,
+        signature_type: int,
+        sponsored: bool,
+        get_json: Callable[..., object],
+        stop_event: threading.Event | None = None,
+    ) -> list[Mapping[str, object]]:
+        rows: list[Mapping[str, object]] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                raise _RewardReadCancelled
+            params: dict[str, object] = {
+                "date": parsed_date.isoformat(),
+                "signature_type": signature_type,
+                "maker_address": maker,
+                "sponsored": sponsored,
+            }
+            if cursor is not None:
+                params["next_cursor"] = cursor
+            payload = get_json("/rewards/user", params=params)
+            if stop_event is not None and stop_event.is_set():
+                raise _RewardReadCancelled
+            if not isinstance(payload, Mapping):
+                raise ValueError("reward_page_unknown")
+            page_rows = payload.get("data")
+            if not isinstance(page_rows, Sequence) or isinstance(page_rows, (str, bytes)):
+                raise ValueError("reward_page_unknown")
+            for row in page_rows:
+                if not isinstance(row, Mapping):
+                    raise ValueError("reward_row_unknown")
+                rows.append(row)
+            next_cursor = payload.get("next_cursor")
+            if not isinstance(next_cursor, str) or not next_cursor:
+                raise ValueError("reward_pagination_unknown")
+            if next_cursor == "LTE=":
+                return rows
+            if next_cursor in seen_cursors:
+                raise ValueError("reward_pagination_loop")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
 
     def lp_snapshot(self, request: Mapping[str, object]) -> dict[str, object]:
         """Read the authenticated and public facts used by one LP session.

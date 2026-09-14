@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import subprocess
 import sys
 from dataclasses import dataclass, replace
@@ -617,6 +618,193 @@ class FakeResponse:
 def make_adapter(fake: FakeClient | None = None) -> tuple[PolymarketTradingClient, FakeClient]:
     fake = fake or FakeClient()
     return PolymarketTradingClient(TradingConfig(SIGNER, WALLET), client=fake), fake
+
+
+def test_lp_reward_snapshot_preserves_identity_assets_and_scope() -> None:
+    class RewardTransport:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, object]]] = []
+            self.payloads: dict[tuple[str, object, object], object] = {}
+            self.stop_after_path: str | None = None
+            self.stop_event: threading.Event | None = None
+
+        def get_json(self, path: str, *, params: dict[str, object]) -> object:
+            self.calls.append((path, dict(params)))
+            payload = self.payloads[(path, params.get("sponsored"), params.get("next_cursor"))]
+            if self.stop_after_path == path and self.stop_event is not None:
+                self.stop_event.set()
+            return payload
+
+    class RewardClient(FakeClient):
+        def __init__(self, transport: RewardTransport) -> None:
+            super().__init__()
+            self._ctx = SimpleNamespace(wallet_type="EOA", secure_clob=transport)
+
+    date = "2026-09-14"
+    condition_id = "condition-target"
+    native_asset = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    sponsored_asset = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+    transport = RewardTransport()
+    transport.payloads[('/rewards/user/total', True, None)] = [
+        {
+            "date": f"{date}T00:00:00Z",
+            "asset_address": native_asset,
+            "maker_address": WALLET,
+            "earnings": "0.60",
+            "asset_rate": "1",
+        },
+        {
+            "date": f"{date}T00:00:00Z",
+            "asset_address": sponsored_asset,
+            "maker_address": WALLET,
+            "earnings": "0.50",
+            "asset_rate": "1",
+        },
+    ]
+    transport.payloads[('/rewards/user', False, None)] = {
+        "data": [
+            {
+                "date": f"{date}T00:00:00Z",
+                "condition_id": condition_id,
+                "asset_address": native_asset,
+                "maker_address": WALLET,
+                "earnings": "0.50",
+                "asset_rate": "1",
+            },
+            {
+                "date": f"{date}T00:00:00Z",
+                "condition_id": "condition-other",
+                "asset_address": native_asset,
+                "maker_address": WALLET,
+                "earnings": "9.00",
+                "asset_rate": "1",
+            },
+        ],
+        "next_cursor": "page-2",
+    }
+    transport.payloads[('/rewards/user', False, "page-2")] = {
+        "data": [],
+        "next_cursor": "LTE=",
+    }
+    transport.payloads[('/rewards/user', True, None)] = {
+        "data": [
+            {
+                "date": f"{date}T00:00:00Z",
+                "condition_id": condition_id,
+                "asset_address": sponsored_asset,
+                "maker_address": WALLET,
+                "earnings": "0.30",
+                "asset_rate": "1",
+            }
+        ],
+        "next_cursor": "LTE=",
+    }
+
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET), RewardClient(transport)
+    )
+
+    snapshot = adapter.lp_reward_snapshot(date, condition_id)
+
+    assert snapshot["state"] == "known"
+    assert snapshot["account_amount"] == Decimal("1.10")
+    assert snapshot["market_amount"] == Decimal("0.80")
+    assert [params["sponsored"] for path, params in transport.calls if path == "/rewards/user/total"] == [True]
+    assert {params["sponsored"] for path, params in transport.calls if path == "/rewards/user"} == {False, True}
+    assert all(params["maker_address"] == WALLET for _, params in transport.calls)
+
+    transport.payloads[('/rewards/user/total', True, None)] = [
+        {
+            "date": f"{date}T00:00:00Z",
+            "asset_address": "0xdeadbeef",
+            "maker_address": WALLET,
+            "earnings": "1",
+            "asset_rate": "1",
+        }
+    ]
+    assert adapter.lp_reward_snapshot(date, condition_id)["state"] == "unknown"
+
+    transport.payloads[('/rewards/user/total', True, None)] = [
+        {
+            "date": f"{date}T00:00:00Z",
+            "asset_address": native_asset,
+            "maker_address": WALLET,
+            "earnings": "1",
+            "asset_rate": "1.25",
+        }
+    ]
+    assert adapter.lp_reward_snapshot(date, condition_id)["state"] == "unknown"
+
+    transport.payloads[('/rewards/user/total', True, None)] = [
+        {
+            "date": "2026-09-13T00:00:00Z",
+            "asset_address": native_asset,
+            "maker_address": WALLET,
+            "earnings": "1",
+            "asset_rate": "1",
+        }
+    ]
+    transport.payloads[('/rewards/user', False, None)] = {
+        "data": [],
+        "next_cursor": "page-2",
+    }
+    assert adapter.lp_reward_snapshot(date, condition_id)["state"] == "unknown"
+
+    transport.payloads[('/rewards/user/total', True, None)] = [
+        {
+            "date": f"{date}T00:00:00Z",
+            "asset_address": native_asset,
+            "maker_address": "0x3333333333333333333333333333333333333333",
+            "earnings": "1",
+            "asset_rate": "1",
+        }
+    ]
+    transport.calls.clear()
+    assert adapter.lp_reward_snapshot(date, condition_id)["state"] == "unknown"
+    assert [path for path, _ in transport.calls] == ["/rewards/user/total"]
+
+    transport.payloads[('/rewards/user/total', True, None)] = [
+        {
+            "date": f"{date}T00:00:00Z",
+            "asset_address": native_asset,
+            "maker_address": WALLET,
+            "earnings": "0.60",
+            "asset_rate": "1",
+        },
+        {
+            "date": f"{date}T00:00:00Z",
+            "asset_address": sponsored_asset,
+            "maker_address": WALLET,
+            "earnings": "0.50",
+            "asset_rate": "1",
+        },
+    ]
+    transport.payloads[('/rewards/user', False, "page-2")] = {
+        "data": [],
+        "next_cursor": None,
+    }
+    transport.calls.clear()
+    assert adapter.lp_reward_snapshot(date, condition_id)["state"] == "unknown"
+    assert [
+        params.get("next_cursor")
+        for path, params in transport.calls
+        if path == "/rewards/user" and params["sponsored"] is False
+    ] == [None, "page-2"]
+
+    transport.payloads[('/rewards/user', False, "page-2")] = {
+        "data": [],
+        "next_cursor": "LTE=",
+    }
+    cancel_event = threading.Event()
+    transport.stop_after_path = "/rewards/user/total"
+    transport.stop_event = cancel_event
+    transport.calls.clear()
+    cancelled = adapter.lp_reward_snapshot(
+        date, condition_id, stop_event=cancel_event
+    )
+    assert cancelled["state"] == "unknown"
+    assert cancelled["reason"] == "cancelled"
+    assert [path for path, _ in transport.calls] == ["/rewards/user/total"]
 
 
 def make_probe_intent(

@@ -2048,6 +2048,13 @@ function predictionMoney(value, fallback = "-") {
   return Number.isFinite(number) ? `$${number.toFixed(2)}` : (String(value || fallback));
 }
 
+function predictionExactMoney(value, fallback = "-") {
+  if (value === null || value === undefined || String(value).trim() === "") return fallback;
+  const text = String(value).trim();
+  if (!/^-?(?:\d+|\d*\.\d+)$/.test(text)) return fallback;
+  return `$${text}`;
+}
+
 function predictionNLegUnitsMoney(value, fallback = "-") {
   const number = Number(value);
   return Number.isFinite(number) ? `$${(number / 1000000).toFixed(2)}` : (String(value || fallback));
@@ -3067,16 +3074,43 @@ function predictionLpCard(payload) {
   const tradePnl = predictionHasValue(source.trade_pnl)
     ? predictionSignedMoney(source.trade_pnl)
     : "UNKNOWN";
-  const reward = predictionHasValue(source.reward_amount) && String(source.reward_status || "").toLowerCase() === "known"
-    ? predictionMoney(source.reward_amount)
-    : "UNKNOWN";
   const total = predictionHasValue(source.total_pnl)
     ? predictionSignedMoney(source.total_pnl)
     : "UNKNOWN";
+  const rewardObservation = source.reward_observation && typeof source.reward_observation === "object"
+    ? source.reward_observation
+    : {};
+  const rewardObservationStatus = String(rewardObservation.status || "unknown").toLowerCase();
+  const rewardStatusLabels = {below: "未达标", met: "已达门槛", unknown: "UNKNOWN"};
+  const rewardStatus = rewardStatusLabels[rewardObservationStatus] || "UNKNOWN";
+  const rewardTone = rewardObservationStatus === "met"
+    ? "pm-tone-ok"
+    : rewardObservationStatus === "below"
+      ? "pm-tone-warning"
+      : "pm-tone-danger";
+  const rewardCurrency = String(rewardObservation.currency || "").toUpperCase();
+  const rewardAmount = rewardCurrency === "USD"
+    ? (value) => predictionExactMoney(value, "UNKNOWN")
+    : () => "UNKNOWN";
+  const rewardHasRetainedAmounts = rewardObservationStatus === "unknown"
+    && [rewardObservation.market_amount, rewardObservation.account_amount, rewardObservation.gap]
+      .some((value) => predictionHasValue(value));
+  const rewardQueryAt = rewardHasRetainedAmounts
+    ? (rewardObservation.last_success_at || rewardObservation.checked_at || rewardObservation.last_attempt_at)
+    : (rewardObservation.last_attempt_at || rewardObservation.checked_at || rewardObservation.last_success_at);
+  const rewardQuery = rewardQueryAt
+    ? predictionClock(rewardHasRetainedAmounts ? "上次成功" : "最后查询", rewardQueryAt, {danger: rewardObservationStatus === "unknown"})
+    : "最后查询：UNKNOWN";
+  const rewardAttempt = rewardHasRetainedAmounts && rewardObservation.last_attempt_at
+    ? predictionClock("最后尝试", rewardObservation.last_attempt_at, {danger: true})
+    : "";
+  const rewardValueSuffix = rewardHasRetainedAmounts ? "（保留值）" : "";
+  const rewardPaid = rewardObservation.paid === false ? "平台累计，未核实到账" : "UNKNOWN";
+  const rewardRow = `<div class="pm-relation-summary pm-lp-reward-observation" aria-label="LP 奖励观察"><span>计奖日（UTC） <strong>${escapeHtml(predictionValue(rewardObservation.reward_date, "UNKNOWN"))}</strong></span><span>市场累计${rewardValueSuffix} <strong>${escapeHtml(rewardAmount(rewardObservation.market_amount))}</strong></span><span>账户累计${rewardValueSuffix} <strong>${escapeHtml(rewardAmount(rewardObservation.account_amount))}</strong></span><span>距 $1 还差${rewardValueSuffix} <strong>${escapeHtml(rewardAmount(rewardObservation.gap))}</strong></span><span class="${rewardTone}">奖励状态 <strong>${escapeHtml(rewardStatus)}</strong></span><span>${rewardQuery}</span>${rewardAttempt ? `<span>${rewardAttempt}</span>` : ""}<span>到账 <strong>${escapeHtml(rewardPaid)}</strong></span></div>`;
   const exitStatus = source.stop_loss_latched === true
     ? `止损已锁定 · ${protectedOrder}`
     : `${stage} · ${passiveOrder}`;
-  return `<section class="pm-panel pm-lp-card" aria-label="LP 会话"><header class="pm-panel-heading"><div><h2>${escapeHtml(String(market))} · ${escapeHtml(String(outcome))}</h2><p>单市场 LP · ${escapeHtml(stage)}</p></div><span class="pm-pill ${predictionTone(stage)}">${escapeHtml(stage)}</span></header><div class="pm-relation-summary"><span>入场角色 <strong>BUY · post-only GTD</strong></span><span>订单 ${escapeHtml(entryOrder)}</span><span class="${scoringTone}">计分 <strong>${escapeHtml(scoring)}</strong></span><span>${scoringTime}</span></div><div class="pm-metrics pm-lp-metrics"><article class="pm-metric"><span>已买</span><strong>${escapeHtml(predictionValue(source.buy_filled_quantity, "UNKNOWN"))}</strong><small>目标 ${escapeHtml(predictionValue(source.quantity, "UNKNOWN"))} 份</small></article><article class="pm-metric"><span>已卖</span><strong>${escapeHtml(predictionValue(source.sold_quantity, "UNKNOWN"))}</strong><small>成交回款 ${escapeHtml(predictionMoney(source.sold_revenue, "UNKNOWN"))}</small></article><article class="pm-metric"><span>剩余</span><strong>${escapeHtml(predictionValue(source.residual_quantity, "UNKNOWN"))}</strong><small>按账户持仓核对</small></article><article class="pm-metric"><span>退出状态</span><strong>${escapeHtml(exitStatus)}</strong><small>开仓盈亏 ${escapeHtml(loss)}</small></article></div><div class="pm-relation-summary"><span>已实现交易 P&amp;L <strong>${escapeHtml(tradePnl)}</strong></span><span>奖励 <strong>${escapeHtml(reward)}</strong></span><span>总净额 <strong>${escapeHtml(total)}</strong></span><span>复盘时间 <strong>${escapeHtml(source.review_at ? predictionHktTimestamp(source.review_at) : "UNKNOWN")}</strong></span></div></section>`;
+  return `<section class="pm-panel pm-lp-card" aria-label="LP 会话"><header class="pm-panel-heading"><div><h2>${escapeHtml(String(market))} · ${escapeHtml(String(outcome))}</h2><p>单市场 LP · ${escapeHtml(stage)}</p></div><span class="pm-pill ${predictionTone(stage)}">${escapeHtml(stage)}</span></header><div class="pm-relation-summary"><span>入场角色 <strong>BUY · post-only GTD</strong></span><span>订单 ${escapeHtml(entryOrder)}</span><span class="${scoringTone}">计分 <strong>${escapeHtml(scoring)}</strong></span><span>${scoringTime}</span></div><div class="pm-metrics pm-lp-metrics"><article class="pm-metric"><span>已买</span><strong>${escapeHtml(predictionValue(source.buy_filled_quantity, "UNKNOWN"))}</strong><small>目标 ${escapeHtml(predictionValue(source.quantity, "UNKNOWN"))} 份</small></article><article class="pm-metric"><span>已卖</span><strong>${escapeHtml(predictionValue(source.sold_quantity, "UNKNOWN"))}</strong><small>成交回款 ${escapeHtml(predictionMoney(source.sold_revenue, "UNKNOWN"))}</small></article><article class="pm-metric"><span>剩余</span><strong>${escapeHtml(predictionValue(source.residual_quantity, "UNKNOWN"))}</strong><small>按账户持仓核对</small></article><article class="pm-metric"><span>退出状态</span><strong>${escapeHtml(exitStatus)}</strong><small>开仓盈亏 ${escapeHtml(loss)}</small></article></div><div class="pm-relation-summary"><span>已实现交易 P&amp;L <strong>${escapeHtml(tradePnl)}</strong></span><span>总净额 <strong>${escapeHtml(total)}</strong></span><span>复盘时间 <strong>${escapeHtml(source.review_at ? predictionHktTimestamp(source.review_at) : "UNKNOWN")}</strong></span></div>${rewardRow}</section>`;
 }
 
 function predictionAnnualizedPercent(value, digits = 1) {

@@ -77,6 +77,11 @@ logger = logging.getLogger(__name__)
 _CROSS_VENUE_START_TIMEOUT = 5
 _DEFAULT_HOLDING_RECONCILER = object()
 _LP_TICK_SECONDS = 1.0
+_LP_REWARD_SECONDS = 60.0
+# One in-flight request may consume the installed SDK's bounded connect/read/
+# write/pool phases (5/10/10/2 seconds); this is a fixed cleanup grace, not a
+# whole multi-request scan deadline.
+_LP_REWARD_STOP_GRACE_SECONDS = 30.0
 
 # Keep the old spelling available for the existing Dashboard test seam.
 discover_threshold_relations = discover_threshold_relation_catalog
@@ -424,6 +429,8 @@ class PredictionRuntime:
         self._cross_validator: object | None = None
         self._lp_stop_event = threading.Event()
         self._lp_thread: threading.Thread | None = None
+        self._reward_stop_event = threading.Event()
+        self._reward_thread: threading.Thread | None = None
 
     @property
     def state(self) -> str:
@@ -796,6 +803,7 @@ class PredictionRuntime:
                 )
                 self.n_leg_order_queue_driver.start()
             self._start_lp_monitor()
+            self._start_reward_monitor()
             self._state = "RUNNING"
             logger.info(
                 "prediction_runtime_state state=RUNNING pid=%s data_dir=%s",
@@ -836,6 +844,37 @@ class PredictionRuntime:
             daemon=True,
         )
         self._lp_thread.start()
+
+    def _start_reward_monitor(self) -> None:
+        """Refresh platform LP earnings without sharing the risk-loop thread."""
+
+        if self.lp is None or self._reward_thread is not None:
+            return
+        self._reward_stop_event.clear()
+
+        def run() -> None:
+            while not self._reward_stop_event.is_set():
+                lp = self.lp
+                if lp is None:
+                    return
+                refresh_rewards = getattr(lp, "refresh_rewards", None)
+                if not callable(refresh_rewards):
+                    return
+                try:
+                    refresh_rewards(stop_event=self._reward_stop_event)
+                except Exception:
+                    # Earnings are read-only and advisory; a failed refresh
+                    # is recorded by the service without touching LP risk.
+                    logger.exception("prediction_lp_reward_refresh_failed")
+                if self._reward_stop_event.wait(_LP_REWARD_SECONDS):
+                    return
+
+        self._reward_thread = threading.Thread(
+            target=run,
+            name="prediction-lp-reward-monitor",
+            daemon=True,
+        )
+        self._reward_thread.start()
 
     def _start_shadow(self) -> None:
         try:
@@ -1043,7 +1082,21 @@ class PredictionRuntime:
     def _cleanup_resources(self) -> list[BaseException]:
         errors: list[BaseException] = []
         uncertain_thread = False
+        self._reward_stop_event.set()
         self._lp_stop_event.set()
+        reward_thread = self._reward_thread
+        if reward_thread is not None:
+            # Cooperative cancellation leaves at most one bounded SDK request
+            # in flight. Wait the fixed per-request grace, rather than
+            # treating one HTTP read timeout as a whole-scan wall bound.
+            reward_thread.join(timeout=_LP_REWARD_STOP_GRACE_SECONDS)
+            if reward_thread.is_alive():
+                errors.append(RuntimeError("prediction LP reward monitor thread did not stop"))
+                # Keep the live LP/trading/store collaborators and owner while
+                # the reader may still use them; a later stop can retry cleanup.
+                uncertain_thread = True
+            else:
+                self._reward_thread = None
         lp_thread = self._lp_thread
         if lp_thread is not None:
             lp_thread.join(timeout=5)
@@ -1109,6 +1162,10 @@ class PredictionRuntime:
                     uncertain_thread = True
                 else:
                     self.monitor = None
+        if reward_thread is not None:
+            if reward_thread.is_alive():
+                return errors
+            self._reward_thread = None
         if not uncertain_thread and self._shadow_guards is not None:
             try:
                 self._shadow_guards.close()

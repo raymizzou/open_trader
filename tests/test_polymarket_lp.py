@@ -149,6 +149,217 @@ def _request(now: datetime) -> dict[str, object]:
     }
 
 
+def test_reward_threshold_uses_current_unrounded_daily_amount(tmp_path) -> None:
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    amounts = iter(("0.99999", "1.00000", "1.10", "0.97"))
+
+    class RewardExchange:
+        def lp_reward_snapshot(self, reward_date: str, condition_id: str) -> dict[str, object]:
+            assert reward_date == "2026-09-14"
+            assert condition_id == "condition-1"
+            return {
+                "state": "known",
+                "reward_date": reward_date,
+                "condition_id": condition_id,
+                "account_amount": Decimal(next(amounts)),
+                "market_amount": Decimal("0.62"),
+            }
+
+    store = PredictionArbitrageStore(tmp_path)
+    store.lp_create_session(
+        "reward-threshold-session",
+        "reward-threshold-idempotency",
+        state="entry_open",
+        payload={
+            "condition_id": "condition-1",
+            "reward_date": "2026-09-14",
+            "paid_rewards": Decimal("0"),
+            "trade_pnl": Decimal("0"),
+        },
+    )
+    service = PolymarketLPService(
+        store, RewardExchange(), clock=lambda: now
+    )
+
+    expectations = (
+        ("below", Decimal("0.00001")),
+        ("met", Decimal("0")),
+        ("met", Decimal("0")),
+        ("below", Decimal("0.03")),
+    )
+    for expected_status, expected_gap in expectations:
+        result = service.refresh_rewards()
+        observation = result["reward_observation"]
+        assert observation["status"] == expected_status
+        assert observation["gap"] == expected_gap
+        assert result["paid_rewards"] == Decimal("0")
+        assert result["trade_pnl"] == Decimal("0")
+
+
+def test_reward_error_and_staleness_preserve_unknown_and_trade_state(tmp_path) -> None:
+    base = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    current = [base]
+
+    class RewardExchange:
+        def __init__(self) -> None:
+            self.fail = False
+
+        def lp_reward_snapshot(self, reward_date: str, condition_id: str) -> dict[str, object]:
+            assert reward_date == "2026-09-14"
+            assert condition_id == "condition-1"
+            if self.fail:
+                raise TimeoutError("rewards_timeout")
+            return {
+                "state": "known",
+                "reward_date": reward_date,
+                "condition_id": condition_id,
+                "account_amount": Decimal("0.80"),
+                "market_amount": Decimal("0.62"),
+            }
+
+    exchange = RewardExchange()
+    store = PredictionArbitrageStore(tmp_path)
+    store.lp_create_session(
+        "reward-unknown-session",
+        "reward-unknown-idempotency",
+        state="stop_loss_exit",
+        payload={
+            "condition_id": "condition-1",
+            "reward_date": "2026-09-14",
+            "entry_order_id": "entry-1",
+            "buy_filled_quantity": Decimal("10"),
+            "residual_quantity": Decimal("10"),
+            "stop_loss_latched": True,
+            "owned_order_ids": ["entry-1", "exit-1"],
+            "order_history": {"entry-1": {"status": "FILLED"}},
+            "trade_pnl": Decimal("-1.25"),
+            "paid_rewards": Decimal("0"),
+        },
+    )
+    service = PolymarketLPService(
+        store, exchange, clock=lambda: current[0]
+    )
+
+    known = service.refresh_rewards()
+    assert known["reward_observation"]["status"] == "below"
+    assert known["reward_observation"]["account_amount"] == Decimal("0.80")
+
+    current[0] = base + timedelta(seconds=181)
+    stale = service.status()
+    assert stale["reward_observation"]["status"] == "unknown"
+    assert stale["reward_observation"]["account_amount"] == Decimal("0.80")
+    assert stale["reward_observation"]["checked_at"] == known["reward_observation"]["checked_at"]
+
+    exchange.fail = True
+    current[0] = base + timedelta(seconds=182)
+    failed = service.refresh_rewards()
+    observation = failed["reward_observation"]
+    assert observation["status"] == "unknown"
+    assert observation["account_amount"] == Decimal("0.80")
+    assert observation["checked_at"] == known["reward_observation"]["checked_at"]
+    assert observation["error"] == "TimeoutError"
+    assert failed["entry_order_id"] == "entry-1"
+    assert failed["buy_filled_quantity"] == Decimal("10")
+    assert failed["residual_quantity"] == Decimal("10")
+    assert failed["stop_loss_latched"] is True
+    assert failed["trade_pnl"] == Decimal("-1.25")
+    assert failed["paid_rewards"] == Decimal("0")
+    assert failed["owned_order_ids"] == ["entry-1", "exit-1"]
+
+
+def test_reward_day_remains_bound_through_review_and_restart(tmp_path) -> None:
+    start = datetime(2026, 9, 14, 23, 59, tzinfo=UTC)
+    current = [start]
+
+    class RewardExchange:
+        def __init__(self) -> None:
+            self.requested_dates: list[str] = []
+
+        def lp_reward_snapshot(self, reward_date: str, condition_id: str) -> dict[str, object]:
+            assert condition_id == "condition-1"
+            self.requested_dates.append(reward_date)
+            return {
+                "state": "known",
+                "reward_date": reward_date,
+                "condition_id": condition_id,
+                "account_amount": Decimal("0.80")
+                if reward_date == "2026-09-14"
+                else Decimal("0.40"),
+                "market_amount": Decimal("0.80")
+                if reward_date == "2026-09-14"
+                else Decimal("0.40"),
+            }
+
+    exchange = RewardExchange()
+    store = PredictionArbitrageStore(tmp_path)
+    store.lp_create_session(
+        "reward-bound-session",
+        "reward-bound-idempotency",
+        state="entry_open",
+        payload={
+            "condition_id": "condition-1",
+            "reward_date": "2026-09-14",
+            "review_at": "2026-09-15T01:00:00Z",
+            "entry_order_id": "entry-1",
+            "owned_order_ids": ["entry-1"],
+            "trade_pnl": Decimal("0.10"),
+            "paid_rewards": Decimal("0"),
+        },
+    )
+    first = PolymarketLPService(store, exchange, clock=lambda: current[0])
+    initial = first.refresh_rewards()
+    assert initial["reward_observation"]["reward_date"] == "2026-09-14"
+    assert initial["reward_observation"]["account_amount"] == Decimal("0.80")
+
+    # Early completion is a review boundary; retaining the observation must
+    # not create a new day or reopen the order lifecycle.
+    store.lp_update_session(
+        "reward-bound-session",
+        state="complete",
+        patch={"review_status": "closed"},
+    )
+    current[0] = start + timedelta(seconds=181)
+    restarted = PolymarketLPService(store, exchange, clock=lambda: current[0])
+    recovered = restarted.status()
+    assert recovered["state"] == "complete"
+    assert recovered["reward_observation"]["status"] == "unknown"
+    assert recovered["reward_observation"]["reward_date"] == "2026-09-14"
+    assert recovered["reward_observation"]["account_amount"] == Decimal("0.80")
+    assert recovered["trade_pnl"] == Decimal("0.10")
+    assert recovered["owned_order_ids"] == ["entry-1"]
+
+    refreshed = restarted.refresh_rewards("reward-bound-session")
+    assert refreshed["state"] == "complete"
+    assert refreshed["reward_observation"]["reward_date"] == "2026-09-14"
+    assert refreshed["reward_observation"]["account_amount"] == Decimal("0.80")
+    assert refreshed["reward_observation"]["status"] == "below"
+    assert refreshed["trade_pnl"] == Decimal("0.10")
+    assert exchange.requested_dates == ["2026-09-14", "2026-09-14"]
+
+    current[0] = datetime(2026, 9, 15, 1, 1, tzinfo=UTC)
+    final = restarted.refresh_rewards("reward-bound-session")
+    assert final["state"] == "complete"
+    assert final["reward_observation"]["reward_date"] == "2026-09-14"
+    assert final["reward_observation"]["account_amount"] == Decimal("0.80")
+    assert final["reward_observation"]["status"] == "below"
+    assert exchange.requested_dates == [
+        "2026-09-14",
+        "2026-09-14",
+        "2026-09-14",
+    ]
+
+    current[0] = datetime(2026, 9, 15, 1, 2, tzinfo=UTC)
+    retained = restarted.refresh_rewards("reward-bound-session")
+    assert retained["state"] == "complete"
+    assert retained["reward_observation"]["reward_date"] == "2026-09-14"
+    assert retained["reward_observation"]["account_amount"] == Decimal("0.80")
+    assert exchange.requested_dates == [
+        "2026-09-14",
+        "2026-09-14",
+        "2026-09-14",
+    ]
+
+
 def test_preview_rejects_invalid_or_unknown_inputs(tmp_path) -> None:
     now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
     exchange = _Exchange()

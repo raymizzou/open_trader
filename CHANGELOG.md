@@ -3,8 +3,13 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-09-15
+
+- Hardened read-only LP reward shutdown: the existing stop signal now cancels further total or pagination requests after the in-flight bounded read, existing background stop calls still run, and uncertain cleanup retains live collaborators and ownership for retry. Documented that a session created between 60-second polls may wait up to one cycle for its first observation; the single-market, single-opening MVP boundary is unchanged. Verified with the amended adapter/runtime cases and the approved affected regression; no live orders or runtime deployment were performed.
+
 ## 2026-09-14
 
+- Added a read-only daily LP earnings observation to the existing session card and runtime: it binds the original UTC reward date, preserves unknown or stale values, exposes the unrounded `$1` threshold, and never treats platform earnings as paid rewards or trading P&L. Verified with focused trading, LP, runtime, service, and Dashboard regressions; no live orders or runtime deployment were performed.
 - Reconciled latched LP exits against the current protected order's confirmed
   fills and actual position before issuing another FOK, while retaining the
   latch through review with partial depth. Durable unresolved BUY/SELL submit
