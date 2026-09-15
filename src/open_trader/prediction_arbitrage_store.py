@@ -9,7 +9,7 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Literal, Mapping
@@ -720,6 +720,12 @@ class PredictionArbitrageStore:
                 payload TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS lp_daily_reports (
+                report_date TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                generated_at TEXT NOT NULL
             );
 
             DROP INDEX IF EXISTS one_active_lp_session;
@@ -2534,6 +2540,74 @@ class PredictionArbitrageStore:
                 "SELECT * FROM lp_sessions ORDER BY created_at DESC LIMIT 1"
             ).fetchone()
         return None if row is None else self._lp_row_result(row)
+
+    def lp_sessions(self) -> list[dict[str, object]]:
+        """Return stored LP sessions for a read-only daily report snapshot."""
+
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM lp_sessions ORDER BY created_at, session_id"
+            ).fetchall()
+        return [self._lp_row_result(row) for row in rows]
+
+    @staticmethod
+    def _lp_report_date(report_date: str) -> str:
+        value = str(report_date)
+        try:
+            parsed = date.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError("lp_report_date_invalid") from exc
+        if parsed.isoformat() != value:
+            raise ValueError("lp_report_date_invalid")
+        return value
+
+    def lp_daily_report(self, report_date: str) -> dict[str, object] | None:
+        key = self._lp_report_date(report_date)
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT payload, generated_at FROM lp_daily_reports WHERE report_date=?",
+                (key,),
+            ).fetchone()
+        if row is None:
+            return None
+        payload = _load_payload(str(row["payload"]))
+        payload.update(
+            {"report_date": key, "generated_at": str(row["generated_at"])}
+        )
+        return payload
+
+    def lp_latest_daily_report(self) -> dict[str, object] | None:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT report_date FROM lp_daily_reports ORDER BY report_date DESC LIMIT 1"
+            ).fetchone()
+        return None if row is None else self.lp_daily_report(str(row["report_date"]))
+
+    def lp_save_daily_report(
+        self, report_date: str, payload: Mapping[str, object]
+    ) -> dict[str, object]:
+        """Insert one immutable report per Beijing report date."""
+
+        key = self._lp_report_date(report_date)
+        generated_at = payload.get("generated_at")
+        if not isinstance(generated_at, str) or not generated_at.strip():
+            raise ValueError("lp_report_generated_at_required")
+        encoded = _dump_execution_payload(payload)
+        with self._transaction() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO lp_daily_reports(report_date,payload,generated_at) VALUES (?,?,?)",
+                (key, encoded, generated_at),
+            )
+            row = connection.execute(
+                "SELECT payload, generated_at FROM lp_daily_reports WHERE report_date=?",
+                (key,),
+            ).fetchone()
+        assert row is not None
+        saved = _load_payload(str(row["payload"]))
+        saved.update(
+            {"report_date": key, "generated_at": str(row["generated_at"])}
+        )
+        return saved
 
     def lp_create_session(
         self,

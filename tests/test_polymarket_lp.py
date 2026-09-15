@@ -617,6 +617,88 @@ def test_stop_loss_is_per_opening_and_includes_partial_exits(tmp_path) -> None:
     assert len(exchange.protected_sells) == 1
 
 
+def test_stop_trigger_evidence_is_latched_across_restart(tmp_path) -> None:
+    now = datetime(2026, 9, 14, 23, 40, tzinfo=UTC)
+    review_at = datetime(2026, 9, 15, 0, 0, tzinfo=UTC)
+    current = [now]
+    exchange = _Exchange()
+    exchange.snapshot_value = _snapshot(now)
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: current[0])
+    preview = service.preview(
+        {**_request(now), "quantity": Decimal("100"), "review_at": review_at}
+    )
+    started = service.start(str(preview["preview_id"]), "lp-trigger-evidence-1")
+    session_id = str(started["session_id"])
+    store.lp_update_session(
+        session_id, patch={"paid_rewards": Decimal("100")}
+    )
+
+    exchange.snapshot_value = _inventory_snapshot(
+        current[0],
+        buy_quantity=Decimal("100"),
+        buy_cost=Decimal("30"),
+        residual=Decimal("100"),
+        residual_value=Decimal("25.01"),
+    )
+    below_trigger = service.tick()
+    assert below_trigger["opening_loss"] == Decimal("4.99")
+    assert below_trigger["stop_loss_latched"] is False
+    assert below_trigger["stop_loss_triggered_at"] is None
+    assert below_trigger["stop_loss_triggered_loss"] is None
+
+    current[0] = now + timedelta(minutes=1)
+    exchange.snapshot_value = _inventory_snapshot(
+        current[0],
+        buy_quantity=Decimal("100"),
+        buy_cost=Decimal("30"),
+        residual=Decimal("100"),
+        residual_value=Decimal("24.99"),
+        passive_status="LIVE",
+    )
+    triggered = service.tick()
+    triggered_at = current[0].isoformat(timespec="microseconds").replace("+00:00", "Z")
+    assert triggered["opening_loss"] == Decimal("5.01")
+    assert triggered["stop_loss_latched"] is True
+    assert triggered["stop_loss_triggered_at"] == triggered_at
+    assert triggered["stop_loss_triggered_loss"] == Decimal("5.01")
+
+    current[0] = now + timedelta(minutes=2)
+    exchange.snapshot_value = _inventory_snapshot(
+        current[0],
+        buy_quantity=Decimal("100"),
+        buy_cost=Decimal("30"),
+        residual=Decimal("100"),
+        residual_value=Decimal("25.20"),
+        passive_status="LIVE",
+    )
+    later = service.tick()
+    assert later["opening_loss"] == Decimal("4.80")
+    assert later["stop_loss_triggered_at"] == triggered_at
+    assert later["stop_loss_triggered_loss"] == Decimal("5.01")
+
+    restarted = PolymarketLPService(store, exchange, clock=lambda: current[0])
+    recovered = restarted.status(session_id)
+    assert recovered["stop_loss_triggered_at"] == triggered_at
+    assert recovered["stop_loss_triggered_loss"] == Decimal("5.01")
+    assert recovered["paid_rewards"] == Decimal("100")
+    assert recovered["opening_loss"] == Decimal("4.80")
+
+    current[0] = review_at
+    exchange.snapshot_value = _inventory_snapshot(
+        current[0],
+        buy_quantity=Decimal("100"),
+        buy_cost=Decimal("30"),
+        residual=Decimal("100"),
+        residual_value=Decimal("25.20"),
+        passive_status="LIVE",
+    )
+    reviewed = restarted.tick()
+    assert reviewed["state"] == "review"
+    assert reviewed["stop_loss_triggered_at"] == triggered_at
+    assert reviewed["stop_loss_triggered_loss"] == Decimal("5.01")
+
+
 def test_entry_is_fixed_post_only_gtd_and_idempotent(tmp_path) -> None:
     now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
     exchange = _Exchange()
@@ -1161,6 +1243,76 @@ def test_review_deadline_cancels_without_forcing_sale(tmp_path) -> None:
     still_review = service.tick()
     assert still_review["state"] == "review"
     assert exchange.protected_sells == []
+
+
+def test_deadline_cancel_rejection_is_retried_after_review_resume(tmp_path) -> None:
+    now = datetime(2026, 9, 14, 23, 50, tzinfo=UTC)
+    review_at = now + timedelta(minutes=10)
+    current = [now]
+    exchange = _Exchange()
+    exchange.snapshot_value = _snapshot(now)
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: current[0])
+    preview = service.preview({**_request(now), "review_at": review_at})
+    started = service.start(str(preview["preview_id"]), "lp-review-cancel-retry-1")
+    session_id = str(started["session_id"])
+
+    def order_snapshot(at: datetime, status: str) -> dict[str, object]:
+        snapshot = _snapshot(at)
+        order = {
+            "order_id": "order-1",
+            "status": status,
+            "token_id": "0x" + "1" * 64,
+            "side": "BUY",
+            "price": Decimal("0.30"),
+            "original_size": Decimal("10"),
+            "size_matched": Decimal("0"),
+            "remaining_size": Decimal("10"),
+        }
+        snapshot["orders"] = [order]
+        account = snapshot["account"]
+        assert isinstance(account, dict)
+        snapshot["account"] = {
+            **account,
+            "open_orders": [order] if status == "LIVE" else [],
+        }
+        return snapshot
+
+    current[0] = review_at
+    exchange.snapshot_value = order_snapshot(current[0], "LIVE")
+    exchange.cancel_responses = [
+        {"canceled": [], "not_canceled": {"order-1": "still_live"}}
+    ]
+    rejected = service.tick()
+    assert rejected["state"] == "needs_attention"
+    assert rejected["resume_state"] == "review"
+    assert rejected["review_status"] == "awaiting_reconciliation"
+    assert rejected["order_history"]["order-1"]["status"] == "LIVE"  # type: ignore[index]
+    assert rejected["orders_terminal"] is False
+    assert rejected["position_reconciled"] is True
+    assert exchange.cancels == ["order-1"]
+
+    current[0] = review_at + timedelta(seconds=1)
+    exchange.snapshot_value = order_snapshot(current[0], "LIVE")
+    exchange.cancel_responses = [{"canceled": ["order-1"], "status": "CANCELED"}]
+    restarted = PolymarketLPService(store, exchange, clock=lambda: current[0])
+    accepted_but_live = restarted.tick()
+    assert accepted_but_live["state"] == "review"
+    assert accepted_but_live["review_status"] == "awaiting_reconciliation"
+    assert accepted_but_live["order_history"]["order-1"]["status"] == "LIVE"  # type: ignore[index]
+    assert accepted_but_live["orders_terminal"] is False
+    assert exchange.cancels == ["order-1", "order-1"]
+    assert len([order for order in exchange.posts if order.get("side") == "BUY"]) == 1
+
+    current[0] = review_at + timedelta(seconds=2)
+    exchange.snapshot_value = order_snapshot(current[0], "CANCELED")
+    confirmed = restarted.tick()
+    assert confirmed["state"] == "complete"
+    assert confirmed["order_history"]["order-1"]["status"] == "CANCELED"  # type: ignore[index]
+    assert confirmed["orders_terminal"] is True
+    assert confirmed["position_reconciled"] is True
+    assert exchange.cancels == ["order-1", "order-1"]
+    assert len([order for order in exchange.posts if order.get("side") == "BUY"]) == 1
 
 
 def test_review_keeps_stop_loss_and_no_repeat_entry(tmp_path) -> None:
@@ -2607,6 +2759,9 @@ def test_production_adapter_normalizes_sdk_account_market_book_and_trades() -> N
             "order_id": "order-open",
             "market": "0x" + "c" * 64,
             "condition_id": "0x" + "c" * 64,
+            "market_id": None,
+            "market_title": None,
+            "market_url": None,
             "token_id": "0x" + "1" * 64,
             "asset_id": "0x" + "1" * 64,
             "side": "SELL",

@@ -5,6 +5,18 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-15
 
+- Extended the existing LP trial card with separate refreshing orders/holdings
+  and eligible recommendations, ranked by daily reward pool. Candidate
+  confirmation rechecks the current best bid, minimum qualifying size, funds
+  and executable exit loss; manual orders remain read-only. Existing session
+  recovery now retains first-stop evidence and reconciles owned orders at the
+  fixed Beijing 08:00 review. Immutable daily reports wait for resumed
+  reconciliation, include pending cancellations, and separate realized trade
+  results, verified paid rewards, unpaid accrual and residual exposure. Initial
+  account-read failures remain visible as unknown rather than initial sync. Covered
+  by the approved adapter, API, lifecycle, report and UI contract checks,
+  the focused regression (790 passed), and offline desktop/mobile visual
+  checks; no deployment or live orders occurred.
 - Hardened read-only LP reward shutdown: the existing stop signal now cancels further total or pagination requests after the in-flight bounded read, existing background stop calls still run, and uncertain cleanup retains live collaborators and ownership for retry. Documented that a session created between 60-second polls may wait up to one cycle for its first observation; the single-market, single-opening MVP boundary is unchanged. Verified with the amended adapter/runtime cases and the approved affected regression; no live orders or runtime deployment were performed.
 
 ## 2026-09-14

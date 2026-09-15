@@ -620,6 +620,98 @@ def make_adapter(fake: FakeClient | None = None) -> tuple[PolymarketTradingClien
     return PolymarketTradingClient(TradingConfig(SIGNER, WALLET), client=fake), fake
 
 
+def test_lp_catalog_reads_all_reward_pages_without_double_counting() -> None:
+    native_asset = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    sponsored_asset = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+
+    def config(asset: str, amount: str, end_date: str = "2500-12-31") -> dict[str, object]:
+        return {
+            "id": 0,
+            "asset_address": asset,
+            "start_date": "2024-03-01",
+            "end_date": end_date,
+            "rate_per_day": amount,
+        }
+
+    native_page_1 = {
+        "condition_id": "condition-a",
+        "rewards_config": [
+            config(native_asset, "80"),
+            config(native_asset, "9", end_date="2024-12-31"),
+        ],
+        "native_daily_rate": "80",
+        "sponsored_daily_rate": "5",
+        "total_daily_rate": "85",
+    }
+    native_page_2 = {
+        "condition_id": "condition-b",
+        "rewards_config": [config(native_asset, "20")],
+        "native_daily_rate": "20",
+        "sponsored_daily_rate": "0",
+        "total_daily_rate": "20",
+    }
+    sponsored_page = {
+        "condition_id": "condition-a",
+        "rewards_config": [config(sponsored_asset, "5")],
+        "native_daily_rate": "80",
+        "sponsored_daily_rate": "5",
+        "total_daily_rate": "85",
+    }
+
+    class PagedRewards:
+        def __init__(
+            self,
+            pages: tuple[tuple[dict[str, object], ...], ...],
+            *,
+            fail_page: int | None = None,
+        ) -> None:
+            self.pages = pages
+            self.fail_page = fail_page
+
+        def iter_items(self):
+            for index, page in enumerate(self.pages):
+                if index == self.fail_page:
+                    raise RuntimeError("second reward page unavailable")
+                yield from page
+
+    class PublicRewardsClient:
+        def __init__(self, *, fail_native_page: int | None = None) -> None:
+            self.calls: list[bool] = []
+            self.fail_native_page = fail_native_page
+
+        def list_current_rewards(self, *, sponsored: bool = False) -> PagedRewards:
+            self.calls.append(sponsored)
+            if sponsored:
+                return PagedRewards(((sponsored_page,),))
+            return PagedRewards(
+                ((native_page_1,), (native_page_2,)),
+                fail_page=self.fail_native_page,
+            )
+
+    public = PublicRewardsClient()
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        client=FakeClient(),
+        public_client_factory=lambda: public,
+    )
+
+    catalog = adapter.lp_reward_catalog()
+
+    assert catalog["state"] == "known"
+    assert catalog["daily_pool_usd"] == Decimal("105")
+    assert public.calls == [False, True]
+
+    incomplete_public = PublicRewardsClient(fail_native_page=1)
+    incomplete_adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        client=FakeClient(),
+        public_client_factory=lambda: incomplete_public,
+    )
+    incomplete = incomplete_adapter.lp_reward_catalog()
+
+    assert incomplete["state"] == "unknown"
+
+
 def test_lp_reward_snapshot_preserves_identity_assets_and_scope() -> None:
     class RewardTransport:
         def __init__(self) -> None:
@@ -805,6 +897,50 @@ def test_lp_reward_snapshot_preserves_identity_assets_and_scope() -> None:
     assert cancelled["state"] == "unknown"
     assert cancelled["reason"] == "cancelled"
     assert [path for path, _ in transport.calls] == ["/rewards/user/total"]
+
+
+def test_lp_rewards_preserve_raw_accrual_when_usd_value_is_unknown() -> None:
+    date = "2026-09-14"
+    condition_id = "condition-raw-reward"
+    usdc_e = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+
+    class RewardTransport:
+        def get_json(self, path: str, *, params: dict[str, object]) -> object:
+            row = {
+                "date": f"{date}T00:00:00Z",
+                "asset_address": usdc_e,
+                "maker_address": WALLET,
+                "condition_id": condition_id,
+                "earnings": "0.25",
+                "asset_rate": "0.9999",
+            }
+            if path == "/rewards/user/total":
+                return [{key: value for key, value in row.items() if key != "condition_id"}]
+            return {
+                "data": [row] if params["sponsored"] is False else [],
+                "next_cursor": "LTE=",
+            }
+
+    class RewardClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self._ctx = SimpleNamespace(
+                wallet_type="EOA", secure_clob=RewardTransport()
+            )
+
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET), RewardClient()
+    )
+
+    snapshot = adapter.lp_reward_snapshot(date, condition_id)
+
+    assert snapshot["state"] == "unknown"
+    assert snapshot.get("market_amount") is None
+    assert snapshot["market_amount_raw"] == Decimal("0.25")
+    assert snapshot["market_asset"] == "USDC.e"
+    assert snapshot["usd_state"] == "unknown"
+    assert snapshot["paid"] is False
+    assert snapshot.get("paid_rewards") is None
 
 
 def make_probe_intent(

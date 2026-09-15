@@ -5522,6 +5522,186 @@ console.log(JSON.stringify({
     }
 
 
+def test_lp_sections_refresh_without_losing_confirmation() -> None:
+    output = run_dashboard_js(r'''
+const requests = [];
+const intervals = [];
+const longManualTitle = "印度央行将在 2026 年 10 月会议上加息至少 25 个基点吗？官方市场完整长名称";
+const dashboard = {
+  state: "ready",
+  stale: false,
+  complete: true,
+  checked_at: "2026-09-15T04:00:00Z",
+  orders: [{
+    order_id: "manual-order", market_id: "market-manual",
+    condition_id: "condition-manual", token_id: "manual-token",
+    market_title: longManualTitle, market_url: "https://polymarket.com/event/manual",
+    outcome: "NO", side: "BUY", status: "LIVE", price: "0.51",
+    quantity: "20", filled_quantity: "5", remaining_quantity: "15",
+    management: "manual_read_only", read_only: true,
+    scoring_status: "true", scoring_checked_at: "2026-09-15T03:59:30Z",
+  }, {
+    order_id: "manual-order-second", market_id: "market-manual",
+    condition_id: "condition-manual", token_id: "manual-token",
+    market_title: longManualTitle, market_url: "https://polymarket.com/event/manual",
+    outcome: "NO", side: "BUY", status: "LIVE", price: "0.52",
+    quantity: "10", filled_quantity: "0", remaining_quantity: "10",
+    management: "manual_read_only", read_only: true,
+    scoring_status: "false", scoring_checked_at: "2026-09-15T03:59:30Z",
+  }],
+  positions: [{
+    market_id: "market-manual", condition_id: "condition-manual",
+    token_id: "manual-token", market_title: longManualTitle,
+    outcome: "NO", size: "5", management: "manual_read_only", read_only: true,
+  }],
+  market_rewards: {"condition-manual": {
+    condition_id: "condition-manual", state: "known",
+    market_amount_raw: "0.02", asset: "USDC.e", market_amount: null,
+    currency: "USDC.e", checked_at: "2026-09-15T03:59:00Z", paid: false,
+  }},
+  candidates: [
+    {
+      market_id: "market-candidate-a", condition_id: "condition-candidate-a",
+      token_id: "candidate-a-no", outcome: "NO",
+      market_title: "纽约 9 月降雨量为 4–5 英寸？", market_url: "https://polymarket.com/event/rain-a",
+      daily_pool_usd: "150", price: "0.40", quantity: "20",
+      required_capital: "8.00", estimated_exit_loss: "0.40",
+      checked_at: "2026-09-15T04:00:00Z", review_at: "2026-09-16T00:00:00Z",
+    },
+    {
+      market_id: "market-candidate-b", condition_id: "condition-candidate-b",
+      token_id: "candidate-b-no", outcome: "NO",
+      market_title: "纽约 9 月降雨量为 5–6 英寸？", market_url: "https://polymarket.com/event/rain-b",
+      daily_pool_usd: "100", price: "0.50", quantity: "20",
+      required_capital: "10.00", estimated_exit_loss: "0.20",
+      checked_at: "2026-09-15T04:00:00Z", review_at: "2026-09-16T00:00:00Z",
+    },
+  ],
+};
+const firstReadFailure = {
+  state: "unknown", stale: true, checked_at: null, last_success_at: null,
+  error: "账户数据读取失败",
+};
+const preview = {
+  state: "previewed", preview_id: "preview-candidate-a",
+  request: {
+    market_id: "market-candidate-a", condition_id: "condition-candidate-a",
+    token_id: "candidate-a-no", outcome: "NO", price: "0.40",
+    quantity: "20", review_at: "2026-09-16T00:00:00Z",
+  },
+  preflight: {estimated_exit_loss: "0.40"},
+};
+let dashboardReads = 0;
+globalThis.window = {
+  location: {search: ""},
+  setInterval(fn, milliseconds) { intervals.push({fn, milliseconds}); return intervals.length; },
+  clearInterval() {},
+};
+const response = (data, ok = true, status = 200) => ({ok, status, json: async () => data});
+globalThis.fetch = async (url, options = {}) => {
+  const request = {url: String(url), method: String(options.method || "GET"), body: options.body || ""};
+  requests.push(request);
+  if (request.url.endsWith("/api/prediction-arbitrage/lp/dashboard")) {
+    dashboardReads += 1;
+    if (dashboardReads === 1) return response(firstReadFailure);
+    if (dashboardReads === 2) return response(dashboard);
+    return response({error: "offline"}, false, 503);
+  }
+  if (request.url.endsWith("/api/prediction-arbitrage/lp/candidates/preview")) return response(preview);
+  if (request.url.endsWith("/api/prediction-arbitrage/state")) {
+    return response({lp_session: {state: "none"}, csrf_token: "csrf-token", histories: {signals: []}});
+  }
+  throw new Error("unexpected request: " + request.method + " " + request.url);
+};
+state.workspaceView = "prediction_market";
+state.predictionMarket.csrfToken = "csrf-token";
+state.predictionMarket.payload = {lp_session: {state: "none"}, histories: {signals: []}};
+startPredictionPolling();
+await fetchPredictionLpDashboard();
+const firstFailure = predictionLpCard(state.predictionMarket.payload);
+const firstFailureState = state.predictionMarket.payload.lp_dashboard;
+await fetchPredictionLpDashboard();
+const initial = predictionLpCard(state.predictionMarket.payload);
+const partial = predictionLpCard({
+  ...state.predictionMarket.payload,
+  lp_dashboard: {...dashboard, complete: false},
+});
+const candidateButton = {disabled: false, dataset: {candidateIndex: "0"}};
+await handlePredictionMarketClick({target: {closest(selector) {
+  return selector === "[data-action='lp-candidate-preview']" ? candidateButton : null;
+}}});
+const expanded = predictionLpCard(state.predictionMarket.payload);
+const candidateRequest = requests.find((item) => item.url.endsWith("/lp/candidates/preview"));
+const timer = intervals.find((item) => item.milliseconds === 5000);
+if (!timer) throw new Error("LP polling did not install the 5 second refresh");
+await timer.fn();
+const stale = predictionLpCard(state.predictionMarket.payload);
+console.log(JSON.stringify({
+  intervalMs: timer.milliseconds,
+  dashboardReads,
+  firstReadFailure: firstFailure.includes("读取失败")
+    && firstFailure.includes("UNKNOWN")
+    && firstFailure.includes("账户数据读取失败")
+    && !firstFailure.includes("等待首次同步")
+    && !firstFailure.includes("已保留旧结果")
+    && firstFailureState.stale === true
+    && firstFailureState.state === "unknown",
+  tableHeaders: (initial.match(/<table class="pm-table[^"]*"[\s\S]*?<\/table>/g) || [])
+    .map((table) => (table.match(/<th\b/g) || []).length),
+  noEmptySession: !initial.includes("当前没有进行中的 LP 会话"),
+  oneTitleAndRefresh: initial.includes("流动性提供试验") && !initial.includes("账户与候选管理") && initial.includes("立即刷新"),
+  safeMarketLink: initial.includes('href="https://polymarket.com/event/manual"') && initial.includes('rel="noopener noreferrer"'),
+  mergedPosition: (() => {
+    const orderTable = (initial.match(/<table class="pm-table[^>]*>[\s\S]*?<\/table>/) || [""])[0];
+    return orderTable.includes("当前持仓 5 份")
+      && orderTable.includes("持仓见同标的上一行")
+      && (orderTable.match(/当前持仓 5 份/g) || []).length === 1
+      && orderTable.split(longManualTitle).length - 1 === 2;
+  })(),
+  honestManualPnl: initial.includes("未接管止损") && initial.includes("已实现 UNKNOWN") && initial.includes("持仓 P&amp;L UNKNOWN"),
+  partialCatalogVisible: partial.includes("候选目录尚未完整") && partial.includes("纽约 9 月降雨量为 4–5 英寸？"),
+  initialShowsBothLists: initial.includes("我的订单与持仓") && initial.includes("推荐开仓"),
+  longName: initial.includes(longManualTitle),
+  manualReadOnly: initial.includes("手工单 · 只读") && !initial.includes("data-manual-cancel"),
+  scoring: initial.includes("官方计分中"),
+  marketCumulative: initial.includes("市场累计") && initial.includes("0.02 USDC.e") && initial.includes("平台累计，未核实到账"),
+  serverEconomics: initial.includes("$8.00") && initial.includes("$0.40"),
+  confirmationExpanded: expanded.includes("确认开仓") && expanded.includes("买入 NO") && expanded.includes("40¢ × 20 份") && expanded.includes("复盘时间") && expanded.includes("08:00") && expanded.includes("每次开仓 $5") && expanded.includes("不保证损失上限"),
+  previewIdInDetails: /<details[^>]*>[\s\S]*preview-candidate-a[\s\S]*<\/details>/.test(expanded),
+  previewIdentityOnly: candidateRequest && JSON.stringify(JSON.parse(candidateRequest.body)) === JSON.stringify({
+    market_id: "market-candidate-a", condition_id: "condition-candidate-a",
+    token_id: "candidate-a-no", outcome: "NO",
+  }),
+  detailsSurviveRefresh: stale.includes("确认开仓") && stale.includes("preview-candidate-a"),
+  staleRetainsData: stale.includes(longManualTitle) && stale.includes("纽约 9 月降雨量为 4–5 英寸？") && stale.includes("上次成功数据"),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered == {
+    "intervalMs": 5000,
+    "dashboardReads": 3,
+    "firstReadFailure": True,
+    "tableHeaders": [4, 6],
+    "noEmptySession": True,
+    "oneTitleAndRefresh": True,
+    "safeMarketLink": True,
+    "mergedPosition": True,
+    "honestManualPnl": True,
+    "partialCatalogVisible": True,
+        "initialShowsBothLists": True,
+        "longName": True,
+        "manualReadOnly": True,
+        "scoring": True,
+        "marketCumulative": True,
+        "serverEconomics": True,
+    "confirmationExpanded": True,
+    "previewIdInDetails": True,
+        "previewIdentityOnly": True,
+        "detailsSurviveRefresh": True,
+        "staleRetainsData": True,
+    }
+
+
 def test_dashboard_display_number_formats_numeric_text_only() -> None:
     output = run_dashboard_js(r'''
 console.log(JSON.stringify({

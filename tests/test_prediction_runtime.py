@@ -437,9 +437,219 @@ def test_lp_restart_owns_one_session_and_preserves_monitoring(
             runtime._owner.release()
 
 
-def test_reward_observation_does_not_block_lp_risk_monitor(
+def test_lp_report_waits_for_restart_reconciliation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A late report uses fills discovered by the restart's first LP tick."""
+    import open_trader.polymarket_lp as lp_module
+    import open_trader.prediction_arbitrage_execution as execution_module
+    import open_trader.prediction_runtime as runtime_module
+
+    clock_time = datetime(2026, 9, 15, 0, 3, tzinfo=UTC)
+    cutoff = datetime(2026, 9, 15, 0, 0, tzinfo=UTC)
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> FrozenDateTime:
+            fixed = cls.fromtimestamp(clock_time.timestamp(), tz=tz or UTC)
+            return fixed if tz is not None else fixed.replace(tzinfo=None)
+
+    now = FrozenDateTime(2026, 9, 15, 0, 3, tzinfo=UTC)
+
+    class Trading:
+        def __init__(self) -> None:
+            self.snapshot_started = threading.Event()
+            self.release_snapshot = threading.Event()
+            self.candidate_catalog_started = threading.Event()
+
+        def lp_snapshot(self, _request: dict[str, object]) -> dict[str, object]:
+            self.snapshot_started.set()
+            assert self.release_snapshot.wait(timeout=5)
+            return {
+                "account": {
+                    "authenticated": True,
+                    "balance": Decimal("100"),
+                    "allowance": Decimal("100"),
+                    "positions": [{"token_id": "token-1", "size": Decimal("12")}],
+                    "open_orders": [{"order_id": "exit-order", "token_id": "token-1", "side": "SELL"}],
+                },
+                "market": {
+                    "market_id": "market-1",
+                    "condition_id": "condition-1",
+                    "token_id": "token-1",
+                    "outcome": "YES",
+                    "accepting_orders": True,
+                    "minimum_order_size": Decimal("1"),
+                    "tick_size": Decimal("0.01"),
+                    "fee": Decimal("0"),
+                    "fees_enabled": True,
+                    "taker_fee_rate": Decimal("0"),
+                },
+                "book": {
+                    "received_at": now,
+                    "bids": [{"price": Decimal("0.48"), "size": Decimal("100")}],
+                    "asks": [],
+                },
+                "trades": [
+                    {
+                        "trade_id": "buy-1",
+                        "matched_at": FrozenDateTime(2026, 9, 14, 14, 0, tzinfo=UTC),
+                        "status": "CONFIRMED",
+                        "maker_orders": [{
+                            "order_id": "entry-order", "token_id": "token-1",
+                            "side": "BUY", "matched_amount": Decimal("20"),
+                            "price": Decimal("0.50"), "fee": Decimal("0.02"),
+                        }],
+                    },
+                    {
+                        "trade_id": "sell-1",
+                        "matched_at": FrozenDateTime(2026, 9, 14, 23, 45, tzinfo=UTC),
+                        "status": "CONFIRMED",
+                        "maker_orders": [{
+                            "order_id": "exit-order", "token_id": "token-1",
+                            "side": "SELL", "matched_amount": Decimal("8"),
+                            "price": Decimal("0.55"), "fee": Decimal("0.01"),
+                        }],
+                    },
+                ],
+                "orders": [
+                    {"order_id": "entry-order", "token_id": "token-1", "side": "BUY", "status": "FILLED"},
+                    {"order_id": "exit-order", "token_id": "token-1", "side": "SELL", "status": "LIVE"},
+                ],
+            }
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "wallet_address": "0x2222222222222222222222222222222222222222",
+                "p_usd_balance": Decimal("100"),
+                "p_usd_allowance": Decimal("100"),
+                "open_order_ids": [],
+                "positions": [],
+                "checked_at": now,
+            }
+
+        def readiness_snapshot(self) -> dict[str, object]:
+            return {"relayer_ready": True, "merge_ready": True, "checked_at": now}
+
+        def lp_reward_catalog(self, **_kwargs: object) -> dict[str, object]:
+            self.candidate_catalog_started.set()
+            return {"state": "known", "complete": True, "checked_at": now, "markets": []}
+
+        def lp_reward_snapshot(self, reward_date: str, condition_id: str, **_kwargs: object) -> dict[str, object]:
+            return {"state": "unknown", "reward_date": reward_date, "condition_id": condition_id}
+
+        def get_order_scoring(self, _order_id: str) -> object:
+            return None
+
+        def cancel_order(self, _order_id: str) -> bool:
+            return False
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(lp_module, "datetime", FrozenDateTime)
+    monkeypatch.setattr(execution_module, "datetime", FrozenDateTime)
+    monkeypatch.setattr(runtime_module, "_LP_TICK_SECONDS", 0.01)
+    seed_store = PredictionArbitrageStore(tmp_path)
+    seed_store.lp_create_session(
+        "restart-report-session",
+        "restart-report-idempotency",
+        state="entry_open",
+        payload={
+            "market_id": "market-1", "condition_id": "condition-1",
+            "token_id": "token-1", "outcome": "YES",
+            "price": Decimal("0.50"), "quantity": Decimal("20"),
+            "review_at": cutoff, "entry_order_id": "entry-order",
+            "passive_exit_order_id": "exit-order",
+            "owned_order_ids": ["entry-order", "exit-order"],
+            "order_history": {
+                "entry-order": {"token_id": "token-1", "side": "BUY", "status": "LIVE"},
+                "exit-order": {"token_id": "token-1", "side": "SELL", "status": "LIVE"},
+            },
+            "trade_events": [], "verified_paid_reward_events": [],
+            "buy_filled_quantity": Decimal("0"), "buy_cost": Decimal("0"),
+            "buy_fees": Decimal("0"), "sold_quantity": Decimal("0"),
+            "sold_revenue": Decimal("0"), "sell_fees": Decimal("0"),
+            "residual_quantity": Decimal("0"), "residual_exit_value": Decimal("0"),
+            "account_checked_at": "2026-09-14T23:59:00Z",
+            "book_checked_at": "2026-09-14T23:59:00Z",
+        },
+    )
+    trading = Trading()
+    config = SimpleNamespace(
+        signer_address="0x1111111111111111111111111111111111111111",
+        wallet_address="0x2222222222222222222222222222222222222222",
+        predict=None,
+    )
+
+    class MacOSNotifier:
+        pass
+
+    class FeishuNotifier:
+        pass
+
+    monkeypatch.setattr(runtime_module, "load_trading_config", lambda _path: config)
+    monkeypatch.setattr(
+        runtime_module, "PolymarketTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: trading), raising=False,
+    )
+    monkeypatch.setattr(
+        runtime_module, "PredictTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: None), raising=False,
+    )
+    runtime = PredictionRuntime(
+        data_dir=tmp_path,
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+        notifier=SimpleNamespace(_notifiers=(MacOSNotifier(), FeishuNotifier())),
+        cross_venue_monitor=_UnavailableCrossVenueMonitor("test-disabled"),
+        solver_server_factory=lambda: object(),
+        enable_n_leg_background=False,
+    )
+    runtime.start()
+    try:
+        assert runtime.state == "RUNNING"
+        assert runtime.store is not None
+        assert trading.snapshot_started.wait(timeout=2)
+        assert trading.candidate_catalog_started.wait(timeout=2)
+        assert runtime.store.lp_daily_report("2026-09-15") is None
+        trading.release_snapshot.set()
+        deadline = time.monotonic() + 3
+        report = None
+        pending_session = None
+        while time.monotonic() < deadline:
+            report = runtime.store.lp_daily_report("2026-09-15")
+            pending_session = runtime.store.lp_active_session()
+            if (
+                report is not None
+                and pending_session is not None
+                and pending_session.get("state") == "needs_attention"
+                and pending_session.get("review_status") == "awaiting_reconciliation"
+            ):
+                break
+            time.sleep(0.01)
+        assert pending_session is not None
+        assert pending_session["state"] == "needs_attention"
+        assert pending_session["review_status"] == "awaiting_reconciliation"
+        assert str(pending_session["reconciliation"]).startswith("deadline_cancel_")
+        assert report is not None
+        session = report["sessions"][0]
+        assert Decimal(str(session["realized_trade_pnl"])) == Decimal("0.382")
+        assert session["residual_quantity_at_period_end"] == "12"
+        assert report["generated_at"] == "2026-09-15T00:03:00Z"
+        assert report["cutoff_market_data_status"] == "unknown"
+    finally:
+        trading.release_snapshot.set()
+        runtime.stop()
+
+    reopened = PredictionArbitrageStore(tmp_path)
+    assert reopened.lp_daily_report("2026-09-15") == report
+
+
+def test_lp_dashboard_refresh_cannot_block_risk_monitor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A blocked server-side candidate refresh stays outside risk and UI lifecycles."""
     import open_trader.prediction_runtime as runtime_module
 
     class RewardProbe:
@@ -449,6 +659,9 @@ def test_reward_observation_does_not_block_lp_risk_monitor(
             self.release_after_stop = threading.Event()
             self.stop_observed = threading.Event()
             self.reward_finished = threading.Event()
+            self.catalog_started = threading.Event()
+            self.release_catalog = threading.Event()
+            self.catalog_finished = threading.Event()
             self.risk_snapshot_started = threading.Event()
             self.risk_reconciled = threading.Event()
             self.close_called = threading.Event()
@@ -457,6 +670,10 @@ def test_reward_observation_does_not_block_lp_risk_monitor(
             self.calls = 0
             self.active = 0
             self.max_active = 0
+            self.catalog_state = "unknown"
+            self.catalog_calls = 0
+            self.catalog_active = 0
+            self.catalog_max_active = 0
             self._lock = threading.Lock()
 
     class FakeTrading:
@@ -464,7 +681,10 @@ def test_reward_observation_does_not_block_lp_risk_monitor(
             self.probe = probe
 
         def lp_snapshot(self, _request: dict[str, object]) -> dict[str, object]:
-            if self.probe.reward_started.is_set():
+            if (
+                self.probe.catalog_started.is_set()
+                or self.probe.reward_started.is_set()
+            ):
                 self.probe.risk_snapshot_started.set()
             return {
                 "account": {
@@ -514,6 +734,39 @@ def test_reward_observation_does_not_block_lp_risk_monitor(
 
         def get_order_scoring(self, _order_id: str) -> object:
             return None
+
+        def lp_reward_catalog(
+            self, *, stop_event: threading.Event | None = None
+        ) -> dict[str, object]:
+            with self.probe._lock:
+                self.probe.catalog_calls += 1
+                self.probe.catalog_active += 1
+                self.probe.catalog_max_active = max(
+                    self.probe.catalog_max_active,
+                    self.probe.catalog_active,
+                )
+            self.probe.catalog_started.set()
+            try:
+                if self.probe.catalog_state == "unknown":
+                    assert self.probe.release_catalog.wait(timeout=5)
+                    return {
+                        "state": "unknown",
+                        "complete": False,
+                        "checked_at": datetime.now(UTC),
+                        "daily_pool_usd": None,
+                        "markets": (),
+                    }
+                return {
+                    "state": "known",
+                    "complete": True,
+                    "checked_at": datetime.now(UTC),
+                    "daily_pool_usd": Decimal("0"),
+                    "markets": (),
+                }
+            finally:
+                with self.probe._lock:
+                    self.probe.catalog_active -= 1
+                self.probe.catalog_finished.set()
 
         def lp_reward_snapshot(
             self,
@@ -684,6 +937,16 @@ def test_reward_observation_does_not_block_lp_risk_monitor(
     first.start()
     try:
         assert first.state == "RUNNING"
+        # No Dashboard request is made while this external catalog read is
+        # blocked; the runtime-owned worker still starts the refresh.
+        assert probe_holder[0].catalog_started.wait(timeout=2)
+        assert probe_holder[0].catalog_calls == 1
+        assert probe_holder[0].catalog_active == 1
+        assert probe_holder[0].catalog_max_active == 1
+        assert probe_holder[0].risk_snapshot_started.wait(timeout=2)
+        assert not probe_holder[0].release_catalog.is_set()
+        probe_holder[0].release_catalog.set()
+        assert probe_holder[0].catalog_finished.wait(timeout=2)
         assert probe_holder[0].reward_started.wait(timeout=2)
         # This event is emitted only by the external account snapshot after
         # the reward reader has entered its blocked state.
@@ -721,6 +984,7 @@ def test_reward_observation_does_not_block_lp_risk_monitor(
         assert stop_errors == []
     finally:
         probe_holder[0].release_reward.set()
+        probe_holder[0].release_catalog.set()
         probe_holder[0].release_after_stop.set()
         if first.state not in {"STOPPED", "NEW"}:
             first.stop()
@@ -729,16 +993,25 @@ def test_reward_observation_does_not_block_lp_risk_monitor(
     # Public stop/start recovery creates one fresh runtime task while the
     # completed session keeps its original UTC reward identity.
     probe_holder[0] = RewardProbe()
+    probe_holder[0].catalog_state = "known"
     normal_reward_grace = runtime_module._LP_REWARD_STOP_GRACE_SECONDS
     monkeypatch.setattr(runtime_module, "_LP_REWARD_STOP_GRACE_SECONDS", 0.0)
     second = new_runtime()
     second.start()
     try:
         assert second.state == "RUNNING"
+        assert probe_holder[0].catalog_started.wait(timeout=2)
+        assert probe_holder[0].catalog_finished.wait(timeout=2)
+        assert probe_holder[0].catalog_calls == 1
+        assert probe_holder[0].catalog_max_active == 1
         assert probe_holder[0].reward_started.wait(timeout=2)
         assert probe_holder[0].risk_snapshot_started.wait(timeout=2)
         assert probe_holder[0].max_active == 1
         assert probe_holder[0].calls == 1
+        refresh_thread = second._reward_thread
+        assert refresh_thread is not None
+        second._start_reward_monitor()
+        assert second._reward_thread is refresh_thread
         with pytest.raises(RuntimeError, match="prediction runtime cleanup failed"):
             second.stop()
         assert second.state == "STOPPING"
@@ -764,9 +1037,11 @@ def test_reward_observation_does_not_block_lp_risk_monitor(
         second.stop()
         assert second.state == "STOPPED"
         assert probe_holder[0].close_called.is_set()
+        assert probe_holder[0].catalog_calls == 1
         assert probe_holder[0].calls == 1
     finally:
         probe_holder[0].release_reward.set()
+        probe_holder[0].release_catalog.set()
         probe_holder[0].release_after_stop.set()
         probe_holder[0].reward_finished.wait(timeout=2)
         monkeypatch.setattr(

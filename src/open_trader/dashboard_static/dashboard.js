@@ -58,6 +58,8 @@ const state = {
     error: "",
     pollId: null,
     stateRequestInFlight: false,
+    lpDashboardRequestInFlight: false,
+    lpConfirmation: null,
     signalPollId: null,
     signalRequestInFlight: false,
     signalLastSuccessAt: "",
@@ -3032,7 +3034,308 @@ function predictionUnifiedPage(payload, filter) {
   return `${predictionUnifiedPageHeader(viewPayload)}${predictionLpCard(viewPayload)}${predictionModeBar(viewPayload)}${predictionNLegIncidentPanel(viewPayload)}${predictionNLegMetrics(viewPayload)}${predictionReadinessStrip(viewPayload)}${predictionCapitalUsage(viewPayload)}${predictionObservationCoverage(viewPayload)}${predictionUnifiedOpportunityList(viewPayload, filterState)}${predictionRelationReview(viewPayload)}${predictionErrorAlert()}${predictionExecutionAlert(viewPayload)}${relationReviewDrawer()}${nlegReportDrawer()}`;
 }
 
+function lpDashboardRows(value) {
+  return Array.isArray(value)
+    ? value.filter((row) => row && typeof row === "object" && !Array.isArray(row))
+    : [];
+}
+
+function lpDashboardMoney(value) {
+  return predictionHasValue(value) && Number.isFinite(Number(value))
+    ? predictionMoney(value, "UNKNOWN")
+    : "UNKNOWN";
+}
+
+function lpDashboardPrice(value) {
+  const price = Number(value);
+  if (!predictionHasValue(value) || !Number.isFinite(price) || price < 0 || price > 1) return "UNKNOWN";
+  return (price * 100).toFixed(2).replace(/\.?0+$/, "") + "¢";
+}
+
+function lpMarketTitle(item) {
+  return String(item.market_title || item.market || item.question || "标的未返回");
+}
+
+function lpMarketTitleLink(item) {
+  const title = escapeHtml(lpMarketTitle(item));
+  const url = String(item.market_url || "").trim();
+  if (!/^https:\/\/polymarket\.com\/[^"'<>\\\s]+$/i.test(url)) return "<strong>" + title + "</strong>";
+  return "<strong><a href=\"" + escapeHtml(url)
+    + "\" rel=\"noopener noreferrer\" target=\"_blank\">" + title + "</a></strong>";
+}
+
+function lpDashboardRewards(value) {
+  if (Array.isArray(value)) {
+    return Object.fromEntries(value
+      .filter((item) => item && typeof item === "object" && item.condition_id)
+      .map((item) => [String(item.condition_id), item]));
+  }
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+function lpDashboardRewardCell(item, rewards, shown) {
+  const identity = String(item.condition_id || "");
+  const repeated = identity && shown.has(identity);
+  if (identity) shown.add(identity);
+  const reward = identity && !repeated && rewards[identity] && typeof rewards[identity] === "object"
+    ? rewards[identity] : {};
+  const rawAmount = reward.market_amount_raw ?? reward.raw_amount;
+  const rawAsset = reward.asset || reward.market_asset || (String(reward.currency || "").toUpperCase() !== "USD" ? reward.currency : "");
+  const currency = String(reward.currency || "").toUpperCase();
+  const amount = predictionHasValue(rawAmount) && predictionHasValue(rawAsset)
+    ? String(rawAmount) + " " + String(rawAsset)
+    : currency === "USD" && predictionHasValue(reward.market_amount)
+      ? predictionExactMoney(reward.market_amount, "UNKNOWN")
+      : "UNKNOWN";
+  const paid = reward.paid === true ? "已核实到账" : "平台累计，未核实到账";
+  const score = lpDashboardOfficialScoring(item);
+  const queryTime = predictionHasValue(item.scoring_checked_at)
+    ? predictionHktTimestamp(item.scoring_checked_at)
+    : "UNKNOWN";
+  const marketReward = repeated ? "市场累计见同市场上一行" : "市场累计 " + amount;
+  return "<div><strong>" + escapeHtml(score) + "</strong><span class=\"sub\">"
+    + escapeHtml(queryTime) + "</span><span class=\"sub\">" + escapeHtml(marketReward)
+    + "</span><span class=\"sub\">" + escapeHtml(paid) + "</span></div>";
+}
+
+function lpDashboardOfficialScoring(order) {
+  const status = String(order.scoring_status || "unknown").toLowerCase();
+  if (status === "true" || status === "scoring") return "官方计分中";
+  if (status === "false" || status === "not_scoring") return "官方未计分";
+  return "官方计分 UNKNOWN";
+}
+
+function lpPositionForOrder(order, positions, shownTokens) {
+  const token = String(order.token_id || "");
+  if (!token || shownTokens.has(token)) return null;
+  const position = positions.find((item) => String(item.token_id || "") === token);
+  if (position) shownTokens.add(token);
+  return position || null;
+}
+
+function lpOrderPositionMarkup(order, position, positionsComplete, positionAlreadyShown) {
+  const filled = predictionValue(order.filled_quantity, "UNKNOWN");
+  const quantity = predictionValue(order.quantity, "UNKNOWN");
+  const remaining = predictionValue(order.remaining_quantity, "UNKNOWN");
+  const holding = position
+    ? "当前持仓 " + predictionValue(position.size, "UNKNOWN") + " 份"
+    : positionAlreadyShown
+      ? "持仓见同标的上一行"
+      : "当前持仓 " + (positionsComplete ? "0" : "UNKNOWN") + " 份";
+  const capital = lpDashboardMoney(order.capital_committed ?? order.reserved_amount);
+  return "<div>" + escapeHtml(lpDashboardPrice(order.price)) + " × "
+    + escapeHtml(quantity) + " 份<span class=\"sub\">已成交 " + escapeHtml(filled)
+    + " · 剩余 " + escapeHtml(remaining) + "</span><span class=\"sub\">"
+    + escapeHtml(holding) + " · 占用 " + escapeHtml(capital) + "</span></div>";
+}
+
+function lpDashboardRiskCell(item, session) {
+  const manual = item.read_only === true || item.management === "manual_read_only";
+  const owned = !manual && session && (
+    String(session.entry_order_id || "") === String(item.order_id || "")
+    || String(session.token_id || "") === String(item.token_id || "")
+  );
+  const stop = manual
+    ? "未接管止损"
+    : owned && session.stop_loss_latched === true
+      ? "止损已触发"
+      : owned && session.stop_loss_latched === false
+        ? "止损未触发"
+        : "止损状态 UNKNOWN";
+  const realized = owned && predictionHasValue(session.trade_pnl)
+    ? predictionSignedMoney(session.trade_pnl, "UNKNOWN")
+    : "UNKNOWN";
+  const residual = owned && predictionHasValue(session.residual_pnl)
+    ? predictionSignedMoney(session.residual_pnl, "UNKNOWN")
+    : "UNKNOWN";
+  const trigger = owned && predictionHasValue(session.opening_loss)
+    ? "<span class=\"sub\">触发估损 " + escapeHtml(predictionMoney(session.opening_loss, "UNKNOWN")) + "</span>"
+    : "";
+  return "<div>" + escapeHtml(stop) + trigger + "<span class=\"sub\">已实现 "
+    + escapeHtml(realized) + "</span><span class=\"sub\">持仓 P&amp;L "
+    + escapeHtml(residual) + "</span></div>";
+}
+
+function lpDashboardOrderRow(
+  order, position, positionAlreadyShown, positionsComplete, rewards, shownRewards, session,
+) {
+  const manual = order.read_only === true || order.management === "manual_read_only";
+  const subtitle = [
+    predictionValue(order.outcome, "UNKNOWN"),
+    String(order.side || "").toUpperCase() === "BUY" ? "买入" : predictionValue(order.side, "UNKNOWN"),
+    manual ? "手工单 · 只读" : "系统管理",
+  ].join(" · ");
+  return "<tr data-lp-order-id=\"" + escapeHtml(predictionValue(order.order_id, "")) + "\">"
+    + "<td>" + lpMarketTitleLink(order) + "<span class=\"sub\">" + escapeHtml(subtitle) + "</span></td>"
+    + "<td data-label=\"挂单与持仓\">" + lpOrderPositionMarkup(order, position, positionsComplete, positionAlreadyShown) + "</td>"
+    + "<td data-label=\"LP 奖励\">" + lpDashboardRewardCell(order, rewards, shownRewards) + "</td>"
+    + "<td data-label=\"止损与盈亏\">" + lpDashboardRiskCell(order, session) + "</td></tr>";
+}
+
+function lpDashboardPositionRow(position, rewards, shownRewards, session) {
+  const subtitle = predictionValue(position.outcome, "UNKNOWN")
+    + (position.read_only === true || position.management === "manual_read_only" ? " · 手工只读" : " · 系统管理");
+  return "<tr data-lp-position-only=\"" + escapeHtml(predictionValue(position.token_id, "")) + "\">"
+    + "<td>" + lpMarketTitleLink(position) + "<span class=\"sub\">" + escapeHtml(subtitle) + "</span></td>"
+    + "<td data-label=\"挂单与持仓\"><div>无未成交委托<span class=\"sub\">持仓 "
+    + escapeHtml(predictionValue(position.size, "UNKNOWN")) + " 份</span></div></td>"
+    + "<td data-label=\"LP 奖励\">" + lpDashboardRewardCell(position, rewards, shownRewards) + "</td>"
+    + "<td data-label=\"止损与盈亏\">" + lpDashboardRiskCell(position, session) + "</td></tr>";
+}
+
+function lpDashboardCandidateRow(candidate, index, stale, confirmation) {
+  const actionDisabled = stale || Boolean(confirmation);
+  return "<tr><td>" + lpMarketTitleLink(candidate) + "<span class=\"sub\">"
+    + escapeHtml(predictionValue(candidate.outcome, "方向未知")) + "</span></td>"
+    + "<td data-label=\"日奖池\"><div class=\"num\">" + escapeHtml(lpDashboardMoney(candidate.daily_pool_usd)) + "</div></td>"
+    + "<td data-label=\"买一 / 最低份额\"><div>" + escapeHtml(lpDashboardPrice(candidate.price))
+    + "<span class=\"sub\">" + escapeHtml(predictionValue(candidate.quantity, "UNKNOWN")) + " 份</span></div></td>"
+    + "<td data-label=\"所需资金\"><div class=\"num\">" + escapeHtml(lpDashboardMoney(candidate.required_capital)) + "</div></td>"
+    + "<td data-label=\"立即退出估损\"><div class=\"num\">" + escapeHtml(lpDashboardMoney(candidate.estimated_exit_loss)) + "</div></td>"
+    + "<td data-label=\"操作\"><button class=\"pm-button primary\" type=\"button\" data-action=\"lp-candidate-preview\" data-candidate-index=\""
+    + String(index) + "\"" + (actionDisabled ? " disabled" : "") + ">查看开仓</button></td></tr>";
+}
+
+function lpCandidateConfirmationMarkup(confirmation) {
+  if (!confirmation) return "";
+  const candidate = confirmation.candidate && typeof confirmation.candidate === "object"
+    ? confirmation.candidate : {};
+  const preview = confirmation.preview && typeof confirmation.preview === "object"
+    ? confirmation.preview : null;
+  const request = preview?.request && typeof preview.request === "object" ? preview.request : {};
+  const facts = preview?.preflight && typeof preview.preflight === "object" ? preview.preflight : {};
+  const title = lpMarketTitle(candidate);
+  const status = confirmation.loading
+    ? "<p>正在重新核对买一价、最低份额、资金与复盘时间。</p>"
+    : confirmation.error
+      ? "<p class=\"pm-signal-error\">" + escapeHtml(confirmation.error) + "</p>"
+      : "";
+  if (!preview) {
+    return "<section class=\"pm-execution-plan\" aria-label=\"确认开仓\"><strong>"
+      + escapeHtml(title) + "</strong>" + status
+      + "<div class=\"pm-modal-actions\"><button class=\"pm-button\" type=\"button\" data-action=\"lp-candidate-cancel\">返回推荐</button>"
+      + "<button class=\"pm-button primary\" type=\"button\" data-action=\"lp-candidate-preview\" data-use-selection=\"true\""
+      + (confirmation.loading ? " disabled" : "") + ">重新获取预览</button></div></section>";
+  }
+  const price = lpDashboardPrice(request.price);
+  const quantity = predictionValue(request.quantity, "UNKNOWN");
+  const capital = lpDashboardMoney(
+    request.required_capital ?? facts.required_capital ?? candidate.required_capital,
+  );
+  const exitLoss = lpDashboardMoney(
+    facts.estimated_exit_loss ?? request.estimated_exit_loss ?? candidate.estimated_exit_loss,
+  );
+  const outcome = predictionValue(request.outcome || candidate.outcome, "UNKNOWN");
+  const reviewAt = predictionHasValue(request.review_at)
+    ? predictionHktTimestamp(request.review_at)
+    : "UNKNOWN";
+  return "<section class=\"pm-execution-plan\" aria-label=\"确认开仓\"><strong>"
+    + escapeHtml(title) + "</strong><p>买入 " + escapeHtml(outcome) + " · "
+    + escapeHtml(price) + " × " + escapeHtml(quantity) + " 份 · 占用 "
+    + escapeHtml(capital) + "</p><p>预计立即退出损失 " + escapeHtml(exitLoss) + "</p>"
+    + "<p>止损触发：每次开仓 $5（不保证损失上限）</p><p>复盘时间："
+    + escapeHtml(reviewAt) + " · 固定北京时间 08:00</p>" + status
+    + "<div class=\"pm-modal-actions\"><button class=\"pm-button\" type=\"button\" data-action=\"lp-candidate-cancel\">返回</button>"
+    + "<button class=\"pm-button\" type=\"button\" data-action=\"lp-candidate-preview\" data-use-selection=\"true\""
+    + (confirmation.loading || confirmation.starting ? " disabled" : "") + ">重新预览</button>"
+    + "<button class=\"pm-button primary\" type=\"button\" data-action=\"lp-candidate-start\""
+    + (confirmation.loading || confirmation.starting ? " disabled" : "") + ">确认开仓</button></div>"
+    + "<details><summary>预览详情</summary><span>预览编号 "
+    + escapeHtml(predictionValue(preview.preview_id, "UNKNOWN")) + "</span></details></section>";
+}
+
 function predictionLpCard(payload) {
+  const dashboard = payload?.lp_dashboard && typeof payload.lp_dashboard === "object"
+    ? payload.lp_dashboard : {};
+  const orders = lpDashboardRows(dashboard.orders);
+  const positions = lpDashboardRows(dashboard.positions);
+  const candidates = lpDashboardRows(dashboard.candidates);
+  const rewards = lpDashboardRewards(dashboard.market_rewards);
+  const shownRewards = new Set();
+  const shownPositionTokens = new Set();
+  const session = payload?.lp_session && payload.lp_session.state !== "none"
+    ? payload.lp_session
+    : dashboard.lp_session;
+  const activeSession = session && typeof session === "object"
+    && String(session.state || "").toLowerCase() !== "none"
+    && !session.error;
+  const stale = dashboard.stale === true || dashboard.state === "stale";
+  const candidatesStale = stale || dashboard.candidate_stale === true;
+  const checkedAt = dashboard.last_success_at || dashboard.checked_at;
+  const freshness = stale
+    ? predictionHasValue(checkedAt)
+      ? "<span class=\"pm-clock pm-clock-danger\">上次成功数据："
+        + escapeHtml(predictionHktTimestamp(checkedAt))
+        + " · 读取失败，已保留旧结果</span>"
+      : "<span class=\"pm-clock pm-clock-danger\">读取失败 · UNKNOWN · "
+        + escapeHtml(predictionValue(dashboard.error, "账户数据暂不可用"))
+        + "</span>"
+    : "<span class=\"pm-clock\">"
+      + escapeHtml(predictionHasValue(checkedAt) ? "同步时间：" + predictionHktTimestamp(checkedAt) : "等待首次同步")
+      + " · 每 5 秒刷新</span>";
+  const positionsComplete = Array.isArray(dashboard.positions);
+  const orderRows = orders.map((order) => {
+    const token = String(order.token_id || "");
+    const positionAlreadyShown = Boolean(token && shownPositionTokens.has(token));
+    const position = lpPositionForOrder(order, positions, shownPositionTokens);
+    return lpDashboardOrderRow(
+      order, position, positionAlreadyShown, positionsComplete, rewards, shownRewards, session,
+    );
+  });
+  for (const position of positions) {
+    const token = String(position.token_id || "");
+    if (token && shownPositionTokens.has(token)) continue;
+    if (token) shownPositionTokens.add(token);
+    orderRows.push(lpDashboardPositionRow(position, rewards, shownRewards, session));
+  }
+  const orderRowsHtml = orderRows.length
+    ? orderRows.join("")
+    : "<tr><td colspan=\"4\" class=\"pm-observation-empty\">暂未读取到订单或持仓。</td></tr>";
+  const catalogStatus = dashboard.scanning === true
+    ? "候选目录尚未完整 · 扫描中"
+    : dashboard.complete === false
+      ? "候选目录尚未完整 · 当前候选列表仅为已读取结果"
+      : dashboard.complete === true
+        ? "日奖池从高到低 · 仅显示合格候选"
+        : "目录完整性 UNKNOWN";
+  const candidateRows = candidates.map((candidate, index) =>
+    lpDashboardCandidateRow(candidate, index, candidatesStale, state.predictionMarket.lpConfirmation)
+  ).join("");
+  const candidateRowsHtml = candidateRows
+    ? candidateRows
+    : "<tr><td colspan=\"6\" class=\"pm-observation-empty\">"
+      + (dashboard.scanning === true || dashboard.complete === false
+        ? "目录尚未完整，暂未读取到可展示候选。"
+        : "当前没有符合条件的推荐开仓。")
+      + "</td></tr>";
+  const sessionDetails = activeSession
+    ? "<details class=\"pm-lp-session-details\"><summary>当前系统会话详情 · "
+      + escapeHtml(predictionValue(session.market_title || session.market || session.question, "系统会话"))
+      + "</summary>" + predictionLpSessionCard({...payload, lp_session: session}) + "</details>"
+    : "";
+  const error = payload?.lp_error || (session && session.error);
+  const errorMarkup = error
+    ? "<p class=\"pm-signal-error\">系统会话状态暂不可用；不会用缺失数据代替零。</p>"
+    : "";
+  const footnote = "<p class=\"sub\">系统订单按已绑定的北京时间 08:00 进入复盘；手工订单只读。$5 是止损触发线，不代表损失上限。</p>";
+  return "<section class=\"pm-panel pm-lp-card\" aria-label=\"LP 会话\"><header class=\"pm-panel-heading\">"
+    + "<div><h2>流动性提供试验</h2><p>单市场 · 单次开仓</p></div>"
+    + "<div class=\"pm-panel-heading-actions\">" + freshness
+    + "<button class=\"pm-button\" type=\"button\" data-action=\"lp-dashboard-refresh\""
+    + (state.predictionMarket.lpDashboardRequestInFlight ? " disabled" : "") + ">立即刷新</button></div></header>"
+    + errorMarkup
+    + "<section aria-label=\"我的订单与持仓\"><h3>我的订单与持仓</h3><div class=\"pm-table-wrap\"><table class=\"pm-table pm-lp-order-table\">"
+    + "<thead><tr><th scope=\"col\">标的</th><th scope=\"col\">挂单与持仓</th><th scope=\"col\">LP 奖励</th><th scope=\"col\">止损与盈亏</th></tr></thead>"
+    + "<tbody>" + orderRowsHtml + "</tbody></table></div></section>"
+    + "<section aria-label=\"推荐开仓\"><h3>推荐开仓 <span class=\"sub\">· "
+    + escapeHtml(catalogStatus) + "</span></h3><div class=\"pm-table-wrap\"><table class=\"pm-table pm-lp-candidate-table\">"
+    + "<thead><tr><th scope=\"col\">标的</th><th scope=\"col\">日奖池</th><th scope=\"col\">买一 / 最低份额</th><th scope=\"col\">所需资金</th><th scope=\"col\">立即退出估损</th><th scope=\"col\">操作</th></tr></thead>"
+    + "<tbody>" + candidateRowsHtml + "</tbody></table></div>"
+    + lpCandidateConfirmationMarkup(state.predictionMarket.lpConfirmation) + "</section>"
+    + sessionDetails + footnote + "</section>";
+}
+
+function predictionLpSessionCard(payload) {
   const source = payload?.lp_session && typeof payload.lp_session === "object"
     ? payload.lp_session
     : payload?.lp && typeof payload.lp === "object"
@@ -3089,12 +3392,27 @@ function predictionLpCard(payload) {
       ? "pm-tone-warning"
       : "pm-tone-danger";
   const rewardCurrency = String(rewardObservation.currency || "").toUpperCase();
-  const rewardAmount = rewardCurrency === "USD"
-    ? (value) => predictionExactMoney(value, "UNKNOWN")
-    : () => "UNKNOWN";
+  const rewardRawAmount = (amount, asset, accruals) => {
+    const rows = Array.isArray(accruals) ? accruals.filter((row) => row && typeof row === "object") : [];
+    if (rows.length) {
+      return rows.map((row) => `${predictionValue(row.amount, "UNKNOWN")} ${predictionValue(row.asset, "UNKNOWN")}`).join(" + ");
+    }
+    return predictionHasValue(amount) && predictionHasValue(asset) ? `${amount} ${asset}` : null;
+  };
+  const rewardAmount = (value, raw, asset, accruals) => {
+    if (rewardCurrency === "USD" && predictionHasValue(value)) return predictionExactMoney(value, "UNKNOWN");
+    return rewardRawAmount(raw, asset, accruals) || "UNKNOWN";
+  };
+  const hasRawRewards = [
+    rewardObservation.market_amount_raw,
+    rewardObservation.account_amount_raw,
+  ].some((value) => predictionHasValue(value))
+    || [rewardObservation.market_accruals_raw, rewardObservation.account_accruals_raw]
+      .some((value) => Array.isArray(value) && value.length > 0);
   const rewardHasRetainedAmounts = rewardObservationStatus === "unknown"
     && [rewardObservation.market_amount, rewardObservation.account_amount, rewardObservation.gap]
-      .some((value) => predictionHasValue(value));
+      .some((value) => predictionHasValue(value))
+    || rewardObservationStatus === "unknown" && hasRawRewards;
   const rewardQueryAt = rewardHasRetainedAmounts
     ? (rewardObservation.last_success_at || rewardObservation.checked_at || rewardObservation.last_attempt_at)
     : (rewardObservation.last_attempt_at || rewardObservation.checked_at || rewardObservation.last_success_at);
@@ -3106,7 +3424,7 @@ function predictionLpCard(payload) {
     : "";
   const rewardValueSuffix = rewardHasRetainedAmounts ? "（保留值）" : "";
   const rewardPaid = rewardObservation.paid === false ? "平台累计，未核实到账" : "UNKNOWN";
-  const rewardRow = `<div class="pm-relation-summary pm-lp-reward-observation" aria-label="LP 奖励观察"><span>计奖日（UTC） <strong>${escapeHtml(predictionValue(rewardObservation.reward_date, "UNKNOWN"))}</strong></span><span>市场累计${rewardValueSuffix} <strong>${escapeHtml(rewardAmount(rewardObservation.market_amount))}</strong></span><span>账户累计${rewardValueSuffix} <strong>${escapeHtml(rewardAmount(rewardObservation.account_amount))}</strong></span><span>距 $1 还差${rewardValueSuffix} <strong>${escapeHtml(rewardAmount(rewardObservation.gap))}</strong></span><span class="${rewardTone}">奖励状态 <strong>${escapeHtml(rewardStatus)}</strong></span><span>${rewardQuery}</span>${rewardAttempt ? `<span>${rewardAttempt}</span>` : ""}<span>到账 <strong>${escapeHtml(rewardPaid)}</strong></span></div>`;
+  const rewardRow = `<div class="pm-relation-summary pm-lp-reward-observation" aria-label="LP 奖励观察"><span>计奖日（UTC） <strong>${escapeHtml(predictionValue(rewardObservation.reward_date, "UNKNOWN"))}</strong></span><span>市场累计${rewardValueSuffix} <strong>${escapeHtml(rewardAmount(rewardObservation.market_amount, rewardObservation.market_amount_raw, rewardObservation.market_asset, rewardObservation.market_accruals_raw))}</strong></span><span>账户累计${rewardValueSuffix} <strong>${escapeHtml(rewardAmount(rewardObservation.account_amount, rewardObservation.account_amount_raw, rewardObservation.account_asset, rewardObservation.account_accruals_raw))}</strong></span><span>距 $1 还差${rewardValueSuffix} <strong>${escapeHtml(rewardAmount(rewardObservation.gap))}</strong></span><span class="${rewardTone}">奖励状态 <strong>${escapeHtml(rewardStatus)}</strong></span><span>${rewardQuery}</span>${rewardAttempt ? `<span>${rewardAttempt}</span>` : ""}<span>到账 <strong>${escapeHtml(rewardPaid)}</strong></span></div>`;
   const exitStatus = source.stop_loss_latched === true
     ? `止损已锁定 · ${protectedOrder}`
     : `${stage} · ${passiveOrder}`;
@@ -4131,7 +4449,9 @@ function renderPredictionMarket() {
 function startPredictionPolling() {
   stopPredictionPolling();
   if (state.workspaceView !== "prediction_market") return;
-  state.predictionMarket.pollId = window.setInterval(fetchPredictionState, 5000);
+  state.predictionMarket.pollId = window.setInterval(async () => {
+    await Promise.all([fetchPredictionState(), fetchPredictionLpDashboard()]);
+  }, 5000);
 }
 
 function stopPredictionPolling() {
@@ -4164,6 +4484,38 @@ function predictionRequestUrl(path) {
   return scenario ? `${path}${path.includes("?") ? "&" : "?"}scenario=${encodeURIComponent(scenario)}` : path;
 }
 
+async function fetchPredictionLpDashboard() {
+  if (state.workspaceView !== "prediction_market" || state.predictionMarket.lpDashboardRequestInFlight) return;
+  state.predictionMarket.lpDashboardRequestInFlight = true;
+  try {
+    const response = await fetch(predictionRequestUrl("/api/prediction-arbitrage/lp/dashboard"), {
+      cache: "no-store",
+      credentials: "same-origin",
+    });
+    if (!response.ok) throw new Error("LP dashboard " + response.status);
+    const dashboard = await response.json();
+    const payload = state.predictionMarket.payload || {status: "loading", events: [], opportunities: []};
+    state.predictionMarket.payload = {...payload, lp_dashboard: {...dashboard}};
+  } catch (error) {
+    const payload = state.predictionMarket.payload || {status: "loading", events: [], opportunities: []};
+    const previous = payload.lp_dashboard && typeof payload.lp_dashboard === "object"
+      ? payload.lp_dashboard
+      : {};
+    state.predictionMarket.payload = {
+      ...payload,
+      lp_dashboard: {
+        ...previous,
+        stale: true,
+        last_success_at: previous.last_success_at || previous.checked_at || null,
+        error: error instanceof Error ? error.message : String(error),
+      },
+    };
+  } finally {
+    state.predictionMarket.lpDashboardRequestInFlight = false;
+    renderPredictionMarket();
+  }
+}
+
 async function fetchPredictionState() {
   if (state.workspaceView !== "prediction_market" || state.predictionMarket.stateRequestInFlight) return;
   state.predictionMarket.stateRequestInFlight = true;
@@ -4177,7 +4529,12 @@ async function fetchPredictionState() {
     if (state.predictionMarket.signalHistoryGeneration !== signalHistoryGeneration && Array.isArray(previousHistories.signals)) {
       histories.signals = previousHistories.signals;
     }
-    state.predictionMarket.payload = {...payload, histories};
+    const lpDashboard = state.predictionMarket.payload?.lp_dashboard;
+    state.predictionMarket.payload = {
+      ...payload,
+      histories,
+      ...(lpDashboard ? {lp_dashboard: lpDashboard} : {}),
+    };
     state.predictionMarket.relationReview.pendingCount = Number(payload?.relation_review?.pending_count || 0);
     state.predictionMarket.error = "";
     state.predictionMarket.csrfToken = payload.csrf_token || state.predictionMarket.csrfToken;
@@ -4777,7 +5134,110 @@ async function mutateRelation(action, relationVersionId) {
   catch (error) { state.predictionMarket.error = error instanceof Error ? error.message : String(error); renderPredictionMarket(); }
 }
 
+function lpCandidateFailureMessage(result) {
+  const reason = String(result?.reason || "preview_unavailable");
+  const labels = {
+    candidate_unavailable: "候选已变化，请刷新后重新选择。",
+    candidate_best_bid_changed: "买一价已变化，请重新获取预览。",
+    candidate_invalid: "候选身份无效，请刷新列表。",
+    insufficient_balance: "可用资金已变化，请重新检查候选。",
+    review_at_too_soon: "距离复盘时间不足，暂不能开仓。",
+  };
+  return labels[reason] || "最新预检未通过（" + reason + "），请重新检查。";
+}
+
+async function previewLpCandidate(button) {
+  const current = state.predictionMarket.lpConfirmation;
+  const dashboardCandidates = lpDashboardRows(state.predictionMarket.payload?.lp_dashboard?.candidates);
+  const selected = button.dataset.useSelection === "true"
+    ? current?.candidate
+    : dashboardCandidates[Number(button.dataset.candidateIndex)];
+  if (!selected || typeof selected !== "object") return;
+  const identity = {
+    market_id: String(selected.market_id || ""),
+    condition_id: String(selected.condition_id || ""),
+    token_id: String(selected.token_id || ""),
+    outcome: String(selected.outcome || "").toUpperCase(),
+  };
+  const confirmation = {
+    candidate: selected,
+    identity,
+    preview: null,
+    idempotencyKey: current?.idempotencyKey || predictionIdempotencyKey(),
+    loading: true,
+    starting: false,
+    error: "",
+  };
+  state.predictionMarket.lpConfirmation = confirmation;
+  renderPredictionMarket();
+  try {
+    const result = await predictionPost("/api/prediction-arbitrage/lp/candidates/preview", identity);
+    if (result?.state === "previewed" && String(result.preview_id || "").trim()) {
+      confirmation.preview = result;
+      confirmation.idempotencyKey = predictionIdempotencyKey();
+    } else {
+      confirmation.error = lpCandidateFailureMessage(result);
+    }
+  } catch (error) {
+    confirmation.error = error instanceof Error ? error.message : String(error);
+  } finally {
+    confirmation.loading = false;
+    renderPredictionMarket();
+  }
+}
+
+async function startLpCandidate() {
+  const confirmation = state.predictionMarket.lpConfirmation;
+  const previewId = String(confirmation?.preview?.preview_id || "");
+  if (!confirmation || !previewId || confirmation.starting) return;
+  confirmation.starting = true;
+  confirmation.error = "";
+  renderPredictionMarket();
+  try {
+    const result = await predictionPost("/api/prediction-arbitrage/lp/sessions", {
+      preview_id: previewId,
+      idempotency_key: confirmation.idempotencyKey,
+    });
+    if (result?.state === "rejected") {
+      confirmation.preview = null;
+      confirmation.error = lpCandidateFailureMessage(result);
+    } else if (["locked", "busy"].includes(String(result?.state || ""))) {
+      confirmation.error = lpCandidateFailureMessage(result);
+    } else {
+      state.predictionMarket.lpConfirmation = null;
+      await Promise.all([fetchPredictionState(), fetchPredictionLpDashboard()]);
+    }
+  } catch (error) {
+    confirmation.error = error instanceof Error ? error.message : String(error);
+  } finally {
+    if (state.predictionMarket.lpConfirmation === confirmation) {
+      confirmation.starting = false;
+    }
+    renderPredictionMarket();
+  }
+}
+
 async function handlePredictionMarketClick(event) {
+  const lpRefresh = event.target.closest("[data-action='lp-dashboard-refresh']");
+  if (lpRefresh && !lpRefresh.disabled) {
+    await fetchPredictionLpDashboard();
+    return;
+  }
+  const lpPreview = event.target.closest("[data-action='lp-candidate-preview']");
+  if (lpPreview && !lpPreview.disabled) {
+    await previewLpCandidate(lpPreview);
+    return;
+  }
+  if (event.target.closest("[data-action='lp-candidate-cancel']")) {
+    state.predictionMarket.lpConfirmation = null;
+    renderPredictionMarket();
+    return;
+  }
+  const lpStart = event.target.closest("[data-action='lp-candidate-start']");
+  if (lpStart && !lpStart.disabled) {
+    await startLpCandidate();
+    return;
+  }
   const llmProviderButton = event.target.closest("[data-llm-provider]");
   if (llmProviderButton && !llmProviderButton.disabled) {
     await switchPredictionLlmProvider(llmProviderButton.dataset.llmProvider || "");

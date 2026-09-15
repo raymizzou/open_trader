@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import Future
 from http.cookies import SimpleCookie
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 import ipaddress
 import json
 import os
@@ -59,6 +59,22 @@ _LEGACY_STRATEGY_ENDPOINTS = frozenset(
         "/api/prediction-arbitrage/cross-auto/pause",
     }
 )
+
+
+def _lp_projection_safe_value(value: object, *, key: str = "") -> object:
+    """Sanitize LP projections while retaining explicit UNKNOWN nulls."""
+
+    if isinstance(value, Mapping):
+        result: dict[str, object] = {}
+        for name, item in value.items():
+            field = str(name)
+            if _prediction_safe_value("safe-field", key=field) is None:
+                continue
+            result[field] = _lp_projection_safe_value(item, key=field)
+        return result
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_lp_projection_safe_value(item, key=key) for item in value]
+    return _prediction_safe_value(value, key=key)
 
 
 class _PredictionHTTPServer(ThreadingHTTPServer):
@@ -446,11 +462,51 @@ def create_prediction_server(
                 except (sqlite3.Error, OSError, RuntimeError) as exc:
                     self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
                 return
+            lp_report_prefix = "/api/prediction-arbitrage/lp/reports/"
+            if parsed.path.startswith(lp_report_prefix):
+                report_date = parsed.path.removeprefix(lp_report_prefix)
+                try:
+                    parsed_date = date.fromisoformat(report_date)
+                    if parsed_date.isoformat() != report_date or parsed.query:
+                        raise ValueError("LP report date is invalid")
+                except ValueError as exc:
+                    self._send_error(HTTPStatus.BAD_REQUEST, exc)
+                    return
+                if (
+                    mode == "shadow"
+                    and not _is_available(runtime)
+                    or mode == "production"
+                    and not _is_production_available(runtime)
+                ):
+                    self._send_unavailable()
+                    return
+                execution = getattr(runtime, "execution", None)
+                if execution is None or not callable(getattr(execution, "lp_report", None)):
+                    self._send_json(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        {"error": "LP reports are unavailable"},
+                    )
+                    return
+                try:
+                    result = execution.lp_report(report_date)
+                    if result is None:
+                        self._send_json(HTTPStatus.NOT_FOUND, {"error": "LP report not found"})
+                        return
+                    safe_result = _lp_projection_safe_value(result)
+                    if not isinstance(safe_result, Mapping):
+                        raise RuntimeError("LP report result is invalid")
+                    self._send_json(HTTPStatus.OK, safe_result)
+                except ValueError as exc:
+                    self._send_error(HTTPStatus.BAD_REQUEST, exc)
+                except (sqlite3.Error, OSError, RuntimeError) as exc:
+                    self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+                return
             if parsed.path not in {
                 "/api/prediction-arbitrage/state",
                 "/api/prediction-arbitrage/history",
                 "/api/prediction-arbitrage/n-leg/mode",
                 "/api/prediction-arbitrage/n-leg/report",
+                "/api/prediction-arbitrage/lp/dashboard",
                 "/api/prediction-arbitrage/lp/sessions/current",
             }:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -522,6 +578,23 @@ def create_prediction_server(
                     safe_result = _prediction_safe_value(result)
                     if not isinstance(safe_result, Mapping):
                         raise RuntimeError("LP status result is invalid")
+                    self._send_json(HTTPStatus.OK, safe_result)
+                except (sqlite3.Error, OSError, RuntimeError) as exc:
+                    self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+                return
+            if parsed.path == "/api/prediction-arbitrage/lp/dashboard":
+                execution = getattr(runtime, "execution", None)
+                if execution is None or not callable(getattr(execution, "lp_dashboard", None)):
+                    self._send_json(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        {"error": "LP dashboard is unavailable"},
+                    )
+                    return
+                try:
+                    result = execution.lp_dashboard()
+                    safe_result = _lp_projection_safe_value(result)
+                    if not isinstance(safe_result, Mapping):
+                        raise RuntimeError("LP dashboard result is invalid")
                     self._send_json(HTTPStatus.OK, safe_result)
                 except (sqlite3.Error, OSError, RuntimeError) as exc:
                     self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
@@ -714,6 +787,9 @@ def create_prediction_server(
                     self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
                 return
             lp_preview_path = "/api/prediction-arbitrage/lp/preview"
+            lp_candidate_preview_path = (
+                "/api/prediction-arbitrage/lp/candidates/preview"
+            )
             lp_sessions_prefix = "/api/prediction-arbitrage/lp/sessions/"
             lp_start_path = "/api/prediction-arbitrage/lp/sessions"
             lp_stop_session: str | None = None
@@ -740,6 +816,7 @@ def create_prediction_server(
                 "/api/prediction-arbitrage/n-leg/circuit-breaker/reset",
                 "/api/prediction-arbitrage/llm-provider",
                 lp_preview_path,
+                lp_candidate_preview_path,
                 lp_start_path,
             } and lp_stop_session is None:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -773,6 +850,15 @@ def create_prediction_server(
                     )
                     self._send_json(HTTPStatus.OK, _llm_provider_payload(runtime))
                     return
+                elif path == lp_candidate_preview_path:
+                    self._require_schema(
+                        payload,
+                        {"market_id", "condition_id", "token_id", "outcome"},
+                    )
+                    candidate_preview = getattr(execution, "lp_candidate_preview", None)
+                    if not callable(candidate_preview):
+                        raise RuntimeError("LP execution service is unavailable")
+                    result = candidate_preview(payload)
                 elif path == lp_preview_path:
                     request_payload: Mapping[str, object]
                     if set(payload) == {"request"} and isinstance(payload.get("request"), Mapping):

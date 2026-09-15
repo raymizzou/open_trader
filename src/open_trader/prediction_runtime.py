@@ -831,12 +831,35 @@ class PredictionRuntime:
                 if not callable(lp_tick):
                     return
                 try:
-                    lp_tick()
+                    status = lp_tick()
                 except Exception:
                     # The durable session remains active and visible; the
                     # next iteration retries through the same reconciliation
                     # and idempotency path.
                     logger.exception("prediction_lp_tick_failed")
+                    continue
+                generate_report = getattr(self.lp, "generate_due_report", None)
+                state = str(status.get("state") or "") if isinstance(status, Mapping) else ""
+                cancellation_pending = (
+                    state == "needs_attention"
+                    and isinstance(status, Mapping)
+                    and status.get("review_status") == "awaiting_reconciliation"
+                    and str(status.get("reconciliation") or "").startswith("deadline_cancel_")
+                )
+                reconciliation_ready = state == "none" or (
+                    isinstance(status, Mapping)
+                    and (
+                        state not in {"busy", "needs_attention", "error", "failed"}
+                        or cancellation_pending
+                    )
+                    and status.get("account_checked_at") is not None
+                    and status.get("book_checked_at") is not None
+                )
+                if callable(generate_report) and reconciliation_ready:
+                    try:
+                        generate_report()
+                    except Exception:
+                        logger.exception("prediction_lp_daily_report_failed")
 
         self._lp_thread = threading.Thread(
             target=run,
@@ -858,6 +881,16 @@ class PredictionRuntime:
                 if lp is None:
                     return
                 refresh_rewards = getattr(lp, "refresh_rewards", None)
+                refresh_candidates = getattr(lp, "refresh_candidates", None)
+                if not callable(refresh_candidates) and not callable(refresh_rewards):
+                    return
+                if callable(refresh_candidates):
+                    try:
+                        refresh_candidates(stop_event=self._reward_stop_event)
+                    except Exception:
+                        logger.exception("prediction_lp_candidate_refresh_failed")
+                if self._reward_stop_event.is_set():
+                    return
                 if not callable(refresh_rewards):
                     return
                 try:

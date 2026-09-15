@@ -5,9 +5,10 @@ from __future__ import annotations
 import threading
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, cast
+from zoneinfo import ZoneInfo
 
 from .prediction_arbitrage_store import PredictionArbitrageStore
 
@@ -22,6 +23,8 @@ PREVIEW_TTL_SECONDS = 10
 BOOK_FRESHNESS_SECONDS = Decimal("10")
 REWARD_THRESHOLD = Decimal("1")
 REWARD_STALE_SECONDS = Decimal("180")
+LP_CANDIDATE_REFRESH_SECONDS = Decimal("300")
+_BEIJING = ZoneInfo("Asia/Shanghai")
 TERMINAL_ORDER_STATES = frozenset(
     {"FILLED", "MATCHED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "FAILED"}
 )
@@ -75,6 +78,25 @@ def _text(value: object) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
+def _reward_accrual_rows(value: object) -> tuple[dict[str, object], ...]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return ()
+    rows: list[dict[str, object]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        amount = _maybe_decimal(item.get("amount"))
+        asset = _text(item.get("asset"))
+        if amount is None or amount < 0 or asset is None:
+            continue
+        row: dict[str, object] = {"amount": amount, "asset": asset}
+        address = _text(item.get("asset_address"))
+        if address is not None:
+            row["asset_address"] = address
+        rows.append(row)
+    return tuple(rows)
+
+
 def _timestamp(value: object, *, name: str = "timestamp") -> datetime:
     if isinstance(value, datetime):
         moment = value
@@ -95,6 +117,12 @@ def _timestamp(value: object, *, name: str = "timestamp") -> datetime:
 
 def _iso(moment: datetime) -> str:
     return moment.astimezone(UTC).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z"
+    )
+
+
+def _report_boundary_iso(moment: datetime) -> str:
+    return moment.astimezone(UTC).isoformat(timespec="seconds").replace(
         "+00:00", "Z"
     )
 
@@ -141,11 +169,403 @@ class PolymarketLPService:
         self._mutation_guard = mutation_guard
         self._mutex = threading.RLock()
         self._reward_refresh_lock = threading.Lock()
+        self._report_lock = threading.Lock()
+        self._candidate_refresh_lock = threading.Lock()
+        self._candidate_state_lock = threading.RLock()
+        self._candidate_attempted_at: datetime | None = None
+        self._candidate_snapshot: dict[str, object] = {
+            "state": "unknown",
+            "complete": False,
+            "scanning": False,
+            "candidates": [],
+            "checked_at": None,
+            "last_success_at": None,
+            "last_attempt_at": None,
+            "candidate_rows_fresh": False,
+        }
 
     def set_mutation_guard(self, guard: Callable[..., bool] | None) -> None:
         """Attach the existing execution breaker to exchange writes."""
 
         self._mutation_guard = guard
+
+    def candidate_snapshot(self) -> dict[str, object]:
+        """Return the latest cached candidate projection without external reads."""
+
+        with self._candidate_state_lock:
+            snapshot = dict(self._candidate_snapshot)
+            candidates = snapshot.get("candidates")
+            snapshot["candidates"] = [
+                dict(candidate)
+                for candidate in candidates
+                if isinstance(candidate, Mapping)
+            ] if isinstance(candidates, (list, tuple)) else []
+        checked_at = snapshot.get("checked_at")
+        if isinstance(checked_at, datetime):
+            checked = checked_at
+        elif isinstance(checked_at, str):
+            try:
+                checked = _timestamp(checked_at, name="candidate_checked_at")
+            except ValueError:
+                checked = None
+        else:
+            checked = None
+        if checked is not None:
+            age = Decimal(str((self._now() - checked).total_seconds()))
+            snapshot["stale"] = age < 0 or age > LP_CANDIDATE_REFRESH_SECONDS
+        else:
+            snapshot["stale"] = True
+        if snapshot.get("state") in {"stale", "unknown"} or (
+            snapshot.get("state") == "incomplete"
+            and snapshot.get("candidate_rows_fresh") is not True
+        ):
+            snapshot["stale"] = True
+        return snapshot
+
+    def refresh_candidates(
+        self,
+        *,
+        stop_event: threading.Event | None = None,
+        force: bool = False,
+    ) -> dict[str, object]:
+        """Refresh active reward candidates on the server's five-minute cadence."""
+
+        if not self._candidate_refresh_lock.acquire(blocking=False):
+            snapshot = self.candidate_snapshot()
+            snapshot["scanning"] = True
+            return snapshot
+        try:
+            now = self._now()
+            with self._candidate_state_lock:
+                attempted_at = self._candidate_attempted_at
+                if (
+                    not force
+                    and attempted_at is not None
+                    and Decimal(str((now - attempted_at).total_seconds()))
+                    < LP_CANDIDATE_REFRESH_SECONDS
+                ):
+                    return self.candidate_snapshot()
+                previous = dict(self._candidate_snapshot)
+                self._candidate_attempted_at = now
+                self._candidate_snapshot = {
+                    **previous,
+                    "state": "scanning",
+                    "complete": False,
+                    "scanning": True,
+                    "last_attempt_at": now,
+                }
+
+            if stop_event is not None and stop_event.is_set():
+                return self._finish_candidate_scan(
+                    previous,
+                    state="unknown",
+                    complete=False,
+                    checked_at=now,
+                )
+            catalog_reader = getattr(self.exchange, "lp_reward_catalog", None)
+            if not callable(catalog_reader):
+                raise ValueError("reward_catalog_unavailable")
+            catalog = catalog_reader(stop_event=stop_event)
+            if (
+                not isinstance(catalog, Mapping)
+                or catalog.get("state") != "known"
+                or catalog.get("complete") is not True
+            ):
+                checked_at = (
+                    catalog.get("checked_at")
+                    if isinstance(catalog, Mapping)
+                    else None
+                )
+                return self._finish_candidate_scan(
+                    previous,
+                    state="incomplete",
+                    complete=False,
+                    checked_at=checked_at or self._now(),
+                )
+            raw_markets = catalog.get("markets")
+            if not isinstance(raw_markets, (list, tuple)):
+                raise ValueError("reward_catalog_unknown")
+            market_rows = [
+                dict(row) for row in raw_markets if isinstance(row, Mapping)
+            ]
+            if not market_rows:
+                completed_at = self._now()
+                return self._finish_candidate_scan(
+                    previous,
+                    state="ready",
+                    complete=True,
+                    checked_at=completed_at,
+                    last_success_at=completed_at,
+                    candidates=[],
+                )
+
+            condition_ids = tuple(
+                dict.fromkeys(
+                    str(row.get("condition_id") or "").strip()
+                    for row in market_rows
+                    if str(row.get("condition_id") or "").strip()
+                )
+            )
+            metadata_reader = getattr(self.exchange, "lp_market_metadata", None)
+            account_reader = getattr(self.exchange, "lp_account_snapshot", None)
+            books_reader = getattr(self.exchange, "lp_order_books", None)
+            if not callable(metadata_reader) or not callable(account_reader) or not callable(books_reader):
+                raise ValueError("candidate_readers_unavailable")
+            metadata_value = metadata_reader(condition_ids)
+            account = account_reader()
+            if (
+                not isinstance(metadata_value, Mapping)
+                or not isinstance(account, Mapping)
+                or account.get("authenticated") is not True
+            ):
+                raise ValueError("candidate_market_facts_unknown")
+            metadata_by_condition = {
+                str(key): value
+                for key, value in metadata_value.items()
+                if isinstance(key, str) and isinstance(value, Mapping)
+            }
+            token_ids = tuple(
+                dict.fromkeys(
+                    str(outcome.get("token_id") or "").strip()
+                    for market in metadata_by_condition.values()
+                    for outcome in (
+                        market.get("outcomes", {}).values()
+                        if isinstance(market.get("outcomes"), Mapping)
+                        else ()
+                    )
+                    if isinstance(outcome, Mapping)
+                    and str(outcome.get("token_id") or "").strip()
+                )
+            )
+            books_value = books_reader(token_ids, stop_event=stop_event)
+            if not isinstance(books_value, Mapping):
+                raise ValueError("candidate_books_unknown")
+            books_by_token = {
+                str(key): value
+                for key, value in books_value.items()
+                if isinstance(key, str) and isinstance(value, Mapping)
+            }
+            direction_facts: list[dict[str, object]] = []
+            complete = True
+            catalog_checked_at = catalog.get("checked_at") or self._now()
+            for reward_market in market_rows:
+                condition_id = str(reward_market.get("condition_id") or "")
+                market_meta = metadata_by_condition.get(condition_id)
+                if market_meta is None:
+                    complete = False
+                    continue
+                raw_outcomes = market_meta.get("outcomes")
+                if not isinstance(raw_outcomes, Mapping):
+                    complete = False
+                    continue
+                reward_minimum = market_meta.get(
+                    "reward_min_size", reward_market.get("rewards_min_size")
+                )
+                reward_spread = market_meta.get(
+                    "reward_max_spread", reward_market.get("rewards_max_spread")
+                )
+                if reward_spread is not None and market_meta.get("reward_max_spread") is None:
+                    raw_spread = _maybe_decimal(reward_spread)
+                    reward_spread = None if raw_spread is None else raw_spread / Decimal("100")
+                if reward_minimum is None or reward_spread is None:
+                    complete = False
+                for outcome_key in ("yes", "no"):
+                    outcome = raw_outcomes.get(outcome_key)
+                    if not isinstance(outcome, Mapping):
+                        complete = False
+                        continue
+                    token_id = str(outcome.get("token_id") or "")
+                    book = books_by_token.get(token_id)
+                    if not token_id or not isinstance(book, Mapping):
+                        complete = False
+                        continue
+                    market = {
+                        **dict(market_meta),
+                        "condition_id": condition_id,
+                        "token_id": token_id,
+                        "outcome": str(outcome.get("label") or outcome_key).upper(),
+                        "reward_min_size": reward_minimum,
+                        "reward_max_spread": reward_spread,
+                    }
+                    direction_facts.append(
+                        {
+                            "market": market,
+                            "book": dict(book),
+                            "reward_active": True,
+                            "daily_pool_usd": reward_market.get("daily_pool_usd"),
+                            "reward_checked_at": catalog_checked_at,
+                        }
+                    )
+
+            from .polymarket_lp_views import lp_candidate_rows
+
+            candidates = lp_candidate_rows(
+                direction_facts,
+                account=account,
+                now=self._now(),
+                reservations=self._candidate_reservations(),
+            )
+            completed_at = self._now()
+            return self._finish_candidate_scan(
+                previous,
+                state="ready" if complete else "incomplete",
+                complete=complete,
+                checked_at=completed_at,
+                last_success_at=completed_at if complete else None,
+                candidates=candidates,
+            )
+        except Exception:
+            previous = self.candidate_snapshot()
+            return self._finish_candidate_scan(
+                previous,
+                state="stale" if previous.get("last_success_at") else "unknown",
+                complete=False,
+                checked_at=self._now(),
+            )
+        finally:
+            self._candidate_refresh_lock.release()
+
+    def _candidate_reservations(self) -> tuple[dict[str, object], ...]:
+        session = self.store.lp_active_session()
+        if session is None:
+            return ()
+        order_id = str(session.get("entry_order_id") or "").strip()
+        if not order_id:
+            order_id = f"lp-session:{session.get('session_id', '')}"
+        price = _maybe_decimal(session.get("price"))
+        quantity = _maybe_decimal(session.get("quantity"))
+        filled = _maybe_decimal(session.get("buy_filled_quantity")) or Decimal("0")
+        amount = (
+            price * max(Decimal("0"), quantity - filled)
+            if price is not None and quantity is not None
+            else None
+        )
+        return ({"order_id": order_id, "amount": amount},)
+
+    def _fresh_candidate_row(
+        self,
+        identity: Mapping[str, object],
+        snapshot: Mapping[str, object],
+        *,
+        now: datetime,
+    ) -> Mapping[str, object]:
+        """Reapply the catalog's shared eligibility rules to live facts."""
+
+        account = snapshot.get("account")
+        market = snapshot.get("market")
+        book = snapshot.get("book")
+        if not isinstance(account, Mapping) or not isinstance(market, Mapping):
+            raise ValueError("candidate_facts_unknown")
+        if not isinstance(book, Mapping):
+            raise ValueError("candidate_facts_unknown")
+
+        catalog_reader = getattr(self.exchange, "lp_reward_catalog", None)
+        if not callable(catalog_reader):
+            raise ValueError("candidate_reward_unknown")
+        try:
+            catalog = catalog_reader()
+        except Exception as exc:
+            raise ValueError("candidate_reward_unknown") from exc
+        if (
+            not isinstance(catalog, Mapping)
+            or catalog.get("state") != "known"
+            or catalog.get("complete") is not True
+        ):
+            raise ValueError("candidate_reward_unknown")
+
+        condition_id = str(identity.get("condition_id") or "")
+        reward_market = next(
+            (
+                row
+                for row in _items(catalog.get("markets"))
+                if isinstance(row, Mapping)
+                and str(row.get("condition_id") or "") == condition_id
+            ),
+            None,
+        )
+        if not isinstance(reward_market, Mapping):
+            raise ValueError("candidate_reward_inactive")
+        pool = _maybe_decimal(reward_market.get("daily_pool_usd"))
+        if pool is None or pool <= 0:
+            raise ValueError("candidate_reward_unknown")
+
+        from .polymarket_lp_views import lp_candidate_rows
+
+        rows = lp_candidate_rows(
+            [
+                {
+                    "market": market,
+                    "book": book,
+                    "reward_active": True,
+                    "daily_pool_usd": pool,
+                    "reward_checked_at": catalog.get("checked_at"),
+                }
+            ],
+            account=account,
+            now=now,
+            reservations=self._candidate_reservations(),
+        )
+        for row in rows:
+            if all(
+                str(row.get(key) or "") == str(identity.get(key) or "")
+                for key in ("market_id", "condition_id", "token_id", "outcome")
+            ):
+                return row
+        raise ValueError("candidate_not_eligible")
+
+    def _finish_candidate_scan(
+        self,
+        previous: Mapping[str, object],
+        *,
+        state: str,
+        complete: bool,
+        checked_at: object,
+        last_success_at: object | None = None,
+        candidates: Sequence[Mapping[str, object]] | None = None,
+    ) -> dict[str, object]:
+        attempted: datetime
+        try:
+            attempted = _timestamp(checked_at, name="candidate_checked_at")
+        except ValueError:
+            attempted = self._now()
+        has_new_rows = candidates is not None
+        successful = complete and has_new_rows
+        try:
+            last_successful_check = (
+                _timestamp(
+                    previous.get("checked_at"),
+                    name="candidate_checked_at",
+                )
+                if not has_new_rows
+                else attempted
+            )
+        except ValueError:
+            last_successful_check = None
+        rows = (
+            [dict(row) for row in candidates]
+            if candidates is not None
+            else [
+                dict(row)
+                for row in previous.get("candidates", ())
+                if isinstance(row, Mapping)
+            ]
+        )
+        prior_success = previous.get("last_success_at")
+        snapshot = {
+            "state": state,
+            "complete": complete,
+            "scanning": False,
+            "candidates": rows,
+            "checked_at": last_successful_check,
+            "last_success_at": (last_success_at or attempted)
+            if successful
+            else prior_success,
+            "last_attempt_at": self._now(),
+            "candidate_rows_fresh": has_new_rows,
+        }
+        with self._candidate_state_lock:
+            self._candidate_snapshot = snapshot
+        return self.candidate_snapshot()
 
     def _mutation_allowed(self, action: str = "submit") -> bool:
         owner = self.owner_lock
@@ -187,7 +607,7 @@ class PolymarketLPService:
         try:
             normalized = self._normalize_request(request)
             snapshot = self._read_snapshot(normalized)
-            facts = self._validate_snapshot(normalized, snapshot)
+            facts = self._validate_snapshot(normalized, snapshot, now=self._now())
         except ValueError as exc:
             return {"state": "rejected", "reason": str(exc)}
         expires_at = self._now() + timedelta(seconds=PREVIEW_TTL_SECONDS)
@@ -202,6 +622,59 @@ class PolymarketLPService:
             "preview_id": preview_id,
             "expires_at": _iso(expires_at),
             "request": normalized,
+            "preflight": facts,
+        }
+
+    def preview_candidate(self, candidate: Mapping[str, object]) -> dict[str, object]:
+        """Build a fresh candidate preview from the server-observed best bid."""
+
+        if not isinstance(candidate, Mapping):
+            return {"state": "rejected", "reason": "candidate_invalid"}
+        identity: dict[str, object] = {}
+        for key in ("market_id", "condition_id", "token_id"):
+            value = _text(candidate.get(key))
+            if value is None:
+                return {"state": "rejected", "reason": f"{key}_invalid"}
+            identity[key] = value
+        outcome = _text(candidate.get("outcome"))
+        if outcome is None or outcome.upper() not in {"YES", "NO"}:
+            return {"state": "rejected", "reason": "outcome_invalid"}
+        identity["outcome"] = outcome.upper()
+
+        try:
+            snapshot = self._read_snapshot(identity)
+            now = self._now()
+            from .polymarket_lp_views import _next_review_at
+
+            review_at = _next_review_at(now)
+            expiration_for_review(review_at, now=now)
+            eligible = self._fresh_candidate_row(identity, snapshot, now=now)
+            price = _decimal(eligible.get("price"), "candidate_price")
+            quantity = _decimal(eligible.get("quantity"), "candidate_quantity")
+            request = self._normalize_request(
+                {
+                    **identity,
+                    "price": price,
+                    "quantity": quantity,
+                    "review_at": review_at,
+                    "candidate_policy": "best_bid_minimum",
+                }
+            )
+            facts = self._validate_snapshot(request, snapshot, now=now)
+        except ValueError as exc:
+            return {"state": "rejected", "reason": str(exc)}
+
+        expires_at = now + timedelta(seconds=PREVIEW_TTL_SECONDS)
+        preview_id = self.store.create_preview(
+            {**request, "preflight": facts},
+            expires_at=_iso(expires_at),
+            created_at=_iso(now),
+        )
+        return {
+            "state": "previewed",
+            "preview_id": preview_id,
+            "expires_at": _iso(expires_at),
+            "request": request,
             "preflight": facts,
         }
 
@@ -236,9 +709,19 @@ class PolymarketLPService:
                     raise ValueError("preview_expired")
                 request = self._normalize_request(preview)
                 snapshot = self._read_snapshot(request)
-                facts = self._validate_snapshot(request, snapshot)
+                now = self._now()
+                if request.get("candidate_policy") == "best_bid_minimum":
+                    eligible = self._fresh_candidate_row(request, snapshot, now=now)
+                    if (
+                        _decimal(eligible.get("price"), "candidate_price")
+                        != request["price"]
+                        or _decimal(eligible.get("quantity"), "candidate_quantity")
+                        != request["quantity"]
+                    ):
+                        raise ValueError("candidate_changed")
+                facts = self._validate_snapshot(request, snapshot, now=now)
                 expiration = expiration_for_review(
-                    _timestamp(request["review_at"], name="review_at"), now=self._now()
+                    _timestamp(request["review_at"], name="review_at"), now=now
                 )
                 reward_date = self._now().date().isoformat()
             except ValueError as exc:
@@ -267,6 +750,8 @@ class PolymarketLPService:
                 "account_checked_at": None,
                 "book_checked_at": None,
                 "stop_loss_latched": False,
+                "stop_loss_triggered_at": None,
+                "stop_loss_triggered_loss": None,
                 "scoring_status": "unknown",
                 "scoring_checked_at": None,
                 "scoring_order_id": None,
@@ -519,7 +1004,19 @@ class PolymarketLPService:
         condition_id: str,
         checked_at: datetime,
     ) -> dict[str, object]:
-        if not isinstance(snapshot, Mapping) or snapshot.get("state") != "known":
+        if not isinstance(snapshot, Mapping):
+            raise ValueError("reward_snapshot_unknown")
+        partial_raw_read = (
+            snapshot.get("state") == "unknown"
+            and snapshot.get("reason") == "usd_value_unknown"
+            and (
+                _maybe_decimal(snapshot.get("market_amount_raw")) is not None
+                or _maybe_decimal(snapshot.get("account_amount_raw")) is not None
+                or bool(snapshot.get("market_accruals_raw"))
+                or bool(snapshot.get("account_accruals_raw"))
+            )
+        )
+        if snapshot.get("state") != "known" and not partial_raw_read:
             raise ValueError("reward_snapshot_unknown")
         if str(snapshot.get("reward_date") or "") != reward_date:
             raise ValueError("reward_date_mismatch")
@@ -527,15 +1024,28 @@ class PolymarketLPService:
             raise ValueError("reward_condition_mismatch")
         account_amount = _maybe_decimal(snapshot.get("account_amount"))
         market_amount = _maybe_decimal(snapshot.get("market_amount"))
-        if (
-            account_amount is None
-            or market_amount is None
-            or account_amount < 0
-            or market_amount < 0
+        if snapshot.get("state") == "known" and (
+            account_amount is None or market_amount is None
         ):
             raise ValueError("reward_amount_unknown")
-        gap = max(Decimal("0"), REWARD_THRESHOLD - account_amount)
-        status = "met" if account_amount >= REWARD_THRESHOLD else "below"
+        if account_amount is not None and account_amount < 0:
+            raise ValueError("reward_amount_invalid")
+        if market_amount is not None and market_amount < 0:
+            raise ValueError("reward_amount_invalid")
+        usd_known = account_amount is not None and market_amount is not None
+        if usd_known:
+            assert account_amount is not None and market_amount is not None
+            gap = max(Decimal("0"), REWARD_THRESHOLD - account_amount)
+            status = "met" if account_amount >= REWARD_THRESHOLD else "below"
+        else:
+            gap = None
+            status = "unknown"
+        account_amount_raw = _maybe_decimal(snapshot.get("account_amount_raw"))
+        market_amount_raw = _maybe_decimal(snapshot.get("market_amount_raw"))
+        if account_amount_raw is not None and account_amount_raw < 0:
+            account_amount_raw = None
+        if market_amount_raw is not None and market_amount_raw < 0:
+            market_amount_raw = None
         checked = _iso(checked_at)
         return {
             "status": status,
@@ -545,6 +1055,18 @@ class PolymarketLPService:
             "market_amount": market_amount,
             "account_amount": account_amount,
             "gap": gap,
+            "market_amount_raw": market_amount_raw,
+            "market_asset": _text(snapshot.get("market_asset")),
+            "market_accruals_raw": _reward_accrual_rows(
+                snapshot.get("market_accruals_raw")
+            ),
+            "account_amount_raw": account_amount_raw,
+            "account_asset": _text(snapshot.get("account_asset")),
+            "account_accruals_raw": _reward_accrual_rows(
+                snapshot.get("account_accruals_raw")
+            ),
+            "usd_state": snapshot.get("usd_state", "known" if usd_known else "unknown"),
+            "valuation_reason": snapshot.get("reason") if not usd_known else None,
             "checked_at": checked,
             "last_success_at": checked,
             "last_attempt_at": checked,
@@ -576,6 +1098,13 @@ class PolymarketLPService:
             "market_amount": retained.get("market_amount"),
             "account_amount": retained.get("account_amount"),
             "gap": retained.get("gap"),
+            "market_amount_raw": retained.get("market_amount_raw"),
+            "market_asset": retained.get("market_asset"),
+            "market_accruals_raw": retained.get("market_accruals_raw"),
+            "account_amount_raw": retained.get("account_amount_raw"),
+            "account_asset": retained.get("account_asset"),
+            "account_accruals_raw": retained.get("account_accruals_raw"),
+            "usd_state": retained.get("usd_state", "unknown"),
             "checked_at": retained.get("checked_at"),
             "last_success_at": retained.get("last_success_at"),
             "last_attempt_at": _iso(attempted_at),
@@ -585,6 +1114,423 @@ class PolymarketLPService:
             "paid": False,
             "error": reason,
         }
+
+    def generate_due_report(self) -> dict[str, object]:
+        """Persist the next completed Beijing 08:00 report from saved facts."""
+
+        now = self._now()
+        local_now = now.astimezone(_BEIJING)
+        read_report = getattr(self.store, "lp_daily_report", None)
+        save_report = getattr(self.store, "lp_save_daily_report", None)
+        list_sessions = getattr(self.store, "lp_sessions", None)
+        latest_report = getattr(self.store, "lp_latest_daily_report", None)
+        if not all(
+            callable(method)
+            for method in (read_report, save_report, list_sessions, latest_report)
+        ):
+            return {"state": "unavailable"}
+        with self._report_lock:
+            sessions = list_sessions()
+            if not isinstance(sessions, (list, tuple)):
+                sessions = []
+            today_boundary = datetime.combine(local_now.date(), time(8), tzinfo=_BEIJING)
+            completed_date = (
+                local_now.date()
+                if local_now >= today_boundary
+                else local_now.date() - timedelta(days=1)
+            )
+            latest = latest_report()
+            if isinstance(latest, Mapping) and latest.get("report_date"):
+                target_date = date.fromisoformat(str(latest["report_date"])) + timedelta(days=1)
+            else:
+                due_review_dates: list[date] = []
+                for session in sessions:
+                    if not isinstance(session, Mapping):
+                        continue
+                    try:
+                        review_at = _timestamp(session.get("review_at"), name="review_at")
+                    except ValueError:
+                        continue
+                    review_date = review_at.astimezone(_BEIJING).date()
+                    if review_date <= completed_date and review_at <= now:
+                        due_review_dates.append(review_date)
+                target_date = min(due_review_dates) if due_review_dates else completed_date
+            if target_date > completed_date:
+                existing = read_report(completed_date.isoformat())
+                return existing if isinstance(existing, Mapping) else {"state": "not_due"}
+
+            report_date = target_date.isoformat()
+            existing = read_report(report_date)
+            if existing is not None:
+                return existing
+            period_end = datetime.combine(target_date, time(8), tzinfo=_BEIJING).astimezone(UTC)
+            period_start = period_end - timedelta(days=1)
+            session_reports: list[dict[str, object]] = []
+            for session in sessions:
+                if not isinstance(session, Mapping):
+                    continue
+                row, relevant = self._daily_report_session(
+                    session,
+                    period_start=period_start,
+                    period_end=period_end,
+                    generated_at=now,
+                )
+                if not relevant:
+                    continue
+                session_reports.append(row)
+            realized_total = self._known_report_sum(
+                session_reports, "realized_trade_pnl", empty=Decimal("0")
+            )
+            paid_total = self._known_report_sum(session_reports, "paid_rewards")
+            net_total = (
+                realized_total + paid_total
+                if realized_total is not None and paid_total is not None
+                else None
+            )
+            payload: dict[str, object] = {
+                "state": "ready",
+                "report_date": report_date,
+                "period_start": _report_boundary_iso(period_start),
+                "period_end": _report_boundary_iso(period_end),
+                "generated_at": _report_boundary_iso(now),
+                "observation_status": "late" if now > period_end else "on_time",
+                "cutoff_market_data_status": "unknown" if now > period_end else "observed_at_generation",
+                "sessions": session_reports,
+                "totals": {
+                    "realized_trade_pnl": realized_total,
+                    "paid_rewards": paid_total,
+                    "realized_net_pnl": net_total,
+                },
+            }
+            saved = save_report(report_date, payload)
+            return saved if isinstance(saved, Mapping) else payload
+
+    @staticmethod
+    def _known_report_sum(
+        rows: Sequence[Mapping[str, object]],
+        key: str,
+        *,
+        empty: Decimal | None = None,
+    ) -> Decimal | None:
+        if not rows:
+            return empty
+        values = [_maybe_decimal(row.get(key)) for row in rows]
+        if any(value is None for value in values):
+            return None
+        return sum((value for value in values if value is not None), Decimal("0"))
+
+    @staticmethod
+    def _daily_report_session(
+        session: Mapping[str, object],
+        *,
+        period_start: datetime,
+        period_end: datetime,
+        generated_at: datetime,
+    ) -> tuple[dict[str, object], bool]:
+        from .polymarket_lp_views import lp_report_totals
+
+        events_value = session.get("trade_events")
+        events = _items(events_value)
+        ledger_complete = isinstance(events_value, (list, tuple))
+        normalized: list[dict[str, object]] = []
+        seen: dict[tuple[str, str], dict[str, object]] = {}
+        event_totals = {
+            "buy_filled_quantity": Decimal("0"),
+            "buy_cost": Decimal("0"),
+            "sold_quantity": Decimal("0"),
+            "sold_revenue": Decimal("0"),
+        }
+        for raw_event in events:
+            if not isinstance(raw_event, Mapping):
+                ledger_complete = False
+                continue
+            status = str(raw_event.get("status") or "").upper()
+            if status == "FAILED":
+                continue
+            if status != "CONFIRMED":
+                ledger_complete = False
+                continue
+            trade_id = str(raw_event.get("trade_id") or "")
+            order_id = str(raw_event.get("order_id") or "")
+            if not trade_id:
+                ledger_complete = False
+                continue
+            identity = (trade_id, order_id)
+            if identity in seen:
+                if seen[identity] != dict(raw_event):
+                    ledger_complete = False
+                continue
+            try:
+                matched_at = _timestamp(raw_event.get("matched_at"))
+            except ValueError:
+                ledger_complete = False
+                continue
+            side = str(raw_event.get("side") or "").upper()
+            quantity = _maybe_decimal(raw_event.get("quantity"))
+            price = _maybe_decimal(raw_event.get("price"))
+            fee = _maybe_decimal(raw_event.get("fee"))
+            if (
+                side not in {"BUY", "SELL"}
+                or quantity is None
+                or quantity <= 0
+                or price is None
+                or price <= 0
+            ):
+                ledger_complete = False
+                continue
+            event = {
+                "trade_id": trade_id,
+                "order_id": order_id,
+                "matched_at": matched_at,
+                "side": side,
+                "quantity": quantity,
+                "price": price,
+                "fee": fee,
+            }
+            seen[identity] = dict(raw_event)
+            normalized.append(event)
+            quantity_key, value_key = (
+                ("buy_filled_quantity", "buy_cost")
+                if side == "BUY"
+                else ("sold_quantity", "sold_revenue")
+            )
+            event_totals[quantity_key] += quantity
+            event_totals[value_key] += quantity * price
+
+        for key, event_total in event_totals.items():
+            recorded = _maybe_decimal(session.get(key))
+            if recorded is None or recorded != event_total:
+                ledger_complete = False
+
+        for side, field_name in (("BUY", "buy_fees"), ("SELL", "sell_fees")):
+            side_events = [event for event in normalized if event["side"] == side]
+            fees = [_maybe_decimal(event.get("fee")) for event in side_events]
+            fee_total = (
+                None
+                if any(fee is None for fee in fees)
+                else sum((fee for fee in fees if fee is not None), Decimal("0"))
+            )
+            recorded_fee = _maybe_decimal(session.get(field_name))
+            if side_events and (fee_total is None or recorded_fee != fee_total):
+                ledger_complete = False
+            elif not side_events and recorded_fee not in (None, Decimal("0")):
+                ledger_complete = False
+
+        normalized.sort(key=lambda event: cast(datetime, event["matched_at"]))
+
+        payment_events_value = session.get("verified_paid_reward_events")
+        payment_events = _items(payment_events_value)
+        payments_complete = isinstance(payment_events_value, (list, tuple)) and bool(
+            payment_events
+        )
+        normalized_payments: list[tuple[datetime, Decimal]] = []
+        for raw_payment in payment_events:
+            if not isinstance(raw_payment, Mapping) or raw_payment.get("verified") is not True:
+                payments_complete = False
+                continue
+            try:
+                paid_at = _timestamp(raw_payment.get("paid_at"))
+            except ValueError:
+                payments_complete = False
+                continue
+            amount = _maybe_decimal(raw_payment.get("usd_amount"))
+            if not raw_payment.get("payment_id") or amount is None or amount < 0:
+                payments_complete = False
+                continue
+            normalized_payments.append((paid_at, amount))
+
+        def cutoff_values(cutoff: datetime) -> tuple[dict[str, object], dict[str, object]]:
+            selected = [
+                event
+                for event in normalized
+                if cast(datetime, event["matched_at"]) < cutoff
+            ]
+            sums = {
+                "buy_filled_quantity": Decimal("0"),
+                "buy_cost": Decimal("0"),
+                "sold_quantity": Decimal("0"),
+                "sold_revenue": Decimal("0"),
+            }
+            cutoff_fees: dict[str, Decimal | None] = {}
+            for event in selected:
+                side = str(event["side"])
+                quantity = cast(Decimal, event["quantity"])
+                price = cast(Decimal, event["price"])
+                quantity_key, value_key = (
+                    ("buy_filled_quantity", "buy_cost")
+                    if side == "BUY"
+                    else ("sold_quantity", "sold_revenue")
+                )
+                sums[quantity_key] += quantity
+                sums[value_key] += quantity * price
+            for side, field_name in (("BUY", "buy_fees"), ("SELL", "sell_fees")):
+                side_events = [event for event in selected if event["side"] == side]
+                fees = [_maybe_decimal(event.get("fee")) for event in side_events]
+                cutoff_fees[field_name] = (
+                    None
+                    if any(fee is None for fee in fees)
+                    else sum((fee for fee in fees if fee is not None), Decimal("0"))
+                )
+            buy_quantity = sums["buy_filled_quantity"]
+            sold_quantity = sums["sold_quantity"]
+            residual_quantity = buy_quantity - sold_quantity
+            if residual_quantity < 0:
+                residual_quantity = None
+            if not ledger_complete:
+                cutoff_sums: dict[str, object] = {key: None for key in sums}
+                cutoff_fees = {key: None for key in cutoff_fees}
+                residual_quantity = None
+            else:
+                cutoff_sums = sums
+            paid_total = (
+                sum(
+                    (amount for paid_at, amount in normalized_payments if paid_at < cutoff),
+                    Decimal("0"),
+                )
+                if payments_complete
+                else None
+            )
+            opening: dict[str, object] = {
+                **cutoff_sums,
+                **cutoff_fees,
+                "residual_quantity": residual_quantity,
+                "residual_exit_value": Decimal("0")
+                if residual_quantity == 0
+                else None,
+                "projected_exit_fee": Decimal("0")
+                if residual_quantity == 0
+                else None,
+            }
+            return opening, lp_report_totals(opening, paid_rewards=paid_total)
+
+        _, opening_projection = cutoff_values(period_start)
+        closing_totals, closing_projection = cutoff_values(period_end)
+
+        def difference(key: str) -> Decimal | None:
+            opening_value = _maybe_decimal(opening_projection.get(key))
+            closing_value = _maybe_decimal(closing_projection.get(key))
+            if opening_value is None or closing_value is None:
+                return None
+            return closing_value - opening_value
+
+        realized_value = difference("realized_trade_pnl")
+        paid_rewards = difference("paid_rewards")
+        realized_net = (
+            realized_value + paid_rewards
+            if realized_value is not None and paid_rewards is not None
+            else None
+        )
+        inventory_at_end = closing_totals.get("residual_quantity")
+        inventory_at_end = (
+            cast(Decimal, inventory_at_end)
+            if isinstance(inventory_at_end, Decimal)
+            else None
+        )
+
+        residual_exit_at_end: Decimal | None = None
+        quote_status = "unknown"
+        if inventory_at_end == 0:
+            residual_exit_at_end = Decimal("0")
+            quote_status = "not_required"
+        elif inventory_at_end is not None and generated_at <= period_end:
+            try:
+                book_checked_at = _timestamp(session.get("book_checked_at"))
+            except ValueError:
+                book_checked_at = None
+            current_exit_value = _maybe_decimal(session.get("residual_exit_value"))
+            if (
+                book_checked_at is not None
+                and abs((period_end - book_checked_at).total_seconds())
+                <= float(BOOK_FRESHNESS_SECONDS)
+                and current_exit_value is not None
+            ):
+                residual_exit_at_end = current_exit_value
+                quote_status = "known"
+
+        order_history = session.get("order_history")
+        unresolved_orders: list[dict[str, object]] = []
+        if isinstance(order_history, Mapping):
+            for order_id, raw_order in order_history.items():
+                if not isinstance(raw_order, Mapping):
+                    continue
+                status = str(raw_order.get("status") or "UNKNOWN").upper()
+                if status not in TERMINAL_ORDER_STATES:
+                    unresolved_orders.append({"order_id": str(order_id), "status": status})
+        reward_observation = session.get("reward_observation")
+        pending_rewards = (
+            dict(reward_observation)
+            if isinstance(reward_observation, Mapping)
+            else None
+        )
+        current_inventory = _maybe_decimal(session.get("residual_quantity"))
+        current_exit_value = _maybe_decimal(session.get("residual_exit_value"))
+        stop_loss_at = session.get("stop_loss_triggered_at")
+        stop_loss_value = _maybe_decimal(session.get("stop_loss_triggered_loss"))
+        session_report = {
+            "session_id": str(session.get("session_id") or ""),
+            "market_id": session.get("market_id"),
+            "condition_id": session.get("condition_id"),
+            "market_title": session.get("market_title", session.get("question")),
+            "market_url": session.get("market_url"),
+            "outcome": session.get("outcome"),
+            "session_state": session.get("state"),
+            "period_start": _report_boundary_iso(period_start),
+            "period_end": _report_boundary_iso(period_end),
+            "realized_trade_pnl": realized_value,
+            "realized_trade_pnl_status": "known" if realized_value is not None else "unknown",
+            "paid_rewards": paid_rewards,
+            "paid_rewards_status": "known" if paid_rewards is not None else "needs_verification",
+            "realized_net_pnl": realized_net,
+            "residual_quantity_at_period_end": inventory_at_end,
+            "residual_exit_value_at_period_end": residual_exit_at_end,
+            "residual_exit_estimate_status": quote_status,
+            "current_residual_quantity": current_inventory,
+            "current_residual_exit_value": current_exit_value,
+            "current_inventory_checked_at": session.get("account_checked_at"),
+            "current_exit_checked_at": session.get("book_checked_at"),
+            "management_observed_at": _report_boundary_iso(generated_at),
+            "stop_loss_triggered": stop_loss_at is not None or session.get("stop_loss_latched") is True,
+            "stop_loss_triggered_at": stop_loss_at,
+            "stop_loss_triggered_loss": stop_loss_value,
+            "review_status": session.get("review_status"),
+            "orders_terminal": session.get("orders_terminal"),
+            "unresolved_orders": unresolved_orders,
+            "reconciliation": session.get("reconciliation"),
+            "pending_rewards": pending_rewards,
+        }
+
+        event_in_period = any(
+            period_start <= cast(datetime, event["matched_at"]) < period_end
+            for event in normalized
+        )
+        payment_in_period = any(
+            period_start <= paid_at < period_end
+            for paid_at, _amount in normalized_payments
+        )
+        try:
+            review_at = _timestamp(session.get("review_at"), name="review_at")
+        except ValueError:
+            review_at = None
+        review_in_period = review_at is not None and period_start < review_at <= period_end
+        try:
+            created_at = _timestamp(session.get("created_at"), name="created_at")
+        except ValueError:
+            created_at = None
+        created_in_period = created_at is not None and period_start <= created_at < period_end
+        active_at_observation = str(session.get("state") or "") not in {
+            "complete",
+            "entry_rejected",
+        }
+        existed_at_cutoff = created_at is not None and created_at <= period_end
+        relevant = (
+            event_in_period
+            or payment_in_period
+            or review_in_period
+            or created_in_period
+            or (inventory_at_end is not None and inventory_at_end > 0)
+            or (active_at_observation and existed_at_cutoff)
+        )
+        return session_report, relevant
 
     def status(self, session_id: str | None = None) -> dict[str, object]:
         with self._mutex:
@@ -782,7 +1728,7 @@ class PolymarketLPService:
                 session = self.store.lp_update_session(
                     str(session["session_id"]),
                     state="stop_loss_exit",
-                    patch={"stop_loss_latched": True},
+                    patch=self._stop_loss_latch_patch(session, loss),
                 )
             session = self.store.lp_session(str(session["session_id"])) or session
             if bool(session.get("stop_loss_latched")) or str(session.get("state")) == "stop_loss_exit":
@@ -822,6 +1768,20 @@ class PolymarketLPService:
             return None
         return cost - proceeds - residual + fees
 
+    def _stop_loss_latch_patch(
+        self, session: Mapping[str, object], loss: Decimal | None
+    ) -> dict[str, object]:
+        patch: dict[str, object] = {"stop_loss_latched": True}
+        if (
+            loss is not None
+            and loss >= STOP_LOSS
+            and session.get("stop_loss_triggered_at") is None
+            and session.get("stop_loss_triggered_loss") is None
+        ):
+            patch["stop_loss_triggered_at"] = _iso(self._now())
+            patch["stop_loss_triggered_loss"] = loss
+        return patch
+
     def _normalize_request(self, request: Mapping[str, object]) -> dict[str, object]:
         if not isinstance(request, Mapping):
             raise ValueError("request_invalid")
@@ -858,10 +1818,14 @@ class PolymarketLPService:
                 return value
         raise ValueError("external_snapshot_unknown")
 
+    @classmethod
     def _validate_snapshot(
-        self, request: Mapping[str, object], snapshot: Mapping[str, object]
+        cls,
+        request: Mapping[str, object],
+        snapshot: Mapping[str, object],
+        *,
+        now: datetime,
     ) -> dict[str, object]:
-        now = self._now()
         account = snapshot.get("account")
         if not isinstance(account, Mapping):
             raise ValueError("account_unknown")
@@ -964,10 +1928,17 @@ class PolymarketLPService:
         if stamp is None:
             raise ValueError("book_freshness_unknown")
         _freshness(stamp, now, "book_freshness")
-        asks = self._levels(book.get("asks"), "asks")
-        bids = self._levels(book.get("bids"), "bids")
+        asks = cls._levels(book.get("asks"), "asks")
+        bids = cls._levels(book.get("bids"), "bids")
         if not asks or not bids:
             raise ValueError("book_invalid")
+        candidate_policy = request.get("candidate_policy")
+        if candidate_policy not in (None, "best_bid_minimum"):
+            raise ValueError("candidate_policy_invalid")
+        if candidate_policy == "best_bid_minimum":
+            external_best_bid = max(level_price for level_price, _ in bids)
+            if price != external_best_bid:
+                raise ValueError("candidate_best_bid_changed")
         qualifying_asks = [row for row in asks if row[1] >= reward_min_d]
         qualifying_bids = [row for row in bids if row[1] >= reward_min_d]
         if not qualifying_asks or not qualifying_bids:
@@ -979,6 +1950,11 @@ class PolymarketLPService:
             raise ValueError("midpoint_out_of_range")
         if abs(price - midpoint) > reward_spread_d:
             raise ValueError("reward_distance_invalid")
+        if (
+            candidate_policy == "best_bid_minimum"
+            and abs(price - midpoint) >= reward_spread_d
+        ):
+            raise ValueError("reward_score_zero")
         if sum(size for _, size in bids) < quantity:
             raise ValueError("exit_liquidity_insufficient")
         review_at = _timestamp(request["review_at"], name="review_at")
@@ -1214,6 +2190,137 @@ class PolymarketLPService:
                 return "unowned_target_order"
         return None
 
+    def _snapshot_trade_events(
+        self,
+        session: Mapping[str, object],
+        snapshot: Mapping[str, object],
+    ) -> list[dict[str, object]]:
+        """Retain official matched trade facts needed for report cutoffs."""
+
+        own_order_ids = set(self._session_order_ids(session))
+        market = snapshot.get("market")
+        market_facts = market if isinstance(market, Mapping) else {}
+        events: list[dict[str, object]] = []
+        for trade in _items(snapshot.get("trades")):
+            status = str(_field(trade, "status", "")).upper()
+            if status == "FAILED":
+                continue
+            if status != "CONFIRMED":
+                continue
+            trade_id = str(_field(trade, "trade_id", _field(trade, "id", "")) or "")
+            if not trade_id:
+                continue
+            maker_orders = _items(_field(trade, "maker_orders", ()))
+            taker_order_id = str(_field(trade, "taker_order_id", "") or "")
+            candidates: list[tuple[object, str, str]] = []
+            for order in maker_orders:
+                order_id = self._order_id(order)
+                if order_id in own_order_ids:
+                    candidates.append((order, "maker", order_id))
+            if taker_order_id in own_order_ids:
+                candidates.append((trade, "taker", taker_order_id))
+            for order, role, order_id in candidates:
+                side = str(
+                    _field(order, "side", _field(trade, "side", ""))
+                ).upper()
+                amount = _maybe_decimal(
+                    _field(
+                        order,
+                        "matched_amount",
+                        _field(order, "size", _field(order, "quantity", _field(trade, "size"))),
+                    )
+                )
+                price = _maybe_decimal(_field(order, "price", _field(trade, "price")))
+                if side not in {"BUY", "SELL"} or amount is None or price is None:
+                    continue
+                fee = _maybe_decimal(
+                    _field(
+                        order,
+                        "fee",
+                        _field(order, "fees", _field(trade, "fee", _field(trade, "fees"))),
+                    )
+                )
+                if fee is None and role == "taker":
+                    rate = _maybe_decimal(
+                        market_facts.get("taker_fee_rate", market_facts.get("fee_rate"))
+                    )
+                    exponent = _maybe_decimal(market_facts.get("fee_exponent", 1))
+                    if rate is not None and exponent is not None and rate >= 0 and exponent >= 0:
+                        fee = (
+                            amount
+                            * rate
+                            * (price * (Decimal("1") - price)) ** exponent
+                        ).quantize(Decimal("0.00001"))
+                elif fee is None and role == "maker":
+                    maker_fee = _maybe_decimal(market_facts.get("fee"))
+                    if market_facts.get("fees_enabled") is False:
+                        fee = Decimal("0")
+                    elif maker_fee == 0:
+                        fee = Decimal("0")
+                matched_at_value = _field(
+                    trade,
+                    "matched_at",
+                    _field(
+                        trade,
+                        "match_time",
+                        _field(trade, "updated_at", _field(trade, "timestamp")),
+                    ),
+                )
+                try:
+                    matched_at = _iso(_timestamp(matched_at_value))
+                except ValueError:
+                    matched_at = None
+                events.append(
+                    {
+                        "trade_id": trade_id,
+                        "order_id": order_id,
+                        "matched_at": matched_at,
+                        "status": "CONFIRMED",
+                        "side": side,
+                        "quantity": amount,
+                        "price": price,
+                        "fee": fee,
+                    }
+                )
+        return events
+
+    def _merge_report_trade_events(
+        self,
+        session: Mapping[str, object],
+        snapshot: Mapping[str, object],
+    ) -> list[dict[str, object]]:
+        merged: dict[tuple[str, str], dict[str, object]] = {}
+        existing = session.get("trade_events")
+        for raw_event in _items(existing):
+            if not isinstance(raw_event, Mapping):
+                continue
+            trade_id = str(raw_event.get("trade_id") or "")
+            order_id = str(raw_event.get("order_id") or "")
+            if trade_id:
+                merged[(trade_id, order_id)] = dict(raw_event)
+        for event in self._snapshot_trade_events(session, snapshot):
+            key = (str(event["trade_id"]), str(event["order_id"]))
+            current = merged.setdefault(key, {})
+            current.update({name: value for name, value in event.items() if value is not None})
+            if event.get("matched_at") is None:
+                current.setdefault("matched_at", None)
+            if event.get("fee") is None:
+                current.setdefault("fee", None)
+        return list(merged.values())
+
+    @staticmethod
+    def _report_fee_total(
+        trade_events: Sequence[Mapping[str, object]], side: str
+    ) -> Decimal | None:
+        fees = [
+            _maybe_decimal(event.get("fee"))
+            for event in trade_events
+            if str(event.get("side") or "").upper() == side
+        ]
+        if any(fee is None for fee in fees):
+            return None
+        return sum((fee for fee in fees if fee is not None), Decimal("0"))
+
     def _fill_patch(
         self, session: Mapping[str, object], snapshot: Mapping[str, object]
     ) -> dict[str, object]:
@@ -1254,6 +2361,9 @@ class PolymarketLPService:
             sold_revenue += current_revenue
         residual = self._position_quantity(account, str(token_id))
         residual_value = self._executable_bid_value(snapshot, residual)
+        trade_events = self._merge_report_trade_events(session, snapshot)
+        buy_fees = self._report_fee_total(trade_events, "BUY")
+        sell_fees = self._report_fee_total(trade_events, "SELL")
         fees = self._known_trade_fees(snapshot, session, token_id=str(token_id))
         projected_fee = self._projected_taker_fee(snapshot, residual)
         fees_known = fees is not None and projected_fee is not None
@@ -1275,8 +2385,12 @@ class PolymarketLPService:
             "buy_cost": cost,
             "sold_quantity": sold_quantity,
             "sold_revenue": sold_revenue,
+            "buy_fees": buy_fees,
+            "sell_fees": sell_fees,
             "residual_quantity": residual,
             "residual_exit_value": residual_value,
+            "projected_exit_fee": projected_fee,
+            "trade_events": trade_events,
             "fees": fees,
             "fee_status": "known" if fees_known else "unknown",
             "position_reconciled": position_reconciled,
@@ -2412,7 +3526,10 @@ class PolymarketLPService:
     def _review_iteration(
         self, session: Mapping[str, object], snapshot: Mapping[str, object]
     ) -> dict[str, object]:
-        if session.get("stop_requested") is True:
+        if (
+            session.get("stop_requested") is True
+            or session.get("review_status") == "awaiting_reconciliation"
+        ):
             try:
                 self._cancel_owned_orders(session)
             except Exception as exc:
@@ -2439,7 +3556,9 @@ class PolymarketLPService:
             return self._complete_if_flat(updated, snapshot)
         if (loss is not None and loss >= STOP_LOSS) or latched:
             updated = self.store.lp_update_session(
-                str(session["session_id"]), state="stop_loss_exit", patch={"stop_loss_latched": True}
+                str(session["session_id"]),
+                state="stop_loss_exit",
+                patch=self._stop_loss_latch_patch(updated, loss),
             )
             updated = self._request_passive_cancel(updated)
             if not updated.get("passive_exit_order_id") or bool(updated.get("orders_terminal")):
@@ -2497,6 +3616,7 @@ class PolymarketLPService:
             "residual_exit_value",
             "fees",
             "opening_loss",
+            "stop_loss_triggered_loss",
             "paid_rewards",
             "trade_pnl",
             "total_pnl",

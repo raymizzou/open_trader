@@ -272,6 +272,8 @@ class PredictionExecutionService:
         # the existing execution path.  Keep the collaborator optional so
         # shadow and legacy test fixtures retain their read-only surface.
         self._lp = lp
+        self._lp_dashboard_lock = threading.RLock()
+        self._lp_dashboard_cache: dict[str, object] | None = None
         self._cross_venue_monitor: object | None = None
         self._notifier = notifier
         self._lock_path = Path(lock_path)
@@ -305,12 +307,318 @@ class PredictionExecutionService:
             return {"state": "rejected", "reason": "lp_unavailable"}
         return preview(request)
 
+    def lp_candidate_preview(
+        self, candidate: Mapping[str, object]
+    ) -> dict[str, object]:
+        """Create a candidate preview with price and size fixed by live facts."""
+
+        service = self._lp
+        preview = getattr(service, "preview_candidate", None)
+        if not callable(preview):
+            return {"state": "rejected", "reason": "lp_unavailable"}
+        return preview(candidate)
+
     def lp_status(self, session_id: str | None = None) -> dict[str, object]:
         service = self._lp
         status = getattr(service, "status", None)
         if not callable(status):
             return {"state": "none", "session_id": None, "reason": "lp_unavailable"}
         return status(session_id)
+
+    def lp_dashboard(self) -> dict[str, object]:
+        """Read official account orders and holdings without managing them."""
+
+        with self._lp_dashboard_lock:
+            reader = getattr(self._trading, "lp_account_snapshot", None)
+            try:
+                if not callable(reader):
+                    raise RuntimeError("lp_account_reader_unavailable")
+                snapshot = _call(reader)
+                if (
+                    not isinstance(snapshot, Mapping)
+                    or snapshot.get("authenticated") is not True
+                    or not isinstance(snapshot.get("open_orders"), (list, tuple))
+                    or not isinstance(snapshot.get("positions"), (list, tuple))
+                ):
+                    raise RuntimeError("lp_account_snapshot_unknown")
+                checked = snapshot.get("checked_at")
+                if isinstance(checked, str):
+                    text = checked.strip()
+                    if text.endswith("Z"):
+                        text = text[:-1] + "+00:00"
+                    try:
+                        checked = datetime.fromisoformat(text)
+                    except ValueError as exc:
+                        raise RuntimeError("lp_account_timestamp_unknown") from exc
+                if not isinstance(checked, datetime) or checked.tzinfo is None:
+                    raise RuntimeError("lp_account_timestamp_unknown")
+                checked_at = _timestamp(checked)
+
+                session: dict[str, object]
+                try:
+                    raw_session = self.lp_status()
+                    session = dict(raw_session) if isinstance(raw_session, Mapping) else {"state": "unknown"}
+                except Exception:
+                    session = {"state": "unknown"}
+                managed_ids = {
+                    str(session.get(key) or "")
+                    for key in (
+                        "entry_order_id",
+                        "passive_exit_order_id",
+                        "protected_exit_order_id",
+                    )
+                } - {""}
+                raw_owned = session.get("owned_order_ids")
+                if isinstance(raw_owned, (list, tuple, set, frozenset)):
+                    managed_ids.update(str(order_id) for order_id in raw_owned if order_id)
+                managed_token = str(session.get("token_id") or "")
+
+                orders: list[dict[str, object]] = []
+                for raw_order in snapshot["open_orders"]:
+                    if not isinstance(raw_order, Mapping):
+                        continue
+                    order_id = str(raw_order.get("order_id", raw_order.get("id", "")) or "")
+                    filled = _decimal(raw_order.get("size_matched", raw_order.get("filled_quantity")))
+                    remaining = _decimal(raw_order.get("remaining_size", raw_order.get("remaining_quantity")))
+                    quantity = _decimal(raw_order.get("original_size", raw_order.get("quantity")))
+                    if quantity is None and filled is not None and remaining is not None:
+                        quantity = filled + remaining
+                    if remaining is None and quantity is not None and filled is not None:
+                        remaining = max(Decimal("0"), quantity - filled)
+                    managed = order_id in managed_ids
+                    orders.append(
+                        {
+                            "order_id": order_id,
+                            "market_id": raw_order.get("market_id"),
+                            "condition_id": raw_order.get("condition_id", raw_order.get("market")),
+                            "market_title": raw_order.get("market_title", raw_order.get("title")),
+                            "market_url": raw_order.get("market_url"),
+                            "token_id": raw_order.get("token_id", raw_order.get("asset_id")),
+                            "outcome": raw_order.get("outcome"),
+                            "side": raw_order.get("side"),
+                            "status": raw_order.get("status"),
+                            "price": _decimal(raw_order.get("price")),
+                            "quantity": quantity,
+                            "filled_quantity": filled,
+                            "remaining_quantity": remaining,
+                            "management": "system_managed" if managed else "manual_read_only",
+                            "read_only": not managed,
+                        }
+                    )
+
+                positions: list[dict[str, object]] = []
+                for raw_position in snapshot["positions"]:
+                    if not isinstance(raw_position, Mapping):
+                        continue
+                    token_id = str(raw_position.get("token_id", raw_position.get("asset_id", "")) or "")
+                    managed = bool(managed_token and token_id == managed_token)
+                    positions.append(
+                        {
+                            "market_id": raw_position.get("market_id"),
+                            "condition_id": raw_position.get("condition_id", raw_position.get("market")),
+                            "market_title": raw_position.get("market_title", raw_position.get("title")),
+                            "market_url": raw_position.get("market_url"),
+                            "token_id": token_id or None,
+                            "outcome": raw_position.get("outcome"),
+                            "size": _decimal(raw_position.get("size", raw_position.get("quantity"))),
+                            "average_price": _decimal(raw_position.get("average_price")),
+                            "current_value": _decimal(raw_position.get("current_value")),
+                            "management": "system_managed" if managed else "manual_read_only",
+                            "read_only": not managed,
+                        }
+                    )
+
+                scoring_reader = getattr(self._trading, "get_order_scoring", None)
+                scoring_by_order: dict[str, tuple[object, str | None]] = {}
+                for order in orders:
+                    order_id = str(order.get("order_id") or "")
+                    if order.get("management") != "manual_read_only" or not order_id:
+                        continue
+                    if order_id not in scoring_by_order:
+                        if not callable(scoring_reader):
+                            scoring_by_order[order_id] = ("unknown", None)
+                        else:
+                            try:
+                                scoring = _call(scoring_reader, order_id)
+                            except Exception:
+                                scoring = "unknown"
+                            scoring_by_order[order_id] = (
+                                scoring if isinstance(scoring, bool) else "unknown",
+                                _timestamp(datetime.now(UTC)),
+                            )
+                    order["scoring_status"], order["scoring_checked_at"] = (
+                        scoring_by_order[order_id]
+                    )
+
+                candidate_reader = getattr(self._lp, "candidate_snapshot", None)
+                try:
+                    raw_candidates = _call(candidate_reader) if callable(candidate_reader) else {}
+                    candidate_snapshot = (
+                        dict(raw_candidates)
+                        if isinstance(raw_candidates, Mapping)
+                        else {}
+                    )
+                except Exception:
+                    candidate_snapshot = {}
+                raw_candidates = candidate_snapshot.get("candidates")
+                candidates = [
+                    dict(candidate)
+                    for candidate in raw_candidates
+                    if isinstance(candidate, Mapping)
+                ] if isinstance(raw_candidates, (list, tuple)) else []
+                raw_market_rewards = candidate_snapshot.get("market_rewards")
+                market_rewards = (
+                    dict(raw_market_rewards)
+                    if isinstance(raw_market_rewards, Mapping)
+                    else {}
+                )
+                manual_conditions = tuple(
+                    dict.fromkeys(
+                        str(row.get("condition_id") or "").strip()
+                        for row in (*orders, *positions)
+                        if row.get("management") == "manual_read_only"
+                        and str(row.get("condition_id") or "").strip()
+                    )
+                )
+                reward_reader = getattr(self._trading, "lp_reward_snapshot", None)
+                previous_dashboard = self._lp_dashboard_cache
+                previous_rewards_value = (
+                    previous_dashboard.get("market_rewards")
+                    if isinstance(previous_dashboard, Mapping)
+                    else None
+                )
+                previous_rewards = (
+                    previous_rewards_value
+                    if isinstance(previous_rewards_value, Mapping)
+                    else {}
+                )
+                reward_date = checked.astimezone(UTC).date().isoformat()
+                for condition_id in manual_conditions:
+                    attempted_at = _timestamp(datetime.now(UTC))
+                    try:
+                        observed = (
+                            _call(reward_reader, reward_date, condition_id)
+                            if callable(reward_reader)
+                            else None
+                        )
+                    except Exception:
+                        observed = None
+                    observed_at = _timestamp(datetime.now(UTC))
+                    raw_market: Mapping[str, object] = (
+                        observed if isinstance(observed, Mapping) else {}
+                    )
+                    accruals = raw_market.get("market_accruals_raw")
+                    has_raw_amount = _decimal(
+                        raw_market.get("market_amount_raw")
+                    ) is not None or (
+                        isinstance(accruals, (list, tuple)) and bool(accruals)
+                    )
+                    identity_matches = (
+                        str(raw_market.get("reward_date") or "") == reward_date
+                        and str(raw_market.get("condition_id") or "")
+                        == condition_id
+                    )
+                    read_complete = identity_matches and (
+                        raw_market.get("state") == "known"
+                        or (
+                            raw_market.get("state") == "unknown"
+                            and raw_market.get("reason") == "usd_value_unknown"
+                            and has_raw_amount
+                        )
+                    )
+                    if read_complete:
+                        market_rewards[condition_id] = {
+                            "state": raw_market.get("state", "unknown"),
+                            "usd_state": raw_market.get("usd_state", "unknown"),
+                            "reward_date": reward_date,
+                            "condition_id": condition_id,
+                            "market_amount": raw_market.get("market_amount"),
+                            "market_amount_raw": raw_market.get(
+                                "market_amount_raw"
+                            ),
+                            "market_asset": raw_market.get("market_asset"),
+                            "market_accruals_raw": accruals,
+                            "checked_at": observed_at,
+                            "last_success_at": observed_at,
+                            "last_attempt_at": observed_at,
+                            "stale": False,
+                            "source": "platform_earnings",
+                            "currency": "USD",
+                            "paid": False,
+                            "reason": raw_market.get("reason"),
+                        }
+                        continue
+
+                    previous_reward = previous_rewards.get(condition_id)
+                    retained_reward = (
+                        previous_reward if isinstance(previous_reward, Mapping) else {}
+                    )
+                    market_rewards[condition_id] = {
+                        "state": "unknown",
+                        "usd_state": "unknown",
+                        "reward_date": reward_date,
+                        "condition_id": condition_id,
+                        "market_amount": retained_reward.get("market_amount"),
+                        "market_amount_raw": retained_reward.get(
+                            "market_amount_raw"
+                        ),
+                        "market_asset": retained_reward.get("market_asset"),
+                        "market_accruals_raw": retained_reward.get(
+                            "market_accruals_raw"
+                        ),
+                        "checked_at": retained_reward.get("checked_at"),
+                        "last_success_at": retained_reward.get("last_success_at"),
+                        "last_attempt_at": attempted_at,
+                        "stale": True,
+                        "source": "platform_earnings",
+                        "currency": "USD",
+                        "paid": False,
+                        "reason": raw_market.get("reason") or "reward_read_unknown",
+                    }
+                result = {
+                    "state": "ready",
+                    "orders": orders,
+                    "positions": positions,
+                    "candidates": candidates,
+                    "market_rewards": market_rewards,
+                    "complete": candidate_snapshot.get("complete") is True,
+                    "scanning": candidate_snapshot.get("scanning") is True,
+                    "candidate_stale": candidate_snapshot.get("stale") is True,
+                    "candidate_checked_at": candidate_snapshot.get("checked_at"),
+                    "checked_at": checked_at,
+                    "last_success_at": checked_at,
+                    "stale": False,
+                    "lp_session": session,
+                }
+                self._lp_dashboard_cache = result
+                return result
+            except Exception:
+                cached = self._lp_dashboard_cache
+                if cached is not None:
+                    return {**cached, "state": "stale", "stale": True}
+                return {
+                    "state": "unknown",
+                    "orders": [],
+                    "positions": [],
+                    "candidates": [],
+                    "market_rewards": {},
+                    "complete": False,
+                    "scanning": False,
+                    "candidate_stale": True,
+                    "checked_at": None,
+                    "last_success_at": None,
+                    "stale": True,
+                    "lp_session": self.lp_status(),
+                }
+
+    def lp_report(self, report_date: str) -> dict[str, object] | None:
+        """Read one immutable stored LP daily report."""
+
+        reader = getattr(self._store, "lp_daily_report", None)
+        if not callable(reader):
+            return None
+        report = reader(report_date)
+        return dict(report) if isinstance(report, Mapping) else None
 
     def lp_start(self, preview_id: str, idempotency_key: str) -> dict[str, object]:
         """Start one LP session under the shared execution mutex."""

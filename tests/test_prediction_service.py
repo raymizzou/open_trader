@@ -25,9 +25,11 @@ import pytest
 
 import open_trader
 import open_trader.prediction_service as prediction_service
+import open_trader.polymarket_trading as polymarket_trading_module
 from open_trader.llm_providers import PROVIDER_IDS, resolve_provider
 from open_trader.notifications import NullNotifier
 from open_trader.polymarket_lp import PolymarketLPService
+from open_trader.polymarket_trading import PolymarketTradingClient, TradingConfig
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 from open_trader.prediction_arbitrage_execution import PredictionExecutionService
 from open_trader.prediction_read_model import (
@@ -653,6 +655,620 @@ def test_lp_state_exposes_reward_threshold_without_paid_profit(tmp_path: Path) -
     assert "total_pnl" not in payload["lp_session"]
     assert execution.status_calls == 1
     assert execution.write_calls == 0
+
+
+def test_lp_dashboard_shows_manual_orders_without_managing_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class RewardTransport:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, object]]] = []
+
+        def get_json(self, path: str, *, params: dict[str, object]) -> object:
+            self.calls.append((path, dict(params)))
+            reward = {
+                "date": f"{params['date']}T00:00:00Z",
+                "maker_address": "wallet",
+                "asset_address": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+                "earnings": "0.25",
+                "asset_rate": "0.9999",
+            }
+            if path == "/rewards/user/total":
+                return [reward]
+            if params.get("sponsored") is False:
+                return {
+                    "data": [{**reward, "condition_id": "condition-1"}],
+                    "next_cursor": "LTE=",
+                }
+            return {"data": [], "next_cursor": "LTE="}
+
+    reward_transport = RewardTransport()
+    monkeypatch.setattr(
+        polymarket_trading_module, "signature_type_for", lambda _wallet_type: 0
+    )
+
+    class AccountSDK:
+        def __init__(self) -> None:
+            self.open_order_reads = 0
+            self.order_writes = 0
+            self.cancellations = 0
+            self.scoring_reads: list[str] = []
+            self._ctx = SimpleNamespace(
+                secure_clob=reward_transport, wallet_type=None
+            )
+            self.environment = SimpleNamespace(standard_exchange="standard-exchange")
+
+        def get_balance_allowance(self, **_kwargs: object) -> object:
+            return SimpleNamespace(
+                balance=30_000_000,
+                allowances={"standard-exchange": 30_000_000},
+            )
+
+        def list_open_orders(self, **_kwargs: object) -> list[object]:
+            self.open_order_reads += 1
+            if self.open_order_reads > 1:
+                raise RuntimeError("account read unavailable")
+            return [
+                {
+                    "id": "manual-order",
+                    "market": "condition-1",
+                    "asset_id": "yes-token",
+                    "outcome": "YES",
+                    "side": "BUY",
+                    "status": "LIVE",
+                    "price": Decimal("0.50"),
+                    "original_size": Decimal("20"),
+                    "size_matched": Decimal("5"),
+                }
+            ]
+
+        def list_account_trades(self, **_kwargs: object) -> list[object]:
+            return []
+
+        def list_positions(self, **_kwargs: object) -> list[object]:
+            return [
+                {
+                    "condition_id": "condition-1",
+                    "asset_id": "yes-token",
+                    "outcome": "YES",
+                    "size": Decimal("5"),
+                }
+            ]
+
+        def get_order_scoring(self, *, order_id: str) -> bool:
+            self.scoring_reads.append(order_id)
+            return True
+
+        def create_limit_order(self, **_kwargs: object) -> object:
+            self.order_writes += 1
+            return object()
+
+        def post_order(self, _order: object) -> object:
+            self.order_writes += 1
+            return object()
+
+        def cancel_orders(self, **_kwargs: object) -> object:
+            self.cancellations += 1
+            return object()
+
+    class PublicMarketSDK:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def list_markets(self, *, condition_ids: object) -> list[object]:
+            assert tuple(condition_ids) == ("condition-1",)  # type: ignore[arg-type]
+            return [
+                {
+                    "id": "market-1",
+                    "condition_id": "condition-1",
+                    "question": "Will it happen?",
+                    "slug": "will-it-happen",
+                }
+            ]
+
+        def close(self) -> None:
+            self.closed = True
+
+    sdk = AccountSDK()
+    public_market = PublicMarketSDK()
+    service, trading, store, monitor = execution_fixture(tmp_path)
+    trading = PolymarketTradingClient(
+        TradingConfig("signer", "wallet"),
+        client=sdk,
+        public_client_factory=lambda: public_market,
+    )
+    service._trading = trading
+    runtime = _Runtime()
+    runtime.store = store  # type: ignore[assignment]
+    runtime.monitor = monitor
+    runtime.execution = service
+
+    with _server(runtime) as base:
+        status, first = _response(base + "/api/prediction-arbitrage/lp/dashboard")
+        status_after_failure, stale = _response(
+            base + "/api/prediction-arbitrage/lp/dashboard"
+        )
+
+    assert status == status_after_failure == 200
+    assert first["stale"] is False
+    first_order = first["orders"][0]
+    assert first_order["management"] == "manual_read_only"
+    assert first_order["filled_quantity"] == "5"
+    assert first_order["quantity"] == "20"
+    assert first_order["market_title"] == "Will it happen?"
+    assert first_order["scoring_status"] is True
+    assert datetime.fromisoformat(
+        str(first_order["scoring_checked_at"]).replace("Z", "+00:00")
+    ).tzinfo is not None
+    assert "market_amount_raw" not in first_order
+    assert first["positions"][0]["size"] == "5"
+    assert first["positions"][0]["market_title"] == "Will it happen?"
+    market_reward = first["market_rewards"]["condition-1"]
+    assert market_reward["state"] == "unknown"
+    assert market_reward["usd_state"] == "unknown"
+    assert market_reward["market_amount"] is None
+    assert market_reward["market_amount_raw"] == "0.25"
+    assert market_reward["market_asset"] == "USDC.e"
+    assert market_reward["paid"] is False
+    assert "account_amount" not in market_reward
+    assert datetime.fromisoformat(
+        str(market_reward["checked_at"]).replace("Z", "+00:00")
+    ).tzinfo is not None
+    assert stale["stale"] is True
+    assert stale["checked_at"] == first["checked_at"]
+    assert stale["orders"] == first["orders"]
+    assert stale["positions"] == first["positions"]
+    assert sdk.open_order_reads == 2
+    assert sdk.scoring_reads == ["manual-order"]
+    assert len(reward_transport.calls) == 3
+    assert sdk.order_writes == 0
+    assert sdk.cancellations == 0
+    assert public_market.closed is True
+
+
+def test_lp_candidate_preview_rechecks_best_bid_before_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    condition_id = "0x" + "c" * 64
+    token_id = "0x" + "1" * 64
+    public_state: dict[str, object] = {
+        "bids": [
+            {"price": Decimal("0.51"), "size": Decimal("1")},
+            {"price": Decimal("0.50"), "size": Decimal("100")},
+        ],
+        "max_spread": Decimal("10"),
+        "reward_min_size": Decimal("20"),
+        "book_reads": 0,
+        "public_creates": 0,
+        "public_closes": 0,
+        "catalog_sources": [],
+        "metadata_conditions": [],
+        "book_batches": [],
+        "catalog_fail": False,
+        "omit_no_book": False,
+    }
+    clock_state = {"now": datetime.now(UTC)}
+
+    class AdapterDateTime(datetime):
+        calls = 0
+
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            cls.calls += 1
+            moment = clock_state["now"]
+            if cls.calls == 2:
+                moment -= timedelta(seconds=200)
+            return moment.astimezone(tz) if tz is not None else moment.replace(tzinfo=None)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(polymarket_trading_module, "datetime", AdapterDateTime)
+
+    class AccountSDK:
+        def __init__(self) -> None:
+            self.environment = SimpleNamespace(standard_exchange="standard-exchange")
+            self.balance_units = 1_000_000_000
+            self.balance_reads = 0
+            self.order_reads = 0
+            self.trade_reads = 0
+            self.position_reads = 0
+            self.open_orders: list[object] = []
+            self.limit_orders: list[dict[str, object]] = []
+            self.posts: list[dict[str, object]] = []
+
+        def get_balance_allowance(self, **_kwargs: object) -> object:
+            self.balance_reads += 1
+            return SimpleNamespace(
+                balance=self.balance_units,
+                allowances={"standard-exchange": self.balance_units},
+            )
+
+        def list_open_orders(self, **_kwargs: object) -> list[object]:
+            self.order_reads += 1
+            return list(self.open_orders)
+
+        def list_account_trades(self, **_kwargs: object) -> list[object]:
+            self.trade_reads += 1
+            return []
+
+        def list_positions(self, **_kwargs: object) -> list[object]:
+            self.position_reads += 1
+            return []
+
+        def create_limit_order(self, **kwargs: object) -> dict[str, object]:
+            self.limit_orders.append(dict(kwargs))
+            return {
+                "post_only": kwargs.get("post_only"),
+                "order_type": "GTD",
+                "token_id": kwargs.get("token_id"),
+                "price": kwargs.get("price"),
+                "size": kwargs.get("size"),
+                "side": kwargs.get("side"),
+                "expiration": kwargs.get("expiration"),
+            }
+
+        def post_order(self, signed_order: object) -> object:
+            assert isinstance(signed_order, dict)
+            self.posts.append(signed_order)
+            return {**signed_order, "order_id": "lp-order-1", "status": "LIVE"}
+
+    class PublicMarketSDK:
+        def _market(self) -> dict[str, object]:
+            return {
+                "id": "market-1",
+                "condition_id": condition_id,
+                "question": "Will it happen?",
+                "slug": "will-it-happen",
+                "state": {"accepting_orders": True},
+                "outcomes": {
+                    "yes": {"label": "Yes", "token_id": token_id},
+                    "no": {"label": "No", "token_id": "no-token"},
+                },
+                "trading": {
+                    "minimum_order_size": Decimal("1"),
+                    "minimum_tick_size": Decimal("0.01"),
+                    "fees_enabled": False,
+                },
+                "rewards": {
+                    "rewards_min_size": public_state["reward_min_size"],
+                    "rewards_max_spread": public_state["max_spread"],
+                },
+            }
+
+        def __init__(self) -> None:
+            public_state["public_creates"] = int(public_state["public_creates"]) + 1
+
+        def list_current_rewards(self, *, sponsored: bool) -> list[object]:
+            cast_sources = public_state["catalog_sources"]
+            assert isinstance(cast_sources, list)
+            cast_sources.append(sponsored)
+            if public_state["catalog_fail"] is True:
+                raise RuntimeError("synthetic reward catalog failure")
+            if sponsored:
+                return []
+            return [
+                {
+                    "condition_id": condition_id,
+                    "rewards_min_size": public_state["reward_min_size"],
+                    "rewards_max_spread": public_state["max_spread"],
+                    "rewards_config": [
+                        {
+                            "id": "native-config-1",
+                            "asset_address": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+                            "start_date": "2026-01-01",
+                            "end_date": "2026-12-31",
+                            "rate_per_day": Decimal("2"),
+                        }
+                    ],
+                }
+            ]
+
+        def list_markets(self, *, condition_ids: object) -> list[object]:
+            cast_conditions = public_state["metadata_conditions"]
+            assert isinstance(cast_conditions, list)
+            conditions = tuple(condition_ids)  # type: ignore[arg-type]
+            cast_conditions.append(conditions)
+            return [self._market()] if condition_id in conditions else []
+
+        def get_order_books(self, *, token_ids: object) -> list[object]:
+            cast_batches = public_state["book_batches"]
+            assert isinstance(cast_batches, list)
+            tokens = tuple(token_ids)  # type: ignore[arg-type]
+            cast_batches.append(tokens)
+            books: list[object] = []
+            for current_token in tokens:
+                if (
+                    current_token != token_id
+                    and public_state["omit_no_book"] is True
+                ):
+                    continue
+                if current_token == token_id:
+                    bids = list(public_state["bids"])
+                    asks = [{"price": Decimal("0.53"), "size": Decimal("100")}]
+                else:
+                    bids = [{"price": Decimal("0.49"), "size": Decimal("100")}]
+                    asks = [{"price": Decimal("0.51"), "size": Decimal("100")}]
+                books.append(
+                    {
+                        "condition_id": condition_id,
+                        "asset_id": current_token,
+                        "timestamp": datetime(2026, 9, 15, 6, 0, tzinfo=UTC),
+                        "bids": bids,
+                        "asks": asks,
+                        "min_order_size": Decimal("1"),
+                        "tick_size": Decimal("0.01"),
+                    }
+                )
+            return books
+
+        def get_market(self, *, id: str) -> object:
+            assert id == "market-1"
+            return self._market()
+
+        def get_order_book(self, *, token_id: str) -> object:
+            assert token_id == "0x" + "1" * 64
+            public_state["book_reads"] = int(public_state["book_reads"]) + 1
+            return {
+                "market": condition_id,
+                "asset_id": token_id,
+                "timestamp": datetime.now(UTC),
+                "bids": list(public_state["bids"]),  # type: ignore[arg-type]
+                "asks": [
+                    {"price": Decimal("0.53"), "size": Decimal("100")}
+                ],
+                "min_order_size": Decimal("1"),
+                "tick_size": Decimal("0.01"),
+            }
+
+        def close(self) -> None:
+            public_state["public_closes"] = int(public_state["public_closes"]) + 1
+
+    sdk = AccountSDK()
+    trading = PolymarketTradingClient(
+        TradingConfig("signer", "wallet"),
+        client=sdk,
+        public_client_factory=PublicMarketSDK,
+    )
+    store = PredictionArbitrageStore(tmp_path)
+    lp = PolymarketLPService(store, trading, clock=lambda: clock_state["now"])
+    AdapterDateTime.calls = 0
+    scanned = lp.refresh_candidates(force=True)
+    assert scanned["state"] == "ready"
+    assert scanned["complete"] is True
+    assert len(scanned["candidates"]) == 2
+    assert sdk.balance_reads == sdk.order_reads == sdk.trade_reads == sdk.position_reads == 1
+    assert len(public_state["catalog_sources"]) == 2
+    assert len(public_state["metadata_conditions"]) == 1
+    assert len(public_state["book_batches"]) == 1
+    public_state["omit_no_book"] = True
+    clock_state["now"] += timedelta(seconds=1)
+    partial_scan = lp.refresh_candidates(force=True)
+    assert partial_scan["state"] == "incomplete"
+    assert partial_scan["complete"] is False
+    assert partial_scan["stale"] is False
+    assert len(partial_scan["candidates"]) == 1
+    assert partial_scan["candidates"][0]["outcome"] == "YES"
+    execution = PredictionExecutionService(
+        store=store,
+        monitor=_Monitor(),
+        trading=trading,
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "prediction_arbitrage" / "execution.lock",
+        lp=lp,
+    )
+    execution._breaker_open = False
+    runtime = SimpleNamespace(
+        mode="production",
+        state="RUNNING",
+        production_owner=True,
+        store=store,
+        monitor=_Monitor(),
+        execution=execution,
+        cross_venue_monitor=None,
+    )
+    candidate = json.dumps(
+        {
+            "market_id": "market-1",
+            "condition_id": condition_id,
+            "token_id": token_id,
+            "outcome": "YES",
+        }
+    ).encode("utf-8")
+
+    def candidate_preview(base: str) -> tuple[int, dict[str, object]]:
+        return _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/candidates/preview",
+                data=candidate,
+            )
+        )
+
+    def confirm_preview(
+        base: str, preview_id: object
+    ) -> tuple[int, dict[str, object]]:
+        return _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/sessions",
+                data=json.dumps(
+                    {
+                        "preview_id": preview_id,
+                        "idempotency_key": "lp-candidate-preview",
+                    }
+                ).encode("utf-8"),
+            )
+        )
+
+    with _running_server(
+        runtime,
+        session_token="session-token",
+        csrf_token="csrf-token",
+        runtime_metadata={"git_sha": "abc123"},
+    ) as (base, _server_instance):
+        dashboard_status, dashboard = _response(
+            base + "/api/prediction-arbitrage/lp/dashboard"
+        )
+        assert dashboard_status == 200
+        candidate_rows = dashboard["candidates"]
+        assert isinstance(candidate_rows, list)
+        assert dashboard["complete"] is False
+        assert dashboard["candidate_stale"] is False
+        assert any(
+            row.get("market_id") == "market-1"
+            and row.get("outcome") == "YES"
+            and row.get("price") == "0.51"
+            and row.get("quantity") == "20"
+            for row in candidate_rows
+            if isinstance(row, dict)
+        )
+        preview_status, preview = candidate_preview(base)
+        assert preview_status == 200
+        assert preview["state"] == "previewed"
+        assert preview["request"]["price"] == "0.51"
+        assert preview["request"]["quantity"] == "20"
+        public_state["omit_no_book"] = False
+        clock_state["now"] += timedelta(seconds=1)
+        complete_scan = lp.refresh_candidates(force=True)
+        assert complete_scan["complete"] is True
+        assert complete_scan["stale"] is False
+        assert len(complete_scan["candidates"]) == 2
+        public_state["bids"] = [
+            {"price": Decimal("0.52"), "size": Decimal("1")},
+            {"price": Decimal("0.50"), "size": Decimal("100")},
+        ]
+        stale_price_status, stale_price = confirm_preview(
+            base, preview["preview_id"]
+        )
+        assert stale_price_status == 200
+        assert stale_price["state"] == "rejected"
+        assert sdk.limit_orders == []
+        assert sdk.posts == []
+
+        public_state["bids"] = [
+            {"price": Decimal("0.51"), "size": Decimal("1")},
+            {"price": Decimal("0.50"), "size": Decimal("100")},
+        ]
+        funds_preview_status, funds_preview = candidate_preview(base)
+        assert funds_preview_status == 200
+        assert funds_preview["request"]["price"] == "0.51"
+        assert funds_preview["request"]["quantity"] == "20"
+        sdk.balance_units = 10_190_000
+        low_funds_status, low_funds = confirm_preview(
+            base, funds_preview["preview_id"]
+        )
+        assert low_funds_status == 200
+        assert low_funds["state"] == "rejected"
+        assert sdk.limit_orders == []
+        assert sdk.posts == []
+
+        sdk.balance_units = 1_000_000_000
+        score_preview_status, score_preview = candidate_preview(base)
+        assert score_preview_status == 200
+        assert score_preview["request"]["price"] == "0.51"
+        assert score_preview["request"]["quantity"] == "20"
+        public_state["max_spread"] = Decimal("0.5")
+        zero_score_status, zero_score = confirm_preview(
+            base, score_preview["preview_id"]
+        )
+        assert zero_score_status == 200
+        assert zero_score["state"] == "rejected"
+        assert sdk.limit_orders == []
+        assert sdk.posts == []
+
+        public_state["max_spread"] = Decimal("10")
+        size_preview_status, size_preview = candidate_preview(base)
+        assert size_preview_status == 200
+        assert size_preview["request"]["quantity"] == "20"
+        public_state["reward_min_size"] = Decimal("19")
+        stale_size_status, stale_size = confirm_preview(base, size_preview["preview_id"])
+        assert stale_size_status == 200
+        assert stale_size["state"] == "rejected"
+        assert sdk.limit_orders == []
+        assert sdk.posts == []
+        resized_status, resized = candidate_preview(base)
+        assert resized_status == 200
+        assert resized["request"]["quantity"] == "19"
+        public_state["reward_min_size"] = Decimal("20")
+
+        commitment_preview_status, commitment_preview = candidate_preview(base)
+        assert commitment_preview_status == 200
+        assert commitment_preview["request"]["quantity"] == "20"
+        sdk.balance_units = 30_000_000
+        sdk.open_orders = [
+            {
+                "id": "other-market-buy",
+                "market": "other-condition",
+                "asset_id": "other-token",
+                "side": "BUY",
+                "status": "LIVE",
+                "price": Decimal("0.50"),
+                "original_size": Decimal("40"),
+                "size_matched": Decimal("0"),
+            }
+        ]
+        committed_status, committed = confirm_preview(
+            base, commitment_preview["preview_id"]
+        )
+        assert committed_status == 200
+        assert committed["state"] == "rejected"
+        assert sdk.limit_orders == []
+        assert sdk.posts == []
+        sdk.open_orders = []
+        sdk.balance_units = 1_000_000_000
+
+        public_state["max_spread"] = Decimal("10")
+        refreshed_status, refreshed = candidate_preview(base)
+        assert refreshed_status == 200
+        assert refreshed["state"] == "previewed"
+        assert refreshed["request"]["price"] == "0.51"
+        assert refreshed["request"]["quantity"] == "20"
+        start_body = json.dumps(
+            {
+                "preview_id": refreshed["preview_id"],
+                "idempotency_key": "lp-candidate-preview",
+            }
+        ).encode("utf-8")
+        start_status, started = _response(
+            _production_request(
+                base, "/api/prediction-arbitrage/lp/sessions", data=start_body
+            )
+        )
+        repeated_status, repeated = _response(
+            _production_request(
+                base, "/api/prediction-arbitrage/lp/sessions", data=start_body
+            )
+        )
+
+    assert start_status == repeated_status == 200
+    assert started["state"] == repeated["state"] == "entry_open"
+    assert started["session_id"] == repeated["session_id"]
+    assert len(sdk.limit_orders) == 1
+    assert {
+        key: sdk.limit_orders[0][key]
+        for key in ("token_id", "price", "size", "side", "post_only")
+    } == {
+        "token_id": token_id,
+        "price": Decimal("0.51"),
+        "size": Decimal("20"),
+        "side": "BUY",
+        "post_only": True,
+    }
+    assert sdk.posts[0]["price"] == Decimal("0.51")
+    assert sdk.posts[0]["size"] == Decimal("20")
+    assert sdk.posts[0]["side"] == "BUY"
+    assert sdk.posts[0]["post_only"] is True
+    assert sdk.posts[0]["order_type"] == "GTD"
+    assert len(sdk.posts) == 1
+    previous_scan = lp.candidate_snapshot()
+    previous_checked_at = previous_scan["checked_at"]
+    previous_candidates = previous_scan["candidates"]
+    public_state["catalog_fail"] = True
+    clock_state["now"] += timedelta(seconds=301)
+    failed_scan = lp.refresh_candidates(force=True)
+    assert failed_scan["stale"] is True
+    assert failed_scan["checked_at"] == previous_checked_at
+    assert failed_scan["last_success_at"] == previous_scan["last_success_at"]
+    assert failed_scan["candidates"] == previous_candidates
+    assert public_state["public_creates"] == public_state["public_closes"]
 
 
 def test_history_single_flight_reuses_identical_inflight_requests(
@@ -2155,3 +2771,473 @@ class TestPredictionSafeValueConfiguredNotStripped:
         assert isinstance(lp, dict)
         assert "configured" in lp
         assert lp["configured"] == {"codex": True, "zhipu": True}
+
+
+def test_lp_daily_report_is_fixed_at_review_date_and_survives_restart(
+    tmp_path: Path,
+) -> None:
+    """Daily reports retain cutoff attribution and survive a process restart."""
+
+    class Exchange:
+        def __init__(self) -> None:
+            self.order_creations = 0
+            self.posts = 0
+            self.cancellations = 0
+
+        def create_limit_order(self, **_kwargs: object) -> object:
+            self.order_creations += 1
+            return {}
+
+        def post_order(self, _signed_order: object) -> object:
+            self.posts += 1
+            return {}
+
+        def cancel_order(self, _order_id: str) -> object:
+            self.cancellations += 1
+            return {}
+
+    current_time = [datetime(2026, 9, 15, 0, 3, tzinfo=UTC)]
+    store = PredictionArbitrageStore(tmp_path)
+    exchanges: list[Exchange] = []
+    session_id = "lp-daily-report-session"
+    session_payload: dict[str, object] = {
+        "market_id": "market-1",
+        "condition_id": "condition-1",
+        "token_id": "token-1",
+        "market_title": "Report cutoff market",
+        "outcome": "YES",
+        "price": Decimal("0.50"),
+        "quantity": Decimal("20"),
+        "review_at": datetime(2026, 9, 15, 0, 0, tzinfo=UTC),
+        "buy_filled_quantity": Decimal("20"),
+        "buy_cost": Decimal("10"),
+        "buy_fees": Decimal("0.02"),
+        "sold_quantity": Decimal("12"),
+        "sold_revenue": Decimal("6.40"),
+        "sell_fees": Decimal("0.015"),
+        "residual_quantity": Decimal("8"),
+        "residual_exit_value": Decimal("3.84"),
+        "projected_exit_fee": Decimal("0.015"),
+        "account_checked_at": "2026-09-15T00:03:00Z",
+        "book_checked_at": "2026-09-15T00:03:00Z",
+        "position_reconciled": True,
+        "orders_terminal": True,
+        "reward_observation": {
+            "status": "met",
+            "market_amount": Decimal("1.50"),
+            "market_asset": "USDC.e",
+            "paid": False,
+        },
+        "trade_events": [
+            {
+                "trade_id": "buy-1",
+                "matched_at": datetime(2026, 9, 14, 14, 0, tzinfo=UTC),
+                "status": "CONFIRMED",
+                "side": "BUY",
+                "quantity": Decimal("20"),
+                "price": Decimal("0.50"),
+                "fee": Decimal("0.02"),
+            },
+            {
+                "trade_id": "sell-1",
+                "matched_at": datetime(2026, 9, 14, 23, 45, tzinfo=UTC),
+                "status": "CONFIRMED",
+                "side": "SELL",
+                "quantity": Decimal("8"),
+                "price": Decimal("0.55"),
+                "fee": Decimal("0.01"),
+            },
+            {
+                # This fill was observed after the 08:00 report boundary and
+                # must be assigned to the next report, even if the first
+                # report is generated a few minutes late.
+                "trade_id": "sell-2",
+                "matched_at": datetime(2026, 9, 15, 0, 1, tzinfo=UTC),
+                "status": "CONFIRMED",
+                "side": "SELL",
+                "quantity": Decimal("4"),
+                "price": Decimal("0.50"),
+                "fee": Decimal("0.005"),
+            },
+        ],
+        "verified_paid_reward_events": [
+            {
+                "payment_id": "paid-1",
+                "paid_at": datetime(2026, 9, 14, 23, 0, tzinfo=UTC),
+                "usd_amount": Decimal("0.20"),
+                "verified": True,
+            }
+        ],
+    }
+    store.lp_create_session(
+        session_id,
+        "lp-report-idempotency",
+        state="review",
+        payload=session_payload,
+    )
+
+    def make_runtime(
+        target_store: PredictionArbitrageStore,
+    ) -> tuple[object, PolymarketLPService]:
+        exchange = Exchange()
+        exchanges.append(exchange)
+        lp = PolymarketLPService(
+            target_store,
+            exchange,
+            clock=lambda: current_time[0],
+        )
+        execution = PredictionExecutionService(
+            store=target_store,
+            monitor=_Monitor(),
+            trading=exchange,
+            notifier=NullNotifier(),
+            lock_path=tmp_path / "prediction_arbitrage" / "execution.lock",
+            lp=lp,
+        )
+        runtime = SimpleNamespace(
+            mode="shadow",
+            state="RUNNING",
+            shadow_evidence={"mode": "shadow", "first_violation": None},
+            store=target_store,
+            monitor=_Monitor(),
+            execution=execution,
+            cross_venue_monitor=None,
+        )
+        return runtime, lp
+
+    runtime, lp = make_runtime(store)
+    generate = getattr(lp, "generate_due_report", None)
+    if callable(generate):
+        generate()
+    with _server(runtime) as base:
+        first_status, first = _response(
+            base + "/api/prediction-arbitrage/lp/reports/2026-09-15"
+        )
+    assert first_status == 200
+    first_session = first["sessions"][0]
+    assert first["report_date"] == "2026-09-15"
+    assert first["period_start"] == "2026-09-14T00:00:00Z"
+    assert first["period_end"] == "2026-09-15T00:00:00Z"
+    assert first["generated_at"] == "2026-09-15T00:03:00Z"
+    assert first_session["session_id"] == session_id
+    assert Decimal(str(first_session["realized_trade_pnl"])) == Decimal("0.382")
+    assert Decimal(str(first_session["paid_rewards"])) == Decimal("0.20")
+    assert Decimal(str(first_session["realized_net_pnl"])) == Decimal("0.582")
+    assert first_session["residual_quantity_at_period_end"] == "12"
+    assert first_session["residual_exit_value_at_period_end"] is None
+    assert first_session["residual_exit_estimate_status"] == "unknown"
+
+    # Reopening the same SQLite file cannot create or rewrite the report for
+    # the date that was already observed.
+    restarted_store = PredictionArbitrageStore(tmp_path)
+    restarted_runtime, restarted_lp = make_runtime(restarted_store)
+    restarted_generate = getattr(restarted_lp, "generate_due_report", None)
+    if callable(restarted_generate):
+        restarted_generate()
+    with _server(restarted_runtime) as base:
+        repeated_status, repeated = _response(
+            base + "/api/prediction-arbitrage/lp/reports/2026-09-15"
+        )
+    assert repeated_status == 200
+    assert repeated == first
+
+    # A later fill and verified payment belong to the following 08:00 window;
+    # the immutable prior report continues to describe the earlier interval.
+    restarted_store.lp_update_session(
+        session_id,
+        patch={
+            "sold_quantity": Decimal("20"),
+            "sold_revenue": Decimal("10.56"),
+            "sell_fees": Decimal("0.025"),
+            "residual_quantity": Decimal("0"),
+            "residual_exit_value": Decimal("0"),
+            "projected_exit_fee": Decimal("0"),
+            "account_checked_at": "2026-09-16T00:03:00Z",
+            "book_checked_at": "2026-09-16T00:03:00Z",
+            "trade_events": [
+                *session_payload["trade_events"],
+                {
+                    "trade_id": "sell-3",
+                    "matched_at": datetime(2026, 9, 15, 22, 0, tzinfo=UTC),
+                    "status": "CONFIRMED",
+                    "side": "SELL",
+                    "quantity": Decimal("8"),
+                    "price": Decimal("0.52"),
+                    "fee": Decimal("0.01"),
+                },
+            ],
+            "verified_paid_reward_events": [
+                *session_payload["verified_paid_reward_events"],
+                {
+                    "payment_id": "paid-2",
+                    "paid_at": datetime(2026, 9, 15, 12, 0, tzinfo=UTC),
+                    "usd_amount": Decimal("0.05"),
+                    "verified": True,
+                },
+            ],
+        },
+    )
+    current_time[0] = datetime(2026, 9, 16, 0, 3, tzinfo=UTC)
+    next_runtime, next_lp = make_runtime(restarted_store)
+    next_generate = getattr(next_lp, "generate_due_report", None)
+    if callable(next_generate):
+        next_generate()
+    with _server(next_runtime) as base:
+        next_status, next_report = _response(
+            base + "/api/prediction-arbitrage/lp/reports/2026-09-16"
+        )
+        prior_status, prior_again = _response(
+            base + "/api/prediction-arbitrage/lp/reports/2026-09-15"
+        )
+    assert next_status == prior_status == 200
+    next_session = next_report["sessions"][0]
+    assert next_report["period_start"] == "2026-09-15T00:00:00Z"
+    assert next_report["period_end"] == "2026-09-16T00:00:00Z"
+    assert next_report["generated_at"] == "2026-09-16T00:03:00Z"
+    assert next_session["session_id"] == session_id
+    assert Decimal(str(next_session["realized_trade_pnl"])) == Decimal("0.133")
+    assert Decimal(str(next_session["paid_rewards"])) == Decimal("0.05")
+    assert Decimal(str(next_session["realized_net_pnl"])) == Decimal("0.183")
+    assert next_session["residual_quantity_at_period_end"] == "0"
+    assert prior_again == first
+    assert all(
+        (exchange.order_creations, exchange.posts, exchange.cancellations) == (0, 0, 0)
+        for exchange in exchanges
+    )
+
+
+def test_lp_candidate_review_time_is_next_beijing_eight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Candidate review deadlines stay fixed through restart and short GTD windows reject."""
+
+    now = [datetime(2026, 9, 15, 1, 0, tzinfo=UTC)]
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> FrozenDateTime:
+            current = now[0]
+            return cls.fromtimestamp(
+                current.timestamp(), tz=tz if tz is not None else UTC
+            )
+
+    monkeypatch.setattr(polymarket_trading_module, "datetime", FrozenDateTime)
+    condition_id = "0x" + "c" * 64
+    token_id = "0x" + "1" * 64
+
+    class AccountSDK:
+        def __init__(self) -> None:
+            self.environment = SimpleNamespace(standard_exchange="standard-exchange")
+            self.balance_units = 1_000_000_000
+            self.limit_orders: list[dict[str, object]] = []
+            self.posts: list[dict[str, object]] = []
+
+        def get_balance_allowance(self, **_kwargs: object) -> object:
+            return SimpleNamespace(
+                balance=self.balance_units,
+                allowances={"standard-exchange": self.balance_units},
+            )
+
+        def list_open_orders(self, **_kwargs: object) -> list[object]:
+            return []
+
+        def list_account_trades(self, **_kwargs: object) -> list[object]:
+            return []
+
+        def list_positions(self, **_kwargs: object) -> list[object]:
+            return []
+
+        def create_limit_order(self, **kwargs: object) -> dict[str, object]:
+            self.limit_orders.append(dict(kwargs))
+            return {**kwargs, "order_type": "GTD"}
+
+        def post_order(self, signed_order: object) -> object:
+            assert isinstance(signed_order, dict)
+            self.posts.append(signed_order)
+            return {**signed_order, "order_id": "lp-review-time-order", "status": "LIVE"}
+
+    class PublicMarketSDK:
+        def list_current_rewards(self, *, sponsored: bool) -> list[object]:
+            if sponsored:
+                return []
+            return [
+                {
+                    "condition_id": condition_id,
+                    "rewards_min_size": Decimal("20"),
+                    "rewards_max_spread": Decimal("10"),
+                    "rewards_config": [
+                        {
+                            "id": "native-config-review-time",
+                            "asset_address": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+                            "start_date": "2026-01-01",
+                            "end_date": "2026-12-31",
+                            "rate_per_day": Decimal("2"),
+                        }
+                    ],
+                }
+            ]
+
+        def get_market(self, *, id: str) -> object:
+            assert id == "market-1"
+            return {
+                "id": "market-1",
+                "condition_id": condition_id,
+                "state": {"accepting_orders": True},
+                "outcomes": {
+                    "yes": {"label": "Yes", "token_id": token_id},
+                    "no": {"label": "No", "token_id": "no-token"},
+                },
+                "trading": {
+                    "minimum_order_size": Decimal("1"),
+                    "minimum_tick_size": Decimal("0.01"),
+                    "fees_enabled": False,
+                },
+                "rewards": {
+                    "rewards_min_size": Decimal("20"),
+                    "rewards_max_spread": Decimal("10"),
+                },
+            }
+
+        def get_order_book(self, *, token_id: str) -> object:
+            assert token_id == "0x" + "1" * 64
+            return {
+                "market": condition_id,
+                "asset_id": token_id,
+                "timestamp": FrozenDateTime.now(UTC),
+                "bids": [
+                    {"price": Decimal("0.51"), "size": Decimal("20")},
+                    {"price": Decimal("0.50"), "size": Decimal("100")},
+                ],
+                "asks": [{"price": Decimal("0.53"), "size": Decimal("100")}],
+                "min_order_size": Decimal("1"),
+                "tick_size": Decimal("0.01"),
+            }
+
+        def close(self) -> None:
+            return None
+
+    def make_runtime(
+        target_store: PredictionArbitrageStore, sdk: AccountSDK
+    ) -> tuple[object, PolymarketLPService]:
+        trading = PolymarketTradingClient(
+            TradingConfig("signer", "wallet"),
+            client=sdk,
+            public_client_factory=PublicMarketSDK,
+        )
+        lp = PolymarketLPService(
+            target_store, trading, clock=lambda: now[0]
+        )
+        execution = PredictionExecutionService(
+            store=target_store,
+            monitor=_Monitor(),
+            trading=trading,
+            notifier=NullNotifier(),
+            lock_path=tmp_path / "prediction_arbitrage" / "execution.lock",
+            lp=lp,
+        )
+        execution._breaker_open = False
+        runtime = SimpleNamespace(
+            mode="production",
+            state="RUNNING",
+            production_owner=True,
+            store=target_store,
+            monitor=_Monitor(),
+            execution=execution,
+            cross_venue_monitor=None,
+        )
+        return runtime, lp
+
+    candidate = json.dumps(
+        {
+            "market_id": "market-1",
+            "condition_id": condition_id,
+            "token_id": token_id,
+            "outcome": "YES",
+        }
+    ).encode("utf-8")
+
+    def post_candidate(base: str) -> tuple[int, dict[str, object]]:
+        return _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/candidates/preview",
+                data=candidate,
+            )
+        )
+
+    def parse_time(value: object) -> datetime:
+        text = str(value)
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        return datetime.fromisoformat(text).astimezone(UTC)
+
+    store = PredictionArbitrageStore(tmp_path / "next-review")
+    sdk = AccountSDK()
+    runtime, _lp = make_runtime(store, sdk)
+    expected_review = datetime(2026, 9, 16, 0, 0, tzinfo=UTC)
+    with _running_server(
+        runtime,
+        session_token="session-token",
+        csrf_token="csrf-token",
+        runtime_metadata={"git_sha": "abc123"},
+    ) as (base, _server_instance):
+        preview_status, preview = post_candidate(base)
+        assert preview_status == 200
+        assert preview["state"] == "previewed"
+        assert parse_time(preview["request"]["review_at"]) == expected_review  # type: ignore[index]
+        start_status, started = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/sessions",
+                data=json.dumps(
+                    {
+                        "preview_id": preview["preview_id"],
+                        "idempotency_key": "lp-review-time-next-day",
+                    }
+                ).encode("utf-8"),
+            )
+        )
+    assert start_status == 200
+    assert started["state"] == "entry_open", started
+    assert len(sdk.posts) == len(sdk.limit_orders) == 1
+    expiration = int(sdk.limit_orders[0]["expiration"])
+    assert datetime.fromtimestamp(expiration, UTC) == expected_review + timedelta(seconds=60)
+    saved_session = store.lp_session(str(started["session_id"]))
+    assert saved_session is not None
+    assert parse_time(saved_session["review_at"]) == expected_review
+
+    # A freshly constructed service after the deadline reads the stored
+    # cutoff unchanged; it does not roll the opening into another day.
+    now[0] = datetime(2026, 9, 16, 0, 2, tzinfo=UTC)
+    restarted_runtime, _restarted_lp = make_runtime(store, AccountSDK())
+    with _running_server(
+        restarted_runtime,
+        session_token="session-token",
+        csrf_token="csrf-token",
+        runtime_metadata={"git_sha": "abc123"},
+    ) as (base, _server_instance):
+        resumed_status, resumed = _response(
+            base + "/api/prediction-arbitrage/lp/sessions/current"
+        )
+    assert resumed_status == 200
+    assert resumed["session_id"] == started["session_id"]
+    assert parse_time(resumed["review_at"]) == expected_review
+
+    # At 07:58 Beijing there are only two minutes before the fixed boundary;
+    # the existing three-minute SDK minimum must reject the preview.
+    now[0] = datetime(2026, 9, 15, 23, 58, tzinfo=UTC)
+    short_window_store = PredictionArbitrageStore(tmp_path / "short-window")
+    short_window_sdk = AccountSDK()
+    short_runtime, _short_lp = make_runtime(short_window_store, short_window_sdk)
+    with _running_server(
+        short_runtime,
+        session_token="session-token",
+        csrf_token="csrf-token",
+        runtime_metadata={"git_sha": "abc123"},
+    ) as (base, _server_instance):
+        short_status, short_preview = post_candidate(base)
+    assert short_status == 200
+    assert short_preview["state"] == "rejected"
+    assert short_preview["reason"] == "review_at_too_soon"
+    assert short_window_sdk.limit_orders == []
+    assert short_window_sdk.posts == []

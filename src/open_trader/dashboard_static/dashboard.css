@@ -6609,6 +6609,18 @@ button { cursor: pointer; }
 .pm-table-wrap { overflow-x: auto; }
 .pm-table .num { font-variant-numeric: tabular-nums; text-align: right; }
 .pm-table .sub { color: var(--muted); display: block; font-size: 11px; margin-top: 3px; }
+.pm-lp-order-table, .pm-lp-candidate-table { table-layout: fixed; }
+.pm-lp-order-table th:nth-child(1), .pm-lp-order-table td:nth-child(1) { width: 30%; }
+.pm-lp-order-table th:nth-child(2), .pm-lp-order-table td:nth-child(2) { width: 25%; }
+.pm-lp-order-table th:nth-child(3), .pm-lp-order-table td:nth-child(3) { width: 25%; }
+.pm-lp-order-table th:nth-child(4), .pm-lp-order-table td:nth-child(4) { width: 20%; }
+.pm-lp-candidate-table th:nth-child(1), .pm-lp-candidate-table td:nth-child(1) { width: 28%; }
+.pm-lp-candidate-table th:nth-child(2), .pm-lp-candidate-table td:nth-child(2) { width: 12%; }
+.pm-lp-candidate-table th:nth-child(3), .pm-lp-candidate-table td:nth-child(3) { width: 17%; }
+.pm-lp-candidate-table th:nth-child(4), .pm-lp-candidate-table td:nth-child(4) { width: 12%; }
+.pm-lp-candidate-table th:nth-child(5), .pm-lp-candidate-table td:nth-child(5) { width: 15%; }
+.pm-lp-candidate-table th:nth-child(6), .pm-lp-candidate-table td:nth-child(6) { width: 16%; }
+.pm-lp-card .pm-table a { color: inherit; text-decoration-color: currentColor; }
 .pm-signal-table { min-width: 0; table-layout: fixed; }
 .pm-signal-table th:nth-child(1), .pm-signal-table td:nth-child(1) { width: 132px; }
 .pm-signal-table th:nth-child(2), .pm-signal-table td:nth-child(2) { width: 35%; }
@@ -6724,6 +6736,15 @@ button { cursor: pointer; }
   .pm-table tr:last-child { border-bottom: 0; }
   .pm-table td { border: 0; display: grid; gap: 8px; grid-template-columns: 108px minmax(0, 1fr); padding: 5px 0; }
   .pm-table td::before { color: var(--muted); content: attr(data-label); font-size: 12px; font-weight: 800; }
+  .pm-lp-card .pm-lp-order-table td:first-child,
+  .pm-lp-card .pm-lp-candidate-table td:first-child { display: block; }
+  .pm-lp-card .pm-lp-order-table td:first-child::before,
+  .pm-lp-card .pm-lp-candidate-table td:first-child::before { content: none; display: none; }
+  .pm-lp-card .pm-lp-order-table,
+  .pm-lp-card .pm-lp-candidate-table { table-layout: auto; }
+  .pm-lp-card .pm-lp-order-table td:nth-child(n),
+  .pm-lp-card .pm-lp-candidate-table td:nth-child(n) { width: 100%; }
+  .pm-lp-card .pm-execution-plan .pm-modal-actions { bottom: auto; position: static; }
   .pm-signal-table { table-layout: auto; }
   .pm-signal-table th:nth-child(n), .pm-signal-table td:nth-child(n) { width: auto; }
   .pm-signal-operation { white-space: normal; }

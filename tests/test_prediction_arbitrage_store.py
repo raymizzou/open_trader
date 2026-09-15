@@ -247,6 +247,7 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
         "observation_pool_members",
         "lp_sessions",
         "lp_actions",
+        "lp_daily_reports",
     }
     assert "signals_market_started_at" in indexes
     assert "signals_started_at" in indexes
