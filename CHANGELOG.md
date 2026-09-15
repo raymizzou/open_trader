@@ -3,6 +3,16 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-09-16
+
+- Added an LP-first tab and a separate multi-leg tab within 预测市场, with
+  shared cached venue cards. Each refresh reads the shared venue summary and
+  only the selected pane; LP preview uses the venue-bootstrap CSRF token and
+  its session display comes from the LP dashboard. Verified by the named LP
+  route and tab cases, 103 focused Dashboard tests, 109 prediction read-model,
+  API and service tests, and 10 bounded monitor cases; no live trading or
+  deployment was performed.
+
 ## 2026-09-15
 
 - Unified prediction-page entry and refresh no longer trigger hidden history

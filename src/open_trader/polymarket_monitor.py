@@ -1492,6 +1492,32 @@ class PolymarketMonitor:
                 },
             }
 
+    def venue_summary_snapshot(self) -> dict[str, object]:
+        """Return only cached readiness and subscription facts for venue cards."""
+
+        with self._lock:
+            now = self._now()
+            health = self._health(now)
+            websocket = self._websocket_snapshot(now)
+            return {
+                "status": health["status"],
+                "health": {
+                    "status": health["status"],
+                    "degraded_reasons": list(health["degraded_reasons"]),
+                },
+                "relation_discovery": {
+                    "websocket": {"status": websocket["status"]},
+                },
+                "heartbeat_at": self._heartbeat_at,
+                "readiness": copy.deepcopy(self._readiness),
+                "diagnostics": {
+                    "cross_venue_token_count": len(
+                        self._cross_venue_effective_tokens()
+                    ),
+                    "n_leg_cross_venue_token_count": len(self._n_leg_tokens),
+                },
+            }
+
     def _llm_provider_snapshot(self) -> dict[str, object]:
         snapshot = getattr(self._relation_validator, "provider_snapshot", None)
         if callable(snapshot):

@@ -4439,12 +4439,11 @@ console.log(JSON.stringify({html, filtered: predictionUnifiedOpportunityList(pay
 ''')
     rendered = json.loads(output)
 
-    assert "预测套利 · 机会" in rendered["html"]
+    assert "多腿套利" in rendered["html"]
     assert "MANUAL" in rendered["html"]
     assert "AUTO" in rendered["html"]
-    assert "交易所连接与账户状态" in rendered["html"]
-    assert "Polymarket" in rendered["html"]
-    assert "Predict.fun" in rendered["html"]
+    assert "交易所连接与账户状态" not in rendered["html"]
+    assert "class=\"pm-venue-card\"" not in rendered["html"]
     assert "人工确认下单" in rendered["html"]
     assert "当前无更多合格机会" in rendered["filtered"]
 
@@ -4791,9 +4790,10 @@ const root = {
     }
     return null;
   },
-};
-elements["prediction-market-root"] = root;
-state.predictionMarket.payload = {status: "healthy", events: [], opportunities: []};
+    };
+    elements["prediction-market-root"] = root;
+    state.predictionMarket.activeTab = "multi_leg";
+    state.predictionMarket.payload = {status: "healthy", events: [], opportunities: []};
 const relation = {
   version_id: "dd44", statement: "B_IMPLIES_A", direction_code: "B_IMPLIES_A",
   discovery_source: "deterministic_rule", discovered_at: "2026-08-17T06:32:00Z",
@@ -4890,11 +4890,12 @@ const payload = {
   },
 };
 const html = predictionUnifiedPage(payload, {kind: "all", legs: null, scope: null});
-const marks = ["pm-page-head", "pm-mode-bar", "pm-venue-readiness", "资金占用", "机会列表", "六态状态计数"].map((label) => html.indexOf(label)).filter((index) => index >= 0);
+const marks = ["pm-page-head", "pm-mode-bar", "资金占用", "机会列表", "六态状态计数"].map((label) => html.indexOf(label)).filter((index) => index >= 0);
 console.log(JSON.stringify({html, ordered: marks.every((index, i) => i === 0 || marks[i - 1] < index)}));
 ''')
     rendered = json.loads(output)
     assert rendered["ordered"] is True
+    assert "pm-venue-readiness" not in rendered["html"]
     assert "数据时间" in rendered["html"]
 
 
@@ -5461,6 +5462,363 @@ const sandbox = { document: { addEventListener() {} }, console, URLSearchParams 
     return result.stdout
 
 
+def test_prediction_lp_home_loads_only_visible_data() -> None:
+    output = run_dashboard_js(r'''
+class Element {
+  constructor(){this.dataset={};this.hidden=false;this.innerHTML="";this.textContent="";this.style={};this.attributes={};this.listeners={};
+    this.classList={toggle(){},add(){},remove(){}};}
+  addEventListener(name, callback){(this.listeners[name] ||= []).push(callback);}
+  setAttribute(name,value){this.attributes[name]=value;}
+  removeAttribute(name){delete this.attributes[name];}
+  querySelector(){return null;}
+  querySelectorAll(){return [];}
+}
+const nodes = {};
+document.getElementById = (id) => nodes[id] || (nodes[id] = new Element());
+document.querySelector = () => nodes["workspace-grid"] || (nodes["workspace-grid"] = new Element());
+document.body = new Element();
+bindElements();
+bindEvents();
+const intervals = new Map();
+const timeouts = new Map();
+let nextIntervalId = 0;
+let nextTimeoutId = 0;
+globalThis.window = {
+  location: {search:"", pathname:"/", hash:""},
+  setInterval(callback, delay) { const id = ++nextIntervalId; intervals.set(id, {callback, delay}); return id; },
+  clearInterval(id) { intervals.delete(id); },
+  setTimeout(callback, delay) { const id = ++nextTimeoutId; timeouts.set(id, {callback, delay}); return id; },
+  clearTimeout(id) { timeouts.delete(id); },
+};
+globalThis.AbortController = class { constructor(){this.signal={};} abort(){} };
+const venues = {
+  csrf_token: "csrf-from-venues",
+  venues: [
+    {venue:"polymarket", mode:"只读", rest:"ready", ws:"ready", wallet:"0xpoly…0000", balance:{asset:"pUSD", value:"50"}},
+    {venue:"predict.fun", mode:"只读", rest:"ready", ws:"ready", wallet:"0xpred…1111", balance:{asset:"USDT", value:"25"}},
+  ],
+  monitor_subscription:{cross_venue_token_count:2,n_leg_cross_venue_token_count:1},
+};
+const lpDashboard = {
+  state:"ready", stale:false, complete:true, checked_at:"2026-09-15T04:00:00Z",
+  orders:[{order_id:"lp-order-1",market_id:"market-order",condition_id:"condition-order",token_id:"order-token",
+    market_title:"LP order fact",outcome:"NO",side:"BUY",status:"LIVE",price:"0.40",quantity:"20",filled_quantity:"0",remaining_quantity:"20",
+    management:"manual_read_only",read_only:true}],
+  positions:[], market_rewards:[],
+  candidates:[{market_id:"market-candidate",condition_id:"condition-candidate",token_id:"candidate-token",outcome:"NO",
+    market_title:"LP candidate fact",daily_pool_usd:"150",price:"0.40",quantity:"20",required_capital:"8.00",estimated_exit_loss:"0.40",
+    checked_at:"2026-09-15T04:00:00Z",review_at:"2026-09-16T00:00:00Z"}],
+};
+const preview = {state:"previewed",preview_id:"preview-lp-candidate",request:{market_id:"market-candidate",condition_id:"condition-candidate",
+  token_id:"candidate-token",outcome:"NO",price:"0.40",quantity:"20",review_at:"2026-09-16T00:00:00Z"},preflight:{estimated_exit_loss:"0.40"}};
+const requests = [];
+let resolveVenues;
+let venueReads = 0;
+const response = (data, ok=true, status=200) => ({ok,status,json:async()=>data});
+globalThis.fetch = async (url, init={}) => {
+  const request = {url:String(url),method:String(init.method || "GET"),headers:init.headers || {},body:init.body || ""};
+  requests.push(request);
+  if (request.url === "/api/prediction-arbitrage/venues") {
+    venueReads += 1;
+    return venueReads === 1
+      ? new Promise((resolve)=>{resolveVenues=()=>resolve(response(venues));})
+      : response(venues);
+  }
+  if (request.url === "/api/prediction-arbitrage/lp/dashboard") return response(lpDashboard);
+  if (request.url === "/api/prediction-arbitrage/lp/candidates/preview") {
+    return request.headers["X-CSRF-Token"] === "csrf-from-venues"
+      ? response(preview) : response({message:"CSRF token required"},false,403);
+  }
+  if (request.url === "/api/prediction-arbitrage/state") return response({csrf_token:"csrf-from-state",status:"healthy",qualified_opportunities:[{title:"N-leg fixture content"}],n_leg_observation:{latest:[{title:"N-leg observation fixture"}]}});
+  if (request.url.startsWith("/api/prediction-arbitrage/history")) return response({items:[]});
+  if (request.url === "/api/v1/account/snapshot") return response({});
+  throw new Error("Unexpected request: " + request.method + " " + request.url);
+};
+const drainRequests = async () => { for (let turn=0; turn<20; turn+=1) await Promise.resolve(); };
+const click = async (matches) => {
+  const target = {closest(selector){return matches[selector] || null;}};
+  await nodes["prediction-market-root"].listeners.click[0]({target});
+};
+setWorkspaceView("prediction_market");
+await drainRequests();
+const candidateDisabled = (html) => /data-action="lp-candidate-preview" data-candidate-index="0" disabled/.test(html);
+const preVenueHtml = nodes["prediction-market-root"].innerHTML;
+const preVenueCandidateDisabled = candidateDisabled(preVenueHtml);
+const prematureCandidateButton = {disabled:preVenueCandidateDisabled,dataset:{candidateIndex:"0"}};
+await click({"[data-action='lp-candidate-preview']":prematureCandidateButton});
+await drainRequests();
+const prematurePreviewCount = requests.filter((request)=>request.url==="/api/prediction-arbitrage/lp/candidates/preview").length;
+const emptyTokenPreviewCount = requests.filter((request)=>request.url==="/api/prediction-arbitrage/lp/candidates/preview"
+  && !request.headers["X-CSRF-Token"]).length;
+const initialRequests = requests.map(({url,method})=>({url,method}));
+resolveVenues();
+await drainRequests();
+const initialHtml = nodes["prediction-market-root"].innerHTML;
+const enabledCandidateDisabled = candidateDisabled(initialHtml);
+const timer = [...intervals.values()].find(({delay})=>delay===5000);
+if (timer) await timer.callback();
+await drainRequests();
+const refreshButton = {disabled:false};
+await click({"[data-action='lp-dashboard-refresh']":refreshButton});
+await drainRequests();
+const candidateButton = {disabled:enabledCandidateDisabled,dataset:{candidateIndex:"0"}};
+await click({"[data-action='lp-candidate-preview']":candidateButton});
+await drainRequests();
+const previewRequest = requests.find((request)=>request.url==="/api/prediction-arbitrage/lp/candidates/preview"
+  && request.headers["X-CSRF-Token"]==="csrf-from-venues");
+await click({"[data-action='lp-dashboard-refresh']":refreshButton});
+await drainRequests();
+const finalHtml = nodes["prediction-market-root"].innerHTML;
+const readRequests = requests.filter((request)=>request.method==="GET");
+console.log(JSON.stringify({
+  preVenueCandidateDisabled,
+  enabledCandidateDisabled,
+  prematurePreviewCount,
+  emptyTokenPreviewCount,
+  initialHtml,
+  initialRequests,
+  finalHtml,
+  readPaths:readRequests.map((request)=>request.url),
+  preview:previewRequest && {method:previewRequest.method,csrf:previewRequest.headers["X-CSRF-Token"],body:JSON.parse(previewRequest.body)},
+  orderSubmitCount:requests.filter((request)=>request.url==="/api/prediction-arbitrage/lp/sessions").length,
+  timerCount:intervals.size,
+}));
+''')
+    rendered = json.loads(output)
+
+    assert rendered["preVenueCandidateDisabled"] is True
+    assert rendered["prematurePreviewCount"] == 0
+    assert rendered["emptyTokenPreviewCount"] == 0
+    assert rendered["enabledCandidateDisabled"] is False
+    assert any(request == {
+        "url": "/api/prediction-arbitrage/venues", "method": "GET"
+    } for request in rendered["initialRequests"])
+    assert any(request == {
+        "url": "/api/prediction-arbitrage/lp/dashboard", "method": "GET"
+    } for request in rendered["initialRequests"])
+    assert 'aria-selected="true"' in rendered["initialHtml"]
+    assert "LP 首页" in rendered["initialHtml"] and "多腿套利" in rendered["initialHtml"]
+    assert "预测市场" in rendered["initialHtml"]
+    for fact in ("Polymarket", "Predict.fun", "pUSD", "USDT", "LP order fact", "LP candidate fact"):
+        assert fact in rendered["initialHtml"]
+    for hidden_fact in ("N-leg fixture content", "N-leg observation fixture", "套利信号", "N_LEG 执行事故"):
+        assert hidden_fact not in rendered["initialHtml"]
+    assert not any(
+        path.startswith(("/api/prediction-arbitrage/state", "/api/prediction-arbitrage/history", "/api/v1/account/snapshot"))
+        for path in rendered["readPaths"]
+    )
+    assert set(rendered["readPaths"]) <= {
+        "/api/prediction-arbitrage/venues", "/api/prediction-arbitrage/lp/dashboard"
+    }
+    assert rendered["preview"] == {
+        "method": "POST",
+        "csrf": "csrf-from-venues",
+        "body": {
+            "market_id": "market-candidate", "condition_id": "condition-candidate",
+            "token_id": "candidate-token", "outcome": "NO",
+        },
+    }
+    assert rendered["orderSubmitCount"] == 0
+    assert "preview-lp-candidate" in rendered["finalHtml"]
+    assert "确认开仓" in rendered["finalHtml"]
+    assert rendered["timerCount"] == 1
+
+
+@pytest.mark.parametrize("late_state_succeeds", (True, False), ids=("late-success", "late-failure"))
+def test_prediction_subtabs_isolate_polling_and_late_results(late_state_succeeds: bool) -> None:
+    output = run_dashboard_js(r'''
+class Element {
+  constructor(){this.dataset={};this.hidden=false;this.innerHTML="";this.textContent="";this.style={};this.attributes={};this.listeners={};
+    this.classList={toggle(){},add(){},remove(){}};}
+  addEventListener(name, callback){(this.listeners[name] ||= []).push(callback);}
+  setAttribute(name,value){this.attributes[name]=value;}
+  removeAttribute(name){delete this.attributes[name];}
+  querySelector(){return null;}
+  querySelectorAll(){return [];}
+}
+const nodes = {};
+document.getElementById = (id) => nodes[id] || (nodes[id] = new Element());
+document.querySelector = () => nodes["workspace-grid"] || (nodes["workspace-grid"] = new Element());
+document.body = new Element();
+bindElements();
+const intervals = new Map();
+const timeouts = new Map();
+let nextIntervalId = 0;
+let nextTimeoutId = 0;
+globalThis.window = {
+  location: {search:"", pathname:"/", hash:""},
+  setInterval(callback, delay) { const id = ++nextIntervalId; intervals.set(id, {callback, delay}); return id; },
+  clearInterval(id) { intervals.delete(id); },
+  setTimeout(callback, delay) { const id = ++nextTimeoutId; timeouts.set(id, {callback, delay}); return id; },
+  clearTimeout(id) { timeouts.delete(id); },
+};
+globalThis.AbortController = class { constructor(){this.signal={};} abort(){} };
+bindEvents();
+const account = {status:"healthy",stale:false,generated_at:"2026-09-16T00:00:00Z",
+  summary:{portfolio_value_hkd:"100000",holding_value_hkd:"0",holding_weight_hkd:"0",cash_like_value_hkd:"100000",
+    cash_like_weight_hkd:"100%",holding_count:"0",broker_count:"0"},
+  broker_summaries:[],positions:[],cash_balances:[],sources:{quotes:{status:"healthy"}}};
+const venues = {csrf_token:"csrf-from-venues",venues:[
+  {venue:"polymarket",mode:"只读",rest:"ready",ws:"ready",wallet:"0xpoly…0000",balance:{asset:"pUSD",value:"50"}},
+  {venue:"predict.fun",mode:"只读",rest:"ready",ws:"ready",wallet:"0xpred…1111",balance:{asset:"USDT",value:"25"}},
+],monitor_subscription:{cross_venue_token_count:2,n_leg_cross_venue_token_count:1}};
+const lpDashboard = {state:"ready",stale:false,complete:true,checked_at:"2026-09-16T00:00:00Z",
+  lp_session:{state:"none"},
+  orders:[{order_id:"lp-order-1",market_id:"market-order",condition_id:"condition-order",token_id:"order-token",
+    market_title:"LP order fact",outcome:"NO",side:"BUY",status:"LIVE",price:"0.40",quantity:"20",filled_quantity:"0",remaining_quantity:"20",
+    management:"manual_read_only",read_only:true}],positions:[],market_rewards:[],
+  candidates:[{market_id:"market-candidate",condition_id:"condition-candidate",token_id:"candidate-token",outcome:"NO",
+    market_title:"LP candidate fact",daily_pool_usd:"150",price:"0.40",quantity:"20",required_capital:"8.00",estimated_exit_loss:"0.40",
+    checked_at:"2026-09-16T00:00:00Z",review_at:"2026-09-17T00:00:00Z"}]};
+const nleg = {status:"healthy",health:{status:"healthy",degraded_reasons:[]},validation_mode:"MANUAL",breaker:{open:false},
+  heartbeat_at:"2026-09-16T00:00:00Z",n_leg:{mode:"MANUAL",contract_generation:7},
+  qualified_opportunities:[{opportunity_id:"visible-opportunity",title:"N-leg opportunity fact",strategy_type:"yes_no",
+    relation_type:"NATIVE_COMPLEMENT",leg_count:2,scope_label:"同所 · 同事件",profit:"1.00",annualized_yield:"0.20",remaining_days:"5",
+    qualification:{status:"QUALIFIED_VERIFIED",order_ready:false,checks:[]}}],
+  n_leg_coverage:{status:"READY",source_scope:"fixture source",generation:7,capacity:"1/40",latest_count:1},
+  n_leg_observation:{status:"READY",latest:[{identity:"visible-observation",stage:"OBSERVING",in_pool:true,title:"N-leg observation fact",
+    result:{current:true,status:"PASS",net_roi:"0.12",net_amount:"1.00",cost:"5.00",payout:"6.00"}}]},
+  relation_review:{pending_count:2,counts:{PENDING_APPROVAL:2}}};
+const preview = {state:"previewed",preview_id:"preview-lp-candidate",request:{market_id:"market-candidate",condition_id:"condition-candidate",
+  token_id:"candidate-token",outcome:"NO",price:"0.40",quantity:"20",review_at:"2026-09-17T00:00:00Z"},preflight:{estimated_exit_loss:"0.40"}};
+const requests = [];
+let lpReads = 0;
+let stateReads = 0;
+let failNextVenues = false;
+let settleLateState;
+const response = (data, ok=true, status=200) => ({ok,status,json:async()=>data});
+globalThis.fetch = async (url, init={}) => {
+  const request = {url:String(url),method:String(init.method || "GET"),headers:init.headers || {},body:init.body || ""};
+  requests.push(request);
+  if (request.url === "/api/v1/account/snapshot") return {...response(account),headers:{get:()=> '"account-v1"'}};
+  if (request.url === "/api/prediction-arbitrage/venues") {
+    if (failNextVenues) {
+      failNextVenues = false;
+      return response({error:"venue source unavailable"},false,503);
+    }
+    return response(venues);
+  }
+  if (request.url === "/api/prediction-arbitrage/lp/dashboard") {
+    lpReads += 1;
+    return lpReads === 3 ? response({error:"LP source unavailable"},false,503) : response(lpDashboard);
+  }
+  if (request.url === "/api/prediction-arbitrage/lp/candidates/preview") return response(preview);
+  if (request.url === "/api/prediction-arbitrage/state") {
+    stateReads += 1;
+    if (stateReads === 2) return new Promise((resolve,reject)=>{settleLateState=(succeeds)=>succeeds?resolve(response(nleg)):reject(new Error("late N-leg failure"));});
+    return response(nleg);
+  }
+  if (request.url.startsWith("/api/prediction-arbitrage/history")) return response({items:[]});
+  throw new Error("Unexpected request: " + request.method + " " + request.url);
+};
+const drainRequests = async () => { for (let turn=0; turn<24; turn+=1) await Promise.resolve(); };
+const click = async (matches) => {
+  const target = {closest(selector){return matches[selector] || null;}};
+  await nodes["prediction-market-root"].listeners.click[0]({target});
+};
+scheduleAccountPolling();
+await drainRequests();
+const accountTimerId = state.accountIntervalId;
+setWorkspaceView("prediction_market");
+await drainRequests();
+const lpTimerId = state.predictionMarket.pollId;
+const firstLp = nodes["prediction-market-root"].innerHTML;
+await click({"[data-action='lp-candidate-preview']":{disabled:false,dataset:{candidateIndex:"0"}}});
+await drainRequests();
+const multiTab = {dataset:{predictionTab:"multi_leg"}};
+await click({"[data-prediction-tab]":multiTab});
+await drainRequests();
+const multiHtml = nodes["prediction-market-root"].innerHTML;
+const lpReadsBeforeMultiTick = lpReads;
+const stateTickStart = requests.length;
+const pendingTick = intervals.get(lpTimerId).callback();
+await drainRequests();
+const multiTickPaths = requests.slice(stateTickStart).filter((request)=>request.method==="GET").map((request)=>request.url);
+const lpReadsAfterMultiTick = lpReads;
+await click({"[data-prediction-tab]":{dataset:{predictionTab:"lp"}}});
+await drainRequests();
+settleLateState(__LATE_STATE_SUCCEEDS__);
+await pendingTick;
+await drainRequests();
+const lpAfterLate = nodes["prediction-market-root"].innerHTML;
+const lpTickStart = requests.length;
+await intervals.get(lpTimerId).callback();
+await drainRequests();
+const lpTickPaths = requests.slice(lpTickStart).filter((request)=>request.method==="GET").map((request)=>request.url);
+const lpAfterFailure = nodes["prediction-market-root"].innerHTML;
+await click({"[data-prediction-tab]":{dataset:{predictionTab:"multi_leg"}}});
+await drainRequests();
+const multiAfterLpFailure = nodes["prediction-market-root"].innerHTML;
+await click({"[data-prediction-tab]":{dataset:{predictionTab:"lp"}}});
+await drainRequests();
+const lpBeforeVenueFailure = nodes["prediction-market-root"].innerHTML;
+failNextVenues = true;
+const venueFailureTickStart = requests.length;
+const lpReadsBeforeVenueFailure = lpReads;
+await intervals.get(lpTimerId).callback();
+await drainRequests();
+const venueFailureTickPaths = requests.slice(venueFailureTickStart).filter((request)=>request.method==="GET").map((request)=>request.url);
+const lpReadsAfterVenueFailure = lpReads;
+const lpAfterVenueFailure = nodes["prediction-market-root"].innerHTML;
+const accountGetsDuringPrediction = requests.filter((request)=>request.url==="/api/v1/account/snapshot").length;
+setWorkspaceView("portfolio");
+await drainRequests();
+const accountGetsAfterExit = requests.filter((request)=>request.url==="/api/v1/account/snapshot").length;
+const accountIntervalsAfterExit = [...intervals.keys()];
+const result = {
+  firstLpHasVenueAndOrders:firstLp.includes("Polymarket") && firstLp.includes("Predict.fun") && firstLp.includes("LP order fact"),
+  multiHasControls:multiHtml.includes("N-leg opportunity fact") && multiHtml.includes("N-leg observation fact") && multiHtml.includes("关系审核"),
+  lpReadsBeforeMultiTick,lpReadsAfterMultiTick,multiTickPaths,
+  afterLateKeepsLP:lpAfterLate.includes("LP order fact") && lpAfterLate.includes("preview-lp-candidate") && lpAfterLate.includes("同步时间")
+    && !lpAfterLate.includes("N-leg opportunity fact") && /id="prediction-market-tab-lp"[^>]*aria-selected="true"/.test(lpAfterLate),
+  lpFailureRetainsFacts:lpAfterFailure.includes("LP order fact") && lpAfterFailure.includes("preview-lp-candidate") && lpAfterFailure.includes("上次成功数据"),
+  lpTickPaths,
+  multiAfterLpFailureShowsNleg:multiAfterLpFailure.includes("N-leg opportunity fact") && multiAfterLpFailure.includes("N-leg observation fact")
+    && !multiAfterLpFailure.includes("LP order fact"),
+  lpBeforeVenueFailureHasConfirmation:lpBeforeVenueFailure.includes("LP order fact")
+    && lpBeforeVenueFailure.includes("preview-lp-candidate") && lpBeforeVenueFailure.includes("同步时间"),
+  venueFailureNotice:lpAfterVenueFailure.includes("平台摘要读取失败 · UNKNOWN · Venue summary 503")
+    && lpAfterVenueFailure.includes("保留上次成功状态"),
+  lpAfterVenueFailureHasFacts:lpAfterVenueFailure.includes("LP order fact")
+    && lpAfterVenueFailure.includes("preview-lp-candidate"),
+  lpAfterVenueFailureIsFresh:lpAfterVenueFailure.includes("同步时间")
+    && !lpAfterVenueFailure.includes("上次成功数据") && !lpAfterVenueFailure.includes("LP dashboard 503"),
+  lpReadsBeforeVenueFailure,lpReadsAfterVenueFailure,venueFailureTickPaths,
+  lpReads,stateReads,accountGetsDuringPrediction,accountGetsAfterExit,accountTimerId,
+  accountTimerRetained:intervals.has(accountTimerId),lpTimerCleared:!intervals.has(lpTimerId),
+  accountIntervalsAfterExit,
+};
+console.log(JSON.stringify(result));
+'''.replace("__LATE_STATE_SUCCEEDS__", "true" if late_state_succeeds else "false"))
+    rendered = json.loads(output)
+
+    assert rendered["firstLpHasVenueAndOrders"] is True
+    assert rendered["multiHasControls"] is True
+    assert rendered["lpReadsBeforeMultiTick"] == rendered["lpReadsAfterMultiTick"]
+    assert sorted(rendered["multiTickPaths"]) == sorted([
+        "/api/prediction-arbitrage/venues", "/api/prediction-arbitrage/state"
+    ])
+    assert rendered["afterLateKeepsLP"] is True
+    assert rendered["lpFailureRetainsFacts"] is True
+    assert sorted(rendered["lpTickPaths"]) == sorted([
+        "/api/prediction-arbitrage/venues", "/api/prediction-arbitrage/lp/dashboard"
+    ])
+    assert rendered["multiAfterLpFailureShowsNleg"] is True
+    assert rendered["lpBeforeVenueFailureHasConfirmation"] is True
+    assert rendered["venueFailureNotice"] is True
+    assert rendered["lpAfterVenueFailureHasFacts"] is True
+    assert rendered["lpAfterVenueFailureIsFresh"] is True
+    assert rendered["lpReadsAfterVenueFailure"] == rendered["lpReadsBeforeVenueFailure"] + 1
+    assert sorted(rendered["venueFailureTickPaths"]) == sorted([
+        "/api/prediction-arbitrage/venues", "/api/prediction-arbitrage/lp/dashboard"
+    ])
+    assert rendered["accountGetsDuringPrediction"] == 1
+    assert rendered["accountGetsAfterExit"] == 2
+    assert rendered["accountTimerRetained"] is True
+    assert rendered["lpTimerCleared"] is True
+    assert rendered["accountIntervalsAfterExit"] == [rendered["accountTimerId"]]
+
+
 def test_lp_card_shows_market_scoring_and_residual() -> None:
     output = run_dashboard_js(r'''
 const base = {
@@ -5478,12 +5836,13 @@ const base = {
   },
   review_at: "2026-09-15T00:00:00Z",
 };
+const lpCard = (lp_session) => predictionLpCard({lp_dashboard: {lp_session}});
 const cards = {
-  true: predictionLpCard({lp_session: {...base, scoring_status: "true", scoring_checked_at: "2026-09-14T12:01:00Z"}}),
-  false: predictionLpCard({lp_session: {...base, scoring_status: "false", scoring_checked_at: "2026-09-14T12:02:00Z"}}),
-  unknown: predictionLpCard({lp_session: {...base, scoring_status: "unknown", scoring_checked_at: "2026-09-14T12:03:00Z"}}),
-  met: predictionLpCard({lp_session: {...base, reward_observation: {...base.reward_observation, status: "met", threshold_status: "met", account_amount: "1.10", gap: "0"}}}),
-  retainedUnknown: predictionLpCard({lp_session: {...base, reward_observation: {...base.reward_observation, status: "unknown", threshold_status: "unknown", account_amount: "1.10", gap: "0", last_success_at: "2026-09-14T12:03:00Z", last_attempt_at: "2026-09-14T12:04:00Z"}}}),
+  true: lpCard({...base, scoring_status: "true", scoring_checked_at: "2026-09-14T12:01:00Z"}),
+  false: lpCard({...base, scoring_status: "false", scoring_checked_at: "2026-09-14T12:02:00Z"}),
+  unknown: lpCard({...base, scoring_status: "unknown", scoring_checked_at: "2026-09-14T12:03:00Z"}),
+  met: lpCard({...base, reward_observation: {...base.reward_observation, status: "met", threshold_status: "met", account_amount: "1.10", gap: "0"}}),
+  retainedUnknown: lpCard({...base, reward_observation: {...base.reward_observation, status: "unknown", threshold_status: "unknown", account_amount: "1.10", gap: "0", last_success_at: "2026-09-14T12:03:00Z", last_attempt_at: "2026-09-14T12:04:00Z"}}),
 };
 console.log(JSON.stringify({
   market: cards.unknown.includes("Will it happen?") && cards.unknown.includes("YES"),
@@ -5614,28 +5973,29 @@ globalThis.fetch = async (url, options = {}) => {
   throw new Error("unexpected request: " + request.method + " " + request.url);
 };
 state.workspaceView = "prediction_market";
+state.predictionMarket.activeTab = "lp";
 state.predictionMarket.csrfToken = "csrf-token";
-state.predictionMarket.payload = {lp_session: {state: "none"}, histories: {signals: []}};
+const lpPayload = () => ({lp_dashboard: state.predictionMarket.lpDashboard, lp_error: state.predictionMarket.lpDashboardError});
 startPredictionPolling();
 await fetchPredictionLpDashboard();
-const firstFailure = predictionLpCard(state.predictionMarket.payload);
-const firstFailureState = state.predictionMarket.payload.lp_dashboard;
+const firstFailure = predictionLpCard(lpPayload());
+const firstFailureState = state.predictionMarket.lpDashboard;
 await fetchPredictionLpDashboard();
-const initial = predictionLpCard(state.predictionMarket.payload);
+const initial = predictionLpCard(lpPayload());
 const partial = predictionLpCard({
-  ...state.predictionMarket.payload,
+  ...lpPayload(),
   lp_dashboard: {...dashboard, complete: false},
 });
 const candidateButton = {disabled: false, dataset: {candidateIndex: "0"}};
 await handlePredictionMarketClick({target: {closest(selector) {
   return selector === "[data-action='lp-candidate-preview']" ? candidateButton : null;
 }}});
-const expanded = predictionLpCard(state.predictionMarket.payload);
+const expanded = predictionLpCard(lpPayload());
 const candidateRequest = requests.find((item) => item.url.endsWith("/lp/candidates/preview"));
 const timer = intervals.find((item) => item.milliseconds === 5000);
 if (!timer) throw new Error("LP polling did not install the 5 second refresh");
 await timer.fn();
-const stale = predictionLpCard(state.predictionMarket.payload);
+const stale = predictionLpCard(lpPayload());
 console.log(JSON.stringify({
   intervalMs: timer.milliseconds,
   dashboardReads,
@@ -7708,6 +8068,11 @@ globalThis.fetch = (url, init = {}) => {
 const drainRequests = async () => { for (let turn = 0; turn < 12; turn += 1) await Promise.resolve(); };
 setWorkspaceView("prediction_market");
 await drainRequests();
+const multiLegTab = {dataset:{predictionTab:"multi_leg"}};
+await handlePredictionMarketClick({target:{closest(selector) {
+  return selector === "[data-prediction-tab]" ? multiLegTab : null;
+}}});
+await drainRequests();
 await Promise.all([...timers.values()].map(({callback})=>callback()));
 await drainRequests();
 const rendered = elements["prediction-market-root"].innerHTML;
@@ -7727,9 +8092,9 @@ console.log(JSON.stringify({requests, rendered, scheduledTimers, clearedTimers, 
         for request in result["requests"]
     )
     assert not any("/api/prediction-arbitrage/history" in request["url"] for request in result["requests"])
-    assert "流动性提供试验" in result["rendered"]
     assert "Visible opportunity" in result["rendered"]
     assert "Visible observation" in result["rendered"]
+    assert "流动性提供试验" not in result["rendered"]
     assert result["scheduledTimers"]
     assert set(result["scheduledTimers"]).issubset(set(result["clearedTimers"]))
     assert result["activeTimers"] == []
@@ -7792,6 +8157,9 @@ const portfolioAccountGets=count("/api/v1/account/snapshot");
 const portfolioIntervals=intervalRegistrations.length;
 setWorkspaceView("prediction_market");
 await drainRequests();
+const multiLegTab={dataset:{predictionTab:"multi_leg"}};
+await handlePredictionMarketClick({target:{closest(selector){return selector==="[data-prediction-tab]"?multiLegTab:null;}}});
+await drainRequests();
 await Promise.all([...intervals.values()].map(({callback})=>callback()));
 await drainRequests();
 const accountGetsDuringPrediction=count("/api/v1/account/snapshot");
@@ -7834,6 +8202,7 @@ console.log(JSON.stringify({portfolioAccountGets,accountGetsDuringPrediction,sta
 def test_prediction_state_poll_does_not_overlap_a_slow_request() -> None:
     output = run_dashboard_js(r'''
 state.workspaceView = "prediction_market";
+state.predictionMarket.activeTab = "multi_leg";
 const pending = [];
 let calls = 0;
 globalThis.fetch = () => {
@@ -7855,6 +8224,7 @@ console.log(JSON.stringify({overlappingCalls,inFlight:state.predictionMarket.sta
 def test_prediction_state_load_does_not_duplicate_the_initial_signal_history_request() -> None:
     output = run_dashboard_js(r'''
 state.workspaceView = "prediction_market";
+state.predictionMarket.activeTab = "multi_leg";
 globalThis.window = {setInterval(){return 1;},clearInterval(){}};
 const urls = [];
 const history = [];
@@ -7879,6 +8249,7 @@ console.log(JSON.stringify({historyCalls}));
 def test_prediction_state_completion_preserves_newer_signal_history() -> None:
     output = run_dashboard_js(r'''
 state.workspaceView = "prediction_market";
+state.predictionMarket.activeTab = "multi_leg";
 const pending = {};
 globalThis.fetch = (url) => new Promise((resolve) => {
   pending[url.includes("/state") ? "state" : "history"] = resolve;
@@ -7911,6 +8282,7 @@ console.log(JSON.stringify({endedAt:row.ended_at,html}));
 def test_prediction_state_started_after_signal_history_accepts_state_signals() -> None:
     output = run_dashboard_js(r'''
 state.workspaceView = "prediction_market";
+state.predictionMarket.activeTab = "multi_leg";
 globalThis.fetch = (url) => Promise.resolve(url.includes("/history")
   ? {ok:true,json:async()=>({items:[{
       opportunity_id:"old-opportunity", ended_at:"2026-08-01T02:00:10Z",

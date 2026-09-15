@@ -4,7 +4,9 @@ async function openPrediction(page: Page, state = 'ready') {
   await page.goto(`/?prediction_state=${state}`, { waitUntil: 'networkidle' });
   await page.getByRole('button', { name: '预测市场', exact: true }).click();
   await expect(page.locator('#prediction-market-workspace')).toBeVisible();
-  await expect(page.getByRole('heading', { name: '预测套利 · 机会' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '预测市场' })).toBeVisible();
+  await page.getByRole('tab', { name: '多腿套利', exact: true }).click();
+  await expect(page.getByRole('heading', { name: '多腿套利' })).toBeVisible();
 }
 
 test.describe('unified N_LEG opportunity page', () => {
@@ -13,7 +15,7 @@ test.describe('unified N_LEG opportunity page', () => {
       await page.setViewportSize(viewport);
       await openPrediction(page);
       const root = page.locator('#prediction-market-workspace');
-      const markers = ['pm-mode-bar', 'pm-venue-readiness', '资金占用', '机会列表', '六态状态计数'];
+      const markers = ['pm-page-head', 'pm-venue-readiness', 'pm-strategy-tabs', 'pm-mode-bar', '资金占用', '机会列表', '六态状态计数'];
       for (const marker of ['[aria-label="资金占用"]', '.pm-opportunity', '.pm-relation-drawer']) {
         await expect(page.locator(marker).first()).toBeVisible();
       }
@@ -34,17 +36,18 @@ test.describe('unified N_LEG opportunity page', () => {
     }
   });
 
-  test('filters the unified opportunity list without strategy tabs', async ({ page }) => {
+  test('filters the multi-leg opportunity list within its tab', async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 1100 });
     await openPrediction(page);
-    await expect(page.locator('.pm-strategy-tabs')).toContainText('全部');
+    const filters = page.locator('[aria-label="机会列表"] .pm-strategy-tabs');
+    await expect(filters).toContainText('全部');
     await expect(page.locator('body')).not.toContainText('YES/NO套利');
     await expect(page.locator('body')).not.toContainText('LLM对冲套利');
     const list = page.locator('[aria-label="机会列表"]');
-    await list.getByRole('button', { name: 'LLM', exact: true }).click();
+    await filters.getByRole('button', { name: 'LLM', exact: true }).click();
     await expect(page.locator('.pm-opportunity')).toHaveCount(0);
     await expect(page.locator('[aria-label="机会列表"] .pm-empty')).toContainText('当前无更多合格机会');
-    await list.getByRole('button', { name: '全部', exact: true }).click();
+    await filters.getByRole('button', { name: '全部', exact: true }).click();
     await expect(page.locator('.pm-opportunity')).toHaveCount(1);
   });
 
@@ -364,7 +367,7 @@ test.describe('unified N_LEG opportunity page', () => {
   test('captures the unified page screenshot for mock parity', async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 1100 });
     await openPrediction(page);
-    await expect(page.locator('.pm-page-head')).toContainText('contract generation 1');
+    await expect(page.locator('#prediction-market-panel-multi-leg .pm-page-head')).toContainText('contract generation 1');
     await expect(page.locator('.pm-opportunity')).toContainText('+$8.40');
     await expect(page.locator('.pm-opportunity')).toContainText('24.5%');
     await expect(page.locator('.pm-opportunity')).toContainText('28.4%');

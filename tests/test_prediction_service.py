@@ -29,7 +29,8 @@ import open_trader.polymarket_trading as polymarket_trading_module
 from open_trader.llm_providers import PROVIDER_IDS, resolve_provider
 from open_trader.notifications import NullNotifier
 from open_trader.polymarket_lp import PolymarketLPService
-from open_trader.polymarket_trading import PolymarketTradingClient, TradingConfig
+from open_trader.polymarket_trading import PredictConfig, PolymarketTradingClient, TradingConfig
+from open_trader.predict_source import PredictSource
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 from open_trader.prediction_arbitrage_execution import PredictionExecutionService
 from open_trader.prediction_read_model import (
@@ -45,6 +46,7 @@ from tests.test_prediction_arbitrage_execution import (
     threshold_execution_fixture,
     wait_until_terminal,
 )
+from tests.test_polymarket_monitor import make_monitor
 from tests.test_prediction_read_model import (
     _CrossVenueMonitor,
     _Execution,
@@ -1600,6 +1602,156 @@ def test_shadow_mutations_do_not_read_body_or_dispatch_downstream() -> None:
 
 
 @pytest.mark.parametrize(
+    ("account_age_seconds", "expected_usdt"),
+    ((0, "25"), (61, None)),
+    ids=("current-predict-account", "expired-predict-account"),
+)
+def test_venues_endpoint_serves_cached_cards_and_bootstraps_lp_auth(
+    tmp_path: Path, account_age_seconds: int, expected_usdt: str | None
+) -> None:
+    now = datetime.now(UTC)
+    poly_wallet = "0x1111222233334444555566667777888899990000"
+    predict_wallet = "0x2222333344445555666677778888999900001111"
+
+    def unexpected_external_call(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("cached venue summary must not call external adapters")
+
+    monitor = make_monitor(
+        tmp_path / "monitor",
+        trading=SimpleNamespace(readiness_snapshot=unexpected_external_call),
+        clock=lambda: now,
+    )
+    with monitor._lock:
+        monitor._universe_at = now
+        monitor._heartbeat_at = now
+        monitor._stream_handle = object()
+        monitor._readiness = {
+            "status": "ready",
+            "wallet_address": poly_wallet,
+            "p_usd_balance": "50",
+            "p_usd_allowance": "50",
+            "checked_at": now,
+        }
+        monitor._cross_venue_tokens = {"poly-token"}
+        monitor._n_leg_tokens = {"n-leg-token"}
+
+    execution, _trading, store, _execution_monitor = execution_fixture(tmp_path / "execution")
+    execution._breaker_open = False
+    execution._cross_breaker_open = False
+    account_cache = {
+        "wallet_address": predict_wallet,
+        "predict_account": predict_wallet,
+        "available_usdt": "25",
+        "allowance": "0",
+        "scope_ready": True,
+        "gas_ready": True,
+        "allowance_breaker": False,
+        "minimum_top_up_bnb": "0",
+        "required_bnb": "0",
+        "bnb_balance": "0.1",
+        "reserved_usdt": "0",
+        "unsettled_usdt": "0",
+        "open_orders": [],
+        "positions": [],
+        "checked_at": now - timedelta(seconds=account_age_seconds),
+    }
+    with execution._predict_snapshot_lock:
+        execution._predict_snapshot_cache = account_cache
+
+    predict_source = PredictSource(
+        PredictConfig(wallet_address=predict_wallet),
+        key_loader=unexpected_external_call,
+        urlopen_fn=unexpected_external_call,
+        websocket_connect=unexpected_external_call,
+        now_fn=lambda: now,
+    )
+    predict_source._rest_status = "ready"
+    predict_source._ws_status = "ready"
+    predict_source._last_success = {"rest": now, "ws": now}
+    runtime = SimpleNamespace(
+        mode="production",
+        state="RUNNING",
+        production_owner=True,
+        store=store,
+        monitor=monitor,
+        execution=execution,
+        cross_venue_monitor=SimpleNamespace(_predict=predict_source),
+    )
+
+    with _production_server(runtime) as (base, _runtime):
+        status, payload, venue_headers = _response_with_headers(
+            Request(base + "/api/prediction-arbitrage/venues", method="GET")
+        )
+        assert status == 200
+        assert set(payload) == {"venues", "monitor_subscription", "csrf_token"}
+        assert payload["csrf_token"] == "csrf-token"
+        venues = payload["venues"]
+        assert isinstance(venues, list) and len(venues) == 2
+        assert venues[0]["venue"] == "polymarket"
+        assert venues[0]["rest"] == venues[0]["ws"] == "ready"
+        assert venues[0]["wallet"] == "0x1111…0000"
+        assert venues[0]["balance"] == {"asset": "pUSD", "value": "50"}
+        assert venues[1]["venue"] == "predict.fun"
+        assert venues[1]["rest"] == venues[1]["ws"] == "ready"
+        assert venues[1]["wallet"] == "0x2222…1111"
+        assert venues[1]["balance"] == {"asset": "USDT", "value": expected_usdt}
+        if expected_usdt is None:
+            assert "account" not in venues[1]
+        else:
+            assert venues[1]["account"]["available_usdt"] == "25"
+        assert payload["monitor_subscription"] == {
+            "cross_venue_token_count": 2,
+            "n_leg_cross_venue_token_count": 1,
+        }
+        for omitted in ("events", "opportunities", "observation", "histories", "orders"):
+            assert omitted not in payload
+
+        assert venue_headers["Set-Cookie"] == (
+            "ot_prediction_session=session-token; SameSite=Strict; HttpOnly; Path=/"
+        )
+        session_cookie = venue_headers["Set-Cookie"].split(";", 1)[0]
+        valid_headers = {
+            "Content-Type": "application/json",
+            "Origin": base,
+            "Cookie": session_cookie,
+            "X-CSRF-Token": str(payload["csrf_token"]),
+        }
+        valid_status, valid_body = _response(
+            Request(
+                base + "/api/prediction-arbitrage/lp/candidates/preview",
+                data=b"{}",
+                headers=valid_headers,
+                method="POST",
+            )
+        )
+        assert valid_status == 400
+        assert valid_body["error_type"] == "ValueError"
+
+        missing_token_headers = {
+            "Content-Type": "application/json",
+            "Origin": base,
+            "Cookie": session_cookie,
+        }
+        missing_token_status = _status(
+            Request(
+                base + "/api/prediction-arbitrage/lp/candidates/preview",
+                data=b"{}",
+                headers=missing_token_headers,
+                method="POST",
+            )
+        )
+        assert missing_token_status == 403
+
+    with _server(_Runtime()) as shadow_base:
+        shadow_status, shadow_payload, shadow_headers = _response_with_headers(
+            Request(shadow_base + "/api/prediction-arbitrage/venues", method="GET")
+        )
+    assert shadow_status == 200
+    assert shadow_payload["csrf_token"] == ""
+    assert "Set-Cookie" not in shadow_headers
+
+
+@pytest.mark.parametrize(
     ("header", "value"),
     (
         ("Host", "evil.example"),
@@ -1608,6 +1760,7 @@ def test_shadow_mutations_do_not_read_body_or_dispatch_downstream() -> None:
         ("X-CSRF-Token", "wrong"),
     ),
 )
+
 def test_production_mutation_rejects_invalid_request_identity_before_dispatch(
     header: str, value: str
 ) -> None:

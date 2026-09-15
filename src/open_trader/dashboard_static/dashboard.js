@@ -52,7 +52,13 @@ const state = {
     result: null,
   },
   predictionMarket: {
+    activeTab: "lp",
     payload: null,
+    venuesPayload: null,
+    venuesError: "",
+    venuesRequestInFlight: false,
+    lpDashboard: null,
+    lpDashboardError: "",
     strategy: "yes_no",
     historyKind: "signals",
     error: "",
@@ -269,6 +275,7 @@ function bindEvents() {
     setWorkspaceView(workspace);
   });
   elements["prediction-market-root"].addEventListener("click", handlePredictionMarketClick);
+  elements["prediction-market-root"].addEventListener("keydown", handlePredictionTabKeydown);
   elements["prediction-market-root"].addEventListener("change", (event) => {
     const filter = event.target.closest?.("[data-observation-filter]");
     if (!filter) return;
@@ -1037,8 +1044,10 @@ function setWorkspaceView(view) {
   renderWorkspaceChrome();
   if (state.workspaceView === "kelly_lab") renderKellyLab();
   if (state.workspaceView === "prediction_market") {
+    if (previousView !== "prediction_market") state.predictionMarket.activeTab = "lp";
     renderPredictionMarket();
-    fetchPredictionState();
+    fetchPredictionVenues();
+    fetchCurrentPredictionPane();
     startPredictionPolling();
   } else {
     stopPredictionPolling();
@@ -3014,7 +3023,7 @@ function predictionUnifiedPageHeader(payload) {
     ? ` · contract generation ${escapeHtml(contractGeneration)}`
     : "";
   const pending = Number(payload?.relation_review?.pending_count || 0);
-  return `<header class="pm-page-head"><div><h1>预测套利 · 机会</h1><p>单一 N_LEG 机会 read model；历史 YES_NO / LLM_RELATION 只读保留。</p></div><div class="pm-updated"><button class="pm-relation-badge" type="button" data-action="open-relation-review">关系审核 <strong>${Number.isFinite(pending) ? pending : 0}</strong></button><span class="pm-status-line"><i class="pm-status-dot ${tone === "danger" ? "danger" : ""}"></i>${health}</span><br>${predictionClock("Watcher 数据时间", heartbeat)}${contract}</div></header>`;
+  return `<header class="pm-page-head"><div><h2>多腿套利</h2><p>单一 N_LEG 机会 read model；历史 YES_NO / LLM_RELATION 只读保留。</p></div><div class="pm-updated"><button class="pm-relation-badge" type="button" data-action="open-relation-review">关系审核 <strong>${Number.isFinite(pending) ? pending : 0}</strong></button><span class="pm-status-line"><i class="pm-status-dot ${tone === "danger" ? "danger" : ""}"></i>${health}</span><br>${predictionClock("Watcher 数据时间", heartbeat)}${contract}</div></header>`;
 }
 
 function predictionNLegIncidentPanel(payload) {
@@ -3032,7 +3041,34 @@ function predictionNLegIncidentPanel(payload) {
 function predictionUnifiedPage(payload, filter) {
   const viewPayload = payload || {status: "loading", events: [], opportunities: []};
   const filterState = state.predictionMarket.filter || {engine: "all", kind: "all", legs: null, scope: null};
-  return `${predictionUnifiedPageHeader(viewPayload)}${predictionLpCard(viewPayload)}${predictionModeBar(viewPayload)}${predictionNLegIncidentPanel(viewPayload)}${predictionNLegMetrics(viewPayload)}${predictionReadinessStrip(viewPayload)}${predictionCapitalUsage(viewPayload)}${predictionObservationCoverage(viewPayload)}${predictionUnifiedOpportunityList(viewPayload, filterState)}${predictionRelationReview(viewPayload)}${predictionErrorAlert()}${predictionExecutionAlert(viewPayload)}${relationReviewDrawer()}${nlegReportDrawer()}`;
+  return `${predictionUnifiedPageHeader(viewPayload)}${predictionModeBar(viewPayload)}${predictionNLegIncidentPanel(viewPayload)}${predictionNLegMetrics(viewPayload)}${predictionCapitalUsage(viewPayload)}${predictionObservationCoverage(viewPayload)}${predictionUnifiedOpportunityList(viewPayload, filterState)}${predictionRelationReview(viewPayload)}${predictionErrorAlert()}${predictionExecutionAlert(viewPayload)}${relationReviewDrawer()}${nlegReportDrawer()}`;
+}
+
+function predictionVenueSummary() {
+  const payload = state.predictionMarket.venuesPayload;
+  const error = state.predictionMarket.venuesError;
+  const summary = Array.isArray(payload?.venues) && payload.venues.length
+    ? predictionReadinessStrip(payload)
+    : `<section class="pm-readiness pm-venue-readiness" aria-label="交易所连接与账户状态"><article class="pm-readiness-item"><span>平台状态</span><strong>UNKNOWN</strong><small>${escapeHtml(error || "等待首次同步")}</small></article></section>`;
+  const stale = error
+    ? `<p class="pm-signal-error" role="status">平台摘要读取失败 · UNKNOWN · ${escapeHtml(error)} · 保留上次成功状态</p>`
+    : "";
+  return summary + stale;
+}
+
+function predictionMarketTabs() {
+  const active = state.predictionMarket.activeTab === "multi_leg" ? "multi_leg" : "lp";
+  return `<div class="pm-strategy-tabs" role="tablist" aria-label="预测市场子页面"><button id="prediction-market-tab-lp" type="button" role="tab" data-prediction-tab="lp" aria-controls="prediction-market-panel-lp" aria-selected="${active === "lp"}" tabindex="${active === "lp" ? "0" : "-1"}">LP 首页</button><button id="prediction-market-tab-multi-leg" type="button" role="tab" data-prediction-tab="multi_leg" aria-controls="prediction-market-panel-multi-leg" aria-selected="${active === "multi_leg"}" tabindex="${active === "multi_leg" ? "0" : "-1"}">多腿套利</button></div>`;
+}
+
+function predictionWorkspacePage() {
+  const active = state.predictionMarket.activeTab === "multi_leg" ? "multi_leg" : "lp";
+  const pane = active === "multi_leg"
+    ? predictionUnifiedPage(state.predictionMarket.payload || {status: "loading", events: [], opportunities: []})
+    : predictionLpCard({lp_dashboard: state.predictionMarket.lpDashboard, lp_error: state.predictionMarket.lpDashboardError});
+  const panelId = active === "multi_leg" ? "prediction-market-panel-multi-leg" : "prediction-market-panel-lp";
+  const tabId = active === "multi_leg" ? "prediction-market-tab-multi-leg" : "prediction-market-tab-lp";
+  return `<header class="pm-page-head"><div><h1>预测市场</h1></div></header>${predictionVenueSummary()}${predictionMarketTabs()}<section id="${panelId}" role="tabpanel" aria-labelledby="${tabId}">${pane}</section>`;
 }
 
 function lpDashboardRows(value) {
@@ -3185,7 +3221,7 @@ function lpDashboardPositionRow(position, rewards, shownRewards, session) {
 }
 
 function lpDashboardCandidateRow(candidate, index, stale, confirmation) {
-  const actionDisabled = stale || Boolean(confirmation);
+  const actionDisabled = stale || Boolean(confirmation) || !state.predictionMarket.csrfToken;
   return "<tr><td>" + lpMarketTitleLink(candidate) + "<span class=\"sub\">"
     + escapeHtml(predictionValue(candidate.outcome, "方向未知")) + "</span></td>"
     + "<td data-label=\"日奖池\"><div class=\"num\">" + escapeHtml(lpDashboardMoney(candidate.daily_pool_usd)) + "</div></td>"
@@ -3254,9 +3290,7 @@ function predictionLpCard(payload) {
   const rewards = lpDashboardRewards(dashboard.market_rewards);
   const shownRewards = new Set();
   const shownPositionTokens = new Set();
-  const session = payload?.lp_session && payload.lp_session.state !== "none"
-    ? payload.lp_session
-    : dashboard.lp_session;
+  const session = dashboard.lp_session;
   const activeSession = session && typeof session === "object"
     && String(session.state || "").toLowerCase() !== "none"
     && !session.error;
@@ -4441,18 +4475,41 @@ function renderPredictionMarket() {
   // drawer's decision form first and refill it after so an operator's picked
   // reason/typed note survives instead of silently resetting.
   const decision = relationDecisionSnapshot(root);
-  const payload = state.predictionMarket.payload;
-  const viewPayload = payload || {status: "loading", events: [], opportunities: []};
-  root.innerHTML = predictionUnifiedPage(viewPayload);
+  root.innerHTML = predictionWorkspacePage();
   restoreRelationDecision(root, decision);
+}
+
+function selectPredictionTab(tab) {
+  const active = tab === "multi_leg" ? "multi_leg" : "lp";
+  if (state.predictionMarket.activeTab === active) return;
+  state.predictionMarket.activeTab = active;
+  renderPredictionMarket();
+  fetchPredictionVenues();
+  fetchCurrentPredictionPane();
+}
+
+function handlePredictionTabKeydown(event) {
+  const button = event.target.closest?.("[data-prediction-tab]");
+  if (!button || !["ArrowLeft", "ArrowRight"].includes(event.key)) return;
+  event.preventDefault();
+  const next = button.dataset.predictionTab === "lp" ? "multi_leg" : "lp";
+  selectPredictionTab(next);
+  elements["prediction-market-root"]?.querySelector?.(`[data-prediction-tab="${next}"]`)?.focus?.();
+}
+
+function fetchCurrentPredictionPane() {
+  return state.predictionMarket.activeTab === "multi_leg"
+    ? fetchPredictionState()
+    : fetchPredictionLpDashboard();
 }
 
 function startPredictionPolling() {
   stopPredictionPolling();
   if (state.workspaceView !== "prediction_market") return;
-  state.predictionMarket.pollId = window.setInterval(async () => {
-    await Promise.all([fetchPredictionState(), fetchPredictionLpDashboard()]);
-  }, 5000);
+  state.predictionMarket.pollId = window.setInterval(
+    () => Promise.all([fetchPredictionVenues(), fetchCurrentPredictionPane()]),
+    5000,
+  );
 }
 
 function stopPredictionPolling() {
@@ -4486,7 +4543,8 @@ function predictionRequestUrl(path) {
 }
 
 async function fetchPredictionLpDashboard() {
-  if (state.workspaceView !== "prediction_market" || state.predictionMarket.lpDashboardRequestInFlight) return;
+  if (state.workspaceView !== "prediction_market" || state.predictionMarket.activeTab !== "lp"
+    || state.predictionMarket.lpDashboardRequestInFlight) return;
   state.predictionMarket.lpDashboardRequestInFlight = true;
   try {
     const response = await fetch(predictionRequestUrl("/api/prediction-arbitrage/lp/dashboard"), {
@@ -4495,30 +4553,51 @@ async function fetchPredictionLpDashboard() {
     });
     if (!response.ok) throw new Error("LP dashboard " + response.status);
     const dashboard = await response.json();
-    const payload = state.predictionMarket.payload || {status: "loading", events: [], opportunities: []};
-    state.predictionMarket.payload = {...payload, lp_dashboard: {...dashboard}};
+    state.predictionMarket.lpDashboard = {...dashboard};
+    state.predictionMarket.lpDashboardError = "";
   } catch (error) {
-    const payload = state.predictionMarket.payload || {status: "loading", events: [], opportunities: []};
-    const previous = payload.lp_dashboard && typeof payload.lp_dashboard === "object"
-      ? payload.lp_dashboard
+    const previous = state.predictionMarket.lpDashboard && typeof state.predictionMarket.lpDashboard === "object"
+      ? state.predictionMarket.lpDashboard
       : {};
-    state.predictionMarket.payload = {
-      ...payload,
-      lp_dashboard: {
-        ...previous,
-        stale: true,
-        last_success_at: previous.last_success_at || previous.checked_at || null,
-        error: error instanceof Error ? error.message : String(error),
-      },
+    state.predictionMarket.lpDashboardError = error instanceof Error ? error.message : String(error);
+    state.predictionMarket.lpDashboard = {
+      ...previous,
+      stale: true,
+      last_success_at: previous.last_success_at || previous.checked_at || null,
+      error: state.predictionMarket.lpDashboardError,
     };
   } finally {
     state.predictionMarket.lpDashboardRequestInFlight = false;
-    renderPredictionMarket();
+    if (state.workspaceView === "prediction_market" && state.predictionMarket.activeTab === "lp") {
+      renderPredictionMarket();
+    }
+  }
+}
+
+async function fetchPredictionVenues() {
+  if (state.workspaceView !== "prediction_market" || state.predictionMarket.venuesRequestInFlight) return;
+  state.predictionMarket.venuesRequestInFlight = true;
+  try {
+    const response = await fetch(predictionRequestUrl("/api/prediction-arbitrage/venues"), {
+      cache: "no-store",
+      credentials: "same-origin",
+    });
+    if (!response.ok) throw new Error("Venue summary " + response.status);
+    const payload = await response.json();
+    state.predictionMarket.venuesPayload = {...payload};
+    state.predictionMarket.venuesError = "";
+    state.predictionMarket.csrfToken = payload.csrf_token || state.predictionMarket.csrfToken;
+  } catch (error) {
+    state.predictionMarket.venuesError = error instanceof Error ? error.message : String(error);
+  } finally {
+    state.predictionMarket.venuesRequestInFlight = false;
+    if (state.workspaceView === "prediction_market") renderPredictionMarket();
   }
 }
 
 async function fetchPredictionState() {
-  if (state.workspaceView !== "prediction_market" || state.predictionMarket.stateRequestInFlight) return;
+  if (state.workspaceView !== "prediction_market" || state.predictionMarket.activeTab !== "multi_leg"
+    || state.predictionMarket.stateRequestInFlight) return;
   state.predictionMarket.stateRequestInFlight = true;
   const signalHistoryGeneration = state.predictionMarket.signalHistoryGeneration;
   try {
@@ -4530,11 +4609,9 @@ async function fetchPredictionState() {
     if (state.predictionMarket.signalHistoryGeneration !== signalHistoryGeneration && Array.isArray(previousHistories.signals)) {
       histories.signals = previousHistories.signals;
     }
-    const lpDashboard = state.predictionMarket.payload?.lp_dashboard;
     state.predictionMarket.payload = {
       ...payload,
       histories,
-      ...(lpDashboard ? {lp_dashboard: lpDashboard} : {}),
     };
     state.predictionMarket.relationReview.pendingCount = Number(payload?.relation_review?.pending_count || 0);
     state.predictionMarket.error = "";
@@ -4604,7 +4681,9 @@ async function fetchPredictionState() {
   } finally {
     state.predictionMarket.stateRequestInFlight = false;
   }
-  renderPredictionMarket();
+  if (state.workspaceView === "prediction_market" && state.predictionMarket.activeTab === "multi_leg") {
+    renderPredictionMarket();
+  }
 }
 
 async function loadPredictionHistory(kind, options = {}) {
@@ -5145,7 +5224,7 @@ function lpCandidateFailureMessage(result) {
 
 async function previewLpCandidate(button) {
   const current = state.predictionMarket.lpConfirmation;
-  const dashboardCandidates = lpDashboardRows(state.predictionMarket.payload?.lp_dashboard?.candidates);
+  const dashboardCandidates = lpDashboardRows(state.predictionMarket.lpDashboard?.candidates);
   const selected = button.dataset.useSelection === "true"
     ? current?.candidate
     : dashboardCandidates[Number(button.dataset.candidateIndex)];
@@ -5202,7 +5281,7 @@ async function startLpCandidate() {
       confirmation.error = lpCandidateFailureMessage(result);
     } else {
       state.predictionMarket.lpConfirmation = null;
-      await Promise.all([fetchPredictionState(), fetchPredictionLpDashboard()]);
+      await fetchPredictionLpDashboard();
     }
   } catch (error) {
     confirmation.error = error instanceof Error ? error.message : String(error);
@@ -5215,6 +5294,11 @@ async function startLpCandidate() {
 }
 
 async function handlePredictionMarketClick(event) {
+  const predictionTab = event.target.closest("[data-prediction-tab]");
+  if (predictionTab) {
+    selectPredictionTab(predictionTab.dataset.predictionTab || "lp");
+    return;
+  }
   const lpRefresh = event.target.closest("[data-action='lp-dashboard-refresh']");
   if (lpRefresh && !lpRefresh.disabled) {
     await fetchPredictionLpDashboard();

@@ -1200,6 +1200,29 @@ class Handler(BaseHTTPRequestHandler):
                 }
             )
             return
+        if path == "/api/prediction-arbitrage/venues":
+            payload = _prediction_payload(type(self).prediction_scenario)
+            self._send_json({
+                "venues": payload.get("venues", []),
+                "monitor_subscription": {
+                    "cross_venue_token_count": 0,
+                    "n_leg_cross_venue_token_count": 0,
+                },
+                "csrf_token": payload.get("csrf_token", ""),
+            })
+            return
+        if path == "/api/prediction-arbitrage/lp/dashboard":
+            self._send_json({
+                "state": "ready",
+                "stale": False,
+                "complete": True,
+                "checked_at": "2026-07-28T08:17:40Z",
+                "orders": [],
+                "positions": [],
+                "market_rewards": [],
+                "candidates": [],
+            })
+            return
         if path == "/api/prediction-arbitrage/state":
             if type(self).prediction_scenario == "observation-fetch-error":
                 type(self).prediction_state_calls += 1

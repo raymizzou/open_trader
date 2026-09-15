@@ -26,6 +26,7 @@ from .prediction_read_model import (
     _prediction_safe_value,
     prediction_history_payload,
     prediction_state_payload,
+    prediction_venues_payload,
 )
 from .prediction_n_leg_canary_report import build_canary_report
 from .prediction_n_leg_confirm import NLegConfirmRejected, confirm_enqueue
@@ -502,6 +503,7 @@ def create_prediction_server(
                     self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
                 return
             if parsed.path not in {
+                "/api/prediction-arbitrage/venues",
                 "/api/prediction-arbitrage/state",
                 "/api/prediction-arbitrage/history",
                 "/api/prediction-arbitrage/n-leg/mode",
@@ -518,6 +520,21 @@ def create_prediction_server(
                 and not _is_production_available(runtime)
             ):
                 self._send_unavailable()
+                return
+            if parsed.path == "/api/prediction-arbitrage/venues":
+                self._send_json(
+                    HTTPStatus.OK,
+                    prediction_venues_payload(
+                        store=getattr(runtime, "store", None),
+                        monitor=getattr(runtime, "monitor", None),
+                        execution=getattr(runtime, "execution", None),
+                        csrf_token="" if mode == "shadow" else prediction_csrf,
+                        cross_venue_monitor=getattr(
+                            runtime, "cross_venue_monitor", None
+                        ),
+                    ),
+                    set_session=mode == "production",
+                )
                 return
             if parsed.path == "/api/prediction-arbitrage/state":
                 state_payload = prediction_state_payload(

@@ -6357,11 +6357,11 @@ button { cursor: pointer; }
   .pm-relation-chips { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .pm-relation-markets { grid-template-columns: 1fr; }
 }
-.pm-page-head h1 { font-size: 25px; margin: 0 0 5px; }
+.pm-page-head h1, .pm-page-head h2 { font-size: 25px; margin: 0 0 5px; }
 .pm-page-head p { color: var(--muted); margin: 0; }
 .pm-strategy-tabs { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; display: inline-flex; flex-wrap: wrap; gap: 4px; margin-bottom: 10px; padding: 4px; }
 .pm-strategy-tabs button { background: transparent; border: 1px solid transparent; border-radius: 6px; color: var(--muted); min-height: 44px; padding: 9px 16px; }
-.pm-strategy-tabs button[aria-pressed="true"] { background: #eef6f8; border-color: #214f5c; color: #214f5c; font-weight: 800; }
+.pm-strategy-tabs button[aria-pressed="true"], .pm-strategy-tabs button[aria-selected="true"] { background: #eef6f8; border-color: #214f5c; color: #214f5c; font-weight: 800; }
 .pm-updated { color: var(--muted); font-variant-numeric: tabular-nums; text-align: right; }
 .pm-failure-reason { color: var(--danger); font-size: 12px; margin-top: 5px; }
 .pm-status-line { align-items: center; display: inline-flex; gap: 7px; }

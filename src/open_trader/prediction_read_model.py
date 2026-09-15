@@ -1705,6 +1705,102 @@ def _prediction_venues_payload(
     ]
 
 
+def _prediction_monitor_subscription(
+    snapshot: Mapping[str, object],
+) -> dict[str, int] | None:
+    diagnostics = snapshot.get("diagnostics")
+    if not isinstance(diagnostics, Mapping):
+        return None
+    try:
+        return {
+            "cross_venue_token_count": int(
+                diagnostics["cross_venue_token_count"]
+            ),
+            "n_leg_cross_venue_token_count": int(
+                diagnostics["n_leg_cross_venue_token_count"]
+            ),
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def prediction_venues_payload(
+    *,
+    store: PredictionArbitrageStore | None,
+    monitor: object | None,
+    execution: object | None,
+    csrf_token: str,
+    cross_venue_monitor: object | None = None,
+) -> dict[str, object]:
+    summary_method = getattr(monitor, "venue_summary_snapshot", None)
+    try:
+        snapshot = summary_method() if callable(summary_method) else {}
+    except Exception:
+        snapshot = {}
+    snapshot = snapshot if isinstance(snapshot, Mapping) else {}
+    safe_snapshot = _prediction_safe_value(snapshot)
+    safe_snapshot = safe_snapshot if isinstance(safe_snapshot, Mapping) else {}
+
+    readiness = safe_snapshot.get("readiness")
+    if not isinstance(readiness, Mapping):
+        readiness = {"status": "unavailable", "reason": "readiness_unavailable"}
+    else:
+        readiness = dict(readiness)
+        for field in ("wallet_address", "wallet"):
+            value = readiness.get(field)
+            if isinstance(value, str) and value.startswith("0x"):
+                readiness[field] = _prediction_mask_wallet(value)
+
+    raw_readiness = snapshot.get("readiness")
+    wallet_address = ""
+    if isinstance(raw_readiness, Mapping):
+        wallet_address = str(
+            raw_readiness.get("wallet_address")
+            or raw_readiness.get("wallet")
+            or ""
+        )
+    if not wallet_address and execution is not None:
+        trading = getattr(execution, "_trading", None)
+        config = getattr(trading, "config", None)
+        wallet_address = str(getattr(config, "wallet_address", "") or "")
+    masked_wallet = _prediction_mask_wallet(wallet_address)
+
+    try:
+        active_execution = store.active_execution() if store is not None else None
+    except Exception:
+        active_execution = None
+    breaker_open = True
+    breaker_method = getattr(execution, "_breaker_is_open", None)
+    if callable(breaker_method):
+        try:
+            breaker_open = bool(breaker_method())
+        except Exception:
+            breaker_open = True
+    elif execution is not None:
+        breaker_open = bool(getattr(execution, "_breaker_open", True))
+
+    status = str(safe_snapshot.get("status") or "unavailable")
+    health = safe_snapshot.get("health")
+    if not isinstance(health, Mapping):
+        health = {"status": status, "degraded_reasons": []}
+    venues = _prediction_venues_payload(
+        snapshot=safe_snapshot,
+        readiness=readiness,
+        health=health,
+        masked_wallet=masked_wallet,
+        breaker_open=breaker_open,
+        execution=execution,
+        active_execution=active_execution,
+        cross_venue_monitor=cross_venue_monitor,
+        cross_venue={},
+    )
+    result: dict[str, object] = {"venues": venues, "csrf_token": csrf_token}
+    monitor_subscription = _prediction_monitor_subscription(safe_snapshot)
+    if monitor_subscription is not None:
+        result["monitor_subscription"] = monitor_subscription
+    return result
+
+
 def _prediction_last_execution(store: PredictionArbitrageStore | None) -> object | None:
     """Summarize the newest execution row for banner and history surfaces."""
 
@@ -1779,21 +1875,7 @@ def prediction_state_payload(
     snapshot = _prediction_monitor_snapshot(monitor)
     cross_venue = _prediction_cross_snapshot(cross_venue_monitor)
     safe_snapshot = _prediction_safe_value(snapshot)
-    # #120: surface the subscription-share counts (#114 diagnostics).
-    monitor_diagnostics = safe_snapshot.get("diagnostics")
-    monitor_subscription = None
-    if isinstance(monitor_diagnostics, Mapping):
-        try:
-            monitor_subscription = {
-                "cross_venue_token_count": int(
-                    monitor_diagnostics["cross_venue_token_count"]
-                ),
-                "n_leg_cross_venue_token_count": int(
-                    monitor_diagnostics["n_leg_cross_venue_token_count"]
-                ),
-            }
-        except (KeyError, TypeError, ValueError):
-            monitor_subscription = None
+    monitor_subscription = _prediction_monitor_subscription(safe_snapshot)
     if not isinstance(safe_snapshot, Mapping):
         safe_snapshot = {}
     readiness = safe_snapshot.get("readiness")
