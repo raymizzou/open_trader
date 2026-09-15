@@ -466,6 +466,12 @@ class PredictionExecutionService:
                     for candidate in raw_candidates
                     if isinstance(candidate, Mapping)
                 ] if isinstance(raw_candidates, (list, tuple)) else []
+                raw_recommendations = candidate_snapshot.get("recommendations")
+                recommendations = [
+                    dict(recommendation)
+                    for recommendation in raw_recommendations
+                    if isinstance(recommendation, Mapping)
+                ] if isinstance(raw_recommendations, (list, tuple)) else []
                 raw_market_rewards = candidate_snapshot.get("market_rewards")
                 market_rewards = (
                     dict(raw_market_rewards)
@@ -580,11 +586,25 @@ class PredictionExecutionService:
                     "orders": orders,
                     "positions": positions,
                     "candidates": candidates,
+                    "recommendations": recommendations,
                     "market_rewards": market_rewards,
+                    "candidate_state": candidate_snapshot.get("state", "unknown"),
                     "complete": candidate_snapshot.get("complete") is True,
                     "scanning": candidate_snapshot.get("scanning") is True,
                     "candidate_stale": candidate_snapshot.get("stale") is True,
                     "candidate_checked_at": candidate_snapshot.get("checked_at"),
+                    "candidate_last_success_at": candidate_snapshot.get("last_success_at"),
+                    "candidate_last_attempt_at": candidate_snapshot.get("last_attempt_at"),
+                    "missing_metadata_condition_ids": candidate_snapshot.get(
+                        "missing_metadata_condition_ids", []
+                    ),
+                    "missing_book_token_ids": candidate_snapshot.get(
+                        "missing_book_token_ids", []
+                    ),
+                    "catalog_complete": candidate_snapshot.get("catalog_complete") is True,
+                    "candidate_retention_reason": candidate_snapshot.get(
+                        "retention_reason"
+                    ),
                     "checked_at": checked_at,
                     "last_success_at": checked_at,
                     "stale": False,
@@ -601,11 +621,20 @@ class PredictionExecutionService:
                     "orders": [],
                     "positions": [],
                     "candidates": [],
+                    "recommendations": [],
                     "market_rewards": {},
+                    "candidate_state": "unknown",
                     "complete": False,
                     "scanning": False,
                     "candidate_stale": True,
                     "checked_at": None,
+                    "candidate_checked_at": None,
+                    "candidate_last_success_at": None,
+                    "candidate_last_attempt_at": None,
+                    "missing_metadata_condition_ids": [],
+                    "missing_book_token_ids": [],
+                    "catalog_complete": False,
+                    "candidate_retention_reason": None,
                     "last_success_at": None,
                     "stale": True,
                     "lp_session": self.lp_status(),

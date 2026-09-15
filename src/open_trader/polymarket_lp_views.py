@@ -7,15 +7,17 @@ from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
+from .polymarket_lp_risk import (
+    _account_after_reservations,
+    _has_market_order,
+    evaluate_lp_entry,
+)
 from .polymarket_lp import (
     LP_CANDIDATE_REFRESH_SECONDS,
     STOP_LOSS,
-    TERMINAL_ORDER_STATES,
     PolymarketLPService,
     _decimal,
-    _field,
     _freshness,
-    _items,
     _iso,
     _maybe_decimal,
     _timestamp,
@@ -32,115 +34,344 @@ def _next_review_at(now: datetime) -> datetime:
     return review_at.astimezone(UTC)
 
 
-def _account_after_reservations(
-    account: Mapping[str, object], reservations: object
-) -> dict[str, object] | None:
-    balance = _maybe_decimal(account.get("balance"))
-    allowance = _maybe_decimal(account.get("allowance"))
-    if balance is None or allowance is None or balance < 0 or allowance < 0:
-        return None
+def screen_lp_direction(
+    direction: object,
+    *,
+    history: object,
+    now: datetime,
+) -> dict[str, object]:
+    """Screen one reward direction using only market facts and BBO history."""
 
-    reservation_by_id: dict[str, Decimal] = {}
-    for reservation in _items(reservations):
-        if not isinstance(reservation, Mapping):
-            return None
-        order_id = str(reservation.get("order_id") or "").strip()
-        amount = _maybe_decimal(reservation.get("amount"))
-        if not order_id or amount is None or amount < 0:
-            return None
-        previous = reservation_by_id.get(order_id)
-        if previous is not None and previous != amount:
-            return None
-        reservation_by_id[order_id] = amount
+    result: dict[str, object] = {
+        "state": "unknown",
+        "reason_codes": [],
+        "stability_range": None,
+        "stability_min_midpoint": None,
+        "stability_max_midpoint": None,
+        "stability_sample_count": 0,
+        "competition_state": "unknown",
+        "competition_quantity": None,
+        "price_change_24h": None,
+        "price_change_24h_source": None,
+    }
 
-    open_buy_amount = Decimal("0")
-    counted_open_ids: set[str] = set()
-    seen_open_ids: set[str] = set()
-    for order in _items(account.get("open_orders")):
-        order_id = str(_field(order, "order_id", _field(order, "id", "")) or "").strip()
-        side = str(_field(order, "side", "")).upper()
-        status = str(_field(order, "status", "")).upper()
-        if status in TERMINAL_ORDER_STATES:
-            continue
-        if side not in {"BUY", "SELL"}:
-            return None
-        if side != "BUY":
-            continue
-        if order_id and order_id in seen_open_ids:
-            continue
-        if order_id:
-            seen_open_ids.add(order_id)
-        price = _maybe_decimal(_field(order, "price"))
-        remaining = _maybe_decimal(
-            _field(order, "remaining_size", _field(order, "size"))
-        )
-        if remaining is None:
-            original = _maybe_decimal(_field(order, "original_size"))
-            matched = _maybe_decimal(_field(order, "size_matched", 0))
-            if original is not None and matched is not None:
-                remaining = max(Decimal("0"), original - matched)
-        amount = (
-            price * remaining
-            if price is not None and price > 0 and remaining is not None and remaining >= 0
-            else reservation_by_id.get(order_id)
-            if order_id
+    def unknown(reason: str) -> dict[str, object]:
+        result["reason_codes"] = [reason]
+        return result
+
+    if not isinstance(now, datetime) or now.tzinfo is None:
+        return unknown("screen_time_unknown")
+    checked_at = now.astimezone(UTC)
+    if not isinstance(direction, Mapping):
+        return unknown("market_facts_unknown")
+    market = direction.get("market")
+    book = direction.get("book")
+    if not isinstance(market, Mapping):
+        return unknown("market_facts_unknown")
+    price_change_24h = _maybe_decimal(market.get("price_change_24h"))
+    price_change_24h_source = market.get("price_change_24h_source")
+    if price_change_24h is not None:
+        result["price_change_24h"] = price_change_24h
+        result["price_change_24h_source"] = (
+            price_change_24h_source
+            if isinstance(price_change_24h_source, str)
+            and price_change_24h_source.strip()
             else None
         )
-        if amount is None:
+
+    condition_id = str(market.get("condition_id") or "").strip()
+    token_id = str(market.get("token_id") or "").strip()
+    if not condition_id or not token_id:
+        return unknown("market_identity_unknown")
+    if direction.get("reward_active") is False:
+        result["state"] = "rejected"
+        result["reason_codes"] = ["reward_inactive"]
+        return result
+    if direction.get("reward_active") is not True:
+        return unknown("reward_status_unknown")
+    pool = _maybe_decimal(direction.get("daily_pool_usd"))
+    if pool is None:
+        return unknown("reward_pool_unknown")
+    if pool <= 0:
+        result["state"] = "rejected"
+        result["reason_codes"] = ["reward_pool_empty"]
+        return result
+    if market.get("accepting_orders") is False:
+        result["state"] = "rejected"
+        result["reason_codes"] = ["market_not_accepting_orders"]
+        return result
+    if market.get("accepting_orders") is not True:
+        return unknown("market_status_unknown")
+
+    reward_stamp = direction.get("reward_checked_at")
+    try:
+        reward_age = (checked_at - _timestamp(reward_stamp, name="reward_checked_at")).total_seconds()
+    except ValueError:
+        return unknown("reward_freshness_unknown")
+    if reward_age < 0 or reward_age > 60:
+        return unknown("reward_data_stale")
+
+    history_rows = history if isinstance(history, (list, tuple)) else None
+    if history_rows is None:
+        return unknown("stability_history_unknown")
+
+    def levels_for(value: Mapping[str, object]) -> tuple[
+        list[tuple[Decimal, Decimal]], list[tuple[Decimal, Decimal]]
+    ] | None:
+        compact_names = (
+            "best_bid_price",
+            "best_bid_size",
+            "best_ask_price",
+            "best_ask_size",
+        )
+        if any(name in value for name in compact_names):
+            bid_price, bid_size, ask_price, ask_size = (
+                _maybe_decimal(value.get(name)) for name in compact_names
+            )
+            if (
+                bid_price is None
+                or bid_size is None
+                or ask_price is None
+                or ask_size is None
+                or not (0 < bid_price <= 1)
+                or not (0 < ask_price <= 1)
+                or bid_size <= 0
+                or ask_size <= 0
+            ):
+                return None
+            return ([(bid_price, bid_size)], [(ask_price, ask_size)])
+        try:
+            return (
+                PolymarketLPService._levels(value.get("bids"), "bids"),
+                PolymarketLPService._levels(value.get("asks"), "asks"),
+            )
+        except (TypeError, ValueError):
             return None
-        open_buy_amount += amount
-        if order_id:
-            counted_open_ids.add(order_id)
 
-    reserved_amount = sum(
-        (
-            amount
-            for order_id, amount in reservation_by_id.items()
-            if order_id not in counted_open_ids
-        ),
-        Decimal("0"),
-    )
-    available = dict(account)
-    available["balance"] = balance - open_buy_amount - reserved_amount
-    available["allowance"] = allowance - open_buy_amount - reserved_amount
-    return available
-
-
-def _has_market_order(account: Mapping[str, object], market: Mapping[str, object]) -> bool:
-    market_id = str(market.get("market_id") or "")
-    condition_id = str(market.get("condition_id") or "")
-    token_id = str(market.get("token_id") or "")
-    for order in _items(account.get("open_orders")):
-        status = str(_field(order, "status", "")).upper()
-        if status in TERMINAL_ORDER_STATES:
+    window_start = checked_at - timedelta(hours=1)
+    earliest_anchor = window_start - timedelta(seconds=10)
+    samples: list[tuple[datetime, Decimal]] = []
+    for row in history_rows:
+        if not isinstance(row, Mapping):
             continue
-        token = str(_field(order, "token_id", _field(order, "asset_id", "")) or "")
-        order_market = str(
-            _field(order, "market_id", _field(order, "market", "")) or ""
-        )
-        order_condition = str(_field(order, "condition_id", "") or "")
-        if token == token_id or order_market in {market_id, condition_id} or order_condition == condition_id:
-            return True
-    for position in _items(account.get("positions")):
-        size = _maybe_decimal(
-            _field(position, "size", _field(position, "quantity"))
-        )
-        if size is None:
-            return True
-        if size <= 0:
-            continue
-        token = str(_field(position, "token_id", _field(position, "asset_id", "")) or "")
-        position_market = str(
-            _field(position, "market_id", _field(position, "market", "")) or ""
-        )
-        position_condition = str(_field(position, "condition_id", "") or "")
         if (
-            token == token_id
-            or position_market in {market_id, condition_id}
-            or position_condition == condition_id
+            row.get("condition_id") != condition_id
+            or row.get("token_id") != token_id
         ):
-            return True
-    return False
+            continue
+        try:
+            received_at = _timestamp(row.get("received_at"), name="received_at")
+        except ValueError:
+            continue
+        if received_at < earliest_anchor or received_at > checked_at:
+            continue
+        levels = levels_for(row)
+        if levels is None:
+            continue
+        bids, asks = levels
+        if not bids or not asks:
+            continue
+        best_bid = max(price for price, _ in bids)
+        best_ask = min(price for price, _ in asks)
+        if best_bid >= best_ask:
+            continue
+        samples.append((received_at, (best_bid + best_ask) / Decimal("2")))
+
+    samples.sort(key=lambda sample: sample[0])
+    anchors = [sample for sample in samples if sample[0] < window_start]
+    window_samples = [sample for sample in samples if sample[0] >= window_start]
+    covered = bool(window_samples) and (
+        window_samples[0][0] == window_start or bool(anchors)
+    )
+    if anchors:
+        latest_anchor = anchors[-1]
+        covered = covered and (window_start - latest_anchor[0]).total_seconds() <= 10
+        coverage_samples = [latest_anchor, *window_samples]
+    else:
+        coverage_samples = window_samples
+    covered = covered and (
+        (checked_at - coverage_samples[-1][0]).total_seconds() <= 10
+    ) if coverage_samples else False
+    covered = covered and all(
+        (current[0] - previous[0]).total_seconds() <= 10
+        for previous, current in zip(coverage_samples, coverage_samples[1:])
+    )
+    if not covered:
+        return unknown("stability_history_incomplete")
+
+    midpoints = [sample[1] for sample in coverage_samples]
+    minimum_midpoint = min(midpoints)
+    maximum_midpoint = max(midpoints)
+    stability_range = maximum_midpoint - minimum_midpoint
+    result.update(
+        {
+            "stability_range": stability_range,
+            "stability_min_midpoint": minimum_midpoint,
+            "stability_max_midpoint": maximum_midpoint,
+            "stability_sample_count": len(coverage_samples),
+        }
+    )
+
+    competition_state = "unknown"
+    competition_quantity: Decimal | None = None
+    spread = _maybe_decimal(market.get("reward_max_spread"))
+    if isinstance(book, Mapping) and spread is not None and spread > 0:
+        book_condition = book.get("condition_id", book.get("market"))
+        book_token = book.get("token_id", book.get("asset_id"))
+        try:
+            book_age = (
+                checked_at - _timestamp(book.get("received_at"), name="received_at")
+            ).total_seconds()
+            book_levels = levels_for(book)
+        except ValueError:
+            book_age = -1
+            book_levels = None
+        if (
+            (book_condition is None or book_condition == condition_id)
+            and (book_token is None or book_token == token_id)
+            and 0 <= book_age <= 10
+            and book_levels is not None
+            and book_levels[0]
+            and book_levels[1]
+        ):
+            bids, asks = book_levels
+            best_bid = max(price for price, _ in bids)
+            best_ask = min(price for price, _ in asks)
+            if best_bid < best_ask:
+                midpoint = (best_bid + best_ask) / Decimal("2")
+                competition_quantity = sum(
+                    (
+                        size
+                        for price, size in (*bids, *asks)
+                        if abs(price - midpoint) < spread
+                    ),
+                    Decimal("0"),
+                )
+                competition_state = "known"
+
+    result["competition_state"] = competition_state
+    result["competition_quantity"] = competition_quantity
+    if stability_range > Decimal("0.01"):
+        result["state"] = "rejected"
+        result["reason_codes"] = ["stability_range_exceeded"]
+    else:
+        result["state"] = "eligible"
+    return result
+
+
+def lp_recommendation_rows(
+    direction_facts: object,
+    *,
+    histories: Mapping[tuple[str, str], object],
+    account: Mapping[str, object],
+    now: datetime,
+    reservations: object = (),
+) -> list[dict[str, object]]:
+    """Return actionable market rows with independently screened outcomes."""
+
+    if (
+        not isinstance(now, datetime)
+        or now.tzinfo is None
+        or not isinstance(direction_facts, (list, tuple))
+        or not isinstance(histories, Mapping)
+        or not isinstance(account, Mapping)
+    ):
+        return []
+    checked_at = now.astimezone(UTC)
+    market_competition: dict[str, dict[str, Decimal | None]] = {}
+    recommendations: dict[str, dict[str, object]] = {}
+
+    for direction in direction_facts:
+        if not isinstance(direction, Mapping):
+            continue
+        market = direction.get("market")
+        if not isinstance(market, Mapping):
+            continue
+        condition_id = str(market.get("condition_id") or "").strip()
+        token_id = str(market.get("token_id") or "").strip()
+        outcome = str(market.get("outcome") or "").strip().upper()
+        if not condition_id or not token_id or outcome not in {"YES", "NO"}:
+            continue
+
+        screening = screen_lp_direction(
+            direction,
+            history=histories.get((condition_id, token_id)),
+            now=checked_at,
+        )
+        competition = market_competition.setdefault(condition_id, {})
+        quantity = _maybe_decimal(screening.get("competition_quantity"))
+        competition[outcome] = (
+            quantity if screening.get("competition_state") == "known" else None
+        )
+        if screening.get("state") != "eligible":
+            continue
+
+        entry = evaluate_lp_entry(
+            {**dict(direction), "screening": screening},
+            account=account,
+            now=checked_at,
+            reservations=reservations,
+        )
+        guidance = entry.get("guidance")
+        pool = _maybe_decimal(direction.get("daily_pool_usd"))
+        if entry.get("state") != "eligible" or not isinstance(guidance, Mapping) or pool is None:
+            continue
+
+        row = recommendations.get(condition_id)
+        if row is None:
+            row = {
+                "market_id": market.get("market_id"),
+                "condition_id": condition_id,
+                "market_title": market.get("market_title"),
+                "market_url": market.get("market_url"),
+                "daily_pool_usd": pool,
+                "state": "eligible",
+                "competition_state": "unknown",
+                "competition_quantity": None,
+                "directions": {},
+            }
+            recommendations[condition_id] = row
+        directions = row["directions"]
+        if isinstance(directions, dict):
+            directions[outcome] = {
+                "token_id": token_id,
+                "state": entry.get("state"),
+                "reason_codes": list(entry.get("reason_codes", ())),
+                "screening": screening,
+                "guidance": dict(guidance),
+            }
+
+    for condition_id, row in recommendations.items():
+        outcomes = market_competition.get(condition_id, {})
+        yes_quantity = outcomes.get("YES")
+        no_quantity = outcomes.get("NO")
+        if yes_quantity is not None and no_quantity is not None:
+            total = yes_quantity + no_quantity
+            row["competition_state"] = "known"
+            row["competition_quantity"] = total
+        directions = row["directions"]
+        if isinstance(directions, dict):
+            for recommendation in directions.values():
+                if not isinstance(recommendation, dict):
+                    continue
+                screening = recommendation.get("screening")
+                if isinstance(screening, Mapping):
+                    recommendation["screening"] = {
+                        **dict(screening),
+                        "competition_state": row["competition_state"],
+                        "competition_quantity": row["competition_quantity"],
+                    }
+
+    rows = list(recommendations.values())
+    rows.sort(
+        key=lambda row: (
+            -_decimal(row["daily_pool_usd"], "daily_pool_usd"),
+            row.get("competition_state") != "known",
+            _maybe_decimal(row.get("competition_quantity")) or Decimal("0"),
+            str(row.get("condition_id") or ""),
+        )
+    )
+    return rows
 
 
 def lp_candidate_rows(

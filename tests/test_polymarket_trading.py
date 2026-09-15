@@ -2417,3 +2417,279 @@ def test_wallet_setup_writes_only_addresses_and_uses_keychain(
 def test_preflight_requires_explicit_no_submit(capsys: pytest.CaptureFixture[str]) -> None:
     assert cli.main(["prediction-arb", "preflight"]) == 2
     assert "--no-submit" in capsys.readouterr().err
+
+
+def test_lp_books_batch_receipts_preserve_unchanged_source_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_time = datetime.now(UTC)
+    source_time = (base_time - timedelta(minutes=10)).isoformat()
+
+    class ReceiptClock(datetime):
+        calls = 0
+
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            moment = base_time + timedelta(seconds=cls.calls)
+            cls.calls += 1
+            return moment
+
+    class BatchPublicClient:
+        def __init__(self, mode: str = "complete") -> None:
+            self.mode = mode
+            self.batches: list[tuple[str, ...]] = []
+
+        def get_order_books(self, *, token_ids: tuple[str, ...]) -> list[object]:
+            self.batches.append(tuple(token_ids))
+            rows = []
+            for index, token_id in enumerate(token_ids):
+                if self.mode == "missing" and index == 0:
+                    continue
+                returned_token = (
+                    "unrequested-token"
+                    if self.mode == "wrong_identity" and index == 0
+                    else token_id
+                )
+                rows.append(
+                    {
+                        "condition_id": f"condition-{token_id}",
+                        "token_id": returned_token,
+                        "timestamp": source_time,
+                        "bids": [{"price": Decimal("0.40"), "size": Decimal("10")}],
+                        "asks": [{"price": Decimal("0.60"), "size": Decimal("11")}],
+                    }
+                )
+            return rows
+
+        def close(self) -> None:
+            return None
+
+    tokens = tuple(f"token-{index:03d}" for index in range(201))
+    public = BatchPublicClient()
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        client=object(),
+        public_client_factory=lambda: public,
+    )
+    monkeypatch.setattr(polymarket_trading, "datetime", ReceiptClock)
+    books = adapter.lp_order_books(tokens)
+
+    assert set(books) == set(tokens)
+    assert len(public.batches) == 3
+    assert all(0 < len(batch) <= 100 for batch in public.batches)
+    for token_id, book in books.items():
+        batch_index = int(token_id.removeprefix("token-")) // 100
+        assert book["token_id"] == token_id
+        assert book["condition_id"] == f"condition-{token_id}"
+        assert book["source_timestamp"] == source_time
+        assert book["received_at"] == base_time + timedelta(seconds=batch_index)
+
+    missing_public = BatchPublicClient("missing")
+    missing_adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        client=object(),
+        public_client_factory=lambda: missing_public,
+    )
+    missing_books = missing_adapter.lp_order_books(tokens[:3])
+    assert "token-000" not in missing_books
+
+    wrong_public = BatchPublicClient("wrong_identity")
+    wrong_adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        client=object(),
+        public_client_factory=lambda: wrong_public,
+    )
+    wrong_books = wrong_adapter.lp_order_books(tokens[:3])
+    assert "token-000" not in wrong_books
+    assert "unrequested-token" not in wrong_books
+
+
+def test_lp_metadata_preserves_event_evidence_and_market_links(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from polymarket.models.gamma.event import Event
+    from polymarket.models.gamma.market import Market
+
+    start_time = datetime(2026, 9, 15, 16, 0, tzinfo=UTC)
+    finished_at = datetime(2026, 9, 15, 18, 4, 12, tzinfo=UTC)
+    event_id = "event-42"
+    event_slug = "world-cup"
+    expected_market_url = f"https://polymarket.com/event/{event_slug}/final-winner"
+    condition_event = "0x" + "1" * 64
+    condition_event_other = "0x" + "2" * 64
+    condition_game = "0x" + "3" * 64
+    condition_mismatch = "0x" + "4" * 64
+    condition_dated = "0x" + "5" * 64
+
+    def parsed_market(
+        market_id: str, condition_id: str, slug: str, *, linked_event: bool
+    ) -> Market:
+        return Market.parse_response(
+            {
+                "id": market_id,
+                "conditionId": condition_id,
+                "slug": slug,
+                "question": f"Will {slug} resolve Yes?",
+                "outcomes": '["Yes", "No"]',
+                "outcomePrices": '["0.50", "0.50"]',
+                "clobTokenIds": '["yes-token", "no-token"]',
+                "endDate": "2026-09-16T00:00:00Z",
+                "gameStartTime": (
+                    "2026-09-15T16:00:00Z" if linked_event else None
+                ),
+                "oneDayPriceChange": "0.12",
+                "events": (
+                    [{"id": event_id, "slug": event_slug, "title": "World Cup"}]
+                    if linked_event
+                    else []
+                ),
+            }
+        )
+
+    linked_markets = (
+        parsed_market(
+            "market-event", condition_event, "final-winner", linked_event=True
+        ),
+        parsed_market(
+            "market-event-other",
+            condition_event_other,
+            "top-scorer",
+            linked_event=True,
+        ),
+    )
+    game_market = Market.parse_response(
+        {
+            "id": "market-game",
+            "conditionId": condition_game,
+            "slug": "game-winner",
+            "question": "Will the home team win?",
+            "outcomes": '["Yes", "No"]',
+            "outcomePrices": '["0.50", "0.50"]',
+            "clobTokenIds": '["game-yes", "game-no"]',
+            "gameId": "game-7",
+            "gameStartTime": "2026-09-15T16:00:00Z",
+            "events": [],
+        }
+    )
+    mismatch_market = Market.parse_response(
+        {
+            "id": "market-mismatch",
+            "conditionId": condition_mismatch,
+            "slug": "mismatch-market",
+            "question": "Will this market resolve Yes?",
+            "outcomes": '["Yes", "No"]',
+            "outcomePrices": '["0.50", "0.50"]',
+            "clobTokenIds": '["mismatch-yes", "mismatch-no"]',
+            "endDate": "2026-09-16T00:00:00Z",
+            "events": [{"id": "event-mismatch", "slug": "wrong-event"}],
+        }
+    )
+    dated_market = parsed_market(
+        "market-dated", condition_dated, "dated-market", linked_event=False
+    )
+    event_markets = (*linked_markets, game_market, mismatch_market, dated_market)
+    event_record = Event.parse_response(
+        {
+            "id": event_id,
+            "slug": event_slug,
+            "title": "World Cup",
+            "startTime": "2026-09-15T16:00:00Z",
+            "ended": True,
+            "finishedTimestamp": "2026-09-15T18:04:12Z",
+            "markets": [],
+        }
+    )
+
+    metadata_read_started_at = datetime(2026, 9, 15, 15, 0, tzinfo=UTC)
+    later_event_read_at = datetime(2026, 9, 15, 19, 0, tzinfo=UTC)
+
+    class MetadataPublicClient:
+        def __init__(self) -> None:
+            self.event_calls: list[str] = []
+            self.closed = False
+
+        def list_markets(self, *, condition_ids: tuple[str, ...]) -> tuple[Market, ...]:
+            assert condition_ids == (
+                condition_event,
+                condition_event_other,
+                condition_game,
+                condition_mismatch,
+                condition_dated,
+            )
+            return event_markets
+
+        def get_event(self, *, id: str) -> Event:
+            assert self.closed is False
+            self.event_calls.append(id)
+            return event_record
+
+        def close(self) -> None:
+            self.closed = True
+
+    public = MetadataPublicClient()
+
+    class MetadataClock(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            value = metadata_read_started_at if not public.event_calls else later_event_read_at
+            return value if tz is None else value.astimezone(tz)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(polymarket_trading, "datetime", MetadataClock)
+
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        client=object(),
+        public_client_factory=lambda: public,
+    )
+
+    metadata = adapter.lp_market_metadata(
+        (
+            condition_event,
+            condition_event_other,
+            condition_game,
+            condition_mismatch,
+            condition_dated,
+        )
+    )
+
+    assert public.event_calls == [event_id, "event-mismatch"]
+    assert public.closed is True
+
+    observed = metadata[condition_event]
+    assert observed["metadata_checked_at"] == metadata_read_started_at
+    assert observed["market_url"] == expected_market_url
+    assert observed["event_id"] == event_id
+    assert observed["game_start_time"] == start_time
+    assert observed["event_start_time"] == start_time
+    assert observed["event_ended"] is True
+    assert observed["event_finished_at"] == finished_at
+    assert observed["price_change_24h"] == Decimal("0.12")
+    assert (
+        observed["price_change_24h_source"]
+        == "polymarket.prices.one_day_price_change"
+    )
+
+    repeated = metadata[condition_event_other]
+    assert repeated["metadata_checked_at"] == metadata_read_started_at
+    assert repeated["event_id"] == event_id
+    assert repeated["market_url"] == (
+        "https://polymarket.com/event/world-cup/top-scorer"
+    )
+    assert repeated["event_start_time"] == start_time
+    assert repeated["price_change_24h"] == Decimal("0.12")
+
+    game = metadata[condition_game]
+    assert game["event_id"] is None
+    assert game["game_id"] == "game-7"
+    assert game["game_start_time"] == start_time
+
+    mismatched = metadata[condition_mismatch]
+    assert mismatched["event_id"] == "event-mismatch"
+    assert mismatched["event_start_time"] is None
+    assert mismatched["event_ended"] is None
+    assert mismatched["event_finished_at"] is None
+
+    dated = metadata[condition_dated]
+    assert dated.get("event_id") is None
+    assert dated.get("event_start_time") is None
+    assert dated.get("game_start_time") is None

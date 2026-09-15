@@ -807,6 +807,9 @@ def create_prediction_server(
             lp_candidate_preview_path = (
                 "/api/prediction-arbitrage/lp/candidates/preview"
             )
+            lp_candidate_refresh_path = (
+                "/api/prediction-arbitrage/lp/candidates/refresh"
+            )
             lp_sessions_prefix = "/api/prediction-arbitrage/lp/sessions/"
             lp_start_path = "/api/prediction-arbitrage/lp/sessions"
             lp_stop_session: str | None = None
@@ -834,6 +837,7 @@ def create_prediction_server(
                 "/api/prediction-arbitrage/llm-provider",
                 lp_preview_path,
                 lp_candidate_preview_path,
+                lp_candidate_refresh_path,
                 lp_start_path,
             } and lp_stop_session is None:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -876,6 +880,21 @@ def create_prediction_server(
                     if not callable(candidate_preview):
                         raise RuntimeError("LP execution service is unavailable")
                     result = candidate_preview(payload)
+                elif path == lp_candidate_refresh_path:
+                    self._require_schema(payload, set())
+                    queue_refresh = getattr(
+                        runtime, "queue_lp_candidate_refresh", None
+                    )
+                    if not callable(queue_refresh) or queue_refresh() is not True:
+                        self._send_json(
+                            HTTPStatus.SERVICE_UNAVAILABLE,
+                            {"error": "LP candidate refresh is unavailable"},
+                        )
+                        return
+                    self._send_json(
+                        HTTPStatus.ACCEPTED, {"state": "queued"}
+                    )
+                    return
                 elif path == lp_preview_path:
                     request_payload: Mapping[str, object]
                     if set(payload) == {"request"} and isinstance(payload.get("request"), Mapping):

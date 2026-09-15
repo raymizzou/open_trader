@@ -625,6 +625,7 @@ def _lp_book(value: object) -> dict[str, object] | None:
         "condition_id": row.get("condition_id", row.get("market")),
         "token_id": row.get("token_id", row.get("asset_id")),
         "timestamp": timestamp,
+        "source_timestamp": row.get("timestamp"),
         "bids": [
             {"price": price, "size": size}
             for price, size in sorted(bids.items())
@@ -975,13 +976,50 @@ class PolymarketTradingClient:
     def lp_account_snapshot(self) -> dict[str, object]:
         """Return current account orders and holdings for the read-only LP panel."""
 
-        balance, allowance, orders, positions, checked_at = self._account_read_facts()
-        order_rows = [
-            row for order in orders if (row := _lp_order(order)) is not None
-        ]
-        position_rows = [
-            row for position in positions if (row := _lp_position(position)) is not None
-        ]
+        lp_checked_at = datetime.now(UTC)
+        balance, allowance, orders, positions, _account_checked_at = self._account_read_facts()
+        checked_at = lp_checked_at
+        order_rows: list[dict[str, object]] = []
+        open_orders_complete = True
+        for order in orders:
+            raw = _model_dict(order)
+            row = _lp_order(order)
+            if raw is None or row is None:
+                open_orders_complete = False
+                continue
+            original_size = _lp_decimal(raw.get("original_size", raw.get("size")))
+            matched_size = _lp_decimal(raw.get("size_matched", raw.get("matched_amount")))
+            if (
+                not row.get("condition_id")
+                or not row.get("token_id")
+                or row.get("side") not in {"BUY", "SELL"}
+                or not row.get("status")
+                or _lp_decimal(raw.get("price")) is None
+                or original_size is None
+                or matched_size is None
+                or original_size < 0
+                or matched_size < 0
+            ):
+                open_orders_complete = False
+            order_rows.append(row)
+
+        position_rows: list[dict[str, object]] = []
+        positions_complete = True
+        for position in positions:
+            raw = _model_dict(position)
+            row = _lp_position(position)
+            if raw is None or row is None:
+                positions_complete = False
+                continue
+            size = _lp_decimal(raw.get("size", raw.get("quantity")))
+            if (
+                not row.get("condition_id")
+                or not row.get("token_id")
+                or size is None
+                or size < 0
+            ):
+                positions_complete = False
+            position_rows.append(row)
         condition_ids = tuple(
             dict.fromkeys(
                 str(row.get("condition_id") or "")
@@ -1002,6 +1040,8 @@ class PolymarketTradingClient:
             "open_orders": tuple(order_rows),
             "positions": tuple(position_rows),
             "checked_at": checked_at,
+            "open_orders_complete": open_orders_complete,
+            "positions_complete": positions_complete,
         }
 
     def lp_market_metadata(
@@ -1010,7 +1050,7 @@ class PolymarketTradingClient:
         *,
         stop_event: threading.Event | None = None,
     ) -> dict[str, dict[str, object]]:
-        """Read labels and LP rule facts for account and candidate projections."""
+        """Read LP market facts with a conservative metadata read-start bound."""
 
         requested = tuple(
             dict.fromkeys(
@@ -1024,8 +1064,40 @@ class PolymarketTradingClient:
         if stop_event is not None and stop_event.is_set():
             return {}
         public = self._public_client_factory()
+        event_facts: dict[str, Mapping[str, object] | None] = {}
+        metadata_checked_at = datetime.now(UTC)
         try:
             rows = _collect(public.list_markets(condition_ids=requested))
+            get_event = getattr(public, "get_event", None)
+            for value in rows:
+                row = _model_dict(value)
+                if row is None:
+                    continue
+                condition_id = row.get("condition_id", row.get("conditionId"))
+                if not isinstance(condition_id, str) or condition_id not in requested:
+                    continue
+                references = tuple(
+                    reference
+                    for raw_reference in _collect(row.get("events"))
+                    if (reference := _model_dict(raw_reference)) is not None
+                )
+                if len(references) != 1:
+                    continue
+                raw_event_id = references[0].get("id")
+                event_id = str(raw_event_id).strip() if raw_event_id is not None else ""
+                if not event_id or event_id in event_facts:
+                    continue
+                event_facts[event_id] = None
+                if stop_event is not None and stop_event.is_set():
+                    break
+                if not callable(get_event):
+                    continue
+                try:
+                    event = _model_dict(get_event(id=event_id))
+                except Exception:
+                    continue
+                if event is not None and str(event.get("id") or "") == event_id:
+                    event_facts[event_id] = event
         finally:
             close = getattr(public, "close", None)
             if callable(close):
@@ -1042,8 +1114,6 @@ class PolymarketTradingClient:
                 continue
             slug = row.get("slug")
             market_url = row.get("market_url", row.get("url"))
-            if not market_url and isinstance(slug, str) and slug.strip():
-                market_url = f"https://polymarket.com/event/{slug.strip()}"
             state = _model_dict(row.get("state")) or {}
             trading = _model_dict(row.get("trading")) or {}
             rewards = _model_dict(row.get("rewards")) or {}
@@ -1069,11 +1139,55 @@ class PolymarketTradingClient:
                     "label": outcome.get("label", key),
                     "token_id": str(token_id),
                 }
+            events = tuple(
+                event
+                for raw_event in _collect(row.get("events"))
+                if (event := _model_dict(raw_event)) is not None
+            )
+            event_reference = events[0] if len(events) == 1 else None
+            event_id = event_reference.get("id") if event_reference else None
+            event_key = str(event_id).strip() if event_id is not None else ""
+            event = event_facts.get(event_key) if event_key else None
+            sports = _model_dict(row.get("sports")) or {}
+            event_state = _model_dict(event.get("state")) or {} if event else {}
+            event_schedule = _model_dict(event.get("schedule")) or {} if event else {}
+            prices = _model_dict(row.get("prices")) or {}
+            one_day_price_change = _lp_decimal(prices.get("one_day_price_change"))
+            event_slug = (
+                event.get("slug")
+                if event is not None
+                else event_reference.get("slug") if event_reference else None
+            )
+            if not market_url and isinstance(slug, str) and slug.strip():
+                market_slug = slug.strip()
+                if (
+                    isinstance(event_slug, str)
+                    and event_slug.strip()
+                    and event_slug.strip() != market_slug
+                ):
+                    market_url = (
+                        f"https://polymarket.com/event/{event_slug.strip()}/{market_slug}"
+                    )
+                else:
+                    market_url = f"https://polymarket.com/event/{market_slug}"
             result[condition_id] = {
                 "market_id": row.get("id", row.get("market_id")),
                 "condition_id": condition_id,
+                "metadata_checked_at": metadata_checked_at,
                 "market_title": row.get("question", row.get("title")),
                 "market_url": market_url,
+                "event_id": event_id,
+                "game_id": sports.get("game_id"),
+                "game_start_time": sports.get("game_start_time"),
+                "event_start_time": event_schedule.get("start_time"),
+                "event_ended": event_state.get("ended"),
+                "event_finished_at": event_schedule.get("finished_at"),
+                "price_change_24h": one_day_price_change,
+                "price_change_24h_source": (
+                    "polymarket.prices.one_day_price_change"
+                    if one_day_price_change is not None
+                    else None
+                ),
                 "accepting_orders": state.get("accepting_orders"),
                 "exchange_type": "CLOB",
                 "tick_size": _lp_decimal(trading.get("minimum_tick_size")),
@@ -1104,7 +1218,7 @@ class PolymarketTradingClient:
         *,
         stop_event: threading.Event | None = None,
     ) -> dict[str, dict[str, object]]:
-        """Read current books in one SDK batch for the LP candidate catalog."""
+        """Read current books in bounded SDK batches for the LP candidate catalog."""
 
         requested = tuple(
             dict.fromkeys(
@@ -1115,29 +1229,33 @@ class PolymarketTradingClient:
         )
         if not requested or (stop_event is not None and stop_event.is_set()):
             return {}
+        result: dict[str, dict[str, object]] = {}
         public = self._public_client_factory()
         try:
-            rows = public.get_order_books(token_ids=requested)
-            received_at = datetime.now(UTC)
+            for offset in range(0, len(requested), 100):
+                if stop_event is not None and stop_event.is_set():
+                    return {}
+                batch = requested[offset : offset + 100]
+                rows = _collect(public.get_order_books(token_ids=batch))
+                received_at = datetime.now(UTC)
+                if stop_event is not None and stop_event.is_set():
+                    return {}
+                for value in rows:
+                    row = _model_dict(value)
+                    if row is None:
+                        continue
+                    token_id = row.get("token_id", row.get("asset_id"))
+                    if not isinstance(token_id, str) or token_id not in batch:
+                        continue
+                    book = _lp_book(row)
+                    if book is None:
+                        continue
+                    book["received_at"] = received_at
+                    result[token_id] = book
         finally:
             close = getattr(public, "close", None)
             if callable(close):
                 close()
-        if stop_event is not None and stop_event.is_set():
-            return {}
-        result: dict[str, dict[str, object]] = {}
-        for value in rows:
-            row = _model_dict(value)
-            if row is None:
-                continue
-            token_id = row.get("token_id", row.get("asset_id"))
-            if not isinstance(token_id, str) or token_id not in requested:
-                continue
-            book = _lp_book(row)
-            if book is None:
-                continue
-            book["received_at"] = received_at
-            result[token_id] = book
         return result
 
     def lp_reward_catalog(

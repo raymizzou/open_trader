@@ -13,6 +13,20 @@ operator-facing: what changed, which workflow is affected, and what was verified
   API and service tests, and 10 bounded monitor cases; no live trading or
   deployment was performed.
 
+- Added read-only LP entry guidance to the integrated LP homepage, with
+  complete one-hour BBO sampling, ranked eligible markets, separate YES/NO
+  guidance and a per-market 10% fee-inclusive exit stress check. Expired quotes
+  retain their historical values but stop showing as current; the existing
+  page poll updates expiry even while data requests remain open. Manual refresh
+  queues a read-only scan only after the venue-bootstrap CSRF token arrives;
+  ordinary Polymarket links never submit orders. The existing managed session's
+  `$5` trigger and 08:00 review remain intact. Affordability includes only the
+  active native pUSD reservation's unspent remainder; incomplete reservation or
+  private-account facts withhold guidance while known public books keep sampling.
+  The source-tagged 24-hour price move remains a display reference. Verified by
+  the 23-test focused Docker integration group and 20-test blocker regression
+  group; no live calls, orders or deployment were performed.
+
 ## 2026-09-15
 
 - Unified prediction-page entry and refresh no longer trigger hidden history

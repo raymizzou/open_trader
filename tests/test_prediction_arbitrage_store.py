@@ -2762,3 +2762,101 @@ def test_lp_and_n_leg_admission_share_one_active_slot(tmp_path: Path) -> None:
         lp_store.lp_active_session()
         and n_leg_store.n_leg_control()["active_batch_id"]
     )
+
+
+def test_lp_screening_history_survives_restart_with_retention(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    now = datetime(2026, 9, 15, 12, tzinfo=UTC)
+    samples = [
+        {
+            "condition_id": "condition-a",
+            "token_id": "token-yes",
+            "received_at": iso(now - timedelta(seconds=3605)),
+            "source_timestamp": iso(now - timedelta(days=1)),
+            "best_bid_price": Decimal("0.49"),
+            "best_bid_size": Decimal("10"),
+            "best_ask_price": Decimal("0.51"),
+            "best_ask_size": Decimal("12"),
+        },
+        {
+            "condition_id": "condition-a",
+            "token_id": "token-yes",
+            "received_at": iso(now - timedelta(seconds=3595)),
+            "source_timestamp": iso(now - timedelta(days=1)),
+            "best_bid_price": Decimal("0.50"),
+            "best_bid_size": Decimal("10"),
+            "best_ask_price": Decimal("0.52"),
+            "best_ask_size": Decimal("12"),
+        },
+        {
+            "condition_id": "condition-a",
+            "token_id": "token-yes",
+            "received_at": iso(now - timedelta(seconds=3580)),
+            "source_timestamp": iso(now - timedelta(days=1)),
+            "best_bid_price": Decimal("0.50"),
+            "best_bid_size": Decimal("10"),
+            "best_ask_price": Decimal("0.52"),
+            "best_ask_size": Decimal("12"),
+        },
+        {
+            "condition_id": "condition-a",
+            "token_id": "token-yes",
+            "received_at": iso(now - timedelta(minutes=66)),
+            "source_timestamp": iso(now - timedelta(days=1)),
+            "best_bid_price": Decimal("0.48"),
+            "best_bid_size": Decimal("10"),
+            "best_ask_price": Decimal("0.50"),
+            "best_ask_size": Decimal("12"),
+        },
+    ]
+    screening = {
+        "event_end_confirmations": {
+            "condition-a": {
+                "event_id": "event-1",
+                "confirmed_end_at": iso(now - timedelta(minutes=50)),
+            }
+        },
+        "guidance": [
+            {"condition_id": "condition-a", "token_id": "token-yes", "price": "0.50"}
+        ],
+    }
+
+    first = store(tmp_path)
+    first.lp_record_book_samples(samples, now=now)
+    first.lp_save_screening_snapshot(screening)
+
+    reopened = PredictionArbitrageStore(data_dir)
+    history = reopened.lp_book_samples(
+        "condition-a",
+        "token-yes",
+        since=now - timedelta(hours=2),
+        until=now,
+    )
+    assert [row["received_at"] for row in history] == [
+        iso(now - timedelta(seconds=3605)),
+        iso(now - timedelta(seconds=3595)),
+        iso(now - timedelta(seconds=3580)),
+    ]
+    assert history[0]["source_timestamp"] == iso(now - timedelta(days=1))
+    assert [
+        tuple(Decimal(str(row[key])) for key in (
+            "best_bid_price", "best_bid_size", "best_ask_price", "best_ask_size"
+        ))
+        for row in history
+    ] == [
+        (Decimal("0.49"), Decimal("10"), Decimal("0.51"), Decimal("12")),
+        (Decimal("0.50"), Decimal("10"), Decimal("0.52"), Decimal("12")),
+        (Decimal("0.50"), Decimal("10"), Decimal("0.52"), Decimal("12")),
+    ]
+    window_history = reopened.lp_book_samples(
+        "condition-a", "token-yes", since=now - timedelta(hours=1), until=now
+    )
+    assert [row["received_at"] for row in window_history] == [
+        iso(now - timedelta(seconds=3605)),
+        iso(now - timedelta(seconds=3595)),
+        iso(now - timedelta(seconds=3580)),
+    ]
+    assert reopened.lp_book_samples(
+        "condition-a", "token-no", since=now - timedelta(hours=1), until=now
+    ) == []
+    assert reopened.lp_screening_snapshot() == screening

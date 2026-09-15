@@ -5505,12 +5505,13 @@ const lpDashboard = {
     market_title:"LP order fact",outcome:"NO",side:"BUY",status:"LIVE",price:"0.40",quantity:"20",filled_quantity:"0",remaining_quantity:"20",
     management:"manual_read_only",read_only:true}],
   positions:[], market_rewards:[],
-  candidates:[{market_id:"market-candidate",condition_id:"condition-candidate",token_id:"candidate-token",outcome:"NO",
-    market_title:"LP candidate fact",daily_pool_usd:"150",price:"0.40",quantity:"20",required_capital:"8.00",estimated_exit_loss:"0.40",
-    checked_at:"2026-09-15T04:00:00Z",review_at:"2026-09-16T00:00:00Z"}],
+  recommendations:[{market_id:"market-candidate",condition_id:"condition-candidate",market_url:"https://polymarket.com/event/candidate",
+    market_title:"LP candidate fact",daily_pool_usd:"150",state:"eligible",competition_state:"known",competition_quantity:"5",
+    directions:{NO:{token_id:"candidate-token",state:"eligible",reason_codes:[],
+      screening:{stability_range:"0.01",stability_sample_count:721,reason_codes:[]},
+      guidance:{price:"0.40",quantity:"20",required_capital:"8.00",estimated_exit_loss:"0.40",estimated_exit_loss_ratio:"0.05",
+        checked_at:"2026-09-15T04:00:00Z",expires_at:"2026-09-17T00:00:00Z"}}}}],
 };
-const preview = {state:"previewed",preview_id:"preview-lp-candidate",request:{market_id:"market-candidate",condition_id:"condition-candidate",
-  token_id:"candidate-token",outcome:"NO",price:"0.40",quantity:"20",review_at:"2026-09-16T00:00:00Z"},preflight:{estimated_exit_loss:"0.40"}};
 const requests = [];
 let resolveVenues;
 let venueReads = 0;
@@ -5525,10 +5526,7 @@ globalThis.fetch = async (url, init={}) => {
       : response(venues);
   }
   if (request.url === "/api/prediction-arbitrage/lp/dashboard") return response(lpDashboard);
-  if (request.url === "/api/prediction-arbitrage/lp/candidates/preview") {
-    return request.headers["X-CSRF-Token"] === "csrf-from-venues"
-      ? response(preview) : response({message:"CSRF token required"},false,403);
-  }
+  if (request.url === "/api/prediction-arbitrage/lp/candidates/refresh" && request.method === "POST") return response({state:"queued"},true,202);
   if (request.url === "/api/prediction-arbitrage/state") return response({csrf_token:"csrf-from-state",status:"healthy",qualified_opportunities:[{title:"N-leg fixture content"}],n_leg_observation:{latest:[{title:"N-leg observation fixture"}]}});
   if (request.url.startsWith("/api/prediction-arbitrage/history")) return response({items:[]});
   if (request.url === "/api/v1/account/snapshot") return response({});
@@ -5541,55 +5539,55 @@ const click = async (matches) => {
 };
 setWorkspaceView("prediction_market");
 await drainRequests();
-const candidateDisabled = (html) => /data-action="lp-candidate-preview" data-candidate-index="0" disabled/.test(html);
+const refreshDisabled = (html) => /data-action="lp-dashboard-refresh"[^>]*disabled/.test(html);
 const preVenueHtml = nodes["prediction-market-root"].innerHTML;
-const preVenueCandidateDisabled = candidateDisabled(preVenueHtml);
-const prematureCandidateButton = {disabled:preVenueCandidateDisabled,dataset:{candidateIndex:"0"}};
-await click({"[data-action='lp-candidate-preview']":prematureCandidateButton});
+const preVenueRefreshDisabled = refreshDisabled(preVenueHtml);
+await click({"[data-action='lp-dashboard-refresh']":{disabled:preVenueRefreshDisabled}});
 await drainRequests();
-const prematurePreviewCount = requests.filter((request)=>request.url==="/api/prediction-arbitrage/lp/candidates/preview").length;
-const emptyTokenPreviewCount = requests.filter((request)=>request.url==="/api/prediction-arbitrage/lp/candidates/preview"
-  && !request.headers["X-CSRF-Token"]).length;
+const prematureRefreshCount = requests.filter((request)=>request.url==="/api/prediction-arbitrage/lp/candidates/refresh" && request.method==="POST").length;
+const emptyTokenRefreshCount = requests.filter((request)=>request.url==="/api/prediction-arbitrage/lp/candidates/refresh"
+  && request.method==="POST" && !request.headers["X-CSRF-Token"]).length;
 const initialRequests = requests.map(({url,method})=>({url,method}));
 resolveVenues();
 await drainRequests();
 const initialHtml = nodes["prediction-market-root"].innerHTML;
-const enabledCandidateDisabled = candidateDisabled(initialHtml);
+const postVenueRefreshDisabled = refreshDisabled(initialHtml);
 const timer = [...intervals.values()].find(({delay})=>delay===5000);
 if (timer) await timer.callback();
 await drainRequests();
-const refreshButton = {disabled:false};
-await click({"[data-action='lp-dashboard-refresh']":refreshButton});
-await drainRequests();
-const candidateButton = {disabled:enabledCandidateDisabled,dataset:{candidateIndex:"0"}};
-await click({"[data-action='lp-candidate-preview']":candidateButton});
-await drainRequests();
-const previewRequest = requests.find((request)=>request.url==="/api/prediction-arbitrage/lp/candidates/preview"
-  && request.headers["X-CSRF-Token"]==="csrf-from-venues");
+const requestsBeforeLink = requests.length;
+await nodes["prediction-market-root"].listeners.click[0]({target:{
+  href:"https://polymarket.com/event/candidate",
+  closest(){return null;},
+}});
+const noRequestFromMarketLink = requests.length === requestsBeforeLink;
+const refreshButton = {disabled:postVenueRefreshDisabled};
 await click({"[data-action='lp-dashboard-refresh']":refreshButton});
 await drainRequests();
 const finalHtml = nodes["prediction-market-root"].innerHTML;
 const readRequests = requests.filter((request)=>request.method==="GET");
+const refreshRequest = requests.find((request)=>request.url==="/api/prediction-arbitrage/lp/candidates/refresh" && request.method==="POST");
 console.log(JSON.stringify({
-  preVenueCandidateDisabled,
-  enabledCandidateDisabled,
-  prematurePreviewCount,
-  emptyTokenPreviewCount,
+  preVenueRefreshDisabled,
+  postVenueRefreshDisabled,
+  prematureRefreshCount,
+  emptyTokenRefreshCount,
   initialHtml,
   initialRequests,
   finalHtml,
   readPaths:readRequests.map((request)=>request.url),
-  preview:previewRequest && {method:previewRequest.method,csrf:previewRequest.headers["X-CSRF-Token"],body:JSON.parse(previewRequest.body)},
+  refresh:refreshRequest && {method:refreshRequest.method,csrf:refreshRequest.headers["X-CSRF-Token"],body:JSON.parse(refreshRequest.body)},
+  noRequestFromMarketLink,
   orderSubmitCount:requests.filter((request)=>request.url==="/api/prediction-arbitrage/lp/sessions").length,
   timerCount:intervals.size,
 }));
 ''')
     rendered = json.loads(output)
 
-    assert rendered["preVenueCandidateDisabled"] is True
-    assert rendered["prematurePreviewCount"] == 0
-    assert rendered["emptyTokenPreviewCount"] == 0
-    assert rendered["enabledCandidateDisabled"] is False
+    assert rendered["preVenueRefreshDisabled"] is True
+    assert rendered["prematureRefreshCount"] == 0
+    assert rendered["emptyTokenRefreshCount"] == 0
+    assert rendered["postVenueRefreshDisabled"] is False
     assert any(request == {
         "url": "/api/prediction-arbitrage/venues", "method": "GET"
     } for request in rendered["initialRequests"])
@@ -5610,17 +5608,16 @@ console.log(JSON.stringify({
     assert set(rendered["readPaths"]) <= {
         "/api/prediction-arbitrage/venues", "/api/prediction-arbitrage/lp/dashboard"
     }
-    assert rendered["preview"] == {
+    assert rendered["refresh"] == {
         "method": "POST",
         "csrf": "csrf-from-venues",
-        "body": {
-            "market_id": "market-candidate", "condition_id": "condition-candidate",
-            "token_id": "candidate-token", "outcome": "NO",
-        },
+        "body": {},
     }
+    assert rendered["noRequestFromMarketLink"] is True
     assert rendered["orderSubmitCount"] == 0
-    assert "preview-lp-candidate" in rendered["finalHtml"]
-    assert "确认开仓" in rendered["finalHtml"]
+    assert 'href="https://polymarket.com/event/candidate"' in rendered["finalHtml"]
+    assert not any("/lp/candidates/preview" in path for path in rendered["readPaths"])
+    assert "确认开仓" not in rendered["finalHtml"]
     assert rendered["timerCount"] == 1
 
 
@@ -5667,9 +5664,12 @@ const lpDashboard = {state:"ready",stale:false,complete:true,checked_at:"2026-09
   orders:[{order_id:"lp-order-1",market_id:"market-order",condition_id:"condition-order",token_id:"order-token",
     market_title:"LP order fact",outcome:"NO",side:"BUY",status:"LIVE",price:"0.40",quantity:"20",filled_quantity:"0",remaining_quantity:"20",
     management:"manual_read_only",read_only:true}],positions:[],market_rewards:[],
-  candidates:[{market_id:"market-candidate",condition_id:"condition-candidate",token_id:"candidate-token",outcome:"NO",
-    market_title:"LP candidate fact",daily_pool_usd:"150",price:"0.40",quantity:"20",required_capital:"8.00",estimated_exit_loss:"0.40",
-    checked_at:"2026-09-16T00:00:00Z",review_at:"2026-09-17T00:00:00Z"}]};
+  recommendations:[{market_id:"market-candidate",condition_id:"condition-candidate",market_url:"https://polymarket.com/event/candidate",
+    market_title:"LP candidate fact",daily_pool_usd:"150",state:"eligible",competition_state:"known",competition_quantity:"5",
+    directions:{YES:{token_id:"candidate-yes",state:"eligible",reason_codes:[],screening:{stability_range:"0.01",stability_sample_count:721},
+      guidance:{price:"0.45",quantity:"20",required_capital:"9.00",estimated_exit_loss:"0.40",estimated_exit_loss_ratio:"0.04",checked_at:"2026-09-16T00:00:00Z",expires_at:"2026-09-17T00:00:00Z"}},
+      NO:{token_id:"candidate-no",state:"eligible",reason_codes:[],screening:{stability_range:"0.01",stability_sample_count:721},
+      guidance:{price:"0.40",quantity:"20",required_capital:"8.00",estimated_exit_loss:"0.40",estimated_exit_loss_ratio:"0.05",checked_at:"2026-09-16T00:00:00Z",expires_at:"2026-09-17T00:00:00Z"}}}}]};
 const nleg = {status:"healthy",health:{status:"healthy",degraded_reasons:[]},validation_mode:"MANUAL",breaker:{open:false},
   heartbeat_at:"2026-09-16T00:00:00Z",n_leg:{mode:"MANUAL",contract_generation:7},
   qualified_opportunities:[{opportunity_id:"visible-opportunity",title:"N-leg opportunity fact",strategy_type:"yes_no",
@@ -5679,8 +5679,6 @@ const nleg = {status:"healthy",health:{status:"healthy",degraded_reasons:[]},val
   n_leg_observation:{status:"READY",latest:[{identity:"visible-observation",stage:"OBSERVING",in_pool:true,title:"N-leg observation fact",
     result:{current:true,status:"PASS",net_roi:"0.12",net_amount:"1.00",cost:"5.00",payout:"6.00"}}]},
   relation_review:{pending_count:2,counts:{PENDING_APPROVAL:2}}};
-const preview = {state:"previewed",preview_id:"preview-lp-candidate",request:{market_id:"market-candidate",condition_id:"condition-candidate",
-  token_id:"candidate-token",outcome:"NO",price:"0.40",quantity:"20",review_at:"2026-09-17T00:00:00Z"},preflight:{estimated_exit_loss:"0.40"}};
 const requests = [];
 let lpReads = 0;
 let stateReads = 0;
@@ -5702,7 +5700,6 @@ globalThis.fetch = async (url, init={}) => {
     lpReads += 1;
     return lpReads === 3 ? response({error:"LP source unavailable"},false,503) : response(lpDashboard);
   }
-  if (request.url === "/api/prediction-arbitrage/lp/candidates/preview") return response(preview);
   if (request.url === "/api/prediction-arbitrage/state") {
     stateReads += 1;
     if (stateReads === 2) return new Promise((resolve,reject)=>{settleLateState=(succeeds)=>succeeds?resolve(response(nleg)):reject(new Error("late N-leg failure"));});
@@ -5723,12 +5720,19 @@ setWorkspaceView("prediction_market");
 await drainRequests();
 const lpTimerId = state.predictionMarket.pollId;
 const firstLp = nodes["prediction-market-root"].innerHTML;
-await click({"[data-action='lp-candidate-preview']":{disabled:false,dataset:{candidateIndex:"0"}}});
+const directionSelect = {value:"NO",dataset:{conditionId:"condition-candidate"}};
+await nodes["prediction-market-root"].listeners.change[0]({target:{closest(selector){
+  return selector === "[data-lp-direction]" ? directionSelect : null;
+}}});
+const lpWithNoSelected = nodes["prediction-market-root"].innerHTML;
 await drainRequests();
-const multiTab = {dataset:{predictionTab:"multi_leg"}};
-await click({"[data-prediction-tab]":multiTab});
+let keyboardNavigationPrevented = false;
+await nodes["prediction-market-root"].listeners.keydown[0]({key:"ArrowRight",preventDefault(){keyboardNavigationPrevented=true;},target:{closest(selector){
+  return selector === "[data-prediction-tab]" ? {dataset:{predictionTab:"lp"}} : null;
+}}});
 await drainRequests();
 const multiHtml = nodes["prediction-market-root"].innerHTML;
+const keyboardNavigation = keyboardNavigationPrevented && state.predictionMarket.activeTab === "multi_leg";
 const lpReadsBeforeMultiTick = lpReads;
 const stateTickStart = requests.length;
 const pendingTick = intervals.get(lpTimerId).callback();
@@ -5768,19 +5772,21 @@ const accountIntervalsAfterExit = [...intervals.keys()];
 const result = {
   firstLpHasVenueAndOrders:firstLp.includes("Polymarket") && firstLp.includes("Predict.fun") && firstLp.includes("LP order fact"),
   multiHasControls:multiHtml.includes("N-leg opportunity fact") && multiHtml.includes("N-leg observation fact") && multiHtml.includes("关系审核"),
+  lpSelectionBeforeSwitch:lpWithNoSelected.includes("买 NO") && lpWithNoSelected.includes("40¢ × 20 份") && lpWithNoSelected.includes("$8.00"),
+  keyboardNavigation,
   lpReadsBeforeMultiTick,lpReadsAfterMultiTick,multiTickPaths,
-  afterLateKeepsLP:lpAfterLate.includes("LP order fact") && lpAfterLate.includes("preview-lp-candidate") && lpAfterLate.includes("同步时间")
+  afterLateKeepsLP:lpAfterLate.includes("LP order fact") && lpAfterLate.includes("买 NO") && lpAfterLate.includes("40¢ × 20 份") && lpAfterLate.includes("同步时间")
     && !lpAfterLate.includes("N-leg opportunity fact") && /id="prediction-market-tab-lp"[^>]*aria-selected="true"/.test(lpAfterLate),
-  lpFailureRetainsFacts:lpAfterFailure.includes("LP order fact") && lpAfterFailure.includes("preview-lp-candidate") && lpAfterFailure.includes("上次成功数据"),
+  lpFailureRetainsFacts:lpAfterFailure.includes("LP order fact") && lpAfterFailure.includes("买 NO") && lpAfterFailure.includes("40¢ × 20 份") && lpAfterFailure.includes("上次成功数据"),
   lpTickPaths,
   multiAfterLpFailureShowsNleg:multiAfterLpFailure.includes("N-leg opportunity fact") && multiAfterLpFailure.includes("N-leg observation fact")
     && !multiAfterLpFailure.includes("LP order fact"),
-  lpBeforeVenueFailureHasConfirmation:lpBeforeVenueFailure.includes("LP order fact")
-    && lpBeforeVenueFailure.includes("preview-lp-candidate") && lpBeforeVenueFailure.includes("同步时间"),
+  lpBeforeVenueFailureKeepsSelection:lpBeforeVenueFailure.includes("LP order fact")
+    && lpBeforeVenueFailure.includes("买 NO") && lpBeforeVenueFailure.includes("40¢ × 20 份") && lpBeforeVenueFailure.includes("同步时间"),
   venueFailureNotice:lpAfterVenueFailure.includes("平台摘要读取失败 · UNKNOWN · Venue summary 503")
     && lpAfterVenueFailure.includes("保留上次成功状态"),
   lpAfterVenueFailureHasFacts:lpAfterVenueFailure.includes("LP order fact")
-    && lpAfterVenueFailure.includes("preview-lp-candidate"),
+    && lpAfterVenueFailure.includes("买 NO") && lpAfterVenueFailure.includes("40¢ × 20 份"),
   lpAfterVenueFailureIsFresh:lpAfterVenueFailure.includes("同步时间")
     && !lpAfterVenueFailure.includes("上次成功数据") && !lpAfterVenueFailure.includes("LP dashboard 503"),
   lpReadsBeforeVenueFailure,lpReadsAfterVenueFailure,venueFailureTickPaths,
@@ -5794,6 +5800,8 @@ console.log(JSON.stringify(result));
 
     assert rendered["firstLpHasVenueAndOrders"] is True
     assert rendered["multiHasControls"] is True
+    assert rendered["lpSelectionBeforeSwitch"] is True
+    assert rendered["keyboardNavigation"] is True
     assert rendered["lpReadsBeforeMultiTick"] == rendered["lpReadsAfterMultiTick"]
     assert sorted(rendered["multiTickPaths"]) == sorted([
         "/api/prediction-arbitrage/venues", "/api/prediction-arbitrage/state"
@@ -5804,7 +5812,7 @@ console.log(JSON.stringify(result));
         "/api/prediction-arbitrage/venues", "/api/prediction-arbitrage/lp/dashboard"
     ])
     assert rendered["multiAfterLpFailureShowsNleg"] is True
-    assert rendered["lpBeforeVenueFailureHasConfirmation"] is True
+    assert rendered["lpBeforeVenueFailureKeepsSelection"] is True
     assert rendered["venueFailureNotice"] is True
     assert rendered["lpAfterVenueFailureHasFacts"] is True
     assert rendered["lpAfterVenueFailureIsFresh"] is True
@@ -5881,16 +5889,72 @@ console.log(JSON.stringify({
     }
 
 
-def test_lp_sections_refresh_without_losing_confirmation() -> None:
+def test_lp_sections_refresh_preserves_history_and_market_links() -> None:
     output = run_dashboard_js(r'''
 const requests = [];
 const intervals = [];
 const longManualTitle = "印度央行将在 2026 年 10 月会议上加息至少 25 个基点吗？官方市场完整长名称";
+const checkedAt = "2026-09-15T04:00:00Z";
+const laterExpiresAt = "2026-09-15T04:01:00Z";
+const earlierExpiresAt = "2026-09-15T04:00:40Z";
+const guide = (marketId, conditionId, outcome, price, quantity, capital, loss, tokenId, expiry = laterExpiresAt) => ({
+  market_id: marketId, condition_id: conditionId, token_id: tokenId, outcome,
+  price, quantity, required_capital: capital, estimated_exit_loss: loss,
+  estimated_exit_loss_ratio: "0.05", checked_at: checkedAt, expires_at: expiry,
+});
+const direction = (marketId, conditionId, outcome, price, capital, loss, tokenId, expiry = laterExpiresAt) => ({
+  token_id: tokenId,
+  state: "eligible",
+  reason_codes: ["event_coverage_incomplete"],
+  screening: {
+    state: "eligible", reason_codes: [], stability_range: "0.01",
+    stability_min_midpoint: "0.50", stability_max_midpoint: "0.51",
+    stability_sample_count: 721, price_change_24h: "0.014",
+    price_change_24h_source: "gamma_market.prices.one_day_price_change",
+    competition_state: "known",
+  },
+  guidance: guide(marketId, conditionId, outcome, price, "20", capital, loss, tokenId, expiry),
+});
+const eligibleMarket = (marketId, title, pool, url, competition, directions) => ({
+  market_id: marketId, condition_id: `condition-${marketId}`, market_title: title,
+  market_url: url, daily_pool_usd: pool,
+  competition_state: competition === null ? "unknown" : "known",
+  competition_quantity: competition, state: "eligible", directions,
+});
+const recommendations = [
+  eligibleMarket("c", "Market C", "200", "https://polymarket.com/event/c-market/c", "41", {
+    YES: direction("c", "condition-c", "YES", "0.57", "11.40", "0.80", "c-yes"),
+  }),
+  eligibleMarket("a", "Market A", "100", "https://polymarket.com/event/a-market/a", "120", {
+    YES: direction("a", "condition-a", "YES", "0.51", "10.20", "0.50", "a-yes"),
+    NO: direction("a", "condition-a", "NO", "0.41", "8.20", "0.40", "a-no", earlierExpiresAt),
+  }),
+  eligibleMarket("b", "Market B", "100", "https://polymarket.com/event/b-market/b", "160", {
+    NO: direction("b", "condition-b", "NO", "0.39", "7.80", "0.45", "b-no"),
+  }),
+  eligibleMarket("d", "Market D", "100", "https://polymarket.com/event/d-market/d", null, {
+    YES: direction("d", "condition-d", "YES", "0.43", "8.60", "0.45", "d-yes"),
+  }),
+  {
+    market_id: "old", condition_id: "condition-old", market_title: "Expired market",
+    market_url: "https://polymarket.com/event/old-market/old", state: "expired",
+    daily_pool_usd: null, competition_state: "unknown", competition_quantity: null,
+    directions: {
+      YES: {
+        token_id: "old-yes", state: "expired", eligible: false,
+        reason_codes: ["book_stale"],
+        guidance: guide("old", "condition-old", "YES", "0.48", "20", "9.60", "0.28", "old-yes"),
+      },
+    },
+  },
+];
 const dashboard = {
   state: "ready",
   stale: false,
   complete: true,
-  checked_at: "2026-09-15T04:00:00Z",
+  checked_at: checkedAt,
+  last_success_at: checkedAt,
+  recommendations,
   orders: [{
     order_id: "manual-order", market_id: "market-manual",
     condition_id: "condition-manual", token_id: "manual-token",
@@ -5918,57 +5982,59 @@ const dashboard = {
     market_amount_raw: "0.02", asset: "USDC.e", market_amount: null,
     currency: "USDC.e", checked_at: "2026-09-15T03:59:00Z", paid: false,
   }},
-  candidates: [
-    {
-      market_id: "market-candidate-a", condition_id: "condition-candidate-a",
-      token_id: "candidate-a-no", outcome: "NO",
-      market_title: "纽约 9 月降雨量为 4–5 英寸？", market_url: "https://polymarket.com/event/rain-a",
-      daily_pool_usd: "150", price: "0.40", quantity: "20",
-      required_capital: "8.00", estimated_exit_loss: "0.40",
-      checked_at: "2026-09-15T04:00:00Z", review_at: "2026-09-16T00:00:00Z",
-    },
-    {
-      market_id: "market-candidate-b", condition_id: "condition-candidate-b",
-      token_id: "candidate-b-no", outcome: "NO",
-      market_title: "纽约 9 月降雨量为 5–6 英寸？", market_url: "https://polymarket.com/event/rain-b",
-      daily_pool_usd: "100", price: "0.50", quantity: "20",
-      required_capital: "10.00", estimated_exit_loss: "0.20",
-      checked_at: "2026-09-15T04:00:00Z", review_at: "2026-09-16T00:00:00Z",
-    },
-  ],
+};
+const refreshedDashboard = {
+  ...dashboard,
+  checked_at: "2026-09-15T04:00:30Z",
+  last_success_at: "2026-09-15T04:00:30Z",
+  recommendations: [...dashboard.recommendations].reverse().map((row) => row.market_id === "c"
+    ? {...row, directions: {...row.directions, YES: direction("c", "condition-c", "YES", "0.58", "11.60", "0.80", "c-yes")}}
+    : row),
 };
 const firstReadFailure = {
   state: "unknown", stale: true, checked_at: null, last_success_at: null,
   error: "账户数据读取失败",
 };
-const preview = {
-  state: "previewed", preview_id: "preview-candidate-a",
-  request: {
-    market_id: "market-candidate-a", condition_id: "condition-candidate-a",
-    token_id: "candidate-a-no", outcome: "NO", price: "0.40",
-    quantity: "20", review_at: "2026-09-16T00:00:00Z",
-  },
-  preflight: {estimated_exit_loss: "0.40"},
-};
 let dashboardReads = 0;
+let refreshPosts = 0;
+let holdPollingResponses = false;
+const heldResponses = [];
+const venuePayload = {csrf_token: "csrf-token", venues: [], monitor_subscription: {}};
 globalThis.window = {
   location: {search: ""},
   setInterval(fn, milliseconds) { intervals.push({fn, milliseconds}); return intervals.length; },
   clearInterval() {},
 };
+const RealDate = Date;
+let now = RealDate.parse("2026-09-15T04:00:30Z");
+globalThis.Date = class extends RealDate {
+  constructor(...args) {
+    if (args.length) super(...args);
+    else super(now);
+  }
+  static now() { return now; }
+};
 const response = (data, ok = true, status = 200) => ({ok, status, json: async () => data});
 globalThis.fetch = async (url, options = {}) => {
   const request = {url: String(url), method: String(options.method || "GET"), body: options.body || ""};
   requests.push(request);
+  if (request.url.endsWith("/api/prediction-arbitrage/venues")) {
+    if (holdPollingResponses) return new Promise((resolve) => heldResponses.push({request, resolve}));
+    return response(venuePayload);
+  }
   if (request.url.endsWith("/api/prediction-arbitrage/lp/dashboard")) {
     dashboardReads += 1;
+    if (holdPollingResponses) {
+      return new Promise((resolve) => heldResponses.push({request, resolve}));
+    }
     if (dashboardReads === 1) return response(firstReadFailure);
     if (dashboardReads === 2) return response(dashboard);
+    if (dashboardReads === 3) return response(refreshedDashboard);
     return response({error: "offline"}, false, 503);
   }
-  if (request.url.endsWith("/api/prediction-arbitrage/lp/candidates/preview")) return response(preview);
-  if (request.url.endsWith("/api/prediction-arbitrage/state")) {
-    return response({lp_session: {state: "none"}, csrf_token: "csrf-token", histories: {signals: []}});
+  if (request.url.endsWith("/api/prediction-arbitrage/lp/candidates/refresh") && request.method === "POST") {
+    refreshPosts += 1;
+    return response({state: "queued"}, true, 202);
   }
   throw new Error("unexpected request: " + request.method + " " + request.url);
 };
@@ -5976,6 +6042,19 @@ state.workspaceView = "prediction_market";
 state.predictionMarket.activeTab = "lp";
 state.predictionMarket.csrfToken = "csrf-token";
 const lpPayload = () => ({lp_dashboard: state.predictionMarket.lpDashboard, lp_error: state.predictionMarket.lpDashboardError});
+const pageListeners = {};
+const elementStub = {addEventListener() {}};
+Object.setPrototypeOf(elements, new Proxy(Object.getPrototypeOf(elements), {
+  get(target, key, receiver) {
+    return key in target ? Reflect.get(target, key, receiver) : elementStub;
+  },
+}));
+elements["prediction-market-root"] = {
+  innerHTML: "",
+  addEventListener(name, listener) { pageListeners[name] = listener; },
+};
+const renderedRoot = elements["prediction-market-root"];
+bindEvents();
 startPredictionPolling();
 await fetchPredictionLpDashboard();
 const firstFailure = predictionLpCard(lpPayload());
@@ -5986,19 +6065,86 @@ const partial = predictionLpCard({
   ...lpPayload(),
   lp_dashboard: {...dashboard, complete: false},
 });
-const candidateButton = {disabled: false, dataset: {candidateIndex: "0"}};
-await handlePredictionMarketClick({target: {closest(selector) {
-  return selector === "[data-action='lp-candidate-preview']" ? candidateButton : null;
+const directionSelect = {value: "NO", dataset: {conditionId: "condition-a"}};
+await pageListeners.change({target: {closest(selector) {
+  return selector === "[data-lp-direction]" ? directionSelect : null;
 }}});
-const expanded = predictionLpCard(lpPayload());
-const candidateRequest = requests.find((item) => item.url.endsWith("/lp/candidates/preview"));
+const selectedNo = predictionLpCard(lpPayload());
+const requestsBeforeLink = requests.length;
+await pageListeners.click({target: {
+  href: "https://polymarket.com/event/a-market/a",
+  closest() { return null; },
+}});
+const noRequestFromMarketLink = requests.length === requestsBeforeLink;
+const refreshButton = {disabled: false};
+await handlePredictionMarketClick({target: {closest(selector) {
+  return selector === "[data-action='lp-dashboard-refresh']" ? refreshButton : null;
+}}});
+const afterRefresh = predictionLpCard(lpPayload());
 const timer = intervals.find((item) => item.milliseconds === 5000);
 if (!timer) throw new Error("LP polling did not install the 5 second refresh");
+const candidateTable = (html) => (html.match(/<table class="pm-table pm-lp-candidate-table">[\s\S]*?<\/table>/) || [""])[0];
+const marketRow = (html, title) => {
+  const table = candidateTable(html);
+  const titleAt = table.indexOf(title);
+  if (titleAt < 0) return "";
+  const rowStart = table.lastIndexOf("<tr", titleAt);
+  const rowEnd = table.indexOf("</tr>", titleAt);
+  return rowStart >= 0 && rowEnd >= 0 ? table.slice(rowStart, rowEnd + 5) : "";
+};
+holdPollingResponses = true;
+const heldTick = timer.fn();
+await Promise.resolve();
+await Promise.resolve();
+const heldLpRequest = heldResponses.find(({request}) => request.url.endsWith("/api/prediction-arbitrage/lp/dashboard"));
+const heldVenueRequest = heldResponses.find(({request}) => request.url.endsWith("/api/prediction-arbitrage/venues"));
+const heldReplacementFetch = Boolean(heldLpRequest && heldVenueRequest);
+now = RealDate.parse("2026-09-15T04:00:41Z");
 await timer.fn();
+const earlierPage = renderedRoot.innerHTML;
+const earlierMarketA = marketRow(earlierPage, "Market A");
+const earlierMarketB = marketRow(earlierPage, "Market B");
+const heldAtEarlierExpiry = heldResponses.length === 2 && requests.filter((item) => item.url.endsWith("/api/prediction-arbitrage/lp/dashboard")).length === 4;
+now = RealDate.parse("2026-09-15T04:01:00Z");
+await timer.fn();
+const laterPage = renderedRoot.innerHTML;
+const laterMarketA = marketRow(laterPage, "Market A");
+const laterMarketB = marketRow(laterPage, "Market B");
+const retainedExpiredNo = state.predictionMarket.lpDashboard.recommendations
+  .find((row) => row.condition_id === "condition-a").directions.NO.guidance;
+const earlyExpiryRerenderedCurrentAlternative = earlierMarketA.includes("买 YES")
+  && earlierMarketA.includes("51¢ × 20 份") && earlierMarketA.includes("可参与")
+  && !earlierMarketA.includes("41¢") && !/<option[^>]*value="NO"/.test(earlierMarketA)
+  && earlierMarketB.includes("39¢ × 20 份") && earlierMarketB.includes("可参与");
+const bothExpiredRowsRetainGuidance = laterMarketA.includes("51¢ × 20 份")
+  && laterMarketA.includes("已过期") && !laterMarketA.includes("可参与")
+  && laterMarketA.includes("检查 2026-09-15 12:00:00 HKT")
+  && laterMarketA.includes('href="https://polymarket.com/event/a-market/a"')
+  && laterMarketB.includes("39¢ × 20 份") && laterMarketB.includes("已过期")
+  && !laterMarketB.includes("可参与")
+  && laterMarketB.includes("检查 2026-09-15 12:00:00 HKT")
+  && laterMarketB.includes('href="https://polymarket.com/event/b-market/b"')
+  && retainedExpiredNo.price === "0.41" && retainedExpiredNo.quantity === "20"
+  && retainedExpiredNo.checked_at === checkedAt;
+const allFetchesStillHeldAtExpiry = heldResponses.length === 2 && heldReplacementFetch
+  && requests.filter((item) => item.url.endsWith("/api/prediction-arbitrage/lp/dashboard")).length === 4;
+heldLpRequest.resolve(response({error: "offline"}, false, 503));
+heldVenueRequest.resolve(response(venuePayload));
+await heldTick;
 const stale = predictionLpCard(lpPayload());
+const staleMarketANo = state.predictionMarket.lpDashboard.recommendations
+  .find((row) => row.condition_id === "condition-a").directions.NO.guidance;
+const initialTable = candidateTable(initial);
+const expiredRow = marketRow(initial, "Expired market");
+const ordered = ["Market C", "Market A", "Market B", "Market D"]
+  .map((title) => initialTable.indexOf(title));
+const aRow = marketRow(initial, "Market A");
+const aNoRow = marketRow(selectedNo, "Market A");
+const refreshRequest = requests.find((item) => item.url.endsWith("/api/prediction-arbitrage/lp/candidates/refresh"));
 console.log(JSON.stringify({
   intervalMs: timer.milliseconds,
   dashboardReads,
+  refreshPosts,
   firstReadFailure: firstFailure.includes("读取失败")
     && firstFailure.includes("UNKNOWN")
     && firstFailure.includes("账户数据读取失败")
@@ -6019,45 +6165,76 @@ console.log(JSON.stringify({
       && orderTable.split(longManualTitle).length - 1 === 2;
   })(),
   honestManualPnl: initial.includes("未接管止损") && initial.includes("已实现 UNKNOWN") && initial.includes("持仓 P&amp;L UNKNOWN"),
-  partialCatalogVisible: partial.includes("候选目录尚未完整") && partial.includes("纽约 9 月降雨量为 4–5 英寸？"),
-  initialShowsBothLists: initial.includes("我的订单与持仓") && initial.includes("推荐开仓"),
+  partialCatalogVisible: partial.includes("候选目录尚未完整") && partial.includes("Market C"),
+  initialShowsBothLists: initial.includes("我的订单与持仓") && initial.includes("推荐标的"),
   longName: initial.includes(longManualTitle),
   manualReadOnly: initial.includes("手工单 · 只读") && !initial.includes("data-manual-cancel"),
   scoring: initial.includes("官方计分中"),
   marketCumulative: initial.includes("市场累计") && initial.includes("0.02 USDC.e") && initial.includes("平台累计，未核实到账"),
-  serverEconomics: initial.includes("$8.00") && initial.includes("$0.40"),
-  confirmationExpanded: expanded.includes("确认开仓") && expanded.includes("买入 NO") && expanded.includes("40¢ × 20 份") && expanded.includes("复盘时间") && expanded.includes("08:00") && expanded.includes("每次开仓 $5") && expanded.includes("不保证损失上限"),
-  previewIdInDetails: /<details[^>]*>[\s\S]*preview-candidate-a[\s\S]*<\/details>/.test(expanded),
-  previewIdentityOnly: candidateRequest && JSON.stringify(JSON.parse(candidateRequest.body)) === JSON.stringify({
-    market_id: "market-candidate-a", condition_id: "condition-candidate-a",
-    token_id: "candidate-a-no", outcome: "NO",
-  }),
-  detailsSurviveRefresh: stale.includes("确认开仓") && stale.includes("preview-candidate-a"),
-  staleRetainsData: stale.includes(longManualTitle) && stale.includes("纽约 9 月降雨量为 4–5 英寸？") && stale.includes("上次成功数据"),
+  orderedMarkets: ordered.every((index, position) => index >= 0 && (position === 0 || index > ordered[position - 1])),
+  marketIdentity: aRow.includes("51¢") && aRow.includes("$10.20") && aRow.includes("120")
+    && marketRow(initial, "Market B").includes("39¢")
+    && marketRow(initial, "Market D").includes("43¢")
+    && marketRow(initial, "Market D").includes("UNKNOWN"),
+  alternativeDirections: aRow.includes("<select") && aRow.includes('value="YES"') && aRow.includes('value="NO"')
+    && aRow.includes("51¢") && aNoRow.includes("41¢") && aNoRow.includes("$8.20"),
+  stableWindowAndEvidence: initial.includes("1¢") && initial.includes("721")
+    && initial.includes("one_day_price_change") && initial.includes("关键事件覆盖不完整"),
+  expiredReferenceOnly: expiredRow.includes("已过期") && expiredRow.includes("48¢")
+    && expiredRow.includes("$9.60") && !/data-action="lp-candidate-(?:preview|start)"/.test(expiredRow),
+  ordinaryMarketLinks: ["c-market/c", "a-market/a", "b-market/b", "d-market/d", "old-market/old"]
+    .every((path) => initial.includes(`href="https://polymarket.com/event/${path}"`))
+    && (initial.match(/rel="noopener noreferrer"/g) || []).length >= 5,
+  noInternalEntryActions: !/data-action="lp-candidate-(?:preview|start|cancel)"/.test(initial)
+    && !initial.includes("确认开仓"),
+  noRequestFromMarketLink,
+  refreshQueuesReadOnly: refreshRequest?.method === "POST" && refreshRequest.body === "{}"
+    && refreshPosts === 1 && marketRow(afterRefresh, "Market C").includes("58¢")
+    && marketRow(afterRefresh, "Market A").includes("41¢")
+    && !requests.some((item) => /\/lp\/candidates\/(?:preview|start)|\/lp\/sessions/.test(item.url)),
+  heldAtEarlierExpiry,
+  earlyExpiryRerenderedCurrentAlternative,
+  bothExpiredRowsRetainGuidance,
+  allFetchesStillHeldAtExpiry,
+  staleRetainsData: stale.includes(longManualTitle) && stale.includes("Market C")
+    && marketRow(stale, "Market C").includes("58¢")
+    && marketRow(stale, "Market A").includes("51¢")
+    && staleMarketANo.price === "0.41" && staleMarketANo.quantity === "20"
+    && staleMarketANo.checked_at === checkedAt
+    && stale.includes("上次成功数据"),
 }));
 ''')
     rendered = json.loads(output)
     assert rendered == {
-    "intervalMs": 5000,
-    "dashboardReads": 3,
-    "firstReadFailure": True,
-    "tableHeaders": [4, 6],
-    "noEmptySession": True,
-    "oneTitleAndRefresh": True,
-    "safeMarketLink": True,
-    "mergedPosition": True,
-    "honestManualPnl": True,
-    "partialCatalogVisible": True,
+        "intervalMs": 5000,
+        "dashboardReads": 4,
+        "refreshPosts": 1,
+        "firstReadFailure": True,
+        "tableHeaders": [4, 6],
+        "noEmptySession": True,
+        "oneTitleAndRefresh": True,
+        "safeMarketLink": True,
+        "mergedPosition": True,
+        "honestManualPnl": True,
+        "partialCatalogVisible": True,
         "initialShowsBothLists": True,
         "longName": True,
         "manualReadOnly": True,
         "scoring": True,
         "marketCumulative": True,
-        "serverEconomics": True,
-    "confirmationExpanded": True,
-    "previewIdInDetails": True,
-        "previewIdentityOnly": True,
-        "detailsSurviveRefresh": True,
+        "orderedMarkets": True,
+        "marketIdentity": True,
+        "alternativeDirections": True,
+        "stableWindowAndEvidence": True,
+        "expiredReferenceOnly": True,
+        "ordinaryMarketLinks": True,
+        "noInternalEntryActions": True,
+        "noRequestFromMarketLink": True,
+        "refreshQueuesReadOnly": True,
+        "heldAtEarlierExpiry": True,
+        "earlyExpiryRerenderedCurrentAlternative": True,
+        "bothExpiredRowsRetainGuidance": True,
+        "allFetchesStillHeldAtExpiry": True,
         "staleRetainsData": True,
     }
 

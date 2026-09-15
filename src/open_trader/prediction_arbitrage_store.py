@@ -26,6 +26,7 @@ SignalHistoryWindow = Literal["24h", "7d", "30d", "all"]
 _BUSY_TIMEOUT_MS = 5_000
 _LLM_USAGE_RETENTION = timedelta(days=7)
 _PREVIEW_TTL = timedelta(seconds=10)
+_LP_BOOK_SAMPLE_RETENTION = timedelta(minutes=65)
 _CROSS_AUTO_DAILY_PRINCIPAL_CAP = Decimal("100")
 _CROSS_AUTO_MODES = frozenset({"observe_only", "manual_confirm", "auto_submit"})
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -746,6 +747,23 @@ class PredictionArbitrageStore:
 
             CREATE INDEX IF NOT EXISTS lp_actions_session
             ON lp_actions(session_id, created_at, action_id);
+
+            CREATE TABLE IF NOT EXISTS lp_book_samples (
+                condition_id TEXT NOT NULL,
+                token_id TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                PRIMARY KEY(condition_id, token_id, received_at)
+            );
+
+            CREATE INDEX IF NOT EXISTS lp_book_samples_received
+            ON lp_book_samples(received_at);
+
+            CREATE TABLE IF NOT EXISTS lp_screening_snapshot (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                payload TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """
         )
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
@@ -842,6 +860,10 @@ class PredictionArbitrageStore:
                 )
             connection.execute("PRAGMA user_version=12")
             version = 12
+        if version < 13:
+            # Issue #130: durable BBO history and the previous screening result.
+            connection.execute("PRAGMA user_version=13")
+            version = 13
 
     @staticmethod
     def _execution_fields(row: sqlite3.Row) -> dict[str, object]:
@@ -2549,6 +2571,181 @@ class PredictionArbitrageStore:
                 "SELECT * FROM lp_sessions ORDER BY created_at, session_id"
             ).fetchall()
         return [self._lp_row_result(row) for row in rows]
+
+    def lp_record_book_samples(
+        self, samples: Iterable[Mapping[str, object]], *, now: datetime
+    ) -> int:
+        """Persist valid BBO receipts and prune samples older than 65 minutes."""
+
+        if isinstance(samples, (str, bytes, Mapping)) or not isinstance(
+            samples, Iterable
+        ):
+            raise ValueError("lp_book_samples_invalid")
+        current = _parse_timestamp(now)
+        cutoff = _canonical_timestamp(current - _LP_BOOK_SAMPLE_RETENTION)
+        rows: list[tuple[str, str, str, str]] = []
+        for sample in samples:
+            if not isinstance(sample, Mapping):
+                continue
+            condition_id = sample.get("condition_id")
+            token_id = sample.get("token_id")
+            if not isinstance(condition_id, str) or not condition_id.strip():
+                continue
+            if not isinstance(token_id, str) or not token_id.strip():
+                continue
+            try:
+                received_at = _canonical_timestamp(sample.get("received_at"))
+                received = _parse_timestamp(received_at)
+            except (TypeError, ValueError):
+                continue
+            if received > current:
+                continue
+
+            values: dict[str, Decimal] = {}
+            for name in (
+                "best_bid_price",
+                "best_bid_size",
+                "best_ask_price",
+                "best_ask_size",
+            ):
+                raw = sample.get(name)
+                if isinstance(raw, bool):
+                    break
+                try:
+                    value = raw if isinstance(raw, Decimal) else Decimal(str(raw))
+                except (InvalidOperation, TypeError, ValueError):
+                    break
+                if not value.is_finite():
+                    break
+                values[name] = value
+            if len(values) != 4:
+                continue
+            bid = values["best_bid_price"]
+            ask = values["best_ask_price"]
+            if (
+                bid <= 0
+                or ask > 1
+                or bid >= ask
+                or values["best_bid_size"] <= 0
+                or values["best_ask_size"] <= 0
+            ):
+                continue
+
+            payload: dict[str, object] = {
+                "condition_id": condition_id.strip(),
+                "token_id": token_id.strip(),
+                "received_at": received_at,
+                "source_timestamp": sample.get("source_timestamp"),
+                **values,
+            }
+            try:
+                encoded = _dump_relation_payload(payload)
+            except (TypeError, ValueError):
+                continue
+            rows.append(
+                (
+                    condition_id.strip(),
+                    token_id.strip(),
+                    received_at,
+                    encoded,
+                )
+            )
+
+        with self._transaction() as connection:
+            if rows:
+                connection.executemany(
+                    """
+                    INSERT INTO lp_book_samples(condition_id,token_id,received_at,payload)
+                    VALUES (?,?,?,?)
+                    ON CONFLICT(condition_id,token_id,received_at)
+                    DO UPDATE SET payload=excluded.payload
+                    """,
+                    rows,
+                )
+            connection.execute(
+                "DELETE FROM lp_book_samples WHERE received_at < ?", (cutoff,)
+            )
+        return len(rows)
+
+    def lp_book_samples(
+        self,
+        condition_id: str,
+        token_id: str,
+        *,
+        since: datetime | str,
+        until: datetime | str,
+    ) -> list[dict[str, object]]:
+        """Read one direction's window plus its closest preceding anchor."""
+
+        condition = str(condition_id).strip()
+        token = str(token_id).strip()
+        if not condition or not token:
+            raise ValueError("lp_book_sample_identity_invalid")
+        start = _canonical_timestamp(since)
+        end = _canonical_timestamp(until)
+        if end < start:
+            return []
+        with self._read_connection() as connection:
+            anchor = connection.execute(
+                """
+                SELECT payload FROM lp_book_samples
+                WHERE condition_id=? AND token_id=? AND received_at < ?
+                ORDER BY received_at DESC LIMIT 1
+                """,
+                (condition, token, start),
+            ).fetchone()
+            rows = connection.execute(
+                """
+                SELECT payload FROM lp_book_samples
+                WHERE condition_id=? AND token_id=? AND received_at >= ? AND received_at <= ?
+                ORDER BY received_at
+                """,
+                (condition, token, start, end),
+            ).fetchall()
+        payloads = ([] if anchor is None else [_load_payload(str(anchor["payload"]))])
+        payloads.extend(_load_payload(str(row["payload"])) for row in rows)
+        return sorted(payloads, key=lambda row: str(row.get("received_at") or ""))
+
+    def lp_save_screening_snapshot(
+        self, payload: Mapping[str, object]
+    ) -> dict[str, object]:
+        """Save screening facts unless a later-started scan already won."""
+
+        encoded = _dump_relation_payload(payload)
+        updated_at = _utc_now()
+        with self._transaction() as connection:
+            current = connection.execute(
+                "SELECT payload FROM lp_screening_snapshot WHERE singleton=1"
+            ).fetchone()
+            if current is not None:
+                previous = _load_payload(str(current["payload"]))
+                previous_started = previous.get("scan_started_at")
+                incoming_started = payload.get("scan_started_at")
+                if (
+                    isinstance(previous_started, str)
+                    and isinstance(incoming_started, str)
+                    and previous_started > incoming_started
+                ):
+                    return previous
+            connection.execute(
+                """
+                INSERT INTO lp_screening_snapshot(singleton,payload,updated_at)
+                VALUES (1,?,?)
+                ON CONFLICT(singleton) DO UPDATE
+                SET payload=excluded.payload, updated_at=excluded.updated_at
+                """,
+                (encoded, updated_at),
+            )
+        return _load_payload(encoded)
+
+    def lp_screening_snapshot(self) -> dict[str, object] | None:
+        """Load the saved LP screening projection and event confirmations."""
+
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT payload FROM lp_screening_snapshot WHERE singleton=1"
+            ).fetchone()
+        return None if row is None else _load_payload(str(row["payload"]))
 
     @staticmethod
     def _lp_report_date(report_date: str) -> str:

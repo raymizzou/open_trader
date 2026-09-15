@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from collections.abc import Mapping
 from contextlib import ExitStack
 from pathlib import Path
@@ -78,10 +79,12 @@ _CROSS_VENUE_START_TIMEOUT = 5
 _DEFAULT_HOLDING_RECONCILER = object()
 _LP_TICK_SECONDS = 1.0
 _LP_REWARD_SECONDS = 60.0
+_LP_BOOK_SAMPLE_SECONDS = 5.0
 # One in-flight request may consume the installed SDK's bounded connect/read/
 # write/pool phases (5/10/10/2 seconds); this is a fixed cleanup grace, not a
 # whole multi-request scan deadline.
 _LP_REWARD_STOP_GRACE_SECONDS = 30.0
+_LP_BOOK_SAMPLE_STOP_GRACE_SECONDS = 30.0
 
 # Keep the old spelling available for the existing Dashboard test seam.
 discover_threshold_relations = discover_threshold_relation_catalog
@@ -429,7 +432,10 @@ class PredictionRuntime:
         self._cross_validator: object | None = None
         self._lp_stop_event = threading.Event()
         self._lp_thread: threading.Thread | None = None
+        self._book_sample_stop_event = threading.Event()
+        self._book_sampler_thread: threading.Thread | None = None
         self._reward_stop_event = threading.Event()
+        self._lp_candidate_refresh_requested = threading.Event()
         self._reward_thread: threading.Thread | None = None
 
     @property
@@ -449,6 +455,20 @@ class PredictionRuntime:
     @property
     def production_owner(self) -> bool:
         return self._mode == "production" and self._owner.held
+
+    def queue_lp_candidate_refresh(self) -> bool:
+        """Wake the owned read-only LP candidate refresh worker."""
+
+        thread = self._reward_thread
+        if (
+            self._mode != "production"
+            or self._state != "RUNNING"
+            or thread is None
+            or not thread.is_alive()
+        ):
+            return False
+        self._lp_candidate_refresh_requested.set()
+        return True
 
     @property
     def shadow_evidence(self) -> dict[str, object]:
@@ -804,6 +824,7 @@ class PredictionRuntime:
                 self.n_leg_order_queue_driver.start()
             self._start_lp_monitor()
             self._start_reward_monitor()
+            self._start_book_sampler()
             self._state = "RUNNING"
             logger.info(
                 "prediction_runtime_state state=RUNNING pid=%s data_dir=%s",
@@ -874,8 +895,10 @@ class PredictionRuntime:
         if self.lp is None or self._reward_thread is not None:
             return
         self._reward_stop_event.clear()
+        self._lp_candidate_refresh_requested.clear()
 
         def run() -> None:
+            force_candidate_refresh = False
             while not self._reward_stop_event.is_set():
                 lp = self.lp
                 if lp is None:
@@ -886,9 +909,13 @@ class PredictionRuntime:
                     return
                 if callable(refresh_candidates):
                     try:
-                        refresh_candidates(stop_event=self._reward_stop_event)
+                        refresh_candidates(
+                            stop_event=self._reward_stop_event,
+                            force=force_candidate_refresh,
+                        )
                     except Exception:
                         logger.exception("prediction_lp_candidate_refresh_failed")
+                force_candidate_refresh = False
                 if self._reward_stop_event.is_set():
                     return
                 if not callable(refresh_rewards):
@@ -899,8 +926,14 @@ class PredictionRuntime:
                     # Earnings are read-only and advisory; a failed refresh
                     # is recorded by the service without touching LP risk.
                     logger.exception("prediction_lp_reward_refresh_failed")
-                if self._reward_stop_event.wait(_LP_REWARD_SECONDS):
+                refresh_requested = self._lp_candidate_refresh_requested.wait(
+                    _LP_REWARD_SECONDS
+                )
+                if self._reward_stop_event.is_set():
                     return
+                if refresh_requested:
+                    self._lp_candidate_refresh_requested.clear()
+                    force_candidate_refresh = True
 
         self._reward_thread = threading.Thread(
             target=run,
@@ -908,6 +941,40 @@ class PredictionRuntime:
             daemon=True,
         )
         self._reward_thread.start()
+
+    def _start_book_sampler(self) -> None:
+        """Sample the published LP observation set on its own bounded loop."""
+
+        if self.lp is None or self._book_sampler_thread is not None:
+            return
+        self._book_sample_stop_event.clear()
+
+        def run() -> None:
+            while not self._book_sample_stop_event.is_set():
+                started = time.monotonic()
+                lp = self.lp
+                if lp is None:
+                    return
+                sample_books = getattr(lp, "sample_candidate_books", None)
+                if not callable(sample_books):
+                    return
+                try:
+                    sample_books(stop_event=self._book_sample_stop_event)
+                except Exception:
+                    logger.exception("prediction_lp_book_sample_failed")
+                remaining = max(
+                    0.0,
+                    _LP_BOOK_SAMPLE_SECONDS - (time.monotonic() - started),
+                )
+                if self._book_sample_stop_event.wait(remaining):
+                    return
+
+        self._book_sampler_thread = threading.Thread(
+            target=run,
+            name="prediction-lp-book-sampler",
+            daemon=True,
+        )
+        self._book_sampler_thread.start()
 
     def _start_shadow(self) -> None:
         try:
@@ -1116,7 +1183,9 @@ class PredictionRuntime:
         errors: list[BaseException] = []
         uncertain_thread = False
         self._reward_stop_event.set()
+        self._lp_candidate_refresh_requested.set()
         self._lp_stop_event.set()
+        self._book_sample_stop_event.set()
         reward_thread = self._reward_thread
         if reward_thread is not None:
             # Cooperative cancellation leaves at most one bounded SDK request
@@ -1138,6 +1207,16 @@ class PredictionRuntime:
                 uncertain_thread = True
             else:
                 self._lp_thread = None
+        book_sampler_thread = self._book_sampler_thread
+        if book_sampler_thread is not None:
+            book_sampler_thread.join(timeout=_LP_BOOK_SAMPLE_STOP_GRACE_SECONDS)
+            if book_sampler_thread.is_alive():
+                errors.append(RuntimeError("book sampler thread did not stop"))
+                # It may still hold a client response or write a sample. Keep
+                # the shared LP, trading, store and runtime owner until a later
+                # stop call can join it after the read returns.
+                return errors
+            self._book_sampler_thread = None
         if self.monitor_selection_driver is not None:
             try:
                 self.monitor_selection_driver.stop()

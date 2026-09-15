@@ -2565,3 +2565,886 @@ def test_shadow_cleanup_retains_lock_and_guards_when_monitor_thread_survives(
         release.set()
         monitor._thread.join(1)
         runtime._owner.release()
+
+
+def test_lp_book_sampling_does_not_block_candidates_or_order_risk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import timedelta
+    from functools import partial
+    from urllib.request import urlopen
+
+    import open_trader.polymarket_lp as polymarket_lp_module
+    import open_trader.polymarket_monitor as polymarket_monitor_module
+    import open_trader.polymarket_trading as polymarket_trading_module
+    import open_trader.prediction_arbitrage_execution as execution_module
+    import open_trader.prediction_arbitrage_store as store_module
+    import open_trader.prediction_runtime as runtime_module
+    from open_trader.prediction_runtime import _UnavailableCrossVenueMonitor
+    from open_trader.prediction_service import create_prediction_server
+
+    class TestClock:
+        def __init__(self) -> None:
+            self.lock = threading.Lock()
+            self.current = datetime(2026, 9, 16, 12, 0, tzinfo=UTC)
+
+        def now(self) -> datetime:
+            with self.lock:
+                return self.current
+
+        def advance(self, delta: timedelta) -> datetime:
+            with self.lock:
+                self.current += delta
+                return self.current
+
+    clock = TestClock()
+
+    class ClockDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            current = clock.now()
+            return cls(
+                current.year,
+                current.month,
+                current.day,
+                current.hour,
+                current.minute,
+                current.second,
+                current.microsecond,
+                tzinfo=tz,
+            )
+
+    for module in (
+        polymarket_lp_module,
+        polymarket_trading_module,
+        execution_module,
+        store_module,
+        runtime_module,
+    ):
+        monkeypatch.setattr(module, "datetime", ClockDateTime, raising=False)
+
+    monkeypatch.setattr(runtime_module, "_LP_TICK_SECONDS", 0.02)
+    monkeypatch.setattr(runtime_module, "_LP_REWARD_SECONDS", 3600)
+    monkeypatch.setattr(runtime_module, "_LP_BOOK_SAMPLE_SECONDS", 0.02, raising=False)
+    monkeypatch.setattr(
+        runtime_module, "_LP_BOOK_SAMPLE_STOP_GRACE_SECONDS", 0.05, raising=False
+    )
+
+    condition_ids = tuple(f"condition-{index}" for index in range(5))
+    token_by_condition = {
+        condition_id: (f"token-{index}-yes", f"token-{index}-no")
+        for index, condition_id in enumerate(condition_ids)
+    }
+    risk_order_id = "owned-entry-0"
+    risk_order = {
+        "id": risk_order_id,
+        "condition_id": condition_ids[0],
+        "market_id": "market-0",
+        "asset_id": token_by_condition[condition_ids[0]][0],
+        "side": "BUY",
+        "status": "LIVE",
+        "price": Decimal("0.49"),
+        "original_size": Decimal("20"),
+        "size_matched": Decimal("0"),
+        "expiration": int((clock.now() + timedelta(hours=2)).timestamp()),
+    }
+    all_tokens = tuple(
+        token for token_pair in token_by_condition.values() for token in token_pair
+    )
+    source_timestamp = "2026-09-16T11:30:00Z"
+
+    class SamplingProbe:
+        def __init__(self) -> None:
+            self.lock = threading.Lock()
+            self.second_catalog_entered = threading.Event()
+            self.release_second_catalog = threading.Event()
+            self.first_sample_entered = threading.Event()
+            self.release_first_sample = threading.Event()
+            self.second_sample_entered = threading.Event()
+            self.release_second_sample = threading.Event()
+            self.both_slow_reads_held = threading.Event()
+            self.risk_order_read_during_blocks = threading.Event()
+            self.native_catalog_calls = 0
+            self.catalog_active = 0
+            self.catalog_max_active = 0
+            self.sampler_batches: list[tuple[str, ...]] = []
+            self.sampler_calls = 0
+            self.sampler_active = 0
+            self.sampler_max_active = 0
+            self.risk_tick_results: list[object] = []
+            self.risk_session_seeded = False
+            self.write_attempts: list[str] = []
+
+    probe = SamplingProbe()
+
+    rewards = [
+        {
+            "condition_id": condition_id,
+            "rewards_min_size": Decimal("20"),
+            "rewards_max_spread": Decimal("10"),
+            "rewards_config": [
+                {
+                    "id": f"reward-{index}",
+                    "asset_address": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+                    "start_date": "2026-09-15",
+                    "end_date": "2026-09-17",
+                    "rate_per_day": Decimal(index + 1),
+                }
+            ],
+        }
+        for index, condition_id in enumerate(condition_ids)
+    ]
+
+    market_rows = [
+        {
+            "id": f"market-{index}",
+            "condition_id": condition_id,
+            "question": f"Screening market {index}",
+            "slug": f"screening-market-{index}",
+            "events": [],
+            "state": {"accepting_orders": True},
+            "trading": {
+                "minimum_order_size": Decimal("1"),
+                "minimum_tick_size": Decimal("0.01"),
+                "fees_enabled": False,
+            },
+            "rewards": {
+                "rewards_min_size": Decimal("20"),
+                "rewards_max_spread": Decimal("10"),
+            },
+            "outcomes": {
+                "yes": {"label": "YES", "token_id": token_by_condition[condition_id][0]},
+                "no": {"label": "NO", "token_id": token_by_condition[condition_id][1]},
+            },
+        }
+        for index, condition_id in enumerate(condition_ids)
+    ]
+
+    def books_for(token_ids: tuple[str, ...]) -> list[dict[str, object]]:
+        return [
+            {
+                "asset_id": token_id,
+                "timestamp": source_timestamp,
+                "bids": [{"price": "0.49", "size": "30"}],
+                "asks": [{"price": "0.51", "size": "30"}],
+                "min_order_size": "1",
+                "tick_size": "0.01",
+            }
+            for token_id in token_ids
+        ]
+
+    class PublicSDK:
+        def list_current_rewards(self, *, sponsored: bool) -> list[object]:
+            if sponsored:
+                return []
+            with probe.lock:
+                probe.native_catalog_calls += 1
+                call = probe.native_catalog_calls
+                probe.catalog_active += 1
+                probe.catalog_max_active = max(
+                    probe.catalog_max_active, probe.catalog_active
+                )
+            try:
+                if call == 2:
+                    probe.second_catalog_entered.set()
+                    probe.release_second_catalog.wait(timeout=8)
+                return rewards
+            finally:
+                with probe.lock:
+                    probe.catalog_active -= 1
+
+        def list_markets(self, *, condition_ids: tuple[str, ...]) -> list[object]:
+            return [row for row in market_rows if row["condition_id"] in condition_ids]
+
+        def get_market(self, *, id: str) -> object:
+            return next(row for row in market_rows if row["id"] == id)
+
+        def get_order_book(self, *, token_id: str) -> object:
+            return books_for((token_id,))[0]
+
+        def get_order_books(self, *, token_ids: tuple[str, ...]) -> list[object]:
+            requested = tuple(token_ids)
+            if threading.current_thread().name != "prediction-lp-book-sampler":
+                return books_for(requested)
+            with probe.lock:
+                probe.sampler_calls += 1
+                call = probe.sampler_calls
+                probe.sampler_batches.append(requested)
+                probe.sampler_active += 1
+                probe.sampler_max_active = max(
+                    probe.sampler_max_active, probe.sampler_active
+                )
+            try:
+                if call == 1:
+                    probe.first_sample_entered.set()
+                    probe.release_first_sample.wait(timeout=8)
+                elif call == 2:
+                    probe.second_sample_entered.set()
+                    probe.release_second_sample.wait(timeout=8)
+                return books_for(requested)
+            finally:
+                with probe.lock:
+                    probe.sampler_active -= 1
+
+        def close(self) -> None:
+            pass
+
+    class RewardTransport:
+        def get_json(self, _path: str, *, params: dict[str, object]) -> object:
+            return [] if params.get("sponsored") is True else {"data": [], "next_cursor": "LTE="}
+
+    class AccountSDK:
+        def __init__(self) -> None:
+            self.signer = "0x1111111111111111111111111111111111111111"
+            self.wallet = "0x2222222222222222222222222222222222222222"
+            self._ctx = SimpleNamespace(secure_clob=RewardTransport(), wallet_type="EOA")
+            self.environment = SimpleNamespace(standard_exchange="standard-exchange")
+
+        def get_balance_allowance(self, **_kwargs: object) -> dict[str, object]:
+            return {
+                "balance": 100_000_000,
+                "allowances": {"standard-exchange": 100_000_000},
+            }
+
+        def list_open_orders(self, **_kwargs: object) -> list[object]:
+            with probe.lock:
+                seeded = probe.risk_session_seeded
+                if (
+                    seeded
+                    and threading.current_thread().name == "prediction-lp-monitor"
+                    and probe.both_slow_reads_held.is_set()
+                ):
+                    probe.risk_order_read_during_blocks.set()
+            return [risk_order] if seeded else []
+
+        def list_account_trades(self, **_kwargs: object) -> list[object]:
+            return []
+
+        def list_positions(self, **_kwargs: object) -> list[object]:
+            return []
+
+        def is_gasless_ready(self) -> bool:
+            return True
+
+        def get_order_scoring(self, **_kwargs: object) -> bool:
+            return True
+
+        def merge_positions(self, **_kwargs: object) -> None:
+            probe.write_attempts.append("merge")
+
+        def create_limit_order(self, **_kwargs: object) -> None:
+            probe.write_attempts.append("sign_limit")
+
+        def create_market_order(self, **_kwargs: object) -> None:
+            probe.write_attempts.append("sign_market")
+
+        def post_order(self, *_args: object, **_kwargs: object) -> None:
+            probe.write_attempts.append("post")
+
+        def post_orders(self, *_args: object, **_kwargs: object) -> None:
+            probe.write_attempts.append("post_batch")
+
+        def cancel_orders(self, *_args: object, **_kwargs: object) -> None:
+            probe.write_attempts.append("cancel")
+
+    class IdlePublicClient:
+        def list_events(self, **_kwargs: object) -> list[object]:
+            return []
+
+        def close(self) -> None:
+            pass
+
+    class GeoBlockResponse:
+        def __enter__(self) -> GeoBlockResponse:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            pass
+
+        def read(self) -> bytes:
+            return b'{"blocked": false}'
+
+    class TestNotifier:
+        def __init__(self) -> None:
+            self._notifiers = (MacOSNotifier(), FeishuNotifier())
+
+    class MacOSNotifier:
+        pass
+
+    class FeishuNotifier:
+        pass
+
+    account_sdk = AccountSDK()
+    secrets = {
+        "signing-private-key": "test-private-key",
+        "builder-key": "test-builder-key",
+        "builder-secret": "test-builder-secret",
+        "builder-passphrase": "test-builder-passphrase",
+    }
+    monkeypatch.setattr(
+        polymarket_trading_module,
+        "load_keychain_secret",
+        lambda account, **_kwargs: secrets[account],
+    )
+    monkeypatch.setattr(
+        polymarket_trading_module.SecureClient,
+        "create",
+        classmethod(lambda _cls, **_kwargs: account_sdk),
+    )
+    monkeypatch.setattr(polymarket_trading_module, "PublicClient", PublicSDK)
+    monkeypatch.setattr(
+        polymarket_trading_module, "urlopen", lambda *_args, **_kwargs: GeoBlockResponse()
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "PolymarketMonitor",
+        partial(
+            polymarket_monitor_module.PolymarketMonitor,
+            public_client_factory=IdlePublicClient,
+        ),
+    )
+
+    config_path = tmp_path / "prediction.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "signer_address": "0x1111111111111111111111111111111111111111",
+                "wallet_address": "0x2222222222222222222222222222222222222222",
+            }
+        ),
+        encoding="utf-8",
+    )
+    runtime = PredictionRuntime(
+        data_dir=tmp_path,
+        prediction_config_path=config_path,
+        dashboard_url="http://127.0.0.1:8766/",
+        cross_venue_monitor=_UnavailableCrossVenueMonitor("test-disabled"),
+        solver_server_factory=lambda: object(),
+        enable_n_leg_background=False,
+        notifier=TestNotifier(),
+    )
+    server = None
+    server_thread = None
+    store = None
+    lp = None
+    execution = None
+    trading = None
+    try:
+        runtime.start()
+        assert runtime.state == "RUNNING"
+        assert runtime.monitor is not None
+        runtime.monitor.stop()
+        assert runtime.lp is not None
+        assert runtime.store is not None
+        assert runtime.execution is not None
+        lp = runtime.lp
+        store = runtime.store
+        execution = runtime.execution
+        trading = runtime._prediction_trading
+        assert trading is not None
+
+        initial_fact_time = (clock.now() - timedelta(minutes=1)).isoformat().replace(
+            "+00:00", "Z"
+        )
+        store.lp_create_session(
+            "n14-risk-session",
+            "n14-risk-session-idempotency",
+            state="entry_open",
+            payload={
+                "market_id": "market-0",
+                "condition_id": condition_ids[0],
+                "token_id": token_by_condition[condition_ids[0]][0],
+                "outcome": "YES",
+                "price": Decimal("0.49"),
+                "quantity": Decimal("20"),
+                "review_at": (clock.now() + timedelta(hours=1))
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "entry_order_id": risk_order_id,
+                "entry_expiration": risk_order["expiration"],
+                "owned_order_ids": [risk_order_id],
+                "order_history": {
+                    risk_order_id: {
+                        "order_id": risk_order_id,
+                        "token_id": token_by_condition[condition_ids[0]][0],
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "price": Decimal("0.49"),
+                        "original_size": Decimal("20"),
+                        "size_matched": Decimal("0"),
+                    }
+                },
+                "buy_filled_quantity": Decimal("0"),
+                "buy_cost": Decimal("0"),
+                "sold_quantity": Decimal("0"),
+                "sold_revenue": Decimal("0"),
+                "residual_quantity": Decimal("0"),
+                "residual_exit_value": Decimal("0"),
+                "fees": Decimal("0"),
+                "fee_status": "known",
+                "position_reconciled": True,
+                "orders_terminal": False,
+                "entry_cancel_requested": False,
+                "stop_loss_latched": False,
+                "scoring_status": "unknown",
+                "scoring_checked_at": None,
+                "account_checked_at": initial_fact_time,
+                "book_checked_at": initial_fact_time,
+                "reward_date": clock.now().date().isoformat(),
+                "trade_pnl": Decimal("0"),
+                "paid_rewards": Decimal("0"),
+            },
+        )
+        with probe.lock:
+            probe.risk_session_seeded = True
+
+        risk_tick = threading.Event()
+        original_lp_tick = execution.lp_tick
+
+        def track_lp_tick() -> object:
+            result = original_lp_tick()
+            with probe.lock:
+                probe.risk_tick_results.append(result)
+            risk_tick.set()
+            return result
+
+        execution.lp_tick = track_lp_tick  # type: ignore[method-assign]
+
+        deadline = time.monotonic() + 3
+        snapshot = lp.candidate_snapshot()
+        while snapshot.get("scanning") is True and time.monotonic() < deadline:
+            time.sleep(0.01)
+            snapshot = lp.candidate_snapshot()
+        assert snapshot.get("state") == "ready"
+        assert snapshot.get("complete") is True
+        assert snapshot.get("recommendations") == []
+
+        server = create_prediction_server(
+            runtime=runtime,
+            host="127.0.0.1",
+            port=0,
+            runtime_metadata={"git_sha": "n14-test"},
+        )
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        host, port = server.server_address[:2]
+
+        assert probe.first_sample_entered.wait(timeout=3), "sampler did not issue an SDK read"
+        assert probe.sampler_batches[0] == all_tokens
+        assert len(probe.sampler_batches[0]) > 3
+        assert not snapshot["recommendations"]
+
+        assert runtime.queue_lp_candidate_refresh() is True
+        assert probe.second_catalog_entered.wait(timeout=3)
+        assert lp.candidate_snapshot().get("scanning") is True
+        probe.both_slow_reads_held.set()
+        risk_tick.clear()
+        assert risk_tick.wait(timeout=2), "the real LP order-risk tick did not advance"
+        assert probe.risk_order_read_during_blocks.wait(timeout=2)
+        with probe.lock:
+            risk_results = list(probe.risk_tick_results)
+        risk_success = next(
+            (
+                result
+                for result in reversed(risk_results)
+                if isinstance(result, dict) and result.get("state") == "entry_open"
+            ),
+            None,
+        )
+        assert isinstance(risk_success, dict)
+        assert risk_success.get("reconciliation") is None
+        refreshed_session = store.lp_active_session()
+        assert refreshed_session is not None
+        assert refreshed_session["state"] == "entry_open"
+        assert refreshed_session.get("reconciliation") is None
+        assert refreshed_session.get("account_checked_at") != initial_fact_time
+        assert refreshed_session.get("book_checked_at") != initial_fact_time
+
+        started = time.monotonic()
+        with urlopen(
+            f"http://{host}:{port}/api/prediction-arbitrage/lp/dashboard", timeout=2
+        ) as response:
+            dashboard_status = response.status
+            dashboard = json.loads(response.read().decode("utf-8"))
+        assert dashboard_status == 200
+        assert time.monotonic() - started < 1
+        assert isinstance(dashboard.get("recommendations"), list)
+
+        with pytest.raises(RuntimeError, match="cannot start from RUNNING"):
+            runtime.start()
+        assert probe.sampler_calls == 1
+
+        probe.release_second_catalog.set()
+        deadline = time.monotonic() + 3
+        snapshot = lp.candidate_snapshot()
+        while snapshot.get("scanning") is True and time.monotonic() < deadline:
+            time.sleep(0.01)
+            snapshot = lp.candidate_snapshot()
+        assert snapshot.get("state") == "ready"
+        assert snapshot.get("complete") is True
+        assert probe.native_catalog_calls == 2
+        assert probe.catalog_max_active == 1
+
+        base_now = clock.now()
+        sample_since = (base_now - timedelta(hours=1)).isoformat().replace(
+            "+00:00", "Z"
+        )
+        base_now_text = base_now.isoformat().replace("+00:00", "Z")
+        probe.release_first_sample.set()
+        assert probe.second_sample_entered.wait(timeout=3)
+        sampled_by_token = {
+            token_id: store.lp_book_samples(
+                condition_id,
+                token_id,
+                since=sample_since,
+                until=base_now_text,
+            )
+            for condition_id, pair in token_by_condition.items()
+            for token_id in pair
+        }
+        assert all(len(rows) == 1 for rows in sampled_by_token.values())
+        first_rows = {token: rows[0] for token, rows in sampled_by_token.items()}
+        for token, row in first_rows.items():
+            assert row["source_timestamp"] == source_timestamp
+            assert Decimal(str(row["best_bid_price"])) == Decimal("0.49")
+            assert Decimal(str(row["best_ask_price"])) == Decimal("0.51")
+            assert datetime.fromisoformat(
+                str(row["received_at"]).replace("Z", "+00:00")
+            ) == base_now
+
+        advanced_now = clock.advance(timedelta(seconds=5))
+        advanced_now_text = advanced_now.isoformat().replace("+00:00", "Z")
+        _ = lp.candidate_snapshot()
+        retained_by_token = {
+            token_id: store.lp_book_samples(
+                condition_id,
+                token_id,
+                since=sample_since,
+                until=advanced_now_text,
+            )
+            for condition_id, pair in token_by_condition.items()
+            for token_id in pair
+        }
+        assert all(len(rows) == 1 for rows in retained_by_token.values())
+        for token, rows in retained_by_token.items():
+            assert rows[0]["received_at"] == first_rows[token]["received_at"]
+            assert rows[0]["source_timestamp"] == source_timestamp
+        assert probe.sampler_max_active == 1
+
+        with pytest.raises(RuntimeError, match="book sampler thread did not stop"):
+            runtime.stop()
+        assert runtime.state == "STOPPING"
+        assert runtime.lp is lp
+        assert runtime.execution is execution
+        assert runtime._prediction_trading is trading
+        assert runtime.store is store
+        assert probe.sampler_active == 1
+
+        probe.release_second_sample.set()
+        deadline = time.monotonic() + 3
+        while probe.sampler_active and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert probe.sampler_active == 0
+        runtime.stop()
+        assert runtime.state == "STOPPED"
+        assert probe.write_attempts == []
+        after_stop = {
+            token_id: store.lp_book_samples(
+                condition_id,
+                token_id,
+                since=sample_since,
+                until=advanced_now_text,
+            )
+            for condition_id, pair in token_by_condition.items()
+            for token_id in pair
+        }
+        assert all(len(rows) == 1 for rows in after_stop.values())
+    finally:
+        probe.release_second_catalog.set()
+        probe.release_first_sample.set()
+        probe.release_second_sample.set()
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+        if server_thread is not None:
+            server_thread.join(timeout=3)
+        if runtime.state not in {"STOPPED", "NEW"}:
+            runtime.stop()
+
+
+def test_lp_book_sampler_bounds_batches_and_preserves_receipts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import timedelta
+
+    import open_trader.polymarket_trading as polymarket_trading_module
+    from open_trader.polymarket_lp import PolymarketLPService
+    from open_trader.polymarket_trading import PolymarketTradingClient, TradingConfig
+
+    market_count = 401
+    conditions = tuple(f"condition-{index:03d}" for index in range(market_count))
+    token_pairs = tuple(
+        (f"token-{index:03d}-yes", f"token-{index:03d}-no")
+        for index in range(market_count)
+    )
+    expected_tokens = tuple(token for pair in token_pairs for token in pair)
+    token_ordinal = {token: index for index, token in enumerate(expected_tokens)}
+    source_timestamp = "2026-09-16T11:30:00Z"
+    start = datetime(2026, 9, 16, 12, 0, tzinfo=UTC)
+    expected_receipt_seconds = (1, 3, 4, 5, 6, 7, 8, 9, 2)
+    release_order = (0, 8, 1, 2, 3, 4, 5, 6, 7)
+
+    class Probe:
+        def __init__(self) -> None:
+            self.lock = threading.RLock()
+            self.phase = "catalog"
+            self.now = start
+            self.thread_batch = threading.local()
+            self.receipts: dict[int, datetime] = {}
+            self.receipt_seen = [threading.Event() for _ in range(9)]
+            self.read_entered = [threading.Event() for _ in range(9)]
+            self.read_released = [threading.Event() for _ in range(9)]
+            self.eight_reads_entered = threading.Event()
+            self.active_reads = 0
+            self.max_active_reads = 0
+            self.catalog_tokens: list[str] = []
+            self.sampled_tokens: list[str] = []
+            self.sample_batches: dict[int, tuple[str, ...]] = {}
+            self.write_attempts: list[str] = []
+
+        def set_time(self, second: int) -> None:
+            with self.lock:
+                self.now = start + timedelta(seconds=second)
+
+        def receipt_time(self, tz: object = None) -> datetime:
+            with self.lock:
+                moment = self.now
+                batch = getattr(self.thread_batch, "index", None)
+                if self.phase == "sampling" and isinstance(batch, int):
+                    self.receipts[batch] = moment
+                    self.receipt_seen[batch].set()
+                if tz is None:
+                    return moment.replace(tzinfo=None)
+                return moment.astimezone(tz)  # type: ignore[arg-type]
+
+    probe = Probe()
+
+    class AdapterDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return probe.receipt_time(tz)
+
+    monkeypatch.setattr(polymarket_trading_module, "datetime", AdapterDateTime)
+
+    rewards = [
+        {
+            "condition_id": condition_id,
+            "rewards_min_size": Decimal("20"),
+            "rewards_max_spread": Decimal("10"),
+            "rewards_config": [
+                {
+                    "id": f"reward-{index}",
+                    "asset_address": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+                    "start_date": "2026-09-15",
+                    "end_date": "2026-09-17",
+                    "rate_per_day": Decimal("1"),
+                }
+            ],
+        }
+        for index, condition_id in enumerate(conditions)
+    ]
+    markets = [
+        {
+            "id": f"market-{index:03d}",
+            "condition_id": condition_id,
+            "question": f"Batch sampling market {index}",
+            "slug": f"batch-sampling-market-{index}",
+            "events": [],
+            "state": {"accepting_orders": True},
+            "trading": {
+                "minimum_order_size": Decimal("1"),
+                "minimum_tick_size": Decimal("0.01"),
+                "fees_enabled": False,
+            },
+            "rewards": {
+                "rewards_min_size": Decimal("20"),
+                "rewards_max_spread": Decimal("10"),
+            },
+            "outcomes": {
+                "yes": {"label": "YES", "token_id": token_pairs[index][0]},
+                "no": {"label": "NO", "token_id": token_pairs[index][1]},
+            },
+        }
+        for index, condition_id in enumerate(conditions)
+    ]
+
+    class PublicSDK:
+        def list_current_rewards(self, *, sponsored: bool) -> list[object]:
+            return [] if sponsored else rewards
+
+        def list_markets(self, *, condition_ids: object) -> list[object]:
+            requested = set(condition_ids)  # type: ignore[arg-type]
+            return [row for row in markets if row["condition_id"] in requested]
+
+        def get_order_books(self, *, token_ids: tuple[str, ...]) -> list[object]:
+            requested = tuple(token_ids)
+            with probe.lock:
+                if probe.phase != "sampling":
+                    probe.catalog_tokens.extend(requested)
+                    return []
+                assert len(requested) <= 100
+                assert len(requested) == len(set(requested))
+                batch_indices = {token_ordinal[token] // 100 for token in requested}
+                assert len(batch_indices) == 1
+                batch = batch_indices.pop()
+                probe.sampled_tokens.extend(requested)
+                probe.sample_batches[batch] = requested
+                probe.thread_batch.index = batch
+                probe.active_reads += 1
+                probe.max_active_reads = max(
+                    probe.max_active_reads, probe.active_reads
+                )
+                probe.read_entered[batch].set()
+                if probe.active_reads == 8:
+                    probe.eight_reads_entered.set()
+            try:
+                assert probe.read_released[batch].wait(timeout=8)
+                return [
+                    {
+                        "condition_id": conditions[token_ordinal[token] // 2],
+                        "asset_id": token,
+                        "timestamp": source_timestamp,
+                        "bids": [{"price": "0.49", "size": "30"}],
+                        "asks": [{"price": "0.51", "size": "30"}],
+                    }
+                    for token in requested
+                ]
+            finally:
+                with probe.lock:
+                    probe.active_reads -= 1
+
+        def close(self) -> None:
+            pass
+
+    class AccountSDK:
+        environment = SimpleNamespace(standard_exchange="standard-exchange")
+
+        def get_balance_allowance(self, **_kwargs: object) -> dict[str, object]:
+            return {
+                "balance": 100_000_000,
+                "allowances": {"standard-exchange": 100_000_000},
+            }
+
+        def list_open_orders(self, **_kwargs: object) -> list[object]:
+            return []
+
+        def list_account_trades(self, **_kwargs: object) -> list[object]:
+            return []
+
+        def list_positions(self, **_kwargs: object) -> list[object]:
+            return []
+
+        def create_limit_order(self, **_kwargs: object) -> None:
+            probe.write_attempts.append("sign_limit")
+
+        def create_market_order(self, **_kwargs: object) -> None:
+            probe.write_attempts.append("sign_market")
+
+        def post_order(self, *_args: object, **_kwargs: object) -> None:
+            probe.write_attempts.append("post")
+
+        def post_orders(self, *_args: object, **_kwargs: object) -> None:
+            probe.write_attempts.append("post_batch")
+
+        def cancel_order(self, *_args: object, **_kwargs: object) -> None:
+            probe.write_attempts.append("cancel")
+
+        def cancel_orders(self, *_args: object, **_kwargs: object) -> None:
+            probe.write_attempts.append("cancel_batch")
+
+        def merge_positions(self, **_kwargs: object) -> None:
+            probe.write_attempts.append("merge")
+
+    store = PredictionArbitrageStore(tmp_path)
+    trading = PolymarketTradingClient(
+        TradingConfig("signer", "wallet"),
+        AccountSDK(),
+        public_client_factory=PublicSDK,
+    )
+    lp = PolymarketLPService(store, trading, clock=lambda: probe.now)
+    driver: threading.Thread | None = None
+    stop_event = threading.Event()
+    sample_results: list[dict[str, object]] = []
+    try:
+        scan = lp.refresh_candidates(force=True)
+        assert scan["catalog_complete"] is True
+        assert scan["recommendations"] == []
+        assert len(probe.catalog_tokens) == 802
+        assert set(probe.catalog_tokens) == set(expected_tokens)
+
+        with probe.lock:
+            probe.phase = "sampling"
+
+        def sample() -> None:
+            sample_results.append(lp.sample_candidate_books(stop_event=stop_event))
+
+        driver = threading.Thread(target=sample, name="n14b-test-driver")
+        driver.start()
+
+        assert probe.eight_reads_entered.wait(timeout=3), (
+            "sampler did not enter eight bounded SDK readers"
+        )
+        assert all(event.is_set() for event in probe.read_entered[:8])
+        assert probe.read_entered[8].is_set() is False
+        assert probe.max_active_reads == 8
+
+        for offset, batch in enumerate(release_order, start=1):
+            if batch == 8:
+                assert probe.read_entered[8].wait(timeout=3)
+            probe.set_time(offset)
+            probe.read_released[batch].set()
+            assert probe.receipt_seen[batch].wait(timeout=3)
+
+        driver.join(timeout=5)
+        assert driver.is_alive() is False
+        assert len(sample_results) == 1
+        assert sample_results[0]["state"] == "recorded"
+        assert sample_results[0]["sampled_count"] == 802
+        assert probe.max_active_reads == 8
+        assert len(probe.sampled_tokens) == 802
+        assert set(probe.sampled_tokens) == set(expected_tokens)
+        assert probe.sampled_tokens.count("token-000-yes") == 1
+        expected_by_batch = {
+            batch: start + timedelta(seconds=seconds)
+            for batch, seconds in enumerate(expected_receipt_seconds)
+        }
+        assert probe.receipts == expected_by_batch
+
+        for ordinal, (condition_id, pair) in enumerate(zip(conditions, token_pairs, strict=True)):
+            for token in pair:
+                rows = store.lp_book_samples(
+                    condition_id,
+                    token,
+                    since=start,
+                    until=start + timedelta(seconds=9),
+                )
+                assert len(rows) == 1
+                row = rows[0]
+                batch = token_ordinal[token] // 100
+                assert row["condition_id"] == condition_id
+                assert row["token_id"] == token
+                assert row["source_timestamp"] == source_timestamp
+                assert row["received_at"] == expected_by_batch[batch].isoformat(
+                    timespec="microseconds"
+                ).replace("+00:00", "Z")
+                assert Decimal(str(row["best_bid_price"])) == Decimal("0.49")
+                assert Decimal(str(row["best_ask_price"])) == Decimal("0.51")
+        assert ordinal == market_count - 1
+        assert probe.write_attempts == []
+    finally:
+        stop_event.set()
+        for event in probe.read_released:
+            event.set()
+        if driver is not None:
+            driver.join(timeout=8)
+            assert driver.is_alive() is False
