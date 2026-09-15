@@ -18,6 +18,7 @@ import pytest
 from open_trader.prediction_arbitrage import PairIntent, ThresholdHedgeIntent, ThresholdHedgeLeg
 from open_trader.prediction_arbitrage_execution import PredictionExecutionService, _call
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+from open_trader.polymarket_lp import PolymarketLPService
 from open_trader.prediction_title_translation import prediction_title_cache_key
 from open_trader.predict_cross_venue import CrossVenueIntent, CrossVenueLeg
 from open_trader.polymarket_trading import (
@@ -29,6 +30,9 @@ from open_trader.polymarket_trading import (
     ThresholdLegResult,
 )
 from open_trader.predict_trading import PredictLegResult, PredictTradingClient
+from tests.test_polymarket_lp import _Exchange as LPExchange
+from tests.test_polymarket_lp import _request as lp_request
+from tests.test_polymarket_lp import _snapshot as lp_snapshot
 
 
 def _intent() -> PairIntent:
@@ -5866,15 +5870,188 @@ def test_notification_failure_does_not_block_one_leg_risk_work(tmp_path: Path) -
     assert store.unacknowledged_incident() is not None
 
 
-def test_startup_reconciliation_cancels_known_orders_once_and_stays_locked(tmp_path: Path) -> None:
-    service, trading, _, _ = incident_fixture(tmp_path, result="unsafe")
+def test_startup_preserves_orders_and_locks_unresolved_execution(tmp_path: Path) -> None:
+    service, trading, store, _ = incident_fixture(tmp_path, result="unsafe")
+    preview = service.preview("opp-1")
+    execution = store.consume_preview_and_create_execution(
+        str(preview["id"]), "startup-preserve-orders"
+    )
     trading.account_mode = "open_order"
 
-    result = service.reconcile_startup()
+    first = service.reconcile_startup()
 
-    assert result["state"] == "locked"
-    assert trading.cancel_calls == [("open-order",)]
+    assert first["state"] == "locked"
+    assert first["reason"] == "open_orders"
+    assert first["canceled"] == []
+    assert first["remaining"] == ("open-order",)
+    assert trading.account_snapshot().open_order_ids == ("open-order",)
+    incident = store.unacknowledged_incident()
+    assert incident is not None
+    assert incident["execution_id"] == execution["execution_id"]
+    assert incident["phase"] == "startup_open_orders"
+    assert tuple(incident["open_orders"]) == ("open-order",)  # type: ignore[arg-type]
+    assert incident["canceled"] == []
+    assert tuple(incident["remaining"]) == ("open-order",)  # type: ignore[arg-type]
+    assert len(store.histories("incidents")) == 1
+
+    second = service.reconcile_startup()
+
+    assert second["state"] == "locked"
+    assert second["reason"] == "unacknowledged_incident"
+    assert len(store.histories("incidents")) == 1
+    assert trading.cancel_calls == []
+    assert trading.batch_calls == 0
+    assert trading.remediation_calls == []
+    assert trading.merge_calls == 0
     assert service.preview("opp-1")["state"] == "locked"
+
+
+def test_lp_restart_preserves_order_until_original_review(tmp_path: Path) -> None:
+    current = [datetime(2026, 9, 15, 23, 50, tzinfo=UTC)]
+    review_at = datetime(2026, 9, 16, 0, 0, tzinfo=UTC)
+
+    def assert_original_review_at(value: object) -> None:
+        assert isinstance(value, str)
+        assert datetime.fromisoformat(value.replace("Z", "+00:00")) == review_at
+
+    manual_order = {
+        "order_id": "manual-order",
+        "status": "LIVE",
+        "market_id": "manual-market",
+        "condition_id": "manual-condition",
+        "token_id": "manual-token",
+        "side": "BUY",
+        "price": Decimal("0.27"),
+        "original_size": Decimal("10"),
+        "size_matched": Decimal("0"),
+        "remaining_size": Decimal("10"),
+    }
+
+    class RestartExchange(LPExchange):
+        def __init__(self) -> None:
+            super().__init__()
+            self.venue_orders = [dict(manual_order)]
+
+        def lp_snapshot(self, request: dict[str, object]) -> dict[str, object]:
+            snapshot = lp_snapshot(current[0])
+            snapshot["orders"] = [dict(order) for order in self.venue_orders]
+            snapshot["scoring"] = True
+            account = snapshot["account"]
+            assert isinstance(account, dict)
+            account["open_orders"] = [
+                dict(order)
+                for order in self.venue_orders
+                if order["status"] == "LIVE"
+            ]
+            self.snapshot_value = snapshot
+            return super().lp_snapshot(request)
+
+        def post_order(self, signed: dict[str, object]) -> dict[str, object]:
+            response = super().post_order(signed)
+            self.venue_orders.append(
+                {
+                    "order_id": str(response["order_id"]),
+                    "status": "LIVE",
+                    "market_id": "market-1",
+                    "condition_id": "0x" + "c" * 64,
+                    "token_id": str(signed["token_id"]),
+                    "side": "BUY",
+                    "price": signed["price"],
+                    "original_size": signed["quantity"],
+                    "size_matched": Decimal("0"),
+                    "remaining_size": signed["quantity"],
+                }
+            )
+            return response
+
+        def open_orders(self) -> list[dict[str, object]]:
+            return [
+                dict(order)
+                for order in self.venue_orders
+                if order["status"] == "LIVE"
+            ]
+
+    exchange = RestartExchange()
+    trading = IncidentTrading(result="unsafe")
+    store = PredictionArbitrageStore(tmp_path / "data")
+    notifier = CompositeTestNotifier(
+        ChannelNotifier("macos"), ChannelNotifier("feishu")
+    )
+
+    def new_execution() -> PredictionExecutionService:
+        lp = PolymarketLPService(store, exchange, clock=lambda: current[0])
+        return PredictionExecutionService(
+            store=store,
+            monitor=FakeMonitor(_intent()),
+            trading=trading,
+            notifier=notifier,
+            lock_path=tmp_path / "execution.lock",
+            lp=lp,
+        )
+
+    original = new_execution()
+    assert original.reconcile_startup()["state"] == "ready"
+    preview = original.lp_preview(
+        {**lp_request(current[0]), "review_at": review_at}
+    )
+    assert preview["state"] == "previewed"
+    started = original.lp_start(str(preview["preview_id"]), "lp-restart-review")
+    assert started["state"] == "entry_open"
+    session_id = str(started["session_id"])
+    entry_order_id = str(started["entry_order_id"])
+    assert_original_review_at(started["review_at"])
+
+    before_review = new_execution()
+    resumed = before_review.reconcile_startup()
+    assert resumed["state"] == "ready"
+    assert resumed["readiness"] == "lp_active"
+    monitored = before_review.lp_tick()
+    session = before_review.lp_status(session_id)
+    assert monitored["state"] == "entry_open"
+    assert session["session_id"] == session_id
+    assert session["entry_order_id"] == entry_order_id
+    assert_original_review_at(session["review_at"])
+    assert session["scoring_status"] == "true"
+    assert [order["order_id"] for order in exchange.open_orders()] == [
+        "manual-order",
+        entry_order_id,
+    ]
+    assert exchange.cancels == []
+    assert len(exchange.posts) == 1
+
+    current[0] = review_at + timedelta(seconds=1)
+    after_review = new_execution()
+    resumed_after_cutoff = after_review.reconcile_startup()
+    assert resumed_after_cutoff["state"] == "ready"
+    assert resumed_after_cutoff["readiness"] == "lp_active"
+    # Startup keeps the breaker open for its tick; the public monitor tick
+    # applies the original deadline after startup has restored readiness.
+    assert exchange.cancels == []
+
+    reviewed = after_review.lp_tick()
+    assert reviewed["state"] == "review"
+    assert_original_review_at(reviewed["review_at"])
+    assert reviewed["orders_terminal"] is False
+    assert exchange.cancels == [entry_order_id]
+    assert [order["order_id"] for order in exchange.open_orders()] == [
+        "manual-order",
+        entry_order_id,
+    ]
+    assert len(exchange.posts) == 1
+
+    entry_order = next(
+        order for order in exchange.venue_orders
+        if order["order_id"] == entry_order_id
+    )
+    entry_order["status"] = "CANCELED"
+    confirmed = after_review.lp_tick()
+    assert confirmed["state"] == "complete"
+    assert_original_review_at(confirmed["review_at"])
+    assert confirmed["order_history"][entry_order_id]["status"] == "CANCELED"  # type: ignore[index]
+    assert confirmed["orders_terminal"] is True
+    assert [order["order_id"] for order in exchange.open_orders()] == ["manual-order"]
+    assert exchange.cancels == [entry_order_id]
+    assert len(exchange.posts) == 1
 
 
 def test_startup_confirmed_merge_requires_fresh_neutral_post_state(tmp_path: Path) -> None:
@@ -6195,19 +6372,18 @@ def test_reset_breaker_requires_fresh_clean_account_and_acknowledges_incident(
     assert trading.batch_calls == 0
 
 
-def test_startup_incident_without_local_execution_is_durable_and_resettable(tmp_path: Path) -> None:
+def test_startup_incident_without_local_execution_is_not_created(tmp_path: Path) -> None:
     service, trading, store, _ = incident_fixture(tmp_path, result="unsafe")
     trading.account_mode = "open_order"
 
-    locked = service.reconcile_startup()
+    ready = service.reconcile_startup()
 
-    assert locked["state"] == "locked"
-    incidents = store.histories("incidents")
-    assert len(incidents) == 1
-    incident_id = str(incidents[0]["incident_id"])
-    trading.account_mode = "clean"
-    reset = service.reset_breaker(incident_id)
-    assert reset["state"] == "ready"
+    assert ready["state"] == "ready"
+    assert ready["readiness"] == "fresh"
+    assert trading.account_snapshot().open_order_ids == ("open-order",)
+    assert trading.cancel_calls == []
+    assert store.histories("incidents") == []
+    assert store.active_execution() is None
 
 
 def test_startup_incident_with_known_holdings_resets_without_db_hand_editing(
@@ -6215,6 +6391,18 @@ def test_startup_incident_with_known_holdings_resets_without_db_hand_editing(
 ) -> None:
     service, trading, store, _ = incident_fixture(tmp_path, result="unsafe")
     holding_execution_id = seed_threshold_holding(service, store, "gta-replay-holding")
+    active_preview_id = store.create_preview(
+        {
+            "opportunity_id": "startup-known-holding-recovery",
+            "intent_type": "threshold_hedge",
+            "market_type": "threshold_hedge",
+            "intent": service._intent_payload(_threshold_intent()),
+        },
+        expires_at=(datetime.now(UTC) + timedelta(seconds=5)).isoformat(),
+    )
+    active_execution = store.consume_preview_and_create_execution(
+        active_preview_id, "startup-known-holding-recovery"
+    )
     trading.account_mode = "open_order"
 
     locked = service.reconcile_startup()
@@ -6225,6 +6413,8 @@ def test_startup_incident_with_known_holdings_resets_without_db_hand_editing(
     incident = incidents[0]
     incident_id = str(incident["incident_id"])
     recovery_execution_id = str(incident["execution_id"])
+    assert recovery_execution_id == active_execution["execution_id"]
+    assert trading.cancel_calls == []
     trading.account_mode = "known_holding_pair"
 
     result = service.reset_breaker(incident_id)

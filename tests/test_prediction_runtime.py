@@ -335,6 +335,243 @@ def test_runtime_owner_lock_rejects_a_second_owner_until_release(
     second.release()
 
 
+def test_restart_preserves_manual_orders_and_resumes_monitoring(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.polymarket_monitor as monitor_module
+    import open_trader.prediction_runtime as runtime_module
+
+    account_orders = [
+        {
+            "id": "manual-no-order",
+            "market": "condition-no",
+            "asset_id": "no-token",
+            "outcome": "NO",
+            "side": "BUY",
+            "status": "LIVE",
+            "price": Decimal("0.36"),
+            "original_size": Decimal("100"),
+            "size_matched": Decimal("0"),
+        },
+        {
+            "id": "manual-yes-order",
+            "market": "condition-yes",
+            "asset_id": "yes-token",
+            "outcome": "YES",
+            "side": "BUY",
+            "status": "LIVE",
+            "price": Decimal("0.27"),
+            "original_size": Decimal("100"),
+            "size_matched": Decimal("0"),
+        },
+    ]
+    mutations: list[tuple[str, object]] = []
+    config = SimpleNamespace(
+        signer_address="0x1111111111111111111111111111111111111111",
+        wallet_address="0x2222222222222222222222222222222222222222",
+        predict=None,
+    )
+
+    class FakeTrading:
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "wallet_address": config.wallet_address,
+                "p_usd_balance": Decimal("100"),
+                "p_usd_allowance": Decimal("100"),
+                "open_order_ids": tuple(str(row["id"]) for row in account_orders),
+                "positions": (),
+                "checked_at": datetime.now(UTC),
+            }
+
+        def readiness_snapshot(self) -> dict[str, object]:
+            return {
+                "relayer_ready": "ready",
+                "merge_ready": "ready",
+                "geoblock": "allowed",
+                "checked_at": datetime.now(UTC),
+            }
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "balance": Decimal("100"),
+                "allowance": Decimal("100"),
+                "open_orders": tuple(dict(row) for row in account_orders),
+                "positions": (),
+                "checked_at": datetime.now(UTC),
+            }
+
+        def get_order_scoring(self, _order_id: str) -> bool:
+            return False
+
+        def lp_reward_snapshot(
+            self, reward_date: str, condition_id: str
+        ) -> dict[str, object]:
+            return {
+                "state": "unknown",
+                "reward_date": reward_date,
+                "condition_id": condition_id,
+            }
+
+        def lp_reward_catalog(self, *, stop_event: threading.Event | None = None) -> dict[str, object]:
+            del stop_event
+            return {
+                "state": "known",
+                "complete": True,
+                "markets": [],
+                "checked_at": datetime.now(UTC),
+            }
+
+        def cancel_orders(self, order_ids: tuple[str, ...]) -> tuple[str, ...]:
+            mutations.append(("cancel", order_ids))
+            account_orders[:] = [
+                row for row in account_orders if str(row["id"]) not in order_ids
+            ]
+            return order_ids
+
+        def submit_pair_once(self, *_args: object, **_kwargs: object) -> None:
+            mutations.append(("submit_pair", None))
+
+        def submit_threshold_hedge_once(
+            self, *_args: object, **_kwargs: object
+        ) -> None:
+            mutations.append(("submit_threshold", None))
+
+        def create_limit_order(self, **_kwargs: object) -> None:
+            mutations.append(("create_limit_order", None))
+
+        def post_order(self, _signed: object) -> None:
+            mutations.append(("post_order", None))
+
+        def submit_protected_sell(self, **_kwargs: object) -> None:
+            mutations.append(("submit_protected_sell", None))
+
+        def close(self) -> None:
+            pass
+
+    class FakeStream:
+        async def __anext__(self) -> object:
+            await asyncio.sleep(10)
+            raise StopAsyncIteration
+
+        async def close(self) -> None:
+            pass
+
+    class FakePublicClient:
+        async def list_events(self, **_kwargs: object) -> list[object]:
+            return [
+                {
+                    "id": "test-event",
+                    "title": "Test event",
+                    "slug": "test-event",
+                    "state": {"active": True, "closed": False, "ended": False},
+                    "metrics": {"volume_24hr": Decimal("1000")},
+                    "markets": [
+                        {
+                            "id": "test-market",
+                            "condition_id": "test-condition",
+                            "question": "Test question",
+                            "slug": "test-market",
+                            "state": {
+                                "active": True,
+                                "closed": False,
+                                "accepting_orders": True,
+                                "enable_order_book": True,
+                                "neg_risk": False,
+                            },
+                            "outcomes": [
+                                {"label": "YES", "token_id": "book-yes"},
+                                {"label": "NO", "token_id": "book-no"},
+                            ],
+                            "trading": {
+                                "minimum_order_size": Decimal("1"),
+                                "minimum_tick_size": Decimal("0.01"),
+                                "fees_enabled": False,
+                                "neg_risk": False,
+                            },
+                        }
+                    ],
+                }
+            ]
+
+        async def get_order_books(self, **_kwargs: object) -> list[object]:
+            return []
+
+        async def subscribe(self, *_args: object, **_kwargs: object) -> FakeStream:
+            return FakeStream()
+
+        async def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(runtime_module, "load_trading_config", lambda _path: config)
+    monkeypatch.setattr(
+        runtime_module,
+        "PolymarketTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: FakeTrading()),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "PredictTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: None),
+    )
+    monkeypatch.setattr(monitor_module, "AsyncPublicClient", FakePublicClient)
+
+    expected_orders = [
+        ("manual-no-order", "BUY", "0.36", "100", "manual_read_only", True),
+        ("manual-yes-order", "BUY", "0.27", "100", "manual_read_only", True),
+    ]
+    observations: list[dict[str, object]] = []
+    for _ in range(2):
+        runtime = PredictionRuntime(
+            data_dir=tmp_path,
+            prediction_config_path=tmp_path / "prediction.json",
+            dashboard_url="http://127.0.0.1:8766/",
+            notifier=SimpleNamespace(
+                _notifiers=(SimpleNamespace(channel="macos"), SimpleNamespace(channel="feishu"))
+            ),
+            cross_venue_monitor=_UnavailableCrossVenueMonitor("test-disabled"),
+            solver_server_factory=lambda: object(),
+            enable_n_leg_background=False,
+        )
+        try:
+            runtime.start()
+            assert runtime.store is not None
+            assert runtime.execution is not None
+            dashboard = runtime.execution.lp_dashboard()
+            observations.append(
+                {
+                    "state": runtime.state,
+                    "dashboard_state": dashboard["state"],
+                    "stale": dashboard["stale"],
+                    "orders": [
+                        (
+                            str(row["order_id"]),
+                            str(row["side"]),
+                            str(row["price"]),
+                            str(row["quantity"]),
+                            str(row["management"]),
+                            row["read_only"],
+                        )
+                        for row in dashboard["orders"]
+                    ],
+                    "incidents": len(runtime.store.histories("incidents")),
+                }
+            )
+        finally:
+            if runtime.state not in {"NEW", "STOPPED"}:
+                runtime.stop()
+
+    expected = {
+        "state": "RUNNING",
+        "dashboard_state": "ready",
+        "stale": False,
+        "orders": expected_orders,
+        "incidents": 0,
+    }
+    assert observations == [expected, expected]
+    assert mutations == []
+
+
 def test_lp_restart_owns_one_session_and_preserves_monitoring(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

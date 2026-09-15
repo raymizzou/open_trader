@@ -2391,9 +2391,8 @@ class PredictionExecutionService:
             return {"state": "locked", "reason": "unacknowledged_incident"}
 
         # An LP session owns its target order and inventory across process
-        # restarts.  Reconcile it before the legacy startup cleanup below so
-        # a still-live LP order is never mistaken for a foreign order and
-        # canceled by the pair-execution recovery path.
+        # restarts. Reconcile it before the legacy execution/account checks so
+        # its session-specific recovery runs first.
         lp_active_reader = getattr(self._store, "lp_active_session", None)
         lp_active = lp_active_reader() if callable(lp_active_reader) else None
         if lp_active is not None:
@@ -2456,25 +2455,12 @@ class PredictionExecutionService:
             self._startup_incident("", "residual_predict_allowance", evidence)
             return {"state": "locked", "reason": "residual_predict_allowance", **evidence}
         open_orders = self._order_ids(snapshot.get("open_order_ids", ()))
-        if open_orders:
-            cancel = getattr(self._trading, "cancel_orders", None)
-            try:
-                canceled = _call(cancel, tuple(open_orders))
-            except Exception:
-                canceled = ()
-            # A cancel response is not proof that the venue has settled the
-            # account.  Re-read the complete account snapshot with freshness
-            # validation before deciding whether the startup incident is
-            # contained.
-            after_cancel = self._fresh_account_snapshot()
-            remaining = self._order_ids(
-                after_cancel.get("open_order_ids", ()) if after_cancel else open_orders
-            )
+        if active is not None and open_orders:
             evidence = {
                 "phase": "startup_open_orders",
                 "open_orders": open_orders,
-                "canceled": self._safe_sequence(canceled),
-                "remaining": remaining,
+                "canceled": [],
+                "remaining": open_orders,
             }
             self._startup_incident(
                 active_id,

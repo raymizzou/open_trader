@@ -5,6 +5,13 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-15
 
+- Startup reconciliation now leaves live account orders untouched when no
+  local execution needs recovery, allowing a clean restart to resume
+  monitoring. Unresolved executions remain locked with durable outstanding
+  order evidence, and LP sessions retain their owner-only original Beijing
+  08:00 review and existing scoring/stop-loss protections. Verified with the
+  restart cases and focused affected regression; no live orders or deployment
+  were performed.
 - Extended the existing LP trial card with separate refreshing orders/holdings
   and eligible recommendations, ranked by daily reward pool. Candidate
   confirmation rechecks the current best bid, minimum qualifying size, funds
