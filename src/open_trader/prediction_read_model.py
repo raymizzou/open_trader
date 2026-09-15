@@ -2199,10 +2199,12 @@ def prediction_state_payload(
     if isinstance(observation_snapshot, Mapping):
         coverage = observation_snapshot.get("coverage")
         if isinstance(coverage, Mapping):
-            result["n_leg_coverage"] = dict(
-                _prediction_safe_value(coverage)
-                if isinstance(_prediction_safe_value(coverage), Mapping)
-                else {}
+            public_coverage = {
+                key: value for key, value in coverage.items() if key != "exclusions"
+            }
+            safe_coverage = _prediction_safe_value(public_coverage)
+            result["n_leg_coverage"] = (
+                dict(safe_coverage) if isinstance(safe_coverage, Mapping) else {}
             )
         else:
             latest = observation_snapshot.get("latest")
@@ -2211,7 +2213,81 @@ def prediction_state_payload(
                 safe_projected = _prediction_safe_value(projected)
                 if isinstance(safe_projected, Mapping):
                     result["n_leg_coverage"] = dict(safe_projected)
-        safe_observation = _prediction_safe_value(observation_snapshot)
+
+        latest = observation_snapshot.get("latest")
+        excluded_stages = {"EXCLUDED", "REJECTED", "INVALID"}
+        excluded_identities: set[str] = set()
+
+        def excluded_stage(row: object) -> bool:
+            return (
+                isinstance(row, Mapping)
+                and str(row.get("stage") or "").upper() in excluded_stages
+            )
+
+        def excluded_row(row: object, identity: object = None) -> bool:
+            if identity not in (None, "") and str(identity) in excluded_identities:
+                return True
+            if not isinstance(row, Mapping):
+                return False
+            row_identity = row.get("identity")
+            return excluded_stage(row) or (
+                row_identity not in (None, "")
+                and str(row_identity) in excluded_identities
+            )
+
+        if isinstance(latest, Mapping):
+            for identity, row in latest.items():
+                if excluded_stage(row):
+                    row_identity = row.get("identity")
+                    excluded_identities.add(
+                        str(row_identity if row_identity not in (None, "") else identity)
+                    )
+        elif isinstance(latest, (list, tuple)):
+            for row in latest:
+                if excluded_stage(row):
+                    identity = row.get("identity")
+                    if identity not in (None, ""):
+                        excluded_identities.add(str(identity))
+
+        def filtered_rows(rows: object) -> object:
+            if isinstance(rows, Mapping):
+                return {
+                    identity: row
+                    for identity, row in rows.items()
+                    if not excluded_row(row, identity)
+                }
+            if isinstance(rows, (list, tuple)):
+                visible = [row for row in rows if not excluded_row(row)]
+                return tuple(visible) if isinstance(rows, tuple) else visible
+            return rows
+
+        projected_coverage = result.get("n_leg_coverage")
+        if isinstance(projected_coverage, Mapping):
+            response_coverage = dict(projected_coverage)
+            if "ranking" in response_coverage:
+                response_coverage["ranking"] = filtered_rows(
+                    response_coverage["ranking"]
+                )
+            result["n_leg_coverage"] = response_coverage
+
+        response_observation = dict(observation_snapshot)
+        for key in ("latest", "members", "results"):
+            if key in response_observation:
+                response_observation[key] = filtered_rows(response_observation[key])
+        nested_coverage = response_observation.get("coverage")
+        if isinstance(nested_coverage, Mapping):
+            response_coverage = {
+                key: value
+                for key, value in nested_coverage.items()
+                if key != "exclusions"
+            }
+            if "ranking" in response_coverage:
+                response_coverage["ranking"] = filtered_rows(
+                    response_coverage["ranking"]
+                )
+            response_observation["coverage"] = response_coverage
+
+        safe_observation = _prediction_safe_value(response_observation)
         if isinstance(safe_observation, Mapping):
             result["n_leg_observation"] = dict(safe_observation)
     if shadow_summary["monitoring"]:

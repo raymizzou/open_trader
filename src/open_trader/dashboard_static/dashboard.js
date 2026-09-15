@@ -977,7 +977,7 @@ function scheduleAccountPolling() {
 }
 
 async function loadAccountSnapshot() {
-  if (state.accountRequestInFlight) {
+  if (state.workspaceView === "prediction_market" || state.accountRequestInFlight) {
     return;
   }
   state.accountRequestInFlight = true;
@@ -1032,6 +1032,7 @@ function renderDashboard() {
 }
 
 function setWorkspaceView(view) {
+  const previousView = state.workspaceView;
   state.workspaceView = WORKSPACE_VIEWS.has(view) ? view : "portfolio";
   renderWorkspaceChrome();
   if (state.workspaceView === "kelly_lab") renderKellyLab();
@@ -1039,10 +1040,10 @@ function setWorkspaceView(view) {
     renderPredictionMarket();
     fetchPredictionState();
     startPredictionPolling();
-    startPredictionSignalPolling();
   } else {
     stopPredictionPolling();
     stopPredictionSignalPolling();
+    if (previousView === "prediction_market") loadAccountSnapshot();
   }
 }
 
@@ -4604,10 +4605,6 @@ async function fetchPredictionState() {
     state.predictionMarket.stateRequestInFlight = false;
   }
   renderPredictionMarket();
-  const kind = state.predictionMarket.historyKind;
-  if (state.predictionMarket.payload && !Array.isArray(state.predictionMarket.payload.histories?.[kind]) && (kind !== "signals" || !state.predictionMarket.signalRequestInFlight)) {
-    loadPredictionHistory(kind);
-  }
 }
 
 async function loadPredictionHistory(kind, options = {}) {

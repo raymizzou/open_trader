@@ -9,6 +9,7 @@ import pytest
 from open_trader.prediction_market_solution import MarketSolution
 from open_trader.prediction_n_leg import ActionQuantity, canonical_payload, fingerprint
 from open_trader.prediction_n_leg_read_model import project_observation_coverage
+from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 from open_trader.prediction_read_model import (
     prediction_history_payload,
     prediction_state_payload,
@@ -1421,3 +1422,134 @@ def test_coverage_counts_and_qualification_are_separate() -> None:
     )
     assert installed["subscribed_tokens"] == 5
     assert installed["all_leg_subscribed_count"] == 2
+
+
+@pytest.mark.parametrize(
+    "cached_coverage", [True, False], ids=["cached-coverage", "fallback-coverage"]
+)
+def test_state_omits_excluded_observation_details_without_changing_counts(
+    tmp_path, cached_coverage: bool
+) -> None:
+    pool = {
+        "identity": "pool",
+        "stage": "OBSERVING",
+        "title": "Pool latest title",
+        "result": {"status": "PASS", "current": True, "net_roi": "0.12"},
+    }
+    waiting = {
+        "identity": "waiting",
+        "stage": "WAITING",
+        "title": "Waiting latest title",
+        "result": {"status": "WAITING", "reason": "not assigned"},
+    }
+    latest = [
+        pool,
+        waiting,
+        {"identity": "excluded", "stage": "EXCLUDED", "title": "Excluded latest title"},
+        {"identity": "rejected", "stage": "REJECTED", "title": "Rejected latest title"},
+        {"identity": "invalid", "stage": "INVALID", "title": "Invalid latest title"},
+    ]
+    pool_member = {
+        "identity": "pool", "stage": "OBSERVING", "title": "Pool member title"
+    }
+    excluded_member = {
+        "identity": "excluded",
+        "stage": "OBSERVING",
+        "title": "Old excluded member",
+    }
+    pool_result = {
+        "identity": "pool", "title": "Pool result title", "status": "PASS"
+    }
+    excluded_result = {
+        "identity": "excluded",
+        "title": "Old excluded result",
+        "status": "PASS",
+    }
+    snapshot: dict[str, object] = {
+        "status": "READY",
+        "generation": 17,
+        "latest": latest,
+        "members": [pool_member, excluded_member],
+        "results": [pool_result, excluded_result],
+    }
+    coverage = {
+        "status": "READY",
+        "generation": 17,
+        "latest_count": 5,
+        "pool_count": 1,
+        "waiting_count": 1,
+        "excluded_count": 3,
+        "ranking": [
+            {
+                "identity": "pool",
+                "title": "Pool ranking title",
+                "net_roi": "0.12",
+                "rank": 1,
+            },
+            {
+                "identity": "excluded",
+                "title": "Excluded ranking title",
+                "net_roi": "9.99",
+                "rank": 2,
+            },
+        ],
+        "exclusions": {
+            "excluded": ["EXCLUDED"],
+            "rejected": ["REJECTED"],
+            "invalid": ["INVALID"],
+        },
+    }
+    if cached_coverage:
+        snapshot["coverage"] = coverage
+    original = json.loads(json.dumps(snapshot))
+
+    state = prediction_state_payload(
+        store=PredictionArbitrageStore(tmp_path / "state"),
+        monitor=None,
+        execution=None,
+        csrf_token="test",
+        observation_snapshot=snapshot,
+    )
+
+    observation = state["n_leg_observation"]
+    assert [row["identity"] for row in observation["latest"]] == ["pool", "waiting"]
+    assert observation["latest"] == [pool, waiting]
+    assert observation["members"] == [pool_member]
+    assert observation["results"] == [pool_result]
+    projected_coverage = state["n_leg_coverage"]
+    assert projected_coverage["latest_count"] == 5
+    assert projected_coverage["pool_count"] == 1
+    assert projected_coverage["waiting_count"] == 1
+    assert projected_coverage["excluded_count"] == 3
+    assert "exclusions" not in projected_coverage
+    assert observation["status"] == "READY"
+    assert observation["generation"] == 17
+    if cached_coverage:
+        assert projected_coverage["status"] == "READY"
+        assert projected_coverage["generation"] == 17
+        assert observation["coverage"]["status"] == "READY"
+        assert observation["coverage"]["generation"] == 17
+        assert observation["coverage"]["latest_count"] == 5
+        assert observation["coverage"]["pool_count"] == 1
+        assert observation["coverage"]["waiting_count"] == 1
+        assert observation["coverage"]["excluded_count"] == 3
+        assert "exclusions" not in observation["coverage"]
+        expected_ranking = [
+            {
+                "identity": "pool",
+                "title": "Pool ranking title",
+                "net_roi": "0.12",
+                "rank": 1,
+            }
+        ]
+        assert projected_coverage["ranking"] == expected_ranking
+        assert observation["coverage"]["ranking"] == expected_ranking
+    else:
+        assert "coverage" not in observation
+        assert all(
+            row.get("identity") != "excluded"
+            for row in projected_coverage["ranking"]
+        )
+    assert snapshot == original
+    if cached_coverage:
+        assert snapshot["coverage"]["exclusions"] == original["coverage"]["exclusions"]

@@ -7629,6 +7629,208 @@ console.log(JSON.stringify({inFlight: state.predictionMarket.signalRequestInFlig
     assert json.loads(output) == {"inFlight": True, "epoch": 1}
 
 
+def test_prediction_unified_workspace_does_not_request_hidden_history() -> None:
+    output = run_dashboard_js(r'''
+class Element {
+  constructor(){this.dataset={};this.hidden=false;this.innerHTML="";this.textContent="";this.style={};this.attributes={};
+    this.classList={toggle(){},add(){},remove(){}};}
+  addEventListener(){}
+  setAttribute(name,value){this.attributes[name]=value;}
+  removeAttribute(name){delete this.attributes[name];}
+  querySelector(){return null;}
+  querySelectorAll(){return [];}
+}
+const nodes = {};
+document.getElementById = (id) => nodes[id] || (nodes[id] = new Element());
+document.querySelector = () => nodes["workspace-grid"] || (nodes["workspace-grid"] = new Element());
+document.body = new Element();
+bindElements();
+const timers = new Map();
+const clearedTimers = [];
+let nextTimerId = 0;
+const timeouts = new Map();
+let nextTimeoutId = 0;
+globalThis.window = {
+  location: {search:"", pathname:"/", hash:""},
+  setInterval(callback, delay) { const id = ++nextTimerId; timers.set(id, {callback, delay}); return id; },
+  clearInterval(id) { clearedTimers.push(id); timers.delete(id); },
+  setTimeout(callback, delay) { const id = ++nextTimeoutId; timeouts.set(id, {callback, delay}); return id; },
+  clearTimeout(id) { timeouts.delete(id); },
+};
+globalThis.AbortController = class { constructor(){this.signal={};} abort(){} };
+const requests = [];
+const healthyState = {
+  status: "healthy",
+  health: {status:"healthy", degraded_reasons:[]},
+  qualified_opportunities: [{
+    opportunity_id: "visible-opportunity",
+    title: "Visible opportunity",
+    strategy_type: "yes_no",
+    relation_type: "NATIVE_COMPLEMENT",
+    leg_count: 2,
+    scope_label: "同所 · 同事件",
+    profit: "1.00",
+    annualized_yield: "0.20",
+    remaining_days: "5",
+    qualification: {status:"QUALIFIED_VERIFIED", order_ready:false, checks:[]},
+  }],
+  n_leg_coverage: {status:"READY", source_scope:"fixture source", generation:7, capacity:"1/40", latest_count:1},
+  n_leg_observation: {status:"READY", latest:[{
+    identity:"visible-observation",
+    stage:"OBSERVING",
+    in_pool:true,
+    title:"Visible observation",
+    result:{current:true, status:"PASS", net_roi:"0.12", net_amount:"1.00", cost:"5.00", payout:"6.00"},
+  }]},
+};
+const readOnlyLpDashboard = {orders:[], positions:[], candidates:[], complete:true};
+globalThis.fetch = (url, init = {}) => {
+  requests.push({url, method:init.method || "GET"});
+  if (url === "/api/prediction-arbitrage/state") {
+    return Promise.resolve({ok:true, json:async()=>healthyState});
+  }
+  if (url === "/api/prediction-arbitrage/lp/dashboard") {
+    return Promise.resolve({ok:true, json:async()=>readOnlyLpDashboard});
+  }
+  if (url === "/api/v1/account/snapshot") {
+    return Promise.resolve({ok:true, status:200, headers:{get:()=> '"account-v1"'}, json:async()=>({
+      status:"healthy", stale:false, generated_at:"2026-09-15T00:00:00Z",
+      summary:{portfolio_value_hkd:"100000", holding_value_hkd:"0", holding_weight_hkd:"0",
+        cash_like_value_hkd:"100000", cash_like_weight_hkd:"100%", holding_count:"0", broker_count:"0"},
+      broker_summaries:[], positions:[], cash_balances:[], sources:{quotes:{status:"healthy"}},
+    })});
+  }
+  if (url.startsWith("/api/prediction-arbitrage/history")) {
+    return Promise.resolve({ok:true, json:async()=>({items:[]})});
+  }
+  return Promise.reject(new Error("Unexpected request: " + url));
+};
+const drainRequests = async () => { for (let turn = 0; turn < 12; turn += 1) await Promise.resolve(); };
+setWorkspaceView("prediction_market");
+await drainRequests();
+await Promise.all([...timers.values()].map(({callback})=>callback()));
+await drainRequests();
+const rendered = elements["prediction-market-root"].innerHTML;
+const scheduledTimers = [...timers.keys()];
+setWorkspaceView("portfolio");
+await drainRequests();
+console.log(JSON.stringify({requests, rendered, scheduledTimers, clearedTimers, activeTimers:[...timers.keys()]}));
+''')
+    result = json.loads(output)
+
+    assert any(
+        request["url"] == "/api/prediction-arbitrage/state" and request["method"] == "GET"
+        for request in result["requests"]
+    )
+    assert any(
+        request["url"] == "/api/prediction-arbitrage/lp/dashboard" and request["method"] == "GET"
+        for request in result["requests"]
+    )
+    assert not any("/api/prediction-arbitrage/history" in request["url"] for request in result["requests"])
+    assert "流动性提供试验" in result["rendered"]
+    assert "Visible opportunity" in result["rendered"]
+    assert "Visible observation" in result["rendered"]
+    assert result["scheduledTimers"]
+    assert set(result["scheduledTimers"]).issubset(set(result["clearedTimers"]))
+    assert result["activeTimers"] == []
+
+
+def test_prediction_workspace_pauses_account_polling_and_resumes_on_exit() -> None:
+    output = run_dashboard_js(r'''
+class Element {
+  constructor(){this.dataset={};this.hidden=false;this.innerHTML="";this.textContent="";this.style={};this.attributes={};
+    this.classList={toggle(){},add(){},remove(){}};}
+  addEventListener(){}
+  setAttribute(name,value){this.attributes[name]=value;}
+  removeAttribute(name){delete this.attributes[name];}
+  querySelector(){return null;}
+  querySelectorAll(){return [];}
+}
+const nodes={};
+document.getElementById=(id)=>nodes[id]||(nodes[id]=new Element());
+document.querySelector=()=>nodes["workspace-grid"]||(nodes["workspace-grid"]=new Element());
+document.body=new Element();
+bindElements();
+const intervals=new Map();
+const intervalRegistrations=[];
+const timeouts=new Map();
+let nextIntervalId=0;
+let nextTimeoutId=0;
+globalThis.window={
+  location:{search:"",pathname:"/",hash:""},
+  setInterval(callback,delay){const id=++nextIntervalId;intervals.set(id,{callback,delay});intervalRegistrations.push(id);return id;},
+  clearInterval(id){intervals.delete(id);},
+  setTimeout(callback,delay){const id=++nextTimeoutId;timeouts.set(id,{callback,delay});return id;},
+  clearTimeout(id){timeouts.delete(id);},
+};
+globalThis.AbortController=class {constructor(){this.signal={};}abort(){}};
+const requests=[];
+let accountGets=0;
+const healthyState={status:"healthy",health:{status:"healthy",degraded_reasons:[]},qualified_opportunities:[],
+  n_leg_coverage:{status:"READY",latest_count:0},n_leg_observation:{status:"READY",latest:[]}};
+const lpDashboard={orders:[],positions:[],candidates:[],complete:true};
+globalThis.fetch=async(url,init={})=>{
+  requests.push({url,headers:init.headers||{}});
+  if(url==="/api/v1/account/snapshot"){
+    accountGets+=1;
+    const portfolioValue=accountGets===1?"100000":accountGets===2?"234567":"345678";
+    return {ok:true,status:200,headers:{get:(name)=>name==="ETag"?'"ordinary-account-v1"':null},
+      json:async()=>({status:"healthy",stale:false,generated_at:`snapshot-${accountGets}`,
+        summary:{portfolio_value_hkd:portfolioValue,holding_value_hkd:"0",holding_weight_hkd:"0",
+          cash_like_value_hkd:portfolioValue,cash_like_weight_hkd:"100%",holding_count:"0",broker_count:"0"},
+        broker_summaries:[],positions:[],cash_balances:[],sources:{quotes:{status:"healthy"}}})};
+  }
+  if(url==="/api/prediction-arbitrage/state")return {ok:true,json:async()=>healthyState};
+  if(url==="/api/prediction-arbitrage/lp/dashboard")return {ok:true,json:async()=>lpDashboard};
+  throw new Error("Unexpected request: "+url);
+};
+const drainRequests=async()=>{for(let turn=0;turn<16;turn+=1)await Promise.resolve();};
+const count=(url)=>requests.filter((request)=>request.url===url).length;
+scheduleAccountPolling();
+await drainRequests();
+const portfolioAccountGets=count("/api/v1/account/snapshot");
+const portfolioIntervals=intervalRegistrations.length;
+setWorkspaceView("prediction_market");
+await drainRequests();
+await Promise.all([...intervals.values()].map(({callback})=>callback()));
+await drainRequests();
+const accountGetsDuringPrediction=count("/api/v1/account/snapshot");
+const stateGetsDuringPrediction=count("/api/prediction-arbitrage/state");
+const lpGetsDuringPrediction=count("/api/prediction-arbitrage/lp/dashboard");
+const predictionIntervals=intervalRegistrations.length;
+setWorkspaceView("portfolio");
+await drainRequests();
+const accountGetsAfterExit=count("/api/v1/account/snapshot");
+const summaryOnReturn=nodes["summary-value"].textContent;
+const accountRequests=requests.filter((request)=>request.url==="/api/v1/account/snapshot");
+const exitEtag=accountRequests[1]?.headers["If-None-Match"]||"";
+const activeIntervalsAfterExit=intervals.size;
+const intervalsAfterExit=intervalRegistrations.length;
+await Promise.all([...intervals.values()].map(({callback})=>callback()));
+await drainRequests();
+const resumedTickAccountGets=count("/api/v1/account/snapshot");
+const resumedTickEtag=requests.filter((request)=>request.url==="/api/v1/account/snapshot")[2]?.headers["If-None-Match"]||"";
+console.log(JSON.stringify({portfolioAccountGets,accountGetsDuringPrediction,stateGetsDuringPrediction,
+  lpGetsDuringPrediction,accountGetsAfterExit,resumedTickAccountGets,exitEtag,resumedTickEtag,
+  summaryOnReturn,portfolioIntervals,predictionIntervals,intervalsAfterExit,activeIntervalsAfterExit}));
+''')
+    rendered = json.loads(output)
+
+    assert rendered["portfolioAccountGets"] == 1
+    assert rendered["accountGetsDuringPrediction"] == 1
+    assert rendered["stateGetsDuringPrediction"] == 2
+    assert rendered["lpGetsDuringPrediction"] == 1
+    assert rendered["accountGetsAfterExit"] == 2
+    assert rendered["resumedTickAccountGets"] == 3
+    assert rendered["exitEtag"] == '"ordinary-account-v1"'
+    assert rendered["resumedTickEtag"] == '"ordinary-account-v1"'
+    assert rendered["summaryOnReturn"] == "HKD 234,567"
+    assert rendered["portfolioIntervals"] == 1
+    assert rendered["predictionIntervals"] == 2
+    assert rendered["intervalsAfterExit"] == 2
+    assert rendered["activeIntervalsAfterExit"] == 1
+
+
 def test_prediction_state_poll_does_not_overlap_a_slow_request() -> None:
     output = run_dashboard_js(r'''
 state.workspaceView = "prediction_market";

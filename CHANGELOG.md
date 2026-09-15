@@ -5,6 +5,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-15
 
+- Unified prediction-page entry and refresh no longer trigger hidden history
+  requests; ordinary account snapshots pause there and refresh immediately on
+  exit. State responses hide excluded observation rows and duplicate exclusion
+  maps while preserving visible rows and full-snapshot counts. Verified by the
+  focused regressions, 100 Dashboard checks, and 43 prediction API/model tests;
+  no live calls or deployment were performed.
 - Startup reconciliation now leaves live account orders untouched when no
   local execution needs recovery, allowing a clean restart to resume
   monitoring. Unresolved executions remain locked with durable outstanding
