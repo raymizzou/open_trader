@@ -2914,6 +2914,21 @@ def test_lp_book_sampling_does_not_block_candidates_or_order_risk(
         ),
         encoding="utf-8",
     )
+    prior_scan_timestamp = "2026-09-16T12:00:00.000000Z"
+    prior_snapshot = {
+        "state": "ready",
+        "complete": True,
+        "scanning": False,
+        "candidates": [],
+        "recommendations": [],
+        "checked_at": prior_scan_timestamp,
+        "last_success_at": prior_scan_timestamp,
+        "last_attempt_at": prior_scan_timestamp,
+        "scan_started_at": prior_scan_timestamp,
+        "catalog_complete": True,
+    }
+    seed_store = store_module.PredictionArbitrageStore(tmp_path)
+    assert seed_store.lp_save_screening_snapshot(prior_snapshot) == prior_snapshot
     runtime = PredictionRuntime(
         data_dir=tmp_path,
         prediction_config_path=config_path,
@@ -2923,6 +2938,7 @@ def test_lp_book_sampling_does_not_block_candidates_or_order_risk(
         enable_n_leg_background=False,
         notifier=TestNotifier(),
     )
+    assert seed_store.lp_screening_snapshot() == prior_snapshot
     server = None
     server_thread = None
     store = None
@@ -3030,6 +3046,7 @@ def test_lp_book_sampling_does_not_block_candidates_or_order_risk(
         host, port = server.server_address[:2]
 
         assert probe.first_sample_entered.wait(timeout=3), "sampler did not issue an SDK read"
+        assert probe.native_catalog_calls == 1
         assert probe.sampler_batches[0] == all_tokens
         assert len(probe.sampler_batches[0]) > 3
         assert not snapshot["recommendations"]

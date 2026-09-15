@@ -23,7 +23,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
   `$5` trigger and 08:00 review remain intact. Affordability includes only the
   active native pUSD reservation's unspent remainder; incomplete reservation or
   private-account facts withhold guidance while known public books keep sampling.
-  The source-tagged 24-hour price move remains a display reference. Verified by
+  The production reward monitor also makes one forced catalog-refresh attempt
+  at startup, even when it restores a recent scan time; its normal 60-second
+  cadence remains unchanged. The source-tagged 24-hour price move remains a
+  display reference. Verified by
   the 23-test focused Docker integration group and 20-test blocker regression
   group; no live calls, orders or deployment were performed.
 

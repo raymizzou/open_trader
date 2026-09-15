@@ -898,7 +898,7 @@ class PredictionRuntime:
         self._lp_candidate_refresh_requested.clear()
 
         def run() -> None:
-            force_candidate_refresh = False
+            force_candidate_refresh = True
             while not self._reward_stop_event.is_set():
                 lp = self.lp
                 if lp is None:
