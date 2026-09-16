@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -958,6 +959,173 @@ def test_background_watermark_failure_blocks_late_result(tmp_path: Path) -> None
     assert late_snapshot["status"] in {"ERROR", "UNKNOWN", "STALE"}
     assert late_result["status"] != "PASS"
     assert late_result["current"] is not True
+
+
+def test_snapshot_does_not_wait_for_catalog_copy(tmp_path: Path) -> None:
+    rows = dated_rows()
+    copy_started = threading.Event()
+    release_copy = threading.Event()
+    block_catalog = [False]
+    blocked_once = [False]
+
+    class BlockingCatalog(dict[str, object]):
+        def __deepcopy__(self, memo: dict[int, object]) -> dict[str, object]:
+            copy_started.set()
+            if not release_copy.wait(timeout=5):
+                raise AssertionError("catalog copy was not released")
+            return {
+                key: deepcopy(value, memo)
+                for key, value in self.items()
+            }
+
+    def source() -> dict[str, object]:
+        if block_catalog[0] and not blocked_once[0]:
+            blocked_once[0] = True
+            return BlockingCatalog(rows)
+        return rows
+
+    monitor = PredictionObservationMonitor(
+        catalog={},
+        candidate_source=source,
+        store=PredictionArbitrageStore(tmp_path / "store"),
+        book_source=lambda token_ids: paper_books(
+            ("0.30", "0.32", "0.33"), now=NOW
+        ),
+        clock=lambda: NOW,
+    )
+    baseline = monitor.refresh_once()
+    block_catalog[0] = True
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        refresh_future = workers.submit(monitor.refresh_once)
+        try:
+            assert copy_started.wait(timeout=2)
+            snapshot_future = workers.submit(monitor.snapshot)
+            observed = snapshot_future.result(timeout=1)
+        finally:
+            release_copy.set()
+        refresh_future.result(timeout=5)
+
+    assert observed == baseline
+
+
+def test_background_refresh_cannot_overwrite_newer_explicit_refresh(
+    tmp_path: Path,
+) -> None:
+    rows = dated_rows()
+    newer_rows = deepcopy(rows)
+    newer_rows["paper-three"]["version_id"] = "generation-2"
+    now = [NOW]
+    copy_started = threading.Event()
+    release_copy = threading.Event()
+    newer_source_started = threading.Event()
+    source_phase = ["baseline"]
+
+    class BlockingCatalog(dict[str, object]):
+        def __deepcopy__(self, memo: dict[int, object]) -> dict[str, object]:
+            copy_started.set()
+            if not release_copy.wait(timeout=5):
+                raise AssertionError("background catalog copy was not released")
+            return {key: deepcopy(value, memo) for key, value in self.items()}
+
+    def source() -> dict[str, object]:
+        if source_phase[0] == "baseline":
+            return rows
+        if source_phase[0] == "background":
+            source_phase[0] = "explicit"
+            return BlockingCatalog(rows)
+        newer_source_started.set()
+        return newer_rows
+
+    monitor = PredictionObservationMonitor(
+        catalog={},
+        candidate_source=source,
+        store=PredictionArbitrageStore(tmp_path / "store"),
+        book_source=lambda token_ids: paper_books(
+            ("0.30", "0.32", "0.33"), now=now[0]
+        ),
+        clock=lambda: now[0],
+    )
+    baseline = monitor.refresh_once()
+    now[0] = NOW + timedelta(seconds=6)
+    source_phase[0] = "background"
+
+    monitor.start()
+    try:
+        assert copy_started.wait(timeout=2)
+
+        explicit_started = threading.Event()
+        explicit_finished = threading.Event()
+
+        def explicit_refresh() -> dict[str, object]:
+            explicit_started.set()
+            try:
+                return monitor.refresh_once()
+            finally:
+                explicit_finished.set()
+
+        with ThreadPoolExecutor(max_workers=1) as workers:
+            explicit_future = workers.submit(explicit_refresh)
+            assert explicit_started.wait(timeout=2)
+            if newer_source_started.wait(timeout=2):
+                assert explicit_finished.wait(timeout=2)
+            release_copy.set()
+            explicit = explicit_future.result(timeout=5)
+    finally:
+        release_copy.set()
+        monitor.stop()
+
+    assert explicit["generation_fingerprint"] != baseline["generation_fingerprint"]
+    assert monitor.snapshot()["generation_fingerprint"] == explicit["generation_fingerprint"]
+
+
+def test_stop_skips_queued_background_refresh(tmp_path: Path) -> None:
+    refresh_calls = 0
+    queued = threading.Event()
+    refresh_lock = threading.Lock()
+
+    class SignalingLock:
+        def acquire(self) -> bool:
+            queued.set()
+            return refresh_lock.acquire()
+
+        def release(self) -> None:
+            refresh_lock.release()
+
+        def __enter__(self) -> SignalingLock:
+            self.acquire()
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+            self.release()
+
+    def source() -> dict[str, object]:
+        nonlocal refresh_calls
+        refresh_calls += 1
+        return {}
+
+    monitor = PredictionObservationMonitor(
+        catalog={},
+        candidate_source=source,
+        store=PredictionArbitrageStore(tmp_path / "store"),
+        clock=lambda: NOW,
+    )
+    monitor._refresh_lock = SignalingLock()  # type: ignore[assignment]
+    refresh_lock.acquire()
+    monitor.start()
+    stop_thread: threading.Thread | None = None
+    try:
+        assert queued.wait(timeout=2)
+        stop_thread = threading.Thread(target=monitor.stop)
+        stop_thread.start()
+        assert monitor._stop.wait(timeout=2)
+    finally:
+        refresh_lock.release()
+        if stop_thread is not None:
+            stop_thread.join(timeout=5)
+        monitor.stop()
+
+    assert refresh_calls == 0
 
 
 def test_restart_restores_members_with_fresh_books(tmp_path: Path) -> None:

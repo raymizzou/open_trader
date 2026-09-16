@@ -680,7 +680,10 @@ class PredictionObservationMonitor:
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
-                self._refresh_internal(force_catalog=False)
+                with self._refresh_lock:
+                    if self._stop.is_set():
+                        return
+                    self._refresh_internal(force_catalog=False)
             except Exception:
                 logger.exception("prediction observation refresh failed")
             self._stop.wait(1.0)
@@ -715,8 +718,9 @@ class PredictionObservationMonitor:
                 self._catalog_error = str(exc)
                 self._last_catalog_check = now
             return None
+        prepared_snapshot = copy.deepcopy(snapshot)
         with self._lock:
-            self._catalog_snapshot = copy.deepcopy(snapshot)
+            self._catalog_snapshot = prepared_snapshot
             self._catalog_metadata = metadata
             self._last_catalog_check = now
             self._catalog_error = None

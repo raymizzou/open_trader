@@ -18,8 +18,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
 - LP dashboard reward reads now return cached or explicit stale/unknown values
   while one coalesced background batch refresh runs; snapshot monitoring keeps
   signal metrics cached and the prediction state route refreshes them on
-  demand. Verified by the approved focused contract and regressions; no live
-  calls, orders or deployment were performed.
+  demand. State reads use the last published observation snapshot while full
+  catalog copies are prepared outside the publication lock. Verified by the
+  approved focused contract and regressions; no live calls, orders or
+  deployment were performed.
 
 - Host Readiness no longer blocks replacement of the old running Prediction
   instance when its business-state status endpoint is slow or unavailable;
