@@ -15,6 +15,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
   Docker check; no live calls, notifications, orders or deployment were
   performed.
 
+- LP dashboard reward reads now return cached or explicit stale/unknown values
+  while one coalesced background batch refresh runs; snapshot monitoring keeps
+  signal metrics cached and the prediction state route refreshes them on
+  demand. Verified by the approved focused contract and regressions; no live
+  calls, orders or deployment were performed.
+
 - Host Readiness no longer blocks replacement of the old running Prediction
   instance when its business-state status endpoint is slow or unavailable;
   ownership/handoff, a reliable submission baseline and new-instance Smoke

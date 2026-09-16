@@ -488,6 +488,8 @@ class PolymarketMonitor:
         self._llm_usage_cache: dict[str, int] | None = None
         self._llm_usage_by_provider_cache: dict[str, object] | None = None
         self._llm_usage_cached_at: float | None = None
+        self._snapshot_metrics_refresh_lock = threading.Lock()
+        self._snapshot_metrics_cached_at: float | None = None
         self._annualized_distribution_cache: dict[str, dict[str, object]] | None = None
         self._signals_24h_cache = 0
         self._store_failed = False
@@ -1341,7 +1343,7 @@ class PolymarketMonitor:
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return
-        self._refresh_snapshot_metrics()
+        self._llm_usage()
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return
@@ -1736,11 +1738,11 @@ class PolymarketMonitor:
                     rows, set(self._active_relation_ids), replace_all=True
                 )
                 await self._subscribe(client)
-            self._refresh_snapshot_metrics(force=True)
+            self._llm_usage(force=True)
             return self.snapshot()
         except Exception as exc:
             self._record_error(exc, "universe")
-            self._refresh_snapshot_metrics(force=True)
+            self._llm_usage(force=True)
             return self.snapshot()
         finally:
             if owned_client and self._stop_event.is_set():
@@ -4354,6 +4356,7 @@ class PolymarketMonitor:
                     if isinstance(row, Mapping)
                 }
             )
+            self._refresh_current_annualized_distribution()
         self._sync_event_rows()
 
     def _relation_row(
@@ -5603,26 +5606,57 @@ class PolymarketMonitor:
         if (
             not force
             and self._annualized_distribution_cache is not None
-            and self._llm_usage_cached_at is not None
-            and self._monotonic() - self._llm_usage_cached_at < 60
+            and self._snapshot_metrics_cached_at is not None
+            and self._monotonic() - self._snapshot_metrics_cached_at < 60
         ):
             return
-        usage = self._llm_usage(force=force)
-        try:
-            annualized = self._annualized_distributions()
-        except Exception:
-            annualized = self._annualized_distribution_cache or {}
-        try:
-            signals_24h = len(self._store.signal_history("24h"))
-        except Exception:
-            signals_24h = self._signals_24h_cache
-        with self._lock:
-            self._llm_usage_cache = dict(usage)
-            self._llm_usage_by_provider_cache = copy.deepcopy(
-                self._llm_usage_by_provider_cache or {}
-            )
-            self._annualized_distribution_cache = copy.deepcopy(annualized)
-            self._signals_24h_cache = signals_24h
+        with self._snapshot_metrics_refresh_lock:
+            if (
+                not force
+                and self._annualized_distribution_cache is not None
+                and self._snapshot_metrics_cached_at is not None
+                and self._monotonic() - self._snapshot_metrics_cached_at < 60
+            ):
+                return
+            usage = self._llm_usage(force=force)
+            annualized: dict[str, dict[str, object]] = {}
+            metrics_failed = False
+            try:
+                summary = self._store.signal_metric_summary()
+                annualized = self._annualized_distributions(summary)
+                signals_24h = int(summary.get("signals_24h", 0))
+            except Exception:
+                metrics_failed = True
+                signals_24h = self._signals_24h_cache
+            with self._lock:
+                self._llm_usage_cache = dict(usage)
+                self._llm_usage_by_provider_cache = copy.deepcopy(
+                    self._llm_usage_by_provider_cache or {}
+                )
+                if metrics_failed:
+                    cached = self._annualized_distribution_cache
+                    installed_annualized = (
+                        copy.deepcopy(cached)
+                        if isinstance(cached, Mapping)
+                        else {}
+                    )
+                    empty = self._distribution(())
+                    for window in ("7d", "30d"):
+                        if not isinstance(installed_annualized.get(window), Mapping):
+                            installed_annualized[window] = copy.deepcopy(empty)
+                else:
+                    installed_annualized = copy.deepcopy(annualized)
+                installed_annualized["current"] = (
+                    self._current_annualized_distribution()
+                )
+                self._annualized_distribution_cache = installed_annualized
+                self._signals_24h_cache = signals_24h
+            self._snapshot_metrics_cached_at = self._monotonic()
+
+    def refresh_snapshot_metrics(self) -> None:
+        """Refresh the cached historical metrics on an explicit state read."""
+
+        self._refresh_snapshot_metrics()
 
     @staticmethod
     def _distribution(values: Sequence[object]) -> dict[str, object]:
@@ -5654,30 +5688,52 @@ class PolymarketMonitor:
             "max": parsed[-1],
         }
 
-    def _annualized_distributions(self) -> dict[str, dict[str, object]]:
+    def _refresh_current_annualized_distribution(self) -> None:
         with self._lock:
-            current = [
+            cached = self._annualized_distribution_cache or {}
+            empty = self._distribution(())
+            historical: dict[str, dict[str, object]] = {}
+            for window in ("7d", "30d"):
+                value = cached.get(window)
+                historical[window] = (
+                    copy.deepcopy(value)
+                    if isinstance(value, Mapping)
+                    else copy.deepcopy(empty)
+                )
+            self._annualized_distribution_cache = {
+                "current": self._current_annualized_distribution(),
+                **historical,
+            }
+
+    def _current_annualized_distribution(self) -> dict[str, object]:
+        return self._distribution(
+            [
                 row.get("annualized_yield")
                 for row in self._opportunities.values()
                 if row.get("market_type") == "threshold_hedge"
             ]
-        history_7d = self._store.signal_history("7d")
-        history_30d = self._store.signal_history("30d")
+        )
+
+    def _annualized_distributions(
+        self, summary: Mapping[str, object] | None = None
+    ) -> dict[str, dict[str, object]]:
+        with self._lock:
+            current = self._current_annualized_distribution()
+        if summary is None:
+            summary = self._store.signal_metric_summary()
+        raw_history = summary.get("annualized_yields", {})
+        history = raw_history if isinstance(raw_history, Mapping) else {}
         return {
-            "current": self._distribution(current),
-            "7d": self._distribution(
-                [row.get("annualized_yield") for row in history_7d]
-            ),
-            "30d": self._distribution(
-                [row.get("annualized_yield") for row in history_30d]
-            ),
+            "current": current,
+            "7d": self._distribution(history.get("7d", [])),
+            "30d": self._distribution(history.get("30d", [])),
         }
 
     def _write_runtime(self, *, force: bool = False) -> None:
         now = self._now()
         if not force and self._last_runtime_write is not None and _age(now, self._last_runtime_write) < RUNTIME_WRITE_SECONDS:
             return
-        self._refresh_snapshot_metrics()
+        self._llm_usage()
         payload = self.snapshot()
         payload.pop("readiness", None)
         # PairIntent is an in-process execution input, not a JSON/store value.

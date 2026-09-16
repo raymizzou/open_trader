@@ -2013,6 +2013,49 @@ def test_signal_history_supports_thirty_day_annualized_distribution_window(
     ]
 
 
+def test_signal_metric_summary_preserves_window_boundaries_and_distribution_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(
+        "open_trader.prediction_arbitrage_store._utc_now", lambda: iso(now)
+    )
+    db = store(tmp_path)
+    rows = (
+        ("recent", now - timedelta(hours=1), "0.21"),
+        ("invalid", now - timedelta(minutes=30), "not-a-number"),
+        ("missing", now - timedelta(hours=2), None),
+        ("boundary24h", now - timedelta(hours=24), "0.24"),
+        ("outside24h", now - timedelta(hours=24, microseconds=1), "0.25"),
+        ("boundary7d", now - timedelta(days=7), "0.27"),
+        ("outside7d", now - timedelta(days=7, microseconds=1), "0.28"),
+        ("boundary30d", now - timedelta(days=30), "0.30"),
+        ("outside30d", now - timedelta(days=30, microseconds=1), "0.31"),
+    )
+    for market_id, started_at, annualized_yield in rows:
+        payload = signal_payload(market_id, iso(started_at))
+        if annualized_yield is not None:
+            payload["annualized_yield"] = annualized_yield
+        db.upsert_signal(payload)
+
+    summary = db.signal_metric_summary()
+
+    assert summary["signals_24h"] == 4
+    assert summary["annualized_yields"] == {
+        "7d": ["not-a-number", "0.21", None, "0.24", "0.25", "0.27"],
+        "30d": [
+            "not-a-number",
+            "0.21",
+            None,
+            "0.24",
+            "0.25",
+            "0.27",
+            "0.28",
+            "0.30",
+        ],
+    }
+
+
 def test_llm_cache_survives_restart_and_replaces_the_same_fingerprint(
     tmp_path: Path,
 ) -> None:

@@ -537,6 +537,13 @@ def create_prediction_server(
                 )
                 return
             if parsed.path == "/api/prediction-arbitrage/state":
+                monitor = getattr(runtime, "monitor", None)
+                refresh_metrics = getattr(monitor, "refresh_snapshot_metrics", None)
+                if callable(refresh_metrics):
+                    try:
+                        refresh_metrics()
+                    except Exception:
+                        pass
                 state_payload = prediction_state_payload(
                     store=getattr(runtime, "store", None),
                     monitor=getattr(runtime, "monitor", None),

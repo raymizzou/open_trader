@@ -926,14 +926,15 @@ class PredictionExecutionService:
                 stale_rows[condition_id] = save_observation(
                     account_id, condition_id, stale
                 )
-            cached = self._lp_dashboard_cache
-            if cached is not None:
-                self._lp_dashboard_cache = {
-                    **cached,
-                    "state": "stale",
-                    "stale": True,
-                    "lp_observations": stale_rows,
-                }
+            with self._lp_dashboard_lock:
+                cached = self._lp_dashboard_cache
+                if cached is not None:
+                    self._lp_dashboard_cache = {
+                        **cached,
+                        "state": "stale",
+                        "stale": True,
+                        "lp_observations": stale_rows,
+                    }
             return stale_rows
 
         if stop_event is not None and stop_event.is_set():

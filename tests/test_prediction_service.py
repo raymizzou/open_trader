@@ -1515,6 +1515,134 @@ def test_lp_dashboard_keeps_old_date_refresh_out_of_new_date_cache(
     assert reward["reward_date"] == "2026-09-16"
 
 
+def test_lp_reward_and_stale_observation_publications_preserve_each_other(
+    tmp_path: Path,
+) -> None:
+    condition_id = "condition-1"
+    coordination_ready = threading.Event()
+    allow_reward = threading.Event()
+    reward_done = threading.Event()
+    coordination_mode: list[str] = []
+
+    class CoordinatedCache(dict[str, object]):
+        def __init__(self, values: Mapping[str, object]) -> None:
+            super().__init__(values)
+
+        def keys(self) -> Iterator[str]:
+            if threading.current_thread().name == "mark-stale":
+                coordination_mode.append("cache_read")
+                coordination_ready.set()
+                if not reward_done.wait(timeout=5):
+                    raise AssertionError("reward publication did not complete")
+            return super().keys()
+
+    class CoordinatedLock:
+        def __init__(self, lock: threading.RLock) -> None:
+            self._lock = lock
+
+        def __enter__(self) -> "CoordinatedLock":
+            caller = sys._getframe(1).f_code.co_name
+            if caller == "mark_stale":
+                coordination_mode.append("lock_before_cache_read")
+                coordination_ready.set()
+                if not allow_reward.wait(timeout=5):
+                    raise AssertionError("reward publication was not released")
+                if not reward_done.wait(timeout=5):
+                    raise AssertionError("reward publication did not complete")
+            self._lock.acquire()
+            return self
+
+        def __exit__(
+            self,
+            exc_type: object,
+            exc: object,
+            tb: object,
+        ) -> bool:
+            self._lock.release()
+            return False
+
+    class Trading:
+        config = SimpleNamespace(wallet_address="0x" + "1" * 40)
+
+        def lp_reward_snapshot(
+            self, reward_date: str, market: str
+        ) -> dict[str, object]:
+            assert reward_date == "2026-09-16"
+            assert market == condition_id
+            return {
+                "state": "known",
+                "reward_date": reward_date,
+                "condition_id": market,
+                "market_amount": Decimal("0.80"),
+            }
+
+    service = PredictionExecutionService(
+        store=PredictionArbitrageStore(tmp_path / "data"),
+        monitor=object(),
+        trading=Trading(),
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+    )
+    account_id = service._lp_account_id()
+    assert account_id is not None
+    service._store.save_lp_observation(
+        account_id,
+        condition_id,
+        {"state": "ready", "stale": False, "trial_baseline": None},
+    )
+    service._lp_dashboard_cache = CoordinatedCache(
+        {
+            "state": "ready",
+            "stale": False,
+            "market_rewards": {
+                condition_id: {
+                    "state": "unknown",
+                    "reward_date": "2026-09-16",
+                    "condition_id": condition_id,
+                    "market_amount": None,
+                }
+            },
+            "lp_observations": {},
+        }
+    )
+    service._lp_dashboard_lock = CoordinatedLock(service._lp_dashboard_lock)  # type: ignore[assignment]
+    service.lp_dashboard = lambda: {"state": "stale", "stale": True}  # type: ignore[method-assign]
+
+    def refresh_stale() -> None:
+        threading.current_thread().name = "mark-stale"
+        service.refresh_lp_observations()
+
+    def refresh_reward() -> None:
+        threading.current_thread().name = "reward-worker"
+        try:
+            service._refresh_lp_reward_batch(
+                "2026-09-16", (condition_id,), "2026-09-16T00:00:00.000000Z"
+            )
+        finally:
+            reward_done.set()
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        stale_future = workers.submit(refresh_stale)
+        assert coordination_ready.wait(timeout=2)
+        reward_future = workers.submit(refresh_reward)
+        allow_reward.set()
+        stale_future.result(timeout=5)
+        reward_future.result(timeout=5)
+
+    assert coordination_mode in (["cache_read"], ["lock_before_cache_read"])
+
+    cache = service._lp_dashboard_cache
+    assert isinstance(cache, Mapping)
+    assert cache["state"] == "stale"
+    assert cache["stale"] is True
+    reward = cache["market_rewards"][condition_id]  # type: ignore[index]
+    assert reward["state"] == "known"
+    assert reward["market_amount"] == Decimal("0.80")
+    observation = cache["lp_observations"][condition_id]  # type: ignore[index]
+    assert observation["state"] == "unknown"
+    assert observation["stale"] is True
+
+
 def test_lp_observations_preserve_trial_after_manual_add(tmp_path: Path) -> None:
     condition_id = "condition-1"
     token_id = "yes-token"
@@ -2219,6 +2347,64 @@ def test_lp_risk_alerts_deduplicate_per_channel_and_rearm(tmp_path: Path) -> Non
     assert len(voice_texts) == 4
     assert state["order_writes"] == 0
     assert state["cancellations"] == 0
+
+def test_state_refreshes_signal_metrics_on_demand_but_lp_dashboard_does_not(
+    tmp_path: Path,
+) -> None:
+    monitor = make_monitor(tmp_path)
+    summary_calls = 0
+
+    def summary() -> dict[str, object]:
+        nonlocal summary_calls
+        summary_calls += 1
+        return {
+            "signals_24h": 2,
+            "annualized_yields": {"7d": ["0.10"], "30d": ["0.10"]},
+        }
+
+    def forbidden_history(_window: str) -> list[dict[str, object]]:
+        raise AssertionError("state metrics loaded the full signal history")
+
+    monitor._store.signal_metric_summary = summary  # type: ignore[method-assign]
+    monitor._store.signal_history = forbidden_history  # type: ignore[method-assign]
+
+    class Execution(_Execution):
+        _breaker_open = False
+
+        def lp_dashboard(self) -> dict[str, object]:
+            return {
+                "state": "ready",
+                "orders": [],
+                "positions": [],
+                "candidates": [],
+                "recommendations": [],
+                "market_rewards": {},
+            }
+
+    runtime = _Runtime()
+    runtime.store = monitor._store  # type: ignore[assignment]
+    runtime.monitor = monitor
+    runtime.execution = Execution()
+
+    with _server(runtime) as base:
+        lp_status, lp_payload = _response(
+            base + "/api/prediction-arbitrage/lp/dashboard"
+        )
+        state_status, first_state = _response(
+            base + "/api/prediction-arbitrage/state"
+        )
+        second_status, second_state = _response(
+            base + "/api/prediction-arbitrage/state"
+        )
+
+    assert lp_status == state_status == second_status == 200
+    assert lp_payload["state"] == "ready"
+    assert summary_calls == 1
+    assert first_state["signals_24h"] == second_state["signals_24h"] == 2
+    assert (
+        first_state["relation_discovery"]["annualized_distribution"]
+        == second_state["relation_discovery"]["annualized_distribution"]
+    )
 
 
 def test_lp_candidate_preview_rechecks_best_bid_before_confirmation(

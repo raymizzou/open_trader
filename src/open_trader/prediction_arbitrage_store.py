@@ -2158,6 +2158,37 @@ class PredictionArbitrageStore:
             )
         return result
 
+    def signal_metric_summary(self) -> dict[str, object]:
+        """Read only the fields needed for cached monitor metrics."""
+
+        now = _parse_timestamp(_utc_now())
+        cutoff_24h = _canonical_timestamp(now - timedelta(hours=24))
+        cutoff_7d = _canonical_timestamp(now - timedelta(days=7))
+        cutoff_30d = _canonical_timestamp(now - timedelta(days=30))
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                "SELECT started_at, "
+                "json_extract(payload, '$.annualized_yield') AS annualized_yield "
+                "FROM signals WHERE started_at >= ? "
+                "ORDER BY started_at DESC, signal_id DESC",
+                (cutoff_30d,),
+            ).fetchall()
+        annualized_7d: list[object] = []
+        annualized_30d: list[object] = []
+        signals_24h = 0
+        for row in rows:
+            started_at = str(row["started_at"])
+            value = row["annualized_yield"]
+            if started_at >= cutoff_24h:
+                signals_24h += 1
+            if started_at >= cutoff_7d:
+                annualized_7d.append(value)
+            annualized_30d.append(value)
+        return {
+            "signals_24h": signals_24h,
+            "annualized_yields": {"7d": annualized_7d, "30d": annualized_30d},
+        }
+
     def open_signal_history(self) -> list[dict[str, object]]:
         """Return only currently open signal episodes, newest first."""
 

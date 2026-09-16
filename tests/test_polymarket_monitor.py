@@ -5,6 +5,7 @@ import copy
 import json
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -551,11 +552,52 @@ def test_auto_eat_observer_skips_non_actionable(tmp_path: Path) -> None:
     assert calls == []
 
 
+def test_start_and_runtime_write_do_not_load_historical_signal_metrics(
+    tmp_path: Path,
+) -> None:
+    monitor = make_monitor(tmp_path)
+    history_calls = 0
+
+    def history(_window: str) -> list[dict[str, object]]:
+        nonlocal history_calls
+        history_calls += 1
+        raise AssertionError("startup/runtime write loaded signal history")
+
+    monitor._store.signal_history = history  # type: ignore[method-assign]
+    monitor._store.llm_usage_24h = lambda: {  # type: ignore[method-assign]
+        "calls": 0,
+        "successes": 0,
+        "failures": 0,
+        "cache_hits": 0,
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+    }
+    monitor._store.llm_usage_24h_by_provider = lambda: {}  # type: ignore[method-assign]
+
+    async def idle() -> None:
+        while not monitor._stop_event.is_set():
+            await asyncio.sleep(0.01)
+
+    monitor.run_forever = idle  # type: ignore[method-assign]
+    monitor.start()
+    try:
+        monitor._write_runtime(force=True)
+        snapshot = monitor.snapshot()
+    finally:
+        monitor.stop()
+
+    assert history_calls == 0
+    assert snapshot["signals_24h"] == 0
+    assert snapshot["relation_discovery"]["annualized_distribution"] == {}
+
+
 def test_snapshot_uses_metrics_refreshed_outside_monitor_lock(tmp_path: Path) -> None:
     monitor = make_monitor(tmp_path)
     monotonic = [0.0]
     usage_calls = 0
-    history_calls = 0
+    summary_calls = 0
 
     def usage() -> dict[str, int]:
         nonlocal usage_calls
@@ -572,15 +614,18 @@ def test_snapshot_uses_metrics_refreshed_outside_monitor_lock(tmp_path: Path) ->
             "reasoning_output_tokens": 0,
         }
 
-    def history(window: str) -> list[dict[str, object]]:
-        nonlocal history_calls
+    def summary() -> dict[str, object]:
+        nonlocal summary_calls
         assert not monitor._lock._is_owned()
-        history_calls += 1
-        return [{"signal_id": "signal-1"}] if window == "24h" else []
+        summary_calls += 1
+        return {
+            "signals_24h": 1,
+            "annualized_yields": {"7d": [], "30d": []},
+        }
 
     monitor._monotonic = lambda: monotonic[0]
     monitor._store.llm_usage_24h = usage  # type: ignore[method-assign]
-    monitor._store.signal_history = history  # type: ignore[method-assign]
+    monitor._store.signal_metric_summary = summary  # type: ignore[method-assign]
 
     monitor._refresh_snapshot_metrics()
     assert monitor.snapshot()["relation_discovery"]["codex_usage_24h"]["calls"] == 1
@@ -590,7 +635,58 @@ def test_snapshot_uses_metrics_refreshed_outside_monitor_lock(tmp_path: Path) ->
     monitor._refresh_snapshot_metrics()
     assert monitor.snapshot()["relation_discovery"]["codex_usage_24h"]["calls"] == 2
     assert usage_calls == 2
-    assert history_calls == 6
+    assert summary_calls == 2
+
+
+def test_concurrent_snapshot_metric_refresh_coalesces_after_expiry(
+    tmp_path: Path,
+) -> None:
+    monitor = make_monitor(tmp_path)
+    monotonic = [0.0]
+    summary_calls = 0
+    priming = True
+    first_entered = threading.Event()
+    second_entered = threading.Event()
+
+    def usage() -> dict[str, int]:
+        return {
+            "calls": 0,
+            "successes": 0,
+            "failures": 0,
+            "cache_hits": 0,
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+        }
+
+    def summary() -> dict[str, object]:
+        nonlocal summary_calls
+        summary_calls += 1
+        if priming:
+            return {"signals_24h": 1, "annualized_yields": {"7d": [], "30d": []}}
+        if summary_calls == 2:
+            first_entered.set()
+            second_entered.wait(timeout=0.5)
+        else:
+            second_entered.set()
+        return {"signals_24h": 1, "annualized_yields": {"7d": [], "30d": []}}
+
+    monitor._monotonic = lambda: monotonic[0]
+    monitor._store.llm_usage_24h = usage  # type: ignore[method-assign]
+    monitor._store.llm_usage_24h_by_provider = lambda: {}  # type: ignore[method-assign]
+    monitor._store.signal_metric_summary = summary  # type: ignore[method-assign]
+
+    monitor.refresh_snapshot_metrics()
+    priming = False
+    monotonic[0] = 61.0
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        futures = [workers.submit(monitor.refresh_snapshot_metrics) for _ in range(2)]
+        assert first_entered.wait(timeout=1)
+        for future in futures:
+            future.result(timeout=2)
+
+    assert summary_calls == 2
 
 
 def test_start_primes_snapshot_metrics_before_monitor_thread(tmp_path: Path) -> None:
@@ -4700,6 +4796,7 @@ def test_subcent_threshold_profit_is_visible_and_annualized_distribution_is_repo
 
     asyncio.run(monitor._run_full_relation_scan(FakePublicClient()))
     monitor.refresh_once()
+    monitor.refresh_snapshot_metrics()
 
     row = next(
         row
@@ -4798,6 +4895,217 @@ def test_threshold_annualized_gate_fails_closed_when_end_date_is_invalid(
     assert distributions["current"]["count"] == 0
     assert distributions["7d"]["count"] == 0
     assert distributions["30d"]["count"] == 0
+
+
+def test_refresh_once_updates_current_and_preserves_cached_history_without_store_io(
+    tmp_path: Path,
+) -> None:
+    setup_public([threshold_event()])
+    setup_threshold_books()
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+
+    asyncio.run(monitor._run_full_relation_scan(FakePublicClient()))
+    monitor._catalog_loaded = True
+    summary_calls = 0
+    unexpected_summary_calls = 0
+
+    def summary() -> dict[str, object]:
+        nonlocal summary_calls
+        summary_calls += 1
+        return {
+            "signals_24h": 1,
+            "annualized_yields": {"7d": [Decimal("0.10")], "30d": [Decimal("0.20")]},
+        }
+
+    monitor._store.signal_metric_summary = summary  # type: ignore[method-assign]
+    monitor.refresh_snapshot_metrics()
+    cached = monitor.snapshot()["relation_discovery"]["annualized_distribution"]
+    assert summary_calls == 1
+
+    def fail_summary() -> dict[str, object]:
+        nonlocal unexpected_summary_calls
+        unexpected_summary_calls += 1
+        raise AssertionError("background refresh loaded historical metrics")
+
+    monitor._store.signal_metric_summary = fail_summary  # type: ignore[method-assign]
+    monitor.refresh_once()
+
+    distributions = monitor.snapshot()["relation_discovery"]["annualized_distribution"]
+    assert summary_calls == 1
+    assert unexpected_summary_calls == 0
+    assert distributions["current"]["count"] == 1
+    assert distributions["7d"] == cached["7d"]
+    assert distributions["30d"] == cached["30d"]
+
+
+def test_merge_relation_rows_keeps_current_distribution_in_sync(tmp_path: Path) -> None:
+    monitor = make_monitor(tmp_path, relation_discovery=None)
+
+    def row(opportunity_id: str, annualized_yield: str) -> dict[str, object]:
+        return {
+            "opportunity_id": opportunity_id,
+            "relation_id": opportunity_id,
+            "market_type": "threshold_hedge",
+            "annualized_yield": Decimal(annualized_yield),
+        }
+
+    monitor._merge_relation_rows(
+        [row("relation-a", "0.10")], {"relation-a"}, replace_all=True
+    )
+    distribution = monitor.snapshot()["relation_discovery"][
+        "annualized_distribution"
+    ]
+    assert distribution["current"]["count"] == 1
+    assert distribution["current"]["min"] == Decimal("0.10")
+
+    monitor._merge_relation_rows(
+        [row("relation-a", "0.20")], {"relation-a"}, replace_all=False
+    )
+    distribution = monitor.snapshot()["relation_discovery"][
+        "annualized_distribution"
+    ]
+    assert distribution["current"]["count"] == 1
+    assert distribution["current"]["min"] == Decimal("0.20")
+
+    monitor._merge_relation_rows([], {"relation-a"}, replace_all=False)
+    distribution = monitor.snapshot()["relation_discovery"][
+        "annualized_distribution"
+    ]
+    assert distribution["current"]["count"] == 0
+    assert distribution["7d"]["count"] == 0
+    assert distribution["30d"]["count"] == 0
+
+
+def test_concurrent_history_refresh_keeps_newer_merge_current_distribution(
+    tmp_path: Path,
+) -> None:
+    monitor = make_monitor(tmp_path, relation_discovery=None)
+
+    def row(opportunity_id: str, annualized_yield: str) -> dict[str, object]:
+        return {
+            "opportunity_id": opportunity_id,
+            "relation_id": opportunity_id,
+            "market_type": "threshold_hedge",
+            "annualized_yield": Decimal(annualized_yield),
+        }
+
+    monitor._merge_relation_rows(
+        [row("relation-a", "0.10")], {"relation-a"}, replace_all=True
+    )
+    monitor._llm_usage = lambda force=False: {}  # type: ignore[method-assign]
+    monitor._store.signal_metric_summary = lambda: {  # type: ignore[method-assign]
+        "signals_24h": 3,
+        "annualized_yields": {
+            "7d": [Decimal("0.30")],
+            "30d": [Decimal("0.40")],
+        },
+    }
+
+    history_ready = threading.Event()
+    release_install = threading.Event()
+    original = monitor._annualized_distributions
+
+    def paused(summary: Mapping[str, object]) -> dict[str, dict[str, object]]:
+        calculated = original(summary)
+        assert not monitor._lock._is_owned()
+        history_ready.set()
+        assert release_install.wait(timeout=5)
+        return calculated
+
+    monitor._annualized_distributions = paused  # type: ignore[method-assign]
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        refresh = executor.submit(monitor.refresh_snapshot_metrics)
+        assert history_ready.wait(timeout=5)
+        monitor._merge_relation_rows(
+            [row("relation-b", "0.20")], {"relation-b"}, replace_all=True
+        )
+        release_install.set()
+        refresh.result(timeout=5)
+
+    distribution = monitor.snapshot()["relation_discovery"][
+        "annualized_distribution"
+    ]
+    assert distribution["current"]["count"] == 1
+    assert distribution["current"]["min"] == Decimal("0.20")
+    assert distribution["7d"]["min"] == Decimal("0.30")
+    assert distribution["30d"]["min"] == Decimal("0.40")
+
+
+def test_failed_history_refresh_preserves_first_merge_default_windows(
+    tmp_path: Path,
+) -> None:
+    monitor = make_monitor(tmp_path, relation_discovery=None)
+    refresh_waiting = threading.Event()
+    allow_install = threading.Event()
+    original_lock = monitor._lock
+
+    class CoordinatedRLock:
+        refresh_thread_id: int | None = None
+
+        def acquire(self, *args: object, **kwargs: object) -> bool:
+            if (
+                threading.get_ident() == self.refresh_thread_id
+                and not allow_install.is_set()
+            ):
+                refresh_waiting.set()
+                assert allow_install.wait(timeout=5)
+            return original_lock.acquire(*args, **kwargs)
+
+        def release(self) -> None:
+            original_lock.release()
+
+        def __enter__(self) -> "CoordinatedRLock":
+            self.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback) -> None:
+            self.release()
+
+        def _is_owned(self) -> bool:
+            return original_lock._is_owned()
+
+    coordinated_lock = CoordinatedRLock()
+    monitor._lock = coordinated_lock  # type: ignore[assignment]
+    monitor._llm_usage = lambda force=False: {}  # type: ignore[method-assign]
+
+    def fail_summary() -> dict[str, object]:
+        coordinated_lock.refresh_thread_id = threading.get_ident()
+        raise RuntimeError("history unavailable")
+
+    monitor._store.signal_metric_summary = fail_summary  # type: ignore[method-assign]
+
+    def row() -> dict[str, object]:
+        return {
+            "opportunity_id": "relation-a",
+            "relation_id": "relation-a",
+            "market_type": "threshold_hedge",
+            "annualized_yield": Decimal("0.10"),
+        }
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        refresh = executor.submit(monitor.refresh_snapshot_metrics)
+        assert refresh_waiting.wait(timeout=5)
+        monitor._merge_relation_rows([row()], {"relation-a"}, replace_all=True)
+        merged = monitor.snapshot()["relation_discovery"][
+            "annualized_distribution"
+        ]
+        assert merged["current"]["count"] == 1
+        assert merged["7d"]["count"] == 0
+        assert merged["30d"]["count"] == 0
+        allow_install.set()
+        refresh.result(timeout=5)
+
+    distribution = monitor.snapshot()["relation_discovery"][
+        "annualized_distribution"
+    ]
+    assert distribution["current"]["count"] == 1
+    assert distribution["current"]["min"] == Decimal("0.10")
+    assert distribution["7d"]["count"] == 0
+    assert distribution["30d"]["count"] == 0
 
 
 def test_relation_scan_logs_are_bounded_and_not_persisted(tmp_path: Path) -> None:
