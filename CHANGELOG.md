@@ -33,6 +33,11 @@ operator-facing: what changed, which workflow is affected, and what was verified
   group; the metadata timeout repair also passed its seven-case focused Docker
   group. No live calls, orders or deployment were performed.
 
+- Added the lean daily LP report output template (rewards-first arbitrage
+  summary, reward-market positions only, post-08:00 auto-cancels) to the
+  Polymarket LP manual SOP. Documentation-only change; no code, tests, or
+  deployment were affected.
+
 ## 2026-09-15
 
 - Unified prediction-page entry and refresh no longer trigger hidden history
