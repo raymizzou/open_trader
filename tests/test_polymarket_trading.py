@@ -925,13 +925,24 @@ def test_lp_reward_rates_use_current_scoped_percentages() -> None:
     class RewardTransport:
         def __init__(self) -> None:
             self.calls: list[tuple[str, dict[str, object]]] = []
-            self.pages: dict[tuple[bool, object], object] = {
-                (False, None): {
+            self.pages: dict[tuple[bool, str, object], object] = {
+                (False, "orders", None): {
                     "data": [
                         {
                             "condition_id": condition_id,
                             "earning_percentage": "1",
                             "rewards_config": [native_config],
+                        },
+                        {
+                            "condition_id": "condition-order-only",
+                            "earning_percentage": "1",
+                            "rewards_config": [
+                                {
+                                    **native_config,
+                                    "id": "order-only-config",
+                                    "rate_per_day": "24",
+                                }
+                            ],
                         },
                         {
                             "condition_id": "condition-other",
@@ -958,9 +969,9 @@ def test_lp_reward_rates_use_current_scoped_percentages() -> None:
                             ],
                         },
                     ],
-                    "next_cursor": "native-page-2",
+                    "next_cursor": "native-orders-page-2",
                 },
-                (False, "native-page-2"): {
+                (False, "orders", "native-orders-page-2"): {
                     "data": [
                         {
                             "condition_id": condition_id,
@@ -970,7 +981,38 @@ def test_lp_reward_rates_use_current_scoped_percentages() -> None:
                     ],
                     "next_cursor": "LTE=",
                 },
-                (True, None): {
+                (False, "positions", None): {
+                    "data": [
+                        {
+                            "condition_id": condition_id,
+                            "earning_percentage": "1",
+                            "rewards_config": [native_config],
+                        },
+                        {
+                            "condition_id": "condition-position-only",
+                            "earning_percentage": "1",
+                            "rewards_config": [
+                                {
+                                    **native_config,
+                                    "id": "position-only-config",
+                                    "rate_per_day": "24",
+                                }
+                            ],
+                        },
+                    ],
+                    "next_cursor": "LTE=",
+                },
+                (True, "orders", None): {
+                    "data": [
+                        {
+                            "condition_id": condition_id,
+                            "earning_percentage": "1",
+                            "rewards_config": [sponsored_config],
+                        }
+                    ],
+                    "next_cursor": "LTE=",
+                },
+                (True, "positions", None): {
                     "data": [
                         {
                             "condition_id": condition_id,
@@ -985,7 +1027,19 @@ def test_lp_reward_rates_use_current_scoped_percentages() -> None:
         def get_json(self, path: str, *, params: dict[str, object]) -> object:
             self.calls.append((path, dict(params)))
             assert path == "/rewards/user/markets"
-            return self.pages[(bool(params["sponsored"]), params.get("next_cursor"))]
+            scope = (
+                "orders"
+                if params.get("only_open_orders") is True
+                and params.get("only_open_positions") is False
+                else "positions"
+                if params.get("only_open_orders") is False
+                and params.get("only_open_positions") is True
+                else "invalid"
+            )
+            assert scope != "invalid"
+            return self.pages[
+                (bool(params["sponsored"]), scope, params.get("next_cursor"))
+            ]
 
     transport = RewardTransport()
 
@@ -1002,10 +1056,21 @@ def test_lp_reward_rates_use_current_scoped_percentages() -> None:
 
     assert rates["state"] == "known"
     assert rates["complete"] is True
-    assert [params["sponsored"] for path, params in transport.calls if path == "/rewards/user/markets"] == [
-        False,
-        False,
-        True,
+    assert [
+        (
+            params["sponsored"],
+            params["only_open_orders"],
+            params["only_open_positions"],
+            params.get("next_cursor"),
+        )
+        for path, params in transport.calls
+        if path == "/rewards/user/markets"
+    ] == [
+        (False, True, False, None),
+        (False, True, False, "native-orders-page-2"),
+        (False, False, True, None),
+        (True, True, False, None),
+        (True, False, True, None),
     ]
     target = rates["markets"][condition_id]
     assert target["state"] == "known"
@@ -1015,28 +1080,34 @@ def test_lp_reward_rates_use_current_scoped_percentages() -> None:
     assert target["sources"] == ("native", "sponsored")
     assert target["native"]["earning_percentage"] == Decimal("1")
     assert target["sponsored"]["earning_percentage"] == Decimal("1")
+    assert rates["markets"]["condition-order-only"]["hourly_reward_usd"] == Decimal("0.01")
+    assert rates["markets"]["condition-position-only"]["hourly_reward_usd"] == Decimal("0.01")
 
-    transport.pages[(False, None)]["data"][0]["earning_percentage"] = "0"
-    transport.pages[(False, "native-page-2")]["data"][0]["earning_percentage"] = "0"
-    transport.pages[(True, None)]["data"][0]["earning_percentage"] = "0"
+    target_rows = [
+        row
+        for (_sponsored, _scope, _cursor), page in transport.pages.items()
+        if isinstance(page, dict)
+        for row in page["data"]
+        if row["condition_id"] == condition_id
+    ]
+    for row in target_rows:
+        row["earning_percentage"] = "0"
     zero_share = adapter.lp_reward_rates()["markets"][condition_id]
     assert zero_share["state"] == "known"
     assert zero_share["hourly_reward_usd"] == Decimal("0")
 
-    del transport.pages[(False, None)]["data"][0]["earning_percentage"]
+    del target_rows[0]["earning_percentage"]
     missing_share = adapter.lp_reward_rates()["markets"][condition_id]
     assert missing_share["state"] == "unknown"
     assert missing_share["hourly_reward_usd"] is None
 
-    transport.pages[(False, None)]["data"][0]["earning_percentage"] = "NaN"
+    target_rows[0]["earning_percentage"] = "NaN"
     nonfinite_share = adapter.lp_reward_rates()["markets"][condition_id]
     assert nonfinite_share["state"] == "unknown"
 
-    transport.pages[(False, None)]["data"][0]["earning_percentage"] = "1"
-    transport.pages[(False, "native-page-2")]["data"][0]["earning_percentage"] = "1"
-    transport.pages[(False, None)]["data"][0]["rewards_config"][0][
-        "asset_address"
-    ] = "0xdeadbeef"
+    for row in target_rows:
+        row["earning_percentage"] = "1"
+    native_config["asset_address"] = "0xdeadbeef"
     unknown_currency = adapter.lp_reward_rates()["markets"][condition_id]
     assert unknown_currency["state"] == "unknown"
     assert unknown_currency["hourly_reward_usd"] is None

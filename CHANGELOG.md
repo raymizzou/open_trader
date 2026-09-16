@@ -5,6 +5,16 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-16
 
+- LP reward-rate reads now union separately paginated open-order and
+  open-position scopes for native and sponsored sources, preserving config
+  identity de-duplication and conservative unknown handling. Candidate scans
+  now run on their own cooperative worker, so reward and durable observation
+  refreshes remain on `prediction-lp-reward-monitor` while catalog reads are
+  slow or held; shutdown retains ownership until both workers stop. Verified
+  by the scoped API RED/GREEN, runtime RED/GREEN, and 119-test affected
+  Docker check; no live calls, notifications, orders or deployment were
+  performed.
+
 - Host Readiness no longer blocks replacement of the old running Prediction
   instance when its business-state status endpoint is slow or unavailable;
   ownership/handoff, a reliable submission baseline and new-instance Smoke

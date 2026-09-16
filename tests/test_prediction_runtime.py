@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import multiprocessing
 import os
@@ -1590,6 +1591,270 @@ def test_lp_observations_refresh_without_dashboard_and_stop_with_runtime(
     assert blocked_probe.observation_finished.is_set()
     assert blocked_probe.monitor_stopped.is_set()
     assert blocked_probe.order_writes == blocked_probe.cancellations == 0
+
+    # The real LP service must keep the durable observation path alive while
+    # its external candidate catalog read is held.
+    from open_trader.notifications import CompositeNotifier, MacOSNotifier
+    from open_trader.polymarket_lp import PolymarketLPService as RealLPService
+
+    class IsolationProbe:
+        def __init__(self) -> None:
+            self.catalog_started = threading.Event()
+            self.catalog_cancelled = threading.Event()
+            self.catalog_finished = threading.Event()
+            self.observation_cycle = threading.Event()
+            self.notification_sent = threading.Event()
+            self.notifications: list[str] = []
+            self.order_writes = 0
+            self.cancellations = 0
+            self.close_called = threading.Event()
+            self.active_reads = 0
+            self._lock = threading.Lock()
+
+        def read_started(self) -> None:
+            with self._lock:
+                self.active_reads += 1
+
+        def read_finished(self) -> None:
+            with self._lock:
+                self.active_reads -= 1
+
+    isolation_probe = IsolationProbe()
+    isolation_order = {
+        "order_id": "manual-order",
+        "condition_id": "condition-1",
+        "token_id": "yes-token",
+        "outcome": "YES",
+        "side": "BUY",
+        "status": "LIVE",
+        "price": Decimal("0.50"),
+        "original_size": Decimal("100"),
+        "size_matched": Decimal("0"),
+        "remaining_size": Decimal("100"),
+        "reward_min_size": Decimal("40"),
+        "fees_enabled": False,
+        "market_title": "Will it happen?",
+    }
+
+    class IsolationTrading:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(
+                wallet_address="0x" + "6" * 40,
+                signer_address="0x" + "7" * 40,
+                predict=None,
+            )
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "wallet_address": self.config.wallet_address,
+                "p_usd_balance": Decimal("100"),
+                "p_usd_allowance": Decimal("100"),
+                "open_order_ids": ["manual-order"],
+                "positions": [],
+                "checked_at": datetime.now(UTC),
+            }
+
+        def readiness_snapshot(self) -> dict[str, object]:
+            return {
+                "relayer_ready": True,
+                "merge_ready": True,
+                "checked_at": datetime.now(UTC),
+            }
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            isolation_probe.read_started()
+            try:
+                isolation_probe.observation_cycle.set()
+                return {
+                    "authenticated": True,
+                    "checked_at": datetime.now(UTC),
+                    "open_orders": [dict(isolation_order)],
+                    "positions": [],
+                    "open_orders_complete": True,
+                    "positions_complete": True,
+                }
+            finally:
+                isolation_probe.read_finished()
+
+        def get_order_scoring(self, _order_id: str) -> bool:
+            return True
+
+        def lp_reward_snapshot(
+            self, reward_date: str, condition_id: str
+        ) -> dict[str, object]:
+            return {
+                "state": "known",
+                "reward_date": reward_date,
+                "condition_id": condition_id,
+                "market_amount": Decimal("0.20"),
+            }
+
+        def lp_reward_rates(
+            self, *, stop_event: threading.Event | None = None
+        ) -> dict[str, object]:
+            del stop_event
+            checked_at = datetime.now(UTC)
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": checked_at,
+                "markets": {
+                    "condition-1": {
+                        "state": "known",
+                        "hourly_reward_usd": Decimal("0.20"),
+                        "currency": "USD",
+                        "checked_at": checked_at,
+                    }
+                },
+            }
+
+        def lp_order_books(
+            self,
+            token_ids: tuple[str, ...],
+            *,
+            stop_event: threading.Event | None = None,
+        ) -> dict[str, dict[str, object]]:
+            del stop_event
+            checked_at = datetime.now(UTC)
+            return {
+                token: {
+                    "condition_id": "condition-1",
+                    "token_id": token,
+                    "received_at": checked_at,
+                    "bids": [
+                        {"price": Decimal("0.51"), "size": Decimal("20")},
+                        {"price": Decimal("0.50"), "size": Decimal("100")},
+                        {"price": Decimal("0.44"), "size": Decimal("1000")},
+                    ],
+                    "asks": [],
+                }
+                for token in token_ids
+            }
+
+        def lp_reward_catalog(
+            self, *, stop_event: threading.Event | None = None
+        ) -> dict[str, object]:
+            assert stop_event is not None
+            isolation_probe.read_started()
+            isolation_probe.catalog_started.set()
+            try:
+                assert stop_event.wait(timeout=5)
+                isolation_probe.catalog_cancelled.set()
+                return {
+                    "state": "unknown",
+                    "complete": False,
+                    "checked_at": datetime.now(UTC),
+                    "markets": (),
+                }
+            finally:
+                isolation_probe.read_finished()
+                isolation_probe.catalog_finished.set()
+
+        def create_limit_order(self, **_kwargs: object) -> None:
+            isolation_probe.order_writes += 1
+
+        def post_order(self, _order: object) -> None:
+            isolation_probe.order_writes += 1
+
+        def post_orders(self, *_orders: object, **_kwargs: object) -> None:
+            isolation_probe.order_writes += 1
+
+        def cancel_order(self, *_args: object, **_kwargs: object) -> None:
+            isolation_probe.cancellations += 1
+
+        def cancel_orders(self, **_kwargs: object) -> None:
+            isolation_probe.cancellations += 1
+
+        def close(self) -> None:
+            with isolation_probe._lock:
+                assert isolation_probe.active_reads == 0
+            assert isolation_probe.catalog_finished.is_set()
+            isolation_probe.close_called.set()
+
+    class NoopMacOSNotifier(MacOSNotifier):
+        def notify(self, _title: str, _message: str) -> None:
+            pass
+
+    isolation_trading = IsolationTrading()
+
+    def isolation_post_json(
+        _url: str,
+        payload: dict[str, object],
+        _timeout_seconds: float,
+    ) -> dict[str, object]:
+        content = payload.get("content")
+        text = content.get("text") if isinstance(content, dict) else ""
+        isolation_probe.notifications.append(str(text))
+        isolation_probe.notification_sent.set()
+        return {"code": 0}
+
+    isolation_notifier = CompositeNotifier(
+        (
+            NoopMacOSNotifier(),
+            FeishuWebhookNotifier(
+                webhook_url="https://feishu.invalid/hook",
+                post_json=isolation_post_json,
+            ),
+        )
+    )
+    monkeypatch.setattr(runtime_module, "PolymarketLPService", RealLPService)
+    monkeypatch.setattr(runtime_module, "PredictionExecutionService", PredictionExecutionService)
+    monkeypatch.setattr(
+        runtime_module,
+        "PolymarketTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: isolation_trading),
+    )
+    isolated = PredictionRuntime(
+        data_dir=tmp_path / "isolated-runtime",
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+        notifier=isolation_notifier,
+        cross_venue_monitor=_UnavailableCrossVenueMonitor("test-disabled"),
+        solver_server_factory=lambda: object(),
+        enable_n_leg_background=False,
+    )
+    isolated.start()
+    account_id = hashlib.sha256(
+        isolation_trading.config.wallet_address.casefold().encode("utf-8")
+    ).hexdigest()
+    try:
+        assert isolated.state == "RUNNING"
+        assert isolation_probe.catalog_started.wait(timeout=2)
+        checked_at_values: set[str] = set()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and len(checked_at_values) < 2:
+            observations = isolated.store.lp_observations(account_id)  # type: ignore[union-attr]
+            checked_at_values.update(
+                str(row.get("checked_at"))
+                for row in observations.values()
+                if row.get("checked_at") is not None
+            )
+            if len(checked_at_values) < 2:
+                isolation_probe.observation_cycle.wait(timeout=0.01)
+                isolation_probe.observation_cycle.clear()
+        assert len(checked_at_values) >= 2
+        assert isolation_probe.notification_sent.wait(timeout=2)
+        observations = isolated.store.lp_observations(account_id)  # type: ignore[union-attr]
+        observation = observations["condition-1"]
+        assert Decimal(str(observation["occupied_capital_usd"])) == Decimal("50")
+        assert Decimal(str(observation["current_yield_pct_per_hour"])) == Decimal("0.4")
+        assert Decimal(str(observation["risk_directions"][0]["stress_loss"])) == Decimal("6")
+        assert Decimal(str(observation["risk_directions"][0]["loss_ratio"])) == Decimal("0.12")
+        assert observation["risk_directions"][0]["warning"] is True
+        assert observation["add_room"] == {"available": False, "reason": "risk_warning"}
+        assert len(isolation_probe.notifications) == 1
+        assert "LP 风险警告" in isolation_probe.notifications[0]
+        assert "达到 10% 警戒线" in isolation_probe.notifications[0]
+        assert isolation_probe.order_writes == isolation_probe.cancellations == 0
+    finally:
+        isolated.stop()
+    assert isolated.state == "STOPPED"
+    assert isolation_probe.catalog_cancelled.is_set()
+    assert isolation_probe.catalog_finished.is_set()
+    assert isolation_probe.close_called.is_set()
+    assert not isolated.production_owner
+    with isolation_probe._lock:
+        assert isolation_probe.active_reads == 0
 
 
 def test_runtime_owner_lock_excludes_a_real_second_process(tmp_path: Path) -> None:

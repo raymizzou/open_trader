@@ -1550,117 +1550,123 @@ class PolymarketTradingClient:
 
             for sponsored in (False, True):
                 source = "sponsored" if sponsored else "native"
-                cursor: str | None = None
-                seen_cursors: set[str] = set()
-                while True:
-                    if stop_event is not None and stop_event.is_set():
-                        raise _RewardReadCancelled
-                    params: dict[str, object] = {
-                        "signature_type": signature_type,
-                        "maker_address": self.config.wallet_address,
-                        "sponsored": sponsored,
-                        "page_size": 500,
-                    }
-                    if cursor is not None:
-                        params["next_cursor"] = cursor
-                    payload = get_json("/rewards/user/markets", params=params)
-                    if stop_event is not None and stop_event.is_set():
-                        raise _RewardReadCancelled
-                    if not isinstance(payload, Mapping):
-                        raise ValueError("reward_page_unknown")
-                    rows = payload.get("data")
-                    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
-                        raise ValueError("reward_page_unknown")
-                    for raw_row in rows:
-                        row = _model_dict(raw_row)
-                        if row is None:
-                            raise ValueError("reward_row_unknown")
-                        condition_id = row.get("condition_id")
-                        if not isinstance(condition_id, str) or not condition_id:
-                            raise ValueError("reward_market_unknown")
-                        percentage = _lp_decimal(row.get("earning_percentage"))
-                        if percentage is not None and not Decimal("0") <= percentage <= Decimal("100"):
-                            percentage = None
-                        raw_configs = row.get("rewards_config")
-                        if not isinstance(raw_configs, Sequence) or isinstance(
-                            raw_configs, (str, bytes)
-                        ):
-                            raise ValueError("reward_config_unknown")
-                        active_configs: list[dict[str, object]] = []
-                        for raw_config in raw_configs:
-                            config = _model_dict(raw_config)
-                            if config is None:
-                                raise ValueError("reward_config_unknown")
-                            config_id = config.get("id")
-                            asset_address = config.get("asset_address")
-                            start_date = _reward_date(config.get("start_date"))
-                            end_date = _reward_date(config.get("end_date"))
-                            rate = _lp_decimal(config.get("rate_per_day"))
-                            if (
-                                config_id is None
-                                or not isinstance(asset_address, str)
-                                or start_date is None
-                                or end_date is None
-                                or rate is None
-                                or rate < 0
+                for only_open_orders, only_open_positions in (
+                    (True, False),
+                    (False, True),
+                ):
+                    cursor: str | None = None
+                    seen_cursors: set[str] = set()
+                    while True:
+                        if stop_event is not None and stop_event.is_set():
+                            raise _RewardReadCancelled
+                        params: dict[str, object] = {
+                            "signature_type": signature_type,
+                            "maker_address": self.config.wallet_address,
+                            "sponsored": sponsored,
+                            "only_open_orders": only_open_orders,
+                            "only_open_positions": only_open_positions,
+                            "page_size": 500,
+                        }
+                        if cursor is not None:
+                            params["next_cursor"] = cursor
+                        payload = get_json("/rewards/user/markets", params=params)
+                        if stop_event is not None and stop_event.is_set():
+                            raise _RewardReadCancelled
+                        if not isinstance(payload, Mapping):
+                            raise ValueError("reward_page_unknown")
+                        rows = payload.get("data")
+                        if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+                            raise ValueError("reward_page_unknown")
+                        for raw_row in rows:
+                            row = _model_dict(raw_row)
+                            if row is None:
+                                raise ValueError("reward_row_unknown")
+                            condition_id = row.get("condition_id")
+                            if not isinstance(condition_id, str) or not condition_id:
+                                raise ValueError("reward_market_unknown")
+                            percentage = _lp_decimal(row.get("earning_percentage"))
+                            if percentage is not None and not Decimal("0") <= percentage <= Decimal("100"):
+                                percentage = None
+                            raw_configs = row.get("rewards_config")
+                            if not isinstance(raw_configs, Sequence) or isinstance(
+                                raw_configs, (str, bytes)
                             ):
                                 raise ValueError("reward_config_unknown")
-                            if not start_date <= as_of <= end_date:
+                            active_configs: list[dict[str, object]] = []
+                            for raw_config in raw_configs:
+                                config = _model_dict(raw_config)
+                                if config is None:
+                                    raise ValueError("reward_config_unknown")
+                                config_id = config.get("id")
+                                asset_address = config.get("asset_address")
+                                start_date = _reward_date(config.get("start_date"))
+                                end_date = _reward_date(config.get("end_date"))
+                                rate = _lp_decimal(config.get("rate_per_day"))
+                                if (
+                                    config_id is None
+                                    or not isinstance(asset_address, str)
+                                    or start_date is None
+                                    or end_date is None
+                                    or rate is None
+                                    or rate < 0
+                                ):
+                                    raise ValueError("reward_config_unknown")
+                                if not start_date <= as_of <= end_date:
+                                    continue
+                                normalized = dict(config)
+                                normalized["rate_per_day"] = rate
+                                normalized["sponsored"] = sponsored
+                                normalized["source"] = source
+                                active_configs.append(normalized)
+                            if not active_configs:
                                 continue
-                            normalized = dict(config)
-                            normalized["rate_per_day"] = rate
-                            normalized["sponsored"] = sponsored
-                            normalized["source"] = source
-                            active_configs.append(normalized)
-                        if not active_configs:
-                            continue
-                        market = collected.setdefault(
-                            condition_id,
-                            {"condition_id": condition_id, "sources": {}},
-                        )
-                        market_sources = cast(
-                            dict[str, dict[str, object]], market["sources"]
-                        )
-                        source_result = market_sources.setdefault(
-                            source,
-                            {
-                                "source": source,
-                                "percentages": [],
-                                "reward_configs": [],
-                            },
-                        )
-                        cast(list[Decimal | None], source_result["percentages"]).append(
-                            percentage
-                        )
-                        for normalized in active_configs:
-                            asset_address = str(normalized["asset_address"])
-                            start_date = _reward_date(normalized["start_date"])
-                            end_date = _reward_date(normalized["end_date"])
-                            assert start_date is not None and end_date is not None
-                            identity = (
+                            market = collected.setdefault(
                                 condition_id,
-                                str(normalized["id"]),
-                                asset_address.casefold(),
-                                start_date,
-                                end_date,
-                                sponsored,
+                                {"condition_id": condition_id, "sources": {}},
                             )
-                            if identity in identities:
-                                continue
-                            identities.add(identity)
-                            cast(
-                                list[dict[str, object]],
-                                source_result["reward_configs"],
-                            ).append(normalized)
-                    next_cursor = payload.get("next_cursor")
-                    if not isinstance(next_cursor, str) or not next_cursor:
-                        raise ValueError("reward_pagination_unknown")
-                    if next_cursor == "LTE=":
-                        break
-                    if next_cursor in seen_cursors:
-                        raise ValueError("reward_pagination_loop")
-                    seen_cursors.add(next_cursor)
-                    cursor = next_cursor
+                            market_sources = cast(
+                                dict[str, dict[str, object]], market["sources"]
+                            )
+                            source_result = market_sources.setdefault(
+                                source,
+                                {
+                                    "source": source,
+                                    "percentages": [],
+                                    "reward_configs": [],
+                                },
+                            )
+                            cast(list[Decimal | None], source_result["percentages"]).append(
+                                percentage
+                            )
+                            for normalized in active_configs:
+                                asset_address = str(normalized["asset_address"])
+                                start_date = _reward_date(normalized["start_date"])
+                                end_date = _reward_date(normalized["end_date"])
+                                assert start_date is not None and end_date is not None
+                                identity = (
+                                    condition_id,
+                                    str(normalized["id"]),
+                                    asset_address.casefold(),
+                                    start_date,
+                                    end_date,
+                                    sponsored,
+                                )
+                                if identity in identities:
+                                    continue
+                                identities.add(identity)
+                                cast(
+                                    list[dict[str, object]],
+                                    source_result["reward_configs"],
+                                ).append(normalized)
+                        next_cursor = payload.get("next_cursor")
+                        if not isinstance(next_cursor, str) or not next_cursor:
+                            raise ValueError("reward_pagination_unknown")
+                        if next_cursor == "LTE=":
+                            break
+                        if next_cursor in seen_cursors:
+                            raise ValueError("reward_pagination_loop")
+                        seen_cursors.add(next_cursor)
+                        cursor = next_cursor
 
             for market in collected.values():
                 hourly_total = Decimal("0")

@@ -436,6 +436,7 @@ class PredictionRuntime:
         self._book_sampler_thread: threading.Thread | None = None
         self._reward_stop_event = threading.Event()
         self._lp_candidate_refresh_requested = threading.Event()
+        self._candidate_thread: threading.Thread | None = None
         self._reward_thread: threading.Thread | None = None
 
     @property
@@ -459,7 +460,7 @@ class PredictionRuntime:
     def queue_lp_candidate_refresh(self) -> bool:
         """Wake the owned read-only LP candidate refresh worker."""
 
-        thread = self._reward_thread
+        thread = self._candidate_thread
         if (
             self._mode != "production"
             or self._state != "RUNNING"
@@ -823,6 +824,7 @@ class PredictionRuntime:
                 )
                 self.n_leg_order_queue_driver.start()
             self._start_lp_monitor()
+            self._start_candidate_monitor()
             self._start_reward_monitor()
             self._start_book_sampler()
             self._state = "RUNNING"
@@ -895,29 +897,13 @@ class PredictionRuntime:
         if self.lp is None or self._reward_thread is not None:
             return
         self._reward_stop_event.clear()
-        self._lp_candidate_refresh_requested.clear()
 
         def run() -> None:
-            force_candidate_refresh = True
             while not self._reward_stop_event.is_set():
                 lp = self.lp
                 if lp is None:
                     return
                 refresh_rewards = getattr(lp, "refresh_rewards", None)
-                refresh_candidates = getattr(lp, "refresh_candidates", None)
-                if not callable(refresh_candidates) and not callable(refresh_rewards):
-                    return
-                if callable(refresh_candidates):
-                    try:
-                        refresh_candidates(
-                            stop_event=self._reward_stop_event,
-                            force=force_candidate_refresh,
-                        )
-                    except Exception:
-                        logger.exception("prediction_lp_candidate_refresh_failed")
-                force_candidate_refresh = False
-                if self._reward_stop_event.is_set():
-                    return
                 if not callable(refresh_rewards):
                     return
                 try:
@@ -939,6 +925,43 @@ class PredictionRuntime:
                         logger.exception("prediction_lp_observation_refresh_failed")
                 if self._reward_stop_event.is_set():
                     return
+                if self._reward_stop_event.wait(_LP_REWARD_SECONDS):
+                    return
+
+        self._reward_thread = threading.Thread(
+            target=run,
+            name="prediction-lp-reward-monitor",
+            daemon=True,
+        )
+        self._reward_thread.start()
+
+    def _start_candidate_monitor(self) -> None:
+        """Refresh LP candidates independently from rewards and observations."""
+
+        if self.lp is None or self._candidate_thread is not None:
+            return
+        self._reward_stop_event.clear()
+        self._lp_candidate_refresh_requested.clear()
+
+        def run() -> None:
+            force_candidate_refresh = True
+            while not self._reward_stop_event.is_set():
+                lp = self.lp
+                if lp is None:
+                    return
+                refresh_candidates = getattr(lp, "refresh_candidates", None)
+                if not callable(refresh_candidates):
+                    return
+                try:
+                    refresh_candidates(
+                        stop_event=self._reward_stop_event,
+                        force=force_candidate_refresh,
+                    )
+                except Exception:
+                    logger.exception("prediction_lp_candidate_refresh_failed")
+                force_candidate_refresh = False
+                if self._reward_stop_event.is_set():
+                    return
                 refresh_requested = self._lp_candidate_refresh_requested.wait(
                     _LP_REWARD_SECONDS
                 )
@@ -948,12 +971,12 @@ class PredictionRuntime:
                     self._lp_candidate_refresh_requested.clear()
                     force_candidate_refresh = True
 
-        self._reward_thread = threading.Thread(
+        self._candidate_thread = threading.Thread(
             target=run,
-            name="prediction-lp-reward-monitor",
+            name="prediction-lp-candidate-monitor",
             daemon=True,
         )
-        self._reward_thread.start()
+        self._candidate_thread.start()
 
     def _start_book_sampler(self) -> None:
         """Sample the published LP observation set on its own bounded loop."""
@@ -1199,6 +1222,16 @@ class PredictionRuntime:
         self._lp_candidate_refresh_requested.set()
         self._lp_stop_event.set()
         self._book_sample_stop_event.set()
+        candidate_thread = self._candidate_thread
+        if candidate_thread is not None:
+            candidate_thread.join(timeout=_LP_REWARD_STOP_GRACE_SECONDS)
+            if candidate_thread.is_alive():
+                errors.append(RuntimeError("prediction LP candidate monitor thread did not stop"))
+                # Keep the live LP/trading/store collaborators and owner while
+                # the reader may still use them; a later stop can retry cleanup.
+                uncertain_thread = True
+            else:
+                self._candidate_thread = None
         reward_thread = self._reward_thread
         if reward_thread is not None:
             # Cooperative cancellation leaves at most one bounded SDK request
@@ -1287,6 +1320,10 @@ class PredictionRuntime:
                     uncertain_thread = True
                 else:
                     self.monitor = None
+        if candidate_thread is not None:
+            if candidate_thread.is_alive():
+                return errors
+            self._candidate_thread = None
         if reward_thread is not None:
             if reward_thread.is_alive():
                 return errors
