@@ -672,6 +672,7 @@ def test_lp_dashboard_shows_manual_orders_without_managing_them(
     class RewardTransport:
         def __init__(self) -> None:
             self.calls: list[tuple[str, dict[str, object]]] = []
+            self.completed = threading.Event()
 
         def get_json(self, path: str, *, params: dict[str, object]) -> object:
             self.calls.append((path, dict(params)))
@@ -683,13 +684,17 @@ def test_lp_dashboard_shows_manual_orders_without_managing_them(
                 "asset_rate": "0.9999",
             }
             if path == "/rewards/user/total":
-                return [reward]
-            if params.get("sponsored") is False:
-                return {
+                result: object = [reward]
+            elif params.get("sponsored") is False:
+                result = {
                     "data": [{**reward, "condition_id": "condition-1"}],
                     "next_cursor": "LTE=",
                 }
-            return {"data": [], "next_cursor": "LTE="}
+            else:
+                result = {"data": [], "next_cursor": "LTE="}
+            if len(self.calls) == 3:
+                self.completed.set()
+            return result
 
     reward_transport = RewardTransport()
     monkeypatch.setattr(
@@ -799,6 +804,7 @@ def test_lp_dashboard_shows_manual_orders_without_managing_them(
         status_after_failure, stale = _response(
             base + "/api/prediction-arbitrage/lp/dashboard"
         )
+        assert reward_transport.completed.wait(timeout=2)
 
     assert status == status_after_failure == 200
     assert first["stale"] is False
@@ -814,17 +820,17 @@ def test_lp_dashboard_shows_manual_orders_without_managing_them(
     assert "market_amount_raw" not in first_order
     assert first["positions"][0]["size"] == "5"
     assert first["positions"][0]["market_title"] == "Will it happen?"
+    assert first["lp_observations"] == {}
     market_reward = first["market_rewards"]["condition-1"]
     assert market_reward["state"] == "unknown"
     assert market_reward["usd_state"] == "unknown"
     assert market_reward["market_amount"] is None
-    assert market_reward["market_amount_raw"] == "0.25"
-    assert market_reward["market_asset"] == "USDC.e"
+    assert market_reward["stale"] is True
+    assert market_reward["market_amount_raw"] is None
+    assert market_reward["market_asset"] is None
     assert market_reward["paid"] is False
     assert "account_amount" not in market_reward
-    assert datetime.fromisoformat(
-        str(market_reward["checked_at"]).replace("Z", "+00:00")
-    ).tzinfo is not None
+    assert market_reward["checked_at"] is None
     assert stale["stale"] is True
     assert stale["checked_at"] == first["checked_at"]
     assert stale["orders"] == first["orders"]
@@ -835,6 +841,678 @@ def test_lp_dashboard_shows_manual_orders_without_managing_them(
     assert sdk.order_writes == 0
     assert sdk.cancellations == 0
     assert public_market.closed is True
+
+
+def test_lp_dashboard_normalizes_candidate_reward_without_freshness_proof(
+    tmp_path: Path,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class Account:
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": datetime(2026, 9, 16, 12, tzinfo=UTC),
+                "open_orders": [
+                    {
+                        "id": "manual-order",
+                        "condition_id": "condition-1",
+                        "asset_id": "yes-token",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "original_size": Decimal("2"),
+                        "size_matched": Decimal("0"),
+                    }
+                ],
+                "positions": [],
+            }
+
+        def get_order_scoring(self, *, order_id: str) -> bool:
+            assert order_id == "manual-order"
+            return True
+
+        def lp_reward_snapshot(
+            self, reward_date: str, condition_id: str
+        ) -> dict[str, object]:
+            entered.set()
+            assert release.wait(timeout=5)
+            return {
+                "state": "known",
+                "reward_date": reward_date,
+                "condition_id": condition_id,
+                "market_amount": Decimal("0.80"),
+            }
+
+    class LP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {
+                "state": "ready",
+                "complete": True,
+                "candidates": [],
+                "market_rewards": {
+                    "condition-1": {
+                        "state": "known",
+                        "reward_date": "2026-09-16",
+                        "condition_id": "condition-1",
+                        "market_amount": Decimal("0.80"),
+                    }
+                },
+            }
+
+        def status(self) -> dict[str, object]:
+            return {"state": "none"}
+
+    service = PredictionExecutionService(
+        store=PredictionArbitrageStore(tmp_path / "data"),
+        monitor=object(),
+        trading=Account(),
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=LP(),
+    )
+
+    try:
+        dashboard = service.lp_dashboard()
+        reward = dashboard["market_rewards"]["condition-1"]
+        assert reward["stale"] is True
+        assert reward["reason"] == "reward_candidate_stale"
+        assert reward["market_amount"] == Decimal("0.80")
+        assert entered.wait(timeout=2)
+    finally:
+        release.set()
+
+
+def test_lp_dashboard_does_not_wait_for_market_reward_refresh(tmp_path: Path) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class Account:
+        order_writes = 0
+        cancellations = 0
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": datetime(2026, 9, 16, 12, tzinfo=UTC),
+                "open_orders": [
+                    {
+                        "id": "manual-order",
+                        "condition_id": "condition-1",
+                        "asset_id": "yes-token",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "original_size": Decimal("2"),
+                        "size_matched": Decimal("0"),
+                    }
+                ],
+                "positions": [],
+            }
+
+        def get_order_scoring(self, *, order_id: str) -> bool:
+            assert order_id == "manual-order"
+            return True
+
+        def lp_reward_snapshot(
+            self, reward_date: str, condition_id: str
+        ) -> dict[str, object]:
+            entered.set()
+            assert release.wait(timeout=5)
+            return {
+                "state": "known",
+                "reward_date": reward_date,
+                "condition_id": condition_id,
+                "market_amount": Decimal("0.80"),
+            }
+
+    class LP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {
+                "state": "ready",
+                "complete": True,
+                "candidates": [{"condition_id": "condition-1"}],
+                "recommendations": [],
+            }
+
+        def status(self) -> dict[str, object]:
+            return {"state": "none"}
+
+    store = PredictionArbitrageStore(tmp_path / "data")
+    account = Account()
+    service = PredictionExecutionService(
+        store=store,
+        monitor=object(),
+        trading=account,
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=LP(),
+    )
+    runtime = _Runtime()
+    runtime.store = store  # type: ignore[assignment]
+    runtime.execution = service
+
+    try:
+        with _server(runtime) as base:
+            with ThreadPoolExecutor(max_workers=1) as clients:
+                future = clients.submit(
+                    _response,
+                    base + "/api/prediction-arbitrage/lp/dashboard",
+                    timeout=5,
+                )
+                assert entered.wait(timeout=2)
+                status, payload = future.result(timeout=0.5)
+    finally:
+        release.set()
+
+    assert status == 200
+    assert payload["orders"][0]["condition_id"] == "condition-1"
+    reward = payload["market_rewards"]["condition-1"]
+    assert reward["state"] == "unknown"
+    assert reward["stale"] is True
+    assert account.order_writes == 0
+    assert account.cancellations == 0
+
+
+def test_lp_dashboard_coalesces_reward_refresh_and_publishes_completed_cache(
+    tmp_path: Path,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    calls = 0
+
+    class Account:
+        order_writes = 0
+        cancellations = 0
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": datetime(2026, 9, 16, 12, tzinfo=UTC),
+                "open_orders": [
+                    {
+                        "id": "manual-order",
+                        "condition_id": "condition-1",
+                        "asset_id": "yes-token",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "original_size": Decimal("2"),
+                        "size_matched": Decimal("0"),
+                    }
+                ],
+                "positions": [],
+            }
+
+        def get_order_scoring(self, *, order_id: str) -> bool:
+            assert order_id == "manual-order"
+            return True
+
+        def lp_reward_snapshot(
+            self, reward_date: str, condition_id: str
+        ) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            entered.set()
+            assert release.wait(timeout=5)
+            return {
+                "state": "known",
+                "reward_date": reward_date,
+                "condition_id": condition_id,
+                "market_amount": Decimal("0.80"),
+            }
+
+    class LP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {"state": "ready", "complete": True, "candidates": []}
+
+        def status(self) -> dict[str, object]:
+            return {"state": "none"}
+
+    store = PredictionArbitrageStore(tmp_path / "data")
+    account = Account()
+    service = PredictionExecutionService(
+        store=store,
+        monitor=object(),
+        trading=account,
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=LP(),
+    )
+    runtime = _Runtime()
+    runtime.store = store  # type: ignore[assignment]
+    runtime.execution = service
+
+    try:
+        with _server(runtime) as base:
+            with ThreadPoolExecutor(max_workers=2) as clients:
+                first_future = clients.submit(
+                    _response,
+                    base + "/api/prediction-arbitrage/lp/dashboard",
+                    timeout=5,
+                )
+                assert entered.wait(timeout=2)
+                second_future = clients.submit(
+                    _response,
+                    base + "/api/prediction-arbitrage/lp/dashboard",
+                    timeout=5,
+                )
+                first_status, first = first_future.result(timeout=2)
+                second_status, second = second_future.result(timeout=2)
+            assert first_status == second_status == 200
+            assert first["market_rewards"]["condition-1"]["state"] == "unknown"
+            assert second["market_rewards"]["condition-1"]["state"] == "unknown"
+            release.set()
+
+            updated: dict[str, object] | None = None
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                status, candidate = _response(
+                    base + "/api/prediction-arbitrage/lp/dashboard",
+                    timeout=5,
+                )
+                if (
+                    status == 200
+                    and candidate["market_rewards"]["condition-1"]["state"]
+                    == "known"
+                ):
+                    updated = candidate
+                    break
+                time.sleep(0.01)
+    finally:
+        release.set()
+
+    assert updated is not None
+    reward = updated["market_rewards"]["condition-1"]
+    assert reward["market_amount"] == "0.80"
+    assert isinstance(reward["checked_at"], str)
+    assert calls == 1
+    assert account.order_writes == 0
+    assert account.cancellations == 0
+
+
+def test_lp_dashboard_expires_reward_cache_without_waiting_for_refresh(
+    tmp_path: Path,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    clock = [0.0]
+    calls = 0
+
+    class Account:
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": datetime(2026, 9, 16, 12, tzinfo=UTC),
+                "open_orders": [
+                    {
+                        "id": "manual-order",
+                        "condition_id": "condition-1",
+                        "asset_id": "yes-token",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "original_size": Decimal("2"),
+                        "size_matched": Decimal("0"),
+                    }
+                ],
+                "positions": [],
+            }
+
+        def get_order_scoring(self, *, order_id: str) -> bool:
+            assert order_id == "manual-order"
+            return True
+
+        def lp_reward_snapshot(
+            self, reward_date: str, condition_id: str
+        ) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                entered.set()
+                assert release.wait(timeout=5)
+            return {
+                "state": "known",
+                "reward_date": reward_date,
+                "condition_id": condition_id,
+                "market_amount": Decimal("0.80"),
+            }
+
+    class LP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {"state": "ready", "complete": True, "candidates": []}
+
+        def status(self) -> dict[str, object]:
+            return {"state": "none"}
+
+    service = PredictionExecutionService(
+        store=PredictionArbitrageStore(tmp_path / "data"),
+        monitor=object(),
+        trading=Account(),
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=LP(),
+    )
+    service._clock = lambda: clock[0]  # type: ignore[method-assign]
+
+    try:
+        service.lp_dashboard()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            first = service.lp_dashboard()
+            if first["market_rewards"]["condition-1"]["state"] == "known":
+                break
+            time.sleep(0.01)
+        assert calls == 1
+        clock[0] = 61.0
+        with ThreadPoolExecutor(max_workers=1) as clients:
+            future = clients.submit(service.lp_dashboard)
+            assert entered.wait(timeout=2)
+            expired = future.result(timeout=0.5)
+    finally:
+        release.set()
+
+    reward = expired["market_rewards"]["condition-1"]
+    assert reward["state"] == "known"
+    assert reward["stale"] is True
+    assert reward["market_amount"] == Decimal("0.80")
+
+
+def test_lp_dashboard_drains_new_conditions_through_single_reward_worker(
+    tmp_path: Path,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    b_done = threading.Event()
+    condition_reads: list[str] = []
+
+    class Account:
+        reads = 0
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            self.reads += 1
+            conditions = ("condition-a",) if self.reads == 1 else (
+                "condition-a",
+                "condition-b",
+            )
+            return {
+                "authenticated": True,
+                "checked_at": datetime(2026, 9, 16, 12, tzinfo=UTC),
+                "open_orders": [
+                    {
+                        "id": f"manual-{condition}",
+                        "condition_id": condition,
+                        "asset_id": f"yes-{condition}",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "original_size": Decimal("2"),
+                        "size_matched": Decimal("0"),
+                    }
+                    for condition in conditions
+                ],
+                "positions": [],
+            }
+
+        def get_order_scoring(self, *, order_id: str) -> bool:
+            assert order_id.startswith("manual-")
+            return True
+
+        def lp_reward_snapshot(
+            self, reward_date: str, condition_id: str
+        ) -> dict[str, object]:
+            condition_reads.append(condition_id)
+            if condition_id == "condition-a" and len(condition_reads) == 1:
+                entered.set()
+                assert release.wait(timeout=5)
+            if condition_id == "condition-b":
+                b_done.set()
+            return {
+                "state": "known",
+                "reward_date": reward_date,
+                "condition_id": condition_id,
+                "market_amount": Decimal("0.80"),
+            }
+
+    class LP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {"state": "ready", "complete": True, "candidates": []}
+
+        def status(self) -> dict[str, object]:
+            return {"state": "none"}
+
+    service = PredictionExecutionService(
+        store=PredictionArbitrageStore(tmp_path / "data"),
+        monitor=object(),
+        trading=Account(),
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=LP(),
+    )
+
+    try:
+        service.lp_dashboard()
+        assert entered.wait(timeout=2)
+        service.lp_dashboard()
+        release.set()
+        assert b_done.wait(timeout=2)
+    finally:
+        release.set()
+
+    assert condition_reads == ["condition-a", "condition-b"]
+
+
+def test_lp_dashboard_restarts_reward_worker_after_empty_queue_handoff(
+    tmp_path: Path,
+) -> None:
+    gap_open = threading.Event()
+    allow_exit = threading.Event()
+    b_done = threading.Event()
+    condition_reads: list[str] = []
+
+    class HandoffLock:
+        def __init__(self, service: PredictionExecutionService) -> None:
+            self._lock = service._lp_dashboard_lock
+            self._worker_lock_entries = 0
+            self._armed = False
+            self._pause_after_release = False
+
+        def __enter__(self) -> "HandoffLock":
+            self._lock.acquire()
+            caller = sys._getframe(1).f_code.co_name
+            if caller == "_refresh_lp_rewards":
+                self._worker_lock_entries += 1
+            self._pause_after_release = (
+                not self._armed
+                and caller == "_refresh_lp_rewards"
+                and self._worker_lock_entries == 3
+            )
+            if self._pause_after_release:
+                self._armed = True
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+            self._lock.release()
+            if self._pause_after_release:
+                gap_open.set()
+                assert allow_exit.wait(timeout=5)
+            return False
+
+    class Account:
+        reads = 0
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            self.reads += 1
+            condition_id = "condition-a" if self.reads == 1 else "condition-b"
+            return {
+                "authenticated": True,
+                "checked_at": datetime(2026, 9, 16, 12, tzinfo=UTC),
+                "open_orders": [
+                    {
+                        "id": f"manual-{condition_id}",
+                        "condition_id": condition_id,
+                        "asset_id": f"yes-{condition_id}",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "original_size": Decimal("2"),
+                        "size_matched": Decimal("0"),
+                    }
+                ],
+                "positions": [],
+            }
+
+        def get_order_scoring(self, *, order_id: str) -> bool:
+            assert order_id.startswith("manual-")
+            return True
+
+        def lp_reward_snapshot(
+            self, reward_date: str, condition_id: str
+        ) -> dict[str, object]:
+            condition_reads.append(condition_id)
+            if condition_id == "condition-b":
+                b_done.set()
+            return {
+                "state": "known",
+                "reward_date": reward_date,
+                "condition_id": condition_id,
+                "market_amount": Decimal("0.80"),
+            }
+
+    class LP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {"state": "ready", "complete": True, "candidates": []}
+
+        def status(self) -> dict[str, object]:
+            return {"state": "none"}
+
+    service = PredictionExecutionService(
+        store=PredictionArbitrageStore(tmp_path / "data"),
+        monitor=object(),
+        trading=Account(),
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=LP(),
+    )
+    service._lp_dashboard_lock = HandoffLock(service)  # type: ignore[assignment]
+
+    try:
+        service.lp_dashboard()
+        assert gap_open.wait(timeout=2)
+        service.lp_dashboard()
+        allow_exit.set()
+        assert b_done.wait(timeout=2)
+    finally:
+        allow_exit.set()
+
+    assert condition_reads == ["condition-a", "condition-b"]
+
+
+def test_lp_dashboard_keeps_old_date_refresh_out_of_new_date_cache(
+    tmp_path: Path,
+) -> None:
+    old_entered = threading.Event()
+    old_release = threading.Event()
+    new_entered = threading.Event()
+    new_release = threading.Event()
+    reward_reads = 0
+
+    class Account:
+        reads = 0
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            self.reads += 1
+            if self.reads == 1:
+                checked_at = datetime(2026, 9, 15, 23, 59, tzinfo=UTC)
+            elif self.reads == 2:
+                checked_at = datetime(2026, 9, 16, 0, 1, tzinfo=UTC)
+            else:
+                raise RuntimeError("account read unavailable")
+            return {
+                "authenticated": True,
+                "checked_at": checked_at,
+                "open_orders": [
+                    {
+                        "id": "manual-order",
+                        "condition_id": "condition-1",
+                        "asset_id": "yes-token",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "original_size": Decimal("2"),
+                        "size_matched": Decimal("0"),
+                    }
+                ],
+                "positions": [],
+            }
+
+        def get_order_scoring(self, *, order_id: str) -> bool:
+            assert order_id == "manual-order"
+            return True
+
+        def lp_reward_snapshot(
+            self, reward_date: str, condition_id: str
+        ) -> dict[str, object]:
+            nonlocal reward_reads
+            reward_reads += 1
+            if reward_reads == 1:
+                old_entered.set()
+                assert old_release.wait(timeout=5)
+                amount = Decimal("0.10")
+            else:
+                new_entered.set()
+                assert new_release.wait(timeout=5)
+                amount = Decimal("0.20")
+            return {
+                "state": "known",
+                "reward_date": reward_date,
+                "condition_id": condition_id,
+                "market_amount": amount,
+            }
+
+    class LP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {"state": "ready", "complete": True, "candidates": []}
+
+        def status(self) -> dict[str, object]:
+            return {"state": "none"}
+
+    service = PredictionExecutionService(
+        store=PredictionArbitrageStore(tmp_path / "data"),
+        monitor=object(),
+        trading=Account(),
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=LP(),
+    )
+
+    try:
+        service.lp_dashboard()
+        assert old_entered.wait(timeout=2)
+        current = service.lp_dashboard()
+        assert current["market_rewards"]["condition-1"]["reward_date"] == "2026-09-16"
+        old_release.set()
+        assert new_entered.wait(timeout=2)
+        stale = service.lp_dashboard()
+        assert stale["stale"] is True
+        reward = stale["market_rewards"]["condition-1"]
+        assert reward["reward_date"] == "2026-09-16"
+        assert reward["market_amount"] is None
+        new_release.set()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and reward_reads < 2:
+            time.sleep(0.01)
+        assert reward_reads == 2
+    finally:
+        old_release.set()
+        new_release.set()
+
+    published: dict[str, object] | None = None
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        candidate = service.lp_dashboard()
+        reward = candidate["market_rewards"]["condition-1"]
+        if reward["market_amount"] == Decimal("0.20"):
+            published = candidate
+            break
+        time.sleep(0.01)
+    assert published is not None
+    reward = published["market_rewards"]["condition-1"]
+    assert reward["reward_date"] == "2026-09-16"
 
 
 def test_lp_observations_preserve_trial_after_manual_add(tmp_path: Path) -> None:

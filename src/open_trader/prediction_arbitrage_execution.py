@@ -62,6 +62,7 @@ from .validation_eat_policy import should_eat as _validation_should_eat
 
 
 PREVIEW_TTL = timedelta(seconds=10)
+_LP_REWARD_CACHE_SECONDS = 60.0
 
 _THRESHOLD_ERROR_HINTS = {
     "auth": "签名或钱包身份校验未通过",
@@ -413,6 +414,11 @@ class PredictionExecutionService:
         self._lp = lp
         self._lp_dashboard_lock = threading.RLock()
         self._lp_dashboard_cache: dict[str, object] | None = None
+        self._lp_reward_cache: dict[tuple[str, str], dict[str, object]] = {}
+        self._lp_reward_cached_at: dict[tuple[str, str], float] = {}
+        self._lp_reward_refresh_pending: dict[str, set[str]] = {}
+        self._lp_reward_refresh_active: set[tuple[str, str]] = set()
+        self._lp_reward_refresh_thread: threading.Thread | None = None
         self._cross_venue_monitor: object | None = None
         self._notifier = notifier
         self._lock_path = Path(lock_path)
@@ -791,7 +797,6 @@ class PredictionExecutionService:
                         and str(row.get("condition_id") or "").strip()
                     )
                 )
-                reward_reader = getattr(self._trading, "lp_reward_snapshot", None)
                 previous_dashboard = self._lp_dashboard_cache
                 previous_rewards_value = (
                     previous_dashboard.get("market_rewards")
@@ -804,88 +809,13 @@ class PredictionExecutionService:
                     else {}
                 )
                 reward_date = checked.astimezone(UTC).date().isoformat()
-                for condition_id in manual_conditions:
-                    attempted_at = _timestamp(datetime.now(UTC))
-                    try:
-                        observed = (
-                            _call(reward_reader, reward_date, condition_id)
-                            if callable(reward_reader)
-                            else None
-                        )
-                    except Exception:
-                        observed = None
-                    observed_at = _timestamp(datetime.now(UTC))
-                    raw_market: Mapping[str, object] = (
-                        observed if isinstance(observed, Mapping) else {}
-                    )
-                    accruals = raw_market.get("market_accruals_raw")
-                    has_raw_amount = _decimal(
-                        raw_market.get("market_amount_raw")
-                    ) is not None or (
-                        isinstance(accruals, (list, tuple)) and bool(accruals)
-                    )
-                    identity_matches = (
-                        str(raw_market.get("reward_date") or "") == reward_date
-                        and str(raw_market.get("condition_id") or "")
-                        == condition_id
-                    )
-                    read_complete = identity_matches and (
-                        raw_market.get("state") == "known"
-                        or (
-                            raw_market.get("state") == "unknown"
-                            and raw_market.get("reason") == "usd_value_unknown"
-                            and has_raw_amount
-                        )
-                    )
-                    if read_complete:
-                        market_rewards[condition_id] = {
-                            "state": raw_market.get("state", "unknown"),
-                            "usd_state": raw_market.get("usd_state", "unknown"),
-                            "reward_date": reward_date,
-                            "condition_id": condition_id,
-                            "market_amount": raw_market.get("market_amount"),
-                            "market_amount_raw": raw_market.get(
-                                "market_amount_raw"
-                            ),
-                            "market_asset": raw_market.get("market_asset"),
-                            "market_accruals_raw": accruals,
-                            "checked_at": observed_at,
-                            "last_success_at": observed_at,
-                            "last_attempt_at": observed_at,
-                            "stale": False,
-                            "source": "platform_earnings",
-                            "currency": "USD",
-                            "paid": False,
-                            "reason": raw_market.get("reason"),
-                        }
-                        continue
-
-                    previous_reward = previous_rewards.get(condition_id)
-                    retained_reward = (
-                        previous_reward if isinstance(previous_reward, Mapping) else {}
-                    )
-                    market_rewards[condition_id] = {
-                        "state": "unknown",
-                        "usd_state": "unknown",
-                        "reward_date": reward_date,
-                        "condition_id": condition_id,
-                        "market_amount": retained_reward.get("market_amount"),
-                        "market_amount_raw": retained_reward.get(
-                            "market_amount_raw"
-                        ),
-                        "market_asset": retained_reward.get("market_asset"),
-                        "market_accruals_raw": retained_reward.get(
-                            "market_accruals_raw"
-                        ),
-                        "checked_at": retained_reward.get("checked_at"),
-                        "last_success_at": retained_reward.get("last_success_at"),
-                        "last_attempt_at": attempted_at,
-                        "stale": True,
-                        "source": "platform_earnings",
-                        "currency": "USD",
-                        "paid": False,
-                        "reason": raw_market.get("reason") or "reward_read_unknown",
-                    }
+                cached_rewards, refresh_ids = self._lp_reward_cache_snapshot(
+                    reward_date,
+                    manual_conditions,
+                    previous_rewards=previous_rewards,
+                    candidate_rewards=market_rewards,
+                )
+                market_rewards.update(cached_rewards)
                 account_id = self._lp_account_id()
                 stored_observations = (
                     self._store.lp_observations(account_id)
@@ -937,6 +867,7 @@ class PredictionExecutionService:
                     "lp_session": session,
                 }
                 self._lp_dashboard_cache = result
+                self._schedule_lp_reward_refresh(reward_date, refresh_ids)
                 return result
             except Exception:
                 cached = self._lp_dashboard_cache
@@ -1430,6 +1361,293 @@ class PredictionExecutionService:
             result[condition_id] = save_observation(account_id, condition_id, observation)
 
         return {"state": "ready", "checked_at": _timestamp(now), "observations": result}
+
+    def _lp_reward_cache_snapshot(
+        self,
+        reward_date: str,
+        condition_ids: tuple[str, ...],
+        *,
+        previous_rewards: Mapping[str, object],
+        candidate_rewards: Mapping[str, object],
+    ) -> tuple[dict[str, dict[str, object]], tuple[str, ...]]:
+        cached: dict[str, dict[str, object]] = {}
+        refresh_ids: list[str] = []
+        now = self._clock()
+        for condition_id in condition_ids:
+            key = (reward_date, condition_id)
+            reward = self._lp_reward_cache.get(key)
+            if reward is None:
+                candidate = candidate_rewards.get(condition_id)
+                if (
+                    isinstance(candidate, Mapping)
+                    and str(candidate.get("reward_date") or "") == reward_date
+                    and str(candidate.get("condition_id") or "") == condition_id
+                ):
+                    reward = dict(candidate)
+                    if reward.get("stale") is not False:
+                        reward["stale"] = True
+                        if not reward.get("reason"):
+                            reward["reason"] = "reward_candidate_stale"
+                else:
+                    previous = previous_rewards.get(condition_id)
+                    reward = self._lp_reward_unknown(
+                        reward_date,
+                        condition_id,
+                        previous if isinstance(previous, Mapping) else {},
+                        attempted_at=None,
+                        reason="reward_read_unknown",
+                    )
+                self._lp_reward_cache[key] = dict(reward)
+                if reward.get("stale") is False:
+                    self._lp_reward_cached_at[key] = now
+            elif reward.get("stale") is False:
+                cached_at = self._lp_reward_cached_at.setdefault(key, now)
+                if now - cached_at >= _LP_REWARD_CACHE_SECONDS:
+                    reward = {**reward, "stale": True, "reason": "reward_cache_expired"}
+                    self._lp_reward_cache[key] = reward
+            cached[condition_id] = dict(reward)
+            if reward.get("stale") is True:
+                refresh_ids.append(condition_id)
+        return cached, tuple(refresh_ids)
+
+
+    def _schedule_lp_reward_refresh(
+        self, reward_date: str, condition_ids: tuple[str, ...]
+    ) -> None:
+        if not condition_ids:
+            return
+        pending = self._lp_reward_refresh_pending.get(reward_date)
+        running = self._lp_reward_refresh_thread
+        attempted_at = _timestamp(datetime.now(UTC))
+        for condition_id in condition_ids:
+            key = (reward_date, condition_id)
+            if key in self._lp_reward_refresh_active:
+                continue
+            if pending is None:
+                pending = self._lp_reward_refresh_pending.setdefault(reward_date, set())
+            pending.add(condition_id)
+            reward = self._lp_reward_cache.get(key)
+            if reward is None:
+                reward = self._lp_reward_unknown(
+                    reward_date,
+                    condition_id,
+                    {},
+                    attempted_at=attempted_at,
+                    reason="reward_read_pending",
+                )
+                self._lp_reward_cache[key] = reward
+            if reward.get("stale") is True:
+                updated = dict(reward)
+                updated["last_attempt_at"] = attempted_at
+                self._lp_reward_cache[key] = updated
+        if running is not None and running.is_alive():
+            return
+        if pending is None or not pending:
+            self._lp_reward_refresh_pending.pop(reward_date, None)
+            return
+        thread = threading.Thread(
+            target=self._refresh_lp_rewards,
+            name="lp-reward-refresh",
+            daemon=True,
+        )
+        self._lp_reward_refresh_thread = thread
+        thread.start()
+
+
+    def _refresh_lp_rewards(self) -> None:
+        try:
+            while True:
+                with self._lp_dashboard_lock:
+                    if not self._lp_reward_refresh_pending:
+                        if (
+                            self._lp_reward_refresh_thread
+                            is threading.current_thread()
+                        ):
+                            self._lp_reward_refresh_thread = None
+                        return
+                    reward_date, pending = next(
+                        iter(self._lp_reward_refresh_pending.items())
+                    )
+                    condition_ids = tuple(pending)
+                    self._lp_reward_refresh_pending.pop(reward_date, None)
+                    active = {
+                        (reward_date, condition_id) for condition_id in condition_ids
+                    }
+                    self._lp_reward_refresh_active.update(active)
+                    attempted_at = _timestamp(datetime.now(UTC))
+                try:
+                    self._refresh_lp_reward_batch(
+                        reward_date, condition_ids, attempted_at
+                    )
+                except Exception:
+                    pass
+                finally:
+                    with self._lp_dashboard_lock:
+                        self._lp_reward_refresh_active.difference_update(active)
+        finally:
+            with self._lp_dashboard_lock:
+                if self._lp_reward_refresh_thread is threading.current_thread():
+                    self._lp_reward_refresh_thread = None
+
+
+    def _refresh_lp_reward_batch(
+        self,
+        reward_date: str,
+        condition_ids: tuple[str, ...],
+        attempted_at: str,
+    ) -> None:
+        observed_by_condition: dict[str, object] = {}
+        try:
+            batch_reader = getattr(self._trading, "lp_reward_snapshots", None)
+            if callable(batch_reader):
+                observed = _call(batch_reader, reward_date, condition_ids)
+                if isinstance(observed, Mapping):
+                    observed_by_condition = {
+                        str(condition_id): value
+                        for condition_id, value in observed.items()
+                    }
+            else:
+                reader = getattr(self._trading, "lp_reward_snapshot", None)
+                if callable(reader):
+                    for condition_id in condition_ids:
+                        try:
+                            observed_by_condition[condition_id] = _call(
+                                reader, reward_date, condition_id
+                            )
+                        except Exception:
+                            observed_by_condition[condition_id] = None
+        except Exception:
+            observed_by_condition = {}
+
+        observed_at = _timestamp(datetime.now(UTC))
+        updated_rewards: dict[str, dict[str, object]] = {}
+        with self._lp_dashboard_lock:
+            for condition_id in condition_ids:
+                key = (reward_date, condition_id)
+                previous = self._lp_reward_cache.get(key, {})
+                updated = self._lp_reward_entry(
+                    observed_by_condition.get(condition_id),
+                    reward_date=reward_date,
+                    condition_id=condition_id,
+                    previous=previous,
+                    attempted_at=attempted_at,
+                    observed_at=observed_at,
+                )
+                self._lp_reward_cache[key] = updated
+                if updated.get("stale") is False:
+                    self._lp_reward_cached_at[key] = self._clock()
+                updated_rewards[condition_id] = updated
+            cached = self._lp_dashboard_cache
+            if isinstance(cached, Mapping):
+                raw_rewards = cached.get("market_rewards")
+                market_rewards = (
+                    dict(raw_rewards) if isinstance(raw_rewards, Mapping) else {}
+                )
+                for condition_id, updated in updated_rewards.items():
+                    current = market_rewards.get(condition_id)
+                    if (
+                        isinstance(current, Mapping)
+                        and str(current.get("reward_date") or "") == reward_date
+                    ):
+                        market_rewards[condition_id] = updated
+                if market_rewards != raw_rewards:
+                    self._lp_dashboard_cache = {
+                        **cached,
+                        "market_rewards": market_rewards,
+                    }
+
+
+    @staticmethod
+    def _lp_reward_entry(
+        observed: object,
+        *,
+        reward_date: str,
+        condition_id: str,
+        previous: Mapping[str, object],
+        attempted_at: str,
+        observed_at: str,
+    ) -> dict[str, object]:
+        raw_market: Mapping[str, object] = (
+            observed if isinstance(observed, Mapping) else {}
+        )
+        accruals = raw_market.get("market_accruals_raw")
+        has_raw_amount = _decimal(raw_market.get("market_amount_raw")) is not None or (
+            isinstance(accruals, (list, tuple)) and bool(accruals)
+        )
+        identity_matches = (
+            str(raw_market.get("reward_date") or "") == reward_date
+            and str(raw_market.get("condition_id") or "") == condition_id
+        )
+        read_complete = identity_matches and (
+            raw_market.get("state") == "known"
+            or (
+                raw_market.get("state") == "unknown"
+                and raw_market.get("reason") == "usd_value_unknown"
+                and has_raw_amount
+            )
+        )
+        if read_complete:
+            return {
+                "state": raw_market.get("state", "unknown"),
+                "usd_state": raw_market.get("usd_state", "unknown"),
+                "reward_date": reward_date,
+                "condition_id": condition_id,
+                "market_amount": raw_market.get("market_amount"),
+                "market_amount_raw": raw_market.get("market_amount_raw"),
+                "market_asset": raw_market.get("market_asset"),
+                "market_accruals_raw": accruals,
+                "checked_at": observed_at,
+                "last_success_at": observed_at,
+                "last_attempt_at": observed_at,
+                "stale": False,
+                "source": "platform_earnings",
+                "currency": "USD",
+                "paid": False,
+                "reason": raw_market.get("reason"),
+            }
+        return PredictionExecutionService._lp_reward_unknown(
+            reward_date,
+            condition_id,
+            previous,
+            attempted_at=attempted_at,
+            reason=str(raw_market.get("reason") or "reward_read_unknown"),
+        )
+
+
+    @staticmethod
+    def _lp_reward_unknown(
+        reward_date: str,
+        condition_id: str,
+        previous: Mapping[str, object],
+        *,
+        attempted_at: str | None,
+        reason: str,
+    ) -> dict[str, object]:
+        retained = (
+            previous
+            if str(previous.get("reward_date") or "") == reward_date
+            and str(previous.get("condition_id") or "") == condition_id
+            else {}
+        )
+        return {
+            "state": "unknown",
+            "usd_state": "unknown",
+            "reward_date": reward_date,
+            "condition_id": condition_id,
+            "market_amount": retained.get("market_amount"),
+            "market_amount_raw": retained.get("market_amount_raw"),
+            "market_asset": retained.get("market_asset"),
+            "market_accruals_raw": retained.get("market_accruals_raw"),
+            "checked_at": retained.get("checked_at"),
+            "last_success_at": retained.get("last_success_at"),
+            "last_attempt_at": attempted_at,
+            "stale": True,
+            "source": "platform_earnings",
+            "currency": "USD",
+            "paid": False,
+            "reason": reason,
+        }
+
 
     def lp_report(self, report_date: str) -> dict[str, object] | None:
         """Read one immutable stored LP daily report."""

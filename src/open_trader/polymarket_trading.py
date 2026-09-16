@@ -1746,33 +1746,33 @@ class PolymarketTradingClient:
         except Exception:
             return unknown
 
-    def lp_reward_snapshot(
+    def lp_reward_snapshots(
         self,
         reward_date: str,
-        condition_id: str,
+        condition_ids: Sequence[str],
         *,
         stop_event: threading.Event | None = None,
-    ) -> dict[str, object]:
-        """Read one day's current platform reward record without trading.
+    ) -> dict[str, dict[str, object]]:
+        """Read one day's rewards for several conditions with one account read."""
 
-        The SDK version in use does not expose the ``sponsored`` query for
-        user earnings.  Keep its authenticated transport and add only those
-        query parameters here; the endpoint's combined total is used once so
-        native earnings cannot be counted a second time.
-        """
-
+        requested = tuple(dict.fromkeys(str(condition_id) for condition_id in condition_ids))
+        if not requested:
+            return {}
         unknown = {
-            "state": "unknown",
-            "reward_date": reward_date,
-            "condition_id": condition_id,
-            "maker_address": self.config.wallet_address,
+            condition_id: {
+                "state": "unknown",
+                "reward_date": reward_date,
+                "condition_id": condition_id,
+                "maker_address": self.config.wallet_address,
+            }
+            for condition_id in requested
         }
+        if not any(requested):
+            return unknown
         try:
             if stop_event is not None and stop_event.is_set():
                 raise _RewardReadCancelled
             parsed_date = Date.fromisoformat(str(reward_date))
-            if not condition_id:
-                raise ValueError("condition_id_required")
             context = getattr(self._client, "_ctx", None)
             transport = getattr(context, "secure_clob", None)
             get_json = getattr(transport, "get_json", None)
@@ -1804,76 +1804,108 @@ class PolymarketTradingClient:
                 for asset in account_raw_amounts
             ):
                 raise ValueError("reward_total_unknown")
-
-            market_rows: list[Mapping[str, object]] = []
-            for sponsored in (False, True):
-                market_rows.extend(
-                    self._lp_reward_market_rows(
+            account_accruals = _reward_accruals(account_raw_amounts)
+            account_raw = account_accruals[0] if len(account_accruals) == 1 else None
+            results: dict[str, dict[str, object]] = {}
+            for condition_id in requested:
+                if not condition_id:
+                    continue
+                try:
+                    market_rows: list[Mapping[str, object]] = []
+                    for sponsored in (False, True):
+                        market_rows.extend(
+                            self._lp_reward_market_rows(
+                                parsed_date=parsed_date,
+                                maker=maker,
+                                condition_id=condition_id,
+                                signature_type=signature_type,
+                                sponsored=sponsored,
+                                get_json=get_json,
+                                stop_event=stop_event,
+                            )
+                        )
+                    market_amount = _reward_amount(
+                        market_rows,
                         parsed_date=parsed_date,
                         maker=maker,
                         condition_id=condition_id,
-                        signature_type=signature_type,
-                        sponsored=sponsored,
-                        get_json=get_json,
-                        stop_event=stop_event,
                     )
-                )
-            market_amount = _reward_amount(
-                market_rows,
-                parsed_date=parsed_date,
-                maker=maker,
-                condition_id=condition_id,
-            )
-            market_raw_amounts = _reward_raw_amounts(
-                market_rows,
-                parsed_date=parsed_date,
-                maker=maker,
-                condition_id=condition_id,
-            )
-            if market_raw_amounts is None or any(
-                asset not in LP_REWARD_ASSET_USD_ADDRESSES
-                for asset in market_raw_amounts
-            ):
-                raise ValueError("reward_market_unknown")
-            account_accruals = _reward_accruals(account_raw_amounts)
-            market_accruals = _reward_accruals(market_raw_amounts)
-            account_raw = account_accruals[0] if len(account_accruals) == 1 else None
-            market_raw = market_accruals[0] if len(market_accruals) == 1 else None
-            usd_state = (
-                "known"
-                if account_amount is not None and market_amount is not None
-                else "unknown"
-            )
-            return {
-                "state": usd_state,
-                "reward_date": parsed_date.isoformat(),
-                "condition_id": condition_id,
-                "maker_address": maker,
-                "account_amount": account_amount,
-                "market_amount": market_amount,
-                "account_amount_raw": account_raw.get("amount") if account_raw else None,
-                "account_asset": account_raw.get("asset") if account_raw else None,
-                "account_accruals_raw": account_accruals,
-                "market_amount_raw": market_raw.get("amount") if market_raw else None,
-                "market_asset": market_raw.get("asset") if market_raw else None,
-                "market_accruals_raw": market_accruals,
-                "usd_state": usd_state,
-                "account_reward": account_amount,
-                "market_reward": market_amount,
-                "currency": "USD",
-                "paid": False,
-                "reason": "usd_value_unknown" if usd_state == "unknown" else None,
-                "conversion_basis": (
-                    "earnings at unit asset_rate for verified pUSD/USDC.e assets; "
-                    "non-unit valuations UNKNOWN"
-                ),
-            }
+                    market_raw_amounts = _reward_raw_amounts(
+                        market_rows,
+                        parsed_date=parsed_date,
+                        maker=maker,
+                        condition_id=condition_id,
+                    )
+                    if market_raw_amounts is None or any(
+                        asset not in LP_REWARD_ASSET_USD_ADDRESSES
+                        for asset in market_raw_amounts
+                    ):
+                        raise ValueError("reward_market_unknown")
+                    market_accruals = _reward_accruals(market_raw_amounts)
+                    market_raw = market_accruals[0] if len(market_accruals) == 1 else None
+                    usd_state = (
+                        "known"
+                        if account_amount is not None and market_amount is not None
+                        else "unknown"
+                    )
+                    results[condition_id] = {
+                        "state": usd_state,
+                        "reward_date": parsed_date.isoformat(),
+                        "condition_id": condition_id,
+                        "maker_address": maker,
+                        "account_amount": account_amount,
+                        "market_amount": market_amount,
+                        "account_amount_raw": account_raw.get("amount") if account_raw else None,
+                        "account_asset": account_raw.get("asset") if account_raw else None,
+                        "account_accruals_raw": account_accruals,
+                        "market_amount_raw": market_raw.get("amount") if market_raw else None,
+                        "market_asset": market_raw.get("asset") if market_raw else None,
+                        "market_accruals_raw": market_accruals,
+                        "usd_state": usd_state,
+                        "account_reward": account_amount,
+                        "market_reward": market_amount,
+                        "currency": "USD",
+                        "paid": False,
+                        "reason": "usd_value_unknown" if usd_state == "unknown" else None,
+                        "conversion_basis": (
+                            "earnings at unit asset_rate for verified pUSD/USDC.e assets; "
+                            "non-unit valuations UNKNOWN"
+                        ),
+                    }
+                except _RewardReadCancelled:
+                    raise
+                except Exception:
+                    results[condition_id] = dict(unknown[condition_id])
+            return {condition_id: results.get(condition_id, unknown[condition_id]) for condition_id in requested}
         except _RewardReadCancelled:
-            unknown["reason"] = "cancelled"
+            return {
+                condition_id: {**unknown[condition_id], "reason": "cancelled"}
+                for condition_id in requested
+            }
+        except Exception:
             return unknown
-        except Exception as exc:
-            del exc
-            return unknown
+
+
+    def lp_reward_snapshot(
+        self,
+        reward_date: str,
+        condition_id: str,
+        *,
+        stop_event: threading.Event | None = None,
+    ) -> dict[str, object]:
+        """Read one day's current platform reward record without trading."""
+
+        return self.lp_reward_snapshots(
+            reward_date, (condition_id,), stop_event=stop_event
+        ).get(
+            condition_id,
+            {
+                "state": "unknown",
+                "reward_date": reward_date,
+                "condition_id": condition_id,
+                "maker_address": self.config.wallet_address,
+            },
+        )
 
     @staticmethod
     def _lp_reward_market_rows(

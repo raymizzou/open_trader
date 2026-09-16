@@ -899,6 +899,91 @@ def test_lp_reward_snapshot_preserves_identity_assets_and_scope() -> None:
     assert [path for path, _ in transport.calls] == ["/rewards/user/total"]
 
 
+def test_lp_reward_snapshots_reads_account_total_once_for_multiple_conditions() -> None:
+    date = "2026-09-14"
+    native_asset = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    sponsored_asset = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def row(
+        *, condition_id: str | None, asset: str, earnings: str
+    ) -> dict[str, object]:
+        result = {
+            "date": f"{date}T00:00:00Z",
+            "asset_address": asset,
+            "maker_address": WALLET,
+            "earnings": earnings,
+            "asset_rate": "1",
+        }
+        if condition_id is not None:
+            result["condition_id"] = condition_id
+        return result
+
+    class RewardTransport:
+        def get_json(self, path: str, *, params: dict[str, object]) -> object:
+            calls.append((path, dict(params)))
+            if path == "/rewards/user/total":
+                return [
+                    row(condition_id=None, asset=native_asset, earnings="0.60"),
+                    row(condition_id=None, asset=sponsored_asset, earnings="0.50"),
+                ]
+            if params["sponsored"] is False:
+                return {
+                    "data": [
+                        row(
+                            condition_id="condition-one",
+                            asset=native_asset,
+                            earnings="0.50",
+                        ),
+                        row(
+                            condition_id="condition-two",
+                            asset=native_asset,
+                            earnings="0.20",
+                        ),
+                    ],
+                    "next_cursor": "LTE=",
+                }
+            return {
+                "data": [
+                    row(
+                        condition_id="condition-one",
+                        asset=sponsored_asset,
+                        earnings="0.30",
+                    ),
+                    row(
+                        condition_id="condition-two",
+                        asset="0xdeadbeef",
+                        earnings="0.30",
+                    ),
+                ],
+                "next_cursor": "LTE=",
+            }
+
+    class RewardClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self._ctx = SimpleNamespace(
+                wallet_type="EOA", secure_clob=RewardTransport()
+            )
+
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET), RewardClient()
+    )
+
+    snapshots = adapter.lp_reward_snapshots(
+        date, ("condition-one", "condition-two")
+    )
+
+    assert snapshots["condition-one"]["state"] == "known"
+    assert snapshots["condition-one"]["account_amount"] == Decimal("1.10")
+    assert snapshots["condition-one"]["market_amount"] == Decimal("0.80")
+    assert snapshots["condition-two"]["state"] == "unknown"
+    assert sum(path == "/rewards/user/total" for path, _ in calls) == 1
+    market_calls = [params for path, params in calls if path == "/rewards/user"]
+    assert {params["sponsored"] for params in market_calls} == {False, True}
+    assert all(params["maker_address"] == WALLET for _, params in calls)
+
+
 def test_lp_reward_rates_use_current_scoped_percentages() -> None:
     today = datetime.now(UTC).date()
     date_text = today.isoformat()
