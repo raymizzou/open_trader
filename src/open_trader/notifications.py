@@ -185,6 +185,8 @@ def render_xiaoai_voice_notification(title: str, message: str) -> str | None:
     title, message = title.strip(), message.strip()
     if "测试通知" in title:
         return message or title
+    if title == "LP 风险警告":
+        return f"{title}\n\n{message}".strip()
     match = re.fullmatch(r"(A股|港股|美股)保护线触发 · ([^·]+)", title)
     if match is None:
         return None

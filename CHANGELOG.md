@@ -11,6 +11,15 @@ operator-facing: what changed, which workflow is affected, and what was verified
   verification remain required. Verified by the Make-target RED/GREEN gate
   cases and focused Dashboard gate regressions; no deployment or live calls
   were performed.
+- LP observations now expose current and preserved trial hourly yield together
+  with a binary add-room decision and one 10% actual-exposure stress warning in
+  the existing four-column table. Supplementary reward, qualification,
+  baseline, risk and delivery facts remain under each market's native details;
+  the background read-only reward monitor refreshes them without opening the
+  Dashboard. Expired or exposure-misaligned nested observations stay masked
+  until an explicit refresh while the fresh account snapshot remains visible.
+  Verified with the focused LP Dashboard contract and affected regressions; no
+  live notifications, orders or deployment were performed.
 
 - Added an LP-first tab and a separate multi-leg tab within 预测市场, with
   shared cached venue cards. Each refresh reads the shared venue summary and

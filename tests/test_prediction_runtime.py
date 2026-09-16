@@ -22,12 +22,14 @@ from open_trader.prediction_runtime import (
     _RuntimeOwnershipLock,
 )
 from open_trader.llm_providers import PROVIDER_IDS, LlmCompletion
+from open_trader.notifications import FeishuWebhookNotifier
 from open_trader.predict_cross_venue import (
     LlmCrossVenueEquivalenceValidator,
     ExplicitMarketPair,
     VenueMarket,
 )
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+from open_trader.prediction_arbitrage_execution import PredictionExecutionService
 
 
 def _shadow_cross_pair(index: int) -> ExplicitMarketPair:
@@ -1289,6 +1291,305 @@ def test_lp_dashboard_refresh_cannot_block_risk_monitor(
         if second.state not in {"STOPPED", "NEW"}:
             second.stop()
     assert probe_holder[0].active == 0
+
+
+def test_lp_observations_refresh_without_dashboard_and_stop_with_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.prediction_runtime as runtime_module
+
+    class Probe:
+        def __init__(self, *, block_rate: bool = False) -> None:
+            self.block_rate = block_rate
+            self.observation_started = threading.Event()
+            self.observation_finished = threading.Event()
+            self.rate_started = threading.Event()
+            self.rate_cancelled = threading.Event()
+            self.lp_tick_seen = threading.Event()
+            self.monitor_stopped = threading.Event()
+            self.notification_sent = threading.Event()
+            self.notifications: list[str] = []
+            self.order_writes = 0
+            self.cancellations = 0
+            self.rate_thread_name = ""
+
+    probe_holder: list[Probe] = []
+    order = {
+        "order_id": "manual-order",
+        "condition_id": "condition-1",
+        "token_id": "yes-token",
+        "outcome": "YES",
+        "side": "BUY",
+        "status": "LIVE",
+        "price": Decimal("0.50"),
+        "original_size": Decimal("100"),
+        "size_matched": Decimal("0"),
+        "remaining_size": Decimal("100"),
+        "reward_min_size": Decimal("40"),
+        "fees_enabled": False,
+        "market_title": "Will it happen?",
+    }
+
+    class FakeTrading:
+        def __init__(self, probe: Probe) -> None:
+            self.probe = probe
+            self.config = SimpleNamespace(
+                wallet_address="0x" + "4" * 40,
+                signer_address="0x" + "5" * 40,
+                predict=None,
+            )
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": datetime.now(UTC),
+                "open_orders": [dict(order)],
+                "positions": [],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def get_order_scoring(self, _order_id: str) -> bool:
+            return True
+
+        def lp_reward_snapshot(self, reward_date: str, condition_id: str) -> dict[str, object]:
+            return {"state": "unknown", "reward_date": reward_date, "condition_id": condition_id}
+
+        def lp_reward_rates(
+            self, *, stop_event: threading.Event | None = None
+        ) -> dict[str, object]:
+            self.probe.rate_thread_name = threading.current_thread().name
+            self.probe.rate_started.set()
+            if self.probe.block_rate:
+                assert stop_event is not None
+                if stop_event.wait(timeout=5):
+                    self.probe.rate_cancelled.set()
+                    return {
+                        "state": "unknown",
+                        "complete": False,
+                        "checked_at": datetime.now(UTC),
+                        "markets": {},
+                    }
+            checked_at = datetime.now(UTC)
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": checked_at,
+                "markets": {
+                    "condition-1": {
+                        "state": "known",
+                        "hourly_reward_usd": Decimal("0.20"),
+                        "currency": "USD",
+                        "checked_at": checked_at,
+                        "sources": ("native",),
+                        "native": {
+                            "state": "known",
+                            "earning_percentage": Decimal("1"),
+                            "hourly_reward_usd": Decimal("0.20"),
+                            "currency": "USD",
+                        },
+                    }
+                },
+            }
+
+        def lp_order_books(
+            self, token_ids: tuple[str, ...]
+        ) -> dict[str, dict[str, object]]:
+            return {
+                token: {
+                    "condition_id": "condition-1",
+                    "token_id": token,
+                    "received_at": datetime.now(UTC),
+                    "bids": [
+                        {"price": Decimal("0.51"), "size": Decimal("20")},
+                        {"price": Decimal("0.50"), "size": Decimal("100")},
+                        {"price": Decimal("0.44"), "size": Decimal("1000")},
+                    ],
+                    "asks": [],
+                }
+                for token in token_ids
+            }
+
+        def create_limit_order(self, **_kwargs: object) -> None:
+            self.probe.order_writes += 1
+
+        def post_order(self, _order: object) -> None:
+            self.probe.order_writes += 1
+
+        def cancel_orders(self, **_kwargs: object) -> None:
+            self.probe.cancellations += 1
+
+        def close(self) -> None:
+            pass
+
+    class FakeLP:
+        def __init__(self, _store: object, _trading: object, **_kwargs: object) -> None:
+            self.probe = probe_holder[0]
+
+        def set_mutation_guard(self, _guard: object) -> None:
+            pass
+
+        def refresh_candidates(self, **_kwargs: object) -> dict[str, object]:
+            return {"state": "known", "complete": True, "candidates": []}
+
+        def refresh_rewards(self, **_kwargs: object) -> dict[str, object]:
+            return {"state": "known"}
+
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {
+                "state": "known",
+                "complete": True,
+                "candidates": [],
+                "recommendations": [],
+                "market_rewards": {},
+            }
+
+        def generate_due_report(self) -> None:
+            pass
+
+        def status(self, _session_id: str | None = None) -> dict[str, object]:
+            return {"state": "none"}
+
+        def close(self) -> None:
+            pass
+
+    class FakeMonitor:
+        def __init__(self, **_kwargs: object) -> None:
+            self.probe = probe_holder[0]
+
+        def set_ready_observer(self, _observer: object) -> None:
+            pass
+
+        def set_observation_observer(self, _observer: object) -> None:
+            pass
+
+        def set_auto_eat_observer(self, _observer: object) -> None:
+            pass
+
+        def set_failure_observer(self, _observer: object) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            self.probe.monitor_stopped.set()
+
+    class FakeObservationMonitor:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+    class TestExecution(PredictionExecutionService):
+        def reconcile_startup(self) -> dict[str, object]:
+            return {"state": "ready"}
+
+        def refresh_lp_observations(
+            self, *, stop_event: threading.Event | None = None
+        ) -> dict[str, object]:
+            probe = probe_holder[0]
+            probe.observation_started.set()
+            try:
+                return super().refresh_lp_observations(stop_event=stop_event)
+            finally:
+                probe.observation_finished.set()
+
+        def lp_tick(self) -> dict[str, object]:
+            probe_holder[0].lp_tick_seen.set()
+            return {"state": "none"}
+
+    monkeypatch.setattr(runtime_module, "_LP_TICK_SECONDS", 0.01)
+    monkeypatch.setattr(runtime_module, "_LP_REWARD_SECONDS", 0.01)
+    monkeypatch.setattr(runtime_module, "PolymarketLPService", FakeLP)
+    monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor)
+    monkeypatch.setattr(runtime_module, "PredictionObservationMonitor", FakeObservationMonitor)
+    monkeypatch.setattr(runtime_module, "PredictionExecutionService", TestExecution)
+    monkeypatch.setattr(runtime_module, "RelationCatalog", lambda _path: object())
+    monkeypatch.setattr(runtime_module, "LlmRelationValidator", lambda _store: object())
+    monkeypatch.setattr(runtime_module, "LlmTitleTranslator", lambda _store: object())
+    monkeypatch.setattr(runtime_module, "ensure_same_event_same_venue_scope", lambda _store: False)
+    monkeypatch.setattr(runtime_module, "load_trading_config", lambda _path: SimpleNamespace(
+        signer_address="0x" + "5" * 40,
+        wallet_address="0x" + "4" * 40,
+        predict=None,
+    ))
+    monkeypatch.setattr(
+        runtime_module,
+        "PolymarketTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: FakeTrading(probe_holder[0])),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "PredictTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: None),
+    )
+    monkeypatch.setattr(PredictionRuntime, "_wire_relation_lifecycle", lambda _self: None)
+    monkeypatch.setattr(
+        PredictionRuntime,
+        "_configure_n_leg_shadow",
+        lambda _self: (lambda *_args: None),
+    )
+
+    def new_runtime(probe: Probe, name: str) -> PredictionRuntime:
+        probe_holder[:] = [probe]
+
+        def post_json(
+            _url: str,
+            payload: dict[str, object],
+            _timeout_seconds: float,
+        ) -> dict[str, object]:
+            text = payload["content"]["text"]
+            probe.notifications.append(str(text))
+            probe.notification_sent.set()
+            return {"code": 0}
+
+        return PredictionRuntime(
+            data_dir=tmp_path / name,
+            prediction_config_path=tmp_path / "prediction.json",
+            dashboard_url="http://127.0.0.1:8766/",
+            notifier=FeishuWebhookNotifier(
+                webhook_url="https://feishu.invalid/hook", post_json=post_json
+            ),
+            cross_venue_monitor=_UnavailableCrossVenueMonitor("test-disabled"),
+            solver_server_factory=lambda: object(),
+            enable_n_leg_background=False,
+        )
+
+    normal_probe = Probe()
+    normal = new_runtime(normal_probe, "normal-runtime")
+    normal.start()
+    try:
+        assert normal.state == "RUNNING"
+        assert normal_probe.observation_started.wait(timeout=2)
+        assert normal_probe.notification_sent.wait(timeout=2)
+        assert normal_probe.rate_thread_name == "prediction-lp-reward-monitor"
+        assert normal_probe.lp_tick_seen.wait(timeout=2)
+        assert len(normal_probe.notifications) == 1
+        assert "LP 风险警告" in normal_probe.notifications[0]
+        assert "达到 10% 警戒线" in normal_probe.notifications[0]
+        assert normal_probe.order_writes == normal_probe.cancellations == 0
+    finally:
+        normal.stop()
+    assert normal.state == "STOPPED"
+    assert normal_probe.monitor_stopped.is_set()
+
+    blocked_probe = Probe(block_rate=True)
+    blocked = new_runtime(blocked_probe, "blocked-runtime")
+    blocked.start()
+    assert blocked_probe.rate_started.wait(timeout=2)
+    assert blocked_probe.lp_tick_seen.wait(timeout=2)
+    assert not blocked_probe.observation_finished.is_set()
+    blocked.stop()
+    assert blocked.state == "STOPPED"
+    assert blocked_probe.rate_cancelled.is_set()
+    assert blocked_probe.observation_finished.is_set()
+    assert blocked_probe.monitor_stopped.is_set()
+    assert blocked_probe.order_writes == blocked_probe.cancellations == 0
 
 
 def test_runtime_owner_lock_excludes_a_real_second_process(tmp_path: Path) -> None:

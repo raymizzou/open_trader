@@ -197,6 +197,145 @@ def test_lp_stress_exit_removes_own_orders_and_the_entire_best_level() -> None:
     assert "exit_liquidity_insufficient" in insufficient["reason_codes"]
 
 
+def test_lp_exposure_uses_actual_cost_and_remaining_orders() -> None:
+    direction = _direction()
+    market = direction["market"]
+    assert isinstance(market, dict)
+    account = {
+        "authenticated": True,
+        "checked_at": NOW,
+        "open_orders_complete": True,
+        "positions_complete": True,
+        "open_orders": [
+            {
+                "condition_id": "condition-a",
+                "token_id": "token-yes",
+                "side": "BUY",
+                "status": "LIVE",
+                "price": Decimal("0.50"),
+                "original_size": Decimal("100"),
+                "size_matched": Decimal("40"),
+                "remaining_size": Decimal("60"),
+            }
+        ],
+        "positions": [
+            {
+                "condition_id": "condition-a",
+                "token_id": "token-yes",
+                "size": Decimal("40"),
+                "average_price": Decimal("0.50"),
+            }
+        ],
+    }
+
+    def book(next_bid: str, *, next_size: str = "100") -> dict[str, object]:
+        return {
+            "condition_id": "condition-a",
+            "token_id": "token-yes",
+            "received_at": NOW,
+            "bids": [
+                {"price": Decimal("0.51"), "size": Decimal("20")},
+                {"price": Decimal("0.50"), "size": Decimal("60")},
+                {"price": Decimal(next_bid), "size": Decimal(next_size)},
+            ],
+        }
+
+    for next_bid, expected_loss, expected_ratio, warning in (
+        ("0.46", Decimal("4"), Decimal("0.08"), False),
+        ("0.45", Decimal("5"), Decimal("0.10"), True),
+        ("0.44", Decimal("6"), Decimal("0.12"), True),
+    ):
+        result = polymarket_lp_risk.evaluate_lp_exposure(
+            book(next_bid), market=market, account=account, now=NOW
+        )
+        assert result["state"] == "known"
+        assert result["risk_quantity"] == Decimal("100")
+        assert result["risk_principal"] == Decimal("50")
+        assert result["stress_loss"] == expected_loss
+        assert result["loss_ratio"] == expected_ratio
+        assert result["warning"] is warning
+
+    for age in (11, 120):
+        delayed_account = {**account, "checked_at": NOW - timedelta(seconds=age)}
+        result = polymarket_lp_risk.evaluate_lp_exposure(
+            book("0.46"), market=market, account=delayed_account, now=NOW
+        )
+        assert result["state"] == "known"
+        assert result["loss_ratio"] == Decimal("0.08")
+    expired_account = {**account, "checked_at": NOW - timedelta(seconds=121)}
+    expired_account_result = polymarket_lp_risk.evaluate_lp_exposure(
+        book("0.46"), market=market, account=expired_account, now=NOW
+    )
+    assert expired_account_result["state"] == "unknown"
+    assert "account_freshness_stale" in expired_account_result["reason_codes"]
+    stale_book = {**book("0.46"), "received_at": NOW - timedelta(seconds=11)}
+    stale_book_result = polymarket_lp_risk.evaluate_lp_exposure(
+        stale_book, market=market, account=account, now=NOW
+    )
+    assert stale_book_result["state"] == "unknown"
+    assert "book_freshness_stale" in stale_book_result["reason_codes"]
+
+    insufficient = polymarket_lp_risk.evaluate_lp_exposure(
+        book("0.45", next_size="99.99"),
+        market=market,
+        account=account,
+        now=NOW,
+    )
+    assert insufficient["state"] == "unknown"
+    assert insufficient["warning"] is None
+    assert insufficient["loss_ratio"] is None
+
+    unknown_fee_market = {
+        **market,
+        "fees_enabled": True,
+        "taker_fee_rate": None,
+        "fee_exponent": Decimal("1"),
+    }
+    unknown_fee = polymarket_lp_risk.evaluate_lp_exposure(
+        book("0.45"),
+        market=unknown_fee_market,
+        account=account,
+        now=NOW,
+    )
+    assert unknown_fee["state"] == "unknown"
+    assert unknown_fee["warning"] is None
+    assert "exit_fee_unknown" in unknown_fee["reason_codes"]
+
+    fee_market = {
+        **market,
+        "fees_enabled": True,
+        "taker_fee_rate": Decimal("0.05"),
+        "fee_exponent": Decimal("1"),
+    }
+    fee_account = {
+        **account,
+        "open_orders": [],
+        "positions": [
+            {
+                "condition_id": "condition-a",
+                "token_id": "token-yes",
+                "size": Decimal("20"),
+                "average_price": Decimal("0.50"),
+            }
+        ],
+    }
+    fee_book = {
+        "condition_id": "condition-a",
+        "token_id": "token-yes",
+        "received_at": NOW,
+        "bids": [
+            {"price": Decimal("0.51"), "size": Decimal("10")},
+            {"price": Decimal("0.46"), "size": Decimal("20")},
+        ],
+    }
+    with_fees = polymarket_lp_risk.evaluate_lp_exposure(
+        fee_book, market=fee_market, account=fee_account, now=NOW
+    )
+    assert with_fees["risk_principal"] == Decimal("10")
+    assert with_fees["exit_fee"] == Decimal("0.24840")
+    assert with_fees["stress_loss"] == Decimal("1.04840")
+
+
 def test_lp_entry_loss_limit_includes_exit_fees() -> None:
     direction = _direction()
     market = dict(direction["market"])

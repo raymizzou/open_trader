@@ -6239,6 +6239,141 @@ console.log(JSON.stringify({
     }
 
 
+def test_lp_orders_show_trial_current_rate_and_risk_warning() -> None:
+    output = run_dashboard_js(r'''
+const checkedAt = "2026-09-15T04:00:00Z";
+const dashboard = {
+  state: "ready", stale: false, checked_at: checkedAt, last_success_at: checkedAt,
+  orders: [
+    {order_id: "order-1", condition_id: "condition-1", token_id: "token-1",
+      market_title: "Tracked LP market", market_url: "https://polymarket.com/event/tracked",
+      outcome: "YES", side: "BUY", status: "LIVE", price: "0.50", quantity: "40",
+      filled_quantity: "40", remaining_quantity: "0", management: "manual_read_only",
+      read_only: true, scoring_status: "true"},
+    {order_id: "order-2", condition_id: "condition-1", token_id: "token-1",
+      market_title: "Tracked LP market", market_url: "https://polymarket.com/event/tracked",
+      outcome: "YES", side: "BUY", status: "LIVE", price: "0.50", quantity: "80",
+      filled_quantity: "0", remaining_quantity: "80", management: "manual_read_only",
+      read_only: true, scoring_status: "true"},
+    {order_id: "stale-order", condition_id: "condition-stale", token_id: "stale-token",
+      market_title: "Stale LP market", market_url: "https://polymarket.com/event/stale",
+      outcome: "NO", side: "BUY", status: "LIVE", price: "0.45", quantity: "40",
+      filled_quantity: "40", remaining_quantity: "0", management: "manual_read_only",
+      read_only: true, scoring_status: "true"},
+    {order_id: "trial-order", condition_id: "condition-trial", token_id: "trial-token",
+      market_title: "Trial LP market", market_url: "https://polymarket.com/event/trial",
+      outcome: "YES", side: "BUY", status: "LIVE", price: "0.50", quantity: "40",
+      filled_quantity: "40", remaining_quantity: "0", management: "manual_read_only",
+      read_only: true, scoring_status: "true"},
+  ],
+  positions: [
+    {condition_id: "condition-old", token_id: "old-token", market_title: "Old LP market",
+      market_url: "https://polymarket.com/event/old", outcome: "YES", size: "10",
+      average_price: "0.50", management: "manual_read_only", read_only: true},
+  ],
+  market_rewards: [{condition_id: "condition-1", market_amount_raw: "0.02", asset: "USDC.e", paid: false}],
+  lp_observations: {
+    "condition-1": {
+      state: "known", stage: "added", stale: false,
+      current_hourly_reward_usd: "0.108", occupied_capital_usd: "60",
+      current_yield_pct_per_hour: "0.18",
+      trial_baseline: {yield_pct_per_hour: "0.25", checked_at: checkedAt, quantity: "40", price: "0.50", occupied_capital_usd: "20"},
+      qualified: true, risk_state: "warning", risk_warning: true,
+      risk_directions: [
+        {outcome: "YES", state: "known", warning: true, risk_principal: "60", stress_loss: "6", loss_ratio: "0.1", threshold: "0.1", unfilled_buy_orders: true, checked_at: checkedAt},
+        {outcome: "NO", state: "known", warning: true, risk_principal: "60", stress_loss: "7.2", loss_ratio: "0.12", threshold: "0.1", unfilled_buy_orders: true, checked_at: checkedAt},
+      ],
+      risk_alerts: {YES: {active: true, title: "LP 风险警告 <stored>", message: "当前风险 <10% & 未成交买单", channels: {feishu: {success: true}, xiaoai: {success: true}}}},
+      add_room: {available: false, reason: "risk_warning"}, checked_at: checkedAt,
+    },
+    "condition-stale": {
+      state: "unknown", stage: "added", stale: true, reason: "reward_rates_stale",
+      current_hourly_reward_usd: null, occupied_capital_usd: "18", current_yield_pct_per_hour: null,
+      trial_baseline: null, qualified: null, risk_state: "warning", risk_warning: true,
+      risk_directions: [{outcome: "NO", state: "known", warning: true, risk_principal: "18", stress_loss: "2.16", loss_ratio: "0.12", threshold: "0.1", reason_codes: [], checked_at: "2026-09-15T01:00:00Z"}],
+      add_room: {available: false, reason: "current_yield_unknown"}, checked_at: "2026-09-15T01:00:00Z",
+    },
+    "condition-trial": {
+      state: "known", stage: "trial", stale: false, current_hourly_reward_usd: "0.05",
+      occupied_capital_usd: "20", current_yield_pct_per_hour: "0.25",
+      trial_reference: {yield_pct_per_hour: "0.25", checked_at: checkedAt, quantity: "40", price: "0.50", occupied_capital_usd: "20"},
+      qualified: true, risk_state: "known", risk_warning: false, risk_directions: [],
+      add_room: {available: true}, checked_at: checkedAt,
+    },
+    "condition-old": {
+      state: "unknown", stage: "added", stale: true, reason: "account_facts_stale",
+      current_hourly_reward_usd: "0.4", occupied_capital_usd: "99", current_yield_pct_per_hour: "0.4",
+      trial_baseline: null, qualified: true, risk_state: "warning", risk_warning: true,
+      risk_directions: [{outcome: "YES", state: "known", warning: true, risk_principal: "99", stress_loss: "15", loss_ratio: "0.15", threshold: "0.1", checked_at: "2026-09-15T01:00:00Z"}],
+      add_room: {available: false, reason: "risk_warning"}, checked_at: "2026-09-15T01:00:00Z",
+    },
+  },
+};
+const html = predictionLpCard({lp_dashboard: dashboard});
+const managed = predictionLpCard({lp_dashboard: {...dashboard, lp_session: {state: "active", market_title: "Managed market", outcome: "YES"}}});
+const orderTable = (html.match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
+const trackedRows = (orderTable.match(/<tr[\s\S]*?Tracked LP market[\s\S]*?<\/tr>/g) || []);
+const details = orderTable.match(/<details[\s\S]*?<\/details>/g) || [];
+console.log(JSON.stringify({
+      headers: [...orderTable.matchAll(/<th\b[^>]*>([\s\S]*?)<\/th>/g)].map((m) => m[1]),
+  current: orderTable.includes("当前 0.18%／小时"),
+  baseline: orderTable.includes("试挂基准 0.25%／小时"),
+      addRoom: orderTable.includes("加单空间：无") && orderTable.includes("风险已触线"),
+      addRoomDangerTone: orderTable.includes('<span class="pm-pill pm-tone-danger">加单空间：无</span>'),
+      addRoomOkTone: orderTable.includes('<span class="pm-pill pm-tone-ok">加单空间：有</span>'),
+      addRoomNeutralTone: orderTable.includes('<span class="pm-pill">加单空间：无</span>'),
+      riskHeader: html.includes("压力损失（警戒线 10%）"),
+      riskValue: orderTable.includes("10% · $6.00") && orderTable.includes("已触线"),
+      riskDangerTone: orderTable.includes('<strong class="pm-tone-danger">YES 10% · $6.00</strong>'),
+      riskDirectionLabels: orderTable.includes("YES 10% · $6.00") && orderTable.includes("NO 12% · $7.20"),
+      rewardOnlyRiskPreserved: orderTable.includes("12% · $2.16"),
+      staleRiskMasked: orderTable.includes("Old LP market") && !orderTable.includes("YES 15% · $15.00") && !orderTable.includes("占用本金 $99.00"),
+      stale: orderTable.includes("当前 —") && orderTable.includes("数据过期"),
+      trialBaselineFromReference: orderTable.includes("Trial LP market") && orderTable.includes("试挂基准 0.25%／小时"),
+      capitalLabel: orderTable.includes("占用本金"),
+      capitalAligned: orderTable.includes("占用本金 $60.00"),
+      subtitle: html.includes("手工挂单 · 收益与风险观察"),
+      managedFootnote: managed.includes("$5 止损触发线") && managed.includes("当前系统会话详情"),
+      detailsAvailable: details.length >= 2 && details.some((item) => item.includes("累计") && item.includes("试挂基准")),
+      alertTextEscaped: orderTable.includes("飞书与语音原文：LP 风险警告 &lt;stored&gt;") && orderTable.includes("当前风险 &lt;10% &amp; 未成交买单"),
+      pressureExplanation: orderTable.includes("压力估算：实际持仓＋未成交买单余量；未成交部分按假设成交估算，不是已发生亏损。"),
+      notificationHours: orderTable.includes("通知时段：飞书全天；语音北京时间 23:00–08:00 静音。"),
+      shortNote: html.includes("预计 LP 毛奖励；压力损失不含奖励抵扣；10% 是风险警告线。"),
+      marketLink: orderTable.includes('href="https://polymarket.com/event/tracked"'),
+  tableRows: trackedRows.length,
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered == {
+        "headers": ["标的", "挂单与持仓", "LP 收益率（预计）", "压力损失（警戒线 10%）"],
+        "current": True,
+        "baseline": True,
+        "addRoom": True,
+        "addRoomDangerTone": True,
+        "addRoomOkTone": True,
+        "addRoomNeutralTone": True,
+        "riskHeader": True,
+        "riskValue": True,
+        "riskDangerTone": True,
+        "riskDirectionLabels": True,
+        "rewardOnlyRiskPreserved": True,
+        "staleRiskMasked": True,
+        "stale": True,
+        "capitalLabel": True,
+        "capitalAligned": True,
+        "subtitle": True,
+        "managedFootnote": True,
+        "detailsAvailable": True,
+        "alertTextEscaped": True,
+        "pressureExplanation": True,
+        "notificationHours": True,
+        "shortNote": True,
+        "marketLink": True,
+        "tableRows": 2,
+        "trialBaselineFromReference": True,
+    }
+
+
 def test_dashboard_display_number_formats_numeric_text_only() -> None:
     output = run_dashboard_js(r'''
 console.log(JSON.stringify({

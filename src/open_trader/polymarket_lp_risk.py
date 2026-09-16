@@ -9,6 +9,7 @@ from typing import cast
 
 
 BOOK_FRESHNESS_SECONDS = Decimal("10")
+ACCOUNT_FRESHNESS_SECONDS = Decimal("120")
 TERMINAL_ORDER_STATES = frozenset(
     {"FILLED", "MATCHED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "FAILED"}
 )
@@ -67,10 +68,16 @@ def _timestamp(value: object, *, name: str = "timestamp") -> datetime:
     return moment.astimezone(UTC)
 
 
-def _freshness(value: object, now: datetime, name: str) -> None:
+def _freshness(
+    value: object,
+    now: datetime,
+    name: str,
+    *,
+    max_age: Decimal = BOOK_FRESHNESS_SECONDS,
+) -> None:
     stamp = _timestamp(value, name=name)
     age = Decimal(str((now - stamp).total_seconds()))
-    if age < 0 or age > BOOK_FRESHNESS_SECONDS:
+    if age < 0 or age > max_age:
         raise ValueError(f"{name}_stale")
 
 
@@ -251,6 +258,81 @@ def _executable_bid_value(
     return value if remaining <= 0 else None
 
 
+def _external_bid_sizes(
+    bids: Sequence[tuple[Decimal, Decimal]],
+    *,
+    condition_id: str,
+    token_id: str,
+    own_orders: object,
+) -> tuple[dict[Decimal, Decimal] | None, str | None]:
+    own_size_by_price: dict[Decimal, Decimal] = {}
+    for order in _items(own_orders):
+        if not isinstance(order, Mapping):
+            return None, "own_order_facts_unknown"
+        if str(order.get("status") or "").upper() in TERMINAL_ORDER_STATES:
+            continue
+        side = str(order.get("side") or "").upper()
+        if side not in {"BUY", "SELL"}:
+            return None, "own_order_side_unknown"
+        if side != "BUY":
+            continue
+        order_condition = order.get("condition_id", order.get("market"))
+        order_token = order.get("token_id", order.get("asset_id"))
+        if order_condition not in (None, "", condition_id):
+            continue
+        if order_token not in (None, "", token_id):
+            continue
+        if order_token in (None, ""):
+            return None, "own_order_identity_unknown"
+        order_price = _maybe_decimal(order.get("price"))
+        remaining = _maybe_decimal(
+            order.get(
+                "remaining_size",
+                order.get("remaining_quantity", order.get("size")),
+            )
+        )
+        if remaining is None:
+            original = _maybe_decimal(order.get("original_size"))
+            matched = _maybe_decimal(order.get("size_matched", 0))
+            if original is not None and matched is not None:
+                remaining = max(Decimal("0"), original - matched)
+        if order_price is None or remaining is None or order_price <= 0 or remaining < 0:
+            return None, "own_order_depth_unknown"
+        own_size_by_price[order_price] = (
+            own_size_by_price.get(order_price, Decimal("0")) + remaining
+        )
+
+    bid_size_by_price: dict[Decimal, Decimal] = {}
+    for level_price, size in bids:
+        bid_size_by_price[level_price] = bid_size_by_price.get(
+            level_price, Decimal("0")
+        ) + size
+    for level_price, own_size in own_size_by_price.items():
+        if level_price in bid_size_by_price:
+            bid_size_by_price[level_price] = max(
+                Decimal("0"), bid_size_by_price[level_price] - own_size
+            )
+    return bid_size_by_price, None
+
+
+def _lp_exit_values(
+    market: Mapping[str, object],
+    remaining_bids: Mapping[Decimal, Decimal],
+    quantity: Decimal,
+) -> tuple[Decimal | None, Decimal | None]:
+    residual_book = {
+        "bids": [
+            {"price": price, "size": size}
+            for price, size in remaining_bids.items()
+        ]
+    }
+    gross_exit_value = _executable_bid_value({"book": residual_book}, quantity)
+    exit_fee = _projected_taker_fee(
+        {"market": market, "book": residual_book}, quantity
+    )
+    return gross_exit_value, exit_fee
+
+
 def _account_after_reservations(
     account: Mapping[str, object], reservations: object
 ) -> dict[str, object] | None:
@@ -412,62 +494,22 @@ def estimate_lp_stress_exit(
         unknown["reason_codes"] = ["best_bid_changed"]
         return unknown
 
-    own_size_by_price: dict[Decimal, Decimal] = {}
-    for order in _items(own_orders):
-        if not isinstance(order, Mapping):
-            unknown["reason_codes"] = ["own_order_facts_unknown"]
-            return unknown
-        if str(order.get("status") or "").upper() in TERMINAL_ORDER_STATES:
-            continue
-        side = str(order.get("side") or "").upper()
-        if side not in {"BUY", "SELL"}:
-            unknown["reason_codes"] = ["own_order_side_unknown"]
-            return unknown
-        if side != "BUY":
-            continue
-        order_condition = order.get("condition_id", order.get("market"))
-        order_token = order.get("token_id", order.get("asset_id"))
-        if order_condition not in (None, "", condition_id):
-            continue
-        if order_token not in (None, "", token_id):
-            continue
-        if order_token in (None, ""):
-            unknown["reason_codes"] = ["own_order_identity_unknown"]
-            return unknown
-        order_price = _maybe_decimal(order.get("price"))
-        remaining = _maybe_decimal(
-            order.get("remaining_size", order.get("size"))
-        )
-        if remaining is None:
-            original = _maybe_decimal(order.get("original_size"))
-            matched = _maybe_decimal(order.get("size_matched", 0))
-            if original is not None and matched is not None:
-                remaining = max(Decimal("0"), original - matched)
-        if order_price is None or remaining is None or order_price <= 0 or remaining < 0:
-            unknown["reason_codes"] = ["own_order_depth_unknown"]
-            return unknown
-        own_size_by_price[order_price] = (
-            own_size_by_price.get(order_price, Decimal("0")) + remaining
-        )
+    bid_size_by_price, order_error = _external_bid_sizes(
+        bids,
+        condition_id=condition_id,
+        token_id=token_id,
+        own_orders=own_orders,
+    )
+    if bid_size_by_price is None:
+        unknown["reason_codes"] = [order_error or "own_order_facts_unknown"]
+        return unknown
 
-    bid_size_by_price: dict[Decimal, Decimal] = {}
-    for level_price, size in bids:
-        bid_size_by_price[level_price] = bid_size_by_price.get(
-            level_price, Decimal("0")
-        ) + size
-    for level_price, own_size in own_size_by_price.items():
-        if level_price in bid_size_by_price:
-            bid_size_by_price[level_price] = max(
-                Decimal("0"), bid_size_by_price[level_price] - own_size
-            )
-
-    remaining_bids = [
-        {"price": level_price, "size": size}
+    remaining_bids = {
+        level_price: size
         for level_price, size in bid_size_by_price.items()
         if level_price != price
-    ]
-    residual_book = {"bids": remaining_bids}
-    gross_exit_value = _executable_bid_value({"book": residual_book}, quantity)
+    }
+    gross_exit_value, exit_fee = _lp_exit_values(market, remaining_bids, quantity)
     if gross_exit_value is None:
         return {
             **unknown,
@@ -475,9 +517,6 @@ def estimate_lp_stress_exit(
             "reason_codes": ["exit_liquidity_insufficient"],
             "fully_covered": False,
         }
-    exit_fee = _projected_taker_fee(
-        {"market": market, "book": residual_book}, quantity
-    )
     if exit_fee is None:
         unknown["reason_codes"] = ["exit_fee_unknown"]
         return unknown
@@ -495,6 +534,233 @@ def estimate_lp_stress_exit(
         "net_loss": net_loss,
         "loss_ratio": loss_ratio,
         "capital": capital,
+    }
+
+
+def evaluate_lp_exposure(
+    book: object,
+    *,
+    market: Mapping[str, object],
+    account: Mapping[str, object],
+    now: datetime,
+) -> dict[str, object]:
+    """Estimate current position and resting-buy risk against stress depth."""
+
+    risk_quantity: Decimal | None = None
+    risk_principal: Decimal | None = None
+    checked_at = now.astimezone(UTC) if isinstance(now, datetime) and now.tzinfo else None
+
+    def unknown(
+        reason: str,
+        *,
+        quantity: Decimal | None = risk_quantity,
+        principal: Decimal | None = risk_principal,
+    ) -> dict[str, object]:
+        return {
+            "state": "unknown",
+            "reason_codes": [reason],
+            "risk_quantity": quantity,
+            "risk_principal": principal,
+            "gross_exit_value": None,
+            "exit_fee": None,
+            "stress_loss": None,
+            "loss_ratio": None,
+            "warning": None,
+            "threshold": Decimal("0.10"),
+            "currency": "USD",
+            "checked_at": checked_at,
+        }
+
+    if checked_at is None:
+        return unknown("exposure_time_unknown")
+    if not isinstance(book, Mapping):
+        return unknown("book_unknown")
+    condition_id = str(market.get("condition_id") or "").strip()
+    token_id = str(market.get("token_id") or "").strip()
+    if not condition_id or not token_id:
+        return unknown("market_identity_unknown")
+    if (
+        book.get("condition_id", book.get("market")) != condition_id
+        or book.get("token_id", book.get("asset_id")) != token_id
+    ):
+        return unknown("book_identity_mismatch")
+    if not isinstance(account, Mapping) or account.get("authenticated") is not True:
+        return unknown("account_auth_unknown")
+    try:
+        _freshness(book.get("received_at"), checked_at, "book_freshness")
+        _freshness(
+            account.get("checked_at"),
+            checked_at,
+            "account_freshness",
+            max_age=ACCOUNT_FRESHNESS_SECONDS,
+        )
+    except ValueError as exc:
+        return unknown(str(exc))
+    if (
+        account.get("open_orders_complete") is not True
+        or account.get("positions_complete") is not True
+        or not isinstance(account.get("open_orders"), Sequence)
+        or isinstance(account.get("open_orders"), (str, bytes))
+        or not isinstance(account.get("positions"), Sequence)
+        or isinstance(account.get("positions"), (str, bytes))
+    ):
+        return unknown("account_facts_unknown")
+    if market.get("fees_enabled") is not True and market.get("fees_enabled") is not False:
+        return unknown("exit_fee_unknown")
+
+    risk_quantity = Decimal("0")
+    risk_principal = Decimal("0")
+    position_quantity = Decimal("0")
+    open_buy_quantity = Decimal("0")
+    positions = cast(Sequence[object], account["positions"])
+    for position in positions:
+        if not isinstance(position, Mapping):
+            return unknown("position_facts_unknown")
+        position_token = position.get("token_id", position.get("asset_id"))
+        position_condition = position.get(
+            "condition_id", position.get("market")
+        )
+        if position_token in (None, ""):
+            if position_condition == condition_id:
+                return unknown("position_identity_unknown")
+            continue
+        if str(position_token) != token_id:
+            continue
+        if position_condition != condition_id:
+            return unknown("position_identity_mismatch")
+        size = _maybe_decimal(position.get("size", position.get("quantity")))
+        if size is None or size < 0:
+            return unknown("position_size_unknown")
+        if size == 0:
+            continue
+        price = _maybe_decimal(
+            position.get(
+                "average_price",
+                position.get("avg_price", position.get("average_cost")),
+            )
+        )
+        if price is None or price <= 0 or price > 1:
+            return unknown("position_cost_unknown")
+        position_quantity += size
+        risk_quantity += size
+        risk_principal += size * price
+
+    open_orders = cast(Sequence[object], account["open_orders"])
+    for order in open_orders:
+        if not isinstance(order, Mapping):
+            return unknown("own_order_facts_unknown")
+        status = str(order.get("status") or "").upper()
+        if status in TERMINAL_ORDER_STATES:
+            continue
+        side = str(order.get("side") or "").upper()
+        if side not in {"BUY", "SELL"}:
+            return unknown("own_order_side_unknown")
+        order_token = order.get("token_id", order.get("asset_id"))
+        order_condition = order.get("condition_id", order.get("market"))
+        if order_token in (None, ""):
+            if order_condition == condition_id and side == "BUY":
+                return unknown("own_order_identity_unknown")
+            continue
+        if str(order_token) != token_id:
+            continue
+        if order_condition != condition_id:
+            return unknown("own_order_identity_mismatch")
+        if side != "BUY":
+            continue
+        if not status:
+            return unknown("own_order_status_unknown")
+        price = _maybe_decimal(order.get("price"))
+        remaining = _maybe_decimal(
+            order.get(
+                "remaining_quantity",
+                order.get("remaining_size", order.get("size")),
+            )
+        )
+        if remaining is None:
+            original = _maybe_decimal(order.get("original_size", order.get("quantity")))
+            matched = _maybe_decimal(
+                order.get("size_matched", order.get("filled_quantity", 0))
+            )
+            if original is not None and matched is not None:
+                remaining = max(Decimal("0"), original - matched)
+        if price is None or price <= 0 or price > 1 or remaining is None or remaining < 0:
+            return unknown("own_order_cost_unknown")
+        open_buy_quantity += remaining
+        risk_quantity += remaining
+        risk_principal += remaining * price
+
+    if risk_quantity == 0:
+        return {
+            "state": "known",
+            "reason_codes": [],
+            "risk_quantity": Decimal("0"),
+            "position_quantity": position_quantity,
+            "open_buy_quantity": open_buy_quantity,
+            "risk_principal": Decimal("0"),
+            "gross_exit_value": Decimal("0"),
+            "exit_fee": Decimal("0"),
+            "stress_loss": Decimal("0"),
+            "loss_ratio": None,
+            "warning": False,
+            "threshold": Decimal("0.10"),
+            "currency": "USD",
+            "checked_at": checked_at,
+        }
+    if risk_principal <= 0:
+        return unknown("risk_principal_unknown")
+
+    try:
+        bids = _levels(book.get("bids"), "bids")
+    except ValueError:
+        return unknown("book_unknown")
+    if not bids:
+        return unknown("book_unknown")
+    bid_sizes, order_error = _external_bid_sizes(
+        bids,
+        condition_id=condition_id,
+        token_id=token_id,
+        own_orders=open_orders,
+    )
+    if bid_sizes is None:
+        return unknown(order_error or "own_order_facts_unknown")
+    external_bids = {
+        price: size for price, size in bid_sizes.items() if size > 0
+    }
+    if not external_bids:
+        return unknown("exit_liquidity_insufficient")
+    best_external_bid = max(external_bids)
+    remaining_bids = {
+        price: size
+        for price, size in external_bids.items()
+        if price != best_external_bid
+    }
+    gross_exit_value, exit_fee = _lp_exit_values(
+        market, remaining_bids, risk_quantity
+    )
+    if gross_exit_value is None:
+        return unknown("exit_liquidity_insufficient")
+    if exit_fee is None:
+        return unknown("exit_fee_unknown")
+    stress_loss = max(
+        Decimal("0"), risk_principal - gross_exit_value + exit_fee
+    )
+    loss_ratio = stress_loss / risk_principal
+    warning = loss_ratio >= Decimal("0.10")
+    return {
+        "state": "known",
+        "reason_codes": ["stress_loss_threshold"] if warning else [],
+        "risk_quantity": risk_quantity,
+        "position_quantity": position_quantity,
+        "open_buy_quantity": open_buy_quantity,
+        "risk_principal": risk_principal,
+        "gross_exit_value": gross_exit_value,
+        "exit_fee": exit_fee,
+        "stress_loss": stress_loss,
+        "loss_ratio": loss_ratio,
+        "warning": warning,
+        "threshold": Decimal("0.10"),
+        "currency": "USD",
+        "checked_at": checked_at,
     }
 
 

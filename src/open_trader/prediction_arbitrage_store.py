@@ -764,6 +764,14 @@ class PredictionArbitrageStore:
                 payload TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS lp_market_observations (
+                account_id TEXT NOT NULL,
+                condition_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(account_id, condition_id)
+            );
             """
         )
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
@@ -2746,6 +2754,61 @@ class PredictionArbitrageStore:
                 "SELECT payload FROM lp_screening_snapshot WHERE singleton=1"
             ).fetchone()
         return None if row is None else _load_payload(str(row["payload"]))
+
+    def save_lp_observation(
+        self,
+        account_id: str,
+        condition_id: str,
+        payload: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Persist one account-scoped LP market observation and its alert state."""
+
+        account_key = str(account_id).strip()
+        market_key = str(condition_id).strip()
+        if not account_key or not market_key:
+            raise ValueError("LP observation identity is required")
+        encoded = _dump_payload(payload)
+        updated_at = _utc_now()
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO lp_market_observations(account_id, condition_id, payload, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(account_id, condition_id) DO UPDATE SET
+                    payload=excluded.payload,
+                    updated_at=excluded.updated_at
+                """,
+                (account_key, market_key, encoded, updated_at),
+            )
+        result = _load_payload(encoded)
+        result.update({"condition_id": market_key, "updated_at": updated_at})
+        return result
+
+    def lp_observations(self, account_id: str) -> dict[str, dict[str, object]]:
+        """Load saved LP observations for one account without changing them."""
+
+        account_key = str(account_id).strip()
+        if not account_key:
+            return {}
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT condition_id, payload, updated_at
+                FROM lp_market_observations
+                WHERE account_id=?
+                ORDER BY condition_id
+                """,
+                (account_key,),
+            ).fetchall()
+        result: dict[str, dict[str, object]] = {}
+        for row in rows:
+            condition_id = str(row["condition_id"])
+            payload = _load_payload(str(row["payload"]))
+            payload.update(
+                {"condition_id": condition_id, "updated_at": str(row["updated_at"])}
+            )
+            result[condition_id] = payload
+        return result
 
     @staticmethod
     def _lp_report_date(report_date: str) -> str:

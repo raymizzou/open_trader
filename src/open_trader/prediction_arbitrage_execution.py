@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import inspect
 import importlib.metadata
 import re
@@ -32,6 +33,7 @@ from .polymarket_trading import (
     ThresholdLegResult,
     _submit_error_detail,
 )
+from .polymarket_lp_risk import TERMINAL_ORDER_STATES, evaluate_lp_exposure
 from .prediction_arbitrage import (
     MAX_CROSS_UNSETTLED_PRINCIPAL,
     MAX_EMERGENCY_LOSS,
@@ -109,6 +111,7 @@ def _preflight_evidence_mark(value: object) -> str:
 
 
 BOOK_FRESHNESS_SECONDS = Decimal("10")
+LP_OBSERVATION_FRESHNESS_SECONDS = Decimal("120")
 MAX_RECONCILIATION_SECONDS = 30
 TERMINAL_STATES = {
     "both_rejected",
@@ -163,6 +166,142 @@ def _age_seconds(value: object) -> float | None:
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=UTC)
     return max(0.0, (_utc_now() - moment.astimezone(UTC)).total_seconds())
+
+
+def _aware_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        moment = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            moment = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    else:
+        return None
+    if moment.tzinfo is None:
+        return None
+    return moment.astimezone(UTC)
+
+
+def _lp_exposure_signature(
+    orders: object,
+    positions: object,
+    condition_id: str,
+) -> str:
+    """Hash the current market rows that determine measured LP exposure."""
+
+    facts: list[tuple[str, ...]] = []
+    for row in orders if isinstance(orders, (list, tuple)) else ():
+        if not isinstance(row, Mapping) or str(row.get("condition_id") or "") != condition_id:
+            continue
+        facts.append(
+            (
+                "order",
+                str(row.get("token_id") or ""),
+                str(row.get("outcome") or ""),
+                str(row.get("side") or ""),
+                str(row.get("status") or ""),
+                _safe_decimal(row.get("price")) or "",
+                _safe_decimal(row.get("quantity")) or "",
+                _safe_decimal(row.get("filled_quantity")) or "",
+                _safe_decimal(row.get("remaining_quantity")) or "",
+            )
+        )
+    for row in positions if isinstance(positions, (list, tuple)) else ():
+        if not isinstance(row, Mapping) or str(row.get("condition_id") or "") != condition_id:
+            continue
+        facts.append(
+            (
+                "position",
+                str(row.get("token_id") or ""),
+                str(row.get("outcome") or ""),
+                _safe_decimal(row.get("size")) or "",
+                _safe_decimal(row.get("average_price")) or "",
+            )
+        )
+    encoded = repr(sorted(facts, key=repr)).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _mask_lp_observation(
+    saved: Mapping[str, object],
+    reason: str,
+) -> dict[str, object]:
+    """Hide current measurements while retaining trial and alert history."""
+
+    return {
+        **saved,
+        "state": "unknown",
+        "stale": True,
+        "reason": reason,
+        "current_hourly_reward_usd": None,
+        "occupied_capital_usd": None,
+        "exposure_quantity": None,
+        "current_yield_pct_per_hour": None,
+        "qualified": None,
+        "risk_state": "unknown",
+        "risk_warning": None,
+        "risk_directions": [],
+        "add_room": {"available": False, "reason": reason},
+    }
+
+
+def _project_lp_observations(
+    saved_observations: object,
+    *,
+    orders: object,
+    positions: object,
+    account_checked_at: object,
+    account_complete: bool,
+    now: datetime,
+) -> dict[str, dict[str, object]]:
+    if not isinstance(saved_observations, Mapping):
+        return {}
+    account_moment = _aware_datetime(account_checked_at)
+    account_age = (
+        Decimal(str((now - account_moment).total_seconds()))
+        if account_moment is not None
+        else None
+    )
+    account_fresh = (
+        account_complete
+        and account_age is not None
+        and Decimal("0") <= account_age <= LP_OBSERVATION_FRESHNESS_SECONDS
+    )
+    projected: dict[str, dict[str, object]] = {}
+    for raw_condition_id, saved in saved_observations.items():
+        condition_id = str(raw_condition_id)
+        if not isinstance(saved, Mapping):
+            continue
+        reason: str | None = None
+        if not account_fresh:
+            reason = "account_facts_stale"
+        else:
+            observed_at = _aware_datetime(saved.get("checked_at"))
+            if observed_at is None:
+                reason = "observation_stale"
+            else:
+                observation_age = Decimal(str((now - observed_at).total_seconds()))
+                if (
+                    observation_age < 0
+                    or observation_age > LP_OBSERVATION_FRESHNESS_SECONDS
+                ):
+                    reason = "observation_stale"
+            if reason is None:
+                expected_signature = _lp_exposure_signature(
+                    orders, positions, condition_id
+                )
+                if saved.get("exposure_fingerprint") != expected_signature:
+                    reason = "exposure_changed"
+        projected[condition_id] = (
+            _mask_lp_observation(saved, reason)
+            if reason is not None
+            else dict(saved)
+        )
+    return projected
 
 
 def _normalize_predict_account_snapshot(
@@ -325,6 +464,162 @@ class PredictionExecutionService:
             return {"state": "none", "session_id": None, "reason": "lp_unavailable"}
         return status(session_id)
 
+    def _lp_account_id(self) -> str | None:
+        config = getattr(self._trading, "config", None)
+        wallet = getattr(config, "wallet_address", None)
+        if not isinstance(wallet, str) or not wallet.strip():
+            return None
+        return hashlib.sha256(wallet.strip().casefold().encode("utf-8")).hexdigest()
+
+    def _update_lp_risk_alerts(
+        self,
+        *,
+        condition_id: str,
+        market_title: str,
+        risk_directions: list[dict[str, object]],
+        previous: object,
+        now: datetime,
+    ) -> dict[str, dict[str, object]]:
+        timestamp = _timestamp(now)
+        alerts = {
+            str(token): dict(alert)
+            for token, alert in previous.items()
+            if isinstance(previous, Mapping) and isinstance(alert, Mapping)
+        } if isinstance(previous, Mapping) else {}
+        current_directions = {
+            str(direction.get("outcome") or "未知方向")
+            for direction in risk_directions
+        }
+        for outcome in set(alerts) - current_directions:
+            if alerts[outcome].get("active") is True:
+                alerts[outcome] = {
+                    **alerts[outcome],
+                    "active": False,
+                    "recovered_at": timestamp,
+                    "recovery_reason": "exposure_zero",
+                }
+
+        targets = getattr(self._notifier, "_notifiers", None)
+        candidates = list(targets) if isinstance(targets, (list, tuple)) else [self._notifier]
+        supported_channels = {"feishu", "feishu_app", "xiaoai"}
+        configured = {
+            channel
+            for target in candidates
+            if (channel := self._notification_channel(target)) in supported_channels
+        }
+
+        for direction in risk_directions:
+            outcome = str(direction.get("outcome") or "未知方向")
+            alert = alerts.get(outcome, {})
+            if direction.get("state") != "known" or not isinstance(direction.get("warning"), bool):
+                continue
+            if direction.get("warning") is False:
+                if alert.get("active") is True:
+                    alerts[outcome] = {
+                        **alert,
+                        "active": False,
+                        "recovered_at": timestamp,
+                        "recovery_reason": "risk_below_threshold",
+                    }
+                continue
+
+            is_new_event = alert.get("active") is not True
+            channels_value = alert.get("channels")
+            channels = (
+                {
+                    str(channel): dict(result)
+                    for channel, result in channels_value.items()
+                    if isinstance(result, Mapping)
+                }
+                if not is_new_event and isinstance(channels_value, Mapping)
+                else {}
+            )
+            title = "LP 风险警告"
+            loss_ratio = _decimal(direction.get("loss_ratio"))
+            ratio_text = (
+                format((loss_ratio * Decimal("100")).normalize(), "f")
+                if loss_ratio is not None
+                else "未知"
+            )
+            principal = _decimal(direction.get("risk_principal"))
+            stress_loss = _decimal(direction.get("stress_loss"))
+            principal_text = f"{principal:.2f}" if principal is not None else "未知"
+            loss_text = f"{stress_loss:.2f}" if stress_loss is not None else "未知"
+            order_note = (
+                "未成交买单按假设成交计入。"
+                if direction.get("unfilled_buy_orders") is True
+                else "按当前已确认持仓及未成交买单计算。"
+            )
+            message = "\n".join(
+                (
+                    f"标的：{market_title}（{condition_id}），方向：{direction.get('outcome') or '未知'}。",
+                    f"当前风险本金 {principal_text} 美元，预计压力退出损失 {loss_text} 美元，损失率 {ratio_text}%，达到 10% 警戒线。",
+                    order_note,
+                    "请检查未成交买单和现有持仓；本告警不代表已执行止损。",
+                    f"数据时间：北京时间 {beijing_clock(now) or '未知'}。",
+                )
+            )
+            pending = {
+                channel
+                for channel in configured
+                if not (
+                    isinstance(channels.get(channel), Mapping)
+                    and channels[channel].get("success") is True
+                )
+            }
+            attempts_result = (
+                send_notification_with_results(
+                    self._notifier, title, message, channels=pending
+                )
+                if pending
+                else []
+            )
+            attempted: set[str] = set()
+            for attempt in attempts_result:
+                channel = str(getattr(attempt, "channel", ""))
+                if channel not in pending:
+                    continue
+                attempted.add(channel)
+                channels[channel] = {
+                    "success": getattr(attempt, "success", False) is True,
+                    "suppressed": getattr(attempt, "suppressed", False) is True,
+                    "error_type": str(getattr(attempt, "error_type", "") or ""),
+                    "error": "delivery_failed" if getattr(attempt, "error", "") else "",
+                    "checked_at": timestamp,
+                }
+            for channel in pending - attempted:
+                channels[channel] = {
+                    "success": False,
+                    "suppressed": False,
+                    "error_type": "not_attempted",
+                    "error": "",
+                    "checked_at": timestamp,
+                }
+            if "feishu" not in configured and "feishu_app" not in configured:
+                channels.setdefault(
+                    "feishu",
+                    {"success": False, "suppressed": False, "error_type": "not_configured"},
+                )
+            if "xiaoai" not in configured:
+                channels.setdefault(
+                    "xiaoai",
+                    {"success": False, "suppressed": False, "error_type": "not_configured"},
+                )
+            alerts[outcome] = {
+                "active": True,
+                "triggered_at": alert.get("triggered_at") if not is_new_event else timestamp,
+                "last_checked_at": timestamp,
+                "last_attempt_at": timestamp if pending else alert.get("last_attempt_at"),
+                "outcome": outcome,
+                "risk_principal": direction.get("risk_principal"),
+                "stress_loss": direction.get("stress_loss"),
+                "loss_ratio": direction.get("loss_ratio"),
+                "title": title,
+                "message": message,
+                "channels": channels,
+            }
+        return alerts
+
     def lp_dashboard(self) -> dict[str, object]:
         """Read official account orders and holdings without managing them."""
 
@@ -401,6 +696,11 @@ class PredictionExecutionService:
                             "quantity": quantity,
                             "filled_quantity": filled,
                             "remaining_quantity": remaining,
+                            "reward_min_size": _decimal(raw_order.get("reward_min_size")),
+                            "reward_max_spread": _decimal(raw_order.get("reward_max_spread")),
+                            "fees_enabled": raw_order.get("fees_enabled"),
+                            "fee_exponent": _decimal(raw_order.get("fee_exponent")),
+                            "taker_fee_rate": _decimal(raw_order.get("taker_fee_rate")),
                             "management": "system_managed" if managed else "manual_read_only",
                             "read_only": not managed,
                         }
@@ -423,6 +723,11 @@ class PredictionExecutionService:
                             "size": _decimal(raw_position.get("size", raw_position.get("quantity"))),
                             "average_price": _decimal(raw_position.get("average_price")),
                             "current_value": _decimal(raw_position.get("current_value")),
+                            "reward_min_size": _decimal(raw_position.get("reward_min_size")),
+                            "reward_max_spread": _decimal(raw_position.get("reward_max_spread")),
+                            "fees_enabled": raw_position.get("fees_enabled"),
+                            "fee_exponent": _decimal(raw_position.get("fee_exponent")),
+                            "taker_fee_rate": _decimal(raw_position.get("taker_fee_rate")),
                             "management": "system_managed" if managed else "manual_read_only",
                             "read_only": not managed,
                         }
@@ -581,6 +886,13 @@ class PredictionExecutionService:
                         "paid": False,
                         "reason": raw_market.get("reason") or "reward_read_unknown",
                     }
+                account_id = self._lp_account_id()
+                stored_observations = (
+                    self._store.lp_observations(account_id)
+                    if account_id is not None
+                    and callable(getattr(self._store, "lp_observations", None))
+                    else {}
+                )
                 result = {
                     "state": "ready",
                     "orders": orders,
@@ -608,6 +920,20 @@ class PredictionExecutionService:
                     "checked_at": checked_at,
                     "last_success_at": checked_at,
                     "stale": False,
+                    "authenticated": True,
+                    "open_orders_complete": snapshot.get("open_orders_complete") is True,
+                    "positions_complete": snapshot.get("positions_complete") is True,
+                    "lp_observations": _project_lp_observations(
+                        stored_observations,
+                        orders=orders,
+                        positions=positions,
+                        account_checked_at=checked_at,
+                        account_complete=(
+                            snapshot.get("open_orders_complete") is True
+                            and snapshot.get("positions_complete") is True
+                        ),
+                        now=_utc_now(),
+                    ),
                     "lp_session": session,
                 }
                 self._lp_dashboard_cache = result
@@ -628,6 +954,9 @@ class PredictionExecutionService:
                     "scanning": False,
                     "candidate_stale": True,
                     "checked_at": None,
+                    "authenticated": False,
+                    "open_orders_complete": False,
+                    "positions_complete": False,
                     "candidate_checked_at": None,
                     "candidate_last_success_at": None,
                     "candidate_last_attempt_at": None,
@@ -637,8 +966,470 @@ class PredictionExecutionService:
                     "candidate_retention_reason": None,
                     "last_success_at": None,
                     "stale": True,
+                    "lp_observations": {},
                     "lp_session": self.lp_status(),
                 }
+
+    def refresh_lp_observations(
+        self, *, stop_event: threading.Event | None = None
+    ) -> dict[str, object]:
+        """Refresh durable, read-only LP yield and risk observations."""
+
+        account_id = self._lp_account_id()
+        observations_reader = getattr(self._store, "lp_observations", None)
+        save_observation = getattr(self._store, "save_lp_observation", None)
+        if account_id is None or not callable(observations_reader) or not callable(save_observation):
+            return {"state": "unknown", "reason": "lp_observation_store_unavailable", "observations": {}}
+
+        previous = observations_reader(account_id)
+        now = _utc_now()
+
+        def mark_stale(reason: str) -> dict[str, dict[str, object]]:
+            stale_rows: dict[str, dict[str, object]] = {}
+            for condition_id, saved in previous.items():
+                stale = {
+                    **_mask_lp_observation(saved, reason),
+                    "checked_at": now,
+                    "last_attempt_at": now,
+                }
+                stale_rows[condition_id] = save_observation(
+                    account_id, condition_id, stale
+                )
+            cached = self._lp_dashboard_cache
+            if cached is not None:
+                self._lp_dashboard_cache = {
+                    **cached,
+                    "state": "stale",
+                    "stale": True,
+                    "lp_observations": stale_rows,
+                }
+            return stale_rows
+
+        if stop_event is not None and stop_event.is_set():
+            return {"state": "cancelled", "observations": previous}
+        dashboard = self.lp_dashboard()
+        now = _utc_now()
+        if dashboard.get("state") != "ready" or dashboard.get("stale") is True:
+            return {
+                "state": "unknown",
+                "reason": "account_snapshot_stale",
+                "observations": mark_stale("account_snapshot_stale"),
+            }
+
+        orders = dashboard.get("orders")
+        positions = dashboard.get("positions")
+        if not isinstance(orders, (list, tuple)) or not isinstance(positions, (list, tuple)):
+            return {
+                "state": "unknown",
+                "reason": "account_facts_unknown",
+                "observations": mark_stale("account_facts_unknown"),
+            }
+        account_checked_at = _aware_datetime(dashboard.get("checked_at"))
+        account_complete = (
+            dashboard.get("authenticated") is True
+            and dashboard.get("open_orders_complete") is True
+            and dashboard.get("positions_complete") is True
+            and account_checked_at is not None
+            and Decimal("0") <= Decimal(str((now - account_checked_at).total_seconds())) <= Decimal("120")
+        )
+        if not account_complete:
+            return {
+                "state": "unknown",
+                "reason": "account_facts_unknown",
+                "observations": mark_stale("account_facts_unknown"),
+            }
+
+        orders = [row for row in orders if isinstance(row, Mapping)]
+        positions = [row for row in positions if isinstance(row, Mapping)]
+        orders_by_market: dict[str, list[Mapping[str, object]]] = {}
+        positions_by_market: dict[str, list[Mapping[str, object]]] = {}
+        for row in orders:
+            condition_id = str(row.get("condition_id") or "").strip()
+            if condition_id:
+                orders_by_market.setdefault(condition_id, []).append(row)
+        for row in positions:
+            condition_id = str(row.get("condition_id") or "").strip()
+            if condition_id:
+                positions_by_market.setdefault(condition_id, []).append(row)
+        active_market_ids = set(orders_by_market) | set(positions_by_market)
+        market_ids = active_market_ids | set(previous)
+        if not market_ids:
+            return {"state": "ready", "checked_at": _timestamp(now), "observations": {}}
+
+        rates: Mapping[str, object] = {}
+        rate_reader = getattr(self._trading, "lp_reward_rates", None)
+        rate_result: object = None
+        if active_market_ids and callable(rate_reader):
+            try:
+                rate_result = _call(rate_reader, stop_event=stop_event)
+            except Exception:
+                rate_result = None
+        if isinstance(rate_result, Mapping):
+            raw_markets = rate_result.get("markets")
+            if isinstance(raw_markets, Mapping):
+                rates = raw_markets
+        rate_now = _utc_now()
+        rates_checked_at = _aware_datetime(
+            rate_result.get("checked_at") if isinstance(rate_result, Mapping) else None
+        )
+        rates_complete = (
+            isinstance(rate_result, Mapping)
+            and rate_result.get("state") == "known"
+            and rate_result.get("complete") is True
+            and rates_checked_at is not None
+            and Decimal("0") <= Decimal(str((rate_now - rates_checked_at).total_seconds())) <= Decimal("120")
+        )
+
+        account_facts = {
+            "authenticated": True,
+            "checked_at": account_checked_at,
+            "open_orders_complete": True,
+            "positions_complete": True,
+            "open_orders": orders,
+            "positions": positions,
+        }
+        tokens = tuple(
+            dict.fromkeys(
+                str(row.get("token_id") or "").strip()
+                for row in (*orders, *positions)
+                if row.get("condition_id") in active_market_ids
+                and str(row.get("token_id") or "").strip()
+            )
+        )
+        books: Mapping[str, object] = {}
+        book_reader = getattr(self._trading, "lp_order_books", None)
+        if tokens and callable(book_reader):
+            try:
+                raw_books = _call(book_reader, tokens, stop_event=stop_event)
+                if isinstance(raw_books, Mapping):
+                    books = raw_books
+            except Exception:
+                books = {}
+
+        now = _utc_now()
+        if account_checked_at is None or not (
+            Decimal("0")
+            <= Decimal(str((now - account_checked_at).total_seconds()))
+            <= Decimal("120")
+        ):
+            return {
+                "state": "unknown",
+                "reason": "account_facts_unknown",
+                "observations": mark_stale("account_facts_unknown"),
+            }
+        if rates_checked_at is None or not (
+            Decimal("0")
+            <= Decimal(str((now - rates_checked_at).total_seconds()))
+            <= Decimal("120")
+        ):
+            rates_complete = False
+
+        result: dict[str, dict[str, object]] = {}
+        for condition_id in sorted(market_ids):
+            market_orders = orders_by_market.get(condition_id, [])
+            market_positions = positions_by_market.get(condition_id, [])
+            previous_market = previous.get(condition_id, {})
+            if not market_orders and not market_positions:
+                # Only a complete, fresh account snapshot can confirm a new trial cycle.
+                flat = {
+                    "state": "known",
+                    "stage": "flat",
+                    "stale": False,
+                    "reason": "no_exposure",
+                    "current_hourly_reward_usd": None,
+                    "occupied_capital_usd": Decimal("0"),
+                    "exposure_quantity": Decimal("0"),
+                    "current_yield_pct_per_hour": None,
+                    "trial_reference": None,
+                    "trial_baseline": None,
+                    "risk_state": "known",
+                    "risk_warning": False,
+                    "risk_directions": [],
+                    "add_room": {"available": False, "reason": "no_exposure"},
+                    "exposure_fingerprint": _lp_exposure_signature(
+                        market_orders, market_positions, condition_id
+                    ),
+                    "checked_at": now,
+                    "last_success_at": now,
+                    "last_attempt_at": now,
+                }
+                flat["risk_alerts"] = self._update_lp_risk_alerts(
+                    condition_id=condition_id,
+                    market_title=condition_id,
+                    risk_directions=[],
+                    previous=previous_market.get("risk_alerts"),
+                    now=now,
+                )
+                result[condition_id] = save_observation(account_id, condition_id, flat)
+                continue
+
+            raw_rate = rates.get(condition_id)
+            reward_known = (
+                rates_complete
+                and isinstance(raw_rate, Mapping)
+                and raw_rate.get("state") == "known"
+                and raw_rate.get("currency") == "USD"
+            )
+            rate_reason: str | None = None
+            if not rates_complete:
+                rate_reason = (
+                    "reward_rates_stale"
+                    if rates_checked_at is not None
+                    and (now - rates_checked_at).total_seconds() > 120
+                    else "reward_rates_unknown"
+                )
+            elif not isinstance(raw_rate, Mapping):
+                rate_reason = "reward_market_missing"
+            elif raw_rate.get("state") != "known" or raw_rate.get("currency") != "USD":
+                rate_reason = str(raw_rate.get("reason") or "reward_rate_unknown")
+            hourly_reward = _decimal(raw_rate.get("hourly_reward_usd")) if reward_known else None
+            if hourly_reward is None or hourly_reward < 0:
+                reward_known = False
+                rate_reason = rate_reason or "reward_rate_unknown"
+
+            exposure_quantity = Decimal("0")
+            occupied_capital = Decimal("0")
+            exposure_known = True
+            buy_orders: list[Mapping[str, object]] = []
+            for position in market_positions:
+                size = _decimal(position.get("size"))
+                if size is None or size < 0:
+                    exposure_known = False
+                    continue
+                if size == 0:
+                    continue
+                price = _decimal(position.get("average_price"))
+                if price is None or price <= 0 or price > 1:
+                    exposure_known = False
+                    continue
+                exposure_quantity += size
+                occupied_capital += size * price
+            for order in market_orders:
+                status = str(order.get("status") or "").upper()
+                if status in TERMINAL_ORDER_STATES:
+                    continue
+                side = str(order.get("side") or "").upper()
+                if side not in {"BUY", "SELL"}:
+                    exposure_known = False
+                    continue
+                if side != "BUY":
+                    continue
+                remaining = _decimal(order.get("remaining_quantity"))
+                price = _decimal(order.get("price"))
+                if remaining is None or remaining < 0 or price is None or price <= 0 or price > 1:
+                    exposure_known = False
+                    continue
+                if remaining > 0:
+                    buy_orders.append(order)
+                    exposure_quantity += remaining
+                    occupied_capital += remaining * price
+
+            market_rows = (*market_orders, *market_positions)
+            min_sizes = {
+                parsed
+                for row in market_rows
+                if (parsed := _decimal(row.get("reward_min_size"))) is not None and parsed > 0
+            }
+            minimum_size = next(iter(min_sizes)) if len(min_sizes) == 1 else None
+            if len(min_sizes) > 1:
+                exposure_known = False
+
+            source_rows = (
+                raw_rate.get("sources")
+                if isinstance(raw_rate, Mapping)
+                else None
+            )
+            source_names = (
+                tuple(source_rows)
+                if isinstance(source_rows, Mapping)
+                else tuple(source_rows)
+                if isinstance(source_rows, (list, tuple))
+                else ()
+            )
+            reward_share_positive = False
+            for source in source_names:
+                source_data = raw_rate.get(str(source)) if isinstance(raw_rate, Mapping) else None
+                if isinstance(source_data, Mapping):
+                    percentage = _decimal(source_data.get("earning_percentage"))
+                    reward_share_positive = reward_share_positive or (
+                        percentage is not None and percentage > 0
+                    )
+            orders_qualified = bool(buy_orders) and all(
+                order.get("scoring_status") is True for order in buy_orders
+            )
+            qualified = orders_qualified or (not buy_orders and reward_share_positive)
+
+            rate_pct = (
+                hourly_reward / occupied_capital * Decimal("100")
+                if reward_known and exposure_known and occupied_capital > 0
+                else None
+            )
+            market_metadata = next(
+                (row for row in market_rows if row.get("token_id")), {}
+            )
+            tokens_by_market = tuple(
+                dict.fromkeys(
+                    str(row.get("token_id") or "")
+                    for row in market_rows
+                    if str(row.get("token_id") or "")
+                )
+            )
+            risk_directions: list[dict[str, object]] = []
+            for token_id in tokens_by_market:
+                direction = next(
+                    (row for row in market_rows if str(row.get("token_id") or "") == token_id),
+                    market_metadata,
+                )
+                risk = evaluate_lp_exposure(
+                    books.get(token_id),
+                    market={
+                        "condition_id": condition_id,
+                        "token_id": token_id,
+                        "fees_enabled": direction.get("fees_enabled"),
+                        "taker_fee_rate": direction.get("taker_fee_rate"),
+                        "fee_exponent": direction.get("fee_exponent"),
+                    },
+                    account=account_facts,
+                    now=now,
+                )
+                risk_directions.append(
+                    {
+                        "outcome": str(direction.get("outcome") or "未知方向"),
+                        "token_id": token_id,
+                        "unfilled_buy_orders": any(
+                            str(order.get("token_id") or "") == token_id
+                            for order in buy_orders
+                        ),
+                        "state": risk.get("state"),
+                        "warning": risk.get("warning"),
+                        "risk_quantity": risk.get("risk_quantity"),
+                        "risk_principal": risk.get("risk_principal"),
+                        "stress_loss": risk.get("stress_loss"),
+                        "loss_ratio": risk.get("loss_ratio"),
+                        "threshold": risk.get("threshold"),
+                        "reason_codes": risk.get("reason_codes", []),
+                        "checked_at": risk.get("checked_at"),
+                    }
+                )
+            if not tokens_by_market:
+                risk_state = "known"
+                risk_warning: bool | None = False
+            elif any(row.get("state") != "known" for row in risk_directions):
+                risk_state = "unknown"
+                risk_warning = None
+            else:
+                risk_warning = any(row.get("warning") is True for row in risk_directions)
+                risk_state = "warning" if risk_warning else "known"
+
+            risk_alerts = self._update_lp_risk_alerts(
+                condition_id=condition_id,
+                market_title=str(
+                    market_metadata.get("market_title")
+                    or market_metadata.get("title")
+                    or condition_id
+                ),
+                risk_directions=risk_directions,
+                previous=previous_market.get("risk_alerts"),
+                now=now,
+            )
+
+            previous_quantity = _decimal(previous_market.get("exposure_quantity")) or Decimal("0")
+            previous_stage = str(previous_market.get("stage") or "")
+            trial_reference = previous_market.get("trial_reference")
+            baseline = previous_market.get("trial_baseline")
+            if not isinstance(trial_reference, Mapping):
+                trial_reference = None
+            if not isinstance(baseline, Mapping):
+                baseline = None
+
+            if exposure_quantity == 0:
+                trial_reference = None
+                baseline = None
+            else:
+                added_quantity = exposure_quantity > previous_quantity
+                if baseline is None and added_quantity and trial_reference is not None:
+                    baseline = dict(trial_reference)
+                    baseline = {**baseline, "captured_at": now}
+                is_trial = (
+                    minimum_size is not None
+                    and exposure_quantity == minimum_size
+                    and occupied_capital > 0
+                    and reward_known
+                    and qualified
+                    and exposure_known
+                    and (
+                        previous_quantity == 0
+                        or previous_stage in {"trial", "trial_unknown"}
+                    )
+                )
+                if baseline is None and is_trial and rate_pct is not None:
+                    trial_reference = {
+                        "yield_pct_per_hour": rate_pct,
+                        "checked_at": now,
+                        "quantity": exposure_quantity,
+                        "price": occupied_capital / exposure_quantity,
+                        "occupied_capital_usd": occupied_capital,
+                    }
+
+            stage_reason: str | None = None
+            if exposure_quantity == 0:
+                stage = "flat"
+                stage_reason = "no_exposure"
+            elif baseline is not None:
+                stage = "added"
+                stage_reason = None if rate_pct is not None else "current_yield_unknown"
+            elif (
+                minimum_size is not None
+                and exposure_quantity == minimum_size
+            ):
+                stage = "trial" if trial_reference is not None else "trial_unknown"
+                stage_reason = None if rate_pct is not None else rate_reason or "current_yield_unknown"
+            else:
+                stage = "added_untracked"
+                stage_reason = "trial_baseline_unrecorded"
+
+            add_room_reason = None
+            if rate_pct is None:
+                add_room_reason = "current_yield_unknown"
+            elif rate_pct < Decimal("0.1"):
+                add_room_reason = "yield_below_threshold"
+            elif not qualified:
+                add_room_reason = "reward_qualification_unknown"
+            elif risk_state == "unknown":
+                add_room_reason = "risk_unknown"
+            elif risk_warning is True:
+                add_room_reason = "risk_warning"
+            elif exposure_quantity <= 0 or occupied_capital <= 0:
+                add_room_reason = "no_exposure"
+            add_room = {"available": add_room_reason is None, "reason": add_room_reason}
+
+            observation = {
+                "state": "known" if rate_pct is not None else "unknown",
+                "stage": stage,
+                "stale": bool(rate_pct is None and rate_reason == "reward_rates_stale"),
+                "reason": rate_reason or stage_reason,
+                "current_hourly_reward_usd": hourly_reward if reward_known else None,
+                "occupied_capital_usd": occupied_capital if exposure_known else None,
+                "exposure_quantity": exposure_quantity if exposure_known else None,
+                "current_yield_pct_per_hour": rate_pct,
+                "trial_reference": trial_reference,
+                "trial_baseline": baseline,
+                "qualified": qualified,
+                "risk_state": risk_state,
+                "risk_warning": risk_warning,
+                "risk_directions": risk_directions,
+                "risk_alerts": risk_alerts,
+                "add_room": add_room,
+                "exposure_fingerprint": _lp_exposure_signature(
+                    market_orders, market_positions, condition_id
+                ),
+                "checked_at": now,
+                "last_success_at": now if rate_pct is not None else previous_market.get("last_success_at"),
+                "last_attempt_at": now,
+            }
+            result[condition_id] = save_observation(account_id, condition_id, observation)
+
+        return {"state": "ready", "checked_at": _timestamp(now), "observations": result}
 
     def lp_report(self, report_date: str) -> dict[str, object] | None:
         """Read one immutable stored LP daily report."""
@@ -7234,9 +8025,11 @@ class PredictionExecutionService:
     @staticmethod
     def _notification_channel(target: object) -> str:
         explicit = getattr(target, "channel", None)
-        if isinstance(explicit, str) and explicit in {"macos", "feishu", "feishu_app"}:
+        if isinstance(explicit, str) and explicit in {"macos", "feishu", "feishu_app", "xiaoai"}:
             return explicit
         name = target.__class__.__name__.lower()
+        if "xiaoai" in name:
+            return "xiaoai"
         if "macos" in name or "mac" in name:
             return "macos"
         if "feishuapp" in name or "feishu_app" in name:

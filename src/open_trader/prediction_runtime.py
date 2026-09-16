@@ -926,6 +926,19 @@ class PredictionRuntime:
                     # Earnings are read-only and advisory; a failed refresh
                     # is recorded by the service without touching LP risk.
                     logger.exception("prediction_lp_reward_refresh_failed")
+                if self._reward_stop_event.is_set():
+                    return
+                execution = self.execution
+                refresh_observations = getattr(
+                    execution, "refresh_lp_observations", None
+                )
+                if callable(refresh_observations):
+                    try:
+                        refresh_observations(stop_event=self._reward_stop_event)
+                    except Exception:
+                        logger.exception("prediction_lp_observation_refresh_failed")
+                if self._reward_stop_event.is_set():
+                    return
                 refresh_requested = self._lp_candidate_refresh_requested.wait(
                     _LP_REWARD_SECONDS
                 )

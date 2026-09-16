@@ -1522,6 +1522,224 @@ class PolymarketTradingClient:
         except Exception:
             return unknown
 
+    def lp_reward_rates(
+        self, *, stop_event: threading.Event | None = None
+    ) -> dict[str, object]:
+        """Read current per-market native and sponsored reward shares."""
+
+        checked_at = datetime.now(UTC)
+        unknown = {
+            "state": "unknown",
+            "complete": False,
+            "checked_at": checked_at,
+            "markets": {},
+        }
+        try:
+            if stop_event is not None and stop_event.is_set():
+                raise _RewardReadCancelled
+            context = getattr(self._client, "_ctx", None)
+            transport = getattr(context, "secure_clob", None)
+            get_json = getattr(transport, "get_json", None)
+            if not callable(get_json):
+                raise ValueError("reward_transport_unknown")
+            wallet_type = getattr(context, "wallet_type", None)
+            signature_type = signature_type_for(wallet_type)
+            as_of = checked_at.date()
+            collected: dict[str, dict[str, object]] = {}
+            identities: set[tuple[object, ...]] = set()
+
+            for sponsored in (False, True):
+                source = "sponsored" if sponsored else "native"
+                cursor: str | None = None
+                seen_cursors: set[str] = set()
+                while True:
+                    if stop_event is not None and stop_event.is_set():
+                        raise _RewardReadCancelled
+                    params: dict[str, object] = {
+                        "signature_type": signature_type,
+                        "maker_address": self.config.wallet_address,
+                        "sponsored": sponsored,
+                        "page_size": 500,
+                    }
+                    if cursor is not None:
+                        params["next_cursor"] = cursor
+                    payload = get_json("/rewards/user/markets", params=params)
+                    if stop_event is not None and stop_event.is_set():
+                        raise _RewardReadCancelled
+                    if not isinstance(payload, Mapping):
+                        raise ValueError("reward_page_unknown")
+                    rows = payload.get("data")
+                    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+                        raise ValueError("reward_page_unknown")
+                    for raw_row in rows:
+                        row = _model_dict(raw_row)
+                        if row is None:
+                            raise ValueError("reward_row_unknown")
+                        condition_id = row.get("condition_id")
+                        if not isinstance(condition_id, str) or not condition_id:
+                            raise ValueError("reward_market_unknown")
+                        percentage = _lp_decimal(row.get("earning_percentage"))
+                        if percentage is not None and not Decimal("0") <= percentage <= Decimal("100"):
+                            percentage = None
+                        raw_configs = row.get("rewards_config")
+                        if not isinstance(raw_configs, Sequence) or isinstance(
+                            raw_configs, (str, bytes)
+                        ):
+                            raise ValueError("reward_config_unknown")
+                        active_configs: list[dict[str, object]] = []
+                        for raw_config in raw_configs:
+                            config = _model_dict(raw_config)
+                            if config is None:
+                                raise ValueError("reward_config_unknown")
+                            config_id = config.get("id")
+                            asset_address = config.get("asset_address")
+                            start_date = _reward_date(config.get("start_date"))
+                            end_date = _reward_date(config.get("end_date"))
+                            rate = _lp_decimal(config.get("rate_per_day"))
+                            if (
+                                config_id is None
+                                or not isinstance(asset_address, str)
+                                or start_date is None
+                                or end_date is None
+                                or rate is None
+                                or rate < 0
+                            ):
+                                raise ValueError("reward_config_unknown")
+                            if not start_date <= as_of <= end_date:
+                                continue
+                            normalized = dict(config)
+                            normalized["rate_per_day"] = rate
+                            normalized["sponsored"] = sponsored
+                            normalized["source"] = source
+                            active_configs.append(normalized)
+                        if not active_configs:
+                            continue
+                        market = collected.setdefault(
+                            condition_id,
+                            {"condition_id": condition_id, "sources": {}},
+                        )
+                        market_sources = cast(
+                            dict[str, dict[str, object]], market["sources"]
+                        )
+                        source_result = market_sources.setdefault(
+                            source,
+                            {
+                                "source": source,
+                                "percentages": [],
+                                "reward_configs": [],
+                            },
+                        )
+                        cast(list[Decimal | None], source_result["percentages"]).append(
+                            percentage
+                        )
+                        for normalized in active_configs:
+                            asset_address = str(normalized["asset_address"])
+                            start_date = _reward_date(normalized["start_date"])
+                            end_date = _reward_date(normalized["end_date"])
+                            assert start_date is not None and end_date is not None
+                            identity = (
+                                condition_id,
+                                str(normalized["id"]),
+                                asset_address.casefold(),
+                                start_date,
+                                end_date,
+                                sponsored,
+                            )
+                            if identity in identities:
+                                continue
+                            identities.add(identity)
+                            cast(
+                                list[dict[str, object]],
+                                source_result["reward_configs"],
+                            ).append(normalized)
+                    next_cursor = payload.get("next_cursor")
+                    if not isinstance(next_cursor, str) or not next_cursor:
+                        raise ValueError("reward_pagination_unknown")
+                    if next_cursor == "LTE=":
+                        break
+                    if next_cursor in seen_cursors:
+                        raise ValueError("reward_pagination_loop")
+                    seen_cursors.add(next_cursor)
+                    cursor = next_cursor
+
+            for market in collected.values():
+                hourly_total = Decimal("0")
+                market_known = True
+                source_rows = cast(dict[str, dict[str, object]], market["sources"])
+                for source in ("native", "sponsored"):
+                    source_result = source_rows.get(source)
+                    if source_result is None:
+                        continue
+                    percentages = cast(list[Decimal | None], source_result["percentages"])
+                    configs = cast(
+                        list[dict[str, object]], source_result["reward_configs"]
+                    )
+                    percentage = (
+                        percentages[0]
+                        if percentages
+                        and percentages[0] is not None
+                        and all(item == percentages[0] for item in percentages)
+                        else None
+                    )
+                    daily_pool = Decimal("0")
+                    source_known = percentage is not None
+                    for config in configs:
+                        asset_address = str(config["asset_address"]).casefold()
+                        if asset_address not in LP_REWARD_ASSET_USD_ADDRESSES:
+                            source_known = False
+                            continue
+                        daily_pool += cast(Decimal, config["rate_per_day"])
+                    rate = (
+                        daily_pool * percentage / Decimal("100") / Decimal("24")
+                        if source_known and percentage is not None
+                        else None
+                    )
+                    if not source_known or rate is None:
+                        market_known = False
+                        source_result.update(
+                            {
+                                "state": "unknown",
+                                "earning_percentage": percentage,
+                                "daily_pool_usd": None,
+                                "hourly_reward_usd": None,
+                                "currency": None,
+                                "checked_at": checked_at,
+                            }
+                        )
+                    else:
+                        source_result.update(
+                            {
+                                "state": "known",
+                                "earning_percentage": percentage,
+                                "daily_pool_usd": daily_pool,
+                                "hourly_reward_usd": rate,
+                                "currency": "USD",
+                                "checked_at": checked_at,
+                            }
+                        )
+                        hourly_total += rate
+                    market[source] = source_result
+                market["state"] = "known" if market_known else "unknown"
+                market["hourly_reward_usd"] = hourly_total if market_known else None
+                market["currency"] = "USD" if market_known else None
+                market["checked_at"] = checked_at
+                market["sources"] = tuple(
+                    source
+                    for source in ("native", "sponsored")
+                    if source in source_rows
+                )
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": checked_at,
+                "markets": collected,
+            }
+        except _RewardReadCancelled:
+            unknown["reason"] = "cancelled"
+            return unknown
+        except Exception:
+            return unknown
+
     def lp_reward_snapshot(
         self,
         reward_date: str,

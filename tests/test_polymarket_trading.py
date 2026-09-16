@@ -899,6 +899,149 @@ def test_lp_reward_snapshot_preserves_identity_assets_and_scope() -> None:
     assert [path for path, _ in transport.calls] == ["/rewards/user/total"]
 
 
+def test_lp_reward_rates_use_current_scoped_percentages() -> None:
+    today = datetime.now(UTC).date()
+    date_text = today.isoformat()
+    yesterday = (today - timedelta(days=1)).isoformat()
+    tomorrow = (today + timedelta(days=1)).isoformat()
+    native_asset = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    sponsored_asset = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+    condition_id = "condition-live-share"
+    native_config = {
+        "id": "native-config",
+        "asset_address": native_asset,
+        "rate_per_day": "120",
+        "start_date": date_text,
+        "end_date": tomorrow,
+    }
+    sponsored_config = {
+        "id": "sponsored-config",
+        "asset_address": sponsored_asset,
+        "rate_per_day": "48",
+        "start_date": date_text,
+        "end_date": tomorrow,
+    }
+
+    class RewardTransport:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, object]]] = []
+            self.pages: dict[tuple[bool, object], object] = {
+                (False, None): {
+                    "data": [
+                        {
+                            "condition_id": condition_id,
+                            "earning_percentage": "1",
+                            "rewards_config": [native_config],
+                        },
+                        {
+                            "condition_id": "condition-other",
+                            "earning_percentage": "98",
+                            "rewards_config": [
+                                {
+                                    **native_config,
+                                    "id": "other-config",
+                                    "rate_per_day": "999",
+                                }
+                            ],
+                        },
+                        {
+                            "condition_id": condition_id,
+                            "earning_percentage": "1",
+                            "rewards_config": [
+                                {
+                                    **native_config,
+                                    "id": "expired-config",
+                                    "rate_per_day": "1000",
+                                    "start_date": (today - timedelta(days=2)).isoformat(),
+                                    "end_date": yesterday,
+                                }
+                            ],
+                        },
+                    ],
+                    "next_cursor": "native-page-2",
+                },
+                (False, "native-page-2"): {
+                    "data": [
+                        {
+                            "condition_id": condition_id,
+                            "earning_percentage": "1",
+                            "rewards_config": [native_config],
+                        }
+                    ],
+                    "next_cursor": "LTE=",
+                },
+                (True, None): {
+                    "data": [
+                        {
+                            "condition_id": condition_id,
+                            "earning_percentage": "1",
+                            "rewards_config": [sponsored_config],
+                        }
+                    ],
+                    "next_cursor": "LTE=",
+                },
+            }
+
+        def get_json(self, path: str, *, params: dict[str, object]) -> object:
+            self.calls.append((path, dict(params)))
+            assert path == "/rewards/user/markets"
+            return self.pages[(bool(params["sponsored"]), params.get("next_cursor"))]
+
+    transport = RewardTransport()
+
+    class RewardClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self._ctx = SimpleNamespace(
+                wallet_type="EOA", secure_clob=transport
+            )
+
+    adapter = PolymarketTradingClient(TradingConfig(SIGNER, WALLET), RewardClient())
+
+    rates = adapter.lp_reward_rates()
+
+    assert rates["state"] == "known"
+    assert rates["complete"] is True
+    assert [params["sponsored"] for path, params in transport.calls if path == "/rewards/user/markets"] == [
+        False,
+        False,
+        True,
+    ]
+    target = rates["markets"][condition_id]
+    assert target["state"] == "known"
+    assert target["hourly_reward_usd"] == Decimal("0.07")
+    assert target["currency"] == "USD"
+    assert target["checked_at"].tzinfo is not None
+    assert target["sources"] == ("native", "sponsored")
+    assert target["native"]["earning_percentage"] == Decimal("1")
+    assert target["sponsored"]["earning_percentage"] == Decimal("1")
+
+    transport.pages[(False, None)]["data"][0]["earning_percentage"] = "0"
+    transport.pages[(False, "native-page-2")]["data"][0]["earning_percentage"] = "0"
+    transport.pages[(True, None)]["data"][0]["earning_percentage"] = "0"
+    zero_share = adapter.lp_reward_rates()["markets"][condition_id]
+    assert zero_share["state"] == "known"
+    assert zero_share["hourly_reward_usd"] == Decimal("0")
+
+    del transport.pages[(False, None)]["data"][0]["earning_percentage"]
+    missing_share = adapter.lp_reward_rates()["markets"][condition_id]
+    assert missing_share["state"] == "unknown"
+    assert missing_share["hourly_reward_usd"] is None
+
+    transport.pages[(False, None)]["data"][0]["earning_percentage"] = "NaN"
+    nonfinite_share = adapter.lp_reward_rates()["markets"][condition_id]
+    assert nonfinite_share["state"] == "unknown"
+
+    transport.pages[(False, None)]["data"][0]["earning_percentage"] = "1"
+    transport.pages[(False, "native-page-2")]["data"][0]["earning_percentage"] = "1"
+    transport.pages[(False, None)]["data"][0]["rewards_config"][0][
+        "asset_address"
+    ] = "0xdeadbeef"
+    unknown_currency = adapter.lp_reward_rates()["markets"][condition_id]
+    assert unknown_currency["state"] == "unknown"
+    assert unknown_currency["hourly_reward_usd"] is None
+
+
 def test_lp_rewards_preserve_raw_accrual_when_usd_value_is_unknown() -> None:
     date = "2026-09-14"
     condition_id = "condition-raw-reward"

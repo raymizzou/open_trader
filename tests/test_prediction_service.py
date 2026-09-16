@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import json
 import os
+import shlex
 from pathlib import Path
 import signal
 import socket
@@ -27,7 +28,12 @@ import open_trader
 import open_trader.prediction_service as prediction_service
 import open_trader.polymarket_trading as polymarket_trading_module
 from open_trader.llm_providers import PROVIDER_IDS, resolve_provider
-from open_trader.notifications import NullNotifier
+from open_trader.notifications import (
+    CompositeNotifier,
+    FeishuWebhookNotifier,
+    NullNotifier,
+    XiaoaiSSHNotifier,
+)
 from open_trader.polymarket_lp import PolymarketLPService
 from open_trader.polymarket_trading import PredictConfig, PolymarketTradingClient, TradingConfig
 from open_trader.predict_source import PredictSource
@@ -829,6 +835,712 @@ def test_lp_dashboard_shows_manual_orders_without_managing_them(
     assert sdk.order_writes == 0
     assert sdk.cancellations == 0
     assert public_market.closed is True
+
+
+def test_lp_observations_preserve_trial_after_manual_add(tmp_path: Path) -> None:
+    condition_id = "condition-1"
+    token_id = "yes-token"
+
+    def order(order_id: str, quantity: Decimal, price: Decimal, filled: Decimal = Decimal("0"), side: str = "BUY") -> dict[str, object]:
+        return {
+            "id": order_id,
+            "order_id": order_id,
+            "condition_id": condition_id,
+            "token_id": token_id,
+            "outcome": "YES",
+            "side": side,
+            "status": "LIVE",
+            "price": price,
+            "original_size": quantity,
+            "size_matched": filled,
+            "remaining_size": quantity - filled,
+            "reward_min_size": Decimal("40"),
+            "fees_enabled": False,
+            "market_title": "Will it happen?",
+        }
+
+    state: dict[str, object] = {
+        "orders": [order("trial-order", Decimal("40"), Decimal("0.50"))],
+        "positions": [],
+        "hourly_reward": Decimal("0.05"),
+        "reward_available": True,
+    }
+
+    class LPObservationTrading:
+        config = SimpleNamespace(wallet_address="0x" + "1" * 40)
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": datetime.now(UTC),
+                "open_orders": tuple(dict(row) for row in state["orders"]),
+                "positions": tuple(dict(row) for row in state["positions"]),
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def get_order_scoring(self, _order_id: str) -> bool:
+            return True
+
+        def lp_reward_snapshot(self, reward_date: str, market: str) -> dict[str, object]:
+            return {"state": "unknown", "reward_date": reward_date, "condition_id": market}
+
+        def lp_reward_rates(self) -> dict[str, object]:
+            if state["reward_available"] is not True:
+                return {
+                    "state": "unknown",
+                    "complete": False,
+                    "checked_at": datetime.now(UTC),
+                    "markets": {},
+                }
+            hourly = state["hourly_reward"]
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": datetime.now(UTC),
+                "markets": {
+                    condition_id: {
+                        "state": "known",
+                        "hourly_reward_usd": hourly,
+                        "currency": "USD",
+                        "checked_at": datetime.now(UTC),
+                        "sources": ("native",),
+                        "native": {
+                            "state": "known",
+                            "earning_percentage": Decimal("1"),
+                            "daily_pool_usd": Decimal("1.2"),
+                            "hourly_reward_usd": hourly,
+                            "currency": "USD",
+                        },
+                    }
+                },
+            }
+
+        def lp_order_books(self, token_ids: tuple[str, ...]) -> dict[str, dict[str, object]]:
+            return {
+                token: {
+                    "condition_id": condition_id,
+                    "token_id": token,
+                    "received_at": datetime.now(UTC),
+                    "bids": [
+                        {"price": Decimal("0.51"), "size": Decimal("20")},
+                        {"price": Decimal("0.50"), "size": Decimal("1000")},
+                        {"price": Decimal("0.46"), "size": Decimal("1000")},
+                    ],
+                    "asks": [],
+                }
+                for token in token_ids
+            }
+
+    service, _trading, store, monitor = execution_fixture(tmp_path)
+    trading = LPObservationTrading()
+    service._trading = trading
+
+    state["reward_available"] = False
+    delayed_trial = service.refresh_lp_observations()["observations"][condition_id]
+    assert delayed_trial["stage"] == "trial_unknown"
+    assert delayed_trial["current_yield_pct_per_hour"] is None
+    assert delayed_trial["trial_reference"] is None
+
+    state["reward_available"] = True
+    trial = service.refresh_lp_observations()
+    trial_market = trial["observations"][condition_id]
+    assert Decimal(str(trial_market["current_yield_pct_per_hour"])) == Decimal("0.25")
+    assert trial_market["trial_baseline"] is None
+
+    state["orders"] = [
+        order("trial-order", Decimal("40"), Decimal("0.50")),
+        order("add-order", Decimal("80"), Decimal("0.50")),
+    ]
+    state["hourly_reward"] = Decimal("0.108")
+    added = service.refresh_lp_observations()
+    added_market = added["observations"][condition_id]
+    baseline = added_market["trial_baseline"]
+    assert isinstance(baseline, Mapping)
+    assert Decimal(str(baseline["yield_pct_per_hour"])) == Decimal("0.25")
+    assert baseline["quantity"] == "40"
+    assert baseline["occupied_capital_usd"] == "20.00"
+    assert Decimal(str(added_market["current_yield_pct_per_hour"])) == Decimal("0.18")
+    assert added_market["exposure_quantity"] == "120"
+    assert added_market["occupied_capital_usd"] == "60.00"
+
+    state["orders"] = [
+        order("trial-order", Decimal("40"), Decimal("0.50")),
+        order("add-order", Decimal("80"), Decimal("0.49"), Decimal("10")),
+        order("second-add", Decimal("30"), Decimal("0.50")),
+        order("sell-order", Decimal("10"), Decimal("0.51"), side="SELL"),
+    ]
+    state["positions"] = [
+        {
+            "condition_id": condition_id,
+            "token_id": token_id,
+            "outcome": "YES",
+            "size": Decimal("10"),
+            "average_price": Decimal("0.49"),
+            "reward_min_size": Decimal("40"),
+            "fees_enabled": False,
+        }
+    ]
+    service.refresh_lp_observations()
+    restarted_store = PredictionArbitrageStore(tmp_path / "data")
+    restarted = PredictionExecutionService(
+        store=restarted_store,
+        monitor=monitor,
+        trading=trading,
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+    )
+    after_restart = restarted.refresh_lp_observations()["observations"][condition_id]
+    assert after_restart["exposure_quantity"] == "150"
+    assert after_restart["occupied_capital_usd"] == "74.20"
+    assert Decimal(str(after_restart["trial_baseline"]["yield_pct_per_hour"])) == Decimal("0.25")
+
+    enlarged_store = PredictionArbitrageStore(tmp_path / "enlarged-data")
+    enlarged = PredictionExecutionService(
+        store=enlarged_store,
+        monitor=monitor,
+        trading=trading,
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "enlarged-execution.lock",
+    )
+    state["orders"] = [order("already-large", Decimal("120"), Decimal("0.50"))]
+    state["positions"] = []
+    first_seen_large = enlarged.refresh_lp_observations()["observations"][condition_id]
+    assert first_seen_large["trial_baseline"] is None
+    assert first_seen_large["reason"] == "trial_baseline_unrecorded"
+
+    state["orders"] = []
+    state["hourly_reward"] = Decimal("0.05")
+    flat = restarted.refresh_lp_observations()["observations"][condition_id]
+    assert flat["stage"] == "flat"
+    assert flat["trial_baseline"] is None
+    state["orders"] = [order("new-trial", Decimal("40"), Decimal("0.50"))]
+    restarted.refresh_lp_observations()
+    state["orders"] = [
+        order("new-trial", Decimal("40"), Decimal("0.50")),
+        order("new-add", Decimal("80"), Decimal("0.50")),
+    ]
+    state["hourly_reward"] = Decimal("0.108")
+    new_cycle = restarted.refresh_lp_observations()["observations"][condition_id]
+    assert Decimal(str(new_cycle["trial_baseline"]["yield_pct_per_hour"])) == Decimal("0.25")
+
+
+def test_lp_add_room_requires_current_aligned_reward_and_risk(tmp_path: Path) -> None:
+    condition_id = "condition-1"
+    token_id = "yes-token"
+    state: dict[str, object] = {
+        "market_id": condition_id,
+        "orders": [],
+        "positions": [],
+        "hourly_reward": Decimal("0.10"),
+        "rate_state": "known",
+        "rate_age": 0,
+        "account_age": 0,
+        "account_complete": True,
+        "account_error": False,
+        "currency": "USD",
+        "book_price": Decimal("0.46"),
+        "order_price": Decimal("0.50"),
+        "fees_enabled": False,
+    }
+
+    def order(quantity: Decimal) -> dict[str, object]:
+        return {
+            "id": "manual-order",
+            "order_id": "manual-order",
+            "condition_id": str(state["market_id"]),
+            "token_id": token_id,
+            "outcome": "YES",
+            "side": "BUY",
+            "status": "LIVE",
+            "price": state["order_price"],
+            "original_size": quantity,
+            "size_matched": Decimal("0"),
+            "remaining_size": quantity,
+            "reward_min_size": Decimal("40"),
+            "fees_enabled": state["fees_enabled"],
+            "market_title": "Will it happen?",
+        }
+
+    class ReadOnlyTrading:
+        config = SimpleNamespace(wallet_address="0x" + "2" * 40)
+
+        def __init__(self) -> None:
+            self.order_writes = 0
+            self.cancellations = 0
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            if state["account_error"] is True:
+                raise RuntimeError("account_snapshot_failed")
+            return {
+                "authenticated": True,
+                "checked_at": datetime.now(UTC) - timedelta(seconds=int(state["account_age"])),
+                "open_orders": tuple(dict(row) for row in state["orders"]),
+                "positions": tuple(dict(row) for row in state["positions"]),
+                "open_orders_complete": state["account_complete"],
+                "positions_complete": state["account_complete"],
+            }
+
+        def get_order_scoring(self, _order_id: str) -> bool:
+            return True
+
+        def lp_reward_snapshot(self, reward_date: str, market: str) -> dict[str, object]:
+            return {"state": "unknown", "reward_date": reward_date, "condition_id": market}
+
+        def lp_reward_rates(self) -> dict[str, object]:
+            hourly = state["hourly_reward"]
+            checked_at = datetime.now(UTC) - timedelta(seconds=int(state["rate_age"]))
+            if state["rate_state"] != "known" or state["market_id"] != condition_id:
+                return {"state": "unknown", "complete": False, "checked_at": checked_at, "markets": {}}
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": checked_at,
+                "markets": {
+                        condition_id: {
+                            "state": "known" if hourly is not None else "unknown",
+                            "hourly_reward_usd": hourly,
+                            "currency": state["currency"] if hourly is not None else None,
+                        "checked_at": checked_at,
+                        "sources": ("native",),
+                        "native": {
+                                "state": "known" if hourly is not None else "unknown",
+                                "earning_percentage": Decimal("0") if hourly == 0 else Decimal("1"),
+                                "hourly_reward_usd": hourly,
+                                "currency": state["currency"] if hourly is not None else None,
+                        },
+                    }
+                },
+            }
+
+        def lp_order_books(self, token_ids: tuple[str, ...]) -> dict[str, dict[str, object]]:
+            quantity = sum(
+                (row["remaining_size"] for row in state["orders"] if row["side"] == "BUY"),
+                Decimal("0"),
+            )
+            return {
+                token: {
+                    "condition_id": str(state["market_id"]),
+                    "token_id": token,
+                    "received_at": datetime.now(UTC),
+                    "bids": [
+                        {"price": Decimal("0.51"), "size": Decimal("20")},
+                        {"price": Decimal("0.50"), "size": quantity},
+                        {"price": state["book_price"], "size": Decimal("1000")},
+                    ],
+                    "asks": [],
+                }
+                for token in token_ids
+            }
+
+        def create_limit_order(self, **_kwargs: object) -> None:
+            self.order_writes += 1
+
+        def post_order(self, _order: object) -> None:
+            self.order_writes += 1
+
+        def cancel_orders(self, **_kwargs: object) -> None:
+            self.cancellations += 1
+
+    class CountingNotifier(FeishuWebhookNotifier):
+        channel = "feishu"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def notify(self, _title: str, _message: str) -> None:
+            self.calls += 1
+
+    service, _trading, store, monitor = execution_fixture(tmp_path)
+    trading = ReadOnlyTrading()
+    service._trading = trading
+    notifier = CountingNotifier()
+    service._notifier = notifier  # type: ignore[assignment]
+    state["orders"] = [order(Decimal("200"))]
+
+    initial = service.refresh_lp_observations()["observations"][condition_id]
+    assert Decimal(str(initial["current_yield_pct_per_hour"])) == Decimal("0.1")
+    assert initial["risk_state"] == "known"
+    assert initial["risk_warning"] is False
+    assert initial["add_room"]["available"] is True
+    assert service.lp_dashboard()["lp_observations"][condition_id]["add_room"]["available"] is True
+
+    account_id = service._lp_account_id()
+    assert isinstance(account_id, str)
+    saved_initial = store.lp_observations(account_id)[condition_id]
+    state["orders"] = [order(Decimal("400"))]
+    notification_calls_before_get = notifier.calls
+    changed_dashboard = service.lp_dashboard()
+    changed_observation = changed_dashboard["lp_observations"][condition_id]
+    assert changed_dashboard["state"] == "ready"
+    assert changed_dashboard["orders"][0]["quantity"] == Decimal("400")
+    assert changed_observation["state"] == "unknown"
+    assert changed_observation["reason"] == "exposure_changed"
+    assert changed_observation["current_hourly_reward_usd"] is None
+    assert changed_observation["occupied_capital_usd"] is None
+    assert changed_observation["exposure_quantity"] is None
+    assert changed_observation["risk_state"] == "unknown"
+    assert changed_observation["risk_warning"] is None
+    assert changed_observation["risk_directions"] == []
+    assert changed_observation["add_room"] == {
+        "available": False,
+        "reason": "exposure_changed",
+    }
+    assert notifier.calls == notification_calls_before_get
+    assert store.lp_observations(account_id)[condition_id] == saved_initial
+
+    aligned = service.refresh_lp_observations()["observations"][condition_id]
+    assert aligned["state"] == "known"
+    assert aligned["exposure_quantity"] == "400"
+    assert aligned["occupied_capital_usd"] == "200.00"
+
+    state["order_price"] = Decimal("0.49")
+    state["orders"] = [order(Decimal("400"))]
+    price_dashboard = service.lp_dashboard()
+    price_observation = price_dashboard["lp_observations"][condition_id]
+    assert price_dashboard["state"] == "ready"
+    assert price_observation["reason"] == "exposure_changed"
+    assert price_observation["occupied_capital_usd"] is None
+    assert price_observation["risk_state"] == "unknown"
+    assert store.lp_observations(account_id)[condition_id] == aligned
+
+    price_aligned = service.refresh_lp_observations()["observations"][condition_id]
+    assert price_aligned["state"] == "known"
+    assert price_aligned["exposure_quantity"] == "400"
+    assert price_aligned["occupied_capital_usd"] == "196.00"
+
+    stored_aligned = store.lp_observations(account_id)[condition_id]
+    aged_observation = {
+        **stored_aligned,
+        "checked_at": datetime.now(UTC) - timedelta(seconds=121),
+    }
+    store.save_lp_observation(account_id, condition_id, aged_observation)
+    stored_before_aged_get = store.lp_observations(account_id)[condition_id]
+    aged_dashboard = service.lp_dashboard()
+    aged_projection = aged_dashboard["lp_observations"][condition_id]
+    assert aged_dashboard["state"] == "ready"
+    assert aged_projection["reason"] == "observation_stale"
+    assert aged_projection["occupied_capital_usd"] is None
+    assert aged_projection["risk_state"] == "unknown"
+    assert store.lp_observations(account_id)[condition_id] == stored_before_aged_get
+
+    state["order_price"] = Decimal("0.50")
+    state["orders"] = [order(Decimal("200"))]
+    state["hourly_reward"] = Decimal("0.099")
+    low_yield = service.refresh_lp_observations()["observations"][condition_id]
+    assert low_yield["add_room"] == {"available": False, "reason": "yield_below_threshold"}
+    state["hourly_reward"] = Decimal("0.20")
+    state["book_price"] = Decimal("0.45")
+    high_risk = service.refresh_lp_observations()["observations"][condition_id]
+    assert high_risk["risk_warning"] is True
+    assert high_risk["add_room"] == {"available": False, "reason": "risk_warning"}
+    risk_alerts_before_account_failure = high_risk["risk_alerts"]
+
+    state["account_complete"] = False
+    incomplete = service.refresh_lp_observations()["observations"][condition_id]
+    assert incomplete["state"] == "unknown"
+    assert incomplete["current_hourly_reward_usd"] is None
+    assert incomplete["occupied_capital_usd"] is None
+    assert incomplete["exposure_quantity"] is None
+    assert incomplete["risk_state"] == "unknown"
+    assert incomplete["risk_warning"] is None
+    assert incomplete["risk_directions"] == []
+    assert incomplete["risk_alerts"] == risk_alerts_before_account_failure
+
+    state["account_complete"] = True
+    state["account_error"] = True
+    failed_account = service.refresh_lp_observations()["observations"][condition_id]
+    assert failed_account["state"] == "unknown"
+    assert failed_account["occupied_capital_usd"] is None
+    assert failed_account["risk_state"] == "unknown"
+    assert failed_account["risk_warning"] is None
+    assert failed_account["risk_directions"] == []
+    assert failed_account["risk_alerts"] == risk_alerts_before_account_failure
+    state["account_error"] = False
+
+    state["hourly_reward"] = Decimal("0")
+    state["book_price"] = Decimal("0.46")
+    zero_reward = service.refresh_lp_observations()["observations"][condition_id]
+    assert Decimal(str(zero_reward["current_yield_pct_per_hour"])) == Decimal("0")
+    state["rate_state"] = "unknown"
+    state["orders"] = [order(Decimal("400"))]
+    unknown_reward = service.refresh_lp_observations()["observations"][condition_id]
+    assert unknown_reward["current_yield_pct_per_hour"] is None
+    assert unknown_reward["exposure_quantity"] == "400"
+    assert unknown_reward["add_room"]["available"] is False
+
+    state["rate_state"] = "known"
+    state["hourly_reward"] = Decimal("0.20")
+    state["currency"] = "EUR"
+    unsupported_currency = service.refresh_lp_observations()["observations"][condition_id]
+    assert unsupported_currency["current_hourly_reward_usd"] is None
+    assert unsupported_currency["current_yield_pct_per_hour"] is None
+    assert unsupported_currency["add_room"]["available"] is False
+    state["currency"] = "USD"
+
+    state["account_age"] = 121
+    stale_account = service.refresh_lp_observations()["observations"][condition_id]
+    assert stale_account["stale"] is True
+    assert stale_account["current_hourly_reward_usd"] is None
+    assert stale_account["occupied_capital_usd"] is None
+    assert stale_account["exposure_quantity"] is None
+    assert stale_account["risk_state"] == "unknown"
+    assert stale_account["risk_warning"] is None
+    assert stale_account["risk_directions"] == []
+    assert stale_account["add_room"]["available"] is False
+    assert service.lp_dashboard()["lp_observations"][condition_id]["add_room"]["available"] is False
+
+    state["account_age"] = 0
+    state["account_complete"] = False
+    incomplete = service.refresh_lp_observations()["observations"][condition_id]
+    assert incomplete["add_room"]["available"] is False
+    state["account_complete"] = True
+    state["rate_age"] = 121
+    expired_reward = service.refresh_lp_observations()["observations"][condition_id]
+    assert expired_reward["current_yield_pct_per_hour"] is None
+    assert expired_reward["add_room"]["available"] is False
+
+    state["rate_age"] = 0
+    state["market_id"] = "condition-2"
+    state["orders"] = [order(Decimal("200"))]
+    mismatched_market = service.refresh_lp_observations()["observations"]["condition-2"]
+    assert mismatched_market["current_yield_pct_per_hour"] is None
+    assert mismatched_market["add_room"]["available"] is False
+
+    state["market_id"] = condition_id
+    state["orders"] = []
+    zero_capital = service.refresh_lp_observations()["observations"][condition_id]
+    assert zero_capital["stage"] == "flat"
+    assert zero_capital["current_yield_pct_per_hour"] is None
+    assert zero_capital["add_room"]["available"] is False
+
+    state["fees_enabled"] = None
+    state["orders"] = [order(Decimal("200"))]
+    unknown_fee = service.refresh_lp_observations()["observations"][condition_id]
+    assert unknown_fee["risk_state"] == "unknown"
+    assert unknown_fee["add_room"]["available"] is False
+    notification_calls_before_get = notifier.calls
+    assert service.lp_dashboard()["state"] == "ready"
+    assert notifier.calls == notification_calls_before_get
+    assert trading.order_writes == 0
+    assert trading.cancellations == 0
+
+
+def test_lp_risk_alerts_deduplicate_per_channel_and_rearm(tmp_path: Path) -> None:
+    condition_id = "condition-1"
+    token_id = "yes-token"
+    state: dict[str, object] = {
+        "book_price": Decimal("0.46"),
+        "book_unknown": False,
+        "voice_time": datetime.fromisoformat("2026-07-15T08:00:00+08:00"),
+        "voice_failures": 1,
+        "order_writes": 0,
+        "cancellations": 0,
+    }
+    order = {
+        "order_id": "manual-order",
+        "condition_id": condition_id,
+        "token_id": token_id,
+        "outcome": "YES",
+        "side": "BUY",
+        "status": "LIVE",
+        "price": Decimal("0.50"),
+        "original_size": Decimal("100"),
+        "size_matched": Decimal("0"),
+        "remaining_size": Decimal("100"),
+        "reward_min_size": Decimal("40"),
+        "fees_enabled": False,
+        "market_title": "Will it happen?",
+    }
+
+    class ReadOnlyTrading:
+        config = SimpleNamespace(wallet_address="0x" + "3" * 40)
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": datetime.now(UTC),
+                "open_orders": [dict(order)],
+                "positions": [],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def get_order_scoring(self, _order_id: str) -> bool:
+            return True
+
+        def lp_reward_snapshot(self, reward_date: str, market: str) -> dict[str, object]:
+            return {"state": "unknown", "reward_date": reward_date, "condition_id": market}
+
+        def lp_reward_rates(self) -> dict[str, object]:
+            checked_at = datetime.now(UTC)
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": checked_at,
+                "markets": {
+                    condition_id: {
+                        "state": "known",
+                        "hourly_reward_usd": Decimal("0.20"),
+                        "currency": "USD",
+                        "checked_at": checked_at,
+                        "sources": ("native",),
+                        "native": {
+                            "state": "known",
+                            "earning_percentage": Decimal("1"),
+                            "hourly_reward_usd": Decimal("0.20"),
+                            "currency": "USD",
+                        },
+                    }
+                },
+            }
+
+        def lp_order_books(self, token_ids: tuple[str, ...]) -> dict[str, dict[str, object]]:
+            if state["book_unknown"] is True:
+                return {}
+            return {
+                token: {
+                    "condition_id": condition_id,
+                    "token_id": token,
+                    "received_at": datetime.now(UTC),
+                    "bids": [
+                        {"price": Decimal("0.51"), "size": Decimal("20")},
+                        {"price": Decimal("0.50"), "size": Decimal("100")},
+                        {"price": state["book_price"], "size": Decimal("1000")},
+                    ],
+                    "asks": [],
+                }
+                for token in token_ids
+            }
+
+        def create_limit_order(self, **_kwargs: object) -> None:
+            state["order_writes"] = int(state["order_writes"]) + 1
+
+        def post_order(self, _order: object) -> None:
+            state["order_writes"] = int(state["order_writes"]) + 1
+
+        def cancel_orders(self, **_kwargs: object) -> None:
+            state["cancellations"] = int(state["cancellations"]) + 1
+
+    posted: list[dict[str, object]] = []
+    voice_texts: list[str] = []
+
+    def fake_post(
+        _url: str,
+        payload: dict[str, object],
+        _timeout_seconds: float,
+    ) -> dict[str, object]:
+        posted.append(payload)
+        return {"code": 0}
+
+    def fake_run(
+        command: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        voice_texts.append(shlex.split(command[-1])[1])
+        if int(state["voice_failures"]) > 0:
+            state["voice_failures"] = int(state["voice_failures"]) - 1
+            return subprocess.CompletedProcess(command, 255)
+        return subprocess.CompletedProcess(command, 0)
+
+    notifier = CompositeNotifier(
+        [
+            FeishuWebhookNotifier(
+                webhook_url="https://feishu.invalid/hook", post_json=fake_post
+            ),
+            XiaoaiSSHNotifier(
+                host="speaker.local",
+                ssh_key=tmp_path / "unused-key",
+                run_command=fake_run,
+                lock_path=tmp_path / "lp-risk-voice.lock",
+                now_fn=lambda: state["voice_time"],
+            ),
+        ]
+    )
+    service, _trading, _store, monitor = execution_fixture(tmp_path)
+    trading = ReadOnlyTrading()
+    service._trading = trading
+    service._notifier = notifier
+    observation = service.refresh_lp_observations()["observations"][condition_id]
+    assert observation["risk_warning"] is False
+    assert posted == []
+    assert voice_texts == []
+
+    state["book_price"] = Decimal("0.44")
+    triggered = service.refresh_lp_observations()["observations"][condition_id]
+    assert triggered["risk_warning"] is True
+    assert len(posted) == 1
+    assert len(voice_texts) == 1
+    alert = triggered["risk_alerts"]["YES"]
+    assert alert["active"] is True
+    assert alert["channels"]["feishu"]["success"] is True
+    assert alert["channels"]["xiaoai"]["success"] is False
+    assert "LP 风险警告" in posted[-1]["content"]["text"]
+    assert voice_texts[-1] == posted[-1]["content"]["text"]
+
+    retry = service.refresh_lp_observations()["observations"][condition_id]
+    assert len(posted) == 1
+    assert len(voice_texts) == 2
+    assert retry["risk_alerts"]["YES"]["channels"]["xiaoai"]["success"] is True
+    assert voice_texts[-1] == posted[-1]["content"]["text"]
+
+    restarted = PredictionExecutionService(
+        store=PredictionArbitrageStore(tmp_path / "data"),
+        monitor=monitor,
+        trading=trading,
+        notifier=notifier,
+        lock_path=tmp_path / "restarted-execution.lock",
+    )
+    restarted.refresh_lp_observations()
+    state["book_unknown"] = True
+    unknown = restarted.refresh_lp_observations()["observations"][condition_id]
+    assert unknown["risk_state"] == "unknown"
+    assert unknown["risk_alerts"]["YES"]["active"] is True
+    assert len(posted) == 1
+    assert len(voice_texts) == 2
+
+    state["book_unknown"] = False
+    state["book_price"] = Decimal("0.46")
+    recovered = restarted.refresh_lp_observations()["observations"][condition_id]
+    assert recovered["risk_warning"] is False
+    assert recovered["risk_alerts"]["YES"]["active"] is False
+    assert len(posted) == 1
+    assert len(voice_texts) == 2
+
+    state["book_price"] = Decimal("0.44")
+    retriggered = restarted.refresh_lp_observations()["observations"][condition_id]
+    assert len(posted) == 2
+    assert len(voice_texts) == 3
+    assert retriggered["risk_alerts"]["YES"]["channels"]["feishu"]["success"] is True
+    assert retriggered["risk_alerts"]["YES"]["channels"]["xiaoai"]["success"] is True
+
+    state["book_price"] = Decimal("0.46")
+    restarted.refresh_lp_observations()
+    state["voice_time"] = datetime.fromisoformat("2026-07-15T23:00:00+08:00")
+    state["book_price"] = Decimal("0.44")
+    night = restarted.refresh_lp_observations()["observations"][condition_id]
+    assert len(posted) == 3
+    assert len(voice_texts) == 3
+    assert night["risk_alerts"]["YES"]["channels"]["xiaoai"]["suppressed"] is True
+
+    state["voice_time"] = datetime.fromisoformat("2026-07-16T08:00:00+08:00")
+    restarted.refresh_lp_observations()
+    assert len(posted) == 3
+    assert len(voice_texts) == 4
+
+    state["voice_time"] = datetime.fromisoformat("2026-07-16T23:00:00+08:00")
+    state["book_price"] = Decimal("0.46")
+    restarted.refresh_lp_observations()
+    state["voice_time"] = datetime.fromisoformat("2026-07-17T23:00:00+08:00")
+    state["book_price"] = Decimal("0.44")
+    second_night = restarted.refresh_lp_observations()["observations"][condition_id]
+    assert len(posted) == 4
+    assert second_night["risk_alerts"]["YES"]["channels"]["xiaoai"]["suppressed"] is True
+    state["voice_time"] = datetime.fromisoformat("2026-07-18T08:00:00+08:00")
+    state["book_price"] = Decimal("0.46")
+    restarted.refresh_lp_observations()
+    assert len(voice_texts) == 4
+    assert state["order_writes"] == 0
+    assert state["cancellations"] == 0
 
 
 def test_lp_candidate_preview_rechecks_best_bid_before_confirmation(
