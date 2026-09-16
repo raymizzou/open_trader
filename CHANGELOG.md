@@ -18,8 +18,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
   the background read-only reward monitor refreshes them without opening the
   Dashboard. Expired or exposure-misaligned nested observations stay masked
   until an explicit refresh while the fresh account snapshot remains visible.
-  Verified with the focused LP Dashboard contract and affected regressions; no
-  live notifications, orders or deployment were performed.
+  Verified with the focused LP Dashboard contract, storage schema coverage and
+  affected regressions; no live notifications, orders or deployment were
+  performed.
 
 - Added an LP-first tab and a separate multi-leg tab within 预测市场, with
   shared cached venue cards. Each refresh reads the shared venue summary and
