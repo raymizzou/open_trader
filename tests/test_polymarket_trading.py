@@ -2507,6 +2507,9 @@ def test_lp_books_batch_receipts_preserve_unchanged_source_time(
 def test_lp_metadata_preserves_event_evidence_and_market_links(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from collections import Counter
+    from http.client import InvalidURL
+
     from polymarket.models.gamma.event import Event
     from polymarket.models.gamma.market import Market
 
@@ -2522,8 +2525,22 @@ def test_lp_metadata_preserves_event_evidence_and_market_links(
     condition_dated = "0x" + "5" * 64
 
     def parsed_market(
-        market_id: str, condition_id: str, slug: str, *, linked_event: bool
+        market_id: str,
+        condition_id: str,
+        slug: str,
+        *,
+        linked_event: bool,
+        numeric_event_id: int | None = None,
+        event_reference_id: str | None = None,
     ) -> Market:
+        event_reference = (
+            {
+                "id": event_reference_id or str(numeric_event_id),
+                "slug": f"bulk-event-{numeric_event_id}",
+            }
+            if numeric_event_id is not None
+            else {"id": event_id, "slug": event_slug, "title": "World Cup"}
+        )
         return Market.parse_response(
             {
                 "id": market_id,
@@ -2538,11 +2555,7 @@ def test_lp_metadata_preserves_event_evidence_and_market_links(
                     "2026-09-15T16:00:00Z" if linked_event else None
                 ),
                 "oneDayPriceChange": "0.12",
-                "events": (
-                    [{"id": event_id, "slug": event_slug, "title": "World Cup"}]
-                    if linked_event
-                    else []
-                ),
+                "events": [event_reference] if linked_event else [],
             }
         )
 
@@ -2599,39 +2612,170 @@ def test_lp_metadata_preserves_event_evidence_and_market_links(
             "markets": [],
         }
     )
+    leading_zero_mismatch_record = Event.parse_response(
+        {
+            "id": "1001",
+            "slug": "bulk-event-1001",
+            "title": "Bulk event 1001",
+            "startTime": "2026-09-15T16:00:00Z",
+            "ended": True,
+            "closed": True,
+            "finishedTimestamp": "2026-09-15T18:04:12Z",
+            "markets": [],
+        }
+    )
+
+    bulk_conditions: list[str] = []
+    bulk_market_records: list[Market] = []
+    bulk_event_ids: list[int] = []
+    bulk_event_records: dict[int, Event] = {}
+    for index in range(196):
+        condition_id = f"0x{index + 6:064x}"
+        if index == 0:
+            numeric_event_id = 1000
+        elif index in (1, 3):
+            numeric_event_id = 1001
+        elif index in (2, 4):
+            numeric_event_id = 1002
+        else:
+            numeric_event_id = 1000 + index - 2
+        bulk_conditions.append(condition_id)
+        bulk_event_ids.append(numeric_event_id)
+        bulk_market_records.append(
+            parsed_market(
+                f"market-bulk-{index}",
+                condition_id,
+                f"bulk-market-{index}",
+                linked_event=True,
+                numeric_event_id=numeric_event_id,
+                event_reference_id=(
+                    f"0{numeric_event_id}" if index == 3 else None
+                ),
+            )
+        )
+        if numeric_event_id not in bulk_event_records:
+            is_closed = numeric_event_id in (1001, 1003)
+            bulk_event_records[numeric_event_id] = Event.parse_response(
+                {
+                    "id": (
+                        "01000"
+                        if numeric_event_id == 1000
+                        else " 1003 "
+                        if numeric_event_id == 1003
+                        else str(numeric_event_id)
+                    ),
+                    "slug": f"bulk-event-{numeric_event_id}",
+                    "title": f"Bulk event {numeric_event_id}",
+                    "startTime": "2026-09-15T16:00:00Z",
+                    "ended": is_closed,
+                    "closed": is_closed,
+                    "finishedTimestamp": (
+                        "2026-09-15T18:04:12Z" if is_closed else None
+                    ),
+                    "markets": [],
+                }
+            )
+
+    all_markets = (*event_markets, *bulk_market_records)
+    market_by_condition = {
+        str(market.condition_id): market for market in all_markets
+    }
+    query_lock = threading.Lock()
+    clients: list[MetadataPublicClient] = []
+    market_queries: list[tuple[tuple[str, ...], int | None]] = []
+    event_queries: list[tuple[tuple[int, ...], bool, int | None]] = []
+    get_event_calls: list[str] = []
+    paginators: list[object] = []
 
     metadata_read_started_at = datetime(2026, 9, 15, 15, 0, tzinfo=UTC)
     later_event_read_at = datetime(2026, 9, 15, 19, 0, tzinfo=UTC)
 
+    class PagedRows:
+        def __init__(self, rows: tuple[object, ...]) -> None:
+            self.rows = rows
+            self.complete = False
+            with query_lock:
+                paginators.append(self)
+
+        def iter_items(self):
+            try:
+                for offset in range(0, len(self.rows), 37):
+                    yield from self.rows[offset : offset + 37]
+            finally:
+                self.complete = True
+
     class MetadataPublicClient:
         def __init__(self) -> None:
-            self.event_calls: list[str] = []
             self.closed = False
+            with query_lock:
+                clients.append(self)
 
-        def list_markets(self, *, condition_ids: tuple[str, ...]) -> tuple[Market, ...]:
-            assert condition_ids == (
-                condition_event,
-                condition_event_other,
-                condition_game,
-                condition_mismatch,
-                condition_dated,
+        def list_markets(
+            self,
+            *,
+            condition_ids: tuple[str, ...],
+            page_size: int | None = None,
+        ) -> PagedRows:
+            assert self.closed is False
+            requested_ids = tuple(condition_ids)
+            with query_lock:
+                market_queries.append((requested_ids, page_size))
+            if len(requested_ids) > 100:
+                raise InvalidURL("URL component 'query' too long")
+            assert page_size == 100
+            return PagedRows(
+                tuple(
+                    market_by_condition[condition_id]
+                    for condition_id in requested_ids
+                    if condition_id in market_by_condition
+                )
             )
-            return event_markets
+
+        def list_events(
+            self,
+            *,
+            ids: tuple[int, ...],
+            closed: bool,
+            page_size: int | None = None,
+        ) -> PagedRows:
+            assert self.closed is False
+            requested_ids = tuple(ids)
+            with query_lock:
+                event_queries.append((requested_ids, closed, page_size))
+            if len(requested_ids) > 100:
+                raise InvalidURL("URL component 'query' too long")
+            assert page_size == 100
+            assert len(requested_ids) == len(set(requested_ids))
+            return PagedRows(
+                tuple(
+                    bulk_event_records[event_id]
+                    for event_id in requested_ids
+                    if event_id in bulk_event_records
+                    and (event_id == 1001) is closed
+                )
+            )
 
         def get_event(self, *, id: str) -> Event:
             assert self.closed is False
-            self.event_calls.append(id)
-            return event_record
+            with query_lock:
+                get_event_calls.append(id)
+            return (
+                leading_zero_mismatch_record
+                if id == "01001"
+                else event_record
+            )
 
         def close(self) -> None:
             self.closed = True
 
-    public = MetadataPublicClient()
-
     class MetadataClock(datetime):
         @classmethod
         def now(cls, tz: object = None) -> datetime:
-            value = metadata_read_started_at if not public.event_calls else later_event_read_at
+            value = (
+                metadata_read_started_at
+                if not market_queries and not event_queries and not get_event_calls
+                else later_event_read_at
+            )
             return value if tz is None else value.astimezone(tz)  # type: ignore[arg-type]
 
     monkeypatch.setattr(polymarket_trading, "datetime", MetadataClock)
@@ -2639,21 +2783,69 @@ def test_lp_metadata_preserves_event_evidence_and_market_links(
     adapter = PolymarketTradingClient(
         TradingConfig(SIGNER, WALLET),
         client=object(),
-        public_client_factory=lambda: public,
+        public_client_factory=MetadataPublicClient,
     )
 
+    requested_conditions = (
+        condition_event,
+        condition_event_other,
+        condition_game,
+        condition_mismatch,
+        condition_dated,
+        *bulk_conditions,
+    )
     metadata = adapter.lp_market_metadata(
-        (
-            condition_event,
-            condition_event_other,
-            condition_game,
-            condition_mismatch,
-            condition_dated,
-        )
+        requested_conditions
     )
 
-    assert public.event_calls == [event_id, "event-mismatch"]
-    assert public.closed is True
+    assert len(metadata) == 201
+    assert set(metadata) == set(requested_conditions)
+    direct_event_call_counts = Counter(get_event_calls)
+    assert direct_event_call_counts[event_id] == 1
+    assert direct_event_call_counts["event-mismatch"] == 1
+    assert direct_event_call_counts["01001"] <= 1
+    assert set(direct_event_call_counts) <= {
+        event_id,
+        "event-mismatch",
+        "01001",
+    }
+    assert market_queries
+    assert all(0 < len(ids) <= 100 for ids, _page_size in market_queries)
+    assert all(page_size == 100 for _ids, page_size in market_queries)
+    queried_market_ids = [
+        condition_id for ids, _page_size in market_queries for condition_id in ids
+    ]
+    assert len(queried_market_ids) == 201
+    assert set(queried_market_ids) == set(requested_conditions)
+    assert event_queries
+    assert all(0 < len(ids) <= 100 for ids, _closed, _page_size in event_queries)
+    assert all(page_size == 100 for _ids, _closed, page_size in event_queries)
+    assert {closed for _ids, closed, _page_size in event_queries} == {False, True}
+    assert len(event_queries) <= 4
+    queried_event_ids_by_mode = {
+        closed: [
+            event_id
+            for ids, query_closed, _page_size in event_queries
+            if query_closed is closed
+            for event_id in ids
+        ]
+        for closed in (False, True)
+    }
+    assert all(
+        len(ids) == len(set(ids)) for ids in queried_event_ids_by_mode.values()
+    )
+    assert set(bulk_event_ids) <= {
+        event_id
+        for ids in queried_event_ids_by_mode.values()
+        for event_id in ids
+    }
+    assert all(getattr(paginator, "complete") for paginator in paginators)
+    assert clients
+    assert all(client.closed is True for client in clients)
+    assert all(
+        row["metadata_checked_at"] == metadata_read_started_at
+        for row in metadata.values()
+    )
 
     observed = metadata[condition_event]
     assert observed["metadata_checked_at"] == metadata_read_started_at
@@ -2693,3 +2885,37 @@ def test_lp_metadata_preserves_event_evidence_and_market_links(
     assert dated.get("event_id") is None
     assert dated.get("event_start_time") is None
     assert dated.get("game_start_time") is None
+
+    closed_event = metadata[bulk_conditions[1]]
+    assert closed_event["event_id"] == "1001"
+    assert closed_event["event_ended"] is True
+    assert closed_event["event_finished_at"] == finished_at
+
+    shared_bulk_event = metadata[bulk_conditions[2]]
+    assert shared_bulk_event["event_id"] == "1002"
+    assert shared_bulk_event["event_start_time"] == start_time
+    assert metadata[bulk_conditions[4]]["event_id"] == "1002"
+    mismatched_bulk_event = metadata[bulk_conditions[0]]
+    assert mismatched_bulk_event["event_id"] == "1000"
+    assert mismatched_bulk_event["event_start_time"] is None
+    assert mismatched_bulk_event["event_ended"] is None
+    assert mismatched_bulk_event["event_finished_at"] is None
+    leading_zero_mismatch = metadata[bulk_conditions[3]]
+    assert leading_zero_mismatch["event_id"] == "01001"
+    assert leading_zero_mismatch["event_start_time"] is None
+    assert leading_zero_mismatch["event_ended"] is None
+    assert leading_zero_mismatch["event_finished_at"] is None
+    padded_event = metadata[bulk_conditions[5]]
+    assert padded_event["event_id"] == "1003"
+    assert padded_event["event_start_time"] is None
+    assert padded_event["event_ended"] is None
+    assert padded_event["event_finished_at"] is None
+    assert str(bulk_event_records[1003].id) == " 1003 "
+
+    stopped_before_clients = len(clients)
+    stopped_before_queries = len(market_queries) + len(event_queries)
+    stopped = threading.Event()
+    stopped.set()
+    assert adapter.lp_market_metadata(requested_conditions, stop_event=stopped) == {}
+    assert len(clients) == stopped_before_clients
+    assert len(market_queries) + len(event_queries) == stopped_before_queries

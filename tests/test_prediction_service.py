@@ -758,7 +758,9 @@ def test_lp_dashboard_shows_manual_orders_without_managing_them(
         def __init__(self) -> None:
             self.closed = False
 
-        def list_markets(self, *, condition_ids: object) -> list[object]:
+        def list_markets(
+            self, *, condition_ids: object, page_size: int = 100
+        ) -> list[object]:
             assert tuple(condition_ids) == ("condition-1",)  # type: ignore[arg-type]
             return [
                 {
@@ -964,7 +966,9 @@ def test_lp_candidate_preview_rechecks_best_bid_before_confirmation(
                 }
             ]
 
-        def list_markets(self, *, condition_ids: object) -> list[object]:
+        def list_markets(
+            self, *, condition_ids: object, page_size: int = 100
+        ) -> list[object]:
             cast_conditions = public_state["metadata_conditions"]
             assert isinstance(cast_conditions, list)
             conditions = tuple(condition_ids)  # type: ignore[arg-type]
@@ -1393,7 +1397,9 @@ def _lp_adapter_service_fixture(
                 if (market := markets_by_id.get(str(condition_id))) is not None
             ]
 
-        def list_markets(self, *, condition_ids: object) -> list[object]:
+        def list_markets(
+            self, *, condition_ids: object, page_size: int = 100
+        ) -> list[object]:
             requested = set(condition_ids)  # type: ignore[arg-type]
             markets_by_id = self._market_specs()
             return [
@@ -1981,7 +1987,9 @@ def test_lp_recommendations_retain_expired_guidance_without_renewing_it(
                 reward_row(missing_condition_id, end_date=end_date),
             ]
 
-        def list_markets(self, *, condition_ids: object) -> list[object]:
+        def list_markets(
+            self, *, condition_ids: object, page_size: int = 100
+        ) -> list[object]:
             conditions = tuple(condition_ids)  # type: ignore[arg-type]
             return [market_row(self.state)] if condition_id in conditions else []
 

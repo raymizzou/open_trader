@@ -2753,7 +2753,9 @@ def test_lp_book_sampling_does_not_block_candidates_or_order_risk(
                 with probe.lock:
                     probe.catalog_active -= 1
 
-        def list_markets(self, *, condition_ids: tuple[str, ...]) -> list[object]:
+        def list_markets(
+            self, *, condition_ids: tuple[str, ...], page_size: int = 100
+        ) -> list[object]:
             return [row for row in market_rows if row["condition_id"] in condition_ids]
 
         def get_market(self, *, id: str) -> object:
@@ -3299,7 +3301,9 @@ def test_lp_book_sampler_bounds_batches_and_preserves_receipts(
         def list_current_rewards(self, *, sponsored: bool) -> list[object]:
             return [] if sponsored else rewards
 
-        def list_markets(self, *, condition_ids: object) -> list[object]:
+        def list_markets(
+            self, *, condition_ids: object, page_size: int = 100
+        ) -> list[object]:
             requested = set(condition_ids)  # type: ignore[arg-type]
             return [row for row in markets if row["condition_id"] in requested]
 

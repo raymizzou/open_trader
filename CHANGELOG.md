@@ -25,10 +25,13 @@ operator-facing: what changed, which workflow is affected, and what was verified
   private-account facts withhold guidance while known public books keep sampling.
   The production reward monitor also makes one forced catalog-refresh attempt
   at startup, even when it restores a recent scan time; its normal 60-second
-  cadence remains unchanged. The source-tagged 24-hour price move remains a
-  display reference. Verified by
+  cadence remains unchanged. Market metadata now uses bounded 100-ID requests
+  with at most eight concurrent public reads; event IDs must match exactly and
+  partial metadata never counts as complete coverage. The source-tagged
+  24-hour price move remains a display reference. Verified by
   the 23-test focused Docker integration group and 20-test blocker regression
-  group; no live calls, orders or deployment were performed.
+  group; the metadata timeout repair also passed its seven-case focused Docker
+  group. No live calls, orders or deployment were performed.
 
 ## 2026-09-15
 

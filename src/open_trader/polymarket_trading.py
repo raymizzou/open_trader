@@ -1063,45 +1063,165 @@ class PolymarketTradingClient:
             return {}
         if stop_event is not None and stop_event.is_set():
             return {}
-        public = self._public_client_factory()
-        event_facts: dict[str, Mapping[str, object] | None] = {}
         metadata_checked_at = datetime.now(UTC)
-        try:
-            rows = _collect(public.list_markets(condition_ids=requested))
-            get_event = getattr(public, "get_event", None)
-            for value in rows:
-                row = _model_dict(value)
-                if row is None:
-                    continue
-                condition_id = row.get("condition_id", row.get("conditionId"))
-                if not isinstance(condition_id, str) or condition_id not in requested:
-                    continue
-                references = tuple(
-                    reference
-                    for raw_reference in _collect(row.get("events"))
-                    if (reference := _model_dict(raw_reference)) is not None
-                )
-                if len(references) != 1:
-                    continue
-                raw_event_id = references[0].get("id")
-                event_id = str(raw_event_id).strip() if raw_event_id is not None else ""
-                if not event_id or event_id in event_facts:
-                    continue
-                event_facts[event_id] = None
-                if stop_event is not None and stop_event.is_set():
-                    break
-                if not callable(get_event):
-                    continue
-                try:
-                    event = _model_dict(get_event(id=event_id))
-                except Exception:
-                    continue
-                if event is not None and str(event.get("id") or "") == event_id:
-                    event_facts[event_id] = event
-        finally:
+        event_facts: dict[str, Mapping[str, object] | None] = {}
+
+        def close_public(public: object) -> None:
             close = getattr(public, "close", None)
             if callable(close):
                 close()
+
+        def read_market_batch(batch: tuple[str, ...]) -> tuple[object, ...]:
+            if stop_event is not None and stop_event.is_set():
+                return ()
+            public = self._public_client_factory()
+            try:
+                if stop_event is not None and stop_event.is_set():
+                    return ()
+                return _collect(
+                    public.list_markets(condition_ids=batch, page_size=100)
+                )
+            finally:
+                close_public(public)
+
+        market_batches = tuple(
+            requested[offset : offset + 100]
+            for offset in range(0, len(requested), 100)
+        )
+        with ThreadPoolExecutor(max_workers=min(8, len(market_batches))) as pool:
+            rows = tuple(
+                value
+                for batch_rows in pool.map(read_market_batch, market_batches)
+                for value in batch_rows
+            )
+        if stop_event is not None and stop_event.is_set():
+            return {}
+
+        numeric_event_keys: dict[int, list[str]] = {}
+        direct_event_ids: list[str] = []
+        for value in rows:
+            row = _model_dict(value)
+            if row is None:
+                continue
+            condition_id = row.get("condition_id", row.get("conditionId"))
+            if not isinstance(condition_id, str) or condition_id not in requested:
+                continue
+            references = tuple(
+                reference
+                for raw_reference in _collect(row.get("events"))
+                if (reference := _model_dict(raw_reference)) is not None
+            )
+            if len(references) != 1:
+                continue
+            raw_event_id = references[0].get("id")
+            event_id = str(raw_event_id).strip() if raw_event_id is not None else ""
+            if not event_id or event_id in event_facts:
+                continue
+            event_facts[event_id] = None
+            if (
+                event_id.isascii()
+                and event_id.isdecimal()
+                and str(int(event_id)) == event_id
+            ):
+                numeric_event_keys.setdefault(int(event_id), []).append(event_id)
+            else:
+                direct_event_ids.append(event_id)
+
+        unresolved_numeric_ids = tuple(numeric_event_keys)
+        for closed in (False, True):
+            if not unresolved_numeric_ids or (
+                stop_event is not None and stop_event.is_set()
+            ):
+                break
+            event_batches = tuple(
+                (unresolved_numeric_ids[offset : offset + 100], closed)
+                for offset in range(0, len(unresolved_numeric_ids), 100)
+            )
+
+            def read_event_batch(
+                query: tuple[tuple[int, ...], bool],
+            ) -> tuple[object, ...]:
+                batch, is_closed = query
+                if stop_event is not None and stop_event.is_set():
+                    return ()
+                public = self._public_client_factory()
+                try:
+                    if stop_event is not None and stop_event.is_set():
+                        return ()
+                    list_events = getattr(public, "list_events", None)
+                    if not callable(list_events):
+                        return ()
+                    try:
+                        return _collect(
+                            list_events(ids=batch, closed=is_closed, page_size=100)
+                        )
+                    except Exception:
+                        return ()
+                finally:
+                    close_public(public)
+
+            resolved: set[int] = set()
+            with ThreadPoolExecutor(max_workers=min(8, len(event_batches))) as pool:
+                for (batch, _is_closed), event_rows in zip(
+                    event_batches, pool.map(read_event_batch, event_batches), strict=True
+                ):
+                    if stop_event is not None and stop_event.is_set():
+                        break
+                    for value in event_rows:
+                        event = _model_dict(value)
+                        if event is None:
+                            continue
+                        raw_id = event.get("id")
+                        event_id = str(raw_id) if raw_id is not None else ""
+                        if not event_id.isascii() or not event_id.isdecimal():
+                            continue
+                        numeric_id = int(event_id)
+                        if (
+                            event_id != str(numeric_id)
+                            or numeric_id not in batch
+                            or numeric_id not in numeric_event_keys
+                        ):
+                            continue
+                        for key in numeric_event_keys[numeric_id]:
+                            event_facts[key] = event
+                        resolved.add(numeric_id)
+            unresolved_numeric_ids = tuple(
+                event_id
+                for event_id in unresolved_numeric_ids
+                if event_id not in resolved
+            )
+
+        def read_direct_event(
+            event_id: str,
+        ) -> tuple[str, Mapping[str, object] | None]:
+            if stop_event is not None and stop_event.is_set():
+                return event_id, None
+            public = self._public_client_factory()
+            try:
+                if stop_event is not None and stop_event.is_set():
+                    return event_id, None
+                get_event = getattr(public, "get_event", None)
+                if not callable(get_event):
+                    return event_id, None
+                try:
+                    event = _model_dict(get_event(id=event_id))
+                except Exception:
+                    return event_id, None
+                if event is None or str(event.get("id") or "") != event_id:
+                    return event_id, None
+                return event_id, event
+            finally:
+                close_public(public)
+
+        if direct_event_ids and not (
+            stop_event is not None and stop_event.is_set()
+        ):
+            with ThreadPoolExecutor(
+                max_workers=min(8, len(direct_event_ids))
+            ) as pool:
+                for event_id, event in pool.map(read_direct_event, direct_event_ids):
+                    if event is not None:
+                        event_facts[event_id] = event
         if stop_event is not None and stop_event.is_set():
             return {}
         result: dict[str, dict[str, object]] = {}
