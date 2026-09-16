@@ -14,6 +14,7 @@ import time
 from types import SimpleNamespace
 from typing import Mapping
 
+import open_trader.prediction_observation_monitor as observation_monitor_module
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 from open_trader.prediction_observation_monitor import PredictionObservationMonitor
 from open_trader.prediction_read_model import prediction_state_payload
@@ -1126,6 +1127,68 @@ def test_stop_skips_queued_background_refresh(tmp_path: Path) -> None:
         monitor.stop()
 
     assert refresh_calls == 0
+
+
+def test_snapshot_does_not_wait_for_publication_build(
+    tmp_path: Path, monkeypatch
+) -> None:
+    rows = dated_rows()
+    generation = [1]
+    build_started = threading.Event()
+    release_build = threading.Event()
+    block_once = [True]
+    original_display_fields = observation_monitor_module._display_fields
+
+    def source() -> dict[str, object]:
+        return {
+            "generation": generation[0],
+            "generation_fingerprint": f"generation-{generation[0]}",
+            "rows": rows,
+        }
+
+    def blocking_display_fields(
+        row: Mapping[str, object],
+        *,
+        identity: str,
+        candidate: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        if block_once[0]:
+            block_once[0] = False
+            build_started.set()
+            if not release_build.wait(timeout=5):
+                raise AssertionError("publication build was not released")
+        return original_display_fields(row, identity=identity, candidate=candidate)
+
+    monitor = PredictionObservationMonitor(
+        catalog={},
+        candidate_source=source,
+        store=PredictionArbitrageStore(tmp_path / "store"),
+        book_source=lambda token_ids: paper_books(
+            ("0.30", "0.32", "0.33"), now=NOW
+        ),
+        clock=lambda: NOW,
+    )
+    initial = monitor.refresh_once()
+    generation[0] = 2
+    rows["paper-three"]["version_id"] = "generation-2"
+    monkeypatch.setattr(observation_monitor_module, "_display_fields", blocking_display_fields)
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        refresh_future = workers.submit(monitor.refresh_once)
+        assert build_started.wait(timeout=2)
+        snapshot_future = workers.submit(monitor.snapshot)
+        try:
+            observed = snapshot_future.result(timeout=1)
+        finally:
+            release_build.set()
+        refreshed = refresh_future.result(timeout=5)
+
+    assert observed == initial
+    assert observed["generation"] == 1
+    assert observed["generation_fingerprint"] == "generation-1"
+    assert refreshed["generation"] == 2
+    assert refreshed["generation_fingerprint"] == "generation-2"
+    assert monitor.snapshot()["generation_fingerprint"] == "generation-2"
 
 
 def test_restart_restores_members_with_fresh_books(tmp_path: Path) -> None:

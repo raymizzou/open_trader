@@ -1341,11 +1341,21 @@ class PredictionObservationMonitor:
         """Build the immutable HTTP-facing snapshot during refresh only."""
 
         with self._lock:
+            membership = self._membership
+            states = self._states
+            catalog_metadata = self._catalog_metadata
+            exclusions_snapshot = self._exclusions
+            catalog_error = self._catalog_error
+            persistence_error = self._persistence_error
+            book_error = self._book_error
+            last_refresh_at = self._last_refresh_at
+
+        def build_snapshot() -> dict[str, object]:
             observation_now = self._clock().astimezone(UTC)
             members: list[dict[str, object]] = []
             all_tokens: set[str] = set()
-            for identity, member in sorted(self._membership.items()):
-                state = self._states.get(identity, {})
+            for identity, member in sorted(membership.items()):
+                state = states.get(identity, {})
                 candidate: Mapping[str, object] = candidates.get(identity, {})
                 tokens = tuple(candidate.get("tokens", ()))
                 all_tokens.update(tokens)
@@ -1382,7 +1392,7 @@ class PredictionObservationMonitor:
             for identity, raw in sorted(rows.items()):
                 candidate = candidates.get(identity)
                 if candidate is not None:
-                    stage = "OBSERVING" if identity in self._membership else "WAITING"
+                    stage = "OBSERVING" if identity in membership else "WAITING"
                     row = candidate.get("row")
                     display_fields = (
                         _display_fields(row, identity=identity, candidate=candidate)
@@ -1406,11 +1416,11 @@ class PredictionObservationMonitor:
                             else None
                         ),
                     }
-                    if identity in self._states:
+                    if identity in states:
                         item["result"] = copy.deepcopy(
-                            self._states[identity].get("result")
+                            states[identity].get("result")
                         )
-                        item["oldest_book_at"] = self._states[identity].get(
+                        item["oldest_book_at"] = states[identity].get(
                             "oldest_book_at"
                         )
                     latest.append(item)
@@ -1491,12 +1501,12 @@ class PredictionObservationMonitor:
                 and result.get("reason") in {"STALE_BOOK", "FUTURE_BOOK"}
                 for result in current_results
             )
-            if self._catalog_error or self._persistence_error or self._book_error:
+            if catalog_error or persistence_error or book_error:
                 observation_status = "ERROR"
                 status_reason = (
-                    self._catalog_error
-                    or self._persistence_error
-                    or self._book_error
+                    catalog_error
+                    or persistence_error
+                    or book_error
                 )
             elif has_source_unknown:
                 observation_status = "UNKNOWN"
@@ -1513,11 +1523,11 @@ class PredictionObservationMonitor:
             else:
                 observation_status = "READY"
                 status_reason = None
-            self._published_snapshot = {
+            return {
                 "status": observation_status,
                 "status_reason": status_reason,
-                "generation": self._catalog_metadata.get("generation"),
-                "generation_fingerprint": self._catalog_metadata.get("generation_fingerprint"),
+                "generation": catalog_metadata.get("generation"),
+                "generation_fingerprint": catalog_metadata.get("generation_fingerprint"),
                 "pool_limit": self._pool_limit,
                 "token_limit": self._token_limit,
                 "pool_count": len(members),
@@ -1530,8 +1540,8 @@ class PredictionObservationMonitor:
                     "status": observation_status,
                     "status_reason": status_reason,
                     "source_scope": " · ".join(source_scopes) if source_scopes else None,
-                    "generation": self._catalog_metadata.get("generation"),
-                    "updated_at": self._last_refresh_at,
+                    "generation": catalog_metadata.get("generation"),
+                    "updated_at": last_refresh_at,
                     "subscribed_tokens": coverage_projection.get(
                         "subscribed_tokens"
                     ),
@@ -1544,13 +1554,17 @@ class PredictionObservationMonitor:
                     "fresh": coverage_projection.get("fresh_count", 0),
                     "positive": coverage_projection.get("positive_count", 0),
                     "non_positive": coverage_projection.get("non_positive_count", 0),
-                    "catalog_error": self._catalog_error,
-                    "persistence_error": self._persistence_error,
-                    "book_error": self._book_error,
-                    "exclusions": copy.deepcopy(self._exclusions),
+                    "catalog_error": catalog_error,
+                    "persistence_error": persistence_error,
+                    "book_error": book_error,
+                    "exclusions": copy.deepcopy(exclusions_snapshot),
                 },
-                "last_refresh_at": self._last_refresh_at,
+                "last_refresh_at": last_refresh_at,
             }
+
+        next_snapshot = build_snapshot()
+        with self._lock:
+            self._published_snapshot = next_snapshot
 
     def snapshot(self) -> dict[str, object]:
         """Return the last published immutable snapshot without evaluation."""

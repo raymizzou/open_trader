@@ -19,9 +19,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
   while one coalesced background batch refresh runs; snapshot monitoring keeps
   signal metrics cached and the prediction state route refreshes them on
   demand. State reads use the last published observation snapshot while full
-  catalog copies are prepared outside the publication lock. Verified by the
-  approved focused contract and regressions; no live calls, orders or
-  deployment were performed.
+  catalog copies and complete observation response snapshots are prepared
+  outside the publication lock, then published atomically. Verified by the
+  approved focused contracts, concurrency regressions and static checks; no
+  notifications or orders were sent.
 
 - Host Readiness no longer blocks replacement of the old running Prediction
   instance when its business-state status endpoint is slow or unavailable;
