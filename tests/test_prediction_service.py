@@ -837,7 +837,8 @@ def test_lp_dashboard_shows_manual_orders_without_managing_them(
     assert stale["positions"] == first["positions"]
     assert sdk.open_order_reads == 2
     assert sdk.scoring_reads == ["manual-order"]
-    assert len(reward_transport.calls) == 3
+    assert len(reward_transport.calls) == 4
+    assert reward_transport.calls[0][0] == "/rewards/user/percentages"
     assert sdk.order_writes == 0
     assert sdk.cancellations == 0
     assert public_market.closed is True
@@ -2406,6 +2407,760 @@ def test_state_refreshes_signal_metrics_on_demand_but_lp_dashboard_does_not(
         == second_state["relation_discovery"]["annualized_distribution"]
     )
 
+
+def test_lp_dashboard_reward_share_thresholds_are_market_scoped(
+    tmp_path: Path,
+) -> None:
+    sequence = [
+        Decimal("5"),
+        Decimal("7.499"),
+        Decimal("7.5"),
+        Decimal("9.999"),
+        Decimal("10"),
+        Decimal("10"),
+        Decimal("7"),
+        Decimal("7.5"),
+    ]
+
+    class Account:
+        wallet_address = "wallet"
+
+        def __init__(self) -> None:
+            self.share_reads = 0
+            self.order_writes = 0
+            self.cancellations = 0
+            self.percentages = sequence[0]
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "open_orders": (
+                    {
+                        "order_id": "a-1",
+                        "condition_id": "condition-a",
+                        "token_id": "a-yes",
+                        "outcome": "YES",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "price": Decimal("0.50"),
+                        "original_size": Decimal("20"),
+                        "size_matched": Decimal("5"),
+                    },
+                    {
+                        "order_id": "a-2",
+                        "condition_id": "condition-a",
+                        "token_id": "a-no",
+                        "outcome": "NO",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "price": Decimal("0.45"),
+                        "original_size": Decimal("10"),
+                        "size_matched": Decimal("0"),
+                    },
+                    {
+                        "order_id": "b-1",
+                        "condition_id": "condition-b",
+                        "token_id": "b-yes",
+                        "outcome": "YES",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "price": Decimal("0.40"),
+                        "original_size": Decimal("4"),
+                        "size_matched": Decimal("1"),
+                    },
+                    {
+                        "order_id": "managed-1",
+                        "condition_id": "condition-managed",
+                        "token_id": "managed-yes",
+                        "outcome": "YES",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "price": Decimal("0.55"),
+                        "original_size": Decimal("8"),
+                        "size_matched": Decimal("2"),
+                    },
+                ),
+                "positions": (),
+                "checked_at": datetime.now(UTC),
+            }
+
+        def get_order_scoring(self, *, order_id: str) -> bool:
+            return order_id == "a-1"
+
+        def lp_reward_percentages(self) -> dict[str, object]:
+            value = sequence[min(self.share_reads, len(sequence) - 1)]
+            self.share_reads += 1
+            self.percentages = value
+            return {
+                "state": "known",
+                "scope": "account",
+                "maker_address": "wallet",
+                "percentages": {
+                    "condition-a": value,
+                    "condition-b": Decimal("5"),
+                    "condition-managed": Decimal("5"),
+                },
+                "checked_at": datetime.now(UTC) - timedelta(microseconds=self.share_reads),
+            }
+
+        def create_limit_order(self, **_kwargs: object) -> object:
+            self.order_writes += 1
+            return object()
+
+        def post_order(self, _order: object) -> object:
+            self.order_writes += 1
+            return object()
+
+        def cancel_orders(self, **_kwargs: object) -> object:
+            self.cancellations += 1
+            return object()
+
+    service, _trading, store, monitor = execution_fixture(tmp_path)
+    account = Account()
+    service._trading = account
+    checked_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    store.lp_save_screening_snapshot(
+        {
+            "state": "ready",
+            "complete": True,
+            "scanning": False,
+            "candidates": [],
+            "recommendations": [
+                {
+                    "condition_id": "condition-rec",
+                    "market_id": "market-rec",
+                    "market_title": "Reference market",
+                    "daily_pool_usd": Decimal("99"),
+                    "state": "eligible",
+                    "directions": {},
+                },
+                {
+                    "condition_id": "condition-no-pool",
+                    "market_id": "market-no-pool",
+                    "daily_pool_usd": None,
+                    "state": "unknown",
+                    "directions": {},
+                },
+            ],
+            "checked_at": checked_at,
+            "last_success_at": checked_at,
+            "last_attempt_at": checked_at,
+            "candidate_rows_fresh": True,
+            "catalog_complete": True,
+            "missing_metadata_condition_ids": [],
+            "missing_book_token_ids": [],
+        }
+    )
+    store.lp_create_session(
+        "managed-session",
+        "managed-idempotency",
+        state="entry_open",
+        payload={
+            "condition_id": "condition-managed",
+            "token_id": "managed-yes",
+            "entry_order_id": "managed-1",
+            "market_title": "Managed market",
+            "outcome": "YES",
+        },
+    )
+    service._lp = PolymarketLPService(
+        store, object(), clock=lambda: datetime.now(UTC)
+    )
+    clock = [0.0]
+    service._clock = lambda: clock[0]
+    runtime = _Runtime()
+    runtime.store = store  # type: ignore[assignment]
+    runtime.monitor = monitor
+    runtime.execution = service
+
+    expected = [
+        ("5", "normal", None),
+        ("7.499", "normal", "2.499"),
+        ("7.5", "warning", "0.001"),
+        ("9.999", "warning", "2.499"),
+        ("10", "critical", "0.001"),
+        ("10", "critical", "0"),
+        ("10", "critical", "0"),
+        ("7", "normal", "-3"),
+        ("7.5", "warning", "0.5"),
+    ]
+    previous_checked_at: str | None = None
+    previous_delta: str | None = None
+    with _server(runtime) as base:
+        for index, (expected_value, expected_severity, expected_delta) in enumerate(expected):
+            clock[0] += 5 if index in {0, 6} else 61
+            status, payload = _response(base + "/api/prediction-arbitrage/lp/dashboard")
+            assert status == 200
+            share = payload["reward_shares"]["condition-a"]
+            assert share["percentage"] == expected_value
+            assert share["severity"] == expected_severity
+            assert share["state"] == "known"
+            assert share["delta_percentage_points"] == expected_delta
+            if index == 4:
+                previous_checked_at = share["checked_at"]
+                previous_delta = share["delta_percentage_points"]
+            if index == 5:
+                assert share["checked_at"] != previous_checked_at
+                previous_checked_at = share["checked_at"]
+                previous_delta = share["delta_percentage_points"]
+            if index == 6:
+                assert share["checked_at"] == previous_checked_at
+                assert share["delta_percentage_points"] == previous_delta
+                assert account.share_reads == 6
+
+    assert len(payload["reward_shares"]) == 3
+    assert payload["reward_shares"]["condition-managed"]["percentage"] == "5"
+    assert next(
+        row for row in payload["orders"] if row["condition_id"] == "condition-managed"
+    )["management"] == "system_managed"
+    assert payload["orders"][0]["remaining_quantity"] == "15"
+    assert payload["orders"][1]["remaining_quantity"] == "10"
+    assert payload["orders"][2]["remaining_quantity"] == "3"
+    recommendation = next(
+        row for row in payload["recommendations"] if row["condition_id"] == "condition-rec"
+    )
+    assert recommendation["reference_share_percentage"] == "5"
+    assert recommendation["reference_daily_reward_usd"] == "4.95"
+    no_pool = next(
+        row for row in payload["recommendations"] if row["condition_id"] == "condition-no-pool"
+    )
+    assert no_pool["reference_share_percentage"] == "5"
+    assert no_pool["reference_daily_reward_usd"] is None
+    assert account.order_writes == 0
+    assert account.cancellations == 0
+
+
+def test_lp_dashboard_share_failures_preserve_unknown_without_order_writes(
+    tmp_path: Path,
+) -> None:
+    events = (
+        "initial",
+        "repeat",
+        "older_replay",
+        "error",
+        "replay_after_failure",
+        "missing",
+        "wrong_maker",
+        "missing_identity",
+        "old",
+        "future",
+        "fresh_8",
+        "fresh_5",
+    )
+
+    class Account:
+        wallet_address = "wallet"
+
+        def __init__(self) -> None:
+            self.share_reads = 0
+            self.first_checked_at: datetime | None = None
+            self.order_writes = 0
+            self.cancellations = 0
+            self.resizes = 0
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "wallet_address": self.wallet_address,
+                "open_orders": (
+                    {
+                        "order_id": "c-1",
+                        "condition_id": "condition-c",
+                        "token_id": "c-yes",
+                        "outcome": "YES",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "price": Decimal("0.50"),
+                        "original_size": Decimal("12"),
+                        "size_matched": Decimal("7"),
+                    },
+                ),
+                "positions": (),
+                "checked_at": datetime.now(UTC),
+            }
+
+        def get_order_scoring(self, *, order_id: str) -> bool:
+            return order_id == "c-1"
+
+        def lp_reward_percentages(self) -> dict[str, object]:
+            event = events[min(self.share_reads, len(events) - 1)]
+            self.share_reads += 1
+            if event == "error":
+                raise RuntimeError("transport failure")
+            if event == "missing":
+                checked_at = datetime.now(UTC)
+                percentages: Mapping[str, object] = {}
+                maker_address = self.wallet_address
+            elif event == "wrong_maker":
+                checked_at = datetime.now(UTC)
+                percentages = {"condition-c": Decimal("8")}
+                maker_address = "other-wallet"
+            elif event == "old":
+                checked_at = datetime.now(UTC) - timedelta(seconds=181)
+                percentages = {"condition-c": Decimal("8")}
+                maker_address = self.wallet_address
+            elif event == "future":
+                checked_at = datetime.now(UTC) + timedelta(seconds=5)
+                percentages = {"condition-c": Decimal("8")}
+                maker_address = self.wallet_address
+            elif event == "repeat":
+                assert self.first_checked_at is not None
+                checked_at = self.first_checked_at
+                percentages = {"condition-c": Decimal("8")}
+                maker_address = self.wallet_address
+            elif event == "replay_after_failure":
+                assert self.first_checked_at is not None
+                checked_at = self.first_checked_at
+                percentages = {"condition-c": Decimal("8")}
+                maker_address = self.wallet_address
+            elif event == "older_replay":
+                assert self.first_checked_at is not None
+                checked_at = self.first_checked_at - timedelta(seconds=1)
+                percentages = {"condition-c": Decimal("5")}
+                maker_address = self.wallet_address
+            elif event == "missing_identity":
+                checked_at = datetime.now(UTC)
+                percentages = {"condition-c": Decimal("8")}
+                maker_address = "wallet"
+            else:
+                checked_at = datetime.now(UTC)
+                value = Decimal("5") if event == "fresh_5" else Decimal("8")
+                percentages = {"condition-c": value}
+                maker_address = self.wallet_address
+                if event == "initial":
+                    self.first_checked_at = checked_at
+            return {
+                "state": "known",
+                "scope": "account",
+                "maker_address": maker_address,
+                "percentages": percentages,
+                "checked_at": checked_at,
+            }
+
+        def create_limit_order(self, **_kwargs: object) -> object:
+            self.order_writes += 1
+            return object()
+
+        def post_order(self, _order: object) -> object:
+            self.order_writes += 1
+            return object()
+
+        def cancel_orders(self, **_kwargs: object) -> object:
+            self.cancellations += 1
+            return object()
+
+        def resize_order(self, **_kwargs: object) -> object:
+            self.resizes += 1
+            return object()
+
+    class Notifier:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def notify(self, **_kwargs: object) -> None:
+            self.calls += 1
+
+    service, _trading, store, monitor = execution_fixture(tmp_path)
+    account = Account()
+    notifier = Notifier()
+    service._trading = account
+    service._notifier = notifier
+    checked_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    store.lp_save_screening_snapshot(
+        {
+            "state": "ready",
+            "complete": True,
+            "scanning": False,
+            "candidates": [],
+            "recommendations": [],
+            "checked_at": checked_at,
+            "last_success_at": checked_at,
+            "last_attempt_at": checked_at,
+            "candidate_rows_fresh": True,
+            "catalog_complete": True,
+            "missing_metadata_condition_ids": [],
+            "missing_book_token_ids": [],
+        }
+    )
+    store.lp_create_session(
+        "session-c",
+        "idempotency-c",
+        state="entry_open",
+        payload={
+            "condition_id": "condition-c",
+            "token_id": "c-yes",
+            "entry_order_id": "c-1",
+            "market_title": "Protected market",
+            "outcome": "YES",
+        },
+    )
+    service._lp = PolymarketLPService(
+        store, object(), clock=lambda: datetime.now(UTC)
+    )
+    clock = [0.0]
+    service._clock = lambda: clock[0]
+    runtime = _Runtime()
+    runtime.store = store  # type: ignore[assignment]
+    runtime.monitor = monitor
+    runtime.execution = service
+
+    def read_dashboard(base: str) -> dict[str, object]:
+        status, payload = _response(base + "/api/prediction-arbitrage/lp/dashboard")
+        assert status == 200
+        assert payload["stale"] is False
+        order = payload["orders"][0]
+        assert order["remaining_quantity"] == "5"
+        assert order["management"] == "system_managed"
+        assert payload["lp_session"]["state"] == "entry_open"
+        return payload
+
+    with _server(runtime) as base:
+        clock[0] += 61
+        first = read_dashboard(base)
+        first_share = first["reward_shares"]["condition-c"]
+        assert first_share["state"] == "known"
+        assert first_share["percentage"] == "8"
+        assert first_share["severity"] == "warning"
+        assert first_share["historical"] is False
+        assert first_share["delta_percentage_points"] is None
+        first_checked_at = first_share["checked_at"]
+
+        clock[0] += 61
+        repeated = read_dashboard(base)["reward_shares"]["condition-c"]
+        assert repeated["state"] == "known"
+        assert repeated["percentage"] == "8"
+        assert repeated["severity"] == "warning"
+        assert repeated["checked_at"] == first_checked_at
+        assert repeated["delta_percentage_points"] is None
+
+        clock[0] += 61
+        older_replay = read_dashboard(base)["reward_shares"]["condition-c"]
+        assert older_replay["state"] == "unknown"
+        assert older_replay["percentage"] == "8"
+        assert older_replay["historical"] is True
+        assert older_replay["severity"] == "unknown"
+        assert older_replay["checked_at"] == first_checked_at
+        assert older_replay["delta_percentage_points"] is None
+        assert older_replay["reason"] == "reward_share_replay_older"
+
+        clock[0] += 61
+        failed = read_dashboard(base)["reward_shares"]["condition-c"]
+        assert failed["state"] == "unknown"
+        assert failed["percentage"] == "8"
+        assert failed["historical"] is True
+        assert failed["severity"] == "unknown"
+        assert failed["delta_percentage_points"] is None
+        assert failed["checked_at"] == first_checked_at
+        assert failed["reason"] == "reward_share_unknown"
+
+        clock[0] += 61
+        replay_after_failure = read_dashboard(base)["reward_shares"]["condition-c"]
+        assert replay_after_failure["state"] == "unknown"
+        assert replay_after_failure["percentage"] == "8"
+        assert replay_after_failure["historical"] is True
+        assert replay_after_failure["severity"] == "unknown"
+        assert replay_after_failure["delta_percentage_points"] is None
+        assert replay_after_failure["checked_at"] == first_checked_at
+        assert replay_after_failure["reason"] == "reward_share_replay_same"
+
+        clock[0] += 61
+        missing = read_dashboard(base)["reward_shares"]["condition-c"]
+        assert missing["state"] == "unknown"
+        assert missing["percentage"] == "8"
+        assert missing["historical"] is True
+        assert missing["reason"] == "reward_share_unknown"
+
+        clock[0] += 61
+        wrong_maker = read_dashboard(base)["reward_shares"]["condition-c"]
+        assert wrong_maker["state"] == "unknown"
+        assert wrong_maker["percentage"] == "8"
+        assert wrong_maker["historical"] is True
+        assert wrong_maker["reason"] == "reward_share_unknown"
+
+        account.wallet_address = None  # type: ignore[assignment]
+        clock[0] += 61
+        missing_identity = read_dashboard(base)["reward_shares"]["condition-c"]
+        assert missing_identity["state"] == "unknown"
+        assert missing_identity["percentage"] == "8"
+        assert missing_identity["historical"] is True
+        assert missing_identity["reason"] == "reward_share_unknown"
+        account.wallet_address = "wallet"
+
+        clock[0] += 61
+        stale = read_dashboard(base)["reward_shares"]["condition-c"]
+        assert stale["state"] == "unknown"
+        assert stale["percentage"] == "8"
+        assert stale["historical"] is True
+        assert stale["reason"] == "reward_share_stale"
+        assert stale["checked_at"] == first_checked_at
+
+        clock[0] += 61
+        future = read_dashboard(base)["reward_shares"]["condition-c"]
+        assert future["state"] == "unknown"
+        assert future["percentage"] == "8"
+        assert future["historical"] is True
+        assert future["reason"] == "reward_share_stale"
+        assert future["checked_at"] == first_checked_at
+
+        clock[0] += 61
+        recovered_warning = read_dashboard(base)["reward_shares"]["condition-c"]
+        assert recovered_warning["state"] == "known"
+        assert recovered_warning["percentage"] == "8"
+        assert recovered_warning["severity"] == "warning"
+        assert recovered_warning["historical"] is False
+        assert recovered_warning["delta_percentage_points"] == "0"
+        assert recovered_warning["checked_at"] != first_checked_at
+
+        clock[0] += 61
+        recovered_normal = read_dashboard(base)["reward_shares"]["condition-c"]
+        assert recovered_normal["state"] == "known"
+        assert recovered_normal["percentage"] == "5"
+        assert recovered_normal["severity"] == "normal"
+        assert recovered_normal["delta_percentage_points"] == "-3"
+
+    assert account.share_reads == len(events)
+    assert account.order_writes == 0
+    assert account.cancellations == 0
+    assert account.resizes == 0
+    assert notifier.calls == 0
+
+
+def test_lp_reward_share_survives_background_reward_refresh(tmp_path: Path) -> None:
+    condition_id = "condition-background"
+    token_id = "background-yes"
+    source_checked_at = datetime.now(UTC).replace(microsecond=0)
+    source_checked_text = source_checked_at.isoformat().replace("+00:00", "Z")
+    reward_started = threading.Event()
+    reward_release = threading.Event()
+    counts = {"percentage": 0, "market": 0}
+    counts_lock = threading.Lock()
+
+    class Account:
+        wallet_address = "wallet"
+        config = SimpleNamespace(wallet_address="wallet")
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "wallet_address": self.wallet_address,
+                "checked_at": datetime.now(UTC),
+                "open_orders": (
+                    {
+                        "order_id": "background-order",
+                        "condition_id": condition_id,
+                        "token_id": token_id,
+                        "outcome": "YES",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "price": Decimal("0.40"),
+                        "original_size": Decimal("20"),
+                        "size_matched": Decimal("5"),
+                    },
+                ),
+                "positions": (
+                    {
+                        "condition_id": condition_id,
+                        "token_id": token_id,
+                        "outcome": "YES",
+                        "size": Decimal("5"),
+                    },
+                ),
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def get_order_scoring(self, *, order_id: str) -> bool:
+            return order_id == "background-order"
+
+        def lp_reward_percentages(self) -> dict[str, object]:
+            with counts_lock:
+                counts["percentage"] += 1
+            return {
+                "state": "known",
+                "scope": "account",
+                "maker_address": self.wallet_address,
+                "percentages": {condition_id: Decimal("7.5")},
+                "checked_at": source_checked_at,
+            }
+
+        def lp_reward_snapshot(
+            self,
+            reward_date: str,
+            market: str,
+            *,
+            stop_event: threading.Event | None = None,
+        ) -> dict[str, object]:
+            assert market == condition_id
+            with counts_lock:
+                counts["market"] += 1
+            reward_started.set()
+            if stop_event is not None and stop_event.is_set():
+                return {
+                    "state": "unknown",
+                    "reward_date": reward_date,
+                    "condition_id": market,
+                }
+            if not reward_release.wait(timeout=30):
+                raise AssertionError("held reward read was not released")
+            return {
+                "state": "known",
+                "reward_date": reward_date,
+                "condition_id": market,
+                "market_amount": Decimal("0.80"),
+                "market_amount_raw": Decimal("0.80"),
+                "market_asset": "USDC.e",
+            }
+
+        def lp_reward_snapshots(
+            self,
+            reward_date: str,
+            condition_ids: object,
+            *,
+            stop_event: threading.Event | None = None,
+        ) -> dict[str, object]:
+            return {
+                str(market): self.lp_reward_snapshot(
+                    reward_date, str(market), stop_event=stop_event
+                )
+                for market in condition_ids  # type: ignore[union-attr]
+            }
+
+        def create_limit_order(self, **_kwargs: object) -> object:
+            self.order_writes += 1
+            return object()
+
+        def post_order(self, _order: object) -> object:
+            self.order_writes += 1
+            return object()
+
+        def cancel_orders(self, **_kwargs: object) -> object:
+            self.cancellations += 1
+            return object()
+
+        def resize_order(self, **_kwargs: object) -> object:
+            self.resizes += 1
+            return object()
+
+        order_writes = 0
+        cancellations = 0
+        resizes = 0
+
+    class CounterNotifier(NullNotifier):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def notify(self, _title: str, _message: str) -> None:
+            self.calls += 1
+
+    service, _trading, store, monitor = execution_fixture(tmp_path)
+    account = Account()
+    notifier = CounterNotifier()
+    service._trading = account
+    service._notifier = notifier
+    store.lp_save_screening_snapshot(
+        {
+            "state": "ready",
+            "complete": True,
+            "scanning": False,
+            "candidates": [],
+            "recommendations": [],
+            "market_rewards": {},
+            "checked_at": source_checked_text,
+            "last_success_at": source_checked_text,
+            "last_attempt_at": source_checked_text,
+            "candidate_rows_fresh": True,
+            "catalog_complete": True,
+            "missing_metadata_condition_ids": [],
+            "missing_book_token_ids": [],
+        }
+    )
+    service._lp = PolymarketLPService(store, account)
+    service._clock = lambda: 0.0
+    runtime = _Runtime()
+    runtime.store = store  # type: ignore[assignment]
+    runtime.monitor = monitor
+    runtime.execution = service
+
+    def read_dashboard(base: str) -> dict[str, object]:
+        status, payload = _response(base + "/api/prediction-arbitrage/lp/dashboard", timeout=5)
+        assert status == 200
+        return payload
+
+    def assert_projection(payload: dict[str, object]) -> tuple[dict[str, object], dict[str, object]]:
+        assert set(payload["reward_shares"]) == {condition_id}
+        share = payload["reward_shares"][condition_id]
+        assert share["state"] == "known"
+        assert share["percentage"] == "7.5"
+        assert share["reference_share_percentage"] == "5"
+        assert share["severity"] == "warning"
+        assert share["delta_percentage_points"] is None
+        assert share["stale"] is False
+        assert share["historical"] is False
+        order = payload["orders"][0]
+        assert order["condition_id"] == condition_id
+        assert order["remaining_quantity"] == "15"
+        position = payload["positions"][0]
+        assert position["condition_id"] == condition_id
+        return share, order
+
+    with _server(runtime) as base:
+        with ThreadPoolExecutor(max_workers=4) as clients:
+            first_future = clients.submit(read_dashboard, base)
+            try:
+                assert reward_started.wait(timeout=5), "market reward refresh did not start"
+                try:
+                    first = first_future.result(timeout=2)
+                except TimeoutError as exc:
+                    raise AssertionError(
+                        "LP dashboard HTTP read blocked on market reward refresh"
+                    ) from exc
+                first_share, _first_order = assert_projection(first)
+                first_reward = first["market_rewards"][condition_id]
+                assert first_reward["state"] == "unknown"
+                assert first_reward["stale"] is True
+
+                repeated_future = clients.submit(read_dashboard, base)
+                try:
+                    repeated = repeated_future.result(timeout=2)
+                except TimeoutError as exc:
+                    raise AssertionError(
+                        "repeated LP dashboard HTTP read blocked on market reward refresh"
+                    ) from exc
+                repeated_share, _repeated_order = assert_projection(repeated)
+                assert repeated_share["checked_at"] == first_share["checked_at"]
+                assert repeated_share["percentage"] == first_share["percentage"]
+                assert repeated_share["delta_percentage_points"] == first_share["delta_percentage_points"]
+                with counts_lock:
+                    assert counts["percentage"] == 1
+                    assert counts["market"] == 1
+            finally:
+                reward_release.set()
+
+            deadline = time.monotonic() + 5
+            while True:
+                final = read_dashboard(base)
+                final_reward = final["market_rewards"].get(condition_id)
+                if (
+                    isinstance(final_reward, Mapping)
+                    and final_reward.get("state") == "known"
+                    and final_reward.get("market_amount") == "0.80"
+                ):
+                    break
+                if time.monotonic() >= deadline:
+                    raise AssertionError("background market reward refresh did not publish 0.80")
+                time.sleep(0.05)
+            final_share, final_order = assert_projection(final)
+            assert final_share["checked_at"] == first_share["checked_at"]
+            assert final_share["delta_percentage_points"] == first_share["delta_percentage_points"]
+            assert final_order["remaining_quantity"] == "15"
+
+    with counts_lock:
+        assert counts["percentage"] == 1
+        assert counts["market"] == 1
+    assert account.order_writes == 0
+    assert account.cancellations == 0
+    assert account.resizes == 0
+    assert notifier.calls == 0
 
 def test_lp_candidate_preview_rechecks_best_bid_before_confirmation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

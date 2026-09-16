@@ -18729,3 +18729,221 @@ console.log(JSON.stringify({drawer: nlegReportDrawer()}));
     assert "已离队 · UNSETTLED_CAP · 仅监控" in drawer
     # Footer generation time (second-precision, T collapsed).
     assert "生成时间 2026-09-04 08:30:00" in drawer
+
+
+def test_lp_reward_share_warnings_render_in_existing_table() -> None:
+    output = run_dashboard_js(r'''
+const checkedAt = "2026-09-16T00:00:00Z";
+const baseDashboard = {
+  state: "ready", stale: false, complete: true, checked_at: checkedAt,
+  orders: [
+    {order_id:"lp-a-yes",condition_id:"condition-a",token_id:"token-yes",market_url:"https://polymarket.com/event/a",
+      market_title:"LP duplicate market",outcome:"YES",side:"BUY",price:"0.40",quantity:"20",filled_quantity:"5",remaining_quantity:"15",
+      management:"manual_read_only",read_only:true,scoring_status:true,scoring_checked_at:checkedAt},
+    {order_id:"lp-a-no",condition_id:"condition-a",token_id:"token-no",market_url:"https://polymarket.com/event/a",
+      market_title:"LP duplicate market",outcome:"NO",side:"BUY",price:"0.45",quantity:"10",filled_quantity:"0",remaining_quantity:"10",
+      management:"manual_read_only",read_only:true,scoring_status:false,scoring_checked_at:checkedAt},
+  ],
+  positions: [], market_rewards: [],
+  lp_observations: {"condition-a": {
+    state:"known", stage:"added", stale:false,
+    current_hourly_reward_usd:"0.108", occupied_capital_usd:"60",
+    current_yield_pct_per_hour:"0.18",
+    trial_baseline:{yield_pct_per_hour:"0.25", checked_at:checkedAt, quantity:"20", price:"0.40", occupied_capital_usd:"20"},
+    qualified:true, risk_state:"warning", risk_warning:true,
+    risk_directions:[
+      {outcome:"YES", state:"known", warning:true, risk_principal:"60", stress_loss:"6", loss_ratio:"0.1", threshold:"0.1", unfilled_buy_orders:true, checked_at:checkedAt},
+      {outcome:"NO", state:"known", warning:true, risk_principal:"60", stress_loss:"7.2", loss_ratio:"0.12", threshold:"0.1", unfilled_buy_orders:true, checked_at:checkedAt},
+    ],
+    risk_alerts:{YES:{active:true, title:"LP 风险警告 <stored>", message:"当前风险 <10% & 未成交买单", channels:{feishu:{success:true}, xiaoai:{success:true}}}},
+    add_room:{available:false, reason:"risk_warning"}, checked_at:checkedAt,
+  }},
+  recommendations: [{condition_id:"condition-rec",market_id:"market-rec",market_title:"Reference market",daily_pool_usd:"99",
+    reference_share_percentage:"5",reference_daily_reward_usd:"4.95",state:"unknown",directions:{}}],
+  lp_session:{state:"none"},
+};
+const share = (value, severity, historical=false) => ({
+  condition_id:"condition-a",state:historical ? "unknown" : "known",percentage:String(value),
+  reference_share_percentage:"5",delta_percentage_points:value === 7.5 ? "2.5" : "0",
+  checked_at:checkedAt,last_success_at:checkedAt,severity,historical,stale:historical,
+});
+const render = (rewardShare) => predictionLpCard({lp_dashboard:{...baseDashboard,reward_shares:{"condition-a":rewardShare}}});
+Date.now = () => Date.parse(checkedAt) + 30 * 1000;
+const warning = render(share(7.5,"warning"));
+const critical = render(share(10,"critical"));
+const recovery = render(share(5,"normal"));
+const historical = render(share(7.5,"unknown",true));
+Date.now = () => Date.parse(checkedAt) + 181 * 1000;
+const expired = render(share(7.5,"warning"));
+console.log(JSON.stringify({warning,critical,recovery,historical,expired}));
+''')
+    rendered = json.loads(output)
+    warning = rendered["warning"]
+    assert warning.count("奖励份额警告") == 1
+    assert '<span class="pm-pill watch">奖励份额警告</span><span class="sub">实际 7.5%' in warning
+    assert "参考 5%" in warning
+    assert "实际 7.5%" in warning
+    assert "+2.5" in warning
+    assert "2026-09-16 08:00:00" in warning
+    assert "$4.95" in warning
+    assert "剩余 15" in warning and "剩余 10" in warning
+    assert warning.count("手工单 · 只读") == 2
+    assert warning.count("LP duplicate market") >= 2
+    assert warning.count("奖励份额警告") == 1
+
+    critical = rendered["critical"]
+    assert critical.count("奖励份额严重") == 1
+    assert '<span class="pm-pill pm-clock-danger">奖励份额严重</span><span class="sub">实际 10%' in critical
+    assert 'pm-pill watch pm-clock-danger' not in critical
+    assert "实际 10%" in critical
+
+    recovery = rendered["recovery"]
+    assert "实际 5%" in recovery
+    assert "奖励份额警告" not in recovery
+    assert "奖励份额严重" not in recovery
+
+    historical = rendered["historical"]
+    assert "历史" in historical
+    assert "UNKNOWN" in historical
+    assert "奖励份额警告" not in historical
+    assert "奖励份额严重" not in historical
+
+    expired = rendered["expired"]
+    assert "历史" in expired or "UNKNOWN" in expired
+    assert "奖励份额警告" not in expired
+    assert "奖励份额严重" not in expired
+    action_markup = " ".join(re.findall(r"<(?:button|a)\b[^>]*>.*?</(?:button|a)>", warning, flags=re.S))
+    assert all(action not in action_markup for action in ("创建订单", "取消订单", "调整数量", "通知"))
+    warning_visible = re.sub(r"<details[\s\S]*?</details>", "", warning)
+    assert "当前 0.18%／小时" in warning_visible
+    assert "试挂基准 0.25%／小时" in warning_visible
+    assert "YES 10% · $6.00" in warning_visible
+    assert "NO 12% · $7.20" in warning_visible
+    assert warning_visible.count("奖励份额警告") == 1
+    assert "实际 7.5%" in warning_visible
+
+    polling_output = run_dashboard_js(r'''
+const checkedAt = "2026-09-16T00:00:00Z";
+const lpDashboard = {
+  state:"ready", stale:false, complete:true, checked_at:checkedAt,
+  orders: [
+    {order_id:"lp-a-yes",condition_id:"condition-a",token_id:"token-yes",market_url:"https://polymarket.com/event/a",
+      market_title:"LP duplicate market",outcome:"YES",side:"BUY",price:"0.40",quantity:"20",filled_quantity:"5",remaining_quantity:"15",
+      management:"manual_read_only",read_only:true,scoring_status:true,scoring_checked_at:checkedAt},
+    {order_id:"lp-a-no",condition_id:"condition-a",token_id:"token-no",market_url:"https://polymarket.com/event/a",
+      market_title:"LP duplicate market",outcome:"NO",side:"BUY",price:"0.45",quantity:"10",filled_quantity:"0",remaining_quantity:"10",
+      management:"manual_read_only",read_only:true,scoring_status:false,scoring_checked_at:checkedAt},
+  ],
+  positions: [], market_rewards: [], recommendations: [], lp_session:{state:"none"},
+  reward_shares: {"condition-a": {
+    condition_id:"condition-a", state:"known", percentage:"7.5", reference_share_percentage:"5",
+    delta_percentage_points:"2.5", checked_at:checkedAt, last_success_at:checkedAt,
+    severity:"warning", historical:false, stale:false,
+  }},
+};
+class Element {
+  constructor(){this.dataset={};this.hidden=false;this.innerHTML="";this.textContent="";this.style={};this.attributes={};this.listeners={};
+    this.classList={toggle(){},add(){},remove(){}};}
+  addEventListener(name, callback){(this.listeners[name] ||= []).push(callback);}
+  setAttribute(name,value){this.attributes[name]=value;}
+  removeAttribute(name){delete this.attributes[name];}
+  querySelector(){return null;}
+  querySelectorAll(){return [];}
+}
+const nodes = {};
+document.getElementById = (id) => nodes[id] || (nodes[id] = new Element());
+document.querySelector = () => nodes["workspace-grid"] || (nodes["workspace-grid"] = new Element());
+document.body = new Element();
+bindElements();
+bindEvents();
+const intervals = new Map();
+let nextIntervalId = 0;
+globalThis.window = {
+  location: {search:"", pathname:"/", hash:""},
+  setInterval(callback, delay) { const id = ++nextIntervalId; intervals.set(id, {callback, delay}); return id; },
+  clearInterval(id) { intervals.delete(id); },
+  setTimeout(callback, delay) { return {callback, delay}; },
+  clearTimeout() {},
+};
+const sourceMillis = Date.parse(checkedAt);
+let nowMillis = sourceMillis;
+Date.now = () => nowMillis;
+const venues = {csrf_token:"csrf", venues:[]};
+const requests = [];
+let venueReads = 0;
+let lpReads = 0;
+let resolveHeldVenues;
+let resolveHeldLp;
+const response = (data) => ({ok:true,status:200,json:async()=>data});
+globalThis.fetch = async (url, init={}) => {
+  const request = {url:String(url), method:String(init.method || "GET")};
+  requests.push(request);
+  if (request.url === "/api/prediction-arbitrage/venues") {
+    venueReads += 1;
+    if (venueReads === 1) return response(venues);
+    return new Promise((resolve) => { resolveHeldVenues = () => resolve(response(venues)); });
+  }
+  if (request.url === "/api/prediction-arbitrage/lp/dashboard") {
+    lpReads += 1;
+    if (lpReads === 1) return response(lpDashboard);
+    return new Promise((resolve) => { resolveHeldLp = () => resolve(response(lpDashboard)); });
+  }
+  throw new Error("Unexpected request: " + request.method + " " + request.url);
+};
+const drainRequests = async () => { for (let turn=0; turn<20; turn+=1) await Promise.resolve(); };
+setWorkspaceView("prediction_market");
+await drainRequests();
+const timer = [...intervals.values()].find(({delay})=>delay===5000);
+if (!timer || intervals.size !== 1) throw new Error("expected one 5000ms prediction timer");
+
+nowMillis = sourceMillis + 30 * 1000;
+const firstPoll = timer.callback();
+await drainRequests();
+const atThirtyHtml = nodes["prediction-market-root"].innerHTML;
+const lpInFlightAtThirty = state.predictionMarket.lpDashboardRequestInFlight;
+
+nowMillis = sourceMillis + 181 * 1000;
+const expiryPoll = timer.callback();
+await drainRequests();
+const atExpiryHtml = nodes["prediction-market-root"].innerHTML;
+const lpInFlightAtExpiry = state.predictionMarket.lpDashboardRequestInFlight;
+const venuesInFlightAtExpiry = state.predictionMarket.venuesRequestInFlight;
+const requestCountAtExpiry = requests.length;
+if (typeof resolveHeldVenues !== "function" || typeof resolveHeldLp !== "function") throw new Error("held responses were not installed");
+resolveHeldVenues();
+resolveHeldLp();
+await firstPoll;
+await expiryPoll;
+await drainRequests();
+console.log(JSON.stringify({
+  timerCount:intervals.size,
+  timerDelay:timer.delay,
+  venueReads,
+  lpReads,
+  requestCountAtExpiry,
+  lpInFlightAtThirty,
+  lpInFlightAtExpiry,
+  venuesInFlightAtExpiry,
+  readOnly:requests.every(({method})=>method === "GET"),
+  atThirtyHtml,
+  atExpiryHtml,
+}));
+''');
+    polling = json.loads(polling_output)
+    assert polling["timerCount"] == 1
+    assert polling["timerDelay"] == 5000
+    assert polling["venueReads"] == 2
+    assert polling["lpReads"] == 2
+    assert polling["requestCountAtExpiry"] == 4
+    assert polling["lpInFlightAtThirty"] is True
+    assert polling["lpInFlightAtExpiry"] is True
+    assert polling["venuesInFlightAtExpiry"] is True
+    assert polling["readOnly"] is True
+    assert polling["atThirtyHtml"].count("奖励份额警告") == 1
+    assert "剩余 15" in polling["atThirtyHtml"]
+    assert "手工单 · 只读" in polling["atThirtyHtml"]
+    assert "UNKNOWN" in polling["atExpiryHtml"] or "历史" in polling["atExpiryHtml"]
+    assert "奖励份额警告" not in polling["atExpiryHtml"]
+    assert "奖励份额严重" not in polling["atExpiryHtml"]
+    assert "剩余 15" in polling["atExpiryHtml"]
+    assert "手工单 · 只读" in polling["atExpiryHtml"]

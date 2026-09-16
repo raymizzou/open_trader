@@ -1242,6 +1242,77 @@ def test_lp_rewards_preserve_raw_accrual_when_usd_value_is_unknown() -> None:
     assert snapshot.get("paid_rewards") is None
 
 
+def test_lp_reward_percentages_reads_official_market_shares(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RewardTransport:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, object]]] = []
+            self.payload: object = {
+                "condition-1": "5",
+                "condition-2": Decimal("7.5"),
+            }
+
+        def get_json(self, path: str, *, params: dict[str, object]) -> object:
+            self.calls.append((path, dict(params)))
+            if isinstance(self.payload, BaseException):
+                raise self.payload
+            return self.payload
+
+    transport = RewardTransport()
+    monkeypatch.setattr(polymarket_trading, "signature_type_for", lambda _: 2)
+
+    class SDK:
+        _ctx = SimpleNamespace(secure_clob=transport, wallet_type="proxy")
+
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET), client=SDK()
+    )
+
+    known = adapter.lp_reward_percentages()
+    assert known["state"] == "known"
+    assert known["percentages"] == {
+        "condition-1": Decimal("5"),
+        "condition-2": Decimal("7.5"),
+    }
+    assert isinstance(known["checked_at"], datetime)
+    assert known["maker_address"] == WALLET
+    assert known["scope"] == "account"
+    assert transport.calls == [
+        (
+            "/rewards/user/percentages",
+            {"signature_type": 2, "maker_address": WALLET},
+        )
+    ]
+
+    for payload in (
+        RuntimeError("transport secret should stay redacted"),
+        [],
+        {"condition-1": True},
+        {"condition-1": "NaN"},
+        {"condition-1": "Infinity"},
+        {"condition-1": "-0.01"},
+        {"condition-1": "100.01"},
+    ):
+        transport.payload = payload
+        unknown = adapter.lp_reward_percentages()
+        assert unknown["state"] == "unknown"
+        assert unknown["percentages"] == {}
+        assert unknown["scope"] == "account"
+        assert "transport secret" not in repr(unknown)
+
+    for value in ("0", "100"):
+        transport.payload = {"condition-1": value}
+        boundary = adapter.lp_reward_percentages()
+        assert boundary["state"] == "known"
+        assert boundary["percentages"] == {"condition-1": Decimal(value)}
+
+    transport.payload = {}
+    empty = adapter.lp_reward_percentages()
+    assert empty["state"] == "known"
+    assert empty["percentages"] == {}
+
+
 def make_probe_intent(
     *, quantity: Decimal, yes_price: Decimal = Decimal("0.45"), no_price: Decimal = Decimal("0.48")
 ) -> PairIntent:

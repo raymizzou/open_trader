@@ -1907,6 +1907,59 @@ class PolymarketTradingClient:
             },
         )
 
+    def lp_reward_percentages(self) -> dict[str, object]:
+        """Read the account's official per-market reward percentages."""
+
+        checked_at = datetime.now(UTC)
+        unknown = {
+            "state": "unknown",
+            "scope": "account",
+            "maker_address": self.config.wallet_address,
+            "percentages": {},
+            "checked_at": checked_at,
+        }
+        try:
+            context = getattr(self._client, "_ctx", None)
+            transport = getattr(context, "secure_clob", None)
+            get_json = getattr(transport, "get_json", None)
+            if not callable(get_json):
+                raise ValueError("reward_percentage_transport_unknown")
+            signature_type = signature_type_for(getattr(context, "wallet_type", None))
+            payload = get_json(
+                "/rewards/user/percentages",
+                params={
+                    "signature_type": signature_type,
+                    "maker_address": self.config.wallet_address,
+                },
+            )
+            if not isinstance(payload, Mapping):
+                raise ValueError("reward_percentage_shape_unknown")
+            percentages: dict[str, Decimal] = {}
+            for raw_condition_id, raw_percentage in payload.items():
+                if (
+                    not isinstance(raw_condition_id, str)
+                    or not raw_condition_id.strip()
+                ):
+                    raise ValueError("reward_percentage_identity_unknown")
+                percentage = _lp_decimal(raw_percentage)
+                if (
+                    percentage is None
+                    or percentage < Decimal("0")
+                    or percentage > Decimal("100")
+                ):
+                    raise ValueError("reward_percentage_value_unknown")
+                percentages[raw_condition_id] = percentage
+            return {
+                "state": "known",
+                "scope": "account",
+                "maker_address": self.config.wallet_address,
+                "percentages": percentages,
+                "checked_at": checked_at,
+            }
+        except Exception as exc:
+            del exc
+            return unknown
+
     @staticmethod
     def _lp_reward_market_rows(
         *,

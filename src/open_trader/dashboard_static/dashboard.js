@@ -3105,6 +3105,48 @@ function lpDashboardRewards(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
 
+function lpDashboardShareIsCurrent(share, dashboardStale) {
+  if (!share || typeof share !== "object" || dashboardStale
+      || share.state !== "known" || share.historical === true || share.stale === true) return false;
+  const checkedAt = Date.parse(String(share.last_success_at || share.checked_at || ""));
+  const age = Date.now() - checkedAt;
+  return Number.isFinite(checkedAt) && age >= 0 && age <= 180 * 1000;
+}
+
+function lpDashboardShareSignedDelta(value) {
+  if (!predictionHasValue(value) || !Number.isFinite(Number(value))) return "UNKNOWN";
+  const number = Number(value);
+  return (number > 0 ? "+" : "") + String(value) + " 个百分点";
+}
+
+function lpDashboardShareMarkup(share, dashboardStale) {
+  if (!share || typeof share !== "object") return "<span class=\"sub\">奖励份额 UNKNOWN</span>";
+  const reference = predictionValue(share.reference_share_percentage, "UNKNOWN");
+  const actual = predictionHasValue(share.percentage) ? String(share.percentage) + "%" : "UNKNOWN";
+  const delta = lpDashboardShareSignedDelta(share.delta_percentage_points);
+  const checkedAt = predictionHasValue(share.last_success_at || share.checked_at)
+    ? predictionHktTimestamp(share.last_success_at || share.checked_at)
+    : "UNKNOWN";
+  const current = lpDashboardShareIsCurrent(share, dashboardStale);
+  const details = "<span class=\"sub\">实际 " + escapeHtml(actual)
+    + " · 参考 " + escapeHtml(reference) + "% · 变化 " + escapeHtml(delta)
+    + " · 检查 " + escapeHtml(checkedAt) + "</span>";
+  if (current && share.severity === "critical") {
+    return "<span class=\"pm-pill pm-clock-danger\">奖励份额严重</span>" + details;
+  }
+  if (current && share.severity === "warning") {
+    return "<span class=\"pm-pill watch\">奖励份额警告</span>" + details;
+  }
+  if (current) {
+    return "<span class=\"sub\">奖励份额：</span>" + details;
+  }
+  if (share.historical === true && predictionHasValue(share.percentage)) {
+    return "<span class=\"sub\">奖励份额历史：" + escapeHtml(actual)
+      + " · 当前 UNKNOWN · 上次成功 " + escapeHtml(checkedAt) + "</span>";
+  }
+  return "<span class=\"sub\">奖励份额 UNKNOWN · 检查 " + escapeHtml(checkedAt) + "</span>";
+}
+
 function lpDashboardObservations(value) {
   if (Array.isArray(value)) {
     return Object.fromEntries(value
@@ -3372,7 +3414,7 @@ function lpDashboardExposureRiskCell(item, session, observation, shownObservatio
 }
 
 function lpDashboardOrderRow(
-  order, position, positionAlreadyShown, positionsComplete, rewards, shownRewards, observations, shownObservations, session,
+  order, position, positionAlreadyShown, positionsComplete, rewards, rewardShares, shownRewards, observations, shownObservations, session, dashboardStale,
 ) {
   const manual = order.read_only === true || order.management === "manual_read_only";
   const identity = String(order.condition_id || "");
@@ -3381,7 +3423,14 @@ function lpDashboardOrderRow(
     : null;
   const detailsShown = Boolean(identity && shownObservations.details.has(identity));
   if (identity) shownObservations.details.add(identity);
+  const shareRepeated = Boolean(identity && shownRewards.has(identity));
   const rewardMarkup = lpDashboardRewardCell(order, rewards, shownRewards, observations, shownObservations.reward);
+  const share = identity && rewardShares && typeof rewardShares === "object" ? rewardShares[identity] : null;
+  const shareMarkup = identity
+    ? shareRepeated
+      ? "<span class=\"sub\">奖励份额见同市场上一行</span>"
+      : lpDashboardShareMarkup(share || {}, dashboardStale)
+    : "";
   const riskMarkup = lpDashboardExposureRiskCell(order, session, observation, shownObservations.risk);
   const detailsMarkup = observation && !detailsShown
     ? lpDashboardObservationDetail(
@@ -3398,18 +3447,25 @@ function lpDashboardOrderRow(
   return "<tr data-lp-order-id=\"" + escapeHtml(predictionValue(order.order_id, "")) + "\">"
     + "<td>" + lpMarketTitleLink(order) + "<span class=\"sub\">" + escapeHtml(subtitle) + "</span>" + detailsMarkup + "</td>"
     + "<td data-label=\"挂单与持仓\">" + lpOrderPositionMarkup(order, position, positionsComplete, positionAlreadyShown, observation, shownObservations.capital) + "</td>"
-    + "<td data-label=\"LP 收益率（预计）\">" + rewardMarkup + "</td>"
+    + "<td data-label=\"LP 收益率（预计）\">" + rewardMarkup + shareMarkup + "</td>"
     + "<td data-label=\"压力损失（警戒线 10%）\">" + riskMarkup + "</td></tr>";
 }
 
-function lpDashboardPositionRow(position, rewards, shownRewards, observations, shownObservations, session) {
+function lpDashboardPositionRow(position, rewards, rewardShares, shownRewards, observations, shownObservations, session, dashboardStale) {
   const identity = String(position.condition_id || "");
   const observation = identity && observations[identity] && typeof observations[identity] === "object"
     ? observations[identity]
     : null;
   const detailsShown = Boolean(identity && shownObservations.details.has(identity));
   if (identity) shownObservations.details.add(identity);
+  const shareRepeated = Boolean(identity && shownRewards.has(identity));
   const rewardMarkup = lpDashboardRewardCell(position, rewards, shownRewards, observations, shownObservations.reward);
+  const share = identity && rewardShares && typeof rewardShares === "object" ? rewardShares[identity] : null;
+  const shareMarkup = identity
+    ? shareRepeated
+      ? "<span class=\"sub\">奖励份额见同市场上一行</span>"
+      : lpDashboardShareMarkup(share || {}, dashboardStale)
+    : "";
   const riskMarkup = lpDashboardExposureRiskCell(position, session, observation, shownObservations.risk);
   const accountFactsStale = lpDashboardAccountFactsStale(observation);
   const hasObservation = observation && typeof observation === "object";
@@ -3436,7 +3492,7 @@ function lpDashboardPositionRow(position, rewards, shownRewards, observations, s
     + "<td data-label=\"挂单与持仓\"><div>无未成交委托<span class=\"sub\">持仓 "
     + escapeHtml(predictionValue(position.size, "UNKNOWN")) + " 份</span>"
     + (capitalText ? `<span class="sub">${escapeHtml(capitalText)}</span>` : "") + "</div></td>"
-    + "<td data-label=\"LP 收益率（预计）\">" + rewardMarkup + "</td>"
+    + "<td data-label=\"LP 收益率（预计）\">" + rewardMarkup + shareMarkup + "</td>"
     + "<td data-label=\"压力损失（警戒线 10%）\">" + riskMarkup + "</td></tr>";
 }
 
@@ -3484,6 +3540,8 @@ function lpDashboardRecommendationRow(recommendation, stale) {
     : "UNKNOWN";
   const sampleCount = predictionNumber(screening.stability_sample_count, "UNKNOWN");
   const pool = lpDashboardMoney(recommendation.daily_pool_usd);
+  const referenceShare = predictionValue(recommendation.reference_share_percentage, "UNKNOWN");
+  const referenceDailyReward = lpDashboardMoney(recommendation.reference_daily_reward_usd);
   const competition = recommendation.competition_state === "known"
     ? predictionNumber(recommendation.competition_quantity, "UNKNOWN")
     : "UNKNOWN";
@@ -3516,7 +3574,7 @@ function lpDashboardRecommendationRow(recommendation, stale) {
   const detailRows = [
     `平稳性：一小时中间价极差 ${range} · 样本 ${sampleCount} · 采样窗口要求 ≤ 1¢。`,
     `24 小时价格参考 ${change} · 来源 ${source}；仅作参考。`,
-    `日奖池 ${pool} · 奖励价带公开挂单 ${competition} 份（竞争代理，不代表个人奖励份额）。`,
+    `日奖池 ${pool} · 参考 ${referenceShare}% 日奖励估算 ${referenceDailyReward} · 奖励价带公开挂单 ${competition} 份（竞争代理，不代表个人奖励份额）。`,
     `买入 ${outcome || "UNKNOWN"}：${lpDashboardPrice(guidance.price)} × ${predictionValue(guidance.quantity, "UNKNOWN")} 份 · 占资 ${lpDashboardMoney(guidance.required_capital)} · 含费压力估损 ${lpDashboardMoney(guidance.estimated_exit_loss)}（${lossPercent}，估损不超过该市场投入的 10%）。`,
     `检查时间 ${predictionHasValue(guidance.checked_at) ? predictionHktTimestamp(guidance.checked_at) : "UNKNOWN"} · 有效至 ${predictionHasValue(guidance.expires_at) ? predictionHktTimestamp(guidance.expires_at) : "UNKNOWN"}.`,
     ...reasons,
@@ -3530,7 +3588,7 @@ function lpDashboardRecommendationRow(recommendation, stale) {
     : "UNKNOWN";
   const title = lpMarketTitleLink(recommendation);
   const directionText = directionsControl + `<span class="sub">${escapeHtml(status)}</span>`;
-  const rowMarkup = `<tr data-lp-recommendation="${escapeHtml(conditionId)}"><td>${title}<span class="sub">${escapeHtml(predictionValue(recommendation.market_id, "UNKNOWN"))}</span></td><td data-label="日奖池 / 竞争"><div class="num">${escapeHtml(pool)}</div><span class="sub">价带公开挂单 ${escapeHtml(competition)} 份</span></td><td data-label="下单指引 / 资金"><div>${directionText}<div>${escapeHtml(lpDashboardPrice(guidance.price))} × ${escapeHtml(predictionValue(guidance.quantity, "UNKNOWN"))} 份</div><span class="sub">占资 ${escapeHtml(lpDashboardMoney(guidance.required_capital))}</span></div></td><td data-label="价格平稳性"><div>1h 极差 ${escapeHtml(range)}<span class="sub">完整 1h · ${escapeHtml(sampleCount)} 个样本</span></div></td><td data-label="压力退出估损"><div class="num">${escapeHtml(lpDashboardMoney(guidance.estimated_exit_loss))}（${escapeHtml(lossPercent)}）<span class="sub">估损不超过该市场投入的 10%</span></div></td><td data-label="操作 / 检查时间"><div>${marketLink}<span class="sub">检查 ${escapeHtml(checkedAt)}</span>${predictionHasValue(guidance.expires_at) ? `<span class="sub">有效至 ${escapeHtml(expiresAt)}</span>` : ""}</div></td></tr>`;
+  const rowMarkup = `<tr data-lp-recommendation="${escapeHtml(conditionId)}"><td>${title}<span class="sub">${escapeHtml(predictionValue(recommendation.market_id, "UNKNOWN"))}</span></td><td data-label="日奖池 / 竞争"><div class="num">${escapeHtml(pool)}</div><span class="sub">参考 ${escapeHtml(referenceShare)}% · 5% 日奖励估算 ${escapeHtml(referenceDailyReward)}</span><span class="sub">价带公开挂单 ${escapeHtml(competition)} 份</span></td><td data-label="下单指引 / 资金"><div>${directionText}<div>${escapeHtml(lpDashboardPrice(guidance.price))} × ${escapeHtml(predictionValue(guidance.quantity, "UNKNOWN"))} 份</div><span class="sub">占资 ${escapeHtml(lpDashboardMoney(guidance.required_capital))}</span></div></td><td data-label="价格平稳性"><div>1h 极差 ${escapeHtml(range)}<span class="sub">完整 1h · ${escapeHtml(sampleCount)} 个样本</span></div></td><td data-label="压力退出估损"><div class="num">${escapeHtml(lpDashboardMoney(guidance.estimated_exit_loss))}（${escapeHtml(lossPercent)}）<span class="sub">估损不超过该市场投入的 10%</span></div></td><td data-label="操作 / 检查时间"><div>${marketLink}<span class="sub">检查 ${escapeHtml(checkedAt)}</span>${predictionHasValue(guidance.expires_at) ? `<span class="sub">有效至 ${escapeHtml(expiresAt)}</span>` : ""}</div></td></tr>`;
   return rowMarkup + `<tr class="pm-lp-evidence-row"><td class="sub" colspan="6">${detailMarkup}</td></tr>`;
 }
 
@@ -3541,6 +3599,7 @@ function predictionLpCard(payload) {
   const positions = lpDashboardRows(dashboard.positions);
   const recommendations = lpDashboardRows(dashboard.recommendations);
   const rewards = lpDashboardRewards(dashboard.market_rewards);
+  const rewardShares = lpDashboardRewards(dashboard.reward_shares);
   const observations = lpDashboardObservations(dashboard.lp_observations);
   const shownRewards = new Set();
   const shownObservations = {reward: new Set(), risk: new Set(), details: new Set(), capital: new Set()};
@@ -3569,14 +3628,14 @@ function predictionLpCard(payload) {
     const positionAlreadyShown = Boolean(token && shownPositionTokens.has(token));
     const position = lpPositionForOrder(order, positions, shownPositionTokens);
     return lpDashboardOrderRow(
-      order, position, positionAlreadyShown, positionsComplete, rewards, shownRewards, observations, shownObservations, session,
+      order, position, positionAlreadyShown, positionsComplete, rewards, rewardShares, shownRewards, observations, shownObservations, session, stale,
     );
   });
   for (const position of positions) {
     const token = String(position.token_id || "");
     if (token && shownPositionTokens.has(token)) continue;
     if (token) shownPositionTokens.add(token);
-    orderRows.push(lpDashboardPositionRow(position, rewards, shownRewards, observations, shownObservations, session));
+    orderRows.push(lpDashboardPositionRow(position, rewards, rewardShares, shownRewards, observations, shownObservations, session, stale));
   }
   const orderRowsHtml = orderRows.length
     ? orderRows.join("")

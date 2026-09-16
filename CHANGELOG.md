@@ -5,6 +5,16 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-16
 
+- Added the read-only official Rewards-page percentage to the existing LP table:
+  recommendations show a conditional 5% reference estimate from a known
+  nonnegative daily pool, while account rows show the actual market share,
+  signed change and last successful check. Raw shares at or above 7.5% and 10%
+  remain inline warning states; failed, wrong-scope, wrong-maker, future or
+  stale observations stay UNKNOWN with prior values marked historical. No
+  fixed dollar target or order action was added. Verified by the ordered LP
+  adapter, service and existing-table Dashboard cases; no live calls or
+  deployment were performed.
+
 - LP reward-rate reads now union separately paginated open-order and
   open-position scopes for native and sponsored sources, preserving config
   identity de-duplication and conservative unknown handling. Candidate scans

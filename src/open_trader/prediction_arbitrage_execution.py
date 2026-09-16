@@ -62,6 +62,9 @@ from .validation_eat_policy import should_eat as _validation_should_eat
 
 
 PREVIEW_TTL = timedelta(seconds=10)
+LP_REWARD_PERCENTAGE_CACHE_SECONDS = 60.0
+LP_REWARD_SHARE_STALE_SECONDS = 180.0
+LP_REWARD_REFERENCE_PERCENTAGE = Decimal("5")
 _LP_REWARD_CACHE_SECONDS = 60.0
 
 _THRESHOLD_ERROR_HINTS = {
@@ -168,6 +171,28 @@ def _age_seconds(value: object) -> float | None:
         moment = moment.replace(tzinfo=UTC)
     return max(0.0, (_utc_now() - moment.astimezone(UTC)).total_seconds())
 
+
+def _lp_share_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else None
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _lp_share_severity(value: Decimal) -> str:
+    if value >= Decimal("10"):
+        return "critical"
+    if value >= Decimal("7.5"):
+        return "warning"
+    return "normal"
 
 def _aware_datetime(value: object) -> datetime | None:
     if isinstance(value, datetime):
@@ -414,6 +439,9 @@ class PredictionExecutionService:
         self._lp = lp
         self._lp_dashboard_lock = threading.RLock()
         self._lp_dashboard_cache: dict[str, object] | None = None
+        self._lp_reward_percentage_cache: dict[str, object] | None = None
+        self._lp_reward_share_observations: dict[str, dict[str, object]] = {}
+        self._lp_reward_share_active: dict[str, bool] = {}
         self._lp_reward_cache: dict[tuple[str, str], dict[str, object]] = {}
         self._lp_reward_cached_at: dict[tuple[str, str], float] = {}
         self._lp_reward_refresh_pending: dict[str, set[str]] = {}
@@ -626,6 +654,159 @@ class PredictionExecutionService:
             }
         return alerts
 
+    def _lp_reward_share_projection(
+        self, condition_ids: tuple[str, ...]
+    ) -> dict[str, dict[str, object]]:
+        reader = getattr(self._trading, "lp_reward_percentages", None)
+        if not callable(reader):
+            raw_result: Mapping[str, object] = {}
+        else:
+            sampled_at = self._clock()
+            cached = self._lp_reward_percentage_cache
+            if (
+                isinstance(cached, Mapping)
+                and sampled_at - float(cached.get("sampled_at", 0.0))
+                < LP_REWARD_PERCENTAGE_CACHE_SECONDS
+            ):
+                cached_result = cached.get("result")
+                raw_result = cached_result if isinstance(cached_result, Mapping) else {}
+            else:
+                try:
+                    result = _call(reader)
+                except Exception:
+                    result = None
+                raw_result = result if isinstance(result, Mapping) else {}
+                self._lp_reward_percentage_cache = {
+                    "sampled_at": sampled_at,
+                    "result": raw_result,
+                }
+
+        percentages = raw_result.get("percentages")
+        result_checked_at = _lp_share_datetime(raw_result.get("checked_at"))
+        expected_maker = getattr(self._trading, "wallet_address", None)
+        if not isinstance(expected_maker, str) or not expected_maker.strip():
+            config = getattr(self._trading, "config", None)
+            expected_maker = getattr(config, "wallet_address", None)
+        maker_address = raw_result.get("maker_address")
+        maker_matches = (
+            isinstance(expected_maker, str)
+            and bool(expected_maker.strip())
+            and isinstance(maker_address, str)
+            and bool(maker_address.strip())
+            and maker_address.strip().casefold() == expected_maker.strip().casefold()
+        )
+        result_is_known = (
+            raw_result.get("state") == "known"
+            and raw_result.get("scope") == "account"
+            and isinstance(percentages, Mapping)
+            and result_checked_at is not None
+            and isinstance(maker_address, str)
+            and bool(maker_address.strip())
+            and maker_matches
+        )
+        now = datetime.now(UTC)
+        result_age = (
+            (now - result_checked_at.astimezone(UTC)).total_seconds()
+            if result_checked_at is not None
+            else None
+        )
+        result_is_fresh = (
+            result_is_known
+            and result_age is not None
+            and 0 <= result_age <= LP_REWARD_SHARE_STALE_SECONDS
+        )
+        result_checked_text = (
+            _timestamp(result_checked_at) if result_checked_at is not None else None
+        )
+        projections: dict[str, dict[str, object]] = {}
+        for condition_id in condition_ids:
+            previous = self._lp_reward_share_observations.get(condition_id)
+            raw_percentage = percentages.get(condition_id) if isinstance(percentages, Mapping) else None
+            percentage = _decimal(raw_percentage)
+            valid = (
+                result_is_fresh
+                and percentage is not None
+                and Decimal("0") <= percentage <= Decimal("100")
+            )
+            older_replay = False
+            replay_same_after_failure = False
+            if valid:
+                assert percentage is not None
+                active = self._lp_reward_share_active.get(condition_id, False)
+                previous_checked_at = _lp_share_datetime(
+                    previous.get("checked_at") if isinstance(previous, Mapping) else None
+                )
+                older_replay = (
+                    previous_checked_at is not None
+                    and result_checked_at is not None
+                    and result_checked_at < previous_checked_at
+                )
+                same_source = (
+                    previous_checked_at is not None
+                    and result_checked_at is not None
+                    and result_checked_at == previous_checked_at
+                )
+                replay_same_after_failure = same_source and not active
+                if not older_replay and not replay_same_after_failure:
+                    same_observation = (
+                        previous is not None
+                        and active
+                        and previous.get("checked_at") == result_checked_text
+                    )
+                    if not same_observation:
+                        delta = (
+                            None
+                            if previous is None or previous.get("percentage") is None
+                            else percentage - previous["percentage"]
+                        )
+                        observation = {
+                            "condition_id": condition_id,
+                            "percentage": percentage,
+                            "reference_share_percentage": LP_REWARD_REFERENCE_PERCENTAGE,
+                            "delta_percentage_points": delta,
+                            "checked_at": result_checked_text,
+                            "last_success_at": result_checked_text,
+                            "severity": _lp_share_severity(percentage),
+                        }
+                        self._lp_reward_share_observations[condition_id] = observation
+                    else:
+                        observation = previous
+                    self._lp_reward_share_active[condition_id] = True
+                    projections[condition_id] = {
+                        **observation,
+                        "state": "known",
+                        "historical": False,
+                        "stale": False,
+                    }
+                    continue
+
+            self._lp_reward_share_active[condition_id] = False
+            historical = previous if isinstance(previous, Mapping) else {}
+            reason = (
+                "reward_share_replay_older"
+                if older_replay
+                else "reward_share_replay_same"
+                if replay_same_after_failure
+                else "reward_share_stale"
+                if result_is_known and not result_is_fresh
+                else "reward_share_unknown"
+            )
+            projections[condition_id] = {
+                "condition_id": condition_id,
+                "state": "unknown",
+                "percentage": historical.get("percentage"),
+                "reference_share_percentage": LP_REWARD_REFERENCE_PERCENTAGE,
+                "delta_percentage_points": None,
+                "checked_at": historical.get("checked_at"),
+                "last_success_at": historical.get("last_success_at"),
+                "severity": "unknown",
+                "historical": bool(historical),
+                "stale": True,
+                "last_attempt_at": _timestamp(now),
+                "reason": reason,
+            }
+        return projections
+
     def lp_dashboard(self) -> dict[str, object]:
         """Read official account orders and holdings without managing them."""
 
@@ -783,6 +964,14 @@ class PredictionExecutionService:
                     for recommendation in raw_recommendations
                     if isinstance(recommendation, Mapping)
                 ] if isinstance(raw_recommendations, (list, tuple)) else []
+                for recommendation in recommendations:
+                    recommendation["reference_share_percentage"] = LP_REWARD_REFERENCE_PERCENTAGE
+                    pool = _decimal(recommendation.get("daily_pool_usd"))
+                    recommendation["reference_daily_reward_usd"] = (
+                        None
+                        if pool is None or pool < Decimal("0")
+                        else pool * LP_REWARD_REFERENCE_PERCENTAGE / Decimal("100")
+                    )
                 raw_market_rewards = candidate_snapshot.get("market_rewards")
                 market_rewards = (
                     dict(raw_market_rewards)
@@ -797,6 +986,14 @@ class PredictionExecutionService:
                         and str(row.get("condition_id") or "").strip()
                     )
                 )
+                share_conditions = tuple(
+                    dict.fromkeys(
+                        str(row.get("condition_id") or "").strip()
+                        for row in (*orders, *positions)
+                        if str(row.get("condition_id") or "").strip()
+                    )
+                )
+                reward_shares = self._lp_reward_share_projection(share_conditions)
                 previous_dashboard = self._lp_dashboard_cache
                 previous_rewards_value = (
                     previous_dashboard.get("market_rewards")
@@ -829,6 +1026,7 @@ class PredictionExecutionService:
                     "positions": positions,
                     "candidates": candidates,
                     "recommendations": recommendations,
+                    "reward_shares": reward_shares,
                     "market_rewards": market_rewards,
                     "candidate_state": candidate_snapshot.get("state", "unknown"),
                     "complete": candidate_snapshot.get("complete") is True,
@@ -879,6 +1077,7 @@ class PredictionExecutionService:
                     "positions": [],
                     "candidates": [],
                     "recommendations": [],
+                    "reward_shares": {},
                     "market_rewards": {},
                     "candidate_state": "unknown",
                     "complete": False,
