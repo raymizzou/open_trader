@@ -36,6 +36,10 @@ SHA named by its gate.
   It performs read-only macOS checks of system Chrome for the five marked
   Python browser regressions and checks the installed repository Playwright
   runner with cached Chromium. A missing host runner or browser is `BLOCKED`.
+  A slow or unavailable business-state response from the old running
+  Prediction instance does not block replacing that instance. Ownership and
+  handoff plus a reliable submission baseline remain required before
+  deployment; Production Smoke verifies the new instance after deployment.
 - The exact Smoke command is:
 
   ```sh

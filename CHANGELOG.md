@@ -5,6 +5,13 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-16
 
+- Host Readiness no longer blocks replacement of the old running Prediction
+  instance when its business-state status endpoint is slow or unavailable;
+  ownership/handoff, a reliable submission baseline and new-instance Smoke
+  verification remain required. Verified by the Make-target RED/GREEN gate
+  cases and focused Dashboard gate regressions; no deployment or live calls
+  were performed.
+
 - Added an LP-first tab and a separate multi-leg tab within 预测市场, with
   shared cached venue cards. Each refresh reads the shared venue summary and
   only the selected pane; LP preview uses the venue-bootstrap CSRF token and
