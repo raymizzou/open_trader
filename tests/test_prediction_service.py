@@ -844,6 +844,245 @@ def test_lp_dashboard_shows_manual_orders_without_managing_them(
     assert public_market.closed is True
 
 
+def test_lp_account_trades_reads_markets_and_flags_incomplete_reads() -> None:
+    """The LP trades adapter reads per market, normalizes rows, flags gaps."""
+
+    calls: list[dict[str, object]] = []
+
+    class TradesSDK:
+        def list_account_trades(self, **kwargs: object) -> list[object]:
+            calls.append(dict(kwargs))
+            market = str(kwargs.get("market") or "")
+            if market == "condition-a":
+                return [
+                    {
+                        "id": "trade-1",
+                        "condition_id": "condition-a",
+                        "asset_id": "yes-token",
+                        "taker_order_id": "",
+                        "side": "BUY",
+                        "trader_side": "MAKER",
+                        "price": "0.44",
+                        "size": "30",
+                        "status": "TRADE_STATUS_MATCHED",
+                        "matched_at": "2026-09-16T02:00:00Z",
+                        "maker_orders": [
+                            {
+                                "order_id": "maker-1",
+                                "asset_id": "yes-token",
+                                "maker_address": "wallet",
+                                "owner": "wallet",
+                                "side": "BUY",
+                                "price": "0.44",
+                                "matched_amount": "30",
+                            }
+                        ],
+                    },
+                    # Unparsable row must flag the read as incomplete.
+                    {"id": "bad-trade"},
+                ]
+            if market == "condition-b":
+                raise RuntimeError("trades unavailable")
+            return []
+
+    client = PolymarketTradingClient(
+        TradingConfig("signer", "wallet"), client=TradesSDK()
+    )
+    result = client.lp_account_trades(("condition-a", "condition-b", "  "))
+
+    # One call per requested market; blank ids are skipped.
+    assert calls == [{"market": "condition-a"}, {"market": "condition-b"}]
+    assert result["state"] == "unknown"
+    assert result["complete"] is False
+    checked_at = result["checked_at"]
+    assert isinstance(checked_at, datetime) and checked_at.tzinfo is not None
+    trades = result["trades"]
+    # The failed market is absent; the readable market keeps its parsed rows.
+    assert set(trades) == {"condition-a"}
+    normalized = trades["condition-a"][0]
+    assert normalized["trade_id"] == "trade-1"
+    assert normalized["condition_id"] == "condition-a"
+    assert normalized["token_id"] == "yes-token"
+    assert normalized["trader_side"] == "MAKER"
+    assert normalized["status"] == "MATCHED"
+    assert normalized["price"] == Decimal("0.44")
+    assert normalized["size"] == Decimal("30")
+    assert normalized["maker_orders"][0]["order_id"] == "maker-1"
+    assert normalized["maker_orders"][0]["matched_amount"] == Decimal("30")
+    assert datetime.fromisoformat(
+        str(normalized["matched_at"]).replace("Z", "+00:00")
+    ) == datetime(2026, 9, 16, 2, 0, tzinfo=UTC)
+
+    empty = client.lp_account_trades(())
+    assert empty["state"] == "unknown"
+    assert empty["complete"] is False
+    assert empty["trades"] == {}
+    assert calls == [{"market": "condition-a"}, {"market": "condition-b"}]
+
+
+def test_lp_today_orders_trades_keep_only_self_maker_orders() -> None:
+    """R1: 一笔 taker 扫单吃我方 10 份与两个外来 maker（40/50 份）时，
+    适配器只保留我方钱包的 maker 行；归属不明的行也不得计入我方成交。"""
+
+    class SweepSDK:
+        def list_account_trades(self, **kwargs: object) -> list[object]:
+            assert kwargs.get("market") == "condition-sweep"
+            return [
+                {
+                    "id": "sweep-1",
+                    "condition_id": "condition-sweep",
+                    "asset_id": "yes-token",
+                    "taker_order_id": "counterparty-taker-order",
+                    "side": "SELL",
+                    "trader_side": "MAKER",
+                    "price": "0.50",
+                    "size": "107",
+                    "status": "CONFIRMED",
+                    "matched_at": "2026-09-16T02:00:00Z",
+                    "maker_orders": [
+                        {
+                            "order_id": "maker-foreign-a",
+                            "asset_id": "yes-token",
+                            "maker_address": "0x" + "a" * 40,
+                            "owner": "0x" + "a" * 40,
+                            "side": "BUY",
+                            "price": "0.50",
+                            "matched_amount": "40",
+                        },
+                        {
+                            "order_id": "maker-ours",
+                            "asset_id": "yes-token",
+                            "maker_address": "WALLET",
+                            "owner": "0x" + "b" * 40,
+                            "side": "BUY",
+                            "price": "0.50",
+                            "matched_amount": "10",
+                        },
+                        {
+                            "order_id": "maker-foreign-b",
+                            "asset_id": "yes-token",
+                            "maker_address": "0x" + "c" * 40,
+                            "owner": "0x" + "c" * 40,
+                            "side": "BUY",
+                            "price": "0.50",
+                            "matched_amount": "50",
+                        },
+                        {
+                            "order_id": "maker-unknown-attribution",
+                            "asset_id": "yes-token",
+                            "side": "BUY",
+                            "price": "0.50",
+                            "matched_amount": "7",
+                        },
+                    ],
+                }
+            ]
+
+    client = PolymarketTradingClient(
+        TradingConfig("signer", "wallet"), client=SweepSDK()
+    )
+    result = client.lp_account_trades(("condition-sweep",))
+
+    assert result["complete"] is True
+    (trade,) = result["trades"]["condition-sweep"]
+    assert [str(maker["order_id"]) for maker in trade["maker_orders"]] == [
+        "maker-ours"
+    ]
+    assert str(trade["maker_orders"][0]["maker_address"]) == "WALLET"
+    assert trade["maker_orders"][0]["matched_amount"] == Decimal("10")
+
+
+def test_lp_dashboard_http_projection_keeps_today_orders(tmp_path: Path) -> None:
+    """AC7: lp_orders_today 与 non_lp_row_count 经投影后保留，Decimal 序列化为字符串。"""
+
+    class FakeTrading:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(
+                wallet_address="0x" + "4" * 40,
+                signer_address="0x" + "5" * 40,
+                predict=None,
+            )
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": datetime.now(UTC),
+                "open_orders": [
+                    {
+                        "order_id": "scoring-order",
+                        "condition_id": "condition-1",
+                        "token_id": "yes-token",
+                        "outcome": "YES",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "price": Decimal("0.50"),
+                        "original_size": Decimal("80"),
+                        "size_matched": Decimal("40"),
+                        "remaining_size": Decimal("40"),
+                        "market_title": "Projected LP market",
+                        "market_url": "https://polymarket.com/event/projected",
+                    }
+                ],
+                "positions": [],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def get_order_scoring(self, _order_id: str) -> bool:
+            return True
+
+        def lp_reward_snapshot(
+            self, reward_date: str, condition_id: str
+        ) -> dict[str, object]:
+            return {
+                "state": "unknown",
+                "reward_date": reward_date,
+                "condition_id": condition_id,
+            }
+
+    class FakeLP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {
+                "state": "known",
+                "complete": False,
+                "candidates": [],
+                "recommendations": [],
+                "market_rewards": {},
+            }
+
+        def status(self, _session_id: str | None = None) -> dict[str, object]:
+            return {"state": "none"}
+
+    store = PredictionArbitrageStore(tmp_path / "data")
+    service = PredictionExecutionService(
+        store=store,
+        monitor=object(),
+        trading=FakeTrading(),
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=FakeLP(),
+    )
+    runtime = _Runtime()
+    runtime.store = store  # type: ignore[assignment]
+    runtime.monitor = object()
+    runtime.execution = service
+
+    with _server(runtime) as base:
+        status, payload = _response(base + "/api/prediction-arbitrage/lp/dashboard")
+
+    assert status == 200
+    today = payload["lp_orders_today"]
+    assert [str(row["order_id"]) for row in today] == ["scoring-order"]
+    row = today[0]
+    assert row["quantity"] == "80"
+    assert row["filled_quantity"] == "40"
+    assert row["remaining_quantity"] == "40"
+    assert row["price"] == "0.50"
+    assert row["state"] == "open"
+    assert row["scoring_status"] is True
+    assert payload["non_lp_row_count"] == 0
+
+
 def test_lp_dashboard_normalizes_candidate_reward_without_freshness_proof(
     tmp_path: Path,
 ) -> None:

@@ -23,7 +23,7 @@ from open_trader.prediction_runtime import (
     _RuntimeOwnershipLock,
 )
 from open_trader.llm_providers import PROVIDER_IDS, LlmCompletion
-from open_trader.notifications import FeishuWebhookNotifier
+from open_trader.notifications import FeishuWebhookNotifier, NullNotifier
 from open_trader.predict_cross_venue import (
     LlmCrossVenueEquivalenceValidator,
     ExplicitMarketPair,
@@ -4035,3 +4035,1412 @@ def test_lp_book_sampler_bounds_batches_and_preserves_receipts(
         if driver is not None:
             driver.join(timeout=8)
             assert driver.is_alive() is False
+
+
+def test_lp_dashboard_today_orders_fail_open_and_non_lp_count(tmp_path: Path) -> None:
+    """当天 LP 委托：三信号全部明确否定才排除；判不出时保留并只统计明确否定行。"""
+
+    wallet = "0x" + "4" * 40
+    account_id = hashlib.sha256(wallet.strip().casefold().encode("utf-8")).hexdigest()
+
+    class FakeTrading:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(
+                wallet_address=wallet,
+                signer_address="0x" + "5" * 40,
+                predict=None,
+            )
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": datetime.now(UTC),
+                "open_orders": [
+                    {
+                        "order_id": "nonlp-order",
+                        "condition_id": "condition-nonlp",
+                        "token_id": "nonlp-token",
+                        "outcome": "YES",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "price": Decimal("0.50"),
+                        "original_size": Decimal("40"),
+                        "size_matched": Decimal("0"),
+                        "remaining_size": Decimal("40"),
+                        "market_title": "No reward market",
+                        "market_url": "https://polymarket.com/event/nonlp",
+                    },
+                    {
+                        "order_id": "failopen-order",
+                        "condition_id": "condition-failopen",
+                        "token_id": "failopen-token",
+                        "outcome": "YES",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "price": Decimal("0.50"),
+                        "original_size": Decimal("50"),
+                        "size_matched": Decimal("10"),
+                        "remaining_size": Decimal("40"),
+                        "market_title": "Fail open market",
+                        "market_url": "https://polymarket.com/event/failopen",
+                    },
+                    {
+                        "order_id": "managed-order",
+                        "condition_id": "condition-nonlp",
+                        "token_id": "nonlp-token",
+                        "outcome": "YES",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "price": Decimal("0.50"),
+                        "original_size": Decimal("5"),
+                        "size_matched": Decimal("0"),
+                        "remaining_size": Decimal("5"),
+                        "market_title": "No reward market",
+                        "market_url": "https://polymarket.com/event/nonlp",
+                    },
+                ],
+                "positions": [
+                    {
+                        "condition_id": "condition-nonlp",
+                        "token_id": "nonlp-token",
+                        "outcome": "YES",
+                        "size": Decimal("3"),
+                        "average_price": Decimal("0.50"),
+                        "market_title": "No reward market",
+                        "market_url": "https://polymarket.com/event/nonlp",
+                    }
+                ],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def get_order_scoring(self, order_id: str) -> object:
+            if order_id == "nonlp-order":
+                return False
+            raise RuntimeError("scoring unavailable")
+
+        def lp_reward_snapshot(
+            self, reward_date: str, condition_id: str
+        ) -> dict[str, object]:
+            return {
+                "state": "unknown",
+                "reward_date": reward_date,
+                "condition_id": condition_id,
+            }
+
+    class FakeLP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {
+                "state": "known",
+                "complete": False,
+                "candidates": [],
+                "recommendations": [],
+                "market_rewards": {},
+            }
+
+        def status(self, _session_id: str | None = None) -> dict[str, object]:
+            return {
+                "state": "entry_open",
+                "entry_order_id": "managed-order",
+                "token_id": "session-token",
+            }
+
+    store = PredictionArbitrageStore(tmp_path / "data")
+    store.save_lp_observation(
+        account_id,
+        "condition-nonlp",
+        {
+            "state": "unknown",
+            "stage": "added",
+            "stale": False,
+            "reason": "reward_market_missing",
+            "checked_at": datetime.now(UTC),
+        },
+    )
+    service = PredictionExecutionService(
+        store=store,
+        monitor=object(),
+        trading=FakeTrading(),
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=FakeLP(),
+    )
+
+    dashboard = service.lp_dashboard()
+
+    today_ids = [
+        str(row["order_id"]) for row in dashboard["lp_orders_today"]
+    ]
+    # AC4: 观察缺失 + 奖励读取不完整 → fail-open 保留。
+    assert "failopen-order" in today_ids
+    # AC3: 会话管理行永不排除。
+    assert "managed-order" in today_ids
+    # AC3: 计分否定 + 奖励市场缺失（读取完整）+ 当天无奖励记录 → 排除。
+    assert "nonlp-order" not in today_ids
+    failopen_row = next(
+        row
+        for row in dashboard["lp_orders_today"]
+        if row["order_id"] == "failopen-order"
+    )
+    assert failopen_row["quantity"] == Decimal("50")
+    assert failopen_row["filled_quantity"] == Decimal("10")
+    assert failopen_row["remaining_quantity"] == Decimal("40")
+    assert failopen_row["price"] == Decimal("0.50")
+    # AC3: non_lp_row_count 只统计明确否定且非会话管理的行（manual 订单 + 持仓）。
+    assert dashboard["non_lp_row_count"] == 2
+
+
+def test_lp_dashboard_today_orders_include_filled_orders_from_trades(
+    tmp_path: Path,
+) -> None:
+    """AC2/AC5: 已离开挂单列表的全量成交订单按当天成交聚合回表；隔日成交不聚合。"""
+
+    class FakeTrading:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(
+                wallet_address="0x" + "4" * 40,
+                signer_address="0x" + "5" * 40,
+                predict=None,
+            )
+            self.trade_calls: list[tuple[str, ...]] = []
+            self.trades_requested = threading.Event()
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": datetime(2026, 9, 16, 10, tzinfo=UTC),
+                "open_orders": [],
+                "positions": [],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def lp_market_metadata(
+            self, condition_ids: object
+        ) -> dict[str, dict[str, object]]:
+            return {
+                str(condition_id): {
+                    "market_id": "market-1",
+                    "market_title": "Filled LP market",
+                    "market_url": "https://polymarket.com/event/filled",
+                }
+                for condition_id in condition_ids  # type: ignore[attr-defined]
+            }
+
+        def lp_account_trades(
+            self, condition_ids: object, *, stop_event: threading.Event | None = None
+        ) -> dict[str, object]:
+            self.trade_calls.append(tuple(str(item) for item in condition_ids))  # type: ignore[attr-defined]
+            self.trades_requested.set()
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": datetime(2026, 9, 16, 10, 5, tzinfo=UTC),
+                "trades": {
+                    "condition-1": [
+                        {
+                            "id": "t1",
+                            "condition_id": "condition-1",
+                            "token_id": "yes-token",
+                            "taker_order_id": "",
+                            "side": "BUY",
+                            "trader_side": "MAKER",
+                            "price": Decimal("0.44"),
+                            "size": Decimal("30"),
+                            "status": "MATCHED",
+                            "matched_at": datetime(2026, 9, 16, 2, 0, tzinfo=UTC),
+                            "maker_orders": [
+                                {
+                                    "order_id": "filled-order-1",
+                                    "token_id": "yes-token",
+                                    "side": "BUY",
+                                    "price": Decimal("0.44"),
+                                    "matched_amount": Decimal("30"),
+                                }
+                            ],
+                        },
+                        {
+                            "id": "t2",
+                            "condition_id": "condition-1",
+                            "token_id": "yes-token",
+                            "taker_order_id": "",
+                            "side": "BUY",
+                            "trader_side": "MAKER",
+                            "price": Decimal("0.46"),
+                            "size": Decimal("20"),
+                            "status": "MATCHED",
+                            "matched_at": datetime(2026, 9, 16, 3, 0, tzinfo=UTC),
+                            "maker_orders": [
+                                {
+                                    "order_id": "filled-order-1",
+                                    "token_id": "yes-token",
+                                    "side": "BUY",
+                                    "price": Decimal("0.46"),
+                                    "matched_amount": Decimal("20"),
+                                }
+                            ],
+                        },
+                        {
+                            "id": "t3",
+                            "condition_id": "condition-1",
+                            "token_id": "yes-token",
+                            "taker_order_id": "filled-order-2",
+                            "side": "BUY",
+                            "trader_side": "TAKER",
+                            "price": Decimal("0.45"),
+                            "size": Decimal("60"),
+                            "status": "MATCHED",
+                            "matched_at": datetime(2026, 9, 16, 2, 5, tzinfo=UTC),
+                            "maker_orders": [],
+                        },
+                        {
+                            "id": "t4",
+                            "condition_id": "condition-1",
+                            "token_id": "yes-token",
+                            "taker_order_id": "filled-order-3",
+                            "side": "BUY",
+                            "trader_side": "TAKER",
+                            "price": Decimal("0.50"),
+                            "size": Decimal("99"),
+                            "status": "MATCHED",
+                            "matched_at": datetime(2026, 9, 15, 23, 0, tzinfo=UTC),
+                            "maker_orders": [],
+                        },
+                    ],
+                },
+            }
+
+    class FakeLP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {
+                "state": "known",
+                "complete": True,
+                "candidates": [],
+                "recommendations": [],
+                "market_rewards": {
+                    "condition-1": {
+                        "state": "known",
+                        "reward_date": "2026-09-16",
+                        "condition_id": "condition-1",
+                        "market_amount": Decimal("0.20"),
+                    }
+                },
+            }
+
+        def status(self, _session_id: str | None = None) -> dict[str, object]:
+            return {"state": "none"}
+
+    trading = FakeTrading()
+    service = PredictionExecutionService(
+        store=PredictionArbitrageStore(tmp_path / "data"),
+        monitor=object(),
+        trading=trading,
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=FakeLP(),
+    )
+
+    first = service.lp_dashboard()
+    # AC4: 成交聚合异步补齐，读取本身不等待。
+    assert first["lp_orders_today"] == []
+    assert trading.trades_requested.wait(timeout=5)
+    dashboard = first
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        dashboard = service.lp_dashboard()
+        filled_ids = {
+            str(row["order_id"])
+            for row in dashboard["lp_orders_today"]
+            if row["state"] == "filled"
+        }
+        if {"filled-order-1", "filled-order-2"} <= filled_ids:
+            break
+        time.sleep(0.05)
+    assert trading.trade_calls and trading.trade_calls[0] == ("condition-1",)
+    rows = {
+        str(row["order_id"]): row for row in dashboard["lp_orders_today"]
+    }
+    # AC5: matched_at 早于当日 UTC 00:00 的成交（filled-order-3）不参与当天聚合。
+    assert set(rows) == {"filled-order-1", "filled-order-2"}
+    order1 = rows["filled-order-1"]
+    # AC2: maker 成交按订单聚合（30 + 20），最新成交时间取最大值。
+    assert order1["filled_quantity"] == Decimal("50")
+    assert order1["remaining_quantity"] == Decimal("0")
+    assert order1["status"] == "MATCHED"
+    assert order1["market_title"] == "Filled LP market"
+    assert datetime.fromisoformat(
+        str(order1["last_fill_at"]).replace("Z", "+00:00")
+    ) == datetime(2026, 9, 16, 3, 0, tzinfo=UTC)
+    order2 = rows["filled-order-2"]
+    # AC2: taker 成交按 taker_order_id 归属。
+    assert order2["filled_quantity"] == Decimal("60")
+    assert order2["side"] == "BUY"
+
+
+def test_lp_today_orders_maker_fills_exclude_counterparty_taker_order(
+    tmp_path: Path,
+) -> None:
+    """R1: 我方是 maker 时，成交聚合只计我方 maker 订单；
+    对手方 taker_order_id 绝不能计为我方成交（无回退归属）。"""
+
+    class FakeTrading:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(
+                wallet_address="0x" + "4" * 40,
+                signer_address="0x" + "5" * 40,
+                predict=None,
+            )
+            self.trade_calls: list[tuple[str, ...]] = []
+            self.trades_requested = threading.Event()
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": datetime(2026, 9, 16, 10, tzinfo=UTC),
+                "open_orders": [],
+                "positions": [],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def lp_market_metadata(
+            self, condition_ids: object
+        ) -> dict[str, dict[str, object]]:
+            return {
+                str(condition_id): {
+                    "market_id": "market-1",
+                    "market_title": "Swept LP market",
+                    "market_url": "https://polymarket.com/event/swept",
+                }
+                for condition_id in condition_ids  # type: ignore[attr-defined]
+            }
+
+        def lp_account_trades(
+            self, condition_ids: object, *, stop_event: threading.Event | None = None
+        ) -> dict[str, object]:
+            self.trade_calls.append(tuple(str(item) for item in condition_ids))  # type: ignore[attr-defined]
+            self.trades_requested.set()
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": datetime(2026, 9, 16, 10, 5, tzinfo=UTC),
+                "trades": {
+                    "condition-1": [
+                        {
+                            "id": "sweep-1",
+                            "condition_id": "condition-1",
+                            "token_id": "yes-token",
+                            # taker 扫单对手方订单；我方是 maker，绝不能计入。
+                            "taker_order_id": "counterparty-taker-order",
+                            "side": "SELL",
+                            "trader_side": "MAKER",
+                            "price": Decimal("0.50"),
+                            "size": Decimal("100"),
+                            "status": "CONFIRMED",
+                            "matched_at": datetime(2026, 9, 16, 2, 0, tzinfo=UTC),
+                            # 适配器按钱包过滤后只剩我方 maker 行（10 份）。
+                            "maker_orders": [
+                                {
+                                    "order_id": "our-maker-order",
+                                    "token_id": "yes-token",
+                                    "side": "BUY",
+                                    "price": Decimal("0.50"),
+                                    "matched_amount": Decimal("10"),
+                                }
+                            ],
+                        },
+                        {
+                            "id": "sweep-2",
+                            "condition_id": "condition-1",
+                            "token_id": "yes-token",
+                            "taker_order_id": "counterparty-order-2",
+                            "side": "SELL",
+                            "trader_side": "MAKER",
+                            "price": Decimal("0.50"),
+                            "size": Decimal("77"),
+                            "status": "CONFIRMED",
+                            "matched_at": datetime(2026, 9, 16, 2, 30, tzinfo=UTC),
+                            # 归属不明的 maker 行已在适配器被丢弃。
+                            "maker_orders": [],
+                        },
+                    ],
+                },
+            }
+
+    class FakeLP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {
+                "state": "known",
+                "complete": True,
+                "candidates": [],
+                "recommendations": [],
+                "market_rewards": {
+                    "condition-1": {
+                        "state": "known",
+                        "reward_date": "2026-09-16",
+                        "condition_id": "condition-1",
+                        "market_amount": Decimal("0.20"),
+                    }
+                },
+            }
+
+        def status(self, _session_id: str | None = None) -> dict[str, object]:
+            return {"state": "none"}
+
+    trading = FakeTrading()
+    service = PredictionExecutionService(
+        store=PredictionArbitrageStore(tmp_path / "data"),
+        monitor=object(),
+        trading=trading,
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=FakeLP(),
+    )
+
+    first = service.lp_dashboard()
+    assert first["lp_orders_today"] == []
+    assert trading.trades_requested.wait(timeout=5)
+    dashboard = first
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        dashboard = service.lp_dashboard()
+        filled_ids = {
+            str(row["order_id"])
+            for row in dashboard["lp_orders_today"]
+            if row["state"] == "filled"
+        }
+        if "our-maker-order" in filled_ids:
+            break
+        time.sleep(0.05)
+    rows = {
+        str(row["order_id"]): row for row in dashboard["lp_orders_today"]
+    }
+    # R1: 只有我方自己的订单出现在 lp_orders_today，外来/对手方 id 不出现。
+    assert set(rows) == {"our-maker-order"}
+    assert rows["our-maker-order"]["filled_quantity"] == Decimal("10")
+    assert rows["our-maker-order"]["side"] == "BUY"
+
+
+def test_lp_today_orders_fills_skip_failed_trades(tmp_path: Path) -> None:
+    """R2: 同市场一笔 CONFIRMED 30 份 + 一笔 FAILED 77 份 → 只聚合 30。"""
+
+    class FakeTrading:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(
+                wallet_address="0x" + "4" * 40,
+                signer_address="0x" + "5" * 40,
+                predict=None,
+            )
+            self.trade_calls: list[tuple[str, ...]] = []
+            self.trades_requested = threading.Event()
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": datetime(2026, 9, 16, 10, tzinfo=UTC),
+                "open_orders": [],
+                "positions": [],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def lp_market_metadata(
+            self, condition_ids: object
+        ) -> dict[str, dict[str, object]]:
+            return {
+                str(condition_id): {
+                    "market_id": "market-1",
+                    "market_title": "Status LP market",
+                    "market_url": "https://polymarket.com/event/status",
+                }
+                for condition_id in condition_ids  # type: ignore[attr-defined]
+            }
+
+        def lp_account_trades(
+            self, condition_ids: object, *, stop_event: threading.Event | None = None
+        ) -> dict[str, object]:
+            self.trade_calls.append(tuple(str(item) for item in condition_ids))  # type: ignore[attr-defined]
+            self.trades_requested.set()
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": datetime(2026, 9, 16, 10, 5, tzinfo=UTC),
+                "trades": {
+                    "condition-1": [
+                        {
+                            "id": "t-ok",
+                            "condition_id": "condition-1",
+                            "token_id": "yes-token",
+                            "taker_order_id": "confirmed-order",
+                            "side": "BUY",
+                            "trader_side": "TAKER",
+                            "price": Decimal("0.50"),
+                            "size": Decimal("30"),
+                            "status": "CONFIRMED",
+                            "matched_at": datetime(2026, 9, 16, 2, 0, tzinfo=UTC),
+                            "maker_orders": [],
+                        },
+                        {
+                            "id": "t-failed",
+                            "condition_id": "condition-1",
+                            "token_id": "yes-token",
+                            "taker_order_id": "failed-order",
+                            "side": "BUY",
+                            "trader_side": "TAKER",
+                            "price": Decimal("0.50"),
+                            "size": Decimal("77"),
+                            "status": "FAILED",
+                            "matched_at": datetime(2026, 9, 16, 2, 30, tzinfo=UTC),
+                            "maker_orders": [],
+                        },
+                    ],
+                },
+            }
+
+    class FakeLP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {
+                "state": "known",
+                "complete": True,
+                "candidates": [],
+                "recommendations": [],
+                "market_rewards": {
+                    "condition-1": {
+                        "state": "known",
+                        "reward_date": "2026-09-16",
+                        "condition_id": "condition-1",
+                        "market_amount": Decimal("0.20"),
+                    }
+                },
+            }
+
+        def status(self, _session_id: str | None = None) -> dict[str, object]:
+            return {"state": "none"}
+
+    trading = FakeTrading()
+    service = PredictionExecutionService(
+        store=PredictionArbitrageStore(tmp_path / "data"),
+        monitor=object(),
+        trading=trading,
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=FakeLP(),
+    )
+
+    first = service.lp_dashboard()
+    assert first["lp_orders_today"] == []
+    assert trading.trades_requested.wait(timeout=5)
+    dashboard = first
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        dashboard = service.lp_dashboard()
+        filled_ids = {
+            str(row["order_id"])
+            for row in dashboard["lp_orders_today"]
+            if row["state"] == "filled"
+        }
+        if "confirmed-order" in filled_ids:
+            break
+        time.sleep(0.05)
+    rows = {
+        str(row["order_id"]): row for row in dashboard["lp_orders_today"]
+    }
+    # R2: 只有落地的 CONFIRMED 成交计入成交量，FAILED 不计。
+    assert set(rows) == {"confirmed-order"}
+    assert rows["confirmed-order"]["filled_quantity"] == Decimal("30")
+
+
+def test_lp_today_orders_prior_day_negative_observation_fails_open(
+    tmp_path: Path,
+) -> None:
+    """R3: reward_market_missing 否定只在观察落在当前奖励日内才成立；
+    昨日的否定观察（跨过北京 08:00 或观察停摆）不再排除今天的 LP 行。"""
+
+    wallet = "0x" + "4" * 40
+    account_id = hashlib.sha256(wallet.strip().casefold().encode("utf-8")).hexdigest()
+
+    class FakeTrading:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(
+                wallet_address=wallet,
+                signer_address="0x" + "5" * 40,
+                predict=None,
+            )
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": datetime(2026, 9, 16, 10, tzinfo=UTC),
+                "open_orders": [
+                    {
+                        "order_id": "prior-day-order",
+                        "condition_id": "condition-prior-day",
+                        "token_id": "prior-day-token",
+                        "outcome": "YES",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "price": Decimal("0.50"),
+                        "original_size": Decimal("40"),
+                        "size_matched": Decimal("0"),
+                        "remaining_size": Decimal("40"),
+                        "market_title": "Prior day negative market",
+                        "market_url": "https://polymarket.com/event/prior-day",
+                    },
+                    {
+                        "order_id": "in-day-order",
+                        "condition_id": "condition-in-day",
+                        "token_id": "in-day-token",
+                        "outcome": "YES",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "price": Decimal("0.50"),
+                        "original_size": Decimal("40"),
+                        "size_matched": Decimal("0"),
+                        "remaining_size": Decimal("40"),
+                        "market_title": "In day negative market",
+                        "market_url": "https://polymarket.com/event/in-day",
+                    },
+                ],
+                "positions": [],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def get_order_scoring(self, _order_id: str) -> object:
+            return False
+
+        def lp_reward_snapshot(
+            self, reward_date: str, condition_id: str
+        ) -> dict[str, object]:
+            return {
+                "state": "unknown",
+                "reward_date": reward_date,
+                "condition_id": condition_id,
+            }
+
+    class FakeLP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {
+                "state": "known",
+                "complete": True,
+                "candidates": [],
+                "recommendations": [],
+                "market_rewards": {},
+            }
+
+        def status(self, _session_id: str | None = None) -> dict[str, object]:
+            return {"state": "none"}
+
+    store = PredictionArbitrageStore(tmp_path / "data")
+    # 同一观察形态，只有 checked_at 相差一天：昨日的否定失效，当日的仍否定。
+    store.save_lp_observation(
+        account_id,
+        "condition-prior-day",
+        {
+            "state": "unknown",
+            "stage": "added",
+            "stale": False,
+            "reason": "reward_market_missing",
+            "checked_at": datetime(2026, 9, 15, 20, 0, tzinfo=UTC),
+        },
+    )
+    store.save_lp_observation(
+        account_id,
+        "condition-in-day",
+        {
+            "state": "unknown",
+            "stage": "added",
+            "stale": False,
+            "reason": "reward_market_missing",
+            "checked_at": datetime(2026, 9, 16, 1, 0, tzinfo=UTC),
+        },
+    )
+    service = PredictionExecutionService(
+        store=store,
+        monitor=object(),
+        trading=FakeTrading(),
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=FakeLP(),
+    )
+
+    dashboard = service.lp_dashboard()
+
+    # R3: 昨日否定 → fail-open 保留；当日否定 → 照常排除。
+    assert [str(row["order_id"]) for row in dashboard["lp_orders_today"]] == [
+        "prior-day-order"
+    ]
+    assert dashboard["non_lp_row_count"] == 1
+
+
+def test_lp_today_orders_cached_fills_follow_market_gate_and_session_management(
+    tmp_path: Path,
+) -> None:
+    """R4: 明确否定市场的缓存成交不进表；会话成交单按会话归属标注。"""
+
+    wallet = "0x" + "4" * 40
+    account_id = hashlib.sha256(wallet.strip().casefold().encode("utf-8")).hexdigest()
+
+    class FakeTrading:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(
+                wallet_address=wallet,
+                signer_address="0x" + "5" * 40,
+                predict=None,
+            )
+            self.trade_calls: list[tuple[str, ...]] = []
+            self.trades_requested = threading.Event()
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": datetime(2026, 9, 16, 10, tzinfo=UTC),
+                "open_orders": [],
+                "positions": [],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def lp_market_metadata(
+            self, condition_ids: object
+        ) -> dict[str, dict[str, object]]:
+            return {
+                str(condition_id): {
+                    "market_id": f"market-{condition_id}",
+                    "market_title": f"Cached LP market {condition_id}",
+                    "market_url": f"https://polymarket.com/event/{condition_id}",
+                }
+                for condition_id in condition_ids  # type: ignore[attr-defined]
+            }
+
+        def lp_account_trades(
+            self, condition_ids: object, *, stop_event: threading.Event | None = None
+        ) -> dict[str, object]:
+            self.trade_calls.append(tuple(str(item) for item in condition_ids))  # type: ignore[attr-defined]
+            self.trades_requested.set()
+            trades: dict[str, object] = {}
+            for fills in (
+                ("condition-neg", "neg-fill-order", "neg-token", "77"),
+                ("condition-managed", "managed-fill-order", "managed-token", "30"),
+                ("condition-manual", "manual-fill-order", "manual-token", "20"),
+            ):
+                market, order_id, token_id, size = fills
+                trades[market] = [
+                    {
+                        "id": f"trade-{order_id}",
+                        "condition_id": market,
+                        "token_id": token_id,
+                        "taker_order_id": order_id,
+                        "side": "BUY",
+                        "trader_side": "TAKER",
+                        "price": Decimal("0.50"),
+                        "size": Decimal(size),
+                        "status": "CONFIRMED",
+                        "matched_at": datetime(2026, 9, 16, 2, 0, tzinfo=UTC),
+                        "maker_orders": [],
+                    }
+                ]
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": datetime(2026, 9, 16, 10, 5, tzinfo=UTC),
+                "trades": trades,
+            }
+
+    class FakeLP:
+        def __init__(self) -> None:
+            self.include_rewards = True
+
+        def candidate_snapshot(self) -> dict[str, object]:
+            market_rewards: dict[str, object] = {}
+            if self.include_rewards:
+                for condition_id in (
+                    "condition-neg",
+                    "condition-managed",
+                    "condition-manual",
+                ):
+                    market_rewards[condition_id] = {
+                        "state": "known",
+                        "reward_date": "2026-09-16",
+                        "condition_id": condition_id,
+                        "market_amount": Decimal("0.20"),
+                    }
+            return {
+                "state": "known",
+                "complete": True,
+                "candidates": [],
+                "recommendations": [],
+                "market_rewards": market_rewards,
+            }
+
+        def status(self, _session_id: str | None = None) -> dict[str, object]:
+            return {
+                "state": "entry_open",
+                "entry_order_id": "managed-fill-order",
+                "token_id": "managed-token",
+            }
+
+    store = PredictionArbitrageStore(tmp_path / "data")
+    store.save_lp_observation(
+        account_id,
+        "condition-neg",
+        {
+            "state": "unknown",
+            "stage": "added",
+            "stale": False,
+            "reason": "reward_market_missing",
+            "checked_at": datetime(2026, 9, 16, 1, 0, tzinfo=UTC),
+        },
+    )
+    lp = FakeLP()
+    service = PredictionExecutionService(
+        store=store,
+        monitor=object(),
+        trading=FakeTrading(),
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=lp,
+    )
+
+    # 第一轮装配：三个市场当天都有奖励记录，成交缓存异步补齐并进表。
+    first = service.lp_dashboard()
+    assert first["lp_orders_today"] == []
+    deadline = time.monotonic() + 5
+    dashboard = first
+    while time.monotonic() < deadline:
+        dashboard = service.lp_dashboard()
+        if any(
+            str(row["order_id"]) == "manual-fill-order"
+            for row in dashboard["lp_orders_today"]
+        ):
+            break
+        time.sleep(0.05)
+    assert any(
+        str(row["order_id"]) == "neg-fill-order"
+        for row in dashboard["lp_orders_today"]
+    )
+
+    # 第二轮装配：奖励记录消失 + 明确否定观察 → 缓存成交行必须被同一门挡住。
+    lp.include_rewards = False
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        dashboard = service.lp_dashboard()
+        if not any(
+            str(row["order_id"]) == "neg-fill-order"
+            for row in dashboard["lp_orders_today"]
+        ):
+            break
+        time.sleep(0.05)
+    rows = {
+        str(row["order_id"]): row for row in dashboard["lp_orders_today"]
+    }
+    # R4: 明确否定市场的成交行不出现。
+    assert "neg-fill-order" not in rows
+    # R4: 会话成交单标 system_managed / read_only False；手工成交单保持 manual。
+    assert set(rows) == {"managed-fill-order", "manual-fill-order"}
+    assert rows["managed-fill-order"]["management"] == "system_managed"
+    assert rows["managed-fill-order"]["read_only"] is False
+    assert rows["manual-fill-order"]["management"] == "manual_read_only"
+    assert rows["manual-fill-order"]["read_only"] is True
+
+
+def test_lp_today_orders_trade_reads_throttled_until_ttl_expires(
+    tmp_path: Path,
+) -> None:
+    """R5: 同一奖励日内按市场节流成交重读；TTL 内不再调用 lp_account_trades，
+    过期后重新入队。"""
+
+    class FakeTrading:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(
+                wallet_address="0x" + "4" * 40,
+                signer_address="0x" + "5" * 40,
+                predict=None,
+            )
+            self.trade_calls: list[tuple[str, ...]] = []
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": datetime(2026, 9, 16, 10, tzinfo=UTC),
+                "open_orders": [],
+                "positions": [],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def lp_market_metadata(
+            self, condition_ids: object
+        ) -> dict[str, dict[str, object]]:
+            return {
+                str(condition_id): {
+                    "market_id": "market-1",
+                    "market_title": "Throttled LP market",
+                    "market_url": "https://polymarket.com/event/throttled",
+                }
+                for condition_id in condition_ids  # type: ignore[attr-defined]
+            }
+
+        def lp_account_trades(
+            self, condition_ids: object, *, stop_event: threading.Event | None = None
+        ) -> dict[str, object]:
+            self.trade_calls.append(tuple(str(item) for item in condition_ids))  # type: ignore[attr-defined]
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": datetime(2026, 9, 16, 10, 5, tzinfo=UTC),
+                "trades": {
+                    "condition-1": [
+                        {
+                            "id": "t1",
+                            "condition_id": "condition-1",
+                            "token_id": "yes-token",
+                            "taker_order_id": "throttled-order",
+                            "side": "BUY",
+                            "trader_side": "TAKER",
+                            "price": Decimal("0.50"),
+                            "size": Decimal("10"),
+                            "status": "CONFIRMED",
+                            "matched_at": datetime(2026, 9, 16, 2, 0, tzinfo=UTC),
+                            "maker_orders": [],
+                        }
+                    ]
+                },
+            }
+
+        def lp_reward_snapshot(
+            self, reward_date: str, condition_id: str
+        ) -> dict[str, object]:
+            return {
+                "state": "known",
+                "reward_date": reward_date,
+                "condition_id": condition_id,
+                "market_amount": Decimal("0.20"),
+            }
+
+    class FakeLP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {
+                "state": "known",
+                "complete": True,
+                "candidates": [],
+                "recommendations": [],
+                "market_rewards": {
+                    "condition-1": {
+                        "state": "known",
+                        "reward_date": "2026-09-16",
+                        "condition_id": "condition-1",
+                        "market_amount": Decimal("0.20"),
+                    }
+                },
+            }
+
+        def status(self, _session_id: str | None = None) -> dict[str, object]:
+            return {"state": "none"}
+
+    trading = FakeTrading()
+    service = PredictionExecutionService(
+        store=PredictionArbitrageStore(tmp_path / "data"),
+        monitor=object(),
+        trading=trading,
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=FakeLP(),
+    )
+    clock = {"now": 1000.0}
+    service._clock = lambda: clock["now"]  # type: ignore[method-assign]
+
+    def wait_for_reads(count: int) -> None:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if len(trading.trade_calls) >= count:
+                return
+            time.sleep(0.02)
+        raise AssertionError(f"expected {count} trade reads, got {len(trading.trade_calls)}")
+
+    # 第一次装配触发首次成交读取。
+    service.lp_dashboard()
+    wait_for_reads(1)
+    # TTL 内的后续装配不再重读该市场。
+    service.lp_dashboard()
+    service.lp_dashboard()
+    time.sleep(0.3)
+    assert len(trading.trade_calls) == 1
+    # 注入时钟越过 TTL 后重新入队。
+    clock["now"] += 61.0
+    service.lp_dashboard()
+    wait_for_reads(2)
+    assert trading.trade_calls[0] == ("condition-1",)
+    assert trading.trade_calls[1] == ("condition-1",)
+
+
+def test_lp_today_orders_fill_rows_resolve_outcome_from_metadata(
+    tmp_path: Path,
+) -> None:
+    """R6: 已成交行按 metadata 的 outcomes/token_id 解析 outcome；解不出保持空。"""
+
+    class FakeTrading:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(
+                wallet_address="0x" + "4" * 40,
+                signer_address="0x" + "5" * 40,
+                predict=None,
+            )
+            self.trade_calls: list[tuple[str, ...]] = []
+            self.trades_requested = threading.Event()
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": datetime(2026, 9, 16, 10, tzinfo=UTC),
+                "open_orders": [],
+                "positions": [],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def lp_market_metadata(
+            self, condition_ids: object
+        ) -> dict[str, dict[str, object]]:
+            return {
+                str(condition_id): {
+                    "market_id": "market-1",
+                    "market_title": "Outcome LP market",
+                    "market_url": "https://polymarket.com/event/outcome",
+                    "outcomes": {
+                        "yes": {"label": "YES", "token_id": "yes-token"},
+                    },
+                }
+                for condition_id in condition_ids  # type: ignore[attr-defined]
+            }
+
+        def lp_account_trades(
+            self, condition_ids: object, *, stop_event: threading.Event | None = None
+        ) -> dict[str, object]:
+            self.trade_calls.append(tuple(str(item) for item in condition_ids))  # type: ignore[attr-defined]
+            self.trades_requested.set()
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": datetime(2026, 9, 16, 10, 5, tzinfo=UTC),
+                "trades": {
+                    "condition-1": [
+                        {
+                            "id": "t-yes",
+                            "condition_id": "condition-1",
+                            "token_id": "yes-token",
+                            "taker_order_id": "outcome-order",
+                            "side": "BUY",
+                            "trader_side": "TAKER",
+                            "price": Decimal("0.45"),
+                            "size": Decimal("60"),
+                            "status": "CONFIRMED",
+                            "matched_at": datetime(2026, 9, 16, 2, 5, tzinfo=UTC),
+                            "maker_orders": [],
+                        },
+                        {
+                            "id": "t-unmapped",
+                            "condition_id": "condition-1",
+                            "token_id": "unmapped-token",
+                            "taker_order_id": "unknown-outcome-order",
+                            "side": "BUY",
+                            "trader_side": "TAKER",
+                            "price": Decimal("0.50"),
+                            "size": Decimal("5"),
+                            "status": "CONFIRMED",
+                            "matched_at": datetime(2026, 9, 16, 2, 6, tzinfo=UTC),
+                            "maker_orders": [],
+                        },
+                    ],
+                },
+            }
+
+    class FakeLP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {
+                "state": "known",
+                "complete": True,
+                "candidates": [],
+                "recommendations": [],
+                "market_rewards": {
+                    "condition-1": {
+                        "state": "known",
+                        "reward_date": "2026-09-16",
+                        "condition_id": "condition-1",
+                        "market_amount": Decimal("0.20"),
+                    }
+                },
+            }
+
+        def status(self, _session_id: str | None = None) -> dict[str, object]:
+            return {"state": "none"}
+
+    trading = FakeTrading()
+    service = PredictionExecutionService(
+        store=PredictionArbitrageStore(tmp_path / "data"),
+        monitor=object(),
+        trading=trading,
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=FakeLP(),
+    )
+
+    first = service.lp_dashboard()
+    assert first["lp_orders_today"] == []
+    assert trading.trades_requested.wait(timeout=5)
+    dashboard = first
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        dashboard = service.lp_dashboard()
+        filled_ids = {
+            str(row["order_id"])
+            for row in dashboard["lp_orders_today"]
+            if row["state"] == "filled"
+        }
+        if "outcome-order" in filled_ids:
+            break
+        time.sleep(0.05)
+    rows = {
+        str(row["order_id"]): row for row in dashboard["lp_orders_today"]
+    }
+    # R6: token_id 命中 metadata outcomes → 真实 outcome（前端副标题渲染为
+    # 「YES · 买入 · 已成交」而非 UNKNOWN）。
+    assert rows["outcome-order"]["outcome"] == "YES"
+    assert rows["outcome-order"]["market_title"] == "Outcome LP market"
+    # R6: 解不出的 token 保持空 outcome（前端回落 UNKNOWN 路径）。
+    assert rows["unknown-outcome-order"]["outcome"] is None
+
+
+def test_lp_dashboard_today_orders_keep_scoring_orders_with_unknown_market(
+    tmp_path: Path,
+) -> None:
+    """AC1: LIVE 挂单官方计分中、市场信号未知 → 进当天 LP 委托，数量取挂单数据。"""
+
+    class FakeTrading:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(
+                wallet_address="0x" + "4" * 40,
+                signer_address="0x" + "5" * 40,
+                predict=None,
+            )
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": datetime.now(UTC),
+                "open_orders": [
+                    {
+                        "order_id": "scoring-order",
+                        "condition_id": "condition-scoring",
+                        "token_id": "scoring-token",
+                        "outcome": "YES",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "price": Decimal("0.50"),
+                        "original_size": Decimal("80"),
+                        "size_matched": Decimal("40"),
+                        "remaining_size": Decimal("40"),
+                        "market_title": "Scoring LP market",
+                        "market_url": "https://polymarket.com/event/scoring",
+                    }
+                ],
+                "positions": [],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def get_order_scoring(self, _order_id: str) -> bool:
+            return True
+
+        def lp_reward_snapshot(
+            self, reward_date: str, condition_id: str
+        ) -> dict[str, object]:
+            return {
+                "state": "unknown",
+                "reward_date": reward_date,
+                "condition_id": condition_id,
+            }
+
+    class FakeLP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {
+                "state": "known",
+                "complete": False,
+                "candidates": [],
+                "recommendations": [],
+                "market_rewards": {},
+            }
+
+        def status(self, _session_id: str | None = None) -> dict[str, object]:
+            return {"state": "none"}
+
+    service = PredictionExecutionService(
+        store=PredictionArbitrageStore(tmp_path / "data"),
+        monitor=object(),
+        trading=FakeTrading(),
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=FakeLP(),
+    )
+
+    dashboard = service.lp_dashboard()
+
+    # AC1: 计分信号命中即归属 LP，市场观察与奖励记录均未知也不排除。
+    assert [str(row["order_id"]) for row in dashboard["lp_orders_today"]] == [
+        "scoring-order"
+    ]
+    row = dashboard["lp_orders_today"][0]
+    assert row["state"] == "open"
+    assert row["quantity"] == Decimal("80")
+    assert row["filled_quantity"] == Decimal("40")
+    assert row["remaining_quantity"] == Decimal("40")
+    assert row["price"] == Decimal("0.50")
+    assert row["scoring_status"] is True
+    assert row["side"] == "BUY"
+    assert row["market_title"] == "Scoring LP market"
+    assert dashboard["non_lp_row_count"] == 0
+
+
+def test_lp_dashboard_payload_keeps_orders_and_positions_intact(
+    tmp_path: Path,
+) -> None:
+    """AC6: orders/positions 载荷逐字段保持不变（风控与推荐排除依赖完整清单）。"""
+
+    class FakeTrading:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(
+                wallet_address="0x" + "4" * 40,
+                signer_address="0x" + "5" * 40,
+                predict=None,
+            )
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": datetime.now(UTC),
+                "open_orders": [
+                    {
+                        "order_id": "manual-order",
+                        "condition_id": "condition-1",
+                        "token_id": "yes-token",
+                        "outcome": "YES",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "price": Decimal("0.50"),
+                        "original_size": Decimal("80"),
+                        "size_matched": Decimal("40"),
+                        "remaining_size": Decimal("40"),
+                        "reward_min_size": Decimal("40"),
+                        "reward_max_spread": Decimal("0.03"),
+                        "fees_enabled": False,
+                        "fee_exponent": Decimal("1"),
+                        "taker_fee_rate": Decimal("0"),
+                        "market_id": "market-1",
+                        "market_title": "Intact LP market",
+                        "market_url": "https://polymarket.com/event/intact",
+                    }
+                ],
+                "positions": [
+                    {
+                        "condition_id": "condition-1",
+                        "token_id": "yes-token",
+                        "outcome": "YES",
+                        "size": Decimal("20"),
+                        "average_price": Decimal("0.50"),
+                        "current_value": Decimal("10.4"),
+                        "reward_min_size": Decimal("40"),
+                        "reward_max_spread": Decimal("0.03"),
+                        "fees_enabled": False,
+                        "fee_exponent": Decimal("1"),
+                        "taker_fee_rate": Decimal("0"),
+                        "market_id": "market-1",
+                        "market_title": "Intact LP market",
+                        "market_url": "https://polymarket.com/event/intact",
+                    }
+                ],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def get_order_scoring(self, _order_id: str) -> bool:
+            return False
+
+        def lp_reward_snapshot(
+            self, reward_date: str, condition_id: str
+        ) -> dict[str, object]:
+            return {
+                "state": "unknown",
+                "reward_date": reward_date,
+                "condition_id": condition_id,
+            }
+
+    class FakeLP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {
+                "state": "known",
+                "complete": False,
+                "candidates": [],
+                "recommendations": [],
+                "market_rewards": {},
+            }
+
+        def status(self, _session_id: str | None = None) -> dict[str, object]:
+            return {"state": "none"}
+
+    service = PredictionExecutionService(
+        store=PredictionArbitrageStore(tmp_path / "data"),
+        monitor=object(),
+        trading=FakeTrading(),
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=FakeLP(),
+    )
+
+    dashboard = service.lp_dashboard()
+
+    order = dict(dashboard["orders"][0])
+    scoring_checked_at = order.pop("scoring_checked_at")
+    assert isinstance(scoring_checked_at, str) and scoring_checked_at
+    assert order == {
+        "order_id": "manual-order",
+        "market_id": "market-1",
+        "condition_id": "condition-1",
+        "market_title": "Intact LP market",
+        "market_url": "https://polymarket.com/event/intact",
+        "token_id": "yes-token",
+        "outcome": "YES",
+        "side": "BUY",
+        "status": "LIVE",
+        "price": Decimal("0.50"),
+        "quantity": Decimal("80"),
+        "filled_quantity": Decimal("40"),
+        "remaining_quantity": Decimal("40"),
+        "reward_min_size": Decimal("40"),
+        "reward_max_spread": Decimal("0.03"),
+        "fees_enabled": False,
+        "fee_exponent": Decimal("1"),
+        "taker_fee_rate": Decimal("0"),
+        "management": "manual_read_only",
+        "read_only": True,
+        "scoring_status": False,
+    }
+    assert dashboard["positions"] == [
+        {
+            "market_id": "market-1",
+            "condition_id": "condition-1",
+            "market_title": "Intact LP market",
+            "market_url": "https://polymarket.com/event/intact",
+            "token_id": "yes-token",
+            "outcome": "YES",
+            "size": Decimal("20"),
+            "average_price": Decimal("0.50"),
+            "current_value": Decimal("10.4"),
+            "reward_min_size": Decimal("40"),
+            "reward_max_spread": Decimal("0.03"),
+            "fees_enabled": False,
+            "fee_exponent": Decimal("1"),
+            "taker_fee_rate": Decimal("0"),
+            "management": "manual_read_only",
+            "read_only": True,
+        }
+    ]

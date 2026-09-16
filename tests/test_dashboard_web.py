@@ -5492,6 +5492,10 @@ const lpDashboard = {
   orders:[{order_id:"lp-order-1",market_id:"market-order",condition_id:"condition-order",token_id:"order-token",
     market_title:"LP order fact",outcome:"NO",side:"BUY",status:"LIVE",price:"0.40",quantity:"20",filled_quantity:"0",remaining_quantity:"20",
     management:"manual_read_only",read_only:true}],
+  lp_orders_today:[{order_id:"lp-order-1",market_id:"market-order",condition_id:"condition-order",token_id:"order-token",
+    market_title:"LP order fact",outcome:"NO",side:"BUY",status:"LIVE",price:"0.40",quantity:"20",filled_quantity:"0",remaining_quantity:"20",
+    state:"open",management:"manual_read_only",read_only:true}],
+  non_lp_row_count:0,
   positions:[], market_rewards:[],
   recommendations:[{market_id:"market-candidate",condition_id:"condition-candidate",market_url:"https://polymarket.com/event/candidate",
     market_title:"LP candidate fact",daily_pool_usd:"150",state:"eligible",competition_state:"known",competition_quantity:"5",
@@ -5651,7 +5655,11 @@ const lpDashboard = {state:"ready",stale:false,complete:true,checked_at:"2026-09
   lp_session:{state:"none"},
   orders:[{order_id:"lp-order-1",market_id:"market-order",condition_id:"condition-order",token_id:"order-token",
     market_title:"LP order fact",outcome:"NO",side:"BUY",status:"LIVE",price:"0.40",quantity:"20",filled_quantity:"0",remaining_quantity:"20",
-    management:"manual_read_only",read_only:true}],positions:[],market_rewards:[],
+    management:"manual_read_only",read_only:true}],
+  lp_orders_today:[{order_id:"lp-order-1",market_id:"market-order",condition_id:"condition-order",token_id:"order-token",
+    market_title:"LP order fact",outcome:"NO",side:"BUY",status:"LIVE",price:"0.40",quantity:"20",filled_quantity:"0",remaining_quantity:"20",
+    state:"open",management:"manual_read_only",read_only:true}],
+  non_lp_row_count:0,positions:[],market_rewards:[],
   recommendations:[{market_id:"market-candidate",condition_id:"condition-candidate",market_url:"https://polymarket.com/event/candidate",
     market_title:"LP candidate fact",daily_pool_usd:"150",state:"eligible",competition_state:"known",competition_quantity:"5",
     directions:{YES:{token_id:"candidate-yes",state:"eligible",reason_codes:[],screening:{stability_range:"0.01",stability_sample_count:721},
@@ -5970,6 +5978,24 @@ const dashboard = {
     market_amount_raw: "0.02", asset: "USDC.e", market_amount: null,
     currency: "USDC.e", checked_at: "2026-09-15T03:59:00Z", paid: false,
   }},
+  lp_orders_today: [{
+    order_id: "manual-order", market_id: "market-manual",
+    condition_id: "condition-manual", token_id: "manual-token",
+    market_title: longManualTitle, market_url: "https://polymarket.com/event/manual",
+    outcome: "NO", side: "BUY", status: "LIVE", price: "0.51",
+    quantity: "20", filled_quantity: "5", remaining_quantity: "15", state: "open",
+    management: "manual_read_only", read_only: true,
+    scoring_status: "true", scoring_checked_at: "2026-09-15T03:59:30Z",
+  }, {
+    order_id: "manual-order-second", market_id: "market-manual",
+    condition_id: "condition-manual", token_id: "manual-token",
+    market_title: longManualTitle, market_url: "https://polymarket.com/event/manual",
+    outcome: "NO", side: "BUY", status: "LIVE", price: "0.52",
+    quantity: "10", filled_quantity: "0", remaining_quantity: "10", state: "open",
+    management: "manual_read_only", read_only: true,
+    scoring_status: "false", scoring_checked_at: "2026-09-15T03:59:30Z",
+  }],
+  non_lp_row_count: 0,
 };
 const refreshedDashboard = {
   ...dashboard,
@@ -6147,16 +6173,15 @@ console.log(JSON.stringify({
   safeMarketLink: initial.includes('href="https://polymarket.com/event/manual"') && initial.includes('rel="noopener noreferrer"'),
   mergedPosition: (() => {
     const orderTable = (initial.match(/<table class="pm-table[^>]*>[\s\S]*?<\/table>/) || [""])[0];
-    return orderTable.includes("当前持仓 5 份")
-      && orderTable.includes("持仓见同标的上一行")
-      && (orderTable.match(/当前持仓 5 份/g) || []).length === 1
+    return orderTable.includes("已成交 5 · 剩余 15")
+      && orderTable.includes("已成交 0 · 剩余 10")
       && orderTable.split(longManualTitle).length - 1 === 2;
   })(),
   honestManualPnl: initial.includes("未接管止损") && initial.includes("已实现 UNKNOWN") && initial.includes("持仓 P&amp;L UNKNOWN"),
   partialCatalogVisible: partial.includes("候选目录尚未完整") && partial.includes("Market C"),
-  initialShowsBothLists: initial.includes("我的订单与持仓") && initial.includes("推荐标的"),
+  initialShowsBothLists: initial.includes("当天 LP 委托") && initial.includes("推荐标的"),
   longName: initial.includes(longManualTitle),
-  manualReadOnly: initial.includes("手工单 · 只读") && !initial.includes("data-manual-cancel"),
+  manualReadOnly: initial.includes("买入") && !initial.includes("data-manual-cancel"),
   scoring: initial.includes("官方计分中"),
   marketCumulative: initial.includes("市场累计") && initial.includes("0.02 USDC.e") && initial.includes("平台累计，未核实到账"),
   orderedMarkets: ordered.every((index, position) => index >= 0 && (position === 0 || index > ordered[position - 1])),
@@ -6259,6 +6284,34 @@ const dashboard = {
       market_url: "https://polymarket.com/event/old", outcome: "YES", size: "10",
       average_price: "0.50", management: "manual_read_only", read_only: true},
   ],
+  lp_orders_today: [
+    {order_id: "order-1", condition_id: "condition-1", token_id: "token-1",
+      market_title: "Tracked LP market", market_url: "https://polymarket.com/event/tracked",
+      outcome: "YES", side: "BUY", status: "LIVE", price: "0.50", quantity: "40",
+      filled_quantity: "40", remaining_quantity: "0", state: "open",
+      management: "manual_read_only", read_only: true, scoring_status: "true"},
+    {order_id: "order-2", condition_id: "condition-1", token_id: "token-1",
+      market_title: "Tracked LP market", market_url: "https://polymarket.com/event/tracked",
+      outcome: "YES", side: "BUY", status: "LIVE", price: "0.50", quantity: "80",
+      filled_quantity: "0", remaining_quantity: "80", state: "open",
+      management: "manual_read_only", read_only: true, scoring_status: "true"},
+    {order_id: "stale-order", condition_id: "condition-stale", token_id: "stale-token",
+      market_title: "Stale LP market", market_url: "https://polymarket.com/event/stale",
+      outcome: "NO", side: "BUY", status: "LIVE", price: "0.45", quantity: "40",
+      filled_quantity: "40", remaining_quantity: "0", state: "open",
+      management: "manual_read_only", read_only: true, scoring_status: "true"},
+    {order_id: "trial-order", condition_id: "condition-trial", token_id: "trial-token",
+      market_title: "Trial LP market", market_url: "https://polymarket.com/event/trial",
+      outcome: "YES", side: "BUY", status: "LIVE", price: "0.50", quantity: "40",
+      filled_quantity: "40", remaining_quantity: "0", state: "open",
+      management: "manual_read_only", read_only: true, scoring_status: "true"},
+    {order_id: "old-order", condition_id: "condition-old", token_id: "old-token",
+      market_title: "Old LP market", market_url: "https://polymarket.com/event/old",
+      outcome: "YES", side: "BUY", status: "LIVE", price: "0.50", quantity: "10",
+      filled_quantity: "0", remaining_quantity: "10", state: "open",
+      management: "manual_read_only", read_only: true, scoring_status: "true"},
+  ],
+  non_lp_row_count: 0,
   market_rewards: [{condition_id: "condition-1", market_amount_raw: "0.02", asset: "USDC.e", paid: false}],
   lp_observations: {
     "condition-1": {
@@ -6333,7 +6386,7 @@ console.log(JSON.stringify({
 ''')
     rendered = json.loads(output)
     assert rendered == {
-        "headers": ["标的", "挂单与持仓", "LP 收益率（预计）", "压力损失（警戒线 10%）"],
+        "headers": ["标的", "委托与成交量", "LP 收益率（预计）", "压力损失（警戒线 10%）"],
         "current": True,
         "baseline": True,
         "addRoom": True,
@@ -6359,6 +6412,82 @@ console.log(JSON.stringify({
         "marketLink": True,
         "tableRows": 2,
         "trialBaselineFromReference": True,
+    }
+
+
+def test_lp_today_orders_table_renders_rows_empty_state_and_footnote() -> None:
+    output = run_dashboard_js(r'''
+const checkedAt = "2026-09-16T02:05:00Z";
+const dashboard = {
+  state: "ready", stale: false, checked_at: checkedAt, last_success_at: checkedAt,
+  orders: [
+    {order_id: "other-order", condition_id: "condition-other", token_id: "token-other",
+      market_title: "Non LP market", market_url: "https://polymarket.com/event/other",
+      outcome: "NO", side: "BUY", status: "LIVE", price: "0.30", quantity: "10",
+      filled_quantity: "0", remaining_quantity: "10", management: "manual_read_only",
+      read_only: true, scoring_status: false},
+  ],
+  positions: [
+    {condition_id: "condition-other", token_id: "token-other", market_title: "Non LP market",
+      market_url: "https://polymarket.com/event/other", outcome: "NO", size: "4",
+      average_price: "0.30", management: "manual_read_only", read_only: true},
+  ],
+  lp_orders_today: [
+    {order_id: "live-1", condition_id: "condition-live", token_id: "token-live",
+      market_title: "Live LP market", market_url: "https://polymarket.com/event/live",
+      outcome: "YES", side: "BUY", status: "LIVE", price: "0.50", quantity: "80",
+      filled_quantity: "40", remaining_quantity: "40", state: "open",
+      management: "manual_read_only", read_only: true, scoring_status: true,
+      scoring_checked_at: checkedAt},
+    {order_id: "filled-1", condition_id: "condition-filled", token_id: "token-filled",
+      market_title: "Filled LP market", market_url: "https://polymarket.com/event/filled",
+      outcome: "YES", side: "BUY", status: "MATCHED", price: "0.45", quantity: null,
+      filled_quantity: "60", remaining_quantity: "0", state: "filled",
+      last_fill_at: "2026-09-16T02:05:00Z", management: "manual_read_only",
+      read_only: true, scoring_status: "unknown", scoring_checked_at: null},
+  ],
+  non_lp_row_count: 9,
+  market_rewards: [], reward_shares: {}, lp_observations: {},
+  recommendations: [], lp_session: {state: "none"},
+};
+const html = predictionLpCard({lp_dashboard: dashboard});
+const orderTable = (html.match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
+const rowTags = (orderTable.match(/<tr[^>]*data-lp-today-/g) || []);
+const legacyPayload = JSON.parse(JSON.stringify(dashboard));
+delete legacyPayload.lp_orders_today;
+delete legacyPayload.non_lp_row_count;
+const legacyHtml = predictionLpCard({lp_dashboard: legacyPayload});
+const emptyHtml = predictionLpCard({lp_dashboard: {...dashboard, lp_orders_today: []}});
+console.log(JSON.stringify({
+  blockTitle: html.includes("当天 LP 委托"),
+  headers: [...orderTable.matchAll(/<th\b[^>]*>([\s\S]*?)<\/th>/g)].map((m) => m[1]),
+  tableRows: rowTags.length,
+  nonLpRowsExcluded: !orderTable.includes("Non LP market"),
+  liveQuantityCell: orderTable.includes("50¢ × 80 份") && orderTable.includes("已成交 40 · 剩余 40"),
+  filledQuantityCell: orderTable.includes("成交量 60 份 · 成交于 2026-09-16 10:05:00 HKT"),
+  openSubtitle: orderTable.includes("YES · 买入 · 未成交 · 官方计分中"),
+  filledSubtitle: orderTable.includes("YES · 买入 · 已成交"),
+  footnote: html.includes("账户另有 9 行非 LP 订单/持仓，不在本表展示。"),
+  emptyState: emptyHtml.includes("当天暂无 LP 委托。"),
+  legacyEmptyState: legacyHtml.includes("当天暂无 LP 委托。"),
+  oldBlockGone: !html.includes("我的订单与持仓") && !html.includes("挂单与持仓")
+    && !html.includes("暂未读取到订单或持仓"),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered == {
+        "blockTitle": True,
+        "headers": ["标的", "委托与成交量", "LP 收益率（预计）", "压力损失（警戒线 10%）"],
+        "tableRows": 2,
+        "nonLpRowsExcluded": True,
+        "liveQuantityCell": True,
+        "filledQuantityCell": True,
+        "openSubtitle": True,
+        "filledSubtitle": True,
+        "footnote": True,
+        "emptyState": True,
+        "legacyEmptyState": True,
+        "oldBlockGone": True,
     }
 
 
@@ -18733,6 +18862,15 @@ const baseDashboard = {
       management:"manual_read_only",read_only:true,scoring_status:false,scoring_checked_at:checkedAt},
   ],
   positions: [], market_rewards: [],
+  lp_orders_today: [
+    {order_id:"lp-a-yes",condition_id:"condition-a",token_id:"token-yes",market_url:"https://polymarket.com/event/a",
+      market_title:"LP duplicate market",outcome:"YES",side:"BUY",price:"0.40",quantity:"20",filled_quantity:"5",remaining_quantity:"15",
+      state:"open",management:"manual_read_only",read_only:true,scoring_status:true,scoring_checked_at:checkedAt},
+    {order_id:"lp-a-no",condition_id:"condition-a",token_id:"token-no",market_url:"https://polymarket.com/event/a",
+      market_title:"LP duplicate market",outcome:"NO",side:"BUY",price:"0.45",quantity:"10",filled_quantity:"0",remaining_quantity:"10",
+      state:"open",management:"manual_read_only",read_only:true,scoring_status:false,scoring_checked_at:checkedAt},
+  ],
+  non_lp_row_count:0,
   lp_observations: {"condition-a": {
     state:"known", stage:"added", stale:false,
     current_hourly_reward_usd:"0.108", occupied_capital_usd:"60",
@@ -18775,7 +18913,7 @@ console.log(JSON.stringify({warning,critical,recovery,historical,expired}));
     assert "2026-09-16 08:00:00" in warning
     assert "$4.95" in warning
     assert "剩余 15" in warning and "剩余 10" in warning
-    assert warning.count("手工单 · 只读") == 2
+    assert warning.count(" · 买入 · ") == 2
     assert warning.count("LP duplicate market") >= 2
     assert warning.count("奖励份额警告") == 1
 
@@ -18823,6 +18961,15 @@ const lpDashboard = {
       management:"manual_read_only",read_only:true,scoring_status:false,scoring_checked_at:checkedAt},
   ],
   positions: [], market_rewards: [], recommendations: [], lp_session:{state:"none"},
+  lp_orders_today: [
+    {order_id:"lp-a-yes",condition_id:"condition-a",token_id:"token-yes",market_url:"https://polymarket.com/event/a",
+      market_title:"LP duplicate market",outcome:"YES",side:"BUY",price:"0.40",quantity:"20",filled_quantity:"5",remaining_quantity:"15",
+      state:"open",management:"manual_read_only",read_only:true,scoring_status:true,scoring_checked_at:checkedAt},
+    {order_id:"lp-a-no",condition_id:"condition-a",token_id:"token-no",market_url:"https://polymarket.com/event/a",
+      market_title:"LP duplicate market",outcome:"NO",side:"BUY",price:"0.45",quantity:"10",filled_quantity:"0",remaining_quantity:"10",
+      state:"open",management:"manual_read_only",read_only:true,scoring_status:false,scoring_checked_at:checkedAt},
+  ],
+  non_lp_row_count:0,
   reward_shares: {"condition-a": {
     condition_id:"condition-a", state:"known", percentage:"7.5", reference_share_percentage:"5",
     delta_percentage_points:"2.5", checked_at:checkedAt, last_success_at:checkedAt,
@@ -18929,9 +19076,9 @@ console.log(JSON.stringify({
     assert polling["readOnly"] is True
     assert polling["atThirtyHtml"].count("奖励份额警告") == 1
     assert "剩余 15" in polling["atThirtyHtml"]
-    assert "手工单 · 只读" in polling["atThirtyHtml"]
+    assert "买入" in polling["atThirtyHtml"]
     assert "UNKNOWN" in polling["atExpiryHtml"] or "历史" in polling["atExpiryHtml"]
     assert "奖励份额警告" not in polling["atExpiryHtml"]
     assert "奖励份额严重" not in polling["atExpiryHtml"]
     assert "剩余 15" in polling["atExpiryHtml"]
-    assert "手工单 · 只读" in polling["atExpiryHtml"]
+    assert "买入" in polling["atExpiryHtml"]

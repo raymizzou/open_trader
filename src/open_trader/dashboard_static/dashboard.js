@@ -3309,42 +3309,6 @@ function lpDashboardOfficialScoring(order) {
   return "官方计分 UNKNOWN";
 }
 
-function lpPositionForOrder(order, positions, shownTokens) {
-  const token = String(order.token_id || "");
-  if (!token || shownTokens.has(token)) return null;
-  const position = positions.find((item) => String(item.token_id || "") === token);
-  if (position) shownTokens.add(token);
-  return position || null;
-}
-
-function lpOrderPositionMarkup(order, position, positionsComplete, positionAlreadyShown, observation, shownCapital) {
-  const filled = predictionValue(order.filled_quantity, "UNKNOWN");
-  const quantity = predictionValue(order.quantity, "UNKNOWN");
-  const remaining = predictionValue(order.remaining_quantity, "UNKNOWN");
-  const holding = position
-    ? "当前持仓 " + predictionValue(position.size, "UNKNOWN") + " 份"
-    : positionAlreadyShown
-      ? "持仓见同标的上一行"
-      : "当前持仓 " + (positionsComplete ? "0" : "UNKNOWN") + " 份";
-  const identity = String(order.condition_id || "");
-  const accountFactsStale = lpDashboardAccountFactsStale(observation);
-  const hasObservation = observation && typeof observation === "object";
-  const observedCapital = hasObservation
-    ? accountFactsStale ? "UNKNOWN" : lpDashboardMoney(observation.occupied_capital_usd)
-    : null;
-  const capital = hasObservation
-    ? observedCapital
-    : lpDashboardMoney(order.capital_committed ?? order.reserved_amount);
-  const capitalText = hasObservation && observedCapital !== null && identity && shownCapital.has(identity)
-    ? "占用本金见同标的上一行"
-    : "占用本金 " + capital;
-  if (hasObservation && observedCapital !== null && identity) shownCapital.add(identity);
-  return "<div>" + escapeHtml(lpDashboardPrice(order.price)) + " × "
-    + escapeHtml(quantity) + " 份<span class=\"sub\">已成交 " + escapeHtml(filled)
-    + " · 剩余 " + escapeHtml(remaining) + "</span><span class=\"sub\">"
-    + escapeHtml(holding) + " · " + escapeHtml(capitalText) + "</span></div>";
-}
-
 function lpDashboardRiskCell(item, session) {
   const manual = item.read_only === true || item.management === "manual_read_only";
   const owned = !manual && session && (
@@ -3413,85 +3377,70 @@ function lpDashboardExposureRiskCell(item, session, observation, shownObservatio
   return riskMarkup;
 }
 
-function lpDashboardOrderRow(
-  order, position, positionAlreadyShown, positionsComplete, rewards, rewardShares, shownRewards, observations, shownObservations, session, dashboardStale,
-) {
-  const manual = order.read_only === true || order.management === "manual_read_only";
-  const identity = String(order.condition_id || "");
-  const observation = identity && observations[identity] && typeof observations[identity] === "object"
-    ? observations[identity]
-    : null;
-  const detailsShown = Boolean(identity && shownObservations.details.has(identity));
-  if (identity) shownObservations.details.add(identity);
-  const shareRepeated = Boolean(identity && shownRewards.has(identity));
-  const rewardMarkup = lpDashboardRewardCell(order, rewards, shownRewards, observations, shownObservations.reward);
-  const share = identity && rewardShares && typeof rewardShares === "object" ? rewardShares[identity] : null;
-  const shareMarkup = identity
-    ? shareRepeated
-      ? "<span class=\"sub\">奖励份额见同市场上一行</span>"
-      : lpDashboardShareMarkup(share || {}, dashboardStale)
-    : "";
-  const riskMarkup = lpDashboardExposureRiskCell(order, session, observation, shownObservations.risk);
-  const detailsMarkup = observation && !detailsShown
-    ? lpDashboardObservationDetail(
-      observation,
-      lpDashboardRewardCell(order, rewards, new Set(), {}, new Set()),
-      lpDashboardRiskCell(order, session),
-    )
-    : "";
-  const subtitle = [
-    predictionValue(order.outcome, "UNKNOWN"),
-    String(order.side || "").toUpperCase() === "BUY" ? "买入" : predictionValue(order.side, "UNKNOWN"),
-    manual ? "手工单 · 只读" : "系统管理",
-  ].join(" · ");
-  return "<tr data-lp-order-id=\"" + escapeHtml(predictionValue(order.order_id, "")) + "\">"
-    + "<td>" + lpMarketTitleLink(order) + "<span class=\"sub\">" + escapeHtml(subtitle) + "</span>" + detailsMarkup + "</td>"
-    + "<td data-label=\"挂单与持仓\">" + lpOrderPositionMarkup(order, position, positionsComplete, positionAlreadyShown, observation, shownObservations.capital) + "</td>"
-    + "<td data-label=\"LP 收益率（预计）\">" + rewardMarkup + shareMarkup + "</td>"
-    + "<td data-label=\"压力损失（警戒线 10%）\">" + riskMarkup + "</td></tr>";
+function lpDashboardTodayFilled(row) {
+  return String(row.state || "").toLowerCase() === "filled"
+    || String(row.status || "").toUpperCase() === "MATCHED";
 }
 
-function lpDashboardPositionRow(position, rewards, rewardShares, shownRewards, observations, shownObservations, session, dashboardStale) {
-  const identity = String(position.condition_id || "");
+function lpDashboardTodayStateLabel(row) {
+  return lpDashboardTodayFilled(row) ? "已成交" : "未成交";
+}
+
+function lpDashboardTodayQuantityCell(row) {
+  if (lpDashboardTodayFilled(row)) {
+    const filled = predictionValue(row.filled_quantity, "UNKNOWN");
+    const filledText = predictionHasValue(row.last_fill_at)
+      ? "成交量 " + filled + " 份 · 成交于 " + predictionHktTimestamp(row.last_fill_at)
+      : "成交量 " + filled + " 份";
+    return "<div>" + escapeHtml(filledText) + "</div>";
+  }
+  const price = lpDashboardPrice(row.price);
+  const quantity = predictionValue(row.quantity, "UNKNOWN");
+  const filled = predictionValue(row.filled_quantity, "UNKNOWN");
+  const remaining = predictionValue(row.remaining_quantity, "UNKNOWN");
+  return "<div>" + escapeHtml(price) + " × " + escapeHtml(quantity)
+    + " 份<span class=\"sub\">已成交 " + escapeHtml(filled)
+    + " · 剩余 " + escapeHtml(remaining) + "</span></div>";
+}
+
+function lpDashboardTodayOrderRow(
+  row, rewards, rewardShares, shownRewards, observations, shownObservations, session, dashboardStale,
+) {
+  const identity = String(row.condition_id || "");
   const observation = identity && observations[identity] && typeof observations[identity] === "object"
     ? observations[identity]
     : null;
   const detailsShown = Boolean(identity && shownObservations.details.has(identity));
   if (identity) shownObservations.details.add(identity);
   const shareRepeated = Boolean(identity && shownRewards.has(identity));
-  const rewardMarkup = lpDashboardRewardCell(position, rewards, shownRewards, observations, shownObservations.reward);
+  const rewardMarkup = lpDashboardRewardCell(row, rewards, shownRewards, observations, shownObservations.reward);
   const share = identity && rewardShares && typeof rewardShares === "object" ? rewardShares[identity] : null;
   const shareMarkup = identity
     ? shareRepeated
       ? "<span class=\"sub\">奖励份额见同市场上一行</span>"
       : lpDashboardShareMarkup(share || {}, dashboardStale)
     : "";
-  const riskMarkup = lpDashboardExposureRiskCell(position, session, observation, shownObservations.risk);
-  const accountFactsStale = lpDashboardAccountFactsStale(observation);
-  const hasObservation = observation && typeof observation === "object";
-  const observedCapital = hasObservation
-    ? accountFactsStale ? "UNKNOWN" : lpDashboardMoney(observation.occupied_capital_usd)
-    : null;
-  const capitalText = observedCapital !== null && identity && shownObservations.capital.has(identity)
-    ? "占用本金见同标的上一行"
-    : observedCapital !== null
-      ? "占用本金 " + observedCapital
-      : "";
-  if (observedCapital !== null && identity) shownObservations.capital.add(identity);
+  const riskMarkup = lpDashboardExposureRiskCell(row, session, observation, shownObservations.risk);
   const detailsMarkup = observation && !detailsShown
     ? lpDashboardObservationDetail(
       observation,
-      lpDashboardRewardCell(position, rewards, new Set(), {}, new Set()),
-      lpDashboardRiskCell(position, session),
+      lpDashboardRewardCell(row, rewards, new Set(), {}, new Set()),
+      lpDashboardRiskCell(row, session),
     )
     : "";
-  const subtitle = predictionValue(position.outcome, "UNKNOWN")
-    + (position.read_only === true || position.management === "manual_read_only" ? " · 手工只读" : " · 系统管理");
-  return "<tr data-lp-position-only=\"" + escapeHtml(predictionValue(position.token_id, "")) + "\">"
-    + "<td>" + lpMarketTitleLink(position) + "<span class=\"sub\">" + escapeHtml(subtitle) + "</span>" + detailsMarkup + "</td>"
-    + "<td data-label=\"挂单与持仓\"><div>无未成交委托<span class=\"sub\">持仓 "
-    + escapeHtml(predictionValue(position.size, "UNKNOWN")) + " 份</span>"
-    + (capitalText ? `<span class="sub">${escapeHtml(capitalText)}</span>` : "") + "</div></td>"
+  const side = String(row.side || "").toUpperCase();
+  const subtitle = [
+    predictionValue(row.outcome, "UNKNOWN"),
+    side === "BUY" ? "买入" : side === "SELL" ? "卖出" : predictionValue(row.side, "UNKNOWN"),
+    lpDashboardTodayStateLabel(row),
+    lpDashboardOfficialScoring(row),
+  ].join(" · ");
+  const rowAttribute = lpDashboardTodayFilled(row)
+    ? "data-lp-today-filled=\"" + escapeHtml(predictionValue(row.order_id, "")) + "\""
+    : "data-lp-today-order=\"" + escapeHtml(predictionValue(row.order_id, "")) + "\"";
+  return "<tr " + rowAttribute + ">"
+    + "<td>" + lpMarketTitleLink(row) + "<span class=\"sub\">" + escapeHtml(subtitle) + "</span>" + detailsMarkup + "</td>"
+    + "<td data-label=\"委托与成交量\">" + lpDashboardTodayQuantityCell(row) + "</td>"
     + "<td data-label=\"LP 收益率（预计）\">" + rewardMarkup + shareMarkup + "</td>"
     + "<td data-label=\"压力损失（警戒线 10%）\">" + riskMarkup + "</td></tr>";
 }
@@ -3595,15 +3544,13 @@ function lpDashboardRecommendationRow(recommendation, stale) {
 function predictionLpCard(payload) {
   const dashboard = payload?.lp_dashboard && typeof payload.lp_dashboard === "object"
     ? payload.lp_dashboard : {};
-  const orders = lpDashboardRows(dashboard.orders);
-  const positions = lpDashboardRows(dashboard.positions);
+  const lpOrdersToday = lpDashboardRows(dashboard.lp_orders_today);
   const recommendations = lpDashboardRows(dashboard.recommendations);
   const rewards = lpDashboardRewards(dashboard.market_rewards);
   const rewardShares = lpDashboardRewards(dashboard.reward_shares);
   const observations = lpDashboardObservations(dashboard.lp_observations);
   const shownRewards = new Set();
-  const shownObservations = {reward: new Set(), risk: new Set(), details: new Set(), capital: new Set()};
-  const shownPositionTokens = new Set();
+  const shownObservations = {reward: new Set(), risk: new Set(), details: new Set()};
   const session = dashboard.lp_session;
   const activeSession = session && typeof session === "object"
     && String(session.state || "").toLowerCase() !== "none"
@@ -3622,24 +3569,16 @@ function predictionLpCard(payload) {
     : "<span class=\"pm-clock\">"
       + escapeHtml(predictionHasValue(checkedAt) ? "同步时间：" + predictionHktTimestamp(checkedAt) : "等待首次同步")
       + " · 每 5 秒刷新</span>";
-  const positionsComplete = Array.isArray(dashboard.positions);
-  const orderRows = orders.map((order) => {
-    const token = String(order.token_id || "");
-    const positionAlreadyShown = Boolean(token && shownPositionTokens.has(token));
-    const position = lpPositionForOrder(order, positions, shownPositionTokens);
-    return lpDashboardOrderRow(
-      order, position, positionAlreadyShown, positionsComplete, rewards, rewardShares, shownRewards, observations, shownObservations, session, stale,
-    );
-  });
-  for (const position of positions) {
-    const token = String(position.token_id || "");
-    if (token && shownPositionTokens.has(token)) continue;
-    if (token) shownPositionTokens.add(token);
-    orderRows.push(lpDashboardPositionRow(position, rewards, rewardShares, shownRewards, observations, shownObservations, session, stale));
-  }
-  const orderRowsHtml = orderRows.length
-    ? orderRows.join("")
-    : "<tr><td colspan=\"4\" class=\"pm-observation-empty\">暂未读取到订单或持仓。</td></tr>";
+  const todayRowsHtml = lpOrdersToday.length
+    ? lpOrdersToday.map((row) => lpDashboardTodayOrderRow(
+      row, rewards, rewardShares, shownRewards, observations, shownObservations, session, stale,
+    )).join("")
+    : "<tr><td colspan=\"4\" class=\"pm-observation-empty\">当天暂无 LP 委托。</td></tr>";
+  const nonLpRowCount = Number(dashboard.non_lp_row_count);
+  const nonLpFootnote = Number.isFinite(nonLpRowCount) && nonLpRowCount > 0
+    ? "<p class=\"sub\">账户另有 " + escapeHtml(String(nonLpRowCount))
+      + " 行非 LP 订单/持仓，不在本表展示。</p>"
+    : "";
   const catalogStatus = dashboard.scanning === true
     ? "候选目录尚未完整 · 扫描中"
     : dashboard.complete === false
@@ -3673,9 +3612,10 @@ function predictionLpCard(payload) {
     + "<button class=\"pm-button\" type=\"button\" data-action=\"lp-dashboard-refresh\""
     + (state.predictionMarket.lpDashboardRequestInFlight || !state.predictionMarket.csrfToken ? " disabled" : "") + ">立即刷新</button></div></header>"
     + errorMarkup
-    + "<section aria-label=\"我的订单与持仓\"><h3>我的订单与持仓</h3><div class=\"pm-table-wrap\"><table class=\"pm-table pm-lp-order-table\">"
-    + "<thead><tr><th scope=\"col\">标的</th><th scope=\"col\">挂单与持仓</th><th scope=\"col\">LP 收益率（预计）</th><th scope=\"col\">压力损失（警戒线 10%）</th></tr></thead>"
-    + "<tbody>" + orderRowsHtml + "</tbody></table></div>"
+    + "<section aria-label=\"当天 LP 委托\"><h3>当天 LP 委托 <span class=\"sub\">· 北京时间 08:00 起</span></h3><div class=\"pm-table-wrap\"><table class=\"pm-table pm-lp-order-table\">"
+    + "<thead><tr><th scope=\"col\">标的</th><th scope=\"col\">委托与成交量</th><th scope=\"col\">LP 收益率（预计）</th><th scope=\"col\">压力损失（警戒线 10%）</th></tr></thead>"
+    + "<tbody>" + todayRowsHtml + "</tbody></table></div>"
+    + nonLpFootnote
     + "<p class=\"sub\">预计 LP 毛奖励；压力损失不含奖励抵扣；10% 是风险警告线。</p></section>"
     + "<section aria-label=\"推荐标的\"><h3>推荐标的 <span class=\"sub\">· "
     + escapeHtml(catalogStatus) + "</span></h3><div class=\"pm-table-wrap\"><table class=\"pm-table pm-lp-candidate-table\">"

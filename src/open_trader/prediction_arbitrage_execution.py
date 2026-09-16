@@ -66,6 +66,7 @@ LP_REWARD_PERCENTAGE_CACHE_SECONDS = 60.0
 LP_REWARD_SHARE_STALE_SECONDS = 180.0
 LP_REWARD_REFERENCE_PERCENTAGE = Decimal("5")
 _LP_REWARD_CACHE_SECONDS = 60.0
+_LP_TRADES_CACHE_SECONDS = 60.0
 
 _THRESHOLD_ERROR_HINTS = {
     "auth": "签名或钱包身份校验未通过",
@@ -193,6 +194,157 @@ def _lp_share_severity(value: Decimal) -> str:
     if value >= Decimal("7.5"):
         return "warning"
     return "normal"
+
+
+def _lp_reward_record_today(entry: object, reward_date: str) -> bool:
+    """True only when a market carries actual reward evidence for the date."""
+
+    if not isinstance(entry, Mapping) or str(entry.get("reward_date") or "") != reward_date:
+        return False
+    if entry.get("state") == "known":
+        return True
+    if _decimal(entry.get("market_amount")) is not None:
+        return True
+    if _decimal(entry.get("market_amount_raw")) is not None:
+        return True
+    accruals = entry.get("market_accruals_raw")
+    return isinstance(accruals, (list, tuple)) and bool(accruals)
+
+
+def _lp_market_reward_known(observation: object) -> bool:
+    """Market is paying rewards today per a complete stored observation."""
+
+    return (
+        isinstance(observation, Mapping) and observation.get("state") == "known"
+    )
+
+
+def _lp_market_reward_missing(
+    observation: object,
+    *,
+    day_start: datetime,
+    day_end: datetime,
+) -> bool:
+    """Complete reward-rate read found no reward market for the day.
+
+    The negative signal only counts when the observation was read inside the
+    current reward day (its ``checked_at``/``last_success_at`` falls on
+    ``[day_start, day_end)``); an older or undated read is unknown and must
+    fail open instead of excluding today's LP rows.
+    """
+
+    if not (
+        isinstance(observation, Mapping)
+        and observation.get("stale") is not True
+        and observation.get("reason") == "reward_market_missing"
+    ):
+        return False
+    for key in ("checked_at", "last_success_at"):
+        moment = _aware_datetime(observation.get(key))
+        if moment is not None and day_start <= moment < day_end:
+            return True
+    return False
+
+
+def _lp_aggregate_fills_by_order(
+    trades_by_market: Mapping[str, object],
+    *,
+    day_start: datetime,
+) -> dict[str, dict[str, object]]:
+    """Group one reward day's account fills by our order id.
+
+    The trades adapter keeps only maker orders provably ours, so maker fills
+    attribute ``matched_amount`` to each remaining maker order; only a trade
+    we placed as taker attributes its size to ``taker_order_id`` — when we
+    are the maker that id belongs to the counterparty and must never count.
+    Fills whose ``matched_at`` precedes ``day_start`` (the reward day's UTC
+    00:00, i.e. Beijing 08:00) do not participate in the aggregation.
+    """
+
+    fills: dict[str, dict[str, object]] = {}
+    for raw_condition, market_trades in trades_by_market.items():
+        condition_id = str(raw_condition or "")
+        if not condition_id or not isinstance(market_trades, (list, tuple)):
+            continue
+        for trade in market_trades:
+            if not isinstance(trade, Mapping):
+                continue
+            # FAILED trades never land on chain and must never become shown
+            # volume; landed-ness of the remaining statuses is decided by the
+            # settlement precedents upstream, not here.
+            if str(trade.get("status") or "").upper() == "FAILED":
+                continue
+            matched_at = _aware_datetime(trade.get("matched_at"))
+            if matched_at is None or matched_at < day_start:
+                continue
+            size = _decimal(trade.get("size"))
+            if size is None or size <= 0:
+                continue
+            price = _decimal(trade.get("price"))
+            trader_side = str(trade.get("trader_side") or "").upper()
+            taker_order_id = str(trade.get("taker_order_id") or "")
+            contributions: list[tuple[str, Decimal, str]] = []
+            if trader_side == "TAKER":
+                if taker_order_id:
+                    contributions.append(
+                        (taker_order_id, size, str(trade.get("side") or "").upper())
+                    )
+            else:
+                makers = trade.get("maker_orders")
+                for maker in makers if isinstance(makers, (list, tuple)) else ():
+                    if not isinstance(maker, Mapping):
+                        continue
+                    maker_id = str(maker.get("order_id") or "")
+                    if not maker_id:
+                        continue
+                    amount = _decimal(maker.get("matched_amount"))
+                    if amount is None or amount <= 0:
+                        amount = size
+                    contributions.append(
+                        (
+                            maker_id,
+                            amount,
+                            str(maker.get("side") or "").upper(),
+                        )
+                    )
+            for order_id, amount, side in contributions:
+                entry = fills.get(order_id)
+                if entry is None:
+                    entry = {
+                        "condition_id": condition_id,
+                        "token_id": str(trade.get("token_id") or ""),
+                        "side": side or None,
+                        "filled_quantity": Decimal("0"),
+                        "notional": Decimal("0"),
+                        "priced": False,
+                        "last_fill": matched_at,
+                    }
+                    fills[order_id] = entry
+                entry["filled_quantity"] = entry["filled_quantity"] + amount
+                if price is not None:
+                    entry["notional"] = entry["notional"] + amount * price
+                    entry["priced"] = True
+                if side:
+                    entry["side"] = side
+                if matched_at > entry["last_fill"]:
+                    entry["last_fill"] = matched_at
+    result: dict[str, dict[str, object]] = {}
+    for order_id, entry in fills.items():
+        filled_quantity = entry["filled_quantity"]
+        result[order_id] = {
+            "order_id": order_id,
+            "condition_id": entry["condition_id"],
+            "token_id": entry["token_id"],
+            "side": entry["side"],
+            "price": (
+                entry["notional"] / filled_quantity
+                if entry["priced"] and filled_quantity > 0
+                else None
+            ),
+            "filled_quantity": filled_quantity,
+            "last_fill_at": _timestamp(entry["last_fill"]),
+        }
+    return result
 
 def _aware_datetime(value: object) -> datetime | None:
     if isinstance(value, datetime):
@@ -447,6 +599,13 @@ class PredictionExecutionService:
         self._lp_reward_refresh_pending: dict[str, set[str]] = {}
         self._lp_reward_refresh_active: set[tuple[str, str]] = set()
         self._lp_reward_refresh_thread: threading.Thread | None = None
+        # 当天 LP 委托：按奖励日缓存的成交聚合（我方订单 id → 汇总成交量），
+        # 由后台刷新线程补全，lp_dashboard() 读取缓存做 fail-open 装配。
+        self._lp_orders_today_fills: dict[str, dict[str, dict[str, object]]] = {}
+        self._lp_orders_today_fills_complete: dict[str, bool] = {}
+        self._lp_orders_today_trades_read_at: dict[tuple[str, str], float] = {}
+        self._lp_orders_today_pending: dict[str, set[str]] = {}
+        self._lp_orders_today_refresh_thread: threading.Thread | None = None
         self._cross_venue_monitor: object | None = None
         self._notifier = notifier
         self._lock_path = Path(lock_path)
@@ -1020,10 +1179,75 @@ class PredictionExecutionService:
                     and callable(getattr(self._store, "lp_observations", None))
                     else {}
                 )
+                with self._lp_dashboard_lock:
+                    cached_fills = dict(
+                        self._lp_orders_today_fills.get(reward_date, {})
+                    )
+                lp_orders_today, non_lp_row_count, trade_condition_ids = (
+                    self._lp_orders_today_snapshot(
+                        orders=orders,
+                        positions=positions,
+                        observations=stored_observations,
+                        market_rewards=market_rewards,
+                        reward_date=reward_date,
+                        managed_order_ids=managed_ids,
+                        managed_token=managed_token,
+                    )
+                )
+                for order_id, fill in cached_fills.items():
+                    if any(
+                        str(row.get("order_id") or "") == order_id
+                        for row in lp_orders_today
+                    ):
+                        continue
+                    # Cached fills face the same explicit-negative gate as
+                    # snapshot rows; a market excluded as non-LP today must
+                    # not re-enter the table through its fills.
+                    if self._lp_market_explicitly_negative(
+                        str(fill.get("condition_id") or ""),
+                        observations=stored_observations,
+                        market_rewards=market_rewards,
+                        reward_date=reward_date,
+                    ):
+                        continue
+                    fill_managed = (
+                        str(order_id) in managed_ids
+                        or bool(managed_token)
+                        and str(fill.get("token_id") or "") == managed_token
+                    )
+                    lp_orders_today.append(
+                        {
+                            "order_id": order_id,
+                            "condition_id": fill.get("condition_id"),
+                            "market_id": fill.get("market_id"),
+                            "market_title": fill.get("market_title"),
+                            "market_url": fill.get("market_url"),
+                            "token_id": fill.get("token_id"),
+                            "outcome": fill.get("outcome"),
+                            "side": fill.get("side"),
+                            "status": "MATCHED",
+                            "price": fill.get("price"),
+                            "quantity": None,
+                            "filled_quantity": fill.get("filled_quantity"),
+                            "remaining_quantity": Decimal("0"),
+                            "last_fill_at": fill.get("last_fill_at"),
+                            "state": "filled",
+                            "scoring_status": "unknown",
+                            "scoring_checked_at": None,
+                            "management": (
+                                "system_managed"
+                                if fill_managed
+                                else "manual_read_only"
+                            ),
+                            "read_only": not fill_managed,
+                        }
+                    )
                 result = {
                     "state": "ready",
                     "orders": orders,
                     "positions": positions,
+                    "lp_orders_today": lp_orders_today,
+                    "non_lp_row_count": non_lp_row_count,
                     "candidates": candidates,
                     "recommendations": recommendations,
                     "reward_shares": reward_shares,
@@ -1066,6 +1290,9 @@ class PredictionExecutionService:
                 }
                 self._lp_dashboard_cache = result
                 self._schedule_lp_reward_refresh(reward_date, refresh_ids)
+                self._schedule_lp_orders_today_refresh(
+                    reward_date, trade_condition_ids
+                )
                 return result
             except Exception:
                 cached = self._lp_dashboard_cache
@@ -1075,6 +1302,8 @@ class PredictionExecutionService:
                     "state": "unknown",
                     "orders": [],
                     "positions": [],
+                    "lp_orders_today": [],
+                    "non_lp_row_count": None,
                     "candidates": [],
                     "recommendations": [],
                     "reward_shares": {},
@@ -1561,6 +1790,261 @@ class PredictionExecutionService:
             result[condition_id] = save_observation(account_id, condition_id, observation)
 
         return {"state": "ready", "checked_at": _timestamp(now), "observations": result}
+
+    def _lp_market_explicitly_negative(
+        self,
+        condition_id: str,
+        *,
+        observations: Mapping[str, object],
+        market_rewards: Mapping[str, object],
+        reward_date: str,
+    ) -> bool:
+        """Every LP signal explicitly negative for this market today.
+
+        Reused by the 当天 LP 委托 snapshot and by the cached-fill append so
+        both exclusions share one day-bounded negative signal.
+        """
+
+        observation = observations.get(condition_id)
+        day_start = datetime.fromisoformat(f"{reward_date}T00:00:00+00:00")
+        return _lp_market_reward_missing(
+            observation,
+            day_start=day_start,
+            day_end=day_start + timedelta(days=1),
+        ) and not (
+            _lp_reward_record_today(market_rewards.get(condition_id), reward_date)
+            or _lp_market_reward_known(observation)
+        )
+
+    def _lp_orders_today_snapshot(
+        self,
+        *,
+        orders: list[dict[str, object]],
+        positions: list[dict[str, object]],
+        observations: Mapping[str, object],
+        market_rewards: Mapping[str, object],
+        reward_date: str,
+        managed_order_ids: set[str],
+        managed_token: str,
+    ) -> tuple[list[dict[str, object]], int, tuple[str, ...]]:
+        """Assemble 当天 LP 委托 rows with fail-open LP attribution.
+
+        Open orders stay when any LP signal is positive or any signal is
+        unknown; a row is excluded only when every signal is explicitly
+        negative and the row is not managed by the LP session.  Positions
+        never become rows here; they only feed the non-LP counter.
+        """
+
+        def reward_record_today(condition_id: str) -> bool:
+            return _lp_reward_record_today(
+                market_rewards.get(condition_id), reward_date
+            )
+
+        def market_negative(condition_id: str) -> bool:
+            return self._lp_market_explicitly_negative(
+                condition_id,
+                observations=observations,
+                market_rewards=market_rewards,
+                reward_date=reward_date,
+            )
+
+        def row_positive(condition_id: str, scoring: object) -> bool:
+            observation = observations.get(condition_id)
+            return (
+                scoring is True
+                or _lp_market_reward_known(observation)
+                or reward_record_today(condition_id)
+            )
+
+        today_rows: list[dict[str, object]] = []
+        non_lp_rows = 0
+        for row in orders:
+            condition_id = str(row.get("condition_id") or "")
+            managed = str(row.get("order_id") or "") in managed_order_ids
+            scoring = row.get("scoring_status")
+            excluded = (
+                not managed
+                and not row_positive(condition_id, scoring)
+                and scoring is False
+                and market_negative(condition_id)
+            )
+            if excluded:
+                non_lp_rows += 1
+                continue
+            today_rows.append({**row, "state": "open", "last_fill_at": None})
+        for row in positions:
+            condition_id = str(row.get("condition_id") or "")
+            managed = bool(
+                managed_token and str(row.get("token_id") or "") == managed_token
+            )
+            if (
+                not managed
+                and not row_positive(condition_id, None)
+                and market_negative(condition_id)
+            ):
+                non_lp_rows += 1
+
+        trade_conditions = {
+            condition_id
+            for condition_id in market_rewards
+            if _lp_reward_record_today(market_rewards.get(condition_id), reward_date)
+        }
+        for condition_id, observation in observations.items():
+            if _lp_market_reward_known(observation):
+                trade_conditions.add(str(condition_id))
+                continue
+            exposure = _decimal(observation.get("exposure_quantity")) if isinstance(observation, Mapping) else None
+            stage = (
+                str(observation.get("stage") or "")
+                if isinstance(observation, Mapping)
+                else ""
+            )
+            if (exposure is not None and exposure > 0) or stage not in {"", "flat"}:
+                trade_conditions.add(str(condition_id))
+        return today_rows, non_lp_rows, tuple(sorted(trade_conditions))
+
+    def _schedule_lp_orders_today_refresh(
+        self, reward_date: str, condition_ids: tuple[str, ...]
+    ) -> None:
+        if not condition_ids:
+            return
+        now = self._clock()
+        with self._lp_dashboard_lock:
+            # TTL throttle: markets already read successfully within the
+            # window are not re-queued, so every dashboard poll does not hit
+            # the authenticated trades API for the whole market set.
+            read_at = self._lp_orders_today_trades_read_at
+            due = tuple(
+                condition_id
+                for condition_id in condition_ids
+                if now - read_at.get((reward_date, condition_id), float("-inf"))
+                >= _LP_TRADES_CACHE_SECONDS
+            )
+            if not due:
+                return
+            pending = self._lp_orders_today_pending.setdefault(reward_date, set())
+            pending.update(due)
+            running = self._lp_orders_today_refresh_thread
+            if running is not None and running.is_alive():
+                return
+            thread = threading.Thread(
+                target=self._refresh_lp_orders_today,
+                name="lp-orders-today-refresh",
+                daemon=True,
+            )
+            self._lp_orders_today_refresh_thread = thread
+        thread.start()
+
+    def _refresh_lp_orders_today(self) -> None:
+        try:
+            while True:
+                with self._lp_dashboard_lock:
+                    if not self._lp_orders_today_pending:
+                        if (
+                            self._lp_orders_today_refresh_thread
+                            is threading.current_thread()
+                        ):
+                            self._lp_orders_today_refresh_thread = None
+                        return
+                    reward_date, pending = next(
+                        iter(self._lp_orders_today_pending.items())
+                    )
+                    condition_ids = tuple(pending)
+                    self._lp_orders_today_pending.pop(reward_date, None)
+                try:
+                    self._refresh_lp_orders_today_batch(reward_date, condition_ids)
+                except Exception:
+                    pass
+        finally:
+            with self._lp_dashboard_lock:
+                if self._lp_orders_today_refresh_thread is threading.current_thread():
+                    self._lp_orders_today_refresh_thread = None
+
+    def _refresh_lp_orders_today_batch(
+        self, reward_date: str, condition_ids: tuple[str, ...]
+    ) -> None:
+        """Refresh one reward date's fill aggregation without blocking reads."""
+
+        reader = getattr(self._trading, "lp_account_trades", None)
+        if not callable(reader):
+            return
+        result = _call(reader, condition_ids)
+        if not isinstance(result, Mapping):
+            return
+        day_start = datetime.fromisoformat(f"{reward_date}T00:00:00+00:00")
+        raw_trades = result.get("trades")
+        fills = (
+            _lp_aggregate_fills_by_order(raw_trades, day_start=day_start)
+            if isinstance(raw_trades, Mapping)
+            else {}
+        )
+        fills = self._lp_enrich_fill_rows(fills)
+        with self._lp_dashboard_lock:
+            previous = self._lp_orders_today_fills.get(reward_date, {})
+            merged = {**previous, **fills}
+            self._lp_orders_today_fills.clear()
+            self._lp_orders_today_fills[reward_date] = merged
+            self._lp_orders_today_fills_complete[reward_date] = (
+                result.get("complete") is True
+            )
+            # Record per-market read success so the TTL throttle only skips
+            # markets whose trades were actually read back.
+            if isinstance(raw_trades, Mapping):
+                read_at = self._lp_orders_today_trades_read_at
+                for stale_key in [
+                    key for key in read_at if key[0] != reward_date
+                ]:
+                    del read_at[stale_key]
+                now = self._clock()
+                for condition_id in condition_ids:
+                    if condition_id in raw_trades:
+                        read_at[(reward_date, condition_id)] = now
+
+    def _lp_enrich_fill_rows(
+        self, fills: dict[str, dict[str, object]]
+    ) -> dict[str, dict[str, object]]:
+        """Best-effort market metadata for orders that already left the book."""
+
+        missing = tuple(
+            dict.fromkeys(
+                str(fill.get("condition_id") or "")
+                for fill in fills.values()
+                if fill.get("condition_id")
+                and (not fill.get("market_title") or not fill.get("outcome"))
+            )
+        )
+        if not missing:
+            return fills
+        metadata_reader = getattr(self._trading, "lp_market_metadata", None)
+        if not callable(metadata_reader):
+            return fills
+        try:
+            metadata = _call(metadata_reader, missing)
+        except Exception:
+            return fills
+        if not isinstance(metadata, Mapping):
+            return fills
+        for fill in fills.values():
+            market = metadata.get(str(fill.get("condition_id") or ""))
+            if isinstance(market, Mapping):
+                for key in ("market_id", "market_title", "market_url"):
+                    if not fill.get(key) and market.get(key) is not None:
+                        fill[key] = market.get(key)
+                # Resolve the traded outcome from the metadata outcome map so
+                # filled rows render their real outcome instead of UNKNOWN.
+                if not fill.get("outcome"):
+                    token_id = str(fill.get("token_id") or "")
+                    outcomes = market.get("outcomes")
+                    if token_id and isinstance(outcomes, Mapping):
+                        for outcome in outcomes.values():
+                            if (
+                                isinstance(outcome, Mapping)
+                                and str(outcome.get("token_id") or "") == token_id
+                                and outcome.get("label") is not None
+                            ):
+                                fill["outcome"] = outcome.get("label")
+                                break
+        return fills
 
     def _lp_reward_cache_snapshot(
         self,

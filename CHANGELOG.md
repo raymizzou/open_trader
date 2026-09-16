@@ -3,6 +3,25 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-09-17
+
+- The LP dashboard's "我的订单与持仓" block was replaced by "当天 LP 委托"（北京时间
+  08:00 起，即当前 UTC 奖励日）：只显示归属为 LP 的委托——未成交（含部分成交）与
+  已成交（含全量成交后已离开挂单列表的订单，按当天成交聚合并标注最新成交时间），
+  每行带成交量；非 LP 订单/持仓不再逐行展示，仅在表底显示一行非 LP 计数注脚。
+  归属沿用三信号（官方计分、当天发奖励、当天奖励记录），全部明确否定才排除，
+  判不出时保留（fail-open）；`orders`/`positions` 载荷逐字段不变，风控与推荐排除
+  不受影响。新增只读 `lp_account_trades` 适配器按市场读取当天成交，由后台线程
+  异步刷新并按奖励日缓存，读取本身不等待。评审修复后：成交归属只计本钱包的
+  maker 订单（对手方 taker 订单与归属不明行不计入），FAILED 成交不计入成交量；
+  「当日无奖励市场」的否定观察只在观察时间落在当前奖励日内才排除行，昨日观察
+  按 fail-open 保留；缓存成交行与挂单行走同一明确否定门并按系统会话标注归属；
+  成交重读按市场加 60 秒 TTL 节流，不再每次装配全量重打鉴权 API；已成交行的
+  outcome 按市场元数据解析，解不出保持 UNKNOWN。Verified by the focused LP runtime,
+  service, HTTP-projection and Dashboard RED/GREEN cases plus the full
+  `make test` and `make candidate-acceptance` gates; no live calls, orders or
+  deployment were performed.
+
 ## 2026-09-16
 
 - Removed Production Smoke's pre-deploy submission-baseline comparison and

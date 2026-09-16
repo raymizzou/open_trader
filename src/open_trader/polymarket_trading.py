@@ -716,11 +716,32 @@ def _lp_maker_order(value: object) -> dict[str, object] | None:
         "order_id": str(order_id),
         "token_id": str(token_id),
         "asset_id": str(token_id),
+        "maker_address": row.get("maker_address"),
+        "owner": row.get("owner"),
         "side": str(row.get("side", "")).upper(),
         "price": _lp_decimal(row.get("price")),
         "matched_amount": _lp_decimal(row.get("matched_amount", row.get("size"))),
         "fee_rate_bps": _lp_decimal(row.get("fee_rate_bps")),
     }
+
+
+def _lp_maker_order_is_self(row: object, wallet_address: object) -> bool:
+    """True only when a maker row provably belongs to our wallet.
+
+    Rows without a usable maker address/owner cannot be attributed and are
+    treated as foreign: missing volume is safer than misattributed volume.
+    """
+
+    target = str(wallet_address or "").strip().lower()
+    if not target:
+        return False
+    if not isinstance(row, Mapping):
+        return False
+    for key in ("maker_address", "owner"):
+        value = str(row.get(key) or "").strip().lower()
+        if value and value == target:
+            return True
+    return False
 
 
 def _lp_trade(value: object) -> dict[str, object] | None:
@@ -1042,6 +1063,86 @@ class PolymarketTradingClient:
             "checked_at": checked_at,
             "open_orders_complete": open_orders_complete,
             "positions_complete": positions_complete,
+        }
+
+    def lp_account_trades(
+        self,
+        condition_ids: Sequence[str],
+        *,
+        stop_event: threading.Event | None = None,
+    ) -> dict[str, object]:
+        """Read per-market account trades with conservative completeness.
+
+        One authenticated call per requested market; markets whose read fails
+        are absent from ``trades`` and flip ``complete`` to False so callers
+        can fail open instead of trusting a partial day.
+        """
+
+        requested = tuple(
+            dict.fromkeys(
+                value.strip()
+                for value in condition_ids
+                if isinstance(value, str) and value.strip()
+            )
+        )
+        checked_at = datetime.now(UTC)
+        if not requested or (stop_event is not None and stop_event.is_set()):
+            return {
+                "state": "unknown",
+                "complete": False,
+                "checked_at": checked_at,
+                "trades": {},
+            }
+        trades: dict[str, tuple[dict[str, object], ...]] = {}
+        complete = True
+        wallet = str(getattr(self.config, "wallet_address", "") or "")
+
+        def read_market(condition_id: str) -> tuple[object, ...]:
+            if stop_event is not None and stop_event.is_set():
+                return ()
+            return _collect(self._client.list_account_trades(market=condition_id))
+
+        with ThreadPoolExecutor(max_workers=min(8, len(requested))) as pool:
+            futures = [
+                (condition_id, pool.submit(read_market, condition_id))
+                for condition_id in requested
+            ]
+            for condition_id, future in futures:
+                try:
+                    rows = future.result()
+                except Exception:
+                    complete = False
+                    continue
+                normalized: list[dict[str, object]] = []
+                for row in rows:
+                    trade = _lp_trade(row)
+                    if trade is None:
+                        complete = False
+                        continue
+                    # One trade row lists every maker it filled; keep only
+                    # maker orders provably ours so aggregation cannot count
+                    # foreign or unattributable fills as our volume.
+                    makers = trade.get("maker_orders")
+                    if isinstance(makers, list):
+                        trade["maker_orders"] = [
+                            maker
+                            for maker in makers
+                            if _lp_maker_order_is_self(maker, wallet)
+                        ]
+                    normalized.append(trade)
+                trades[condition_id] = tuple(normalized)
+        if stop_event is not None and stop_event.is_set():
+            return {
+                "state": "unknown",
+                "complete": False,
+                "checked_at": checked_at,
+                "trades": {},
+            }
+        return {
+            "state": "known" if complete else "unknown",
+            "complete": complete,
+            "checked_at": checked_at,
+            "trades": trades,
         }
 
     def lp_market_metadata(
