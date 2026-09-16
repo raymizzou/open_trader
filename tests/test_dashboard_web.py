@@ -79,11 +79,16 @@ def test_acceptance_gate_is_backend_only_and_production_smoke_owns_playwright() 
     assert '$(REPOSITORY_ROOT)/node_modules/.bin/playwright" test tests/e2e/production-smoke.spec.ts' in production_smoke
 
 
-def test_production_smoke_blocks_unsafe_requests_and_rechecks_submission_state() -> None:
+def test_production_smoke_blocks_unsafe_requests_without_submission_baseline() -> None:
     repo_root = Path(__file__).resolve().parents[1]
-    makefile = (repo_root / "Makefile").read_text(encoding="utf-8")
-    production_smoke = makefile.split("\nproduction-smoke:\n", 1)[1]
-    normalized = " ".join(re.sub(r"\\\s*\n", " ", production_smoke).split())
+    smoke_plan = subprocess.run(
+        ["make", "-n", "production-smoke"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    normalized = " ".join(re.sub(r"\\\s*\n", " ", smoke_plan).split())
     smoke = (repo_root / "tests/e2e/production-smoke.spec.ts").read_text(
         encoding="utf-8"
     )
@@ -93,30 +98,24 @@ def test_production_smoke_blocks_unsafe_requests_and_rechecks_submission_state()
     guard_start = smoke.find("page.route('**/*'")
     goto_start = smoke.find("page.goto")
     route_guard = smoke[guard_start:goto_start] if guard_start >= 0 and goto_start >= 0 else ""
-    post_browser_state = re.search(
-        r'(\w+)="\$\$\(curl -fsS --max-time 10 "http://127\.0\.0\.1:8769/api/prediction-arbitrage/state',
-        normalized[browser_position:],
-    )
-    post_browser_state_position = (
-        browser_position + post_browser_state.start()
-        if post_browser_state
-        else -1
-    )
-    post_browser_call = (
-        f'if submission_baseline_matches "$${post_browser_state.group(1)}"; then'
-        if post_browser_state
-        else ""
-    )
-    call_positions = [
+    state_reads = [
         match.start()
-        for match in re.finditer(r"\bsubmission_baseline_matches \"", normalized)
+        for match in re.finditer(
+            r'curl -fsS --max-time 10 "http://127\.0\.0\.1:8769/api/prediction-arbitrage/state',
+            normalized,
+        )
     ]
-    post_browser_call_position = (
-        normalized.find(post_browser_call.removeprefix("if "), post_browser_state_position)
-        if post_browser_call
-        else -1
-    )
     required = (
+        "PRE_DEPLOY_SUBMISSION_BASELINE" not in normalized,
+        "baseline" not in normalized,
+        "current_execution" not in normalized,
+        "last_execution" not in normalized,
+        "current execution:" not in normalized,
+        "submission_baseline_matches" not in normalized,
+        len(state_reads) == 1,
+        state_reads[0] < browser_position if state_reads else False,
+        'n_leg.get("contract_generation")==2' in normalized,
+        'scope.get("capability")=="OBSERVE_ONLY"' in normalized,
         "page.route('**/*'" in smoke,
         guard_start < goto_start,
         all(method in route_guard for method in ("GET", "HEAD", "OPTIONS")),
@@ -127,17 +126,6 @@ def test_production_smoke_blocks_unsafe_requests_and_rechecks_submission_state()
         < route_guard.find("unsafeMethods.push(method)")
         < route_guard.find("route.abort('blockedbyclient')"),
         "expect(unsafeMethods).toEqual([])" in smoke,
-        "submission_baseline_matches()" in normalized,
-        len(call_positions) == 2,
-        call_positions[0] < browser_position < call_positions[1],
-        post_browser_state is not None,
-        post_browser_state_position >= browser_position,
-        post_browser_state_position < post_browser_call_position == call_positions[1],
-        'keys=("current_execution", "last_execution")' in normalized,
-        '("execution_id", "id", "status", "state", "result", "order_ids", "legs")'
-        in normalized,
-        "else echo \"submission baseline: BLOCKED\"; status=1; fi"
-        in normalized[call_positions[1]:],
     )
     assert all(required)
 

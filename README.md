@@ -192,37 +192,30 @@ Use four explicit stages; a local merge is not a deployment:
    regressions. A missing runner/browser yields `BLOCKED`; the gate ends with
    `READY` or `BLOCKED` and never prints secrets.
 4. **Exact-SHA deploy and Smoke** — after Host Readiness is `READY` and explicit deployment authorization,
-   capture the pre-deploy submission state and deploy the exact accepted SHA
-   using the existing release runbook. Then run the read-only smoke check. It
-   first validates the exact immutable checkout and captured submission
-   baseline, then runs the five marked host-Python browser prerequisites. It
-   next checks health, PID/listener, cwd, submission baseline, and logs; only
-   if those runtime checks remain clean does it run the host-only Playwright
-   check with
+   deploy the exact accepted SHA using the existing release runbook. Then run
+   the read-only smoke check. It first validates the exact immutable checkout,
+   then runs the five marked host-Python browser prerequisites. It next checks
+   health, PID/listener, cwd, N_LEG state, and logs; only if those runtime
+   checks remain clean does it run the host-only Playwright check with
    `OPEN_TRADER_SMOKE_URL="$DASHBOARD_URL"` against
    `tests/e2e/production-smoke.spec.ts`:
 
    ```bash
-   curl -fsS http://127.0.0.1:8769/api/prediction-arbitrage/state |
-     .venv/bin/python -c 'import json,sys; p=json.load(sys.stdin); print(json.dumps({k:p.get(k) for k in ("current_execution","last_execution")}, sort_keys=True))' \
-     > /tmp/open-trader-submission-baseline.json
-
    make production-smoke \
      EXPECTED_SHA="$ACCEPTED_SHA" \
      EXPECTED_ROOT=/absolute/path/to/immutable-detached-release \
-     EXPECTED_RUNTIME_ROOT=/absolute/path/to/shared-runtime \
-     PRE_DEPLOY_SUBMISSION_BASELINE=/tmp/open-trader-submission-baseline.json
+     EXPECTED_RUNTIME_ROOT=/absolute/path/to/shared-runtime
    ```
 
    `production-smoke` requires the exact 40-hex SHA, an absolute clean detached
-   checkout, an existing absolute shared runtime root, and that captured
-   baseline. It runs the host tests and Playwright spec from the validated
-   release root, reads the prediction error log from the shared runtime root,
-   blocks browser write requests before navigation, and rechecks the submission
-   baseline after Playwright. It only reads health, process/listener, log,
-   current-execution, and deployed UI evidence and ends with `HEALTHY` or
-   `ROLLBACK`; a browser failure sets `ROLLBACK`. It never starts the fixture
-   server, downloads a browser, deploys, restarts, rolls back, or submits.
+   checkout, and an existing absolute shared runtime root. It runs the host
+   tests and Playwright spec from the validated release root, reads the
+   prediction error log from the shared runtime root, blocks browser write
+   requests before navigation, and checks the N_LEG state contract. It only
+   reads health, process/listener, log, N_LEG state, and deployed UI evidence
+   and ends with `HEALTHY` or `ROLLBACK`; a browser failure sets `ROLLBACK`.
+   It never starts the fixture server, downloads a browser, deploys, restarts,
+   rolls back, or submits.
 
 Before the first deployment, production must be moved once—manually—to a clean,
 immutable detached release checkout (for example, a checkout created at the

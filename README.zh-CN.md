@@ -219,32 +219,26 @@ watchlist 使用市场、标的和 Trend Animals 业务标识：
    但不会下载或安装任何内容；同时用 host Python Playwright 以
    `channel='chrome'` 启动并关闭系统 Chrome，验证五个标记的 Python 浏览器回归用例所需的
    浏览器。runner 或浏览器缺失即为 `BLOCKED`，最后输出 `READY` 或 `BLOCKED`，不会输出密钥。
-4. **精确 SHA 部署与 Smoke**：获得明确部署授权后，先保存提交基线，再按既有发布
-   runbook 部署完全相同的 accepted SHA，随后运行只读检查。它先核对 exact immutable
-   checkout 和已捕获的提交基线，然后运行五个标记的 host-Python 浏览器前置回归；接着
-   检查 health、PID/监听器、工作目录、提交基线和日志；只有这些运行时检查仍保持 clean，
-   才用
+4. **精确 SHA 部署与 Smoke**：获得明确部署授权后，按既有发布 runbook 部署完全相同的
+   accepted SHA，随后运行只读检查。它先核对 exact immutable checkout，然后运行五个标记的
+   host-Python 浏览器前置回归；接着检查 health、PID/监听器、工作目录、N_LEG 状态和日志；
+   只有这些运行时检查仍保持 clean，才用
    `OPEN_TRADER_SMOKE_URL="$DASHBOARD_URL"` 调用宿主机已有的 Playwright runner，且只运行
    `tests/e2e/production-smoke.spec.ts`：
 
    ```bash
-   curl -fsS http://127.0.0.1:8769/api/prediction-arbitrage/state |
-     .venv/bin/python -c 'import json,sys; p=json.load(sys.stdin); print(json.dumps({k:p.get(k) for k in ("current_execution","last_execution")}, sort_keys=True))' \
-     > /tmp/open-trader-submission-baseline.json
-
    make production-smoke \
      EXPECTED_SHA="$ACCEPTED_SHA" \
      EXPECTED_ROOT=/absolute/path/to/immutable-detached-release \
-     EXPECTED_RUNTIME_ROOT=/absolute/path/to/shared-runtime \
-     PRE_DEPLOY_SUBMISSION_BASELINE=/tmp/open-trader-submission-baseline.json
+     EXPECTED_RUNTIME_ROOT=/absolute/path/to/shared-runtime
    ```
 
    `production-smoke` 强制要求 40 位十六进制 SHA、绝对路径的 clean detached immutable
-   checkout、已存在的绝对路径 shared runtime root，以及明确捕获的提交基线；host 测试和
-   Playwright spec 都从已验证的 release root 运行，prediction 错误日志从 shared runtime root
-   读取；浏览器导航前阻断写请求，Playwright 后再次核对提交基线。它读取 health、进程/监听器、
-   日志、当前执行和已部署 UI 证据，最后输出 `HEALTHY` 或 `ROLLBACK`；浏览器失败即为
-   `ROLLBACK`。它不会启动 fixture server、下载浏览器、部署、重启、回滚或下单。
+   checkout 和已存在的绝对路径 shared runtime root；host 测试和 Playwright spec 都从已验证的
+   release root 运行，prediction 错误日志从 shared runtime root 读取；浏览器导航前阻断写请求，
+   并检查 N_LEG 状态契约。它读取 health、进程/监听器、日志、N_LEG 状态和已部署 UI 证据，最后
+   输出 `HEALTHY` 或 `ROLLBACK`；浏览器失败即为 `ROLLBACK`。它不会启动 fixture server、下载
+   浏览器、部署、重启、回滚或下单。
 
 首次部署前，生产必须由人工一次性迁移到 clean、immutable 的 detached release
 checkout（例如在 accepted SHA 创建的 checkout）。这项一次性迁移是必需的，但不由
@@ -608,21 +602,19 @@ Chrome 回归用例由 macOS Smoke 的 `-m browser` 阶段负责。
 
 第一次部署前，生产必须由人工一次性迁移到 clean、immutable 的 detached release
 checkout；该迁移不是本任务或任何 Make 目标执行的动作。明确授权后只部署
-Candidate 通过的精确 SHA，并先保存 `current_execution`/`last_execution` 的脱敏
-提交基线，再执行：
+Candidate 通过的精确 SHA，再执行：
 
 ```bash
 make production-smoke \
   EXPECTED_SHA="$ACCEPTED_SHA" \
   EXPECTED_ROOT=/absolute/path/to/immutable-detached-release \
-  EXPECTED_RUNTIME_ROOT=/absolute/path/to/shared-runtime \
-  PRE_DEPLOY_SUBMISSION_BASELINE=/tmp/open-trader-submission-baseline.json
+  EXPECTED_RUNTIME_ROOT=/absolute/path/to/shared-runtime
 ```
 
 Production Smoke 要求已存在的绝对路径 shared runtime root；host 测试和 Playwright 从验证过的
 release root 运行，prediction 错误日志从 shared runtime root 读取，浏览器写请求会在导航前被阻断，
-并在 Playwright 后重新核对提交基线。它只读取 health、进程/监听器、日志和当前执行证据，最后输出
-`HEALTHY` 或 `ROLLBACK`；它不会部署、重启、回滚或下单。
+并检查 N_LEG 状态契约。它只读取 health、进程/监听器、日志、N_LEG 状态和已部署 UI 证据，最后
+输出 `HEALTHY` 或 `ROLLBACK`；它不会部署、重启、回滚或下单。
 
 也可以用结构化检查确认 API 和 SOXX 决策事实是否存在：
 

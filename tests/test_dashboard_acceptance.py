@@ -1148,7 +1148,7 @@ def test_production_smoke_checks_each_runtime_log_and_health_boundary() -> None:
     assert 'check_health "account health"' in makefile
     assert 'check_health "prediction health"' in makefile
     assert 'OPEN_TRADER_SMOKE_URL="$(DASHBOARD_URL)"' in makefile
-    assert "PRE_DEPLOY_SUBMISSION_BASELINE" in makefile
+    assert "PRE_DEPLOY_SUBMISSION_BASELINE" not in makefile
     assert "--legacy-url" not in makefile
     assert "--legacy-log" not in makefile
     assert "--account-log" not in makefile

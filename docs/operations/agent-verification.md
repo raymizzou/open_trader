@@ -38,12 +38,12 @@ SHA named by its gate.
   runner with cached Chromium. A missing host runner or browser is `BLOCKED`.
   A slow or unavailable business-state response from the old running
   Prediction instance does not block replacing that instance. Ownership and
-  handoff plus a reliable submission baseline remain required before
-  deployment; Production Smoke verifies the new instance after deployment.
+  handoff remain required before deployment; Production Smoke verifies the new
+  instance after deployment.
 - The exact Smoke command is:
 
   ```sh
-  make production-smoke EXPECTED_SHA=<40hex> EXPECTED_ROOT=<absolute immutable checkout> EXPECTED_RUNTIME_ROOT=/absolute/path/to/shared-runtime PRE_DEPLOY_SUBMISSION_BASELINE=<captured JSON>
+  make production-smoke EXPECTED_SHA=<40hex> EXPECTED_ROOT=<absolute immutable checkout> EXPECTED_RUNTIME_ROOT=/absolute/path/to/shared-runtime
   ```
 
   It must end with `HEALTHY` or `ROLLBACK`. `make production-smoke` first runs
@@ -51,9 +51,9 @@ SHA named by its gate.
   runner against `tests/e2e/production-smoke.spec.ts` from the validated
   release root; both runs use that validated release root. The prediction
   error log comes from the shared runtime root. The browser blocks
-  non-read-only requests before navigation and checks the submission baseline
-  again afterward. Smoke never downloads a browser or starts the fixture
-  server.
+  non-read-only requests before navigation. Smoke checks the N_LEG state
+  contract before the browser run and never downloads a browser or starts the
+  fixture server.
 - `make acceptance` is the non-mutating Docker Candidate Acceptance alias. It
   never installs launchd, performs an outage check, reads production, or
   submits orders.
@@ -77,12 +77,11 @@ timestamped logs before claiming that live behavior changed.
 
 Before the first deployment, manually move production once to a clean,
 immutable detached release checkout. `make`, acceptance, readiness, and Smoke
-never perform that migration. Before explicit deployment authorization,
-capture a redacted `current_execution`/`last_execution` JSON baseline. Deploy
+never perform that migration. Before explicit deployment authorization, deploy
 only the exact Candidate-accepted SHA using the existing release runbook, then
-run Smoke against that detached checkout. Smoke reads health, process/listener,
-logs, and current-execution evidence; it never deploys, restarts, rolls back,
-or submits. `ROLLBACK` is evidence only.
+run Smoke against that detached checkout. Smoke reads health,
+process/listener, logs, N_LEG state, and browser evidence; it never deploys,
+restarts, rolls back, or submits. `ROLLBACK` is evidence only.
 
 Candidate `FAIL` or Host `BLOCKED` blocks deployment. For a Candidate failure,
 first complete one read-only audit of every reported error and its downstream

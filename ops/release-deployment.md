@@ -1,6 +1,6 @@
 # 发布部署清单(新 SHA 上生产)
 
-本清单把"新 SHA 发布到本机 launchd 生产"固定为五步。每一步都以仓库现成的
+本清单把"新 SHA 发布到本机 launchd 生产"固定为四步。每一步都以仓库现成的
 install 脚本为准;任何一步失败即停止,不要临场发明替代做法。
 
 背景:#110(2026-09-02)部署事故中,有人用 PlistBuddy 按下标手工改
@@ -19,7 +19,7 @@ install 脚本为准;任何一步失败即停止,不要临场发明替代做法�
 > 必须同时指向同一发布目录的键**,逐项手改极易漏改其中之一,造成"服务跑旧代码、
 > 冒烟全绿"的假部署(#110/#113)。核对 plist 只读,不手改。
 
-## 五步发布流程
+## 四步发布流程
 
 以下记号:`<SHA>` 为待发布 40 位 commit SHA;`<新发布>` 为不可变发布目录;
 `<运行时根>` 为共享运行时根(数据/配置所在,跨发布不变)。
@@ -36,21 +36,7 @@ git rev-parse HEAD                              # 必须等于 <SHA>
 
 发布目录一经建好即为不可变:后续所有步骤只读它,不再有任何写操作。
 
-### 第 2 步:捕获部署前基线 JSON
-
-正式 install 脚本可能重启服务,因此必须先捕获基线。在部署动作(bootout/bootstrap)之前,
-从当前 Prediction 只读状态接口导出
-`current_execution`/`last_execution` 基线并妥善保存(脱敏后归档):
-
-```bash
-curl -fsS http://127.0.0.1:8769/api/prediction-arbitrage/state \
-  | python3 -m json.tool > <基线文件>.json
-```
-
-第 5 步的 `PRE_DEPLOY_SUBMISSION_BASELINE` 指向该文件;冒烟会在浏览器压测前后
-各比对一次,防止发布窗口内发生计划外提交。
-
-### 第 3 步:按序运行 install 脚本,把五个服务指到新发布
+### 第 2 步:按序运行 install 脚本,把五个服务指到新发布
 
 每个脚本先 `--dry-run` 核对输出,确认无误后去掉 `--dry-run` 正式执行。
 以脚本实际参数为准(先读脚本 usage);不要凭记忆抄参数。
@@ -117,7 +103,7 @@ curl -fsS http://127.0.0.1:8769/api/prediction-arbitrage/state \
 install 脚本会从 `<新发布>/ops/launchd/*.plist.template` 整体重写
 `~/Library/LaunchAgents` 下的 plist——这正是红线所要求的唯一改法。
 
-### 第 4 步:bootout / bootstrap 五个服务
+### 第 3 步:bootout / bootstrap 五个服务
 
 install 脚本自身会完成停止/重启与 health 等待;只有当某个服务需要显式重启时,
 才手工执行(标签以 plist 内 `Label` 为准):
@@ -131,14 +117,13 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<label>.plist
 - Prediction Service 首次拉起会预热大库,health 从启动到 `running` 约需
   35-60 秒;不要在此期间判定失败。
 
-### 第 5 步:Production Smoke 绑定新发布验证
+### 第 4 步:Production Smoke 绑定新发布验证
 
 ```bash
 make production-smoke \
   EXPECTED_SHA=<SHA> \
   EXPECTED_ROOT=<新发布> \
-  EXPECTED_RUNTIME_ROOT=<运行时根> \
-  PRE_DEPLOY_SUBMISSION_BASELINE=<基线文件>.json
+  EXPECTED_RUNTIME_ROOT=<运行时根>
 ```
 
 必须以 `HEALTHY` 收尾。冒烟会逐一核对四个服务的 `/healthz`:除既有的

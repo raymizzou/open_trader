@@ -5,6 +5,14 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-16
 
+- Removed Production Smoke's pre-deploy submission-baseline comparison and
+  dependent runtime-log timestamp check. The command now retains exact release
+  identity, health/process/listener/root checks, one N_LEG state read, log
+  existence/error scanning, and read-only browser request interception without
+  a baseline argument. Verified by the four focused contract tests,
+  `make -n production-smoke | sh -n`, `git diff --check`, and stale-instruction
+  search; no deployment or live calls were performed.
+
 - Added the read-only official Rewards-page percentage to the existing LP table:
   recommendations show a conditional 5% reference estimate from a known
   nonnegative daily pool, while account rows show the actual market share,
