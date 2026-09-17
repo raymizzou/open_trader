@@ -3631,6 +3631,7 @@ class _LpMetadataProbe:
         self.market_rows: dict[str, object] = {}
         self.event_rows: dict[str, object] = {}
         self.fail_market_reads = False
+        self.market_error: BaseException | None = None
         self.fail_event_reads: set[str] = set()
         self.fail_direct_events: set[str] = set()
 
@@ -3654,6 +3655,9 @@ class _LpMetadataProbe:
                 with probe.lock:
                     probe.market_queries.append((requested_ids, page_size))
                     failing = probe.fail_market_reads
+                    error = probe.market_error
+                if error is not None:
+                    raise error
                 if failing:
                     raise RuntimeError("market read failed")
                 assert page_size == 100
@@ -3700,6 +3704,110 @@ class _LpMetadataProbe:
                 self.closed = True
 
         return _ProbePublicClient
+
+
+def test_lp_metadata_logs_redacted_transport_cause(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import httpx
+    from polymarket.errors import TransportError
+
+    probe = _LpMetadataProbe()
+    condition_id = "0x" + "d" * 64
+    request_url = "https://private-sentinel.invalid/market?token=secret"
+
+    def transport_failure() -> TransportError:
+        try:
+            raise httpx.ReadTimeout(
+                "read timeout private sentinel",
+                request=httpx.Request("GET", request_url),
+            )
+        except httpx.ReadTimeout as cause:
+            try:
+                raise TransportError("transport private sentinel") from cause
+            except TransportError as error:
+                return error
+        raise AssertionError("unreachable")
+
+    transport_error = transport_failure()
+    probe.market_error = transport_error
+    adapter = _lp_cache_adapter(probe)
+
+    result = adapter.lp_market_metadata_batch((condition_id,))
+
+    assert result["markets"] == {}
+    assert result["confirmed_absent_ids"] == ()
+    assert result["failed_ids"] == {condition_id: "market_read_TransportError"}
+    assert result["state"] == "unknown"
+    warning_records = [
+        record
+        for record in caplog.records
+        if record.name == polymarket_trading.__name__
+    ]
+    assert any(
+        "stage=market" in record.getMessage()
+        and "TransportError" in record.getMessage()
+        and "ReadTimeout" in record.getMessage()
+        for record in warning_records
+    )
+    assert all(
+        "private-sentinel" not in record.getMessage()
+        and "private sentinel" not in record.getMessage()
+        and request_url not in record.getMessage()
+        and record.exc_info is None
+        and record.exc_text is None
+        and not any(
+            isinstance(argument, BaseException)
+            for argument in (
+                record.args if isinstance(record.args, tuple) else ()
+            )
+        )
+        for record in warning_records
+    )
+
+
+def test_lp_metadata_logs_redacted_rejection_status(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import httpx
+    from polymarket.errors import RequestRejectedError
+
+    probe = _LpMetadataProbe()
+    condition_id = "0x" + "e" * 64
+    request_url = "https://private-sentinel.invalid/rejected?token=secret"
+    rejection = RequestRejectedError("rejection private sentinel", status=400)
+    rejection.request = httpx.Request("GET", request_url)
+    probe.market_error = rejection
+    adapter = _lp_cache_adapter(probe)
+
+    result = adapter.lp_market_metadata_batch((condition_id,))
+
+    assert result["markets"] == {}
+    assert result["confirmed_absent_ids"] == ()
+    assert result["failed_ids"] == {
+        condition_id: "market_read_RequestRejectedError"
+    }
+    assert result["state"] == "unknown"
+    warning_records = [
+        record
+        for record in caplog.records
+        if record.name == polymarket_trading.__name__
+    ]
+    assert any("status=400" in record.getMessage() for record in warning_records)
+    assert all(
+        "private-sentinel" not in record.getMessage()
+        and "private sentinel" not in record.getMessage()
+        and request_url not in record.getMessage()
+        and record.exc_info is None
+        and record.exc_text is None
+        and not any(
+            isinstance(argument, BaseException)
+            for argument in (
+                record.args if isinstance(record.args, tuple) else ()
+            )
+        )
+        for record in warning_records
+    )
 
 
 def _lp_cache_market(condition_id: str, *, slug: str) -> object:

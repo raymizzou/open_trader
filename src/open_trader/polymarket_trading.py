@@ -447,6 +447,28 @@ def _safe_error_code(exc: BaseException) -> str:
 def _safe_read_failure(stage: str, exc: BaseException) -> str:
     """Identify a failed read without retaining exception details."""
 
+    error_types: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    status: int | None = None
+    for _ in range(8):
+        if current is None or id(current) in seen:
+            break
+        seen.add(id(current))
+        error_types.append(type(current).__name__)
+        if status is None and type(getattr(current, "status", None)) is int:
+            status = cast(int, getattr(current, "status"))
+        cause = current.__cause__
+        if cause is None and not current.__suppress_context__:
+            cause = current.__context__
+        current = cause if isinstance(cause, BaseException) else None
+    status_detail = f" status={status}" if status is not None else ""
+    logger.warning(
+        "lp_metadata_read_failed stage=%s error_types=%s%s",
+        stage,
+        ">".join(error_types) or "unknown",
+        status_detail,
+    )
     return f"{stage}_read_{type(exc).__name__}"
 
 

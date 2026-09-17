@@ -5,6 +5,11 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-18
 
+- LP metadata read failures now log redacted stage, exception type-chain and
+  integer SDK rejection status diagnostics while preserving failure codes and
+  the existing retry policy. Verified by the two focused selectors and the
+  affected metadata regression batch; no live calls, retries or deployment.
+
 - LP preparation now persists its progress and attempt budget: history failures
   receive one five-minute retry, repeated failure pauses with one alert, and
   the existing manual recovery route can resume it. Metadata warmup continues
