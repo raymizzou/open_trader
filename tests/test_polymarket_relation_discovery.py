@@ -732,6 +732,50 @@ def select_provider(db: PredictionArbitrageStore, provider: str) -> None:
     assert db.get_llm_provider() == provider
 
 
+class ExplodingBookkeepingStore:
+    """Delegates everything except the LLM bookkeeping writes, which fail."""
+
+    def __init__(self, store: PredictionArbitrageStore) -> None:
+        self._store = store
+
+    def record_llm_call(self, **_kwargs: object) -> None:
+        import sqlite3
+
+        raise sqlite3.OperationalError("database is locked")
+
+    def save_llm_cache(self, *_args: object, **_kwargs: object) -> None:
+        import sqlite3
+
+        raise sqlite3.OperationalError("database is locked")
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._store, name)
+
+
+def test_validate_survives_store_bookkeeping_write_failures(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    validator = LlmRelationValidator(
+        ExplodingBookkeepingStore(codex_store(tmp_path)),
+        completers=all_providers(make_completer()[0]),
+    )
+
+    with caplog.at_level(
+        logging.WARNING, logger="open_trader.polymarket_relation_discovery"
+    ):
+        validation = validator.validate(threshold_relation())
+
+    assert validation.status == "approved"
+    assert validator.llm_successes == 1
+    assert any(
+        record.getMessage().startswith("llm_store_write_failed")
+        for record in caplog.records
+        if record.name == "open_trader.polymarket_relation_discovery"
+    )
+
+
 def test_relation_cache_key_uses_only_versioned_semantic_payload() -> None:
     relation = threshold_relation()
     payload = _relation_cache_payload(relation)

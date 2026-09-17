@@ -2624,6 +2624,25 @@ class LlmRelationValidator:
                 result[k] = v
         return result
 
+    def _record_llm_call(self, **kwargs: object) -> None:
+        """Bookkeeping write: degrade to a warning, never fail validation.
+
+        In production these writes raised sqlite3.OperationalError after the
+        LLM call had already succeeded, and the failure surfaced to operators
+        as a bogus "LLM 校验不可用（LLM_FAILED）" alert.
+        """
+
+        try:
+            self.store.record_llm_call(**kwargs)
+        except Exception:
+            logger.warning("llm_store_write_failed", exc_info=True)
+
+    def _save_llm_cache(self, cache_key: str, payload: Mapping[str, object]) -> None:
+        try:
+            self.store.save_llm_cache(cache_key, payload)
+        except Exception:
+            logger.warning("llm_store_write_failed", exc_info=True)
+
     def _fail_over(
         self,
         relation: ThresholdRelation,
@@ -2672,7 +2691,7 @@ class LlmRelationValidator:
             assert isinstance(structured, Mapping)
             self._breakers[fallback].record_success()
             self.llm_successes += 1
-            self.store.record_llm_call(
+            self._record_llm_call(
                 status="success",
                 usage={**completion.usage, "provider": fallback},
             )
@@ -2700,7 +2719,7 @@ class LlmRelationValidator:
                 provider=fallback,
             )
             if validation.status in {"approved", "llm_rejected"}:
-                self.store.save_llm_cache(
+                self._save_llm_cache(
                     cache_key,
                     {
                         "provider": fallback,
@@ -2712,7 +2731,7 @@ class LlmRelationValidator:
             return validation
         if completion.content is None:
             self._breakers[fallback].record_failure(time.monotonic())
-            self.store.record_llm_call(
+            self._record_llm_call(
                 status="failed",
                 usage={**completion.usage, "provider": fallback},
                 reason=completion.reason,
@@ -2731,7 +2750,7 @@ class LlmRelationValidator:
                 (completion.content or "")[:1200],
             )
             self._breakers[fallback].record_failure(time.monotonic())
-            self.store.record_llm_call(
+            self._record_llm_call(
                 status="failed",
                 usage={**completion.usage, "provider": fallback},
                 violation=fallback_violation,
@@ -2793,7 +2812,7 @@ class LlmRelationValidator:
             )
             if completion.content is None:
                 breaker.record_failure(time.monotonic())
-                self.store.record_llm_call(
+                self._record_llm_call(
                     status="failed",
                     usage={**completion.usage, "provider": provider},
                     reason=completion.reason,
@@ -2821,7 +2840,7 @@ class LlmRelationValidator:
                     (completion.content or "")[:1200],
                 )
                 breaker.record_failure(time.monotonic())
-                self.store.record_llm_call(
+                self._record_llm_call(
                     status="failed",
                     usage={**completion.usage, "provider": provider},
                     violation=violation,
@@ -2830,7 +2849,7 @@ class LlmRelationValidator:
             assert isinstance(structured, Mapping)
             breaker.record_success()
             self.llm_successes += 1
-            self.store.record_llm_call(
+            self._record_llm_call(
                 status="success",
                 usage={**completion.usage, "provider": provider},
             )
@@ -2843,7 +2862,7 @@ class LlmRelationValidator:
                 provider=provider,
             )
             if validation.status in {"approved", "llm_rejected"}:
-                self.store.save_llm_cache(
+                self._save_llm_cache(
                     cache_key,
                     {
                         "provider": provider,

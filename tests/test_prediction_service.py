@@ -150,6 +150,44 @@ def _socket_fd_count() -> int:
     return count
 
 
+def test_prediction_service_entry_logging_carries_iso_timestamps() -> None:
+    import logging
+    import re
+
+    from open_trader import prediction_service
+
+    root = logging.getLogger()
+    previous_handlers = root.handlers[:]
+    previous_level = root.level
+    root.handlers[:] = []
+    try:
+        prediction_service._configure_entry_logging()
+        stream_handlers = [
+            handler
+            for handler in root.handlers
+            if isinstance(handler, logging.StreamHandler)
+            and handler.formatter is not None
+        ]
+        assert stream_handlers
+        record = logging.LogRecord(
+            "open_trader.prediction_service",
+            logging.INFO,
+            __file__,
+            1,
+            "entry probe",
+            None,
+            None,
+        )
+        rendered = stream_handlers[-1].formatter.format(record)
+        stamp = rendered.split(" ", 1)[0]
+        assert re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4}", stamp
+        ), rendered
+    finally:
+        root.handlers[:] = previous_handlers
+        root.setLevel(previous_level)
+
+
 def test_socket_fd_count_does_not_leak_non_socket_descriptors() -> None:
     read_fd, write_fd = os.pipe()
     try:

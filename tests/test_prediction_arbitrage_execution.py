@@ -6564,8 +6564,8 @@ def test_one_leg_neutralization_does_not_mark_first_live_order_validated(tmp_pat
     final = wait_until_terminal(service, str(execution["execution_id"]))
 
     assert final["state"] == "neutralized_incident"
-    runtime = store.load_runtime() or {}
-    assert runtime.get("first_live_order") != "validated"
+    flag_state = store.first_live_order_state() or {}
+    assert flag_state.get("status") != "validated"
 
 
 class SubmitFailureThresholdTrading(ThresholdTrading):

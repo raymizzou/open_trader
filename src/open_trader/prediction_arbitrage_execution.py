@@ -4211,14 +4211,6 @@ class PredictionExecutionService:
                         "reason": "notification_config_unavailable",
                     }
                 self._breaker_open = False
-                self._store.write_runtime(
-                    {
-                        "prediction_arbitrage": "ready",
-                        "reconciled_at": _timestamp(_utc_now()),
-                        "readiness": "lp_active",
-                        "lp_session_id": lp_active.get("session_id"),
-                    }
-                )
                 return {
                     "state": "ready",
                     "readiness": "lp_active",
@@ -4350,13 +4342,6 @@ class PredictionExecutionService:
             if not self._notification_channels_ready():
                 return {"state": "locked", "reason": "notification_config_unavailable"}
             self._breaker_open = False
-            self._store.write_runtime(
-                {
-                    "prediction_arbitrage": "ready",
-                    "reconciled_at": _timestamp(_utc_now()),
-                    "readiness": "reconciled",
-                }
-            )
             return {
                 "state": "ready",
                 "readiness": "reconciled",
@@ -4371,9 +4356,6 @@ class PredictionExecutionService:
         if not self._notification_channels_ready():
             return {"state": "locked", "reason": "notification_config_unavailable"}
         self._breaker_open = False
-        self._store.write_runtime(
-            {"prediction_arbitrage": "ready", "reconciled_at": _timestamp(_utc_now())}
-        )
         return {"state": "ready", "readiness": "fresh"}
 
     def reset_breaker(
@@ -4938,12 +4920,8 @@ class PredictionExecutionService:
                 return
             if self._real_live_success(execution_proof, merge_result):
                 self._first_live_order_verified = True
-                self._store.write_runtime(
-                    {
-                        "prediction_arbitrage": "ready",
-                        "first_live_order": "validated",
-                        "validated_at": _timestamp(_utc_now()),
-                    }
+                self._store.set_first_live_order_validated(
+                    _timestamp(_utc_now())
                 )
             self._transition(
                 execution_id,

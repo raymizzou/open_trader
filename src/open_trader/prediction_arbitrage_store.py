@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 import threading
@@ -23,6 +24,8 @@ from open_trader.prediction_n_leg_episodes import CLOSE_NO_QUALIFIED_OPPORTUNITY
 
 StoreHistoryKind = Literal["signals", "executions", "incidents"]
 SignalHistoryWindow = Literal["24h", "7d", "30d", "all"]
+
+logger = logging.getLogger(__name__)
 
 _BUSY_TIMEOUT_MS = 5_000
 _LLM_USAGE_RETENTION = timedelta(days=7)
@@ -361,6 +364,21 @@ class PredictionArbitrageStore:
         self._cache_hits: dict[str, int] = {}
         self._cache_hits_lock = threading.Lock()
         self.prune_llm_usage()
+        self._truncate_wal()
+
+    def _truncate_wal(self) -> None:
+        """Best-effort startup `wal_checkpoint(TRUNCATE)`.
+
+        The retired runtime snapshot table used to grow the WAL by several
+        MB every second; a long-lived process could otherwise keep a huge
+        WAL alive forever.  A failed checkpoint must never block startup.
+        """
+
+        try:
+            with self._read_connection() as connection:
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            logger.warning("prediction_arbitrage_wal_checkpoint_failed", exc_info=True)
 
     def _connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
@@ -399,7 +417,7 @@ class PredictionArbitrageStore:
     def _create_schema(connection: sqlite3.Connection) -> None:
         connection.executescript(
             """
-            CREATE TABLE IF NOT EXISTS runtime (
+            CREATE TABLE IF NOT EXISTS service_flags (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 payload TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -881,6 +899,14 @@ class PredictionArbitrageStore:
             # Issue #130: durable BBO history and the previous screening result.
             connection.execute("PRAGMA user_version=13")
             version = 13
+        if version < 14:
+            # retire-runtime-snapshot-20260917: the every-second full-snapshot
+            # rewrite of `runtime` (≈5 MB/s WAL growth) is retired.  The only
+            # durable fact it carried — the first-live-order flag — lives in
+            # service_flags now; drop the legacy table on upgrade.
+            connection.execute("DROP TABLE IF EXISTS runtime")
+            connection.execute("PRAGMA user_version=14")
+            version = 14
 
     @staticmethod
     def _execution_fields(row: sqlite3.Row) -> dict[str, object]:
@@ -1122,13 +1148,17 @@ class PredictionArbitrageStore:
             for row in rows
         ]
 
-    def write_runtime(self, payload: Mapping[str, object]) -> None:
+    def set_first_live_order_validated(self, validated_at: str) -> None:
+        """Persist the durable first-live-order flag in service_flags."""
+
+        encoded = _dump_payload(
+            {"status": "validated", "validated_at": validated_at}
+        )
         now = _utc_now()
-        encoded = _dump_payload(payload)
         with self._transaction() as connection:
             connection.execute(
                 """
-                INSERT INTO runtime(singleton, payload, updated_at)
+                INSERT INTO service_flags(singleton, payload, updated_at)
                 VALUES (1, ?, ?)
                 ON CONFLICT(singleton) DO UPDATE SET
                     payload=excluded.payload,
@@ -1137,10 +1167,10 @@ class PredictionArbitrageStore:
                 (encoded, now),
             )
 
-    def load_runtime(self) -> dict[str, object] | None:
+    def first_live_order_state(self) -> dict[str, object] | None:
         with self._read_connection() as connection:
             row = connection.execute(
-                "SELECT payload FROM runtime WHERE singleton=1"
+                "SELECT payload FROM service_flags WHERE singleton=1"
             ).fetchone()
         return None if row is None else _load_payload(str(row["payload"]))
 

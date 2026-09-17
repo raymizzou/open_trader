@@ -3407,7 +3407,7 @@ def test_prediction_state_does_not_requery_titles_already_owned_by_monitor() -> 
         def signal_history(self, _window: str) -> list[dict[str, object]]:
             return []
 
-        def load_runtime(self) -> dict[str, object]:
+        def first_live_order_state(self) -> dict[str, object]:
             return {}
 
         def load_llm_cache(self, _cache_key: str) -> None:
@@ -3443,6 +3443,38 @@ def test_prediction_state_does_not_requery_titles_already_owned_by_monitor() -> 
 
     assert len(state["events"][0]["markets"]) == 200
     assert store.title_reads == 0
+
+
+def test_prediction_state_first_live_order_flag_read_from_service_flags(
+    tmp_path: Path,
+) -> None:
+    from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+    from open_trader.prediction_read_model import prediction_state_payload as _prediction_state_payload
+
+    store = PredictionArbitrageStore(tmp_path / "data")
+    store.set_first_live_order_validated("2026-09-17T00:00:00+00:00")
+
+    class FakeMonitor:
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "status": "healthy",
+                "health": {"status": "healthy", "degraded_reasons": []},
+                "readiness": {"status": "ready"},
+                "events": [],
+                "opportunities": [],
+            }
+
+    state = _prediction_state_payload(
+        store=store,
+        monitor=FakeMonitor(),
+        execution=type("Execution", (), {"_breaker_open": False})(),
+        csrf_token="csrf",
+    )
+
+    assert state["first_live_order"] == "已验证"
+    assert state["readiness"]["first_live_order"] == "已验证"
+
+
 def test_prediction_arbitrage_projects_live_monitor_and_store_rows_for_ui() -> None:
     from open_trader.prediction_read_model import prediction_history_payload as _prediction_history_payload, prediction_state_payload as _prediction_state_payload
 
@@ -3460,8 +3492,11 @@ def test_prediction_arbitrage_projects_live_monitor_and_store_rows_for_ui() -> N
         def signal_history(self, _window: str) -> list[dict[str, object]]:
             return self.histories("signals") + [{"signal_id": "s-2"}]
 
-        def load_runtime(self) -> dict[str, object]:
-            return {"prediction_arbitrage": "ready", "first_live_order": "validated"}
+        def first_live_order_state(self) -> dict[str, object]:
+            return {
+                "status": "validated",
+                "validated_at": "2026-07-27T12:00:00+00:00",
+            }
 
         def histories(self, kind: str) -> list[dict[str, object]]:
             if kind == "signals":
@@ -3596,7 +3631,7 @@ def test_prediction_arbitrage_projects_threshold_relation_validation_without_sec
         def signal_history(self, _window: str) -> list[dict[str, object]]:
             return []
 
-        def load_runtime(self) -> dict[str, object]:
+        def first_live_order_state(self) -> dict[str, object]:
             return {}
 
     class FakeMonitor:
@@ -4900,7 +4935,7 @@ def test_prediction_state_projects_relation_funnel_without_secrets() -> None:
         def signal_history(self, _window: str) -> list[dict[str, object]]:
             return []
 
-        def load_runtime(self) -> dict[str, object]:
+        def first_live_order_state(self) -> dict[str, object]:
             return {}
 
     class FakeMonitor:
@@ -17415,7 +17450,7 @@ def test_prediction_history_projects_live_yes_no_actionability_and_cached_title(
         def signal_history(self, _window: str) -> list[dict[str, object]]:
             return rows
 
-        def load_runtime(self) -> dict[str, object]:
+        def first_live_order_state(self) -> dict[str, object]:
             return {}
 
         def load_llm_cache(self, cache_key: str) -> dict[str, object] | None:
@@ -17533,7 +17568,7 @@ def test_prediction_history_title_lookup_is_memoized_per_request() -> None:
         def signal_history(self, _window: str) -> list[dict[str, object]]:
             return rows
 
-        def load_runtime(self) -> dict[str, object]:
+        def first_live_order_state(self) -> dict[str, object]:
             return {}
 
         def load_llm_cache(self, cache_key: str) -> dict[str, object] | None:
@@ -17572,7 +17607,7 @@ def test_prediction_history_signals_use_thirty_day_window() -> None:
         def unacknowledged_incident(self) -> None:
             return None
 
-        def load_runtime(self) -> dict[str, object]:
+        def first_live_order_state(self) -> dict[str, object]:
             return {}
 
     fake = FakeStore()
@@ -17665,7 +17700,7 @@ def test_prediction_history_fails_closed_for_unusable_live_truth(
         def signal_history(self, _window: str) -> list[dict[str, object]]:
             return [row]
 
-        def load_runtime(self) -> dict[str, object]:
+        def first_live_order_state(self) -> dict[str, object]:
             return {}
 
     class FakeMonitor:
@@ -17725,7 +17760,7 @@ def test_state_payload_hides_below_threshold_opportunities_and_markets() -> None
         def cross_unsettled_principal(self) -> Decimal:
             return Decimal("0")
 
-        def load_runtime(self) -> dict[str, object]:
+        def first_live_order_state(self) -> dict[str, object]:
             return {}
 
         def signal_history(self, _window: str) -> list[dict[str, object]]:
@@ -17845,7 +17880,7 @@ def test_signal_history_hides_below_threshold_rows() -> None:
         def signal_history(self, _window: str) -> list[dict[str, object]]:
             return rows
 
-        def load_runtime(self) -> dict[str, object]:
+        def first_live_order_state(self) -> dict[str, object]:
             return {}
 
         def load_llm_cache(self, _key: str) -> dict[str, object] | None:

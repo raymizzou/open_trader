@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -583,7 +584,7 @@ def test_start_and_runtime_write_do_not_load_historical_signal_metrics(
     monitor.run_forever = idle  # type: ignore[method-assign]
     monitor.start()
     try:
-        monitor._write_runtime(force=True)
+        monitor._emit_health_log(force=True)
         snapshot = monitor.snapshot()
     finally:
         monitor.stop()
@@ -591,6 +592,99 @@ def test_start_and_runtime_write_do_not_load_historical_signal_metrics(
     assert history_calls == 0
     assert snapshot["signals_24h"] == 0
     assert snapshot["relation_discovery"]["annualized_distribution"] == {}
+
+
+def test_health_log_line_is_a_single_json_object() -> None:
+    from open_trader.polymarket_monitor import health_log_line
+
+    line = health_log_line(
+        {
+            "status": "degraded",
+            "degraded_reasons": ["store_write_failed"],
+            "universe_age_seconds": 32715.0,
+        },
+        {"last_error": "store:OperationalError"},
+    )
+
+    assert "\n" not in line
+    payload = json.loads(line)
+    assert payload["status"] == "degraded"
+    assert payload["degraded_reasons"] == ["store_write_failed"]
+    assert payload["level"] == "WARNING"
+    assert payload["component"] == "prediction_monitor"
+    assert payload["universe_age_seconds"] == 32715.0
+    assert payload["last_error"] == "store:OperationalError"
+    assert datetime.fromisoformat(payload["ts"]).tzinfo is not None
+
+
+def test_healthy_status_logs_at_info_level() -> None:
+    from open_trader.polymarket_monitor import health_log_line
+
+    payload = json.loads(
+        health_log_line(
+            {"status": "healthy", "degraded_reasons": [], "universe_age_seconds": 5.0},
+            {"last_error": None},
+        )
+    )
+
+    assert payload["level"] == "INFO"
+    assert payload["status"] == "healthy"
+    assert payload["degraded_reasons"] == []
+    assert payload["last_error"] is None
+
+
+def test_diagnostic_log_scheduler_emits_on_change_and_sixty_second_heartbeat(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import logging
+
+    import open_trader.polymarket_monitor as monitor_module
+
+    monitor = make_monitor(tmp_path)
+    monotonic = [1000.0]
+    monkeypatch.setattr(monitor, "_monotonic", lambda: monotonic[0])
+    # Deterministic healthy baseline: fresh universe and readiness.
+    monitor._universe_at = NOW
+    monitor._readiness = {"checked_at": NOW}
+
+    def lines() -> list[str]:
+        return [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "open_trader.polymarket_monitor"
+        ]
+
+    with caplog.at_level(
+        logging.INFO, logger="open_trader.polymarket_monitor"
+    ):
+        monitor._emit_health_log()
+        assert len(lines()) == 1
+        assert json.loads(lines()[0])["status"] == "healthy"
+
+        # No state change within 60 s: no new line.
+        monotonic[0] += 30
+        monitor._emit_health_log()
+        assert len(lines()) == 1
+
+        # 60 s heartbeat with no change: exactly one refresh line.
+        monotonic[0] += 31
+        monitor._emit_health_log()
+        assert len(lines()) == 2
+
+        # A changed degraded-reason set is emitted immediately.
+        monitor._store_failed = True
+        monotonic[0] += 1
+        monitor._emit_health_log()
+        assert len(lines()) == 3
+        changed = json.loads(lines()[-1])
+        assert changed["status"] != "healthy"
+        assert changed["degraded_reasons"] == ["store_write_failed"]
+
+        # Recovery to the previous state is a change too.
+        monitor._store_failed = False
+        monotonic[0] += 1
+        monitor._emit_health_log()
+        assert len(lines()) == 4
 
 
 def test_snapshot_uses_metrics_refreshed_outside_monitor_lock(tmp_path: Path) -> None:
@@ -2412,6 +2506,40 @@ def test_subscription_refresh_swaps_handles_without_disconnect_window(
     asyncio.run(exercise())
 
 
+def test_refresh_universe_runs_without_runtime_table(tmp_path: Path) -> None:
+    setup_public([threshold_event()])
+    store = PredictionArbitrageStore(tmp_path / "data")
+    # Shape the database like a pre-migration production file: the legacy
+    # runtime snapshot table present and user_version still at 13.
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "CREATE TABLE runtime ("
+            "singleton INTEGER PRIMARY KEY CHECK (singleton = 1),"
+            " payload TEXT NOT NULL, updated_at TEXT NOT NULL)"
+        )
+        connection.execute("PRAGMA user_version=13")
+    # Re-instantiation runs the v14 schema migration that drops the legacy table.
+    store = PredictionArbitrageStore(tmp_path / "data")
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+    assert monitor._store.path == store.path
+
+    asyncio.run(monitor._refresh_universe_bounded(FakePublicClient()))
+
+    with sqlite3.connect(store.path) as connection:
+        names = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+    assert "runtime" not in names
+    assert monitor.snapshot()["health"]["degraded_reasons"] == []
+
+
 def test_bounded_top_twenty_refresh_does_not_wait_for_relation_activity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4049,6 +4177,93 @@ def test_relation_rescan_is_throttled_but_harvest_is_not(tmp_path: Path) -> None
         assert validator.relation_ids == [relation_id]
 
     asyncio.run(exercise())
+
+
+def test_validation_task_exception_marks_error_without_failure_notification(
+    tmp_path: Path,
+) -> None:
+    setup_public([threshold_event()])
+    setup_threshold_books(low_ask="0.50", high_no_ask="0.51")
+    validator = FakeRelationValidator()
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=validator,
+    )
+    calls: list[dict[str, object]] = []
+    monitor.set_failure_observer(
+        lambda payload: calls.append(dict(payload)) or {"state": "sent"}
+    )
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    asyncio.run(monitor._refresh_relation_activity(client))
+    relation_id = next(iter(monitor._active_relation_ids))
+
+    async def failing_validation() -> object:
+        raise sqlite3.OperationalError("database is locked")
+
+    async def exercise() -> None:
+        monitor._codex_statuses[relation_id] = "pending"
+        monitor._codex_relation_id = relation_id
+        monitor._codex_wait_started_at.setdefault(relation_id, NOW)
+        task = asyncio.create_task(failing_validation())
+        monitor._codex_task = task
+        with pytest.raises(sqlite3.OperationalError):
+            await task
+        await monitor._poll_relation_validation(None)
+        await asyncio.sleep(0.01)
+        monitor._reap_llm_failure_notification_task()
+
+    asyncio.run(exercise())
+
+    assert calls == []
+    assert monitor._diagnostics["last_error"] == "validation:OperationalError"
+    assert monitor._codex_statuses[relation_id] == "error"
+    assert monitor._codex_retry_at[relation_id] > NOW
+
+
+def test_llm_provider_failure_notifies_observer_with_provider_reason_codes(
+    tmp_path: Path,
+) -> None:
+    from open_trader.llm_providers import PROVIDER_IDS, LlmCompletion
+
+    def failing_completer(_system: str, _user: str) -> LlmCompletion:
+        return LlmCompletion(None, "ZHIPU_FAILED", {"input_tokens": 1, "cached_input_tokens": 0, "output_tokens": 0, "reasoning_output_tokens": 0})
+
+    setup_public([threshold_event()])
+    setup_threshold_books(low_ask="0.50", high_no_ask="0.51")
+    validator = LlmRelationValidator(
+        PredictionArbitrageStore(tmp_path / "data"),
+        completers={provider: failing_completer for provider in PROVIDER_IDS},
+    )
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=validator,
+    )
+    calls: list[dict[str, object]] = []
+    monitor.set_failure_observer(
+        lambda payload: calls.append(dict(payload)) or {"state": "sent"}
+    )
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    asyncio.run(monitor._refresh_relation_activity(client))
+    relation_id = next(iter(monitor._active_relation_ids))
+
+    async def exercise() -> None:
+        await monitor._poll_relation_validation(client)
+        assert monitor._codex_task is not None
+        await monitor._codex_task
+        await monitor._poll_relation_validation(client)
+        await asyncio.sleep(0.01)
+        monitor._reap_llm_failure_notification_task()
+
+    asyncio.run(exercise())
+
+    assert len(calls) == 1
+    assert calls[0]["component"] == "llm_validation"
+    assert calls[0]["reason_codes"] == ["ZHIPU_FAILED"]
+    assert monitor._codex_statuses[relation_id] == "llm_unavailable"
 
 
 def test_llm_unavailable_notifies_failure_observer_once_and_resets_on_success(

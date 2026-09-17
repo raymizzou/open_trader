@@ -3070,6 +3070,126 @@ def test_shadow_runtime_stops_on_first_guard_violation_from_owner_thread(
     ]
 
 
+def test_shadow_evidence_codex_counters_come_from_llm_attributes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """healthz 的 codex 计数必须读 validator 的 llm_calls/llm_successes。"""
+
+    import contextlib
+
+    import open_trader.prediction_runtime as runtime_module
+
+    class CountingValidator:
+        llm_calls = 5
+        llm_successes = 3
+
+    class FakeStore:
+        def __init__(self, _data_dir: object) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    class FakeClient:
+        @classmethod
+        def from_keychain(cls, _config: object) -> "FakeClient":
+            return FakeClient()
+
+        def close(self) -> None:
+            pass
+
+    class FakeMonitor:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def set_ready_observer(self, _observer: object) -> None:
+            pass
+
+        def set_observation_observer(self, _observer: object) -> None:
+            pass
+
+        def set_failure_observer(self, _observer: object) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+    class FakeExecution:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def notify_ready_opportunity(self, *_args: object) -> None:
+            pass
+
+        notify_observation = notify_ready_opportunity
+        notify_monitor_failure = notify_ready_opportunity
+
+        def set_cross_venue_monitor(self, _monitor: object) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    class FakeCrossMonitor:
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            pass
+
+        def snapshot(self) -> dict[str, object]:
+            return {"status": "ready"}
+
+    class Owner:
+        def acquire(self) -> None:
+            pass
+
+        def release(self) -> None:
+            pass
+
+    @contextlib.contextmanager
+    def fake_guard(client: object, _guard: object):
+        yield client
+
+    monkeypatch.setattr(runtime_module, "PredictionArbitrageStore", FakeStore)
+    monkeypatch.setattr(runtime_module, "PolymarketTradingClient", FakeClient)
+    monkeypatch.setattr(runtime_module, "PredictTradingClient", FakeClient)
+    monkeypatch.setattr(runtime_module, "load_trading_config", lambda _path: object())
+    monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor)
+    monkeypatch.setattr(runtime_module, "PredictionExecutionService", FakeExecution)
+    monkeypatch.setattr(runtime_module, "LlmRelationValidator", lambda *_a, **_k: CountingValidator())
+    monkeypatch.setattr(runtime_module, "LlmTitleTranslator", lambda *_a, **_k: object())
+    monkeypatch.setattr(
+        runtime_module,
+        "_build_cross_venue_monitor",
+        lambda **_kwargs: FakeCrossMonitor(),
+    )
+    monkeypatch.setattr(runtime_module, "PolymarketReadOnlyGuard", lambda *_a: object())
+    monkeypatch.setattr(runtime_module, "PredictReadOnlyGuard", lambda *_a: object())
+    monkeypatch.setattr(runtime_module, "guard_polymarket_client", fake_guard)
+    monkeypatch.setattr(runtime_module, "guard_predict_client", fake_guard)
+
+    runtime = PredictionRuntime(
+        data_dir=tmp_path / "shadow",
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+        mode="shadow",
+    )
+    runtime._owner = Owner()  # type: ignore[assignment]
+    try:
+        runtime.start()
+        assert runtime.state == "RUNNING"
+        assert runtime.shadow_evidence["codex"]["relation"] == {
+            "calls": 5,
+            "successes": 3,
+        }
+    finally:
+        runtime.stop()
+
+
 def test_shadow_cleanup_retains_lock_and_guards_when_monitor_thread_survives(
     tmp_path: Path,
 ) -> None:

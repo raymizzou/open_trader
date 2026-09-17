@@ -185,14 +185,14 @@ def create_execution(
 
 def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> None:
     db = store(tmp_path)
-    db.write_runtime({"heartbeat": "ok"})
+    db.set_first_live_order_validated("2026-09-17T00:00:00+00:00")
 
     path = tmp_path / "data" / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
     assert path.is_file()
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         assert connection.execute("PRAGMA busy_timeout").fetchone()[0] > 0
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
         names = {
             row[1]
             for row in connection.execute("PRAGMA table_list")
@@ -217,7 +217,7 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
             ("market-1",),
         ).fetchall()
     assert names == {
-        "runtime",
+        "service_flags",
         "signals",
         "previews",
         "executions",
@@ -573,7 +573,7 @@ def test_control_event_transitions_from_started_to_one_terminal_outcome(
         )
 
 
-def test_cross_auto_pause_is_durable_and_runtime_writes_do_not_clear_it(
+def test_cross_auto_pause_is_durable_and_flag_writes_do_not_clear_it(
     tmp_path: Path,
 ) -> None:
     db = store(tmp_path)
@@ -585,7 +585,7 @@ def test_cross_auto_pause_is_durable_and_runtime_writes_do_not_clear_it(
         "updated_at": None,
     }
     assert db.arm_cross_auto()["armed"] is True
-    db.write_runtime({"heartbeat": "ok"})
+    db.set_first_live_order_validated("2026-09-17T00:00:00+00:00")
     paused = db.pause_cross_auto("operator_paused")
 
     assert paused["armed"] is False
@@ -813,11 +813,52 @@ def test_store_sets_wal_once_instead_of_on_every_read(
     assert all("PRAGMA journal_mode=WAL" not in sql for sql in statements)
 
 
-def test_runtime_round_trips_canonical_json_and_survives_restart(tmp_path: Path) -> None:
-    payload = {"z": Decimal("1.20"), "a": {"amount": Decimal("2.00")}}
-    store(tmp_path).write_runtime(payload)
+def test_first_live_order_state_round_trips_and_fresh_store_is_none(
+    tmp_path: Path,
+) -> None:
+    db = store(tmp_path)
+    assert db.first_live_order_state() is None
 
-    assert PredictionArbitrageStore(tmp_path / "data").load_runtime() == {
+    db.set_first_live_order_validated("2026-09-17T00:00:00+00:00")
+
+    assert db.first_live_order_state() == {
+        "status": "validated",
+        "validated_at": "2026-09-17T00:00:00+00:00",
+    }
+    assert PredictionArbitrageStore(tmp_path / "data").first_live_order_state() == {
+        "status": "validated",
+        "validated_at": "2026-09-17T00:00:00+00:00",
+    }
+
+
+def test_store_init_truncates_wal(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    db = store(tmp_path)
+    # An idle open connection keeps the WAL file on disk across writes, like
+    # the live prediction process does; without it SQLite deletes the empty
+    # WAL on last-connection close and the invariant would be vacuous.
+    held = sqlite3.connect(db.path)
+    try:
+        held.execute("SELECT count(*) FROM signals").fetchall()
+        db.set_first_live_order_validated("2026-09-17T00:00:00+00:00")
+        db.upsert_signal(signal_payload("market-1", iso(datetime.now(UTC))))
+        wal = db.path.parent / "prediction_arbitrage.sqlite3-wal"
+        assert wal.stat().st_size > 0
+
+        PredictionArbitrageStore(data_dir)
+
+        assert wal.stat().st_size == 0
+    finally:
+        held.close()
+
+
+def test_relation_state_round_trips_canonical_json_and_survives_restart(
+    tmp_path: Path,
+) -> None:
+    payload = {"z": Decimal("1.20"), "a": {"amount": Decimal("2.00")}}
+    store(tmp_path).save_relation_state(payload, full_scanned_at="2026-09-17T00:00:00Z")
+
+    assert PredictionArbitrageStore(tmp_path / "data").load_relation_state() == {
         "a": {"amount": "2.00"},
         "z": "1.20",
     }
@@ -2328,8 +2369,12 @@ def test_histories_are_newest_first_for_all_kinds(tmp_path: Path) -> None:
 
 def test_sensitive_ticks_signed_orders_and_secrets_never_reach_sqlite(tmp_path: Path) -> None:
     db = store(tmp_path)
-    db.write_runtime(
-        {
+    db.record_relation_scan(
+        scope="full",
+        status="completed",
+        started_at=iso(datetime.now(UTC)),
+        completed_at=iso(datetime.now(UTC)),
+        payload={
             "raw_ticks": [{"price": "0.45", "size": "20", "sentinel": "raw-tick-secret"}],
             "api_secret": "api-secret-sentinel",
             "api_token": "api-token-sentinel",
@@ -2338,7 +2383,7 @@ def test_sensitive_ticks_signed_orders_and_secrets_never_reach_sqlite(tmp_path: 
             "raw_websocket_message": "raw-websocket-sentinel",
             "order_payload": "order-payload-sentinel",
             "safe": "kept",
-        }
+        },
     )
     db.upsert_signal(
         {
@@ -2350,7 +2395,7 @@ def test_sensitive_ticks_signed_orders_and_secrets_never_reach_sqlite(tmp_path: 
     path = tmp_path / "data" / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
     with sqlite3.connect(path) as connection:
         rows = connection.execute("SELECT sql FROM sqlite_schema WHERE sql IS NOT NULL").fetchall()
-        values = connection.execute("SELECT payload FROM runtime UNION ALL SELECT payload FROM signals").fetchall()
+        values = connection.execute("SELECT payload FROM relation_scan_runs UNION ALL SELECT payload FROM signals").fetchall()
     schema = " ".join(str(row[0]).lower() for row in rows)
     stored = " ".join(str(row[0]).lower() for row in values)
     for sentinel in (
@@ -2415,8 +2460,11 @@ def test_signed_substring_keys_other_than_preflight_status_still_dropped(
 
 def test_decimal_strings_are_stored_without_exponents(tmp_path: Path) -> None:
     db = store(tmp_path)
-    db.write_runtime({"amount": Decimal("1E+2"), "negative": Decimal("-0.50")})
-    restored = db.load_runtime()
+    db.save_relation_state(
+        {"amount": Decimal("1E+2"), "negative": Decimal("-0.50")},
+        full_scanned_at="2026-09-17T00:00:00Z",
+    )
+    restored = db.load_relation_state()
     assert restored == {"amount": "100", "negative": "-0.50"}
     raw = json.dumps(restored, sort_keys=True)
     assert "E" not in raw
@@ -2426,16 +2474,25 @@ def test_generic_payload_redacts_public_pair_token_ids_and_camel_case_order_payl
     tmp_path: Path,
 ) -> None:
     db = store(tmp_path)
-    db.write_runtime(
-        {
+    db.record_relation_scan(
+        scope="full",
+        status="completed",
+        started_at=iso(datetime.now(UTC)),
+        completed_at=iso(datetime.now(UTC)),
+        payload={
             "yes_token_id": "yes-public-token-123",
             "no_token_id": "no-public-token-456",
             "orderPayload": "signed-order-payload-sentinel",
-        }
+        },
     )
 
-    restored = db.load_runtime()
-    assert restored is not None
+    path = tmp_path / "data" / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
+    with sqlite3.connect(path) as connection:
+        stored = connection.execute(
+            "SELECT payload FROM relation_scan_runs WHERE scope='full'"
+        ).fetchone()[0]
+    restored = json.loads(stored)
+    assert isinstance(restored, dict)
     assert "yes_token_id" not in restored
     assert "no_token_id" not in restored
     assert "orderPayload" not in restored

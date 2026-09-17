@@ -63,7 +63,7 @@ READINESS_FRESHNESS_SECONDS = 60
 READINESS_REFRESH_SECONDS = 30
 STREAM_DISCONNECT_SECONDS = 15
 UNIVERSE_STALE_SECONDS = 10 * 60
-RUNTIME_WRITE_SECONDS = 1
+DIAGNOSTIC_LOG_SECONDS = 60
 PUBLIC_REFRESH_TIMEOUT_SECONDS = 30.0
 PUBLIC_BOOK_CONCURRENCY = 8
 STREAM_SUBSCRIPTION_CHUNK_SIZE = 250
@@ -233,6 +233,31 @@ def _age(now: datetime, then: datetime | None) -> float:
     if then is None:
         return float("inf")
     return max(0.0, (now - then).total_seconds())
+
+
+def health_log_line(health: Mapping, diagnostics: Mapping) -> str:
+    """Render one structured, single-line diagnostics record.
+
+    Replaces the retired per-second ``runtime`` SQLite snapshot: operators
+    grep these lines from the service log instead of querying a row that was
+    rewritten (and WAL-amplified) every second.
+    """
+
+    status = str(health.get("status", ""))
+    return json.dumps(
+        {
+            "ts": datetime.now(UTC).isoformat(),
+            "level": "WARNING" if status != "healthy" else "INFO",
+            "component": "prediction_monitor",
+            "status": status,
+            "degraded_reasons": [
+                str(reason) for reason in (health.get("degraded_reasons") or ())
+            ],
+            "universe_age_seconds": health.get("universe_age_seconds"),
+            "last_error": diagnostics.get("last_error"),
+        },
+        ensure_ascii=False,
+    )
 
 
 def _display_age(value: float) -> float | None:
@@ -484,7 +509,8 @@ class PolymarketMonitor:
         self._stream_connected_at: datetime | None = None
         self._stream_disconnected_at: datetime | None = None
         self._subscription_dirty = False
-        self._last_runtime_write: datetime | None = None
+        self._diagnostic_log_at: float | None = None
+        self._diagnostic_log_key: tuple[str, frozenset[str]] | None = None
         self._llm_usage_cache: dict[str, int] | None = None
         self._llm_usage_by_provider_cache: dict[str, object] | None = None
         self._llm_usage_cached_at: float | None = None
@@ -1978,7 +2004,7 @@ class PolymarketMonitor:
                     )
                 except asyncio.TimeoutError:
                     self._maintain_open_signals()
-                    self._write_runtime()
+                    self._emit_health_log()
                     continue
                 except (StopAsyncIteration, ConnectionError, OSError) as exc:
                     await self._close_stream()
@@ -1996,7 +2022,7 @@ class PolymarketMonitor:
                     await self._process_stream_event(client, message)
                 except Exception as exc:
                     self._record_error(exc, "stream_event")
-                self._write_runtime()
+                self._emit_health_log()
         finally:
             for task_name in (
                 "_full_scan_task",
@@ -2482,7 +2508,7 @@ class PolymarketMonitor:
                     scope="refresh",
                     reason=type(exc).__name__,
                 )
-        self._write_runtime(force=True)
+        self._emit_health_log(force=True)
 
     def _log_relation_scan(self, **fields: object) -> None:
         entry = {"at": self._now(), **fields}
@@ -4156,23 +4182,6 @@ class PolymarketMonitor:
             raise RuntimeError("relation validator is not callable")
         return await asyncio.to_thread(method, relation)
 
-    @staticmethod
-    def _codex_unavailable(summary: str = "LLM 语义校验不可用，当前不可下单。") -> RelationValidation:
-        return RelationValidation(
-            status="llm_unavailable",
-            decision=None,
-            relation=None,
-            summary=summary,
-            reason_codes=("LLM_FAILED",),
-            evidence=(),
-            uncertainties=(),
-            model="",
-            prompt_version="",
-            cache_key="",
-            cached=False,
-            structured_result=None,
-        )
-
     async def _poll_relation_validation(self, client: object | None = None) -> None:
         """Run at most one Codex validation without occupying REST/WS work."""
 
@@ -4184,20 +4193,38 @@ class PolymarketMonitor:
             self._codex_task = None
             self._codex_relation_id = None
             if relation_id is not None:
+                validation: object | None = None
+                status = "error"
                 try:
                     validation = task.result()
-                except asyncio.CancelledError:
-                    validation = self._codex_unavailable()
-                except Exception:
-                    validation = self._codex_unavailable()
-                self._codex_validations[relation_id] = validation
-                status = str(getattr(validation, "status", "llm_unavailable"))
+                except asyncio.CancelledError as exc:
+                    # Shutdown or superseded task: never report this as an
+                    # LLM outage — it is a store/loop failure at worst.
+                    self._record_error(exc, "validation")
+                    logger.warning(
+                        "relation_validation_task_failed", exc_info=True
+                    )
+                except Exception as exc:
+                    # A raised task (e.g. sqlite3.OperationalError from store
+                    # bookkeeping AFTER a successful LLM call) must not fire
+                    # the LLM-unavailable alert; record and retry instead.
+                    self._record_error(exc, "validation")
+                    logger.warning(
+                        "relation_validation_task_failed", exc_info=True
+                    )
+                if validation is not None:
+                    self._codex_validations[relation_id] = validation
+                    status = str(getattr(validation, "status", "llm_unavailable"))
                 self._codex_statuses[relation_id] = status
                 if status == "llm_unavailable":
                     self._codex_retry_at[relation_id] = self._now() + relation_validation_retry_delay(
                         getattr(validation, "reason_codes", ())
                     )
                     self._schedule_llm_failure_notification(validation)
+                elif status == "error":
+                    self._codex_retry_at[relation_id] = (
+                        self._now() + relation_validation_retry_delay(())
+                    )
                 else:
                     self._llm_failure_notified = False
                     self._codex_retry_at.pop(relation_id, None)
@@ -5729,25 +5756,39 @@ class PolymarketMonitor:
             "30d": self._distribution(history.get("30d", [])),
         }
 
-    def _write_runtime(self, *, force: bool = False) -> None:
-        now = self._now()
-        if not force and self._last_runtime_write is not None and _age(now, self._last_runtime_write) < RUNTIME_WRITE_SECONDS:
-            return
-        self._llm_usage()
-        payload = self.snapshot()
-        payload.pop("readiness", None)
-        # PairIntent is an in-process execution input, not a JSON/store value.
-        payload["opportunities"] = [
-            {key: value for key, value in item.items() if key != "intent"}
-            for item in payload.get("opportunities", [])
-            if isinstance(item, Mapping)
-        ]
-        try:
-            self._store.write_runtime(payload)
-            self._last_runtime_write = now
-        except Exception as exc:
-            self._store_failed = True
-            self._record_error(exc, "store")
+    def _emit_health_log(self, *, force: bool = False) -> None:
+        """Emit one structured diagnostics line via the module logger.
+
+        Bounded replacement for the retired per-second ``runtime`` snapshot
+        write: a line is emitted only when the status/degraded-reason set
+        changes or ``DIAGNOSTIC_LOG_SECONDS`` elapsed since the last line.
+        """
+
+        now_mono = self._monotonic()
+        key: tuple[str, frozenset[str]] | None = None
+        with self._lock:
+            health = self._health(self._now())
+            diagnostics = copy.deepcopy(self._diagnostics)
+            status = str(health.get("status", ""))
+            reasons = frozenset(
+                str(reason) for reason in (health.get("degraded_reasons") or ())
+            )
+            key = (status, reasons)
+            last_at = self._diagnostic_log_at
+            if (
+                not force
+                and self._diagnostic_log_key == key
+                and last_at is not None
+                and now_mono - last_at < DIAGNOSTIC_LOG_SECONDS
+            ):
+                return
+        line = health_log_line(health, diagnostics)
+        if status == "healthy":
+            logger.info(line)
+        else:
+            logger.warning(line)
+        self._diagnostic_log_at = now_mono
+        self._diagnostic_log_key = key
 
     def _health(self, now: datetime) -> dict[str, object]:
         reasons: list[str] = []

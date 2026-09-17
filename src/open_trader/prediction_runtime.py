@@ -478,9 +478,11 @@ class PredictionRuntime:
     @property
     def shadow_evidence(self) -> dict[str, object]:
         def counters(validator: object | None) -> dict[str, int]:
+            # The validators expose llm_calls/llm_successes; the previous
+            # codex_* names never existed, so healthz always reported zeros.
             return {
-                "calls": int(getattr(validator, "codex_calls", 0)),
-                "successes": int(getattr(validator, "codex_successes", 0)),
+                "calls": int(getattr(validator, "llm_calls", 0)),
+                "successes": int(getattr(validator, "llm_successes", 0)),
             }
 
         with self._shadow_failure_lock:

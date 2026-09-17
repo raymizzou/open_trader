@@ -41,8 +41,6 @@ def _populate_forbidden_categories(store: PredictionArbitrageStore) -> None:
         connection.execute("PRAGMA foreign_keys=OFF")
         connection.executescript(
             f"""
-            INSERT INTO runtime(singleton, payload, updated_at)
-            VALUES (1, '{{"breaker":{{"open":true}}}}', '{now}');
             INSERT INTO previews(preview_id, payload, created_at, expires_at)
             VALUES ('preview-1', '{{}}', '{now}', '{now}');
             INSERT INTO executions(
@@ -161,7 +159,7 @@ def test_seed_shadow_store_excludes_every_forbidden_category_and_preserves_sourc
     )
     destination = PredictionArbitrageStore(tmp_path / "shadow")
     forbidden = {
-        "runtime", "validation_mode", "cross_auto_state", "signals", "previews",
+        "validation_mode", "cross_auto_state", "signals", "previews",
         "executions", "cross_execution_reservations", "execution_legs", "incidents",
         "llm_usage", "relation_scan_runs", "auto_eat_attempts", "cross_auto_attempts",
     }

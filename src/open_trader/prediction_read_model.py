@@ -2110,18 +2110,14 @@ def prediction_state_payload(
     if bool(getattr(execution, "_first_live_order_verified", False)):
         first_live_order = "已验证"
     elif first_live_order is None and store is not None:
-        load_runtime = getattr(store, "load_runtime", None)
-        if callable(load_runtime):
+        flag_state = getattr(store, "first_live_order_state", None)
+        if callable(flag_state):
             try:
-                runtime = load_runtime()
+                state = flag_state()
             except Exception:
-                runtime = None
-            if isinstance(runtime, Mapping):
-                runtime_prediction = runtime.get("prediction_arbitrage")
-                if isinstance(runtime_prediction, Mapping):
-                    first_live_order = runtime_prediction.get("first_live_order")
-                if first_live_order is None:
-                    first_live_order = runtime.get("first_live_order")
+                state = None
+            if isinstance(state, Mapping) and state.get("status") is not None:
+                first_live_order = state.get("status")
     if first_live_order is not None:
         if str(first_live_order).casefold() in {"validated", "verified", "complete"}:
             first_live_order = "已验证"

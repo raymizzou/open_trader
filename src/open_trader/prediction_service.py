@@ -6,6 +6,7 @@ from http.cookies import SimpleCookie
 from datetime import UTC, date, datetime
 import ipaddress
 import json
+import logging
 import os
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1366,6 +1367,22 @@ def serve_prediction_service(
                 signal.signal(signum, handler)
 
 
+def _configure_entry_logging() -> None:
+    """Give the prediction-service launchd logs ISO-8601 timestamps.
+
+    The launchd StandardOut/Err logs previously carried no timestamp prefix
+    at all, so operators could not correlate structured diagnostics lines
+    with incidents.  Scoped to the CLI entry only: library-level logging
+    defaults stay untouched.
+    """
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S%z",
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="open_trader prediction-service")
     parser.add_argument("--mode", default="shadow")
@@ -1376,6 +1393,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--release-manifest", type=Path)
     parser.add_argument("--notifier-config", type=Path)
     args = parser.parse_args(argv)
+    _configure_entry_logging()
     return serve_prediction_service(
         data_dir=args.data_dir,
         prediction_config_path=args.config,
