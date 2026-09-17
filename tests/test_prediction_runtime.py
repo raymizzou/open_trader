@@ -3259,7 +3259,7 @@ def test_lp_runtime_stops_obsolete_sampling_and_keeps_exposure_risk(
 ) -> None:
     import open_trader.prediction_runtime as runtime_module
 
-    now = datetime(2026, 9, 17, 1, 0, tzinfo=UTC)
+    now = datetime.now(UTC)
     risk_seen = threading.Event()
     candidate_scan_seen = threading.Event()
     history_started = threading.Event()

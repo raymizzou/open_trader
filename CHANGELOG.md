@@ -5,6 +5,33 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-17
 
+- Retired the prediction monitor's every-second full-snapshot rewrite of the
+  `runtime` SQLite table (it drove ~5 MB/s WAL growth; a production WAL once
+  ballooned to 19 GB and its lock storms were misreported to Feishu as
+  `LLM 校验不可用（LLM_FAILED）`). Monitor diagnostics now go to structured
+  single-line JSON log lines (`ts`/`status`/`degraded_reasons`/…, emitted on
+  status or degraded-reason change and at least every 60 s); the
+  first-live-order flag moved to its own `service_flags` table and now
+  actually survives the former per-second overwrite and restarts (the legacy
+  `runtime` table is dropped by the v14 schema migration); store startup runs
+  a best-effort `wal_checkpoint(TRUNCATE)`. LLM-unavailable alerts are no
+  longer fired for store-write failures inside validation (a failed
+  validation task is recorded as `validation:<Exception>` with an "error"
+  status and a bounded retry), validator bookkeeping/cache writes degrade to
+  warnings instead of failing an approved validation, healthz LLM counters
+  now read the real `llm_calls`/`llm_successes` attributes (they always
+  reported 0), and the prediction-service launchd logs carry ISO-8601
+  timestamps. Verified by the seven approved seam RED/GREEN cases
+  (service_flags round-trip, read-model flag rendering, runtime-table-free
+  refresh, health-log formatter/scheduler, alert semantics, healthz counters,
+  WAL truncate) plus the full `make test` and `make candidate-acceptance`
+  gates; no live calls, orders or deployment were performed. A same-day gate
+  fix-forward also replaced the hardcoded clock literal in
+  `test_lp_runtime_stops_obsolete_sampling_and_keeps_exposure_risk`
+  (introduced by a5a7afe4) with the real clock, because the 60-second
+  account-snapshot freshness window made the fixed 2026-09-17 09:01 Beijing
+  timestamp fail forever after.
+
 - The LP dashboard's "我的订单与持仓" block was replaced by "当天 LP 委托"（北京时间
   08:00 起，即当前 UTC 奖励日）：只显示归属为 LP 的委托——未成交（含部分成交）与
   已成交（含全量成交后已离开挂单列表的订单，按当天成交聚合并标注最新成交时间），
