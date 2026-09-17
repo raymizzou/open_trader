@@ -24,6 +24,115 @@ from .polymarket_lp import (
 )
 
 _BEIJING = ZoneInfo("Asia/Shanghai")
+LP_DAILY_AMPLITUDE_LIMIT = Decimal("0.01")
+LP_SHORTLIST_LIMIT = 50
+
+
+def _lp_history_summary(direction: Mapping[str, object]) -> Mapping[str, object] | None:
+    value = direction.get("history_summary")
+    if isinstance(value, Mapping):
+        return value
+    market = direction.get("market")
+    if isinstance(market, Mapping):
+        value = market.get("history_summary")
+        if isinstance(value, Mapping):
+            return value
+    return None
+
+
+def _lp_summary_amplitude(summary: Mapping[str, object]) -> Decimal | None:
+    return _maybe_decimal(summary.get("amplitude"))
+
+
+def _lp_shortlist_rows(
+    direction_facts: object,
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, object]]:
+    """Build every market passing the light rules before the fixed cap."""
+
+    if not isinstance(direction_facts, (list, tuple)):
+        return []
+    checked_at = now.astimezone(UTC) if isinstance(now, datetime) and now.tzinfo else None
+    markets: dict[str, dict[str, object]] = {}
+    for direction in direction_facts:
+        if not isinstance(direction, Mapping):
+            continue
+        market = direction.get("market")
+        if not isinstance(market, Mapping):
+            market = direction
+        condition_id = str(market.get("condition_id") or "").strip()
+        market_id = str(market.get("market_id") or condition_id).strip()
+        if not condition_id or not market_id:
+            continue
+        if direction.get("reward_active") is not True:
+            continue
+        pool = _maybe_decimal(direction.get("daily_pool_usd", market.get("daily_pool_usd")))
+        if pool is None or pool <= 0 or market.get("accepting_orders") is not True:
+            continue
+        if any(direction.get(key) is True or market.get(key) is True for key in ("participating", "already_participating", "known_participation")):
+            continue
+        summary = _lp_history_summary(direction)
+        if summary is None or str(summary.get("state") or "").lower() not in {"known", "ready", "eligible"}:
+            continue
+        amplitude = _lp_summary_amplitude(summary)
+        if amplitude is None or amplitude < 0 or amplitude > LP_DAILY_AMPLITUDE_LIMIT:
+            continue
+        if checked_at is not None:
+            checked_value = summary.get("checked_at", summary.get("updated_at"))
+            try:
+                checked_summary_at = _timestamp(checked_value, name="history_checked_at")
+            except ValueError:
+                continue
+            age = (checked_at - checked_summary_at).total_seconds()
+            if age < 0 or age >= 2 * 60 * 60:
+                continue
+            valid_until = summary.get("valid_until")
+            if valid_until is not None:
+                try:
+                    if checked_at >= _timestamp(valid_until, name="history_valid_until"):
+                        continue
+                except ValueError:
+                    continue
+        row = markets.setdefault(
+            condition_id,
+            {
+                "market_id": market_id,
+                "condition_id": condition_id,
+                "market_title": market.get("market_title"),
+                "market_url": market.get("market_url"),
+                "daily_pool_usd": pool,
+                "state": "eligible",
+                "directions": [],
+            },
+        )
+        directions = row["directions"]
+        if isinstance(directions, list):
+            directions.append(
+                {
+                    "outcome": str(market.get("outcome") or direction.get("outcome") or "").upper(),
+                    "token_id": market.get("token_id", direction.get("token_id")),
+                    "history_summary": dict(summary),
+                }
+            )
+        if pool > _maybe_decimal(row.get("daily_pool_usd")):
+            row["daily_pool_usd"] = pool
+    rows = list(markets.values())
+    rows.sort(key=lambda row: (-_maybe_decimal(row.get("daily_pool_usd")) or Decimal("0"), str(row.get("market_id") or row.get("condition_id") or "")))
+    return rows
+
+
+def lp_shortlist(
+    direction_facts: object,
+    *,
+    now: datetime | None = None,
+    limit: int = LP_SHORTLIST_LIMIT,
+) -> list[dict[str, object]]:
+    """Select reward markets from prepared facts before any risk reads."""
+
+    if type(limit) is not int or limit < 1:
+        return []
+    return _lp_shortlist_rows(direction_facts, now=now)[:LP_SHORTLIST_LIMIT]
 
 
 def _next_review_at(now: datetime) -> datetime:

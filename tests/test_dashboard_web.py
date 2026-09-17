@@ -5823,6 +5823,158 @@ console.log(JSON.stringify(result));
     assert rendered["accountIntervalsAfterExit"] == [rendered["accountTimerId"]]
 
 
+def test_lp_funnel_renders_stage_counts_before_recommendations() -> None:
+    output = run_dashboard_js(r'''
+const dashboard = {
+  state:"ready", complete:true, checked_at:"2026-09-17T01:00:00Z",
+  funnel:{
+    catalog_read:1200, base_pass:800, volatility_pass:120, selected:50,
+    risk:{passed:30,rejected:15,unknown:5},
+    conditions:{
+      catalog:"本轮实际返回的奖励目录",
+      base:"奖励启用 · 奖池大于 0 · 接受订单 · 无已知参与",
+      volatility:"window=24h; fidelity=1m; amplitude<=0.01; refresh=1h; ttl=2h",
+      selected:"limit=50; sort=daily_pool_usd_desc,market_id_asc",
+      risk:"当前盘口、账户事实与压力退出",
+    },
+    reasons:{base:["奖励状态未知"],volatility:["历史不足"],risk:["盘口缺失"]},
+  }, recommendations:[{market_id:"M01",condition_id:"condition-M01",market_title:"Rejected day history",daily_pool_usd:"100",state:"rejected",directions:{YES:{state:"rejected",token_id:"token-M01",reason_codes:["book_stale"],screening:{state:"known",amplitude:"0.005",window_start:"2026-09-16T01:00:00Z",window_end:"2026-09-17T01:00:00Z",checked_at:"2026-09-17T01:00:00Z",valid_until:"2026-09-17T03:00:00Z",sample_count:721},guidance:null}}}], orders:[], positions:[],
+};
+const html = predictionLpCard({lp_dashboard:dashboard});
+console.log(JSON.stringify({
+  html,
+  order:["目录已读取","基础条件通过","波动条件通过","排序入选","风控通过"].map((label)=>html.indexOf(label)),
+  counts:["1,200","800","120","50","30","15","5"].map((value)=>html.includes(value)),
+  stages:(html.match(/data-lp-funnel-stage=/g)||[]).length,
+  reasons:html.includes("data-lp-funnel-reasons") && html.includes("奖励状态未知") && html.includes("历史不足") && html.includes("盘口缺失"),
+  tableAfter:html.indexOf("推荐标的") < html.indexOf("pm-lp-candidate-table"),
+  dayHistory:html.includes("24h 极差 0.5¢") && html.includes("2026-09-17") && !html.includes("1h 极差") && !html.includes("完整 1h") && !html.includes("一小时中间价"),
+  rejectedReason:html.includes("当前盘口已过期") && !html.includes("可参与"),
+}));
+''')
+    rendered = json.loads(output)
+    assert all(index >= 0 for index in rendered["order"])
+    assert rendered["order"] == sorted(rendered["order"])
+    assert all(rendered["counts"])
+    assert rendered["stages"] == 5
+    assert rendered["reasons"] is True
+    assert rendered["tableAfter"] is True
+    assert rendered["dayHistory"] is True
+    assert rendered["rejectedReason"] is True
+    assert "未入选 70" in rendered["html"]
+    assert "风险拒绝 70" not in rendered["html"]
+
+
+def test_lp_funnel_distinguishes_unknown_stale_and_confirmed_zero() -> None:
+    output = run_dashboard_js(r'''
+const base = {orders:[],positions:[],recommendations:[],candidate_state:"ready",candidate_stale:false,candidate_checked_at:"2026-09-17T01:00:00Z",candidate_last_success_at:"2026-09-17T01:00:00Z"};
+const unknown = predictionLpCard({lp_dashboard:{...base, funnel:{}}});
+const zero = predictionLpCard({lp_dashboard:{...base, funnel:{
+  catalog_read:0,base_pass:0,volatility_pass:0,selected:0,
+  risk:{passed:0,rejected:0,unknown:0}, conditions:{},
+}}});
+const zeroConfirmed = predictionLpCard({lp_dashboard:{...base, funnel:{
+  catalog_read:0,base_pass:0,volatility_pass:0,selected:0,
+  risk:{passed:0,rejected:0,unknown:0},
+  conditions:{
+    catalog:{来源:"奖励目录与市场资料",完整性:"完整目录；部分结果可参与筛选；缺失资料=UNKNOWN"},
+    base:{奖励:"奖励启用且日奖池>0",市场:"接受订单",参与:"没有已知订单或持仓"},
+    volatility:{窗口:"24h",粒度:"1m",振幅:"不超过1¢",刷新:"每小时",有效期:"2h",缺失:"UNKNOWN"},
+    selected:{排序:"日奖池降序，同额按市场ID升序",上限:50},
+    risk:{奖励与市场资料:"60s内",盘口与账户:"10s内；订单与持仓资料完整",事件:"开始前30分钟、进行中、结束后1h冷却；结束后筛选必须通过；缺失=UNKNOWN",入场压力:"最小数量、奖励价带、资金预留、含费压力退出不超过10%"},
+  },
+  reasons:{catalog:[],base:[],volatility:[],selected:[],risk:[]},
+}}});
+const scanning = predictionLpCard({lp_dashboard:{...base, state:"scanning", scanning:true, funnel:{
+  catalog_read:12,base_pass:8,volatility_pass:3,selected:2,
+  risk:{state:"pending"}, conditions:{},
+}}});
+const stale = predictionLpCard({lp_dashboard:{...base, state:"ready", stale:false,
+  checked_at:"2026-09-17T05:00:00Z", last_success_at:"2026-09-17T05:00:00Z",
+  candidate_state:"stale", candidate_stale:true,
+  candidate_checked_at:"2026-09-17T01:00:00Z", candidate_last_success_at:"2026-09-17T01:00:00Z", funnel:{
+    catalog_read:12,base_pass:8,volatility_pass:3,selected:2,
+    risk:{passed:1,rejected:1,unknown:0}, conditions:{},
+  },
+}});
+const partial = predictionLpCard({lp_dashboard:{...base, state:"ready", stale:false,
+  checked_at:"2026-09-17T05:00:00Z", last_success_at:"2026-09-17T05:00:00Z",
+  complete:false, candidate_state:"incomplete", candidate_stale:false,
+  candidate_checked_at:"2026-09-17T02:00:00Z", candidate_last_success_at:"2026-09-17T01:00:00Z", funnel:{
+    catalog_read:12,base_pass:8,volatility_pass:3,selected:2,
+    risk:{passed:1,rejected:1,unknown:0}, conditions:{},
+  },
+}});
+const partialStale = predictionLpCard({lp_dashboard:{...base, state:"ready", stale:false,
+  checked_at:"2026-09-17T05:00:00Z", last_success_at:"2026-09-17T05:00:00Z",
+  complete:false, candidate_state:"stale", candidate_stale:true,
+  candidate_checked_at:"2026-09-17T02:00:00Z", candidate_last_success_at:"2026-09-17T01:00:00Z", funnel:{
+    catalog_read:12,base_pass:8,volatility_pass:3,selected:2,
+    risk:{passed:1,rejected:1,unknown:0}, conditions:{},
+  },
+}});
+const funnelFragment = (html) => html.slice(html.indexOf('<section class="pm-panel pm-relation-funnel pm-lp-funnel"'));
+const confirmedFunnel = funnelFragment(zeroConfirmed);
+console.log(JSON.stringify({
+  unknown:unknown.includes("UNKNOWN") && unknown.includes("待评估"),
+  zero:zero.includes('data-lp-funnel-stage="catalog-read"><span>目录已读取') && zero.includes('>0</strong>'),
+  confirmedZero:confirmedFunnel.includes("奖励目录与市场资料") && confirmedFunnel.includes("0")
+    && confirmedFunnel.includes("本轮没有淘汰原因") && !confirmedFunnel.includes("原因 UNKNOWN")
+    && !confirmedFunnel.includes("规则 UNKNOWN"),
+  scanning:scanning.includes("扫描中") && scanning.includes("待评估") && !scanning.includes("风险拒绝 0"),
+  stale:stale.includes("已过期") && stale.includes("2026-09-17") && stale.includes("上次筛选条件") && !stale.includes("05:00"),
+  partial:(funnelFragment(partial).includes("部分") && funnelFragment(partial).includes("10:00")
+    && !funnelFragment(partial).includes("09:00") && !funnelFragment(partial).includes("13:00")),
+  partialStale:(funnelFragment(partialStale).includes("已过期") && funnelFragment(partialStale).includes("部分结果") && funnelFragment(partialStale).includes("10:00")
+    && !funnelFragment(partialStale).includes("09:00")),
+  keyboard:[unknown,zero,scanning,stale].every((html)=>html.includes("<details data-lp-funnel-reasons") && html.includes("<summary>筛选原因</summary>")),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered == {
+    "unknown": True,
+    "zero": True,
+    "confirmedZero": True,
+    "scanning": True,
+    "stale": True,
+    "partial": True,
+    "partialStale": True,
+    "keyboard": True,
+}
+
+
+def test_lp_funnel_hints_show_applied_conditions() -> None:
+    output = run_dashboard_js(r'''
+const render = (conditions) => predictionLpCard({lp_dashboard:{
+  orders:[],positions:[],recommendations:[], funnel:{
+    catalog_read:1,base_pass:1,volatility_pass:1,selected:1,
+    risk:{passed:1,rejected:0,unknown:0}, conditions,
+  },
+}});
+const actual = render({
+  catalog:{来源:"奖励目录与市场资料",完整性:"部分结果可参与筛选；缺失资料=UNKNOWN"},
+  base:{奖励:"奖励启用且日奖池>0",市场:"接受订单",参与:"没有已知订单或持仓"},
+  volatility:{窗口:"24h",粒度:"1m",振幅:"不超过1¢",刷新:"每小时",有效期:"2h",缺失:"UNKNOWN"},
+  selected:{排序:"日奖池降序，同额按市场ID升序",上限:50},
+  risk:{盘口与账户:"10s内；订单与持仓资料完整",事件:"结束后1h冷却",入场压力:"含费压力退出不超过10%"},
+});
+const missing = render({});
+console.log(JSON.stringify({
+  hintCount:(actual.match(/data-lp-funnel-hint=/g)||[]).length,
+  actual:["24h","1m","不超过1¢","每小时","2h","50","含费压力退出不超过10%"].every((item)=>actual.includes(item)),
+  missingConditions:missing.includes("规则 UNKNOWN") && !missing.includes("window=24h") && !missing.includes("limit=50"),
+  readable:actual.includes("奖励目录与市场资料") && actual.includes("订单与持仓资料完整") && !actual.includes("[object Object]") && !actual.includes("source=") && !actual.includes("complete=True"),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered == {"hintCount": 5, "actual": True, "missingConditions": True, "readable": True}
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    assert ".pm-lp-funnel-hint:hover" in css
+    assert ".pm-lp-funnel-hint:focus-visible" in css
+    assert ".pm-lp-funnel" in css and "overflow: visible" in css
+    assert ".pm-lp-funnel .pm-lp-funnel-grid { grid-template-columns: 1fr; }" in css
+
+
 def test_lp_card_shows_market_scoring_and_residual() -> None:
     output = run_dashboard_js(r'''
 const base = {
@@ -5903,9 +6055,10 @@ const direction = (marketId, conditionId, outcome, price, capital, loss, tokenId
   state: "eligible",
   reason_codes: ["event_coverage_incomplete"],
   screening: {
-    state: "eligible", reason_codes: [], stability_range: "0.01",
-    stability_min_midpoint: "0.50", stability_max_midpoint: "0.51",
-    stability_sample_count: 721, price_change_24h: "0.014",
+    state: "known", amplitude: "0.01", sample_count: 721,
+    window_start: "2026-09-14T04:00:00Z", window_end: checkedAt,
+    checked_at: checkedAt, valid_until: "2026-09-15T06:00:00Z",
+    price_change_24h: "0.014",
     price_change_24h_source: "gamma_market.prices.one_day_price_change",
     competition_state: "known",
   },

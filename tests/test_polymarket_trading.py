@@ -620,6 +620,58 @@ def make_adapter(fake: FakeClient | None = None) -> tuple[PolymarketTradingClien
     return PolymarketTradingClient(TradingConfig(SIGNER, WALLET), client=fake), fake
 
 
+def test_lp_price_history_reader_batches_and_preserves_missing_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, _ = make_adapter()
+    tokens = [f"token-{index:02d}" for index in range(21)] + ["token-00"]
+    start_ts = 1_700_000_000
+    end_ts = start_ts + 60
+    requests: list[dict[str, object]] = []
+
+    def open_batch(request: object, **_: object) -> FakeResponse:
+        body = json.loads(getattr(request, "data").decode("utf-8"))
+        requests.append(body)
+        markets = body["markets"]
+        assert body["start_ts"] == start_ts
+        assert body["end_ts"] == end_ts
+        assert body["fidelity"] == 1
+        if "token-20" in markets:
+            raise OSError("history endpoint unavailable")
+        history: dict[str, object] = {}
+        for token in markets:
+            if token == "token-02":
+                continue
+            if token == "token-01":
+                history[token] = [
+                    {"t": start_ts, "p": "0.50"},
+                    {"t": end_ts, "p": "1.20"},
+                ]
+                continue
+            history[token] = [
+                {"t": start_ts, "p": "0"},
+                {"t": end_ts, "p": "0.005"},
+            ]
+        return FakeResponse({"history": history})
+
+    monkeypatch.setattr("open_trader.polymarket_trading.urlopen", open_batch)
+    result = adapter.lp_price_history(
+        tokens, start_ts=start_ts, end_ts=end_ts, fidelity=1
+    )
+
+    assert len(requests) == 2
+    assert sorted(len(body["markets"]) for body in requests) == [1, 20]
+    assert len({token for body in requests for token in body["markets"]}) == 21
+    assert all("token_ids" not in body for body in requests)
+    assert result["request_count"] == 2
+    assert result["history"]["token-00"][0]["p"] == Decimal("0")
+    assert "token-01" in result["unknown_token_ids"]
+    assert "token-02" in result["unknown_token_ids"]
+    assert "token-20" in result["unknown_token_ids"]
+    assert "token-01" not in result["history"]
+    assert result["state"] == "partial"
+
+
 def test_lp_catalog_reads_all_reward_pages_without_double_counting() -> None:
     native_asset = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
     sponsored_asset = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"

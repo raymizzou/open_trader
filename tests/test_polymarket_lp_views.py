@@ -4,10 +4,62 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from open_trader import polymarket_lp_views
-from open_trader.polymarket_lp_views import lp_candidate_rows
+from open_trader.polymarket_lp_views import lp_candidate_rows, lp_shortlist
 
 
 NOW = datetime(2026, 9, 15, 1, 0, tzinfo=UTC)
+
+
+def test_lp_shortlist_uses_available_facts_and_caps_markets_before_risk() -> None:
+    def direction(
+        market_id: str,
+        pool: int,
+        *,
+        amplitude: str = "0.005",
+        history_state: str = "known",
+        outcome: str = "YES",
+    ) -> dict[str, object]:
+        return {
+            "market": {
+                "market_id": market_id,
+                "condition_id": f"condition-{market_id}",
+                "outcome": outcome,
+                "accepting_orders": True,
+            },
+            "daily_pool_usd": Decimal(pool),
+            "reward_active": True,
+            "history_summary": {
+                "state": history_state,
+                "amplitude": Decimal(amplitude),
+                "checked_at": NOW,
+                "window_start": NOW - timedelta(hours=24),
+                "window_end": NOW,
+            },
+        }
+
+    directions = [
+        direction(f"M{index:02d}", 601 - index)
+        for index in range(1, 61)
+    ]
+    directions.extend(
+        (
+            direction("V", 1000, amplitude="0.0101"),
+            direction("U", 999, history_state="unknown"),
+            direction("H", 998, history_state="insufficient_history"),
+            direction("M01", 601, outcome="NO"),
+        )
+    )
+
+    shortlisted = lp_shortlist(directions, now=NOW)
+    assert [row["market_id"] for row in shortlisted] == [
+        f"M{index:02d}" for index in range(1, 51)
+    ]
+
+    exact_boundary = direction("E", 2000, amplitude="0.0100")
+    with_boundary = lp_shortlist([exact_boundary, *directions], now=NOW)
+    assert [row["market_id"] for row in with_boundary[:2]] == ["E", "M01"]
+    assert len(with_boundary) == 50
+    assert all("risk" not in row for row in with_boundary)
 
 
 def _direction(

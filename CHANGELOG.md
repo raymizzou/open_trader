@@ -22,6 +22,19 @@ operator-facing: what changed, which workflow is affected, and what was verified
   `make test` and `make candidate-acceptance` gates; no live calls, orders or
   deployment were performed.
 
+- Replaced the LP candidate path's whole-catalog BBO gate with a read-only light
+  funnel backed by cached 24-hour price history: hourly batched history refreshes
+  use 20-token-ID/direction requests with at most four concurrent batches, summaries expire
+  at two hours, and only the selected 50 markets receive final risk reads.
+  Partial or failed account/盘口 reads preserve the known funnel and mark final
+  risk UNKNOWN; the existing event cooldown and exposure protections remain.
+  The native LP page now shows actual stage counts, reasons, history windows and
+  candidate timestamps, with responsive accessible hints. Verified by the
+  ordered funnel/history/runtime/UI cases, 13 passing mandatory regressions,
+  focused history-cache/runtime/UI checks, and the documented retired-path
+  fixture migrations; no live calls, orders, eligibility activation or deployment
+  were performed.
+
 ## 2026-09-16
 
 - Removed Production Smoke's pre-deploy submission-baseline comparison and

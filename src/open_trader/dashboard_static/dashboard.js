@@ -3468,7 +3468,8 @@ function lpDashboardRecommendationRow(recommendation, stale) {
   const priorOutcome = state.predictionMarket.lpDirectionSelections[conditionId];
   const selected = actionable.find(([outcome]) => outcome === priorOutcome)
     || actionable[0]
-    || rows.find(([, direction]) => direction.guidance && typeof direction.guidance === "object");
+    || rows.find(([, direction]) => direction.guidance && typeof direction.guidance === "object")
+    || rows[0];
   const outcome = selected?.[0] || "";
   const direction = selected?.[1] || {};
   const screening = direction.screening && typeof direction.screening === "object"
@@ -3484,10 +3485,23 @@ function lpDashboardRecommendationRow(recommendation, stale) {
   const directionsControl = eligible && actionable.length > 1
     ? `<select class="pm-button" data-lp-direction data-condition-id="${escapeHtml(conditionId)}" aria-label="${escapeHtml(lpMarketTitle(recommendation))} 参考方向">${actionable.map(([value]) => `<option value="${value}"${value === outcome ? " selected" : ""}>买 ${value}</option>`).join("")}</select>`
     : `<span>${outcome ? `买 ${escapeHtml(outcome)}` : "方向 UNKNOWN"}</span>`;
-  const range = predictionHasValue(screening.stability_range)
-    ? lpDashboardPrice(screening.stability_range)
+  const history = screening;
+  const range = predictionHasValue(history.amplitude)
+    ? lpDashboardPrice(history.amplitude)
     : "UNKNOWN";
-  const sampleCount = predictionNumber(screening.stability_sample_count, "UNKNOWN");
+  const sampleCount = predictionNumber(history.sample_count, "UNKNOWN");
+  const historyWindowStart = predictionHasValue(history.window_start)
+    ? predictionHktTimestamp(history.window_start)
+    : "UNKNOWN";
+  const historyWindowEnd = predictionHasValue(history.window_end)
+    ? predictionHktTimestamp(history.window_end)
+    : "UNKNOWN";
+  const historyCheckedAt = predictionHasValue(history.checked_at)
+    ? predictionHktTimestamp(history.checked_at)
+    : "UNKNOWN";
+  const historyValidUntil = predictionHasValue(history.valid_until)
+    ? predictionHktTimestamp(history.valid_until)
+    : "UNKNOWN";
   const pool = lpDashboardMoney(recommendation.daily_pool_usd);
   const referenceShare = predictionValue(recommendation.reference_share_percentage, "UNKNOWN");
   const referenceDailyReward = lpDashboardMoney(recommendation.reference_daily_reward_usd);
@@ -3498,8 +3512,8 @@ function lpDashboardRecommendationRow(recommendation, stale) {
   const lossPercent = Number.isFinite(lossRatio) ? `${(lossRatio * 100).toFixed(2)}%` : "UNKNOWN";
   const reasonLabels = {
     event_coverage_incomplete: "未接入新闻与其他事件日历，关键事件覆盖不完整",
-    stability_history_incomplete: "一小时盘口样本不完整",
-    stability_range_exceeded: "一小时中间价波动超过 1¢",
+    stability_history_incomplete: "24 小时历史样本不完整",
+    stability_range_exceeded: "24 小时价格波动超过 1¢",
     account_facts_unknown: "账户订单或持仓信息不完整",
     market_already_participating: "该市场已有订单或持仓",
     reward_inactive: "奖励已停止",
@@ -3521,7 +3535,8 @@ function lpDashboardRecommendationRow(recommendation, stale) {
     ? `<a class="pm-button" href="${escapeHtml(marketUrl)}" target="_blank" rel="noopener noreferrer">Polymarket</a>`
     : "<span class=\"sub\">官方市场链接 UNKNOWN</span>";
   const detailRows = [
-    `平稳性：一小时中间价极差 ${range} · 样本 ${sampleCount} · 采样窗口要求 ≤ 1¢。`,
+    `平稳性：24 小时历史极差 ${range} · 样本 ${sampleCount} · 窗口 ${historyWindowStart} 至 ${historyWindowEnd}。`,
+    `历史检查 ${historyCheckedAt} · 有效至 ${historyValidUntil} · 缺失资料保持 UNKNOWN。`,
     `24 小时价格参考 ${change} · 来源 ${source}；仅作参考。`,
     `日奖池 ${pool} · 参考 ${referenceShare}% 日奖励估算 ${referenceDailyReward} · 奖励价带公开挂单 ${competition} 份（竞争代理，不代表个人奖励份额）。`,
     `买入 ${outcome || "UNKNOWN"}：${lpDashboardPrice(guidance.price)} × ${predictionValue(guidance.quantity, "UNKNOWN")} 份 · 占资 ${lpDashboardMoney(guidance.required_capital)} · 含费压力估损 ${lpDashboardMoney(guidance.estimated_exit_loss)}（${lossPercent}，估损不超过该市场投入的 10%）。`,
@@ -3537,7 +3552,7 @@ function lpDashboardRecommendationRow(recommendation, stale) {
     : "UNKNOWN";
   const title = lpMarketTitleLink(recommendation);
   const directionText = directionsControl + `<span class="sub">${escapeHtml(status)}</span>`;
-  const rowMarkup = `<tr data-lp-recommendation="${escapeHtml(conditionId)}"><td>${title}<span class="sub">${escapeHtml(predictionValue(recommendation.market_id, "UNKNOWN"))}</span></td><td data-label="日奖池 / 竞争"><div class="num">${escapeHtml(pool)}</div><span class="sub">参考 ${escapeHtml(referenceShare)}% · 5% 日奖励估算 ${escapeHtml(referenceDailyReward)}</span><span class="sub">价带公开挂单 ${escapeHtml(competition)} 份</span></td><td data-label="下单指引 / 资金"><div>${directionText}<div>${escapeHtml(lpDashboardPrice(guidance.price))} × ${escapeHtml(predictionValue(guidance.quantity, "UNKNOWN"))} 份</div><span class="sub">占资 ${escapeHtml(lpDashboardMoney(guidance.required_capital))}</span></div></td><td data-label="价格平稳性"><div>1h 极差 ${escapeHtml(range)}<span class="sub">完整 1h · ${escapeHtml(sampleCount)} 个样本</span></div></td><td data-label="压力退出估损"><div class="num">${escapeHtml(lpDashboardMoney(guidance.estimated_exit_loss))}（${escapeHtml(lossPercent)}）<span class="sub">估损不超过该市场投入的 10%</span></div></td><td data-label="操作 / 检查时间"><div>${marketLink}<span class="sub">检查 ${escapeHtml(checkedAt)}</span>${predictionHasValue(guidance.expires_at) ? `<span class="sub">有效至 ${escapeHtml(expiresAt)}</span>` : ""}</div></td></tr>`;
+  const rowMarkup = `<tr data-lp-recommendation="${escapeHtml(conditionId)}"><td>${title}<span class="sub">${escapeHtml(predictionValue(recommendation.market_id, "UNKNOWN"))}</span></td><td data-label="日奖池 / 竞争"><div class="num">${escapeHtml(pool)}</div><span class="sub">参考 ${escapeHtml(referenceShare)}% · 5% 日奖励估算 ${escapeHtml(referenceDailyReward)}</span><span class="sub">价带公开挂单 ${escapeHtml(competition)} 份</span></td><td data-label="下单指引 / 资金"><div>${directionText}<div>${escapeHtml(lpDashboardPrice(guidance.price))} × ${escapeHtml(predictionValue(guidance.quantity, "UNKNOWN"))} 份</div><span class="sub">占资 ${escapeHtml(lpDashboardMoney(guidance.required_capital))}</span></div></td><td data-label="价格平稳性"><div>24h 极差 ${escapeHtml(range)}<span class="sub">窗口 ${escapeHtml(historyWindowStart)} 至 ${escapeHtml(historyWindowEnd)} · ${escapeHtml(sampleCount)} 个样本</span><span class="sub">历史检查 ${escapeHtml(historyCheckedAt)} · 有效至 ${escapeHtml(historyValidUntil)}</span></div></td><td data-label="压力退出估损"><div class="num">${escapeHtml(lpDashboardMoney(guidance.estimated_exit_loss))}（${escapeHtml(lossPercent)}）<span class="sub">估损不超过该市场投入的 10%</span></div></td><td data-label="操作 / 检查时间"><div>${marketLink}<span class="sub">检查 ${escapeHtml(checkedAt)}</span>${predictionHasValue(guidance.expires_at) ? `<span class="sub">有效至 ${escapeHtml(expiresAt)}</span>` : ""}</div></td></tr>`;
   return rowMarkup + `<tr class="pm-lp-evidence-row"><td class="sub" colspan="6">${detailMarkup}</td></tr>`;
 }
 
@@ -3556,7 +3571,8 @@ function predictionLpCard(payload) {
     && String(session.state || "").toLowerCase() !== "none"
     && !session.error;
   const stale = dashboard.stale === true || dashboard.state === "stale";
-  const candidatesStale = stale || dashboard.candidate_stale === true;
+  const candidateState = String(dashboard.candidate_state || "").toLowerCase();
+  const candidatesStale = dashboard.candidate_stale === true || candidateState === "stale";
   const checkedAt = dashboard.last_success_at || dashboard.checked_at;
   const freshness = stale
     ? predictionHasValue(checkedAt)
@@ -3596,6 +3612,16 @@ function predictionLpCard(payload) {
         ? "目录尚未完整，暂未读取到可展示标的。"
         : "当前没有符合条件的推荐标的。")
       + "</td></tr>";
+  const funnelMarkup = predictionLpFunnel({
+    ...(dashboard.funnel && typeof dashboard.funnel === "object" ? dashboard.funnel : {}),
+    state: dashboard.candidate_state,
+    stale: candidatesStale,
+    scanning: dashboard.scanning,
+    complete: dashboard.complete,
+    checked_at: dashboard.candidate_checked_at,
+    last_success_at: dashboard.candidate_last_success_at,
+    candidate_last_success_at: dashboard.candidate_last_success_at,
+  });
   const sessionDetails = activeSession
     ? "<details class=\"pm-lp-session-details\"><summary>当前系统会话详情 · "
       + escapeHtml(predictionValue(session.market_title || session.market || session.question, "系统会话"))
@@ -3617,6 +3643,7 @@ function predictionLpCard(payload) {
     + "<tbody>" + todayRowsHtml + "</tbody></table></div>"
     + nonLpFootnote
     + "<p class=\"sub\">预计 LP 毛奖励；压力损失不含奖励抵扣；10% 是风险警告线。</p></section>"
+    + funnelMarkup
     + "<section aria-label=\"推荐标的\"><h3>推荐标的 <span class=\"sub\">· "
     + escapeHtml(catalogStatus) + "</span></h3><div class=\"pm-table-wrap\"><table class=\"pm-table pm-lp-candidate-table\">"
     + "<thead><tr><th scope=\"col\">标的</th><th scope=\"col\">日奖池 / 竞争</th><th scope=\"col\">下单指引 / 资金</th><th scope=\"col\">价格平稳性</th><th scope=\"col\">压力退出估损</th><th scope=\"col\">操作 / 检查时间</th></tr></thead>"
@@ -4266,6 +4293,115 @@ function predictionFunnelDuration(value) {
 function predictionFunnelStage(label, value, note = "", tone = "") {
   const display = predictionNumber(value);
   return `<article class="pm-funnel-stage ${tone}"><span>${escapeHtml(label)}</span><strong>${escapeHtml(display)}</strong>${note ? `<small>${escapeHtml(note)}</small>` : ""}</article>`;
+}
+
+function predictionLpFunnelCount(value) {
+  if (value === null || value === undefined || String(value).trim() === "") return "UNKNOWN";
+  return predictionNumber(value, "UNKNOWN");
+}
+
+function predictionLpFunnelCondition(conditions, key) {
+  const value = conditions && typeof conditions === "object" ? conditions[key] : undefined;
+  if (value === null || value === undefined || String(value).trim() === "") return "规则 UNKNOWN";
+  if (typeof value === "object") {
+    const parts = Object.entries(value).map(([name, item]) => `${name}：${item}`);
+    return parts.length ? parts.join(" · ") : "规则 UNKNOWN";
+  }
+  return String(value);
+}
+
+function predictionLpFunnelStage(label, key, value, note, hint, tone = "") {
+  const hintNode = `<span class="pm-lp-funnel-hint" tabindex="0" role="note" aria-label="${escapeHtml(hint)}" data-lp-funnel-hint="${escapeHtml(key)}">!<span class="pm-lp-funnel-tip" role="tooltip">${escapeHtml(hint)}</span></span>`;
+  return `<article class="pm-funnel-stage pm-lp-funnel-stage ${tone}" data-lp-funnel-stage="${escapeHtml(key)}"><span>${escapeHtml(label)}${hintNode}</span><strong>${escapeHtml(value)}</strong><small>${escapeHtml(note)}</small></article>`;
+}
+
+function predictionLpFunnel(payload) {
+  const funnel = payload && typeof payload === "object" ? payload : {};
+  const conditions = funnel.conditions && typeof funnel.conditions === "object" ? funnel.conditions : {};
+  const risk = funnel.risk && typeof funnel.risk === "object" ? funnel.risk : {};
+  const read = (key) => funnel[key];
+  const numeric = (value) => {
+    if (value === null || value === undefined || String(value).trim() === "") return null;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  };
+  const difference = (from, to, label) => {
+    const first = numeric(from);
+    const second = numeric(to);
+    return first !== null && second !== null
+      ? `${label} ${predictionNumber(Math.max(0, first - second), "UNKNOWN")}`
+      : `${label} UNKNOWN`;
+  };
+  const hasRiskCount = ["passed", "rejected", "unknown"].some((key) => numeric(risk[key]) !== null);
+  const riskPending = risk.state === "pending"
+    || funnel.risk_evaluated === false
+    || (!hasRiskCount && funnel.risk_evaluated !== true);
+  const riskValue = riskPending ? "待评估" : predictionLpFunnelCount(risk.passed);
+  const riskNote = riskPending
+    ? "盘口与账户尚未评估"
+    : `通过 ${predictionLpFunnelCount(risk.passed)} · 拒绝 ${predictionLpFunnelCount(risk.rejected)} · 资料不足 ${predictionLpFunnelCount(risk.unknown)}`;
+  const stale = payload.stale === true || payload.state === "stale";
+  const scanning = payload.scanning === true || payload.state === "scanning";
+  const incomplete = payload.state === "incomplete" || payload.complete === false;
+  const checkedAt = payload.checked_at || funnel.checked_at || payload.last_success_at || payload.candidate_last_success_at;
+  const status = stale
+    ? `已过期${incomplete ? " · 部分结果" : ""} · 上次筛选条件 ${predictionHasValue(checkedAt) ? predictionHktTimestamp(checkedAt) : "UNKNOWN"}`
+    : scanning
+      ? "扫描中 · 保留当前已读计数"
+      : incomplete
+        ? `部分结果 · 检查 ${predictionHasValue(checkedAt) ? predictionHktTimestamp(checkedAt) : "UNKNOWN"}`
+        : predictionHasValue(checkedAt)
+          ? `检查 ${predictionHktTimestamp(checkedAt)}`
+          : "检查时间 UNKNOWN";
+  const rawReasons = funnel.reasons && typeof funnel.reasons === "object" ? funnel.reasons : {};
+  const reasonLabels = {catalog: "目录", base: "基础条件", volatility: "波动条件", selected: "排序入选", risk: "风控"};
+  const reasonText = (item) => {
+    if (!item || typeof item !== "object") return String(item);
+    const market = item.market_id || item.condition_id || "UNKNOWN";
+    const outcome = item.outcome ? ` ${item.outcome}` : "";
+    const code = item.reason || item.code || "UNKNOWN";
+    return `${market}${outcome} · ${String(code).replaceAll("_", " ")}`;
+  };
+  const reasonGroups = ["catalog", "base", "volatility", "selected", "risk"].map((key) => {
+    const hasReasons = Object.prototype.hasOwnProperty.call(rawReasons, key)
+      && Array.isArray(rawReasons[key]);
+    const values = hasReasons ? rawReasons[key] : [];
+    return `<section data-lp-funnel-reason-stage="${key}"><strong>${reasonLabels[key]}</strong>${values.length ? `<ul>${values.map((item) => `<li>${escapeHtml(reasonText(item))}</li>`).join("")}</ul>` : hasReasons ? "<p>本轮没有淘汰原因</p>" : "<p>原因 UNKNOWN</p>"}</section>`;
+  }).join("");
+  const reasons = `<details data-lp-funnel-reasons><summary>筛选原因</summary><div class="pm-lp-funnel-reasons">${reasonGroups}</div><p class="sub">同一标的可能有多个原因，原因数量不可相加。</p></details>`;
+  const stages = [
+    predictionLpFunnelStage(
+      "目录已读取", "catalog-read", predictionLpFunnelCount(read("catalog_read")),
+      difference(read("catalog_read"), read("base_pass"), "基础条件未通过/资料不足"),
+      predictionLpFunnelCondition(conditions, "catalog"), "live",
+    ),
+    predictionLpFunnelStage(
+      "基础条件通过", "base-pass", predictionLpFunnelCount(read("base_pass")),
+      difference(read("base_pass"), read("volatility_pass"), "波动资料不足/未通过"),
+      predictionLpFunnelCondition(conditions, "base"),
+    ),
+    predictionLpFunnelStage(
+      "波动条件通过", "volatility-pass", predictionLpFunnelCount(read("volatility_pass")),
+      difference(read("volatility_pass"), read("selected"), "未入选"),
+      predictionLpFunnelCondition(conditions, "volatility"), "live",
+    ),
+    predictionLpFunnelStage(
+      "排序入选", "selected", predictionLpFunnelCount(read("selected")),
+      (() => {
+        const selectedCondition = conditions && typeof conditions.selected === "object"
+          ? conditions.selected
+          : {};
+        const limit = selectedCondition.limit ?? selectedCondition.上限 ?? "UNKNOWN";
+        return `上限 ${limit}`;
+      })(),
+      predictionLpFunnelCondition(conditions, "selected"), "good",
+    ),
+    predictionLpFunnelStage(
+      "风控通过", "risk", riskValue, riskNote,
+      predictionLpFunnelCondition(conditions, "risk"), riskPending ? "" : "good",
+    ),
+  ].join("");
+  return `<section class="pm-panel pm-relation-funnel pm-lp-funnel" aria-label="LP 候选漏斗"><header class="pm-funnel-header"><div><h2>LP 候选漏斗</h2><p>目录已读取 → 基础条件通过 → 波动条件通过 → 排序入选（最多 50）→ 风控通过</p></div><span class="pm-pill ${stale ? "watch" : scanning ? "watch" : ""}">${escapeHtml(status)}</span></header><div class="pm-funnel-lane"><div class="pm-funnel-grid pm-funnel-grid-catalog pm-lp-funnel-grid">${stages}</div></div><div class="pm-funnel-meta"><span>市场数按阶段分别计数</span><span>未入选不等于风控拒绝</span>${reasons}</div></section>`;
 }
 
 function predictionFunnelRejections(counts) {

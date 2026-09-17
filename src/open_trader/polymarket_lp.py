@@ -6,6 +6,7 @@ import threading
 import uuid
 from copy import deepcopy
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any, cast
@@ -18,6 +19,7 @@ from .polymarket_lp_risk import (
     _executable_bid_value,
     _field,
     _freshness,
+    _has_market_order,
     _items,
     _levels,
     _maybe_decimal,
@@ -41,6 +43,10 @@ LP_CANDIDATE_REFRESH_SECONDS = Decimal("300")
 LP_RECOMMENDATION_REFRESH_SECONDS = Decimal("60")
 _LP_BOOK_SAMPLE_BATCH_SIZE = 100
 _LP_BOOK_SAMPLE_MAX_CONCURRENCY = 8
+_LP_PRICE_HISTORY_BATCH_SIZE = 20
+_LP_PRICE_HISTORY_MAX_CONCURRENCY = 4
+_LP_PRICE_HISTORY_WINDOW = timedelta(hours=24)
+_LP_PRICE_HISTORY_OVERLAP = timedelta(minutes=1)
 _BEIJING = ZoneInfo("Asia/Shanghai")
 TERMINAL_TRADE_STATES = frozenset({"CONFIRMED", "FAILED"})
 
@@ -88,6 +94,40 @@ def _report_boundary_iso(moment: datetime) -> str:
     )
 
 
+def _lp_funnel_conditions() -> dict[str, object]:
+    """Return the user-facing rules applied by every LP funnel batch."""
+
+    return {
+        "catalog": {
+            "来源": "奖励目录与市场资料",
+            "完整性": "完整目录；部分结果可参与筛选；缺失资料=UNKNOWN",
+        },
+        "base": {
+            "奖励": "奖励启用且日奖池>0",
+            "市场": "接受订单",
+            "参与": "没有已知订单或持仓",
+        },
+        "volatility": {
+            "窗口": "24h",
+            "粒度": "1m",
+            "振幅": "不超过1¢",
+            "刷新": "每小时",
+            "有效期": "2h",
+            "缺失": "UNKNOWN",
+        },
+        "selected": {
+            "排序": "日奖池降序，同额按市场ID升序",
+            "上限": 50,
+        },
+        "risk": {
+            "奖励与市场资料": "60s内",
+            "盘口与账户": "10s内；订单与持仓资料完整",
+            "事件": "开始前30分钟、进行中、结束后1h冷却；结束后筛选必须通过；缺失=UNKNOWN",
+            "入场压力": "最小数量、奖励价带、资金预留、含费压力退出不超过10%",
+        },
+    }
+
+
 def expiration_for_review(review_at: datetime, *, now: datetime | None = None) -> int:
     """Bind one GTD expiration to an absolute review deadline.
 
@@ -123,6 +163,7 @@ class PolymarketLPService:
         self._mutation_guard = mutation_guard
         self._mutex = threading.RLock()
         self._reward_refresh_lock = threading.Lock()
+        self._price_history_refresh_lock = threading.Lock()
         self._report_lock = threading.Lock()
         self._candidate_refresh_lock = threading.Lock()
         self._candidate_state_lock = threading.RLock()
@@ -141,6 +182,11 @@ class PolymarketLPService:
             "last_attempt_at": None,
             "candidate_rows_fresh": False,
             "missing_metadata_condition_ids": [],
+            "missing_book_token_ids": [],
+            "catalog_complete": False,
+            "funnel": {},
+            "selected_market_ids": [],
+            "candidate_retention_reason": "background_candidates_retired",
         }
         self._restore_candidate_snapshot()
 
@@ -167,7 +213,10 @@ class PolymarketLPService:
             checked = None
         if checked is not None:
             age = Decimal(str((now - checked).total_seconds()))
-            snapshot["stale"] = age < 0 or age > LP_CANDIDATE_REFRESH_SECONDS
+            # Candidate guidance is refreshed on the minute cadence.  Keep
+            # the batch counts and timestamp when that cadence is missed, but
+            # present the risk projection as historical at the exact boundary.
+            snapshot["stale"] = age < 0 or age >= LP_RECOMMENDATION_REFRESH_SECONDS
         else:
             snapshot["stale"] = True
         if snapshot.get("state") in {"stale", "unknown"} or (
@@ -209,7 +258,19 @@ class PolymarketLPService:
                             and direction.get("eligible") is True
                             for direction in directions.values()
                         )
+                        else "unknown"
+                        if any(
+                            isinstance(direction, Mapping)
+                            and direction.get("state") == "unknown"
+                            for direction in directions.values()
+                        )
                         else "expired"
+                        if all(
+                            isinstance(direction, Mapping)
+                            and direction.get("state") == "expired"
+                            for direction in directions.values()
+                        )
+                        else "rejected"
                     )
         return snapshot
 
@@ -334,6 +395,365 @@ class PolymarketLPService:
             "target_count": len(targets),
         }
 
+    def refresh_price_history(
+        self, *, stop_event: threading.Event | None = None
+    ) -> dict[str, object]:
+        """Refresh bounded 24-hour price summaries for the light-screen range.
+
+        This hourly path prepares history only. Candidate refreshes consume the
+        stored summaries and never call the history endpoint themselves.
+        Network work is issued in batches of twenty with at most four active
+        requests, and each completed batch is persisted before the next group
+        is allowed to retain its response.
+        """
+
+        if not self._price_history_refresh_lock.acquire(blocking=False):
+            return {"state": "busy", "target_count": 0, "updated_count": 0}
+        try:
+            now = self._now().astimezone(UTC)
+            window_start = now - _LP_PRICE_HISTORY_WINDOW
+            end_ts = int(now.timestamp())
+            catalog_reader = getattr(self.exchange, "lp_reward_catalog", None)
+            metadata_reader = getattr(self.exchange, "lp_market_metadata", None)
+            history_reader = getattr(self.exchange, "lp_price_history", None)
+            if not callable(catalog_reader):
+                return {
+                    "state": "unknown",
+                    "target_count": 0,
+                    "updated_count": 0,
+                    "unknown_count": 0,
+                    "request_count": 0,
+                    "reason": "history_readers_unavailable",
+                }
+            if stop_event is not None and stop_event.is_set():
+                return {"state": "cancelled", "target_count": 0, "updated_count": 0}
+
+            try:
+                catalog = catalog_reader(stop_event=stop_event)
+                raw_markets = catalog.get("markets") if isinstance(catalog, Mapping) else None
+                if not isinstance(raw_markets, (list, tuple)):
+                    raise ValueError("history_catalog_unknown")
+                market_rows = [row for row in raw_markets if isinstance(row, Mapping)]
+                condition_ids = tuple(
+                    dict.fromkeys(
+                        str(row.get("condition_id") or "").strip()
+                        for row in market_rows
+                        if str(row.get("condition_id") or "").strip()
+                    )
+                )
+                if not callable(metadata_reader):
+                    return {
+                        "state": "unknown",
+                        "target_count": 0,
+                        "updated_count": 0,
+                        "unknown_count": 0,
+                        "request_count": 0,
+                        "reason": "history_readers_unavailable",
+                    }
+                metadata_value = metadata_reader(condition_ids, stop_event=stop_event)
+            except Exception as exc:
+                return {
+                    "state": "unknown",
+                    "target_count": 0,
+                    "updated_count": 0,
+                    "unknown_count": 0,
+                    "request_count": 0,
+                    "reason": type(exc).__name__,
+                }
+            if not isinstance(metadata_value, Mapping):
+                return {
+                    "state": "unknown",
+                    "target_count": 0,
+                    "updated_count": 0,
+                    "unknown_count": 0,
+                    "request_count": 0,
+                    "reason": "history_metadata_unknown",
+                }
+            if not callable(history_reader):
+                return {
+                    "state": "unknown",
+                    "target_count": 0,
+                    "updated_count": 0,
+                    "unknown_count": 0,
+                    "request_count": 0,
+                    "reason": "history_readers_unavailable",
+                }
+
+            targets: list[tuple[str, str]] = []
+            for reward_market in market_rows:
+                if reward_market.get("reward_active") is not True:
+                    continue
+                pool = _maybe_decimal(reward_market.get("daily_pool_usd"))
+                if pool is None or pool <= 0:
+                    continue
+                condition_id = str(reward_market.get("condition_id") or "").strip()
+                market = metadata_value.get(condition_id)
+                if not isinstance(market, Mapping) or market.get("accepting_orders") is not True:
+                    continue
+                outcomes = market.get("outcomes")
+                if not isinstance(outcomes, Mapping):
+                    continue
+                for raw_outcome in outcomes.values():
+                    if not isinstance(raw_outcome, Mapping):
+                        continue
+                    token_id = str(raw_outcome.get("token_id") or "").strip()
+                    if token_id:
+                        targets.append((condition_id, token_id))
+            targets = list(dict.fromkeys(targets))
+            if not targets:
+                return {
+                    "state": "unknown",
+                    "target_count": 0,
+                    "updated_count": 0,
+                    "unknown_count": 0,
+                    "request_count": 0,
+                    "checked_at": now,
+                }
+
+            summary_reader = getattr(self.store, "lp_price_history_summaries", None)
+            sample_reader = getattr(self.store, "lp_price_history_samples_batch", None)
+            summary_one = getattr(self.store, "lp_price_history_summary", None)
+            samples_one = getattr(self.store, "lp_price_history_samples", None)
+            batch_writer = getattr(self.store, "lp_save_price_history_batch", None)
+            one_writer = getattr(self.store, "lp_save_price_history", None)
+            identity_batches = tuple(
+                tuple(targets[offset : offset + _LP_PRICE_HISTORY_BATCH_SIZE])
+                for offset in range(0, len(targets), _LP_PRICE_HISTORY_BATCH_SIZE)
+            )
+
+            def cached_facts(
+                identities: tuple[tuple[str, str], ...],
+            ) -> tuple[dict[tuple[str, str], Mapping[str, object]], dict[tuple[str, str], list[dict[str, object]]]]:
+                summaries: dict[tuple[str, str], Mapping[str, object]] = {}
+                samples: dict[tuple[str, str], list[dict[str, object]]] = {}
+                if callable(summary_reader):
+                    try:
+                        value = summary_reader(identities, now=now)
+                        if isinstance(value, Mapping):
+                            summaries.update(
+                                (key, item)
+                                for key, item in value.items()
+                                if isinstance(key, tuple) and isinstance(item, Mapping)
+                            )
+                    except Exception:
+                        pass
+                elif callable(summary_one):
+                    for identity in identities:
+                        try:
+                            value = summary_one(*identity, now=now)
+                        except Exception:
+                            value = None
+                        if isinstance(value, Mapping):
+                            summaries[identity] = value
+                if callable(sample_reader):
+                    try:
+                        value = sample_reader(identities)
+                        if isinstance(value, Mapping):
+                            samples.update(
+                                (key, [dict(item) for item in rows if isinstance(item, Mapping)])
+                                for key, rows in value.items()
+                                if isinstance(key, tuple) and isinstance(rows, (list, tuple))
+                            )
+                    except Exception:
+                        pass
+                elif callable(samples_one):
+                    for identity in identities:
+                        try:
+                            value = samples_one(*identity)
+                        except Exception:
+                            value = []
+                        if isinstance(value, (list, tuple)):
+                            samples[identity] = [dict(item) for item in value if isinstance(item, Mapping)]
+                return summaries, samples
+
+            def request_batch(
+                identities: tuple[tuple[str, str], ...],
+                start_ts: int,
+            ) -> tuple[tuple[tuple[str, str], ...], object, str | None]:
+                token_ids = tuple(token for _, token in identities)
+                if stop_event is not None and stop_event.is_set():
+                    return identities, None, "cancelled"
+                try:
+                    value = history_reader(
+                        token_ids,
+                        start_ts=start_ts,
+                        end_ts=end_ts,
+                        fidelity=1,
+                        stop_event=stop_event,
+                    )
+                    return identities, value, None
+                except Exception as exc:
+                    return identities, None, type(exc).__name__
+
+            def parse_samples(
+                rows: object,
+            ) -> tuple[dict[int, dict[str, object]], str | None]:
+                if not isinstance(rows, (list, tuple)):
+                    return {}, "history_missing"
+                parsed: dict[int, dict[str, object]] = {}
+                for row in rows:
+                    if not isinstance(row, Mapping):
+                        return {}, "history_values_invalid"
+                    stamp = row.get("t", row.get("timestamp"))
+                    price = _maybe_decimal(row.get("p", row.get("price")))
+                    if type(stamp) is not int or price is None or price < 0 or price > 1:
+                        return {}, "history_values_invalid"
+                    parsed[stamp] = {"t": stamp, "p": price}
+                return parsed, None
+
+            def write_rows(rows: list[dict[str, object]]) -> None:
+                if not rows:
+                    return
+                if callable(batch_writer):
+                    batch_writer(rows)
+                    return
+                if callable(one_writer):
+                    for row in rows:
+                        one_writer(
+                            str(row["condition_id"]),
+                            str(row["token_id"]),
+                            row["samples"],
+                            row["summary"],
+                        )
+
+            updated_count = 0
+            unknown_count = 0
+            request_count = 0
+            errors: dict[str, str] = {}
+            for group_offset in range(0, len(identity_batches), _LP_PRICE_HISTORY_MAX_CONCURRENCY):
+                if stop_event is not None and stop_event.is_set():
+                    break
+                batch_group = identity_batches[
+                    group_offset : group_offset + _LP_PRICE_HISTORY_MAX_CONCURRENCY
+                ]
+                cache_by_batch: dict[
+                    tuple[tuple[str, str], ...],
+                    tuple[
+                        dict[tuple[str, str], Mapping[str, object]],
+                        dict[tuple[str, str], list[dict[str, object]]],
+                    ],
+                ] = {}
+                request_group: list[tuple[tuple[tuple[str, str], ...], int]] = []
+                for identity_batch in batch_group:
+                    summaries, cached_samples = cached_facts(identity_batch)
+                    cache_by_batch[identity_batch] = (summaries, cached_samples)
+                    starts: list[int] = []
+                    for identity in identity_batch:
+                        rows = cached_samples.get(identity, [])
+                        stamps = [
+                            row.get("t")
+                            for row in rows
+                            if isinstance(row.get("t"), int)
+                        ]
+                        starts.append(
+                            max(
+                                int(window_start.timestamp()),
+                                max(stamps) - int(_LP_PRICE_HISTORY_OVERLAP.total_seconds())
+                                if stamps
+                                else int(window_start.timestamp()),
+                            )
+                        )
+                    request_group.append((identity_batch, min(starts)))
+                with ThreadPoolExecutor(
+                    max_workers=min(_LP_PRICE_HISTORY_MAX_CONCURRENCY, len(request_group)),
+                    thread_name_prefix="prediction-lp-history",
+                ) as executor:
+                    futures = {
+                        executor.submit(request_batch, identities, start_ts): (identities, start_ts)
+                        for identities, start_ts in request_group
+                    }
+                    for future in as_completed(futures):
+                        identities, start_ts = futures[future]
+                        del start_ts
+                        request_count += 1
+                        try:
+                            returned_identities, payload, error = future.result()
+                        except Exception as exc:
+                            returned_identities, payload, error = identities, None, type(exc).__name__
+                        summaries, cached_samples = cache_by_batch[identities]
+                        history_map = payload.get("history") if isinstance(payload, Mapping) else None
+                        if not isinstance(history_map, Mapping):
+                            history_map = {}
+                        rows_to_write: list[dict[str, object]] = []
+                        for condition_id, token_id in returned_identities:
+                            identity = (condition_id, token_id)
+                            prior = dict(summaries.get(identity, {}))
+                            previous_rows = cached_samples.get(identity, [])
+                            raw_rows = history_map.get(token_id)
+                            if error is None and isinstance(raw_rows, (list, tuple)):
+                                new_points, parse_error = parse_samples(raw_rows)
+                            else:
+                                new_points, parse_error = {}, error or "history_missing"
+                            merged, merge_error = parse_samples(previous_rows)
+                            reason = parse_error or merge_error
+                            if reason is None:
+                                merged.update(new_points)
+                                bounded = {
+                                    stamp: row
+                                    for stamp, row in merged.items()
+                                    if int(window_start.timestamp()) <= stamp <= end_ts
+                                }
+                                if len(bounded) < 2:
+                                    reason = "history_insufficient"
+                                else:
+                                    first_stamp = min(bounded)
+                                    last_stamp = max(bounded)
+                                    if first_stamp > int(window_start.timestamp()) + 60 or last_stamp < end_ts - 60:
+                                        reason = "history_window_incomplete"
+                            if reason is None:
+                                prices = [row["p"] for row in bounded.values()]
+                                summary: dict[str, object] = {
+                                    "state": "known",
+                                    "amplitude": max(prices) - min(prices),
+                                    "checked_at": now,
+                                    "window_start": window_start,
+                                    "window_end": now,
+                                    "sample_count": len(bounded),
+                                    "valid_until": now + timedelta(hours=2),
+                                    "last_attempt_at": now,
+                                }
+                                samples_for_store = [bounded[stamp] for stamp in sorted(bounded)]
+                                updated_count += 1
+                            else:
+                                unknown_count += 1
+                                errors[token_id] = reason
+                                samples_for_store = previous_rows
+                                summary = prior
+                                summary["last_attempt_at"] = now
+                                summary["last_error"] = reason
+                                if not summary:
+                                    summary = {
+                                        "state": "unknown",
+                                        "checked_at": None,
+                                        "last_attempt_at": now,
+                                        "reason": reason,
+                                    }
+                                elif summary.get("checked_at") is None:
+                                    summary["state"] = "unknown"
+                            rows_to_write.append(
+                                {
+                                    "condition_id": condition_id,
+                                    "token_id": token_id,
+                                    "samples": samples_for_store,
+                                    "summary": summary,
+                                }
+                            )
+                        write_rows(rows_to_write)
+                        del rows_to_write, payload, history_map, future
+                del cache_by_batch, request_group
+            state = "known" if updated_count and not unknown_count else "partial" if updated_count else "unknown"
+            return {
+                "state": state,
+                "target_count": len(targets),
+                "updated_count": updated_count,
+                "unknown_count": unknown_count,
+                "request_count": request_count,
+                "checked_at": now,
+                "errors": errors,
+            }
+        finally:
+            self._price_history_refresh_lock.release()
+
     def _restore_candidate_snapshot(
         self, saved: Mapping[str, object] | None = None
     ) -> None:
@@ -346,6 +766,36 @@ class PolymarketLPService:
             except Exception:
                 return
         if not isinstance(saved, Mapping):
+            return
+        # Snapshots written before the light-funnel contract do not carry the
+        # stage counts or selected-market boundary. They cannot be presented
+        # as a successful result from the new flow after a restart.
+        if (
+            "funnel" not in saved
+            or "selected_market_ids" not in saved
+            or not isinstance(saved.get("funnel"), Mapping)
+        ):
+            with self._candidate_state_lock:
+                self._candidate_snapshot.update(
+                    {
+                        "state": "unknown",
+                        "complete": False,
+                        "scanning": False,
+                        "candidates": [],
+                        "recommendations": [],
+                        "checked_at": None,
+                        "last_success_at": None,
+                        "last_attempt_at": saved.get("last_attempt_at"),
+                        "candidate_rows_fresh": False,
+                        "missing_metadata_condition_ids": [],
+                        "missing_book_token_ids": [],
+                        "catalog_complete": False,
+                        "funnel": {},
+                        "selected_market_ids": [],
+                        "candidate_retention_reason": "legacy_snapshot_unusable",
+                    }
+                )
+            self._candidate_attempted_at = None
             return
         with self._candidate_state_lock:
             for key in (
@@ -363,6 +813,9 @@ class PolymarketLPService:
                 "event_end_confirmations",
                 "retention_reason",
                 "scan_started_at",
+                "funnel",
+                "selected_market_ids",
+                "candidate_retention_reason",
             ):
                 if key in saved:
                     self._candidate_snapshot[key] = deepcopy(saved[key])
@@ -381,7 +834,7 @@ class PolymarketLPService:
         stop_event: threading.Event | None = None,
         force: bool = False,
     ) -> dict[str, object]:
-        """Refresh managed candidates and read-only manual entry guidance."""
+        """Refresh the light shortlist, then risk-check only selected markets."""
 
         if not self._candidate_refresh_lock.acquire(blocking=False):
             snapshot = self.candidate_snapshot()
@@ -420,43 +873,54 @@ class PolymarketLPService:
                     retention_reason="scan_cancelled",
                 )
             catalog_reader = getattr(self.exchange, "lp_reward_catalog", None)
-            if not callable(catalog_reader):
-                raise ValueError("reward_catalog_unavailable")
+            metadata_reader = getattr(self.exchange, "lp_market_metadata", None)
+            account_reader = getattr(self.exchange, "lp_account_snapshot", None)
+            books_reader = getattr(self.exchange, "lp_order_books", None)
+            if not callable(catalog_reader) or not callable(metadata_reader) or not callable(account_reader):
+                raise ValueError("candidate_readers_unavailable")
             catalog = catalog_reader(stop_event=stop_event)
-            if (
-                not isinstance(catalog, Mapping)
-                or catalog.get("state") != "known"
-                or catalog.get("complete") is not True
-            ):
-                checked_at = (
-                    catalog.get("checked_at")
-                    if isinstance(catalog, Mapping)
-                    else None
-                )
+            catalog_is_known = (
+                isinstance(catalog, Mapping) and catalog.get("state") == "known"
+            )
+            raw_markets = (
+                catalog.get("markets")
+                if isinstance(catalog, Mapping)
+                else None
+            )
+            if not isinstance(raw_markets, (list, tuple)):
                 return self._finish_candidate_scan(
                     previous,
-                    state="incomplete",
+                    state="stale" if previous.get("last_success_at") else "unknown",
                     complete=False,
-                    checked_at=checked_at or self._now(),
+                    checked_at=(
+                        catalog.get("checked_at")
+                        if isinstance(catalog, Mapping)
+                        else None
+                    )
+                    or self._now(),
                     scan_started_at=scan_started_at,
                     retention_reason="reward_catalog_unknown",
                     catalog_complete=False,
                 )
-            raw_markets = catalog.get("markets")
-            if not isinstance(raw_markets, (list, tuple)):
-                raise ValueError("reward_catalog_unknown")
-            market_rows = [
-                dict(row) for row in raw_markets if isinstance(row, Mapping)
-            ]
+            market_rows = [dict(row) for row in raw_markets if isinstance(row, Mapping)]
             if not market_rows:
+                if not catalog_is_known or catalog.get("complete") is not True:
+                    return self._finish_candidate_scan(
+                        previous,
+                        state="stale" if previous.get("last_success_at") else "incomplete",
+                        complete=False,
+                        checked_at=(
+                            catalog.get("checked_at")
+                            if isinstance(catalog, Mapping)
+                            else None
+                        )
+                        or self._now(),
+                        scan_started_at=scan_started_at,
+                        retention_reason="reward_catalog_unknown",
+                        catalog_complete=False,
+                    )
                 self._publish_sample_targets(())
                 completed_at = self._now()
-                recommendations = self._merge_recommendations(
-                    previous.get("recommendations"),
-                    (),
-                    observations={},
-                    retention_reason="reward_inactive",
-                )
                 return self._finish_candidate_scan(
                     previous,
                     state="ready",
@@ -465,9 +929,28 @@ class PolymarketLPService:
                     scan_started_at=scan_started_at,
                     last_success_at=completed_at,
                     candidates=[],
-                    recommendations=recommendations,
+                    recommendations=[],
                     missing_metadata_condition_ids=(),
+                    missing_book_token_ids=(),
                     catalog_complete=True,
+                    funnel={
+                        "catalog_read": 0,
+                        "base_pass": 0,
+                        "volatility_pass": 0,
+                        "selected": 0,
+                        "risk": {"passed": 0, "rejected": 0, "unknown": 0},
+                        "risk_directions": {"passed": 0, "rejected": 0, "unknown": 0},
+                        "selected_market_ids": [],
+                        "conditions": _lp_funnel_conditions(),
+                        "reasons": {
+                            "catalog": [],
+                            "base": [],
+                            "volatility": [],
+                            "selected": [],
+                            "risk": [],
+                        },
+                    },
+                    selected_market_ids=(),
                 )
 
             condition_ids = tuple(
@@ -477,11 +960,6 @@ class PolymarketLPService:
                     if str(row.get("condition_id") or "").strip()
                 )
             )
-            metadata_reader = getattr(self.exchange, "lp_market_metadata", None)
-            account_reader = getattr(self.exchange, "lp_account_snapshot", None)
-            books_reader = getattr(self.exchange, "lp_order_books", None)
-            if not callable(metadata_reader) or not callable(account_reader) or not callable(books_reader):
-                raise ValueError("candidate_readers_unavailable")
             metadata_value = metadata_reader(condition_ids)
             metadata_observed_at = self._now()
             if not isinstance(metadata_value, Mapping):
@@ -492,74 +970,60 @@ class PolymarketLPService:
                 if isinstance(key, str) and isinstance(value, Mapping)
             }
             missing_metadata_condition_ids = tuple(
-                condition_id
-                for condition_id in condition_ids
+                condition_id for condition_id in condition_ids
                 if condition_id not in metadata_by_condition
             )
-            self._publish_sample_targets(
-                tuple(
-                    (condition_id, str(outcome.get("token_id") or "").strip())
-                    for condition_id in condition_ids
-                    for outcome in (
-                        metadata_by_condition.get(condition_id, {})
-                        .get("outcomes", {})
-                        .values()
-                        if isinstance(
-                            metadata_by_condition.get(condition_id, {}).get(
-                                "outcomes"
-                            ),
-                            Mapping,
-                        )
-                        else ()
-                    )
-                    if isinstance(outcome, Mapping)
-                    and str(outcome.get("token_id") or "").strip()
-                )
+            account: Mapping[str, object] | None = None
+            try:
+                account_value = account_reader()
+            except Exception:
+                account_value = None
+            if (
+                isinstance(account_value, Mapping)
+                and account_value.get("authenticated") is True
+            ):
+                account = account_value
+            checked_at = self._now()
+            reservations = self._candidate_reservations()
+            cache_batch_reader = getattr(
+                self.store, "lp_price_history_summaries", None
             )
-            account = account_reader()
-            if not isinstance(account, Mapping) or account.get("authenticated") is not True:
-                raise ValueError("candidate_market_facts_unknown")
-            token_ids = tuple(
-                dict.fromkeys(
-                    str(outcome.get("token_id") or "").strip()
-                    for market in metadata_by_condition.values()
-                    for outcome in (
-                        market.get("outcomes", {}).values()
-                        if isinstance(market.get("outcomes"), Mapping)
-                        else ()
-                    )
-                    if isinstance(outcome, Mapping)
-                    and str(outcome.get("token_id") or "").strip()
-                )
-            )
-            books_value = books_reader(token_ids, stop_event=stop_event)
-            if not isinstance(books_value, Mapping):
-                raise ValueError("candidate_books_unknown")
-            books_by_token = {
-                str(key): value
-                for key, value in books_value.items()
-                if isinstance(key, str) and isinstance(value, Mapping)
-            }
-            direction_facts: list[dict[str, object]] = []
-            complete = not missing_metadata_condition_ids
-            missing_book_token_ids: list[str] = []
-            catalog_checked_at = catalog.get("checked_at")
+            cache_reader = getattr(self.store, "lp_price_history_summary", None)
             saved_screening = getattr(self.store, "lp_screening_snapshot", lambda: None)()
             saved_confirmations = (
                 saved_screening.get("event_end_confirmations", {})
-                if isinstance(saved_screening, Mapping)
-                else {}
+                if isinstance(saved_screening, Mapping) else {}
             )
-            event_end_confirmations = (
-                deepcopy(dict(saved_confirmations))
-                if isinstance(saved_confirmations, Mapping)
-                else {}
-            )
-            for reward_market in market_rows:
-                condition_id = str(reward_market.get("condition_id") or "")
-                reward_guidance_deadline = self._reward_guidance_deadline(
-                    reward_market
+            event_end_confirmations = deepcopy(dict(saved_confirmations)) if isinstance(saved_confirmations, Mapping) else {}
+            direction_facts: list[dict[str, object]] = []
+            complete = catalog_is_known and catalog.get("complete") is True
+            complete = complete and not missing_metadata_condition_ids
+            cache_identities = tuple(
+                (
+                    condition_id,
+                    str(
+                        outcome.get("token_id") or ""
+                    ).strip(),
                 )
+                for reward_market in market_rows
+                for condition_id in (str(reward_market.get("condition_id") or "").strip(),)
+                for market_meta in (metadata_by_condition.get(condition_id),)
+                if isinstance(market_meta, Mapping)
+                and isinstance(market_meta.get("outcomes"), Mapping)
+                for outcome in cast(Mapping[object, object], market_meta["outcomes"]).values()
+                if isinstance(outcome, Mapping)
+                and str(outcome.get("token_id") or "").strip()
+            )
+            cached_summaries: Mapping[tuple[str, str], Mapping[str, object]] = {}
+            if callable(cache_batch_reader):
+                try:
+                    batch_value = cache_batch_reader(cache_identities, now=checked_at)
+                except Exception:
+                    batch_value = {}
+                if isinstance(batch_value, Mapping):
+                    cached_summaries = batch_value
+            for reward_market in market_rows:
+                condition_id = str(reward_market.get("condition_id") or "").strip()
                 market_meta = metadata_by_condition.get(condition_id)
                 if market_meta is None:
                     complete = False
@@ -568,12 +1032,8 @@ class PolymarketLPService:
                 if not isinstance(raw_outcomes, Mapping):
                     complete = False
                     continue
-                reward_minimum = market_meta.get(
-                    "reward_min_size", reward_market.get("rewards_min_size")
-                )
-                reward_spread = market_meta.get(
-                    "reward_max_spread", reward_market.get("rewards_max_spread")
-                )
+                reward_minimum = market_meta.get("reward_min_size", reward_market.get("rewards_min_size"))
+                reward_spread = market_meta.get("reward_max_spread", reward_market.get("rewards_max_spread"))
                 if reward_spread is not None and market_meta.get("reward_max_spread") is None:
                     raw_spread = _maybe_decimal(reward_spread)
                     reward_spread = None if raw_spread is None else raw_spread / Decimal("100")
@@ -587,125 +1047,387 @@ class PolymarketLPService:
                 )
                 if confirmation is not None:
                     event_end_confirmations[condition_id] = confirmation
-                for outcome_key in ("yes", "no"):
-                    outcome = raw_outcomes.get(outcome_key)
-                    if not isinstance(outcome, Mapping):
-                        complete = False
+                for outcome_key, raw_outcome in raw_outcomes.items():
+                    if str(outcome_key).lower() not in {"yes", "no"} or not isinstance(raw_outcome, Mapping):
                         continue
-                    token_id = str(outcome.get("token_id") or "")
-                    book = books_by_token.get(token_id)
-                    if not token_id or not isinstance(book, Mapping):
+                    token_id = str(raw_outcome.get("token_id") or "").strip()
+                    if not token_id:
                         complete = False
-                        if token_id:
-                            missing_book_token_ids.append(token_id)
                         continue
                     market = {
                         **dict(market_meta),
                         "condition_id": condition_id,
                         "token_id": token_id,
-                        "outcome": str(outcome.get("label") or outcome_key).upper(),
+                        "outcome": str(raw_outcome.get("label") or outcome_key).upper(),
                         "reward_min_size": reward_minimum,
                         "reward_max_spread": reward_spread,
                     }
-                    direction_facts.append(
-                        {
-                            "market": market,
-                            "book": dict(book),
-                            "reward_active": True,
-                            "daily_pool_usd": reward_market.get("daily_pool_usd"),
-                            "reward_checked_at": catalog_checked_at,
-                            "reward_guidance_deadline": reward_guidance_deadline,
-                            "event_end_confirmation": confirmation,
-                        }
-                    )
+                    summary: Mapping[str, object] | None = None
+                    cache_key = (condition_id, token_id)
+                    cached_summary = cached_summaries.get(cache_key)
+                    if isinstance(cached_summary, Mapping):
+                        summary = cached_summary
+                    elif not callable(cache_batch_reader) and callable(cache_reader):
+                        try:
+                            cached = cache_reader(condition_id, token_id, now=checked_at)
+                        except Exception:
+                            cached = None
+                        if isinstance(cached, Mapping):
+                            summary = cached
+                    direction: dict[str, object] = {
+                        "market": market,
+                        "reward_active": (
+                            reward_market.get("reward_active")
+                            if isinstance(reward_market.get("reward_active"), bool)
+                            else None
+                        ),
+                        "daily_pool_usd": reward_market.get("daily_pool_usd"),
+                        "reward_checked_at": catalog.get("checked_at"),
+                        "reward_guidance_deadline": self._reward_guidance_deadline(reward_market),
+                        "event_end_confirmation": confirmation,
+                    }
+                    if summary is not None:
+                        direction["history_summary"] = dict(summary)
+                    if account is not None and _has_market_order(account, market):
+                        direction["known_participation"] = True
+                    direction_facts.append(direction)
 
-            from .polymarket_lp_views import (
-                lp_candidate_rows,
-                lp_recommendation_rows,
-                screen_lp_direction,
+            from .polymarket_lp_views import _lp_shortlist_rows
+
+            light_rows = _lp_shortlist_rows(direction_facts, now=checked_at)
+            shortlist = light_rows[:50]
+            selected_condition_ids = tuple(
+                str(row.get("condition_id") or "") for row in shortlist
             )
-            from .polymarket_lp_risk import evaluate_lp_entry
-
-            reservations = self._candidate_reservations()
-            checked_at = self._now()
-            histories: dict[tuple[str, str], object] = {}
-            history_reader = getattr(self.store, "lp_book_samples", None)
-            for direction in direction_facts:
-                market = direction.get("market")
-                if not isinstance(market, Mapping) or not callable(history_reader):
+            selected_set = set(selected_condition_ids)
+            selected_direction_keys: set[tuple[str, str, str]] = set()
+            for row in shortlist:
+                condition_id = str(row.get("condition_id") or "")
+                raw_directions = row.get("directions")
+                if not isinstance(raw_directions, Sequence):
                     continue
-                condition_id = str(market.get("condition_id") or "")
-                token_id = str(market.get("token_id") or "")
+                for row_direction in raw_directions:
+                    if not isinstance(row_direction, Mapping):
+                        continue
+                    outcome = str(row_direction.get("outcome") or "").upper()
+                    token_id = str(row_direction.get("token_id") or "")
+                    if outcome and token_id:
+                        selected_direction_keys.add((condition_id, outcome, token_id))
+            selected_directions = [
+                direction for direction in direction_facts
+                if isinstance(direction.get("market"), Mapping)
+                and (
+                    str(cast(Mapping[str, object], direction["market"]).get("condition_id") or ""),
+                    str(cast(Mapping[str, object], direction["market"]).get("outcome") or "").upper(),
+                    str(cast(Mapping[str, object], direction["market"]).get("token_id") or ""),
+                ) in selected_direction_keys
+            ]
+            books_by_token: Mapping[str, object] = {}
+            missing_book_token_ids: list[str] = []
+            token_ids = tuple(
+                dict.fromkeys(
+                    str(cast(Mapping[str, object], direction["market"]).get("token_id") or "")
+                    for direction in selected_directions
+                    if isinstance(direction.get("market"), Mapping)
+                    and str(cast(Mapping[str, object], direction["market"]).get("token_id") or "")
+                )
+            )
+            if token_ids and callable(books_reader):
                 try:
-                    histories[(condition_id, token_id)] = history_reader(
-                        condition_id,
-                        token_id,
-                        since=checked_at - timedelta(hours=1),
-                        until=checked_at,
-                    )
+                    books_value = books_reader(token_ids, stop_event=stop_event)
                 except Exception:
-                    histories[(condition_id, token_id)] = None
-
-            observations: dict[tuple[str, str], dict[str, object]] = {}
-            for direction in direction_facts:
+                    # A complete light shortlist remains useful when the
+                    # selected risk-book batch is unavailable; risk is then
+                    # UNKNOWN for each selected direction.
+                    books_value = {}
+                if isinstance(books_value, Mapping):
+                    books_by_token = books_value
+            try:
+                risk_account_value = account_reader()
+            except Exception:
+                # A fresh account read is required for risk, but an outage
+                # must preserve the light shortlist and report UNKNOWN risk.
+                risk_account_value = None
+            risk_account = (
+                risk_account_value
+                if isinstance(risk_account_value, Mapping)
+                and risk_account_value.get("authenticated") is True
+                else {}
+            )
+            # Account and book reads define the risk evaluation instant. Keep
+            # the scan timestamp separate so a just-returned fact is never
+            # rejected as being in the future.
+            evaluation_at = self._now()
+            risk_results: dict[tuple[str, str], dict[str, object]] = {}
+            from .polymarket_lp_risk import evaluate_lp_entry
+            for direction in selected_directions:
                 market = direction.get("market")
                 if not isinstance(market, Mapping):
                     continue
-                identity = (
-                    str(market.get("condition_id") or ""),
-                    str(market.get("outcome") or "").upper(),
-                )
-                screening = screen_lp_direction(
-                    direction,
-                    history=histories.get(
-                        (
-                            identity[0],
-                            str(market.get("token_id") or ""),
-                        )
-                    ),
-                    now=checked_at,
-                )
-                if screening.get("state") == "eligible":
-                    entry = evaluate_lp_entry(
-                        {**direction, "screening": screening},
-                        account=account,
-                        now=checked_at,
+                condition_id = str(market.get("condition_id") or "")
+                token_id = str(market.get("token_id") or "")
+                book = books_by_token.get(token_id)
+                if not isinstance(book, Mapping):
+                    missing_book_token_ids.append(token_id)
+                    result = {"state": "unknown", "reason_codes": ["book_unknown"], "guidance": None}
+                else:
+                    summary = direction.get("history_summary")
+                    direction["screening"] = {
+                        "state": "eligible",
+                        "reason_codes": [],
+                        "checked_at": summary.get("checked_at")
+                        if isinstance(summary, Mapping)
+                        else None,
+                    }
+                    result = evaluate_lp_entry(
+                        {**direction, "book": dict(book)},
+                        account=risk_account,
+                        now=evaluation_at,
                         reservations=reservations,
                     )
-                    observations[identity] = {
-                        "state": entry.get("state"),
-                        "reason_codes": list(entry.get("reason_codes", ())),
-                    }
-                else:
-                    observations[identity] = {
-                        "state": screening.get("state"),
-                        "reason_codes": list(screening.get("reason_codes", ())),
-                    }
+                risk_results[(condition_id, str(market.get("outcome") or "").upper())] = result
 
-            candidates = lp_candidate_rows(
-                direction_facts,
-                account=account,
-                now=checked_at,
-                reservations=reservations,
-            )
-            fresh_recommendations = lp_recommendation_rows(
-                direction_facts,
-                histories=histories,
-                account=account,
-                now=checked_at,
-                reservations=reservations,
-            )
-            recommendations = self._merge_recommendations(
-                previous.get("recommendations"),
-                fresh_recommendations,
-                observations=observations,
-                retention_reason=(
-                    "market_metadata_missing"
-                    if missing_metadata_condition_ids
-                    else "market_facts_unknown"
+            recommendations: list[dict[str, object]] = []
+            for shortlist_row in shortlist:
+                condition_id = str(shortlist_row.get("condition_id") or "")
+                directions: dict[str, object] = {}
+                for direction in selected_directions:
+                    market = direction.get("market")
+                    if not isinstance(market, Mapping) or str(market.get("condition_id") or "") != condition_id:
+                        continue
+                    outcome = str(market.get("outcome") or "").upper()
+                    result = risk_results.get((condition_id, outcome), {"state": "unknown", "reason_codes": ["risk_unknown"], "guidance": None})
+                    directions[outcome] = {
+                        "token_id": market.get("token_id"),
+                        "state": result.get("state"),
+                        "eligible": result.get("state") == "eligible",
+                        "reason_codes": list(result.get("reason_codes", ())),
+                        "screening": direction.get("history_summary"),
+                        "guidance": result.get("guidance"),
+                    }
+                states = [
+                    str(value.get("state") or "unknown")
+                    for value in directions.values() if isinstance(value, Mapping)
+                ]
+                market_state = "eligible" if "eligible" in states else "unknown" if "unknown" in states else "rejected"
+                recommendations.append({
+                    **dict(shortlist_row),
+                    "state": market_state,
+                    "selected": True,
+                    "directions": directions,
+                })
+            risk_counts = {
+                "passed": sum(1 for row in recommendations if row.get("state") == "eligible"),
+                "rejected": sum(1 for row in recommendations if row.get("state") == "rejected"),
+                "unknown": sum(1 for row in recommendations if row.get("state") == "unknown"),
+            }
+            direction_risk_counts = {
+                "passed": sum(
+                    1
+                    for result in risk_results.values()
+                    if result.get("state") == "eligible"
                 ),
-            )
-            completed_at = checked_at
+                "rejected": sum(
+                    1
+                    for result in risk_results.values()
+                    if result.get("state") == "rejected"
+                ),
+                "unknown": sum(
+                    1
+                    for result in risk_results.values()
+                    if result.get("state") == "unknown"
+                ),
+            }
+            base_markets = {
+                str(cast(Mapping[str, object], direction["market"]).get("condition_id") or "")
+                for direction in direction_facts
+                if direction.get("reward_active") is True
+                and not direction.get("known_participation")
+                and _maybe_decimal(direction.get("daily_pool_usd")) is not None
+                and cast(Decimal, _maybe_decimal(direction.get("daily_pool_usd"))) > 0
+                and isinstance(direction.get("market"), Mapping)
+                and cast(Mapping[str, object], direction["market"]).get("accepting_orders") is True
+            }
+            volatility_markets = {
+                str(row.get("condition_id") or "") for row in shortlist
+            }
+            reason_rows: dict[str, list[dict[str, object]]] = {
+                "catalog": [],
+                "base": [],
+                "volatility": [],
+                "selected": [],
+                "risk": [],
+            }
+            seen_reasons: set[tuple[str, str, str, str]] = set()
+
+            def add_reason(
+                stage: str,
+                direction: Mapping[str, object] | None,
+                code: str,
+                *,
+                outcome: str | None = None,
+            ) -> None:
+                market = direction.get("market") if isinstance(direction, Mapping) else None
+                market_map = market if isinstance(market, Mapping) else {}
+                condition_id = str(
+                    market_map.get("condition_id")
+                    or (direction or {}).get("condition_id")
+                    or ""
+                ).strip()
+                market_id = str(
+                    market_map.get("market_id")
+                    or condition_id
+                ).strip()
+                if not market_id:
+                    return
+                outcome_value = str(
+                    outcome
+                    or market_map.get("outcome")
+                    or (direction or {}).get("outcome")
+                    or ""
+                ).upper()
+                identity = (stage, market_id, outcome_value, code)
+                if identity in seen_reasons:
+                    return
+                seen_reasons.add(identity)
+                row: dict[str, object] = {
+                    "market_id": market_id,
+                    "condition_id": condition_id,
+                    "code": code,
+                }
+                if outcome_value:
+                    row["outcome"] = outcome_value
+                reason_rows[stage].append(row)
+
+            directions_by_condition: dict[str, list[dict[str, object]]] = {}
+            for direction in direction_facts:
+                market = direction.get("market")
+                market_map = market if isinstance(market, Mapping) else {}
+                condition_id = str(market_map.get("condition_id") or "").strip()
+                if condition_id:
+                    directions_by_condition.setdefault(condition_id, []).append(direction)
+            for condition_id in condition_ids:
+                if condition_id not in metadata_by_condition:
+                    add_reason(
+                        "catalog",
+                        {"market": {"condition_id": condition_id, "market_id": condition_id}},
+                        "market_metadata_unknown",
+                    )
+            if catalog.get("complete") is not True:
+                for condition_id in condition_ids:
+                    add_reason(
+                        "catalog",
+                        {"market": {"condition_id": condition_id, "market_id": condition_id}},
+                        "catalog_incomplete",
+                    )
+            for condition_id, directions in directions_by_condition.items():
+                if condition_id in base_markets:
+                    continue
+                for direction in directions:
+                    market = direction.get("market")
+                    market_map = market if isinstance(market, Mapping) else {}
+                    reward_active = direction.get("reward_active")
+                    if reward_active is None:
+                        add_reason("base", direction, "reward_status_unknown")
+                    elif reward_active is False:
+                        add_reason("base", direction, "reward_inactive")
+                    pool = _maybe_decimal(direction.get("daily_pool_usd"))
+                    if pool is None:
+                        add_reason("base", direction, "reward_pool_unknown")
+                    elif pool <= 0:
+                        add_reason("base", direction, "reward_pool_empty")
+                    if market_map.get("accepting_orders") is not True:
+                        add_reason(
+                            "base",
+                            direction,
+                            "market_not_accepting_orders"
+                            if market_map.get("accepting_orders") is False
+                            else "market_status_unknown",
+                        )
+                    if any(
+                        direction.get(key) is True or market_map.get(key) is True
+                        for key in (
+                            "participating",
+                            "already_participating",
+                            "known_participation",
+                        )
+                    ):
+                        add_reason("base", direction, "market_already_participating")
+            for condition_id in base_markets:
+                if condition_id in volatility_markets:
+                    continue
+                for direction in directions_by_condition.get(condition_id, ()):
+                    summary = direction.get("history_summary")
+                    if not isinstance(summary, Mapping):
+                        add_reason("volatility", direction, "history_summary_unknown")
+                        continue
+                    state = str(summary.get("state") or "").lower()
+                    if state not in {"known", "ready", "eligible"}:
+                        add_reason("volatility", direction, "history_summary_unknown")
+                        continue
+                    amplitude = _maybe_decimal(summary.get("amplitude"))
+                    if amplitude is None:
+                        add_reason("volatility", direction, "history_amplitude_unknown")
+                    elif amplitude < 0 or amplitude > Decimal("0.01"):
+                        add_reason("volatility", direction, "history_amplitude_exceeded")
+                    try:
+                        history_checked_at = _timestamp(
+                            summary.get("checked_at", summary.get("updated_at")),
+                            name="history_checked_at",
+                        )
+                        history_age = (checked_at - history_checked_at).total_seconds()
+                    except ValueError:
+                        add_reason("volatility", direction, "history_time_unknown")
+                    else:
+                        if history_age < 0 or history_age >= 2 * 60 * 60:
+                            add_reason("volatility", direction, "history_summary_expired")
+                        valid_until = summary.get("valid_until")
+                        if valid_until is not None:
+                            try:
+                                if checked_at >= _timestamp(valid_until, name="history_valid_until"):
+                                    add_reason("volatility", direction, "history_summary_expired")
+                            except ValueError:
+                                add_reason("volatility", direction, "history_time_unknown")
+            for row in light_rows[50:]:
+                add_reason("selected", {"market": row}, "shortlist_cap")
+            for row in recommendations:
+                condition_id = str(row.get("condition_id") or "")
+                for outcome, direction in (
+                    row.get("directions", {}).items()
+                    if isinstance(row.get("directions"), Mapping)
+                    else ()
+                ):
+                    if not isinstance(direction, Mapping) or direction.get("state") == "eligible":
+                        continue
+                    reasons = direction.get("reason_codes")
+                    if isinstance(reasons, Sequence) and not isinstance(reasons, (str, bytes)) and reasons:
+                        for reason in reasons:
+                            add_reason(
+                                "risk",
+                                {"market": {"condition_id": condition_id, "market_id": row.get("market_id"), "outcome": outcome}},
+                                str(reason),
+                                outcome=str(outcome),
+                            )
+                    else:
+                        add_reason(
+                            "risk",
+                            {"market": {"condition_id": condition_id, "market_id": row.get("market_id"), "outcome": outcome}},
+                            "risk_unknown",
+                            outcome=str(outcome),
+                        )
+            funnel = {
+                "catalog_read": len(condition_ids),
+                "base_pass": len(base_markets),
+                "volatility_pass": len(light_rows),
+                "selected": len(shortlist),
+                "risk": risk_counts,
+                "risk_directions": direction_risk_counts,
+                "selected_market_ids": [str(row.get("market_id") or "") for row in shortlist],
+                "conditions": _lp_funnel_conditions(),
+                "reasons": reason_rows,
+            }
+            self._publish_sample_targets(())
+            completed_at = evaluation_at
             return self._finish_candidate_scan(
                 previous,
                 state="ready" if complete else "incomplete",
@@ -713,12 +1435,16 @@ class PolymarketLPService:
                 checked_at=completed_at,
                 scan_started_at=scan_started_at,
                 last_success_at=completed_at if complete else None,
-                candidates=candidates,
+                candidates=[],
                 recommendations=recommendations,
                 missing_metadata_condition_ids=missing_metadata_condition_ids,
                 missing_book_token_ids=tuple(dict.fromkeys(missing_book_token_ids)),
-                catalog_complete=True,
+                catalog_complete=catalog_is_known and catalog.get("complete") is True,
                 event_end_confirmations=event_end_confirmations,
+                funnel=funnel,
+                selected_market_ids=tuple(
+                    str(row.get("market_id") or "") for row in shortlist
+                ),
             )
         except Exception:
             previous = self.candidate_snapshot()
@@ -1102,6 +1828,8 @@ class PolymarketLPService:
         missing_book_token_ids: Sequence[str] | None = None,
         catalog_complete: bool | None = None,
         event_end_confirmations: Mapping[str, object] | None = None,
+        funnel: Mapping[str, object] | None = None,
+        selected_market_ids: Sequence[str] | None = None,
         retention_reason: str = "candidate_refresh_failed",
     ) -> dict[str, object]:
         attempted: datetime
@@ -1187,6 +1915,9 @@ class PolymarketLPService:
             "catalog_complete": catalog_complete,
             "event_end_confirmations": confirmations,
             "retention_reason": None if recommendations is not None else retention_reason,
+            "funnel": deepcopy(dict(funnel)) if funnel is not None else deepcopy(previous.get("funnel", {})),
+            "selected_market_ids": list(selected_market_ids) if selected_market_ids is not None else list(previous.get("selected_market_ids", ())),
+            "candidate_retention_reason": "background_candidates_retired",
         }
         writer = getattr(self.store, "lp_save_screening_snapshot", None)
         if callable(writer):

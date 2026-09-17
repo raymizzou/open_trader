@@ -8,6 +8,7 @@ import re
 import sqlite3
 import threading
 import uuid
+import zlib
 from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -758,6 +759,14 @@ class PredictionArbitrageStore:
 
             CREATE INDEX IF NOT EXISTS lp_book_samples_received
             ON lp_book_samples(received_at);
+
+            CREATE TABLE IF NOT EXISTS lp_price_history_cache (
+                condition_id TEXT NOT NULL,
+                token_id TEXT NOT NULL,
+                samples BLOB NOT NULL,
+                summary TEXT NOT NULL,
+                PRIMARY KEY(condition_id, token_id)
+            );
 
             CREATE TABLE IF NOT EXISTS lp_screening_snapshot (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -2744,6 +2753,204 @@ class PredictionArbitrageStore:
         payloads = ([] if anchor is None else [_load_payload(str(anchor["payload"]))])
         payloads.extend(_load_payload(str(row["payload"])) for row in rows)
         return sorted(payloads, key=lambda row: str(row.get("received_at") or ""))
+
+    def lp_save_price_history(
+        self,
+        condition_id: str,
+        token_id: str,
+        samples: Iterable[Mapping[str, object]],
+        summary: Mapping[str, object],
+    ) -> None:
+        """Persist compressed price samples and their independently readable summary."""
+        self.lp_save_price_history_batch(
+            (
+                {
+                    "condition_id": condition_id,
+                    "token_id": token_id,
+                    "samples": samples,
+                    "summary": summary,
+                },
+            )
+        )
+
+    def lp_save_price_history_batch(
+        self, rows: Iterable[Mapping[str, object]]
+    ) -> int:
+        """Write a small batch without opening one transaction per token."""
+
+        encoded: list[tuple[str, str, sqlite3.Binary, str]] = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            condition = str(row.get("condition_id") or "").strip()
+            token = str(row.get("token_id") or "").strip()
+            summary = row.get("summary")
+            if not condition or not token or not isinstance(summary, Mapping):
+                raise ValueError("lp_price_history_identity_invalid")
+            samples = row.get("samples")
+            sample_rows = (
+                [dict(sample) for sample in samples if isinstance(sample, Mapping)]
+                if isinstance(samples, Iterable) and not isinstance(samples, (str, bytes, Mapping))
+                else []
+            )
+            samples_payload = _dump_relation_payload({"samples": sample_rows}).encode(
+                "utf-8"
+            )
+            summary_payload = _dump_relation_payload(summary)
+            encoded.append(
+                (
+                    condition,
+                    token,
+                    sqlite3.Binary(zlib.compress(samples_payload)),
+                    summary_payload,
+                )
+            )
+        if not encoded:
+            return 0
+        with self._transaction() as connection:
+            connection.executemany(
+                """
+                INSERT INTO lp_price_history_cache(condition_id,token_id,samples,summary)
+                VALUES (?,?,?,?)
+                ON CONFLICT(condition_id,token_id) DO UPDATE SET
+                    samples=excluded.samples, summary=excluded.summary
+                """,
+                encoded,
+            )
+        return len(encoded)
+
+    @staticmethod
+    def _lp_expire_price_history_summary(
+        summary: Mapping[str, object], *, now: datetime | None
+    ) -> dict[str, object]:
+        result = dict(summary)
+        if isinstance(now, datetime) and now.tzinfo is not None:
+            checked_at = result.get("checked_at")
+            try:
+                if _parse_timestamp(checked_at) <= _parse_timestamp(now) - timedelta(hours=2):
+                    result["state"] = "expired"
+                    result.setdefault("reason", "summary_expired")
+            except ValueError:
+                result["state"] = "unknown"
+                result.setdefault("reason", "summary_time_unknown")
+        return result
+
+    def lp_price_history_summary(
+        self,
+        condition_id: str,
+        token_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, object] | None:
+        """Read a cached range summary without decompressing historical samples."""
+
+        condition = str(condition_id).strip()
+        token = str(token_id).strip()
+        if not condition or not token:
+            return None
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT summary FROM lp_price_history_cache WHERE condition_id=? AND token_id=?",
+                (condition, token),
+            ).fetchone()
+        if row is None:
+            return None
+        summary = _load_payload(str(row["summary"]))
+        return self._lp_expire_price_history_summary(summary, now=now)
+
+    def lp_price_history_summaries(
+        self,
+        identities: Iterable[tuple[str, str]],
+        *,
+        now: datetime | None = None,
+    ) -> dict[tuple[str, str], dict[str, object]]:
+        """Read only summary columns for many directions in one read batch."""
+
+        unique = tuple(
+            dict.fromkeys(
+                (str(condition).strip(), str(token).strip())
+                for condition, token in identities
+                if str(condition).strip() and str(token).strip()
+            )
+        )
+        if not unique:
+            return {}
+        result: dict[tuple[str, str], dict[str, object]] = {}
+        with self._read_connection() as connection:
+            for offset in range(0, len(unique), 400):
+                batch = unique[offset : offset + 400]
+                where = " OR ".join("(condition_id=? AND token_id=?)" for _ in batch)
+                params = tuple(value for pair in batch for value in pair)
+                rows = connection.execute(
+                    f"SELECT condition_id,token_id,summary FROM lp_price_history_cache WHERE {where}",
+                    params,
+                ).fetchall()
+                for row in rows:
+                    key = (str(row["condition_id"]), str(row["token_id"]))
+                    result[key] = self._lp_expire_price_history_summary(
+                        _load_payload(str(row["summary"])), now=now
+                    )
+        return result
+
+    def lp_price_history_samples(
+        self, condition_id: str, token_id: str
+    ) -> list[dict[str, object]]:
+        """Read and decompress one token's cached samples."""
+
+        condition = str(condition_id).strip()
+        token = str(token_id).strip()
+        if not condition or not token:
+            return []
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT samples FROM lp_price_history_cache WHERE condition_id=? AND token_id=?",
+                (condition, token),
+            ).fetchone()
+        if row is None:
+            return []
+        try:
+            payload = _load_payload(zlib.decompress(bytes(row["samples"])).decode("utf-8"))
+        except (OSError, TypeError, ValueError, zlib.error):
+            return []
+        samples = payload.get("samples")
+        return [dict(item) for item in samples if isinstance(item, Mapping)] if isinstance(samples, list) else []
+
+    def lp_price_history_samples_batch(
+        self, identities: Iterable[tuple[str, str]]
+    ) -> dict[tuple[str, str], list[dict[str, object]]]:
+        """Read compressed samples for one bounded batch in one connection."""
+
+        unique = tuple(
+            dict.fromkeys(
+                (str(condition).strip(), str(token).strip())
+                for condition, token in identities
+                if str(condition).strip() and str(token).strip()
+            )
+        )
+        if not unique:
+            return {}
+        result: dict[tuple[str, str], list[dict[str, object]]] = {}
+        with self._read_connection() as connection:
+            where = " OR ".join("(condition_id=? AND token_id=?)" for _ in unique)
+            params = tuple(value for pair in unique for value in pair)
+            rows = connection.execute(
+                f"SELECT condition_id,token_id,samples FROM lp_price_history_cache WHERE {where}",
+                params,
+            ).fetchall()
+        for row in rows:
+            key = (str(row["condition_id"]), str(row["token_id"]))
+            try:
+                payload = _load_payload(zlib.decompress(bytes(row["samples"])).decode("utf-8"))
+            except (OSError, TypeError, ValueError, zlib.error):
+                result[key] = []
+                continue
+            samples = payload.get("samples")
+            result[key] = (
+                [dict(item) for item in samples if isinstance(item, Mapping)]
+                if isinstance(samples, list)
+                else []
+            )
+        return result
 
     def lp_save_screening_snapshot(
         self, payload: Mapping[str, object]

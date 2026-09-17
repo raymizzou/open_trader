@@ -79,6 +79,7 @@ _CROSS_VENUE_START_TIMEOUT = 5
 _DEFAULT_HOLDING_RECONCILER = object()
 _LP_TICK_SECONDS = 1.0
 _LP_REWARD_SECONDS = 60.0
+_LP_HISTORY_SECONDS = 3600.0
 _LP_BOOK_SAMPLE_SECONDS = 5.0
 # One in-flight request may consume the installed SDK's bounded connect/read/
 # write/pool phases (5/10/10/2 seconds); this is a fixed cleanup grace, not a
@@ -434,6 +435,9 @@ class PredictionRuntime:
         self._lp_thread: threading.Thread | None = None
         self._book_sample_stop_event = threading.Event()
         self._book_sampler_thread: threading.Thread | None = None
+        self._history_stop_event = threading.Event()
+        self._history_initial_done = threading.Event()
+        self._history_thread: threading.Thread | None = None
         self._reward_stop_event = threading.Event()
         self._lp_candidate_refresh_requested = threading.Event()
         self._candidate_thread: threading.Thread | None = None
@@ -824,9 +828,9 @@ class PredictionRuntime:
                 )
                 self.n_leg_order_queue_driver.start()
             self._start_lp_monitor()
+            self._start_history_monitor()
             self._start_candidate_monitor()
             self._start_reward_monitor()
-            self._start_book_sampler()
             self._state = "RUNNING"
             logger.info(
                 "prediction_runtime_state state=RUNNING pid=%s data_dir=%s",
@@ -944,6 +948,10 @@ class PredictionRuntime:
         self._lp_candidate_refresh_requested.clear()
 
         def run() -> None:
+            # History refreshes publish summaries independently.  The first
+            # candidate pass may expose the catalog/base funnel while history
+            # is still preparing; it must not block risk and observation work
+            # behind a potentially large hourly refresh.
             force_candidate_refresh = True
             while not self._reward_stop_event.is_set():
                 lp = self.lp
@@ -977,6 +985,42 @@ class PredictionRuntime:
             daemon=True,
         )
         self._candidate_thread.start()
+
+    def _start_history_monitor(self) -> None:
+        """Refresh the bounded LP price-history cache hourly."""
+
+        if self.lp is None or self._history_thread is not None:
+            return
+        self._history_stop_event.clear()
+        self._history_initial_done.clear()
+
+        def run() -> None:
+            try:
+                while not self._history_stop_event.is_set():
+                    lp = self.lp
+                    if lp is None:
+                        return
+                    refresh_history = getattr(lp, "refresh_price_history", None)
+                    if not callable(refresh_history):
+                        return
+                    try:
+                        refresh_history(stop_event=self._history_stop_event)
+                    except Exception:
+                        logger.exception("prediction_lp_history_refresh_failed")
+                    finally:
+                        self._history_initial_done.set()
+                        self._lp_candidate_refresh_requested.set()
+                    if self._history_stop_event.wait(_LP_HISTORY_SECONDS):
+                        return
+            finally:
+                self._history_initial_done.set()
+
+        self._history_thread = threading.Thread(
+            target=run,
+            name="prediction-lp-history-monitor",
+            daemon=True,
+        )
+        self._history_thread.start()
 
     def _start_book_sampler(self) -> None:
         """Sample the published LP observation set on its own bounded loop."""
@@ -1219,9 +1263,22 @@ class PredictionRuntime:
         errors: list[BaseException] = []
         uncertain_thread = False
         self._reward_stop_event.set()
+        self._history_stop_event.set()
+        self._history_initial_done.set()
         self._lp_candidate_refresh_requested.set()
         self._lp_stop_event.set()
         self._book_sample_stop_event.set()
+        history_thread = self._history_thread
+        if history_thread is not None:
+            history_thread.join(timeout=_LP_REWARD_STOP_GRACE_SECONDS)
+            if history_thread.is_alive():
+                errors.append(RuntimeError("prediction LP history monitor thread did not stop"))
+                uncertain_thread = True
+                # The reader may still be using the shared LP, trading, and
+                # store collaborators. Preserve ownership until a later stop
+                # call can join it after the external read returns.
+            else:
+                self._history_thread = None
         candidate_thread = self._candidate_thread
         if candidate_thread is not None:
             candidate_thread.join(timeout=_LP_REWARD_STOP_GRACE_SECONDS)
@@ -1328,6 +1385,10 @@ class PredictionRuntime:
             if reward_thread.is_alive():
                 return errors
             self._reward_thread = None
+        if history_thread is not None:
+            if history_thread.is_alive():
+                return errors
+            self._history_thread = None
         if not uncertain_thread and self._shadow_guards is not None:
             try:
                 self._shadow_guards.close()

@@ -150,6 +150,27 @@ def _decimal(value: object) -> Decimal | None:
     return result if result.is_finite() else None
 
 
+def _normalize_lp_recommendations(value: object) -> list[dict[str, object]]:
+    """Copy candidate rows and attach the existing reference reward fields."""
+
+    if not isinstance(value, (list, tuple)):
+        return []
+    normalized: list[dict[str, object]] = []
+    for row in value:
+        if not isinstance(row, Mapping):
+            continue
+        recommendation = dict(row)
+        recommendation["reference_share_percentage"] = LP_REWARD_REFERENCE_PERCENTAGE
+        pool = _decimal(recommendation.get("daily_pool_usd"))
+        recommendation["reference_daily_reward_usd"] = (
+            None
+            if pool is None or pool < Decimal("0")
+            else pool * LP_REWARD_REFERENCE_PERCENTAGE / Decimal("100")
+        )
+        normalized.append(recommendation)
+    return normalized
+
+
 def _safe_decimal(value: object) -> str | None:
     parsed = _decimal(value)
     return None if parsed is None else format(parsed, "f")
@@ -1118,19 +1139,7 @@ class PredictionExecutionService:
                     if isinstance(candidate, Mapping)
                 ] if isinstance(raw_candidates, (list, tuple)) else []
                 raw_recommendations = candidate_snapshot.get("recommendations")
-                recommendations = [
-                    dict(recommendation)
-                    for recommendation in raw_recommendations
-                    if isinstance(recommendation, Mapping)
-                ] if isinstance(raw_recommendations, (list, tuple)) else []
-                for recommendation in recommendations:
-                    recommendation["reference_share_percentage"] = LP_REWARD_REFERENCE_PERCENTAGE
-                    pool = _decimal(recommendation.get("daily_pool_usd"))
-                    recommendation["reference_daily_reward_usd"] = (
-                        None
-                        if pool is None or pool < Decimal("0")
-                        else pool * LP_REWARD_REFERENCE_PERCENTAGE / Decimal("100")
-                    )
+                recommendations = _normalize_lp_recommendations(raw_recommendations)
                 raw_market_rewards = candidate_snapshot.get("market_rewards")
                 market_rewards = (
                     dict(raw_market_rewards)
@@ -1250,12 +1259,23 @@ class PredictionExecutionService:
                     "non_lp_row_count": non_lp_row_count,
                     "candidates": candidates,
                     "recommendations": recommendations,
+                    "funnel": (
+                        dict(candidate_snapshot.get("funnel"))
+                        if isinstance(candidate_snapshot.get("funnel"), Mapping)
+                        else {}
+                    ),
+                    "selected_market_ids": candidate_snapshot.get(
+                        "selected_market_ids", []
+                    ),
                     "reward_shares": reward_shares,
                     "market_rewards": market_rewards,
                     "candidate_state": candidate_snapshot.get("state", "unknown"),
                     "complete": candidate_snapshot.get("complete") is True,
                     "scanning": candidate_snapshot.get("scanning") is True,
-                    "candidate_stale": candidate_snapshot.get("stale") is True,
+                    "candidate_stale": (
+                        candidate_snapshot.get("stale") is True
+                        or candidate_snapshot.get("state") == "stale"
+                    ),
                     "candidate_checked_at": candidate_snapshot.get("checked_at"),
                     "candidate_last_success_at": candidate_snapshot.get("last_success_at"),
                     "candidate_last_attempt_at": candidate_snapshot.get("last_attempt_at"),
@@ -1296,33 +1316,80 @@ class PredictionExecutionService:
                 return result
             except Exception:
                 cached = self._lp_dashboard_cache
+                try:
+                    raw_candidate_snapshot = _call(
+                        getattr(self._lp, "candidate_snapshot")
+                    )
+                    candidate_snapshot = (
+                        dict(raw_candidate_snapshot)
+                        if isinstance(raw_candidate_snapshot, Mapping)
+                        else {}
+                    )
+                except Exception:
+                    candidate_snapshot = {}
+                candidate_rows = candidate_snapshot.get("candidates")
+                recommendations = candidate_snapshot.get("recommendations")
+                candidate_funnel = candidate_snapshot.get("funnel")
+                candidate_state = candidate_snapshot.get("state", "unknown")
+                candidate_projection = {
+                    "candidates": [
+                        dict(row)
+                        for row in candidate_rows
+                        if isinstance(row, Mapping)
+                    ] if isinstance(candidate_rows, (list, tuple)) else [],
+                    "recommendations": [
+                        dict(row)
+                        for row in _normalize_lp_recommendations(recommendations)
+                    ],
+                    "funnel": (
+                        dict(candidate_funnel)
+                        if isinstance(candidate_funnel, Mapping)
+                        else {}
+                    ),
+                    "selected_market_ids": candidate_snapshot.get(
+                        "selected_market_ids", []
+                    ),
+                    "candidate_state": candidate_state,
+                    "complete": candidate_snapshot.get("complete") is True,
+                    "scanning": candidate_snapshot.get("scanning") is True,
+                    "candidate_stale": (
+                        candidate_snapshot.get("stale") is True
+                        or candidate_state == "stale"
+                    ),
+                    "candidate_checked_at": candidate_snapshot.get("checked_at"),
+                    "candidate_last_success_at": candidate_snapshot.get("last_success_at"),
+                    "candidate_last_attempt_at": candidate_snapshot.get("last_attempt_at"),
+                    "missing_metadata_condition_ids": candidate_snapshot.get(
+                        "missing_metadata_condition_ids", []
+                    ),
+                    "missing_book_token_ids": candidate_snapshot.get(
+                        "missing_book_token_ids", []
+                    ),
+                    "catalog_complete": candidate_snapshot.get("catalog_complete") is True,
+                    "candidate_retention_reason": candidate_snapshot.get(
+                        "retention_reason"
+                    ),
+                }
                 if cached is not None:
-                    return {**cached, "state": "stale", "stale": True}
+                    return {
+                        **cached,
+                        **candidate_projection,
+                        "state": "stale",
+                        "stale": True,
+                    }
                 return {
                     "state": "unknown",
                     "orders": [],
                     "positions": [],
                     "lp_orders_today": [],
                     "non_lp_row_count": None,
-                    "candidates": [],
-                    "recommendations": [],
+                    **candidate_projection,
                     "reward_shares": {},
                     "market_rewards": {},
-                    "candidate_state": "unknown",
-                    "complete": False,
-                    "scanning": False,
-                    "candidate_stale": True,
                     "checked_at": None,
                     "authenticated": False,
                     "open_orders_complete": False,
                     "positions_complete": False,
-                    "candidate_checked_at": None,
-                    "candidate_last_success_at": None,
-                    "candidate_last_attempt_at": None,
-                    "missing_metadata_condition_ids": [],
-                    "missing_book_token_ids": [],
-                    "catalog_complete": False,
-                    "candidate_retention_reason": None,
                     "last_success_at": None,
                     "stale": True,
                     "lp_observations": {},

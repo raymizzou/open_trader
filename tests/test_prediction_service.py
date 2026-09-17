@@ -1082,6 +1082,424 @@ def test_lp_dashboard_http_projection_keeps_today_orders(tmp_path: Path) -> None
     assert row["scoring_status"] is True
     assert payload["non_lp_row_count"] == 0
 
+def test_lp_dashboard_account_outage_keeps_newer_public_funnel(tmp_path: Path) -> None:
+    first_now = datetime(2026, 9, 17, 1, tzinfo=UTC)
+    now = [first_now]
+    account_failure = [False]
+
+    class Exchange:
+        config = SimpleNamespace(wallet_address="wallet")
+
+        def __init__(self) -> None:
+            self.catalog_reads = 0
+            self.metadata_reads = 0
+            self.book_reads = 0
+            self.history_reads = 0
+            self.account_reads = 0
+
+        def lp_reward_catalog(
+            self, *, stop_event: object = None
+        ) -> dict[str, object]:
+            del stop_event
+            self.catalog_reads += 1
+            market_specs = (
+                (("A", Decimal("100")),)
+                if self.catalog_reads == 1
+                else (("B", Decimal("90")), ("C", Decimal("80")))
+            )
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": now[0],
+                "markets": tuple(
+                    {
+                        "condition_id": f"condition-{market_id}",
+                        "daily_pool_usd": daily_pool,
+                        "reward_active": True,
+                    }
+                    for market_id, daily_pool in market_specs
+                ),
+            }
+
+        def lp_market_metadata(
+            self, condition_ids: tuple[str, ...], *, stop_event: object = None
+        ) -> dict[str, dict[str, object]]:
+            del stop_event
+            self.metadata_reads += 1
+            metadata: dict[str, dict[str, object]] = {}
+            for market_id in ("A", "B", "C"):
+                condition_id = f"condition-{market_id}"
+                if condition_id not in condition_ids:
+                    continue
+                metadata[condition_id] = {
+                    "market_id": f"market-{market_id}",
+                    "condition_id": condition_id,
+                    "market_title": f"Market {market_id}",
+                    "accepting_orders": True,
+                    "metadata_checked_at": now[0],
+                    "tick_size": Decimal("0.01"),
+                    "minimum_order_size": Decimal("20"),
+                    "reward_min_size": Decimal("20"),
+                    "reward_max_spread": Decimal("0.10"),
+                    "fees_enabled": False,
+                    "taker_fee_rate": Decimal("0"),
+                    "fee_exponent": Decimal("1"),
+                    "fee": Decimal("0"),
+                    "outcomes": {
+                        "yes": {
+                            "label": "YES",
+                            "token_id": f"token-{market_id}",
+                        }
+                    },
+                }
+            return metadata
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            self.account_reads += 1
+            if account_failure[0]:
+                raise RuntimeError("account unavailable")
+            return {
+                "authenticated": True,
+                "balance": Decimal("10000"),
+                "allowance": Decimal("10000"),
+                "open_orders": [
+                    {
+                        "order_id": "warm-lp-order",
+                        "condition_id": "condition-WARM",
+                        "token_id": "token-WARM",
+                        "outcome": "YES",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "price": Decimal("0.50"),
+                        "original_size": Decimal("20"),
+                        "size_matched": Decimal("0"),
+                        "remaining_size": Decimal("20"),
+                    }
+                ],
+                "positions": [],
+                "checked_at": now[0],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def get_order_scoring(self, order_id: str) -> bool:
+            assert order_id == "warm-lp-order"
+            return True
+
+        def lp_order_books(
+            self, token_ids: tuple[str, ...], *, stop_event: object = None
+        ) -> dict[str, dict[str, object]]:
+            del stop_event
+            self.book_reads += 1
+            return {
+                token_id: {
+                    "condition_id": f"condition-{token_id.removeprefix('token-')}",
+                    "token_id": token_id,
+                    "received_at": now[0],
+                    "bids": [
+                        {"price": Decimal("0.50"), "size": Decimal("20")},
+                        {"price": Decimal("0.49"), "size": Decimal("20")},
+                    ],
+                    "asks": [{"price": Decimal("0.52"), "size": Decimal("20")}],
+                }
+                for token_id in token_ids
+            }
+
+        def lp_price_history(self, *args: object, **kwargs: object) -> object:
+            del args, kwargs
+            self.history_reads += 1
+            raise AssertionError("candidate refresh must use stored history summaries")
+
+    def save_history(store: PredictionArbitrageStore, market_id: str, at: datetime) -> None:
+        store.lp_save_price_history(
+            f"condition-{market_id}",
+            f"token-{market_id}",
+            [
+                {"t": int((at - timedelta(hours=24)).timestamp()), "p": Decimal("0.500")},
+                {"t": int(at.timestamp()), "p": Decimal("0.505")},
+            ],
+            {
+                "state": "known",
+                "amplitude": Decimal("0.005"),
+                "window_start": at - timedelta(hours=24),
+                "window_end": at,
+                "sample_count": 2,
+                "checked_at": at,
+                "valid_until": at + timedelta(hours=2),
+            },
+        )
+
+    store = PredictionArbitrageStore(tmp_path)
+    save_history(store, "A", first_now)
+    save_history(store, "B", first_now + timedelta(seconds=10))
+    save_history(store, "C", first_now + timedelta(seconds=10))
+    exchange = Exchange()
+    lp = PolymarketLPService(store, exchange, clock=lambda: now[0])
+    first_scan = lp.refresh_candidates(force=True)
+    assert first_scan["state"] == "ready"
+    assert first_scan["complete"] is True
+    assert first_scan["selected_market_ids"] == ["market-A"]
+    assert first_scan["checked_at"] == "2026-09-17T01:00:00.000000Z"
+    assert first_scan["funnel"]["catalog_read"] == 1
+    assert first_scan["funnel"]["base_pass"] == 1
+    assert first_scan["funnel"]["volatility_pass"] == 1
+    assert first_scan["funnel"]["selected"] == 1
+    assert first_scan["funnel"]["risk"] == {
+        "passed": 1,
+        "rejected": 0,
+        "unknown": 0,
+    }
+    assert first_scan["funnel"]["risk_directions"] == {
+        "passed": 1,
+        "rejected": 0,
+        "unknown": 0,
+    }
+    assert first_scan["recommendations"][0]["state"] == "eligible"
+    assert first_scan["recommendations"][0]["directions"]["YES"]["state"] == "eligible"
+    assert exchange.catalog_reads == 1
+    assert exchange.metadata_reads == 1
+    assert exchange.book_reads == 1
+    assert exchange.history_reads == 0
+    assert exchange.account_reads == 2
+
+    execution = PredictionExecutionService(
+        store=store,
+        monitor=object(),
+        trading=exchange,
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=lp,
+    )
+    counters_before_first_dashboard = {
+        "catalog": exchange.catalog_reads,
+        "metadata": exchange.metadata_reads,
+        "books": exchange.book_reads,
+        "history": exchange.history_reads,
+        "account": exchange.account_reads,
+    }
+    first_dashboard = execution.lp_dashboard()
+    assert exchange.catalog_reads == counters_before_first_dashboard["catalog"]
+    assert exchange.metadata_reads == counters_before_first_dashboard["metadata"]
+    assert exchange.book_reads == counters_before_first_dashboard["books"]
+    assert exchange.history_reads == counters_before_first_dashboard["history"]
+    assert exchange.account_reads == counters_before_first_dashboard["account"] + 1
+    assert first_dashboard["state"] == "ready"
+    assert first_dashboard["candidate_state"] == "ready"
+    assert first_dashboard["complete"] is True
+    assert first_dashboard["candidate_stale"] is False
+    assert first_dashboard["candidate_checked_at"] == "2026-09-17T01:00:00.000000Z"
+    assert first_dashboard["funnel"]["catalog_read"] == 1
+    assert first_dashboard["funnel"]["base_pass"] == 1
+    assert first_dashboard["funnel"]["volatility_pass"] == 1
+    assert first_dashboard["funnel"]["selected"] == 1
+    assert first_dashboard["funnel"]["risk"] == {
+        "passed": 1,
+        "rejected": 0,
+        "unknown": 0,
+    }
+    assert first_dashboard["selected_market_ids"] == ["market-A"]
+    assert first_dashboard["funnel"]["selected"] == 1
+    assert first_dashboard["checked_at"] == "2026-09-17T01:00:00.000000Z"
+    assert [row["order_id"] for row in first_dashboard["lp_orders_today"]] == [
+        "warm-lp-order"
+    ]
+    assert first_dashboard["non_lp_row_count"] == 0
+    assert first_dashboard["recommendations"][0]["reference_share_percentage"] == Decimal("5")
+    assert first_dashboard["recommendations"][0]["reference_daily_reward_usd"] == Decimal("5")
+    first_account_checked_at = "2026-09-17T01:00:00.000000Z"
+
+    now[0] = first_now + timedelta(seconds=10)
+    account_failure[0] = True
+    second_scan = lp.refresh_candidates(force=True)
+    assert second_scan["state"] == "ready"
+    assert second_scan["complete"] is True
+    assert second_scan["stale"] is False
+    assert second_scan["selected_market_ids"] == ["market-B", "market-C"]
+    assert second_scan["checked_at"] == "2026-09-17T01:00:10.000000Z"
+    assert second_scan["funnel"]["catalog_read"] == 2
+    assert second_scan["funnel"]["base_pass"] == 2
+    assert second_scan["funnel"]["volatility_pass"] == 2
+    assert second_scan["funnel"]["selected"] == 2
+    assert second_scan["funnel"]["risk"] == {
+        "passed": 0,
+        "rejected": 0,
+        "unknown": 2,
+    }
+    assert second_scan["funnel"]["risk_directions"] == {
+        "passed": 0,
+        "rejected": 0,
+        "unknown": 2,
+    }
+    assert [row["market_id"] for row in second_scan["recommendations"]] == [
+        "market-B",
+        "market-C",
+    ]
+    assert all(row["state"] == "unknown" for row in second_scan["recommendations"])
+    assert all(
+        row["directions"]["YES"]["state"] == "unknown"
+        for row in second_scan["recommendations"]
+    )
+    assert exchange.catalog_reads == 2
+    assert exchange.metadata_reads == 2
+    assert exchange.book_reads == 2
+    assert exchange.history_reads == 0
+    assert exchange.account_reads == 5
+
+    counters_before_stale_dashboard = {
+        "catalog": exchange.catalog_reads,
+        "metadata": exchange.metadata_reads,
+        "books": exchange.book_reads,
+        "history": exchange.history_reads,
+        "account": exchange.account_reads,
+    }
+    stale_dashboard = execution.lp_dashboard()
+    assert exchange.catalog_reads == counters_before_stale_dashboard["catalog"]
+    assert exchange.metadata_reads == counters_before_stale_dashboard["metadata"]
+    assert exchange.book_reads == counters_before_stale_dashboard["books"]
+    assert exchange.history_reads == counters_before_stale_dashboard["history"]
+    assert exchange.account_reads == counters_before_stale_dashboard["account"] + 1
+    assert stale_dashboard["state"] == "stale"
+    assert stale_dashboard["stale"] is True
+    assert stale_dashboard["checked_at"] == first_account_checked_at
+    assert stale_dashboard["open_orders_complete"] is True
+    assert stale_dashboard["positions_complete"] is True
+    assert stale_dashboard["candidate_state"] == "ready"
+    assert stale_dashboard["complete"] is True
+    assert stale_dashboard["candidate_stale"] is False
+    assert stale_dashboard["candidate_checked_at"] == "2026-09-17T01:00:10.000000Z"
+    assert stale_dashboard["selected_market_ids"] == ["market-B", "market-C"]
+    assert stale_dashboard["funnel"]["catalog_read"] == 2
+    assert stale_dashboard["funnel"]["base_pass"] == 2
+    assert stale_dashboard["funnel"]["volatility_pass"] == 2
+    assert stale_dashboard["funnel"]["selected"] == 2
+    assert stale_dashboard["funnel"]["risk"] == {
+        "passed": 0,
+        "rejected": 0,
+        "unknown": 2,
+    }
+    assert [row["market_id"] for row in stale_dashboard["recommendations"]] == [
+        "market-B",
+        "market-C",
+    ]
+    assert [row["order_id"] for row in stale_dashboard["lp_orders_today"]] == [
+        "warm-lp-order"
+    ]
+    assert stale_dashboard["non_lp_row_count"] == 0
+    assert stale_dashboard["recommendations"][0]["reference_share_percentage"] == Decimal("5")
+    assert stale_dashboard["recommendations"][0]["reference_daily_reward_usd"] == Decimal("4.5")
+    assert stale_dashboard["recommendations"][1]["reference_share_percentage"] == Decimal("5")
+    assert stale_dashboard["recommendations"][1]["reference_daily_reward_usd"] == Decimal("4")
+    assert all(
+        row["directions"]["YES"]["state"] == "unknown"
+        for row in stale_dashboard["recommendations"]
+    )
+
+    counters_before_repeated_dashboard = {
+        "catalog": exchange.catalog_reads,
+        "metadata": exchange.metadata_reads,
+        "books": exchange.book_reads,
+        "history": exchange.history_reads,
+        "account": exchange.account_reads,
+    }
+    repeated_stale_dashboard = execution.lp_dashboard()
+    assert exchange.catalog_reads == counters_before_repeated_dashboard["catalog"]
+    assert exchange.metadata_reads == counters_before_repeated_dashboard["metadata"]
+    assert exchange.book_reads == counters_before_repeated_dashboard["books"]
+    assert exchange.history_reads == counters_before_repeated_dashboard["history"]
+    assert exchange.account_reads == counters_before_repeated_dashboard["account"] + 1
+    assert repeated_stale_dashboard["state"] == "stale"
+    assert repeated_stale_dashboard["stale"] is True
+    assert repeated_stale_dashboard["checked_at"] == first_account_checked_at
+    assert repeated_stale_dashboard["candidate_state"] == "ready"
+    assert repeated_stale_dashboard["complete"] is True
+    assert repeated_stale_dashboard["candidate_stale"] is False
+    assert repeated_stale_dashboard["candidate_checked_at"] == "2026-09-17T01:00:10.000000Z"
+    assert repeated_stale_dashboard["selected_market_ids"] == ["market-B", "market-C"]
+    assert repeated_stale_dashboard["funnel"]["catalog_read"] == 2
+    assert repeated_stale_dashboard["funnel"]["base_pass"] == 2
+    assert repeated_stale_dashboard["funnel"]["volatility_pass"] == 2
+    assert repeated_stale_dashboard["funnel"]["selected"] == 2
+    assert repeated_stale_dashboard["funnel"]["risk"] == {
+        "passed": 0,
+        "rejected": 0,
+        "unknown": 2,
+    }
+    assert [row["market_id"] for row in repeated_stale_dashboard["recommendations"]] == [
+        "market-B",
+        "market-C",
+    ]
+    assert [
+        row["order_id"] for row in repeated_stale_dashboard["lp_orders_today"]
+    ] == ["warm-lp-order"]
+    assert repeated_stale_dashboard["non_lp_row_count"] == 0
+    assert repeated_stale_dashboard["recommendations"][0]["reference_share_percentage"] == Decimal("5")
+    assert repeated_stale_dashboard["recommendations"][0]["reference_daily_reward_usd"] == Decimal("4.5")
+    assert repeated_stale_dashboard["recommendations"][1]["reference_share_percentage"] == Decimal("5")
+    assert repeated_stale_dashboard["recommendations"][1]["reference_daily_reward_usd"] == Decimal("4")
+    assert all(
+        row["directions"]["YES"]["state"] == "unknown"
+        for row in repeated_stale_dashboard["recommendations"]
+    )
+
+    cold_execution = PredictionExecutionService(
+        store=store,
+        monitor=object(),
+        trading=exchange,
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "cold-execution.lock",
+        lp=lp,
+    )
+    counters_before_cold_dashboard = {
+        "catalog": exchange.catalog_reads,
+        "metadata": exchange.metadata_reads,
+        "books": exchange.book_reads,
+        "history": exchange.history_reads,
+        "account": exchange.account_reads,
+    }
+    cold_dashboard = cold_execution.lp_dashboard()
+    assert exchange.catalog_reads == counters_before_cold_dashboard["catalog"]
+    assert exchange.metadata_reads == counters_before_cold_dashboard["metadata"]
+    assert exchange.book_reads == counters_before_cold_dashboard["books"]
+    assert exchange.history_reads == counters_before_cold_dashboard["history"]
+    assert exchange.account_reads == counters_before_cold_dashboard["account"] + 1
+    assert cold_dashboard["state"] == "unknown"
+    assert cold_dashboard["stale"] is True
+    assert cold_dashboard["authenticated"] is False
+    assert cold_dashboard["orders"] == []
+    assert cold_dashboard["positions"] == []
+    assert cold_dashboard["lp_orders_today"] == []
+    assert cold_dashboard["non_lp_row_count"] is None
+    assert cold_dashboard["checked_at"] is None
+    assert cold_dashboard["open_orders_complete"] is False
+    assert cold_dashboard["positions_complete"] is False
+    assert cold_dashboard["candidate_state"] == "ready"
+    assert cold_dashboard["complete"] is True
+    assert cold_dashboard["candidate_stale"] is False
+    assert cold_dashboard["candidate_checked_at"] == "2026-09-17T01:00:10.000000Z"
+    assert cold_dashboard["selected_market_ids"] == ["market-B", "market-C"]
+    assert cold_dashboard["funnel"]["catalog_read"] == 2
+    assert cold_dashboard["funnel"]["base_pass"] == 2
+    assert cold_dashboard["funnel"]["volatility_pass"] == 2
+    assert cold_dashboard["funnel"]["selected"] == 2
+    assert cold_dashboard["funnel"]["risk"] == {
+        "passed": 0,
+        "rejected": 0,
+        "unknown": 2,
+    }
+    assert [row["market_id"] for row in cold_dashboard["recommendations"]] == [
+        "market-B",
+        "market-C",
+    ]
+    assert cold_dashboard["recommendations"][0]["reference_share_percentage"] == Decimal("5")
+    assert cold_dashboard["recommendations"][0]["reference_daily_reward_usd"] == Decimal("4.5")
+    assert cold_dashboard["recommendations"][1]["reference_share_percentage"] == Decimal("5")
+    assert cold_dashboard["recommendations"][1]["reference_daily_reward_usd"] == Decimal("4")
+    assert all(
+        row["directions"]["YES"]["state"] == "unknown"
+        for row in cold_dashboard["recommendations"]
+    )
+
+
 
 def test_lp_dashboard_normalizes_candidate_reward_without_freshness_proof(
     tmp_path: Path,
@@ -2788,6 +3206,8 @@ def test_lp_dashboard_reward_share_thresholds_are_market_scoped(
             "catalog_complete": True,
             "missing_metadata_condition_ids": [],
             "missing_book_token_ids": [],
+            "funnel": {},
+            "selected_market_ids": [],
         }
     )
     store.lp_create_session(
@@ -3610,19 +4030,10 @@ def test_lp_candidate_preview_rechecks_best_bid_before_confirmation(
     scanned = lp.refresh_candidates(force=True)
     assert scanned["state"] == "ready"
     assert scanned["complete"] is True
-    assert len(scanned["candidates"]) == 2
-    assert sdk.balance_reads == sdk.order_reads == sdk.trade_reads == sdk.position_reads == 1
+    assert scanned["candidates"] == []
+    assert scanned["recommendations"] == []
     assert len(public_state["catalog_sources"]) == 2
     assert len(public_state["metadata_conditions"]) == 1
-    assert len(public_state["book_batches"]) == 1
-    public_state["omit_no_book"] = True
-    clock_state["now"] += timedelta(seconds=1)
-    partial_scan = lp.refresh_candidates(force=True)
-    assert partial_scan["state"] == "incomplete"
-    assert partial_scan["complete"] is False
-    assert partial_scan["stale"] is False
-    assert len(partial_scan["candidates"]) == 1
-    assert partial_scan["candidates"][0]["outcome"] == "YES"
     execution = PredictionExecutionService(
         store=store,
         monitor=_Monitor(),
@@ -3687,27 +4098,14 @@ def test_lp_candidate_preview_rechecks_best_bid_before_confirmation(
         assert dashboard_status == 200
         candidate_rows = dashboard["candidates"]
         assert isinstance(candidate_rows, list)
-        assert dashboard["complete"] is False
+        assert dashboard["complete"] is True
+        assert candidate_rows == []
         assert dashboard["candidate_stale"] is False
-        assert any(
-            row.get("market_id") == "market-1"
-            and row.get("outcome") == "YES"
-            and row.get("price") == "0.51"
-            and row.get("quantity") == "20"
-            for row in candidate_rows
-            if isinstance(row, dict)
-        )
         preview_status, preview = candidate_preview(base)
         assert preview_status == 200
         assert preview["state"] == "previewed"
         assert preview["request"]["price"] == "0.51"
         assert preview["request"]["quantity"] == "20"
-        public_state["omit_no_book"] = False
-        clock_state["now"] += timedelta(seconds=1)
-        complete_scan = lp.refresh_candidates(force=True)
-        assert complete_scan["complete"] is True
-        assert complete_scan["stale"] is False
-        assert len(complete_scan["candidates"]) == 2
         public_state["bids"] = [
             {"price": Decimal("0.52"), "size": Decimal("1")},
             {"price": Decimal("0.50"), "size": Decimal("100")},
@@ -4048,22 +4446,29 @@ def test_lp_recommendations_deduct_active_n_leg_cash_reservation(
         tmp_path, monkeypatch, markets=[market]
     )
 
-    samples: list[dict[str, object]] = []
-    for token_id in ("lp-yes", "lp-no"):
-        samples.extend(
-            {
-                "condition_id": condition_id,
-                "token_id": token_id,
-                "received_at": clock["now"] - timedelta(hours=1) + timedelta(seconds=elapsed),
-                "source_timestamp": clock["now"] - timedelta(days=1),
-                "best_bid_price": Decimal("0.50"),
-                "best_bid_size": Decimal("100"),
-                "best_ask_price": Decimal("0.52"),
-                "best_ask_size": Decimal("100"),
-            }
-            for elapsed in range(0, 3601, 5)
-        )
-    store.lp_record_book_samples(samples, now=clock["now"])
+    history_start = clock["now"] - timedelta(hours=24)
+    history_samples = [
+        {"t": int(history_start.timestamp()), "p": Decimal("0.500")},
+        {"t": int(clock["now"].timestamp()), "p": Decimal("0.505")},
+    ]
+    history_summary = {
+        "state": "known",
+        "amplitude": Decimal("0.005"),
+        "window_start": history_start,
+        "window_end": clock["now"],
+        "sample_count": len(history_samples),
+        "checked_at": clock["now"],
+        "valid_until": clock["now"] + timedelta(hours=2),
+    }
+    store.lp_save_price_history_batch(
+        {
+            "condition_id": condition_id,
+            "token_id": token_id,
+            "samples": [dict(sample) for sample in history_samples],
+            "summary": dict(history_summary),
+        }
+        for token_id in ("lp-yes", "lp-no")
+    )
 
     def yes_direction(snapshot: Mapping[str, object]) -> Mapping[str, object]:
         rows = snapshot["recommendations"]
@@ -4243,14 +4648,10 @@ def test_lp_recommendations_deduct_active_n_leg_cash_reservation(
 
     blocked = service.refresh_candidates(force=True)
     blocked_yes = yes_direction(blocked)
-    assert blocked_yes["state"] == "expired"
+    assert blocked_yes["state"] == "rejected"
     assert blocked_yes["eligible"] is False
     assert blocked_yes["reason_codes"] == ["balance_insufficient"]
-    retained_guidance = blocked_yes["guidance"]
-    assert isinstance(retained_guidance, Mapping)
-    assert Decimal(str(retained_guidance["price"])) == Decimal("0.50")
-    assert Decimal(str(retained_guidance["quantity"])) == Decimal("90")
-    assert Decimal(str(retained_guidance["required_capital"])) == Decimal("45.00")
+    assert blocked_yes["guidance"] is None
 
     market["reward_min_size"] = Decimal("72")
     exact_fit = service.refresh_candidates(force=True)
@@ -4356,93 +4757,137 @@ def test_lp_recommendations_deduct_active_n_leg_cash_reservation(
     assert state["trade_writes"] == []
 
 
-def test_lp_public_book_sampling_survives_account_read_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    market_a = _lp_test_market(
-        "condition-a", yes_token="a-yes", no_token="a-no"
+def test_lp_public_book_sampling_survives_account_read_failure(tmp_path: Path) -> None:
+    first_now = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
+    second_now = first_now + timedelta(seconds=5)
+    clock = {"now": first_now}
+    markets = {
+        "condition-a": {"market_id": "market-a", "yes_token": "a-yes", "no_token": "a-no"},
+        "condition-b": {"market_id": "market-b", "yes_token": "b-yes", "no_token": "b-no"},
+    }
+
+    class Exchange:
+        def __init__(self) -> None:
+            self.catalog_reads = 0
+            self.history_calls: list[dict[str, object]] = []
+            self.trade_writes: list[str] = []
+
+        def lp_reward_catalog(self, *, stop_event: object = None) -> dict[str, object]:
+            del stop_event
+            self.catalog_reads += 1
+            condition_id = "condition-a" if self.catalog_reads == 1 else "condition-b"
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": clock["now"],
+                "markets": [
+                    {
+                        "condition_id": condition_id,
+                        "daily_pool_usd": Decimal("100"),
+                        "reward_active": True,
+                    }
+                ],
+            }
+
+        def lp_market_metadata(
+            self, condition_ids: tuple[str, ...], *, stop_event: object = None
+        ) -> dict[str, dict[str, object]]:
+            del stop_event
+            return {
+                condition_id: {
+                    "condition_id": condition_id,
+                    "market_id": markets[condition_id]["market_id"],
+                    "accepting_orders": True,
+                    "outcomes": {
+                        "yes": {"label": "YES", "token_id": markets[condition_id]["yes_token"]},
+                        "no": {"label": "NO", "token_id": markets[condition_id]["no_token"]},
+                    },
+                }
+                for condition_id in condition_ids
+            }
+
+        def lp_price_history(
+            self,
+            token_ids: tuple[str, ...],
+            *,
+            start_ts: int,
+            end_ts: int,
+            fidelity: int,
+            stop_event: object = None,
+        ) -> dict[str, object]:
+            del stop_event
+            self.history_calls.append(
+                {
+                    "token_ids": token_ids,
+                    "start_ts": start_ts,
+                    "end_ts": end_ts,
+                    "fidelity": fidelity,
+                }
+            )
+            return {
+                "state": "known",
+                "history": {
+                    token_id: [
+                        {"t": start_ts, "p": Decimal("0.500")},
+                        {"t": end_ts, "p": Decimal("0.505")},
+                    ]
+                    for token_id in token_ids
+                },
+            }
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            raise AssertionError("public history refresh must not require private account facts")
+
+        def create_limit_order(self, **_kwargs: object) -> object:
+            self.trade_writes.append("create")
+            raise AssertionError("history refresh must not sign orders")
+
+        def post_order(self, _order: object) -> object:
+            self.trade_writes.append("post")
+            raise AssertionError("history refresh must not post orders")
+
+        def cancel_orders(self, **_kwargs: object) -> object:
+            self.trade_writes.append("cancel")
+            raise AssertionError("history refresh must not cancel orders")
+
+    exchange = Exchange()
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: clock["now"])
+
+    first = service.refresh_price_history()
+    assert first["state"] == "known"
+    assert first["updated_count"] == 2
+    assert exchange.history_calls[0]["token_ids"] == ("a-yes", "a-no")
+    first_summary = store.lp_price_history_summary(
+        "condition-a", "a-yes", now=first_now
     )
-    market_b = _lp_test_market(
-        "condition-b", yes_token="b-yes", no_token="b-no"
+    assert first_summary is not None
+    assert Decimal(str(first_summary["amplitude"])) == Decimal("0.005")
+    assert str(first_summary["checked_at"]).startswith(first_now.isoformat().replace("+00:00", ""))
+    assert str(first_summary["window_end"]).startswith(first_now.isoformat().replace("+00:00", ""))
+
+    clock["now"] = second_now
+    second = service.refresh_price_history()
+    assert second["state"] == "known"
+    assert second["updated_count"] == 2
+    assert exchange.history_calls[1]["token_ids"] == ("b-yes", "b-no")
+    second_summary = store.lp_price_history_summary(
+        "condition-b", "b-yes", now=second_now
     )
-    clock, state, store, _trading, service = _lp_adapter_service_fixture(
-        tmp_path, monkeypatch, markets=[market_a]
-    )
-    state["account_error"] = True
-
-    first = service.refresh_candidates(force=True)
-    assert first["recommendations"] == []
-    first_at = clock["now"]
-    first_sampling = service.sample_candidate_books()
-    assert first_sampling["sampled_count"] == 2
-    assert first_sampling["target_count"] == 2
-
-    def parsed_stamp(value: object) -> datetime:
-        if isinstance(value, datetime):
-            return value.astimezone(UTC)
-        text = str(value).strip()
-        if text.endswith("Z"):
-            text = text[:-1] + "+00:00"
-        return datetime.fromisoformat(text).astimezone(UTC)
-
-    def samples_for(condition_id: str, token_id: str) -> list[dict[str, object]]:
-        return store.lp_book_samples(
-            condition_id,
-            token_id,
-            since=clock["now"] - timedelta(hours=1),
-            until=clock["now"],
-        )
-
-    def assert_sample(
-        condition_id: str, token_id: str, *, received_at: datetime
-    ) -> None:
-        rows = samples_for(condition_id, token_id)
-        assert len(rows) == 1
-        sample = rows[0]
-        assert parsed_stamp(sample["received_at"]) == received_at
-        assert parsed_stamp(sample["source_timestamp"]) == received_at - timedelta(
-            minutes=10
-        )
-        assert Decimal(str(sample["best_bid_price"])) == Decimal("0.50")
-        assert Decimal(str(sample["best_ask_price"])) == Decimal("0.52")
-
-    assert_sample("condition-a", "a-yes", received_at=first_at)
-    assert_sample("condition-a", "a-no", received_at=first_at)
-
-    second_at = first_at + timedelta(seconds=5)
-    clock["now"] = second_at
-    state["markets"] = {"condition-b": market_b}
-    state["catalog_condition_ids"] = ("condition-b",)
-    second = service.refresh_candidates(force=True)
-    assert second["recommendations"] == []
-    second_sampling = service.sample_candidate_books()
-    assert second_sampling["sampled_count"] == 2
-    assert second_sampling["target_count"] == 2
-    assert_sample("condition-b", "b-yes", received_at=second_at)
-    assert_sample("condition-b", "b-no", received_at=second_at)
-    assert [parsed_stamp(row["received_at"]) for row in samples_for("condition-a", "a-yes")] == [first_at]
-    assert [parsed_stamp(row["received_at"]) for row in samples_for("condition-a", "a-no")] == [first_at]
-
-    state["account_error"] = False
-    recovered_at = second_at + timedelta(seconds=5)
-    clock["now"] = recovered_at
-    recovered = service.refresh_candidates(force=True)
-    recovered_rows = recovered["recommendations"]
-    assert isinstance(recovered_rows, list)
-    assert not any(
-        isinstance(row, Mapping)
-        and isinstance(row.get("directions"), Mapping)
-        and any(
-            isinstance(direction, Mapping) and direction.get("eligible") is True
-            for direction in row["directions"].values()
-        )
-        for row in recovered_rows
-    )
-    assert_sample("condition-b", "b-yes", received_at=second_at)
-    assert_sample("condition-b", "b-no", received_at=second_at)
-    assert [parsed_stamp(row["received_at"]) for row in samples_for("condition-a", "a-yes")] == [first_at]
-    assert [parsed_stamp(row["received_at"]) for row in samples_for("condition-a", "a-no")] == [first_at]
-    assert state["trade_writes"] == []
+    assert second_summary is not None
+    assert Decimal(str(second_summary["amplitude"])) == Decimal("0.005")
+    assert str(second_summary["checked_at"]).startswith(second_now.isoformat().replace("+00:00", ""))
+    retained = store.lp_price_history_summary("condition-a", "a-yes", now=second_now)
+    assert retained is not None
+    assert str(retained["checked_at"]).startswith(first_now.isoformat().replace("+00:00", ""))
+    assert str(retained["window_end"]).startswith(first_now.isoformat().replace("+00:00", ""))
+    assert store.lp_book_samples(
+        "condition-a", "a-yes", since=first_now - timedelta(hours=1), until=second_now
+    ) == []
+    assert store.lp_book_samples(
+        "condition-b", "b-yes", since=first_now - timedelta(hours=1), until=second_now
+    ) == []
+    assert exchange.trade_writes == []
 
 
 def test_lp_recommendations_retain_expired_guidance_without_renewing_it(
@@ -4654,25 +5099,30 @@ def test_lp_recommendations_retain_expired_guidance_without_renewing_it(
         no_bid: str = "0.48",
         no_ask: str = "0.52",
     ) -> None:
-        samples: list[dict[str, object]] = []
-        for token, bid_text, ask_text in (
-            (yes_token, yes_bid, yes_ask),
-            (no_token, no_bid, no_ask),
-        ):
-            for elapsed in range(0, 3601, 5):
-                samples.append(
-                    {
-                        "condition_id": condition_id,
-                        "token_id": token,
-                        "received_at": at - timedelta(hours=1) + timedelta(seconds=elapsed),
-                        "source_timestamp": at - timedelta(days=1),
-                        "best_bid_price": Decimal(bid_text),
-                        "best_bid_size": Decimal("100"),
-                        "best_ask_price": Decimal(ask_text),
-                        "best_ask_size": Decimal("100"),
-                    }
-                )
-        store.lp_record_book_samples(samples, now=at)
+        del yes_bid, yes_ask, no_bid, no_ask
+        window_start = at - timedelta(hours=24)
+        history_samples = [
+            {"t": int(window_start.timestamp()), "p": Decimal("0.500")},
+            {"t": int(at.timestamp()), "p": Decimal("0.505")},
+        ]
+        history_summary = {
+            "state": "known",
+            "amplitude": Decimal("0.005"),
+            "window_start": window_start,
+            "window_end": at,
+            "sample_count": len(history_samples),
+            "checked_at": at,
+            "valid_until": at + timedelta(hours=2),
+        }
+        store.lp_save_price_history_batch(
+            {
+                "condition_id": condition_id,
+                "token_id": token,
+                "samples": [dict(sample) for sample in history_samples],
+                "summary": dict(history_summary),
+            }
+            for token in (yes_token, no_token)
+        )
 
     state = market_state()
     trading = make_trading(state)
@@ -4694,11 +5144,11 @@ def test_lp_recommendations_retain_expired_guidance_without_renewing_it(
     assert isinstance(first_yes, dict) and first_yes["state"] == "eligible"
     first_yes_screening = first_yes["screening"]
     assert isinstance(first_yes_screening, dict)
-    assert first_yes_screening["state"] == "eligible"
-    assert Decimal(str(first_yes_screening["price_change_24h"])) == Decimal("0.02")
-    assert first_yes_screening["price_change_24h_source"] == (
-        "polymarket.prices.one_day_price_change"
-    )
+    assert first_yes_screening["state"] == "known"
+    assert Decimal(str(first_yes_screening["amplitude"])) == Decimal("0.005")
+    assert first_yes_screening["sample_count"] == 2
+    assert parsed_stamp(first_yes_screening["window_start"]) == clock["now"] - timedelta(hours=24)
+    assert parsed_stamp(first_yes_screening["window_end"]) == clock["now"]
     old_guidance = first_yes["guidance"]
     assert isinstance(old_guidance, dict)
     assert Decimal(str(old_guidance["price"])) == Decimal("0.49")
@@ -4757,10 +5207,10 @@ def test_lp_recommendations_retain_expired_guidance_without_renewing_it(
         assert current_directions["NO"]["eligible"] is True
         current_yes_screening = current_directions["YES"]["screening"]
         assert isinstance(current_yes_screening, dict)
-        assert Decimal(str(current_yes_screening["price_change_24h"])) == Decimal("0.02")
-        assert current_yes_screening["price_change_24h_source"] == (
-            "polymarket.prices.one_day_price_change"
-        )
+        assert Decimal(str(current_yes_screening["amplitude"])) == Decimal("0.005")
+        assert current_yes_screening["sample_count"] == 2
+        assert parsed_stamp(current_yes_screening["window_start"]) == clock["now"] - timedelta(hours=24)
+        assert parsed_stamp(current_yes_screening["window_end"]) == clock["now"]
 
         clock["now"] = datetime(2026, 9, 15, 12, 0, 11, tzinfo=UTC)
         first_expiry_status, first_expiry_dashboard = _response(
@@ -4824,12 +5274,10 @@ def test_lp_recommendations_retain_expired_guidance_without_renewing_it(
         record_history(store, confirmation_at)
         ended = lp.refresh_candidates(force=True)
         ended_yes = ended["recommendations"][0]["directions"]["YES"]
-        assert ended_yes["state"] == "expired"
+        assert ended_yes["state"] == "rejected"
         assert ended_yes["eligible"] is False
         assert ended_yes["reason_codes"] == ["event_recovery_pending"]
-        assert Decimal(str(ended_yes["guidance"]["price"])) == Decimal("0.49")
-        assert Decimal(str(ended_yes["guidance"]["quantity"])) == Decimal(str(old_quantity))
-        assert parsed_stamp(ended_yes["guidance"]["checked_at"]) == old_checked_at
+        assert ended_yes["guidance"] is None
 
         saved = store.lp_screening_snapshot()
         assert isinstance(saved, dict)
@@ -4848,7 +5296,8 @@ def test_lp_recommendations_retain_expired_guidance_without_renewing_it(
         record_history(reopened_store, clock["now"])
         refreshed = reopened_lp.refresh_candidates(force=True)
         refreshed_yes = refreshed["recommendations"][0]["directions"]["YES"]
-        assert refreshed_yes["state"] == "expired"
+        assert refreshed_yes["state"] == "rejected"
+        assert refreshed_yes["guidance"] is None
         reopened_confirmation = reopened_store.lp_screening_snapshot()
         assert isinstance(reopened_confirmation, dict)
         reopened_confirmations = reopened_confirmation["event_end_confirmations"]
@@ -4863,9 +5312,7 @@ def test_lp_recommendations_retain_expired_guidance_without_renewing_it(
         assert failed_yes["state"] == "expired"
         assert failed_yes["eligible"] is False
         assert failed_yes["reason_codes"] == ["reward_catalog_unknown"]
-        assert Decimal(str(failed_yes["guidance"]["price"])) == Decimal("0.49")
-        assert Decimal(str(failed_yes["guidance"]["quantity"])) == Decimal(str(old_quantity))
-        assert parsed_stamp(failed_yes["guidance"]["checked_at"]) == old_checked_at
+        assert failed_yes["guidance"] is None
         reopened_execution = PredictionExecutionService(
             store=reopened_store,
             monitor=_Monitor(),
@@ -4895,8 +5342,7 @@ def test_lp_recommendations_retain_expired_guidance_without_renewing_it(
             assert failed_status == 200
             failed_dashboard_yes = failed_dashboard["recommendations"][0]["directions"]["YES"]
             assert failed_dashboard_yes["eligible"] is False
-            assert Decimal(str(failed_dashboard_yes["guidance"]["price"])) == Decimal("0.49")
-            assert parsed_stamp(failed_dashboard_yes["guidance"]["checked_at"]) == old_checked_at
+            assert failed_dashboard_yes["guidance"] is None
 
         state["catalog_failure"] = False
         state["yes_bid"] = Decimal("0.48")
@@ -4997,8 +5443,8 @@ def test_lp_recommendations_retain_expired_guidance_without_renewing_it(
         {"side": "BUY", "status": "LIVE"},
         {
             "id": "missing-size-order",
-            "asset_id": yes_token,
-            "condition_id": condition_id,
+            "asset_id": "other-token",
+            "condition_id": "other-condition",
             "side": "BUY",
             "status": "LIVE",
             "price": Decimal("0.47"),
@@ -5090,6 +5536,7 @@ def test_lp_refresh_queues_work_without_trading_or_waiting_for_catalog(
         def __init__(self) -> None:
             self.lock = threading.Lock()
             self.first_catalog_entered = threading.Event()
+            self.second_catalog_entered = threading.Event()
             self.release_first_catalog = threading.Event()
             self.second_catalog_finished = threading.Event()
             self.unexpected_catalog = threading.Event()
@@ -5166,10 +5613,13 @@ def test_lp_refresh_queues_work_without_trading_or_waiting_for_catalog(
                     probe.native_catalog_calls += 1
                     call = probe.native_catalog_calls
             try:
-                if not sponsored and call == 1:
-                    probe.first_catalog_entered.set()
+                if not sponsored and call in {1, 2}:
+                    if call == 1:
+                        probe.first_catalog_entered.set()
+                    else:
+                        probe.second_catalog_entered.set()
                     assert probe.release_first_catalog.wait(timeout=5)
-                elif not sponsored and call >= 3:
+                elif not sponsored and call >= 4:
                     probe.unexpected_catalog.set()
                 if sponsored and call == 2:
                     probe.second_catalog_finished.set()
@@ -5256,6 +5706,14 @@ def test_lp_refresh_queues_work_without_trading_or_waiting_for_catalog(
             "complete": True,
             "candidate_rows_fresh": True,
             "catalog_complete": True,
+            "funnel": {
+                "catalog_read": 1,
+                "base_pass": 1,
+                "volatility_pass": 1,
+                "selected": 1,
+                "risk": {"passed": 1, "rejected": 0, "unknown": 0},
+            },
+            "selected_market_ids": ["market-old"],
             "candidates": [],
             "recommendations": [
                 {
@@ -5321,6 +5779,7 @@ def test_lp_refresh_queues_work_without_trading_or_waiting_for_catalog(
         assert runtime.monitor is not None
         runtime.monitor.stop()
         assert probe.first_catalog_entered.wait(timeout=2)
+        assert probe.second_catalog_entered.wait(timeout=2)
         assert runtime.store is not None
         assert runtime.execution is not None
         assert runtime.execution.set_validation_mode(
@@ -5393,9 +5852,9 @@ def test_lp_refresh_queues_work_without_trading_or_waiting_for_catalog(
             )
             assert invalid_status == 400
 
-            assert probe.native_catalog_calls == 1
-            assert probe.catalog_active == 1
-            assert probe.max_catalog_active == 1
+            assert probe.native_catalog_calls == 2
+            assert probe.catalog_active == 2
+            assert probe.max_catalog_active == 2
             assert probe.writes == []
 
             probe.release_first_catalog.set()
@@ -5404,14 +5863,14 @@ def test_lp_refresh_queues_work_without_trading_or_waiting_for_catalog(
             while time.monotonic() < deadline:
                 snapshot = runtime.lp.candidate_snapshot()
                 if (
-                    probe.native_catalog_calls == 2
+                    probe.native_catalog_calls == 3
                     and snapshot.get("scanning") is False
                 ):
                     break
                 time.sleep(0.01)
-            assert probe.native_catalog_calls == 2
+            assert probe.native_catalog_calls == 3
             assert probe.catalog_active == 0
-            assert probe.max_catalog_active == 1
+            assert probe.max_catalog_active == 2
             assert not probe.unexpected_catalog.wait(timeout=0.1)
             assert probe.writes == []
     finally:
@@ -7540,3 +7999,1077 @@ def test_lp_candidate_review_time_is_next_beijing_eight(
     assert short_preview["reason"] == "review_at_too_soon"
     assert short_window_sdk.limit_orders == []
     assert short_window_sdk.posts == []
+
+
+def test_lp_refresh_reads_risk_books_only_for_selected_markets(tmp_path: Path) -> None:
+    initial_now = datetime(2026, 9, 15, 1, 0, tzinfo=UTC)
+    now = [initial_now]
+    markets = tuple(f"M{index:02d}" for index in range(1, 52))
+
+    class Exchange:
+        def __init__(self) -> None:
+            self.book_requests: list[tuple[str, ...]] = []
+            self.account_calls = 0
+
+        def lp_reward_catalog(self, *, stop_event: object = None) -> dict[str, object]:
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": now[0],
+                "markets": tuple(
+                    {
+                        "condition_id": f"condition-{market_id}",
+                        "daily_pool_usd": Decimal(700 - index),
+                        "reward_active": True,
+                    }
+                    for index, market_id in enumerate(markets)
+                ),
+            }
+
+        def lp_market_metadata(
+            self, condition_ids: tuple[str, ...], *, stop_event: object = None
+        ) -> dict[str, dict[str, object]]:
+            return {
+                condition_id: {
+                    "market_id": market_id,
+                    "condition_id": condition_id,
+                    "market_title": market_id,
+                    "accepting_orders": True,
+                    "metadata_checked_at": now[0],
+                    "tick_size": Decimal("0.01"),
+                    "minimum_order_size": Decimal("20"),
+                    "reward_min_size": Decimal("20"),
+                    "reward_max_spread": Decimal("0.10"),
+                    "fee": Decimal("0"),
+                    "fees_enabled": False,
+                    "taker_fee_rate": Decimal("0"),
+                    "fee_exponent": Decimal("1"),
+                    "outcomes": {
+                        "yes": {"label": "YES", "token_id": f"token-{market_id}"}
+                    },
+                    **(
+                        {
+                            "event_id": "event-M01",
+                            "event_ended": True,
+                            "event_finished_at": initial_now - timedelta(hours=2),
+                        }
+                        if market_id == "M01"
+                        else {}
+                    ),
+                }
+                for market_id, condition_id in (
+                    (market_id, f"condition-{market_id}") for market_id in markets
+                )
+                if condition_id in condition_ids
+            }
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            self.account_calls += 1
+            now[0] = initial_now + timedelta(seconds=self.account_calls)
+            return {
+                "authenticated": True,
+                "balance": Decimal("10000"),
+                "allowance": Decimal("10000"),
+                "open_orders": [],
+                "positions": [],
+                "checked_at": now[0],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def lp_order_books(
+            self, token_ids: tuple[str, ...], *, stop_event: object = None
+        ) -> dict[str, dict[str, object]]:
+            now[0] = max(now[0], initial_now) + timedelta(seconds=1)
+            self.book_requests.append(tuple(token_ids))
+            expected = {f"token-{market_id}" for market_id in markets[:50]}
+            if set(token_ids) != expected:
+                raise AssertionError("risk books requested outside selected markets")
+            return {
+                token_id: {
+                    "condition_id": f"condition-{token_id.removeprefix('token-')}",
+                    "token_id": token_id,
+                    "received_at": now[0],
+                    "bids": [
+                        {"price": Decimal("0.50"), "size": Decimal("20")},
+                        {"price": Decimal("0.49"), "size": Decimal("20")},
+                    ],
+                    "asks": [{"price": Decimal("0.52"), "size": Decimal("20")}],
+                }
+                for token_id in token_ids
+            }
+
+    exchange = Exchange()
+    store = PredictionArbitrageStore(tmp_path)
+    for market_id in markets:
+        store.lp_save_price_history(
+            f"condition-{market_id}",
+            f"token-{market_id}",
+            [],
+            {
+                "state": "known",
+                "amplitude": Decimal("0.005"),
+                "checked_at": initial_now,
+                "window_start": initial_now - timedelta(hours=24),
+                "window_end": initial_now,
+            },
+        )
+    service = PolymarketLPService(
+        store,
+        exchange,
+        clock=lambda: now[0],
+    )
+    snapshot = service.refresh_candidates(force=True)
+    assert [row["market_id"] for row in snapshot["recommendations"]] == list(markets[:50])
+    assert exchange.book_requests == [tuple(f"token-{market_id}" for market_id in markets[:50])]
+    assert snapshot["funnel"]["catalog_read"] == 51
+    assert snapshot["funnel"]["base_pass"] == 51
+    assert snapshot["funnel"]["volatility_pass"] == 51
+    assert snapshot["funnel"]["selected"] == 50
+    assert snapshot["funnel"]["risk"] == {"passed": 50, "rejected": 0, "unknown": 0}
+    conditions = snapshot["funnel"]["conditions"]
+    assert conditions == {
+        "catalog": {
+            "来源": "奖励目录与市场资料",
+            "完整性": "完整目录；部分结果可参与筛选；缺失资料=UNKNOWN",
+        },
+        "base": {
+            "奖励": "奖励启用且日奖池>0",
+            "市场": "接受订单",
+            "参与": "没有已知订单或持仓",
+        },
+        "volatility": {
+            "窗口": "24h",
+            "粒度": "1m",
+            "振幅": "不超过1¢",
+            "刷新": "每小时",
+            "有效期": "2h",
+            "缺失": "UNKNOWN",
+        },
+        "selected": {"排序": "日奖池降序，同额按市场ID升序", "上限": 50},
+        "risk": {
+            "奖励与市场资料": "60s内",
+            "盘口与账户": "10s内；订单与持仓资料完整",
+            "事件": "开始前30分钟、进行中、结束后1h冷却；结束后筛选必须通过；缺失=UNKNOWN",
+            "入场压力": "最小数量、奖励价带、资金预留、含费压力退出不超过10%",
+        },
+    }
+    assert conditions["selected"] == {
+        "排序": "日奖池降序，同额按市场ID升序",
+        "上限": 50,
+    }
+    assert any(
+        reason["market_id"] == "M51" and reason["code"] == "shortlist_cap"
+        for reason in snapshot["funnel"]["reasons"]["selected"]
+    )
+    assert all(row["state"] == "eligible" for row in snapshot["recommendations"])
+
+
+def test_lp_refresh_preserves_selection_after_risk_without_backfill(tmp_path: Path) -> None:
+    now = datetime(2026, 9, 15, 1, 0, tzinfo=UTC)
+    markets = tuple(f"M{index:02d}" for index in range(1, 52))
+
+    class Exchange:
+        def __init__(self) -> None:
+            self.book_requests: list[tuple[str, ...]] = []
+
+        def lp_reward_catalog(self, *, stop_event: object = None) -> dict[str, object]:
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": now,
+                "markets": tuple(
+                    {
+                        "condition_id": f"condition-{market_id}",
+                        "daily_pool_usd": Decimal(700 - index),
+                        "reward_active": True,
+                    }
+                    for index, market_id in enumerate(markets)
+                ),
+            }
+
+        def lp_market_metadata(
+            self, condition_ids: tuple[str, ...], *, stop_event: object = None
+        ) -> dict[str, dict[str, object]]:
+            return {
+                f"condition-{market_id}": {
+                    "market_id": market_id,
+                    "condition_id": f"condition-{market_id}",
+                    "market_title": market_id,
+                    "accepting_orders": True,
+                    "metadata_checked_at": now,
+                    "tick_size": Decimal("0.01"),
+                    "minimum_order_size": Decimal("20"),
+                    "reward_min_size": Decimal("20"),
+                    "reward_max_spread": Decimal("0.10"),
+                    "fee": Decimal("0"),
+                    "fees_enabled": False,
+                    "taker_fee_rate": Decimal("0"),
+                    "fee_exponent": Decimal("1"),
+                    "outcomes": {
+                        "yes": {"label": "YES", "token_id": f"token-{market_id}"},
+                        **(
+                            {
+                                "no": {
+                                    "label": "NO",
+                                    "token_id": f"token-{market_id}-no",
+                                }
+                            }
+                            if market_id in {"M01", "M02"}
+                            else {}
+                        ),
+                    },
+                }
+                for market_id in markets
+                if f"condition-{market_id}" in condition_ids
+            }
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "balance": Decimal("10000"),
+                "allowance": Decimal("10000"),
+                "open_orders": [],
+                "positions": [],
+                "checked_at": now,
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def lp_order_books(
+            self, token_ids: tuple[str, ...], *, stop_event: object = None
+        ) -> dict[str, dict[str, object]]:
+            self.book_requests.append(tuple(token_ids))
+            expected = {f"token-{market_id}" for market_id in markets[:50]}
+            expected.add("token-M02-no")
+            assert set(token_ids) == expected
+            assert "token-M01-no" not in token_ids
+            result: dict[str, dict[str, object]] = {}
+            for token_id in token_ids:
+                market_id = token_id.removeprefix("token-").removesuffix("-no")
+                ordinal = int(market_id.removeprefix("M"))
+                if ordinal > 45:
+                    continue
+                exit_bid = Decimal("0.49") if ordinal <= 30 else Decimal("0.40")
+                result[token_id] = {
+                    "condition_id": f"condition-{market_id}",
+                    "token_id": token_id,
+                    "received_at": now,
+                    "bids": [
+                        {"price": Decimal("0.50"), "size": Decimal("20")},
+                        {"price": exit_bid, "size": Decimal("20")},
+                    ],
+                    "asks": [{"price": Decimal("0.52"), "size": Decimal("20")}],
+                }
+            return result
+
+    store = PredictionArbitrageStore(tmp_path)
+    for market_id in markets:
+        store.lp_save_price_history(
+            f"condition-{market_id}",
+            f"token-{market_id}",
+            [],
+            {
+                "state": "known",
+                "amplitude": Decimal("0.005"),
+                "checked_at": now,
+                "window_start": now - timedelta(hours=24),
+                "window_end": now,
+            },
+        )
+        if market_id == "M01":
+            store.lp_save_price_history(
+                f"condition-{market_id}",
+                f"token-{market_id}-no",
+                [],
+                {
+                    "state": "known",
+                    "amplitude": Decimal("0.0101"),
+                    "checked_at": now,
+                    "window_start": now - timedelta(hours=24),
+                    "window_end": now,
+                },
+            )
+        if market_id == "M02":
+            store.lp_save_price_history(
+                f"condition-{market_id}",
+                f"token-{market_id}-no",
+                [],
+                {
+                    "state": "known",
+                    "amplitude": Decimal("0.005"),
+                    "checked_at": now,
+                    "window_start": now - timedelta(hours=24),
+                    "window_end": now,
+                },
+            )
+    snapshot = PolymarketLPService(store, Exchange(), clock=lambda: now).refresh_candidates(force=True)
+    recommendations = snapshot["recommendations"]
+    assert [row["market_id"] for row in recommendations] == list(markets[:50])
+    states = [
+        direction["state"]
+        for row in recommendations
+        for direction in row["directions"].values()
+    ]
+    market_states = [row["state"] for row in recommendations]
+    assert states.count("eligible") == 31
+    assert sum(
+        1
+        for row in recommendations
+        for outcome in row["directions"]
+        if outcome == "NO" and row["market_id"] == "M02"
+    ) == 1
+    assert recommendations[1]["directions"]["NO"]["state"] == "eligible"
+    assert states.count("rejected") == 15
+    assert states.count("unknown") == 5
+    assert market_states.count("eligible") == 30
+    assert market_states.count("rejected") == 15
+    assert market_states.count("unknown") == 5
+    assert snapshot["funnel"]["risk"] == {"passed": 30, "rejected": 15, "unknown": 5}
+    assert Decimal("0.20") / Decimal("10") == Decimal("0.02")
+    assert Decimal("2") / Decimal("10") == Decimal("0.20")
+
+
+def test_lp_refresh_keeps_stale_batches_out_of_current_selection(tmp_path: Path) -> None:
+    first_now = datetime(2026, 9, 15, 1, 0, tzinfo=UTC)
+    now = [first_now]
+
+    class Exchange:
+        def __init__(self) -> None:
+            self.catalog_calls = 0
+            self.book_requests: list[tuple[str, ...]] = []
+
+        def lp_reward_catalog(self, *, stop_event: object = None) -> dict[str, object]:
+            self.catalog_calls += 1
+            if self.catalog_calls > 1:
+                raise RuntimeError("temporary catalog outage")
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": now[0],
+                "markets": tuple(
+                    {
+                        "condition_id": f"condition-M{index}",
+                        "daily_pool_usd": Decimal(100 - index),
+                        "reward_active": True,
+                    }
+                    for index in (1, 2)
+                ),
+            }
+
+        def lp_market_metadata(
+            self, condition_ids: tuple[str, ...], *, stop_event: object = None
+        ) -> dict[str, dict[str, object]]:
+            return {
+                f"condition-M{index}": {
+                    "market_id": f"M{index}",
+                    "condition_id": f"condition-M{index}",
+                    "accepting_orders": True,
+                    "metadata_checked_at": first_now,
+                    "tick_size": Decimal("0.01"),
+                    "minimum_order_size": Decimal("20"),
+                    "reward_min_size": Decimal("20"),
+                    "reward_max_spread": Decimal("0.10"),
+                    "fee": Decimal("0"),
+                    "fees_enabled": False,
+                    "taker_fee_rate": Decimal("0"),
+                    "fee_exponent": Decimal("1"),
+                    "outcomes": {"yes": {"label": "YES", "token_id": f"token-M{index}"}},
+                }
+                for index in (1, 2)
+                if f"condition-M{index}" in condition_ids
+            }
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "balance": Decimal("10000"),
+                "allowance": Decimal("10000"),
+                "open_orders": [],
+                "positions": [],
+                "checked_at": now[0],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def lp_order_books(
+            self, token_ids: tuple[str, ...], *, stop_event: object = None
+        ) -> dict[str, dict[str, object]]:
+            self.book_requests.append(tuple(token_ids))
+            return {
+                token_id: {
+                    "condition_id": f"condition-{token_id.removeprefix('token-')}",
+                    "token_id": token_id,
+                    "received_at": first_now,
+                    "bids": [
+                        {"price": Decimal("0.50"), "size": Decimal("20")},
+                        {"price": Decimal("0.49"), "size": Decimal("20")},
+                    ],
+                    "asks": [{"price": Decimal("0.52"), "size": Decimal("20")}],
+                }
+                for token_id in token_ids
+            }
+
+    store = PredictionArbitrageStore(tmp_path)
+    for index in (1, 2):
+        store.lp_save_price_history(
+            f"condition-M{index}",
+            f"token-M{index}",
+            [],
+            {
+                "state": "known",
+                "amplitude": Decimal("0.005"),
+                "checked_at": first_now,
+                "window_start": first_now - timedelta(hours=24),
+                "window_end": first_now,
+            },
+        )
+    exchange = Exchange()
+    service = PolymarketLPService(store, exchange, clock=lambda: now[0])
+    first = service.refresh_candidates(force=True)
+    assert first["state"] == "ready"
+    assert [row["market_id"] for row in first["recommendations"]] == ["M1", "M2"]
+    first_last_success = first["last_success_at"]
+    now[0] = first_now + timedelta(minutes=2)
+    stale = service.refresh_candidates(force=True)
+    assert stale["state"] == "stale"
+    assert stale["stale"] is True
+    assert stale["last_success_at"] == first_last_success
+    assert [row["market_id"] for row in stale["recommendations"]] == ["M1", "M2"]
+    assert all(row["state"] == "expired" for row in stale["recommendations"])
+    assert stale["selected_market_ids"] == ["M1", "M2"]
+    assert exchange.book_requests == [("token-M1", "token-M2")]
+
+    # A completed batch replaces the previous selection instead of carrying
+    # old markets forward when the catalog changes.
+    class ReplacementExchange(Exchange):
+        def __init__(self) -> None:
+            super().__init__()
+            self.catalog_calls = 0
+
+        def lp_reward_catalog(self, *, stop_event: object = None) -> dict[str, object]:
+            self.catalog_calls += 1
+            selected = ("M1", "M2") if self.catalog_calls == 1 else ("M3",)
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": now[0],
+                "markets": tuple(
+                    {
+                        "condition_id": f"condition-{market_id}",
+                        "daily_pool_usd": Decimal(100 - int(market_id[1:])),
+                        "reward_active": True,
+                    }
+                    for market_id in selected
+                ),
+            }
+
+        def lp_market_metadata(
+            self, condition_ids: tuple[str, ...], *, stop_event: object = None
+        ) -> dict[str, dict[str, object]]:
+            return {
+                f"condition-{market_id}": {
+                    "market_id": market_id,
+                    "condition_id": f"condition-{market_id}",
+                    "accepting_orders": True,
+                    "metadata_checked_at": now[0],
+                    "tick_size": Decimal("0.01"),
+                    "minimum_order_size": Decimal("20"),
+                    "reward_min_size": Decimal("20"),
+                    "reward_max_spread": Decimal("0.10"),
+                    "fee": Decimal("0"),
+                    "fees_enabled": False,
+                    "taker_fee_rate": Decimal("0"),
+                    "fee_exponent": Decimal("1"),
+                    "outcomes": {
+                        "yes": {"label": "YES", "token_id": f"token-{market_id}"}
+                    },
+                }
+                for market_id in ("M1", "M2", "M3")
+                if f"condition-{market_id}" in condition_ids
+            }
+
+        def lp_order_books(
+            self, token_ids: tuple[str, ...], *, stop_event: object = None
+        ) -> dict[str, dict[str, object]]:
+            self.book_requests.append(tuple(token_ids))
+            return {
+                token_id: {
+                    "condition_id": f"condition-{token_id.removeprefix('token-')}",
+                    "token_id": token_id,
+                    "received_at": now[0],
+                    "bids": [
+                        {"price": Decimal("0.50"), "size": Decimal("20")},
+                        {"price": Decimal("0.49"), "size": Decimal("20")},
+                    ],
+                    "asks": [{"price": Decimal("0.52"), "size": Decimal("20")}],
+                }
+                for token_id in token_ids
+            }
+
+    replacement_store = PredictionArbitrageStore(tmp_path / "replacement")
+    for index in (1, 2, 3):
+        replacement_store.lp_save_price_history(
+            f"condition-M{index}",
+            f"token-M{index}",
+            [],
+            {
+                "state": "known",
+                "amplitude": Decimal("0.005"),
+                "checked_at": first_now,
+                "window_start": first_now - timedelta(hours=24),
+                "window_end": first_now,
+            },
+        )
+    replacement_exchange = ReplacementExchange()
+    replacement_service = PolymarketLPService(
+        replacement_store, replacement_exchange, clock=lambda: now[0]
+    )
+    first_replacement = replacement_service.refresh_candidates(force=True)
+    assert first_replacement["selected_market_ids"] == ["M1", "M2"]
+    now[0] = first_now + timedelta(minutes=3)
+    second_replacement = replacement_service.refresh_candidates(force=True)
+    assert [row["market_id"] for row in second_replacement["recommendations"]] == ["M3"]
+    assert second_replacement["selected_market_ids"] == ["M3"]
+    assert replacement_exchange.book_requests == [
+        ("token-M1", "token-M2"),
+        ("token-M3",),
+    ]
+
+    # A legacy snapshot has no funnel contract and cannot be restored as a
+    # successful result from the new flow.
+    legacy_store = PredictionArbitrageStore(tmp_path / "legacy")
+    legacy_store.lp_save_screening_snapshot(
+        {
+            "state": "ready",
+            "complete": True,
+            "scanning": False,
+            "candidates": [{"market_id": "legacy-market"}],
+            "recommendations": [{"market_id": "legacy-market", "state": "eligible"}],
+            "checked_at": first_now,
+            "last_success_at": first_now,
+            "last_attempt_at": first_now,
+            "candidate_rows_fresh": True,
+            "scan_started_at": first_now.isoformat(),
+        }
+    )
+    legacy_service = PolymarketLPService(
+        legacy_store, replacement_exchange, clock=lambda: now[0]
+    )
+    legacy_snapshot = legacy_service.candidate_snapshot()
+    assert legacy_snapshot["state"] in {"unknown", "incomplete"}
+    assert legacy_snapshot["complete"] is False
+    assert legacy_snapshot["candidate_rows_fresh"] is False
+    assert legacy_snapshot["selected_market_ids"] == []
+    assert legacy_snapshot["funnel"] == {}
+
+    class PartialExchange(ReplacementExchange):
+        def __init__(self) -> None:
+            super().__init__()
+            self.account_failure = False
+            self.book_failure = False
+
+        def lp_reward_catalog(self, *, stop_event: object = None) -> dict[str, object]:
+            return {
+                "state": "known",
+                "complete": False,
+                "checked_at": now[0],
+                "markets": (
+                    {
+                        "condition_id": "condition-M4",
+                        "daily_pool_usd": Decimal("96"),
+                        "reward_active": True,
+                    },
+                ),
+            }
+
+        def lp_market_metadata(
+            self, condition_ids: tuple[str, ...], *, stop_event: object = None
+        ) -> dict[str, dict[str, object]]:
+            del stop_event
+            if "condition-M4" not in condition_ids:
+                return {}
+            return {
+                "condition-M4": {
+                    "market_id": "M4",
+                    "condition_id": "condition-M4",
+                    "accepting_orders": True,
+                    "metadata_checked_at": now[0],
+                    "tick_size": Decimal("0.01"),
+                    "minimum_order_size": Decimal("20"),
+                    "reward_min_size": Decimal("20"),
+                    "reward_max_spread": Decimal("0.10"),
+                    "fee": Decimal("0"),
+                    "fees_enabled": False,
+                    "taker_fee_rate": Decimal("0"),
+                    "fee_exponent": Decimal("1"),
+                    "outcomes": {
+                        "yes": {"label": "YES", "token_id": "token-M4"}
+                    },
+                }
+            }
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            if self.account_failure:
+                raise RuntimeError("temporary account outage")
+            return super().lp_account_snapshot()
+
+        def lp_order_books(
+            self, token_ids: tuple[str, ...], *, stop_event: object = None
+        ) -> dict[str, dict[str, object]]:
+            if self.book_failure:
+                raise RuntimeError("temporary books outage")
+            return super().lp_order_books(token_ids, stop_event=stop_event)
+
+    partial_store = PredictionArbitrageStore(tmp_path / "partial")
+    partial_store.lp_save_price_history(
+        "condition-M4",
+        "token-M4",
+        [],
+        {
+            "state": "known",
+            "amplitude": Decimal("0.005"),
+            "checked_at": first_now,
+            "window_start": first_now - timedelta(hours=24),
+            "window_end": first_now,
+        },
+    )
+    partial_exchange = PartialExchange()
+    partial_service = PolymarketLPService(
+        partial_store, partial_exchange, clock=lambda: now[0]
+    )
+    partial = partial_service.refresh_candidates(force=True)
+    assert partial["state"] == "incomplete"
+    assert partial["complete"] is False
+    assert [row["market_id"] for row in partial["recommendations"]] == ["M4"]
+    assert partial["funnel"]["catalog_read"] == 1
+    assert partial["funnel"]["base_pass"] == 1
+    assert partial["funnel"]["volatility_pass"] == 1
+    assert partial["funnel"]["selected"] == 1
+    assert partial["funnel"]["risk"] == {"passed": 1, "rejected": 0, "unknown": 0}
+
+    partial_exchange.account_failure = True
+    partial_failed = partial_service.refresh_candidates(force=True)
+    assert partial_failed["state"] == "incomplete"
+    assert partial_failed["complete"] is False
+    assert [row["market_id"] for row in partial_failed["recommendations"]] == ["M4"]
+    assert partial_failed["funnel"]["selected"] == 1
+    assert partial_failed["funnel"]["risk"] == {"passed": 0, "rejected": 0, "unknown": 1}
+
+    partial_exchange.account_failure = False
+    partial_exchange.book_failure = True
+    partial_books_failed = partial_service.refresh_candidates(force=True)
+    assert partial_books_failed["state"] == "incomplete"
+    assert partial_books_failed["funnel"]["catalog_read"] == 1
+    assert partial_books_failed["funnel"]["base_pass"] == 1
+    assert partial_books_failed["funnel"]["volatility_pass"] == 1
+    assert partial_books_failed["funnel"]["selected"] == 1
+    assert partial_books_failed["funnel"]["risk"] == {"passed": 0, "rejected": 0, "unknown": 1}
+
+
+def test_lp_candidate_snapshot_marks_minute_risk_expired_without_refreshing(
+    tmp_path: Path,
+) -> None:
+    first_now = datetime(2026, 9, 17, 1, 0, tzinfo=UTC)
+    now = [first_now]
+
+    class Exchange:
+        def __init__(self) -> None:
+            self.calls: dict[str, int] = {
+                "catalog": 0,
+                "metadata": 0,
+                "account": 0,
+                "books": 0,
+            }
+
+        def lp_reward_catalog(self, *, stop_event: object = None) -> dict[str, object]:
+            del stop_event
+            self.calls["catalog"] += 1
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": now[0],
+                "markets": (
+                    {
+                        "condition_id": "condition-minute",
+                        "daily_pool_usd": Decimal("100"),
+                        "reward_active": True,
+                    },
+                ),
+            }
+
+        def lp_market_metadata(
+            self, condition_ids: tuple[str, ...], *, stop_event: object = None
+        ) -> dict[str, dict[str, object]]:
+            del stop_event
+            self.calls["metadata"] += 1
+            if "condition-minute" not in condition_ids:
+                return {}
+            return {
+                "condition-minute": {
+                    "market_id": "market-minute",
+                    "condition_id": "condition-minute",
+                    "market_title": "Minute expiry market",
+                    "accepting_orders": True,
+                    "metadata_checked_at": now[0],
+                    "tick_size": Decimal("0.01"),
+                    "minimum_order_size": Decimal("20"),
+                    "reward_min_size": Decimal("20"),
+                    "reward_max_spread": Decimal("0.10"),
+                    "fees_enabled": False,
+                    "fee": Decimal("0"),
+                    "outcomes": {
+                        "yes": {
+                            "label": "YES",
+                            "token_id": "token-minute",
+                        }
+                    },
+                }
+            }
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            self.calls["account"] += 1
+            return {
+                "authenticated": True,
+                "balance": Decimal("10000"),
+                "allowance": Decimal("10000"),
+                "open_orders": [],
+                "positions": [],
+                "checked_at": first_now,
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def lp_order_books(
+            self, token_ids: tuple[str, ...], *, stop_event: object = None
+        ) -> dict[str, dict[str, object]]:
+            del stop_event
+            self.calls["books"] += 1
+            return {
+                token_id: {
+                    "condition_id": "condition-minute",
+                    "token_id": token_id,
+                    "received_at": first_now,
+                    "bids": [
+                        {"price": Decimal("0.50"), "size": Decimal("20")},
+                        {"price": Decimal("0.49"), "size": Decimal("20")},
+                    ],
+                    "asks": [{"price": Decimal("0.52"), "size": Decimal("20")}],
+                }
+                for token_id in token_ids
+            }
+
+    store = PredictionArbitrageStore(tmp_path)
+    store.lp_save_price_history(
+        "condition-minute",
+        "token-minute",
+        [],
+        {
+            "state": "known",
+            "amplitude": Decimal("0.005"),
+            "checked_at": first_now,
+            "window_start": first_now - timedelta(hours=24),
+            "window_end": first_now,
+            "valid_until": first_now + timedelta(hours=2),
+        },
+    )
+    exchange = Exchange()
+    service = PolymarketLPService(store, exchange, clock=lambda: now[0])
+
+    first = service.refresh_candidates(force=True)
+    assert first["state"] == "ready"
+    assert first["complete"] is True
+    assert first["selected_market_ids"] == ["market-minute"]
+    assert first["funnel"]["selected"] == 1
+    assert first["funnel"]["risk"] == {"passed": 1, "rejected": 0, "unknown": 0}
+    first_checked_at = first["checked_at"]
+    first_funnel = first["funnel"]
+    first_calls = dict(exchange.calls)
+
+    now[0] = first_now + timedelta(seconds=59)
+    fresh = service.candidate_snapshot()
+    assert fresh["stale"] is False
+    assert fresh["checked_at"] == first_checked_at
+    assert fresh["selected_market_ids"] == ["market-minute"]
+    assert fresh["funnel"] == first_funnel
+    assert fresh["recommendations"][0]["directions"]["YES"]["state"] == "eligible"
+    assert exchange.calls == first_calls
+
+    now[0] = first_now + timedelta(seconds=60)
+    exactly_expired = service.candidate_snapshot()
+    assert exactly_expired["stale"] is True
+    assert exactly_expired["checked_at"] == first_checked_at
+    assert exactly_expired["selected_market_ids"] == ["market-minute"]
+    assert exactly_expired["funnel"] == first_funnel
+    expired_direction = exactly_expired["recommendations"][0]["directions"]["YES"]
+    assert expired_direction["state"] == "expired"
+    assert expired_direction["eligible"] is False
+    assert exchange.calls == first_calls
+
+    now[0] = first_now + timedelta(seconds=61)
+    historical = service.candidate_snapshot()
+    assert historical["stale"] is True
+    assert historical["checked_at"] == first_checked_at
+    assert historical["selected_market_ids"] == ["market-minute"]
+    assert historical["funnel"] == first_funnel
+    assert historical["recommendations"][0]["directions"]["YES"]["state"] == "expired"
+    assert exchange.calls == first_calls
+
+
+def test_lp_refresh_confirmed_empty_catalog_preserves_funnel_rules(
+    tmp_path: Path,
+) -> None:
+    first_now = datetime(2026, 9, 17, 1, 0, tzinfo=UTC)
+
+    class EmptyExchange:
+        def __init__(self) -> None:
+            self.catalog_calls = 0
+            self.unexpected_calls: list[str] = []
+
+        def lp_reward_catalog(self, *, stop_event: object = None) -> dict[str, object]:
+            del stop_event
+            self.catalog_calls += 1
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": first_now,
+                "markets": (),
+            }
+
+        def lp_market_metadata(
+            self, condition_ids: tuple[str, ...], *, stop_event: object = None
+        ) -> dict[str, dict[str, object]]:
+            del condition_ids, stop_event
+            self.unexpected_calls.append("metadata")
+            raise AssertionError("empty catalog must not read market metadata")
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            self.unexpected_calls.append("account")
+            raise AssertionError("empty catalog must not read account facts")
+
+        def lp_order_books(
+            self, token_ids: tuple[str, ...], *, stop_event: object = None
+        ) -> dict[str, dict[str, object]]:
+            del token_ids, stop_event
+            self.unexpected_calls.append("books")
+            raise AssertionError("empty catalog must not read order books")
+
+    store = PredictionArbitrageStore(tmp_path)
+    exchange = EmptyExchange()
+    service = PolymarketLPService(store, exchange, clock=lambda: first_now)
+
+    snapshot = service.refresh_candidates(force=True)
+
+    assert snapshot["state"] == "ready"
+    assert snapshot["complete"] is True
+    assert snapshot["selected_market_ids"] == []
+    assert snapshot["recommendations"] == []
+    funnel = snapshot["funnel"]
+    assert funnel["catalog_read"] == 0
+    assert funnel["base_pass"] == 0
+    assert funnel["volatility_pass"] == 0
+    assert funnel["selected"] == 0
+    assert funnel["risk"] == {"passed": 0, "rejected": 0, "unknown": 0}
+    assert funnel["conditions"] == {
+        "catalog": {
+            "来源": "奖励目录与市场资料",
+            "完整性": "完整目录；部分结果可参与筛选；缺失资料=UNKNOWN",
+        },
+        "base": {
+            "奖励": "奖励启用且日奖池>0",
+            "市场": "接受订单",
+            "参与": "没有已知订单或持仓",
+        },
+        "volatility": {
+            "窗口": "24h",
+            "粒度": "1m",
+            "振幅": "不超过1¢",
+            "刷新": "每小时",
+            "有效期": "2h",
+            "缺失": "UNKNOWN",
+        },
+        "selected": {
+            "排序": "日奖池降序，同额按市场ID升序",
+            "上限": 50,
+        },
+        "risk": {
+            "奖励与市场资料": "60s内",
+            "盘口与账户": "10s内；订单与持仓资料完整",
+            "事件": "开始前30分钟、进行中、结束后1h冷却；结束后筛选必须通过；缺失=UNKNOWN",
+            "入场压力": "最小数量、奖励价带、资金预留、含费压力退出不超过10%",
+        },
+    }
+    assert funnel["reasons"] == {
+        "catalog": [],
+        "base": [],
+        "volatility": [],
+        "selected": [],
+        "risk": [],
+    }
+    assert exchange.catalog_calls == 1
+    assert exchange.unexpected_calls == []
+
+
+def test_lp_price_history_updates_incrementally_and_expires(tmp_path: Path) -> None:
+    first_now = datetime(2026, 9, 15, 10, 0, tzinfo=UTC)
+    now = [first_now]
+
+    class Exchange:
+        def __init__(self) -> None:
+            self.history_calls: list[dict[str, object]] = []
+            self.fail_history = False
+
+        def lp_reward_catalog(self, *, stop_event: object = None) -> dict[str, object]:
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": now[0],
+                "markets": (
+                    {
+                        "condition_id": "condition-M1",
+                        "daily_pool_usd": Decimal("100"),
+                        "reward_active": True,
+                    },
+                ),
+            }
+
+        def lp_market_metadata(
+            self, condition_ids: tuple[str, ...], *, stop_event: object = None
+        ) -> dict[str, dict[str, object]]:
+            del stop_event
+            if "condition-M1" not in condition_ids:
+                return {}
+            return {
+                "condition-M1": {
+                    "market_id": "M1",
+                    "condition_id": "condition-M1",
+                    "accepting_orders": True,
+                    "metadata_checked_at": now[0],
+                    "outcomes": {"yes": {"label": "YES", "token_id": "token-M1"}},
+                    "reward_min_size": Decimal("20"),
+                    "reward_max_spread": Decimal("0.10"),
+                }
+            }
+
+        def lp_price_history(
+            self,
+            token_ids: tuple[str, ...],
+            *,
+            start_ts: int,
+            end_ts: int,
+            fidelity: int,
+            stop_event: object = None,
+        ) -> dict[str, object]:
+            del stop_event
+            self.history_calls.append(
+                {
+                    "token_ids": token_ids,
+                    "start_ts": start_ts,
+                    "end_ts": end_ts,
+                    "fidelity": fidelity,
+                }
+            )
+            if self.fail_history:
+                raise RuntimeError("temporary history outage")
+            if len(self.history_calls) == 1:
+                return {
+                    "state": "known",
+                    "history": {
+                        "token-M1": [
+                            {"t": int((first_now - timedelta(hours=24)).timestamp()), "p": Decimal("0.80")},
+                            {"t": int((first_now - timedelta(hours=23)).timestamp()), "p": Decimal("0.500")},
+                            {"t": int(first_now.timestamp()), "p": Decimal("0.500")},
+                        ]
+                    },
+                }
+            return {
+                "state": "known",
+                "history": {
+                    "token-M1": [
+                        {"t": int(first_now.timestamp()), "p": Decimal("0.500")},
+                        {"t": int(now[0].timestamp()), "p": Decimal("0.505")},
+                    ]
+                },
+            }
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "balance": Decimal("10000"),
+                "allowance": Decimal("10000"),
+                "open_orders": [],
+                "positions": [],
+                "checked_at": now[0],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def lp_order_books(
+            self, token_ids: tuple[str, ...], *, stop_event: object = None
+        ) -> dict[str, dict[str, object]]:
+            del stop_event
+            return {
+                "token-M1": {
+                    "condition_id": "condition-M1",
+                    "token_id": "token-M1",
+                    "received_at": now[0],
+                    "bids": [{"price": Decimal("0.50"), "size": Decimal("20")}],
+                    "asks": [{"price": Decimal("0.52"), "size": Decimal("20")}],
+                }
+                for _ in token_ids
+            }
+
+    store = PredictionArbitrageStore(tmp_path)
+    exchange = Exchange()
+    service = PolymarketLPService(store, exchange, clock=lambda: now[0])
+
+    first = service.refresh_price_history()
+    assert first["state"] == "known"
+    assert len(exchange.history_calls) == 1
+    first_call = exchange.history_calls[0]
+    assert first_call["start_ts"] == int((first_now - timedelta(hours=24)).timestamp())
+    first_summary = store.lp_price_history_summary("condition-M1", "token-M1", now=first_now)
+    assert first_summary is not None
+    assert Decimal(str(first_summary["amplitude"])) == Decimal("0.300")
+
+    now[0] = first_now + timedelta(hours=1)
+    second = service.refresh_price_history()
+    assert second["state"] == "known"
+    assert len(exchange.history_calls) == 2
+    second_call = exchange.history_calls[1]
+    assert second_call["start_ts"] == int(first_now.timestamp()) - 60
+    samples = store.lp_price_history_samples("condition-M1", "token-M1")
+    assert [Decimal(str(row["p"])) for row in samples] == [
+        Decimal("0.500"),
+        Decimal("0.500"),
+        Decimal("0.505"),
+    ]
+    second_summary = store.lp_price_history_summary("condition-M1", "token-M1", now=now[0])
+    assert second_summary is not None
+    assert Decimal(str(second_summary["amplitude"])) == Decimal("0.005")
+    assert str(second_summary["checked_at"]).startswith(
+        now[0].isoformat().replace("+00:00", "")
+    )
+
+    exchange.fail_history = True
+    now[0] = first_now + timedelta(hours=2)
+    failed = service.refresh_price_history()
+    assert failed["state"] == "unknown"
+    assert len(exchange.history_calls) == 3
+    preserved = store.lp_price_history_summary("condition-M1", "token-M1", now=now[0])
+    assert preserved is not None
+    assert str(preserved["checked_at"]).startswith(
+        (first_now + timedelta(hours=1)).isoformat().replace("+00:00", "")
+    )
+    assert Decimal(str(preserved["amplitude"])) == Decimal("0.005")
+
+    now[0] = first_now + timedelta(hours=2, minutes=59, seconds=59)
+    before_candidates = len(exchange.history_calls)
+    usable = service.refresh_candidates(force=True)
+    assert len(exchange.history_calls) == before_candidates
+    assert usable["funnel"]["volatility_pass"] == 1
+
+    now[0] = first_now + timedelta(hours=3)
+    expired = service.refresh_candidates(force=True)
+    assert len(exchange.history_calls) == before_candidates
+    assert expired["funnel"]["volatility_pass"] == 0

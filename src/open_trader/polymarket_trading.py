@@ -54,6 +54,10 @@ GEOBLOCK_URL = "https://polymarket.com/api/geoblock"
 GEOBLOCK_TIMEOUT_SECONDS = 5.0
 MERGE_WAIT_TIMEOUT_SECONDS = 60.0
 REMEDIATION_BOOK_FRESHNESS_SECONDS = 10.0
+LP_PRICE_HISTORY_ENDPOINT = "https://clob.polymarket.com/batch-prices-history"
+LP_PRICE_HISTORY_BATCH_SIZE = 20
+LP_PRICE_HISTORY_MAX_CONCURRENCY = 4
+LP_PRICE_HISTORY_TIMEOUT_SECONDS = 20.0
 LP_REWARD_ASSET_USD_ADDRESSES = frozenset(
     {
         # Both contracts are identified by the official Polymarket contracts
@@ -1479,6 +1483,146 @@ class PolymarketTradingClient:
                 close()
         return result
 
+    def lp_price_history(
+        self,
+        token_ids: Sequence[str],
+        *,
+        start_ts: int,
+        end_ts: int,
+        fidelity: int = 1,
+        stop_event: threading.Event | None = None,
+    ) -> dict[str, object]:
+        """Read minute price histories in bounded public batches.
+
+        The response is intentionally lossless about missing directions: a
+        token with no valid rows is reported in ``unknown_token_ids`` rather
+        than being given an empty or zero-priced range.
+        """
+
+        requested = tuple(
+            dict.fromkeys(
+                value.strip()
+                for value in token_ids
+                if isinstance(value, str) and value.strip()
+            )
+        )
+        if not requested or type(start_ts) is not int or type(end_ts) is not int:
+            return {
+                "state": "unknown",
+                "history": {},
+                "unknown_token_ids": list(requested),
+                "errors": {token: "request_invalid" for token in requested},
+                "request_count": 0,
+            }
+        if end_ts < start_ts or fidelity != 1:
+            return {
+                "state": "unknown",
+                "history": {},
+                "unknown_token_ids": list(requested),
+                "errors": {token: "request_invalid" for token in requested},
+                "request_count": 0,
+            }
+        batches = tuple(
+            requested[offset : offset + LP_PRICE_HISTORY_BATCH_SIZE]
+            for offset in range(0, len(requested), LP_PRICE_HISTORY_BATCH_SIZE)
+        )
+        opener = self._urlopen_fn or urlopen
+
+        def read_batch(batch: tuple[str, ...]) -> tuple[tuple[str, ...], object, str | None]:
+            if stop_event is not None and stop_event.is_set():
+                return batch, None, "cancelled"
+            body = json.dumps(
+                {
+                    "markets": list(batch),
+                    "start_ts": start_ts,
+                    "end_ts": end_ts,
+                    "fidelity": fidelity,
+                },
+                separators=(",", ":"),
+            ).encode("utf-8")
+            request = Request(
+                LP_PRICE_HISTORY_ENDPOINT,
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "User-Agent": "OpenTrader/1.0",
+                },
+                method="POST",
+            )
+            try:
+                with opener(request, timeout=LP_PRICE_HISTORY_TIMEOUT_SECONDS) as response:
+                    raw = response.read()
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8")
+                return batch, json.loads(raw), None
+            except Exception as exc:
+                return batch, None, type(exc).__name__
+
+        histories: dict[str, list[dict[str, object]]] = {}
+        unknown: set[str] = set()
+        errors: dict[str, str] = {}
+        with ThreadPoolExecutor(
+            max_workers=min(LP_PRICE_HISTORY_MAX_CONCURRENCY, len(batches))
+        ) as pool:
+            for batch, payload, error in pool.map(read_batch, batches):
+                if error is not None:
+                    unknown.update(batch)
+                    for token in batch:
+                        errors[token] = error
+                    continue
+                raw_history = payload.get("history") if isinstance(payload, Mapping) else None
+                if not isinstance(raw_history, Mapping):
+                    unknown.update(batch)
+                    for token in batch:
+                        errors[token] = "history_shape_unknown"
+                    continue
+                for token in batch:
+                    raw_rows = raw_history.get(token)
+                    if not isinstance(raw_rows, Sequence) or isinstance(raw_rows, (str, bytes)):
+                        unknown.add(token)
+                        errors[token] = "history_missing"
+                        continue
+                    by_timestamp: dict[int, dict[str, object]] = {}
+                    invalid = False
+                    for raw_row in raw_rows:
+                        if not isinstance(raw_row, Mapping):
+                            invalid = True
+                            continue
+                        stamp = raw_row.get("t", raw_row.get("timestamp"))
+                        price = _lp_decimal(raw_row.get("p", raw_row.get("price")))
+                        if type(stamp) is not int or stamp < start_ts or stamp > end_ts:
+                            invalid = True
+                            continue
+                        if price is None or price < 0 or price > 1:
+                            invalid = True
+                            continue
+                        by_timestamp[stamp] = {"t": stamp, "p": price}
+                    rows = [by_timestamp[stamp] for stamp in sorted(by_timestamp)]
+                    if rows and not invalid:
+                        histories[token] = rows
+                    elif invalid:
+                        unknown.add(token)
+                        errors[token] = "history_values_invalid"
+                    else:
+                        unknown.add(token)
+                        errors[token] = "history_values_unknown"
+        if stop_event is not None and stop_event.is_set():
+            for token in requested:
+                unknown.add(token)
+                errors.setdefault(token, "cancelled")
+        unknown.difference_update(histories)
+        return {
+            "state": "known" if not unknown else "partial" if histories else "unknown",
+            "history": histories,
+            "unknown_token_ids": [token for token in requested if token in unknown],
+            "errors": errors,
+            "request_count": len(batches),
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "fidelity": fidelity,
+        }
+
     def lp_reward_catalog(
         self, *, stop_event: threading.Event | None = None
     ) -> dict[str, object]:
@@ -1610,6 +1754,7 @@ class PolymarketTradingClient:
                 else:
                     total += pool
                 result_markets.append(market)
+                market["reward_active"] = True
             return {
                 "state": "known",
                 "complete": True,

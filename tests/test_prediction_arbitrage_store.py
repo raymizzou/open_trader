@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from open_trader.polymarket_lp import PolymarketLPService
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 from open_trader.prediction_n_leg import fingerprint
 from open_trader.prediction_n_leg_execution import (
@@ -2906,3 +2907,227 @@ def test_lp_screening_history_survives_restart_with_retention(tmp_path: Path) ->
         "condition-a", "token-no", since=now - timedelta(hours=1), until=now
     ) == []
     assert reopened.lp_screening_snapshot() == screening
+
+
+def test_lp_price_history_cache_survives_restart_without_fabricating_books(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "price-history"
+    now = datetime(2026, 9, 17, 1, tzinfo=UTC)
+    samples = [
+        {"t": int((now - timedelta(hours=24)).timestamp()), "p": Decimal("0.500")},
+        {"t": int((now - timedelta(hours=23, minutes=59)).timestamp()), "p": Decimal("0.500")},
+        {"t": int(now.timestamp()), "p": Decimal("0.505")},
+    ]
+    summary = {
+        "state": "known",
+        "amplitude": Decimal("0.005"),
+        "checked_at": now,
+        "window_start": now - timedelta(hours=24),
+        "window_end": now,
+        "sample_count": 3,
+        "valid_until": now + timedelta(hours=2),
+    }
+
+    first = PredictionArbitrageStore(data_dir)
+    session_before = first.lp_create_session(
+        "lp-history-preserved",
+        "history-preserved-key",
+        state="needs_attention",
+        payload={
+            "entry_order_id": "order-history-preserved",
+            "market_id": "market-preserved",
+            "outcome": "YES",
+            "quantity": Decimal("20"),
+            "price": Decimal("0.50"),
+        },
+    )
+    action_before = first.lp_upsert_action(
+        "lp-history-preserved",
+        "history-preserved-entry-action",
+        state="submitted",
+        payload={
+            "order_id": "order-history-preserved",
+            "side": "BUY",
+            "quantity": Decimal("20"),
+            "price": Decimal("0.50"),
+        },
+    )
+    first.lp_save_price_history(
+        "condition-history",
+        "token-history",
+        samples,
+        summary,
+    )
+
+    reopened = PredictionArbitrageStore(data_dir)
+    cached = reopened.lp_price_history_summary(
+        "condition-history", "token-history", now=now + timedelta(minutes=1)
+    )
+    assert cached is not None
+    assert cached["state"] == "known"
+    assert Decimal(str(cached["amplitude"])) == Decimal("0.005")
+    assert cached["checked_at"] == iso(now)
+    assert cached["window_start"] == iso(now - timedelta(hours=24))
+    assert cached["window_end"] == iso(now)
+    assert cached["valid_until"] == iso(now + timedelta(hours=2))
+    assert cached["sample_count"] == 3
+    restored_samples = reopened.lp_price_history_samples(
+        "condition-history", "token-history"
+    )
+    assert [row["t"] for row in restored_samples] == [row["t"] for row in samples]
+    assert [Decimal(str(row["p"])) for row in restored_samples] == [
+        row["p"] for row in samples
+    ]
+    assert reopened.lp_book_samples(
+        "condition-history",
+        "token-history",
+        since=now - timedelta(hours=24),
+        until=now,
+    ) == []
+
+    assert reopened.lp_session("lp-history-preserved") == session_before
+    assert reopened.lp_actions("lp-history-preserved") == [action_before]
+    restored_session = reopened.lp_session("lp-history-preserved")
+    assert restored_session is not None
+    assert restored_session["state"] == "needs_attention"
+    assert restored_session["entry_order_id"] == "order-history-preserved"
+    assert restored_session["market_id"] == "market-preserved"
+    assert restored_session["outcome"] == "YES"
+    assert Decimal(str(restored_session["quantity"])) == Decimal("20")
+    assert Decimal(str(restored_session["price"])) == Decimal("0.50")
+    restored_actions = reopened.lp_actions("lp-history-preserved")
+    assert len(restored_actions) == 1
+    assert restored_actions[0]["state"] == "submitted"
+    assert restored_actions[0]["order_id"] == "order-history-preserved"
+    assert restored_actions[0]["side"] == "BUY"
+    assert Decimal(str(restored_actions[0]["quantity"])) == Decimal("20")
+    assert Decimal(str(restored_actions[0]["price"])) == Decimal("0.50")
+
+    next_now = now + timedelta(minutes=1)
+
+    class HistoryExchange:
+        def __init__(self) -> None:
+            self.history_calls: list[dict[str, object]] = []
+            self.unexpected_calls: list[str] = []
+
+        def lp_reward_catalog(self, *, stop_event: object = None) -> dict[str, object]:
+            del stop_event
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": next_now,
+                "markets": (
+                    {
+                        "condition_id": "condition-history",
+                        "daily_pool_usd": Decimal("100"),
+                        "reward_active": True,
+                    },
+                ),
+            }
+
+        def lp_market_metadata(
+            self,
+            condition_ids: tuple[str, ...],
+            *,
+            stop_event: object = None,
+        ) -> dict[str, dict[str, object]]:
+            del stop_event
+            if condition_ids != ("condition-history",):
+                raise AssertionError(condition_ids)
+            return {
+                "condition-history": {
+                    "market_id": "market-history",
+                    "condition_id": "condition-history",
+                    "accepting_orders": True,
+                    "outcomes": {
+                        "yes": {
+                            "label": "YES",
+                            "token_id": "token-history",
+                        }
+                    },
+                }
+            }
+
+        def lp_price_history(
+            self,
+            token_ids: tuple[str, ...],
+            *,
+            start_ts: int,
+            end_ts: int,
+            fidelity: int,
+            stop_event: object = None,
+        ) -> dict[str, object]:
+            del stop_event
+            assert token_ids == ("token-history",)
+            assert start_ts == int((now - timedelta(minutes=1)).timestamp())
+            assert end_ts == int(next_now.timestamp())
+            assert fidelity == 1
+            self.history_calls.append(
+                {
+                    "token_ids": token_ids,
+                    "start_ts": start_ts,
+                    "end_ts": end_ts,
+                    "fidelity": fidelity,
+                }
+            )
+            return {
+                "state": "known",
+                "history": {
+                    "token-history": [
+                        {"t": int(now.timestamp()), "p": Decimal("0.500")},
+                        {"t": int(next_now.timestamp()), "p": Decimal("0.505")},
+                    ]
+                },
+            }
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            self.unexpected_calls.append("account")
+            raise AssertionError("history preparation must not read account facts")
+
+        def lp_order_books(
+            self, token_ids: tuple[str, ...], *, stop_event: object = None
+        ) -> dict[str, dict[str, object]]:
+            del token_ids, stop_event
+            self.unexpected_calls.append("books")
+            raise AssertionError("history preparation must not read full books")
+
+    exchange = HistoryExchange()
+    service = PolymarketLPService(reopened, exchange, clock=lambda: next_now)
+    service.candidate_snapshot()
+    service.candidate_snapshot()
+    assert exchange.history_calls == []
+
+    refreshed = service.refresh_price_history()
+    assert refreshed["state"] == "known"
+    assert refreshed["updated_count"] == 1
+    assert refreshed["request_count"] == 1
+    assert len(exchange.history_calls) == 1
+    assert exchange.unexpected_calls == []
+    assert [row["t"] for row in reopened.lp_price_history_samples(
+        "condition-history", "token-history"
+    )] == [
+        int((next_now - timedelta(hours=24)).timestamp()),
+        int(now.timestamp()),
+        int(next_now.timestamp()),
+    ]
+    assert [Decimal(str(row["p"])) for row in reopened.lp_price_history_samples(
+        "condition-history", "token-history"
+    )] == [Decimal("0.500"), Decimal("0.500"), Decimal("0.505")]
+    refreshed_summary = reopened.lp_price_history_summary(
+        "condition-history", "token-history", now=next_now
+    )
+    assert refreshed_summary is not None
+    assert refreshed_summary["checked_at"] == iso(next_now)
+    assert refreshed_summary["window_start"] == iso(next_now - timedelta(hours=24))
+    assert refreshed_summary["window_end"] == iso(next_now)
+    assert refreshed_summary["sample_count"] == 3
+    assert Decimal(str(refreshed_summary["amplitude"])) == Decimal("0.005")
+    assert reopened.lp_session("lp-history-preserved") == session_before
+    assert reopened.lp_actions("lp-history-preserved") == [action_before]
+    assert reopened.lp_book_samples(
+        "condition-history",
+        "token-history",
+        since=now - timedelta(hours=24),
+        until=next_now,
+    ) == []
