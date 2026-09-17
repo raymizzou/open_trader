@@ -185,7 +185,7 @@ def render_xiaoai_voice_notification(title: str, message: str) -> str | None:
     title, message = title.strip(), message.strip()
     if "测试通知" in title:
         return message or title
-    if title == "LP 风险警告":
+    if title in {"LP 风险警告", "LP 份额预警"}:
         return f"{title}\n\n{message}".strip()
     match = re.fullmatch(r"(A股|港股|美股)保护线触发 · ([^·]+)", title)
     if match is None:
@@ -239,7 +239,16 @@ class XiaoaiSSHNotifier:
             raise XiaoaiVoiceSuppressed("quiet hours")
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         with self.lock_path.open("a+", encoding="utf-8") as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            lp_share_alert = title.strip() == "LP 份额预警"
+            try:
+                fcntl.flock(
+                    lock.fileno(),
+                    fcntl.LOCK_EX | (fcntl.LOCK_NB if lp_share_alert else 0),
+                )
+            except BlockingIOError as exc:
+                if lp_share_alert:
+                    raise XiaoaiVoiceSuppressed("voice transport busy") from exc
+                raise
             if not xiaoai_voice_allowed(self._now_fn()):
                 raise XiaoaiVoiceSuppressed("quiet hours")
             command = [

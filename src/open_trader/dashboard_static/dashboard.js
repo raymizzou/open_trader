@@ -73,6 +73,9 @@ const state = {
     signalPollEpoch: 0,
     signalHistoryGeneration: 0,
     csrfToken: "",
+    lpShareWatchPending: {},
+    lpShareWatchConfirmed: {},
+    lpShareWatchRevision: 0,
     llmSwitchInFlight: "",
     activeExecutionId: "",
     filter: {engine: "all", kind: "all", legs: null, scope: null},
@@ -3105,12 +3108,12 @@ function lpDashboardRewards(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
 
-function lpDashboardShareIsCurrent(share, dashboardStale) {
-  if (!share || typeof share !== "object" || dashboardStale
+function lpDashboardShareIsCurrent(share) {
+  if (!share || typeof share !== "object"
       || share.state !== "known" || share.historical === true || share.stale === true) return false;
   const checkedAt = Date.parse(String(share.last_success_at || share.checked_at || ""));
   const age = Date.now() - checkedAt;
-  return Number.isFinite(checkedAt) && age >= 0 && age <= 180 * 1000;
+  return Number.isFinite(checkedAt) && age >= 0 && age < 30 * 1000;
 }
 
 function lpDashboardShareSignedDelta(value) {
@@ -3119,32 +3122,43 @@ function lpDashboardShareSignedDelta(value) {
   return (number > 0 ? "+" : "") + String(value) + " 个百分点";
 }
 
-function lpDashboardShareMarkup(share, dashboardStale) {
+function lpDashboardShareMarkup(share) {
   if (!share || typeof share !== "object") return "<span class=\"sub\">奖励份额 UNKNOWN</span>";
-  const reference = predictionValue(share.reference_share_percentage, "UNKNOWN");
-  const actual = predictionHasValue(share.percentage) ? String(share.percentage) + "%" : "UNKNOWN";
-  const delta = lpDashboardShareSignedDelta(share.delta_percentage_points);
+  const actualValue = predictionHasValue(share.percentage) ? String(share.percentage) : "UNKNOWN";
+  const actual = actualValue === "UNKNOWN" ? actualValue : actualValue + "%";
   const checkedAt = predictionHasValue(share.last_success_at || share.checked_at)
     ? predictionHktTimestamp(share.last_success_at || share.checked_at)
     : "UNKNOWN";
-  const current = lpDashboardShareIsCurrent(share, dashboardStale);
-  const details = "<span class=\"sub\">实际 " + escapeHtml(actual)
-    + " · 参考 " + escapeHtml(reference) + "% · 变化 " + escapeHtml(delta)
+  const current = lpDashboardShareIsCurrent(share);
+  if (!current) {
+    const historical = predictionHasValue(share.percentage)
+      ? " · 上次值 " + escapeHtml(actual)
+      : "";
+    return "<span class=\"sub\">奖励份额暂不可判断" + historical
+      + " · 上次成功 " + escapeHtml(checkedAt) + "</span>";
+  }
+  const value = Number(actualValue);
+  if (!Number.isFinite(value)) {
+    return "<span class=\"sub\">奖励份额暂不可判断 · 检查 "
+      + escapeHtml(checkedAt) + "</span>";
+  }
+  let status = "target";
+  if (value < 5) status = "space";
+  else if (value > 8) status = "excess";
+  const suppliedDelta = predictionHasValue(share.target_delta_percentage_points)
+    ? String(share.target_delta_percentage_points)
+    : status === "space"
+      ? String(5 - value)
+      : status === "excess" ? String(value - 8) : "0";
+  const label = status === "space"
+    ? "还有空间 " + suppliedDelta + " 个百分点"
+    : status === "excess"
+      ? "⚠ 份额超额 " + suppliedDelta + " 个百分点"
+      : "已达目标";
+  const tone = status === "excess" ? " class=\"pm-pill watch\"" : " class=\"pm-pill\"";
+  return "<span" + tone + ">" + escapeHtml(label) + "</span>"
+    + "<span class=\"sub\">实际 " + escapeHtml(actual)
     + " · 检查 " + escapeHtml(checkedAt) + "</span>";
-  if (current && share.severity === "critical") {
-    return "<span class=\"pm-pill pm-clock-danger\">奖励份额严重</span>" + details;
-  }
-  if (current && share.severity === "warning") {
-    return "<span class=\"pm-pill watch\">奖励份额警告</span>" + details;
-  }
-  if (current) {
-    return "<span class=\"sub\">奖励份额：</span>" + details;
-  }
-  if (share.historical === true && predictionHasValue(share.percentage)) {
-    return "<span class=\"sub\">奖励份额历史：" + escapeHtml(actual)
-      + " · 当前 UNKNOWN · 上次成功 " + escapeHtml(checkedAt) + "</span>";
-  }
-  return "<span class=\"sub\">奖励份额 UNKNOWN · 检查 " + escapeHtml(checkedAt) + "</span>";
 }
 
 function lpDashboardObservations(value) {
@@ -3403,8 +3417,87 @@ function lpDashboardTodayQuantityCell(row) {
     + " · 剩余 " + escapeHtml(remaining) + "</span></div>";
 }
 
+function lpDashboardShareWatchStates(dashboard, observations) {
+  const result = {};
+  const saved = dashboard && dashboard.lp_share_watch_state
+    && typeof dashboard.lp_share_watch_state === "object"
+    && !Array.isArray(dashboard.lp_share_watch_state)
+    ? dashboard.lp_share_watch_state
+    : {};
+  Object.entries(saved).forEach(([conditionId, alert]) => {
+    if (alert && typeof alert === "object" && !Array.isArray(alert)) {
+      result[String(conditionId)] = {...alert};
+    }
+  });
+  Object.entries(observations || {}).forEach(([conditionId, observation]) => {
+    if (result[conditionId] || !observation || typeof observation !== "object") return;
+    const alert = observation.share_alert;
+    if (alert && typeof alert === "object" && !Array.isArray(alert)) {
+      result[String(conditionId)] = {...alert};
+    }
+  });
+  return result;
+}
+
+function lpDashboardTodayHasActiveOrder(row) {
+  if (!row || typeof row !== "object" || lpDashboardTodayFilled(row)) return false;
+  const status = String(row.status || "").toUpperCase();
+  if (["CANCELLED", "CANCELED", "REJECTED", "EXPIRED", "DONE", "CLOSED"].includes(status)) return false;
+  let remaining = Number(row.remaining_quantity);
+  if (!Number.isFinite(remaining)) {
+    const quantity = Number(row.quantity);
+    const filled = Number(row.filled_quantity);
+    remaining = Number.isFinite(quantity) && Number.isFinite(filled) ? quantity - filled : NaN;
+  }
+  return Number.isFinite(remaining) && remaining > 0;
+}
+
+function lpDashboardTodayActiveConditions(rows) {
+  const active = {};
+  rows.forEach((row) => {
+    const conditionId = String(row.condition_id || "").trim();
+    if (conditionId && lpDashboardTodayHasActiveOrder(row)) active[conditionId] = true;
+  });
+  return active;
+}
+
+function lpDashboardShareWatchControl(conditionId, alert, hasActiveOrder) {
+  const id = String(conditionId || "").trim();
+  if (!id) return "";
+  const saved = alert && typeof alert === "object" ? alert : {};
+  const pendingMap = state.predictionMarket.lpShareWatchPending;
+  const pending = pendingMap && pendingMap[id] && typeof pendingMap[id] === "object"
+    ? pendingMap[id]
+    : null;
+  const saving = pending && pending.inFlight === true;
+  const enabled = pending ? pending.enabled === true : saved.enabled === true;
+  const paused = saved.paused === true;
+  const controlId = "lp-share-watch-" + id.replace(/[^A-Za-z0-9_-]/g, "-");
+  const status = saving
+    ? "保存中"
+    : pending && pending.error
+      ? "保存失败"
+    : saved.enabled === true && paused
+      ? "已暂停"
+      : saved.enabled === true ? "已选择" : "未选择";
+  const error = pending && pending.error ? String(pending.error) : "";
+  const activity = hasActiveOrder ? "当前有未完成挂单" : "当前无未完成挂单";
+  return "<div class=\"pm-lp-share-watch\" data-lp-share-watch-active=\""
+    + (hasActiveOrder ? "true" : "false") + "\"><label for=\""
+    + escapeHtml(controlId) + "\"><input type=\"checkbox\" id=\""
+    + escapeHtml(controlId) + "\" data-lp-share-watch=\"true\" data-condition-id=\""
+    + escapeHtml(id) + "\""
+    + (enabled ? " checked" : "")
+    + (saving ? " disabled aria-busy=\"true\"" : "")
+    + "><span>份额预警</span></label><span class=\"sub\">目标 5%–8% · "
+    + escapeHtml(status) + " · " + escapeHtml(activity) + "</span>"
+    + (error ? "<span class=\"sub pm-signal-error\" role=\"status\">"
+      + escapeHtml(error) + "</span>" : "") + "</div>";
+}
+
 function lpDashboardTodayOrderRow(
-  row, rewards, rewardShares, shownRewards, observations, shownObservations, session, dashboardStale,
+  row, rewards, rewardShares, shownRewards, observations, shownObservations,
+  shownShareWatches, shareWatchStates, activeConditions, session, dashboardStale,
 ) {
   const identity = String(row.condition_id || "");
   const observation = identity && observations[identity] && typeof observations[identity] === "object"
@@ -3418,8 +3511,16 @@ function lpDashboardTodayOrderRow(
   const shareMarkup = identity
     ? shareRepeated
       ? "<span class=\"sub\">奖励份额见同市场上一行</span>"
-      : lpDashboardShareMarkup(share || {}, dashboardStale)
+      : lpDashboardShareMarkup(share || {})
     : "";
+  const shareWatchMarkup = identity && !shownShareWatches.has(identity)
+    ? lpDashboardShareWatchControl(
+      identity,
+      shareWatchStates[identity],
+      activeConditions[identity] === true,
+    )
+    : "";
+  if (identity) shownShareWatches.add(identity);
   const riskMarkup = lpDashboardExposureRiskCell(row, session, observation, shownObservations.risk);
   const detailsMarkup = observation && !detailsShown
     ? lpDashboardObservationDetail(
@@ -3441,7 +3542,7 @@ function lpDashboardTodayOrderRow(
   return "<tr " + rowAttribute + ">"
     + "<td>" + lpMarketTitleLink(row) + "<span class=\"sub\">" + escapeHtml(subtitle) + "</span>" + detailsMarkup + "</td>"
     + "<td data-label=\"委托与成交量\">" + lpDashboardTodayQuantityCell(row) + "</td>"
-    + "<td data-label=\"LP 收益率（预计）\">" + rewardMarkup + shareMarkup + "</td>"
+    + "<td data-label=\"LP 收益率（预计）\">" + rewardMarkup + shareMarkup + shareWatchMarkup + "</td>"
     + "<td data-label=\"压力损失（警戒线 10%）\">" + riskMarkup + "</td></tr>";
 }
 
@@ -3676,6 +3777,9 @@ function predictionLpCard(payload) {
   const rewardShares = lpDashboardRewards(dashboard.reward_shares);
   const observations = lpDashboardObservations(dashboard.lp_observations);
   const shownRewards = new Set();
+  const shownShareWatches = new Set();
+  const shareWatchStates = lpDashboardShareWatchStates(dashboard, observations);
+  const activeConditions = lpDashboardTodayActiveConditions(lpOrdersToday);
   const shownObservations = {reward: new Set(), risk: new Set(), details: new Set()};
   const session = dashboard.lp_session;
   const activeSession = session && typeof session === "object"
@@ -3698,9 +3802,25 @@ function predictionLpCard(payload) {
       + " · 每 5 秒刷新</span>";
   const todayRowsHtml = lpOrdersToday.length
     ? lpOrdersToday.map((row) => lpDashboardTodayOrderRow(
-      row, rewards, rewardShares, shownRewards, observations, shownObservations, session, stale,
+      row, rewards, rewardShares, shownRewards, observations, shownObservations,
+      shownShareWatches, shareWatchStates, activeConditions, session, stale,
     )).join("")
     : "<tr><td colspan=\"4\" class=\"pm-observation-empty\">当天暂无 LP 委托。</td></tr>";
+  const todayConditions = new Set(
+    lpOrdersToday
+      .map((row) => String(row.condition_id || "").trim())
+      .filter(Boolean),
+  );
+  const savedShareWatches = Object.entries(shareWatchStates)
+    .filter(([conditionId, alert]) => alert && alert.enabled === true && !todayConditions.has(conditionId))
+    .map(([conditionId, alert]) => "<div class=\"pm-lp-share-watch-saved\"><strong>"
+      + escapeHtml(alert.market_title || conditionId) + "</strong>"
+      + lpDashboardShareWatchControl(conditionId, alert, false) + "</div>")
+    .join("");
+  const savedShareWatchesMarkup = savedShareWatches
+    ? "<div class=\"pm-lp-share-watch-saved-list\" aria-label=\"已保存的份额预警\"><p class=\"sub\">已保存但当前无今日委托的市场</p>"
+      + savedShareWatches + "</div>"
+    : "";
   const nonLpRowCount = Number(dashboard.non_lp_row_count);
   const nonLpFootnote = Number.isFinite(nonLpRowCount) && nonLpRowCount > 0
     ? "<p class=\"sub\">账户另有 " + escapeHtml(String(nonLpRowCount))
@@ -3781,6 +3901,7 @@ function predictionLpCard(payload) {
     + "<section aria-label=\"当天 LP 委托\"><h3>当天 LP 委托 <span class=\"sub\">· 北京时间 08:00 起</span></h3><div class=\"pm-table-wrap\"><table class=\"pm-table pm-lp-order-table\">"
     + "<thead><tr><th scope=\"col\">标的</th><th scope=\"col\">委托与成交量</th><th scope=\"col\">LP 收益率（预计）</th><th scope=\"col\">压力损失（警戒线 10%）</th></tr></thead>"
     + "<tbody>" + todayRowsHtml + "</tbody></table></div>"
+    + savedShareWatchesMarkup
     + nonLpFootnote
     + "<p class=\"sub\">预计 LP 毛奖励；压力损失不含奖励抵扣；10% 是风险警告线。</p></section>"
     + funnelMarkup
@@ -5073,6 +5194,7 @@ function predictionRequestUrl(path) {
 async function fetchPredictionLpDashboard() {
   if (state.workspaceView !== "prediction_market" || state.predictionMarket.activeTab !== "lp"
     || state.predictionMarket.lpDashboardRequestInFlight) return;
+  const requestRevision = state.predictionMarket.lpShareWatchRevision || 0;
   state.predictionMarket.lpDashboardRequestInFlight = true;
   try {
     const response = await fetch(predictionRequestUrl("/api/prediction-arbitrage/lp/dashboard"), {
@@ -5081,6 +5203,23 @@ async function fetchPredictionLpDashboard() {
     });
     if (!response.ok) throw new Error("LP dashboard " + response.status);
     const dashboard = await response.json();
+    const confirmed = state.predictionMarket.lpShareWatchConfirmed || {};
+    const incomingWatchState = dashboard && dashboard.lp_share_watch_state
+      && typeof dashboard.lp_share_watch_state === "object"
+      && !Array.isArray(dashboard.lp_share_watch_state)
+      ? dashboard.lp_share_watch_state
+      : {};
+    if (requestRevision !== (state.predictionMarket.lpShareWatchRevision || 0)) {
+      dashboard.lp_share_watch_state = {...incomingWatchState};
+      Object.entries(confirmed).forEach(([conditionId, alert]) => {
+        if (alert && typeof alert === "object") {
+          dashboard.lp_share_watch_state[conditionId] = {
+            ...(dashboard.lp_share_watch_state[conditionId] || {}),
+            ...alert,
+          };
+        }
+      });
+    }
     state.predictionMarket.lpDashboard = {...dashboard};
     state.predictionMarket.lpDashboardError = "";
   } catch (error) {
@@ -5738,7 +5877,59 @@ async function mutateRelation(action, relationVersionId) {
   catch (error) { state.predictionMarket.error = error instanceof Error ? error.message : String(error); renderPredictionMarket(); }
 }
 
+async function savePredictionLpShareWatch(control) {
+  const conditionId = String(control?.dataset?.conditionId || "").trim();
+  if (!conditionId) return;
+  const dashboard = state.predictionMarket.lpDashboard || {};
+  const states = lpDashboardShareWatchStates(
+    dashboard,
+    lpDashboardObservations(dashboard.lp_observations),
+  );
+  const previous = states[conditionId] && typeof states[conditionId] === "object"
+    ? {...states[conditionId]}
+    : {};
+  const enabled = control.checked === true;
+  state.predictionMarket.lpShareWatchPending[conditionId] = {enabled, inFlight: true};
+  renderPredictionMarket();
+  try {
+    const result = await predictionPost(
+      "/api/prediction-arbitrage/lp/share-watch",
+      {condition_id: conditionId, enabled},
+    );
+    const resultAlert = result && typeof result.share_alert === "object"
+      ? result.share_alert
+      : {};
+    const confirmed = {
+      ...previous,
+      ...resultAlert,
+      enabled: result.enabled === true,
+    };
+    const currentDashboard = state.predictionMarket.lpDashboard || {};
+    const currentStates = lpDashboardShareWatchStates(
+      currentDashboard,
+      lpDashboardObservations(currentDashboard.lp_observations),
+    );
+    state.predictionMarket.lpDashboard = {
+      ...currentDashboard,
+      lp_share_watch_state: {...currentStates, [conditionId]: confirmed},
+    };
+    state.predictionMarket.lpShareWatchConfirmed[conditionId] = confirmed;
+    state.predictionMarket.lpShareWatchRevision += 1;
+    delete state.predictionMarket.lpShareWatchPending[conditionId];
+  } catch (error) {
+    state.predictionMarket.lpShareWatchPending[conditionId] = {
+      enabled: previous.enabled === true,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+  renderPredictionMarket();
+}
+
 function handlePredictionMarketChange(event) {
+  const shareWatch = event.target.closest?.("[data-lp-share-watch]");
+  if (shareWatch) {
+    return savePredictionLpShareWatch(shareWatch);
+  }
   const directionSelect = event.target.closest?.("[data-lp-direction]");
   if (directionSelect) {
     const conditionId = String(directionSelect.dataset.conditionId || "");

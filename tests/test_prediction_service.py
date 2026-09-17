@@ -25,14 +25,18 @@ from urllib.request import Request, urlopen
 import pytest
 
 import open_trader
+import open_trader.prediction_arbitrage_execution as prediction_execution_module
 import open_trader.prediction_service as prediction_service
 import open_trader.polymarket_trading as polymarket_trading_module
 from open_trader.llm_providers import PROVIDER_IDS, resolve_provider
 from open_trader.notifications import (
     CompositeNotifier,
     FeishuWebhookNotifier,
+    NotificationError,
     NullNotifier,
+    XiaoaiVoiceSuppressed,
     XiaoaiSSHNotifier,
+    xiaoai_voice_allowed,
 )
 from open_trader.polymarket_lp import PolymarketLPService
 from open_trader.polymarket_trading import PredictConfig, PolymarketTradingClient, TradingConfig
@@ -3181,28 +3185,35 @@ def test_state_refreshes_signal_metrics_on_demand_but_lp_dashboard_does_not(
     )
 
 
-def test_lp_dashboard_reward_share_thresholds_are_market_scoped(
-    tmp_path: Path,
+def test_lp_dashboard_reward_share_target_status_is_market_scoped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    source_base = datetime.now(UTC)
+    controlled_now = [source_base]
+
     sequence = [
+        Decimal("4.8"),
         Decimal("5"),
-        Decimal("7.499"),
-        Decimal("7.5"),
-        Decimal("9.999"),
-        Decimal("10"),
-        Decimal("10"),
-        Decimal("7"),
-        Decimal("7.5"),
+        Decimal("5.956665"),
+        Decimal("8"),
+        Decimal("8.000001"),
+        Decimal("8.5"),
+        Decimal("8.5"),
+        Decimal("8.5"),
+        Decimal("8.5"),
     ]
 
     class Account:
         wallet_address = "wallet"
 
         def __init__(self) -> None:
+            self.config = SimpleNamespace(wallet_address=self.wallet_address)
             self.share_reads = 0
             self.order_writes = 0
             self.cancellations = 0
             self.percentages = sequence[0]
+            self.share_result: dict[str, object] | None = None
+            self.share_failure = False
 
         def lp_account_snapshot(self) -> dict[str, object]:
             return {
@@ -3261,6 +3272,17 @@ def test_lp_dashboard_reward_share_thresholds_are_market_scoped(
             return order_id == "a-1"
 
         def lp_reward_percentages(self) -> dict[str, object]:
+            if self.share_failure:
+                raise RuntimeError("reward share read unavailable")
+            if self.share_result is not None:
+                self.share_reads += 1
+                result = dict(self.share_result)
+                age_seconds = result.pop("_age_seconds", None)
+                if isinstance(age_seconds, (int, float)):
+                    result["checked_at"] = controlled_now[0] - timedelta(
+                        seconds=age_seconds
+                    )
+                return result
             value = sequence[min(self.share_reads, len(sequence) - 1)]
             self.share_reads += 1
             self.percentages = value
@@ -3273,7 +3295,8 @@ def test_lp_dashboard_reward_share_thresholds_are_market_scoped(
                     "condition-b": Decimal("5"),
                     "condition-managed": Decimal("5"),
                 },
-                "checked_at": datetime.now(UTC) - timedelta(microseconds=self.share_reads),
+                "checked_at": controlled_now[0]
+                - timedelta(microseconds=self.share_reads),
             }
 
         def create_limit_order(self, **_kwargs: object) -> object:
@@ -3289,10 +3312,13 @@ def test_lp_dashboard_reward_share_thresholds_are_market_scoped(
             return object()
 
     service, _trading, store, monitor = execution_fixture(tmp_path)
+    monkeypatch.setattr(
+        prediction_execution_module, "_utc_now", lambda: controlled_now[0]
+    )
     account = Account()
     service._trading = account
-    checked_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-    guide_checked_at = datetime.now(UTC)
+    checked_at = controlled_now[0].isoformat().replace("+00:00", "Z")
+    guide_checked_at = controlled_now[0]
     guide_expires_at = guide_checked_at + timedelta(hours=1)
     valid_recommendation = {
         "condition_id": "condition-rec",
@@ -3375,7 +3401,14 @@ def test_lp_dashboard_reward_share_thresholds_are_market_scoped(
         },
     )
     service._lp = PolymarketLPService(
-        store, object(), clock=lambda: datetime.now(UTC)
+        store, object(), clock=lambda: controlled_now[0]
+    )
+    account_id = service._lp_account_id()
+    assert account_id is not None
+    store.update_lp_observation(
+        account_id,
+        "condition-a",
+        {"share_alert": {"enabled": True, "market_title": "Market A"}},
     )
     clock = [0.0]
     service._clock = lambda: clock[0]
@@ -3385,25 +3418,35 @@ def test_lp_dashboard_reward_share_thresholds_are_market_scoped(
     runtime.execution = service
 
     expected = [
-        ("5", "normal", None),
-        ("7.499", "normal", "2.499"),
-        ("7.5", "warning", "0.001"),
-        ("9.999", "warning", "2.499"),
-        ("10", "critical", "0.001"),
-        ("10", "critical", "0"),
-        ("10", "critical", "0"),
-        ("7", "normal", "-3"),
-        ("7.5", "warning", "0.5"),
+        ("4.8", "space", "0.2", "normal", None),
+        ("5", "target", "0", "normal", "0.2"),
+        ("5.956665", "target", "0", "normal", "0.956665"),
+        ("8", "target", "0", "normal", "2.043335"),
+        ("8.000001", "excess", "0.000001", "warning", "0.000001"),
+        ("8.5", "excess", "0.5", "warning", "0.499999"),
+        ("8.5", "excess", "0.5", "warning", "0.499999"),
+        ("8.5", "excess", "0.5", "warning", "0.0"),
+        ("8.5", "excess", "0.5", "warning", "0.0"),
     ]
     previous_checked_at: str | None = None
     previous_delta: str | None = None
     with _server(runtime) as base:
-        for index, (expected_value, expected_severity, expected_delta) in enumerate(expected):
+        for index, (
+            expected_value,
+            expected_target,
+            expected_target_delta,
+            expected_severity,
+            expected_delta,
+        ) in enumerate(expected):
             clock[0] += 5 if index in {0, 6} else 61
+            controlled_now[0] = source_base + timedelta(seconds=clock[0])
             status, payload = _response(base + "/api/prediction-arbitrage/lp/dashboard")
             assert status == 200
+            assert "condition-a" in payload["reward_shares"], payload
             share = payload["reward_shares"]["condition-a"]
             assert share["percentage"] == expected_value
+            assert share["target_status"] == expected_target
+            assert share["target_delta_percentage_points"] == expected_target_delta
             assert share["severity"] == expected_severity
             assert share["state"] == "known"
             assert share["delta_percentage_points"] == expected_delta
@@ -3418,29 +3461,698 @@ def test_lp_dashboard_reward_share_thresholds_are_market_scoped(
                 assert share["checked_at"] == previous_checked_at
                 assert share["delta_percentage_points"] == previous_delta
                 assert account.share_reads == 6
+            if index == 0:
+                recommendation = next(
+                    row
+                    for row in payload["recommendations"]
+                    if row["condition_id"] == "condition-rec"
+                )
+                assert recommendation["reference_share_percentage"] == "5"
+                assert recommendation["reference_daily_reward_usd"] == "4.95"
+                no_pool = next(
+                    row
+                    for row in payload["selected_results"]
+                    if row["condition_id"] == "condition-no-pool"
+                )
+                assert no_pool["reference_share_percentage"] == "5"
+                assert no_pool["reference_daily_reward_usd"] is None
+
+        boundary_service = PredictionExecutionService(
+            store=store,
+            monitor=monitor,
+            trading=account,
+            notifier=NullNotifier(),
+            lock_path=tmp_path / "share-boundary.lock",
+        )
+        boundary_service._lp = PolymarketLPService(
+            store, object(), clock=lambda: datetime.now(UTC)
+        )
+        boundary_service._clock = lambda: clock[0]
+        runtime.execution = boundary_service
+
+        def read_share() -> dict[str, object]:
+            status, dashboard = _response(base + "/api/prediction-arbitrage/lp/dashboard")
+            assert status == 200
+            return dashboard["reward_shares"]["condition-a"]
+
+        last_known = read_share()
+        assert last_known["state"] == "known"
+
+        account.share_result = {
+            "state": "known",
+            "scope": "account",
+            "maker_address": "another-wallet",
+            "percentages": {"condition-a": Decimal("6")},
+            "checked_at": controlled_now[0],
+        }
+        clock[0] += 61
+        wrong_maker = read_share()
+        assert wrong_maker["state"] == "unknown"
+        assert wrong_maker["target_status"] == "unknown"
+        assert wrong_maker["percentage"] == last_known["percentage"]
+
+        account.share_result = {
+            "state": "known",
+            "scope": "account",
+            "maker_address": "wallet",
+            "percentages": {"condition-a": Decimal("-0.1")},
+            "checked_at": controlled_now[0],
+        }
+        clock[0] += 61
+        invalid_percentage = read_share()
+        assert invalid_percentage["state"] == "unknown"
+        assert invalid_percentage["target_status"] == "unknown"
+
+        account.share_result = {
+            "state": "known",
+            "scope": "account",
+            "maker_address": "wallet",
+            "percentages": {"condition-a": Decimal("6")},
+            "checked_at": controlled_now[0] + timedelta(seconds=1),
+        }
+        clock[0] += 61
+        future = read_share()
+        assert future["state"] == "unknown"
+        assert future["target_status"] == "unknown"
+
+        fresh_service = PredictionExecutionService(
+            store=store,
+            monitor=monitor,
+            trading=account,
+            notifier=NullNotifier(),
+            lock_path=tmp_path / "share-fresh-boundary.lock",
+        )
+        fresh_service._lp = PolymarketLPService(
+            store, object(), clock=lambda: controlled_now[0]
+        )
+        fresh_service._clock = lambda: clock[0]
+        runtime.execution = fresh_service
+
+        account.share_result = {
+            "state": "known",
+            "scope": "account",
+            "maker_address": "wallet",
+            "percentages": {"condition-a": Decimal("6")},
+            "_age_seconds": 29.999,
+        }
+        clock[0] += 61
+        fresh_boundary = read_share()
+        assert fresh_boundary["state"] == "known", fresh_boundary
+        assert fresh_boundary["target_status"] == "target"
+
+        exact_service = PredictionExecutionService(
+            store=store,
+            monitor=monitor,
+            trading=account,
+            notifier=NullNotifier(),
+            lock_path=tmp_path / "share-exact-boundary.lock",
+        )
+        exact_service._lp = PolymarketLPService(
+            store, object(), clock=lambda: controlled_now[0]
+        )
+        exact_service._clock = lambda: clock[0]
+        runtime.execution = exact_service
+
+        account.share_result = {
+            "state": "known",
+            "scope": "account",
+            "maker_address": "wallet",
+            "percentages": {"condition-a": Decimal("6")},
+            "_age_seconds": 30.0,
+        }
+        clock[0] += 61
+        stale_boundary = read_share()
+        assert stale_boundary["state"] == "unknown"
+        assert stale_boundary["target_status"] == "unknown"
+
+        account.share_result = {
+            "state": "known",
+            "scope": "account",
+            "maker_address": "wallet",
+            "percentages": {"condition-b": Decimal("6")},
+            "checked_at": controlled_now[0],
+        }
+        clock[0] += 61
+        missing_condition = read_share()
+        assert missing_condition["state"] == "unknown"
+        assert missing_condition["target_status"] == "unknown"
+
+        account.share_result = None
+        account.share_failure = True
+        clock[0] += 61
+        failed_read = read_share()
+        assert failed_read["state"] == "unknown"
+        assert failed_read["target_status"] == "unknown"
 
     assert len(payload["reward_shares"]) == 3
     assert payload["reward_shares"]["condition-managed"]["percentage"] == "5"
+    assert payload["reward_shares"]["condition-b"]["target_status"] == "target"
+    assert payload["lp_observations"]["condition-a"]["share_alert"]["enabled"] is True
+    assert "condition-b" not in payload["lp_observations"] or (
+        payload["lp_observations"]["condition-b"].get("share_alert", {}).get("enabled") is not True
+    )
     assert next(
         row for row in payload["orders"] if row["condition_id"] == "condition-managed"
     )["management"] == "system_managed"
     assert payload["orders"][0]["remaining_quantity"] == "15"
     assert payload["orders"][1]["remaining_quantity"] == "10"
     assert payload["orders"][2]["remaining_quantity"] == "3"
-    recommendation = next(
-        row for row in payload["recommendations"] if row["condition_id"] == "condition-rec"
-    )
-    assert recommendation["reference_share_percentage"] == "5"
-    assert recommendation["reference_daily_reward_usd"] == "4.95"
-    no_pool = next(
-        row
-        for row in payload["selected_results"]
-        if row["condition_id"] == "condition-no-pool"
-    )
-    assert no_pool["reference_share_percentage"] == "5"
-    assert no_pool["reference_daily_reward_usd"] is None
+    assert payload["recommendations"] == []
     assert account.order_writes == 0
     assert account.cancellations == 0
+
+
+def test_lp_share_watch_alerts_only_on_confirmed_breach(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = datetime(2026, 9, 17, 12, 0, tzinfo=UTC)
+    controlled_now = [base]
+    elapsed_seconds = [0.0]
+
+    class Account:
+        wallet_address = "wallet-a"
+
+        def __init__(self, *, include_second_market: bool = True) -> None:
+            self.config = SimpleNamespace(wallet_address=self.wallet_address)
+            self.open_orders: list[dict[str, object]] = [
+                {
+                    "order_id": "a-1",
+                    "condition_id": "condition-a",
+                    "market_title": "Market A",
+                    "token_id": "a-yes",
+                    "side": "BUY",
+                    "status": "LIVE",
+                    "price": Decimal("0.40"),
+                    "original_size": Decimal("20"),
+                    "size_matched": Decimal("5"),
+                },
+                {
+                    "order_id": "a-2",
+                    "condition_id": "condition-a",
+                    "market_title": "Market A",
+                    "token_id": "a-no",
+                    "side": "BUY",
+                    "status": "LIVE",
+                    "price": Decimal("0.45"),
+                    "original_size": Decimal("10"),
+                    "size_matched": Decimal("0"),
+                },
+            ]
+            if include_second_market:
+                self.open_orders.append(
+                    {
+                        "order_id": "b-1",
+                        "condition_id": "condition-b",
+                        "market_title": "Market B",
+                        "token_id": "b-yes",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "price": Decimal("0.50"),
+                        "original_size": Decimal("12"),
+                        "size_matched": Decimal("2"),
+                    }
+                )
+            self.reward_value = Decimal("8.5")
+            self.reward_checked_at: datetime | None = None
+            self.reward_failure = False
+            self.reward_maker = self.wallet_address
+            self.reward_source_override: datetime | None = None
+            self.reward_reads = 0
+            self.order_reads = 0
+            self.stop_event_on_share_read: threading.Event | None = None
+
+        def lp_open_orders_snapshot(self) -> dict[str, object]:
+            self.order_reads += 1
+            controlled_now[0] += timedelta(milliseconds=1)
+            return {
+                "authenticated": True,
+                "open_orders": tuple(self.open_orders),
+                "open_orders_complete": True,
+                "checked_at": controlled_now[0],
+            }
+
+        def lp_reward_percentages(self) -> dict[str, object]:
+            self.reward_reads += 1
+            if self.reward_failure:
+                raise RuntimeError("reward share read unavailable")
+            stop_event = self.stop_event_on_share_read
+            self.stop_event_on_share_read = None
+            checked_at = (
+                self.reward_source_override
+                or self.reward_checked_at
+                or controlled_now[0]
+            )
+            if stop_event is not None:
+                stop_event.set()
+            return {
+                "state": "known",
+                "scope": "account",
+                "maker_address": self.reward_maker,
+                "percentages": {
+                    "condition-a": self.reward_value,
+                    "condition-b": self.reward_value,
+                },
+                "checked_at": checked_at,
+            }
+
+    class RecordingXiaoai(XiaoaiSSHNotifier):
+        def __init__(
+            self,
+            *,
+            fail: bool = False,
+            suppress: bool = False,
+            respect_quiet_hours: bool = False,
+            advance_after_success_seconds: float = 0.0,
+        ) -> None:
+            self.calls: list[tuple[str, str]] = []
+            self.successes: list[tuple[str, str]] = []
+            self.fail = fail
+            self.suppress = suppress
+            self.respect_quiet_hours = respect_quiet_hours
+            self.advance_after_success_seconds = advance_after_success_seconds
+
+        def notify(self, title: str, message: str) -> None:
+            self.calls.append((title, message))
+            if self.suppress or (
+                self.respect_quiet_hours
+                and not xiaoai_voice_allowed(controlled_now[0])
+            ):
+                raise XiaoaiVoiceSuppressed("quiet hours")
+            if self.fail:
+                raise NotificationError("delivery failed")
+            if self.advance_after_success_seconds:
+                controlled_now[0] += timedelta(
+                    seconds=self.advance_after_success_seconds
+                )
+                self.advance_after_success_seconds = 0.0
+            self.successes.append((title, message))
+
+    def make_service(
+        root: Path, account: Account, notifier: RecordingXiaoai
+    ) -> PredictionExecutionService:
+        service, _trading, _store, _monitor = execution_fixture(root)
+        service._trading = account
+        service._notifier = notifier
+        service._clock = lambda: elapsed_seconds[0]
+        return service
+
+    def set_time(seconds: float) -> None:
+        elapsed_seconds[0] = seconds
+        controlled_now[0] = base + timedelta(seconds=seconds)
+
+    def set_absolute_time(moment: datetime) -> None:
+        elapsed_seconds[0] = (moment - base).total_seconds()
+        controlled_now[0] = moment
+
+    def refresh(
+        service: PredictionExecutionService,
+        account: Account,
+        seconds: float,
+        value: Decimal = Decimal("8.5"),
+        *,
+        checked_at: datetime | None = None,
+        failure: bool = False,
+        maker: str | None = None,
+        stop_event: threading.Event | None = None,
+    ) -> dict[str, object]:
+        set_time(seconds)
+        account.reward_value = value
+        account.reward_checked_at = checked_at
+        account.reward_failure = failure
+        account.reward_maker = maker or account.wallet_address
+        return service.refresh_lp_share_watch(stop_event=stop_event)
+
+    def refresh_at(
+        service: PredictionExecutionService,
+        account: Account,
+        moment: datetime,
+        value: Decimal = Decimal("8.5"),
+        *,
+        checked_at: datetime | None = None,
+        failure: bool = False,
+        maker: str | None = None,
+        stop_event: threading.Event | None = None,
+    ) -> dict[str, object]:
+        set_absolute_time(moment)
+        account.reward_value = value
+        account.reward_checked_at = checked_at
+        account.reward_failure = failure
+        account.reward_maker = maker or account.wallet_address
+        return service.refresh_lp_share_watch(stop_event=stop_event)
+
+    account = Account()
+    notifier = RecordingXiaoai()
+    service = make_service(tmp_path, account, notifier)
+    recovery_account = Account(include_second_market=False)
+    recovery_notifier = RecordingXiaoai()
+    recovery_service = make_service(
+        tmp_path / "recovery", recovery_account, recovery_notifier
+    )
+    gap_account = Account(include_second_market=False)
+    gap_notifier = RecordingXiaoai()
+    gap_service = make_service(tmp_path / "gap", gap_account, gap_notifier)
+    spent_account = Account(include_second_market=False)
+    spent_notifier = RecordingXiaoai()
+    spent_service = make_service(tmp_path / "spent", spent_account, spent_notifier)
+    pending_account = Account(include_second_market=False)
+    pending_notifier = RecordingXiaoai(fail=True)
+    pending_service = make_service(
+        tmp_path / "pending", pending_account, pending_notifier
+    )
+    recovered_account = Account(include_second_market=False)
+    recovered_notifier = RecordingXiaoai(suppress=True)
+    recovered_service = make_service(
+        tmp_path / "recovered", recovered_account, recovered_notifier
+    )
+    cached_account = Account(include_second_market=False)
+    cached_notifier = RecordingXiaoai()
+    cached_service = make_service(
+        tmp_path / "cached", cached_account, cached_notifier
+    )
+    restart_account = Account(include_second_market=False)
+    restart_notifier = RecordingXiaoai()
+    restart_service = make_service(
+        tmp_path / "restart", restart_account, restart_notifier
+    )
+    pending_restart_account = Account(include_second_market=False)
+    pending_restart_notifier = RecordingXiaoai(fail=True)
+    pending_restart_service = make_service(
+        tmp_path / "pending-restart",
+        pending_restart_account,
+        pending_restart_notifier,
+    )
+    cancelled_account = Account(include_second_market=False)
+    cancelled_notifier = RecordingXiaoai()
+    cancelled_service = make_service(
+        tmp_path / "cancelled", cancelled_account, cancelled_notifier
+    )
+    queued_account = Account()
+    queued_notifier = RecordingXiaoai()
+    queued_service = make_service(
+        tmp_path / "queued", queued_account, queued_notifier
+    )
+    delayed_account = Account(include_second_market=False)
+    delayed_notifier = RecordingXiaoai()
+    delayed_service = make_service(
+        tmp_path / "delayed", delayed_account, delayed_notifier
+    )
+    quiet_account = Account(include_second_market=False)
+    quiet_notifier = RecordingXiaoai(respect_quiet_hours=True)
+    quiet_service = make_service(tmp_path / "quiet", quiet_account, quiet_notifier)
+    quiet_recovery_account = Account(include_second_market=False)
+    quiet_recovery_notifier = RecordingXiaoai(respect_quiet_hours=True)
+    quiet_recovery_service = make_service(
+        tmp_path / "quiet-recovery",
+        quiet_recovery_account,
+        quiet_recovery_notifier,
+    )
+    sent_quiet_account = Account(include_second_market=False)
+    sent_quiet_notifier = RecordingXiaoai(respect_quiet_hours=True)
+    sent_quiet_service = make_service(
+        tmp_path / "sent-quiet", sent_quiet_account, sent_quiet_notifier
+    )
+    monkeypatch.setattr(
+        prediction_execution_module, "_utc_now", lambda: controlled_now[0]
+    )
+
+    assert service.set_lp_share_watch("condition-a", enabled=True)["enabled"] is True
+    assert "condition-b" not in service.lp_share_watch_state()
+
+    # Independent fresh over-limit samples must span a complete minute before
+    # the first successful delivery.
+    for seconds in (0, 10, 20, 30, 40, 50, 59.999):
+        refresh(service, account, seconds)
+    assert notifier.calls == []
+    refresh(service, account, 60)
+    assert len(notifier.successes) == 1
+    assert notifier.successes[0][0] == "LP 份额预警"
+    assert "Market A" in notifier.successes[0][1]
+    assert "8.5" in notifier.successes[0][1]
+    assert "5%–8%" in notifier.successes[0][1]
+    assert "8%" in notifier.successes[0][1]
+    assert "condition-b" not in service.lp_share_watch_state() or (
+        service.lp_share_watch_state()["condition-b"].get("notification_pending") is not True
+    )
+
+    # A stop raised by the external percentage read cancels an otherwise
+    # eligible refresh before it can send.
+    assert cancelled_service.set_lp_share_watch("condition-a", enabled=True)[
+        "enabled"
+    ] is True
+    for seconds in (0, 10, 20, 30, 40, 50):
+        refresh(cancelled_service, cancelled_account, seconds)
+    cancel_event = threading.Event()
+    cancelled_account.stop_event_on_share_read = cancel_event
+    cancelled_result = refresh(
+        cancelled_service,
+        cancelled_account,
+        60,
+        stop_event=cancel_event,
+    )
+    assert cancelled_result["state"] == "cancelled"
+    assert cancel_event.is_set()
+    assert cancelled_notifier.calls == []
+    assert cancelled_notifier.successes == []
+
+    # With two eligible markets, a successful first voice that consumes more
+    # than the freshness window must prevent the queued second voice.  The
+    # second event is cleared so it can only restart from a fresh sample.
+    assert queued_service.set_lp_share_watch("condition-a", enabled=True)[
+        "enabled"
+    ] is True
+    assert queued_service.set_lp_share_watch("condition-b", enabled=True)[
+        "enabled"
+    ] is True
+    for seconds in (0, 10, 20, 30, 40, 50):
+        refresh(queued_service, queued_account, seconds)
+    queued_before_delivery = queued_service.lp_share_watch_state()
+    assert all(
+        queued_before_delivery[condition_id].get("breach_started_at") is not None
+        for condition_id in ("condition-a", "condition-b")
+    )
+    queued_notifier.advance_after_success_seconds = 31.0
+    refresh(queued_service, queued_account, 60)
+    assert len(queued_notifier.calls) == 1
+    assert len(queued_notifier.successes) == 1
+    queued_after_delivery = queued_service.lp_share_watch_state()
+    assert queued_after_delivery["condition-b"].get("notification_pending") is False
+    assert queued_after_delivery["condition-b"].get("breach_started_at") is None
+
+    # A continuously fresh breach does not repeat. Returning to 8% re-arms a
+    # later episode, which first succeeds at t=680.
+    for seconds in range(70, 601, 10):
+        refresh(service, account, seconds)
+    assert len(notifier.successes) == 1
+    refresh(service, account, 610, Decimal("8"))
+    for seconds in range(620, 681, 10):
+        refresh(service, account, seconds)
+    assert len(notifier.successes) == 2
+
+    # UNKNOWN after a successful event does not re-arm that spent episode.
+    refresh(service, account, 690, failure=True)
+    refresh(service, account, 700)
+    assert len(notifier.successes) == 2
+
+    # A complete fresh no-order snapshot pauses the selected market. A new
+    # order id resumes it, and manual OFF remains authoritative.
+    account.open_orders = []
+    refresh(service, account, 705)
+    assert service.lp_share_watch_state()["condition-a"].get("paused") is True
+    account.open_orders = [
+        {
+            "order_id": "a-new",
+            "condition_id": "condition-a",
+            "market_title": "Market A",
+            "token_id": "a-yes",
+            "side": "BUY",
+            "status": "LIVE",
+            "price": Decimal("0.40"),
+            "original_size": Decimal("20"),
+            "size_matched": Decimal("5"),
+        }
+    ]
+    refresh(service, account, 711, Decimal("6"))
+    refresh(service, account, 721)
+    assert service.lp_share_watch_state()["condition-a"].get("paused") is False
+    assert service.set_lp_share_watch("condition-a", enabled=False)["enabled"] is False
+    refresh(service, account, 800)
+    assert len(notifier.successes) == 2
+
+    # An unfinished breach is not carried through a service restart. Three
+    # fresh over-limit readings before restart leave only ten seconds of
+    # source continuity at t=730; t=790 is the first eligible delivery.
+    assert restart_service.set_lp_share_watch("condition-a", enabled=True)["enabled"] is True
+    for seconds in (700, 710, 720):
+        refresh(restart_service, restart_account, seconds)
+    restarted = PredictionExecutionService(
+        store=restart_service._store,
+        monitor=restart_service._monitor,
+        trading=restart_account,
+        notifier=restart_notifier,
+        lock_path=tmp_path / "restart-after-samples.lock",
+    )
+    restarted._clock = lambda: elapsed_seconds[0]
+    assert restarted.lp_share_watch_state()["condition-a"]["enabled"] is True
+    for seconds in (730, 740, 750, 760, 770, 780, 789.999):
+        refresh(restarted, restart_account, seconds)
+    assert restart_notifier.successes == []
+    refresh(restarted, restart_account, 790)
+    assert len(restart_notifier.successes) == 1
+
+    # A repeated source sample remains readable while fresh, but cannot be
+    # counted as the new observation that makes a minute eligible.
+    assert cached_service.set_lp_share_watch("condition-a", enabled=True)["enabled"] is True
+    for seconds in (0, 10, 20, 30, 40):
+        refresh(cached_service, cached_account, seconds)
+    cached_account.reward_source_override = base + timedelta(seconds=50)
+    refresh(cached_service, cached_account, 50)
+    refresh(cached_service, cached_account, 60)
+    assert cached_notifier.successes == []
+    cached_account.reward_source_override = None
+    refresh(cached_service, cached_account, 70)
+    assert len(cached_notifier.successes) == 1
+
+    # A source stamped at t=59 but received at wall t=60 has only 59 seconds
+    # of confirmed source continuity. The next fresh t=70 source is the first
+    # one that can complete the minute.
+    assert delayed_service.set_lp_share_watch("condition-a", enabled=True)["enabled"] is True
+    for seconds in (0, 10, 20, 30, 40, 50):
+        refresh(delayed_service, delayed_account, seconds)
+    delayed_account.reward_source_override = base + timedelta(seconds=59)
+    refresh(delayed_service, delayed_account, 60)
+    assert delayed_notifier.successes == []
+    delayed_account.reward_source_override = None
+    refresh(delayed_service, delayed_account, 70)
+    assert len(delayed_notifier.successes) == 1
+
+    # A recovery at t=30 starts a new continuous window at t=40; t=90 and
+    # t=99.999 are still too early, and t=100 is the first eligible delivery.
+    assert recovery_service.set_lp_share_watch("condition-a", enabled=True)["enabled"] is True
+    for seconds in (0, 10, 20):
+        refresh(recovery_service, recovery_account, seconds)
+    refresh(recovery_service, recovery_account, 30, Decimal("8"))
+    for seconds in (40, 50, 60, 70, 80, 90, 99.999):
+        refresh(recovery_service, recovery_account, seconds)
+    assert recovery_notifier.successes == []
+    refresh(recovery_service, recovery_account, 100)
+    assert len(recovery_notifier.successes) == 1, recovery_service.lp_share_watch_state()
+
+    # A failed delivery leaves an unsent event pending within one service,
+    # but a restarted service must establish a fresh minute instead of
+    # delivering immediately after a ten-second source gap.
+    assert pending_restart_service.set_lp_share_watch("condition-a", enabled=True)["enabled"] is True
+    for seconds in (0, 10, 20, 30, 40, 50, 60):
+        refresh(pending_restart_service, pending_restart_account, seconds)
+    assert pending_restart_notifier.calls
+    assert pending_restart_notifier.successes == []
+    pending_restart = PredictionExecutionService(
+        store=pending_restart_service._store,
+        monitor=pending_restart_service._monitor,
+        trading=pending_restart_account,
+        notifier=pending_restart_notifier,
+        lock_path=tmp_path / "pending-restart-after-failure.lock",
+    )
+    pending_restart._clock = lambda: elapsed_seconds[0]
+    pending_restart_notifier.fail = False
+    refresh(pending_restart, pending_restart_account, 70)
+    assert pending_restart_notifier.successes == []
+    for seconds in (80, 90, 100, 110, 120, 129.999):
+        refresh(pending_restart, pending_restart_account, seconds)
+    assert pending_restart_notifier.successes == []
+    refresh(pending_restart, pending_restart_account, 130)
+    assert len(pending_restart_notifier.successes) == 1
+
+    # An unseen gap after t=20 expires the old evidence; the fresh t=60
+    # sample starts a new window and t=120 is the first eligible delivery.
+    assert gap_service.set_lp_share_watch("condition-a", enabled=True)["enabled"] is True
+    for seconds in (0, 10, 20):
+        refresh(gap_service, gap_account, seconds)
+    refresh(gap_service, gap_account, 60)
+    for seconds in (70, 80, 90, 100, 110):
+        refresh(gap_service, gap_account, seconds)
+    assert gap_notifier.successes == []
+    refresh(gap_service, gap_account, 120)
+    assert len(gap_notifier.successes) == 1
+
+    # A restart and UNKNOWN result after a successful episode do not create a
+    # second delivery without a confirmed <=8% recovery.
+    assert spent_service.set_lp_share_watch("condition-a", enabled=True)["enabled"] is True
+    for seconds in (0, 10, 20, 30, 40, 50, 60):
+        refresh(spent_service, spent_account, seconds)
+    assert len(spent_notifier.successes) == 1
+    spent_restarted = PredictionExecutionService(
+        store=spent_service._store,
+        monitor=spent_service._monitor,
+        trading=spent_account,
+        notifier=spent_notifier,
+        lock_path=tmp_path / "spent-restarted.lock",
+    )
+    spent_restarted._clock = lambda: elapsed_seconds[0]
+    refresh(spent_restarted, spent_account, 70, failure=True)
+    for seconds in (80, 90, 100, 110, 120, 130):
+        refresh(spent_restarted, spent_account, seconds)
+    assert len(spent_notifier.successes) == 1
+
+    # Failed and suppressed attempts remain pending and retry through the
+    # public refresh seam while the same fresh breach continues. Recovery
+    # clears a pending event before delivery, so that old event is not replayed.
+    assert pending_service.set_lp_share_watch("condition-a", enabled=True)["enabled"] is True
+    for seconds in (0, 10, 20, 30, 40, 50, 60):
+        refresh(pending_service, pending_account, seconds)
+    assert len(pending_notifier.calls) == 1
+    assert pending_notifier.successes == []
+    pending_notifier.fail = False
+    refresh(pending_service, pending_account, 70)
+    assert len(pending_notifier.successes) == 1
+    refresh(pending_service, pending_account, 80)
+    assert len(pending_notifier.successes) == 1
+
+    assert recovered_service.set_lp_share_watch("condition-a", enabled=True)["enabled"] is True
+    for seconds in (0, 10, 20, 30, 40, 50, 60):
+        refresh(recovered_service, recovered_account, seconds)
+    assert len(recovered_notifier.calls) == 1
+    recovered_account.reward_value = Decimal("8")
+    recovered_notifier.suppress = False
+    refresh(recovered_service, recovered_account, 70, Decimal("8"))
+    for seconds in (80, 90, 100, 110, 120, 130, 140):
+        refresh(recovered_service, recovered_account, seconds)
+    assert len(recovered_notifier.successes) == 1
+
+    # A pending over-limit event at 07:59 is suppressed by the existing
+    # Xiaoai quiet-hour boundary. Fresh readings at 08:00 release that same
+    # event exactly once, with later readings remaining deduplicated.
+    assert quiet_service.set_lp_share_watch("condition-a", enabled=True)["enabled"] is True
+    for seconds in range(43080, 43191, 10):
+        refresh(quiet_service, quiet_account, seconds)
+    assert quiet_notifier.successes == []
+    assert quiet_notifier.calls
+    refresh(quiet_service, quiet_account, 43200)
+    assert len(quiet_notifier.successes) == 1
+    for seconds in (43210, 43220):
+        refresh(quiet_service, quiet_account, seconds)
+    assert len(quiet_notifier.successes) == 1
+
+    # Recovering at 07:59:30 clears the suppressed pending event before the
+    # quiet period ends, so 08:00 cannot replay it.
+    assert quiet_recovery_service.set_lp_share_watch("condition-a", enabled=True)["enabled"] is True
+    for seconds in range(43080, 43141, 10):
+        refresh(quiet_recovery_service, quiet_recovery_account, seconds)
+    refresh(quiet_recovery_service, quiet_recovery_account, 43170, Decimal("8"))
+    for seconds in (43180, 43190, 43200):
+        refresh(quiet_recovery_service, quiet_recovery_account, seconds, Decimal("8"))
+    assert quiet_recovery_notifier.successes == []
+
+    # A successful event before quiet hours remains spent across the overnight
+    # gap and the next 08:00 boundary, even though all later readings exceed
+    # the threshold.
+    assert sent_quiet_service.set_lp_share_watch("condition-a", enabled=True)["enabled"] is True
+    for seconds in range(10680, 10741, 10):
+        refresh(sent_quiet_service, sent_quiet_account, seconds)
+    assert len(sent_quiet_notifier.successes) == 1
+    refresh(sent_quiet_service, sent_quiet_account, 10800)
+    for seconds in range(43140, 43201, 10):
+        refresh(sent_quiet_service, sent_quiet_account, seconds)
+    assert len(sent_quiet_notifier.successes) == 1
 
 
 def test_lp_dashboard_share_failures_preserve_unknown_without_order_writes(
@@ -3633,7 +4345,8 @@ def test_lp_dashboard_share_failures_preserve_unknown_without_order_writes(
         first_share = first["reward_shares"]["condition-c"]
         assert first_share["state"] == "known"
         assert first_share["percentage"] == "8"
-        assert first_share["severity"] == "warning"
+        assert first_share["target_status"] == "target"
+        assert first_share["target_delta_percentage_points"] == "0"
         assert first_share["historical"] is False
         assert first_share["delta_percentage_points"] is None
         first_checked_at = first_share["checked_at"]
@@ -3642,7 +4355,8 @@ def test_lp_dashboard_share_failures_preserve_unknown_without_order_writes(
         repeated = read_dashboard(base)["reward_shares"]["condition-c"]
         assert repeated["state"] == "known"
         assert repeated["percentage"] == "8"
-        assert repeated["severity"] == "warning"
+        assert repeated["target_status"] == "target"
+        assert repeated["target_delta_percentage_points"] == "0"
         assert repeated["checked_at"] == first_checked_at
         assert repeated["delta_percentage_points"] is None
 
@@ -3719,7 +4433,8 @@ def test_lp_dashboard_share_failures_preserve_unknown_without_order_writes(
         recovered_warning = read_dashboard(base)["reward_shares"]["condition-c"]
         assert recovered_warning["state"] == "known"
         assert recovered_warning["percentage"] == "8"
-        assert recovered_warning["severity"] == "warning"
+        assert recovered_warning["target_status"] == "target"
+        assert recovered_warning["target_delta_percentage_points"] == "0"
         assert recovered_warning["historical"] is False
         assert recovered_warning["delta_percentage_points"] == "0"
         assert recovered_warning["checked_at"] != first_checked_at
@@ -3728,7 +4443,8 @@ def test_lp_dashboard_share_failures_preserve_unknown_without_order_writes(
         recovered_normal = read_dashboard(base)["reward_shares"]["condition-c"]
         assert recovered_normal["state"] == "known"
         assert recovered_normal["percentage"] == "5"
-        assert recovered_normal["severity"] == "normal"
+        assert recovered_normal["target_status"] == "target"
+        assert recovered_normal["target_delta_percentage_points"] == "0"
         assert recovered_normal["delta_percentage_points"] == "-3"
 
     assert account.share_reads == len(events)
@@ -3736,6 +4452,162 @@ def test_lp_dashboard_share_failures_preserve_unknown_without_order_writes(
     assert account.cancellations == 0
     assert account.resizes == 0
     assert notifier.calls == 0
+
+    source_checked_at = datetime.now(UTC).replace(microsecond=0)
+    source_checked_text = source_checked_at.isoformat(timespec="microseconds").replace(
+        "+00:00", "Z"
+    )
+    restart_condition = "condition-restart"
+
+    class RestartAccount:
+        def __init__(self, wallet: str, *, fail_percentage: bool = False) -> None:
+            self.wallet_address = wallet
+            self.config = SimpleNamespace(wallet_address=wallet)
+            self.fail_percentage = fail_percentage
+            self.share_reads = 0
+            self.order_writes = 0
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "wallet_address": self.wallet_address,
+                "open_orders": (
+                    {
+                        "order_id": "restart-order",
+                        "condition_id": restart_condition,
+                        "token_id": "restart-yes",
+                        "outcome": "YES",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "price": Decimal("0.50"),
+                        "original_size": Decimal("10"),
+                        "size_matched": Decimal("0"),
+                    },
+                ),
+                "positions": (),
+                "checked_at": source_checked_at,
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def get_order_scoring(self, *, order_id: str) -> bool:
+            return order_id == "restart-order"
+
+        def lp_reward_percentages(self) -> dict[str, object]:
+            self.share_reads += 1
+            if self.fail_percentage:
+                raise RuntimeError("percentage read unavailable")
+            return {
+                "state": "known",
+                "scope": "account",
+                "maker_address": self.wallet_address,
+                "percentages": {restart_condition: Decimal("8.5")},
+                "checked_at": source_checked_at,
+            }
+
+        def create_limit_order(self, **_kwargs: object) -> object:
+            self.order_writes += 1
+            return object()
+
+        def post_order(self, _order: object) -> object:
+            self.order_writes += 1
+            return object()
+
+        def cancel_orders(self, **_kwargs: object) -> object:
+            self.order_writes += 1
+            return object()
+
+    restart_account = RestartAccount("wallet-restart-a")
+    restart_service = PredictionExecutionService(
+        store=store,
+        monitor=monitor,
+        trading=restart_account,
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution-restart-a.lock",
+        lp=PolymarketLPService(store, restart_account),
+    )
+    restart_service._breaker_open = False
+    restart_runtime = _Runtime()
+    restart_runtime.mode = "production"
+    restart_runtime.state = "RUNNING"
+    restart_runtime.production_owner = True
+    restart_runtime.store = store  # type: ignore[assignment]
+    restart_runtime.monitor = monitor
+    restart_runtime.execution = restart_service
+
+    with _server(restart_runtime, session_token="restart-session", csrf_token="restart-csrf") as base:
+        request = Request(
+            base + "/api/prediction-arbitrage/lp/share-watch",
+            data=json.dumps(
+                {"condition_id": restart_condition, "enabled": True}
+            ).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Cookie": "ot_prediction_session=restart-session",
+                "Origin": base,
+                "X-CSRF-Token": "restart-csrf",
+            },
+            method="POST",
+        )
+        status, payload = _response(request)
+        assert status == 200, payload
+        assert payload["enabled"] is True
+
+    refreshed = restart_service.refresh_lp_share_watch()
+    assert refreshed["state"] == "ready"
+    restart_account_id = restart_service._lp_account_id()
+    assert restart_account_id is not None
+    saved_restart = store.lp_observations(restart_account_id)[restart_condition]
+    assert saved_restart["share_alert"]["last_share_percentage"] == "8.5"
+    assert saved_restart["share_alert"]["last_share_checked_at"] == source_checked_text
+
+    restarted_account = RestartAccount("wallet-restart-a", fail_percentage=True)
+    restarted_service = PredictionExecutionService(
+        store=store,
+        monitor=monitor,
+        trading=restarted_account,
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution-restarted-a.lock",
+        lp=PolymarketLPService(store, restarted_account),
+    )
+    restarted_runtime = _Runtime()
+    restarted_runtime.store = store  # type: ignore[assignment]
+    restarted_runtime.monitor = monitor
+    restarted_runtime.execution = restarted_service
+
+    with _server(restarted_runtime) as base:
+        status, payload = _response(base + "/api/prediction-arbitrage/lp/dashboard")
+        assert status == 200
+        share = payload["reward_shares"][restart_condition]
+        assert share["state"] == "unknown"
+        assert share["historical"] is True
+        assert share["percentage"] == "8.5"
+        assert share["checked_at"] == source_checked_text
+        assert share["last_success_at"] == source_checked_text
+        assert share["target_status"] == "unknown"
+        assert share["stale"] is True
+
+    account_b = RestartAccount("wallet-restart-b", fail_percentage=True)
+    service_b = PredictionExecutionService(
+        store=store,
+        monitor=monitor,
+        trading=account_b,
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution-restart-b.lock",
+        lp=PolymarketLPService(store, account_b),
+    )
+    runtime_b = _Runtime()
+    runtime_b.store = store  # type: ignore[assignment]
+    runtime_b.monitor = monitor
+    runtime_b.execution = service_b
+    with _server(runtime_b) as base:
+        status, payload = _response(base + "/api/prediction-arbitrage/lp/dashboard")
+        assert status == 200
+        share_b = payload["reward_shares"][restart_condition]
+        assert share_b["state"] == "unknown"
+        assert share_b["historical"] is False
+        assert share_b["percentage"] is None
+        assert share_b["checked_at"] is None
 
 
 def test_lp_reward_share_survives_background_reward_refresh(tmp_path: Path) -> None:
@@ -3905,7 +4777,8 @@ def test_lp_reward_share_survives_background_reward_refresh(tmp_path: Path) -> N
         assert share["state"] == "known"
         assert share["percentage"] == "7.5"
         assert share["reference_share_percentage"] == "5"
-        assert share["severity"] == "warning"
+        assert share["target_status"] == "target"
+        assert share["target_delta_percentage_points"] == "0"
         assert share["delta_percentage_points"] is None
         assert share["stale"] is False
         assert share["historical"] is False
@@ -10595,3 +11468,383 @@ def test_lp_price_history_updates_incrementally_and_expires(tmp_path: Path) -> N
     expired = service.refresh_candidates(force=True)
     assert len(exchange.history_calls) == before_candidates
     assert expired["funnel"]["volatility_pass"] == 0
+
+
+def test_lp_share_watch_selection_is_durable_and_validated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Account:
+        def __init__(self, wallet: str) -> None:
+            self.wallet_address = wallet
+            self.config = SimpleNamespace(wallet_address=wallet)
+            self.order_writes = 0
+            self.fail_open_order_reads = False
+            self.omit_open_orders_checked_at = False
+            self.open_orders_checked_at: datetime | None = None
+            self.open_orders_wallet: str | None = None
+            self.block_account_snapshot = False
+            self.account_snapshot_started = threading.Event()
+            self.release_account_snapshot = threading.Event()
+            self.fail_account_snapshot = False
+            self.open_orders = [
+                {
+                    "order_id": "a-1",
+                    "condition_id": "condition-a",
+                    "token_id": "a-yes",
+                    "side": "BUY",
+                    "status": "LIVE",
+                    "price": Decimal("0.40"),
+                    "original_size": Decimal("20"),
+                    "size_matched": Decimal("5"),
+                },
+                {
+                    "order_id": "a-2",
+                    "condition_id": "condition-a",
+                    "token_id": "a-no",
+                    "side": "BUY",
+                    "status": "LIVE",
+                    "price": Decimal("0.45"),
+                    "original_size": Decimal("10"),
+                    "size_matched": Decimal("0"),
+                },
+                {
+                    "order_id": "b-1",
+                    "condition_id": "condition-b",
+                    "token_id": "b-yes",
+                    "side": "BUY",
+                    "status": "LIVE",
+                    "price": Decimal("0.50"),
+                    "original_size": Decimal("12"),
+                    "size_matched": Decimal("2"),
+                },
+            ]
+
+        def lp_open_orders_snapshot(self) -> dict[str, object]:
+            if self.fail_open_order_reads:
+                raise RuntimeError("account read unavailable")
+            result: dict[str, object] = {
+                "authenticated": True,
+                "open_orders": tuple(self.open_orders),
+                "open_orders_complete": True,
+            }
+            if not self.omit_open_orders_checked_at:
+                result["checked_at"] = self.open_orders_checked_at or datetime.now(UTC)
+            if self.open_orders_wallet is not None:
+                result["wallet_address"] = self.open_orders_wallet
+            return result
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            if self.block_account_snapshot:
+                self.account_snapshot_started.set()
+                self.release_account_snapshot.wait(timeout=5)
+                if self.fail_account_snapshot:
+                    raise RuntimeError("account snapshot failed")
+            if self.fail_account_snapshot:
+                raise RuntimeError("account snapshot failed")
+            return {
+                "authenticated": not self.fail_open_order_reads,
+                "open_orders": tuple(self.open_orders),
+                "open_orders_complete": not self.fail_open_order_reads,
+                "positions": (),
+                "positions_complete": not self.fail_open_order_reads,
+                "checked_at": datetime.now(UTC),
+            }
+
+        def create_limit_order(self, **_kwargs: object) -> object:
+            self.order_writes += 1
+            return object()
+
+        def post_order(self, _order: object) -> object:
+            self.order_writes += 1
+            return object()
+
+        def cancel_orders(self, **_kwargs: object) -> object:
+            self.order_writes += 1
+            return object()
+
+    store = PredictionArbitrageStore(tmp_path / "data")
+    account = Account("wallet-a")
+    monitor = make_monitor(tmp_path)
+    service = PredictionExecutionService(
+        store=store,
+        monitor=monitor,
+        trading=account,
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+    )
+    service._breaker_open = False
+
+    class Runtime:
+        mode = "production"
+        state = "RUNNING"
+        production_owner = True
+        execution = service
+
+    Runtime.store = store
+
+    with _server(
+        Runtime(),
+        session_token="session-token",
+        csrf_token="csrf-token",
+    ) as base:
+        def post(payload: dict[str, object], *, csrf: str = "csrf-token") -> tuple[int, dict[str, object]]:
+            request = Request(
+                base + "/api/prediction-arbitrage/lp/share-watch",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Cookie": "ot_prediction_session=session-token",
+                    "Origin": base,
+                    "X-CSRF-Token": csrf,
+                },
+                method="POST",
+            )
+            return _response(request)
+
+        status, payload = post({"condition_id": "condition-a", "enabled": True})
+        assert status == 200, payload
+        assert payload["enabled"] is True
+        assert payload["condition_id"] == "condition-a"
+        dashboard_status, dashboard_payload = _response(
+            base + "/api/prediction-arbitrage/lp/dashboard"
+        )
+        assert dashboard_status == 200
+        assert dashboard_payload["lp_share_watch_state"]["condition-a"]["enabled"] is True
+
+        fixed_now = datetime.now(UTC).replace(microsecond=0)
+        original_utc_now = prediction_execution_module._utc_now
+        monkeypatch.setattr(prediction_execution_module, "_utc_now", lambda: fixed_now)
+        account.open_orders_checked_at = fixed_now - timedelta(seconds=29.999)
+        assert post({"condition_id": "condition-b", "enabled": True})[0] == 200
+        assert post({"condition_id": "condition-b", "enabled": False})[0] == 200
+
+        account.open_orders_checked_at = fixed_now - timedelta(seconds=30)
+        assert post({"condition_id": "condition-b", "enabled": True})[0] == 400
+        assert service.lp_share_watch_state()["condition-b"]["enabled"] is False
+
+        account.omit_open_orders_checked_at = True
+        assert post({"condition_id": "condition-b", "enabled": True})[0] == 400
+        assert service.lp_share_watch_state()["condition-b"]["enabled"] is False
+        account.omit_open_orders_checked_at = False
+
+        account.open_orders_checked_at = fixed_now + timedelta(seconds=1)
+        assert post({"condition_id": "condition-b", "enabled": True})[0] == 400
+        assert service.lp_share_watch_state()["condition-b"]["enabled"] is False
+
+        account.open_orders_checked_at = fixed_now - timedelta(seconds=1)
+        account.open_orders_wallet = "wallet-other"
+        assert post({"condition_id": "condition-b", "enabled": True})[0] == 400
+        assert service.lp_share_watch_state()["condition-b"]["enabled"] is False
+        account.open_orders_wallet = None
+        monkeypatch.setattr(prediction_execution_module, "_utc_now", original_utc_now)
+
+        account.fail_account_snapshot = True
+        off_status, off_payload = post({"condition_id": "condition-a", "enabled": False})
+        assert off_status == 200, off_payload
+        assert off_payload["enabled"] is False
+        failed_dashboard_status, failed_dashboard = _response(
+            base + "/api/prediction-arbitrage/lp/dashboard"
+        )
+        assert failed_dashboard_status == 200
+        assert failed_dashboard["state"] == "stale"
+        assert failed_dashboard["lp_share_watch_state"]["condition-a"]["enabled"] is False
+        account.fail_account_snapshot = False
+        assert post({"condition_id": "condition-a", "enabled": True})[0] == 200
+        before_b = service.lp_share_watch_state()
+        assert "condition-b" not in before_b or before_b["condition-b"].get("enabled") is not True
+        account_id = service._lp_account_id()
+        assert account_id is not None
+        store.update_lp_observation(
+            account_id,
+            "condition-a",
+            {
+                "share_alert": {
+                    "breach_started_at": "2026-09-17T00:00:00+00:00",
+                    "notification_pending": True,
+                }
+            },
+        )
+        repeated_status, repeated = post({"condition_id": "condition-a", "enabled": True})
+        assert repeated_status == 200
+        assert repeated["share_alert"]["breach_started_at"] == "2026-09-17T00:00:00+00:00"
+        assert repeated["share_alert"]["notification_pending"] is True
+        assert post({"condition_id": "condition-b", "enabled": True})[0] == 200
+        restarted_while_enabled = PredictionExecutionService(
+            store=store,
+            monitor=monitor,
+            trading=Account("wallet-a"),
+            notifier=NullNotifier(),
+            lock_path=tmp_path / "execution-restarted-enabled.lock",
+        )
+        enabled_after_restart = restarted_while_enabled.lp_share_watch_state()
+        assert enabled_after_restart["condition-a"]["enabled"] is True
+        assert enabled_after_restart["condition-b"]["enabled"] is True
+        assert post({"condition_id": "condition-b", "enabled": False})[0] == 200
+        assert post({"condition_id": "condition-a", "enabled": "true"})[0] == 400
+        assert post({"condition_id": "condition-a", "enabled": True}, csrf="")[0] == 403
+        assert post({"condition_id": "condition-a", "enabled": True, "account": "other"})[0] == 400
+        assert post({"condition_id": "", "enabled": True})[0] == 400
+        assert post({"condition_id": "condition-unknown", "enabled": True})[0] == 400
+
+        account.fail_open_order_reads = True
+        disabled_status, disabled_payload = post({"condition_id": "condition-a", "enabled": False})
+        assert disabled_status == 200, disabled_payload
+        assert disabled_payload["enabled"] is False
+        account.fail_open_order_reads = False
+        account.open_orders = []
+        assert post({"condition_id": "condition-a", "enabled": True})[0] == 400
+
+        account.open_orders = [
+            {
+                "order_id": "a-3",
+                "condition_id": "condition-a",
+                "token_id": "a-yes",
+                "side": "BUY",
+                "status": "LIVE",
+                "price": Decimal("0.40"),
+                "original_size": Decimal("20"),
+                "size_matched": Decimal("5"),
+            }
+        ]
+        store.save_lp_observation(
+            account_id,
+            "condition-a",
+            {
+                "state": "known",
+                "risk_alerts": {"YES": {"active": True}},
+                "share_alert": {"enabled": False},
+            },
+        )
+        account.block_account_snapshot = True
+        account.fail_account_snapshot = True
+        refresh_result: dict[str, object] = {}
+
+        def refresh() -> None:
+            refresh_result.update(service.refresh_lp_observations())
+
+        refresh_thread = threading.Thread(target=refresh)
+        refresh_thread.start()
+        assert account.account_snapshot_started.wait(timeout=5)
+        selected_status, selected_payload = post({"condition_id": "condition-a", "enabled": True})
+        assert selected_status == 200, selected_payload
+        assert selected_payload["enabled"] is True
+        account.release_account_snapshot.set()
+        refresh_thread.join(timeout=5)
+        assert not refresh_thread.is_alive()
+        assert refresh_result["state"] == "unknown"
+        interleaved = store.lp_observations(account_id)["condition-a"]
+        assert interleaved["share_alert"]["enabled"] is True
+        assert interleaved["risk_alerts"]["YES"]["active"] is True
+
+    account.fail_open_order_reads = True
+    disabled_during_read_failure = service.set_lp_share_watch("condition-a", enabled=False)
+    assert disabled_during_read_failure["enabled"] is False
+    account.fail_open_order_reads = False
+    assert account.order_writes == 0
+
+    restarted = PredictionExecutionService(
+        store=store,
+        monitor=monitor,
+        trading=Account("wallet-a"),
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution-restarted.lock",
+    )
+    assert restarted.lp_share_watch_state()["condition-a"]["enabled"] is False
+    other = PredictionExecutionService(
+        store=store,
+        monitor=monitor,
+        trading=Account("wallet-b"),
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution-other.lock",
+    )
+    assert other.lp_share_watch_state() == {}
+
+    class FallbackAccount:
+        def __init__(self, checked_at: datetime) -> None:
+            self.wallet_address = "wallet-fallback"
+            self.config = SimpleNamespace(wallet_address=self.wallet_address)
+            self.checked_at = checked_at
+            self.snapshot_calls = 0
+            self.order_writes = 0
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            self.snapshot_calls += 1
+            return {
+                "authenticated": True,
+                "wallet_address": "wallet-other",
+                "checked_at": self.checked_at,
+                "open_orders": (
+                    {
+                        "order_id": "fallback-order",
+                        "condition_id": "condition-fallback",
+                        "token_id": "fallback-yes",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "price": Decimal("0.40"),
+                        "original_size": Decimal("20"),
+                        "size_matched": Decimal("5"),
+                    },
+                ),
+                "open_orders_complete": True,
+                "positions": (),
+                "positions_complete": True,
+            }
+
+        def create_limit_order(self, **_kwargs: object) -> object:
+            self.order_writes += 1
+            return object()
+
+        def post_order(self, _order: object) -> object:
+            self.order_writes += 1
+            return object()
+
+        def cancel_orders(self, **_kwargs: object) -> object:
+            self.order_writes += 1
+            return object()
+
+    fallback_now = datetime(2026, 9, 17, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(prediction_execution_module, "_utc_now", lambda: fallback_now)
+    fallback_account = FallbackAccount(fallback_now)
+    assert not callable(getattr(fallback_account, "lp_open_orders_snapshot", None))
+    fallback_service = PredictionExecutionService(
+        store=store,
+        monitor=monitor,
+        trading=fallback_account,
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution-fallback.lock",
+    )
+    fallback_service._breaker_open = False
+
+    class FallbackRuntime:
+        mode = "production"
+        state = "RUNNING"
+        production_owner = True
+        execution = fallback_service
+
+    FallbackRuntime.store = store
+
+    with _server(
+        FallbackRuntime(),
+        session_token="fallback-session",
+        csrf_token="fallback-csrf",
+    ) as fallback_base:
+        fallback_request = Request(
+            fallback_base + "/api/prediction-arbitrage/lp/share-watch",
+            data=json.dumps(
+                {"condition_id": "condition-fallback", "enabled": True}
+            ).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Cookie": "ot_prediction_session=fallback-session",
+                "Origin": fallback_base,
+                "X-CSRF-Token": "fallback-csrf",
+            },
+            method="POST",
+        )
+        fallback_status, fallback_payload = _response(fallback_request)
+
+    assert fallback_status == 400, fallback_payload
+    assert fallback_payload["reason"] == "account_facts_unknown"
+    assert fallback_account.snapshot_calls == 1
+    assert fallback_service.lp_share_watch_state() == {}
+    assert fallback_account.order_writes == 0

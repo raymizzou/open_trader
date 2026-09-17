@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import fcntl
 import json
 import shlex
 import subprocess
@@ -708,6 +709,159 @@ def test_lp_alert_uses_identical_feishu_and_voice_text(tmp_path: Path) -> None:
     assert failed_feishu[1].success is True
     assert len(spoken) == spoken_before + 1
     assert spoken[-1] == posted[-1]["content"]["text"] == expected_text
+
+
+def test_lp_share_watch_voice_quiet_hours_and_delivery(tmp_path: Path) -> None:
+    title = "LP 份额预警"
+    message = (
+        "市场：Market A。\n"
+        "当前奖励份额 8.000001%，目标区间 5%–8%，已连续超过 8% 至少一分钟。\n"
+        "数据时间：北京时间 07:59:00。"
+    )
+    expected_voice = f"{title}\n\n{message}"
+    spoken: list[str] = []
+    feishu_posts: list[dict[str, object]] = []
+
+    def deliver(
+        value: str, *, returncode: int = 0
+    ) -> list[object]:
+        now = datetime.fromisoformat(value)
+
+        def fake_run(
+            command: list[str], **_kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            spoken.append(shlex.split(command[-1])[1])
+            return subprocess.CompletedProcess(command, returncode)
+
+        def fake_post(
+            _url: str, payload: dict[str, object], _timeout: float
+        ) -> dict[str, object]:
+            feishu_posts.append(payload)
+            return {"code": 0}
+
+        notifier = CompositeNotifier(
+            [
+                FeishuWebhookNotifier(
+                    webhook_url=WEBHOOK_URL,
+                    post_json=fake_post,
+                ),
+                XiaoaiSSHNotifier(
+                    host="speaker.local",
+                    ssh_key=tmp_path / "unused-key",
+                    run_command=fake_run,
+                    lock_path=tmp_path / f"voice-{len(spoken)}.lock",
+                    now_fn=lambda: now,
+                ),
+            ]
+        )
+        return send_notification_with_results(
+            notifier,
+            title,
+            message,
+            channels={"xiaoai"},
+        )
+
+    allowed_late = deliver("2026-09-17T22:59:00+08:00")
+    assert allowed_late[0].channel == "xiaoai"
+    assert allowed_late[0].success is True
+    assert allowed_late[0].suppressed is False
+    assert spoken == [expected_voice]
+
+    quiet_late = deliver("2026-09-17T23:00:00+08:00")
+    assert quiet_late[0].channel == "xiaoai"
+    assert quiet_late[0].success is False
+    assert quiet_late[0].suppressed is True
+    assert len(spoken) == 1
+
+    quiet_morning = deliver("2026-09-18T07:59:00+08:00")
+    assert quiet_morning[0].channel == "xiaoai"
+    assert quiet_morning[0].success is False
+    assert quiet_morning[0].suppressed is True
+    assert len(spoken) == 1
+
+    allowed_morning = deliver("2026-09-18T08:00:00+08:00")
+    assert allowed_morning[0].channel == "xiaoai"
+    assert allowed_morning[0].success is True
+    assert allowed_morning[0].suppressed is False
+    assert spoken == [expected_voice, expected_voice]
+
+    failed = deliver("2026-09-18T08:00:00+08:00", returncode=1)
+    assert failed[0].channel == "xiaoai"
+    assert failed[0].success is False
+    assert failed[0].suppressed is False
+    assert failed[0].error_type == "NotificationError"
+    assert len(feishu_posts) == 0
+
+    # A held voice lock must leave an LP share event pending promptly instead
+    # of waiting behind another transport. A later fresh attempt can acquire
+    # the released lock and deliver once.
+    busy_lock_path = tmp_path / "busy-voice.lock"
+    lock_handle = busy_lock_path.open("a+", encoding="utf-8")
+    fcntl.flock(lock_handle, fcntl.LOCK_EX)
+    busy_transport_calls: list[list[str]] = []
+    busy_attempts: list[list[object]] = []
+    busy_completed = threading.Event()
+
+    def busy_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        busy_transport_calls.append(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    busy_notifier = XiaoaiSSHNotifier(
+        host="speaker.local",
+        ssh_key=tmp_path / "unused-key",
+        run_command=busy_run,
+        lock_path=busy_lock_path,
+        now_fn=lambda: datetime.fromisoformat("2026-09-18T08:00:00+08:00"),
+    )
+
+    def try_busy_delivery() -> None:
+        busy_attempts.append(
+            send_notification_with_results(
+                busy_notifier,
+                title,
+                message,
+                channels={"xiaoai"},
+            )
+        )
+        busy_completed.set()
+
+    busy_thread = threading.Thread(target=try_busy_delivery)
+    busy_thread.start()
+    try:
+        assert busy_completed.wait(timeout=1.0)
+        assert busy_attempts[0][0].success is False
+        assert busy_attempts[0][0].suppressed is True
+        assert busy_transport_calls == []
+    finally:
+        fcntl.flock(lock_handle, fcntl.LOCK_UN)
+        lock_handle.close()
+        busy_thread.join(timeout=1.0)
+    assert busy_completed.is_set()
+
+    released_transport_calls: list[list[str]] = []
+
+    def released_run(
+        command: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        released_transport_calls.append(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    released_notifier = XiaoaiSSHNotifier(
+        host="speaker.local",
+        ssh_key=tmp_path / "unused-key",
+        run_command=released_run,
+        lock_path=busy_lock_path,
+        now_fn=lambda: datetime.fromisoformat("2026-09-18T08:00:00+08:00"),
+    )
+    released = send_notification_with_results(
+        released_notifier,
+        title,
+        message,
+        channels={"xiaoai"},
+    )
+    assert released[0].success is True
+    assert released[0].suppressed is False
+    assert len(released_transport_calls) == 1
 
 
 def test_xiaoai_voice_notifier_sends_rendered_protection_text(tmp_path: Path) -> None:

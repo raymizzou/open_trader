@@ -1858,6 +1858,473 @@ def test_lp_observations_refresh_without_dashboard_and_stop_with_runtime(
         assert isolation_probe.active_reads == 0
 
 
+def test_lp_share_watch_runs_without_dashboard_and_stops_with_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.prediction_runtime as runtime_module
+    from open_trader.polymarket_trading import PolymarketTradingClient
+
+    data_dir = tmp_path / "runtime-data"
+    config = SimpleNamespace(
+        signer_address="0x" + "1" * 40,
+        wallet_address="0x" + "2" * 40,
+        predict=None,
+    )
+    account_id = hashlib.sha256(
+        config.wallet_address.casefold().encode("utf-8")
+    ).hexdigest()
+    controlled_clock = [0.0]
+    probe = SimpleNamespace(
+        lock=threading.Lock(),
+        order_reads=0,
+        active_order_reads=0,
+        max_active_order_reads=0,
+        first_order_read=threading.Event(),
+        percentage_reads=0,
+        first_percentage_read=threading.Event(),
+        percentage_active=0,
+        max_percentage_active=0,
+        percentage_started=threading.Event(),
+        percentage_release=threading.Event(),
+        percentage_blocked=False,
+        reward_rate_started=threading.Event(),
+        reward_rate_cancelled=threading.Event(),
+        orders_started=threading.Event(),
+        orders_release=threading.Event(),
+        orders_blocked=False,
+        unknown_orders=False,
+        trading_closed=threading.Event(),
+        lp_closed=threading.Event(),
+        notifications=[],
+    )
+    probe.percentage_release.set()
+    probe.orders_release.set()
+    orders = [
+        {
+            "id": "order-a",
+            "market": "condition-a",
+            "asset_id": "token-a",
+            "side": "BUY",
+            "status": "LIVE",
+            "price": "0.50",
+            "original_size": "10",
+            "size_matched": "0",
+        },
+        {
+            "id": "order-b",
+            "market": "condition-b",
+            "asset_id": "token-b",
+            "side": "BUY",
+            "status": "LIVE",
+            "price": "0.50",
+            "original_size": "10",
+            "size_matched": "0",
+        },
+    ]
+
+    class FakeSDK:
+        def list_open_orders(self) -> list[dict[str, str]]:
+            with probe.lock:
+                probe.order_reads += 1
+                probe.active_order_reads += 1
+                probe.max_active_order_reads = max(
+                    probe.max_active_order_reads, probe.active_order_reads
+                )
+                probe.first_order_read.set()
+                if probe.orders_blocked:
+                    probe.orders_started.set()
+            try:
+                if probe.unknown_orders:
+                    raise RuntimeError("open orders unavailable")
+                if probe.orders_blocked:
+                    probe.orders_release.wait(timeout=5)
+                return [dict(row) for row in orders]
+            finally:
+                with probe.lock:
+                    probe.active_order_reads -= 1
+
+    class RuntimeTrading(PolymarketTradingClient):
+        def __init__(self) -> None:
+            super().__init__(config, FakeSDK())
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": datetime.now(UTC),
+                "open_orders": [dict(row) for row in orders],
+                "positions": [],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def lp_reward_percentages(self) -> dict[str, object]:
+            with probe.lock:
+                probe.percentage_reads += 1
+                probe.percentage_active += 1
+                probe.max_percentage_active = max(
+                    probe.max_percentage_active, probe.percentage_active
+                )
+                probe.first_percentage_read.set()
+                if probe.percentage_blocked:
+                    probe.percentage_started.set()
+            try:
+                if probe.percentage_blocked:
+                    probe.percentage_release.wait(timeout=5)
+                return {
+                    "state": "known",
+                    "scope": "account",
+                    "maker_address": config.wallet_address,
+                    "percentages": {
+                        "condition-a": Decimal("7"),
+                        "condition-b": Decimal("7"),
+                    },
+                    "checked_at": datetime.now(UTC),
+                }
+            finally:
+                with probe.lock:
+                    probe.percentage_active -= 1
+
+        def lp_reward_rates(
+            self, *, stop_event: threading.Event | None = None
+        ) -> dict[str, object]:
+            probe.reward_rate_started.set()
+            if stop_event is not None:
+                while not stop_event.wait(0.01):
+                    pass
+                probe.reward_rate_cancelled.set()
+            return {
+                "state": "unknown",
+                "complete": False,
+                "checked_at": datetime.now(UTC),
+                "markets": {},
+            }
+
+        def lp_order_books(
+            self,
+            token_ids: tuple[str, ...],
+            *,
+            stop_event: threading.Event | None = None,
+        ) -> dict[str, dict[str, object]]:
+            del stop_event
+            checked_at = datetime.now(UTC)
+            return {
+                token: {
+                    "condition_id": "condition-a"
+                    if token == "token-a"
+                    else "condition-b",
+                    "token_id": token,
+                    "received_at": checked_at,
+                    "bids": [],
+                    "asks": [],
+                }
+                for token in token_ids
+            }
+
+        def get_order_scoring(self, _order_id: str) -> bool:
+            return False
+
+        def close(self) -> None:
+            probe.trading_closed.set()
+
+    class FakeLP:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def set_mutation_guard(self, _guard: object) -> None:
+            pass
+
+        def refresh_candidates(self, **_kwargs: object) -> dict[str, object]:
+            return {"state": "known", "complete": True, "candidates": []}
+
+        def refresh_rewards(self, **_kwargs: object) -> dict[str, object]:
+            return {"state": "known"}
+
+        def refresh_price_history(self, **_kwargs: object) -> dict[str, object]:
+            return {"state": "known"}
+
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {
+                "state": "known",
+                "complete": True,
+                "candidates": [],
+                "recommendations": [],
+                "market_rewards": {},
+            }
+
+        def status(self, _session_id: str | None = None) -> dict[str, object]:
+            return {"state": "none"}
+
+        def close(self) -> None:
+            probe.lp_closed.set()
+
+    class FakeMonitor:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def set_ready_observer(self, _observer: object) -> None:
+            pass
+
+        def set_observation_observer(self, _observer: object) -> None:
+            pass
+
+        def set_auto_eat_observer(self, _observer: object) -> None:
+            pass
+
+        def set_failure_observer(self, _observer: object) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+    class FakeObservationMonitor:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+    class TestExecution(PredictionExecutionService):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)
+            self._clock = lambda: controlled_clock[0]
+
+        def reconcile_startup(self) -> dict[str, object]:
+            return {"state": "ready"}
+
+        def lp_tick(self) -> dict[str, object]:
+            return {"state": "none"}
+
+    class RecordingNotifier:
+        def notify(self, title: str, message: str) -> None:
+            probe.notifications.append((title, message))
+
+    trading = RuntimeTrading()
+    monkeypatch.setattr(runtime_module, "_LP_SHARE_WATCH_SECONDS", 0.01, raising=False)
+    monkeypatch.setattr(runtime_module, "_LP_REWARD_STOP_GRACE_SECONDS", 0.05)
+    monkeypatch.setattr(runtime_module, "PolymarketLPService", FakeLP)
+    monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor)
+    monkeypatch.setattr(
+        runtime_module, "PredictionObservationMonitor", FakeObservationMonitor
+    )
+    monkeypatch.setattr(runtime_module, "PredictionExecutionService", TestExecution)
+    monkeypatch.setattr(runtime_module, "RelationCatalog", lambda _path: object())
+    monkeypatch.setattr(runtime_module, "LlmRelationValidator", lambda _store: object())
+    monkeypatch.setattr(runtime_module, "LlmTitleTranslator", lambda _store: object())
+    monkeypatch.setattr(
+        runtime_module, "ensure_same_event_same_venue_scope", lambda _store: False
+    )
+    monkeypatch.setattr(runtime_module, "load_trading_config", lambda _path: config)
+    monkeypatch.setattr(
+        runtime_module,
+        "PolymarketTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: trading),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "PredictTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: None),
+    )
+    monkeypatch.setattr(PredictionRuntime, "_wire_relation_lifecycle", lambda _self: None)
+    monkeypatch.setattr(
+        PredictionRuntime,
+        "_configure_n_leg_shadow",
+        lambda _self: (lambda *_args: None),
+    )
+
+    seed_store = PredictionArbitrageStore(data_dir)
+    for condition_id, title in (("condition-a", "Market A"), ("condition-b", "Market B")):
+        seed_store.save_lp_observation(
+            account_id,
+            condition_id,
+            {
+                "market_title": title,
+                "checked_at": datetime.now(UTC),
+                "share_alert": {
+                    "enabled": True,
+                    "paused": False,
+                    "notification_sent": False,
+                    "notification_pending": False,
+                },
+            },
+        )
+
+    runtime = PredictionRuntime(
+        data_dir=data_dir,
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+        notifier=RecordingNotifier(),
+        cross_venue_monitor=_UnavailableCrossVenueMonitor("test-disabled"),
+        solver_server_factory=lambda: object(),
+        enable_n_leg_background=False,
+    )
+
+    def wait_for(predicate: object, timeout: float = 2.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():  # type: ignore[operator]
+                return
+            time.sleep(0.005)
+        assert predicate()  # type: ignore[operator]
+
+    try:
+        runtime.start()
+        assert runtime.state == "RUNNING"
+        wait_for(probe.first_percentage_read.is_set)
+        assert probe.percentage_reads == 1
+        wait_for(probe.first_order_read.is_set)
+        assert probe.order_reads >= 1
+        wait_for(probe.reward_rate_started.is_set)
+
+        controlled_clock[0] = 5.0
+        time.sleep(0.05)
+        assert probe.percentage_reads == 1
+
+        controlled_clock[0] = 10.0
+        wait_for(lambda: probe.percentage_reads == 2)
+
+        probe.percentage_blocked = True
+        probe.percentage_release.clear()
+        probe.percentage_started.clear()
+        controlled_clock[0] = 20.0
+        wait_for(probe.percentage_started.is_set)
+        assert probe.max_percentage_active == 1
+
+        dashboard_done = threading.Event()
+        dashboard_results: list[dict[str, object]] = []
+
+        def read_dashboard() -> None:
+            assert runtime.execution is not None
+            dashboard_results.append(runtime.execution.lp_dashboard())
+            dashboard_done.set()
+
+        dashboard_thread = threading.Thread(target=read_dashboard)
+        dashboard_thread.start()
+        assert not dashboard_done.wait(timeout=0.05)
+        controlled_clock[0] = 35.0
+        probe.percentage_release.set()
+        dashboard_thread.join(timeout=1)
+        assert dashboard_done.is_set()
+        assert dashboard_results[0]["state"] == "ready"
+        assert probe.percentage_reads == 3
+        assert probe.max_percentage_active == 1
+
+        probe.percentage_blocked = False
+        controlled_clock[0] = 30.0
+        orders.clear()
+        assert runtime.execution is not None
+        execution = runtime.execution
+        wait_for(
+            lambda: execution.lp_share_watch_state()
+            .get("condition-a", {})
+            .get("paused")
+            is True
+            and execution.lp_share_watch_state()
+            .get("condition-b", {})
+            .get("paused")
+            is True
+        )
+        paused = execution.lp_share_watch_state()
+        assert paused["condition-a"]["enabled"] is True
+        assert paused["condition-a"]["paused"] is True
+        assert paused["condition-b"]["paused"] is True
+
+        orders.append(
+            {
+                "id": "order-a-new",
+                "market": "condition-a",
+                "asset_id": "token-a",
+                "side": "BUY",
+                "status": "LIVE",
+                "price": "0.50",
+                "original_size": "10",
+                "size_matched": "0",
+            }
+        )
+        controlled_clock[0] = 40.0
+        wait_for(
+            lambda: execution.lp_share_watch_state()
+            .get("condition-a", {})
+            .get("paused")
+            is False
+            and execution.lp_share_watch_state()
+            .get("condition-b", {})
+            .get("paused")
+            is True
+        )
+        resumed = execution.lp_share_watch_state()
+        assert resumed["condition-a"]["enabled"] is True
+        assert resumed["condition-a"]["paused"] is False
+        assert resumed["condition-b"]["paused"] is True
+
+        probe.unknown_orders = True
+        controlled_clock[0] = 50.0
+        previous_attempt = resumed["condition-a"].get("last_attempt_at")
+        wait_for(
+            lambda: execution.lp_share_watch_state()
+            .get("condition-a", {})
+            .get("last_attempt_at")
+            != previous_attempt
+        )
+        unknown = execution.lp_share_watch_state()
+        assert unknown["condition-a"]["enabled"] is True
+        assert unknown["condition-a"]["paused"] is False
+
+        probe.unknown_orders = False
+        probe.orders_started.clear()
+        probe.orders_release.clear()
+        probe.orders_blocked = True
+        controlled_clock[0] = 60.0
+        wait_for(probe.orders_started.is_set)
+        percentage_reads_at_stop = probe.percentage_reads
+
+        stop_done = threading.Event()
+        stop_errors: list[BaseException] = []
+
+        def stop_runtime() -> None:
+            try:
+                runtime.stop()
+            except BaseException as exc:
+                stop_errors.append(exc)
+            finally:
+                stop_done.set()
+
+        stop_thread = threading.Thread(target=stop_runtime)
+        stop_thread.start()
+        assert stop_done.wait(timeout=1)
+        stop_thread.join(timeout=1)
+        assert stop_errors
+        assert runtime.state == "STOPPING"
+        assert runtime.production_owner is True
+        assert runtime.store is not None
+        assert not probe.trading_closed.is_set()
+        assert not probe.lp_closed.is_set()
+
+        probe.orders_blocked = False
+        probe.orders_release.set()
+        wait_for(lambda: probe.active_order_reads == 0)
+        reads_after_release = probe.order_reads
+        time.sleep(0.05)
+        assert probe.order_reads == reads_after_release
+        assert probe.percentage_reads == percentage_reads_at_stop
+        runtime.stop()
+        assert runtime.state == "STOPPED"
+        assert runtime.production_owner is False
+        assert probe.trading_closed.is_set()
+        assert probe.lp_closed.is_set()
+    finally:
+        if runtime.state not in {"NEW", "STOPPED"}:
+            probe.orders_blocked = False
+            probe.orders_release.set()
+            probe.percentage_release.set()
+            runtime.stop()
+
+
 def test_runtime_owner_lock_excludes_a_real_second_process(tmp_path: Path) -> None:
     context = multiprocessing.get_context("spawn")
     path = tmp_path / "prediction_arbitrage" / "runtime.lock"

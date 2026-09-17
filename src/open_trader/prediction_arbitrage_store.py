@@ -3038,6 +3038,65 @@ class PredictionArbitrageStore:
         encoded = _dump_payload(payload)
         updated_at = _utc_now()
         with self._transaction() as connection:
+            current = connection.execute(
+                "SELECT payload FROM lp_market_observations WHERE account_id=? AND condition_id=?",
+                (account_key, market_key),
+            ).fetchone()
+            if current is not None:
+                previous = _load_payload(str(current["payload"]))
+                previous_share = previous.get("share_alert")
+                if isinstance(previous_share, Mapping):
+                    # Observation publishers may have read an older selection
+                    # and an older alert episode.  They must not overwrite any
+                    # part of the current share-watch state.  Explicit share
+                    # updates use update_lp_observation(), which reads and
+                    # merges the latest row in its own short transaction.
+                    merged_payload = dict(payload)
+                    merged_payload["share_alert"] = dict(previous_share)
+                    encoded = _dump_payload(merged_payload)
+            connection.execute(
+                """
+                INSERT INTO lp_market_observations(account_id, condition_id, payload, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(account_id, condition_id) DO UPDATE SET
+                    payload=excluded.payload,
+                    updated_at=excluded.updated_at
+                """,
+                (account_key, market_key, encoded, updated_at),
+            )
+        result = _load_payload(encoded)
+        result.update({"condition_id": market_key, "updated_at": updated_at})
+        return result
+
+    def update_lp_observation(
+        self,
+        account_id: str,
+        condition_id: str,
+        updates: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Atomically merge selected fields into one LP observation."""
+
+        account_key = str(account_id).strip()
+        market_key = str(condition_id).strip()
+        if not account_key or not market_key:
+            raise ValueError("LP observation identity is required")
+        if not isinstance(updates, Mapping):
+            raise ValueError("LP observation updates must be an object")
+        with self._transaction() as connection:
+            current = connection.execute(
+                "SELECT payload FROM lp_market_observations WHERE account_id=? AND condition_id=?",
+                (account_key, market_key),
+            ).fetchone()
+            previous = _load_payload(str(current["payload"])) if current is not None else {}
+            merged = dict(previous)
+            for key, value in updates.items():
+                old_value = merged.get(str(key))
+                if isinstance(old_value, Mapping) and isinstance(value, Mapping):
+                    merged[str(key)] = {**old_value, **value}
+                else:
+                    merged[str(key)] = value
+            encoded = _dump_payload(merged)
+            updated_at = _utc_now()
             connection.execute(
                 """
                 INSERT INTO lp_market_observations(account_id, condition_id, payload, updated_at)

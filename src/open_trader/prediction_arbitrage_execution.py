@@ -62,9 +62,11 @@ from .validation_eat_policy import should_eat as _validation_should_eat
 
 
 PREVIEW_TTL = timedelta(seconds=10)
-LP_REWARD_PERCENTAGE_CACHE_SECONDS = 60.0
-LP_REWARD_SHARE_STALE_SECONDS = 180.0
+LP_REWARD_PERCENTAGE_CACHE_SECONDS = 10.0
+LP_REWARD_SHARE_STALE_SECONDS = 30.0
+LP_SHARE_WATCH_DURATION_SECONDS = 60.0
 LP_REWARD_REFERENCE_PERCENTAGE = Decimal("5")
+LP_REWARD_SHARE_TARGET_MAX = Decimal("8")
 _LP_REWARD_CACHE_SECONDS = 60.0
 _LP_TRADES_CACHE_SECONDS = 60.0
 
@@ -210,11 +212,17 @@ def _lp_share_datetime(value: object) -> datetime | None:
 
 
 def _lp_share_severity(value: Decimal) -> str:
-    if value >= Decimal("10"):
-        return "critical"
-    if value >= Decimal("7.5"):
+    if value > LP_REWARD_SHARE_TARGET_MAX:
         return "warning"
     return "normal"
+
+
+def _lp_share_target(value: Decimal) -> tuple[str, Decimal]:
+    if value < LP_REWARD_REFERENCE_PERCENTAGE:
+        return "space", LP_REWARD_REFERENCE_PERCENTAGE - value
+    if value > LP_REWARD_SHARE_TARGET_MAX:
+        return "excess", value - LP_REWARD_SHARE_TARGET_MAX
+    return "target", Decimal("0")
 
 
 def _lp_reward_record_today(entry: object, reward_date: str) -> bool:
@@ -611,6 +619,9 @@ class PredictionExecutionService:
         # shadow and legacy test fixtures retain their read-only surface.
         self._lp = lp
         self._lp_dashboard_lock = threading.RLock()
+        self._lp_reward_percentage_lock = threading.Lock()
+        self._lp_share_watch_notification_lock = threading.Lock()
+        self._lp_share_watch_seen: set[str] = set()
         self._lp_dashboard_cache: dict[str, object] | None = None
         self._lp_reward_percentage_cache: dict[str, object] | None = None
         self._lp_reward_share_observations: dict[str, dict[str, object]] = {}
@@ -684,6 +695,595 @@ class PredictionExecutionService:
         if not isinstance(wallet, str) or not wallet.strip():
             return None
         return hashlib.sha256(wallet.strip().casefold().encode("utf-8")).hexdigest()
+
+    def lp_share_watch_state(self) -> dict[str, dict[str, object]]:
+        account_id = self._lp_account_id()
+        reader = getattr(self._store, "lp_observations", None)
+        if account_id is None or not callable(reader):
+            return {}
+        try:
+            observations = reader(account_id)
+        except Exception:
+            return {}
+        result: dict[str, dict[str, object]] = {}
+        if not isinstance(observations, Mapping):
+            return result
+        for condition_id, observation in observations.items():
+            if not isinstance(observation, Mapping):
+                continue
+            share_alert = observation.get("share_alert")
+            if isinstance(share_alert, Mapping):
+                result[str(condition_id)] = dict(share_alert)
+        return result
+
+    def _lp_open_orders_snapshot(
+        self, *, stop_event: threading.Event | None = None
+    ) -> Mapping[str, object] | None:
+        if stop_event is not None and stop_event.is_set():
+            return None
+        reader = getattr(self._trading, "lp_open_orders_snapshot", None)
+        if callable(reader):
+            try:
+                result = _call(reader)
+            except Exception:
+                return None
+            if stop_event is not None and stop_event.is_set():
+                return None
+            return result if isinstance(result, Mapping) else None
+        # Compatibility for read-only collaborators that predate the narrow
+        # adapter; the production client supplies the lightweight method above.
+        reader = getattr(self._trading, "lp_account_snapshot", None)
+        if not callable(reader):
+            return None
+        try:
+            result = _call(reader)
+        except Exception:
+            return None
+        if stop_event is not None and stop_event.is_set():
+            return None
+        if not isinstance(result, Mapping):
+            return None
+        return {
+            "authenticated": result.get("authenticated") is True,
+            "open_orders": result.get("open_orders", ()),
+            "open_orders_complete": result.get("open_orders_complete") is True,
+            "checked_at": result.get("checked_at"),
+            "wallet_address": result.get("wallet_address"),
+        }
+
+    def _lp_open_orders_snapshot_valid(
+        self, snapshot: object, *, now: datetime | None = None
+    ) -> bool:
+        if not isinstance(snapshot, Mapping):
+            return False
+        checked_at = _lp_share_datetime(snapshot.get("checked_at"))
+        current = now or _utc_now()
+        age = (
+            (current - checked_at.astimezone(UTC)).total_seconds()
+            if checked_at is not None
+            else None
+        )
+        expected_wallet = getattr(self._trading, "wallet_address", None)
+        if not isinstance(expected_wallet, str) or not expected_wallet.strip():
+            config = getattr(self._trading, "config", None)
+            expected_wallet = getattr(config, "wallet_address", None)
+        snapshot_wallet = snapshot.get("wallet_address")
+        wallet_matches = (
+            snapshot_wallet is None
+            or (
+                isinstance(expected_wallet, str)
+                and bool(expected_wallet.strip())
+                and isinstance(snapshot_wallet, str)
+                and bool(snapshot_wallet.strip())
+                and snapshot_wallet.strip().casefold()
+                == expected_wallet.strip().casefold()
+            )
+        )
+        return (
+            snapshot.get("authenticated") is True
+            and snapshot.get("open_orders_complete") is True
+            and isinstance(snapshot.get("open_orders"), (list, tuple))
+            and checked_at is not None
+            and age is not None
+            and 0 <= age < LP_REWARD_SHARE_STALE_SECONDS
+            and wallet_matches
+        )
+
+    @staticmethod
+    def _lp_active_order_conditions(snapshot: Mapping[str, object]) -> set[str] | None:
+        if (
+            snapshot.get("authenticated") is not True
+            or snapshot.get("open_orders_complete") is not True
+            or not isinstance(snapshot.get("open_orders"), (list, tuple))
+        ):
+            return None
+        active: set[str] = set()
+        for order in snapshot["open_orders"]:
+            if not isinstance(order, Mapping):
+                return None
+            condition_id = str(order.get("condition_id") or "").strip()
+            if not condition_id:
+                return None
+            status = str(order.get("status") or "").upper()
+            remaining = _decimal(order.get("remaining_quantity"))
+            if remaining is None:
+                remaining = _decimal(order.get("remaining_size"))
+            if remaining is None:
+                remaining = _decimal(order.get("size"))
+            if remaining is None:
+                original = _decimal(order.get("original_size"))
+                matched = _decimal(order.get("size_matched"))
+                if original is not None and matched is not None:
+                    remaining = original - matched
+            if remaining is None or remaining < 0:
+                return None
+            if status not in TERMINAL_ORDER_STATES and remaining > 0:
+                active.add(condition_id)
+        return active
+
+    def set_lp_share_watch(
+        self, condition_id: str, *, enabled: bool
+    ) -> dict[str, object]:
+        market = str(condition_id).strip()
+        if not market:
+            raise ValueError("condition_id is required")
+        if type(enabled) is not bool:
+            raise ValueError("enabled must be a boolean")
+        account_id = self._lp_account_id()
+        updater = getattr(self._store, "update_lp_observation", None)
+        if account_id is None or not callable(updater):
+            raise RuntimeError("LP share watch persistence is unavailable")
+        existing = self.lp_share_watch_state().get(market, {})
+        if not enabled:
+            saved = updater(
+                account_id,
+                market,
+                {
+                    "share_alert": {
+                        "enabled": False,
+                        "paused": False,
+                        "breach_started_at": None,
+                        "notification_pending": False,
+                    }
+                },
+            )
+            return {
+                "state": "disabled",
+                "condition_id": market,
+                "enabled": False,
+                "share_alert": saved.get("share_alert", {}),
+            }
+        snapshot = self._lp_open_orders_snapshot()
+        active_conditions = (
+            None
+            if not self._lp_open_orders_snapshot_valid(snapshot)
+            else self._lp_active_order_conditions(snapshot)
+        )
+        if active_conditions is None:
+            return {
+                "state": "rejected",
+                "reason": "account_facts_unknown",
+                "condition_id": market,
+                "enabled": False,
+            }
+        if market not in active_conditions:
+            return {
+                "state": "rejected",
+                "reason": "no_active_orders",
+                "condition_id": market,
+                "enabled": False,
+            }
+        title = existing.get("market_title")
+        observations_reader = getattr(self._store, "lp_observations", None)
+        if callable(observations_reader):
+            try:
+                observations = observations_reader(account_id)
+            except Exception:
+                observations = {}
+            observation = observations.get(market) if isinstance(observations, Mapping) else None
+            if isinstance(observation, Mapping):
+                root_title = observation.get("market_title")
+                if isinstance(root_title, str) and root_title.strip():
+                    title = root_title.strip()
+        for order in snapshot.get("open_orders", ()):
+            if isinstance(order, Mapping) and str(order.get("condition_id") or "").strip() == market:
+                title = order.get("market_title") or order.get("title") or title
+                break
+        # Repeating an already-enabled selection is an idempotent no-op.  In
+        # particular, do not clear a breach start or pending delivery and
+        # accidentally extend the continuous-breach window.
+        share_update = {
+            "enabled": True,
+            "paused": False,
+            "market_title": title or market,
+        }
+        if existing.get("enabled") is not True:
+            share_update.update(
+                {
+                    "breach_started_at": None,
+                    "notification_pending": False,
+                }
+            )
+        saved = updater(
+            account_id,
+            market,
+            {"share_alert": share_update},
+        )
+        return {
+            "state": "enabled",
+            "condition_id": market,
+            "enabled": True,
+            "share_alert": saved.get("share_alert", {}),
+        }
+
+    def refresh_lp_share_watch(
+        self, *, stop_event: threading.Event | None = None
+    ) -> dict[str, object]:
+        """Refresh selected LP share watches and deliver Xiaoai alerts."""
+
+        account_id = self._lp_account_id()
+        observations_reader = getattr(self._store, "lp_observations", None)
+        update_observation = getattr(self._store, "update_lp_observation", None)
+        if (
+            account_id is None
+            or not callable(observations_reader)
+            or not callable(update_observation)
+        ):
+            return {
+                "state": "unknown",
+                "reason": "lp_observation_store_unavailable",
+                "observations": {},
+            }
+        try:
+            saved_observations = observations_reader(account_id)
+        except Exception:
+            return {
+                "state": "unknown",
+                "reason": "lp_observation_store_unavailable",
+                "observations": {},
+            }
+        if not isinstance(saved_observations, Mapping):
+            saved_observations = {}
+        selected = {
+            str(condition_id): dict(alert)
+            for condition_id, observation in saved_observations.items()
+            if isinstance(observation, Mapping)
+            and isinstance(observation.get("share_alert"), Mapping)
+            and observation["share_alert"].get("enabled") is True
+            for alert in (observation["share_alert"],)
+        }
+        if stop_event is not None and stop_event.is_set():
+            return {"state": "cancelled", "observations": dict(saved_observations)}
+        first_seen = {
+            condition_id: condition_id not in self._lp_share_watch_seen
+            for condition_id in selected
+        }
+        self._lp_share_watch_seen.update(selected)
+
+        def current_alert(condition_id: str) -> dict[str, object]:
+            current = self.lp_share_watch_state().get(condition_id, {})
+            return dict(current) if isinstance(current, Mapping) else {}
+
+        def save_watch_fields(
+            condition_id: str, fields: Mapping[str, object]
+        ) -> dict[str, object] | None:
+            current = current_alert(condition_id)
+            if current.get("enabled") is not True:
+                return None
+            return update_observation(
+                account_id,
+                condition_id,
+                {"share_alert": dict(fields)},
+            )
+
+        now = _utc_now()
+        if not selected:
+            return {
+                "state": "ready",
+                "checked_at": _timestamp(now),
+                "observations": dict(saved_observations),
+            }
+
+        snapshot = self._lp_open_orders_snapshot(stop_event=stop_event)
+        # The authenticated reader stamps its result after the network call;
+        # compare against a clock read taken after that external operation.
+        now = _utc_now()
+        snapshot_checked_at = (
+            _lp_share_datetime(snapshot.get("checked_at"))
+            if isinstance(snapshot, Mapping)
+            else None
+        )
+        snapshot_valid = self._lp_open_orders_snapshot_valid(snapshot, now=now)
+        active_conditions = (
+            self._lp_active_order_conditions(snapshot)
+            if snapshot_valid and isinstance(snapshot, Mapping)
+            else None
+        )
+        if active_conditions is None:
+            for condition_id in selected:
+                save_watch_fields(
+                    condition_id,
+                    {
+                        "paused": False,
+                        "breach_started_at": None,
+                        "notification_pending": False,
+                        "last_attempt_at": _timestamp(now),
+                    },
+                )
+            return {
+                "state": "unknown",
+                "reason": "account_facts_unknown",
+                "checked_at": _timestamp(now),
+                "observations": observations_reader(account_id),
+            }
+
+        active_selected = tuple(
+            condition_id for condition_id in selected if condition_id in active_conditions
+        )
+        if not active_selected:
+            for condition_id in selected:
+                save_watch_fields(
+                    condition_id,
+                    {
+                        "paused": True,
+                        "breach_started_at": None,
+                        "notification_pending": False,
+                        "last_attempt_at": _timestamp(now),
+                    },
+                )
+            return {
+                "state": "ready",
+                "checked_at": _timestamp(now),
+                "observations": observations_reader(account_id),
+            }
+
+        if stop_event is not None and stop_event.is_set():
+            return {"state": "cancelled", "observations": observations_reader(account_id)}
+        projections = self._lp_reward_share_projection(active_selected)
+        if stop_event is not None and stop_event.is_set():
+            return {"state": "cancelled", "observations": observations_reader(account_id)}
+        now = _utc_now()
+        observation_titles: dict[str, str] = {}
+        for condition_id, observation in saved_observations.items():
+            if not isinstance(observation, Mapping):
+                continue
+            title = observation.get("market_title")
+            if isinstance(title, str) and title.strip():
+                observation_titles[str(condition_id)] = title.strip()
+        order_titles: dict[str, str] = {}
+        if isinstance(snapshot, Mapping):
+            for raw_order in snapshot.get("open_orders", ()):
+                if not isinstance(raw_order, Mapping):
+                    continue
+                condition_id = str(raw_order.get("condition_id") or "").strip()
+                title = str(
+                    raw_order.get("market_title")
+                    or raw_order.get("title")
+                    or ""
+                ).strip()
+                if condition_id and title and condition_id not in order_titles:
+                    order_titles[condition_id] = title
+
+        pending_notifications: list[tuple[str, str, str, str, datetime]] = []
+        for condition_id in selected:
+            alert = current_alert(condition_id)
+            if alert.get("enabled") is not True:
+                continue
+            if condition_id not in active_conditions:
+                save_watch_fields(
+                    condition_id,
+                    {
+                        "paused": True,
+                        "breach_started_at": None,
+                        "notification_pending": False,
+                        "last_attempt_at": _timestamp(now),
+                    },
+                )
+                continue
+            projection = projections.get(condition_id, {})
+            percentage = _decimal(projection.get("percentage"))
+            source_checked_at = _lp_share_datetime(projection.get("checked_at"))
+            valid = (
+                projection.get("state") == "known"
+                and percentage is not None
+                and source_checked_at is not None
+            )
+            if not valid:
+                save_watch_fields(
+                    condition_id,
+                    {
+                        "paused": False,
+                        "breach_started_at": None,
+                        "notification_pending": False,
+                        "last_attempt_at": _timestamp(now),
+                    },
+                )
+                continue
+            assert percentage is not None
+            source_text = _timestamp(source_checked_at)
+            previous_source = _lp_share_datetime(alert.get("last_share_checked_at"))
+            if previous_source is not None and source_checked_at < previous_source:
+                save_watch_fields(
+                    condition_id,
+                    {
+                        "paused": False,
+                        "breach_started_at": None,
+                        "notification_pending": False,
+                        "last_attempt_at": _timestamp(now),
+                    },
+                )
+                continue
+            source_advanced = previous_source is None or source_checked_at > previous_source
+            source_gap = (
+                source_advanced
+                and previous_source is not None
+                and (source_checked_at - previous_source).total_seconds()
+                >= LP_REWARD_SHARE_STALE_SECONDS
+            )
+            update: dict[str, object] = {
+                "paused": False,
+                "last_share_checked_at": source_text,
+                "last_share_percentage": percentage,
+                "market_title": order_titles.get(condition_id)
+                or observation_titles.get(condition_id)
+                or alert.get("market_title")
+                or condition_id,
+                "last_attempt_at": _timestamp(now),
+            }
+            if first_seen.get(condition_id):
+                # An unfinished breach, including a pending unsent delivery,
+                # belongs to the prior service process; restart must establish
+                # a new source-timestamp window. A successful event remains
+                # represented by notification_sent below.
+                alert = {
+                    **alert,
+                    "breach_started_at": None,
+                    "notification_pending": False,
+                }
+            if percentage <= LP_REWARD_SHARE_TARGET_MAX:
+                update.update(
+                    {
+                        "breach_started_at": None,
+                        "notification_pending": False,
+                        "notification_sent": False,
+                    }
+                )
+            else:
+                breach_started_at = _lp_share_datetime(alert.get("breach_started_at"))
+                if source_gap:
+                    breach_started_at = None
+                if breach_started_at is None:
+                    breach_started_at = source_checked_at
+                update["breach_started_at"] = _timestamp(breach_started_at)
+                if alert.get("notification_sent") is True:
+                    update["notification_pending"] = False
+                elif source_advanced and (
+                    source_checked_at - breach_started_at
+                ).total_seconds() >= LP_SHARE_WATCH_DURATION_SECONDS:
+                    update["notification_pending"] = True
+                    title = "LP 份额预警"
+                    market_title = str(
+                        order_titles.get(condition_id)
+                        or observation_titles.get(condition_id)
+                        or alert.get("market_title")
+                        or condition_id
+                    )
+                    message = "\n".join(
+                        (
+                            f"市场：{market_title}。",
+                            f"当前奖励份额 {percentage.normalize():f}%，目标区间 5%–8%，已连续超过 8% 至少一分钟。",
+                            f"数据时间：北京时间 {beijing_clock(source_checked_at, seconds=True) or '未知'}。",
+                        )
+                    )
+                    pending_notifications.append(
+                        (condition_id, title, message, source_text, source_checked_at)
+                    )
+            save_watch_fields(condition_id, update)
+
+        for (
+            condition_id,
+            title,
+            message,
+            source_text,
+            source_checked_at,
+        ) in pending_notifications:
+            if stop_event is not None and stop_event.is_set():
+                break
+            latest = self.lp_share_watch_state().get(condition_id, {})
+            if (
+                latest.get("enabled") is not True
+                or latest.get("paused") is True
+                or latest.get("notification_pending") is not True
+                or latest.get("last_share_checked_at") != source_text
+            ):
+                continue
+            with self._lp_share_watch_notification_lock:
+                latest = self.lp_share_watch_state().get(condition_id, {})
+                if (
+                    latest.get("enabled") is not True
+                    or latest.get("paused") is True
+                    or latest.get("notification_pending") is not True
+                    or latest.get("last_share_checked_at") != source_text
+                ):
+                    continue
+                if stop_event is not None and stop_event.is_set():
+                    break
+                send_now = _utc_now()
+                source_age = (
+                    send_now - source_checked_at.astimezone(UTC)
+                ).total_seconds()
+                order_age = (
+                    send_now - snapshot_checked_at.astimezone(UTC)
+                ).total_seconds()
+                if not (
+                    0 <= source_age < LP_REWARD_SHARE_STALE_SECONDS
+                    and 0 <= order_age < LP_REWARD_SHARE_STALE_SECONDS
+                ):
+                    save_watch_fields(
+                        condition_id,
+                        {
+                            "paused": False,
+                            "breach_started_at": None,
+                            "notification_pending": False,
+                            "last_attempt_at": _timestamp(send_now),
+                        },
+                    )
+                    continue
+                if stop_event is not None and stop_event.is_set():
+                    break
+                attempts = send_notification_with_results(
+                    self._notifier,
+                    title,
+                    message,
+                    channels={"xiaoai"},
+                )
+            succeeded = any(
+                getattr(attempt, "channel", "") == "xiaoai"
+                and getattr(attempt, "success", False) is True
+                for attempt in attempts
+            )
+            attempt = next(
+                (
+                    attempt
+                    for attempt in attempts
+                    if getattr(attempt, "channel", "") == "xiaoai"
+                ),
+                None,
+            )
+            attempt_payload = {
+                "success": succeeded,
+                "suppressed": bool(
+                    getattr(attempt, "suppressed", False) if attempt is not None else False
+                ),
+                "error_type": str(
+                    getattr(attempt, "error_type", "not_attempted")
+                    if attempt is not None
+                    else "not_attempted"
+                ),
+                "error": str(getattr(attempt, "error", "") if attempt is not None else ""),
+                    "checked_at": _timestamp(send_now),
+                }
+            save_watch_fields(
+                condition_id,
+                {
+                    "notification_pending": not succeeded,
+                    "notification_sent": succeeded
+                    or latest.get("notification_sent") is True,
+                    "notification_channels": {"xiaoai": attempt_payload},
+                    "last_notification_attempt": attempt_payload,
+                    "last_notification_attempt_at": _timestamp(send_now),
+                    "last_notification_success_at": (
+                        _timestamp(send_now)
+                        if succeeded
+                        else latest.get("last_notification_success_at")
+                    ),
+                },
+            )
+        return {
+            "state": "ready",
+            "checked_at": _timestamp(now),
+            "observations": observations_reader(account_id),
+        }
 
     def _update_lp_risk_alerts(
         self,
@@ -837,6 +1437,12 @@ class PredictionExecutionService:
     def _lp_reward_share_projection(
         self, condition_ids: tuple[str, ...]
     ) -> dict[str, dict[str, object]]:
+        with self._lp_reward_percentage_lock:
+            return self._lp_reward_share_projection_locked(condition_ids)
+
+    def _lp_reward_share_projection_locked(
+        self, condition_ids: tuple[str, ...]
+    ) -> dict[str, dict[str, object]]:
         reader = getattr(self._trading, "lp_reward_percentages", None)
         if not callable(reader):
             raw_result: Mapping[str, object] = {}
@@ -857,7 +1463,7 @@ class PredictionExecutionService:
                     result = None
                 raw_result = result if isinstance(result, Mapping) else {}
                 self._lp_reward_percentage_cache = {
-                    "sampled_at": sampled_at,
+                    "sampled_at": self._clock(),
                     "result": raw_result,
                 }
 
@@ -884,7 +1490,7 @@ class PredictionExecutionService:
             and bool(maker_address.strip())
             and maker_matches
         )
-        now = datetime.now(UTC)
+        now = _utc_now()
         result_age = (
             (now - result_checked_at.astimezone(UTC)).total_seconds()
             if result_checked_at is not None
@@ -893,12 +1499,14 @@ class PredictionExecutionService:
         result_is_fresh = (
             result_is_known
             and result_age is not None
-            and 0 <= result_age <= LP_REWARD_SHARE_STALE_SECONDS
+            and 0 <= result_age < LP_REWARD_SHARE_STALE_SECONDS
         )
         result_checked_text = (
             _timestamp(result_checked_at) if result_checked_at is not None else None
         )
         projections: dict[str, dict[str, object]] = {}
+        persisted_loaded = False
+        persisted_observations: Mapping[str, object] = {}
         for condition_id in condition_ids:
             previous = self._lp_reward_share_observations.get(condition_id)
             raw_percentage = percentages.get(condition_id) if isinstance(percentages, Mapping) else None
@@ -939,10 +1547,14 @@ class PredictionExecutionService:
                             if previous is None or previous.get("percentage") is None
                             else percentage - previous["percentage"]
                         )
+                        target_status, target_delta = _lp_share_target(percentage)
                         observation = {
                             "condition_id": condition_id,
                             "percentage": percentage,
                             "reference_share_percentage": LP_REWARD_REFERENCE_PERCENTAGE,
+                            "target_share_percentage": LP_REWARD_SHARE_TARGET_MAX,
+                            "target_status": target_status,
+                            "target_delta_percentage_points": target_delta,
                             "delta_percentage_points": delta,
                             "checked_at": result_checked_text,
                             "last_success_at": result_checked_text,
@@ -961,7 +1573,46 @@ class PredictionExecutionService:
                     continue
 
             self._lp_reward_share_active[condition_id] = False
-            historical = previous if isinstance(previous, Mapping) else {}
+            historical = dict(previous) if isinstance(previous, Mapping) else {}
+            if not historical and not persisted_loaded:
+                persisted_loaded = True
+                account_id = self._lp_account_id()
+                observations_reader = getattr(self._store, "lp_observations", None)
+                if account_id is not None and callable(observations_reader):
+                    try:
+                        saved = observations_reader(account_id)
+                    except Exception:
+                        saved = {}
+                    if isinstance(saved, Mapping):
+                        persisted_observations = saved
+            if not historical:
+                saved_observation = persisted_observations.get(condition_id)
+                saved_share = (
+                    saved_observation.get("share_alert")
+                    if isinstance(saved_observation, Mapping)
+                    else None
+                )
+                saved_percentage = (
+                    _decimal(saved_share.get("last_share_percentage"))
+                    if isinstance(saved_share, Mapping)
+                    else None
+                )
+                saved_checked_at = (
+                    _lp_share_datetime(saved_share.get("last_share_checked_at"))
+                    if isinstance(saved_share, Mapping)
+                    else None
+                )
+                if (
+                    saved_percentage is not None
+                    and Decimal("0") <= saved_percentage <= Decimal("100")
+                    and saved_checked_at is not None
+                ):
+                    saved_checked_text = _timestamp(saved_checked_at)
+                    historical = {
+                        "percentage": saved_percentage,
+                        "checked_at": saved_checked_text,
+                        "last_success_at": saved_checked_text,
+                    }
             reason = (
                 "reward_share_replay_older"
                 if older_replay
@@ -976,6 +1627,9 @@ class PredictionExecutionService:
                 "state": "unknown",
                 "percentage": historical.get("percentage"),
                 "reference_share_percentage": LP_REWARD_REFERENCE_PERCENTAGE,
+                "target_share_percentage": LP_REWARD_SHARE_TARGET_MAX,
+                "target_status": "unknown",
+                "target_delta_percentage_points": None,
                 "delta_percentage_points": None,
                 "checked_at": historical.get("checked_at"),
                 "last_success_at": historical.get("last_success_at"),
@@ -1298,6 +1952,7 @@ class PredictionExecutionService:
                     "authenticated": True,
                     "open_orders_complete": snapshot.get("open_orders_complete") is True,
                     "positions_complete": snapshot.get("positions_complete") is True,
+                    "lp_share_watch_state": self.lp_share_watch_state(),
                     "lp_observations": _project_lp_observations(
                         stored_observations,
                         orders=orders,
@@ -1381,6 +2036,7 @@ class PredictionExecutionService:
                         **candidate_projection,
                         "state": "stale",
                         "stale": True,
+                        "lp_share_watch_state": self.lp_share_watch_state(),
                     }
                 return {
                     "state": "unknown",
@@ -1397,6 +2053,7 @@ class PredictionExecutionService:
                     "positions_complete": False,
                     "last_success_at": None,
                     "stale": True,
+                    "lp_share_watch_state": self.lp_share_watch_state(),
                     "lp_observations": {},
                     "lp_session": self.lp_status(),
                 }

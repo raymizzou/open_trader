@@ -1108,6 +1108,50 @@ class PolymarketTradingClient:
             "positions_complete": positions_complete,
         }
 
+    def lp_open_orders_snapshot(self) -> dict[str, object]:
+        """Read only authenticated open-order facts for the LP share watcher."""
+
+        checked_at = datetime.now(UTC)
+        try:
+            orders = tuple(_collect(self._client.list_open_orders()))
+        except Exception:
+            return {
+                "authenticated": False,
+                "open_orders": (),
+                "open_orders_complete": False,
+                "checked_at": checked_at,
+            }
+        order_rows: list[dict[str, object]] = []
+        complete = True
+        for order in orders:
+            raw = _model_dict(order)
+            row = _lp_order(order)
+            if raw is None or row is None:
+                complete = False
+                continue
+            original_size = _lp_decimal(raw.get("original_size", raw.get("size")))
+            matched_size = _lp_decimal(raw.get("size_matched", raw.get("matched_amount")))
+            if (
+                not row.get("condition_id")
+                or not row.get("token_id")
+                or row.get("side") not in {"BUY", "SELL"}
+                or not row.get("status")
+                or _lp_decimal(raw.get("price")) is None
+                or original_size is None
+                or matched_size is None
+                or original_size < 0
+                or matched_size < 0
+            ):
+                complete = False
+            order_rows.append(row)
+        return {
+            "authenticated": True,
+            "wallet_address": self.config.wallet_address,
+            "open_orders": tuple(order_rows),
+            "open_orders_complete": complete,
+            "checked_at": checked_at,
+        }
+
     def lp_account_trades(
         self,
         condition_ids: Sequence[str],

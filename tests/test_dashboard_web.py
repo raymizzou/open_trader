@@ -19220,55 +19220,57 @@ const baseDashboard = {
 };
 const share = (value, severity, historical=false) => ({
   condition_id:"condition-a",state:historical ? "unknown" : "known",percentage:String(value),
-  reference_share_percentage:"5",delta_percentage_points:value === 7.5 ? "2.5" : "0",
+  reference_share_percentage:"5",
+  target_delta_percentage_points:value === 4.8 ? "0.2" : value === 8.000001 ? "0.000001" : "0",
   checked_at:checkedAt,last_success_at:checkedAt,severity,historical,stale:historical,
 });
 const render = (rewardShare) => predictionLpCard({lp_dashboard:{...baseDashboard,reward_shares:{"condition-a":rewardShare}}});
-Date.now = () => Date.parse(checkedAt) + 30 * 1000;
-const warning = render(share(7.5,"warning"));
-const critical = render(share(10,"critical"));
+Date.now = () => Date.parse(checkedAt) + 29_999;
+const warning = render(share(4.8,"space"));
+const critical = render(share(8.000001,"excess"));
 const recovery = render(share(5,"normal"));
 const historical = render(share(7.5,"unknown",true));
-Date.now = () => Date.parse(checkedAt) + 181 * 1000;
-const expired = render(share(7.5,"warning"));
+Date.now = () => Date.parse(checkedAt) + 30 * 1000;
+const expired = render(share(4.8,"space"));
 console.log(JSON.stringify({warning,critical,recovery,historical,expired}));
 ''')
     rendered = json.loads(output)
     warning = rendered["warning"]
-    assert warning.count("奖励份额警告") == 1
-    assert '<span class="pm-pill watch">奖励份额警告</span><span class="sub">实际 7.5%' in warning
-    assert "参考 5%" in warning
-    assert "实际 7.5%" in warning
-    assert "+2.5" in warning
+    assert warning.count("还有空间 0.2 个百分点") == 1
+    assert '<span class="pm-pill">还有空间 0.2 个百分点</span><span class="sub">实际 4.8%' in warning
+    assert "实际 4.8%" in warning
+    assert "还有空间 0.2 个百分点" in warning
     assert "2026-09-16 08:00:00" in warning
     assert "Reference market" not in warning
     assert "风控通过标的（0）" in warning
     assert "剩余 15" in warning and "剩余 10" in warning
     assert warning.count(" · 买入 · ") == 2
     assert warning.count("LP duplicate market") >= 2
-    assert warning.count("奖励份额警告") == 1
+    assert warning.count("还有空间 0.2 个百分点") == 1
 
     critical = rendered["critical"]
-    assert critical.count("奖励份额严重") == 1
-    assert '<span class="pm-pill pm-clock-danger">奖励份额严重</span><span class="sub">实际 10%' in critical
+    assert critical.count("份额超额 0.000001 个百分点") == 1
+    assert '<span class="pm-pill watch">⚠ 份额超额 0.000001 个百分点</span><span class="sub">实际 8.000001%' in critical
     assert 'pm-pill watch pm-clock-danger' not in critical
-    assert "实际 10%" in critical
+    assert "实际 8.000001%" in critical
 
     recovery = rendered["recovery"]
     assert "实际 5%" in recovery
-    assert "奖励份额警告" not in recovery
-    assert "奖励份额严重" not in recovery
+    assert "已达目标" in recovery
+    assert "还有空间" not in recovery
+    assert "份额超额" not in recovery
 
     historical = rendered["historical"]
-    assert "历史" in historical
+    assert "上次值 7.5%" in historical
     assert "UNKNOWN" in historical
-    assert "奖励份额警告" not in historical
-    assert "奖励份额严重" not in historical
+    assert "还有空间" not in historical
+    assert "份额超额" not in historical
 
     expired = rendered["expired"]
-    assert "历史" in expired or "UNKNOWN" in expired
-    assert "奖励份额警告" not in expired
-    assert "奖励份额严重" not in expired
+    assert "上次值 4.8%" in expired
+    assert "奖励份额暂不可判断" in expired
+    assert "还有空间" not in expired
+    assert "份额超额" not in expired
     action_markup = " ".join(re.findall(r"<(?:button|a)\b[^>]*>.*?</(?:button|a)>", warning, flags=re.S))
     assert all(action not in action_markup for action in ("创建订单", "取消订单", "调整数量", "通知"))
     warning_visible = re.sub(r"<details[\s\S]*?</details>", "", warning)
@@ -19276,8 +19278,8 @@ console.log(JSON.stringify({warning,critical,recovery,historical,expired}));
     assert "试挂基准 0.25%／小时" in warning_visible
     assert "YES 10% · $6.00" in warning_visible
     assert "NO 12% · $7.20" in warning_visible
-    assert warning_visible.count("奖励份额警告") == 1
-    assert "实际 7.5%" in warning_visible
+    assert warning_visible.count("还有空间 0.2 个百分点") == 1
+    assert "实际 4.8%" in warning_visible
 
     polling_output = run_dashboard_js(r'''
 const checkedAt = "2026-09-16T00:00:00Z";
@@ -19362,7 +19364,7 @@ await drainRequests();
 const timer = [...intervals.values()].find(({delay})=>delay===5000);
 if (!timer || intervals.size !== 1) throw new Error("expected one 5000ms prediction timer");
 
-nowMillis = sourceMillis + 30 * 1000;
+    nowMillis = sourceMillis + 29_999;
 const firstPoll = timer.callback();
 await drainRequests();
 const atThirtyHtml = nodes["prediction-market-root"].innerHTML;
@@ -19405,11 +19407,177 @@ console.log(JSON.stringify({
     assert polling["lpInFlightAtExpiry"] is True
     assert polling["venuesInFlightAtExpiry"] is True
     assert polling["readOnly"] is True
-    assert polling["atThirtyHtml"].count("奖励份额警告") == 1
+    assert polling["atThirtyHtml"].count("已达目标") == 1
     assert "剩余 15" in polling["atThirtyHtml"]
     assert "买入" in polling["atThirtyHtml"]
     assert "UNKNOWN" in polling["atExpiryHtml"] or "历史" in polling["atExpiryHtml"]
-    assert "奖励份额警告" not in polling["atExpiryHtml"]
-    assert "奖励份额严重" not in polling["atExpiryHtml"]
+    assert "还有空间" not in polling["atExpiryHtml"]
+    assert "份额超额" not in polling["atExpiryHtml"]
     assert "剩余 15" in polling["atExpiryHtml"]
     assert "买入" in polling["atExpiryHtml"]
+
+
+def test_lp_share_watch_controls_and_status_render_in_existing_table() -> None:
+    output = run_dashboard_js(r'''
+const checkedAt = "2026-09-17T00:00:00Z";
+const baseDashboard = {
+  state: "ready", stale: false, complete: true, checked_at: checkedAt,
+  lp_orders_today: [
+    {order_id:"a-filled",condition_id:"condition-a",token_id:"token-a-yes",market_title:"Market A",outcome:"YES",side:"BUY",price:"0.40",quantity:"20",filled_quantity:"20",remaining_quantity:"0",state:"filled",status:"MATCHED"},
+    {order_id:"a-open",condition_id:"condition-a",token_id:"token-a-no",market_title:"Market A",outcome:"NO",side:"BUY",price:"0.45",quantity:"10",filled_quantity:"0",remaining_quantity:"10",state:"open",status:"LIVE"},
+    {order_id:"b-open",condition_id:"condition-b",token_id:"token-b-yes",market_title:"Market B",outcome:"YES",side:"BUY",price:"0.50",quantity:"12",filled_quantity:"2",remaining_quantity:"10",state:"open",status:"LIVE"},
+  ],
+  market_rewards: {},
+  reward_shares: {
+    "condition-a": {condition_id:"condition-a",state:"known",percentage:"4.8",reference_share_percentage:"5",target_status:"space",target_delta_percentage_points:"0.2",checked_at:checkedAt,last_success_at:checkedAt},
+    "condition-b": {condition_id:"condition-b",state:"known",percentage:"8",reference_share_percentage:"5",target_status:"target",target_delta_percentage_points:"0",checked_at:checkedAt,last_success_at:checkedAt},
+  },
+  lp_observations: {
+    "condition-a": {state:"known",current_hourly_reward_usd:"0.108",occupied_capital_usd:"60",current_yield_pct_per_hour:"0.18",risk_state:"warning",risk_warning:true,add_room:{available:false,reason:"risk_warning"},risk_directions:[{outcome:"YES",state:"known",warning:true,risk_principal:"60",stress_loss:"6",loss_ratio:"0.1",checked_at:checkedAt},{outcome:"NO",state:"known",warning:true,risk_principal:"60",stress_loss:"7.2",loss_ratio:"0.12",checked_at:checkedAt}],checked_at:checkedAt},
+    "condition-b": {state:"known",current_hourly_reward_usd:"0.2",occupied_capital_usd:"70",current_yield_pct_per_hour:"0.2",risk_state:"known",risk_warning:false,add_room:{available:true},risk_directions:[],checked_at:checkedAt},
+  },
+  lp_share_watch_state: {
+    "condition-a": {enabled:false,paused:false},
+    "condition-b": {enabled:false,paused:false},
+    "condition-saved": {enabled:true,paused:true,market_title:"Saved market",last_share_percentage:"8.5",last_share_checked_at:checkedAt},
+  },
+  recommendations: [], lp_session:{state:"none"}, non_lp_row_count:0,
+};
+const render = (dashboard = baseDashboard) => predictionLpCard({lp_dashboard: dashboard});
+const count = (value, pattern) => (value.match(pattern) || []).length;
+const RealDate = Date;
+let now = RealDate.parse(checkedAt);
+globalThis.Date = class extends RealDate {
+  constructor(...args) { args.length ? super(...args) : super(now); }
+  static now() { return now; }
+};
+
+const initial = render();
+const controlsFor = (html, conditionId) => count(
+  html,
+  new RegExp('data-condition-id="' + conditionId + '"', 'g'),
+);
+const controlState = (html, conditionId) => {
+  const match = html.match(new RegExp(
+    '<div class="pm-lp-share-watch" data-lp-share-watch-active="(true|false)">[\\s\\S]*?'
+      + 'data-condition-id="' + conditionId + '"[\\s\\S]*?</div>',
+  ));
+  return match && match[1];
+};
+const currentAt29 = () => {
+  now = RealDate.parse(checkedAt) + 29999;
+  return render();
+};
+const expiredAt30 = () => {
+  now = RealDate.parse(checkedAt) + 30000;
+  return render();
+};
+const share = (percentage, status, delta) => ({
+  condition_id:"condition-a", state:"known", percentage:String(percentage),
+  reference_share_percentage:"5", target_status:status,
+  target_delta_percentage_points:delta, checked_at:checkedAt,
+  last_success_at:checkedAt,
+});
+const low = render({...baseDashboard, reward_shares:{"condition-a":share("4.8","space","0.2")} });
+const metFive = render({...baseDashboard, reward_shares:{"condition-a":share("5","target","0")} });
+const metEight = render({...baseDashboard, reward_shares:{"condition-a":share("8","target","0")} });
+const excess = render({...baseDashboard, reward_shares:{"condition-a":share("8.000001","excess","0.000001")} });
+const current = currentAt29();
+const expired = expiredAt30();
+
+state.workspaceView = "prediction_market";
+state.predictionMarket.activeTab = "lp";
+state.predictionMarket.csrfToken = "csrf-token";
+state.predictionMarket.lpDashboard = {...baseDashboard};
+state.predictionMarket.lpDashboardError = "";
+elements["prediction-market-root"] = {innerHTML:"", querySelector(){return null;}};
+const requests = [];
+let postMode = "success";
+let deferredGet = false;
+let resolveDeferredGet;
+const response = (payload, ok = true, status = 200) => ({ok, status, json: async () => payload});
+globalThis.fetch = async (url, options = {}) => {
+  const request = {url:String(url), method:String(options.method || "GET"), body:String(options.body || ""), headers:options.headers || {}};
+  requests.push(request);
+  if (request.method === "POST") {
+    if (postMode === "failure") return response({message:"保存失败"}, false, 503);
+    const body = JSON.parse(request.body);
+    const enabled = body.enabled === true;
+    return response({state:enabled ? "enabled" : "disabled", condition_id:body.condition_id, enabled,
+      share_alert:{enabled, paused:false}});
+  }
+  if (deferredGet) return new Promise((resolve) => { resolveDeferredGet = resolve; });
+  return response({...baseDashboard});
+};
+const checkbox = (conditionId, checked) => ({
+  checked, dataset:{conditionId},
+  closest(selector) { return selector === "[data-lp-share-watch]" ? this : null; },
+});
+const saveRequest = async (conditionId, checked) => {
+  const target = checkbox(conditionId, checked);
+  await handlePredictionMarketChange({target});
+};
+await saveRequest("condition-a", true);
+const successRequest = requests.find((request) => request.method === "POST");
+const afterSuccess = state.predictionMarket.lpDashboard;
+postMode = "failure";
+await saveRequest("condition-a", false);
+const afterFailure = elements["prediction-market-root"].innerHTML;
+deferredGet = true;
+const oldGet = fetchPredictionLpDashboard();
+await Promise.resolve();
+await Promise.resolve();
+postMode = "success";
+await saveRequest("condition-a", false);
+resolveDeferredGet(response({...baseDashboard, lp_share_watch_state:{...baseDashboard.lp_share_watch_state,
+  "condition-a":{enabled:true,paused:false}}}));
+await oldGet;
+const afterRace = state.predictionMarket.lpDashboard;
+console.log(JSON.stringify({
+  controlCount:count(initial, /type="checkbox"/g),
+  controlA:controlsFor(initial,"condition-a"),
+  controlB:controlsFor(initial,"condition-b"),
+  savedControl:controlsFor(initial,"condition-saved"),
+  hasWatchLabel:initial.includes("份额预警") && initial.includes("5%–8%"),
+  aggregateActive:controlState(initial, "condition-a") === "true",
+  pausedSaved:initial.includes("Saved market") && initial.includes("已暂停"),
+  noFabricatedSavedRow:(initial.indexOf("Saved market") > initial.indexOf("</table>")),
+  low:low.includes("还有空间 0.2 个百分点"),
+  metFive:metFive.includes("已达目标"),
+  metEight:metEight.includes("已达目标"),
+  excess:excess.includes("份额超额 0.000001 个百分点") && excess.includes("⚠"),
+  current:current.includes("实际 4.8%") && current.includes("还有空间"),
+  expired:expired.includes("暂不可判断") && expired.includes("上次值 4.8%") && !expired.includes("还有空间"),
+  riskPreserved:initial.includes("当前 0.18%／小时") && initial.includes("YES 10% · $6.00"),
+  successBody:successRequest && successRequest.body === JSON.stringify({condition_id:"condition-a",enabled:true}),
+  csrf:successRequest && successRequest.headers["X-CSRF-Token"] === "csrf-token",
+  successChecked:afterSuccess.lp_share_watch_state["condition-a"].enabled === true,
+  failureKeepsChecked:/<input[^>]*data-condition-id="condition-a"[^>]*checked/.test(afterFailure)
+    && !/<input[^>]*data-condition-id="condition-a"[^>]*disabled/.test(afterFailure)
+    && !/<input[^>]*data-condition-id="condition-a"[^>]*aria-busy/.test(afterFailure)
+    && afterFailure.includes("保存失败"),
+  raceKeepsConfirmed:afterRace.lp_share_watch_state["condition-a"].enabled === false,
+  getOnlyNoPost:false,
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["controlCount"] == 3
+    assert rendered["controlA"] == 1
+    assert rendered["controlB"] == 1
+    assert rendered["savedControl"] == 1
+    assert rendered["hasWatchLabel"] is True
+    assert rendered["aggregateActive"] is True
+    assert rendered["pausedSaved"] is True
+    assert rendered["noFabricatedSavedRow"] is True
+    assert rendered["low"] is True
+    assert rendered["metFive"] is True
+    assert rendered["metEight"] is True
+    assert rendered["excess"] is True
+    assert rendered["current"] is True
+    assert rendered["expired"] is True
+    assert rendered["riskPreserved"] is True
+    assert rendered["successBody"] is True
+    assert rendered["csrf"] is True
+    assert rendered["successChecked"] is True
+    assert rendered["failureKeepsChecked"] is True
+    assert rendered["raceKeepsConfirmed"] is True

@@ -79,6 +79,7 @@ _CROSS_VENUE_START_TIMEOUT = 5
 _DEFAULT_HOLDING_RECONCILER = object()
 _LP_TICK_SECONDS = 1.0
 _LP_REWARD_SECONDS = 60.0
+_LP_SHARE_WATCH_SECONDS = 10.0
 _LP_HISTORY_SECONDS = 3600.0
 _LP_BOOK_SAMPLE_SECONDS = 5.0
 # One in-flight request may consume the installed SDK's bounded connect/read/
@@ -439,9 +440,11 @@ class PredictionRuntime:
         self._history_initial_done = threading.Event()
         self._history_thread: threading.Thread | None = None
         self._reward_stop_event = threading.Event()
+        self._lp_share_stop_event = threading.Event()
         self._lp_candidate_refresh_requested = threading.Event()
         self._candidate_thread: threading.Thread | None = None
         self._reward_thread: threading.Thread | None = None
+        self._lp_share_thread: threading.Thread | None = None
 
     @property
     def state(self) -> str:
@@ -833,6 +836,7 @@ class PredictionRuntime:
             self._start_history_monitor()
             self._start_candidate_monitor()
             self._start_reward_monitor()
+            self._start_lp_share_watch()
             self._state = "RUNNING"
             logger.info(
                 "prediction_runtime_state state=RUNNING pid=%s data_dir=%s",
@@ -940,6 +944,35 @@ class PredictionRuntime:
             daemon=True,
         )
         self._reward_thread.start()
+
+    def _start_lp_share_watch(self) -> None:
+        """Refresh selected LP share watches on an independent short loop."""
+
+        if self.execution is None or self._lp_share_thread is not None:
+            return
+        self._lp_share_stop_event.clear()
+
+        def run() -> None:
+            while not self._lp_share_stop_event.is_set():
+                execution = self.execution
+                if execution is None:
+                    return
+                refresh_watch = getattr(execution, "refresh_lp_share_watch", None)
+                if not callable(refresh_watch):
+                    return
+                try:
+                    refresh_watch(stop_event=self._lp_share_stop_event)
+                except Exception:
+                    logger.exception("prediction_lp_share_watch_refresh_failed")
+                if self._lp_share_stop_event.wait(_LP_SHARE_WATCH_SECONDS):
+                    return
+
+        self._lp_share_thread = threading.Thread(
+            target=run,
+            name="prediction-lp-share-watch",
+            daemon=True,
+        )
+        self._lp_share_thread.start()
 
     def _start_candidate_monitor(self) -> None:
         """Refresh LP candidates independently from rewards and observations."""
@@ -1265,6 +1298,7 @@ class PredictionRuntime:
         errors: list[BaseException] = []
         uncertain_thread = False
         self._reward_stop_event.set()
+        self._lp_share_stop_event.set()
         self._history_stop_event.set()
         self._history_initial_done.set()
         self._lp_candidate_refresh_requested.set()
@@ -1304,6 +1338,14 @@ class PredictionRuntime:
                 uncertain_thread = True
             else:
                 self._reward_thread = None
+        lp_share_thread = self._lp_share_thread
+        if lp_share_thread is not None:
+            lp_share_thread.join(timeout=_LP_REWARD_STOP_GRACE_SECONDS)
+            if lp_share_thread.is_alive():
+                errors.append(RuntimeError("prediction LP share watch thread did not stop"))
+                uncertain_thread = True
+            else:
+                self._lp_share_thread = None
         lp_thread = self._lp_thread
         if lp_thread is not None:
             lp_thread.join(timeout=5)
@@ -1387,6 +1429,10 @@ class PredictionRuntime:
             if reward_thread.is_alive():
                 return errors
             self._reward_thread = None
+        if lp_share_thread is not None:
+            if lp_share_thread.is_alive():
+                return errors
+            self._lp_share_thread = None
         if history_thread is not None:
             if history_thread.is_alive():
                 return errors

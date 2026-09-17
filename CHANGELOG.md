@@ -12,6 +12,22 @@ operator-facing: what changed, which workflow is affected, and what was verified
   projections alongside the exact seven-case Docker batch (`7 passed`); no
   live calls, orders or deployment were performed.
 
+- Added opt-in LP share monitoring to the existing LP table and protected
+  dashboard projection. The account-level `GET /rewards/user/percentages`
+  observation is scoped by condition and maker, uses the 5%–8% target range,
+  strict `>8%` yellow status, 10-second samples, `<30s` source freshness and a
+  60-second continuous Xiaoai breach before one delivery per episode; Beijing
+  23:00–08:00 remains quiet, with UNKNOWN/restart/pause/recovery continuity
+  preserved. Failed saves remain retryable and late dashboard reads cannot
+  overwrite a confirmed selection. Verified by the case6 Dashboard RED/GREEN
+  check and the required final16 Docker regression batch (`16 passed`); no
+  live calls, notifications, orders or deployment were performed.
+  Follow-up review repairs now reject stale, future or mismatched-wallet
+  enable snapshots, timestamp the share cache on read completion, project a
+  durable OFF state through cached account failures, and retain persisted
+  historical share data after restart; the current-tree repair selectors and
+  final16 batch pass (`16 passed`).
+
 - Retired the prediction monitor's every-second full-snapshot rewrite of the
   `runtime` SQLite table (it drove ~5 MB/s WAL growth; a production WAL once
   ballooned to 19 GB and its lock storms were misreported to Feishu as
