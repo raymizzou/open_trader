@@ -3495,7 +3495,7 @@ def test_lp_runtime_stops_obsolete_sampling_and_keeps_exposure_risk(
             store,
             trading,
             owner_lock=owner_lock,
-            clock=lambda: now[0],
+            clock=lambda: now,
         ),
     )
     monkeypatch.setattr(runtime_module, "_LP_TICK_SECONDS", 0.01)
@@ -3520,22 +3520,18 @@ def test_lp_runtime_stops_obsolete_sampling_and_keeps_exposure_risk(
         assert runtime.lp is not None
         assert runtime.execution is not None
         assert history_started.wait(timeout=2)
-        assert candidate_scan_seen.wait(timeout=2)
         preparing = runtime.lp.candidate_snapshot()
         deadline = time.monotonic() + 2
-        preparing_funnel = preparing.get("funnel")
         while (
-            not isinstance(preparing_funnel, Mapping)
-            or "catalog_read" not in preparing_funnel
+            preparing.get("retention_reason") is None
         ) and time.monotonic() < deadline:
             time.sleep(0.01)
             preparing = runtime.lp.candidate_snapshot()
-            preparing_funnel = preparing.get("funnel")
-        assert isinstance(preparing_funnel, Mapping)
-        assert preparing_funnel["catalog_read"] == 1
-        assert preparing_funnel["base_pass"] == 1
-        assert preparing_funnel["volatility_pass"] == 0
+        assert preparing.get("retention_reason") == "catalog_preparation_pending"
+        assert preparing["recommendations"] == []
+        assert preparing["selected_results"] == []
         assert preparing["selected_market_ids"] == []
+        assert not candidate_scan_seen.is_set()
 
         runtime.store.lp_create_session(
             "exposure-session",

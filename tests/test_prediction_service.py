@@ -1489,6 +1489,14 @@ def test_lp_dashboard_account_outage_keeps_newer_public_funnel(tmp_path: Path) -
     assert [
         row["daily_pool_usd"] for row in stale_dashboard["selected_results"]
     ] == ["90", "80"]
+    assert [
+        row["reference_share_percentage"]
+        for row in stale_dashboard["selected_results"]
+    ] == [Decimal("5"), Decimal("5")]
+    assert [
+        row["reference_daily_reward_usd"]
+        for row in stale_dashboard["selected_results"]
+    ] == [Decimal("4.5"), Decimal("4")]
     assert all(
         row["directions"]["YES"]["state"] == "unknown"
         for row in stale_dashboard["selected_results"]
@@ -1536,6 +1544,14 @@ def test_lp_dashboard_account_outage_keeps_newer_public_funnel(tmp_path: Path) -
         row["daily_pool_usd"]
         for row in repeated_stale_dashboard["selected_results"]
     ] == ["90", "80"]
+    assert [
+        row["reference_share_percentage"]
+        for row in repeated_stale_dashboard["selected_results"]
+    ] == [Decimal("5"), Decimal("5")]
+    assert [
+        row["reference_daily_reward_usd"]
+        for row in repeated_stale_dashboard["selected_results"]
+    ] == [Decimal("4.5"), Decimal("4")]
     assert all(
         row["directions"]["YES"]["state"] == "unknown"
         for row in repeated_stale_dashboard["selected_results"]
@@ -3276,29 +3292,65 @@ def test_lp_dashboard_reward_share_thresholds_are_market_scoped(
     account = Account()
     service._trading = account
     checked_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    guide_checked_at = datetime.now(UTC)
+    guide_expires_at = guide_checked_at + timedelta(hours=1)
+    valid_recommendation = {
+        "condition_id": "condition-rec",
+        "market_id": "market-rec",
+        "market_title": "Reference market",
+        "daily_pool_usd": Decimal("99"),
+        "state": "eligible",
+        "directions": {
+            "YES": {
+                "condition_id": "condition-rec",
+                "market_id": "market-rec",
+                "token_id": "rec-yes",
+                "outcome": "YES",
+                "state": "eligible",
+                "eligible": True,
+                "reason_codes": [],
+                "guidance": {
+                    "condition_id": "condition-rec",
+                    "market_id": "market-rec",
+                    "token_id": "rec-yes",
+                    "outcome": "YES",
+                    "price": Decimal("0.50"),
+                    "quantity": Decimal("20"),
+                    "required_capital": Decimal("10"),
+                    "estimated_exit_loss": Decimal("0.20"),
+                    "estimated_exit_loss_ratio": Decimal("0.02"),
+                    "checked_at": guide_checked_at,
+                    "expires_at": guide_expires_at,
+                },
+            }
+        },
+    }
+    unknown_recommendation = {
+        "condition_id": "condition-no-pool",
+        "market_id": "market-no-pool",
+        "daily_pool_usd": None,
+        "state": "unknown",
+        "directions": {
+            "YES": {
+                "condition_id": "condition-no-pool",
+                "market_id": "market-no-pool",
+                "token_id": "no-pool-yes",
+                "outcome": "YES",
+                "state": "unknown",
+                "eligible": False,
+                "reason_codes": ["reward_pool_unknown"],
+                "guidance": None,
+            }
+        },
+    }
     store.lp_save_screening_snapshot(
         {
             "state": "ready",
             "complete": True,
             "scanning": False,
             "candidates": [],
-            "recommendations": [
-                {
-                    "condition_id": "condition-rec",
-                    "market_id": "market-rec",
-                    "market_title": "Reference market",
-                    "daily_pool_usd": Decimal("99"),
-                    "state": "eligible",
-                    "directions": {},
-                },
-                {
-                    "condition_id": "condition-no-pool",
-                    "market_id": "market-no-pool",
-                    "daily_pool_usd": None,
-                    "state": "unknown",
-                    "directions": {},
-                },
-            ],
+            "recommendations": [valid_recommendation],
+            "selected_results": [valid_recommendation, unknown_recommendation],
             "checked_at": checked_at,
             "last_success_at": checked_at,
             "last_attempt_at": checked_at,
@@ -3381,7 +3433,9 @@ def test_lp_dashboard_reward_share_thresholds_are_market_scoped(
     assert recommendation["reference_share_percentage"] == "5"
     assert recommendation["reference_daily_reward_usd"] == "4.95"
     no_pool = next(
-        row for row in payload["recommendations"] if row["condition_id"] == "condition-no-pool"
+        row
+        for row in payload["selected_results"]
+        if row["condition_id"] == "condition-no-pool"
     )
     assert no_pool["reference_share_percentage"] == "5"
     assert no_pool["reference_daily_reward_usd"] is None
@@ -6198,9 +6252,8 @@ def test_lp_refresh_queues_work_without_trading_or_waiting_for_catalog(
         def __init__(self) -> None:
             self.lock = threading.Lock()
             self.first_catalog_entered = threading.Event()
-            self.second_catalog_entered = threading.Event()
             self.release_first_catalog = threading.Event()
-            self.second_catalog_finished = threading.Event()
+            self.sponsored_catalog_finished = threading.Event()
             self.unexpected_catalog = threading.Event()
             self.native_catalog_calls = 0
             self.sponsored_catalog_calls = 0
@@ -6275,16 +6328,13 @@ def test_lp_refresh_queues_work_without_trading_or_waiting_for_catalog(
                     probe.native_catalog_calls += 1
                     call = probe.native_catalog_calls
             try:
-                if not sponsored and call in {1, 2}:
-                    if call == 1:
-                        probe.first_catalog_entered.set()
-                    else:
-                        probe.second_catalog_entered.set()
+                if not sponsored and call == 1:
+                    probe.first_catalog_entered.set()
                     assert probe.release_first_catalog.wait(timeout=5)
-                elif not sponsored and call >= 4:
+                elif not sponsored and call >= 2:
                     probe.unexpected_catalog.set()
-                if sponsored and call == 2:
-                    probe.second_catalog_finished.set()
+                if sponsored:
+                    probe.sponsored_catalog_finished.set()
                 return []
             finally:
                 with probe.lock:
@@ -6400,6 +6450,42 @@ def test_lp_refresh_queues_work_without_trading_or_waiting_for_catalog(
                                 "outcome": "YES",
                                 "price": Decimal("0.49"),
                                 "quantity": Decimal("20"),
+                                "required_capital": Decimal("9.80"),
+                                "estimated_exit_loss": Decimal("0.20"),
+                                "estimated_exit_loss_ratio": Decimal("0.020408163265306122"),
+                                "checked_at": now,
+                                "expires_at": now + timedelta(seconds=45),
+                            },
+                        }
+                    },
+                }
+            ],
+            "selected_results": [
+                {
+                    "condition_id": "condition-old",
+                    "market_id": "market-old",
+                    "state": "eligible",
+                    "market_title": "Previously screened market",
+                    "market_url": "https://polymarket.com/event/old-market",
+                    "directions": {
+                        "YES": {
+                            "condition_id": "condition-old",
+                            "market_id": "market-old",
+                            "token_id": "token-old-yes",
+                            "outcome": "YES",
+                            "state": "eligible",
+                            "eligible": True,
+                            "reason_codes": [],
+                            "guidance": {
+                                "condition_id": "condition-old",
+                                "market_id": "market-old",
+                                "token_id": "token-old-yes",
+                                "outcome": "YES",
+                                "price": Decimal("0.49"),
+                                "quantity": Decimal("20"),
+                                "required_capital": Decimal("9.80"),
+                                "estimated_exit_loss": Decimal("0.20"),
+                                "estimated_exit_loss_ratio": Decimal("0.020408163265306122"),
                                 "checked_at": now,
                                 "expires_at": now + timedelta(seconds=45),
                             },
@@ -6441,7 +6527,20 @@ def test_lp_refresh_queues_work_without_trading_or_waiting_for_catalog(
         assert runtime.monitor is not None
         runtime.monitor.stop()
         assert probe.first_catalog_entered.wait(timeout=2)
-        assert probe.second_catalog_entered.wait(timeout=2)
+        assert runtime.lp is not None
+        deadline = time.monotonic() + 2
+        preparation_snapshot = runtime.lp.candidate_snapshot()
+        while (
+            preparation_snapshot.get("retention_reason")
+            != "catalog_preparation_pending"
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+            preparation_snapshot = runtime.lp.candidate_snapshot()
+        assert preparation_snapshot.get("retention_reason") == (
+            "catalog_preparation_pending"
+        )
+        preparation_attempt = preparation_snapshot.get("last_attempt_at")
         assert runtime.store is not None
         assert runtime.execution is not None
         assert runtime.execution.set_validation_mode(
@@ -6479,16 +6578,45 @@ def test_lp_refresh_queues_work_without_trading_or_waiting_for_catalog(
             assert queued == {"state": "queued"}
             assert time.monotonic() - started_at < 1
 
+            deadline = time.monotonic() + 2
+            preparation_snapshot = runtime.lp.candidate_snapshot()
+            while (
+                (
+                    preparation_snapshot.get("retention_reason")
+                    != "catalog_preparation_pending"
+                    or preparation_snapshot.get("last_attempt_at")
+                    == preparation_attempt
+                    or preparation_snapshot.get("scanning") is True
+                )
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+                preparation_snapshot = runtime.lp.candidate_snapshot()
+            assert preparation_snapshot.get("retention_reason") == (
+                "catalog_preparation_pending"
+            )
+            assert preparation_snapshot.get("last_attempt_at") != preparation_attempt
+            assert preparation_snapshot.get("scanning") is False
+
             dashboard_status, dashboard = _response(
                 base + "/api/prediction-arbitrage/lp/dashboard", timeout=2
             )
             assert dashboard_status == 200
             saved_rows = dashboard["recommendations"]
-            assert isinstance(saved_rows, list) and len(saved_rows) == 1
-            saved_direction = saved_rows[0]["directions"]["YES"]
-            assert saved_direction["state"] == "eligible"
+            assert saved_rows == []
+            diagnostic_rows = dashboard["selected_results"]
+            assert isinstance(diagnostic_rows, list) and len(diagnostic_rows) == 1
+            saved_direction = diagnostic_rows[0]["directions"]["YES"]
+            assert saved_direction["state"] == "unknown"
+            assert saved_direction["eligible"] is False
             assert saved_direction["guidance"]["price"] == "0.49"
             assert saved_direction["guidance"]["quantity"] == "20"
+            assert saved_direction["guidance"]["checked_at"] == now.isoformat().replace(
+                "+00:00", "Z"
+            )
+            assert saved_direction["guidance"]["expires_at"] == (
+                now + timedelta(seconds=45)
+            ).isoformat().replace("+00:00", "Z")
 
             for _ in range(2):
                 duplicate_status, duplicate = _response(
@@ -6514,25 +6642,37 @@ def test_lp_refresh_queues_work_without_trading_or_waiting_for_catalog(
             )
             assert invalid_status == 400
 
-            assert probe.native_catalog_calls == 2
-            assert probe.catalog_active == 2
-            assert probe.max_catalog_active == 2
+            assert probe.native_catalog_calls == 1
+            assert probe.sponsored_catalog_calls == 0
+            assert probe.catalog_active == 1
+            assert probe.max_catalog_active == 1
             assert probe.writes == []
 
             probe.release_first_catalog.set()
-            assert probe.second_catalog_finished.wait(timeout=3)
+            assert probe.sponsored_catalog_finished.wait(timeout=3)
             deadline = time.monotonic() + 3
             while time.monotonic() < deadline:
                 snapshot = runtime.lp.candidate_snapshot()
                 if (
-                    probe.native_catalog_calls == 3
+                    probe.native_catalog_calls == 1
+                    and probe.sponsored_catalog_calls == 1
+                    and snapshot.get("state") == "ready"
+                    and snapshot.get("complete") is True
                     and snapshot.get("scanning") is False
+                    and snapshot.get("recommendations") == []
+                    and snapshot.get("selected_results") == []
                 ):
                     break
                 time.sleep(0.01)
-            assert probe.native_catalog_calls == 3
+            assert snapshot.get("state") == "ready"
+            assert snapshot.get("complete") is True
+            assert snapshot.get("scanning") is False
+            assert snapshot.get("recommendations") == []
+            assert snapshot.get("selected_results") == []
+            assert probe.native_catalog_calls == 1
+            assert probe.sponsored_catalog_calls == 1
             assert probe.catalog_active == 0
-            assert probe.max_catalog_active == 2
+            assert probe.max_catalog_active == 1
             assert not probe.unexpected_catalog.wait(timeout=0.1)
             assert probe.writes == []
     finally:

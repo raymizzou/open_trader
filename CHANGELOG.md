@@ -5,6 +5,13 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-17
 
+- Candidate gate compatibility fixtures now model one pending hourly reward
+  preparation, preserve complete guidance in selected diagnostics, and keep
+  dashboard reference reward fields consistent in normal and outage paths via
+  the shared normalizer. Verified explicit empty-result and outage-reference
+  projections alongside the exact seven-case Docker batch (`7 passed`); no
+  live calls, orders or deployment were performed.
+
 - Retired the prediction monitor's every-second full-snapshot rewrite of the
   `runtime` SQLite table (it drove ~5 MB/s WAL growth; a production WAL once
   ballooned to 19 GB and its lock storms were misreported to Feishu as

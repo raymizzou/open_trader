@@ -1141,11 +1141,7 @@ class PredictionExecutionService:
                 raw_recommendations = candidate_snapshot.get("recommendations")
                 recommendations = _normalize_lp_recommendations(raw_recommendations)
                 raw_selected_results = candidate_snapshot.get("selected_results")
-                selected_results = [
-                    dict(row)
-                    for row in raw_selected_results
-                    if isinstance(row, Mapping)
-                ] if isinstance(raw_selected_results, (list, tuple)) else []
+                selected_results = _normalize_lp_recommendations(raw_selected_results)
                 raw_market_rewards = candidate_snapshot.get("market_rewards")
                 market_rewards = (
                     dict(raw_market_rewards)
@@ -1349,11 +1345,7 @@ class PredictionExecutionService:
                         dict(row)
                         for row in _normalize_lp_recommendations(recommendations)
                     ],
-                    "selected_results": [
-                        dict(row)
-                        for row in selected_results
-                        if isinstance(row, Mapping)
-                    ] if isinstance(selected_results, (list, tuple)) else [],
+                    "selected_results": _normalize_lp_recommendations(selected_results),
                     "funnel": (
                         dict(candidate_funnel)
                         if isinstance(candidate_funnel, Mapping)
