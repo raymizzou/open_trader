@@ -5516,6 +5516,7 @@ globalThis.window = {
 globalThis.AbortController = class { constructor(){this.signal={};} abort(){} };
 const venues = {
   csrf_token: "csrf-from-venues",
+  n_leg: {status:"running",code:"N_LEG_RUNNING"},
   venues: [
     {venue:"polymarket", mode:"只读", rest:"ready", ws:"ready", wallet:"0xpoly…0000", balance:{asset:"pUSD", value:"50"}},
     {venue:"predict.fun", mode:"只读", rest:"ready", ws:"ready", wallet:"0xpred…1111", balance:{asset:"USDT", value:"25"}},
@@ -5648,6 +5649,262 @@ console.log(JSON.stringify({
     assert rendered["timerCount"] == 1
 
 
+def test_prediction_paused_bootstrap_keeps_lp_requests_only() -> None:
+    output = run_dashboard_js(r'''
+class Element {
+  constructor(){this.dataset={};this.hidden=false;this.innerHTML="";this.textContent="";this.style={};this.attributes={};this.listeners={};
+    this.classList={toggle(){},add(){},remove(){}};}
+  addEventListener(name, callback){(this.listeners[name] ||= []).push(callback);}
+  setAttribute(name,value){this.attributes[name]=value;}
+  removeAttribute(name){delete this.attributes[name];}
+  querySelector(){return null;}
+  querySelectorAll(){return [];}
+}
+const nodes = {};
+document.getElementById = (id) => nodes[id] || (nodes[id] = new Element());
+document.querySelector = () => nodes["workspace-grid"] || (nodes["workspace-grid"] = new Element());
+document.body = new Element();
+bindElements();
+bindEvents();
+const intervals = new Map();
+let nextIntervalId = 0;
+globalThis.window = {
+  location: {search:"", pathname:"/", hash:""},
+  setInterval(callback, delay) { const id = ++nextIntervalId; intervals.set(id, {callback, delay}); return id; },
+  clearInterval(id) { intervals.delete(id); },
+  setTimeout(callback) { return callback; },
+  clearTimeout() {},
+};
+globalThis.AbortController = class { constructor(){this.signal={};} abort(){} };
+const venues = {
+  csrf_token: "csrf-from-venues",
+  n_leg: {status:"paused", code:"N_LEG_PAUSED"},
+  venues: [{venue:"polymarket", mode:"只读", rest:"ready", ws:"ready", wallet:"0xpoly…0000", balance:{asset:"pUSD", value:"50"}}],
+  monitor_subscription:{cross_venue_token_count:1,n_leg_cross_venue_token_count:0},
+};
+const lpDashboard = {
+  state:"ready", stale:false, complete:true, checked_at:"2026-09-17T00:00:00Z",
+  orders:[{order_id:"lp-order-1",market_id:"market-order",condition_id:"condition-order",token_id:"order-token",
+    market_title:"LP remains available",outcome:"NO",side:"BUY",status:"LIVE",price:"0.40",quantity:"20",filled_quantity:"0",remaining_quantity:"20",
+    management:"manual_read_only",read_only:true}],
+  lp_orders_today:[{order_id:"lp-order-1",market_id:"market-order",condition_id:"condition-order",token_id:"order-token",
+    market_title:"LP remains available",outcome:"NO",side:"BUY",status:"LIVE",price:"0.40",quantity:"20",filled_quantity:"0",remaining_quantity:"20",
+    state:"open",management:"manual_read_only",read_only:true}],
+  positions:[], market_rewards:[], recommendations:[],
+};
+const requests = [];
+let resolveVenues;
+let venueReads = 0;
+const response = (data, ok=true, status=200) => ({ok,status,json:async()=>data});
+globalThis.fetch = async (url, init={}) => {
+  const request = {url:String(url),method:String(init.method || "GET"),headers:init.headers || {},body:init.body || ""};
+  requests.push(request);
+  if (request.url === "/api/prediction-arbitrage/venues") {
+    venueReads += 1;
+    return venueReads === 1
+      ? new Promise((resolve)=>{resolveVenues=()=>resolve(response(venues));})
+      : response(venues);
+  }
+  if (request.url === "/api/prediction-arbitrage/lp/dashboard") return response(lpDashboard);
+  if (request.url === "/api/prediction-arbitrage/state") return response({status:"should-not-load",qualified_opportunities:[{title:"N_LEG must stay hidden"}]});
+  if (request.url.startsWith("/api/prediction-arbitrage/history")) return response({items:[{title:"history must stay hidden"}]});
+  throw new Error("Unexpected request: " + request.method + " " + request.url);
+};
+const drainRequests = async () => { for (let turn=0; turn<24; turn+=1) await Promise.resolve(); };
+const click = async (matches) => {
+  const target = {closest(selector){return matches[selector] || null;}};
+  await nodes["prediction-market-root"].listeners.click[0]({target});
+};
+setWorkspaceView("prediction_market");
+await drainRequests();
+const beforeVenuePaths = requests.map(({url,method})=>({url,method}));
+await click({"[data-prediction-tab]":{dataset:{predictionTab:"multi_leg"}}});
+await drainRequests();
+const whileBootstrapHtml = nodes["prediction-market-root"].innerHTML;
+const whileBootstrapPaths = requests.map(({url,method})=>({url,method}));
+resolveVenues();
+await drainRequests();
+const pausedHtml = nodes["prediction-market-root"].innerHTML;
+await click({"[data-prediction-tab]":{dataset:{predictionTab:"lp"}}});
+await drainRequests();
+const lpHtml = nodes["prediction-market-root"].innerHTML;
+console.log(JSON.stringify({
+  beforeVenuePaths, whileBootstrapPaths, venueReads,
+  whileBootstrapHtml, pausedHtml, lpHtml,
+  stateReads:requests.filter(({url})=>url==="/api/prediction-arbitrage/state").length,
+  historyReads:requests.filter(({url})=>url.startsWith("/api/prediction-arbitrage/history")).length,
+  lpReads:requests.filter(({url})=>url==="/api/prediction-arbitrage/lp/dashboard").length,
+}));
+''')
+    rendered = json.loads(output)
+
+    assert rendered["stateReads"] == 0
+    assert rendered["historyReads"] == 0
+    assert rendered["lpReads"] >= 2
+    assert any(
+        request == {"url": "/api/prediction-arbitrage/venues", "method": "GET"}
+        for request in rendered["beforeVenuePaths"]
+    )
+    assert "已暂停" in rendered["pausedHtml"]
+    assert "多腿套利已暂停" in rendered["pausedHtml"]
+    assert "N_LEG_PAUSED" not in rendered["pausedHtml"]
+    assert "LP remains available" in rendered["lpHtml"]
+    assert "N_LEG must stay hidden" not in rendered["whileBootstrapHtml"]
+
+
+def test_prediction_pause_discards_late_responses_and_stale_actions() -> None:
+    output = run_dashboard_js(r'''
+class Element {
+  constructor(){this.dataset={};this.hidden=false;this.innerHTML="";this.textContent="";this.style={};this.attributes={};this.listeners={};
+    this.classList={toggle(){},add(){},remove(){}};}
+  addEventListener(name, callback){(this.listeners[name] ||= []).push(callback);}
+  setAttribute(name,value){this.attributes[name]=value;}
+  removeAttribute(name){delete this.attributes[name];}
+  querySelector(){return null;}
+  querySelectorAll(){return [];}
+}
+const nodes = {};
+document.getElementById = (id) => nodes[id] || (nodes[id] = new Element());
+document.querySelector = () => nodes["workspace-grid"] || (nodes["workspace-grid"] = new Element());
+document.body = new Element();
+bindElements();
+bindEvents();
+const intervals = new Map();
+let nextIntervalId = 0;
+globalThis.window = {
+  location: {search:"", pathname:"/", hash:""},
+  setInterval(callback, delay) { const id = ++nextIntervalId; intervals.set(id, {callback, delay}); return id; },
+  clearInterval(id) { intervals.delete(id); },
+  setTimeout(callback) { return callback; },
+  clearTimeout() {},
+};
+let abortCount = 0;
+const controllers = [];
+globalThis.AbortController = class {
+  constructor(){this.signal={aborted:false}; this.aborts=0; controllers.push(this);}
+  abort(){this.signal.aborted=true; this.aborts += 1; abortCount += 1;}
+};
+const runningVenues = {csrf_token:"csrf-running", n_leg:{status:"running",code:"N_LEG_RUNNING"}, venues:[], monitor_subscription:{}};
+const pausedVenues = {csrf_token:"csrf-paused", n_leg:{status:"paused",code:"N_LEG_PAUSED"}, venues:[], monitor_subscription:{}};
+const lpDashboard = {state:"ready", stale:false, complete:true, checked_at:"2026-09-17T00:00:00Z", orders:[], positions:[], market_rewards:[], recommendations:[]};
+const stalePayload = {status:"STALE N_LEG", qualified_opportunities:[{title:"STALE N_LEG opportunity"}], histories:{signals:[{title:"STALE N_LEG history"}]}};
+const requests = [];
+const pending = new Map();
+let stateReads = 0;
+let venueReads = 0;
+let responseSerial = 0;
+let lpCompleted = false;
+const response = (data, kind, ok=true, status=200) => ({ok,status,json:async()=>{
+  if (kind === "lp") lpCompleted = true;
+  if (kind !== "lp" && kind !== "venues") throw new Error(`late JSON parse: ${kind}`);
+  return data;
+}});
+const makeDeferred = (kind) => {
+  const key = `${kind}-${++responseSerial}`;
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  pending.set(key, {resolve, kind});
+  return promise;
+};
+const resolvePending = () => {
+  for (const {resolve, kind} of pending.values()) resolve(response(stalePayload, kind));
+  pending.clear();
+};
+globalThis.fetch = async (url, init={}) => {
+  const request = {url:String(url),method:String(init.method || "GET"),headers:init.headers || {},body:init.body || ""};
+  requests.push(request);
+  const controller = controllers.find((item) => item.signal === init.signal);
+  if (controller) request.controller = controller;
+  if (request.url === "/api/prediction-arbitrage/venues") return response(++venueReads <= 3 ? runningVenues : pausedVenues, "venues");
+  if (request.url === "/api/prediction-arbitrage/lp/dashboard") return response(lpDashboard, "lp");
+  if (request.url === "/api/prediction-arbitrage/state") {
+    stateReads += 1;
+    request.kind = "state";
+    return makeDeferred("state");
+  }
+  if (request.url === "/api/prediction-arbitrage/history?kind=executions&limit=100") {
+    request.kind = "history";
+    return makeDeferred("history");
+  }
+  if (request.url === "/api/prediction-arbitrage/n-leg/report") {
+    request.kind = "report";
+    return makeDeferred("report");
+  }
+  if (request.url.startsWith("/api/prediction-arbitrage/relations/")) {
+    request.kind = "relation-detail";
+    return makeDeferred("relation-detail");
+  }
+  if (request.url.startsWith("/api/prediction-arbitrage/relations?")) {
+    request.kind = "relation-review";
+    return makeDeferred("relation-review");
+  }
+  if (request.method === "POST") return response({state:"accepted"}, "mutation");
+  throw new Error("Unexpected request: " + request.method + " " + request.url);
+};
+const drainRequests = async () => { for (let turn=0; turn<24; turn+=1) await Promise.resolve(); };
+const click = async (matches) => {
+  const target = {closest(selector){return matches[selector] || null;}};
+  await nodes["prediction-market-root"].listeners.click[0]({target});
+};
+setWorkspaceView("prediction_market");
+await drainRequests();
+await click({"[data-prediction-tab]":{dataset:{predictionTab:"multi_leg"}}});
+await drainRequests();
+const historyOld = loadPredictionHistory("executions");
+const historyNew = loadPredictionHistory("executions");
+const reportOld = loadNLegReport();
+const reportNew = loadNLegReport();
+const reviewOld = loadRelationReview("pending_approval", 0);
+const reviewNew = loadRelationReview("pending_approval", 0);
+const detailOld = loadRelationDetail("relation-old");
+const detailNew = loadRelationDetail("relation-new");
+await drainRequests();
+const replacementKinds = requests.filter(({kind}) => kind).map(({kind}) => kind);
+const replacementAborts = controllers.filter((controller) => controller.aborts > 0).length;
+await click({"[data-prediction-tab]":{dataset:{predictionTab:"lp"}}});
+await drainRequests();
+const requestsBeforeLate = requests.length;
+resolvePending();
+await Promise.all([historyOld, historyNew, reportOld, reportNew, reviewOld, reviewNew, detailOld, detailNew]);
+await drainRequests();
+const afterLateHtml = nodes["prediction-market-root"].innerHTML;
+const requestsAfterLate = requests.length;
+await fetchPredictionVenues();
+await drainRequests();
+await click({"[data-prediction-tab]":{dataset:{predictionTab:"multi_leg"}}});
+await drainRequests();
+const beforeStaleAction = requests.length;
+await click({"[data-action='open-nleg-report']":{}});
+await drainRequests();
+let postError = "";
+try { await predictionPost("/api/prediction-arbitrage/n-leg/orders/confirm", {confirm:true}); }
+catch (error) { postError = String(error && error.message || error); }
+await drainRequests();
+console.log(JSON.stringify({
+  afterLateHtml, finalHtml:nodes["prediction-market-root"].innerHTML,
+  stateReads, venueReads, abortCount, replacementAborts, replacementKinds,
+  allNlegAborted:requests.filter(({kind})=>kind && kind !== "venues" && kind !== "lp").every(({controller})=>controller?.signal.aborted === true),
+  lpCompleted, requestsBeforeLate, requestsAfterLate, postError,
+  staleActionRequests:requests.slice(beforeStaleAction).map(({url,method})=>({url,method})),
+}));
+''')
+    rendered = json.loads(output)
+
+    assert rendered["abortCount"] >= 9
+    assert rendered["stateReads"] == 1
+    assert rendered["replacementAborts"] >= 4
+    assert set(rendered["replacementKinds"]) == {"state", "history", "report", "relation-review", "relation-detail"}
+    assert rendered["allNlegAborted"] is True
+    assert rendered["lpCompleted"] is True
+    assert rendered["requestsAfterLate"] == rendered["requestsBeforeLate"]
+    assert rendered["postError"]
+    assert rendered["staleActionRequests"] == []
+    assert "STALE N_LEG" not in rendered["afterLateHtml"]
+    assert "STALE N_LEG" not in rendered["finalHtml"]
+    assert "已暂停" in rendered["finalHtml"]
+
+
+
 @pytest.mark.parametrize("late_state_succeeds", (True, False), ids=("late-success", "late-failure"))
 def test_prediction_subtabs_isolate_polling_and_late_results(late_state_succeeds: bool) -> None:
     output = run_dashboard_js(r'''
@@ -5682,7 +5939,7 @@ const account = {status:"healthy",stale:false,generated_at:"2026-09-16T00:00:00Z
   summary:{portfolio_value_hkd:"100000",holding_value_hkd:"0",holding_weight_hkd:"0",cash_like_value_hkd:"100000",
     cash_like_weight_hkd:"100%",holding_count:"0",broker_count:"0"},
   broker_summaries:[],positions:[],cash_balances:[],sources:{quotes:{status:"healthy"}}};
-const venues = {csrf_token:"csrf-from-venues",venues:[
+const venues = {csrf_token:"csrf-from-venues",n_leg:{status:"running",code:"N_LEG_RUNNING"},venues:[
   {venue:"polymarket",mode:"只读",rest:"ready",ws:"ready",wallet:"0xpoly…0000",balance:{asset:"pUSD",value:"50"}},
   {venue:"predict.fun",mode:"只读",rest:"ready",ws:"ready",wallet:"0xpred…1111",balance:{asset:"USDT",value:"25"}},
 ],monitor_subscription:{cross_venue_token_count:2,n_leg_cross_venue_token_count:1}};
@@ -6352,7 +6609,7 @@ let dashboardReads = 0;
 let refreshPosts = 0;
 let holdPollingResponses = false;
 const heldResponses = [];
-const venuePayload = {csrf_token: "csrf-token", venues: [], monitor_subscription: {}};
+const venuePayload = {csrf_token: "csrf-token", n_leg:{status:"running",code:"N_LEG_RUNNING"}, venues: [], monitor_subscription: {}};
 globalThis.window = {
   location: {search: ""},
   setInterval(fn, milliseconds) { intervals.push({fn, milliseconds}); return intervals.length; },
@@ -8805,6 +9062,9 @@ const healthyState = {
 const readOnlyLpDashboard = {orders:[], positions:[], candidates:[], complete:true};
 globalThis.fetch = (url, init = {}) => {
   requests.push({url, method:init.method || "GET"});
+  if (url === "/api/prediction-arbitrage/venues") {
+    return Promise.resolve({ok:true, json:async()=>({n_leg:{status:"running",code:"N_LEG_RUNNING"},venues:[]})});
+  }
   if (url === "/api/prediction-arbitrage/state") {
     return Promise.resolve({ok:true, json:async()=>healthyState});
   }
@@ -8825,6 +9085,7 @@ globalThis.fetch = (url, init = {}) => {
   return Promise.reject(new Error("Unexpected request: " + url));
 };
 const drainRequests = async () => { for (let turn = 0; turn < 12; turn += 1) await Promise.resolve(); };
+state.predictionMarket.nLegStatus = "running";
 setWorkspaceView("prediction_market");
 await drainRequests();
 const multiLegTab = {dataset:{predictionTab:"multi_leg"}};
@@ -8895,6 +9156,7 @@ const healthyState={status:"healthy",health:{status:"healthy",degraded_reasons:[
 const lpDashboard={orders:[],positions:[],candidates:[],complete:true};
 globalThis.fetch=async(url,init={})=>{
   requests.push({url,headers:init.headers||{}});
+  if(url==="/api/prediction-arbitrage/venues")return {ok:true,json:async()=>({n_leg:{status:"running",code:"N_LEG_RUNNING"},venues:[]})};
   if(url==="/api/v1/account/snapshot"){
     accountGets+=1;
     const portfolioValue=accountGets===1?"100000":accountGets===2?"234567":"345678";
@@ -8910,6 +9172,7 @@ globalThis.fetch=async(url,init={})=>{
 };
 const drainRequests=async()=>{for(let turn=0;turn<16;turn+=1)await Promise.resolve();};
 const count=(url)=>requests.filter((request)=>request.url===url).length;
+state.predictionMarket.nLegStatus = "running";
 scheduleAccountPolling();
 await drainRequests();
 const portfolioAccountGets=count("/api/v1/account/snapshot");
@@ -8962,6 +9225,8 @@ def test_prediction_state_poll_does_not_overlap_a_slow_request() -> None:
     output = run_dashboard_js(r'''
 state.workspaceView = "prediction_market";
 state.predictionMarket.activeTab = "multi_leg";
+state.predictionMarket.nLegStatus = "running";
+globalThis.AbortController = class { constructor(){this.signal={aborted:false};} abort(){this.signal.aborted=true;} };
 const pending = [];
 let calls = 0;
 globalThis.fetch = () => {
@@ -8984,6 +9249,8 @@ def test_prediction_state_load_does_not_duplicate_the_initial_signal_history_req
     output = run_dashboard_js(r'''
 state.workspaceView = "prediction_market";
 state.predictionMarket.activeTab = "multi_leg";
+state.predictionMarket.nLegStatus = "running";
+globalThis.AbortController = class { constructor(){this.signal={aborted:false};} abort(){this.signal.aborted=true;} };
 globalThis.window = {setInterval(){return 1;},clearInterval(){}};
 const urls = [];
 const history = [];
@@ -9009,6 +9276,8 @@ def test_prediction_state_completion_preserves_newer_signal_history() -> None:
     output = run_dashboard_js(r'''
 state.workspaceView = "prediction_market";
 state.predictionMarket.activeTab = "multi_leg";
+state.predictionMarket.nLegStatus = "running";
+globalThis.AbortController = class { constructor(){this.signal={aborted:false};} abort(){this.signal.aborted=true;} };
 const pending = {};
 globalThis.fetch = (url) => new Promise((resolve) => {
   pending[url.includes("/state") ? "state" : "history"] = resolve;
@@ -9042,6 +9311,8 @@ def test_prediction_state_started_after_signal_history_accepts_state_signals() -
     output = run_dashboard_js(r'''
 state.workspaceView = "prediction_market";
 state.predictionMarket.activeTab = "multi_leg";
+state.predictionMarket.nLegStatus = "running";
+globalThis.AbortController = class { constructor(){this.signal={aborted:false};} abort(){this.signal.aborted=true;} };
 globalThis.fetch = (url) => Promise.resolve(url.includes("/history")
   ? {ok:true,json:async()=>({items:[{
       opportunity_id:"old-opportunity", ended_at:"2026-08-01T02:00:10Z",
@@ -19049,6 +19320,9 @@ globalThis.fetch = async () => { fetchCount += 1; return {ok: true, json: async 
 document.body = {style: {}};
 elements["prediction-market-modal-root"] = {innerHTML: "", querySelectorAll: () => [], querySelector: () => null};
 state.predictionMarket.csrfToken = "csrf";
+state.workspaceView = "prediction_market";
+state.predictionMarket.activeTab = "multi_leg";
+state.predictionMarket.nLegStatus = "running";
 predictionModal = {kind: "nleg_order", previousFocus: null, busy: false, data: {
   n_leg_solution: {component_id: "component:a:b", execution: {execution_solution_fingerprint: "sha256:abc"}},
 }};
@@ -19336,7 +19610,7 @@ globalThis.window = {
 const sourceMillis = Date.parse(checkedAt);
 let nowMillis = sourceMillis;
 Date.now = () => nowMillis;
-const venues = {csrf_token:"csrf", venues:[]};
+const venues = {csrf_token:"csrf", n_leg:{status:"running",code:"N_LEG_RUNNING"}, venues:[]};
 const requests = [];
 let venueReads = 0;
 let lpReads = 0;

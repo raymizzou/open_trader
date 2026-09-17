@@ -801,6 +801,8 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
         },
     }
     payload["n_leg"] = {
+        "status": "running",
+        "code": "N_LEG_RUNNING",
         "mode": "MANUAL",
         "contract_generation": 1,
         "qualification_policy_version": 1,
@@ -812,6 +814,8 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
             "batch_active": False,
         },
     }
+    if scenario == "n-leg-paused":
+        payload["n_leg"] = {"status": "paused", "code": "N_LEG_PAUSED"}
     payload.update(_observation_fixture(scenario))
     if scenario == "ready-zero-allowance":
         payload["venues"][1] = {**payload["venues"][1], "allowance": {"asset": "USDT", "value": "0", "spender": "0xSpender…C0DE"}, "mode": "可以交易"}
@@ -1204,6 +1208,7 @@ class Handler(BaseHTTPRequestHandler):
             payload = _prediction_payload(type(self).prediction_scenario)
             self._send_json({
                 "venues": payload.get("venues", []),
+                "n_leg": payload.get("n_leg", {"status": "running", "code": "N_LEG_RUNNING"}),
                 "monitor_subscription": {
                     "cross_venue_token_count": 0,
                     "n_leg_cross_venue_token_count": 0,

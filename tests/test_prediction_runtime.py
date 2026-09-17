@@ -273,6 +273,495 @@ def test_runtime_constructor_is_side_effect_free(tmp_path: Path) -> None:
     assert runtime.execution is None
 
 
+def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.prediction_runtime as runtime_module
+
+    calls: list[tuple[str, object]] = []
+    lp_events = {
+        name: threading.Event()
+        for name in ("account", "catalog", "metadata", "history", "books", "reward")
+    }
+
+    class ExternalTrading:
+        config = SimpleNamespace(wallet_address="0xwallet")
+
+        def __init__(self) -> None:
+            self.order = {
+                "order_id": "manual-order",
+                "market_id": "manual-market",
+                "condition_id": "manual-condition",
+                "token_id": "manual-token",
+                "market_title": "Manual order retained",
+                "outcome": "NO",
+                "side": "BUY",
+                "status": "LIVE",
+                "price": Decimal("0.36"),
+                "original_size": Decimal("100"),
+                "size_matched": Decimal("0"),
+                "remaining_size": Decimal("100"),
+            }
+            self.lp_order = {
+                "order_id": "lp-order",
+                "market_id": "lp-risk-market",
+                "condition_id": "lp-risk-condition",
+                "token_id": "lp-risk-yes",
+                "market_title": "LP risk market",
+                "outcome": "YES",
+                "side": "BUY",
+                "status": "LIVE",
+                "price": Decimal("0.40"),
+                "original_size": Decimal("20"),
+                "size_matched": Decimal("0"),
+                "remaining_size": Decimal("20"),
+                "expiration": (datetime.now(UTC) + timedelta(hours=1)),
+            }
+
+        def readiness_snapshot(self) -> dict[str, object]:
+            return {
+                "checked_at": datetime.now(UTC),
+                "relayer_ready": True,
+                "merge_ready": True,
+            }
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "checked_at": datetime.now(UTC),
+                "open_order_ids": ("manual-order", "lp-order"),
+                "positions": (),
+            }
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            lp_events["account"].set()
+            return {
+                "authenticated": True,
+                "balance": Decimal("100"),
+                "allowance": Decimal("100"),
+                "open_orders": (dict(self.order), dict(self.lp_order)),
+                "positions": (),
+                "checked_at": datetime.now(UTC),
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def get_order_scoring(self, order_id: str) -> bool:
+            return order_id == "lp-order"
+
+        def lp_snapshot(self, _request: object) -> dict[str, object]:
+            now = datetime.now(UTC)
+            return {
+                "account": {
+                    "authenticated": True,
+                    "balance": Decimal("100"),
+                    "allowance": Decimal("100"),
+                    "open_orders": (dict(self.order), dict(self.lp_order)),
+                    "positions": (),
+                    "checked_at": now,
+                },
+                "orders": (dict(self.lp_order),),
+                "book": {
+                    "token_id": "lp-risk-yes",
+                    "condition_id": "lp-risk-condition",
+                    "received_at": now,
+                    "source_timestamp": now,
+                    "bids": [
+                        {"price": Decimal("0.40"), "size": Decimal("100")},
+                        {"price": Decimal("0.39"), "size": Decimal("100")},
+                    ],
+                    "asks": [{"price": Decimal("0.42"), "size": Decimal("100")}],
+                },
+                "trades": (),
+                "market": {
+                    "market_id": "lp-risk-market",
+                    "condition_id": "lp-risk-condition",
+                    "token_id": "lp-risk-yes",
+                    "outcome": "YES",
+                    "fees_enabled": False,
+                    "fee": Decimal("0"),
+                    "fee_exponent": Decimal("1"),
+                    "taker_fee_rate": Decimal("0"),
+                },
+            }
+
+        def lp_reward_catalog(
+            self,
+            *,
+            condition_ids: object = None,
+            stop_event: threading.Event | None = None,
+        ) -> dict[str, object]:
+            del condition_ids, stop_event
+            lp_events["catalog"].set()
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": datetime.now(UTC),
+                "daily_pool_usd": Decimal("100"),
+                "markets": ({
+                    "condition_id": "candidate-condition",
+                    "reward_active": True,
+                    "rewards_max_spread": Decimal("0.03"),
+                    "rewards_min_size": Decimal("10"),
+                    "daily_pool_usd": Decimal("100"),
+                    "native_reward_configs": (),
+                    "sponsored_reward_configs": (),
+                },),
+            }
+
+        def lp_market_metadata(self, condition_ids: object, **_kwargs: object) -> dict[str, dict[str, object]]:
+            del condition_ids
+            lp_events["metadata"].set()
+            return {
+                "candidate-condition": {
+                    "market_id": "candidate-market",
+                    "condition_id": "candidate-condition",
+                    "market_title": "Candidate market",
+                    "market_url": "https://polymarket.com/event/candidate",
+                    "exchange_type": "CLOB",
+                    "metadata_checked_at": datetime.now(UTC),
+                    "event_ended": False,
+                    "event_start_time": datetime.now(UTC) + timedelta(hours=2),
+                    "accepting_orders": True,
+                    "minimum_order_size": Decimal("1"),
+                    "tick_size": Decimal("0.01"),
+                    "fees_enabled": False,
+                    "fee": Decimal("0"),
+                    "fee_exponent": Decimal("1"),
+                    "taker_fee_rate": Decimal("0"),
+                    "reward_min_size": Decimal("10"),
+                    "reward_max_spread": Decimal("0.03"),
+                    "outcomes": {
+                        "yes": {"label": "YES", "token_id": "candidate-yes"},
+                        "no": {"label": "NO", "token_id": "candidate-no"},
+                    },
+                }
+            }
+
+        def lp_price_history(
+            self,
+            token_ids: object,
+            *,
+            start_ts: int,
+            end_ts: int,
+            fidelity: int,
+            stop_event: object = None,
+        ) -> dict[str, object]:
+            del fidelity, stop_event
+            lp_events["history"].set()
+            sample_timestamps = list(range(start_ts, end_ts + 1, 60))
+            if sample_timestamps[-1] != end_ts:
+                sample_timestamps.append(end_ts)
+            return {
+                "state": "known",
+                "history": {
+                    token_id: [
+                        {
+                            "t": timestamp,
+                            "p": Decimal("0.505") if timestamp == end_ts else Decimal("0.50"),
+                        }
+                        for timestamp in sample_timestamps
+                    ]
+                    for token_id in tuple(token_ids)  # type: ignore[arg-type]
+                },
+            }
+
+        def lp_order_books(self, token_ids: object, *, stop_event: threading.Event | None = None) -> dict[str, dict[str, object]]:
+            del stop_event
+            lp_events["books"].set()
+            now = datetime.now(UTC)
+            return {
+                token: {
+                    "token_id": token,
+                    "condition_id": "candidate-condition",
+                    "received_at": now,
+                    "source_timestamp": now,
+                    "bids": [
+                        {"price": Decimal("0.40"), "size": Decimal("100")},
+                        {"price": Decimal("0.39"), "size": Decimal("100")},
+                    ],
+                    "asks": [{"price": Decimal("0.42"), "size": Decimal("100")}],
+                }
+                for token in token_ids
+            }
+
+        def lp_reward_snapshot(self, reward_date: str, condition_id: str, **_kwargs: object) -> dict[str, object]:
+            lp_events["reward"].set()
+            return {
+                "state": "known",
+                "reward_date": reward_date,
+                "condition_id": condition_id,
+                "market_amount": Decimal("0.25"),
+                "account_amount": Decimal("0.25"),
+                "market_asset": "USDC.e",
+                "account_asset": "USDC.e",
+            }
+
+        def close(self) -> None:
+            calls.append(("trading-close", None))
+
+        def __getattr__(self, name: str) -> object:
+            if name in {"cancel_orders", "lp_post_order", "post_order", "submit_protected_sell"}:
+                def forbidden(*_args: object, **_kwargs: object) -> None:
+                    calls.append(("order-mutation", name))
+                    raise AssertionError(f"paused runtime attempted {name}")
+                return forbidden
+            raise AttributeError(name)
+
+    class ExternalNotifier:
+        def __init__(self, channel: str) -> None:
+            self.channel = channel
+
+        def send(self, *args: object, **kwargs: object) -> bool:
+            calls.append(("notification", (self.channel, args, kwargs)))
+            return True
+
+    trading = ExternalTrading()
+    config = SimpleNamespace(
+        signer_address="0xsigner",
+        wallet_address="0xwallet",
+        predict=None,
+    )
+    store = PredictionArbitrageStore(tmp_path)
+    store.n_leg_safety_config_write(
+        1,
+        {
+            "max_per_trade_cost_units": 10_000_000,
+            "max_total_unsettled_capital_units": 20_000_000,
+            "max_partial_fill_loss_units": 10_000_000,
+            "max_auto_repair_loss_units": 10_000_000,
+        },
+    )
+    store.n_leg_mode_control_write(
+        mode="MANUAL", contract_generation=7, qualification_policy_version=3,
+        safety_config_version=1, enabled_execution_scope_version=[],
+    )
+    store.n_leg_create_batch({
+        "execution_batch_id": "nleg-accounting-batch",
+        "opportunity_episode_id": "nleg-accounting-episode",
+        "episode_lineage_id": "nleg-accounting-lineage",
+        "mode": "MANUAL",
+        "state": "INCIDENT",
+        "entry_fingerprint": "nleg-accounting-entry",
+        "total_unsettled_capital_units": 1_000_000,
+        "reservation_units": 1_000_000,
+        "reservations": [{"remaining_units": 0, "holding_units": 1_000_000}],
+        "legs": [{"receipt": {"state": "REJECTED"}}],
+    })
+    store.n_leg_acknowledge_incident(
+        "nleg-accounting-batch",
+        acknowledgement={"actor": "test", "reconciliation": "fresh_clean"},
+    )
+    store.lp_create_session(
+        "lp-session", "lp-idempotency", state="complete",
+        payload={
+            "market_id": "manual-market", "condition_id": "manual-condition",
+            "token_id": "manual-token", "outcome": "NO", "price": "0.36",
+            "quantity": "100", "review_at": (datetime.now(UTC).replace(microsecond=0)).isoformat(),
+        },
+    )
+    risk_stale_at = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
+    risk_expiry = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+    store.lp_create_session(
+        "lp-risk-session", "lp-risk-idempotency", state="entry_open",
+        payload={
+            "market_id": "lp-risk-market",
+            "condition_id": "lp-risk-condition",
+            "token_id": "lp-risk-yes",
+            "outcome": "YES",
+            "price": Decimal("0.40"),
+            "quantity": Decimal("20"),
+            "review_at": risk_expiry,
+            "entry_order_id": "lp-order",
+            "entry_expiration": risk_expiry,
+            "owned_order_ids": ["lp-order"],
+            "order_history": {
+                "lp-order": {
+                    "order_id": "lp-order",
+                    "token_id": "lp-risk-yes",
+                    "side": "BUY",
+                    "status": "LIVE",
+                    "price": Decimal("0.40"),
+                    "original_size": Decimal("20"),
+                    "size_matched": Decimal("0"),
+                    "remaining_size": Decimal("20"),
+                    "expiration": risk_expiry,
+                }
+            },
+            "buy_filled_quantity": Decimal("0"),
+            "buy_cost": Decimal("0"),
+            "sold_quantity": Decimal("0"),
+            "sold_revenue": Decimal("0"),
+            "residual_quantity": Decimal("0"),
+            "residual_exit_value": Decimal("0"),
+            "fees": Decimal("0"),
+            "fee_status": "known",
+            "position_reconciled": True,
+            "orders_terminal": False,
+            "entry_cancel_requested": False,
+            "stop_loss_latched": False,
+            "scoring_status": "unknown",
+            "scoring_checked_at": risk_stale_at,
+            "scoring_order_id": "lp-order",
+            "scoring_order_role": "entry",
+            "account_checked_at": risk_stale_at,
+            "book_checked_at": risk_stale_at,
+            "reward_date": datetime.now(UTC).date().isoformat(),
+            "trade_pnl": Decimal("0"),
+            "paid_rewards": Decimal("0"),
+        },
+    )
+    accounting_before = store.n_leg_control()
+    session_before = store.lp_session("lp-session")
+    risk_before = store.lp_session("lp-risk-session")
+    assert risk_before is not None
+    assert risk_before["state"] == "entry_open"
+    assert risk_before["account_checked_at"] == risk_stale_at
+    assert risk_before["book_checked_at"] == risk_stale_at
+    solver_calls: list[str] = []
+    predict_calls: list[str] = []
+
+    def make_runtime() -> PredictionRuntime:
+        return PredictionRuntime(
+            data_dir=tmp_path,
+            prediction_config_path=tmp_path / "prediction.json",
+            dashboard_url="http://127.0.0.1:8766/",
+            notifier=SimpleNamespace(_notifiers=(ExternalNotifier("macos"), ExternalNotifier("feishu"))),
+            solver_server_factory=lambda: (_ for _ in ()).throw(
+                (solver_calls.append("started") or AssertionError("solver must not start while N_LEG is paused"))
+            ),
+        )
+
+    monkeypatch.setenv("OPEN_TRADER_NLEG_PAUSED", "1")
+    monkeypatch.setattr(runtime_module, "load_trading_config", lambda _path: config)
+    monkeypatch.setattr(
+        runtime_module,
+        "PolymarketTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: trading),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "PredictTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: (predict_calls.append("started") or (_ for _ in ()).throw(
+            AssertionError("Predict account client must not start while N_LEG is paused")
+        ))),
+    )
+    monkeypatch.setattr(runtime_module, "_LP_TICK_SECONDS", 0.001)
+    monkeypatch.setattr(runtime_module, "_LP_REWARD_SECONDS", 0.01)
+    monkeypatch.setattr(runtime_module, "_LP_BOOK_SAMPLE_SECONDS", 0.01)
+
+    runtime = make_runtime()
+    try:
+        runtime.start()
+        assert runtime.state == "RUNNING"
+        assert all(event.wait(timeout=3) for event in lp_events.values())
+        candidate = runtime.lp.candidate_snapshot()  # type: ignore[union-attr]
+        deadline = time.monotonic() + 2
+        while candidate.get("state") != "ready" and time.monotonic() < deadline:
+            time.sleep(0.01)
+            candidate = runtime.lp.candidate_snapshot()  # type: ignore[union-attr]
+        reward_deadline = time.monotonic() + 2
+        risk_session = store.lp_session("lp-risk-session")
+        while (
+            isinstance(risk_session, dict)
+            and not isinstance(risk_session.get("reward_observation"), dict)
+            and time.monotonic() < reward_deadline
+        ):
+            time.sleep(0.01)
+            risk_session = store.lp_session("lp-risk-session")
+        dashboard = runtime.execution.lp_dashboard()  # type: ignore[union-attr]
+        assert runtime.solver_server is None
+        assert runtime.relation_catalog is None
+        assert runtime.live_resolver is None
+        assert runtime.observation_monitor is None
+        assert runtime.predict_snapshot_refresher is None
+        assert dashboard["orders"][0]["order_id"] == "manual-order"
+        assert dashboard["orders"][0]["management"] == "manual_read_only"
+        assert candidate["state"] == "ready"
+        assert candidate["complete"] is True
+        assert candidate["catalog_complete"] is True
+        assert candidate["missing_metadata_condition_ids"] == []
+        assert candidate.get("missing_book_token_ids", []) == []
+        candidate_rows = [
+            row
+            for row in candidate["selected_results"]
+            if isinstance(row, dict)
+            and row.get("market_id") == "candidate-market"
+            and row.get("condition_id") == "candidate-condition"
+        ]
+        assert candidate_rows
+        assert any(
+            isinstance(direction, dict)
+            and direction.get("token_id") == "candidate-yes"
+            and isinstance(direction.get("guidance"), dict)
+            and Decimal(str(direction["guidance"].get("price"))) == Decimal("0.40")
+            for row in candidate_rows
+            for direction in (
+                row.get("directions", {}).values()
+                if isinstance(row.get("directions"), dict)
+                else ()
+            )
+        ), repr(candidate_rows)
+        risk_session = store.lp_session("lp-risk-session")
+        assert risk_session is not None
+        assert risk_session["state"] == "entry_open"
+        assert risk_session["account_checked_at"] != risk_stale_at
+        assert risk_session["book_checked_at"] != risk_stale_at
+        assert risk_session["scoring_status"] == "true"
+        assert risk_session["scoring_checked_at"] != risk_stale_at
+        assert dashboard["lp_session"]["state"] == "entry_open"
+        reward_observation = dashboard["lp_session"]["reward_observation"]
+        assert reward_observation["status"] == "below"
+        assert Decimal(str(reward_observation["market_amount"])) == Decimal("0.25")
+        assert Decimal(str(reward_observation["account_amount"])) == Decimal("0.25")
+        assert Decimal(str(risk_session["paid_rewards"])) == Decimal("0")
+        assert Decimal(str(risk_session["trade_pnl"])) == Decimal("0")
+    finally:
+        runtime.stop()
+
+    accounting_after = store.n_leg_control()
+    session_after = store.lp_session("lp-session")
+    risk_after = store.lp_session("lp-risk-session")
+    assert accounting_after["total_unsettled_capital_units"] == accounting_before["total_unsettled_capital_units"] == 1_000_000
+    assert accounting_after["active_batch_id"] is None
+    assert session_after["state"] == session_before["state"] == "complete"  # type: ignore[index]
+    assert session_after["condition_id"] == session_before["condition_id"] == "manual-condition"  # type: ignore[index]
+    assert risk_after is not None
+    assert risk_after["state"] == "entry_open"
+    assert risk_after["owned_order_ids"] == ["lp-order"]
+    assert Decimal(str(risk_after["paid_rewards"])) == Decimal("0")
+    assert Decimal(str(risk_after["trade_pnl"])) == Decimal("0")
+    assert not solver_calls
+    assert not predict_calls
+    assert not [call for call in calls if call[0] == "order-mutation"]
+    assert not [
+        call
+        for call in calls
+        if call[0] == "notification" and "N_LEG" in repr(call[1])
+    ]
+
+    for event in lp_events.values():
+        event.clear()
+    restarted = make_runtime()
+    try:
+        restarted.start()
+        assert restarted.state == "RUNNING"
+        assert all(event.wait(timeout=3) for event in lp_events.values())
+        restarted_dashboard = restarted.execution.lp_dashboard()  # type: ignore[union-attr]
+        assert restarted_dashboard["orders"][0]["order_id"] == "manual-order"
+        assert restarted_dashboard["orders"][0]["management"] == "manual_read_only"
+        restarted_risk = store.lp_session("lp-risk-session")
+        assert restarted_risk is not None
+        assert restarted_risk["state"] == "entry_open"
+        assert restarted_risk["owned_order_ids"] == ["lp-order"]
+        assert Decimal(str(restarted_risk["paid_rewards"])) == Decimal("0")
+        assert Decimal(str(restarted_risk["trade_pnl"])) == Decimal("0")
+        assert restarted_dashboard["lp_session"]["reward_observation"]["status"] == "below"
+    finally:
+        restarted.stop()
+
+    assert store.n_leg_control()["total_unsettled_capital_units"] == 1_000_000
+
+
 @pytest.mark.parametrize("reader_generation", (True, False, 0, -1))
 def test_reader_generation_must_be_a_positive_integer(
     tmp_path: Path, reader_generation: object
@@ -3655,6 +4144,87 @@ def test_shadow_evidence_codex_counters_come_from_llm_attributes(
         }
     finally:
         runtime.stop()
+
+
+def test_n_leg_pause_suppresses_shadow_background_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.prediction_runtime as runtime_module
+
+    external_calls: list[str] = []
+
+    def fail_solver() -> object:
+        external_calls.append("solver.construct")
+        raise AssertionError("paused shadow must not construct the solver")
+
+    class FakePolymarketTradingClient:
+        @classmethod
+        def from_keychain(cls, _config: object) -> object:
+            external_calls.append("polymarket.construct")
+            raise AssertionError("paused shadow must not construct a venue client")
+
+    class FakePredictTradingClient:
+        @classmethod
+        def from_keychain(cls, _config: object) -> object:
+            external_calls.append("predict.construct")
+            raise AssertionError("paused shadow must not construct a Predict client")
+
+    monkeypatch.setattr(
+        runtime_module, "PolymarketTradingClient", FakePolymarketTradingClient
+    )
+    monkeypatch.setattr(runtime_module, "PredictTradingClient", FakePredictTradingClient)
+
+    def make_runtime() -> PredictionRuntime:
+        return PredictionRuntime(
+            data_dir=tmp_path / "shadow",
+            prediction_config_path=tmp_path / "prediction.json",
+            dashboard_url="http://127.0.0.1:8766/",
+            mode="shadow",
+            solver_server_factory=fail_solver,
+        )
+
+    monkeypatch.setenv("OPEN_TRADER_NLEG_PAUSED", "1")
+    runtime = make_runtime()
+    runtime.start()
+    try:
+        assert runtime.state == "RUNNING"
+        assert runtime.mode == "shadow"
+        assert runtime.n_leg_paused is True
+        assert runtime.production_owner is False
+        assert runtime.store is not None
+        assert runtime.solver_server is None
+        assert runtime.monitor is None
+        assert runtime.observation_monitor is None
+        assert runtime.cross_venue_monitor is None
+        assert runtime.n_leg_shadow is None
+        assert runtime.predict_snapshot_refresher is None
+        assert runtime.shadow_evidence == {
+            "mode": "shadow",
+            "guard_attempts": [],
+            "first_violation": None,
+            "codex": {
+                "relation": {"calls": 0, "successes": 0},
+                "cross_venue": {"calls": 0, "successes": 0},
+            },
+        }
+        competing_owner = _RuntimeOwnershipLock(
+            tmp_path / "shadow" / "prediction_arbitrage" / "runtime.lock"
+        )
+        with pytest.raises(PredictionRuntimeOwnershipError):
+            competing_owner.acquire()
+    finally:
+        runtime.stop()
+
+    restarted = make_runtime()
+    restarted.start()
+    try:
+        assert restarted.state == "RUNNING"
+        assert restarted.store is not None
+        assert restarted.store.data_dir == tmp_path / "shadow"
+    finally:
+        restarted.stop()
+
+    assert external_calls == []
 
 
 def test_shadow_cleanup_retains_lock_and_guards_when_monitor_thread_survives(

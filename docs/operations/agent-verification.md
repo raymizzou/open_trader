@@ -46,6 +46,13 @@ SHA named by its gate.
   make production-smoke EXPECTED_SHA=<40hex> EXPECTED_ROOT=<absolute immutable checkout> EXPECTED_RUNTIME_ROOT=/absolute/path/to/shared-runtime
   ```
 
+  For a release with the reversible N_LEG pause enabled, add
+  `N_LEG_PAUSED=1`. Smoke then requires the prediction health payload to report
+  `N_LEG_PAUSED`, verifies the LP dashboard contract, and does not request
+  `/api/prediction-arbitrage/state`. The default `N_LEG_PAUSED=0` keeps the
+  normal state contract check; a missing or contradictory pause status blocks
+  the gate.
+
   It must end with `HEALTHY` or `ROLLBACK`. `make production-smoke` first runs
   the five marked Python browser regressions, then uses the direct cached JS
   runner against `tests/e2e/production-smoke.spec.ts` from the validated

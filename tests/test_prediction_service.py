@@ -7863,6 +7863,444 @@ def test_shadow_health_and_reads_fail_closed_after_a_violation() -> None:
     assert state == {"error": "shadow runtime is unavailable"}
 
 
+def test_paused_n_leg_routes_reject_before_business_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.prediction_runtime as runtime_module
+
+    external_calls: list[tuple[str, object]] = []
+
+    class ExternalTrading:
+        config = SimpleNamespace(wallet_address="0xwallet")
+
+        def __init__(self) -> None:
+            self.order = {
+                "order_id": "manual-order",
+                "market_id": "manual-market",
+                "condition_id": "manual-condition",
+                "token_id": "manual-token",
+                "market_title": "Manual order fact",
+                "outcome": "NO",
+                "side": "BUY",
+                "status": "LIVE",
+                "price": Decimal("0.36"),
+                "original_size": Decimal("100"),
+                "size_matched": Decimal("0"),
+                "remaining_size": Decimal("100"),
+            }
+
+        def readiness_snapshot(self) -> dict[str, object]:
+            return {
+                "checked_at": datetime.now(UTC),
+                "relayer_ready": True,
+                "merge_ready": True,
+            }
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "wallet_address": "0xwallet",
+                "p_usd_balance": Decimal("100"),
+                "p_usd_allowance": Decimal("100"),
+                "open_order_ids": ("manual-order",),
+                "positions": (),
+                "checked_at": datetime.now(UTC),
+            }
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            external_calls.append(("lp_account_snapshot", None))
+            return {
+                "authenticated": True,
+                "balance": Decimal("100"),
+                "allowance": Decimal("100"),
+                "open_orders": (dict(self.order),),
+                "positions": (),
+                "checked_at": datetime.now(UTC),
+            }
+
+        def get_order_scoring(self, _order_id: str) -> bool:
+            return False
+
+        def lp_reward_catalog(
+            self,
+            *,
+            condition_ids: object = None,
+            stop_event: threading.Event | None = None,
+        ) -> dict[str, object]:
+            del condition_ids, stop_event
+            external_calls.append(("lp_reward_catalog", None))
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": datetime.now(UTC),
+                "markets": (),
+            }
+
+        def lp_reward_snapshot(
+            self, reward_date: str, condition_id: str, **_kwargs: object
+        ) -> dict[str, object]:
+            external_calls.append(("lp_reward_snapshot", (reward_date, condition_id)))
+            return {
+                "state": "known",
+                "reward_date": reward_date,
+                "condition_id": condition_id,
+                "market_amount": Decimal("0"),
+                "account_amount": Decimal("0"),
+            }
+
+        def close(self) -> None:
+            external_calls.append(("trading_close", None))
+
+        def __getattr__(self, name: str) -> object:
+            if name in {
+                "cancel_orders",
+                "lp_post_order",
+                "post_order",
+                "submit_protected_sell",
+            }:
+
+                def forbidden(*_args: object, **_kwargs: object) -> None:
+                    external_calls.append(("order_mutation", name))
+                    raise AssertionError(f"paused HTTP path attempted {name}")
+
+                return forbidden
+            raise AttributeError(name)
+
+    class ExternalNotifier:
+        def __init__(self, channel: str) -> None:
+            self.channel = channel
+
+        def send(self, *_args: object, **_kwargs: object) -> bool:
+            external_calls.append(("notification", self.channel))
+            return True
+
+    config = SimpleNamespace(
+        signer_address="0xsigner", wallet_address="0xwallet", predict=None
+    )
+    trading = ExternalTrading()
+    store = PredictionArbitrageStore(tmp_path)
+    store.lp_create_session(
+        "lp-session",
+        "lp-idempotency",
+        state="complete",
+        payload={
+            "market_id": "manual-market",
+            "condition_id": "manual-condition",
+            "token_id": "manual-token",
+            "outcome": "NO",
+            "price": "0.36",
+            "quantity": "100",
+            "review_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
+        },
+    )
+    monkeypatch.setenv("OPEN_TRADER_NLEG_PAUSED", "1")
+    monkeypatch.setattr(runtime_module, "load_trading_config", lambda _path: config)
+    monkeypatch.setattr(
+        runtime_module,
+        "PolymarketTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: trading),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "PredictTradingClient",
+        SimpleNamespace(
+            from_keychain=lambda _config: (_ for _ in ()).throw(
+                AssertionError("paused HTTP server must not construct Predict client")
+            )
+        ),
+    )
+    runtime = runtime_module.PredictionRuntime(
+        data_dir=tmp_path,
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+        notifier=SimpleNamespace(
+            _notifiers=(ExternalNotifier("macos"), ExternalNotifier("feishu"))
+        ),
+    )
+    runtime.start()
+    try:
+        with _running_server(
+            runtime,
+            session_token="session-token",
+            csrf_token="csrf-token",
+            runtime_metadata={"git_sha": "abc123"},
+        ) as (base, _server_instance):
+            health_status, health = _response(base + "/healthz")
+            venues_status, venues = _response(
+                base + "/api/prediction-arbitrage/venues"
+            )
+
+            get_paths = (
+                "/api/prediction-arbitrage/state",
+                "/api/prediction-arbitrage/history?kind=signals",
+                "/api/prediction-arbitrage/n-leg/mode",
+                "/api/prediction-arbitrage/n-leg/report",
+                "/api/prediction-arbitrage/relations",
+                "/api/prediction-arbitrage/relations/version-1",
+                "/api/prediction-arbitrage/llm-provider",
+            )
+            get_results = [_response(base + path) for path in get_paths]
+            post_paths = (
+                "/api/prediction-arbitrage/mode",
+                "/api/prediction-arbitrage/preview",
+                "/api/prediction-arbitrage/n-leg/mode",
+                "/api/prediction-arbitrage/n-leg/orders/confirm",
+                "/api/prediction-arbitrage/relations/change-set",
+                "/api/prediction-arbitrage/llm-provider",
+            )
+            post_results = [
+                _response(_production_request(base, path, data=b"{}"))
+                for path in post_paths
+            ]
+            lp_status, lp_payload = _response(
+                base + "/api/prediction-arbitrage/lp/dashboard"
+            )
+            session_status, session_payload = _response(
+                base + "/api/prediction-arbitrage/lp/sessions/current"
+            )
+            report_status, report_payload = _response(
+                base + "/api/prediction-arbitrage/lp/reports/2026-09-17"
+            )
+            lp_post_status, lp_post_payload = _response(
+                _production_request(
+                    base,
+                    "/api/prediction-arbitrage/lp/candidates/refresh",
+                    data=b"{}",
+                )
+            )
+            unauthorized_lp_status = _status(
+                Request(
+                    base + "/api/prediction-arbitrage/lp/candidates/refresh",
+                    data=b"{}",
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+            )
+    finally:
+        runtime.stop()
+
+    assert health_status == 200
+    assert health["n_leg"] == {"status": "paused", "code": "N_LEG_PAUSED"}
+    assert venues_status == 200
+    assert venues["n_leg"] == {"status": "paused", "code": "N_LEG_PAUSED"}
+    assert [status for status, _payload in get_results] == [409] * len(get_paths)
+    assert all(
+        payload["error"] == "N_LEG_PAUSED"
+        for _status_code, payload in get_results
+    )
+    assert [status for status, _payload in post_results] == [409] * len(post_paths)
+    assert all(
+        payload["error"] == "N_LEG_PAUSED"
+        for _status_code, payload in post_results
+    )
+    assert lp_status == 200
+    assert lp_payload["orders"][0]["order_id"] == "manual-order"
+    assert lp_payload["orders"][0]["management"] == "manual_read_only"
+    assert session_status == 200
+    assert session_payload["state"] == "complete"
+    assert report_status == 404
+    assert report_payload == {"error": "LP report not found"}
+    assert lp_post_status == 202
+    assert lp_post_payload == {"state": "queued"}
+    assert unauthorized_lp_status == 403
+    assert not [
+        call
+        for call in external_calls
+        if call[0] in {"order_mutation", "notification"}
+    ]
+
+
+def test_paused_n_leg_requests_do_not_hold_lp_or_health_responses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.prediction_runtime as runtime_module
+
+    n_leg_entered = threading.Event()
+    release_n_leg = threading.Event()
+    external_calls: list[str] = []
+
+    class ExternalTrading:
+        config = SimpleNamespace(wallet_address="0xwallet")
+
+        def readiness_snapshot(self) -> dict[str, object]:
+            return {
+                "checked_at": datetime.now(UTC),
+                "relayer_ready": True,
+                "merge_ready": True,
+            }
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "wallet_address": "0xwallet",
+                "p_usd_balance": Decimal("100"),
+                "p_usd_allowance": Decimal("100"),
+                "open_order_ids": (),
+                "positions": (),
+                "checked_at": datetime.now(UTC),
+            }
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            external_calls.append("lp_account_snapshot")
+            return {
+                "authenticated": True,
+                "balance": Decimal("100"),
+                "allowance": Decimal("100"),
+                "open_orders": (),
+                "positions": (),
+                "checked_at": datetime.now(UTC),
+            }
+
+        def lp_reward_catalog(
+            self,
+            *,
+            condition_ids: object = None,
+            stop_event: threading.Event | None = None,
+        ) -> dict[str, object]:
+            del condition_ids, stop_event
+            external_calls.append("lp_reward_catalog")
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": datetime.now(UTC),
+                "markets": (),
+            }
+
+        def close(self) -> None:
+            external_calls.append("trading_close")
+
+    class ExternalNotifier:
+        def __init__(self, channel: str) -> None:
+            self.channel = channel
+
+        def send(self, *_args: object, **_kwargs: object) -> bool:
+            external_calls.append(f"notification:{self.channel}")
+            return True
+
+    def blocked_predict_client(_config: object) -> object:
+        n_leg_entered.set()
+        release_n_leg.wait(timeout=5)
+        raise AssertionError("paused concurrent HTTP path entered N_LEG external boundary")
+
+    config = SimpleNamespace(
+        signer_address="0xsigner", wallet_address="0xwallet", predict=None
+    )
+    trading = ExternalTrading()
+    monkeypatch.setenv("OPEN_TRADER_NLEG_PAUSED", "1")
+    monkeypatch.setattr(runtime_module, "load_trading_config", lambda _path: config)
+    monkeypatch.setattr(
+        runtime_module,
+        "PolymarketTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: trading),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "PredictTradingClient",
+        SimpleNamespace(from_keychain=blocked_predict_client),
+    )
+    runtime = runtime_module.PredictionRuntime(
+        data_dir=tmp_path,
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+        notifier=SimpleNamespace(
+            _notifiers=(ExternalNotifier("macos"), ExternalNotifier("feishu"))
+        ),
+    )
+    runtime.start()
+    try:
+        with _running_server(
+            runtime,
+            session_token="session-token",
+            csrf_token="csrf-token",
+            runtime_metadata={"git_sha": "abc123"},
+        ) as (base, _server_instance):
+            paths = (
+                "/api/prediction-arbitrage/state",
+                "/api/prediction-arbitrage/history?kind=signals",
+                "/api/prediction-arbitrage/n-leg/report",
+                "/api/prediction-arbitrage/lp/dashboard",
+                "/healthz",
+            )
+            barrier = threading.Barrier(len(paths))
+
+            def fetch(path: str) -> tuple[str, int, dict[str, object]]:
+                barrier.wait(timeout=5)
+                status, payload = _response(base + path, timeout=5)
+                return path, status, payload
+
+            with ThreadPoolExecutor(max_workers=len(paths)) as clients:
+                results = list(clients.map(fetch, paths))
+
+            by_path = {path: (status, payload) for path, status, payload in results}
+            assert [by_path[path][0] for path in paths[:3]] == [409, 409, 409]
+            assert by_path["/api/prediction-arbitrage/lp/dashboard"][0] == 200
+            assert by_path["/healthz"][0] == 200
+            assert by_path["/api/prediction-arbitrage/lp/dashboard"][1]["state"] == "ready"
+            assert by_path["/healthz"][1]["n_leg"] == {
+                "status": "paused",
+                "code": "N_LEG_PAUSED",
+            }
+            assert n_leg_entered.is_set() is False
+            assert release_n_leg.is_set() is False
+    finally:
+        release_n_leg.set()
+        runtime.stop()
+
+    assert "lp_account_snapshot" in external_calls
+    assert not any(item.startswith("notification:") for item in external_calls)
+
+
+def test_shadow_paused_n_leg_posts_report_pause_before_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.prediction_runtime as runtime_module
+
+    monkeypatch.setenv("OPEN_TRADER_NLEG_PAUSED", "1")
+    runtime = runtime_module.PredictionRuntime(
+        data_dir=tmp_path,
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+        mode="shadow",
+    )
+    runtime.start()
+    try:
+        with _server(runtime) as base:
+            n_leg_paths = (
+                "/api/prediction-arbitrage/preview",
+                "/api/prediction-arbitrage/n-leg/orders/confirm",
+                "/api/prediction-arbitrage/relations/change-set",
+            )
+            n_leg_results = [
+                _response(
+                    Request(
+                        base + path,
+                        data=b"{",
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                )
+                for path in n_leg_paths
+            ]
+            lp_status, lp_payload = _response(
+                Request(
+                    base + "/api/prediction-arbitrage/lp/sessions/start",
+                    data=b"{",
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+            )
+    finally:
+        runtime.stop()
+
+    assert n_leg_results == [
+        (409, {"error": "N_LEG_PAUSED", "error_code": "N_LEG_PAUSED"})
+        for _path in n_leg_paths
+    ]
+    assert lp_status == 403
+    assert lp_payload == {
+        "code": "shadow_read_only",
+        "message": "Shadow Prediction Service is read-only",
+    }
+
+
 def test_shadow_service_rejects_non_loopback_before_binding() -> None:
     with pytest.raises(ValueError, match="loopback"):
         create_prediction_server(runtime=_Runtime(), host="0.0.0.0", port=0)
@@ -8002,7 +8440,13 @@ def test_venues_endpoint_serves_cached_cards_and_bootstraps_lp_auth(
             Request(base + "/api/prediction-arbitrage/venues", method="GET")
         )
         assert status == 200
-        assert set(payload) == {"venues", "monitor_subscription", "csrf_token"}
+        assert set(payload) == {
+            "venues",
+            "monitor_subscription",
+            "csrf_token",
+            "n_leg",
+        }
+        assert payload["n_leg"] == {"status": "running", "code": "N_LEG_RUNNING"}
         assert payload["csrf_token"] == "csrf-token"
         venues = payload["venues"]
         assert isinstance(venues, list) and len(venues) == 2

@@ -72,6 +72,13 @@ const state = {
     signalError: "",
     signalPollEpoch: 0,
     signalHistoryGeneration: 0,
+    nLegStatus: "unknown",
+    nLegReadGeneration: 0,
+    stateRequestController: null,
+    historyRequestController: null,
+    nlegReportRequestController: null,
+    relationReviewRequestController: null,
+    relationDetailRequestController: null,
     csrfToken: "",
     lpShareWatchPending: {},
     lpShareWatchConfirmed: {},
@@ -1050,6 +1057,7 @@ function setWorkspaceView(view) {
   } else {
     stopPredictionPolling();
     stopPredictionSignalPolling();
+    if (previousView === "prediction_market") invalidatePredictionNLegReads();
     if (previousView === "prediction_market") loadAccountSnapshot();
   }
 }
@@ -3045,13 +3053,17 @@ function predictionUnifiedPage(payload, filter) {
 function predictionVenueSummary() {
   const payload = state.predictionMarket.venuesPayload;
   const error = state.predictionMarket.venuesError;
+  const nLeg = payload?.n_leg && typeof payload.n_leg === "object" ? payload.n_leg : {};
   const summary = Array.isArray(payload?.venues) && payload.venues.length
     ? predictionReadinessStrip(payload)
     : `<section class="pm-readiness pm-venue-readiness" aria-label="交易所连接与账户状态"><article class="pm-readiness-item"><span>平台状态</span><strong>UNKNOWN</strong><small>${escapeHtml(error || "等待首次同步")}</small></article></section>`;
+  const pauseNotice = nLeg.status === "paused"
+    ? `<p class="pm-signal-error" role="status">多腿套利已暂停 · 仅保留 LP 请求</p>`
+    : "";
   const stale = error
     ? `<p class="pm-signal-error" role="status">平台摘要读取失败 · UNKNOWN · ${escapeHtml(error)} · 保留上次成功状态</p>`
     : "";
-  return summary + stale;
+  return pauseNotice + summary + stale;
 }
 
 function predictionMarketTabs() {
@@ -5060,6 +5072,7 @@ function predictionLegacyControlsRetired(payload) {
 }
 
 function predictionModeBar(payload) {
+  if (state.predictionMarket.nLegStatus === "paused") return "";
   const nleg = payload?.n_leg && typeof payload.n_leg === "object" ? payload.n_leg : {};
   const gates = nleg.execution_gates && typeof nleg.execution_gates === "object" ? nleg.execution_gates : {};
   const contractMode = String(nleg.mode || "");
@@ -5131,6 +5144,7 @@ function renderPredictionMarket() {
 function selectPredictionTab(tab) {
   const active = tab === "multi_leg" ? "multi_leg" : "lp";
   if (state.predictionMarket.activeTab === active) return;
+  if (active !== "multi_leg") invalidatePredictionNLegReads();
   state.predictionMarket.activeTab = active;
   renderPredictionMarket();
   fetchPredictionVenues();
@@ -5170,7 +5184,7 @@ function stopPredictionPolling() {
 
 function startPredictionSignalPolling() {
   stopPredictionSignalPolling();
-  if (state.workspaceView !== "prediction_market" || state.predictionMarket.strategy !== "yes_no") return;
+  if (!predictionNLegReadAllowed() || state.predictionMarket.strategy !== "yes_no") return;
   loadPredictionHistory("signals", {panelOnly: true});
   state.predictionMarket.signalPollId = window.setInterval(() => {
     loadPredictionHistory("signals", {panelOnly: true});
@@ -5189,6 +5203,67 @@ function predictionRequestUrl(path) {
   if (typeof window === "undefined" || !window.location) return path;
   const scenario = new URLSearchParams(window.location.search || "").get("prediction_state");
   return scenario ? `${path}${path.includes("?") ? "&" : "?"}scenario=${encodeURIComponent(scenario)}` : path;
+}
+
+function predictionNLegStatus(payload) {
+  const status = String(payload?.n_leg?.status || "").trim().toLowerCase();
+  return status === "paused" ? "paused" : status === "running" ? "running" : "unknown";
+}
+
+function predictionNLegReadAllowed() {
+  return state.workspaceView === "prediction_market"
+    && state.predictionMarket.activeTab === "multi_leg"
+    && state.predictionMarket.nLegStatus === "running";
+}
+
+function predictionNLegPath(path) {
+  const value = String(path || "").split("?", 1)[0];
+  return value.includes("/prediction-arbitrage/state")
+    || value.includes("/prediction-arbitrage/history")
+    || value.includes("/prediction-arbitrage/n-leg/")
+    || value.includes("/prediction-arbitrage/relations")
+    || value.endsWith("/prediction-arbitrage/llm-provider")
+    || value.endsWith("/prediction-arbitrage/mode")
+    || value.endsWith("/prediction-arbitrage/preview")
+    || value.endsWith("/prediction-arbitrage/executions")
+    || value.endsWith("/prediction-arbitrage/circuit-breaker/reset")
+    || value.endsWith("/prediction-arbitrage/predict-allowance/cleanup")
+    || value.endsWith("/prediction-arbitrage/cross-auto/pause");
+}
+
+function predictionNLegReadCurrent(generation, controller) {
+  const signal = controller?.signal;
+  return state.predictionMarket.nLegReadGeneration === generation
+    && predictionNLegReadAllowed()
+    && signal?.aborted !== true;
+}
+
+function invalidatePredictionNLegReads() {
+  const prediction = state.predictionMarket;
+  prediction.nLegReadGeneration += 1;
+  for (const key of [
+    "stateRequestController",
+    "historyRequestController",
+    "nlegReportRequestController",
+    "relationReviewRequestController",
+    "relationDetailRequestController",
+  ]) {
+    const controller = prediction[key];
+    controller?.abort?.();
+    prediction[key] = null;
+  }
+  prediction.stateRequestInFlight = false;
+  prediction.signalRequestInFlight = false;
+  prediction.signalPollEpoch += 1;
+  prediction.relationReview.loading = false;
+  if (prediction.nlegReport) {
+    prediction.nlegReport.open = false;
+    prediction.nlegReport.data = null;
+    prediction.nlegReport.error = null;
+  }
+  prediction.relationReview.open = false;
+  prediction.relationReview.detail = null;
+  if (predictionModal?.kind && predictionModal.kind !== "order") closePredictionModal();
 }
 
 async function fetchPredictionLpDashboard() {
@@ -5254,8 +5329,14 @@ async function fetchPredictionVenues() {
     state.predictionMarket.venuesPayload = {...payload};
     state.predictionMarket.venuesError = "";
     state.predictionMarket.csrfToken = payload.csrf_token || state.predictionMarket.csrfToken;
+    const nLegStatus = predictionNLegStatus(payload);
+    state.predictionMarket.nLegStatus = nLegStatus;
+    if (nLegStatus !== "running") invalidatePredictionNLegReads();
+    else if (state.predictionMarket.activeTab === "multi_leg") fetchPredictionState();
   } catch (error) {
     state.predictionMarket.venuesError = error instanceof Error ? error.message : String(error);
+    state.predictionMarket.nLegStatus = "unknown";
+    invalidatePredictionNLegReads();
   } finally {
     state.predictionMarket.venuesRequestInFlight = false;
     if (state.workspaceView === "prediction_market") renderPredictionMarket();
@@ -5263,14 +5344,19 @@ async function fetchPredictionVenues() {
 }
 
 async function fetchPredictionState() {
-  if (state.workspaceView !== "prediction_market" || state.predictionMarket.activeTab !== "multi_leg"
-    || state.predictionMarket.stateRequestInFlight) return;
-  state.predictionMarket.stateRequestInFlight = true;
+  const prediction = state.predictionMarket;
+  if (!predictionNLegReadAllowed() || prediction.stateRequestInFlight) return;
+  prediction.stateRequestInFlight = true;
+  const generation = prediction.nLegReadGeneration;
+  const controller = new AbortController();
+  prediction.stateRequestController = controller;
   const signalHistoryGeneration = state.predictionMarket.signalHistoryGeneration;
   try {
-    const response = await fetch(predictionRequestUrl("/api/prediction-arbitrage/state"), {cache: "no-store", credentials: "same-origin"});
+    const response = await fetch(predictionRequestUrl("/api/prediction-arbitrage/state"), {cache: "no-store", credentials: "same-origin", signal: controller.signal});
+    if (!predictionNLegReadCurrent(generation, controller)) return;
     if (!response.ok) throw new Error(`prediction state ${response.status}`);
     const payload = await response.json();
+    if (!predictionNLegReadCurrent(generation, controller)) return;
     const previousHistories = state.predictionMarket.payload?.histories || {};
     const histories = {...previousHistories, ...(payload.histories || {})};
     if (state.predictionMarket.signalHistoryGeneration !== signalHistoryGeneration && Array.isArray(previousHistories.signals)) {
@@ -5287,6 +5373,7 @@ async function fetchPredictionState() {
       state.predictionMarket.historyKind = "signals";
     }
   } catch (error) {
+    if (!predictionNLegReadCurrent(generation, controller)) return;
     state.predictionMarket.error = error instanceof Error ? error.message : String(error);
     if (state.predictionMarket.payload) {
       const payload = state.predictionMarket.payload;
@@ -5346,22 +5433,31 @@ async function fetchPredictionState() {
       state.predictionMarket.payload = {status: "unavailable", stale: true, readiness: {status: "unavailable"}, events: [], opportunities: [], breaker: {open: true}};
     }
   } finally {
-    state.predictionMarket.stateRequestInFlight = false;
+    if (prediction.stateRequestController === controller) prediction.stateRequestController = null;
+    if (prediction.nLegReadGeneration === generation) prediction.stateRequestInFlight = false;
   }
-  if (state.workspaceView === "prediction_market" && state.predictionMarket.activeTab === "multi_leg") {
+  if (predictionNLegReadCurrent(generation, controller)) {
     renderPredictionMarket();
   }
 }
 
 async function loadPredictionHistory(kind, options = {}) {
   const panelOnly = options.panelOnly === true;
+  if (!predictionNLegReadAllowed()) return;
   if (panelOnly && state.predictionMarket.signalRequestInFlight) return;
   const requestEpoch = panelOnly ? state.predictionMarket.signalPollEpoch : null;
-  if (panelOnly) state.predictionMarket.signalRequestInFlight = true;
+  const prediction = state.predictionMarket;
+  const generation = prediction.nLegReadGeneration;
+  prediction.historyRequestController?.abort?.();
+  const controller = new AbortController();
+  prediction.historyRequestController = controller;
+  if (panelOnly) prediction.signalRequestInFlight = true;
   try {
-    const response = await fetch(predictionRequestUrl(`/api/prediction-arbitrage/history?kind=${encodeURIComponent(kind)}&limit=100`), {cache: "no-store", credentials: "same-origin"});
+    const response = await fetch(predictionRequestUrl(`/api/prediction-arbitrage/history?kind=${encodeURIComponent(kind)}&limit=100`), {cache: "no-store", credentials: "same-origin", signal: controller.signal});
+    if (!predictionNLegReadCurrent(generation, controller)) return;
     if (!response.ok) throw new Error(`prediction history ${response.status}`);
     const result = await response.json();
+    if (!predictionNLegReadCurrent(generation, controller)) return;
     const payload = state.predictionMarket.payload || {};
     state.predictionMarket.payload = {...payload, histories: {...(payload.histories || {}), [kind]: Array.isArray(result.items) ? result.items : []}};
     if (!panelOnly) state.predictionMarket.error = "";
@@ -5371,6 +5467,7 @@ async function loadPredictionHistory(kind, options = {}) {
       state.predictionMarket.signalError = "";
     }
   } catch (error) {
+    if (!predictionNLegReadCurrent(generation, controller)) return;
     const message = error instanceof Error ? error.message : String(error);
     if (kind === "signals" && panelOnly) {
       state.predictionMarket.signalError = message;
@@ -5378,8 +5475,10 @@ async function loadPredictionHistory(kind, options = {}) {
       state.predictionMarket.error = message;
     }
   } finally {
-    if (panelOnly) state.predictionMarket.signalRequestInFlight = false;
+    if (prediction.historyRequestController === controller) prediction.historyRequestController = null;
+    if (panelOnly && prediction.nLegReadGeneration === generation) prediction.signalRequestInFlight = false;
   }
+  if (!predictionNLegReadCurrent(generation, controller)) return;
   if (panelOnly && requestEpoch === state.predictionMarket.signalPollEpoch) {
     renderPredictionSignalPanel();
   } else if (kind === state.predictionMarket.historyKind) {
@@ -5401,6 +5500,7 @@ function renderPredictionSignalPanel() {
 }
 
 async function predictionPost(path, body) {
+  if (predictionNLegPath(path) && !predictionNLegReadAllowed()) throw new Error("N_LEG_PAUSED");
   const response = await fetch(predictionRequestUrl(path), {method: "POST", credentials: "same-origin", headers: {"Content-Type": "application/json", "X-CSRF-Token": state.predictionMarket.csrfToken}, body: JSON.stringify(body)});
   if (!response.ok) {
     let message = `prediction mutation ${response.status}`;
@@ -5822,31 +5922,51 @@ function nlegReportDrawer() {
   return `${base}<div class="pm-n-leg-report-ledger"><span>总未结算资本 <strong>${escapeHtml(predictionNLegUnitsMoney(ledger.total_unsettled_capital_units))}</strong></span><span>活跃批次 <strong>${ledger.active_execution_batch_id ? escapeHtml(nlegReportShortId(ledger.active_execution_batch_id)) : "无"}</strong></span><span>模式 <strong>${escapeHtml(predictionValue(ledger.mode))}</strong></span><span>熔断 <strong>${ledger.breaker_open === true ? "开" : "关"}</strong></span></div><section class="pm-n-leg-report-batches">${batches.length ? batches.map(nlegReportBatchArticle).join("") : `<p class="pm-relation-empty">尚无批次。首笔真实订单确认后，这里逐批列出事实。</p>`}</section><section class="pm-n-leg-report-queue"><h3>队内请求</h3>${requestRows}</section><footer class="pm-n-leg-report-footer">只读事实快照 · 生成时间 ${escapeHtml(String(report.generated_at ?? "").slice(0, 19).replace("T", " "))} · CLI 导出 reports/n_leg_canary/</footer></div></aside>`;
 }
 async function loadNLegReport() {
+  if (!predictionNLegReadAllowed()) return;
+  const prediction = state.predictionMarket;
+  const generation = prediction.nLegReadGeneration;
+  prediction.nlegReportRequestController?.abort?.();
+  const controller = new AbortController();
+  prediction.nlegReportRequestController = controller;
   if (!state.predictionMarket.nlegReport) state.predictionMarket.nlegReport = { open: false, data: null, error: null };
   state.predictionMarket.nlegReport.open = true;
   state.predictionMarket.nlegReport.data = null;
   state.predictionMarket.nlegReport.error = null;
   renderPredictionMarket();
   try {
-    const response = await fetch(predictionRequestUrl("/api/prediction-arbitrage/n-leg/report"), { cache: "no-store", credentials: "same-origin" });
+    const response = await fetch(predictionRequestUrl("/api/prediction-arbitrage/n-leg/report"), { cache: "no-store", credentials: "same-origin", signal: controller.signal });
+    if (!predictionNLegReadCurrent(generation, controller)) return;
     if (!response.ok) throw new Error(`执行报告 ${response.status}`);
-    state.predictionMarket.nlegReport.data = await response.json();
+    const data = await response.json();
+    if (!predictionNLegReadCurrent(generation, controller)) return;
+    state.predictionMarket.nlegReport.data = data;
   } catch (error) {
+    if (!predictionNLegReadCurrent(generation, controller)) return;
     state.predictionMarket.nlegReport.error = String(error?.message || error);
+  } finally {
+    if (prediction.nlegReportRequestController === controller) prediction.nlegReportRequestController = null;
   }
-  renderPredictionMarket();
+  if (predictionNLegReadCurrent(generation, controller)) renderPredictionMarket();
 }
 
 async function loadRelationReview(view = state.predictionMarket.relationReview.view, offset = 0) {
+  if (!predictionNLegReadAllowed()) return;
   const review = state.predictionMarket.relationReview;
+  const prediction = state.predictionMarket;
+  const generation = prediction.nLegReadGeneration;
+  prediction.relationReviewRequestController?.abort?.();
+  const controller = new AbortController();
+  prediction.relationReviewRequestController = controller;
   const fetchPage = async (pageOffset) => {
-    const response = await fetch(predictionRequestUrl(`/api/prediction-arbitrage/relations?view=${encodeURIComponent(review.view)}&limit=${RELATION_REVIEW_PAGE_SIZE}&offset=${pageOffset}`), {cache: "no-store", credentials: "same-origin"});
+    const response = await fetch(predictionRequestUrl(`/api/prediction-arbitrage/relations?view=${encodeURIComponent(review.view)}&limit=${RELATION_REVIEW_PAGE_SIZE}&offset=${pageOffset}`), {cache: "no-store", credentials: "same-origin", signal: controller.signal});
+    if (!predictionNLegReadCurrent(generation, controller)) return null;
     if (!response.ok) throw new Error(`关系目录 ${response.status}`);
     return response.json();
   };
   review.loading = true; review.view = view; review.offset = Math.max(0, Number(offset) || 0); review.detail = null; renderPredictionMarket();
   try {
     const result = await fetchPage(review.offset);
+    if (!result || !predictionNLegReadCurrent(generation, controller)) return;
     review.items = Array.isArray(result.items) ? result.items : [];
     review.total = Number(result.total || 0);
     review.pendingCount = Number(result.pending_count || 0);
@@ -5854,18 +5974,39 @@ async function loadRelationReview(view = state.predictionMarket.relationReview.v
     if (review.total > 0 && review.offset > maxOffset) {
       review.offset = maxOffset;
       const clamped = await fetchPage(review.offset);
+      if (!clamped || !predictionNLegReadCurrent(generation, controller)) return;
       review.items = Array.isArray(clamped.items) ? clamped.items : [];
     }
-  } catch (error) { state.predictionMarket.error = error instanceof Error ? error.message : String(error); review.items = []; review.total = 0; }
-  finally { review.loading = false; renderPredictionMarket(); }
+  } catch (error) {
+    if (!predictionNLegReadCurrent(generation, controller)) return;
+    state.predictionMarket.error = error instanceof Error ? error.message : String(error); review.items = []; review.total = 0;
+  } finally {
+    if (prediction.relationReviewRequestController === controller) prediction.relationReviewRequestController = null;
+    if (predictionNLegReadCurrent(generation, controller)) { review.loading = false; renderPredictionMarket(); }
+  }
 }
 
 async function loadRelationDetail(relationVersionId) {
+  if (!predictionNLegReadAllowed()) return;
+  const prediction = state.predictionMarket;
+  const generation = prediction.nLegReadGeneration;
+  prediction.relationDetailRequestController?.abort?.();
+  const controller = new AbortController();
+  prediction.relationDetailRequestController = controller;
   try {
-    const response = await fetch(predictionRequestUrl(`/api/prediction-arbitrage/relations/${encodeURIComponent(relationVersionId)}`), {cache: "no-store", credentials: "same-origin"});
+    const response = await fetch(predictionRequestUrl(`/api/prediction-arbitrage/relations/${encodeURIComponent(relationVersionId)}`), {cache: "no-store", credentials: "same-origin", signal: controller.signal});
+    if (!predictionNLegReadCurrent(generation, controller)) return;
     if (!response.ok) throw new Error(`关系详情 ${response.status}`);
-    state.predictionMarket.relationReview.detail = await response.json();
-  } catch (error) { state.predictionMarket.error = error instanceof Error ? error.message : String(error); }
+    const detail = await response.json();
+    if (!predictionNLegReadCurrent(generation, controller)) return;
+    state.predictionMarket.relationReview.detail = detail;
+  } catch (error) {
+    if (!predictionNLegReadCurrent(generation, controller)) return;
+    state.predictionMarket.error = error instanceof Error ? error.message : String(error);
+  } finally {
+    if (prediction.relationDetailRequestController === controller) prediction.relationDetailRequestController = null;
+  }
+  if (!predictionNLegReadCurrent(generation, controller)) return;
   renderPredictionMarket();
   document.querySelector("[data-relation-detail]")?.scrollIntoView?.({block: "nearest", behavior: "smooth"});
 }

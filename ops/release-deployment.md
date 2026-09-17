@@ -126,6 +126,14 @@ make production-smoke \
   EXPECTED_RUNTIME_ROOT=<运行时根>
 ```
 
+若本次发布要保持 N_LEG 暂停，在同一条命令增加 `N_LEG_PAUSED=1`。Smoke
+会要求 Prediction Service 的 health 返回 `N_LEG_PAUSED`，核对 LP dashboard
+仍可读，并跳过 `/api/prediction-arbitrage/state`；默认 `N_LEG_PAUSED=0`
+继续核对正常 N_LEG state。暂停值由
+`scripts/install_prediction_service_launchd.sh --n-leg-paused 1` 写入
+launchd 环境；后续安装省略参数时保留已有值，恢复必须明确指定
+`--n-leg-paused 0`。
+
 必须以 `HEALTHY` 收尾。冒烟会逐一核对四个服务的 `/healthz`:除既有的
 `cwd`/`git_sha` 外,还要求 `code_root`(account 另有 `worker_code_root`)存在且
 位于 `EXPECTED_ROOT` 之下——这是防止"服务加载旧发布代码"的关键断言

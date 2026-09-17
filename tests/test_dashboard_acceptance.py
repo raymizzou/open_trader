@@ -1198,6 +1198,165 @@ def test_production_smoke_binds_checks_to_release_and_runtime_roots() -> None:
     assert all(required)
 
 
+def test_production_smoke_validates_paused_n_leg_without_state_request(tmp_path: Path) -> None:
+    repo_root = Path(__file__).parents[1]
+    expected_root = tmp_path / "release"
+    expected_root.mkdir()
+    runtime_root = tmp_path / "runtime"
+    (runtime_root / "logs/prediction_service").mkdir(parents=True)
+    (runtime_root / "logs/prediction_service/launchd.err.log").write_text("clean\n", encoding="utf-8")
+    for name in ("frontend_gateway", "legacy_dashboard", "account_api"):
+        log = expected_root / f"logs/{name}/launchd.err.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("clean\n", encoding="utf-8")
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    calls = tmp_path / "calls"
+    python_wrapper = fake_bin / "python-wrapper"
+    python_wrapper.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"-m\" ] && [ \"$2\" = \"pytest\" ]; then exit 0; fi\n"
+        "exec \"$REAL_PYTHON\" \"$@\"\n",
+        encoding="utf-8",
+    )
+    curl = fake_bin / "curl"
+    curl.write_text(
+        "#!/bin/sh\n"
+        "url=\"\"\n"
+        "for arg in \"$@\"; do url=\"$arg\"; done\n"
+        "printf '%s\\n' \"$url\" >> \"$FAKE_CALLS\"\n"
+        "case \"$url\" in\n"
+        "  *8769/healthz) if [ \"${FAKE_NLEG_MISSING:-0}\" = 1 ]; then printf '%s\\n' \"{\\\"schema_version\\\":\\\"open_trader.prediction_service.health.v1\\\",\\\"module\\\":\\\"prediction_service\\\",\\\"status\\\":\\\"running\\\",\\\"mode\\\":\\\"production\\\",\\\"production_owner\\\":true,\\\"mutations\\\":\\\"enabled\\\",\\\"cwd\\\":\\\"$FAKE_ROOT\\\",\\\"source_state\\\":\\\"clean\\\",\\\"git_sha\\\":\\\"$FAKE_SHA\\\",\\\"code_root\\\":\\\"$FAKE_ROOT\\\",\\\"pid\\\":8769}\"; else printf '%s\\n' \"{\\\"schema_version\\\":\\\"open_trader.prediction_service.health.v1\\\",\\\"module\\\":\\\"prediction_service\\\",\\\"status\\\":\\\"running\\\",\\\"mode\\\":\\\"production\\\",\\\"production_owner\\\":true,\\\"mutations\\\":\\\"enabled\\\",\\\"cwd\\\":\\\"$FAKE_ROOT\\\",\\\"source_state\\\":\\\"clean\\\",\\\"git_sha\\\":\\\"$FAKE_SHA\\\",\\\"code_root\\\":\\\"$FAKE_ROOT\\\",\\\"n_leg\\\":{\\\"status\\\":\\\"$FAKE_NLEG_STATUS\\\",\\\"code\\\":\\\"$FAKE_NLEG_CODE\\\"},\\\"pid\\\":8769}\"; fi ;;\n"
+        "  */api/prediction-arbitrage/lp/dashboard) if [ \"${FAKE_LP_MISSING:-0}\" = 1 ]; then printf '%s\\n' '{\"state\":\"unknown\"}'; else printf '%s\\n' '{\"state\":\"ready\",\"orders\":[],\"positions\":[],\"recommendations\":[]}'; fi ;;\n"
+        "  *8766/healthz) printf '%s\\n' \"{\\\"schema_version\\\":\\\"open_trader.frontend_gateway.health.v1\\\",\\\"module\\\":\\\"frontend_gateway\\\",\\\"status\\\":\\\"running\\\",\\\"cwd\\\":\\\"$FAKE_ROOT\\\",\\\"source_state\\\":\\\"clean\\\",\\\"git_sha\\\":\\\"$FAKE_SHA\\\",\\\"code_root\\\":\\\"$FAKE_ROOT\\\",\\\"legacy_upstream_status\\\":\\\"ok\\\",\\\"account_upstream_status\\\":\\\"ok\\\",\\\"prediction_upstream_status\\\":\\\"ok\\\",\\\"prediction_route_mode\\\":\\\"service\\\",\\\"pid\\\":8766}\" ;;\n"
+        "  *8767/healthz) printf '%s\\n' \"{\\\"schema_version\\\":\\\"open_trader.legacy_dashboard.health.v1\\\",\\\"module\\\":\\\"legacy_dashboard\\\",\\\"status\\\":\\\"running\\\",\\\"cwd\\\":\\\"$FAKE_ROOT\\\",\\\"source_state\\\":\\\"clean\\\",\\\"git_sha\\\":\\\"$FAKE_SHA\\\",\\\"code_root\\\":\\\"$FAKE_ROOT\\\",\\\"pid\\\":8767}\" ;;\n"
+        "  *8768/healthz) printf '%s\\n' \"{\\\"schema_version\\\":\\\"open_trader.account_api.health.v1\\\",\\\"module\\\":\\\"account_api\\\",\\\"status\\\":\\\"ok\\\",\\\"mode\\\":\\\"production\\\",\\\"api_git_sha\\\":\\\"$FAKE_SHA\\\",\\\"worker_git_sha\\\":\\\"$FAKE_SHA\\\",\\\"code_root\\\":\\\"$FAKE_ROOT\\\",\\\"worker_code_root\\\":\\\"$FAKE_ROOT\\\",\\\"release_match\\\":true,\\\"pid\\\":8768}\" ;;\n"
+        "  *8769/healthz) printf '%s\\n' \"{\\\"schema_version\\\":\\\"open_trader.prediction_service.health.v1\\\",\\\"module\\\":\\\"prediction_service\\\",\\\"status\\\":\\\"running\\\",\\\"mode\\\":\\\"production\\\",\\\"production_owner\\\":true,\\\"mutations\\\":\\\"enabled\\\",\\\"cwd\\\":\\\"$FAKE_ROOT\\\",\\\"source_state\\\":\\\"clean\\\",\\\"git_sha\\\":\\\"$FAKE_SHA\\\",\\\"code_root\\\":\\\"$FAKE_ROOT\\\",\\\"n_leg\\\":{\\\"status\\\":\\\"$FAKE_NLEG_STATUS\\\",\\\"code\\\":\\\"$FAKE_NLEG_CODE\\\"},\\\"pid\\\":8769}\" ;;\n"
+        "  */api/prediction-arbitrage/lp/dashboard) printf '%s\\n' '{\"state\":\"ready\",\"orders\":[],\"positions\":[],\"recommendations\":[]}' ;;\n"
+        "  */api/prediction-arbitrage/state) printf '%s\\n' '{\"n_leg\":{\"contract_generation\":2,\"mode\":\"MANUAL\",\"execution_scopes\":{\"SAME_EVENT_SAME_VENUE\":{\"capability\":\"OBSERVE_ONLY\"}}},\"opportunities\":[]}' ;;\n"
+        "  *) exit 1 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    lsof = fake_bin / "lsof"
+    lsof.write_text(
+        "#!/bin/sh\n"
+        "case \"$*\" in\n"
+        "  *-tiTCP:8766*) echo 8766 ;; *-tiTCP:8767*) echo 8767 ;; *-tiTCP:8768*) echo 8768 ;; *-tiTCP:8769*) echo 8769 ;;\n"
+        "  *-d\\ cwd\\ -Fn*) printf 'n%s\\n' \"$FAKE_ROOT\" ;;\n"
+        "  *) exit 1 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    ps = fake_bin / "ps"
+    ps.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    ripgrep = fake_bin / "rg"
+    ripgrep.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    for command in (python_wrapper, curl, lsof, ps, ripgrep):
+        command.chmod(0o755)
+    playwright = expected_root / "node_modules/.bin/playwright"
+    playwright.parent.mkdir(parents=True)
+    playwright.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    playwright.chmod(0o755)
+
+    subprocess.run(["git", "init", "--quiet"], cwd=expected_root, check=True)
+    subprocess.run(["git", "config", "user.name", "smoke-test"], cwd=expected_root, check=True)
+    subprocess.run(["git", "config", "user.email", "smoke-test@example.invalid"], cwd=expected_root, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=expected_root, check=True)
+    subprocess.run(["git", "commit", "--quiet", "-m", "fixture"], cwd=expected_root, check=True)
+    subprocess.run(["git", "checkout", "--quiet", "--detach"], cwd=expected_root, check=True)
+    expected_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=expected_root, text=True).strip()
+    probe = subprocess.run(
+        [str(curl), "-fsS", "--max-time", "5", "http://127.0.0.1:8766/healthz"],
+        env={
+            **os.environ,
+            "FAKE_CALLS": str(calls),
+            "FAKE_ROOT": str(expected_root),
+            "FAKE_SHA": expected_sha,
+            "FAKE_NLEG_STATUS": "paused",
+            "FAKE_NLEG_CODE": "N_LEG_PAUSED",
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert probe.returncode == 0, probe.stderr
+    json.loads(probe.stdout)
+
+    def run_smoke(
+        expected_pause: str,
+        status: str,
+        code: str,
+        *,
+        missing_n_leg: bool = False,
+        missing_lp: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        calls.unlink(missing_ok=True)
+        return subprocess.run(
+            [
+                "make", "production-smoke", f"EXPECTED_SHA={expected_sha}",
+                f"EXPECTED_ROOT={expected_root}", f"EXPECTED_RUNTIME_ROOT={runtime_root}",
+                f"REPOSITORY_ROOT={expected_root}", f"PYTHON_BIN={python_wrapper}",
+                f"N_LEG_PAUSED={expected_pause}",
+            ],
+            cwd=repo_root,
+            env={
+                **os.environ,
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "REAL_PYTHON": sys.executable,
+                "FAKE_CALLS": str(calls),
+                "FAKE_ROOT": str(expected_root),
+                "FAKE_SHA": expected_sha,
+                "FAKE_NLEG_STATUS": status,
+                "FAKE_NLEG_CODE": code,
+                "FAKE_NLEG_MISSING": "1" if missing_n_leg else "0",
+                "FAKE_LP_MISSING": "1" if missing_lp else "0",
+            },
+            capture_output=True,
+            text=True,
+        )
+
+    paused = run_smoke("1", "paused", "N_LEG_PAUSED")
+    assert paused.returncode == 0, paused.stdout + paused.stderr
+    paused_calls = calls.read_text(encoding="utf-8").splitlines()
+    assert any(path.endswith("/api/prediction-arbitrage/lp/dashboard") for path in paused_calls)
+    assert not any(path.endswith("/api/prediction-arbitrage/state") for path in paused_calls)
+
+    running = run_smoke("0", "running", "N_LEG_RUNNING")
+    assert running.returncode == 0, running.stdout + running.stderr
+    running_calls = calls.read_text(encoding="utf-8").splitlines()
+    assert any(path.endswith("/api/prediction-arbitrage/state") for path in running_calls)
+
+    normal_missing_n_leg = run_smoke("0", "", "", missing_n_leg=True)
+    assert normal_missing_n_leg.returncode != 0
+    assert "n-leg state: BLOCKED" in normal_missing_n_leg.stdout
+
+    normal_paused_n_leg = run_smoke("0", "paused", "N_LEG_PAUSED")
+    assert normal_paused_n_leg.returncode != 0
+    assert "n-leg state: BLOCKED" in normal_paused_n_leg.stdout
+
+    contradictory = run_smoke("1", "running", "N_LEG_RUNNING")
+    assert contradictory.returncode != 0
+    assert "n-leg state: BLOCKED" in contradictory.stdout
+
+    missing_n_leg = run_smoke("1", "paused", "N_LEG_PAUSED", missing_n_leg=True)
+    assert missing_n_leg.returncode != 0
+    assert "n-leg state: BLOCKED" in missing_n_leg.stdout
+    assert not any(
+        path.endswith("/api/prediction-arbitrage/state")
+        for path in calls.read_text(encoding="utf-8").splitlines()
+    )
+
+    missing_lp = run_smoke("1", "paused", "N_LEG_PAUSED", missing_lp=True)
+    assert missing_lp.returncode != 0
+    assert "lp dashboard: BLOCKED" in missing_lp.stdout
+    assert not any(
+        path.endswith("/api/prediction-arbitrage/state")
+        for path in calls.read_text(encoding="utf-8").splitlines()
+    )
+
+
+
 def test_acceptance_main_rejects_same_gateway_and_legacy_pid(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

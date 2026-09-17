@@ -20,9 +20,10 @@ CURL_BIN="${CURL_BIN:-/usr/bin/curl}"
 PS_BIN="${PS_BIN:-/bin/ps}"
 WAIT_SECONDS="${PREDICTION_SERVICE_LAUNCHD_WAIT_SECONDS:-90}"
 LABEL="com.open-trader.prediction-service"
+N_LEG_PAUSED_OVERRIDE="${OPEN_TRADER_NLEG_PAUSED:-}"
 
 usage() {
-  echo "usage: $0 --runtime-root PATH [--dry-run] [--preflight] [--mode shadow|production] [--repo-root PATH] [--python PATH] [--config PATH] [--notifier-config PATH] [--launch-agents-dir PATH] [--wait-seconds N] [--release-manifest PATH] [--expected-sha SHA]" >&2
+  echo "usage: $0 --runtime-root PATH [--dry-run] [--preflight] [--mode shadow|production] [--n-leg-paused 0|1] [--repo-root PATH] [--python PATH] [--config PATH] [--notifier-config PATH] [--launch-agents-dir PATH] [--wait-seconds N] [--release-manifest PATH] [--expected-sha SHA]" >&2
 }
 
 fail() {
@@ -35,6 +36,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY_RUN=1; shift ;;
     --preflight) PREFLIGHT=1; shift ;;
     --mode) [[ $# -ge 2 ]] || { usage; exit 2; }; MODE="$2"; shift 2 ;;
+    --n-leg-paused) [[ $# -ge 2 ]] || { usage; exit 2; }; N_LEG_PAUSED_OVERRIDE="$2"; shift 2 ;;
     --runtime-root) [[ $# -ge 2 ]] || { usage; exit 2; }; RUNTIME_ROOT="$2"; shift 2 ;;
     --repo-root) [[ $# -ge 2 ]] || { usage; exit 2; }; REPO_ROOT="$2"; shift 2 ;;
     --python) [[ $# -ge 2 ]] || { usage; exit 2; }; PYTHON_BIN="$2"; shift 2 ;;
@@ -48,9 +50,15 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Preserve whether the caller explicitly supplied a startup setting.  The
+# command-line parser may replace the environment value above.
+N_LEG_PAUSED_REQUESTED="$N_LEG_PAUSED_OVERRIDE"
+
 [[ -n "$RUNTIME_ROOT" && "$WAIT_SECONDS" =~ ^[1-9][0-9]*$ ]] || { usage; exit 2; }
 [[ "$MODE" == "shadow" || "$MODE" == "production" ]] || { usage; exit 2; }
 [[ "$PREFLIGHT" -eq 0 || "$MODE" == "production" ]] || { usage; exit 2; }
+[[ -z "$N_LEG_PAUSED_OVERRIDE" || "$N_LEG_PAUSED_OVERRIDE" == "0" || "$N_LEG_PAUSED_OVERRIDE" == "1" ]] \
+  || { echo "OPEN_TRADER_NLEG_PAUSED must be 0 or 1" >&2; exit 2; }
 
 resolve_path() {
   "$PYTHON_BIN" -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve())' "$1"
@@ -74,6 +82,35 @@ ERR_LOG="$LOG_DIR/launchd.err.log"
 RUNTIME_RECORD="$RUNTIME_ROOT/prediction-service-runtime.json"
 [[ -f "$TEMPLATE" ]] || fail "missing launchd template: $TEMPLATE"
 
+existing_n_leg_pause() {
+  [[ -e "$PLIST_PATH" || -L "$PLIST_PATH" ]] || return 0
+  "$PYTHON_BIN" - "$PLIST_PATH" <<'PY'
+import plistlib
+import sys
+from pathlib import Path
+
+try:
+    payload = plistlib.loads(Path(sys.argv[1]).read_bytes())
+    value = payload.get("EnvironmentVariables", {}).get("OPEN_TRADER_NLEG_PAUSED", "")
+except (OSError, ValueError, TypeError, AttributeError):
+    raise SystemExit("malformed managed prediction-service plist")
+if value not in ("", "0", "1"):
+    raise SystemExit("OPEN_TRADER_NLEG_PAUSED must be 0 or 1")
+print(value)
+PY
+}
+
+EXISTING_N_LEG_PAUSED="$(existing_n_leg_pause)"
+if [[ -z "$N_LEG_PAUSED_OVERRIDE" ]]; then
+  N_LEG_PAUSED_OVERRIDE="$EXISTING_N_LEG_PAUSED"
+fi
+N_LEG_PAUSED="${N_LEG_PAUSED_OVERRIDE:-0}"
+N_LEG_PAUSED_CHANGED=0
+if [[ -n "$N_LEG_PAUSED_REQUESTED" \
+  && "$N_LEG_PAUSED_REQUESTED" != "$EXISTING_N_LEG_PAUSED" ]]; then
+  N_LEG_PAUSED_CHANGED=1
+fi
+
 sed_escape() {
   printf '%s' "$1" | sed 's/[\\&|]/\\&/g'
 }
@@ -85,6 +122,7 @@ render_plist() {
     -e "s|OPEN_TRADER_PREDICTION_CONFIG|$(sed_escape "$CONFIG")|g" \
     -e "s|OPEN_TRADER_NOTIFIER_CONFIG|$(sed_escape "$NOTIFIER_CONFIG")|g" \
     -e "s|OPEN_TRADER_PREDICTION_MODE|$(sed_escape "$MODE")|g" \
+    -e "s|OPEN_TRADER_NLEG_PAUSED_VALUE|$(sed_escape "$N_LEG_PAUSED")|g" \
     -e "s|OPEN_TRADER_RELEASE_MANIFEST|$(sed_escape "$RELEASE_MANIFEST")|g" \
     -e "s|OPEN_TRADER_RUNTIME_ROOT|$(sed_escape "$RUNTIME_ROOT")|g" \
     -e "s|OPEN_TRADER_REPO|$(sed_escape "$REPO_ROOT")|g" \
@@ -922,7 +960,8 @@ if [[ "$PREFLIGHT" -eq 1 ]]; then
 fi
 
 if [[ "$MANAGED_OLD" -eq 1 \
-  && "$CANDIDATE_JSON" == "$OBSERVED_RELEASE_FOR_RECORD" ]] && record_matches_observed \
+  && "$CANDIDATE_JSON" == "$OBSERVED_RELEASE_FOR_RECORD" \
+  && "$N_LEG_PAUSED_CHANGED" -eq 0 ]] && record_matches_observed \
   && record_ready_matches_observed; then
   echo "prediction release already ready: $ACTUAL_SHA"
   exit 0
@@ -1117,7 +1156,7 @@ if [[ "$MANAGED_OLD" -eq 1 && "$RECORD_CANDIDATE_OBSERVED" -eq 0 ]]; then
   archive_record "$OBSERVED_RECOVERY_REASON" \
     || fail "prediction runtime record recovery archive could not be written"
 fi
-if [[ "$TARGET_CANDIDATE_OBSERVED" -eq 1 ]]; then
+if [[ "$TARGET_CANDIDATE_OBSERVED" -eq 1 && "$N_LEG_PAUSED_CHANGED" -eq 0 ]]; then
   RECORD_STATE="$("$PYTHON_BIN" - "$CURRENT_RECORD_JSON" <<'PY'
 import json
 import sys

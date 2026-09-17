@@ -61,6 +61,29 @@ _LEGACY_STRATEGY_ENDPOINTS = frozenset(
         "/api/prediction-arbitrage/cross-auto/pause",
     }
 )
+_N_LEG_PAUSE_PATHS = frozenset(
+    {
+        "/api/prediction-arbitrage/state",
+        "/api/prediction-arbitrage/history",
+        "/api/prediction-arbitrage/llm-provider",
+        "/api/prediction-arbitrage/preview",
+        "/api/prediction-arbitrage/executions",
+        "/api/prediction-arbitrage/mode",
+        "/api/prediction-arbitrage/circuit-breaker/reset",
+        "/api/prediction-arbitrage/predict-allowance/cleanup",
+        "/api/prediction-arbitrage/cross-auto/pause",
+    }
+)
+
+
+def _is_n_leg_pause_path(path: str) -> bool:
+    return path in _N_LEG_PAUSE_PATHS or path == "/api/prediction-arbitrage/relations" or path.startswith(
+        "/api/prediction-arbitrage/relations/"
+    ) or path.startswith("/api/prediction-arbitrage/n-leg/")
+
+
+def _n_leg_paused(runtime: object) -> bool:
+    return getattr(runtime, "n_leg_paused", False) is True
 
 
 def _lp_projection_safe_value(value: object, *, key: str = "") -> object:
@@ -368,6 +391,12 @@ def create_prediction_server(
                 {"error": f"{mode} runtime is unavailable"},
             )
 
+        def _send_n_leg_paused(self) -> None:
+            self._send_json(
+                HTTPStatus.CONFLICT,
+                {"error": "N_LEG_PAUSED", "error_code": "N_LEG_PAUSED"},
+            )
+
         def _send_error(self, status: HTTPStatus, error: Exception) -> None:
             self._send_json(
                 status,
@@ -405,8 +434,16 @@ def create_prediction_server(
                         "first_violation": evidence.get("first_violation"),
                         "guard_attempts": evidence.get("guard_attempts", []),
                         "http_load": self.server.http_load_snapshot(),  # type: ignore[attr-defined]
+                        "n_leg": (
+                            {"status": "paused", "code": "N_LEG_PAUSED"}
+                            if _n_leg_paused(runtime)
+                            else {"status": "running", "code": "N_LEG_RUNNING"}
+                        ),
                     },
                 )
+                return
+            if _n_leg_paused(runtime) and _is_n_leg_pause_path(parsed.path):
+                self._send_n_leg_paused()
                 return
             relation_prefix = "/api/prediction-arbitrage/relations"
             if parsed.path == relation_prefix or parsed.path.startswith(relation_prefix + "/"):
@@ -533,6 +570,7 @@ def create_prediction_server(
                         cross_venue_monitor=getattr(
                             runtime, "cross_venue_monitor", None
                         ),
+                        n_leg_paused=_n_leg_paused(runtime),
                     ),
                     set_session=mode == "production",
                 )
@@ -686,6 +724,9 @@ def create_prediction_server(
         def do_POST(self) -> None:
             self.close_connection = True
             path = urlparse(self.path).path
+            if _n_leg_paused(runtime) and _is_n_leg_pause_path(path):
+                self._send_n_leg_paused()
+                return
             if mode == "shadow" and path.startswith("/api/prediction-arbitrage/"):
                 self._send_json(HTTPStatus.FORBIDDEN, _READ_ONLY_ERROR)
                 return

@@ -1731,10 +1731,15 @@ def prediction_venues_payload(
     execution: object | None,
     csrf_token: str,
     cross_venue_monitor: object | None = None,
+    n_leg_paused: bool = False,
 ) -> dict[str, object]:
     summary_method = getattr(monitor, "venue_summary_snapshot", None)
     try:
-        snapshot = summary_method() if callable(summary_method) else {}
+        snapshot = (
+            summary_method()
+            if callable(summary_method) and not n_leg_paused
+            else {}
+        )
     except Exception:
         snapshot = {}
     snapshot = snapshot if isinstance(snapshot, Mapping) else {}
@@ -1796,8 +1801,12 @@ def prediction_venues_payload(
     )
     result: dict[str, object] = {"venues": venues, "csrf_token": csrf_token}
     monitor_subscription = _prediction_monitor_subscription(safe_snapshot)
-    if monitor_subscription is not None:
+    if monitor_subscription is not None and not n_leg_paused:
         result["monitor_subscription"] = monitor_subscription
+    result["n_leg"] = {
+        "status": "paused" if n_leg_paused else "running",
+        "code": "N_LEG_PAUSED" if n_leg_paused else "N_LEG_RUNNING",
+    }
     return result
 
 

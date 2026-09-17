@@ -3,7 +3,22 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-09-18
+
+- Corrected paused shadow POST precedence so protected N-Leg routes return
+  `409 N_LEG_PAUSED` before the shadow read-only guard while LP mutations
+  remain `403 shadow_read_only`. Verified the focused repair and related
+  prediction-service regression (`113 passed`); no live calls, orders or
+  deployment were performed.
+
 ## 2026-09-17
+
+- Added reversible `OPEN_TRADER_NLEG_PAUSED=1` support: N-Leg routes reject
+  before business work, health and venues expose pause status, N-Leg runtime
+  side effects stay stopped while the LP lifecycle remains available, and the
+  dashboard, launchd installer and Production Smoke checks are mode-aware.
+  Verified the focused A–I cases and related Docker regression (`1023 passed,
+  8 deselected`); no live calls, orders or deployment were performed.
 
 - Candidate gate compatibility fixtures now model one pending hourly reward
   preparation, preserve complete guidance in selected diagnostics, and keep

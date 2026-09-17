@@ -87,6 +87,7 @@ _LP_BOOK_SAMPLE_SECONDS = 5.0
 # whole multi-request scan deadline.
 _LP_REWARD_STOP_GRACE_SECONDS = 30.0
 _LP_BOOK_SAMPLE_STOP_GRACE_SECONDS = 30.0
+_N_LEG_PAUSED_ENV = "OPEN_TRADER_NLEG_PAUSED"
 
 # Keep the old spelling available for the existing Dashboard test seam.
 discover_threshold_relations = discover_threshold_relation_catalog
@@ -380,6 +381,7 @@ class PredictionRuntime:
         reader_generation: int | None = None,
         solver_server_factory: Callable[[], SolverServerOwner] | None = None,
         enable_n_leg_background: bool = True,
+        n_leg_paused: bool | None = None,
     ) -> None:
         if mode not in {"production", "shadow"}:
             raise ValueError("prediction runtime mode must be production or shadow")
@@ -398,6 +400,11 @@ class PredictionRuntime:
         # fence; before start() the runtime is at fence-1 semantics.
         self._minimum_reader_generation = 1
         self._enable_n_leg_background = bool(enable_n_leg_background)
+        if n_leg_paused is None:
+            n_leg_paused = self._parse_n_leg_paused(os.environ.get(_N_LEG_PAUSED_ENV))
+        elif type(n_leg_paused) is not bool:
+            raise ValueError("n_leg_paused must be a boolean")
+        self._n_leg_paused = n_leg_paused
         self._solver_server_factory = solver_server_factory or (
             lambda: SolverServerOwner(
                 [sys.executable, "-m", "open_trader.prediction_solver_worker", "--backend", "cp_sat"]
@@ -463,6 +470,18 @@ class PredictionRuntime:
     @property
     def production_owner(self) -> bool:
         return self._mode == "production" and self._owner.held
+
+    @staticmethod
+    def _parse_n_leg_paused(value: str | None) -> bool:
+        if value in (None, "", "0"):
+            return False
+        if value == "1":
+            return True
+        raise ValueError(f"{_N_LEG_PAUSED_ENV} must be 0 or 1")
+
+    @property
+    def n_leg_paused(self) -> bool:
+        return self._n_leg_paused
 
     def queue_lp_candidate_refresh(self) -> bool:
         """Wake the owned read-only LP candidate refresh worker."""
@@ -589,16 +608,18 @@ class PredictionRuntime:
                         f"prediction reader generation {self._reader_generation} "
                         f"is below required {minimum_reader_generation}"
                     )
-            self.solver_server = self._solver_server_factory()
+            if not self._n_leg_paused:
+                self.solver_server = self._solver_server_factory()
             self.store = PredictionArbitrageStore(self._data_dir)
             # #104: idempotent startup seed; failures are logged inside and
             # never block startup.
-            if ensure_same_event_same_venue_scope(self.store):
+            if not self._n_leg_paused and ensure_same_event_same_venue_scope(self.store):
                 logger.info(
                     "prediction_n_leg_scope_seed scope=SAME_EVENT_SAME_VENUE pid=%s",
                     os.getpid(),
                 )
-            self.relation_catalog = RelationCatalog(self._data_dir)
+            if not self._n_leg_paused:
+                self.relation_catalog = RelationCatalog(self._data_dir)
             trading_config = load_trading_config(self._prediction_config_path)
             apply_safety_policy = getattr(self.store, "apply_safety_policy", None)
             if callable(apply_safety_policy):
@@ -622,28 +643,38 @@ class PredictionRuntime:
                 self._prediction_trading,
                 owner_lock=self._owner,
             )
-            try:
-                self._predict_trading = PredictTradingClient.from_keychain(
-                    trading_config
-                )
-            except Exception:
-                self._predict_trading = None
-            relation_validator = LlmRelationValidator(self.store)
-            title_translator = LlmTitleTranslator(self.store)
+            if not self._n_leg_paused:
+                try:
+                    self._predict_trading = PredictTradingClient.from_keychain(
+                        trading_config
+                    )
+                except Exception:
+                    self._predict_trading = None
+            relation_validator = (
+                LlmRelationValidator(self.store) if not self._n_leg_paused else None
+            )
+            title_translator = (
+                LlmTitleTranslator(self.store) if not self._n_leg_paused else None
+            )
             self.monitor = PolymarketMonitor(
                 store=self.store,
                 trading=self._prediction_trading,
-                relation_discovery=discover_threshold_relation_catalog,
+                relation_discovery=(
+                    discover_threshold_relation_catalog
+                    if not self._n_leg_paused
+                    else None
+                ),
                 relation_validator=relation_validator,
                 title_translator=title_translator,
                 relation_catalog=self.relation_catalog,
             )
-            self.observation_monitor = PredictionObservationMonitor(
-                catalog=self.relation_catalog,
-                store=self.store,
-                monitor=self.monitor,
-            )
-            self._wire_relation_lifecycle()
+            if not self._n_leg_paused:
+                self.observation_monitor = PredictionObservationMonitor(
+                    catalog=self.relation_catalog,
+                    store=self.store,
+                    monitor=self.monitor,
+                )
+                self._wire_relation_lifecycle()
             self.execution = PredictionExecutionService(
                 store=self.store,
                 monitor=self.monitor,
@@ -657,11 +688,12 @@ class PredictionRuntime:
                 legacy_retired=self.legacy_retired,
                 lp=self.lp,
             )
+            setattr(self.execution, "_n_leg_paused", self._n_leg_paused)
             set_mutation_guard = getattr(self.lp, "set_mutation_guard", None)
             lp_mutation_allowed = getattr(self.execution, "lp_mutation_allowed", None)
             if callable(set_mutation_guard) and callable(lp_mutation_allowed):
                 set_mutation_guard(lp_mutation_allowed)
-            if not self.legacy_retired:
+            if not self._n_leg_paused and not self.legacy_retired:
                 # Issue #109: legacy ready/observation alerts retire with the
                 # legacy engine at the N_LEG fence; the monitor keeps both
                 # channels silent while no observer is set.
@@ -676,11 +708,18 @@ class PredictionRuntime:
                 self.monitor.set_auto_eat_observer(
                     self.execution.auto_eat_threshold
                 )
-            self.monitor.set_failure_observer(
-                self.execution.notify_monitor_failure
+            if not self._n_leg_paused:
+                self.monitor.set_failure_observer(
+                    self.execution.notify_monitor_failure
+                )
+            shadow_observer = (
+                self._configure_n_leg_shadow() if not self._n_leg_paused else None
             )
-            shadow_observer = self._configure_n_leg_shadow()
-            cross_monitor = self._injected_cross_venue_monitor
+            cross_monitor = (
+                self._injected_cross_venue_monitor
+                if not self._n_leg_paused
+                else _UnavailableCrossVenueMonitor("n_leg_paused")
+            )
             if cross_monitor is None:
                 cross_monitor = _build_cross_venue_monitor(
                     trading_config=trading_config,
@@ -729,10 +768,11 @@ class PredictionRuntime:
             return
 
         try:
-            self.monitor.start()
-            if self.observation_monitor is not None:
+            if not self._n_leg_paused:
+                self.monitor.start()
+            if self.observation_monitor is not None and not self._n_leg_paused:
                 self.observation_monitor.start()
-            if self._cross_runtime is not None:
+            if self._cross_runtime is not None and not self._n_leg_paused:
                 try:
                     self._cross_runtime.start()
                 except Exception:
@@ -746,7 +786,7 @@ class PredictionRuntime:
                     )
                     if callable(set_cross_venue_monitor):
                         set_cross_venue_monitor(self.cross_venue_monitor)
-            if self._predict_trading is not None and callable(
+            if not self._n_leg_paused and self._predict_trading is not None and callable(
                 getattr(self.execution, "_refresh_predict_account_snapshot", None)
             ):
                 # #93: keep the predict snapshot cache warm off the HTTP threads.
@@ -754,7 +794,7 @@ class PredictionRuntime:
                     execution=self.execution
                 )
                 self.predict_snapshot_refresher.start()
-            if self._enable_n_leg_background:
+            if self._enable_n_leg_background and not self._n_leg_paused:
                 selection_store = MonitorSelectionStore(self._data_dir)
                 selection_lock = threading.RLock()
                 # #106: the episode store owns the shared SQLite tables; the
@@ -1102,6 +1142,15 @@ class PredictionRuntime:
     def _start_shadow(self) -> None:
         try:
             self._owner.acquire()
+            if self._n_leg_paused:
+                self.store = PredictionArbitrageStore(self._data_dir)
+                self._state = "RUNNING"
+                logger.info(
+                    "prediction_runtime_state state=RUNNING mode=shadow n_leg_paused=true pid=%s data_dir=%s",
+                    os.getpid(),
+                    self._data_dir,
+                )
+                return
             self.solver_server = self._solver_server_factory()
             self.store = PredictionArbitrageStore(self._data_dir)
             trading_config = load_trading_config(self._prediction_config_path)

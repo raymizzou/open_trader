@@ -646,6 +646,7 @@ class PredictionExecutionService:
         # legacy cross-auto submit path is observe-only regardless of the
         # stored configured mode / armed flag.
         self._legacy_strategy_retired = bool(legacy_retired)
+        self._n_leg_paused = False
         self._process_lock = _PROCESS_LOCK
         # A newly constructed process has not reconciled its dedicated wallet;
         # only a clean startup/reset path may clear this lock.
@@ -4878,6 +4879,17 @@ class PredictionExecutionService:
                     "readiness": "lp_active",
                     "lp": lp_result,
                 }
+
+        if self._n_leg_paused:
+            if not self._relayer_ready(require_merge=False):
+                return {"state": "locked", "reason": "readiness_unavailable"}
+            if not self._notification_channels_ready():
+                return {
+                    "state": "locked",
+                    "reason": "notification_config_unavailable",
+                }
+            self._breaker_open = False
+            return {"state": "ready", "readiness": "n_leg_paused"}
 
         active = self._store.active_execution()
         active_id = str(active.get("execution_id", "")) if active else ""
