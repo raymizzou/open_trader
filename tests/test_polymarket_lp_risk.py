@@ -730,3 +730,46 @@ def test_lp_entry_event_window_requires_a_fresh_post_event_hour(tmp_path) -> Non
     assert no_known_event["state"] == "eligible"
     assert "event_coverage_incomplete" in no_known_event["reason_codes"]
     assert known_game_time_unknown["state"] == "unknown"
+
+
+def test_lp_entry_metadata_within_cache_window_is_not_stale() -> None:
+    direction = _direction()
+    direction["market"] = {
+        **direction["market"],
+        "metadata_checked_at": NOW - timedelta(seconds=3661),
+    }
+
+    result = polymarket_lp_risk.evaluate_lp_entry(
+        direction, account=_account(), now=NOW
+    )
+
+    assert result["state"] == "eligible"
+    assert "market_metadata_stale" not in result["reason_codes"]
+
+
+def test_lp_entry_metadata_beyond_cache_window_is_stale() -> None:
+    direction = _direction()
+    direction["market"] = {
+        **direction["market"],
+        "metadata_checked_at": NOW
+        - timedelta(seconds=polymarket_lp_risk._MARKET_METADATA_MAX_AGE_SECONDS + 1),
+    }
+
+    result = polymarket_lp_risk.evaluate_lp_entry(
+        direction, account=_account(), now=NOW
+    )
+
+    assert result["state"] == "unknown"
+    assert result["reason_codes"] == ["market_metadata_stale"]
+
+
+def test_lp_entry_reward_data_stale_bound_unchanged() -> None:
+    direction = _direction()
+    direction["reward_checked_at"] = NOW - timedelta(seconds=61)
+
+    result = polymarket_lp_risk.evaluate_lp_entry(
+        direction, account=_account(), now=NOW
+    )
+
+    assert result["state"] == "unknown"
+    assert result["reason_codes"] == ["reward_data_stale"]

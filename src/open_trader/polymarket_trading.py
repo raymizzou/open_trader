@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import json
 import importlib.metadata
+import logging
 import os
 import pty
+import random
 import re
 import subprocess
 import threading
@@ -40,6 +42,7 @@ from .prediction_arbitrage import (
 
 
 SECURITY = "/usr/bin/security"
+logger = logging.getLogger(__name__)
 KEYCHAIN_SERVICE = "com.open-trader.polymarket"
 PREDICT_KEYCHAIN_SERVICE = "com.open-trader.predict"
 PREDICT_API_KEY_ACCOUNT = "api-key"
@@ -59,6 +62,15 @@ LP_PRICE_HISTORY_BATCH_SIZE = 20
 LP_PRICE_HISTORY_MAX_CONCURRENCY = 4
 LP_PRICE_HISTORY_TIMEOUT_SECONDS = 20.0
 LP_REWARD_SELECTED_MAX_CONCURRENCY = 4
+# Issue #137: the ~17k-market reward catalog must not be re-read and fully
+# re-validated from gamma on every lp_market_metadata call.  Results live in
+# an in-process TTL cache (positive and confirmed-missing entries) with a
+# per-call refresh budget, optionally warm-started from a SQLite backing
+# store.
+LP_METADATA_CACHE_TTL_SECONDS = 3600.0
+LP_METADATA_CACHE_JITTER_SECONDS = 600.0
+LP_METADATA_NEGATIVE_TTL_SECONDS = 3600.0
+LP_METADATA_MAX_REFRESH_IDS_PER_CALL = 1500
 LP_REWARD_ASSET_USD_ADDRESSES = frozenset(
     {
         # Both contracts are identified by the official Polymarket contracts
@@ -929,15 +941,35 @@ class PolymarketTradingClient:
         *,
         urlopen_fn: Callable[..., object] | None = None,
         public_client_factory: Callable[[], object] | None = None,
+        metadata_cache: object | None = None,
     ) -> None:
         self.config = config
         self._client = client
         self._urlopen_fn = urlopen_fn
         self._public_client_factory = public_client_factory or PublicClient
+        self._metadata_cache = metadata_cache
+        self._metadata_entries: dict[
+            str, tuple[float, dict[str, object] | None]
+        ] = {}
+        self._metadata_lock = threading.Lock()
+        self._metadata_warm_loaded = False
+        self._metadata_last_prune_epoch = float("-inf")
         self._readiness_key: tuple[PairIntent, Decimal] | None = None
         self._threshold_readiness_key: ThresholdHedgeIntent | None = None
         self._cross_leg_readiness_key: object | None = None
         self._last_submit_error: dict[str, str] | None = None
+
+    def attach_metadata_cache(self, cache: object | None) -> None:
+        """Attach a duck-typed persistent backing store before first use."""
+
+        with self._metadata_lock:
+            self._metadata_cache = cache
+
+    def expire_lp_metadata_cache(self) -> None:
+        """Drop all cached LP market metadata so the next read re-fetches."""
+
+        with self._metadata_lock:
+            self._metadata_entries.clear()
 
     def last_submit_error(self) -> dict[str, str] | None:
         """Redacted detail of the most recent submit exception, if any."""
@@ -952,6 +984,7 @@ class PolymarketTradingClient:
         client_factory: Callable[..., object] | None = None,
         run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
         public_client_factory: Callable[[], object] | None = None,
+        metadata_cache: object | None = None,
     ) -> "PolymarketTradingClient":
         private_key = load_keychain_secret("signing-private-key", run=run)
         builder_key = load_keychain_secret("builder-key", run=run)
@@ -978,7 +1011,12 @@ class PolymarketTradingClient:
             raise PolymarketTradingError("auth")
         if wallet is None or wallet.lower() != config.wallet_address.lower():
             raise PolymarketTradingError("auth")
-        return cls(config, client, public_client_factory=public_client_factory)
+        return cls(
+            config,
+            client,
+            public_client_factory=public_client_factory,
+            metadata_cache=metadata_cache,
+        )
 
     def geoblock_allowed(self) -> bool:
         """Return true only for an explicit ``{"blocked": false}`` response."""
@@ -1251,26 +1289,218 @@ class PolymarketTradingClient:
             return {}
         if stop_event is not None and stop_event.is_set():
             return {}
+        now = datetime.now(UTC)
+        fresh, stale, refresh_ids = self._partition_metadata_cache(requested, now)
+        self._prune_metadata_cache(now)
+        fetched: dict[str, dict[str, object]] = {}
+        failed_event_ids: frozenset[str] = frozenset()
+        if refresh_ids:
+            public = self._public_client_factory()
+            try:
+                fetched, failed_event_ids = self._fetch_lp_market_metadata(
+                    tuple(refresh_ids), public=public, stop_event=stop_event
+                )
+            finally:
+                close = getattr(public, "close", None)
+                if callable(close):
+                    close()
+        if stop_event is not None and stop_event.is_set():
+            return {}
+        if refresh_ids:
+            self._record_metadata_entries(
+                tuple(refresh_ids),
+                fetched,
+                metadata_checked_at=now,
+                failed_event_ids=failed_event_ids,
+            )
+        result: dict[str, dict[str, object]] = {}
+        for condition_id in requested:
+            value = fresh.get(condition_id)
+            if value is None:
+                value = fetched.get(condition_id)
+            if value is None:
+                value = stale.get(condition_id)
+            if value is not None:
+                result[condition_id] = dict(value)
+        return result
+
+    def _partition_metadata_cache(
+        self,
+        requested: tuple[str, ...],
+        now: datetime,
+    ) -> tuple[
+        dict[str, dict[str, object] | None],
+        dict[str, dict[str, object] | None],
+        list[str],
+    ]:
+        """Split requested ids into fresh, stale, and refresh candidates.
+
+        Refresh candidates are ordered oldest-expiry first (never-read ids
+        first) and capped at ``LP_METADATA_MAX_REFRESH_IDS_PER_CALL``.  Ids
+        over the refresh budget are served from their (expired) cached
+        value when one exists; never-read ids and expired confirmed-missing
+        entries stay absent.
+        """
+
+        now_epoch = now.timestamp()
+        fresh: dict[str, dict[str, object] | None] = {}
+        stale: dict[str, dict[str, object] | None] = {}
+        refresh: list[tuple[float, int, str]] = []
+        with self._metadata_lock:
+            self._warm_load_metadata_cache(now)
+            for index, condition_id in enumerate(requested):
+                entry = self._metadata_entries.get(condition_id)
+                if entry is None:
+                    refresh.append((float("-inf"), index, condition_id))
+                elif entry[0] > now_epoch:
+                    fresh[condition_id] = entry[1]
+                else:
+                    refresh.append((entry[0], index, condition_id))
+        refresh.sort(key=lambda item: (item[0], item[1]))
+        refresh_ids = [
+            condition_id for _expires_at, _index, condition_id in refresh
+        ]
+        over_budget = refresh_ids[LP_METADATA_MAX_REFRESH_IDS_PER_CALL :]
+        for condition_id in over_budget:
+            entry = self._metadata_entries.get(condition_id)
+            if entry is not None and entry[1] is not None:
+                stale[condition_id] = entry[1]
+        capped = refresh_ids[:LP_METADATA_MAX_REFRESH_IDS_PER_CALL]
+        return fresh, stale, capped
+
+    def _warm_load_metadata_cache(self, now: datetime) -> None:
+        """Bulk-load non-expired persisted entries once per process.
+
+        Warm-started entries keep the persisted `expires_at` stamp as their
+        in-memory expiry, so a restart never extends freshness past the
+        originally persisted window (which is bounded by the risk-gate
+        horizon by construction).  Backing-store failures degrade to a
+        memory-only cache.
+        """
+
+        cache_store = self._metadata_cache
+        if cache_store is None or self._metadata_warm_loaded:
+            return
+        self._metadata_warm_loaded = True
+        try:
+            warm = cache_store.lp_metadata_cache_entries(now=now)
+        except Exception:
+            logger.warning("lp_metadata_cache_warm_load_failed", exc_info=True)
+            return
+        if not isinstance(warm, Mapping):
+            return
+        for key, value in warm.items():
+            if not (isinstance(key, str) and key):
+                continue
+            if not isinstance(value, tuple) or len(value) != 2:
+                continue
+            raw_expires_at, payload = value
+            if isinstance(raw_expires_at, bool) or not isinstance(
+                raw_expires_at, (int, float)
+            ):
+                continue
+            if payload is not None and not isinstance(payload, dict):
+                continue
+            if key not in self._metadata_entries:
+                self._metadata_entries[key] = (float(raw_expires_at), payload)
+
+    def _prune_metadata_cache(self, now: datetime) -> None:
+        """Prune the backing store at most once per process per hour."""
+
+        cache_store = self._metadata_cache
+        if cache_store is None:
+            return
+        now_epoch = now.timestamp()
+        with self._metadata_lock:
+            due = (
+                now_epoch - self._metadata_last_prune_epoch
+                >= LP_METADATA_CACHE_TTL_SECONDS
+            )
+            if due:
+                self._metadata_last_prune_epoch = now_epoch
+        if not due:
+            return
+        try:
+            cache_store.lp_metadata_cache_prune(now=now)
+        except Exception:
+            logger.warning("lp_metadata_cache_prune_failed", exc_info=True)
+
+    def _record_metadata_entries(
+        self,
+        refresh_ids: tuple[str, ...],
+        fetched: Mapping[str, dict[str, object]],
+        *,
+        metadata_checked_at: datetime,
+        failed_event_ids: frozenset[str] = frozenset(),
+    ) -> None:
+        """Write a completed refresh into the in-memory TTL cache.
+
+        Only successful reads reach this point: confirmed-missing ids record
+        negative entries, failed reads raise before any write happens, and
+        payloads whose event sub-read failed (their ``event_id`` is in
+        ``failed_event_ids``) are returned uncached so the next call re-reads
+        them.
+        """
+
+        read_epoch = metadata_checked_at.timestamp()
+        expires_at = (
+            read_epoch
+            + LP_METADATA_CACHE_TTL_SECONDS
+            + random.uniform(0.0, LP_METADATA_CACHE_JITTER_SECONDS)
+        )
+        negative_expires_at = read_epoch + LP_METADATA_NEGATIVE_TTL_SECONDS
+        updated: dict[str, tuple[float, dict[str, object] | None]] = {}
+        uncached: set[str] = set()
+        for condition_id in refresh_ids:
+            value = fetched.get(condition_id)
+            if value is None:
+                continue
+            raw_event_id = value.get("event_id")
+            event_key = str(raw_event_id).strip() if raw_event_id is not None else ""
+            if event_key and event_key in failed_event_ids:
+                uncached.add(condition_id)
+                continue
+            updated[condition_id] = (expires_at, value)
+        for condition_id in refresh_ids:
+            if condition_id not in updated and condition_id not in uncached:
+                updated[condition_id] = (negative_expires_at, None)
+        with self._metadata_lock:
+            self._metadata_entries.update(updated)
+        cache_store = self._metadata_cache
+        if cache_store is not None:
+            try:
+                cache_store.lp_metadata_cache_store_entries(updated)
+            except Exception:
+                logger.warning(
+                    "lp_metadata_cache_store_entries_failed", exc_info=True
+                )
+
+    def _fetch_lp_market_metadata(
+        self,
+        requested: tuple[str, ...],
+        *,
+        public: object,
+        stop_event: threading.Event | None = None,
+    ) -> tuple[dict[str, dict[str, object]], frozenset[str]]:
+        """Fetch LP market facts for already-normalised ids over one client.
+
+        Returns the fetched payloads plus the set of event ids whose
+        ``list_events``/``get_event`` sub-read raised; callers must not
+        cache payloads carrying a failed event id so the next call re-reads
+        them.
+        """
+
         metadata_checked_at = datetime.now(UTC)
         event_facts: dict[str, Mapping[str, object] | None] = {}
-
-        def close_public(public: object) -> None:
-            close = getattr(public, "close", None)
-            if callable(close):
-                close()
+        failed_event_ids: set[str] = set()
+        failed_event_ids_lock = threading.Lock()
 
         def read_market_batch(batch: tuple[str, ...]) -> tuple[object, ...]:
             if stop_event is not None and stop_event.is_set():
                 return ()
-            public = self._public_client_factory()
-            try:
-                if stop_event is not None and stop_event.is_set():
-                    return ()
-                return _collect(
-                    public.list_markets(condition_ids=batch, page_size=100)
-                )
-            finally:
-                close_public(public)
+            return _collect(
+                public.list_markets(condition_ids=batch, page_size=100)
+            )
 
         market_batches = tuple(
             requested[offset : offset + 100]
@@ -1283,7 +1513,7 @@ class PolymarketTradingClient:
                 for value in batch_rows
             )
         if stop_event is not None and stop_event.is_set():
-            return {}
+            return {}, frozenset(failed_event_ids)
 
         numeric_event_keys: dict[int, list[str]] = {}
         direct_event_ids: list[str] = []
@@ -1332,21 +1562,19 @@ class PolymarketTradingClient:
                 batch, is_closed = query
                 if stop_event is not None and stop_event.is_set():
                     return ()
-                public = self._public_client_factory()
+                list_events = getattr(public, "list_events", None)
+                if not callable(list_events):
+                    return ()
                 try:
-                    if stop_event is not None and stop_event.is_set():
-                        return ()
-                    list_events = getattr(public, "list_events", None)
-                    if not callable(list_events):
-                        return ()
-                    try:
-                        return _collect(
-                            list_events(ids=batch, closed=is_closed, page_size=100)
+                    return _collect(
+                        list_events(ids=batch, closed=is_closed, page_size=100)
+                    )
+                except Exception:
+                    with failed_event_ids_lock:
+                        failed_event_ids.update(
+                            str(value) for value in batch
                         )
-                    except Exception:
-                        return ()
-                finally:
-                    close_public(public)
+                    return ()
 
             resolved: set[int] = set()
             with ThreadPoolExecutor(max_workers=min(8, len(event_batches))) as pool:
@@ -1384,22 +1612,18 @@ class PolymarketTradingClient:
         ) -> tuple[str, Mapping[str, object] | None]:
             if stop_event is not None and stop_event.is_set():
                 return event_id, None
-            public = self._public_client_factory()
+            get_event = getattr(public, "get_event", None)
+            if not callable(get_event):
+                return event_id, None
             try:
-                if stop_event is not None and stop_event.is_set():
-                    return event_id, None
-                get_event = getattr(public, "get_event", None)
-                if not callable(get_event):
-                    return event_id, None
-                try:
-                    event = _model_dict(get_event(id=event_id))
-                except Exception:
-                    return event_id, None
-                if event is None or str(event.get("id") or "") != event_id:
-                    return event_id, None
-                return event_id, event
-            finally:
-                close_public(public)
+                event = _model_dict(get_event(id=event_id))
+            except Exception:
+                with failed_event_ids_lock:
+                    failed_event_ids.add(str(event_id).strip())
+                return event_id, None
+            if event is None or str(event.get("id") or "") != event_id:
+                return event_id, None
+            return event_id, event
 
         if direct_event_ids and not (
             stop_event is not None and stop_event.is_set()
@@ -1411,7 +1635,7 @@ class PolymarketTradingClient:
                     if event is not None:
                         event_facts[event_id] = event
         if stop_event is not None and stop_event.is_set():
-            return {}
+            return {}, frozenset(failed_event_ids)
         result: dict[str, dict[str, object]] = {}
         for value in rows:
             row = _model_dict(value)
@@ -1518,7 +1742,7 @@ class PolymarketTradingClient:
                 ),
                 "outcomes": outcomes,
             }
-        return result
+        return result, frozenset(failed_event_ids)
 
     def lp_order_books(
         self,

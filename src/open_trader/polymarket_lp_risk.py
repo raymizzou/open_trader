@@ -7,9 +7,16 @@ from datetime import UTC, datetime, timedelta
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from typing import cast
 
+from .polymarket_trading import (
+    LP_METADATA_CACHE_JITTER_SECONDS,
+    LP_METADATA_CACHE_TTL_SECONDS,
+)
 
 BOOK_FRESHNESS_SECONDS = Decimal("10")
 ACCOUNT_FRESHNESS_SECONDS = Decimal("120")
+_MARKET_METADATA_MAX_AGE_SECONDS = (
+    LP_METADATA_CACHE_TTL_SECONDS + LP_METADATA_CACHE_JITTER_SECONDS
+)
 TERMINAL_ORDER_STATES = frozenset(
     {"FILLED", "MATCHED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "FAILED"}
 )
@@ -788,7 +795,12 @@ def evaluate_lp_entry(
     if not condition_id or not token_id:
         return {"state": "unknown", "reason_codes": ["market_identity_unknown"], "guidance": None}
     for field, max_age, unknown_code, stale_code in (
-        (market.get("metadata_checked_at"), 60, "market_metadata_time_unknown", "market_metadata_stale"),
+        (
+            market.get("metadata_checked_at"),
+            _MARKET_METADATA_MAX_AGE_SECONDS,
+            "market_metadata_time_unknown",
+            "market_metadata_stale",
+        ),
         (direction.get("reward_checked_at"), 60, "reward_time_unknown", "reward_data_stale"),
     ):
         try:

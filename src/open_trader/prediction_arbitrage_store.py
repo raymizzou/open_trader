@@ -363,6 +363,8 @@ class PredictionArbitrageStore:
             self._create_schema(connection)
         self._cache_hits: dict[str, int] = {}
         self._cache_hits_lock = threading.Lock()
+        self._lp_metadata_cache_ready = False
+        self._lp_metadata_cache_schema_lock = threading.Lock()
         self.prune_llm_usage()
         self._truncate_wal()
 
@@ -2981,6 +2983,133 @@ class PredictionArbitrageStore:
                 else []
             )
         return result
+
+    def _ensure_lp_metadata_cache_schema(self) -> None:
+        """Create `lp_market_metadata_cache` on first use.
+
+        Expand-only companion of the LP price-history cache.  It is created
+        lazily (CREATE TABLE IF NOT EXISTS on the first metadata-cache call)
+        so a store open never mutates the pinned init-time table set.
+        """
+
+        if self._lp_metadata_cache_ready:
+            return
+        with self._lp_metadata_cache_schema_lock:
+            if self._lp_metadata_cache_ready:
+                return
+            with self._transaction() as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS lp_market_metadata_cache(
+                        condition_id TEXT PRIMARY KEY,
+                        payload TEXT NOT NULL,
+                        expires_at REAL NOT NULL,
+                        present INTEGER NOT NULL
+                    )
+                    """
+                )
+            self._lp_metadata_cache_ready = True
+
+    @staticmethod
+    def _lp_metadata_cache_horizon(now: datetime | None) -> float:
+        moment = (
+            _parse_timestamp(now) if now is not None else datetime.now(timezone.utc)
+        )
+        return moment.timestamp()
+
+    def lp_metadata_cache_entries(
+        self,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, tuple[float, dict[str, object] | None]]:
+        """Bulk-read non-expired rows with their persisted `expires_at`.
+
+        Each value is ``(expires_at, payload)`` carrying the persisted
+        expiry stamp; a ``None`` payload marks a confirmed-missing row.
+        """
+
+        self._ensure_lp_metadata_cache_schema()
+        horizon = self._lp_metadata_cache_horizon(now)
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT condition_id, payload, expires_at, present
+                FROM lp_market_metadata_cache
+                WHERE expires_at > ?
+                """,
+                (horizon,),
+            ).fetchall()
+        result: dict[str, tuple[float, dict[str, object] | None]] = {}
+        for row in rows:
+            condition_id = str(row["condition_id"])
+            expires_at = float(row["expires_at"])
+            if not int(row["present"]):
+                result[condition_id] = (expires_at, None)
+                continue
+            try:
+                payload = _load_payload(str(row["payload"]))
+            except ValueError:
+                continue
+            result[condition_id] = (expires_at, payload)
+        return result
+
+    def lp_metadata_cache_store_entries(
+        self,
+        entries: Mapping[str, tuple[float, Mapping[str, object] | None]],
+    ) -> None:
+        """Upsert LP market metadata rows in bounded ~400-row transactions."""
+
+        self._ensure_lp_metadata_cache_schema()
+        encoded: list[tuple[str, str, float, int]] = []
+        for raw_condition, raw_entry in entries.items():
+            condition = str(raw_condition or "").strip()
+            if not condition or not isinstance(raw_entry, tuple) or len(raw_entry) != 2:
+                raise ValueError("lp_metadata_cache_entry_invalid")
+            raw_expires_at, raw_payload = raw_entry
+            if isinstance(raw_expires_at, bool) or not isinstance(
+                raw_expires_at, (int, float)
+            ):
+                raise ValueError("lp_metadata_cache_entry_invalid")
+            expires_at = float(raw_expires_at)
+            if raw_payload is None:
+                encoded.append((condition, "{}", expires_at, 0))
+                continue
+            if not isinstance(raw_payload, Mapping):
+                raise ValueError("lp_metadata_cache_entry_invalid")
+            encoded.append(
+                (
+                    condition,
+                    _dump_relation_payload(dict(raw_payload)),
+                    expires_at,
+                    1,
+                )
+            )
+        for offset in range(0, len(encoded), 400):
+            chunk = encoded[offset : offset + 400]
+            with self._transaction() as connection:
+                connection.executemany(
+                    """
+                    INSERT INTO
+                    lp_market_metadata_cache(condition_id,payload,expires_at,present)
+                    VALUES (?,?,?,?)
+                    ON CONFLICT(condition_id) DO UPDATE SET
+                        payload=excluded.payload,
+                        expires_at=excluded.expires_at,
+                        present=excluded.present
+                    """,
+                    chunk,
+                )
+
+    def lp_metadata_cache_prune(self, *, now: datetime | None = None) -> None:
+        """Delete expired LP market metadata rows."""
+
+        self._ensure_lp_metadata_cache_schema()
+        horizon = self._lp_metadata_cache_horizon(now)
+        with self._transaction() as connection:
+            connection.execute(
+                "DELETE FROM lp_market_metadata_cache WHERE expires_at <= ?",
+                (horizon,),
+            )
 
     def lp_save_screening_snapshot(
         self, payload: Mapping[str, object]

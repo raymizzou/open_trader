@@ -66,6 +66,11 @@ from tests.test_prediction_read_model import (
 )
 
 
+METADATA_TTL = (
+    polymarket_trading_module.LP_METADATA_CACHE_TTL_SECONDS
+    + polymarket_trading_module.LP_METADATA_CACHE_JITTER_SECONDS
+)
+
 FROZEN_PREDICTION_MUTATION_PATHS = (
     "/api/prediction-arbitrage/preview",
     "/api/prediction-arbitrage/executions",
@@ -5116,6 +5121,7 @@ def test_lp_candidate_preview_rechecks_best_bid_before_confirmation(
     prepared = lp.refresh_price_history()
     assert prepared["state"] == "known"
     AdapterDateTime.calls = 0
+    trading.expire_lp_metadata_cache()
     scanned = lp.refresh_candidates(force=True)
     assert scanned["state"] == "ready"
     assert scanned["complete"] is True
@@ -5236,6 +5242,7 @@ def test_lp_candidate_preview_rechecks_best_bid_before_confirmation(
         assert score_preview["request"]["price"] == "0.51"
         assert score_preview["request"]["quantity"] == "20"
         public_state["max_spread"] = Decimal("0.5")
+        trading.expire_lp_metadata_cache()
         zero_score_status, zero_score = confirm_preview(
             base, score_preview["preview_id"]
         )
@@ -5245,10 +5252,12 @@ def test_lp_candidate_preview_rechecks_best_bid_before_confirmation(
         assert sdk.posts == []
 
         public_state["max_spread"] = Decimal("10")
+        trading.expire_lp_metadata_cache()
         size_preview_status, size_preview = candidate_preview(base)
         assert size_preview_status == 200
         assert size_preview["request"]["quantity"] == "20"
         public_state["reward_min_size"] = Decimal("19")
+        trading.expire_lp_metadata_cache()
         stale_size_status, stale_size = confirm_preview(base, size_preview["preview_id"])
         assert stale_size_status == 200
         assert stale_size["state"] == "rejected"
@@ -5258,6 +5267,7 @@ def test_lp_candidate_preview_rechecks_best_bid_before_confirmation(
         assert resized_status == 200
         assert resized["request"]["quantity"] == "19"
         public_state["reward_min_size"] = Decimal("20")
+        trading.expire_lp_metadata_cache()
 
         commitment_preview_status, commitment_preview = candidate_preview(base)
         assert commitment_preview_status == 200
@@ -5286,6 +5296,7 @@ def test_lp_candidate_preview_rechecks_best_bid_before_confirmation(
         sdk.balance_units = 1_000_000_000
 
         public_state["max_spread"] = Decimal("10")
+        trading.expire_lp_metadata_cache()
         refreshed_status, refreshed = candidate_preview(base)
         assert refreshed_status == 200
         assert refreshed["state"] == "previewed"
@@ -6173,6 +6184,32 @@ def test_lp_recommendations_deduct_active_n_leg_cash_reservation(
     assert blocked_yes["reason_codes"] == ["balance_insufficient"]
     assert blocked_yes["guidance"] is None
 
+    def reseed_history() -> None:
+        window_start = clock["now"] - timedelta(hours=24)
+        history_samples = [
+            {"t": int(window_start.timestamp()), "p": Decimal("0.500")},
+            {"t": int(clock["now"].timestamp()), "p": Decimal("0.505")},
+        ]
+        store.lp_save_price_history_batch(
+            {
+                "condition_id": condition_id,
+                "token_id": token_id,
+                "samples": [dict(sample) for sample in history_samples],
+                "summary": {
+                    "state": "known",
+                    "amplitude": Decimal("0.005"),
+                    "window_start": window_start,
+                    "window_end": clock["now"],
+                    "sample_count": len(history_samples),
+                    "checked_at": clock["now"],
+                    "valid_until": clock["now"] + timedelta(hours=2),
+                },
+            }
+            for token_id in ("lp-yes", "lp-no")
+        )
+
+    clock["now"] += timedelta(seconds=METADATA_TTL + 1)
+    reseed_history()
     market["reward_min_size"] = Decimal("72")
     exact_fit = service.refresh_candidates(force=True)
     exact_fit_yes = yes_direction(exact_fit)
@@ -6190,6 +6227,8 @@ def test_lp_recommendations_deduct_active_n_leg_cash_reservation(
     assert store.n_leg_control()["active_batch_id"] is None
     assert store.n_leg_control()["total_unsettled_capital_units"] == 20_000_000
 
+    clock["now"] += timedelta(seconds=METADATA_TTL + 1)
+    reseed_history()
     market["reward_min_size"] = Decimal("90")
     after_acknowledgement = service.refresh_candidates(force=True)
     after_ack_yes = yes_direction(after_acknowledgement)

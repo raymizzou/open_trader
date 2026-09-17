@@ -3189,3 +3189,59 @@ def test_lp_price_history_cache_survives_restart_without_fabricating_books(
         since=now - timedelta(hours=24),
         until=next_now,
     ) == []
+
+
+def test_lp_metadata_cache_store_round_trip_and_prune(tmp_path: Path) -> None:
+    db = store(tmp_path)
+    now = datetime(2026, 9, 17, 12, tzinfo=UTC)
+    now_epoch = now.timestamp()
+    payload = {
+        "market_id": "market-1",
+        "condition_id": "condition-1",
+        "metadata_checked_at": now,
+        "tick_size": Decimal("0.01"),
+        "reward_max_spread": Decimal("0.015"),
+        "outcomes": {
+            "yes": {"label": "YES", "token_id": "yes-token"},
+            "no": {"label": "NO", "token_id": "no-token"},
+        },
+    }
+    db.lp_metadata_cache_store_entries(
+        {
+            "condition-1": (now_epoch + 3600.0, payload),
+            "condition-missing": (now_epoch + 3600.0, None),
+            "condition-stale": (now_epoch - 1.0, payload),
+        }
+    )
+
+    entries = db.lp_metadata_cache_entries(now=now)
+    assert set(entries) == {"condition-1", "condition-missing"}
+    # The persisted `expires_at` stamps are returned verbatim: the floats
+    # passed to `lp_metadata_cache_store_entries` are the expected values.
+    missing_entry = entries["condition-missing"]
+    assert missing_entry == (now_epoch + 3600.0, None)
+    positive_entry = entries["condition-1"]
+    assert positive_entry[0] == now_epoch + 3600.0
+    round_tripped = positive_entry[1]
+    assert round_tripped is not None
+    assert round_tripped["market_id"] == "market-1"
+    assert round_tripped["condition_id"] == "condition-1"
+    assert Decimal(str(round_tripped["tick_size"])) == Decimal("0.01")
+    assert Decimal(str(round_tripped["reward_max_spread"])) == Decimal("0.015")
+    assert round_tripped["metadata_checked_at"] == iso(now)
+    assert round_tripped["outcomes"] == {
+        "yes": {"label": "YES", "token_id": "yes-token"},
+        "no": {"label": "NO", "token_id": "no-token"},
+    }
+
+    db.lp_metadata_cache_prune(now=now)
+    pruned = db.lp_metadata_cache_entries(now=now)
+    assert set(pruned) == {"condition-1", "condition-missing"}
+    with sqlite3.connect(db.path) as connection:
+        remaining = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT condition_id FROM lp_market_metadata_cache"
+            ).fetchall()
+        }
+    assert remaining == {"condition-1", "condition-missing"}

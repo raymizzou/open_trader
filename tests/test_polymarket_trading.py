@@ -3523,3 +3523,736 @@ def test_lp_metadata_preserves_event_evidence_and_market_links(
     assert adapter.lp_market_metadata(requested_conditions, stop_event=stopped) == {}
     assert len(clients) == stopped_before_clients
     assert len(market_queries) + len(event_queries) == stopped_before_queries
+
+
+# --- LP market metadata cache (#137) test helpers -------------------------
+
+
+class _LpMetadataProbe:
+    """Records public-client instantiations and every metadata query."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.clients: list[object] = []
+        self.market_queries: list[tuple[tuple[str, ...], int | None]] = []
+        self.event_queries: list[tuple[tuple[int, ...], bool, int | None]] = []
+        self.get_event_calls: list[str] = []
+        self.market_rows: dict[str, object] = {}
+        self.event_rows: dict[str, object] = {}
+        self.fail_market_reads = False
+        self.fail_event_reads: set[str] = set()
+        self.fail_direct_events: set[str] = set()
+
+    def public_client_factory(self) -> type:
+        probe = self
+
+        class _ProbePublicClient:
+            def __init__(self) -> None:
+                self.closed = False
+                with probe.lock:
+                    probe.clients.append(self)
+
+            def list_markets(
+                self,
+                *,
+                condition_ids: tuple[str, ...],
+                page_size: int | None = None,
+            ) -> tuple[object, ...]:
+                assert self.closed is False
+                requested_ids = tuple(condition_ids)
+                with probe.lock:
+                    probe.market_queries.append((requested_ids, page_size))
+                    failing = probe.fail_market_reads
+                if failing:
+                    raise RuntimeError("market read failed")
+                assert page_size == 100
+                return tuple(
+                    probe.market_rows[condition_id]
+                    for condition_id in requested_ids
+                    if condition_id in probe.market_rows
+                )
+
+            def list_events(
+                self,
+                *,
+                ids: tuple[int, ...],
+                closed: bool,
+                page_size: int | None = None,
+            ) -> tuple[object, ...]:
+                assert self.closed is False
+                with probe.lock:
+                    probe.event_queries.append((tuple(ids), closed, page_size))
+                    failing = [
+                        str(value)
+                        for value in ids
+                        if str(value) in probe.fail_event_reads
+                    ]
+                if failing:
+                    raise RuntimeError(f"event read failed: {failing[0]}")
+                return tuple(
+                    probe.event_rows[str(value)]
+                    for value in ids
+                    if str(value) in probe.event_rows
+                )
+
+            def get_event(self, *, id: str) -> object:
+                assert self.closed is False
+                with probe.lock:
+                    probe.get_event_calls.append(id)
+                    if id in probe.fail_direct_events:
+                        raise RuntimeError(f"direct event read failed: {id}")
+                if id in probe.event_rows:
+                    return probe.event_rows[id]
+                raise AssertionError("no direct event expected")
+
+            def close(self) -> None:
+                self.closed = True
+
+        return _ProbePublicClient
+
+
+def _lp_cache_market(condition_id: str, *, slug: str) -> object:
+    from polymarket.models.gamma.market import Market
+
+    return Market.parse_response(
+        {
+            "id": f"market-{slug}",
+            "conditionId": condition_id,
+            "slug": slug,
+            "question": f"Will {slug} resolve Yes?",
+            "outcomes": '["Yes", "No"]',
+            "outcomePrices": '["0.50", "0.50"]',
+            "clobTokenIds": '["yes-token", "no-token"]',
+            "endDate": "2026-09-18T00:00:00Z",
+            "events": [],
+        }
+    )
+
+
+def _lp_cache_market_with_event(
+    condition_id: str,
+    *,
+    slug: str,
+    event_id: str,
+) -> object:
+    from polymarket.models.gamma.market import Market
+
+    return Market.parse_response(
+        {
+            "id": f"market-{slug}",
+            "conditionId": condition_id,
+            "slug": slug,
+            "question": f"Will {slug} resolve Yes?",
+            "outcomes": '["Yes", "No"]',
+            "outcomePrices": '["0.50", "0.50"]',
+            "clobTokenIds": '["yes-token", "no-token"]',
+            "endDate": "2026-09-18T00:00:00Z",
+            "events": [{"id": event_id, "slug": f"event-{slug}"}],
+        }
+    )
+
+
+def _lp_cache_event(event_id: str, *, slug: str) -> object:
+    from polymarket.models.gamma.event import Event
+
+    return Event.parse_response(
+        {
+            "id": event_id,
+            "slug": slug,
+            "title": f"Event {event_id}",
+            "startTime": "2026-09-17T15:00:00Z",
+            "ended": False,
+            "markets": [],
+        }
+    )
+
+
+def _lp_cache_clock(monkeypatch: pytest.MonkeyPatch, read_at: datetime) -> None:
+    class _CacheClock(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return read_at if tz is None else read_at.astimezone(tz)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(polymarket_trading, "datetime", _CacheClock)
+
+
+def _lp_cache_adapter(probe: _LpMetadataProbe) -> PolymarketTradingClient:
+    return PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        client=object(),
+        public_client_factory=probe.public_client_factory(),
+    )
+
+
+def test_lp_metadata_shares_one_public_client_per_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = _LpMetadataProbe()
+    condition_ids = tuple(f"0x{index:064x}" for index in range(201))
+    for index, condition_id in enumerate(condition_ids):
+        probe.market_rows[condition_id] = _lp_cache_market(
+            condition_id, slug=f"cache-{index}"
+        )
+    _lp_cache_clock(monkeypatch, datetime(2026, 9, 17, 12, 0, tzinfo=UTC))
+    adapter = _lp_cache_adapter(probe)
+
+    result = adapter.lp_market_metadata(condition_ids)
+
+    assert len(result) == 201
+    assert len(probe.clients) == 1
+    assert probe.clients[0].closed is True
+    assert len(probe.market_queries) == 3
+
+
+def test_lp_metadata_cache_hit_within_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = _LpMetadataProbe()
+    condition_a = "0x" + "a" * 64
+    condition_b = "0x" + "b" * 64
+    for index, condition_id in enumerate((condition_a, condition_b)):
+        probe.market_rows[condition_id] = _lp_cache_market(
+            condition_id, slug=f"hit-{index}"
+        )
+    _lp_cache_clock(monkeypatch, datetime(2026, 9, 17, 12, 0, tzinfo=UTC))
+    adapter = _lp_cache_adapter(probe)
+
+    first = adapter.lp_market_metadata((condition_a, condition_b))
+    assert set(first) == {condition_a, condition_b}
+    before = (
+        len(probe.market_queries),
+        len(probe.event_queries),
+        len(probe.get_event_calls),
+        len(probe.clients),
+    )
+
+    second = adapter.lp_market_metadata((condition_a, condition_b))
+
+    assert second == first
+    assert (
+        len(probe.market_queries),
+        len(probe.event_queries),
+        len(probe.get_event_calls),
+        len(probe.clients),
+    ) == before
+
+
+def test_expire_lp_metadata_cache_forces_refetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = _LpMetadataProbe()
+    condition_a = "0x" + "a" * 64
+    condition_b = "0x" + "b" * 64
+    for index, condition_id in enumerate((condition_a, condition_b)):
+        probe.market_rows[condition_id] = _lp_cache_market(
+            condition_id, slug=f"expire-{index}"
+        )
+    _lp_cache_clock(monkeypatch, datetime(2026, 9, 17, 12, 0, tzinfo=UTC))
+    adapter = _lp_cache_adapter(probe)
+
+    first = adapter.lp_market_metadata((condition_a, condition_b))
+    assert set(first) == {condition_a, condition_b}
+    before = (
+        len(probe.market_queries),
+        len(probe.event_queries),
+        len(probe.get_event_calls),
+        len(probe.clients),
+    )
+
+    adapter.expire_lp_metadata_cache()
+
+    second = adapter.lp_market_metadata((condition_a, condition_b))
+
+    assert second == first
+    assert (
+        len(probe.market_queries),
+        len(probe.event_queries),
+        len(probe.get_event_calls),
+        len(probe.clients),
+    ) == (
+        before[0] + 1,
+        before[1],
+        before[2],
+        before[3] + 1,
+    )
+
+
+def test_lp_metadata_cache_delta_fetch_only_new_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = _LpMetadataProbe()
+    condition_a = "0x" + "a" * 64
+    condition_b = "0x" + "b" * 64
+    condition_c = "0x" + "c" * 64
+    for index, condition_id in enumerate((condition_a, condition_b, condition_c)):
+        probe.market_rows[condition_id] = _lp_cache_market(
+            condition_id, slug=f"delta-{index}"
+        )
+    _lp_cache_clock(monkeypatch, datetime(2026, 9, 17, 12, 0, tzinfo=UTC))
+    adapter = _lp_cache_adapter(probe)
+
+    first = adapter.lp_market_metadata((condition_a, condition_b))
+    assert set(first) == {condition_a, condition_b}
+    queries_before = len(probe.market_queries)
+    queried_before = {
+        condition_id
+        for ids, _page_size in probe.market_queries
+        for condition_id in ids
+    }
+    assert queried_before == {condition_a, condition_b}
+
+    result = adapter.lp_market_metadata((condition_b, condition_c))
+
+    new_queried = {
+        condition_id
+        for ids, _page_size in probe.market_queries[queries_before:]
+        for condition_id in ids
+    }
+    assert new_queried == {condition_c}
+    assert set(result) == {condition_b, condition_c}
+    assert result[condition_b] == first[condition_b]
+
+    # The cached entries for A and B survive the delta call: A is still
+    # served from the cache with zero further queries.
+    queries_after_delta = len(probe.market_queries)
+    again = adapter.lp_market_metadata((condition_a,))
+    assert again == {condition_a: first[condition_a]}
+    assert len(probe.market_queries) == queries_after_delta
+
+
+def test_lp_metadata_negative_ttl_requeries_after_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = _LpMetadataProbe()
+    condition_present = "0x" + "a" * 64
+    condition_absent = "0x" + "b" * 64
+    probe.market_rows[condition_present] = _lp_cache_market(
+        condition_present, slug="negative-present"
+    )
+    read_at = {"value": datetime(2026, 9, 17, 12, 0, tzinfo=UTC)}
+
+    class _NegativeClock(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            value = read_at["value"]
+            return value if tz is None else value.astimezone(tz)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(polymarket_trading, "datetime", _NegativeClock)
+    adapter = _lp_cache_adapter(probe)
+
+    first = adapter.lp_market_metadata((condition_present, condition_absent))
+    assert set(first) == {condition_present}
+    queries_after_first = len(probe.market_queries)
+    assert queries_after_first == 1
+
+    read_at["value"] = read_at["value"] + timedelta(
+        seconds=polymarket_trading.LP_METADATA_NEGATIVE_TTL_SECONDS - 1
+    )
+    second = adapter.lp_market_metadata((condition_present, condition_absent))
+    assert set(second) == {condition_present}
+    assert len(probe.market_queries) == queries_after_first
+
+    read_at["value"] = read_at["value"] + timedelta(seconds=2)
+    third = adapter.lp_market_metadata((condition_present, condition_absent))
+    assert set(third) == {condition_present}
+    new_queried = {
+        condition_id
+        for ids, _page_size in probe.market_queries[queries_after_first:]
+        for condition_id in ids
+    }
+    # The confirmed-missing id is queried again once its negative TTL has
+    # elapsed; the positive entry may still be within its jittered TTL.
+    assert condition_absent in new_queried
+    assert new_queried <= {condition_absent, condition_present}
+
+
+def test_lp_metadata_cache_not_poisoned_by_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = _LpMetadataProbe()
+    condition_a = "0x" + "a" * 64
+    probe.market_rows[condition_a] = _lp_cache_market(condition_a, slug="failure-a")
+    _lp_cache_clock(monkeypatch, datetime(2026, 9, 17, 12, 0, tzinfo=UTC))
+    adapter = _lp_cache_adapter(probe)
+
+    probe.fail_market_reads = True
+    with pytest.raises(RuntimeError, match="market read failed"):
+        adapter.lp_market_metadata((condition_a,))
+
+    queries_after_failure = len(probe.market_queries)
+    assert queries_after_failure == 1
+
+    # The failed read must not have written any cache entry: the retry
+    # queries the network again.
+    probe.fail_market_reads = False
+    second = adapter.lp_market_metadata((condition_a,))
+    assert set(second) == {condition_a}
+    assert len(probe.market_queries) == queries_after_failure + 1
+
+    # With a working factory the successful read is cached.
+    third = adapter.lp_market_metadata((condition_a,))
+    assert third == second
+    assert len(probe.market_queries) == queries_after_failure + 1
+
+
+def test_lp_metadata_refresh_cap_bounds_ids_per_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = _LpMetadataProbe()
+    condition_ids = tuple(f"0x{index:064x}" for index in range(4))
+    for index, condition_id in enumerate(condition_ids):
+        probe.market_rows[condition_id] = _lp_cache_market(
+            condition_id, slug=f"cap-{index}"
+        )
+    monkeypatch.setattr(
+        polymarket_trading, "LP_METADATA_MAX_REFRESH_IDS_PER_CALL", 2
+    )
+    _lp_cache_clock(monkeypatch, datetime(2026, 9, 17, 12, 0, tzinfo=UTC))
+    adapter = _lp_cache_adapter(probe)
+
+    result = adapter.lp_market_metadata(condition_ids)
+
+    queried = {
+        condition_id
+        for ids, _page_size in probe.market_queries
+        for condition_id in ids
+    }
+    cap = polymarket_trading.LP_METADATA_MAX_REFRESH_IDS_PER_CALL
+    assert len(queried) <= cap
+    assert len(result) <= cap
+    over_budget = set(condition_ids) - queried
+    assert over_budget
+    assert over_budget.isdisjoint(result)
+
+    # A later call refreshes the ids that were left over budget; the ids
+    # served within the cap are fresh and do not requery.
+    queries_after_first = len(probe.market_queries)
+    second = adapter.lp_market_metadata(condition_ids)
+    second_queried = {
+        condition_id
+        for ids, _page_size in probe.market_queries[queries_after_first:]
+        for condition_id in ids
+    }
+    assert second_queried == over_budget
+    assert set(second) == set(condition_ids)
+
+
+class _LpMetadataBackingStore:
+    """Duck-typed stand-in for the SQLite metadata cache backing store."""
+
+    def __init__(
+        self,
+        rows: dict[str, tuple[float, dict[str, object] | None]] | None = None,
+    ) -> None:
+        self.rows: dict[str, tuple[float, dict[str, object] | None]] = dict(
+            rows or {}
+        )
+        self.stored: list[dict[str, tuple[float, dict[str, object] | None]]] = []
+        self.prune_calls: list[datetime] = []
+
+    def lp_metadata_cache_entries(
+        self, *, now: datetime | None = None
+    ) -> dict[str, tuple[float, dict[str, object] | None]]:
+        horizon = now.timestamp() if now is not None else datetime.now(UTC).timestamp()
+        return {
+            condition_id: value
+            for condition_id, value in self.rows.items()
+            if value[0] > horizon
+        }
+
+    def lp_metadata_cache_store_entries(
+        self,
+        entries: dict[str, tuple[float, dict[str, object] | None]],
+    ) -> None:
+        self.stored.append(dict(entries))
+        self.rows.update(entries)
+
+    def lp_metadata_cache_prune(self, *, now: datetime | None = None) -> None:
+        self.prune_calls.append(
+            now if now is not None else datetime.now(UTC)
+        )
+        horizon = (now if now is not None else datetime.now(UTC)).timestamp()
+        self.rows = {
+            condition_id: value
+            for condition_id, value in self.rows.items()
+            if value[0] > horizon
+        }
+
+
+def test_lp_metadata_warm_start_from_persisted_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = _LpMetadataProbe()
+    condition_a = "0x" + "a" * 64
+    condition_b = "0x" + "b" * 64
+    read_at = datetime(2026, 9, 17, 12, 0, tzinfo=UTC)
+    payload_a = {
+        "market_id": "market-warm-a",
+        "condition_id": condition_a,
+        "metadata_checked_at": "2026-09-17T04:00:00.000000Z",
+        "market_url": "https://polymarket.com/event/warm-a",
+        "outcomes": {"yes": {"label": "YES", "token_id": "warm-yes"}},
+        "accepting_orders": True,
+        "exchange_type": "CLOB",
+    }
+    payload_b = {
+        "market_id": "market-warm-b",
+        "condition_id": condition_b,
+        "metadata_checked_at": "2026-09-17T04:00:00.000000Z",
+        "market_url": None,
+        "outcomes": {},
+        "accepting_orders": None,
+        "exchange_type": "CLOB",
+    }
+    backing = _LpMetadataBackingStore(
+        {
+            condition_a: (read_at.timestamp() + 3600.0, payload_a),
+            condition_b: (read_at.timestamp() + 3600.0, payload_b),
+        }
+    )
+    _lp_cache_clock(monkeypatch, read_at)
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        client=object(),
+        public_client_factory=probe.public_client_factory(),
+        metadata_cache=backing,
+    )
+
+    result = adapter.lp_market_metadata((condition_a, condition_b))
+
+    assert result == {condition_a: payload_a, condition_b: payload_b}
+    assert probe.clients == []
+    assert probe.market_queries == []
+    assert probe.event_queries == []
+    assert probe.get_event_calls == []
+
+
+def test_lp_metadata_persisted_expiry_rollover(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = _LpMetadataProbe()
+    condition_a = "0x" + "a" * 64
+    condition_b = "0x" + "b" * 64
+    for index, condition_id in enumerate((condition_a, condition_b)):
+        probe.market_rows[condition_id] = _lp_cache_market(
+            condition_id, slug=f"rollover-{index}"
+        )
+    read_at = datetime(2026, 9, 17, 12, 0, tzinfo=UTC)
+    backing = _LpMetadataBackingStore(
+        {
+            condition_a: (read_at.timestamp() - 1.0, {"market_id": "stale-a"}),
+            condition_b: (read_at.timestamp() - 1.0, None),
+        }
+    )
+    _lp_cache_clock(monkeypatch, read_at)
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        client=object(),
+        public_client_factory=probe.public_client_factory(),
+        metadata_cache=backing,
+    )
+
+    result = adapter.lp_market_metadata((condition_a, condition_b))
+
+    # Expired persisted entries are treated as stale: refreshed under the
+    # cap with observed queries.
+    queried = {
+        condition_id
+        for ids, _page_size in probe.market_queries
+        for condition_id in ids
+    }
+    assert queried == {condition_a, condition_b}
+    assert set(result) == {condition_a, condition_b}
+    assert result[condition_a]["market_id"] == "market-rollover-0"
+    assert len(queried) <= polymarket_trading.LP_METADATA_MAX_REFRESH_IDS_PER_CALL
+
+    # The backing store rows are updated afterwards with fresh expiries.
+    assert backing.stored
+    assert set(backing.stored[-1]) == {condition_a, condition_b}
+    for condition_id in (condition_a, condition_b):
+        new_expires_at, new_payload = backing.rows[condition_id]
+        assert new_expires_at > read_at.timestamp()
+        assert new_payload == result[condition_id]
+
+
+def test_lp_metadata_warm_entry_expires_at_persisted_stamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = _LpMetadataProbe()
+    condition_present = "0x" + "a" * 64
+    condition_absent = "0x" + "b" * 64
+    probe.market_rows[condition_present] = _lp_cache_market(
+        condition_present, slug="warm-present"
+    )
+    read_at = datetime(2026, 9, 17, 12, 0, tzinfo=UTC)
+    positive_expires_at = (
+        read_at.timestamp() + polymarket_trading.LP_METADATA_CACHE_TTL_SECONDS
+    )
+    negative_expires_at = (
+        read_at.timestamp() + polymarket_trading.LP_METADATA_NEGATIVE_TTL_SECONDS
+    )
+    payload_present = {
+        "market_id": "market-warm-present",
+        "condition_id": condition_present,
+        "metadata_checked_at": read_at,
+        "market_url": "https://polymarket.com/event/warm-present",
+        "outcomes": {"yes": {"label": "YES", "token_id": "warm-yes"}},
+        "accepting_orders": True,
+        "exchange_type": "CLOB",
+    }
+    backing = _LpMetadataBackingStore(
+        {
+            condition_present: (positive_expires_at, payload_present),
+            condition_absent: (negative_expires_at, None),
+        }
+    )
+    clock_at = {"value": read_at}
+
+    class _WarmClock(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            value = clock_at["value"]
+            return value if tz is None else value.astimezone(tz)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(polymarket_trading, "datetime", _WarmClock)
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        client=object(),
+        public_client_factory=probe.public_client_factory(),
+        metadata_cache=backing,
+    )
+
+    first = adapter.lp_market_metadata((condition_present, condition_absent))
+
+    # Before the persisted stamps: served/omitted with zero queries.
+    assert first == {condition_present: payload_present}
+    assert probe.clients == []
+    assert probe.market_queries == []
+
+    # While in-memory fresh the served payload age stays within the
+    # risk-gate bound: the in-memory expiry is the persisted stamp.
+    clock_at["value"] = read_at + timedelta(
+        seconds=polymarket_trading.LP_METADATA_CACHE_TTL_SECONDS - 1
+    )
+    still_fresh = adapter.lp_market_metadata((condition_present, condition_absent))
+    assert set(still_fresh) == {condition_present}
+    assert probe.market_queries == []
+    served_age = (
+        clock_at["value"] - still_fresh[condition_present]["metadata_checked_at"]
+    ).total_seconds()
+    assert served_age <= (
+        polymarket_trading.LP_METADATA_CACHE_TTL_SECONDS
+        + polymarket_trading.LP_METADATA_CACHE_JITTER_SECONDS
+    )
+
+    # After the persisted stamps both rows are re-queried: the persisted
+    # expiry stays authoritative across a warm start (a restart never
+    # re-derives the TTL), and the negative row re-queries on its own
+    # negative-TTL stamp.
+    clock_at["value"] = read_at + timedelta(
+        seconds=polymarket_trading.LP_METADATA_CACHE_TTL_SECONDS + 1
+    )
+    refreshed = adapter.lp_market_metadata((condition_present, condition_absent))
+    re_queried = {
+        condition_id
+        for ids, _page_size in probe.market_queries
+        for condition_id in ids
+    }
+    assert re_queried == {condition_present, condition_absent}
+    assert set(refreshed) == {condition_present}
+    assert refreshed[condition_present]["market_id"] == "market-warm-present"
+    # The re-read negative row persists the negative TTL again (confirmed
+    # missing never adopts the positive jittered TTL).
+    negative_stamp, negative_payload = backing.rows[condition_absent]
+    assert negative_payload is None
+    assert negative_stamp == (
+        clock_at["value"].timestamp()
+        + polymarket_trading.LP_METADATA_NEGATIVE_TTL_SECONDS
+    )
+
+
+def test_lp_metadata_event_read_failure_not_cached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = _LpMetadataProbe()
+    condition_failed = "0x" + "a" * 64
+    condition_healthy = "0x" + "b" * 64
+    probe.market_rows[condition_failed] = _lp_cache_market_with_event(
+        condition_failed, slug="event-failure", event_id="6001"
+    )
+    probe.market_rows[condition_healthy] = _lp_cache_market_with_event(
+        condition_healthy, slug="event-healthy", event_id="good-event"
+    )
+    probe.fail_event_reads.add("6001")
+    probe.event_rows["good-event"] = _lp_cache_event(
+        "good-event", slug="event-event-healthy"
+    )
+    _lp_cache_clock(monkeypatch, datetime(2026, 9, 17, 12, 0, tzinfo=UTC))
+    adapter = _lp_cache_adapter(probe)
+
+    first = adapter.lp_market_metadata((condition_failed, condition_healthy))
+
+    # The affected market is still returned by this call, with its event
+    # facts unknown; the healthy market keeps its resolved event facts.
+    assert set(first) == {condition_failed, condition_healthy}
+    assert first[condition_failed]["event_id"] == "6001"
+    assert first[condition_failed]["event_start_time"] is None
+    assert first[condition_failed]["event_ended"] is None
+    assert first[condition_failed]["event_finished_at"] is None
+    assert first[condition_healthy]["event_start_time"] == datetime(
+        2026, 9, 17, 15, 0, tzinfo=UTC
+    )
+    queries_after_first = len(probe.market_queries)
+
+    # Within the metadata TTL the affected condition is re-read (its
+    # failed sub-read never entered the cache); the healthy condition is
+    # served from the cache without queries.
+    second = adapter.lp_market_metadata((condition_failed, condition_healthy))
+    re_queried = {
+        condition_id
+        for ids, _page_size in probe.market_queries[queries_after_first:]
+        for condition_id in ids
+    }
+    assert re_queried == {condition_failed}
+    assert set(second) == {condition_failed, condition_healthy}
+    assert second[condition_healthy] == first[condition_healthy]
+
+    # Once the event sub-read succeeds, the condition is cached again.
+    probe.fail_event_reads.clear()
+    probe.event_rows["6001"] = _lp_cache_event("6001", slug="event-event-failure")
+    third = adapter.lp_market_metadata((condition_failed, condition_healthy))
+    assert third[condition_failed]["event_start_time"] == datetime(
+        2026, 9, 17, 15, 0, tzinfo=UTC
+    )
+    queries_after_recovery = len(probe.market_queries)
+    fourth = adapter.lp_market_metadata((condition_failed, condition_healthy))
+    assert fourth == third
+    assert len(probe.market_queries) == queries_after_recovery
+
+    # The `get_event` failure variant behaves the same for a non-numeric
+    # event id read on the direct path.
+    direct_probe = _LpMetadataProbe()
+    condition_direct = "0x" + "c" * 64
+    direct_probe.market_rows[condition_direct] = _lp_cache_market_with_event(
+        condition_direct, slug="event-direct-failure", event_id="bad-direct"
+    )
+    direct_probe.fail_direct_events.add("bad-direct")
+    direct_adapter = _lp_cache_adapter(direct_probe)
+
+    direct_first = direct_adapter.lp_market_metadata((condition_direct,))
+
+    assert set(direct_first) == {condition_direct}
+    assert direct_first[condition_direct]["event_id"] == "bad-direct"
+    assert direct_first[condition_direct]["event_start_time"] is None
+    direct_queries_after_first = len(direct_probe.market_queries)
+
+    direct_second = direct_adapter.lp_market_metadata((condition_direct,))
+
+    direct_re_queried = {
+        condition_id
+        for ids, _page_size in direct_probe.market_queries[
+            direct_queries_after_first:
+        ]
+        for condition_id in ids
+    }
+    assert direct_re_queried == {condition_direct}

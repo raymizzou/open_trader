@@ -28,6 +28,30 @@ operator-facing: what changed, which workflow is affected, and what was verified
   historical share data after restart; the current-tree repair selectors and
   final16 batch pass (`16 passed`).
 
+- LP market metadata now serves from an in-process TTL cache (1 h + jitter,
+  confirmed-missing ids cached the same way) persisted in a new
+  `lp_market_metadata_cache` SQLite table so the cache is warm after a
+  restart, refreshes at most 1,500 stale ids per call (over-budget ids are
+  served stale for that call), and reuses one public HTTP client per call —
+  this stops the catalog-scale gamma re-validation (≈17k condition ids every
+  60 s) that pegged one core and starved `/api/prediction-arbitrage/state`
+  (#137). Cache read/write failures degrade to the previous uncached read
+  path; result dicts are shallow copies so callers cannot mutate shared
+  entries. Verified by the ten approved seam RED/GREEN cases (SQLite
+  round-trip/prune, shared client, cache hit, delta fetch, negative TTL,
+  failure isolation, refresh cap, warm start, persisted-expiry rollover)
+  plus the focused trading/store/runtime/LP/execution test files and the
+  full `make test` gate; no live calls, orders or deployment were performed.
+  The LP entry risk gate's `market_metadata_stale` bound moved from 60 s to
+  the cache window (3600 s + jitter), matching the approved hourly metadata
+  contract (reward-data staleness bound unchanged at 60 s). Warm-started
+  rows keep their originally persisted expiry, so a restart no longer
+  extends freshness past the risk-gate window, and markets whose event
+  sub-reads failed are not pinned into the cache for the TTL (the next
+  scan re-reads them). A deterministic `expire_lp_metadata_cache` seam
+  supports the LP preview tests (and any operator tooling) in declaring
+  that a metadata TTL has passed; production code never calls it.
+
 - Retired the prediction monitor's every-second full-snapshot rewrite of the
   `runtime` SQLite table (it drove ~5 MB/s WAL growth; a production WAL once
   ballooned to 19 GB and its lock storms were misreported to Feishu as

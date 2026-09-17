@@ -609,6 +609,14 @@ class PredictionRuntime:
             self._prediction_trading = PolymarketTradingClient.from_keychain(
                 trading_config
             )
+            # Issue #137: persist the LP metadata TTL cache across restarts.
+            # Attached duck-typed (not via from_keychain) so the many test
+            # doubles that replace the client keep working unchanged.
+            attach_metadata_cache = getattr(
+                self._prediction_trading, "attach_metadata_cache", None
+            )
+            if callable(attach_metadata_cache):
+                attach_metadata_cache(self.store)
             self.lp = PolymarketLPService(
                 self.store,
                 self._prediction_trading,
@@ -1100,6 +1108,12 @@ class PredictionRuntime:
             self._prediction_trading = PolymarketTradingClient.from_keychain(
                 trading_config
             )
+            # Issue #137: shadow mode keeps the same warm LP metadata cache.
+            attach_metadata_cache = getattr(
+                self._prediction_trading, "attach_metadata_cache", None
+            )
+            if callable(attach_metadata_cache):
+                attach_metadata_cache(self.store)
             # Keep the durable LP read model available in shadow mode.  The
             # service rejects every LP POST before dispatch, and shadow never
             # starts the LP monitor, so this collaborator is read-only in
