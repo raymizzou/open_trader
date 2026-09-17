@@ -37,6 +37,19 @@ operator-facing: what changed, which workflow is affected, and what was verified
   cyclic GC to continuous full collections (production pinned one core and
   starved /state and universe refreshes until the gate was restored).
 
+- LP candidate evaluation now publishes completed hourly catalog, market metadata
+  and 24-hour history inputs before the minute risk pass; the selected 50 markets
+  receive fresh metadata, native/sponsored reward facts, books and account data
+  with bounded reward reads. The public snapshot and dashboard now expose all
+  selected diagnostics while recommendations and risk counts contain only current
+  complete guidance, including explicit expiry and account-outage UNKNOWN states.
+  The evaluation area uses three same-style modules (已读取市场、筛选通过、风控通过),
+  keeps base/range rules and sorting/max50 in accessible hints, and renders actual
+  outcomes with usable guidance or a specific error. The existing 当天 LP 委托 area
+  remains intact. Verified by the ordered LP adapter/service/runtime cases and
+  focused selection, history and account-outage regressions plus seven Dashboard
+  regressions; no live calls, orders or deployment were performed.
+
 - The LP dashboard's "我的订单与持仓" block was replaced by "当天 LP 委托"（北京时间
   08:00 起，即当前 UTC 奖励日）：只显示归属为 LP 的委托——未成交（含部分成交）与
   已成交（含全量成交后已离开挂单列表的订单，按当天成交聚合并标注最新成交时间），

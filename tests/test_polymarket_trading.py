@@ -764,6 +764,188 @@ def test_lp_catalog_reads_all_reward_pages_without_double_counting() -> None:
     assert incomplete["state"] == "unknown"
 
 
+def test_lp_selected_reward_facts_preserve_identity_time_and_failures() -> None:
+    native_asset = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    sponsored_asset = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+
+    def config(
+        config_id: str,
+        asset: str,
+        amount: str,
+        *,
+        end_date: str = "2500-12-31",
+    ) -> dict[str, object]:
+        return {
+            "id": config_id,
+            "asset_address": asset,
+            "start_date": "2024-03-01",
+            "end_date": end_date,
+            "rate_per_day": amount,
+        }
+
+    valid_native = {
+        "condition_id": "condition-a",
+        "rewards_config": [
+            config("native-a", native_asset, "3"),
+            config("expired-a", native_asset, "99", end_date="2024-12-31"),
+        ],
+    }
+    valid_sponsored = {
+        "condition_id": "condition-a",
+        "rewards_config": [config("sponsored-a", sponsored_asset, "2")],
+    }
+    wrong_asset = {
+        "condition_id": "condition-b",
+        "rewards_config": [
+            config(
+                "wrong-b",
+                "0x9999999999999999999999999999999999999999",
+                "100",
+            )
+        ],
+    }
+
+    class PagedRewards:
+        def __init__(self, pages: tuple[tuple[dict[str, object], ...], ...]) -> None:
+            self.pages = pages
+
+        def iter_items(self):
+            for page in self.pages:
+                yield from page
+
+    class PublicRewardsClient:
+        def __init__(
+            self,
+            *,
+            failures: set[tuple[str, bool]] | None = None,
+            gated: tuple[threading.Event, threading.Event] | None = None,
+        ) -> None:
+            self.calls: list[tuple[str, bool]] = []
+            self.active = 0
+            self.max_active = 0
+            self.lock = threading.Lock()
+            self.failures = failures or set()
+            self.gated = gated
+
+        def list_market_rewards(
+            self, *, condition_id: str, sponsored: bool | None = None
+        ) -> PagedRewards:
+            assert sponsored is not None
+            with self.lock:
+                self.calls.append((condition_id, sponsored))
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            try:
+                if self.gated is not None:
+                    started, release = self.gated
+                    if len(self.calls) >= 4:
+                        started.set()
+                    assert release.wait(timeout=2)
+                if (condition_id, sponsored) in self.failures:
+                    raise RuntimeError("selected reward page unavailable")
+                if condition_id == "condition-a" and sponsored is False:
+                    return PagedRewards(((valid_native,), (valid_native,)))
+                if condition_id == "condition-a" and sponsored is True:
+                    return PagedRewards(((valid_sponsored,),))
+                if condition_id == "condition-b" and sponsored is False:
+                    return PagedRewards(((wrong_asset,),))
+                return PagedRewards(())
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+        def list_current_rewards(self, **_: object) -> PagedRewards:
+            raise AssertionError("selected reward refresh must not read global rewards")
+
+    public = PublicRewardsClient()
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        client=FakeClient(),
+        public_client_factory=lambda: public,
+    )
+
+    before = datetime.now(UTC)
+    catalog = adapter.lp_reward_catalog(
+        condition_ids=("condition-a", "condition-b")
+    )
+    after = datetime.now(UTC)
+
+    assert catalog["state"] == "partial"
+    assert catalog["complete"] is False
+    assert public.calls == [
+        ("condition-a", False),
+        ("condition-a", True),
+        ("condition-b", False),
+        ("condition-b", True),
+    ] or sorted(public.calls) == sorted(
+        [
+            ("condition-a", False),
+            ("condition-a", True),
+            ("condition-b", False),
+            ("condition-b", True),
+        ]
+    )
+    assert public.max_active <= 4
+    checked_at = catalog["checked_at"]
+    assert isinstance(checked_at, datetime)
+    assert before <= checked_at <= after
+    markets = {
+        str(row["condition_id"]): row
+        for row in catalog["markets"]
+        if isinstance(row, dict)
+    }
+    assert markets["condition-a"]["daily_pool_usd"] == Decimal("5")
+    assert markets["condition-a"]["reward_active"] is True
+    assert markets["condition-a"]["checked_at"] == checked_at
+    assert markets["condition-b"]["daily_pool_usd"] is None
+    assert markets["condition-b"]["reward_active"] is None
+    assert markets["condition-b"]["state"] == "unknown"
+    assert "reward_asset_unknown" in markets["condition-b"]["reason_codes"]
+
+    failed_public = PublicRewardsClient(failures={("condition-b", True)})
+    failed_adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        client=FakeClient(),
+        public_client_factory=lambda: failed_public,
+    )
+    failed = failed_adapter.lp_reward_catalog(
+        condition_ids=("condition-a", "condition-b")
+    )
+    failed_markets = {
+        str(row["condition_id"]): row
+        for row in failed["markets"]
+        if isinstance(row, dict)
+    }
+    assert failed_markets["condition-b"]["daily_pool_usd"] is None
+    assert failed_markets["condition-b"]["state"] == "unknown"
+    assert "reward_read_failed" in failed_markets["condition-b"]["reason_codes"]
+
+    started = threading.Event()
+    release = threading.Event()
+    bounded_public = PublicRewardsClient(gated=(started, release))
+    bounded_adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        client=FakeClient(),
+        public_client_factory=lambda: bounded_public,
+    )
+    conditions = tuple(f"condition-{letter}" for letter in "abcde")
+    bounded_call = threading.Thread(
+        target=bounded_adapter.lp_reward_catalog,
+        kwargs={"condition_ids": conditions},
+    )
+    bounded_call.start()
+    assert started.wait(timeout=2)
+    release.set()
+    bounded_call.join(timeout=2)
+    assert not bounded_call.is_alive()
+    assert bounded_public.max_active <= 4
+    assert sorted(bounded_public.calls) == sorted(
+        (condition_id, sponsored)
+        for condition_id in conditions
+        for sponsored in (False, True)
+    )
+
+
 def test_lp_reward_snapshot_preserves_identity_assets_and_scope() -> None:
     class RewardTransport:
         def __init__(self) -> None:

@@ -58,6 +58,7 @@ LP_PRICE_HISTORY_ENDPOINT = "https://clob.polymarket.com/batch-prices-history"
 LP_PRICE_HISTORY_BATCH_SIZE = 20
 LP_PRICE_HISTORY_MAX_CONCURRENCY = 4
 LP_PRICE_HISTORY_TIMEOUT_SECONDS = 20.0
+LP_REWARD_SELECTED_MAX_CONCURRENCY = 4
 LP_REWARD_ASSET_USD_ADDRESSES = frozenset(
     {
         # Both contracts are identified by the official Polymarket contracts
@@ -531,6 +532,44 @@ def _reward_date(value: object) -> Date | None:
         return Date.fromisoformat(text)
     except ValueError:
         return None
+
+
+def _normalize_lp_reward_config(
+    value: object,
+    *,
+    sponsored: bool,
+    source: str | None = None,
+) -> tuple[dict[str, object], tuple[str, str, Date, Date]] | None:
+    """Normalize one SDK reward config for both catalog read paths."""
+
+    config = _model_dict(value)
+    if config is None:
+        return None
+    config_id = config.get("id")
+    asset_address = config.get("asset_address")
+    start_date = _reward_date(config.get("start_date"))
+    end_date = _reward_date(config.get("end_date"))
+    rate = _lp_decimal(config.get("rate_per_day"))
+    if (
+        config_id is None
+        or not isinstance(asset_address, str)
+        or start_date is None
+        or end_date is None
+        or rate is None
+        or rate < 0
+    ):
+        return None
+    normalized = dict(config)
+    normalized["rate_per_day"] = rate
+    normalized["sponsored"] = sponsored
+    if source is not None:
+        normalized["source"] = source
+    return normalized, (
+        str(config_id),
+        asset_address.casefold(),
+        start_date,
+        end_date,
+    )
 
 
 def _reward_usd_value(row: Mapping[str, object]) -> Decimal | None:
@@ -1623,10 +1662,214 @@ class PolymarketTradingClient:
             "fidelity": fidelity,
         }
 
+    def _lp_selected_reward_catalog(
+        self,
+        condition_ids: Sequence[str],
+        *,
+        stop_event: threading.Event | None = None,
+    ) -> dict[str, object]:
+        """Read reward facts for a fixed market set without global calls."""
+
+        checked_at = datetime.now(UTC)
+        requested = tuple(
+            dict.fromkeys(
+                value.strip()
+                for value in condition_ids
+                if isinstance(value, str) and value.strip()
+            )
+        )
+        if not requested:
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": checked_at,
+                "daily_pool_usd": Decimal("0"),
+                "markets": (),
+            }
+
+        requests = tuple(
+            (condition_id, sponsored)
+            for condition_id in requested
+            for sponsored in (False, True)
+        )
+
+        def close_public(public: object) -> None:
+            close = getattr(public, "close", None)
+            if callable(close):
+                close()
+
+        def read_rewards(
+            request: tuple[str, bool],
+        ) -> tuple[str, bool, tuple[object, ...], str | None]:
+            condition_id, sponsored = request
+            if stop_event is not None and stop_event.is_set():
+                return condition_id, sponsored, (), "reward_read_cancelled"
+            public = self._public_client_factory()
+            try:
+                reader = getattr(public, "list_market_rewards", None)
+                if not callable(reader):
+                    raise ValueError("selected_reward_reader_unavailable")
+                return condition_id, sponsored, _collect(
+                    reader(condition_id=condition_id, sponsored=sponsored)
+                ), None
+            except _RewardReadCancelled:
+                return condition_id, sponsored, (), "reward_read_cancelled"
+            except Exception:
+                return condition_id, sponsored, (), "reward_read_failed"
+            finally:
+                close_public(public)
+
+        results: dict[tuple[str, bool], tuple[tuple[object, ...], str | None]] = {}
+        with ThreadPoolExecutor(
+            max_workers=min(LP_REWARD_SELECTED_MAX_CONCURRENCY, len(requests)),
+            thread_name_prefix="polymarket-selected-rewards",
+        ) as executor:
+            for condition_id, sponsored, rows, error in executor.map(
+                read_rewards, requests
+            ):
+                results[(condition_id, sponsored)] = (rows, error)
+
+        markets: list[dict[str, object]] = []
+        known_count = 0
+        total = Decimal("0")
+        total_known = True
+        as_of = checked_at.date()
+        for condition_id in requested:
+            market: dict[str, object] = {
+                "condition_id": condition_id,
+                "checked_at": checked_at,
+                "reward_checked_at": checked_at,
+                "rewards_max_spread": None,
+                "rewards_min_size": None,
+                "native_reward_configs": [],
+                "sponsored_reward_configs": [],
+                "native_daily_pool_usd": Decimal("0"),
+                "sponsored_daily_pool_usd": Decimal("0"),
+            }
+            reason_codes: list[str] = []
+            seen: set[tuple[object, ...]] = set()
+            active_configs = 0
+            unknown_asset = False
+
+            for sponsored in (False, True):
+                rows, read_error = results[(condition_id, sponsored)]
+                if read_error is not None:
+                    reason_codes.append(read_error)
+                    continue
+                for reward in rows:
+                    row = _model_dict(reward)
+                    if row is None or row.get("condition_id") != condition_id:
+                        reason_codes.append("reward_identity_unknown")
+                        continue
+                    if market["rewards_max_spread"] is None:
+                        market["rewards_max_spread"] = _lp_decimal(
+                            row.get("rewards_max_spread")
+                        )
+                    if market["rewards_min_size"] is None:
+                        market["rewards_min_size"] = _lp_decimal(
+                            row.get("rewards_min_size")
+                        )
+                    raw_configs = row.get("rewards_config")
+                    if not isinstance(raw_configs, Sequence) or isinstance(
+                        raw_configs, (str, bytes)
+                    ):
+                        reason_codes.append("reward_config_unknown")
+                        continue
+                    for raw_config in raw_configs:
+                        normalized_parts = _normalize_lp_reward_config(
+                            raw_config,
+                            sponsored=sponsored,
+                        )
+                        if normalized_parts is None:
+                            reason_codes.append("reward_config_unknown")
+                            continue
+                        normalized, config_identity = normalized_parts
+                        _, asset_key, start_date, end_date = config_identity
+                        asset = str(normalized["asset_address"])
+                        rate = cast(Decimal, normalized["rate_per_day"])
+                        identity = (condition_id, *config_identity)
+                        if identity in seen:
+                            continue
+                        seen.add(identity)
+                        if not start_date <= as_of <= end_date:
+                            continue
+                        cast(
+                            list[dict[str, object]],
+                            market[
+                                "sponsored_reward_configs"
+                                if sponsored
+                                else "native_reward_configs"
+                            ],
+                        ).append(normalized)
+                        active_configs += 1
+                        if asset_key not in LP_REWARD_ASSET_USD_ADDRESSES:
+                            unknown_asset = True
+                            continue
+                        amount_key = (
+                            "sponsored_daily_pool_usd"
+                            if sponsored
+                            else "native_daily_pool_usd"
+                        )
+                        current = cast(Decimal | None, market[amount_key])
+                        if current is not None:
+                            market[amount_key] = current + rate
+
+            if unknown_asset:
+                reason_codes.append("reward_asset_unknown")
+            reason_codes = list(dict.fromkeys(reason_codes))
+            if reason_codes:
+                market.update(
+                    {
+                        "state": "unknown",
+                        "complete": False,
+                        "reward_active": None,
+                        "daily_pool_usd": None,
+                        "reason_codes": reason_codes,
+                    }
+                )
+                total_known = False
+            else:
+                native = cast(Decimal, market["native_daily_pool_usd"])
+                sponsored = cast(Decimal, market["sponsored_daily_pool_usd"])
+                daily_pool = native + sponsored
+                market.update(
+                    {
+                        "state": "known",
+                        "complete": True,
+                        "reward_active": active_configs > 0,
+                        "daily_pool_usd": daily_pool,
+                        "reason_codes": [],
+                    }
+                )
+                known_count += 1
+                total += daily_pool
+            markets.append(market)
+
+        complete = known_count == len(requested)
+        return {
+            "state": "known"
+            if complete
+            else "partial"
+            if known_count
+            else "unknown",
+            "complete": complete,
+            "checked_at": checked_at,
+            "daily_pool_usd": total if total_known else None,
+            "markets": tuple(markets),
+        }
+
     def lp_reward_catalog(
-        self, *, stop_event: threading.Event | None = None
+        self,
+        *,
+        condition_ids: Sequence[str] | None = None,
+        stop_event: threading.Event | None = None,
     ) -> dict[str, object]:
         """Read complete active native and sponsored LP reward configurations."""
+
+        if condition_ids is not None:
+            return self._lp_selected_reward_catalog(
+                condition_ids, stop_event=stop_event
+            )
 
         checked_at = datetime.now(UTC)
         unknown = {
@@ -1695,29 +1938,18 @@ class PolymarketTradingClient:
                         else "native_daily_pool_usd"
                     )
                     for raw_config in raw_configs:
-                        config = _model_dict(raw_config)
-                        if config is None:
+                        normalized_parts = _normalize_lp_reward_config(
+                            raw_config,
+                            sponsored=sponsored,
+                        )
+                        if normalized_parts is None:
                             raise ValueError("reward_config_unknown")
-                        config_id = config.get("id")
-                        asset_address = config.get("asset_address")
-                        start_date = _reward_date(config.get("start_date"))
-                        end_date = _reward_date(config.get("end_date"))
-                        rate = _lp_decimal(config.get("rate_per_day"))
-                        if (
-                            config_id is None
-                            or not isinstance(asset_address, str)
-                            or start_date is None
-                            or end_date is None
-                            or rate is None
-                            or rate < 0
-                        ):
-                            raise ValueError("reward_config_unknown")
+                        normalized, config_identity = normalized_parts
+                        _, asset_key, start_date, end_date = config_identity
+                        rate = cast(Decimal, normalized["rate_per_day"])
                         identity = (
                             condition_id,
-                            str(config_id),
-                            asset_address.casefold(),
-                            start_date,
-                            end_date,
+                            *config_identity,
                             sponsored,
                         )
                         if identity in seen:
@@ -1726,13 +1958,10 @@ class PolymarketTradingClient:
                         if not start_date <= as_of <= end_date:
                             continue
 
-                        normalized = dict(config)
-                        normalized["rate_per_day"] = rate
-                        normalized["sponsored"] = sponsored
                         cast(list[dict[str, object]], market[configs_key]).append(
                             normalized
                         )
-                        if asset_address.casefold() not in LP_REWARD_ASSET_USD_ADDRESSES:
+                        if asset_key not in LP_REWARD_ASSET_USD_ADDRESSES:
                             market[amount_key] = None
                             continue
                         current_amount = cast(Decimal | None, market[amount_key])

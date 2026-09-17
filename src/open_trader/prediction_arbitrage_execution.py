@@ -1140,6 +1140,12 @@ class PredictionExecutionService:
                 ] if isinstance(raw_candidates, (list, tuple)) else []
                 raw_recommendations = candidate_snapshot.get("recommendations")
                 recommendations = _normalize_lp_recommendations(raw_recommendations)
+                raw_selected_results = candidate_snapshot.get("selected_results")
+                selected_results = [
+                    dict(row)
+                    for row in raw_selected_results
+                    if isinstance(row, Mapping)
+                ] if isinstance(raw_selected_results, (list, tuple)) else []
                 raw_market_rewards = candidate_snapshot.get("market_rewards")
                 market_rewards = (
                     dict(raw_market_rewards)
@@ -1259,6 +1265,7 @@ class PredictionExecutionService:
                     "non_lp_row_count": non_lp_row_count,
                     "candidates": candidates,
                     "recommendations": recommendations,
+                    "selected_results": selected_results,
                     "funnel": (
                         dict(candidate_snapshot.get("funnel"))
                         if isinstance(candidate_snapshot.get("funnel"), Mapping)
@@ -1329,6 +1336,7 @@ class PredictionExecutionService:
                     candidate_snapshot = {}
                 candidate_rows = candidate_snapshot.get("candidates")
                 recommendations = candidate_snapshot.get("recommendations")
+                selected_results = candidate_snapshot.get("selected_results")
                 candidate_funnel = candidate_snapshot.get("funnel")
                 candidate_state = candidate_snapshot.get("state", "unknown")
                 candidate_projection = {
@@ -1341,6 +1349,11 @@ class PredictionExecutionService:
                         dict(row)
                         for row in _normalize_lp_recommendations(recommendations)
                     ],
+                    "selected_results": [
+                        dict(row)
+                        for row in selected_results
+                        if isinstance(row, Mapping)
+                    ] if isinstance(selected_results, (list, tuple)) else [],
                     "funnel": (
                         dict(candidate_funnel)
                         if isinstance(candidate_funnel, Mapping)

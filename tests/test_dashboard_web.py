@@ -5537,7 +5537,7 @@ const lpDashboard = {
     directions:{NO:{token_id:"candidate-token",state:"eligible",reason_codes:[],
       screening:{stability_range:"0.01",stability_sample_count:721,reason_codes:[]},
       guidance:{price:"0.40",quantity:"20",required_capital:"8.00",estimated_exit_loss:"0.40",estimated_exit_loss_ratio:"0.05",
-        checked_at:"2026-09-15T04:00:00Z",expires_at:"2026-09-17T00:00:00Z"}}}}],
+        checked_at:"2026-09-15T04:00:00Z",expires_at:"2026-09-18T00:00:00Z"}}}}],
 };
 const requests = [];
 let resolveVenues;
@@ -5859,6 +5859,157 @@ console.log(JSON.stringify(result));
     assert rendered["accountIntervalsAfterExit"] == [rendered["accountTimerId"]]
 
 
+def test_lp_recommendations_render_usable_guidance_or_explicit_error() -> None:
+    output = run_dashboard_js(r'''
+const checkedAt = "2026-09-17T01:00:00Z";
+const expiresAt = "2026-09-17T01:01:00Z";
+const conditions = {
+  catalog: {来源:"奖励目录与市场资料",完整性:"完整目录；缺失资料=UNKNOWN"},
+  base: {奖励:"奖励启用且日奖池>0",市场:"接受订单",参与:"没有已知订单或持仓"},
+  volatility: {窗口:"24h",粒度:"1m",振幅:"不超过1¢",刷新:"每小时",有效期:"2h",缺失:"UNKNOWN"},
+  selected: {排序:"日奖池降序，同额按市场ID升序",上限:50},
+  risk: {盘口与账户:"10s内；订单与持仓资料完整",入场压力:"含费压力退出估损不超过10%"},
+};
+const guide = (price = "0.50", quantity = "20", capital = "10.00", loss = "0.20", expiry = expiresAt) => ({
+  price, quantity, required_capital: capital, estimated_exit_loss: loss,
+  estimated_exit_loss_ratio: "0.02", checked_at: checkedAt, expires_at: expiry,
+});
+const direction = (outcome, guideValue) => ({
+  outcome, state:"eligible", eligible:true, reason_codes:[],
+  screening: {state:"known", amplitude:"0.005", sample_count:721,
+    window_start:"2026-09-16T01:00:00Z", window_end:checkedAt,
+    checked_at:checkedAt, valid_until:"2026-09-17T03:00:00Z"},
+  guidance: guideValue,
+});
+const baseFunnel = {catalog_read:43,base_pass:43,volatility_pass:43,selected:43,
+  risk:{passed:2,rejected:40,unknown:1},conditions,
+  reasons:{catalog:[],base:[],volatility:[],selected:[],risk:[{market_id:"M-unknown",code:"book_unknown"}]}};
+const dashboard = (recommendations, risk = baseFunnel.risk, selectedResults = undefined, reasons = baseFunnel.reasons) => ({
+  state:"ready", candidate_state:"ready", complete:true, candidate_stale:false,
+  candidate_checked_at:checkedAt, candidate_last_success_at:checkedAt,
+  funnel:{...baseFunnel,risk,reasons}, recommendations, selected_results:selectedResults, orders:[], positions:[],
+});
+const validRecommendations = [
+  {market_id:"team-market",condition_id:"condition-team",market_title:"KBO fixture",
+    market_url:"https://polymarket.com/event/team",daily_pool_usd:"15",state:"eligible",
+    directions:{"Samsung Lions":direction("Samsung Lions",guide())}},
+  {market_id:"ou-market",condition_id:"condition-ou",market_title:"Baseball total",
+    market_url:"https://polymarket.com/event/ou",daily_pool_usd:"10",state:"eligible",
+    directions:{"Over 8.5":direction("Over 8.5",guide())}},
+];
+Date.now = () => Date.parse(checkedAt);
+const valid = predictionLpCard({lp_dashboard:dashboard(validRecommendations)});
+const unavailable = predictionLpCard({lp_dashboard:dashboard([
+  {market_id:"unknown-market",condition_id:"condition-unknown",market_title:"Unknown fixture",state:"unknown",
+    directions:{YES:{state:"unknown",reason_codes:["book_unknown"],guidance:null}}},
+], {passed:0,rejected:0,unknown:43})});
+const expired = predictionLpCard({lp_dashboard:dashboard(validRecommendations.map((row) => ({
+  ...row, directions:Object.fromEntries(Object.entries(row.directions).map(([outcome, value]) => [outcome,
+    {...value, guidance:{...value.guidance, expires_at:"2026-09-17T00:59:59Z"}}]))
+})), {passed:0,rejected:0,unknown:43})});
+const diagnosticResults = [
+  {market_id:"unknown-market",condition_id:"condition-unknown",market_title:"Unknown fixture",state:"unknown",
+    directions:{YES:{state:"unknown",reason_codes:["reward_data_unknown","guidance_unknown"],guidance:null}}},
+  {market_id:"rejected-market",condition_id:"condition-rejected",market_title:"Rejected fixture",state:"rejected",
+    directions:{YES:{state:"rejected",reason_codes:["market_identity_changed"],guidance:null}}},
+  {market_id:"expired-market",condition_id:"condition-expired",market_title:"Expired fixture",state:"expired",
+    directions:{YES:{state:"expired",reason_codes:["candidate_snapshot_stale"],guidance:guide("0.50","20","10.00","0.20","2026-09-17T00:59:59Z")}}},
+];
+const diagnostic = predictionLpCard({lp_dashboard:dashboard([], {passed:0,rejected:1,unknown:2}, diagnosticResults, {
+  catalog:[],base:[],volatility:[],selected:[],risk:[
+    {market_id:"unknown-market",code:"reward_data_unknown"},
+    {market_id:"unknown-market",code:"guidance_unknown"},
+    {market_id:"rejected-market",code:"market_identity_changed"},
+    {market_id:"expired-market",code:"candidate_snapshot_stale"},
+  ],
+})});
+const mixed = predictionLpCard({lp_dashboard:dashboard([], {passed:0,rejected:0,unknown:1}, [{
+  market_id:"mixed-market",condition_id:"condition-mixed",market_title:"Mixed fixture",state:"unknown",
+  directions:{
+    YES:{state:"unknown",reason_codes:["book_unknown"],guidance:null},
+    NO:{state:"rejected",reason_codes:["event_recovery_pending"],guidance:null},
+  },
+}], {
+  catalog:[],base:[],volatility:[],selected:[],risk:[
+    {market_id:"mixed-market",outcome:"YES",code:"book_unknown"},
+    {market_id:"mixed-market",outcome:"NO",code:"event_recovery_pending"},
+  ],
+})});
+const candidateTable = (html) => (html.match(/<table class="pm-table pm-lp-candidate-table">[\s\S]*?<\/table>/) || [""])[0];
+const stages = (html) => [...html.matchAll(/data-lp-funnel-stage="([^"]+)"/g)].map((match) => match[1]);
+const validTable = candidateTable(valid);
+const unavailableTable = candidateTable(unavailable);
+const expiredTable = candidateTable(expired);
+const diagnosticError = (diagnostic.match(/<p class="pm-lp-candidate-error"[\s\S]*?<\/p>/) || [""])[0];
+const diagnosticList = (diagnostic.match(/<details class="pm-lp-candidate-diagnostics">[\s\S]*?<\/details>/) || [""])[0];
+const mixedList = (mixed.match(/<details class="pm-lp-candidate-diagnostics">[\s\S]*?<\/details>/) || [""])[0];
+const filterHint = valid.match(/data-lp-funnel-hint="filter"[\s\S]*?<span class="pm-lp-funnel-tip" role="tooltip">([\s\S]*?)<\/span>/)?.[1] || "";
+const riskHint = valid.match(/data-lp-funnel-hint="risk"[\s\S]*?<span class="pm-lp-funnel-tip" role="tooltip">([\s\S]*?)<\/span>/)?.[1] || "";
+console.log(JSON.stringify({
+  stages: stages(valid),
+  noLegacyStages: !valid.includes("基础条件通过") && !valid.includes("波动条件通过") && !valid.includes("排序入选"),
+  filterRules: filterHint.includes("奖励启用") && filterHint.includes("24h") && filterHint.includes("不超过1¢"),
+  riskRules: riskHint.includes("日奖池降序") && riskHint.includes("50") && riskHint.includes("压力退出估损"),
+  validCount: (valid.match(/<tr data-lp-recommendation=/g) || []).length,
+  validTitle: valid.includes("<h2>LP 标的评估</h2>") && valid.includes("风控通过标的（2）"),
+  teamOutcome: validTable.includes("Samsung Lions") && validTable.includes("买 Samsung Lions"),
+  overUnderOutcome: validTable.includes("Over 8.5") && validTable.includes("买 Over 8.5"),
+  guideFacts: ["50¢", "$0.50", "20 份", "$10.00", "$0.20", "2%", "2026-09-17 09:00:00 HKT", "2026-09-17 09:01:00 HKT"].every((value) => validTable.includes(value)),
+  linkAndTimes: validTable.indexOf("检查") < validTable.indexOf("Polymarket")
+    && validTable.includes("有效至") && validTable.includes("下单指引"),
+  unavailableError: unavailable.includes("资料不可用") && unavailable.includes("43")
+    && unavailable.includes("当前盘口资料不可用")
+    && unavailable.includes("pm-funnel-stage pm-lp-funnel-stage drop")
+    && !unavailableTable.includes("买 YES") && !/UNKNOWN\s*[×x]\s*UNKNOWN/.test(unavailableTable),
+  diagnosticStates: diagnosticList.includes("Unknown fixture · YES · 资料不可用")
+    && !diagnosticList.includes("Unknown fixture · YES · 未通过")
+    && diagnosticList.includes("Rejected fixture · YES · 未通过（无下单指引）")
+    && diagnosticList.includes("Expired fixture · YES · 指引已过期"),
+  diagnosticReasons: diagnosticError.includes("奖励资料不可用")
+    && diagnosticError.includes("下单指引资料不可用")
+    && diagnosticError.includes("市场身份已变化，资料待核验")
+    && diagnosticError.includes("候选快照已过期")
+    && !diagnosticError.includes("reward_data_unknown")
+    && !diagnosticError.includes("market_identity_changed")
+    && !diagnosticError.includes("guidance_unknown")
+    && !diagnosticError.includes("candidate_snapshot_stale"),
+  diagnosticCounts: diagnostic.includes("风控通过标的（0）")
+    && diagnostic.includes("未通过 1") && diagnostic.includes("资料不可用 2")
+    && !candidateTable(diagnostic).includes("买 YES"),
+  mixedDirectionStates: mixedList.includes("Mixed fixture · YES · 资料不可用")
+    && mixedList.includes("Mixed fixture · NO · 未通过（无下单指引）")
+    && !mixedList.includes("Mixed fixture · NO · 资料不可用")
+    && mixed.includes("风控通过标的（0）") && mixed.includes("资料不可用 1")
+    && !candidateTable(mixed).includes("买 YES") && !candidateTable(mixed).includes("买 NO"),
+  expiredError: expired.includes("指引已过期") && expired.includes("过期")
+    && (expired.match(/<tr data-lp-recommendation=/g) || []).length === 0
+    && expired.includes("风控通过标的（0）")
+    && expired.includes("有效至 2026-09-17 08:59:59 HKT"),
+  accessibleHints: (valid.match(/tabindex="0" role="note"/g) || []).length === 3,
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered == {
+        "stages": ["catalog-read", "filter", "risk"],
+        "noLegacyStages": True,
+        "filterRules": True,
+        "riskRules": True,
+        "validCount": 2,
+        "validTitle": True,
+        "teamOutcome": True,
+        "overUnderOutcome": True,
+        "guideFacts": True,
+        "linkAndTimes": True,
+        "unavailableError": True,
+        "diagnosticStates": True,
+        "diagnosticReasons": True,
+        "diagnosticCounts": True,
+        "mixedDirectionStates": True,
+        "expiredError": True,
+        "accessibleHints": True,
+    }
+
+
 def test_lp_funnel_renders_stage_counts_before_recommendations() -> None:
     output = run_dashboard_js(r'''
 const dashboard = {
@@ -5877,28 +6028,27 @@ const dashboard = {
   }, recommendations:[{market_id:"M01",condition_id:"condition-M01",market_title:"Rejected day history",daily_pool_usd:"100",state:"rejected",directions:{YES:{state:"rejected",token_id:"token-M01",reason_codes:["book_stale"],screening:{state:"known",amplitude:"0.005",window_start:"2026-09-16T01:00:00Z",window_end:"2026-09-17T01:00:00Z",checked_at:"2026-09-17T01:00:00Z",valid_until:"2026-09-17T03:00:00Z",sample_count:721},guidance:null}}}], orders:[], positions:[],
 };
 const html = predictionLpCard({lp_dashboard:dashboard});
+const riskStage = (html.match(/data-lp-funnel-stage="risk"[\s\S]*?<\/article>/) || [""])[0];
 console.log(JSON.stringify({
   html,
-  order:["目录已读取","基础条件通过","波动条件通过","排序入选","风控通过"].map((label)=>html.indexOf(label)),
-  counts:["1,200","800","120","50","30","15","5"].map((value)=>html.includes(value)),
+  order:["已读取市场","筛选通过","风控通过"].map((label)=>html.indexOf(label)),
+  counts:["1,200","120","0","15","5"].map((value)=>riskStage.includes(value) || html.includes(value)),
   stages:(html.match(/data-lp-funnel-stage=/g)||[]).length,
   reasons:html.includes("data-lp-funnel-reasons") && html.includes("奖励状态未知") && html.includes("历史不足") && html.includes("盘口缺失"),
-  tableAfter:html.indexOf("推荐标的") < html.indexOf("pm-lp-candidate-table"),
-  dayHistory:html.includes("24h 极差 0.5¢") && html.includes("2026-09-17") && !html.includes("1h 极差") && !html.includes("完整 1h") && !html.includes("一小时中间价"),
-  rejectedReason:html.includes("当前盘口已过期") && !html.includes("可参与"),
+  tableAfter:html.indexOf("风控通过标的") < html.indexOf("pm-lp-candidate-table"),
+  noRecommendation:!html.includes("data-lp-recommendation=") && html.includes("未通过（无下单指引）"),
+  riskCounts:riskStage.includes("未通过 15") && riskStage.includes("资料不可用 5") && riskStage.includes("待评估 0")
 }));
 ''')
     rendered = json.loads(output)
-    assert all(index >= 0 for index in rendered["order"])
     assert rendered["order"] == sorted(rendered["order"])
-    assert all(rendered["counts"])
-    assert rendered["stages"] == 5
+    assert all(index >= 0 for index in rendered["order"])
+    assert rendered["counts"] == [True, True, True, True, True]
+    assert rendered["stages"] == 3
     assert rendered["reasons"] is True
     assert rendered["tableAfter"] is True
-    assert rendered["dayHistory"] is True
-    assert rendered["rejectedReason"] is True
-    assert "未入选 70" in rendered["html"]
-    assert "风险拒绝 70" not in rendered["html"]
+    assert rendered["noRecommendation"] is True
+    assert rendered["riskCounts"] is True
 
 
 def test_lp_funnel_distinguishes_unknown_stale_and_confirmed_zero() -> None:
@@ -5953,10 +6103,10 @@ const funnelFragment = (html) => html.slice(html.indexOf('<section class="pm-pan
 const confirmedFunnel = funnelFragment(zeroConfirmed);
 console.log(JSON.stringify({
   unknown:unknown.includes("UNKNOWN") && unknown.includes("待评估"),
-  zero:zero.includes('data-lp-funnel-stage="catalog-read"><span>目录已读取') && zero.includes('>0</strong>'),
+  zero:zero.includes('data-lp-funnel-stage="catalog-read"><span>已读取市场') && zero.includes('>0</strong>'),
   confirmedZero:confirmedFunnel.includes("奖励目录与市场资料") && confirmedFunnel.includes("0")
     && confirmedFunnel.includes("本轮没有淘汰原因") && !confirmedFunnel.includes("原因 UNKNOWN")
-    && !confirmedFunnel.includes("规则 UNKNOWN"),
+    && !confirmedFunnel.includes("规则不可用（UNKNOWN）"),
   scanning:scanning.includes("扫描中") && scanning.includes("待评估") && !scanning.includes("风险拒绝 0"),
   stale:stale.includes("已过期") && stale.includes("2026-09-17") && stale.includes("上次筛选条件") && !stale.includes("05:00"),
   partial:(funnelFragment(partial).includes("部分") && funnelFragment(partial).includes("10:00")
@@ -5998,12 +6148,12 @@ const missing = render({});
 console.log(JSON.stringify({
   hintCount:(actual.match(/data-lp-funnel-hint=/g)||[]).length,
   actual:["24h","1m","不超过1¢","每小时","2h","50","含费压力退出不超过10%"].every((item)=>actual.includes(item)),
-  missingConditions:missing.includes("规则 UNKNOWN") && !missing.includes("window=24h") && !missing.includes("limit=50"),
+    missingConditions:missing.includes("规则不可用（UNKNOWN）") && !missing.includes("window=24h") && !missing.includes("limit=50"),
   readable:actual.includes("奖励目录与市场资料") && actual.includes("订单与持仓资料完整") && !actual.includes("[object Object]") && !actual.includes("source=") && !actual.includes("complete=True"),
 }));
 ''')
     rendered = json.loads(output)
-    assert rendered == {"hintCount": 5, "actual": True, "missingConditions": True, "readable": True}
+    assert rendered == {"hintCount": 3, "actual": True, "missingConditions": True, "readable": True}
     css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
     assert ".pm-lp-funnel-hint:hover" in css
     assert ".pm-lp-funnel-hint:focus-visible" in css
@@ -6315,20 +6465,6 @@ const laterMarketA = marketRow(laterPage, "Market A");
 const laterMarketB = marketRow(laterPage, "Market B");
 const retainedExpiredNo = state.predictionMarket.lpDashboard.recommendations
   .find((row) => row.condition_id === "condition-a").directions.NO.guidance;
-const earlyExpiryRerenderedCurrentAlternative = earlierMarketA.includes("买 YES")
-  && earlierMarketA.includes("51¢ × 20 份") && earlierMarketA.includes("可参与")
-  && !earlierMarketA.includes("41¢") && !/<option[^>]*value="NO"/.test(earlierMarketA)
-  && earlierMarketB.includes("39¢ × 20 份") && earlierMarketB.includes("可参与");
-const bothExpiredRowsRetainGuidance = laterMarketA.includes("51¢ × 20 份")
-  && laterMarketA.includes("已过期") && !laterMarketA.includes("可参与")
-  && laterMarketA.includes("检查 2026-09-15 12:00:00 HKT")
-  && laterMarketA.includes('href="https://polymarket.com/event/a-market/a"')
-  && laterMarketB.includes("39¢ × 20 份") && laterMarketB.includes("已过期")
-  && !laterMarketB.includes("可参与")
-  && laterMarketB.includes("检查 2026-09-15 12:00:00 HKT")
-  && laterMarketB.includes('href="https://polymarket.com/event/b-market/b"')
-  && retainedExpiredNo.price === "0.41" && retainedExpiredNo.quantity === "20"
-  && retainedExpiredNo.checked_at === checkedAt;
 const allFetchesStillHeldAtExpiry = heldResponses.length === 2 && heldReplacementFetch
   && requests.filter((item) => item.url.endsWith("/api/prediction-arbitrage/lp/dashboard")).length === 4;
 heldLpRequest.resolve(response({error: "offline"}, false, 503));
@@ -6367,8 +6503,8 @@ console.log(JSON.stringify({
       && orderTable.split(longManualTitle).length - 1 === 2;
   })(),
   honestManualPnl: initial.includes("未接管止损") && initial.includes("已实现 UNKNOWN") && initial.includes("持仓 P&amp;L UNKNOWN"),
-  partialCatalogVisible: partial.includes("候选目录尚未完整") && partial.includes("Market C"),
-  initialShowsBothLists: initial.includes("当天 LP 委托") && initial.includes("推荐标的"),
+  partialCatalogVisible: partial.includes("部分结果") && partial.includes("Market C"),
+  initialShowsBothLists: initial.includes("当天 LP 委托") && initial.includes("风控通过标的（4）"),
   longName: initial.includes(longManualTitle),
   manualReadOnly: initial.includes("买入") && !initial.includes("data-manual-cancel"),
   scoring: initial.includes("官方计分中"),
@@ -6377,33 +6513,38 @@ console.log(JSON.stringify({
   marketIdentity: aRow.includes("51¢") && aRow.includes("$10.20") && aRow.includes("120")
     && marketRow(initial, "Market B").includes("39¢")
     && marketRow(initial, "Market D").includes("43¢")
-    && marketRow(initial, "Market D").includes("UNKNOWN"),
+    && !marketRow(initial, "Market D").includes("UNKNOWN"),
   alternativeDirections: aRow.includes("<select") && aRow.includes('value="YES"') && aRow.includes('value="NO"')
     && aRow.includes("51¢") && aNoRow.includes("41¢") && aNoRow.includes("$8.20"),
   stableWindowAndEvidence: initial.includes("1¢") && initial.includes("721")
     && initial.includes("one_day_price_change") && initial.includes("关键事件覆盖不完整"),
-  expiredReferenceOnly: expiredRow.includes("已过期") && expiredRow.includes("48¢")
-    && expiredRow.includes("$9.60") && !/data-action="lp-candidate-(?:preview|start)"/.test(expiredRow),
-  ordinaryMarketLinks: ["c-market/c", "a-market/a", "b-market/b", "d-market/d", "old-market/old"]
+  expiredRowsDiagnosticOnly: !expiredRow.includes("data-lp-recommendation=") && initial.includes("Expired market")
+    && initial.includes("指引已过期") && initial.includes("有效至 2026-09-15 12:01:00 HKT"),
+  currentMarketLinks: ["c-market/c", "a-market/a", "b-market/b", "d-market/d"]
     .every((path) => initial.includes(`href="https://polymarket.com/event/${path}"`))
-    && (initial.match(/rel="noopener noreferrer"/g) || []).length >= 5,
+    && (initial.match(/rel="noopener noreferrer"/g) || []).length >= 4,
   noInternalEntryActions: !/data-action="lp-candidate-(?:preview|start|cancel)"/.test(initial)
     && !initial.includes("确认开仓"),
   noRequestFromMarketLink,
   refreshQueuesReadOnly: refreshRequest?.method === "POST" && refreshRequest.body === "{}"
-    && refreshPosts === 1 && marketRow(afterRefresh, "Market C").includes("58¢")
-    && marketRow(afterRefresh, "Market A").includes("41¢")
+    && refreshPosts === 1 && marketRow(afterRefresh, "Market C").includes("58¢（$0.58）")
+    && marketRow(afterRefresh, "Market A").includes("41¢（$0.41）")
     && !requests.some((item) => /\/lp\/candidates\/(?:preview|start)|\/lp\/sessions/.test(item.url)),
   heldAtEarlierExpiry,
-  earlyExpiryRerenderedCurrentAlternative,
-  bothExpiredRowsRetainGuidance,
+  earlyExpiryHidesExpiredAlternative: earlierMarketA.includes("51¢（$0.51） × 20 份")
+    && !earlierMarketA.includes("41¢") && !/<option[^>]*value="NO"/.test(earlierMarketA)
+    && earlierMarketA.includes("可参与")
+    && earlierMarketB.includes("39¢（$0.39） × 20 份"),
+  expiredRowsOmittedWithDiagnostics: !laterMarketA.includes("data-lp-recommendation")
+    && !laterMarketB.includes("data-lp-recommendation")
+    && laterPage.includes("指引已过期")
+    && laterPage.includes("检查 2026-09-15 12:00:00 HKT"),
   allFetchesStillHeldAtExpiry,
-  staleRetainsData: stale.includes(longManualTitle) && stale.includes("Market C")
-    && marketRow(stale, "Market C").includes("58¢")
-    && marketRow(stale, "Market A").includes("51¢")
+  staleHidesRecommendationsWithDiagnostics: stale.includes(longManualTitle)
+    && !stale.includes("data-lp-recommendation=")
     && staleMarketANo.price === "0.41" && staleMarketANo.quantity === "20"
     && staleMarketANo.checked_at === checkedAt
-    && stale.includes("上次成功数据"),
+    && stale.includes("上次成功数据") && stale.includes("已过期"),
 }));
 ''')
     rendered = json.loads(output)
@@ -6428,16 +6569,16 @@ console.log(JSON.stringify({
         "marketIdentity": True,
         "alternativeDirections": True,
         "stableWindowAndEvidence": True,
-        "expiredReferenceOnly": True,
-        "ordinaryMarketLinks": True,
+        "expiredRowsDiagnosticOnly": True,
+        "currentMarketLinks": True,
         "noInternalEntryActions": True,
         "noRequestFromMarketLink": True,
         "refreshQueuesReadOnly": True,
         "heldAtEarlierExpiry": True,
-        "earlyExpiryRerenderedCurrentAlternative": True,
-        "bothExpiredRowsRetainGuidance": True,
+        "earlyExpiryHidesExpiredAlternative": True,
+        "expiredRowsOmittedWithDiagnostics": True,
         "allFetchesStillHeldAtExpiry": True,
-        "staleRetainsData": True,
+        "staleHidesRecommendationsWithDiagnostics": True,
     }
 
 
@@ -19100,7 +19241,8 @@ console.log(JSON.stringify({warning,critical,recovery,historical,expired}));
     assert "实际 7.5%" in warning
     assert "+2.5" in warning
     assert "2026-09-16 08:00:00" in warning
-    assert "$4.95" in warning
+    assert "Reference market" not in warning
+    assert "风控通过标的（0）" in warning
     assert "剩余 15" in warning and "剩余 10" in warning
     assert warning.count(" · 买入 · ") == 2
     assert warning.count("LP duplicate market") >= 2

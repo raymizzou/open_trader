@@ -6507,7 +6507,7 @@ button { cursor: pointer; }
 .pm-relation-summary-grid strong { color: var(--text); display: block; margin-top: 3px; overflow-wrap: anywhere; }
 .pm-relation-funnel { margin-bottom: 10px; overflow: hidden; padding: 0; }
 .pm-lp-funnel { overflow: visible; }
-.pm-lp-funnel-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+.pm-lp-funnel-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .pm-lp-funnel-stage { position: relative; }
 .pm-lp-funnel-hint { align-items: center; border: 1px solid var(--line); border-radius: 50%; color: var(--muted); cursor: help; display: inline-flex; font-size: 10px; font-weight: 800; height: 14px; justify-content: center; margin-left: 5px; position: relative; vertical-align: 1px; width: 14px; }
 .pm-lp-funnel-hint:hover, .pm-lp-funnel-hint:focus-visible { border-color: var(--accent); color: var(--accent); outline: none; }
@@ -6547,7 +6547,7 @@ button { cursor: pointer; }
 .pm-funnel-lane-title small { color: var(--muted); }
 .pm-funnel-grid { display: grid; gap: 7px; min-width: 0; }
 .pm-funnel-grid-catalog { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-.pm-lp-funnel .pm-lp-funnel-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+.pm-lp-funnel .pm-lp-funnel-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .pm-funnel-grid-activity { grid-template-columns: repeat(8, minmax(0, 1fr)); }
 .pm-cross-venue-funnel-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); }
 .pm-funnel-stage { background: #f2eee7; border: 1px solid transparent; border-radius: 7px; min-width: 0; padding: 8px; }
@@ -6561,6 +6561,14 @@ button { cursor: pointer; }
 .pm-lp-funnel .pm-lp-funnel-hint:hover .pm-lp-funnel-tip,
 .pm-lp-funnel .pm-lp-funnel-hint:focus .pm-lp-funnel-tip,
 .pm-lp-funnel .pm-lp-funnel-hint:focus-visible .pm-lp-funnel-tip { display: block; }
+.pm-lp-candidate-diagnostics { border-top: 1px solid var(--line); margin-top: 10px; padding-top: 10px; }
+.pm-lp-candidate-diagnostics summary { cursor: pointer; min-height: 36px; padding: 8px 0; }
+.pm-lp-candidate-diagnostics ul { margin: 4px 0 0 18px; padding: 0; }
+.pm-lp-candidate-diagnostics li { margin: 4px 0; }
+.pm-lp-candidate-error { background: #fff8e8; border: 1px solid #e4c98e; border-radius: 7px; color: #704915; margin: 10px 0; padding: 10px 12px; }
+.pm-lp-candidate-error strong { display: block; margin-bottom: 3px; }
+.pm-lp-candidate-table td[data-label="操作"] > div { display: grid; gap: 4px; }
+.pm-lp-candidate-table select.pm-button { max-width: 100%; min-width: 0; }
 .pm-funnel-meta { align-items: center; border-top: 1px solid var(--line); color: var(--muted); display: flex; flex-wrap: wrap; font-size: 11px; gap: 8px 14px; padding: 9px 14px; }
 .pm-funnel-meta details { color: var(--text); }
 .pm-collapse-summary { cursor: pointer; list-style: none; }
