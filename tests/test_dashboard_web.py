@@ -5709,6 +5709,7 @@ const click = async (matches) => {
   const target = {closest(selector){return matches[selector] || null;}};
   await nodes["prediction-market-root"].listeners.click[0]({target});
 };
+Date.now = () => Date.parse("2026-09-16T00:00:10Z");
 scheduleAccountPolling();
 await drainRequests();
 const accountTimerId = state.accountIntervalId;

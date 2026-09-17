@@ -250,6 +250,7 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
         "lp_actions",
         "lp_daily_reports",
         "lp_book_samples",
+        "lp_price_history_cache",
         "lp_screening_snapshot",
         "lp_market_observations",
     }

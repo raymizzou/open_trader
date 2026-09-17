@@ -33,7 +33,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
   ordered funnel/history/runtime/UI cases, 13 passing mandatory regressions,
   focused history-cache/runtime/UI checks, and the documented retired-path
   fixture migrations; no live calls, orders, eligibility activation or deployment
-  were performed.
+  were performed. Final-gate maintenance now pins the UI guidance clock and
+  inventories the approved price-history cache table; no production code changed.
 
 ## 2026-09-16
 
