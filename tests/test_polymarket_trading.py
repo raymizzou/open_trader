@@ -672,6 +672,95 @@ def test_lp_price_history_reader_batches_and_preserves_missing_data(
     assert result["state"] == "partial"
 
 
+@pytest.mark.parametrize(
+    ("raw_rows", "expected_state", "expected_rows", "expected_error"),
+    [
+        (
+            [
+                {"t": 1_699_999_940, "p": "0.10"},
+                {"t": 1_700_000_000, "p": "0.20"},
+                {"t": 1_700_000_060, "p": "0.30"},
+                {"t": 1_700_000_120, "p": "0.40"},
+            ],
+            "known",
+            [
+                {"t": 1_700_000_000, "p": Decimal("0.20")},
+                {"t": 1_700_000_060, "p": Decimal("0.30")},
+            ],
+            None,
+        ),
+        (
+            [
+                {"t": 1_700_000_000, "p": "0.20"},
+                "malformed",
+            ],
+            "unknown",
+            [],
+            "history_values_invalid",
+        ),
+        (
+            [
+                {"t": 1_700_000_000, "p": "0.20"},
+                {"t": "1700000060", "p": "0.30"},
+            ],
+            "unknown",
+            [],
+            "history_values_invalid",
+        ),
+        (
+            [
+                {"t": 1_700_000_000, "p": "0.20"},
+                {"t": 1_700_000_060, "p": "1.20"},
+            ],
+            "unknown",
+            [],
+            "history_values_invalid",
+        ),
+        (
+            [
+                {"t": 1_699_999_940, "p": "-0.10"},
+                {"t": 1_700_000_000, "p": "0.20"},
+                {"t": 1_700_000_060, "p": "0.30"},
+            ],
+            "unknown",
+            [],
+            "history_values_invalid",
+        ),
+    ],
+)
+def test_lp_history_discards_only_valid_out_of_window_points(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_rows: object,
+    expected_state: str,
+    expected_rows: list[dict[str, object]],
+    expected_error: str | None,
+) -> None:
+    adapter, _ = make_adapter()
+    token = "token-history"
+
+    def open_history(request: object, **_: object) -> FakeResponse:
+        body = json.loads(getattr(request, "data").decode("utf-8"))
+        assert body["markets"] == [token]
+        assert body["start_ts"] == 1_700_000_000
+        assert body["end_ts"] == 1_700_000_060
+        assert body["fidelity"] == 1
+        return FakeResponse({"history": {token: raw_rows}})
+
+    monkeypatch.setattr("open_trader.polymarket_trading.urlopen", open_history)
+    result = adapter.lp_price_history(
+        [token], start_ts=1_700_000_000, end_ts=1_700_000_060, fidelity=1
+    )
+
+    assert result["state"] == expected_state
+    assert result["history"].get(token, []) == expected_rows
+    if expected_error is None:
+        assert result["unknown_token_ids"] == []
+        assert result["errors"] == {}
+    else:
+        assert result["unknown_token_ids"] == [token]
+        assert result["errors"] == {token: expected_error}
+
+
 def test_lp_catalog_reads_all_reward_pages_without_double_counting() -> None:
     native_asset = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
     sponsored_asset = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
@@ -762,6 +851,8 @@ def test_lp_catalog_reads_all_reward_pages_without_double_counting() -> None:
     incomplete = incomplete_adapter.lp_reward_catalog()
 
     assert incomplete["state"] == "unknown"
+    assert incomplete["reason"] == "reward_catalog_read_failed"
+    assert incomplete["error_type"] == "RuntimeError"
 
 
 def test_lp_selected_reward_facts_preserve_identity_time_and_failures() -> None:
@@ -792,7 +883,7 @@ def test_lp_selected_reward_facts_preserve_identity_time_and_failures() -> None:
     }
     valid_sponsored = {
         "condition_id": "condition-a",
-        "rewards_config": [config("sponsored-a", sponsored_asset, "2")],
+        "rewards_config": [config("sponsored-a", sponsored_asset, "5")],
     }
     wrong_asset = {
         "condition_id": "condition-b",
@@ -3979,6 +4070,427 @@ class _LpMetadataBackingStore:
         }
 
 
+def test_lp_metadata_batches_preserve_success_and_distinguish_absence_from_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    condition_ids = tuple(f"0x{index:064x}" for index in range(201))
+    cached_id = condition_ids[0]
+    absent_id = condition_ids[99]
+    failed_ids = condition_ids[101:]
+    failed_batch_id = condition_ids[101]
+    read_at = datetime(2026, 9, 18, 12, 0, tzinfo=UTC)
+    old_checked_at = read_at - timedelta(hours=1)
+    cached_payload = {
+        "market_id": "market-cached",
+        "condition_id": cached_id,
+        "metadata_checked_at": old_checked_at,
+        "market_url": "https://polymarket.com/event/cached",
+        "outcomes": {},
+        "accepting_orders": True,
+        "exchange_type": "CLOB",
+    }
+    backing = _LpMetadataBackingStore(
+        {cached_id: (read_at.timestamp() + 3600.0, cached_payload)}
+    )
+    market_rows = {
+        condition_id: _lp_cache_market(condition_id, slug=condition_id)
+        for condition_id in condition_ids
+        if condition_id not in {cached_id, absent_id, *failed_ids}
+    }
+    market_rows[condition_ids[100]] = _lp_cache_market(
+        condition_ids[100], slug=condition_ids[100]
+    )
+    market_queries: list[tuple[str, ...]] = []
+    probe_lock = threading.Lock()
+
+    class BatchPublicClient:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def list_markets(
+            self,
+            *,
+            condition_ids: tuple[str, ...],
+            page_size: int | None = None,
+        ) -> tuple[object, ...]:
+            assert self.closed is False
+            assert page_size == 100
+            with probe_lock:
+                market_queries.append(tuple(condition_ids))
+            if condition_ids and condition_ids[0] == failed_batch_id:
+                raise TimeoutError("market timeout details must stay private")
+            return tuple(
+                market_rows[condition_id]
+                for condition_id in condition_ids
+                if condition_id in market_rows
+            )
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(
+        polymarket_trading,
+        "datetime",
+        type(
+            "BatchClock",
+            (datetime,),
+            {
+                "now": classmethod(
+                    lambda cls, tz=None: read_at
+                    if tz is None
+                    else read_at.astimezone(tz)
+                )
+            },
+        ),
+    )
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        client=object(),
+        public_client_factory=BatchPublicClient,
+        metadata_cache=backing,
+    )
+
+    result = adapter.lp_market_metadata_batch(condition_ids)
+
+    assert result["state"] == "partial"
+    assert result["checked_at"] == read_at
+    assert result["confirmed_absent_ids"] == (absent_id,)
+    assert set(result["failed_ids"]) == set(failed_ids)
+    assert all(
+        value == "market_read_TimeoutError" for value in result["failed_ids"].values()
+    )
+    assert result["deferred_ids"] == ()
+    markets = result["markets"]
+    assert markets[cached_id]["metadata_checked_at"] == old_checked_at
+    assert markets[condition_ids[1]]["metadata_checked_at"] == read_at
+    assert absent_id not in markets
+    assert set(markets).isdisjoint(set(result["failed_ids"]))
+    assert all(condition_id not in backing.rows for condition_id in failed_ids)
+
+    queries_after_first = len(market_queries)
+    rebuilt = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        client=object(),
+        public_client_factory=BatchPublicClient,
+        metadata_cache=backing,
+    )
+    rebuilt_result = rebuilt.lp_market_metadata_batch(condition_ids)
+
+    assert rebuilt_result["state"] == "partial"
+    assert rebuilt_result["confirmed_absent_ids"] == (absent_id,)
+    assert set(rebuilt_result["failed_ids"]) == set(failed_ids)
+    assert rebuilt_result["markets"][condition_ids[1]]["metadata_checked_at"] == read_at
+    assert market_queries[queries_after_first:] == [failed_ids]
+
+    stop_event = threading.Event()
+    stop_event.set()
+    cancelled = rebuilt.lp_market_metadata_batch(
+        condition_ids[:2], stop_event=stop_event
+    )
+    assert cancelled["state"] == "cancelled"
+    assert cancelled["deferred_ids"] == condition_ids[:2]
+    assert cancelled["confirmed_absent_ids"] == ()
+    assert cancelled["failed_ids"] == {}
+
+    cap_ids = tuple(f"0x{1000 + index:064x}" for index in range(1501))
+    cap_queries: list[tuple[str, ...]] = []
+
+    class CapPublicClient:
+        def list_markets(
+            self,
+            *,
+            condition_ids: tuple[str, ...],
+            page_size: int | None = None,
+        ) -> tuple[object, ...]:
+            assert page_size == 100
+            cap_queries.append(condition_ids)
+            return tuple(
+                _lp_cache_market(condition_id, slug=condition_id)
+                for condition_id in condition_ids
+            )
+
+        def close(self) -> None:
+            return None
+
+    capped = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        client=object(),
+        public_client_factory=CapPublicClient,
+    ).lp_market_metadata_batch(cap_ids)
+    assert capped["state"] == "partial"
+    assert capped["deferred_ids"] == (cap_ids[-1],)
+    assert capped["confirmed_absent_ids"] == ()
+    assert capped["failed_ids"] == {}
+    assert set(capped["markets"]) == set(cap_ids[:-1])
+    assert len(cap_queries) == 15
+    assert all(len(batch) <= 100 for batch in cap_queries)
+
+
+def test_lp_metadata_cache_keeps_original_twelve_hour_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    condition_present = "0x" + "a" * 64
+    condition_absent = "0x" + "b" * 64
+    condition_fresh = "0x" + "c" * 64
+    read_at = datetime(2026, 9, 18, 12, 0, tzinfo=UTC)
+    clock_at = {"value": read_at}
+
+    class CacheClock(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            value = clock_at["value"]
+            return value if tz is None else value.astimezone(tz)  # type: ignore[arg-type]
+
+    class NoPruneBackingStore(_LpMetadataBackingStore):
+        def lp_metadata_cache_prune(self, *, now: datetime | None = None) -> None:
+            self.prune_calls.append(now if now is not None else clock_at["value"])
+
+    probe = _LpMetadataProbe()
+    probe.market_rows[condition_present] = _lp_cache_market(
+        condition_present, slug="twelve-hour-present"
+    )
+    probe.market_rows[condition_fresh] = _lp_cache_market(
+        condition_fresh, slug="twelve-hour-fresh"
+    )
+    backing = NoPruneBackingStore()
+    monkeypatch.setattr(polymarket_trading, "datetime", CacheClock)
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        client=object(),
+        public_client_factory=probe.public_client_factory(),
+        metadata_cache=backing,
+    )
+
+    first = adapter.lp_market_metadata(
+        (condition_present, condition_absent, condition_fresh)
+    )
+    assert set(first) == {condition_present, condition_fresh}
+    first_positive_stamp = backing.rows[condition_present][0]
+    assert first_positive_stamp == read_at.timestamp() + 43200
+    assert backing.rows[condition_absent][0] == read_at.timestamp() + 3600
+    assert first[condition_present]["metadata_checked_at"] == read_at
+    queries_after_first = len(probe.market_queries)
+
+    clock_at["value"] = read_at + timedelta(seconds=1)
+    fresh_read = adapter.lp_market_metadata_fresh((condition_fresh,))
+    assert set(fresh_read) == {condition_fresh}
+    assert len(probe.market_queries) == queries_after_first + 1
+
+    rebuilt = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        client=object(),
+        public_client_factory=probe.public_client_factory(),
+        metadata_cache=backing,
+    )
+    clock_at["value"] = read_at + timedelta(seconds=100)
+    warm = rebuilt.lp_market_metadata((condition_present, condition_absent))
+    assert set(warm) == {condition_present}
+    assert warm[condition_present]["metadata_checked_at"] == read_at
+    assert backing.rows[condition_present][0] == first_positive_stamp
+    queries_after_warm = len(probe.market_queries)
+
+    clock_at["value"] = read_at + timedelta(seconds=3599)
+    before_negative_expiry = rebuilt.lp_market_metadata(
+        (condition_present, condition_absent)
+    )
+    assert set(before_negative_expiry) == {condition_present}
+    assert len(probe.market_queries) == queries_after_warm
+
+    clock_at["value"] = read_at + timedelta(seconds=3600)
+    after_negative_expiry = rebuilt.lp_market_metadata(
+        (condition_present, condition_absent)
+    )
+    assert set(after_negative_expiry) == {condition_present}
+    assert len(probe.market_queries) == queries_after_warm + 1
+    assert backing.rows[condition_absent][0] == clock_at["value"].timestamp() + 3600
+    assert backing.rows[condition_absent][1] is None
+
+    clock_at["value"] = read_at + timedelta(seconds=43199)
+    before_positive_expiry = rebuilt.lp_market_metadata((condition_present,))
+    assert set(before_positive_expiry) == {condition_present}
+    assert len(probe.market_queries) == queries_after_warm + 1
+
+    stored_before_failure = len(backing.stored)
+    probe.fail_market_reads = True
+    clock_at["value"] = read_at + timedelta(seconds=43200)
+    stale_after_failure = rebuilt.lp_market_metadata((condition_present,))
+    assert stale_after_failure[condition_present]["metadata_checked_at"] == read_at
+    assert backing.rows[condition_present][0] == first_positive_stamp
+    assert backing.rows[condition_present][1] == stale_after_failure[condition_present]
+    assert len(backing.stored) == stored_before_failure
+
+    assert rebuilt.lp_market_metadata_fresh((condition_present,)) == {}
+    assert len(backing.stored) == stored_before_failure
+
+    probe.fail_market_reads = False
+    refreshed = rebuilt.lp_market_metadata((condition_present,))
+    assert refreshed[condition_present]["metadata_checked_at"] == clock_at["value"]
+    assert backing.rows[condition_present][0] == clock_at["value"].timestamp() + 43200
+
+
+def test_lp_selected_rewards_accept_real_sdk_configs_without_double_counting() -> None:
+    from polymarket.models.clob.rewards import (
+        MarketReward,
+        MarketRewardConfig,
+        MarketRewardToken,
+    )
+
+    native_asset = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    sponsored_asset = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+    start_date = datetime(2026, 1, 1, tzinfo=UTC)
+    end_date = datetime(2026, 12, 31, tzinfo=UTC)
+    token_id = "0x" + "1" * 64
+    condition_total = "0x" + "1" * 64
+    condition_migration = "0x" + "2" * 64
+    condition_multiplicity = "0x" + "3" * 64
+    condition_invalid = "0x" + "4" * 64
+    condition_failed = "0x" + "5" * 64
+    condition_inconsistent = "0x" + "6" * 64
+
+    def config(asset: str, amount: str) -> MarketRewardConfig:
+        return MarketRewardConfig(
+            asset_address=asset,
+            start_date=start_date,
+            end_date=end_date,
+            rate_per_day=amount,
+        )
+
+    def reward(
+        condition_id: str,
+        configs: tuple[MarketRewardConfig, ...],
+        *,
+        max_spread: float = 0.1,
+        min_size: str = "20",
+    ) -> MarketReward:
+        return MarketReward(
+            condition_id=condition_id,
+            question=f"Question {condition_id}",
+            rewards_max_spread=max_spread,
+            rewards_min_size=min_size,
+            tokens=(
+                MarketRewardToken(token_id=token_id, outcome="Yes", price="0.5"),
+            ),
+            rewards_config=configs,
+        )
+
+    native_total = reward(condition_total, (config(native_asset, "3"),))
+    combined_total = reward(condition_total, (config(sponsored_asset, "5"),))
+    native_migration = reward(condition_migration, (config(native_asset, "20"),))
+    combined_migration = reward(
+        condition_migration, (config(sponsored_asset, "20"),)
+    )
+    native_multiplicity = reward(
+        condition_multiplicity,
+        (config(native_asset, "1"), config(native_asset, "1")),
+    )
+    combined_multiplicity = reward(
+        condition_multiplicity, (config(sponsored_asset, "2"),)
+    )
+    valid_native = reward(condition_invalid, (config(native_asset, "3"),))
+    invalid_combined = reward(
+        condition_invalid,
+        (config("0x" + "9" * 40, "5"),),
+    )
+    native_failed = reward(condition_failed, (config(native_asset, "3"),))
+    native_inconsistent = reward(
+        condition_inconsistent, (config(native_asset, "3"),)
+    )
+    combined_inconsistent = reward(
+        condition_inconsistent, (config(sponsored_asset, "2"),)
+    )
+
+    class PagedRewards:
+        def __init__(self, pages: tuple[tuple[object, ...], ...]) -> None:
+            self.pages = pages
+
+        def iter_items(self):
+            for page in self.pages:
+                yield from page
+
+    rows = {
+        (condition_total, False): PagedRewards(((native_total,),)),
+        (condition_total, True): PagedRewards(
+            ((combined_total,), (combined_total,))
+        ),
+        (condition_migration, False): PagedRewards(((native_migration,),)),
+        (condition_migration, True): PagedRewards(((combined_migration,),)),
+        (condition_multiplicity, False): PagedRewards(((native_multiplicity,),)),
+        (condition_multiplicity, True): PagedRewards(((combined_multiplicity,),)),
+        (condition_invalid, False): PagedRewards(((valid_native,),)),
+        (condition_invalid, True): PagedRewards(((invalid_combined,),)),
+        (condition_failed, False): PagedRewards(((native_failed,),)),
+        (condition_inconsistent, False): PagedRewards(((native_inconsistent,),)),
+        (condition_inconsistent, True): PagedRewards(((combined_inconsistent,),)),
+    }
+
+    class PublicRewardsClient:
+        def list_market_rewards(
+            self, *, condition_id: str, sponsored: bool | None = None
+        ) -> PagedRewards:
+            assert sponsored is not None
+            if condition_id == condition_failed and sponsored:
+                raise TimeoutError("combined reward response must stay private")
+            return rows.get(
+                (condition_id, sponsored),
+                PagedRewards(()),
+            )
+
+        def list_current_rewards(self, **_: object) -> PagedRewards:
+            raise AssertionError("selected reward refresh must not read global rewards")
+
+    condition_ids = (
+        condition_total,
+        condition_migration,
+        condition_multiplicity,
+        condition_invalid,
+        condition_failed,
+        condition_inconsistent,
+    )
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        client=FakeClient(),
+        public_client_factory=PublicRewardsClient,
+    )
+
+    catalog = adapter.lp_reward_catalog(condition_ids=condition_ids)
+    markets = {
+        str(row["condition_id"]): row
+        for row in catalog["markets"]
+        if isinstance(row, dict)
+    }
+
+    assert catalog["state"] == "partial"
+    assert catalog["complete"] is False
+    total = markets[condition_total]
+    assert total["daily_pool_usd"] == Decimal("5")
+    assert total["native_daily_pool_usd"] == Decimal("3")
+    assert total["sponsored_daily_pool_usd"] == Decimal("2")
+    assert len(total["native_reward_configs"]) == 1
+    assert len(total["combined_reward_configs"]) == 1
+    assert total["sponsored_reward_configs"] == []
+    assert total["rewards_max_spread"] == Decimal("0.1")
+    assert total["rewards_min_size"] == Decimal("20")
+
+    migration = markets[condition_migration]
+    assert migration["daily_pool_usd"] == Decimal("20")
+    assert migration["native_daily_pool_usd"] == Decimal("20")
+    assert migration["sponsored_daily_pool_usd"] == Decimal("0")
+    assert migration["combined_reward_configs"][0]["asset_address"] == sponsored_asset
+
+    multiplicity = markets[condition_multiplicity]
+    assert len(multiplicity["native_reward_configs"]) == 2
+    assert multiplicity["native_daily_pool_usd"] == Decimal("2")
+    assert multiplicity["daily_pool_usd"] == Decimal("2")
+
+    for condition_id in (
+        condition_invalid,
+        condition_failed,
+        condition_inconsistent,
+    ):
+        assert markets[condition_id]["state"] == "unknown"
+        assert markets[condition_id]["daily_pool_usd"] is None
+
+
 def test_lp_metadata_warm_start_from_persisted_store(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4132,7 +4644,7 @@ def test_lp_metadata_warm_entry_expires_at_persisted_stamp(
     # While in-memory fresh the served payload age stays within the
     # risk-gate bound: the in-memory expiry is the persisted stamp.
     clock_at["value"] = read_at + timedelta(
-        seconds=polymarket_trading.LP_METADATA_CACHE_TTL_SECONDS - 1
+        seconds=polymarket_trading.LP_METADATA_NEGATIVE_TTL_SECONDS - 1
     )
     still_fresh = adapter.lp_market_metadata((condition_present, condition_absent))
     assert set(still_fresh) == {condition_present}

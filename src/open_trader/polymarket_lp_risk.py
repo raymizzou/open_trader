@@ -7,16 +7,11 @@ from datetime import UTC, datetime, timedelta
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from typing import cast
 
-from .polymarket_trading import (
-    LP_METADATA_CACHE_JITTER_SECONDS,
-    LP_METADATA_CACHE_TTL_SECONDS,
-)
-
 BOOK_FRESHNESS_SECONDS = Decimal("10")
 ACCOUNT_FRESHNESS_SECONDS = Decimal("120")
-_MARKET_METADATA_MAX_AGE_SECONDS = (
-    LP_METADATA_CACHE_TTL_SECONDS + LP_METADATA_CACHE_JITTER_SECONDS
-)
+# Metadata caching may retain a positive market description for hours, while
+# final entry risk must observe the market's dynamic state on a short bound.
+_MARKET_METADATA_MAX_AGE_SECONDS = Decimal("60")
 TERMINAL_ORDER_STATES = frozenset(
     {"FILLED", "MATCHED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "FAILED"}
 )

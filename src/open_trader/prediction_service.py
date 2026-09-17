@@ -932,7 +932,24 @@ def create_prediction_server(
                         raise RuntimeError("LP execution service is unavailable")
                     result = candidate_preview(payload)
                 elif path == lp_candidate_refresh_path:
-                    self._require_schema(payload, set())
+                    if set(payload) - {"manual_recovery"}:
+                        raise ValueError("prediction request fields are invalid")
+                    if "manual_recovery" in payload and type(payload["manual_recovery"]) is not bool:
+                        raise ValueError("manual_recovery must be a boolean")
+                    if payload.get("manual_recovery") is True:
+                        recover = getattr(runtime, "recover_lp_preparation", None)
+                        if not callable(recover):
+                            self._send_json(
+                                HTTPStatus.SERVICE_UNAVAILABLE,
+                                {"error": "LP preparation recovery is unavailable"},
+                            )
+                            return
+                        result = recover()
+                        safe_result = _lp_projection_safe_value(result)
+                        if not isinstance(safe_result, Mapping):
+                            raise RuntimeError("LP preparation recovery result is invalid")
+                        self._send_json(HTTPStatus.OK, safe_result)
+                        return
                     queue_refresh = getattr(
                         runtime, "queue_lp_candidate_refresh", None
                     )

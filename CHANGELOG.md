@@ -5,6 +5,17 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-18
 
+- LP preparation now persists its progress and attempt budget: history failures
+  receive one five-minute retry, repeated failure pauses with one alert, and
+  the existing manual recovery route can resume it. Metadata warmup continues
+  in batches of at most 1,500 ids, while successful metadata keeps its original
+  12-hour cache expiry. Selected reward reads now accept the SDK's id-less
+  combined configs, preserve safe UNKNOWN reasons on source failures, and use
+  the combined expiry; final LP risk rechecks fresh market metadata within 60
+  seconds. Valid partial results remain usable, and a failed history group stops
+  further dispatch. Verified by the focused history, preparation, adapter,
+  dashboard, preview, risk, and paused-runtime checks.
+
 - Corrected paused shadow POST precedence so protected N-Leg routes return
   `409 N_LEG_PAUSED` before the shadow read-only guard while LP mutations
   remain `403 shadow_read_only`. Verified the focused repair and related

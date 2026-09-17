@@ -47,6 +47,8 @@ _LP_PRICE_HISTORY_BATCH_SIZE = 20
 _LP_PRICE_HISTORY_MAX_CONCURRENCY = 4
 _LP_PRICE_HISTORY_WINDOW = timedelta(hours=24)
 _LP_PRICE_HISTORY_OVERLAP = timedelta(minutes=1)
+_LP_METADATA_BATCH_SIZE = 1500
+_LP_PREPARATION_RETRY_SECONDS = 300
 _BEIJING = ZoneInfo("Asia/Shanghai")
 TERMINAL_TRADE_STATES = frozenset({"CONFIRMED", "FAILED"})
 
@@ -216,6 +218,7 @@ class PolymarketLPService:
         self._report_lock = threading.Lock()
         self._candidate_refresh_lock = threading.Lock()
         self._candidate_state_lock = threading.RLock()
+        self._preparation_lock = threading.RLock()
         self._sample_target_lock = threading.Lock()
         self._sample_targets: tuple[tuple[str, str], ...] = ()
         self._sample_target_version = 0
@@ -239,6 +242,8 @@ class PolymarketLPService:
             "selected_market_ids": [],
             "candidate_retention_reason": "background_candidates_retired",
         }
+        self._preparation: dict[str, object] | None = None
+        self._restore_preparation()
         self._restore_candidate_snapshot()
 
     def set_mutation_guard(self, guard: Callable[..., bool] | None) -> None:
@@ -263,20 +268,298 @@ class PolymarketLPService:
             )
         ):
             return
+        # Copy and encode before taking the publication lock.  A large catalog
+        # must never make candidate readers wait for the network-sized copy.
+        prepared = {
+            "catalog": deepcopy(dict(catalog)),
+            "metadata": deepcopy(dict(metadata)),
+            "state": state,
+        }
         with self._candidate_state_lock:
-            self._prepared_inputs = {
-                "catalog": deepcopy(dict(catalog)),
-                "metadata": deepcopy(dict(metadata)),
-                "state": state,
-            }
+            self._prepared_inputs = prepared
 
     def _prepared_input_snapshot(self) -> dict[str, object] | None:
         with self._candidate_state_lock:
-            return (
-                deepcopy(self._prepared_inputs)
-                if isinstance(self._prepared_inputs, Mapping)
-                else None
+            prepared = self._prepared_inputs
+        return deepcopy(prepared) if isinstance(prepared, Mapping) else None
+
+    @staticmethod
+    def _new_preparation_state() -> dict[str, object]:
+        return {
+            "state": "idle",
+            "stage": "history",
+            "generation": 1,
+            "attempt": 0,
+            "failure_count": 0,
+            "paused": False,
+            "alert_attempted": False,
+            "alert_state": None,
+            "last_attempt_at": None,
+            "last_success_at": None,
+            "last_failure_at": None,
+            "last_progress_at": None,
+            "next_retry_at": None,
+            "completed_count": 0,
+            "total_count": 0,
+            "metadata_completed_count": 0,
+            "metadata_total_count": 0,
+            "last_error": None,
+        }
+
+    def _restore_preparation(self) -> None:
+        reader = getattr(self.store, "lp_preparation", None)
+        saved: object = None
+        if callable(reader):
+            try:
+                saved = reader()
+            except Exception:
+                saved = None
+        with self._preparation_lock:
+            if isinstance(saved, Mapping):
+                state = self._new_preparation_state()
+                state.update(deepcopy(dict(saved)))
+                self._preparation = state
+            else:
+                self._preparation = self._new_preparation_state()
+
+    def preparation_snapshot(self) -> dict[str, object]:
+        """Return the small durable preparation projection."""
+
+        reader = getattr(self.store, "lp_preparation", None)
+        saved: object = None
+        if callable(reader):
+            try:
+                saved = reader()
+            except Exception:
+                saved = None
+        with self._preparation_lock:
+            if isinstance(saved, Mapping):
+                state = self._new_preparation_state()
+                state.update(deepcopy(dict(saved)))
+                self._preparation = state
+            return deepcopy(self._preparation or self._new_preparation_state())
+
+    def _save_preparation(
+        self,
+        updates: Mapping[str, object],
+        *,
+        expected_generation: int | None = None,
+    ) -> dict[str, object]:
+        with self._preparation_lock:
+            current = self.preparation_snapshot()
+            merged = {**current, **dict(updates)}
+            if expected_generation is not None and "generation" not in updates:
+                merged["generation"] = expected_generation
+            writer = getattr(self.store, "lp_save_preparation", None)
+            reader = getattr(self.store, "lp_preparation", None)
+            existing = reader() if callable(reader) else None
+            store_expected = (
+                expected_generation if isinstance(existing, Mapping) else None
             )
+            saved = (
+                writer(merged, expected_generation=store_expected)
+                if callable(writer)
+                else merged
+            )
+            if isinstance(saved, Mapping):
+                self._preparation = deepcopy(dict(saved))
+                return deepcopy(dict(saved))
+            latest = self.preparation_snapshot()
+            self._preparation = latest
+            return latest
+
+    def _preparation_result(
+        self,
+        state: Mapping[str, object],
+        *,
+        outcome: str,
+        reason: str | None = None,
+        display_state: str | None = None,
+        alert_pending: bool = False,
+    ) -> dict[str, object]:
+        result: dict[str, object] = {
+            "state": display_state or str(state.get("state") or "unknown"),
+            "preparation_outcome": outcome,
+            "preparation": deepcopy(dict(state)),
+            "target_count": int(state.get("total_count") or 0),
+            "updated_count": 0,
+            "unknown_count": 0,
+            "request_count": 0,
+        }
+        if reason:
+            result["reason"] = reason
+        if alert_pending:
+            result["alert_pending"] = True
+        return result
+
+    @staticmethod
+    def _safe_error_type(value: object) -> str:
+        text = str(value or "unknown_error")
+        return text if text.replace("_", "").isalnum() and text[0:1].isalpha() else "unknown_error"
+
+    @classmethod
+    def _safe_selected_reward_reasons(
+        cls, value: Mapping[str, object]
+    ) -> list[str]:
+        """Keep upstream selected-reward provenance without raw transport text."""
+
+        reasons: list[str] = []
+        raw_codes = value.get("reason_codes")
+        if isinstance(raw_codes, str):
+            raw_codes = (raw_codes,)
+        if isinstance(raw_codes, Sequence) and not isinstance(raw_codes, (str, bytes)):
+            for raw_code in raw_codes:
+                code = cls._safe_error_type(raw_code)
+                if code != "unknown_error" and code not in reasons:
+                    reasons.append(code)
+        error_type = value.get("error_type")
+        if error_type is not None:
+            safe_error = cls._safe_error_type(error_type)
+            if safe_error != "unknown_error":
+                code = f"reward_error_{safe_error}"
+                if code not in reasons:
+                    reasons.append(code)
+        status = value.get("status")
+        if type(status) is int and 100 <= status <= 599:
+            code = f"reward_http_status_{status}"
+            if code not in reasons:
+                reasons.append(code)
+        elif isinstance(status, str):
+            safe_status = cls._safe_error_type(status)
+            if safe_status != "unknown_error":
+                code = f"reward_status_{safe_status}"
+                if code not in reasons:
+                    reasons.append(code)
+        return reasons
+
+    def _begin_preparation(self, now: datetime) -> dict[str, object]:
+        current = self.preparation_snapshot()
+        generation = current.get("generation")
+        generation = generation if type(generation) is int and generation >= 1 else 1
+        attempt = current.get("attempt")
+        attempt = attempt if type(attempt) is int and attempt >= 0 else 0
+        failures = current.get("failure_count")
+        failures = failures if type(failures) is int and failures >= 0 else 0
+        if attempt >= 2:
+            # A process may stop after persisting an attempt and before its
+            # external read returns.  The persisted attempt budget covers the
+            # whole generation, regardless of the state written by that read;
+            # do not turn reconstruction into another unbounded attempt.
+            last_error = self._safe_error_type(current.get("last_error"))
+            if last_error == "unknown_error":
+                last_error = "preparation_attempt_budget_exhausted"
+            state = self._save_preparation(
+                {
+                    "state": "paused",
+                    "paused": True,
+                    "failure_count": max(2, failures),
+                    "last_failure_at": now,
+                    "next_retry_at": None,
+                    "last_error": last_error,
+                },
+                expected_generation=generation,
+            )
+            if state.get("alert_attempted") is not True:
+                claimer = getattr(self.store, "lp_claim_preparation_alert", None)
+                claimed = (
+                    claimer(expected_generation=generation)
+                    if callable(claimer)
+                    else state
+                )
+                if isinstance(claimed, Mapping):
+                    with self._preparation_lock:
+                        self._preparation = deepcopy(dict(claimed))
+                    state = deepcopy(dict(claimed))
+            return state
+        return self._save_preparation(
+            {
+                "state": "preparing",
+                "stage": "catalog",
+                "attempt": attempt + 1,
+                "last_attempt_at": now,
+                "next_retry_at": None,
+                "last_error": None,
+                "alert_attempted": False,
+                "alert_state": None,
+            },
+            expected_generation=generation,
+        )
+
+    def _preparation_failure(
+        self,
+        now: datetime,
+        *,
+        stage: str,
+        error_type: object,
+    ) -> dict[str, object]:
+        current = self.preparation_snapshot()
+        generation = current.get("generation")
+        generation = generation if type(generation) is int and generation >= 1 else 1
+        failures = current.get("failure_count")
+        failures = failures if type(failures) is int and failures >= 0 else 0
+        failures += 1
+        paused = failures >= 2
+        retry_at = None if paused else now + timedelta(seconds=_LP_PREPARATION_RETRY_SECONDS)
+        state = self._save_preparation(
+            {
+                "state": "paused" if paused else "waiting_retry",
+                "stage": stage,
+                "failure_count": failures,
+                "paused": paused,
+                "last_failure_at": now,
+                "last_error": self._safe_error_type(error_type),
+                "next_retry_at": retry_at,
+                "alert_attempted": False if not paused else current.get("alert_attempted") is True,
+                "alert_state": None if not paused else current.get("alert_state"),
+            },
+            expected_generation=generation,
+        )
+        if paused and state.get("alert_attempted") is not True:
+            claimer = getattr(self.store, "lp_claim_preparation_alert", None)
+            claimed = claimer(expected_generation=generation) if callable(claimer) else state
+            if isinstance(claimed, Mapping):
+                with self._preparation_lock:
+                    self._preparation = deepcopy(dict(claimed))
+                state = deepcopy(dict(claimed))
+        return state
+
+    def recover_preparation(self) -> dict[str, object]:
+        """Explicitly re-arm a paused preparation cycle."""
+
+        current = self.preparation_snapshot()
+        if current.get("paused") is not True:
+            return current
+        generation = current.get("generation")
+        generation = generation if type(generation) is int and generation >= 1 else 1
+        state = self._save_preparation(
+            {
+                "state": "ready",
+                "stage": "catalog",
+                "generation": generation + 1,
+                "attempt": 0,
+                "failure_count": 0,
+                "paused": False,
+                "alert_attempted": False,
+                "alert_state": None,
+                "last_error": None,
+                "next_retry_at": None,
+            },
+            expected_generation=generation,
+        )
+        return state
+
+    def finish_preparation_alert(self, *, generation: int, success: bool) -> dict[str, object] | None:
+        """Record the result of the already-claimed operator notification."""
+
+        writer = getattr(self.store, "lp_finish_preparation_alert", None)
+        if not callable(writer):
+            return None
+        saved = writer(generation=generation, success=success)
+        if isinstance(saved, Mapping):
+            with self._preparation_lock:
+                self._preparation = deepcopy(dict(saved))
+            return dict(saved)
+        return None
 
     def candidate_snapshot(self) -> dict[str, object]:
         """Return the latest cached candidate projection without external reads."""
@@ -451,6 +734,10 @@ class PolymarketLPService:
                 projected_reasons["risk"] = projected_risk_reasons
                 projected_funnel["reasons"] = projected_reasons
             snapshot["funnel"] = projected_funnel
+        # Keep preparation lifecycle state adjacent to the cached candidate
+        # projection.  It is a small durable row, so readers can show a
+        # pending/retry/paused reason without re-running the external funnel.
+        snapshot["preparation"] = self.preparation_snapshot()
         return snapshot
 
     def _publish_sample_targets(
@@ -575,7 +862,10 @@ class PolymarketLPService:
         }
 
     def refresh_price_history(
-        self, *, stop_event: threading.Event | None = None
+        self,
+        *,
+        stop_event: threading.Event | None = None,
+        manual_recovery: bool = False,
     ) -> dict[str, object]:
         """Refresh bounded 24-hour price summaries for the light-screen range.
 
@@ -586,33 +876,111 @@ class PolymarketLPService:
         is allowed to retain its response.
         """
 
+        if type(manual_recovery) is not bool:
+            raise ValueError("manual_recovery must be a boolean")
         if not self._price_history_refresh_lock.acquire(blocking=False):
-            return {"state": "busy", "target_count": 0, "updated_count": 0}
+            return self._preparation_result(
+                self.preparation_snapshot(), outcome="busy", display_state="busy"
+            )
         try:
             now = self._now().astimezone(UTC)
-            window_start = now - _LP_PRICE_HISTORY_WINDOW
-            end_ts = int(now.timestamp())
+            preparation = self.preparation_snapshot()
+            if manual_recovery:
+                if preparation.get("paused") is not True:
+                    return self._preparation_result(
+                        preparation, outcome="ignored", display_state="unknown"
+                    )
+                preparation = self.recover_preparation()
+            elif preparation.get("paused") is True:
+                return self._preparation_result(
+                    preparation,
+                    outcome="paused",
+                    reason="preparation_paused",
+                    display_state="unknown",
+                )
+            elif preparation.get("state") == "waiting_retry":
+                try:
+                    retry_at = _timestamp(
+                        preparation.get("next_retry_at"), name="next_retry_at"
+                    )
+                except ValueError:
+                    retry_at = now
+                if now < retry_at:
+                    return self._preparation_result(
+                        preparation,
+                        outcome="waiting_retry",
+                        reason="retry_not_due",
+                        display_state="unknown",
+                    )
+            preparation = self._begin_preparation(now)
+            if preparation.get("state") == "paused":
+                return self._preparation_result(
+                preparation,
+                outcome="paused",
+                reason="preparation_attempt_budget_exhausted",
+                display_state="unknown",
+                alert_pending=preparation.get("alert_claimed_now") is True,
+            )
+            generation = preparation.get("generation")
+            generation = generation if type(generation) is int and generation >= 1 else 1
+            window_end = now.replace(second=0, microsecond=0)
+            window_start = window_end - _LP_PRICE_HISTORY_WINDOW
+            end_ts = int(window_end.timestamp())
             catalog_reader = getattr(self.exchange, "lp_reward_catalog", None)
             metadata_reader = getattr(self.exchange, "lp_market_metadata", None)
             history_reader = getattr(self.exchange, "lp_price_history", None)
             if not callable(catalog_reader):
-                return {
-                    "state": "unknown",
-                    "target_count": 0,
-                    "updated_count": 0,
-                    "unknown_count": 0,
-                    "request_count": 0,
-                    "reason": "history_readers_unavailable",
-                }
+                failed = self._preparation_failure(
+                    self._now(), stage="catalog", error_type="history_readers_unavailable"
+                )
+                return self._preparation_result(
+                    failed,
+                    outcome="failure",
+                    reason="history_readers_unavailable",
+                    display_state="unknown",
+                    alert_pending=failed.get("alert_claimed_now") is True,
+                )
             if stop_event is not None and stop_event.is_set():
-                return {"state": "cancelled", "target_count": 0, "updated_count": 0}
+                return self._preparation_result(
+                    preparation, outcome="cancelled", display_state="cancelled"
+                )
 
+            catalog_failure: tuple[str, str] | None = None
+            catalog_failure_error: str | None = None
             try:
                 catalog = catalog_reader(stop_event=stop_event)
-                raw_markets = catalog.get("markets") if isinstance(catalog, Mapping) else None
+                if stop_event is not None and stop_event.is_set():
+                    return self._preparation_result(
+                        preparation, outcome="cancelled", display_state="cancelled"
+                    )
+                if not isinstance(catalog, Mapping):
+                    catalog_failure_error = "history_catalog_unknown"
+                    raise ValueError("history_catalog_unknown")
+                safe_catalog_error = self._safe_error_type(catalog.get("error_type"))
+                if safe_catalog_error == "unknown_error":
+                    safe_catalog_error = "history_catalog_unknown"
+                raw_markets = catalog.get("markets")
                 if not isinstance(raw_markets, (list, tuple)):
+                    catalog_failure_error = safe_catalog_error
+                    raise ValueError("history_catalog_unknown")
+                if catalog.get("state") != "known":
+                    catalog_failure_error = safe_catalog_error
                     raise ValueError("history_catalog_unknown")
                 market_rows = [row for row in raw_markets if isinstance(row, Mapping)]
+                if catalog.get("complete") is not True:
+                    if not market_rows:
+                        catalog_failure_error = (
+                            safe_catalog_error
+                            if safe_catalog_error != "history_catalog_unknown"
+                            else "history_catalog_unknown"
+                        )
+                        raise ValueError("history_catalog_unknown")
+                    catalog_failure = (
+                        "catalog",
+                        safe_catalog_error
+                        if safe_catalog_error != "history_catalog_unknown"
+                        else "history_catalog_incomplete",
+                    )
                 condition_ids = tuple(
                     dict.fromkeys(
                         str(row.get("condition_id") or "").strip()
@@ -620,43 +988,192 @@ class PolymarketLPService:
                         if str(row.get("condition_id") or "").strip()
                     )
                 )
-                if not callable(metadata_reader):
-                    return {
-                        "state": "unknown",
-                        "target_count": 0,
-                        "updated_count": 0,
-                        "unknown_count": 0,
-                        "request_count": 0,
-                        "reason": "history_readers_unavailable",
-                    }
-                metadata_value = metadata_reader(condition_ids, stop_event=stop_event)
+                if catalog_failure is not None and not condition_ids:
+                    catalog_failure_error = "history_catalog_unknown"
+                    raise ValueError("history_catalog_unknown")
             except Exception as exc:
-                return {
-                    "state": "unknown",
-                    "target_count": 0,
-                    "updated_count": 0,
-                    "unknown_count": 0,
-                    "request_count": 0,
-                    "reason": type(exc).__name__,
-                }
+                error_type = catalog_failure_error or type(exc).__name__
+                failed = self._preparation_failure(
+                    self._now(), stage="catalog", error_type=error_type
+                )
+                return self._preparation_result(
+                    failed,
+                    outcome="failure",
+                    reason=self._safe_error_type(error_type),
+                    display_state="unknown",
+                    alert_pending=failed.get("alert_claimed_now") is True,
+                )
+            metadata_batch_reader = getattr(
+                self.exchange, "lp_market_metadata_batch", None
+            )
+            if not callable(metadata_reader) and not callable(metadata_batch_reader):
+                failed = self._preparation_failure(
+                    self._now(), stage="metadata", error_type="history_readers_unavailable"
+                )
+                return self._preparation_result(
+                    failed,
+                    outcome="failure",
+                    reason="history_readers_unavailable",
+                    display_state="unknown",
+                    alert_pending=failed.get("alert_claimed_now") is True,
+                )
+            metadata_value: Mapping[str, object] | None = None
+            if callable(metadata_batch_reader):
+                metadata_by_condition: dict[str, object] = {}
+                metadata_failure: str | None = None
+                self._save_preparation(
+                    {
+                        "stage": "metadata",
+                        "metadata_completed_count": 0,
+                        "metadata_total_count": len(condition_ids),
+                    },
+                    expected_generation=generation,
+                )
+
+                def batch_failure_code(value: object) -> str:
+                    if isinstance(value, Mapping):
+                        for field in ("error", "reason", "code", "type", "status"):
+                            if field in value:
+                                return self._safe_error_type(value.get(field))
+                        return "metadata_batch_failed"
+                    return self._safe_error_type(value)
+
+                for offset in range(0, len(condition_ids), _LP_METADATA_BATCH_SIZE):
+                    if stop_event is not None and stop_event.is_set():
+                        return self._preparation_result(
+                            self.preparation_snapshot(),
+                            outcome="cancelled",
+                            display_state="cancelled",
+                        )
+                    metadata_batch_ids = condition_ids[
+                        offset : offset + _LP_METADATA_BATCH_SIZE
+                    ]
+                    try:
+                        batch_value = metadata_batch_reader(
+                            metadata_batch_ids, stop_event=stop_event
+                        )
+                    except Exception as exc:
+                        metadata_failure = type(exc).__name__
+                        break
+                    if stop_event is not None and stop_event.is_set():
+                        return self._preparation_result(
+                            self.preparation_snapshot(),
+                            outcome="cancelled",
+                            display_state="cancelled",
+                        )
+                    if not isinstance(batch_value, Mapping):
+                        metadata_failure = "metadata_batch_unknown"
+                        break
+                    if str(batch_value.get("state") or "").lower() in {
+                        "cancelled",
+                        "canceled",
+                    }:
+                        return self._preparation_result(
+                            self.preparation_snapshot(),
+                            outcome="cancelled",
+                            display_state="cancelled",
+                        )
+                    raw_markets = batch_value.get("markets")
+                    if not isinstance(raw_markets, Mapping):
+                        metadata_failure = "metadata_batch_unknown"
+                        break
+                    requested = set(metadata_batch_ids)
+                    returned_markets = {
+                        str(key): value
+                        for key, value in raw_markets.items()
+                        if str(key) in requested and isinstance(value, Mapping)
+                    }
+                    raw_absent = batch_value.get("confirmed_absent_ids")
+                    confirmed_absent = {
+                        str(value)
+                        for value in raw_absent
+                        if isinstance(value, str) and value in requested
+                    } if isinstance(raw_absent, Sequence) and not isinstance(raw_absent, (str, bytes)) else set()
+                    raw_failed = batch_value.get("failed_ids")
+                    if isinstance(raw_failed, Mapping):
+                        failed_ids = {
+                            str(key): value
+                            for key, value in raw_failed.items()
+                            if str(key) in requested
+                        }
+                    elif isinstance(raw_failed, Sequence) and not isinstance(raw_failed, (str, bytes)):
+                        failed_ids = {str(value): "metadata_batch_failed" for value in raw_failed if str(value) in requested}
+                    else:
+                        failed_ids = {}
+                    if failed_ids:
+                        metadata_failure = batch_failure_code(next(iter(failed_ids.values())))
+                        break
+                    raw_deferred = batch_value.get("deferred_ids")
+                    deferred_ids = {
+                        str(value)
+                        for value in raw_deferred
+                        if isinstance(value, str) and value in requested
+                    } if isinstance(raw_deferred, Sequence) and not isinstance(raw_deferred, (str, bytes)) else set()
+                    if deferred_ids:
+                        metadata_failure = "metadata_deferred"
+                        break
+                    resolved = set(returned_markets) | confirmed_absent
+                    if resolved != requested:
+                        metadata_failure = "metadata_batch_incomplete"
+                        break
+                    metadata_by_condition.update(returned_markets)
+                    self._save_preparation(
+                        {
+                            "stage": "metadata",
+                            "metadata_completed_count": offset + len(metadata_batch_ids),
+                            "metadata_total_count": len(condition_ids),
+                            "last_progress_at": self._now(),
+                        },
+                        expected_generation=generation,
+                    )
+                if metadata_failure is not None:
+                    failed = self._preparation_failure(
+                        self._now(), stage="metadata", error_type=metadata_failure
+                    )
+                    return self._preparation_result(
+                        failed,
+                        outcome="failure",
+                        reason=self._safe_error_type(metadata_failure),
+                        display_state="unknown",
+                        alert_pending=failed.get("alert_claimed_now") is True,
+                    )
+                metadata_value = metadata_by_condition
+            else:
+                try:
+                    metadata_value = metadata_reader(condition_ids, stop_event=stop_event)  # type: ignore[misc]
+                except Exception as exc:
+                    failed = self._preparation_failure(
+                        self._now(), stage="metadata", error_type=type(exc).__name__
+                    )
+                    return self._preparation_result(
+                        failed,
+                        outcome="failure",
+                        reason=self._safe_error_type(type(exc).__name__),
+                        display_state="unknown",
+                        alert_pending=failed.get("alert_claimed_now") is True,
+                    )
             if not isinstance(metadata_value, Mapping):
-                return {
-                    "state": "unknown",
-                    "target_count": 0,
-                    "updated_count": 0,
-                    "unknown_count": 0,
-                    "request_count": 0,
-                    "reason": "history_metadata_unknown",
-                }
+                failed = self._preparation_failure(
+                    self._now(), stage="metadata", error_type="history_metadata_unknown"
+                )
+                return self._preparation_result(
+                    failed,
+                    outcome="failure",
+                    reason="history_metadata_unknown",
+                    display_state="unknown",
+                    alert_pending=failed.get("alert_claimed_now") is True,
+                )
             if not callable(history_reader):
-                return {
-                    "state": "unknown",
-                    "target_count": 0,
-                    "updated_count": 0,
-                    "unknown_count": 0,
-                    "request_count": 0,
-                    "reason": "history_readers_unavailable",
-                }
+                failed = self._preparation_failure(
+                    self._now(), stage="history", error_type="history_readers_unavailable"
+                )
+                return self._preparation_result(
+                    failed,
+                    outcome="failure",
+                    reason="history_readers_unavailable",
+                    display_state="unknown",
+                    alert_pending=failed.get("alert_claimed_now") is True,
+                )
 
             targets: list[tuple[str, str]] = []
             for reward_market in market_rows:
@@ -680,24 +1197,82 @@ class PolymarketLPService:
                         targets.append((condition_id, token_id))
             targets = list(dict.fromkeys(targets))
             if not targets:
+                prepared_state = (
+                    "known"
+                    if catalog.get("state") == "known"
+                    and catalog.get("complete") is True
+                    else "partial"
+                )
                 self._publish_prepared_inputs(
                     catalog,
                     metadata_value,
-                    state=(
-                        "known"
-                        if catalog.get("state") == "known"
-                        and catalog.get("complete") is True
-                        else "partial"
-                    ),
+                    state=prepared_state,
                 )
-                return {
-                    "state": "unknown",
-                    "target_count": 0,
-                    "updated_count": 0,
-                    "unknown_count": 0,
-                    "request_count": 0,
-                    "checked_at": now,
-                }
+                if catalog_failure is not None:
+                    failed = self._preparation_failure(
+                        self._now(),
+                        stage=catalog_failure[0],
+                        error_type=catalog_failure[1],
+                    )
+                    result = self._preparation_result(
+                        failed,
+                        outcome="failure",
+                        reason=catalog_failure[1],
+                        display_state=prepared_state,
+                        alert_pending=failed.get("alert_claimed_now") is True,
+                    )
+                    result.update(
+                        {
+                            "checked_at": now,
+                            "target_count": 0,
+                            "updated_count": 0,
+                            "unknown_count": 0,
+                            "request_count": 0,
+                        }
+                    )
+                    return result
+                completed = self._save_preparation(
+                    {
+                        "state": "ready",
+                        "stage": "complete",
+                        "failure_count": 0,
+                        "paused": False,
+                        "attempt": 0,
+                        "last_success_at": now,
+                        "last_progress_at": now,
+                        "completed_count": 0,
+                        "total_count": 0,
+                        "next_retry_at": None,
+                        "last_error": None,
+                    },
+                    expected_generation=generation,
+                )
+                result = self._preparation_result(
+                    completed, outcome="success", display_state=prepared_state
+                )
+                result.update(
+                    {
+                        "checked_at": now,
+                        "target_count": 0,
+                        "updated_count": 0,
+                        "unknown_count": 0,
+                        "request_count": 0,
+                    }
+                )
+                return result
+
+            self._publish_prepared_inputs(
+                catalog, metadata_value, state="preparing"
+            )
+            self._save_preparation(
+                {
+                    "stage": "history",
+                    "completed_count": 0,
+                    "total_count": len(targets),
+                    "last_progress_at": now,
+                },
+                expected_generation=generation,
+            )
 
             summary_reader = getattr(self.store, "lp_price_history_summaries", None)
             sample_reader = getattr(self.store, "lp_price_history_samples_batch", None)
@@ -809,6 +1384,15 @@ class PolymarketLPService:
             unknown_count = 0
             request_count = 0
             errors: dict[str, str] = {}
+            operational_failure: tuple[str, str] | None = None
+            benign_history_errors = {
+                "cancelled",
+                "history_insufficient",
+                "history_missing",
+                "history_values_unknown",
+                "history_window_incomplete",
+            }
+            completed_count = 0
             for group_offset in range(0, len(identity_batches), _LP_PRICE_HISTORY_MAX_CONCURRENCY):
                 if stop_event is not None and stop_event.is_set():
                     break
@@ -859,10 +1443,27 @@ class PolymarketLPService:
                             returned_identities, payload, error = future.result()
                         except Exception as exc:
                             returned_identities, payload, error = identities, None, type(exc).__name__
+                        if error is not None and error != "cancelled":
+                            operational_failure = (
+                                "history", self._safe_error_type(error)
+                            )
                         summaries, cached_samples = cache_by_batch[identities]
                         history_map = payload.get("history") if isinstance(payload, Mapping) else None
                         if not isinstance(history_map, Mapping):
                             history_map = {}
+                        payload_errors = payload.get("errors") if isinstance(payload, Mapping) else None
+                        if not isinstance(payload_errors, Mapping):
+                            payload_errors = {}
+                        for payload_error in payload_errors.values():
+                            if (
+                                isinstance(payload_error, str)
+                                and payload_error not in benign_history_errors
+                            ):
+                                operational_failure = (
+                                    "history",
+                                    self._safe_error_type(payload_error),
+                                )
+                                break
                         rows_to_write: list[dict[str, object]] = []
                         for condition_id, token_id in returned_identities:
                             identity = (condition_id, token_id)
@@ -872,7 +1473,13 @@ class PolymarketLPService:
                             if error is None and isinstance(raw_rows, (list, tuple)):
                                 new_points, parse_error = parse_samples(raw_rows)
                             else:
-                                new_points, parse_error = {}, error or "history_missing"
+                                upstream_error = payload_errors.get(token_id)
+                                parse_error = (
+                                    upstream_error
+                                    if isinstance(upstream_error, str) and upstream_error
+                                    else error or "history_missing"
+                                )
+                                new_points = {}
                             merged, merge_error = parse_samples(previous_rows)
                             reason = parse_error or merge_error
                             if reason is None:
@@ -896,7 +1503,7 @@ class PolymarketLPService:
                                     "amplitude": max(prices) - min(prices),
                                     "checked_at": now,
                                     "window_start": window_start,
-                                    "window_end": now,
+                                    "window_end": window_end,
                                     "sample_count": len(bounded),
                                     "valid_until": now + timedelta(hours=2),
                                     "last_attempt_at": now,
@@ -928,19 +1535,83 @@ class PolymarketLPService:
                                 }
                             )
                         write_rows(rows_to_write)
+                        completed_count += len(returned_identities)
+                        self._save_preparation(
+                            {
+                                "stage": "history",
+                                "completed_count": completed_count,
+                                "total_count": len(targets),
+                                "last_progress_at": self._now(),
+                            },
+                            expected_generation=generation,
+                        )
                         del rows_to_write, payload, history_map, future
+                if operational_failure is not None:
+                    break
                 del cache_by_batch, request_group
+            if stop_event is not None and stop_event.is_set():
+                return self._preparation_result(
+                    self.preparation_snapshot(),
+                    outcome="cancelled",
+                    display_state="cancelled",
+                )
             state = "known" if updated_count and not unknown_count else "partial" if updated_count else "unknown"
             self._publish_prepared_inputs(catalog, metadata_value, state=state)
-            return {
-                "state": state,
-                "target_count": len(targets),
-                "updated_count": updated_count,
-                "unknown_count": unknown_count,
-                "request_count": request_count,
-                "checked_at": now,
-                "errors": errors,
-            }
+            if operational_failure is None:
+                operational_failure = catalog_failure
+            if operational_failure is not None:
+                stage, error_type = operational_failure
+                failed = self._preparation_failure(
+                    self._now(), stage=stage, error_type=error_type
+                )
+                result = self._preparation_result(
+                    failed,
+                    outcome="failure",
+                    reason=error_type,
+                    display_state=state,
+                    alert_pending=failed.get("alert_claimed_now") is True,
+                )
+                result.update(
+                    {
+                        "target_count": len(targets),
+                        "updated_count": updated_count,
+                        "unknown_count": unknown_count,
+                        "request_count": request_count,
+                        "checked_at": now,
+                        "errors": errors,
+                    }
+                )
+                return result
+            completed = self._save_preparation(
+                {
+                    "state": "ready",
+                    "stage": "complete",
+                    "failure_count": 0,
+                    "paused": False,
+                    "attempt": 0,
+                    "last_success_at": now,
+                    "last_progress_at": now,
+                    "completed_count": len(targets),
+                    "total_count": len(targets),
+                    "next_retry_at": None,
+                    "last_error": None,
+                },
+                expected_generation=generation,
+            )
+            result = self._preparation_result(
+                completed, outcome="success", display_state=state
+            )
+            result.update(
+                {
+                    "target_count": len(targets),
+                    "updated_count": updated_count,
+                    "unknown_count": unknown_count,
+                    "request_count": request_count,
+                    "checked_at": now,
+                    "errors": errors,
+                }
+            )
+            return result
         finally:
             self._price_history_refresh_lock.release()
 
@@ -1311,11 +1982,17 @@ class PolymarketLPService:
             selected_metadata_by_condition: Mapping[str, object] = {}
             selected_reward_by_condition: dict[str, Mapping[str, object]] = {}
             selected_reward_error_conditions: set[str] = set()
+            selected_reward_error_reasons: dict[str, list[str]] = {}
             selected_reward_checked_at: object | None = None
             selected_metadata_error = False
             if selected_condition_ids:
+                selected_metadata_reader = getattr(
+                    self.exchange, "lp_market_metadata_fresh", None
+                )
+                if not callable(selected_metadata_reader):
+                    selected_metadata_reader = metadata_reader
                 try:
-                    selected_metadata_value = metadata_reader(
+                    selected_metadata_value = selected_metadata_reader(
                         selected_condition_ids,
                         stop_event=stop_event,
                     )
@@ -1354,6 +2031,10 @@ class PolymarketLPService:
                                 or selected_reward.get("complete") is False
                             ):
                                 selected_reward_error_conditions.add(condition_id)
+                                if isinstance(selected_reward, Mapping):
+                                    selected_reward_error_reasons[condition_id] = (
+                                        self._safe_selected_reward_reasons(selected_reward)
+                                    )
                     else:
                         selected_reward_error_conditions.update(selected_condition_ids)
                 else:
@@ -1454,6 +2135,9 @@ class PolymarketLPService:
                 elif selected_token_id != original_token_id:
                     direction["selected_metadata_unknown"] = True
                     direction["selected_metadata_reason"] = "market_identity_changed"
+                elif selected_market.get("accepting_orders") is not True:
+                    direction["selected_metadata_unknown"] = True
+                    direction["selected_metadata_reason"] = "market_not_accepting_orders"
                 else:
                     selected_market_value = {
                         **dict(selected_market),
@@ -1474,6 +2158,9 @@ class PolymarketLPService:
                 selected_reward = selected_reward_by_condition.get(condition_id)
                 if condition_id in selected_reward_error_conditions:
                     direction["selected_reward_unknown"] = True
+                    direction["selected_reward_reason_codes"] = list(
+                        selected_reward_error_reasons.get(condition_id, ())
+                    )
                 else:
                     assert selected_reward is not None
                     reward_minimum, reward_spread = _lp_reward_terms(
@@ -1560,9 +2247,14 @@ class PolymarketLPService:
                         "guidance": None,
                     }
                 elif direction.get("selected_reward_unknown"):
+                    reward_reasons = list(
+                        direction.get("selected_reward_reason_codes", ())
+                    )
+                    if "reward_data_unknown" not in reward_reasons:
+                        reward_reasons.append("reward_data_unknown")
                     result = {
                         "state": "unknown",
-                        "reason_codes": ["reward_data_unknown"],
+                        "reason_codes": reward_reasons,
                         "guidance": None,
                     }
                 elif not isinstance(book, Mapping):
@@ -2039,7 +2731,12 @@ class PolymarketLPService:
         )
 
         end_dates: list[date] = []
-        for field in ("native_reward_configs", "sponsored_reward_configs"):
+        config_fields = (
+            ("combined_reward_configs",)
+            if "combined_reward_configs" in reward_market
+            else ("native_reward_configs", "sponsored_reward_configs")
+        )
+        for field in config_fields:
             configs = reward_market.get(field)
             if not isinstance(configs, Sequence) or isinstance(configs, (str, bytes)):
                 continue

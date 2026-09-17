@@ -253,6 +253,7 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
         "lp_price_history_cache",
         "lp_screening_snapshot",
         "lp_market_observations",
+        "lp_preparation",
     }
     assert "signals_market_started_at" in indexes
     assert "signals_started_at" in indexes

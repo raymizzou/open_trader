@@ -1480,10 +1480,10 @@ def test_lp_dashboard_refresh_cannot_block_risk_monitor(
                 if self.probe.catalog_state == "unknown":
                     assert self.probe.release_catalog.wait(timeout=5)
                     return {
-                        "state": "unknown",
-                        "complete": False,
+                        "state": "known",
+                        "complete": True,
                         "checked_at": datetime.now(UTC),
-                        "daily_pool_usd": None,
+                        "daily_pool_usd": Decimal("0"),
                         "markets": (),
                     }
                 return {
@@ -1497,6 +1497,24 @@ def test_lp_dashboard_refresh_cannot_block_risk_monitor(
                 with self.probe._lock:
                     self.probe.catalog_active -= 1
                 self.probe.catalog_finished.set()
+
+        def lp_market_metadata(
+            self, _condition_ids: tuple[str, ...], *, stop_event: object = None
+        ) -> dict[str, object]:
+            del stop_event
+            return {}
+
+        def lp_price_history(
+            self,
+            _token_ids: tuple[str, ...],
+            *,
+            start_ts: int,
+            end_ts: int,
+            fidelity: int,
+            stop_event: object = None,
+        ) -> dict[str, object]:
+            del start_ts, end_ts, fidelity, stop_event
+            return {"state": "known", "history": {}}
 
         def lp_reward_snapshot(
             self,
@@ -4643,10 +4661,758 @@ def test_lp_runtime_stops_obsolete_sampling_and_keeps_exposure_risk(
         ) == []
         runtime.stop()
         assert runtime.state == "STOPPED"
+
     finally:
         release_history.set()
         if runtime.state not in {"NEW", "STOPPED"}:
             runtime.stop()
+
+
+@pytest.mark.parametrize(
+    ("retry_succeeds", "catalog_unknown"),
+    [(False, False), (True, False), (False, True)],
+)
+def test_lp_preparation_retries_after_five_minutes_and_alerts_on_repeat_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    retry_succeeds: bool,
+    catalog_unknown: bool,
+) -> None:
+    """A preparation transport failure has one durable, operator-visible retry."""
+
+    import open_trader.prediction_runtime as runtime_module
+
+    clock = [datetime(2026, 9, 18, 12, 0, tzinfo=UTC)]
+    catalog_calls: list[datetime] = []
+    notifications: list[tuple[str, str]] = []
+    first_call = threading.Event()
+    at_299 = threading.Event()
+    release_299 = threading.Event()
+    paused_wait = threading.Event()
+    release_paused = threading.Event()
+    success_call = threading.Event()
+    hourly_wait_after_success = threading.Event()
+    history_wait_calls: list[float] = []
+    paused_wait_count = [0]
+
+    class FakeTrading:
+        fail_catalog = True
+
+        def attach_metadata_cache(self, _store: object) -> None:
+            pass
+
+        def lp_reward_catalog(
+            self, *, stop_event: threading.Event | None = None
+        ) -> dict[str, object]:
+            del stop_event
+            catalog_calls.append(clock[0])
+            first_call.set()
+            if self.fail_catalog:
+                clock[0] += timedelta(seconds=75)
+                if catalog_unknown:
+                    return {
+                        "state": "unknown",
+                        "complete": False,
+                        "checked_at": clock[0],
+                        "markets": (),
+                        "error_type": "TimeoutError",
+                    }
+                raise TimeoutError("upstream response body unavailable")
+            success_call.set()
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": clock[0],
+                "markets": (),
+            }
+
+        def lp_market_metadata(
+            self, _condition_ids: tuple[str, ...], *, stop_event: object = None
+        ) -> dict[str, object]:
+            del stop_event
+            return {}
+
+        def lp_price_history(
+            self,
+            _token_ids: tuple[str, ...],
+            *,
+            start_ts: int,
+            end_ts: int,
+            fidelity: int,
+            stop_event: object = None,
+        ) -> dict[str, object]:
+            del start_ts, end_ts, fidelity, stop_event
+            return {"state": "known", "history": {}}
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": clock[0],
+                "open_orders": [],
+                "positions": [],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def lp_order_books(
+            self, _token_ids: tuple[str, ...], *, stop_event: object = None
+        ) -> dict[str, object]:
+            del stop_event
+            return {}
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "wallet_address": "0x1111111111111111111111111111111111111111",
+                "p_usd_balance": Decimal("100"),
+                "p_usd_allowance": Decimal("100"),
+                "open_order_ids": [],
+                "positions": [],
+                "checked_at": clock[0],
+            }
+
+        def readiness_snapshot(self) -> dict[str, object]:
+            return {
+                "relayer_ready": True,
+                "merge_ready": True,
+                "checked_at": clock[0],
+            }
+
+        def close(self) -> None:
+            pass
+
+    class FakeMonitor:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def set_ready_observer(self, _observer: object) -> None:
+            pass
+
+        def set_observation_observer(self, _observer: object) -> None:
+            pass
+
+        def set_auto_eat_observer(self, _observer: object) -> None:
+            pass
+
+        def set_failure_observer(self, _observer: object) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+    class Feishu:
+        channel = "feishu"
+
+        def notify(self, title: str, message: str) -> None:
+            notifications.append((title, message))
+
+    class TestExecution(PredictionExecutionService):
+        def reconcile_startup(self) -> dict[str, object]:
+            return {"state": "ready"}
+
+    trading = FakeTrading()
+    notifier = Feishu()
+    monkeypatch.setattr(runtime_module, "load_trading_config", lambda _path: SimpleNamespace(
+        signer_address="0x1111111111111111111111111111111111111111",
+        wallet_address="0x2222222222222222222222222222222222222222",
+        predict=None,
+    ))
+    monkeypatch.setattr(
+        runtime_module,
+        "PolymarketTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: trading),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "PredictTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: None),
+    )
+    monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor)
+    monkeypatch.setattr(runtime_module, "PredictionExecutionService", TestExecution)
+    monkeypatch.setattr(runtime_module, "_LP_TICK_SECONDS", 3600)
+    monkeypatch.setattr(runtime_module, "_LP_REWARD_SECONDS", 3600)
+    monkeypatch.setattr(runtime_module, "_LP_SHARE_WATCH_SECONDS", 3600)
+    monkeypatch.setattr(runtime_module, "_LP_REWARD_STOP_GRACE_SECONDS", 0.1)
+
+    def history_wait(stop_event: threading.Event, seconds: float) -> bool:
+        history_wait_calls.append(seconds)
+        if seconds == 300:
+            clock[0] += timedelta(seconds=299)
+            at_299.set()
+            while not release_299.wait(timeout=0.01):
+                if stop_event.is_set():
+                    return True
+            return stop_event.is_set()
+        if seconds == 1:
+            clock[0] += timedelta(seconds=1)
+            return stop_event.is_set()
+        if seconds >= 3600:
+            paused_wait_count[0] += 1
+            paused_wait.set()
+            if success_call.is_set():
+                hourly_wait_after_success.set()
+            while not release_paused.wait(timeout=0.01):
+                if stop_event.is_set():
+                    return True
+            release_paused.clear()
+            return stop_event.is_set()
+        raise AssertionError(f"unexpected history wait: {seconds}")
+
+    def make_runtime() -> PredictionRuntime:
+        data_dir = tmp_path / ("retry-success" if retry_succeeds else "retry-failure")
+        return PredictionRuntime(
+            data_dir=data_dir,
+            prediction_config_path=data_dir / "prediction.json",
+            dashboard_url="http://127.0.0.1:8766/",
+            notifier=SimpleNamespace(_notifiers=(notifier,)),
+            cross_venue_monitor=_UnavailableCrossVenueMonitor("test-disabled"),
+            enable_n_leg_background=False,
+            n_leg_paused=True,
+            history_clock=lambda: clock[0],
+            history_wait=history_wait,
+        )
+
+    runtime = make_runtime()
+    runtime.start()
+    try:
+        assert first_call.wait(timeout=2)
+        assert len(catalog_calls) == 1
+        assert at_299.wait(timeout=2)
+        assert len(catalog_calls) == 1
+        preparation = runtime.lp.preparation_snapshot()  # type: ignore[union-attr]
+        assert preparation["state"] == "waiting_retry"
+        assert preparation["last_failure_at"] == "2026-09-18T12:01:15.000000Z"
+        assert preparation["next_retry_at"] == "2026-09-18T12:06:15.000000Z"
+        if catalog_unknown:
+            assert preparation["last_error"] == "TimeoutError"
+
+        runtime.stop()
+    finally:
+        release_299.set()
+        if runtime.state not in {"STOPPED", "FAILED"}:
+            runtime.stop()
+
+    if retry_succeeds:
+        # The unique retry can succeed at the exact five-minute deadline. It
+        # clears the first failure without alerting and returns to the hourly
+        # history cadence.
+        trading.fail_catalog = False
+        success_call.clear()
+        runtime = make_runtime()
+        runtime.start()
+        try:
+            assert success_call.wait(timeout=2)
+            assert len(catalog_calls) == 2
+            assert notifications == []
+            assert hourly_wait_after_success.wait(timeout=2)
+            preparation = runtime.lp.preparation_snapshot()  # type: ignore[union-attr]
+            assert preparation["state"] == "ready"
+            assert preparation["failure_count"] == 0
+        finally:
+            if runtime.state not in {"NEW", "STOPPED", "FAILED"}:
+                runtime.stop()
+        return
+
+    # A reconstructed runtime honors the original due time. The retry then
+    # fails once, pauses durably, and sends one LP-specific notification.
+    runtime = make_runtime()
+    runtime.start()
+    try:
+        assert paused_wait.wait(timeout=2)
+        assert len(catalog_calls) == 2
+        assert len(notifications) == 1
+        preparation = runtime.lp.preparation_snapshot()  # type: ignore[union-attr]
+        assert preparation["state"] == "paused"
+        assert preparation["paused"] is True
+        assert preparation["failure_count"] == 2
+        assert preparation["alert_attempted"] is True
+        if catalog_unknown:
+            assert preparation["last_error"] == "TimeoutError"
+            assert "TimeoutError" in notifications[0][1]
+            assert "ValueError" not in notifications[0][1]
+        assert "重启" not in notifications[0][1]
+        assert "恢复准备" in notifications[0][1]
+
+        # Ordinary refreshes and elapsed hours do not reset the paused cycle.
+        clock[0] += timedelta(hours=2)
+        assert runtime.lp.refresh_price_history()["preparation_outcome"] == "paused"  # type: ignore[union-attr]
+        assert len(catalog_calls) == 2
+        assert len(notifications) == 1
+
+        # A second process reconstruction also honors the paused generation;
+        # it cannot consume a third attempt or send a duplicate alert.
+        paused_wait.clear()
+        runtime.stop()
+        assert runtime.state == "STOPPED"
+
+        runtime = make_runtime()
+        runtime.start()
+        assert paused_wait.wait(timeout=2)
+        assert len(catalog_calls) == 2
+        assert len(notifications) == 1
+        preparation = runtime.lp.preparation_snapshot()  # type: ignore[union-attr]
+        assert preparation["state"] == "paused"
+        assert preparation["failure_count"] == 2
+        if catalog_unknown:
+            assert preparation["last_error"] == "TimeoutError"
+
+        # Explicit recovery re-arms one cycle. A successful retry clears the
+        # failure budget and returns to the normal hourly scheduler.
+        trading.fail_catalog = False
+        recovered = runtime.recover_lp_preparation()
+        assert recovered["paused"] is False
+        release_paused.set()
+        assert success_call.wait(timeout=2)
+        assert len(catalog_calls) == 3
+        assert hourly_wait_after_success.wait(timeout=2), history_wait_calls
+        assert runtime.lp.preparation_snapshot()["state"] == "ready"  # type: ignore[union-attr]
+        assert runtime.lp.preparation_snapshot()["failure_count"] == 0  # type: ignore[union-attr]
+
+        # A process can stop after persisting attempt one but before its
+        # external read returns.  Reconstruction may consume attempt two;
+        # after that failure the persisted budget must pause before any third
+        # external read, with the same single-alert path.
+        release_paused.set()
+        runtime.stop()
+        assert runtime.state == "STOPPED"
+        trading.fail_catalog = True
+        data_dir = tmp_path / "retry-failure"
+        seed_store = PredictionArbitrageStore(data_dir)
+        saved = seed_store.lp_preparation()
+        assert saved is not None
+        seed_store.lp_save_preparation(
+            {
+                **saved,
+                "state": "preparing",
+                "stage": "catalog",
+                "attempt": 1,
+                "failure_count": 0,
+                "paused": False,
+                "alert_attempted": False,
+                "alert_state": None,
+                "next_retry_at": None,
+                "last_error": None,
+            },
+            expected_generation=saved["generation"],
+        )
+        first_call.clear()
+        at_299.clear()
+        release_299.clear()
+        paused_wait.clear()
+        release_paused.clear()
+        success_call.clear()
+        catalog_before = len(catalog_calls)
+        notifications_before = len(notifications)
+        runtime = make_runtime()
+        runtime.start()
+        assert first_call.wait(timeout=2)
+        assert at_299.wait(timeout=2)
+        preparation = runtime.lp.preparation_snapshot()  # type: ignore[union-attr]
+        assert preparation["state"] == "waiting_retry"
+        assert preparation["attempt"] == 2
+        assert preparation["failure_count"] == 1
+        if catalog_unknown:
+            assert preparation["last_error"] == "TimeoutError"
+        release_299.set()
+        assert paused_wait.wait(timeout=2)
+        assert len(catalog_calls) == catalog_before + 1
+        assert len(notifications) == notifications_before + 1
+        preparation = runtime.lp.preparation_snapshot()  # type: ignore[union-attr]
+        assert preparation["state"] == "paused"
+        assert preparation["paused"] is True
+        assert preparation["attempt"] == 2
+        assert preparation["failure_count"] == 2
+        assert preparation["alert_attempted"] is True
+        if catalog_unknown:
+            assert preparation["last_error"] == "TimeoutError"
+            assert "TimeoutError" in notifications[-1][1]
+            assert "ValueError" not in notifications[-1][1]
+    finally:
+        release_paused.set()
+        if runtime.state not in {"NEW", "STOPPED", "FAILED"}:
+            runtime.stop()
+        assert runtime.state == "STOPPED"
+
+
+def test_lp_metadata_warmup_advances_beyond_one_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real adapter warms 1501 metadata IDs and stops without overlap."""
+
+    import open_trader.polymarket_trading as trading_module
+    import open_trader.prediction_runtime as runtime_module
+    from open_trader.polymarket_trading import (
+        PolymarketTradingClient,
+        TradingConfig,
+    )
+
+    fixed_now = datetime(2026, 9, 18, 12, 0, tzinfo=UTC)
+    clock = [fixed_now]
+
+    class AdapterClock(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return clock[0] if tz is None else clock[0].astimezone(tz)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(trading_module, "datetime", AdapterClock)
+
+    condition_ids = tuple(f"condition-{index:04d}" for index in range(1501))
+    absent_id = condition_ids[1499]
+    failed_id = condition_ids[1500]
+    initial_ids = frozenset(condition_ids[:1500])
+    positive_ids = frozenset(condition_ids[:1499])
+    request_lock = threading.Lock()
+    metadata_requests: list[tuple[str, ...]] = []
+    dispatch_after_stop_signal: list[tuple[str, ...]] = []
+    fail_last_once = [True]
+    hold_next_metadata = [False]
+    metadata_hold_batches: list[tuple[str, ...]] = []
+    catalog_calls = [0]
+    stop_event_ref: list[threading.Event | None] = [None]
+    first_failure = threading.Event()
+    retry_wait_entered = threading.Event()
+    retry_release = threading.Event()
+    preparation_ready = threading.Event()
+    initial_wait_entered = threading.Event()
+    allow_expired = threading.Event()
+    metadata_hold_started = threading.Event()
+    release_metadata = threading.Event()
+    stop_started = threading.Event()
+    stop_returned = threading.Event()
+    wait_seconds: list[float] = []
+    stop_errors: list[BaseException] = []
+
+    def reward_row(condition_id: str) -> dict[str, object]:
+        return {
+            "condition_id": condition_id,
+            "rewards_min_size": "1",
+            "rewards_max_spread": "10",
+            "rewards_config": [
+                {
+                    "id": f"reward-{condition_id}",
+                    "asset_address": "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",
+                    "start_date": "2026-01-01",
+                    "end_date": "2030-01-01",
+                    "rate_per_day": "1",
+                }
+            ],
+        }
+
+    def market_row(condition_id: str) -> dict[str, object]:
+        index = int(condition_id.rsplit("-", 1)[-1])
+        return {
+            "id": f"market-{index:04d}",
+            "condition_id": condition_id,
+            "question": f"Metadata market {index}",
+            "slug": f"metadata-market-{index:04d}",
+            "events": [],
+            "state": {"accepting_orders": False},
+            "trading": {
+                "minimum_order_size": "1",
+                "minimum_tick_size": "0.01",
+                "fees_enabled": False,
+            },
+            "rewards": {
+                "rewards_min_size": "1",
+                "rewards_max_spread": "10",
+            },
+            "outcomes": {
+                "yes": {
+                    "label": "YES",
+                    "token_id": f"token-{condition_id}-yes",
+                },
+                "no": {
+                    "label": "NO",
+                    "token_id": f"token-{condition_id}-no",
+                },
+            },
+        }
+
+    def open_history(_request: object, *, timeout: float) -> object:
+        del timeout
+        raise AssertionError("history must not be read without an accepting market")
+
+    class PublicSDK:
+        def list_current_rewards(self, *, sponsored: bool) -> list[object]:
+            if sponsored:
+                return []
+            catalog_calls[0] += 1
+            return [reward_row(condition_id) for condition_id in condition_ids]
+
+        def list_market_rewards(
+            self, *, condition_id: str, sponsored: bool
+        ) -> list[object]:
+            del sponsored
+            return [reward_row(condition_id)] if condition_id in condition_ids else []
+
+        def list_markets(
+            self, *, condition_ids: object, page_size: int = 100
+        ) -> list[object]:
+            assert page_size == 100
+            batch = tuple(str(value) for value in condition_ids)  # type: ignore[arg-type]
+            assert 1 <= len(batch) <= 100
+            should_fail = False
+            should_hold = False
+            with request_lock:
+                stop_event = stop_event_ref[0]
+                if stop_event is not None and stop_event.is_set():
+                    dispatch_after_stop_signal.append(batch)
+                metadata_requests.append(batch)
+                if batch == (failed_id,) and fail_last_once[0]:
+                    fail_last_once[0] = False
+                    should_fail = True
+                if hold_next_metadata[0] and len(metadata_hold_batches) < 8:
+                    metadata_hold_batches.append(batch)
+                    should_hold = True
+                    if len(metadata_hold_batches) == 8:
+                        metadata_hold_started.set()
+            if should_fail:
+                first_failure.set()
+                raise TimeoutError("last metadata request unavailable")
+            if should_hold:
+                assert release_metadata.wait(timeout=60)
+            return [market_row(condition_id) for condition_id in batch if condition_id != absent_id]
+
+        def get_order_books(self, *, token_ids: object) -> list[object]:
+            del token_ids
+            return []
+
+        def close(self) -> None:
+            return None
+
+    class AccountSDK:
+        environment = SimpleNamespace(standard_exchange="0x" + "2" * 40)
+
+        def get_balance_allowance(self, *, asset_type: str) -> Mapping[str, object]:
+            assert asset_type == "COLLATERAL"
+            return {
+                "balance": "100000000",
+                "allowances": {self.environment.standard_exchange: "100000000"},
+            }
+
+        def list_open_orders(self, *args: object, **kwargs: object) -> tuple[object, ...]:
+            del args, kwargs
+            return ()
+
+        def list_account_trades(
+            self, *args: object, **kwargs: object
+        ) -> tuple[object, ...]:
+            del args, kwargs
+            return ()
+
+        def list_positions(self, *args: object, **kwargs: object) -> tuple[object, ...]:
+            del args, kwargs
+            return ()
+
+        def is_gasless_ready(self) -> bool:
+            return True
+
+        def merge_positions(self, *args: object, **kwargs: object) -> object:
+            del args, kwargs
+            return {"status": "not_called"}
+
+    config = TradingConfig(
+        signer_address="0x" + "3" * 40,
+        wallet_address="0x" + "1" * 40,
+        predict=None,
+    )
+    trading = PolymarketTradingClient(
+        config,
+        AccountSDK(),
+        urlopen_fn=open_history,
+        public_client_factory=PublicSDK,
+    )
+    monkeypatch.setattr(runtime_module, "load_trading_config", lambda _path: config)
+    monkeypatch.setattr(
+        runtime_module,
+        "PolymarketTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: trading),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "PredictTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: None),
+    )
+
+    class MacOSNotifier:
+        channel = "macos"
+
+        def notify(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+    class FeishuNotifier:
+        channel = "feishu"
+
+        def notify(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+    notifier = SimpleNamespace(_notifiers=(MacOSNotifier(), FeishuNotifier()))
+
+    def history_wait(stop_event: threading.Event, seconds: float) -> bool:
+        stop_event_ref[0] = stop_event
+        wait_seconds.append(seconds)
+        if seconds == 300:
+            retry_wait_entered.set()
+            if not retry_release.wait(timeout=60):
+                return True
+            return stop_event.is_set()
+        if seconds == 3600:
+            if not initial_wait_entered.is_set():
+                initial_wait_entered.set()
+                preparation_ready.set()
+                if not allow_expired.wait(timeout=60):
+                    return True
+            return stop_event.is_set()
+        raise AssertionError(f"unexpected history wait: {seconds}")
+
+    runtime = PredictionRuntime(
+        data_dir=tmp_path,
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+        notifier=notifier,
+        cross_venue_monitor=_UnavailableCrossVenueMonitor("test-disabled"),
+        enable_n_leg_background=False,
+        n_leg_paused=True,
+        history_clock=lambda: clock[0],
+        history_wait=history_wait,
+    )
+    stop_thread: threading.Thread | None = None
+    try:
+        runtime.start()
+        assert runtime.state == "RUNNING"
+        assert retry_wait_entered.wait(timeout=60)
+        assert first_failure.is_set()
+        lp = runtime.lp
+        store = runtime.store
+        assert lp is not None and store is not None
+
+        first_preparation = lp.preparation_snapshot()
+        assert first_preparation["state"] == "waiting_retry"
+        assert first_preparation["failure_count"] == 1
+        assert first_preparation["metadata_completed_count"] == 1500
+        assert first_preparation["metadata_total_count"] == 1501
+        first_entries = store.lp_metadata_cache_entries(now=clock[0])
+        assert set(first_entries) == set(initial_ids)
+        assert len(first_entries) == 1500
+        assert failed_id not in first_entries
+        assert first_entries[absent_id][1] is None
+        absent_expiry = first_entries[absent_id][0]
+        expected_checked_at = "2026-09-18T12:00:00.000000Z"
+        before_facts = {
+            condition_id: (
+                first_entries[condition_id][0],
+                first_entries[condition_id][1]["metadata_checked_at"],  # type: ignore[index]
+            )
+            for condition_id in positive_ids
+        }
+        for condition_id, (expires_at, checked_at) in before_facts.items():
+            assert checked_at == expected_checked_at
+            assert expires_at == fixed_now.timestamp() + 43_200
+        assert absent_expiry == fixed_now.timestamp() + 3_600
+        assert absent_expiry > clock[0].timestamp()
+
+        clock[0] += timedelta(seconds=300)
+        retry_release.set()
+        assert preparation_ready.wait(timeout=60)
+        assert initial_wait_entered.wait(timeout=60)
+        preparation = lp.preparation_snapshot()
+        assert preparation["state"] == "ready"
+        assert preparation["failure_count"] == 0
+        assert preparation["total_count"] == 0
+        with request_lock:
+            retry_requests = tuple(metadata_requests)
+        assert len(retry_requests) == 17
+        assert retry_requests[-1] == (failed_id,)
+        assert sum(len(batch) for batch in retry_requests) == 1502
+        assert sum(failed_id in batch for batch in retry_requests) == 2
+        assert all(len(batch) <= 100 for batch in retry_requests)
+        assert all(
+            sum(condition_id in batch for batch in retry_requests) == 1
+            for condition_id in initial_ids
+        )
+        assert set(
+            condition_id
+            for batch in retry_requests
+            for condition_id in batch
+        ) == set(condition_ids)
+
+        final_entries = store.lp_metadata_cache_entries(now=clock[0])
+        assert set(final_entries) == set(condition_ids)
+        assert len(final_entries) == 1501
+        assert sum(payload is not None for _, payload in final_entries.values()) == 1500
+        assert final_entries[absent_id][1] is None
+        assert isinstance(final_entries[failed_id][1], Mapping)
+        assert final_entries[absent_id][0] == absent_expiry
+        for condition_id, (expires_at, checked_at) in before_facts.items():
+            payload = final_entries[condition_id][1]
+            assert isinstance(payload, Mapping)
+            assert final_entries[condition_id][0] == expires_at
+            assert payload["metadata_checked_at"] == checked_at
+        failed_payload = final_entries[failed_id][1]
+        assert isinstance(failed_payload, Mapping)
+        assert failed_payload["metadata_checked_at"] == "2026-09-18T12:05:00.000000Z"
+        assert final_entries[failed_id][0] == (
+            fixed_now + timedelta(seconds=300)
+        ).timestamp() + 43_200
+        assert all(value in {300.0, 3600.0} for value in wait_seconds[:2])
+        assert wait_seconds[:2] == [300.0, 3600.0]
+
+        hold_next_metadata[0] = True
+        clock[0] += timedelta(seconds=43200)
+        allow_expired.set()
+        assert metadata_hold_started.wait(timeout=60)
+        with request_lock:
+            assert len(metadata_hold_batches) == 8
+            requests_before_busy = len(metadata_requests)
+            expired_start = requests_before_busy - len(metadata_hold_batches)
+        preparation_before_busy = lp.preparation_snapshot()
+        busy = lp.refresh_price_history()
+        assert busy["state"] == "busy"
+        assert busy["preparation_outcome"] == "busy"
+        with request_lock:
+            assert len(metadata_requests) == requests_before_busy
+        assert lp.preparation_snapshot()["attempt"] == preparation_before_busy["attempt"]
+
+        def stop_runtime() -> None:
+            stop_started.set()
+            try:
+                runtime.stop()
+            except BaseException as exc:
+                stop_errors.append(exc)
+            finally:
+                stop_returned.set()
+
+        stop_thread = threading.Thread(target=stop_runtime, name="lp-runtime-stop")
+        stop_thread.start()
+        assert stop_started.wait(timeout=2)
+        stop_event = stop_event_ref[0]
+        assert stop_event is not None
+        assert stop_event.wait(timeout=2)
+        release_metadata.set()
+        assert stop_returned.wait(timeout=60)
+        stop_thread.join(timeout=2)
+        assert not stop_thread.is_alive()
+        assert not stop_errors
+        assert runtime.state == "STOPPED"
+        with request_lock:
+            assert dispatch_after_stop_signal == []
+            assert len(metadata_requests) == requests_before_busy
+            assert len(metadata_hold_batches) == 8
+            expired_requests = metadata_requests[expired_start:]
+            assert len(expired_requests) == 8
+            assert all(failed_id not in batch for batch in expired_requests)
+    finally:
+        retry_release.set()
+        allow_expired.set()
+        release_metadata.set()
+        if stop_thread is not None:
+            stop_thread.join(timeout=60)
+        if runtime.state not in {"NEW", "STOPPED", "FAILED"}:
+            runtime.stop()
+    assert runtime.state == "STOPPED"
+    assert catalog_calls[0] == 3
 
 
 def test_lp_minute_risk_does_not_wait_for_hourly_catalog_preparation(

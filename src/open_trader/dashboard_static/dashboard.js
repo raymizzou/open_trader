@@ -65,6 +65,7 @@ const state = {
     pollId: null,
     stateRequestInFlight: false,
     lpDashboardRequestInFlight: false,
+    lpPreparationRecoveryInFlight: false,
     lpDirectionSelections: {},
     signalPollId: null,
     signalRequestInFlight: false,
@@ -3908,8 +3909,9 @@ function predictionLpCard(payload) {
     + "<div><h2>流动性提供试验</h2><p>手工挂单 · 收益与风险观察</p></div>"
     + "<div class=\"pm-panel-heading-actions\">" + freshness
     + "<button class=\"pm-button\" type=\"button\" data-action=\"lp-dashboard-refresh\""
-    + (state.predictionMarket.lpDashboardRequestInFlight || !state.predictionMarket.csrfToken ? " disabled" : "") + ">立即刷新</button></div></header>"
+    + (state.predictionMarket.lpDashboardRequestInFlight || state.predictionMarket.lpPreparationRecoveryInFlight || !state.predictionMarket.csrfToken ? " disabled" : "") + ">立即刷新</button></div></header>"
     + errorMarkup
+    + predictionLpPreparation(dashboard.preparation)
     + "<section aria-label=\"当天 LP 委托\"><h3>当天 LP 委托 <span class=\"sub\">· 北京时间 08:00 起</span></h3><div class=\"pm-table-wrap\"><table class=\"pm-table pm-lp-order-table\">"
     + "<thead><tr><th scope=\"col\">标的</th><th scope=\"col\">委托与成交量</th><th scope=\"col\">LP 收益率（预计）</th><th scope=\"col\">压力损失（警戒线 10%）</th></tr></thead>"
     + "<tbody>" + todayRowsHtml + "</tbody></table></div>"
@@ -4672,6 +4674,46 @@ function predictionLpFunnel(payload) {
     ),
   ].join("");
   return `<section class="pm-panel pm-relation-funnel pm-lp-funnel" aria-label="LP 标的评估"><header class="pm-funnel-header"><div><h2>LP 标的评估</h2><p>读取市场 → 筛选 → 风控</p></div><span class="pm-pill ${stale ? "watch" : scanning ? "watch" : ""}">${escapeHtml(status)}</span></header><div class="pm-funnel-lane"><div class="pm-funnel-grid pm-funnel-grid-catalog pm-lp-funnel-grid">${stages}</div></div><div class="pm-funnel-meta"><span>筛选通过为全部廉价条件通过数</span><span>资料不可用、未通过与过期项不计入风控通过数</span>${reasons}</div></section>`;
+}
+
+function predictionLpPreparation(preparation) {
+  if (!preparation || typeof preparation !== "object" || Array.isArray(preparation)) return "";
+  const rawState = String(preparation.state || "").trim().toLowerCase();
+  const rawStage = String(preparation.stage || "").trim().toLowerCase();
+  const stateLabels = {idle: "空闲", preparing: "准备中", waiting_retry: "等待重试", paused: "已暂停", ready: "已就绪"};
+  const stageLabels = {catalog: "目录", metadata: "市场资料", history: "历史", complete: "完成"};
+  const stateLabel = stateLabels[rawState] || "UNKNOWN";
+  const stageLabel = stageLabels[rawStage] || "UNKNOWN";
+  const count = (value) => predictionHasValue(value) ? predictionNumber(value, "UNKNOWN") : "UNKNOWN";
+  const timestamp = (label, value) => predictionHasValue(value)
+    ? `<span>${label}：${escapeHtml(predictionHktTimestamp(value, "UNKNOWN"))}</span>`
+    : "";
+  const emptyCatalog = rawState === "ready" && rawStage === "complete"
+    && [preparation.completed_count, preparation.total_count,
+      preparation.metadata_completed_count, preparation.metadata_total_count]
+      .every((value) => predictionHasValue(value)
+        && Number.isFinite(Number(value)) && Number(value) === 0);
+  const alertProvided = Object.prototype.hasOwnProperty.call(preparation, "alert_attempted")
+    || Object.prototype.hasOwnProperty.call(preparation, "alert_state");
+  const alertState = predictionHasValue(preparation.alert_state)
+    ? String(preparation.alert_state)
+    : preparation.alert_attempted === true ? "UNKNOWN" : "未尝试";
+  const recoveryBusy = state.predictionMarket.lpDashboardRequestInFlight
+    || state.predictionMarket.lpPreparationRecoveryInFlight;
+  const recoveryButton = rawState === "paused"
+    ? `<button class="pm-button" type="button" data-action="lp-preparation-recovery"${recoveryBusy || !state.predictionMarket.csrfToken ? " disabled" : ""}>恢复准备</button>`
+    : "";
+  const failure = predictionHasValue(preparation.last_error)
+    ? `<p class="pm-signal-error" role="${rawState === "paused" ? "alert" : "status"}">最近失败：${escapeHtml(String(preparation.last_error))}</p>`
+    : "";
+  const retry = rawState === "waiting_retry"
+    ? `<p class="pm-signal-error" role="status">下次重试：${escapeHtml(predictionHktTimestamp(preparation.next_retry_at, "UNKNOWN"))}</p>`
+    : "";
+  const alert = alertProvided ? `<span>告警：${escapeHtml(alertState)}</span>` : "";
+  const emptyNote = emptyCatalog
+    ? "目录已确认为空；暂无候选资料。"
+    : "准备状态不等同于候选资格；下单指引仍需独立风控资料。";
+  return `<section class="pm-panel pm-lp-preparation" aria-label="LP 准备状态" data-lp-preparation-state="${escapeHtml(rawState || "unknown")}"><header class="pm-panel-heading"><div><h3>LP 准备状态</h3><p>阶段：${escapeHtml(stageLabel)}</p></div><div class="pm-panel-heading-actions"><span class="pm-pill ${rawState === "paused" ? "pm-tone-danger" : rawState === "ready" ? "pm-tone-ok" : "watch"}">${escapeHtml(stateLabel)}</span>${recoveryButton}</div></header><div class="pm-relation-summary"><span>历史方向 ${escapeHtml(count(preparation.completed_count))} / ${escapeHtml(count(preparation.total_count))}</span><span>市场资料 ${escapeHtml(count(preparation.metadata_completed_count))} / ${escapeHtml(count(preparation.metadata_total_count))}</span><span>尝试 ${escapeHtml(count(preparation.attempt))}</span><span>失败 ${escapeHtml(count(preparation.failure_count))}</span>${alert}</div><div class="pm-relation-summary">${timestamp("上次尝试", preparation.last_attempt_at)}${timestamp("最近进展", preparation.last_progress_at)}${timestamp("上次失败", preparation.last_failure_at)}${timestamp("上次成功", preparation.last_success_at)}</div>${failure}${retry}<p class="sub">${emptyNote}</p></section>`;
 }
 
 function predictionFunnelRejections(counts) {
@@ -6092,8 +6134,26 @@ async function handlePredictionMarketClick(event) {
     selectPredictionTab(predictionTab.dataset.predictionTab || "lp");
     return;
   }
+  const lpPreparationRecovery = event.target.closest("[data-action='lp-preparation-recovery']");
+  if (lpPreparationRecovery && !lpPreparationRecovery.disabled
+    && state.predictionMarket.csrfToken
+    && !state.predictionMarket.lpDashboardRequestInFlight
+    && !state.predictionMarket.lpPreparationRecoveryInFlight) {
+    state.predictionMarket.lpPreparationRecoveryInFlight = true;
+    renderPredictionMarket();
+    try {
+      await predictionPost("/api/prediction-arbitrage/lp/candidates/refresh", {manual_recovery: true});
+      await fetchPredictionLpDashboard();
+    } catch (error) {
+      state.predictionMarket.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.predictionMarket.lpPreparationRecoveryInFlight = false;
+      renderPredictionMarket();
+    }
+    return;
+  }
   const lpRefresh = event.target.closest("[data-action='lp-dashboard-refresh']");
-  if (lpRefresh && !lpRefresh.disabled) {
+  if (lpRefresh && !lpRefresh.disabled && !state.predictionMarket.lpPreparationRecoveryInFlight) {
     try {
       await predictionPost("/api/prediction-arbitrage/lp/candidates/refresh", {});
       await fetchPredictionLpDashboard();

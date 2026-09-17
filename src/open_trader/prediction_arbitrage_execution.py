@@ -1797,6 +1797,22 @@ class PredictionExecutionService:
                 recommendations = _normalize_lp_recommendations(raw_recommendations)
                 raw_selected_results = candidate_snapshot.get("selected_results")
                 selected_results = _normalize_lp_recommendations(raw_selected_results)
+                preparation_value = candidate_snapshot.get("preparation")
+                if not isinstance(preparation_value, Mapping):
+                    preparation_reader = getattr(self._lp, "preparation_snapshot", None)
+                    try:
+                        preparation_value = (
+                            _call(preparation_reader)
+                            if callable(preparation_reader)
+                            else {}
+                        )
+                    except Exception:
+                        preparation_value = {}
+                preparation = (
+                    dict(preparation_value)
+                    if isinstance(preparation_value, Mapping)
+                    else {}
+                )
                 raw_market_rewards = candidate_snapshot.get("market_rewards")
                 market_rewards = (
                     dict(raw_market_rewards)
@@ -1917,6 +1933,7 @@ class PredictionExecutionService:
                     "candidates": candidates,
                     "recommendations": recommendations,
                     "selected_results": selected_results,
+                    "preparation": preparation,
                     "funnel": (
                         dict(candidate_snapshot.get("funnel"))
                         if isinstance(candidate_snapshot.get("funnel"), Mapping)
@@ -1991,6 +2008,22 @@ class PredictionExecutionService:
                 selected_results = candidate_snapshot.get("selected_results")
                 candidate_funnel = candidate_snapshot.get("funnel")
                 candidate_state = candidate_snapshot.get("state", "unknown")
+                preparation_value = candidate_snapshot.get("preparation")
+                if not isinstance(preparation_value, Mapping):
+                    preparation_reader = getattr(self._lp, "preparation_snapshot", None)
+                    try:
+                        preparation_value = (
+                            _call(preparation_reader)
+                            if callable(preparation_reader)
+                            else {}
+                        )
+                    except Exception:
+                        preparation_value = {}
+                preparation = (
+                    dict(preparation_value)
+                    if isinstance(preparation_value, Mapping)
+                    else {}
+                )
                 candidate_projection = {
                     "candidates": [
                         dict(row)
@@ -2002,6 +2035,7 @@ class PredictionExecutionService:
                         for row in _normalize_lp_recommendations(recommendations)
                     ],
                     "selected_results": _normalize_lp_recommendations(selected_results),
+                    "preparation": preparation,
                     "funnel": (
                         dict(candidate_funnel)
                         if isinstance(candidate_funnel, Mapping)
@@ -4259,6 +4293,44 @@ class PredictionExecutionService:
         if completion.get("state") == "closed":
             return {"state": "ignored", "reason": "signal_closed"}
         return {"state": "failed", "reason": "notification_failed"}
+
+    def notify_lp_preparation_failure(
+        self, failure: Mapping[str, object]
+    ) -> dict[str, object]:
+        """Alert once when the durable LP preparation task is paused."""
+
+        raw_stage = str(failure.get("stage") or "unknown_stage")
+        stage = (
+            raw_stage
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}", raw_stage)
+            else "unknown_stage"
+        )
+        raw_error = str(failure.get("last_error") or "unknown_error")
+        error = (
+            raw_error
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}", raw_error)
+            else "unknown_error"
+        )
+        completed = failure.get("completed_count")
+        total = failure.get("total_count")
+        completed_text = str(completed) if type(completed) is int and completed >= 0 else "未知"
+        total_text = str(total) if type(total) is int and total >= 0 else "未知"
+        last_failure = beijing_clock(failure.get("last_failure_at")) or "未知"
+        last_success = beijing_clock(failure.get("last_success_at")) or "从未成功"
+        message = "\n".join(
+            (
+                f"LP 准备已暂停：阶段 {stage} · 错误 {error}。",
+                f"进度 {completed_text}/{total_text}；失败时间 {last_failure}；上次成功 {last_success}。",
+                "请检查交易所连接后，在 Dashboard 使用“恢复准备”继续。",
+                f"Dashboard：{self._dashboard_url}",
+            )
+        )
+        now_clock = beijing_clock(datetime.now(UTC)) or "未知"
+        if self._deliver_feishu_notification(
+            f"❌ LP 准备已暂停（{now_clock}）", message
+        ):
+            return {"state": "sent"}
+        return {"state": "failed", "reason": "notification_unavailable"}
 
     def notify_monitor_failure(
         self, failure: Mapping[str, object]

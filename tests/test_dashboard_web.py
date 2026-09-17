@@ -5649,6 +5649,194 @@ console.log(JSON.stringify({
     assert rendered["timerCount"] == 1
 
 
+def test_lp_preparation_status_and_explicit_recovery() -> None:
+    output = run_dashboard_js(r'''
+class Element {
+  constructor(){this.dataset={};this.hidden=false;this.innerHTML="";this.textContent="";this.style={};this.attributes={};this.listeners={};
+    this.classList={toggle(){},add(){},remove(){}};}
+  addEventListener(name, callback){(this.listeners[name] ||= []).push(callback);}
+  setAttribute(name,value){this.attributes[name]=value;}
+  removeAttribute(name){delete this.attributes[name];}
+  querySelector(){return null;}
+  querySelectorAll(){return [];}
+}
+const nodes = {};
+document.getElementById = (id) => nodes[id] || (nodes[id] = new Element());
+document.querySelector = () => nodes["workspace-grid"] || (nodes["workspace-grid"] = new Element());
+document.body = new Element();
+bindElements();
+bindEvents();
+const intervals = new Map();
+let nextIntervalId = 0;
+globalThis.window = {
+  location: {search:"", pathname:"/", hash:""},
+  setInterval(callback, delay) { const id = ++nextIntervalId; intervals.set(id, {callback, delay}); return id; },
+  clearInterval(id) { intervals.delete(id); },
+  setTimeout(callback) { return callback(); },
+  clearTimeout() {},
+};
+const response = (data, ok = true, status = 200) => ({ok, status, json: async () => data});
+const preparing = {
+  state:"preparing", stage:"metadata", generation:3, attempt:2, failure_count:1, paused:false,
+  completed_count:12, total_count:20, metadata_completed_count:3, metadata_total_count:8,
+  last_attempt_at:"2026-09-18T00:00:00Z", last_progress_at:"2026-09-18T00:01:00Z",
+};
+const waitingRetry = {
+  state:"waiting_retry", stage:"history", generation:3, attempt:3, failure_count:2, paused:false,
+  completed_count:12, total_count:20, metadata_completed_count:8, metadata_total_count:8,
+  last_attempt_at:"2026-09-18T00:02:00Z", last_failure_at:"2026-09-18T00:02:01Z",
+  next_retry_at:"2026-09-18T01:02:03Z", last_error:"TimeoutError",
+};
+const paused = {
+  state:"paused", stage:"metadata", generation:3, attempt:4, failure_count:3, paused:true,
+  completed_count:12, total_count:20, metadata_completed_count:3, metadata_total_count:8,
+  last_failure_at:"2026-09-18T00:03:00Z", last_error:"TimeoutError",
+  alert_attempted:true, alert_state:"sent",
+};
+const readyEmpty = {
+  state:"ready", stage:"complete", generation:4, attempt:1, failure_count:0, paused:false,
+  completed_count:0, total_count:0, metadata_completed_count:0, metadata_total_count:0,
+  last_attempt_at:"2026-09-18T01:00:00Z", last_success_at:"2026-09-18T01:00:01Z",
+  last_progress_at:"2026-09-18T01:00:01Z", alert_attempted:false, alert_state:null,
+};
+const readyUnknownCounts = {
+  ...readyEmpty,
+  completed_count:null, total_count:"", metadata_completed_count:null, metadata_total_count:"",
+};
+const dashboard = (preparation) => ({
+  state:"ready", stale:false, complete:true, checked_at:"2026-09-18T01:00:01Z",
+  preparation, lp_orders_today:[], positions:[], market_rewards:[], recommendations:[],
+});
+const venues = {csrf_token:"csrf-token", n_leg:{status:"running",code:"N_LEG_RUNNING"}, venues:[], monitor_subscription:{}};
+const requests = [];
+let recoveryPostCount = 0;
+let releaseRecoveryPost;
+globalThis.fetch = async (url, options = {}) => {
+  const request = {url:String(url), method:String(options.method || "GET"), body:String(options.body || ""), headers:options.headers || {}, credentials:String(options.credentials || "")};
+  requests.push(request);
+  if (request.url === "/api/prediction-arbitrage/venues") return response(venues);
+  if (request.url === "/api/prediction-arbitrage/lp/dashboard") return response(dashboard(readyEmpty));
+  if (request.url === "/api/prediction-arbitrage/lp/candidates/refresh" && request.method === "POST") {
+    const body = JSON.parse(request.body);
+    if (body.manual_recovery === true) {
+      recoveryPostCount += 1;
+      if (recoveryPostCount === 1) return new Promise((resolve) => { releaseRecoveryPost = () => resolve(response({state:"queued"}, true, 202)); });
+    }
+    return response({state:"queued"}, true, 202);
+  }
+  throw new Error("Unexpected request: " + request.method + " " + request.url);
+};
+const direct = (value) => predictionLpCard({lp_dashboard:value});
+const preparingHtml = direct(dashboard(preparing));
+const waitingHtml = direct(dashboard(waitingRetry));
+const pausedHtml = direct(dashboard(paused));
+const readyHtml = direct(dashboard(readyEmpty));
+const readyUnknownCountsHtml = direct(dashboard(readyUnknownCounts));
+const legacyHtml = direct({state:"ready", recommendations:[]});
+state.workspaceView = "prediction_market";
+state.predictionMarket.activeTab = "lp";
+state.predictionMarket.csrfToken = "csrf-token";
+state.predictionMarket.lpDashboardRequestInFlight = false;
+state.predictionMarket.lpPreparationRecoveryInFlight = false;
+setWorkspaceView("prediction_market");
+for (let turn=0; turn<24; turn+=1) await Promise.resolve();
+const bootstrapManualRecoveryPosts = requests.filter((request)=>request.method === "POST"
+  && request.url === "/api/prediction-arbitrage/lp/candidates/refresh"
+  && JSON.parse(request.body).manual_recovery === true).length;
+const timer = [...intervals.values()].find(({delay})=>delay===5000);
+if (!timer) throw new Error("LP polling did not install the 5 second refresh");
+await timer.callback();
+for (let turn=0; turn<24; turn+=1) await Promise.resolve();
+const pollingManualRecoveryPosts = requests.filter((request)=>request.method === "POST"
+  && request.url === "/api/prediction-arbitrage/lp/candidates/refresh"
+  && JSON.parse(request.body).manual_recovery === true).length;
+
+state.predictionMarket.lpDashboard = dashboard(paused);
+state.predictionMarket.lpDashboardRequestInFlight = false;
+state.predictionMarket.lpPreparationRecoveryInFlight = false;
+state.predictionMarket.csrfToken = "";
+renderPredictionMarket();
+const noCsrfHtml = nodes["prediction-market-root"].innerHTML;
+await handlePredictionMarketClick({target:{closest(selector) {
+  return selector === "[data-action='lp-preparation-recovery']" ? {disabled:true} : null;
+}}});
+state.predictionMarket.csrfToken = "csrf-token";
+state.predictionMarket.lpDashboardRequestInFlight = true;
+renderPredictionMarket();
+const busyHtml = nodes["prediction-market-root"].innerHTML;
+await handlePredictionMarketClick({target:{closest(selector) {
+  return selector === "[data-action='lp-preparation-recovery']" ? {disabled:true} : null;
+}}});
+state.predictionMarket.lpDashboardRequestInFlight = false;
+renderPredictionMarket();
+const recoveryButton = {disabled:false};
+const recoveryTarget = {closest(selector) {
+  return selector === "[data-action='lp-preparation-recovery']" ? recoveryButton : null;
+}};
+const firstRecovery = handlePredictionMarketClick({target:recoveryTarget});
+await Promise.resolve();
+const secondRecovery = handlePredictionMarketClick({target:recoveryTarget});
+await Promise.resolve();
+const recoveryHeld = typeof releaseRecoveryPost === "function";
+if (recoveryHeld) releaseRecoveryPost();
+await Promise.all([firstRecovery, secondRecovery]);
+state.predictionMarket.lpDashboardRequestInFlight = false;
+state.predictionMarket.lpPreparationRecoveryInFlight = false;
+state.predictionMarket.csrfToken = "csrf-token";
+const refreshTarget = {closest(selector) {
+  return selector === "[data-action='lp-dashboard-refresh']" ? {disabled:false} : null;
+}};
+await handlePredictionMarketClick({target:refreshTarget});
+const recoveryRequests = requests.filter((request)=>request.method === "POST"
+  && request.url === "/api/prediction-arbitrage/lp/candidates/refresh");
+console.log(JSON.stringify({
+  preparing: preparingHtml.includes("准备中") && preparingHtml.includes("阶段：市场资料")
+    && preparingHtml.includes("历史方向 12 / 20") && preparingHtml.includes("市场资料 3 / 8"),
+  waitingRetry: waitingHtml.includes("等待重试") && waitingHtml.includes("下次重试：2026-09-18 09:02:03 HKT")
+    && waitingHtml.includes("最近失败：TimeoutError"),
+  paused: pausedHtml.includes("已暂停") && pausedHtml.includes("最近失败：TimeoutError")
+    && pausedHtml.includes("告警：sent") && pausedHtml.includes("恢复准备"),
+  readyEmpty: readyHtml.includes("已就绪") && readyHtml.includes("目录已确认为空")
+    && readyHtml.includes("历史方向 0 / 0") && !readyHtml.includes("data-lp-recommendation=")
+    && !readyHtml.includes("可参与") && !readyHtml.includes("恢复准备"),
+  readyUnknownCounts: readyUnknownCountsHtml.includes("历史方向 UNKNOWN / UNKNOWN")
+    && readyUnknownCountsHtml.includes("市场资料 UNKNOWN / UNKNOWN")
+    && !readyUnknownCountsHtml.includes("目录已确认为空"),
+  legacyCompatible: !legacyHtml.includes("LP 准备状态") && !legacyHtml.includes("目录已确认为空"),
+  bootstrapManualRecoveryPosts,
+  pollingManualRecoveryPosts,
+  noCsrfDisabled: /<button[^>]*data-action="lp-preparation-recovery"[^>]*disabled/.test(noCsrfHtml),
+  busyDisabled: /<button[^>]*data-action="lp-preparation-recovery"[^>]*disabled/.test(busyHtml),
+  recoveryHeld,
+  recoveryPostCount,
+  recoveryBodies: recoveryRequests.map((request)=>JSON.parse(request.body)),
+  recoveryCsrf: recoveryRequests.filter((request)=>JSON.parse(request.body).manual_recovery === true)
+    .every((request)=>request.headers["X-CSRF-Token"] === "csrf-token"),
+  recoveryAuth: recoveryRequests.filter((request)=>JSON.parse(request.body).manual_recovery === true)
+    .every((request)=>request.credentials === "same-origin" && request.headers["Content-Type"] === "application/json"),
+}));
+''')
+    rendered = json.loads(output)
+
+    assert rendered == {
+        "preparing": True,
+        "waitingRetry": True,
+        "paused": True,
+        "readyEmpty": True,
+        "readyUnknownCounts": True,
+        "legacyCompatible": True,
+        "bootstrapManualRecoveryPosts": 0,
+        "pollingManualRecoveryPosts": 0,
+        "noCsrfDisabled": True,
+        "busyDisabled": True,
+        "recoveryHeld": True,
+        "recoveryPostCount": 1,
+        "recoveryBodies": [{"manual_recovery": True}, {}],
+        "recoveryCsrf": True,
+        "recoveryAuth": True,
+    }
+
+
 def test_prediction_paused_bootstrap_keeps_lp_requests_only() -> None:
     output = run_dashboard_js(r'''
 class Element {

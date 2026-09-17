@@ -794,6 +794,13 @@ class PredictionArbitrageStore:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS lp_preparation (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                generation INTEGER NOT NULL CHECK (generation >= 1),
+                payload TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS lp_market_observations (
                 account_id TEXT NOT NULL,
                 condition_id TEXT NOT NULL,
@@ -3151,6 +3158,123 @@ class PredictionArbitrageStore:
                 "SELECT payload FROM lp_screening_snapshot WHERE singleton=1"
             ).fetchone()
         return None if row is None else _load_payload(str(row["payload"]))
+
+    def lp_preparation(self) -> dict[str, object] | None:
+        """Load the durable singleton state for LP preparation."""
+
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT generation,payload FROM lp_preparation WHERE singleton=1"
+            ).fetchone()
+        if row is None:
+            return None
+        payload = _load_payload(str(row["payload"]))
+        payload["generation"] = int(row["generation"])
+        return payload
+
+    def lp_save_preparation(
+        self,
+        payload: Mapping[str, object],
+        *,
+        expected_generation: int | None = None,
+    ) -> dict[str, object] | None:
+        """Persist one preparation snapshot with an optional cycle guard.
+
+        ``generation`` identifies a manual recovery cycle.  Progress updates
+        keep that generation; a stale worker cannot overwrite a newer cycle.
+        """
+
+        encoded = _dump_payload(payload)
+        requested_generation = payload.get("generation")
+        if type(requested_generation) is not int or requested_generation < 1:
+            requested_generation = 1
+        updated_at = _utc_now()
+        with self._transaction() as connection:
+            current = connection.execute(
+                "SELECT generation,payload FROM lp_preparation WHERE singleton=1"
+            ).fetchone()
+            if current is None:
+                if expected_generation is not None:
+                    return None
+                generation = requested_generation
+                connection.execute(
+                    "INSERT INTO lp_preparation(singleton,generation,payload,updated_at) VALUES (1,?,?,?)",
+                    (generation, encoded, updated_at),
+                )
+            else:
+                current_generation = int(current["generation"])
+                if (
+                    expected_generation is not None
+                    and current_generation != expected_generation
+                ):
+                    saved = _load_payload(str(current["payload"]))
+                    saved["generation"] = current_generation
+                    return saved
+                generation = requested_generation
+                connection.execute(
+                    "UPDATE lp_preparation SET generation=?,payload=?,updated_at=? WHERE singleton=1",
+                    (generation, encoded, updated_at),
+                )
+        saved = _load_payload(encoded)
+        saved["generation"] = generation
+        return saved
+
+    def lp_claim_preparation_alert(
+        self, *, expected_generation: int | None = None
+    ) -> dict[str, object] | None:
+        """Claim the one alert attempt for a paused preparation cycle."""
+
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT generation,payload FROM lp_preparation WHERE singleton=1"
+            ).fetchone()
+            if row is None:
+                return None
+            generation = int(row["generation"])
+            if expected_generation is not None and generation != expected_generation:
+                saved = _load_payload(str(row["payload"]))
+                saved["generation"] = generation
+                saved["alert_claimed_now"] = False
+                return saved
+            payload = _load_payload(str(row["payload"]))
+            if payload.get("paused") is not True or payload.get("alert_attempted") is True:
+                payload["generation"] = generation
+                payload["alert_claimed_now"] = False
+                return payload
+            payload["alert_attempted"] = True
+            payload["alert_state"] = "claimed"
+            encoded = _dump_payload(payload)
+            connection.execute(
+                "UPDATE lp_preparation SET payload=?,updated_at=? WHERE singleton=1 AND generation=?",
+                (encoded, _utc_now(), generation),
+            )
+        payload["generation"] = generation
+        payload["alert_claimed_now"] = True
+        return payload
+
+    def lp_finish_preparation_alert(
+        self,
+        *,
+        generation: int,
+        success: bool,
+    ) -> dict[str, object] | None:
+        """Record the result of the claimed preparation alert attempt."""
+
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT generation,payload FROM lp_preparation WHERE singleton=1"
+            ).fetchone()
+            if row is None or int(row["generation"]) != generation:
+                return None
+            payload = _load_payload(str(row["payload"]))
+            payload["alert_state"] = "sent" if success else "failed"
+            encoded = _dump_payload(payload)
+            connection.execute(
+                "UPDATE lp_preparation SET payload=?,updated_at=? WHERE singleton=1 AND generation=?",
+                (encoded, _utc_now(), generation),
+            )
+        payload["generation"] = generation
+        return payload
 
     def save_lp_observation(
         self,

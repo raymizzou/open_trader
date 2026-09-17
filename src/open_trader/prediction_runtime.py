@@ -10,6 +10,7 @@ import threading
 import time
 from collections.abc import Mapping
 from contextlib import ExitStack
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Callable, Literal
 
@@ -382,6 +383,8 @@ class PredictionRuntime:
         solver_server_factory: Callable[[], SolverServerOwner] | None = None,
         enable_n_leg_background: bool = True,
         n_leg_paused: bool | None = None,
+        history_clock: Callable[[], datetime] | None = None,
+        history_wait: Callable[[threading.Event, float], bool] | None = None,
     ) -> None:
         if mode not in {"production", "shadow"}:
             raise ValueError("prediction runtime mode must be production or shadow")
@@ -400,6 +403,9 @@ class PredictionRuntime:
         # fence; before start() the runtime is at fence-1 semantics.
         self._minimum_reader_generation = 1
         self._enable_n_leg_background = bool(enable_n_leg_background)
+        self._history_clock = history_clock or (lambda: datetime.now(UTC))
+        self._history_clock_injected = history_clock is not None
+        self._history_waiter = history_wait
         if n_leg_paused is None:
             n_leg_paused = self._parse_n_leg_paused(os.environ.get(_N_LEG_PAUSED_ENV))
         elif type(n_leg_paused) is not bool:
@@ -444,6 +450,7 @@ class PredictionRuntime:
         self._book_sample_stop_event = threading.Event()
         self._book_sampler_thread: threading.Thread | None = None
         self._history_stop_event = threading.Event()
+        self._history_wakeup_event = threading.Event()
         self._history_initial_done = threading.Event()
         self._history_thread: threading.Thread | None = None
         self._reward_stop_event = threading.Event()
@@ -482,6 +489,18 @@ class PredictionRuntime:
     @property
     def n_leg_paused(self) -> bool:
         return self._n_leg_paused
+
+    def recover_lp_preparation(self) -> dict[str, object]:
+        """Explicitly re-arm a paused LP preparation task and wake its worker."""
+
+        lp = self.lp
+        recover = getattr(lp, "recover_preparation", None) if lp is not None else None
+        if not callable(recover):
+            return {"state": "unknown", "reason": "lp_unavailable"}
+        result = recover()
+        self._history_wakeup_event.set()
+        self._lp_candidate_refresh_requested.set()
+        return result if isinstance(result, Mapping) else {"state": "unknown"}
 
     def queue_lp_candidate_refresh(self) -> bool:
         """Wake the owned read-only LP candidate refresh worker."""
@@ -643,6 +662,11 @@ class PredictionRuntime:
                 self._prediction_trading,
                 owner_lock=self._owner,
             )
+            if self._history_clock_injected:
+                # Keep the production constructor seam compatible with the
+                # existing test doubles while allowing the history scheduler
+                # and LP reader to share one injected boundary clock.
+                setattr(self.lp, "clock", self._history_clock)
             if not self._n_leg_paused:
                 try:
                     self._predict_trading = PredictTradingClient.from_keychain(
@@ -1076,6 +1100,66 @@ class PredictionRuntime:
             return
         self._history_stop_event.clear()
         self._history_initial_done.clear()
+        self._history_wakeup_event.clear()
+
+        def wait_for_history(seconds: float) -> bool:
+            if self._history_waiter is not None:
+                return bool(self._history_waiter(self._history_stop_event, seconds))
+            deadline = time.monotonic() + max(0.0, seconds)
+            while not self._history_stop_event.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                if self._history_wakeup_event.wait(min(remaining, 0.5)):
+                    self._history_wakeup_event.clear()
+                    return False
+            return True
+
+        def preparation_alert(result: Mapping[str, object]) -> None:
+            if result.get("alert_pending") is not True:
+                return
+            lp = self.lp
+            execution = self.execution
+            if lp is None or execution is None:
+                return
+            preparation = result.get("preparation")
+            if not isinstance(preparation, Mapping):
+                return
+            notifier = getattr(execution, "notify_lp_preparation_failure", None)
+            success = False
+            if callable(notifier):
+                try:
+                    value = notifier(preparation)
+                    success = isinstance(value, Mapping) and value.get("state") == "sent"
+                except Exception:
+                    logger.exception("prediction_lp_preparation_notification_failed")
+            finish = getattr(lp, "finish_preparation_alert", None)
+            generation = preparation.get("generation")
+            if callable(finish) and type(generation) is int:
+                try:
+                    finish(generation=generation, success=success)
+                except Exception:
+                    logger.exception("prediction_lp_preparation_notification_state_failed")
+
+        def retry_delay(result: Mapping[str, object]) -> float:
+            preparation = result.get("preparation")
+            if not isinstance(preparation, Mapping):
+                return _LP_HISTORY_SECONDS
+            retry_at = preparation.get("next_retry_at")
+            if isinstance(retry_at, datetime):
+                due = retry_at
+            elif isinstance(retry_at, str):
+                text = retry_at[:-1] + "+00:00" if retry_at.endswith("Z") else retry_at
+                try:
+                    due = datetime.fromisoformat(text)
+                except ValueError:
+                    return _LP_HISTORY_SECONDS
+            else:
+                return _LP_HISTORY_SECONDS
+            now = self._history_clock()
+            if now.tzinfo is None:
+                now = now.replace(tzinfo=UTC)
+            return max(0.0, (due.astimezone(UTC) - now.astimezone(UTC)).total_seconds())
 
         def run() -> None:
             try:
@@ -1087,13 +1171,33 @@ class PredictionRuntime:
                     if not callable(refresh_history):
                         return
                     try:
-                        refresh_history(stop_event=self._history_stop_event)
+                        result = refresh_history(stop_event=self._history_stop_event)
                     except Exception:
+                        result = None
                         logger.exception("prediction_lp_history_refresh_failed")
                     finally:
                         self._history_initial_done.set()
                         self._lp_candidate_refresh_requested.set()
-                    if self._history_stop_event.wait(_LP_HISTORY_SECONDS):
+                    if isinstance(result, Mapping):
+                        preparation_alert(result)
+                        outcome = str(result.get("preparation_outcome") or "")
+                        preparation = result.get("preparation")
+                        preparation_state = (
+                            str(preparation.get("state") or "")
+                            if isinstance(preparation, Mapping)
+                            else ""
+                        )
+                        if outcome == "waiting_retry" or (
+                            outcome == "failure" and preparation_state == "waiting_retry"
+                        ):
+                            wait_seconds = retry_delay(result)
+                        elif outcome == "paused":
+                            wait_seconds = _LP_HISTORY_SECONDS
+                        else:
+                            wait_seconds = _LP_HISTORY_SECONDS
+                    else:
+                        wait_seconds = _LP_HISTORY_SECONDS
+                    if wait_for_history(wait_seconds):
                         return
             finally:
                 self._history_initial_done.set()
@@ -1363,6 +1467,7 @@ class PredictionRuntime:
         self._reward_stop_event.set()
         self._lp_share_stop_event.set()
         self._history_stop_event.set()
+        self._history_wakeup_event.set()
         self._history_initial_done.set()
         self._lp_candidate_refresh_requested.set()
         self._lp_stop_event.set()

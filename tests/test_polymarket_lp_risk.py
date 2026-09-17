@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+import pytest
+
 from open_trader import polymarket_lp_risk, polymarket_lp_views
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 
@@ -732,27 +734,33 @@ def test_lp_entry_event_window_requires_a_fresh_post_event_hour(tmp_path) -> Non
     assert known_game_time_unknown["state"] == "unknown"
 
 
-def test_lp_entry_metadata_within_cache_window_is_not_stale() -> None:
+@pytest.mark.parametrize("age_seconds", [60, 61, 3661, 43200])
+def test_lp_entry_metadata_requires_fresh_dynamic_observation(
+    age_seconds: int,
+) -> None:
     direction = _direction()
     direction["market"] = {
         **direction["market"],
-        "metadata_checked_at": NOW - timedelta(seconds=3661),
+        "metadata_checked_at": NOW - timedelta(seconds=age_seconds),
     }
 
     result = polymarket_lp_risk.evaluate_lp_entry(
         direction, account=_account(), now=NOW
     )
 
-    assert result["state"] == "eligible"
-    assert "market_metadata_stale" not in result["reason_codes"]
+    if age_seconds == 60:
+        assert result["state"] == "eligible"
+        assert "market_metadata_stale" not in result["reason_codes"]
+    else:
+        assert result["state"] == "unknown"
+        assert result["reason_codes"] == ["market_metadata_stale"]
 
 
 def test_lp_entry_metadata_beyond_cache_window_is_stale() -> None:
     direction = _direction()
     direction["market"] = {
         **direction["market"],
-        "metadata_checked_at": NOW
-        - timedelta(seconds=polymarket_lp_risk._MARKET_METADATA_MAX_AGE_SECONDS + 1),
+        "metadata_checked_at": NOW - timedelta(seconds=61),
     }
 
     result = polymarket_lp_risk.evaluate_lp_entry(

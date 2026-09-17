@@ -11,7 +11,6 @@ import importlib.metadata
 import logging
 import os
 import pty
-import random
 import re
 import subprocess
 import threading
@@ -67,8 +66,8 @@ LP_REWARD_SELECTED_MAX_CONCURRENCY = 4
 # an in-process TTL cache (positive and confirmed-missing entries) with a
 # per-call refresh budget, optionally warm-started from a SQLite backing
 # store.
-LP_METADATA_CACHE_TTL_SECONDS = 3600.0
-LP_METADATA_CACHE_JITTER_SECONDS = 600.0
+LP_METADATA_CACHE_TTL_SECONDS = 43200.0
+LP_METADATA_CACHE_JITTER_SECONDS = 0.0
 LP_METADATA_NEGATIVE_TTL_SECONDS = 3600.0
 LP_METADATA_MAX_REFRESH_IDS_PER_CALL = 1500
 LP_REWARD_ASSET_USD_ADDRESSES = frozenset(
@@ -445,6 +444,12 @@ def _safe_error_code(exc: BaseException) -> str:
     return "sdk_error"
 
 
+def _safe_read_failure(stage: str, exc: BaseException) -> str:
+    """Identify a failed read without retaining exception details."""
+
+    return f"{stage}_read_{type(exc).__name__}"
+
+
 def _submit_error_detail(exc: BaseException) -> dict[str, str]:
     """Redacted observable facts about a submit exception; never credentials."""
 
@@ -551,7 +556,8 @@ def _normalize_lp_reward_config(
     *,
     sponsored: bool,
     source: str | None = None,
-) -> tuple[dict[str, object], tuple[str, str, Date, Date]] | None:
+    require_id: bool = True,
+) -> tuple[dict[str, object], tuple[str | None, str, Date, Date]] | None:
     """Normalize one SDK reward config for both catalog read paths."""
 
     config = _model_dict(value)
@@ -563,7 +569,7 @@ def _normalize_lp_reward_config(
     end_date = _reward_date(config.get("end_date"))
     rate = _lp_decimal(config.get("rate_per_day"))
     if (
-        config_id is None
+        (require_id and config_id is None)
         or not isinstance(asset_address, str)
         or start_date is None
         or end_date is None
@@ -577,7 +583,7 @@ def _normalize_lp_reward_config(
     if source is not None:
         normalized["source"] = source
     return normalized, (
-        str(config_id),
+        None if config_id is None else str(config_id),
         asset_address.casefold(),
         start_date,
         end_date,
@@ -1276,53 +1282,208 @@ class PolymarketTradingClient:
         *,
         stop_event: threading.Event | None = None,
     ) -> dict[str, dict[str, object]]:
-        """Read LP market facts with a conservative metadata read-start bound."""
+        """Read LP market facts while retaining the mapping-only API."""
 
-        requested = tuple(
+        requested = self._normalise_condition_ids(condition_ids)
+        if not requested or (stop_event is not None and stop_event.is_set()):
+            return {}
+        result = self.lp_market_metadata_batch(requested, stop_event=stop_event)
+        markets = cast(dict[str, dict[str, object]], result["markets"])
+        failed_ids = cast(dict[str, str], result["failed_ids"])
+        market_failures = {
+            condition_id
+            for condition_id, reason in failed_ids.items()
+            if reason.startswith("market_read_")
+        }
+        if market_failures:
+            confirmed_absent = set(result["confirmed_absent_ids"])
+            if not markets and not confirmed_absent:
+                raise RuntimeError("market read failed")
+        return {
+            condition_id: dict(markets[condition_id])
+            for condition_id in requested
+            if condition_id in markets
+        }
+
+    def lp_market_metadata_batch(
+        self,
+        condition_ids: Sequence[str],
+        *,
+        stop_event: threading.Event | None = None,
+    ) -> dict[str, object]:
+        """Read metadata with explicit success, absence, failure, and deferral."""
+
+        requested = self._normalise_condition_ids(condition_ids)
+        checked_at = datetime.now(UTC)
+        if not requested:
+            return {
+                "markets": {},
+                "confirmed_absent_ids": (),
+                "failed_ids": {},
+                "deferred_ids": (),
+                "state": "known",
+                "checked_at": checked_at,
+            }
+        if stop_event is not None and stop_event.is_set():
+            return {
+                "markets": {},
+                "confirmed_absent_ids": (),
+                "failed_ids": {},
+                "deferred_ids": requested,
+                "state": "cancelled",
+                "checked_at": checked_at,
+            }
+        return self._lp_market_metadata_batch_result(
+            requested, checked_at=checked_at, force_refresh=False, stop_event=stop_event
+        )
+
+    def lp_market_metadata_fresh(
+        self,
+        condition_ids: Sequence[str],
+        *,
+        stop_event: threading.Event | None = None,
+    ) -> dict[str, dict[str, object]]:
+        """Read metadata directly, without serving a stale cached payload."""
+
+        requested = self._normalise_condition_ids(condition_ids)
+        if not requested or (stop_event is not None and stop_event.is_set()):
+            return {}
+        checked_at = datetime.now(UTC)
+        result = self._lp_market_metadata_batch_result(
+            requested, checked_at=checked_at, force_refresh=True, stop_event=stop_event
+        )
+        markets = cast(dict[str, dict[str, object]], result["markets"])
+        failed_ids = cast(dict[str, str], result["failed_ids"])
+        return {
+            condition_id: dict(value)
+            for condition_id, value in markets.items()
+            if condition_id not in failed_ids
+        }
+
+    @staticmethod
+    def _normalise_condition_ids(condition_ids: Sequence[str]) -> tuple[str, ...]:
+        return tuple(
             dict.fromkeys(
                 value.strip()
                 for value in condition_ids
                 if isinstance(value, str) and value.strip()
             )
         )
-        if not requested:
-            return {}
-        if stop_event is not None and stop_event.is_set():
-            return {}
-        now = datetime.now(UTC)
-        fresh, stale, refresh_ids = self._partition_metadata_cache(requested, now)
-        self._prune_metadata_cache(now)
+
+    def _lp_market_metadata_batch_result(
+        self,
+        requested: tuple[str, ...],
+        *,
+        checked_at: datetime,
+        force_refresh: bool,
+        stop_event: threading.Event | None,
+    ) -> dict[str, object]:
+        if force_refresh:
+            fresh: dict[str, dict[str, object] | None] = {}
+            stale: dict[str, dict[str, object] | None] = {}
+            refresh_ids = list(requested[:LP_METADATA_MAX_REFRESH_IDS_PER_CALL])
+            deferred_ids = list(requested[LP_METADATA_MAX_REFRESH_IDS_PER_CALL:])
+            self._prune_metadata_cache(checked_at)
+        else:
+            fresh, stale, refresh_ids = self._partition_metadata_cache(
+                requested, checked_at
+            )
+            deferred_ids = [
+                condition_id
+                for condition_id in requested
+                if condition_id not in fresh
+                and condition_id not in refresh_ids
+            ]
+            self._prune_metadata_cache(checked_at)
+
+        markets = {
+            condition_id: dict(value)
+            for condition_id, value in fresh.items()
+            if value is not None
+        }
+        markets.update(
+            {
+                condition_id: dict(value)
+                for condition_id, value in stale.items()
+                if value is not None
+            }
+        )
+        confirmed_absent = {
+            condition_id
+            for condition_id, value in fresh.items()
+            if value is None
+        }
+        failed_ids: dict[str, str] = {}
         fetched: dict[str, dict[str, object]] = {}
-        failed_event_ids: frozenset[str] = frozenset()
+        fetched_absent: frozenset[str] = frozenset()
         if refresh_ids:
-            public = self._public_client_factory()
+            public: object | None = None
             try:
-                fetched, failed_event_ids = self._fetch_lp_market_metadata(
+                public = self._public_client_factory()
+                fetched, failed_ids, fetched_absent = self._fetch_lp_market_metadata(
                     tuple(refresh_ids), public=public, stop_event=stop_event
+                )
+            except Exception as exc:
+                reason = _safe_read_failure("market", exc)
+                failed_ids.update(
+                    (condition_id, reason) for condition_id in refresh_ids
                 )
             finally:
                 close = getattr(public, "close", None)
                 if callable(close):
                     close()
-        if stop_event is not None and stop_event.is_set():
-            return {}
-        if refresh_ids:
+            markets.update(fetched)
+            confirmed_absent.update(fetched_absent)
             self._record_metadata_entries(
                 tuple(refresh_ids),
                 fetched,
-                metadata_checked_at=now,
-                failed_event_ids=failed_event_ids,
+                metadata_checked_at=checked_at,
+                confirmed_absent_ids=fetched_absent,
+                failed_ids=failed_ids,
             )
-        result: dict[str, dict[str, object]] = {}
-        for condition_id in requested:
-            value = fresh.get(condition_id)
-            if value is None:
-                value = fetched.get(condition_id)
-            if value is None:
-                value = stale.get(condition_id)
-            if value is not None:
-                result[condition_id] = dict(value)
-        return result
+
+        accounted = set(markets) | confirmed_absent | set(failed_ids) | set(deferred_ids)
+        unclassified = set(requested).difference(accounted)
+        deferred_ids.extend(
+            condition_id
+            for condition_id in requested
+            if condition_id in unclassified
+        )
+        deferred = tuple(dict.fromkeys(deferred_ids))
+        confirmed = tuple(
+            condition_id for condition_id in requested if condition_id in confirmed_absent
+        )
+        ordered_failed = {
+            condition_id: failed_ids[condition_id]
+            for condition_id in requested
+            if condition_id in failed_ids
+        }
+        known_ids = (
+            set(fresh).difference({condition_id for condition_id, value in fresh.items() if value is None})
+            | set(fetched).difference(ordered_failed)
+            | set(confirmed)
+        )
+        cancelled = stop_event is not None and stop_event.is_set()
+        if cancelled:
+            state = "cancelled"
+        elif not ordered_failed and not deferred and len(known_ids) == len(requested):
+            state = "known"
+        elif known_ids:
+            state = "partial"
+        else:
+            state = "unknown"
+        return {
+            "markets": {
+                condition_id: markets[condition_id]
+                for condition_id in requested
+                if condition_id in markets
+            },
+            "confirmed_absent_ids": confirmed,
+            "failed_ids": ordered_failed,
+            "deferred_ids": deferred,
+            "state": state,
+            "checked_at": checked_at,
+        }
 
     def _partition_metadata_cache(
         self,
@@ -1360,8 +1521,7 @@ class PolymarketTradingClient:
         refresh_ids = [
             condition_id for _expires_at, _index, condition_id in refresh
         ]
-        over_budget = refresh_ids[LP_METADATA_MAX_REFRESH_IDS_PER_CALL :]
-        for condition_id in over_budget:
+        for condition_id in refresh_ids:
             entry = self._metadata_entries.get(condition_id)
             if entry is not None and entry[1] is not None:
                 stale[condition_id] = entry[1]
@@ -1431,39 +1591,30 @@ class PolymarketTradingClient:
         fetched: Mapping[str, dict[str, object]],
         *,
         metadata_checked_at: datetime,
-        failed_event_ids: frozenset[str] = frozenset(),
+        confirmed_absent_ids: frozenset[str] = frozenset(),
+        failed_ids: Mapping[str, str] | None = None,
     ) -> None:
         """Write a completed refresh into the in-memory TTL cache.
 
         Only successful reads reach this point: confirmed-missing ids record
-        negative entries, failed reads raise before any write happens, and
-        payloads whose event sub-read failed (their ``event_id`` is in
-        ``failed_event_ids``) are returned uncached so the next call re-reads
-        them.
+        negative entries, while failed or deferred ids leave any prior cache
+        entry untouched.
         """
 
         read_epoch = metadata_checked_at.timestamp()
-        expires_at = (
-            read_epoch
-            + LP_METADATA_CACHE_TTL_SECONDS
-            + random.uniform(0.0, LP_METADATA_CACHE_JITTER_SECONDS)
-        )
+        expires_at = read_epoch + LP_METADATA_CACHE_TTL_SECONDS
         negative_expires_at = read_epoch + LP_METADATA_NEGATIVE_TTL_SECONDS
         updated: dict[str, tuple[float, dict[str, object] | None]] = {}
-        uncached: set[str] = set()
         for condition_id in refresh_ids:
+            if failed_ids is not None and condition_id in failed_ids:
+                continue
             value = fetched.get(condition_id)
-            if value is None:
-                continue
-            raw_event_id = value.get("event_id")
-            event_key = str(raw_event_id).strip() if raw_event_id is not None else ""
-            if event_key and event_key in failed_event_ids:
-                uncached.add(condition_id)
-                continue
-            updated[condition_id] = (expires_at, value)
-        for condition_id in refresh_ids:
-            if condition_id not in updated and condition_id not in uncached:
+            if value is not None:
+                updated[condition_id] = (expires_at, value)
+            elif condition_id in confirmed_absent_ids:
                 updated[condition_id] = (negative_expires_at, None)
+        if not updated:
+            return
         with self._metadata_lock:
             self._metadata_entries.update(updated)
         cache_store = self._metadata_cache
@@ -1481,25 +1632,25 @@ class PolymarketTradingClient:
         *,
         public: object,
         stop_event: threading.Event | None = None,
-    ) -> tuple[dict[str, dict[str, object]], frozenset[str]]:
-        """Fetch LP market facts for already-normalised ids over one client.
-
-        Returns the fetched payloads plus the set of event ids whose
-        ``list_events``/``get_event`` sub-read raised; callers must not
-        cache payloads carrying a failed event id so the next call re-reads
-        them.
-        """
+    ) -> tuple[dict[str, dict[str, object]], dict[str, str], frozenset[str]]:
+        """Fetch LP market facts while preserving each completed sub-read."""
 
         metadata_checked_at = datetime.now(UTC)
         event_facts: dict[str, Mapping[str, object] | None] = {}
-        failed_event_ids: set[str] = set()
-        failed_event_ids_lock = threading.Lock()
+        event_failures: dict[str, str] = {}
+        event_failures_lock = threading.Lock()
+        rows: list[object] = []
+        completed_market_ids: set[str] = set()
+        failed_ids: dict[str, str] = {}
 
-        def read_market_batch(batch: tuple[str, ...]) -> tuple[object, ...]:
+        def read_market_batch(
+            batch: tuple[str, ...],
+        ) -> tuple[tuple[object, ...], bool]:
             if stop_event is not None and stop_event.is_set():
-                return ()
-            return _collect(
-                public.list_markets(condition_ids=batch, page_size=100)
+                return (), False
+            return (
+                _collect(public.list_markets(condition_ids=batch, page_size=100)),
+                True,
             )
 
         market_batches = tuple(
@@ -1507,13 +1658,20 @@ class PolymarketTradingClient:
             for offset in range(0, len(requested), 100)
         )
         with ThreadPoolExecutor(max_workers=min(8, len(market_batches))) as pool:
-            rows = tuple(
-                value
-                for batch_rows in pool.map(read_market_batch, market_batches)
-                for value in batch_rows
-            )
-        if stop_event is not None and stop_event.is_set():
-            return {}, frozenset(failed_event_ids)
+            futures = [
+                (batch, pool.submit(read_market_batch, batch))
+                for batch in market_batches
+            ]
+            for batch, future in futures:
+                try:
+                    batch_rows, completed = future.result()
+                except Exception as exc:
+                    reason = _safe_read_failure("market", exc)
+                    failed_ids.update((condition_id, reason) for condition_id in batch)
+                    continue
+                if completed:
+                    completed_market_ids.update(batch)
+                    rows.extend(batch_rows)
 
         numeric_event_keys: dict[int, list[str]] = {}
         direct_event_ids: list[str] = []
@@ -1545,11 +1703,13 @@ class PolymarketTradingClient:
             else:
                 direct_event_ids.append(event_id)
 
+        def mark_event_failure(event_ids: Sequence[object], reason: str) -> None:
+            with event_failures_lock:
+                event_failures.update((str(value).strip(), reason) for value in event_ids)
+
         unresolved_numeric_ids = tuple(numeric_event_keys)
         for closed in (False, True):
-            if not unresolved_numeric_ids or (
-                stop_event is not None and stop_event.is_set()
-            ):
+            if not unresolved_numeric_ids:
                 break
             event_batches = tuple(
                 (unresolved_numeric_ids[offset : offset + 100], closed)
@@ -1558,31 +1718,36 @@ class PolymarketTradingClient:
 
             def read_event_batch(
                 query: tuple[tuple[int, ...], bool],
-            ) -> tuple[object, ...]:
+            ) -> tuple[tuple[object, ...], str | None]:
                 batch, is_closed = query
                 if stop_event is not None and stop_event.is_set():
-                    return ()
+                    reason = "event_read_cancelled"
+                    mark_event_failure(batch, reason)
+                    return (), reason
                 list_events = getattr(public, "list_events", None)
                 if not callable(list_events):
-                    return ()
+                    reason = "event_read_unavailable"
+                    mark_event_failure(batch, reason)
+                    return (), reason
                 try:
-                    return _collect(
-                        list_events(ids=batch, closed=is_closed, page_size=100)
+                    return (
+                        _collect(list_events(ids=batch, closed=is_closed, page_size=100)),
+                        None,
                     )
-                except Exception:
-                    with failed_event_ids_lock:
-                        failed_event_ids.update(
-                            str(value) for value in batch
-                        )
-                    return ()
+                except Exception as exc:
+                    reason = _safe_read_failure("event", exc)
+                    mark_event_failure(batch, reason)
+                    return (), reason
 
             resolved: set[int] = set()
             with ThreadPoolExecutor(max_workers=min(8, len(event_batches))) as pool:
-                for (batch, _is_closed), event_rows in zip(
-                    event_batches, pool.map(read_event_batch, event_batches), strict=True
-                ):
-                    if stop_event is not None and stop_event.is_set():
-                        break
+                futures = [
+                    (batch, pool.submit(read_event_batch, query))
+                    for query in event_batches
+                    for batch in (query[0],)
+                ]
+                for batch, future in futures:
+                    event_rows, _error = future.result()
                     for value in event_rows:
                         event = _model_dict(value)
                         if event is None:
@@ -1600,42 +1765,42 @@ class PolymarketTradingClient:
                             continue
                         for key in numeric_event_keys[numeric_id]:
                             event_facts[key] = event
+                            with event_failures_lock:
+                                event_failures.pop(key, None)
                         resolved.add(numeric_id)
             unresolved_numeric_ids = tuple(
                 event_id
                 for event_id in unresolved_numeric_ids
                 if event_id not in resolved
             )
+        if stop_event is not None and stop_event.is_set():
+            mark_event_failure(unresolved_numeric_ids, "event_read_cancelled")
 
         def read_direct_event(
             event_id: str,
-        ) -> tuple[str, Mapping[str, object] | None]:
+        ) -> tuple[str, Mapping[str, object] | None, str | None]:
             if stop_event is not None and stop_event.is_set():
-                return event_id, None
+                return event_id, None, "event_read_cancelled"
             get_event = getattr(public, "get_event", None)
             if not callable(get_event):
-                return event_id, None
+                return event_id, None, "event_read_unavailable"
             try:
                 event = _model_dict(get_event(id=event_id))
-            except Exception:
-                with failed_event_ids_lock:
-                    failed_event_ids.add(str(event_id).strip())
-                return event_id, None
+            except Exception as exc:
+                return event_id, None, _safe_read_failure("event", exc)
             if event is None or str(event.get("id") or "") != event_id:
-                return event_id, None
-            return event_id, event
+                return event_id, None, None
+            return event_id, event, None
 
-        if direct_event_ids and not (
-            stop_event is not None and stop_event.is_set()
-        ):
-            with ThreadPoolExecutor(
-                max_workers=min(8, len(direct_event_ids))
-            ) as pool:
-                for event_id, event in pool.map(read_direct_event, direct_event_ids):
+        if direct_event_ids:
+            with ThreadPoolExecutor(max_workers=min(8, len(direct_event_ids))) as pool:
+                for event_id, event, error in pool.map(read_direct_event, direct_event_ids):
                     if event is not None:
                         event_facts[event_id] = event
-        if stop_event is not None and stop_event.is_set():
-            return {}, frozenset(failed_event_ids)
+                        with event_failures_lock:
+                            event_failures.pop(event_id, None)
+                    elif error is not None:
+                        mark_event_failure((event_id,), error)
         result: dict[str, dict[str, object]] = {}
         for value in rows:
             row = _model_dict(value)
@@ -1680,6 +1845,8 @@ class PolymarketTradingClient:
             event_id = event_reference.get("id") if event_reference else None
             event_key = str(event_id).strip() if event_id is not None else ""
             event = event_facts.get(event_key) if event_key else None
+            if event_key in event_failures:
+                failed_ids.setdefault(condition_id, event_failures[event_key])
             sports = _model_dict(row.get("sports")) or {}
             event_state = _model_dict(event.get("state")) or {} if event else {}
             event_schedule = _model_dict(event.get("schedule")) or {} if event else {}
@@ -1742,7 +1909,12 @@ class PolymarketTradingClient:
                 ),
                 "outcomes": outcomes,
             }
-        return result, frozenset(failed_event_ids)
+        confirmed_absent_ids = frozenset(
+            condition_id
+            for condition_id in completed_market_ids
+            if condition_id not in result and condition_id not in failed_ids
+        )
+        return result, failed_ids, confirmed_absent_ids
 
     def lp_order_books(
         self,
@@ -1898,11 +2070,13 @@ class PolymarketTradingClient:
                             continue
                         stamp = raw_row.get("t", raw_row.get("timestamp"))
                         price = _lp_decimal(raw_row.get("p", raw_row.get("price")))
-                        if type(stamp) is not int or stamp < start_ts or stamp > end_ts:
+                        if type(stamp) is not int:
                             invalid = True
                             continue
                         if price is None or price < 0 or price > 1:
                             invalid = True
+                            continue
+                        if stamp < start_ts or stamp > end_ts:
                             continue
                         by_timestamp[stamp] = {"t": stamp, "p": price}
                     rows = [by_timestamp[stamp] for stamp in sorted(by_timestamp)]
@@ -2010,14 +2184,21 @@ class PolymarketTradingClient:
                 "rewards_max_spread": None,
                 "rewards_min_size": None,
                 "native_reward_configs": [],
+                "combined_reward_configs": [],
                 "sponsored_reward_configs": [],
                 "native_daily_pool_usd": Decimal("0"),
                 "sponsored_daily_pool_usd": Decimal("0"),
             }
             reason_codes: list[str] = []
-            seen: set[tuple[object, ...]] = set()
+            row_fingerprints: dict[bool, str] = {}
+            config_signatures: dict[bool, dict[str, tuple[object, ...]]] = {
+                False: {},
+                True: {},
+            }
             active_configs = 0
             unknown_asset = False
+            native_total: Decimal | None = Decimal("0")
+            combined_total: Decimal | None = Decimal("0")
 
             for sponsored in (False, True):
                 rows, read_error = results[(condition_id, sponsored)]
@@ -2029,14 +2210,35 @@ class PolymarketTradingClient:
                     if row is None or row.get("condition_id") != condition_id:
                         reason_codes.append("reward_identity_unknown")
                         continue
-                    if market["rewards_max_spread"] is None:
-                        market["rewards_max_spread"] = _lp_decimal(
+                    try:
+                        fingerprint = json.dumps(
+                            row,
+                            sort_keys=True,
+                            default=str,
+                            separators=(",", ":"),
+                        )
+                    except (TypeError, ValueError):
+                        reason_codes.append("reward_identity_unknown")
+                        continue
+                    previous_fingerprint = row_fingerprints.get(sponsored)
+                    if previous_fingerprint is not None:
+                        if previous_fingerprint == fingerprint:
+                            continue
+                        reason_codes.append("reward_identity_unknown")
+                        continue
+                    row_fingerprints[sponsored] = fingerprint
+
+                    if sponsored:
+                        combined_spread = _lp_decimal(
                             row.get("rewards_max_spread")
                         )
-                    if market["rewards_min_size"] is None:
-                        market["rewards_min_size"] = _lp_decimal(
+                        combined_min_size = _lp_decimal(
                             row.get("rewards_min_size")
                         )
+                        if combined_spread is not None:
+                            market["rewards_max_spread"] = combined_spread
+                        if combined_min_size is not None:
+                            market["rewards_min_size"] = combined_min_size
                     raw_configs = row.get("rewards_config")
                     if not isinstance(raw_configs, Sequence) or isinstance(
                         raw_configs, (str, bytes)
@@ -2047,40 +2249,49 @@ class PolymarketTradingClient:
                         normalized_parts = _normalize_lp_reward_config(
                             raw_config,
                             sponsored=sponsored,
+                            require_id=False,
                         )
                         if normalized_parts is None:
                             reason_codes.append("reward_config_unknown")
                             continue
                         normalized, config_identity = normalized_parts
-                        _, asset_key, start_date, end_date = config_identity
-                        asset = str(normalized["asset_address"])
+                        config_id, asset_key, start_date, end_date = config_identity
                         rate = cast(Decimal, normalized["rate_per_day"])
-                        identity = (condition_id, *config_identity)
-                        if identity in seen:
-                            continue
-                        seen.add(identity)
+                        if config_id is not None:
+                            config_key = str(config_id)
+                            signature = (asset_key, start_date, end_date, rate)
+                            previous_signature = config_signatures[sponsored].get(
+                                config_key
+                            )
+                            if previous_signature is not None:
+                                if previous_signature == signature:
+                                    continue
+                                reason_codes.append("reward_identity_unknown")
+                                continue
+                            config_signatures[sponsored][config_key] = signature
                         if not start_date <= as_of <= end_date:
                             continue
-                        cast(
-                            list[dict[str, object]],
-                            market[
-                                "sponsored_reward_configs"
-                                if sponsored
-                                else "native_reward_configs"
-                            ],
-                        ).append(normalized)
+                        configs_key = (
+                            "combined_reward_configs"
+                            if sponsored
+                            else "native_reward_configs"
+                        )
+                        cast(list[dict[str, object]], market[configs_key]).append(
+                            normalized
+                        )
                         active_configs += 1
                         if asset_key not in LP_REWARD_ASSET_USD_ADDRESSES:
                             unknown_asset = True
+                            if sponsored:
+                                combined_total = None
+                            else:
+                                native_total = None
                             continue
-                        amount_key = (
-                            "sponsored_daily_pool_usd"
-                            if sponsored
-                            else "native_daily_pool_usd"
-                        )
-                        current = cast(Decimal | None, market[amount_key])
-                        if current is not None:
-                            market[amount_key] = current + rate
+                        if sponsored:
+                            if combined_total is not None:
+                                combined_total += rate
+                        elif native_total is not None:
+                            native_total += rate
 
             if unknown_asset:
                 reason_codes.append("reward_asset_unknown")
@@ -2097,9 +2308,39 @@ class PolymarketTradingClient:
                 )
                 total_known = False
             else:
-                native = cast(Decimal, market["native_daily_pool_usd"])
-                sponsored = cast(Decimal, market["sponsored_daily_pool_usd"])
-                daily_pool = native + sponsored
+                native = native_total
+                combined = combined_total
+                if native is None or combined is None:
+                    market.update(
+                        {
+                            "state": "unknown",
+                            "complete": False,
+                            "reward_active": None,
+                            "daily_pool_usd": None,
+                            "reason_codes": ["reward_total_unknown"],
+                        }
+                    )
+                    total_known = False
+                    markets.append(market)
+                    continue
+                if combined < native:
+                    market.update(
+                        {
+                            "state": "unknown",
+                            "complete": False,
+                            "reward_active": None,
+                            "daily_pool_usd": None,
+                            "sponsored_daily_pool_usd": None,
+                            "reason_codes": ["reward_totals_inconsistent"],
+                        }
+                    )
+                    total_known = False
+                    markets.append(market)
+                    continue
+                sponsored = combined - native
+                daily_pool = combined
+                market["native_daily_pool_usd"] = native
+                market["sponsored_daily_pool_usd"] = sponsored
                 market.update(
                     {
                         "state": "known",
@@ -2262,7 +2503,9 @@ class PolymarketTradingClient:
         except _RewardReadCancelled:
             unknown["reason"] = "cancelled"
             return unknown
-        except Exception:
+        except Exception as exc:
+            unknown["reason"] = "reward_catalog_read_failed"
+            unknown["error_type"] = type(exc).__name__
             return unknown
 
     def lp_reward_rates(
