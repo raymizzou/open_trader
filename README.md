@@ -195,7 +195,8 @@ Use four explicit stages; a local merge is not a deployment:
    deploy the exact accepted SHA using the existing release runbook. Then run
    the read-only smoke check. It first validates the exact immutable checkout,
    then runs the five marked host-Python browser prerequisites. It next checks
-   health, PID/listener, cwd, N_LEG state, and logs; only if those runtime
+   health, PID/listener, cwd, selected-service logs, and the selected Prediction
+   N_LEG/LP contract; only if those runtime
    checks remain clean does it run the host-only Playwright check with
    `OPEN_TRADER_SMOKE_URL="$DASHBOARD_URL"` against
    `tests/e2e/production-smoke.spec.ts`:
@@ -211,8 +212,9 @@ Use four explicit stages; a local merge is not a deployment:
    checkout, and an existing absolute shared runtime root. It runs the host
    tests and Playwright spec from the validated release root, reads the
    prediction error log from the shared runtime root, blocks browser write
-   requests before navigation, and checks the N_LEG state contract. It only
-   reads health, process/listener, log, N_LEG state, and deployed UI evidence
+   requests before navigation, and checks the selected Prediction N_LEG/LP
+   contract according to `N_LEG_PAUSED`. It only reads health, process/listener,
+   log, selected Prediction N_LEG/LP evidence, and deployed UI evidence
    and ends with `HEALTHY` or `ROLLBACK`; a browser failure sets `ROLLBACK`.
    It never starts the fixture server, downloads a browser, deploys, restarts,
    rolls back, or submits.
@@ -749,8 +751,7 @@ returns 404. Prediction runtime, database, read API, and mutation API are
 owned solely by the Service on `8769`, and all listeners must remain loopback-only.
 
 On the first install, create the preserved single-process non-Prediction fallback
-plist before cutting over to the stack. After that bootstrap, stack refreshes use
-one command:
+plist before cutting over to the stack. The first-install sequence is:
 
 ```bash
 scripts/install_dashboard_launchd.sh --dry-run
@@ -758,7 +759,60 @@ scripts/install_dashboard_launchd.sh --mode single
 scripts/install_dashboard_launchd.sh
 ```
 
-For an existing stack, run the dry-run and stack-install commands only.
+For an existing stack, run the dry-run and stack-install commands only. If the
+existing stack needs only a Gateway release, use the gateway mode instead; it
+requires the existing shared-runtime `config/prediction-route.json` and rewrites
+and restarts only Gateway:
+
+```bash
+scripts/install_dashboard_launchd.sh --dry-run \
+  --repo-root <immutable-release> \
+  --runtime-root <shared-runtime> \
+  --python <shared-runtime>/.venv/bin/python \
+  --mode gateway
+scripts/install_dashboard_launchd.sh \
+  --repo-root <immutable-release> \
+  --runtime-root <shared-runtime> \
+  --python <shared-runtime>/.venv/bin/python \
+  --mode gateway
+```
+
+Gateway-only is an independent update, not a stack migration. Unknown port
+ownership or a missing existing route state stops the installer before it writes
+the Gateway plist. Use `--mode legacy` for a Legacy-only release; use `--mode
+stack` only when Gateway and Legacy are updated together. The installer performs
+the scoped restart once, so routine manual `bootout`/`bootstrap` is unnecessary.
+
+Host Readiness and Production Smoke use `RELEASE_SERVICES`, a nonempty
+whitespace-separated list of `gateway`, `legacy`, `account`, and `prediction`.
+The default is `gateway legacy account prediction`, preserving full-stack
+compatibility. Examples include `gateway`, `legacy`, `account`, `prediction`,
+and combinations such as `gateway prediction` or `gateway legacy`. Selected
+services must use the same immutable release SHA/root; unrelated services may
+remain on older releases. Account is updated through the existing
+worker-first `install_account_release.sh` wrapper, while selected Prediction
+uses its N_LEG state check when `N_LEG_PAUSED=0` and its paused health plus LP
+dashboard contract when `N_LEG_PAUSED=1`. Readiness and Smoke keep selected service identity checks and
+the browser's read-only request guard; they never deploy or change trading
+rules.
+
+When running Smoke from an immutable clone, point Make at the shared runtime so
+the clone's missing `.venv` and `node_modules` are not used:
+
+```bash
+make production-smoke \
+  RELEASE_SERVICES='gateway prediction' \
+  REPOSITORY_ROOT=<shared-runtime> \
+  PYTHON_BIN=<shared-runtime>/.venv/bin/python \
+  PLAYWRIGHT_NODE_PATH=<shared-runtime>/node_modules \
+  EXPECTED_SHA=<accepted-sha> \
+  EXPECTED_ROOT=<immutable-release> \
+  EXPECTED_RUNTIME_ROOT=<shared-runtime>
+```
+
+Run this only after Candidate Acceptance `PASS`, Host Readiness `READY`, and
+separate deployment authorization. Confirm unaffected service PIDs and versions
+remain unchanged without treating them as updated or exact-SHA accepted.
 
 Check both jobs, listeners, health identities, the forwarded quotes API, and
 fresh startup logs:

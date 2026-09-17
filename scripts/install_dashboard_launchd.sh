@@ -14,7 +14,7 @@ CURL_BIN="${CURL_BIN:-$(command -v curl || true)}"
 WAIT_SECONDS="${DASHBOARD_LAUNCHD_WAIT_SECONDS:-30}"
 
 usage() {
-  echo "usage: $0 [--dry-run] [--mode stack|single|legacy] [--repo-root PATH] [--runtime-root PATH] [--python PATH] [--launch-agents-dir PATH] [--wait-seconds N]" >&2
+  echo "usage: $0 [--dry-run] [--mode stack|single|gateway|legacy] [--repo-root PATH] [--runtime-root PATH] [--python PATH] [--launch-agents-dir PATH] [--wait-seconds N]" >&2
 }
 
 for arg in "$@"; do
@@ -39,7 +39,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ "$MODE" == "stack" || "$MODE" == "single" || "$MODE" == "legacy" ]] || { usage; exit 2; }
+[[ "$MODE" == "stack" || "$MODE" == "single" || "$MODE" == "gateway" || "$MODE" == "legacy" ]] || { usage; exit 2; }
 
 REPO_ROOT="$(cd "$REPO_ROOT" && pwd)"
 RUNTIME_ROOT="${RUNTIME_ROOT:-$REPO_ROOT}"
@@ -67,6 +67,8 @@ LEGACY_ERR_LOG="$REPO_ROOT/logs/legacy_dashboard/launchd.err.log"
 
 if [[ "$MODE" == "single" ]]; then
   [[ -f "$SINGLE_TEMPLATE" ]] || { echo "missing launchd template: $SINGLE_TEMPLATE" >&2; exit 1; }
+elif [[ "$MODE" == "gateway" ]]; then
+  [[ -f "$GATEWAY_TEMPLATE" ]] || { echo "missing launchd template: $GATEWAY_TEMPLATE" >&2; exit 1; }
 elif [[ "$MODE" == "legacy" ]]; then
   [[ -f "$LEGACY_TEMPLATE" ]] || { echo "missing launchd template: $LEGACY_TEMPLATE" >&2; exit 1; }
 else
@@ -309,6 +311,31 @@ install_legacy() {
   echo "installed launchd agent: $LEGACY_LABEL"
 }
 
+install_gateway() {
+  local gateway_rendered
+  [[ -f "$PREDICTION_ROUTE_STATE" ]] || {
+    echo "missing prediction route state: $PREDICTION_ROUTE_STATE; run --mode stack first" >&2
+    return 1
+  }
+  "$LAUNCHCTL_BIN" print "gui/$UID/$LEGACY_LABEL" >/dev/null 2>&1 || {
+    echo "existing Legacy launchd job is not loaded: $LEGACY_LABEL" >&2
+    return 1
+  }
+  gateway_rendered="$(render_template "$GATEWAY_TEMPLATE")"
+  lint_plist "$gateway_rendered"
+  ensure_port_owned 8766 "$GATEWAY_LABEL"
+  bootout_agent "$GATEWAY_LABEL" || return 1
+  mkdir -p "$LAUNCH_AGENTS_DIR" "$REPO_ROOT/logs/frontend_gateway"
+  : > "$GATEWAY_OUT_LOG" || return 1
+  : > "$GATEWAY_ERR_LOG" || return 1
+  printf '%s\n' "$gateway_rendered" > "$GATEWAY_PLIST"
+  bootstrap_agent "$GATEWAY_PLIST" || return 1
+  wait_health "http://127.0.0.1:8766/healthz" "frontend_gateway"
+  wait_http "http://127.0.0.1:8766/"
+  echo "installed launchd agent: $GATEWAY_LABEL"
+  echo "review URL: http://127.0.0.1:8766/"
+}
+
 if [[ "$DRY_RUN" -eq 1 ]]; then
   if [[ "$MODE" == "stack" ]]; then
     gateway_rendered="$(render_template "$GATEWAY_TEMPLATE")"
@@ -317,6 +344,10 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
     lint_plist "$legacy_rendered"
     printf '===== %s =====\n%s\n' "$GATEWAY_LABEL" "$gateway_rendered"
     printf '===== %s =====\n%s\n' "$LEGACY_LABEL" "$legacy_rendered"
+  elif [[ "$MODE" == "gateway" ]]; then
+    gateway_rendered="$(render_template "$GATEWAY_TEMPLATE")"
+    lint_plist "$gateway_rendered"
+    printf '%s\n' "$gateway_rendered"
   elif [[ "$MODE" == "legacy" ]]; then
     legacy_rendered="$(render_template "$LEGACY_TEMPLATE")"
     lint_plist "$legacy_rendered"
@@ -331,6 +362,8 @@ fi
 
 if [[ "$MODE" == "single" ]]; then
   install_single
+elif [[ "$MODE" == "gateway" ]]; then
+  install_gateway
 elif [[ "$MODE" == "legacy" ]]; then
   install_legacy
 else

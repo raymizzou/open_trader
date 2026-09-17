@@ -39,6 +39,18 @@ def _write_executable(path: Path, body: str) -> None:
     path.chmod(0o755)
 
 
+def _path_bytes(path: Path) -> tuple[tuple[str, bytes], ...] | None:
+    if not path.exists():
+        return None
+    if path.is_file():
+        return ((path.name, path.read_bytes()),)
+    return tuple(
+        (str(child.relative_to(path)), child.read_bytes())
+        for child in sorted(path.rglob("*"))
+        if child.is_file()
+    )
+
+
 def _run_installer(
     tmp_path: Path,
     *,
@@ -139,7 +151,12 @@ exit 0
         """#!/bin/bash
 echo "lsof $*" >> "$FAKE_CALLS"
 case "$*" in
-  *tiTCP:8766*) [[ -n "${FAKE_8766_PID:-4101}" ]] && echo "${FAKE_8766_PID:-4101}" ;;
+  *tiTCP:8766*)
+    if [[ "${FAKE_8766_PID+x}" == x ]]; then
+      [[ -n "$FAKE_8766_PID" ]] && echo "$FAKE_8766_PID"
+    else
+      echo 4101
+    fi ;;
   *tiTCP:8767*) [[ -n "${FAKE_8767_PID:-}" ]] && echo "$FAKE_8767_PID" ;;
   *tiTCP:8768*) [[ -f "$FAKE_LISTENER_STATE_DIR/8768" ]] && cat "$FAKE_LISTENER_STATE_DIR/8768" ;;
 esac
@@ -202,18 +219,76 @@ exit 0
     )
     for label, payload in _dry_run_sections(stack_dry_run.stdout).items():
         (agents / f"{label}.plist").write_bytes(plistlib.dumps(payload))
-    if mode == "legacy":
+    if mode in ("legacy", "gateway"):
         (agents / f"{ACCOUNT_LABEL}.plist").write_bytes(
             plistlib.dumps(
                 {"Label": ACCOUNT_LABEL, "ProgramArguments": ["account-sentinel"]}
             )
         )
+    if mode == "gateway" and env_overrides.get("FAKE_MISSING_ROUTE") != "1":
+        route = runtime / "config/prediction-route.json"
+        route.parent.mkdir()
+        route.write_text(
+            '{"schema_version":"open_trader.frontend_gateway.prediction_route.v1",'
+            '"mode":"service","operation_id":"sentinel",'
+            '"updated_at":"2026-09-17T00:00:00Z"}\n',
+            encoding="utf-8",
+        )
+        sentinel_logs = (
+            repo / "logs/frontend_gateway/launchd.out.log",
+            repo / "logs/frontend_gateway/launchd.err.log",
+            repo / "logs/legacy_dashboard/launchd.out.log",
+            repo / "logs/legacy_dashboard/launchd.err.log",
+            repo / "logs/account_api/launchd.out.log",
+            repo / "logs/account_api/launchd.err.log",
+        )
+        for log in sentinel_logs:
+            log.parent.mkdir(parents=True, exist_ok=True)
+            log.write_text(f"sentinel:{log.name}\n", encoding="utf-8")
+        snapshots = tmp_path / "gateway-nontarget-snapshots"
+        snapshots.mkdir()
+        for label in (SINGLE_LABEL, LEGACY_LABEL, ACCOUNT_LABEL):
+            shutil.copy2(agents / f"{label}.plist", snapshots / f"{label}.plist")
+            shutil.copy2(state_dir / label, snapshots / label)
+        shutil.copy2(listener_state / "8768", snapshots / "port-8768")
+        for log in sentinel_logs:
+            snapshot = snapshots / log.relative_to(repo)
+            snapshot.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(log, snapshot)
+    if mode == "legacy":
         snapshots = tmp_path / "legacy-nonlegacy-snapshots"
         snapshots.mkdir()
         for label in (SINGLE_LABEL, GATEWAY_LABEL, ACCOUNT_LABEL):
             shutil.copy2(agents / f"{label}.plist", snapshots / f"{label}.plist")
             shutil.copy2(state_dir / label, snapshots / label)
         shutil.copy2(listener_state / "8768", snapshots / "port-8768")
+
+    if env_overrides.get("FAKE_GATEWAY_ABSENT") == "1":
+        (state_dir / GATEWAY_LABEL).unlink(missing_ok=True)
+    if env_overrides.get("FAKE_LEGACY_ABSENT") == "1":
+        (state_dir / LEGACY_LABEL).unlink(missing_ok=True)
+    if env_overrides.get("FAKE_UNINSTALLED") == "1":
+        for path in state_dir.iterdir():
+            path.unlink()
+        for path in agents.glob("*.plist"):
+            path.unlink()
+        shutil.rmtree(repo / "logs", ignore_errors=True)
+
+    baseline_dir = env_overrides.get("FAKE_BASELINE_DIR")
+    if baseline_dir:
+        baseline = Path(baseline_dir)
+        for relative in (
+            Path("LaunchAgents"),
+            Path("repo/logs"),
+            Path("runtime/config/prediction-route.json"),
+        ):
+            source = tmp_path / relative
+            destination = baseline / relative
+            if source.is_dir():
+                shutil.copytree(source, destination)
+            elif source.exists():
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
 
     env = {
         **os.environ,
@@ -365,6 +440,221 @@ def test_stack_dry_run_prints_two_valid_plists_without_side_effects(
     assert str(runtime / "data") in legacy_args
     assert "--prediction-config" not in legacy_args
     assert not list(agents.iterdir())
+
+
+def test_gateway_only_dry_run_has_no_side_effects(tmp_path: Path) -> None:
+    repo = tmp_path / "release"
+    (repo / "ops/launchd").mkdir(parents=True)
+    shutil.copy2(GATEWAY_TEMPLATE, repo / "ops/launchd" / GATEWAY_TEMPLATE.name)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    calls = tmp_path / "calls"
+    forbidden = tmp_path / "forbidden"
+    _write_executable(forbidden, '#!/bin/sh\nprintf x >> "$FAKE_CALLS"\nexit 99\n')
+
+    result = subprocess.run(
+        [
+            str(INSTALLER),
+            "--mode",
+            "gateway",
+            "--dry-run",
+            "--repo-root",
+            str(repo),
+            "--runtime-root",
+            str(runtime),
+            "--launch-agents-dir",
+            str(agents),
+            "--python",
+            str(repo / ".venv/bin/python"),
+        ],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "FAKE_CALLS": str(calls),
+            "LAUNCHCTL_BIN": str(forbidden),
+            "LSOF_BIN": str(forbidden),
+            "CURL_BIN": str(forbidden),
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    payload = plistlib.loads(result.stdout.encode("utf-8"))
+    assert payload["Label"] == GATEWAY_LABEL
+    assert payload["WorkingDirectory"] == str(repo)
+    args = payload["ProgramArguments"]
+    assert args[args.index("-m") : args.index("-m") + 3] == [
+        "-m",
+        "open_trader",
+        "frontend-gateway",
+    ]
+    assert str(runtime / "config/prediction-route.json") in args
+    assert str(repo / "src/open_trader/dashboard_static") in args
+    assert payload["EnvironmentVariables"]["PYTHONPATH"] == str(repo / "src")
+    assert not list(agents.iterdir())
+    assert not list(runtime.iterdir())
+    assert not (repo / "logs").exists()
+    assert not calls.exists()
+
+
+@pytest.mark.parametrize("free_port", (False, True))
+def test_gateway_only_preserves_other_services_and_route(
+    tmp_path: Path, free_port: bool
+) -> None:
+    env_overrides = (
+        {"FAKE_8766_PID": "", "FAKE_GATEWAY_ABSENT": "1"}
+        if free_port
+        else {"FAKE_8766_PID": "4102"}
+    )
+    result, calls, agents = _run_installer(
+        tmp_path,
+        mode="gateway",
+        **env_overrides,
+    )
+    domain = f"gui/{os.getuid()}"
+    snapshots = tmp_path / "gateway-nontarget-snapshots"
+    repo = tmp_path / "repo"
+    runtime = tmp_path / "runtime"
+
+    assert result.returncode == 0, result.stderr
+    gateway = plistlib.loads((agents / f"{GATEWAY_LABEL}.plist").read_bytes())
+    assert gateway["WorkingDirectory"] == str(repo)
+    assert gateway["EnvironmentVariables"]["PYTHONPATH"] == str(repo / "src")
+    gateway_args = gateway["ProgramArguments"]
+    assert str(repo / "src/open_trader/dashboard_static") in gateway_args
+    assert str(runtime / "config/prediction-route.json") in gateway_args
+    assert (runtime / "config/prediction-route.json").read_text(encoding="utf-8").endswith(
+        '"updated_at":"2026-09-17T00:00:00Z"}\n'
+    )
+    assert [
+        call
+        for call in calls
+        if any(word in call for word in (" bootout ", " bootstrap ", " kickstart"))
+    ] == [
+        f"launchctl bootout {domain}/{GATEWAY_LABEL}",
+        f"launchctl bootstrap {domain} {agents / f'{GATEWAY_LABEL}.plist'}",
+    ]
+    assert not any(
+        label in call
+        and call != f"launchctl print {domain}/{LEGACY_LABEL}"
+        for call in calls
+        for label in (SINGLE_LABEL, LEGACY_LABEL, ACCOUNT_LABEL)
+    )
+    assert not any("8767" in call or "8768" in call for call in calls)
+    assert (tmp_path / "listener-state/8768").read_bytes() == (
+        snapshots / "port-8768"
+    ).read_bytes()
+    for label in (SINGLE_LABEL, LEGACY_LABEL, ACCOUNT_LABEL):
+        assert (agents / f"{label}.plist").read_bytes() == (
+            snapshots / f"{label}.plist"
+        ).read_bytes()
+        assert (tmp_path / "launchd-state" / label).read_bytes() == (
+            snapshots / label
+        ).read_bytes()
+    for log in (
+        "legacy_dashboard/launchd.out.log",
+        "legacy_dashboard/launchd.err.log",
+        "account_api/launchd.out.log",
+        "account_api/launchd.err.log",
+    ):
+        assert (repo / "logs" / log).read_bytes() == (
+            snapshots / "logs" / log
+        ).read_bytes()
+
+
+@pytest.mark.parametrize("stack_state", ("single-fallback", "uninstalled"))
+def test_gateway_only_rejects_stale_route_without_existing_stack(
+    tmp_path: Path, stack_state: str
+) -> None:
+    baseline = tmp_path / "stale-route-baseline"
+    env_overrides = {
+        "FAKE_8766_PID": "",
+        "FAKE_GATEWAY_ABSENT": "1",
+        "FAKE_LEGACY_ABSENT": "1",
+        "FAKE_BASELINE_DIR": str(baseline),
+    }
+    if stack_state == "uninstalled":
+        env_overrides["FAKE_UNINSTALLED"] = "1"
+    result, calls, _ = _run_installer(
+        tmp_path,
+        mode="gateway",
+        **env_overrides,
+    )
+
+    assert result.returncode == 1
+    assert "existing Legacy launchd job" in result.stderr
+    assert not any(
+        any(word in call for word in (" bootout ", " bootstrap ", " kickstart"))
+        for call in calls
+    )
+    assert not any(call.startswith("curl ") for call in calls)
+    for relative in (
+        Path("LaunchAgents"),
+        Path("repo/logs"),
+        Path("runtime/config/prediction-route.json"),
+    ):
+        assert _path_bytes(tmp_path / relative) == _path_bytes(baseline / relative)
+
+
+def test_gateway_only_requires_existing_prediction_route_before_mutation(
+    tmp_path: Path,
+) -> None:
+    result, calls, agents = _run_installer(
+        tmp_path,
+        mode="gateway",
+        FAKE_MISSING_ROUTE="1",
+        FAKE_8766_PID="4102",
+    )
+
+    assert result.returncode == 1
+    assert "missing prediction route state" in result.stderr
+    assert not any(
+        any(word in call for word in (" bootout ", " bootstrap ", " kickstart"))
+        for call in calls
+    )
+    assert not any(call.startswith("curl ") for call in calls)
+
+
+def test_gateway_only_rejects_stuck_gateway_before_bootstrap(tmp_path: Path) -> None:
+    baseline = tmp_path / "stuck-gateway-baseline"
+    result, calls, _ = _run_installer(
+        tmp_path,
+        mode="gateway",
+        FAKE_8766_PID="4102",
+        FAKE_STUCK_LABEL=GATEWAY_LABEL,
+        FAKE_BASELINE_DIR=str(baseline),
+    )
+
+    assert result.returncode == 1
+    assert f"launchd job is still loaded: {GATEWAY_LABEL}" in result.stderr
+    assert not any(" bootstrap " in call for call in calls)
+    assert not any(call.startswith("curl ") for call in calls)
+    assert _path_bytes(
+        tmp_path / "LaunchAgents" / f"{GATEWAY_LABEL}.plist"
+    ) == _path_bytes(baseline / "LaunchAgents" / f"{GATEWAY_LABEL}.plist")
+    for log in ("launchd.out.log", "launchd.err.log"):
+        current = tmp_path / "repo/logs/frontend_gateway" / log
+        expected = baseline / "repo/logs/frontend_gateway" / log
+        assert _path_bytes(current) == _path_bytes(expected)
+
+
+def test_gateway_only_rejects_unknown_listener_before_mutation(tmp_path: Path) -> None:
+    result, calls, _ = _run_installer(
+        tmp_path,
+        mode="gateway",
+        FAKE_8766_PID="9999",
+    )
+
+    assert result.returncode == 1
+    assert "port 8766 is occupied by an unknown process (pid 9999)" in result.stderr
+    assert not any(
+        any(word in call for word in (" bootout ", " bootstrap ", " kickstart"))
+        for call in calls
+    )
+    assert not any(call.startswith("curl ") for call in calls)
 
 
 def test_legacy_only_preserves_gateway_and_single_without_prediction_flags(

@@ -24,6 +24,15 @@
 - `scripts/uninstall_dashboard_launchd.sh` 才是完整卸载，会幂等移除三个已知 job；
   卸载不会启动回滚服务。
 
+默认的 `--mode stack` 仍用于首次安装以及同时更新 Gateway 和 Legacy。已有 stack
+只更新 Gateway 时使用 `--mode gateway`；真实安装要求共享运行时中的既有
+`config/prediction-route.json`，并以只读 `launchctl print` 确认已知的 Legacy job 已加载；
+只重写并重启 Gateway，保留 Legacy、Account、Prediction
+的 plist、PID、日志和 route state。它不是 stack migration。只更新 Legacy 使用
+`--mode legacy`。Host Readiness/Production Smoke 用 `RELEASE_SERVICES` 选择同一范围：
+默认 `gateway legacy account prediction`，也支持单个服务和空格组合；选中的服务绑定
+同一个 release SHA/root，未选中的服务可以继续运行较旧版本。
+
 当前部署绑定 loopback，云端公开访问还需要后续的进程监管和入口层设计；不要直接把 `8767` 暴露到公网。
 
 Prediction 运行时的当前边界固定如下：
@@ -66,6 +75,27 @@ scripts/install_dashboard_launchd.sh --mode single
 ```bash
 scripts/install_dashboard_launchd.sh
 ```
+
+已有 stack 只更新 Gateway 时，先做单服务 dry-run，再执行同一个 mode 的正式安装：
+
+```bash
+scripts/install_dashboard_launchd.sh --dry-run \
+  --repo-root <新发布> \
+  --runtime-root <运行时根> \
+  --python <运行时根>/.venv/bin/python \
+  --mode gateway
+scripts/install_dashboard_launchd.sh \
+  --repo-root <新发布> \
+  --runtime-root <运行时根> \
+  --python <运行时根>/.venv/bin/python \
+  --mode gateway
+```
+
+Gateway-only 会先只读检查已加载的 Legacy job、既有 route state 和 `8766` 的占用者；任一
+前置检查失败时，安装器会在写入/启动前拒绝操作。它确认 Gateway bootout 完成且 job 已
+退出后，才替换 Gateway plist、清空 Gateway 日志并启动 Gateway。Gateway readiness 在启动
+后失败时只报告失败并停止该切换流程，不会自动 bootstrap 单进程或宣称回滚成功。安装器
+本身完成一次范围内的 bootout/bootstrap；无需例行手工重复这些操作。
 
 完整卸载三个固定 label（重复运行安全）：
 
@@ -281,20 +311,38 @@ Service health 必须匹配当前隔离模式（shadow）或生产模式（produ
 
 ## 生产验收与 exact-SHA 交付
 
-所有文档和 CHANGELOG 先提交，随后冻结候选 SHA。最终顺序固定为：
+先运行本次改动的 focused Docker tests；Candidate Acceptance 已负责完整 backend
+coverage，发布前无需再紧邻它运行一次完整 `make test`。`make acceptance` 是该
+Candidate gate 的别名，不是第二个 gate。随后冻结候选 SHA，并在获得单独明确的部署授权
+后，按 `RELEASE_SERVICES` 选择的范围运行现有 installer 和 Smoke。
 
-1. 运行 Gateway、launchd stack 和双运行时 acceptance 聚焦测试；
-2. 运行完整 pytest suite；
-3. 从候选 worktree 部署 Gateway、Legacy Dashboard、Prediction Service 及 acceptance
-   依赖的后台进程；
-4. 直接验证三个 launchd job（Gateway、Legacy、Prediction Service）、三个 listener
-   （8766、8767、8769）、三个 health identity 和一条经 `8766` 转发的 `/api/quotes` 请求；
-5. 运行一次最终 `make acceptance`；
-6. 仅在 `PASS` 后重新部署完全相同的 accepted SHA；
-7. 核对三个新 PID、cwd、SHA、source state、启动时间、新鲜 runtime 日志及
-   `http://127.0.0.1:8766/` HTTP 200；确认 8769 `/healthz` 为
-   `mode=production`、`production_owner=true`，并确认 Gateway Prediction state 经
-   8766 返回 200。
+例如，Gateway-only 使用 `RELEASE_SERVICES=gateway` 和
+`scripts/install_dashboard_launchd.sh --mode gateway`；Prediction-only 使用
+`RELEASE_SERVICES=prediction` 和 Prediction Service installer；Account 使用
+`RELEASE_SERVICES=account` 及现有 `install_account_release.sh` 的 worker-first wrapper；
+Legacy 使用 `RELEASE_SERVICES=legacy` 和 `--mode legacy`；`gateway legacy` 使用
+`--mode stack`，其他组合按各服务的现有 installer 组合执行。选中的服务都必须来自同一个
+clean immutable `<SHA>/<新发布>`，未选中的服务可以继续运行旧 release。
+
+Smoke 只检查选定服务的 health、PID/listener、代码 root 和日志，同时保留所有 scope 的
+浏览器只读写入护栏；选中 Prediction 且 `N_LEG_PAUSED=0` 时检查 N_LEG 状态契约，暂停模式
+检查暂停 health 和可读的 LP dashboard 并跳过 state 请求。运维应确认未选中服务的
+PID/版本仍未变化，但不要把它们标记为本次已更新或 exact-SHA 已验收。每个 installer
+完成范围内一次 restart；不要例行追加手工 bootout/bootstrap 或 deploy-accept-redeploy
+循环。
+
+从独立 detached release 运行 Smoke 时，把 Makefile 的运行时路径显式指向共享运行时根：
+
+```bash
+make production-smoke \
+  RELEASE_SERVICES='gateway prediction' \
+  REPOSITORY_ROOT=/absolute/path/to/shared-runtime \
+  PYTHON_BIN=/absolute/path/to/shared-runtime/.venv/bin/python \
+  PLAYWRIGHT_NODE_PATH=/absolute/path/to/shared-runtime/node_modules \
+  EXPECTED_SHA=<SHA> \
+  EXPECTED_ROOT=<新发布> \
+  EXPECTED_RUNTIME_ROOT=/absolute/path/to/shared-runtime
+```
 
 `FAIL` 必须修复并从候选验证重新开始；`BLOCKED` 必须报告实际外部或浏览器
 阻塞，不能用 curl、fixture、mock 或单元测试替代。exact-SHA 重启未改变源码或

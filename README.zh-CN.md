@@ -600,20 +600,41 @@ Chrome 回归用例由 macOS Smoke 的 `-m browser` 阶段负责。
 端口、存储、连接性和缓存 Chromium 先决条件，并输出 `READY` 或 `BLOCKED`。本地 `main` 的
 `--ff-only` 合并不是部署，也不能用 curl 或单元测试替代这些阶段。
 
+Host Readiness 和 Production Smoke 通过 `RELEASE_SERVICES` 选择发布范围，值必须是非空的
+空格分隔列表：`gateway`、`legacy`、`account`、`prediction`，默认值为
+`gateway legacy account prediction` 以保持全栈兼容。可以分别选择 `gateway`、`legacy`、
+`account`、`prediction`，也可以选择 `gateway prediction`、`gateway legacy` 等组合。选定
+服务必须来自同一个 immutable SHA/root；未选定服务可以继续运行较旧版本，运维应确认其
+PID/版本未变化，但不要把它们标记为本次已更新或 exact-SHA 已验收。
+
+Gateway-only 使用现有
+`scripts/install_dashboard_launchd.sh --mode gateway`，要求共享运行时中已有的
+`config/prediction-route.json`，只重启 Gateway；Gateway 和 Legacy 一起更新才使用
+`--mode stack`，Legacy-only 使用 `--mode legacy`。Account 使用现有
+`install_account_release.sh` worker-first wrapper，Prediction 使用现有 Prediction Service
+installer。installer 会完成范围内一次重启，不需要例行重复 `bootout`/`bootstrap`；Make
+目标不会执行安装或部署，也不改变交易规则。
+
 第一次部署前，生产必须由人工一次性迁移到 clean、immutable 的 detached release
 checkout；该迁移不是本任务或任何 Make 目标执行的动作。明确授权后只部署
 Candidate 通过的精确 SHA，再执行：
 
 ```bash
 make production-smoke \
+  RELEASE_SERVICES='gateway prediction' \
+  REPOSITORY_ROOT=/absolute/path/to/shared-runtime \
+  PYTHON_BIN=/absolute/path/to/shared-runtime/.venv/bin/python \
+  PLAYWRIGHT_NODE_PATH=/absolute/path/to/shared-runtime/node_modules \
   EXPECTED_SHA="$ACCEPTED_SHA" \
   EXPECTED_ROOT=/absolute/path/to/immutable-detached-release \
   EXPECTED_RUNTIME_ROOT=/absolute/path/to/shared-runtime
 ```
 
-Production Smoke 要求已存在的绝对路径 shared runtime root；host 测试和 Playwright 从验证过的
-release root 运行，prediction 错误日志从 shared runtime root 读取，浏览器写请求会在导航前被阻断，
-并检查 N_LEG 状态契约。它只读取 health、进程/监听器、日志、N_LEG 状态和已部署 UI 证据，最后
+Production Smoke 只检查 `RELEASE_SERVICES` 选定服务的 health、进程/监听器、代码 root 和
+日志；要求已存在的绝对路径 shared runtime root；host 测试和 Playwright 从验证过的
+release root 运行，prediction 错误日志从 shared runtime root 读取，浏览器写请求会在导航前被阻断；选中
+`prediction` 且 `N_LEG_PAUSED=0` 时检查 N_LEG 状态契约，`N_LEG_PAUSED=1` 时检查暂停 health
+和可读的 LP dashboard 并跳过 state 请求。它只读取 health、进程/监听器、日志和已部署 UI 证据，最后
 输出 `HEALTHY` 或 `ROLLBACK`；它不会部署、重启、回滚或下单。
 
 也可以用结构化检查确认 API 和 SOXX 决策事实是否存在：

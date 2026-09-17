@@ -26,6 +26,16 @@ operator-facing: what changed, which workflow is affected, and what was verified
   remain `403 shadow_read_only`. Verified the focused repair and related
   prediction-service regression (`113 passed`); no live calls, orders or
   deployment were performed.
+- Added scoped release selection to Host Readiness and Production Smoke, with
+  exact SHA/root/process checks for selected services and older releases allowed
+  to remain on unrelated services. Added `--mode gateway` for an existing stack;
+  it updates only the Gateway, requires the existing prediction route state and
+  a read-only check that the exact Legacy launchd job is loaded, and leaves the
+  Gateway plist/logs untouched when Gateway bootout cannot complete. Account
+  remains a worker-first release unit and the browser/N_LEG protections remain
+  active. Focused mocked Docker coverage passes; no live deployment was
+  performed. The LP home regression clock is pinned to fixture time so
+  acceptance is independent of calendar-date rollover.
 
 ## 2026-09-17
 

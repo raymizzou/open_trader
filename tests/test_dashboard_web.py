@@ -5514,6 +5514,7 @@ globalThis.window = {
   clearTimeout(id) { timeouts.delete(id); },
 };
 globalThis.AbortController = class { constructor(){this.signal={};} abort(){} };
+Date.now = () => Date.parse("2026-09-15T04:00:00Z");
 const venues = {
   csrf_token: "csrf-from-venues",
   n_leg: {status:"running",code:"N_LEG_RUNNING"},

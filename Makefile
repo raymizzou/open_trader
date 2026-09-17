@@ -24,6 +24,7 @@ N_LEG_PAUSED ?= 0
 
 PREDICTION_CONFIG ?= $(REPOSITORY_ROOT)/config/prediction_arbitrage.json
 DAILY_CONFIG ?= $(REPOSITORY_ROOT)/config/daily_premarket.env
+RELEASE_SERVICES ?= gateway legacy account prediction
 
 test:
 	$(DOCKER_BUILD)
@@ -74,25 +75,50 @@ acceptance: candidate-acceptance
 
 host-readiness:
 	@set -u; \
+	services='$(strip $(RELEASE_SERVICES))'; \
+	set -f; \
+	if [ -z "$$services" ]; then echo "RELEASE_SERVICES must name one or more of: gateway legacy account prediction" >&2; echo BLOCKED; exit 2; fi; \
+	set -- $$services; \
+	gateway_selected=0; legacy_selected=0; account_selected=0; prediction_selected=0; \
+	for service in "$$@"; do case "$$service" in gateway) gateway_selected=1 ;; legacy) legacy_selected=1 ;; account) account_selected=1 ;; prediction) prediction_selected=1 ;; *) echo "unknown RELEASE_SERVICES entry: $$service" >&2; echo BLOCKED; exit 2 ;; esac; done; \
 	status=0; \
 	check() { label="$$1"; shift; if "$$@" >/dev/null 2>&1; then echo "$$label: PASS"; else echo "$$label: BLOCKED"; status=1; fi; }; \
-	check "account launchd dry-run" "$(WORKTREE_ROOT)/scripts/install_account_release.sh" --dry-run --repo-root "$(WORKTREE_ROOT)" --runtime-root "$(REPOSITORY_ROOT)" --python "$(PYTHON_BIN)"; \
-	check "dashboard launchd dry-run" "$(WORKTREE_ROOT)/scripts/install_dashboard_launchd.sh" --dry-run --mode stack --repo-root "$(WORKTREE_ROOT)" --runtime-root "$(REPOSITORY_ROOT)"; \
-	check "trend launchd dry-run" "$(WORKTREE_ROOT)/scripts/install_daily_premarket_launchd.sh" --dry-run --trend-only --market all --config "$(DAILY_CONFIG)"; \
+	if [ $$gateway_selected -eq 1 ]; then \
+		if [ $$legacy_selected -eq 1 ]; then \
+			check "dashboard launchd dry-run" "$(WORKTREE_ROOT)/scripts/install_dashboard_launchd.sh" --dry-run --mode stack --repo-root "$(WORKTREE_ROOT)" --runtime-root "$(REPOSITORY_ROOT)"; \
+		else \
+			check "gateway launchd dry-run" "$(WORKTREE_ROOT)/scripts/install_dashboard_launchd.sh" --dry-run --mode gateway --repo-root "$(WORKTREE_ROOT)" --runtime-root "$(REPOSITORY_ROOT)"; \
+		fi; \
+	elif [ $$legacy_selected -eq 1 ]; then \
+		check "legacy launchd dry-run" "$(WORKTREE_ROOT)/scripts/install_dashboard_launchd.sh" --dry-run --mode legacy --repo-root "$(WORKTREE_ROOT)" --runtime-root "$(REPOSITORY_ROOT)"; \
+	fi; \
+	if [ $$account_selected -eq 1 ]; then \
+		check "account launchd dry-run" "$(WORKTREE_ROOT)/scripts/install_account_release.sh" --dry-run --repo-root "$(WORKTREE_ROOT)" --runtime-root "$(REPOSITORY_ROOT)" --python "$(PYTHON_BIN)"; \
+	fi; \
+	if [ $$legacy_selected -eq 1 ]; then \
+		check "trend launchd dry-run" "$(WORKTREE_ROOT)/scripts/install_daily_premarket_launchd.sh" --dry-run --trend-only --market all --config "$(DAILY_CONFIG)"; \
+	fi; \
 	nleg_replay_passes() { \
 		"$(PYTHON_BIN)" -m open_trader prediction-arb nleg-validate \
 			--replay "$(REPOSITORY_ROOT)/tests/fixtures/prediction_n_leg_validation_frozen_n3.json" \
 			--live-catalog /dev/null 2>/dev/null \
 			| "$(PYTHON_BIN)" -c 'import json,sys; p=json.load(sys.stdin); ok=(p.get("replay") or {}).get("status")=="PASS" and (p.get("live") or {}).get("reason")=="LIVE_CATALOG_UNAVAILABLE"; raise SystemExit(0 if ok else 1)'; \
 	}; \
-	check "account status" "$(PYTHON_BIN)" -m open_trader account-sync-status --account-url "$(ACCOUNT_API_URL)" --json; \
-	check "prediction wallet" "$(PYTHON_BIN)" -m open_trader prediction-arb wallet status --config "$(PREDICTION_CONFIG)"; \
-	if nleg_replay_passes >/dev/null 2>&1; then echo "prediction n-leg replay validation: PASS"; else echo "prediction n-leg replay validation: BLOCKED"; status=1; fi; \
+	if [ $$account_selected -eq 1 ]; then check "account status" "$(PYTHON_BIN)" -m open_trader account-sync-status --account-url "$(ACCOUNT_API_URL)" --json; fi; \
+	if [ $$prediction_selected -eq 1 ]; then \
+		check "prediction wallet" "$(PYTHON_BIN)" -m open_trader prediction-arb wallet status --config "$(PREDICTION_CONFIG)"; \
+		if nleg_replay_passes >/dev/null 2>&1; then echo "prediction n-leg replay validation: PASS"; else echo "prediction n-leg replay validation: BLOCKED"; status=1; fi; \
+	fi; \
 	check "Python Playwright Chrome" "$(PYTHON_BIN)" -c 'from playwright.sync_api import sync_playwright; p = sync_playwright().start(); browser = p.chromium.launch(channel="chrome", headless=True); browser.close(); p.stop()'; \
 	if [ -x "$(REPOSITORY_ROOT)/node_modules/.bin/playwright" ] && (cd "$(WORKTREE_ROOT)" && NODE_PATH="$(PLAYWRIGHT_NODE_PATH)" node -e 'const {chromium}=require("playwright"); (async()=>{const browser=await chromium.launch({headless:true}); await browser.close();})().catch(()=>process.exit(1));' && NODE_PATH="$(PLAYWRIGHT_NODE_PATH)" OPEN_TRADER_SMOKE_URL="$(DASHBOARD_URL)" "$(REPOSITORY_ROOT)/node_modules/.bin/playwright" test tests/e2e/production-smoke.spec.ts --config=playwright.config.ts --project=chromium --list) >/dev/null 2>&1; then echo "Playwright Chromium: PASS"; else echo "Playwright Chromium: BLOCKED"; status=1; fi; \
-	check "loopback listeners" sh -c 'command -v lsof >/dev/null && for port in 8766 8767 8768 8769; do lsof -nP -iTCP:$$port -sTCP:LISTEN >/dev/null; done'; \
+	listener_ports=""; \
+	if [ $$gateway_selected -eq 1 ]; then listener_ports="$$listener_ports 8766"; fi; \
+	if [ $$legacy_selected -eq 1 ]; then listener_ports="$$listener_ports 8767"; fi; \
+	if [ $$account_selected -eq 1 ]; then listener_ports="$$listener_ports 8768"; fi; \
+	if [ $$prediction_selected -eq 1 ]; then listener_ports="$$listener_ports 8769"; fi; \
+	check "loopback listeners" sh -c 'command -v lsof >/dev/null && for port do lsof -nP -iTCP:"$$port" -sTCP:LISTEN >/dev/null || exit 1; done' sh $$listener_ports; \
 	check "storage" df -P "$(REPOSITORY_ROOT)"; \
-	check "Futu connectivity" "$(PYTHON_BIN)" -c 'import socket; s = socket.create_connection(("127.0.0.1", 11111), 2); s.close()'; \
+	if [ $$legacy_selected -eq 1 ]; then check "Futu connectivity" "$(PYTHON_BIN)" -c 'import socket; s = socket.create_connection(("127.0.0.1", 11111), 2); s.close()'; fi; \
 	if [ $$status -eq 0 ]; then echo READY; else echo BLOCKED; exit 2; fi
 
 # This target asserts the POST-#60-cutover world (reader fence 2): it is the
@@ -101,6 +127,12 @@ host-readiness:
 # mutation set; state assertions below pin the N_LEG contract generation.
 production-smoke:
 	@set -u; \
+	services='$(strip $(RELEASE_SERVICES))'; \
+	set -f; \
+	if [ -z "$$services" ]; then echo "RELEASE_SERVICES must name one or more of: gateway legacy account prediction" >&2; echo ROLLBACK; exit 2; fi; \
+	set -- $$services; \
+	gateway_selected=0; legacy_selected=0; account_selected=0; prediction_selected=0; \
+	for service in "$$@"; do case "$$service" in gateway) gateway_selected=1 ;; legacy) legacy_selected=1 ;; account) account_selected=1 ;; prediction) prediction_selected=1 ;; *) echo "unknown RELEASE_SERVICES entry: $$service" >&2; echo ROLLBACK; exit 2 ;; esac; done; \
 	status=0; \
 	prediction_n_leg_status=""; prediction_n_leg_code=""; \
 	expected_sha='$(EXPECTED_SHA)'; expected_root='$(EXPECTED_ROOT)'; expected_runtime_root='$(EXPECTED_RUNTIME_ROOT)'; expected_n_leg_paused='$(N_LEG_PAUSED)'; \
@@ -121,27 +153,32 @@ production-smoke:
 			echo "Python browser prerequisite: BLOCKED"; echo ROLLBACK; exit 1; \
 		fi; \
 	fi; \
-	check_health "gateway health" gateway "$(DASHBOARD_URL)"; gateway_pid="$$health_pid"; \
-	check_health "legacy health" legacy "$(LEGACY_DASHBOARD_URL)"; legacy_pid="$$health_pid"; \
-	check_health "account health" account "$(ACCOUNT_API_URL)"; account_pid="$$health_pid"; \
-	check_health "prediction health" prediction "http://127.0.0.1:8769"; prediction_pid="$$health_pid"; \
-	if [ "$$expected_n_leg_paused" = 0 ]; then \
-		if [ "$$prediction_n_leg_status" = running ] && [ "$$prediction_n_leg_code" = N_LEG_RUNNING ]; then echo "n-leg state: RUNNING"; else echo "n-leg state: BLOCKED"; status=1; fi; \
-	fi; \
+	gateway_pid=""; legacy_pid=""; account_pid=""; prediction_pid=""; \
+	if [ $$gateway_selected -eq 1 ]; then check_health "gateway health" gateway "$(DASHBOARD_URL)"; gateway_pid="$$health_pid"; fi; \
+	if [ $$legacy_selected -eq 1 ]; then check_health "legacy health" legacy "$(LEGACY_DASHBOARD_URL)"; legacy_pid="$$health_pid"; fi; \
+	if [ $$account_selected -eq 1 ]; then check_health "account health" account "$(ACCOUNT_API_URL)"; account_pid="$$health_pid"; fi; \
+	if [ $$prediction_selected -eq 1 ]; then check_health "prediction health" prediction "http://127.0.0.1:8769"; prediction_pid="$$health_pid"; fi; \
 	check_process() { name="$$1"; port="$$2"; pid="$$3"; listener="$$(lsof -nP -tiTCP:"$$port" -sTCP:LISTEN 2>/dev/null | awk 'NF {print; count++} END {if (count != 1) exit 1}')" || listener=""; cwd="$$(lsof -a -p "$$pid" -d cwd -Fn 2>/dev/null | awk '/^n/ {print substr($$0,2); exit}')"; if [ -n "$$pid" ] && [ "$$listener" = "$$pid" ] && [ "$$cwd" = "$$expected_root" ] && ps -p "$$pid" -o pid=,lstart=,command= >/dev/null 2>&1; then echo "$$name: PASS pid=$$pid"; else echo "$$name: BLOCKED"; status=1; fi; }; \
-	check_process "gateway process/listener" 8766 "$$gateway_pid"; \
-	check_process "legacy process/listener" 8767 "$$legacy_pid"; \
-	check_process "account process/listener" 8768 "$$account_pid"; \
-	check_process "prediction process/listener" 8769 "$$prediction_pid"; \
-	if [ "$$expected_n_leg_paused" = 1 ]; then \
-		if [ "$$prediction_n_leg_status" = paused ] && [ "$$prediction_n_leg_code" = N_LEG_PAUSED ]; then echo "n-leg state: PAUSED"; else echo "n-leg state: BLOCKED"; status=1; fi; \
-		lp_payload="$$(curl -fsS --max-time 10 "http://127.0.0.1:8769/api/prediction-arbitrage/lp/dashboard" 2>/dev/null || true)"; \
-		if printf '%s' "$$lp_payload" | "$(PYTHON_BIN)" -c 'import json,sys; p=json.load(sys.stdin); ok=(isinstance(p,dict) and p.get("state")=="ready" and isinstance(p.get("orders"),list) and isinstance(p.get("positions"),list) and isinstance(p.get("recommendations"),list)); raise SystemExit(0 if ok else 1)' >/dev/null 2>&1; then echo "lp dashboard: PASS"; else echo "lp dashboard: BLOCKED"; status=1; fi; \
-	else \
-		state_payload="$$(curl -fsS --max-time 10 "http://127.0.0.1:8769/api/prediction-arbitrage/state" 2>/dev/null || true)"; \
-		if printf '%s' "$$state_payload" | "$(PYTHON_BIN)" -c 'import json,sys; p=json.load(sys.stdin); n_leg=p.get("n_leg") or {}; scopes=n_leg.get("execution_scopes") or {}; scope=scopes.get("SAME_EVENT_SAME_VENUE") or {}; rows=p.get("opportunities") or []; ok=(n_leg.get("contract_generation")==2 and n_leg.get("mode")=="MANUAL" and scope.get("capability")=="OBSERVE_ONLY" and all(row.get("engine_owner")=="N_LEG" for row in rows if isinstance(row,dict))); raise SystemExit(0 if ok else 1)' >/dev/null 2>&1; then echo "n-leg state: PASS"; else echo "n-leg state: BLOCKED"; status=1; fi; \
+	if [ $$gateway_selected -eq 1 ]; then check_process "gateway process/listener" 8766 "$$gateway_pid"; fi; \
+	if [ $$legacy_selected -eq 1 ]; then check_process "legacy process/listener" 8767 "$$legacy_pid"; fi; \
+	if [ $$account_selected -eq 1 ]; then check_process "account process/listener" 8768 "$$account_pid"; fi; \
+	if [ $$prediction_selected -eq 1 ]; then check_process "prediction process/listener" 8769 "$$prediction_pid"; fi; \
+	if [ $$prediction_selected -eq 1 ]; then \
+		if [ "$$expected_n_leg_paused" = 1 ]; then \
+			if [ "$$prediction_n_leg_status" = paused ] && [ "$$prediction_n_leg_code" = N_LEG_PAUSED ]; then echo "n-leg state: PAUSED"; else echo "n-leg state: BLOCKED"; status=1; fi; \
+			lp_payload="$$(curl -fsS --max-time 10 "http://127.0.0.1:8769/api/prediction-arbitrage/lp/dashboard" 2>/dev/null || true)"; \
+			if printf '%s' "$$lp_payload" | "$(PYTHON_BIN)" -c 'import json,sys; p=json.load(sys.stdin); ok=(isinstance(p,dict) and p.get("state")=="ready" and isinstance(p.get("orders"),list) and isinstance(p.get("positions"),list) and isinstance(p.get("recommendations"),list)); raise SystemExit(0 if ok else 1)' >/dev/null 2>&1; then echo "lp dashboard: PASS"; else echo "lp dashboard: BLOCKED"; status=1; fi; \
+		else \
+			if [ "$$prediction_n_leg_status" = running ] && [ "$$prediction_n_leg_code" = N_LEG_RUNNING ]; then echo "n-leg state: RUNNING"; else echo "n-leg state: BLOCKED"; status=1; fi; \
+			state_payload="$$(curl -fsS --max-time 10 "http://127.0.0.1:8769/api/prediction-arbitrage/state" 2>/dev/null || true)"; \
+			if printf '%s' "$$state_payload" | "$(PYTHON_BIN)" -c 'import json,sys; p=json.load(sys.stdin); n_leg=p.get("n_leg") or {}; scopes=n_leg.get("execution_scopes") or {}; scope=scopes.get("SAME_EVENT_SAME_VENUE") or {}; rows=p.get("opportunities") or []; ok=(n_leg.get("contract_generation")==2 and n_leg.get("mode")=="MANUAL" and scope.get("capability")=="OBSERVE_ONLY" and all(row.get("engine_owner")=="N_LEG" for row in rows if isinstance(row,dict))); raise SystemExit(0 if ok else 1)' >/dev/null 2>&1; then echo "n-leg state: PASS"; else echo "n-leg state: BLOCKED"; status=1; fi; \
+		fi; \
 	fi; \
-	for log in "$$expected_root/logs/frontend_gateway/launchd.err.log" "$$expected_root/logs/legacy_dashboard/launchd.err.log" "$$expected_root/logs/account_api/launchd.err.log" "$$expected_runtime_root/logs/prediction_service/launchd.err.log"; do if [ ! -f "$$log" ]; then echo "log missing: $$log"; status=1; elif tail -n 200 "$$log" | rg -qi 'traceback|fatal|exception|error'; then echo "log error: $$log"; status=1; else echo "log clean: $$log"; fi; done; \
+	check_log() { log="$$1"; if [ ! -f "$$log" ]; then echo "log missing: $$log"; status=1; elif tail -n 200 "$$log" | rg -qi 'traceback|fatal|exception|error'; then echo "log error: $$log"; status=1; else echo "log clean: $$log"; fi; }; \
+	if [ $$gateway_selected -eq 1 ]; then check_log "$$expected_root/logs/frontend_gateway/launchd.err.log"; fi; \
+	if [ $$legacy_selected -eq 1 ]; then check_log "$$expected_root/logs/legacy_dashboard/launchd.err.log"; fi; \
+	if [ $$account_selected -eq 1 ]; then check_log "$$expected_root/logs/account_api/launchd.err.log"; fi; \
+	if [ $$prediction_selected -eq 1 ]; then check_log "$$expected_runtime_root/logs/prediction_service/launchd.err.log"; fi; \
 	if [ $$status -eq 0 ]; then \
 		if (cd "$$expected_root" && NODE_PATH="$(PLAYWRIGHT_NODE_PATH)" OPEN_TRADER_SMOKE_URL="$(DASHBOARD_URL)" "$(REPOSITORY_ROOT)/node_modules/.bin/playwright" test tests/e2e/production-smoke.spec.ts --config=playwright.config.ts --project=chromium); then echo "browser smoke: PASS"; else echo "browser smoke: BLOCKED"; status=1; fi; \
 	fi; \
