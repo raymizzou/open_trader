@@ -30,7 +30,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
   `test_lp_runtime_stops_obsolete_sampling_and_keeps_exposure_risk`
   (introduced by a5a7afe4) with the real clock, because the 60-second
   account-snapshot freshness window made the fixed 2026-09-17 09:01 Beijing
-  timestamp fail forever after.
+  timestamp fail forever after. A second same-day fix-forward restored the
+  cheap 1-second pre-gate in front of `_emit_health_log`: without it the
+  per-websocket-message call sites took the monitor lock, re-evaluated
+  health, and deepcopied diagnostics on every message, driving CPython's
+  cyclic GC to continuous full collections (production pinned one core and
+  starved /state and universe refreshes until the gate was restored).
 
 - The LP dashboard's "我的订单与持仓" block was replaced by "当天 LP 委托"（北京时间
   08:00 起，即当前 UTC 奖励日）：只显示归属为 LP 的委托——未成交（含部分成交）与

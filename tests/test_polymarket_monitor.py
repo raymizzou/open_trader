@@ -687,6 +687,60 @@ def test_diagnostic_log_scheduler_emits_on_change_and_sixty_second_heartbeat(
         assert len(lines()) == 4
 
 
+def test_diagnostic_log_skips_evaluation_within_one_second(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import logging
+
+    monitor = make_monitor(tmp_path)
+    monotonic = [1000.0]
+    monkeypatch.setattr(monitor, "_monotonic", lambda: monotonic[0])
+    # Deterministic healthy baseline: fresh universe and readiness.
+    monitor._universe_at = NOW
+    monitor._readiness = {"checked_at": NOW}
+
+    health_evaluations = 0
+    real_health = monitor._health
+
+    def counting_health(now: datetime) -> dict[str, object]:
+        nonlocal health_evaluations
+        health_evaluations += 1
+        return real_health(now)
+
+    monkeypatch.setattr(monitor, "_health", counting_health)
+
+    def lines() -> list[str]:
+        return [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "open_trader.polymarket_monitor"
+        ]
+
+    with caplog.at_level(
+        logging.INFO, logger="open_trader.polymarket_monitor"
+    ):
+        monitor._emit_health_log()
+        assert len(lines()) == 1
+        assert json.loads(lines()[0])["status"] == "healthy"
+        evaluations_after_first_line = health_evaluations
+
+        # A changed degraded-reason set 0.5 fake-seconds after the last line
+        # is gated out before any evaluation: no line, no health computation.
+        monitor._store_failed = True
+        monotonic[0] += 0.5
+        monitor._emit_health_log()
+        assert len(lines()) == 1
+        assert health_evaluations == evaluations_after_first_line
+
+        # The same change 1.5 fake-seconds after the last line is emitted.
+        monotonic[0] += 1.0
+        monitor._emit_health_log()
+        assert len(lines()) == 2
+        changed = json.loads(lines()[-1])
+        assert changed["status"] != "healthy"
+        assert changed["degraded_reasons"] == ["store_write_failed"]
+
+
 def test_snapshot_uses_metrics_refreshed_outside_monitor_lock(tmp_path: Path) -> None:
     monitor = make_monitor(tmp_path)
     monotonic = [0.0]

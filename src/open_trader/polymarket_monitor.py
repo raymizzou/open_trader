@@ -64,6 +64,10 @@ READINESS_REFRESH_SECONDS = 30
 STREAM_DISCONNECT_SECONDS = 15
 UNIVERSE_STALE_SECONDS = 10 * 60
 DIAGNOSTIC_LOG_SECONDS = 60
+# Cheap pre-gate for the per-message ``_emit_health_log`` call sites: skip the
+# lock, health evaluation, and diagnostics deepcopy entirely within this
+# window, so the stream hot path never triggers full GC passes.
+DIAGNOSTIC_MIN_INTERVAL_SECONDS = 1.0
 PUBLIC_REFRESH_TIMEOUT_SECONDS = 30.0
 PUBLIC_BOOK_CONCURRENCY = 8
 STREAM_SUBSCRIPTION_CHUNK_SIZE = 250
@@ -5762,9 +5766,19 @@ class PolymarketMonitor:
         Bounded replacement for the retired per-second ``runtime`` snapshot
         write: a line is emitted only when the status/degraded-reason set
         changes or ``DIAGNOSTIC_LOG_SECONDS`` elapsed since the last line.
+        A cheap monotonic-clock gate (``DIAGNOSTIC_MIN_INTERVAL_SECONDS``)
+        returns before any evaluation, so calls from the per-message stream
+        hot path cost one clock read and one comparison within the window;
+        changed state therefore emits within ≤1 s instead of instantly.
         """
 
         now_mono = self._monotonic()
+        if (
+            not force
+            and self._diagnostic_log_at is not None
+            and now_mono - self._diagnostic_log_at < DIAGNOSTIC_MIN_INTERVAL_SECONDS
+        ):
+            return
         key: tuple[str, frozenset[str]] | None = None
         with self._lock:
             health = self._health(self._now())
