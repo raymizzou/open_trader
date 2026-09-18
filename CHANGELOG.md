@@ -5,6 +5,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-18
 
+- LP 日常准备现在以 24 小时摘要有效期和逐市场覆盖状态运行：健康方向在部分历史或资料失败时继续轻筛，首次失败五分钟后补一次，再次失败只暂停该市场并告警；到期元数据重试在下一空闲历史批次边界实际派发，摘要命中不读取原始样本。Dashboard 显示有界覆盖计数，并在 `partial` 且存在暂停项时复用既有恢复请求；等待中的部分覆盖保持无恢复动作。Docker 重点历史、准备、运行时、通知、恢复、调度、Dashboard 与既有服务集成回归通过。
+
+- 已知且完整目录确认市场消失时，仅结束该市场尚未消耗的待补项并保留有效摘要；失败或部分目录继续保留待补项。
+
 - LP metadata paging now stops once all requested condition ids are collected,
   while incomplete batches continue to Gamma cursors; failed Gamma responses
   retain bounded, redacted status diagnostics without changing failure or

@@ -4299,6 +4299,55 @@ class PredictionExecutionService:
     ) -> dict[str, object]:
         """Alert once when the durable LP preparation task is paused."""
 
+        paused_market_count = failure.get("paused_market_count")
+        if type(paused_market_count) is int and paused_market_count > 0:
+            raw_samples = failure.get("alert_error_samples")
+            if not isinstance(raw_samples, (list, tuple)):
+                raw_samples = failure.get("paused_error_samples")
+            samples = (
+                [sample for sample in raw_samples if isinstance(sample, Mapping)]
+                if isinstance(raw_samples, (list, tuple))
+                else []
+            )
+            sample_text = "、".join(
+                f"{str(sample.get('condition_id') or '未知标的')}"
+                f"({str(sample.get('stage') or 'unknown_stage')}/"
+                f"{str(sample.get('error') or 'unknown_error')})"
+                for sample in samples[:5]
+            ) or "未知"
+            if failure.get("alert_error_samples_truncated") is True or (
+                not isinstance(failure.get("alert_error_samples"), (list, tuple))
+                and failure.get("paused_error_samples_truncated") is True
+            ):
+                sample_text += "、…"
+            alert_count = failure.get("alert_condition_count")
+            cohort_count = (
+                alert_count
+                if type(alert_count) is int and alert_count > 0
+                else paused_market_count
+            )
+            if cohort_count == paused_market_count:
+                headline = f"部分标的补全暂停：共 {paused_market_count} 个市场。"
+            else:
+                headline = (
+                    f"部分标的补全暂停：本次新增 {cohort_count} 个市场（累计暂停 "
+                    f"{paused_market_count} 个）。"
+                )
+            message = "\n".join(
+                (
+                    headline,
+                    f"失败样例：{sample_text}。",
+                    "其他标的仍可继续准备和筛选；请在 Dashboard 使用“恢复准备”继续。",
+                    f"Dashboard：{self._dashboard_url}",
+                )
+            )
+            now_clock = beijing_clock(datetime.now(UTC)) or "未知"
+            if self._deliver_feishu_notification(
+                f"❌ 部分 LP 标的补全暂停（{now_clock}）", message
+            ):
+                return {"state": "sent"}
+            return {"state": "failed", "reason": "notification_unavailable"}
+
         raw_stage = str(failure.get("stage") or "unknown_stage")
         stage = (
             raw_stage

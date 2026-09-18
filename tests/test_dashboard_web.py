@@ -5694,6 +5694,15 @@ const paused = {
   last_failure_at:"2026-09-18T00:03:00Z", last_error:"TimeoutError",
   alert_attempted:true, alert_state:"sent",
 };
+const partialPaused = {
+  ...paused, state:"partial", paused:false,
+  preparation_item_total:3, paused_market_count:3, waiting_market_count:0,
+  retrying_market_count:0, failed_market_count:3,
+};
+const partialWaiting = {
+  ...partialPaused, preparation_item_total:3, paused_market_count:0,
+  waiting_market_count:3, failed_market_count:0,
+};
 const readyEmpty = {
   state:"ready", stage:"complete", generation:4, attempt:1, failure_count:0, paused:false,
   completed_count:0, total_count:0, metadata_completed_count:0, metadata_total_count:0,
@@ -5739,6 +5748,8 @@ state.predictionMarket.activeTab = "lp";
 state.predictionMarket.csrfToken = "csrf-token";
 state.predictionMarket.lpDashboardRequestInFlight = false;
 state.predictionMarket.lpPreparationRecoveryInFlight = false;
+const partialPausedHtml = direct(dashboard(partialPaused));
+const partialWaitingHtml = direct(dashboard(partialWaiting));
 setWorkspaceView("prediction_market");
 for (let turn=0; turn<24; turn+=1) await Promise.resolve();
 const bootstrapManualRecoveryPosts = requests.filter((request)=>request.method === "POST"
@@ -5781,6 +5792,15 @@ await Promise.resolve();
 const recoveryHeld = typeof releaseRecoveryPost === "function";
 if (recoveryHeld) releaseRecoveryPost();
 await Promise.all([firstRecovery, secondRecovery]);
+state.predictionMarket.lpDashboard = dashboard(partialPaused);
+state.predictionMarket.lpDashboardRequestInFlight = false;
+state.predictionMarket.lpPreparationRecoveryInFlight = false;
+state.predictionMarket.csrfToken = "csrf-token";
+renderPredictionMarket();
+const partialRecoveryTarget = {closest(selector) {
+  return selector === "[data-action='lp-preparation-recovery']" ? {disabled:false} : null;
+}};
+await handlePredictionMarketClick({target:partialRecoveryTarget});
 state.predictionMarket.lpDashboardRequestInFlight = false;
 state.predictionMarket.lpPreparationRecoveryInFlight = false;
 state.predictionMarket.csrfToken = "csrf-token";
@@ -5797,6 +5817,9 @@ console.log(JSON.stringify({
     && waitingHtml.includes("最近失败：TimeoutError"),
   paused: pausedHtml.includes("已暂停") && pausedHtml.includes("最近失败：TimeoutError")
     && pausedHtml.includes("告警：sent") && pausedHtml.includes("恢复准备"),
+  partialRecovery: partialPausedHtml.includes("恢复暂停项")
+    && /<button[^>]*data-action="lp-preparation-recovery"(?![^>]*disabled)/.test(partialPausedHtml),
+  waitingOnlyNoRecovery: !partialWaitingHtml.includes("data-action=\"lp-preparation-recovery\""),
   readyEmpty: readyHtml.includes("已就绪") && readyHtml.includes("目录已确认为空")
     && readyHtml.includes("历史方向 0 / 0") && !readyHtml.includes("data-lp-recommendation=")
     && !readyHtml.includes("可参与") && !readyHtml.includes("恢复准备"),
@@ -5823,6 +5846,8 @@ console.log(JSON.stringify({
         "preparing": True,
         "waitingRetry": True,
         "paused": True,
+        "partialRecovery": True,
+        "waitingOnlyNoRecovery": True,
         "readyEmpty": True,
         "readyUnknownCounts": True,
         "legacyCompatible": True,
@@ -5831,8 +5856,8 @@ console.log(JSON.stringify({
         "noCsrfDisabled": True,
         "busyDisabled": True,
         "recoveryHeld": True,
-        "recoveryPostCount": 1,
-        "recoveryBodies": [{"manual_recovery": True}, {}],
+        "recoveryPostCount": 2,
+        "recoveryBodies": [{"manual_recovery": True}, {"manual_recovery": True}, {}],
         "recoveryCsrf": True,
         "recoveryAuth": True,
     }
@@ -20044,3 +20069,52 @@ console.log(JSON.stringify({
     assert rendered["successChecked"] is True
     assert rendered["failureKeepsChecked"] is True
     assert rendered["raceKeepsConfirmed"] is True
+
+
+def test_lp_partial_preparation_keeps_valid_recommendations_visible() -> None:
+    output = run_dashboard_js(r'''
+const healthy = {
+  market_id:"market-a", condition_id:"condition-a", market_title:"Healthy A",
+  daily_pool_usd:"100", state:"eligible",
+  directions:{YES:{state:"eligible", eligible:true, token_id:"token-a",
+    screening:{amplitude:"0.005", sample_count:1441, window_start:"2026-09-17T00:00:00Z", window_end:"2026-09-18T00:00:00Z", checked_at:"2026-09-18T00:00:00Z", valid_until:"2099-01-01T00:00:00Z"},
+    guidance:{price:"0.50", quantity:"20", required_capital:"10", estimated_exit_loss:"0.50", estimated_exit_loss_ratio:"0.05", checked_at:"2026-09-18T00:00:00Z", expires_at:"2099-01-01T00:00:00Z"}}},
+};
+const preparation = {
+  state:"partial", stage:"history", generation:3, attempt:0, failure_count:0, paused:false,
+  completed_count:80, total_count:100, metadata_completed_count:100, metadata_total_count:100,
+  preparation_item_total:20, paused_market_count:20, failed_market_count:20,
+  waiting_market_count:0, retrying_market_count:0,
+  paused_error_samples:[{condition_id:"condition-b", stage:"history", error:"IncompleteRead"}],
+  paused_error_samples_truncated:false, last_error:"IncompleteRead",
+};
+const dashboard = {
+  state:"ready", candidate_state:"incomplete", complete:false, catalog_complete:false,
+  candidate_stale:false, checked_at:"2026-09-18T00:00:00Z", candidate_checked_at:"2026-09-18T00:00:00Z",
+  recommendations:[healthy], selected_results:[healthy], preparation,
+  funnel:{catalog_read:100, base_pass:100, volatility_pass:80, selected:1,
+    risk:{passed:1,rejected:0,unknown:0}, conditions:{volatility:{窗口:"24h",有效期:"24h"}}},
+  lp_orders_today:[], positions:[], market_rewards:[],
+};
+const html = predictionLpCard({lp_dashboard:dashboard});
+const expired = predictionLpCard({lp_dashboard:{...dashboard, recommendations:[{
+  ...healthy, directions:{YES:{...healthy.directions.YES, guidance:{...healthy.directions.YES.guidance, expires_at:"2026-09-18T00:00:00Z"}}}
+}], selected_results:[]}});
+console.log(JSON.stringify({
+  recommendation:html.includes('data-lp-recommendation="condition-a"'),
+  partial:html.includes("部分覆盖") || html.includes("部分完成"),
+  paused:html.includes("20 个市场") && html.includes("暂停"),
+  error:html.includes("IncompleteRead"),
+  noGlobalStop:!html.includes("全局暂停") && !html.includes("当前没有可用的风控通过标的"),
+  expired:!expired.includes('data-lp-recommendation="condition-a"') && expired.includes("指引已过期"),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered == {
+        "recommendation": True,
+        "partial": True,
+        "paused": True,
+        "error": True,
+        "noGlobalStop": True,
+        "expired": True,
+    }

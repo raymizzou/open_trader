@@ -5036,6 +5036,925 @@ def test_lp_preparation_retries_after_five_minutes_and_alerts_on_repeat_failure(
         assert runtime.state == "STOPPED"
 
 
+def test_lp_partial_preparation_uses_item_retry_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A partial LP preparation wakes at the failed item's durable deadline."""
+
+    import open_trader.prediction_runtime as runtime_module
+
+    clock = [datetime(2026, 9, 18, 12, 0, tzinfo=UTC)]
+    history_calls: list[tuple[str, ...]] = []
+    history_wait_calls: list[float] = []
+    notifications: list[tuple[str, str]] = []
+    first_history_done = threading.Event()
+    at_299 = threading.Event()
+    release_299 = threading.Event()
+    retry_history_done = threading.Event()
+    notification_done = threading.Event()
+    history_wait_called = threading.Event()
+    hourly_wait = threading.Event()
+    release_hourly = threading.Event()
+
+    class FakeTrading:
+        def attach_metadata_cache(self, _store: object) -> None:
+            pass
+
+        @staticmethod
+        def _market(condition_id: str) -> dict[str, object]:
+            return {
+                "market_id": f"market-{condition_id[-1]}",
+                "condition_id": condition_id,
+                "accepting_orders": True,
+                "reward_min_size": Decimal("20"),
+                "reward_max_spread": Decimal("0.10"),
+                "minimum_order_size": Decimal("20"),
+                "tick_size": Decimal("0.01"),
+                "fees_enabled": False,
+                "taker_fee_rate": Decimal("0"),
+                "fee_exponent": Decimal("1"),
+                "metadata_checked_at": clock[0],
+                "outcomes": {
+                    "yes": {
+                        "label": "YES",
+                        "token_id": f"token-{condition_id[-1]}",
+                    }
+                },
+            }
+
+        def lp_reward_catalog(
+            self,
+            *,
+            condition_ids: tuple[str, ...] | None = None,
+            stop_event: object = None,
+        ) -> dict[str, object]:
+            del stop_event
+            requested = ("condition-a", "condition-b") if condition_ids is None else condition_ids
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": clock[0],
+                "markets": [
+                    {
+                        "condition_id": condition_id,
+                        "daily_pool_usd": Decimal("100"),
+                        "reward_active": True,
+                        "rewards_min_size": Decimal("20"),
+                        "rewards_max_spread": Decimal("10"),
+                    }
+                    for condition_id in requested
+                ],
+            }
+
+        def lp_market_metadata(
+            self,
+            condition_ids: tuple[str, ...],
+            *,
+            stop_event: object = None,
+        ) -> dict[str, dict[str, object]]:
+            del stop_event
+            return {
+                condition_id: self._market(condition_id)
+                for condition_id in condition_ids
+            }
+
+        def lp_price_history(
+            self,
+            token_ids: tuple[str, ...],
+            *,
+            start_ts: int,
+            end_ts: int,
+            fidelity: int,
+            stop_event: object = None,
+        ) -> dict[str, object]:
+            del fidelity, stop_event
+            history_calls.append(token_ids)
+            if token_ids == ("token-a", "token-b"):
+                first_history_done.set()
+                return {
+                    "state": "partial",
+                    "history": {
+                        "token-a": [
+                            {"t": start_ts, "p": Decimal("0.500")},
+                            {"t": end_ts, "p": Decimal("0.505")},
+                        ]
+                    },
+                    "errors": {"token-b": "IncompleteRead"},
+                }
+            if token_ids == ("token-b",):
+                retry_history_done.set()
+                return {
+                    "state": "partial",
+                    "history": {},
+                    "errors": {"token-b": "IncompleteRead"},
+                }
+            raise AssertionError(f"unexpected history request: {token_ids}")
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "balance": Decimal("10000"),
+                "allowance": Decimal("10000"),
+                "open_orders": [],
+                "positions": [],
+                "checked_at": clock[0],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def lp_order_books(
+            self,
+            token_ids: tuple[str, ...],
+            *,
+            stop_event: object = None,
+        ) -> dict[str, dict[str, object]]:
+            del stop_event
+            return {
+                token_id: {
+                    "condition_id": f"condition-{token_id.removeprefix('token-')}",
+                    "token_id": token_id,
+                    "received_at": clock[0],
+                    "bids": [
+                        {"price": Decimal("0.50"), "size": Decimal("20")},
+                        {"price": Decimal("0.49"), "size": Decimal("20")},
+                    ],
+                    "asks": [{"price": Decimal("0.52"), "size": Decimal("20")}],
+                }
+                for token_id in token_ids
+            }
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "wallet_address": "0x1111111111111111111111111111111111111111",
+                "p_usd_balance": Decimal("100"),
+                "p_usd_allowance": Decimal("100"),
+                "open_order_ids": [],
+                "positions": [],
+                "checked_at": clock[0],
+            }
+
+        def readiness_snapshot(self) -> dict[str, object]:
+            return {
+                "relayer_ready": True,
+                "merge_ready": True,
+                "checked_at": clock[0],
+            }
+
+        def close(self) -> None:
+            pass
+
+    class FakeMonitor:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def set_ready_observer(self, _observer: object) -> None:
+            pass
+
+        def set_observation_observer(self, _observer: object) -> None:
+            pass
+
+        def set_auto_eat_observer(self, _observer: object) -> None:
+            pass
+
+        def set_failure_observer(self, _observer: object) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+    class Feishu:
+        channel = "feishu"
+
+        def notify(self, title: str, message: str) -> None:
+            notifications.append((title, message))
+            notification_done.set()
+
+    class TestExecution(PredictionExecutionService):
+        def reconcile_startup(self) -> dict[str, object]:
+            return {"state": "ready"}
+
+        def refresh_lp_share_watch(
+            self, *, stop_event: threading.Event | None = None
+        ) -> dict[str, object]:
+            del stop_event
+            return {"state": "none"}
+
+    trading = FakeTrading()
+    notifier = Feishu()
+    monkeypatch.setattr(
+        runtime_module,
+        "load_trading_config",
+        lambda _path: SimpleNamespace(
+            signer_address="0x1111111111111111111111111111111111111111",
+            wallet_address="0x2222222222222222222222222222222222222222",
+            predict=None,
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "PolymarketTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: trading),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "PredictTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: None),
+    )
+    monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor)
+    monkeypatch.setattr(runtime_module, "PredictionExecutionService", TestExecution)
+    monkeypatch.setattr(runtime_module, "_LP_TICK_SECONDS", 3600)
+    monkeypatch.setattr(runtime_module, "_LP_REWARD_SECONDS", 3600)
+    monkeypatch.setattr(runtime_module, "_LP_SHARE_WATCH_SECONDS", 3600)
+    monkeypatch.setattr(runtime_module, "_LP_REWARD_STOP_GRACE_SECONDS", 0.1)
+
+    def history_wait(stop_event: threading.Event, seconds: float) -> bool:
+        history_wait_calls.append(seconds)
+        history_wait_called.set()
+        if seconds == pytest.approx(300):
+            clock[0] += timedelta(seconds=299)
+            at_299.set()
+            while not release_299.wait(timeout=0.01):
+                if stop_event.is_set():
+                    return True
+            return stop_event.is_set()
+        if seconds == pytest.approx(1):
+            clock[0] += timedelta(seconds=1)
+            return stop_event.is_set()
+        if seconds >= 3600:
+            hourly_wait.set()
+            while not release_hourly.wait(timeout=0.01):
+                if stop_event.is_set():
+                    return True
+            return stop_event.is_set()
+        raise AssertionError(f"unexpected history wait: {seconds}")
+
+    runtime = PredictionRuntime(
+        data_dir=tmp_path / "partial-runtime",
+        prediction_config_path=tmp_path / "partial-runtime" / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+        notifier=SimpleNamespace(_notifiers=(notifier,)),
+        cross_venue_monitor=_UnavailableCrossVenueMonitor("test-disabled"),
+        enable_n_leg_background=False,
+        n_leg_paused=True,
+        history_clock=lambda: clock[0],
+        history_wait=history_wait,
+    )
+    runtime_started = False
+    try:
+        runtime.start()
+        runtime_started = True
+        assert first_history_done.wait(timeout=2)
+        assert history_wait_called.wait(timeout=2)
+        assert history_wait_calls[0] == pytest.approx(300)
+        assert at_299.wait(timeout=2)
+        assert history_calls == [("token-a", "token-b")]
+        preparation = runtime.lp.preparation_snapshot()  # type: ignore[union-attr]
+        assert preparation["state"] == "partial"
+        assert preparation["waiting_market_count"] == 1
+
+        snapshot = runtime.lp.refresh_candidates(force=True)  # type: ignore[union-attr]
+        for _ in range(200):
+            if snapshot.get("scanning") is not True:
+                break
+            time.sleep(0.01)
+            snapshot = runtime.lp.refresh_candidates(force=True)  # type: ignore[union-attr]
+        assert any(
+            row["condition_id"] == "condition-a"
+            for row in snapshot["recommendations"]
+        ), snapshot
+        assert all(
+            row["condition_id"] != "condition-b"
+            for row in snapshot["recommendations"]
+        )
+
+        release_299.set()
+        assert retry_history_done.wait(timeout=2)
+        assert notification_done.wait(timeout=2)
+        assert history_calls == [("token-a", "token-b"), ("token-b",)]
+        assert history_wait_calls[:2] == [pytest.approx(300), pytest.approx(1)]
+        assert len(notifications) == 1
+        assert "部分标的补全暂停" in notifications[0][1]
+        assert not hourly_wait.is_set() or history_wait_calls[:2] == [
+            pytest.approx(300),
+            pytest.approx(1),
+        ]
+    finally:
+        release_299.set()
+        release_hourly.set()
+        if runtime_started and runtime.state not in {"STOPPED", "FAILED"}:
+            runtime.stop()
+        assert runtime.state == "STOPPED"
+    assert history_calls == [("token-a", "token-b"), ("token-b",)]
+    assert len(notifications) == 1
+
+
+def test_lp_all_metadata_failures_keep_five_minute_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Metadata-only failures still wake at the item retry deadline."""
+
+    import open_trader.prediction_runtime as runtime_module
+
+    clock = [datetime(2026, 9, 18, 12, 0, tzinfo=UTC)]
+    metadata_calls: list[tuple[str, ...]] = []
+    history_calls: list[tuple[str, ...]] = []
+    history_wait_calls: list[float] = []
+    notifications: list[tuple[str, str]] = []
+    at_299 = threading.Event()
+    release_299 = threading.Event()
+    paused_wait = threading.Event()
+
+    class FakeTrading:
+        def attach_metadata_cache(self, _store: object) -> None:
+            pass
+
+        @staticmethod
+        def _market(condition_id: str) -> dict[str, object]:
+            return {
+                "market_id": f"market-{condition_id[-1]}",
+                "condition_id": condition_id,
+                "accepting_orders": True,
+                "reward_min_size": Decimal("20"),
+                "reward_max_spread": Decimal("0.10"),
+                "minimum_order_size": Decimal("20"),
+                "tick_size": Decimal("0.01"),
+                "fees_enabled": False,
+                "taker_fee_rate": Decimal("0"),
+                "fee_exponent": Decimal("1"),
+                "metadata_checked_at": clock[0],
+                "outcomes": {
+                    "yes": {
+                        "label": "YES",
+                        "token_id": f"token-{condition_id[-1]}",
+                    }
+                },
+            }
+
+        def lp_reward_catalog(
+            self,
+            *,
+            condition_ids: tuple[str, ...] | None = None,
+            stop_event: object = None,
+        ) -> dict[str, object]:
+            del stop_event
+            requested = ("condition-b",) if condition_ids is None else condition_ids
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": clock[0],
+                "markets": [
+                    {
+                        "condition_id": condition_id,
+                        "daily_pool_usd": Decimal("100"),
+                        "reward_active": True,
+                        "rewards_min_size": Decimal("20"),
+                        "rewards_max_spread": Decimal("10"),
+                    }
+                    for condition_id in requested
+                ],
+            }
+
+        def lp_market_metadata_batch(
+            self,
+            requested: tuple[str, ...],
+            *,
+            stop_event: object = None,
+        ) -> dict[str, object]:
+            del stop_event
+            metadata_calls.append(tuple(requested))
+            return {
+                "state": "known",
+                "markets": {},
+                "failed_ids": {
+                    condition_id: "IncompleteRead" for condition_id in requested
+                },
+            }
+
+        def lp_market_metadata(
+            self,
+            requested: tuple[str, ...],
+            *,
+            stop_event: object = None,
+        ) -> dict[str, dict[str, object]]:
+            del stop_event
+            return {
+                condition_id: self._market(condition_id) for condition_id in requested
+            }
+
+        def lp_price_history(
+            self,
+            token_ids: tuple[str, ...],
+            *,
+            start_ts: int,
+            end_ts: int,
+            fidelity: int,
+            stop_event: object = None,
+        ) -> dict[str, object]:
+            del start_ts, end_ts, fidelity, stop_event
+            history_calls.append(token_ids)
+            raise AssertionError("metadata-only failure must not request history")
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "balance": Decimal("10000"),
+                "allowance": Decimal("10000"),
+                "open_orders": [],
+                "positions": [],
+                "checked_at": clock[0],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def lp_order_books(
+            self,
+            token_ids: tuple[str, ...],
+            *,
+            stop_event: object = None,
+        ) -> dict[str, dict[str, object]]:
+            del stop_event
+            return {
+                token_id: {
+                    "condition_id": "condition-b",
+                    "token_id": token_id,
+                    "received_at": clock[0],
+                    "bids": [{"price": Decimal("0.50"), "size": Decimal("20")}],
+                    "asks": [{"price": Decimal("0.52"), "size": Decimal("20")}],
+                }
+                for token_id in token_ids
+            }
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "wallet_address": "0x1111111111111111111111111111111111111111",
+                "p_usd_balance": Decimal("100"),
+                "p_usd_allowance": Decimal("100"),
+                "open_order_ids": [],
+                "positions": [],
+                "checked_at": clock[0],
+            }
+
+        def readiness_snapshot(self) -> dict[str, object]:
+            return {
+                "relayer_ready": True,
+                "merge_ready": True,
+                "checked_at": clock[0],
+            }
+
+        def close(self) -> None:
+            pass
+
+    class FakeMonitor:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def set_ready_observer(self, _observer: object) -> None:
+            pass
+
+        def set_observation_observer(self, _observer: object) -> None:
+            pass
+
+        def set_auto_eat_observer(self, _observer: object) -> None:
+            pass
+
+        def set_failure_observer(self, _observer: object) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+    class Feishu:
+        channel = "feishu"
+
+        def notify(self, title: str, message: str) -> None:
+            notifications.append((title, message))
+
+    class TestExecution(PredictionExecutionService):
+        def reconcile_startup(self) -> dict[str, object]:
+            return {"state": "ready"}
+
+        def refresh_lp_share_watch(
+            self, *, stop_event: threading.Event | None = None
+        ) -> dict[str, object]:
+            del stop_event
+            return {"state": "none"}
+
+    trading = FakeTrading()
+    notifier = Feishu()
+    monkeypatch.setattr(
+        runtime_module,
+        "load_trading_config",
+        lambda _path: SimpleNamespace(
+            signer_address="0x1111111111111111111111111111111111111111",
+            wallet_address="0x2222222222222222222222222222222222222222",
+            predict=None,
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "PolymarketTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: trading),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "PredictTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: None),
+    )
+    monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor)
+    monkeypatch.setattr(runtime_module, "PredictionExecutionService", TestExecution)
+    monkeypatch.setattr(runtime_module, "_LP_TICK_SECONDS", 3600)
+    monkeypatch.setattr(runtime_module, "_LP_REWARD_SECONDS", 3600)
+    monkeypatch.setattr(runtime_module, "_LP_SHARE_WATCH_SECONDS", 3600)
+    monkeypatch.setattr(runtime_module, "_LP_REWARD_STOP_GRACE_SECONDS", 0.1)
+
+    def history_wait(stop_event: threading.Event, seconds: float) -> bool:
+        history_wait_calls.append(seconds)
+        if seconds == pytest.approx(300):
+            clock[0] += timedelta(seconds=299)
+            at_299.set()
+            while not release_299.wait(timeout=0.01):
+                if stop_event.is_set():
+                    return True
+            clock[0] += timedelta(seconds=1)
+            return stop_event.is_set()
+        if seconds >= 3600:
+            paused_wait.set()
+            return True
+        raise AssertionError(f"unexpected history wait: {seconds}")
+
+    runtime = PredictionRuntime(
+        data_dir=tmp_path / "metadata-runtime",
+        prediction_config_path=tmp_path / "metadata-runtime" / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+        notifier=SimpleNamespace(_notifiers=(notifier,)),
+        cross_venue_monitor=_UnavailableCrossVenueMonitor("test-disabled"),
+        enable_n_leg_background=False,
+        n_leg_paused=True,
+        history_clock=lambda: clock[0],
+        history_wait=history_wait,
+    )
+    runtime_started = False
+    try:
+        runtime.start()
+        runtime_started = True
+        assert at_299.wait(timeout=2) or paused_wait.wait(timeout=2)
+        assert history_wait_calls[0] == pytest.approx(300)
+        assert history_calls == []
+        assert metadata_calls == [("condition-b",)]
+        preparation = runtime.lp.preparation_snapshot()  # type: ignore[union-attr]
+        assert preparation["state"] == "partial"
+        assert preparation["waiting_market_count"] == 1
+
+        release_299.set()
+        assert paused_wait.wait(timeout=2)
+        assert history_wait_calls[:2] == [pytest.approx(300), pytest.approx(3600)]
+        assert history_calls == []
+        assert metadata_calls == [("condition-b",), ("condition-b",)]
+        assert len(notifications) == 1
+        preparation = runtime.lp.preparation_snapshot()  # type: ignore[union-attr]
+        assert preparation["paused_market_count"] == 1
+        assert preparation["state"] == "partial"
+    finally:
+        release_299.set()
+        if runtime_started and runtime.state not in {"STOPPED", "FAILED"}:
+            runtime.stop()
+        assert runtime.state == "STOPPED"
+
+
+def test_lp_confirmed_absent_catalog_item_finishes_pending_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A complete catalog omission retires one unspent pending market."""
+
+    import open_trader.prediction_runtime as runtime_module
+
+    clock = [datetime(2026, 9, 18, 12, 0, tzinfo=UTC)]
+    data_dir = tmp_path / "confirmed-absent-runtime"
+    metadata_calls: list[tuple[str, ...]] = []
+    history_calls: list[tuple[str, ...]] = []
+    history_wait_calls: list[float] = []
+    notifications: list[tuple[str, str]] = []
+    first_wait_started = threading.Event()
+    normal_wait_started = threading.Event()
+    final_wait_started = threading.Event()
+    zero_wait_seen = threading.Event()
+    release_normal_wait = threading.Event()
+    normal_wait_count = [0]
+
+    samples = [
+        {"t": int((clock[0] - timedelta(hours=24)).timestamp()), "p": Decimal("0.500")},
+        {"t": int(clock[0].timestamp()), "p": Decimal("0.505")},
+    ]
+    seeded_store = PredictionArbitrageStore(data_dir)
+    seeded_store.lp_save_price_history(
+        "condition-b",
+        "token-b",
+        samples,
+        {
+            "state": "known",
+            "amplitude": Decimal("0.005"),
+            "checked_at": clock[0],
+            "window_start": clock[0] - timedelta(hours=24),
+            "window_end": clock[0],
+            "sample_count": 2,
+            "valid_until": clock[0] + timedelta(hours=24),
+        },
+    )
+    seeded_summary = seeded_store.lp_price_history_summary(
+        "condition-b", "token-b", now=clock[0]
+    )
+    assert seeded_summary is not None
+
+    class FakeTrading:
+        def attach_metadata_cache(self, _store: object) -> None:
+            pass
+
+        @staticmethod
+        def _market(condition_id: str) -> dict[str, object]:
+            return {
+                "market_id": f"market-{condition_id[-1]}",
+                "condition_id": condition_id,
+                "accepting_orders": True,
+                "reward_min_size": Decimal("20"),
+                "reward_max_spread": Decimal("0.10"),
+                "minimum_order_size": Decimal("20"),
+                "tick_size": Decimal("0.01"),
+                "fees_enabled": False,
+                "taker_fee_rate": Decimal("0"),
+                "fee_exponent": Decimal("1"),
+                "metadata_checked_at": clock[0],
+                "outcomes": {
+                    "yes": {
+                        "label": "YES",
+                        "token_id": f"token-{condition_id[-1]}",
+                    }
+                },
+            }
+
+        def lp_reward_catalog(
+            self,
+            *,
+            condition_ids: tuple[str, ...] | None = None,
+            stop_event: object = None,
+        ) -> dict[str, object]:
+            del condition_ids, stop_event
+            if clock[0] == datetime(2026, 9, 18, 12, 0, tzinfo=UTC):
+                markets = [
+                    {
+                        "condition_id": "condition-b",
+                        "daily_pool_usd": Decimal("100"),
+                        "reward_active": True,
+                        "rewards_min_size": Decimal("20"),
+                        "rewards_max_spread": Decimal("10"),
+                    }
+                ]
+            else:
+                markets = []
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": clock[0],
+                "markets": markets,
+            }
+
+        def lp_market_metadata_batch(
+            self,
+            requested: tuple[str, ...],
+            *,
+            stop_event: object = None,
+        ) -> dict[str, object]:
+            del stop_event
+            metadata_calls.append(tuple(requested))
+            if len(metadata_calls) == 1:
+                return {
+                    "state": "known",
+                    "markets": {},
+                    "failed_ids": {condition_id: "IncompleteRead" for condition_id in requested},
+                }
+            return {
+                "state": "known",
+                "markets": {
+                    condition_id: self._market(condition_id) for condition_id in requested
+                },
+            }
+
+        def lp_market_metadata(
+            self,
+            requested: tuple[str, ...],
+            *,
+            stop_event: object = None,
+        ) -> dict[str, dict[str, object]]:
+            del stop_event
+            return {condition_id: self._market(condition_id) for condition_id in requested}
+
+        def lp_price_history(
+            self,
+            token_ids: tuple[str, ...],
+            *,
+            start_ts: int,
+            end_ts: int,
+            fidelity: int,
+            stop_event: object = None,
+        ) -> dict[str, object]:
+            del start_ts, end_ts, fidelity, stop_event
+            history_calls.append(tuple(token_ids))
+            raise AssertionError("catalog-confirmed absence must not request history")
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "balance": Decimal("10000"),
+                "allowance": Decimal("10000"),
+                "open_orders": [],
+                "positions": [],
+                "checked_at": clock[0],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def lp_order_books(
+            self,
+            token_ids: tuple[str, ...],
+            *,
+            stop_event: object = None,
+        ) -> dict[str, dict[str, object]]:
+            del stop_event
+            return {
+                token_id: {
+                    "condition_id": "condition-b",
+                    "token_id": token_id,
+                    "received_at": clock[0],
+                    "bids": [{"price": Decimal("0.50"), "size": Decimal("20")}],
+                    "asks": [{"price": Decimal("0.52"), "size": Decimal("20")}],
+                }
+                for token_id in token_ids
+            }
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "wallet_address": "0x1111111111111111111111111111111111111111",
+                "p_usd_balance": Decimal("100"),
+                "p_usd_allowance": Decimal("100"),
+                "open_order_ids": [],
+                "positions": [],
+                "checked_at": clock[0],
+            }
+
+        def readiness_snapshot(self) -> dict[str, object]:
+            return {
+                "relayer_ready": True,
+                "merge_ready": True,
+                "checked_at": clock[0],
+            }
+
+        def close(self) -> None:
+            pass
+
+    class FakeMonitor:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def set_ready_observer(self, _observer: object) -> None:
+            pass
+
+        def set_observation_observer(self, _observer: object) -> None:
+            pass
+
+        def set_auto_eat_observer(self, _observer: object) -> None:
+            pass
+
+        def set_failure_observer(self, _observer: object) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+    class Feishu:
+        channel = "feishu"
+
+        def notify(self, title: str, message: str) -> None:
+            notifications.append((title, message))
+
+    class TestExecution(PredictionExecutionService):
+        def reconcile_startup(self) -> dict[str, object]:
+            return {"state": "ready"}
+
+        def refresh_lp_share_watch(
+            self, *, stop_event: threading.Event | None = None
+        ) -> dict[str, object]:
+            del stop_event
+            return {"state": "none"}
+
+    trading = FakeTrading()
+    notifier = Feishu()
+    monkeypatch.setattr(
+        runtime_module,
+        "load_trading_config",
+        lambda _path: SimpleNamespace(
+            signer_address="0x1111111111111111111111111111111111111111",
+            wallet_address="0x2222222222222222222222222222222222222222",
+            predict=None,
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "PolymarketTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: trading),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "PredictTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: None),
+    )
+    monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor)
+    monkeypatch.setattr(runtime_module, "PredictionExecutionService", TestExecution)
+    monkeypatch.setattr(runtime_module, "_LP_TICK_SECONDS", 3600)
+    monkeypatch.setattr(runtime_module, "_LP_REWARD_SECONDS", 3600)
+    monkeypatch.setattr(runtime_module, "_LP_SHARE_WATCH_SECONDS", 3600)
+    monkeypatch.setattr(runtime_module, "_LP_REWARD_STOP_GRACE_SECONDS", 0.1)
+
+    def history_wait(stop_event: threading.Event, seconds: float) -> bool:
+        history_wait_calls.append(seconds)
+        if seconds == pytest.approx(300):
+            first_wait_started.set()
+            clock[0] += timedelta(seconds=300)
+            return False
+        if seconds < 1:
+            zero_wait_seen.set()
+            return True
+        if seconds == pytest.approx(3600):
+            normal_wait_count[0] += 1
+            if normal_wait_count[0] == 1:
+                normal_wait_started.set()
+                while not release_normal_wait.wait(timeout=0.01):
+                    if stop_event.is_set():
+                        return True
+                clock[0] += timedelta(seconds=3600)
+                return False
+            final_wait_started.set()
+            return True
+        raise AssertionError(f"unexpected history wait: {seconds}")
+
+    runtime = PredictionRuntime(
+        data_dir=data_dir,
+        prediction_config_path=data_dir / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+        notifier=SimpleNamespace(_notifiers=(notifier,)),
+        cross_venue_monitor=_UnavailableCrossVenueMonitor("test-disabled"),
+        enable_n_leg_background=False,
+        n_leg_paused=True,
+        history_clock=lambda: clock[0],
+        history_wait=history_wait,
+    )
+    runtime_started = False
+    try:
+        runtime.start()
+        runtime_started = True
+        assert first_wait_started.wait(timeout=2)
+        assert normal_wait_started.wait(timeout=2) or zero_wait_seen.wait(timeout=2)
+        assert not zero_wait_seen.is_set()
+        assert history_wait_calls[:2] == [pytest.approx(300), pytest.approx(3600)]
+        assert metadata_calls == [("condition-b",)]
+        assert history_calls == []
+        assert notifications == []
+        assert runtime.store.lp_preparation_items() == []
+        preparation = runtime.lp.preparation_snapshot()  # type: ignore[union-attr]
+        assert preparation["paused_market_count"] == 0
+        assert preparation["waiting_market_count"] == 0
+        assert runtime.store.lp_price_history_summary(
+            "condition-b", "token-b", now=clock[0]
+        ) == seeded_summary
+        restored_samples = runtime.store.lp_price_history_samples(
+            "condition-b", "token-b"
+        )
+        assert [int(row["t"]) for row in restored_samples] == [
+            int(row["t"]) for row in samples
+        ]
+        assert [Decimal(str(row["p"])) for row in restored_samples] == [
+            row["p"] for row in samples
+        ]
+
+        release_normal_wait.set()
+        assert final_wait_started.wait(timeout=2)
+        assert metadata_calls == [("condition-b",)]
+        assert history_calls == []
+        assert runtime.store.lp_preparation_items() == []
+    finally:
+        release_normal_wait.set()
+        if runtime_started and runtime.state not in {"STOPPED", "FAILED"}:
+            runtime.stop()
+        assert runtime.state == "STOPPED"
+
+
 def test_lp_metadata_warmup_advances_beyond_one_batch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

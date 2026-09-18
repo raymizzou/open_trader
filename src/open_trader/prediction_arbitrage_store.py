@@ -31,6 +31,7 @@ _BUSY_TIMEOUT_MS = 5_000
 _LLM_USAGE_RETENTION = timedelta(days=7)
 _PREVIEW_TTL = timedelta(seconds=10)
 _LP_BOOK_SAMPLE_RETENTION = timedelta(minutes=65)
+_LP_PRICE_HISTORY_VALIDITY = timedelta(hours=24)
 _CROSS_AUTO_DAILY_PRINCIPAL_CAP = Decimal("100")
 _CROSS_AUTO_MODES = frozenset({"observe_only", "manual_confirm", "auto_submit"})
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -798,6 +799,25 @@ class PredictionArbitrageStore:
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 generation INTEGER NOT NULL CHECK (generation >= 1),
                 payload TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS lp_preparation_items (
+                condition_id TEXT PRIMARY KEY,
+                generation INTEGER NOT NULL CHECK (generation >= 1),
+                retry_used INTEGER NOT NULL DEFAULT 0 CHECK (retry_used IN (0,1)),
+                failure_count INTEGER NOT NULL DEFAULT 1 CHECK (failure_count >= 1),
+                state TEXT NOT NULL,
+                paused INTEGER NOT NULL DEFAULT 0 CHECK (paused IN (0,1)),
+                stage TEXT NOT NULL,
+                direction TEXT,
+                token_id TEXT,
+                error TEXT,
+                failed_at TEXT,
+                next_retry_at TEXT,
+                retry_started_at TEXT,
+                alert_attempted INTEGER NOT NULL DEFAULT 0 CHECK (alert_attempted IN (0,1)),
+                alert_state TEXT,
                 updated_at TEXT NOT NULL
             );
 
@@ -2813,7 +2833,10 @@ class PredictionArbitrageStore:
         )
 
     def lp_save_price_history_batch(
-        self, rows: Iterable[Mapping[str, object]]
+        self,
+        rows: Iterable[Mapping[str, object]],
+        *,
+        generation: int | None = None,
     ) -> int:
         """Write a small batch without opening one transaction per token."""
 
@@ -2846,17 +2869,56 @@ class PredictionArbitrageStore:
             )
         if not encoded:
             return 0
+        expected_generation = (
+            generation if type(generation) is int and generation >= 1 else None
+        )
         with self._transaction() as connection:
-            connection.executemany(
-                """
-                INSERT INTO lp_price_history_cache(condition_id,token_id,samples,summary)
-                VALUES (?,?,?,?)
-                ON CONFLICT(condition_id,token_id) DO UPDATE SET
-                    samples=excluded.samples, summary=excluded.summary
-                """,
-                encoded,
-            )
-        return len(encoded)
+            persisted = 0
+            for row in encoded:
+                if expected_generation is not None:
+                    fence = connection.execute(
+                        """
+                        SELECT generation FROM lp_preparation_items
+                        WHERE condition_id=?
+                        """,
+                        (row[0],),
+                    ).fetchone()
+                    if (
+                        fence is not None
+                        and int(fence["generation"]) > expected_generation
+                    ):
+                        continue
+                    current = connection.execute(
+                        """
+                        SELECT summary FROM lp_price_history_cache
+                        WHERE condition_id=? AND token_id=?
+                        """,
+                        (row[0], row[1]),
+                    ).fetchone()
+                    if current is not None:
+                        try:
+                            current_summary = _load_payload(str(current["summary"]))
+                            current_generation = current_summary.get(
+                                "preparation_generation"
+                            )
+                        except (TypeError, ValueError):
+                            current_generation = None
+                        if (
+                            type(current_generation) is int
+                            and current_generation > expected_generation
+                        ):
+                            continue
+                connection.execute(
+                    """
+                    INSERT INTO lp_price_history_cache(condition_id,token_id,samples,summary)
+                    VALUES (?,?,?,?)
+                    ON CONFLICT(condition_id,token_id) DO UPDATE SET
+                        samples=excluded.samples, summary=excluded.summary
+                    """,
+                    row,
+                )
+                persisted += 1
+        return persisted
 
     @staticmethod
     def _lp_expire_price_history_summary(
@@ -2866,7 +2928,19 @@ class PredictionArbitrageStore:
         if isinstance(now, datetime) and now.tzinfo is not None:
             checked_at = result.get("checked_at")
             try:
-                if _parse_timestamp(checked_at) <= _parse_timestamp(now) - timedelta(hours=2):
+                checked = _parse_timestamp(checked_at)
+                current = _parse_timestamp(now)
+                if checked > current:
+                    result["state"] = "unknown"
+                    result.setdefault("reason", "summary_time_unknown")
+                    return result
+                expiry = checked + _LP_PRICE_HISTORY_VALIDITY
+                valid_until = result.get("valid_until")
+                if valid_until is not None:
+                    declared_expiry = _parse_timestamp(valid_until)
+                    if declared_expiry < expiry:
+                        expiry = declared_expiry
+                if current >= expiry:
                     result["state"] = "expired"
                     result.setdefault("reason", "summary_expired")
             except ValueError:
@@ -3158,6 +3232,642 @@ class PredictionArbitrageStore:
                 "SELECT payload FROM lp_screening_snapshot WHERE singleton=1"
             ).fetchone()
         return None if row is None else _load_payload(str(row["payload"]))
+
+    @staticmethod
+    def _lp_preparation_item(row: sqlite3.Row) -> dict[str, object]:
+        result = {key: row[key] for key in row.keys()}
+        for key in ("retry_used", "paused", "alert_attempted"):
+            result[key] = bool(result.get(key))
+        return result
+
+    def lp_preparation_items(self) -> list[dict[str, object]]:
+        """Read durable per-market preparation failures and retry state."""
+
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM lp_preparation_items
+                WHERE state != 'recovered'
+                ORDER BY condition_id
+                """
+            ).fetchall()
+        return [self._lp_preparation_item(row) for row in rows]
+
+    def lp_normalize_interrupted_preparation_items(self) -> int:
+        """Pause retries whose process stopped after spending their budget."""
+
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE lp_preparation_items
+                SET state='paused',paused=1,next_retry_at=NULL,
+                    error='retry_interrupted',alert_attempted=0,alert_state=NULL,
+                    updated_at=?
+                WHERE state='retrying' AND retry_used=1 AND paused=0
+                """,
+                (_utc_now(),),
+            )
+        return int(cursor.rowcount)
+
+    def lp_migrate_legacy_preparation(self) -> dict[str, object] | None:
+        """Preserve identifiable old history failures as per-market pauses."""
+
+        with self._transaction() as connection:
+            preparation_row = connection.execute(
+                "SELECT generation,payload FROM lp_preparation WHERE singleton=1"
+            ).fetchone()
+            if preparation_row is None:
+                return None
+            payload = _load_payload(str(preparation_row["payload"]))
+            if (
+                payload.get("state") != "paused"
+                or payload.get("paused") is not True
+                or payload.get("stage") != "history"
+                or payload.get("attempt") != 2
+                or payload.get("failure_count") != 2
+                or payload.get("alert_attempted") is not True
+                or payload.get("alert_state") != "sent"
+            ):
+                payload["generation"] = int(preparation_row["generation"])
+                return payload
+            try:
+                attempt_at = _canonical_timestamp(payload.get("last_attempt_at"))
+            except (TypeError, ValueError):
+                payload["generation"] = int(preparation_row["generation"])
+                return payload
+            error = payload.get("last_error")
+            if not isinstance(error, str) or not error.strip():
+                payload["generation"] = int(preparation_row["generation"])
+                return payload
+            existing_item = connection.execute(
+                """
+                SELECT 1 FROM lp_preparation_items
+                WHERE state != 'recovered'
+                LIMIT 1
+                """
+            ).fetchone()
+            if existing_item is not None:
+                payload["generation"] = int(preparation_row["generation"])
+                return payload
+
+            matches: dict[str, str] = {}
+            for row in connection.execute(
+                "SELECT condition_id,token_id,summary FROM lp_price_history_cache"
+            ).fetchall():
+                try:
+                    summary = _load_payload(str(row["summary"]))
+                    if summary.get("last_error") != error:
+                        continue
+                    if _canonical_timestamp(summary.get("last_attempt_at")) != attempt_at:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                condition_id = str(row["condition_id"] or "").strip()
+                token_id = str(row["token_id"] or "").strip()
+                if condition_id and token_id:
+                    matches.setdefault(condition_id, token_id)
+            if not matches:
+                payload["generation"] = int(preparation_row["generation"])
+                return payload
+
+            generation = int(preparation_row["generation"])
+            updated_at = _utc_now()
+            connection.executemany(
+                """
+                INSERT INTO lp_preparation_items(
+                    condition_id,generation,retry_used,failure_count,state,paused,
+                    stage,direction,token_id,error,failed_at,next_retry_at,
+                    retry_started_at,alert_attempted,alert_state,updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    (
+                        condition_id,
+                        generation,
+                        1,
+                        2,
+                        "paused",
+                        1,
+                        "history",
+                        None,
+                        token_id,
+                        error,
+                        attempt_at,
+                        None,
+                        None,
+                        1,
+                        "sent",
+                        updated_at,
+                    )
+                    for condition_id, token_id in sorted(matches.items())
+                ),
+            )
+            payload.update(
+                {
+                    "state": "partial",
+                    "attempt": 0,
+                    "failure_count": 0,
+                    "paused": False,
+                    "next_retry_at": None,
+                    "last_error": None,
+                    "generation": generation,
+                }
+            )
+            connection.execute(
+                "UPDATE lp_preparation SET payload=?,updated_at=? WHERE singleton=1",
+                (_dump_payload(payload), updated_at),
+            )
+            return payload
+
+    @staticmethod
+    def _lp_preparation_item_summary_from_connection(
+        connection: sqlite3.Connection,
+        *,
+        limit: int,
+    ) -> dict[str, object]:
+        bounded_limit = max(1, min(int(limit), 20))
+        counts = connection.execute(
+            """
+            SELECT
+                COUNT(*) AS total_count,
+                SUM(CASE WHEN state='waiting_retry' THEN 1 ELSE 0 END) AS waiting_count,
+                SUM(CASE WHEN state='retrying' THEN 1 ELSE 0 END) AS retrying_count,
+                SUM(CASE WHEN paused=1 THEN 1 ELSE 0 END) AS paused_count
+            FROM lp_preparation_items
+            WHERE state != 'recovered'
+            """
+        ).fetchone()
+        paused_rows = connection.execute(
+            """
+            SELECT condition_id,stage,error,token_id
+            FROM lp_preparation_items
+            WHERE paused=1 AND state != 'recovered'
+            ORDER BY condition_id
+            LIMIT ?
+            """,
+            (bounded_limit,),
+        ).fetchall()
+        waiting_rows = connection.execute(
+            """
+            SELECT condition_id,stage,error,token_id
+            FROM lp_preparation_items
+            WHERE state IN ('waiting_retry','retrying')
+              AND state != 'recovered'
+            ORDER BY condition_id
+            LIMIT ?
+            """,
+            (bounded_limit,),
+        ).fetchall()
+
+        def samples(rows: list[sqlite3.Row]) -> list[dict[str, object]]:
+            return [
+                {
+                    "condition_id": str(row["condition_id"]),
+                    "stage": str(row["stage"]),
+                    "error": row["error"],
+                    "token_id": row["token_id"],
+                }
+                for row in rows
+            ]
+
+        total_count = int(counts["total_count"] or 0) if counts is not None else 0
+        waiting_count = int(counts["waiting_count"] or 0) if counts is not None else 0
+        retrying_count = int(counts["retrying_count"] or 0) if counts is not None else 0
+        paused_count = int(counts["paused_count"] or 0) if counts is not None else 0
+        return {
+            "preparation_item_total": total_count,
+            "waiting_market_count": waiting_count,
+            "retrying_market_count": retrying_count,
+            "paused_market_count": paused_count,
+            "failed_market_count": paused_count,
+            "paused_error_samples": samples(paused_rows),
+            "waiting_error_samples": samples(waiting_rows),
+            "paused_error_samples_truncated": paused_count > bounded_limit,
+            "waiting_error_samples_truncated": waiting_count + retrying_count > bounded_limit,
+        }
+
+    def lp_preparation_item_summary(self, *, limit: int = 5) -> dict[str, object]:
+        """Read bounded per-market coverage counts and error samples."""
+
+        with self._read_connection() as connection:
+            return self._lp_preparation_item_summary_from_connection(
+                connection, limit=limit
+            )
+
+    def lp_claim_preparation_item_alerts(self, *, limit: int = 5) -> dict[str, object]:
+        """Claim one aggregate alert for newly paused markets."""
+
+        bounded_limit = max(1, min(int(limit), 20))
+        with self._transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT condition_id
+                FROM lp_preparation_items
+                WHERE paused=1 AND alert_attempted=0
+                ORDER BY condition_id
+                """
+            ).fetchall()
+            condition_ids = tuple(str(row["condition_id"]) for row in rows)
+            if condition_ids:
+                connection.executemany(
+                    """
+                    UPDATE lp_preparation_items
+                    SET alert_attempted=1,alert_state='claimed',updated_at=?
+                    WHERE condition_id=? AND paused=1 AND alert_attempted=0
+                    """,
+                    ((_utc_now(), condition_id) for condition_id in condition_ids),
+                )
+            alert_rows = ()
+            if condition_ids:
+                placeholders = ",".join("?" for _ in condition_ids)
+                alert_rows = connection.execute(
+                    f"""
+                    SELECT condition_id,stage,error,token_id
+                    FROM lp_preparation_items
+                    WHERE paused=1 AND alert_attempted=1 AND alert_state='claimed'
+                      AND condition_id IN ({placeholders})
+                    ORDER BY condition_id
+                    """,
+                    condition_ids,
+                ).fetchall()
+
+            def samples(rows: Iterable[sqlite3.Row]) -> list[dict[str, object]]:
+                return [
+                    {
+                        "condition_id": str(row["condition_id"]),
+                        "stage": str(row["stage"]),
+                        "error": row["error"],
+                        "token_id": row["token_id"],
+                    }
+                    for row in rows
+                ]
+
+            summary = self._lp_preparation_item_summary_from_connection(
+                connection, limit=bounded_limit
+            )
+        summary["alert_pending"] = bool(condition_ids)
+        summary["alert_condition_ids"] = list(condition_ids[:bounded_limit])
+        summary["alert_condition_count"] = len(condition_ids)
+        summary["alert_error_samples"] = samples(alert_rows[:bounded_limit])
+        summary["alert_error_samples_truncated"] = len(condition_ids) > bounded_limit
+        return summary
+
+    def lp_finish_preparation_item_alerts(
+        self,
+        *,
+        success: bool,
+        condition_ids: Iterable[str] | None = None,
+    ) -> int:
+        """Record one completed aggregate alert attempt without rearming data."""
+
+        identities = None if condition_ids is None else tuple(
+            dict.fromkeys(
+                str(value).strip() for value in condition_ids if str(value).strip()
+            )
+        )
+        state = "sent" if success else "failed"
+        with self._transaction() as connection:
+            if identities is None:
+                cursor = connection.execute(
+                    """
+                    UPDATE lp_preparation_items
+                    SET alert_state=?,updated_at=?
+                    WHERE paused=1 AND alert_attempted=1 AND alert_state='claimed'
+                    """,
+                    (state, _utc_now()),
+                )
+            elif identities:
+                where = " OR ".join("condition_id=?" for _ in identities)
+                cursor = connection.execute(
+                    f"""
+                    UPDATE lp_preparation_items
+                    SET alert_state=?,updated_at=?
+                    WHERE paused=1 AND alert_attempted=1 AND alert_state='claimed'
+                      AND ({where})
+                    """,
+                    (state, _utc_now(), *identities),
+                )
+            else:
+                return 0
+        return int(cursor.rowcount)
+
+    def lp_record_preparation_failure(
+        self,
+        condition_id: str,
+        *,
+        generation: int,
+        stage: str,
+        error: str,
+        failed_at: datetime,
+        direction: str | None = None,
+        token_id: str | None = None,
+    ) -> dict[str, object] | None:
+        """Record one market failure while sharing one retry budget."""
+
+        condition = str(condition_id or "").strip()
+        if not condition:
+            return None
+        failed = _canonical_timestamp(failed_at)
+        safe_stage = str(stage or "unknown").strip() or "unknown"
+        safe_error = str(error or "unknown_error").strip() or "unknown_error"
+        retry_started_at: str | None = None
+        with self._transaction() as connection:
+            request_generation = max(1, int(generation))
+            existing = connection.execute(
+                "SELECT * FROM lp_preparation_items WHERE condition_id=?",
+                (condition,),
+            ).fetchone()
+            if (
+                existing is not None
+                and int(existing["generation"]) > request_generation
+            ):
+                return None
+            effective_generation = request_generation
+            existing_is_fence = bool(existing and existing["state"] == "recovered")
+            previous_retry_used = (
+                False if existing_is_fence else bool(existing and existing["retry_used"])
+            )
+            previous_paused = (
+                False if existing_is_fence else bool(existing and existing["paused"])
+            )
+            previous_count = (
+                0 if existing_is_fence else int(existing["failure_count"]) if existing else 0
+            )
+            retry_used = previous_retry_used or previous_paused
+            paused = retry_used
+            state = "paused" if paused else "waiting_retry"
+            next_retry_at = None
+            if not paused:
+                next_retry_at = _canonical_timestamp(
+                    _parse_timestamp(failed) + timedelta(seconds=300)
+                )
+            if existing is not None and not existing_is_fence:
+                retry_started_at = existing["retry_started_at"]
+            alert_attempted = (
+                int(existing["alert_attempted"])
+                if existing is not None and not existing_is_fence
+                else 0
+            )
+            alert_state = (
+                existing["alert_state"]
+                if existing is not None and not existing_is_fence
+                else None
+            )
+            if paused and not previous_paused:
+                alert_attempted = 0
+                alert_state = None
+            connection.execute(
+                """
+                INSERT INTO lp_preparation_items(
+                    condition_id,generation,retry_used,failure_count,state,paused,
+                    stage,direction,token_id,error,failed_at,next_retry_at,
+                    retry_started_at,alert_attempted,alert_state,updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(condition_id) DO UPDATE SET
+                    generation=excluded.generation,
+                    retry_used=excluded.retry_used,
+                    failure_count=excluded.failure_count,
+                    state=excluded.state,
+                    paused=excluded.paused,
+                    stage=excluded.stage,
+                    direction=excluded.direction,
+                    token_id=excluded.token_id,
+                    error=excluded.error,
+                    failed_at=excluded.failed_at,
+                    next_retry_at=excluded.next_retry_at,
+                    retry_started_at=excluded.retry_started_at,
+                    alert_attempted=excluded.alert_attempted,
+                    alert_state=excluded.alert_state,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    condition,
+                    effective_generation,
+                    int(retry_used),
+                    max(1, previous_count + 1),
+                    state,
+                    int(paused),
+                    safe_stage,
+                    direction,
+                    token_id,
+                    safe_error,
+                    failed,
+                    next_retry_at,
+                    retry_started_at,
+                    alert_attempted,
+                    alert_state,
+                    _utc_now(),
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM lp_preparation_items WHERE condition_id=?",
+                (condition,),
+            ).fetchone()
+        return None if row is None else self._lp_preparation_item(row)
+
+    def lp_claim_preparation_retries(
+        self,
+        *,
+        now: datetime,
+        condition_ids: Iterable[str] | None = None,
+    ) -> list[dict[str, object]]:
+        """Atomically spend due retries that the caller is ready to dispatch."""
+
+        current = _canonical_timestamp(now)
+        now_moment = _parse_timestamp(current)
+        claimed: list[dict[str, object]] = []
+        identities = None if condition_ids is None else tuple(
+            dict.fromkeys(
+                str(value).strip() for value in condition_ids if str(value).strip()
+            )
+        )
+        if identities == ():
+            return claimed
+        with self._transaction() as connection:
+            if identities is None:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM lp_preparation_items
+                    WHERE state != 'recovered'
+                      AND paused=0 AND retry_used=0 AND next_retry_at IS NOT NULL
+                    ORDER BY next_retry_at, condition_id
+                    """
+                ).fetchall()
+            else:
+                placeholders = ",".join("?" for _ in identities)
+                rows = connection.execute(
+                    f"""
+                    SELECT * FROM lp_preparation_items
+                    WHERE state != 'recovered'
+                      AND paused=0 AND retry_used=0 AND next_retry_at IS NOT NULL
+                      AND condition_id IN ({placeholders})
+                    ORDER BY next_retry_at, condition_id
+                    """,
+                    identities,
+                ).fetchall()
+            for row in rows:
+                try:
+                    due = _parse_timestamp(row["next_retry_at"])
+                except ValueError:
+                    continue
+                if due > now_moment:
+                    continue
+                condition = str(row["condition_id"])
+                connection.execute(
+                    """
+                    UPDATE lp_preparation_items
+                    SET retry_used=1,state='retrying',retry_started_at=?,
+                        next_retry_at=NULL,updated_at=?
+                    WHERE condition_id=? AND paused=0 AND retry_used=0
+                    """,
+                    (current, _utc_now(), condition),
+                )
+                updated = connection.execute(
+                    "SELECT * FROM lp_preparation_items WHERE condition_id=?",
+                    (condition,),
+                ).fetchone()
+                if updated is not None:
+                    claimed.append(self._lp_preparation_item(updated))
+        return claimed
+
+    def lp_clear_preparation_items(
+        self,
+        condition_ids: Iterable[str],
+        *,
+        generation: int | None = None,
+    ) -> int:
+        identities = tuple(
+            dict.fromkeys(
+                str(value).strip() for value in condition_ids if str(value).strip()
+            )
+        )
+        if not identities:
+            return 0
+        with self._transaction() as connection:
+            cleared = 0
+            expected_generation = (
+                generation if type(generation) is int and generation >= 1 else None
+            )
+            for condition_id in identities:
+                row = connection.execute(
+                    "SELECT generation,state FROM lp_preparation_items WHERE condition_id=?",
+                    (condition_id,),
+                ).fetchone()
+                if row is None:
+                    continue
+                if (
+                    expected_generation is not None
+                    and int(row["generation"]) > expected_generation
+                ):
+                    continue
+                if expected_generation is None:
+                    if row["state"] == "recovered":
+                        continue
+                    connection.execute(
+                        "DELETE FROM lp_preparation_items WHERE condition_id=?",
+                        (condition_id,),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        UPDATE lp_preparation_items
+                        SET generation=?,retry_used=1,failure_count=1,
+                            state='recovered',paused=0,error=NULL,failed_at=NULL,
+                            next_retry_at=NULL,retry_started_at=NULL,
+                            alert_attempted=0,alert_state=NULL,updated_at=?
+                        WHERE condition_id=?
+                        """,
+                        (expected_generation, _utc_now(), condition_id),
+                    )
+                cleared += 1
+        return cleared
+
+    def lp_recover_preparation_items(
+        self, condition_ids: Iterable[str] | None = None
+    ) -> list[dict[str, object]]:
+        identities = None if condition_ids is None else tuple(
+            dict.fromkeys(
+                str(value).strip() for value in condition_ids if str(value).strip()
+            )
+        )
+        with self._transaction() as connection:
+            singleton = connection.execute(
+                "SELECT generation,payload FROM lp_preparation WHERE singleton=1"
+            ).fetchone()
+            if singleton is None:
+                return []
+            current_generation = int(singleton["generation"])
+            payload = _load_payload(str(singleton["payload"]))
+            if identities is None:
+                rows = connection.execute(
+                    """
+                    SELECT condition_id FROM lp_preparation_items
+                    WHERE paused=1 AND state != 'recovered'
+                    """
+                ).fetchall()
+            elif not identities:
+                rows = []
+            else:
+                where = " OR ".join("condition_id=?" for _ in identities)
+                rows = connection.execute(
+                    f"""
+                    SELECT condition_id FROM lp_preparation_items
+                    WHERE paused=1 AND state != 'recovered' AND ({where})
+                    """,
+                    identities,
+                ).fetchall()
+            selected = tuple(str(row["condition_id"]) for row in rows)
+            should_advance = bool(selected) or payload.get("paused") is True
+            if not should_advance:
+                return []
+            new_generation = current_generation + 1
+            if selected:
+                connection.executemany(
+                    """
+                    UPDATE lp_preparation_items
+                    SET generation=?,retry_used=1,failure_count=1,
+                        state='recovered',paused=0,error=NULL,failed_at=NULL,
+                        next_retry_at=NULL,retry_started_at=NULL,
+                        alert_attempted=0,alert_state=NULL,updated_at=?
+                    WHERE condition_id=? AND paused=1 AND state != 'recovered'
+                    """,
+                    (
+                        (new_generation, _utc_now(), value)
+                        for value in selected
+                    ),
+                )
+            recovered_state = (
+                "partial"
+                if selected and payload.get("state") != "paused"
+                else "ready"
+            )
+            payload.update(
+                {
+                    "state": recovered_state,
+                    "stage": "catalog",
+                    "attempt": 0,
+                    "failure_count": 0,
+                    "paused": False,
+                    "alert_attempted": False,
+                    "alert_state": None,
+                    "last_error": None,
+                    "next_retry_at": None,
+                }
+            )
+            connection.execute(
+                """
+                UPDATE lp_preparation
+                SET generation=?,payload=?,updated_at=?
+                WHERE singleton=1 AND generation=?
+                """,
+                (
+                    new_generation,
+                    _dump_payload(payload),
+                    _utc_now(),
+                    current_generation,
+                ),
+            )
+        return [{"condition_id": value, "recovered": True} for value in selected]
 
     def lp_preparation(self) -> dict[str, object] | None:
         """Load the durable singleton state for LP preparation."""

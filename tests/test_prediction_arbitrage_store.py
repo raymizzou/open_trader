@@ -2976,6 +2976,7 @@ def test_lp_price_history_cache_survives_restart_without_fabricating_books(
     samples = [
         {"t": int((now - timedelta(hours=24)).timestamp()), "p": Decimal("0.500")},
         {"t": int((now - timedelta(hours=23, minutes=59)).timestamp()), "p": Decimal("0.500")},
+        {"t": int((now - timedelta(hours=22)).timestamp()), "p": Decimal("0.500")},
         {"t": int(now.timestamp()), "p": Decimal("0.505")},
     ]
     summary = {
@@ -2984,7 +2985,7 @@ def test_lp_price_history_cache_survives_restart_without_fabricating_books(
         "checked_at": now,
         "window_start": now - timedelta(hours=24),
         "window_end": now,
-        "sample_count": 3,
+        "sample_count": 4,
         "valid_until": now + timedelta(hours=2),
     }
 
@@ -3030,7 +3031,7 @@ def test_lp_price_history_cache_survives_restart_without_fabricating_books(
     assert cached["window_start"] == iso(now - timedelta(hours=24))
     assert cached["window_end"] == iso(now)
     assert cached["valid_until"] == iso(now + timedelta(hours=2))
-    assert cached["sample_count"] == 3
+    assert cached["sample_count"] == 4
     restored_samples = reopened.lp_price_history_samples(
         "condition-history", "token-history"
     )
@@ -3159,6 +3160,25 @@ def test_lp_price_history_cache_survives_restart_without_fabricating_books(
 
     refreshed = service.refresh_price_history()
     assert refreshed["state"] == "known"
+    assert refreshed["updated_count"] == 0
+    assert refreshed["request_count"] == 0
+    assert exchange.history_calls == []
+    assert exchange.unexpected_calls == []
+    cached_after_hit = reopened.lp_price_history_summary(
+        "condition-history", "token-history", now=next_now
+    )
+    assert cached_after_hit is not None
+    assert cached_after_hit["state"] == "known"
+    assert cached_after_hit["checked_at"] == iso(now)
+    assert cached_after_hit["valid_until"] == iso(now + timedelta(hours=2))
+    assert cached_after_hit["sample_count"] == 4
+    assert [row["t"] for row in reopened.lp_price_history_samples(
+        "condition-history", "token-history"
+    )] == [row["t"] for row in samples]
+
+    next_now = now + timedelta(hours=2)
+    refreshed = service.refresh_price_history()
+    assert refreshed["state"] == "known"
     assert refreshed["updated_count"] == 1
     assert refreshed["request_count"] == 1
     assert len(exchange.history_calls) == 1
@@ -3172,7 +3192,11 @@ def test_lp_price_history_cache_survives_restart_without_fabricating_books(
     ]
     assert [Decimal(str(row["p"])) for row in reopened.lp_price_history_samples(
         "condition-history", "token-history"
-    )] == [Decimal("0.500"), Decimal("0.500"), Decimal("0.505")]
+    )] == [
+        Decimal("0.500"),
+        Decimal("0.500"),
+        Decimal("0.505"),
+    ]
     refreshed_summary = reopened.lp_price_history_summary(
         "condition-history", "token-history", now=next_now
     )
@@ -3190,6 +3214,153 @@ def test_lp_price_history_cache_survives_restart_without_fabricating_books(
         since=now - timedelta(hours=24),
         until=next_now,
     ) == []
+
+
+def test_lp_recovery_fences_only_recovered_condition(tmp_path: Path) -> None:
+    data_dir = tmp_path / "recovery-fence"
+    failed_at = datetime(2026, 9, 18, 12, 0, tzinfo=UTC)
+    retry_at = failed_at + timedelta(seconds=300)
+    db = PredictionArbitrageStore(data_dir)
+    db.lp_save_preparation(
+        {
+            "state": "partial",
+            "stage": "history",
+            "generation": 1,
+            "attempt": 1,
+            "failure_count": 0,
+            "paused": False,
+            "next_retry_at": None,
+        }
+    )
+
+    db.lp_record_preparation_failure(
+        "condition-b",
+        generation=1,
+        stage="history",
+        error="IncompleteRead",
+        failed_at=failed_at,
+        token_id="token-b",
+    )
+    db.lp_record_preparation_failure(
+        "condition-c",
+        generation=1,
+        stage="history",
+        error="IncompleteRead",
+        failed_at=failed_at,
+        token_id="token-c",
+    )
+    assert [item["condition_id"] for item in db.lp_claim_preparation_retries(
+        now=retry_at,
+        condition_ids=["condition-b"],
+    )] == ["condition-b"]
+    db.lp_record_preparation_failure(
+        "condition-b",
+        generation=1,
+        stage="history",
+        error="IncompleteRead",
+        failed_at=retry_at,
+        token_id="token-b",
+    )
+    assert db.lp_recover_preparation_items(["condition-b"]) == [
+        {"condition_id": "condition-b", "recovered": True}
+    ]
+
+    # C1 started in generation 1 and arrives after B's independent recovery.
+    db.lp_record_preparation_failure(
+        "condition-c",
+        generation=1,
+        stage="history",
+        error="IncompleteRead",
+        failed_at=failed_at,
+        token_id="token-c",
+    )
+    c_item = next(
+        item
+        for item in db.lp_preparation_items()
+        if item["condition_id"] == "condition-c"
+    )
+    assert c_item["generation"] == 1
+    assert c_item["state"] == "waiting_retry"
+    assert c_item["failed_at"] == iso(failed_at)
+    assert c_item["next_retry_at"] == iso(retry_at)
+
+    c_checked_at = failed_at + timedelta(seconds=301)
+    c_window_start = failed_at - timedelta(hours=24)
+    c_window_end = failed_at
+    c_summary = {
+        "state": "known",
+        "amplitude": Decimal("0.005"),
+        "checked_at": c_checked_at,
+        "window_start": c_window_start,
+        "window_end": c_window_end,
+        "sample_count": 2,
+        "valid_until": c_checked_at + timedelta(hours=24),
+        "preparation_generation": 1,
+    }
+    persisted = db.lp_save_price_history_batch(
+        [
+            {
+                "condition_id": "condition-c",
+                "token_id": "token-c",
+                "samples": [
+                    {"t": int(c_window_start.timestamp()), "p": Decimal("0.500")},
+                    {"t": int(c_window_end.timestamp()), "p": Decimal("0.505")},
+                ],
+                "summary": c_summary,
+            }
+        ],
+        generation=1,
+    )
+    assert persisted == 1
+    saved_c = db.lp_price_history_summary("condition-c", "token-c", now=c_checked_at)
+    assert saved_c is not None
+    assert saved_c["checked_at"] == iso(c_checked_at)
+    assert saved_c["window_start"] == iso(c_window_start)
+    assert saved_c["window_end"] == iso(c_window_end)
+
+    c_after_success = next(
+        item
+        for item in db.lp_preparation_items()
+        if item["condition_id"] == "condition-c"
+    )
+    assert c_after_success["generation"] == 1
+    assert c_after_success["failed_at"] == iso(failed_at)
+    assert c_after_success["next_retry_at"] == iso(retry_at)
+    claimed = db.lp_claim_preparation_retries(
+        now=retry_at,
+        condition_ids=["condition-c"],
+    )
+    assert [item["condition_id"] for item in claimed] == ["condition-c"]
+    assert claimed[0]["generation"] == 1
+
+    b_summary = {
+        **c_summary,
+        "checked_at": failed_at,
+        "window_start": c_window_start,
+        "window_end": c_window_end,
+    }
+    assert db.lp_save_price_history_batch(
+        [
+            {
+                "condition_id": "condition-b",
+                "token_id": "token-b",
+                "samples": [],
+                "summary": b_summary,
+            }
+        ],
+        generation=1,
+    ) == 0
+    assert db.lp_record_preparation_failure(
+        "condition-b",
+        generation=1,
+        stage="history",
+        error="IncompleteRead",
+        failed_at=retry_at,
+        token_id="token-b",
+    ) is None
+    assert all(
+        item["condition_id"] != "condition-b" for item in db.lp_preparation_items()
+    )
 
 
 def test_lp_metadata_cache_store_round_trip_and_prune(tmp_path: Path) -> None:

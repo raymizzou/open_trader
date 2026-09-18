@@ -1188,7 +1188,8 @@ class PredictionRuntime:
                             else ""
                         )
                         if outcome == "waiting_retry" or (
-                            outcome == "failure" and preparation_state == "waiting_retry"
+                            outcome == "failure"
+                            and preparation_state in {"waiting_retry", "partial"}
                         ):
                             wait_seconds = retry_delay(result)
                         elif outcome == "paused":

@@ -15,6 +15,7 @@ from .polymarket_lp_risk import (
 from .polymarket_lp import (
     LP_CANDIDATE_REFRESH_SECONDS,
     STOP_LOSS,
+    _LP_PRICE_HISTORY_WINDOW,
     PolymarketLPService,
     _decimal,
     _freshness,
@@ -85,7 +86,7 @@ def _lp_shortlist_rows(
             except ValueError:
                 continue
             age = (checked_at - checked_summary_at).total_seconds()
-            if age < 0 or age >= 2 * 60 * 60:
+            if age < 0 or age >= _LP_PRICE_HISTORY_WINDOW.total_seconds():
                 continue
             valid_until = summary.get("valid_until")
             if valid_until is not None:

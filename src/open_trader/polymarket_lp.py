@@ -165,7 +165,7 @@ def _lp_funnel_conditions() -> dict[str, object]:
             "粒度": "1m",
             "振幅": "不超过1¢",
             "刷新": "每小时",
-            "有效期": "2h",
+            "有效期": "24h",
             "缺失": "UNKNOWN",
         },
         "risk": {
@@ -337,7 +337,16 @@ class PolymarketLPService:
                 state = self._new_preparation_state()
                 state.update(deepcopy(dict(saved)))
                 self._preparation = state
-            return deepcopy(self._preparation or self._new_preparation_state())
+            result = deepcopy(self._preparation or self._new_preparation_state())
+        summary_reader = getattr(self.store, "lp_preparation_item_summary", None)
+        if callable(summary_reader):
+            try:
+                summary = summary_reader(limit=5)
+            except Exception:
+                summary = None
+            if isinstance(summary, Mapping):
+                result.update(deepcopy(dict(summary)))
+        return result
 
     def _save_preparation(
         self,
@@ -386,6 +395,14 @@ class PolymarketLPService:
             "unknown_count": 0,
             "request_count": 0,
         }
+        summary_reader = getattr(self.store, "lp_preparation_item_summary", None)
+        if callable(summary_reader):
+            try:
+                summary = summary_reader(limit=5)
+            except Exception:
+                summary = None
+            if isinstance(summary, Mapping):
+                result["preparation"].update(deepcopy(dict(summary)))
         if reason:
             result["reason"] = reason
         if alert_pending:
@@ -527,13 +544,26 @@ class PolymarketLPService:
         """Explicitly re-arm a paused preparation cycle."""
 
         current = self.preparation_snapshot()
-        if current.get("paused") is not True:
-            return current
+        item_recoverer = getattr(self.store, "lp_recover_preparation_items", None)
+        recovered_items = item_recoverer() if callable(item_recoverer) else ()
+        recovered_condition_ids = [
+            str(item.get("condition_id"))
+            for item in recovered_items
+            if isinstance(item, Mapping)
+            and str(item.get("condition_id") or "").strip()
+        ]
+        if current.get("paused") is not True and not recovered_condition_ids:
+            return {**current, "recovered_condition_ids": []}
         generation = current.get("generation")
         generation = generation if type(generation) is int and generation >= 1 else 1
+        recovered_state = (
+            "partial"
+            if recovered_condition_ids and current.get("state") != "paused"
+            else "ready"
+        )
         state = self._save_preparation(
             {
-                "state": "ready",
+                "state": recovered_state,
                 "stage": "catalog",
                 "generation": generation + 1,
                 "attempt": 0,
@@ -546,11 +576,28 @@ class PolymarketLPService:
             },
             expected_generation=generation,
         )
+        state["recovered_condition_ids"] = recovered_condition_ids
         return state
+
+    def _claim_preparation_item_alerts(self) -> dict[str, object] | None:
+        claimer = getattr(self.store, "lp_claim_preparation_item_alerts", None)
+        if not callable(claimer):
+            return None
+        try:
+            claimed = claimer(limit=5)
+        except Exception:
+            return None
+        return dict(claimed) if isinstance(claimed, Mapping) else None
 
     def finish_preparation_alert(self, *, generation: int, success: bool) -> dict[str, object] | None:
         """Record the result of the already-claimed operator notification."""
 
+        item_finisher = getattr(self.store, "lp_finish_preparation_item_alerts", None)
+        if callable(item_finisher):
+            try:
+                item_finisher(success=success)
+            except Exception:
+                pass
         writer = getattr(self.store, "lp_finish_preparation_alert", None)
         if not callable(writer):
             return None
@@ -883,8 +930,41 @@ class PolymarketLPService:
                 self.preparation_snapshot(), outcome="busy", display_state="busy"
             )
         try:
+            interrupted_normalizer = getattr(
+                self.store, "lp_normalize_interrupted_preparation_items", None
+            )
+            if callable(interrupted_normalizer):
+                try:
+                    interrupted_normalizer()
+                except Exception:
+                    pass
             now = self._now().astimezone(UTC)
             preparation = self.preparation_snapshot()
+            legacy_migrator = getattr(
+                self.store, "lp_migrate_legacy_preparation", None
+            )
+            if callable(legacy_migrator):
+                try:
+                    migrated = legacy_migrator()
+                except Exception:
+                    migrated = None
+                if isinstance(migrated, Mapping):
+                    restored = self._new_preparation_state()
+                    restored.update(deepcopy(dict(migrated)))
+                    with self._preparation_lock:
+                        self._preparation = restored
+                    preparation = self.preparation_snapshot()
+            preparation_item_reader = getattr(self.store, "lp_preparation_items", None)
+            existing_preparation_items = (
+                preparation_item_reader()
+                if callable(preparation_item_reader)
+                else ()
+            )
+            has_partial_items = any(
+                isinstance(item, Mapping)
+                and str(item.get("condition_id") or "").strip()
+                for item in existing_preparation_items
+            )
             if manual_recovery:
                 if preparation.get("paused") is not True:
                     return self._preparation_result(
@@ -898,7 +978,13 @@ class PolymarketLPService:
                     reason="preparation_paused",
                     display_state="unknown",
                 )
-            elif preparation.get("state") == "waiting_retry":
+            elif (
+                not has_partial_items
+                and (
+                    preparation.get("state") == "waiting_retry"
+                    or preparation.get("next_retry_at") is not None
+                )
+            ):
                 try:
                     retry_at = _timestamp(
                         preparation.get("next_retry_at"), name="next_retry_at"
@@ -923,6 +1009,22 @@ class PolymarketLPService:
             )
             generation = preparation.get("generation")
             generation = generation if type(generation) is int and generation >= 1 else 1
+            preparation_retry_claimer = getattr(
+                self.store, "lp_claim_preparation_retries", None
+            )
+            preparation_failure_writer = getattr(
+                self.store, "lp_record_preparation_failure", None
+            )
+            preparation_clearer = getattr(self.store, "lp_clear_preparation_items", None)
+            claimed_condition_ids: set[str] = set()
+            preparation_items: dict[str, Mapping[str, object]] = {}
+            if callable(preparation_item_reader):
+                preparation_items = {
+                    str(item.get("condition_id")): item
+                    for item in preparation_item_reader()
+                    if isinstance(item, Mapping)
+                    and str(item.get("condition_id") or "").strip()
+                }
             window_end = now.replace(second=0, microsecond=0)
             window_start = window_end - _LP_PRICE_HISTORY_WINDOW
             end_ts = int(window_end.timestamp())
@@ -988,9 +1090,62 @@ class PolymarketLPService:
                         if str(row.get("condition_id") or "").strip()
                     )
                 )
+                metadata_condition_ids: list[str] = []
+                for condition_id in condition_ids:
+                    item = preparation_items.get(condition_id)
+                    if item is None:
+                        metadata_condition_ids.append(condition_id)
+                        continue
+                    item_state = str(item.get("state") or "")
+                    if bool(item.get("paused")) or (
+                        item_state == "retrying"
+                        and condition_id not in claimed_condition_ids
+                    ):
+                        continue
+                    item_retry_at = item.get("next_retry_at")
+                    if item_state == "waiting_retry" and item_retry_at:
+                        try:
+                            if now < _timestamp(item_retry_at, name="next_retry_at"):
+                                continue
+                        except ValueError:
+                            continue
+                    metadata_condition_ids.append(condition_id)
+                metadata_condition_ids_tuple = tuple(metadata_condition_ids)
                 if catalog_failure is not None and not condition_ids:
                     catalog_failure_error = "history_catalog_unknown"
                     raise ValueError("history_catalog_unknown")
+                if callable(preparation_retry_claimer):
+                    retryable_conditions = tuple(
+                        dict.fromkeys(
+                            str(item.get("condition_id") or "")
+                            for item in preparation_items.values()
+                            if isinstance(item, Mapping)
+                            and str(item.get("condition_id") or "").strip()
+                            and item.get("stage") == "metadata"
+                            and str(item.get("condition_id") or "") in condition_ids
+                            and item.get("state") == "waiting_retry"
+                            and item.get("next_retry_at") is not None
+                            and _timestamp(
+                                item.get("next_retry_at"), name="next_retry_at"
+                            )
+                            <= now
+                        )
+                    )
+                    claimed_condition_ids = {
+                        str(item.get("condition_id"))
+                        for item in preparation_retry_claimer(
+                            now=now, condition_ids=retryable_conditions
+                        )
+                        if isinstance(item, Mapping)
+                        and str(item.get("condition_id") or "").strip()
+                    }
+                    if callable(preparation_item_reader):
+                        preparation_items = {
+                            str(item.get("condition_id")): item
+                            for item in preparation_item_reader()
+                            if isinstance(item, Mapping)
+                            and str(item.get("condition_id") or "").strip()
+                        }
             except Exception as exc:
                 error_type = catalog_failure_error or type(exc).__name__
                 failed = self._preparation_failure(
@@ -1018,14 +1173,15 @@ class PolymarketLPService:
                     alert_pending=failed.get("alert_claimed_now") is True,
                 )
             metadata_value: Mapping[str, object] | None = None
+            metadata_confirmed_absent: set[str] = set()
             if callable(metadata_batch_reader):
                 metadata_by_condition: dict[str, object] = {}
-                metadata_failure: str | None = None
+                metadata_failures: dict[str, str] = {}
                 self._save_preparation(
                     {
                         "stage": "metadata",
                         "metadata_completed_count": 0,
-                        "metadata_total_count": len(condition_ids),
+                        "metadata_total_count": len(metadata_condition_ids_tuple),
                     },
                     expected_generation=generation,
                 )
@@ -1038,14 +1194,16 @@ class PolymarketLPService:
                         return "metadata_batch_failed"
                     return self._safe_error_type(value)
 
-                for offset in range(0, len(condition_ids), _LP_METADATA_BATCH_SIZE):
+                for offset in range(
+                    0, len(metadata_condition_ids_tuple), _LP_METADATA_BATCH_SIZE
+                ):
                     if stop_event is not None and stop_event.is_set():
                         return self._preparation_result(
                             self.preparation_snapshot(),
                             outcome="cancelled",
                             display_state="cancelled",
                         )
-                    metadata_batch_ids = condition_ids[
+                    metadata_batch_ids = metadata_condition_ids_tuple[
                         offset : offset + _LP_METADATA_BATCH_SIZE
                     ]
                     try:
@@ -1053,8 +1211,23 @@ class PolymarketLPService:
                             metadata_batch_ids, stop_event=stop_event
                         )
                     except Exception as exc:
-                        metadata_failure = type(exc).__name__
-                        break
+                        error_type = self._safe_error_type(type(exc).__name__)
+                        metadata_failures.update(
+                            {
+                                condition_id: error_type
+                                for condition_id in metadata_batch_ids
+                            }
+                        )
+                        self._save_preparation(
+                            {
+                                "stage": "metadata",
+                                "metadata_completed_count": offset + len(metadata_batch_ids),
+                                "metadata_total_count": len(metadata_condition_ids_tuple),
+                                "last_progress_at": self._now(),
+                            },
+                            expected_generation=generation,
+                        )
+                        continue
                     if stop_event is not None and stop_event.is_set():
                         return self._preparation_result(
                             self.preparation_snapshot(),
@@ -1062,8 +1235,13 @@ class PolymarketLPService:
                             display_state="cancelled",
                         )
                     if not isinstance(batch_value, Mapping):
-                        metadata_failure = "metadata_batch_unknown"
-                        break
+                        metadata_failures.update(
+                            {
+                                condition_id: "metadata_batch_unknown"
+                                for condition_id in metadata_batch_ids
+                            }
+                        )
+                        continue
                     if str(batch_value.get("state") or "").lower() in {
                         "cancelled",
                         "canceled",
@@ -1075,8 +1253,13 @@ class PolymarketLPService:
                         )
                     raw_markets = batch_value.get("markets")
                     if not isinstance(raw_markets, Mapping):
-                        metadata_failure = "metadata_batch_unknown"
-                        break
+                        metadata_failures.update(
+                            {
+                                condition_id: "metadata_batch_unknown"
+                                for condition_id in metadata_batch_ids
+                            }
+                        )
+                        continue
                     requested = set(metadata_batch_ids)
                     returned_markets = {
                         str(key): value
@@ -1100,47 +1283,60 @@ class PolymarketLPService:
                         failed_ids = {str(value): "metadata_batch_failed" for value in raw_failed if str(value) in requested}
                     else:
                         failed_ids = {}
-                    if failed_ids:
-                        metadata_failure = batch_failure_code(next(iter(failed_ids.values())))
-                        break
                     raw_deferred = batch_value.get("deferred_ids")
                     deferred_ids = {
                         str(value)
                         for value in raw_deferred
                         if isinstance(value, str) and value in requested
                     } if isinstance(raw_deferred, Sequence) and not isinstance(raw_deferred, (str, bytes)) else set()
-                    if deferred_ids:
-                        metadata_failure = "metadata_deferred"
-                        break
-                    resolved = set(returned_markets) | confirmed_absent
-                    if resolved != requested:
-                        metadata_failure = "metadata_batch_incomplete"
-                        break
+                    for condition_id, failure in failed_ids.items():
+                        metadata_failures[condition_id] = batch_failure_code(failure)
+                    for condition_id in deferred_ids:
+                        metadata_failures[condition_id] = "metadata_deferred"
+                    resolved = (
+                        set(returned_markets)
+                        | confirmed_absent
+                        | set(failed_ids)
+                        | deferred_ids
+                    )
+                    metadata_confirmed_absent.update(
+                        confirmed_absent - set(failed_ids) - deferred_ids
+                    )
+                    for condition_id in requested - resolved:
+                        metadata_failures[condition_id] = "metadata_batch_incomplete"
                     metadata_by_condition.update(returned_markets)
                     self._save_preparation(
                         {
                             "stage": "metadata",
                             "metadata_completed_count": offset + len(metadata_batch_ids),
-                            "metadata_total_count": len(condition_ids),
+                            "metadata_total_count": len(metadata_condition_ids_tuple),
                             "last_progress_at": self._now(),
                         },
                         expected_generation=generation,
                     )
-                if metadata_failure is not None:
-                    failed = self._preparation_failure(
-                        self._now(), stage="metadata", error_type=metadata_failure
-                    )
-                    return self._preparation_result(
-                        failed,
-                        outcome="failure",
-                        reason=self._safe_error_type(metadata_failure),
-                        display_state="unknown",
-                        alert_pending=failed.get("alert_claimed_now") is True,
-                    )
                 metadata_value = metadata_by_condition
+                if metadata_failures and callable(preparation_failure_writer):
+                    failed_at = self._now().astimezone(UTC)
+                    for condition_id, error_type in metadata_failures.items():
+                        preparation_failure_writer(
+                            condition_id,
+                            generation=generation,
+                            stage="metadata",
+                            error=error_type,
+                            failed_at=failed_at,
+                        )
+                    if callable(preparation_item_reader):
+                        preparation_items = {
+                            str(item.get("condition_id")): item
+                            for item in preparation_item_reader()
+                            if isinstance(item, Mapping)
+                            and str(item.get("condition_id") or "").strip()
+                        }
             else:
                 try:
-                    metadata_value = metadata_reader(condition_ids, stop_event=stop_event)  # type: ignore[misc]
+                    metadata_value = metadata_reader(
+                        metadata_condition_ids_tuple, stop_event=stop_event
+                    )  # type: ignore[misc]
                 except Exception as exc:
                     failed = self._preparation_failure(
                         self._now(), stage="metadata", error_type=type(exc).__name__
@@ -1196,6 +1392,59 @@ class PolymarketLPService:
                     if token_id:
                         targets.append((condition_id, token_id))
             targets = list(dict.fromkeys(targets))
+            eligible_targets = tuple(targets)
+            active_targets: list[tuple[str, str]] = []
+            for identity in targets:
+                condition_id = identity[0]
+                item = preparation_items.get(condition_id)
+                if item is None:
+                    active_targets.append(identity)
+                    continue
+                state = str(item.get("state") or "")
+                if bool(item.get("paused")) or (
+                    state == "retrying" and condition_id not in claimed_condition_ids
+                ):
+                    continue
+                next_retry_at = item.get("next_retry_at")
+                if state == "waiting_retry" and next_retry_at:
+                    try:
+                        if now < _timestamp(next_retry_at, name="next_retry_at"):
+                            continue
+                    except ValueError:
+                        continue
+                active_targets.append(identity)
+            targets = active_targets
+            current_items = (
+                preparation_item_reader()
+                if callable(preparation_item_reader)
+                else ()
+            )
+            catalog_confirmed_absent: set[str] = set()
+            if catalog.get("state") == "known" and catalog.get("complete") is True:
+                catalog_condition_ids = set(condition_ids)
+                catalog_confirmed_absent = {
+                    str(item.get("condition_id"))
+                    for item in current_items
+                    if isinstance(item, Mapping)
+                    and str(item.get("condition_id") or "").strip()
+                    and str(item.get("condition_id")) not in catalog_condition_ids
+                    and item.get("state") == "waiting_retry"
+                    and item.get("retry_used") is False
+                    and item.get("paused") is False
+                }
+            clearable_condition_ids = (
+                set(metadata_confirmed_absent) | catalog_confirmed_absent
+            )
+            if callable(preparation_clearer) and clearable_condition_ids:
+                preparation_clearer(
+                    clearable_condition_ids,
+                    generation=generation,
+                )
+                current_items = (
+                    preparation_item_reader()
+                    if callable(preparation_item_reader)
+                    else ()
+                )
             if not targets:
                 prepared_state = (
                     "known"
@@ -1230,6 +1479,79 @@ class PolymarketLPService:
                             "request_count": 0,
                         }
                     )
+                    return result
+                active_items = [
+                    item
+                    for item in current_items
+                    if isinstance(item, Mapping)
+                    and str(item.get("condition_id") or "").strip()
+                ]
+                if active_items:
+                    retry_times: list[datetime] = []
+                    waiting_retry = False
+                    for item in active_items:
+                        if item.get("state") != "waiting_retry":
+                            continue
+                        retry_at = item.get("next_retry_at")
+                        if not retry_at:
+                            continue
+                        try:
+                            retry_timestamp = _timestamp(
+                                retry_at, name="next_retry_at"
+                            )
+                        except ValueError:
+                            continue
+                        retry_times.append(retry_timestamp)
+                        waiting_retry = waiting_retry or now < retry_timestamp
+                    next_retry_at = min(retry_times) if retry_times else None
+                    last_error = next(
+                        (
+                            str(item.get("error"))
+                            for item in active_items
+                            if item.get("error")
+                        ),
+                        None,
+                    )
+                    completed = self._save_preparation(
+                        {
+                            "state": "partial",
+                            "stage": "metadata",
+                            "failure_count": 0,
+                            "paused": False,
+                            "attempt": 0,
+                            "last_success_at": None,
+                            "last_progress_at": now,
+                            "completed_count": 0,
+                            "total_count": 0,
+                            "next_retry_at": next_retry_at,
+                            "last_error": last_error,
+                        },
+                        expected_generation=generation,
+                    )
+                    result = self._preparation_result(
+                        completed,
+                        outcome="waiting_retry" if waiting_retry else "failure",
+                        reason=last_error,
+                        display_state="partial",
+                    )
+                    result.update(
+                        {
+                            "checked_at": now,
+                            "target_count": 0,
+                            "updated_count": 0,
+                            "unknown_count": 0,
+                            "request_count": 0,
+                            "errors": {
+                                str(item.get("condition_id")): str(item.get("error"))
+                                for item in active_items
+                                if item.get("error")
+                            },
+                        }
+                    )
+                    item_alert = self._claim_preparation_item_alerts()
+                    if item_alert is not None and item_alert.get("alert_pending") is True:
+                        result["alert_pending"] = True
+                        result["preparation"].update(deepcopy(dict(item_alert)))
                     return result
                 completed = self._save_preparation(
                     {
@@ -1290,6 +1612,15 @@ class PolymarketLPService:
             ) -> tuple[dict[tuple[str, str], Mapping[str, object]], dict[tuple[str, str], list[dict[str, object]]]]:
                 summaries: dict[tuple[str, str], Mapping[str, object]] = {}
                 samples: dict[tuple[str, str], list[dict[str, object]]] = {}
+
+                def reusable(summary: Mapping[str, object] | None) -> bool:
+                    return bool(
+                        summary
+                        and str(summary.get("state") or "").lower()
+                        in {"known", "ready", "eligible"}
+                        and summary.get("checked_at") is not None
+                    )
+
                 if callable(summary_reader):
                     try:
                         value = summary_reader(identities, now=now)
@@ -1309,9 +1640,14 @@ class PolymarketLPService:
                             value = None
                         if isinstance(value, Mapping):
                             summaries[identity] = value
-                if callable(sample_reader):
+                sample_identities = tuple(
+                    identity
+                    for identity in identities
+                    if not reusable(summaries.get(identity))
+                )
+                if callable(sample_reader) and sample_identities:
                     try:
-                        value = sample_reader(identities)
+                        value = sample_reader(sample_identities)
                         if isinstance(value, Mapping):
                             samples.update(
                                 (key, [dict(item) for item in rows if isinstance(item, Mapping)])
@@ -1321,7 +1657,7 @@ class PolymarketLPService:
                     except Exception:
                         pass
                 elif callable(samples_one):
-                    for identity in identities:
+                    for identity in sample_identities:
                         try:
                             value = samples_one(*identity)
                         except Exception:
@@ -1369,7 +1705,7 @@ class PolymarketLPService:
                 if not rows:
                     return
                 if callable(batch_writer):
-                    batch_writer(rows)
+                    batch_writer(rows, generation=generation)
                     return
                 if callable(one_writer):
                     for row in rows:
@@ -1385,6 +1721,9 @@ class PolymarketLPService:
             request_count = 0
             errors: dict[str, str] = {}
             operational_failure: tuple[str, str] | None = None
+            market_failures: dict[str, tuple[str, str, str | None]] = {}
+            recorded_failure_conditions: set[str] = set()
+            successful_conditions: set[str] = set(metadata_confirmed_absent)
             benign_history_errors = {
                 "cancelled",
                 "history_insufficient",
@@ -1392,13 +1731,283 @@ class PolymarketLPService:
                 "history_values_unknown",
                 "history_window_incomplete",
             }
-            completed_count = 0
-            for group_offset in range(0, len(identity_batches), _LP_PRICE_HISTORY_MAX_CONCURRENCY):
+            completed_identities: set[tuple[str, str]] = set()
+            successful_identities: set[tuple[str, str]] = set()
+            updated_identities: set[tuple[str, str]] = set()
+            unknown_identities: set[tuple[str, str]] = set()
+            target_identities_by_condition_lists: dict[str, list[tuple[str, str]]] = {}
+            for identity in eligible_targets:
+                target_identities_by_condition_lists.setdefault(identity[0], []).append(identity)
+            target_identities_by_condition = {
+                condition_id: tuple(identities)
+                for condition_id, identities in target_identities_by_condition_lists.items()
+            }
+            queued_batches = list(identity_batches)
+
+            def persist_new_market_failures() -> None:
+                if not callable(preparation_failure_writer):
+                    return
+                failed_at = self._now().astimezone(UTC)
+                for condition_id, (stage, error_type, token_id) in market_failures.items():
+                    if condition_id in recorded_failure_conditions:
+                        continue
+                    preparation_failure_writer(
+                        condition_id,
+                        generation=generation,
+                        stage=stage,
+                        error=error_type,
+                        failed_at=failed_at,
+                        token_id=token_id,
+                    )
+                    recorded_failure_conditions.add(condition_id)
+
+            def dispatch_due_metadata(
+                condition_ids: tuple[str, ...],
+            ) -> tuple[tuple[str, str], ...]:
+                """Resolve due metadata before claiming its history retry."""
+
+                nonlocal metadata_value
+                requested = tuple(
+                    dict.fromkeys(
+                        condition_id
+                        for condition_id in condition_ids
+                        if condition_id
+                    )
+                )
+                if not requested:
+                    return ()
+                returned_markets: dict[str, Mapping[str, object]] = {}
+                failed_ids: dict[str, str] = {}
+                try:
+                    if callable(metadata_batch_reader):
+                        batch_value = metadata_batch_reader(
+                            requested, stop_event=stop_event
+                        )
+                        if not isinstance(batch_value, Mapping):
+                            raise ValueError("metadata_batch_unknown")
+                        raw_markets = batch_value.get("markets")
+                        if isinstance(raw_markets, Mapping):
+                            returned_markets = {
+                                str(key): value
+                                for key, value in raw_markets.items()
+                                if str(key) in requested and isinstance(value, Mapping)
+                            }
+                        raw_failed = batch_value.get("failed_ids")
+                        if isinstance(raw_failed, Mapping):
+                            failed_ids.update(
+                                {
+                                    str(key): self._safe_error_type(value)
+                                    for key, value in raw_failed.items()
+                                    if str(key) in requested
+                                }
+                            )
+                        elif isinstance(raw_failed, Sequence) and not isinstance(
+                            raw_failed, (str, bytes)
+                        ):
+                            failed_ids.update(
+                                {
+                                    str(value): "metadata_batch_failed"
+                                    for value in raw_failed
+                                    if str(value) in requested
+                                }
+                            )
+                        raw_absent = batch_value.get("confirmed_absent_ids")
+                        confirmed_absent = (
+                            {
+                                str(value)
+                                for value in raw_absent
+                                if isinstance(value, str) and value in requested
+                            }
+                            if isinstance(raw_absent, Sequence)
+                            and not isinstance(raw_absent, (str, bytes))
+                            else set()
+                        )
+                        confirmed_absent -= set(failed_ids)
+                        successful_conditions.update(confirmed_absent)
+                    elif callable(metadata_reader):
+                        raw_value = metadata_reader(requested, stop_event=stop_event)
+                        if isinstance(raw_value, Mapping):
+                            returned_markets = {
+                                str(key): value
+                                for key, value in raw_value.items()
+                                if str(key) in requested and isinstance(value, Mapping)
+                            }
+                    else:
+                        failed_ids = {
+                            condition_id: "history_readers_unavailable"
+                            for condition_id in requested
+                        }
+                except Exception as exc:
+                    failed_ids = {
+                        condition_id: self._safe_error_type(type(exc).__name__)
+                        for condition_id in requested
+                    }
+
+                retry_identities: list[tuple[str, str]] = []
+                updated_metadata = dict(metadata_value)
+                reward_by_condition = {
+                    str(row.get("condition_id") or ""): row
+                    for row in market_rows
+                    if isinstance(row, Mapping)
+                }
+                for condition_id in requested:
+                    market = returned_markets.get(condition_id)
+                    if not isinstance(market, Mapping):
+                        failed_ids.setdefault(
+                            condition_id, "metadata_batch_incomplete"
+                        )
+                        market_failures.setdefault(
+                            condition_id,
+                            (
+                                "metadata",
+                                self._safe_error_type(failed_ids[condition_id]),
+                                None,
+                            ),
+                        )
+                        continue
+                    reward_market = reward_by_condition.get(condition_id)
+                    pool = (
+                        _maybe_decimal(reward_market.get("daily_pool_usd"))
+                        if isinstance(reward_market, Mapping)
+                        else None
+                    )
+                    outcomes = market.get("outcomes")
+                    if (
+                        not isinstance(reward_market, Mapping)
+                        or reward_market.get("reward_active") is not True
+                        or pool is None
+                        or pool <= 0
+                        or market.get("accepting_orders") is not True
+                        or not isinstance(outcomes, Mapping)
+                    ):
+                        market_failures.setdefault(
+                            condition_id,
+                            ("metadata", "metadata_market_unusable", None),
+                        )
+                        continue
+                    identities = tuple(
+                        (condition_id, str(raw_outcome.get("token_id") or "").strip())
+                        for raw_outcome in outcomes.values()
+                        if isinstance(raw_outcome, Mapping)
+                        and str(raw_outcome.get("token_id") or "").strip()
+                    )
+                    if not identities:
+                        market_failures.setdefault(
+                            condition_id,
+                            ("metadata", "metadata_market_unusable", None),
+                        )
+                        continue
+                    updated_metadata[condition_id] = market
+                    target_identities_by_condition[condition_id] = identities
+                    retry_identities.extend(identities)
+                if retry_identities:
+                    metadata_value = updated_metadata
+                    self._publish_prepared_inputs(
+                        catalog, metadata_value, state="preparing"
+                    )
+                return tuple(retry_identities)
+
+            while queued_batches:
                 if stop_event is not None and stop_event.is_set():
                     break
-                batch_group = identity_batches[
-                    group_offset : group_offset + _LP_PRICE_HISTORY_MAX_CONCURRENCY
-                ]
+                if callable(preparation_retry_claimer):
+                    retry_now = self._now()
+                    retryable_items = (
+                        preparation_item_reader()
+                        if callable(preparation_item_reader)
+                        else ()
+                    )
+                    claimable_conditions = tuple(
+                        dict.fromkeys(
+                            str(item.get("condition_id") or "")
+                            for item in retryable_items
+                            if isinstance(item, Mapping)
+                            and str(item.get("condition_id") or "").strip()
+                            and item.get("state") == "waiting_retry"
+                            and item.get("next_retry_at") is not None
+                            and (
+                                str(item.get("condition_id") or "")
+                                in target_identities_by_condition
+                                or (
+                                    item.get("stage") == "metadata"
+                                    and str(item.get("condition_id") or "")
+                                    in condition_ids
+                                )
+                            )
+                            and (
+                                _timestamp(
+                                    item.get("next_retry_at"),
+                                    name="next_retry_at",
+                                )
+                                <= retry_now
+                            )
+                        )
+                    )
+                    due_retries = preparation_retry_claimer(
+                        now=retry_now,
+                        condition_ids=claimable_conditions,
+                    )
+                    due_metadata_ids = tuple(
+                        str(item.get("condition_id") or "")
+                        for item in due_retries
+                        if isinstance(item, Mapping)
+                        and item.get("stage") == "metadata"
+                    )
+                    metadata_retry_identities = dispatch_due_metadata(due_metadata_ids)
+                    if metadata_retry_identities:
+                        targets.extend(metadata_retry_identities)
+                        targets[:] = list(dict.fromkeys(targets))
+                        for offset in range(
+                            0,
+                            len(metadata_retry_identities),
+                            _LP_PRICE_HISTORY_BATCH_SIZE,
+                        ):
+                            queued_batches.insert(
+                                offset // _LP_PRICE_HISTORY_BATCH_SIZE,
+                                tuple(
+                                    metadata_retry_identities[
+                                        offset : offset + _LP_PRICE_HISTORY_BATCH_SIZE
+                                    ]
+                                ),
+                            )
+                    retry_identities = tuple(
+                        identity
+                        for item in due_retries
+                        if isinstance(item, Mapping)
+                        and item.get("stage") != "metadata"
+                        for identity in target_identities_by_condition.get(
+                            str(item.get("condition_id") or ""), ()
+                        )
+                    )
+                    if retry_identities:
+                        targets.extend(retry_identities)
+                        targets[:] = list(dict.fromkeys(targets))
+                        retry_identity_set = set(retry_identities)
+                        queued_batches = [
+                            tuple(
+                                identity
+                                for identity in batch
+                                if identity not in retry_identity_set
+                            )
+                            for batch in queued_batches
+                        ]
+                        queued_batches = [batch for batch in queued_batches if batch]
+                        retry_batches = [
+                            tuple(retry_identities[offset : offset + _LP_PRICE_HISTORY_BATCH_SIZE])
+                            for offset in range(
+                                0, len(retry_identities), _LP_PRICE_HISTORY_BATCH_SIZE
+                            )
+                        ]
+                        queued_batches[0:0] = retry_batches
+                        for item in due_retries:
+                            if isinstance(item, Mapping):
+                                recorded_failure_conditions.discard(
+                                    str(item.get("condition_id") or "")
+                                )
+                batch_group = tuple(
+                    queued_batches[:_LP_PRICE_HISTORY_MAX_CONCURRENCY]
+                )
+                del queued_batches[:_LP_PRICE_HISTORY_MAX_CONCURRENCY]
                 cache_by_batch: dict[
                     tuple[tuple[str, str], ...],
                     tuple[
@@ -1409,9 +2018,26 @@ class PolymarketLPService:
                 request_group: list[tuple[tuple[tuple[str, str], ...], int]] = []
                 for identity_batch in batch_group:
                     summaries, cached_samples = cached_facts(identity_batch)
-                    cache_by_batch[identity_batch] = (summaries, cached_samples)
-                    starts: list[int] = []
+                    missing_identities: list[tuple[str, str]] = []
                     for identity in identity_batch:
+                        summary = summaries.get(identity)
+                        state = str(summary.get("state") or "").lower() if summary else ""
+                        if (
+                            state in {"known", "ready", "eligible"}
+                            and summary is not None
+                            and summary.get("checked_at") is not None
+                        ):
+                            completed_identities.add(identity)
+                            successful_identities.add(identity)
+                        else:
+                            missing_identities.append(identity)
+                    completed_count = len(completed_identities)
+                    if not missing_identities:
+                        continue
+                    request_identities = tuple(missing_identities)
+                    cache_by_batch[request_identities] = (summaries, cached_samples)
+                    starts: list[int] = []
+                    for identity in request_identities:
                         rows = cached_samples.get(identity, [])
                         stamps = [
                             row.get("t")
@@ -1426,7 +2052,18 @@ class PolymarketLPService:
                                 else int(window_start.timestamp()),
                             )
                         )
-                    request_group.append((identity_batch, min(starts)))
+                    request_group.append((request_identities, min(starts)))
+                self._save_preparation(
+                    {
+                        "stage": "history",
+                        "completed_count": completed_count,
+                        "total_count": len(targets),
+                        "last_progress_at": self._now(),
+                    },
+                    expected_generation=generation,
+                )
+                if not request_group:
+                    continue
                 with ThreadPoolExecutor(
                     max_workers=min(_LP_PRICE_HISTORY_MAX_CONCURRENCY, len(request_group)),
                     thread_name_prefix="prediction-lp-history",
@@ -1482,6 +2119,21 @@ class PolymarketLPService:
                                 new_points = {}
                             merged, merge_error = parse_samples(previous_rows)
                             reason = parse_error or merge_error
+                            failure_code: str | None = None
+                            if error is not None and error != "cancelled":
+                                failure_code = error
+                            else:
+                                payload_error = payload_errors.get(token_id)
+                                if (
+                                    isinstance(payload_error, str)
+                                    and payload_error not in benign_history_errors
+                                ):
+                                    failure_code = payload_error
+                            if failure_code is not None:
+                                market_failures.setdefault(
+                                    condition_id,
+                                    ("history", self._safe_error_type(failure_code), token_id),
+                                )
                             if reason is None:
                                 merged.update(new_points)
                                 bounded = {
@@ -1497,6 +2149,12 @@ class PolymarketLPService:
                                     if first_stamp > int(window_start.timestamp()) + 60 or last_stamp < end_ts - 60:
                                         reason = "history_window_incomplete"
                             if reason is None:
+                                successful_identities.add(identity)
+                                successful_conditions.add(condition_id)
+                            if reason is None:
+                                updated_identities.add(identity)
+                                unknown_identities.discard(identity)
+                                errors.pop(token_id, None)
                                 prices = [row["p"] for row in bounded.values()]
                                 summary: dict[str, object] = {
                                     "state": "known",
@@ -1504,14 +2162,15 @@ class PolymarketLPService:
                                     "checked_at": now,
                                     "window_start": window_start,
                                     "window_end": window_end,
-                                    "sample_count": len(bounded),
-                                    "valid_until": now + timedelta(hours=2),
-                                    "last_attempt_at": now,
-                                }
+                                "sample_count": len(bounded),
+                                "valid_until": now + timedelta(hours=24),
+                                "last_attempt_at": now,
+                                "preparation_generation": generation,
+                            }
                                 samples_for_store = [bounded[stamp] for stamp in sorted(bounded)]
-                                updated_count += 1
                             else:
-                                unknown_count += 1
+                                unknown_identities.add(identity)
+                                updated_identities.discard(identity)
                                 errors[token_id] = reason
                                 samples_for_store = previous_rows
                                 summary = prior
@@ -1526,6 +2185,7 @@ class PolymarketLPService:
                                     }
                                 elif summary.get("checked_at") is None:
                                     summary["state"] = "unknown"
+                                summary["preparation_generation"] = generation
                             rows_to_write.append(
                                 {
                                     "condition_id": condition_id,
@@ -1535,7 +2195,10 @@ class PolymarketLPService:
                                 }
                             )
                         write_rows(rows_to_write)
-                        completed_count += len(returned_identities)
+                        completed_identities.update(returned_identities)
+                        completed_count = len(completed_identities)
+                        updated_count = len(updated_identities)
+                        unknown_count = len(unknown_identities)
                         self._save_preparation(
                             {
                                 "stage": "history",
@@ -1546,21 +2209,93 @@ class PolymarketLPService:
                             expected_generation=generation,
                         )
                         del rows_to_write, payload, history_map, future
-                if operational_failure is not None:
-                    break
+                persist_new_market_failures()
+                for condition_id in tuple(market_failures):
+                    if not any(
+                        identity in unknown_identities
+                        for identity in target_identities_by_condition.get(condition_id, ())
+                    ):
+                        market_failures.pop(condition_id, None)
+                        recorded_failure_conditions.discard(condition_id)
                 del cache_by_batch, request_group
+            for condition_id, identities in target_identities_by_condition.items():
+                if identities and all(
+                    identity in successful_identities for identity in identities
+                ):
+                    successful_conditions.add(condition_id)
+            persist_new_market_failures()
+            if (
+                operational_failure is not None
+                and operational_failure[0] == "history"
+                and not market_failures
+                and not unknown_identities
+            ):
+                operational_failure = None
+            if callable(preparation_clearer) and successful_conditions:
+                preparation_clearer(
+                    (
+                        condition_id
+                        for condition_id in successful_conditions
+                        if condition_id not in market_failures
+                    ),
+                    generation=generation,
+                )
             if stop_event is not None and stop_event.is_set():
                 return self._preparation_result(
                     self.preparation_snapshot(),
                     outcome="cancelled",
                     display_state="cancelled",
                 )
-            state = "known" if updated_count and not unknown_count else "partial" if updated_count else "unknown"
+            state = "known" if completed_count and not unknown_count else "partial" if completed_count else "unknown"
             self._publish_prepared_inputs(catalog, metadata_value, state=state)
             if operational_failure is None:
                 operational_failure = catalog_failure
             if operational_failure is not None:
                 stage, error_type = operational_failure
+                if market_failures and callable(preparation_item_reader):
+                    current_items = preparation_item_reader()
+                    retry_times = [
+                        item.get("next_retry_at")
+                        for item in current_items
+                        if isinstance(item, Mapping) and item.get("next_retry_at")
+                    ]
+                    partial = self._save_preparation(
+                        {
+                            "state": "partial",
+                            "stage": stage,
+                            "failure_count": 0,
+                            "paused": False,
+                            "attempt": 0,
+                            "last_success_at": None,
+                            "last_progress_at": self._now(),
+                            "completed_count": completed_count,
+                            "total_count": len(targets),
+                            "next_retry_at": min(retry_times) if retry_times else None,
+                            "last_error": error_type,
+                        },
+                        expected_generation=generation,
+                    )
+                    result = self._preparation_result(
+                        partial,
+                        outcome="failure",
+                        reason=error_type,
+                        display_state=state,
+                    )
+                    result.update(
+                        {
+                            "target_count": len(targets),
+                            "updated_count": updated_count,
+                            "unknown_count": unknown_count,
+                            "request_count": request_count,
+                            "checked_at": now,
+                            "errors": errors,
+                        }
+                    )
+                    item_alert = self._claim_preparation_item_alerts()
+                    if item_alert is not None and item_alert.get("alert_pending") is True:
+                        result["alert_pending"] = True
+                        result["preparation"].update(deepcopy(dict(item_alert)))
+                    return result
                 failed = self._preparation_failure(
                     self._now(), stage=stage, error_type=error_type
                 )
@@ -1582,9 +2317,32 @@ class PolymarketLPService:
                     }
                 )
                 return result
+            remaining_items = (
+                preparation_item_reader() if callable(preparation_item_reader) else []
+            )
+            final_state = "partial" if remaining_items else "ready"
+            waiting_retry = False
+            next_retry_at: object | None = None
+            for item in remaining_items:
+                if not isinstance(item, Mapping) or item.get("state") != "waiting_retry":
+                    continue
+                retry_at = item.get("next_retry_at")
+                if retry_at:
+                    try:
+                        retry_timestamp = _timestamp(retry_at, name="next_retry_at")
+                        waiting_retry = now < retry_timestamp
+                        if waiting_retry and (
+                            next_retry_at is None
+                            or retry_timestamp < _timestamp(
+                                next_retry_at, name="next_retry_at"
+                            )
+                        ):
+                            next_retry_at = retry_timestamp
+                    except ValueError:
+                        waiting_retry = True
             completed = self._save_preparation(
                 {
-                    "state": "ready",
+                    "state": final_state,
                     "stage": "complete",
                     "failure_count": 0,
                     "paused": False,
@@ -1593,13 +2351,16 @@ class PolymarketLPService:
                     "last_progress_at": now,
                     "completed_count": len(targets),
                     "total_count": len(targets),
-                    "next_retry_at": None,
+                    "next_retry_at": next_retry_at,
                     "last_error": None,
                 },
                 expected_generation=generation,
             )
             result = self._preparation_result(
-                completed, outcome="success", display_state=state
+                completed,
+                outcome="waiting_retry" if waiting_retry else "success",
+                reason="retry_not_due" if waiting_retry else None,
+                display_state=state if final_state == "ready" else final_state,
             )
             result.update(
                 {
@@ -2507,7 +3268,7 @@ class PolymarketLPService:
                     except ValueError:
                         add_reason("volatility", direction, "history_time_unknown")
                     else:
-                        if history_age < 0 or history_age >= 2 * 60 * 60:
+                        if history_age < 0 or history_age >= _LP_PRICE_HISTORY_WINDOW.total_seconds():
                             add_reason("volatility", direction, "history_summary_expired")
                         valid_until = summary.get("valid_until")
                         if valid_until is not None:

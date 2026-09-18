@@ -12628,7 +12628,7 @@ def test_lp_history_progress_does_not_block_ready_candidates(tmp_path: Path) -> 
     assert history_started.wait(timeout=2)
     preparation = service.preparation_snapshot()
     assert preparation["state"] == "preparing"
-    assert preparation["completed_count"] == 0
+    assert preparation["completed_count"] == 1
     assert preparation["total_count"] == 2
 
     snapshot = service.refresh_candidates(force=True)
@@ -13036,7 +13036,7 @@ def test_lp_price_history_updates_incrementally_and_expires(tmp_path: Path) -> N
                 "state": "known",
                 "history": {
                     "token-M1": [
-                        {"t": int(first_now.timestamp()), "p": Decimal("0.500")},
+                        {"t": start_ts, "p": Decimal("0.500")},
                         {"t": int(now[0].timestamp()), "p": Decimal("0.505")},
                     ]
                 },
@@ -13082,15 +13082,16 @@ def test_lp_price_history_updates_incrementally_and_expires(tmp_path: Path) -> N
     assert first_summary is not None
     assert Decimal(str(first_summary["amplitude"])) == Decimal("0.300")
 
-    now[0] = first_now + timedelta(hours=1)
+    now[0] = first_now + timedelta(hours=25)
     second = service.refresh_price_history()
     assert second["state"] == "known"
     assert len(exchange.history_calls) == 2
     second_call = exchange.history_calls[1]
-    assert second_call["start_ts"] == int(first_now.timestamp()) - 60
+    assert second_call["start_ts"] == int(
+        (first_now + timedelta(hours=1)).timestamp()
+    )
     samples = store.lp_price_history_samples("condition-M1", "token-M1")
     assert [Decimal(str(row["p"])) for row in samples] == [
-        Decimal("0.500"),
         Decimal("0.500"),
         Decimal("0.505"),
     ]
@@ -13101,27 +13102,27 @@ def test_lp_price_history_updates_incrementally_and_expires(tmp_path: Path) -> N
         now[0].isoformat().replace("+00:00", "")
     )
 
-    exchange.fail_history = True
-    now[0] = first_now + timedelta(hours=2)
-    failed = service.refresh_price_history()
-    assert failed["state"] == "unknown"
-    assert len(exchange.history_calls) == 3
-    preserved = store.lp_price_history_summary("condition-M1", "token-M1", now=now[0])
-    assert preserved is not None
-    assert str(preserved["checked_at"]).startswith(
-        (first_now + timedelta(hours=1)).isoformat().replace("+00:00", "")
-    )
-    assert Decimal(str(preserved["amplitude"])) == Decimal("0.005")
-
-    now[0] = first_now + timedelta(hours=2, minutes=59, seconds=59)
+    now[0] = first_now + timedelta(hours=48, minutes=59, seconds=59)
     before_candidates = len(exchange.history_calls)
     usable = service.refresh_candidates(force=True)
     assert len(exchange.history_calls) == before_candidates
     assert usable["funnel"]["volatility_pass"] == 1
 
-    now[0] = first_now + timedelta(hours=3)
+    exchange.fail_history = True
+    now[0] = first_now + timedelta(hours=49)
+    failed = service.refresh_price_history()
+    assert failed["state"] == "partial"
+    assert len(exchange.history_calls) == 3
+    preserved = store.lp_price_history_summary("condition-M1", "token-M1", now=now[0])
+    assert preserved is not None
+    assert str(preserved["checked_at"]).startswith(
+        (first_now + timedelta(hours=25)).isoformat().replace("+00:00", "")
+    )
+    assert Decimal(str(preserved["amplitude"])) == Decimal("0.005")
+
+    history_after_failure = len(exchange.history_calls)
     expired = service.refresh_candidates(force=True)
-    assert len(exchange.history_calls) == before_candidates
+    assert len(exchange.history_calls) == history_after_failure
     assert expired["funnel"]["volatility_pass"] == 0
 
 
