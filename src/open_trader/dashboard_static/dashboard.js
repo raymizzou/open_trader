@@ -9470,9 +9470,12 @@ function renderSimulatedAccountView(broker) {
     report.hold_actions,
     payload.portfolio_value_hkd,
   );
+  const excludedNote = Array.isArray(payload.excluded_positions) && payload.excluded_positions.length
+    ? `<p class="account-empty">非股票资产未计入持仓明细：${payload.excluded_positions.map((row) => `${escapeHtml(formatPlain(row?.code || ""))} · ${escapeHtml(formatPlain(row?.name || ""))} · 市值 ${escapeHtml(formatPlain(row?.market_value || ""))} ${escapeHtml(formatPlain(row?.currency || ""))}`).join("；")}</p>`
+    : "";
   return `${distribution}${rows.length
     ? renderAccountTable(rows, {simulated: true})
-    : '<p class="account-empty">当前无模拟盘持仓</p>'}`;
+    : '<p class="account-empty">当前无模拟盘持仓</p>'}${excludedNote}`;
 }
 
 function renderEmbeddedTrendReport(broker) {

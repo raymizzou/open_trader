@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-18
 
+- 模拟盘持仓现在过滤富途 OpenD 间歇返回的非正股行（如 `US.0000`）：无法规范成本市场正股代码的持仓行从持仓表排除，payload 透传 `excluded_positions` 说明，Dashboard 在持仓明细后追加「非股票资产未计入持仓明细」提示，面板不再因单行异常整体不可用；其余解析错误仍保持 fail-closed。验收脚本同步跳过非正股行并拒绝正股代码藏入排除行。Docker 重点回归：`test_trend_simulate_positions.py`、两个模拟盘验收用例与 Dashboard simulate 渲染用例通过。
+
 - LP 准备状态现在依据可用历史覆盖判定：有效缓存仍为 `known`，部分可用为 `partial`，全量未知为 `unknown`；成功关闭的待补市场会结束其未消耗预算并避免零延迟重试。元数据批量与直读路径共享该完成规则，最终 Docker 重点回归 17 个用例通过（17 passed）。
 
 - LP 日常准备现在以 24 小时摘要有效期和逐市场覆盖状态运行：健康方向在部分历史或资料失败时继续轻筛，首次失败五分钟后补一次，再次失败只暂停该市场并告警；到期元数据重试在下一空闲历史批次边界实际派发，摘要命中不读取原始样本。Dashboard 显示有界覆盖计数，并在 `partial` 且存在暂停项时复用既有恢复请求；等待中的部分覆盖保持无恢复动作。Docker 重点历史、准备、运行时、通知、恢复、调度、Dashboard 与既有服务集成回归通过。

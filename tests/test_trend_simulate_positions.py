@@ -658,6 +658,52 @@ def test_simulated_positions_skip_non_positive_positions(tmp_path: Path) -> None
     assert [row["symbol"] for row in payload["positions"]] == ["TRV"]
 
 
+def test_simulated_positions_exclude_non_equity_cash_rows(tmp_path: Path) -> None:
+    cash_row = {
+        "code": "US.0000",
+        "stock_name": "现金",
+        "qty": "1",
+        "cost_price": "8488.12",
+        "nominal_price": "8488.12",
+        "market_val": "8488.12",
+        "pl_ratio": "0",
+    }
+    clients = FakeClientFactory([cash_row, _position("US.TRV")])
+
+    payload = _service(tmp_path, clients).load("futu")
+
+    assert payload["available"] is True
+    assert payload["error"] == ""
+    assert [row["symbol"] for row in payload["positions"]] == ["TRV"]
+    assert payload["excluded_positions"] == [
+        {
+            "code": "US.0000",
+            "name": "现金",
+            "quantity": "1",
+            "market_value": "8488.12",
+            "currency": "USD",
+        }
+    ]
+
+
+def test_simulated_positions_exclude_non_canonical_hk_row(tmp_path: Path) -> None:
+    clients = FakeClientFactory([_position("HK.0000")])
+
+    payload = _service(tmp_path, clients).load("phillips")
+
+    assert payload["available"] is True
+    assert payload["positions"] == []
+    assert payload["excluded_positions"] == [
+        {
+            "code": "HK.0000",
+            "name": "旅行者保险",
+            "quantity": "9",
+            "market_value": "3340.80",
+            "currency": "HKD",
+        }
+    ]
+
+
 def test_simulated_positions_accept_beijing_exchange_position(tmp_path: Path) -> None:
     payload = _service(
         tmp_path, FakeClientFactory([_position("BJ.920000")])

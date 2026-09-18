@@ -10110,6 +10110,36 @@ console.log(JSON.stringify({loaded,initialPanelRenders,linkedCalls,allCalls:call
     assert rendered["attributionStates"].count("报告关联冲突") == 1
 
 
+def test_dashboard_simulate_positions_note_excluded_non_equity_rows() -> None:
+    output = run_dashboard_js(r'''
+function mount(){return {innerHTML:"",textContent:"",attributes:{},classList:{add(){},remove(){}},
+  setAttribute(name,value){this.attributes[name]=value;},removeAttribute(name){delete this.attributes[name];},
+  querySelector(){return null;}};}
+for(const id of ["account-tabs","account-holdings","visible-count","workspace-grid","symbol-detail-panel"]){elements[id]=mount();}
+const panel=mount();
+const tabs=["real","simulate","report","review"].map((view)=>({dataset:{accountBroker:"futu",accountView:view},
+  tabIndex:-1,setAttribute(){}}));
+elements["account-holdings"].querySelector=(selector)=>selector==="#account-futu-view-panel"?panel:null;
+elements["account-holdings"].querySelectorAll=()=>tabs;
+state.dashboard={summary:{portfolio_value_hkd:"1000"},broker_summaries:[{broker:"futu",portfolio_value_hkd:"1000"}],
+  cash_rows:[],holdings:[],trend_reports:{futu:{available:true}},trend_reviews:{futu:{available:true,market_label:"美股"}}};
+state.brokerFilter="futu";
+const position={broker:"futu",market:"US",symbol:"AAPL",name:"AAPL",quantity:"1",market_value_hkd:"750"};
+state.trendSimulatePositions.futu={available:true,broker:"futu",portfolio_value_hkd:"4000",positions:[position],
+  excluded_positions:[{code:"US.0000",name:"现金",quantity:"1",market_value:"8488.12",currency:"USD"}]};
+await setAccountView("futu","simulate");
+const withNote=panel.innerHTML;
+state.trendSimulatePositions.futu={available:true,broker:"futu",portfolio_value_hkd:"4000",positions:[position]};
+await setAccountView("futu","simulate");
+const withoutNote=panel.innerHTML;
+console.log(JSON.stringify({withNote,withoutNote}));
+''')
+    rendered = json.loads(output)
+    for fragment in ("非股票资产未计入持仓明细", "US.0000", "现金", "8488.12"):
+        assert fragment in rendered["withNote"]
+    assert "非股票资产未计入持仓明细" not in rendered["withoutNote"]
+
+
 def test_dashboard_account_poll_is_independent_and_conditional() -> None:
     output = run_dashboard_js(r'''
 const requests=[];

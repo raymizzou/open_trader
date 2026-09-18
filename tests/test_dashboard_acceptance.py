@@ -8169,6 +8169,54 @@ def test_acceptance_accepts_zero_simulated_positions(tmp_path: Path) -> None:
     )
 
 
+def test_acceptance_direct_simulate_facts_skip_non_equity_rows(tmp_path: Path) -> None:
+    snapshot = simulate_snapshot()
+    snapshot["positions"] = [
+        *snapshot["positions"],
+        {"code": "US.0000", "qty": "1", "cost_price": "8488.12", "last_price": "8488.12"},
+    ]
+    payload = simulate_api_payload()
+    payload["excluded_positions"] = [
+        {
+            "code": "US.0000",
+            "name": "现金",
+            "quantity": "1",
+            "market_value": "8488.12",
+            "currency": "USD",
+        }
+    ]
+
+    dashboard_acceptance._validate_simulated_positions(
+        "futu",
+        snapshot,
+        payload,
+        tmp_path / "data",
+        tmp_path / "reports",
+    )
+
+
+def test_acceptance_rejects_equity_row_hidden_in_excluded_positions(tmp_path: Path) -> None:
+    payload = simulate_api_payload()
+    payload["excluded_positions"] = [
+        {
+            "code": "US.NDAQ",
+            "name": "纳斯达克",
+            "quantity": "13",
+            "market_value": "1300.00",
+            "currency": "USD",
+        }
+    ]
+
+    with pytest.raises(AssertionError, match="排除行包含正股代码"):
+        dashboard_acceptance._validate_simulated_positions(
+            "futu",
+            simulate_snapshot(),
+            payload,
+            tmp_path / "data",
+            tmp_path / "reports",
+        )
+
+
 def test_acceptance_classifies_unavailable_configured_futu_account_as_blocked(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -106,7 +106,7 @@ class TrendSimulatePositionService:
             )
             snapshot = client.account_snapshot()
             synced_at = self.now().isoformat(timespec="seconds")
-            positions = _project_positions(
+            positions, excluded_positions = _project_positions(
                 snapshot,
                 broker=broker,
                 market=market,
@@ -129,6 +129,7 @@ class TrendSimulatePositionService:
                 "synced_at": synced_at,
                 "portfolio_value_hkd": _money(net_value * fx),
                 "positions": positions,
+                "excluded_positions": excluded_positions,
                 "error": "",
             }
         except Exception as exc:
@@ -158,7 +159,7 @@ def _project_positions(
     fx_to_hkd: Mapping[str, Decimal],
     price_as_of: str,
     attributions: Mapping[str, dict[str, Any]],
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     if not isinstance(snapshot, Mapping):
         raise ValueError("simulate account snapshot is invalid")
     net_value, _ = _required_decimal(snapshot.get("net_value"), "simulate net value")
@@ -175,6 +176,7 @@ def _project_positions(
         raise ValueError("missing HKD conversion rate for USD")
 
     projected: list[dict[str, Any]] = []
+    excluded: list[dict[str, str]] = []
     for position in positions:
         if not isinstance(position, Mapping):
             raise ValueError("simulate account position is invalid")
@@ -186,7 +188,27 @@ def _project_positions(
         code = str(
             _first_nonempty(position, "code", "futu_code") or ""
         ).strip().upper()
-        symbol = _position_symbol(code, market)
+        symbol = equity_position_symbol(code, market)
+        if symbol is None:
+            excluded.append(
+                {
+                    "code": code,
+                    "name": str(
+                        _first_nonempty(
+                            position, "stock_name", "name", "security_name"
+                        )
+                        or code
+                    ).strip(),
+                    "quantity": str(
+                        _first_nonempty(position, "qty", "quantity") or ""
+                    ).strip(),
+                    "market_value": str(
+                        _first_nonempty(position, "market_val", "market_value") or ""
+                    ).strip(),
+                    "currency": currency,
+                }
+            )
+            continue
         cost_price, cost_price_text = _required_decimal(
             _first_nonempty(position, "cost_price", "average_cost"),
             "position cost price",
@@ -239,13 +261,16 @@ def _project_positions(
                 **attribution,
             }
         )
-    return projected
+    return projected, excluded
 
 
-def _position_symbol(code: str, market: str) -> str:
-    canonical = to_futu_symbol(market, code)
+def equity_position_symbol(code: str, market: str) -> str | None:
+    try:
+        canonical = to_futu_symbol(market, code)
+    except ValueError:
+        return None
     if canonical != code:
-        raise ValueError(f"position code {code!r} does not belong to {market}")
+        return None
     return canonical.split(".", 1)[1]
 
 

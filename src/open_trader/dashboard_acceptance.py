@@ -34,13 +34,13 @@ from .dashboard import (
     _valid_partial_trend_action,
 )
 from .daily_premarket import _optional_positive_tm_id, _read_env_file
-from .futu_symbols import to_futu_symbol
 from .futu_universe import build_account_quote_universe
 from .kelly_order_execution import FutuSimulateOrderExecutionClient
 from .trend_simulate_positions import (
     TREND_SIMULATE_BROKERS,
     _action_events,
     _reports_by_hash,
+    equity_position_symbol,
 )
 from .trend_review import _protection_event_identity, _report_hash
 from .strategy_drawdown import (
@@ -1456,10 +1456,12 @@ def _direct_simulate_facts(
         if quantity <= 0:
             continue
         code = str(position.get("code") or position.get("futu_code") or "").upper()
-        assert to_futu_symbol(market, code) == code, f"Futu 持仓代码无效：{code}"
+        symbol = equity_position_symbol(code, market)
+        if symbol is None:
+            continue
         facts.append((
             market,
-            code.split(".", 1)[1],
+            symbol,
             quantity,
             _position_decimal(
                 position.get("cost_price", position.get("average_cost")),
@@ -1562,6 +1564,17 @@ def _validate_simulated_positions(
     assert payload.get("broker") == broker and payload.get("market") == market, (
         f"{broker} Dashboard 模拟盘账户身份不匹配"
     )
+    excluded_positions = payload.get("excluded_positions", [])
+    assert isinstance(excluded_positions, list), (
+        f"{broker} 模拟盘排除行格式无效"
+    )
+    for row in excluded_positions:
+        assert isinstance(row, Mapping), f"{broker} 模拟盘排除行格式无效"
+        code = str(row.get("code") or "").strip()
+        assert code, f"{broker} 模拟盘排除行缺少代码"
+        assert equity_position_symbol(code, market) is None, (
+            f"{broker} 模拟盘排除行包含正股代码：{code}"
+        )
     assert _api_simulate_facts(payload, market) == _direct_simulate_facts(
         direct_snapshot, market
     ), f"{broker} 模拟盘持仓与 Futu 不匹配"
