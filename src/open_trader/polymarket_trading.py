@@ -3164,6 +3164,110 @@ class PolymarketTradingClient:
             del exc
             return unknown
 
+    def lp_market_competitiveness(
+        self,
+        *,
+        stop_event: threading.Event | None = None,
+        previous: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        """Read official market competitiveness across all reward pages.
+
+        The read never raises for transport failures: pages that succeed merge
+        into the returned mapping, targets covered by failed pages keep their
+        previous value and are flagged in ``not_updated`` so the caller can
+        mark them as stale-this-round.  Explicit zero competitiveness is kept
+        as zero; the projection owns the danger-signal exclusion.
+        """
+
+        checked_at = datetime.now(UTC)
+        previous_map: dict[str, tuple[Decimal, datetime]] = {}
+        if isinstance(previous, Mapping):
+            for key, value in previous.items():
+                if not isinstance(key, str) or not key.strip():
+                    continue
+                if isinstance(value, tuple) and len(value) == 2:
+                    stamp = value[1]
+                    if isinstance(value[0], Decimal) and isinstance(stamp, datetime):
+                        previous_map[key] = (value[0], stamp)
+
+        def incomplete(
+            state: str, merged: dict[str, tuple[Decimal, datetime]], updated: set[str]
+        ) -> dict[str, object]:
+            return {
+                "state": state,
+                "complete": False,
+                "checked_at": checked_at,
+                "round_checked_at": checked_at,
+                "competitiveness": merged,
+                "not_updated": sorted(key for key in previous_map if key not in updated),
+            }
+
+        merged: dict[str, tuple[Decimal, datetime]] = {}
+        updated: set[str] = set()
+        pages_ok = 0
+        try:
+            if stop_event is not None and stop_event.is_set():
+                raise _RewardReadCancelled
+            context = getattr(self._client, "_ctx", None)
+            transport = getattr(context, "secure_clob", None)
+            get_json = getattr(transport, "get_json", None)
+            if not callable(get_json):
+                raise ValueError("competitiveness_transport_unknown")
+            cursor: str | None = None
+            seen_cursors: set[str] = set()
+            while True:
+                if stop_event is not None and stop_event.is_set():
+                    raise _RewardReadCancelled
+                params: dict[str, object] = {"page_size": 500}
+                if cursor is not None:
+                    params["next_cursor"] = cursor
+                payload = get_json("/rewards/markets/multi", params=params)
+                if stop_event is not None and stop_event.is_set():
+                    raise _RewardReadCancelled
+                if not isinstance(payload, Mapping):
+                    raise ValueError("competitiveness_page_unknown")
+                rows = payload.get("data")
+                if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+                    raise ValueError("competitiveness_page_unknown")
+                for raw_row in rows:
+                    row = _model_dict(raw_row)
+                    if row is None:
+                        continue
+                    condition_id = row.get("condition_id")
+                    if not isinstance(condition_id, str) or not condition_id.strip():
+                        continue
+                    value = _lp_decimal(row.get("market_competitiveness"))
+                    if value is None or value < 0:
+                        continue
+                    merged[condition_id] = (value, checked_at)
+                    updated.add(condition_id)
+                pages_ok += 1
+                next_cursor = payload.get("next_cursor")
+                if not isinstance(next_cursor, str) or not next_cursor or next_cursor == "LTE=":
+                    break
+                if next_cursor in seen_cursors:
+                    raise ValueError("competitiveness_pagination_loop")
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": checked_at,
+                "round_checked_at": checked_at,
+                "competitiveness": merged,
+                "not_updated": sorted(key for key in previous_map if key not in updated),
+            }
+        except _RewardReadCancelled:
+            for key, value in previous_map.items():
+                merged.setdefault(key, value)
+            return incomplete("unknown", merged, updated)
+        except Exception:
+            for key, value in previous_map.items():
+                merged.setdefault(key, value)
+            # Some pages succeeded: keep the partial round.  Nothing arrived:
+            # the whole read failed and must not block the funnel.
+            return incomplete("partial" if pages_ok else "unknown", merged, updated)
+
     @staticmethod
     def _lp_reward_market_rows(
         *,

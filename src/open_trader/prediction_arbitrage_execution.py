@@ -14,7 +14,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields, replace
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -150,6 +150,45 @@ def _decimal(value: object) -> Decimal | None:
     except (InvalidOperation, ValueError):
         return None
     return result if result.is_finite() else None
+
+
+def _lp_min_scoring_size(
+    minimum_order_size: Decimal | None, reward_min_size: Decimal | None
+) -> Decimal | None:
+    """Smallest quantity that can score rewards, legalised to the 0.01 grid."""
+
+    if (
+        minimum_order_size is None
+        or reward_min_size is None
+        or minimum_order_size <= 0
+        or reward_min_size <= 0
+    ):
+        return None
+    quantity = max(minimum_order_size, reward_min_size)
+    return (quantity / Decimal("0.01")).to_integral_value(
+        rounding=ROUND_CEILING
+    ) * Decimal("0.01")
+
+
+def _lp_order_purpose(
+    side: object, quantity: Decimal | None, min_scoring_size: Decimal | None
+) -> str | None:
+    """Derive the order purpose chip with zero storage.
+
+    A BUY whose original size equals the market's minimum scoring quantity is
+    a trial order; a larger BUY is a formal order.  SELL orders and markets
+    with unknown rules stay unlabelled instead of guessing.
+    """
+
+    if str(side or "").strip().upper() != "BUY":
+        return None
+    if quantity is None or min_scoring_size is None or min_scoring_size <= 0:
+        return None
+    if quantity == min_scoring_size:
+        return "trial"
+    if quantity > min_scoring_size:
+        return "formal"
+    return None
 
 
 def _normalize_lp_recommendations(value: object) -> list[dict[str, object]]:
@@ -1703,6 +1742,11 @@ class PredictionExecutionService:
                     if remaining is None and quantity is not None and filled is not None:
                         remaining = max(Decimal("0"), quantity - filled)
                     managed = order_id in managed_ids
+                    minimum_order_size = _decimal(raw_order.get("minimum_order_size"))
+                    reward_min_size = _decimal(raw_order.get("reward_min_size"))
+                    min_scoring_size = _lp_min_scoring_size(
+                        minimum_order_size, reward_min_size
+                    )
                     orders.append(
                         {
                             "order_id": order_id,
@@ -1718,7 +1762,12 @@ class PredictionExecutionService:
                             "quantity": quantity,
                             "filled_quantity": filled,
                             "remaining_quantity": remaining,
-                            "reward_min_size": _decimal(raw_order.get("reward_min_size")),
+                            "minimum_order_size": minimum_order_size,
+                            "reward_min_size": reward_min_size,
+                            "min_scoring_size": min_scoring_size,
+                            "purpose": _lp_order_purpose(
+                                raw_order.get("side"), quantity, min_scoring_size
+                            ),
                             "reward_max_spread": _decimal(raw_order.get("reward_max_spread")),
                             "fees_enabled": raw_order.get("fees_enabled"),
                             "fee_exponent": _decimal(raw_order.get("fee_exponent")),
@@ -1916,6 +1965,8 @@ class PredictionExecutionService:
                             "state": "filled",
                             "scoring_status": "unknown",
                             "scoring_checked_at": None,
+                            "min_scoring_size": None,
+                            "purpose": None,
                             "management": (
                                 "system_managed"
                                 if fill_managed

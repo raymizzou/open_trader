@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, time, timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING
 from zoneinfo import ZoneInfo
 
 from .polymarket_lp_risk import (
     _account_after_reservations,
+    _event_window_check,
     _has_market_order,
     evaluate_lp_entry,
 )
@@ -27,6 +28,8 @@ from .polymarket_lp import (
 _BEIJING = ZoneInfo("Asia/Shanghai")
 LP_DAILY_AMPLITUDE_LIMIT = Decimal("0.01")
 LP_SHORTLIST_LIMIT = 50
+LP_TRIAL_CANDIDATE_LIMIT = 10
+LP_COMPETITION_MAX_AGE = timedelta(hours=1)
 
 
 def _lp_history_summary(direction: Mapping[str, object]) -> Mapping[str, object] | None:
@@ -599,6 +602,470 @@ def lp_candidate_rows(
         )
     )
     return rows
+
+
+def _lp_competition_entry(entry: object) -> dict[str, object]:
+    """Parse one competition cache entry into value, checked_at, and updated."""
+
+    if isinstance(entry, Mapping):
+        value = _maybe_decimal(entry.get("value"))
+        checked = entry.get("checked_at")
+        updated = entry.get("updated")
+    elif isinstance(entry, (list, tuple)) and len(entry) == 2:
+        value = _maybe_decimal(entry[0])
+        checked = entry[1]
+        updated = None
+    else:
+        value, checked, updated = None, None, None
+    checked_at: datetime | None = None
+    if isinstance(checked, datetime) and checked.tzinfo is not None:
+        checked_at = checked.astimezone(UTC)
+    elif isinstance(checked, str):
+        try:
+            checked_at = _timestamp(checked, name="competition_checked_at")
+        except ValueError:
+            checked_at = None
+    return {
+        "value": value,
+        "checked_at": checked_at,
+        "updated": updated if isinstance(updated, bool) else None,
+    }
+
+
+def _lp_event_window_rejections(
+    direction_facts: list[dict[str, object]], *, now: datetime
+) -> dict[str, str]:
+    """Return condition_id to rejection code for blocking event windows."""
+
+    rejections: dict[str, str] = {}
+    for direction in direction_facts:
+        market = direction.get("market")
+        if not isinstance(market, Mapping):
+            continue
+        condition_id = str(market.get("condition_id") or "").strip()
+        if not condition_id or condition_id in rejections:
+            continue
+        state, reason, _, _ = _event_window_check(direction, market, now)
+        if state == "rejected" and reason:
+            rejections[condition_id] = reason
+    return rejections
+
+
+def _lp_trial_capital(candidate: Mapping[str, object]) -> tuple[int, Decimal]:
+    capital = candidate.get("reference_capital")
+    if isinstance(capital, Decimal) and capital > 0:
+        return (0, capital)
+    return (1, Decimal("0"))
+
+
+def _lp_trial_direction_row(
+    direction: Mapping[str, object],
+    *,
+    daily_pool_usd: Decimal,
+) -> dict[str, object] | None:
+    """Build one trial-direction candidate with the legalized minimum size."""
+
+    market = direction.get("market")
+    if not isinstance(market, Mapping):
+        return None
+    minimum = _maybe_decimal(market.get("minimum_order_size"))
+    reward_minimum = _maybe_decimal(market.get("reward_min_size"))
+    if minimum is None or reward_minimum is None or minimum <= 0 or reward_minimum <= 0:
+        return None
+    quantity = max(minimum, reward_minimum)
+    quantity = (quantity / Decimal("0.01")).to_integral_value(
+        rounding=ROUND_CEILING
+    ) * Decimal("0.01")
+    summary = direction.get("history_summary")
+    reference_price = (
+        _maybe_decimal(summary.get("latest_midpoint"))
+        if isinstance(summary, Mapping)
+        else None
+    )
+    if reference_price is not None and not Decimal("0") < reference_price <= Decimal("1"):
+        reference_price = None
+    summary_fields = (
+        "amplitude",
+        "sample_count",
+        "window_start",
+        "window_end",
+        "valid_until",
+    )
+    evidence = (
+        {
+            key: summary.get(key)
+            for key in summary_fields
+            if summary.get(key) is not None
+        }
+        if isinstance(summary, Mapping)
+        else {}
+    )
+    return {
+        "market_id": market.get("market_id"),
+        "condition_id": str(market.get("condition_id") or "").strip(),
+        "market_title": market.get("market_title"),
+        "market_url": market.get("market_url"),
+        "token_id": market.get("token_id"),
+        "outcome": str(market.get("outcome") or "").strip().upper(),
+        "daily_pool_usd": daily_pool_usd,
+        "min_quantity": quantity,
+        "minimum_order_size": minimum,
+        "reward_min_size": reward_minimum,
+        "reference_price": reference_price,
+        "reference_capital": (
+            quantity * reference_price if reference_price is not None else None
+        ),
+        "summary": evidence,
+    }
+
+
+def _lp_base_rejection_code(
+    direction: Mapping[str, object],
+    *,
+    now: datetime | None = None,
+) -> str | None:
+    """Return the first light-rule code that would drop this direction."""
+
+    market = direction.get("market")
+    if not isinstance(market, Mapping):
+        return "market_facts_unknown"
+    reward_active = direction.get("reward_active")
+    if reward_active is None:
+        return "reward_status_unknown"
+    if reward_active is False:
+        return "reward_inactive"
+    pool = _maybe_decimal(direction.get("daily_pool_usd"))
+    if pool is None:
+        return "reward_pool_unknown"
+    if pool <= 0:
+        return "reward_pool_empty"
+    if market.get("accepting_orders") is not True:
+        return (
+            "market_not_accepting_orders"
+            if market.get("accepting_orders") is False
+            else "market_status_unknown"
+        )
+    if any(
+        direction.get(key) is True or market.get(key) is True
+        for key in (
+            "participating",
+            "already_participating",
+            "known_participation",
+        )
+    ):
+        return "market_already_participating"
+    summary = _lp_history_summary(direction)
+    if summary is None or str(summary.get("state") or "").lower() not in {
+        "known",
+        "ready",
+        "eligible",
+    }:
+        return "history_summary_unknown"
+    amplitude = _lp_summary_amplitude(summary)
+    if amplitude is None:
+        return "history_amplitude_unknown"
+    if amplitude < 0 or amplitude > LP_DAILY_AMPLITUDE_LIMIT:
+        return "history_amplitude_exceeded"
+    checked_value = summary.get("checked_at", summary.get("updated_at"))
+    try:
+        checked_summary_at = _timestamp(checked_value, name="history_checked_at")
+    except ValueError:
+        return "history_time_unknown"
+    if now is not None:
+        # Mirror the shortlist gates: an over-age or past-valid_until summary
+        # is dropped there, so the base stage must report why.
+        age = (now - checked_summary_at).total_seconds()
+        if age < 0 or age >= _LP_PRICE_HISTORY_WINDOW.total_seconds():
+            return "history_summary_expired"
+        valid_until = summary.get("valid_until")
+        if valid_until is not None:
+            try:
+                if now >= _timestamp(valid_until, name="history_valid_until"):
+                    return "history_summary_expired"
+            except ValueError:
+                return "history_summary_expired"
+    return None
+
+
+def lp_trial_candidates(
+    direction_facts: object,
+    *,
+    competition: object,
+    account_budget_facts: object,
+    now: datetime,
+) -> dict[str, object]:
+    """Project the at most ten trial candidates shown on the LP dashboard.
+
+    Pipeline: cheap base facts (including event windows) then the official
+    competition coarse ranking, then the hard over-available exclusion, then
+    the fixed top-ten cap.  Explicit zero competition means nobody competes
+    and is excluded as a danger signal; unread or stale competition stays
+    unknown, sorts last, and never blocks the funnel.
+    """
+
+    result: dict[str, object] = {
+        "rows": [],
+        "funnel": {
+            "read": 0,
+            "base": 0,
+            "sort": 0,
+            "trial": 0,
+            "competition_known": 0,
+            "competition_unknown": 0,
+            "excluded": {"competition_empty": 0, "over_available": 0},
+            "gap_reason": None,
+            "reasons": {"read": [], "base": [], "sort": [], "trial": []},
+        },
+        "compared_range": {"compared": 0, "total": 0, "pending": 0},
+        "budget": {"available_capital": None},
+    }
+    if not isinstance(now, datetime) or now.tzinfo is None:
+        return result
+    checked_at = now.astimezone(UTC)
+    if not isinstance(direction_facts, (list, tuple)):
+        return result
+    budget = (
+        account_budget_facts
+        if isinstance(account_budget_facts, Mapping)
+        else {}
+    )
+    available_capital = _maybe_decimal(budget.get("available_capital"))
+    competition_map: dict[str, object] = {
+        str(key): value
+        for key, value in competition.items()
+        if isinstance(key, str)
+    } if isinstance(competition, Mapping) else {}
+
+    directions_by_condition: dict[str, list[dict[str, object]]] = {}
+    read_conditions: set[str] = set()
+    for direction in direction_facts:
+        if not isinstance(direction, Mapping):
+            continue
+        market = direction.get("market")
+        if not isinstance(market, Mapping):
+            continue
+        condition_id = str(market.get("condition_id") or "").strip()
+        if not condition_id:
+            continue
+        read_conditions.add(condition_id)
+        directions_by_condition.setdefault(condition_id, []).append(dict(direction))
+
+    funnel_reasons: dict[str, list[dict[str, object]]] = {
+        "read": [],
+        "base": [],
+        "sort": [],
+        "trial": [],
+    }
+
+    def add_reason(stage: str, row: Mapping[str, object], code: str) -> None:
+        market_id = str(row.get("market_id") or row.get("condition_id") or "")
+        funnel_reasons[stage].append(
+            {
+                "market_id": market_id,
+                "condition_id": str(row.get("condition_id") or ""),
+                "code": code,
+            }
+        )
+
+    base_rows = _lp_shortlist_rows(direction_facts, now=checked_at)
+    window_rejections = _lp_event_window_rejections(
+        [row for row in direction_facts if isinstance(row, Mapping)],
+        now=checked_at,
+    )
+    base_candidates: list[dict[str, object]] = []
+    base_condition_ids: set[str] = set()
+    for row in base_rows:
+        condition_id = str(row.get("condition_id") or "")
+        if condition_id in window_rejections:
+            add_reason("base", row, window_rejections[condition_id])
+            continue
+        pool = _maybe_decimal(row.get("daily_pool_usd"))
+        if pool is None:
+            continue
+        best: dict[str, object] | None = None
+        rules_known = True
+        for direction in directions_by_condition.get(condition_id, ()):
+            candidate = _lp_trial_direction_row(direction, daily_pool_usd=pool)
+            if candidate is None:
+                rules_known = False
+                continue
+            if best is None or _lp_trial_capital(candidate) < _lp_trial_capital(best):
+                best = candidate
+        if best is None:
+            if not rules_known:
+                add_reason("base", row, "market_rules_unknown")
+            continue
+        base_candidates.append(best)
+        base_condition_ids.add(condition_id)
+    for condition_id in sorted(read_conditions - base_condition_ids):
+        if condition_id in window_rejections:
+            continue
+        for direction in directions_by_condition.get(condition_id, ()):
+            code = _lp_base_rejection_code(direction, now=checked_at)
+            if code is None:
+                continue
+            market = direction.get("market")
+            add_reason(
+                "base",
+                {
+                    "market_id": (
+                        market.get("market_id")
+                        if isinstance(market, Mapping)
+                        else condition_id
+                    ),
+                    "condition_id": condition_id,
+                },
+                code,
+            )
+            break
+
+    entries = {
+        condition_id: _lp_competition_entry(competition_map.get(condition_id))
+        for condition_id in read_conditions
+    }
+    ranked: list[dict[str, object]] = []
+    empty_competition = 0
+    for candidate in base_candidates:
+        condition_id = str(candidate.get("condition_id") or "")
+        entry = entries.get(condition_id, {
+            "value": None, "checked_at": None, "updated": None,
+        })
+        value = entry["value"]
+        entry_checked = entry["checked_at"]
+        stale = (
+            entry_checked is None
+            or entry_checked > checked_at
+            or (checked_at - entry_checked).total_seconds() >= LP_COMPETITION_MAX_AGE.total_seconds()
+        )
+        known = value is not None and not stale
+        if known and value == 0:
+            # Explicit zero means nobody competes on the official market:
+            # a danger signal, so the market is dropped, never shown as 0.
+            empty_competition += 1
+            add_reason("sort", candidate, "competition_empty")
+            continue
+        candidate["competition"] = {
+            "value": value if known else None,
+            "raw_value": value,
+            "checked_at": _iso(entry_checked) if entry_checked is not None else None,
+            "state": "known" if known else "unknown",
+            "stale": stale and value is not None,
+            "updated": entry["updated"],
+        }
+        ranked.append(candidate)
+
+    def sort_key(candidate: Mapping[str, object]) -> tuple[int, Decimal, int, Decimal, str]:
+        competition_row = candidate.get("competition")
+        assert isinstance(competition_row, Mapping)
+        if competition_row.get("state") == "known":
+            value = competition_row.get("value")
+            competition_key = (0, value if isinstance(value, Decimal) else Decimal("0"))
+        else:
+            competition_key = (1, Decimal("0"))
+        capital = candidate.get("reference_capital")
+        pool = candidate.get("daily_pool_usd")
+        ratio: Decimal | None = None
+        if (
+            isinstance(capital, Decimal)
+            and capital > 0
+            and isinstance(pool, Decimal)
+        ):
+            ratio = pool / capital
+        ratio_key = (0, -ratio) if ratio is not None else (1, Decimal("0"))
+        return (
+            *competition_key,
+            *ratio_key,
+            str(candidate.get("condition_id") or ""),
+        )
+
+    ranked.sort(key=sort_key)
+    for rank_position, candidate in enumerate(ranked, start=1):
+        competition_row = candidate.get("competition")
+        assert isinstance(competition_row, Mapping)
+        capital = candidate.get("reference_capital")
+        pool = candidate.get("daily_pool_usd")
+        ratio: Decimal | None = None
+        if (
+            isinstance(capital, Decimal)
+            and capital > 0
+            and isinstance(pool, Decimal)
+        ):
+            ratio = pool / capital
+        competition_value = competition_row.get("value")
+        candidate["reason"] = [
+            (
+                f"竞争 {competition_value}（第 {rank_position} 低）"
+                if competition_row.get("state") == "known"
+                else "竞争未知（按未知排最后，不填 0）"
+            ),
+            (
+                f"参考指标 日奖池÷占资 {ratio.quantize(Decimal('0.01'))}"
+                if ratio is not None
+                else "参考指标 日奖池÷占资 未知"
+            ),
+            "无已知订单或持仓",
+        ]
+    excluded_counts = {"competition_empty": 0, "over_available": 0}
+    selected: list[dict[str, object]] = []
+    for candidate in ranked:
+        if len(selected) >= LP_TRIAL_CANDIDATE_LIMIT:
+            break
+        capital = candidate.get("reference_capital")
+        if (
+            available_capital is not None
+            and isinstance(capital, Decimal)
+            and capital > available_capital
+        ):
+            excluded_counts["over_available"] += 1
+            add_reason("trial", candidate, "capital_over_available")
+            continue
+        candidate["reason"] = list(candidate.get("reason") or [])
+        if available_capital is None:
+            candidate["reason"].append("可用资金未知（不做超可用排除）")
+        else:
+            candidate["reason"].append("占资 ≤ 可用")
+        selected.append(dict(candidate))
+    compared = sum(
+        1 for entry in entries.values() if entry["value"] is not None
+    )
+    funnel: dict[str, object] = {
+        "read": len(read_conditions),
+        "base": len(base_candidates),
+        "sort": len(ranked),
+        "trial": len(selected),
+        "competition_known": sum(
+            1
+            for candidate in ranked
+            if isinstance(candidate.get("competition"), Mapping)
+            and candidate["competition"].get("state") == "known"
+        ),
+        "competition_unknown": sum(
+            1
+            for candidate in ranked
+            if isinstance(candidate.get("competition"), Mapping)
+            and candidate["competition"].get("state") != "known"
+        ),
+        "excluded": {
+            "competition_empty": empty_competition,
+            "over_available": excluded_counts["over_available"],
+        },
+        "gap_reason": (
+            None
+            if len(selected) >= LP_TRIAL_CANDIDATE_LIMIT
+            else f"合格候选不足 {LP_TRIAL_CANDIDATE_LIMIT} 个（本轮 {len(selected)} 个）"
+        ),
+        "reasons": funnel_reasons,
+    }
+    funnel["budget"] = {"available_capital": available_capital}
+    result["rows"] = selected
+    result["funnel"] = funnel
+    result["compared_range"] = {
+        "compared": compared,
+        "total": len(read_conditions),
+        "pending": len(read_conditions) - compared,
+    }
+    result["budget"] = {"available_capital": available_capital}
+    return result
 
 
 def lp_report_totals(

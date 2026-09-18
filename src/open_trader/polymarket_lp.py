@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from .polymarket_lp_risk import (
     BOOK_FRESHNESS_SECONDS,
     TERMINAL_ORDER_STATES,
+    _account_after_reservations,
     _decimal,
     _executable_bid_value,
     _field,
@@ -155,26 +156,24 @@ def _lp_funnel_conditions() -> dict[str, object]:
     return {
         "read": {
             "来源": "奖励目录与市场资料",
-            "完整性": "完整目录；部分结果可参与筛选；缺失资料=UNKNOWN",
+            "完整性": "奖励目录全量读取；部分结果可参与筛选，缺失按 UNKNOWN 处理，不阻塞漏斗",
         },
-        "filter": {
+        "base": {
             "奖励": "奖励启用且日奖池>0",
             "市场": "接受订单",
             "参与": "没有已知订单或持仓",
-            "窗口": "24h",
-            "粒度": "1m",
-            "振幅": "不超过1¢",
-            "刷新": "每小时",
-            "有效期": "24h",
-            "缺失": "UNKNOWN",
+            "摘要": "24h 摘要有效且振幅不超过1¢",
+            "事件": "开始前30分钟、进行中、结束后1h冷却不参与",
         },
-        "risk": {
-            "奖励与市场资料": "60s内",
-            "盘口与账户": "10s内；订单与持仓资料完整",
-            "事件": "开始前30分钟、进行中、结束后1h冷却；结束后筛选必须通过；缺失=UNKNOWN",
-            "入场压力": "最小数量、奖励价带、资金预留、含费压力退出不超过10%",
-            "排序": "日奖池降序，同额按市场ID升序",
-            "上限": 50,
+        "sort": {
+            "竞争": "官方竞争升序，低竞争优先；竞争为 0 是危险信号直接排除；缺失或超1小时排最后显示未知",
+            "参考指标": "日奖池÷最低试挂占资（参考价）降序",
+            "兜底": "condition_id 升序",
+        },
+        "trial": {
+            "超可用": "最低试挂占资（实时值优先，缺失用参考值）超过预留后可用资金不展示，计入排除数",
+            "上限": 10,
+            "缺口": "不足 10 个如实展示实际数量与原因；不宣称全市场收益前十",
         },
     }
 
@@ -218,6 +217,8 @@ class PolymarketLPService:
         self._report_lock = threading.Lock()
         self._candidate_refresh_lock = threading.Lock()
         self._candidate_state_lock = threading.RLock()
+        self._competition_lock = threading.Lock()
+        self._competition_state: dict[str, object] = {}
         self._preparation_lock = threading.RLock()
         self._sample_target_lock = threading.Lock()
         self._sample_targets: tuple[tuple[str, str], ...] = ()
@@ -755,32 +756,6 @@ class PolymarketLPService:
                 market_counts["unknown"] += 1
         snapshot["selected_results"] = selected_results
         snapshot["recommendations"] = current_recommendations
-        funnel = snapshot.get("funnel")
-        has_funnel_risk_evidence = isinstance(funnel, Mapping) and (
-            "selected" in funnel or "risk" in funnel
-        )
-        if isinstance(funnel, Mapping) and (
-            selected_results or has_funnel_risk_evidence
-        ):
-            projected_funnel = deepcopy(dict(funnel))
-            projected_funnel["selected"] = len(selected_results)
-            projected_funnel["risk"] = market_counts
-            projected_funnel["risk_directions"] = direction_counts
-            reasons = projected_funnel.get("reasons")
-            if isinstance(reasons, Mapping):
-                projected_reasons = deepcopy(dict(reasons))
-                risk_reasons = projected_reasons.get("risk")
-                projected_risk_reasons = (
-                    [dict(reason) for reason in risk_reasons if isinstance(reason, Mapping)]
-                    if isinstance(risk_reasons, (list, tuple))
-                    else []
-                )
-                for reason in [*expired_reasons, *projection_reasons]:
-                    if reason not in projected_risk_reasons:
-                        projected_risk_reasons.append(reason)
-                projected_reasons["risk"] = projected_risk_reasons
-                projected_funnel["reasons"] = projected_reasons
-            snapshot["funnel"] = projected_funnel
         # Keep preparation lifecycle state adjacent to the cached candidate
         # projection.  It is a small durable row, so readers can show a
         # pending/retry/paused reason without re-running the external funnel.
@@ -2187,6 +2162,7 @@ class PolymarketLPService:
                                 unknown_identities.discard(identity)
                                 errors.pop(token_id, None)
                                 prices = [row["p"] for row in bounded.values()]
+                                latest_sample = bounded[max(bounded)]
                                 summary: dict[str, object] = {
                                     "state": "known",
                                     "amplitude": max(prices) - min(prices),
@@ -2194,6 +2170,7 @@ class PolymarketLPService:
                                     "window_start": window_start,
                                     "window_end": window_end,
                                 "sample_count": len(bounded),
+                                "latest_midpoint": latest_sample["p"],
                                 "valid_until": now + timedelta(hours=24),
                                 "last_attempt_at": now,
                                 "preparation_generation": generation,
@@ -2623,21 +2600,17 @@ class PolymarketLPService:
                     missing_book_token_ids=(),
                     catalog_complete=True,
                     funnel={
-                        "catalog_read": 0,
-                        "base_pass": 0,
-                        "volatility_pass": 0,
-                        "selected": 0,
-                        "risk": {"passed": 0, "rejected": 0, "unknown": 0},
-                        "risk_directions": {"passed": 0, "rejected": 0, "unknown": 0},
-                        "selected_market_ids": [],
+                        "read": 0,
+                        "base": 0,
+                        "sort": 0,
+                        "trial": 0,
+                        "competition_known": 0,
+                        "competition_unknown": 0,
+                        "excluded": {"competition_empty": 0, "over_available": 0},
+                        "gap_reason": None,
+                        "compared_range": {"compared": 0, "total": 0, "pending": 0},
                         "conditions": _lp_funnel_conditions(),
-                        "reasons": {
-                            "catalog": [],
-                            "base": [],
-                            "volatility": [],
-                            "selected": [],
-                            "risk": [],
-                        },
+                        "reasons": {"read": [], "base": [], "sort": [], "trial": []},
                     },
                     selected_market_ids=(),
                 )
@@ -2772,590 +2745,145 @@ class PolymarketLPService:
                         direction["known_participation"] = True
                     direction_facts.append(direction)
 
-            from .polymarket_lp_views import _lp_shortlist_rows
+            competition_state = self._refresh_competition(stop_event)
 
-            light_rows = _lp_shortlist_rows(direction_facts, now=checked_at)
-            shortlist = light_rows[:50]
-            selected_condition_ids = tuple(
-                str(row.get("condition_id") or "") for row in shortlist
+            from .polymarket_lp_views import (
+                LP_TRIAL_CANDIDATE_LIMIT,
+                lp_trial_candidates,
             )
-            selected_metadata_by_condition: Mapping[str, object] = {}
-            selected_reward_by_condition: dict[str, Mapping[str, object]] = {}
-            selected_reward_error_conditions: set[str] = set()
-            selected_reward_error_reasons: dict[str, list[str]] = {}
-            selected_reward_checked_at: object | None = None
-            selected_metadata_error = False
-            if selected_condition_ids:
-                selected_metadata_reader = getattr(
-                    self.exchange, "lp_market_metadata_fresh", None
+
+            available_facts: dict[str, object] = {}
+            if account is not None:
+                adjusted_account = _account_after_reservations(
+                    account, reservations
                 )
-                if not callable(selected_metadata_reader):
-                    selected_metadata_reader = metadata_reader
-                try:
-                    selected_metadata_value = selected_metadata_reader(
-                        selected_condition_ids,
-                        stop_event=stop_event,
+                if isinstance(adjusted_account, Mapping):
+                    adjusted_balance = _maybe_decimal(
+                        adjusted_account.get("balance")
                     )
-                except Exception:
-                    selected_metadata_value = None
-                if isinstance(selected_metadata_value, Mapping):
-                    selected_metadata_by_condition = {
-                        str(key): value
-                        for key, value in selected_metadata_value.items()
-                        if isinstance(key, str) and isinstance(value, Mapping)
-                    }
-                else:
-                    selected_metadata_error = True
-                try:
-                    selected_reward_value = catalog_reader(
-                        condition_ids=selected_condition_ids,
-                        stop_event=stop_event,
+                    adjusted_allowance = _maybe_decimal(
+                        adjusted_account.get("allowance")
                     )
-                except Exception:
-                    selected_reward_value = None
-                if isinstance(selected_reward_value, Mapping):
-                    selected_reward_checked_at = selected_reward_value.get("checked_at")
-                    raw_selected_rewards = selected_reward_value.get("markets")
-                    if isinstance(raw_selected_rewards, (list, tuple)):
-                        selected_reward_by_condition = {
-                            str(row.get("condition_id")): row
-                            for row in raw_selected_rewards
-                            if isinstance(row, Mapping)
-                            and str(row.get("condition_id") or "")
-                        }
-                        for condition_id in selected_condition_ids:
-                            selected_reward = selected_reward_by_condition.get(condition_id)
-                            if (
-                                selected_reward is None
-                                or selected_reward.get("state") == "unknown"
-                                or selected_reward.get("complete") is False
-                            ):
-                                selected_reward_error_conditions.add(condition_id)
-                                if isinstance(selected_reward, Mapping):
-                                    selected_reward_error_reasons[condition_id] = (
-                                        self._safe_selected_reward_reasons(selected_reward)
-                                    )
-                    else:
-                        selected_reward_error_conditions.update(selected_condition_ids)
-                else:
-                    selected_reward_error_conditions.update(selected_condition_ids)
-            selected_event_end_confirmations: dict[str, object] = {}
-            selected_event_observation_bound = self._now()
-            for condition_id, selected_market_value in selected_metadata_by_condition.items():
-                existing_confirmation = event_end_confirmations.get(condition_id)
-                selected_confirmation: object = existing_confirmation
-                if (
-                    selected_market_value.get("event_ended") is True
-                    and selected_market_value.get("event_finished_at") is None
-                ):
-                    try:
-                        selected_observed_at = _timestamp(
-                            selected_market_value.get("metadata_checked_at"),
-                            name="selected_metadata_checked_at",
+                    if adjusted_balance is not None and adjusted_allowance is not None:
+                        available_facts["available_capital"] = min(
+                            adjusted_balance, adjusted_allowance
                         )
-                    except ValueError:
-                        selected_observed_at = None
-                    if (
-                        selected_observed_at is not None
-                        and selected_observed_at <= selected_event_observation_bound
-                    ):
-                        confirmation = self._observe_event_end(
-                            condition_id,
-                            selected_market_value,
-                            existing=existing_confirmation,
-                            observed_at=selected_observed_at,
-                        )
-                        if confirmation is not None:
-                            selected_confirmation = confirmation
-                            event_end_confirmations[condition_id] = confirmation
-                elif selected_market_value.get("event_finished_at") is not None:
-                    selected_confirmation = None
-                selected_event_end_confirmations[condition_id] = selected_confirmation
-            selected_direction_keys: set[tuple[str, str, str]] = set()
-            for row in shortlist:
-                condition_id = str(row.get("condition_id") or "")
-                raw_directions = row.get("directions")
-                if not isinstance(raw_directions, Sequence):
-                    continue
-                for row_direction in raw_directions:
-                    if not isinstance(row_direction, Mapping):
-                        continue
-                    outcome = str(row_direction.get("outcome") or "").upper()
-                    token_id = str(row_direction.get("token_id") or "")
-                    if outcome and token_id:
-                        selected_direction_keys.add((condition_id, outcome, token_id))
-            selected_directions = [
-                direction for direction in direction_facts
-                if isinstance(direction.get("market"), Mapping)
-                and (
-                    str(cast(Mapping[str, object], direction["market"]).get("condition_id") or ""),
-                    str(cast(Mapping[str, object], direction["market"]).get("outcome") or "").upper(),
-                    str(cast(Mapping[str, object], direction["market"]).get("token_id") or ""),
-                ) in selected_direction_keys
+            trial = lp_trial_candidates(
+                direction_facts,
+                competition=self._competition_entries(),
+                account_budget_facts=available_facts,
+                now=checked_at,
+            )
+            trial_rows: list[dict[str, object]] = [
+                dict(row)
+                for row in trial.get("rows", ())
+                if isinstance(row, Mapping)
             ]
-            for direction in selected_directions:
-                market = direction.get("market")
-                if not isinstance(market, Mapping):
-                    continue
-                condition_id = str(market.get("condition_id") or "")
-                outcome_key = str(market.get("outcome") or "").strip().lower()
-                selected_market = selected_metadata_by_condition.get(condition_id)
-                selected_outcome: Mapping[str, object] | None = None
-                if isinstance(selected_market, Mapping):
-                    raw_outcomes = selected_market.get("outcomes")
-                    if isinstance(raw_outcomes, Mapping):
-                        raw = raw_outcomes.get(outcome_key)
-                        if isinstance(raw, Mapping):
-                            selected_outcome = raw
-                        else:
-                            for candidate in raw_outcomes.values():
-                                if not isinstance(candidate, Mapping):
-                                    continue
-                                if (
-                                    str(candidate.get("label") or "")
-                                    .strip()
-                                    .lower()
-                                    == outcome_key
-                                ):
-                                    selected_outcome = candidate
-                                    break
-                original_token_id = str(market.get("token_id") or "").strip()
-                selected_token_id = (
-                    str(
-                        selected_outcome.get("token_id")
-                        or selected_outcome.get("tokenId")
-                        or ""
-                    ).strip()
-                    if selected_outcome is not None
-                    else ""
-                )
-                if selected_outcome is None or not selected_token_id:
-                    direction["selected_metadata_unknown"] = True
-                    direction["selected_metadata_reason"] = "market_metadata_unknown"
-                elif selected_token_id != original_token_id:
-                    direction["selected_metadata_unknown"] = True
-                    direction["selected_metadata_reason"] = "market_identity_changed"
-                elif selected_market.get("accepting_orders") is not True:
-                    direction["selected_metadata_unknown"] = True
-                    direction["selected_metadata_reason"] = "market_not_accepting_orders"
-                else:
-                    selected_market_value = {
-                        **dict(selected_market),
-                        "condition_id": condition_id,
-                        "token_id": selected_token_id,
-                        "outcome": str(
-                            selected_outcome.get("label") or market.get("outcome") or ""
-                        ).upper(),
-                        "market_id": selected_market.get(
-                            "market_id", market.get("market_id")
-                        ),
-                    }
-                    direction["market"] = selected_market_value
-                if condition_id in selected_event_end_confirmations:
-                    direction["event_end_confirmation"] = (
-                        selected_event_end_confirmations[condition_id]
-                    )
-                selected_reward = selected_reward_by_condition.get(condition_id)
-                if condition_id in selected_reward_error_conditions:
-                    direction["selected_reward_unknown"] = True
-                    direction["selected_reward_reason_codes"] = list(
-                        selected_reward_error_reasons.get(condition_id, ())
-                    )
-                else:
-                    assert selected_reward is not None
-                    reward_minimum, reward_spread = _lp_reward_terms(
-                        selected_market
-                        if isinstance(selected_market, Mapping)
-                        else {},
-                        selected_reward,
-                    )
-                    selected_market_value = direction.get("market")
-                    if isinstance(selected_market_value, dict):
-                        selected_market_value["reward_min_size"] = reward_minimum
-                        selected_market_value["reward_max_spread"] = reward_spread
-                    direction.update(
-                        {
-                            "reward_active": selected_reward.get("reward_active"),
-                            "daily_pool_usd": selected_reward.get("daily_pool_usd"),
-                            "reward_checked_at": selected_reward.get(
-                                "checked_at", selected_reward_checked_at
-                            ),
-                            "reward_guidance_deadline": self._reward_guidance_deadline(
-                                selected_reward
-                            ),
-                        }
-                    )
-            if selected_metadata_error:
-                for direction in selected_directions:
-                    direction["selected_metadata_unknown"] = True
-            books_by_token: Mapping[str, object] = {}
+
             missing_book_token_ids: list[str] = []
-            token_ids = tuple(
-                dict.fromkeys(
-                    str(cast(Mapping[str, object], direction["market"]).get("token_id") or "")
-                    for direction in selected_directions
-                    if isinstance(direction.get("market"), Mapping)
-                    and str(cast(Mapping[str, object], direction["market"]).get("token_id") or "")
+            if trial_rows and callable(books_reader):
+                candidate_token_ids = tuple(
+                    dict.fromkeys(
+                        str(row.get("token_id") or "").strip()
+                        for row in trial_rows
+                        if str(row.get("token_id") or "").strip()
+                    )
                 )
-            )
-            if token_ids and callable(books_reader):
                 try:
-                    books_value = books_reader(token_ids, stop_event=stop_event)
+                    candidate_books = books_reader(
+                        candidate_token_ids, stop_event=stop_event
+                    )
                 except Exception:
-                    # A complete light shortlist remains useful when the
-                    # selected risk-book batch is unavailable; risk is then
-                    # UNKNOWN for each selected direction.
-                    books_value = {}
-                if isinstance(books_value, Mapping):
-                    books_by_token = books_value
-            try:
-                risk_account_value = account_reader()
-            except Exception:
-                # A fresh account read is required for risk, but an outage
-                # must preserve the light shortlist and report UNKNOWN risk.
-                risk_account_value = None
-            risk_account = (
-                risk_account_value
-                if isinstance(risk_account_value, Mapping)
-                and risk_account_value.get("authenticated") is True
-                else {}
-            )
-            # Account and book reads define the risk evaluation instant. Keep
-            # the scan timestamp separate so a just-returned fact is never
-            # rejected as being in the future.
-            evaluation_at = self._now()
-            risk_results: dict[tuple[str, str], dict[str, object]] = {}
-            from .polymarket_lp_risk import evaluate_lp_entry
-            for direction in selected_directions:
-                market = direction.get("market")
-                if not isinstance(market, Mapping):
-                    continue
-                condition_id = str(market.get("condition_id") or "")
-                token_id = str(market.get("token_id") or "")
-                book = books_by_token.get(token_id)
-                if direction.get("selected_metadata_unknown"):
-                    result = {
-                        "state": "unknown",
-                        "reason_codes": [
-                            str(
-                                direction.get(
-                                    "selected_metadata_reason",
-                                    "market_metadata_unknown",
-                                )
-                            )
-                        ],
-                        "guidance": None,
-                    }
-                elif direction.get("selected_reward_unknown"):
-                    reward_reasons = list(
-                        direction.get("selected_reward_reason_codes", ())
-                    )
-                    if "reward_data_unknown" not in reward_reasons:
-                        reward_reasons.append("reward_data_unknown")
-                    result = {
-                        "state": "unknown",
-                        "reason_codes": reward_reasons,
-                        "guidance": None,
-                    }
-                elif not isinstance(book, Mapping):
-                    missing_book_token_ids.append(token_id)
-                    result = {"state": "unknown", "reason_codes": ["book_unknown"], "guidance": None}
+                    candidate_books = {}
+                if isinstance(candidate_books, Mapping):
+                    for row in trial_rows:
+                        token_id = str(row.get("token_id") or "")
+                        book = candidate_books.get(token_id)
+                        if not isinstance(book, Mapping):
+                            if token_id:
+                                missing_book_token_ids.append(token_id)
+                            continue
+                        try:
+                            bids = _levels(book.get("bids"), "bids")
+                        except ValueError:
+                            bids = []
+                        if not bids:
+                            if token_id:
+                                missing_book_token_ids.append(token_id)
+                            continue
+                        realtime_price = max(price for price, _ in bids)
+                        quantity = row.get("min_quantity")
+                        if isinstance(quantity, Decimal) and quantity > 0:
+                            row["realtime_price"] = realtime_price
+                            row["realtime_capital"] = realtime_price * quantity
+                            row["realtime_checked_at"] = book.get("received_at")
                 else:
-                    summary = direction.get("history_summary")
-                    direction["screening"] = {
-                        "state": "eligible",
-                        "reason_codes": [],
-                        "checked_at": summary.get("checked_at")
-                        if isinstance(summary, Mapping)
-                        else None,
-                    }
-                    result = evaluate_lp_entry(
-                        {**direction, "book": dict(book)},
-                        account=risk_account,
-                        now=evaluation_at,
-                        reservations=reservations,
+                    missing_book_token_ids.extend(
+                        str(row.get("token_id") or "")
+                        for row in trial_rows
+                        if str(row.get("token_id") or "")
                     )
-                risk_results[(condition_id, str(market.get("outcome") or "").upper())] = result
-
-            selected_results: list[dict[str, object]] = []
-            for shortlist_row in shortlist:
-                condition_id = str(shortlist_row.get("condition_id") or "")
-                directions: dict[str, object] = {}
-                for direction in selected_directions:
-                    market = direction.get("market")
-                    if not isinstance(market, Mapping) or str(market.get("condition_id") or "") != condition_id:
-                        continue
-                    outcome = str(market.get("outcome") or "").upper()
-                    result = risk_results.get((condition_id, outcome), {"state": "unknown", "reason_codes": ["risk_unknown"], "guidance": None})
-                    directions[outcome] = {
-                        "token_id": market.get("token_id"),
-                        "state": result.get("state"),
-                        "eligible": result.get("state") == "eligible",
-                        "reason_codes": list(result.get("reason_codes", ())),
-                        "screening": direction.get("history_summary"),
-                        "guidance": result.get("guidance"),
-                    }
-                states = [
-                    str(value.get("state") or "unknown")
-                    for value in directions.values() if isinstance(value, Mapping)
-                ]
-                market_state = "eligible" if "eligible" in states else "unknown" if "unknown" in states else "rejected"
-                selected_result = {
-                    **dict(shortlist_row),
-                    "state": market_state,
-                    "selected": True,
-                    "directions": directions,
-                }
-                selected_reward = selected_reward_by_condition.get(condition_id)
-                if (
-                    selected_reward is not None
-                    and condition_id not in selected_reward_error_conditions
-                ):
-                    selected_result.update(
-                        {
-                            "daily_pool_usd": selected_reward.get("daily_pool_usd"),
-                            "reward_active": selected_reward.get("reward_active"),
-                            "reward_checked_at": selected_reward.get(
-                                "checked_at", selected_reward_checked_at
-                            ),
-                            "rewards_min_size": selected_reward.get(
-                                "rewards_min_size"
-                            ),
-                            "rewards_max_spread": selected_reward.get(
-                                "rewards_max_spread"
-                            ),
-                        }
-                    )
-                selected_results.append(selected_result)
-            recommendations = [
-                row
-                for row in selected_results
-                if any(
-                    isinstance(direction, Mapping)
-                    and direction.get("state") == "eligible"
-                    and _lp_guidance_is_usable(direction.get("guidance"))
-                    for direction in (
-                        row.get("directions", {}).values()
-                        if isinstance(row.get("directions"), Mapping)
-                        else ()
-                    )
-                )
-            ]
-            complete = complete and not any(
-                row.get("state") == "unknown" for row in selected_results
+            funnel = dict(trial.get("funnel") or {})
+            # The trial gate compares reference capital, but the binding
+            # budget is the live book: recheck selected rows with
+            # realtime_capital ?? reference_capital after enrichment and
+            # drop rows that exceed the reserved available capital.
+            available_capital = _maybe_decimal(
+                available_facts.get("available_capital")
+                if isinstance(available_facts, Mapping)
+                else None
             )
-            risk_counts = {
-                "passed": sum(1 for row in selected_results if row.get("state") == "eligible"),
-                "rejected": sum(1 for row in selected_results if row.get("state") == "rejected"),
-                "unknown": sum(1 for row in selected_results if row.get("state") == "unknown"),
-            }
-            direction_risk_counts = {
-                "passed": sum(
-                    1
-                    for result in risk_results.values()
-                    if result.get("state") == "eligible"
-                ),
-                "rejected": sum(
-                    1
-                    for result in risk_results.values()
-                    if result.get("state") == "rejected"
-                ),
-                "unknown": sum(
-                    1
-                    for result in risk_results.values()
-                    if result.get("state") == "unknown"
-                ),
-            }
-            base_markets = {
-                str(cast(Mapping[str, object], direction["market"]).get("condition_id") or "")
-                for direction in direction_facts
-                if direction.get("reward_active") is True
-                and not direction.get("known_participation")
-                and _maybe_decimal(direction.get("daily_pool_usd")) is not None
-                and cast(Decimal, _maybe_decimal(direction.get("daily_pool_usd"))) > 0
-                and isinstance(direction.get("market"), Mapping)
-                and cast(Mapping[str, object], direction["market"]).get("accepting_orders") is True
-            }
-            volatility_markets = {
-                str(row.get("condition_id") or "") for row in shortlist
-            }
-            reason_rows: dict[str, list[dict[str, object]]] = {
-                "catalog": [],
-                "base": [],
-                "volatility": [],
-                "selected": [],
-                "risk": [],
-            }
-            seen_reasons: set[tuple[str, str, str, str]] = set()
-
-            def add_reason(
-                stage: str,
-                direction: Mapping[str, object] | None,
-                code: str,
-                *,
-                outcome: str | None = None,
-            ) -> None:
-                market = direction.get("market") if isinstance(direction, Mapping) else None
-                market_map = market if isinstance(market, Mapping) else {}
-                condition_id = str(
-                    market_map.get("condition_id")
-                    or (direction or {}).get("condition_id")
-                    or ""
-                ).strip()
-                market_id = str(
-                    market_map.get("market_id")
-                    or condition_id
-                ).strip()
-                if not market_id:
-                    return
-                outcome_value = str(
-                    outcome
-                    or market_map.get("outcome")
-                    or (direction or {}).get("outcome")
-                    or ""
-                ).upper()
-                identity = (stage, market_id, outcome_value, code)
-                if identity in seen_reasons:
-                    return
-                seen_reasons.add(identity)
-                row: dict[str, object] = {
-                    "market_id": market_id,
-                    "condition_id": condition_id,
-                    "code": code,
-                }
-                if outcome_value:
-                    row["outcome"] = outcome_value
-                reason_rows[stage].append(row)
-
-            directions_by_condition: dict[str, list[dict[str, object]]] = {}
-            for direction in direction_facts:
-                market = direction.get("market")
-                market_map = market if isinstance(market, Mapping) else {}
-                condition_id = str(market_map.get("condition_id") or "").strip()
-                if condition_id:
-                    directions_by_condition.setdefault(condition_id, []).append(direction)
-            for condition_id in condition_ids:
-                if condition_id not in metadata_by_condition:
-                    add_reason(
-                        "catalog",
-                        {"market": {"condition_id": condition_id, "market_id": condition_id}},
-                        "market_metadata_unknown",
+            if available_capital is not None:
+                kept_rows: list[dict[str, object]] = []
+                for row in trial_rows:
+                    effective_capital = _maybe_decimal(
+                        row.get("realtime_capital")
+                        if row.get("realtime_capital") is not None
+                        else row.get("reference_capital")
                     )
-            if catalog.get("complete") is not True:
-                for condition_id in condition_ids:
-                    add_reason(
-                        "catalog",
-                        {"market": {"condition_id": condition_id, "market_id": condition_id}},
-                        "catalog_incomplete",
-                    )
-            for condition_id, directions in directions_by_condition.items():
-                if condition_id in base_markets:
-                    continue
-                for direction in directions:
-                    market = direction.get("market")
-                    market_map = market if isinstance(market, Mapping) else {}
-                    reward_active = direction.get("reward_active")
-                    if reward_active is None:
-                        add_reason("base", direction, "reward_status_unknown")
-                    elif reward_active is False:
-                        add_reason("base", direction, "reward_inactive")
-                    pool = _maybe_decimal(direction.get("daily_pool_usd"))
-                    if pool is None:
-                        add_reason("base", direction, "reward_pool_unknown")
-                    elif pool <= 0:
-                        add_reason("base", direction, "reward_pool_empty")
-                    if market_map.get("accepting_orders") is not True:
-                        add_reason(
-                            "base",
-                            direction,
-                            "market_not_accepting_orders"
-                            if market_map.get("accepting_orders") is False
-                            else "market_status_unknown",
-                        )
-                    if any(
-                        direction.get(key) is True or market_map.get(key) is True
-                        for key in (
-                            "participating",
-                            "already_participating",
-                            "known_participation",
-                        )
+                    if (
+                        effective_capital is None
+                        or effective_capital <= available_capital
                     ):
-                        add_reason("base", direction, "market_already_participating")
-            for condition_id in base_markets:
-                if condition_id in volatility_markets:
-                    continue
-                for direction in directions_by_condition.get(condition_id, ()):
-                    summary = direction.get("history_summary")
-                    if not isinstance(summary, Mapping):
-                        add_reason("volatility", direction, "history_summary_unknown")
+                        kept_rows.append(row)
                         continue
-                    state = str(summary.get("state") or "").lower()
-                    if state not in {"known", "ready", "eligible"}:
-                        add_reason("volatility", direction, "history_summary_unknown")
-                        continue
-                    amplitude = _maybe_decimal(summary.get("amplitude"))
-                    if amplitude is None:
-                        add_reason("volatility", direction, "history_amplitude_unknown")
-                    elif amplitude < 0 or amplitude > Decimal("0.01"):
-                        add_reason("volatility", direction, "history_amplitude_exceeded")
-                    try:
-                        history_checked_at = _timestamp(
-                            summary.get("checked_at", summary.get("updated_at")),
-                            name="history_checked_at",
+                    excluded_counts = funnel.get("excluded")
+                    if isinstance(excluded_counts, dict):
+                        excluded_counts["over_available"] = (
+                            int(excluded_counts.get("over_available") or 0) + 1
                         )
-                        history_age = (checked_at - history_checked_at).total_seconds()
-                    except ValueError:
-                        add_reason("volatility", direction, "history_time_unknown")
-                    else:
-                        if history_age < 0 or history_age >= _LP_PRICE_HISTORY_WINDOW.total_seconds():
-                            add_reason("volatility", direction, "history_summary_expired")
-                        valid_until = summary.get("valid_until")
-                        if valid_until is not None:
-                            try:
-                                if checked_at >= _timestamp(valid_until, name="history_valid_until"):
-                                    add_reason("volatility", direction, "history_summary_expired")
-                            except ValueError:
-                                add_reason("volatility", direction, "history_time_unknown")
-            for row in light_rows[50:]:
-                add_reason("selected", {"market": row}, "shortlist_cap")
-            for row in selected_results:
-                condition_id = str(row.get("condition_id") or "")
-                for outcome, direction in (
-                    row.get("directions", {}).items()
-                    if isinstance(row.get("directions"), Mapping)
-                    else ()
-                ):
-                    if not isinstance(direction, Mapping) or direction.get("state") == "eligible":
-                        continue
-                    reasons = direction.get("reason_codes")
-                    if isinstance(reasons, Sequence) and not isinstance(reasons, (str, bytes)) and reasons:
-                        for reason in reasons:
-                            add_reason(
-                                "risk",
-                                {"market": {"condition_id": condition_id, "market_id": row.get("market_id"), "outcome": outcome}},
-                                str(reason),
-                                outcome=str(outcome),
-                            )
-                    else:
-                        add_reason(
-                            "risk",
-                            {"market": {"condition_id": condition_id, "market_id": row.get("market_id"), "outcome": outcome}},
-                            "risk_unknown",
-                            outcome=str(outcome),
+                    trial_reasons = funnel.get("reasons")
+                    if isinstance(trial_reasons, Mapping) and isinstance(
+                        trial_reasons.get("trial"), list
+                    ):
+                        trial_reasons["trial"].append(
+                            {
+                                "market_id": str(row.get("market_id") or ""),
+                                "condition_id": str(
+                                    row.get("condition_id") or ""
+                                ),
+                                "code": "realtime_capital_over_available",
+                            }
                         )
-            funnel = {
-                "catalog_read": len(condition_ids),
-                "base_pass": len(base_markets),
-                "volatility_pass": len(light_rows),
-                "selected": len(shortlist),
-                "risk": risk_counts,
-                "risk_directions": direction_risk_counts,
-                "selected_market_ids": [str(row.get("market_id") or "") for row in shortlist],
-                "conditions": _lp_funnel_conditions(),
-                "reasons": reason_rows,
-            }
+                if len(kept_rows) != len(trial_rows):
+                    trial_rows[:] = kept_rows
+                    funnel["trial"] = len(trial_rows)
+                    funnel["gap_reason"] = (
+                        None
+                        if len(trial_rows) >= LP_TRIAL_CANDIDATE_LIMIT
+                        else (
+                            f"合格候选不足 {LP_TRIAL_CANDIDATE_LIMIT} 个"
+                            f"（本轮 {len(trial_rows)} 个）"
+                        )
+                    )
+            funnel["compared_range"] = dict(trial.get("compared_range") or {})
+            funnel["conditions"] = _lp_funnel_conditions()
+            funnel["competition_state"] = competition_state.get("state")
+            funnel["competition_not_updated"] = list(
+                competition_state.get("not_updated") or ()
+            )
             self._publish_sample_targets(())
-            completed_at = evaluation_at
+            completed_at = self._now()
             return self._finish_candidate_scan(
                 previous,
                 state="ready" if complete else "incomplete",
@@ -3363,16 +2891,16 @@ class PolymarketLPService:
                 checked_at=completed_at,
                 scan_started_at=scan_started_at,
                 last_success_at=completed_at if complete else None,
-                candidates=[],
-                recommendations=recommendations,
-                selected_results=selected_results,
+                candidates=trial_rows,
+                recommendations=[],
+                selected_results=[],
                 missing_metadata_condition_ids=missing_metadata_condition_ids,
                 missing_book_token_ids=tuple(dict.fromkeys(missing_book_token_ids)),
                 catalog_complete=catalog_is_known and catalog.get("complete") is True,
                 event_end_confirmations=event_end_confirmations,
                 funnel=funnel,
                 selected_market_ids=tuple(
-                    str(row.get("market_id") or "") for row in shortlist
+                    str(row.get("market_id") or "") for row in trial_rows
                 ),
             )
         except Exception:
@@ -3387,6 +2915,72 @@ class PolymarketLPService:
             )
         finally:
             self._candidate_refresh_lock.release()
+
+    def _refresh_competition(
+        self, stop_event: threading.Event | None
+    ) -> dict[str, object]:
+        """Pull official competitiveness into the in-process cache.
+
+        The cache is pure memory: never persisted, never a table.  A failed
+        read keeps the previous values (the reader already merges them) and
+        never blocks the candidate funnel.
+        """
+
+        reader = getattr(self.exchange, "lp_market_competitiveness", None)
+        if callable(reader):
+            with self._competition_lock:
+                previous = dict(self._competition_state)
+            try:
+                result = reader(
+                    stop_event=stop_event,
+                    previous=previous.get("competitiveness", {}),
+                )
+            except Exception:
+                result = None
+            if isinstance(result, Mapping):
+                stored = {
+                    "state": result.get("state", "unknown"),
+                    "complete": result.get("complete") is True,
+                    "round_checked_at": result.get("round_checked_at"),
+                    "competitiveness": dict(
+                        result.get("competitiveness") or {}
+                    ),
+                    "not_updated": list(result.get("not_updated") or []),
+                }
+                with self._competition_lock:
+                    self._competition_state = stored
+        with self._competition_lock:
+            return deepcopy(self._competition_state)
+
+    def _competition_entries(self) -> dict[str, object]:
+        """Project the cached competition map for the trial-candidate view."""
+
+        state = self._competition_state
+        round_checked_at = state.get("round_checked_at")
+        entries: dict[str, object] = {}
+        raw_map = state.get("competitiveness")
+        if isinstance(raw_map, Mapping):
+            for condition_id, value in raw_map.items():
+                if not isinstance(condition_id, str):
+                    continue
+                if isinstance(value, tuple) and len(value) == 2:
+                    entry_value, checked_at = value
+                elif isinstance(value, Mapping):
+                    entry_value = value.get("value")
+                    checked_at = value.get("checked_at")
+                else:
+                    continue
+                entries[condition_id] = {
+                    "value": entry_value,
+                    "checked_at": checked_at,
+                    "updated": (
+                        checked_at == round_checked_at
+                        if isinstance(checked_at, datetime)
+                        and isinstance(round_checked_at, datetime)
+                        else None
+                    ),
+                }
+        return entries
 
     def _candidate_reservations(self) -> tuple[dict[str, object], ...]:
         reservations: list[dict[str, object]] = []

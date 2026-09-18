@@ -4,7 +4,11 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from open_trader import polymarket_lp_views
-from open_trader.polymarket_lp_views import lp_candidate_rows, lp_shortlist
+from open_trader.polymarket_lp_views import (
+    lp_candidate_rows,
+    lp_shortlist,
+    lp_trial_candidates,
+)
 
 
 NOW = datetime(2026, 9, 15, 1, 0, tzinfo=UTC)
@@ -264,6 +268,216 @@ def test_candidates_hide_ineligible_or_unaffordable_orders() -> None:
         account=_account(open_orders=[target_open_buy]),
         now=NOW,
     ) == []
+
+
+def _trial_direction(
+    market_id: str,
+    *,
+    outcome: str = "YES",
+    minimum_order_size: str = "10",
+    reward_min_size: str = "20",
+    latest_midpoint: str | None = "0.33",
+    pool: str = "120",
+    event_start: datetime | None = None,
+) -> dict[str, object]:
+    market: dict[str, object] = {
+        "market_id": market_id,
+        "condition_id": f"condition-{market_id}",
+        "token_id": f"{market_id.lower()}-{outcome.lower()}",
+        "outcome": outcome,
+        "market_title": f"Market {market_id}",
+        "market_url": f"https://polymarket.com/event/{market_id}",
+        "accepting_orders": True,
+        "minimum_order_size": Decimal(minimum_order_size),
+        "reward_min_size": Decimal(reward_min_size),
+    }
+    if event_start is not None:
+        market["event_ended"] = False
+        market["event_start_time"] = event_start
+    summary: dict[str, object] = {
+        "state": "known",
+        "amplitude": Decimal("0.005"),
+        "checked_at": NOW,
+        "window_start": NOW - timedelta(hours=24),
+        "window_end": NOW,
+        "sample_count": 2,
+        "valid_until": NOW + timedelta(hours=24),
+    }
+    if latest_midpoint is not None:
+        summary["latest_midpoint"] = Decimal(latest_midpoint)
+    return {
+        "market": market,
+        "daily_pool_usd": Decimal(pool),
+        "reward_active": True,
+        "history_summary": summary,
+    }
+
+
+def _trial(
+    directions: object,
+    *,
+    competition: object,
+    available: str | None = "480",
+) -> dict[str, object]:
+    budget: dict[str, object] = (
+        {} if available is None else {"available_capital": Decimal(available)}
+    )
+    return lp_trial_candidates(
+        directions,
+        competition=competition,
+        account_budget_facts=budget,
+        now=NOW,
+    )
+
+
+def test_trial_candidates_derive_min_quantity_and_reference_capital() -> None:
+    direction = _trial_direction(
+        "A", minimum_order_size="10", reward_min_size="20", latest_midpoint="0.33"
+    )
+
+    result = _trial([direction], competition={})
+
+    row = result["rows"][0]
+    assert row["market_id"] == "A"
+    assert row["condition_id"] == "condition-A"
+    assert row["min_quantity"] == Decimal("20")
+    assert row["reference_capital"] == Decimal("6.60")
+    assert row["daily_pool_usd"] == Decimal("120")
+
+
+def test_trial_candidates_exclude_markets_over_available_capital() -> None:
+    directions = [
+        _trial_direction("A", reward_min_size="1000", latest_midpoint="0.20"),
+        _trial_direction("B", reward_min_size="1000", latest_midpoint="0.20"),
+        _trial_direction("C", reward_min_size="1000", latest_midpoint="0.20"),
+        _trial_direction("D", reward_min_size="1000", latest_midpoint="0.52"),
+    ]
+
+    result = _trial(directions, competition={}, available="480")
+
+    assert [row["market_id"] for row in result["rows"]] == ["A", "B", "C"]
+    assert result["funnel"]["excluded"]["over_available"] == 1
+    assert result["funnel"]["trial"] == 3
+
+    tighter = _trial(directions, competition={}, available="100")
+    assert tighter["rows"] == []
+    assert tighter["funnel"]["excluded"]["over_available"] == 4
+    assert tighter["funnel"]["trial"] == 0
+
+
+def test_trial_candidates_cap_ten_report_gap_and_zero_competition() -> None:
+    twelve = [_trial_direction(f"M{index:02d}") for index in range(1, 13)]
+    competition = {
+        f"condition-M{index:02d}": (Decimal(index) + Decimal("1"), NOW)
+        for index in range(1, 13)
+    }
+
+    capped = _trial(twelve, competition=competition)
+    assert len(capped["rows"]) == 10
+    assert capped["rows"][0]["market_id"] == "M01"
+    assert capped["funnel"]["trial"] == 10
+
+    short = _trial(twelve[:7], competition=dict(list(competition.items())[:7]))
+    assert len(short["rows"]) == 7
+    assert short["funnel"]["gap_reason"]
+
+    zero = _trial(
+        [_trial_direction("Z")],
+        competition={"condition-Z": (Decimal("0"), NOW)},
+    )
+    assert zero["rows"] == []
+    assert zero["funnel"]["excluded"]["competition_empty"] == 1
+    assert zero["funnel"]["sort"] == 0
+
+    unread = _trial(
+        [_trial_direction("U")],
+        competition={"condition-U": (None, NOW)},
+    )
+    assert len(unread["rows"]) == 1
+    assert unread["rows"][0]["competition"]["state"] == "unknown"
+    assert unread["rows"][0]["competition"]["raw_value"] is None
+    assert unread["funnel"]["excluded"]["competition_empty"] == 0
+
+
+def test_trial_candidates_order_by_competition_pool_yield_and_identity() -> None:
+    # Independent arithmetic: capital = 20 × midpoint; ratio = pool ÷ capital.
+    # B: 100/10=10, A: 200/10=20, C: 120/8=15, D/E: 100/10=10 each.
+    directions = [
+        _trial_direction("B", pool="100", latest_midpoint="0.50"),
+        _trial_direction("A", pool="200", latest_midpoint="0.50"),
+        _trial_direction("C", pool="120", latest_midpoint="0.40"),
+        _trial_direction("E", pool="100", latest_midpoint="0.50"),
+        _trial_direction("D", pool="100", latest_midpoint="0.50"),
+        _trial_direction("U", pool="120", latest_midpoint="0.40"),
+    ]
+    competition = {
+        "condition-A": (Decimal("28.4"), NOW),
+        "condition-B": (Decimal("12.5"), NOW),
+        "condition-C": (Decimal("12.5"), NOW),
+        "condition-D": (Decimal("5"), NOW),
+        "condition-E": (Decimal("5"), NOW),
+    }
+
+    result = _trial(directions, competition=competition)
+
+    assert [row["market_id"] for row in result["rows"]] == [
+        "D", "E", "C", "B", "A", "U",
+    ]
+    unknown_row = result["rows"][-1]
+    assert unknown_row["competition"]["state"] == "unknown"
+    assert unknown_row["competition"]["value"] is None
+
+
+def test_trial_candidates_treat_stale_competition_as_unusable() -> None:
+    stale = _trial(
+        [_trial_direction("S")],
+        competition={
+            "condition-S": (Decimal("12.5"), NOW - timedelta(hours=2)),
+        },
+    )
+    row = stale["rows"][0]
+    assert row["competition"]["state"] == "unknown"
+    assert row["competition"]["stale"] is True
+    assert row["competition"]["raw_value"] == Decimal("12.5")
+    assert row["competition"]["value"] is None
+
+    # Fresh competition still ranks ahead of a stale value of any size.
+    mixed = _trial(
+        [_trial_direction("S"), _trial_direction("T")],
+        competition={
+            "condition-S": (Decimal("12.5"), NOW - timedelta(hours=2)),
+            "condition-T": (Decimal("99"), NOW),
+        },
+    )
+    assert [row["market_id"] for row in mixed["rows"]] == ["T", "S"]
+
+
+def test_trial_candidates_report_expired_history_base_rejection() -> None:
+    """Expired summaries vanish in the shortlist; the base stage must say why."""
+    expired_by_age = _trial_direction("X")
+    expired_by_age["history_summary"]["checked_at"] = NOW - timedelta(hours=25)
+    expired_by_validity = _trial_direction("Y")
+    expired_by_validity["history_summary"]["valid_until"] = NOW
+
+    result = _trial([expired_by_age, expired_by_validity], competition={})
+
+    assert result["rows"] == []
+    base_codes = [row["code"] for row in result["funnel"]["reasons"]["base"]]
+    assert base_codes.count("history_summary_expired") == 2
+
+
+def test_trial_candidates_report_event_window_base_rejections() -> None:
+    """In-progress and starting-soon markets are base-stage rejections."""
+    in_progress = _trial_direction("G", event_start=NOW)
+    starting_soon = _trial_direction("H", event_start=NOW + timedelta(minutes=30))
+
+    result = _trial([in_progress, starting_soon], competition={})
+
+    assert result["rows"] == []
+    assert result["funnel"]["base"] == 0
+    base_codes = {row["code"] for row in result["funnel"]["reasons"]["base"]}
+    assert "event_in_progress" in base_codes
+    assert "event_starting_soon" in base_codes
 
 
 def test_report_separates_partial_exit_realized_pnl_and_open_inventory() -> None:

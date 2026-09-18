@@ -3306,9 +3306,11 @@ function lpDashboardRewardCell(item, rewards, shown, observations = {}, shownObs
     return "<div><span class=\"sub\">市场收益观察见同标的上一行</span></div>";
   }
   const accountFactsStale = lpDashboardAccountFactsStale(observation);
-  const current = observation.state === "known" && !accountFactsStale
+  const yieldKnown = observation.state === "known" && !accountFactsStale
+    && Number.isFinite(Number(observation.current_yield_pct_per_hour));
+  const current = yieldKnown
     ? lpDashboardRate(observation.current_yield_pct_per_hour)
-    : "—";
+    : "待更新";
   const baseline = observation.trial_baseline && typeof observation.trial_baseline === "object"
     ? lpDashboardRate(observation.trial_baseline.yield_pct_per_hour)
     : observation.trial_reference && typeof observation.trial_reference === "object"
@@ -3325,7 +3327,10 @@ function lpDashboardRewardCell(item, rewards, shown, observations = {}, shownObs
   );
   const addRoomTone = addRoomAvailable ? " pm-tone-ok" : addRoomDanger ? " pm-tone-danger" : "";
   const addRoomMarkup = `<span class="pm-pill${addRoomTone}">加单空间：${addRoomAvailable ? "有" : "无"}</span>`;
-  const rateRows = `<div><strong>当前 ${escapeHtml(current)}</strong><span class="sub">试挂基准 ${escapeHtml(baseline)}</span><div>${addRoomMarkup}</div></div>`;
+  const yieldNote = yieldKnown
+    ? `<span class="sub">试挂基准 ${escapeHtml(baseline)}</span>`
+    : `<span class="sub">市场奖励率未知 · 不按 0 计</span><span class="sub">试挂基准 ${escapeHtml(baseline)}</span>`;
+  const rateRows = `<div${yieldKnown ? " class=\"num\"" : " class=\"num pm-lp-unknown\""}><strong>当前 ${escapeHtml(current)}</strong>${yieldNote}<div>${addRoomMarkup}</div></div>`;
   return rateRows;
 }
 
@@ -3545,7 +3550,7 @@ function lpDashboardTodayOrderRow(
   const side = String(row.side || "").toUpperCase();
   const subtitle = [
     predictionValue(row.outcome, "UNKNOWN"),
-    side === "BUY" ? "买入" : side === "SELL" ? "卖出" : predictionValue(row.side, "UNKNOWN"),
+    side === "BUY" ? "买入" : side === "SELL" ? "卖出（卖出单，不标注）" : predictionValue(row.side, "UNKNOWN"),
     lpDashboardTodayStateLabel(row),
     lpDashboardOfficialScoring(row),
   ].join(" · ");
@@ -3553,239 +3558,186 @@ function lpDashboardTodayOrderRow(
     ? "data-lp-today-filled=\"" + escapeHtml(predictionValue(row.order_id, "")) + "\""
     : "data-lp-today-order=\"" + escapeHtml(predictionValue(row.order_id, "")) + "\"";
   return "<tr " + rowAttribute + ">"
-    + "<td>" + lpMarketTitleLink(row) + "<span class=\"sub\">" + escapeHtml(subtitle) + "</span>" + detailsMarkup + "</td>"
+    + "<td>" + lpMarketTitleLink(row) + "<span class=\"sub\">" + escapeHtml(subtitle)
+    + lpDashboardPurposeChip(row) + "</span>" + detailsMarkup + "</td>"
     + "<td data-label=\"委托与成交量\">" + lpDashboardTodayQuantityCell(row) + "</td>"
     + "<td data-label=\"LP 收益率（预计）\">" + rewardMarkup + shareMarkup + shareWatchMarkup + "</td>"
     + "<td data-label=\"压力损失（警戒线 10%）\">" + riskMarkup + "</td></tr>";
 }
 
-function lpDashboardRecommendationDirections(recommendation) {
-  const directions = recommendation.directions && typeof recommendation.directions === "object"
-    ? recommendation.directions
-    : {};
-  return Object.entries(directions)
-    .filter(([outcome, direction]) => outcome && direction && typeof direction === "object")
-    .map(([outcome, direction]) => [String(outcome), direction]);
+function lpDashboardPurposeChip(row) {
+  const purpose = String(row?.purpose || "");
+  const minimum = predictionValue(row?.min_scoring_size, "UNKNOWN");
+  if (purpose === "trial") {
+    return "<span class=\"pm-pill purpose-trial purpose-chip\" title=\"委托数量等于最小计分数量 "
+      + escapeHtml(minimum) + " 份\">试挂</span>";
+  }
+  if (purpose === "formal") {
+    return "<span class=\"pm-pill purpose-formal purpose-chip\" title=\"委托数量大于最小计分数量 "
+      + escapeHtml(minimum) + " 份\">正式</span>";
+  }
+  return "";
 }
 
-const LP_REASON_LABELS = {
-  event_coverage_incomplete: "未接入新闻与其他事件日历，关键事件覆盖不完整",
-  stability_history_incomplete: "24 小时历史样本不完整",
-  stability_range_exceeded: "24 小时价格波动超过 1¢",
-  account_facts_unknown: "账户订单或持仓信息不完整",
-  market_already_participating: "该市场已有订单或持仓",
-  reward_inactive: "奖励已停止",
-  reward_data_unknown: "奖励资料不可用",
-  market_identity_changed: "市场身份已变化，资料待核验",
-  guidance_unknown: "下单指引资料不可用",
-  guidance_expired: "下单指引已过期",
-  candidate_snapshot_stale: "候选快照已过期",
-  book_stale: "当前盘口已过期",
-  book_unknown: "当前盘口资料不可用",
-  market_metadata_stale: "市场资料已过期",
-  market_metadata_unknown: "市场资料不可用",
-  risk_unknown: "风控资料不可用",
-};
-
-function lpDashboardReasonLabel(value) {
-  const raw = String(value || "").trim();
-  if (!raw) return "资料不可用，原因待核验";
-  if (LP_REASON_LABELS[raw]) return LP_REASON_LABELS[raw];
-  const translated = predictionReasonLabel(raw);
-  return translated === raw.replaceAll("_", " ") ? "资料不可用，原因待核验" : translated;
-}
-
-function lpDashboardRecommendationGuidanceIsCurrent(direction, now) {
-  const guidance = direction.guidance && typeof direction.guidance === "object"
-    ? direction.guidance
-    : {};
-  const required = ["price", "quantity", "required_capital", "estimated_exit_loss",
-    "estimated_exit_loss_ratio", "checked_at", "expires_at"];
-  const expiresAt = Date.parse(String(guidance.expires_at || ""));
-  return direction.state === "eligible"
-    && direction.eligible !== false
-    && required.every((key) => predictionHasValue(guidance[key]))
-    && Number.isFinite(Number(guidance.price))
-    && Number(guidance.price) >= 0
-    && Number(guidance.price) <= 1
-    && Number.isFinite(expiresAt)
-    && now < expiresAt;
-}
-
-function lpDashboardRecommendationCurrentDirections(recommendation, now, stale) {
-  if (stale || recommendation.state !== "eligible") return [];
-  return lpDashboardRecommendationDirections(recommendation)
-    .filter(([, direction]) => lpDashboardRecommendationGuidanceIsCurrent(direction, now));
-}
-
-function lpDashboardRecommendationDiagnostics(recommendations, now, stale) {
-  const diagnostics = [];
-  recommendations.forEach((recommendation) => {
-    lpDashboardRecommendationDirections(recommendation).forEach(([outcome, direction]) => {
-      if (lpDashboardRecommendationGuidanceIsCurrent(direction, now)) return;
-      const guidance = direction.guidance && typeof direction.guidance === "object"
-        ? direction.guidance
-        : {};
-      const expiresAt = Date.parse(String(guidance.expires_at || ""));
-      const recommendationState = String(recommendation.state || "").toLowerCase();
-      const directionState = String(direction.state || "").toLowerCase();
-      const state = directionState || recommendationState;
-      const directionStateKnown = Boolean(directionState);
-      const expired = !directionStateKnown && recommendationState === "expired"
-        || directionState === "expired"
-        || Number.isFinite(expiresAt) && now >= expiresAt
-        || stale && state === "eligible" && Object.keys(guidance).length > 0;
-      const pending = state === "pending";
-      const unavailable = ["unknown", "unavailable"].includes(state)
-        || recommendationState === "eligible" && (!directionStateKnown || directionState === "eligible");
-      const status = expired
-        ? stale && state === "eligible" && Object.keys(guidance).length > 0
-          ? "指引已过期（候选资料已过期）"
-          : "指引已过期"
-        : pending
-          ? "待评估"
-          : unavailable
-            ? stale ? "资料不可用（候选资料已过期）" : "资料不可用"
-            : "未通过（无下单指引）";
-      const times = [
-        predictionHasValue(guidance.checked_at) ? "检查 " + predictionHktTimestamp(guidance.checked_at) : "",
-        predictionHasValue(guidance.expires_at) ? "有效至 " + predictionHktTimestamp(guidance.expires_at) : "",
-      ].filter(Boolean).join(" · ");
-      diagnostics.push(lpMarketTitle(recommendation) + " · " + outcome + " · " + status
-        + (times ? " · " + times : ""));
-    });
+function lpDashboardTodayYieldOrder(rows, observations) {
+  const keyOf = (row) => {
+    const identity = String(row?.condition_id || "");
+    const observation = identity && observations[identity]
+      && typeof observations[identity] === "object" ? observations[identity] : null;
+    const known = Boolean(observation)
+      && observation.state === "known"
+      && !lpDashboardAccountFactsStale(observation)
+      && Number.isFinite(Number(observation.current_yield_pct_per_hour));
+    return {
+      known,
+      value: known ? Number(observation.current_yield_pct_per_hour) : 0,
+      orderId: String(row?.order_id || ""),
+    };
+  };
+  return [...rows].sort((a, b) => {
+    const ka = keyOf(a);
+    const kb = keyOf(b);
+    if (ka.known !== kb.known) return ka.known ? -1 : 1;
+    if (ka.known && ka.value !== kb.value) return kb.value - ka.value;
+    return ka.orderId.localeCompare(kb.orderId);
   });
-  return diagnostics;
 }
 
-function lpDashboardRecommendationRow(recommendation, actionable) {
-  const conditionId = String(recommendation.condition_id || "");
-  const priorOutcome = state.predictionMarket.lpDirectionSelections?.[conditionId];
-  const selected = actionable.find(([outcome]) => outcome === priorOutcome) || actionable[0];
-  const outcome = selected?.[0] || "";
-  const direction = selected?.[1] || {};
-  const screening = direction.screening && typeof direction.screening === "object"
-    ? direction.screening
-    : {};
-  const guidance = direction.guidance && typeof direction.guidance === "object"
-    ? direction.guidance
-    : {};
-  const directionsControl = actionable.length > 1
-    ? "<select class=\"pm-button\" data-lp-direction data-condition-id=\"" + escapeHtml(conditionId)
-      + "\" aria-label=\"" + escapeHtml(lpMarketTitle(recommendation)) + " 参考方向\">"
-      + actionable.map(([value]) => "<option value=\"" + escapeHtml(value) + "\""
-        + (value === outcome ? " selected" : "") + ">买 " + escapeHtml(value) + "</option>").join("")
-      + "</select>"
-    : "<span>买 " + escapeHtml(outcome) + "</span>";
-  const history = screening;
-  const range = predictionHasValue(history.amplitude)
-    ? lpDashboardPrice(history.amplitude)
-    : predictionHasValue(history.stability_range)
-      ? lpDashboardPrice(history.stability_range)
-      : "UNKNOWN";
-  const sampleCount = predictionNumber(history.sample_count, "UNKNOWN");
-  const historyWindowStart = predictionHasValue(history.window_start)
-    ? predictionHktTimestamp(history.window_start)
-    : "UNKNOWN";
-  const historyWindowEnd = predictionHasValue(history.window_end)
-    ? predictionHktTimestamp(history.window_end)
-    : "UNKNOWN";
-  const historyCheckedAt = predictionHasValue(history.checked_at)
-    ? predictionHktTimestamp(history.checked_at)
-    : "UNKNOWN";
-  const historyValidUntil = predictionHasValue(history.valid_until)
-    ? predictionHktTimestamp(history.valid_until)
-    : "UNKNOWN";
-  const pool = lpDashboardMoney(recommendation.daily_pool_usd);
-  const referenceDailyReward = lpDashboardMoney(recommendation.reference_daily_reward_usd);
-  const competition = recommendation.competition_state === "known"
-    ? predictionNumber(recommendation.competition_quantity, "UNKNOWN")
+function lpTrialCompetitionMarkup(competition) {
+  const comp = competition && typeof competition === "object" ? competition : {};
+  const updatedSub = comp.updated === false
+    ? "<span class=\"sub\">本轮未更新</span>"
     : "";
-  const lossRatio = Number(guidance.estimated_exit_loss_ratio);
-  const lossPercent = Number.isFinite(lossRatio)
-    ? (lossRatio * 100).toFixed(2).replace(/\.?0+$/, "") + "%"
-    : "UNKNOWN";
-  const reasons = [...new Set([
-    ...(Array.isArray(direction.reason_codes) ? direction.reason_codes : []),
-    ...(Array.isArray(screening.reason_codes) ? screening.reason_codes : []),
-  ])].map((reason) => lpDashboardReasonLabel(reason));
-  const source = predictionHasValue(screening.price_change_24h_source)
-    ? String(screening.price_change_24h_source)
+  if (comp.state === "known" && predictionHasValue(comp.value)) {
+    const stamp = predictionHasValue(comp.checked_at)
+      ? "<span class=\"sub\">数据 " + escapeHtml(predictionHktTimestamp(comp.checked_at)) + "</span>"
+      : "";
+    return "<div class=\"num\">" + escapeHtml(String(comp.value)) + stamp + updatedSub + "</div>";
+  }
+  const note = comp.stale === true
+    ? "<span class=\"sub\">超 1 小时未更新</span>"
+    : "<span class=\"sub\">按未知排最后 · 不填 0</span>";
+  return "<div class=\"num pm-lp-unknown\">未知" + note + updatedSub + "</div>";
+}
+
+function lpTrialCapitalCell(row) {
+  const reference = row?.reference_capital;
+  const realtime = row?.realtime_capital;
+  const referenceText = predictionHasValue(reference) ? lpDashboardMoney(reference) : "<span class=\"pm-lp-unknown\">未知</span>";
+  const referenceSub = predictionHasValue(row?.reference_price)
+    ? "<span class=\"sub\">参考价 " + escapeHtml(lpDashboardPrice(row.reference_price)) + "</span>"
+    : "<span class=\"sub\">参考价未知（首轮 24h 摘要未生成）</span>";
+  const realtimeText = predictionHasValue(realtime)
+    ? "<strong>" + escapeHtml(lpDashboardMoney(realtime)) + "</strong>"
+    : "<strong class=\"pm-lp-unknown\">待实时</strong>";
+  const realtimeSub = predictionHasValue(row?.realtime_price)
+    ? "<span class=\"sub\">实时买价 " + escapeHtml(lpDashboardPrice(row.realtime_price)) + "</span>"
     : "";
-  const change = predictionHasValue(screening.price_change_24h)
-    ? String(screening.price_change_24h)
+  return "<div class=\"num\">" + referenceText + " → " + realtimeText + referenceSub + realtimeSub + "</div>";
+}
+
+function lpTrialEvidenceRow(row) {
+  const summary = row?.summary && typeof row.summary === "object" ? row.summary : {};
+  const details = [];
+  if (predictionHasValue(summary.amplitude)) {
+    details.push("24h 极差 " + escapeHtml(lpDashboardPrice(summary.amplitude)));
+  }
+  if (predictionHasValue(summary.sample_count)) {
+    details.push("样本 " + escapeHtml(predictionNumber(summary.sample_count, "UNKNOWN")));
+  }
+  if (predictionHasValue(summary.window_start) && predictionHasValue(summary.window_end)) {
+    details.push("窗口 " + escapeHtml(predictionHktTimestamp(summary.window_start))
+      + " 至 " + escapeHtml(predictionHktTimestamp(summary.window_end)));
+  }
+  if (predictionHasValue(summary.valid_until)) {
+    details.push("有效至 " + escapeHtml(predictionHktTimestamp(summary.valid_until)));
+  }
+  const evidenceLine = details.length
+    ? "<li>" + escapeHtml(lpMarketTitle(row)) + "：" + details.join(" · ") + "。</li>"
     : "";
-  const marketUrl = String(recommendation.market_url || "").trim();
-  const marketLink = /^https:\/\/polymarket\.com\/[^"'<>\\\s]+$/i.test(marketUrl)
-    ? "<a class=\"pm-button\" href=\"" + escapeHtml(marketUrl)
-      + "\" target=\"_blank\" rel=\"noopener noreferrer\">Polymarket</a>"
+  const reasonList = Array.isArray(row?.reason) ? row.reason : [];
+  const reasonLine = reasonList.length
+    ? "<li>入选理由：" + reasonList.map((item) => escapeHtml(String(item))).join(" · ") + "。</li>"
     : "";
-  const referenceMarkup = predictionHasValue(recommendation.reference_share_percentage)
-    && predictionHasValue(recommendation.reference_daily_reward_usd)
-    ? "<span class=\"sub\">参考 " + escapeHtml(String(recommendation.reference_share_percentage))
-      + "% 日奖励估算 " + escapeHtml(referenceDailyReward) + "</span>"
+  if (!evidenceLine && !reasonLine) return "";
+  const key = "lp-candidate-evidence-" + String(row?.condition_id || row?.market_id || "");
+  return "<tr class=\"pm-lp-evidence-row\"><td colspan=\"6\"><details data-lp-details-key=\""
+    + escapeHtml(key) + "\"><summary>筛选与依据（展开状态在刷新后保持）</summary><ul>"
+    + evidenceLine + reasonLine + "</ul></details></td></tr>";
+}
+
+function lpTrialCandidateRow(row) {
+  const identity = "<td data-label=\"市场与选项\">" + lpMarketTitleLink(row)
+    + "<span class=\"sub\">" + escapeHtml(predictionValue(row.market_id, row.condition_id))
+    + " · 买 " + escapeHtml(predictionValue(row.outcome, "UNKNOWN")) + "</span></td>";
+  const competition = "<td data-label=\"官方竞争\">" + lpTrialCompetitionMarkup(row.competition) + "</td>";
+  const pool = "<td data-label=\"日奖池\" class=\"num\">"
+    + escapeHtml(lpDashboardMoney(row.daily_pool_usd)) + "</td>";
+  const minimum = "<td data-label=\"最低试挂\" class=\"num\"><div>"
+    + escapeHtml(predictionValue(row.min_quantity, "UNKNOWN")) + " 份</div><span class=\"sub\">奖励最低 "
+    + escapeHtml(predictionValue(row.reward_min_size, "UNKNOWN")) + " · 交易最低 "
+    + escapeHtml(predictionValue(row.minimum_order_size, "UNKNOWN")) + "</span></td>";
+  const capital = "<td data-label=\"最低占资（参考 → 实时）\">" + lpTrialCapitalCell(row) + "</td>";
+  const url = String(row.market_url || "").trim();
+  const action = "<td data-label=\"操作\"><div>"
+    + (/^https:\/\/polymarket\.com\//i.test(url)
+      ? "<a class=\"pm-button\" href=\"" + escapeHtml(url)
+        + "\" target=\"_blank\" rel=\"noopener noreferrer\">Polymarket</a>"
+      : "<span class=\"pm-lp-unknown\">链接未知</span>")
+    + "</div></td>";
+  return "<tr data-lp-trial-candidate=\"" + escapeHtml(String(row.condition_id || "")) + "\">"
+    + identity + competition + pool + minimum + capital + action + "</tr>"
+    + lpTrialEvidenceRow(row);
+}
+
+function lpTrialGroupTotalMarkup(candidates, budget) {
+  if (!candidates.length) return "";
+  const availableRaw = budget && typeof budget === "object" ? budget.available_capital : null;
+  const available = predictionHasValue(availableRaw) && Number.isFinite(Number(availableRaw))
+    ? Number(availableRaw) : null;
+  let total = 0;
+  let complete = true;
+  candidates.forEach((row) => {
+    const value = Number(row.realtime_capital ?? row.reference_capital);
+    if (Number.isFinite(value) && value >= 0) total += value;
+    else complete = false;
+  });
+  const totalText = predictionMoney(total, "UNKNOWN");
+  const count = String(candidates.length);
+  if (available === null || !complete) {
+    return "<p class=\"pm-lp-group-total\">入选 " + count + " 个整组合计 <strong>"
+      + escapeHtml(totalText) + "</strong> USD · "
+      + (available === null ? "可用资金未知，无法判断能否同时试挂。" : "部分占资待实时，合计以实时值为准。")
+      + "</p>";
+  }
+  if (total <= available) {
+    return "<p class=\"pm-lp-group-total\">入选 " + count + " 个整组合计 <strong>"
+      + escapeHtml(totalText) + "</strong> USD ≤ 可用 " + escapeHtml(predictionMoney(available))
+      + "，可同时试挂。</p>";
+  }
+  return "<p class=\"pm-lp-group-total over\">入选 " + count + " 个整组合计 <strong>"
+    + escapeHtml(totalText) + "</strong> USD 超出可用 " + escapeHtml(predictionMoney(available))
+    + "，差额 " + escapeHtml(predictionMoney(total - available))
+    + "，不能全部同时试挂，请优先试挂排序靠前候选。</p>";
+}
+
+function lpBudgetLineMarkup(budget, checkedAt) {
+  const availableRaw = budget && typeof budget === "object" ? budget.available_capital : null;
+  const hasAvailable = predictionHasValue(availableRaw) && Number.isFinite(Number(availableRaw));
+  const availableText = hasAvailable
+    ? "可用资金 <strong>" + escapeHtml(Number(availableRaw).toFixed(2)) + "</strong> USD（已扣未成交委托占用）"
+    : "可用资金 <strong class=\"pm-lp-unknown\">未知</strong>（预算数据缺失）";
+  const stamp = predictionHasValue(checkedAt)
+    ? " · 数据 " + escapeHtml(predictionHktTimestamp(checkedAt))
     : "";
-  const competitionMarkup = competition && competition !== "UNKNOWN"
-    ? "<span class=\"sub\">价带公开挂单 " + escapeHtml(competition) + " 份</span>"
-    : "";
-  const detailRows = [
-    range !== "UNKNOWN" && sampleCount !== "UNKNOWN"
-      ? "平稳性：24 小时历史极差 " + range + " · 样本 " + sampleCount + " · 窗口 "
-        + historyWindowStart + " 至 " + historyWindowEnd + "。"
-      : "",
-    historyCheckedAt !== "UNKNOWN" && historyValidUntil !== "UNKNOWN"
-      ? "历史检查 " + historyCheckedAt + " · 有效至 " + historyValidUntil + "。"
-      : "",
-    change && source ? "24 小时价格参考 " + change + " · 来源 " + source + "；仅作参考。" : "",
-    referenceMarkup || competitionMarkup
-      ? "日奖池 " + pool + " · " + (referenceMarkup ? referenceMarkup.replace(/<[^>]+>/g, "") : "")
-        + (competitionMarkup ? " · " + competitionMarkup.replace(/<[^>]+>/g, "")
-          + "（竞争代理，不代表个人奖励份额）。" : "")
-      : "",
-    "买入 " + outcome + "：" + lpDashboardPrice(guidance.price) + " × "
-      + predictionValue(guidance.quantity, "UNKNOWN") + " 份 · 占资 "
-      + lpDashboardMoney(guidance.required_capital) + " · 含费压力估损 "
-      + lpDashboardMoney(guidance.estimated_exit_loss) + "（" + lossPercent
-      + "，估损不超过该市场投入的 10%）。",
-    "检查时间 " + predictionHktTimestamp(guidance.checked_at) + " · 有效至 "
-      + predictionHktTimestamp(guidance.expires_at) + ".",
-    ...reasons,
-  ].filter(Boolean);
-  const detailMarkup = "<details><summary>筛选与风控依据</summary><ul>"
-    + detailRows.map((item) => "<li>" + escapeHtml(item) + "</li>").join("")
-    + "</ul></details>";
-  const title = lpMarketTitleLink(recommendation);
-  const marketId = predictionValue(recommendation.market_id, "UNKNOWN");
-  const rowMarkup = "<tr data-lp-recommendation=\"" + escapeHtml(conditionId)
-    + "\"><td data-label=\"市场与选项\">" + title + "<span class=\"sub\">"
-    + escapeHtml(marketId) + " · " + escapeHtml(outcome)
-    + "</span></td><td data-label=\"日奖池\"><div class=\"num\">"
-    + escapeHtml(pool) + "</div>" + referenceMarkup + competitionMarkup
-    + "</td><td data-label=\"下单指引\"><div>" + directionsControl + "<span class=\"sub\">可参与</span>"
-    + "<div>" + escapeHtml(lpDashboardPrice(guidance.price)) + "（"
-    + escapeHtml(predictionMoney(guidance.price, "UNKNOWN")) + "） × "
-    + escapeHtml(predictionValue(guidance.quantity, "UNKNOWN")) + " 份</div><span class=\"sub\">所需资金 "
-    + escapeHtml(lpDashboardMoney(guidance.required_capital))
-    + "</span><span class=\"sub\">检查 " + escapeHtml(predictionHktTimestamp(guidance.checked_at))
-    + " · 有效至 " + escapeHtml(predictionHktTimestamp(guidance.expires_at))
-    + "</span></div></td><td data-label=\"24 小时振幅\"><div>24h 极差 "
-    + escapeHtml(range) + "<span class=\"sub\">窗口 " + escapeHtml(historyWindowStart)
-    + " 至 " + escapeHtml(historyWindowEnd) + " · " + escapeHtml(sampleCount)
-    + " 个样本</span></div></td><td data-label=\"压力退出估损\"><div class=\"num\">"
-    + escapeHtml(lpDashboardMoney(guidance.estimated_exit_loss)) + "（"
-    + escapeHtml(lossPercent) + "）<span class=\"sub\">估损不超过该市场投入的 10%</span></div></td>"
-    + "<td data-label=\"操作\"><div>" + marketLink + "</div></td></tr>";
-  return rowMarkup + "<tr class=\"pm-lp-evidence-row\"><td class=\"sub\" colspan=\"6\">"
-    + detailMarkup + "</td></tr>";
+  return "<p class=\"pm-lp-budget-line\">" + availableText + stamp + "</p>";
 }
 
 function predictionLpCard(payload) {
   const dashboard = payload?.lp_dashboard && typeof payload.lp_dashboard === "object"
     ? payload.lp_dashboard : {};
   const lpOrdersToday = lpDashboardRows(dashboard.lp_orders_today);
-  const recommendations = lpDashboardRows(dashboard.recommendations);
-  const selectedResults = lpDashboardRows(dashboard.selected_results);
-  const candidateSource = selectedResults.length ? selectedResults : recommendations;
+  const candidates = lpDashboardRows(dashboard.candidates);
   const rewards = lpDashboardRewards(dashboard.market_rewards);
   const rewardShares = lpDashboardRewards(dashboard.reward_shares);
   const observations = lpDashboardObservations(dashboard.lp_observations);
@@ -3813,8 +3765,9 @@ function predictionLpCard(payload) {
     : "<span class=\"pm-clock\">"
       + escapeHtml(predictionHasValue(checkedAt) ? "同步时间：" + predictionHktTimestamp(checkedAt) : "等待首次同步")
       + " · 每 5 秒刷新</span>";
-  const todayRowsHtml = lpOrdersToday.length
-    ? lpOrdersToday.map((row) => lpDashboardTodayOrderRow(
+  const orderedToday = lpDashboardTodayYieldOrder(lpOrdersToday, observations);
+  const todayRowsHtml = orderedToday.length
+    ? orderedToday.map((row) => lpDashboardTodayOrderRow(
       row, rewards, rewardShares, shownRewards, observations, shownObservations,
       shownShareWatches, shareWatchStates, activeConditions, session, stale,
     )).join("")
@@ -3839,52 +3792,9 @@ function predictionLpCard(payload) {
     ? "<p class=\"sub\">账户另有 " + escapeHtml(String(nonLpRowCount))
       + " 行非 LP 订单/持仓，不在本表展示。</p>"
     : "";
-  const candidateNow = Date.now();
-  const seenCandidates = new Set();
-  const currentRecommendations = [];
-  candidateSource.forEach((recommendation) => {
-    const actionable = lpDashboardRecommendationCurrentDirections(recommendation, candidateNow, candidatesStale);
-    const identity = String(recommendation.condition_id || recommendation.market_id || lpMarketTitle(recommendation));
-    if (!actionable.length || seenCandidates.has(identity)) return;
-    seenCandidates.add(identity);
-    currentRecommendations.push({recommendation, actionable});
-  });
-  const candidateDiagnostics = lpDashboardRecommendationDiagnostics(candidateSource, candidateNow, candidatesStale);
-  const recommendationRows = currentRecommendations.map(({recommendation, actionable}) =>
-    lpDashboardRecommendationRow(recommendation, actionable)
-  ).join("");
-  const recommendationRowsHtml = recommendationRows
-    ? recommendationRows
-    : "<tr><td colspan=\"6\" class=\"pm-observation-empty\">"
-      + (dashboard.scanning === true || dashboard.complete === false
-        ? "目录尚未完整，暂未读取到可展示标的。"
-        : candidateDiagnostics.some((item) => item.includes("指引已过期"))
-          ? "当前指引已过期，暂无可用的风控通过标的；过期项保留在资料诊断中。"
-          : "当前没有可用的风控通过标的；资料不可用或未通过的市场不会显示买入建议。")
-      + "</td></tr>";
-  const diagnosticsMarkup = candidateDiagnostics.length
-    ? "<details class=\"pm-lp-candidate-diagnostics\"><summary>资料不可用/过期诊断</summary><ul>"
-      + candidateDiagnostics.map((item) => "<li>" + escapeHtml(item) + "</li>").join("")
-      + "</ul></details>"
-    : "";
   const funnel = dashboard.funnel && typeof dashboard.funnel === "object" ? dashboard.funnel : {};
-  const risk = funnel.risk && typeof funnel.risk === "object" ? funnel.risk : {};
-  const unavailableCount = Number(risk.unknown);
-  const riskReasons = funnel.reasons && Array.isArray(funnel.reasons.risk)
-    ? [...new Set(funnel.reasons.risk.map((item) => {
-      const code = item && typeof item === "object" ? item.reason || item.code : item;
-      return lpDashboardReasonLabel(code);
-    }))]
-    : [];
-  const candidateErrorMarkup = Number.isFinite(unavailableCount) && unavailableCount > 0
-    ? "<p class=\"pm-lp-candidate-error\" role=\"status\"><strong>资料不可用</strong>本轮 "
-      + escapeHtml(predictionNumber(unavailableCount, "UNKNOWN"))
-      + " 个市场资料不可用"
-      + (riskReasons.length ? "：" + escapeHtml(riskReasons.join("、")) : "。")
-      + "；资料不可用不计为明确风控未通过。</p>"
-    : "";
   const funnelMarkup = predictionLpFunnel({
-    ...(dashboard.funnel && typeof dashboard.funnel === "object" ? dashboard.funnel : {}),
+    ...funnel,
     state: dashboard.candidate_state,
     stale: candidatesStale,
     scanning: dashboard.scanning,
@@ -3892,14 +3802,44 @@ function predictionLpCard(payload) {
     checked_at: dashboard.candidate_checked_at,
     last_success_at: dashboard.candidate_last_success_at,
     candidate_last_success_at: dashboard.candidate_last_success_at,
-    rendered_count: currentRecommendations.length,
-    recommendation_diagnostics: candidateDiagnostics,
   });
+  const notUpdatedCompetition = Array.isArray(funnel.competition_not_updated)
+    ? funnel.competition_not_updated : [];
+  const dataNoticeMarkup = notUpdatedCompetition.length
+    ? "<p class=\"pm-lp-candidate-error\" role=\"status\"><strong>数据提示</strong>"
+      + escapeHtml(String(notUpdatedCompetition.length))
+      + " 个标的竞争值本轮未更新（读取失败页覆盖），已沿用旧值并标注数据时间；不影响其余标的排序。</p>"
+    : "";
+  const excluded = funnel.excluded && typeof funnel.excluded === "object" ? funnel.excluded : {};
+  const overAvailableCount = Math.max(0, Number(excluded.over_available) || 0);
+  const competitionEmptyCount = Math.max(0, Number(excluded.competition_empty) || 0);
+  const budget = funnel.budget && typeof funnel.budget === "object" ? funnel.budget : {};
+  const budgetStampAt = dashboard.candidate_last_success_at || dashboard.candidate_checked_at;
+  const budgetLineMarkup = lpBudgetLineMarkup(budget, budgetStampAt);
+  const gapReason = predictionHasValue(funnel.gap_reason) ? String(funnel.gap_reason) : "";
+  const candidateRowsHtml = candidates.length
+    ? candidates.map((row) => lpTrialCandidateRow(row)).join("")
+    : "<tr><td colspan=\"6\" class=\"pm-observation-empty\">"
+      + (dashboard.scanning === true
+        ? "目录扫描中，暂无待测候选。"
+        : "本轮没有可展示的待测候选；竞争为 0 排除 " + escapeHtml(String(competitionEmptyCount))
+          + " 个，超可用排除 " + escapeHtml(String(overAvailableCount)) + " 个。")
+      + "</td></tr>";
+  const candidateSection = "<section aria-label=\"LP 待测候选\"><h3>待测候选（"
+    + escapeHtml(String(candidates.length)) + " 个 · 低竞争优先）<span class=\"sub\">· 非全市场收益前十 · 已排除超可用资金 "
+    + escapeHtml(String(overAvailableCount)) + " 个"
+    + (gapReason ? " · " + escapeHtml(gapReason) : "")
+    + "</span></h3><div class=\"pm-table-wrap\"><table class=\"pm-table pm-lp-candidate-table\">"
+    + "<thead><tr><th scope=\"col\">市场与选项</th><th scope=\"col\">官方竞争 ↑</th><th scope=\"col\">日奖池</th>"
+    + "<th scope=\"col\">最低试挂</th><th scope=\"col\">最低占资（参考 → 实时）</th><th scope=\"col\">操作</th></tr></thead>"
+    + "<tbody>" + candidateRowsHtml + "</tbody></table></div>"
+    + lpTrialGroupTotalMarkup(candidates, budget)
+    + "<p class=\"sub\">已有委托或持仓的市场不重复推荐；最低占资超过可用资金（已扣委托占用）的候选不展示、计入漏斗排除数；官方竞争为粗排参考（越低竞争越小），缺失显示未知、不填 0；参考占资基于 24h 摘要价，实时占资来自入选候选的盘口读取；实际下单前以 Polymarket 页面实时事实为准。</p></section>";
   const sessionDetails = activeSession
-    ? "<details class=\"pm-lp-session-details\"><summary>当前系统会话详情 · "
+    ? "<details class=\"pm-lp-session-details\" data-lp-details-key=\"lp-session-details\"><summary>当前系统会话详情 · "
       + escapeHtml(predictionValue(session.market_title || session.market || session.question, "系统会话"))
       + "</summary>" + predictionLpSessionCard({...payload, lp_session: session})
-      + "<p class=\"sub\">系统会话仍按北京时间 08:00 复盘并使用原 $5 止损触发线；推荐指引是入场前压力估算，不会创建或管理订单。</p></details>"
+      + "<p class=\"sub\">系统会话仍按北京时间 08:00 复盘并使用原 $5 止损触发线；候选是待测参考，不会创建或管理订单。</p></details>"
     : "";
   const error = payload?.lp_error || (session && session.error);
   const errorMarkup = error
@@ -3912,22 +3852,18 @@ function predictionLpCard(payload) {
     + (state.predictionMarket.lpDashboardRequestInFlight || state.predictionMarket.lpPreparationRecoveryInFlight || !state.predictionMarket.csrfToken ? " disabled" : "") + ">立即刷新</button></div></header>"
     + errorMarkup
     + predictionLpPreparation(dashboard.preparation)
-    + "<section aria-label=\"当天 LP 委托\"><h3>当天 LP 委托 <span class=\"sub\">· 北京时间 08:00 起</span></h3><div class=\"pm-table-wrap\"><table class=\"pm-table pm-lp-order-table\">"
+    + budgetLineMarkup
+    + "<section aria-label=\"当天 LP 委托\"><h3>当天 LP 委托 <span class=\"sub\">· 北京时间 08:00 起 · 按当前小时奖励率降序</span></h3><div class=\"pm-table-wrap\"><table class=\"pm-table pm-lp-order-table\">"
     + "<thead><tr><th scope=\"col\">标的</th><th scope=\"col\">委托与成交量</th><th scope=\"col\">LP 收益率（预计）</th><th scope=\"col\">压力损失（警戒线 10%）</th></tr></thead>"
     + "<tbody>" + todayRowsHtml + "</tbody></table></div>"
     + savedShareWatchesMarkup
     + nonLpFootnote
-    + "<p class=\"sub\">预计 LP 毛奖励；压力损失不含奖励抵扣；10% 是风险警告线。</p></section>"
+    + "<p class=\"sub\">预计 LP 毛奖励；压力损失不含奖励抵扣；10% 是风险警告线；「试挂/正式」由委托数量对比最小计分数量自动标注（买=最小计分数量→试挂；更大→正式；卖出单不标注）。</p></section>"
     + funnelMarkup
-    + candidateErrorMarkup
-    + "<section aria-label=\"LP 标的评估\"><h3>风控通过标的（" + escapeHtml(String(currentRecommendations.length)) + "）</h3><div class=\"pm-table-wrap\"><table class=\"pm-table pm-lp-candidate-table\">"
-    + "<thead><tr><th scope=\"col\">市场与选项</th><th scope=\"col\">日奖池</th><th scope=\"col\">下单指引</th><th scope=\"col\">24 小时振幅</th><th scope=\"col\">压力退出估损</th><th scope=\"col\">操作</th></tr></thead>"
-    + "<tbody>" + recommendationRowsHtml + "</tbody></table></div>"
-    + diagnosticsMarkup
-    + "<p class=\"sub\">已有委托或持仓的市场不会重复推荐；方向按接口返回的实际选项展示，点 Polymarket 链接后由用户手动操作。</p></section>"
+    + dataNoticeMarkup
+    + candidateSection
     + sessionDetails + "</section>";
 }
-
 function predictionLpSessionCard(payload) {
   const source = payload?.lp_session && typeof payload.lp_session === "object"
     ? payload.lp_session
@@ -4594,32 +4530,19 @@ function predictionLpFunnelStage(label, key, value, note, hint, tone = "") {
 function predictionLpFunnel(payload) {
   const funnel = payload && typeof payload === "object" ? payload : {};
   const conditions = funnel.conditions && typeof funnel.conditions === "object" ? funnel.conditions : {};
-  const risk = funnel.risk && typeof funnel.risk === "object" ? funnel.risk : {};
   const read = (key) => funnel[key];
   const hasCondition = (key) => Object.prototype.hasOwnProperty.call(conditions, key);
-  const conditionText = (key, fallback) => hasCondition(key)
+  const conditionText = (key) => hasCondition(key)
     ? predictionLpFunnelCondition(conditions, key)
-    : fallback && hasCondition(fallback)
-      ? predictionLpFunnelCondition(conditions, fallback)
-      : "规则不可用（UNKNOWN）";
+    : "规则不可用（UNKNOWN）";
   const numeric = (value) => {
     if (value === null || value === undefined || String(value).trim() === "") return null;
     const number = Number(value);
     return Number.isFinite(number) ? number : null;
   };
-  const hasRiskCount = ["passed", "rejected", "unknown"].some((key) => numeric(risk[key]) !== null);
-  const riskPending = risk.state === "pending"
-    || funnel.risk_evaluated === false
-    || (!hasRiskCount && funnel.risk_evaluated !== true);
-  const renderedCount = numeric(funnel.rendered_count);
-  const riskValue = riskPending
-    ? "待评估"
-    : renderedCount !== null
-      ? predictionLpFunnelCount(renderedCount)
-      : predictionLpFunnelCount(risk.passed);
-  const riskNote = riskPending
-    ? "未通过 UNKNOWN · 资料不可用 UNKNOWN · 待评估"
-    : `未通过 ${predictionLpFunnelCount(risk.rejected)} · 资料不可用 ${predictionLpFunnelCount(risk.unknown)} · 待评估 ${predictionLpFunnelCount(risk.pending || risk.pending_count || 0)}`;
+  const excluded = funnel.excluded && typeof funnel.excluded === "object" ? funnel.excluded : {};
+  const compared = funnel.compared_range && typeof funnel.compared_range === "object"
+    ? funnel.compared_range : {};
   const stale = payload.stale === true || payload.state === "stale";
   const scanning = payload.scanning === true || payload.state === "scanning";
   const incomplete = payload.state === "incomplete" || payload.complete === false;
@@ -4634,46 +4557,44 @@ function predictionLpFunnel(payload) {
           ? `检查 ${predictionHktTimestamp(checkedAt)}`
           : "检查时间 UNKNOWN";
   const rawReasons = funnel.reasons && typeof funnel.reasons === "object" ? funnel.reasons : {};
-  const reasonLabels = {catalog: "目录", base: "基础条件", volatility: "波动条件", selected: "筛选范围", risk: "风控"};
+  const reasonLabels = {read: "读取", base: "基础筛选", sort: "排序", trial: "待测候选"};
   const reasonText = (item) => {
     if (!item || typeof item !== "object") return String(item);
     const market = item.market_id || item.condition_id || "UNKNOWN";
-    const outcome = item.outcome ? ` ${item.outcome}` : "";
     const code = item.reason || item.code || "UNKNOWN";
-    return `${market}${outcome} · ${String(code).replaceAll("_", " ")}`;
+    return `${market} · ${String(code).replaceAll("_", " ")}`;
   };
-  const reasonGroups = ["catalog", "base", "volatility", "selected", "risk"].map((key) => {
+  const reasonGroups = ["read", "base", "sort", "trial"].map((key) => {
     const hasReasons = Object.prototype.hasOwnProperty.call(rawReasons, key)
       && Array.isArray(rawReasons[key]);
     const values = hasReasons ? rawReasons[key] : [];
     return `<section data-lp-funnel-reason-stage="${key}"><strong>${reasonLabels[key]}</strong>${values.length ? `<ul>${values.map((item) => `<li>${escapeHtml(reasonText(item))}</li>`).join("")}</ul>` : hasReasons ? "<p>本轮没有淘汰原因</p>" : "<p>原因 UNKNOWN</p>"}</section>`;
   }).join("");
-  const reasons = `<details data-lp-funnel-reasons><summary>筛选原因</summary><div class="pm-lp-funnel-reasons">${reasonGroups}</div><p class="sub">同一标的可能有多个原因，原因数量不可相加。</p></details>`;
+  const reasons = `<details data-lp-funnel-reasons data-lp-details-key="lp-funnel-reasons"><summary>筛选原因</summary><div class="pm-lp-funnel-reasons">${reasonGroups}</div><p class="sub">同一标的可能有多个原因，原因数量不可相加。</p></details>`;
   const stages = [
     predictionLpFunnelStage(
-      "已读取市场", "catalog-read", predictionLpFunnelCount(read("catalog_read")),
-      "本次筛选范围",
-      conditionText("read", "catalog"), "live",
+      "读取", "read", predictionLpFunnelCount(read("read")),
+      `已比较 ${predictionLpFunnelCount(compared.compared)}/${predictionLpFunnelCount(compared.total)} · 待处理 ${predictionLpFunnelCount(compared.pending)}`,
+      conditionText("read"), "live",
     ),
     predictionLpFunnelStage(
-      "筛选通过", "filter", predictionLpFunnelCount(read("volatility_pass")),
-      numeric(read("volatility_pass")) === null ? "筛选资料不可用" : "满足当前全部筛选条件",
-      (hasCondition("filter")
-        ? conditionText("filter")
-        : [conditionText("base"), conditionText("volatility")].join(" · ")), "live",
+      "基础筛选", "base", predictionLpFunnelCount(read("base")),
+      "奖励、市场、参与、摘要与事件窗口剔除",
+      conditionText("base"), "live",
     ),
     predictionLpFunnelStage(
-      "风控通过", "risk", riskValue, riskNote,
-      [
-        hasCondition("selected") ? conditionText("selected") : "",
-        conditionText("risk"),
-      ].filter(Boolean).join(" · "),
-      riskPending || ((renderedCount !== null ? renderedCount : numeric(risk.passed)) || 0) === 0
-        ? numeric(risk.unknown) > 0 ? "drop" : ""
-        : numeric(risk.unknown) > 0 ? "drop" : "good",
+      "排序", "sort", predictionLpFunnelCount(read("sort")),
+      `竞争有效 ${predictionLpFunnelCount(funnel.competition_known)} · 未知 ${predictionLpFunnelCount(funnel.competition_unknown)} · 竞争 0 排除 ${predictionLpFunnelCount(excluded.competition_empty)}`,
+      conditionText("sort"), "live",
+    ),
+    predictionLpFunnelStage(
+      "待测候选", "trial", predictionLpFunnelCount(read("trial")),
+      `超可用排除 ${predictionLpFunnelCount(excluded.over_available)} · 展示 ${predictionLpFunnelCount(funnel.trial)}`,
+      conditionText("trial"),
+      (numeric(read("trial")) || 0) > 0 ? "good" : "drop",
     ),
   ].join("");
-  return `<section class="pm-panel pm-relation-funnel pm-lp-funnel" aria-label="LP 标的评估"><header class="pm-funnel-header"><div><h2>LP 标的评估</h2><p>读取市场 → 筛选 → 风控</p></div><span class="pm-pill ${stale ? "watch" : scanning ? "watch" : ""}">${escapeHtml(status)}</span></header><div class="pm-funnel-lane"><div class="pm-funnel-grid pm-funnel-grid-catalog pm-lp-funnel-grid">${stages}</div></div><div class="pm-funnel-meta"><span>筛选通过为全部廉价条件通过数</span><span>资料不可用、未通过与过期项不计入风控通过数</span>${reasons}</div></section>`;
+  return `<section class="pm-panel pm-relation-funnel pm-lp-funnel" aria-label="LP 标的评估"><header class="pm-funnel-header"><div><h2>LP 标的评估</h2><p>读取市场 → 基础筛选 → 排序 → 待测候选</p></div><span class="pm-pill ${stale ? "watch" : scanning ? "watch" : ""}">${escapeHtml(status)}</span></header><div class="pm-funnel-lane"><div class="pm-funnel-grid pm-funnel-grid-catalog pm-lp-funnel-grid">${stages}</div></div><div class="pm-funnel-meta"><span>官方竞争为粗排参考；缺失或超 1 小时排最后显示未知，不填 0</span><span>最低占资超过可用资金的候选不展示，计入排除数</span>${reasons}</div></section>`;
 }
 
 function predictionLpPreparation(preparation) {
@@ -5194,8 +5115,40 @@ function renderPredictionMarket() {
   // drawer's decision form first and refill it after so an operator's picked
   // reason/typed note survives instead of silently resetting.
   const decision = relationDecisionSnapshot(root);
+  const lpSnapshot = lpRenderFidelitySnapshot(root);
   root.innerHTML = predictionWorkspacePage();
   restoreRelationDecision(root, decision);
+  lpRenderFidelityRestore(root, lpSnapshot);
+}
+
+function lpRenderFidelitySnapshot(root) {
+  const open = new Set();
+  if (typeof root.querySelectorAll === "function") {
+    root.querySelectorAll("details[data-lp-details-key][open]").forEach((element) => {
+      const key = element.getAttribute("data-lp-details-key");
+      if (key) open.add(key);
+    });
+  }
+  const anchor = typeof window !== "undefined" && Number.isFinite(window.scrollY)
+    ? window.scrollY : 0;
+  return {open, anchor};
+}
+
+function lpRenderFidelityRestore(root, snapshot) {
+  if (!snapshot
+    || !(snapshot.open instanceof Set)
+    || typeof root.querySelectorAll !== "function") {
+    return;
+  }
+  root.querySelectorAll("details[data-lp-details-key]").forEach((element) => {
+    if (snapshot.open.has(element.getAttribute("data-lp-details-key"))) {
+      element.open = true;
+    }
+  });
+  if (snapshot.anchor > 0 && typeof window !== "undefined"
+    && Number.isFinite(window.scrollY) && typeof window.scrollTo === "function") {
+    window.scrollTo(0, snapshot.anchor);
+  }
 }
 
 function selectPredictionTab(tab) {
@@ -5327,6 +5280,8 @@ async function fetchPredictionLpDashboard() {
   if (state.workspaceView !== "prediction_market" || state.predictionMarket.activeTab !== "lp"
     || state.predictionMarket.lpDashboardRequestInFlight) return;
   const requestRevision = state.predictionMarket.lpShareWatchRevision || 0;
+  const requestSeq = (state.predictionMarket.lpDashboardRequestSeq || 0) + 1;
+  state.predictionMarket.lpDashboardRequestSeq = requestSeq;
   state.predictionMarket.lpDashboardRequestInFlight = true;
   try {
     const response = await fetch(predictionRequestUrl("/api/prediction-arbitrage/lp/dashboard"), {
@@ -5335,6 +5290,7 @@ async function fetchPredictionLpDashboard() {
     });
     if (!response.ok) throw new Error("LP dashboard " + response.status);
     const dashboard = await response.json();
+    if (requestSeq !== state.predictionMarket.lpDashboardRequestSeq) return;
     const confirmed = state.predictionMarket.lpShareWatchConfirmed || {};
     const incomingWatchState = dashboard && dashboard.lp_share_watch_state
       && typeof dashboard.lp_share_watch_state === "object"
@@ -5355,6 +5311,7 @@ async function fetchPredictionLpDashboard() {
     state.predictionMarket.lpDashboard = {...dashboard};
     state.predictionMarket.lpDashboardError = "";
   } catch (error) {
+    if (requestSeq !== state.predictionMarket.lpDashboardRequestSeq) return;
     const previous = state.predictionMarket.lpDashboard && typeof state.predictionMarket.lpDashboard === "object"
       ? state.predictionMarket.lpDashboard
       : {};

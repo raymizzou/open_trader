@@ -3,6 +3,10 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-09-19
+
+- LP 首页候选闭环重做（issue 138）：候选区改为「待测候选」表——按官方竞争升序粗排（竞争值 0 视为危险信号直接排除、缺失或超 1 小时排最后显示未知不填 0）、次键日奖池÷最低试挂占资降序，最低试挂占资超过预留后可用资金（实时值优先、缺失用参考值）的候选硬排除并计入漏斗排除数，最多展示 10 个并附「非全市场收益前十」与缺口原因；候选行展示参考→实时占资双值、竞争数据时间，整组合计行区分「可同时试挂」与超可用差额警示。风控评估撤出候选漏斗（漏斗改为 读取→基础筛选→排序→待测候选 四阶段，删除 risk 阶段；preview/start 执行路径不变）。委托区新增用途小图标（BUY 原始数量=最小计分数量→琥珀「试挂」、更大→绿色「正式」、卖出单不标注，服务端零存储派生）并默认按当前小时奖励率降序（缺失显示待更新、不按 0 计）；LP 竞争数据随候选节奏拉取 `/rewards/markets/multi`（进程内缓存、失败按标的粒度保留旧值并标注本轮未更新、不阻塞漏斗）；前端刷新保留展开的 data-key 详情与滚动锚点，LP 仪表盘旧响应不再覆盖新响应、失败保留旧值与时间戳。已知问题修复：main 上两个既有失败用例随本次修正——`test_lp_price_history_updates_incrementally_and_expires` 的 partial→unknown 断言未随 f78562c6 状态口径同步；`test_lp_metadata_warmup_advances_beyond_one_batch` 的执行侧时钟未与适配器冻结时钟同源，跨日运行误判 account_unavailable（测试内将 `_utc_now` 对齐夹具时钟）。Docker 回归：views/trading/lp/runtime/dashboard_web/prediction_service/lp_preparation_partial/lp_history_daily_cache 全绿后跑通 `make test`。
+
 ## 2026-09-18
 
 - 模拟盘持仓现在过滤富途 OpenD 间歇返回的非正股行（如 `US.0000`）：无法规范成本市场正股代码的持仓行从持仓表排除，payload 透传 `excluded_positions` 说明，Dashboard 在持仓明细后追加「非股票资产未计入持仓明细」提示，面板不再因单行异常整体不可用；其余解析错误仍保持 fail-closed。验收脚本同步跳过非正股行并拒绝正股代码藏入排除行。Docker 重点回归：`test_trend_simulate_positions.py`、两个模拟盘验收用例与 Dashboard simulate 渲染用例通过。

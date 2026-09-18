@@ -2868,3 +2868,325 @@ def test_fresh_local_receipt_accepts_unchanged_source_book(tmp_path) -> None:
         clock=lambda: datetime.now(UTC),
     )
     assert missing_service.preview(service_request)["reason"] == "book_freshness_unknown"
+
+
+def test_refresh_candidates_projects_trial_funnel_without_risk(tmp_path) -> None:
+    """A8: 候选漏斗为 读取/基础筛选/排序/待测候选 四阶段，风控阶段移除。"""
+
+    now = datetime(2026, 9, 17, 1, tzinfo=UTC)
+
+    class Exchange:
+        def __init__(self) -> None:
+            self.competition_reads = 0
+            self.book_token_reads: tuple[tuple[str, ...], ...] = ()
+
+        def lp_reward_catalog(
+            self, *, condition_ids=None, stop_event=None
+        ) -> dict[str, object]:
+            del condition_ids, stop_event
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": now,
+                "markets": (
+                    {
+                        "condition_id": "condition-A",
+                        "daily_pool_usd": Decimal("120"),
+                        "reward_active": True,
+                    },
+                    {
+                        "condition_id": "condition-B",
+                        "daily_pool_usd": Decimal("90"),
+                        "reward_active": True,
+                    },
+                    {
+                        "condition_id": "condition-Z",
+                        "daily_pool_usd": Decimal("500"),
+                        "reward_active": True,
+                    },
+                ),
+            }
+
+        def lp_market_metadata(
+            self, condition_ids, *, stop_event=None
+        ) -> dict[str, dict[str, object]]:
+            del stop_event
+            sizes = {"condition-A": "20", "condition-B": "20", "condition-Z": "5000"}
+            return {
+                condition_id: {
+                    "market_id": f"market-{condition_id.removeprefix('condition-')}",
+                    "condition_id": condition_id,
+                    "market_title": f"Market {condition_id}",
+                    "market_url": f"https://polymarket.com/event/{condition_id}",
+                    "accepting_orders": True,
+                    "metadata_checked_at": now,
+                    "tick_size": Decimal("0.01"),
+                    "minimum_order_size": Decimal(sizes[condition_id]),
+                    "reward_min_size": Decimal("20"),
+                    "reward_max_spread": Decimal("0.10"),
+                    "fees_enabled": False,
+                    "taker_fee_rate": Decimal("0"),
+                    "fee_exponent": Decimal("1"),
+                    "fee": Decimal("0"),
+                    "outcomes": {
+                        "yes": {
+                            "label": "YES",
+                            "token_id": f"token-{condition_id}",
+                        }
+                    },
+                }
+                for condition_id in condition_ids
+            }
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "balance": Decimal("1000"),
+                "allowance": Decimal("1000"),
+                "open_orders": [],
+                "positions": [],
+                "checked_at": now,
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def lp_order_books(self, token_ids, *, stop_event=None):
+            del stop_event
+            self.book_token_reads = (*self.book_token_reads, tuple(token_ids))
+            return {
+                token_id: {
+                    "condition_id": token_id.removeprefix("token-"),
+                    "token_id": token_id,
+                    "received_at": now,
+                    "bids": [{"price": Decimal("0.34"), "size": Decimal("100")}],
+                    "asks": [{"price": Decimal("0.36"), "size": Decimal("100")}],
+                }
+                for token_id in token_ids
+            }
+
+        def lp_market_competitiveness(
+            self, *, stop_event=None, previous=None
+        ) -> dict[str, object]:
+            del stop_event, previous
+            self.competition_reads += 1
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": now,
+                "round_checked_at": now,
+                "competitiveness": {
+                    "condition-A": (Decimal("0.12"), now),
+                    "condition-B": (Decimal("0"), now),
+                    "condition-Z": (Decimal("5"), now),
+                },
+                "not_updated": [],
+            }
+
+    def lp_price_history(
+        self, token_ids, *, start_ts, end_ts, fidelity=1, stop_event=None
+    ):
+        del fidelity, stop_event
+        return {
+            "state": "known",
+            "history": {
+                token_id: [
+                    {"t": start_ts, "p": "0.500"},
+                    {"t": end_ts, "p": "0.505"},
+                ]
+                for token_id in token_ids
+            },
+            "unknown_token_ids": [],
+        }
+
+    Exchange.lp_price_history = lp_price_history  # type: ignore[attr-defined]
+
+    store = PredictionArbitrageStore(tmp_path)
+    exchange = Exchange()
+    lp = PolymarketLPService(store, exchange, clock=lambda: now)
+    prepared = lp.refresh_price_history()
+    assert prepared["state"] == "known"
+
+    snapshot = lp.refresh_candidates(force=True)
+
+    assert snapshot["state"] == "ready"
+    funnel = snapshot["funnel"]
+    assert {"read", "base", "sort", "trial"} <= set(funnel)
+    assert "risk" not in funnel
+    assert "risk_directions" not in funnel
+    assert funnel["read"] == 3
+    assert funnel["base"] == 3
+    # condition-B carries explicit zero competition: dropped before ranking.
+    assert funnel["sort"] == 2
+    assert funnel["excluded"]["competition_empty"] == 1
+    # condition-Z needs ~5000 × 0.505 capital over the 1000 available.
+    assert funnel["excluded"]["over_available"] == 1
+    assert funnel["trial"] == 1
+    assert funnel["compared_range"] == {
+        "compared": 3,
+        "total": 3,
+        "pending": 0,
+    }
+    candidates = snapshot["candidates"]
+    assert [row["condition_id"] for row in candidates] == ["condition-A"]
+    row = candidates[0]
+    assert row["min_quantity"] == "20"
+    assert row["reference_capital"] == "10.100"  # 20.00 × 0.505 exact
+    assert row["competition"]["value"] == "0.12"
+    assert row["competition"]["state"] == "known"
+    # The selected candidate's live book is read once and merged in-place.
+    assert exchange.book_token_reads == (("token-condition-A",),)
+    assert row["realtime_price"] == "0.34"
+    assert row["realtime_capital"] == "6.80"
+    assert snapshot["recommendations"] == []
+    assert snapshot["selected_market_ids"] == ["market-A"]
+    assert exchange.competition_reads == 1
+
+
+def test_refresh_candidates_drops_rows_whose_realtime_capital_over_available(tmp_path) -> None:
+    """Contract: the over-available gate must use realtime ?? reference capital.
+
+    Reference capital 20 × 0.505 = 10.100 fits the 11 available, so the row
+    reaches the trial list and its live book is read; the realtime bid 0.60
+    lifts capital to 12.00 which exceeds available, so the row must be
+    dropped and counted after enrichment.
+    """
+
+    now = datetime(2026, 9, 17, 2, tzinfo=UTC)
+
+    class Exchange:
+        def __init__(self) -> None:
+            self.book_token_reads: tuple[tuple[str, ...], ...] = ()
+
+        def lp_reward_catalog(
+            self, *, condition_ids=None, stop_event=None
+        ) -> dict[str, object]:
+            del condition_ids, stop_event
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": now,
+                "markets": (
+                    {
+                        "condition_id": "condition-A",
+                        "daily_pool_usd": Decimal("120"),
+                        "reward_active": True,
+                    },
+                    {
+                        "condition_id": "condition-Z",
+                        "daily_pool_usd": Decimal("500"),
+                        "reward_active": True,
+                    },
+                ),
+            }
+
+        def lp_market_metadata(
+            self, condition_ids, *, stop_event=None
+        ) -> dict[str, dict[str, object]]:
+            del stop_event
+            sizes = {"condition-A": "20", "condition-Z": "5000"}
+            return {
+                condition_id: {
+                    "market_id": f"market-{condition_id.removeprefix('condition-')}",
+                    "condition_id": condition_id,
+                    "market_title": f"Market {condition_id}",
+                    "market_url": f"https://polymarket.com/event/{condition_id}",
+                    "accepting_orders": True,
+                    "metadata_checked_at": now,
+                    "tick_size": Decimal("0.01"),
+                    "minimum_order_size": Decimal(sizes[condition_id]),
+                    "reward_min_size": Decimal("20"),
+                    "reward_max_spread": Decimal("0.10"),
+                    "fees_enabled": False,
+                    "taker_fee_rate": Decimal("0"),
+                    "fee_exponent": Decimal("1"),
+                    "fee": Decimal("0"),
+                    "outcomes": {
+                        "yes": {
+                            "label": "YES",
+                            "token_id": f"token-{condition_id}",
+                        }
+                    },
+                }
+                for condition_id in condition_ids
+            }
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "balance": Decimal("11"),
+                "allowance": Decimal("11"),
+                "open_orders": [],
+                "positions": [],
+                "checked_at": now,
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def lp_order_books(self, token_ids, *, stop_event=None):
+            del stop_event
+            self.book_token_reads = (*self.book_token_reads, tuple(token_ids))
+            return {
+                token_id: {
+                    "condition_id": token_id.removeprefix("token-"),
+                    "token_id": token_id,
+                    "received_at": now,
+                    "bids": [{"price": Decimal("0.60"), "size": Decimal("100")}],
+                    "asks": [{"price": Decimal("0.62"), "size": Decimal("100")}],
+                }
+                for token_id in token_ids
+            }
+
+        def lp_market_competitiveness(
+            self, *, stop_event=None, previous=None
+        ) -> dict[str, object]:
+            del stop_event, previous
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": now,
+                "round_checked_at": now,
+                "competitiveness": {
+                    "condition-A": (Decimal("0.12"), now),
+                    "condition-Z": (Decimal("5"), now),
+                },
+                "not_updated": [],
+            }
+
+    def lp_price_history(
+        self, token_ids, *, start_ts, end_ts, fidelity=1, stop_event=None
+    ):
+        del fidelity, stop_event
+        return {
+            "state": "known",
+            "history": {
+                token_id: [
+                    {"t": start_ts, "p": "0.500"},
+                    {"t": end_ts, "p": "0.505"},
+                ]
+                for token_id in token_ids
+            },
+            "unknown_token_ids": [],
+        }
+
+    Exchange.lp_price_history = lp_price_history  # type: ignore[attr-defined]
+
+    store = PredictionArbitrageStore(tmp_path)
+    exchange = Exchange()
+    lp = PolymarketLPService(store, exchange, clock=lambda: now)
+    prepared = lp.refresh_price_history()
+    assert prepared["state"] == "known"
+
+    snapshot = lp.refresh_candidates(force=True)
+
+    assert snapshot["state"] == "ready"
+    # The row passed the reference-stage gate and its live book was read.
+    assert exchange.book_token_reads == (("token-condition-A",),)
+    funnel = snapshot["funnel"]
+    # condition-Z exceeds available at the reference stage, condition-A only
+    # after the realtime recheck: both count as over_available exclusions.
+    assert funnel["excluded"]["over_available"] == 2
+    assert funnel["trial"] == 0
+    assert snapshot["candidates"] == []
+    assert snapshot["selected_market_ids"] == []
+    assert funnel["gap_reason"] is not None
+    assert "本轮 0 个" in funnel["gap_reason"]

@@ -1638,6 +1638,129 @@ def test_lp_reward_percentages_reads_official_market_shares(
     assert empty["percentages"] == {}
 
 
+def test_lp_market_competitiveness_merges_pages_and_isolates_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CompetitivenessTransport:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, object]]] = []
+            self.fail_second_page = False
+
+        def get_json(self, path: str, *, params: dict[str, object]) -> object:
+            self.calls.append((path, dict(params)))
+            if params.get("next_cursor") is None:
+                return {
+                    "data": [
+                        {
+                            "condition_id": "condition-a",
+                            "market_competitiveness": 16.6,
+                        },
+                        {
+                            "condition_id": "condition-b",
+                            "market_competitiveness": "0",
+                        },
+                        {
+                            "condition_id": "condition-bad",
+                            "market_competitiveness": "NaN",
+                        },
+                    ],
+                    "next_cursor": "Mg==",
+                    "limit": 500,
+                    "count": 3,
+                }
+            if self.fail_second_page:
+                raise RuntimeError("second page failed")
+            return {
+                "data": [
+                    {
+                        "condition_id": "condition-c",
+                        "market_competitiveness": 39190,
+                    }
+                ],
+                "next_cursor": "LTE=",
+                "limit": 500,
+                "count": 1,
+            }
+
+    transport = CompetitivenessTransport()
+    monkeypatch.setattr(polymarket_trading, "signature_type_for", lambda _: 2)
+
+    class SDK:
+        _ctx = SimpleNamespace(secure_clob=transport, wallet_type="proxy")
+
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET), client=SDK()
+    )
+
+    complete = adapter.lp_market_competitiveness()
+    assert complete["state"] == "known"
+    assert complete["complete"] is True
+    assert complete["not_updated"] == []
+    assert complete["competitiveness"]["condition-a"] == (
+        Decimal("16.6"),
+        complete["round_checked_at"],
+    )
+    # Explicit zero survives as zero: the projection excludes it as a
+    # danger signal, it is never rewritten to unknown.
+    assert complete["competitiveness"]["condition-b"] == (
+        Decimal("0"),
+        complete["round_checked_at"],
+    )
+    assert complete["competitiveness"]["condition-c"][0] == Decimal("39190")
+    assert "condition-bad" not in complete["competitiveness"]
+    assert [(path, params["page_size"]) for path, params in transport.calls] == [
+        ("/rewards/markets/multi", 500),
+        ("/rewards/markets/multi", 500),
+    ]
+    assert transport.calls[1][1]["next_cursor"] == "Mg=="
+
+    # Round 2: page 1 succeeds, page 2 fails.  Page-1 targets update with the
+    # new round stamp; page-2 targets keep the old value and are flagged as
+    # not updated this round.
+    transport.fail_second_page = True
+    partial = adapter.lp_market_competitiveness(
+        previous=complete["competitiveness"]
+    )
+    assert partial["state"] == "partial"
+    assert partial["complete"] is False
+    assert partial["competitiveness"]["condition-a"] == (
+        Decimal("16.6"),
+        partial["round_checked_at"],
+    )
+    assert (
+        partial["competitiveness"]["condition-a"][1]
+        != complete["competitiveness"]["condition-a"][1]
+    )
+    assert partial["competitiveness"]["condition-c"] == (
+        complete["competitiveness"]["condition-c"]
+    )
+    assert partial["not_updated"] == ["condition-c"]
+
+    # Total failure stays non-blocking: structure complete, previous values
+    # preserved and flagged not updated.
+    class BrokenTransport:
+        def get_json(self, path: str, *, params: dict[str, object]) -> object:
+            raise RuntimeError("transport down")
+
+    class BrokenSDK:
+        _ctx = SimpleNamespace(secure_clob=BrokenTransport(), wallet_type="proxy")
+
+    broken_adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET), client=BrokenSDK()
+    )
+    failed = broken_adapter.lp_market_competitiveness(
+        previous=complete["competitiveness"]
+    )
+    assert failed["state"] == "unknown"
+    assert failed["complete"] is False
+    assert failed["competitiveness"] == complete["competitiveness"]
+    assert failed["not_updated"] == ["condition-a", "condition-b", "condition-c"]
+    failed_empty = broken_adapter.lp_market_competitiveness()
+    assert failed_empty["state"] == "unknown"
+    assert failed_empty["competitiveness"] == {}
+    assert failed_empty["not_updated"] == []
+
+
 def make_probe_intent(
     *, quantity: Decimal, yes_price: Decimal = Decimal("0.45"), no_price: Decimal = Decimal("0.48")
 ) -> PairIntent:

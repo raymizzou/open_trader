@@ -174,19 +174,18 @@ def test_history_batch_failure_keeps_later_batches_and_partial_results(
 
     snapshot = service.refresh_candidates(force=True)
     failed_ids = set(conditions[20:40])
-    recommendations = snapshot["recommendations"]
+    recommendations = snapshot["candidates"]
     assert recommendations
     assert all(row["condition_id"] not in failed_ids for row in recommendations)
     healthy = next(
-        row for row in snapshot["selected_results"] if row["condition_id"] == "condition-000"
+        row for row in snapshot["candidates"] if row["condition_id"] == "condition-000"
     )
-    assert healthy["directions"]["YES"]["state"] == "eligible"
-    assert healthy["directions"]["YES"]["guidance"] is not None
-    assert all(row["condition_id"] not in failed_ids for row in snapshot["selected_results"])
+    assert healthy["market_id"]
+    assert all(row["condition_id"] not in failed_ids for row in snapshot["candidates"])
     assert any(
         reason["condition_id"] in failed_ids
         and reason["code"] == "history_summary_unknown"
-        for reason in snapshot["funnel"]["reasons"]["volatility"]
+        for reason in snapshot["funnel"]["reasons"]["base"]
     )
 
 
@@ -362,17 +361,13 @@ def test_partial_metadata_keeps_successful_markets_screenable(
     first_snapshot = service.refresh_candidates(force=True)
     assert first_snapshot["complete"] is False
     candidate_rows = {
-        row["condition_id"]: row for row in first_snapshot["selected_results"]
+        row["condition_id"]: row for row in first_snapshot["candidates"]
     }
     assert {"condition-a", "condition-c"} <= candidate_rows.keys()
     assert "condition-b" not in candidate_rows
     assert {
-        candidate_rows[condition_id]["directions"]["YES"]["state"]
-        for condition_id in ("condition-a", "condition-c")
-    } == {"eligible"}
-    assert {
         row["condition_id"] for row in first_snapshot["recommendations"]
-    } == {"condition-a", "condition-c"}
+    } == set()
     assert first_snapshot["missing_metadata_condition_ids"] == ["condition-b"]
 
     current[0] = T + timedelta(seconds=300)
@@ -743,7 +738,7 @@ def test_metadata_retry_with_valid_history_cache_finishes_budget(
     snapshot = service.refresh_candidates(force=True)
     assert any(
         row.get("condition_id") == "condition-b"
-        for row in snapshot["selected_results"]
+        for row in snapshot["candidates"]
     )
 
     restarted = PolymarketLPService(
@@ -1392,13 +1387,13 @@ def test_preparation_can_publish_valid_results_before_slow_batch_finishes(
 
     snapshot = service.refresh_candidates(force=True)
     ready = next(
-        row for row in snapshot["selected_results"] if row["condition_id"] == "condition-ready"
+        row for row in snapshot["candidates"] if row["condition_id"] == "condition-ready"
     )
-    assert ready["directions"]["YES"]["state"] in {"eligible", "rejected"}
+    assert ready["market_id"]
     assert any(
         row["condition_id"] == "condition-waiting"
         and row["code"] == "history_summary_unknown"
-        for row in snapshot["funnel"]["reasons"]["volatility"]
+        for row in snapshot["funnel"]["reasons"]["base"]
     )
 
     release_history.set()
@@ -1697,7 +1692,7 @@ def test_partial_retry_pauses_only_failed_items_across_restart(tmp_path: Path) -
     current[0] = T + timedelta(hours=23)
     candidate = service.refresh_candidates(force=True)
     candidate_ids = {
-        row["condition_id"] for row in candidate["recommendations"]
+        row["condition_id"] for row in candidate["candidates"]
     }
     assert {"condition-a", "condition-c"} <= candidate_ids
     summaries = store.lp_price_history_summaries(
@@ -1745,11 +1740,6 @@ def test_partial_retry_pauses_only_failed_items_across_restart(tmp_path: Path) -
     assert lp_shortlist(expired_directions, now=current[0]) == []
     expired_snapshot = service.candidate_snapshot()
     assert expired_snapshot["recommendations"] == []
-    assert any(
-        reason.get("code") in {"guidance_expired", "candidate_snapshot_stale"}
-        for reason in expired_snapshot.get("funnel", {}).get("reasons", {}).get("risk", ())
-        if isinstance(reason, dict)
-    )
     restarted = PolymarketLPService(
         PredictionArbitrageStore(tmp_path / "data"), Exchange(), clock=lambda: current[0]
     )
@@ -1970,9 +1960,16 @@ def test_failed_group_does_not_block_other_items_or_duplicate_retry_alerts(
     assert first["preparation"]["state"] == "partial"
     assert len(history_calls) == 5
     first_snapshot = service.refresh_candidates(force=True)
-    assert {"condition-080", "condition-099"} <= {
-        row["condition_id"] for row in first_snapshot["recommendations"]
+    # The failed tail batch must not block healthy markets: candidates still
+    # project (capped at ten) and the failed batch shows up as base reasons.
+    assert "condition-080" in {
+        row["condition_id"] for row in first_snapshot["candidates"]
     }
+    assert any(
+        reason["condition_id"] in {f"condition-{index:03d}" for index in range(80)}
+        and reason["code"] == "history_summary_unknown"
+        for reason in first_snapshot["funnel"]["reasons"]["base"]
+    )
     current[0] = T + timedelta(seconds=299)
     before_due = service.refresh_price_history()
     assert before_due["preparation_outcome"] == "waiting_retry"
@@ -2046,7 +2043,7 @@ def test_failed_group_does_not_block_other_items_or_duplicate_retry_alerts(
     assert restart_result.get("alert_pending") is not True
     candidate = restarted.refresh_candidates(force=True)
     assert "condition-080" in {
-        row["condition_id"] for row in candidate["recommendations"]
+        row["condition_id"] for row in candidate["candidates"]
     }
     notification_fails[0] = False
     wake_result = restarted.refresh_price_history()
@@ -2273,11 +2270,11 @@ def test_market_retry_budget_is_shared_across_preparation_stages(
     assert len(history_calls) == 2
     candidate = restarted.refresh_candidates(force=True)
     assert "condition-c" in {
-        row["condition_id"] for row in candidate["recommendations"]
+        row["condition_id"] for row in candidate["candidates"]
     }
     assert all(
         row["condition_id"] != "condition-b"
-        for row in candidate["recommendations"]
+        for row in candidate["candidates"]
     )
     assert restarted.refresh_price_history().get("alert_pending") is not True
 
@@ -3412,7 +3409,7 @@ def test_due_metadata_retry_dispatches_before_initial_history_pass_finishes(
     snapshot = service.refresh_candidates(force=True)
     assert any(
         row.get("condition_id") == "condition-000"
-        for row in snapshot["selected_results"]
+        for row in snapshot["candidates"]
     )
 
     history_count = len(history_calls)

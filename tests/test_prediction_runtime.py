@@ -683,23 +683,18 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
         assert candidate.get("missing_book_token_ids", []) == []
         candidate_rows = [
             row
-            for row in candidate["selected_results"]
+            for row in candidate["candidates"]
             if isinstance(row, dict)
             and row.get("market_id") == "candidate-market"
             and row.get("condition_id") == "candidate-condition"
         ]
         assert candidate_rows
+        # 入选候选行并入实时盘口：YES 方向实时买价 0.40（原 risk guidance 价）。
         assert any(
-            isinstance(direction, dict)
-            and direction.get("token_id") == "candidate-yes"
-            and isinstance(direction.get("guidance"), dict)
-            and Decimal(str(direction["guidance"].get("price"))) == Decimal("0.40")
+            isinstance(row, dict)
+            and row.get("token_id") == "candidate-yes"
+            and Decimal(str(row.get("realtime_price"))) == Decimal("0.40")
             for row in candidate_rows
-            for direction in (
-                row.get("directions", {}).values()
-                if isinstance(row.get("directions"), dict)
-                else ()
-            )
         ), repr(candidate_rows)
         risk_session = store.lp_session("lp-risk-session")
         assert risk_session is not None
@@ -5376,11 +5371,11 @@ def test_lp_partial_preparation_uses_item_retry_deadline(
             snapshot = runtime.lp.refresh_candidates(force=True)  # type: ignore[union-attr]
         assert any(
             row["condition_id"] == "condition-a"
-            for row in snapshot["recommendations"]
+            for row in snapshot["candidates"]
         ), snapshot
         assert all(
             row["condition_id"] != "condition-b"
-            for row in snapshot["recommendations"]
+            for row in snapshot["candidates"]
         )
 
         release_299.set()
@@ -6029,6 +6024,11 @@ def test_lp_metadata_warmup_advances_beyond_one_batch(
             return clock[0] if tz is None else clock[0].astimezone(tz)  # type: ignore[arg-type]
 
     monkeypatch.setattr(trading_module, "datetime", AdapterClock)
+    # 执行侧 _age_seconds 用真实时钟对比适配器冻结时间戳；跨日运行会误判
+    # account_unavailable。执行侧"现在"必须与适配器冻结时钟同源。
+    import open_trader.prediction_arbitrage_execution as execution_module
+
+    monkeypatch.setattr(execution_module, "_utc_now", lambda: clock[0])
 
     condition_ids = tuple(f"condition-{index:04d}" for index in range(1501))
     absent_id = condition_ids[1499]
@@ -6726,14 +6726,14 @@ def test_lp_minute_risk_does_not_wait_for_hourly_catalog_preparation(
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
             snapshot = runtime.lp.candidate_snapshot()
-            if snapshot.get("selected_results") and snapshot.get("state") in {
+            if snapshot.get("candidates") and snapshot.get("state") in {
                 "ready",
                 "incomplete",
             }:
                 break
             time.sleep(0.01)
         else:
-            raise AssertionError("initial candidate risk scan did not finish")
+            raise AssertionError("initial candidate scan did not finish")
         now[0] += timedelta(seconds=61)
         deadline = time.monotonic() + 2
         while len(selected_book_calls) < 2 and time.monotonic() < deadline:
@@ -6741,10 +6741,10 @@ def test_lp_minute_risk_does_not_wait_for_hourly_catalog_preparation(
         assert len(selected_book_calls) >= 2
         assert catalog_calls == 2
         assert full_metadata_calls == 1
-        assert selected_metadata_calls
-        assert all(call == ("condition-A",) for call in selected_metadata_calls)
-        assert selected_reward_calls
-        assert all(call == ("condition-A",) for call in selected_reward_calls)
+        # 分钟级候选扫描不再做逐市场的新鲜资料/奖励重读：只读已发布 prepared
+        # inputs 并为入选候选读取盘口，等待期间的小时级目录读取不被阻塞。
+        assert selected_metadata_calls == []
+        assert selected_reward_calls == []
         release_catalog.set()
         runtime.stop()
         assert runtime.state == "STOPPED"
@@ -8350,7 +8350,10 @@ def test_lp_dashboard_payload_keeps_orders_and_positions_intact(
         "quantity": Decimal("80"),
         "filled_quantity": Decimal("40"),
         "remaining_quantity": Decimal("40"),
+        "minimum_order_size": None,
         "reward_min_size": Decimal("40"),
+        "min_scoring_size": None,
+        "purpose": None,
         "reward_max_spread": Decimal("0.03"),
         "fees_enabled": False,
         "fee_exponent": Decimal("1"),
@@ -8379,3 +8382,129 @@ def test_lp_dashboard_payload_keeps_orders_and_positions_intact(
             "read_only": True,
         }
     ]
+
+
+def test_lp_dashboard_orders_carry_purpose_and_min_scoring_size(tmp_path: Path) -> None:
+    """A6: BUY 原始数量 = 最小计分数量 → trial；大于 → formal；SELL 或规则缺失 → null。"""
+
+    def order(order_id: str, condition_id: str, side: str, original: str, **rules: object) -> dict[str, object]:
+        row: dict[str, object] = {
+            "order_id": order_id,
+            "condition_id": condition_id,
+            "token_id": f"token-{order_id}",
+            "outcome": "YES",
+            "side": side,
+            "status": "LIVE",
+            "price": Decimal("0.50"),
+            "original_size": Decimal(original),
+            "size_matched": Decimal("0"),
+            "remaining_size": Decimal(original),
+            "market_title": f"Market {order_id}",
+            "market_url": f"https://polymarket.com/event/{order_id}",
+        }
+        row.update(rules)
+        return row
+
+    class FakeTrading:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(
+                wallet_address="0x" + "4" * 40,
+                signer_address="0x" + "5" * 40,
+                predict=None,
+            )
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": datetime.now(UTC),
+                "open_orders": [
+                    order(
+                        "trial-order",
+                        "condition-trial",
+                        "BUY",
+                        "20",
+                        minimum_order_size=Decimal("5"),
+                        reward_min_size=Decimal("20"),
+                    ),
+                    order(
+                        "formal-order",
+                        "condition-formal",
+                        "BUY",
+                        "50",
+                        minimum_order_size=Decimal("5"),
+                        reward_min_size=Decimal("20"),
+                    ),
+                    order(
+                        "sell-order",
+                        "condition-sell",
+                        "SELL",
+                        "20",
+                        minimum_order_size=Decimal("5"),
+                        reward_min_size=Decimal("20"),
+                    ),
+                    order("rules-missing-order", "condition-missing", "BUY", "20"),
+                ],
+                "positions": [],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def get_order_scoring(self, _order_id: str) -> object:
+            return True
+
+        def lp_reward_snapshot(
+            self, reward_date: str, condition_id: str
+        ) -> dict[str, object]:
+            return {
+                "state": "unknown",
+                "reward_date": reward_date,
+                "condition_id": condition_id,
+            }
+
+    class FakeLP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {
+                "state": "known",
+                "complete": False,
+                "candidates": [],
+                "recommendations": [],
+                "market_rewards": {},
+            }
+
+        def status(self, _session_id: str | None = None) -> dict[str, object]:
+            return {"state": "none"}
+
+    store = PredictionArbitrageStore(tmp_path / "data")
+    service = PredictionExecutionService(
+        store=store,
+        monitor=object(),
+        trading=FakeTrading(),
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=FakeLP(),
+    )
+
+    dashboard = service.lp_dashboard()
+
+    orders = {
+        str(row["order_id"]): row
+        for row in dashboard["orders"]
+    }
+    assert orders["trial-order"]["purpose"] == "trial"
+    assert orders["trial-order"]["min_scoring_size"] == Decimal("20")
+    assert orders["formal-order"]["purpose"] == "formal"
+    assert orders["formal-order"]["min_scoring_size"] == Decimal("20")
+    assert orders["sell-order"]["purpose"] is None
+    assert orders["sell-order"]["min_scoring_size"] == Decimal("20")
+    assert orders["rules-missing-order"]["purpose"] is None
+    assert orders["rules-missing-order"]["min_scoring_size"] is None
+
+    today = {
+        str(row["order_id"]): row
+        for row in dashboard["lp_orders_today"]
+    }
+    assert today["trial-order"]["purpose"] == "trial"
+    assert today["formal-order"]["purpose"] == "formal"
+    assert today["sell-order"]["purpose"] is None
+    assert today["rules-missing-order"]["purpose"] is None
+    assert today["rules-missing-order"]["min_scoring_size"] is None
