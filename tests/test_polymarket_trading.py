@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from polymarket import PRODUCTION, SecureClient
+from polymarket import PRODUCTION, PublicClient, SecureClient
 
 import open_trader.cli as cli
 import open_trader.polymarket_trading as polymarket_trading
@@ -3881,6 +3881,472 @@ def _lp_cache_adapter(probe: _LpMetadataProbe) -> PolymarketTradingClient:
         client=object(),
         public_client_factory=probe.public_client_factory(),
     )
+
+
+def _lp_mock_public_client(handler, *, response_hooks=()):
+    import httpx
+
+    public = PublicClient(PRODUCTION)
+    public._ctx.gamma._client = httpx.Client(
+        base_url=PRODUCTION.gamma_url,
+        transport=httpx.MockTransport(handler),
+        event_hooks={"response": list(response_hooks)},
+    )
+    return public
+
+
+def _lp_market_payload(condition_id: str) -> dict[str, object]:
+    return {
+        "id": f"market-{condition_id}",
+        "conditionId": condition_id,
+        "slug": f"market-{condition_id[-8:]}",
+        "question": "Will this market resolve Yes?",
+        "outcomes": '["Yes", "No"]',
+        "outcomePrices": '["0.50", "0.50"]',
+        "clobTokenIds": '["yes-token", "no-token"]',
+        "events": [],
+    }
+
+
+def _lp_market_page_response(request, rows, *, next_cursor=None):
+    import httpx
+
+    payload: dict[str, object] = {"markets": list(rows)}
+    if next_cursor is not None:
+        payload["next_cursor"] = next_cursor
+    return httpx.Response(200, json=payload, request=request)
+
+
+def test_lp_metadata_continues_until_requested_ids_are_accounted() -> None:
+    import httpx
+
+    condition_ids = tuple(f"0x{index:064x}" for index in range(100))
+    first_rows = tuple(
+        _lp_market_payload(condition_id) for condition_id in condition_ids[:-2]
+    ) + (
+        _lp_market_payload(condition_ids[0]),
+        _lp_market_payload("0x" + "f" * 64),
+    )
+    missing_ids = condition_ids[-2:]
+    requests: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/markets/keyset"
+        cursor = request.url.params.get("after_cursor")
+        requests.append(cursor)
+        if cursor == "second":
+            return _lp_market_page_response(
+                request,
+                tuple(_lp_market_payload(condition_id) for condition_id in missing_ids),
+                next_cursor="third",
+            )
+        if cursor == "third":
+            return httpx.Response(
+                400,
+                headers={"content-type": "application/json"},
+                json={"error": "unnecessary third page"},
+                request=request,
+            )
+        assert cursor is None
+        return _lp_market_page_response(request, first_rows, next_cursor="second")
+
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        client=object(),
+        public_client_factory=lambda: _lp_mock_public_client(handler),
+    )
+    result = adapter.lp_market_metadata_batch(condition_ids)
+
+    assert result["state"] == "known"
+    assert set(result["markets"]) == set(condition_ids)
+    assert result["confirmed_absent_ids"] == ()
+    assert result["failed_ids"] == {}
+    assert requests == [None, "second"]
+
+    def exhausted_handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/markets/keyset"
+        if request.url.params.get("after_cursor") == "second":
+            return _lp_market_page_response(request, ())
+        return _lp_market_page_response(request, first_rows, next_cursor="second")
+
+    exhausted = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        client=object(),
+        public_client_factory=lambda: _lp_mock_public_client(exhausted_handler),
+    ).lp_market_metadata_batch(condition_ids)
+
+    assert exhausted["state"] == "known"
+    assert set(exhausted["markets"]) == set(condition_ids[:-2])
+    assert exhausted["confirmed_absent_ids"] == missing_ids
+    assert exhausted["failed_ids"] == {}
+
+
+def test_lp_metadata_stops_after_all_requested_ids() -> None:
+    import httpx
+
+    condition_ids = tuple(f"0x{index:064x}" for index in range(100))
+    requests: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/markets/keyset"
+        cursor = request.url.params.get("after_cursor")
+        requests.append(cursor)
+        if cursor == "should-not-fetch":
+            return httpx.Response(
+                400,
+                headers={"content-type": "application/json"},
+                json={"error": "unnecessary continuation"},
+                request=request,
+            )
+        assert cursor is None
+        return _lp_market_page_response(
+            request,
+            tuple(_lp_market_payload(condition_id) for condition_id in condition_ids),
+            next_cursor="should-not-fetch",
+        )
+
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        client=object(),
+        public_client_factory=lambda: _lp_mock_public_client(handler),
+    )
+    result = adapter.lp_market_metadata_batch(condition_ids)
+
+    assert result["state"] == "known"
+    assert set(result["markets"]) == set(condition_ids)
+    assert result["confirmed_absent_ids"] == ()
+    assert result["failed_ids"] == {}
+    assert requests == [None]
+
+
+def test_lp_metadata_missing_id_continuation_failure_stays_unknown() -> None:
+    import httpx
+
+    condition_ids = tuple(f"0x{index:064x}" for index in range(100))
+    first_rows = tuple(
+        _lp_market_payload(condition_id) for condition_id in condition_ids[:-2]
+    ) + (
+        _lp_market_payload(condition_ids[0]),
+        _lp_market_payload("0x" + "f" * 64),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/markets/keyset"
+        if request.url.params.get("after_cursor") == "second":
+            return httpx.Response(
+                400,
+                headers={"content-type": "application/json"},
+                json={"error": "continuation rejected"},
+                request=request,
+            )
+        return _lp_market_page_response(request, first_rows, next_cursor="second")
+
+    backing = _LpMetadataBackingStore()
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        client=object(),
+        public_client_factory=lambda: _lp_mock_public_client(handler),
+        metadata_cache=backing,
+    )
+    result = adapter.lp_market_metadata_batch(condition_ids)
+
+    assert result["state"] == "unknown"
+    assert result["markets"] == {}
+    assert result["confirmed_absent_ids"] == ()
+    assert set(result["failed_ids"]) == set(condition_ids)
+    assert all(
+        reason == "market_read_RequestRejectedError"
+        for reason in result["failed_ids"].values()
+    )
+    assert backing.rows == {}
+
+
+def test_lp_metadata_error_response_diagnostics_are_bounded_and_redacted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import httpx
+
+    condition_ids = tuple(f"0x{index:064x}" for index in range(100))
+    first_rows = tuple(
+        _lp_market_payload(condition_id) for condition_id in condition_ids[:-2]
+    ) + (
+        _lp_market_payload(condition_ids[0]),
+        _lp_market_payload("0x" + "f" * 64),
+    )
+    wallet = "0x" + "a" * 40
+    condition_id = condition_ids[0]
+    url_token = "url-token-sentinel"
+    auth_token = "auth-token-sentinel"
+    cookie_token = "cookie-token-sentinel"
+    opaque_auth = "Q7ab29LMp8nX4cd6"
+    opaque_cookie = "S3ss10nValue8K"
+    opaque_refresh = "R9yz31VNt2kW5ef8"
+    long_token = "long-token-sentinel-" + "x" * 700
+    existing_statuses: list[int] = []
+
+    cases = (
+        ("json-first", 400, "application/json", False),
+        ("nested-json", 400, "application/json", False),
+        ("html-continuation", 400, "text/html", True),
+        ("rate-limit", 429, "text/plain", False),
+    )
+    for name, status_code, content_type, continuation in cases:
+        caplog.clear()
+        existing_statuses.clear()
+        saved_public: dict[str, PublicClient] = {}
+
+        def existing_hook(response: httpx.Response) -> None:
+            existing_statuses.append(response.status_code)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/markets/keyset"
+            is_continuation = request.url.params.get("after_cursor") is not None
+            if continuation and not is_continuation:
+                return _lp_market_page_response(request, first_rows, next_cursor="error")
+            if continuation:
+                assert is_continuation
+            error_text = (
+                f"{name} url=https://private.invalid/failure?token={url_token} "
+                f"wallet={wallet} condition_id={condition_id} "
+                f"Authorization: Bearer {opaque_auth}\n"
+                f"Cookie: session={opaque_cookie}; refresh={opaque_refresh}\n"
+                f"legacy-auth={auth_token} legacy-cookie={cookie_token} "
+                f"{long_token}\nsecond line"
+            )
+            headers = {
+                "content-type": content_type,
+                "server": "cloudflare",
+                "cf-ray": "ray-sentinel",
+                "retry-after": "7",
+                "set-cookie": f"session={cookie_token}",
+            }
+            if name == "nested-json":
+                body = json.dumps(
+                    {
+                        "error": {
+                            "Authorization": f"Bearer {opaque_auth}",
+                            "Cookie": (
+                                f"session={opaque_cookie}; "
+                                f"refresh={opaque_refresh}"
+                            ),
+                            "message": "public rejection reason",
+                            "code": "PUBLIC_FAILURE",
+                        },
+                        "detail": "benign detail " + ("visible-" * 200),
+                    }
+                ).encode()
+            elif content_type == "application/json":
+                body = json.dumps(
+                    {
+                        "error": error_text,
+                        "message": error_text,
+                        "detail": error_text,
+                        "code": "PUBLIC_FAILURE",
+                    }
+                ).encode()
+            elif content_type == "text/html":
+                body = f"<html><body>{error_text}</body></html>".encode()
+            else:
+                body = error_text.encode()
+            return httpx.Response(status_code, headers=headers, content=body, request=request)
+
+        def factory() -> PublicClient:
+            public = _lp_mock_public_client(handler, response_hooks=(existing_hook,))
+            public.close = lambda: None
+            saved_public["value"] = public
+            return public
+
+        adapter = PolymarketTradingClient(
+            TradingConfig(SIGNER, WALLET),
+            client=object(),
+            public_client_factory=factory,
+        )
+        result = adapter.lp_market_metadata_batch(condition_ids)
+
+        expected_error = (
+            "market_read_RateLimitError"
+            if status_code == 429
+            else "market_read_RequestRejectedError"
+        )
+        assert result["markets"] == {}
+        assert result["confirmed_absent_ids"] == ()
+        assert set(result["failed_ids"]) == set(condition_ids)
+        assert set(result["failed_ids"].values()) == {expected_error}
+        assert existing_statuses == ([200, status_code] if continuation else [status_code])
+
+        diagnostic_messages = [
+            record.getMessage()
+            for record in caplog.records
+            if "lp_metadata_http_failure" in record.getMessage()
+        ]
+        assert len(diagnostic_messages) == 1
+        diagnostic = diagnostic_messages[0]
+        assert f"status={status_code}" in diagnostic
+        assert f"page={'continuation' if continuation else 'first'}" in diagnostic
+        assert "requested_ids=100" in diagnostic
+        assert "url_bytes=" in diagnostic
+        assert "content_type=" in diagnostic
+        assert "server=cloudflare" in diagnostic
+        assert "cf_ray=ray-sentinel" in diagnostic
+        assert "retry_after=7" in diagnostic
+        assert len(diagnostic) <= 2048
+        summary = diagnostic.split(" summary=", 1)[1]
+        assert len(summary) <= 512
+        if name == "nested-json":
+            assert "public rejection reason" in diagnostic
+            assert "PUBLIC_FAILURE" in diagnostic
+        for secret in (
+            url_token,
+            auth_token,
+            cookie_token,
+            opaque_auth,
+            opaque_cookie,
+            opaque_refresh,
+            long_token,
+            wallet,
+            condition_id,
+            "private.invalid",
+            "set-cookie",
+        ):
+            assert secret not in diagnostic
+
+        gamma_client = saved_public["value"]._ctx.gamma._client
+        assert gamma_client.event_hooks["response"] == [existing_hook]
+        with pytest.raises(Exception):
+            saved_public["value"].list_events(
+                ids=(1,), closed=False, page_size=1
+            ).first_page()
+        assert not [
+            record
+            for record in caplog.records
+            if "lp_metadata_http_failure" in record.getMessage()
+        ][1:]
+
+    caplog.clear()
+    existing_statuses.clear()
+    saved_public: dict[str, PublicClient] = {}
+
+    class FailingResponseStream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b'{"error":"partial response"'
+            raise httpx.ReadError("stream transport sentinel")
+
+    def stream_handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/markets/keyset"
+        return httpx.Response(
+            400,
+            headers={"content-type": "application/json"},
+            stream=FailingResponseStream(),
+            request=request,
+        )
+
+    def stream_existing_hook(response: httpx.Response) -> None:
+        existing_statuses.append(response.status_code)
+
+    def stream_factory() -> PublicClient:
+        public = _lp_mock_public_client(
+            stream_handler, response_hooks=(stream_existing_hook,)
+        )
+        public.close = lambda: None
+        saved_public["value"] = public
+        return public
+
+    stream_backing = _LpMetadataBackingStore()
+    stream_result = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        client=object(),
+        public_client_factory=stream_factory,
+        metadata_cache=stream_backing,
+    ).lp_market_metadata_batch(condition_ids)
+
+    assert stream_result["state"] == "unknown"
+    assert stream_result["markets"] == {}
+    assert stream_result["confirmed_absent_ids"] == ()
+    assert set(stream_result["failed_ids"]) == set(condition_ids)
+    assert set(stream_result["failed_ids"].values()) == {"market_read_TransportError"}
+    assert any(
+        "lp_metadata_read_failed stage=market "
+        "error_types=TransportError>ReadError" in record.getMessage()
+        for record in caplog.records
+    )
+    assert stream_backing.rows == {}
+    assert existing_statuses == [400]
+    assert saved_public["value"]._ctx.gamma._client.event_hooks["response"] == [
+        stream_existing_hook
+    ]
+    assert not [
+        record
+        for record in caplog.records
+        if "lp_metadata_http_failure" in record.getMessage()
+    ]
+
+    import logging
+
+    caplog.clear()
+    existing_statuses.clear()
+    saved_public = {}
+
+    class RaisingDiagnosticHandler(logging.Handler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def emit(self, record: logging.LogRecord) -> None:
+            if "lp_metadata_http_failure" in record.getMessage():
+                self.calls += 1
+                raise RuntimeError("diagnostic sink sentinel")
+
+    logging_handler = RaisingDiagnosticHandler()
+
+    def logging_failure_handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/markets/keyset"
+        return httpx.Response(
+            400,
+            headers={
+                "content-type": "application/json",
+                "server": "cloudflare",
+            },
+            content=b'{"broken":',
+            request=request,
+        )
+
+    def logging_existing_hook(response: httpx.Response) -> None:
+        existing_statuses.append(response.status_code)
+
+    def logging_factory() -> PublicClient:
+        public = _lp_mock_public_client(
+            logging_failure_handler,
+            response_hooks=(logging_existing_hook,),
+        )
+        public.close = lambda: None
+        saved_public["value"] = public
+        return public
+
+    logging_backing = _LpMetadataBackingStore()
+    polymarket_trading.logger.addHandler(logging_handler)
+    try:
+        logging_result = PolymarketTradingClient(
+            TradingConfig(SIGNER, WALLET),
+            client=object(),
+            public_client_factory=logging_factory,
+            metadata_cache=logging_backing,
+        ).lp_market_metadata_batch(condition_ids)
+    finally:
+        polymarket_trading.logger.removeHandler(logging_handler)
+
+    assert logging_result["state"] == "unknown"
+    assert logging_result["markets"] == {}
+    assert logging_result["confirmed_absent_ids"] == ()
+    assert set(logging_result["failed_ids"]) == set(condition_ids)
+    assert set(logging_result["failed_ids"].values()) == {
+        "market_read_RequestRejectedError"
+    }
+    assert logging_backing.rows == {}
+    assert logging_handler.calls == 1
+    assert existing_statuses == [400]
+    assert saved_public["value"]._ctx.gamma._client.event_hooks["response"] == [
+        logging_existing_hook
+    ]
 
 
 def test_lp_metadata_shares_one_public_client_per_call(

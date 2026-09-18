@@ -86,6 +86,9 @@ COLLATERAL_BASE_UNITS = Decimal("1000000")
 DEFAULT_TICK_SIZE = Decimal("0.01")
 CENT = Decimal("0.01")
 _ADDRESS_RE = re.compile(r"0x[0-9a-fA-F]{40}\Z")
+_LP_DIAGNOSTIC_SUMMARY_MAX_CHARS = 512
+_LP_DIAGNOSTIC_LOG_MAX_CHARS = 2048
+_LP_DIAGNOSTIC_FIELD_MAX_CHARS = 96
 _SAFE_ERROR_CODES = {
     "ambiguous",
     "auth",
@@ -472,6 +475,157 @@ def _safe_read_failure(stage: str, exc: BaseException) -> str:
     return f"{stage}_read_{type(exc).__name__}"
 
 
+def _redact_lp_diagnostic(value: object, *, limit: int) -> str:
+    text = str(value)
+    text = re.sub(
+        r"(?im)\b(?:authorization|proxy-authorization)\s*[:=]\s*[^\r\n]*",
+        "[redacted-header]",
+        text,
+    )
+    text = re.sub(
+        r"(?im)\b(?:cookie|set-cookie)\s*[:=]\s*[^\r\n]*",
+        "[redacted-header]",
+        text,
+    )
+    text = " ".join(text.split())
+    text = re.sub(r"(?i)https?://[^\s<>\"']+", "[redacted-url]", text)
+    text = re.sub(
+        r"(?i)\b(?:authorization|proxy-authorization|cookie|set-cookie)\s*[:=]\s*[^\s,;]+",
+        "[redacted-header]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)(?:[?&](?:token|access_token|api[_-]?key|secret|auth|cookie)=[^&\s]+)",
+        "[redacted-query]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\b(?:wallet|token|condition|market|asset|address)(?:[_-]?id)?\s*[:=]\s*[^\s,;]+",
+        "[redacted-id]",
+        text,
+    )
+    text = re.sub(r"\b0x[0-9a-fA-F]{40,64}\b", "[redacted-id]", text)
+    text = re.sub(r"\b\d{40,}\b", "[redacted-id]", text)
+    text = re.sub(
+        r"(?i)\b(?:[a-z0-9]+[-_])*(?:token|secret|cookie|password|credential)[-_][a-z0-9._~-]+",
+        "[redacted-secret]",
+        text,
+    )
+    return text[:limit]
+
+
+def _lp_response_error_summary(response: object) -> str:
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+    if isinstance(payload, Mapping):
+        field_names = ("error", "message", "detail", "code")
+
+        def public_values(value: object, depth: int = 0) -> tuple[str, ...]:
+            if depth > 3:
+                return ()
+            if isinstance(value, Mapping):
+                return tuple(
+                    fragment
+                    for name in field_names
+                    if name in value
+                    for fragment in public_values(value[name], depth + 1)
+                )
+            if isinstance(value, (str, int, float, bool)):
+                return (str(value),)
+            return ()
+
+        raw = " ".join(public_values(payload))
+    elif isinstance(payload, str):
+        raw = payload
+    else:
+        try:
+            raw = response.text
+        except Exception:
+            return "[unavailable]"
+    return _redact_lp_diagnostic(raw, limit=_LP_DIAGNOSTIC_SUMMARY_MAX_CHARS)
+
+
+def _install_lp_metadata_response_hook(
+    public: object, requested_count: int
+) -> Callable[[], None] | None:
+    try:
+        gamma = getattr(getattr(public, "_ctx"), "gamma")
+        http_client = getattr(gamma, "_client")
+        response_hooks = getattr(http_client, "event_hooks").get("response")
+    except Exception:
+        return None
+    if not isinstance(response_hooks, list):
+        return None
+
+    def on_response(response: object) -> None:
+        status = getattr(response, "status_code", None)
+        if not isinstance(status, int) or 200 <= status < 300:
+            return
+        request = getattr(response, "request", None)
+        url = getattr(request, "url", None)
+        if getattr(url, "path", None) != "/markets/keyset":
+            return
+        # httpx runs response hooks before Client.send reads the body.  Keep
+        # this read outside the best-effort diagnostic block so a real stream
+        # error remains the original request error.
+        response.read()
+        try:
+            params = getattr(url, "params", None)
+            condition_ids = (
+                params.get_list("condition_ids")
+                if callable(getattr(params, "get_list", None))
+                else ()
+            )
+            page = (
+                "continuation"
+                if params is not None and params.get("after_cursor") is not None
+                else "first"
+            )
+            url_bytes = len(str(url).encode("utf-8"))
+            headers = getattr(response, "headers")
+            fields = {
+                "content_type": headers.get("content-type", "-"),
+                "server": headers.get("server", "-"),
+                "cf_ray": headers.get("cf-ray", "-"),
+                "retry_after": headers.get("retry-after", "-"),
+            }
+            safe_fields = {
+                name: _redact_lp_diagnostic(
+                    value, limit=_LP_DIAGNOSTIC_FIELD_MAX_CHARS
+                )
+                for name, value in fields.items()
+            }
+            requested = len(condition_ids) or requested_count
+            message = (
+                "lp_metadata_http_failure "
+                f"status={status} page={page} requested_ids={requested} "
+                f"url_bytes={url_bytes} "
+                f"content_type={safe_fields['content_type']} "
+                f"server={safe_fields['server']} "
+                f"cf_ray={safe_fields['cf_ray']} "
+                f"retry_after={safe_fields['retry_after']} "
+                f"summary={_lp_response_error_summary(response)}"
+            )
+            logger.warning("%s", message[:_LP_DIAGNOSTIC_LOG_MAX_CHARS])
+        except Exception:
+            return
+
+    response_hooks.append(on_response)
+
+    def remove() -> None:
+        try:
+            for index, hook in enumerate(response_hooks):
+                if hook is on_response:
+                    del response_hooks[index]
+                    break
+        except Exception:
+            return
+
+    return remove
+
+
 def _submit_error_detail(exc: BaseException) -> dict[str, str]:
     """Redacted observable facts about a submit exception; never credentials."""
 
@@ -501,6 +655,38 @@ def _collect(value: object) -> tuple[object, ...]:
         return tuple(cast(Sequence[object], value))
     except TypeError:
         return (value,)
+
+
+def _collect_lp_market_pages(
+    value: object, requested: set[str]
+) -> tuple[object, ...]:
+    first_page = getattr(value, "first_page", None)
+    from_cursor = getattr(value, "from_cursor", None)
+    if not callable(first_page) or not callable(from_cursor):
+        page_items = _field(value, "items", None)
+        if page_items is not None:
+            return _collect(page_items)
+        return _collect(value)
+
+    rows: list[object] = []
+    observed: set[str] = set()
+    page = first_page()
+    while True:
+        page_rows = _collect(_field(page, "items", ()))
+        rows.extend(page_rows)
+        observed.update(
+            condition_id
+            for item in page_rows
+            if (row := _model_dict(item)) is not None
+            for condition_id in (row.get("condition_id", row.get("conditionId")),)
+            if isinstance(condition_id, str) and condition_id in requested
+        )
+        if observed >= requested or not _field(page, "has_more", False):
+            return tuple(rows)
+        cursor = _field(page, "next_cursor")
+        if not isinstance(cursor, str) or not cursor:
+            raise RuntimeError("market pagination cursor missing")
+        page = from_cursor(cursor).first_page()
 
 
 def _field(value: object, name: str, default: object = None) -> object:
@@ -1671,7 +1857,10 @@ class PolymarketTradingClient:
             if stop_event is not None and stop_event.is_set():
                 return (), False
             return (
-                _collect(public.list_markets(condition_ids=batch, page_size=100)),
+                _collect_lp_market_pages(
+                    public.list_markets(condition_ids=batch, page_size=100),
+                    set(batch),
+                ),
                 True,
             )
 
@@ -1679,21 +1868,28 @@ class PolymarketTradingClient:
             requested[offset : offset + 100]
             for offset in range(0, len(requested), 100)
         )
-        with ThreadPoolExecutor(max_workers=min(8, len(market_batches))) as pool:
-            futures = [
-                (batch, pool.submit(read_market_batch, batch))
-                for batch in market_batches
-            ]
-            for batch, future in futures:
-                try:
-                    batch_rows, completed = future.result()
-                except Exception as exc:
-                    reason = _safe_read_failure("market", exc)
-                    failed_ids.update((condition_id, reason) for condition_id in batch)
-                    continue
-                if completed:
-                    completed_market_ids.update(batch)
-                    rows.extend(batch_rows)
+        remove_response_hook = _install_lp_metadata_response_hook(
+            public, len(requested)
+        )
+        try:
+            with ThreadPoolExecutor(max_workers=min(8, len(market_batches))) as pool:
+                futures = [
+                    (batch, pool.submit(read_market_batch, batch))
+                    for batch in market_batches
+                ]
+                for batch, future in futures:
+                    try:
+                        batch_rows, completed = future.result()
+                    except Exception as exc:
+                        reason = _safe_read_failure("market", exc)
+                        failed_ids.update((condition_id, reason) for condition_id in batch)
+                        continue
+                    if completed:
+                        completed_market_ids.update(batch)
+                        rows.extend(batch_rows)
+        finally:
+            if remove_response_hook is not None:
+                remove_response_hook()
 
         numeric_event_keys: dict[int, list[str]] = {}
         direct_event_ids: list[str] = []

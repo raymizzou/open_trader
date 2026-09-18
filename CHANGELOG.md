@@ -5,6 +5,13 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-18
 
+- LP metadata paging now stops once all requested condition ids are collected,
+  while incomplete batches continue to Gamma cursors; failed Gamma responses
+  retain bounded, redacted status diagnostics without changing failure or
+  cache semantics. Verified by the approved pagination and diagnostics
+  selectors plus the focused LP metadata regression; the upstream 400 cause
+  remains unknown, with no live calls, retries or deployment.
+
 - LP metadata read failures now log redacted stage, exception type-chain and
   integer SDK rejection status diagnostics while preserving failure codes and
   the existing retry policy. Verified by the two focused selectors and the
