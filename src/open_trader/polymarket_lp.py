@@ -1174,9 +1174,10 @@ class PolymarketLPService:
                 )
             metadata_value: Mapping[str, object] | None = None
             metadata_confirmed_absent: set[str] = set()
+            metadata_failures: dict[str, str] = {}
+            successful_metadata_retry_conditions: set[str] = set()
             if callable(metadata_batch_reader):
                 metadata_by_condition: dict[str, object] = {}
-                metadata_failures: dict[str, str] = {}
                 self._save_preparation(
                     {
                         "stage": "metadata",
@@ -1221,7 +1222,13 @@ class PolymarketLPService:
                         self._save_preparation(
                             {
                                 "stage": "metadata",
-                                "metadata_completed_count": offset + len(metadata_batch_ids),
+                                "metadata_completed_count": len(
+                                    (
+                                        set(metadata_by_condition)
+                                        - set(metadata_failures)
+                                    )
+                                    | metadata_confirmed_absent
+                                ),
                                 "metadata_total_count": len(metadata_condition_ids_tuple),
                                 "last_progress_at": self._now(),
                             },
@@ -1308,7 +1315,13 @@ class PolymarketLPService:
                     self._save_preparation(
                         {
                             "stage": "metadata",
-                            "metadata_completed_count": offset + len(metadata_batch_ids),
+                            "metadata_completed_count": len(
+                                (
+                                    set(metadata_by_condition)
+                                    - set(metadata_failures)
+                                )
+                                | metadata_confirmed_absent
+                            ),
                             "metadata_total_count": len(metadata_condition_ids_tuple),
                             "last_progress_at": self._now(),
                         },
@@ -1359,6 +1372,22 @@ class PolymarketLPService:
                     display_state="unknown",
                     alert_pending=failed.get("alert_claimed_now") is True,
                 )
+            metadata_retry_completion_candidates = set(claimed_condition_ids)
+            metadata_retry_completion_candidates.update(
+                condition_id
+                for condition_id, item in preparation_items.items()
+                if item.get("state") == "waiting_retry"
+                and item.get("retry_used") is False
+                and item.get("paused") is False
+            )
+            successful_metadata_retry_conditions.update(
+                condition_id
+                for condition_id in metadata_retry_completion_candidates
+                if condition_id in metadata_value
+                and condition_id not in metadata_failures
+                and isinstance(metadata_value[condition_id], Mapping)
+                and metadata_value[condition_id].get("accepting_orders") is False
+            )
             if not callable(history_reader):
                 failed = self._preparation_failure(
                     self._now(), stage="history", error_type="history_readers_unavailable"
@@ -1433,7 +1462,9 @@ class PolymarketLPService:
                     and item.get("paused") is False
                 }
             clearable_condition_ids = (
-                set(metadata_confirmed_absent) | catalog_confirmed_absent
+                set(metadata_confirmed_absent)
+                | catalog_confirmed_absent
+                | successful_metadata_retry_conditions
             )
             if callable(preparation_clearer) and clearable_condition_ids:
                 preparation_clearer(
@@ -2246,7 +2277,15 @@ class PolymarketLPService:
                     outcome="cancelled",
                     display_state="cancelled",
                 )
-            state = "known" if completed_count and not unknown_count else "partial" if completed_count else "unknown"
+            usable_identities = successful_identities - unknown_identities
+            unresolved_identities = unknown_identities - successful_identities
+            state = (
+                "known"
+                if usable_identities and not unresolved_identities
+                else "partial"
+                if usable_identities
+                else "unknown"
+            )
             self._publish_prepared_inputs(catalog, metadata_value, state=state)
             if operational_failure is None:
                 operational_failure = catalog_failure

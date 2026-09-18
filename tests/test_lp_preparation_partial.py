@@ -393,6 +393,190 @@ def test_partial_metadata_keeps_successful_markets_screenable(
     assert exchange.history_calls.count(("token-b",)) == 1
 
 
+@pytest.mark.parametrize("reader_kind", ("batch", "direct"))
+@pytest.mark.parametrize("with_healthy_a", (True, False))
+def test_nonaccepting_market_finishes_unspent_history_retry(
+    tmp_path: Path, reader_kind: str, with_healthy_a: bool
+) -> None:
+    current = [T]
+    metadata_closed = [False]
+    metadata_calls: list[tuple[str, tuple[str, ...]]] = []
+    history_calls: list[tuple[str, ...]] = []
+    catalog_ids = ("condition-a", "condition-b") if with_healthy_a else ("condition-b",)
+
+    def market(condition_id: str) -> dict[str, object]:
+        return {
+            "market_id": f"market-{condition_id[-1]}",
+            "condition_id": condition_id,
+            "accepting_orders": not (
+                condition_id == "condition-b" and metadata_closed[0]
+            ),
+            "reward_min_size": Decimal("20"),
+            "reward_max_spread": Decimal("0.10"),
+            "minimum_order_size": Decimal("20"),
+            "tick_size": Decimal("0.01"),
+            "fees_enabled": False,
+            "taker_fee_rate": Decimal("0"),
+            "fee_exponent": Decimal("1"),
+            "metadata_checked_at": current[0],
+            "outcomes": {
+                "yes": {"label": "YES", "token_id": f"token-{condition_id[-1]}"}
+            },
+        }
+
+    class Exchange:
+        def __init__(self) -> None:
+            if reader_kind == "batch":
+                self.lp_market_metadata_batch = self._metadata_batch
+            else:
+                self.lp_market_metadata = self._metadata_direct
+
+        def lp_reward_catalog(
+            self,
+            *,
+            condition_ids: tuple[str, ...] | None = None,
+            stop_event: object = None,
+        ) -> dict[str, object]:
+            del condition_ids, stop_event
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": current[0],
+                "markets": [
+                    {
+                        "condition_id": condition_id,
+                        "daily_pool_usd": Decimal("100"),
+                        "reward_active": True,
+                        "rewards_min_size": Decimal("20"),
+                        "rewards_max_spread": Decimal("10"),
+                    }
+                    for condition_id in catalog_ids
+                ],
+            }
+
+        def _metadata_batch(
+            self,
+            requested: tuple[str, ...],
+            *,
+            stop_event: object = None,
+        ) -> dict[str, object]:
+            del stop_event
+            requested = tuple(requested)
+            metadata_calls.append(("batch", requested))
+            return {
+                "state": "known",
+                "complete": True,
+                "markets": {
+                    condition_id: market(condition_id) for condition_id in requested
+                },
+            }
+
+        def _metadata_direct(
+            self,
+            requested: tuple[str, ...],
+            *,
+            stop_event: object = None,
+        ) -> dict[str, dict[str, object]]:
+            del stop_event
+            requested = tuple(requested)
+            metadata_calls.append(("direct", requested))
+            return {
+                condition_id: market(condition_id) for condition_id in requested
+            }
+
+        def lp_price_history(
+            self,
+            token_ids: tuple[str, ...],
+            *,
+            start_ts: int,
+            end_ts: int,
+            fidelity: int,
+            stop_event: object = None,
+        ) -> dict[str, object]:
+            del fidelity, stop_event
+            history_calls.append(tuple(token_ids))
+            history = {}
+            if "token-a" in token_ids:
+                history["token-a"] = [
+                    {"t": start_ts, "p": Decimal("0.500")},
+                    {"t": end_ts, "p": Decimal("0.505")},
+                ]
+            errors = {"token-b": "IncompleteRead"} if "token-b" in token_ids else {}
+            return {
+                "state": "partial",
+                "history": history,
+                "errors": errors,
+            }
+
+    store = PredictionArbitrageStore(tmp_path / "data")
+    service = PolymarketLPService(store, Exchange(), clock=lambda: current[0])
+
+    first = service.refresh_price_history()
+    assert first["preparation_outcome"] == "failure"
+    assert first["preparation"]["state"] == "partial"
+    expected_history_request = ("token-a", "token-b") if with_healthy_a else ("token-b",)
+    assert history_calls == [expected_history_request]
+    assert first["target_count"] == (2 if with_healthy_a else 1)
+    assert first["updated_count"] == (1 if with_healthy_a else 0)
+    assert first["unknown_count"] == 1
+    assert first["request_count"] == 1
+    assert [kind for kind, _ in metadata_calls] == [reader_kind]
+    assert metadata_calls[0][1] == catalog_ids
+    waiting = store.lp_preparation_items()
+    assert len(waiting) == 1
+    assert waiting[0]["condition_id"] == "condition-b"
+    assert waiting[0]["stage"] == "history"
+    assert waiting[0]["state"] == "waiting_retry"
+    assert waiting[0]["retry_used"] is False
+    assert waiting[0]["paused"] is False
+    assert waiting[0]["failed_at"] == T.isoformat(timespec="microseconds").replace(
+        "+00:00", "Z"
+    )
+    assert waiting[0]["next_retry_at"] == (
+        (T + timedelta(seconds=300))
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+
+    a_before = (
+        store.lp_price_history_summary("condition-a", "token-a", now=T)
+        if with_healthy_a
+        else None
+    )
+    if with_healthy_a:
+        assert a_before is not None and a_before["state"] == "known"
+    b_before = store.lp_price_history_summary("condition-b", "token-b", now=T)
+    assert b_before is not None
+    metadata_closed[0] = True
+    current[0] = T + timedelta(seconds=300)
+    second = service.refresh_price_history()
+    assert second["preparation_outcome"] == "success"
+    assert second["preparation"]["state"] == "ready"
+    assert second["preparation"]["next_retry_at"] is None
+    assert second.get("alert_pending") is not True
+    assert store.lp_preparation_items() == []
+    assert history_calls == [expected_history_request]
+    assert [kind for kind, _ in metadata_calls] == [reader_kind, reader_kind]
+    assert all(requested == catalog_ids for _, requested in metadata_calls)
+    b_after = store.lp_price_history_summary("condition-b", "token-b", now=current[0])
+    assert b_after == b_before
+    if with_healthy_a:
+        a_after = store.lp_price_history_summary(
+            "condition-a", "token-a", now=current[0]
+        )
+        assert a_after is not None
+        assert a_after == a_before
+
+    current[0] = T + timedelta(hours=1)
+    wake = service.refresh_price_history()
+    assert wake["preparation_outcome"] == "success"
+    assert wake["preparation"]["state"] == "ready"
+    assert wake.get("alert_pending") is not True
+    assert store.lp_preparation_items() == []
+    assert history_calls == [expected_history_request]
+    assert [kind for kind, _ in metadata_calls] == [reader_kind] * 3
+
+
 def test_metadata_retry_with_valid_history_cache_finishes_budget(
     tmp_path: Path,
 ) -> None:

@@ -1360,7 +1360,7 @@ def test_lp_dashboard_account_outage_keeps_newer_public_funnel(tmp_path: Path) -
     assert exchange.catalog_reads == 1
     assert exchange.metadata_reads == 2
     assert exchange.book_reads == 1
-    assert exchange.history_reads == 1
+    assert exchange.history_reads == 0
     assert exchange.account_reads == 2
 
     execution = PredictionExecutionService(
@@ -1446,7 +1446,7 @@ def test_lp_dashboard_account_outage_keeps_newer_public_funnel(tmp_path: Path) -
     assert exchange.catalog_reads == 2
     assert exchange.metadata_reads == 4
     assert exchange.book_reads == 2
-    assert exchange.history_reads == 2
+    assert exchange.history_reads == 0
     assert exchange.account_reads == 5
 
     counters_before_stale_dashboard = {
@@ -5722,25 +5722,50 @@ def test_lp_returned_history_errors_obey_preparation_retry_budget(
     assert first["preparation_outcome"] == "failure"
     first_preparation = first["preparation"]
     assert isinstance(first_preparation, Mapping)
-    assert first_preparation["state"] == "waiting_retry"
-    assert first_preparation["failure_count"] == 1
-    assert first_preparation["last_failure_at"] == (
-        started_at.isoformat(timespec="microseconds").replace("+00:00", "Z")
-    )
+    assert first_preparation["state"] == "partial"
+    assert first_preparation["paused"] is False
+    assert first_preparation["attempt"] == 0
+    assert first_preparation["failure_count"] == 0
     assert first_preparation["next_retry_at"] == (
         (started_at + timedelta(seconds=300))
         .isoformat(timespec="microseconds")
         .replace("+00:00", "Z")
     )
     assert first["target_count"] == 82
-    assert first["updated_count"] == 60
+    assert first["updated_count"] == 62
     assert first["unknown_count"] == 20
-    assert first["request_count"] == 4
+    assert first["request_count"] == 5
+    failed_condition_ids = {
+        f"condition-scale-{index:02d}" for index in range(10)
+    }
+    failed_direction_ids = {
+        f"scale-{index:02d}-{side}"
+        for index in range(10)
+        for side in ("yes", "no")
+    }
+    preparation_items = store.lp_preparation_items()
+    assert {item["condition_id"] for item in preparation_items} == failed_condition_ids
+    assert all(item["state"] == "waiting_retry" for item in preparation_items)
+    assert all(item["retry_used"] is False for item in preparation_items)
+    assert all(item["failure_count"] == 1 for item in preparation_items)
+    assert all(
+        item["failed_at"]
+        == started_at.isoformat(timespec="microseconds").replace("+00:00", "Z")
+        for item in preparation_items
+    )
+    assert all(
+        item["next_retry_at"]
+        == (started_at + timedelta(seconds=300))
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+        for item in preparation_items
+    )
     with lock:
-        assert len(requests) == 4
-        assert sum(len(batch) for batch in requests) == 80
+        assert len(requests) == 5
+        assert sum(len(batch) for batch in requests) == 82
         assert max_active == 4
-        assert all("scale-40-yes" not in batch for batch in requests)
+        assert all(len(batch) <= 20 for batch in requests)
+        assert "scale-40-yes" in {token for batch in requests for token in batch}
         assert active == 0
 
     retained = store.lp_price_history_summary(
@@ -5748,14 +5773,16 @@ def test_lp_returned_history_errors_obey_preparation_retry_budget(
     )
     assert retained is not None
     assert retained["state"] == "known"
-    assert store.lp_price_history_summary(
+    tail_summary = store.lp_price_history_summary(
         "condition-scale-40", "scale-40-yes", now=started_at
-    ) is None
+    )
+    assert tail_summary is not None
+    assert tail_summary["state"] == "known"
 
     clock["now"] = started_at + timedelta(seconds=299)
     before_retry = service.refresh_price_history()
     assert before_retry["preparation_outcome"] == "waiting_retry"
-    assert len(requests) == 4
+    assert len(requests) == 5
 
     clock["now"] = started_at + timedelta(seconds=300)
     second = service.refresh_price_history()
@@ -5763,20 +5790,44 @@ def test_lp_returned_history_errors_obey_preparation_retry_budget(
     assert second["preparation_outcome"] == "failure"
     second_preparation = second["preparation"]
     assert isinstance(second_preparation, Mapping)
-    assert second_preparation["state"] == "paused"
-    assert second_preparation["paused"] is True
-    assert second_preparation["attempt"] == 2
-    assert second_preparation["failure_count"] == 2
-    assert len(requests) == 8
+    assert second_preparation["state"] == "partial"
+    assert second_preparation["paused"] is False
+    assert second_preparation["attempt"] == 0
+    assert second_preparation["failure_count"] == 0
+    assert len(requests) == 6
+    assert set(requests[-1]) == failed_direction_ids
+    assert len(requests[-1]) == 20
+    all_direction_ids = {
+        f"scale-{index:02d}-{side}"
+        for index in range(41)
+        for side in ("yes", "no")
+    }
+    assert all(
+        sum(direction in batch for batch in requests)
+        == (2 if direction in failed_direction_ids else 1)
+        for direction in all_direction_ids
+    )
+    paused_items = store.lp_preparation_items()
+    assert {item["condition_id"] for item in paused_items} == failed_condition_ids
+    assert all(item["state"] == "paused" for item in paused_items)
+    assert all(item["paused"] is True for item in paused_items)
+    assert all(item["retry_used"] is True for item in paused_items)
+    assert all(item["failure_count"] == 2 for item in paused_items)
+    assert all(item["next_retry_at"] is None for item in paused_items)
+    assert second.get("alert_pending") is True
 
     clock["now"] = started_at + timedelta(hours=1)
     paused = service.refresh_price_history()
-    assert paused["preparation_outcome"] == "paused"
-    assert len(requests) == 8
+    assert paused["preparation"]["state"] == "partial"
+    assert paused["preparation"]["paused"] is False
+    assert paused.get("alert_pending") is not True
+    assert len(requests) == 6
     rebuilt = PolymarketLPService(store, trading, clock=lambda: clock["now"])
     rebuilt_paused = rebuilt.refresh_price_history()
-    assert rebuilt_paused["preparation_outcome"] == "paused"
-    assert len(requests) == 8
+    assert rebuilt_paused["preparation"]["state"] == "partial"
+    assert rebuilt_paused["preparation"]["paused"] is False
+    assert rebuilt_paused.get("alert_pending") is not True
+    assert len(requests) == 6
 
     short_clock, _short_state, _short_store, short_trading, short_service = (
         _lp_adapter_service_fixture(
@@ -10806,7 +10857,7 @@ def test_lp_refresh_reads_risk_books_only_for_selected_markets(tmp_path: Path) -
             "粒度": "1m",
             "振幅": "不超过1¢",
             "刷新": "每小时",
-            "有效期": "2h",
+            "有效期": "24h",
             "缺失": "UNKNOWN",
         },
         "risk": {
@@ -12251,7 +12302,7 @@ def test_lp_refresh_confirmed_empty_catalog_preserves_funnel_rules(
             "粒度": "1m",
             "振幅": "不超过1¢",
             "刷新": "每小时",
-            "有效期": "2h",
+            "有效期": "24h",
             "缺失": "UNKNOWN",
         },
         "risk": {

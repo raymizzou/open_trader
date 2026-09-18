@@ -211,6 +211,7 @@ def test_daily_history_refresh_reuses_persisted_valid_results(
             service = PolymarketLPService(db, exchange, clock=lambda: current[0])
         refreshed = service.refresh_price_history()
         assert refreshed["preparation_outcome"] == "success"
+        assert refreshed["state"] == "known"
         assert refreshed["request_count"] == 0
         assert refreshed["updated_count"] == 0
         assert refreshed["preparation"]["completed_count"] == 1

@@ -739,14 +739,51 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
         if call[0] == "notification" and "N_LEG" in repr(call[1])
     ]
 
+    preparation_before_restart = runtime.lp.preparation_snapshot()  # type: ignore[union-attr]
+    last_attempt_before_restart = preparation_before_restart["last_attempt_at"]
+    summary_before_restart = store.lp_price_history_summary(
+        "candidate-condition", "candidate-yes", now=datetime.now(UTC)
+    )
+    assert summary_before_restart is not None
+    summary_timestamps_before_restart = {
+        key: summary_before_restart[key]
+        for key in ("checked_at", "window_start", "window_end")
+    }
     for event in lp_events.values():
         event.clear()
+    warm_restart_started_at = datetime.now(UTC)
     restarted = make_runtime()
     try:
         restarted.start()
         assert restarted.state == "RUNNING"
-        assert all(event.wait(timeout=3) for event in lp_events.values())
+        assert all(
+            event.wait(timeout=3)
+            for name, event in lp_events.items()
+            if name != "history"
+        )
+        assert not lp_events["history"].is_set()
+        restarted_preparation = restarted.lp.preparation_snapshot()  # type: ignore[union-attr]
+        deadline = time.monotonic() + 2
+        while (
+            restarted_preparation.get("state") != "ready"
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+            restarted_preparation = restarted.lp.preparation_snapshot()  # type: ignore[union-attr]
+        assert restarted_preparation["state"] == "ready"
+        assert restarted_preparation["last_attempt_at"] != last_attempt_before_restart
+        restarted_attempt_at = datetime.fromisoformat(
+            str(restarted_preparation["last_attempt_at"]).replace("Z", "+00:00")
+        )
+        assert warm_restart_started_at <= restarted_attempt_at <= (
+            warm_restart_started_at + timedelta(seconds=2)
+        )
         restarted_dashboard = restarted.execution.lp_dashboard()  # type: ignore[union-attr]
+        assert restarted.solver_server is None
+        assert restarted.relation_catalog is None
+        assert restarted.live_resolver is None
+        assert restarted.observation_monitor is None
+        assert restarted.predict_snapshot_refresher is None
         assert restarted_dashboard["orders"][0]["order_id"] == "manual-order"
         assert restarted_dashboard["orders"][0]["management"] == "manual_read_only"
         restarted_risk = store.lp_session("lp-risk-session")
@@ -756,10 +793,26 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
         assert Decimal(str(restarted_risk["paid_rewards"])) == Decimal("0")
         assert Decimal(str(restarted_risk["trade_pnl"])) == Decimal("0")
         assert restarted_dashboard["lp_session"]["reward_observation"]["status"] == "below"
+        summary_after_restart = store.lp_price_history_summary(
+            "candidate-condition", "candidate-yes", now=datetime.now(UTC)
+        )
+        assert summary_after_restart is not None
+        assert {
+            key: summary_after_restart[key]
+            for key in ("checked_at", "window_start", "window_end")
+        } == summary_timestamps_before_restart
     finally:
         restarted.stop()
 
     assert store.n_leg_control()["total_unsettled_capital_units"] == 1_000_000
+    assert not solver_calls
+    assert not predict_calls
+    assert not [call for call in calls if call[0] == "order-mutation"]
+    assert not [
+        call
+        for call in calls
+        if call[0] == "notification" and "N_LEG" in repr(call[1])
+    ]
 
 
 @pytest.mark.parametrize("reader_generation", (True, False, 0, -1))
@@ -6208,10 +6261,25 @@ def test_lp_metadata_warmup_advances_beyond_one_batch(
         assert lp is not None and store is not None
 
         first_preparation = lp.preparation_snapshot()
-        assert first_preparation["state"] == "waiting_retry"
-        assert first_preparation["failure_count"] == 1
+        assert first_preparation["state"] == "partial"
+        assert first_preparation["paused"] is False
+        assert first_preparation["attempt"] == 0
+        assert first_preparation["failure_count"] == 0
         assert first_preparation["metadata_completed_count"] == 1500
         assert first_preparation["metadata_total_count"] == 1501
+        preparation_items = store.lp_preparation_items()
+        assert [item["condition_id"] for item in preparation_items] == [failed_id]
+        assert preparation_items[0]["state"] == "waiting_retry"
+        assert preparation_items[0]["retry_used"] is False
+        assert preparation_items[0]["failure_count"] == 1
+        assert preparation_items[0]["failed_at"] == (
+            fixed_now.isoformat(timespec="microseconds").replace("+00:00", "Z")
+        )
+        assert preparation_items[0]["next_retry_at"] == (
+            (fixed_now + timedelta(seconds=300))
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z")
+        )
         first_entries = store.lp_metadata_cache_entries(now=clock[0])
         assert set(first_entries) == set(initial_ids)
         assert len(first_entries) == 1500
