@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import fcntl
+import hashlib
 import json
 import re
 import shlex
@@ -185,8 +186,6 @@ def render_xiaoai_voice_notification(title: str, message: str) -> str | None:
     title, message = title.strip(), message.strip()
     if "测试通知" in title:
         return message or title
-    if title in {"LP 风险警告", "LP 份额预警"}:
-        return f"{title}\n\n{message}".strip()
     match = re.fullmatch(r"(A股|港股|美股)保护线触发 · ([^·]+)", title)
     if match is None:
         return None
@@ -213,6 +212,26 @@ def xiaoai_voice_allowed(now: datetime) -> bool:
     return time(8) <= local < time(23)
 
 
+LP_VOICE_COOLDOWN_SECONDS = 300.0
+_LP_VOICE_TITLES = frozenset({"LP 风险警告", "LP 份额预警"})
+_LP_RISK_SUBJECT_PATTERN = re.compile(r"^标的：.*（(?P<cid>[^）]*)），方向：")
+_LP_SHARE_SUBJECT_PATTERN = re.compile(r"^市场：(?P<m>.+)。")
+
+
+def _lp_voice_subject_key(title: str, message: str) -> str:
+    lines = message.splitlines()
+    first_line = lines[0].strip() if lines else ""
+    pattern = (
+        _LP_RISK_SUBJECT_PATTERN
+        if title == "LP 风险警告"
+        else _LP_SHARE_SUBJECT_PATTERN
+    )
+    match = pattern.match(first_line)
+    if match is None:
+        return hashlib.sha256(message.encode("utf-8")).hexdigest()[:16]
+    return match.group("cid") if title == "LP 风险警告" else match.group("m")
+
+
 class XiaoaiSSHNotifier:
     def __init__(
         self,
@@ -230,16 +249,58 @@ class XiaoaiSSHNotifier:
         self.timeout_seconds = timeout_seconds
         self.lock_path = lock_path
         self._now_fn = now_fn
+        self._lp_voice_events: dict[str, list[tuple[datetime, str]]] = {}
+        self._lp_voice_last_spoken_at: dict[str, datetime | None] = {}
 
     def notify(self, title: str, message: str) -> None:
+        if title.strip() in _LP_VOICE_TITLES:
+            self._notify_lp_voice(title, message)
+            return
         voice_message = render_xiaoai_voice_notification(title, message)
         if voice_message is None:
             return
+        self._speak_over_ssh(
+            voice_message,
+            lp_share_alert=False,
+            spoken_record=None,
+        )
+
+    def _notify_lp_voice(self, title: str, message: str) -> None:
+        subject = title.strip()
+        now = self._now_fn()
+        events = [
+            (moment, key)
+            for moment, key in self._lp_voice_events.get(subject, [])
+            if (now - moment).total_seconds() <= LP_VOICE_COOLDOWN_SECONDS
+        ]
+        events.append((now, _lp_voice_subject_key(subject, message)))
+        self._lp_voice_events[subject] = events
+        if not xiaoai_voice_allowed(now):
+            raise XiaoaiVoiceSuppressed("quiet hours")
+        last_spoken_at = self._lp_voice_last_spoken_at.get(subject)
+        if (
+            last_spoken_at is not None
+            and (now - last_spoken_at).total_seconds() < LP_VOICE_COOLDOWN_SECONDS
+        ):
+            raise XiaoaiVoiceSuppressed("lp voice rate limited")
+        count = len({key for _, key in events})
+        self._speak_over_ssh(
+            f"{subject}，{count} 个标的，请立即查看飞书。",
+            lp_share_alert=subject == "LP 份额预警",
+            spoken_record=(subject, now),
+        )
+
+    def _speak_over_ssh(
+        self,
+        voice_message: str,
+        *,
+        lp_share_alert: bool,
+        spoken_record: tuple[str, datetime] | None,
+    ) -> None:
         if not xiaoai_voice_allowed(self._now_fn()):
             raise XiaoaiVoiceSuppressed("quiet hours")
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         with self.lock_path.open("a+", encoding="utf-8") as lock:
-            lp_share_alert = title.strip() == "LP 份额预警"
             try:
                 fcntl.flock(
                     lock.fileno(),
@@ -282,6 +343,9 @@ class XiaoaiSSHNotifier:
                 raise NotificationError(
                     f"XiaoAI voice command failed with exit code {result.returncode}"
                 )
+            if spoken_record is not None:
+                spoken_subject, spoken_at = spoken_record
+                self._lp_voice_last_spoken_at[spoken_subject] = spoken_at
 
 
 def _voice_field(message: str, name: str) -> str:

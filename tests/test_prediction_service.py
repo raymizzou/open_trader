@@ -2983,13 +2983,14 @@ def test_lp_risk_alerts_deduplicate_per_channel_and_rearm(tmp_path: Path) -> Non
     assert alert["channels"]["feishu"]["success"] is True
     assert alert["channels"]["xiaoai"]["success"] is False
     assert "LP 风险警告" in posted[-1]["content"]["text"]
-    assert voice_texts[-1] == posted[-1]["content"]["text"]
+    assert voice_texts[-1] == "LP 风险警告，1 个标的，请立即查看飞书。"
+    assert "标的：Will it happen?（condition-1）" in posted[-1]["content"]["text"]
 
     retry = service.refresh_lp_observations()["observations"][condition_id]
     assert len(posted) == 1
     assert len(voice_texts) == 2
     assert retry["risk_alerts"]["YES"]["channels"]["xiaoai"]["success"] is True
-    assert voice_texts[-1] == posted[-1]["content"]["text"]
+    assert voice_texts[-1] == "LP 风险警告，1 个标的，请立即查看飞书。"
 
     restarted = PredictionExecutionService(
         store=PredictionArbitrageStore(tmp_path / "data"),
@@ -3014,6 +3015,8 @@ def test_lp_risk_alerts_deduplicate_per_channel_and_rearm(tmp_path: Path) -> Non
     assert len(posted) == 1
     assert len(voice_texts) == 2
 
+    # 语音冷却 5 分钟：重触发前推进注入时钟，验证恢复后再播报而非被限流抑制
+    state["voice_time"] = datetime.fromisoformat("2026-07-15T08:10:00+08:00")
     state["book_price"] = Decimal("0.44")
     retriggered = restarted.refresh_lp_observations()["observations"][condition_id]
     assert len(posted) == 2

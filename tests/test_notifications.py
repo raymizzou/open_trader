@@ -636,79 +636,203 @@ def test_xiaoai_voice_hours(value: str, allowed: bool) -> None:
     assert xiaoai_voice_allowed(datetime.fromisoformat(value)) is allowed
 
 
-def test_lp_alert_uses_identical_feishu_and_voice_text(tmp_path: Path) -> None:
-    title = "LP 风险警告"
-    message = (
-        "标的：Thug，方向：YES。当前风险本金 100 美元，预计压力退出损失 11.2 美元，"
-        "亏损率 11.2%，达到 10% 警戒线。请检查未成交买单和现有持仓。数据时间：北京时间 14:30。"
+LP_RISK_TITLE = "LP 风险警告"
+LP_SHARE_TITLE = "LP 份额预警"
+LP_RISK_TAIL = (
+    "当前风险本金 100.00 美元，预计压力退出损失 12.00 美元，损失率 12%，达到 10% 警戒线。",
+    "未成交买单按假设成交计入。",
+    "请检查未成交买单和现有持仓；本告警不代表已执行止损。",
+    "数据时间：北京时间 10:00。",
+)
+LP_RISK_MESSAGE_A = "\n".join(("标的：Market A（0xaaa111），方向：YES。", *LP_RISK_TAIL))
+LP_RISK_MESSAGE_B = "\n".join(("标的：Market B（0xbbb222），方向：NO。", *LP_RISK_TAIL))
+LP_SHARE_MESSAGE_C = "\n".join(
+    (
+        "市场：Market C。",
+        "当前奖励份额 8.000001%，目标区间 5%–8%，已连续超过 8% 至少一分钟。",
+        "数据时间：北京时间 10:00:00。",
     )
-    expected_text = f"{title}\n\n{message}"
-    posted: list[dict[str, object]] = []
-    spoken: list[str] = []
+)
 
-    def deliver(
-        timestamp: str, *, feishu_fails: bool = False, lock_name: str = "voice.lock"
-    ) -> list[object]:
-        now = datetime.fromisoformat(timestamp)
 
-        def fake_post(
-            _url: str,
-            payload: dict[str, object],
-            _timeout_seconds: float,
-        ) -> dict[str, object]:
-            posted.append(payload)
-            return {"code": 1, "msg": "offline"} if feishu_fails else {"code": 0}
+class _LpVoiceRecorder:
+    """One XiaoaiSSHNotifier instance with a run_command spy and fixed clock."""
 
-        def fake_run(
-            command: list[str], **_kwargs: object
-        ) -> subprocess.CompletedProcess[str]:
-            spoken.append(shlex.split(command[-1])[1])
-            return subprocess.CompletedProcess(command, 0)
-
-        notifier = CompositeNotifier(
-            [
-                FeishuWebhookNotifier(webhook_url=WEBHOOK_URL, post_json=fake_post),
-                XiaoaiSSHNotifier(
-                    host="speaker.local",
-                    ssh_key=tmp_path / "unused-key",
-                    run_command=fake_run,
-                    lock_path=tmp_path / lock_name,
-                    now_fn=lambda: now,
-                ),
-            ]
+    def __init__(self, tmp_path: Path, lock_name: str) -> None:
+        self.now = datetime.fromisoformat("2026-09-19T10:00:00+08:00")
+        self.spoken: list[str] = []
+        self.feishu_payloads: list[dict[str, object]] = []
+        self._notifier = XiaoaiSSHNotifier(
+            host="speaker.local",
+            ssh_key=tmp_path / "unused-key",
+            run_command=self._run,
+            lock_path=tmp_path / lock_name,
+            now_fn=lambda: self.now,
         )
-        return send_notification_with_results(notifier, title, message)
-
-    for index, (timestamp, voice_allowed) in enumerate(
-        (
-            ("2026-07-15T07:59:59+08:00", False),
-            ("2026-07-15T08:00:00+08:00", True),
-            ("2026-07-15T22:59:59+08:00", True),
-            ("2026-07-15T23:00:00+08:00", False),
+        self._feishu = FeishuWebhookNotifier(
+            webhook_url=WEBHOOK_URL,
+            post_json=self._post,
         )
-    ):
-        spoken_before = len(spoken)
-        attempts = deliver(timestamp, lock_name=f"voice-{index}.lock")
-        feishu_text = posted[-1]["content"]["text"]
-        assert feishu_text == expected_text
-        assert attempts[0].channel == "feishu" and attempts[0].success is True
-        assert attempts[1].channel == "xiaoai"
-        assert attempts[1].success is voice_allowed
-        assert attempts[1].suppressed is not voice_allowed
-        assert len(spoken) == spoken_before + int(voice_allowed)
-        if voice_allowed:
-            assert spoken[-1] == feishu_text
 
-    spoken_before = len(spoken)
-    failed_feishu = deliver(
-        "2026-07-15T08:00:00+08:00",
-        feishu_fails=True,
-        lock_name="voice-failure.lock",
+    def _run(
+        self, command: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        self.spoken.append(shlex.split(command[-1])[1])
+        return subprocess.CompletedProcess(command, 0)
+
+    def _post(
+        self, _url: str, payload: dict[str, object], _timeout: float
+    ) -> dict[str, object]:
+        self.feishu_payloads.append(payload)
+        return {"code": 0}
+
+    def deliver(self, at: str, title: str, message: str) -> list[object]:
+        self.now = datetime.fromisoformat(at)
+        return send_notification_with_results(
+            CompositeNotifier([self._feishu, self._notifier]),
+            title,
+            message,
+        )
+
+
+def test_lp_risk_voice_first_speak_announces_short_subject_count(
+    tmp_path: Path,
+) -> None:
+    recorder = _LpVoiceRecorder(tmp_path, "lp-voice-t1.lock")
+
+    attempts = recorder.deliver(
+        "2026-09-19T10:00:00+08:00", LP_RISK_TITLE, LP_RISK_MESSAGE_A
     )
-    assert failed_feishu[0].success is False
-    assert failed_feishu[1].success is True
-    assert len(spoken) == spoken_before + 1
-    assert spoken[-1] == posted[-1]["content"]["text"] == expected_text
+
+    assert attempts[0].channel == "feishu"
+    assert attempts[0].success is True
+    assert attempts[1].channel == "xiaoai"
+    assert attempts[1].success is True
+    assert attempts[1].suppressed is False
+    assert recorder.spoken == ["LP 风险警告，1 个标的，请立即查看飞书。"]
+    assert recorder.feishu_payloads[-1]["content"]["text"] == (
+        f"{LP_RISK_TITLE}\n\n{LP_RISK_MESSAGE_A}"
+    )
+
+
+def test_lp_risk_voice_suppresses_second_subject_within_cooldown(
+    tmp_path: Path,
+) -> None:
+    recorder = _LpVoiceRecorder(tmp_path, "lp-voice-t2.lock")
+    recorder.deliver("2026-09-19T10:00:00+08:00", LP_RISK_TITLE, LP_RISK_MESSAGE_A)
+
+    attempts = recorder.deliver(
+        "2026-09-19T10:01:00+08:00", LP_RISK_TITLE, LP_RISK_MESSAGE_B
+    )
+
+    assert recorder.spoken == ["LP 风险警告，1 个标的，请立即查看飞书。"]
+    assert attempts[1].success is False
+    assert attempts[1].suppressed is True
+    assert attempts[1].error == "lp voice rate limited"
+
+
+def test_lp_risk_voice_keeps_suppressing_later_within_cooldown(
+    tmp_path: Path,
+) -> None:
+    recorder = _LpVoiceRecorder(tmp_path, "lp-voice-t3.lock")
+    recorder.deliver("2026-09-19T10:00:00+08:00", LP_RISK_TITLE, LP_RISK_MESSAGE_A)
+    recorder.deliver("2026-09-19T10:01:00+08:00", LP_RISK_TITLE, LP_RISK_MESSAGE_B)
+
+    attempts = recorder.deliver(
+        "2026-09-19T10:04:00+08:00", LP_RISK_TITLE, LP_RISK_MESSAGE_B
+    )
+
+    assert recorder.spoken == ["LP 风险警告，1 个标的，请立即查看飞书。"]
+    assert attempts[1].success is False
+    assert attempts[1].suppressed is True
+
+
+def test_lp_risk_voice_speaks_again_after_cooldown_window(tmp_path: Path) -> None:
+    recorder = _LpVoiceRecorder(tmp_path, "lp-voice-t4.lock")
+    recorder.deliver("2026-09-19T10:00:00+08:00", LP_RISK_TITLE, LP_RISK_MESSAGE_A)
+    recorder.deliver("2026-09-19T10:01:00+08:00", LP_RISK_TITLE, LP_RISK_MESSAGE_B)
+    recorder.deliver("2026-09-19T10:04:00+08:00", LP_RISK_TITLE, LP_RISK_MESSAGE_B)
+
+    attempts = recorder.deliver(
+        "2026-09-19T10:05:30+08:00", LP_RISK_TITLE, LP_RISK_MESSAGE_B
+    )
+
+    assert attempts[1].success is True
+    assert attempts[1].suppressed is False
+    assert recorder.spoken == [
+        "LP 风险警告，1 个标的，请立即查看飞书。",
+        "LP 风险警告，1 个标的，请立即查看飞书。",
+    ]
+
+
+def test_lp_risk_voice_counts_distinct_subjects_within_window(tmp_path: Path) -> None:
+    recorder = _LpVoiceRecorder(tmp_path, "lp-voice-t4b.lock")
+    recorder.deliver("2026-09-19T10:00:00+08:00", LP_RISK_TITLE, LP_RISK_MESSAGE_A)
+    flipped_a = recorder.deliver(
+        "2026-09-19T10:04:30+08:00", LP_RISK_TITLE, LP_RISK_MESSAGE_A
+    )
+    flipped_b = recorder.deliver(
+        "2026-09-19T10:04:45+08:00", LP_RISK_TITLE, LP_RISK_MESSAGE_B
+    )
+    assert flipped_a[1].suppressed is True
+    assert flipped_b[1].suppressed is True
+    assert len(recorder.spoken) == 1
+
+    attempts = recorder.deliver(
+        "2026-09-19T10:05:15+08:00", LP_RISK_TITLE, LP_RISK_MESSAGE_B
+    )
+
+    assert attempts[1].success is True
+    assert recorder.spoken[-1] == "LP 风险警告，2 个标的，请立即查看飞书。"
+
+
+def test_lp_risk_voice_suppresses_same_subject_repeat(tmp_path: Path) -> None:
+    recorder = _LpVoiceRecorder(tmp_path, "lp-voice-t5.lock")
+    recorder.deliver("2026-09-19T10:00:00+08:00", LP_RISK_TITLE, LP_RISK_MESSAGE_A)
+
+    attempts = recorder.deliver(
+        "2026-09-19T10:02:00+08:00", LP_RISK_TITLE, LP_RISK_MESSAGE_A
+    )
+
+    assert attempts[1].success is False
+    assert attempts[1].suppressed is True
+    assert len(recorder.spoken) == 1
+
+
+def test_lp_share_voice_cooldown_independent_of_risk(tmp_path: Path) -> None:
+    recorder = _LpVoiceRecorder(tmp_path, "lp-voice-t6.lock")
+    recorder.deliver("2026-09-19T10:00:00+08:00", LP_RISK_TITLE, LP_RISK_MESSAGE_A)
+
+    attempts = recorder.deliver(
+        "2026-09-19T10:00:00+08:00", LP_SHARE_TITLE, LP_SHARE_MESSAGE_C
+    )
+
+    assert attempts[1].success is True
+    assert attempts[1].suppressed is False
+    assert recorder.spoken == [
+        "LP 风险警告，1 个标的，请立即查看飞书。",
+        "LP 份额预警，1 个标的，请立即查看飞书。",
+    ]
+
+
+def test_lp_risk_voice_quiet_arrival_kept_without_consuming_cooldown(
+    tmp_path: Path,
+) -> None:
+    recorder = _LpVoiceRecorder(tmp_path, "lp-voice-t7.lock")
+
+    quiet = recorder.deliver(
+        "2026-09-19T07:59:00+08:00", LP_RISK_TITLE, LP_RISK_MESSAGE_A
+    )
+    assert quiet[1].success is False
+    assert quiet[1].suppressed is True
+    assert quiet[1].error == "quiet hours"
+    assert recorder.spoken == []
+
+    attempts = recorder.deliver(
+        "2026-09-19T08:00:30+08:00", LP_RISK_TITLE, LP_RISK_MESSAGE_A
+    )
+    assert attempts[1].success is True
+    assert recorder.spoken == ["LP 风险警告，1 个标的，请立即查看飞书。"]
 
 
 def test_lp_share_watch_voice_quiet_hours_and_delivery(tmp_path: Path) -> None:
@@ -718,7 +842,7 @@ def test_lp_share_watch_voice_quiet_hours_and_delivery(tmp_path: Path) -> None:
         "当前奖励份额 8.000001%，目标区间 5%–8%，已连续超过 8% 至少一分钟。\n"
         "数据时间：北京时间 07:59:00。"
     )
-    expected_voice = f"{title}\n\n{message}"
+    expected_voice = f"{title}，1 个标的，请立即查看飞书。"
     spoken: list[str] = []
     feishu_posts: list[dict[str, object]] = []
 
