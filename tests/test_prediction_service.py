@@ -4106,13 +4106,17 @@ def test_lp_dashboard_reward_share_target_status_is_market_scoped(
                 assert share["delta_percentage_points"] == previous_delta
                 assert account.share_reads == 6
             if index == 0:
-                recommendation = next(
-                    row
+                assert all(
+                    row["condition_id"] != "condition-rec"
                     for row in payload["recommendations"]
+                )
+                diagnostic = next(
+                    row
+                    for row in payload["selected_results"]
                     if row["condition_id"] == "condition-rec"
                 )
-                assert recommendation["reference_share_percentage"] == "5"
-                assert recommendation["reference_daily_reward_usd"] == "4.95"
+                assert diagnostic["reference_share_percentage"] == "5"
+                assert diagnostic["reference_daily_reward_usd"] == "4.95"
                 no_pool = next(
                     row
                     for row in payload["selected_results"]
@@ -10405,6 +10409,7 @@ def test_lp_candidate_review_time_is_next_beijing_eight(
 
     monkeypatch.setattr(polymarket_trading_module, "datetime", FrozenDateTime)
     condition_id = "0x" + "c" * 64
+    expected_condition_id = condition_id
     token_id = "0x" + "1" * 64
 
     class AccountSDK:
@@ -10459,6 +10464,13 @@ def test_lp_candidate_review_time_is_next_beijing_eight(
                 }
             ]
 
+        def list_market_rewards(
+            self, *, condition_id: str, sponsored: bool
+        ) -> list[object]:
+            assert condition_id == expected_condition_id
+            del sponsored
+            return self.list_current_rewards(sponsored=False)
+
         def get_market(self, *, id: str) -> object:
             assert id == "market-1"
             return {
@@ -10480,6 +10492,13 @@ def test_lp_candidate_review_time_is_next_beijing_eight(
                 },
             }
 
+        def list_markets(
+            self, *, condition_ids: object, page_size: int = 100
+        ) -> list[object]:
+            assert page_size == 100
+            assert tuple(condition_ids) == (condition_id,)  # type: ignore[arg-type]
+            return [self.get_market(id="market-1")]
+
         def get_order_book(self, *, token_id: str) -> object:
             assert token_id == "0x" + "1" * 64
             return {
@@ -10494,6 +10513,10 @@ def test_lp_candidate_review_time_is_next_beijing_eight(
                 "min_order_size": Decimal("1"),
                 "tick_size": Decimal("0.01"),
             }
+
+        def get_order_books(self, *, token_ids: object) -> list[object]:
+            assert tuple(token_ids) == (token_id,)  # type: ignore[arg-type]
+            return [self.get_order_book(token_id=token_id)]
 
         def close(self) -> None:
             return None

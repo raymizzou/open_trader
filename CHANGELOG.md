@@ -5,6 +5,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-19
 
+- Issue 142 acceptance repair: synchronized the paused-runtime metadata/fee
+  fixture, kept stale recommendation checks in selected diagnostics, and
+  aligned the review-time fake SDK with selected reward, market, and book
+  reads. The three affected Docker selectors passed (`3 passed, 1 warning`);
+  no full acceptance, live calls, orders, deployment, or trading were run.
+
 - Issue 142 final repair: reward-only expiry now re-derives candidate rules from
   the fresh reward source without retaining stale normalized guidance, and a
   partial or failed maintenance round waits for the next normal scan instead

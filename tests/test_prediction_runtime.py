@@ -411,6 +411,7 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
         def lp_market_metadata(self, condition_ids: object, **_kwargs: object) -> dict[str, dict[str, object]]:
             del condition_ids
             lp_events["metadata"].set()
+            checked_at = datetime.now(UTC)
             return {
                 "candidate-condition": {
                     "market_id": "candidate-market",
@@ -418,7 +419,8 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
                     "market_title": "Candidate market",
                     "market_url": "https://polymarket.com/event/candidate",
                     "exchange_type": "CLOB",
-                    "metadata_checked_at": datetime.now(UTC),
+                    "metadata_checked_at": checked_at,
+                    "fees_checked_at": checked_at,
                     "event_ended": False,
                     "event_start_time": datetime.now(UTC) + timedelta(hours=2),
                     "accepting_orders": True,
