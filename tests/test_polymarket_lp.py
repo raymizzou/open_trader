@@ -3541,6 +3541,151 @@ class _LPBatchQueryExchange(_LPCandidateQueryExchange):
         return books
 
 
+class _LPAdvancingClockExchange(_LPBatchQueryExchange):
+    """Advancing-clock batch fixture for the issue-143 repair-2 tests.
+
+    The shared clock jumps forward ``step_seconds`` after every
+    ``lp_order_books`` call, so batch N is evaluated ``step_seconds * N``
+    seconds after the round-start facts were built — the real scan reads a
+    ten-thousand-market catalog plus five batches of books and evaluation
+    and crosses the 60-second fact window (production saw every late batch
+    die as ``market_metadata_stale``).  Stamp deltas let a test choose which
+    fact class is already stale when the scan starts (prepared-cache ageing),
+    and the renewal adapters serve fresh stamps at the current clock while
+    recording every call so the once-per-batch targeted renewal semantics is
+    assertable.
+    """
+
+    def __init__(
+        self,
+        now: datetime,
+        pools: dict[str, Decimal],
+        *,
+        step_seconds: int = 30,
+        metadata_stamp_delta: timedelta = timedelta(0),
+        reward_stamp_delta: timedelta = timedelta(0),
+        account_stamp_delta: timedelta = timedelta(0),
+        metadata_fresh_mode: str = "fresh",
+        refreshed_reward_override: dict[str, object] | None = None,
+        open_orders: tuple[dict[str, object], ...] = (),
+        backup: frozenset[str] = frozenset(),
+        reject: frozenset[str] = frozenset(),
+        omit_tokens: frozenset[str] = frozenset(),
+        bid_by_suffix: dict[str, Decimal] | None = None,
+        available: str = "1000",
+    ) -> None:
+        super().__init__(
+            now,
+            pools,
+            backup=backup,
+            reject=reject,
+            omit_tokens=omit_tokens,
+            bid_by_suffix=bid_by_suffix,
+            available=available,
+        )
+        self.step = timedelta(seconds=step_seconds)
+        self.metadata_stamp_delta = metadata_stamp_delta
+        self.reward_stamp_delta = reward_stamp_delta
+        self.account_stamp_delta = account_stamp_delta
+        self.metadata_fresh_mode = metadata_fresh_mode
+        self.refreshed_reward_override = refreshed_reward_override or {}
+        self.open_orders = open_orders
+        self.metadata_fresh_calls = 0
+        self.metadata_fresh_reads: tuple[tuple[str, ...], ...] = ()
+        self.targeted_reward_reads: tuple[tuple[str, ...], ...] = ()
+        self.account_reads = 0
+
+    def lp_market_metadata(self, condition_ids, *, stop_event=None):
+        metadata = super().lp_market_metadata(condition_ids, stop_event=stop_event)
+        stamp = self.now + self.metadata_stamp_delta
+        return {
+            condition_id: {
+                **dict(row),
+                "metadata_checked_at": stamp,
+                "fees_checked_at": stamp,
+            }
+            for condition_id, row in metadata.items()
+        }
+
+    def lp_market_metadata_fresh(self, condition_ids, *, stop_event=None):
+        self.metadata_fresh_calls += 1
+        self.metadata_fresh_reads = (
+            *self.metadata_fresh_reads,
+            tuple(dict.fromkeys(condition_ids)),
+        )
+        if self.metadata_fresh_mode == "failure":
+            raise RuntimeError("metadata_refresh_failed")
+        if self.metadata_fresh_mode == "missing":
+            return {}
+        return self.lp_market_metadata(condition_ids, stop_event=stop_event)
+
+    def lp_reward_catalog(self, *, condition_ids=None, stop_event=None):
+        catalog = super().lp_reward_catalog(
+            condition_ids=condition_ids, stop_event=stop_event
+        )
+        stamp = self.now + self.reward_stamp_delta
+        catalog["checked_at"] = stamp
+        catalog["markets"] = tuple(
+            {**dict(row), "reward_checked_at": stamp} for row in catalog["markets"]
+        )
+        if condition_ids is not None:
+            self.targeted_reward_reads = (
+                *self.targeted_reward_reads,
+                tuple(dict.fromkeys(condition_ids)),
+            )
+            if self.refreshed_reward_override:
+                catalog["markets"] = tuple(
+                    {**dict(row), **self.refreshed_reward_override}
+                    for row in catalog["markets"]
+                )
+        return catalog
+
+    def lp_account_snapshot(self):
+        self.account_reads += 1
+        account = super().lp_account_snapshot()
+        if self.account_reads == 1:
+            # The round-start receipt carries the stale-origins delta; a
+            # renewal is a real adapter read and stamps the current clock.
+            account["checked_at"] = self.now + self.account_stamp_delta
+        else:
+            account["checked_at"] = self.now
+        if self.open_orders:
+            account["open_orders"] = list(self.open_orders)
+        return account
+
+    def lp_order_books(self, token_ids, *, stop_event=None):
+        books = super().lp_order_books(token_ids, stop_event=stop_event)
+        self.now = self.now + self.step
+        return books
+
+
+class _LPWallClockRenewalExchange(_LPAdvancingClockExchange):
+    """Renewal adapters whose stamps postdate the call, like real HTTP reads.
+
+    Issue #143 review round 3: every shared-fact read (metadata/fees,
+    reward catalog, account) advances the fixture clock one second before
+    stamping — the wall-clock latency of a real network read — so renewal
+    stamps land strictly after a clock captured before the renewal.  With
+    the batch evaluation clock taken before ``_renew_batch_shared_facts``
+    this made every renewed batch die as stale unknowns even though the
+    renewal had just succeeded.
+    """
+
+    def lp_market_metadata(self, condition_ids, *, stop_event=None):
+        self.now = self.now + timedelta(seconds=1)
+        return super().lp_market_metadata(condition_ids, stop_event=stop_event)
+
+    def lp_reward_catalog(self, *, condition_ids=None, stop_event=None):
+        self.now = self.now + timedelta(seconds=1)
+        return super().lp_reward_catalog(
+            condition_ids=condition_ids, stop_event=stop_event
+        )
+
+    def lp_account_snapshot(self):
+        self.now = self.now + timedelta(seconds=1)
+        return super().lp_account_snapshot()
+
+
 def _batch_pools() -> dict[str, Decimal]:
     pools = {
         f"N{index:02d}": Decimal(500 - index) for index in range(1, 19)
@@ -3706,6 +3851,330 @@ def test_batch_refresh_stops_at_fifty_markets_checked(tmp_path) -> None:
     ]
     assert all(row["selected_direction"] is not None for row in candidates)
     assert snapshot["recommendations"][0]["market_id"] == "market-N01"
+
+
+def test_batch_refresh_renews_stale_market_facts_mid_round(tmp_path) -> None:
+    """R2-1 (issue #143 repair 2): real-scan latency must not poison batches.
+
+    Batches 1-2 evaluate on facts inside the 60-second window; batch 3
+    crosses it (+90 seconds against the round-start stamps).  The repair
+    renews each shared fact class once per batch, targeted at that batch's
+    conditions, so batch 3 qualifies on fresh facts instead of every market
+    dying as ``market_metadata_stale``.
+    """
+
+    now = datetime(2026, 9, 19, 9, tzinfo=UTC)
+    pools = {f"N{index:02d}": Decimal(600 - index) for index in range(1, 31)}
+    exchange = _LPAdvancingClockExchange(
+        now,
+        pools,
+        reject=frozenset({f"N{index:02d}" for index in range(1, 21)}),
+    )
+    lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: exchange.now
+    )
+    assert lp.refresh_price_history()["state"] == "known"
+
+    snapshot = lp.refresh_candidates(force=True)
+
+    funnel = snapshot["funnel"]
+    assert funnel["checked"] == 30
+    assert funnel["batches"] == 3
+    assert funnel["rejected"] == 20
+    assert funnel["passed"] == 10
+    assert funnel["unknown"] == 0
+    assert funnel["stop_reason"] == "filled"
+    # Batch three (condition-N21..N30) crossed the window and was renewed:
+    # exactly one targeted metadata read covering exactly that batch's
+    # conditions, one targeted reward read, one account renewal.  Batches
+    # 1-2 stayed inside the window and renewed nothing.
+    assert len(exchange.metadata_fresh_reads) == 1
+    assert set(exchange.metadata_fresh_reads[0]) == {
+        f"condition-N{index:02d}" for index in range(21, 31)
+    }
+    assert len(exchange.targeted_reward_reads) == 1
+    assert set(exchange.targeted_reward_reads[0]) == set(
+        exchange.metadata_fresh_reads[0]
+    )
+    assert exchange.account_reads == 2
+    candidates = snapshot["candidates"]
+    assert {row["market_id"] for row in candidates} == {
+        f"market-N{index:02d}" for index in range(21, 31)
+    }
+    assert all(row["state"] == "eligible" for row in candidates)
+
+
+def test_batch_refresh_renews_facts_stale_at_scan_start(tmp_path) -> None:
+    """R2-2 (issue #143 repair 2): a stale prepared cache cannot sink batch 1.
+
+    The prepared input snapshot may serve a preparation that is hours old,
+    so the very first batch can start past the 60-second window.  The scan
+    must renew the expired metadata and reward facts for that batch's
+    conditions before qualifying them.
+    """
+
+    now = datetime(2026, 9, 19, 10, tzinfo=UTC)
+    pools = {f"N{index:02d}": Decimal(600 - index) for index in range(1, 11)}
+    exchange = _LPAdvancingClockExchange(now, pools)
+    lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: exchange.now
+    )
+    assert lp.refresh_price_history()["state"] == "known"
+    # The prepared snapshot serves a preparation built ten minutes ago.
+    exchange.now = now + timedelta(minutes=10)
+
+    snapshot = lp.refresh_candidates(force=True)
+
+    funnel = snapshot["funnel"]
+    assert funnel["checked"] == 10
+    assert funnel["batches"] == 1
+    assert funnel["passed"] == 10
+    assert funnel["unknown"] == 0
+    assert funnel["stop_reason"] == "filled"
+    # The first batch renewed the expired facts once, targeted at exactly
+    # its own conditions.
+    assert len(exchange.metadata_fresh_reads) == 1
+    assert set(exchange.metadata_fresh_reads[0]) == {
+        f"condition-N{index:02d}" for index in range(1, 11)
+    }
+    assert len(exchange.targeted_reward_reads) == 1
+    assert set(exchange.targeted_reward_reads[0]) == set(
+        exchange.metadata_fresh_reads[0]
+    )
+    # The round-start account was read inside the window: no renewal.
+    assert exchange.account_reads == 1
+    assert all(row["state"] == "eligible" for row in snapshot["candidates"])
+
+
+def test_batch_refresh_renews_stale_reward_and_account_facts(tmp_path) -> None:
+    """R2-3 (issue #143 repair 2): reward and account facts renew targeted.
+
+    Two scans, each with exactly one stale fact class at the batch clock.
+    A refreshed reward row that flips ``reward_active`` to ``False`` must
+    turn the verdict into a ``reward_inactive`` rejection (judged on the
+    new facts).  A refreshed account must be judged on its own receipts and
+    apply the open-order reservation exactly once: balance 50 minus the 30
+    reserved order still funds the 6.80 minimum, a double deduction would
+    not.
+    """
+
+    now = datetime(2026, 9, 19, 11, tzinfo=UTC)
+    pools = {f"N{index:02d}": Decimal(600 - index) for index in range(1, 11)}
+
+    # Scenario A: only the reward receipt is stale when the batch evaluates.
+    reward_exchange = _LPAdvancingClockExchange(
+        now,
+        pools,
+        metadata_stamp_delta=timedelta(minutes=10),
+        refreshed_reward_override={"reward_active": False},
+    )
+    reward_lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path / "reward"),
+        reward_exchange,
+        clock=lambda: reward_exchange.now,
+    )
+    assert reward_lp.refresh_price_history()["state"] == "known"
+    reward_exchange.now = now + timedelta(minutes=10)
+
+    reward_snapshot = reward_lp.refresh_candidates(force=True)
+
+    reward_funnel = reward_snapshot["funnel"]
+    assert reward_funnel["checked"] == 10
+    assert reward_funnel["passed"] == 0
+    assert reward_funnel["rejected"] == 10
+    assert reward_funnel["unknown"] == 0
+    # The refreshed reward facts were judged: once, targeted, and the
+    # renewed ``reward_active=False`` row rejected every market.  Metadata
+    # and account stayed inside the window and renewed nothing.
+    assert len(reward_exchange.targeted_reward_reads) == 1
+    assert set(reward_exchange.targeted_reward_reads[0]) == {
+        f"condition-N{index:02d}" for index in range(1, 11)
+    }
+    assert reward_exchange.metadata_fresh_reads == ()
+    assert reward_exchange.account_reads == 1
+
+    # Scenario B: only the account receipt is stale when the batch
+    # evaluates; the renewed account carries a 30.00 open BUY on another
+    # market that must be reserved exactly once.
+    other_order = {
+        "order_id": "res-other",
+        "market_id": "market-OTHER",
+        "condition_id": "condition-OTHER",
+        "token_id": "token-OTHER-yes",
+        "side": "BUY",
+        "status": "LIVE",
+        "price": Decimal("1"),
+        "remaining_size": Decimal("30"),
+    }
+    account_exchange = _LPAdvancingClockExchange(
+        now,
+        pools,
+        metadata_stamp_delta=timedelta(minutes=10),
+        reward_stamp_delta=timedelta(minutes=10),
+        account_stamp_delta=timedelta(minutes=-10),
+        open_orders=(other_order,),
+        available="50",
+    )
+    account_lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path / "account"),
+        account_exchange,
+        clock=lambda: account_exchange.now,
+    )
+    assert account_lp.refresh_price_history()["state"] == "known"
+    account_exchange.now = now + timedelta(minutes=10)
+
+    account_snapshot = account_lp.refresh_candidates(force=True)
+
+    account_funnel = account_snapshot["funnel"]
+    assert account_funnel["checked"] == 10
+    assert account_funnel["passed"] == 10
+    assert account_funnel["rejected"] == 0
+    assert account_funnel["unknown"] == 0
+    assert account_funnel["stop_reason"] == "filled"
+    # The account renewed exactly once (round start plus one renewal) and
+    # eligibility ran on the renewed receipts; metadata and reward were
+    # still fresh and renewed nothing.
+    assert account_exchange.account_reads == 2
+    assert account_exchange.metadata_fresh_reads == ()
+    assert account_exchange.targeted_reward_reads == ()
+    # 50.00 balance minus the 30.00 reserved order funds exactly one 6.80
+    # minimum order — a duplicated reservation deduction would reject.
+    for row in account_snapshot["candidates"]:
+        assert row["state"] == "eligible"
+        assert Decimal(str(row["realtime_capital"])) == Decimal("6.80")
+
+
+def test_batch_renewal_latency_keeps_renewed_facts_evaluable(tmp_path) -> None:
+    """R3-1 (issue #143 repair 3): renewal latency must not poison the batch.
+
+    Real renewal reads carry network latency, so their stamps land
+    strictly after the moment the batch began renewing.  The batch
+    evaluation clock is captured only after ``_renew_batch_shared_facts``
+    returns, so the renewed stamps are judged on a clock at or after their
+    own time (age >= 0) and the batch qualifies on the renewed facts
+    instead of every market dying as a stale unknown.
+    """
+
+    now = datetime(2026, 9, 19, 13, tzinfo=UTC)
+    pools = {f"N{index:02d}": Decimal(600 - index) for index in range(1, 11)}
+    exchange = _LPWallClockRenewalExchange(now, pools)
+    lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: exchange.now
+    )
+    assert lp.refresh_price_history()["state"] == "known"
+    # The prepared snapshot is ten minutes old at scan start (the R2-2
+    # scenario): batch one must renew its metadata and reward facts, and
+    # each renewal read takes one wall-clock second.
+    exchange.now = now + timedelta(minutes=10)
+
+    snapshot = lp.refresh_candidates(force=True)
+
+    funnel = snapshot["funnel"]
+    assert funnel["checked"] == 10
+    assert funnel["batches"] == 1
+    assert funnel["passed"] == 10
+    assert funnel["rejected"] == 0
+    assert funnel["unknown"] == 0
+    assert funnel["stop_reason"] == "filled"
+    # Each expired fact class renewed once, targeted at the batch's own
+    # conditions, and the renewed stamps were judged fresh.
+    assert len(exchange.metadata_fresh_reads) == 1
+    assert set(exchange.metadata_fresh_reads[0]) == {
+        f"condition-N{index:02d}" for index in range(1, 11)
+    }
+    assert len(exchange.targeted_reward_reads) == 1
+    assert set(exchange.targeted_reward_reads[0]) == set(
+        exchange.metadata_fresh_reads[0]
+    )
+    # The round-start account receipt is inside the window: no renewal.
+    assert exchange.account_reads == 1
+    assert all(row["state"] == "eligible" for row in snapshot["candidates"])
+
+
+def test_batch_refresh_failure_keeps_honest_stale_unknown(tmp_path) -> None:
+    """R2-4 (issue #143 repair 2): a failed renewal degrades honestly.
+
+    The metadata renewal for batch 3 raises.  Batch 3 and batch 4 then
+    qualify on the old facts and report ``market_metadata_stale`` unknowns,
+    the round makes exactly one renewal attempt for the class, and a forced
+    next round retries and recovers.
+    """
+
+    now = datetime(2026, 9, 19, 12, tzinfo=UTC)
+    pools = {f"N{index:02d}": Decimal(600 - index) for index in range(1, 41)}
+    exchange = _LPAdvancingClockExchange(
+        now,
+        pools,
+        reject=frozenset({f"N{index:02d}" for index in range(1, 21)}),
+        metadata_fresh_mode="failure",
+    )
+    lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: exchange.now
+    )
+    assert lp.refresh_price_history()["state"] == "known"
+
+    first = lp.refresh_candidates(force=True)
+
+    funnel = first["funnel"]
+    assert funnel["checked"] == 40
+    assert funnel["batches"] == 4
+    assert funnel["rejected"] == 20
+    assert funnel["passed"] == 0
+    assert funnel["unknown"] == 20
+    assert funnel["stop_reason"] == "queue_exhausted"
+    stale_reasons = {
+        row["condition_id"]: row["code"]
+        for row in funnel["reasons"]["trial"]
+    }
+    assert len(stale_reasons) == 20
+    assert all(
+        stale_reasons[f"condition-N{index:02d}"] == "market_metadata_stale"
+        for index in range(21, 41)
+    )
+    # Exactly one renewal attempt per class per batch: the batch-3 metadata
+    # failure is not retried on batch 4 (one call total), while the reward
+    # class lawfully renews once per batch for that batch's own conditions
+    # (their round-start receipts each age past the window).  The account
+    # fact is shared across conditions, so its batch-3 renewal covers
+    # batch 4 and reads only twice in the round.
+    assert exchange.metadata_fresh_calls == 1
+    assert exchange.metadata_fresh_reads == (
+        tuple(f"condition-N{index:02d}" for index in range(21, 31)),
+    )
+    assert len(exchange.targeted_reward_reads) == 2
+    assert set(exchange.targeted_reward_reads[0]) == {
+        f"condition-N{index:02d}" for index in range(21, 31)
+    }
+    assert set(exchange.targeted_reward_reads[1]) == {
+        f"condition-N{index:02d}" for index in range(31, 41)
+    }
+    assert exchange.account_reads == 2
+
+    # The next forced round retries the renewal and recovers.
+    exchange.metadata_fresh_mode = "fresh"
+    second = lp.refresh_candidates(force=True)
+
+    second_funnel = second["funnel"]
+    assert second_funnel["checked"] == 30
+    assert second_funnel["batches"] == 3
+    assert second_funnel["passed"] == 10
+    assert second_funnel["rejected"] == 20
+    assert second_funnel["unknown"] == 0
+    assert second_funnel["stop_reason"] == "filled"
+    # The recovery round renews each batch's own conditions once (its
+    # round-start receipts are the still-stale prepared stamps), so three
+    # further targeted calls — one per batch, never wider than the batch.
+    assert exchange.metadata_fresh_calls == 4
+    assert exchange.metadata_fresh_reads == (
+        tuple(f"condition-N{index:02d}" for index in range(21, 31)),
+        tuple(f"condition-N{index:02d}" for index in range(1, 11)),
+        tuple(f"condition-N{index:02d}" for index in range(11, 21)),
+        tuple(f"condition-N{index:02d}" for index in range(21, 31)),
+    )
+    assert {row["market_id"] for row in second["candidates"]} == {
+        f"market-N{index:02d}" for index in range(21, 31)
+    }
+    assert all(row["state"] == "eligible" for row in second["candidates"])
 
 
 def test_batch_refresh_isolates_missing_books_and_reads_backup_once(tmp_path) -> None:

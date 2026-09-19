@@ -5819,15 +5819,18 @@ def test_lp_partial_preparation_uses_item_retry_deadline(
                 break
             time.sleep(0.01)
             snapshot = runtime.lp.refresh_candidates(force=True)  # type: ignore[union-attr]
-        # Issue #143: only live-qualified passers are published.  After the
-        # 300-second history wait the cached metadata is older than the
-        # 60-second candidate freshness window, so market-a is accounted
-        # unknown (market_metadata_stale) and no row is published.
+        # Issue #143 repair 2: after the 300-second history wait the cached
+        # metadata is older than the 60-second candidate freshness window,
+        # so the batch renews it once (targeted) before qualifying and
+        # market-a is judged live and published as the only passer.
         assert snapshot.get("scanning") is not True
         assert snapshot["funnel"]["checked"] == 1
-        assert snapshot["funnel"]["unknown"] == 1
+        assert snapshot["funnel"]["passed"] == 1
+        assert snapshot["funnel"]["unknown"] == 0
         assert snapshot["funnel"]["batches"] == 1
-        assert snapshot["candidates"] == []
+        assert [row["condition_id"] for row in snapshot["candidates"]] == [
+            "condition-a"
+        ]
 
         release_299.set()
         assert retry_history_done.wait(timeout=2)

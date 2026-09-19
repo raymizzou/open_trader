@@ -1715,12 +1715,21 @@ def test_partial_retry_pauses_only_failed_items_across_restart(tmp_path: Path) -
 
     current[0] = T + timedelta(hours=23)
     candidate = service.refresh_candidates(force=True)
-    # After 23 hours the cached metadata/books are far outside the
-    # 60-second candidate freshness window: the queue is still consumed and
-    # honestly accounted unknown, but no passer is published (issue #143).
-    assert candidate["candidates"] == []
+    # Issue #143 repair 2: after 23 hours the cached metadata is far outside
+    # the 60-second candidate freshness window, so the batch renews the
+    # expired shared facts once (targeted) before qualifying: the queue is
+    # consumed, every market is judged live, and all three passers publish.
+    assert candidate["candidates"] != []
     assert candidate["funnel"]["checked"] == 3
-    assert candidate["funnel"]["unknown"] == 3
+    assert candidate["funnel"]["passed"] == 3
+    assert candidate["funnel"]["unknown"] == 0
+    # Paused condition-b (no history summary) never queues; the three
+    # healthy markets a, c, and d are judged live and publish.
+    assert {row["condition_id"] for row in candidate["candidates"]} == {
+        "condition-a",
+        "condition-c",
+        "condition-d",
+    }
     summaries = store.lp_price_history_summaries(
         (("condition-a", "token-a"), ("condition-c", "token-c")),
         now=current[0],
@@ -3440,14 +3449,16 @@ def test_due_metadata_retry_dispatches_before_initial_history_pass_finishes(
     assert store.lp_preparation_items() == []
 
     snapshot = service.refresh_candidates(force=True)
-    # Issue 143: the token-080 history read advanced the clock by 300s, so
-    # metadata cached before the jump is outside the 60-second candidate
-    # freshness window (honestly unknown), and this fixture's 100/100 bid
-    # levels fail the exit-liquidity rule for the rest: no passer survives.
-    assert snapshot["candidates"] == []
-    assert snapshot["funnel"]["stop_reason"] == "checked_limit"
-    assert snapshot["funnel"]["checked"] == 50
-    assert snapshot["funnel"]["passed"] == 0
+    # Issue 143 repair 2: the token-080 history read advanced the clock by
+    # 300s, so the prepared metadata is outside the 60-second candidate
+    # freshness window; the first batch renews it once (targeted) before
+    # qualifying, and the ten live-qualified passers fill the table and end
+    # the round.
+    assert snapshot["funnel"]["stop_reason"] == "filled"
+    assert snapshot["funnel"]["checked"] == 10
+    assert snapshot["funnel"]["passed"] == 10
+    assert snapshot["funnel"]["unknown"] == 0
+    assert len(snapshot["candidates"]) == 10
 
     history_count = len(history_calls)
     metadata_retry_count = metadata_calls.count(("condition-b",))

@@ -5759,15 +5759,19 @@ def test_lp_candidate_preview_rechecks_best_bid_before_confirmation(
     scanned = lp.refresh_candidates(force=True)
     assert scanned["state"] == "ready"
     assert scanned["complete"] is True
-    # Issue #143: only live-qualified passers are published.  This fixture's
-    # reward receipt is deliberately read 200 seconds in the past, so the
-    # market is accounted unknown (reward freshness) and stays unpublished;
-    # the preview path below re-reads fresh facts directly.
-    assert scanned["candidates"] == []
-    assert scanned["recommendations"] == []
+    # Issue #143 repair 2: receipts cached with the 200-second offset (the
+    # prepared reward catalog and the first account read) are renewed once,
+    # targeted at the scanned condition, and the market is judged live and
+    # published; the preview path below still rechecks fresh facts directly.
     assert scanned["funnel"]["checked"] == 1
-    assert scanned["funnel"]["unknown"] == 1
-    assert public_state["selected_reward_requests"] == []
+    assert scanned["funnel"]["passed"] == 1
+    assert scanned["funnel"]["unknown"] == 0
+    assert [row["condition_id"] for row in scanned["candidates"]] == [condition_id]
+    assert len(scanned["recommendations"]) == 1
+    assert public_state["selected_reward_requests"] == [
+        (condition_id, False),
+        (condition_id, True),
+    ]
     execution = PredictionExecutionService(
         store=store,
         monitor=_Monitor(),
@@ -5833,9 +5837,10 @@ def test_lp_candidate_preview_rechecks_best_bid_before_confirmation(
         candidate_rows = dashboard["candidates"]
         assert isinstance(candidate_rows, list)
         assert dashboard["complete"] is True
-        # Issue #143: the scan's reward receipt is stale by design, so no
-        # passer is published; the preview below rechecks fresh facts.
-        assert candidate_rows == []
+        # Issue #143 repair 2: the scan renewed the stale account receipt and
+        # published its live-qualified passer; the preview below still
+        # rechecks fresh facts before confirming.
+        assert [row["condition_id"] for row in candidate_rows] == [condition_id]
         assert dashboard["candidate_stale"] is False
         preview_status, preview = candidate_preview(base)
         assert preview_status == 200

@@ -122,6 +122,103 @@ def _lp_reward_terms(
     return reward_minimum, reward_spread
 
 
+def _lp_direction_fact(
+    market_meta: Mapping[str, object],
+    reward_market: Mapping[str, object],
+    *,
+    condition_id: str,
+    token_id: str,
+    outcome: str,
+    reward_checked_at: object,
+    reward_guidance_deadline: object,
+    event_end_confirmation: object,
+    history_summary: object,
+    account: Mapping[str, object] | None,
+) -> dict[str, object]:
+    """Build one YES/NO direction fact from market and reward rows.
+
+    Single copy of the direction-construction formula, shared by the
+    round-start build and the issue-143 batch renewal, so both produce
+    identical market fields (including the ``_lp_reward_terms`` minimum and
+    spread resolution and the reward-catalog overlays) from the same code.
+    """
+
+    reward_minimum, reward_spread = _lp_reward_terms(market_meta, reward_market)
+    market: dict[str, object] = {
+        **dict(market_meta),
+        "condition_id": condition_id,
+        "token_id": token_id,
+        "outcome": outcome,
+        "reward_min_size": reward_minimum,
+        "reward_max_spread": reward_spread,
+    }
+    if "rewards_min_size" in reward_market:
+        market["_reward_catalog_min_size"] = reward_market.get("rewards_min_size")
+    if "rewards_max_spread" in reward_market:
+        market["_reward_catalog_max_spread"] = reward_market.get("rewards_max_spread")
+    if market_meta.get("reward_min_size") is not None:
+        market["_metadata_reward_min_size"] = market_meta.get("reward_min_size")
+    if market_meta.get("reward_max_spread") is not None:
+        market["_metadata_reward_max_spread"] = market_meta.get("reward_max_spread")
+    direction: dict[str, object] = {
+        "market": market,
+        "reward_active": (
+            reward_market.get("reward_active")
+            if isinstance(reward_market.get("reward_active"), bool)
+            else None
+        ),
+        "daily_pool_usd": reward_market.get("daily_pool_usd"),
+        "reward_checked_at": reward_checked_at,
+        "reward_guidance_deadline": reward_guidance_deadline,
+        "event_end_confirmation": event_end_confirmation,
+    }
+    if isinstance(history_summary, Mapping):
+        direction["history_summary"] = dict(history_summary)
+    if account is not None and _has_market_order(account, market):
+        direction["known_participation"] = True
+    return direction
+
+
+def _lp_metadata_stale_conditions(
+    directions_by_condition: Mapping[str, Sequence[Mapping[str, object]]],
+    condition_ids: Sequence[str],
+    now: datetime,
+) -> tuple[str, ...]:
+    """Batch conditions whose metadata or fee receipt misses the 60s window."""
+
+    stale: list[str] = []
+    for condition_id in condition_ids:
+        for direction in directions_by_condition.get(condition_id, ()):
+            market = (
+                direction.get("market") if isinstance(direction, Mapping) else None
+            )
+            if isinstance(market, Mapping) and (
+                _candidate_source_expired(market.get("metadata_checked_at"), now)
+                or _candidate_source_expired(market.get("fees_checked_at"), now)
+            ):
+                stale.append(condition_id)
+                break
+    return tuple(stale)
+
+
+def _lp_reward_stale_conditions(
+    directions_by_condition: Mapping[str, Sequence[Mapping[str, object]]],
+    condition_ids: Sequence[str],
+    now: datetime,
+) -> tuple[str, ...]:
+    """Batch conditions whose reward receipt misses the 60s window."""
+
+    stale: list[str] = []
+    for condition_id in condition_ids:
+        for direction in directions_by_condition.get(condition_id, ()):
+            if isinstance(direction, Mapping) and _candidate_source_expired(
+                direction.get("reward_checked_at"), now
+            ):
+                stale.append(condition_id)
+                break
+    return tuple(stale)
+
+
 def _lp_guidance_is_usable(value: object) -> bool:
     """Require every fact the UI needs before counting a direction as passed."""
 
@@ -2913,6 +3010,7 @@ class PolymarketLPService:
                     batch_value = {}
                 if isinstance(batch_value, Mapping):
                     cached_summaries = batch_value
+            reward_market_by_condition: dict[str, Mapping[str, object]] = {}
             for reward_market in market_rows:
                 condition_id = str(reward_market.get("condition_id") or "").strip()
                 market_meta = metadata_by_condition.get(condition_id)
@@ -2930,6 +3028,8 @@ class PolymarketLPService:
                 if reward_minimum is None or reward_spread is None:
                     complete = False
                 confirmation = event_end_confirmations.get(condition_id)
+                reward_deadline = self._reward_guidance_deadline(reward_market)
+                reward_market_by_condition[condition_id] = reward_market
                 for outcome_key, raw_outcome in raw_outcomes.items():
                     if str(outcome_key).lower() not in {"yes", "no"} or not isinstance(raw_outcome, Mapping):
                         continue
@@ -2937,30 +3037,6 @@ class PolymarketLPService:
                     if not token_id:
                         complete = False
                         continue
-                    market = {
-                        **dict(market_meta),
-                        "condition_id": condition_id,
-                        "token_id": token_id,
-                        "outcome": str(raw_outcome.get("label") or outcome_key).upper(),
-                        "reward_min_size": reward_minimum,
-                        "reward_max_spread": reward_spread,
-                    }
-                    if "rewards_min_size" in reward_market:
-                        market["_reward_catalog_min_size"] = reward_market.get(
-                            "rewards_min_size"
-                        )
-                    if "rewards_max_spread" in reward_market:
-                        market["_reward_catalog_max_spread"] = reward_market.get(
-                            "rewards_max_spread"
-                        )
-                    if market_meta.get("reward_min_size") is not None:
-                        market["_metadata_reward_min_size"] = market_meta.get(
-                            "reward_min_size"
-                        )
-                    if market_meta.get("reward_max_spread") is not None:
-                        market["_metadata_reward_max_spread"] = market_meta.get(
-                            "reward_max_spread"
-                        )
                     summary: Mapping[str, object] | None = None
                     cache_key = (condition_id, token_id)
                     cached_summary = cached_summaries.get(cache_key)
@@ -2973,23 +3049,20 @@ class PolymarketLPService:
                             cached = None
                         if isinstance(cached, Mapping):
                             summary = cached
-                    direction: dict[str, object] = {
-                        "market": market,
-                        "reward_active": (
-                            reward_market.get("reward_active")
-                            if isinstance(reward_market.get("reward_active"), bool)
-                            else None
-                        ),
-                        "daily_pool_usd": reward_market.get("daily_pool_usd"),
-                        "reward_checked_at": catalog.get("checked_at"),
-                        "reward_guidance_deadline": self._reward_guidance_deadline(reward_market),
-                        "event_end_confirmation": confirmation,
-                    }
-                    if summary is not None:
-                        direction["history_summary"] = dict(summary)
-                    if account is not None and _has_market_order(account, market):
-                        direction["known_participation"] = True
-                    direction_facts.append(direction)
+                    direction_facts.append(
+                        _lp_direction_fact(
+                            market_meta,
+                            reward_market,
+                            condition_id=condition_id,
+                            token_id=token_id,
+                            outcome=str(raw_outcome.get("label") or outcome_key).upper(),
+                            reward_checked_at=catalog.get("checked_at"),
+                            reward_guidance_deadline=reward_deadline,
+                            event_end_confirmation=confirmation,
+                            history_summary=summary,
+                            account=account,
+                        )
+                    )
 
             competition_state = self._refresh_competition(stop_event)
 
@@ -3072,6 +3145,200 @@ class PolymarketLPService:
             # under `_candidate_state_lock` when the round publishes, so
             # `candidate_snapshot()` deep copies never see a resizing dict.
             round_facts: dict[str, object] = {}
+            # Issue #143 repair 2: the shared facts (metadata+fees, reward
+            # catalog, account) are built once at round start, but a real
+            # round outlives the 60-second fact window, so every batch
+            # re-checks their age on that batch's own clock and renews each
+            # expired class once — targeted at that batch's conditions only.
+            # Fresh (<=60s) facts are reused without another read.  A failed
+            # renewal keeps the previous facts (honest stale unknowns) and is
+            # never retried for the rest of the round; the next round or a
+            # manual force starts over.
+            metadata_renewal_failed = False
+            reward_renewal_failed = False
+            account_renewal_failed = False
+            evaluation_account: Mapping[str, object] | None = account
+
+            def _renew_batch_shared_facts(
+                condition_ids: tuple[str, ...], now: datetime
+            ) -> None:
+                nonlocal metadata_renewal_failed, reward_renewal_failed
+                nonlocal account_renewal_failed, evaluation_account
+
+                fresh_metadata: dict[str, Mapping[str, object]] = {}
+                stale_metadata_ids = _lp_metadata_stale_conditions(
+                    directions_by_condition, condition_ids, now
+                )
+                if stale_metadata_ids and not metadata_renewal_failed:
+                    reader = getattr(self.exchange, "lp_market_metadata_fresh", None)
+                    if not callable(reader):
+                        reader = getattr(self.exchange, "lp_market_metadata", None)
+                    raw_metadata: object = None
+                    if callable(reader):
+                        try:
+                            raw_metadata = reader(
+                                stale_metadata_ids, stop_event=stop_event
+                            )
+                        except TypeError:
+                            try:
+                                raw_metadata = reader(stale_metadata_ids)
+                            except Exception:
+                                raw_metadata = None
+                        except Exception:
+                            raw_metadata = None
+                    metadata_rows = (
+                        raw_metadata if isinstance(raw_metadata, Mapping) else {}
+                    )
+                    response_complete = True
+                    for condition_id in stale_metadata_ids:
+                        row = metadata_rows.get(condition_id)
+                        if not isinstance(row, Mapping):
+                            response_complete = False
+                            continue
+                        observed_at = self._now()
+                        if _candidate_source_expired(
+                            row.get("metadata_checked_at"), observed_at
+                        ) or _candidate_source_expired(
+                            row.get("fees_checked_at"), observed_at
+                        ):
+                            response_complete = False
+                            continue
+                        fresh_metadata[condition_id] = row
+                    if not response_complete:
+                        metadata_renewal_failed = True
+                    metadata_by_condition.update(fresh_metadata)
+
+                fresh_rewards: dict[str, Mapping[str, object]] = {}
+                fresh_reward_stamps: dict[str, object] = {}
+                stale_reward_ids = _lp_reward_stale_conditions(
+                    directions_by_condition, condition_ids, now
+                )
+                if stale_reward_ids and not reward_renewal_failed:
+                    raw_reward: object = None
+                    try:
+                        raw_reward = catalog_reader(
+                            condition_ids=stale_reward_ids, stop_event=stop_event
+                        )
+                    except TypeError:
+                        try:
+                            raw_reward = catalog_reader(
+                                condition_ids=stale_reward_ids
+                            )
+                        except Exception:
+                            raw_reward = None
+                    except Exception:
+                        raw_reward = None
+                    raw_rows = (
+                        raw_reward.get("markets")
+                        if isinstance(raw_reward, Mapping)
+                        else None
+                    )
+                    reward_rows_by_id: dict[str, Mapping[str, object]] = {}
+                    if isinstance(raw_rows, Mapping):
+                        reward_rows_by_id = {
+                            str(key): value
+                            for key, value in raw_rows.items()
+                            if isinstance(value, Mapping)
+                        }
+                    elif isinstance(raw_rows, (list, tuple)):
+                        for row in raw_rows:
+                            if isinstance(row, Mapping):
+                                reward_rows_by_id.setdefault(
+                                    str(row.get("condition_id") or ""), row
+                                )
+                    response_complete = True
+                    observed_at = self._now()
+                    for condition_id in stale_reward_ids:
+                        row = reward_rows_by_id.get(condition_id)
+                        if not isinstance(row, Mapping) or row.get("state") == "unknown":
+                            response_complete = False
+                            continue
+                        reward_stamp = row.get("reward_checked_at")
+                        if reward_stamp is None and isinstance(raw_reward, Mapping):
+                            reward_stamp = raw_reward.get("checked_at")
+                        if _candidate_source_expired(reward_stamp, observed_at):
+                            response_complete = False
+                            continue
+                        fresh_rewards[condition_id] = row
+                        fresh_reward_stamps[condition_id] = reward_stamp
+                    if not response_complete:
+                        reward_renewal_failed = True
+
+                if evaluation_account is None or _candidate_source_expired(
+                    evaluation_account.get("checked_at"), now
+                ):
+                    if not account_renewal_failed:
+                        refreshed_account: object = None
+                        try:
+                            refreshed_account = account_reader()
+                        except Exception:
+                            refreshed_account = None
+                        if (
+                            isinstance(refreshed_account, Mapping)
+                            and refreshed_account.get("authenticated") is True
+                            and not _candidate_source_expired(
+                                refreshed_account.get("checked_at"), self._now()
+                            )
+                        ):
+                            # The raw snapshot is kept: eligibility keeps
+                            # applying `_account_after_reservations` once on
+                            # top of it, and the round-start queue budget is
+                            # never rebuilt.
+                            evaluation_account = deepcopy(dict(refreshed_account))
+                        else:
+                            account_renewal_failed = True
+
+                renewed_ids = tuple(dict.fromkeys((*fresh_metadata, *fresh_rewards)))
+                for condition_id in renewed_ids:
+                    market_meta = (
+                        fresh_metadata[condition_id]
+                        if condition_id in fresh_metadata
+                        else metadata_by_condition.get(condition_id)
+                    )
+                    reward_row = (
+                        fresh_rewards[condition_id]
+                        if condition_id in fresh_rewards
+                        else reward_market_by_condition.get(condition_id)
+                    )
+                    if (
+                        not isinstance(market_meta, Mapping)
+                        or not isinstance(reward_row, Mapping)
+                    ):
+                        continue
+                    reward_deadline = self._reward_guidance_deadline(reward_row)
+                    rebuilt: list[Mapping[str, object]] = []
+                    for direction in directions_by_condition.get(condition_id, ()):
+                        if not isinstance(direction, Mapping):
+                            continue
+                        market = direction.get("market")
+                        if not isinstance(market, Mapping):
+                            continue
+                        outcome = str(market.get("outcome") or "").upper()
+                        token_id = str(market.get("token_id") or "").strip()
+                        if outcome not in {"YES", "NO"} or not token_id:
+                            continue
+                        rebuilt.append(
+                            _lp_direction_fact(
+                                market_meta,
+                                reward_row,
+                                condition_id=condition_id,
+                                token_id=token_id,
+                                outcome=outcome,
+                                reward_checked_at=(
+                                    fresh_reward_stamps[condition_id]
+                                    if condition_id in fresh_reward_stamps
+                                    else direction.get("reward_checked_at")
+                                ),
+                                reward_guidance_deadline=reward_deadline,
+                                event_end_confirmation=direction.get(
+                                    "event_end_confirmation"
+                                ),
+                                history_summary=direction.get("history_summary"),
+                                account=evaluation_account,
+                            )
+                        )
+                    if rebuilt:
+                        directions_by_condition[condition_id] = rebuilt
 
             def _passer_sort_key(
                 row: Mapping[str, object],
@@ -3152,9 +3419,7 @@ class PolymarketLPService:
                             retention_reason="scan_cancelled",
                         )
                     batches_read += 1
-                    batch_entries: list[
-                        tuple[dict[str, object], list[Mapping[str, object]]]
-                    ] = []
+                    batch_entries: list[tuple[dict[str, object], str]] = []
                     batch_tokens: list[str] = []
                     for candidate in batch:
                         condition_id = str(candidate.get("condition_id") or "").strip()
@@ -3162,6 +3427,46 @@ class PolymarketLPService:
                         checked_count += 1
                         if candidate.get("queue") == "backup":
                             backup_read_count += 1
+                        batch_entries.append((candidate, condition_id))
+                        # Directions are resolved again after evaluation (the
+                        # renewal below may rebuild them), but this batch's
+                        # book request covers the tokens as queued.
+                        for direction in directions_by_condition.get(condition_id, ()):
+                            if (
+                                isinstance(direction, Mapping)
+                                and isinstance(direction.get("market"), Mapping)
+                                and str(direction["market"].get("outcome") or "").upper()
+                                in {"YES", "NO"}
+                            ):
+                                market = direction["market"]
+                                token_id = str(market.get("token_id") or "").strip()  # type: ignore[union-attr]
+                                if token_id and token_id not in batch_tokens:
+                                    batch_tokens.append(token_id)
+                    try:
+                        candidate_books = books_reader(
+                            tuple(batch_tokens), stop_event=stop_event
+                        )
+                    except Exception:
+                        candidate_books = {}
+                    # Repair 2: renew expired shared facts for this batch
+                    # once, on this batch's own clock, before qualifying.
+                    # Repair 3: the batch evaluation clock is captured only
+                    # after the renewal reads finish — real reads carry
+                    # network latency, so their stamps postdate a clock
+                    # taken earlier and evaluate_lp_entry's negative-age
+                    # guard would report every renewed fact as stale.
+                    # Renewal staleness detection keeps this pre-renewal
+                    # batch clock unchanged.
+                    _renew_batch_shared_facts(
+                        tuple(
+                            dict.fromkeys(
+                                condition_id for _, condition_id in batch_entries
+                            )
+                        ),
+                        self._now(),
+                    )
+                    candidate_evaluation_now = self._now()
+                    for candidate, condition_id in batch_entries:
                         market_directions = [
                             direction
                             for direction in directions_by_condition.get(condition_id, ())
@@ -3170,21 +3475,6 @@ class PolymarketLPService:
                             and str(direction["market"].get("outcome") or "").upper()
                             in {"YES", "NO"}
                         ]
-                        batch_entries.append((candidate, market_directions))
-                        for direction in market_directions:
-                            market = direction.get("market")
-                            token_id = str(market.get("token_id") or "").strip()  # type: ignore[union-attr]
-                            if token_id and token_id not in batch_tokens:
-                                batch_tokens.append(token_id)
-                    try:
-                        candidate_books = books_reader(
-                            tuple(batch_tokens), stop_event=stop_event
-                        )
-                    except Exception:
-                        candidate_books = {}
-                    candidate_evaluation_now = self._now()
-                    for candidate, market_directions in batch_entries:
-                        condition_id = str(candidate.get("condition_id") or "").strip()
                         direction_results: dict[str, dict[str, object]] = {}
                         eligible_directions: list[dict[str, object]] = []
                         qualified_directions: list[dict[str, object]] = []
@@ -3211,7 +3501,7 @@ class PolymarketLPService:
                                 qualified_direction["book"] = deepcopy(dict(book))
                                 evaluated = evaluate_lp_entry(
                                     qualified_direction,
-                                    account=account or {},
+                                    account=evaluation_account or {},
                                     now=candidate_evaluation_now,
                                     reservations=reservations,
                                     candidate=True,
@@ -3337,8 +3627,11 @@ class PolymarketLPService:
                         )
                         round_facts[condition_id] = {
                             "directions": deepcopy(qualified_directions),
-                            "account": deepcopy(dict(account))
-                            if isinstance(account, Mapping)
+                            # The account fact this evaluation actually used,
+                            # so the 60-second maintenance path judges its
+                            # age honestly after a mid-round renewal.
+                            "account": deepcopy(dict(evaluation_account))
+                            if isinstance(evaluation_account, Mapping)
                             else None,
                             "reservations": deepcopy(reservations),
                             "checked_at": checked_at,
