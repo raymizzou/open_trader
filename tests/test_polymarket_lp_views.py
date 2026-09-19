@@ -539,6 +539,45 @@ def test_trial_candidates_assemble_batch_from_normal_and_backup_queues() -> None
     assert mixed["funnel"]["reference_price_unknown"] == 10
 
 
+def test_lp_trial_candidates_exposes_full_consumption_queues() -> None:
+    """S1: the service consumes the full ordered queues, not just the display batch."""
+
+    def normal(market_id: str, pool: str) -> dict[str, object]:
+        return _trial_direction(market_id, pool=pool, latest_midpoint="0.55")
+
+    def stale(market_id: str, pool: str) -> dict[str, object]:
+        direction = normal(market_id, pool)
+        direction["history_summary"]["checked_at"] = NOW - timedelta(hours=2)
+        return direction
+
+    fourteen = [normal(f"M{index:02d}", str(200 - index)) for index in range(1, 15)]
+    backups = [stale("B200", "200"), stale("B300", "300")]
+
+    result = _trial([*fourteen, *backups], competition={})
+
+    # Independent order source: pool 200-i with equal capital means the
+    # assumed upper bound descends with pool, so M01..M14; backups sort by
+    # pool descending: B300 before B200.
+    assert [row["market_id"] for row in result["queue_normal"]] == [
+        f"M{index:02d}" for index in range(1, 15)
+    ]
+    assert [row["market_id"] for row in result["queue_backup"]] == ["B300", "B200"]
+    assert all(row["queue"] == "normal" for row in result["queue_normal"])
+    assert all(row["queue"] == "backup" for row in result["queue_backup"])
+    condition_ids = [row["condition_id"] for row in result["queue_normal"]]
+    assert len(condition_ids) == len(set(condition_ids)) == 14
+
+    # Funnel counts and the ten-slot display batch keep their current meaning.
+    assert result["funnel"]["normal_queue_count"] == 14
+    assert result["funnel"]["backup_queue_count"] == 2
+    assert result["funnel"]["trial"] == 10
+    assert [row["market_id"] for row in result["rows"]] == [
+        "M01", "M02", "M03", "M04", "M05", "M06",
+        "M07", "M08", "M09", "B300",
+    ]
+    assert all(row["verification"] == "pending" for row in result["rows"])
+
+
 def test_trial_candidates_exclude_known_capital_over_available_hard() -> None:
     # Independent arithmetic: quantity = max(1000, 1000) = 1000;
     # capital = 1000 × 0.50 = 500.

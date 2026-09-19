@@ -1914,6 +1914,7 @@ def test_lp_dashboard_account_outage_keeps_newer_public_funnel(tmp_path: Path) -
                     "market_title": f"Market {market_id}",
                     "accepting_orders": True,
                     "metadata_checked_at": now[0],
+                    "fees_checked_at": now[0],
                     "tick_size": Decimal("0.01"),
                     "minimum_order_size": Decimal("20"),
                     "reward_min_size": Decimal("20"),
@@ -2064,7 +2065,11 @@ def test_lp_dashboard_account_outage_keeps_newer_public_funnel(tmp_path: Path) -
     assert first_scan["funnel"]["trial"] == 1
     assert "risk" not in first_scan["funnel"]
     assert [row["market_id"] for row in first_scan["candidates"]] == ["market-A"]
-    assert first_scan["recommendations"] == []
+    # Issue #143: the sole passer is the merged rank one and is the current
+    # recommendation.
+    assert [row["market_id"] for row in first_scan["recommendations"]] == [
+        "market-A"
+    ]
     assert exchange.catalog_reads == 1
     assert exchange.metadata_reads == 1
     assert exchange.book_reads == 1
@@ -2108,7 +2113,9 @@ def test_lp_dashboard_account_outage_keeps_newer_public_funnel(tmp_path: Path) -
     ]
     assert first_dashboard["non_lp_row_count"] == 0
     assert [row["market_id"] for row in first_dashboard["candidates"]] == ["market-A"]
-    assert first_dashboard["recommendations"] == []
+    assert [row["market_id"] for row in first_dashboard["recommendations"]] == [
+        "market-A"
+    ]
     first_account_checked_at = "2026-09-17T01:00:00.000000Z"
 
     now[0] = first_now + timedelta(seconds=10)
@@ -2116,27 +2123,22 @@ def test_lp_dashboard_account_outage_keeps_newer_public_funnel(tmp_path: Path) -
     second_prepared = lp.refresh_price_history()
     assert second_prepared["state"] == "known"
     second_scan = lp.refresh_candidates(force=True)
-    # The account outage must not block the public funnel: the budget facts
-    # are unknown, so no over-available exclusion is applied and the light
-    # candidates still project.
-    assert second_scan["state"] == "ready"
-    assert second_scan["complete"] is True
-    assert second_scan["stale"] is False
-    assert second_scan["selected_market_ids"] == ["market-B", "market-C"]
-    assert second_scan["checked_at"] == "2026-09-17T01:00:10.000000Z"
-    assert second_scan["funnel"]["read"] == 2
-    assert second_scan["funnel"]["base"] == 2
-    assert second_scan["funnel"]["sort"] == 2
-    assert second_scan["funnel"]["trial"] == 2
-    assert second_scan["funnel"]["budget"] == {"available_capital": None}
+    # Issue #143 decision 5: an unusable account fact ends the round before
+    # any batch consumption — zero book reads, zero checked markets, and the
+    # previous round's rows stay published (marked stale).
+    assert second_scan["state"] == "stale"
+    assert second_scan["complete"] is False
+    assert second_scan["selected_market_ids"] == ["market-A"]
+    assert second_scan["checked_at"] == "2026-09-17T01:00:00.000000Z"
+    assert second_scan["funnel"]["stop_reason"] == "account_unavailable"
+    assert second_scan["funnel"]["checked"] == 0
+    assert second_scan["funnel"]["passed"] == 0
+    assert second_scan["funnel"]["batches"] == 0
     assert second_scan["recommendations"] == []
-    assert [row["market_id"] for row in second_scan["candidates"]] == [
-        "market-B",
-        "market-C",
-    ]
+    assert [row["market_id"] for row in second_scan["candidates"]] == ["market-A"]
     assert exchange.catalog_reads == 2
     assert exchange.metadata_reads == 2
-    assert exchange.book_reads == 2
+    assert exchange.book_reads == 1
     assert exchange.history_reads == 0
     assert exchange.account_reads == 3
 
@@ -2158,27 +2160,26 @@ def test_lp_dashboard_account_outage_keeps_newer_public_funnel(tmp_path: Path) -
     assert stale_dashboard["checked_at"] == first_account_checked_at
     assert stale_dashboard["open_orders_complete"] is True
     assert stale_dashboard["positions_complete"] is True
-    assert stale_dashboard["candidate_state"] == "ready"
-    assert stale_dashboard["complete"] is True
-    assert stale_dashboard["candidate_stale"] is False
-    assert stale_dashboard["candidate_checked_at"] == "2026-09-17T01:00:10.000000Z"
-    assert stale_dashboard["selected_market_ids"] == ["market-B", "market-C"]
-    assert stale_dashboard["funnel"]["read"] == 2
-    assert stale_dashboard["funnel"]["base"] == 2
-    assert stale_dashboard["funnel"]["sort"] == 2
-    assert stale_dashboard["funnel"]["trial"] == 2
+    assert stale_dashboard["candidate_state"] == "stale"
+    assert stale_dashboard["complete"] is False
+    assert stale_dashboard["candidate_stale"] is True
+    assert stale_dashboard["candidate_checked_at"] == "2026-09-17T01:00:00.000000Z"
+    assert stale_dashboard["selected_market_ids"] == ["market-A"]
+    assert stale_dashboard["funnel"]["stop_reason"] == "account_unavailable"
+    assert stale_dashboard["funnel"]["read"] == 1
+    assert stale_dashboard["funnel"]["base"] == 1
+    assert stale_dashboard["funnel"]["sort"] == 1
+    assert stale_dashboard["funnel"]["trial"] == 1
     assert stale_dashboard["recommendations"] == []
     assert [row["market_id"] for row in stale_dashboard["candidates"]] == [
-        "market-B",
-        "market-C",
+        "market-A",
     ]
     assert [row["order_id"] for row in stale_dashboard["lp_orders_today"]] == [
         "warm-lp-order"
     ]
     assert stale_dashboard["non_lp_row_count"] == 0
     assert [row["daily_pool_usd"] for row in stale_dashboard["candidates"]] == [
-        "90",
-        "80",
+        "100",
     ]
 
     counters_before_repeated_dashboard = {
@@ -2197,19 +2198,16 @@ def test_lp_dashboard_account_outage_keeps_newer_public_funnel(tmp_path: Path) -
     assert repeated_stale_dashboard["state"] == "stale"
     assert repeated_stale_dashboard["stale"] is True
     assert repeated_stale_dashboard["checked_at"] == first_account_checked_at
-    assert repeated_stale_dashboard["candidate_state"] == "ready"
-    assert repeated_stale_dashboard["complete"] is True
-    assert repeated_stale_dashboard["candidate_stale"] is False
-    assert repeated_stale_dashboard["candidate_checked_at"] == "2026-09-17T01:00:10.000000Z"
-    assert repeated_stale_dashboard["selected_market_ids"] == ["market-B", "market-C"]
-    assert repeated_stale_dashboard["funnel"]["read"] == 2
-    assert repeated_stale_dashboard["funnel"]["base"] == 2
-    assert repeated_stale_dashboard["funnel"]["sort"] == 2
-    assert repeated_stale_dashboard["funnel"]["trial"] == 2
+    assert repeated_stale_dashboard["candidate_state"] == "stale"
+    assert repeated_stale_dashboard["complete"] is False
+    assert repeated_stale_dashboard["candidate_stale"] is True
+    assert repeated_stale_dashboard["candidate_checked_at"] == "2026-09-17T01:00:00.000000Z"
+    assert repeated_stale_dashboard["selected_market_ids"] == ["market-A"]
+    assert repeated_stale_dashboard["funnel"]["stop_reason"] == "account_unavailable"
     assert repeated_stale_dashboard["recommendations"] == []
     assert [
         row["market_id"] for row in repeated_stale_dashboard["candidates"]
-    ] == ["market-B", "market-C"]
+    ] == ["market-A"]
     assert [
         row["order_id"] for row in repeated_stale_dashboard["lp_orders_today"]
     ] == ["warm-lp-order"]
@@ -2246,19 +2244,14 @@ def test_lp_dashboard_account_outage_keeps_newer_public_funnel(tmp_path: Path) -
     assert cold_dashboard["checked_at"] is None
     assert cold_dashboard["open_orders_complete"] is False
     assert cold_dashboard["positions_complete"] is False
-    assert cold_dashboard["candidate_state"] == "ready"
-    assert cold_dashboard["complete"] is True
-    assert cold_dashboard["candidate_stale"] is False
-    assert cold_dashboard["candidate_checked_at"] == "2026-09-17T01:00:10.000000Z"
-    assert cold_dashboard["selected_market_ids"] == ["market-B", "market-C"]
-    assert cold_dashboard["funnel"]["read"] == 2
-    assert cold_dashboard["funnel"]["base"] == 2
-    assert cold_dashboard["funnel"]["sort"] == 2
-    assert cold_dashboard["funnel"]["trial"] == 2
+    assert cold_dashboard["candidate_state"] == "stale"
+    assert cold_dashboard["complete"] is False
+    assert cold_dashboard["candidate_stale"] is True
+    assert cold_dashboard["candidate_checked_at"] == "2026-09-17T01:00:00.000000Z"
+    assert cold_dashboard["selected_market_ids"] == ["market-A"]
     assert cold_dashboard["recommendations"] == []
     assert [row["market_id"] for row in cold_dashboard["candidates"]] == [
-        "market-B",
-        "market-C",
+        "market-A",
     ]
 
 
@@ -5766,10 +5759,14 @@ def test_lp_candidate_preview_rechecks_best_bid_before_confirmation(
     scanned = lp.refresh_candidates(force=True)
     assert scanned["state"] == "ready"
     assert scanned["complete"] is True
-    # The trial-candidate projection lists the market; the risk-selection
-    # pipeline (fresh selected reward/metadata re-reads) retired with it.
-    assert [row["market_id"] for row in scanned["candidates"]] == ["market-1"]
+    # Issue #143: only live-qualified passers are published.  This fixture's
+    # reward receipt is deliberately read 200 seconds in the past, so the
+    # market is accounted unknown (reward freshness) and stays unpublished;
+    # the preview path below re-reads fresh facts directly.
+    assert scanned["candidates"] == []
     assert scanned["recommendations"] == []
+    assert scanned["funnel"]["checked"] == 1
+    assert scanned["funnel"]["unknown"] == 1
     assert public_state["selected_reward_requests"] == []
     execution = PredictionExecutionService(
         store=store,
@@ -5836,7 +5833,9 @@ def test_lp_candidate_preview_rechecks_best_bid_before_confirmation(
         candidate_rows = dashboard["candidates"]
         assert isinstance(candidate_rows, list)
         assert dashboard["complete"] is True
-        assert [row["market_id"] for row in candidate_rows] == ["market-1"]
+        # Issue #143: the scan's reward receipt is stale by design, so no
+        # passer is published; the preview below rechecks fresh facts.
+        assert candidate_rows == []
         assert dashboard["candidate_stale"] is False
         preview_status, preview = candidate_preview(base)
         assert preview_status == 200
@@ -6300,7 +6299,9 @@ def test_lp_trial_preview_uses_same_qualification_and_selected_reads(
             changed["request"]["quantity"]
         ) == Decimal("9.20")
 
-    assert preview_book_batches == [(token_id,)] * 4
+    # Issue #143: each preview re-check reads both token books of the
+    # selected market in one call.
+    assert preview_book_batches == [(token_id, "preview-no")] * 4
     metadata_reads = state["metadata_requests"][initial_metadata_reads:]
     assert metadata_reads == [(condition_id,)] * 4
     reward_reads = state["selected_reward_requests"][initial_reward_reads:]
@@ -6859,6 +6860,7 @@ def test_lp_empty_preparation_clears_previous_selected_results(tmp_path: Path) -
                 "condition_id": condition_id,
                 "market_id": "market-empty-after",
                 "metadata_checked_at": clock["now"],
+                "fees_checked_at": clock["now"],
                 "accepting_orders": True,
                 "tick_size": Decimal("0.01"),
                 "minimum_order_size": Decimal("1"),
@@ -7309,11 +7311,12 @@ def test_lp_recommendations_deduct_active_n_leg_cash_reservation(
         }
     ]
     unknown = service.refresh_candidates(force=True)
-    # An unmapped open buy makes the reserved budget unknown; the funnel
-    # fails open (no over-available exclusion) and stays non-blocking.
-    assert [row["market_id"] for row in unknown["candidates"]] == [
-        "market-condition-lp"
-    ]
+    # An unmapped open buy makes the reserved budget unknown: the funnel
+    # fails open (no over-available exclusion), and the candidate's own
+    # affordability becomes unknown, so no passer is published under
+    # issue #143.
+    assert unknown["candidates"] == []
+    assert unknown["funnel"]["unknown"] == 1
     assert unknown["funnel"]["excluded"]["over_available"] == 0
     assert unknown["funnel"]["budget"] == {"available_capital": None}
     assert state["trade_writes"] == []
@@ -10500,7 +10503,7 @@ def test_lp_candidate_review_time_is_next_beijing_eight(
             return [self.get_market(id="market-1")]
 
         def get_order_book(self, *, token_id: str) -> object:
-            assert token_id == "0x" + "1" * 64
+            assert token_id in ("0x" + "1" * 64, "no-token")
             return {
                 "market": condition_id,
                 "asset_id": token_id,
@@ -10515,8 +10518,10 @@ def test_lp_candidate_review_time_is_next_beijing_eight(
             }
 
         def get_order_books(self, *, token_ids: object) -> list[object]:
-            assert tuple(token_ids) == (token_id,)  # type: ignore[arg-type]
-            return [self.get_order_book(token_id=token_id)]
+            # Issue #143: a candidate preview reads both token books of the
+            # selected market in one call.
+            assert tuple(token_ids) == (token_id, "no-token")  # type: ignore[arg-type]
+            return [self.get_order_book(token_id=str(t)) for t in token_ids]
 
         def close(self) -> None:
             return None
@@ -10704,15 +10709,6 @@ def test_lp_refresh_reads_risk_books_only_for_selected_markets(tmp_path: Path) -
                     "outcomes": {
                         "yes": {"label": "YES", "token_id": f"token-{market_id}"}
                     },
-                    **(
-                        {
-                            "event_id": "event-M01",
-                            "event_ended": True,
-                            "event_finished_at": initial_now - timedelta(hours=2),
-                        }
-                        if market_id == "M01"
-                        else {}
-                    ),
                 }
                 for market_id, condition_id in (
                     (market_id, f"condition-{market_id}") for market_id in markets
@@ -10739,10 +10735,10 @@ def test_lp_refresh_reads_risk_books_only_for_selected_markets(tmp_path: Path) -
         ) -> dict[str, dict[str, object]]:
             now[0] = max(now[0], initial_now) + timedelta(seconds=1)
             self.book_requests.append(tuple(token_ids))
-            # Issue 141: only the batch head is read; any other request set
-            # (extra tokens or out-of-batch tokens) must fail.
-            expected = {f"token-{markets[0]}"}
-            if set(token_ids) != expected:
+            # Issue 143: books are read per ≤10-market batch; any other
+            # request set (extra tokens or out-of-batch tokens) must fail.
+            expected = tuple(f"token-{market_id}" for market_id in markets[:10])
+            if tuple(token_ids) != expected:
                 raise AssertionError("books requested outside trial candidates")
             return {
                 token_id: {
@@ -10804,22 +10800,33 @@ def test_lp_refresh_reads_risk_books_only_for_selected_markets(tmp_path: Path) -
     snapshot = service.refresh_candidates(force=True)
     # Issue 141: books are read only for the batch head (1 token), not for
     # all ten displayed trial candidates.
-    assert [row["market_id"] for row in snapshot["candidates"]] == list(markets[:10])
-    assert exchange.book_requests == [(f"token-{markets[0]}",)]
-    # Direction invariants: exactly the batch head row (markets[0]) is
-    # verified with realtime data; the other nine rows stay pending.
+    # Issue 143: books are read per ≤10-market batch in one call; batch one
+    # covers M01..M10 and its ten passers fill the table (filled stop).
+    assert [row["market_id"] for row in snapshot["candidates"]] == list(
+        markets[:10]
+    )
+    assert exchange.book_requests == [
+        tuple(f"token-{market_id}" for market_id in markets[:10])
+    ]
     candidate_rows = snapshot["candidates"]
     assert len(candidate_rows) == 10
     assert candidate_rows[0]["market_id"] == markets[0]
-    assert candidate_rows[0]["verification"] == "partial"
-    assert "realtime_price" not in candidate_rows[0]
-    assert candidate_rows[0]["directions"]["YES"]["state"] == "unknown"
-    assert all(row["verification"] == "pending" for row in candidate_rows[1:])
-    assert all("realtime_capital" not in row for row in candidate_rows[1:])
+    assert all(row["verification"] == "verified" for row in candidate_rows)
+    assert all("realtime_capital" in row for row in candidate_rows)
     assert snapshot["funnel"]["read"] == 51
     assert snapshot["funnel"]["base"] == 51
     assert snapshot["funnel"]["sort"] == 51
     assert snapshot["funnel"]["trial"] == 10
+    assert snapshot["funnel"]["checked"] == 10
+    assert snapshot["funnel"]["passed"] == 10
+    assert snapshot["funnel"]["rejected"] == 0
+    assert snapshot["funnel"]["unknown"] == 0
+    assert snapshot["funnel"]["unchecked"] == 41
+    assert snapshot["funnel"]["batches"] == 1
+    # The seeded summaries carry no latest_midpoint, so every market queues
+    # as backup (no reference price) — each batch still reads one backup.
+    assert snapshot["funnel"]["backup_read"] == 10
+    assert snapshot["funnel"]["stop_reason"] == "filled"
     assert snapshot["funnel"]["competition_known"] == 0
     assert snapshot["funnel"]["competition_unknown"] == 51
     assert "risk" not in snapshot["funnel"]
@@ -10884,6 +10891,7 @@ def test_lp_refresh_keeps_stale_batches_out_of_current_selection(tmp_path: Path)
                     "condition_id": f"condition-M{index}",
                     "accepting_orders": True,
                     "metadata_checked_at": first_now,
+                    "fees_checked_at": first_now,
                     "tick_size": Decimal("0.01"),
                     "minimum_order_size": Decimal("20"),
                     "reward_min_size": Decimal("20"),
@@ -10979,9 +10987,8 @@ def test_lp_refresh_keeps_stale_batches_out_of_current_selection(tmp_path: Path)
     assert stale["last_success_at"] == first_last_success
     assert stale["recommendations"] == []
     assert stale["selected_market_ids"] == ["M1", "M2"]
-    # Issue 141: books are read only for the batch head (1 token), not for
-    # all displayed trial candidates.
-    assert exchange.book_requests == [("token-M1",)]
+    # Issue 143: both queued markets are read in one batch call.
+    assert exchange.book_requests == [("token-M1", "token-M2")]
 
     # A completed batch replaces the previous selection instead of carrying
     # old markets forward when the catalog changes.
@@ -11039,6 +11046,7 @@ def test_lp_refresh_keeps_stale_batches_out_of_current_selection(tmp_path: Path)
                     "condition_id": f"condition-{market_id}",
                     "accepting_orders": True,
                     "metadata_checked_at": now[0],
+                    "fees_checked_at": now[0],
                     "tick_size": Decimal("0.01"),
                     "minimum_order_size": Decimal("20"),
                     "reward_min_size": Decimal("20"),
@@ -11100,7 +11108,7 @@ def test_lp_refresh_keeps_stale_batches_out_of_current_selection(tmp_path: Path)
     assert [row["market_id"] for row in second_replacement["candidates"]] == ["M3"]
     assert second_replacement["selected_market_ids"] == ["M3"]
     assert replacement_exchange.book_requests == [
-        ("token-M1",),
+        ("token-M1", "token-M2"),
         ("token-M3",),
     ]
 
@@ -11190,6 +11198,7 @@ def test_lp_refresh_keeps_stale_batches_out_of_current_selection(tmp_path: Path)
                     "condition_id": "condition-M4",
                     "accepting_orders": True,
                     "metadata_checked_at": now[0],
+                    "fees_checked_at": now[0],
                     "tick_size": Decimal("0.01"),
                     "minimum_order_size": Decimal("20"),
                     "reward_min_size": Decimal("20"),
@@ -11257,26 +11266,153 @@ def test_lp_refresh_keeps_stale_batches_out_of_current_selection(tmp_path: Path)
 
     partial_exchange.account_failure = True
     partial_failed = partial_service.refresh_candidates(force=True)
-    # Account outage: budget unknown, the light candidate fails open.
-    assert partial_failed["state"] == "incomplete"
+    # Issue #143 decision 5: an account outage ends the round before batch
+    # consumption; the previous passer row stays published (stale).
+    assert partial_failed["state"] == "unknown"
     assert partial_failed["complete"] is False
     assert partial_failed["recommendations"] == []
     assert [row["market_id"] for row in partial_failed["candidates"]] == ["M4"]
+    assert partial_failed["funnel"]["stop_reason"] == "account_unavailable"
+    assert partial_failed["funnel"]["checked"] == 0
     assert partial_failed["funnel"]["trial"] == 1
-    assert partial_failed["funnel"]["budget"] == {"available_capital": None}
 
     partial_exchange.account_failure = False
     partial_exchange.book_failure = True
     partial_books_failed = partial_service.refresh_candidates(force=True)
-    # Books outage: the candidate stays with its reference capital only.
+    # Books outage: the market cannot be live-qualified, so it is accounted
+    # unknown with a book reason and stays unpublished (issue #143).
     assert partial_books_failed["state"] == "incomplete"
     assert partial_books_failed["funnel"]["read"] == 1
     assert partial_books_failed["funnel"]["base"] == 1
     assert partial_books_failed["funnel"]["sort"] == 1
-    assert partial_books_failed["funnel"]["trial"] == 1
+    # Passers-only counting (issue #143 review repair): nothing passed the
+    # batch check, so the trial stage reports 0 and agrees with the empty
+    # table and the zero progress-line passer count.
+    assert partial_books_failed["funnel"]["trial"] == 0
+    assert partial_books_failed["funnel"]["checked"] == 1
+    assert partial_books_failed["funnel"]["unknown"] == 1
     assert partial_books_failed["recommendations"] == []
-    assert [row["market_id"] for row in partial_books_failed["candidates"]] == ["M4"]
-    assert "realtime_capital" not in partial_books_failed["candidates"][0]
+    assert partial_books_failed["candidates"] == []
+    unknown_codes = [
+        row["code"] for row in partial_books_failed["funnel"]["reasons"]["trial"]
+    ]
+    assert unknown_codes.count("book_unknown") == 1
+
+
+def test_lp_candidate_refresh_api_shares_round_and_preview_counts_separately(
+    tmp_path: Path,
+) -> None:
+    """S8: the refresh endpoint only wakes the shared round; a preview reads
+    only the selected market's two tokens, separate from scan counting, and
+    never swaps the confirmed request identity for the recommendation."""
+    from tests.test_polymarket_lp import (
+        _LPBatchQueryExchange,
+        _seed_stale_backup_summaries,
+    )
+
+    class PreviewExchange(_LPBatchQueryExchange):
+        def lp_market_metadata_fresh(self, condition_ids, *, stop_event=None):
+            return self.lp_market_metadata(condition_ids, stop_event=stop_event)
+
+    now = datetime(2026, 9, 19, 12, tzinfo=UTC)
+    pools = {"P1": Decimal(400), "P2": Decimal(300)}
+    exchange = PreviewExchange(now, pools)
+    store = PredictionArbitrageStore(tmp_path)
+    lp = PolymarketLPService(store, exchange, clock=lambda: now)
+    assert lp.refresh_price_history()["state"] in {"known", "partial"}
+    scan = lp.refresh_candidates(force=True)
+    reads_after_scan = len(exchange.book_token_reads)
+    scan_checked = scan["funnel"]["checked"]
+
+    class Execution:
+        dashboard_reads = 0
+
+        def lp_dashboard(self) -> dict[str, object]:
+            Execution.dashboard_reads += 1
+            return {
+                "state": "ready",
+                "stale": False,
+                "complete": True,
+                "candidates": scan["candidates"],
+                "recommendations": scan["recommendations"],
+                "selected_results": scan["selected_results"],
+                "funnel": scan["funnel"],
+                "orders": [],
+                "positions": [],
+            }
+
+        def lp_candidate_preview(
+            self, payload: Mapping[str, object]
+        ) -> dict[str, object]:
+            return lp.preview_candidate(payload)
+
+    class Runtime:
+        mode = "production"
+        state = "RUNNING"
+        production_owner = True
+
+        def __init__(self) -> None:
+            self.execution = Execution()
+            self.refresh_requests = 0
+
+        def queue_lp_candidate_refresh(self) -> bool:
+            self.refresh_requests += 1
+            return True
+
+    runtime = Runtime()
+    refresh_path = "/api/prediction-arbitrage/lp/candidates/refresh"
+    preview_path = "/api/prediction-arbitrage/lp/candidates/preview"
+    with _running_server(
+        runtime,
+        session_token="session-token",
+        csrf_token="csrf-token",
+        runtime_metadata={"git_sha": "abc123"},
+    ) as (base, _server_instance):
+        status, queued = _response(_production_request(base, refresh_path, b"{}"))
+        assert status == 202
+        assert queued == {"state": "queued"}
+        assert runtime.refresh_requests == 1
+
+        # Page reads are served from the cached projection: repeated dashboards
+        # never amplify into external candidate reads.
+        for _ in range(3):
+            dashboard_status, _dashboard = _response(
+                base + "/api/prediction-arbitrage/lp/dashboard"
+            )
+            assert dashboard_status == 200
+        assert Execution.dashboard_reads == 3
+        assert len(exchange.book_token_reads) == reads_after_scan
+
+        # A preview re-checks only the requested market (both of its token
+        # books in one read) and keeps the confirmed identity even though the
+        # scan's current recommendation points elsewhere.
+        preview_payload = {
+            "market_id": "market-P2",
+            "condition_id": "condition-P2",
+            "token_id": "token-condition-P2-no",
+            "outcome": "NO",
+        }
+        status, previewed = _response(
+            _production_request(
+                base, preview_path, json.dumps(preview_payload).encode("utf-8")
+            )
+        )
+        assert status == 200
+        assert previewed["state"] == "previewed"
+        request = previewed["request"]
+        assert request["condition_id"] == "condition-P2"
+        assert request["token_id"] == "token-condition-P2-no"
+        assert request["outcome"] == "NO"
+        new_reads = exchange.book_token_reads[reads_after_scan:]
+        assert len(new_reads) == 1
+        assert set(new_reads[0]) == {
+            "token-condition-P2-yes",
+            "token-condition-P2-no",
+        }
+        # Preview reads never touch the scan's progress accounting.
+        current_snapshot = lp.candidate_snapshot()
+        assert current_snapshot["funnel"]["checked"] == scan_checked
+        assert runtime.refresh_requests == 1
 
 
 def test_lp_candidate_snapshot_marks_minute_stale_without_refreshing(
@@ -11785,6 +11921,7 @@ def test_lp_history_progress_does_not_block_ready_candidates(tmp_path: Path) -> 
             "taker_fee_rate": Decimal("0"),
             "fee_exponent": Decimal("1"),
             "metadata_checked_at": now,
+            "fees_checked_at": now,
             "outcomes": {"yes": {"label": "YES", "token_id": token_id}},
         }
 
@@ -11871,7 +12008,12 @@ def test_lp_history_progress_does_not_block_ready_candidates(tmp_path: Path) -> 
                     ),
                     "token_id": token_id,
                     "received_at": now,
-                    "bids": [{"price": Decimal("0.50"), "size": Decimal("100")}],
+                    # Exit-liquidity rule: the stress exit needs depth beyond
+                    # the top bid level.
+                    "bids": [
+                        {"price": Decimal("0.50"), "size": Decimal("20")},
+                        {"price": Decimal("0.49"), "size": Decimal("100")},
+                    ],
                     "asks": [{"price": Decimal("0.52"), "size": Decimal("100")}],
                 }
                 for token_id in token_ids

@@ -1846,9 +1846,122 @@ def test_lp_dashboard_refresh_cannot_block_risk_monitor(
             "_LP_REWARD_STOP_GRACE_SECONDS",
             normal_reward_grace,
         )
-        if second.state not in {"STOPPED", "NEW"}:
-            second.stop()
+    if second.state not in {"STOPPED", "NEW"}:
+        second.stop()
     assert probe_holder[0].active == 0
+
+
+def test_candidate_monitor_scan_cadence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S6: the candidate loop forces only the first round and manual wakes.
+
+    Ordinary 60-second wakes call refresh_candidates(force=False); the
+    service-level 300-second scan window turns those into snapshot reads.
+    Only queue_lp_candidate_refresh() (a manual page refresh) requests a
+    forced new round.
+    """
+    import open_trader.prediction_runtime as runtime_module
+
+    class StubLP:
+        def __init__(self, _store, _exchange, owner_lock=None) -> None:
+            del owner_lock
+            self.calls: list[bool] = []
+
+        def refresh_candidates(
+            self, *, stop_event=None, force: bool = False
+        ) -> dict[str, object]:
+            del stop_event
+            self.calls.append(force)
+            return {"state": "ready", "scanning": False}
+
+        def refresh_candidate_recommendations(
+            self, *, stop_event=None
+        ) -> dict[str, object]:
+            del stop_event
+            return {"state": "ready"}
+
+        def candidate_maintenance_wait_seconds(self) -> float:
+            return 0.01
+
+        def refresh_rewards(self, *, stop_event=None) -> dict[str, object]:
+            del stop_event
+            return {"state": "none"}
+
+    class FakeTrading:
+        config = SimpleNamespace(
+            signer_address="0x" + "1" * 40,
+            wallet_address="0x" + "2" * 40,
+        )
+
+    class FakeMonitor:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def stop(self) -> None:
+            return None
+
+    class FakeExecution:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def reconcile_startup(self) -> dict[str, object]:
+            return {"state": "ready"}
+
+        def lp_tick(self) -> dict[str, object]:
+            return {"state": "none"}
+
+        def set_cross_venue_monitor(self, _monitor: object) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        runtime_module,
+        "PolymarketTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: FakeTrading()),
+    )
+    monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor)
+    monkeypatch.setattr(runtime_module, "PredictionExecutionService", FakeExecution)
+    monkeypatch.setattr(runtime_module, "load_trading_config", lambda _path: FakeTrading.config)
+    monkeypatch.setattr(runtime_module, "PolymarketLPService", StubLP)
+
+    runtime = PredictionRuntime(
+        data_dir=tmp_path,
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+        mode="production",
+        n_leg_paused=True,
+        enable_n_leg_background=False,
+    )
+    runtime.start()
+    try:
+        assert runtime.lp is not None
+        deadline = time.monotonic() + 5
+        while len(runtime.lp.calls) < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        calls = runtime.lp.calls
+        assert calls[0] is True
+        # Ordinary wakes never force a new scan round.
+        assert calls[1] is False
+        assert calls[2] is False
+
+        assert runtime.queue_lp_candidate_refresh() is True
+        deadline = time.monotonic() + 5
+        while True not in calls[3:] and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert True in calls[3:]
+        forced_index = 3 + calls[3:].index(True)
+        # The wake after the manual forced round is ordinary again.
+        deadline = time.monotonic() + 5
+        while len(calls) < forced_index + 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+            calls = runtime.lp.calls
+        assert calls[forced_index + 1] is False
+    finally:
+        runtime.stop()
+    assert runtime.state == "STOPPED"
 
 
 def test_lp_trial_maintenance_runs_without_page_and_stops(
@@ -2110,6 +2223,13 @@ def test_lp_trial_maintenance_runs_without_page_and_stops(
         else:
             raise AssertionError("initial candidate recommendation was not published")
         assert len(book_calls) == 1
+        # The initial scan reads the whole two-market batch (both outcomes)
+        # in one call.
+        assert set(book_calls[0]) == {
+            markets[condition_id][f"{outcome}_token"]
+            for condition_id in condition_ids
+            for outcome in ("yes", "no")
+        }
         # The published book is 59 seconds old; advancing the source clock by
         # two seconds must wake maintenance before the ordinary 60-second
         # candidate wait expires.
@@ -2120,7 +2240,8 @@ def test_lp_trial_maintenance_runs_without_page_and_stops(
             markets[condition_ids[0]]["yes_token"],
             markets[condition_ids[0]]["no_token"],
         }
-        assert all(set(batch) == expected_head for batch in book_calls)
+        # Maintenance refreshes only the merged rank-one market's books.
+        assert set(book_calls[1]) == expected_head
         assert risk_tick_seen.wait(timeout=2)
     finally:
         runtime.stop()
@@ -5450,6 +5571,7 @@ def test_lp_partial_preparation_uses_item_retry_deadline(
                 "taker_fee_rate": Decimal("0"),
                 "fee_exponent": Decimal("1"),
                 "metadata_checked_at": clock[0],
+                "fees_checked_at": clock[0],
                 "outcomes": {
                     "yes": {
                         "label": "YES",
@@ -5697,14 +5819,15 @@ def test_lp_partial_preparation_uses_item_retry_deadline(
                 break
             time.sleep(0.01)
             snapshot = runtime.lp.refresh_candidates(force=True)  # type: ignore[union-attr]
-        assert any(
-            row["condition_id"] == "condition-a"
-            for row in snapshot["candidates"]
-        ), snapshot
-        assert all(
-            row["condition_id"] != "condition-b"
-            for row in snapshot["candidates"]
-        )
+        # Issue #143: only live-qualified passers are published.  After the
+        # 300-second history wait the cached metadata is older than the
+        # 60-second candidate freshness window, so market-a is accounted
+        # unknown (market_metadata_stale) and no row is published.
+        assert snapshot.get("scanning") is not True
+        assert snapshot["funnel"]["checked"] == 1
+        assert snapshot["funnel"]["unknown"] == 1
+        assert snapshot["funnel"]["batches"] == 1
+        assert snapshot["candidates"] == []
 
         release_299.set()
         assert retry_history_done.wait(timeout=2)
@@ -7046,6 +7169,11 @@ def test_lp_minute_risk_does_not_wait_for_hourly_catalog_preparation(
                 "condition_id": "condition-A",
                 "reward_date": now[0].date().isoformat(),
                 "review_at": "2099-01-01T00:00:00Z",
+                # A priced session keeps its capital reservation computable;
+                # an unpriced reservation makes every candidate evaluation
+                # honestly unknown (account_facts_unknown).
+                "price": Decimal("0.50"),
+                "quantity": Decimal("20"),
             },
         )
         assert catalog_blocked.wait(timeout=2)

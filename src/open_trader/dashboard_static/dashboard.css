@@ -6578,6 +6578,9 @@ button { cursor: pointer; }
 .pm-lp-group-total.over strong { color: var(--warning-text); }
 .pm-lp-order-table tbody tr:hover td, .pm-lp-candidate-table tbody tr:hover td { background: #faf7f0; }
 .pm-lp-unknown { color: var(--muted); }
+.pm-lp-scan-progress { background: #f2eee7; border: 1px solid var(--line); border-radius: 7px; color: var(--muted); font-size: 12px; margin: 10px 0; padding: 8px 11px; }
+.pm-lp-scan-progress span[title] { color: var(--text); }
+.pm-lp-candidate-row-expired td { opacity: 0.55; }
 .pm-lp-candidate-table td[data-label="操作"] > div { display: grid; gap: 4px; }
 .pm-lp-candidate-table select.pm-button { max-width: 100%; min-width: 0; }
 .pm-funnel-meta { align-items: center; border-top: 1px solid var(--line); color: var(--muted); display: flex; flex-wrap: wrap; font-size: 11px; gap: 8px 14px; padding: 9px 14px; }

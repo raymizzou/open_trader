@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import ast
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
+
+import threading
 
 import pytest
 from polymarket.models.clob.account import ClobTrade, MakerOrder, OpenOrder
@@ -21,6 +25,7 @@ from polymarket.models.gamma.market import (
     MarketTrading,
 )
 
+from open_trader import polymarket_lp
 from open_trader.polymarket_lp import PolymarketLPService
 from open_trader.polymarket_trading import PolymarketTradingClient, TradingConfig
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
@@ -3048,13 +3053,14 @@ def test_refresh_candidates_projects_trial_funnel_without_risk(tmp_path) -> None
 
 
 def test_refresh_candidates_drops_rows_whose_realtime_capital_over_available(tmp_path) -> None:
-    """The candidate risk gate rejects a queue head over available funds.
+    """A market whose live capital exceeds available funds is not displayed.
 
-    Issue 141: only the batch head carries realtime values, so the dropped
-    row must be the queue head.  Reference capital 20 × 0.505 = 10.100 fits
-    the 11 available, so market A forms the normal queue and its head row's
-    live book is read; the realtime bid 0.60 lifts capital to 12.00 which
-    exceeds available, so the head is dropped and counted after enrichment.
+    Issue 143: only live-qualified passers are published, so a head rejected
+    at the risk gate for exceeding the reserved available capital stays out
+    of the table entirely (counted in the scan funnel instead).  Reference
+    capital 20 × 0.505 = 10.100 fits the 11 available, so market A forms the
+    normal queue and its live book is read; the realtime bid 0.60 lifts
+    capital to 12.00 which exceeds available, so the gate rejects it.
     condition-Z (reference capital 2525) never enters a queue.
     """
 
@@ -3190,23 +3196,32 @@ def test_refresh_candidates_drops_rows_whose_realtime_capital_over_available(tmp
     snapshot = lp.refresh_candidates(force=True)
 
     assert snapshot["state"] == "ready"
-    # Only the queue head's live book was read (one call, one token).
+    # The rejected market's live book was read once and never retried.
     assert exchange.book_token_reads == (("token-condition-A",),)
     funnel = snapshot["funnel"]
     # condition-Z exceeds available at the reference stage and enters no
-    # queue; the candidate risk gate itself rejects the head before the
-    # post-qualification realtime-capital projection can drop it.
+    # queue; market A is checked, rejected by the risk gate, and therefore
+    # not published at all under the passers-only table.
     assert funnel["excluded"]["over_available"] == 1
     assert funnel["normal_queue_count"] == 1
     assert funnel["backup_queue_count"] == 0
     assert funnel["reference_price_unknown"] == 0
-    assert funnel["trial"] == 1
-    assert [row["market_id"] for row in snapshot["candidates"]] == ["market-A"]
-    assert snapshot["candidates"][0]["state"] == "rejected"
+    # Passers-only publication: the trial stage counts published passers,
+    # so a round whose only market was rejected reports 0, matching the
+    # empty table and the progress line.
+    assert funnel["trial"] == 0
+    assert funnel["stop_reason"] == "queue_exhausted"
+    assert funnel["checked"] == 1
+    assert funnel["passed"] == 0
+    assert funnel["rejected"] == 1
+    assert funnel["unknown"] == 0
+    assert funnel["unchecked"] == 0
+    assert snapshot["candidates"] == []
     assert snapshot["recommendations"] == []
-    assert snapshot["selected_market_ids"] == ["market-A"]
+    assert snapshot["selected_results"] == []
+    assert snapshot["selected_market_ids"] == []
     assert funnel["gap_reason"] is not None
-    assert "本轮 1 个" in funnel["gap_reason"]
+    assert "本轮通过 0 个" in funnel["gap_reason"]
 
 
 class _LPCandidateQueryExchange:
@@ -3365,8 +3380,13 @@ class _LPCandidateQueryExchange:
         }
 
 
-def test_refresh_candidates_reads_live_book_only_for_batch_head(tmp_path) -> None:
-    """B1: with ≥10 qualifying markets only the batch head's token is read."""
+def test_batch_refresh_reads_books_per_batch_of_ten_markets(tmp_path) -> None:
+    """Issue 143: with 12 qualifying markets the scan runs two batches.
+
+    Batch one reads ten markets (20 tokens) in one call; batch two reads the
+    remaining two (4 tokens); no token is requested twice; the merged table
+    keeps the best ten live-qualified passers.
+    """
 
     now = datetime(2026, 9, 17, 3, tzinfo=UTC)
     exchange = _LPCandidateQueryExchange(
@@ -3385,20 +3405,784 @@ def test_refresh_candidates_reads_live_book_only_for_batch_head(tmp_path) -> Non
     assert len(candidates) == 10
     head = candidates[0]
     assert head["market_id"] == "market-M01"
-    # Exactly one live read, one token: the batch head's.
-    assert exchange.book_token_reads == (("token-condition-M01",),)
     assert head["verification"] == "verified"
     assert "realtime_price" in head
     assert "realtime_capital" in head
-    for row in candidates[1:]:
-        assert row["verification"] == "pending"
-        assert "realtime_price" not in row
-        assert "realtime_capital" not in row
+    for row in candidates:
+        assert row["verification"] == "verified"
+        assert "realtime_price" in row
+        assert "realtime_capital" in row
+    # Ten passers end the round after one batch; the remaining two queued
+    # markets stay unchecked (they are not worse than the shown ten).
+    assert len(exchange.book_token_reads) == 1
+    first = exchange.book_token_reads[0]
+    # Single-outcome fixture: one token per market, one call per batch.
+    assert len(first) == 10
     funnel = snapshot["funnel"]
+    assert funnel["stop_reason"] == "filled"
+    assert funnel["checked"] == 10
+    assert funnel["passed"] == 10
+    assert funnel["rejected"] == 0
+    assert funnel["unknown"] == 0
+    assert funnel["unchecked"] == 2
+    assert funnel["batches"] == 1
+    assert funnel["backup_read"] == 0
     assert funnel["trial"] == 10
     assert funnel["normal_queue_count"] == 12
     assert funnel["backup_queue_count"] == 0
     assert funnel["reference_price_unknown"] == 0
+
+
+class _LPBatchQueryExchange(_LPCandidateQueryExchange):
+    """Two-outcome batch fixture for the issue-143 batch backfill scans.
+
+    Extends the query-queue exchange with YES/NO token pairs.  `backup`
+    suffixes get an unknown history summary (no reference price, so the
+    market queues as backup); `reject` suffixes get an off-tick live book so
+    both directions reject at the candidate risk gate; `omit` token ids are
+    left out of the book response entirely.
+    """
+
+    def __init__(
+        self,
+        now: datetime,
+        pools: dict[str, Decimal],
+        *,
+        backup: frozenset[str] = frozenset(),
+        reject: frozenset[str] = frozenset(),
+        omit_tokens: frozenset[str] = frozenset(),
+        bid_by_suffix: dict[str, Decimal] | None = None,
+        available: str = "1000",
+    ) -> None:
+        super().__init__(now, pools, available=available)
+        self.backup = backup
+        self.reject = reject
+        self.omit_tokens = omit_tokens
+        self.bid_by_suffix = bid_by_suffix or {}
+
+    @staticmethod
+    def _suffix(token_id: str) -> str:
+        return token_id.removeprefix("token-condition-").rsplit("-", 1)[0]
+
+    def lp_market_metadata(self, condition_ids, *, stop_event=None):
+        del stop_event
+        return {
+            condition_id: {
+                "market_id": f"market-{condition_id.removeprefix('condition-')}",
+                "condition_id": condition_id,
+                "market_title": f"Market {condition_id}",
+                "market_url": f"https://polymarket.com/event/{condition_id}",
+                "accepting_orders": True,
+                "exchange_type": "CLOB",
+                "metadata_checked_at": self.now,
+                "fees_checked_at": self.now,
+                "tick_size": Decimal("0.01"),
+                "minimum_order_size": Decimal("20"),
+                "reward_min_size": Decimal("20"),
+                "reward_max_spread": Decimal("0.10"),
+                "fees_enabled": False,
+                "taker_fee_rate": Decimal("0"),
+                "fee_exponent": Decimal("1"),
+                "fee": Decimal("0"),
+                "outcomes": {
+                    "yes": {
+                        "label": "YES",
+                        "token_id": f"token-{condition_id}-yes",
+                    },
+                    "no": {
+                        "label": "NO",
+                        "token_id": f"token-{condition_id}-no",
+                    },
+                },
+            }
+            for condition_id in condition_ids
+        }
+
+    def lp_price_history(
+        self, token_ids, *, start_ts, end_ts, fidelity=1, stop_event=None
+    ):
+        del fidelity, stop_event
+        history = {}
+        unknown = []
+        for token_id in tuple(token_ids):
+            if self._suffix(token_id) in self.backup:
+                unknown.append(token_id)
+                continue
+            history[token_id] = [
+                {"t": start_ts, "p": "0.500"},
+                {"t": end_ts, "p": "0.505"},
+            ]
+        return {"state": "known", "history": history, "unknown_token_ids": unknown}
+
+    def lp_order_books(self, token_ids, *, stop_event=None):
+        del stop_event
+        self.book_token_reads = (*self.book_token_reads, tuple(token_ids))
+        books = {}
+        for token_id in tuple(token_ids):
+            if token_id in self.omit_tokens:
+                continue
+            suffix = self._suffix(token_id)
+            if suffix in self.reject:
+                best = Decimal("0.345")
+            elif suffix in self.bid_by_suffix:
+                best = self.bid_by_suffix[suffix]
+            else:
+                best = Decimal("0.34")
+            books[token_id] = {
+                "condition_id": token_id.removeprefix("token-").rsplit("-", 1)[0],
+                "token_id": token_id,
+                "received_at": self.now,
+                "bids": [
+                    {"price": best, "size": Decimal("100")},
+                    {"price": best - Decimal("0.01"), "size": Decimal("100")},
+                ],
+                "asks": [{"price": best + Decimal("0.02"), "size": Decimal("100")}],
+            }
+        return books
+
+
+def _batch_pools() -> dict[str, Decimal]:
+    pools = {
+        f"N{index:02d}": Decimal(500 - index) for index in range(1, 19)
+    }
+    pools["B1"] = Decimal(400)
+    pools["B2"] = Decimal(300)
+    return pools
+
+
+def _seed_stale_backup_summaries(
+    store: PredictionArbitrageStore,
+    now: datetime,
+    suffixes: tuple[str, ...],
+) -> None:
+    """Pre-seed known summaries whose reference price is older than 1h.
+
+    The batch exchange answers history reads for backup tokens with
+    "unknown", so the refresh keeps these prior summaries: base facts stay
+    valid (amplitude known, window valid) while the reference price is
+    stale, which is exactly the backup-queue definition.
+    """
+
+    checked_at = now - timedelta(hours=2)
+    store.lp_save_price_history_batch(
+        [
+            {
+                "condition_id": f"condition-{suffix}",
+                "token_id": f"token-condition-{suffix}-yes",
+                "samples": [
+                    {
+                        "t": int((checked_at - timedelta(hours=1)).timestamp()),
+                        "p": "0.300",
+                    },
+                    {
+                        "t": int(checked_at.timestamp()),
+                        "p": "0.305",
+                    },
+                ],
+                "summary": {
+                    "state": "known",
+                    "amplitude": Decimal("0.005"),
+                    "checked_at": checked_at,
+                    "window_start": checked_at - timedelta(hours=22),
+                    "window_end": checked_at,
+                    "sample_count": 2,
+                    "latest_midpoint": Decimal("0.305"),
+                    "valid_until": now + timedelta(hours=22),
+                },
+            }
+            for suffix in suffixes
+        ]
+    )
+
+
+def test_batch_refresh_backfills_until_ten_passed(tmp_path) -> None:
+    """S2 acceptance case 1: 3 pass in batch one, batches backfill to ten."""
+    now = datetime(2026, 9, 19, 6, tzinfo=UTC)
+    exchange = _LPBatchQueryExchange(
+        now,
+        _batch_pools(),
+        backup=frozenset({"B1", "B2"}),
+        reject=frozenset({
+            "N04", "N05", "N06", "N07", "N08", "N09", "N17", "N18", "B1", "B2",
+        }),
+    )
+    store = PredictionArbitrageStore(tmp_path)
+    _seed_stale_backup_summaries(store, now, ("B1", "B2"))
+    lp = PolymarketLPService(store, exchange, clock=lambda: now)
+    # Backup markets keep their stale summaries, so preparation reports
+    # partial; the scan proceeds and treats those markets as backup rows.
+    assert lp.refresh_price_history()["state"] in {"known", "partial"}
+
+    snapshot = lp.refresh_candidates(force=True)
+
+    assert snapshot["state"] == "ready"
+    # Two batches of ten markets each: 9 normal + 1 backup, 20 tokens per
+    # call, no token read twice.
+    assert len(exchange.book_token_reads) == 2
+    first, second = exchange.book_token_reads
+    assert len(first) == len(second) == 20
+    assert len(set(first) | set(second)) == 40
+    first_markets = {
+        token.removeprefix("token-").rsplit("-", 1)[0] for token in first
+    }
+    second_markets = {
+        token.removeprefix("token-").rsplit("-", 1)[0] for token in second
+    }
+    assert first_markets == {
+        *{f"condition-N{index:02d}" for index in range(1, 10)},
+        "condition-B1",
+    }
+    assert second_markets == {
+        *{f"condition-N{index:02d}" for index in range(10, 19)},
+        "condition-B2",
+    }
+    funnel = snapshot["funnel"]
+    assert funnel["stop_reason"] == "filled"
+    assert funnel["checked"] == 20
+    assert funnel["passed"] == 10
+    assert funnel["rejected"] == 10
+    assert funnel["unknown"] == 0
+    assert funnel["unchecked"] == 0
+    assert funnel["batches"] == 2
+    assert funnel["backup_read"] == 2
+    candidates = snapshot["candidates"]
+    assert len(candidates) == 10
+    passed_markets = {
+        "market-N01", "market-N02", "market-N03",
+        *{f"market-N{index:02d}" for index in range(10, 17)},
+    }
+    assert {row["market_id"] for row in candidates} == passed_markets
+    # Every published row is a live-qualified passer.
+    for row in candidates:
+        assert row["selected_direction"] is not None
+        assert "realtime_capital" in row
+        assert row["state"] == "eligible"
+        assert row["verification"] == "verified"
+    # Equal actual capital (20 × 0.34 = 6.80): the highest pool among the
+    # passers (N01, pool 499) yields the highest optimistic upper bound.
+    assert candidates[0]["market_id"] == "market-N01"
+    assert snapshot["recommendations"][0]["market_id"] == "market-N01"
+    assert snapshot["selected_results"][0]["market_id"] == "market-N01"
+    assert snapshot["selected_market_ids"] == [
+        row["market_id"] for row in candidates
+    ]
+
+
+def test_batch_refresh_stops_at_fifty_markets_checked(tmp_path) -> None:
+    """S3 acceptance case 2: only four pass, the round budget stops at 50."""
+    now = datetime(2026, 9, 19, 7, tzinfo=UTC)
+    pools = {f"N{index:02d}": Decimal(600 - index) for index in range(1, 61)}
+    exchange = _LPBatchQueryExchange(
+        now,
+        pools,
+        reject=frozenset({f"N{index:02d}" for index in range(5, 61)}),
+    )
+    lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: now
+    )
+    assert lp.refresh_price_history()["state"] == "known"
+
+    snapshot = lp.refresh_candidates(force=True)
+
+    assert snapshot["state"] == "ready"
+    funnel = snapshot["funnel"]
+    assert funnel["stop_reason"] == "checked_limit"
+    assert funnel["checked"] == 50
+    assert funnel["passed"] == 4
+    assert funnel["rejected"] == 46
+    assert funnel["unknown"] == 0
+    assert funnel["unchecked"] == 60 - 50
+    assert funnel["batches"] == 5
+    assert funnel["backup_read"] == 0
+    # Binary markets: 50 markets × 2 tokens = 100 first-read tokens, each
+    # requested exactly once across five ≤20-token batch calls.
+    all_tokens = [token for batch in exchange.book_token_reads for token in batch]
+    assert len(exchange.book_token_reads) == 5
+    assert len(all_tokens) == 100
+    assert len(set(all_tokens)) == 100
+    candidates = snapshot["candidates"]
+    assert [row["market_id"] for row in candidates] == [
+        "market-N01", "market-N02", "market-N03", "market-N04",
+    ]
+    assert all(row["selected_direction"] is not None for row in candidates)
+    assert snapshot["recommendations"][0]["market_id"] == "market-N01"
+
+
+def test_batch_refresh_isolates_missing_books_and_reads_backup_once(tmp_path) -> None:
+    """S4: a batch's missing books isolate to unknown, backups read once."""
+    now = datetime(2026, 9, 19, 8, tzinfo=UTC)
+    pools = {f"N{index:02d}": Decimal(500 - index) for index in range(1, 12)}
+    pools["B1"] = Decimal(400)
+    pools["B2"] = Decimal(300)
+    exchange = _LPBatchQueryExchange(
+        now,
+        pools,
+        backup=frozenset({"B1", "B2"}),
+        omit_tokens=frozenset({
+            "token-condition-B1-yes",
+            "token-condition-B1-no",
+        }),
+    )
+    store = PredictionArbitrageStore(tmp_path)
+    _seed_stale_backup_summaries(store, now, ("B1", "B2"))
+    lp = PolymarketLPService(store, exchange, clock=lambda: now)
+    assert lp.refresh_price_history()["state"] in {"known", "partial"}
+
+    snapshot = lp.refresh_candidates(force=True)
+
+    assert snapshot["state"] == "ready"
+    # Batch one: N01..N09 + B1 (its two books are missing from the response).
+    # Batch two: N10, N11 + B2, all passing and ending the round with ten
+    # merged passers.
+    assert len(exchange.book_token_reads) == 2
+    missing = {"token-condition-B1-yes", "token-condition-B1-no"}
+    # Each missing token was requested exactly once and never retried.
+    for token in missing:
+        reads = sum(batch.count(token) for batch in exchange.book_token_reads)
+        assert reads == 1
+    # The backup markets were each read in exactly one batch call.
+    for suffix in ("B1", "B2"):
+        batches_with_backup = [
+            batch
+            for batch in exchange.book_token_reads
+            if any(f"condition-{suffix}-" in token for token in batch)
+        ]
+        assert len(batches_with_backup) == 1
+    funnel = snapshot["funnel"]
+    assert funnel["stop_reason"] == "filled"
+    assert funnel["checked"] == 13
+    assert funnel["passed"] == 12
+    assert funnel["rejected"] == 0
+    assert funnel["unknown"] == 1
+    assert funnel["backup_read"] == 2
+    unknown_reasons = [
+        row for row in funnel["reasons"]["trial"]
+        if row.get("condition_id") == "condition-B1"
+    ]
+    assert unknown_reasons
+    assert all(row.get("code") == "book_unknown" for row in unknown_reasons)
+    candidates = snapshot["candidates"]
+    assert len(candidates) == 10
+    assert all(row["state"] == "eligible" for row in candidates)
+    assert "market-B1" not in {row["market_id"] for row in candidates}
+
+
+def test_batch_scan_funnel_trial_counts_published_passers(tmp_path) -> None:
+    """Reviewer fix 5: after a batch scan the funnel's trial stage counts the
+    published passers, not the ≤10 view preview batch, so the funnel, the
+    scan progress line, and the table agree."""
+    now = datetime(2026, 9, 19, 10, tzinfo=UTC)
+    pools = {f"N{index:02d}": Decimal(500 - index) for index in range(1, 13)}
+    exchange = _LPBatchQueryExchange(
+        now,
+        pools,
+        reject=frozenset({"N03", "N07", "N08", "N12"}),
+    )
+    store = PredictionArbitrageStore(tmp_path)
+    lp = PolymarketLPService(store, exchange, clock=lambda: now)
+    assert lp.refresh_price_history()["state"] == "known"
+
+    snapshot = lp.refresh_candidates(force=True)
+
+    funnel = snapshot["funnel"]
+    candidates = snapshot["candidates"]
+    # 12 kept markets: the view preview batch is capped at 10, but only 8
+    # markets pass the live batch check (4 reject off-tick) and only passers
+    # are published under the passers-only table.
+    assert funnel["checked"] == 12
+    assert funnel["passed"] == 8
+    assert len(candidates) == 8
+    assert all(row["state"] == "eligible" for row in candidates)
+    # Funnel, progress line, and table agree on the trial stage.
+    assert funnel["trial"] == 8
+    assert funnel["trial"] == len(candidates)
+
+
+def test_candidate_qualification_facts_writes_hold_state_lock() -> None:
+    """Reviewer fix 2 (lock discipline): every in-place subscript write to
+    `_candidate_qualification_facts` sits inside a
+    `with self._candidate_state_lock` block, so a concurrent
+    `candidate_snapshot()` deepcopy can never iterate a dict that changes
+    size. Whole-reference swaps are atomic and stay allowed anywhere."""
+    source = Path(polymarket_lp.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    parents: dict[ast.AST, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+
+    def inside_state_lock(node: ast.AST) -> bool:
+        current = parents.get(node)
+        while current is not None:
+            if isinstance(current, ast.With):
+                for item in current.items:
+                    context = item.context_expr
+                    if (
+                        isinstance(context, ast.Attribute)
+                        and context.attr == "_candidate_state_lock"
+                    ):
+                        return True
+            current = parents.get(current)
+        return False
+
+    def targets_facts_subscription(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "_candidate_qualification_facts"
+        )
+
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and any(targets_facts_subscription(target) for target in node.targets)
+            and not inside_state_lock(node)
+        ):
+            offenders.append(f"line {node.lineno}")
+    assert not offenders, (
+        "unlocked in-place writes to _candidate_qualification_facts: "
+        + ", ".join(offenders)
+    )
+
+
+def test_batch_refresh_ranks_passers_by_actual_capital_and_maintains_top_one(
+    tmp_path,
+) -> None:
+    """S5: batches merge by actual-capital upper bound; only rank 1 maintains."""
+    now = datetime(2026, 9, 19, 9, tzinfo=UTC)
+    current = {"now": now}
+    pools = {f"A{index:02d}": Decimal(480) for index in range(1, 10)}
+    pools["Z1"] = Decimal(480)
+    pools["B1"] = Decimal(480)
+
+    class Exchange(_LPBatchQueryExchange):
+        def __init__(self, initial_now: datetime) -> None:
+            super().__init__(
+                initial_now,
+                pools,
+                backup=frozenset({"B1"}),
+                reject=frozenset({"A09"}),
+                bid_by_suffix={
+                    **{f"A{index:02d}": Decimal("0.50") for index in range(1, 9)},
+                    "Z1": Decimal("0.30"),
+                    "B1": Decimal("0.34"),
+                },
+            )
+            self.competitiveness = {
+                **{f"condition-A{index:02d}": index for index in range(1, 10)},
+                "condition-Z1": 10,
+                "condition-B1": 11,
+            }
+
+        def lp_market_competitiveness(self, *, stop_event=None, previous=None):
+            del stop_event, previous
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": self.now,
+                "round_checked_at": self.now,
+                "competitiveness": {
+                    key: (Decimal(value), self.now)
+                    for key, value in self.competitiveness.items()
+                },
+                "not_updated": [],
+            }
+
+        def lp_order_books(self, token_ids, *, stop_event=None):
+            books = super().lp_order_books(token_ids, stop_event=stop_event)
+            current["now"] += timedelta(seconds=1)
+            self.now = current["now"]
+            return {
+                token_id: {**dict(book), "received_at": self.now}
+                for token_id, book in books.items()
+            }
+
+    exchange = Exchange(now)
+    store = PredictionArbitrageStore(tmp_path)
+    _seed_stale_backup_summaries(store, now, ("B1",))
+    lp = PolymarketLPService(store, exchange, clock=lambda: current["now"])
+    assert lp.refresh_price_history()["state"] in {"known", "partial"}
+
+    snapshot = lp.refresh_candidates(force=True)
+
+    assert snapshot["state"] == "ready"
+    assert len(exchange.book_token_reads) == 2
+    # Independent arithmetic (quantity 20 × live bid, pool 480):
+    #   Z1 capital 6.00 → 480/(24×6)×100  = 333.333333 (checked in batch two)
+    #   B1 capital 6.80 → 480/(24×6.8)×100 = 294.117647 (backup, batch one)
+    #   A01..A08 capital 10.00 → 200.000000, ties fall to competition then
+    #   token_id (A05 before A06 share competition 5); A09 rejects off-tick.
+    candidates = snapshot["candidates"]
+    assert [row["market_id"] for row in candidates] == [
+        "market-Z1", "market-B1",
+        "market-A01", "market-A02", "market-A03", "market-A04",
+        "market-A05", "market-A06", "market-A07", "market-A08",
+    ]
+    assert Decimal(
+        str(candidates[0]["realtime_query_rate_upper_bound"])
+    ) == Decimal("333.333333")
+    assert Decimal(
+        str(candidates[1]["realtime_query_rate_upper_bound"])
+    ) == Decimal("294.117647")
+    assert snapshot["recommendations"][0]["market_id"] == "market-Z1"
+
+    # Immediately after the scan the 60-second maintenance gate holds.
+    before_maintenance_reads = len(exchange.book_token_reads)
+    current["now"] = now + timedelta(seconds=30)
+    exchange.now = current["now"]
+    assert lp.refresh_candidate_recommendations()["recommendations"]
+    assert len(exchange.book_token_reads) == before_maintenance_reads
+
+    # Once the round is older than 60 seconds only rank one (Z1) is
+    # maintained; rank two (B1) expiry triggers no reads.
+    current["now"] = now + timedelta(seconds=65)
+    exchange.now = current["now"]
+    maintained = lp.refresh_candidate_recommendations()
+    assert maintained["recommendations"][0]["market_id"] == "market-Z1"
+    new_reads = exchange.book_token_reads[before_maintenance_reads:]
+    assert len(new_reads) == 1
+    assert set(new_reads[0]) == {
+        "token-condition-Z1-yes",
+        "token-condition-Z1-no",
+    }
+    # The maintained head row refreshes in place in the published table.
+    assert maintained["candidates"][0]["realtime_checked_at"] == (
+        current["now"]
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+    # Passer rows two and up keep their check-time snapshot facts.
+    assert len(maintained["selected_results"]) == 10
+    assert maintained["selected_results"][1]["market_id"] == "market-B1"
+    assert maintained["candidates"][1]["market_id"] == "market-B1"
+    # A second maintenance tick inside the fresh window stays read-free.
+    steady = len(exchange.book_token_reads)
+    assert lp.refresh_candidate_recommendations()["recommendations"]
+    assert len(exchange.book_token_reads) == steady
+
+
+def test_maintenance_recomputes_upper_bound_from_new_capital(tmp_path) -> None:
+    """Reviewer fix 4: when 60-second maintenance refreshes the head's
+    actual capital, the optimistic hourly upper bound is recomputed with the
+    same pool÷(24×actual capital) formula as the scan path."""
+    now = datetime(2026, 9, 19, 9, tzinfo=UTC)
+    current = {"now": now}
+    pools = {f"A{index:02d}": Decimal(480) for index in range(1, 10)}
+    pools["Z1"] = Decimal(480)
+
+    class Exchange(_LPBatchQueryExchange):
+        def __init__(self, initial_now: datetime) -> None:
+            super().__init__(
+                initial_now,
+                pools,
+                reject=frozenset({"A09"}),
+                bid_by_suffix={
+                    **{f"A{index:02d}": Decimal("0.50") for index in range(1, 9)},
+                    "Z1": Decimal("0.30"),
+                },
+            )
+            self.competitiveness = {
+                **{f"condition-A{index:02d}": index for index in range(1, 10)},
+                "condition-Z1": 10,
+            }
+
+        def lp_market_competitiveness(self, *, stop_event=None, previous=None):
+            del stop_event, previous
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": self.now,
+                "round_checked_at": self.now,
+                "competitiveness": {
+                    key: (Decimal(value), self.now)
+                    for key, value in self.competitiveness.items()
+                },
+                "not_updated": [],
+            }
+
+    exchange = Exchange(now)
+    store = PredictionArbitrageStore(tmp_path)
+    lp = PolymarketLPService(store, exchange, clock=lambda: current["now"])
+    assert lp.refresh_price_history()["state"] == "known"
+
+    snapshot = lp.refresh_candidates(force=True)
+
+    assert snapshot["recommendations"][0]["market_id"] == "market-Z1"
+    # Independent arithmetic: pool 480, capital 20 × 0.30 = 6.00 →
+    # 480/(24×6)×100 = 333.333333.
+    assert Decimal(
+        str(snapshot["candidates"][0]["realtime_query_rate_upper_bound"])
+    ) == Decimal("333.333333")
+
+    # The live bid moves before the maintenance tick: capital becomes
+    # 20 × 0.45 = 9.00 and the bound must follow the new actual capital.
+    exchange.bid_by_suffix["Z1"] = Decimal("0.45")
+    current["now"] = now + timedelta(seconds=65)
+    exchange.now = current["now"]
+    maintained = lp.refresh_candidate_recommendations()
+
+    assert maintained["recommendations"][0]["market_id"] == "market-Z1"
+    assert Decimal(
+        str(maintained["candidates"][0]["realtime_capital"])
+    ) == Decimal("9.00")
+    # 480/(24×9)×100 = 222.222222 — recomputed, not the stale scan value.
+    assert Decimal(
+        str(maintained["candidates"][0]["realtime_query_rate_upper_bound"])
+    ) == Decimal("222.222222")
+
+
+def test_batch_scan_cadence_and_shared_round_protection(tmp_path) -> None:
+    """S6: 300-second scan gate, shared in-flight rounds, stale writes lose."""
+    now = datetime(2026, 9, 19, 10, tzinfo=UTC)
+    current = {"now": now}
+    pools = {f"N{index:02d}": Decimal(500 - index) for index in range(1, 4)}
+    exchange = _LPBatchQueryExchange(now, pools)
+    store = PredictionArbitrageStore(tmp_path)
+    lp = PolymarketLPService(store, exchange, clock=lambda: current["now"])
+    assert lp.refresh_price_history()["state"] == "known"
+
+    first = lp.refresh_candidates(force=True)
+    assert first["state"] == "ready"
+    reads_after_first = len(exchange.book_token_reads)
+    competition_after_first = exchange.competition_reads
+    assert reads_after_first == 1
+
+    # Inside the 300-second window a non-force call returns the snapshot
+    # with zero external reads.
+    current["now"] = now + timedelta(seconds=60)
+    exchanged = lp.refresh_candidates(force=False)
+    assert len(exchange.book_token_reads) == reads_after_first
+    assert exchange.competition_reads == competition_after_first
+    assert (
+        [row["market_id"] for row in exchanged["candidates"]]
+        == [row["market_id"] for row in first["candidates"]]
+    )
+
+    # A manual force starts a new round immediately.
+    current["now"] = now + timedelta(seconds=61)
+    exchange.now = current["now"]
+    forced = lp.refresh_candidates(force=True)
+    assert len(exchange.book_token_reads) == reads_after_first + 1
+    assert exchange.competition_reads == competition_after_first + 1
+    assert forced["funnel"]["batches"] == 1
+
+    # Concurrent calls share one in-flight round: while a force round is
+    # blocked inside its batch read, a non-force call returns the scanning
+    # snapshot instead of starting a second round.
+    release = threading.Event()
+    entered = threading.Event()
+
+    class BlockingExchange(_LPBatchQueryExchange):
+        def lp_order_books(self, token_ids, *, stop_event=None):
+            entered.set()
+            release.wait(timeout=5)
+            return super().lp_order_books(token_ids, stop_event=stop_event)
+
+    blocked_exchange = BlockingExchange(now, pools)
+    shared_store = PredictionArbitrageStore(tmp_path / "shared")
+    blocked_lp = PolymarketLPService(
+        shared_store,
+        blocked_exchange,
+        clock=lambda: current["now"],
+    )
+    assert blocked_lp.refresh_price_history()["state"] == "known"
+    current["now"] = now + timedelta(seconds=62)
+    blocked_exchange.now = current["now"]
+    blocked_reads = len(blocked_exchange.book_token_reads)
+    round_result: dict[str, object] = {}
+
+    def run_round() -> None:
+        round_result["snapshot"] = blocked_lp.refresh_candidates(force=True)
+
+    round_thread = threading.Thread(target=run_round)
+    round_thread.start()
+    assert entered.wait(timeout=5)
+    shared = blocked_lp.refresh_candidates(force=False)
+    assert shared["scanning"] is True
+    assert len(blocked_exchange.book_token_reads) == blocked_reads
+
+    # A snapshot persisted by a newer round wins over this blocked older
+    # round: the stale response must not overwrite the newer result.
+    newer_started = current["now"] + timedelta(seconds=3600)
+    marker = {"market_id": "market-newer", "condition_id": "condition-newer"}
+    shared_store.lp_save_screening_snapshot(
+        {
+            "state": "ready",
+            "complete": True,
+            "candidate_rows_fresh": True,
+            "scan_started_at": newer_started.isoformat().replace("+00:00", "Z"),
+            "funnel": {"checked": 0},
+            "selected_market_ids": ["market-newer"],
+            "candidates": [marker],
+            "recommendations": [],
+            "selected_results": [],
+        }
+    )
+    release.set()
+    round_thread.join(timeout=5)
+    settled = round_result["snapshot"]
+    assert [row["market_id"] for row in settled["candidates"]] == ["market-newer"]
+    assert blocked_lp.candidate_snapshot()["scanning"] is False
+
+
+def test_batch_refresh_early_stops_when_account_unavailable(tmp_path) -> None:
+    """S7: an unusable account fact ends the round before any batch read."""
+    now = datetime(2026, 9, 19, 11, tzinfo=UTC)
+    pools = {f"N{index:02d}": Decimal(500 - index) for index in range(1, 4)}
+
+    class Exchange(_LPBatchQueryExchange):
+        def __init__(self, initial_now: datetime) -> None:
+            super().__init__(initial_now, pools)
+            self.account_mode = "valid"
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            if self.account_mode == "failure":
+                raise RuntimeError("account_read_failed")
+            return super().lp_account_snapshot()
+
+    exchange = Exchange(now)
+    lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: now
+    )
+    assert lp.refresh_price_history()["state"] == "known"
+    healthy = lp.refresh_candidates(force=True)
+    assert [row["market_id"] for row in healthy["candidates"]] == [
+        "market-N01", "market-N02", "market-N03",
+    ]
+    reads_after_healthy = len(exchange.book_token_reads)
+
+    # The account read fails: the round must not consume any queue batch.
+    exchange.account_mode = "failure"
+    failed = lp.refresh_candidates(force=True)
+
+    assert failed["state"] == "stale"
+    assert failed["funnel"]["stop_reason"] == "account_unavailable"
+    assert failed["funnel"]["checked"] == 0
+    assert failed["funnel"]["passed"] == 0
+    assert failed["funnel"]["batches"] == 0
+    assert len(exchange.book_token_reads) == reads_after_healthy
+    assert exchange.competition_reads == 1  # no re-read either
+    # The previous round's rows are kept for read-only display.
+    assert [row["market_id"] for row in failed["candidates"]] == [
+        "market-N01", "market-N02", "market-N03",
+    ]
+
+    # A forced refresh with the account back recovers immediately.
+    exchange.account_mode = "valid"
+    exchange.now = now
+    recovered = lp.refresh_candidates(force=True)
+    assert recovered["state"] == "ready"
+    # Only three queue markets exist, so the recovered round ends exhausted,
+    # not filled.
+    assert recovered["funnel"]["stop_reason"] == "queue_exhausted"
+    assert recovered["funnel"]["checked"] == 3
+    assert recovered["funnel"]["passed"] == 3
+    assert [row["market_id"] for row in recovered["candidates"]] == [
+        "market-N01", "market-N02", "market-N03",
+    ]
+    assert recovered["recommendations"][0]["market_id"] == "market-N01"
 
 
 def test_trial_refresh_qualifies_head_and_selects_lowest_capital(tmp_path) -> None:
@@ -3541,7 +4325,15 @@ def test_trial_refresh_qualifies_head_and_selects_lowest_capital(tmp_path) -> No
     )
     assert capital_lp.refresh_price_history()["state"] == "known"
     capital_snapshot = capital_lp.refresh_candidates(force=True)
-    capital_row = capital_snapshot["recommendations"][0]
+    # Both markets are checked in the same batch and both pass.  M02's cheap
+    # NO direction (0.09 × 20 = 1.80) wins the merged ranking by the
+    # actual-capital optimistic upper bound (190/(24×1.80)×100 ≈ 439.8),
+    # ahead of M01 (200/(24×9)×100 ≈ 92.6 with its NO at 9.00).
+    capital_rows = {
+        str(row["condition_id"]): row
+        for row in capital_snapshot["candidates"]
+    }
+    capital_row = capital_rows["condition-M01"]
     assert capital_row["directions"]["YES"]["state"] == "eligible"
     assert capital_row["directions"]["NO"]["state"] == "eligible"
     assert Decimal(
@@ -3550,6 +4342,11 @@ def test_trial_refresh_qualifies_head_and_selects_lowest_capital(tmp_path) -> No
     assert Decimal(
         str(capital_row["directions"]["NO"]["required_capital"])
     ) == Decimal("9.00")
+    capital_rank_one = capital_snapshot["recommendations"][0]
+    assert capital_rank_one["condition_id"] == "condition-M02"
+    assert Decimal(
+        str(capital_rank_one["selected_direction"]["required_capital"])
+    ) == Decimal("1.80")
     current["now"] = now
 
     exchange = Exchange(now, scenario="budget", available="15")
@@ -3561,11 +4358,14 @@ def test_trial_refresh_qualifies_head_and_selects_lowest_capital(tmp_path) -> No
     snapshot = lp.refresh_candidates(force=True)
 
     assert snapshot["state"] == "ready"
-    assert exchange.book_token_reads == (
-        ("token-condition-M01-no", "token-condition-M01-yes"),
-    ) or exchange.book_token_reads == (
-        ("token-condition-M01-yes", "token-condition-M01-no"),
-    )
+    # One batch covers both markets: their four token books in one call.
+    assert len(exchange.book_token_reads) == 1
+    assert set(exchange.book_token_reads[0]) == {
+        "token-condition-M01-yes",
+        "token-condition-M01-no",
+        "token-condition-M02-yes",
+        "token-condition-M02-no",
+    }
     recommendations = snapshot["recommendations"]
     assert len(recommendations) == 1
     row = recommendations[0]
@@ -3587,7 +4387,8 @@ def test_trial_refresh_qualifies_head_and_selects_lowest_capital(tmp_path) -> No
     assert "condition-M02" not in row["condition_id"]
 
     # One direction can be UNKNOWN while the other remains a usable current
-    # recommendation; the queue head does not backfill from market M02.
+    # recommendation; the head stays ranked first by its actual-capital
+    # upper bound even though both markets are checked in the same batch.
     exchange.phase = "unknown_yes"
     unknown_direction = lp.refresh_candidates(force=True)
     unknown_row = unknown_direction["recommendations"][0]
@@ -3618,8 +4419,17 @@ def test_trial_refresh_qualifies_head_and_selects_lowest_capital(tmp_path) -> No
     exchange.phase = "none"
     no_direction = lp.refresh_candidates(force=True)
     assert no_direction["recommendations"] == []
-    assert no_direction["selected_results"][0]["state"] == "unknown"
-    assert no_direction["selected_results"][0]["condition_id"] == "condition-M01"
+    # Both batch markets lost their books: no passer is published and the
+    # scan funnel reports them as unknown with book reasons.
+    assert no_direction["selected_results"] == []
+    assert no_direction["candidates"] == []
+    assert no_direction["funnel"]["checked"] == 2
+    assert no_direction["funnel"]["unknown"] == 2
+    assert no_direction["funnel"]["stop_reason"] == "queue_exhausted"
+    unknown_codes = [
+        row["code"] for row in no_direction["funnel"]["reasons"]["trial"]
+    ]
+    assert unknown_codes.count("book_unknown") == 2
 
 
 def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:

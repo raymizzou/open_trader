@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-19
 
+- Issue 143 implementation: LP 候选刷新从「每轮仅队首实时核验」改为分批验证并向后补位。每批 ≤10 个不同市场（9 正常 + 1 备用交错、condition 去重、备用每轮保底 1 席），整批一次盘口读取（≤20 token）、两方向统一资格判定后合并，凑满 10 个通过／检查满 50 个市场（100 token）／队列耗尽即停；账户事实不可用时轮首早停（已检查记 0、不烧预算、保留上一轮快照）。候选表只展示实时通过者：按实际占资重算乐观上限降序（竞争→占资→token 兜底），第 1 名为「当前推荐」并独享 60 秒维护（维护结果原位刷新表内首行，后续行保持检查时快照），行龄超 300 秒降级「仅供阅读」；新增 300 秒完整扫描最小间隔（force=False 窗口内零外部读取，手动/页面 force 立即新轮，runtime 60 秒唤醒不重复扫描），漏斗新增扫描覆盖计数与停止原因（filled/checked_limit/queue_exhausted/account_unavailable），preview 复核一次读取所选市场两向 token 且与扫描预算分离、不替换已确认请求身份。Dashboard 按已批 Mock 重做候选区：标题「待试挂候选」、扫描进度行、8 列表头、当前推荐/本轮通过徽章与降级行。准备管道部分失败场景（test_lp_preparation_partial.py，20 用例）按 passers-only 语义同步修复：夹具补齐 #142/#143 事实要素（fees_checked_at、账户完整性、退出流动性第二档深度），跨时钟跳跃场景改为断言扫描覆盖记账与停止原因。评审修复：备用通过者的「假设上限/小时」列改按实际占资重算值展示（删除 queue=backup 的 UNKNOWN 特判）、60 秒维护失败的首行改降级「维护失败 · 仅供阅读」徽章、维护刷新首行占资时同步用与扫描共用的同一公式重算假设上限、批扫描的资格事实改为轮末在状态锁下整体引用替换（消除与面板快照 deepcopy 的并发竞态）、漏斗「待测候选」阶段在批扫描完成后改报发布通过者数使漏斗/进度行/表格三处一致。Docker 定向回归（lp_views/lp/lp_risk/trading/prediction_service/prediction_runtime/dashboard_web/lp_preparation_partial）全绿；修复后定向复跑（lp/lp_views/prediction_service/prediction_runtime/dashboard_web 738 通过 + lp_preparation_partial 20 通过）全绿。未进行 live 调用、下单或部署。
+
 - Issue 142 acceptance repair: synchronized the paused-runtime metadata/fee
   fixture, kept stale recommendation checks in selected diagnostics, and
   aligned the review-time fake SDK with selected reward, market, and book

@@ -1113,6 +1113,11 @@ def lp_trial_candidates(
     kept_backup = [
         candidate for candidate in backup_queue if not over_available(candidate)
     ]
+    # Full ordered consumption queues for the service layer: the display
+    # batch below stays capped at ten rows, but the refresh scan may consume
+    # the whole kept order (issue #143 batch backfill).
+    result["queue_normal"] = [dict(candidate) for candidate in kept_normal]
+    result["queue_backup"] = [dict(candidate) for candidate in kept_backup]
     batch: list[dict[str, object]] = list(
         kept_normal[: LP_TRIAL_CANDIDATE_LIMIT - 1]
     )

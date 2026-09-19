@@ -8,7 +8,7 @@ from copy import deepcopy
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, date, datetime, time, timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, cast
 from zoneinfo import ZoneInfo
 
@@ -43,6 +43,14 @@ REWARD_THRESHOLD = Decimal("1")
 REWARD_STALE_SECONDS = Decimal("180")
 LP_CANDIDATE_REFRESH_SECONDS = Decimal("300")
 LP_RECOMMENDATION_REFRESH_SECONDS = Decimal("60")
+# Issue #143 cadence: a full batch scan runs at most once every 300 seconds.
+# refresh_candidates(force=False) inside that window returns the current
+# snapshot with zero external reads; force=True always starts a new round.
+LP_CANDIDATE_SCAN_MIN_INTERVAL_SECONDS = Decimal("300")
+# Issue #143 round budget: one full batch scan checks at most 50 distinct
+# markets (binary markets: at most 100 first-read tokens, one request per
+# token, failures not retried within the round).
+_LP_CANDIDATE_SCAN_MARKET_LIMIT = 50
 _LP_BOOK_SAMPLE_BATCH_SIZE = 100
 _LP_BOOK_SAMPLE_MAX_CONCURRENCY = 8
 _LP_PRICE_HISTORY_BATCH_SIZE = 20
@@ -162,6 +170,24 @@ def _candidate_source_expired(value: object, now: datetime) -> bool:
     return age < 0 or age > LP_RECOMMENDATION_REFRESH_SECONDS
 
 
+def _realtime_query_rate_upper_bound(
+    daily_pool: object, capital: object
+) -> Decimal | None:
+    """Optimistic hourly upper bound: pool ÷ (24 × actual capital) × 100.
+
+    Shared by the batch scan and the 60-second maintenance path so both
+    publish the same recomputed figure; ``None`` when the facts are missing.
+    """
+
+    pool_value = _maybe_decimal(daily_pool)
+    capital_value = _maybe_decimal(capital)
+    if pool_value is None or capital_value is None or capital_value <= 0:
+        return None
+    return (
+        pool_value / (Decimal("24") * capital_value) * Decimal("100")
+    ).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+
+
 def _lp_funnel_conditions() -> dict[str, object]:
     """Return the user-facing rules applied by every LP funnel batch."""
 
@@ -239,6 +265,7 @@ class PolymarketLPService:
         self._sample_targets: tuple[tuple[str, str], ...] = ()
         self._sample_target_version = 0
         self._candidate_attempted_at: datetime | None = None
+        self._candidate_scan_completed_at: datetime | None = None
         self._candidate_maintenance_attempted_at: datetime | None = None
         self._candidate_maintenance_failed = False
         self._candidate_qualification_facts: dict[str, object] = {}
@@ -823,7 +850,14 @@ class PolymarketLPService:
                 row["state"] = "unknown"
                 market_counts["unknown"] += 1
         snapshot["selected_results"] = selected_results
-        snapshot["recommendations"] = current_recommendations
+        # Issue #143: only the merged rank-one row is the current
+        # recommendation.  If that head row is not currently eligible, no
+        # later passer is promoted in its place — the next maintenance or
+        # scan round recovers the head instead.
+        head_is_current = bool(current_recommendations) and bool(selected_results) and str(
+            current_recommendations[0].get("condition_id") or ""
+        ) == str(selected_results[0].get("condition_id") or "")
+        snapshot["recommendations"] = current_recommendations[:1] if head_is_current else []
         # Keep preparation lifecycle state adjacent to the cached candidate
         # projection.  It is a small durable row, so readers can show a
         # pending/retry/paused reason without re-running the external funnel.
@@ -2635,6 +2669,22 @@ class PolymarketLPService:
         try:
             scan_started_at = self._now()
             with self._candidate_state_lock:
+                last_scan_completed_at = self._candidate_scan_completed_at
+                if (
+                    not force
+                    and last_scan_completed_at is not None
+                    and Decimal(
+                        str(
+                            (
+                                scan_started_at - last_scan_completed_at
+                            ).total_seconds()
+                        )
+                    )
+                    < LP_CANDIDATE_SCAN_MIN_INTERVAL_SECONDS
+                ):
+                    # Issue #143: inside the 300-second scan window a
+                    # non-force refresh is a pure snapshot read.
+                    return self.candidate_snapshot()
                 attempted_at = self._candidate_attempted_at
                 if (
                     not force
@@ -2741,6 +2791,8 @@ class PolymarketLPService:
                     )
                 self._publish_sample_targets(())
                 completed_at = self._now()
+                with self._candidate_state_lock:
+                    self._candidate_scan_completed_at = completed_at
                 return self._finish_candidate_scan(
                     previous,
                     state="ready",
@@ -2799,6 +2851,29 @@ class PolymarketLPService:
                 and account_value.get("authenticated") is True
             ):
                 account = account_value
+            if account is None:
+                # Issue #143 decision 5: without a usable account fact the
+                # round never enters batch consumption — zero batch reads,
+                # zero checked markets, the previous rows stay for read-only
+                # display, and the next round or a manual force retries.
+                funnel = dict(previous.get("funnel") or {})
+                funnel["checked"] = 0
+                funnel["passed"] = 0
+                funnel["rejected"] = 0
+                funnel["unknown"] = 0
+                funnel["unchecked"] = None
+                funnel["batches"] = 0
+                funnel["backup_read"] = 0
+                funnel["stop_reason"] = "account_unavailable"
+                return self._finish_candidate_scan(
+                    previous,
+                    state="stale" if previous.get("last_success_at") else "unknown",
+                    complete=False,
+                    checked_at=self._now(),
+                    scan_started_at=scan_started_at,
+                    retention_reason="account_unavailable",
+                    funnel=funnel,
+                )
             checked_at = self._now()
             reservations = self._candidate_reservations()
             cache_batch_reader = getattr(
@@ -2954,234 +3029,374 @@ class PolymarketLPService:
             missing_book_token_ids: list[str] = []
             selected_results: list[dict[str, object]] = []
             recommendations: list[dict[str, object]] = []
-            if trial_rows and callable(books_reader):
-                # Only the queue head is live-qualified.  Both outcomes of its
-                # condition are read together; the remaining queue stays pending.
-                head_row = trial_rows[0]
-                head_condition_id = str(head_row.get("condition_id") or "").strip()
-                head_directions = [
-                    direction
-                    for direction in direction_facts
-                    if isinstance(direction, Mapping)
-                    and isinstance(direction.get("market"), Mapping)
-                    and str(direction["market"].get("condition_id") or "").strip()
-                    == head_condition_id
-                    and str(direction["market"].get("outcome") or "").upper()
-                    in {"YES", "NO"}
-                ]
-                candidate_token_ids = tuple(
-                    dict.fromkeys(
-                        str(direction["market"].get("token_id") or "").strip()
-                        for direction in head_directions
-                        if str(direction["market"].get("token_id") or "").strip()
-                    )
-                )
-                self._candidate_qualification_facts = {
-                    head_condition_id: {
-                        "directions": deepcopy(head_directions),
-                        "account": deepcopy(dict(account))
-                        if isinstance(account, Mapping)
-                        else None,
-                        "reservations": deepcopy(reservations),
-                        "checked_at": checked_at,
-                    }
-                }
-                try:
-                    candidate_books = books_reader(
-                        candidate_token_ids, stop_event=stop_event
-                    )
-                except Exception:
-                    candidate_books = {}
-                candidate_evaluation_now = self._now()
-                cached_head = self._candidate_qualification_facts.get(
-                    head_condition_id
-                )
-                if isinstance(cached_head, Mapping) and isinstance(
-                    cached_head.get("directions"), list
-                ):
-                    for cached_direction in cached_head["directions"]:
-                        if not isinstance(cached_direction, dict):
-                            continue
-                        cached_market = cached_direction.get("market")
-                        if not isinstance(cached_market, Mapping):
-                            continue
-                        cached_token_id = str(
-                            cached_market.get("token_id") or ""
-                        ).strip()
-                        cached_book = (
-                            candidate_books.get(cached_token_id)
-                            if isinstance(candidate_books, Mapping)
-                            else None
-                        )
-                        if isinstance(cached_book, Mapping):
-                            cached_direction["book"] = deepcopy(dict(cached_book))
-                direction_results: dict[str, dict[str, object]] = {}
-                eligible_directions: list[dict[str, object]] = []
-                for direction in head_directions:
-                    market = direction.get("market")
-                    if not isinstance(market, Mapping):
-                        continue
-                    outcome = str(market.get("outcome") or "").upper()
-                    token_id = str(market.get("token_id") or "").strip()
-                    book = (
-                        candidate_books.get(token_id)
-                        if isinstance(candidate_books, Mapping)
-                        else None
-                    )
-                    if not isinstance(book, Mapping):
-                        missing_book_token_ids.append(token_id)
-                    evaluated = evaluate_lp_entry(
-                        {**dict(direction), "book": book},
-                        account=account or {},
-                        now=candidate_evaluation_now,
-                        reservations=reservations,
-                        candidate=True,
-                    )
-                    result = {
-                        "token_id": token_id,
-                        "outcome": outcome,
-                        "state": evaluated.get("state", "unknown"),
-                        "eligible": evaluated.get("state") == "eligible",
-                        "reason_codes": list(evaluated.get("reason_codes", ())),
-                        "guidance": evaluated.get("guidance"),
-                    }
-                    if isinstance(result["guidance"], Mapping):
-                        for field in (
-                            "price",
-                            "quantity",
-                            "required_capital",
-                            "estimated_exit_loss",
-                            "estimated_exit_loss_ratio",
-                            "checked_at",
-                        ):
-                            if field in result["guidance"]:
-                                result[field] = result["guidance"][field]
-                    direction_results[outcome] = result
-                    if result["eligible"] is True:
-                        eligible_directions.append(result)
-                selected_direction = (
-                    min(
-                        eligible_directions,
-                        key=lambda result: (
-                            _maybe_decimal(
-                                result.get("guidance", {}).get("required_capital")
-                                if isinstance(result.get("guidance"), Mapping)
-                                else None
-                            )
-                            or Decimal("Infinity"),
-                            _maybe_decimal(
-                                result.get("guidance", {}).get(
-                                    "estimated_exit_loss_ratio"
-                                )
-                                if isinstance(result.get("guidance"), Mapping)
-                                else None
-                            )
-                            or Decimal("Infinity"),
-                            str(result.get("token_id") or ""),
-                        ),
-                    )
-                    if eligible_directions
+            # Batch scan (issue #143): consume the full kept queues in batches
+            # of at most ten distinct markets (nine normal + one backup, each
+            # queue topping the other up), read the whole batch's books in one
+            # call, qualify every market in both directions, and keep merging
+            # passers until ten passed, the queues run out, or the round
+            # budget stops the scan.
+            queue_normal = [
+                dict(row)
+                for row in (trial.get("queue_normal") or ())
+                if isinstance(row, Mapping)
+            ]
+            queue_backup = [
+                dict(row)
+                for row in (trial.get("queue_backup") or ())
+                if isinstance(row, Mapping)
+            ]
+            queue_total = len(queue_normal) + len(queue_backup)
+            directions_by_condition: dict[str, list[Mapping[str, object]]] = {}
+            for direction in direction_facts:
+                if not isinstance(direction, Mapping):
+                    continue
+                market = direction.get("market")
+                if not isinstance(market, Mapping):
+                    continue
+                direction_condition = str(market.get("condition_id") or "").strip()
+                if direction_condition:
+                    directions_by_condition.setdefault(
+                        direction_condition, []
+                    ).append(direction)
+            passers: list[dict[str, object]] = []
+            checked_count = 0
+            passed_count = 0
+            rejected_count = 0
+            unknown_count = 0
+            batches_read = 0
+            backup_read_count = 0
+            stop_reason = "queue_exhausted"
+            scan_unknown_reasons: list[dict[str, object]] = []
+            # Reviewer fix 2: qualification facts are collected into this
+            # round-local mapping while batches run and swapped as a whole
+            # under `_candidate_state_lock` when the round publishes, so
+            # `candidate_snapshot()` deep copies never see a resizing dict.
+            round_facts: dict[str, object] = {}
+
+            def _passer_sort_key(
+                row: Mapping[str, object],
+            ) -> tuple[int, Decimal, int, Decimal, int, Decimal, str]:
+                # Merged order (issue #143 decision 2): optimistic upper bound
+                # recomputed from the actual occupied capital, descending;
+                # ties fall back to competition, actual capital, then the
+                # stable selected token identity.
+                upper = _maybe_decimal(row.get("realtime_query_rate_upper_bound"))
+                upper_key = (0, -upper) if upper is not None else (1, Decimal("0"))
+                competition_row = row.get("competition")
+                competition_value = (
+                    competition_row.get("value")
+                    if isinstance(competition_row, Mapping)
                     else None
                 )
-                head_result = dict(head_row)
-                head_result["directions"] = direction_results
-                head_result["selected_direction"] = selected_direction
-                head_result["state"] = (
-                    "eligible"
-                    if selected_direction is not None
-                    else "unknown"
-                    if any(
-                        result.get("state") == "unknown"
-                        for result in direction_results.values()
-                    )
-                    else "rejected"
+                if (
+                    isinstance(competition_row, Mapping)
+                    and competition_row.get("state") == "known"
+                    and isinstance(competition_value, Decimal)
+                ):
+                    competition_key = (0, competition_value)
+                else:
+                    competition_key = (1, Decimal("0"))
+                capital = _maybe_decimal(row.get("realtime_capital"))
+                capital_key = (
+                    (0, capital) if capital is not None and capital > 0 else (1, Decimal("0"))
                 )
-                head_result["verification"] = (
-                    "verified"
-                    if direction_results
-                    and all(
-                        result.get("state") in {"eligible", "rejected"}
-                        for result in direction_results.values()
-                    )
-                    else "partial"
+                selected = row.get("selected_direction")
+                identity = (
+                    str(selected.get("token_id") or "")
+                    if isinstance(selected, Mapping)
+                    else ""
                 )
-                head_row["directions"] = direction_results
-                head_row["selected_direction"] = selected_direction
-                head_row["state"] = head_result["state"]
-                head_row["verification"] = head_result["verification"]
-                if isinstance(selected_direction, Mapping):
-                    guidance = selected_direction.get("guidance")
-                    if isinstance(guidance, Mapping):
-                        head_result["realtime_price"] = guidance.get("price")
-                        head_result["realtime_capital"] = guidance.get(
-                            "required_capital"
-                        )
-                        head_result["realtime_checked_at"] = guidance.get(
-                            "checked_at"
-                        )
-                        head_row["realtime_price"] = guidance.get("price")
-                        head_row["realtime_capital"] = guidance.get(
-                            "required_capital"
-                        )
-                        head_row["realtime_checked_at"] = guidance.get(
-                            "checked_at"
-                        )
-                selected_results = [head_result]
-                if selected_direction is not None:
-                    recommendations = [head_result]
-            funnel = dict(trial.get("funnel") or {})
-            # The trial gate compares reference capital, but the binding
-            # budget is the live book: recheck selected rows with
-            # realtime_capital ?? reference_capital after enrichment and
-            # drop rows that exceed the reserved available capital.
-            available_capital = _maybe_decimal(
-                available_facts.get("available_capital")
-                if isinstance(available_facts, Mapping)
-                else None
-            )
-            if available_capital is not None:
-                kept_rows: list[dict[str, object]] = []
-                for row in trial_rows:
-                    effective_capital = _maybe_decimal(
-                        row.get("realtime_capital")
-                        if row.get("realtime_capital") is not None
-                        else row.get("reference_capital")
-                    )
-                    if (
-                        effective_capital is None
-                        or effective_capital <= available_capital
+                if not identity:
+                    identity = str(row.get("condition_id") or row.get("market_id") or "")
+                return (*upper_key, *competition_key, *capital_key, identity)
+
+            if callable(books_reader):
+                normal_index = 0
+                backup_index = 0
+                consumed_conditions: set[str] = set()
+                while (
+                    len(passers) < LP_TRIAL_CANDIDATE_LIMIT
+                    and checked_count < _LP_CANDIDATE_SCAN_MARKET_LIMIT
+                ):
+                    batch: list[dict[str, object]] = []
+                    if backup_index < len(queue_backup):
+                        batch.append(queue_backup[backup_index])
+                        backup_index += 1
+                    while (
+                        len(batch) < LP_TRIAL_CANDIDATE_LIMIT
+                        and normal_index < len(queue_normal)
                     ):
-                        kept_rows.append(row)
-                        continue
-                    excluded_counts = funnel.get("excluded")
-                    if isinstance(excluded_counts, dict):
-                        excluded_counts["over_available"] = (
-                            int(excluded_counts.get("over_available") or 0) + 1
-                        )
-                    trial_reasons = funnel.get("reasons")
-                    if isinstance(trial_reasons, Mapping) and isinstance(
-                        trial_reasons.get("trial"), list
+                        batch.append(queue_normal[normal_index])
+                        normal_index += 1
+                    while (
+                        len(batch) < LP_TRIAL_CANDIDATE_LIMIT
+                        and backup_index < len(queue_backup)
                     ):
-                        trial_reasons["trial"].append(
-                            {
-                                "market_id": str(row.get("market_id") or ""),
-                                "condition_id": str(
-                                    row.get("condition_id") or ""
-                                ),
-                                "code": "realtime_capital_over_available",
+                        batch.append(queue_backup[backup_index])
+                        backup_index += 1
+                    batch = [
+                        candidate
+                        for candidate in batch
+                        if str(candidate.get("condition_id") or "").strip()
+                        not in consumed_conditions
+                    ]
+                    if not batch:
+                        break
+                    if stop_event is not None and stop_event.is_set():
+                        return self._finish_candidate_scan(
+                            previous,
+                            state="stale" if previous.get("last_success_at") else "unknown",
+                            complete=False,
+                            checked_at=self._now(),
+                            scan_started_at=scan_started_at,
+                            retention_reason="scan_cancelled",
+                        )
+                    batches_read += 1
+                    batch_entries: list[
+                        tuple[dict[str, object], list[Mapping[str, object]]]
+                    ] = []
+                    batch_tokens: list[str] = []
+                    for candidate in batch:
+                        condition_id = str(candidate.get("condition_id") or "").strip()
+                        consumed_conditions.add(condition_id)
+                        checked_count += 1
+                        if candidate.get("queue") == "backup":
+                            backup_read_count += 1
+                        market_directions = [
+                            direction
+                            for direction in directions_by_condition.get(condition_id, ())
+                            if isinstance(direction, Mapping)
+                            and isinstance(direction.get("market"), Mapping)
+                            and str(direction["market"].get("outcome") or "").upper()
+                            in {"YES", "NO"}
+                        ]
+                        batch_entries.append((candidate, market_directions))
+                        for direction in market_directions:
+                            market = direction.get("market")
+                            token_id = str(market.get("token_id") or "").strip()  # type: ignore[union-attr]
+                            if token_id and token_id not in batch_tokens:
+                                batch_tokens.append(token_id)
+                    try:
+                        candidate_books = books_reader(
+                            tuple(batch_tokens), stop_event=stop_event
+                        )
+                    except Exception:
+                        candidate_books = {}
+                    candidate_evaluation_now = self._now()
+                    for candidate, market_directions in batch_entries:
+                        condition_id = str(candidate.get("condition_id") or "").strip()
+                        direction_results: dict[str, dict[str, object]] = {}
+                        eligible_directions: list[dict[str, object]] = []
+                        qualified_directions: list[dict[str, object]] = []
+                        for direction in market_directions:
+                            market = direction.get("market")
+                            if not isinstance(market, Mapping):
+                                continue
+                            outcome = str(market.get("outcome") or "").upper()
+                            token_id = str(market.get("token_id") or "").strip()
+                            book = (
+                                candidate_books.get(token_id)
+                                if isinstance(candidate_books, Mapping)
+                                else None
+                            )
+                            qualified_direction = {**dict(direction)}
+                            if not isinstance(book, Mapping):
+                                missing_book_token_ids.append(token_id)
+                                evaluated: Mapping[str, object] = {
+                                    "state": "unknown",
+                                    "reason_codes": ["book_unknown"],
+                                    "guidance": None,
+                                }
+                            else:
+                                qualified_direction["book"] = deepcopy(dict(book))
+                                evaluated = evaluate_lp_entry(
+                                    qualified_direction,
+                                    account=account or {},
+                                    now=candidate_evaluation_now,
+                                    reservations=reservations,
+                                    candidate=True,
+                                )
+                            qualified_directions.append(qualified_direction)
+                            result = {
+                                "token_id": token_id,
+                                "outcome": outcome,
+                                "state": evaluated.get("state", "unknown"),
+                                "eligible": evaluated.get("state") == "eligible",
+                                "reason_codes": list(evaluated.get("reason_codes", ())),
+                                "guidance": evaluated.get("guidance"),
                             }
+                            if isinstance(result["guidance"], Mapping):
+                                for field in (
+                                    "price",
+                                    "quantity",
+                                    "required_capital",
+                                    "estimated_exit_loss",
+                                    "estimated_exit_loss_ratio",
+                                    "checked_at",
+                                ):
+                                    if field in result["guidance"]:
+                                        result[field] = result["guidance"][field]
+                            direction_results[outcome] = result
+                            if result["eligible"] is True:
+                                eligible_directions.append(result)
+                        selected_direction = (
+                            min(
+                                eligible_directions,
+                                key=lambda result: (
+                                    _maybe_decimal(
+                                        result.get("guidance", {}).get("required_capital")
+                                        if isinstance(result.get("guidance"), Mapping)
+                                        else None
+                                    )
+                                    or Decimal("Infinity"),
+                                    _maybe_decimal(
+                                        result.get("guidance", {}).get(
+                                            "estimated_exit_loss_ratio"
+                                        )
+                                        if isinstance(result.get("guidance"), Mapping)
+                                        else None
+                                    )
+                                    or Decimal("Infinity"),
+                                    str(result.get("token_id") or ""),
+                                ),
+                            )
+                            if eligible_directions
+                            else None
                         )
-                if len(kept_rows) != len(trial_rows):
-                    trial_rows[:] = kept_rows
-                    funnel["trial"] = len(trial_rows)
-                    funnel["gap_reason"] = (
-                        None
-                        if len(trial_rows) >= LP_TRIAL_CANDIDATE_LIMIT
-                        else (
-                            f"合格候选不足 {LP_TRIAL_CANDIDATE_LIMIT} 个"
-                            f"（本轮 {len(trial_rows)} 个）"
+                        row_state = (
+                            "eligible"
+                            if selected_direction is not None
+                            else "unknown"
+                            if any(
+                                result.get("state") == "unknown"
+                                for result in direction_results.values()
+                            )
+                            else "rejected"
                         )
-                    )
+                        if row_state == "eligible":
+                            passed_count += 1
+                        elif row_state == "rejected":
+                            rejected_count += 1
+                        else:
+                            unknown_count += 1
+                            unknown_code = next(
+                                (
+                                    str(code)
+                                    for result in direction_results.values()
+                                    if result.get("state") == "unknown"
+                                    for code in (
+                                        result.get("reason_codes") or ()
+                                    )
+                                    if str(code)
+                                ),
+                                "candidate_unknown",
+                            )
+                            scan_unknown_reasons.append(
+                                {
+                                    "market_id": str(
+                                        candidate.get("market_id") or ""
+                                    ),
+                                    "condition_id": condition_id,
+                                    "code": unknown_code,
+                                }
+                            )
+                        if selected_direction is None:
+                            continue
+                        row = dict(candidate)
+                        row["directions"] = direction_results
+                        row["selected_direction"] = selected_direction
+                        row["state"] = row_state
+                        row["verification"] = (
+                            "verified"
+                            if direction_results
+                            and all(
+                                result.get("state") in {"eligible", "rejected"}
+                                for result in direction_results.values()
+                            )
+                            else "partial"
+                        )
+                        if isinstance(selected_direction, Mapping):
+                            guidance = selected_direction.get("guidance")
+                            if isinstance(guidance, Mapping):
+                                row["realtime_price"] = guidance.get("price")
+                                row["realtime_capital"] = guidance.get(
+                                    "required_capital"
+                                )
+                                row["realtime_checked_at"] = guidance.get("checked_at")
+                                row["estimated_exit_loss"] = guidance.get(
+                                    "estimated_exit_loss"
+                                )
+                                row["estimated_exit_loss_ratio"] = guidance.get(
+                                    "estimated_exit_loss_ratio"
+                                )
+                        row["realtime_query_rate_upper_bound"] = (
+                            _realtime_query_rate_upper_bound(
+                                row.get("daily_pool_usd"),
+                                row.get("realtime_capital"),
+                            )
+                        )
+                        round_facts[condition_id] = {
+                            "directions": deepcopy(qualified_directions),
+                            "account": deepcopy(dict(account))
+                            if isinstance(account, Mapping)
+                            else None,
+                            "reservations": deepcopy(reservations),
+                            "checked_at": checked_at,
+                        }
+                        passers.append(row)
+                    # Merge rule (issue #143 decision 4): after each batch the
+                    # combined passers are re-ranked and trimmed to the best
+                    # ten; the loop stops once ten passers are merged.
+                    passers.sort(key=_passer_sort_key)
+                    del passers[LP_TRIAL_CANDIDATE_LIMIT:]
+                if len(passers) >= LP_TRIAL_CANDIDATE_LIMIT:
+                    stop_reason = "filled"
+                elif checked_count >= _LP_CANDIDATE_SCAN_MARKET_LIMIT:
+                    stop_reason = "checked_limit"
+                else:
+                    stop_reason = "queue_exhausted"
+            trial_rows = [deepcopy(dict(row)) for row in passers]
+            selected_results = [deepcopy(dict(row)) for row in passers]
+            recommendations = (
+                [deepcopy(dict(passers[0]))] if passers else []
+            )
+            funnel = dict(trial.get("funnel") or {})
+            trial_reasons = funnel.get("reasons")
+            if (
+                isinstance(trial_reasons, Mapping)
+                and isinstance(trial_reasons.get("trial"), list)
+                and scan_unknown_reasons
+            ):
+                # Scan-time unknown markets keep their reason codes visible
+                # through the funnel, per market (token ids stay out of the
+                # persisted projection by redaction policy).
+                trial_reasons["trial"].extend(deepcopy(scan_unknown_reasons))
+            # Scan coverage (issue #143): the progress line reports this
+            # round's batch consumption per deduplicated condition, and the
+            # stop reason names why the scan ended.  Published rows are only
+            # live-qualified passers, so the former realtime-capital recheck
+            # is inherently satisfied by each selected direction's own
+            # account funds check.
+            funnel["checked"] = checked_count
+            funnel["passed"] = passed_count
+            # Reviewer fix 5: the published table shows only passers, so the
+            # trial stage reports the published passer count (the view's
+            # preview-batch semantics remain for pre-scan preparation views).
+            funnel["trial"] = len(trial_rows)
+            funnel["rejected"] = rejected_count
+            funnel["unknown"] = unknown_count
+            funnel["unchecked"] = max(0, queue_total - checked_count)
+            funnel["stop_reason"] = stop_reason
+            funnel["batches"] = batches_read
+            funnel["backup_read"] = backup_read_count
+            funnel["gap_reason"] = (
+                None
+                if stop_reason == "filled"
+                else (
+                    f"合格候选不足 {LP_TRIAL_CANDIDATE_LIMIT} 个"
+                    f"（本轮通过 {passed_count} 个）"
+                )
+            )
             funnel["compared_range"] = dict(trial.get("compared_range") or {})
             funnel["conditions"] = _lp_funnel_conditions()
             funnel["competition_state"] = competition_state.get("state")
@@ -3190,6 +3405,13 @@ class PolymarketLPService:
             )
             self._publish_sample_targets(())
             completed_at = self._now()
+            # The round reached batch consumption: the 300-second scan
+            # window starts now regardless of the published completeness.
+            # The round-local qualification facts swap in as one atomic
+            # reference replacement under the state lock (reviewer fix 2).
+            with self._candidate_state_lock:
+                self._candidate_qualification_facts = round_facts
+                self._candidate_scan_completed_at = completed_at
             return self._finish_candidate_scan(
                 previous,
                 state="ready" if complete else "incomplete",
@@ -3664,9 +3886,30 @@ class PolymarketLPService:
                 head_result["realtime_price"] = selected_direction.get("price")
                 head_result["realtime_capital"] = selected_direction.get("required_capital")
                 head_result["realtime_checked_at"] = selected_direction.get("checked_at")
+            # Reviewer fix 4: maintenance refreshes the head's actual capital,
+            # so the optimistic upper bound is recomputed with the same shared
+            # formula as the scan path instead of keeping the stale figure.
+            head_result["realtime_query_rate_upper_bound"] = (
+                _realtime_query_rate_upper_bound(
+                    head_result.get("daily_pool_usd"),
+                    head_result.get("realtime_capital"),
+                )
+            )
             recommendations = [head_result] if selected_direction is not None else []
             evaluation_now = self._now()
             self._candidate_maintenance_failed = selected_direction is None
+            # Issue #143: the published table shows only passers.  The
+            # maintained head row refreshes in place (it stays the current
+            # recommendation), rows two and up keep their check-time snapshot,
+            # and the selected-results detail keeps the full passer list.
+            maintained_candidates = []
+            for row in previous.get("candidates", ()):
+                if not isinstance(row, Mapping):
+                    continue
+                if str(row.get("condition_id") or "").strip() == condition_id:
+                    maintained_candidates.append(dict(head_result))
+                else:
+                    maintained_candidates.append(dict(row))
             return self._finish_candidate_scan(
                 previous,
                 state=str(previous.get("state") or "ready"),
@@ -3674,9 +3917,10 @@ class PolymarketLPService:
                 checked_at=evaluation_now,
                 scan_started_at=evaluation_now,
                 last_success_at=evaluation_now,
-                candidates=[row for row in previous.get("candidates", ()) if isinstance(row, Mapping)],
+                candidates=maintained_candidates,
                 recommendations=recommendations,
-                selected_results=[head_result],
+                selected_results=[head_result]
+                + [dict(row) for row in selected_rows[1:]],
                 missing_metadata_condition_ids=previous.get("missing_metadata_condition_ids", ()),
                 missing_book_token_ids=tuple(dict.fromkeys(missing_book_token_ids)),
                 catalog_complete=previous.get("catalog_complete") is True,
@@ -4146,11 +4390,19 @@ class PolymarketLPService:
             "reward_min_size": reward_minimum,
             "reward_max_spread": reward_spread,
         }
+        # Issue #143: the preview re-check reads both token books of the
+        # selected market in one call, separate from the scan's round budget.
+        outcome_token_ids = [
+            str(value.get("token_id") or "").strip()
+            for value in raw_outcomes.values()
+            if isinstance(value, Mapping) and str(value.get("token_id") or "").strip()
+        ]
+        preview_token_ids = tuple(dict.fromkeys(outcome_token_ids)) or (token_id,)
         try:
             try:
-                raw_books = books_reader((token_id,), stop_event=None)
+                raw_books = books_reader(preview_token_ids, stop_event=None)
             except TypeError:
-                raw_books = books_reader((token_id,))
+                raw_books = books_reader(preview_token_ids)
         except Exception as exc:
             raise ValueError("book_unknown") from exc
         book = raw_books.get(token_id) if isinstance(raw_books, Mapping) else None

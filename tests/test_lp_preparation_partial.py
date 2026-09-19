@@ -67,6 +67,7 @@ def test_history_batch_failure_keeps_later_batches_and_partial_results(
                 "taker_fee_rate": Decimal("0"),
                 "fee_exponent": Decimal("1"),
                 "metadata_checked_at": T,
+                "fees_checked_at": T,
                 "outcomes": {
                     "yes": {"label": "YES", "token_id": token_id}
                 },
@@ -241,6 +242,7 @@ def test_partial_metadata_keeps_successful_markets_screenable(
                 "taker_fee_rate": Decimal("0"),
                 "fee_exponent": Decimal("1"),
                 "metadata_checked_at": current[0],
+                "fees_checked_at": current[0],
                 "outcomes": {
                     "yes": {
                         "label": "YES",
@@ -365,9 +367,11 @@ def test_partial_metadata_keeps_successful_markets_screenable(
     }
     assert {"condition-a", "condition-c"} <= candidate_rows.keys()
     assert "condition-b" not in candidate_rows
+    # Issue #143: the merged rank one (condition-a wins the token identity
+    # tie-break over condition-c) is the current recommendation.
     assert {
         row["condition_id"] for row in first_snapshot["recommendations"]
-    } == set()
+    } == {"condition-a"}
     assert first_snapshot["missing_metadata_condition_ids"] == ["condition-b"]
 
     current[0] = T + timedelta(seconds=300)
@@ -414,6 +418,7 @@ def test_nonaccepting_market_finishes_unspent_history_retry(
             "taker_fee_rate": Decimal("0"),
             "fee_exponent": Decimal("1"),
             "metadata_checked_at": current[0],
+            "fees_checked_at": current[0],
             "outcomes": {
                 "yes": {"label": "YES", "token_id": f"token-{condition_id[-1]}"}
             },
@@ -593,6 +598,7 @@ def test_metadata_retry_with_valid_history_cache_finishes_budget(
             "taker_fee_rate": Decimal("0"),
             "fee_exponent": Decimal("1"),
             "metadata_checked_at": current[0],
+            "fees_checked_at": current[0],
             "outcomes": {"yes": {"label": "YES", "token_id": "token-b"}},
         }
 
@@ -685,7 +691,10 @@ def test_metadata_retry_with_valid_history_cache_finishes_budget(
                     "condition_id": "condition-b",
                     "token_id": token_id,
                     "received_at": current[0],
-                    "bids": [{"price": Decimal("0.50"), "size": Decimal("20")}],
+                    "bids": [
+                        {"price": Decimal("0.50"), "size": Decimal("20")},
+                        {"price": Decimal("0.49"), "size": Decimal("100")},
+                    ],
                     "asks": [{"price": Decimal("0.52"), "size": Decimal("20")}],
                 }
                 for token_id in token_ids
@@ -869,6 +878,7 @@ def test_catalog_failure_does_not_spend_market_retry(tmp_path: Path) -> None:
                 "taker_fee_rate": Decimal("0"),
                 "fee_exponent": Decimal("1"),
                 "metadata_checked_at": current[0],
+                "fees_checked_at": current[0],
                 "outcomes": {
                     "yes": {"label": "YES", "token_id": f"token-{condition_id[-1]}"}
                 },
@@ -1137,6 +1147,7 @@ def test_waiting_history_retry_dispatches_during_later_backfill(
             "taker_fee_rate": Decimal("0"),
             "fee_exponent": Decimal("1"),
             "metadata_checked_at": current[0],
+            "fees_checked_at": current[0],
             "outcomes": {"yes": {"label": "YES", "token_id": token_id}},
         }
 
@@ -1264,6 +1275,7 @@ def test_preparation_can_publish_valid_results_before_slow_batch_finishes(
             "taker_fee_rate": Decimal("0"),
             "fee_exponent": Decimal("1"),
             "metadata_checked_at": T,
+            "fees_checked_at": T,
             "outcomes": {"yes": {"label": "YES", "token_id": token_id}},
         }
 
@@ -1350,7 +1362,11 @@ def test_preparation_can_publish_valid_results_before_slow_batch_finishes(
                     ),
                     "token_id": token_id,
                     "received_at": T,
-                    "bids": [{"price": Decimal("0.50"), "size": Decimal("100")}],
+                    # Exit-liquidity rule: depth beyond the top bid level.
+                    "bids": [
+                        {"price": Decimal("0.50"), "size": Decimal("20")},
+                        {"price": Decimal("0.49"), "size": Decimal("100")},
+                    ],
                     "asks": [{"price": Decimal("0.52"), "size": Decimal("100")}],
                 }
                 for token_id in token_ids
@@ -1568,6 +1584,7 @@ def test_partial_retry_pauses_only_failed_items_across_restart(tmp_path: Path) -
                 "taker_fee_rate": Decimal("0"),
                 "fee_exponent": Decimal("1"),
                 "metadata_checked_at": checked_at,
+                "fees_checked_at": checked_at,
                 "outcomes": {
                     "yes": {
                         "label": "YES",
@@ -1667,6 +1684,13 @@ def test_partial_retry_pauses_only_failed_items_across_restart(tmp_path: Path) -
     c_before = store.lp_price_history_summary("condition-c", "token-c", now=T)
     assert a_before is not None and c_before is not None
 
+    # Issue #143: with the facts still fresh, the scan publishes the healthy
+    # markets while condition-b waits for its history retry.
+    screenable = service.refresh_candidates(force=True)
+    screenable_ids = {row["condition_id"] for row in screenable["candidates"]}
+    assert {"condition-a", "condition-c"} <= screenable_ids
+    assert "condition-b" not in screenable_ids
+
     include_d[0] = True
     current[0] = T + timedelta(seconds=299)
     before_due = service.refresh_price_history()
@@ -1691,10 +1715,12 @@ def test_partial_retry_pauses_only_failed_items_across_restart(tmp_path: Path) -
 
     current[0] = T + timedelta(hours=23)
     candidate = service.refresh_candidates(force=True)
-    candidate_ids = {
-        row["condition_id"] for row in candidate["candidates"]
-    }
-    assert {"condition-a", "condition-c"} <= candidate_ids
+    # After 23 hours the cached metadata/books are far outside the
+    # 60-second candidate freshness window: the queue is still consumed and
+    # honestly accounted unknown, but no passer is published (issue #143).
+    assert candidate["candidates"] == []
+    assert candidate["funnel"]["checked"] == 3
+    assert candidate["funnel"]["unknown"] == 3
     summaries = store.lp_price_history_summaries(
         (("condition-a", "token-a"), ("condition-c", "token-c")),
         now=current[0],
@@ -1873,6 +1899,7 @@ def test_failed_group_does_not_block_other_items_or_duplicate_retry_alerts(
                 "taker_fee_rate": Decimal("0"),
                 "fee_exponent": Decimal("1"),
                 "metadata_checked_at": checked_at,
+                "fees_checked_at": checked_at,
                 "outcomes": {
                     "yes": {"label": "YES", "token_id": token_id}
                 },
@@ -2087,6 +2114,7 @@ def test_market_retry_budget_is_shared_across_preparation_stages(
                 "taker_fee_rate": Decimal("0"),
                 "fee_exponent": Decimal("1"),
                 "metadata_checked_at": current[0],
+                "fees_checked_at": current[0],
                 "outcomes": outcomes,
             }
 
@@ -2303,6 +2331,7 @@ def test_legacy_paused_history_migrates_only_identified_failed_markets(
                 "taker_fee_rate": Decimal("0"),
                 "fee_exponent": Decimal("1"),
                 "metadata_checked_at": current[0],
+                "fees_checked_at": current[0],
                 "outcomes": {
                     "yes": {
                         "label": "YES",
@@ -2514,6 +2543,7 @@ def test_new_preparation_alert_excludes_previously_notified_markets(
                 "taker_fee_rate": Decimal("0"),
                 "fee_exponent": Decimal("1"),
                 "metadata_checked_at": current[0],
+                "fees_checked_at": current[0],
                 "outcomes": {
                     "yes": {
                         "label": "YES",
@@ -2692,6 +2722,7 @@ def test_interrupted_preparation_retry_remains_paused_and_recoverable(
                     "taker_fee_rate": Decimal("0"),
                     "fee_exponent": Decimal("1"),
                     "metadata_checked_at": current[0],
+                    "fees_checked_at": current[0],
                     "outcomes": {
                         "yes": {"label": "YES", "token_id": "token-b"}
                     },
@@ -2827,6 +2858,7 @@ def test_recovering_paused_market_preserves_other_inflight_failures(
                 "taker_fee_rate": Decimal("0"),
                 "fee_exponent": Decimal("1"),
                 "metadata_checked_at": current[0],
+                "fees_checked_at": current[0],
                 "outcomes": {
                     "yes": {"label": "YES", "token_id": f"token-{condition_id[-1]}"}
                 },
@@ -3244,6 +3276,7 @@ def test_due_metadata_retry_dispatches_before_initial_history_pass_finishes(
             "taker_fee_rate": Decimal("0"),
             "fee_exponent": Decimal("1"),
             "metadata_checked_at": current[0],
+            "fees_checked_at": current[0],
             "outcomes": {
                 "yes": {"label": "YES", "token_id": token_id},
             },
@@ -3407,10 +3440,14 @@ def test_due_metadata_retry_dispatches_before_initial_history_pass_finishes(
     assert store.lp_preparation_items() == []
 
     snapshot = service.refresh_candidates(force=True)
-    assert any(
-        row.get("condition_id") == "condition-000"
-        for row in snapshot["candidates"]
-    )
+    # Issue 143: the token-080 history read advanced the clock by 300s, so
+    # metadata cached before the jump is outside the 60-second candidate
+    # freshness window (honestly unknown), and this fixture's 100/100 bid
+    # levels fail the exit-liquidity rule for the rest: no passer survives.
+    assert snapshot["candidates"] == []
+    assert snapshot["funnel"]["stop_reason"] == "checked_limit"
+    assert snapshot["funnel"]["checked"] == 50
+    assert snapshot["funnel"]["passed"] == 0
 
     history_count = len(history_calls)
     metadata_retry_count = metadata_calls.count(("condition-b",))
