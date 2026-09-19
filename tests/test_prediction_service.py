@@ -855,7 +855,8 @@ def test_lp_dashboard_shows_manual_orders_without_managing_them(
     assert first_order["filled_quantity"] == "5"
     assert first_order["quantity"] == "20"
     assert first_order["market_title"] == "Will it happen?"
-    assert first_order["scoring_status"] is True
+    assert first_order["scoring_status"] == "true"
+    assert first_order["scoring_last_success_at"] == first_order["scoring_checked_at"]
     assert datetime.fromisoformat(
         str(first_order["scoring_checked_at"]).replace("Z", "+00:00")
     ).tzinfo is not None
@@ -875,7 +876,15 @@ def test_lp_dashboard_shows_manual_orders_without_managing_them(
     assert market_reward["checked_at"] is None
     assert stale["stale"] is True
     assert stale["checked_at"] == first["checked_at"]
-    assert stale["orders"] == first["orders"]
+    # Issue #140: the stale cache downgrades scoring to unknown while keeping
+    # the first build's checked_at as the last confirmed success time.
+    assert stale["orders"] == [
+        {
+            **first_order,
+            "scoring_status": "unknown",
+            "scoring_last_success_at": first_order["scoring_checked_at"],
+        }
+    ]
     assert stale["positions"] == first["positions"]
     assert sdk.open_order_reads == 2
     assert sdk.scoring_reads == ["manual-order"]
@@ -884,6 +893,714 @@ def test_lp_dashboard_shows_manual_orders_without_managing_them(
     assert sdk.order_writes == 0
     assert sdk.cancellations == 0
     assert public_market.closed is True
+
+
+def test_lp_dashboard_scoring_status_preserves_official_false(tmp_path: Path) -> None:
+    """S1-a: 官方计分以字符串词表输出，false 不得退化为 unknown 或原始布尔。"""
+
+    state: dict[str, object] = {"scoring": False}
+
+    class ScoringTrading:
+        config = SimpleNamespace(wallet_address="0x" + "3" * 40)
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": datetime.now(UTC),
+                "open_orders": [
+                    {
+                        "order_id": "manual-order",
+                        "condition_id": "condition-1",
+                        "token_id": "yes-token",
+                        "outcome": "YES",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "price": Decimal("0.50"),
+                        "original_size": Decimal("20"),
+                        "size_matched": Decimal("5"),
+                        "market_title": "Scoring market",
+                    }
+                ],
+                "positions": [],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def get_order_scoring(self, order_id: str) -> bool:
+            del order_id
+            return bool(state["scoring"])
+
+        def lp_reward_snapshot(
+            self, reward_date: str, market: str
+        ) -> dict[str, object]:
+            return {
+                "state": "unknown",
+                "reward_date": reward_date,
+                "condition_id": market,
+            }
+
+    class FakeLP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {
+                "state": "known",
+                "complete": False,
+                "candidates": [],
+                "recommendations": [],
+                "market_rewards": {},
+            }
+
+        def status(self, _session_id: str | None = None) -> dict[str, object]:
+            return {"state": "none"}
+
+    service = PredictionExecutionService(
+        store=PredictionArbitrageStore(tmp_path / "data"),
+        monitor=object(),
+        trading=ScoringTrading(),
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=FakeLP(),
+    )
+    runtime = _Runtime()
+    runtime.store = service._store  # type: ignore[assignment]
+    runtime.monitor = object()
+    runtime.execution = service
+
+    with _server(runtime) as base:
+        status_false, first = _response(
+            base + "/api/prediction-arbitrage/lp/dashboard"
+        )
+        state["scoring"] = True
+        status_true, second = _response(
+            base + "/api/prediction-arbitrage/lp/dashboard"
+        )
+
+    assert status_false == status_true == 200
+    false_order = first["orders"][0]
+    assert false_order["scoring_status"] == "false"
+    assert datetime.fromisoformat(
+        str(false_order["scoring_checked_at"]).replace("Z", "+00:00")
+    ).tzinfo is not None
+    assert false_order["scoring_last_success_at"] == false_order["scoring_checked_at"]
+    true_order = second["orders"][0]
+    assert true_order["scoring_status"] == "true"
+    assert true_order["scoring_last_success_at"] == true_order["scoring_checked_at"]
+
+
+def test_lp_dashboard_scoring_failure_keeps_last_success(tmp_path: Path) -> None:
+    """S1-b: 计分查询失败 → unknown + 本次尝试时间，最后成功时间保留首次成功值。"""
+
+    state: dict[str, object] = {"fail": False}
+
+    class ScoringTrading:
+        config = SimpleNamespace(wallet_address="0x" + "3" * 40)
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": datetime.now(UTC),
+                "open_orders": [
+                    {
+                        "order_id": "manual-order",
+                        "condition_id": "condition-1",
+                        "token_id": "yes-token",
+                        "outcome": "YES",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "price": Decimal("0.50"),
+                        "original_size": Decimal("20"),
+                        "size_matched": Decimal("5"),
+                        "market_title": "Scoring market",
+                    }
+                ],
+                "positions": [],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def get_order_scoring(self, order_id: str) -> bool:
+            del order_id
+            if state["fail"] is True:
+                raise RuntimeError("scoring read unavailable")
+            return True
+
+        def lp_reward_snapshot(
+            self, reward_date: str, market: str
+        ) -> dict[str, object]:
+            return {
+                "state": "unknown",
+                "reward_date": reward_date,
+                "condition_id": market,
+            }
+
+    class FakeLP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {
+                "state": "known",
+                "complete": False,
+                "candidates": [],
+                "recommendations": [],
+                "market_rewards": {},
+            }
+
+        def status(self, _session_id: str | None = None) -> dict[str, object]:
+            return {"state": "none"}
+
+    service = PredictionExecutionService(
+        store=PredictionArbitrageStore(tmp_path / "data"),
+        monitor=object(),
+        trading=ScoringTrading(),
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=FakeLP(),
+    )
+
+    first = service.lp_dashboard()
+    first_order = first["orders"][0]
+    assert first_order["scoring_status"] == "true"
+    first_success_at = first_order["scoring_last_success_at"]
+    assert isinstance(first_success_at, str) and first_success_at
+    assert first_order["scoring_checked_at"] == first_success_at
+
+    state["fail"] = True
+    second = service.lp_dashboard()
+    second_order = second["orders"][0]
+    assert second_order["scoring_status"] == "unknown"
+    assert second_order["scoring_checked_at"] != first_order["scoring_checked_at"]
+    assert datetime.fromisoformat(
+        str(second_order["scoring_checked_at"]).replace("Z", "+00:00")
+    ).tzinfo is not None
+    assert second_order["scoring_last_success_at"] == first_success_at
+
+
+def test_lp_dashboard_stale_cache_downgrades_scoring_unknown(tmp_path: Path) -> None:
+    """S1-c: stale 缓存服务把订单计分降级为 unknown，最后成功保留首次查询时间。"""
+
+    state: dict[str, object] = {"fail_account": False}
+
+    class ScoringTrading:
+        config = SimpleNamespace(wallet_address="0x" + "3" * 40)
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            if state["fail_account"] is True:
+                raise RuntimeError("account read unavailable")
+            return {
+                "authenticated": True,
+                "checked_at": datetime.now(UTC),
+                "open_orders": [
+                    {
+                        "order_id": "manual-order",
+                        "condition_id": "condition-1",
+                        "token_id": "yes-token",
+                        "outcome": "YES",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "price": Decimal("0.50"),
+                        "original_size": Decimal("20"),
+                        "size_matched": Decimal("5"),
+                        "market_title": "Scoring market",
+                    }
+                ],
+                "positions": [],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def get_order_scoring(self, order_id: str) -> bool:
+            del order_id
+            return True
+
+        def lp_reward_snapshot(
+            self, reward_date: str, market: str
+        ) -> dict[str, object]:
+            return {
+                "state": "unknown",
+                "reward_date": reward_date,
+                "condition_id": market,
+            }
+
+    class FakeLP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {
+                "state": "known",
+                "complete": False,
+                "candidates": [],
+                "recommendations": [],
+                "market_rewards": {},
+            }
+
+        def status(self, _session_id: str | None = None) -> dict[str, object]:
+            return {"state": "none"}
+
+    service = PredictionExecutionService(
+        store=PredictionArbitrageStore(tmp_path / "data"),
+        monitor=object(),
+        trading=ScoringTrading(),
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=FakeLP(),
+    )
+
+    first = service.lp_dashboard()
+    first_order = first["orders"][0]
+    assert first_order["scoring_status"] == "true"
+    first_checked_at = first_order["scoring_checked_at"]
+    assert isinstance(first_checked_at, str) and first_checked_at
+
+    state["fail_account"] = True
+    stale = service.lp_dashboard()
+    assert stale["state"] == "stale"
+    assert stale["stale"] is True
+    stale_order = stale["orders"][0]
+    assert stale_order["scoring_status"] == "unknown"
+    assert stale_order["scoring_checked_at"] == first_checked_at
+    assert stale_order["scoring_last_success_at"] == first_checked_at
+    # 缓存本体不得被就地改写。
+    assert first["orders"][0]["scoring_status"] == "true"
+
+
+def test_lp_dashboard_stale_cache_downgrades_today_orders_scoring(
+    tmp_path: Path,
+) -> None:
+    """stale 缓存服务同样降级当天 LP 委托行的计分状态与最后成功时间。"""
+
+    state: dict[str, object] = {"fail_account": False}
+
+    class ScoringTrading:
+        config = SimpleNamespace(wallet_address="0x" + "3" * 40)
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            if state["fail_account"] is True:
+                raise RuntimeError("account read unavailable")
+            return {
+                "authenticated": True,
+                "checked_at": datetime.now(UTC),
+                "open_orders": [
+                    {
+                        "order_id": "manual-order",
+                        "condition_id": "condition-1",
+                        "token_id": "yes-token",
+                        "outcome": "YES",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "price": Decimal("0.50"),
+                        "original_size": Decimal("20"),
+                        "size_matched": Decimal("5"),
+                        "market_title": "Scoring market",
+                    }
+                ],
+                "positions": [],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def get_order_scoring(self, order_id: str) -> bool:
+            del order_id
+            return True
+
+        def lp_reward_snapshot(
+            self, reward_date: str, market: str
+        ) -> dict[str, object]:
+            return {
+                "state": "unknown",
+                "reward_date": reward_date,
+                "condition_id": market,
+            }
+
+    class FakeLP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {
+                "state": "known",
+                "complete": False,
+                "candidates": [],
+                "recommendations": [],
+                "market_rewards": {},
+            }
+
+        def status(self, _session_id: str | None = None) -> dict[str, object]:
+            return {"state": "none"}
+
+    service = PredictionExecutionService(
+        store=PredictionArbitrageStore(tmp_path / "data"),
+        monitor=object(),
+        trading=ScoringTrading(),
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=FakeLP(),
+    )
+
+    first = service.lp_dashboard()
+    assert first["lp_orders_today"], "manual order must appear in today table"
+    first_row = first["lp_orders_today"][0]
+    assert first_row["scoring_status"] == "true"
+    first_checked_at = first_row["scoring_checked_at"]
+    assert isinstance(first_checked_at, str) and first_checked_at
+
+    state["fail_account"] = True
+    stale = service.lp_dashboard()
+    assert stale["state"] == "stale"
+    stale_row = stale["lp_orders_today"][0]
+    assert stale_row["scoring_status"] == "unknown"
+    assert stale_row["scoring_last_success_at"] == first_checked_at
+    # 缓存本体不得被就地改写。
+    assert first["lp_orders_today"][0]["scoring_status"] == "true"
+
+
+_LP_REWARD_USDC_ASSET = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+
+
+def _lp_reward_market_row(
+    condition_id: str,
+    *,
+    earning_percentage: str,
+    rate_per_day: str = "1.2",
+) -> dict[str, object]:
+    """官方 /rewards/user/markets 行；日期窗口动态覆盖真实今天（防日历炸弹）。"""
+
+    return {
+        "condition_id": condition_id,
+        "earning_percentage": earning_percentage,
+        "rewards_config": [
+            {
+                "id": f"config-{condition_id}",
+                "asset_address": _LP_REWARD_USDC_ASSET,
+                "start_date": "2020-01-01",
+                "end_date": "2030-01-01",
+                "rate_per_day": rate_per_day,
+            }
+        ],
+    }
+
+
+def _lp_reward_order(
+    order_id: str,
+    *,
+    remaining: Decimal,
+    matched: Decimal,
+    price: Decimal = Decimal("0.50"),
+) -> dict[str, object]:
+    return {
+        "id": order_id,
+        "market": "condition-1",
+        "asset_id": "yes-token",
+        "outcome": "YES",
+        "side": "BUY",
+        "status": "LIVE",
+        "price": price,
+        "original_size": remaining + matched,
+        "size_matched": matched,
+        "remaining_size": remaining,
+    }
+
+
+class _LPDashboardFakeLP:
+    def candidate_snapshot(self) -> dict[str, object]:
+        return {
+            "state": "known",
+            "complete": False,
+            "candidates": [],
+            "recommendations": [],
+            "market_rewards": {},
+        }
+
+    def status(self, _session_id: str | None = None) -> dict[str, object]:
+        return {"state": "none"}
+
+
+def _lp_reward_dashboard_service(
+    tmp_path: Path, state: dict[str, object]
+) -> PredictionExecutionService:
+    """S1-d..i 共用夹具：真实 PolymarketTradingClient 走假 SDK 传输层。"""
+
+    class RewardTransport:
+        def get_json(self, path: str, *, params: dict[str, object]) -> object:
+            if path == "/rewards/user/percentages":
+                return {}
+            if path == "/rewards/user/total":
+                return []
+            if path == "/rewards/user/markets":
+                if state.get("market_missing") is True:
+                    return {"data": [], "next_cursor": "LTE="}
+                if params.get("sponsored") is not True:
+                    return {
+                        "data": [dict(row) for row in state["reward_markets"]],
+                        "next_cursor": "LTE=",
+                    }
+                return {"data": [], "next_cursor": "LTE="}
+            return {"data": [], "next_cursor": "LTE="}
+
+    class AccountSDK:
+        def __init__(self) -> None:
+            self.scoring_reads: list[str] = []
+            self._ctx = SimpleNamespace(
+                secure_clob=RewardTransport(), wallet_type=None
+            )
+            self.environment = SimpleNamespace(
+                standard_exchange="standard-exchange"
+            )
+
+        def get_balance_allowance(self, **_kwargs: object) -> object:
+            return SimpleNamespace(
+                balance=30_000_000,
+                allowances={"standard-exchange": 30_000_000},
+            )
+
+        def list_open_orders(self, **_kwargs: object) -> list[object]:
+            if state.get("fail_orders") is True:
+                raise RuntimeError("account read unavailable")
+            return [dict(row) for row in state["orders"]]
+
+        def list_account_trades(self, **_kwargs: object) -> list[object]:
+            return []
+
+        def list_positions(self, **_kwargs: object) -> list[object]:
+            return [dict(row) for row in state["positions"]]
+
+        def get_order_scoring(self, *, order_id: str) -> bool:
+            self.scoring_reads.append(order_id)
+            behavior = state["scoring"].get(order_id, True)
+            if behavior == "raise":
+                raise RuntimeError("scoring read unavailable")
+            return behavior is True
+
+    class PublicMarketSDK:
+        def list_markets(
+            self, *, condition_ids: object, page_size: int = 100
+        ) -> list[object]:
+            return [
+                {
+                    "id": f"market-{condition}",
+                    "condition_id": str(condition),
+                    "question": f"Will {condition} happen?",
+                    "slug": f"will-{condition}-happen",
+                }
+                for condition in tuple(condition_ids)  # type: ignore[arg-type]
+            ]
+
+        def get_order_books(self, *, token_ids: object) -> list[object]:
+            del token_ids
+            return []
+
+        def close(self) -> None:
+            pass
+
+    trading = PolymarketTradingClient(
+        TradingConfig("signer", "wallet"),
+        client=AccountSDK(),
+        public_client_factory=lambda: PublicMarketSDK(),
+    )
+    return PredictionExecutionService(
+        store=PredictionArbitrageStore(tmp_path / "data"),
+        monitor=object(),
+        trading=trading,
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=_LPDashboardFakeLP(),
+    )
+
+
+def _lp_reward_dashboard_state(
+    *, earning_percentage: str
+) -> dict[str, object]:
+    return {
+        "orders": [
+            _lp_reward_order(
+                "manual-order", remaining=Decimal("40"), matched=Decimal("0")
+            )
+        ],
+        "positions": [],
+        "reward_markets": [
+            _lp_reward_market_row(
+                "condition-1", earning_percentage=earning_percentage
+            )
+        ],
+        "scoring": {},
+        "market_missing": False,
+    }
+
+
+def test_lp_dashboard_explicit_zero_reward_keeps_zero_not_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S1-d: earning_percentage 0 → 显式零奖励；占资 $20，率与小时奖励均为 0 而非 None。"""
+
+    monkeypatch.setattr(
+        polymarket_trading_module, "signature_type_for", lambda _wallet_type: 0
+    )
+    state = _lp_reward_dashboard_state(earning_percentage="0")
+    service = _lp_reward_dashboard_service(tmp_path, state)
+    runtime = _Runtime()
+    runtime.store = service._store  # type: ignore[assignment]
+    runtime.monitor = object()
+    runtime.execution = service
+
+    refreshed = service.refresh_lp_observations()
+    assert refreshed["state"] == "ready"
+    with _server(runtime) as base:
+        status, payload = _response(base + "/api/prediction-arbitrage/lp/dashboard")
+
+    assert status == 200
+    observation = payload["lp_observations"]["condition-1"]
+    assert observation["current_hourly_reward_usd"] == "0"
+    assert observation["current_yield_pct_per_hour"] == "0"
+    assert observation["state"] == "known"
+
+
+def test_lp_dashboard_missing_reward_market_stays_unknown_not_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S1-e: 奖励读取成功但 markets 缺该市场 → reward_market_missing，不按 0 计。"""
+
+    monkeypatch.setattr(
+        polymarket_trading_module, "signature_type_for", lambda _wallet_type: 0
+    )
+    state = _lp_reward_dashboard_state(earning_percentage="100")
+    state["market_missing"] = True
+    service = _lp_reward_dashboard_service(tmp_path, state)
+
+    refreshed = service.refresh_lp_observations()
+    assert refreshed["state"] == "ready"
+    observation = refreshed["observations"]["condition-1"]
+    assert observation["reason"] == "reward_market_missing"
+    assert observation["current_yield_pct_per_hour"] is None
+    assert observation["current_hourly_reward_usd"] is None
+
+
+def test_lp_dashboard_zero_capital_keeps_rate_unknown_and_flat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S1-f: 全成交无占资 → 率为 None 不按 0 计，占资 0，stage flat。"""
+
+    monkeypatch.setattr(
+        polymarket_trading_module, "signature_type_for", lambda _wallet_type: 0
+    )
+    state = _lp_reward_dashboard_state(earning_percentage="100")
+    state["orders"] = [
+        _lp_reward_order(
+            "manual-order", remaining=Decimal("0"), matched=Decimal("40")
+        )
+    ]
+    service = _lp_reward_dashboard_service(tmp_path, state)
+
+    refreshed = service.refresh_lp_observations()
+    assert refreshed["state"] == "ready"
+    observation = refreshed["observations"]["condition-1"]
+    assert observation["current_yield_pct_per_hour"] is None
+    assert observation["occupied_capital_usd"] == "0"
+    assert observation["stage"] == "flat"
+
+
+def test_lp_dashboard_yield_worked_example_hourly_and_capital(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S1-g: 1.2×100/100/24=0.05/小时；剩余 40 × 0.50=$20 → 0.05/20×100=0.25%／小时。"""
+
+    monkeypatch.setattr(
+        polymarket_trading_module, "signature_type_for", lambda _wallet_type: 0
+    )
+    state = _lp_reward_dashboard_state(earning_percentage="100")
+    service = _lp_reward_dashboard_service(tmp_path, state)
+    runtime = _Runtime()
+    runtime.store = service._store  # type: ignore[assignment]
+    runtime.monitor = object()
+    runtime.execution = service
+
+    refreshed = service.refresh_lp_observations()
+    assert refreshed["state"] == "ready"
+    with _server(runtime) as base:
+        status, payload = _response(base + "/api/prediction-arbitrage/lp/dashboard")
+
+    assert status == 200
+    observation = payload["lp_observations"]["condition-1"]
+    assert observation["current_hourly_reward_usd"] == "0.05"
+    assert observation["occupied_capital_usd"] == "20.00"
+    assert observation["current_yield_pct_per_hour"] == "0.25"
+
+
+def test_lp_dashboard_dual_orders_share_one_market_reward(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S1-h: 同市场双订单奖励单份、分母合计；连续构建不累加；观察仅一条。"""
+
+    monkeypatch.setattr(
+        polymarket_trading_module, "signature_type_for", lambda _wallet_type: 0
+    )
+    state = _lp_reward_dashboard_state(earning_percentage="100")
+    state["orders"] = [
+        _lp_reward_order(
+            "manual-a", remaining=Decimal("20"), matched=Decimal("0")
+        ),
+        _lp_reward_order(
+            "manual-b", remaining=Decimal("20"), matched=Decimal("0")
+        ),
+    ]
+    service = _lp_reward_dashboard_service(tmp_path, state)
+    runtime = _Runtime()
+    runtime.store = service._store  # type: ignore[assignment]
+    runtime.monitor = object()
+    runtime.execution = service
+
+    first_refresh = service.refresh_lp_observations()
+    assert first_refresh["state"] == "ready"
+    with _server(runtime) as base:
+        status, payload = _response(base + "/api/prediction-arbitrage/lp/dashboard")
+        assert status == 200
+        observation = payload["lp_observations"]["condition-1"]
+        assert observation["current_hourly_reward_usd"] == "0.05"
+        assert observation["current_yield_pct_per_hour"] == "0.25"
+        assert sorted(
+            str(row["order_id"]) for row in payload["lp_orders_today"]
+        ) == ["manual-a", "manual-b"]
+        assert list(payload["lp_observations"]) == ["condition-1"]
+
+        service.refresh_lp_observations()
+        status_second, payload_second = _response(
+            base + "/api/prediction-arbitrage/lp/dashboard"
+        )
+
+    assert status_second == 200
+    second_observation = payload_second["lp_observations"]["condition-1"]
+    assert second_observation["current_hourly_reward_usd"] == "0.05"
+    assert second_observation["current_yield_pct_per_hour"] == "0.25"
+
+
+def test_lp_dashboard_qualification_three_states_with_basis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S1-i: qualified 三态与推导依据——orders_scoring / orders_not_scoring / 未知。"""
+
+    monkeypatch.setattr(
+        polymarket_trading_module, "signature_type_for", lambda _wallet_type: 0
+    )
+    state = _lp_reward_dashboard_state(earning_percentage="0")
+    service = _lp_reward_dashboard_service(tmp_path, state)
+
+    # (1) 全部买单计分 false（份额非正）→ 明确未确认。
+    state["scoring"] = {"manual-order": False}
+    first = service.refresh_lp_observations()
+    assert first["state"] == "ready"
+    first_observation = first["observations"]["condition-1"]
+    assert first_observation["qualified"] is False
+    assert first_observation["qualification_basis"] == "orders_not_scoring"
+
+    # (2) 一 false 一查询失败 → 混合未知。
+    state["orders"] = [
+        _lp_reward_order("manual-a", remaining=Decimal("20"), matched=Decimal("0")),
+        _lp_reward_order("manual-b", remaining=Decimal("20"), matched=Decimal("0")),
+    ]
+    state["scoring"] = {"manual-a": False, "manual-b": "raise"}
+    second = service.refresh_lp_observations()
+    assert second["state"] == "ready"
+    second_observation = second["observations"]["condition-1"]
+    assert second_observation["qualified"] is None
+    assert second_observation["qualification_basis"] is None
+
+    # (3) 全部 true → 明确已确认。
+    state["scoring"] = {}
+    third = service.refresh_lp_observations()
+    assert third["state"] == "ready"
+    third_observation = third["observations"]["condition-1"]
+    assert third_observation["qualified"] is True
+    assert third_observation["qualification_basis"] == "orders_scoring"
 
 
 def test_lp_account_trades_reads_markets_and_flags_incomplete_reads() -> None:
@@ -1121,7 +1838,7 @@ def test_lp_dashboard_http_projection_keeps_today_orders(tmp_path: Path) -> None
     assert row["remaining_quantity"] == "40"
     assert row["price"] == "0.50"
     assert row["state"] == "open"
-    assert row["scoring_status"] is True
+    assert row["scoring_status"] == "true"
     assert payload["non_lp_row_count"] == 0
 
 def test_lp_dashboard_account_outage_keeps_newer_public_funnel(tmp_path: Path) -> None:

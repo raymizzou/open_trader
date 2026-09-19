@@ -8229,7 +8229,8 @@ def test_lp_dashboard_today_orders_keep_scoring_orders_with_unknown_market(
     assert row["filled_quantity"] == Decimal("40")
     assert row["remaining_quantity"] == Decimal("40")
     assert row["price"] == Decimal("0.50")
-    assert row["scoring_status"] is True
+    assert row["scoring_status"] == "true"
+    assert row["scoring_last_success_at"] == row["scoring_checked_at"]
     assert row["side"] == "BUY"
     assert row["market_title"] == "Scoring LP market"
     assert dashboard["non_lp_row_count"] == 0
@@ -8335,6 +8336,7 @@ def test_lp_dashboard_payload_keeps_orders_and_positions_intact(
     order = dict(dashboard["orders"][0])
     scoring_checked_at = order.pop("scoring_checked_at")
     assert isinstance(scoring_checked_at, str) and scoring_checked_at
+    assert order.pop("scoring_last_success_at") == scoring_checked_at
     assert order == {
         "order_id": "manual-order",
         "market_id": "market-1",
@@ -8359,7 +8361,7 @@ def test_lp_dashboard_payload_keeps_orders_and_positions_intact(
         "taker_fee_rate": Decimal("0"),
         "management": "manual_read_only",
         "read_only": True,
-        "scoring_status": False,
+        "scoring_status": "false",
     }
     assert dashboard["positions"] == [
         {

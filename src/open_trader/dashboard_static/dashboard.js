@@ -3187,6 +3187,8 @@ function lpDashboardRate(value) {
   if (!predictionHasValue(value)) return "—";
   const number = Number(value);
   if (!Number.isFinite(number)) return "—";
+  if (number === 0) return "0%／小时";
+  if (number > 0 && number < 0.005) return "<0.01%／小时";
   return `${number.toFixed(2).replace(/\.?0+$/, "")}%／小时`;
 }
 
@@ -3242,6 +3244,15 @@ function lpDashboardObservationDetail(observation, reward, risk) {
     : observation.qualified === false
       ? "未确认"
       : "UNKNOWN";
+  // Issue #140: show why the three-state qualification was derived.
+  const qualificationBasisLabels = {
+    orders_scoring: "依据：全部订单官方计分中",
+    orders_not_scoring: "依据：全部订单官方未计分",
+    reward_share_positive: "依据：奖励份额为正",
+  };
+  const qualificationBasis = accountFactsStale
+    ? "依据：未知"
+    : qualificationBasisLabels[observation.qualification_basis] || "依据：未知";
   const currentReward = observation.state === "known" && !accountFactsStale
     ? lpDashboardMoney(observation.current_hourly_reward_usd)
     : "UNKNOWN";
@@ -3270,7 +3281,7 @@ function lpDashboardObservationDetail(observation, reward, risk) {
         return `<div class="sub">飞书与语音原文：${title}${title && message ? "<br><br>" : ""}${message}</div>`;
       })
     : [];
-  return `<details class="pm-lp-observation-details"><summary>详情</summary><div class="sub">预计小时奖励 ${escapeHtml(currentReward)} · 占用本金 ${escapeHtml(capital)} · 计奖资格 ${escapeHtml(qualified)}</div><div class="sub">${baselineText}</div><div class="sub">加单空间 ${escapeHtml(addRoom)} · ${escapeHtml(addRoomReason)}</div><div class="sub">数据时间 ${escapeHtml(checkedAt)}</div>${channelRows.length ? `<div class="sub">告警投递：${escapeHtml(channelRows.join(" · "))}</div>` : ""}<div class="sub">奖励与到账：${reward}</div><div class="sub">风险与托管状态：${risk}</div><div class="sub">压力估算：实际持仓＋未成交买单余量；未成交部分按假设成交估算，不是已发生亏损。</div><div class="sub">通知时段：飞书全天；语音北京时间 23:00–08:00 静音。</div>${alertRows.join("")}</details>`;
+  return `<details class="pm-lp-observation-details"><summary>详情</summary><div class="sub">预计小时奖励 ${escapeHtml(currentReward)} · 占用本金 ${escapeHtml(capital)} · 计奖资格 ${escapeHtml(qualified)} · ${escapeHtml(qualificationBasis)}</div><div class="sub">${baselineText}</div><div class="sub">加单空间 ${escapeHtml(addRoom)} · ${escapeHtml(addRoomReason)}</div><div class="sub">数据时间 ${escapeHtml(checkedAt)}</div>${channelRows.length ? `<div class="sub">告警投递：${escapeHtml(channelRows.join(" · "))}</div>` : ""}<div class="sub">奖励与到账：${reward}</div><div class="sub">风险与托管状态：${risk}</div><div class="sub">压力估算：实际持仓＋未成交买单余量；未成交部分按假设成交估算，不是已发生亏损。</div><div class="sub">通知时段：飞书全天；语音北京时间 23:00–08:00 静音。</div>${alertRows.join("")}</details>`;
 }
 
 function lpDashboardRewardCell(item, rewards, shown, observations = {}, shownObservations = new Set()) {
@@ -3289,12 +3300,18 @@ function lpDashboardRewardCell(item, rewards, shown, observations = {}, shownObs
       : "UNKNOWN";
   const paid = reward.paid === true ? "已核实到账" : "平台累计，未核实到账";
   const score = lpDashboardOfficialScoring(item);
-  const queryTime = predictionHasValue(item.scoring_checked_at)
-    ? predictionHktTimestamp(item.scoring_checked_at)
-    : "UNKNOWN";
+  // Issue #140: a failed/stale scoring poll shows when the order was last
+  // confirmed, instead of dressing the unknown status up with a fresh clock.
+  const scoringTimeLabel = score === "官方计分 UNKNOWN"
+    ? (predictionHasValue(item.scoring_last_success_at)
+      ? "最后成功 " + predictionHktTimestamp(item.scoring_last_success_at)
+      : "UNKNOWN")
+    : "查询时间 " + (predictionHasValue(item.scoring_checked_at)
+      ? predictionHktTimestamp(item.scoring_checked_at)
+      : "UNKNOWN");
   const marketReward = repeated ? "市场累计见同市场上一行" : "市场累计 " + amount;
   const legacy = "<div><strong>" + escapeHtml(score) + "</strong><span class=\"sub\">"
-    + escapeHtml(queryTime) + "</span><span class=\"sub\">" + escapeHtml(marketReward)
+    + escapeHtml(scoringTimeLabel) + "</span><span class=\"sub\">" + escapeHtml(marketReward)
     + "</span><span class=\"sub\">" + escapeHtml(paid) + "</span></div>";
   const observation = identity && observations[identity] && typeof observations[identity] === "object"
     ? observations[identity]
@@ -3311,11 +3328,18 @@ function lpDashboardRewardCell(item, rewards, shown, observations = {}, shownObs
   const current = yieldKnown
     ? lpDashboardRate(observation.current_yield_pct_per_hour)
     : "待更新";
-  const baseline = observation.trial_baseline && typeof observation.trial_baseline === "object"
-    ? lpDashboardRate(observation.trial_baseline.yield_pct_per_hour)
+  const baselineSource = observation.trial_baseline && typeof observation.trial_baseline === "object"
+    ? observation.trial_baseline
     : observation.trial_reference && typeof observation.trial_reference === "object"
-      ? lpDashboardRate(observation.trial_reference.yield_pct_per_hour)
+      ? observation.trial_reference
+    : null;
+  const baseline = baselineSource
+    ? lpDashboardRate(baselineSource.yield_pct_per_hour)
     : "—";
+  const baselineStamp = baselineSource && predictionHasValue(baselineSource.checked_at)
+    ? predictionHktTimestamp(baselineSource.checked_at)
+    : "UNKNOWN";
+  const baselineLabel = `试挂基准 ${escapeHtml(baseline)} · ${escapeHtml(baselineStamp)}`;
   const addRoomAvailable = !accountFactsStale
     && observation.state === "known"
     && observation.add_room
@@ -3328,14 +3352,20 @@ function lpDashboardRewardCell(item, rewards, shown, observations = {}, shownObs
   const addRoomTone = addRoomAvailable ? " pm-tone-ok" : addRoomDanger ? " pm-tone-danger" : "";
   const addRoomMarkup = `<span class="pm-pill${addRoomTone}">加单空间：${addRoomAvailable ? "有" : "无"}</span>`;
   const yieldNote = yieldKnown
-    ? `<span class="sub">试挂基准 ${escapeHtml(baseline)}</span>`
-    : `<span class="sub">市场奖励率未知 · 不按 0 计</span><span class="sub">试挂基准 ${escapeHtml(baseline)}</span>`;
+    ? `<span class="sub">${baselineLabel}</span>`
+    : `<span class="sub">市场奖励率未知 · 不按 0 计</span><span class="sub">${baselineLabel}</span>`;
   const rateRows = `<div${yieldKnown ? " class=\"num\"" : " class=\"num pm-lp-unknown\""}><strong>当前 ${escapeHtml(current)}</strong>${yieldNote}<div>${addRoomMarkup}</div></div>`;
   return rateRows;
 }
 
 function lpDashboardOfficialScoring(order) {
-  const status = String(order.scoring_status || "unknown").toLowerCase();
+  // Issue #140: the backend now emits "true"/"false"/"unknown" strings, but
+  // rolling releases may still serve JSON booleans; accept both explicitly
+  // and never let a falsy status collapse into "unknown" via `||`.
+  const raw = order.scoring_status;
+  const status = typeof raw === "boolean"
+    ? String(raw)
+    : String(raw ?? "").trim().toLowerCase();
   if (status === "true" || status === "scoring") return "官方计分中";
   if (status === "false" || status === "not_scoring") return "官方未计分";
   return "官方计分 UNKNOWN";
@@ -3909,9 +3939,16 @@ function predictionLpSessionCard(payload) {
   const entryOrder = source.entry_order_id ? `BUY · ${source.entry_order_id}` : "BUY · 未绑定订单";
   const passiveOrder = source.passive_exit_order_id ? `SELL · ${source.passive_exit_order_id}` : "未挂被动卖单";
   const protectedOrder = source.protected_exit_order_id ? `FOK SELL · ${source.protected_exit_order_id}` : "未提交主动卖单";
-  const scoringTime = source.scoring_checked_at
-    ? predictionClock("查询时间", source.scoring_checked_at)
-    : "查询时间：UNKNOWN";
+  // Issue #140: an unknown session scoring status shows the last confirmed
+  // time instead of implying the unknown value was just queried.
+  const scoringUnknown = String(source.scoring_status || "unknown").toLowerCase() === "unknown";
+  const scoringTime = scoringUnknown
+    ? (source.scoring_last_success_at
+      ? predictionClock("最后成功", source.scoring_last_success_at)
+      : "查询时间：UNKNOWN")
+    : source.scoring_checked_at
+      ? predictionClock("查询时间", source.scoring_checked_at)
+      : "查询时间：UNKNOWN";
   const loss = predictionHasValue(source.opening_loss)
     ? predictionSignedMoney(source.opening_loss)
     : "UNKNOWN";

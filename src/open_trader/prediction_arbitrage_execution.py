@@ -152,6 +152,20 @@ def _decimal(value: object) -> Decimal | None:
     return result if result.is_finite() else None
 
 
+def _canonical_decimal(value: Decimal) -> Decimal:
+    """Drop insignificant trailing zeros without exponent notation (issue #140).
+
+    Observation decimals persist through the JSON store, so the same numeric
+    value must not surface as both "0.25" and "0.2500" depending on operand
+    shapes.  Canonical form keeps the numeric semantics untouched.
+    """
+
+    normalized = value.normalize()
+    if normalized == normalized.to_integral_value():
+        return normalized.quantize(Decimal("1"))
+    return normalized
+
+
 def _lp_min_scoring_size(
     minimum_order_size: Decimal | None, reward_min_size: Decimal | None
 ) -> Decimal | None:
@@ -488,6 +502,7 @@ def _mask_lp_observation(
         "exposure_quantity": None,
         "current_yield_pct_per_hour": None,
         "qualified": None,
+        "qualification_basis": None,
         "risk_state": "unknown",
         "risk_warning": None,
         "risk_directions": [],
@@ -670,6 +685,10 @@ class PredictionExecutionService:
         self._lp_reward_refresh_pending: dict[str, set[str]] = {}
         self._lp_reward_refresh_active: set[tuple[str, str]] = set()
         self._lp_reward_refresh_thread: threading.Thread | None = None
+        # Issue #140: process-memory record of the last successful official
+        # scoring read per order id, so a failed poll can still show when the
+        # order was last confirmed scoring (or explicitly not scoring).
+        self._lp_scoring_observations: dict[str, dict[str, str]] = {}
         # 当天 LP 委托：按奖励日缓存的成交聚合（我方订单 id → 汇总成交量），
         # 由后台刷新线程补全，lp_dashboard() 读取缓存做 fail-open 装配。
         self._lp_orders_today_fills: dict[str, dict[str, dict[str, object]]] = {}
@@ -1805,26 +1824,54 @@ class PredictionExecutionService:
                     )
 
                 scoring_reader = getattr(self._trading, "get_order_scoring", None)
-                scoring_by_order: dict[str, tuple[object, str | None]] = {}
+                scoring_by_order: dict[str, tuple[str, str | None, str | None]] = {}
                 for order in orders:
                     order_id = str(order.get("order_id") or "")
                     if order.get("management") != "manual_read_only" or not order_id:
                         continue
                     if order_id not in scoring_by_order:
-                        if not callable(scoring_reader):
-                            scoring_by_order[order_id] = ("unknown", None)
-                        else:
+                        attempted_at = _timestamp(datetime.now(UTC))
+                        status = "unknown"
+                        # Deliberately not named `checked_at`: that name is
+                        # already the dashboard's account snapshot timestamp.
+                        scoring_read_at: str | None = attempted_at
+                        last_success_at = (
+                            self._lp_scoring_observations.get(order_id, {}).get(
+                                "scoring_last_success_at"
+                            )
+                        )
+                        if callable(scoring_reader):
                             try:
                                 scoring = _call(scoring_reader, order_id)
                             except Exception:
-                                scoring = "unknown"
-                            scoring_by_order[order_id] = (
-                                scoring if isinstance(scoring, bool) else "unknown",
-                                _timestamp(datetime.now(UTC)),
-                            )
-                    order["scoring_status"], order["scoring_checked_at"] = (
-                        scoring_by_order[order_id]
-                    )
+                                scoring = None
+                            if isinstance(scoring, bool):
+                                status = "true" if scoring else "false"
+                                scoring_read_at = attempted_at
+                                last_success_at = attempted_at
+                                self._lp_scoring_observations[order_id] = {
+                                    "scoring_status": status,
+                                    "scoring_last_success_at": attempted_at,
+                                }
+                        scoring_by_order[order_id] = (
+                            status,
+                            scoring_read_at,
+                            last_success_at,
+                        )
+                    order["scoring_status"], order["scoring_checked_at"], order[
+                        "scoring_last_success_at"
+                    ] = scoring_by_order[order_id]
+                live_manual_order_ids = {
+                    str(order.get("order_id") or "")
+                    for order in orders
+                    if order.get("management") == "manual_read_only"
+                    and order.get("order_id")
+                }
+                self._lp_scoring_observations = {
+                    order_id: record
+                    for order_id, record in self._lp_scoring_observations.items()
+                    if order_id in live_manual_order_ids
+                }
 
                 candidate_reader = getattr(self._lp, "candidate_snapshot", None)
                 try:
@@ -1965,6 +2012,7 @@ class PredictionExecutionService:
                             "state": "filled",
                             "scoring_status": "unknown",
                             "scoring_checked_at": None,
+                            "scoring_last_success_at": None,
                             "min_scoring_size": None,
                             "purpose": None,
                             "management": (
@@ -2117,9 +2165,53 @@ class PredictionExecutionService:
                     ),
                 }
                 if cached is not None:
+                    cached_orders = cached.get("orders")
+                    degraded_orders = (
+                        [
+                            {
+                                **order,
+                                # Issue #140: a stale snapshot carries no fresh
+                                # official scoring; keep the last success time
+                                # instead of replaying the old status verbatim.
+                                "scoring_status": "unknown",
+                                "scoring_last_success_at": (
+                                    order.get("scoring_checked_at")
+                                    if order.get("scoring_checked_at") is not None
+                                    else order.get("scoring_last_success_at")
+                                ),
+                            }
+                            for order in cached_orders
+                            if isinstance(order, Mapping)
+                        ]
+                        if isinstance(cached_orders, (list, tuple))
+                        else cached_orders
+                    )
+                    cached_today_orders = cached.get("lp_orders_today")
+                    degraded_today_orders = (
+                        [
+                            {
+                                **order,
+                                # Issue #140: the 当天 LP 委托 table renders from
+                                # lp_orders_today, so stale scoring must be
+                                # downgraded here exactly like `orders`.
+                                "scoring_status": "unknown",
+                                "scoring_last_success_at": (
+                                    order.get("scoring_checked_at")
+                                    if order.get("scoring_checked_at") is not None
+                                    else order.get("scoring_last_success_at")
+                                ),
+                            }
+                            for order in cached_today_orders
+                            if isinstance(order, Mapping)
+                        ]
+                        if isinstance(cached_today_orders, (list, tuple))
+                        else cached_today_orders
+                    )
                     return {
                         **cached,
                         **candidate_projection,
+                        "orders": degraded_orders,
+                        "lp_orders_today": degraded_today_orders,
                         "state": "stale",
                         "stale": True,
                         "lp_share_watch_state": self.lp_share_watch_state(),
@@ -2361,6 +2453,8 @@ class PredictionExecutionService:
             if hourly_reward is None or hourly_reward < 0:
                 reward_known = False
                 rate_reason = rate_reason or "reward_rate_unknown"
+            elif reward_known:
+                hourly_reward = _canonical_decimal(hourly_reward)
 
             exposure_quantity = Decimal("0")
             occupied_capital = Decimal("0")
@@ -2429,16 +2523,38 @@ class PredictionExecutionService:
                     reward_share_positive = reward_share_positive or (
                         percentage is not None and percentage > 0
                     )
-            orders_qualified = bool(buy_orders) and all(
-                order.get("scoring_status") is True for order in buy_orders
-            )
-            qualified = orders_qualified or (not buy_orders and reward_share_positive)
+            # Issue #140: qualification is three-state and carries its basis.
+            # Official per-order scoring decides when buy orders exist; a
+            # contradictory mix (explicit false vs positive reward share) or
+            # any unknown keeps the state explicitly UNKNOWN instead of
+            # guessing from the reward share alone.
+            orders_qualified: bool | None
+            qualification_basis: str | None = None
+            if buy_orders:
+                buy_scoring = {
+                    str(order.get("scoring_status")) for order in buy_orders
+                }
+                if buy_scoring == {"true"}:
+                    orders_qualified = True
+                    qualification_basis = "orders_scoring"
+                elif buy_scoring == {"false"} and not reward_share_positive:
+                    orders_qualified = False
+                    qualification_basis = "orders_not_scoring"
+                else:
+                    orders_qualified = None
+            else:
+                orders_qualified = True if reward_share_positive else None
+                if orders_qualified is True:
+                    qualification_basis = "reward_share_positive"
+            qualified = orders_qualified
 
             rate_pct = (
                 hourly_reward / occupied_capital * Decimal("100")
                 if reward_known and exposure_known and occupied_capital > 0
                 else None
             )
+            if rate_pct is not None:
+                rate_pct = _canonical_decimal(rate_pct)
             market_metadata = next(
                 (row for row in market_rows if row.get("token_id")), {}
             )
@@ -2590,6 +2706,7 @@ class PredictionExecutionService:
                 "trial_reference": trial_reference,
                 "trial_baseline": baseline,
                 "qualified": qualified,
+                "qualification_basis": qualification_basis,
                 "risk_state": risk_state,
                 "risk_warning": risk_warning,
                 "risk_directions": risk_directions,
@@ -2666,7 +2783,7 @@ class PredictionExecutionService:
         def row_positive(condition_id: str, scoring: object) -> bool:
             observation = observations.get(condition_id)
             return (
-                scoring is True
+                scoring == "true"
                 or _lp_market_reward_known(observation)
                 or reward_record_today(condition_id)
             )
@@ -2680,7 +2797,7 @@ class PredictionExecutionService:
             excluded = (
                 not managed
                 and not row_positive(condition_id, scoring)
-                and scoring is False
+                and scoring == "false"
                 and market_negative(condition_id)
             )
             if excluded:

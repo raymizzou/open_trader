@@ -7028,6 +7028,151 @@ console.log(JSON.stringify({
     }
 
 
+def test_lp_scoring_status_word_list_accepts_bool_and_string() -> None:
+    """S2-a: 计分状态显式词表——布尔/字符串同义，null 与异常值落 UNKNOWN。"""
+
+    output = run_dashboard_js(r'''
+const checkedAt = "2026-09-16T02:05:00Z";
+const row = (scoring) => ({
+  order_id: "o1", condition_id: "condition-1", token_id: "token-1",
+  market_title: "Scoring display", market_url: "https://polymarket.com/event/s",
+  outcome: "YES", side: "BUY", status: "LIVE", price: "0.50", quantity: "80",
+  filled_quantity: "40", remaining_quantity: "40", state: "open",
+  management: "manual_read_only", read_only: true,
+  scoring_status: scoring, scoring_checked_at: checkedAt,
+});
+const card = (scoring) => predictionLpCard({lp_dashboard: {
+  state: "ready", stale: false, checked_at: checkedAt, last_success_at: checkedAt,
+  orders: [row(scoring)], positions: [],
+  lp_orders_today: [row(scoring)],
+  non_lp_row_count: 0, market_rewards: [], lp_observations: {},
+  recommendations: [], lp_session: {state: "none"},
+}});
+const table = (html) => (html.match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
+console.log(JSON.stringify({
+  boolFalse: table(card(false)).includes("YES · 买入 · 未成交 · 官方未计分"),
+  strFalse: table(card("false")).includes("YES · 买入 · 未成交 · 官方未计分"),
+  nullUnknown: table(card(null)).includes("YES · 买入 · 未成交 · 官方计分 UNKNOWN"),
+  boolTrue: table(card(true)).includes("YES · 买入 · 未成交 · 官方计分中"),
+  strTrue: table(card("true")).includes("YES · 买入 · 未成交 · 官方计分中"),
+}));
+''')
+    assert json.loads(output) == {
+        "boolFalse": True,
+        "strFalse": True,
+        "nullUnknown": True,
+        "boolTrue": True,
+        "strTrue": True,
+    }
+
+
+def test_lp_scoring_unknown_shows_last_success_time() -> None:
+    """S2-b: unknown + 最后成功时间 → 「最后成功 <HKT>」；无记录仅 UNKNOWN；有效状态显示查询时间。"""
+
+    output = run_dashboard_js(r'''
+const checkedAt = "2026-09-16T02:05:00Z";
+const row = (scoring, extra = {}) => ({
+  order_id: "o1", condition_id: "condition-1", token_id: "token-1",
+  market_title: "Scoring display", market_url: "https://polymarket.com/event/s",
+  outcome: "YES", side: "BUY", status: "LIVE", price: "0.50", quantity: "80",
+  filled_quantity: "40", remaining_quantity: "40", state: "open",
+  management: "manual_read_only", read_only: true,
+  scoring_status: scoring, scoring_checked_at: checkedAt, ...extra,
+});
+const card = (row) => predictionLpCard({lp_dashboard: {
+  state: "ready", stale: false, checked_at: checkedAt, last_success_at: checkedAt,
+  orders: [row], positions: [],
+  lp_orders_today: [row],
+  non_lp_row_count: 0, market_rewards: [], lp_observations: {},
+  recommendations: [], lp_session: {state: "none"},
+}});
+const table = (html) => (html.match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
+const unknownWithHistory = table(card(row("unknown", {
+  scoring_last_success_at: "2026-09-15T20:00:00Z",
+})));
+const unknownWithoutHistory = table(card(row("unknown", {scoring_checked_at: null})));
+const known = table(card(row("true")));
+console.log(JSON.stringify({
+  unknownShowsLastSuccess: unknownWithHistory.includes(
+    "最后成功 2026-09-16 04:00:00 HKT"
+  ),
+  unknownWithoutHistoryKeepsUnknown: unknownWithoutHistory.includes(
+    "<span class=\"sub\">UNKNOWN</span>"
+  ) && !unknownWithoutHistory.includes("最后成功"),
+  knownShowsQueryTime: known.includes("查询时间 2026-09-16 10:05:00 HKT"),
+}));
+''')
+    assert json.loads(output) == {
+        "unknownShowsLastSuccess": True,
+        "unknownWithoutHistoryKeepsUnknown": True,
+        "knownShowsQueryTime": True,
+    }
+
+
+def test_lp_rate_display_thresholds_and_fallbacks() -> None:
+    """S2-c: 奖励率展示——0、极小正值阈值式、常规值与缺省占位。"""
+
+    output = run_dashboard_js(r'''
+console.log(JSON.stringify({
+  zero: lpDashboardRate("0"),
+  tiny: lpDashboardRate("0.004"),
+  quarter: lpDashboardRate("0.25"),
+  missing: lpDashboardRate(null),
+}));
+''')
+    assert json.loads(output) == {
+        "zero": "0%／小时",
+        "tiny": "<0.01%／小时",
+        "quarter": "0.25%／小时",
+        "missing": "—",
+    }
+
+
+def test_lp_unknown_observation_keeps_current_slot_and_dated_baseline() -> None:
+    """S2-d: 观察 unknown + 试挂基准 → 同时显示「待更新」与带时间的基准，当前槽不被顶替。"""
+
+    output = run_dashboard_js(r'''
+const checkedAt = "2026-09-16T02:05:00Z";
+const dashboard = {
+  state: "ready", stale: false, checked_at: checkedAt, last_success_at: checkedAt,
+  orders: [], positions: [],
+  lp_orders_today: [
+    {order_id: "o1", condition_id: "condition-1", token_id: "token-1",
+      market_title: "Baseline display", market_url: "https://polymarket.com/event/b",
+      outcome: "YES", side: "BUY", status: "LIVE", price: "0.50", quantity: "80",
+      filled_quantity: "40", remaining_quantity: "40", state: "open",
+      management: "manual_read_only", read_only: true,
+      scoring_status: "true", scoring_checked_at: checkedAt},
+  ],
+  non_lp_row_count: 0, market_rewards: [],
+  lp_observations: {
+    "condition-1": {
+      state: "unknown", stage: "added", stale: true, reason: "reward_rates_stale",
+      current_hourly_reward_usd: null, occupied_capital_usd: "20",
+      current_yield_pct_per_hour: null,
+      trial_baseline: {yield_pct_per_hour: "0.25", checked_at: "2026-09-16T01:00:00Z",
+        quantity: "40", price: "0.50", occupied_capital_usd: "20"},
+      qualified: null, risk_state: "known", risk_warning: false,
+      risk_directions: [],
+      add_room: {available: false, reason: "current_yield_unknown"},
+      checked_at: checkedAt,
+    },
+  },
+  recommendations: [], lp_session: {state: "none"},
+};
+const html = predictionLpCard({lp_dashboard: dashboard});
+const orderTable = (html.match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
+console.log(JSON.stringify({
+  currentSlotKept: orderTable.includes("当前 待更新"),
+  datedBaseline: orderTable.includes("试挂基准 0.25%／小时 · 2026-09-16 09:00:00 HKT"),
+}));
+''')
+    assert json.loads(output) == {
+        "currentSlotKept": True,
+        "datedBaseline": True,
+    }
+
+
 def test_dashboard_display_number_formats_numeric_text_only() -> None:
     output = run_dashboard_js(r'''
 console.log(JSON.stringify({
