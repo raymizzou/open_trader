@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, time, timedelta
-from decimal import Decimal, ROUND_CEILING
+from decimal import Decimal, ROUND_CEILING, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 
 from .polymarket_lp_risk import (
@@ -30,6 +30,7 @@ LP_DAILY_AMPLITUDE_LIMIT = Decimal("0.01")
 LP_SHORTLIST_LIMIT = 50
 LP_TRIAL_CANDIDATE_LIMIT = 10
 LP_COMPETITION_MAX_AGE = timedelta(hours=1)
+LP_REFERENCE_PRICE_MAX_AGE = timedelta(hours=1)
 
 
 def _lp_history_summary(direction: Mapping[str, object]) -> Mapping[str, object] | None:
@@ -651,17 +652,31 @@ def _lp_event_window_rejections(
     return rejections
 
 
-def _lp_trial_capital(candidate: Mapping[str, object]) -> tuple[int, Decimal]:
-    capital = candidate.get("reference_capital")
-    if isinstance(capital, Decimal) and capital > 0:
-        return (0, capital)
-    return (1, Decimal("0"))
+def _lp_reference_price_state(
+    summary: object,
+    *,
+    now: datetime,
+) -> tuple[str, datetime | None]:
+    """Classify the summary price freshness: known, stale, or missing."""
+
+    if not isinstance(summary, Mapping):
+        return "missing", None
+    checked_value = summary.get("checked_at", summary.get("updated_at"))
+    try:
+        checked_at = _timestamp(checked_value, name="reference_price_checked_at")
+    except ValueError:
+        return "missing", None
+    age = (now - checked_at).total_seconds()
+    if age >= LP_REFERENCE_PRICE_MAX_AGE.total_seconds():
+        return "stale", checked_at
+    return "known", checked_at
 
 
 def _lp_trial_direction_row(
     direction: Mapping[str, object],
     *,
     daily_pool_usd: Decimal,
+    now: datetime,
 ) -> dict[str, object] | None:
     """Build one trial-direction candidate with the legalized minimum size."""
 
@@ -677,13 +692,14 @@ def _lp_trial_direction_row(
         rounding=ROUND_CEILING
     ) * Decimal("0.01")
     summary = direction.get("history_summary")
-    reference_price = (
-        _maybe_decimal(summary.get("latest_midpoint"))
-        if isinstance(summary, Mapping)
-        else None
-    )
-    if reference_price is not None and not Decimal("0") < reference_price <= Decimal("1"):
-        reference_price = None
+    price_state, price_checked_at = _lp_reference_price_state(summary, now=now)
+    reference_price: Decimal | None = None
+    if price_state == "known" and isinstance(summary, Mapping):
+        reference_price = _maybe_decimal(summary.get("latest_midpoint"))
+        if reference_price is not None and not Decimal("0") < reference_price <= Decimal("1"):
+            reference_price = None
+    if price_state == "known" and reference_price is None:
+        price_state = "missing"
     summary_fields = (
         "amplitude",
         "sample_count",
@@ -711,6 +727,10 @@ def _lp_trial_direction_row(
         "min_quantity": quantity,
         "minimum_order_size": minimum,
         "reward_min_size": reward_minimum,
+        "reference_price_state": price_state,
+        "reference_price_checked_at": (
+            _iso(price_checked_at) if price_checked_at is not None else None
+        ),
         "reference_price": reference_price,
         "reference_capital": (
             quantity * reference_price if reference_price is not None else None
@@ -796,11 +816,16 @@ def lp_trial_candidates(
 ) -> dict[str, object]:
     """Project the at most ten trial candidates shown on the LP dashboard.
 
-    Pipeline: cheap base facts (including event windows) then the official
-    competition coarse ranking, then the hard over-available exclusion, then
-    the fixed top-ten cap.  Explicit zero competition means nobody competes
-    and is excluded as a danger signal; unread or stale competition stays
-    unknown, sorts last, and never blocks the funnel.
+    Pipeline: cheap base facts (including event windows), one direction
+    representative per market, the hard over-available exclusion, a normal
+    queue (known reference price, ranked by the assumed hourly upper bound
+    daily pool ÷ (24 × reference capital)) and a backup queue (unknown
+    reference price, by daily pool), then the query batch: the first nine
+    normal rows plus backup fill up to ten.  Only the batch head is verified
+    against the live book by the service.  Explicit zero competition means
+    nobody competes and is excluded as a danger signal; unread or stale
+    competition stays unknown, never fills in as 0, and only breaks ties
+    after the assumed upper bound.
     """
 
     result: dict[str, object] = {
@@ -882,19 +907,50 @@ def lp_trial_candidates(
         pool = _maybe_decimal(row.get("daily_pool_usd"))
         if pool is None:
             continue
-        best: dict[str, object] | None = None
+        parsed: list[dict[str, object]] = []
         rules_known = True
         for direction in directions_by_condition.get(condition_id, ()):
-            candidate = _lp_trial_direction_row(direction, daily_pool_usd=pool)
+            candidate = _lp_trial_direction_row(
+                direction, daily_pool_usd=pool, now=checked_at
+            )
             if candidate is None:
                 rules_known = False
                 continue
-            if best is None or _lp_trial_capital(candidate) < _lp_trial_capital(best):
-                best = candidate
-        if best is None:
+            parsed.append(candidate)
+        if not parsed:
             if not rules_known:
                 add_reason("base", row, "market_rules_unknown")
             continue
+        # Direction representative: among base-passing directions prefer the
+        # ones with a known reference price and the lowest reference capital;
+        # with no known price anywhere the identity falls back to the first
+        # direction by outcome label then token_id, and the market can only
+        # enter the backup queue.
+        known = [
+            candidate
+            for candidate in parsed
+            if candidate.get("reference_capital") is not None
+        ]
+        if known:
+            best = min(
+                known,
+                key=lambda candidate: (
+                    candidate.get("reference_capital"),
+                    str(candidate.get("outcome") or ""),
+                    str(candidate.get("token_id") or ""),
+                ),
+            )
+        else:
+            best = min(
+                parsed,
+                key=lambda candidate: (
+                    str(candidate.get("outcome") or ""),
+                    str(candidate.get("token_id") or ""),
+                ),
+            )
+        best["queue"] = (
+            "backup" if best.get("reference_capital") is None else "normal"
+        )
         base_candidates.append(best)
         base_condition_ids.add(condition_id)
     for condition_id in sorted(read_conditions - base_condition_ids):
@@ -954,7 +1010,23 @@ def lp_trial_candidates(
         }
         ranked.append(candidate)
 
-    def sort_key(candidate: Mapping[str, object]) -> tuple[int, Decimal, int, Decimal, str]:
+    def upper_bound_of(candidate: Mapping[str, object]) -> tuple[int, Decimal]:
+        capital = candidate.get("reference_capital")
+        pool = candidate.get("daily_pool_usd")
+        if (
+            isinstance(capital, Decimal)
+            and capital > 0
+            and isinstance(pool, Decimal)
+        ):
+            upper = (
+                pool / (Decimal("24") * capital) * Decimal("100")
+            ).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+            return (0, -upper)
+        return (1, Decimal("0"))
+
+    def sort_key(
+        candidate: Mapping[str, object],
+    ) -> tuple[int, Decimal, int, Decimal, int, Decimal, str]:
         competition_row = candidate.get("competition")
         assert isinstance(competition_row, Mapping)
         if competition_row.get("state") == "known":
@@ -963,53 +1035,63 @@ def lp_trial_candidates(
         else:
             competition_key = (1, Decimal("0"))
         capital = candidate.get("reference_capital")
-        pool = candidate.get("daily_pool_usd")
-        ratio: Decimal | None = None
-        if (
-            isinstance(capital, Decimal)
-            and capital > 0
-            and isinstance(pool, Decimal)
-        ):
-            ratio = pool / capital
-        ratio_key = (0, -ratio) if ratio is not None else (1, Decimal("0"))
+        if isinstance(capital, Decimal) and capital > 0:
+            capital_key = (0, capital)
+        else:
+            capital_key = (1, Decimal("0"))
         return (
+            *upper_bound_of(candidate),
             *competition_key,
-            *ratio_key,
-            str(candidate.get("condition_id") or ""),
+            *capital_key,
+            str(candidate.get("market_id") or candidate.get("condition_id") or ""),
         )
 
-    ranked.sort(key=sort_key)
-    for rank_position, candidate in enumerate(ranked, start=1):
+    def backup_sort_key(candidate: Mapping[str, object]) -> tuple[Decimal, str]:
+        pool = candidate.get("daily_pool_usd")
+        return (
+            -(pool if isinstance(pool, Decimal) else Decimal("0")),
+            str(candidate.get("market_id") or candidate.get("condition_id") or ""),
+        )
+
+    normal_queue = [row for row in ranked if row.get("queue") == "normal"]
+    backup_queue = [row for row in ranked if row.get("queue") != "normal"]
+    normal_queue.sort(key=sort_key)
+    backup_queue.sort(key=backup_sort_key)
+    ranked = normal_queue + backup_queue
+    for candidate in ranked:
         competition_row = candidate.get("competition")
         assert isinstance(competition_row, Mapping)
         capital = candidate.get("reference_capital")
         pool = candidate.get("daily_pool_usd")
-        ratio: Decimal | None = None
+        competition_value = competition_row.get("value")
+        upper_bound: Decimal | None = None
         if (
             isinstance(capital, Decimal)
             and capital > 0
             and isinstance(pool, Decimal)
         ):
-            ratio = pool / capital
-        competition_value = competition_row.get("value")
+            upper_bound = (
+                pool / (Decimal("24") * capital) * Decimal("100")
+            ).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+        candidate["query_rate_upper_bound"] = upper_bound
         candidate["reason"] = [
             (
-                f"竞争 {competition_value}（第 {rank_position} 低）"
+                f"竞争 {competition_value}（粗排参考）"
                 if competition_row.get("state") == "known"
-                else "竞争未知（按未知排最后，不填 0）"
+                else "竞争未知（不填 0；指标并列时排已知之后）"
             ),
             (
-                f"参考指标 日奖池÷占资 {ratio.quantize(Decimal('0.01'))}"
-                if ratio is not None
-                else "参考指标 日奖池÷占资 未知"
+                "假设每小时收益上限 "
+                f"{upper_bound}%/小时（参考价格不变且取得全部奖池时的乐观上限，"
+                "仅决定查询顺序）"
+                if upper_bound is not None
+                else "假设每小时收益上限 未知（参考价缺失或过期；仅决定查询顺序）"
             ),
             "无已知订单或持仓",
         ]
     excluded_counts = {"competition_empty": 0, "over_available": 0}
-    selected: list[dict[str, object]] = []
-    for candidate in ranked:
-        if len(selected) >= LP_TRIAL_CANDIDATE_LIMIT:
-            break
+
+    def over_available(candidate: Mapping[str, object]) -> bool:
         capital = candidate.get("reference_capital")
         if (
             available_capital is not None
@@ -1018,7 +1100,38 @@ def lp_trial_candidates(
         ):
             excluded_counts["over_available"] += 1
             add_reason("trial", candidate, "capital_over_available")
+            return True
+        return False
+
+    # The known-capital hard exclusion lands before the batch is formed:
+    # an excluded market enters no queue and never consumes a batch slot.
+    # The sort-stage count stays the pre-exclusion queue total.
+    sort_count = len(normal_queue) + len(backup_queue)
+    kept_normal = [
+        candidate for candidate in normal_queue if not over_available(candidate)
+    ]
+    kept_backup = [
+        candidate for candidate in backup_queue if not over_available(candidate)
+    ]
+    batch: list[dict[str, object]] = list(
+        kept_normal[: LP_TRIAL_CANDIDATE_LIMIT - 1]
+    )
+    for candidate in kept_backup:
+        if len(batch) >= LP_TRIAL_CANDIDATE_LIMIT:
+            break
+        batch.append(candidate)
+    for candidate in kept_normal[LP_TRIAL_CANDIDATE_LIMIT - 1:]:
+        if len(batch) >= LP_TRIAL_CANDIDATE_LIMIT:
+            break
+        batch.append(candidate)
+    seen_conditions: set[str] = set()
+    selected: list[dict[str, object]] = []
+    for candidate in batch:
+        condition_id = str(candidate.get("condition_id") or "")
+        if condition_id in seen_conditions:
             continue
+        seen_conditions.add(condition_id)
+        candidate["verification"] = "pending"
         candidate["reason"] = list(candidate.get("reason") or [])
         if available_capital is None:
             candidate["reason"].append("可用资金未知（不做超可用排除）")
@@ -1031,7 +1144,7 @@ def lp_trial_candidates(
     funnel: dict[str, object] = {
         "read": len(read_conditions),
         "base": len(base_candidates),
-        "sort": len(ranked),
+        "sort": sort_count,
         "trial": len(selected),
         "competition_known": sum(
             1
@@ -1049,6 +1162,9 @@ def lp_trial_candidates(
             "competition_empty": empty_competition,
             "over_available": excluded_counts["over_available"],
         },
+        "normal_queue_count": len(kept_normal),
+        "backup_queue_count": len(kept_backup),
+        "reference_price_unknown": len(kept_backup),
         "gap_reason": (
             None
             if len(selected) >= LP_TRIAL_CANDIDATE_LIMIT

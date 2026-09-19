@@ -688,14 +688,13 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
             and row.get("market_id") == "candidate-market"
             and row.get("condition_id") == "candidate-condition"
         ]
-        assert candidate_rows
-        # 入选候选行并入实时盘口：YES 方向实时买价 0.40（原 risk guidance 价）。
-        assert any(
-            isinstance(row, dict)
-            and row.get("token_id") == "candidate-yes"
-            and Decimal(str(row.get("realtime_price"))) == Decimal("0.40")
-            for row in candidate_rows
-        ), repr(candidate_rows)
+        # Issue 141 起每轮仅队首 1 行读取实时盘口并置 verified，方向代表按占资
+        # 最低（同占资按 outcome 升序取代表），因此不再断言特定方向；
+        # 队首行实时买价为 0.40。
+        assert len(candidate_rows) == 1, repr(candidate_rows)
+        head_row = candidate_rows[0]
+        assert head_row["verification"] == "verified"
+        assert Decimal(str(head_row["realtime_price"])) == Decimal("0.40")
         risk_session = store.lp_session("lp-risk-session")
         assert risk_session is not None
         assert risk_session["state"] == "entry_open"

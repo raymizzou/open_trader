@@ -9679,7 +9679,9 @@ def test_lp_refresh_reads_risk_books_only_for_selected_markets(tmp_path: Path) -
         ) -> dict[str, dict[str, object]]:
             now[0] = max(now[0], initial_now) + timedelta(seconds=1)
             self.book_requests.append(tuple(token_ids))
-            expected = {f"token-{market_id}" for market_id in markets[:10]}
+            # Issue 141: only the batch head is read; any other request set
+            # (extra tokens or out-of-batch tokens) must fail.
+            expected = {f"token-{markets[0]}"}
             if set(token_ids) != expected:
                 raise AssertionError("books requested outside trial candidates")
             return {
@@ -9740,11 +9742,19 @@ def test_lp_refresh_reads_risk_books_only_for_selected_markets(tmp_path: Path) -
     )
     assert service.refresh_price_history()["state"] == "known"
     snapshot = service.refresh_candidates(force=True)
-    # Books are read only for the ten displayed trial candidates.
+    # Issue 141: books are read only for the batch head (1 token), not for
+    # all ten displayed trial candidates.
     assert [row["market_id"] for row in snapshot["candidates"]] == list(markets[:10])
-    assert exchange.book_requests == [
-        tuple(f"token-{market_id}" for market_id in markets[:10])
-    ]
+    assert exchange.book_requests == [(f"token-{markets[0]}",)]
+    # Direction invariants: exactly the batch head row (markets[0]) is
+    # verified with realtime data; the other nine rows stay pending.
+    candidate_rows = snapshot["candidates"]
+    assert len(candidate_rows) == 10
+    assert candidate_rows[0]["market_id"] == markets[0]
+    assert candidate_rows[0]["verification"] == "verified"
+    assert "realtime_price" in candidate_rows[0]
+    assert all(row["verification"] == "pending" for row in candidate_rows[1:])
+    assert all("realtime_capital" not in row for row in candidate_rows[1:])
     assert snapshot["funnel"]["read"] == 51
     assert snapshot["funnel"]["base"] == 51
     assert snapshot["funnel"]["sort"] == 51
@@ -9908,7 +9918,9 @@ def test_lp_refresh_keeps_stale_batches_out_of_current_selection(tmp_path: Path)
     assert stale["last_success_at"] == first_last_success
     assert stale["recommendations"] == []
     assert stale["selected_market_ids"] == ["M1", "M2"]
-    assert exchange.book_requests == [("token-M1", "token-M2")]
+    # Issue 141: books are read only for the batch head (1 token), not for
+    # all displayed trial candidates.
+    assert exchange.book_requests == [("token-M1",)]
 
     # A completed batch replaces the previous selection instead of carrying
     # old markets forward when the catalog changes.
@@ -10027,7 +10039,7 @@ def test_lp_refresh_keeps_stale_batches_out_of_current_selection(tmp_path: Path)
     assert [row["market_id"] for row in second_replacement["candidates"]] == ["M3"]
     assert second_replacement["selected_market_ids"] == ["M3"]
     assert replacement_exchange.book_requests == [
-        ("token-M1", "token-M2"),
+        ("token-M1",),
         ("token-M3",),
     ]
 

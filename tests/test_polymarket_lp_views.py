@@ -330,6 +330,47 @@ def _trial(
     )
 
 
+def test_trial_candidates_order_backup_queue_by_pool_then_market_id() -> None:
+    # Backup rows carry no usable reference price, so the assumed upper bound
+    # is undefined; they queue by daily pool descending, then market_id asc.
+    def stale(market_id: str, pool: str) -> dict[str, object]:
+        direction = _trial_direction(market_id, pool=pool, latest_midpoint="0.30")
+        direction["history_summary"]["checked_at"] = NOW - timedelta(hours=2)
+        return direction
+
+    result = _trial(
+        [stale("C", "200"), stale("A", "500"), stale("B", "100")],
+        competition={},
+    )
+
+    # Pools 200/500/100 → order 500, 200, 100 (ids deliberately differ from
+    # pool order so market_id sorting cannot fake a pool sort).
+    assert [row["market_id"] for row in result["rows"]] == ["A", "C", "B"]
+    assert all(row["queue"] == "backup" for row in result["rows"])
+
+    tied = _trial(
+        [stale("Z", "120"), stale("M", "120")],
+        competition={},
+    )
+    assert [row["market_id"] for row in tied["rows"]] == ["M", "Z"]
+
+
+def test_trial_candidates_report_query_rate_upper_bound_and_copy() -> None:
+    # Independent arithmetic: capital = 20 × 0.45 = 9;
+    # 5 / (24 × 9) × 100 = 2.3148148… → ROUND_HALF_UP 6dp → 2.314815.
+    direction = _trial_direction("A", pool="5", latest_midpoint="0.45")
+
+    result = _trial([direction], competition={})
+
+    row = result["rows"][0]
+    assert row["query_rate_upper_bound"] == Decimal("2.314815")
+    reason = " ".join(str(item) for item in row["reason"])
+    assert "假设" in reason
+    assert "上限" in reason
+    assert "仅决定查询顺序" in reason
+    assert "预计收益" not in reason
+
+
 def test_trial_candidates_derive_min_quantity_and_reference_capital() -> None:
     direction = _trial_direction(
         "A", minimum_order_size="10", reward_min_size="20", latest_midpoint="0.33"
@@ -399,9 +440,31 @@ def test_trial_candidates_cap_ten_report_gap_and_zero_competition() -> None:
     assert unread["funnel"]["excluded"]["competition_empty"] == 0
 
 
+def test_trial_candidates_order_by_query_rate_upper_bound_first() -> None:
+    # Independent arithmetic: X 1/(24×10)×100 = 0.416667; Y 5/(24×9)×100 = 2.314815.
+    # Y's competition value (50) must not outrank X's (1): the assumed hourly
+    # upper bound is the primary sort key.
+    directions = [
+        _trial_direction("X", pool="1", latest_midpoint="0.50"),
+        _trial_direction("Y", pool="5", latest_midpoint="0.45"),
+    ]
+    competition = {
+        "condition-X": (Decimal("1"), NOW),
+        "condition-Y": (Decimal("50"), NOW),
+    }
+
+    result = _trial(directions, competition=competition)
+
+    assert [row["market_id"] for row in result["rows"]] == ["Y", "X"]
+
+
 def test_trial_candidates_order_by_competition_pool_yield_and_identity() -> None:
-    # Independent arithmetic: capital = 20 × midpoint; ratio = pool ÷ capital.
-    # B: 100/10=10, A: 200/10=20, C: 120/8=15, D/E: 100/10=10 each.
+    # Independent arithmetic: capital = 20 × midpoint; assumed hourly upper
+    # bound = pool ÷ (24 × capital) × 100.
+    # A: 200/10 → 83.333333, C/U: 120/8 → 62.5, B/D/E: 100/10 → 41.666667.
+    # C and U tie → C has known competition 12.5, ranks before unknown U.
+    # B/D/E tie → competition D(5), E(5) before B(12.5); D/E share competition
+    # and capital → market_id D < E.
     directions = [
         _trial_direction("B", pool="100", latest_midpoint="0.50"),
         _trial_direction("A", pool="200", latest_midpoint="0.50"),
@@ -421,11 +484,179 @@ def test_trial_candidates_order_by_competition_pool_yield_and_identity() -> None
     result = _trial(directions, competition=competition)
 
     assert [row["market_id"] for row in result["rows"]] == [
-        "D", "E", "C", "B", "A", "U",
+        "A", "C", "U", "D", "E", "B",
     ]
-    unknown_row = result["rows"][-1]
+    unknown_row = result["rows"][2]
     assert unknown_row["competition"]["state"] == "unknown"
     assert unknown_row["competition"]["value"] is None
+
+
+def test_trial_candidates_assemble_batch_from_normal_and_backup_queues() -> None:
+    # Independent arithmetic: pool 200-i ÷ (24 × 20 × 0.55) × 100 with
+    # capital 11.00 gives each normal market a distinct assumed upper bound,
+    # descending with pool. Backup markets carry a stale price.
+    def normal(market_id: str, pool: str) -> dict[str, object]:
+        return _trial_direction(market_id, pool=pool, latest_midpoint="0.55")
+
+    def stale(market_id: str, pool: str) -> dict[str, object]:
+        direction = normal(market_id, pool)
+        direction["history_summary"]["checked_at"] = NOW - timedelta(hours=2)
+        return direction
+
+    twelve = [normal(f"M{index:02d}", str(200 - index)) for index in range(1, 13)]
+    backups = [stale("B200", "200"), stale("B300", "300")]
+
+    batched = _trial([*twelve, *backups], competition={})
+
+    rows = batched["rows"]
+    assert [row["market_id"] for row in rows] == [
+        "M01", "M02", "M03", "M04", "M05", "M06",
+        "M07", "M08", "M09", "B300",
+    ]
+    assert [row["queue"] for row in rows] == ["normal"] * 9 + ["backup"]
+    assert all(row["verification"] == "pending" for row in rows)
+    condition_ids = [row["condition_id"] for row in rows]
+    assert len(condition_ids) == len(set(condition_ids))
+    assert batched["funnel"]["normal_queue_count"] == 12
+    assert batched["funnel"]["backup_queue_count"] == 2
+    assert batched["funnel"]["reference_price_unknown"] == 2
+
+    without_backup = _trial(twelve, competition={})
+    assert [row["queue"] for row in without_backup["rows"]] == ["normal"] * 10
+
+    four = [normal(f"N{index:02d}", str(200 - index)) for index in range(1, 5)]
+    ten_backups = [
+        stale(f"S{index:02d}", str(300 - index)) for index in range(1, 11)
+    ]
+    mixed = _trial([*four, *ten_backups], competition={})
+
+    assert [row["queue"] for row in mixed["rows"]] == ["normal"] * 4 + ["backup"] * 6
+    assert [row["market_id"] for row in mixed["rows"]][4:] == [
+        "S01", "S02", "S03", "S04", "S05", "S06",
+    ]
+    assert mixed["funnel"]["normal_queue_count"] == 4
+    assert mixed["funnel"]["backup_queue_count"] == 10
+    assert mixed["funnel"]["reference_price_unknown"] == 10
+
+
+def test_trial_candidates_exclude_known_capital_over_available_hard() -> None:
+    # Independent arithmetic: quantity = max(1000, 1000) = 1000;
+    # capital = 1000 × 0.50 = 500.
+    direction = _trial_direction(
+        "A",
+        minimum_order_size="1000",
+        reward_min_size="1000",
+        latest_midpoint="0.50",
+    )
+
+    excluded = _trial([direction], competition={}, available="480")
+    assert excluded["rows"] == []
+    assert excluded["funnel"]["excluded"]["over_available"] == 1
+    trial_codes = [
+        row["code"] for row in excluded["funnel"]["reasons"]["trial"]
+    ]
+    assert trial_codes == ["capital_over_available"]
+
+    affordable = _trial([dict(direction)], competition={}, available="600")
+    assert [row["market_id"] for row in affordable["rows"]] == ["A"]
+    assert affordable["rows"][0]["queue"] == "normal"
+
+    unknown_available = _trial([dict(direction)], competition={}, available=None)
+    assert [row["market_id"] for row in unknown_available["rows"]] == ["A"]
+    assert unknown_available["rows"][0]["queue"] == "normal"
+    assert unknown_available["funnel"]["excluded"]["over_available"] == 0
+
+
+def test_trial_candidates_pick_fresh_lowest_capital_representative() -> None:
+    # YES: price 0.30 fresh → capital 20 × 0.30 = 6.00. NO: price 0.20 checked
+    # 2h ago → stale, so its would-be 4.00 capital is unusable and YES (the
+    # only direction with a known price) represents the market.
+    yes = _trial_direction("A", outcome="YES", latest_midpoint="0.30")
+    no = _trial_direction("A", outcome="NO", latest_midpoint="0.20")
+    no["history_summary"]["checked_at"] = NOW - timedelta(hours=2)
+
+    result = _trial([yes, no], competition={})
+
+    row = result["rows"][0]
+    assert row["outcome"] == "YES"
+    assert row["reference_capital"] == Decimal("6.00")
+    assert row["queue"] == "normal"
+
+    # Both directions stale → the market falls to the backup queue with no
+    # reference capital; the row identity is the first direction by outcome
+    # label then token_id ("NO" < "YES").
+    stale_yes = _trial_direction("B", outcome="YES", latest_midpoint="0.30")
+    stale_yes["history_summary"]["checked_at"] = NOW - timedelta(hours=2)
+    stale_no = _trial_direction("B", outcome="NO", latest_midpoint="0.20")
+    stale_no["history_summary"]["checked_at"] = NOW - timedelta(hours=2)
+
+    backup = _trial([stale_yes, stale_no], competition={})
+
+    backup_row = backup["rows"][0]
+    assert backup_row["queue"] == "backup"
+    assert backup_row["reference_capital"] is None
+    assert backup_row["outcome"] == "NO"
+
+
+def test_trial_candidates_gate_reference_price_by_one_hour_freshness() -> None:
+    # The 24h amplitude summary is 2h old, so the market still passes the
+    # base screen; but the reference price is older than 1h → stale: no
+    # reference price/capital, backup queue only, amplitude evidence kept.
+    direction = _trial_direction("S", latest_midpoint="0.30")
+    direction["history_summary"]["checked_at"] = NOW - timedelta(hours=2)
+    direction["history_summary"]["valid_until"] = NOW + timedelta(hours=22)
+
+    result = _trial([direction], competition={})
+
+    row = result["rows"][0]
+    assert row["queue"] == "backup"
+    assert row["reference_price"] is None
+    assert row["reference_capital"] is None
+    assert row["reference_price_state"] == "stale"
+    assert row["summary"]["amplitude"] == Decimal("0.005")
+
+
+def test_trial_candidates_tie_breaks_by_competition_capital_market_id() -> None:
+    # Independent arithmetic: pool 120 ÷ (24 × 12) × 100 = 41.666667 for each
+    # of JIA/YI/BING, so the tie-break chain decides. YI carries competition 8
+    # fetched 50 min ago (still known; fetch time is not compared within 1h),
+    # JIA 12.5 fetched 5 min ago, BING has no entry → unknown sorts after known.
+    tied = [
+        _trial_direction("JIA", pool="120", latest_midpoint="0.60"),
+        _trial_direction("YI", pool="120", latest_midpoint="0.60"),
+        _trial_direction("BING", pool="120", latest_midpoint="0.60"),
+    ]
+    competition = {
+        "condition-JIA": (Decimal("12.5"), NOW - timedelta(minutes=5)),
+        "condition-YI": (Decimal("8"), NOW - timedelta(minutes=50)),
+    }
+
+    result = _trial(tied, competition=competition)
+
+    assert [row["market_id"] for row in result["rows"]] == ["YI", "JIA", "BING"]
+    assert result["rows"][0]["competition"]["state"] == "known"
+
+    # Same assumed upper bound and competition → lower reference capital
+    # first: D2 60/(24×6)×100 = 41.666667 (capital 6) vs D1 120/(24×12)×100
+    # = 41.666667 (capital 12).
+    capitals = [
+        _trial_direction("D1", pool="120", latest_midpoint="0.60"),
+        _trial_direction("D2", pool="60", latest_midpoint="0.30"),
+    ]
+    same_competition = {
+        "condition-D1": (Decimal("5"), NOW),
+        "condition-D2": (Decimal("5"), NOW),
+    }
+    capital_order = _trial(capitals, competition=same_competition)
+    assert [row["market_id"] for row in capital_order["rows"]] == ["D2", "D1"]
+
+    # Same assumed upper bound, competition, and capital → market_id ascending.
+    identical = [
+        _trial_direction("Z9", pool="120", latest_midpoint="0.60"),
+        _trial_direction("A1", pool="120", latest_midpoint="0.60"),
+    ]
+    market_order = _trial(identical, competition=same_competition)
+    assert [row["market_id"] for row in market_order["rows"]] == ["A1", "Z9"]
 
 
 def test_trial_candidates_treat_stale_competition_as_unusable() -> None:
@@ -441,7 +672,8 @@ def test_trial_candidates_treat_stale_competition_as_unusable() -> None:
     assert row["competition"]["raw_value"] == Decimal("12.5")
     assert row["competition"]["value"] is None
 
-    # Fresh competition still ranks ahead of a stale value of any size.
+    # With equal assumed upper bounds, fresh competition ranks ahead of a
+    # stale value; a higher assumed upper bound always outranks competition.
     mixed = _trial(
         [_trial_direction("S"), _trial_direction("T")],
         competition={

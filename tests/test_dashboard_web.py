@@ -6356,7 +6356,7 @@ console.log(JSON.stringify({
   sortNote:html.includes("竞争有效 61 · 未知 2 · 竞争 0 排除 2"),
   trialNote:trialStage.includes("超可用排除 5 · 展示 10"),
   trialTone:/pm-lp-funnel-stage good" data-lp-funnel-stage="trial"/.test(html),
-  candidateHeading:html.includes("待测候选（1 个 · 低竞争优先）") && html.includes("非全市场收益前十"),
+  candidateHeading:html.includes("查询队列（正常 0 + 备用 0）") && html.includes("非全市场收益前十"),
   candidateRowFirst:html.indexOf("pm-lp-candidate-table") < html.indexOf("data-lp-trial-candidate"),
   reasons:html.includes("data-lp-funnel-reasons") && html.includes("history summary unknown"),
 }));
@@ -6403,9 +6403,9 @@ const stale = predictionLpCard({lp_dashboard:{...base, state:"ready", stale:fals
 const funnelFragment = (html) => html.slice(html.indexOf('<section class="pm-panel pm-relation-funnel pm-lp-funnel"'));
 console.log(JSON.stringify({
   unknown:unknown.includes("UNKNOWN") && unknown.includes("扫描中 · 保留当前已读计数") === false || unknown.includes("UNKNOWN"),
-  shortGap:short.includes("合格候选不足 10 个（本轮 5 个）") && short.includes("待测候选（5 个 · 低竞争优先）"),
+  shortGap:short.includes("合格候选不足 10 个（本轮 5 个）") && short.includes("查询队列（正常 0 + 备用 0）"),
   shortOverAvailable:short.includes("已排除超可用资金 2 个"),
-  shortBudget:short.includes("<strong>$27.00</strong> USD ≤ 可用 $480.00，可同时试挂。"),
+  shortBudget:short.includes("整组合计（参考） <strong>$27.00</strong> USD · 仅队首已实时核验，其余待验证。"),
   scanning:scanning.includes("扫描中"),
   stale:stale.includes("已过期") && stale.includes("上次筛选条件"),
   keyboard:[unknown,short,scanning,stale].every((html)=>html.includes("<details data-lp-funnel-reasons") && html.includes("<summary>筛选原因</summary>")),
@@ -6421,6 +6421,44 @@ console.log(JSON.stringify({
         "stale": True,
         "keyboard": True,
     }
+
+
+def test_lp_group_total_skips_unknown_reference_capital_rows() -> None:
+    """Backup rows with unknown reference capital are never summed as 0: the
+    group total sums known reference capital only and flags the unknown rows."""
+    output = run_dashboard_js(r"""
+const row = (overrides) => ({
+  market_id:"m1", condition_id:"condition-m1", outcome:"YES",
+  daily_pool_usd:"100", min_quantity:"20",
+  competition:{state:"known", value:"3"},
+  ...overrides,
+});
+const mixed = predictionLpCard({lp_dashboard:{
+  orders:[],positions:[],recommendations:[],
+  candidates:[row({reference_capital:"6.60"}), row({market_id:"m2", condition_id:"condition-m2", reference_capital:null, queue:"backup", competition:{state:"unknown", value:null}})],
+  funnel:{},
+}});
+const allKnown = predictionLpCard({lp_dashboard:{
+  orders:[],positions:[],recommendations:[],
+  candidates:[row({reference_capital:"6.60"}), row({market_id:"m2", condition_id:"condition-m2", reference_capital:"6.60"})],
+  funnel:{},
+}});
+const groupTotal = (html) => (html.match(/<p class="pm-lp-group-total">[\s\S]*?<\/p>/) || [""])[0];
+console.log(JSON.stringify({
+  mixedTotal:groupTotal(mixed),
+  allKnownTotal:groupTotal(allKnown),
+}));
+""")
+    rendered = json.loads(output)
+    assert rendered["mixedTotal"] == (
+        "<p class=\"pm-lp-group-total\">入选 2 个整组合计（参考） "
+        "<strong>$6.60</strong> USD（部分参考占资未知）"
+        " · 仅队首已实时核验，其余待验证。</p>"
+    )
+    assert rendered["allKnownTotal"] == (
+        "<p class=\"pm-lp-group-total\">入选 2 个整组合计（参考） "
+        "<strong>$13.20</strong> USD · 仅队首已实时核验，其余待验证。</p>"
+    )
 
 
 def test_lp_card_renders_budget_fact_line_above_orders() -> None:
@@ -6668,7 +6706,7 @@ console.log(JSON.stringify({
   firstReadFailure: firstFailure.includes("读取失败"),
   initialRendersCandidates: initialTable.includes("Market C") && initialTable.includes("Market A"),
   serverOrderKept: ordered[0] >= 0 && ordered[1] > ordered[0],
-  unknownCompetitionShown: initialTable.includes("未知") && initialTable.includes("按未知排最后"),
+  unknownCompetitionShown: initialTable.includes("未知") && initialTable.includes("指标并列时排已知之后"),
   noRequestFromMarketLink,
   refreshQueued: refreshPosts === 1 && afterRefresh.includes("流动性提供试验"),
   pollFailureRetainsCandidates: afterPollFailure.includes("Market C")
@@ -19458,7 +19496,7 @@ console.log(JSON.stringify({warning,critical,recovery,historical,expired}));
     assert "还有空间 0.2 个百分点" in warning
     assert "2026-09-16 08:00:00" in warning
     assert "Reference market" not in warning
-    assert "待测候选（0 个 · 低竞争优先）" in warning
+    assert "查询队列（正常 0 + 备用 0）" in warning
     assert "剩余 15" in warning and "剩余 10" in warning
     assert warning.count(" · 买入 · ") == 2
     assert warning.count("LP duplicate market") >= 2
@@ -19857,8 +19895,10 @@ const payload = {
       minimum_order_size: "5", reward_min_size: "20",
       reference_price: "0.33", reference_capital: "6.60",
       realtime_price: "0.34", realtime_capital: "6.80",
+      queue: "normal", verification: "verified",
+      query_rate_upper_bound: "49.504950",
       competition: {value: "12.5", raw_value: "12.5", checked_at: now, state: "known", stale: false, updated: true},
-      reason: ["竞争 12.5（第 1 低）", "参考指标 日奖池÷占资 18.18", "无已知订单或持仓", "占资 ≤ 可用"],
+      reason: ["竞争 12.5（粗排参考）", "假设每小时收益上限 49.504950%/小时（参考价格不变且取得全部奖池时的乐观上限，仅决定查询顺序）", "无已知订单或持仓", "占资 ≤ 可用"],
       summary: {amplitude: "0.006", sample_count: 1438, window_start: "2026-09-18T02:00:00Z", window_end: now, valid_until: "2026-09-20T02:00:00Z"},
     },
     {
@@ -19868,8 +19908,10 @@ const payload = {
       daily_pool_usd: "90.00", min_quantity: "20",
       minimum_order_size: "5", reward_min_size: "20",
       reference_price: "0.27", reference_capital: "5.40",
+      queue: "normal", verification: "pending",
+      query_rate_upper_bound: "41.666667",
       competition: {value: null, raw_value: null, checked_at: null, state: "unknown", stale: false, updated: null},
-      reason: ["竞争未知（按未知排最后，不填 0）", "参考指标 日奖池÷占资 16.67", "无已知订单或持仓", "占资 ≤ 可用"],
+      reason: ["竞争未知（不填 0；指标并列时排已知之后）", "假设每小时收益上限 41.666667%/小时（参考价格不变且取得全部奖池时的乐观上限，仅决定查询顺序）", "无已知订单或持仓", "占资 ≤ 可用"],
       summary: {},
     },
   ],
@@ -19887,7 +19929,7 @@ const payload = {
 const html = predictionLpCard({lp_dashboard: payload});
 const purposeCell = (orderId) => html.split("data-lp-today-order=\"" + orderId + "\"")[1] || "";
 const candidateSection = html.slice(html.indexOf("LP 待测候选"));
-const totalWithin = "入选 2 个整组合计 <strong>$12.20</strong> USD ≤ 可用 $480.00，可同时试挂。";
+const totalWithin = "入选 2 个整组合计（参考） <strong>$12.00</strong> USD · 仅队首已实时核验，其余待验证。";
 const overPayload = JSON.parse(JSON.stringify(payload));
 overPayload.candidates = overPayload.candidates.map((row) => ({
   ...row, realtime_capital: "300.00",
@@ -19906,14 +19948,18 @@ console.log(JSON.stringify({
   dedupReward: (html.match(/市场累计 \$1\.50/g) || []).length === 1
     && (html.includes("市场累计见同市场上一行") || html.includes("市场收益观察见同标的上一行")),
   withinTotal: candidateSection.includes(totalWithin),
-  overGap: overHtml.includes("超出可用 $480.00") && overHtml.includes("差额 $120.00") && overHtml.includes("不能全部同时试挂"),
+  // 整组合计只按参考占资：实时值变化不改变合计，也不再断言能否同时试挂。
+  overTotalUnchanged: overHtml.includes("整组合计（参考） <strong>$12.00</strong> USD"),
+  noGroupTrialClaim: !overHtml.includes("可同时试挂") && !overHtml.includes("差额"),
   serverOrder: orderIndex("condition-A") >= 0 && orderIndex("condition-B") > orderIndex("condition-A"),
-  unknownLast: candidateSection.indexOf("按未知排最后") > orderIndex("condition-A"),
+  unknownLast: candidateSection.indexOf("指标并列时排已知之后") > orderIndex("condition-A"),
   notTopTen: candidateSection.includes("非全市场收益前十"),
   excludedCount: candidateSection.includes("已排除超可用资金 0 个"),
   competitionDataTime: candidateSection.includes("数据 ") && candidateSection.includes("12.5"),
   evidenceRow: candidateSection.includes("筛选与依据") && candidateSection.includes("入选理由"),
-  dualCapital: candidateSection.includes("6.60 → <strong>6.80</strong>") || (candidateSection.includes("6.60") && candidateSection.includes("6.80")),
+  dualCapital: candidateSection.includes("$6.60 → <strong>$6.80</strong>"),
+  pendingBadge: candidateSection.includes("待验证"),
+  queryRateColumn: candidateSection.includes("≈49.504950%/小时"),
 }));
 ''')
     rendered = json.loads(output)
@@ -19925,7 +19971,8 @@ console.log(JSON.stringify({
         "yieldPending": True,
         "dedupReward": True,
         "withinTotal": True,
-        "overGap": True,
+        "overTotalUnchanged": True,
+        "noGroupTrialClaim": True,
         "serverOrder": True,
         "unknownLast": True,
         "notTopTen": True,
@@ -19933,6 +19980,8 @@ console.log(JSON.stringify({
         "competitionDataTime": True,
         "evidenceRow": True,
         "dualCapital": True,
+        "pendingBadge": True,
+        "queryRateColumn": True,
     }, rendered
 
 

@@ -3045,10 +3045,12 @@ def test_refresh_candidates_projects_trial_funnel_without_risk(tmp_path) -> None
 def test_refresh_candidates_drops_rows_whose_realtime_capital_over_available(tmp_path) -> None:
     """Contract: the over-available gate must use realtime ?? reference capital.
 
-    Reference capital 20 × 0.505 = 10.100 fits the 11 available, so the row
-    reaches the trial list and its live book is read; the realtime bid 0.60
-    lifts capital to 12.00 which exceeds available, so the row must be
-    dropped and counted after enrichment.
+    Issue 141: only the batch head carries realtime values, so the dropped
+    row must be the queue head.  Reference capital 20 × 0.505 = 10.100 fits
+    the 11 available, so market A forms the normal queue and its head row's
+    live book is read; the realtime bid 0.60 lifts capital to 12.00 which
+    exceeds available, so the head is dropped and counted after enrichment.
+    condition-Z (reference capital 2525) never enters a queue.
     """
 
     now = datetime(2026, 9, 17, 2, tzinfo=UTC)
@@ -3179,14 +3181,285 @@ def test_refresh_candidates_drops_rows_whose_realtime_capital_over_available(tmp
     snapshot = lp.refresh_candidates(force=True)
 
     assert snapshot["state"] == "ready"
-    # The row passed the reference-stage gate and its live book was read.
+    # Only the queue head's live book was read (one call, one token).
     assert exchange.book_token_reads == (("token-condition-A",),)
     funnel = snapshot["funnel"]
-    # condition-Z exceeds available at the reference stage, condition-A only
-    # after the realtime recheck: both count as over_available exclusions.
+    # condition-Z exceeds available at the reference stage and enters no
+    # queue; the head (market A) is dropped only after the realtime recheck:
+    # both count as over_available exclusions.
     assert funnel["excluded"]["over_available"] == 2
+    assert funnel["normal_queue_count"] == 1
+    assert funnel["backup_queue_count"] == 0
+    assert funnel["reference_price_unknown"] == 0
     assert funnel["trial"] == 0
     assert snapshot["candidates"] == []
     assert snapshot["selected_market_ids"] == []
     assert funnel["gap_reason"] is not None
     assert "本轮 0 个" in funnel["gap_reason"]
+
+
+class _LPCandidateQueryExchange:
+    """Fake exchange for the issue-141 query-queue candidate refresh.
+
+    Every market qualifies: minimum order size 20, a fresh 0.505 summary
+    (prepared via refresh_price_history), and a fresh non-zero competition
+    value.  `pools` maps market suffixes to daily pools; distinct pools give
+    distinct assumed upper bounds, so suffix M01 (largest pool) is the
+    batch head.
+    """
+
+    def __init__(
+        self,
+        now: datetime,
+        pools: dict[str, Decimal],
+        *,
+        available: str = "1000",
+        book_bid: str = "0.34",
+        min_sizes: dict[str, str] | None = None,
+    ) -> None:
+        self.now = now
+        self.pools = pools
+        self.available = Decimal(available)
+        self.book_bid = Decimal(book_bid)
+        self.min_sizes = min_sizes or {}
+        self.competition_reads = 0
+        self.history_calls = 0
+        self.book_token_reads: tuple[tuple[str, ...], ...] = ()
+
+    def lp_reward_catalog(
+        self, *, condition_ids=None, stop_event=None
+    ) -> dict[str, object]:
+        del condition_ids, stop_event
+        return {
+            "state": "known",
+            "complete": True,
+            "checked_at": self.now,
+            "markets": tuple(
+                {
+                    "condition_id": f"condition-{suffix}",
+                    "daily_pool_usd": pool,
+                    "reward_active": True,
+                }
+                for suffix, pool in self.pools.items()
+            ),
+        }
+
+    def lp_market_metadata(
+        self, condition_ids, *, stop_event=None
+    ) -> dict[str, dict[str, object]]:
+        del stop_event
+        return {
+            condition_id: {
+                "market_id": f"market-{condition_id.removeprefix('condition-')}",
+                "condition_id": condition_id,
+                "market_title": f"Market {condition_id}",
+                "market_url": f"https://polymarket.com/event/{condition_id}",
+                "accepting_orders": True,
+                "metadata_checked_at": self.now,
+                "tick_size": Decimal("0.01"),
+                "minimum_order_size": Decimal(
+                    self.min_sizes.get(
+                        condition_id.removeprefix("condition-"), "20"
+                    )
+                ),
+                "reward_min_size": Decimal("20"),
+                "reward_max_spread": Decimal("0.10"),
+                "fees_enabled": False,
+                "taker_fee_rate": Decimal("0"),
+                "fee_exponent": Decimal("1"),
+                "fee": Decimal("0"),
+                "outcomes": {
+                    "yes": {
+                        "label": "YES",
+                        "token_id": f"token-{condition_id}",
+                    }
+                },
+            }
+            for condition_id in condition_ids
+        }
+
+    def lp_account_snapshot(self) -> dict[str, object]:
+        return {
+            "authenticated": True,
+            "balance": self.available,
+            "allowance": self.available,
+            "open_orders": [],
+            "positions": [],
+            "checked_at": self.now,
+            "open_orders_complete": True,
+            "positions_complete": True,
+        }
+
+    def lp_order_books(self, token_ids, *, stop_event=None):
+        del stop_event
+        self.book_token_reads = (*self.book_token_reads, tuple(token_ids))
+        return {
+            token_id: {
+                "condition_id": token_id.removeprefix("token-"),
+                "token_id": token_id,
+                "received_at": self.now,
+                "bids": [{"price": self.book_bid, "size": Decimal("100")}],
+                "asks": [
+                    {
+                        "price": self.book_bid + Decimal("0.02"),
+                        "size": Decimal("100"),
+                    }
+                ],
+            }
+            for token_id in token_ids
+        }
+
+    def lp_market_competitiveness(
+        self, *, stop_event=None, previous=None
+    ) -> dict[str, object]:
+        del stop_event, previous
+        self.competition_reads += 1
+        return {
+            "state": "known",
+            "complete": True,
+            "checked_at": self.now,
+            "round_checked_at": self.now,
+            "competitiveness": {
+                f"condition-{suffix}": (
+                    Decimal(index) + Decimal("1"),
+                    self.now,
+                )
+                for index, suffix in enumerate(self.pools)
+            },
+            "not_updated": [],
+        }
+
+    def lp_price_history(
+        self, token_ids, *, start_ts, end_ts, fidelity=1, stop_event=None
+    ):
+        del fidelity, stop_event
+        self.history_calls += 1
+        return {
+            "state": "known",
+            "history": {
+                token_id: [
+                    {"t": start_ts, "p": "0.500"},
+                    {"t": end_ts, "p": "0.505"},
+                ]
+                for token_id in token_ids
+            },
+            "unknown_token_ids": [],
+        }
+
+
+def test_refresh_candidates_reads_live_book_only_for_batch_head(tmp_path) -> None:
+    """B1: with ≥10 qualifying markets only the batch head's token is read."""
+
+    now = datetime(2026, 9, 17, 3, tzinfo=UTC)
+    exchange = _LPCandidateQueryExchange(
+        now, {f"M{index:02d}": Decimal(200 - index) for index in range(1, 13)}
+    )
+    lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: now
+    )
+    prepared = lp.refresh_price_history()
+    assert prepared["state"] == "known"
+
+    snapshot = lp.refresh_candidates(force=True)
+
+    assert snapshot["state"] == "ready"
+    candidates = snapshot["candidates"]
+    assert len(candidates) == 10
+    head = candidates[0]
+    assert head["market_id"] == "market-M01"
+    # Exactly one live read, one token: the batch head's.
+    assert exchange.book_token_reads == (("token-condition-M01",),)
+    assert head["verification"] == "verified"
+    assert "realtime_price" in head
+    assert "realtime_capital" in head
+    for row in candidates[1:]:
+        assert row["verification"] == "pending"
+        assert "realtime_price" not in row
+        assert "realtime_capital" not in row
+    funnel = snapshot["funnel"]
+    assert funnel["trial"] == 10
+    assert funnel["normal_queue_count"] == 12
+    assert funnel["backup_queue_count"] == 0
+    assert funnel["reference_price_unknown"] == 0
+
+
+def test_refresh_candidates_excludes_reference_capital_over_available(tmp_path) -> None:
+    """B3: available 480; a market needing 1000 × 0.505 = 505 never shows."""
+
+    now = datetime(2026, 9, 17, 4, tzinfo=UTC)
+    exchange = _LPCandidateQueryExchange(
+        now,
+        {"M01": Decimal("120"), "BIG": Decimal("500")},
+        available="480",
+        min_sizes={"BIG": "1000"},
+    )
+    lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: now
+    )
+    prepared = lp.refresh_price_history()
+    assert prepared["state"] == "known"
+
+    snapshot = lp.refresh_candidates(force=True)
+
+    assert snapshot["state"] == "ready"
+    candidates = snapshot["candidates"]
+    assert [row["condition_id"] for row in candidates] == ["condition-M01"]
+    assert snapshot["selected_market_ids"] == ["market-M01"]
+    funnel = snapshot["funnel"]
+    assert funnel["excluded"]["over_available"] == 1
+    assert funnel["normal_queue_count"] == 1
+    assert funnel["backup_queue_count"] == 0
+
+
+def test_refresh_candidates_never_calls_price_history_endpoint(tmp_path) -> None:
+    """B4: the candidate refresh consumes cached summaries only."""
+
+    now = datetime(2026, 9, 17, 5, tzinfo=UTC)
+    exchange = _LPCandidateQueryExchange(
+        now, {"M01": Decimal("120"), "M02": Decimal("90")}
+    )
+    lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: now
+    )
+    prepared = lp.refresh_price_history()
+    assert prepared["state"] == "known"
+    assert exchange.history_calls > 0
+
+    exchange.history_calls = 0
+    snapshot = lp.refresh_candidates(force=True)
+
+    assert snapshot["state"] == "ready"
+    assert len(snapshot["candidates"]) == 2
+    assert exchange.history_calls == 0
+
+
+def test_refresh_candidates_keeps_valid_markets_when_metadata_missing(tmp_path) -> None:
+    """B5: one market without metadata → incomplete scan, others still queue."""
+
+    now = datetime(2026, 9, 17, 6, tzinfo=UTC)
+    exchange = _LPCandidateQueryExchange(
+        now, {"M01": Decimal("120"), "M02": Decimal("90")}
+    )
+    original_metadata = exchange.lp_market_metadata
+
+    def metadata_without_m02(condition_ids, *, stop_event=None):
+        return original_metadata(
+            tuple(cid for cid in condition_ids if cid != "condition-M02"),
+            stop_event=stop_event,
+        )
+
+    exchange.lp_market_metadata = metadata_without_m02
+    lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: now
+    )
+    lp.refresh_price_history()
+
+    snapshot = lp.refresh_candidates(force=True)
+
+    assert snapshot["state"] == "incomplete"
+    assert snapshot["complete"] is False
+    assert "condition-M02" in snapshot["missing_metadata_condition_ids"]
+    candidates = snapshot["candidates"]
+    assert [row["condition_id"] for row in candidates] == ["condition-M01"]
+    assert snapshot["funnel"]["read"] == 1
+    assert snapshot["funnel"]["trial"] == 1

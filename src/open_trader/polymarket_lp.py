@@ -166,12 +166,15 @@ def _lp_funnel_conditions() -> dict[str, object]:
             "事件": "开始前30分钟、进行中、结束后1h冷却不参与",
         },
         "sort": {
-            "竞争": "官方竞争升序，低竞争优先；竞争为 0 是危险信号直接排除；缺失或超1小时排最后显示未知",
-            "参考指标": "日奖池÷最低试挂占资（参考价）降序",
-            "兜底": "condition_id 升序",
+            "主排序": "假设每小时收益上限（日奖池÷(24×最低参考占资)）降序；乐观上限仅决定查询顺序，不是预计收益",
+            "并列": "官方竞争仅在指标并列时决定先后：≤1 小时已知按值升序，缺失或超 1 小时为未知、不填 0、排已知之后；竞争为 0 是危险信号直接排除",
+            "再排": "参考占资升序；兜底 market_id 升序",
+            "备用": "参考价超 1 小时或缺失的进备用队列，按日奖池降序",
         },
         "trial": {
-            "超可用": "最低试挂占资（实时值优先，缺失用参考值）超过预留后可用资金不展示，计入排除数",
+            "展示批": "前 9 个正常候选 + 备用队列补足，不足再以正常队列后续候选补足（最多 10 个）",
+            "核验": "每轮仅队首读取实时盘口核验（实时值优先，缺失或无买档保持「待验证」），其余行待验证",
+            "超可用": "最低占资超可用资金（实时值优先、缺失用参考值）的候选复核删行、不递补，计入排除数",
             "上限": 10,
             "缺口": "不足 10 个如实展示实际数量与原因；不宣称全市场收益前十",
         },
@@ -2782,47 +2785,39 @@ class PolymarketLPService:
 
             missing_book_token_ids: list[str] = []
             if trial_rows and callable(books_reader):
-                candidate_token_ids = tuple(
-                    dict.fromkeys(
-                        str(row.get("token_id") or "").strip()
-                        for row in trial_rows
-                        if str(row.get("token_id") or "").strip()
+                # Issue 141: only the batch head is verified against the live
+                # book each round; the remaining rows stay pending.
+                head_token = str(trial_rows[0].get("token_id") or "").strip()
+                candidate_token_ids = (head_token,) if head_token else ()
+                if candidate_token_ids:
+                    try:
+                        candidate_books = books_reader(
+                            candidate_token_ids, stop_event=stop_event
+                        )
+                    except Exception:
+                        candidate_books = {}
+                    row = trial_rows[0]
+                    book = (
+                        candidate_books.get(head_token)
+                        if isinstance(candidate_books, Mapping)
+                        else None
                     )
-                )
-                try:
-                    candidate_books = books_reader(
-                        candidate_token_ids, stop_event=stop_event
-                    )
-                except Exception:
-                    candidate_books = {}
-                if isinstance(candidate_books, Mapping):
-                    for row in trial_rows:
-                        token_id = str(row.get("token_id") or "")
-                        book = candidate_books.get(token_id)
-                        if not isinstance(book, Mapping):
-                            if token_id:
-                                missing_book_token_ids.append(token_id)
-                            continue
+                    bids: list[tuple[Decimal, Decimal]] = []
+                    if isinstance(book, Mapping):
                         try:
                             bids = _levels(book.get("bids"), "bids")
                         except ValueError:
                             bids = []
-                        if not bids:
-                            if token_id:
-                                missing_book_token_ids.append(token_id)
-                            continue
+                    if not isinstance(book, Mapping) or not bids:
+                        missing_book_token_ids.append(head_token)
+                    else:
                         realtime_price = max(price for price, _ in bids)
                         quantity = row.get("min_quantity")
                         if isinstance(quantity, Decimal) and quantity > 0:
                             row["realtime_price"] = realtime_price
                             row["realtime_capital"] = realtime_price * quantity
                             row["realtime_checked_at"] = book.get("received_at")
-                else:
-                    missing_book_token_ids.extend(
-                        str(row.get("token_id") or "")
-                        for row in trial_rows
-                        if str(row.get("token_id") or "")
-                    )
+                            row["verification"] = "verified"
             funnel = dict(trial.get("funnel") or {})
             # The trial gate compares reference capital, but the binding
             # budget is the live book: recheck selected rows with
