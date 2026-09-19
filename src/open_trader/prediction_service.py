@@ -859,7 +859,6 @@ def create_prediction_server(
             lp_candidate_refresh_path = (
                 "/api/prediction-arbitrage/lp/candidates/refresh"
             )
-            lp_share_watch_path = "/api/prediction-arbitrage/lp/share-watch"
             lp_sessions_prefix = "/api/prediction-arbitrage/lp/sessions/"
             lp_start_path = "/api/prediction-arbitrage/lp/sessions"
             lp_stop_session: str | None = None
@@ -888,7 +887,6 @@ def create_prediction_server(
                 lp_preview_path,
                 lp_candidate_preview_path,
                 lp_candidate_refresh_path,
-                lp_share_watch_path,
                 lp_start_path,
             } and lp_stop_session is None:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -963,23 +961,6 @@ def create_prediction_server(
                         HTTPStatus.ACCEPTED, {"state": "queued"}
                     )
                     return
-                elif path == lp_share_watch_path:
-                    self._require_schema(payload, {"condition_id", "enabled"})
-                    if type(payload.get("enabled")) is not bool:
-                        raise ValueError("enabled must be a boolean")
-                    set_watch = getattr(execution, "set_lp_share_watch", None)
-                    if not callable(set_watch):
-                        raise RuntimeError("LP share watch is unavailable")
-                    result = set_watch(
-                        self._required_string(payload, "condition_id"),
-                        enabled=payload["enabled"],
-                    )
-                    if isinstance(result, Mapping) and result.get("state") == "rejected":
-                        safe_result = _prediction_safe_value(result)
-                        if not isinstance(safe_result, Mapping):
-                            raise RuntimeError("LP share watch result is invalid")
-                        self._send_json(HTTPStatus.BAD_REQUEST, safe_result)
-                        return
                 elif path == lp_preview_path:
                     request_payload: Mapping[str, object]
                     if set(payload) == {"request"} and isinstance(payload.get("request"), Mapping):

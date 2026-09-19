@@ -6827,23 +6827,23 @@ const dashboard = {
 const html = predictionLpCard({lp_dashboard: dashboard});
 const managed = predictionLpCard({lp_dashboard: {...dashboard, lp_session: {state: "active", market_title: "Managed market", outcome: "YES"}}});
 const orderTable = (html.match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
-const trackedRows = (orderTable.match(/<tr[\s\S]*?Tracked LP market[\s\S]*?<\/tr>/g) || []);
+const marketRows = (orderTable.match(/<tr data-lp-today-market=/g) || []);
 const details = orderTable.match(/<details[\s\S]*?<\/details>/g) || [];
+const yieldCells = orderTable.split("data-label=\"LP 收益率(推荐 → 实际)\"").slice(1)
+  .map((segment) => segment.split("</td>")[0]);
 console.log(JSON.stringify({
       headers: [...orderTable.matchAll(/<th\b[^>]*>([\s\S]*?)<\/th>/g)].map((m) => m[1]),
-  current: orderTable.includes("当前 0.18%／小时"),
+  current: yieldCells.some((cell) => cell.includes("推荐 <strong>0.25%</strong>") && cell.includes("实际 <strong>0.18%</strong>")),
   baseline: orderTable.includes("试挂基准 0.25%／小时"),
-      addRoom: orderTable.includes("加单空间：无") && orderTable.includes("风险已触线"),
-      addRoomDangerTone: orderTable.includes('<span class="pm-pill pm-tone-danger">加单空间：无</span>'),
-      addRoomOkTone: orderTable.includes('<span class="pm-pill pm-tone-ok">加单空间：有</span>'),
-      addRoomNeutralTone: orderTable.includes('<span class="pm-pill">加单空间：无</span>'),
-      riskHeader: html.includes("压力损失（警戒线 10%）"),
+      addRoom: orderTable.includes("加单空间 无") && orderTable.includes("风险已触线"),
+      addRoomPillsGone: !orderTable.includes("加单空间："),
+      riskHeader: html.includes("压力损失(警戒线 10%)"),
       riskValue: orderTable.includes("10% · $6.00") && orderTable.includes("已触线"),
       riskDangerTone: orderTable.includes('<strong class="pm-tone-danger">YES 10% · $6.00</strong>'),
       riskDirectionLabels: orderTable.includes("YES 10% · $6.00") && orderTable.includes("NO 12% · $7.20"),
       rewardOnlyRiskPreserved: orderTable.includes("12% · $2.16"),
       staleRiskMasked: orderTable.includes("Old LP market") && !orderTable.includes("YES 15% · $15.00") && !orderTable.includes("占用本金 $99.00"),
-      stale: orderTable.includes("当前 待更新") && orderTable.includes("数据过期"),
+      stale: yieldCells.some((cell) => cell.includes("待更新") && cell.includes("不按 0 计")) && orderTable.includes("数据过期"),
       trialBaselineFromReference: orderTable.includes("Trial LP market") && orderTable.includes("试挂基准 0.25%／小时"),
       capitalLabel: orderTable.includes("占用本金"),
       capitalAligned: orderTable.includes("占用本金 $60.00"),
@@ -6855,18 +6855,16 @@ console.log(JSON.stringify({
       notificationHours: orderTable.includes("通知时段：飞书全天；语音北京时间 23:00–08:00 静音。"),
       shortNote: html.includes("预计 LP 毛奖励；压力损失不含奖励抵扣；10% 是风险警告线；「试挂/正式」由委托数量对比最小计分数量自动标注"),
       marketLink: orderTable.includes('href="https://polymarket.com/event/tracked"'),
-  tableRows: trackedRows.length,
+  marketRows: marketRows.length,
 }));
 ''')
     rendered = json.loads(output)
     assert rendered == {
-        "headers": ["标的", "委托与成交量", "LP 收益率（预计）", "压力损失（警戒线 10%）"],
+        "headers": ["标的", "LP 收益率(推荐 → 实际)", "份额占比", "压力损失(警戒线 10%)", "委托与成交量"],
         "current": True,
         "baseline": True,
         "addRoom": True,
-        "addRoomDangerTone": True,
-        "addRoomOkTone": True,
-        "addRoomNeutralTone": True,
+        "addRoomPillsGone": True,
         "riskHeader": True,
         "riskValue": True,
         "riskDangerTone": True,
@@ -6884,7 +6882,7 @@ console.log(JSON.stringify({
         "notificationHours": True,
         "shortNote": True,
         "marketLink": True,
-        "tableRows": 2,
+        "marketRows": 4,
         "trialBaselineFromReference": True,
     }
 
@@ -6940,7 +6938,7 @@ console.log(JSON.stringify({
   descendingThenUnknown: positions[0] >= 0
     && positions[0] < positions[1] && positions[1] < positions[2] && positions[2] < positions[3],
   unknownMarkedLast: orderTable.indexOf("Yield U") > orderTable.indexOf("Yield C")
-    && orderTable.includes("当前 待更新"),
+    && orderTable.includes("待更新"),
 }));
 ''')
     rendered = json.loads(output)
@@ -6950,79 +6948,556 @@ console.log(JSON.stringify({
     assert all(index >= 0 for index in rendered["positions"])
 
 
-def test_lp_today_orders_table_renders_rows_empty_state_and_footnote() -> None:
-    output = run_dashboard_js(r'''
-const checkedAt = "2026-09-16T02:05:00Z";
+def test_lp_today_orders_merge_into_one_row_per_market() -> None:
+    """A1: 同价三笔+单笔另一市场 → 恰 2 个标的行为，5 列表头，逐笔行带撤单。"""
+    output = run_dashboard_js(r"""
+const checkedAt = "2026-09-20T02:00:00Z";
+const order = (orderId, conditionId, title, price, quantity, purpose) => ({
+  order_id: orderId, condition_id: conditionId,
+  token_id: "token-" + orderId,
+  market_title: title, market_url: "https://polymarket.com/event/" + conditionId,
+  outcome: "YES", side: "BUY", status: "LIVE", price,
+  quantity, filled_quantity: "0", remaining_quantity: quantity,
+  state: "open", purpose,
+  management: "manual_read_only", read_only: true,
+  scoring_status: "true", scoring_checked_at: checkedAt,
+});
 const dashboard = {
   state: "ready", stale: false, checked_at: checkedAt, last_success_at: checkedAt,
-  orders: [
-    {order_id: "other-order", condition_id: "condition-other", token_id: "token-other",
-      market_title: "Non LP market", market_url: "https://polymarket.com/event/other",
-      outcome: "NO", side: "BUY", status: "LIVE", price: "0.30", quantity: "10",
-      filled_quantity: "0", remaining_quantity: "10", management: "manual_read_only",
-      read_only: true, scoring_status: false},
-  ],
-  positions: [
-    {condition_id: "condition-other", token_id: "token-other", market_title: "Non LP market",
-      market_url: "https://polymarket.com/event/other", outcome: "NO", size: "4",
-      average_price: "0.30", management: "manual_read_only", read_only: true},
-  ],
+  orders: [], positions: [],
   lp_orders_today: [
-    {order_id: "live-1", condition_id: "condition-live", token_id: "token-live",
-      market_title: "Live LP market", market_url: "https://polymarket.com/event/live",
-      outcome: "YES", side: "BUY", status: "LIVE", price: "0.50", quantity: "80",
-      filled_quantity: "40", remaining_quantity: "40", state: "open",
-      management: "manual_read_only", read_only: true, scoring_status: true,
-      scoring_checked_at: checkedAt},
-    {order_id: "filled-1", condition_id: "condition-filled", token_id: "token-filled",
-      market_title: "Filled LP market", market_url: "https://polymarket.com/event/filled",
-      outcome: "YES", side: "BUY", status: "MATCHED", price: "0.45", quantity: null,
-      filled_quantity: "60", remaining_quantity: "0", state: "filled",
-      last_fill_at: "2026-09-16T02:05:00Z", management: "manual_read_only",
-      read_only: true, scoring_status: "unknown", scoring_checked_at: null},
+    order("a1", "condition-a", "Market A", "0.23", "650", "formal"),
+    order("a2", "condition-a", "Market A", "0.23", "300", "formal"),
+    order("a3", "condition-a", "Market A", "0.23", "50", "trial"),
+    order("b1", "condition-b", "Market B", "0.31", "120", null),
   ],
-  non_lp_row_count: 9,
-  market_rewards: [], reward_shares: {}, lp_observations: {},
+  non_lp_row_count: 0, market_rewards: {}, reward_shares: {}, lp_observations: {},
   recommendations: [], lp_session: {state: "none"},
 };
 const html = predictionLpCard({lp_dashboard: dashboard});
 const orderTable = (html.match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
-const rowTags = (orderTable.match(/<tr[^>]*data-lp-today-/g) || []);
+const rowSegments = orderTable.split("<tr data-lp-today-market=").slice(1);
+const rowFor = (conditionId) => rowSegments.find((segment) => segment.startsWith("\"" + conditionId + "\"")) || "";
+const marketARow = rowFor("condition-a");
+const marketBRow = rowFor("condition-b");
+const count = (value, needle) => value.split(needle).length - 1;
+console.log(JSON.stringify({
+  headers: [...orderTable.matchAll(/<th\b[^>]*>([\s\S]*?)<\/th>/g)].map((m) => m[1]),
+  rowCount: rowSegments.length,
+  unifiedHeadline: marketARow.includes("23¢ × 合计 1,000 份"),
+  fillLine: marketARow.includes("已成交 0 · 剩余 1,000"),
+  line1: marketARow.includes("650 份 @ 23¢ · 正式"),
+  line2: marketARow.includes("300 份 @ 23¢ · 正式"),
+  line3: marketARow.includes("50 份 @ 23¢ · 试挂"),
+  noSeePrevious: !orderTable.includes("见同标的上一行") && !orderTable.includes("见同市场上一行"),
+  cancelButtonsA: count(marketARow, 'lp-cancel"'),
+  cancelAllA: count(marketARow, "lp-cancel-all"),
+  cancelButtonsB: count(marketBRow, 'lp-cancel"'),
+  cancelAllB: count(marketBRow, "lp-cancel-all"),
+}));
+""")
+    rendered = json.loads(output)
+    assert rendered == {
+        "headers": ["标的", "LP 收益率(推荐 → 实际)", "份额占比", "压力损失(警戒线 10%)", "委托与成交量"],
+        "rowCount": 2,
+        "unifiedHeadline": True,
+        "fillLine": True,
+        "line1": True,
+        "line2": True,
+        "line3": True,
+        "noSeePrevious": True,
+        "cancelButtonsA": 3,
+        "cancelAllA": 1,
+        "cancelButtonsB": 1,
+        "cancelAllB": 0,
+    }
+
+
+def test_lp_today_orders_mixed_prices_show_no_unified_or_average_price() -> None:
+    """A2: 异价两笔 → 只显示合计，无统一价、无均价。"""
+    output = run_dashboard_js(r"""
+const checkedAt = "2026-09-20T02:00:00Z";
+const order = (orderId, price, quantity) => ({
+  order_id: orderId, condition_id: "condition-a",
+  token_id: "token-" + orderId,
+  market_title: "Market A", market_url: "https://polymarket.com/event/a",
+  outcome: "YES", side: "BUY", status: "LIVE", price,
+  quantity, filled_quantity: "0", remaining_quantity: quantity,
+  state: "open", purpose: "formal",
+  management: "manual_read_only", read_only: true,
+  scoring_status: "true", scoring_checked_at: checkedAt,
+});
+const dashboard = {
+  state: "ready", stale: false, checked_at: checkedAt, last_success_at: checkedAt,
+  orders: [], positions: [],
+  lp_orders_today: [order("a1", "0.23", "650"), order("a2", "0.25", "300")],
+  non_lp_row_count: 0, market_rewards: {}, reward_shares: {}, lp_observations: {},
+  recommendations: [], lp_session: {state: "none"},
+};
+const html = predictionLpCard({lp_dashboard: dashboard});
+const orderTable = (html.match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
+const marketRow = (orderTable.split("<tr data-lp-today-market=")[1] || "");
+console.log(JSON.stringify({
+  total: marketRow.includes("合计 950 份"),
+  fillLine: marketRow.includes("已成交 0 · 剩余 950"),
+  line1: marketRow.includes("650 份 @ 23¢"),
+  line2: marketRow.includes("300 份 @ 25¢"),
+  noUnifiedPrice: !marketRow.includes("23¢ × 合计"),
+  noAverage: !marketRow.includes("均价"),
+}));
+""")
+    rendered = json.loads(output)
+    assert rendered == {
+        "total": True,
+        "fillLine": True,
+        "line1": True,
+        "line2": True,
+        "noUnifiedPrice": True,
+        "noAverage": True,
+    }
+
+
+def test_lp_today_orders_mixed_sides_do_not_net() -> None:
+    """A3: 买卖混合 → headline 拆买入/卖出，逐笔行带方向，两枚撤单。"""
+    output = run_dashboard_js(r"""
+const checkedAt = "2026-09-20T02:00:00Z";
+const order = (orderId, side, price, quantity) => ({
+  order_id: orderId, condition_id: "condition-a",
+  token_id: "token-" + orderId,
+  market_title: "Market A", market_url: "https://polymarket.com/event/a",
+  outcome: "YES", side, status: "LIVE", price,
+  quantity, filled_quantity: "0", remaining_quantity: quantity,
+  state: "open", purpose: null,
+  management: "manual_read_only", read_only: true,
+  scoring_status: "true", scoring_checked_at: checkedAt,
+});
+const dashboard = {
+  state: "ready", stale: false, checked_at: checkedAt, last_success_at: checkedAt,
+  orders: [], positions: [],
+  lp_orders_today: [
+    order("a1", "BUY", "0.23", "650"),
+    order("a2", "SELL", "0.30", "100"),
+  ],
+  non_lp_row_count: 0, market_rewards: {}, reward_shares: {}, lp_observations: {},
+  recommendations: [], lp_session: {state: "none"},
+};
+const html = predictionLpCard({lp_dashboard: dashboard});
+const orderTable = (html.match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
+const marketRow = (orderTable.split("<tr data-lp-today-market=")[1] || "");
+const count = (value, needle) => value.split(needle).length - 1;
+console.log(JSON.stringify({
+  headline: marketRow.includes("合计 750 份 · 买入 650 · 卖出 100"),
+  buyLine: marketRow.includes("650 份 @ 23¢ · 买入"),
+  sellLine: marketRow.includes("100 份 @ 30¢ · 卖出"),
+  cancelButtons: count(marketRow, 'lp-cancel"'),
+  cancelAll: count(marketRow, "lp-cancel-all"),
+}));
+""")
+    rendered = json.loads(output)
+    assert rendered == {
+        "headline": True,
+        "buyLine": True,
+        "sellLine": True,
+        "cancelButtons": 2,
+        "cancelAll": 1,
+    }
+
+
+def test_lp_today_orders_merge_filled_amounts_and_cancel_targets() -> None:
+    """A4: 已成交并入合计；撤单只挂可撤销单；仅 1 笔可撤销时无撤全部。"""
+    output = run_dashboard_js(r"""
+const checkedAt = "2026-09-20T02:00:00Z";
+const dashboard = {
+  state: "ready", stale: false, checked_at: checkedAt, last_success_at: checkedAt,
+  orders: [], positions: [],
+  lp_orders_today: [
+    {order_id: "a1", condition_id: "condition-a", token_id: "token-a1",
+      market_title: "Market A", market_url: "https://polymarket.com/event/a",
+      outcome: "YES", side: "BUY", status: "LIVE", price: "0.50", quantity: "80",
+      filled_quantity: "40", remaining_quantity: "40", state: "open", purpose: "formal",
+      management: "manual_read_only", read_only: true,
+      scoring_status: "true", scoring_checked_at: checkedAt},
+    {order_id: "a2", condition_id: "condition-a", token_id: "token-a2",
+      market_title: "Market A", market_url: "https://polymarket.com/event/a",
+      outcome: "YES", side: "BUY", status: "MATCHED", price: "0.45", quantity: null,
+      filled_quantity: "60", remaining_quantity: "0", state: "filled", purpose: null,
+      last_fill_at: checkedAt,
+      management: "manual_read_only", read_only: true,
+      scoring_status: "unknown", scoring_checked_at: null},
+  ],
+  non_lp_row_count: 0, market_rewards: {}, reward_shares: {}, lp_observations: {},
+  recommendations: [], lp_session: {state: "none"},
+};
+const html = predictionLpCard({lp_dashboard: dashboard});
+const orderTable = (html.match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
+const marketRow = (orderTable.split("<tr data-lp-today-market=")[1] || "");
+const count = (value, needle) => value.split(needle).length - 1;
+console.log(JSON.stringify({
+  total: marketRow.includes("合计 140 份"),
+  fillLine: marketRow.includes("已成交 100 · 剩余 40"),
+  openLine: marketRow.includes("80 份 @ 50¢ · 正式 · 已成交 40"),
+  filledLine: marketRow.includes("60 份 @ 45¢ · 已成交"),
+  cancelButtons: count(marketRow, 'lp-cancel"'),
+  cancelAll: count(marketRow, "lp-cancel-all"),
+}));
+""")
+    rendered = json.loads(output)
+    assert rendered == {
+        "total": True,
+        "fillLine": True,
+        "openLine": True,
+        "filledLine": True,
+        "cancelButtons": 1,
+        "cancelAll": 0,
+    }
+
+
+def test_lp_today_orders_sort_known_desc_then_unknown_by_condition_id() -> None:
+    """A5: 排序——已知收益率降序、UNKNOWN 最后、并列按 condition_id 字典序。"""
+    output = run_dashboard_js(r"""
+const checkedAt = "2026-09-20T02:00:00Z";
+const order = (orderId, conditionId) => ({
+  order_id: orderId, condition_id: conditionId,
+  token_id: "token-" + orderId,
+  market_title: "Market " + conditionId,
+  market_url: "https://polymarket.com/event/" + conditionId,
+  outcome: "YES", side: "BUY", status: "LIVE", price: "0.50",
+  quantity: "20", filled_quantity: "0", remaining_quantity: "20",
+  state: "open", purpose: null,
+  management: "manual_read_only", read_only: true,
+  scoring_status: "true", scoring_checked_at: checkedAt,
+});
+const known = (yieldPct) => ({
+  state: "known", stage: "added", stale: false,
+  current_yield_pct_per_hour: yieldPct, qualified: true,
+  risk_state: "known", risk_warning: false, risk_directions: [],
+  checked_at: checkedAt,
+});
+const dashboard = {
+  state: "ready", stale: false, checked_at: checkedAt, last_success_at: checkedAt,
+  orders: [], positions: [],
+  lp_orders_today: [
+    order("o1", "condition-d"),
+    order("o2", "condition-b"),
+    order("o3", "condition-c"),
+    order("o4", "condition-a"),
+  ],
+  non_lp_row_count: 0, market_rewards: {}, reward_shares: {},
+  lp_observations: {
+    "condition-a": known("0.72"),
+    "condition-b": known("0.60"),
+    "condition-c": known("0.60"),
+    "condition-d": {state: "unknown", stale: true, reason: "reward_rates_stale",
+      current_yield_pct_per_hour: null, risk_directions: [], checked_at: checkedAt},
+  },
+  recommendations: [], lp_session: {state: "none"},
+};
+const html = predictionLpCard({lp_dashboard: dashboard});
+const orderTable = (html.match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
+const positions = ["condition-a", "condition-b", "condition-c", "condition-d"].map(
+  (conditionId) => orderTable.indexOf('data-lp-today-market="' + conditionId + '"'));
+console.log(JSON.stringify({positions}));
+""")
+    rendered = json.loads(output)
+    positions = rendered["positions"]
+    assert all(index >= 0 for index in positions)
+    assert positions == sorted(positions)
+
+
+def test_lp_today_orders_single_order_hides_detail_and_full_enable_footnote() -> None:
+    """A6: 单笔省略明细；脚注宣告份额预警全量开启；勾选控件与已保存区块移除。"""
+    output = run_dashboard_js(r"""
+const checkedAt = "2026-09-20T02:00:00Z";
+const dashboard = {
+  state: "ready", stale: false, checked_at: checkedAt, last_success_at: checkedAt,
+  orders: [], positions: [],
+  lp_orders_today: [
+    {order_id: "a1", condition_id: "condition-a", token_id: "token-a1",
+      market_title: "Market A", market_url: "https://polymarket.com/event/a",
+      outcome: "YES", side: "BUY", status: "LIVE", price: "0.23", quantity: "650",
+      filled_quantity: "0", remaining_quantity: "650", state: "open", purpose: "formal",
+      management: "manual_read_only", read_only: true,
+      scoring_status: "true", scoring_checked_at: checkedAt},
+  ],
+  non_lp_row_count: 0, market_rewards: {}, reward_shares: {},
+  lp_observations: {},
+  lp_share_watch_state: {"condition-z": {enabled: true, market_title: "Saved market"}},
+  recommendations: [], lp_session: {state: "none"},
+};
+const html = predictionLpCard({lp_dashboard: dashboard});
+const orderTable = (html.match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
+const marketRow = (orderTable.split("<tr data-lp-today-market=")[1] || "");
+const trialDashboard = JSON.parse(JSON.stringify(dashboard));
+trialDashboard.lp_orders_today[0].purpose = "trial";
+const trialTable = (predictionLpCard({lp_dashboard: trialDashboard})
+  .match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
+const trialRow = (trialTable.split("<tr data-lp-today-market=")[1] || "");
+const plainDashboard = JSON.parse(JSON.stringify(dashboard));
+delete plainDashboard.lp_orders_today[0].purpose;
+const plainTable = (predictionLpCard({lp_dashboard: plainDashboard})
+  .match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
+const plainRow = (plainTable.split("<tr data-lp-today-market=")[1] || "");
+const count = (value, needle) => value.split(needle).length - 1;
+console.log(JSON.stringify({
+  headline: marketRow.includes("23¢ × 650 份"),
+  headlineFormalPurpose: marketRow.includes("23¢ × 650 份 · 正式"),
+  headlineTrialPurpose: trialRow.includes("23¢ × 650 份 · 试挂"),
+  noPurposeWhenMissing: plainRow.includes("23¢ × 650 份")
+    && !plainRow.includes("· 正式") && !plainRow.includes("· 试挂"),
+  fillLine: marketRow.includes("已成交 0 · 剩余 650"),
+  noTotalWord: !marketRow.includes("合计"),
+  noCancelAll: count(marketRow, "lp-cancel-all") === 0,
+  cancelButtons: count(marketRow, 'lp-cancel"'),
+  fullEnableFootnote: html.includes("份额预警已全量开启"),
+  noShareWatchControl: !html.includes("data-lp-share-watch"),
+  noSavedWatchBlock: !html.includes("已保存但当前无今日委托的市场"),
+}));
+""")
+    rendered = json.loads(output)
+    assert rendered == {
+        "headline": True,
+        "headlineFormalPurpose": True,
+        "headlineTrialPurpose": True,
+        "noPurposeWhenMissing": True,
+        "fillLine": True,
+        "noTotalWord": True,
+        "noCancelAll": True,
+        "cancelButtons": 1,
+        "fullEnableFootnote": True,
+        "noShareWatchControl": True,
+        "noSavedWatchBlock": True,
+    }
+
+
+def test_lp_today_orders_empty_state_non_lp_footnote_and_legacy_payload() -> None:
+    """恢复旧表用例的三条覆盖：空态、非 LP 脚注、legacy payload 回退空态。"""
+    output = run_dashboard_js(r"""
+const checkedAt = "2026-09-20T02:05:00Z";
+const lpRow = {
+  order_id: "live-1", condition_id: "condition-live", token_id: "token-live",
+  market_title: "Live LP market", market_url: "https://polymarket.com/event/live",
+  outcome: "YES", side: "BUY", status: "LIVE", price: "0.50", quantity: "80",
+  filled_quantity: "40", remaining_quantity: "40", state: "open",
+  management: "manual_read_only", read_only: true,
+  scoring_status: "true", scoring_checked_at: checkedAt,
+};
+const dashboard = {
+  state: "ready", stale: false, checked_at: checkedAt, last_success_at: checkedAt,
+  orders: [], positions: [],
+  lp_orders_today: [lpRow],
+  non_lp_row_count: 9,
+  market_rewards: {}, reward_shares: {}, lp_observations: {},
+  recommendations: [], lp_session: {state: "none"},
+};
+const html = predictionLpCard({lp_dashboard: dashboard});
+const orderTable = (html.match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
 const legacyPayload = JSON.parse(JSON.stringify(dashboard));
 delete legacyPayload.lp_orders_today;
 delete legacyPayload.non_lp_row_count;
 const legacyHtml = predictionLpCard({lp_dashboard: legacyPayload});
 const emptyHtml = predictionLpCard({lp_dashboard: {...dashboard, lp_orders_today: []}});
 console.log(JSON.stringify({
-  blockTitle: html.includes("当天 LP 委托"),
-  headers: [...orderTable.matchAll(/<th\b[^>]*>([\s\S]*?)<\/th>/g)].map((m) => m[1]),
-  tableRows: rowTags.length,
-  nonLpRowsExcluded: !orderTable.includes("Non LP market"),
-  liveQuantityCell: orderTable.includes("50¢ × 80 份") && orderTable.includes("已成交 40 · 剩余 40"),
-  filledQuantityCell: orderTable.includes("成交量 60 份 · 成交于 2026-09-16 10:05:00 HKT"),
-  openSubtitle: orderTable.includes("YES · 买入 · 未成交 · 官方计分中"),
-  filledSubtitle: orderTable.includes("YES · 买入 · 已成交"),
+  marketRows: (orderTable.match(/<tr[^>]*data-lp-today-market=/g) || []).length,
   footnote: html.includes("账户另有 9 行非 LP 订单/持仓，不在本表展示。"),
-  emptyState: emptyHtml.includes("当天暂无 LP 委托。"),
+  emptyState: emptyHtml
+    .includes("<td colspan=\"5\" class=\"pm-observation-empty\">当天暂无 LP 委托。</td>"),
   legacyEmptyState: legacyHtml.includes("当天暂无 LP 委托。"),
-  oldBlockGone: !html.includes("我的订单与持仓") && !html.includes("挂单与持仓")
-    && !html.includes("暂未读取到订单或持仓"),
+  legacyNoFootnote: !legacyHtml.includes("非 LP 订单/持仓"),
 }));
-''')
+""")
     rendered = json.loads(output)
     assert rendered == {
-        "blockTitle": True,
-        "headers": ["标的", "委托与成交量", "LP 收益率（预计）", "压力损失（警戒线 10%）"],
-        "tableRows": 2,
-        "nonLpRowsExcluded": True,
-        "liveQuantityCell": True,
-        "filledQuantityCell": True,
-        "openSubtitle": True,
-        "filledSubtitle": True,
+        "marketRows": 1,
         "footnote": True,
         "emptyState": True,
         "legacyEmptyState": True,
-        "oldBlockGone": True,
+        "legacyNoFootnote": True,
+    }
+
+
+def test_lp_today_orders_unidentified_condition_rows_render_with_fallback() -> None:
+    """空 condition_id 的行不得丢弃：各自成组按无 observation 回退渲染。"""
+    output = run_dashboard_js(r"""
+const checkedAt = "2026-09-20T02:05:00Z";
+const row = (overrides) => ({
+  order_id: "x1", condition_id: "", token_id: "token-x1",
+  market_title: "Unidentified market", market_url: "",
+  outcome: "YES", side: "BUY", status: "LIVE", price: "0.40", quantity: "10",
+  filled_quantity: "0", remaining_quantity: "10", state: "open",
+  management: "manual_read_only", read_only: true,
+  scoring_status: "true", scoring_checked_at: checkedAt,
+  ...overrides,
+});
+const dashboard = {
+  state: "ready", stale: false, checked_at: checkedAt, last_success_at: checkedAt,
+  orders: [], positions: [],
+  lp_orders_today: [
+    row({order_id: "a1", condition_id: "condition-a",
+      market_title: "Market A", token_id: "token-a1"}),
+    row({order_id: "x1"}),
+    row({order_id: "x2"}),
+  ],
+  non_lp_row_count: 0, market_rewards: {}, reward_shares: {},
+  lp_observations: {},
+  recommendations: [], lp_session: {state: "none"},
+};
+const html = predictionLpCard({lp_dashboard: dashboard});
+const orderTable = (html.match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
+const rowTags = (orderTable.match(/<tr[^>]*data-lp-today-market=/g) || []);
+const unidentifiedRows = orderTable.split("<tr data-lp-today-market=\"\">").slice(1);
+console.log(JSON.stringify({
+  rowCount: rowTags.length,
+  unidentifiedCount: unidentifiedRows.length,
+  identifiedRendered: orderTable.includes("Market A"),
+  unidentifiedTitles: unidentifiedRows.map((segment) =>
+    segment.includes("Unidentified market")),
+  unidentifiedQuantity: unidentifiedRows.every((segment) =>
+    segment.includes("40¢ × 10 份")),
+  degradedShareCell: unidentifiedRows.every((segment) =>
+    segment.includes("奖励 UNKNOWN")),
+}));
+""")
+    rendered = json.loads(output)
+    assert rendered == {
+        "rowCount": 3,
+        "unidentifiedCount": 2,
+        "identifiedRendered": True,
+        "unidentifiedTitles": [True, True],
+        "unidentifiedQuantity": True,
+        "degradedShareCell": True,
+    }
+
+
+def test_lp_yield_cell_recommended_vs_actual() -> None:
+    """A7: 收益率格 = 推荐(试挂基准) → 实际(当前)；未知不按 0 计；无基准推荐为 —。"""
+    output = run_dashboard_js(r"""
+const checkedAt = "2026-09-20T02:00:00Z";
+const order = {
+  order_id: "a1", condition_id: "condition-a", token_id: "token-a1",
+  market_title: "Market A", market_url: "https://polymarket.com/event/a",
+  outcome: "YES", side: "BUY", status: "LIVE", price: "0.50",
+  quantity: "20", filled_quantity: "0", remaining_quantity: "20",
+  state: "open", purpose: null,
+  management: "manual_read_only", read_only: true,
+  scoring_status: "true", scoring_checked_at: checkedAt,
+};
+const baseDashboard = {
+  state: "ready", stale: false, checked_at: checkedAt, last_success_at: checkedAt,
+  orders: [], positions: [],
+  lp_orders_today: [order],
+  non_lp_row_count: 0, market_rewards: {}, reward_shares: {},
+  recommendations: [], lp_session: {state: "none"},
+};
+const card = (observation) => predictionLpCard({lp_dashboard: {...baseDashboard, lp_observations: {"condition-a": observation}}});
+const cellOf = (html) => (html.split("data-label=\"LP 收益率(推荐 → 实际)\"")[1] || "").split("</td>")[0];
+const known = card({
+  state: "known", stale: false,
+  current_yield_pct_per_hour: "0.72",
+  trial_baseline: {yield_pct_per_hour: "0.82", checked_at: checkedAt},
+  risk_directions: [], checked_at: checkedAt,
+});
+const unknownActual = card({
+  state: "unknown", stale: false, reason: "reward_rates_stale",
+  current_yield_pct_per_hour: null,
+  trial_baseline: {yield_pct_per_hour: "0.82", checked_at: checkedAt},
+  risk_directions: [], checked_at: checkedAt,
+});
+const noBaseline = card({
+  state: "known", stale: false,
+  current_yield_pct_per_hour: "0.72",
+  trial_baseline: null, trial_reference: null,
+  risk_directions: [], checked_at: checkedAt,
+});
+const knownCell = cellOf(known);
+const unknownCell = cellOf(unknownActual);
+const noBaselineCell = cellOf(noBaseline);
+console.log(JSON.stringify({
+  knownRecommended: knownCell.includes("推荐") && knownCell.includes("0.82%"),
+  knownArrow: knownCell.includes("→ 实际"),
+  knownActual: knownCell.includes("0.72%"),
+  noAddRoom: !knownCell.includes("加单空间"),
+  noBaselineStampRow: !knownCell.includes("试挂基准"),
+  unknownActualShown: unknownCell.includes("待更新") && unknownCell.includes("不按 0 计"),
+  noBaselineDash: noBaselineCell.includes("推荐 <strong>—</strong>"),
+}));
+""")
+    rendered = json.loads(output)
+    assert rendered == {
+        "knownRecommended": True,
+        "knownArrow": True,
+        "knownActual": True,
+        "noAddRoom": True,
+        "noBaselineStampRow": True,
+        "unknownActualShown": True,
+        "noBaselineDash": True,
+    }
+
+
+def test_lp_share_cell_reward_pill_and_book_share() -> None:
+    """A8: 份额占比格 = 奖励 + 状态 pill + 盘口份额副行；缺失保持 UNKNOWN。"""
+    output = run_dashboard_js(r"""
+const checkedAt = "2026-09-20T02:00:00Z";
+const order = {
+  order_id: "a1", condition_id: "condition-a", token_id: "token-a1",
+  market_title: "Market A", market_url: "https://polymarket.com/event/a",
+  outcome: "YES", side: "BUY", status: "LIVE", price: "0.50",
+  quantity: "20", filled_quantity: "0", remaining_quantity: "20",
+  state: "open", purpose: null,
+  management: "manual_read_only", read_only: true,
+  scoring_status: "true", scoring_checked_at: checkedAt,
+};
+const baseDashboard = {
+  state: "ready", stale: false, checked_at: checkedAt, last_success_at: checkedAt,
+  orders: [], positions: [],
+  lp_orders_today: [order],
+  non_lp_row_count: 0, market_rewards: {},
+  lp_observations: {"condition-a": {
+    state: "known", stale: false,
+    current_yield_pct_per_hour: "0.72",
+    risk_directions: [{outcome: "YES", state: "known", warning: false,
+      book_shares: {
+        BUY: {own_side_quantity: "1000", side_total_quantity: "8050", book_share_pct: "12.42"},
+        SELL: {own_side_quantity: "100", side_total_quantity: "4200", book_share_pct: "2.38"},
+      },
+      checked_at: checkedAt}],
+    checked_at: checkedAt,
+  }},
+  recommendations: [], lp_session: {state: "none"},
+};
+const share = (percentage) => ({
+  condition_id: "condition-a", state: "known", percentage,
+  reference_share_percentage: "5", target_status: "target",
+  target_delta_percentage_points: "0",
+  checked_at: checkedAt, last_success_at: checkedAt,
+});
+const RealDate = Date;
+let now = RealDate.parse(checkedAt);
+globalThis.Date = class extends RealDate {
+  constructor(...args) { args.length ? super(...args) : super(now); }
+  static now() { return now; }
+};
+const cellOf = (html) => (html.split("data-label=\"份额占比\"")[1] || "").split("</td>")[0];
+const known = predictionLpCard({lp_dashboard: {...baseDashboard, reward_shares: {"condition-a": share("6.2")}}});
+const missing = predictionLpCard({lp_dashboard: baseDashboard});
+const knownCell = cellOf(known);
+const missingCell = cellOf(missing);
+console.log(JSON.stringify({
+  rewardLabel: knownCell.includes("奖励") && knownCell.includes("6.2%"),
+  pill: knownCell.includes("已达目标"),
+  bookShare: knownCell.includes("盘口") && knownCell.includes("12.4%"),
+  buySide: knownCell.includes("我的挂单 1,000／买侧 8,050 份"),
+  sellSide: knownCell.includes("我的挂单 100／卖侧 4,200 份"),
+  missingRewardUnknown: missingCell.includes("奖励 UNKNOWN"),
+}));
+""")
+    rendered = json.loads(output)
+    assert rendered == {
+        "rewardLabel": True,
+        "pill": True,
+        "bookShare": True,
+        "buySide": True,
+        "sellSide": True,
+        "missingRewardUnknown": True,
     }
 
 
@@ -7048,11 +7523,11 @@ const card = (scoring) => predictionLpCard({lp_dashboard: {
 }});
 const table = (html) => (html.match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
 console.log(JSON.stringify({
-  boolFalse: table(card(false)).includes("YES · 买入 · 未成交 · 官方未计分"),
-  strFalse: table(card("false")).includes("YES · 买入 · 未成交 · 官方未计分"),
-  nullUnknown: table(card(null)).includes("YES · 买入 · 未成交 · 官方计分 UNKNOWN"),
-  boolTrue: table(card(true)).includes("YES · 买入 · 未成交 · 官方计分中"),
-  strTrue: table(card("true")).includes("YES · 买入 · 未成交 · 官方计分中"),
+  boolFalse: table(card(false)).includes("YES · 买入 · 官方未计分"),
+  strFalse: table(card("false")).includes("YES · 买入 · 官方未计分"),
+  nullUnknown: table(card(null)).includes("YES · 买入 · 官方计分 UNKNOWN"),
+  boolTrue: table(card(true)).includes("YES · 买入 · 官方计分中"),
+  strTrue: table(card("true")).includes("YES · 买入 · 官方计分中"),
 }));
 ''')
     assert json.loads(output) == {
@@ -7160,13 +7635,16 @@ const dashboard = {
 };
 const html = predictionLpCard({lp_dashboard: dashboard});
 const orderTable = (html.match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
+const yieldCell = (orderTable.split("data-label=\"LP 收益率(推荐 → 实际)\"")[1] || "").split("</td>")[0];
 console.log(JSON.stringify({
-  currentSlotKept: orderTable.includes("当前 待更新"),
-  datedBaseline: orderTable.includes("试挂基准 0.25%／小时 · 2026-09-16 09:00:00 HKT"),
+  currentSlotKept: yieldCell.includes("待更新") && yieldCell.includes("不按 0 计"),
+  recommendedFromBaseline: yieldCell.includes("推荐 <strong>0.25%</strong>"),
+  datedBaseline: orderTable.includes("试挂基准 0.25%／小时 · $20.00 · 40 份 × 50¢ · 2026-09-16 09:00:00 HKT"),
 }));
 ''')
     assert json.loads(output) == {
         "currentSlotKept": True,
+        "recommendedFromBaseline": True,
         "datedBaseline": True,
     }
 
@@ -19634,49 +20112,48 @@ console.log(JSON.stringify({warning,critical,recovery,historical,expired}));
     rendered = json.loads(output)
     warning = rendered["warning"]
     assert warning.count("还有空间 0.2 个百分点") == 1
-    assert '<span class="pm-pill">还有空间 0.2 个百分点</span><span class="sub">实际 4.8%' in warning
-    assert "实际 4.8%" in warning
-    assert "还有空间 0.2 个百分点" in warning
-    assert "2026-09-16 08:00:00" in warning
+    assert '<span class="pm-pill">还有空间 0.2 个百分点</span>' in warning
+    assert "奖励 <strong>4.8%</strong>" in warning
     assert "Reference market" not in warning
     assert "待试挂候选" in warning
-    assert "剩余 15" in warning and "剩余 10" in warning
-    assert warning.count(" · 买入 · ") == 2
-    assert warning.count("LP duplicate market") >= 2
+    assert "已成交 5 · 剩余 25" in warning
+    assert "20 份 @ 40¢ · 已成交 5" in warning
+    assert "10 份 @ 45¢" in warning
+    assert warning.count("LP duplicate market") == 1
     assert warning.count("还有空间 0.2 个百分点") == 1
 
     critical = rendered["critical"]
     assert critical.count("份额超额 0.000001 个百分点") == 1
-    assert '<span class="pm-pill watch">⚠ 份额超额 0.000001 个百分点</span><span class="sub">实际 8.000001%' in critical
+    assert '<span class="pm-pill watch">⚠ 份额超额 0.000001 个百分点</span>' in critical
     assert 'pm-pill watch pm-clock-danger' not in critical
-    assert "实际 8.000001%" in critical
 
     recovery = rendered["recovery"]
-    assert "实际 5%" in recovery
+    assert "奖励 <strong>5%</strong>" in recovery
     assert "已达目标" in recovery
     assert "还有空间" not in recovery
     assert "份额超额" not in recovery
 
     historical = rendered["historical"]
     assert "上次值 7.5%" in historical
-    assert "UNKNOWN" in historical
+    assert "暂不可判断" in historical
     assert "还有空间" not in historical
     assert "份额超额" not in historical
 
     expired = rendered["expired"]
     assert "上次值 4.8%" in expired
-    assert "奖励份额暂不可判断" in expired
+    assert "暂不可判断" in expired
     assert "还有空间" not in expired
     assert "份额超额" not in expired
     action_markup = " ".join(re.findall(r"<(?:button|a)\b[^>]*>.*?</(?:button|a)>", warning, flags=re.S))
     assert all(action not in action_markup for action in ("创建订单", "取消订单", "调整数量", "通知"))
     warning_visible = re.sub(r"<details[\s\S]*?</details>", "", warning)
-    assert "当前 0.18%／小时" in warning_visible
-    assert "试挂基准 0.25%／小时" in warning_visible
+    assert "推荐 <strong>0.25%</strong>" in warning_visible
+    assert "实际 <strong>0.18%</strong>" in warning_visible
+    assert "试挂基准" not in warning_visible
     assert "YES 10% · $6.00" in warning_visible
     assert "NO 12% · $7.20" in warning_visible
     assert warning_visible.count("还有空间 0.2 个百分点") == 1
-    assert "实际 4.8%" in warning_visible
+    assert "奖励 <strong>4.8%</strong>" in warning_visible
 
     polling_output = run_dashboard_js(r'''
 const checkedAt = "2026-09-16T00:00:00Z";
@@ -19805,69 +20282,43 @@ console.log(JSON.stringify({
     assert polling["venuesInFlightAtExpiry"] is True
     assert polling["readOnly"] is True
     assert polling["atThirtyHtml"].count("已达目标") == 1
-    assert "剩余 15" in polling["atThirtyHtml"]
+    assert "剩余 25" in polling["atThirtyHtml"]
     assert "买入" in polling["atThirtyHtml"]
     assert "UNKNOWN" in polling["atExpiryHtml"] or "历史" in polling["atExpiryHtml"]
     assert "还有空间" not in polling["atExpiryHtml"]
     assert "份额超额" not in polling["atExpiryHtml"]
-    assert "剩余 15" in polling["atExpiryHtml"]
+    assert "剩余 25" in polling["atExpiryHtml"]
     assert "买入" in polling["atExpiryHtml"]
 
 
-def test_lp_share_watch_controls_and_status_render_in_existing_table() -> None:
-    output = run_dashboard_js(r'''
+def test_lp_share_watch_controls_removed_and_alerts_fully_enabled() -> None:
+    """份额预警全量开启：勾选控件与已保存区块移除；pill 语义保留；GET-only。"""
+    output = run_dashboard_js(r"""
 const checkedAt = "2026-09-17T00:00:00Z";
 const baseDashboard = {
   state: "ready", stale: false, complete: true, checked_at: checkedAt,
   lp_orders_today: [
-    {order_id:"a-filled",condition_id:"condition-a",token_id:"token-a-yes",market_title:"Market A",outcome:"YES",side:"BUY",price:"0.40",quantity:"20",filled_quantity:"20",remaining_quantity:"0",state:"filled",status:"MATCHED"},
-    {order_id:"a-open",condition_id:"condition-a",token_id:"token-a-no",market_title:"Market A",outcome:"NO",side:"BUY",price:"0.45",quantity:"10",filled_quantity:"0",remaining_quantity:"10",state:"open",status:"LIVE"},
-    {order_id:"b-open",condition_id:"condition-b",token_id:"token-b-yes",market_title:"Market B",outcome:"YES",side:"BUY",price:"0.50",quantity:"12",filled_quantity:"2",remaining_quantity:"10",state:"open",status:"LIVE"},
+    {order_id:"a-open",condition_id:"condition-a",token_id:"token-a-no",market_title:"Market A",market_url:"https://polymarket.com/event/a",outcome:"YES",side:"BUY",price:"0.45",quantity:"10",filled_quantity:"0",remaining_quantity:"10",state:"open",status:"LIVE"},
   ],
   market_rewards: {},
   reward_shares: {
     "condition-a": {condition_id:"condition-a",state:"known",percentage:"4.8",reference_share_percentage:"5",target_status:"space",target_delta_percentage_points:"0.2",checked_at:checkedAt,last_success_at:checkedAt},
-    "condition-b": {condition_id:"condition-b",state:"known",percentage:"8",reference_share_percentage:"5",target_status:"target",target_delta_percentage_points:"0",checked_at:checkedAt,last_success_at:checkedAt},
   },
   lp_observations: {
-    "condition-a": {state:"known",current_hourly_reward_usd:"0.108",occupied_capital_usd:"60",current_yield_pct_per_hour:"0.18",risk_state:"warning",risk_warning:true,add_room:{available:false,reason:"risk_warning"},risk_directions:[{outcome:"YES",state:"known",warning:true,risk_principal:"60",stress_loss:"6",loss_ratio:"0.1",checked_at:checkedAt},{outcome:"NO",state:"known",warning:true,risk_principal:"60",stress_loss:"7.2",loss_ratio:"0.12",checked_at:checkedAt}],checked_at:checkedAt},
-    "condition-b": {state:"known",current_hourly_reward_usd:"0.2",occupied_capital_usd:"70",current_yield_pct_per_hour:"0.2",risk_state:"known",risk_warning:false,add_room:{available:true},risk_directions:[],checked_at:checkedAt},
+    "condition-a": {state:"known",current_yield_pct_per_hour:"0.18",risk_state:"warning",risk_warning:true,add_room:{available:false,reason:"risk_warning"},risk_directions:[{outcome:"YES",state:"known",warning:true,risk_principal:"60",stress_loss:"6",loss_ratio:"0.1",checked_at:checkedAt}],checked_at:checkedAt},
   },
   lp_share_watch_state: {
     "condition-a": {enabled:false,paused:false},
-    "condition-b": {enabled:false,paused:false},
-    "condition-saved": {enabled:true,paused:true,market_title:"Saved market",last_share_percentage:"8.5",last_share_checked_at:checkedAt},
+    "condition-saved": {enabled:true,paused:true,market_title:"Saved market"},
   },
   recommendations: [], lp_session:{state:"none"}, non_lp_row_count:0,
 };
 const render = (dashboard = baseDashboard) => predictionLpCard({lp_dashboard: dashboard});
-const count = (value, pattern) => (value.match(pattern) || []).length;
 const RealDate = Date;
 let now = RealDate.parse(checkedAt);
 globalThis.Date = class extends RealDate {
   constructor(...args) { args.length ? super(...args) : super(now); }
   static now() { return now; }
-};
-
-const initial = render();
-const controlsFor = (html, conditionId) => count(
-  html,
-  new RegExp('data-condition-id="' + conditionId + '"', 'g'),
-);
-const controlState = (html, conditionId) => {
-  const match = html.match(new RegExp(
-    '<div class="pm-lp-share-watch" data-lp-share-watch-active="(true|false)">[\\s\\S]*?'
-      + 'data-condition-id="' + conditionId + '"[\\s\\S]*?</div>',
-  ));
-  return match && match[1];
-};
-const currentAt29 = () => {
-  now = RealDate.parse(checkedAt) + 29999;
-  return render();
-};
-const expiredAt30 = () => {
-  now = RealDate.parse(checkedAt) + 30000;
-  return render();
 };
 const share = (percentage, status, delta) => ({
   condition_id:"condition-a", state:"known", percentage:String(percentage),
@@ -19875,12 +20326,12 @@ const share = (percentage, status, delta) => ({
   target_delta_percentage_points:delta, checked_at:checkedAt,
   last_success_at:checkedAt,
 });
+const initial = render();
 const low = render({...baseDashboard, reward_shares:{"condition-a":share("4.8","space","0.2")} });
 const metFive = render({...baseDashboard, reward_shares:{"condition-a":share("5","target","0")} });
-const metEight = render({...baseDashboard, reward_shares:{"condition-a":share("8","target","0")} });
 const excess = render({...baseDashboard, reward_shares:{"condition-a":share("8.000001","excess","0.000001")} });
-const current = currentAt29();
-const expired = expiredAt30();
+now = RealDate.parse(checkedAt) + 30000;
+const expired = render({...baseDashboard, reward_shares:{"condition-a":share("4.8","space","0.2")} });
 
 state.workspaceView = "prediction_market";
 state.predictionMarket.activeTab = "lp";
@@ -19889,100 +20340,49 @@ state.predictionMarket.lpDashboard = {...baseDashboard};
 state.predictionMarket.lpDashboardError = "";
 elements["prediction-market-root"] = {innerHTML:"", querySelector(){return null;}};
 const requests = [];
-let postMode = "success";
-let deferredGet = false;
-let resolveDeferredGet;
-const response = (payload, ok = true, status = 200) => ({ok, status, json: async () => payload});
+const response = (payload) => ({ok:true, status:200, json: async () => payload});
 globalThis.fetch = async (url, options = {}) => {
-  const request = {url:String(url), method:String(options.method || "GET"), body:String(options.body || ""), headers:options.headers || {}};
-  requests.push(request);
-  if (request.method === "POST") {
-    if (postMode === "failure") return response({message:"保存失败"}, false, 503);
-    const body = JSON.parse(request.body);
-    const enabled = body.enabled === true;
-    return response({state:enabled ? "enabled" : "disabled", condition_id:body.condition_id, enabled,
-      share_alert:{enabled, paused:false}});
-  }
-  if (deferredGet) return new Promise((resolve) => { resolveDeferredGet = resolve; });
-  return response({...baseDashboard});
+  requests.push({url:String(url), method:String(options.method || "GET")});
+  return response(baseDashboard);
 };
-const checkbox = (conditionId, checked) => ({
-  checked, dataset:{conditionId},
-  closest(selector) { return selector === "[data-lp-share-watch]" ? this : null; },
-});
-const saveRequest = async (conditionId, checked) => {
-  const target = checkbox(conditionId, checked);
-  await handlePredictionMarketChange({target});
-};
-await saveRequest("condition-a", true);
-const successRequest = requests.find((request) => request.method === "POST");
-const afterSuccess = state.predictionMarket.lpDashboard;
-postMode = "failure";
-await saveRequest("condition-a", false);
-const afterFailure = elements["prediction-market-root"].innerHTML;
-deferredGet = true;
-const oldGet = fetchPredictionLpDashboard();
-await Promise.resolve();
-await Promise.resolve();
-postMode = "success";
-await saveRequest("condition-a", false);
-resolveDeferredGet(response({...baseDashboard, lp_share_watch_state:{...baseDashboard.lp_share_watch_state,
-  "condition-a":{enabled:true,paused:false}}}));
-await oldGet;
-const afterRace = state.predictionMarket.lpDashboard;
+const poll = fetchPredictionLpDashboard();
+for (let turn=0; turn<24; turn+=1) await Promise.resolve();
+await poll;
 console.log(JSON.stringify({
-  controlCount:count(initial, /type="checkbox"/g),
-  controlA:controlsFor(initial,"condition-a"),
-  controlB:controlsFor(initial,"condition-b"),
-  savedControl:controlsFor(initial,"condition-saved"),
-  hasWatchLabel:initial.includes("份额预警") && initial.includes("5%–8%"),
-  aggregateActive:controlState(initial, "condition-a") === "true",
-  pausedSaved:initial.includes("Saved market") && initial.includes("已暂停"),
-  noFabricatedSavedRow:(initial.indexOf("Saved market") > initial.indexOf("</table>")),
-  low:low.includes("还有空间 0.2 个百分点"),
-  metFive:metFive.includes("已达目标"),
-  metEight:metEight.includes("已达目标"),
-  excess:excess.includes("份额超额 0.000001 个百分点") && excess.includes("⚠"),
-  current:current.includes("实际 4.8%") && current.includes("还有空间"),
-  expired:expired.includes("暂不可判断") && expired.includes("上次值 4.8%") && !expired.includes("还有空间"),
-  riskPreserved:initial.includes("当前 0.18%／小时") && initial.includes("YES 10% · $6.00"),
-  successBody:successRequest && successRequest.body === JSON.stringify({condition_id:"condition-a",enabled:true}),
-  csrf:successRequest && successRequest.headers["X-CSRF-Token"] === "csrf-token",
-  successChecked:afterSuccess.lp_share_watch_state["condition-a"].enabled === true,
-  failureKeepsChecked:/<input[^>]*data-condition-id="condition-a"[^>]*checked/.test(afterFailure)
-    && !/<input[^>]*data-condition-id="condition-a"[^>]*disabled/.test(afterFailure)
-    && !/<input[^>]*data-condition-id="condition-a"[^>]*aria-busy/.test(afterFailure)
-    && afterFailure.includes("保存失败"),
-  raceKeepsConfirmed:afterRace.lp_share_watch_state["condition-a"].enabled === false,
-  getOnlyNoPost:false,
+  noCheckbox: !initial.includes("type=\"checkbox\""),
+  noShareWatchControl: !initial.includes("data-lp-share-watch"),
+  noSavedWatchBlock: !initial.includes("已保存但当前无今日委托的市场"),
+  noSavedMarketTitle: !initial.includes("Saved market"),
+  noWatchStatusWords: !initial.includes("已选择") && !initial.includes("未选择") && !initial.includes("已暂停"),
+  low: low.includes("还有空间 0.2 个百分点"),
+  metFive: metFive.includes("已达目标"),
+  excess: excess.includes("份额超额 0.000001 个百分点") && excess.includes("⚠"),
+  expired: expired.includes("暂不可判断") && expired.includes("上次值 4.8%") && !expired.includes("还有空间"),
+  riskPreserved: initial.includes("实际 <strong>0.18%</strong>") && initial.includes("10% · $6.00"),
+  fullEnableFootnote: initial.includes("份额预警已全量开启"),
+  getOnlyNoPost: requests.every((request) => request.method === "GET"),
 }));
-''')
+""")
     rendered = json.loads(output)
-    assert rendered["controlCount"] == 3
-    assert rendered["controlA"] == 1
-    assert rendered["controlB"] == 1
-    assert rendered["savedControl"] == 1
-    assert rendered["hasWatchLabel"] is True
-    assert rendered["aggregateActive"] is True
-    assert rendered["pausedSaved"] is True
-    assert rendered["noFabricatedSavedRow"] is True
-    assert rendered["low"] is True
-    assert rendered["metFive"] is True
-    assert rendered["metEight"] is True
-    assert rendered["excess"] is True
-    assert rendered["current"] is True
-    assert rendered["expired"] is True
-    assert rendered["riskPreserved"] is True
-    assert rendered["successBody"] is True
-    assert rendered["csrf"] is True
-    assert rendered["successChecked"] is True
-    assert rendered["failureKeepsChecked"] is True
-    assert rendered["raceKeepsConfirmed"] is True
+    assert rendered == {
+        "noCheckbox": True,
+        "noShareWatchControl": True,
+        "noSavedWatchBlock": True,
+        "noSavedMarketTitle": True,
+        "noWatchStatusWords": True,
+        "low": True,
+        "metFive": True,
+        "excess": True,
+        "expired": True,
+        "riskPreserved": True,
+        "fullEnableFootnote": True,
+        "getOnlyNoPost": True,
+    }
 
 
 def test_lp_card_renders_purpose_chips_yield_order_and_trial_candidates() -> None:
-    """A7: 用途小图标、奖励率排序与待测候选表渲染。"""
-    output = run_dashboard_js(r'''
+    """A5/A7 配套：用途标注、收益率排序与待测候选表渲染（一标的一行）。"""
+    output = run_dashboard_js(r"""
 const now = "2026-09-19T02:32:03Z";
 const observation = (conditionId, yieldValue) => ({
   state: yieldValue === null ? "unknown" : "known",
@@ -20023,8 +20423,6 @@ const payload = {
     "condition-a": observation("condition-a", 0.80),
     "condition-sell": observation("condition-sell", null),
   },
-  // order-b/b2 share condition-b: 市场奖励只展示一次，第二行显示见上一行
-
   market_rewards: {
     "condition-b": {condition_id: "condition-b", currency: "USD", market_amount: "1.50", paid: false},
   },
@@ -20077,7 +20475,7 @@ const payload = {
   non_lp_row_count: 0,
 };
 const html = predictionLpCard({lp_dashboard: payload});
-const purposeCell = (orderId) => html.split("data-lp-today-order=\"" + orderId + "\"")[1] || "";
+const marketSegment = (conditionId) => html.split("data-lp-today-market=\"" + conditionId + "\"")[1] || "";
 const candidateSection = html.slice(html.indexOf("LP 待试挂候选"));
 const overPayload = JSON.parse(JSON.stringify(payload));
 overPayload.candidates = overPayload.candidates.map((row) => ({
@@ -20089,13 +20487,12 @@ const overHtml = predictionLpCard({lp_dashboard: overPayload});
 // 未知竞争必须排在已知竞争之后（服务端顺序保真）
 const orderIndex = (needle) => candidateSection.indexOf(needle);
 console.log(JSON.stringify({
-  trialChip: purposeCell("order-b").includes("purpose-trial") && purposeCell("order-b").includes("试挂"),
-  formalChip: purposeCell("order-a").includes("purpose-formal") && purposeCell("order-a").includes("正式"),
-  noChipSell: !purposeCell("order-sell").includes("purpose-chip"),
-  sellMarked: purposeCell("order-sell").includes("卖出单，不标注"),
+  trialLabel: marketSegment("condition-b").includes("20 份 @ 33¢ · 试挂"),
+  formalLabel: marketSegment("condition-b").includes("20 份 @ 33¢ · 正式"),
   yieldPending: html.includes("待更新") && !html.includes("<strong>当前 0</strong>"),
-  dedupReward: (html.match(/市场累计 \$1\.50/g) || []).length === 1
-    && (html.includes("市场累计见同市场上一行") || html.includes("市场收益观察见同标的上一行")),
+  marketRewardOnce: (html.match(/市场累计 \$1\.50/g) || []).length === 1
+    && !html.includes("市场累计见同市场上一行")
+    && !html.includes("市场收益观察见同标的上一行"),
   noGroupTotal: !candidateSection.includes("整组合计") && !overHtml.includes("整组合计"),
   noGroupTrialClaim: !overHtml.includes("可同时试挂") && !overHtml.includes("差额"),
   serverOrder: orderIndex("condition-A") >= 0 && orderIndex("condition-B") > orderIndex("condition-A"),
@@ -20109,15 +20506,13 @@ console.log(JSON.stringify({
   queryRateColumn: candidateSection.includes("≈55.555556%/小时"),
   backupQueryRateColumn: candidateSection.includes("≈41.666667%/小时"),
 }));
-''')
+""")
     rendered = json.loads(output)
     assert rendered == {
-        "trialChip": True,
-        "formalChip": True,
-        "noChipSell": True,
-        "sellMarked": True,
+        "trialLabel": True,
+        "formalLabel": True,
         "yieldPending": True,
-        "dedupReward": True,
+        "marketRewardOnce": True,
         "noGroupTotal": True,
         "noGroupTrialClaim": True,
         "serverOrder": True,

@@ -1021,3 +1021,72 @@ def test_lp_entry_reward_data_stale_bound_unchanged() -> None:
 
     assert result["state"] == "unknown"
     assert result["reason_codes"] == ["reward_data_stale"]
+
+
+def test_lp_book_share_reports_both_sides_with_literal_arithmetic() -> None:
+    book = {
+        "condition_id": "condition-a",
+        "token_id": "token-yes",
+        "bids": [
+            {"price": Decimal("0.50"), "size": Decimal("1000")},
+            {"price": Decimal("0.45"), "size": Decimal("7050")},
+        ],
+        "asks": [{"price": Decimal("0.55"), "size": Decimal("4200")}],
+    }
+    own_orders = [
+        {
+            "condition_id": "condition-a",
+            "token_id": "token-yes",
+            "side": "BUY",
+            "status": "LIVE",
+            "price": Decimal("0.50"),
+            "remaining_quantity": Decimal("1000"),
+        },
+        {
+            "condition_id": "condition-a",
+            "token_id": "token-yes",
+            "side": "SELL",
+            "status": "LIVE",
+            "price": Decimal("0.55"),
+            "remaining_quantity": Decimal("100"),
+        },
+    ]
+
+    result = polymarket_lp_risk.evaluate_lp_book_share(
+        book,
+        condition_id="condition-a",
+        token_id="token-yes",
+        own_orders=own_orders,
+    )
+
+    assert result["BUY"] == {
+        "own_side_quantity": Decimal("1000"),
+        "side_total_quantity": Decimal("8050"),
+        "book_share_pct": Decimal("12.42"),
+    }
+    assert result["SELL"] == {
+        "own_side_quantity": Decimal("100"),
+        "side_total_quantity": Decimal("4200"),
+        "book_share_pct": Decimal("2.38"),
+    }
+
+
+def test_lp_book_share_missing_book_keeps_fields_none_not_zero() -> None:
+    result = polymarket_lp_risk.evaluate_lp_book_share(
+        None,
+        condition_id="condition-a",
+        token_id="token-yes",
+        own_orders=(),
+    )
+
+    assert result["state"] == "unknown"
+    assert result["BUY"] == {
+        "own_side_quantity": None,
+        "side_total_quantity": None,
+        "book_share_pct": None,
+    }
+    assert result["SELL"] == {
+        "own_side_quantity": None,
+        "side_total_quantity": None,
+        "book_share_pct": None,
+    }

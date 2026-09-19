@@ -33,7 +33,11 @@ from .polymarket_trading import (
     ThresholdLegResult,
     _submit_error_detail,
 )
-from .polymarket_lp_risk import TERMINAL_ORDER_STATES, evaluate_lp_exposure
+from .polymarket_lp_risk import (
+    TERMINAL_ORDER_STATES,
+    evaluate_lp_book_share,
+    evaluate_lp_exposure,
+)
 from .prediction_arbitrage import (
     MAX_CROSS_UNSETTLED_PRINCIPAL,
     MAX_EMERGENCY_LOSS,
@@ -880,105 +884,16 @@ class PredictionExecutionService:
                 active.add(condition_id)
         return active
 
-    def set_lp_share_watch(
-        self, condition_id: str, *, enabled: bool
-    ) -> dict[str, object]:
-        market = str(condition_id).strip()
-        if not market:
-            raise ValueError("condition_id is required")
-        if type(enabled) is not bool:
-            raise ValueError("enabled must be a boolean")
-        account_id = self._lp_account_id()
-        updater = getattr(self._store, "update_lp_observation", None)
-        if account_id is None or not callable(updater):
-            raise RuntimeError("LP share watch persistence is unavailable")
-        existing = self.lp_share_watch_state().get(market, {})
-        if not enabled:
-            saved = updater(
-                account_id,
-                market,
-                {
-                    "share_alert": {
-                        "enabled": False,
-                        "paused": False,
-                        "breach_started_at": None,
-                        "notification_pending": False,
-                    }
-                },
-            )
-            return {
-                "state": "disabled",
-                "condition_id": market,
-                "enabled": False,
-                "share_alert": saved.get("share_alert", {}),
-            }
-        snapshot = self._lp_open_orders_snapshot()
-        active_conditions = (
-            None
-            if not self._lp_open_orders_snapshot_valid(snapshot)
-            else self._lp_active_order_conditions(snapshot)
-        )
-        if active_conditions is None:
-            return {
-                "state": "rejected",
-                "reason": "account_facts_unknown",
-                "condition_id": market,
-                "enabled": False,
-            }
-        if market not in active_conditions:
-            return {
-                "state": "rejected",
-                "reason": "no_active_orders",
-                "condition_id": market,
-                "enabled": False,
-            }
-        title = existing.get("market_title")
-        observations_reader = getattr(self._store, "lp_observations", None)
-        if callable(observations_reader):
-            try:
-                observations = observations_reader(account_id)
-            except Exception:
-                observations = {}
-            observation = observations.get(market) if isinstance(observations, Mapping) else None
-            if isinstance(observation, Mapping):
-                root_title = observation.get("market_title")
-                if isinstance(root_title, str) and root_title.strip():
-                    title = root_title.strip()
-        for order in snapshot.get("open_orders", ()):
-            if isinstance(order, Mapping) and str(order.get("condition_id") or "").strip() == market:
-                title = order.get("market_title") or order.get("title") or title
-                break
-        # Repeating an already-enabled selection is an idempotent no-op.  In
-        # particular, do not clear a breach start or pending delivery and
-        # accidentally extend the continuous-breach window.
-        share_update = {
-            "enabled": True,
-            "paused": False,
-            "market_title": title or market,
-        }
-        if existing.get("enabled") is not True:
-            share_update.update(
-                {
-                    "breach_started_at": None,
-                    "notification_pending": False,
-                }
-            )
-        saved = updater(
-            account_id,
-            market,
-            {"share_alert": share_update},
-        )
-        return {
-            "state": "enabled",
-            "condition_id": market,
-            "enabled": True,
-            "share_alert": saved.get("share_alert", {}),
-        }
-
     def refresh_lp_share_watch(
         self, *, stop_event: threading.Event | None = None
     ) -> dict[str, object]:
-        """Refresh selected LP share watches and deliver Xiaoai alerts."""
+        """Refresh LP share watches for every active-order condition and
+        deliver Xiaoai alerts.
+
+        Issue #145: the monitored set is derived from unfinished open orders
+        (full enablement).  Persisted ``enabled``/``paused`` flags are legacy
+        values that are ignored on read and never written again.
+        """
 
         account_id = self._lp_account_id()
         observations_reader = getattr(self._store, "lp_observations", None)
@@ -1003,21 +918,14 @@ class PredictionExecutionService:
             }
         if not isinstance(saved_observations, Mapping):
             saved_observations = {}
-        selected = {
-            str(condition_id): dict(alert)
+        persisted_alerts = {
+            str(condition_id): dict(observation.get("share_alert"))
             for condition_id, observation in saved_observations.items()
             if isinstance(observation, Mapping)
             and isinstance(observation.get("share_alert"), Mapping)
-            and observation["share_alert"].get("enabled") is True
-            for alert in (observation["share_alert"],)
         }
         if stop_event is not None and stop_event.is_set():
             return {"state": "cancelled", "observations": dict(saved_observations)}
-        first_seen = {
-            condition_id: condition_id not in self._lp_share_watch_seen
-            for condition_id in selected
-        }
-        self._lp_share_watch_seen.update(selected)
 
         def current_alert(condition_id: str) -> dict[str, object]:
             current = self.lp_share_watch_state().get(condition_id, {})
@@ -1026,22 +934,11 @@ class PredictionExecutionService:
         def save_watch_fields(
             condition_id: str, fields: Mapping[str, object]
         ) -> dict[str, object] | None:
-            current = current_alert(condition_id)
-            if current.get("enabled") is not True:
-                return None
             return update_observation(
                 account_id,
                 condition_id,
                 {"share_alert": dict(fields)},
             )
-
-        now = _utc_now()
-        if not selected:
-            return {
-                "state": "ready",
-                "checked_at": _timestamp(now),
-                "observations": dict(saved_observations),
-            }
 
         snapshot = self._lp_open_orders_snapshot(stop_event=stop_event)
         # The authenticated reader stamps its result after the network call;
@@ -1058,12 +955,12 @@ class PredictionExecutionService:
             if snapshot_valid and isinstance(snapshot, Mapping)
             else None
         )
+        now = _utc_now()
         if active_conditions is None:
-            for condition_id in selected:
+            for condition_id in persisted_alerts:
                 save_watch_fields(
                     condition_id,
                     {
-                        "paused": False,
                         "breach_started_at": None,
                         "notification_pending": False,
                         "last_attempt_at": _timestamp(now),
@@ -1076,29 +973,37 @@ class PredictionExecutionService:
                 "observations": observations_reader(account_id),
             }
 
-        active_selected = tuple(
-            condition_id for condition_id in selected if condition_id in active_conditions
-        )
-        if not active_selected:
-            for condition_id in selected:
+        # A market without unfinished orders leaves the monitored set; any
+        # lingering breach evidence is cleared while the last observed share
+        # value is kept for the dashboard.
+        for condition_id in persisted_alerts:
+            if condition_id not in active_conditions:
                 save_watch_fields(
                     condition_id,
                     {
-                        "paused": True,
                         "breach_started_at": None,
                         "notification_pending": False,
                         "last_attempt_at": _timestamp(now),
                     },
                 )
+
+        selected = sorted(active_conditions)
+        first_seen = {
+            condition_id: condition_id not in self._lp_share_watch_seen
+            for condition_id in selected
+        }
+        self._lp_share_watch_seen.update(selected)
+        now = _utc_now()
+        if not selected:
             return {
                 "state": "ready",
                 "checked_at": _timestamp(now),
-                "observations": observations_reader(account_id),
+                "observations": dict(saved_observations),
             }
 
         if stop_event is not None and stop_event.is_set():
             return {"state": "cancelled", "observations": observations_reader(account_id)}
-        projections = self._lp_reward_share_projection(active_selected)
+        projections = self._lp_reward_share_projection(tuple(selected))
         if stop_event is not None and stop_event.is_set():
             return {"state": "cancelled", "observations": observations_reader(account_id)}
         now = _utc_now()
@@ -1126,19 +1031,6 @@ class PredictionExecutionService:
         pending_notifications: list[tuple[str, str, str, str, datetime]] = []
         for condition_id in selected:
             alert = current_alert(condition_id)
-            if alert.get("enabled") is not True:
-                continue
-            if condition_id not in active_conditions:
-                save_watch_fields(
-                    condition_id,
-                    {
-                        "paused": True,
-                        "breach_started_at": None,
-                        "notification_pending": False,
-                        "last_attempt_at": _timestamp(now),
-                    },
-                )
-                continue
             projection = projections.get(condition_id, {})
             percentage = _decimal(projection.get("percentage"))
             source_checked_at = _lp_share_datetime(projection.get("checked_at"))
@@ -1151,7 +1043,6 @@ class PredictionExecutionService:
                 save_watch_fields(
                     condition_id,
                     {
-                        "paused": False,
                         "breach_started_at": None,
                         "notification_pending": False,
                         "last_attempt_at": _timestamp(now),
@@ -1165,7 +1056,6 @@ class PredictionExecutionService:
                 save_watch_fields(
                     condition_id,
                     {
-                        "paused": False,
                         "breach_started_at": None,
                         "notification_pending": False,
                         "last_attempt_at": _timestamp(now),
@@ -1180,7 +1070,6 @@ class PredictionExecutionService:
                 >= LP_REWARD_SHARE_STALE_SECONDS
             )
             update: dict[str, object] = {
-                "paused": False,
                 "last_share_checked_at": source_text,
                 "last_share_percentage": percentage,
                 "market_title": order_titles.get(condition_id)
@@ -1250,18 +1139,14 @@ class PredictionExecutionService:
                 break
             latest = self.lp_share_watch_state().get(condition_id, {})
             if (
-                latest.get("enabled") is not True
-                or latest.get("paused") is True
-                or latest.get("notification_pending") is not True
+                latest.get("notification_pending") is not True
                 or latest.get("last_share_checked_at") != source_text
             ):
                 continue
             with self._lp_share_watch_notification_lock:
                 latest = self.lp_share_watch_state().get(condition_id, {})
                 if (
-                    latest.get("enabled") is not True
-                    or latest.get("paused") is True
-                    or latest.get("notification_pending") is not True
+                    latest.get("notification_pending") is not True
                     or latest.get("last_share_checked_at") != source_text
                 ):
                     continue
@@ -1281,7 +1166,6 @@ class PredictionExecutionService:
                     save_watch_fields(
                         condition_id,
                         {
-                            "paused": False,
                             "breach_started_at": None,
                             "notification_pending": False,
                             "last_attempt_at": _timestamp(send_now),
@@ -2600,6 +2484,12 @@ class PredictionExecutionService:
                         "threshold": risk.get("threshold"),
                         "reason_codes": risk.get("reason_codes", []),
                         "checked_at": risk.get("checked_at"),
+                        "book_shares": evaluate_lp_book_share(
+                            books.get(token_id),
+                            condition_id=condition_id,
+                            token_id=token_id,
+                            own_orders=account_facts["open_orders"],
+                        ),
                     }
                 )
             if not tokens_by_market:

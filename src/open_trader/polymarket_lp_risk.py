@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
-from decimal import ROUND_CEILING, Decimal, InvalidOperation
+from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import cast
 
 BOOK_FRESHNESS_SECONDS = Decimal("10")
@@ -556,6 +556,125 @@ def estimate_lp_stress_exit(
         "loss_ratio": loss_ratio,
         "capital": capital,
     }
+
+
+def _own_remaining_by_side(
+    own_orders: object,
+    *,
+    condition_id: str,
+    token_id: str,
+) -> tuple[dict[str, Decimal] | None, str | None]:
+    """Sum this account's non-terminal remaining size per side for one token."""
+
+    totals: dict[str, Decimal] = {"BUY": Decimal("0"), "SELL": Decimal("0")}
+    for order in _items(own_orders):
+        if not isinstance(order, Mapping):
+            return None, "own_order_facts_unknown"
+        if str(order.get("status") or "").upper() in TERMINAL_ORDER_STATES:
+            continue
+        side = str(order.get("side") or "").upper()
+        if side not in {"BUY", "SELL"}:
+            return None, "own_order_side_unknown"
+        order_condition = order.get("condition_id", order.get("market"))
+        order_token = order.get("token_id", order.get("asset_id"))
+        if order_condition not in (None, "", condition_id):
+            continue
+        if order_token not in (None, "", token_id):
+            continue
+        if order_token in (None, ""):
+            return None, "own_order_identity_unknown"
+        remaining = _maybe_decimal(
+            order.get(
+                "remaining_size",
+                order.get("remaining_quantity", order.get("size")),
+            )
+        )
+        if remaining is None:
+            original = _maybe_decimal(order.get("original_size"))
+            matched = _maybe_decimal(order.get("size_matched", 0))
+            if original is not None and matched is not None:
+                remaining = max(Decimal("0"), original - matched)
+        if remaining is None or remaining < 0:
+            return None, "own_order_depth_unknown"
+        totals[side] += remaining
+    return totals, None
+
+
+def evaluate_lp_book_share(
+    book: object,
+    *,
+    condition_id: str,
+    token_id: str,
+    own_orders: object,
+) -> dict[str, object]:
+    """Share of each book side taken by this account's resting orders.
+
+    Issue #145: per side, own non-terminal open-order remaining quantity
+    divided by the total quantity of that book side (the public snapshot
+    already includes own resting orders).  Any unknown input keeps the
+    fields None instead of faking zero.
+    """
+
+    unknown_side = {
+        "own_side_quantity": None,
+        "side_total_quantity": None,
+        "book_share_pct": None,
+    }
+
+    def result(
+        state: str, reason_codes: list[str], sides: dict[str, dict[str, object]]
+    ) -> dict[str, object]:
+        return {
+            "state": state,
+            "reason_codes": reason_codes,
+            "BUY": sides["BUY"],
+            "SELL": sides["SELL"],
+        }
+
+    sides: dict[str, dict[str, object]] = {
+        "BUY": dict(unknown_side),
+        "SELL": dict(unknown_side),
+    }
+    if not isinstance(book, Mapping):
+        return result("unknown", ["book_unknown"], sides)
+    book_condition = str(book.get("condition_id", book.get("market")) or "").strip()
+    book_token = str(book.get("token_id", book.get("asset_id")) or "").strip()
+    if not book_condition or not book_token:
+        return result("unknown", ["book_unknown"], sides)
+    if book_condition != condition_id or book_token != token_id:
+        return result("unknown", ["book_identity_mismatch"], sides)
+    try:
+        bids = _levels(book.get("bids"), "bids")
+        asks = _levels(book.get("asks"), "asks")
+    except ValueError:
+        return result("unknown", ["book_unknown"], sides)
+    own_sizes, error = _own_remaining_by_side(
+        own_orders, condition_id=condition_id, token_id=token_id
+    )
+    if own_sizes is None:
+        return result("unknown", [error or "own_order_facts_unknown"], sides)
+    side_totals = {
+        "BUY": sum((size for _price, size in bids), Decimal("0")),
+        "SELL": sum((size for _price, size in asks), Decimal("0")),
+    }
+    known = True
+    for side in ("BUY", "SELL"):
+        total = side_totals[side]
+        own = own_sizes[side]
+        share: Decimal | None
+        if total <= 0:
+            share = None
+            known = False
+        else:
+            share = (own / total * Decimal("100")).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+        sides[side] = {
+            "own_side_quantity": own,
+            "side_total_quantity": total,
+            "book_share_pct": share,
+        }
+    return result("known" if known else "unknown", [] if known else ["book_side_empty"], sides)
 
 
 def evaluate_lp_exposure(

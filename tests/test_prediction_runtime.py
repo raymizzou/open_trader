@@ -3220,23 +3220,62 @@ def test_lp_share_watch_runs_without_dashboard_and_stops_with_runtime(
 
         probe.percentage_blocked = False
         controlled_clock[0] = 30.0
-        orders.clear()
         assert runtime.execution is not None
         execution = runtime.execution
+
+        def share_checked_at(condition_id: str) -> str:
+            alert = execution.lp_share_watch_state().get(condition_id, {})
+            return str(alert.get("last_share_checked_at") or "")
+
+        wait_for(lambda: share_checked_at("condition-a") != "")
+        pre_clear_attempt = (
+            execution.lp_share_watch_state()
+            .get("condition-a", {})
+            .get("last_attempt_at")
+        )
         wait_for(
             lambda: execution.lp_share_watch_state()
             .get("condition-a", {})
-            .get("paused")
-            is True
-            and execution.lp_share_watch_state()
-            .get("condition-b", {})
-            .get("paused")
-            is True
+            .get("last_attempt_at")
+            != pre_clear_attempt
         )
-        paused = execution.lp_share_watch_state()
-        assert paused["condition-a"]["enabled"] is True
-        assert paused["condition-a"]["paused"] is True
-        assert paused["condition-b"]["paused"] is True
+        cleared_checked_at = share_checked_at("condition-a")
+        cleared_attempt_a = (
+            execution.lp_share_watch_state()
+            .get("condition-a", {})
+            .get("last_attempt_at")
+        )
+        cleared_attempt_b = (
+            execution.lp_share_watch_state()
+            .get("condition-b", {})
+            .get("last_attempt_at")
+        )
+        orders.clear()
+        wait_for(
+            lambda: (
+                execution.lp_share_watch_state()
+                .get("condition-a", {})
+                .get("last_attempt_at")
+                != cleared_attempt_a
+                and execution.lp_share_watch_state()
+                .get("condition-b", {})
+                .get("last_attempt_at")
+                != cleared_attempt_b
+                and share_checked_at("condition-a") == cleared_checked_at
+                and share_checked_at("condition-b") == cleared_checked_at
+                and execution.lp_share_watch_state()
+                .get("condition-a", {})
+                .get("breach_started_at")
+                is None
+                and execution.lp_share_watch_state()
+                .get("condition-b", {})
+                .get("breach_started_at")
+                is None
+            )
+        )
+        cleared_state = execution.lp_share_watch_state()
+        assert cleared_state["condition-a"]["last_share_percentage"] is not None
+        assert cleared_state["condition-b"]["last_share_percentage"] is not None
 
         orders.append(
             {
@@ -3250,25 +3289,16 @@ def test_lp_share_watch_runs_without_dashboard_and_stops_with_runtime(
                 "size_matched": "0",
             }
         )
-        controlled_clock[0] = 40.0
-        wait_for(
-            lambda: execution.lp_share_watch_state()
-            .get("condition-a", {})
-            .get("paused")
-            is False
-            and execution.lp_share_watch_state()
-            .get("condition-b", {})
-            .get("paused")
-            is True
-        )
+        controlled_clock[0] = 46.0
+        wait_for(lambda: share_checked_at("condition-a") > cleared_checked_at)
         resumed = execution.lp_share_watch_state()
-        assert resumed["condition-a"]["enabled"] is True
-        assert resumed["condition-a"]["paused"] is False
-        assert resumed["condition-b"]["paused"] is True
+        assert share_checked_at("condition-a") > cleared_checked_at
+        assert share_checked_at("condition-b") == cleared_checked_at
 
         probe.unknown_orders = True
         controlled_clock[0] = 50.0
         previous_attempt = resumed["condition-a"].get("last_attempt_at")
+        frozen_checked_at = resumed["condition-a"].get("last_share_checked_at")
         wait_for(
             lambda: execution.lp_share_watch_state()
             .get("condition-a", {})
@@ -3276,8 +3306,9 @@ def test_lp_share_watch_runs_without_dashboard_and_stops_with_runtime(
             != previous_attempt
         )
         unknown = execution.lp_share_watch_state()
-        assert unknown["condition-a"]["enabled"] is True
-        assert unknown["condition-a"]["paused"] is False
+        assert unknown["condition-a"]["last_share_percentage"] is not None
+        assert unknown["condition-a"]["breach_started_at"] is None
+        assert share_checked_at("condition-a") == str(frozen_checked_at or "")
 
         probe.unknown_orders = False
         probe.orders_started.clear()
