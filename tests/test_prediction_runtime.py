@@ -6779,7 +6779,7 @@ def test_lp_history_batches_are_bounded_and_persist_public_summaries(
                     "id": f"reward-{index}",
                     "asset_address": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
                     "start_date": "2026-09-16",
-                    "end_date": "2026-09-18",
+                    "end_date": "2030-01-01",
                     "rate_per_day": "1",
                 }
             ],
