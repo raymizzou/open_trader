@@ -5536,7 +5536,8 @@ const lpDashboard = {
   positions:[], market_rewards:[],
   recommendations:[],
   candidates:[{market_id:"market-candidate",condition_id:"condition-candidate",market_url:"https://polymarket.com/event/candidate",
-    market_title:"LP candidate fact",token_id:"candidate-token",outcome:"NO",daily_pool_usd:"150",min_quantity:"20",
+    market_title:"LP candidate fact",token_id:"candidate-token",outcome:"NO",state:"eligible",daily_pool_usd:"150",min_quantity:"20",
+    selected_direction:{outcome:"NO",price:"0.40",quantity:"20",required_capital:"8.00",estimated_exit_loss:"0.80",estimated_exit_loss_ratio:"0.10",checked_at:"2026-09-15T04:00:00Z"},
     reference_capital:"8.00",competition:{value:"12.5",raw_value:"12.5",checked_at:"2026-09-15T04:00:00Z",state:"known",stale:false,updated:true},
     reason:[],summary:{}}],
 };
@@ -6166,7 +6167,8 @@ const lpDashboard = {state:"ready",stale:false,complete:true,checked_at:"2026-09
     state:"open",management:"manual_read_only",read_only:true}],
   non_lp_row_count:0,positions:[],market_rewards:[],recommendations:[],
   candidates:[{market_id:"market-candidate",condition_id:"condition-candidate",market_url:"https://polymarket.com/event/candidate",
-    market_title:"LP candidate fact",token_id:"candidate-no",outcome:"NO",
+    market_title:"LP candidate fact",token_id:"candidate-no",outcome:"NO",state:"eligible",
+    selected_direction:{outcome:"NO",price:"0.40",quantity:"20",required_capital:"8.00",estimated_exit_loss:"0.80",estimated_exit_loss_ratio:"0.10",checked_at:"2026-09-16T00:00:00Z"},
     daily_pool_usd:"150",min_quantity:"20",minimum_order_size:"5",reward_min_size:"20",
     reference_price:"0.40",reference_capital:"8.00",
     competition:{value:"12.5",raw_value:"12.5",checked_at:"2026-09-16T00:00:00Z",state:"known",stale:false,updated:true},
@@ -6343,7 +6345,9 @@ const dashboard = {
     },
     reasons:{read:[],base:[{market_id:"m1",condition_id:"condition-m1",code:"history_summary_unknown"}],sort:[],trial:[]},
   },
-  orders:[], positions:[], recommendations:[], candidates:[{market_id:"M01",condition_id:"condition-M01",market_title:"Market M01",min_quantity:"20",competition:{state:"known",value:"0.12"}}],
+  orders:[], positions:[], recommendations:[], candidates:[{market_id:"M01",condition_id:"condition-M01",market_title:"Market M01",min_quantity:"20",state:"eligible",
+    selected_direction:{outcome:"YES",price:"0.30",quantity:"20",required_capital:"6.00",estimated_exit_loss:"0.60",estimated_exit_loss_ratio:"0.10",checked_at:"2026-09-17T01:00:00Z"},
+    competition:{state:"known",value:"0.12"}}],
 };
 const html = predictionLpCard({lp_dashboard:dashboard});
 const order = ["读取","基础筛选","排序","待测候选"].map((label)=>html.indexOf(label));
@@ -6602,6 +6606,9 @@ const candidate = (marketId, conditionId, title, pool, competition, capital) => 
   market_id: marketId, condition_id: conditionId, market_title: title,
   market_url: "https://polymarket.com/event/" + marketId,
   token_id: "token-" + marketId, outcome: "YES",
+  state: "eligible",
+  selected_direction: {outcome: "YES", price: "0.33", quantity: "20", required_capital: capital,
+    estimated_exit_loss: "0.80", estimated_exit_loss_ratio: "0.10", checked_at: checkedAt},
   daily_pool_usd: pool, min_quantity: "20",
   minimum_order_size: "5", reward_min_size: "20",
   reference_price: "0.33", reference_capital: capital,
@@ -20206,7 +20213,7 @@ console.log(JSON.stringify({
     && third.includes("book_unknown") && third.includes("fee_unknown")
     && (third.match(/book_unknown/g) || []).length === 1
     && (third.match(/fee_unknown/g) || []).length === 1,
-  pendingLinkKept: third.includes("https://polymarket.com/event/pending"),
+  pendingLinkHidden: !third.includes("https://polymarket.com/event/pending"),
 }));
 ''')
     rendered = json.loads(output)
@@ -20217,7 +20224,7 @@ console.log(JSON.stringify({
         "noDirectionNotice": True,
         "noGroupBudget": True,
         "clearedWhenUnknown": True,
-        "pendingLinkKept": True,
+    "pendingLinkHidden": True,
     }, rendered
 
 
@@ -20333,9 +20340,66 @@ console.log(JSON.stringify({
     }, rendered
 
 
+def test_lp_candidate_identity_matches_selected_direction() -> None:
+    output = run_dashboard_js(r'''
+const checkedAt = "2026-09-19T12:00:00Z";
+const selected = {
+  outcome: "YES", price: "0.23", quantity: "50", required_capital: "11.50",
+  estimated_exit_loss: "1.15", estimated_exit_loss_ratio: "0.10",
+  checked_at: checkedAt,
+};
+const row = (overrides = {}) => ({
+  market_id: "market-direction", condition_id: "condition-direction",
+  market_title: "Direction market", market_url: "https://polymarket.com/event/direction",
+  outcome: "NO", state: "eligible", realtime_checked_at: checkedAt,
+  selected_direction: selected,
+  competition: {state: "known", value: "1", checked_at: checkedAt},
+  ...overrides,
+});
+const dashboard = {
+  state: "ready", complete: true, scanning: false, checked_at: checkedAt,
+  candidate_state: "ready", candidate_stale: false,
+  candidate_checked_at: checkedAt, candidate_last_success_at: checkedAt,
+  orders: [], positions: [], lp_orders_today: [], market_rewards: {},
+  lp_observations: {}, lp_share_watch_state: {},
+  candidates: [row(), row({
+    condition_id: "condition-no-selected", market_id: "market-no-selected",
+    market_title: "No selected direction", market_url: "https://polymarket.com/event/no-selected",
+    selected_direction: null,
+  })],
+  recommendations: [row()], selected_results: [row()],
+  funnel: {
+    normal_queue_count: 2, backup_queue_count: 0, checked: 2, passed: 2,
+    rejected: 0, unknown: 0, unchecked: 0, stop_reason: "filled",
+    excluded: {}, compared_range: {compared: 2, total: 2, pending: 0},
+    budget: {available_capital: "50.00"},
+  },
+};
+const html = predictionLpCard({lp_dashboard: dashboard});
+const tableStart = html.indexOf("pm-lp-candidate-table");
+const table = html.slice(tableStart, html.indexOf("</table>", tableStart));
+const cellsFor = (label) => table.split("<td data-label=\"" + label + "\">")
+  .slice(1).map((fragment) => fragment.slice(0, fragment.indexOf("</td>")));
+const identityCells = cellsFor("市场与方向");
+console.log(JSON.stringify({
+  identityUsesSelected: identityCells[0]?.includes("买 YES") === true,
+  planUsesSelected: table.includes("买 YES · 实际占资"),
+  noClaimedBuy: identityCells.every((cell) => !cell.includes("买 NO")),
+  fixedArithmetic: table.includes("23¢ × 50 份 = <strong>$11.50</strong>"),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered == {
+        "identityUsesSelected": True,
+        "planUsesSelected": True,
+        "noClaimedBuy": True,
+        "fixedArithmetic": True,
+    }, rendered
+
+
 def test_lp_maintenance_failed_head_row_shows_read_only_badge() -> None:
-    """A maintained head that fails its re-check keeps its row but loses the
-    passer badge: non-eligible rows render as read-only, never 本轮通过."""
+    """A maintained head that fails its re-check is hidden from candidates,
+    while its direction reasons remain available in diagnostics."""
     output = run_dashboard_js(r'''
 Date.now = () => Date.parse("2026-09-19T12:01:00Z");
 const checkedAt = "2026-09-19T12:00:30Z";
@@ -20381,16 +20445,100 @@ const start = html.indexOf("pm-lp-candidate-table");
 const table = html.slice(start, html.indexOf("</table>", start));
 console.log(JSON.stringify({
   noPassBadgeOnFailedHead: !table.includes("本轮通过"),
-  failedReadOnlyBadge: table.includes("维护失败 · 仅供阅读")
-    && table.includes("不再当前有效"),
-  rowKept: table.includes("condition-current"),
+  failedHiddenFromTable: !table.includes("condition-current"),
+  diagnosticsKept: html.includes("book_unknown")
+    && html.includes("stress_loss_exceeded"),
 }));
 ''')
     rendered = json.loads(output)
     assert rendered == {
         "noPassBadgeOnFailedHead": True,
-        "failedReadOnlyBadge": True,
-        "rowKept": True,
+        "failedHiddenFromTable": True,
+        "diagnosticsKept": True,
+    }, rendered
+
+
+def test_lp_failed_candidate_hidden_with_diagnostics() -> None:
+    output = run_dashboard_js(r'''
+const checkedAt = "2026-09-20T03:00:00Z";
+const selected = {
+  outcome: "YES", price: "0.23", quantity: "50", required_capital: "11.50",
+  estimated_exit_loss: "1.15", estimated_exit_loss_ratio: "0.10", checked_at: checkedAt,
+};
+const validRunner = {
+  market_id: "market-runner", condition_id: "condition-runner",
+  market_title: "Valid runner", market_url: "https://polymarket.com/event/runner",
+  outcome: "NO", state: "eligible", realtime_checked_at: checkedAt,
+  selected_direction: selected,
+  competition: {state: "known", value: "2", checked_at: checkedAt},
+  reason: ["保留的检查时快照"], summary: {},
+};
+const failedHead = (state, conditionId, reasonCodes) => ({
+  market_id: "market-" + conditionId, condition_id: conditionId,
+  market_title: "Failed head", market_url: "https://polymarket.com/event/" + conditionId,
+  outcome: "NO", state, realtime_checked_at: checkedAt, selected_direction: null,
+  directions: {
+    YES: {state, eligible: false, reason_codes: reasonCodes},
+    NO: {state, eligible: false, reason_codes: reasonCodes},
+  },
+});
+const noPlan = {
+  ...validRunner, market_id: "market-no-plan", condition_id: "condition-no-plan",
+  market_title: "Claimed eligible without plan", outcome: "NO", state: "eligible",
+  selected_direction: null,
+};
+const base = {
+  state: "ready", complete: true, scanning: false, checked_at: checkedAt,
+  candidate_state: "ready", candidate_stale: false,
+  candidate_checked_at: checkedAt, candidate_last_success_at: checkedAt,
+  orders: [], positions: [], lp_orders_today: [], market_rewards: {},
+  lp_observations: {}, lp_share_watch_state: {}, non_lp_row_count: 0,
+  funnel: {
+    normal_queue_count: 2, backup_queue_count: 0, checked: 2, passed: 1,
+    rejected: 1, unknown: 0, unchecked: 0, stop_reason: "queue_exhausted",
+    excluded: {}, compared_range: {compared: 2, total: 2, pending: 0},
+    budget: {available_capital: "50.00"},
+  },
+};
+const render = (head, candidates = [head, validRunner]) => predictionLpCard({
+  lp_dashboard: {...base, candidates, recommendations: [], selected_results: [head, validRunner]},
+});
+const table = (html) => {
+  const start = html.indexOf("pm-lp-candidate-table");
+  return html.slice(start, html.indexOf("</table>", start));
+};
+const unknownHtml = render(failedHead(
+  "unknown", "condition-failed-unknown", ["account_freshness_stale", "market_metadata_stale"],
+));
+const rejectedHtml = render(failedHead(
+  "rejected", "condition-failed-rejected", ["market_metadata_stale"],
+));
+const noPlanHtml = render(noPlan, [noPlan, validRunner]);
+console.log(JSON.stringify({
+  unknownHidden: !table(unknownHtml).includes("condition-failed-unknown"),
+  unknownReasonVisible: unknownHtml.includes("account_freshness_stale")
+    && unknownHtml.includes("market_metadata_stale"),
+  unknownRunnerKept: table(unknownHtml).includes("condition-runner"),
+  unknownRunnerNotCurrent: !table(unknownHtml).includes("当前推荐"),
+  rejectedHidden: !table(rejectedHtml).includes("condition-failed-rejected"),
+  rejectedReasonVisible: rejectedHtml.includes("market_metadata_stale"),
+  rejectedRunnerKept: table(rejectedHtml).includes("condition-runner"),
+  noPlanHidden: !table(noPlanHtml).includes("condition-no-plan")
+    && !table(noPlanHtml).includes("买 NO"),
+  noPlanRunnerKept: table(noPlanHtml).includes("condition-runner"),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered == {
+        "unknownHidden": True,
+        "unknownReasonVisible": True,
+        "unknownRunnerKept": True,
+        "unknownRunnerNotCurrent": True,
+        "rejectedHidden": True,
+        "rejectedReasonVisible": True,
+        "rejectedRunnerKept": True,
+        "noPlanHidden": True,
+        "noPlanRunnerKept": True,
     }, rendered
 
 

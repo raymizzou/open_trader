@@ -3821,9 +3821,12 @@ function lpTrialCandidateRow(row, currentConditionId, degraded) {
   const rowKey = String(row?.condition_id || row?.market_id || "") + ":" + String(row?.outcome || "");
   const isCurrent = Boolean(currentConditionId)
     && String(row?.condition_id || "") === currentConditionId;
+  const selected = row?.selected_direction && typeof row.selected_direction === "object"
+    ? row.selected_direction : null;
+  const selectedOutcome = selected?.outcome;
   const identity = "<td data-label=\"市场与方向\">" + lpMarketTitleLink(row)
     + "<span class=\"sub\">" + escapeHtml(predictionValue(row.market_id, row.condition_id))
-    + " · 买 " + escapeHtml(predictionValue(row.outcome, "UNKNOWN")) + "</span></td>";
+    + " · 买 " + escapeHtml(predictionValue(selectedOutcome, "UNKNOWN")) + "</span></td>";
   const competition = "<td data-label=\"官方竞争\">" + lpTrialCompetitionMarkup(row.competition) + "</td>";
   const pool = "<td data-label=\"日奖池\" class=\"num\">"
     + escapeHtml(lpDashboardMoney(row.daily_pool_usd)) + "</td>";
@@ -3983,8 +3986,13 @@ function predictionLpCard(payload) {
     const ms = Date.now() - Date.parse(String(stamp));
     return Number.isFinite(ms) ? ms / 1000 : null;
   };
-  const candidateRowsHtml = candidates.length
-    ? candidates.map((row) => lpTrialCandidateRow(
+  const visibleCandidates = candidates.filter((row) => {
+    const selected = row?.selected_direction;
+    const state = String(row?.state || "eligible").toLowerCase();
+    return selected && typeof selected === "object" && state === "eligible";
+  });
+  const candidateRowsHtml = visibleCandidates.length
+    ? visibleCandidates.map((row) => lpTrialCandidateRow(
         row,
         currentConditionId,
         (candidateAgeSeconds(row?.realtime_checked_at || dashboard.candidate_checked_at) ?? 0) > 300,
