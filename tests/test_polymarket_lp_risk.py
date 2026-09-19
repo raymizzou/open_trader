@@ -22,6 +22,7 @@ def _direction(
             "token_id": "token-yes",
             "outcome": "YES",
             "metadata_checked_at": NOW,
+            "fees_checked_at": NOW,
             "accepting_orders": True,
             "exchange_type": "CLOB",
             "tick_size": Decimal("0.01"),
@@ -143,6 +144,245 @@ def test_lp_entry_uses_best_bid_and_minimum_eligible_quantity() -> None:
     assert "midpoint_out_of_range" in out_of_range_result["reason_codes"]
     assert thin_bbo_result["state"] == "rejected"
     assert "reward_distance_invalid" in thin_bbo_result["reason_codes"]
+
+
+def test_lp_entry_cumulative_midpoint_qualification() -> None:
+    direction = _direction()
+    direction["market"] = {
+        **direction["market"],
+        "reward_min_size": Decimal("20"),
+        "reward_max_spread": Decimal("0.01"),
+    }
+    direction["book"] = {
+        "condition_id": "condition-a",
+        "token_id": "token-yes",
+        "received_at": NOW,
+        "bids": [
+            {"price": Decimal("0.45"), "size": Decimal("10")},
+            {"price": Decimal("0.44"), "size": Decimal("10")},
+            {"price": Decimal("0.40"), "size": Decimal("100")},
+        ],
+        "asks": [{"price": Decimal("0.47"), "size": Decimal("20")}],
+    }
+    account = _account()
+    account.update(
+        {
+            "wallet_address": "wallet-a",
+            "open_orders_complete": True,
+            "positions_complete": True,
+        }
+    )
+
+    result = polymarket_lp_risk.evaluate_lp_entry(
+        direction, account=account, now=NOW, candidate=True
+    )
+
+    assert result["state"] == "eligible"
+    guidance = result["guidance"]
+    assert isinstance(guidance, dict)
+    assert guidance["price"] == Decimal("0.45")
+    assert guidance["quantity"] == Decimal("20")
+    assert guidance["required_capital"] == Decimal("9.00")
+    assert guidance["estimated_exit_loss"] == Decimal("0.60")
+
+
+def test_lp_entry_candidate_fact_freshness_and_identity() -> None:
+    direction = _direction()
+    market = dict(direction["market"])
+    market["account_wallet_address"] = "wallet-a"
+    direction["market"] = market
+    account = _account()
+    account.update(
+        {
+            "wallet_address": "wallet-a",
+            "open_orders_complete": True,
+            "positions_complete": True,
+        }
+    )
+
+    def evaluate(
+        current_direction: dict[str, object] | None = None,
+        current_account: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        return polymarket_lp_risk.evaluate_lp_entry(
+            current_direction or direction,
+            account=current_account or account,
+            now=NOW,
+            candidate=True,
+        )
+
+    at_boundary = {
+        **direction,
+        "market": {
+            **market,
+            "metadata_checked_at": NOW - timedelta(seconds=60),
+            "fees_checked_at": NOW - timedelta(seconds=60),
+        },
+        "book": {**direction["book"], "received_at": NOW - timedelta(seconds=60)},
+        "reward_checked_at": NOW - timedelta(seconds=60),
+    }
+    boundary_account = {
+        **account,
+        "checked_at": NOW - timedelta(seconds=60),
+    }
+    boundary = evaluate(at_boundary, boundary_account)
+    assert boundary["state"] == "eligible"
+
+    for changed in (
+        {"book": {**direction["book"], "received_at": NOW - timedelta(seconds=60, microseconds=1)}},
+        {"reward_checked_at": NOW - timedelta(seconds=60, microseconds=1)},
+        {"market": {**market, "metadata_checked_at": NOW + timedelta(microseconds=1)}},
+        {"market": {**market, "fees_checked_at": NOW - timedelta(seconds=60, microseconds=1)}},
+        {"market": {**market, "fees_checked_at": NOW + timedelta(microseconds=1)}},
+        {"market": {**market, "account_wallet_address": "wallet-b"}},
+    ):
+        result = evaluate({**direction, **changed})
+        assert result["state"] == "unknown"
+        assert result["guidance"] is None
+
+    missing_reward = {**direction}
+    missing_reward.pop("reward_checked_at")
+    result = evaluate(missing_reward)
+    assert result["state"] == "unknown"
+    assert result["guidance"] is None
+
+    missing_fees = {**direction, "market": dict(market)}
+    missing_fees["market"].pop("fees_checked_at")
+    result = evaluate(missing_fees)
+    assert result["state"] == "unknown"
+    assert result["guidance"] is None
+
+    incomplete_account = {**account, "open_orders_complete": False}
+    result = evaluate(current_account=incomplete_account)
+    assert result["state"] == "unknown"
+    assert result["guidance"] is None
+
+    unknown_fee_market = {
+        **market,
+        "fees_enabled": True,
+        "taker_fee_rate": None,
+        "fee_exponent": Decimal("1"),
+    }
+    result = evaluate({**direction, "market": unknown_fee_market})
+    assert result["state"] == "unknown"
+    assert result["guidance"] is None
+
+    known_zero_fee = evaluate()
+    assert known_zero_fee["state"] == "eligible"
+
+
+def test_lp_entry_minimum_capital_and_stress_boundaries() -> None:
+    direction = _direction(reward_min_size="20", minimum_order_size="5")
+    direction["market"] = {
+        **direction["market"],
+        "reward_max_spread": Decimal("0.10"),
+    }
+    direction["book"] = {
+        "condition_id": "condition-a",
+        "token_id": "token-yes",
+        "received_at": NOW,
+        "bids": [
+                {"price": Decimal("0.45"), "size": Decimal("21")},
+                {"price": Decimal("0.44"), "size": Decimal("21")},
+            ],
+            "asks": [{"price": Decimal("0.47"), "size": Decimal("21")}],
+    }
+    account = _account()
+    account.update(
+        {
+            "open_orders_complete": True,
+            "positions_complete": True,
+            "wallet_address": "wallet-a",
+            "balance": Decimal("9"),
+            "allowance": Decimal("9"),
+        }
+    )
+    direction["market"] = {
+        **direction["market"],
+        "account_wallet_address": "wallet-a",
+    }
+
+    funded = polymarket_lp_risk.evaluate_lp_entry(
+        direction, account=account, now=NOW, candidate=True
+    )
+    assert funded["state"] == "eligible"
+    funded_guidance = funded["guidance"]
+    assert isinstance(funded_guidance, dict)
+    assert funded_guidance["quantity"] == Decimal("20")
+    assert funded_guidance["required_capital"] == Decimal("9")
+
+    overfunded = {**account, "balance": Decimal("9"), "allowance": Decimal("9")}
+    overfunded_direction = {
+        **direction,
+        "book": {
+            **direction["book"],
+            "bids": [
+                    {"price": Decimal("0.46"), "size": Decimal("21")},
+                    {"price": Decimal("0.45"), "size": Decimal("21")},
+            ],
+        },
+    }
+    overfunded_result = polymarket_lp_risk.evaluate_lp_entry(
+        overfunded_direction, account=overfunded, now=NOW, candidate=True
+    )
+    assert overfunded_result["state"] == "rejected"
+    assert "balance_insufficient" in overfunded_result["reason_codes"]
+
+    fractional_direction = {
+        **direction,
+        "market": {**direction["market"], "reward_min_size": Decimal("20.001")},
+    }
+    fractional = polymarket_lp_risk.evaluate_lp_entry(
+        fractional_direction, account={**account, "balance": Decimal("20"), "allowance": Decimal("20")}, now=NOW, candidate=True
+    )
+    assert fractional["state"] == "eligible"
+    fractional_guidance = fractional["guidance"]
+    assert isinstance(fractional_guidance, dict)
+    assert fractional_guidance["quantity"] == Decimal("20.01")
+
+    unknown_funds = polymarket_lp_risk.evaluate_lp_entry(
+        direction,
+        account={**account, "balance": None},
+        now=NOW,
+        candidate=True,
+    )
+    assert unknown_funds["state"] == "unknown"
+    assert unknown_funds["guidance"] is None
+
+    market = direction["market"]
+    assert isinstance(market, dict)
+    stress_market = {**market, "fees_enabled": False}
+    stress_book = {
+        "condition_id": "condition-a",
+        "token_id": "token-yes",
+        "received_at": NOW,
+        "bids": [
+            {"price": Decimal("0.50"), "size": Decimal("20")},
+            {"price": Decimal("0.45"), "size": Decimal("20")},
+        ],
+    }
+    at_limit = polymarket_lp_risk.estimate_lp_stress_exit(
+        stress_book,
+        market=stress_market,
+        price=Decimal("0.50"),
+        quantity=Decimal("20"),
+    )
+    below_limit = polymarket_lp_risk.estimate_lp_stress_exit(
+        {
+            **stress_book,
+            "bids": [
+                {"price": Decimal("0.50"), "size": Decimal("20")},
+                {"price": Decimal("0.4495"), "size": Decimal("20")},
+            ],
+        },
+        market=stress_market,
+        price=Decimal("0.50"),
+        quantity=Decimal("20"),
+    )
+    assert at_limit["state"] == "eligible"
+    assert at_limit["net_loss"] == Decimal("1.00")
+    assert below_limit["state"] == "rejected"
+    assert below_limit["loss_ratio"] == Decimal("0.101")
 
 
 def test_lp_stress_exit_removes_own_orders_and_the_entire_best_level() -> None:

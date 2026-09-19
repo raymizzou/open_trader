@@ -1849,6 +1849,333 @@ def test_lp_dashboard_refresh_cannot_block_risk_monitor(
     assert probe_holder[0].active == 0
 
 
+def test_lp_trial_maintenance_runs_without_page_and_stops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.prediction_runtime as runtime_module
+
+    initial_now = datetime(2026, 9, 19, 12, 0, tzinfo=UTC)
+    clock = {"now": initial_now}
+    clock_reads = 0
+
+    def read_clock() -> datetime:
+        nonlocal clock_reads
+        clock_reads += 1
+        return clock["now"]
+
+    condition_ids = ("runtime-condition-a", "runtime-condition-b")
+    markets = {
+        condition_id: {
+            "market_id": f"market-{condition_id}",
+            "yes_token": f"{condition_id}-yes",
+            "no_token": f"{condition_id}-no",
+        }
+        for condition_id in condition_ids
+    }
+    book_calls: list[tuple[str, ...]] = []
+    maintenance_started = threading.Event()
+    maintenance_stop_seen = threading.Event()
+    maintenance_release = threading.Event()
+    maintenance_finished = threading.Event()
+    history_waiting = threading.Event()
+    risk_tick_seen = threading.Event()
+    behavior = {"block_maintenance": True, "missing_no": False}
+
+    class FakeTrading:
+        config = SimpleNamespace(
+            signer_address="0x" + "1" * 40,
+            wallet_address="0x" + "2" * 40,
+        )
+
+        def lp_reward_catalog(
+            self, *, stop_event: threading.Event | None = None
+        ) -> dict[str, object]:
+            if stop_event is not None and stop_event.is_set():
+                return {
+                    "state": "unknown",
+                    "complete": False,
+                    "checked_at": clock["now"],
+                    "markets": (),
+                }
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": clock["now"],
+                "daily_pool_usd": Decimal("2"),
+                "markets": [
+                    {
+                        "condition_id": condition_id,
+                        "rewards_min_size": Decimal("90"),
+                        "rewards_max_spread": Decimal("10"),
+                        "reward_active": True,
+                        "daily_pool_usd": Decimal("2"),
+                        "rewards_config": [
+                            {
+                                "id": f"reward-{condition_id}",
+                                "asset_address": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+                                "start_date": "2026-01-01",
+                                "end_date": "2026-12-31",
+                                "rate_per_day": Decimal("2"),
+                            }
+                        ],
+                    }
+                    for condition_id in condition_ids
+                ],
+            }
+
+        def lp_market_metadata(
+            self,
+            requested: object,
+            *,
+            stop_event: threading.Event | None = None,
+        ) -> dict[str, dict[str, object]]:
+            del stop_event
+            condition_ids_requested = tuple(requested)  # type: ignore[arg-type]
+            return {
+                condition_id: {
+                    "market_id": markets[condition_id]["market_id"],
+                    "condition_id": condition_id,
+                    "market_title": condition_id,
+                    "market_url": f"https://polymarket.com/event/{condition_id}",
+                    "accepting_orders": True,
+                    "metadata_checked_at": clock["now"],
+                    "fees_checked_at": clock["now"],
+                    "exchange_type": "CLOB",
+                    "tick_size": Decimal("0.01"),
+                    "minimum_order_size": Decimal("1"),
+                    "reward_min_size": Decimal("90"),
+                    "reward_max_spread": Decimal("0.10"),
+                    "fees_enabled": False,
+                    "fee": Decimal("0"),
+                    "taker_fee_rate": Decimal("0"),
+                    "outcomes": {
+                        "yes": {
+                            "label": "YES",
+                            "token_id": markets[condition_id]["yes_token"],
+                        },
+                        "no": {
+                            "label": "NO",
+                            "token_id": markets[condition_id]["no_token"],
+                        },
+                    },
+                }
+                for condition_id in condition_ids_requested
+                if condition_id in markets
+            }
+
+        def lp_price_history(
+            self,
+            token_ids: object,
+            *,
+            start_ts: int,
+            end_ts: int,
+            fidelity: int,
+            stop_event: threading.Event | None = None,
+        ) -> dict[str, object]:
+            del fidelity
+            if stop_event is not None and stop_event.is_set():
+                return {"state": "cancelled", "history": {}}
+            return {
+                "state": "known",
+                "history": {
+                    token_id: [
+                        {"t": start_ts, "p": "0.50"},
+                        {"t": end_ts, "p": "0.50"},
+                    ]
+                    for token_id in tuple(token_ids)  # type: ignore[arg-type]
+                },
+            }
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "wallet_address": self.config.wallet_address,
+                "balance": Decimal("100"),
+                "allowance": Decimal("100"),
+                "open_orders": [],
+                "positions": [],
+                "open_orders_complete": True,
+                "positions_complete": True,
+                "checked_at": clock["now"],
+            }
+
+        def lp_order_books(
+            self,
+            token_ids: object,
+            *,
+            stop_event: threading.Event | None = None,
+        ) -> dict[str, dict[str, object]]:
+            batch = tuple(token_ids)  # type: ignore[arg-type]
+            book_calls.append(batch)
+            if len(book_calls) == 2 and behavior["block_maintenance"]:
+                maintenance_started.set()
+                while not maintenance_release.is_set():
+                    if stop_event is not None and stop_event.is_set():
+                        maintenance_stop_seen.set()
+                        return {}
+                    maintenance_stop_seen.wait(0.01)
+            now = clock["now"]
+            received_at = (
+                now - timedelta(seconds=59) if len(book_calls) == 1 else now
+            )
+            result: dict[str, dict[str, object]] = {}
+            for condition_id, market in markets.items():
+                for outcome in ("yes", "no"):
+                    if (
+                        len(book_calls) == 2
+                        and behavior["missing_no"]
+                        and outcome == "no"
+                    ):
+                        continue
+                    token_id = market[f"{outcome}_token"]
+                    if token_id not in batch:
+                        continue
+                    result[token_id] = {
+                        "condition_id": condition_id,
+                        "token_id": token_id,
+                        "received_at": received_at,
+                        "bids": [
+                            {"price": Decimal("0.50"), "size": Decimal("1")},
+                            {"price": Decimal("0.49"), "size": Decimal("100")},
+                        ],
+                        "asks": [{"price": Decimal("0.52"), "size": Decimal("100")}],
+                    }
+            if len(book_calls) == 2 and behavior["missing_no"]:
+                maintenance_finished.set()
+            return result
+
+        def close(self) -> None:
+            return None
+
+    class FakeMonitor:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def stop(self) -> None:
+            return None
+
+    class FakeExecution:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def reconcile_startup(self) -> dict[str, object]:
+            return {"state": "ready"}
+
+        def lp_tick(self) -> dict[str, object]:
+            risk_tick_seen.set()
+            return {"state": "none"}
+
+        def set_cross_venue_monitor(self, _monitor: object) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        runtime_module,
+        "PolymarketTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: FakeTrading()),
+    )
+    monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor)
+    monkeypatch.setattr(runtime_module, "PredictionExecutionService", FakeExecution)
+    monkeypatch.setattr(runtime_module, "load_trading_config", lambda _path: FakeTrading.config)
+
+    def wait_for_history(stop_event: threading.Event, _seconds: float) -> bool:
+        history_waiting.set()
+        return stop_event.wait()
+
+    runtime = PredictionRuntime(
+        data_dir=tmp_path,
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+        mode="production",
+        n_leg_paused=True,
+        enable_n_leg_background=False,
+        history_clock=read_clock,
+        history_wait=wait_for_history,
+    )
+    runtime.start()
+    try:
+        assert runtime.state == "RUNNING"
+        assert history_waiting.wait(timeout=5)
+        assert runtime.lp is not None
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            published = runtime.lp.candidate_snapshot()
+            if published.get("recommendations"):
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("initial candidate recommendation was not published")
+        assert len(book_calls) == 1
+        # The published book is 59 seconds old; advancing the source clock by
+        # two seconds must wake maintenance before the ordinary 60-second
+        # candidate wait expires.
+        clock["now"] = initial_now + timedelta(seconds=2)
+        assert maintenance_started.wait(timeout=5)
+        assert len(book_calls) == 2
+        expected_head = {
+            markets[condition_ids[0]]["yes_token"],
+            markets[condition_ids[0]]["no_token"],
+        }
+        assert all(set(batch) == expected_head for batch in book_calls)
+        assert risk_tick_seen.wait(timeout=2)
+    finally:
+        runtime.stop()
+    assert runtime.state == "STOPPED"
+    assert maintenance_stop_seen.is_set()
+    calls_after_stop = len(book_calls)
+    time.sleep(0.05)
+    assert len(book_calls) == calls_after_stop
+
+    # A partial maintenance result remains eligible on one direction, but the
+    # missing direction must not turn the runtime into a 50ms polling loop.
+    book_calls.clear()
+    clock["now"] = initial_now
+    clock_reads = 0
+    behavior["block_maintenance"] = False
+    behavior["missing_no"] = True
+    maintenance_started = threading.Event()
+    maintenance_stop_seen = threading.Event()
+    maintenance_release = threading.Event()
+    maintenance_finished = threading.Event()
+    history_waiting = threading.Event()
+    risk_tick_seen = threading.Event()
+    runtime2 = PredictionRuntime(
+        data_dir=tmp_path / "missing-direction",
+        prediction_config_path=tmp_path / "missing-direction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+        mode="production",
+        n_leg_paused=True,
+        enable_n_leg_background=False,
+        history_clock=read_clock,
+        history_wait=wait_for_history,
+    )
+    runtime2.start()
+    try:
+        assert runtime2.state == "RUNNING"
+        assert history_waiting.wait(timeout=5)
+        assert runtime2.lp is not None
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            published = runtime2.lp.candidate_snapshot()
+            if published.get("recommendations"):
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("second candidate recommendation was not published")
+        assert len(book_calls) == 1
+        clock["now"] = initial_now + timedelta(seconds=2)
+        assert maintenance_finished.wait(timeout=5)
+        assert len(book_calls) == 2
+        reads_after_partial_refresh = clock_reads
+        time.sleep(0.35)
+        assert clock_reads - reads_after_partial_refresh <= 10
+    finally:
+        runtime2.stop()
+    assert runtime2.state == "STOPPED"
+
+
 def test_lp_observations_refresh_without_dashboard_and_stop_with_runtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -6518,9 +6845,10 @@ def test_lp_minute_risk_does_not_wait_for_hourly_catalog_preparation(
                     "market_id": "market-A",
                     "condition_id": "condition-A",
                     "market_title": "Market A",
-                    "accepting_orders": True,
-                    "metadata_checked_at": now[0],
-                    "tick_size": Decimal("0.01"),
+                        "accepting_orders": True,
+                        "metadata_checked_at": now[0],
+                        "fees_checked_at": now[0],
+                        "tick_size": Decimal("0.01"),
                     "minimum_order_size": Decimal("20"),
                     "reward_min_size": Decimal("20"),
                     "reward_max_spread": Decimal("0.10"),
@@ -6740,10 +7068,11 @@ def test_lp_minute_risk_does_not_wait_for_hourly_catalog_preparation(
         assert len(selected_book_calls) >= 2
         assert catalog_calls == 2
         assert full_metadata_calls == 1
-        # 分钟级候选扫描不再做逐市场的新鲜资料/奖励重读：只读已发布 prepared
-        # inputs 并为入选候选读取盘口，等待期间的小时级目录读取不被阻塞。
-        assert selected_metadata_calls == []
-        assert selected_reward_calls == []
+        # Risk and reward loops remain independent while candidate
+        # maintenance refreshes only the selected condition's expired
+        # metadata/reward facts and its book.
+        assert selected_metadata_calls == [("condition-A",)]
+        assert selected_reward_calls == [("condition-A",)]
         release_catalog.set()
         runtime.stop()
         assert runtime.state == "STOPPED"

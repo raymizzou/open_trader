@@ -1293,8 +1293,13 @@ class PolymarketTradingClient:
         """Return current account orders and holdings for the read-only LP panel."""
 
         lp_checked_at = datetime.now(UTC)
-        balance, allowance, orders, positions, _account_checked_at = self._account_read_facts()
-        checked_at = lp_checked_at
+        balance, allowance, orders, positions, account_checked_at = self._account_read_facts()
+        checked_at = (
+            account_checked_at
+            if isinstance(account_checked_at, datetime)
+            and account_checked_at.tzinfo is not None
+            else lp_checked_at
+        )
         order_rows: list[dict[str, object]] = []
         open_orders_complete = True
         for order in orders:
@@ -1351,6 +1356,7 @@ class PolymarketTradingClient:
                 row["condition_id"] = market.get("condition_id")
         return {
             "authenticated": True,
+            "wallet_address": self.config.wallet_address,
             "balance": balance,
             "allowance": allowance,
             "open_orders": tuple(order_rows),
@@ -2091,6 +2097,7 @@ class PolymarketTradingClient:
                 "market_id": row.get("id", row.get("market_id")),
                 "condition_id": condition_id,
                 "metadata_checked_at": metadata_checked_at,
+                "fees_checked_at": metadata_checked_at,
                 "market_title": row.get("question", row.get("title")),
                 "market_url": market_url,
                 "event_id": event_id,

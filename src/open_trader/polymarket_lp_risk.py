@@ -179,13 +179,32 @@ def _qualify_reward_quote(
     reward_min_size: Decimal,
     reward_max_spread: Decimal,
     require_positive_score: bool = False,
+    cumulative_depth: bool = False,
 ) -> tuple[tuple[Decimal, Decimal], tuple[Decimal, Decimal], Decimal]:
-    qualifying_asks = [row for row in asks if row[1] >= reward_min_size]
-    qualifying_bids = [row for row in bids if row[1] >= reward_min_size]
-    if not qualifying_asks or not qualifying_bids:
-        raise ValueError("midpoint_unknown")
-    ask = min(qualifying_asks, key=lambda row: row[0])
-    bid = max(qualifying_bids, key=lambda row: row[0])
+    if cumulative_depth:
+        bid_depth = Decimal("0")
+        bid = None
+        for row in sorted(bids, key=lambda item: item[0], reverse=True):
+            bid_depth += row[1]
+            if bid_depth >= reward_min_size:
+                bid = row
+                break
+        ask_depth = Decimal("0")
+        ask = None
+        for row in sorted(asks, key=lambda item: item[0]):
+            ask_depth += row[1]
+            if ask_depth >= reward_min_size:
+                ask = row
+                break
+        if bid is None or ask is None:
+            raise ValueError("midpoint_unknown")
+    else:
+        qualifying_asks = [row for row in asks if row[1] >= reward_min_size]
+        qualifying_bids = [row for row in bids if row[1] >= reward_min_size]
+        if not qualifying_asks or not qualifying_bids:
+            raise ValueError("midpoint_unknown")
+        ask = min(qualifying_asks, key=lambda row: row[0])
+        bid = max(qualifying_bids, key=lambda row: row[0])
     midpoint = (ask[0] + bid[0]) / Decimal("2")
     if midpoint < Decimal("0.10") or midpoint > Decimal("0.90"):
         raise ValueError("midpoint_out_of_range")
@@ -772,6 +791,7 @@ def evaluate_lp_entry(
     account: Mapping[str, object],
     now: datetime,
     reservations: object = (),
+    candidate: bool = False,
 ) -> dict[str, object]:
     """Return a manual LP entry guide when current input facts pass risk checks."""
 
@@ -789,7 +809,7 @@ def evaluate_lp_entry(
     token_id = str(market.get("token_id") or "").strip()
     if not condition_id or not token_id:
         return {"state": "unknown", "reason_codes": ["market_identity_unknown"], "guidance": None}
-    for field, max_age, unknown_code, stale_code in (
+    freshness_checks = [
         (
             market.get("metadata_checked_at"),
             _MARKET_METADATA_MAX_AGE_SECONDS,
@@ -797,7 +817,17 @@ def evaluate_lp_entry(
             "market_metadata_stale",
         ),
         (direction.get("reward_checked_at"), 60, "reward_time_unknown", "reward_data_stale"),
-    ):
+    ]
+    if candidate:
+        freshness_checks.append(
+            (
+                market.get("fees_checked_at"),
+                _MARKET_METADATA_MAX_AGE_SECONDS,
+                "market_fees_time_unknown",
+                "market_fees_stale",
+            )
+        )
+    for field, max_age, unknown_code, stale_code in freshness_checks:
         try:
             age = (checked_at - _timestamp(field, name="metadata_checked_at")).total_seconds()
         except ValueError:
@@ -856,9 +886,20 @@ def evaluate_lp_entry(
         or book.get("token_id", book.get("asset_id")) != token_id
     ):
         return {"state": "unknown", "reason_codes": ["book_identity_mismatch"], "guidance": None}
+    candidate_max_age = Decimal("60") if candidate else None
     try:
-        _freshness(book.get("received_at"), checked_at, "book_freshness")
-        _freshness(account.get("checked_at"), checked_at, "account_freshness")
+        _freshness(
+            book.get("received_at"),
+            checked_at,
+            "book_freshness",
+            max_age=(candidate_max_age or BOOK_FRESHNESS_SECONDS),
+        )
+        _freshness(
+            account.get("checked_at"),
+            checked_at,
+            "account_freshness",
+            max_age=(candidate_max_age or BOOK_FRESHNESS_SECONDS),
+        )
         bids = _levels(book.get("bids"), "bids")
         asks = _levels(book.get("asks"), "asks")
     except ValueError as exc:
@@ -869,7 +910,15 @@ def evaluate_lp_entry(
         for field in ("open_orders", "positions")
     ):
         return {"state": "unknown", "reason_codes": ["account_facts_unknown"], "guidance": None}
-    if account.get("open_orders_complete") is False or account.get("positions_complete") is False:
+    if (
+        account.get("open_orders_complete") is not True
+        if candidate
+        else account.get("open_orders_complete") is False
+    ) or (
+        account.get("positions_complete") is not True
+        if candidate
+        else account.get("positions_complete") is False
+    ):
         return {"state": "unknown", "reason_codes": ["account_facts_unknown"], "guidance": None}
     if not bids or not asks:
         return {"state": "unknown", "reason_codes": ["book_invalid"], "guidance": None}
@@ -898,6 +947,7 @@ def evaluate_lp_entry(
             reward_min_size=reward_minimum,
             reward_max_spread=reward_spread,
             require_positive_score=True,
+            cumulative_depth=candidate,
         )
     except ValueError as exc:
         reason = str(exc)
@@ -905,6 +955,16 @@ def evaluate_lp_entry(
         return {"state": state, "reason_codes": [reason], "guidance": None}
     if account.get("authenticated") is not True:
         return {"state": "unknown", "reason_codes": ["account_auth_unknown"], "guidance": None}
+    expected_identity = market.get(
+        "account_wallet_address",
+        direction.get("account_wallet_address", direction.get("account_id")),
+    )
+    observed_identity = account.get("wallet_address", account.get("account_id"))
+    if expected_identity is not None:
+        if observed_identity in (None, ""):
+            return {"state": "unknown", "reason_codes": ["account_identity_unknown"], "guidance": None}
+        if str(observed_identity).casefold() != str(expected_identity).casefold():
+            return {"state": "unknown", "reason_codes": ["account_identity_mismatch"], "guidance": None}
     if _has_market_order(account, market):
         return {"state": "rejected", "reason_codes": ["market_already_participating"], "guidance": None}
     adjusted_account = _account_after_reservations(account, reservations)

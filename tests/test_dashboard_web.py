@@ -6405,7 +6405,7 @@ console.log(JSON.stringify({
   unknown:unknown.includes("UNKNOWN") && unknown.includes("扫描中 · 保留当前已读计数") === false || unknown.includes("UNKNOWN"),
   shortGap:short.includes("合格候选不足 10 个（本轮 5 个）") && short.includes("查询队列（正常 0 + 备用 0）"),
   shortOverAvailable:short.includes("已排除超可用资金 2 个"),
-  shortBudget:short.includes("整组合计（参考） <strong>$27.00</strong> USD · 仅队首已实时核验，其余待验证。"),
+  noGroupTotal:!short.includes("整组合计") && !short.includes("可同时试挂"),
   scanning:scanning.includes("扫描中"),
   stale:stale.includes("已过期") && stale.includes("上次筛选条件"),
   keyboard:[unknown,short,scanning,stale].every((html)=>html.includes("<details data-lp-funnel-reasons") && html.includes("<summary>筛选原因</summary>")),
@@ -6416,7 +6416,7 @@ console.log(JSON.stringify({
         "unknown": True,
         "shortGap": True,
         "shortOverAvailable": True,
-        "shortBudget": True,
+        "noGroupTotal": True,
         "scanning": True,
         "stale": True,
         "keyboard": True,
@@ -6424,8 +6424,7 @@ console.log(JSON.stringify({
 
 
 def test_lp_group_total_skips_unknown_reference_capital_rows() -> None:
-    """Backup rows with unknown reference capital are never summed as 0: the
-    group total sums known reference capital only and flags the unknown rows."""
+    """The candidate card no longer renders a group total."""
     output = run_dashboard_js(r"""
 const row = (overrides) => ({
   market_id:"m1", condition_id:"condition-m1", outcome:"YES",
@@ -6450,15 +6449,7 @@ console.log(JSON.stringify({
 }));
 """)
     rendered = json.loads(output)
-    assert rendered["mixedTotal"] == (
-        "<p class=\"pm-lp-group-total\">入选 2 个整组合计（参考） "
-        "<strong>$6.60</strong> USD（部分参考占资未知）"
-        " · 仅队首已实时核验，其余待验证。</p>"
-    )
-    assert rendered["allKnownTotal"] == (
-        "<p class=\"pm-lp-group-total\">入选 2 个整组合计（参考） "
-        "<strong>$13.20</strong> USD · 仅队首已实时核验，其余待验证。</p>"
-    )
+    assert rendered == {"mixedTotal": "", "allKnownTotal": ""}
 
 
 def test_lp_card_renders_budget_fact_line_above_orders() -> None:
@@ -20074,7 +20065,6 @@ const payload = {
 const html = predictionLpCard({lp_dashboard: payload});
 const purposeCell = (orderId) => html.split("data-lp-today-order=\"" + orderId + "\"")[1] || "";
 const candidateSection = html.slice(html.indexOf("LP 待测候选"));
-const totalWithin = "入选 2 个整组合计（参考） <strong>$12.00</strong> USD · 仅队首已实时核验，其余待验证。";
 const overPayload = JSON.parse(JSON.stringify(payload));
 overPayload.candidates = overPayload.candidates.map((row) => ({
   ...row, realtime_capital: "300.00",
@@ -20092,9 +20082,7 @@ console.log(JSON.stringify({
   yieldPending: html.includes("待更新") && !html.includes("<strong>当前 0</strong>"),
   dedupReward: (html.match(/市场累计 \$1\.50/g) || []).length === 1
     && (html.includes("市场累计见同市场上一行") || html.includes("市场收益观察见同标的上一行")),
-  withinTotal: candidateSection.includes(totalWithin),
-  // 整组合计只按参考占资：实时值变化不改变合计，也不再断言能否同时试挂。
-  overTotalUnchanged: overHtml.includes("整组合计（参考） <strong>$12.00</strong> USD"),
+  noGroupTotal: !candidateSection.includes("整组合计") && !overHtml.includes("整组合计"),
   noGroupTrialClaim: !overHtml.includes("可同时试挂") && !overHtml.includes("差额"),
   serverOrder: orderIndex("condition-A") >= 0 && orderIndex("condition-B") > orderIndex("condition-A"),
   unknownLast: candidateSection.indexOf("指标并列时排已知之后") > orderIndex("condition-A"),
@@ -20115,8 +20103,7 @@ console.log(JSON.stringify({
         "sellMarked": True,
         "yieldPending": True,
         "dedupReward": True,
-        "withinTotal": True,
-        "overTotalUnchanged": True,
+        "noGroupTotal": True,
         "noGroupTrialClaim": True,
         "serverOrder": True,
         "unknownLast": True,
@@ -20127,6 +20114,101 @@ console.log(JSON.stringify({
         "dualCapital": True,
         "pendingBadge": True,
         "queryRateColumn": True,
+    }, rendered
+
+
+def test_lp_trial_single_market_qualification_display() -> None:
+    output = run_dashboard_js(r'''
+const checkedAt = "2026-09-19T03:00:00Z";
+const direction = (outcome, price, capital, loss, ratio) => ({
+  outcome, price, quantity: "20", required_capital: capital,
+  estimated_exit_loss: loss, estimated_exit_loss_ratio: ratio,
+  checked_at: checkedAt,
+});
+const recommendation = (outcome, price, capital, loss, ratio) => {
+  const selected = direction(outcome, price, capital, loss, ratio);
+  const other = outcome === "YES" ? "NO" : "YES";
+  return {
+    market_id: "market-current", condition_id: "condition-current",
+    market_title: "Current market", market_url: "https://polymarket.com/event/current",
+    selected_direction: selected,
+    directions: {
+      [outcome]: {state: "eligible", eligible: true, guidance: selected},
+      [other]: {state: "rejected", eligible: false, reason_codes: ["stress_loss_exceeded"]},
+    },
+  };
+};
+const pending = {
+  market_id: "market-pending", condition_id: "condition-pending",
+  market_title: "Pending market", market_url: "https://polymarket.com/event/pending",
+  token_id: "pending-token", outcome: "YES", min_quantity: "20",
+  minimum_order_size: "1", reward_min_size: "20", reference_price: "0.50",
+  reference_capital: "10.00", queue: "normal", verification: "pending",
+  summary: {},
+};
+const failedHead = {
+  market_id: "market-current", condition_id: "condition-current",
+  market_title: "Current market", market_url: "https://polymarket.com/event/current",
+  state: "unknown", selected_direction: null,
+  directions: {
+    YES: {state: "unknown", eligible: false, reason_codes: ["book_unknown"]},
+    NO: {state: "unknown", eligible: false, reason_codes: ["fee_unknown"]},
+  },
+};
+const base = {
+  state: "ready", candidate_state: "ready", candidate_stale: false,
+  scanning: false, complete: true, checked_at: checkedAt,
+  candidate_checked_at: checkedAt, candidate_last_success_at: checkedAt,
+  orders: [], positions: [], lp_orders_today: [], market_rewards: {},
+  lp_observations: {}, lp_share_watch_state: {}, candidates: [pending],
+  funnel: {
+    read: 1, base: 1, sort: 1, trial: 1, competition_known: 0,
+    competition_unknown: 1, excluded: {}, compared_range: {compared: 1, total: 1, pending: 0},
+    normal_queue_count: 1, backup_queue_count: 0, budget: {available_capital: "50.00"},
+  },
+};
+const first = predictionLpCard({lp_dashboard: {
+  ...base, recommendations: [recommendation("YES", "0.45", "9.20", "0.92", "0.10")],
+  selected_results: [recommendation("YES", "0.45", "9.20", "0.92", "0.10")],
+}});
+const second = predictionLpCard({lp_dashboard: {
+  ...base, recommendations: [recommendation("NO", "0.46", "9.20", "0.92", "0.10")],
+  selected_results: [recommendation("NO", "0.46", "9.20", "0.92", "0.10")],
+}});
+const third = predictionLpCard({lp_dashboard: {
+  ...base, recommendations: [], selected_results: [failedHead],
+}});
+const currentPanel = (html) => (html.match(/data-lp-current-recommendation[\s\S]*?<\/section>/) || [""])[0];
+const firstPanel = currentPanel(first);
+const secondPanel = currentPanel(second);
+console.log(JSON.stringify({
+  firstSingle: (first.match(/data-lp-current-recommendation/g) || []).length === 1,
+  firstFacts: firstPanel.includes("YES") && firstPanel.includes("45¢")
+    && firstPanel.includes("20 份") && firstPanel.includes("$9.20")
+    && firstPanel.includes("$0.92") && firstPanel.includes("10%")
+    && firstPanel.includes("2026-09-19"),
+  directionUpdated: secondPanel.includes("NO") && secondPanel.includes("46¢")
+    && !secondPanel.includes("YES"),
+  noDirectionNotice: !second.includes("方向变化") && !second.includes("换方向"),
+  noGroupBudget: !second.includes("整组合计") && !second.includes("可同时试挂")
+    && !second.includes("预算输入"),
+  clearedWhenUnknown: !third.includes("data-lp-current-recommendation")
+    && third.includes("当前队首校验")
+    && third.includes("book_unknown") && third.includes("fee_unknown")
+    && (third.match(/book_unknown/g) || []).length === 1
+    && (third.match(/fee_unknown/g) || []).length === 1,
+  pendingLinkKept: third.includes("https://polymarket.com/event/pending"),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered == {
+        "firstSingle": True,
+        "firstFacts": True,
+        "directionUpdated": True,
+        "noDirectionNotice": True,
+        "noGroupBudget": True,
+        "clearedWhenUnknown": True,
+        "pendingLinkKept": True,
     }, rendered
 
 

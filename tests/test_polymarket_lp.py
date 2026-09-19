@@ -2920,6 +2920,7 @@ def test_refresh_candidates_projects_trial_funnel_without_risk(tmp_path) -> None
                     "market_url": f"https://polymarket.com/event/{condition_id}",
                     "accepting_orders": True,
                     "metadata_checked_at": now,
+                    "fees_checked_at": now,
                     "tick_size": Decimal("0.01"),
                     "minimum_order_size": Decimal(sizes[condition_id]),
                     "reward_min_size": Decimal("20"),
@@ -2958,7 +2959,10 @@ def test_refresh_candidates_projects_trial_funnel_without_risk(tmp_path) -> None
                     "condition_id": token_id.removeprefix("token-"),
                     "token_id": token_id,
                     "received_at": now,
-                    "bids": [{"price": Decimal("0.34"), "size": Decimal("100")}],
+                    "bids": [
+                        {"price": Decimal("0.34"), "size": Decimal("100")},
+                        {"price": Decimal("0.33"), "size": Decimal("100")},
+                    ],
                     "asks": [{"price": Decimal("0.36"), "size": Decimal("100")}],
                 }
                 for token_id in token_ids
@@ -3037,13 +3041,14 @@ def test_refresh_candidates_projects_trial_funnel_without_risk(tmp_path) -> None
     assert exchange.book_token_reads == (("token-condition-A",),)
     assert row["realtime_price"] == "0.34"
     assert row["realtime_capital"] == "6.80"
-    assert snapshot["recommendations"] == []
+    assert len(snapshot["recommendations"]) == 1
+    assert snapshot["recommendations"][0]["selected_direction"]["outcome"] == "YES"
     assert snapshot["selected_market_ids"] == ["market-A"]
     assert exchange.competition_reads == 1
 
 
 def test_refresh_candidates_drops_rows_whose_realtime_capital_over_available(tmp_path) -> None:
-    """Contract: the over-available gate must use realtime ?? reference capital.
+    """The candidate risk gate rejects a queue head over available funds.
 
     Issue 141: only the batch head carries realtime values, so the dropped
     row must be the queue head.  Reference capital 20 × 0.505 = 10.100 fits
@@ -3094,6 +3099,7 @@ def test_refresh_candidates_drops_rows_whose_realtime_capital_over_available(tmp
                     "market_url": f"https://polymarket.com/event/{condition_id}",
                     "accepting_orders": True,
                     "metadata_checked_at": now,
+                    "fees_checked_at": now,
                     "tick_size": Decimal("0.01"),
                     "minimum_order_size": Decimal(sizes[condition_id]),
                     "reward_min_size": Decimal("20"),
@@ -3132,7 +3138,10 @@ def test_refresh_candidates_drops_rows_whose_realtime_capital_over_available(tmp
                     "condition_id": token_id.removeprefix("token-"),
                     "token_id": token_id,
                     "received_at": now,
-                    "bids": [{"price": Decimal("0.60"), "size": Decimal("100")}],
+                    "bids": [
+                        {"price": Decimal("0.60"), "size": Decimal("100")},
+                        {"price": Decimal("0.59"), "size": Decimal("100")},
+                    ],
                     "asks": [{"price": Decimal("0.62"), "size": Decimal("100")}],
                 }
                 for token_id in token_ids
@@ -3185,17 +3194,19 @@ def test_refresh_candidates_drops_rows_whose_realtime_capital_over_available(tmp
     assert exchange.book_token_reads == (("token-condition-A",),)
     funnel = snapshot["funnel"]
     # condition-Z exceeds available at the reference stage and enters no
-    # queue; the head (market A) is dropped only after the realtime recheck:
-    # both count as over_available exclusions.
-    assert funnel["excluded"]["over_available"] == 2
+    # queue; the candidate risk gate itself rejects the head before the
+    # post-qualification realtime-capital projection can drop it.
+    assert funnel["excluded"]["over_available"] == 1
     assert funnel["normal_queue_count"] == 1
     assert funnel["backup_queue_count"] == 0
     assert funnel["reference_price_unknown"] == 0
-    assert funnel["trial"] == 0
-    assert snapshot["candidates"] == []
-    assert snapshot["selected_market_ids"] == []
+    assert funnel["trial"] == 1
+    assert [row["market_id"] for row in snapshot["candidates"]] == ["market-A"]
+    assert snapshot["candidates"][0]["state"] == "rejected"
+    assert snapshot["recommendations"] == []
+    assert snapshot["selected_market_ids"] == ["market-A"]
     assert funnel["gap_reason"] is not None
-    assert "本轮 0 个" in funnel["gap_reason"]
+    assert "本轮 1 个" in funnel["gap_reason"]
 
 
 class _LPCandidateQueryExchange:
@@ -3256,6 +3267,7 @@ class _LPCandidateQueryExchange:
                 "market_url": f"https://polymarket.com/event/{condition_id}",
                 "accepting_orders": True,
                 "metadata_checked_at": self.now,
+                "fees_checked_at": self.now,
                 "tick_size": Decimal("0.01"),
                 "minimum_order_size": Decimal(
                     self.min_sizes.get(
@@ -3298,7 +3310,13 @@ class _LPCandidateQueryExchange:
                 "condition_id": token_id.removeprefix("token-"),
                 "token_id": token_id,
                 "received_at": self.now,
-                "bids": [{"price": self.book_bid, "size": Decimal("100")}],
+                "bids": [
+                    {"price": self.book_bid, "size": Decimal("100")},
+                    {
+                        "price": self.book_bid - Decimal("0.01"),
+                        "size": Decimal("100"),
+                    },
+                ],
                 "asks": [
                     {
                         "price": self.book_bid + Decimal("0.02"),
@@ -3381,6 +3399,769 @@ def test_refresh_candidates_reads_live_book_only_for_batch_head(tmp_path) -> Non
     assert funnel["normal_queue_count"] == 12
     assert funnel["backup_queue_count"] == 0
     assert funnel["reference_price_unknown"] == 0
+
+
+def test_trial_refresh_qualifies_head_and_selects_lowest_capital(tmp_path) -> None:
+    now = datetime(2026, 9, 17, 3, 30, tzinfo=UTC)
+    current = {"now": now}
+
+    class Exchange(_LPCandidateQueryExchange):
+        def __init__(self, initial_now, *, scenario="budget", available="15"):
+            super().__init__(
+                initial_now,
+                {"M01": Decimal("200"), "M02": Decimal("190")},
+                available=available,
+            )
+            self.scenario = scenario
+            self.phase = "normal"
+
+        def lp_market_metadata(self, condition_ids, *, stop_event=None):
+            del stop_event
+            return {
+                condition_id: {
+                    "market_id": f"market-{condition_id.removeprefix('condition-')}",
+                    "condition_id": condition_id,
+                    "market_title": condition_id,
+                    "market_url": f"https://polymarket.com/event/{condition_id}",
+                    "accepting_orders": True,
+                    "metadata_checked_at": self.now,
+                    "fees_checked_at": self.now,
+                    "tick_size": Decimal(
+                        "0.0001" if self.scenario == "capital" else "0.01"
+                    ),
+                    "minimum_order_size": Decimal(
+                        "100"
+                        if self.scenario == "capital"
+                        and condition_id == "condition-M01"
+                        else "20"
+                    ),
+                    "reward_min_size": Decimal(
+                        "100"
+                        if self.scenario == "capital"
+                        and condition_id == "condition-M01"
+                        else "20"
+                    ),
+                    "reward_max_spread": Decimal(
+                        "0.02"
+                        if self.scenario == "capital"
+                        and condition_id == "condition-M01"
+                        else "0.10"
+                    ),
+                    "fees_enabled": False,
+                    "taker_fee_rate": Decimal("0"),
+                    "fee_exponent": Decimal("1"),
+                    "fee": Decimal("0"),
+                    "outcomes": {
+                        "yes": {"label": "YES", "token_id": f"token-{condition_id}-yes"},
+                        "no": {"label": "NO", "token_id": f"token-{condition_id}-no"},
+                    },
+                }
+                for condition_id in condition_ids
+            }
+
+        def lp_order_books(self, token_ids, *, stop_event=None):
+            del stop_event
+            self.book_token_reads = (*self.book_token_reads, tuple(token_ids))
+            # The adapter stamps the returned books after the external read;
+            # candidate evaluation must use this later clock value.
+            current["now"] += timedelta(seconds=1)
+            self.now = current["now"]
+            if self.phase == "none":
+                return {}
+            books = {}
+            for token_id in token_ids:
+                if self.phase == "unknown_yes" and token_id.endswith("-yes"):
+                    continue
+                if self.scenario == "capital" and token_id.endswith("-yes"):
+                    best, lower = Decimal("0.90"), Decimal("0.89")
+                    bid_sizes = (Decimal("10"), Decimal("100"))
+                    ask_size = Decimal("100")
+                    ask_price = Decimal("0.91")
+                elif self.scenario == "capital":
+                    best, lower = Decimal("0.09"), Decimal("0.0873")
+                    bid_sizes = (Decimal("100"), Decimal("100"))
+                    ask_size = Decimal("100")
+                    ask_price = Decimal("0.11")
+                elif token_id.endswith("-yes"):
+                    best, lower = (
+                        (Decimal("0.50"), Decimal("0.48"))
+                        if self.phase == "tie_loss"
+                        else (Decimal("0.50"), Decimal("0.495"))
+                    )
+                    bid_sizes = (Decimal("200"), Decimal("200"))
+                    ask_size = Decimal("200")
+                    ask_price = best + Decimal("0.02")
+                else:
+                    best, lower = (
+                        (Decimal("0.50"), Decimal("0.495"))
+                        if self.phase in {"tie_loss", "tie_token"}
+                        else (Decimal("0.45"), Decimal("0.43"))
+                    )
+                    bid_sizes = (Decimal("200"), Decimal("200"))
+                    ask_size = Decimal("200")
+                    ask_price = best + Decimal("0.02")
+                if self.phase == "tie_token":
+                    best, lower = Decimal("0.50"), Decimal("0.495")
+                    bid_sizes = (Decimal("200"), Decimal("200"))
+                    ask_size = Decimal("200")
+                    ask_price = best + Decimal("0.02")
+                books[token_id] = {
+                    "condition_id": token_id.removeprefix("token-").rsplit("-", 1)[0],
+                    "token_id": token_id,
+                    "received_at": self.now,
+                    "bids": [
+                        {"price": best, "size": bid_sizes[0]},
+                        {"price": lower, "size": bid_sizes[1]},
+                    ],
+                    "asks": [{"price": ask_price, "size": ask_size}],
+                }
+            return books
+
+        def lp_price_history(
+            self, token_ids, *, start_ts, end_ts, fidelity=1, stop_event=None
+        ):
+            del fidelity, stop_event
+            return {
+                "state": "known",
+                "history": {
+                    token_id: [
+                        {"t": start_ts, "p": "0.090" if self.scenario == "capital" and token_id.startswith("token-condition-M01") else "0.450"},
+                        {"t": end_ts, "p": "0.090" if self.scenario == "capital" and token_id.startswith("token-condition-M01") else "0.450"},
+                    ]
+                    for token_id in token_ids
+                },
+                "unknown_token_ids": [],
+            }
+
+    capital_exchange = Exchange(now, scenario="capital", available="100")
+    capital_lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path / "capital"),
+        capital_exchange,
+        clock=lambda: current["now"],
+    )
+    assert capital_lp.refresh_price_history()["state"] == "known"
+    capital_snapshot = capital_lp.refresh_candidates(force=True)
+    capital_row = capital_snapshot["recommendations"][0]
+    assert capital_row["directions"]["YES"]["state"] == "eligible"
+    assert capital_row["directions"]["NO"]["state"] == "eligible"
+    assert Decimal(
+        str(capital_row["directions"]["YES"]["required_capital"])
+    ) == Decimal("90.00")
+    assert Decimal(
+        str(capital_row["directions"]["NO"]["required_capital"])
+    ) == Decimal("9.00")
+    current["now"] = now
+
+    exchange = Exchange(now, scenario="budget", available="15")
+    lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
+    )
+    assert lp.refresh_price_history()["state"] == "known"
+
+    snapshot = lp.refresh_candidates(force=True)
+
+    assert snapshot["state"] == "ready"
+    assert exchange.book_token_reads == (
+        ("token-condition-M01-no", "token-condition-M01-yes"),
+    ) or exchange.book_token_reads == (
+        ("token-condition-M01-yes", "token-condition-M01-no"),
+    )
+    recommendations = snapshot["recommendations"]
+    assert len(recommendations) == 1
+    row = recommendations[0]
+    assert row["condition_id"] == "condition-M01"
+    assert row["selected_direction"]["outcome"] == "NO"
+    assert Decimal(str(row["selected_direction"]["required_capital"])) == Decimal(
+        "9.00"
+    )
+    assert {
+        str(candidate["condition_id"]): Decimal(str(candidate["reference_capital"]))
+        for candidate in snapshot["candidates"]
+    } == {
+        "condition-M01": Decimal("9.00"),
+        "condition-M02": Decimal("9.00"),
+    }
+    assert snapshot["funnel"]["budget"]["available_capital"] == "15"
+    assert row["directions"]["YES"]["state"] == "eligible"
+    assert row["directions"]["NO"]["state"] == "eligible"
+    assert "condition-M02" not in row["condition_id"]
+
+    # One direction can be UNKNOWN while the other remains a usable current
+    # recommendation; the queue head does not backfill from market M02.
+    exchange.phase = "unknown_yes"
+    unknown_direction = lp.refresh_candidates(force=True)
+    unknown_row = unknown_direction["recommendations"][0]
+    assert unknown_row["selected_direction"]["outcome"] == "NO"
+    assert unknown_row["directions"]["YES"]["state"] == "unknown"
+    assert unknown_row["directions"]["NO"]["state"] == "eligible"
+    assert len(unknown_direction["recommendations"]) == 1
+    assert "condition-M02" not in unknown_direction["recommendations"][0]["condition_id"]
+
+    # Direction choice follows capital, then stress loss, then token ID.
+    exchange.phase = "tie_loss"
+    tie_loss = lp.refresh_candidates(force=True)
+    assert tie_loss["recommendations"][0]["selected_direction"]["outcome"] == "NO"
+    assert Decimal(
+        str(tie_loss["recommendations"][0]["directions"]["YES"]["required_capital"])
+    ) == Decimal("10.00")
+    assert Decimal(
+        str(tie_loss["recommendations"][0]["directions"]["NO"]["required_capital"])
+    ) == Decimal("10.00")
+
+    exchange.phase = "tie_token"
+    tie_token = lp.refresh_candidates(force=True)
+    assert tie_token["recommendations"][0]["selected_direction"]["outcome"] == "NO"
+    assert tie_token["recommendations"][0]["selected_direction"]["token_id"].endswith(
+        "-no"
+    )
+
+    exchange.phase = "none"
+    no_direction = lp.refresh_candidates(force=True)
+    assert no_direction["recommendations"] == []
+    assert no_direction["selected_results"][0]["state"] == "unknown"
+    assert no_direction["selected_results"][0]["condition_id"] == "condition-M01"
+
+
+def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:
+    now = datetime(2026, 9, 17, 4, tzinfo=UTC)
+
+    class Exchange(_LPCandidateQueryExchange):
+        def __init__(self, initial_now):
+            super().__init__(initial_now, {"M01": Decimal("200")}, available="100")
+            self.phase = "initial"
+            self.account_reads = 0
+            self.reward_reads = 0
+            self.metadata_reads = 0
+            self.account_mode = "valid"
+            self.reward_mode = "valid"
+            self.metadata_mode = "valid"
+            self.book_age_seconds = 0
+
+        def lp_account_snapshot(self):
+            self.account_reads += 1
+            if self.account_mode == "failure":
+                raise RuntimeError("account_read_failed")
+            account = super().lp_account_snapshot()
+            if self.account_mode == "insufficient":
+                account["balance"] = Decimal("8")
+                account["allowance"] = Decimal("8")
+            return account
+
+        def lp_reward_catalog(self, *, condition_ids=None, stop_event=None):
+            self.reward_reads += 1
+            if self.reward_mode == "failure":
+                return {
+                    "state": "unknown",
+                    "complete": False,
+                    "checked_at": self.now,
+                    "markets": ({
+                        "condition_id": "condition-M01",
+                        "state": "unknown",
+                        "complete": False,
+                        "reason_codes": ["reward_read_failed"],
+                    },),
+                }
+            catalog = super().lp_reward_catalog(
+                condition_ids=condition_ids, stop_event=stop_event
+            )
+            catalog["markets"] = tuple(
+                {
+                    **dict(market),
+                    "rewards_min_size": Decimal("20"),
+                    "rewards_max_spread": Decimal("10"),
+                    "reward_checked_at": self.now,
+                }
+                for market in catalog["markets"]
+            )
+            return catalog
+
+        def lp_market_metadata(self, condition_ids, *, stop_event=None):
+            del stop_event
+            self.metadata_reads += 1
+            if self.metadata_mode == "failure":
+                return {}
+            return {
+                condition_id: {
+                    "market_id": f"market-{condition_id.removeprefix('condition-')}",
+                    "condition_id": condition_id,
+                    "market_title": condition_id,
+                    "market_url": f"https://polymarket.com/event/{condition_id}",
+                    "accepting_orders": True,
+                    "metadata_checked_at": self.now,
+                    "fees_checked_at": self.now,
+                    "tick_size": Decimal("0.01"),
+                    "minimum_order_size": Decimal("20"),
+                    "fees_enabled": False,
+                    "taker_fee_rate": Decimal("0"),
+                    "fee_exponent": Decimal("1"),
+                    "fee": Decimal("0"),
+                    "outcomes": {
+                        "yes": {"label": "YES", "token_id": f"token-{condition_id}-yes"},
+                        "no": {"label": "NO", "token_id": f"token-{condition_id}-no"},
+                    },
+                }
+                for condition_id in condition_ids
+            }
+
+        def lp_market_metadata_fresh(self, condition_ids, *, stop_event=None):
+            return self.lp_market_metadata(condition_ids, stop_event=stop_event)
+
+        def lp_order_books(self, token_ids, *, stop_event=None):
+            del stop_event
+            self.book_token_reads = (*self.book_token_reads, tuple(token_ids))
+            if self.phase == "failure":
+                return {}
+            books = {}
+            for token_id in token_ids:
+                if self.phase == "reverse":
+                    best = Decimal("0.44") if token_id.endswith("-yes") else Decimal("0.48")
+                else:
+                    best = Decimal("0.50") if token_id.endswith("-yes") else Decimal("0.45")
+                books[token_id] = {
+                    "condition_id": token_id.removeprefix("token-").rsplit("-", 1)[0],
+                    "token_id": token_id,
+                    "received_at": self.now - timedelta(seconds=self.book_age_seconds),
+                    "bids": [
+                        {"price": best, "size": Decimal("20")},
+                        {"price": best - Decimal("0.02"), "size": Decimal("20")},
+                    ],
+                    "asks": [{"price": best + Decimal("0.02"), "size": Decimal("20")}],
+                }
+            return books
+
+    current = {"now": now}
+    exchange = Exchange(now)
+    lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path),
+        exchange,
+        clock=lambda: current["now"],
+    )
+    assert lp.refresh_price_history()["state"] == "known"
+    first = lp.refresh_candidates(force=True)
+    assert first["recommendations"][0]["selected_direction"]["outcome"] == "NO"
+    assert len(exchange.book_token_reads) == 1
+    initial_reader_counts = (
+        exchange.account_reads,
+        exchange.reward_reads,
+        exchange.metadata_reads,
+    )
+
+    current["now"] = now + timedelta(seconds=60)
+    exchange.now = current["now"]
+    at_boundary = lp.refresh_candidate_recommendations()
+    assert at_boundary["stale"] is True
+    assert len(exchange.book_token_reads) == 1
+
+    current["now"] = now + timedelta(seconds=60, microseconds=1)
+    exchange.now = current["now"]
+    exchange.phase = "reverse"
+    exchange.account_mode = "insufficient"
+    reversed_snapshot = lp.refresh_candidate_recommendations()
+    assert reversed_snapshot["recommendations"] == []
+    assert reversed_snapshot["selected_results"][0]["state"] == "rejected"
+    assert reversed_snapshot["selected_results"][0]["directions"]["YES"][
+        "reason_codes"
+    ]
+    assert (
+        exchange.account_reads,
+        exchange.reward_reads,
+        exchange.metadata_reads,
+    ) == tuple(value + 1 for value in initial_reader_counts)
+    assert len(exchange.book_token_reads) == 2
+    first_maintenance_counts = (
+        exchange.account_reads,
+        exchange.reward_reads,
+        exchange.metadata_reads,
+        len(exchange.book_token_reads),
+    )
+    retry_same_round = lp.refresh_candidate_recommendations()
+    assert retry_same_round["recommendations"] == []
+    assert (
+        exchange.account_reads,
+        exchange.reward_reads,
+        exchange.metadata_reads,
+        len(exchange.book_token_reads),
+    ) == first_maintenance_counts
+
+    # A failed refresh removes the recommendation for this normal scan
+    # round.  A later maintenance tick must not retry the external readers.
+    current["now"] = now + timedelta(seconds=120, microseconds=2)
+    exchange.now = current["now"]
+    no_retry = lp.refresh_candidate_recommendations()
+    assert no_retry["recommendations"] == []
+    assert (
+        exchange.account_reads,
+        exchange.reward_reads,
+        exchange.metadata_reads,
+        len(exchange.book_token_reads),
+    ) == first_maintenance_counts
+
+    # A new normal scan starts a new round and can restore the candidate.
+    exchange.account_mode = "valid"
+    exchange.phase = "initial"
+    assert lp.refresh_price_history()["state"] == "known"
+    recovered_round = lp.refresh_candidates(force=True)
+    assert recovered_round["recommendations"][0]["selected_direction"]["outcome"] == "NO"
+    assert len(exchange.book_token_reads) == 3
+
+    # With the whole fact bundle expired, all selected readers run once and
+    # the actual returned timestamps permit the reversed direction.
+    current["now"] = now + timedelta(seconds=180, microseconds=3)
+    exchange.now = current["now"]
+    exchange.phase = "reverse"
+    refreshed = lp.refresh_candidate_recommendations()
+    assert refreshed["recommendations"][0]["selected_direction"]["outcome"] == "YES"
+    assert refreshed["recommendations"][0]["realtime_checked_at"] == current["now"].isoformat().replace("+00:00", "Z")
+    assert len(exchange.book_token_reads) == 4
+    successful_refresh_counts = (
+        exchange.account_reads,
+        exchange.reward_reads,
+        exchange.metadata_reads,
+        len(exchange.book_token_reads),
+    )
+    retry_success = lp.refresh_candidate_recommendations()
+    assert retry_success["recommendations"][0]["selected_direction"]["outcome"] == "YES"
+    assert (
+        exchange.account_reads,
+        exchange.reward_reads,
+        exchange.metadata_reads,
+        len(exchange.book_token_reads),
+    ) == successful_refresh_counts
+
+    # Each failed fact refresh is isolated by a fresh normal round.
+    current["now"] = now + timedelta(seconds=240, microseconds=2)
+    exchange.now = current["now"]
+    exchange.phase = "initial"
+    assert lp.refresh_price_history()["state"] == "known"
+    assert lp.refresh_candidates(force=True)["recommendations"][0]["selected_direction"]["outcome"] == "NO"
+    assert len(exchange.book_token_reads) == 5
+
+    current["now"] = now + timedelta(seconds=300, microseconds=3)
+    exchange.now = current["now"]
+    exchange.phase = "reverse"
+    exchange.reward_mode = "failure"
+    failed_reward = lp.refresh_candidate_recommendations()
+    assert failed_reward["recommendations"] == []
+    assert failed_reward["selected_results"][0]["directions"]["YES"]["state"] == "unknown"
+    assert "reward" in " ".join(
+        failed_reward["selected_results"][0]["directions"]["YES"]["reason_codes"]
+    )
+    assert len(exchange.book_token_reads) == 6
+    failed_reward_counts = (
+        exchange.account_reads,
+        exchange.reward_reads,
+        exchange.metadata_reads,
+        len(exchange.book_token_reads),
+    )
+    current["now"] = now + timedelta(seconds=360, microseconds=3)
+    exchange.now = current["now"]
+    assert lp.refresh_candidate_recommendations()["recommendations"] == []
+    assert (
+        exchange.account_reads,
+        exchange.reward_reads,
+        exchange.metadata_reads,
+        len(exchange.book_token_reads),
+    ) == failed_reward_counts
+
+    current["now"] = now + timedelta(seconds=360, microseconds=3)
+    exchange.now = current["now"]
+    exchange.reward_mode = "valid"
+    exchange.phase = "initial"
+    assert lp.refresh_price_history()["state"] == "known"
+    assert lp.refresh_candidates(force=True)["recommendations"][0]["selected_direction"]["outcome"] == "NO"
+    assert len(exchange.book_token_reads) == 7
+
+    current["now"] = now + timedelta(seconds=420, microseconds=4)
+    exchange.now = current["now"]
+    exchange.phase = "reverse"
+    exchange.metadata_mode = "failure"
+    failed_metadata = lp.refresh_candidate_recommendations()
+    assert failed_metadata["recommendations"] == []
+    assert failed_metadata["selected_results"][0]["directions"]["YES"]["state"] == "unknown"
+    assert "market" in " ".join(
+        failed_metadata["selected_results"][0]["directions"]["YES"]["reason_codes"]
+    )
+    assert len(exchange.book_token_reads) == 8
+    failed_metadata_counts = (
+        exchange.account_reads,
+        exchange.reward_reads,
+        exchange.metadata_reads,
+        len(exchange.book_token_reads),
+    )
+    current["now"] = now + timedelta(seconds=480, microseconds=4)
+    exchange.now = current["now"]
+    assert lp.refresh_candidate_recommendations()["recommendations"] == []
+    assert (
+        exchange.account_reads,
+        exchange.reward_reads,
+        exchange.metadata_reads,
+        len(exchange.book_token_reads),
+    ) == failed_metadata_counts
+
+    current["now"] = now + timedelta(seconds=480, microseconds=4)
+    exchange.now = current["now"]
+    exchange.metadata_mode = "valid"
+    exchange.phase = "initial"
+    assert lp.refresh_price_history()["state"] == "known"
+    assert lp.refresh_candidates(force=True)["recommendations"][0]["selected_direction"]["outcome"] == "NO"
+    assert len(exchange.book_token_reads) == 9
+
+    current["now"] = now + timedelta(seconds=540, microseconds=5)
+    exchange.now = current["now"]
+    exchange.phase = "failure"
+    failed_books = lp.refresh_candidate_recommendations()
+    assert failed_books["recommendations"] == []
+    assert failed_books["selected_results"][0]["directions"]["YES"]["state"] == "unknown"
+    assert failed_books["selected_results"][0]["directions"]["YES"][
+        "reason_codes"
+    ] == ["book_unknown"]
+    assert len(exchange.book_token_reads) == 10
+    failed_books_counts = (
+        exchange.account_reads,
+        exchange.reward_reads,
+        exchange.metadata_reads,
+        len(exchange.book_token_reads),
+    )
+    current["now"] = now + timedelta(seconds=600, microseconds=5)
+    exchange.now = current["now"]
+    assert lp.refresh_candidate_recommendations()["recommendations"] == []
+    assert (
+        exchange.account_reads,
+        exchange.reward_reads,
+        exchange.metadata_reads,
+        len(exchange.book_token_reads),
+    ) == failed_books_counts
+
+    current["now"] = now + timedelta(seconds=600, microseconds=6)
+    exchange.now = current["now"]
+    exchange.phase = "initial"
+    assert lp.refresh_price_history()["state"] == "known"
+    recovered = lp.refresh_candidates(force=True)
+    assert recovered["recommendations"][0]["selected_direction"]["outcome"] == "NO"
+    assert len(exchange.book_token_reads) == 11
+
+    # A source receipt 59s old at publication expires two seconds later even
+    # though the publication itself is only two seconds old.  Maintenance
+    # refreshes that book only, rather than treating publication time as the
+    # source timestamp.
+    boundary_now = now + timedelta(seconds=700)
+    boundary_current = {"now": boundary_now}
+    boundary_exchange = Exchange(boundary_now)
+    boundary_exchange.book_age_seconds = 59
+    boundary_lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path / "source-boundary"),
+        boundary_exchange,
+        clock=lambda: boundary_current["now"],
+    )
+    assert boundary_lp.refresh_price_history()["state"] == "known"
+    boundary_first = boundary_lp.refresh_candidates(force=True)
+    assert boundary_first["recommendations"][0]["selected_direction"]["outcome"] == "NO"
+    boundary_counts = (
+        boundary_exchange.account_reads,
+        boundary_exchange.reward_reads,
+        boundary_exchange.metadata_reads,
+    )
+    assert len(boundary_exchange.book_token_reads) == 1
+    boundary_current["now"] = boundary_now + timedelta(seconds=2)
+    boundary_exchange.now = boundary_current["now"]
+    boundary_refreshed = boundary_lp.refresh_candidate_recommendations()
+    assert boundary_refreshed["recommendations"][0]["selected_direction"]["outcome"] == "NO"
+    assert len(boundary_exchange.book_token_reads) == 2
+    assert (
+        boundary_exchange.account_reads,
+        boundary_exchange.reward_reads,
+        boundary_exchange.metadata_reads,
+    ) == boundary_counts
+
+    # Reward facts can expire independently while account, metadata, and book
+    # receipts remain fresh.  A changed reward minimum must replace the old
+    # normalized guidance instead of reusing it.
+    class RewardOnlyExchange(Exchange):
+        def __init__(self, initial_now):
+            super().__init__(initial_now)
+            self.reward_minimum = Decimal("20")
+            self.reward_response_checked_at = initial_now - timedelta(seconds=30)
+            self.nonreward_checked_at = initial_now
+
+        def lp_reward_catalog(self, *, condition_ids=None, stop_event=None):
+            catalog = super().lp_reward_catalog(
+                condition_ids=condition_ids, stop_event=stop_event
+            )
+            catalog["checked_at"] = self.reward_response_checked_at
+            catalog["markets"] = tuple(
+                {
+                    **dict(market),
+                    "rewards_min_size": self.reward_minimum,
+                    "rewards_max_spread": Decimal("10"),
+                    "reward_checked_at": self.reward_response_checked_at,
+                }
+                for market in catalog["markets"]
+            )
+            return catalog
+
+        def lp_account_snapshot(self):
+            account = super().lp_account_snapshot()
+            account["checked_at"] = self.nonreward_checked_at
+            return account
+
+        def lp_market_metadata(self, condition_ids, *, stop_event=None):
+            metadata = super().lp_market_metadata(
+                condition_ids, stop_event=stop_event
+            )
+            return {
+                condition_id: {
+                    **dict(market),
+                    "metadata_checked_at": self.nonreward_checked_at,
+                    "fees_checked_at": self.nonreward_checked_at,
+                }
+                for condition_id, market in metadata.items()
+            }
+
+        def lp_order_books(self, token_ids, *, stop_event=None):
+            books = super().lp_order_books(token_ids, stop_event=stop_event)
+            return {
+                token_id: {
+                    **dict(book),
+                    "received_at": self.nonreward_checked_at,
+                    "bids": [
+                        {**dict(level), "size": Decimal("100")}
+                        for level in book.get("bids", ())
+                    ],
+                    "asks": [
+                        {**dict(level), "size": Decimal("100")}
+                        for level in book.get("asks", ())
+                    ],
+                }
+                for token_id, book in books.items()
+            }
+
+    reward_only_now = now + timedelta(seconds=800)
+    reward_only_current = {"now": reward_only_now}
+    reward_only_exchange = RewardOnlyExchange(reward_only_now)
+    reward_only_lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path / "reward-only"),
+        reward_only_exchange,
+        clock=lambda: reward_only_current["now"],
+    )
+    assert reward_only_lp.refresh_price_history()["state"] == "known"
+    initial_reward_only = reward_only_lp.refresh_candidates(force=True)
+    assert Decimal(
+        str(initial_reward_only["recommendations"][0]["selected_direction"]["quantity"])
+    ) == Decimal("20")
+    reward_only_counts = (
+        reward_only_exchange.account_reads,
+        reward_only_exchange.metadata_reads,
+        len(reward_only_exchange.book_token_reads),
+    )
+
+    reward_only_exchange.reward_minimum = Decimal("40")
+    reward_only_exchange.reward_response_checked_at = reward_only_now + timedelta(
+        seconds=30, microseconds=1
+    )
+    reward_only_current["now"] = reward_only_exchange.reward_response_checked_at
+    reward_only_exchange.now = reward_only_current["now"]
+    reward_only_refreshed = reward_only_lp.refresh_candidate_recommendations()
+    reward_only_selected = reward_only_refreshed["recommendations"][0][
+        "selected_direction"
+    ]
+    assert Decimal(str(reward_only_selected["quantity"])) == Decimal("40")
+    assert Decimal(str(reward_only_selected["required_capital"])) == Decimal("18.00")
+    assert reward_only_exchange.reward_reads == 2
+    assert (
+        reward_only_exchange.account_reads,
+        reward_only_exchange.metadata_reads,
+        len(reward_only_exchange.book_token_reads),
+    ) == reward_only_counts
+
+    # When only metadata and books expire, the cached reward spread remains a
+    # raw percentage.  A fresh metadata read must normalize it once, so a
+    # 0.15 quote distance is rejected against the 0.10 spread.
+    class InverseExpiryExchange(Exchange):
+        def __init__(self, initial_now):
+            super().__init__(initial_now)
+            self.initial_now = initial_now
+
+        def lp_market_metadata(self, condition_ids, *, stop_event=None):
+            metadata = super().lp_market_metadata(
+                condition_ids, stop_event=stop_event
+            )
+            checked_at = (
+                self.initial_now - timedelta(seconds=59)
+                if self.phase == "initial"
+                else self.now
+            )
+            return {
+                condition_id: {
+                    **dict(market),
+                    "metadata_checked_at": checked_at,
+                    "fees_checked_at": checked_at,
+                }
+                for condition_id, market in metadata.items()
+            }
+
+        def lp_order_books(self, token_ids, *, stop_event=None):
+            books = super().lp_order_books(token_ids, stop_event=stop_event)
+            checked_at = (
+                self.initial_now - timedelta(seconds=59)
+                if self.phase == "initial"
+                else self.now
+            )
+            if self.phase != "invalid":
+                return {
+                    token_id: {**dict(book), "received_at": checked_at}
+                    for token_id, book in books.items()
+                }
+            return {
+                token_id: {
+                    **dict(book),
+                    "received_at": checked_at,
+                    "bids": [
+                        {"price": Decimal("0.40"), "size": Decimal("100")},
+                        {"price": Decimal("0.38"), "size": Decimal("100")},
+                    ],
+                    "asks": [{"price": Decimal("0.70"), "size": Decimal("100")}],
+                }
+                for token_id, book in books.items()
+            }
+
+    inverse_now = now + timedelta(seconds=900)
+    inverse_current = {"now": inverse_now}
+    inverse_exchange = InverseExpiryExchange(inverse_now)
+    inverse_lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path / "inverse-expiry"),
+        inverse_exchange,
+        clock=lambda: inverse_current["now"],
+    )
+    assert inverse_lp.refresh_price_history()["state"] == "known"
+    inverse_first = inverse_lp.refresh_candidates(force=True)
+    assert inverse_first["recommendations"]
+    inverse_counts = (
+        inverse_exchange.account_reads,
+        inverse_exchange.reward_reads,
+        inverse_exchange.metadata_reads,
+        len(inverse_exchange.book_token_reads),
+    )
+
+    inverse_exchange.phase = "invalid"
+    inverse_current["now"] = inverse_now + timedelta(seconds=2)
+    inverse_exchange.now = inverse_current["now"]
+    inverse_refreshed = inverse_lp.refresh_candidate_recommendations()
+    assert inverse_refreshed["recommendations"] == []
+    for outcome in ("YES", "NO"):
+        assert inverse_refreshed["selected_results"][0]["directions"][outcome][
+            "reason_codes"
+        ] == ["reward_distance_invalid"]
+    assert (
+        inverse_exchange.account_reads,
+        inverse_exchange.reward_reads,
+        inverse_exchange.metadata_reads,
+        len(inverse_exchange.book_token_reads),
+    ) == (
+        inverse_counts[0],
+        inverse_counts[1],
+        inverse_counts[2] + 1,
+        inverse_counts[3] + 1,
+    )
 
 
 def test_refresh_candidates_excludes_reference_capital_over_available(tmp_path) -> None:

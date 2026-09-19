@@ -5986,6 +5986,325 @@ def test_lp_candidate_preview_rechecks_best_bid_before_confirmation(
     assert public_state["public_creates"] == public_state["public_closes"]
 
 
+def test_lp_trial_reads_share_current_refresh_and_ignore_late_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    condition_id = "condition-concurrent"
+    market = _lp_test_market(
+        condition_id,
+        yes_token="concurrent-yes",
+        no_token="concurrent-no",
+        reward_min_size=Decimal("90"),
+    )
+    clock, state, store, trading, service = _lp_adapter_service_fixture(
+        tmp_path, monkeypatch, markets=[market], balance_units=50_000_000
+    )
+    assert service.refresh_price_history()["state"] == "known"
+    first = service.refresh_candidates(force=True)
+    assert first["recommendations"]
+    initial_reads = len(state["metadata_requests"])
+
+    entered = threading.Event()
+    release = threading.Event()
+    original_books = trading.lp_order_books
+    book_calls: list[tuple[str, ...]] = []
+
+    def blocked_books(token_ids: object, *, stop_event: object = None):
+        del stop_event
+        batch = tuple(token_ids)  # type: ignore[arg-type]
+        book_calls.append(batch)
+        entered.set()
+        assert release.wait(timeout=5)
+        return original_books(batch)
+
+    trading.lp_order_books = blocked_books  # type: ignore[method-assign]
+    clock["now"] += timedelta(seconds=61)
+    maintenance = threading.Thread(
+        target=service.refresh_candidate_recommendations,
+        name="issue142-maintenance",
+        daemon=True,
+    )
+    maintenance.start()
+    assert entered.wait(timeout=5)
+
+    execution = PredictionExecutionService(
+        store=store,
+        monitor=_Monitor(),
+        trading=trading,
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "prediction_arbitrage" / "execution.lock",
+        lp=service,
+    )
+    runtime = SimpleNamespace(
+        mode="production",
+        state="RUNNING",
+        production_owner=True,
+        store=store,
+        monitor=_Monitor(),
+        execution=execution,
+        cross_venue_monitor=None,
+    )
+    with _running_server(
+        runtime,
+        session_token="session-token",
+        csrf_token="csrf-token",
+        runtime_metadata={"git_sha": "issue142-test"},
+    ) as (base, _server_instance):
+        with ThreadPoolExecutor(max_workers=3) as clients:
+            responses = list(
+                clients.map(
+                    lambda _index: _response(
+                        base + "/api/prediction-arbitrage/lp/dashboard",
+                        timeout=2,
+                    ),
+                    range(3),
+                )
+            )
+        assert all(status == 200 for status, _payload in responses)
+        assert all(payload["selected_results"] for _status, payload in responses)
+    release.set()
+    maintenance.join(timeout=5)
+    assert not maintenance.is_alive()
+    assert len(book_calls) == 1
+    assert state["trade_writes"] == []
+    # Maintenance refreshes the expired metadata once before its selected
+    # book read; concurrent dashboard reads must not trigger another read.
+    assert len(state["metadata_requests"]) == initial_reads + 1
+
+    # Exercise the cross-service stale-writer boundary directly: an older
+    # maintenance response is held after its source read, then a newer normal
+    # candidate round publishes a changed direction before the old response is
+    # released.
+    trading.lp_order_books = original_books  # type: ignore[method-assign]
+    late_store = PredictionArbitrageStore(tmp_path / "late-publication")
+    late_initial = PolymarketLPService(
+        late_store, trading, clock=lambda: clock["now"]
+    )
+    assert late_initial.refresh_price_history()["state"] == "known"
+    assert late_initial.refresh_candidates(force=True)["recommendations"]
+
+    old_entered = threading.Event()
+    old_release = threading.Event()
+    old_payloads: list[dict[str, object]] = []
+
+    class DelayedExchange:
+        def __getattr__(self, name: str) -> object:
+            return getattr(trading, name)
+
+        def lp_order_books(self, token_ids: object, *, stop_event: object = None):
+            del stop_event
+            batch = tuple(token_ids)  # type: ignore[arg-type]
+            payload = original_books(batch)
+            old_payloads.append(dict(payload))
+            old_entered.set()
+            assert old_release.wait(timeout=5)
+            return payload
+
+    # Keep the in-memory qualification facts from the completed normal round;
+    # a new service instance would correctly have no maintenance scope yet.
+    old_service = late_initial
+    old_service.exchange = DelayedExchange()  # type: ignore[assignment]
+    clock["now"] += timedelta(seconds=61)
+    old_result: list[dict[str, object]] = []
+
+    def run_old_maintenance() -> None:
+        old_result.append(old_service.refresh_candidate_recommendations())
+
+    old_thread = threading.Thread(
+        target=run_old_maintenance,
+        name="issue142-old-publication",
+        daemon=True,
+    )
+    old_thread.start()
+    assert old_entered.wait(timeout=5)
+    assert old_payloads
+
+    state["markets"][condition_id]["yes_bid"] = Decimal("0.45")  # type: ignore[index]
+    clock["now"] += timedelta(seconds=1)
+    newer_service = PolymarketLPService(
+        late_store, trading, clock=lambda: clock["now"]
+    )
+    assert newer_service.refresh_price_history()["state"] == "known"
+    newer = newer_service.refresh_candidates(force=True)
+    assert newer["recommendations"][0]["selected_direction"]["outcome"] == "NO"
+    newer_checked_at = newer["checked_at"]
+
+    old_release.set()
+    old_thread.join(timeout=5)
+    assert not old_thread.is_alive()
+    assert len(old_result) == 1
+    assert old_result[0]["checked_at"] == newer_checked_at
+    assert old_result[0]["recommendations"][0]["selected_direction"]["outcome"] == "NO"
+    assert old_service.candidate_snapshot()["checked_at"] == newer_checked_at
+    assert state["trade_writes"] == []
+
+
+def test_lp_trial_preview_uses_same_qualification_and_selected_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    condition_id = "condition-preview"
+    token_id = "preview-yes"
+    market = _lp_test_market(
+        condition_id,
+        yes_token=token_id,
+        no_token="preview-no",
+        reward_min_size=Decimal("20"),
+    )
+    clock, state, store, trading, service = _lp_adapter_service_fixture(
+        tmp_path, monkeypatch, markets=[market], balance_units=50_000_000
+    )
+    assert service.refresh_price_history()["state"] == "known"
+    scanned = service.refresh_candidates(force=True)
+    assert scanned["recommendations"]
+
+    execution = PredictionExecutionService(
+        store=store,
+        monitor=_Monitor(),
+        trading=trading,
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "prediction_arbitrage" / "execution.lock",
+        lp=service,
+    )
+    runtime = SimpleNamespace(
+        mode="production",
+        state="RUNNING",
+        production_owner=True,
+        store=store,
+        monitor=_Monitor(),
+        execution=execution,
+        cross_venue_monitor=None,
+    )
+    request = json.dumps(
+        {
+            "market_id": market["market_id"],
+            "condition_id": condition_id,
+            "token_id": token_id,
+            "outcome": "YES",
+        }
+    ).encode("utf-8")
+    phase = {"name": "initial"}
+    advance_before_book = {"value": True}
+    original_books = trading.lp_order_books
+    preview_book_batches: list[tuple[str, ...]] = []
+
+    def staged_books(token_ids: object, *, stop_event: object = None):
+        del stop_event
+        batch = tuple(token_ids)  # type: ignore[arg-type]
+        preview_book_batches.append(batch)
+        if advance_before_book["value"]:
+            clock["now"] += timedelta(seconds=1)
+            advance_before_book["value"] = False
+        books = original_books(batch)
+        if token_id not in books:
+            return books
+        if phase["name"] == "initial":
+            books[token_id] = {
+                **books[token_id],
+                "bids": [
+                    {"price": Decimal("0.45"), "size": Decimal("1")},
+                    {"price": Decimal("0.44"), "size": Decimal("100")},
+                ],
+                "asks": [{"price": Decimal("0.47"), "size": Decimal("100")}],
+            }
+        elif phase["name"] == "stress":
+            books[token_id] = {
+                **books[token_id],
+                "bids": [
+                    {"price": Decimal("0.45"), "size": Decimal("1")},
+                    {"price": Decimal("0.40"), "size": Decimal("100")},
+                ],
+            }
+        elif phase["name"] == "changed":
+            books[token_id] = {
+                **books[token_id],
+                "bids": [
+                    {"price": Decimal("0.46"), "size": Decimal("1")},
+                    {"price": Decimal("0.45"), "size": Decimal("100")},
+                ],
+            }
+        return books
+
+    trading.lp_order_books = staged_books  # type: ignore[method-assign]
+    initial_metadata_reads = len(state["metadata_requests"])
+    initial_reward_reads = len(state["selected_reward_requests"])
+
+    def post_preview(base: str) -> tuple[int, dict[str, object]]:
+        return _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/candidates/preview",
+                data=request,
+            )
+        )
+
+    with _running_server(
+        runtime,
+        session_token="session-token",
+        csrf_token="csrf-token",
+        runtime_metadata={"git_sha": "issue142-test"},
+    ) as (base, _server_instance):
+        status, previewed = post_preview(base)
+        assert status == 200
+        assert previewed["state"] == "previewed", previewed
+        assert previewed["request"]["price"] == "0.45"
+        assert previewed["request"]["quantity"] == "20"
+        assert Decimal(previewed["request"]["price"]) * Decimal(
+            previewed["request"]["quantity"]
+        ) == Decimal("9.00")
+
+        phase["name"] = "stress"
+        status, rejected_stress = post_preview(base)
+        assert status == 200
+        assert rejected_stress == {
+            "state": "rejected",
+            "reason": "stress_loss_exceeded",
+        }
+
+        original_metadata = trading.lp_market_metadata_fresh
+
+        def unknown_fee_metadata(
+            condition_ids: object, *, stop_event: object = None
+        ):
+            del stop_event
+            metadata = original_metadata(tuple(condition_ids))  # type: ignore[arg-type]
+            return {
+                condition: {
+                    **value,
+                    "fees_enabled": None,
+                    "fee": None,
+                    "taker_fee_rate": None,
+                }
+                for condition, value in metadata.items()
+            }
+
+        trading.lp_market_metadata_fresh = unknown_fee_metadata  # type: ignore[method-assign]
+        status, rejected_fee = post_preview(base)
+        assert status == 200
+        assert rejected_fee == {
+            "state": "rejected",
+            "reason": "exit_fee_unknown",
+        }
+        trading.lp_market_metadata_fresh = original_metadata  # type: ignore[method-assign]
+
+        phase["name"] = "changed"
+        status, changed = post_preview(base)
+        assert status == 200
+        assert changed["state"] == "previewed"
+        assert changed["request"]["price"] == "0.46"
+        assert changed["request"]["quantity"] == "20"
+        assert Decimal(changed["request"]["price"]) * Decimal(
+            changed["request"]["quantity"]
+        ) == Decimal("9.20")
+
+    assert preview_book_batches == [(token_id,)] * 4
+    metadata_reads = state["metadata_requests"][initial_metadata_reads:]
+    assert metadata_reads == [(condition_id,)] * 4
+    reward_reads = state["selected_reward_requests"][initial_reward_reads:]
+    assert len(reward_reads) == 8
+    assert set(reward_reads) == {(condition_id, False), (condition_id, True)}
+    assert state["trade_writes"] == []
+
+
 def _lp_test_market(
     condition_id: str,
     *,
@@ -10350,6 +10669,7 @@ def test_lp_refresh_reads_risk_books_only_for_selected_markets(tmp_path: Path) -
                     "market_title": market_id,
                     "accepting_orders": True,
                     "metadata_checked_at": now[0],
+                    "fees_checked_at": now[0],
                     "tick_size": Decimal("0.01"),
                     "minimum_order_size": Decimal("20"),
                     "reward_min_size": Decimal("20"),
@@ -10468,8 +10788,9 @@ def test_lp_refresh_reads_risk_books_only_for_selected_markets(tmp_path: Path) -
     candidate_rows = snapshot["candidates"]
     assert len(candidate_rows) == 10
     assert candidate_rows[0]["market_id"] == markets[0]
-    assert candidate_rows[0]["verification"] == "verified"
-    assert "realtime_price" in candidate_rows[0]
+    assert candidate_rows[0]["verification"] == "partial"
+    assert "realtime_price" not in candidate_rows[0]
+    assert candidate_rows[0]["directions"]["YES"]["state"] == "unknown"
     assert all(row["verification"] == "pending" for row in candidate_rows[1:])
     assert all("realtime_capital" not in row for row in candidate_rows[1:])
     assert snapshot["funnel"]["read"] == 51
@@ -10993,6 +11314,7 @@ def test_lp_candidate_snapshot_marks_minute_stale_without_refreshing(
                     "market_title": "Minute expiry market",
                     "accepting_orders": True,
                     "metadata_checked_at": now[0],
+                    "fees_checked_at": now[0],
                     "tick_size": Decimal("0.01"),
                     "minimum_order_size": Decimal("20"),
                     "reward_min_size": Decimal("20"),
@@ -11097,7 +11419,8 @@ def test_lp_candidate_snapshot_marks_minute_stale_without_refreshing(
     assert fresh["checked_at"] == first_checked_at
     assert fresh["selected_market_ids"] == ["market-minute"]
     assert fresh["funnel"] == first_funnel
-    assert fresh["recommendations"] == []
+    assert len(fresh["recommendations"]) == 1
+    assert fresh["recommendations"][0]["state"] == "eligible"
     assert exchange.calls == first_calls
 
     now[0] = first_now + timedelta(seconds=60)

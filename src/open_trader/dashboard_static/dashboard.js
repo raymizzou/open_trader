@@ -3211,7 +3211,9 @@ function lpDashboardObservationReason(reason) {
     observation_stale: "观察数据过期",
     exposure_changed: "账户敞口已变化，等待刷新",
     book_stale: "盘口过期",
+    book_unknown: "盘口未知",
     fees_unknown: "费用未知",
+    fee_unknown: "费用未知",
   };
   return labels[String(reason)] || (reason ? String(reason).replace(/_/g, " ") : "数据未知");
 }
@@ -3713,6 +3715,67 @@ function lpTrialEvidenceRow(row) {
     + evidenceLine + reasonLine + "</ul></details></td></tr>";
 }
 
+function lpCurrentRecommendationMarkup(recommendations) {
+  const rows = lpDashboardRows(recommendations);
+  const row = rows.find((candidate) => (
+    candidate.selected_direction && typeof candidate.selected_direction === "object"
+    && candidate.selected_direction.state !== "rejected"
+  ));
+  if (!row) return "";
+  const selected = row.selected_direction;
+  const price = selected.price;
+  const quantity = selected.quantity;
+  const capital = selected.required_capital;
+  const loss = selected.estimated_exit_loss;
+  const ratio = Number(selected.estimated_exit_loss_ratio);
+  const ratioText = Number.isFinite(ratio)
+    ? `${(ratio * 100).toFixed(2).replace(/\.?0+$/, "")}%`
+    : "UNKNOWN";
+  const checkedAt = selected.checked_at;
+  const timestamp = predictionHasValue(checkedAt)
+    ? predictionHktTimestamp(checkedAt, "UNKNOWN")
+    : "UNKNOWN";
+  return "<section class=\"pm-lp-current-recommendation\" data-lp-current-recommendation=\""
+    + escapeHtml(String(row.condition_id || row.market_id || "current"))
+    + "\" aria-label=\"当前 LP 推荐\"><header class=\"pm-panel-heading\"><div><h3>当前单市场推荐</h3>"
+    + "<p>只显示本轮通过资格检查的方向</p></div><span class=\"pm-pill pm-tone-ok\">已验证</span></header>"
+    + "<div class=\"pm-lp-current-recommendation-title\">" + lpMarketTitleLink(row)
+    + "<span class=\"sub\">方向 " + escapeHtml(predictionValue(selected.outcome, "UNKNOWN")) + "</span></div>"
+    + "<dl class=\"pm-lp-current-recommendation-metrics\"><div><dt>买一</dt><dd>"
+    + escapeHtml(lpDashboardPrice(price)) + "</dd></div><div><dt>数量</dt><dd>"
+    + escapeHtml(predictionValue(quantity, "UNKNOWN")) + " 份</dd></div><div><dt>单项占资</dt><dd>"
+    + escapeHtml(lpDashboardMoney(capital)) + "</dd></div><div><dt>压力损失</dt><dd>"
+    + escapeHtml(lpDashboardMoney(loss)) + " · " + escapeHtml(ratioText)
+    + "</dd></div><div><dt>检查时间</dt><dd>" + escapeHtml(timestamp) + "</dd></div></dl></section>";
+}
+
+function lpTrialSelectedResultDiagnostics(selectedResults, recommendations) {
+  if (recommendations.length || !selectedResults.length) return "";
+  const head = selectedResults[0];
+  if (!head || typeof head !== "object") return "";
+  const directions = head.directions && typeof head.directions === "object"
+    ? Object.entries(head.directions)
+    : [];
+  const reasonRows = directions.map(([outcome, direction]) => {
+    if (!direction || typeof direction !== "object") return "";
+    const reasons = Array.isArray(direction.reason_codes)
+      ? direction.reason_codes.filter((reason) => predictionHasValue(reason))
+      : [];
+    if (!reasons.length) return "";
+    const labels = reasons.map((reason) => {
+      const code = String(reason);
+      return escapeHtml(lpDashboardObservationReason(code)) + "（"
+        + escapeHtml(code) + "）";
+    }).join(" · ");
+    return "<li><strong>" + escapeHtml(String(outcome)) + "</strong>：" + labels + "</li>";
+  }).filter(Boolean).join("");
+  if (!reasonRows) return "";
+  const key = "lp-candidate-diagnostics-" + String(head.condition_id || head.market_id || "head");
+  return "<details class=\"pm-lp-candidate-diagnostics\" data-lp-details-key=\""
+    + escapeHtml(key) + "\"><summary>当前队首校验</summary><p class=\"sub\">"
+    + lpMarketTitleLink(head) + "</p><ul>" + reasonRows + "</ul></details>";
+}
+
 function lpTrialCandidateRow(row) {
   const rowKey = String(row?.condition_id || row?.market_id || "") + ":" + String(row?.outcome || "");
   const identity = "<td data-label=\"市场与选项\">" + lpMarketTitleLink(row)
@@ -3739,27 +3802,6 @@ function lpTrialCandidateRow(row) {
     + lpTrialEvidenceRow(row);
 }
 
-function lpTrialGroupTotalMarkup(candidates) {
-  if (!candidates.length) return "";
-  let total = 0;
-  let complete = true;
-  candidates.forEach((row) => {
-    if (!predictionHasValue(row.reference_capital)) {
-      complete = false;
-      return;
-    }
-    const value = Number(row.reference_capital);
-    if (Number.isFinite(value) && value >= 0) total += value;
-    else complete = false;
-  });
-  const totalText = predictionMoney(total, "UNKNOWN");
-  const count = String(candidates.length);
-  const note = complete ? "" : "（部分参考占资未知）";
-  return "<p class=\"pm-lp-group-total\">入选 " + count + " 个整组合计（参考） <strong>"
-    + escapeHtml(totalText) + "</strong> USD" + escapeHtml(note)
-    + " · 仅队首已实时核验，其余待验证。</p>";
-}
-
 function lpBudgetLineMarkup(budget, checkedAt) {
   const availableRaw = budget && typeof budget === "object" ? budget.available_capital : null;
   const hasAvailable = predictionHasValue(availableRaw) && Number.isFinite(Number(availableRaw));
@@ -3777,6 +3819,8 @@ function predictionLpCard(payload) {
     ? payload.lp_dashboard : {};
   const lpOrdersToday = lpDashboardRows(dashboard.lp_orders_today);
   const candidates = lpDashboardRows(dashboard.candidates);
+  const recommendations = lpDashboardRows(dashboard.recommendations);
+  const selectedResults = lpDashboardRows(dashboard.selected_results);
   const rewards = lpDashboardRewards(dashboard.market_rewards);
   const rewardShares = lpDashboardRewards(dashboard.reward_shares);
   const observations = lpDashboardObservations(dashboard.lp_observations);
@@ -3875,7 +3919,6 @@ function predictionLpCard(payload) {
     + "<thead><tr><th scope=\"col\">市场与选项</th><th scope=\"col\">官方竞争</th><th scope=\"col\">日奖池</th>"
     + "<th scope=\"col\">假设上限/小时</th><th scope=\"col\">最低试挂</th><th scope=\"col\">最低占资（参考 → 实时）</th><th scope=\"col\">操作</th></tr></thead>"
     + "<tbody>" + candidateRowsHtml + "</tbody></table></div>"
-    + lpTrialGroupTotalMarkup(candidates)
     + "<p class=\"sub\">已有委托或持仓的市场不重复推荐；最低占资超过可用资金（已扣委托占用）的候选不展示、计入漏斗排除数；参考价有 1 小时新鲜门，过期进入备用队列不参与排序；仅队首每轮读取实时盘口核验，其余行待验证；官方竞争为粗排参考（仅在指标并列时决定先后），缺失显示未知、不填 0；假设每小时收益上限仅为查询顺序依据，不是预计收益；实际下单前以 Polymarket 页面实时事实为准。</p></section>";
   const sessionDetails = activeSession
     ? "<details class=\"pm-lp-session-details\" data-lp-details-key=\"lp-session-details\"><summary>当前系统会话详情 · "
@@ -3903,6 +3946,8 @@ function predictionLpCard(payload) {
     + "<p class=\"sub\">预计 LP 毛奖励；压力损失不含奖励抵扣；10% 是风险警告线；「试挂/正式」由委托数量对比最小计分数量自动标注（买=最小计分数量→试挂；更大→正式；卖出单不标注）。</p></section>"
     + funnelMarkup
     + dataNoticeMarkup
+    + lpCurrentRecommendationMarkup(recommendations)
+    + lpTrialSelectedResultDiagnostics(selectedResults, recommendations)
     + candidateSection
     + sessionDetails + "</section>";
 }

@@ -1037,6 +1037,137 @@ def test_lp_selected_reward_facts_preserve_identity_time_and_failures() -> None:
     )
 
 
+def test_lp_trial_selected_facts_preserve_identity_and_time() -> None:
+    source_timestamp = "2026-09-18T23:59:00Z"
+    native_asset = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+
+    def reward(condition_id: str, *, sponsored: bool) -> dict[str, object]:
+        return {
+            "condition_id": condition_id,
+            "rewards_max_spread": "1",
+            "rewards_min_size": "20",
+            "rewards_config": [
+                {
+                    "id": f"{'sponsored' if sponsored else 'native'}-{condition_id}",
+                    "asset_address": native_asset,
+                    "start_date": "2026-01-01",
+                    "end_date": "2500-12-31",
+                    "rate_per_day": "5",
+                }
+            ],
+        }
+
+    class PublicFacts:
+        def __init__(self) -> None:
+            self.book_calls: list[tuple[str, ...]] = []
+            self.reward_calls: list[tuple[str, bool]] = []
+            self.metadata_calls: list[tuple[str, ...]] = []
+
+        def get_order_books(self, *, token_ids: tuple[str, ...]) -> list[object]:
+            self.book_calls.append(tuple(token_ids))
+            return [
+                {
+                    "condition_id": "condition-a",
+                    "token_id": "token-a",
+                    "timestamp": source_timestamp,
+                    "bids": [{"price": "0.45", "size": "20"}],
+                    "asks": [{"price": "0.47", "size": "20"}],
+                }
+            ]
+
+        def list_market_rewards(
+            self, *, condition_id: str, sponsored: bool
+        ) -> list[object]:
+            self.reward_calls.append((condition_id, sponsored))
+            if condition_id != "condition-a":
+                raise AssertionError("unselected reward market was read")
+            return [reward(condition_id, sponsored=sponsored)]
+
+        def list_current_rewards(self, **_: object) -> list[object]:
+            raise AssertionError("selected read must not request the global catalog")
+
+        def list_markets(
+            self, *, condition_ids: tuple[str, ...], page_size: int
+        ) -> list[object]:
+            self.metadata_calls.append(tuple(condition_ids))
+            return [
+                {
+                    "id": "market-a",
+                    "condition_id": "condition-a",
+                    "state": {"accepting_orders": True},
+                    "trading": {
+                        "minimum_tick_size": "0.01",
+                        "minimum_order_size": "20",
+                        "fees_enabled": False,
+                        "fee_schedule": {"exponent": "1"},
+                    },
+                    "rewards": {
+                        "rewards_min_size": "20",
+                        "rewards_max_spread": "1",
+                    },
+                    "outcomes": {
+                        "yes": {"label": "YES", "token_id": "token-a"},
+                    },
+                    "events": [],
+                }
+            ]
+
+        def close(self) -> None:
+            return None
+
+    class AccountClient(FakeClient):
+        def list_open_orders(self, **kwargs: object) -> list[object]:
+            return [
+                {
+                    "id": "order-a",
+                    "condition_id": "condition-a",
+                    "token_id": "token-a",
+                    "side": "BUY",
+                    "status": "LIVE",
+                    "price": "0.45",
+                    "original_size": "20",
+                    "size_matched": "0",
+                }
+            ]
+
+        def list_positions(self, **kwargs: object) -> list[object]:
+            return []
+
+        def list_account_trades(self, **kwargs: object) -> list[object]:
+            return []
+
+    public = PublicFacts()
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        client=AccountClient(),
+        public_client_factory=lambda: public,
+    )
+
+    books = adapter.lp_order_books(("token-a",))
+    assert public.book_calls == [("token-a",)]
+    assert all("token-b" not in call for call in public.book_calls)
+    assert set(books) == {"token-a"}
+    assert books["token-a"]["source_timestamp"] == source_timestamp
+    assert books["token-a"]["received_at"] != source_timestamp
+
+    catalog = adapter.lp_reward_catalog(condition_ids=("condition-a",))
+    assert sorted(public.reward_calls) == [("condition-a", False), ("condition-a", True)]
+    assert catalog["complete"] is True
+    assert catalog["checked_at"] is not None
+    assert catalog["markets"][0]["checked_at"] == catalog["checked_at"]
+
+    metadata = adapter.lp_market_metadata_fresh(("condition-a", "condition-b"))
+    assert public.metadata_calls == [("condition-a", "condition-b")]
+    assert set(metadata) == {"condition-a"}
+    assert metadata["condition-a"]["metadata_checked_at"] is not None
+
+    account = adapter.lp_account_snapshot()
+    assert account["wallet_address"] == WALLET
+    assert account["open_orders_complete"] is True
+    assert account["positions_complete"] is True
+    assert account["open_orders"][0]["condition_id"] == "condition-a"
+
+
 def test_lp_reward_snapshot_preserves_identity_assets_and_scope() -> None:
     class RewardTransport:
         def __init__(self) -> None:

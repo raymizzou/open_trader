@@ -1077,8 +1077,36 @@ class PredictionRuntime:
                 force_candidate_refresh = False
                 if self._reward_stop_event.is_set():
                     return
+                refresh_recommendations = getattr(
+                    lp, "refresh_candidate_recommendations", None
+                )
+                if callable(refresh_recommendations):
+                    try:
+                        refresh_recommendations(
+                            stop_event=self._reward_stop_event
+                        )
+                    except Exception:
+                        logger.exception(
+                            "prediction_lp_candidate_recommendation_refresh_failed"
+                        )
+                if self._reward_stop_event.is_set():
+                    return
+                wait_seconds = _LP_REWARD_SECONDS
+                next_deadline = getattr(
+                    lp, "candidate_maintenance_wait_seconds", None
+                )
+                if callable(next_deadline):
+                    try:
+                        candidate_wait = next_deadline()
+                    except Exception:
+                        candidate_wait = None
+                        logger.exception(
+                            "prediction_lp_candidate_deadline_failed"
+                        )
+                    if isinstance(candidate_wait, (int, float)) and candidate_wait >= 0:
+                        wait_seconds = min(wait_seconds, float(candidate_wait))
                 refresh_requested = self._lp_candidate_refresh_requested.wait(
-                    _LP_REWARD_SECONDS
+                    wait_seconds
                 )
                 if self._reward_stop_event.is_set():
                     return

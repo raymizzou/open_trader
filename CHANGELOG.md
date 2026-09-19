@@ -5,6 +5,26 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-19
 
+- Issue 142 final repair: reward-only expiry now re-derives candidate rules from
+  the fresh reward source without retaining stale normalized guidance, and a
+  partial or failed maintenance round waits for the next normal scan instead
+  of spinning at 50ms; metadata-only expiry also preserves raw reward spread
+  units during normalization. The exact T6 and T9 Docker selectors passed
+  after genuine RED/GREEN cycles; no live calls, orders, deployment, or
+  acceptance were performed.
+
+- Issue 142 review repairs: candidate evaluation now uses the post-read clock,
+  candidate fees require an independently fresh `fees_checked_at`, and current
+  maintenance preserves reward-rule provenance while scheduling source expiry
+  without shifting the ordinary scan cadence. Failed selected heads retain
+  direction reason codes in the existing LP details view. Approved T4/T5/T8
+  fixtures now prove selected-only reads, 90-versus-9 direction capital and
+  two individually affordable $9 markets, and the $0.45→$0.46 preview change.
+  The scoped Docker regression passed (`225 passed, 1 skipped`); no live calls,
+  orders, deployment, or final acceptance were performed.
+
+- LP 候选资格闭环（issue 142）：候选队首现在共享当前账户、奖励与市场事实，以 60 秒候选新鲜门和双方向累计深度完成资格复核；到期维护复用现有候选 worker 的锁、缓存与停止事件，只刷新实际过期的账户、市场/费用、奖励及队首双向盘口事实，保留源时间戳，失败轮次不重复读取并可在下一轮恢复；发布后的源事实过期会隐藏资格，preview/start 在连续 SDK 读取后以当前时钟复核。Dashboard 改为展示单市场当前推荐并保留待验证/未知原因，不再展示整组合计。Docker 定向 T1–T10 与 LP 相关回归通过；T3 的首次失败仅由夹具深度变更造成，T7 现已覆盖较旧维护响应晚于较新候选轮次的顺序保护，T8/T9 首测前已有实现，均已在证据中标注。未进行 live 调用、下单或部署。
+
 - LP 候选区改为分批查询队列（issue 141，评审定案已回写票面）：主排序由「官方竞争升序」改为「日奖池÷(24×最低参考占资)」假设每小时收益上限降序（行内与列头明示为参考价格不变且取得全部奖池时的乐观上限、仅决定查询顺序，不作收益预测；数值例 日池 $5、占资 $9 ≈ 2.314815%/小时），官方竞争降为指标并列时的次级依据（≤1 小时已知只比值升序，未知/过期不填 0、排已知之后），再按占资升序、market_id 稳定排序。参考价新增独立 1 小时新鲜门（时间戳=摘要 checked_at）：过期/缺失的市场不剔除、进入备用队列（日池降序、market_id 升序），振幅摘要 24h 门不受连带失效；多方向市场由已知占资最低方向代表，全部方向价格未知才整市场备用。展示批改为「前 9 正常 + 1 备用」（≤10、condition_id 去重、某队列不足由另一队列补足），每轮仅队首读取实时盘口核验（每轮实时读取 10→1），未读盘口的行显示「待验证」徽标且不作可试挂表述，整组合计改为参考值合计并注明仅队首已实时核验；队首实时占资超可用沿用 #138 复核删行；参考占资超可用资金仍直接排除（试挂预算概念整体取消，无输入）。Docker 定向回归：lp_views/lp/trading/dashboard_web 全绿。
 
 - LP 手工挂单的「官方计分」状态统一为字符串词表（`true`/`false`/`unknown`），不再输出 JSON 布尔导致前端把 `false` 吞成 UNKNOWN；计分查询失败或 stale 缓存降级为 unknown 时，面板订单行与「当天 LP 委托」表改显「最后成功 <HKT 时间>」（stale 缓存对两处计分一并降级为 unknown，不改缓存本体），订单行新增 `scoring_last_success_at`；LP 会话卡片前端已就绪、待会话后端产出该数据键后接入（本次未含）。观察级计奖资格改三态（已确认/未确认/UNKNOWN）并新增 `qualification_basis` 依据（全部订单官方计分中／全部订单官方未计分／奖励份额为正），详情行同步展示。奖励率展示：显式 0 显示 0%／小时、极小正值显示 <0.01%／小时（不再舍入成 0）；「试挂基准」紧凑行附基准测量时间（HKT）；观察奖励数值以规范字符串落盘（0.25 不再呈现为 0.2500）。验证：`make test` 全绿（新增 test_prediction_service.py 十个服务/HTTP 用例与 test_dashboard_web.py 四个渲染用例；prediction_service/dashboard_web/prediction_runtime/prediction_arbitrage_execution/polymarket_lp 回归组通过）。
