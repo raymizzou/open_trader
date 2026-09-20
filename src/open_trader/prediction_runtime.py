@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Callable, Literal
 
 from .notifications import NullNotifier
+from .daily_premarket import send_notification_with_results
 from .polymarket_monitor import PolymarketMonitor
 from .polymarket_lp import (
     LP_CANDIDATE_SCAN_MIN_INTERVAL_SECONDS,
@@ -728,6 +729,38 @@ class PredictionRuntime:
             lp_mutation_allowed = getattr(self.execution, "lp_mutation_allowed", None)
             if callable(set_mutation_guard) and callable(lp_mutation_allowed):
                 set_mutation_guard(lp_mutation_allowed)
+            # Issue 152: wire the LP queue-protection notifier to the
+            # execution notification capability (feishu via the execution
+            # delivery path, xiaoai as the second hop in the same callback).
+            set_protection_notifier = getattr(self.lp, "set_protection_notifier", None)
+            if callable(set_protection_notifier):
+                def _deliver_lp_protection_notification(
+                    title: str, message: str, xiaoai_text: str
+                ) -> None:
+                    deliver = getattr(
+                        self.execution, "_deliver_feishu_notification", None
+                    )
+                    if callable(deliver):
+                        try:
+                            deliver(title, message)
+                        except Exception:
+                            logger.warning(
+                                "lp_protection_feishu_delivery_failed",
+                                exc_info=True,
+                            )
+                    notifier = getattr(self, "_notifier", None)
+                    if notifier is None:
+                        return
+                    try:
+                        send_notification_with_results(
+                            notifier, title, xiaoai_text, channels={"xiaoai"}
+                        )
+                    except Exception:
+                        logger.warning(
+                            "lp_protection_xiaoai_delivery_failed", exc_info=True
+                        )
+
+                set_protection_notifier(_deliver_lp_protection_notification)
             if not self._n_leg_paused and not self.legacy_retired:
                 # Issue #109: legacy ready/observation alerts retire with the
                 # legacy engine at the N_LEG fence; the monitor keeps both

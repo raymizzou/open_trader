@@ -6059,3 +6059,443 @@ def test_queue_protection_baseline_survives_restart(tmp_path) -> None:
     assert Decimal(str(after["ratio"])) == Decimal("0.80")
     assert Decimal(str(after["baseline_front"])) == Decimal("8000")
     assert exchange.cancels == []
+
+
+# ---- Issue 152: 队列位置保护运行时闭环（Seam 3）与通知（Seam 6） ----
+
+
+class _AccountReadExchange(_Exchange):
+    def __init__(self) -> None:
+        super().__init__()
+        self.account_reads = 0
+        self.account_open_orders: list[dict[str, object]] = []
+
+    def lp_account_snapshot(self) -> dict[str, object]:
+        self.account_reads += 1
+        return {
+            "authenticated": True,
+            "open_orders": list(self.account_open_orders),
+        }
+
+
+def _queue_receipt(
+    order_id: str,
+    *,
+    side: str = "BUY",
+    status: str = "LIVE",
+    price: object = Decimal("0.30"),
+    original: object = Decimal("2000"),
+    matched: object = Decimal("0"),
+) -> dict[str, object]:
+    original_d = Decimal(str(original))
+    matched_d = Decimal(str(matched))
+    return {
+        "order_id": order_id,
+        "token_id": "0x" + "1" * 64,
+        "side": side,
+        "status": status,
+        "price": price,
+        "original_size": original_d,
+        "size_matched": matched_d,
+        "remaining_size": original_d - matched_d,
+    }
+
+
+def _queue_runtime_snapshot(
+    now: datetime,
+    *,
+    bid_size: object,
+    orders: list[dict[str, object]] | None = None,
+    open_orders: list[dict[str, object]] | None = None,
+    trades: list[dict[str, object]] | None = None,
+    positions: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    snapshot = _queue_book_snapshot(now, Decimal(str(bid_size)))
+    snapshot["account"].update(
+        {
+            "balance": Decimal("10000"),
+            "allowance": Decimal("10000"),
+            "positions": list(positions or []),
+            "open_orders": list(open_orders or []),
+        }
+    )
+    snapshot["orders"] = list(orders or [])
+    snapshot["trades"] = list(trades or [])
+    return snapshot
+
+
+def _queue_running_service(
+    tmp_path,
+    now: datetime,
+    *,
+    key: str,
+    guard: object = None,
+    register_bid: object = Decimal("10000"),
+):
+    """Start one registered session with quantity 2000 at price 0.30."""
+
+    exchange = _Exchange()
+    exchange.snapshot_value = _queue_runtime_snapshot(now, bid_size=register_bid)
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(
+        store, exchange, clock=lambda: now, mutation_guard=guard
+    )
+    request = {**_request(now), "quantity": Decimal("2000")}
+    preview = service.preview(request)
+    started = service.start(str(preview["preview_id"]), key)
+    assert started["state"] == "entry_open"
+    return store, exchange, service, started
+
+
+def test_queue_protection_triggers_cancel_once_and_converges(tmp_path) -> None:
+    """T13: 10000→4000 触发：撤单一次、action pending→回执、终态 canceled。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _queue_running_service(
+        tmp_path, now, key="lp-queue-t13"
+    )
+    session_id = str(started["session_id"])
+    entry_id = "order-1"
+    live_receipt = _queue_receipt(entry_id)
+    exchange.snapshots = [
+        _queue_runtime_snapshot(now, bid_size="10000", orders=[live_receipt]),
+        _queue_runtime_snapshot(now, bid_size="4000", orders=[live_receipt]),
+        _queue_runtime_snapshot(
+            now, bid_size="4000", orders=[_queue_receipt(entry_id, status="CANCELED")]
+        ),
+    ]
+    exchange.snapshot_calls = 0
+
+    monitoring = service.tick()
+    assert monitoring["queue_protection"]["state"] == "monitoring"
+    assert Decimal(str(monitoring["queue_protection"]["ratio"])) == Decimal("0.80")
+    assert exchange.cancels == []
+
+    triggered = service.tick()
+    assert exchange.cancels == [entry_id]
+    protection = triggered["queue_protection"]
+    assert protection["state"] == "canceling"
+    assert protection["cancel_targets"] == [entry_id]
+    assert Decimal(str(protection["ratio"])) == Decimal("0.50")
+    assert store.lp_session(session_id)["entry_cancel_requested"] is True
+    (cancel_action,) = [
+        action
+        for action in store.lp_actions(session_id)
+        if action["action_key"].endswith(f"entry-protection-cancel:{entry_id}")
+    ]
+    assert cancel_action["state"] == "accepted"
+    assert cancel_action["targets"] == [entry_id]
+    assert cancel_action["reason"] == "queue_ahead_ratio"
+
+    converged = service.tick()
+    assert converged["queue_protection"]["state"] == "canceled"
+    assert exchange.cancels == [entry_id]
+
+
+def test_queue_protection_stable_level_never_cancels(tmp_path) -> None:
+    """T14: 快照维持 10000：不撤，状态 monitoring。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _queue_running_service(
+        tmp_path, now, key="lp-queue-t14"
+    )
+    live_receipt = _queue_receipt("order-1")
+    exchange.snapshots = [
+        _queue_runtime_snapshot(now, bid_size="10000", orders=[live_receipt]),
+        _queue_runtime_snapshot(now, bid_size="10000", orders=[live_receipt]),
+    ]
+    exchange.snapshot_calls = 0
+    first = service.tick()
+    second = service.tick()
+    assert first["queue_protection"]["state"] == "monitoring"
+    assert second["queue_protection"]["state"] == "monitoring"
+    assert exchange.cancels == []
+
+
+def test_queue_protection_trigger_is_idempotent_across_ticks(tmp_path) -> None:
+    """T15: 触发后连续多个 tick：cancels 仍只一次。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _queue_running_service(
+        tmp_path, now, key="lp-queue-t15"
+    )
+    live_receipt = _queue_receipt("order-1")
+    trigger = _queue_runtime_snapshot(now, bid_size="4000", orders=[live_receipt])
+    exchange.snapshots = [trigger, trigger, trigger]
+    exchange.snapshot_calls = 0
+    service.tick()
+    service.tick()
+    service.tick()
+    assert exchange.cancels == ["order-1"]
+
+
+def test_queue_protection_failed_cancel_receipts_retry_next_tick(tmp_path) -> None:
+    """T16: 撤单回执未确认 → canceling，下一 tick 重试，无重复买入。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _queue_running_service(
+        tmp_path, now, key="lp-queue-t16"
+    )
+    entry_id = "order-1"
+    live_receipt = _queue_receipt(entry_id)
+    trigger = _queue_runtime_snapshot(now, bid_size="4000", orders=[live_receipt])
+    exchange.snapshots = [trigger, trigger, trigger]
+    exchange.snapshot_calls = 0
+    exchange.cancel_responses = [{"not_canceled": {entry_id: "venue_busy"}}]
+
+    first = service.tick()
+    protection = first["queue_protection"]
+    assert protection["state"] == "canceling"
+    assert protection["cancel_failed"] == [entry_id]
+    assert protection["cancel_failure"]
+    (cancel_action,) = [
+        action
+        for action in store.lp_actions(str(started["session_id"]))
+        if action["action_key"].endswith(f"entry-protection-cancel:{entry_id}")
+    ]
+    assert cancel_action["state"] == "pending"
+    assert exchange.cancels == [entry_id]
+    assert len(exchange.posts) == 1
+
+    second = service.tick()
+    assert exchange.cancels == [entry_id, entry_id]
+    assert second["queue_protection"]["cancel_failed"] == []
+    assert len(exchange.posts) == 1
+
+
+def test_queue_protection_partial_fill_during_cancel_episode(tmp_path) -> None:
+    """T17: 撤单期间成交 500 → 部分成交、余量撤、不补买、无保护性 SELL。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    token_id = "0x" + "1" * 64
+    store, exchange, service, started = _queue_running_service(
+        tmp_path, now, key="lp-queue-t17"
+    )
+    entry_id = "order-1"
+    trigger = _queue_runtime_snapshot(
+        now, bid_size="3000", orders=[_queue_receipt(entry_id)]
+    )
+    filling = _queue_runtime_snapshot(
+        now,
+        bid_size="3000",
+        orders=[_queue_receipt(entry_id, matched="500")],
+        trades=[
+            {
+                "trade_id": "t-1",
+                "status": "CONFIRMED",
+                "maker_orders": [
+                    {
+                        "order_id": entry_id,
+                        "side": "BUY",
+                        "token_id": token_id,
+                        "matched_amount": Decimal("500"),
+                        "price": Decimal("0.30"),
+                    }
+                ],
+            }
+        ],
+        positions=[{"token_id": token_id, "size": Decimal("500")}],
+    )
+    cancelled = _queue_runtime_snapshot(
+        now,
+        bid_size="3000",
+        orders=[_queue_receipt(entry_id, status="CANCELED", matched="500")],
+        trades=filling["trades"],
+        positions=[{"token_id": token_id, "size": Decimal("500")}],
+    )
+    exchange.snapshots = [trigger, filling, cancelled]
+    exchange.snapshot_calls = 0
+
+    assert service.tick()["queue_protection"]["state"] == "canceling"
+    mid = service.tick()
+    assert mid["buy_filled_quantity"] == Decimal("500")
+    final = service.tick()
+    assert final["queue_protection"]["state"] == "partially_filled"
+    assert Decimal(
+        str(final["queue_protection"]["partially_filled_quantity"])
+    ) == Decimal("500")
+    assert len([item for item in exchange.posts if item["side"] == "BUY"]) == 1
+    assert exchange.protected_sells == []
+
+
+def test_queue_protection_outage_conservative_cancel_after_ten_failures(
+    tmp_path,
+) -> None:
+    """T18: 连续 9 次断联不触发；第 10 次保守撤同价 2 张。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    exchange = _AccountReadExchange()
+    exchange.snapshot_value = _queue_runtime_snapshot(now, bid_size="10000")
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    request = {**_request(now), "quantity": Decimal("2000")}
+    preview = service.preview(request)
+    started = service.start(str(preview["preview_id"]), "lp-queue-t18")
+    session_id = str(started["session_id"])
+    exchange.account_open_orders = [
+        _queue_receipt("order-1"),
+        _queue_receipt("manual-2", original="1000"),
+    ]
+    exchange.snapshot_value = None
+    exchange.snapshots = []
+    exchange.snapshot_calls = 0
+
+    for expected_failures in range(1, 10):
+        result = service.tick()
+        assert result["state"] == "needs_attention"
+        protection = result["queue_protection"]
+        assert Decimal(str(protection["data_failures"])) == expected_failures
+        assert exchange.cancels == []
+        assert protection["state"] == "registered"
+
+    conservative = service.tick()
+    protection = conservative["queue_protection"]
+    assert exchange.cancels == ["order-1", "manual-2"]
+    assert protection["cancel_reason"] == "book_unreliable"
+    assert protection["state"] == "canceling"
+    assert store.lp_session(session_id)["entry_cancel_requested"] is True
+    assert exchange.account_reads >= 1
+
+
+def test_queue_protection_mutation_breaker_blocks_cancel(tmp_path) -> None:
+    """T19: 熔断返回 False：无撤单调用，blocked/mutation_blocked，受阻通知。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    flags = {"allowed": True}
+    store, exchange, service, started = _queue_running_service(
+        tmp_path, now, key="lp-queue-t19", guard=lambda *args, **kwargs: flags["allowed"]
+    )
+    notifications: list[tuple[str, str, str]] = []
+    service.set_protection_notifier(
+        lambda title, message, xiaoai: notifications.append((title, message, xiaoai))
+    )
+    flags["allowed"] = False
+    live_receipt = _queue_receipt("order-1")
+    trigger = _queue_runtime_snapshot(now, bid_size="4000", orders=[live_receipt])
+    exchange.snapshots = [trigger, trigger]
+    exchange.snapshot_calls = 0
+    service.tick()
+    second = service.tick()
+
+    assert exchange.cancels == []
+    protection = second["queue_protection"]
+    assert protection["state"] == "blocked"
+    assert "mutation_blocked" in protection["reason_codes"]
+    assert len(notifications) == 1
+    title, message, xiaoai = notifications[0]
+    assert title == "LP 位置保护撤单受阻"
+    assert "撤单未成功" in message
+    assert xiaoai == "LP 位置保护撤单受阻"
+
+
+def test_queue_protection_restart_does_not_repeat_cancel(tmp_path) -> None:
+    """T20: 撤单请求落库后新实例 tick：不重复 cancel，终态收敛。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _queue_running_service(
+        tmp_path, now, key="lp-queue-t20"
+    )
+    entry_id = "order-1"
+    trigger = _queue_runtime_snapshot(
+        now, bid_size="4000", orders=[_queue_receipt(entry_id)]
+    )
+    exchange.snapshots = [trigger]
+    exchange.snapshot_calls = 0
+    service.tick()
+    assert exchange.cancels == [entry_id]
+
+    restarted = PolymarketLPService(store, exchange, clock=lambda: now)
+    exchange.snapshots = [
+        _queue_runtime_snapshot(
+            now, bid_size="4000", orders=[_queue_receipt(entry_id, status="CANCELED")]
+        )
+    ]
+    exchange.snapshot_calls = 0
+    recovered = restarted.tick()
+    assert exchange.cancels == [entry_id]
+    assert recovered["queue_protection"]["state"] == "canceled"
+
+
+def test_queue_protection_identity_conflict_blocks_cancel(tmp_path) -> None:
+    """T21: 回执 side=SELL → 不撤、blocked/identity_conflict。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _queue_running_service(
+        tmp_path, now, key="lp-queue-t21"
+    )
+    conflict_orders = [
+        _queue_receipt("order-1", side="SELL"),
+        _queue_receipt("manual-2", original="2000"),
+    ]
+    trigger = _queue_runtime_snapshot(
+        now, bid_size="3000", open_orders=conflict_orders
+    )
+    exchange.snapshots = [trigger]
+    exchange.snapshot_calls = 0
+    result = service.tick()
+
+    assert exchange.cancels == []
+    protection = result["queue_protection"]
+    assert protection["state"] == "blocked"
+    assert "identity_conflict" in protection["reason_codes"]
+
+
+def test_queue_protection_cancels_manual_same_price_buy_only(tmp_path) -> None:
+    """T22: 手动同价第二张 BUY 一并撤；不同价位 BUY 不撤。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _queue_running_service(
+        tmp_path, now, key="lp-queue-t22"
+    )
+    open_orders = [
+        _queue_receipt("order-1"),
+        _queue_receipt("manual-2", original="1500"),
+        _queue_receipt("manual-other-price", price=Decimal("0.29"), original="999"),
+    ]
+    trigger = _queue_runtime_snapshot(now, bid_size="6000", open_orders=open_orders)
+    exchange.snapshots = [trigger]
+    exchange.snapshot_calls = 0
+    result = service.tick()
+
+    assert exchange.cancels == ["order-1", "manual-2"]
+    assert "manual-other-price" not in exchange.cancels
+    protection = result["queue_protection"]
+    assert protection["state"] == "canceling"
+    assert protection["cancel_targets"] == ["order-1", "manual-2"]
+
+
+def test_queue_protection_notification_success_template_once(tmp_path) -> None:
+    """T26: 成功模板一次（N 张/M 手动/数字格式），置位后不重发；xiaoai 短句。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _queue_running_service(
+        tmp_path, now, key="lp-queue-t26"
+    )
+    notifications: list[tuple[str, str, str]] = []
+    service.set_protection_notifier(
+        lambda title, message, xiaoai: notifications.append((title, message, xiaoai))
+    )
+    entry_id = "order-1"
+    open_orders = [
+        _queue_receipt(entry_id),
+        _queue_receipt("manual-2", original="1000"),
+    ]
+    trigger = _queue_runtime_snapshot(now, bid_size="4000", open_orders=open_orders)
+    cancelled = _queue_runtime_snapshot(
+        now,
+        bid_size="4000",
+        open_orders=open_orders,
+        orders=[
+            _queue_receipt(entry_id, status="CANCELED"),
+            _queue_receipt("manual-2", status="CANCELED", original="1000"),
+        ],
+    )
+    exchange.snapshots = [trigger, trigger, cancelled]
+    exchange.snapshot_calls = 0
+    service.tick()
+    assert len(notifications) == 1
+    title, message, xiaoai = notifications[0]
+    assert title == "LP 位置保护撤单"
+    assert "市场：Will it happen?" in message
+    assert "A 比例 25% ≤ 50%" in message
+    assert "前方≈1000 / 同价位 4000 份" in message
+    assert "已撤 2 张买单合计余量 3000 份 @ 0.3（含 1 张手动）" in message
+    assert "数据时间：北京时间" in message
+    assert xiaoai == "LP 位置保护撤单，2 张买单已撤"
+
+    restarted = PolymarketLPService(store, exchange, clock=lambda: now)
+    restarted.set_protection_notifier(
+        lambda title, message, xiaoai: notifications.append((title, message, xiaoai))
+    )
+    service.tick()
+    restarted.tick()
+    assert len(notifications) == 1

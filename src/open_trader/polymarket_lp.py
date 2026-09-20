@@ -9,7 +9,7 @@ from copy import deepcopy
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, date, datetime, time, timedelta
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, cast
 from zoneinfo import ZoneInfo
 
@@ -37,6 +37,7 @@ from .prediction_arbitrage_store import (
     LP_RESERVED_MANUAL_SESSION_ID,
     PredictionArbitrageStore,
 )
+from .notifications import beijing_clock
 
 
 STOP_LOSS = Decimal("5")
@@ -90,6 +91,11 @@ TERMINAL_TRADE_STATES = frozenset({"CONFIRMED", "FAILED"})
 # Issue 152: consecutive tick-level data outages (snapshot/book unknown) turn
 # into a conservative cancel of the protected BUY once this limit is reached.
 LP_PROTECTION_DATA_FAILURE_LIMIT = 10
+# Issue 152: only these tick early-exit reasons count as data outages;
+# identity/holding conflicts are decision blockers, not data outages.
+_QUEUE_DATA_FAILURE_REASONS = frozenset(
+    {"external_snapshot_unknown", "book_unknown", "book_freshness_unknown"}
+)
 
 
 class _MutationBlocked(RuntimeError):
@@ -126,6 +132,27 @@ def _reward_accrual_rows(value: object) -> tuple[dict[str, object], ...]:
 def _iso(moment: datetime) -> str:
     return moment.astimezone(UTC).isoformat(timespec="microseconds").replace(
         "+00:00", "Z"
+    )
+
+
+def _queue_decimal_text(value: Decimal | None) -> str:
+    """Render a share/price amount without trailing zeros (issue 152)."""
+
+    if value is None:
+        return "UNKNOWN"
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _queue_ratio_percent_text(ratio: Decimal | None) -> str:
+    """Render an A ratio as a two-decimal percent without trailing zeros."""
+
+    if ratio is None:
+        return "UNKNOWN"
+    return _queue_decimal_text(
+        (ratio * Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     )
 
 
@@ -544,6 +571,7 @@ class PolymarketLPService:
         self.clock = clock
         self.owner_lock = owner_lock
         self._mutation_guard = mutation_guard
+        self._protection_notifier: Callable[..., object] | None = None
         self._mutex = threading.RLock()
         self._reward_refresh_lock = threading.Lock()
         self._price_history_refresh_lock = threading.Lock()
@@ -594,6 +622,11 @@ class PolymarketLPService:
         """Attach the existing execution breaker to exchange writes."""
 
         self._mutation_guard = guard
+
+    def set_protection_notifier(self, callback: Callable[..., object] | None) -> None:
+        """Attach the two-channel (feishu + xiaoai) protection notifier."""
+
+        self._protection_notifier = callback
 
     def _publish_prepared_inputs(
         self,
@@ -7545,6 +7578,44 @@ class PolymarketLPService:
             )
             return self._status_payload(updated)
 
+    def _queue_protection_data_failure(
+        self, session: Mapping[str, object], reason: str
+    ) -> dict[str, object] | None:
+        """Increment the durable outage counter on data-outage early exits."""
+
+        protection = session.get("queue_protection")
+        if not isinstance(protection, Mapping):
+            return None
+        if reason not in _QUEUE_DATA_FAILURE_REASONS:
+            return None
+        if str(protection.get("state")) in {"canceling", "canceled", "partially_filled"}:
+            return None
+        updated = dict(protection)
+        failures = _maybe_decimal(updated.get("data_failures")) or Decimal("0")
+        updated["data_failures"] = failures + 1
+        return updated
+
+    def _conservative_protection_cancel(
+        self,
+        session: Mapping[str, object],
+        failures: dict[str, object] | None,
+    ) -> dict[str, object] | None:
+        """Issue 152 D5: cancel the protected BUY after ten data outages."""
+
+        if failures is None:
+            return None
+        count = _maybe_decimal(failures.get("data_failures")) or Decimal("0")
+        if count < LP_PROTECTION_DATA_FAILURE_LIMIT:
+            return None
+        result = self._request_protection_cancel(
+            session, None, reason="book_unreliable"
+        )
+        if result is None:
+            return None
+        return self.store.lp_update_session(
+            str(session["session_id"]), patch=result
+        )
+
     def tick(self) -> dict[str, object]:
         """Run one deterministic monitoring/reconciliation iteration."""
 
@@ -7559,30 +7630,44 @@ class PolymarketLPService:
                 request = self._normalize_request(session)
                 snapshot = self._read_snapshot(request)
             except ValueError as exc:
+                patch: dict[str, object] = {
+                    "reconciliation": str(exc),
+                    "resume_state": state
+                    if state != "needs_attention"
+                    else session.get("resume_state"),
+                }
+                failures = self._queue_protection_data_failure(session, str(exc))
+                if failures is not None:
+                    patch["queue_protection"] = failures
                 updated = self.store.lp_update_session(
                     str(session["session_id"]),
                     state="needs_attention",
-                    patch={
-                        "reconciliation": str(exc),
-                        "resume_state": state
-                        if state != "needs_attention"
-                        else session.get("resume_state"),
-                    },
+                    patch=patch,
                 )
+                conservative = self._conservative_protection_cancel(updated, failures)
+                if conservative is not None:
+                    return self._status_payload(conservative)
                 return self._status_payload(updated)
             try:
                 patch = self._fill_patch(session, snapshot)
             except ValueError as exc:
+                outage_patch: dict[str, object] = {
+                    "reconciliation": str(exc),
+                    "resume_state": state
+                    if state != "needs_attention"
+                    else session.get("resume_state"),
+                }
+                failures = self._queue_protection_data_failure(session, str(exc))
+                if failures is not None:
+                    outage_patch["queue_protection"] = failures
                 updated = self.store.lp_update_session(
                     str(session["session_id"]),
                     state="needs_attention",
-                    patch={
-                        "reconciliation": str(exc),
-                        "resume_state": state
-                        if state != "needs_attention"
-                        else session.get("resume_state"),
-                    },
+                    patch=outage_patch,
                 )
+                conservative = self._conservative_protection_cancel(updated, failures)
+                if conservative is not None:
+                    return self._status_payload(conservative)
                 return self._status_payload(updated)
             ownership_reason = self._unowned_target_order_reason(session, snapshot)
             if ownership_reason is not None:
@@ -7943,6 +8028,64 @@ class PolymarketLPService:
     def _order_id(value: object) -> str:
         return str(_field(value, "order_id", _field(value, "id", "")) or "")
 
+    @staticmethod
+    def _queue_level_rows(
+        snapshot: Mapping[str, object] | None,
+    ) -> dict[str, object]:
+        """Merge order receipts over the account open-order projection."""
+
+        rows_by_id: dict[str, object] = {}
+        if not isinstance(snapshot, Mapping):
+            return rows_by_id
+        for order in _items(snapshot.get("orders")):
+            order_id = PolymarketLPService._order_id(order)
+            if order_id:
+                rows_by_id.setdefault(order_id, order)
+        account = snapshot.get("account")
+        open_orders = (
+            account.get("open_orders") if isinstance(account, Mapping) else ()
+        )
+        for order in _items(open_orders):
+            order_id = PolymarketLPService._order_id(order)
+            if order_id:
+                rows_by_id.setdefault(order_id, order)
+        return rows_by_id
+
+    @staticmethod
+    def _queue_row_remaining(row: object) -> Decimal | None:
+        for name in ("remaining_size", "remaining_quantity", "size"):
+            value = _maybe_decimal(_field(row, name))
+            if value is not None:
+                return value
+        original = _maybe_decimal(
+            _field(row, "original_size", _field(row, "quantity"))
+        )
+        matched = _maybe_decimal(_field(row, "size_matched"))
+        if original is not None and matched is not None:
+            return original - matched
+        return None
+
+    def _queue_account_open_orders(self) -> list[object] | None:
+        """Read open orders through one fresh account read (issue 152 D5)."""
+
+        for name in ("lp_account_snapshot", "account_snapshot"):
+            reader = getattr(self.exchange, name, None)
+            if not callable(reader):
+                continue
+            try:
+                value = reader()
+            except Exception:
+                return None
+            rows: object = ()
+            if isinstance(value, Mapping):
+                rows = value.get("open_orders")
+            else:
+                rows = getattr(value, "open_orders", None)
+            if rows is None:
+                continue
+            return list(_items(rows))
+        return None
+
     def _own_queue_remaining(
         self,
         snapshot: Mapping[str, object],
@@ -7958,47 +8101,18 @@ class PolymarketLPService:
         receives None and the estimate stays UNKNOWN instead of guessing.
         """
 
-        rows_by_id: dict[str, object] = {}
-        for order in _items(snapshot.get("orders")):
-            order_id = self._order_id(order)
-            if order_id:
-                rows_by_id.setdefault(order_id, order)
-        account = snapshot.get("account")
-        open_orders = account.get("open_orders") if isinstance(account, Mapping) else ()
-        for order in _items(open_orders):
-            order_id = self._order_id(order)
-            if order_id:
-                rows_by_id.setdefault(order_id, order)
-
-        def row_matches(row: object) -> bool:
+        total = Decimal("0")
+        for row in self._queue_level_rows(snapshot).values():
             row_token = _field(row, "token_id", _field(row, "asset_id"))
             if row_token not in (None, "", token_id):
-                return False
-            if str(_field(row, "side", "")).upper() != "BUY":
-                return False
-            row_price = _maybe_decimal(_field(row, "price"))
-            if row_price != price:
-                return False
-            return str(_field(row, "status", "")).upper() not in TERMINAL_ORDER_STATES
-
-        def row_remaining(row: object) -> Decimal | None:
-            for name in ("remaining_size", "remaining_quantity", "size"):
-                value = _maybe_decimal(_field(row, name))
-                if value is not None:
-                    return value
-            original = _maybe_decimal(
-                _field(row, "original_size", _field(row, "quantity"))
-            )
-            matched = _maybe_decimal(_field(row, "size_matched"))
-            if original is not None and matched is not None:
-                return original - matched
-            return None
-
-        total = Decimal("0")
-        for row in rows_by_id.values():
-            if not row_matches(row):
                 continue
-            remaining = row_remaining(row)
+            if str(_field(row, "side", "")).upper() != "BUY":
+                continue
+            if _maybe_decimal(_field(row, "price")) != price:
+                continue
+            if str(_field(row, "status", "")).upper() in TERMINAL_ORDER_STATES:
+                continue
+            remaining = self._queue_row_remaining(row)
             if remaining is None:
                 return None
             total += remaining
@@ -8011,6 +8125,8 @@ class PolymarketLPService:
 
         protection = session.get("queue_protection")
         if not isinstance(protection, Mapping):
+            return None
+        if str(protection.get("state")) in {"canceling", "canceled", "partially_filled"}:
             return None
         baseline_price = _maybe_decimal(protection.get("baseline_price"))
         if baseline_price is None:
@@ -8054,18 +8170,386 @@ class PolymarketLPService:
             updated["data_failures"] = 0
         return updated
 
+    def _notify_protection(
+        self, title: str, message: str, xiaoai_text: str
+    ) -> None:
+        """Deliver one protection notification through both channels."""
+
+        callback = self._protection_notifier
+        if callback is None:
+            return
+        try:
+            callback(title, message, xiaoai_text)
+        except Exception:
+            pass
+
+    def _queue_protection_market_title(
+        self, session: Mapping[str, object]
+    ) -> str:
+        question = _text(session.get("question"))
+        if question is not None:
+            return question
+        condition_id = str(session.get("condition_id") or "")
+        return condition_id[:8] if condition_id else "未知市场"
+
+    def _queue_protection_success_notification(
+        self,
+        protection: Mapping[str, object],
+        session: Mapping[str, object],
+        *,
+        canceled_count: int,
+        manual_count: int,
+        canceled_remaining: Decimal | None,
+    ) -> tuple[str, str, str]:
+        ratio = _maybe_decimal(protection.get("ratio"))
+        if str(protection.get("cancel_reason") or "") == "book_unreliable":
+            trigger = "行情断联超 10 秒，保守撤单"
+        else:
+            threshold = (
+                _maybe_decimal(protection.get("threshold"))
+                or LP_QUEUE_PROTECTION_THRESHOLD
+            )
+            trigger = (
+                f"A 比例 {_queue_ratio_percent_text(ratio)}% ≤ "
+                f"{_queue_ratio_percent_text(threshold)}%"
+            )
+            front = _maybe_decimal(protection.get("front_estimate"))
+            total = _maybe_decimal(protection.get("level_total"))
+            trigger += (
+                f"（前方≈{_queue_decimal_text(front)} / "
+                f"同价位 {_queue_decimal_text(total)} 份）"
+            )
+        price = _maybe_decimal(protection.get("baseline_price"))
+        message = (
+            f"市场：{self._queue_protection_market_title(session)}。\n"
+            f"触发：{trigger}，已撤 {canceled_count} 张买单"
+            f"合计余量 {_queue_decimal_text(canceled_remaining)} 份"
+            f" @ {_queue_decimal_text(price)}"
+            f"（含 {manual_count} 张手动）。\n"
+            f"数据时间：北京时间 "
+            f"{beijing_clock(protection.get('data_time'), seconds=True) or '未知'}。"
+        )
+        return (
+            "LP 位置保护撤单",
+            message,
+            f"LP 位置保护撤单，{canceled_count} 张买单已撤",
+        )
+
+    def _queue_protection_blocked_notification(
+        self,
+        protection: Mapping[str, object],
+        session: Mapping[str, object],
+        failure_reason: str,
+        remaining: Decimal | None,
+    ) -> tuple[str, str, str]:
+        ratio = _maybe_decimal(protection.get("ratio"))
+        message = (
+            f"市场：{self._queue_protection_market_title(session)}。\n"
+            f"触发：A 比例 {_queue_ratio_percent_text(ratio)}% ≤ 50%，"
+            f"撤单未成功：{failure_reason}，"
+            f"残余 {_queue_decimal_text(remaining)} 份待处理。\n"
+            f"数据时间：北京时间 "
+            f"{beijing_clock(protection.get('data_time'), seconds=True) or '未知'}。"
+        )
+        return ("LP 位置保护撤单受阻", message, "LP 位置保护撤单受阻")
+
+    def _request_protection_cancel(
+        self,
+        session: Mapping[str, object],
+        snapshot: Mapping[str, object] | None,
+        *,
+        reason: str = "queue_ahead_ratio",
+        only_order_ids: list[str] | None = None,
+    ) -> dict[str, object] | None:
+        """Cancel every own BUY resting at the baseline price (issue 152 D4).
+
+        Deliberately not routed through the manual cancel audit pipeline;
+        the protection episode records its own durable action instead.
+        """
+
+        protection = session.get("queue_protection")
+        if not isinstance(protection, Mapping):
+            return None
+        session_id = str(session["session_id"])
+        entry_order_id = str(session.get("entry_order_id") or "")
+        token_id = str(session.get("token_id") or "")
+        baseline_price = _maybe_decimal(protection.get("baseline_price"))
+        if baseline_price is None:
+            return None
+        updated = dict(protection)
+
+        if snapshot is None:
+            # Data-unreliable path: enumerate targets from one fresh
+            # account read; a failed read blocks this tick and retries.
+            rows = self._queue_account_open_orders()
+            if rows is None:
+                return self._blocked_protection_cancel(
+                    session,
+                    updated,
+                    "account_read_failed",
+                    "账户读取失败",
+                    None,
+                )
+            rows_by_id: dict[str, object] = {}
+            for row in rows:
+                order_id = self._order_id(row)
+                if order_id:
+                    rows_by_id.setdefault(order_id, row)
+        else:
+            rows_by_id = self._queue_level_rows(snapshot)
+
+        # Identity re-check: the registered entry receipt must still name a
+        # BUY on the protected token before any cancel is sent.
+        for order_id, row in rows_by_id.items():
+            if order_id != entry_order_id:
+                continue
+            row_token = str(_field(row, "token_id", _field(row, "asset_id", "")) or "")
+            side = str(_field(row, "side", "")).upper()
+            if (side and side != "BUY") or (row_token and row_token != token_id):
+                return self._blocked_protection_cancel(
+                    session, updated, "identity_conflict", "回执身份不符", None
+                )
+
+        if not self._mutation_allowed():
+            return self._blocked_protection_cancel(
+                session, updated, "mutation_blocked", "撤单被熔断阻止", None
+            )
+
+        targets: list[str] = []
+        manual_targets: list[str] = []
+        skipped: list[dict[str, object]] = []
+        if entry_order_id:
+            targets.append(entry_order_id)
+        for order_id, row in rows_by_id.items():
+            if not order_id or order_id == entry_order_id:
+                continue
+            row_token = str(_field(row, "token_id", _field(row, "asset_id", "")) or "")
+            if row_token and row_token != token_id:
+                continue
+            row_price = _maybe_decimal(_field(row, "price"))
+            if row_price is None:
+                skipped.append({"order_id": order_id, "reason": "identity_unknown"})
+                continue
+            if row_price != baseline_price:
+                continue
+            side = str(_field(row, "side", "")).upper()
+            if side != "BUY":
+                skipped.append({"order_id": order_id, "reason": "identity_mismatch"})
+                continue
+            if str(_field(row, "status", "")).upper() in TERMINAL_ORDER_STATES:
+                continue
+            targets.append(order_id)
+            manual_targets.append(order_id)
+        if only_order_ids is not None:
+            retry = set(only_order_ids)
+            targets = [order_id for order_id in targets if order_id in retry]
+            manual_targets = [
+                order_id for order_id in manual_targets if order_id in retry
+            ]
+
+        action_key = f"{session_id}:entry-protection-cancel:{entry_order_id}"
+        intent_payload: dict[str, object] = {
+            "role": "entry-protection-cancel",
+            "targets": targets,
+            "skipped": skipped,
+            "reason": reason,
+            "ratio": updated.get("ratio"),
+            "data_time": updated.get("data_time"),
+        }
+        self.store.lp_upsert_action(
+            session_id, action_key, state="pending", payload=intent_payload
+        )
+
+        canceled: list[str] = []
+        failed: list[str] = []
+        failure_error: str | None = None
+        for order_id in targets:
+            try:
+                if self._cancel_order(order_id):
+                    canceled.append(order_id)
+                else:
+                    failed.append(order_id)
+            except Exception as exc:
+                failed.append(order_id)
+                failure_error = type(exc).__name__
+
+        receipt_payload: dict[str, object] = {
+            **intent_payload,
+            "canceled": canceled,
+            "failed": failed,
+        }
+        if failed:
+            receipt_payload["error"] = failure_error or "cancel_not_acknowledged"
+            self.store.lp_upsert_action(
+                session_id, action_key, state="pending", payload=receipt_payload
+            )
+        else:
+            self.store.lp_upsert_action(
+                session_id, action_key, state="accepted", payload=receipt_payload
+            )
+
+        canceled_remaining = Decimal("0")
+        for order_id in canceled:
+            row = rows_by_id.get(order_id)
+            if row is None:
+                continue
+            remaining = self._queue_row_remaining(row)
+            if remaining is not None:
+                canceled_remaining += remaining
+
+        updated["state"] = "canceling"
+        updated["cancel_reason"] = reason
+        updated["cancel_targets"] = targets
+        updated["cancel_failed"] = failed
+        updated["canceled_order_ids"] = canceled
+        updated["cancel_requested_at"] = _iso(self._now())
+        if failed:
+            updated["cancel_failure"] = failure_error or "cancel_not_acknowledged"
+        if not failed:
+            title, message, xiaoai = self._queue_protection_success_notification(
+                updated,
+                session,
+                canceled_count=len(canceled),
+                manual_count=len(manual_targets),
+                canceled_remaining=canceled_remaining,
+            )
+            self._notify_protection(title, message, xiaoai)
+            updated["notification_sent"] = True
+
+        patch: dict[str, object] = {"queue_protection": updated}
+        if entry_order_id in targets and not bool(session.get("entry_cancel_requested")):
+            patch["entry_cancel_requested"] = True
+        return patch
+
+    def _blocked_protection_cancel(
+        self,
+        session: Mapping[str, object],
+        protection: dict[str, object],
+        reason_code: str,
+        failure_reason: str,
+        remaining: Decimal | None,
+    ) -> dict[str, object]:
+        codes = list(protection.get("reason_codes") or [])
+        if reason_code not in codes:
+            codes.append(reason_code)
+        protection["state"] = "blocked"
+        protection["reason_codes"] = codes
+        if protection.get("blocked_notified") is not True:
+            title, message, xiaoai = self._queue_protection_blocked_notification(
+                protection, session, failure_reason, remaining
+            )
+            self._notify_protection(title, message, xiaoai)
+            protection["blocked_notified"] = True
+        return {"queue_protection": protection}
+
+    def _converge_queue_protection(
+        self, session: Mapping[str, object], snapshot: Mapping[str, object]
+    ) -> dict[str, object] | None:
+        """Settle a canceling episode from order receipts (issue 152 D4.7)."""
+
+        protection = session.get("queue_protection")
+        if not isinstance(protection, Mapping):
+            return None
+        if str(protection.get("state")) != "canceling":
+            return None
+        targets = [
+            str(value)
+            for value in _items(protection.get("cancel_targets"))
+            if str(value or "")
+        ]
+        if not targets:
+            return None
+        history = self._order_history(session)
+        rows_by_id = self._queue_level_rows(snapshot)
+        filled = Decimal("0")
+        for order_id in targets:
+            record = history.get(order_id)
+            row = rows_by_id.get(order_id)
+            source = (
+                record
+                if isinstance(record, Mapping) and record.get("status")
+                else row
+            )
+            if source is None:
+                # No receipt and no resting row anywhere: the order is no
+                # longer open on any read path, i.e. canceled.
+                continue
+            status = str(_field(source, "status", "") or "").upper()
+            if not status:
+                return None
+            if status not in TERMINAL_ORDER_STATES:
+                return None
+            matched = _maybe_decimal(_field(source, "size_matched"))
+            if matched is not None and matched > 0:
+                filled += matched
+        updated = dict(protection)
+        if filled > 0:
+            updated["state"] = "partially_filled"
+            updated["partially_filled_quantity"] = filled
+        else:
+            updated["state"] = "canceled"
+        if updated.get("notification_sent") is not True:
+            canceled = [
+                str(value)
+                for value in _items(updated.get("canceled_order_ids"))
+                if str(value or "")
+            ]
+            manual_count = max(len(canceled) - 1, 0)
+            title, message, xiaoai = self._queue_protection_success_notification(
+                updated,
+                session,
+                canceled_count=len(canceled) or len(targets),
+                manual_count=manual_count,
+                canceled_remaining=filled,
+            )
+            self._notify_protection(title, message, xiaoai)
+            updated["notification_sent"] = True
+        return updated
+
     def _apply_queue_protection(
         self, session: Mapping[str, object], snapshot: Mapping[str, object]
     ) -> dict[str, object]:
         """Evaluate queue protection inside the monitor tick and persist it."""
 
+        protection = session.get("queue_protection")
+        if not isinstance(protection, Mapping):
+            return dict(session)
+        session_id = str(session["session_id"])
+        if str(protection.get("state")) == "canceling":
+            converged = self._converge_queue_protection(session, snapshot)
+            if converged is not None:
+                return self.store.lp_update_session(
+                    session_id, patch={"queue_protection": converged}
+                )
+            failed = [
+                str(value)
+                for value in _items(protection.get("cancel_failed"))
+                if str(value or "")
+            ]
+            if failed:
+                result = self._request_protection_cancel(
+                    session,
+                    snapshot,
+                    reason=str(protection.get("cancel_reason") or "queue_ahead_ratio"),
+                    only_order_ids=failed,
+                )
+                if result is not None:
+                    return self.store.lp_update_session(session_id, patch=result)
+            return dict(session)
         evaluation = self._queue_protection_evaluation(session, snapshot)
         if evaluation is None:
             return dict(session)
-        return self.store.lp_update_session(
-            str(session["session_id"]),
-            patch={"queue_protection": evaluation},
+        session = self.store.lp_update_session(
+            session_id, patch={"queue_protection": evaluation}
         )
+        if evaluation["state"] != "triggered":
+            return session
+        result = self._request_protection_cancel(
+            session, snapshot, reason="queue_ahead_ratio"
+        )
+        if result is not None:
+            session = self.store.lp_update_session(session_id, patch=result)
+        return session
 
     @staticmethod
     def _session_order_ids(session: Mapping[str, object]) -> list[str]:
@@ -8238,6 +8722,31 @@ class PolymarketLPService:
             return True, order
         return False, order
 
+    def _queue_level_order_exempt(
+        self, session: Mapping[str, object], order: object
+    ) -> bool:
+        """Whether a same-token BUY belongs to the active protection episode.
+
+        Issue 152: manual BUY quotes on the protected token (any price) are
+        expected while an episode is open — they are monitored and, on
+        trigger, canceled at the baseline price.  SELL rows and other
+        tokens remain governed by the unowned-order guard, and the submit
+        boundary keeps rejecting outside orders exactly as before.
+        """
+
+        protection = session.get("queue_protection")
+        if not isinstance(protection, Mapping):
+            return False
+        if str(protection.get("state")) in {"canceled", "partially_filled"}:
+            return False
+        if protection.get("cancel_scope") != "own_buys_at_level":
+            return False
+        if str(_field(order, "side", "")).upper() != "BUY":
+            return False
+        row_token = str(_field(order, "token_id", _field(order, "asset_id", "")) or "")
+        expected = str(session.get("token_id") or "")
+        return bool(row_token) and row_token == expected
+
     def _unowned_target_order_reason(
         self, session: Mapping[str, object], snapshot: Mapping[str, object]
     ) -> str | None:
@@ -8259,6 +8768,8 @@ class PolymarketLPService:
                 # that this open order is outside the selected exposure.
                 target = True
             if target and (not order_id or order_id not in owned_ids):
+                if self._queue_level_order_exempt(session, order):
+                    continue
                 return "unowned_target_order"
             if order_id in owned_ids and token and token != expected_token:
                 return "unowned_target_order"
