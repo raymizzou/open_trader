@@ -1220,3 +1220,225 @@ def test_estimate_target_share_unknown_boundary_cases() -> None:
     assert "reward_score_zero" in far["reason_codes"]
     assert "midpoint_out_of_range" in low_mid["reason_codes"]
     assert "book_unknown" in no_book["reason_codes"]
+
+
+# ---- Issue 152: LP BUY 队列位置保护估算（Seam 1 验收用例，票面独立真值） ----
+
+
+def _queue_book(
+    bids: list[tuple[str, str]],
+    *,
+    received_at: object = NOW,
+    condition_id: str = "condition-a",
+    token_id: str = "token-yes",
+) -> dict[str, object]:
+    book: dict[str, object] = {
+        "condition_id": condition_id,
+        "token_id": token_id,
+        "bids": [{"price": Decimal(price), "size": Decimal(size)} for price, size in bids],
+        "asks": [{"price": Decimal("0.52"), "size": Decimal("100")}],
+    }
+    if received_at is not None:
+        book["received_at"] = received_at
+    return book
+
+
+def _queue_estimate(
+    book: object,
+    *,
+    price: str,
+    own_remaining: str | None,
+    baseline_front: str,
+    **kwargs: object,
+) -> dict[str, object]:
+    return polymarket_lp_risk.estimate_lp_queue_position(
+        book,
+        price=Decimal(price),
+        own_remaining=None if own_remaining is None else Decimal(own_remaining),
+        baseline_front=Decimal(baseline_front),
+        **kwargs,
+    )
+
+
+def test_queue_position_monitoring_above_threshold() -> None:
+    """T1: baseline=8000, C=10000, own=2000 → front 8000, ratio 0.80, monitoring."""
+    result = _queue_estimate(
+        _queue_book([("0.50", "10000")]),
+        price="0.50",
+        own_remaining="2000",
+        baseline_front="8000",
+    )
+    assert result["state"] == "monitoring"
+    assert result["front_estimate"] == Decimal("8000")
+    assert result["level_total"] == Decimal("10000")
+    assert result["ratio"] == Decimal("0.80")
+    assert result["threshold"] == Decimal("0.5")
+    assert result["data_time"] == NOW
+    assert result["reason_codes"] == []
+
+
+def test_queue_position_same_price_reduction_stays_monitoring() -> None:
+    """T2: baseline=8000, C=6000, own=2000 → front 4000, ratio 2/3, monitoring."""
+    result = _queue_estimate(
+        _queue_book([("0.50", "6000")]),
+        price="0.50",
+        own_remaining="2000",
+        baseline_front="8000",
+    )
+    assert result["state"] == "monitoring"
+    assert result["front_estimate"] == Decimal("4000")
+    assert result["level_total"] == Decimal("6000")
+    assert result["ratio"] == Decimal("2") / Decimal("3")
+
+
+def test_queue_position_exactly_half_triggers() -> None:
+    """T3: baseline=8000, C=4000, own=2000 → front 2000, ratio 0.50, triggered."""
+    result = _queue_estimate(
+        _queue_book([("0.50", "4000")]),
+        price="0.50",
+        own_remaining="2000",
+        baseline_front="8000",
+    )
+    assert result["state"] == "triggered"
+    assert result["front_estimate"] == Decimal("2000")
+    assert result["level_total"] == Decimal("4000")
+    assert result["ratio"] == Decimal("0.50")
+
+
+def test_queue_position_behind_growth_ignores_new_depth() -> None:
+    """T4: baseline=8000, C=16000, own=2000 → front 8000, ratio 0.50, triggered."""
+    result = _queue_estimate(
+        _queue_book([("0.50", "16000")]),
+        price="0.50",
+        own_remaining="2000",
+        baseline_front="8000",
+    )
+    assert result["state"] == "triggered"
+    assert result["front_estimate"] == Decimal("8000")
+    assert result["level_total"] == Decimal("16000")
+    assert result["ratio"] == Decimal("0.50")
+
+
+def test_queue_position_empty_baseline_triggers_first_tick() -> None:
+    """T5: baseline=0（空档位）, C=2000, own=2000 → front 0, ratio 0, triggered."""
+    result = _queue_estimate(
+        _queue_book([("0.50", "2000")]),
+        price="0.50",
+        own_remaining="2000",
+        baseline_front="0",
+    )
+    assert result["state"] == "triggered"
+    assert result["front_estimate"] == Decimal("0")
+    assert result["level_total"] == Decimal("2000")
+    assert result["ratio"] == Decimal("0")
+
+
+def test_queue_position_missing_receipt_is_unknown() -> None:
+    """T6: own_remaining=None → unknown/remaining_unknown，数值全 None."""
+    result = _queue_estimate(
+        _queue_book([("0.50", "10000")]),
+        price="0.50",
+        own_remaining=None,
+        baseline_front="8000",
+    )
+    assert result["state"] == "unknown"
+    assert result["front_estimate"] is None
+    assert result["level_total"] is None
+    assert result["ratio"] is None
+    assert result["data_time"] == NOW
+    assert result["reason_codes"] == ["remaining_unknown"]
+
+
+def test_queue_position_unknown_book_identity_and_stamp() -> None:
+    """T7: 身份不符 → book_identity_mismatch；缺 received_at → book_unknown."""
+    mismatch = _queue_estimate(
+        _queue_book([("0.50", "10000")], condition_id="condition-other"),
+        price="0.50",
+        own_remaining="2000",
+        baseline_front="8000",
+        condition_id="condition-a",
+        token_id="token-yes",
+    )
+    assert mismatch["state"] == "unknown"
+    assert mismatch["front_estimate"] is None
+    assert mismatch["level_total"] is None
+    assert mismatch["ratio"] is None
+    assert mismatch["reason_codes"] == ["book_identity_mismatch"]
+
+    no_stamp = _queue_estimate(
+        _queue_book([("0.50", "10000")], received_at=None),
+        price="0.50",
+        own_remaining="2000",
+        baseline_front="8000",
+    )
+    assert no_stamp["state"] == "unknown"
+    assert no_stamp["front_estimate"] is None
+    assert no_stamp["level_total"] is None
+    assert no_stamp["ratio"] is None
+    assert no_stamp["data_time"] is None
+    assert no_stamp["reason_codes"] == ["book_unknown"]
+
+    not_a_book = _queue_estimate(
+        "not-a-book",
+        price="0.50",
+        own_remaining="2000",
+        baseline_front="8000",
+    )
+    assert not_a_book["state"] == "unknown"
+    assert not_a_book["reason_codes"] == ["book_unknown"]
+
+
+def test_queue_position_inconsistent_and_missing_level_are_unknown() -> None:
+    """T8: own=2500 > C=2000 → data_inconsistent；档位缺失 → book_level_missing."""
+    inconsistent = _queue_estimate(
+        _queue_book([("0.50", "2000")]),
+        price="0.50",
+        own_remaining="2500",
+        baseline_front="8000",
+    )
+    assert inconsistent["state"] == "unknown"
+    assert inconsistent["front_estimate"] is None
+    assert inconsistent["level_total"] is None
+    assert inconsistent["ratio"] is None
+    assert inconsistent["reason_codes"] == ["data_inconsistent"]
+
+    zero_total = _queue_estimate(
+        _queue_book([("0.49", "2000")]),
+        price="0.50",
+        own_remaining="0",
+        baseline_front="8000",
+    )
+    assert zero_total["state"] == "unknown"
+    assert zero_total["reason_codes"] == ["book_level_missing"]
+
+
+def test_queue_position_own_fill_does_not_reduce_front() -> None:
+    """T9: baseline=8000, C=9000, own=1000（自己成交 1000）→ front 8000."""
+    result = _queue_estimate(
+        _queue_book([("0.50", "9000")]),
+        price="0.50",
+        own_remaining="1000",
+        baseline_front="8000",
+    )
+    assert result["state"] == "monitoring"
+    assert result["front_estimate"] == Decimal("8000")
+    assert result["level_total"] == Decimal("9000")
+    assert result["ratio"] == Decimal("8000") / Decimal("9000")
+
+
+def test_queue_position_bids_at_same_price_aggregate() -> None:
+    """C 按同价多档聚合；聚合总量参与比例而非逐行最大值。"""
+    result = _queue_estimate(
+        _queue_book([("0.51", "500"), ("0.50", "3000"), ("0.50", "7000")]),
+        price="0.50",
+        own_remaining="2000",
+        baseline_front="8000",
+    )
+    assert result["level_total"] == Decimal("10000")
+    assert result["front_estimate"] == Decimal("8000")
+    assert result["ratio"] == Decimal("0.80")
+
+
+def test_queue_position_threshold_constant_attached() -> None:
+    """附着常量 LP_QUEUE_PROTECTION_THRESHOLD = Decimal("0.5")."""
+    assert polymarket_lp_risk.LP_QUEUE_PROTECTION_THRESHOLD == Decimal("0.5")

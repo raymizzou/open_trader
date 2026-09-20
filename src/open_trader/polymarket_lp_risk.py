@@ -1274,3 +1274,91 @@ def estimate_lp_target_share_yield(
         "competition_upper_bound": competition,
         "checked_at": checked_at,
     }
+
+
+# Issue 152: a BUY quote is protected once its estimated share of the
+# same-price level drops to (or below) this ratio.
+LP_QUEUE_PROTECTION_THRESHOLD = Decimal("0.5")
+
+
+def estimate_lp_queue_position(
+    book: object,
+    *,
+    price: Decimal,
+    own_remaining: Decimal | None,
+    baseline_front: Decimal,
+    threshold: Decimal = LP_QUEUE_PROTECTION_THRESHOLD,
+    condition_id: str | None = None,
+    token_id: str | None = None,
+) -> dict[str, object]:
+    """Estimate one BUY quote's share ahead of it inside the same price level.
+
+    Conservative estimation (issue 152): the registered baseline is the
+    level depth seen at submit time, when validation guaranteed the session
+    owned no existing order on the token, so the whole level was ahead.  Any
+    later decrease of the level counts as queue ahead — fills and cancels
+    are deliberately not distinguished.  The result is an estimate; it never
+    promises fill prevention.
+    """
+
+    def unknown(reason: str) -> dict[str, object]:
+        return {
+            "state": "unknown",
+            "front_estimate": None,
+            "level_total": None,
+            "ratio": None,
+            "threshold": threshold,
+            "reason_codes": [reason],
+            "data_time": (
+                book.get("received_at")
+                if isinstance(book, Mapping)
+                else None
+            ),
+        }
+
+    if not isinstance(book, Mapping) or book.get("received_at") is None:
+        return unknown("book_unknown")
+    for passed, book_value in (
+        (condition_id, book.get("condition_id")),
+        (token_id, book.get("token_id")),
+    ):
+        text = str(passed or "").strip()
+        observed = str(book_value or "").strip()
+        if text and observed and text != observed:
+            return unknown("book_identity_mismatch")
+
+    # Level existence is judged on the raw rows so a level that only
+    # carries zero sizes stays distinguishable from a missing level.
+    level_exists = False
+    for row in _items(book.get("bids")):
+        row_price = _maybe_decimal(_field(row, "price"))
+        if row_price is not None and row_price == price:
+            level_exists = True
+            break
+    if not level_exists:
+        return unknown("book_level_missing")
+
+    try:
+        bids = _levels(book.get("bids"), "bids")
+    except ValueError:
+        return unknown("book_unknown")
+    level_total = sum(
+        (size for row_price, size in bids if row_price == price),
+        Decimal("0"),
+    )
+    if own_remaining is None:
+        return unknown("remaining_unknown")
+    if level_total <= 0 or own_remaining > level_total:
+        return unknown("data_inconsistent")
+
+    front_estimate = min(baseline_front, max(Decimal("0"), level_total - own_remaining))
+    ratio = front_estimate / level_total
+    return {
+        "state": "triggered" if ratio <= threshold else "monitoring",
+        "front_estimate": front_estimate,
+        "level_total": level_total,
+        "ratio": ratio,
+        "threshold": threshold,
+        "reason_codes": [],
+        "data_time": book.get("received_at"),
+    }
