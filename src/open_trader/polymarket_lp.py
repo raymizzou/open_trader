@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 
 from .polymarket_lp_risk import (
     BOOK_FRESHNESS_SECONDS,
+    LP_QUEUE_PROTECTION_THRESHOLD,
     TERMINAL_ORDER_STATES,
     _account_after_reservations,
     _decimal,
@@ -28,6 +29,7 @@ from .polymarket_lp_risk import (
     _projected_taker_fee,
     _qualify_reward_quote,
     _timestamp,
+    estimate_lp_queue_position,
     estimate_lp_target_share_yield,
     evaluate_lp_entry,
 )
@@ -85,6 +87,9 @@ _LP_METADATA_BATCH_SIZE = 1500
 _LP_PREPARATION_RETRY_DELAYS_SECONDS = (300, 600, 1200, 1800, 1800)
 _BEIJING = ZoneInfo("Asia/Shanghai")
 TERMINAL_TRADE_STATES = frozenset({"CONFIRMED", "FAILED"})
+# Issue 152: consecutive tick-level data outages (snapshot/book unknown) turn
+# into a conservative cancel of the protected BUY once this limit is reached.
+LP_PROTECTION_DATA_FAILURE_LIMIT = 10
 
 
 class _MutationBlocked(RuntimeError):
@@ -6434,6 +6439,9 @@ class PolymarketLPService:
             "expires_at": _iso(expires_at),
             "request": normalized,
             "preflight": facts,
+            "queue_protection_estimate": self._queue_protection_preview_estimate(
+                normalized, snapshot
+            ),
         }
 
     def preview_candidate(self, candidate: Mapping[str, object]) -> dict[str, object]:
@@ -6488,6 +6496,98 @@ class PolymarketLPService:
             "expires_at": _iso(expires_at),
             "request": request,
             "preflight": facts,
+            "queue_protection_estimate": self._queue_protection_preview_estimate(
+                request, snapshot
+            ),
+        }
+
+    def _queue_baseline_front(
+        self, snapshot: Mapping[str, object], price: Decimal
+    ) -> Decimal:
+        """Sum the price level's size in a validated book; a missing level is 0.
+
+        Registration never rejects on the level: validation already proved the
+        session owns no order on the token, so any level size present here is
+        queue ahead.  An empty level registers a zero baseline by explicit
+        decision (first tick with any depth then estimates A = 0% and cancels).
+        """
+
+        book = snapshot.get("book")
+        if not isinstance(book, Mapping):
+            return Decimal("0")
+        try:
+            bids = self._levels(book.get("bids"), "bids")
+        except ValueError:
+            return Decimal("0")
+        return sum(
+            (size for row_price, size in bids if row_price == price),
+            Decimal("0"),
+        )
+
+    def _queue_protection_baseline(
+        self, request: Mapping[str, object], snapshot: Mapping[str, object]
+    ) -> dict[str, object]:
+        """Build the durable baseline facts recorded at the submit boundary."""
+
+        book = snapshot.get("book")
+        book_mapping = book if isinstance(book, Mapping) else None
+        return {
+            "baseline_front": self._queue_baseline_front(
+                snapshot, cast(Decimal, request["price"])
+            ),
+            "baseline_price": request["price"],
+            "baseline_book_received_at": (
+                book_mapping.get("received_at") if book_mapping else None
+            ),
+            "baseline_source_timestamp": (
+                book_mapping.get("source_timestamp") if book_mapping else None
+            ),
+            "baseline_book_hash": book_mapping.get("hash") if book_mapping else None,
+        }
+
+    def _queue_protection_preview_estimate(
+        self, request: Mapping[str, object], snapshot: Mapping[str, object]
+    ) -> dict[str, object]:
+        """Project the post-submit share of the same-price level (A estimate)."""
+
+        baseline_front = self._queue_baseline_front(
+            snapshot, cast(Decimal, request["price"])
+        )
+        quantity = cast(Decimal, request["quantity"])
+        projected = (
+            baseline_front / (baseline_front + quantity)
+            if baseline_front + quantity > 0
+            else Decimal("0")
+        )
+        return {"baseline_front": baseline_front, "projected_ratio": projected}
+
+    def _queue_baseline_book_sample(
+        self, request: Mapping[str, object], snapshot: Mapping[str, object]
+    ) -> dict[str, object] | None:
+        """Build one BBO receipt row mirroring sample_candidate_books."""
+
+        book = snapshot.get("book")
+        if not isinstance(book, Mapping) or book.get("received_at") is None:
+            return None
+        try:
+            received_at = _timestamp(book.get("received_at"), name="book_received_at")
+            bids = self._levels(book.get("bids"), "bids")
+            asks = self._levels(book.get("asks"), "asks")
+        except ValueError:
+            return None
+        if not bids or not asks:
+            return None
+        bid_price, bid_size = max(bids, key=lambda level: level[0])
+        ask_price, ask_size = min(asks, key=lambda level: level[0])
+        return {
+            "condition_id": str(request["condition_id"]),
+            "token_id": str(request["token_id"]),
+            "received_at": received_at,
+            "source_timestamp": book.get("source_timestamp"),
+            "best_bid_price": bid_price,
+            "best_bid_size": bid_size,
+            "best_ask_price": ask_price,
+            "best_ask_size": ask_size,
         }
 
     def start(
@@ -6548,6 +6648,26 @@ class PolymarketLPService:
                 self.store.consume_lp_preview(preview_id)
             except ValueError as exc:
                 return {"state": "rejected", "reason": str(exc)}
+            # Issue 152: registration boundary.  Validation just proved the
+            # session owns no order on the token, so the whole price level in
+            # this validated snapshot is queue ahead of the entry order.
+            queue_baseline = self._queue_protection_baseline(request, snapshot)
+            recorder = getattr(self.store, "lp_record_book_samples", None)
+            if callable(recorder):
+                baseline_sample = self._queue_baseline_book_sample(request, snapshot)
+                if baseline_sample is not None:
+                    try:
+                        recorder([baseline_sample], now=now)
+                    except Exception:
+                        pass
+            queue_baseline_summary = {
+                "baseline_front": queue_baseline["baseline_front"],
+                "baseline_price": queue_baseline["baseline_price"],
+            }
+            entry_action_base = {
+                "submit_requested_at": _iso(now),
+                "queue_protection_baseline": queue_baseline_summary,
+            }
             session_id = uuid.uuid4().hex
             intent: dict[str, object] = {
                 **request,
@@ -6595,6 +6715,15 @@ class PolymarketLPService:
                 "reward_status": "unknown",
                 "trade_pnl": None,
                 "total_pnl": None,
+                "queue_protection": {
+                    **queue_baseline,
+                    "baseline_version": 1,
+                    "threshold": LP_QUEUE_PROTECTION_THRESHOLD,
+                    "data_failures": 0,
+                    "state": "registered",
+                    "notification_sent": False,
+                    "cancel_scope": "own_buys_at_level",
+                },
             }
             try:
                 session = self.store.lp_create_session(
@@ -6615,6 +6744,7 @@ class PolymarketLPService:
                     "side": "BUY",
                     "token_id": request["token_id"],
                     "expiration": expiration,
+                    **entry_action_base,
                 },
             )
             try:
@@ -6638,6 +6768,7 @@ class PolymarketLPService:
                         "token_id": request["token_id"],
                         "expiration": expiration,
                         "error": type(exc).__name__,
+                        **entry_action_base,
                     },
                 )
                 session = self.store.lp_update_session(
@@ -6658,6 +6789,7 @@ class PolymarketLPService:
                         "token_id": request["token_id"],
                         "expiration": expiration,
                         "order_id": order_id or "",
+                        **entry_action_base,
                     },
                 )
                 session = self.store.lp_update_session(
@@ -6676,6 +6808,8 @@ class PolymarketLPService:
                     "token_id": request["token_id"],
                     "expiration": expiration,
                     "order_id": order_id,
+                    **entry_action_base,
+                    "submit_receipt_at": _iso(self._now()),
                 },
             )
             if not order_id:
@@ -7497,6 +7631,9 @@ class PolymarketLPService:
                     patch={"reconciliation": None, "resume_state": None},
                 )
                 state = resume_state
+            # Issue 152: queue protection runs inside the existing one-second
+            # monitor tick, before any exit reconciliation can mutate orders.
+            session = self._apply_queue_protection(session, snapshot)
             session = self._reconcile_protected_exit(session, snapshot)
             if _decimal(session.get("buy_filled_quantity", 0), "buy_filled_quantity") > 0:
                 entry_terminal = self._order_terminal(
@@ -7805,6 +7942,130 @@ class PolymarketLPService:
     @staticmethod
     def _order_id(value: object) -> str:
         return str(_field(value, "order_id", _field(value, "id", "")) or "")
+
+    def _own_queue_remaining(
+        self,
+        snapshot: Mapping[str, object],
+        *,
+        token_id: str,
+        price: Decimal,
+    ) -> Decimal | None:
+        """Sum remaining size of own open BUY orders at one token and price.
+
+        Receipt rows (``snapshot["orders"]``) take priority over the account
+        ``open_orders`` projection for the same order id.  Any participating
+        row without a parseable remaining size poisons the total: the caller
+        receives None and the estimate stays UNKNOWN instead of guessing.
+        """
+
+        rows_by_id: dict[str, object] = {}
+        for order in _items(snapshot.get("orders")):
+            order_id = self._order_id(order)
+            if order_id:
+                rows_by_id.setdefault(order_id, order)
+        account = snapshot.get("account")
+        open_orders = account.get("open_orders") if isinstance(account, Mapping) else ()
+        for order in _items(open_orders):
+            order_id = self._order_id(order)
+            if order_id:
+                rows_by_id.setdefault(order_id, order)
+
+        def row_matches(row: object) -> bool:
+            row_token = _field(row, "token_id", _field(row, "asset_id"))
+            if row_token not in (None, "", token_id):
+                return False
+            if str(_field(row, "side", "")).upper() != "BUY":
+                return False
+            row_price = _maybe_decimal(_field(row, "price"))
+            if row_price != price:
+                return False
+            return str(_field(row, "status", "")).upper() not in TERMINAL_ORDER_STATES
+
+        def row_remaining(row: object) -> Decimal | None:
+            for name in ("remaining_size", "remaining_quantity", "size"):
+                value = _maybe_decimal(_field(row, name))
+                if value is not None:
+                    return value
+            original = _maybe_decimal(
+                _field(row, "original_size", _field(row, "quantity"))
+            )
+            matched = _maybe_decimal(_field(row, "size_matched"))
+            if original is not None and matched is not None:
+                return original - matched
+            return None
+
+        total = Decimal("0")
+        for row in rows_by_id.values():
+            if not row_matches(row):
+                continue
+            remaining = row_remaining(row)
+            if remaining is None:
+                return None
+            total += remaining
+        return total
+
+    def _queue_protection_evaluation(
+        self, session: Mapping[str, object], snapshot: Mapping[str, object]
+    ) -> dict[str, object] | None:
+        """Return the queue-protection patch for this tick, or None to skip."""
+
+        protection = session.get("queue_protection")
+        if not isinstance(protection, Mapping):
+            return None
+        baseline_price = _maybe_decimal(protection.get("baseline_price"))
+        if baseline_price is None:
+            return None
+        entry_order_id = str(session.get("entry_order_id") or "")
+        if not entry_order_id or bool(session.get("entry_cancel_requested")):
+            return None
+        if _maybe_decimal(session.get("buy_filled_quantity", 0)) != 0:
+            return None
+        history = self._order_history(session)
+        entry_status = str(history.get(entry_order_id, {}).get("status") or "").upper()
+        if entry_status and entry_status in TERMINAL_ORDER_STATES:
+            return None
+        token_id = str(session.get("token_id") or "")
+        own_remaining = self._own_queue_remaining(
+            snapshot, token_id=token_id, price=baseline_price
+        )
+        estimate = estimate_lp_queue_position(
+            snapshot.get("book"),
+            price=baseline_price,
+            own_remaining=own_remaining,
+            baseline_front=_maybe_decimal(protection.get("baseline_front"))
+            or Decimal("0"),
+            threshold=_maybe_decimal(protection.get("threshold"))
+            or LP_QUEUE_PROTECTION_THRESHOLD,
+            condition_id=str(session.get("condition_id") or "") or None,
+            token_id=token_id or None,
+        )
+        updated = dict(protection)
+        updated.update(
+            {
+                "state": estimate["state"],
+                "front_estimate": estimate["front_estimate"],
+                "level_total": estimate["level_total"],
+                "ratio": estimate["ratio"],
+                "reason_codes": estimate["reason_codes"],
+                "data_time": estimate["data_time"],
+            }
+        )
+        if estimate["state"] != "unknown":
+            updated["data_failures"] = 0
+        return updated
+
+    def _apply_queue_protection(
+        self, session: Mapping[str, object], snapshot: Mapping[str, object]
+    ) -> dict[str, object]:
+        """Evaluate queue protection inside the monitor tick and persist it."""
+
+        evaluation = self._queue_protection_evaluation(session, snapshot)
+        if evaluation is None:
+            return dict(session)
+        return self.store.lp_update_session(
+            str(session["session_id"]),
+            patch={"queue_protection": evaluation},
+        )
 
     @staticmethod
     def _session_order_ids(session: Mapping[str, object]) -> list[str]:

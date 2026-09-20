@@ -5908,3 +5908,154 @@ def test_daily_report_session_excludes_reserved_manual_anchor(tmp_path) -> None:
         generated_at=now,
     )
     assert relevant is False
+
+
+# ---- Issue 152: LP BUY 队列位置保护（Seam 2 登记与提交） ----
+
+
+def _queue_book_snapshot(now: datetime, bid_size: Decimal) -> dict[str, object]:
+    base = _snapshot(now)
+    base["book"] = {
+        "timestamp": now,
+        "received_at": now,
+        "source_timestamp": "2026-09-14T11:59:59Z",
+        "hash": "book-hash-queue-1",
+        "asks": [{"price": Decimal("0.31"), "size": Decimal("100")}],
+        "bids": [
+            {"price": Decimal("0.30"), "size": bid_size},
+            {"price": Decimal("0.29"), "size": Decimal("100")},
+        ],
+    }
+    return base
+
+
+def _queue_tick_snapshot(now: datetime, bid_size: Decimal) -> dict[str, object]:
+    snapshot = _queue_book_snapshot(now, bid_size)
+    snapshot["orders"] = [
+        {
+            "order_id": "order-1",
+            "token_id": "0x" + "1" * 64,
+            "side": "BUY",
+            "status": "LIVE",
+            "price": Decimal("0.30"),
+            "original_size": Decimal("10"),
+            "size_matched": Decimal("0"),
+            "remaining_size": Decimal("10"),
+        }
+    ]
+    return snapshot
+
+
+def test_queue_protection_registered_at_submit_boundary(tmp_path) -> None:
+    """T10: 正常 start 落基线：session payload、entry action、盘口档、preview 估算。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    exchange = _Exchange()
+    exchange.snapshot_value = _queue_book_snapshot(now, Decimal("8000"))
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+
+    request = _request(now)
+    preview = service.preview(request)
+    estimate = preview["queue_protection_estimate"]
+    assert Decimal(str(estimate["baseline_front"])) == Decimal("8000")
+    assert Decimal(str(estimate["projected_ratio"])) == Decimal("8000") / Decimal("8010")
+
+    started = service.start(str(preview["preview_id"]), "lp-queue-registered-1")
+    session_id = str(started["session_id"])
+    session = store.lp_session(session_id)
+    protection = session["queue_protection"]
+    assert Decimal(str(protection["baseline_front"])) == Decimal("8000")
+    assert Decimal(str(protection["baseline_price"])) == Decimal("0.30")
+    assert protection["baseline_book_received_at"] is not None
+    assert protection["baseline_source_timestamp"] == "2026-09-14T11:59:59Z"
+    assert protection["baseline_book_hash"] == "book-hash-queue-1"
+    assert protection["baseline_version"] == 1
+    assert Decimal(str(protection["threshold"])) == Decimal("0.5")
+    assert protection["data_failures"] == 0
+    assert protection["state"] == "registered"
+    assert protection["notification_sent"] is False
+    assert protection["cancel_scope"] == "own_buys_at_level"
+
+    (entry_action,) = [
+        action
+        for action in store.lp_actions(session_id)
+        if action["action_key"].endswith("entry-submit")
+    ]
+    assert entry_action["state"] == "accepted"
+    assert entry_action["submit_requested_at"]
+    assert entry_action["submit_receipt_at"]
+    baseline_summary = entry_action["queue_protection_baseline"]
+    assert Decimal(str(baseline_summary["baseline_front"])) == Decimal("8000")
+    assert Decimal(str(baseline_summary["baseline_price"])) == Decimal("0.30")
+
+    condition_id = request["condition_id"]
+    token_id = request["token_id"]
+    samples = store.lp_book_samples(
+        condition_id,
+        token_id,
+        since=now - timedelta(minutes=1),
+        until=now + timedelta(minutes=1),
+    )
+    assert len(samples) == 1
+    assert Decimal(str(samples[0]["best_bid_price"])) == Decimal("0.30")
+    assert Decimal(str(samples[0]["best_bid_size"])) == Decimal("8000")
+
+    # 空档位：基线为 0、比例 0，不拒绝不加门槛。
+    empty_level_exchange = _Exchange()
+    empty_book = _snapshot(now)
+    empty_level_exchange.snapshot_value = empty_book
+    empty_service = PolymarketLPService(
+        store, empty_level_exchange, clock=lambda: now
+    )
+    empty_preview = empty_service.preview(request)
+    empty_estimate = empty_preview["queue_protection_estimate"]
+    assert Decimal(str(empty_estimate["baseline_front"])) == Decimal("0")
+    assert Decimal(str(empty_estimate["projected_ratio"])) == Decimal("0")
+
+
+def test_queue_protection_stale_book_keeps_existing_rejection(tmp_path) -> None:
+    """T11: 盘口过期沿用现有拒绝路径：不建会话不下单。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    exchange = _Exchange()
+    exchange.snapshot_value = _queue_book_snapshot(now, Decimal("8000"))
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+
+    preview = service.preview(_request(now))
+    exchange.snapshots = [
+        _queue_book_snapshot(now - timedelta(seconds=30), Decimal("8000"))
+    ]
+    result = service.start(str(preview["preview_id"]), "lp-queue-stale-1")
+
+    assert result["state"] == "rejected"
+    assert result["reason"] == "book_freshness_stale"
+    assert store.lp_active_session() is None
+    assert exchange.posts == []
+
+
+def test_queue_protection_baseline_survives_restart(tmp_path) -> None:
+    """T12: 同 store 新建实例后基线仍在，tick 评估用持久 baseline。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    exchange = _Exchange()
+    exchange.snapshot_value = _queue_book_snapshot(now, Decimal("8000"))
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    preview = service.preview(_request(now))
+    started = service.start(str(preview["preview_id"]), "lp-queue-restart-1")
+    session_id = str(started["session_id"])
+
+    restarted = PolymarketLPService(store, exchange, clock=lambda: now)
+    recovered = restarted.status(session_id)
+    protection = recovered["queue_protection"]
+    assert Decimal(str(protection["baseline_front"])) == Decimal("8000")
+    assert Decimal(str(protection["baseline_price"])) == Decimal("0.30")
+
+    exchange.snapshot_value = _queue_tick_snapshot(now, Decimal("10000"))
+    ticked = restarted.tick()
+    after = ticked["queue_protection"]
+    assert after["state"] == "monitoring"
+    assert Decimal(str(after["level_total"])) == Decimal("10000")
+    assert Decimal(str(after["front_estimate"])) == Decimal("8000")
+    assert Decimal(str(after["ratio"])) == Decimal("0.80")
+    assert Decimal(str(after["baseline_front"])) == Decimal("8000")
+    assert exchange.cancels == []
