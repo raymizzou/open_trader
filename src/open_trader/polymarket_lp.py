@@ -7578,6 +7578,23 @@ class PolymarketLPService:
             )
             return self._status_payload(updated)
 
+    def _queue_protection_gate_open(self, session: Mapping[str, object]) -> bool:
+        """Issue 152: protection applies only while the registered entry is
+        alive, not yet cancel-requested, and completely unfilled.
+
+        Shared by the runtime evaluation, the data-outage counter, and the
+        conservative cancel so the three can never drift apart.
+        """
+
+        entry_order_id = str(session.get("entry_order_id") or "")
+        if not entry_order_id or bool(session.get("entry_cancel_requested")):
+            return False
+        if _maybe_decimal(session.get("buy_filled_quantity", 0)) != 0:
+            return False
+        history = self._order_history(session)
+        entry_status = str(history.get(entry_order_id, {}).get("status") or "").upper()
+        return not entry_status or entry_status not in TERMINAL_ORDER_STATES
+
     def _queue_protection_data_failure(
         self, session: Mapping[str, object], reason: str
     ) -> dict[str, object] | None:
@@ -7591,6 +7608,13 @@ class PolymarketLPService:
         if str(protection.get("state")) in {"canceling", "canceled", "partially_filled"}:
             return None
         updated = dict(protection)
+        if not self._queue_protection_gate_open(session):
+            # The episode no longer protects a live entry (filled, cancel
+            # requested, terminal, or never submitted): an outage streak is
+            # irrelevant, so the counter resets instead of accumulating
+            # toward a stale conservative cancel.
+            updated["data_failures"] = 0
+            return updated
         failures = _maybe_decimal(updated.get("data_failures")) or Decimal("0")
         updated["data_failures"] = failures + 1
         return updated
@@ -7606,6 +7630,8 @@ class PolymarketLPService:
             return None
         count = _maybe_decimal(failures.get("data_failures")) or Decimal("0")
         if count < LP_PROTECTION_DATA_FAILURE_LIMIT:
+            return None
+        if not self._queue_protection_gate_open(session):
             return None
         result = self._request_protection_cancel(
             session, None, reason="book_unreliable"
@@ -8131,14 +8157,7 @@ class PolymarketLPService:
         baseline_price = _maybe_decimal(protection.get("baseline_price"))
         if baseline_price is None:
             return None
-        entry_order_id = str(session.get("entry_order_id") or "")
-        if not entry_order_id or bool(session.get("entry_cancel_requested")):
-            return None
-        if _maybe_decimal(session.get("buy_filled_quantity", 0)) != 0:
-            return None
-        history = self._order_history(session)
-        entry_status = str(history.get(entry_order_id, {}).get("status") or "").upper()
-        if entry_status and entry_status in TERMINAL_ORDER_STATES:
+        if not self._queue_protection_gate_open(session):
             return None
         token_id = str(session.get("token_id") or "")
         own_remaining = self._own_queue_remaining(
@@ -8253,6 +8272,20 @@ class PolymarketLPService:
         )
         return ("LP 位置保护撤单受阻", message, "LP 位置保护撤单受阻")
 
+    @staticmethod
+    def _merge_order_id_lists(*groups: object) -> list[str]:
+        """Union order ids across a protection episode (ordered, deduplicated)."""
+
+        result: list[str] = []
+        seen: set[str] = set()
+        for group in groups:
+            for value in _items(group):
+                order_id = str(value or "")
+                if order_id and order_id not in seen:
+                    seen.add(order_id)
+                    result.append(order_id)
+        return result
+
     def _request_protection_cancel(
         self,
         session: Mapping[str, object],
@@ -8316,7 +8349,6 @@ class PolymarketLPService:
             )
 
         targets: list[str] = []
-        manual_targets: list[str] = []
         skipped: list[dict[str, object]] = []
         if entry_order_id:
             targets.append(entry_order_id)
@@ -8339,13 +8371,16 @@ class PolymarketLPService:
             if str(_field(row, "status", "")).upper() in TERMINAL_ORDER_STATES:
                 continue
             targets.append(order_id)
-            manual_targets.append(order_id)
+
         if only_order_ids is not None:
             retry = set(only_order_ids)
             targets = [order_id for order_id in targets if order_id in retry]
-            manual_targets = [
-                order_id for order_id in manual_targets if order_id in retry
-            ]
+        # Issue 152 review: within one protection episode the target set and
+        # the canceled set accumulate across retries (ordered union), so a
+        # retried batch can never overwrite the earlier episode state.
+        episode_targets = self._merge_order_id_lists(
+            protection.get("cancel_targets"), targets
+        )
 
         action_key = f"{session_id}:entry-protection-cancel:{entry_order_id}"
         intent_payload: dict[str, object] = {
@@ -8388,30 +8423,46 @@ class PolymarketLPService:
                 session_id, action_key, state="accepted", payload=receipt_payload
             )
 
-        canceled_remaining = Decimal("0")
+        # Cancel-time remaining is accumulated per newly acknowledged order
+        # (the remaining size of the row the cancel request was issued
+        # against), never re-derived from post-cancel reads.
+        episode_remaining = (
+            _maybe_decimal(protection.get("canceled_remaining")) or Decimal("0")
+        )
         for order_id in canceled:
             row = rows_by_id.get(order_id)
             if row is None:
                 continue
             remaining = self._queue_row_remaining(row)
             if remaining is not None:
-                canceled_remaining += remaining
+                episode_remaining += remaining
+        episode_canceled = self._merge_order_id_lists(
+            protection.get("canceled_order_ids"), canceled
+        )
 
         updated["state"] = "canceling"
         updated["cancel_reason"] = reason
-        updated["cancel_targets"] = targets
+        updated["cancel_targets"] = episode_targets
         updated["cancel_failed"] = failed
-        updated["canceled_order_ids"] = canceled
+        updated["canceled_order_ids"] = episode_canceled
+        updated["canceled_remaining"] = episode_remaining
         updated["cancel_requested_at"] = _iso(self._now())
         if failed:
             updated["cancel_failure"] = failure_error or "cancel_not_acknowledged"
-        if not failed:
+        canceled_set = set(episode_canceled)
+        episode_complete = bool(episode_targets) and all(
+            order_id in canceled_set for order_id in episode_targets
+        )
+        if episode_complete:
+            manual_count = sum(
+                1 for order_id in episode_canceled if order_id != entry_order_id
+            )
             title, message, xiaoai = self._queue_protection_success_notification(
                 updated,
                 session,
-                canceled_count=len(canceled),
-                manual_count=len(manual_targets),
-                canceled_remaining=canceled_remaining,
+                canceled_count=len(episode_canceled),
+                manual_count=manual_count,
+                canceled_remaining=episode_remaining,
             )
             self._notify_protection(title, message, xiaoai)
             updated["notification_sent"] = True
@@ -8462,6 +8513,7 @@ class PolymarketLPService:
         history = self._order_history(session)
         rows_by_id = self._queue_level_rows(snapshot)
         filled = Decimal("0")
+        receipt_canceled: list[str] = []
         for order_id in targets:
             record = history.get(order_id)
             row = rows_by_id.get(order_id)
@@ -8473,12 +8525,15 @@ class PolymarketLPService:
             if source is None:
                 # No receipt and no resting row anywhere: the order is no
                 # longer open on any read path, i.e. canceled.
+                receipt_canceled.append(order_id)
                 continue
             status = str(_field(source, "status", "") or "").upper()
             if not status:
                 return None
             if status not in TERMINAL_ORDER_STATES:
                 return None
+            if status in {"CANCELED", "CANCELLED"}:
+                receipt_canceled.append(order_id)
             matched = _maybe_decimal(_field(source, "size_matched"))
             if matched is not None and matched > 0:
                 filled += matched
@@ -8489,18 +8544,26 @@ class PolymarketLPService:
         else:
             updated["state"] = "canceled"
         if updated.get("notification_sent") is not True:
-            canceled = [
-                str(value)
-                for value in _items(updated.get("canceled_order_ids"))
-                if str(value or "")
-            ]
-            manual_count = max(len(canceled) - 1, 0)
+            entry_order_id = str(session.get("entry_order_id") or "")
+            # Receipt-proved cancellations join the durable episode set so
+            # the one-shot success notification reports the full target set,
+            # and the cancel-time remaining (never the matched volume) is
+            # reported as the canceled remaining.
+            canceled = self._merge_order_id_lists(
+                updated.get("canceled_order_ids"), receipt_canceled
+            )
+            updated["canceled_order_ids"] = canceled
+            manual_count = sum(
+                1 for order_id in canceled if order_id != entry_order_id
+            )
             title, message, xiaoai = self._queue_protection_success_notification(
                 updated,
                 session,
                 canceled_count=len(canceled) or len(targets),
                 manual_count=manual_count,
-                canceled_remaining=filled,
+                canceled_remaining=_maybe_decimal(
+                    updated.get("canceled_remaining")
+                ),
             )
             self._notify_protection(title, message, xiaoai)
             updated["notification_sent"] = True

@@ -21532,6 +21532,81 @@ console.log(JSON.stringify({
     }
 
 
+def test_lp_queue_protection_unknown_ratio_and_persisted_terminal_counts() -> None:
+    """R7(F3)+R8(F4): ratio=null 撤单中副行显示 A UNKNOWN（触发线 50%）不虚构
+    「0% ≤ 50% 已触发」；保护已撤且在挂行消失的组按持久化字段显示 2 张（含 1 手动）
+    与撤单余量，不显示 0 张/0 份。"""
+    output = run_dashboard_js(r'''
+const checkedAt = "2026-09-20T04:00:00Z";
+const dataTime = "2026-09-20T04:00:03Z";
+const row = (orderId, conditionId, extra) => ({
+  order_id: orderId, condition_id: conditionId, token_id: "token-" + orderId,
+  market_title: "Queue market " + conditionId,
+  market_url: "https://polymarket.com/event/" + conditionId,
+  outcome: "YES", side: "BUY", status: "LIVE", price: "0.30",
+  quantity: "2000", filled_quantity: "0", remaining_quantity: "2000",
+  state: "open", management: "manual_read_only", read_only: true,
+  scoring_status: "true", anchor: true, ...extra,
+});
+// R7：book_unreliable 保守撤单从未评估 ratio → null。
+const outageRow = row("entry-1", "condition-outage", {
+  queue_protection: {
+    state: "canceling", cancel_reason: "book_unreliable", threshold: "0.5",
+    ratio: null, reason_codes: [], data_time: dataTime,
+    cancel_targets: ["entry-1"], canceled_order_ids: ["entry-1"],
+    canceled_remaining: "2000",
+  },
+});
+// R8：保护已撤，零成交手动单已从在挂行消失，只剩 entry 一行。
+const canceledRow = row("entry-9", "condition-gone", {
+  remaining_quantity: "0",
+  queue_protection: {
+    state: "canceled", threshold: "0.5", ratio: "0.25",
+    reason_codes: [], data_time: dataTime,
+    cancel_targets: ["entry-9", "manual-10"],
+    canceled_order_ids: ["entry-9", "manual-10"],
+    canceled_remaining: "2500",
+  },
+});
+const dashboard = {
+  state: "ready", stale: false, checked_at: checkedAt, last_success_at: checkedAt,
+  orders: [], positions: [],
+  lp_orders_today: [outageRow, canceledRow],
+  non_lp_row_count: 0, market_rewards: [], lp_observations: {},
+};
+const html = predictionLpCard({lp_dashboard: dashboard});
+const orderTable = (html.match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
+const marketRow = (title) => {
+  const start = orderTable.indexOf(title);
+  const end = orderTable.indexOf("</tr>", start);
+  return orderTable.slice(start, end);
+};
+const outage = marketRow("Queue market condition-outage");
+const gone = marketRow("Queue market condition-gone");
+console.log(JSON.stringify({
+  outageUnknown: outage.includes("A UNKNOWN"),
+  outageTriggerLine: outage.includes("（触发线 50%）"),
+  outageNoZeroTrigger: !outage.includes("0% ≤ 50%") && !outage.includes("UNKNOWN% ≤"),
+  outageRequestCount: outage.includes("1 张撤单请求已发") && !outage.includes("0 张撤单请求已发"),
+  outagePill: outage.includes("位置保护 · 撤单中"),
+  goneCounts: gone.includes("2 张全撤成功（含 1 张手动）"),
+  goneNoZeroCounts: !gone.includes("0 张全撤成功") && !gone.includes("含 0 张手动"),
+  goneRemaining: gone.includes("合计余量 2,500 份") && !gone.includes("合计余量 0 份"),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered == {
+        "outageUnknown": True,
+        "outageTriggerLine": True,
+        "outageNoZeroTrigger": True,
+        "outageRequestCount": True,
+        "outagePill": True,
+        "goneCounts": True,
+        "goneNoZeroCounts": True,
+        "goneRemaining": True,
+    }
+
+
 def test_lp_queue_protection_styles_shipped() -> None:
     """T25(视觉): dashboard.css 携带保护副行与 chip 样式，值与批准 mock 一致。"""
     css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")

@@ -6351,6 +6351,180 @@ def test_queue_protection_outage_conservative_cancel_after_ten_failures(
     assert exchange.account_reads >= 1
 
 
+def _queue_outage_service(tmp_path, now: datetime, key: str):
+    """Start one registered session (quantity 2000 @ 0.30) ready for outage ticks."""
+
+    exchange = _AccountReadExchange()
+    exchange.snapshot_value = _queue_runtime_snapshot(now, bid_size="10000")
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    request = {**_request(now), "quantity": Decimal("2000")}
+    preview = service.preview(request)
+    started = service.start(str(preview["preview_id"]), key)
+    assert started["state"] == "entry_open"
+    return store, exchange, service, started
+
+
+def test_queue_protection_outage_never_fires_after_entry_fill(tmp_path) -> None:
+    """R1(F1): entry 已成交的会话，好坏 tick 交错累计 10 个断联 tick → 永不保守撤、计数保持 0。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    token_id = "0x" + "1" * 64
+    store, exchange, service, started = _queue_outage_service(
+        tmp_path, now, key="lp-queue-r1"
+    )
+    session_id = str(started["session_id"])
+
+    filled = _queue_runtime_snapshot(
+        now,
+        bid_size="8000",
+        orders=[_queue_receipt("order-1", status="MATCHED", matched="2000")],
+        trades=[
+            {
+                "trade_id": "t-1",
+                "status": "CONFIRMED",
+                "maker_orders": [
+                    {
+                        "order_id": "order-1",
+                        "side": "BUY",
+                        "token_id": token_id,
+                        "matched_amount": Decimal("2000"),
+                        "price": Decimal("0.30"),
+                    }
+                ],
+            }
+        ],
+        positions=[{"token_id": token_id, "size": Decimal("2000")}],
+        open_orders=[_queue_receipt("manual-2", original="1000")],
+    )
+    exchange.snapshot_value = filled
+    result = service.tick()
+    assert result["buy_filled_quantity"] == Decimal("2000")
+
+    # 手动同价 BUY 仍在挂；断联与成交后好 tick 交错，断联累计 10 次。
+    exchange.account_open_orders = [_queue_receipt("manual-2", original="1000")]
+    for index in range(20):
+        exchange.snapshot_value = None if index % 2 == 0 else filled
+        service.tick()
+        protection = store.lp_session(session_id)["queue_protection"]
+        assert exchange.cancels == []
+        assert Decimal(str(protection["data_failures"])) == 0
+        assert protection["state"] != "canceling"
+
+
+def test_queue_protection_outage_never_fires_when_cancel_requested(tmp_path) -> None:
+    """R2(F1): entry_cancel_requested=True 的会话，连续 10 个断联 tick → 不保守撤。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _queue_outage_service(
+        tmp_path, now, key="lp-queue-r2a"
+    )
+    session_id = str(started["session_id"])
+    store.lp_update_session(session_id, patch={"entry_cancel_requested": True})
+
+    exchange.snapshot_value = None
+    for _ in range(10):
+        result = service.tick()
+        assert result["state"] == "needs_attention"
+        assert exchange.cancels == []
+        assert Decimal(str(result["queue_protection"]["data_failures"])) == 0
+
+
+def test_queue_protection_outage_never_fires_when_entry_terminal(tmp_path) -> None:
+    """R2(F1): entry 回执终态（已撤）的会话，连续 10 个断联 tick → 不保守撤。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _queue_outage_service(
+        tmp_path, now, key="lp-queue-r2b"
+    )
+    session_id = str(started["session_id"])
+    store.lp_update_session(
+        session_id,
+        patch={"order_history": {"order-1": {"order_id": "order-1", "status": "CANCELED"}}},
+    )
+
+    exchange.snapshot_value = None
+    for _ in range(10):
+        result = service.tick()
+        assert exchange.cancels == []
+        assert Decimal(str(result["queue_protection"]["data_failures"])) == 0
+
+
+def test_queue_protection_outage_never_fires_without_entry_order_id(tmp_path) -> None:
+    """R3(F1): 提交失败无 entry_order_id 的 needs_attention 会话，断联 tick 不保守撤。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    exchange = _Exchange()
+    exchange.snapshot_value = None
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    store.lp_create_session(
+        "lp-queue-r3",
+        "lp-queue-r3-idempotency",
+        state="needs_attention",
+        payload={
+            "market_id": "market-1",
+            "condition_id": "0x" + "c" * 64,
+            "token_id": "0x" + "1" * 64,
+            "outcome": "YES",
+            "question": "Will it happen?",
+            "price": Decimal("0.30"),
+            "quantity": Decimal("2000"),
+            "review_at": now + timedelta(minutes=10),
+            "resume_state": "entry_open",
+            "queue_protection": {
+                "state": "registered",
+                "baseline_price": "0.30",
+                "baseline_front": "0",
+                "threshold": "0.5",
+                "reason_codes": [],
+                "data_time": now.isoformat(),
+            },
+        },
+    )
+
+    for _ in range(10):
+        result = service.tick()
+        assert result["state"] == "needs_attention"
+        assert exchange.cancels == []
+        assert Decimal(str(result["queue_protection"]["data_failures"])) == 0
+
+
+def test_queue_protection_outage_streak_resets_on_successful_tick(tmp_path) -> None:
+    """R4(F1/T18 语义): entry 存活时连续 10 次触发、第 9 次不触发、成功 tick 复位计数。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _queue_outage_service(
+        tmp_path, now, key="lp-queue-r4"
+    )
+    good = _queue_runtime_snapshot(
+        now, bid_size="10000", orders=[_queue_receipt("order-1")]
+    )
+
+    # 断联与成功 tick 交错：每次成功 tick 把计数复位为 0，断联后最多为 1。
+    for _ in range(5):
+        exchange.snapshot_value = None
+        outage = service.tick()
+        assert Decimal(str(outage["queue_protection"]["data_failures"])) == 1
+        assert exchange.cancels == []
+        exchange.snapshot_value = good
+        healthy = service.tick()
+        assert Decimal(str(healthy["queue_protection"]["data_failures"])) == 0
+        assert exchange.cancels == []
+
+    # 连续 9 次断联：计数递增且不触发。
+    exchange.snapshot_value = None
+    for expected in range(1, 10):
+        result = service.tick()
+        assert Decimal(str(result["queue_protection"]["data_failures"])) == expected
+        assert exchange.cancels == []
+
+    # 第 10 次连续断联 → 保守撤（同价 2 张，走新账户读取）。
+    exchange.account_open_orders = [
+        _queue_receipt("order-1"),
+        _queue_receipt("manual-2", original="1000"),
+    ]
+    conservative = service.tick()
+    assert exchange.cancels == ["order-1", "manual-2"]
+    assert conservative["queue_protection"]["cancel_reason"] == "book_unreliable"
+    assert conservative["queue_protection"]["state"] == "canceling"
+
+
 def test_queue_protection_mutation_breaker_blocks_cancel(tmp_path) -> None:
     """T19: 熔断返回 False：无撤单调用，blocked/mutation_blocked，受阻通知。"""
     now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
@@ -6499,3 +6673,126 @@ def test_queue_protection_notification_success_template_once(tmp_path) -> None:
     service.tick()
     restarted.tick()
     assert len(notifications) == 1
+
+
+def test_queue_protection_retry_success_notifies_full_episode_once(tmp_path) -> None:
+    """R5(F2): entry 撤成+manual 失败 → 重试成功后恰一条通知，按全量 2 张/合计余量 3000 报告；
+    cancel_targets/canceled_order_ids 跨重试保持并集。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _queue_running_service(
+        tmp_path, now, key="lp-queue-r5"
+    )
+    notifications: list[tuple[str, str, str]] = []
+    service.set_protection_notifier(
+        lambda title, message, xiaoai: notifications.append((title, message, xiaoai))
+    )
+    entry_id = "order-1"
+    open_orders = [
+        _queue_receipt(entry_id),
+        _queue_receipt("manual-2", original="1000"),
+    ]
+    trigger = _queue_runtime_snapshot(now, bid_size="4000", open_orders=open_orders)
+    exchange.snapshots = [trigger, trigger, trigger]
+    exchange.snapshot_calls = 0
+    exchange.cancel_responses = [
+        {"canceled": [entry_id], "status": "CANCELED"},
+        {"not_canceled": {"manual-2": "venue_busy"}},
+        {"canceled": ["manual-2"], "status": "CANCELED"},
+    ]
+
+    first = service.tick()
+    protection = first["queue_protection"]
+    assert protection["state"] == "canceling"
+    assert protection["cancel_failed"] == ["manual-2"]
+    assert protection["cancel_targets"] == [entry_id, "manual-2"]
+    assert protection["canceled_order_ids"] == [entry_id]
+    assert Decimal(str(protection["canceled_remaining"])) == Decimal("2000")
+    assert notifications == []
+
+    second = service.tick()
+    # 首次尝试对 manual-2 发过一次被拒的撤单调用，重试再发一次。
+    assert exchange.cancels == [entry_id, "manual-2", "manual-2"]
+    protection = second["queue_protection"]
+    assert protection["cancel_failed"] == []
+    assert protection["cancel_targets"] == [entry_id, "manual-2"]
+    assert protection["canceled_order_ids"] == [entry_id, "manual-2"]
+    assert Decimal(str(protection["canceled_remaining"])) == Decimal("3000")
+    assert len(notifications) == 1
+    title, message, xiaoai = notifications[0]
+    assert title == "LP 位置保护撤单"
+    assert "已撤 2 张买单合计余量 3000 份 @ 0.3（含 1 张手动）" in message
+    assert xiaoai == "LP 位置保护撤单，2 张买单已撤"
+
+
+def test_queue_protection_converge_keeps_fill_and_cancel_remaining_apart(
+    tmp_path,
+) -> None:
+    """R6(F2): 部分成交（filled=300）收敛：通知合计余量=撤单时点余量 2000，
+    不把成交量 300 冒充撤单余量；持久化中 300（已成交）与 2000（已撤余量）分列。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    token_id = "0x" + "1" * 64
+    store, exchange, service, started = _queue_running_service(
+        tmp_path, now, key="lp-queue-r6"
+    )
+    notifications: list[tuple[str, str, str]] = []
+    service.set_protection_notifier(
+        lambda title, message, xiaoai: notifications.append((title, message, xiaoai))
+    )
+    entry_id = "order-1"
+    open_orders = [
+        _queue_receipt(entry_id),
+        _queue_receipt("manual-2", original="1000"),
+    ]
+    trigger = _queue_runtime_snapshot(now, bid_size="4000", open_orders=open_orders)
+    exchange.snapshots = [trigger]
+    exchange.snapshot_calls = 0
+    exchange.cancel_responses = [
+        {"canceled": [entry_id], "status": "CANCELED"},
+        {"not_canceled": {"manual-2": "venue_busy"}},
+    ]
+
+    first = service.tick()
+    protection = first["queue_protection"]
+    assert protection["state"] == "canceling"
+    assert protection["cancel_failed"] == ["manual-2"]
+    assert Decimal(str(protection["canceled_remaining"])) == Decimal("2000")
+    assert notifications == []
+
+    # 下一 tick 回执显示两单都已终态：entry 撤前成交 300，manual 已撤。
+    converged_snapshot = _queue_runtime_snapshot(
+        now,
+        bid_size="4000",
+        orders=[
+            _queue_receipt(entry_id, status="CANCELED", matched="300"),
+            _queue_receipt("manual-2", status="CANCELED", original="1000"),
+        ],
+        trades=[
+            {
+                "trade_id": "t-1",
+                "status": "CONFIRMED",
+                "maker_orders": [
+                    {
+                        "order_id": entry_id,
+                        "side": "BUY",
+                        "token_id": token_id,
+                        "matched_amount": Decimal("300"),
+                        "price": Decimal("0.30"),
+                    }
+                ],
+            }
+        ],
+        positions=[{"token_id": token_id, "size": Decimal("300")}],
+    )
+    exchange.snapshots = [converged_snapshot]
+    exchange.snapshot_calls = 0
+    final = service.tick()
+    protection = final["queue_protection"]
+    assert protection["state"] == "partially_filled"
+    assert Decimal(str(protection["partially_filled_quantity"])) == Decimal("300")
+    assert Decimal(str(protection["canceled_remaining"])) == Decimal("2000")
+    assert len(notifications) == 1
+    title, message, xiaoai = notifications[0]
+    assert title == "LP 位置保护撤单"
+    assert "已撤 2 张买单合计余量 2000 份" in message
+    assert "合计余量 300" not in message
+    assert xiaoai == "LP 位置保护撤单，2 张买单已撤"

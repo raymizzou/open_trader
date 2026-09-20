@@ -3578,6 +3578,9 @@ const LP_QUEUE_PROTECTION_UNANCHORED_TEXT =
   "位置未知 · 尚未建立位置保护（网页手动挂单，无下单基线）";
 
 function lpQueueProtectionPercent(ratio) {
+  // Issue 152 review: a missing estimate (null/undefined) must render as
+  // UNKNOWN, never as Number(null) === 0%.
+  if (ratio === null || ratio === undefined || ratio === "") return "UNKNOWN";
   const value = Number(ratio);
   if (!Number.isFinite(value)) return "UNKNOWN";
   return (value * 100).toFixed(2).replace(/\.?0+$/, "");
@@ -3649,7 +3652,6 @@ function lpDashboardTodayQueueProtectionRow(orders) {
   const buys = orders.filter((row) => String(row.side || "").toUpperCase() === "BUY");
   if (summary && typeof summary === "object") {
     const samePrice = lpQueueSamePriceBuyRows(orders, summary);
-    const manualCount = samePrice.filter((row) => row?.anchor !== true).length;
     const targetCount = samePrice.length;
     const remaining = samePrice.reduce((sum, row) => {
       const value = Number(row.remaining_quantity);
@@ -3659,6 +3661,23 @@ function lpDashboardTodayQueueProtectionRow(orders) {
     const thresholdText = lpQueueProtectionPercent(summary.threshold ?? 0.5) || "50";
     const clock = lpQueueProtectionClock(summary.data_time);
     const state = String(summary.state || "unknown");
+    // Issue 152 review: settled states report the persisted episode counts
+    // (cancel targets / canceled receipts / cancel-time remaining); resting
+    // rows vanish once orders drop off the open-order snapshot, so they are
+    // only a fallback for summaries without the persisted fields and the
+    // live "trigger" preview for monitoring.
+    const idList = (value) => (Array.isArray(value)
+      ? value.map((item) => String(item || "")).filter(Boolean)
+      : null);
+    const canceledIds = idList(summary.canceled_order_ids);
+    const targetIds = idList(summary.cancel_targets);
+    const persistedCount = canceledIds ? canceledIds.length
+      : targetIds ? targetIds.length : null;
+    const persistedRemaining = Number(summary.canceled_remaining);
+    const hasPersistedRemaining = Number.isFinite(persistedRemaining);
+    const ratioHead = ratioText === "UNKNOWN"
+      ? "A UNKNOWN"
+      : "A " + escapeHtml(ratioText) + "%";
     let data = "";
     if (state === "monitoring") {
       data = "<abbr title=\"" + escapeHtml(LP_QUEUE_PROTECTION_ABBR_TITLE)
@@ -3668,23 +3687,31 @@ function lpDashboardTodayQueueProtectionRow(orders) {
         + escapeHtml(thresholdText) + "%）· 触发撤同价 <strong>" + escapeHtml(String(targetCount))
         + " 张</strong> · " + escapeHtml(clock);
     } else if (state === "canceling") {
-      data = "A " + escapeHtml(ratioText) + "% ≤ " + escapeHtml(thresholdText)
-        + "% 已触发 · " + escapeHtml(String(targetCount)) + " 张撤单请求已发，等待回执 · "
-        + escapeHtml(clock);
+      const requestCount = targetIds ? targetIds.length : targetCount;
+      const triggerHead = ratioText === "UNKNOWN"
+        ? "A UNKNOWN（触发线 " + escapeHtml(thresholdText) + "%）"
+        : "A " + escapeHtml(ratioText) + "% ≤ " + escapeHtml(thresholdText) + "% 已触发";
+      data = triggerHead + " · " + escapeHtml(String(requestCount))
+        + " 张撤单请求已发，等待回执 · " + escapeHtml(clock);
     } else if (state === "canceled") {
-      data = "A " + escapeHtml(ratioText) + "% 已触发 · "
-        + escapeHtml(String(targetCount)) + " 张全撤成功（含 " + escapeHtml(String(manualCount))
-        + " 张手动）· " + escapeHtml(clock);
+      const count = persistedCount ?? targetCount;
+      const manual = Math.max(count - 1, 0);
+      const remainValue = hasPersistedRemaining ? persistedRemaining : remaining;
+      data = ratioHead + " 已触发 · "
+        + escapeHtml(String(count)) + " 张全撤成功（含 " + escapeHtml(String(manual))
+        + " 张手动）· 合计余量 " + escapeHtml(formatDisplayNumber(String(remainValue)))
+        + " 份 · " + escapeHtml(clock);
     } else if (state === "partially_filled") {
       const filled = Number(summary.partially_filled_quantity);
       const filledText = Number.isFinite(filled) && filled > 0
         ? formatDisplayNumber(String(filled))
         : "UNKNOWN";
+      const remainValue = hasPersistedRemaining ? persistedRemaining : remaining;
       data = "已成交 " + escapeHtml(filledText) + " / 已撤余量 "
-        + escapeHtml(formatDisplayNumber(String(remaining))) + " · 不补买 · "
+        + escapeHtml(formatDisplayNumber(String(remainValue))) + " · 不补买 · "
         + escapeHtml(clock);
     } else if (state === "blocked") {
-      data = "A " + escapeHtml(ratioText) + "% 已触发 · "
+      data = ratioHead + " 已触发 · "
         + escapeHtml(lpQueueProtectionBlockReason(summary)) + " · 残余 <strong>"
         + escapeHtml(formatDisplayNumber(String(remaining))) + " 份</strong> · "
         + escapeHtml(clock);
