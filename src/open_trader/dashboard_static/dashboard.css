@@ -5464,7 +5464,9 @@ tbody tr.active-row,
 .trend-kelly-observation-table th,
 .pm-observation-table dl,
 .pm-relation-chip,
-.pm-relation-tag {
+.pm-relation-tag,
+.lp-queue-protection,
+.status-unknown {
   --muted: var(--text);
 }
 
@@ -6659,6 +6661,40 @@ button { cursor: pointer; }
 .pm-lp-order-table th:nth-child(5), .pm-lp-order-table td:nth-child(5) { width: 25%; }
 .pm-lp-order-table .lp-line { align-items: baseline; display: flex; gap: 8px; justify-content: space-between; }
 .pm-lp-order-table .lp-line > div { min-width: 0; overflow-wrap: anywhere; }
+/* —— issue 152 新增样式：LP BUY 队列位置保护副行与来源 chip —— */
+.src-chip {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1;
+  padding: 2px 6px;
+  vertical-align: 1px;
+}
+.src-chip.registered { border-color: #e4c98e; background: #fff8e8; color: #6b4a11; }
+.lp-queue-protection {
+  background: var(--surface-soft);
+  border-radius: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: 6px;
+  row-gap: 2px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  margin-top: 6px;
+  padding: 5px 8px;
+}
+.lp-queue-protection .status-pill { font-size: 11px; min-height: 20px; padding: 0 6px; }
+.lp-queue-protection .qp-data { color: var(--muted); min-width: 0; overflow-wrap: anywhere; }
+.lp-queue-protection .qp-data strong { color: var(--text); font-weight: 700; }
+.lp-queue-protection .qp-triggered strong { color: var(--danger); }
+.lp-queue-protection.qp-none { color: var(--muted); display: block; }
+.lp-queue-protection abbr { cursor: help; text-decoration: underline dotted var(--muted); }
+.status-danger { background: #fbeae8; border-color: #e5b5b0; color: var(--danger); }
+.status-unknown { background: var(--surface-soft); border: 1px dashed var(--muted); color: var(--muted); }
 .pm-button.lp-cancel, .pm-button.lp-cancel-all { flex: 0 0 auto; font-size: 11px; min-height: 26px; padding: 2px 8px; }
 .pm-lp-candidate-table th:nth-child(1), .pm-lp-candidate-table td:nth-child(1) { width: 26%; }
 .pm-lp-candidate-table th:nth-child(2), .pm-lp-candidate-table td:nth-child(2) { width: 12%; }

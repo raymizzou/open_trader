@@ -3571,6 +3571,138 @@ function lpDashboardTodayPurposeLabel(row) {
   return "";
 }
 
+// Issue 152: LP BUY 队列位置保护副行（登记锚 + 保守估算展示）。
+const LP_QUEUE_PROTECTION_ABBR_TITLE =
+  "保守估算：下单后同价位任何减少均计入前方，不区分成交与撤单；比例为预计值，不承诺防成交";
+const LP_QUEUE_PROTECTION_UNANCHORED_TEXT =
+  "位置未知 · 尚未建立位置保护（网页手动挂单，无下单基线）";
+
+function lpQueueProtectionPercent(ratio) {
+  const value = Number(ratio);
+  if (!Number.isFinite(value)) return "UNKNOWN";
+  return (value * 100).toFixed(2).replace(/\.?0+$/, "");
+}
+
+function lpQueueProtectionClock(value) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "UNKNOWN";
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Hong_Kong",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(date);
+}
+
+function lpQueueProtectionPill(state) {
+  const pills = {
+    monitoring: {tone: "", label: "位置保护 · 监控中"},
+    canceling: {tone: " status-warn", label: "位置保护 · 撤单中"},
+    canceled: {tone: " status-ok", label: "位置保护 · 已撤"},
+    partially_filled: {tone: " status-partial", label: "位置保护 · 部分成交"},
+    unknown: {tone: " status-unknown", label: "位置保护 · 未知"},
+    blocked: {tone: " status-danger", label: "位置保护 · 撤单受阻"},
+  };
+  const pill = pills[state] || pills.unknown;
+  return "<span class=\"status-pill" + pill.tone + "\">" + escapeHtml(pill.label) + "</span>";
+}
+
+function lpQueueProtectionSourceChip(row) {
+  const anchored = row?.anchor === true;
+  return "<span class=\"src-chip" + (anchored ? " registered" : "") + "\">"
+    + (anchored ? "登记" : "手动") + "</span>";
+}
+
+function lpDashboardTodayQueueSummary(orders) {
+  for (const row of orders) {
+    if (row && typeof row === "object"
+      && row.queue_protection && typeof row.queue_protection === "object") {
+      return row.queue_protection;
+    }
+  }
+  return null;
+}
+
+function lpQueueSamePriceBuyRows(orders, summary) {
+  const price = summary?.baseline_price ?? null;
+  return orders.filter((row) => {
+    if (String(row.side || "").toUpperCase() !== "BUY") return false;
+    if (price === null || price === undefined || price === "") return true;
+    const rowPrice = Number(row.price);
+    const target = Number(price);
+    if (Number.isFinite(rowPrice) && Number.isFinite(target)) return rowPrice === target;
+    return String(row.price ?? "") === String(price);
+  });
+}
+
+function lpQueueProtectionBlockReason(summary) {
+  const codes = Array.isArray(summary.reason_codes) ? summary.reason_codes : [];
+  if (codes.includes("mutation_blocked")) return "撤单被熔断阻止";
+  if (codes.includes("identity_conflict")) return "回执身份不符";
+  if (codes.includes("account_read_failed")) return "账户读取失败";
+  return codes[0] ? String(codes[0]) : "撤单未成功";
+}
+
+function lpDashboardTodayQueueProtectionRow(orders) {
+  const summary = lpDashboardTodayQueueSummary(orders);
+  const buys = orders.filter((row) => String(row.side || "").toUpperCase() === "BUY");
+  if (summary && typeof summary === "object") {
+    const samePrice = lpQueueSamePriceBuyRows(orders, summary);
+    const manualCount = samePrice.filter((row) => row?.anchor !== true).length;
+    const targetCount = samePrice.length;
+    const remaining = samePrice.reduce((sum, row) => {
+      const value = Number(row.remaining_quantity);
+      return sum + (Number.isFinite(value) && value > 0 ? value : 0);
+    }, 0);
+    const ratioText = lpQueueProtectionPercent(summary.ratio);
+    const thresholdText = lpQueueProtectionPercent(summary.threshold ?? 0.5) || "50";
+    const clock = lpQueueProtectionClock(summary.data_time);
+    const state = String(summary.state || "unknown");
+    let data = "";
+    if (state === "monitoring") {
+      data = "<abbr title=\"" + escapeHtml(LP_QUEUE_PROTECTION_ABBR_TITLE)
+        + "\">前方≈" + escapeHtml(formatDisplayNumber(String(summary.front_estimate ?? "UNKNOWN")))
+        + "</abbr> / 同价位 " + escapeHtml(formatDisplayNumber(String(summary.level_total ?? "UNKNOWN")))
+        + " · <strong>A " + escapeHtml(ratioText) + "%</strong>（触发线 "
+        + escapeHtml(thresholdText) + "%）· 触发撤同价 <strong>" + escapeHtml(String(targetCount))
+        + " 张</strong> · " + escapeHtml(clock);
+    } else if (state === "canceling") {
+      data = "A " + escapeHtml(ratioText) + "% ≤ " + escapeHtml(thresholdText)
+        + "% 已触发 · " + escapeHtml(String(targetCount)) + " 张撤单请求已发，等待回执 · "
+        + escapeHtml(clock);
+    } else if (state === "canceled") {
+      data = "A " + escapeHtml(ratioText) + "% 已触发 · "
+        + escapeHtml(String(targetCount)) + " 张全撤成功（含 " + escapeHtml(String(manualCount))
+        + " 张手动）· " + escapeHtml(clock);
+    } else if (state === "partially_filled") {
+      const filled = Number(summary.partially_filled_quantity);
+      const filledText = Number.isFinite(filled) && filled > 0
+        ? formatDisplayNumber(String(filled))
+        : "UNKNOWN";
+      data = "已成交 " + escapeHtml(filledText) + " / 已撤余量 "
+        + escapeHtml(formatDisplayNumber(String(remaining))) + " · 不补买 · "
+        + escapeHtml(clock);
+    } else if (state === "blocked") {
+      data = "A " + escapeHtml(ratioText) + "% 已触发 · "
+        + escapeHtml(lpQueueProtectionBlockReason(summary)) + " · 残余 <strong>"
+        + escapeHtml(formatDisplayNumber(String(remaining))) + " 份</strong> · "
+        + escapeHtml(clock);
+    } else {
+      const codes = Array.isArray(summary.reason_codes) ? summary.reason_codes : [];
+      const reason = codes.includes("remaining_unknown") ? "回执缺失，" : "";
+      data = reason + "位置无法估算 · " + escapeHtml(clock);
+    }
+    const triggered = ["canceling", "canceled", "blocked", "partially_filled"].includes(state);
+    return "<div class=\"lp-queue-protection\">"
+      + lpQueueProtectionPill(state)
+      + "<span class=\"qp-data num" + (triggered ? " qp-triggered" : "") + "\">" + data + "</span></div>";
+  }
+  const sellOnly = orders.length > 0 && buys.length === 0;
+  const text = sellOnly ? "不适用（卖出）" : LP_QUEUE_PROTECTION_UNANCHORED_TEXT;
+  return "<div class=\"lp-queue-protection qp-none\">" + escapeHtml(text) + "</div>";
+}
+
 function lpDashboardTodayQuantityCell(orders) {
   const filledSum = orders.reduce((sum, row) => {
     const filled = Number(row.filled_quantity);
@@ -3611,6 +3743,10 @@ function lpDashboardTodayQuantityCell(orders) {
     const purpose = lpDashboardTodayPurposeLabel(orders[0]);
     if (purpose) headline += " · " + purpose;
   }
+  const singleBuyChip = !multi
+    && String(orders[0]?.side || "").toUpperCase() === "BUY"
+    ? lpQueueProtectionSourceChip(orders[0])
+    : "";
   const fillLine = "已成交 " + formatDisplayNumber(String(filledSum))
     + " · 剩余 " + formatDisplayNumber(String(remainingSum));
   const headlineRight = cancellable.length >= 2
@@ -3619,6 +3755,7 @@ function lpDashboardTodayQuantityCell(orders) {
       ? lpDashboardCancelButton("one", {orderId: orders[0]?.order_id})
       : "";
   let markup = "<div class=\"lp-line\"><div>" + escapeHtml(headline)
+    + (singleBuyChip ? " " + singleBuyChip : "")
     + "<span class=\"sub\">" + escapeHtml(fillLine) + "</span></div>"
     + headlineRight + "</div>";
   if (multi) {
@@ -3629,7 +3766,8 @@ function lpDashboardTodayQuantityCell(orders) {
       const parts = [formatDisplayNumber(String(lpDashboardTodayOrderQuantity(row)))
         + " 份 @ " + lpDashboardPrice(row.price)];
       const side = String(row.side || "").toUpperCase();
-      if (!sidesConsistent) parts.push(side === "BUY" ? "买入" : side === "SELL" ? "卖出" : predictionValue(row.side, "UNKNOWN"));
+      const isBuy = side === "BUY";
+      if (!sidesConsistent) parts.push(isBuy ? "买入" : side === "SELL" ? "卖出" : predictionValue(row.side, "UNKNOWN"));
       const purpose = lpDashboardTodayPurposeLabel(row);
       if (!purposesConsistent && purpose) parts.push(purpose);
       if (lpDashboardTodayFilled(row)) parts.push("已成交");
@@ -3637,13 +3775,17 @@ function lpDashboardTodayQuantityCell(orders) {
         const filled = Number(row.filled_quantity);
         if (Number.isFinite(filled) && filled > 0) parts.push("已成交 " + formatDisplayNumber(String(filled)));
       }
+      const chip = isBuy ? lpQueueProtectionSourceChip(row) : "";
       const right = lpDashboardTodayHasActiveOrder(row)
         ? lpDashboardCancelButton("one", {orderId: row.order_id})
         : "";
       return "<div class=\"lp-line\"><div>" + parts.map((part) => escapeHtml(part)).join(" · ")
+        + (chip ? " · " + chip : "")
         + "</div>" + right + "</div>";
     }).join("");
   }
+  // Issue 152: the group's protection sub-row closes the quantity cell.
+  markup += lpDashboardTodayQueueProtectionRow(orders);
   return markup;
 }
 

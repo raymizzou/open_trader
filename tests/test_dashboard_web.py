@@ -21417,3 +21417,127 @@ console.log(JSON.stringify({
         "confirmAction": True,
         "cancelAction": True,
     }
+
+
+def test_lp_today_renders_queue_protection_subrow_and_source_chips() -> None:
+    """T25: 保护副行文案、六态 pill、无锚组、登记/手动 chip、受阻原因与残余。"""
+    output = run_dashboard_js(r'''
+const checkedAt = "2026-09-20T04:00:00Z";
+const dataTime = "2026-09-20T04:00:03Z";
+const row = (orderId, conditionId, extra) => ({
+  order_id: orderId, condition_id: conditionId, token_id: "token-" + orderId,
+  market_title: "Queue market " + conditionId,
+  market_url: "https://polymarket.com/event/" + conditionId,
+  outcome: "YES", side: "BUY", status: "LIVE", price: "0.29",
+  quantity: "2000", filled_quantity: "0", remaining_quantity: "2000",
+  state: "open", management: "manual_read_only", read_only: true,
+  scoring_status: "true", anchor: false, ...extra,
+});
+const summary = (state, extra) => ({
+  state, threshold: "0.5", reason_codes: [], data_time: dataTime, ...extra,
+});
+const monitored = summary("monitoring", {
+  front_estimate: "8000", level_total: "10500", ratio: "0.76",
+});
+const blocked = summary("blocked", {
+  ratio: "0.48", reason_codes: ["mutation_blocked"],
+});
+const dashboard = {
+  state: "ready", stale: false, checked_at: checkedAt, last_success_at: checkedAt,
+  orders: [], positions: [],
+  lp_orders_today: [
+    // 登记锚组（监控中）：登记 + 手动同价两张。
+    row("entry-1", "condition-mon", {anchor: true, queue_protection: monitored}),
+    row("manual-2", "condition-mon", {remaining_quantity: "500", queue_protection: monitored}),
+    // 无锚纯手动组。
+    row("manual-3", "condition-free", {}),
+    // 六态：撤单中。
+    row("canceling-1", "condition-canceling",
+      {anchor: true, queue_protection: summary("canceling", {ratio: "0.48"})}),
+    // 六态：已撤（含 1 张手动）。
+    row("canceled-1", "condition-canceled",
+      {anchor: true, queue_protection: summary("canceled", {ratio: "0.50"})}),
+    row("canceled-2", "condition-canceled",
+      {anchor: false, queue_protection: summary("canceled", {ratio: "0.50"})}),
+    // 六态：部分成交。
+    row("partial-1", "condition-partial",
+      {anchor: true, queue_protection: summary("partially_filled",
+        {partially_filled_quantity: "300"}), remaining_quantity: "1700"}),
+    // 六态：未知（回执缺失）。
+    row("unknown-1", "condition-unknown",
+      {anchor: true, queue_protection: summary("unknown", {reason_codes: ["remaining_unknown"]})}),
+    // 撤单受阻：熔断原因 + 残余。
+    row("blocked-1", "condition-blocked",
+      {anchor: true, remaining_quantity: "3000", queue_protection: blocked}),
+    // 纯卖出组：不适用。
+    {order_id: "sell-1", condition_id: "condition-sell", token_id: "token-sell",
+      market_title: "Queue market condition-sell", outcome: "YES", side: "SELL",
+      status: "LIVE", price: "0.31", quantity: "100", filled_quantity: "0",
+      remaining_quantity: "100", state: "open", anchor: false},
+  ],
+  non_lp_row_count: 0, market_rewards: [], lp_observations: {},
+};
+const html = predictionLpCard({lp_dashboard: dashboard});
+const orderTable = (html.match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
+const marketRow = (title) => {
+  const start = orderTable.indexOf(title);
+  const end = orderTable.indexOf("</tr>", start);
+  return orderTable.slice(start, end);
+};
+const mon = marketRow("Queue market condition-mon");
+console.log(JSON.stringify({
+  monitoringPill: mon.includes("位置保护 · 监控中"),
+  frontAbbr: mon.includes("前方≈8,000") && mon.includes("同价位 10,500"),
+  abbrTitle: mon.includes("保守估算：下单后同价位任何减少均计入前方") && mon.includes("不承诺防成交"),
+  ratio: mon.includes("A 76%") && mon.includes("触发线 50%"),
+  targetCount: mon.includes("触发撤同价 <strong>2 张</strong>"),
+  dataClock: mon.includes("12:00:03"),
+  registeredChip: mon.includes("src-chip registered") && mon.includes(">登记<"),
+  manualChip: mon.includes(">手动<"),
+  unanchored: marketRow("Queue market condition-free")
+    .includes("位置未知 · 尚未建立位置保护（网页手动挂单，无下单基线）"),
+  cancelingPill: orderTable.includes("位置保护 · 撤单中")
+    && marketRow("Queue market condition-canceling").includes("已触发 · 1 张撤单请求已发，等待回执"),
+  canceledPill: orderTable.includes("位置保护 · 已撤")
+    && marketRow("Queue market condition-canceled").includes("2 张全撤成功（含 1 张手动）"),
+  partialPill: orderTable.includes("位置保护 · 部分成交")
+    && marketRow("Queue market condition-partial").includes("已成交 300 / 已撤余量 1,700 · 不补买"),
+  unknownPill: orderTable.includes("位置保护 · 未知")
+    && marketRow("Queue market condition-unknown").includes("回执缺失，位置无法估算"),
+  blockedPill: orderTable.includes("位置保护 · 撤单受阻"),
+  blockedReason: marketRow("Queue market condition-blocked").includes("撤单被熔断阻止"),
+  blockedRemainder: marketRow("Queue market condition-blocked").includes("残余 <strong>3,000 份</strong>"),
+  sellNotApplicable: marketRow("Queue market condition-sell").includes("不适用（卖出）"),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered == {
+        "monitoringPill": True,
+        "frontAbbr": True,
+        "abbrTitle": True,
+        "ratio": True,
+        "targetCount": True,
+        "dataClock": True,
+        "registeredChip": True,
+        "manualChip": True,
+        "unanchored": True,
+        "cancelingPill": True,
+        "canceledPill": True,
+        "partialPill": True,
+        "unknownPill": True,
+        "blockedPill": True,
+        "blockedReason": True,
+        "blockedRemainder": True,
+        "sellNotApplicable": True,
+    }
+
+
+def test_lp_queue_protection_styles_shipped() -> None:
+    """T25(视觉): dashboard.css 携带保护副行与 chip 样式，值与批准 mock 一致。"""
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    assert ".lp-queue-protection {" in css
+    assert "font-variant-numeric: tabular-nums" in css.split(".lp-queue-protection {", 1)[1]
+    assert ".src-chip.registered { border-color: #e4c98e; background: #fff8e8; color: #6b4a11; }" in css
+    assert ".status-danger { background: #fbeae8; border-color: #e5b5b0; color: var(--danger); }" in css
+    assert ".status-unknown { background: var(--surface-soft); border: 1px dashed var(--muted); color: var(--muted); }" in css
+    assert ".lp-queue-protection .status-pill { font-size: 11px; min-height: 20px; padding: 0 6px; }" in css
