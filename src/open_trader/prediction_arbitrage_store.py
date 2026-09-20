@@ -34,6 +34,7 @@ _LLM_USAGE_RETENTION = timedelta(days=7)
 _PREVIEW_TTL = timedelta(seconds=10)
 _LP_BOOK_SAMPLE_RETENTION = timedelta(minutes=65)
 _LP_PRICE_HISTORY_VALIDITY = timedelta(hours=24)
+_LP_PREPARATION_RETRY_DELAYS_SECONDS = (300, 600, 1200, 1800, 1800)
 _CROSS_AUTO_DAILY_PRINCIPAL_CAP = Decimal("100")
 _CROSS_AUTO_MODES = frozenset({"observe_only", "manual_confirm", "auto_submit"})
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -3783,7 +3784,13 @@ class PredictionArbitrageStore:
             state = "paused" if paused else "waiting_retry"
             next_retry_at = None
             if not paused:
-                retry_deadline = _parse_timestamp(failed) + timedelta(seconds=300)
+                delay_index = min(
+                    max(previous_count, 0),
+                    len(_LP_PREPARATION_RETRY_DELAYS_SECONDS) - 1,
+                )
+                retry_deadline = _parse_timestamp(failed) + timedelta(
+                    seconds=_LP_PREPARATION_RETRY_DELAYS_SECONDS[delay_index]
+                )
                 if (
                     isinstance(retry_after_seconds, (int, float))
                     and not isinstance(retry_after_seconds, bool)

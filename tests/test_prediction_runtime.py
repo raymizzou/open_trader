@@ -774,7 +774,15 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
         assert warm_restart_started_at <= restarted_attempt_at <= (
             warm_restart_started_at + timedelta(seconds=2)
         )
+        dashboard_deadline = time.monotonic() + 3
         restarted_dashboard = restarted.execution.lp_dashboard()  # type: ignore[union-attr]
+        while (
+            restarted_dashboard.get("state") != "ready"
+            and time.monotonic() < dashboard_deadline
+        ):
+            time.sleep(0.01)
+            restarted_dashboard = restarted.execution.lp_dashboard()  # type: ignore[union-attr]
+        assert restarted_dashboard["state"] == "ready"
         assert restarted.solver_server is None
         assert restarted.relation_catalog is None
         assert restarted.live_resolver is None

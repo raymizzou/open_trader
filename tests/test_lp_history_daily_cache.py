@@ -487,7 +487,7 @@ def test_daily_history_failure_preserves_cache_and_per_market_budget(
         PredictionArbitrageStore(data_dir), exchange, clock=lambda: current[0]
     )
     refreshed = next_day.refresh_price_history()
-    assert refreshed["request_count"] == 1
+    assert refreshed["request_count"] == 2
     assert exchange.history_calls[-1] == ("token-a", "token-c")
     updated_a = next_day.store.lp_price_history_summary(
         "condition-a", "token-a", now=current[0]
@@ -497,4 +497,4 @@ def test_daily_history_failure_preserves_cache_and_per_market_budget(
     )
     assert updated_a is not None and updated_a["checked_at"] == "2026-09-19T01:00:00.000000Z"
     assert updated_c is not None and updated_c["state"] == "known"
-    assert exchange.history_calls.count(("token-b",)) == 2
+    assert exchange.history_calls.count(("token-b",)) == 3

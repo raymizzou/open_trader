@@ -166,6 +166,173 @@ def test_transient_outage_recovers_after_more_than_two_failures(tmp_path) -> Non
     assert candidate["stale"] is True
 
 
+def test_failed_market_full_reads_keep_exponential_backoff_across_restart(
+    tmp_path,
+) -> None:
+    """A market's full-read budget survives probes and service reconstruction."""
+
+    clock = [datetime(2026, 9, 20, 5, 0, tzinfo=UTC)]
+    history_calls: list[tuple[str, ...]] = []
+    probe_calls: list[tuple[str, ...]] = []
+    failed_full_reads = 0
+    fail_market = True
+
+    def market(condition_id: str, token_id: str) -> dict[str, object]:
+        return {
+            "market_id": f"market-{condition_id.removeprefix('condition-')}",
+            "condition_id": condition_id,
+            "accepting_orders": True,
+            "daily_pool_usd": Decimal("100"),
+            "reward_active": True,
+            "outcomes": {"yes": {"label": "YES", "token_id": token_id}},
+        }
+
+    class Exchange:
+        def lp_preparation_probe(
+            self,
+            *,
+            stop_event: object = None,
+            stage: str | None = None,
+            condition_ids: tuple[str, ...] = (),
+        ) -> dict[str, object]:
+            del stop_event, stage
+            probe_calls.append(tuple(condition_ids))
+            return {
+                "state": "unknown",
+                "complete": False,
+                "checked_at": clock[0],
+            }
+
+        def lp_reward_catalog(
+            self, *, stop_event: object = None
+        ) -> dict[str, object]:
+            del stop_event
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": clock[0],
+                "markets": [
+                    market("condition-healthy", "token-healthy"),
+                    market("condition-failed", "token-failed"),
+                ],
+            }
+
+        def lp_market_metadata(
+            self,
+            condition_ids: tuple[str, ...],
+            *,
+            stop_event: object = None,
+        ) -> dict[str, dict[str, object]]:
+            del stop_event
+            return {
+                condition_id: market(
+                    condition_id,
+                    "token-healthy"
+                    if condition_id == "condition-healthy"
+                    else "token-failed",
+                )
+                for condition_id in condition_ids
+            }
+
+        def lp_price_history(
+            self,
+            token_ids: tuple[str, ...],
+            *,
+            start_ts: int,
+            end_ts: int,
+            fidelity: int,
+            stop_event: object = None,
+        ) -> dict[str, object]:
+            del fidelity, stop_event
+            nonlocal failed_full_reads, fail_market
+            history_calls.append(tuple(token_ids))
+            if "token-failed" in token_ids and fail_market:
+                failed_full_reads += 1
+                if "token-healthy" in token_ids:
+                    return {
+                        "state": "partial",
+                        "history": {
+                            "token-healthy": [
+                                {"t": start_ts, "p": "0.40"},
+                                {"t": end_ts, "p": "0.41"},
+                            ]
+                        },
+                        "errors": {"token-failed": "TimeoutError"},
+                    }
+                raise TimeoutError("temporary history transport interruption")
+            return {
+                "state": "known",
+                "history": {
+                    token_id: [
+                        {"t": start_ts, "p": "0.40"},
+                        {"t": end_ts, "p": "0.41"},
+                    ]
+                    for token_id in token_ids
+                },
+                "errors": {},
+            }
+
+    store = PredictionArbitrageStore(tmp_path)
+    exchange = Exchange()
+    service = PolymarketLPService(store, exchange, clock=lambda: clock[0])
+    first = service.refresh_price_history()
+    assert first["preparation_outcome"] == "failure"
+    healthy_before = store.lp_price_history_summary(
+        "condition-healthy", "token-healthy", now=clock[0]
+    )
+    assert healthy_before is not None
+    assert failed_full_reads == 1
+    first_item = store.lp_preparation_items()[0]
+    assert first_item["failure_count"] == 1
+    assert first_item["next_retry_at"] == (
+        (clock[0] + timedelta(seconds=300))
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+
+    retry_delays = (300, 600, 1200, 1800, 1800)
+    for failure_index, delay in enumerate(retry_delays[1:], start=1):
+        item = store.lp_preparation_items()[0]
+        due = datetime.fromisoformat(str(item["next_retry_at"]).replace("Z", "+00:00"))
+        clock[0] = due - timedelta(seconds=1)
+        before = failed_full_reads
+        waiting = service.refresh_price_history()
+        assert waiting["preparation_outcome"] == "waiting_retry"
+        assert failed_full_reads == before
+
+        clock[0] = due
+        result = service.refresh_price_history()
+        assert result["preparation_outcome"] == "failure"
+        assert failed_full_reads == failure_index + 1
+        item = store.lp_preparation_items()[0]
+        expected_due = clock[0] + timedelta(seconds=delay)
+        assert item["failure_count"] == failure_index + 1
+        assert item["next_retry_at"] == expected_due.isoformat(
+            timespec="microseconds"
+        ).replace("+00:00", "Z")
+
+        if failure_index == 1:
+            store = PredictionArbitrageStore(tmp_path)
+            service = PolymarketLPService(store, exchange, clock=lambda: clock[0])
+            rebuilt = store.lp_preparation_items()[0]
+            assert rebuilt["next_retry_at"] == item["next_retry_at"]
+
+    item = store.lp_preparation_items()[0]
+    final_due = datetime.fromisoformat(str(item["next_retry_at"]).replace("Z", "+00:00"))
+    clock[0] = final_due
+    fail_market = False
+    recovered = service.refresh_price_history()
+    assert recovered["preparation_outcome"] == "success"
+    assert store.lp_preparation_items() == []
+    assert store.lp_price_history_summary(
+        "condition-healthy", "token-healthy", now=clock[0]
+    ) == healthy_before
+    assert store.lp_price_history_summary(
+        "condition-failed", "token-failed", now=clock[0]
+    )["state"] == "known"
+    assert probe_calls
+
+
 @pytest.mark.parametrize(
     ("retry_after_header", "expected_delay"),
     [

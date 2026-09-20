@@ -10,6 +10,7 @@ import shlex
 from pathlib import Path
 import signal
 import socket
+import ssl
 import sqlite3
 import stat
 import subprocess
@@ -7338,7 +7339,8 @@ def test_lp_returned_history_errors_obey_preparation_retry_budget(
     clock["now"] = started_at + timedelta(seconds=299)
     before_retry = service.refresh_price_history()
     assert before_retry["preparation_outcome"] == "waiting_retry"
-    assert len(requests) == 5
+    assert len(requests) == 6
+    assert requests[-1] == ("scale-00-yes", "scale-00-no")
 
     clock["now"] = started_at + timedelta(seconds=300)
     second = service.refresh_price_history()
@@ -7350,7 +7352,7 @@ def test_lp_returned_history_errors_obey_preparation_retry_budget(
     assert second_preparation["paused"] is False
     assert second_preparation["attempt"] == 0
     assert second_preparation["failure_count"] == 0
-    assert len(requests) == 6
+    assert len(requests) == 7
     assert set(requests[-1]) == failed_direction_ids
     assert len(requests[-1]) == 20
     all_direction_ids = {
@@ -7360,16 +7362,28 @@ def test_lp_returned_history_errors_obey_preparation_retry_budget(
     }
     assert all(
         sum(direction in batch for batch in requests)
-        == (2 if direction in failed_direction_ids else 1)
+        == (
+            3
+            if direction in {"scale-00-yes", "scale-00-no"}
+            else 2
+            if direction in failed_direction_ids
+            else 1
+        )
         for direction in all_direction_ids
     )
-    paused_items = store.lp_preparation_items()
-    assert {item["condition_id"] for item in paused_items} == failed_condition_ids
-    assert all(item["state"] == "paused" for item in paused_items)
-    assert all(item["paused"] is True for item in paused_items)
-    assert all(item["retry_used"] is True for item in paused_items)
-    assert all(item["failure_count"] == 2 for item in paused_items)
-    assert all(item["next_retry_at"] is None for item in paused_items)
+    waiting_items = store.lp_preparation_items()
+    assert {item["condition_id"] for item in waiting_items} == failed_condition_ids
+    assert all(item["state"] == "waiting_retry" for item in waiting_items)
+    assert all(item["paused"] is False for item in waiting_items)
+    assert all(item["retry_used"] is False for item in waiting_items)
+    assert all(item["failure_count"] == 2 for item in waiting_items)
+    assert all(
+        item["next_retry_at"]
+        == (started_at + timedelta(seconds=900))
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+        for item in waiting_items
+    )
     assert second.get("alert_pending") is True
 
     clock["now"] = started_at + timedelta(hours=1)
@@ -7377,13 +7391,13 @@ def test_lp_returned_history_errors_obey_preparation_retry_budget(
     assert paused["preparation"]["state"] == "partial"
     assert paused["preparation"]["paused"] is False
     assert paused.get("alert_pending") is not True
-    assert len(requests) == 6
+    assert len(requests) == 8
     rebuilt = PolymarketLPService(store, trading, clock=lambda: clock["now"])
     rebuilt_paused = rebuilt.refresh_price_history()
     assert rebuilt_paused["preparation"]["state"] == "partial"
     assert rebuilt_paused["preparation"]["paused"] is False
     assert rebuilt_paused.get("alert_pending") is not True
-    assert len(requests) == 6
+    assert len(requests) == 8
 
     short_clock, _short_state, _short_store, short_trading, short_service = (
         _lp_adapter_service_fixture(
@@ -7403,16 +7417,26 @@ def test_lp_returned_history_errors_obey_preparation_retry_budget(
 
     setattr(short_trading, "_urlopen_fn", open_short_history)
     short_result = short_service.refresh_price_history()
-    assert short_result["state"] == "unknown"
-    assert short_result["preparation_outcome"] == "success"
+    assert short_result["state"] == "partial"
+    assert short_result["preparation_outcome"] == "waiting_retry"
     assert short_result["unknown_count"] == 82
     assert short_result["request_count"] == 5
     short_preparation = short_result["preparation"]
     assert isinstance(short_preparation, Mapping)
-    assert short_preparation["state"] == "ready"
+    assert short_preparation["state"] == "partial"
+    assert short_preparation["paused"] is False
     assert short_preparation["failure_count"] == 0
+    assert short_preparation["next_retry_at"] == (
+        (short_clock["now"] + timedelta(seconds=300))
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
     assert len(short_requests) == 5
     assert sum(len(batch) for batch in short_requests) == 82
+    short_items = _short_store.lp_preparation_items()
+    assert len(short_items) == 41
+    assert all(item["state"] == "waiting_retry" for item in short_items)
+    assert all(item["paused"] is False for item in short_items)
 
 
 def test_lp_empty_preparation_clears_previous_selected_results(tmp_path: Path) -> None:
@@ -12713,6 +12737,7 @@ def test_lp_dashboard_reports_preparation_and_manual_recovery(
 
     class Trading:
         fail_catalog = True
+        catalog_error = "TimeoutError"
 
         def attach_metadata_cache(self, _store: object) -> None:
             pass
@@ -12737,6 +12762,8 @@ def test_lp_dashboard_reports_preparation_and_manual_recovery(
                     catalog_started.set()
                     assert catalog_release.wait(timeout=5)
                 clock[0] += timedelta(seconds=75)
+                if self.catalog_error == "certificate_error":
+                    raise ssl.SSLCertVerificationError("catalog certificate invalid")
                 raise TimeoutError("catalog body unavailable")
             recovered.set()
             return {
@@ -12856,12 +12883,32 @@ def test_lp_dashboard_reports_preparation_and_manual_recovery(
     monkeypatch.setattr(runtime_module, "_LP_SHARE_WATCH_SECONDS", 3600)
 
     def history_wait(stop_event: threading.Event, seconds: float) -> bool:
-        if seconds == 300:
+        if seconds in {60, 300}:
+            runtime = runtime_holder[0] if runtime_holder else None
+            lp = getattr(runtime, "lp", None)
+            preparation_snapshot = getattr(lp, "preparation_snapshot", None)
+            preparation = (
+                preparation_snapshot() if callable(preparation_snapshot) else {}
+            )
+            if (
+                trading.fail_catalog
+                and trading.catalog_error == "certificate_error"
+                and isinstance(preparation, Mapping)
+                and preparation.get("state") == "paused"
+            ):
+                paused_waiting.set()
+                while not stop_event.is_set():
+                    wake = getattr(runtime, "_history_wakeup_event", None)
+                    if wake is not None and wake.wait(timeout=0.01):
+                        wake.clear()
+                        return False
+                return True
             retry_waiting.set()
             while not retry_release.wait(timeout=0.01):
                 if stop_event.is_set():
                     return True
-            clock[0] += timedelta(seconds=300)
+            retry_release.clear()
+            clock[0] += timedelta(seconds=seconds)
             return False
         if seconds >= 3600:
             if trading.fail_catalog:
@@ -12957,18 +13004,43 @@ def test_lp_dashboard_reports_preparation_and_manual_recovery(
             )
             assert missing_csrf_status == 403
 
+            def release_retry_probe() -> None:
+                retry_waiting.clear()
+                retry_release.set()
+                assert retry_waiting.wait(timeout=2)
+
+            for _ in range(4):
+                release_retry_probe()
+
+            trading.catalog_error = "certificate_error"
+            retry_waiting.clear()
             retry_release.set()
             assert paused_waiting.wait(timeout=2)
             # Issue #146: refresh the background snapshot before serving.
-            runtime.execution.refresh_lp_dashboard_snapshot()
-            paused_status, paused = _response(
-                base + "/api/prediction-arbitrage/lp/dashboard"
-            )
+            pause_deadline = time.monotonic() + 2
+            while True:
+                runtime.execution.refresh_lp_dashboard_snapshot()
+                paused_status, paused = _response(
+                    base + "/api/prediction-arbitrage/lp/dashboard"
+                )
+                if (
+                    paused_status == 200
+                    and paused["preparation"]["state"] == "paused"
+                    and len(notifications) == 1
+                ):
+                    break
+                if time.monotonic() >= pause_deadline:
+                    raise AssertionError("paused LP dashboard state was not published")
+                time.sleep(0.01)
             assert paused_status == 200
             assert paused["preparation"]["state"] == "paused"
             assert paused["preparation"]["failure_count"] == 2
-            assert paused["preparation"]["last_error"] == "TimeoutError"
+            assert paused["preparation"]["last_error"] == "SSLCertVerificationError"
             assert len(notifications) == 1
+            expected_recovery_at = clock[0]
+            assert expected_recovery_at == datetime(
+                2026, 9, 18, 12, 7, 30, tzinfo=UTC
+            )
             state_status, _ = _response(
                 base + "/api/prediction-arbitrage/state"
             )
@@ -12994,7 +13066,11 @@ def test_lp_dashboard_reports_preparation_and_manual_recovery(
             assert ready_status == 200
             assert ready["preparation"]["state"] == "ready"
             assert ready["preparation"]["stage"] == "complete"
-            assert ready["preparation"]["last_success_at"] == "2026-09-18T12:07:30.000000Z"
+            assert ready["preparation"]["last_success_at"] == (
+                expected_recovery_at.isoformat(timespec="microseconds").replace(
+                    "+00:00", "Z"
+                )
+            )
             assert ready["preparation"]["total_count"] == 0
             assert ready["recommendations"] == []
             assert ready["selected_results"] == []

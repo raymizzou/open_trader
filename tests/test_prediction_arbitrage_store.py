@@ -3280,10 +3280,11 @@ def test_lp_recovery_fences_only_recovered_condition(tmp_path: Path) -> None:
         for item in db.lp_preparation_items()
         if item["condition_id"] == "condition-c"
     )
+    c_retry_at = failed_at + timedelta(seconds=600)
     assert c_item["generation"] == 1
     assert c_item["state"] == "waiting_retry"
     assert c_item["failed_at"] == iso(failed_at)
-    assert c_item["next_retry_at"] == iso(retry_at)
+    assert c_item["next_retry_at"] == iso(c_retry_at)
 
     c_checked_at = failed_at + timedelta(seconds=301)
     c_window_start = failed_at - timedelta(hours=24)
@@ -3326,9 +3327,9 @@ def test_lp_recovery_fences_only_recovered_condition(tmp_path: Path) -> None:
     )
     assert c_after_success["generation"] == 1
     assert c_after_success["failed_at"] == iso(failed_at)
-    assert c_after_success["next_retry_at"] == iso(retry_at)
+    assert c_after_success["next_retry_at"] == iso(c_retry_at)
     claimed = db.lp_claim_preparation_retries(
-        now=retry_at,
+        now=c_retry_at,
         condition_ids=["condition-c"],
     )
     assert [item["condition_id"] for item in claimed] == ["condition-c"]

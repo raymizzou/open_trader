@@ -380,16 +380,23 @@ def test_partial_metadata_keeps_successful_markets_screenable(
     assert exchange.history_calls == [("token-a", "token-c"), ("token-b",)]
     paused = db.lp_preparation_items()
     assert [item["condition_id"] for item in paused] == ["condition-b"]
-    assert paused[0]["paused"] is True
+    assert paused[0]["state"] == "waiting_retry"
+    assert paused[0]["paused"] is False
+    assert paused[0]["retry_used"] is False
+    assert paused[0]["next_retry_at"] == (
+        (T + timedelta(seconds=900))
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
 
     include_d[0] = True
     current[0] = T + timedelta(hours=1)
     third = service.refresh_price_history()
-    assert third["request_count"] == 1
+    assert third["request_count"] == 2
     assert exchange.history_calls[-1] == ("token-d",)
     d_summary = db.lp_price_history_summary("condition-d", "token-d", now=current[0])
     assert d_summary is not None and d_summary["state"] == "known"
-    assert exchange.history_calls.count(("token-b",)) == 1
+    assert exchange.history_calls.count(("token-b",)) == 2
 
 
 @pytest.mark.parametrize("reader_kind", ("batch", "direct"))
@@ -1104,11 +1111,12 @@ def test_catalog_failure_does_not_spend_market_retry(tmp_path: Path) -> None:
         retried = service.refresh_price_history()
         assert retried["preparation_outcome"] in {"failure", "success"}
         assert history_calls.count(("token-b",)) == 1
-        paused_item = next(
+        waiting_item = next(
             item for item in store.lp_preparation_items() if item["condition_id"] == "condition-b"
         )
-        assert paused_item["paused"] is True
-        assert paused_item["retry_used"] is True
+        assert waiting_item["state"] == "waiting_retry"
+        assert waiting_item["paused"] is False
+        assert waiting_item["retry_used"] is False
 
         restarted = PolymarketLPService(
             PredictionArbitrageStore(tmp_path / case_name), exchange, clock=lambda: current[0]
@@ -1227,6 +1235,11 @@ def test_waiting_history_retry_dispatches_during_later_backfill(
     catalog_ids.extend(f"condition-a-{index:03d}" for index in range(161))
     current[0] = T + timedelta(seconds=299)
     result = service.refresh_price_history()
+    assert result["preparation_outcome"] == "waiting_retry"
+    assert history_calls == [("token-b",)]
+
+    current[0] = T + timedelta(seconds=300)
+    result = service.refresh_price_history()
     assert result["preparation_outcome"] == "failure"
     assert result["target_count"] == 162
     assert result["preparation"]["total_count"] == 162
@@ -1235,15 +1248,18 @@ def test_waiting_history_retry_dispatches_during_later_backfill(
     assert history_calls.count(("token-b",)) == 2
     assert b_retry_times == [T + timedelta(seconds=300)]
     retry_index = history_calls.index(("token-b",), 1)
-    final_a_index = history_calls.index(
-        tuple(f"token-a-{index:03d}" for index in range(160, 161))
+    final_a_index = next(
+        index
+        for index, batch in enumerate(history_calls)
+        if "token-a-160" in batch
     )
     assert retry_index < final_a_index
     paused = store.lp_preparation_items()
     assert len(paused) == 1
     assert paused[0]["condition_id"] == "condition-b"
-    assert paused[0]["paused"] is True
-    assert paused[0]["retry_used"] is True
+    assert paused[0]["state"] == "waiting_retry"
+    assert paused[0]["paused"] is False
+    assert paused[0]["retry_used"] is False
 
 
 def test_preparation_can_publish_valid_results_before_slow_batch_finishes(
@@ -1695,20 +1711,22 @@ def test_partial_retry_pauses_only_failed_items_across_restart(tmp_path: Path) -
     current[0] = T + timedelta(seconds=299)
     before_due = service.refresh_price_history()
     assert before_due["preparation_outcome"] in {"success", "failure", "waiting_retry"}
-    assert history_calls[-1] == ("token-d",)
-    assert "token-b" not in history_calls[-1]
+    assert before_due["preparation_outcome"] == "waiting_retry"
+    assert history_calls == [("token-a", "token-b", "token-c")]
 
     current[0] = T + timedelta(seconds=300)
     second = service.refresh_price_history()
     assert second["preparation_outcome"] == "failure"
     assert history_calls == [
         ("token-a", "token-b", "token-c"),
-        ("token-d",),
         ("token-b",),
+        ("token-d",),
     ]
     paused = store.lp_preparation_items()
     assert [item["condition_id"] for item in paused] == ["condition-b"]
-    assert paused[0]["paused"] is True
+    assert paused[0]["state"] == "waiting_retry"
+    assert paused[0]["paused"] is False
+    assert paused[0]["retry_used"] is False
     assert store.lp_price_history_summary("condition-d", "token-d", now=current[0]) is not None
     assert store.lp_price_history_summary("condition-a", "token-a", now=current[0]) == a_before
     assert store.lp_price_history_summary("condition-c", "token-c", now=current[0]) == c_before
@@ -1794,9 +1812,12 @@ def test_partial_retry_pauses_only_failed_items_across_restart(tmp_path: Path) -
     assert a_after_restart is not None and c_after_restart is not None
 
     allow_b_success[0] = True
-    recovered = restarted.recover_preparation()
-    assert recovered["recovered_condition_ids"] == ["condition-b"]
-    assert restarted.store.lp_preparation_items() == []
+    waiting_b = restarted.store.lp_preparation_items()
+    assert [item["condition_id"] for item in waiting_b] == ["condition-b"]
+    retry_at = datetime.fromisoformat(
+        str(waiting_b[0]["next_retry_at"]).replace("Z", "+00:00")
+    )
+    current[0] = max(current[0], retry_at)
     recovered_result = restarted.refresh_price_history()
     assert recovered_result["preparation_outcome"] == "success"
     assert history_calls[-1] == ("token-b",)
@@ -1823,7 +1844,8 @@ def test_partial_retry_pauses_only_failed_items_across_restart(tmp_path: Path) -
     stale_service.refresh_price_history()
     current[0] = T + timedelta(seconds=300)
     stale_service.refresh_price_history()
-    assert stale_store.lp_preparation_items()[0]["paused"] is True
+    assert stale_store.lp_preparation_items()[0]["state"] == "waiting_retry"
+    assert stale_store.lp_preparation_items()[0]["paused"] is False
 
     current[0] = T + timedelta(hours=25)
     stale_block[0] = True
@@ -1835,19 +1857,51 @@ def test_partial_retry_pauses_only_failed_items_across_restart(tmp_path: Path) -
     stale_thread = threading.Thread(target=stale_refresh)
     stale_thread.start()
     assert stale_started.wait(timeout=2)
-    allow_b_success[0] = True
     stale_recovered = stale_service.recover_preparation()
-    assert stale_recovered["recovered_condition_ids"] == ["condition-b"]
-    assert stale_store.lp_preparation_items() == []
+    assert stale_recovered["recovered_condition_ids"] == []
+    live_item = stale_store.lp_preparation_items()[0]
+    assert live_item["state"] == "retrying"
+    assert live_item["paused"] is False
     stale_release.set()
     stale_thread.join(timeout=3)
     assert not stale_thread.is_alive()
     assert stale_result["preparation_outcome"] in {"success", "failure", "waiting_retry"}
-    stale_count = len(stale_history_calls)
-    assert all("token-b" not in call for call in stale_history_calls[2:stale_count])
+    old_item = stale_store.lp_preparation_items()[0]
+    assert old_item["state"] == "waiting_retry"
+    old_generation = int(old_item["generation"])
+    allow_b_success[0] = True
+    assert stale_store.lp_recover_preparation_items(
+        ["condition-b"]
+    ) == [{"condition_id": "condition-b", "recovered": True}]
+    replacement = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path / "stale"),
+        Exchange(stale_history_calls),
+        clock=lambda: current[0],
+    )
+    recovered_result = replacement.refresh_price_history()
+    assert recovered_result["preparation_outcome"] == "success"
+    new_summary = replacement.store.lp_price_history_summary(
+        "condition-b", "token-b", now=current[0]
+    )
+    assert new_summary is not None and new_summary["state"] == "known"
+    stale_write = replacement.store.lp_save_price_history_batch(
+        (
+            {
+                "condition_id": "condition-b",
+                "token_id": "token-b",
+                "samples": [],
+                "summary": {"state": "known", "checked_at": current[0]},
+            },
+        ),
+        generation=old_generation,
+    )
+    assert stale_write == 0
+    assert replacement.store.lp_price_history_summary(
+        "condition-b", "token-b", now=current[0]
+    ) == new_summary
 
     stale_block[0] = False
-    follow_up = stale_service.refresh_price_history()
+    follow_up = replacement.refresh_price_history()
     assert follow_up["preparation_outcome"] in {"success", "failure"}
     assert any("token-b" in call for call in stale_history_calls[2:])
 
@@ -2027,21 +2081,25 @@ def test_failed_group_does_not_block_other_items_or_duplicate_retry_alerts(
         PredictionArbitrageStore(tmp_path / "data"), Exchange(), clock=lambda: current[0]
     )
     in_flight_restart = restarted_in_flight.refresh_price_history()
-    assert in_flight_restart["preparation_outcome"] != "paused"
+    assert in_flight_restart["preparation_outcome"] == "busy"
+    assert in_flight_restart["alert_pending"] is True
+    assert in_flight_restart["preparation"]["fault_alert_state"] == "claimed"
     assert len(history_calls) == in_flight_call_count
     release_retry.set()
     worker.join(timeout=3)
     assert not worker.is_alive()
     assert len(history_calls) == 9
-    paused = store.lp_preparation_items()
-    assert len(paused) == 80
-    assert all(item["paused"] is True for item in paused)
-    assert all(item["retry_used"] is True for item in paused)
+    waiting = store.lp_preparation_items()
+    assert len(waiting) == 80
+    assert all(item["state"] == "waiting_retry" for item in waiting)
+    assert all(item["paused"] is False for item in waiting)
+    assert all(item["retry_used"] is False for item in waiting)
     retry_result = result_holder[0]
-    assert retry_result["alert_pending"] is True
-    preparation = retry_result["preparation"]
-    assert preparation["paused_market_count"] == 80
-    assert preparation["paused_error_samples"]
+    assert retry_result.get("alert_pending") is not True
+    preparation = in_flight_restart["preparation"]
+    assert preparation["fault_alert_state"] == "claimed"
+    assert preparation["paused_market_count"] == 0
+    assert "alert_condition_ids" not in preparation
 
     class Feishu:
         channel = "feishu"
@@ -2062,9 +2120,8 @@ def test_failed_group_does_not_block_other_items_or_duplicate_retry_alerts(
     notification = execution.notify_lp_preparation_failure(preparation)
     assert notification["state"] == "failed"
     assert len(notifications) == 1
-    assert "部分标的补全暂停" in notifications[0][1]
-    assert "80" in notifications[0][1]
-    assert notifications[0][1].count("condition-") <= 5
+    assert "自动探测并按退避继续补全" in notifications[0][1]
+    assert "condition-" not in notifications[0][1]
     finished = service.finish_preparation_alert(
         generation=int(preparation["generation"]), success=False
     )
@@ -2263,48 +2320,48 @@ def test_market_retry_budget_is_shared_across_preparation_stages(
 
     current[0] = T + timedelta(seconds=299)
     assert service.refresh_price_history()["preparation_outcome"] == "waiting_retry"
-    assert metadata_calls == [
-        ("condition-b", "condition-c"),
-        ("condition-c",),
-    ]
+    assert metadata_calls == [("condition-b", "condition-c")]
     current[0] = T + timedelta(seconds=300)
     second = service.refresh_price_history()
     assert second["preparation_outcome"] == "failure"
     assert second["alert_pending"] is True
-    assert second["preparation"]["paused_market_count"] == 1
-    assert second["preparation"]["alert_condition_count"] == 1
-    assert second["preparation"]["alert_condition_ids"] == ["condition-b"]
+    assert second["preparation"]["fault_alert_state"] == "claimed"
+    assert second["preparation"]["fault_started_at"] == (
+        T.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    )
+    assert second["preparation"]["last_success_at"] is None
+    assert second["preparation"]["paused_market_count"] == 0
+    assert "alert_condition_ids" not in second["preparation"]
     assert metadata_calls == [
         ("condition-b", "condition-c"),
-        ("condition-c",),
         ("condition-b", "condition-c"),
     ]
     assert history_calls == [("token-c",), ("token-b", "token-b-no")]
-    paused = store.lp_preparation_items()
-    assert [item["condition_id"] for item in paused] == ["condition-b"]
-    assert paused[0]["paused"] is True
-    assert paused[0]["retry_used"] is True
-    finished = service.finish_preparation_alert(
-        generation=int(second["preparation"]["generation"]), success=False
-    )
-    assert finished is not None
+    waiting = store.lp_preparation_items()
+    assert [item["condition_id"] for item in waiting] == ["condition-b"]
+    assert waiting[0]["state"] == "waiting_retry"
+    assert waiting[0]["paused"] is False
+    assert waiting[0]["retry_used"] is False
 
     current[0] = T + timedelta(hours=23)
     restarted = PolymarketLPService(
         PredictionArbitrageStore(tmp_path / "data"), Exchange(), clock=lambda: current[0]
     )
     third = restarted.refresh_price_history()
-    assert third["preparation_outcome"] == "success"
+    assert third["preparation_outcome"] == "failure"
     assert third["preparation"]["state"] == "partial"
-    assert metadata_calls == [
+    assert metadata_calls[:2] == [
         ("condition-b", "condition-c"),
-        ("condition-c",),
         ("condition-b", "condition-c"),
-        ("condition-c",),
     ]
-    assert all("condition-b" not in call for call in metadata_calls[3:])
-    assert all("token-b" not in call for call in history_calls[2:])
-    assert len(history_calls) == 2
+    assert metadata_calls[-1] == ("condition-b", "condition-c")
+    assert history_calls[0] == ("token-c",)
+    assert history_calls.count(("token-b", "token-b-no")) == 2
+    assert len(history_calls) == 3
+    waiting = restarted.store.lp_preparation_items()
+    assert waiting[0]["state"] == "waiting_retry"
+    assert waiting[0]["paused"] is False
+    assert waiting[0]["retry_used"] is False
     candidate = restarted.refresh_candidates(force=True)
     assert "condition-c" in {
         row["condition_id"] for row in candidate["candidates"]
@@ -2319,7 +2376,7 @@ def test_market_retry_budget_is_shared_across_preparation_stages(
 def test_legacy_paused_history_migrates_only_identified_failed_markets(
     tmp_path: Path,
 ) -> None:
-    current = [T + timedelta(hours=1)]
+    current = [T + timedelta(seconds=299)]
     old_attempt = T
     history_calls: list[tuple[str, ...]] = []
     metadata_calls: list[tuple[str, ...]] = []
@@ -2481,43 +2538,35 @@ def test_legacy_paused_history_migrates_only_identified_failed_markets(
     first = service.refresh_price_history()
     assert first["preparation_outcome"] in {"success", "waiting_retry"}
     assert first.get("alert_pending") is not True
-    assert history_calls == [("token-c",)]
-    assert metadata_calls == [("condition-a", "condition-c")]
+    assert history_calls == []
+    assert metadata_calls == []
     items = store.lp_preparation_items()
     assert [item["condition_id"] for item in items] == ["condition-b"]
-    assert items[0]["paused"] is True
-    assert items[0]["retry_used"] is True
+    assert items[0]["state"] == "waiting_retry"
+    assert items[0]["paused"] is False
+    assert items[0]["retry_used"] is False
     assert items[0]["alert_attempted"] is True
     assert items[0]["alert_state"] == "sent"
     preparation = service.preparation_snapshot()
     assert preparation["paused"] is False
     assert preparation["state"] == "partial"
-    assert preparation["paused_market_count"] == 1
+    assert preparation["paused_market_count"] == 0
 
     reopened = PolymarketLPService(
         PredictionArbitrageStore(tmp_path / "data"), exchange, clock=lambda: current[0]
     )
     reopened_result = reopened.refresh_price_history()
-    assert reopened_result["preparation_outcome"] == "success"
-    assert history_calls == [("token-c",)]
-    assert all("token-b" not in call for call in metadata_calls)
-    assert reopened.preparation_snapshot()["paused_market_count"] == 1
+    assert reopened_result["preparation_outcome"] == "waiting_retry"
+    assert history_calls == []
+    assert metadata_calls == []
+    assert reopened.preparation_snapshot()["paused_market_count"] == 0
 
-    current[0] = T + timedelta(hours=25)
+    current[0] = T + timedelta(seconds=300)
+    allow_b[0] = True
     expired_result = reopened.refresh_price_history()
     assert expired_result["preparation_outcome"] == "success"
-    assert history_calls[-1] == ("token-a", "token-c")
-    assert all("token-b" not in call for call in history_calls)
-    assert metadata_calls[-1] == ("condition-a", "condition-c")
-    assert reopened.preparation_snapshot()["paused_market_count"] == 1
-
-    recovered = reopened.recover_preparation()
-    assert recovered["recovered_condition_ids"] == ["condition-b"]
+    assert any("token-b" in call for call in history_calls)
     assert store.lp_preparation_items() == []
-    allow_b[0] = True
-    recovered_result = reopened.refresh_price_history()
-    assert recovered_result["preparation_outcome"] == "success"
-    assert history_calls[-1] == ("token-b",)
     assert reopened.store.lp_price_history_summary(
         "condition-b", "token-b", now=current[0]
     )["state"] == "known"
@@ -2624,7 +2673,8 @@ def test_new_preparation_alert_excludes_previously_notified_markets(
     current[0] = T + timedelta(seconds=300)
     old_retry = service.refresh_price_history()
     assert old_retry["alert_pending"] is True
-    assert old_retry["preparation"]["alert_condition_ids"] == ["condition-old"]
+    assert old_retry["preparation"]["fault_alert_state"] == "claimed"
+    assert "alert_condition_ids" not in old_retry["preparation"]
 
     class Feishu:
         channel = "feishu"
@@ -2649,29 +2699,33 @@ def test_new_preparation_alert_excludes_previously_notified_markets(
     condition_ids.append("condition-new")
     current[0] = T + timedelta(seconds=301)
     new_initial = service.refresh_price_history()
-    assert new_initial["preparation_outcome"] == "failure"
-    assert history_calls[-1] == ("token-new",)
+    assert new_initial["preparation_outcome"] == "waiting_retry"
+    assert history_calls == [("token-old",), ("token-old",)]
+    assert {item["condition_id"] for item in store.lp_preparation_items()} == {
+        "condition-old"
+    }
 
     current[0] = T + timedelta(seconds=601)
+    before_due = service.refresh_price_history()
+    assert before_due["preparation_outcome"] == "waiting_retry"
+    assert history_calls == [("token-old",), ("token-old",)]
+    assert len(notifications) == 1
+
+    current[0] = T + timedelta(seconds=900)
     new_retry = service.refresh_price_history()
-    assert new_retry["alert_pending"] is True
-    assert new_retry["preparation"]["alert_condition_count"] == 1
-    assert new_retry["preparation"]["alert_condition_ids"] == ["condition-new"]
-    assert new_retry["preparation"]["paused_market_count"] == 2
-    assert execution.notify_lp_preparation_failure(new_retry["preparation"])["state"] == "sent"
-    assert len(notifications) == 2
-    assert "condition-new" in notifications[1]
-    assert "condition-old" not in notifications[1]
-    assert service.finish_preparation_alert(
-        generation=int(new_retry["preparation"]["generation"]), success=True
-    ) is not None
+    assert new_retry["preparation_outcome"] == "failure"
+    assert new_retry.get("alert_pending") is not True
+    assert new_retry["preparation"]["fault_alert_state"] == "sent"
+    assert any(call == ("token-old",) for call in history_calls[-2:])
+    assert any(call == ("token-new",) for call in history_calls[-2:])
+    assert len(notifications) == 1
 
     restarted = PolymarketLPService(
         PredictionArbitrageStore(tmp_path / "data"), exchange, clock=lambda: current[0]
     )
     wake = restarted.refresh_price_history()
     assert wake.get("alert_pending") is not True
-    assert len(notifications) == 2
+    assert len(notifications) == 1
     assert {item["condition_id"] for item in store.lp_preparation_items()} == {
         "condition-old",
         "condition-new",
@@ -2799,28 +2853,35 @@ def test_interrupted_preparation_retry_remains_paused_and_recoverable(
     )
     restart_result = restarted.refresh_price_history()
     state = restarted.preparation_snapshot()
-    assert restart_result["preparation_outcome"] != "paused"
-    assert len(history_calls) == 2
+    assert restart_result["preparation_outcome"] == "failure"
+    assert len(history_calls) == 3
     assert state["retrying_market_count"] == 0
-    assert state["paused_market_count"] == 1
+    assert state["paused_market_count"] == 0
     item = restarted.store.lp_preparation_items()[0]
     assert item["condition_id"] == "condition-b"
-    assert item["state"] == "paused"
-    assert item["retry_used"] is True
-    assert item["error"] not in {"IncompleteRead", "RuntimeError"}
-    assert "unknown" in str(item["error"]).lower() or "interrupt" in str(item["error"]).lower()
+    assert item["state"] == "waiting_retry"
+    assert item["paused"] is False
+    assert item["retry_used"] is False
+    assert item["failure_count"] == 3
+    assert item["error"] == "IncompleteRead"
+    assert item["next_retry_at"] == (
+        (current[0] + timedelta(seconds=1200))
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
 
     repeated = restarted.refresh_price_history()
-    assert repeated["preparation_outcome"] != "paused"
-    assert len(history_calls) == 2
-    recovered = restarted.recover_preparation()
-    assert recovered["recovered_condition_ids"] == ["condition-b"]
-    assert restarted.store.lp_preparation_items() == []
+    assert repeated["preparation_outcome"] == "waiting_retry"
+    assert len(history_calls) == 3
 
     allow_success[0] = True
+    current[0] = datetime.fromisoformat(
+        str(item["next_retry_at"]).replace("Z", "+00:00")
+    )
     recovered_result = restarted.refresh_price_history()
     assert recovered_result["preparation_outcome"] == "success"
     assert history_calls[-1] == ("token-b",)
+    assert restarted.store.lp_preparation_items() == []
     assert restarted.store.lp_price_history_summary(
         "condition-b", "token-b", now=current[0]
     )["state"] == "known"
@@ -2922,7 +2983,11 @@ def test_recovering_paused_market_preserves_other_inflight_failures(
             history_calls.append(token_ids)
             if token_ids == ("token-b",):
                 if not b_success[0]:
-                    raise IncompleteRead(b"partial")
+                    return {
+                        "state": "partial",
+                        "history": {},
+                        "errors": {"token-b": "certificate_error"},
+                    }
                 return history_payload(token_ids, start_ts, end_ts)
             if c_blocked[0]:
                 c_started.set()
@@ -3086,46 +3151,103 @@ def test_recovering_paused_market_preserves_other_inflight_failures(
         restarted = PolymarketLPService(
             PredictionArbitrageStore(data_dir), exchange, clock=lambda: gap_now[0]
         )
-        assert restarted.refresh_price_history()["preparation_outcome"] != "paused"
-        assert restarted.store.lp_preparation_items()[0]["paused"] is True
-        recovered = restarted.recover_preparation()
-        assert recovered["recovered_condition_ids"] == ["condition-b"]
-
-        if outcome == "success":
-            gap_now[0] = T + timedelta(seconds=301)
-            new_result = restarted.refresh_price_history()
-            assert new_result["preparation_outcome"] == "failure"
-            new_summary = restarted.store.lp_price_history_summary(
-                "condition-b", "token-b", now=gap_now[0]
-            )
-            assert new_summary is not None
-            new_item = restarted.store.lp_preparation_items()[0]
-            assert new_item["state"] == "waiting_retry"
-            retry_at = datetime.fromisoformat(
-                str(new_item["next_retry_at"]).replace("Z", "+00:00")
-            )
-            assert retry_at == T + timedelta(seconds=601)
+        busy = restarted.refresh_price_history()
+        assert busy["preparation_outcome"] == "busy"
+        assert len(gap_calls) == 2
+        live_item = restarted.store.lp_preparation_items()[0]
+        assert live_item["state"] == "retrying"
+        assert live_item["paused"] is False
+        assert restarted.store.lp_price_history_summary(
+            "condition-b", "token-b", now=gap_now[0]
+        ) == initial_summary
+        assert restarted.recover_preparation()["recovered_condition_ids"] == []
 
         release_old.set()
         old_worker.join(timeout=3)
         assert not old_worker.is_alive()
         assert old_result
+        old_generation = int(restarted.preparation_snapshot()["generation"])
         if outcome == "failure":
-            assert restarted.store.lp_preparation_items() == []
-            assert restarted.store.lp_price_history_summary(
+            old_item = restarted.store.lp_preparation_items()[0]
+            old_generation = int(old_item["generation"])
+            assert old_item["state"] == "waiting_retry"
+            recovered_items = restarted.store.lp_recover_preparation_items(
+                ["condition-b"]
+            )
+            assert recovered_items == [{"condition_id": "condition-b", "recovered": True}]
+            restarted = PolymarketLPService(
+                PredictionArbitrageStore(data_dir), exchange, clock=lambda: gap_now[0]
+            )
+            gap_now[0] = T + timedelta(seconds=301)
+            new_result = restarted.refresh_price_history()
+            assert new_result["preparation_outcome"] == "success"
+            new_summary = restarted.store.lp_price_history_summary(
                 "condition-b", "token-b", now=gap_now[0]
-            ) == initial_summary
-        else:
-            final_item = restarted.store.lp_preparation_items()
-            assert len(final_item) == 1
-            assert final_item[0]["condition_id"] == "condition-b"
-            assert final_item[0]["state"] == "waiting_retry"
-            assert datetime.fromisoformat(
-                str(final_item[0]["next_retry_at"]).replace("Z", "+00:00")
-            ) == T + timedelta(seconds=601)
+            )
+            assert new_summary is not None and new_summary["state"] == "known"
+            stale = restarted.store.lp_record_preparation_failure(
+                "condition-b",
+                generation=old_generation,
+                stage="history",
+                error="TimeoutError",
+                failed_at=gap_now[0],
+            )
+            assert stale is None
             assert restarted.store.lp_price_history_summary(
                 "condition-b", "token-b", now=gap_now[0]
             ) == new_summary
+            assert restarted.store.lp_preparation_items() == []
+        else:
+            assert restarted.store.lp_preparation_items() == []
+            old_summary = restarted.store.lp_price_history_summary(
+                "condition-b", "token-b", now=gap_now[0]
+            )
+            assert old_summary is not None and old_summary["state"] == "known"
+            current_generation = int(restarted.preparation_snapshot()["generation"])
+            restarted.store.lp_record_preparation_failure(
+                "condition-b",
+                generation=current_generation,
+                stage="history",
+                error="certificate_error",
+                failed_at=gap_now[0],
+            )
+            restarted = PolymarketLPService(
+                PredictionArbitrageStore(data_dir), exchange, clock=lambda: gap_now[0]
+            )
+            recovered = restarted.recover_preparation()
+            assert recovered["recovered_condition_ids"] == ["condition-b"]
+            newer_generation = int(restarted.preparation_snapshot()["generation"])
+            assert newer_generation > old_generation
+            gap_now[0] = T + timedelta(seconds=301)
+            newer_failure = restarted.store.lp_record_preparation_failure(
+                "condition-b",
+                generation=newer_generation,
+                stage="history",
+                error="TimeoutError",
+                failed_at=gap_now[0],
+            )
+            assert newer_failure is not None
+            assert newer_failure["state"] == "waiting_retry"
+            new_item = restarted.store.lp_preparation_items()[0]
+            assert new_item["state"] == "waiting_retry"
+            assert datetime.fromisoformat(
+                str(new_item["next_retry_at"]).replace("Z", "+00:00")
+            ) == T + timedelta(seconds=601)
+            stale = restarted.store.lp_save_price_history_batch(
+                (
+                    {
+                        "condition_id": "condition-b",
+                        "token_id": "token-b",
+                        "samples": [],
+                        "summary": {"state": "known", "checked_at": gap_now[0]},
+                    },
+                ),
+                generation=old_generation,
+            )
+            assert stale == 0
+            assert restarted.store.lp_price_history_summary(
+                "condition-b", "token-b", now=gap_now[0]
+            ) == old_summary
 
     run_recovery_gap("failure", tmp_path / "gap-failure")
     run_recovery_gap("success", tmp_path / "gap-success")
@@ -3204,6 +3326,8 @@ def test_recovering_paused_market_preserves_other_inflight_failures(
                     assert release_old.wait(timeout=3)
                     if outcome == "failure":
                         raise IncompleteRead(b"old response")
+                if len(late_calls) == 3 and outcome == "success":
+                    raise IncompleteRead(b"new response")
                 return history_payload(token_ids, start_ts, end_ts)
 
         old_store = PredictionArbitrageStore(data_dir)
@@ -3212,6 +3336,10 @@ def test_recovering_paused_market_preserves_other_inflight_failures(
             old_store, old_exchange, clock=lambda: late_now[0]
         )
         assert old_service.refresh_price_history()["preparation_outcome"] == "failure"
+        initial_summary = old_store.lp_price_history_summary(
+            "condition-b", "token-b", now=late_now[0]
+        )
+        assert initial_summary is not None
         late_now[0] = T + timedelta(seconds=300)
         old_result: list[dict[str, object]] = []
         old_worker = threading.Thread(
@@ -3223,30 +3351,106 @@ def test_recovering_paused_market_preserves_other_inflight_failures(
         restarted = PolymarketLPService(
             PredictionArbitrageStore(data_dir), old_exchange, clock=lambda: late_now[0]
         )
-        assert restarted.refresh_price_history()["preparation_outcome"] != "paused"
-        assert restarted.store.lp_preparation_items()[0]["paused"] is True
-        recovered = restarted.recover_preparation()
-        assert recovered["recovered_condition_ids"] == ["condition-b"]
-        late_now[0] = T + timedelta(seconds=301)
-        new_result = restarted.refresh_price_history()
-        assert new_result["preparation_outcome"] == "success"
-        new_summary = restarted.store.lp_price_history_summary(
+        busy = restarted.refresh_price_history()
+        assert busy["preparation_outcome"] == "busy"
+        assert len(late_calls) == 2
+        live_item = restarted.store.lp_preparation_items()[0]
+        assert live_item["state"] == "retrying"
+        assert live_item["paused"] is False
+        assert restarted.store.lp_price_history_summary(
             "condition-b", "token-b", now=late_now[0]
-        )
-        assert new_summary is not None and new_summary["state"] == "known"
-        assert datetime.fromisoformat(
-            str(new_summary["checked_at"]).replace("Z", "+00:00")
-        ) == T + timedelta(seconds=301)
+        ) == initial_summary
+        assert restarted.recover_preparation()["recovered_condition_ids"] == []
 
         release_old.set()
         old_worker.join(timeout=3)
         assert not old_worker.is_alive()
         assert old_result
-        final_summary = restarted.store.lp_price_history_summary(
-            "condition-b", "token-b", now=late_now[0]
-        )
-        assert final_summary == new_summary
-        assert restarted.store.lp_preparation_items() == []
+        old_generation = int(restarted.preparation_snapshot()["generation"])
+        if outcome == "failure":
+            old_item = restarted.store.lp_preparation_items()[0]
+            old_generation = int(old_item["generation"])
+            recovered_items = restarted.store.lp_recover_preparation_items(
+                ["condition-b"]
+            )
+            assert recovered_items == [{"condition_id": "condition-b", "recovered": True}]
+            restarted = PolymarketLPService(
+                PredictionArbitrageStore(data_dir), old_exchange, clock=lambda: late_now[0]
+            )
+            late_now[0] = T + timedelta(seconds=301)
+            new_result = restarted.refresh_price_history()
+            assert new_result["preparation_outcome"] == "success"
+            new_summary = restarted.store.lp_price_history_summary(
+                "condition-b", "token-b", now=late_now[0]
+            )
+            assert new_summary is not None and new_summary["state"] == "known"
+            stale = restarted.store.lp_record_preparation_failure(
+                "condition-b",
+                generation=old_generation,
+                stage="history",
+                error="TimeoutError",
+                failed_at=late_now[0],
+            )
+            assert stale is None
+            assert restarted.store.lp_price_history_summary(
+                "condition-b", "token-b", now=late_now[0]
+            ) == new_summary
+            assert restarted.store.lp_preparation_items() == []
+        else:
+            assert restarted.store.lp_preparation_items() == []
+            old_summary = restarted.store.lp_price_history_summary(
+                "condition-b", "token-b", now=late_now[0]
+            )
+            assert old_summary is not None and old_summary["state"] == "known"
+            current_generation = int(restarted.preparation_snapshot()["generation"])
+            restarted.store.lp_record_preparation_failure(
+                "condition-b",
+                generation=current_generation,
+                stage="history",
+                error="certificate_error",
+                failed_at=late_now[0],
+            )
+            restarted = PolymarketLPService(
+                PredictionArbitrageStore(data_dir), old_exchange, clock=lambda: late_now[0]
+            )
+            recovered = restarted.recover_preparation()
+            assert recovered["recovered_condition_ids"] == ["condition-b"]
+            newer_generation = int(restarted.preparation_snapshot()["generation"])
+            assert newer_generation > old_generation
+            late_now[0] = T + timedelta(seconds=301)
+            newer_failure = restarted.store.lp_record_preparation_failure(
+                "condition-b",
+                generation=newer_generation,
+                stage="history",
+                error="TimeoutError",
+                failed_at=late_now[0],
+            )
+            assert newer_failure is not None
+            assert newer_failure["state"] == "waiting_retry"
+            new_summary = restarted.store.lp_price_history_summary(
+                "condition-b", "token-b", now=late_now[0]
+            )
+            assert new_summary == old_summary
+            new_item = restarted.store.lp_preparation_items()[0]
+            assert new_item["state"] == "waiting_retry"
+            assert datetime.fromisoformat(
+                str(new_item["next_retry_at"]).replace("Z", "+00:00")
+            ) == T + timedelta(seconds=601)
+            stale = restarted.store.lp_save_price_history_batch(
+                (
+                    {
+                        "condition_id": "condition-b",
+                        "token_id": "token-b",
+                        "samples": [],
+                        "summary": {"state": "known", "checked_at": late_now[0]},
+                    },
+                ),
+                generation=old_generation,
+            )
+            assert stale == 0
+            assert restarted.store.lp_price_history_summary(
+                "condition-b", "token-b", now=late_now[0]
+            ) == old_summary
 
     run_late_response("failure", tmp_path / "late-failure")
     run_late_response("success", tmp_path / "late-success")

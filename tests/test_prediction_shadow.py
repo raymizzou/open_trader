@@ -35,9 +35,10 @@ def _populated_store(data_dir: Path) -> PredictionArbitrageStore:
     return store
 
 
-def _populate_forbidden_categories(store: PredictionArbitrageStore) -> None:
+def _populate_forbidden_categories(store: PredictionArbitrageStore) -> sqlite3.Connection:
     now = "2026-08-10T00:00:00Z"
-    with sqlite3.connect(store.path) as connection:
+    connection = sqlite3.connect(store.path)
+    try:
         connection.execute("PRAGMA foreign_keys=OFF")
         connection.executescript(
             f"""
@@ -74,6 +75,11 @@ def _populate_forbidden_categories(store: PredictionArbitrageStore) -> None:
             ) VALUES ('signal-1', 'opportunity-1', 'reject', 'test', '{{}}', 'preview-1', 'execution-1', '{now}', '{now}');
             """
         )
+        connection.commit()
+    except BaseException:
+        connection.close()
+        raise
+    return connection
 
 
 def _file_snapshot(path: Path) -> tuple[bool, int | None, int | None, bytes | None]:
@@ -131,81 +137,84 @@ def test_seed_shadow_store_excludes_every_forbidden_category_and_preserves_sourc
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = _populated_store(tmp_path / "production")
-    _populate_forbidden_categories(source)
-    source_files = {
-        path: _file_snapshot(path)
-        for path in (
-            source.path,
-            Path(f"{source.path}-wal"),
-        )
-    }
-    import open_trader.prediction_shadow as shadow_module
-
-    connect_calls: list[tuple[object, dict[str, object]]] = []
-    read_only_connections: list[sqlite3.Connection] = []
-    connect = shadow_module.sqlite3.connect
-
-    def recording_connect(database: object, *args: object, **kwargs: object):
-        connect_calls.append((database, dict(kwargs)))
-        connection = connect(database, *args, **kwargs)
-        if "mode=ro" in str(database):
-            read_only_connections.append(connection)
-        return connection
-
-    monkeypatch.setattr(shadow_module.sqlite3, "connect", recording_connect)
-    report = seed_shadow_store(
-        source_data_dir=source.data_dir,
-        shadow_data_dir=tmp_path / "shadow",
-    )
-    destination = PredictionArbitrageStore(tmp_path / "shadow")
-    forbidden = {
-        "validation_mode", "cross_auto_state", "signals", "previews",
-        "executions", "cross_execution_reservations", "execution_legs", "incidents",
-        "llm_usage", "relation_scan_runs", "auto_eat_attempts", "cross_auto_attempts",
-    }
-    with sqlite3.connect(destination.path) as connection:
-        counts = {
-            table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            for table in forbidden
+    fixture_writer = _populate_forbidden_categories(source)
+    try:
+        source_files = {
+            path: _file_snapshot(path)
+            for path in (
+                source.path,
+                Path(f"{source.path}-wal"),
+            )
         }
-        relation_rows = connection.execute(
-            "SELECT singleton, payload, full_scanned_at, updated_at FROM relation_state ORDER BY singleton"
-        ).fetchall()
-        cache_rows = connection.execute(
-            "SELECT cache_key, payload, created_at FROM llm_cache ORDER BY cache_key"
-        ).fetchall()
+        import open_trader.prediction_shadow as shadow_module
 
-    assert all(count == 0 for count in counts.values())
-    assert any(
-        str(database).endswith("prediction_arbitrage.sqlite3?mode=ro")
-        and kwargs.get("uri") is True
-        for database, kwargs in connect_calls
-    )
-    assert any(
-        str(database) == f"{source.path.resolve().as_uri()}?mode=ro"
-        for database, _kwargs in connect_calls
-    )
-    assert read_only_connections
-    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
-        read_only_connections[0].execute("SELECT 1")
-    expected_digest = hashlib.sha256(
-        json.dumps(
-            {"relation_state": relation_rows, "llm_cache": cache_rows},
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
-    assert report["sha256"] == expected_digest
-    unchanged = {
-        str(path): (
-            _file_snapshot(path)[:3],
-            snapshot[:3],
-            _file_snapshot(path)[3] == snapshot[3],
+        connect_calls: list[tuple[object, dict[str, object]]] = []
+        read_only_connections: list[sqlite3.Connection] = []
+        connect = shadow_module.sqlite3.connect
+
+        def recording_connect(database: object, *args: object, **kwargs: object):
+            connect_calls.append((database, dict(kwargs)))
+            connection = connect(database, *args, **kwargs)
+            if "mode=ro" in str(database):
+                read_only_connections.append(connection)
+            return connection
+
+        monkeypatch.setattr(shadow_module.sqlite3, "connect", recording_connect)
+        report = seed_shadow_store(
+            source_data_dir=source.data_dir,
+            shadow_data_dir=tmp_path / "shadow",
         )
-        for path, snapshot in source_files.items()
-        if _file_snapshot(path) != snapshot
-    }
-    assert unchanged == {}
+        destination = PredictionArbitrageStore(tmp_path / "shadow")
+        forbidden = {
+            "validation_mode", "cross_auto_state", "signals", "previews",
+            "executions", "cross_execution_reservations", "execution_legs", "incidents",
+            "llm_usage", "relation_scan_runs", "auto_eat_attempts", "cross_auto_attempts",
+        }
+        with sqlite3.connect(destination.path) as connection:
+            counts = {
+                table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in forbidden
+            }
+            relation_rows = connection.execute(
+                "SELECT singleton, payload, full_scanned_at, updated_at FROM relation_state ORDER BY singleton"
+            ).fetchall()
+            cache_rows = connection.execute(
+                "SELECT cache_key, payload, created_at FROM llm_cache ORDER BY cache_key"
+            ).fetchall()
+
+        assert all(count == 0 for count in counts.values())
+        assert any(
+            str(database).endswith("prediction_arbitrage.sqlite3?mode=ro")
+            and kwargs.get("uri") is True
+            for database, kwargs in connect_calls
+        )
+        assert any(
+            str(database) == f"{source.path.resolve().as_uri()}?mode=ro"
+            for database, _kwargs in connect_calls
+        )
+        assert read_only_connections
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            read_only_connections[0].execute("SELECT 1")
+        expected_digest = hashlib.sha256(
+            json.dumps(
+                {"relation_state": relation_rows, "llm_cache": cache_rows},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        assert report["sha256"] == expected_digest
+        unchanged = {
+            str(path): (
+                _file_snapshot(path)[:3],
+                snapshot[:3],
+                _file_snapshot(path)[3] == snapshot[3],
+            )
+            for path, snapshot in source_files.items()
+            if _file_snapshot(path) != snapshot
+        }
+        assert unchanged == {}
+    finally:
+        fixture_writer.close()
 
 
 def test_seed_shadow_store_reads_latest_rows_from_live_wal(

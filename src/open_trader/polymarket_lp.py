@@ -936,6 +936,7 @@ class PolymarketLPService:
                 "connectionerror",
                 "connectionreseterror",
                 "readerror",
+                "incompleteread",
                 "proxyerror",
                 "network",
                 "unavailable",
@@ -946,6 +947,7 @@ class PolymarketLPService:
                 "http502",
                 "http503",
                 "http504",
+                "history_catalog_incomplete",
             } or code.startswith("market_read_") and any(
                 marker in code
                 for marker in (
@@ -1979,7 +1981,7 @@ class PolymarketLPService:
                     reason="preparation_paused",
                     display_state="unknown",
                 )
-            elif has_partial_items:
+            elif has_partial_items and preparation.get("next_retry_at") is not None:
                 waiting_items = [
                     item
                     for item in existing_preparation_items
@@ -3667,7 +3669,6 @@ class PolymarketLPService:
                     "failure_count": 0,
                     "paused": False,
                     "attempt": 0,
-                    "last_success_at": now,
                     "last_progress_at": now,
                     "completed_count": len(targets),
                     "total_count": len(targets),
@@ -3677,6 +3678,7 @@ class PolymarketLPService:
                     ),
                     "last_probe_stage": probe_stage,
                     "last_error": None,
+                    **({"last_success_at": now} if final_state == "ready" else {}),
                     **(
                         self._clear_unacknowledged_fault_episode()
                         if final_state == "ready"
