@@ -5858,7 +5858,7 @@ const recoveryRequests = requests.filter((request)=>request.method === "POST"
 console.log(JSON.stringify({
   preparing: preparingHtml.includes("准备中") && preparingHtml.includes("阶段：市场资料")
     && preparingHtml.includes("历史方向 12 / 20") && preparingHtml.includes("市场资料 3 / 8"),
-  waitingRetry: waitingHtml.includes("等待重试") && waitingHtml.includes("下次重试：2026-09-18 09:02:03 HKT")
+  waitingRetry: waitingHtml.includes("等待自动重试") && waitingHtml.includes("下次重试：2026-09-18 09:02:03 HKT")
     && waitingHtml.includes("最近失败：TimeoutError"),
   paused: pausedHtml.includes("已暂停") && pausedHtml.includes("最近失败：TimeoutError")
     && pausedHtml.includes("告警：sent") && pausedHtml.includes("恢复准备"),
@@ -5906,6 +5906,69 @@ console.log(JSON.stringify({
         "recoveryCsrf": True,
         "recoveryAuth": True,
     }
+
+
+def test_dashboard_explains_automatic_recovery_and_legacy_state() -> None:
+    """The public LP preparation card exposes recovery facts without guessing eligibility."""
+
+    output = run_dashboard_js(
+        r'''
+const waiting = {
+  state: "waiting_retry", stage: "history", completed_count: 1, total_count: 4,
+  metadata_completed_count: 4, metadata_total_count: 4, attempt: 2, failure_count: 1,
+  last_error: "TimeoutError", last_success_at: "2026-09-20T04:00:00Z",
+  next_retry_at: "2026-09-20T05:10:00Z", next_probe_at: "2026-09-20T05:06:00Z",
+};
+const preparing = {
+  state: "preparing", stage: "metadata", completed_count: 2, total_count: 4,
+  metadata_completed_count: 1, metadata_total_count: 3, attempt: 3, failure_count: 1,
+};
+const partial = {
+  state: "partial", stage: "metadata", preparation_item_total: 5,
+  paused_market_count: 2, waiting_market_count: 1, retrying_market_count: 2,
+  failed_market_count: 2, completed_count: 2, total_count: 4,
+};
+const attention = {
+  state: "paused", stage: "metadata", paused: true,
+  last_error_category: "operator_attention", last_error: "Authentication <token> & bad",
+  paused_market_count: 2, waiting_market_count: 0, failed_market_count: 2,
+  attempt: 3, failure_count: 3, last_success_at: "2026-09-20T04:00:00Z",
+};
+const legacy = {state: "paused", stage: "history", paused: true, last_error: "legacy_error"};
+const render = (value) => predictionLpPreparation(value);
+console.log(JSON.stringify({
+  waiting: render(waiting),
+  preparing: render(preparing),
+  partial: render(partial),
+  attention: render(attention),
+  legacy: render(legacy),
+}));
+'''
+    )
+    rendered = json.loads(output)
+    waiting = rendered["waiting"]
+    preparing = rendered["preparing"]
+    partial = rendered["partial"]
+    attention = rendered["attention"]
+    legacy = rendered["legacy"]
+
+    assert "自动恢复中" in waiting
+    assert "等待自动重试" in waiting
+    assert "下次探测：2026-09-20 13:06:00 HKT" in waiting
+    assert "下次重试：2026-09-20 13:10:00 HKT" in waiting
+    assert "准备中" in preparing and "历史方向 2 / 4" in preparing
+    assert "待重试 1 个市场" in partial
+    assert "重试中 2 个市场" in partial
+    assert "需人工处理 2 个市场" in partial
+    assert "需人工处理" in attention
+    assert "Authentication &lt;token&gt; &amp; bad" in attention
+    assert "上次成功：2026-09-20 12:00:00 HKT" in attention
+    assert 'data-action="lp-preparation-recovery"' in legacy
+    assert "已暂停" in legacy
+    assert "legacy_error" in legacy
+    assert "准备状态不等同于候选资格；下单指引仍需独立风控资料。" in waiting
+    assert "data-action=\"lp-preparation-pause\"" not in "".join(rendered.values())
+    assert "NaN" not in legacy and "undefined" not in legacy
 
 
 def test_prediction_paused_bootstrap_keeps_lp_requests_only() -> None:

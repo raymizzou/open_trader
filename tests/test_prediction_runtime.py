@@ -5351,7 +5351,7 @@ def test_lp_preparation_retries_after_five_minutes_and_alerts_on_repeat_failure(
     retry_succeeds: bool,
     catalog_unknown: bool,
 ) -> None:
-    """A preparation transport failure has one durable, operator-visible retry."""
+    """A preparation transport failure keeps retrying with one fault notice."""
 
     import open_trader.prediction_runtime as runtime_module
 
@@ -5363,6 +5363,7 @@ def test_lp_preparation_retries_after_five_minutes_and_alerts_on_repeat_failure(
     release_299 = threading.Event()
     paused_wait = threading.Event()
     release_paused = threading.Event()
+    second_failure_gate = [False]
     success_call = threading.Event()
     hourly_wait_after_success = threading.Event()
     history_wait_calls: list[float] = []
@@ -5511,15 +5512,18 @@ def test_lp_preparation_retries_after_five_minutes_and_alerts_on_repeat_failure(
 
     def history_wait(stop_event: threading.Event, seconds: float) -> bool:
         history_wait_calls.append(seconds)
-        if seconds == 300:
-            clock[0] += timedelta(seconds=299)
-            at_299.set()
-            while not release_299.wait(timeout=0.01):
+        retry_deadline = datetime(2026, 9, 18, 12, 6, 15, tzinfo=UTC)
+        if (
+            len(catalog_calls) >= 2
+            and not success_call.is_set()
+            and not second_failure_gate[0]
+        ):
+            second_failure_gate[0] = True
+            paused_wait.set()
+            while not release_paused.wait(timeout=0.01):
                 if stop_event.is_set():
                     return True
-            return stop_event.is_set()
-        if seconds == 1:
-            clock[0] += timedelta(seconds=1)
+            release_paused.clear()
             return stop_event.is_set()
         if seconds >= 3600:
             paused_wait_count[0] += 1
@@ -5530,6 +5534,20 @@ def test_lp_preparation_retries_after_five_minutes_and_alerts_on_repeat_failure(
                 if stop_event.is_set():
                     return True
             release_paused.clear()
+            return stop_event.is_set()
+        if 0 < seconds < 3600:
+            if (
+                not at_299.is_set()
+                and clock[0] + timedelta(seconds=seconds)
+                >= retry_deadline - timedelta(seconds=1)
+            ):
+                clock[0] = retry_deadline - timedelta(seconds=1)
+                at_299.set()
+                while not release_299.wait(timeout=0.01):
+                    if stop_event.is_set():
+                        return True
+                return stop_event.is_set()
+            clock[0] += timedelta(seconds=seconds)
             return stop_event.is_set()
         raise AssertionError(f"unexpected history wait: {seconds}")
 
@@ -5588,120 +5606,37 @@ def test_lp_preparation_retries_after_five_minutes_and_alerts_on_repeat_failure(
                 runtime.stop()
         return
 
-    # A reconstructed runtime honors the original due time. The retry then
-    # fails once, pauses durably, and sends one LP-specific notification.
+    # A reconstructed runtime honors the original due time. The retry can fail
+    # again without converting a recoverable transport fault into a pause; the
+    # fault episode sends one notice and continues on its bounded probe/retry
+    # schedule.
     runtime = make_runtime()
     runtime.start()
     try:
         assert paused_wait.wait(timeout=2)
+        assert len(catalog_calls) >= 2
         assert len(catalog_calls) == 2
         assert len(notifications) == 1
         preparation = runtime.lp.preparation_snapshot()  # type: ignore[union-attr]
-        assert preparation["state"] == "paused"
-        assert preparation["paused"] is True
+        assert preparation["state"] == "waiting_retry"
+        assert preparation["paused"] is False
         assert preparation["failure_count"] == 2
-        assert preparation["alert_attempted"] is True
         if catalog_unknown:
             assert preparation["last_error"] == "TimeoutError"
             assert "TimeoutError" in notifications[0][1]
             assert "ValueError" not in notifications[0][1]
         assert "重启" not in notifications[0][1]
-        assert "恢复准备" in notifications[0][1]
+        assert "自动探测" in notifications[0][1]
 
-        # Ordinary refreshes and elapsed hours do not reset the paused cycle.
-        clock[0] += timedelta(hours=2)
-        assert runtime.lp.refresh_price_history()["preparation_outcome"] == "paused"  # type: ignore[union-attr]
-        assert len(catalog_calls) == 2
-        assert len(notifications) == 1
-
-        # A second process reconstruction also honors the paused generation;
-        # it cannot consume a third attempt or send a duplicate alert.
-        paused_wait.clear()
-        runtime.stop()
-        assert runtime.state == "STOPPED"
-
-        runtime = make_runtime()
-        runtime.start()
-        assert paused_wait.wait(timeout=2)
-        assert len(catalog_calls) == 2
-        assert len(notifications) == 1
-        preparation = runtime.lp.preparation_snapshot()  # type: ignore[union-attr]
-        assert preparation["state"] == "paused"
-        assert preparation["failure_count"] == 2
-        if catalog_unknown:
-            assert preparation["last_error"] == "TimeoutError"
-
-        # Explicit recovery re-arms one cycle. A successful retry clears the
-        # failure budget and returns to the normal hourly scheduler.
+        # A later bounded retry can recover without an explicit operator
+        # action and returns to the normal hourly scheduler.
         trading.fail_catalog = False
-        recovered = runtime.recover_lp_preparation()
-        assert recovered["paused"] is False
         release_paused.set()
         assert success_call.wait(timeout=2)
         assert len(catalog_calls) == 3
         assert hourly_wait_after_success.wait(timeout=2), history_wait_calls
         assert runtime.lp.preparation_snapshot()["state"] == "ready"  # type: ignore[union-attr]
         assert runtime.lp.preparation_snapshot()["failure_count"] == 0  # type: ignore[union-attr]
-
-        # A process can stop after persisting attempt one but before its
-        # external read returns.  Reconstruction may consume attempt two;
-        # after that failure the persisted budget must pause before any third
-        # external read, with the same single-alert path.
-        release_paused.set()
-        runtime.stop()
-        assert runtime.state == "STOPPED"
-        trading.fail_catalog = True
-        data_dir = tmp_path / "retry-failure"
-        seed_store = PredictionArbitrageStore(data_dir)
-        saved = seed_store.lp_preparation()
-        assert saved is not None
-        seed_store.lp_save_preparation(
-            {
-                **saved,
-                "state": "preparing",
-                "stage": "catalog",
-                "attempt": 1,
-                "failure_count": 0,
-                "paused": False,
-                "alert_attempted": False,
-                "alert_state": None,
-                "next_retry_at": None,
-                "last_error": None,
-            },
-            expected_generation=saved["generation"],
-        )
-        first_call.clear()
-        at_299.clear()
-        release_299.clear()
-        paused_wait.clear()
-        release_paused.clear()
-        success_call.clear()
-        catalog_before = len(catalog_calls)
-        notifications_before = len(notifications)
-        runtime = make_runtime()
-        runtime.start()
-        assert first_call.wait(timeout=2)
-        assert at_299.wait(timeout=2)
-        preparation = runtime.lp.preparation_snapshot()  # type: ignore[union-attr]
-        assert preparation["state"] == "waiting_retry"
-        assert preparation["attempt"] == 2
-        assert preparation["failure_count"] == 1
-        if catalog_unknown:
-            assert preparation["last_error"] == "TimeoutError"
-        release_299.set()
-        assert paused_wait.wait(timeout=2)
-        assert len(catalog_calls) == catalog_before + 1
-        assert len(notifications) == notifications_before + 1
-        preparation = runtime.lp.preparation_snapshot()  # type: ignore[union-attr]
-        assert preparation["state"] == "paused"
-        assert preparation["paused"] is True
-        assert preparation["attempt"] == 2
-        assert preparation["failure_count"] == 2
-        assert preparation["alert_attempted"] is True
-        if catalog_unknown:
-            assert preparation["last_error"] == "TimeoutError"
-            assert "TimeoutError" in notifications[-1][1]
-            assert "ValueError" not in notifications[-1][1]
     finally:
         release_paused.set()
         if runtime.state not in {"NEW", "STOPPED", "FAILED"}:
@@ -5947,21 +5882,26 @@ def test_lp_partial_preparation_uses_item_retry_deadline(
     def history_wait(stop_event: threading.Event, seconds: float) -> bool:
         history_wait_calls.append(seconds)
         history_wait_called.set()
-        if seconds == pytest.approx(300):
-            clock[0] += timedelta(seconds=299)
-            at_299.set()
-            while not release_299.wait(timeout=0.01):
-                if stop_event.is_set():
-                    return True
-            return stop_event.is_set()
-        if seconds == pytest.approx(1):
-            clock[0] += timedelta(seconds=1)
-            return stop_event.is_set()
         if seconds >= 3600:
             hourly_wait.set()
             while not release_hourly.wait(timeout=0.01):
                 if stop_event.is_set():
                     return True
+            return stop_event.is_set()
+        if 0 < seconds < 3600:
+            retry_deadline = datetime(2026, 9, 18, 12, 5, tzinfo=UTC)
+            if (
+                not at_299.is_set()
+                and clock[0] + timedelta(seconds=seconds)
+                >= retry_deadline - timedelta(seconds=1)
+            ):
+                clock[0] = retry_deadline - timedelta(seconds=1)
+                at_299.set()
+                while not release_299.wait(timeout=0.01):
+                    if stop_event.is_set():
+                        return True
+                return stop_event.is_set()
+            clock[0] += timedelta(seconds=seconds)
             return stop_event.is_set()
         raise AssertionError(f"unexpected history wait: {seconds}")
 
@@ -5982,7 +5922,7 @@ def test_lp_partial_preparation_uses_item_retry_deadline(
         runtime_started = True
         assert first_history_done.wait(timeout=2)
         assert history_wait_called.wait(timeout=2)
-        assert history_wait_calls[0] == pytest.approx(300)
+        assert history_wait_calls[0] == pytest.approx(60)
         assert at_299.wait(timeout=2)
         assert history_calls == [("token-a", "token-b")]
         preparation = runtime.lp.preparation_snapshot()  # type: ignore[union-attr]
@@ -5995,7 +5935,7 @@ def test_lp_partial_preparation_uses_item_retry_deadline(
                 break
             time.sleep(0.01)
             snapshot = runtime.lp.refresh_candidates(force=True)  # type: ignore[union-attr]
-        # Issue #143 repair 2: after the 300-second history wait the cached
+        # Issue #143 repair 2: after the bounded retry wait the cached
         # metadata is older than the 60-second candidate freshness window,
         # so the batch renews it once (targeted) before qualifying and
         # market-a is judged live and published as the only passer.
@@ -6012,13 +5952,15 @@ def test_lp_partial_preparation_uses_item_retry_deadline(
         assert retry_history_done.wait(timeout=2)
         assert notification_done.wait(timeout=2)
         assert history_calls == [("token-a", "token-b"), ("token-b",)]
-        assert history_wait_calls[:2] == [pytest.approx(300), pytest.approx(1)]
+        assert history_wait_calls[0] == pytest.approx(60)
+        assert any(seconds == pytest.approx(1) for seconds in history_wait_calls)
         assert len(notifications) == 1
-        assert "部分标的补全暂停" in notifications[0][1]
-        assert not hourly_wait.is_set() or history_wait_calls[:2] == [
-            pytest.approx(300),
-            pytest.approx(1),
-        ]
+        assert "自动探测" in notifications[0][1]
+        assert "按退避继续补全" in notifications[0][1]
+        assert "手动恢复" not in notifications[0][1]
+        assert not hourly_wait.is_set() or any(
+            seconds == pytest.approx(1) for seconds in history_wait_calls
+        )
     finally:
         release_299.set()
         release_hourly.set()
@@ -6044,6 +5986,8 @@ def test_lp_all_metadata_failures_keep_five_minute_retry(
     at_299 = threading.Event()
     release_299 = threading.Event()
     paused_wait = threading.Event()
+    notification_done = threading.Event()
+    release_hourly = threading.Event()
 
     class FakeTrading:
         def attach_metadata_cache(self, _store: object) -> None:
@@ -6212,6 +6156,7 @@ def test_lp_all_metadata_failures_keep_five_minute_retry(
 
         def notify(self, title: str, message: str) -> None:
             notifications.append((title, message))
+            notification_done.set()
 
     class TestExecution(PredictionExecutionService):
         def reconcile_startup(self) -> dict[str, object]:
@@ -6253,17 +6198,30 @@ def test_lp_all_metadata_failures_keep_five_minute_retry(
 
     def history_wait(stop_event: threading.Event, seconds: float) -> bool:
         history_wait_calls.append(seconds)
-        if seconds == pytest.approx(300):
-            clock[0] += timedelta(seconds=299)
-            at_299.set()
-            while not release_299.wait(timeout=0.01):
+        if len(metadata_calls) >= 2:
+            paused_wait.set()
+            while not release_hourly.wait(timeout=0.01):
                 if stop_event.is_set():
                     return True
-            clock[0] += timedelta(seconds=1)
             return stop_event.is_set()
         if seconds >= 3600:
             paused_wait.set()
             return True
+        if 0 < seconds < 3600:
+            retry_deadline = datetime(2026, 9, 18, 12, 5, tzinfo=UTC)
+            if (
+                not at_299.is_set()
+                and clock[0] + timedelta(seconds=seconds)
+                >= retry_deadline - timedelta(seconds=1)
+            ):
+                clock[0] = retry_deadline - timedelta(seconds=1)
+                at_299.set()
+                while not release_299.wait(timeout=0.01):
+                    if stop_event.is_set():
+                        return True
+                return stop_event.is_set()
+            clock[0] += timedelta(seconds=seconds)
+            return stop_event.is_set()
         raise AssertionError(f"unexpected history wait: {seconds}")
 
     runtime = PredictionRuntime(
@@ -6282,7 +6240,7 @@ def test_lp_all_metadata_failures_keep_five_minute_retry(
         runtime.start()
         runtime_started = True
         assert at_299.wait(timeout=2) or paused_wait.wait(timeout=2)
-        assert history_wait_calls[0] == pytest.approx(300)
+        assert history_wait_calls[0] == pytest.approx(60)
         assert history_calls == []
         assert metadata_calls == [("condition-b",)]
         preparation = runtime.lp.preparation_snapshot()  # type: ignore[union-attr]
@@ -6291,13 +6249,18 @@ def test_lp_all_metadata_failures_keep_five_minute_retry(
 
         release_299.set()
         assert paused_wait.wait(timeout=2)
-        assert history_wait_calls[:2] == [pytest.approx(300), pytest.approx(3600)]
+        assert notification_done.wait(timeout=2)
+        assert history_wait_calls[0] == pytest.approx(60)
+        assert pytest.approx(60) in history_wait_calls
+        assert not any(seconds >= 3600 for seconds in history_wait_calls)
         assert history_calls == []
         assert metadata_calls == [("condition-b",), ("condition-b",)]
         assert len(notifications) == 1
         preparation = runtime.lp.preparation_snapshot()  # type: ignore[union-attr]
-        assert preparation["paused_market_count"] == 1
+        assert preparation["paused_market_count"] == 0
+        assert preparation["waiting_market_count"] == 1
         assert preparation["state"] == "partial"
+        release_hourly.set()
     finally:
         release_299.set()
         if runtime_started and runtime.state not in {"STOPPED", "FAILED"}:
@@ -6562,6 +6525,10 @@ def test_lp_confirmed_absent_catalog_item_finishes_pending_work(
 
     def history_wait(stop_event: threading.Event, seconds: float) -> bool:
         history_wait_calls.append(seconds)
+        if seconds == pytest.approx(60):
+            first_wait_started.set()
+            clock[0] += timedelta(seconds=60)
+            return False
         if seconds == pytest.approx(300):
             first_wait_started.set()
             clock[0] += timedelta(seconds=300)
@@ -6600,7 +6567,8 @@ def test_lp_confirmed_absent_catalog_item_finishes_pending_work(
         assert first_wait_started.wait(timeout=2)
         assert normal_wait_started.wait(timeout=2) or zero_wait_seen.wait(timeout=2)
         assert not zero_wait_seen.is_set()
-        assert history_wait_calls[:2] == [pytest.approx(300), pytest.approx(3600)]
+        assert history_wait_calls[0] == pytest.approx(60)
+        assert any(seconds == pytest.approx(3600) for seconds in history_wait_calls)
         assert metadata_calls == [("condition-b",)]
         assert history_calls == []
         assert notifications == []
@@ -6855,6 +6823,11 @@ def test_lp_metadata_warmup_advances_beyond_one_batch(
     def history_wait(stop_event: threading.Event, seconds: float) -> bool:
         stop_event_ref[0] = stop_event
         wait_seconds.append(seconds)
+        if seconds == 60:
+            retry_wait_entered.set()
+            if not retry_release.wait(timeout=60):
+                return True
+            return stop_event.is_set()
         if seconds == 300:
             retry_wait_entered.set()
             if not retry_release.wait(timeout=60):
@@ -6973,8 +6946,8 @@ def test_lp_metadata_warmup_advances_beyond_one_batch(
         assert final_entries[failed_id][0] == (
             fixed_now + timedelta(seconds=300)
         ).timestamp() + 43_200
-        assert all(value in {300.0, 3600.0} for value in wait_seconds[:2])
-        assert wait_seconds[:2] == [300.0, 3600.0]
+        assert all(value in {60.0, 3600.0} for value in wait_seconds[:2])
+        assert wait_seconds[:2] == [60.0, 3600.0]
 
         hold_next_metadata[0] = True
         clock[0] += timedelta(seconds=43200)

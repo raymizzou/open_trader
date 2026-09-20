@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import logging
+import math
 import re
 import sqlite3
 import threading
@@ -43,6 +45,19 @@ _TERMINAL_EXECUTION_STATES = (
     "directional_incident",
     "merge_incident",
     "submit_failed_cleared",
+)
+
+_LP_OPERATOR_ERROR_MARKERS = (
+    "auth",
+    "cert",
+    "ssl",
+    "credential",
+    "config",
+    "schema",
+    "forbidden",
+    "unauthor",
+    "requestrejected",
+    "invalid",
 )
 
 _NOTIFICATION_KINDS = {
@@ -364,6 +379,8 @@ class PredictionArbitrageStore:
             self._create_schema(connection)
         self._cache_hits: dict[str, int] = {}
         self._cache_hits_lock = threading.Lock()
+        self._lp_preparation_owner_handle: Any | None = None
+        self._lp_preparation_owner_mutex = threading.Lock()
         self._lp_metadata_cache_ready = False
         self._lp_metadata_cache_schema_lock = threading.Lock()
         self.prune_llm_usage()
@@ -3253,21 +3270,68 @@ class PredictionArbitrageStore:
             ).fetchall()
         return [self._lp_preparation_item(row) for row in rows]
 
-    def lp_normalize_interrupted_preparation_items(self) -> int:
-        """Pause retries whose process stopped after spending their budget."""
+    @property
+    def _lp_preparation_owner_path(self) -> Path:
+        return self.path.with_name("lp-preparation.lock")
 
-        with self._transaction() as connection:
-            cursor = connection.execute(
-                """
-                UPDATE lp_preparation_items
-                SET state='paused',paused=1,next_retry_at=NULL,
-                    error='retry_interrupted',alert_attempted=0,alert_state=NULL,
-                    updated_at=?
-                WHERE state='retrying' AND retry_used=1 AND paused=0
-                """,
-                (_utc_now(),),
-            )
-        return int(cursor.rowcount)
+    def lp_try_acquire_preparation_owner(self) -> bool:
+        """Acquire the process-wide preparation read/publish fence if free."""
+
+        with self._lp_preparation_owner_mutex:
+            if self._lp_preparation_owner_handle is not None:
+                return True
+            handle = self._lp_preparation_owner_path.open("a+")
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (BlockingIOError, OSError):
+                handle.close()
+                return False
+            self._lp_preparation_owner_handle = handle
+            return True
+
+    def lp_release_preparation_owner(self) -> None:
+        """Release the preparation fence held by this store instance."""
+
+        with self._lp_preparation_owner_mutex:
+            handle = self._lp_preparation_owner_handle
+            if handle is None:
+                return
+            self._lp_preparation_owner_handle = None
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+
+    def _lp_preparation_owner_entered_here(self) -> bool:
+        if self._lp_preparation_owner_handle is not None:
+            return False
+        return self.lp_try_acquire_preparation_owner()
+
+    def lp_normalize_interrupted_preparation_items(self) -> int:
+        """Requeue retries whose exclusive owner stopped before publishing."""
+
+        entered_here = self._lp_preparation_owner_entered_here()
+        if not entered_here and self._lp_preparation_owner_handle is None:
+            return 0
+
+        try:
+            with self._transaction() as connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE lp_preparation_items
+                    SET state='waiting_retry',paused=0,retry_used=0,
+                        next_retry_at=COALESCE(retry_started_at,updated_at),
+                        retry_started_at=NULL,
+                        error='retry_interrupted',alert_attempted=0,alert_state=NULL,
+                        updated_at=?
+                    WHERE state='retrying' AND retry_used=1 AND paused=0
+                    """,
+                    (_utc_now(),),
+                )
+            return int(cursor.rowcount)
+        finally:
+            if entered_here:
+                self.lp_release_preparation_owner()
 
     def lp_migrate_legacy_preparation(self) -> dict[str, object] | None:
         """Preserve identifiable old history failures as per-market pauses."""
@@ -3331,7 +3395,47 @@ class PredictionArbitrageStore:
                 return payload
 
             generation = int(preparation_row["generation"])
+            normalized_error = re.sub(r"[^a-z0-9]", "", error.casefold())
+            explicit_certificate = any(
+                marker in normalized_error
+                for marker in (
+                    "sslcertverificationerror",
+                    "certificateverify",
+                    "certverification",
+                    "explicitcert",
+                )
+            )
+            generic_ssl = "genericssl" in normalized_error or (
+                "sslerror" in normalized_error and not explicit_certificate
+            )
+            transient_legacy = generic_ssl or any(
+                marker in normalized_error
+                for marker in (
+                    "globaltransporterror",
+                    "incompleteread",
+                    "retryinterrupted",
+                    "timeout",
+                    "proxyerror",
+                    "connectionerror",
+                    "network",
+                )
+            )
             updated_at = _utc_now()
+            retry_at = _canonical_timestamp(
+                _parse_timestamp(attempt_at)
+                + timedelta(seconds=0 if generic_ssl or normalized_error == "retryinterrupted" else 300)
+            ) if transient_legacy else None
+            migrated_rows = tuple(
+                (
+                    condition_id,
+                    token_id,
+                    "waiting_retry" if transient_legacy else "paused",
+                    0 if transient_legacy else 1,
+                    0 if transient_legacy else 1,
+                    retry_at,
+                )
+                for condition_id, token_id in sorted(matches.items())
+            )
             connection.executemany(
                 """
                 INSERT INTO lp_preparation_items(
@@ -3344,23 +3448,27 @@ class PredictionArbitrageStore:
                     (
                         condition_id,
                         generation,
-                        1,
+                        retry_used,
                         2,
-                        "paused",
-                        1,
+                        state,
+                        paused,
                         "history",
                         None,
                         token_id,
                         error,
                         attempt_at,
-                        None,
+                        retry_at,
                         None,
                         1,
                         "sent",
                         updated_at,
                     )
-                    for condition_id, token_id in sorted(matches.items())
+                    for condition_id, _token_id, state, retry_used, paused, retry_at in migrated_rows
+                    for token_id in (_token_id,)
                 ),
+            )
+            migrated_retry_times = tuple(
+                value[5] for value in migrated_rows if value[5] is not None
             )
             payload.update(
                 {
@@ -3368,8 +3476,12 @@ class PredictionArbitrageStore:
                     "attempt": 0,
                     "failure_count": 0,
                     "paused": False,
-                    "next_retry_at": None,
-                    "last_error": None,
+                    "next_retry_at": min(migrated_retry_times)
+                    if migrated_retry_times
+                    else None,
+                    "next_probe_at": attempt_at if transient_legacy else None,
+                    "last_probe_stage": "history" if transient_legacy else None,
+                    "last_error": error if not transient_legacy else None,
                     "generation": generation,
                 }
             )
@@ -3551,6 +3663,52 @@ class PredictionArbitrageStore:
                 return 0
         return int(cursor.rowcount)
 
+    def lp_wake_preparation_retries(
+        self,
+        *,
+        condition_ids: Iterable[str],
+        stage: str | None = None,
+        now: datetime,
+        generation: int | None = None,
+    ) -> int:
+        """Wake waiting markets after their related dependency recovers."""
+
+        identities = tuple(
+            dict.fromkeys(
+                str(value).strip() for value in condition_ids if str(value).strip()
+            )
+        )
+        if not identities:
+            return 0
+        current = _canonical_timestamp(now)
+        expected_generation = (
+            generation if type(generation) is int and generation >= 1 else None
+        )
+        with self._transaction() as connection:
+            changed = 0
+            for condition_id in identities:
+                row = connection.execute(
+                    "SELECT generation,state,paused,stage FROM lp_preparation_items WHERE condition_id=?",
+                    (condition_id,),
+                ).fetchone()
+                if row is None or row["state"] != "waiting_retry" or row["paused"]:
+                    continue
+                if expected_generation is not None and int(row["generation"]) > expected_generation:
+                    continue
+                if stage is not None and str(row["stage"] or "") != str(stage):
+                    continue
+                connection.execute(
+                    """
+                    UPDATE lp_preparation_items
+                    SET retry_used=0,state='waiting_retry',paused=0,
+                        next_retry_at=?,retry_started_at=NULL,updated_at=?
+                    WHERE condition_id=?
+                    """,
+                    (current, _utc_now(), condition_id),
+                )
+                changed += 1
+        return changed
+
     def lp_record_preparation_failure(
         self,
         condition_id: str,
@@ -3561,6 +3719,8 @@ class PredictionArbitrageStore:
         failed_at: datetime,
         direction: str | None = None,
         token_id: str | None = None,
+        retry_after_seconds: int | float | None = None,
+        retry_after_at: datetime | str | None = None,
     ) -> dict[str, object] | None:
         """Record one market failure while sharing one retry budget."""
 
@@ -3584,23 +3744,65 @@ class PredictionArbitrageStore:
                 return None
             effective_generation = request_generation
             existing_is_fence = bool(existing and existing["state"] == "recovered")
-            previous_retry_used = (
-                False if existing_is_fence else bool(existing and existing["retry_used"])
-            )
             previous_paused = (
                 False if existing_is_fence else bool(existing and existing["paused"])
             )
             previous_count = (
                 0 if existing_is_fence else int(existing["failure_count"]) if existing else 0
             )
-            retry_used = previous_retry_used or previous_paused
-            paused = retry_used
+            normalized_error = str(safe_error).casefold()
+            upstream_history_shape_error = (
+                safe_stage == "history"
+                and normalized_error
+                in {
+                    "history_values_invalid",
+                    "history_values_unknown",
+                    "history_missing",
+                    "history_insufficient",
+                    "history_window_incomplete",
+                }
+            )
+            operator_error = (
+                not upstream_history_shape_error
+                and (
+                    any(
+                        marker in normalized_error
+                        for marker in _LP_OPERATOR_ERROR_MARKERS
+                    )
+                    or any(
+                        code in normalized_error
+                        for code in ("http401", "http403", "status401", "status403")
+                    )
+                )
+            )
+            paused = previous_paused or operator_error
+            # A transient market retry is a bounded, repeatable probe rather
+            # than a one-shot allowance.  The claim lease still fences a live
+            # attempt, while a failed attempt returns to waiting_retry.
+            retry_used = 1 if paused else 0
             state = "paused" if paused else "waiting_retry"
             next_retry_at = None
             if not paused:
-                next_retry_at = _canonical_timestamp(
-                    _parse_timestamp(failed) + timedelta(seconds=300)
-                )
+                retry_deadline = _parse_timestamp(failed) + timedelta(seconds=300)
+                if (
+                    isinstance(retry_after_seconds, (int, float))
+                    and not isinstance(retry_after_seconds, bool)
+                    and math.isfinite(float(retry_after_seconds))
+                    and retry_after_seconds >= 0
+                ):
+                    retry_deadline = max(
+                        retry_deadline,
+                        _parse_timestamp(failed)
+                        + timedelta(seconds=float(retry_after_seconds)),
+                    )
+                elif retry_after_at is not None:
+                    try:
+                        retry_deadline = max(
+                            retry_deadline, _parse_timestamp(retry_after_at)
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                next_retry_at = _canonical_timestamp(retry_deadline)
             if existing is not None and not existing_is_fence:
                 retry_started_at = existing["retry_started_at"]
             alert_attempted = (
@@ -3683,51 +3885,58 @@ class PredictionArbitrageStore:
         )
         if identities == ():
             return claimed
-        with self._transaction() as connection:
-            if identities is None:
-                rows = connection.execute(
-                    """
-                    SELECT * FROM lp_preparation_items
-                    WHERE state != 'recovered'
-                      AND paused=0 AND retry_used=0 AND next_retry_at IS NOT NULL
-                    ORDER BY next_retry_at, condition_id
-                    """
-                ).fetchall()
-            else:
-                placeholders = ",".join("?" for _ in identities)
-                rows = connection.execute(
-                    f"""
-                    SELECT * FROM lp_preparation_items
-                    WHERE state != 'recovered'
-                      AND paused=0 AND retry_used=0 AND next_retry_at IS NOT NULL
-                      AND condition_id IN ({placeholders})
-                    ORDER BY next_retry_at, condition_id
-                    """,
-                    identities,
-                ).fetchall()
-            for row in rows:
-                try:
-                    due = _parse_timestamp(row["next_retry_at"])
-                except ValueError:
-                    continue
-                if due > now_moment:
-                    continue
-                condition = str(row["condition_id"])
-                connection.execute(
-                    """
-                    UPDATE lp_preparation_items
-                    SET retry_used=1,state='retrying',retry_started_at=?,
-                        next_retry_at=NULL,updated_at=?
-                    WHERE condition_id=? AND paused=0 AND retry_used=0
-                    """,
-                    (current, _utc_now(), condition),
-                )
-                updated = connection.execute(
-                    "SELECT * FROM lp_preparation_items WHERE condition_id=?",
-                    (condition,),
-                ).fetchone()
-                if updated is not None:
-                    claimed.append(self._lp_preparation_item(updated))
+        entered_here = self._lp_preparation_owner_entered_here()
+        if not entered_here and self._lp_preparation_owner_handle is None:
+            return claimed
+        try:
+            with self._transaction() as connection:
+                if identities is None:
+                    rows = connection.execute(
+                        """
+                        SELECT * FROM lp_preparation_items
+                        WHERE state != 'recovered'
+                          AND paused=0 AND retry_used=0 AND next_retry_at IS NOT NULL
+                        ORDER BY next_retry_at, condition_id
+                        """
+                    ).fetchall()
+                else:
+                    placeholders = ",".join("?" for _ in identities)
+                    rows = connection.execute(
+                        f"""
+                        SELECT * FROM lp_preparation_items
+                        WHERE state != 'recovered'
+                          AND paused=0 AND retry_used=0 AND next_retry_at IS NOT NULL
+                          AND condition_id IN ({placeholders})
+                        ORDER BY next_retry_at, condition_id
+                        """,
+                        identities,
+                    ).fetchall()
+                for row in rows:
+                    try:
+                        due = _parse_timestamp(row["next_retry_at"])
+                    except ValueError:
+                        continue
+                    if due > now_moment:
+                        continue
+                    condition = str(row["condition_id"])
+                    connection.execute(
+                        """
+                        UPDATE lp_preparation_items
+                        SET retry_used=1,state='retrying',retry_started_at=?,
+                            next_retry_at=NULL,updated_at=?
+                        WHERE condition_id=? AND paused=0 AND retry_used=0
+                        """,
+                        (current, _utc_now(), condition),
+                    )
+                    updated = connection.execute(
+                        "SELECT * FROM lp_preparation_items WHERE condition_id=?",
+                        (condition,),
+                    ).fetchone()
+                    if updated is not None:
+                        claimed.append(self._lp_preparation_item(updated))
+        finally:
+            if entered_here:
+                self.lp_release_preparation_owner()
         return claimed
 
     def lp_clear_preparation_items(
@@ -3812,7 +4021,9 @@ class PredictionArbitrageStore:
                 rows = connection.execute(
                     f"""
                     SELECT condition_id FROM lp_preparation_items
-                    WHERE paused=1 AND state != 'recovered' AND ({where})
+                    WHERE state != 'recovered'
+                      AND (paused=1 OR state='waiting_retry')
+                      AND ({where})
                     """,
                     identities,
                 ).fetchall()
@@ -3829,7 +4040,8 @@ class PredictionArbitrageStore:
                         state='recovered',paused=0,error=NULL,failed_at=NULL,
                         next_retry_at=NULL,retry_started_at=NULL,
                         alert_attempted=0,alert_state=NULL,updated_at=?
-                    WHERE condition_id=? AND paused=1 AND state != 'recovered'
+                    WHERE condition_id=? AND state != 'recovered'
+                      AND (paused=1 OR state='waiting_retry')
                     """,
                     (
                         (new_generation, _utc_now(), value)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 import uuid
 from copy import deepcopy
@@ -73,7 +74,11 @@ _LP_PRICE_HISTORY_MAX_CONCURRENCY = 4
 _LP_PRICE_HISTORY_WINDOW = timedelta(hours=24)
 _LP_PRICE_HISTORY_OVERLAP = timedelta(minutes=1)
 _LP_METADATA_BATCH_SIZE = 1500
-_LP_PREPARATION_RETRY_SECONDS = 300
+# Keep transient preparation failures recoverable while still bounding the
+# amount of upstream work during an outage.  The final interval is repeated
+# indefinitely until a validated read succeeds or an operator blocker is
+# classified.
+_LP_PREPARATION_RETRY_DELAYS_SECONDS = (300, 600, 1200, 1800, 1800)
 _BEIJING = ZoneInfo("Asia/Shanghai")
 TERMINAL_TRADE_STATES = frozenset({"CONFIRMED", "FAILED"})
 
@@ -517,6 +522,89 @@ class PolymarketLPService:
             prepared = self._prepared_inputs
         return deepcopy(prepared) if isinstance(prepared, Mapping) else None
 
+    def _preparation_priority_order(
+        self, condition_ids: Sequence[str]
+    ) -> tuple[str, ...]:
+        """Order preparation from durable/session exposure to background."""
+
+        ordered = tuple(
+            dict.fromkeys(
+                str(value).strip() for value in condition_ids if str(value).strip()
+            )
+        )
+        if not ordered:
+            return ()
+        rank = {condition_id: 2 for condition_id in ordered}
+        position_markers = (
+            "position",
+            "position_size",
+            "open_order",
+            "open_orders",
+            "open_order_count",
+            "exposure",
+            "in_position",
+            "has_open_orders",
+        )
+        with self._candidate_state_lock:
+            snapshot = deepcopy(self._candidate_snapshot)
+            facts = deepcopy(self._candidate_qualification_facts)
+        active_session_condition: str | None = None
+        active_session_reader = getattr(self.store, "lp_active_session", None)
+        if callable(active_session_reader):
+            try:
+                active_session = active_session_reader()
+            except Exception:
+                active_session = None
+            if isinstance(active_session, Mapping):
+                raw_condition = active_session.get("condition_id")
+                if not isinstance(raw_condition, str):
+                    payload = active_session.get("payload")
+                    if isinstance(payload, Mapping):
+                        raw_condition = payload.get("condition_id")
+                if isinstance(raw_condition, str) and raw_condition.strip() in rank:
+                    active_session_condition = raw_condition.strip()
+        for field in ("selected_results", "recommendations", "candidates"):
+            rows = snapshot.get(field)
+            if not isinstance(rows, (list, tuple)):
+                continue
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    continue
+                condition_id = str(row.get("condition_id") or "").strip()
+                if condition_id not in rank:
+                    continue
+                if any(
+                    key in row
+                    and row.get(key) not in (None, False, 0, "", (), [], {})
+                    for key in position_markers
+                ):
+                    rank[condition_id] = 0
+                elif rank[condition_id] > 1:
+                    rank[condition_id] = 1
+        if isinstance(facts, Mapping):
+            for condition_id, fact in facts.items():
+                condition = str(condition_id).strip()
+                if condition not in rank or not isinstance(fact, Mapping):
+                    continue
+                account = fact.get("account")
+                if not isinstance(account, Mapping):
+                    continue
+                positions = account.get("positions")
+                open_orders = account.get("open_orders")
+                if (
+                    isinstance(positions, (list, tuple))
+                    and positions
+                    or isinstance(open_orders, (list, tuple))
+                    and open_orders
+                ):
+                    rank[condition] = 0
+        if active_session_condition is not None:
+            rank[active_session_condition] = 0
+        order_index = {condition_id: index for index, condition_id in enumerate(ordered)}
+        return tuple(
+            sorted(ordered, key=lambda condition_id: (rank[condition_id], order_index[condition_id]))
+        )
+
     @staticmethod
     def _new_preparation_state() -> dict[str, object]:
         return {
@@ -533,6 +621,26 @@ class PolymarketLPService:
             "last_failure_at": None,
             "last_progress_at": None,
             "next_retry_at": None,
+            "next_probe_at": None,
+            "last_probe_at": None,
+            "last_probe_state": None,
+            "last_probe_stage": None,
+            "probe_states": {},
+            "probe_cursor": 0,
+            "retry_after_seconds": None,
+            "last_error_chain": (),
+            "last_error_status": None,
+            "last_error_category": None,
+            "fault_started_at": None,
+            "fault_alert_attempts": 0,
+            "fault_alert_state": None,
+            "fault_alert_next_at": None,
+            "fault_alert_sent_at": None,
+            "recovery_alert_state": None,
+            "recovery_alert_attempts": 0,
+            "recovery_alert_next_at": None,
+            "recovery_alert_claimed_at": None,
+            "recovery_alert_sent_at": None,
             "completed_count": 0,
             "total_count": 0,
             "metadata_completed_count": 0,
@@ -611,6 +719,109 @@ class PolymarketLPService:
             self._preparation = latest
             return latest
 
+    def _claim_fault_alert_if_due(
+        self, state: Mapping[str, object]
+    ) -> dict[str, object] | None:
+        """Claim one delayed transient-fault notification for this episode."""
+
+        if state.get("fault_alert_state") in {"claimed", "sent"}:
+            return None
+        started = state.get("fault_started_at")
+        try:
+            started_at = _timestamp(started, name="fault_started_at")
+        except ValueError:
+            return None
+        try:
+            next_at = _timestamp(
+                state.get("fault_alert_next_at"), name="fault_alert_next_at"
+            )
+        except ValueError:
+            next_at = started_at + timedelta(seconds=300)
+        now = self._now().astimezone(UTC)
+        if now < next_at:
+            return None
+        generation = state.get("generation")
+        if type(generation) is not int or generation < 1:
+            generation = 1
+        attempts = state.get("fault_alert_attempts")
+        attempts = attempts if type(attempts) is int and attempts >= 0 else 0
+        claimed = self._save_preparation(
+            {
+                "fault_alert_attempts": attempts + 1,
+                "fault_alert_state": "claimed",
+                "fault_alert_next_at": None,
+            },
+            expected_generation=generation,
+        )
+        claimed["fault_alert_claimed_now"] = True
+        return claimed
+
+    def _claim_recovery_alert_if_validated(
+        self,
+        state: Mapping[str, object],
+        *,
+        outcome: str,
+    ) -> dict[str, object] | None:
+        """Claim recovery notification only after an affected full read wins."""
+
+        if outcome != "success" or state.get("state") != "ready":
+            return None
+        if state.get("fault_alert_state") != "sent":
+            return None
+        if state.get("recovery_alert_state") in {"claimed", "sent"}:
+            return None
+        try:
+            fault_started = _timestamp(
+                state.get("fault_started_at"), name="fault_started_at"
+            )
+            last_success = _timestamp(
+                state.get("last_success_at"), name="last_success_at"
+            )
+        except ValueError:
+            return None
+        if last_success < fault_started:
+            return None
+        if state.get("recovery_alert_state") == "failed":
+            try:
+                next_at = _timestamp(
+                    state.get("recovery_alert_next_at"), name="recovery_alert_next_at"
+                )
+            except ValueError:
+                next_at = None
+            if next_at is not None and self._now().astimezone(UTC) < next_at:
+                return None
+        generation = state.get("generation")
+        if type(generation) is not int or generation < 1:
+            generation = 1
+        attempts = state.get("recovery_alert_attempts")
+        attempts = attempts if type(attempts) is int and attempts >= 0 else 0
+        claimed = self._save_preparation(
+            {
+                "recovery_alert_attempts": attempts + 1,
+                "recovery_alert_state": "claimed",
+                "recovery_alert_next_at": None,
+                "recovery_alert_claimed_at": self._now().astimezone(UTC),
+            },
+            expected_generation=generation,
+        )
+        claimed["recovery_alert_claimed_now"] = True
+        return claimed
+
+    def claim_due_preparation_recovery_alert(self) -> dict[str, object] | None:
+        """Claim a due validated recovery notice without reading the exchange."""
+
+        state = self.preparation_snapshot()
+        if state.get("recovery_alert_state") != "failed":
+            return None
+        claimed = self._claim_recovery_alert_if_validated(state, outcome="success")
+        if not isinstance(claimed, Mapping):
+            return None
+        return self._preparation_result(
+            claimed,
+            outcome="success",
+            display_state="ready",
+        )
+
     def _preparation_result(
         self,
         state: Mapping[str, object],
@@ -620,6 +831,15 @@ class PolymarketLPService:
         display_state: str | None = None,
         alert_pending: bool = False,
     ) -> dict[str, object]:
+        claimed_fault = self._claim_fault_alert_if_due(state)
+        if isinstance(claimed_fault, Mapping):
+            state = claimed_fault
+            alert_pending = True
+        claimed_recovery = self._claim_recovery_alert_if_validated(
+            state, outcome=outcome
+        )
+        if isinstance(claimed_recovery, Mapping):
+            state = claimed_recovery
         result: dict[str, object] = {
             "state": display_state or str(state.get("state") or "unknown"),
             "preparation_outcome": outcome,
@@ -639,14 +859,306 @@ class PolymarketLPService:
                 result["preparation"].update(deepcopy(dict(summary)))
         if reason:
             result["reason"] = reason
-        if alert_pending:
+        if alert_pending or state.get("fault_alert_claimed_now") is True:
             result["alert_pending"] = True
+        if state.get("recovery_alert_claimed_now") is True:
+            result["recovery_alert_pending"] = True
         return result
 
     @staticmethod
     def _safe_error_type(value: object) -> str:
         text = str(value or "unknown_error")
         return text if text.replace("_", "").isalnum() and text[0:1].isalpha() else "unknown_error"
+
+    @classmethod
+    def _preparation_error_details(
+        cls, value: object
+    ) -> tuple[str, bool, tuple[str, ...], int | None, str]:
+        """Normalize safe adapter facts for retry policy and operator status."""
+
+        raw_chain: list[object] = []
+        status: int | None = None
+        if isinstance(value, Mapping):
+            raw_chain_value = value.get("error_chain", value.get("error_types"))
+            if isinstance(raw_chain_value, Sequence) and not isinstance(
+                raw_chain_value, (str, bytes)
+            ):
+                raw_chain.extend(raw_chain_value)
+            raw_chain.append(
+                value.get("error_type", value.get("error", value.get("reason")))
+            )
+            raw_status = value.get("status")
+            if type(raw_status) is int and 100 <= raw_status <= 599:
+                status = raw_status
+            elif isinstance(raw_status, str) and raw_status.isdigit():
+                parsed_status = int(raw_status)
+                if 100 <= parsed_status <= 599:
+                    status = parsed_status
+        else:
+            raw_chain.append(value)
+
+        chain_values: list[str] = []
+        for raw in raw_chain:
+            safe = cls._safe_error_type(raw)
+            if safe != "unknown_error" and safe not in chain_values:
+                chain_values.append(safe)
+        chain = tuple(chain_values)
+        if not chain:
+            chain = ("unknown_error",)
+        joined = " ".join(chain).casefold()
+        operator_markers = (
+            "auth",
+            "cert",
+            "ssl",
+            "credential",
+            "config",
+            "schema",
+            "forbidden",
+            "unauthor",
+            "requestrejected",
+            "invalid",
+        )
+        operator_blocker = any(marker in joined for marker in operator_markers)
+        automatically_recoverable = False
+        if status is not None:
+            if status in {401, 403} or 400 <= status < 500 and status != 429:
+                operator_blocker = True
+            elif status == 429 or 500 <= status <= 599:
+                automatically_recoverable = True
+            else:
+                automatically_recoverable = False
+        else:
+            code = chain[0].casefold()
+            automatically_recoverable = code in {
+                "timeout",
+                "timeouterror",
+                "transporterror",
+                "connectionerror",
+                "connectionreseterror",
+                "readerror",
+                "proxyerror",
+                "network",
+                "unavailable",
+                "ratelimiterror",
+                "http429",
+                "status429",
+                "http500",
+                "http502",
+                "http503",
+                "http504",
+            } or code.startswith("market_read_") and any(
+                marker in code
+                for marker in (
+                    "transport",
+                    "timeout",
+                    "connection",
+                    "proxy",
+                    "readerror",
+                    "ratelimit",
+                    "status5",
+                    "http5",
+                )
+            )
+        automatically_recoverable = automatically_recoverable and not operator_blocker
+        category = (
+            "operator_attention"
+            if operator_blocker or not automatically_recoverable
+            else "transient"
+        )
+        return chain[0], automatically_recoverable, chain, status, category
+
+    @classmethod
+    def _automatic_recovery_error(cls, value: object) -> bool:
+        """Return whether a safe read result can be retried automatically."""
+
+        return cls._preparation_error_details(value)[1]
+
+    @staticmethod
+    def _retry_after_deadline(
+        now: datetime, value: object
+    ) -> tuple[datetime | None, int | float | None]:
+        """Convert safe adapter pacing facts into a durable absolute deadline."""
+
+        retry_seconds: int | float | None = None
+        retry_at: datetime | None = None
+        if isinstance(value, Mapping):
+            raw_seconds = value.get("retry_after_seconds")
+            if isinstance(raw_seconds, (int, float)) and not isinstance(
+                raw_seconds, bool
+            ) and math.isfinite(float(raw_seconds)) and raw_seconds >= 0:
+                retry_seconds = raw_seconds
+            if retry_seconds is None and value.get("retry_after_at") is not None:
+                try:
+                    retry_at = _timestamp(
+                        value.get("retry_after_at"), name="retry_after_at"
+                    )
+                except ValueError:
+                    retry_at = None
+        if retry_seconds is not None:
+            return now + timedelta(seconds=float(retry_seconds)), retry_seconds
+        if retry_at is not None and retry_at >= now:
+            delta = max(0.0, (retry_at - now).total_seconds())
+            return retry_at, int(delta) if delta.is_integer() else delta
+        return None, None
+
+    def _run_preparation_probe(
+        self,
+        now: datetime,
+        preparation: Mapping[str, object],
+        *,
+        stop_event: threading.Event | None = None,
+        stage: str | None = None,
+        condition_ids: Sequence[str] = (),
+    ) -> tuple[dict[str, object], bool]:
+        """Run one bounded dependency probe when its durable deadline is due.
+
+        The boolean reports a healthy transition from an unhealthy probe.  A
+        transition may wake one full preparation attempt before its normal
+        backoff deadline, while repeated healthy probes leave that deadline
+        intact so a failing catalog cannot turn into a scan loop.
+        """
+
+        try:
+            next_probe_at = _timestamp(
+                preparation.get("next_probe_at"), name="next_probe_at"
+            )
+        except ValueError:
+            next_probe_at = now
+        if now < next_probe_at:
+            return deepcopy(dict(preparation)), False
+
+        generation = preparation.get("generation")
+        generation = generation if type(generation) is int and generation >= 1 else 1
+        scoped_condition_ids = tuple(
+            str(value).strip() for value in condition_ids if str(value).strip()
+        )
+        probe_condition_ids = tuple(
+            str(value).strip() for value in condition_ids if str(value).strip()
+        )
+        next_probe_cursor = preparation.get("probe_cursor")
+        if type(next_probe_cursor) is not int or next_probe_cursor < 0:
+            next_probe_cursor = 0
+        if stage == "history" and probe_condition_ids:
+            selected_index = next_probe_cursor % len(probe_condition_ids)
+            probe_condition_ids = (probe_condition_ids[selected_index],)
+            next_probe_cursor = (selected_index + 1) % len(scoped_condition_ids)
+        selected_condition_id = (
+            probe_condition_ids[0] if len(probe_condition_ids) == 1 else None
+        )
+        raw_probe_states = preparation.get("probe_states")
+        probe_states: dict[str, dict[str, str]] = {}
+        if isinstance(raw_probe_states, Mapping):
+            for raw_stage, raw_states in raw_probe_states.items():
+                if not isinstance(raw_stage, str) or not isinstance(raw_states, Mapping):
+                    continue
+                probe_states[raw_stage] = {
+                    str(condition_id): str(state)
+                    for condition_id, state in raw_states.items()
+                    if str(condition_id).strip() and isinstance(state, str)
+                }
+        probe_stage = str(stage or preparation.get("stage") or "unknown")
+        if selected_condition_id is not None:
+            previous_probe_state = probe_states.get(probe_stage, {}).get(
+                selected_condition_id, ""
+            )
+        else:
+            previous_probe_state = str(preparation.get("last_probe_state") or "")
+        reader = getattr(self.exchange, "lp_preparation_probe", None)
+        probe: Mapping[str, object]
+        if not callable(reader):
+            probe = {"state": "unsupported", "complete": False}
+        else:
+            try:
+                try:
+                    value = reader(
+                        stop_event=stop_event,
+                        stage=stage,
+                        condition_ids=probe_condition_ids,
+                    )
+                except TypeError:
+                    # Existing exchange doubles and adapters may still expose
+                    # the original rewards-only probe signature.
+                    value = reader(stop_event=stop_event)
+                probe = value if isinstance(value, Mapping) else {}
+            except Exception as exc:
+                probe = {
+                    "state": "unknown",
+                    "complete": False,
+                    "error_type": type(exc).__name__,
+                }
+
+        healthy = probe.get("state") == "healthy" and probe.get("complete") is True
+        probe_state = "healthy" if healthy else str(probe.get("state") or "unknown")
+        healthy_transition = healthy and previous_probe_state != "healthy"
+        retry_after = probe.get("retry_after_seconds")
+        retry_after_seconds: int | float | None = None
+        if isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool):
+            if retry_after >= 0 and math.isfinite(float(retry_after)):
+                retry_after_seconds = retry_after
+        if retry_after_seconds is None:
+            try:
+                retry_at = _timestamp(
+                    probe.get("retry_after_at"), name="retry_after_at"
+                )
+            except ValueError:
+                retry_at = None
+            if retry_at is not None:
+                retry_delta = (retry_at - now).total_seconds()
+                if retry_delta >= 0 and math.isfinite(retry_delta):
+                    retry_after_seconds = retry_delta
+        probe_interval = max(60, int(retry_after_seconds or 0))
+        updates: dict[str, object] = {
+            "last_probe_at": now,
+            "last_probe_state": probe_state,
+            "last_probe_stage": stage or preparation.get("stage"),
+            "probe_cursor": next_probe_cursor,
+            "next_probe_at": now + timedelta(seconds=probe_interval),
+            "retry_after_seconds": retry_after_seconds,
+        }
+        if selected_condition_id is not None:
+            stage_states = dict(probe_states.get(probe_stage, {}))
+            if scoped_condition_ids:
+                allowed_condition_ids = set(scoped_condition_ids)
+                stage_states = {
+                    condition_id: state
+                    for condition_id, state in stage_states.items()
+                    if condition_id in allowed_condition_ids
+                }
+            stage_states[selected_condition_id] = probe_state
+            probe_states[probe_stage] = stage_states
+            updates["probe_states"] = probe_states
+        if retry_after_seconds is not None:
+            try:
+                retry_at = _timestamp(
+                    preparation.get("next_retry_at"), name="next_retry_at"
+                )
+            except ValueError:
+                retry_at = now
+            retry_after_at = now + timedelta(seconds=retry_after_seconds)
+            if retry_after_at > retry_at:
+                # Server pacing applies to full reads as well as cheap probes;
+                # retain the existing backoff when it is already later.
+                updates["next_retry_at"] = retry_after_at
+        if healthy_transition:
+            if retry_after_seconds is None:
+                updates["next_retry_at"] = now
+            updates["state"] = "waiting_retry"
+            updates["paused"] = False
+            waker = getattr(self.store, "lp_wake_preparation_retries", None)
+            if callable(waker) and probe_condition_ids:
+                try:
+                    waker(
+                        condition_ids=probe_condition_ids,
+                        stage=stage,
+                        now=now,
+                        generation=generation,
+                    )
+                except Exception:
+                    # A probe must never turn into a data-path failure merely
+                    # because durable wake-up is unavailable.
+                    pass
+        saved = self._save_preparation(updates, expected_generation=generation)
+        return saved, healthy_transition
 
     @classmethod
     def _safe_selected_reward_reasons(
@@ -691,37 +1203,6 @@ class PolymarketLPService:
         attempt = attempt if type(attempt) is int and attempt >= 0 else 0
         failures = current.get("failure_count")
         failures = failures if type(failures) is int and failures >= 0 else 0
-        if attempt >= 2:
-            # A process may stop after persisting an attempt and before its
-            # external read returns.  The persisted attempt budget covers the
-            # whole generation, regardless of the state written by that read;
-            # do not turn reconstruction into another unbounded attempt.
-            last_error = self._safe_error_type(current.get("last_error"))
-            if last_error == "unknown_error":
-                last_error = "preparation_attempt_budget_exhausted"
-            state = self._save_preparation(
-                {
-                    "state": "paused",
-                    "paused": True,
-                    "failure_count": max(2, failures),
-                    "last_failure_at": now,
-                    "next_retry_at": None,
-                    "last_error": last_error,
-                },
-                expected_generation=generation,
-            )
-            if state.get("alert_attempted") is not True:
-                claimer = getattr(self.store, "lp_claim_preparation_alert", None)
-                claimed = (
-                    claimer(expected_generation=generation)
-                    if callable(claimer)
-                    else state
-                )
-                if isinstance(claimed, Mapping):
-                    with self._preparation_lock:
-                        self._preparation = deepcopy(dict(claimed))
-                    state = deepcopy(dict(claimed))
-            return state
         return self._save_preparation(
             {
                 "state": "preparing",
@@ -729,6 +1210,7 @@ class PolymarketLPService:
                 "attempt": attempt + 1,
                 "last_attempt_at": now,
                 "next_retry_at": None,
+                "next_probe_at": None,
                 "last_error": None,
                 "alert_attempted": False,
                 "alert_state": None,
@@ -749,8 +1231,62 @@ class PolymarketLPService:
         failures = current.get("failure_count")
         failures = failures if type(failures) is int and failures >= 0 else 0
         failures += 1
-        paused = failures >= 2
-        retry_at = None if paused else now + timedelta(seconds=_LP_PREPARATION_RETRY_SECONDS)
+        safe_error, recoverable, error_chain, error_status, error_category = (
+            self._preparation_error_details(error_type)
+        )
+        paused = not recoverable
+        delay_index = min(
+            max(failures - 1, 0), len(_LP_PREPARATION_RETRY_DELAYS_SECONDS) - 1
+        )
+        retry_at = (
+            None
+            if paused
+            else now
+            + timedelta(seconds=_LP_PREPARATION_RETRY_DELAYS_SECONDS[delay_index])
+        )
+        probe_at = (
+            None if paused else now + timedelta(seconds=60)
+        )
+        retry_after_at, retry_after_seconds = self._retry_after_deadline(
+            now, error_type
+        )
+        if not paused and retry_after_at is not None:
+            retry_at = max(retry_at, retry_after_at)  # type: ignore[arg-type]
+            probe_at = max(probe_at, retry_after_at)  # type: ignore[arg-type]
+        fault_started_at: object = current.get("fault_started_at")
+        fault_alert_state = current.get("fault_alert_state")
+        try:
+            prior_fault_started = _timestamp(
+                fault_started_at, name="fault_started_at"
+            )
+        except ValueError:
+            prior_fault_started = None
+        try:
+            prior_success = _timestamp(
+                current.get("last_success_at"), name="last_success_at"
+            )
+        except ValueError:
+            prior_success = None
+        if prior_fault_started is None or (
+            prior_success is not None and prior_success >= prior_fault_started
+        ):
+            fault_started_at = now
+            fault_alert_state = None
+            fault_alert_attempts = 0
+            fault_alert_next_at: object = now + timedelta(seconds=300)
+            fault_alert_sent_at: object = None
+            recovery_alert_state: object = None
+            recovery_alert_claimed_at: object = None
+            recovery_alert_sent_at: object = None
+        else:
+            fault_alert_attempts = current.get("fault_alert_attempts")
+            if type(fault_alert_attempts) is not int or fault_alert_attempts < 0:
+                fault_alert_attempts = 0
+            fault_alert_next_at = current.get("fault_alert_next_at")
+            fault_alert_sent_at = current.get("fault_alert_sent_at")
+            recovery_alert_state = current.get("recovery_alert_state")
+            recovery_alert_claimed_at = current.get("recovery_alert_claimed_at")
+            recovery_alert_sent_at = current.get("recovery_alert_sent_at")
         state = self._save_preparation(
             {
                 "state": "paused" if paused else "waiting_retry",
@@ -758,8 +1294,21 @@ class PolymarketLPService:
                 "failure_count": failures,
                 "paused": paused,
                 "last_failure_at": now,
-                "last_error": self._safe_error_type(error_type),
+                "last_error": safe_error,
+                "last_error_chain": error_chain,
+                "last_error_status": error_status,
+                "last_error_category": error_category,
                 "next_retry_at": retry_at,
+                "next_probe_at": probe_at,
+                "retry_after_seconds": retry_after_seconds,
+                "fault_started_at": fault_started_at,
+                "fault_alert_attempts": fault_alert_attempts,
+                "fault_alert_state": fault_alert_state,
+                "fault_alert_next_at": fault_alert_next_at,
+                "fault_alert_sent_at": fault_alert_sent_at,
+                "recovery_alert_state": recovery_alert_state,
+                "recovery_alert_claimed_at": recovery_alert_claimed_at,
+                "recovery_alert_sent_at": recovery_alert_sent_at,
                 "alert_attempted": False if not paused else current.get("alert_attempted") is True,
                 "alert_state": None if not paused else current.get("alert_state"),
             },
@@ -773,6 +1322,56 @@ class PolymarketLPService:
                     self._preparation = deepcopy(dict(claimed))
                 state = deepcopy(dict(claimed))
         return state
+
+    def _ensure_fault_episode(self, now: datetime) -> dict[str, object]:
+        """Start a coalesced fault episode for persistent market failures."""
+
+        current = self.preparation_snapshot()
+        try:
+            started = _timestamp(
+                current.get("fault_started_at"), name="fault_started_at"
+            )
+        except ValueError:
+            started = None
+        try:
+            succeeded = _timestamp(
+                current.get("last_success_at"), name="last_success_at"
+            )
+        except ValueError:
+            succeeded = None
+        if started is not None and (succeeded is None or succeeded < started):
+            return {}
+        return {
+            "fault_started_at": now,
+            "fault_alert_attempts": 0,
+            "fault_alert_state": None,
+            "fault_alert_next_at": now + timedelta(seconds=300),
+            "fault_alert_sent_at": None,
+            "recovery_alert_state": None,
+            "recovery_alert_attempts": 0,
+            "recovery_alert_next_at": None,
+            "recovery_alert_claimed_at": None,
+            "recovery_alert_sent_at": None,
+        }
+
+    def _clear_unacknowledged_fault_episode(self) -> dict[str, object]:
+        """Drop a transient fault that recovered before its notice was sent."""
+
+        current = self.preparation_snapshot()
+        if current.get("fault_alert_state") in {"sent", "claimed", "failed"}:
+            return {}
+        return {
+            "fault_started_at": None,
+            "fault_alert_attempts": 0,
+            "fault_alert_state": None,
+            "fault_alert_next_at": None,
+            "fault_alert_sent_at": None,
+            "recovery_alert_state": None,
+            "recovery_alert_attempts": 0,
+            "recovery_alert_next_at": None,
+            "recovery_alert_claimed_at": None,
+            "recovery_alert_sent_at": None,
+        }
 
     def recover_preparation(self) -> dict[str, object]:
         """Explicitly re-arm a paused preparation cycle."""
@@ -807,6 +1406,10 @@ class PolymarketLPService:
                 "alert_state": None,
                 "last_error": None,
                 "next_retry_at": None,
+                "next_probe_at": None,
+                "last_probe_at": None,
+                "last_probe_state": None,
+                "retry_after_seconds": None,
             },
             expected_generation=generation,
         )
@@ -826,6 +1429,35 @@ class PolymarketLPService:
     def finish_preparation_alert(self, *, generation: int, success: bool) -> dict[str, object] | None:
         """Record the result of the already-claimed operator notification."""
 
+        current = self.preparation_snapshot()
+        if current.get("fault_alert_state") == "claimed":
+            attempts = current.get("fault_alert_attempts")
+            attempts = attempts if type(attempts) is int and attempts >= 1 else 1
+            if success:
+                updates = {
+                    "fault_alert_state": "sent",
+                    "fault_alert_next_at": None,
+                    "fault_alert_sent_at": self._now().astimezone(UTC),
+                    # Wake one affected full read so a validated recovery
+                    # notice can follow this incident delivery.
+                    "next_probe_at": self._now().astimezone(UTC)
+                    + timedelta(seconds=60),
+                }
+            else:
+                delay = _LP_PREPARATION_RETRY_DELAYS_SECONDS[
+                    min(attempts - 1, len(_LP_PREPARATION_RETRY_DELAYS_SECONDS) - 1)
+                ]
+                updates = {
+                    "fault_alert_state": "failed",
+                    "fault_alert_next_at": self._now().astimezone(UTC)
+                    + timedelta(seconds=delay),
+                }
+            saved_fault = self._save_preparation(
+                updates, expected_generation=generation
+            )
+            if isinstance(saved_fault, Mapping):
+                return dict(saved_fault)
+
         item_finisher = getattr(self.store, "lp_finish_preparation_item_alerts", None)
         if callable(item_finisher):
             try:
@@ -841,6 +1473,35 @@ class PolymarketLPService:
                 self._preparation = deepcopy(dict(saved))
             return dict(saved)
         return None
+
+    def finish_preparation_recovery(
+        self, *, generation: int, success: bool
+    ) -> dict[str, object] | None:
+        """Record delivery of one validated recovery notification."""
+
+        current = self.preparation_snapshot()
+        if current.get("recovery_alert_state") != "claimed":
+            return current
+        attempts = current.get("recovery_alert_attempts")
+        attempts = attempts if type(attempts) is int and attempts >= 1 else 1
+        if success:
+            next_at: object = None
+        else:
+            delay = _LP_PREPARATION_RETRY_DELAYS_SECONDS[
+                min(attempts - 1, len(_LP_PREPARATION_RETRY_DELAYS_SECONDS) - 1)
+            ]
+            next_at = self._now().astimezone(UTC) + timedelta(seconds=delay)
+        saved = self._save_preparation(
+            {
+                "recovery_alert_state": "sent" if success else "failed",
+                "recovery_alert_next_at": next_at,
+                "recovery_alert_sent_at": self._now().astimezone(UTC)
+                if success
+                else current.get("recovery_alert_sent_at"),
+            },
+            expected_generation=generation,
+        )
+        return saved if isinstance(saved, Mapping) else None
 
     def candidate_snapshot(self) -> dict[str, object]:
         """Return the latest cached candidate projection without external reads."""
@@ -1254,7 +1915,22 @@ class PolymarketLPService:
             return self._preparation_result(
                 self.preparation_snapshot(), outcome="busy", display_state="busy"
             )
+        preparation_owner_acquired = False
         try:
+            owner_acquirer = getattr(
+                self.store, "lp_try_acquire_preparation_owner", None
+            )
+            owner_releaser = getattr(
+                self.store, "lp_release_preparation_owner", None
+            )
+            if callable(owner_acquirer):
+                preparation_owner_acquired = bool(owner_acquirer())
+                if not preparation_owner_acquired:
+                    return self._preparation_result(
+                        self.preparation_snapshot(),
+                        outcome="busy",
+                        display_state="busy",
+                    )
             interrupted_normalizer = getattr(
                 self.store, "lp_normalize_interrupted_preparation_items", None
             )
@@ -1303,6 +1979,51 @@ class PolymarketLPService:
                     reason="preparation_paused",
                     display_state="unknown",
                 )
+            elif has_partial_items:
+                waiting_items = [
+                    item
+                    for item in existing_preparation_items
+                    if isinstance(item, Mapping)
+                    and str(item.get("condition_id") or "").strip()
+                    and item.get("state") == "waiting_retry"
+                    and item.get("paused") is not True
+                ]
+                retry_times: list[datetime] = []
+                for item in waiting_items:
+                    try:
+                        retry_at = _timestamp(
+                            item.get("next_retry_at"), name="next_retry_at"
+                        )
+                    except ValueError:
+                        continue
+                    retry_times.append(retry_at)
+                retry_at = min(retry_times) if retry_times else now
+                if waiting_items and now < retry_at:
+                    probe_stage = str(
+                        waiting_items[0].get("stage")
+                        or preparation.get("last_probe_stage")
+                        or preparation.get("stage")
+                        or "history"
+                    )
+                    probe_ids = tuple(
+                        str(item.get("condition_id"))
+                        for item in waiting_items
+                        if str(item.get("condition_id") or "").strip()
+                    )
+                    preparation, probe_recovered = self._run_preparation_probe(
+                        now,
+                        preparation,
+                        stop_event=stop_event,
+                        stage=probe_stage,
+                        condition_ids=probe_ids,
+                    )
+                    if not probe_recovered:
+                        return self._preparation_result(
+                            preparation,
+                            outcome="waiting_retry",
+                            reason="retry_not_due",
+                            display_state="partial",
+                        )
             elif (
                 not has_partial_items
                 and (
@@ -1316,6 +2037,29 @@ class PolymarketLPService:
                     )
                 except ValueError:
                     retry_at = now
+                if now < retry_at:
+                    preparation, probe_recovered = self._run_preparation_probe(
+                        now, preparation, stop_event=stop_event
+                    )
+                    if probe_recovered:
+                        try:
+                            retry_at = _timestamp(
+                                preparation.get("next_retry_at"),
+                                name="next_retry_at",
+                            )
+                        except ValueError:
+                            retry_at = now
+                    else:
+                        return self._preparation_result(
+                            preparation,
+                            outcome="waiting_retry",
+                            reason="retry_not_due",
+                            display_state="unknown",
+                        )
+                else:
+                    preparation, _ = self._run_preparation_probe(
+                        now, preparation, stop_event=stop_event
+                    )
                 if now < retry_at:
                     return self._preparation_result(
                         preparation,
@@ -1373,7 +2117,7 @@ class PolymarketLPService:
                 )
 
             catalog_failure: tuple[str, str] | None = None
-            catalog_failure_error: str | None = None
+            catalog_failure_error: object | None = None
             try:
                 catalog = catalog_reader(stop_event=stop_event)
                 if stop_event is not None and stop_event.is_set():
@@ -1386,21 +2130,30 @@ class PolymarketLPService:
                 safe_catalog_error = self._safe_error_type(catalog.get("error_type"))
                 if safe_catalog_error == "unknown_error":
                     safe_catalog_error = "history_catalog_unknown"
+                catalog_error_details: dict[str, object] = {
+                    "error_type": safe_catalog_error
+                }
+                for field in (
+                    "error_chain",
+                    "error_types",
+                    "status",
+                    "retry_after_seconds",
+                    "retry_after_at",
+                ):
+                    value = catalog.get(field)
+                    if value is not None:
+                        catalog_error_details[field] = value
                 raw_markets = catalog.get("markets")
                 if not isinstance(raw_markets, (list, tuple)):
-                    catalog_failure_error = safe_catalog_error
+                    catalog_failure_error = catalog_error_details
                     raise ValueError("history_catalog_unknown")
                 if catalog.get("state") != "known":
-                    catalog_failure_error = safe_catalog_error
+                    catalog_failure_error = catalog_error_details
                     raise ValueError("history_catalog_unknown")
                 market_rows = [row for row in raw_markets if isinstance(row, Mapping)]
                 if catalog.get("complete") is not True:
                     if not market_rows:
-                        catalog_failure_error = (
-                            safe_catalog_error
-                            if safe_catalog_error != "history_catalog_unknown"
-                            else "history_catalog_unknown"
-                        )
+                        catalog_failure_error = catalog_error_details
                         raise ValueError("history_catalog_unknown")
                     catalog_failure = (
                         "catalog",
@@ -1415,8 +2168,13 @@ class PolymarketLPService:
                         if str(row.get("condition_id") or "").strip()
                     )
                 )
+                priority_condition_ids = self._preparation_priority_order(condition_ids)
+                priority_index = {
+                    condition_id: index
+                    for index, condition_id in enumerate(priority_condition_ids)
+                }
                 metadata_condition_ids: list[str] = []
-                for condition_id in condition_ids:
+                for condition_id in priority_condition_ids:
                     item = preparation_items.get(condition_id)
                     if item is None:
                         metadata_condition_ids.append(condition_id)
@@ -1437,7 +2195,7 @@ class PolymarketLPService:
                     metadata_condition_ids.append(condition_id)
                 metadata_condition_ids_tuple = tuple(metadata_condition_ids)
                 if catalog_failure is not None and not condition_ids:
-                    catalog_failure_error = "history_catalog_unknown"
+                    catalog_failure_error = catalog_error_details
                     raise ValueError("history_catalog_unknown")
                 if callable(preparation_retry_claimer):
                     retryable_conditions = tuple(
@@ -1479,7 +2237,7 @@ class PolymarketLPService:
                 return self._preparation_result(
                     failed,
                     outcome="failure",
-                    reason=self._safe_error_type(error_type),
+                    reason=str(failed.get("last_error") or "unknown_error"),
                     display_state="unknown",
                     alert_pending=failed.get("alert_claimed_now") is True,
                 )
@@ -1500,6 +2258,7 @@ class PolymarketLPService:
             metadata_value: Mapping[str, object] | None = None
             metadata_confirmed_absent: set[str] = set()
             metadata_failures: dict[str, str] = {}
+            metadata_failure_facts: dict[str, Mapping[str, object]] = {}
             successful_metadata_retry_conditions: set[str] = set()
             if callable(metadata_batch_reader):
                 metadata_by_condition: dict[str, object] = {}
@@ -1514,7 +2273,27 @@ class PolymarketLPService:
 
                 def batch_failure_code(value: object) -> str:
                     if isinstance(value, Mapping):
-                        for field in ("error", "reason", "code", "type", "status"):
+                        raw_status = value.get("status")
+                        if type(raw_status) is int:
+                            return f"status{raw_status}"
+                        raw_chain = value.get("error_chain", value.get("error_types"))
+                        if isinstance(raw_chain, Sequence) and not isinstance(
+                            raw_chain, (str, bytes)
+                        ):
+                            for chain_value in raw_chain:
+                                code = self._safe_error_type(chain_value)
+                                if any(
+                                    marker in code.casefold()
+                                    for marker in ("cert", "ssl", "auth", "forbidden")
+                                ):
+                                    return code
+                        for field in (
+                            "error_type",
+                            "error",
+                            "reason",
+                            "code",
+                            "type",
+                        ):
                             if field in value:
                                 return self._safe_error_type(value.get(field))
                         return "metadata_batch_failed"
@@ -1615,6 +2394,7 @@ class PolymarketLPService:
                         failed_ids = {str(value): "metadata_batch_failed" for value in raw_failed if str(value) in requested}
                     else:
                         failed_ids = {}
+                    raw_failure_facts = batch_value.get("failure_facts")
                     raw_deferred = batch_value.get("deferred_ids")
                     deferred_ids = {
                         str(value)
@@ -1622,7 +2402,17 @@ class PolymarketLPService:
                         if isinstance(value, str) and value in requested
                     } if isinstance(raw_deferred, Sequence) and not isinstance(raw_deferred, (str, bytes)) else set()
                     for condition_id, failure in failed_ids.items():
-                        metadata_failures[condition_id] = batch_failure_code(failure)
+                        facts = (
+                            raw_failure_facts.get(condition_id)
+                            if isinstance(raw_failure_facts, Mapping)
+                            else None
+                        )
+                        failure_value = facts if isinstance(facts, Mapping) else failure
+                        metadata_failures[condition_id] = batch_failure_code(
+                            failure_value
+                        )
+                        if isinstance(failure_value, Mapping):
+                            metadata_failure_facts[condition_id] = dict(failure_value)
                     for condition_id in deferred_ids:
                         metadata_failures[condition_id] = "metadata_deferred"
                     resolved = (
@@ -1662,6 +2452,16 @@ class PolymarketLPService:
                             stage="metadata",
                             error=error_type,
                             failed_at=failed_at,
+                            retry_after_seconds=(
+                                metadata_failure_facts.get(condition_id, {}).get(
+                                    "retry_after_seconds"
+                                )
+                            ),
+                            retry_after_at=(
+                                metadata_failure_facts.get(condition_id, {}).get(
+                                    "retry_after_at"
+                                )
+                            ),
                         )
                     if callable(preparation_item_reader):
                         preparation_items = {
@@ -1746,6 +2546,9 @@ class PolymarketLPService:
                     if token_id:
                         targets.append((condition_id, token_id))
             targets = list(dict.fromkeys(targets))
+            targets.sort(
+                key=lambda identity: priority_index.get(identity[0], len(priority_index))
+            )
             eligible_targets = tuple(targets)
             active_targets: list[tuple[str, str]] = []
             for identity in targets:
@@ -1860,6 +2663,14 @@ class PolymarketLPService:
                         retry_times.append(retry_timestamp)
                         waiting_retry = waiting_retry or now < retry_timestamp
                     next_retry_at = min(retry_times) if retry_times else None
+                    probe_stage = next(
+                        (
+                            str(item.get("stage") or "history")
+                            for item in active_items
+                            if item.get("state") == "waiting_retry"
+                        ),
+                        None,
+                    )
                     last_error = next(
                         (
                             str(item.get("error"))
@@ -1880,7 +2691,14 @@ class PolymarketLPService:
                             "completed_count": 0,
                             "total_count": 0,
                             "next_retry_at": next_retry_at,
+                            "next_probe_at": (
+                                now + timedelta(seconds=60)
+                                if waiting_retry
+                                else None
+                            ),
+                            "last_probe_stage": probe_stage,
                             "last_error": last_error,
+                            **self._ensure_fault_episode(now),
                         },
                         expected_generation=generation,
                     )
@@ -1922,6 +2740,7 @@ class PolymarketLPService:
                         "total_count": 0,
                         "next_retry_at": None,
                         "last_error": None,
+                        **self._clear_unacknowledged_fault_episode(),
                     },
                     expected_generation=generation,
                 )
@@ -2077,7 +2896,10 @@ class PolymarketLPService:
             request_count = 0
             errors: dict[str, str] = {}
             operational_failure: tuple[str, str] | None = None
-            market_failures: dict[str, tuple[str, str, str | None]] = {}
+            history_retry_deadline: datetime | None = None
+            market_failures: dict[
+                str, tuple[str, str, str | None, Mapping[str, object] | None]
+            ] = {}
             recorded_failure_conditions: set[str] = set()
             successful_conditions: set[str] = set(metadata_confirmed_absent)
             benign_history_errors = {
@@ -2104,7 +2926,12 @@ class PolymarketLPService:
                 if not callable(preparation_failure_writer):
                     return
                 failed_at = self._now().astimezone(UTC)
-                for condition_id, (stage, error_type, token_id) in market_failures.items():
+                for condition_id, (
+                    stage,
+                    error_type,
+                    token_id,
+                    retry_facts,
+                ) in market_failures.items():
                     if condition_id in recorded_failure_conditions:
                         continue
                     preparation_failure_writer(
@@ -2114,6 +2941,16 @@ class PolymarketLPService:
                         error=error_type,
                         failed_at=failed_at,
                         token_id=token_id,
+                        retry_after_seconds=(
+                            retry_facts.get("retry_after_seconds")
+                            if isinstance(retry_facts, Mapping)
+                            else None
+                        ),
+                        retry_after_at=(
+                            retry_facts.get("retry_after_at")
+                            if isinstance(retry_facts, Mapping)
+                            else None
+                        ),
                     )
                     recorded_failure_conditions.add(condition_id)
 
@@ -2130,10 +2967,47 @@ class PolymarketLPService:
                         if condition_id
                     )
                 )
+                requested = tuple(
+                    sorted(
+                        requested,
+                        key=lambda condition_id: priority_index.get(
+                            condition_id, len(priority_index)
+                        ),
+                    )
+                )
                 if not requested:
                     return ()
                 returned_markets: dict[str, Mapping[str, object]] = {}
-                failed_ids: dict[str, str] = {}
+                failed_ids: dict[str, object] = {}
+                raw_failure_facts: object = None
+
+                def failure_code(value: object) -> str:
+                    if isinstance(value, Mapping):
+                        raw_status = value.get("status")
+                        if type(raw_status) is int:
+                            return f"status{raw_status}"
+                        raw_chain = value.get("error_chain", value.get("error_types"))
+                        if isinstance(raw_chain, Sequence) and not isinstance(
+                            raw_chain, (str, bytes)
+                        ):
+                            for chain_value in raw_chain:
+                                code = self._safe_error_type(chain_value)
+                                if any(
+                                    marker in code.casefold()
+                                    for marker in ("cert", "ssl", "auth", "forbidden")
+                                ):
+                                    return code
+                        for field in (
+                            "error_type",
+                            "error",
+                            "reason",
+                            "code",
+                            "type",
+                        ):
+                            if field in value:
+                                return self._safe_error_type(value.get(field))
+                        return "metadata_batch_failed"
+                    return self._safe_error_type(value)
                 try:
                     if callable(metadata_batch_reader):
                         batch_value = metadata_batch_reader(
@@ -2152,7 +3026,7 @@ class PolymarketLPService:
                         if isinstance(raw_failed, Mapping):
                             failed_ids.update(
                                 {
-                                    str(key): self._safe_error_type(value)
+                                    str(key): value
                                     for key, value in raw_failed.items()
                                     if str(key) in requested
                                 }
@@ -2167,6 +3041,7 @@ class PolymarketLPService:
                                     if str(value) in requested
                                 }
                             )
+                        raw_failure_facts = batch_value.get("failure_facts")
                         raw_absent = batch_value.get("confirmed_absent_ids")
                         confirmed_absent = (
                             {
@@ -2207,17 +3082,36 @@ class PolymarketLPService:
                     if isinstance(row, Mapping)
                 }
                 for condition_id in requested:
+                    failure = failed_ids.get(condition_id)
+                    facts = (
+                        raw_failure_facts.get(condition_id)
+                        if isinstance(raw_failure_facts, Mapping)
+                        else None
+                    )
+                    failure_value = facts if isinstance(facts, Mapping) else failure
+                    if isinstance(failure_value, Mapping):
+                        metadata_failure_facts[condition_id] = dict(failure_value)
                     market = returned_markets.get(condition_id)
                     if not isinstance(market, Mapping):
                         failed_ids.setdefault(
                             condition_id, "metadata_batch_incomplete"
                         )
+                        failure_value = (
+                            failed_ids[condition_id]
+                            if failure_value is None
+                            else failure_value
+                        )
                         market_failures.setdefault(
                             condition_id,
                             (
                                 "metadata",
-                                self._safe_error_type(failed_ids[condition_id]),
+                                failure_code(failure_value),
                                 None,
+                                (
+                                    dict(failure_value)
+                                    if isinstance(failure_value, Mapping)
+                                    else None
+                                ),
                             ),
                         )
                         continue
@@ -2238,7 +3132,12 @@ class PolymarketLPService:
                     ):
                         market_failures.setdefault(
                             condition_id,
-                            ("metadata", "metadata_market_unusable", None),
+                            (
+                                "metadata",
+                                "metadata_market_unusable",
+                                None,
+                                None,
+                            ),
                         )
                         continue
                     identities = tuple(
@@ -2250,7 +3149,12 @@ class PolymarketLPService:
                     if not identities:
                         market_failures.setdefault(
                             condition_id,
-                            ("metadata", "metadata_market_unusable", None),
+                            (
+                                "metadata",
+                                "metadata_market_unusable",
+                                None,
+                                None,
+                            ),
                         )
                         continue
                     updated_metadata[condition_id] = market
@@ -2447,6 +3351,24 @@ class PolymarketLPService:
                         payload_errors = payload.get("errors") if isinstance(payload, Mapping) else None
                         if not isinstance(payload_errors, Mapping):
                             payload_errors = {}
+                        retry_facts = (
+                            {
+                                field: payload[field]
+                                for field in ("retry_after_seconds", "retry_after_at")
+                                if isinstance(payload, Mapping)
+                                and payload.get(field) is not None
+                            }
+                            if isinstance(payload, Mapping)
+                            else {}
+                        )
+                        payload_retry_deadline, _ = self._retry_after_deadline(
+                            now, payload
+                        )
+                        if payload_retry_deadline is not None and (
+                            history_retry_deadline is None
+                            or payload_retry_deadline > history_retry_deadline
+                        ):
+                            history_retry_deadline = payload_retry_deadline
                         for payload_error in payload_errors.values():
                             if (
                                 isinstance(payload_error, str)
@@ -2485,10 +3407,22 @@ class PolymarketLPService:
                                     and payload_error not in benign_history_errors
                                 ):
                                     failure_code = payload_error
+                                elif reason is not None and reason != "cancelled":
+                                    # A missing or incomplete market history
+                                    # is still an isolated market failure.  It
+                                    # must return to its low-frequency retry
+                                    # queue rather than leaving a claimed
+                                    # owner lease in retrying forever.
+                                    failure_code = reason
                             if failure_code is not None:
                                 market_failures.setdefault(
                                     condition_id,
-                                    ("history", self._safe_error_type(failure_code), token_id),
+                                    (
+                                        "history",
+                                        self._safe_error_type(failure_code),
+                                        token_id,
+                                        retry_facts or None,
+                                    ),
                                 )
                             if reason is None:
                                 merged.update(new_points)
@@ -2625,6 +3559,15 @@ class PolymarketLPService:
                         for item in current_items
                         if isinstance(item, Mapping) and item.get("next_retry_at")
                     ]
+                    probe_stage = next(
+                        (
+                            str(item.get("stage") or stage)
+                            for item in current_items
+                            if isinstance(item, Mapping)
+                            and item.get("state") == "waiting_retry"
+                        ),
+                        stage,
+                    )
                     partial = self._save_preparation(
                         {
                             "state": "partial",
@@ -2637,7 +3580,15 @@ class PolymarketLPService:
                             "completed_count": completed_count,
                             "total_count": len(targets),
                             "next_retry_at": min(retry_times) if retry_times else None,
+                            "next_probe_at": max(
+                                self._now() + timedelta(seconds=60),
+                                history_retry_deadline
+                                if history_retry_deadline is not None
+                                else self._now() + timedelta(seconds=60),
+                            ),
+                            "last_probe_stage": probe_stage,
                             "last_error": error_type,
+                            **self._ensure_fault_episode(self._now().astimezone(UTC)),
                         },
                         expected_generation=generation,
                     )
@@ -2689,9 +3640,12 @@ class PolymarketLPService:
             final_state = "partial" if remaining_items else "ready"
             waiting_retry = False
             next_retry_at: object | None = None
+            probe_stage: str | None = None
             for item in remaining_items:
                 if not isinstance(item, Mapping) or item.get("state") != "waiting_retry":
                     continue
+                if probe_stage is None:
+                    probe_stage = str(item.get("stage") or "history")
                 retry_at = item.get("next_retry_at")
                 if retry_at:
                     try:
@@ -2718,7 +3672,21 @@ class PolymarketLPService:
                     "completed_count": len(targets),
                     "total_count": len(targets),
                     "next_retry_at": next_retry_at,
+                    "next_probe_at": (
+                        now + timedelta(seconds=60) if waiting_retry else None
+                    ),
+                    "last_probe_stage": probe_stage,
                     "last_error": None,
+                    **(
+                        self._clear_unacknowledged_fault_episode()
+                        if final_state == "ready"
+                        else {}
+                    ),
+                    **(
+                        self._ensure_fault_episode(now)
+                        if final_state == "partial"
+                        else {}
+                    ),
                 },
                 expected_generation=generation,
             )
@@ -2740,6 +3708,12 @@ class PolymarketLPService:
             )
             return result
         finally:
+            if preparation_owner_acquired:
+                owner_releaser = getattr(
+                    self.store, "lp_release_preparation_owner", None
+                )
+                if callable(owner_releaser):
+                    owner_releaser()
             self._price_history_refresh_lock.release()
 
     def _restore_candidate_snapshot(

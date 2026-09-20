@@ -1227,7 +1227,9 @@ class PredictionRuntime:
             return True
 
         def preparation_alert(result: Mapping[str, object]) -> None:
-            if result.get("alert_pending") is not True:
+            fault_pending = result.get("alert_pending") is True
+            recovery_pending = result.get("recovery_alert_pending") is True
+            if not fault_pending and not recovery_pending:
                 return
             lp = self.lp
             execution = self.execution
@@ -1236,41 +1238,88 @@ class PredictionRuntime:
             preparation = result.get("preparation")
             if not isinstance(preparation, Mapping):
                 return
-            notifier = getattr(execution, "notify_lp_preparation_failure", None)
-            success = False
-            if callable(notifier):
-                try:
-                    value = notifier(preparation)
-                    success = isinstance(value, Mapping) and value.get("state") == "sent"
-                except Exception:
-                    logger.exception("prediction_lp_preparation_notification_failed")
-            finish = getattr(lp, "finish_preparation_alert", None)
             generation = preparation.get("generation")
-            if callable(finish) and type(generation) is int:
-                try:
-                    finish(generation=generation, success=success)
-                except Exception:
-                    logger.exception("prediction_lp_preparation_notification_state_failed")
+            if type(generation) is not int:
+                return
+            if fault_pending:
+                notifier = getattr(execution, "notify_lp_preparation_failure", None)
+                success = False
+                if callable(notifier):
+                    try:
+                        value = notifier(preparation)
+                        success = isinstance(value, Mapping) and value.get("state") == "sent"
+                    except Exception:
+                        logger.exception("prediction_lp_preparation_notification_failed")
+                finish = getattr(lp, "finish_preparation_alert", None)
+                if callable(finish):
+                    try:
+                        finish(generation=generation, success=success)
+                    except Exception:
+                        logger.exception("prediction_lp_preparation_notification_state_failed")
+            if recovery_pending:
+                notifier = getattr(execution, "notify_lp_preparation_recovery", None)
+                success = False
+                if callable(notifier):
+                    try:
+                        value = notifier(preparation)
+                        success = isinstance(value, Mapping) and value.get("state") == "sent"
+                    except Exception:
+                        logger.exception("prediction_lp_preparation_recovery_notification_failed")
+                finish = getattr(lp, "finish_preparation_recovery", None)
+                if callable(finish):
+                    try:
+                        finish(generation=generation, success=success)
+                    except Exception:
+                        logger.exception("prediction_lp_preparation_recovery_state_failed")
 
         def retry_delay(result: Mapping[str, object]) -> float:
             preparation = result.get("preparation")
             if not isinstance(preparation, Mapping):
                 return _LP_HISTORY_SECONDS
-            retry_at = preparation.get("next_retry_at")
-            if isinstance(retry_at, datetime):
-                due = retry_at
-            elif isinstance(retry_at, str):
-                text = retry_at[:-1] + "+00:00" if retry_at.endswith("Z") else retry_at
-                try:
-                    due = datetime.fromisoformat(text)
-                except ValueError:
-                    return _LP_HISTORY_SECONDS
-            else:
-                return _LP_HISTORY_SECONDS
             now = self._history_clock()
             if now.tzinfo is None:
                 now = now.replace(tzinfo=UTC)
-            return max(0.0, (due.astimezone(UTC) - now.astimezone(UTC)).total_seconds())
+
+            def parse_deadline(value: object) -> datetime | None:
+                if isinstance(value, datetime):
+                    due = value
+                elif isinstance(value, str):
+                    text = value[:-1] + "+00:00" if value.endswith("Z") else value
+                    try:
+                        due = datetime.fromisoformat(text)
+                    except ValueError:
+                        return None
+                else:
+                    return None
+                if due.tzinfo is None:
+                    due = due.replace(tzinfo=UTC)
+                return due.astimezone(UTC)
+
+            deadlines: list[datetime] = []
+            for key in ("next_retry_at", "next_probe_at"):
+                due = parse_deadline(preparation.get(key))
+                if due is not None:
+                    deadlines.append(due)
+            # A failed or not-yet-delivered incident has its own durable
+            # deadline. Include it so delivery retries do not wait behind a
+            # later full preparation retry; a sent/claimed episode has no
+            # independent wake-up requirement.
+            if preparation.get("fault_alert_state") not in {"sent", "claimed"}:
+                due = parse_deadline(preparation.get("fault_alert_next_at"))
+                if due is not None:
+                    deadlines.append(due)
+            if preparation.get("recovery_alert_state") == "failed":
+                due = parse_deadline(preparation.get("recovery_alert_next_at"))
+                if due is not None:
+                    deadlines.append(due)
+            if not deadlines:
+                return _LP_HISTORY_SECONDS
+            seconds = min(
+                (due - now.astimezone(UTC)).total_seconds() for due in deadlines
+            )
+            # A persisted deadline can already be due after a process pause;
+            # keep the loop bounded without spinning at zero seconds.
+            return max(1.0, seconds)
 
         def run() -> None:
             try:
@@ -1281,16 +1330,55 @@ class PredictionRuntime:
                     refresh_history = getattr(lp, "refresh_price_history", None)
                     if not callable(refresh_history):
                         return
-                    try:
-                        result = refresh_history(stop_event=self._history_stop_event)
-                    except Exception:
-                        result = None
-                        logger.exception("prediction_lp_history_refresh_failed")
-                    finally:
-                        self._history_initial_done.set()
+                    result: object = None
+                    claim_recovery = getattr(
+                        lp, "claim_due_preparation_recovery_alert", None
+                    )
+                    if callable(claim_recovery):
+                        try:
+                            result = claim_recovery()
+                        except Exception:
+                            result = None
+                            logger.exception(
+                                "prediction_lp_recovery_claim_failed"
+                            )
+                    business_refresh_completed = False
+                    if not isinstance(result, Mapping):
+                        try:
+                            result = refresh_history(
+                                stop_event=self._history_stop_event
+                            )
+                            business_refresh_completed = True
+                        except Exception:
+                            result = None
+                            logger.exception("prediction_lp_history_refresh_failed")
+                    self._history_initial_done.set()
+                    if business_refresh_completed:
                         self._lp_candidate_refresh_requested.set()
                     if isinstance(result, Mapping):
                         preparation_alert(result)
+                        # Delivery state is persisted by the alert finisher;
+                        # use that post-delivery snapshot when selecting the
+                        # next wake-up instead of the claimed pre-send copy.
+                        refreshed_preparation = getattr(
+                            lp, "preparation_snapshot", None
+                        )
+                        if (
+                            callable(refreshed_preparation)
+                            and (
+                                result.get("alert_pending") is True
+                                or result.get("recovery_alert_pending") is True
+                            )
+                        ):
+                            try:
+                                current_preparation = refreshed_preparation()
+                            except Exception:
+                                current_preparation = None
+                            if isinstance(current_preparation, Mapping):
+                                result = {
+                                    **result,
+                                    "preparation": current_preparation,
+                                }
                         outcome = str(result.get("preparation_outcome") or "")
                         preparation = result.get("preparation")
                         preparation_state = (
@@ -1306,7 +1394,11 @@ class PredictionRuntime:
                         elif outcome == "paused":
                             wait_seconds = _LP_HISTORY_SECONDS
                         else:
-                            wait_seconds = _LP_HISTORY_SECONDS
+                            # A successful data read can still leave a
+                            # failed recovery notification due. Reuse the
+                            # same deadline selector so delivery retries do
+                            # not sleep behind the hourly refresh interval.
+                            wait_seconds = retry_delay(result)
                     else:
                         wait_seconds = _LP_HISTORY_SECONDS
                     if wait_for_history(wait_seconds):

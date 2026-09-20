@@ -4498,6 +4498,25 @@ class PredictionExecutionService:
         total_text = str(total) if type(total) is int and total >= 0 else "未知"
         last_failure = beijing_clock(failure.get("last_failure_at")) or "未知"
         last_success = beijing_clock(failure.get("last_success_at")) or "从未成功"
+        automatic = failure.get("paused") is not True and (
+            failure.get("fault_started_at") is not None
+            or failure.get("state") in {"waiting_retry", "partial"}
+        )
+        if automatic:
+            message = "\n".join(
+                (
+                    f"LP 准备上游暂时不可用：阶段 {stage} · 错误 {error}。",
+                    f"进度 {completed_text}/{total_text}；失败时间 {last_failure}；上次成功 {last_success}。",
+                    "系统将自动探测并按退避继续补全，暂不影响其他风险监控。",
+                    f"Dashboard：{self._dashboard_url}",
+                )
+            )
+            now_clock = beijing_clock(datetime.now(UTC)) or "未知"
+            if self._deliver_feishu_notification(
+                f"⚠️ LP 准备自动恢复中（{now_clock}）", message
+            ):
+                return {"state": "sent"}
+            return {"state": "failed", "reason": "notification_unavailable"}
         message = "\n".join(
             (
                 f"LP 准备已暂停：阶段 {stage} · 错误 {error}。",
@@ -4509,6 +4528,35 @@ class PredictionExecutionService:
         now_clock = beijing_clock(datetime.now(UTC)) or "未知"
         if self._deliver_feishu_notification(
             f"❌ LP 准备已暂停（{now_clock}）", message
+        ):
+            return {"state": "sent"}
+        return {"state": "failed", "reason": "notification_unavailable"}
+
+    def notify_lp_preparation_recovery(
+        self, recovery: Mapping[str, object]
+    ) -> dict[str, object]:
+        """Announce validated LP preparation recovery once per episode."""
+
+        stage = str(recovery.get("stage") or "history")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}", stage):
+            stage = "history"
+        completed = recovery.get("completed_count")
+        total = recovery.get("total_count")
+        completed_text = (
+            str(completed) if type(completed) is int and completed >= 0 else "未知"
+        )
+        total_text = str(total) if type(total) is int and total >= 0 else "未知"
+        last_success = beijing_clock(recovery.get("last_success_at")) or "刚刚"
+        message = "\n".join(
+            (
+                f"LP 准备已恢复：阶段 {stage}；资料校验完成 {completed_text}/{total_text}。",
+                f"本次恢复时间：{last_success}。",
+                f"Dashboard：{self._dashboard_url}",
+            )
+        )
+        now_clock = beijing_clock(datetime.now(UTC)) or "未知"
+        if self._deliver_feishu_notification(
+            f"✅ LP 准备恢复（{now_clock}）", message
         ):
             return {"state": "sent"}
         return {"state": "failed", "reason": "notification_unavailable"}

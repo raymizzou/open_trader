@@ -4812,9 +4812,12 @@ function predictionLpPreparation(preparation) {
   if (!preparation || typeof preparation !== "object" || Array.isArray(preparation)) return "";
   const rawState = String(preparation.state || "").trim().toLowerCase();
   const rawStage = String(preparation.stage || "").trim().toLowerCase();
-  const stateLabels = {idle: "空闲", preparing: "准备中", waiting_retry: "等待重试", partial: "部分完成", paused: "已暂停", ready: "已就绪"};
+  const stateLabels = {idle: "空闲", preparing: "准备中", waiting_retry: "等待自动重试", partial: "部分完成", paused: "已暂停", ready: "已就绪"};
   const stageLabels = {catalog: "目录", metadata: "市场资料", history: "历史", complete: "完成"};
   const stateLabel = stateLabels[rawState] || "UNKNOWN";
+  const operatorAttention = rawState === "paused"
+    && preparation.last_error_category === "operator_attention";
+  const displayedStateLabel = operatorAttention ? "需人工处理" : stateLabel;
   const stageLabel = stageLabels[rawStage] || "UNKNOWN";
   const count = (value) => predictionHasValue(value) ? predictionNumber(value, "UNKNOWN") : "UNKNOWN";
   const timestamp = (label, value) => predictionHasValue(value)
@@ -4841,7 +4844,7 @@ function predictionLpPreparation(preparation) {
       .some((key) => Number(preparation[key]) > 0)
     || Number.isFinite(completed) && Number.isFinite(total) && total > completed;
   const itemCoverage = itemSummaryProvided && partialCoverage
-    ? `<div class="pm-relation-summary"><span>部分覆盖</span><span>暂停 ${escapeHtml(count(preparation.paused_market_count))} 个市场</span><span>待重试 ${escapeHtml(count(preparation.waiting_market_count))} 个市场</span><span>重试中 ${escapeHtml(count(preparation.retrying_market_count))} 个市场</span></div>`
+    ? `<div class="pm-relation-summary"><span>部分覆盖</span><span>需人工处理 ${escapeHtml(count(preparation.paused_market_count))} 个市场</span><span>待重试 ${escapeHtml(count(preparation.waiting_market_count))} 个市场</span><span>重试中 ${escapeHtml(count(preparation.retrying_market_count))} 个市场</span></div>`
     : "";
   const recoveryBusy = state.predictionMarket.lpDashboardRequestInFlight
     || state.predictionMarket.lpPreparationRecoveryInFlight;
@@ -4853,6 +4856,12 @@ function predictionLpPreparation(preparation) {
   const failure = predictionHasValue(preparation.last_error)
     ? `<p class="pm-signal-error" role="${rawState === "paused" ? "alert" : "status"}">最近失败：${escapeHtml(String(preparation.last_error))}</p>`
     : "";
+  const automaticRecovery = rawState === "waiting_retry"
+    ? "<span>自动恢复中</span>"
+    : "";
+  const probe = rawState === "waiting_retry"
+    ? `<p class="pm-signal-error" role="status">下次探测：${escapeHtml(predictionHktTimestamp(preparation.next_probe_at, "UNKNOWN"))}</p>`
+    : "";
   const retry = rawState === "waiting_retry"
     ? `<p class="pm-signal-error" role="status">下次重试：${escapeHtml(predictionHktTimestamp(preparation.next_retry_at, "UNKNOWN"))}</p>`
     : "";
@@ -4860,7 +4869,7 @@ function predictionLpPreparation(preparation) {
   const emptyNote = emptyCatalog
     ? "目录已确认为空；暂无候选资料。"
     : "准备状态不等同于候选资格；下单指引仍需独立风控资料。";
-  return `<section class="pm-panel pm-lp-preparation" aria-label="LP 准备状态" data-lp-preparation-state="${escapeHtml(rawState || "unknown")}"><header class="pm-panel-heading"><div><h3>LP 准备状态</h3><p>阶段：${escapeHtml(stageLabel)}</p></div><div class="pm-panel-heading-actions"><span class="pm-pill ${rawState === "paused" ? "pm-tone-danger" : rawState === "ready" ? "pm-tone-ok" : "watch"}">${escapeHtml(stateLabel)}</span>${recoveryButton}</div></header><div class="pm-relation-summary"><span>历史方向 ${escapeHtml(count(preparation.completed_count))} / ${escapeHtml(count(preparation.total_count))}</span><span>市场资料 ${escapeHtml(count(preparation.metadata_completed_count))} / ${escapeHtml(count(preparation.metadata_total_count))}</span><span>尝试 ${escapeHtml(count(preparation.attempt))}</span><span>失败 ${escapeHtml(count(preparation.failure_count))}</span>${alert}</div>${itemCoverage}<div class="pm-relation-summary">${timestamp("上次尝试", preparation.last_attempt_at)}${timestamp("最近进展", preparation.last_progress_at)}${timestamp("上次失败", preparation.last_failure_at)}${timestamp("上次成功", preparation.last_success_at)}</div>${failure}${retry}<p class="sub">${emptyNote}</p></section>`;
+  return `<section class="pm-panel pm-lp-preparation" aria-label="LP 准备状态" data-lp-preparation-state="${escapeHtml(rawState || "unknown")}"><header class="pm-panel-heading"><div><h3>LP 准备状态</h3><p>阶段：${escapeHtml(stageLabel)}</p></div><div class="pm-panel-heading-actions"><span class="pm-pill ${rawState === "paused" ? "pm-tone-danger" : rawState === "ready" ? "pm-tone-ok" : "watch"}">${escapeHtml(displayedStateLabel)}</span>${automaticRecovery}${recoveryButton}</div></header><div class="pm-relation-summary"><span>历史方向 ${escapeHtml(count(preparation.completed_count))} / ${escapeHtml(count(preparation.total_count))}</span><span>市场资料 ${escapeHtml(count(preparation.metadata_completed_count))} / ${escapeHtml(count(preparation.metadata_total_count))}</span><span>尝试 ${escapeHtml(count(preparation.attempt))}</span><span>失败 ${escapeHtml(count(preparation.failure_count))}</span>${alert}</div>${itemCoverage}<div class="pm-relation-summary">${timestamp("上次尝试", preparation.last_attempt_at)}${timestamp("最近进展", preparation.last_progress_at)}${timestamp("上次失败", preparation.last_failure_at)}${timestamp("上次成功", preparation.last_success_at)}</div>${failure}${probe}${retry}<p class="sub">${emptyNote}</p></section>`;
 }
 
 function predictionFunnelRejections(counts) {

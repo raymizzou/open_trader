@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import importlib.metadata
 import logging
+import math
 import os
 import pty
 import re
@@ -22,6 +23,7 @@ from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from datetime import UTC, date as Date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Callable, Literal, cast
 from urllib.error import URLError
@@ -477,6 +479,116 @@ def _safe_read_failure(stage: str, exc: BaseException) -> str:
     return f"{stage}_read_{type(exc).__name__}"
 
 
+def _safe_metadata_failure(
+    stage: str,
+    exc: BaseException,
+    response_facts: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Return redacted structured facts for one Gamma metadata failure."""
+
+    facts: dict[str, object] = {
+        "error_type": _safe_read_failure(stage, exc),
+        "error_chain": _safe_read_error_chain(exc),
+    }
+    if response_facts:
+        facts.update(
+            {
+                key: value
+                for key, value in response_facts.items()
+                if key in {"status", "retry_after_seconds", "retry_after_at"}
+            }
+        )
+    status = facts.get("status")
+    if type(status) is not int:
+        status = getattr(exc, "status", None)
+    if type(status) is not int:
+        status = getattr(exc, "code", None)
+    if type(status) is not int:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+    if type(status) is int and 100 <= status <= 599:
+        facts["status"] = status
+    return facts
+
+
+def _safe_read_error_chain(exc: BaseException) -> tuple[str, ...]:
+    """Return exception class names without retaining exception messages."""
+
+    chain: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    for _ in range(8):
+        if current is None or id(current) in seen:
+            break
+        seen.add(id(current))
+        name = type(current).__name__
+        if name not in chain and name.replace("_", "").isalnum():
+            chain.append(name)
+        cause = current.__cause__
+        if cause is None and not current.__suppress_context__:
+            cause = current.__context__
+        current = cause if isinstance(cause, BaseException) else None
+    return tuple(chain)
+
+
+def _safe_history_response_facts(exc: BaseException) -> dict[str, object]:
+    """Keep status, pacing, and exception-chain facts from urllib reads."""
+
+    facts: dict[str, object] = {
+        "error_chain": _safe_read_error_chain(exc),
+        "error_type": type(exc).__name__,
+    }
+    status = getattr(exc, "code", None)
+    if type(status) is not int:
+        status = getattr(exc, "status", None)
+    if type(status) is int and 100 <= status <= 599:
+        facts["status"] = status
+        if status == 429 or 500 <= status <= 599:
+            facts["error_type"] = f"status{status}"
+
+    headers = getattr(exc, "headers", None)
+    if headers is None:
+        headers = getattr(exc, "hdrs", None)
+    try:
+        retry_after = headers.get("Retry-After") if headers is not None else None
+    except Exception:
+        retry_after = None
+    if retry_after is None:
+        return facts
+    try:
+        retry_seconds = float(str(retry_after).strip())
+    except (TypeError, ValueError):
+        retry_seconds = math.nan
+    if math.isfinite(retry_seconds) and retry_seconds >= 0:
+        facts["retry_after_seconds"] = (
+            int(retry_seconds)
+            if retry_seconds.is_integer()
+            else retry_seconds
+        )
+        return facts
+    try:
+        retry_at = parsedate_to_datetime(str(retry_after).strip())
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=UTC)
+        facts["retry_after_at"] = retry_at
+        response_date = headers.get("Date") if headers is not None else None
+        if response_date is None:
+            response_date = headers.get("date") if headers is not None else None
+        if response_date is None:
+            return facts
+        response_at = parsedate_to_datetime(str(response_date).strip())
+        if response_at.tzinfo is None:
+            response_at = response_at.replace(tzinfo=UTC)
+        retry_delta = (retry_at - response_at).total_seconds()
+    except (TypeError, ValueError, OverflowError):
+        return facts
+    if math.isfinite(retry_delta) and retry_delta >= 0:
+        facts["retry_after_seconds"] = (
+            int(retry_delta) if retry_delta.is_integer() else retry_delta
+        )
+    return facts
+
+
 def _redact_lp_diagnostic(value: object, *, limit: int) -> str:
     text = str(value)
     text = re.sub(
@@ -550,7 +662,11 @@ def _lp_response_error_summary(response: object) -> str:
 
 
 def _install_lp_metadata_response_hook(
-    public: object, requested_count: int
+    public: object,
+    requested_count: int,
+    *,
+    facts: dict[str, object] | None = None,
+    facts_by_condition_ids: Mapping[frozenset[str], dict[str, object]] | None = None,
 ) -> Callable[[], None] | None:
     try:
         gamma = getattr(getattr(public, "_ctx"), "gamma")
@@ -569,17 +685,44 @@ def _install_lp_metadata_response_hook(
         url = getattr(request, "url", None)
         if getattr(url, "path", None) != "/markets/keyset":
             return
+        params = getattr(url, "params", None)
+        condition_ids = (
+            tuple(str(value) for value in params.get_list("condition_ids"))
+            if callable(getattr(params, "get_list", None))
+            else ()
+        )
+        response_facts = facts
+        if facts_by_condition_ids is not None:
+            response_facts = facts_by_condition_ids.get(frozenset(condition_ids))
+        if response_facts is not None:
+            if type(status) is int:
+                response_facts["status"] = status
+            headers = getattr(response, "headers", None)
+            retry_after = headers.get("retry-after") if headers is not None else None
+            if retry_after is not None:
+                try:
+                    retry_seconds = float(str(retry_after).strip())
+                except (TypeError, ValueError):
+                    retry_seconds = math.nan
+                if math.isfinite(retry_seconds) and retry_seconds >= 0:
+                    response_facts["retry_after_seconds"] = (
+                        int(retry_seconds)
+                        if retry_seconds.is_integer()
+                        else retry_seconds
+                    )
+                else:
+                    try:
+                        retry_at = parsedate_to_datetime(str(retry_after).strip())
+                        if retry_at.tzinfo is None:
+                            retry_at = retry_at.replace(tzinfo=UTC)
+                        response_facts["retry_after_at"] = retry_at
+                    except (TypeError, ValueError, OverflowError):
+                        pass
         # httpx runs response hooks before Client.send reads the body.  Keep
         # this read outside the best-effort diagnostic block so a real stream
         # error remains the original request error.
         response.read()
         try:
-            params = getattr(url, "params", None)
-            condition_ids = (
-                params.get_list("condition_ids")
-                if callable(getattr(params, "get_list", None))
-                else ()
-            )
             page = (
                 "continuation"
                 if params is not None and params.get("after_cursor") is not None
@@ -613,6 +756,91 @@ def _install_lp_metadata_response_hook(
             logger.warning("%s", message[:_LP_DIAGNOSTIC_LOG_MAX_CHARS])
         except Exception:
             return
+
+    response_hooks.append(on_response)
+
+    def remove() -> None:
+        try:
+            for index, hook in enumerate(response_hooks):
+                if hook is on_response:
+                    del response_hooks[index]
+                    break
+        except Exception:
+            return
+
+    return remove
+
+
+def _install_lp_response_fact_hook(
+    public: object,
+    *,
+    path: str,
+    facts: dict[str, object],
+) -> Callable[[], None] | None:
+    """Capture safe response facts before the SDK turns them into exceptions."""
+
+    try:
+        context = getattr(public, "_ctx")
+        preferred = "gamma" if path == "/markets/keyset" else "clob"
+        transport_names = (preferred,) + tuple(
+            name for name in ("clob", "gamma", "data") if name != preferred
+        )
+        transport = next(
+            getattr(context, name)
+            for name in transport_names
+            if getattr(context, name, None) is not None
+        )
+        http_client = getattr(transport, "_client")
+        response_hooks = getattr(http_client, "event_hooks").get("response")
+    except Exception:
+        return None
+    if not isinstance(response_hooks, list):
+        return None
+
+    def on_response(response: object) -> None:
+        url = getattr(getattr(response, "request", None), "url", None)
+        if getattr(url, "path", None) != path:
+            return
+        status = getattr(response, "status_code", None)
+        if type(status) is int:
+            facts["status"] = status
+        headers = getattr(response, "headers", None)
+        retry_after = headers.get("retry-after") if headers is not None else None
+        if retry_after is None:
+            return
+        try:
+            retry_seconds = float(str(retry_after).strip())
+        except (TypeError, ValueError):
+            retry_seconds = math.nan
+        if math.isfinite(retry_seconds) and retry_seconds >= 0:
+            facts["retry_after_seconds"] = (
+                int(retry_seconds)
+                if retry_seconds.is_integer()
+                else retry_seconds
+            )
+            return
+        try:
+            retry_at = parsedate_to_datetime(str(retry_after).strip())
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=UTC)
+            facts["retry_after_at"] = retry_at
+            response_date = (
+                headers.get("date") if headers is not None else None
+            )
+            if response_date is None:
+                return
+            response_at = parsedate_to_datetime(str(response_date).strip())
+            if response_at.tzinfo is None:
+                response_at = response_at.replace(tzinfo=UTC)
+            retry_delta = (retry_at - response_at).total_seconds()
+        except (TypeError, ValueError, OverflowError):
+            return
+        if math.isfinite(retry_delta) and retry_delta >= 0:
+            facts["retry_after_seconds"] = (
+                int(retry_delta)
+                if retry_delta.is_integer()
+                else retry_delta
+            )
 
     response_hooks.append(on_response)
 
@@ -1542,11 +1770,17 @@ class PolymarketTradingClient:
             return {}
         result = self.lp_market_metadata_batch(requested, stop_event=stop_event)
         markets = cast(dict[str, dict[str, object]], result["markets"])
-        failed_ids = cast(dict[str, str], result["failed_ids"])
+        failed_ids = cast(dict[str, object], result["failed_ids"])
         market_failures = {
             condition_id
             for condition_id, reason in failed_ids.items()
-            if reason.startswith("market_read_")
+            if (
+                isinstance(reason, Mapping)
+                and str(reason.get("error_type") or "").startswith("market_read_")
+            )
+            or (
+                isinstance(reason, str) and reason.startswith("market_read_")
+            )
         }
         if market_failures:
             confirmed_absent = set(result["confirmed_absent_ids"])
@@ -1573,6 +1807,7 @@ class PolymarketTradingClient:
                 "markets": {},
                 "confirmed_absent_ids": (),
                 "failed_ids": {},
+                "failure_facts": {},
                 "deferred_ids": (),
                 "state": "known",
                 "checked_at": checked_at,
@@ -1582,6 +1817,7 @@ class PolymarketTradingClient:
                 "markets": {},
                 "confirmed_absent_ids": (),
                 "failed_ids": {},
+                "failure_facts": {},
                 "deferred_ids": requested,
                 "state": "cancelled",
                 "checked_at": checked_at,
@@ -1606,7 +1842,7 @@ class PolymarketTradingClient:
             requested, checked_at=checked_at, force_refresh=True, stop_event=stop_event
         )
         markets = cast(dict[str, dict[str, object]], result["markets"])
-        failed_ids = cast(dict[str, str], result["failed_ids"])
+        failed_ids = cast(dict[str, object], result["failed_ids"])
         return {
             condition_id: dict(value)
             for condition_id, value in markets.items()
@@ -1666,7 +1902,7 @@ class PolymarketTradingClient:
             for condition_id, value in fresh.items()
             if value is None
         }
-        failed_ids: dict[str, str] = {}
+        failed_ids: dict[str, object] = {}
         fetched: dict[str, dict[str, object]] = {}
         fetched_absent: frozenset[str] = frozenset()
         if refresh_ids:
@@ -1706,11 +1942,20 @@ class PolymarketTradingClient:
         confirmed = tuple(
             condition_id for condition_id in requested if condition_id in confirmed_absent
         )
-        ordered_failed = {
-            condition_id: failed_ids[condition_id]
-            for condition_id in requested
-            if condition_id in failed_ids
-        }
+        ordered_failed: dict[str, str] = {}
+        failure_facts: dict[str, dict[str, object]] = {}
+        for condition_id in requested:
+            if condition_id not in failed_ids:
+                continue
+            failure = failed_ids[condition_id]
+            if isinstance(failure, Mapping):
+                facts = dict(failure)
+                failure_facts[condition_id] = facts
+                ordered_failed[condition_id] = str(
+                    facts.get("error_type") or "market_read_unknown"
+                )
+            else:
+                ordered_failed[condition_id] = str(failure)
         known_ids = (
             set(fresh).difference({condition_id for condition_id, value in fresh.items() if value is None})
             | set(fetched).difference(ordered_failed)
@@ -1733,6 +1978,7 @@ class PolymarketTradingClient:
             },
             "confirmed_absent_ids": confirmed,
             "failed_ids": ordered_failed,
+            "failure_facts": failure_facts,
             "deferred_ids": deferred,
             "state": state,
             "checked_at": checked_at,
@@ -1845,7 +2091,7 @@ class PolymarketTradingClient:
         *,
         metadata_checked_at: datetime,
         confirmed_absent_ids: frozenset[str] = frozenset(),
-        failed_ids: Mapping[str, str] | None = None,
+        failed_ids: Mapping[str, object] | None = None,
     ) -> None:
         """Write a completed refresh into the in-memory TTL cache.
 
@@ -1885,7 +2131,7 @@ class PolymarketTradingClient:
         *,
         public: object,
         stop_event: threading.Event | None = None,
-    ) -> tuple[dict[str, dict[str, object]], dict[str, str], frozenset[str]]:
+    ) -> tuple[dict[str, dict[str, object]], dict[str, object], frozenset[str]]:
         """Fetch LP market facts while preserving each completed sub-read."""
 
         metadata_checked_at = datetime.now(UTC)
@@ -1894,7 +2140,10 @@ class PolymarketTradingClient:
         event_failures_lock = threading.Lock()
         rows: list[object] = []
         completed_market_ids: set[str] = set()
-        failed_ids: dict[str, str] = {}
+        failed_ids: dict[str, object] = {}
+        response_facts_by_condition_ids: dict[
+            frozenset[str], dict[str, object]
+        ] = {}
 
         def read_market_batch(
             batch: tuple[str, ...],
@@ -1913,8 +2162,13 @@ class PolymarketTradingClient:
             requested[offset : offset + 100]
             for offset in range(0, len(requested), 100)
         )
+        response_facts_by_condition_ids = {
+            frozenset(batch): {} for batch in market_batches
+        }
         remove_response_hook = _install_lp_metadata_response_hook(
-            public, len(requested)
+            public,
+            len(requested),
+            facts_by_condition_ids=response_facts_by_condition_ids,
         )
         try:
             with ThreadPoolExecutor(max_workers=min(8, len(market_batches))) as pool:
@@ -1926,7 +2180,11 @@ class PolymarketTradingClient:
                     try:
                         batch_rows, completed = future.result()
                     except Exception as exc:
-                        reason = _safe_read_failure("market", exc)
+                        reason = _safe_metadata_failure(
+                            "market",
+                            exc,
+                            response_facts_by_condition_ids.get(frozenset(batch)),
+                        )
                         failed_ids.update((condition_id, reason) for condition_id in batch)
                         continue
                     if completed:
@@ -2271,9 +2529,11 @@ class PolymarketTradingClient:
         )
         opener = self._urlopen_fn or urlopen
 
-        def read_batch(batch: tuple[str, ...]) -> tuple[tuple[str, ...], object, str | None]:
+        def read_batch(
+            batch: tuple[str, ...],
+        ) -> tuple[tuple[str, ...], object, str | None, dict[str, object]]:
             if stop_event is not None and stop_event.is_set():
-                return batch, None, "cancelled"
+                return batch, None, "cancelled", {}
             body = json.dumps(
                 {
                     "markets": list(batch),
@@ -2298,17 +2558,21 @@ class PolymarketTradingClient:
                     raw = response.read()
                 if isinstance(raw, bytes):
                     raw = raw.decode("utf-8")
-                return batch, json.loads(raw), None
+                return batch, json.loads(raw), None, {}
             except Exception as exc:
-                return batch, None, type(exc).__name__
+                facts = _safe_history_response_facts(exc)
+                return batch, None, str(facts["error_type"]), facts
 
         histories: dict[str, list[dict[str, object]]] = {}
         unknown: set[str] = set()
         errors: dict[str, str] = {}
+        response_facts: dict[str, object] = {}
         with ThreadPoolExecutor(
             max_workers=min(LP_PRICE_HISTORY_MAX_CONCURRENCY, len(batches))
         ) as pool:
-            for batch, payload, error in pool.map(read_batch, batches):
+            for batch, payload, error, facts in pool.map(read_batch, batches):
+                for name, value in facts.items():
+                    response_facts.setdefault(name, value)
                 if error is not None:
                     unknown.update(batch)
                     for token in batch:
@@ -2366,6 +2630,7 @@ class PolymarketTradingClient:
             "start_ts": start_ts,
             "end_ts": end_ts,
             "fidelity": fidelity,
+            **response_facts,
         }
 
     def _lp_selected_reward_catalog(
@@ -2652,16 +2917,25 @@ class PolymarketTradingClient:
             "daily_pool_usd": None,
             "markets": (),
         }
+        response_facts: dict[str, object] = {}
+        remove_response_hook: Callable[[], None] | None = None
         try:
             if stop_event is not None and stop_event.is_set():
                 raise _RewardReadCancelled
             public = self._public_client_factory()
             try:
+                remove_response_hook = _install_lp_response_fact_hook(
+                    public,
+                    path="/rewards/markets/current",
+                    facts=response_facts,
+                )
                 reward_rows = (
                     (False, _collect(public.list_current_rewards(sponsored=False))),
                     (True, _collect(public.list_current_rewards(sponsored=True))),
                 )
             finally:
+                if remove_response_hook is not None:
+                    remove_response_hook()
                 close = getattr(public, "close", None)
                 if callable(close):
                     close()
@@ -2766,11 +3040,181 @@ class PolymarketTradingClient:
             }
         except _RewardReadCancelled:
             unknown["reason"] = "cancelled"
+            unknown.update(response_facts)
             return unknown
         except Exception as exc:
             unknown["reason"] = "reward_catalog_read_failed"
             unknown["error_type"] = type(exc).__name__
+            unknown["error_chain"] = _safe_read_error_chain(exc)
+            unknown.update(response_facts)
             return unknown
+
+    def _cached_lp_token_ids(
+        self, condition_ids: Sequence[str]
+    ) -> tuple[str, ...]:
+        """Resolve condition ids to token ids without a probe-side metadata read."""
+
+        requested = self._normalise_condition_ids(condition_ids)
+        if not requested:
+            return ()
+        now = datetime.now(UTC)
+        with self._metadata_lock:
+            self._warm_load_metadata_cache(now)
+            cached = tuple(
+                self._metadata_entries.get(condition_id, (0.0, None))[1]
+                for condition_id in requested
+            )
+        tokens: list[str] = []
+        for market in cached:
+            if not isinstance(market, Mapping):
+                continue
+            outcomes = market.get("outcomes")
+            if not isinstance(outcomes, Mapping):
+                continue
+            for value in outcomes.values():
+                if not isinstance(value, Mapping):
+                    continue
+                token_id = value.get("token_id", value.get("tokenId"))
+                if isinstance(token_id, str) and token_id.strip():
+                    tokens.append(token_id.strip())
+        return tuple(dict.fromkeys(tokens))
+
+    def lp_preparation_probe(
+        self,
+        *,
+        stop_event: threading.Event | None = None,
+        stage: str | None = None,
+        condition_ids: Sequence[str] = (),
+    ) -> dict[str, object]:
+        """Read one first page of current rewards as a bounded health probe.
+
+        The full reward catalog deliberately drains both native and sponsored
+        paginators.  Recovery only needs to know whether the related public
+        endpoint can answer, so this method performs one native first-page
+        request and never follows its continuation cursor.
+        """
+
+        checked_at = datetime.now(UTC)
+        result: dict[str, object] = {
+            "state": "unknown",
+            "complete": False,
+            "checked_at": checked_at,
+            "request_count": 0,
+            "bounded": True,
+            "stage": stage,
+            "condition_ids": tuple(
+                value.strip()
+                for value in condition_ids
+                if isinstance(value, str) and value.strip()
+            ),
+        }
+        if stop_event is not None and stop_event.is_set():
+            result["error_type"] = "cancelled"
+            return result
+
+        probe_stage = str(stage or "rewards").strip().lower()
+        requested_ids = tuple(result["condition_ids"])
+        if probe_stage == "history":
+            if not requested_ids:
+                result["error_type"] = "history_probe_identity_unknown"
+                return result
+            token_ids = self._cached_lp_token_ids(requested_ids)
+            if not token_ids:
+                result["error_type"] = "history_probe_token_cache_unknown"
+                return result
+            end_ts = int(checked_at.timestamp())
+            history = self.lp_price_history(
+                token_ids,
+                start_ts=end_ts - 60,
+                end_ts=end_ts,
+                fidelity=1,
+                stop_event=stop_event,
+            )
+            if (
+                isinstance(history, Mapping)
+                and history.get("state") == "known"
+                and isinstance(history.get("history"), Mapping)
+            ):
+                result.update(
+                    {
+                        "state": "healthy",
+                        "complete": True,
+                        "request_count": 1,
+                    }
+                )
+            else:
+                for field in (
+                    "status",
+                    "retry_after_seconds",
+                    "retry_after_at",
+                    "error_chain",
+                ):
+                    if isinstance(history, Mapping) and history.get(field) is not None:
+                        result[field] = history[field]
+                errors = history.get("errors") if isinstance(history, Mapping) else None
+                if isinstance(errors, Mapping):
+                    first_error = next(iter(errors.values()), None)
+                    if isinstance(first_error, str) and first_error.replace("_", "").isalnum():
+                        result["error_type"] = first_error
+                result.setdefault("error_type", "history_probe_unknown")
+            return result
+
+        facts: dict[str, object] = {}
+        public: object | None = None
+        remove_response_hook: Callable[[], None] | None = None
+        try:
+            public = self._public_client_factory()
+            remove_response_hook = _install_lp_response_fact_hook(
+                public,
+                path=(
+                    "/markets/keyset"
+                    if probe_stage == "metadata"
+                    else "/rewards/markets/current"
+                ),
+                facts=facts,
+            )
+            if probe_stage == "metadata":
+                if not requested_ids:
+                    raise ValueError("metadata_probe_identity_unknown")
+                paginator = public.list_markets(
+                    condition_ids=requested_ids[:1], page_size=1
+                )
+            else:
+                paginator = public.list_current_rewards(sponsored=False)
+            first_page = getattr(paginator, "first_page", None)
+            if not callable(first_page):
+                raise ValueError("reward_probe_paginator_unknown")
+            page = first_page()
+            items = _field(page, "items")
+            if not isinstance(items, Sequence) or isinstance(items, (str, bytes)):
+                raise ValueError("reward_probe_page_unknown")
+            has_more = _field(page, "has_more")
+            if type(has_more) is not bool:
+                raise ValueError("reward_probe_page_unknown")
+            result.update(
+                {
+                    "state": "healthy",
+                    "complete": True,
+                    "request_count": 1,
+                    "item_count": len(items),
+                    "has_more": has_more,
+                }
+            )
+        except _RewardReadCancelled:
+            result["error_type"] = "cancelled"
+        except Exception as exc:
+            result["error_type"] = _safe_read_failure("reward_probe", exc)
+            result["error_chain"] = _safe_read_error_chain(exc)
+        finally:
+            if remove_response_hook is not None:
+                remove_response_hook()
+            if public is not None:
+                close = getattr(public, "close", None)
+                if callable(close):
+                    close()
+
+        result.update(facts)
+        return result
 
     def lp_reward_rates(
         self, *, stop_event: threading.Event | None = None
