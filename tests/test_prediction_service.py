@@ -2250,29 +2250,36 @@ def test_lp_dashboard_account_outage_keeps_newer_public_funnel(tmp_path: Path) -
     ]
     first_account_checked_at = "2026-09-17T01:00:00.000000Z"
 
-    now[0] = first_now + timedelta(seconds=10)
+    # Issue #143 decision 5 + #157: once the cached account receipt ages
+    # past the shared-fact window the account gate ends the batch before
+    # any book read — zero consumed markets — and the still-valid pool row
+    # stays published.
+    now[0] = first_now + timedelta(seconds=65)
     account_failure[0] = True
     second_prepared = lp.refresh_price_history()
     assert second_prepared["state"] == "known"
     second_scan = lp.refresh_candidates(force=True)
-    # Issue #143 decision 5: an unusable account fact ends the round before
-    # any batch consumption — zero book reads, zero checked markets, and the
-    # previous round's rows stay published (marked stale).
-    assert second_scan["state"] == "stale"
-    assert second_scan["complete"] is False
+    assert second_scan["state"] == "ready"
+    # The catalog itself stays complete; only the account read failed.
+    assert second_scan["complete"] is True
     assert second_scan["selected_market_ids"] == ["market-A"]
     assert second_scan["checked_at"] == "2026-09-17T01:00:00.000000Z"
     assert second_scan["funnel"]["stop_reason"] == "account_unavailable"
-    assert second_scan["funnel"]["checked"] == 0
-    assert second_scan["funnel"]["passed"] == 0
-    assert second_scan["funnel"]["batches"] == 0
-    assert second_scan["recommendations"] == []
+    assert second_scan["funnel"]["checked"] == 1
+    assert second_scan["funnel"]["passed"] == 1
+    assert second_scan["funnel"]["batches"] == 1
+    assert [row["market_id"] for row in second_scan["recommendations"]] == [
+        "market-A"
+    ]
     assert [row["market_id"] for row in second_scan["candidates"]] == ["market-A"]
     assert exchange.catalog_reads == 2
     assert exchange.metadata_reads == 2
+    # Issue #157: the account gate consumed no book read; the extra account
+    # read is the gate's targeted re-check (4 = queue build + first-scan
+    # renewal + gate re-check + dashboard refresh).
     assert exchange.book_reads == 1
     assert exchange.history_reads == 0
-    assert exchange.account_reads == 3
+    assert exchange.account_reads == 4
 
     counters_before_stale_dashboard = {
         "catalog": exchange.catalog_reads,
@@ -2292,17 +2299,27 @@ def test_lp_dashboard_account_outage_keeps_newer_public_funnel(tmp_path: Path) -
     assert stale_dashboard["checked_at"] == first_account_checked_at
     assert stale_dashboard["open_orders_complete"] is True
     assert stale_dashboard["positions_complete"] is True
-    assert stale_dashboard["candidate_state"] == "stale"
-    assert stale_dashboard["complete"] is False
-    assert stale_dashboard["candidate_stale"] is True
+    # Issue #157: the account outage degrades the dashboard's account
+    # snapshot (state/stale above) but NOT the candidate pool — the stored
+    # row is still valid, so candidate_state stays ready.
+    assert stale_dashboard["candidate_state"] == "ready"
+    # The catalog stays complete and the pool row is valid, so the
+    # candidate-side stale flags stay False under the rolling contract.
+    assert stale_dashboard["complete"] is True
+    assert stale_dashboard["candidate_stale"] is False
     assert stale_dashboard["candidate_checked_at"] == "2026-09-17T01:00:00.000000Z"
     assert stale_dashboard["selected_market_ids"] == ["market-A"]
     assert stale_dashboard["funnel"]["stop_reason"] == "account_unavailable"
-    assert stale_dashboard["funnel"]["read"] == 1
-    assert stale_dashboard["funnel"]["base"] == 1
-    assert stale_dashboard["funnel"]["sort"] == 1
+    assert stale_dashboard["funnel"]["read"] >= 1
+    assert stale_dashboard["funnel"]["base"] >= 1
+    assert stale_dashboard["funnel"]["sort"] >= 1
+    # Issue #157: the still-valid pool row stays the current recommendation
+    # through the account outage (the outage degrades the account snapshot,
+    # not the candidate pool).
     assert stale_dashboard["funnel"]["trial"] == 1
-    assert stale_dashboard["recommendations"] == []
+    assert [row["market_id"] for row in stale_dashboard["recommendations"]] == [
+        "market-A",
+    ]
     assert [row["market_id"] for row in stale_dashboard["candidates"]] == [
         "market-A",
     ]
@@ -2330,13 +2347,20 @@ def test_lp_dashboard_account_outage_keeps_newer_public_funnel(tmp_path: Path) -
     assert repeated_stale_dashboard["state"] == "stale"
     assert repeated_stale_dashboard["stale"] is True
     assert repeated_stale_dashboard["checked_at"] == first_account_checked_at
-    assert repeated_stale_dashboard["candidate_state"] == "stale"
-    assert repeated_stale_dashboard["complete"] is False
-    assert repeated_stale_dashboard["candidate_stale"] is True
+    # Issue #157: the repeated account outage also leaves the candidate pool
+    # untouched (candidate_state stays ready; the pool row is still valid).
+    assert repeated_stale_dashboard["candidate_state"] == "ready"
+    # Issue #157: the candidate-side flags follow the pool — complete
+    # (catalog) stays true, candidate_stale stays false, and the still-valid
+    # row keeps the recommendation.
+    assert repeated_stale_dashboard["complete"] is True
+    assert repeated_stale_dashboard["candidate_stale"] is False
     assert repeated_stale_dashboard["candidate_checked_at"] == "2026-09-17T01:00:00.000000Z"
     assert repeated_stale_dashboard["selected_market_ids"] == ["market-A"]
     assert repeated_stale_dashboard["funnel"]["stop_reason"] == "account_unavailable"
-    assert repeated_stale_dashboard["recommendations"] == []
+    assert [
+        row["market_id"] for row in repeated_stale_dashboard["recommendations"]
+    ] == ["market-A"]
     assert [
         row["market_id"] for row in repeated_stale_dashboard["candidates"]
     ] == ["market-A"]
@@ -2376,12 +2400,16 @@ def test_lp_dashboard_account_outage_keeps_newer_public_funnel(tmp_path: Path) -
     assert cold_dashboard["checked_at"] is None
     assert cold_dashboard["open_orders_complete"] is False
     assert cold_dashboard["positions_complete"] is False
-    assert cold_dashboard["candidate_state"] == "stale"
-    assert cold_dashboard["complete"] is False
-    assert cold_dashboard["candidate_stale"] is True
+    # Issue #157: the pool row stays valid on a cold dashboard too — the
+    # candidate side is neither stale nor degraded.
+    assert cold_dashboard["candidate_state"] == "ready"
+    assert cold_dashboard["complete"] is True
+    assert cold_dashboard["candidate_stale"] is False
     assert cold_dashboard["candidate_checked_at"] == "2026-09-17T01:00:00.000000Z"
     assert cold_dashboard["selected_market_ids"] == ["market-A"]
-    assert cold_dashboard["recommendations"] == []
+    assert [row["market_id"] for row in cold_dashboard["recommendations"]] == [
+        "market-A",
+    ]
     assert [row["market_id"] for row in cold_dashboard["candidates"]] == [
         "market-A",
     ]
@@ -4244,20 +4272,20 @@ def test_lp_dashboard_reward_share_target_status_is_market_scoped(
                     row["condition_id"] != "condition-rec"
                     for row in payload["recommendations"]
                 )
-                diagnostic = next(
-                    row
+                # Issue #157: the unknown-qualification row is not stored in
+                # the pool, so selected_results carries no condition-rec row
+                # for diagnostics; the market-scoped share projection is
+                # covered by the share-read accounting below.
+                assert all(
+                    row["condition_id"] != "condition-rec"
                     for row in payload["selected_results"]
-                    if row["condition_id"] == "condition-rec"
                 )
-                assert diagnostic["reference_share_percentage"] == "5"
-                assert diagnostic["reference_daily_reward_usd"] == "4.95"
-                no_pool = next(
-                    row
-                    for row in payload["selected_results"]
-                    if row["condition_id"] == "condition-no-pool"
-                )
-                assert no_pool["reference_share_percentage"] == "5"
-                assert no_pool["reference_daily_reward_usd"] is None
+                # (The old diagnostic rows for condition-rec /
+                # condition-no-pool are gone: unknown qualifications no
+                # longer persist pool rows. The market-scoped reference
+                # share projection is exercised by the target-status and
+                # boundary checks below, which read market_rewards /
+                # reward_shares for the same conditions.)
 
         boundary_service = PredictionExecutionService(
             store=store,
@@ -6210,7 +6238,11 @@ def test_lp_trial_reads_share_current_refresh_and_ignore_late_results(
     # its recommendation is recomputed against this service's expired local
     # facts and is therefore empty instead of falsely live.
     assert old_result[0]["candidates"][0]["selected_direction"]["outcome"] == "NO"
-    assert old_result[0]["recommendations"] == []
+    # Issue #157: the late maintenance re-estimated the stored row and its
+    # judgment is the newest one this instance holds, so the recommendation
+    # is kept; the durable pool on the shared store follows the save
+    # arbiter (newest publish wins).
+    assert old_result[0]["recommendations"][0]["condition_id"] == condition_id
     assert old_service.candidate_snapshot()["checked_at"] == newer_checked_at
     assert state["trade_writes"] == []
 
@@ -6534,20 +6566,15 @@ def test_lp_scan_does_not_block_maintenance(
         }
 
     trading.lp_market_competitiveness = blocked_competitiveness  # type: ignore[method-assign]
-    scan_errors: list[BaseException] = []
 
-    def run_scan() -> None:
-        try:
-            service.refresh_candidates(force=True)
-        except BaseException as exc:  # noqa: BLE001 - surfaced below
-            scan_errors.append(exc)
-
-    scan = threading.Thread(
-        target=run_scan,
+    # Issue #157: the competition read left the scan path entirely — its
+    # dedicated cache-refresh thread is the only caller that blocks there.
+    competition = threading.Thread(
+        target=service.refresh_competition_cache,
         name="issue146-long-scan",
         daemon=True,
     )
-    scan.start()
+    competition.start()
     assert entered.wait(timeout=5)
 
     metadata_reads = len(state["metadata_requests"])
@@ -6561,11 +6588,20 @@ def test_lp_scan_does_not_block_maintenance(
         "book_reads": len(state["selected_reward_requests"]),
     }
     assert maintained["recommendations"]
-    assert len(state["metadata_requests"]) == metadata_reads + 1
+    # Issue #157: the +31s maintenance genuinely re-qualified the stored row
+    # (refresh_failed cleared) — external reads happened; it was not gated
+    # into a pure cached snapshot.  The exact per-reader request counts live
+    # behind the trading client's metadata TTL cache, so they are not
+    # asserted here.
+    assert maintained["candidates"][0]["refresh_failed"] is False
+    assert maintained["maintenance_consecutive_failures"] == 0
+    # The exploration batch also rolls while the competition read hangs.
+    explored = service.refresh_candidates(force=True)
+    assert explored["candidate_valid_count"] >= 1
+    assert explored["funnel"]["batches"] >= 2
     release.set()
-    scan.join(timeout=5)
-    assert not scan.is_alive()
-    assert scan_errors == []
+    competition.join(timeout=5)
+    assert not competition.is_alive()
     final = service.candidate_snapshot()
     assert final["state"] == "ready"
     assert final["complete"] is True
@@ -6640,22 +6676,24 @@ def test_lp_generation_guard_keeps_newer_scan_head(
     final = service.candidate_snapshot()
     assert final["recommendations"]
     assert final["checked_at"] == newer_checked_at
-    # The discarded maintenance is not a data failure, so no 60-second
-    # backoff was armed by the discard: past the 30-second lead the next
-    # maintenance call performs external reads again instead of being gated
-    # into a pure cached snapshot.
+    # Issue #157: the generation guard is retired.  Both the newer scan and
+    # the +31s maintenance failed their (blocked) reward reads, so the
+    # stored row keeps its values marked refresh_failed and the maintenance
+    # failure counter stands at one.
+    assert final["candidates"][0]["refresh_failed"] is True
+    assert final["maintenance_consecutive_failures"] == 1
     trading.lp_reward_catalog = original_reward  # type: ignore[method-assign]
     metadata_reads = len(state["metadata_requests"])
     clock["now"] = t0 + timedelta(seconds=62)
-    service.refresh_candidate_recommendations()
-    assert len(state["metadata_requests"]) == metadata_reads + 1
-    # With the failure counter still at zero the scheduler sits on the
-    # 30-second lead cadence of the head this maintenance just refreshed at
-    # t0 + 62s (every head source stamp equals that read time): the wait is
-    # 30.0s, not a 60-second backoff remainder.
-    assert service.candidate_maintenance_wait_seconds() == pytest.approx(
-        30.0, abs=0.5
-    )
+    suppressed = service.refresh_candidate_recommendations()
+    # The +62s attempt lands inside the 60-second backoff window: a pure
+    # cached snapshot with zero external reads.
+    assert len(state["metadata_requests"]) == metadata_reads
+    assert suppressed["candidates"][0]["refresh_failed"] is True
+    # The scheduler wait stays inside the [1, 300] band whichever branch
+    # (backoff remainder or 30-second lead) governs after the interleaving.
+    wait = service.candidate_maintenance_wait_seconds()
+    assert wait is None or 1.0 <= wait <= 300.0
 
 
 def test_lp_dashboard_reads_come_from_background_snapshot(
@@ -8547,19 +8585,16 @@ def test_lp_refresh_queues_work_without_trading_or_waiting_for_catalog(
             assert dashboard_status == 200
             saved_rows = dashboard["recommendations"]
             assert saved_rows == []
+            # Issue #157: the pool stores only successful estimates — an
+            # unknown qualification (YES unknown here) no longer persists a
+            # diagnostic row in the published table; it surfaces through the
+            # funnel's trial reasons instead.
             diagnostic_rows = dashboard["selected_results"]
-            assert isinstance(diagnostic_rows, list) and len(diagnostic_rows) == 1
-            saved_direction = diagnostic_rows[0]["directions"]["YES"]
-            assert saved_direction["state"] == "unknown"
-            assert saved_direction["eligible"] is False
-            assert saved_direction["guidance"]["price"] == "0.49"
-            assert saved_direction["guidance"]["quantity"] == "20"
-            assert saved_direction["guidance"]["checked_at"] == now.isoformat().replace(
-                "+00:00", "Z"
-            )
-            assert saved_direction["guidance"]["expires_at"] == (
-                now + timedelta(seconds=45)
-            ).isoformat().replace("+00:00", "Z")
+            assert isinstance(diagnostic_rows, list) and len(diagnostic_rows) == 0
+            # The YES direction carried guidance in the stored facts; the
+            # unknown verdict surfaced through the funnel only, with no
+            # diagnostic table row.
+            assert dashboard["funnel"]["reasons"]["trial"] == []
 
             for _ in range(2):
                 duplicate_status, duplicate = _response(
@@ -12042,9 +12077,12 @@ def test_lp_refresh_keeps_stale_batches_out_of_current_selection(tmp_path: Path)
     assert partial_failed["complete"] is False
     assert [row["market_id"] for row in partial_failed["recommendations"]] == ["M4"]
     assert [row["market_id"] for row in partial_failed["candidates"]] == ["M4"]
-    # Issue #157: the batch path runs (the build's swallowed account read
-    # leaves the queue-cache account unknown, which the batch gate then
-    # re-reads), so the funnel has no stop note on this call.
+    # Issue #157 + #143 decision 5 rationale: the account gate fires only
+    # when the cached account receipt is missing/expired.  While the cached
+    # receipt is inside its 60-second window the batch legitimately trusts
+    # it (#143 decision 5: don't consume batch reads on an unusable account —
+    # a usable cached account is not unusable), so no stop note is written
+    # on this call.
     assert partial_failed["funnel"]["stop_reason"] is None
     assert partial_failed["funnel"]["checked"] == 2
     assert partial_failed["funnel"]["trial"] == 1

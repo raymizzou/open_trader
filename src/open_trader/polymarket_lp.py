@@ -781,8 +781,19 @@ class PolymarketLPService:
                         raw_condition = payload.get("condition_id")
                 if isinstance(raw_condition, str) and raw_condition.strip() in rank:
                     active_session_condition = raw_condition.strip()
+        pool_rows: tuple[Mapping[str, object], ...] = tuple()
+        with self._candidate_state_lock:
+            pool_rows = tuple(
+                row
+                for row in self._candidate_pool.values()
+                if isinstance(row, Mapping)
+            )
         for field in ("selected_results", "recommendations", "candidates"):
-            rows = snapshot.get(field)
+            rows: object = snapshot.get(field)
+            if field == "candidates" and pool_rows:
+                # Issue #157: the rolling pool is the live row source; its
+                # rows join the persisted selected_results for ranking.
+                rows = pool_rows
             if not isinstance(rows, (list, tuple)):
                 continue
             for row in rows:
@@ -1838,9 +1849,13 @@ class PolymarketLPService:
             "candidates": published,
             "recommendations": [deepcopy(published[0])] if published else [],
             "selected_results": deepcopy(published),
-            "checked_at": snapshot.get("checked_at"),
-            "last_success_at": last_success_at,
-            "last_attempt_at": snapshot.get("last_attempt_at"),
+            # Published stamps keep the durable (ISO string) shape that the
+            # whole-snapshot contract always had via its store round trip.
+            "checked_at": _pool_published_value(snapshot.get("checked_at")),
+            "last_success_at": _pool_published_value(last_success_at),
+            "last_attempt_at": _pool_published_value(
+                snapshot.get("last_attempt_at")
+            ),
             "candidate_rows_fresh": bool(published),
             "missing_metadata_condition_ids": snapshot.get(
                 "missing_metadata_condition_ids", []
@@ -3911,9 +3926,22 @@ class PolymarketLPService:
         if not isinstance(pool, Mapping) or not pool:
             # Pre-pool snapshots carry whole-round rows without per-row
             # judgment times.  They cannot be presented as valid estimates
-            # under the rolling contract, so the pool starts empty.
+            # under the rolling contract, so the pool starts empty — but the
+            # row metadata is still kept: preparation prioritization (issue
+            # #152 era) consumes the persisted selected_results markers.
             with self._candidate_state_lock:
                 self._candidate_attempted_at = None
+                # state/complete are whole-round claims: a legacy snapshot
+                # must not present itself as a valid result, so only the
+                # prioritization inputs are restored.
+                for key in (
+                    "selected_results",
+                    "recommendations",
+                    "event_end_confirmations",
+                ):
+                    if key in saved:
+                        self._candidate_snapshot[key] = deepcopy(saved[key])
+                self._candidate_snapshot["scanning"] = False
             return
         restored_pool: dict[str, dict[str, object]] = {}
         for condition_id, row in pool.items():
@@ -5312,6 +5340,8 @@ class PolymarketLPService:
             )
             metadata_error: str | None = None
             refreshed_metadata: dict[str, Mapping[str, object]] = {}
+            import sys
+            print("MAINT_META_DUE", metadata_due, file=sys.stderr)
             if metadata_due:
                 metadata_reader = getattr(
                     self.exchange, "lp_market_metadata_fresh", None
@@ -5369,6 +5399,8 @@ class PolymarketLPService:
                 )
 
             reward_error: str | None = None
+            import sys
+            print("MAINT_REACHED_REWARD metadata_due=", metadata_due, "metadata_error=", metadata_error, file=sys.stderr)
             refreshed_rewards: dict[str, Mapping[str, object]] = {}
             raw_reward: Mapping[str, object] | None = None
             if reward_due:

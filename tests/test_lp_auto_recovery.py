@@ -134,7 +134,9 @@ def test_transient_outage_recovers_after_more_than_two_failures(tmp_path) -> Non
 
         candidate = service.candidate_snapshot()
         assert candidate["state"] == "unknown"
-        assert candidate["stale"] is True
+        # Issue #157: the whole-snapshot staleness flag is retired; a
+        # waiting preparation no longer marks the candidate projection stale.
+        assert candidate["stale"] is False
 
         clock[0] = expected_retry_at - timedelta(seconds=1)
         waiting = service.refresh_price_history()
@@ -160,10 +162,11 @@ def test_transient_outage_recovers_after_more_than_two_failures(tmp_path) -> Non
     assert persisted["last_success_at"] == preparation["last_success_at"]
 
     # A valid preparation result does not itself publish candidate eligibility;
-    # the stale/unknown candidate projection remains safe until a scan validates it.
+    # the unknown candidate projection remains safe until an exploration batch
+    # validates it (issue #157: no whole-snapshot staleness flag).
     candidate = service.candidate_snapshot()
     assert candidate["state"] == "unknown"
-    assert candidate["stale"] is True
+    assert candidate["stale"] is False
 
 
 def test_failed_market_full_reads_keep_exponential_backoff_across_restart(
