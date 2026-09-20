@@ -7912,3 +7912,316 @@ def test_candidate_snapshot_has_no_whole_snapshot_expiry(tmp_path) -> None:
     assert "candidate_snapshot_stale" not in serialized
     assert at_61["stale"] is False
     assert at_61["recommendations"][0]["market_id"] == "market-M01"
+
+
+def test_refresh_candidates_mid_batch_failure_publishes_honestly(
+    tmp_path,
+) -> None:
+    """Issue #157 review R3: a fake store read raising mid-batch must not
+    leave the projection stuck on ``scanning`` — the failure publishes with
+    the pool rows kept, ``retention_reason="candidate_refresh_failed"``,
+    and the next batch recovers normally."""
+
+    now = datetime(2026, 9, 21, 9, tzinfo=UTC)
+    current = {"now": now}
+    pools = {"M01": Decimal(600), "M02": Decimal(590), "M03": Decimal(580)}
+    exchange = _LPCandidateQueryExchange(now, pools)
+    store = PredictionArbitrageStore(tmp_path)
+    lp = PolymarketLPService(store, exchange, clock=lambda: current["now"])
+    assert lp.refresh_price_history()["state"] == "known"
+
+    first = lp.refresh_candidates(force=True)
+    assert [row["market_id"] for row in first["candidates"]] == [
+        "market-M01", "market-M02", "market-M03",
+    ]
+    original_updated = first["candidates"][0]["updated_at"]
+
+    # The reservations read is the batch's last read before publication:
+    # make it raise once, mid-batch, after the books were already read.
+    real_reader = store.lp_active_session
+    failure = {"on": False}
+
+    def failing_reader():
+        if failure["on"]:
+            raise RuntimeError("reservations_read_failed")
+        return real_reader()
+
+    store.lp_active_session = failing_reader  # type: ignore[method-assign]
+
+    failure["on"] = True
+    current["now"] = now + timedelta(seconds=5)
+    exchange.now = current["now"]
+    failed = lp.refresh_candidates(force=True)
+
+    assert failed["scanning"] is False
+    assert failed["retention_reason"] == "candidate_refresh_failed"
+    # The batch was not consumed and the pool rows are kept for display.
+    assert failed["funnel"]["batches"] == 1
+    assert [row["market_id"] for row in failed["candidates"]] == [
+        "market-M01", "market-M02", "market-M03",
+    ]
+    assert failed["candidates"][0]["updated_at"] == original_updated
+
+    # The next batch recovers normally.
+    failure["on"] = False
+    current["now"] = now + timedelta(seconds=10)
+    exchange.now = current["now"]
+    recovered = lp.refresh_candidates(force=True)
+
+    assert recovered["scanning"] is False
+    assert recovered["retention_reason"] is None
+    assert recovered["funnel"]["batches"] == 2
+    assert recovered["candidates"][0]["updated_at"] == _iso_z(
+        now + timedelta(seconds=10)
+    )
+
+
+def test_maintenance_late_failure_never_mislabels_newer_row(tmp_path) -> None:
+    """Issue #157 review R4: a whole-round maintenance failure judged before
+    the stored row's ``updated_at`` is a late arrival — it must neither mark
+    the newer row ``refresh_failed`` nor advance its failure ladder."""
+
+    now = datetime(2026, 9, 21, 11, tzinfo=UTC)
+    current = {"now": now}
+    pools = {"M01": Decimal(600), "M02": Decimal(590)}
+    exchange = _LPYieldBooksExchange(now, pools)
+    lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
+    )
+    assert lp.refresh_price_history()["state"] == "known"
+
+    assert lp.refresh_candidates(force=True)["candidate_valid_count"] == 2
+    # A second exploration batch re-judges both markets at +40s; the queue
+    # facts keep their build-era stamps, so maintenance stays lead-due.
+    current["now"] = now + timedelta(seconds=40)
+    exchange.now = current["now"]
+    second = lp.refresh_candidates(force=True)
+    newer_updated = second["candidates"][0]["updated_at"]
+
+    # The books disappear for a maintenance round judged at +35s — before
+    # the row's +40s judgment.  The late failure must not mislabel it.
+    exchange.omit_tokens = frozenset({
+        "token-condition-M01-yes", "token-condition-M01-no",
+        "token-condition-M02-yes", "token-condition-M02-no",
+    })
+    current["now"] = now + timedelta(seconds=35)
+    exchange.now = current["now"]
+    lp.refresh_candidate_recommendations()
+
+    snapshot = lp.candidate_snapshot()
+    assert [row["market_id"] for row in snapshot["candidates"]] == [
+        "market-M01", "market-M02",
+    ]
+    assert all(row["refresh_failed"] is False for row in snapshot["candidates"])
+    assert snapshot["candidate_failed_recent_count"] == 0
+    assert snapshot["candidates"][0]["updated_at"] == newer_updated
+    # The round itself still counts as a maintenance failure.
+    assert snapshot["maintenance_consecutive_failures"] == 1
+
+
+def test_maintenance_late_rejection_never_evicts_newer_row(tmp_path) -> None:
+    """Issue #157 review R4: a deterministic rejection judged before the
+    stored row's ``updated_at`` is a late arrival — it must not evict the
+    newer successful row from the pool."""
+
+    now = datetime(2026, 9, 21, 12, tzinfo=UTC)
+    current = {"now": now}
+    pools = {"M01": Decimal(600), "M02": Decimal(590)}
+    exchange = _LPCandidateQueryExchange(now, pools)
+    lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
+    )
+    assert lp.refresh_price_history()["state"] == "known"
+
+    assert lp.refresh_candidates(force=True)["candidate_valid_count"] == 2
+    current["now"] = now + timedelta(seconds=40)
+    exchange.now = current["now"]
+    second = lp.refresh_candidates(force=True)
+    newer_updated = second["candidates"][0]["updated_at"]
+
+    # A maintenance round judged at +35s reads an off-tick book: its
+    # rejection is older than the +40s rows and must not evict them.
+    exchange.book_bid = Decimal("0.345")
+    current["now"] = now + timedelta(seconds=35)
+    exchange.now = current["now"]
+    lp.refresh_candidate_recommendations()
+
+    snapshot = lp.candidate_snapshot()
+    assert [row["market_id"] for row in snapshot["candidates"]] == [
+        "market-M01", "market-M02",
+    ]
+    assert all(row["state"] == "eligible" for row in snapshot["candidates"])
+    assert all(row["refresh_failed"] is False for row in snapshot["candidates"])
+    assert snapshot["candidates"][0]["updated_at"] == newer_updated
+
+
+def test_maintenance_guard_rejected_success_is_not_a_failure(tmp_path) -> None:
+    """Issue #157 review R4: a maintenance success rejected by the one-line
+    write protection (a concurrent newer row already holds the line) is not
+    a round failure — it must not advance the 60/120/300s backoff."""
+
+    now = datetime(2026, 9, 21, 13, tzinfo=UTC)
+    current = {"now": now}
+    exchange = _LPCandidateQueryExchange(now, {"M01": Decimal(600)})
+    lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
+    )
+    assert lp.refresh_price_history()["state"] == "known"
+
+    assert lp.refresh_candidates(force=True)["candidate_valid_count"] == 1
+    current["now"] = now + timedelta(seconds=40)
+    exchange.now = current["now"]
+    second = lp.refresh_candidates(force=True)
+    newer_updated = second["candidates"][0]["updated_at"]
+
+    # A healthy maintenance round judged at +35s — before the +40s row.
+    # Its write loses the one-line write protection, which is not a
+    # failure: the backoff ladder stays at zero.
+    current["now"] = now + timedelta(seconds=35)
+    exchange.now = current["now"]
+    lp.refresh_candidate_recommendations()
+
+    snapshot = lp.candidate_snapshot()
+    assert snapshot["candidates"][0]["updated_at"] == newer_updated
+    assert snapshot["maintenance_consecutive_failures"] == 0
+    assert snapshot["maintenance_next_attempt_at"] is None
+
+
+def test_subsequent_publish_evicts_expired_rows_and_facts(tmp_path) -> None:
+    """Issue #157 review R5: every publication first evicts the rows the
+    current clock has expired together with their qualification facts — the
+    pool, its persisted payload, and a restart restore cannot grow without
+    bound or resurrect ghost rows."""
+
+    now = datetime(2026, 9, 21, 14, tzinfo=UTC)
+    current = {"now": now}
+    pools = {f"M{index:02d}": Decimal(600 - index) for index in range(1, 61)}
+    exchange = _LPYieldBooksExchange(now, pools)
+    store = PredictionArbitrageStore(tmp_path)
+    lp = PolymarketLPService(store, exchange, clock=lambda: current["now"])
+    assert lp.refresh_price_history()["state"] == "known"
+
+    first = lp.refresh_candidates(force=True)
+    assert [row["market_id"] for row in first["candidates"]] == [
+        f"market-M{index:02d}" for index in range(1, 11)
+    ]
+
+    # Beyond the five-minute validity the next batch rolls to ten never-tried
+    # markets; its publication evicts the ten expired rows and their facts.
+    current["now"] = now + timedelta(seconds=310)
+    exchange.now = current["now"]
+    second = lp.refresh_candidates(force=True)
+    assert [row["market_id"] for row in second["candidates"]] == [
+        f"market-M{index:02d}" for index in range(11, 21)
+    ]
+
+    fresh_condition_ids = {f"condition-M{index:02d}" for index in range(11, 21)}
+    saved_pool = store.lp_screening_snapshot()["pool"]
+    assert set(saved_pool) == fresh_condition_ids
+    # Qualification facts have no public projection; assert the service
+    # state directly so the cleanup contract stays pinned.
+    with lp._candidate_state_lock:
+        assert set(lp._candidate_qualification_facts) == fresh_condition_ids
+
+    # A restarted service restores the pruned pool — no expired ghost rows.
+    restored = PolymarketLPService(store, exchange, clock=lambda: current["now"])
+    with restored._candidate_state_lock:
+        assert set(restored._candidate_pool) == fresh_condition_ids
+    assert restored.candidate_snapshot()["candidate_valid_count"] == 10
+
+
+def test_candidate_pending_count_counts_current_queue_members(tmp_path) -> None:
+    """Issue #157 review R6: pending counts the current queue members that
+    have never been tried — rotation stamps of markets that left the queue
+    no longer mask untried ones."""
+
+    now = datetime(2026, 9, 21, 15, tzinfo=UTC)
+    current = {"now": now}
+    pools = {f"M{index:02d}": Decimal(600 - index) for index in range(1, 31)}
+
+    class ExitExchange(_LPCandidateQueryExchange):
+        def __init__(self, initial_now: datetime) -> None:
+            super().__init__(initial_now, pools)
+            self.exit_suffixes: frozenset[str] = frozenset()
+
+        def lp_reward_catalog(self, *, condition_ids=None, stop_event=None):
+            catalog = super().lp_reward_catalog(
+                condition_ids=condition_ids, stop_event=stop_event
+            )
+            rows = catalog.get("markets")
+            adjusted = tuple(
+                {**row, "reward_active": False}
+                if str(row.get("condition_id") or "").removeprefix(
+                    "condition-"
+                ) in self.exit_suffixes
+                else row
+                for row in rows
+            )
+            return {**catalog, "markets": adjusted}
+
+    exchange = ExitExchange(now)
+    lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
+    )
+    assert lp.refresh_price_history()["state"] == "known"
+
+    first = lp.refresh_candidates(force=True)
+    assert first["funnel"]["checked"] == 10
+    assert first["candidate_pending_count"] == 20
+
+    # M09 and M10 leave the base queue (reward inactive); the rebuilt queue
+    # keeps 28 members and their stale rotation stamps must not mask the
+    # ten members still untried (M21-M30).
+    exchange.exit_suffixes = frozenset({"M09", "M10"})
+    current["now"] = now + timedelta(seconds=5)
+    exchange.now = current["now"]
+    assert lp.refresh_price_history()["state"] == "known"
+    second = lp.refresh_candidates(force=True)
+
+    assert second["funnel"]["queue_total"] == 28
+    assert second["funnel"]["checked"] == 20
+    assert second["candidate_pending_count"] == 10
+    assert second["funnel"]["unchecked"] == 10
+
+
+def test_healthy_batch_clears_stale_stop_reason(tmp_path) -> None:
+    """Issue #157 review R7: the ``account_unavailable`` stop note reported
+    by a failed batch is cleared by the next healthy batch — the projection
+    never reports a stale stop reason after recovery."""
+
+    now = datetime(2026, 9, 21, 16, tzinfo=UTC)
+    current = {"now": now}
+    pools = {f"N{index:02d}": Decimal(500 - index) for index in range(1, 4)}
+
+    class Exchange(_LPBatchQueryExchange):
+        def __init__(self, initial_now: datetime) -> None:
+            super().__init__(initial_now, pools)
+            self.account_mode = "valid"
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            if self.account_mode == "failure":
+                raise RuntimeError("account_read_failed")
+            return super().lp_account_snapshot()
+
+    exchange = Exchange(now)
+    lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
+    )
+    assert lp.refresh_price_history()["state"] == "known"
+    assert lp.refresh_candidates(force=True)["state"] == "ready"
+
+    exchange.account_mode = "failure"
+    current["now"] = now + timedelta(seconds=65)
+    exchange.now = current["now"]
+    failed = lp.refresh_candidates(force=True)
+    assert failed["funnel"]["stop_reason"] == "account_unavailable"
+
+    # The account recovers: the next healthy batch publishes its own
+    # semantics and no longer reports the stale stop note.
+    exchange.account_mode = "valid"
+    current["now"] = now + timedelta(seconds=66)
+    exchange.now = current["now"]
+    recovered = lp.refresh_candidates(force=True)
+    assert recovered["state"] == "ready"
+    assert recovered["funnel"]["stop_reason"] is None
+    assert recovered["retention_reason"] is None

@@ -19,6 +19,7 @@ from .daily_premarket import send_notification_with_results
 from .polymarket_monitor import PolymarketMonitor
 from .polymarket_lp import (
     _LP_CANDIDATE_BATCH_MIN_INTERVAL_SECONDS,
+    _LP_COMPETITION_REFRESH_SECONDS,
     PolymarketLPService,
 )
 from .polymarket_relation_discovery import (
@@ -468,6 +469,9 @@ class PredictionRuntime:
         self._candidate_maintenance_wakeup = threading.Event()
         self._candidate_scan_thread: threading.Thread | None = None
         self._candidate_maintenance_thread: threading.Thread | None = None
+        # Issue #157: the official competition cache refreshes on its own
+        # daemon thread; candidate paths only read the in-memory cache.
+        self._candidate_competition_thread: threading.Thread | None = None
         self._lp_dashboard_thread: threading.Thread | None = None
         self._reward_thread: threading.Thread | None = None
         self._lp_share_thread: threading.Thread | None = None
@@ -952,6 +956,7 @@ class PredictionRuntime:
             self._start_history_monitor()
             self._start_candidate_scan_monitor()
             self._start_candidate_maintenance_monitor()
+            self._start_candidate_competition_monitor()
             self._start_lp_dashboard_monitor()
             self._start_reward_monitor()
             self._start_lp_share_watch()
@@ -1207,6 +1212,47 @@ class PredictionRuntime:
             daemon=True,
         )
         self._candidate_maintenance_thread.start()
+
+    def _start_candidate_competition_monitor(self) -> None:
+        """Refresh the official competition cache on its own thread (#157).
+
+        The loop is the only production caller of
+        ``refresh_competition_cache``: every ``_LP_COMPETITION_REFRESH_SECONDS``
+        it pulls official competitiveness into the in-memory cache that
+        candidate batch paths read without blocking.  The wait shares the
+        cooperative stop event with the other candidate monitors.
+        """
+
+        if self.lp is None or self._candidate_competition_thread is not None:
+            return
+
+        def run() -> None:
+            while not self._reward_stop_event.is_set():
+                lp = self.lp
+                if lp is None:
+                    return
+                refresh_competition = getattr(
+                    lp, "refresh_competition_cache", None
+                )
+                if not callable(refresh_competition):
+                    return
+                try:
+                    refresh_competition(
+                        stop_event=self._reward_stop_event
+                    )
+                except Exception:
+                    # A failed competition read keeps the previous cache on
+                    # the LP service side; the next cadence retries.
+                    logger.exception("prediction_lp_competition_refresh_failed")
+                if self._reward_stop_event.wait(_LP_COMPETITION_REFRESH_SECONDS):
+                    return
+
+        self._candidate_competition_thread = threading.Thread(
+            target=run,
+            name="prediction-lp-competition-monitor",
+            daemon=True,
+        )
+        self._candidate_competition_thread.start()
 
     def _start_lp_dashboard_monitor(self) -> None:
         """Publish the LP dashboard snapshot the page endpoint serves."""
@@ -1725,6 +1771,7 @@ class PredictionRuntime:
         for attr, label in (
             ("_candidate_scan_thread", "candidate scan monitor"),
             ("_candidate_maintenance_thread", "candidate maintenance monitor"),
+            ("_candidate_competition_thread", "candidate competition monitor"),
             ("_lp_dashboard_thread", "LP dashboard snapshot monitor"),
         ):
             thread = getattr(self, attr)

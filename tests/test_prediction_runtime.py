@@ -9144,3 +9144,63 @@ def test_lp_dashboard_orders_carry_purpose_and_min_scoring_size(tmp_path: Path) 
     assert today["sell-order"]["purpose"] is None
     assert today["rules-missing-order"]["purpose"] is None
     assert today["rules-missing-order"]["min_scoring_size"] is None
+
+
+def test_candidate_competition_monitor_refreshes_and_stops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #157 review R1: the production runtime wires the official
+    competition refresh onto its own daemon thread — the reader runs with
+    the cooperative stop event at the configured cadence, a second start
+    never spawns a second loop, and the stop event ends the thread."""
+
+    import open_trader.prediction_runtime as runtime_module
+
+    class FakeLP:
+        def __init__(self) -> None:
+            self.calls: list[threading.Event | None] = []
+            self.first_call = threading.Event()
+
+        def refresh_competition_cache(
+            self, *, stop_event: threading.Event | None = None
+        ) -> dict[str, object]:
+            self.calls.append(stop_event)
+            self.first_call.set()
+            return {"state": "unknown"}
+
+    runtime = PredictionRuntime(
+        data_dir=tmp_path,
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+    )
+    lp = FakeLP()
+    runtime.lp = lp  # type: ignore[assignment]
+    monkeypatch.setattr(
+        runtime_module, "_LP_COMPETITION_REFRESH_SECONDS", 0.01
+    )
+
+    try:
+        runtime._start_candidate_competition_monitor()
+        thread = runtime._candidate_competition_thread
+        assert thread is not None
+        assert thread.name == "prediction-lp-competition-monitor"
+        assert thread.daemon is True
+        assert lp.first_call.wait(timeout=2)
+        deadline = time.monotonic() + 2
+        while len(lp.calls) < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(lp.calls) >= 3
+        assert all(call is runtime._reward_stop_event for call in lp.calls)
+
+        runtime._start_candidate_competition_monitor()
+        assert runtime._candidate_competition_thread is thread
+
+        runtime._reward_stop_event.set()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+    finally:
+        runtime._reward_stop_event.set()
+        thread = runtime._candidate_competition_thread
+        if thread is not None:
+            thread.join(timeout=2)
+            runtime._candidate_competition_thread = None

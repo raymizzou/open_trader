@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 import uuid
@@ -104,6 +105,8 @@ LP_PROTECTION_DATA_FAILURE_LIMIT = 10
 _QUEUE_DATA_FAILURE_REASONS = frozenset(
     {"external_snapshot_unknown", "book_unknown", "book_freshness_unknown"}
 )
+
+logger = logging.getLogger(__name__)
 
 
 class _MutationBlocked(RuntimeError):
@@ -664,8 +667,11 @@ class PolymarketLPService:
         )
         self._candidate_queue_funnel: dict[str, object] = {}
         self._candidate_queue_state: dict[str, object] | None = None
+        # Issue #157 review R6: the current queue's condition ids, kept next
+        # to the queue funnel so pending can count untried members directly
+        # instead of subtracting a rotation that outlives the queue.
+        self._candidate_queue_condition_ids: tuple[str, ...] = ()
         self._candidate_pool_last_saved_at: datetime | None = None
-        self._candidate_stop_note: str | None = None
         self._prepared_inputs: dict[str, object] | None = None
         self._prepared_inputs_version = 0
         self._candidate_snapshot: dict[str, object] = {
@@ -1750,6 +1756,7 @@ class PolymarketLPService:
             snapshot = deepcopy(self._candidate_snapshot)
             funnel = deepcopy(self._candidate_funnel_totals)
             queue_funnel = deepcopy(self._candidate_queue_funnel)
+            queue_condition_ids = self._candidate_queue_condition_ids
             rotation = deepcopy(self._candidate_rotation)
             competition_state = deepcopy(self._competition_state)
         from .polymarket_lp_views import LP_TRIAL_CANDIDATE_LIMIT
@@ -1768,17 +1775,19 @@ class PolymarketLPService:
         failed_count = sum(
             1 for row in valid_rows if row.get("refresh_failed") is True
         )
-        tried = sum(
-            1
-            for entry in rotation.values()
-            if isinstance(entry, Mapping) and entry.get("last_attempt_at") is not None
-        )
-        queue_total = queue_funnel.get("queue_total")
-        pending = (
-            max(0, int(queue_total) - tried)
-            if isinstance(queue_total, int)
-            else 0
-        )
+        # Issue #157 review R6: pending counts the current queue members
+        # without a rotation attempt stamp directly.  The rotation outlives
+        # the queue (markets leave, restarts restore it), so subtracting its
+        # size from the queue total could underreport — even to zero — while
+        # untried members remain.
+        pending = 0
+        for condition_id in queue_condition_ids:
+            entry = rotation.get(condition_id)
+            if (
+                not isinstance(entry, Mapping)
+                or entry.get("last_attempt_at") is None
+            ):
+                pending += 1
         # Scheduler hint for the exploration loop: zero while any queue
         # market is still untried or any tried market is out of backoff,
         # otherwise the seconds until the earliest backoff expiry.
@@ -4233,6 +4242,13 @@ class PolymarketLPService:
             trial.get("compared_range") or {}
         )
         queue_funnel["queue_total"] = len(queue_normal) + len(queue_backup)
+        queue_condition_ids: dict[str, None] = {}
+        for candidate in (*queue_normal, *queue_backup):
+            if not isinstance(candidate, Mapping):
+                continue
+            condition_id = str(candidate.get("condition_id") or "").strip()
+            if condition_id:
+                queue_condition_ids[condition_id] = None
         # Keep the published (JSON-like) funnel shape, as the whole-scan
         # snapshot did through its durable-store round trip.
         queue_funnel = _pool_published_value(queue_funnel)
@@ -4273,6 +4289,9 @@ class PolymarketLPService:
             ):
                 self._candidate_queue_state = state
                 self._candidate_queue_funnel = dict(queue_funnel)
+                self._candidate_queue_condition_ids = tuple(
+                    queue_condition_ids
+                )
             return self._candidate_queue_state or state
 
     def _candidate_rotation_entry(
@@ -4615,12 +4634,21 @@ class PolymarketLPService:
 
         The row keeps its values until its original ``expires_at``, is
         marked ``refresh_failed``, and its ``updated_at`` never moves; the
-        market's rotation failure ladder advances (60/120/300s).
+        market's rotation failure ladder advances (60/120/300s).  A failure
+        judged before the stored row's ``updated_at`` is a late arrival: it
+        neither mislabels the newer row nor advances the ladder (issue #157
+        review R4).
         """
 
         with self._candidate_state_lock:
             existing = self._candidate_pool.get(condition_id)
             if existing is not None:
+                existing_updated = _candidate_row_updated_at(existing)
+                if (
+                    existing_updated is not None
+                    and existing_updated > attempted_at
+                ):
+                    return
                 existing["refresh_failed"] = True
             entry = self._candidate_rotation.get(condition_id)
             rotation = dict(entry) if isinstance(entry, Mapping) else {}
@@ -4635,15 +4663,49 @@ class PolymarketLPService:
         self, condition_id: str, *, judged_at: datetime
     ) -> None:
         """Remove a deterministically rejected market from the pool and put
-        it back at the rotation tail (issue #157)."""
+        it back at the rotation tail (issue #157).
+
+        A rejection judged before the stored row's ``updated_at`` is a late
+        arrival: the newer row keeps its place in the pool (issue #157
+        review R4)."""
 
         with self._candidate_state_lock:
+            existing = self._candidate_pool.get(condition_id)
+            if existing is not None:
+                existing_updated = _candidate_row_updated_at(existing)
+                if (
+                    existing_updated is not None
+                    and existing_updated > judged_at
+                ):
+                    return
             self._candidate_pool.pop(condition_id, None)
             entry = self._candidate_rotation.get(condition_id)
             rotation = dict(entry) if isinstance(entry, Mapping) else {}
             rotation["last_attempt_at"] = _iso(judged_at)
             rotation["failures"] = 0
             self._candidate_rotation[condition_id] = rotation
+
+    def _candidate_pool_prune_expired_locked(
+        self, now: datetime
+    ) -> list[str]:
+        """Evict expired pool rows with their qualification facts (R5).
+
+        Called with ``_candidate_state_lock`` held from the publication
+        path: every publish drops the rows the current clock has expired so
+        the in-memory pool, its persisted payload, and a restart restore
+        cannot grow without bound.  Reads stay read-only and never mutate
+        the pool.  Returns the evicted condition ids.
+        """
+
+        expired = [
+            condition_id
+            for condition_id, row in self._candidate_pool.items()
+            if _candidate_pool_row_expired(row, now)
+        ]
+        for condition_id in expired:
+            self._candidate_pool.pop(condition_id, None)
+            self._candidate_qualification_facts.pop(condition_id, None)
+        return expired
 
     def _save_candidate_pool(self, *, force: bool = False) -> None:
         """Persist the pool with the five-second save throttle (issue #157).
@@ -4711,6 +4773,10 @@ class PolymarketLPService:
         now = self._now()
         attempted = attempted_at or now
         with self._candidate_state_lock:
+            # Issue #157 review R5: a publication first evicts every row the
+            # current clock has expired, together with its qualification
+            # facts, before the refreshed metadata is published and saved.
+            self._candidate_pool_prune_expired_locked(now)
             snapshot = deepcopy(self._candidate_snapshot)
             snapshot["scanning"] = scanning
             snapshot["last_attempt_at"] = attempted
@@ -4723,10 +4789,17 @@ class PolymarketLPService:
             if state is not None:
                 snapshot["state"] = state
             if notes:
-                if "stop_reason" in notes:
-                    self._candidate_stop_note = notes.get("stop_reason")
                 for key, value in notes.items():
                     snapshot[key] = deepcopy(value)
+            # Issue #157 review R3/R7: a publication always carries its own
+            # batch's semantics — a batch without a stop note or retention
+            # reason clears any stale one instead of reporting it forever.
+            snapshot["stop_reason"] = (
+                deepcopy(notes.get("stop_reason")) if notes else None
+            )
+            snapshot["retention_reason"] = (
+                deepcopy(notes.get("retention_reason")) if notes else None
+            )
             if missing_book_token_ids is not None:
                 snapshot["missing_book_token_ids"] = list(
                     dict.fromkeys(missing_book_token_ids)
@@ -5133,7 +5206,15 @@ class PolymarketLPService:
                 missing_book_token_ids=missing_book_token_ids,
             )
         except Exception:
-            return self.candidate_snapshot()
+            # Issue #157 review R3: a mid-batch failure publishes honestly —
+            # the stuck ``scanning`` flag is cleared, the pool rows stay for
+            # read-only display, and the failure carries the retention
+            # reason the whole-scan path used to publish.  The next batch
+            # retries from the unchanged rotation.
+            logger.exception("candidate_refresh_failed")
+            return self._finish_candidate_scan(
+                notes={"retention_reason": "candidate_refresh_failed"},
+            )
         finally:
             self._candidate_scan_lock.release()
 
@@ -5340,8 +5421,6 @@ class PolymarketLPService:
             )
             metadata_error: str | None = None
             refreshed_metadata: dict[str, Mapping[str, object]] = {}
-            import sys
-            print("MAINT_META_DUE", metadata_due, file=sys.stderr)
             if metadata_due:
                 metadata_reader = getattr(
                     self.exchange, "lp_market_metadata_fresh", None
@@ -5399,8 +5478,6 @@ class PolymarketLPService:
                 )
 
             reward_error: str | None = None
-            import sys
-            print("MAINT_REACHED_REWARD metadata_due=", metadata_due, "metadata_error=", metadata_error, file=sys.stderr)
             refreshed_rewards: dict[str, Mapping[str, object]] = {}
             raw_reward: Mapping[str, object] | None = None
             if reward_due:
@@ -5823,13 +5900,18 @@ class PolymarketLPService:
                         condition_id, judged_at=evaluation_now
                     )
                     continue
-                if self._candidate_pool_record_success(
+                # Issue #157 review R4: the write protection may reject this
+                # write because a concurrent newer publication already holds
+                # the line.  The row was refreshed either way, so a
+                # guard-rejected success is not a round failure and must not
+                # advance the 60/120/300s maintenance backoff.
+                self._candidate_pool_record_success(
                     condition_id,
                     new_row,
                     judged_at=evaluation_now,
                     facts=facts,
-                ):
-                    refreshed_any = True
+                )
+                refreshed_any = True
             # Issue #146: the maintenance attempt's backoff bookkeeping is
             # applied together with its publication.
             with self._candidate_state_lock:
@@ -5870,14 +5952,18 @@ class PolymarketLPService:
         finally:
             self._candidate_maintenance_lock.release()
 
-    def refresh_competition_cache(self) -> dict[str, object]:
+    def refresh_competition_cache(
+        self, stop_event: threading.Event | None = None
+    ) -> dict[str, object]:
         """Refresh the in-memory competition cache (issue #157).
 
         Public entry point for the dedicated competition thread: candidate
-        batch paths only read the cache and never block on this read.
+        batch paths only read the cache and never block on this read.  The
+        optional ``stop_event`` flows into the underlying read so a stopping
+        runtime cancels an in-flight page pull cooperatively.
         """
 
-        return self._refresh_competition(None)
+        return self._refresh_competition(stop_event)
 
     def _refresh_competition(
         self, stop_event: threading.Event | None
