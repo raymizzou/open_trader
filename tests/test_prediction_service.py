@@ -38,7 +38,11 @@ from open_trader.notifications import (
     XiaoaiSSHNotifier,
     xiaoai_voice_allowed,
 )
-from open_trader.polymarket_lp import PolymarketLPService, _lp_funnel_conditions
+from open_trader.polymarket_lp import (
+    PolymarketLPService,
+    _candidate_source_expired,
+    _lp_funnel_conditions,
+)
 from open_trader.polymarket_trading import PredictConfig, PolymarketTradingClient, TradingConfig
 from open_trader.predict_source import PredictSource
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
@@ -841,14 +845,22 @@ def test_lp_dashboard_shows_manual_orders_without_managing_them(
     runtime.monitor = monitor
     runtime.execution = service
 
-    with _server(runtime) as base:
-        status, first = _response(base + "/api/prediction-arbitrage/lp/dashboard")
-        status_after_failure, stale = _response(
-            base + "/api/prediction-arbitrage/lp/dashboard"
-        )
-        assert reward_transport.completed.wait(timeout=2)
-
-    assert status == status_after_failure == 200
+    # Issue #146: the HTTP route only serves the background snapshot, so the
+    # test drives the snapshot pipeline the way the runtime thread does and
+    # applies the same route projection. The first payload is built before
+    # the reward worker is scheduled (deterministically pre-completion); the
+    # second account read fails and degrades to the stale cache.
+    first = prediction_service._lp_projection_safe_value(
+        service.refresh_lp_dashboard_snapshot()
+    )
+    assert reward_transport.completed.wait(timeout=2)
+    # Issue #146 D3: the dashboard refresh shares the trading client's
+    # account TTL cache; expire it so this refresh genuinely re-attempts the
+    # external read (which fails) and the stale-degradation path is kept.
+    trading._lp_account_shared_cache = None
+    stale = prediction_service._lp_projection_safe_value(
+        service.refresh_lp_dashboard_snapshot()
+    )
     assert first["stale"] is False
     first_order = first["orders"][0]
     assert first_order["management"] == "manual_read_only"
@@ -966,10 +978,12 @@ def test_lp_dashboard_scoring_status_preserves_official_false(tmp_path: Path) ->
     runtime.execution = service
 
     with _server(runtime) as base:
+        first = service.refresh_lp_dashboard_snapshot()
         status_false, first = _response(
             base + "/api/prediction-arbitrage/lp/dashboard"
         )
         state["scoring"] = True
+        second = service.refresh_lp_dashboard_snapshot()
         status_true, second = _response(
             base + "/api/prediction-arbitrage/lp/dashboard"
         )
@@ -1054,7 +1068,7 @@ def test_lp_dashboard_scoring_failure_keeps_last_success(tmp_path: Path) -> None
         lp=FakeLP(),
     )
 
-    first = service.lp_dashboard()
+    first = service.refresh_lp_dashboard_snapshot()
     first_order = first["orders"][0]
     assert first_order["scoring_status"] == "true"
     first_success_at = first_order["scoring_last_success_at"]
@@ -1062,7 +1076,12 @@ def test_lp_dashboard_scoring_failure_keeps_last_success(tmp_path: Path) -> None
     assert first_order["scoring_checked_at"] == first_success_at
 
     state["fail"] = True
-    second = service.lp_dashboard()
+    # Join the worker scheduled by the first refresh so the second refresh
+    # owns the pipeline lock and re-reads scoring live.
+    reward_worker = service._lp_reward_refresh_thread
+    if reward_worker is not None:
+        reward_worker.join(timeout=2)
+    second = service.refresh_lp_dashboard_snapshot()
     second_order = second["orders"][0]
     assert second_order["scoring_status"] == "unknown"
     assert second_order["scoring_checked_at"] != first_order["scoring_checked_at"]
@@ -1140,14 +1159,19 @@ def test_lp_dashboard_stale_cache_downgrades_scoring_unknown(tmp_path: Path) -> 
         lp=FakeLP(),
     )
 
-    first = service.lp_dashboard()
+    first = service.refresh_lp_dashboard_snapshot()
     first_order = first["orders"][0]
     assert first_order["scoring_status"] == "true"
     first_checked_at = first_order["scoring_checked_at"]
     assert isinstance(first_checked_at, str) and first_checked_at
 
     state["fail_account"] = True
-    stale = service.lp_dashboard()
+    # Issue #146: the page read no longer blocks on the reward worker; join
+    # it so the next snapshot refresh owns the pipeline lock.
+    worker = service._lp_reward_refresh_thread
+    if worker is not None:
+        worker.join(timeout=2)
+    stale = service.refresh_lp_dashboard_snapshot()
     assert stale["state"] == "stale"
     assert stale["stale"] is True
     stale_order = stale["orders"][0]
@@ -1228,7 +1252,7 @@ def test_lp_dashboard_stale_cache_downgrades_today_orders_scoring(
         lp=FakeLP(),
     )
 
-    first = service.lp_dashboard()
+    first = service.refresh_lp_dashboard_snapshot()
     assert first["lp_orders_today"], "manual order must appear in today table"
     first_row = first["lp_orders_today"][0]
     assert first_row["scoring_status"] == "true"
@@ -1236,7 +1260,12 @@ def test_lp_dashboard_stale_cache_downgrades_today_orders_scoring(
     assert isinstance(first_checked_at, str) and first_checked_at
 
     state["fail_account"] = True
-    stale = service.lp_dashboard()
+    # Issue #146: the page read no longer blocks on the reward worker; join
+    # it so the next snapshot refresh owns the pipeline lock.
+    worker = service._lp_reward_refresh_thread
+    if worker is not None:
+        worker.join(timeout=2)
+    stale = service.refresh_lp_dashboard_snapshot()
     assert stale["state"] == "stale"
     stale_row = stale["lp_orders_today"][0]
     assert stale_row["scoring_status"] == "unknown"
@@ -1435,6 +1464,10 @@ def test_lp_dashboard_explicit_zero_reward_keeps_zero_not_unknown(
 
     refreshed = service.refresh_lp_observations()
     assert refreshed["state"] == "ready"
+    # Issue #146: the route serves the background snapshot; run one
+    # more snapshot pass so the served payload carries the stored
+    # observations.
+    service.refresh_lp_dashboard_snapshot()
     with _server(runtime) as base:
         status, payload = _response(base + "/api/prediction-arbitrage/lp/dashboard")
 
@@ -1506,6 +1539,10 @@ def test_lp_dashboard_yield_worked_example_hourly_and_capital(
 
     refreshed = service.refresh_lp_observations()
     assert refreshed["state"] == "ready"
+    # Issue #146: the route serves the background snapshot; run one
+    # more snapshot pass so the served payload carries the stored
+    # observations.
+    service.refresh_lp_dashboard_snapshot()
     with _server(runtime) as base:
         status, payload = _response(base + "/api/prediction-arbitrage/lp/dashboard")
 
@@ -1541,6 +1578,9 @@ def test_lp_dashboard_dual_orders_share_one_market_reward(
 
     first_refresh = service.refresh_lp_observations()
     assert first_refresh["state"] == "ready"
+    # Issue #146: the route serves the background snapshot; run one more
+    # snapshot pass so the served payload carries the stored observations.
+    service.refresh_lp_dashboard_snapshot()
     with _server(runtime) as base:
         status, payload = _response(base + "/api/prediction-arbitrage/lp/dashboard")
         assert status == 200
@@ -1574,6 +1614,14 @@ def test_lp_dashboard_qualification_three_states_with_basis(
     state = _lp_reward_dashboard_state(earning_percentage="0")
     service = _lp_reward_dashboard_service(tmp_path, state)
 
+    def _expire_shared_account_cache() -> None:
+        # Issue #146 D3: observation passes share the trading client's
+        # account TTL cache; expire it so each pass genuinely re-reads the
+        # mutated account facts instead of the 10-second cached snapshot.
+        trading = service._trading
+        assert isinstance(trading, PolymarketTradingClient)
+        trading._lp_account_shared_cache = None
+
     # (1) 全部买单计分 false（份额非正）→ 明确未确认。
     state["scoring"] = {"manual-order": False}
     first = service.refresh_lp_observations()
@@ -1588,6 +1636,7 @@ def test_lp_dashboard_qualification_three_states_with_basis(
         _lp_reward_order("manual-b", remaining=Decimal("20"), matched=Decimal("0")),
     ]
     state["scoring"] = {"manual-a": False, "manual-b": "raise"}
+    _expire_shared_account_cache()
     second = service.refresh_lp_observations()
     assert second["state"] == "ready"
     second_observation = second["observations"]["condition-1"]
@@ -1596,6 +1645,7 @@ def test_lp_dashboard_qualification_three_states_with_basis(
 
     # (3) 全部 true → 明确已确认。
     state["scoring"] = {}
+    _expire_shared_account_cache()
     third = service.refresh_lp_observations()
     assert third["state"] == "ready"
     third_observation = third["observations"]["condition-1"]
@@ -1826,6 +1876,9 @@ def test_lp_dashboard_http_projection_keeps_today_orders(tmp_path: Path) -> None
     runtime.monitor = object()
     runtime.execution = service
 
+    # Issue #146: the route serves the background snapshot, so run the
+    # snapshot pipeline (as the runtime thread would) before serving.
+    service.refresh_lp_dashboard_snapshot()
     with _server(runtime) as base:
         status, payload = _response(base + "/api/prediction-arbitrage/lp/dashboard")
 
@@ -2091,7 +2144,8 @@ def test_lp_dashboard_account_outage_keeps_newer_public_funnel(tmp_path: Path) -
         "history": exchange.history_reads,
         "account": exchange.account_reads,
     }
-    first_dashboard = execution.lp_dashboard()
+    # Issue #146: pipeline runs now happen only in the snapshot refresh.
+    first_dashboard = execution.refresh_lp_dashboard_snapshot()
     assert exchange.catalog_reads == counters_before_first_dashboard["catalog"]
     assert exchange.metadata_reads == counters_before_first_dashboard["metadata"]
     assert exchange.book_reads == counters_before_first_dashboard["books"]
@@ -2149,7 +2203,7 @@ def test_lp_dashboard_account_outage_keeps_newer_public_funnel(tmp_path: Path) -
         "history": exchange.history_reads,
         "account": exchange.account_reads,
     }
-    stale_dashboard = execution.lp_dashboard()
+    stale_dashboard = execution.refresh_lp_dashboard_snapshot()
     assert exchange.catalog_reads == counters_before_stale_dashboard["catalog"]
     assert exchange.metadata_reads == counters_before_stale_dashboard["metadata"]
     assert exchange.book_reads == counters_before_stale_dashboard["books"]
@@ -2189,7 +2243,7 @@ def test_lp_dashboard_account_outage_keeps_newer_public_funnel(tmp_path: Path) -
         "history": exchange.history_reads,
         "account": exchange.account_reads,
     }
-    repeated_stale_dashboard = execution.lp_dashboard()
+    repeated_stale_dashboard = execution.refresh_lp_dashboard_snapshot()
     assert exchange.catalog_reads == counters_before_repeated_dashboard["catalog"]
     assert exchange.metadata_reads == counters_before_repeated_dashboard["metadata"]
     assert exchange.book_reads == counters_before_repeated_dashboard["books"]
@@ -2228,7 +2282,7 @@ def test_lp_dashboard_account_outage_keeps_newer_public_funnel(tmp_path: Path) -
         "history": exchange.history_reads,
         "account": exchange.account_reads,
     }
-    cold_dashboard = cold_execution.lp_dashboard()
+    cold_dashboard = cold_execution.refresh_lp_dashboard_snapshot()
     assert exchange.catalog_reads == counters_before_cold_dashboard["catalog"]
     assert exchange.metadata_reads == counters_before_cold_dashboard["metadata"]
     assert exchange.book_reads == counters_before_cold_dashboard["books"]
@@ -2325,7 +2379,8 @@ def test_lp_dashboard_normalizes_candidate_reward_without_freshness_proof(
     )
 
     try:
-        dashboard = service.lp_dashboard()
+        # Issue #146: the pipeline only runs inside the snapshot refresh.
+        dashboard = service.refresh_lp_dashboard_snapshot()
         reward = dashboard["market_rewards"]["condition-1"]
         assert reward["stale"] is True
         assert reward["reason"] == "reward_candidate_stale"
@@ -2404,19 +2459,15 @@ def test_lp_dashboard_does_not_wait_for_market_reward_refresh(tmp_path: Path) ->
     runtime.execution = service
 
     try:
-        with _server(runtime) as base:
-            with ThreadPoolExecutor(max_workers=1) as clients:
-                future = clients.submit(
-                    _response,
-                    base + "/api/prediction-arbitrage/lp/dashboard",
-                    timeout=5,
-                )
-                assert entered.wait(timeout=2)
-                status, payload = future.result(timeout=0.5)
+        # Issue #146: the snapshot refresh schedules the reward worker and
+        # returns unknown rewards without waiting for it.
+        with ThreadPoolExecutor(max_workers=1) as clients:
+            future = clients.submit(service.refresh_lp_dashboard_snapshot)
+            assert entered.wait(timeout=2)
+            payload = future.result(timeout=5)
     finally:
         release.set()
 
-    assert status == 200
     assert payload["orders"][0]["condition_id"] == "condition-1"
     reward = payload["market_rewards"]["condition-1"]
     assert reward["state"] == "unknown"
@@ -2493,42 +2544,27 @@ def test_lp_dashboard_coalesces_reward_refresh_and_publishes_completed_cache(
     runtime.store = store  # type: ignore[assignment]
     runtime.execution = service
 
+    # Issue #146: concurrent snapshot refreshes coalesce; the second caller
+    # receives the current cache instead of starting a second pipeline.
     try:
-        with _server(runtime) as base:
-            with ThreadPoolExecutor(max_workers=2) as clients:
-                first_future = clients.submit(
-                    _response,
-                    base + "/api/prediction-arbitrage/lp/dashboard",
-                    timeout=5,
-                )
-                assert entered.wait(timeout=2)
-                second_future = clients.submit(
-                    _response,
-                    base + "/api/prediction-arbitrage/lp/dashboard",
-                    timeout=5,
-                )
-                first_status, first = first_future.result(timeout=2)
-                second_status, second = second_future.result(timeout=2)
-            assert first_status == second_status == 200
-            assert first["market_rewards"]["condition-1"]["state"] == "unknown"
-            assert second["market_rewards"]["condition-1"]["state"] == "unknown"
-            release.set()
+        with ThreadPoolExecutor(max_workers=2) as clients:
+            first_future = clients.submit(service.refresh_lp_dashboard_snapshot)
+            assert entered.wait(timeout=2)
+            second_future = clients.submit(service.refresh_lp_dashboard_snapshot)
+            first = first_future.result(timeout=2)
+            second = second_future.result(timeout=2)
+        assert first["market_rewards"]["condition-1"]["state"] == "unknown"
+        assert second["market_rewards"]["condition-1"]["state"] == "unknown"
+        release.set()
 
-            updated: dict[str, object] | None = None
-            deadline = time.monotonic() + 2
-            while time.monotonic() < deadline:
-                status, candidate = _response(
-                    base + "/api/prediction-arbitrage/lp/dashboard",
-                    timeout=5,
-                )
-                if (
-                    status == 200
-                    and candidate["market_rewards"]["condition-1"]["state"]
-                    == "known"
-                ):
-                    updated = candidate
-                    break
-                time.sleep(0.01)
+        updated: dict[str, object] | None = None
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            candidate = service.lp_dashboard()
+            if candidate["market_rewards"]["condition-1"]["state"] == "known":
+                updated = prediction_service._lp_projection_safe_value(candidate)
+                break
+            time.sleep(0.01)
     finally:
         release.set()
 
@@ -2605,7 +2641,9 @@ def test_lp_dashboard_expires_reward_cache_without_waiting_for_refresh(
     service._clock = lambda: clock[0]  # type: ignore[method-assign]
 
     try:
-        service.lp_dashboard()
+        # Issue #146: pipeline runs belong to the snapshot refresh; the page
+        # read polls the cache until the background worker publishes.
+        service.refresh_lp_dashboard_snapshot()
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
             first = service.lp_dashboard()
@@ -2615,9 +2653,9 @@ def test_lp_dashboard_expires_reward_cache_without_waiting_for_refresh(
         assert calls == 1
         clock[0] = 61.0
         with ThreadPoolExecutor(max_workers=1) as clients:
-            future = clients.submit(service.lp_dashboard)
+            future = clients.submit(service.refresh_lp_dashboard_snapshot)
             assert entered.wait(timeout=2)
-            expired = future.result(timeout=0.5)
+            expired = future.result(timeout=5)
     finally:
         release.set()
 
@@ -2699,9 +2737,11 @@ def test_lp_dashboard_drains_new_conditions_through_single_reward_worker(
     )
 
     try:
-        service.lp_dashboard()
+        # Issue #146: the pipeline runs inside the snapshot refresh; the
+        # second refresh picks up the newly listed condition.
+        service.refresh_lp_dashboard_snapshot()
         assert entered.wait(timeout=2)
-        service.lp_dashboard()
+        service.refresh_lp_dashboard_snapshot()
         release.set()
         assert b_done.wait(timeout=2)
     finally:
@@ -2801,12 +2841,21 @@ def test_lp_dashboard_restarts_reward_worker_after_empty_queue_handoff(
         lock_path=tmp_path / "execution.lock",
         lp=LP(),
     )
-    service._lp_dashboard_lock = HandoffLock(service)  # type: ignore[assignment]
+    class RefreshCapableHandoffLock(HandoffLock):
+        """Issue #146: the snapshot refresh acquires the lock directly."""
+
+        def acquire(self, blocking: bool = True) -> bool:
+            return self._lock.acquire(blocking=blocking)
+
+        def release(self) -> None:
+            self._lock.release()
+
+    service._lp_dashboard_lock = RefreshCapableHandoffLock(service)  # type: ignore[assignment]
 
     try:
-        service.lp_dashboard()
+        service.refresh_lp_dashboard_snapshot()
         assert gap_open.wait(timeout=2)
-        service.lp_dashboard()
+        service.refresh_lp_dashboard_snapshot()
         allow_exit.set()
         assert b_done.wait(timeout=2)
     finally:
@@ -2893,13 +2942,15 @@ def test_lp_dashboard_keeps_old_date_refresh_out_of_new_date_cache(
     )
 
     try:
-        service.lp_dashboard()
+        service.refresh_lp_dashboard_snapshot()
         assert old_entered.wait(timeout=2)
-        current = service.lp_dashboard()
+        # Issue #146: this second pipeline run belongs to the snapshot
+        # refresh (the old route re-ran the pipeline on every request).
+        current = service.refresh_lp_dashboard_snapshot()
         assert current["market_rewards"]["condition-1"]["reward_date"] == "2026-09-16"
         old_release.set()
         assert new_entered.wait(timeout=2)
-        stale = service.lp_dashboard()
+        stale = service.refresh_lp_dashboard_snapshot()
         assert stale["stale"] is True
         reward = stale["market_rewards"]["condition-1"]
         assert reward["reward_date"] == "2026-09-16"
@@ -3018,7 +3069,9 @@ def test_lp_reward_and_stale_observation_publications_preserve_each_other(
         }
     )
     service._lp_dashboard_lock = CoordinatedLock(service._lp_dashboard_lock)  # type: ignore[assignment]
-    service.lp_dashboard = lambda: {"state": "stale", "stale": True}  # type: ignore[method-assign]
+    # Issue #146: refresh_lp_observations drives the snapshot refresh, not
+    # the page cache read, so the stale-account stub moves with it.
+    service.refresh_lp_dashboard_snapshot = lambda: {"state": "stale", "stale": True}  # type: ignore[method-assign]
 
     def refresh_stale() -> None:
         threading.current_thread().name = "mark-stale"
@@ -3381,14 +3434,17 @@ def test_lp_add_room_requires_current_aligned_reward_and_risk(tmp_path: Path) ->
     assert initial["risk_state"] == "known"
     assert initial["risk_warning"] is False
     assert initial["add_room"]["available"] is True
-    assert service.lp_dashboard()["lp_observations"][condition_id]["add_room"]["available"] is True
+    # Issue #146: the served payload reflects a fresh snapshot pass.
+    assert service.refresh_lp_dashboard_snapshot()["lp_observations"][condition_id][
+        "add_room"
+    ]["available"] is True
 
     account_id = service._lp_account_id()
     assert isinstance(account_id, str)
     saved_initial = store.lp_observations(account_id)[condition_id]
     state["orders"] = [order(Decimal("400"))]
     notification_calls_before_get = notifier.calls
-    changed_dashboard = service.lp_dashboard()
+    changed_dashboard = service.refresh_lp_dashboard_snapshot()
     changed_observation = changed_dashboard["lp_observations"][condition_id]
     assert changed_dashboard["state"] == "ready"
     assert changed_dashboard["orders"][0]["quantity"] == Decimal("400")
@@ -3414,7 +3470,7 @@ def test_lp_add_room_requires_current_aligned_reward_and_risk(tmp_path: Path) ->
 
     state["order_price"] = Decimal("0.49")
     state["orders"] = [order(Decimal("400"))]
-    price_dashboard = service.lp_dashboard()
+    price_dashboard = service.refresh_lp_dashboard_snapshot()
     price_observation = price_dashboard["lp_observations"][condition_id]
     assert price_dashboard["state"] == "ready"
     assert price_observation["reason"] == "exposure_changed"
@@ -3434,7 +3490,7 @@ def test_lp_add_room_requires_current_aligned_reward_and_risk(tmp_path: Path) ->
     }
     store.save_lp_observation(account_id, condition_id, aged_observation)
     stored_before_aged_get = store.lp_observations(account_id)[condition_id]
-    aged_dashboard = service.lp_dashboard()
+    aged_dashboard = service.refresh_lp_dashboard_snapshot()
     aged_projection = aged_dashboard["lp_observations"][condition_id]
     assert aged_dashboard["state"] == "ready"
     assert aged_projection["reason"] == "observation_stale"
@@ -3506,7 +3562,7 @@ def test_lp_add_room_requires_current_aligned_reward_and_risk(tmp_path: Path) ->
     assert stale_account["risk_warning"] is None
     assert stale_account["risk_directions"] == []
     assert stale_account["add_room"]["available"] is False
-    assert service.lp_dashboard()["lp_observations"][condition_id]["add_room"]["available"] is False
+    assert service.refresh_lp_dashboard_snapshot()["lp_observations"][condition_id]["add_room"]["available"] is False
 
     state["account_age"] = 0
     state["account_complete"] = False
@@ -3538,7 +3594,7 @@ def test_lp_add_room_requires_current_aligned_reward_and_risk(tmp_path: Path) ->
     assert unknown_fee["risk_state"] == "unknown"
     assert unknown_fee["add_room"]["available"] is False
     notification_calls_before_get = notifier.calls
-    assert service.lp_dashboard()["state"] == "ready"
+    assert service.refresh_lp_dashboard_snapshot()["state"] == "ready"
     assert notifier.calls == notification_calls_before_get
     assert trading.order_writes == 0
     assert trading.cancellations == 0
@@ -4077,8 +4133,15 @@ def test_lp_dashboard_reward_share_target_status_is_market_scoped(
         ) in enumerate(expected):
             clock[0] += 5 if index in {0, 6} else 61
             controlled_now[0] = source_base + timedelta(seconds=clock[0])
-            status, payload = _response(base + "/api/prediction-arbitrage/lp/dashboard")
-            assert status == 200
+            # Issue #146: run the snapshot pipeline, then serve it the way
+            # the route does. Join the reward worker first so the refresh
+            # owns the pipeline lock and cannot coalesce into the cache.
+            worker = service._lp_reward_refresh_thread
+            if worker is not None:
+                worker.join(timeout=2)
+            payload = prediction_service._lp_projection_safe_value(
+                service.refresh_lp_dashboard_snapshot()
+            )
             assert "condition-a" in payload["reward_shares"], payload
             share = payload["reward_shares"]["condition-a"]
             assert share["percentage"] == expected_value
@@ -4132,8 +4195,16 @@ def test_lp_dashboard_reward_share_target_status_is_market_scoped(
         runtime.execution = boundary_service
 
         def read_share() -> dict[str, object]:
-            status, dashboard = _response(base + "/api/prediction-arbitrage/lp/dashboard")
-            assert status == 200
+            # Issue #146: drive the current execution service's snapshot
+            # pipeline (the route only serves its published cache).
+            execution = runtime.execution
+            assert execution is not None
+            worker = getattr(execution, "_lp_reward_refresh_thread", None)
+            if worker is not None:
+                worker.join(timeout=2)
+            dashboard = prediction_service._lp_projection_safe_value(
+                execution.refresh_lp_dashboard_snapshot()
+            )
             return dashboard["reward_shares"]["condition-a"]
 
         last_known = read_share()
@@ -4868,8 +4939,15 @@ def test_lp_dashboard_share_failures_preserve_unknown_without_order_writes(
     runtime.execution = service
 
     def read_dashboard(base: str) -> dict[str, object]:
-        status, payload = _response(base + "/api/prediction-arbitrage/lp/dashboard")
-        assert status == 200
+        # Issue #146: the route serves the background snapshot, so run the
+        # snapshot pipeline (joining the reward worker to own the pipeline
+        # lock) and serve the result the way the route does.
+        worker = getattr(service, "_lp_reward_refresh_thread", None)
+        if worker is not None:
+            worker.join(timeout=2)
+        payload = prediction_service._lp_projection_safe_value(
+            service.refresh_lp_dashboard_snapshot()
+        )
         assert payload["stale"] is False
         order = payload["orders"][0]
         assert order["remaining_quantity"] == "5"
@@ -5098,6 +5176,9 @@ def test_lp_dashboard_share_failures_preserve_unknown_without_order_writes(
     restarted_runtime.execution = restarted_service
 
     with _server(restarted_runtime) as base:
+        # Issue #146: run one snapshot pass so the payload carries the
+        # restart condition (see the matching fix on runtime_b below).
+        restarted_service.refresh_lp_dashboard_snapshot()
         status, payload = _response(base + "/api/prediction-arbitrage/lp/dashboard")
         assert status == 200
         share = payload["reward_shares"][restart_condition]
@@ -5123,6 +5204,9 @@ def test_lp_dashboard_share_failures_preserve_unknown_without_order_writes(
     runtime_b.monitor = monitor
     runtime_b.execution = service_b
     with _server(runtime_b) as base:
+        # Issue #146: the route serves the background snapshot; run one
+        # snapshot pass so the payload carries the restart condition.
+        service_b.refresh_lp_dashboard_snapshot()
         status, payload = _response(base + "/api/prediction-arbitrage/lp/dashboard")
         assert status == 200
         share_b = payload["reward_shares"][restart_condition]
@@ -5289,6 +5373,9 @@ def test_lp_reward_share_survives_background_reward_refresh(tmp_path: Path) -> N
     runtime.execution = service
 
     def read_dashboard(base: str) -> dict[str, object]:
+        # Issue #146: the route serves the background snapshot; run the
+        # snapshot pipeline first (this is what schedules the reward worker).
+        service.refresh_lp_dashboard_snapshot()
         status, payload = _response(base + "/api/prediction-arbitrage/lp/dashboard", timeout=5)
         assert status == 200
         return payload
@@ -5711,6 +5798,9 @@ def test_lp_candidate_preview_rechecks_best_bid_before_confirmation(
         csrf_token="csrf-token",
         runtime_metadata={"git_sha": "abc123"},
     ) as (base, _server_instance):
+        # Issue #146: the route serves the background snapshot, so run the
+        # snapshot pipeline before serving.
+        execution.refresh_lp_dashboard_snapshot()
         dashboard_status, dashboard = _response(
             base + "/api/prediction-arbitrage/lp/dashboard"
         )
@@ -5939,6 +6029,9 @@ def test_lp_trial_reads_share_current_refresh_and_ignore_late_results(
         csrf_token="csrf-token",
         runtime_metadata={"git_sha": "issue142-test"},
     ) as (base, _server_instance):
+        # Issue #146: the route serves the background snapshot, so publish
+        # one before the concurrent page polls.
+        execution.refresh_lp_dashboard_snapshot()
         with ThreadPoolExecutor(max_workers=3) as clients:
             responses = list(
                 clients.map(
@@ -5970,7 +6063,14 @@ def test_lp_trial_reads_share_current_refresh_and_ignore_late_results(
         late_store, trading, clock=lambda: clock["now"]
     )
     assert late_initial.refresh_price_history()["state"] == "known"
-    assert late_initial.refresh_candidates(force=True)["recommendations"]
+    # Issue #146: drop the trading-level shared account cache so the scan
+    # reads an account stamped on the test's clock timeline.
+    trading._lp_account_shared_cache = None
+    late_scan = late_initial.refresh_candidates(force=True)
+    assert late_scan["recommendations"], (
+        late_scan.get("funnel"), late_scan.get("state"),
+        late_initial._candidate_qualification_facts,
+    )
 
     old_entered = threading.Event()
     old_release = threading.Event()
@@ -6014,6 +6114,7 @@ def test_lp_trial_reads_share_current_refresh_and_ignore_late_results(
         late_store, trading, clock=lambda: clock["now"]
     )
     assert newer_service.refresh_price_history()["state"] == "known"
+    trading._lp_account_shared_cache = None
     newer = newer_service.refresh_candidates(force=True)
     assert newer["recommendations"][0]["selected_direction"]["outcome"] == "NO"
     newer_checked_at = newer["checked_at"]
@@ -6023,9 +6124,615 @@ def test_lp_trial_reads_share_current_refresh_and_ignore_late_results(
     assert not old_thread.is_alive()
     assert len(old_result) == 1
     assert old_result[0]["checked_at"] == newer_checked_at
-    assert old_result[0]["recommendations"][0]["selected_direction"]["outcome"] == "NO"
+    # Issue #146: the stale maintenance publication loses to the newer scan
+    # round (in-process generation guard, persistence arbiter across
+    # service instances). The response carries the newer round's head row;
+    # its recommendation is recomputed against this service's expired local
+    # facts and is therefore empty instead of falsely live.
+    assert old_result[0]["candidates"][0]["selected_direction"]["outcome"] == "NO"
+    assert old_result[0]["recommendations"] == []
     assert old_service.candidate_snapshot()["checked_at"] == newer_checked_at
     assert state["trade_writes"] == []
+
+
+def test_lp_maintenance_refreshes_at_thirty_second_source_lead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #146 A1: maintenance fires on the oldest source age (30s lead),
+    well before the 60-second source expiry."""
+    condition_id = "condition-lead"
+    market = _lp_test_market(
+        condition_id,
+        yes_token="lead-yes",
+        no_token="lead-no",
+        reward_min_size=Decimal("20"),
+    )
+    clock, state, store, trading, service = _lp_adapter_service_fixture(
+        tmp_path, monkeypatch, markets=[market], balance_units=50_000_000
+    )
+    # Tie the trading client's shared-snapshot TTL clock to the injected
+    # service clock so TTL expiry follows the scenario timeline.
+    monkeypatch.setattr(
+        polymarket_trading_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock["now"].timestamp()),  # type: ignore[attr-defined]
+    )
+    assert service.refresh_price_history()["state"] == "known"
+    scanned = service.refresh_candidates(force=True)
+    assert scanned["recommendations"]
+    t0 = clock["now"]
+
+    account_reads: list[datetime] = []
+    original_account = trading.lp_account_snapshot
+
+    def counting_account() -> dict[str, object]:
+        account_reads.append(clock["now"])
+        return original_account()  # type: ignore[no-any-return]
+
+    trading.lp_account_snapshot = counting_account  # type: ignore[method-assign]
+    original_books = trading.lp_order_books
+    book_reads: list[tuple[str, ...]] = []
+
+    def counting_books(token_ids: object, *, stop_event: object = None) -> object:
+        del stop_event
+        batch = tuple(token_ids)  # type: ignore[arg-type]
+        book_reads.append(batch)
+        return original_books(batch)
+
+    trading.lp_order_books = counting_books  # type: ignore[method-assign]
+    metadata_before = len(state["metadata_requests"])
+    reward_before = len(state["selected_reward_requests"])
+
+    # At 29 seconds of source age the maintenance call is a pure snapshot
+    # read: zero external reads, published rows unchanged.
+    clock["now"] = t0 + timedelta(seconds=29)
+    untouched = service.refresh_candidate_recommendations()
+    assert untouched["recommendations"] == scanned["recommendations"]
+    assert account_reads == []
+    assert book_reads == []
+    assert len(state["metadata_requests"]) == metadata_before
+    assert len(state["selected_reward_requests"]) == reward_before
+
+    # One second past the lead boundary the due sources are re-read and the
+    # refreshed facts carry the newer receipt times.
+    clock["now"] = t0 + timedelta(seconds=31)
+    lead_refreshed = service.refresh_candidate_recommendations()
+    assert lead_refreshed["recommendations"]
+    assert account_reads == [t0 + timedelta(seconds=31)]
+    assert book_reads and set(book_reads[-1]) == {"lead-yes", "lead-no"}
+    assert len(state["metadata_requests"]) == metadata_before + 1
+    assert len(state["selected_reward_requests"]) >= reward_before + 1
+    refreshed_head = lead_refreshed["recommendations"][0]
+    assert refreshed_head["realtime_checked_at"] == (
+        (t0 + timedelta(seconds=31))
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def test_candidate_source_expiry_boundary_stays_at_sixty_seconds() -> None:
+    """Issue #146 A1: the 60-second source expiry itself is unchanged."""
+
+    now = datetime(2026, 9, 20, 12, 0, tzinfo=UTC)
+    assert (
+        _candidate_source_expired(now - timedelta(seconds=59), now) is False
+    )
+    assert _candidate_source_expired(now - timedelta(seconds=61), now) is True
+
+
+def test_lp_maintenance_backoff_schedule_and_wait_floor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #146 A4: maintenance failures back off 60/120/300 seconds by
+    attempt-finish time and every scheduler wait clamps to [1.0, 300.0]."""
+    condition_id = "condition-backoff"
+    market = _lp_test_market(
+        condition_id,
+        yes_token="backoff-yes",
+        no_token="backoff-no",
+        reward_min_size=Decimal("20"),
+    )
+    clock, state, store, trading, service = _lp_adapter_service_fixture(
+        tmp_path, monkeypatch, markets=[market], balance_units=50_000_000
+    )
+    monkeypatch.setattr(
+        polymarket_trading_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock["now"].timestamp()),  # type: ignore[attr-defined]
+    )
+    assert service.refresh_price_history()["state"] == "known"
+    assert service.refresh_candidates(force=True)["recommendations"]
+    t0 = clock["now"]
+
+    state["metadata_error"] = True
+    clock["now"] = t0 + timedelta(seconds=31)
+    failed = service.refresh_candidate_recommendations()
+    assert failed["recommendations"] == []
+    assert failed["candidates"][0]["condition_id"] == condition_id
+    assert failed["maintenance_consecutive_failures"] == 1
+    first_failure_at = clock["now"]
+    assert service.candidate_maintenance_wait_seconds() == pytest.approx(
+        60.0, abs=1e-6
+    )
+
+    # Inside the 60-second backoff window the maintenance call is a pure
+    # snapshot read: no external retries.
+    metadata_reads = len(state["metadata_requests"])
+    clock["now"] = first_failure_at + timedelta(seconds=59)
+    retried_too_soon = service.refresh_candidate_recommendations()
+    assert retried_too_soon["maintenance_consecutive_failures"] == 1
+    assert len(state["metadata_requests"]) == metadata_reads
+    assert service.candidate_maintenance_wait_seconds() == pytest.approx(
+        1.0, abs=1e-6
+    )
+
+    # Backoff elapsed: the retry runs, fails again, and the wait doubles.
+    clock["now"] = first_failure_at + timedelta(seconds=61)
+    second_failure = service.refresh_candidate_recommendations()
+    assert second_failure["maintenance_consecutive_failures"] == 2
+    assert service.candidate_maintenance_wait_seconds() == pytest.approx(
+        120.0, abs=1e-6
+    )
+    clock["now"] = clock["now"] + timedelta(seconds=121)
+    third_failure = service.refresh_candidate_recommendations()
+    assert third_failure["maintenance_consecutive_failures"] == 3
+    assert service.candidate_maintenance_wait_seconds() == pytest.approx(
+        300.0, abs=1e-6
+    )
+    # Three or more consecutive failures hold at 300 seconds.
+    clock["now"] = clock["now"] + timedelta(seconds=301)
+    fourth_failure = service.refresh_candidate_recommendations()
+    assert fourth_failure["maintenance_consecutive_failures"] == 4
+    assert service.candidate_maintenance_wait_seconds() == pytest.approx(
+        300.0, abs=1e-6
+    )
+
+    # Any success resets the backoff to the 30-second lead cadence.
+    state["metadata_error"] = False
+    clock["now"] = clock["now"] + timedelta(seconds=301)
+    recovered = service.refresh_candidate_recommendations()
+    assert recovered["recommendations"]
+    assert recovered["maintenance_consecutive_failures"] == 0
+    assert recovered["maintenance_next_attempt_at"] is None
+    recovered_wait = service.candidate_maintenance_wait_seconds()
+    assert recovered_wait is not None and 29.0 <= recovered_wait <= 30.0
+
+    # Degenerate source stamps clamp the wait to the 1.0-second floor.
+    facts = service._candidate_qualification_facts[condition_id]
+    facts["account"]["checked_at"] = "not-a-timestamp"
+    assert service.candidate_maintenance_wait_seconds() == 1.0
+    facts["account"]["checked_at"] = clock["now"] + timedelta(hours=1)
+    assert service.candidate_maintenance_wait_seconds() == 1.0
+
+
+def test_lp_same_kind_refreshes_do_not_overlap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #146 A2: concurrent same-kind refreshes never read twice."""
+    condition_id = "condition-overlap"
+    market = _lp_test_market(
+        condition_id,
+        yes_token="overlap-yes",
+        no_token="overlap-no",
+        reward_min_size=Decimal("20"),
+    )
+    clock, state, store, trading, service = _lp_adapter_service_fixture(
+        tmp_path, monkeypatch, markets=[market], balance_units=50_000_000
+    )
+    monkeypatch.setattr(
+        polymarket_trading_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock["now"].timestamp()),  # type: ignore[attr-defined]
+    )
+    assert service.refresh_price_history()["state"] == "known"
+    assert service.refresh_candidates(force=True)["recommendations"]
+
+    entered = threading.Event()
+    release = threading.Event()
+    original_books = trading.lp_order_books
+    book_calls: list[tuple[str, ...]] = []
+
+    def blocked_books(token_ids: object, *, stop_event: object = None) -> object:
+        del stop_event
+        batch = tuple(token_ids)  # type: ignore[arg-type]
+        book_calls.append(batch)
+        entered.set()
+        assert release.wait(timeout=5)
+        return original_books(batch)
+
+    trading.lp_order_books = blocked_books  # type: ignore[method-assign]
+    clock["now"] = clock["now"] + timedelta(seconds=31)
+    maintenance = threading.Thread(
+        target=service.refresh_candidate_recommendations,
+        name="issue146-maintenance-in-flight",
+        daemon=True,
+    )
+    maintenance.start()
+    assert entered.wait(timeout=5)
+    started = time.monotonic()
+    second = service.refresh_candidate_recommendations()
+    elapsed = time.monotonic() - started
+    assert elapsed < 2
+    assert second["scanning"] is True
+    assert len(book_calls) == 1
+    release.set()
+    maintenance.join(timeout=5)
+    assert not maintenance.is_alive()
+    assert len(book_calls) == 1
+
+    # The scan behaves the same way: one in-flight scan, second call returns
+    # the snapshot immediately.  The competition read is scan-only, so
+    # blocking it parks the scan without touching maintenance reads.
+    book_calls.clear()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_competitiveness(
+        *, stop_event: object = None, previous: object = None
+    ) -> dict[str, object]:
+        del stop_event, previous
+        entered.set()
+        assert release.wait(timeout=5)
+        return {
+            "state": "unknown",
+            "complete": False,
+            "competitiveness": {},
+            "not_updated": [],
+        }
+
+    trading.lp_market_competitiveness = blocked_competitiveness  # type: ignore[method-assign]
+    clock["now"] = clock["now"] + timedelta(seconds=31)
+    scan = threading.Thread(
+        target=service.refresh_candidates,
+        kwargs={"force": True},
+        name="issue146-scan-in-flight",
+        daemon=True,
+    )
+    scan.start()
+    assert entered.wait(timeout=5)
+    started = time.monotonic()
+    again = service.refresh_candidates()
+    elapsed = time.monotonic() - started
+    assert elapsed < 2
+    assert again["scanning"] is True
+    release.set()
+    scan.join(timeout=5)
+    assert not scan.is_alive()
+
+
+def test_lp_scan_does_not_block_maintenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #146 A3: a long in-flight scan must not stop the maintenance
+    loop from reading and publishing the maintained head."""
+    condition_id = "condition-independent"
+    market = _lp_test_market(
+        condition_id,
+        yes_token="independent-yes",
+        no_token="independent-no",
+        reward_min_size=Decimal("20"),
+    )
+    clock, state, store, trading, service = _lp_adapter_service_fixture(
+        tmp_path, monkeypatch, markets=[market], balance_units=50_000_000
+    )
+    monkeypatch.setattr(
+        polymarket_trading_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock["now"].timestamp()),  # type: ignore[attr-defined]
+    )
+    assert service.refresh_price_history()["state"] == "known"
+    assert service.refresh_candidates(force=True)["recommendations"]
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_competitiveness(
+        *, stop_event: object = None, previous: object = None
+    ) -> dict[str, object]:
+        del stop_event, previous
+        entered.set()
+        assert release.wait(timeout=5)
+        return {
+            "state": "unknown",
+            "complete": False,
+            "competitiveness": {},
+            "not_updated": [],
+        }
+
+    trading.lp_market_competitiveness = blocked_competitiveness  # type: ignore[method-assign]
+    scan_errors: list[BaseException] = []
+
+    def run_scan() -> None:
+        try:
+            service.refresh_candidates(force=True)
+        except BaseException as exc:  # noqa: BLE001 - surfaced below
+            scan_errors.append(exc)
+
+    scan = threading.Thread(
+        target=run_scan,
+        name="issue146-long-scan",
+        daemon=True,
+    )
+    scan.start()
+    assert entered.wait(timeout=5)
+
+    metadata_reads = len(state["metadata_requests"])
+    clock["now"] = clock["now"] + timedelta(seconds=31)
+    maintained = service.refresh_candidate_recommendations()
+    assert maintained["scanning"] is False, {  # type: ignore[unreachable]
+        "state": maintained.get("state"),
+        "checked_at": str(maintained.get("checked_at")),
+        "recommendations": maintained.get("recommendations"),
+        "metadata_reads": len(state["metadata_requests"]),
+        "book_reads": len(state["selected_reward_requests"]),
+    }
+    assert maintained["recommendations"]
+    assert len(state["metadata_requests"]) == metadata_reads + 1
+    release.set()
+    scan.join(timeout=5)
+    assert not scan.is_alive()
+    assert scan_errors == []
+    final = service.candidate_snapshot()
+    assert final["state"] == "ready"
+    assert final["complete"] is True
+    assert final["recommendations"]
+
+
+def test_lp_generation_guard_keeps_newer_scan_head(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #146 A5/D9: a stale maintenance result is discarded instead of
+    overwriting a head published by a newer scan, and the discard is not
+    counted as a data failure."""
+    condition_id = "condition-generation"
+    market = _lp_test_market(
+        condition_id,
+        yes_token="generation-yes",
+        no_token="generation-no",
+        reward_min_size=Decimal("20"),
+    )
+    clock, state, store, trading, service = _lp_adapter_service_fixture(
+        tmp_path, monkeypatch, markets=[market], balance_units=50_000_000
+    )
+    monkeypatch.setattr(
+        polymarket_trading_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock["now"].timestamp()),  # type: ignore[attr-defined]
+    )
+    assert service.refresh_price_history()["state"] == "known"
+    first = service.refresh_candidates(force=True)
+    assert first["recommendations"]
+    t0 = clock["now"]
+
+    entered = threading.Event()
+    release = threading.Event()
+    original_reward = trading.lp_reward_catalog
+
+    def blocked_selected_reward(
+        *, condition_ids: object = None, stop_event: object = None
+    ) -> dict[str, object]:
+        if condition_ids is None:
+            return original_reward()  # type: ignore[no-any-return]
+        del condition_ids, stop_event
+        entered.set()
+        assert release.wait(timeout=5)
+        return {
+            "state": "unknown",
+            "complete": False,
+            "checked_at": clock["now"],
+            "markets": (),
+        }
+
+    trading.lp_reward_catalog = blocked_selected_reward  # type: ignore[method-assign]
+    clock["now"] = t0 + timedelta(seconds=31)
+    maintenance = threading.Thread(
+        target=service.refresh_candidate_recommendations,
+        name="issue146-stale-maintenance",
+        daemon=True,
+    )
+    maintenance.start()
+    assert entered.wait(timeout=5)
+
+    # While the stale maintenance is parked in its reward read, a newer full
+    # scan publishes a fresh head (new generation).
+    state["markets"][condition_id]["yes_bid"] = Decimal("0.45")  # type: ignore[index]
+    newer_scan = service.refresh_candidates(force=True)
+    assert newer_scan["recommendations"]
+    newer_checked_at = newer_scan["checked_at"]
+
+    release.set()
+    maintenance.join(timeout=5)
+    assert not maintenance.is_alive()
+    final = service.candidate_snapshot()
+    assert final["recommendations"]
+    assert final["checked_at"] == newer_checked_at
+    # The discarded maintenance is not a data failure, so no 60-second
+    # backoff was armed by the discard: past the 30-second lead the next
+    # maintenance call performs external reads again instead of being gated
+    # into a pure cached snapshot.
+    trading.lp_reward_catalog = original_reward  # type: ignore[method-assign]
+    metadata_reads = len(state["metadata_requests"])
+    clock["now"] = t0 + timedelta(seconds=62)
+    service.refresh_candidate_recommendations()
+    assert len(state["metadata_requests"]) == metadata_reads + 1
+    # With the failure counter still at zero the scheduler sits on the
+    # 30-second lead cadence of the head this maintenance just refreshed at
+    # t0 + 62s (every head source stamp equals that read time): the wait is
+    # 30.0s, not a 60-second backoff remainder.
+    assert service.candidate_maintenance_wait_seconds() == pytest.approx(
+        30.0, abs=0.5
+    )
+
+
+def test_lp_dashboard_reads_come_from_background_snapshot(
+    tmp_path: Path,
+) -> None:
+    """Issue #146 A6: the page endpoint reads only the background snapshot;
+    external account reads happen solely inside the snapshot refresh. Issue
+    #146 D3: the refresh reads the account through the trading client's
+    shared TTL reader and falls back to the direct read when it is absent."""
+    state: dict[str, object] = {"now": datetime(2026, 9, 20, 12, 0, tzinfo=UTC)}
+    counters: dict[str, int] = {"account_reads": 0, "shared_reads": 0}
+
+    class CountingTrading:
+        config = SimpleNamespace(wallet_address="0x" + "4" * 40)
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            counters["account_reads"] += 1
+            return {
+                "authenticated": True,
+                "checked_at": state["now"],
+                "open_orders": [],
+                "positions": [],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def lp_account_snapshot_shared(
+            self, max_age_seconds: float = 10.0
+        ) -> dict[str, object]:
+            del max_age_seconds
+            counters["shared_reads"] += 1
+            return self.lp_account_snapshot()
+
+        def lp_reward_snapshot(
+            self, reward_date: str, market: str
+        ) -> dict[str, object]:
+            del reward_date, market
+            return {"state": "unknown"}
+
+    class FakeLP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {
+                "state": "ready",
+                "complete": True,
+                "candidates": [],
+                "recommendations": [],
+                "selected_results": [],
+                "funnel": {},
+                "selected_market_ids": [],
+            }
+
+        def status(self, _session_id: str | None = None) -> dict[str, object]:
+            return {"state": "none"}
+
+    service = PredictionExecutionService(
+        store=PredictionArbitrageStore(tmp_path / "data"),
+        monitor=object(),
+        trading=CountingTrading(),
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=FakeLP(),
+    )
+
+    # Before the first snapshot refresh the page endpoint serves the pending
+    # payload without any external read.
+    pending = service.lp_dashboard()
+    assert pending["state"] == "snapshot_pending"
+    assert counters["account_reads"] == 0
+
+    first = service.refresh_lp_dashboard_snapshot()
+    assert counters["account_reads"] == 1
+    assert counters["shared_reads"] == 1
+    checked_times = {str(first.get("checked_at"))}
+    for _ in range(5):
+        cached = service.lp_dashboard()
+        assert cached["state"] == "ready"
+        assert str(cached["checked_at"]) in checked_times
+    assert counters["account_reads"] == 1
+
+    # The next snapshot refresh performs exactly one more external read.
+    state["now"] = state["now"] + timedelta(seconds=10)
+    second = service.refresh_lp_dashboard_snapshot()
+    assert counters["account_reads"] == 2
+    assert counters["shared_reads"] == 2
+    assert str(second["checked_at"]) not in checked_times
+
+    # The pending payload carries every key a ready payload carries.
+    assert set(first.keys()) <= set(pending.keys())
+
+    # Issue #146 D3: without the shared reader the refresh falls back to the
+    # duck-typed direct read and still succeeds.
+    del CountingTrading.lp_account_snapshot_shared
+    state["now"] = state["now"] + timedelta(seconds=10)
+    third = service.refresh_lp_dashboard_snapshot()
+    assert third["state"] == "ready"
+    assert counters["account_reads"] == 3
+    assert counters["shared_reads"] == 2
+    assert str(third["checked_at"]) not in checked_times | {
+        str(second.get("checked_at"))
+    }
+
+
+def test_lp_maintenance_publishes_diagnostics_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #146 A9: the snapshot carries per-read timings, the next
+    allowed attempt, and the consecutive failure count."""
+    condition_id = "condition-diag"
+    market = _lp_test_market(
+        condition_id,
+        yes_token="diag-yes",
+        no_token="diag-no",
+        reward_min_size=Decimal("20"),
+    )
+    clock, state, store, trading, service = _lp_adapter_service_fixture(
+        tmp_path, monkeypatch, markets=[market], balance_units=50_000_000
+    )
+    monkeypatch.setattr(
+        polymarket_trading_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock["now"].timestamp()),  # type: ignore[attr-defined]
+    )
+    assert service.refresh_price_history()["state"] == "known"
+    assert service.refresh_candidates(force=True)["recommendations"]
+    t0 = clock["now"]
+
+    state["metadata_error"] = True
+    clock["now"] = t0 + timedelta(seconds=31)
+    failed = service.refresh_candidate_recommendations()
+    failed_diagnostics = failed["maintenance_diagnostics"]
+    assert set(failed_diagnostics) == {"started_at", "finished_at", "read_seconds"}
+    started = datetime.fromisoformat(
+        failed_diagnostics["started_at"].replace("Z", "+00:00")
+    )
+    finished = datetime.fromisoformat(
+        failed_diagnostics["finished_at"].replace("Z", "+00:00")
+    )
+    assert finished >= started
+    assert set(failed_diagnostics["read_seconds"]) == {
+        "account",
+        "metadata",
+        "reward",
+        "books",
+    }
+    assert all(
+        isinstance(value, float) and value >= 0.0
+        for value in failed_diagnostics["read_seconds"].values()
+    )
+    assert failed["maintenance_consecutive_failures"] == 1
+    next_attempt = datetime.fromisoformat(
+        failed["maintenance_next_attempt_at"].replace("Z", "+00:00")
+    )
+    assert next_attempt == finished + timedelta(seconds=60)
+
+    state["metadata_error"] = False
+    clock["now"] = finished + timedelta(seconds=61)
+    recovered = service.refresh_candidate_recommendations()
+    assert recovered["recommendations"]
+    assert recovered["maintenance_consecutive_failures"] == 0
+    assert recovered["maintenance_next_attempt_at"] is None
+    recovered_diagnostics = recovered["maintenance_diagnostics"]
+    assert set(recovered_diagnostics["read_seconds"]) == {
+        "account",
+        "metadata",
+        "reward",
+        "books",
+    }
+    recovered_finished = datetime.fromisoformat(
+        recovered_diagnostics["finished_at"].replace("Z", "+00:00")
+    )
+    assert recovered_finished >= t0 + timedelta(seconds=92)
 
 
 def test_lp_trial_preview_uses_same_qualification_and_selected_reads(
@@ -8244,9 +8951,19 @@ def test_paused_n_leg_routes_reject_before_business_work(
                 _response(_production_request(base, path, data=b"{}"))
                 for path in post_paths
             ]
-            lp_status, lp_payload = _response(
-                base + "/api/prediction-arbitrage/lp/dashboard"
-            )
+            # Issue #146: the route serves the background snapshot and
+            # coalesces while the observation refresh owns the pipeline, so
+            # retry like the page's 5-second poller would.
+            lp_payload: dict[str, object] = {}
+            lp_deadline = time.monotonic() + 5
+            while time.monotonic() < lp_deadline:
+                runtime.execution.refresh_lp_dashboard_snapshot()
+                lp_status, lp_payload = _response(
+                    base + "/api/prediction-arbitrage/lp/dashboard"
+                )
+                if lp_payload.get("state") != "snapshot_pending":
+                    break
+                time.sleep(0.05)
             session_status, session_payload = _response(
                 base + "/api/prediction-arbitrage/lp/sessions/current"
             )
@@ -8286,6 +9003,7 @@ def test_paused_n_leg_routes_reject_before_business_work(
         for _status_code, payload in post_results
     )
     assert lp_status == 200
+    assert lp_payload["orders"], sorted(lp_payload) and lp_payload.get("state")
     assert lp_payload["orders"][0]["order_id"] == "manual-order"
     assert lp_payload["orders"][0]["management"] == "manual_read_only"
     assert session_status == 200
@@ -8426,7 +9144,20 @@ def test_paused_n_leg_requests_do_not_hold_lp_or_health_responses(
             assert [by_path[path][0] for path in paths[:3]] == [409, 409, 409]
             assert by_path["/api/prediction-arbitrage/lp/dashboard"][0] == 200
             assert by_path["/healthz"][0] == 200
-            assert by_path["/api/prediction-arbitrage/lp/dashboard"][1]["state"] == "ready"
+            # Issue #146: the route serves the background snapshot; poll like
+            # the page does until the first snapshot is published.
+            dashboard_payload = by_path["/api/prediction-arbitrage/lp/dashboard"][1]
+            dashboard_deadline = time.monotonic() + 5
+            while (
+                dashboard_payload.get("state") != "ready"
+                and time.monotonic() < dashboard_deadline
+            ):
+                runtime.execution.refresh_lp_dashboard_snapshot()
+                _dash_status, dashboard_payload = _response(
+                    base + "/api/prediction-arbitrage/lp/dashboard", timeout=5
+                )
+                time.sleep(0.05)
+            assert dashboard_payload["state"] == "ready"
             assert by_path["/healthz"][1]["n_leg"] == {
                 "status": "paused",
                 "code": "N_LEG_PAUSED",
@@ -8598,8 +9329,10 @@ def test_paused_state_and_lp_remain_responsive_during_preparation(
             "code": "N_LEG_PAUSED",
         }
         assert dashboard_status == 200
-        assert dashboard["preparation"]["state"] == "preparing"
-        assert dashboard["preparation"]["stage"] == "catalog"
+        # Issue #146 D2: the page endpoint stays fast while preparation is
+        # still in flight. It serves the pending payload until the background
+        # snapshot thread publishes, and the published snapshot afterwards.
+        assert dashboard["state"] in {"snapshot_pending", "ready", "stale"}
         assert dashboard["recommendations"] == []
         assert dashboard["selected_results"] == []
     finally:
@@ -12168,6 +12901,8 @@ def test_lp_dashboard_reports_preparation_and_manual_recovery(
             csrf_token="csrf-token",
             runtime_metadata={"git_sha": "abc123"},
         ) as (base, _server_instance):
+            # Issue #146: refresh the background snapshot before serving.
+            runtime.execution.refresh_lp_dashboard_snapshot()
             initial_status, initial = _response(
                 base + "/api/prediction-arbitrage/lp/dashboard"
             )
@@ -12179,6 +12914,8 @@ def test_lp_dashboard_reports_preparation_and_manual_recovery(
 
             catalog_release.set()
             assert retry_waiting.wait(timeout=2)
+            # Issue #146: refresh the background snapshot before serving.
+            runtime.execution.refresh_lp_dashboard_snapshot()
             waiting_status, waiting = _response(
                 base + "/api/prediction-arbitrage/lp/dashboard"
             )
@@ -12222,6 +12959,8 @@ def test_lp_dashboard_reports_preparation_and_manual_recovery(
 
             retry_release.set()
             assert paused_waiting.wait(timeout=2)
+            # Issue #146: refresh the background snapshot before serving.
+            runtime.execution.refresh_lp_dashboard_snapshot()
             paused_status, paused = _response(
                 base + "/api/prediction-arbitrage/lp/dashboard"
             )
@@ -12247,6 +12986,8 @@ def test_lp_dashboard_reports_preparation_and_manual_recovery(
             assert recovery["paused"] is False
             assert recovered.wait(timeout=2)
             assert ready_waiting.wait(timeout=2)
+            # Issue #146: refresh the background snapshot before serving.
+            runtime.execution.refresh_lp_dashboard_snapshot()
             ready_status, ready = _response(
                 base + "/api/prediction-arbitrage/lp/dashboard"
             )

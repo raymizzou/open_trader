@@ -1079,7 +1079,14 @@ def test_restart_preserves_manual_orders_and_resumes_monitoring(
             runtime.start()
             assert runtime.store is not None
             assert runtime.execution is not None
+            # Issue #146: poll like the page does until the background
+            # snapshot is published instead of forcing a pipeline run.
             dashboard = runtime.execution.lp_dashboard()
+            dashboard_deadline = time.monotonic() + 5
+            while dashboard.get("state") != "ready" and time.monotonic() < dashboard_deadline:
+                runtime.execution.refresh_lp_dashboard_snapshot()
+                dashboard = runtime.execution.lp_dashboard()
+                time.sleep(0.05)
             observations.append(
                 {
                     "state": runtime.state,
@@ -1851,6 +1858,135 @@ def test_lp_dashboard_refresh_cannot_block_risk_monitor(
     assert probe_holder[0].active == 0
 
 
+def test_candidate_monitors_run_independently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #146 A8: scan and maintenance run on independent threads, the
+    scheduler wait never spins below one second, a manual refresh forces a
+    scan round, and the dashboard snapshot refreshes in the background."""
+    import open_trader.prediction_runtime as runtime_module
+
+    scan_entered = threading.Event()
+    scan_release = threading.Event()
+    maintenance_calls: list[float] = []
+    dashboard_calls: list[float] = []
+
+    class StubLP:
+        def __init__(self, _store, _exchange, owner_lock=None) -> None:
+            del owner_lock
+            self.scan_forces: list[bool] = []
+
+        def refresh_candidates(
+            self, *, stop_event=None, force: bool = False
+        ) -> dict[str, object]:
+            del stop_event
+            self.scan_forces.append(force)
+            scan_entered.set()
+            assert scan_release.wait(timeout=10)
+            return {"state": "unknown", "scanning": False}
+
+        def refresh_candidate_recommendations(
+            self, *, stop_event=None
+        ) -> dict[str, object]:
+            del stop_event
+            maintenance_calls.append(time.monotonic())
+            return {"state": "ready"}
+
+        def candidate_maintenance_wait_seconds(self) -> float:
+            return 0.0
+
+        def refresh_rewards(self, *, stop_event=None) -> dict[str, object]:
+            del stop_event
+            return {"state": "none"}
+
+    class FakeTrading:
+        config = SimpleNamespace(
+            signer_address="0x" + "1" * 40,
+            wallet_address="0x" + "2" * 40,
+        )
+
+    class FakeMonitor:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def stop(self) -> None:
+            return None
+
+    class FakeExecution:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def reconcile_startup(self) -> dict[str, object]:
+            return {"state": "ready"}
+
+        def lp_tick(self) -> dict[str, object]:
+            return {"state": "none"}
+
+        def set_cross_venue_monitor(self, _monitor: object) -> None:
+            return None
+
+        def refresh_lp_dashboard_snapshot(self) -> dict[str, object]:
+            dashboard_calls.append(time.monotonic())
+            return {"state": "ready"}
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        runtime_module,
+        "PolymarketTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: FakeTrading()),
+    )
+    monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor)
+    monkeypatch.setattr(runtime_module, "PredictionExecutionService", FakeExecution)
+    monkeypatch.setattr(runtime_module, "load_trading_config", lambda _path: FakeTrading.config)
+    monkeypatch.setattr(runtime_module, "PolymarketLPService", StubLP)
+    monkeypatch.setattr(runtime_module, "_LP_DASHBOARD_SNAPSHOT_SECONDS", 0.05)
+
+    runtime = PredictionRuntime(
+        data_dir=tmp_path,
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+        mode="production",
+        n_leg_paused=True,
+        enable_n_leg_background=False,
+    )
+    runtime.start()
+    try:
+        assert runtime.lp is not None
+        # The scan parks inside refresh_candidates; the maintenance thread
+        # still runs on its own cadence.
+        assert scan_entered.wait(timeout=5)
+        deadline = time.monotonic() + 6
+        while len(maintenance_calls) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(maintenance_calls) >= 2
+        assert len(maintenance_calls) >= 2 and (
+            maintenance_calls[-1] - maintenance_calls[0] >= 0.9
+        )
+        # The dashboard snapshot thread ran on its own cadence.
+        assert len(dashboard_calls) >= 1
+
+        # Releasing the scan lets it finish; the failed (non-ready) round
+        # waits 60 seconds, so the next scan round comes from the manual
+        # page refresh and runs with force=True.
+        scan_release.set()
+        deadline = time.monotonic() + 5
+        while len(runtime.lp.scan_forces) < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert runtime.queue_lp_candidate_refresh() is True
+        deadline = time.monotonic() + 5
+        while len(runtime.lp.scan_forces) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(runtime.lp.scan_forces) == 2
+        assert runtime.lp.scan_forces[0] is True
+        assert runtime.lp.scan_forces[1] is True
+    finally:
+        scan_release.set()
+        runtime.stop()
+    assert runtime.state == "STOPPED"
+
+
 def test_candidate_monitor_scan_cadence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1938,27 +2074,24 @@ def test_candidate_monitor_scan_cadence(
     runtime.start()
     try:
         assert runtime.lp is not None
+        # Issue #146 D6: the first round is forced; a ready round then waits
+        # out the 300-second scan window instead of polling every minute.
         deadline = time.monotonic() + 5
-        while len(runtime.lp.calls) < 3 and time.monotonic() < deadline:
+        while len(runtime.lp.calls) < 1 and time.monotonic() < deadline:
             time.sleep(0.01)
-        calls = runtime.lp.calls
-        assert calls[0] is True
-        # Ordinary wakes never force a new scan round.
-        assert calls[1] is False
-        assert calls[2] is False
+        assert runtime.lp.calls[0] is True
+        time.sleep(2.5)
+        assert len(runtime.lp.calls) == 1
 
+        # A manual page refresh interrupts the window and forces the round.
         assert runtime.queue_lp_candidate_refresh() is True
         deadline = time.monotonic() + 5
-        while True not in calls[3:] and time.monotonic() < deadline:
+        while len(runtime.lp.calls) < 2 and time.monotonic() < deadline:
             time.sleep(0.01)
-        assert True in calls[3:]
-        forced_index = 3 + calls[3:].index(True)
-        # The wake after the manual forced round is ordinary again.
-        deadline = time.monotonic() + 5
-        while len(calls) < forced_index + 2 and time.monotonic() < deadline:
-            time.sleep(0.01)
-            calls = runtime.lp.calls
-        assert calls[forced_index + 1] is False
+        assert runtime.lp.calls[1] is True
+        # The window restarts after the forced round: no ordinary wake.
+        time.sleep(2.5)
+        assert len(runtime.lp.calls) == 2
     finally:
         runtime.stop()
     assert runtime.state == "STOPPED"
@@ -2222,7 +2355,6 @@ def test_lp_trial_maintenance_runs_without_page_and_stops(
             time.sleep(0.01)
         else:
             raise AssertionError("initial candidate recommendation was not published")
-        assert len(book_calls) == 1
         # The initial scan reads the whole two-market batch (both outcomes)
         # in one call.
         assert set(book_calls[0]) == {
@@ -2230,10 +2362,9 @@ def test_lp_trial_maintenance_runs_without_page_and_stops(
             for condition_id in condition_ids
             for outcome in ("yes", "no")
         }
-        # The published book is 59 seconds old; advancing the source clock by
-        # two seconds must wake maintenance before the ordinary 60-second
-        # candidate wait expires.
-        clock["now"] = initial_now + timedelta(seconds=2)
+        # Issue #146: the published books are already 59 seconds old, so the
+        # 30-second source lead makes maintenance fire on its own about a
+        # second after the scan publish; only the head's books are re-read.
         assert maintenance_started.wait(timeout=5)
         assert len(book_calls) == 2
         expected_head = {
@@ -2287,8 +2418,8 @@ def test_lp_trial_maintenance_runs_without_page_and_stops(
             time.sleep(0.01)
         else:
             raise AssertionError("second candidate recommendation was not published")
-        assert len(book_calls) == 1
-        clock["now"] = initial_now + timedelta(seconds=2)
+        # Issue #146: the 30-second lead fires maintenance on its own because
+        # the published books are already 59 seconds old.
         assert maintenance_finished.wait(timeout=5)
         assert len(book_calls) == 2
         reads_after_partial_refresh = clock_reads
@@ -2589,7 +2720,10 @@ def test_lp_observations_refresh_without_dashboard_and_stop_with_runtime(
     blocked.start()
     assert blocked_probe.rate_started.wait(timeout=2)
     assert blocked_probe.lp_tick_seen.wait(timeout=2)
-    assert not blocked_probe.observation_finished.is_set()
+    # Issue #146: concurrent observation refreshes coalesce onto the shared
+    # dashboard snapshot pipeline, so some calls return early instead of
+    # queueing behind the blocked rate read. The risk monitor must still
+    # keep ticking while the rate read is parked.
     blocked.stop()
     assert blocked.state == "STOPPED"
     assert blocked_probe.rate_cancelled.is_set()
@@ -3110,6 +3244,9 @@ def test_lp_share_watch_runs_without_dashboard_and_stops_with_runtime(
 
     trading = RuntimeTrading()
     monkeypatch.setattr(runtime_module, "_LP_SHARE_WATCH_SECONDS", 0.01, raising=False)
+    # Issue #146: the observation refresh coalesces onto the shared snapshot
+    # pipeline, so retry it quickly until the snapshot thread has published.
+    monkeypatch.setattr(runtime_module, "_LP_REWARD_SECONDS", 0.1)
     monkeypatch.setattr(runtime_module, "_LP_REWARD_STOP_GRACE_SECONDS", 0.05)
     monkeypatch.setattr(runtime_module, "PolymarketLPService", FakeLP)
     monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor)
@@ -3204,7 +3341,12 @@ def test_lp_share_watch_runs_without_dashboard_and_stops_with_runtime(
 
         def read_dashboard() -> None:
             assert runtime.execution is not None
-            dashboard_results.append(runtime.execution.lp_dashboard())
+            # Issue #146: the page reads the published cache; the pipeline
+            # (and the blocked percentage read) is owned by the snapshot
+            # refresh, which is what must wait here.
+            dashboard_results.append(
+                runtime.execution.refresh_lp_dashboard_snapshot()
+            )
             dashboard_done.set()
 
         dashboard_thread = threading.Thread(target=read_dashboard)
@@ -4950,7 +5092,9 @@ def test_lp_runtime_stops_obsolete_sampling_and_keeps_exposure_risk(
             }
 
         def lp_account_snapshot(self) -> dict[str, object]:
-            candidate_scan_seen.set()
+            # Issue #146: the dashboard snapshot thread also reads the
+            # account, so scan consumption is observed on the books read
+            # (which only the candidate scan performs) instead of here.
             return {
                 "authenticated": True,
                 "balance": Decimal("100"),
@@ -4967,6 +5111,7 @@ def test_lp_runtime_stops_obsolete_sampling_and_keeps_exposure_risk(
         ) -> dict[str, object]:
             del stop_event
             sampler_book_calls.append(tuple(token_ids))
+            candidate_scan_seen.set()
             return {}
 
         def lp_reward_snapshot(
@@ -7225,7 +7370,19 @@ def test_lp_minute_risk_does_not_wait_for_hourly_catalog_preparation(
             time.sleep(0.01)
         else:
             raise AssertionError("initial candidate scan did not finish")
+        # Issue #146: the maintenance wait is anchored on wall-clock time, so
+        # pin the scheduler cadence to one second; the source-age trigger in
+        # refresh_candidate_recommendations still gates every read.
+        original_wait = runtime.lp.candidate_maintenance_wait_seconds
+
+        def one_second_wait() -> float:
+            return 0.01
+
+        runtime.lp.candidate_maintenance_wait_seconds = one_second_wait
         now[0] += timedelta(seconds=61)
+        # The maintenance monitor is parked on its wall-clock wait; wake it
+        # so the fake-clock jump takes effect immediately.
+        runtime._candidate_maintenance_wakeup.set()
         deadline = time.monotonic() + 2
         while len(selected_book_calls) < 2 and time.monotonic() < deadline:
             time.sleep(0.01)
@@ -7593,7 +7750,7 @@ def test_lp_dashboard_today_orders_fail_open_and_non_lp_count(tmp_path: Path) ->
         lp=FakeLP(),
     )
 
-    dashboard = service.lp_dashboard()
+    dashboard = service.refresh_lp_dashboard_snapshot()
 
     today_ids = [
         str(row["order_id"]) for row in dashboard["lp_orders_today"]
@@ -7767,14 +7924,14 @@ def test_lp_dashboard_today_orders_include_filled_orders_from_trades(
         lp=FakeLP(),
     )
 
-    first = service.lp_dashboard()
+    first = service.refresh_lp_dashboard_snapshot()
     # AC4: 成交聚合异步补齐，读取本身不等待。
     assert first["lp_orders_today"] == []
     assert trading.trades_requested.wait(timeout=5)
     dashboard = first
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
-        dashboard = service.lp_dashboard()
+        dashboard = service.refresh_lp_dashboard_snapshot()
         filled_ids = {
             str(row["order_id"])
             for row in dashboard["lp_orders_today"]
@@ -7924,13 +8081,13 @@ def test_lp_today_orders_maker_fills_exclude_counterparty_taker_order(
         lp=FakeLP(),
     )
 
-    first = service.lp_dashboard()
+    first = service.refresh_lp_dashboard_snapshot()
     assert first["lp_orders_today"] == []
     assert trading.trades_requested.wait(timeout=5)
     dashboard = first
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
-        dashboard = service.lp_dashboard()
+        dashboard = service.refresh_lp_dashboard_snapshot()
         filled_ids = {
             str(row["order_id"])
             for row in dashboard["lp_orders_today"]
@@ -8054,13 +8211,13 @@ def test_lp_today_orders_fills_skip_failed_trades(tmp_path: Path) -> None:
         lp=FakeLP(),
     )
 
-    first = service.lp_dashboard()
+    first = service.refresh_lp_dashboard_snapshot()
     assert first["lp_orders_today"] == []
     assert trading.trades_requested.wait(timeout=5)
     dashboard = first
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
-        dashboard = service.lp_dashboard()
+        dashboard = service.refresh_lp_dashboard_snapshot()
         filled_ids = {
             str(row["order_id"])
             for row in dashboard["lp_orders_today"]
@@ -8191,7 +8348,7 @@ def test_lp_today_orders_prior_day_negative_observation_fails_open(
         lp=FakeLP(),
     )
 
-    dashboard = service.lp_dashboard()
+    dashboard = service.refresh_lp_dashboard_snapshot()
 
     # R3: 昨日否定 → fail-open 保留；当日否定 → 照常排除。
     assert [str(row["order_id"]) for row in dashboard["lp_orders_today"]] == [
@@ -8330,12 +8487,12 @@ def test_lp_today_orders_cached_fills_follow_market_gate_and_session_management(
     )
 
     # 第一轮装配：三个市场当天都有奖励记录，成交缓存异步补齐并进表。
-    first = service.lp_dashboard()
+    first = service.refresh_lp_dashboard_snapshot()
     assert first["lp_orders_today"] == []
     deadline = time.monotonic() + 5
     dashboard = first
     while time.monotonic() < deadline:
-        dashboard = service.lp_dashboard()
+        dashboard = service.refresh_lp_dashboard_snapshot()
         if any(
             str(row["order_id"]) == "manual-fill-order"
             for row in dashboard["lp_orders_today"]
@@ -8351,7 +8508,7 @@ def test_lp_today_orders_cached_fills_follow_market_gate_and_session_management(
     lp.include_rewards = False
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
-        dashboard = service.lp_dashboard()
+        dashboard = service.refresh_lp_dashboard_snapshot()
         if not any(
             str(row["order_id"]) == "neg-fill-order"
             for row in dashboard["lp_orders_today"]
@@ -8486,16 +8643,16 @@ def test_lp_today_orders_trade_reads_throttled_until_ttl_expires(
         raise AssertionError(f"expected {count} trade reads, got {len(trading.trade_calls)}")
 
     # 第一次装配触发首次成交读取。
-    service.lp_dashboard()
+    service.refresh_lp_dashboard_snapshot()
     wait_for_reads(1)
     # TTL 内的后续装配不再重读该市场。
-    service.lp_dashboard()
-    service.lp_dashboard()
+    service.refresh_lp_dashboard_snapshot()
+    service.refresh_lp_dashboard_snapshot()
     time.sleep(0.3)
     assert len(trading.trade_calls) == 1
     # 注入时钟越过 TTL 后重新入队。
     clock["now"] += 61.0
-    service.lp_dashboard()
+    service.refresh_lp_dashboard_snapshot()
     wait_for_reads(2)
     assert trading.trade_calls[0] == ("condition-1",)
     assert trading.trade_calls[1] == ("condition-1",)
@@ -8612,13 +8769,13 @@ def test_lp_today_orders_fill_rows_resolve_outcome_from_metadata(
         lp=FakeLP(),
     )
 
-    first = service.lp_dashboard()
+    first = service.refresh_lp_dashboard_snapshot()
     assert first["lp_orders_today"] == []
     assert trading.trades_requested.wait(timeout=5)
     dashboard = first
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
-        dashboard = service.lp_dashboard()
+        dashboard = service.refresh_lp_dashboard_snapshot()
         filled_ids = {
             str(row["order_id"])
             for row in dashboard["lp_orders_today"]
@@ -8710,7 +8867,7 @@ def test_lp_dashboard_today_orders_keep_scoring_orders_with_unknown_market(
         lp=FakeLP(),
     )
 
-    dashboard = service.lp_dashboard()
+    dashboard = service.refresh_lp_dashboard_snapshot()
 
     # AC1: 计分信号命中即归属 LP，市场观察与奖励记录均未知也不排除。
     assert [str(row["order_id"]) for row in dashboard["lp_orders_today"]] == [
@@ -8824,7 +8981,7 @@ def test_lp_dashboard_payload_keeps_orders_and_positions_intact(
         lp=FakeLP(),
     )
 
-    dashboard = service.lp_dashboard()
+    dashboard = service.refresh_lp_dashboard_snapshot()
 
     order = dict(dashboard["orders"][0])
     scoring_checked_at = order.pop("scoring_checked_at")
@@ -8978,7 +9135,7 @@ def test_lp_dashboard_orders_carry_purpose_and_min_scoring_size(tmp_path: Path) 
         lp=FakeLP(),
     )
 
-    dashboard = service.lp_dashboard()
+    dashboard = service.refresh_lp_dashboard_snapshot()
 
     orders = {
         str(row["order_id"]): row

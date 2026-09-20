@@ -14,6 +14,8 @@ import pty
 import re
 import subprocess
 import threading
+import time
+from copy import deepcopy
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
@@ -1166,6 +1168,8 @@ class PolymarketTradingClient:
             str, tuple[float, dict[str, object] | None]
         ] = {}
         self._metadata_lock = threading.Lock()
+        self._lp_account_shared_lock = threading.Lock()
+        self._lp_account_shared_cache: dict[str, object] | None = None
         self._metadata_warm_loaded = False
         self._metadata_last_prune_epoch = float("-inf")
         self._readiness_key: tuple[PairIntent, Decimal] | None = None
@@ -1288,6 +1292,41 @@ class PolymarketTradingClient:
             positions=tuple(safe_positions),
             checked_at=checked_at,
         )
+
+    def lp_account_snapshot_shared(
+        self, max_age_seconds: float = 10.0
+    ) -> dict[str, object]:
+        """Return a shared LP account snapshot within the TTL window.
+
+        Issue #146: the full scan, the head maintenance, and the dashboard
+        snapshot all read the same account facts. Callers block on one
+        instance-level lock so concurrent refreshes coalesce into a single
+        external read, and the snapshot is reused until ``max_age_seconds``
+        have passed. An underlying read failure is not cached.
+        """
+
+        with self._lp_account_shared_lock:
+            cached = self._lp_account_shared_cache
+            if isinstance(cached, Mapping):
+                fetched_at = cached.get("fetched_at")
+                snapshot = cached.get("snapshot")
+                age = (
+                    time.monotonic() - float(fetched_at)
+                    if isinstance(fetched_at, (int, float))
+                    else None
+                )
+                if (
+                    isinstance(snapshot, Mapping)
+                    and age is not None
+                    and age <= max_age_seconds
+                ):
+                    return deepcopy(dict(snapshot))
+            snapshot = self.lp_account_snapshot()
+            self._lp_account_shared_cache = {
+                "snapshot": deepcopy(snapshot),
+                "fetched_at": time.monotonic(),
+            }
+            return deepcopy(snapshot)
 
     def lp_account_snapshot(self) -> dict[str, object]:
         """Return current account orders and holdings for the read-only LP panel."""

@@ -43,6 +43,21 @@ REWARD_THRESHOLD = Decimal("1")
 REWARD_STALE_SECONDS = Decimal("180")
 LP_CANDIDATE_REFRESH_SECONDS = Decimal("300")
 LP_RECOMMENDATION_REFRESH_SECONDS = Decimal("60")
+# Issue #146: maintenance refreshes the head's sources on the oldest source
+# age (30-second lead) instead of waiting for the 60-second expiry.
+LP_RECOMMENDATION_REFRESH_LEAD_SECONDS = Decimal("30")
+# Issue #146: after consecutive maintenance failures the next attempt waits
+# 60/120/300 seconds counted from the attempt's finish; three or more
+# consecutive failures hold at 300 seconds. A success resets the schedule.
+_CANDIDATE_MAINTENANCE_BACKOFF_SECONDS = (
+    Decimal("60"),
+    Decimal("120"),
+    Decimal("300"),
+)
+# Issue #146: scheduler waits never spin below one second and never exceed
+# the 300-second scan cadence.
+_CANDIDATE_SCHEDULER_WAIT_FLOOR_SECONDS = 1.0
+_CANDIDATE_SCHEDULER_WAIT_CEILING_SECONDS = 300.0
 # Issue #143 cadence: a full batch scan runs at most once every 300 seconds.
 # refresh_candidates(force=False) inside that window returns the current
 # snapshot with zero external reads; force=True always starts a new round.
@@ -267,6 +282,76 @@ def _candidate_source_expired(value: object, now: datetime) -> bool:
     return age < 0 or age > LP_RECOMMENDATION_REFRESH_SECONDS
 
 
+def _candidate_source_due(value: object, now: datetime) -> bool:
+    """Return whether a source receipt needs a refresh (30s lead or expired)."""
+
+    try:
+        checked_at = _timestamp(value, name="candidate_source_checked_at")
+    except ValueError:
+        return True
+    age = Decimal(str((now - checked_at).total_seconds()))
+    return (
+        age < 0
+        or age >= LP_RECOMMENDATION_REFRESH_LEAD_SECONDS
+        or age > LP_RECOMMENDATION_REFRESH_SECONDS
+    )
+
+
+def _candidate_head_source_values(cached: Mapping[str, object]) -> list[object]:
+    """Collect the head's source receipt stamps, oldest-age candidates only.
+
+    Shared by the maintenance trigger and
+    :meth:`PolymarketLPService.candidate_maintenance_wait_seconds` so both
+    judge the same values with the same clock.
+    """
+
+    raw_account = cached.get("account")
+    values: list[object] = [
+        raw_account.get("checked_at") if isinstance(raw_account, Mapping) else None
+    ]
+    for direction in cached.get("directions", ()):
+        if not isinstance(direction, Mapping):
+            continue
+        market = direction.get("market")
+        if isinstance(market, Mapping):
+            values.extend(
+                [
+                    market.get("metadata_checked_at"),
+                    market.get("fees_checked_at"),
+                ]
+            )
+        values.extend(
+            [
+                direction.get("reward_checked_at"),
+                direction.get("book", {}).get("received_at")
+                if isinstance(direction.get("book"), Mapping)
+                else None,
+            ]
+        )
+    return values
+
+
+def _candidate_head_source_times(
+    cached: Mapping[str, object], now: datetime
+) -> tuple[list[datetime], bool]:
+    """Return the parseable source stamps and whether any source is expired."""
+
+    source_times: list[datetime] = []
+    for value in _candidate_head_source_values(cached):
+        try:
+            checked_at = _timestamp(value, name="candidate_source_checked_at")
+        except ValueError:
+            continue
+        if checked_at > now:
+            continue
+        source_times.append(checked_at)
+    any_expired = any(
+        _candidate_source_expired(value, now)
+        for value in _candidate_head_source_values(cached)
+    )
+    return source_times, any_expired
+
+
 def _realtime_query_rate_upper_bound(
     daily_pool: object, capital: object
 ) -> Decimal | None:
@@ -353,7 +438,12 @@ class PolymarketLPService:
         self._reward_refresh_lock = threading.Lock()
         self._price_history_refresh_lock = threading.Lock()
         self._report_lock = threading.Lock()
-        self._candidate_refresh_lock = threading.Lock()
+        # Issue #146: the full scan and the head maintenance run on
+        # independent threads; separate locks let a long scan proceed while
+        # maintenance refreshes the published head (and vice versa) without
+        # either kind overlapping itself.
+        self._candidate_scan_lock = threading.Lock()
+        self._candidate_maintenance_lock = threading.Lock()
         self._candidate_state_lock = threading.RLock()
         self._competition_lock = threading.Lock()
         self._competition_state: dict[str, object] = {}
@@ -363,8 +453,9 @@ class PolymarketLPService:
         self._sample_target_version = 0
         self._candidate_attempted_at: datetime | None = None
         self._candidate_scan_completed_at: datetime | None = None
-        self._candidate_maintenance_attempted_at: datetime | None = None
-        self._candidate_maintenance_failed = False
+        self._candidate_maintenance_failures = 0
+        self._candidate_maintenance_last_finished_at: datetime | None = None
+        self._candidate_publication_generation = 0
         self._candidate_qualification_facts: dict[str, object] = {}
         self._prepared_inputs: dict[str, object] | None = None
         self._candidate_snapshot: dict[str, object] = {
@@ -962,13 +1053,33 @@ class PolymarketLPService:
         return snapshot
 
     def candidate_maintenance_wait_seconds(self) -> float | None:
-        """Return the next source-expiry deadline for the published head."""
+        """Return seconds until maintenance may run again (issue #146).
+
+        Inside a failure backoff window this is the remaining backoff;
+        otherwise it is the time until the oldest head source reaches the
+        30-second lead. Every numeric result clamps to [1.0, 300.0] so the
+        scheduler can never spin; ``None`` means there is nothing to
+        maintain (no head, no facts, or no source stamps).
+        """
 
         with self._candidate_state_lock:
             snapshot = deepcopy(self._candidate_snapshot)
             qualification_facts = deepcopy(self._candidate_qualification_facts)
-            attempted_at = self._candidate_attempted_at
-            maintenance_attempted_at = self._candidate_maintenance_attempted_at
+            failures = self._candidate_maintenance_failures
+            last_finished_at = self._candidate_maintenance_last_finished_at
+        now = self._now()
+        floor = _CANDIDATE_SCHEDULER_WAIT_FLOOR_SECONDS
+        ceiling = _CANDIDATE_SCHEDULER_WAIT_CEILING_SECONDS
+
+        if failures > 0 and last_finished_at is not None:
+            backoff = _CANDIDATE_MAINTENANCE_BACKOFF_SECONDS[
+                min(failures - 1, 2)
+            ]
+            remaining = (
+                last_finished_at + timedelta(seconds=float(backoff)) - now
+            ).total_seconds()
+            if remaining > 0:
+                return min(max(remaining, floor), ceiling)
         raw_selected = snapshot.get("selected_results")
         selected_rows = (
             [row for row in raw_selected if isinstance(row, Mapping)]
@@ -981,69 +1092,25 @@ class PolymarketLPService:
         cached = qualification_facts.get(condition_id)
         if not isinstance(cached, Mapping):
             return None
-        now = self._now()
-        normal_wait = float(LP_RECOMMENDATION_REFRESH_SECONDS)
-        if attempted_at is not None:
-            normal_wait = (
-                attempted_at
-                + timedelta(seconds=float(LP_RECOMMENDATION_REFRESH_SECONDS))
-                - now
-            ).total_seconds()
-            if normal_wait <= 0:
-                normal_wait = 0.05
-        if (
-            maintenance_attempted_at is not None
-            and (attempted_at is None or maintenance_attempted_at >= attempted_at)
-        ):
-            # A maintenance attempt already consumed this normal-scan round.
-            # Missing or failed facts are not an actionable deadline for a
-            # second attempt; wait for the next normal scan instead.
-            return normal_wait
-        values: list[object] = []
-        raw_account = cached.get("account")
-        values.append(
-            raw_account.get("checked_at")
-            if isinstance(raw_account, Mapping)
-            else None
-        )
-        for direction in cached.get("directions", ()):
-            if not isinstance(direction, Mapping):
-                continue
-            market = direction.get("market")
-            if isinstance(market, Mapping):
-                values.extend(
-                    [
-                        market.get("metadata_checked_at"),
-                        market.get("fees_checked_at"),
-                    ]
-                )
-            values.extend(
-                [
-                    direction.get("reward_checked_at"),
-                    direction.get("book", {}).get("received_at")
-                    if isinstance(direction.get("book"), Mapping)
-                    else None,
-                ]
-            )
         source_times: list[datetime] = []
-        for value in values:
+        for value in _candidate_head_source_values(cached):
             try:
                 checked_at = _timestamp(value, name="candidate_source_checked_at")
             except ValueError:
-                return 0.05
+                # An unparseable stamp is degenerate: retry on the floor.
+                return floor
             if checked_at > now:
-                return 0.05
+                # A future stamp is degenerate: retry on the floor.
+                return floor
             source_times.append(checked_at)
         if not source_times:
             return None
-        earliest_expiry = min(
-            checked_at + timedelta(seconds=float(LP_RECOMMENDATION_REFRESH_SECONDS))
-            for checked_at in source_times
-        )
-        wait_seconds = (earliest_expiry - now).total_seconds()
-        if wait_seconds <= 0:
-            wait_seconds = 0.05
-        return min(wait_seconds, normal_wait)
+        wait_seconds = (
+            min(source_times)
+            + timedelta(seconds=float(LP_RECOMMENDATION_REFRESH_LEAD_SECONDS))
+            - now
+        ).total_seconds()
+        return min(max(wait_seconds, floor), ceiling)
 
     def _publish_sample_targets(
         self, targets: Sequence[tuple[str, str]]
@@ -2759,7 +2826,7 @@ class PolymarketLPService:
     ) -> dict[str, object]:
         """Refresh the light shortlist, then risk-check only selected markets."""
 
-        if not self._candidate_refresh_lock.acquire(blocking=False):
+        if not self._candidate_scan_lock.acquire(blocking=False):
             snapshot = self.candidate_snapshot()
             snapshot["scanning"] = True
             return snapshot
@@ -2794,9 +2861,6 @@ class PolymarketLPService:
                     return self.candidate_snapshot()
                 previous = dict(self._candidate_snapshot)
                 self._candidate_attempted_at = scan_started_at
-                self._candidate_maintenance_attempted_at = None
-                self._candidate_maintenance_failed = False
-                self._candidate_qualification_facts = {}
                 self._candidate_snapshot = {
                     **previous,
                     "state": "scanning",
@@ -2816,7 +2880,13 @@ class PolymarketLPService:
                 )
             catalog_reader = getattr(self.exchange, "lp_reward_catalog", None)
             metadata_reader = getattr(self.exchange, "lp_market_metadata", None)
-            account_reader = getattr(self.exchange, "lp_account_snapshot", None)
+            # Issue #146: scan, maintenance, and the dashboard snapshot share
+            # one account read through the trading client's TTL cache.
+            account_reader = getattr(
+                self.exchange, "lp_account_snapshot_shared", None
+            )
+            if not callable(account_reader):
+                account_reader = getattr(self.exchange, "lp_account_snapshot", None)
             books_reader = getattr(self.exchange, "lp_order_books", None)
             if (
                 not callable(catalog_reader)
@@ -3735,14 +3805,14 @@ class PolymarketLPService:
                 retention_reason="candidate_refresh_failed",
             )
         finally:
-            self._candidate_refresh_lock.release()
+            self._candidate_scan_lock.release()
 
     def refresh_candidate_recommendations(
         self, *, stop_event: threading.Event | None = None
     ) -> dict[str, object]:
         """Refresh expired facts for the current recommendation head only."""
 
-        if not self._candidate_refresh_lock.acquire(blocking=False):
+        if not self._candidate_maintenance_lock.acquire(blocking=False):
             snapshot = self.candidate_snapshot()
             snapshot["scanning"] = True
             return snapshot
@@ -3750,7 +3820,9 @@ class PolymarketLPService:
             now = self._now()
             with self._candidate_state_lock:
                 previous = deepcopy(self._candidate_snapshot)
-                attempted_at = self._candidate_maintenance_attempted_at
+                generation = self._candidate_publication_generation
+                failures = self._candidate_maintenance_failures
+                last_finished_at = self._candidate_maintenance_last_finished_at
             raw_selected = previous.get("selected_results")
             selected_rows = (
                 [row for row in raw_selected if isinstance(row, Mapping)]
@@ -3780,20 +3852,20 @@ class PolymarketLPService:
                 else {}
             )
 
-            account_expired = _candidate_source_expired(
+            account_due = _candidate_source_due(
                 account.get("checked_at"), now
             )
-            reward_expired = any(
-                _candidate_source_expired(direction.get("reward_checked_at"), now)
+            reward_due = any(
+                _candidate_source_due(direction.get("reward_checked_at"), now)
                 for direction in directions
             )
-            metadata_expired = any(
+            metadata_due = any(
                 isinstance(direction.get("market"), Mapping)
                 and (
-                    _candidate_source_expired(
+                    _candidate_source_due(
                         direction["market"].get("metadata_checked_at"), now
                     )
-                    or _candidate_source_expired(
+                    or _candidate_source_due(
                         direction["market"].get("fees_checked_at"), now
                     )
                 )
@@ -3806,8 +3878,8 @@ class PolymarketLPService:
                     if str(direction["market"].get("token_id") or "").strip()
                 )
             )
-            book_expired = any(
-                _candidate_source_expired(
+            book_due = any(
+                _candidate_source_due(
                     direction.get("book", {}).get("received_at")
                     if isinstance(direction.get("book"), Mapping)
                     else None,
@@ -3815,44 +3887,57 @@ class PolymarketLPService:
                 )
                 for direction in directions
             )
-            try:
-                checked_at = _timestamp(
-                    previous.get("checked_at"), name="candidate_checked_at"
-                )
-            except ValueError:
-                return self.candidate_snapshot()
-            publication_age = Decimal(str((now - checked_at).total_seconds()))
-            source_expired = (
-                account_expired
-                or reward_expired
-                or metadata_expired
-                or book_expired
+            source_times, source_expired = _candidate_head_source_times(
+                cached, now
             )
-            if self._candidate_maintenance_failed:
-                return self.candidate_snapshot()
-            if (
-                publication_age <= LP_RECOMMENDATION_REFRESH_SECONDS
-                and not source_expired
-            ):
-                return self.candidate_snapshot()
-            if (
-                attempted_at is not None
-                and Decimal(str((now - attempted_at).total_seconds()))
-                < LP_RECOMMENDATION_REFRESH_SECONDS
-            ):
+            # Issue #146: fire on the oldest source age (30-second lead) or
+            # any already-expired source. The publication age and the
+            # maintenance attempted-at gates are gone.
+            lead_due = bool(source_times) and min(source_times) + timedelta(
+                seconds=float(LP_RECOMMENDATION_REFRESH_LEAD_SECONDS)
+            ) <= now
+            if failures > 0 and last_finished_at is not None:
+                # Issue #146: a failed maintenance attempt suppresses further
+                # reads until its backoff window (60/120/300s, counted from
+                # the attempt's finish) has elapsed.
+                backoff = _CANDIDATE_MAINTENANCE_BACKOFF_SECONDS[
+                    min(failures - 1, 2)
+                ]
+                if (
+                    Decimal(str((now - last_finished_at).total_seconds()))
+                    < backoff
+                ):
+                    return self.candidate_snapshot()
+            if not lead_due and not source_expired:
                 return self.candidate_snapshot()
             if stop_event is not None and stop_event.is_set():
                 return self.candidate_snapshot()
-            with self._candidate_state_lock:
-                self._candidate_maintenance_attempted_at = now
 
+            # Issue #146: expose how long each source read took so the
+            # operator can see which source drove a refresh.
+            read_seconds: dict[str, float] = {
+                "account": 0.0,
+                "metadata": 0.0,
+                "reward": 0.0,
+                "books": 0.0,
+            }
             account_error: str | None = None
-            if account_expired:
-                account_reader = getattr(self.exchange, "lp_account_snapshot", None)
+            if account_due:
+                account_reader = getattr(
+                    self.exchange, "lp_account_snapshot_shared", None
+                )
+                if not callable(account_reader):
+                    account_reader = getattr(
+                        self.exchange, "lp_account_snapshot", None
+                    )
+                read_started_at = self._now()
                 try:
                     refreshed_account = account_reader() if callable(account_reader) else None
                 except Exception:
                     refreshed_account = None
+                read_seconds["account"] = float(
+                    (self._now() - read_started_at).total_seconds()
+                )
                 if isinstance(refreshed_account, Mapping) and not _candidate_source_expired(
                     refreshed_account.get("checked_at"), self._now()
                 ):
@@ -3862,12 +3947,13 @@ class PolymarketLPService:
 
             metadata_error: str | None = None
             refreshed_market: Mapping[str, object] | None = None
-            if metadata_expired:
+            if metadata_due:
                 metadata_reader = getattr(
                     self.exchange, "lp_market_metadata_fresh", None
                 )
                 if not callable(metadata_reader):
                     metadata_reader = getattr(self.exchange, "lp_market_metadata", None)
+                read_started_at = self._now()
                 try:
                     raw_metadata = (
                         metadata_reader((condition_id,), stop_event=stop_event)
@@ -3907,11 +3993,15 @@ class PolymarketLPService:
                         refreshed_market.get("fees_checked_at"), metadata_checked_now
                     ):
                         metadata_error = "market_fees_unknown"
+                read_seconds["metadata"] = float(
+                    (self._now() - read_started_at).total_seconds()
+                )
 
             reward_error: str | None = None
             refreshed_reward: Mapping[str, object] | None = None
-            if reward_expired:
+            if reward_due:
                 reward_reader = getattr(self.exchange, "lp_reward_catalog", None)
+                read_started_at = self._now()
                 try:
                     raw_reward = (
                         reward_reader(
@@ -3963,10 +4053,14 @@ class PolymarketLPService:
                     reward_checked_at, self._now()
                 ):
                     reward_error = "reward_unknown"
+                read_seconds["reward"] = float(
+                    (self._now() - read_started_at).total_seconds()
+                )
 
             books: Mapping[str, object] = {}
-            if book_expired and token_ids:
+            if book_due and token_ids:
                 books_reader = getattr(self.exchange, "lp_order_books", None)
+                read_started_at = self._now()
                 try:
                     raw_books = (
                         books_reader(token_ids, stop_event=stop_event)
@@ -3982,6 +4076,9 @@ class PolymarketLPService:
                         raw_books = None
                 except Exception:
                     raw_books = None
+                read_seconds["books"] = float(
+                    (self._now() - read_started_at).total_seconds()
+                )
                 if isinstance(raw_books, Mapping):
                     books = raw_books
 
@@ -3998,7 +4095,7 @@ class PolymarketLPService:
                 market = dict(market_value)
                 outcome = str(market.get("outcome") or "").upper()
                 token_id = str(market.get("token_id") or "").strip()
-                if metadata_expired and refreshed_market is not None and metadata_error is None:
+                if metadata_due and refreshed_market is not None and metadata_error is None:
                     market = {
                         **dict(refreshed_market),
                         "condition_id": condition_id,
@@ -4014,14 +4111,14 @@ class PolymarketLPService:
                             "reward_max_spread"
                         )
                 if (
-                    (metadata_expired and refreshed_market is not None and metadata_error is None)
-                    or (reward_expired and refreshed_reward is not None and reward_error is None)
+                    (metadata_due and refreshed_market is not None and metadata_error is None)
+                    or (reward_due and refreshed_reward is not None and reward_error is None)
                 ):
                     reward_source: dict[str, object] = {}
                     # Reuse cached reward rules only while their reward read
                     # remains valid.  Once reward facts expire, a response
                     # that omits the rules cannot renew those old values.
-                    if not reward_expired:
+                    if not reward_due:
                         cached_minimum = market_value.get("_reward_catalog_min_size")
                         cached_spread = _maybe_decimal(
                             market_value.get("_reward_catalog_max_spread")
@@ -4033,7 +4130,7 @@ class PolymarketLPService:
                     if isinstance(refreshed_reward, Mapping):
                         reward_source.update(dict(refreshed_reward))
                     market_for_rules = dict(market)
-                    if not metadata_expired:
+                    if not metadata_due:
                         # Normalized fields can have come from the prior reward
                         # read.  Reuse only rules proven to originate in the
                         # still-fresh metadata source.
@@ -4051,7 +4148,7 @@ class PolymarketLPService:
                     market["reward_min_size"] = reward_minimum
                     market["reward_max_spread"] = reward_spread
                 maintenance_direction["market"] = market
-                if reward_expired and refreshed_reward is not None and reward_error is None:
+                if reward_due and refreshed_reward is not None and reward_error is None:
                     maintenance_direction["reward_active"] = refreshed_reward.get(
                         "reward_active"
                     )
@@ -4069,10 +4166,10 @@ class PolymarketLPService:
                     ] = self._reward_guidance_deadline(refreshed_reward)
                 book = (
                     books.get(token_id)
-                    if book_expired
+                    if book_due
                     else maintenance_direction.get("book")
                 )
-                if book_expired and isinstance(book, Mapping):
+                if book_due and isinstance(book, Mapping):
                     maintenance_direction["book"] = dict(book)
                 source_reason = account_error or metadata_error or reward_error
                 if not isinstance(book, Mapping):
@@ -4190,7 +4287,10 @@ class PolymarketLPService:
             )
             recommendations = [head_result] if selected_direction is not None else []
             evaluation_now = self._now()
-            self._candidate_maintenance_failed = selected_direction is None
+            # Issue #146: the maintenance attempt's backoff bookkeeping is
+            # applied together with its publication, so a publication vetoed
+            # by the generation guard is not counted as a data failure.
+            maintenance_success = selected_direction is not None
             # Issue #143: the published table shows only passers.  The
             # maintained head row refreshes in place (it stays the current
             # recommendation), rows two and up keep their check-time snapshot,
@@ -4208,7 +4308,13 @@ class PolymarketLPService:
                 state=str(previous.get("state") or "ready"),
                 complete=previous.get("complete") is True,
                 checked_at=evaluation_now,
-                scan_started_at=evaluation_now,
+                # Maintenance refreshes facts inside the current scan round;
+                # it must not claim a newer scan start than a concurrently
+                # in-flight full scan, or the persistence arbiter would let
+                # the maintenance snapshot outrank the scan's publication.
+                scan_started_at=(
+                    previous.get("scan_started_at") or evaluation_now
+                ),
                 last_success_at=evaluation_now,
                 candidates=maintained_candidates,
                 recommendations=recommendations,
@@ -4220,9 +4326,17 @@ class PolymarketLPService:
                 event_end_confirmations=previous.get("event_end_confirmations", {}),
                 funnel=previous.get("funnel", {}),
                 selected_market_ids=previous.get("selected_market_ids", ()),
+                maintenance_publish=True,
+                maintenance_success=maintenance_success,
+                expected_generation=generation,
+                maintenance_diagnostics={
+                    "started_at": _iso(now),
+                    "finished_at": _iso(evaluation_now),
+                    "read_seconds": read_seconds,
+                },
             )
         finally:
-            self._candidate_refresh_lock.release()
+            self._candidate_maintenance_lock.release()
 
     def _refresh_competition(
         self, stop_event: threading.Event | None
@@ -4780,6 +4894,10 @@ class PolymarketLPService:
         funnel: Mapping[str, object] | None = None,
         selected_market_ids: Sequence[str] | None = None,
         retention_reason: str = "candidate_refresh_failed",
+        maintenance_publish: bool = False,
+        maintenance_success: bool = False,
+        expected_generation: int | None = None,
+        maintenance_diagnostics: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         attempted: datetime
         try:
@@ -4788,6 +4906,13 @@ class PolymarketLPService:
             attempted = self._now()
         has_new_rows = candidates is not None
         successful = complete and has_new_rows
+        if not has_new_rows and not maintenance_publish:
+            # Issue #146 D9: a scan-failure fallback publish must not roll
+            # the snapshot back to the rows captured before the scan started.
+            # Base it on the newest published snapshot so any head a
+            # concurrent maintenance published mid-scan survives.
+            with self._candidate_state_lock:
+                previous = deepcopy(self._candidate_snapshot)
         try:
             last_successful_check = (
                 _timestamp(
@@ -4882,6 +5007,53 @@ class PolymarketLPService:
             "selected_market_ids": list(selected_market_ids) if selected_market_ids is not None else list(previous.get("selected_market_ids", ())),
             "candidate_retention_reason": "background_candidates_retired",
         }
+        maintenance_failures_now: int | None = None
+        maintenance_finished_at: datetime | None = None
+        publication_baseline = expected_generation
+        if maintenance_publish:
+            # Issue #146: the attempt is "finished" together with its
+            # publication. A publication vetoed by the generation guard never
+            # reaches this point, so a discarded result is not counted as a
+            # data failure.
+            with self._candidate_state_lock:
+                if (
+                    expected_generation is not None
+                    and self._candidate_publication_generation
+                    != expected_generation
+                ):
+                    return self.candidate_snapshot()
+                maintenance_finished_at = self._now()
+                self._candidate_maintenance_last_finished_at = (
+                    maintenance_finished_at
+                )
+                if maintenance_success:
+                    self._candidate_maintenance_failures = 0
+                    self._candidate_publication_generation += 1
+                else:
+                    self._candidate_maintenance_failures += 1
+                maintenance_failures_now = self._candidate_maintenance_failures
+                # The success path just advanced the generation itself; the
+                # final publish check below must compare against that new
+                # baseline, not the one captured before the reads.
+                publication_baseline = self._candidate_publication_generation
+            snapshot["maintenance_consecutive_failures"] = (
+                maintenance_failures_now
+            )
+            if maintenance_diagnostics is not None:
+                snapshot["maintenance_diagnostics"] = deepcopy(
+                    dict(maintenance_diagnostics)
+                )
+            if maintenance_failures_now > 0:
+                assert maintenance_finished_at is not None
+                next_backoff = _CANDIDATE_MAINTENANCE_BACKOFF_SECONDS[
+                    min(maintenance_failures_now - 1, 2)
+                ]
+                snapshot["maintenance_next_attempt_at"] = _iso(
+                    maintenance_finished_at
+                    + timedelta(seconds=float(next_backoff))
+                )
+            else:
+                snapshot["maintenance_next_attempt_at"] = None
         writer = getattr(self.store, "lp_save_screening_snapshot", None)
         if callable(writer):
             try:
@@ -4900,7 +5072,18 @@ class PolymarketLPService:
                     return self.candidate_snapshot()
                 snapshot = deepcopy(dict(saved))
         with self._candidate_state_lock:
+            if (
+                publication_baseline is not None
+                and self._candidate_publication_generation != publication_baseline
+            ):
+                return self.candidate_snapshot()
             self._candidate_snapshot = snapshot
+            if not maintenance_publish and successful:
+                # Issue #146 D5: a successful scan publication resets the
+                # maintenance backoff and advances the publication generation.
+                self._candidate_publication_generation += 1
+                self._candidate_maintenance_failures = 0
+                self._candidate_maintenance_last_finished_at = None
         return self.candidate_snapshot()
 
     def _mutation_allowed(self, action: str = "submit") -> bool:

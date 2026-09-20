@@ -16,7 +16,10 @@ from typing import Callable, Literal
 
 from .notifications import NullNotifier
 from .polymarket_monitor import PolymarketMonitor
-from .polymarket_lp import PolymarketLPService
+from .polymarket_lp import (
+    LP_CANDIDATE_SCAN_MIN_INTERVAL_SECONDS,
+    PolymarketLPService,
+)
 from .polymarket_relation_discovery import (
     LlmRelationValidator,
     discover_threshold_relation_catalog,
@@ -83,6 +86,9 @@ _LP_REWARD_SECONDS = 60.0
 _LP_SHARE_WATCH_SECONDS = 10.0
 _LP_HISTORY_SECONDS = 3600.0
 _LP_BOOK_SAMPLE_SECONDS = 5.0
+# Issue #146 D1: the LP dashboard snapshot refreshes on a fixed background
+# cadence; the page's 5-second polling only reads the published snapshot.
+_LP_DASHBOARD_SNAPSHOT_SECONDS = 10.0
 # One in-flight request may consume the installed SDK's bounded connect/read/
 # write/pool phases (5/10/10/2 seconds); this is a fixed cleanup grace, not a
 # whole multi-request scan deadline.
@@ -456,7 +462,12 @@ class PredictionRuntime:
         self._reward_stop_event = threading.Event()
         self._lp_share_stop_event = threading.Event()
         self._lp_candidate_refresh_requested = threading.Event()
-        self._candidate_thread: threading.Thread | None = None
+        # Issue #146: wakes the maintenance monitor when a scan round
+        # publishes so its wait re-anchors on the fresh snapshot.
+        self._candidate_maintenance_wakeup = threading.Event()
+        self._candidate_scan_thread: threading.Thread | None = None
+        self._candidate_maintenance_thread: threading.Thread | None = None
+        self._lp_dashboard_thread: threading.Thread | None = None
         self._reward_thread: threading.Thread | None = None
         self._lp_share_thread: threading.Thread | None = None
 
@@ -505,7 +516,7 @@ class PredictionRuntime:
     def queue_lp_candidate_refresh(self) -> bool:
         """Wake the owned read-only LP candidate refresh worker."""
 
-        thread = self._candidate_thread
+        thread = self._candidate_scan_thread
         if (
             self._mode != "production"
             or self._state != "RUNNING"
@@ -906,7 +917,9 @@ class PredictionRuntime:
                 self.n_leg_order_queue_driver.start()
             self._start_lp_monitor()
             self._start_history_monitor()
-            self._start_candidate_monitor()
+            self._start_candidate_scan_monitor()
+            self._start_candidate_maintenance_monitor()
+            self._start_lp_dashboard_monitor()
             self._start_reward_monitor()
             self._start_lp_share_watch()
             self._state = "RUNNING"
@@ -1046,19 +1059,20 @@ class PredictionRuntime:
         )
         self._lp_share_thread.start()
 
-    def _start_candidate_monitor(self) -> None:
-        """Refresh LP candidates independently from rewards and observations."""
+    def _start_candidate_scan_monitor(self) -> None:
+        """Run full LP candidate scans on their own thread (issue #146 D6).
 
-        if self.lp is None or self._candidate_thread is not None:
+        A successful round waits out the 300-second scan window; a failed
+        round retries after 60 seconds. A manual page refresh interrupts the
+        wait and forces a new round.
+        """
+
+        if self.lp is None or self._candidate_scan_thread is not None:
             return
         self._reward_stop_event.clear()
         self._lp_candidate_refresh_requested.clear()
 
         def run() -> None:
-            # History refreshes publish summaries independently.  The first
-            # candidate pass may expose the catalog/base funnel while history
-            # is still preparing; it must not block risk and observation work
-            # behind a potentially large hourly refresh.
             force_candidate_refresh = True
             while not self._reward_stop_event.is_set():
                 lp = self.lp
@@ -1067,8 +1081,9 @@ class PredictionRuntime:
                 refresh_candidates = getattr(lp, "refresh_candidates", None)
                 if not callable(refresh_candidates):
                     return
+                scan_result: Mapping[str, object] | None = None
                 try:
-                    refresh_candidates(
+                    scan_result = refresh_candidates(
                         stop_event=self._reward_stop_event,
                         force=force_candidate_refresh,
                     )
@@ -1076,6 +1091,48 @@ class PredictionRuntime:
                     logger.exception("prediction_lp_candidate_refresh_failed")
                 force_candidate_refresh = False
                 if self._reward_stop_event.is_set():
+                    return
+                scan_wait = 60.0
+                if isinstance(scan_result, Mapping) and (
+                    scan_result.get("complete") is True
+                    or scan_result.get("state") == "ready"
+                ):
+                    scan_wait = float(LP_CANDIDATE_SCAN_MIN_INTERVAL_SECONDS)
+                # A finished round re-anchors the maintenance monitor on the
+                # freshly published snapshot.
+                self._candidate_maintenance_wakeup.set()
+                refresh_requested = self._lp_candidate_refresh_requested.wait(
+                    scan_wait
+                )
+                if self._reward_stop_event.is_set():
+                    return
+                if refresh_requested:
+                    self._lp_candidate_refresh_requested.clear()
+                    force_candidate_refresh = True
+
+        self._candidate_scan_thread = threading.Thread(
+            target=run,
+            name="prediction-lp-candidate-scan-monitor",
+            daemon=True,
+        )
+        self._candidate_scan_thread.start()
+
+    def _start_candidate_maintenance_monitor(self) -> None:
+        """Maintain the published recommendation head on its own thread.
+
+        The wait comes from ``candidate_maintenance_wait_seconds`` (the
+        30-second source lead or the failure backoff, clamped to
+        [1.0, 300.0]); a scan publication wakes the loop early.
+        """
+
+        if self.lp is None or self._candidate_maintenance_thread is not None:
+            return
+        self._candidate_maintenance_wakeup.clear()
+
+        def run() -> None:
+            while not self._reward_stop_event.is_set():
+                lp = self.lp
+                if lp is None:
                     return
                 refresh_recommendations = getattr(
                     lp, "refresh_candidate_recommendations", None
@@ -1091,7 +1148,7 @@ class PredictionRuntime:
                         )
                 if self._reward_stop_event.is_set():
                     return
-                wait_seconds = _LP_REWARD_SECONDS
+                wait_seconds = 30.0
                 next_deadline = getattr(
                     lp, "candidate_maintenance_wait_seconds", None
                 )
@@ -1103,23 +1160,49 @@ class PredictionRuntime:
                         logger.exception(
                             "prediction_lp_candidate_deadline_failed"
                         )
-                    if isinstance(candidate_wait, (int, float)) and candidate_wait >= 0:
-                        wait_seconds = min(wait_seconds, float(candidate_wait))
-                refresh_requested = self._lp_candidate_refresh_requested.wait(
-                    wait_seconds
-                )
-                if self._reward_stop_event.is_set():
-                    return
-                if refresh_requested:
-                    self._lp_candidate_refresh_requested.clear()
-                    force_candidate_refresh = True
+                    if isinstance(candidate_wait, (int, float)):
+                        wait_seconds = min(
+                            max(float(candidate_wait), 1.0), 300.0
+                        )
+                if self._candidate_maintenance_wakeup.wait(wait_seconds):
+                    self._candidate_maintenance_wakeup.clear()
 
-        self._candidate_thread = threading.Thread(
+        self._candidate_maintenance_thread = threading.Thread(
             target=run,
-            name="prediction-lp-candidate-monitor",
+            name="prediction-lp-candidate-maintenance-monitor",
             daemon=True,
         )
-        self._candidate_thread.start()
+        self._candidate_maintenance_thread.start()
+
+    def _start_lp_dashboard_monitor(self) -> None:
+        """Publish the LP dashboard snapshot the page endpoint serves."""
+
+        if self.execution is None or self._lp_dashboard_thread is not None:
+            return
+
+        def run() -> None:
+            execution = self.execution
+            if execution is None:
+                return
+            refresh_snapshot = getattr(
+                execution, "refresh_lp_dashboard_snapshot", None
+            )
+            if not callable(refresh_snapshot):
+                return
+            while not self._reward_stop_event.is_set():
+                try:
+                    refresh_snapshot()
+                except Exception:
+                    logger.exception("prediction_lp_dashboard_refresh_failed")
+                if self._reward_stop_event.wait(_LP_DASHBOARD_SNAPSHOT_SECONDS):
+                    return
+
+        self._lp_dashboard_thread = threading.Thread(
+            target=run,
+            name="prediction-lp-dashboard-snapshot-monitor",
+            daemon=True,
+        )
+        self._lp_dashboard_thread.start()
 
     def _start_history_monitor(self) -> None:
         """Refresh the bounded LP price-history cache hourly."""
@@ -1499,6 +1582,7 @@ class PredictionRuntime:
         self._history_wakeup_event.set()
         self._history_initial_done.set()
         self._lp_candidate_refresh_requested.set()
+        self._candidate_maintenance_wakeup.set()
         self._lp_stop_event.set()
         self._book_sample_stop_event.set()
         history_thread = self._history_thread
@@ -1512,16 +1596,26 @@ class PredictionRuntime:
                 # call can join it after the external read returns.
             else:
                 self._history_thread = None
-        candidate_thread = self._candidate_thread
-        if candidate_thread is not None:
-            candidate_thread.join(timeout=_LP_REWARD_STOP_GRACE_SECONDS)
-            if candidate_thread.is_alive():
-                errors.append(RuntimeError("prediction LP candidate monitor thread did not stop"))
-                # Keep the live LP/trading/store collaborators and owner while
-                # the reader may still use them; a later stop can retry cleanup.
-                uncertain_thread = True
-            else:
-                self._candidate_thread = None
+        for attr, label in (
+            ("_candidate_scan_thread", "candidate scan monitor"),
+            ("_candidate_maintenance_thread", "candidate maintenance monitor"),
+            ("_lp_dashboard_thread", "LP dashboard snapshot monitor"),
+        ):
+            thread = getattr(self, attr)
+            if thread is not None:
+                thread.join(timeout=_LP_REWARD_STOP_GRACE_SECONDS)
+                if thread.is_alive():
+                    errors.append(
+                        RuntimeError(
+                            f"prediction LP {label} thread did not stop"
+                        )
+                    )
+                    # Keep the live LP/trading/store collaborators and owner
+                    # while the reader may still use them; a later stop can
+                    # retry cleanup.
+                    uncertain_thread = True
+                else:
+                    setattr(self, attr, None)
         reward_thread = self._reward_thread
         if reward_thread is not None:
             # Cooperative cancellation leaves at most one bounded SDK request
@@ -1618,10 +1712,15 @@ class PredictionRuntime:
                     uncertain_thread = True
                 else:
                     self.monitor = None
-        if candidate_thread is not None:
-            if candidate_thread.is_alive():
+        for attr in (
+            "_candidate_scan_thread",
+            "_candidate_maintenance_thread",
+            "_lp_dashboard_thread",
+        ):
+            thread = getattr(self, attr)
+            if thread is not None and thread.is_alive():
                 return errors
-            self._candidate_thread = None
+            setattr(self, attr, None)
         if reward_thread is not None:
             if reward_thread.is_alive():
                 return errors

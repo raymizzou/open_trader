@@ -5650,6 +5650,51 @@ console.log(JSON.stringify({
     assert rendered["timerCount"] == 1
 
 
+def test_lp_card_renders_snapshot_pending_banner() -> None:
+    """Issue #146: a `state:"snapshot_pending"` payload renders a loading
+    hint instead of empty tables, and the ready payload does not."""
+    output = run_dashboard_js(r'''
+class Element {
+  constructor(){this.dataset={};this.hidden=false;this.innerHTML="";this.textContent="";this.style={};this.attributes={};this.listeners={};
+    this.classList={toggle(){},add(){},remove(){}};}
+  addEventListener(name, callback){(this.listeners[name] ||= []).push(callback);}
+  setAttribute(name,value){this.attributes[name]=value;}
+  removeAttribute(name){delete this.attributes[name];}
+  querySelector(){return null;}
+  querySelectorAll(){return [];}
+}
+const nodes = {};
+document.getElementById = (id) => nodes[id] || (nodes[id] = new Element());
+document.querySelector = () => nodes["workspace-grid"] || (nodes["workspace-grid"] = new Element());
+document.body = new Element();
+bindElements();
+bindEvents();
+const response = (data, ok = true, status = 200) => ({ok, status, json: async () => data});
+const venues = {csrf_token:"csrf-token", n_leg:{status:"running",code:"N_LEG_RUNNING"}, venues:[], monitor_subscription:{}};
+globalThis.fetch = async (url) => {
+  if (url === "/api/prediction-arbitrage/venues") return response(venues);
+  if (url === "/api/prediction-arbitrage/lp/dashboard") return response(venues && pendingPayload);
+  throw new Error("Unexpected request: " + url);
+};
+const pendingPayload = {
+  state:"snapshot_pending", stale:true, orders:[], positions:[], lp_orders_today:[],
+  non_lp_row_count:0, candidates:[], recommendations:[], selected_results:[],
+  preparation:null, funnel:{}, checked_at:null,
+};
+const direct = (value) => predictionLpCard({lp_dashboard:value});
+const pendingHtml = direct(pendingPayload);
+const readyHtml = direct({...pendingPayload, state:"ready", checked_at:"2026-09-20T04:00:00Z"});
+console.log(JSON.stringify({pendingHtml, readyHtml}));
+''')
+    rendered = json.loads(output)
+
+    assert "LP 面板快照准备中" in rendered["pendingHtml"]
+    assert "上次成功数据" not in rendered["pendingHtml"]
+    assert "pm-observation-empty" in rendered["pendingHtml"]
+    assert "LP 面板快照准备中" not in rendered["readyHtml"]
+    assert "上次成功数据" in rendered["readyHtml"]
+
+
 def test_lp_preparation_status_and_explicit_recovery() -> None:
     output = run_dashboard_js(r'''
 class Element {

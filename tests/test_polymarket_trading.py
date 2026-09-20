@@ -4,6 +4,7 @@ import json
 import threading
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_FLOOR, Decimal
@@ -1166,6 +1167,66 @@ def test_lp_trial_selected_facts_preserve_identity_and_time() -> None:
     assert account["open_orders_complete"] is True
     assert account["positions_complete"] is True
     assert account["open_orders"][0]["condition_id"] == "condition-a"
+
+
+def test_lp_account_snapshot_shared_single_flight_and_ttl() -> None:
+    """Issue #146 A7: scan, maintenance, and dashboard snapshot share one
+    account read per TTL window; concurrent callers coalesce into one read."""
+
+    class SharedAccountClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.account_reads = 0
+            self._read_lock = threading.Lock()
+
+        def list_open_orders(self, **kwargs: object) -> list[object]:
+            with self._read_lock:
+                self.account_reads += 1
+            return []
+
+        def list_positions(self, **kwargs: object) -> list[object]:
+            return []
+
+        def list_account_trades(self, **kwargs: object) -> list[object]:
+            return []
+
+    client = SharedAccountClient()
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        client=client,
+        public_client_factory=PublicClient,
+    )
+    monotonic = {"now": 1000.0}
+    original_realtime = polymarket_trading.time
+
+    class FakeTime:
+        @staticmethod
+        def monotonic() -> float:
+            return monotonic["now"]
+
+    polymarket_trading.time = FakeTime  # type: ignore[misc]
+    try:
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            concurrent = list(
+                pool.map(lambda _: adapter.lp_account_snapshot_shared(), range(3))
+            )
+        sequential = [adapter.lp_account_snapshot_shared() for _ in range(3)]
+        assert client.account_reads == 1
+        assert all(row["authenticated"] is True for row in concurrent)
+        assert all(row["authenticated"] is True for row in sequential)
+        assert [row["wallet_address"] for row in sequential] == [WALLET] * 3
+
+        # Past the TTL window the next shared call re-reads exactly once.
+        monotonic["now"] += 11.0
+        refreshed = adapter.lp_account_snapshot_shared()
+        assert client.account_reads == 2
+        assert refreshed["authenticated"] is True
+        # A shorter custom window re-reads again.
+        monotonic["now"] += 5.0
+        adapter.lp_account_snapshot_shared(max_age_seconds=1.0)
+        assert client.account_reads == 3
+    finally:
+        polymarket_trading.time = original_realtime  # type: ignore[misc]
 
 
 def test_lp_reward_snapshot_preserves_identity_assets_and_scope() -> None:

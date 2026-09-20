@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import fields, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
@@ -1584,11 +1585,79 @@ class PredictionExecutionService:
             }
         return projections
 
-    def lp_dashboard(self) -> dict[str, object]:
-        """Read official account orders and holdings without managing them."""
+    def _lp_dashboard_pending_payload(self) -> dict[str, object]:
+        """Issue #146 D2: first-visit payload while the background snapshot
+        thread has not published yet. Key-complete, value-empty."""
 
-        with self._lp_dashboard_lock:
-            reader = getattr(self._trading, "lp_account_snapshot", None)
+        return {
+            "state": "snapshot_pending",
+            "stale": True,
+            "orders": [],
+            "positions": [],
+            "lp_orders_today": [],
+            "non_lp_row_count": 0,
+            "candidates": [],
+            "recommendations": [],
+            "selected_results": [],
+            "preparation": None,
+            "funnel": {},
+            "selected_market_ids": [],
+            "reward_shares": {},
+            "market_rewards": {},
+            "candidate_state": "unknown",
+            "complete": False,
+            "scanning": False,
+            "candidate_stale": True,
+            "candidate_checked_at": None,
+            "candidate_last_success_at": None,
+            "candidate_last_attempt_at": None,
+            "missing_metadata_condition_ids": [],
+            "missing_book_token_ids": [],
+            "catalog_complete": False,
+            "candidate_retention_reason": None,
+            "checked_at": None,
+            "last_success_at": None,
+            "authenticated": False,
+            "open_orders_complete": False,
+            "positions_complete": False,
+            "lp_share_watch_state": self.lp_share_watch_state(),
+            "lp_observations": {},
+            "lp_session": {"state": "none"},
+        }
+
+    def lp_dashboard(self) -> dict[str, object]:
+        """Return the cached background LP snapshot without external reads.
+
+        Issue #146 D1/D2: the 5-second page polling reads only the snapshot
+        the background thread maintains; it never triggers account reads.
+        """
+
+        cached = self._lp_dashboard_cache
+        if cached is not None:
+            return deepcopy(cached)
+        return self._lp_dashboard_pending_payload()
+
+    def refresh_lp_dashboard_snapshot(self) -> dict[str, object]:
+        """Run the LP dashboard read pipeline once into the shared cache.
+
+        Only one refresh runs at a time; a concurrent caller receives the
+        current cache (or the pending payload) instead of starting a second
+        pipeline.
+        """
+
+        if not self._lp_dashboard_lock.acquire(blocking=False):
+            cached = self._lp_dashboard_cache
+            if cached is not None:
+                return deepcopy(cached)
+            return self._lp_dashboard_pending_payload()
+        # The lock is held for the whole pipeline; the body's inner
+        # `with self._lp_dashboard_lock:` blocks re-enter the same RLock.
+        try:
+            # Issue #146: scan, maintenance, and the dashboard snapshot share
+            # one account read through the trading client's TTL cache.
+            reader = getattr(self._trading, "lp_account_snapshot_shared", None)
+            if not callable(reader):
+                reader = getattr(self._trading, "lp_account_snapshot", None)
             try:
                 if not callable(reader):
                     raise RuntimeError("lp_account_reader_unavailable")
@@ -2120,6 +2189,9 @@ class PredictionExecutionService:
                     "lp_session": self.lp_status(),
                 }
 
+        finally:
+            self._lp_dashboard_lock.release()
+
     def refresh_lp_observations(
         self, *, stop_event: threading.Event | None = None
     ) -> dict[str, object]:
@@ -2158,7 +2230,9 @@ class PredictionExecutionService:
 
         if stop_event is not None and stop_event.is_set():
             return {"state": "cancelled", "observations": previous}
-        dashboard = self.lp_dashboard()
+        # Issue #146: observations need fresh account facts, so they drive
+        # the snapshot pipeline directly instead of reading the page cache.
+        dashboard = self.refresh_lp_dashboard_snapshot()
         now = _utc_now()
         if dashboard.get("state") != "ready" or dashboard.get("stale") is True:
             return {

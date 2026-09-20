@@ -3910,6 +3910,10 @@ function predictionLpCard(payload) {
     && String(session.state || "").toLowerCase() !== "none"
     && !session.error;
   const stale = dashboard.stale === true || dashboard.state === "stale";
+  const snapshotPending = String(dashboard.state || "") === "snapshot_pending";
+  const snapshotPendingMarkup = snapshotPending
+    ? "<p class=\"pm-observation-empty\" role=\"status\">LP 面板快照准备中，首次加载约需 10 秒；页面每 5 秒自动刷新。</p>"
+    : "";
   const candidateState = String(dashboard.candidate_state || "").toLowerCase();
   const candidatesStale = dashboard.candidate_stale === true || candidateState === "stale";
   const checkedAt = dashboard.last_success_at || dashboard.checked_at;
@@ -4049,6 +4053,7 @@ function predictionLpCard(payload) {
     + "<button class=\"pm-button\" type=\"button\" data-action=\"lp-dashboard-refresh\""
     + (state.predictionMarket.lpDashboardRequestInFlight || state.predictionMarket.lpPreparationRecoveryInFlight || !state.predictionMarket.csrfToken ? " disabled" : "") + ">立即刷新</button></div></header>"
     + errorMarkup
+    + snapshotPendingMarkup
     + predictionLpPreparation(dashboard.preparation)
     + budgetLineMarkup
     + "<section aria-label=\"当天 LP 委托\"><h3>当天 LP 委托 <span class=\"sub\">· 北京时间 08:00 起 · 按当前小时奖励率降序 · 一标的一行</span></h3><div class=\"pm-table-wrap\"><table class=\"pm-table pm-lp-order-table\">"

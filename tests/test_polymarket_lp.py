@@ -4397,15 +4397,16 @@ def test_batch_refresh_ranks_passers_by_actual_capital_and_maintains_top_one(
     ) == Decimal("294.117647")
     assert snapshot["recommendations"][0]["market_id"] == "market-Z1"
 
-    # Immediately after the scan the 60-second maintenance gate holds.
+    # Immediately after the scan the 30-second lead window is still open
+    # (issue #146): the maintenance call is a pure snapshot read.
     before_maintenance_reads = len(exchange.book_token_reads)
-    current["now"] = now + timedelta(seconds=30)
+    current["now"] = now + timedelta(seconds=29)
     exchange.now = current["now"]
     assert lp.refresh_candidate_recommendations()["recommendations"]
     assert len(exchange.book_token_reads) == before_maintenance_reads
 
-    # Once the round is older than 60 seconds only rank one (Z1) is
-    # maintained; rank two (B1) expiry triggers no reads.
+    # Once the oldest source passes the 30-second lead only rank one (Z1)
+    # is maintained; rank two (B1) expiry triggers no reads.
     current["now"] = now + timedelta(seconds=65)
     exchange.now = current["now"]
     maintained = lp.refresh_candidate_recommendations()
@@ -5025,11 +5026,18 @@ def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:
         exchange.metadata_reads,
     )
 
-    current["now"] = now + timedelta(seconds=60)
+    # Below the 30-second source lead (issue #146) maintenance is a pure
+    # snapshot read: no source has reached the lead boundary or expiry yet.
+    current["now"] = now + timedelta(seconds=29)
     exchange.now = current["now"]
     at_boundary = lp.refresh_candidate_recommendations()
-    assert at_boundary["stale"] is True
+    assert at_boundary["recommendations"]
     assert len(exchange.book_token_reads) == 1
+    assert (
+        exchange.account_reads,
+        exchange.reward_reads,
+        exchange.metadata_reads,
+    ) == initial_reader_counts
 
     current["now"] = now + timedelta(seconds=60, microseconds=1)
     exchange.now = current["now"]
@@ -5062,18 +5070,20 @@ def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:
         len(exchange.book_token_reads),
     ) == first_maintenance_counts
 
-    # A failed refresh removes the recommendation for this normal scan
-    # round.  A later maintenance tick must not retry the external readers.
+    # A failed refresh suppresses retries for its 60-second backoff window
+    # (issue #146). Once the window elapses the retry runs and fails again
+    # while the account stays insufficient.
     current["now"] = now + timedelta(seconds=120, microseconds=2)
     exchange.now = current["now"]
     no_retry = lp.refresh_candidate_recommendations()
     assert no_retry["recommendations"] == []
+    assert no_retry["maintenance_consecutive_failures"] == 2
     assert (
         exchange.account_reads,
         exchange.reward_reads,
         exchange.metadata_reads,
         len(exchange.book_token_reads),
-    ) == first_maintenance_counts
+    ) == tuple(value + 1 for value in first_maintenance_counts)
 
     # A new normal scan starts a new round and can restore the candidate.
     exchange.account_mode = "valid"
@@ -5081,7 +5091,7 @@ def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:
     assert lp.refresh_price_history()["state"] == "known"
     recovered_round = lp.refresh_candidates(force=True)
     assert recovered_round["recommendations"][0]["selected_direction"]["outcome"] == "NO"
-    assert len(exchange.book_token_reads) == 3
+    assert len(exchange.book_token_reads) == 4
 
     # With the whole fact bundle expired, all selected readers run once and
     # the actual returned timestamps permit the reversed direction.
@@ -5091,7 +5101,7 @@ def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:
     refreshed = lp.refresh_candidate_recommendations()
     assert refreshed["recommendations"][0]["selected_direction"]["outcome"] == "YES"
     assert refreshed["recommendations"][0]["realtime_checked_at"] == current["now"].isoformat().replace("+00:00", "Z")
-    assert len(exchange.book_token_reads) == 4
+    assert len(exchange.book_token_reads) == 5
     successful_refresh_counts = (
         exchange.account_reads,
         exchange.reward_reads,
@@ -5113,7 +5123,7 @@ def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:
     exchange.phase = "initial"
     assert lp.refresh_price_history()["state"] == "known"
     assert lp.refresh_candidates(force=True)["recommendations"][0]["selected_direction"]["outcome"] == "NO"
-    assert len(exchange.book_token_reads) == 5
+    assert len(exchange.book_token_reads) == 6
 
     current["now"] = now + timedelta(seconds=300, microseconds=3)
     exchange.now = current["now"]
@@ -5125,7 +5135,7 @@ def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:
     assert "reward" in " ".join(
         failed_reward["selected_results"][0]["directions"]["YES"]["reason_codes"]
     )
-    assert len(exchange.book_token_reads) == 6
+    assert len(exchange.book_token_reads) == 7
     failed_reward_counts = (
         exchange.account_reads,
         exchange.reward_reads,
@@ -5134,13 +5144,14 @@ def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:
     )
     current["now"] = now + timedelta(seconds=360, microseconds=3)
     exchange.now = current["now"]
+    # The 60-second backoff has elapsed, so the retry runs and fails again.
     assert lp.refresh_candidate_recommendations()["recommendations"] == []
     assert (
         exchange.account_reads,
         exchange.reward_reads,
         exchange.metadata_reads,
         len(exchange.book_token_reads),
-    ) == failed_reward_counts
+    ) == tuple(value + 1 for value in failed_reward_counts)
 
     current["now"] = now + timedelta(seconds=360, microseconds=3)
     exchange.now = current["now"]
@@ -5148,7 +5159,7 @@ def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:
     exchange.phase = "initial"
     assert lp.refresh_price_history()["state"] == "known"
     assert lp.refresh_candidates(force=True)["recommendations"][0]["selected_direction"]["outcome"] == "NO"
-    assert len(exchange.book_token_reads) == 7
+    assert len(exchange.book_token_reads) == 9
 
     current["now"] = now + timedelta(seconds=420, microseconds=4)
     exchange.now = current["now"]
@@ -5160,7 +5171,7 @@ def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:
     assert "market" in " ".join(
         failed_metadata["selected_results"][0]["directions"]["YES"]["reason_codes"]
     )
-    assert len(exchange.book_token_reads) == 8
+    assert len(exchange.book_token_reads) == 10
     failed_metadata_counts = (
         exchange.account_reads,
         exchange.reward_reads,
@@ -5169,13 +5180,14 @@ def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:
     )
     current["now"] = now + timedelta(seconds=480, microseconds=4)
     exchange.now = current["now"]
+    # The 60-second backoff has elapsed, so the retry runs and fails again.
     assert lp.refresh_candidate_recommendations()["recommendations"] == []
     assert (
         exchange.account_reads,
         exchange.reward_reads,
         exchange.metadata_reads,
         len(exchange.book_token_reads),
-    ) == failed_metadata_counts
+    ) == tuple(value + 1 for value in failed_metadata_counts)
 
     current["now"] = now + timedelta(seconds=480, microseconds=4)
     exchange.now = current["now"]
@@ -5183,7 +5195,7 @@ def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:
     exchange.phase = "initial"
     assert lp.refresh_price_history()["state"] == "known"
     assert lp.refresh_candidates(force=True)["recommendations"][0]["selected_direction"]["outcome"] == "NO"
-    assert len(exchange.book_token_reads) == 9
+    assert len(exchange.book_token_reads) == 12
 
     current["now"] = now + timedelta(seconds=540, microseconds=5)
     exchange.now = current["now"]
@@ -5194,7 +5206,7 @@ def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:
     assert failed_books["selected_results"][0]["directions"]["YES"][
         "reason_codes"
     ] == ["book_unknown"]
-    assert len(exchange.book_token_reads) == 10
+    assert len(exchange.book_token_reads) == 13
     failed_books_counts = (
         exchange.account_reads,
         exchange.reward_reads,
@@ -5203,13 +5215,14 @@ def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:
     )
     current["now"] = now + timedelta(seconds=600, microseconds=5)
     exchange.now = current["now"]
+    # The 60-second backoff has elapsed, so the retry runs and fails again.
     assert lp.refresh_candidate_recommendations()["recommendations"] == []
     assert (
         exchange.account_reads,
         exchange.reward_reads,
         exchange.metadata_reads,
         len(exchange.book_token_reads),
-    ) == failed_books_counts
+    ) == tuple(value + 1 for value in failed_books_counts)
 
     current["now"] = now + timedelta(seconds=600, microseconds=6)
     exchange.now = current["now"]
@@ -5217,7 +5230,7 @@ def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:
     assert lp.refresh_price_history()["state"] == "known"
     recovered = lp.refresh_candidates(force=True)
     assert recovered["recommendations"][0]["selected_direction"]["outcome"] == "NO"
-    assert len(exchange.book_token_reads) == 11
+    assert len(exchange.book_token_reads) == 15
 
     # A source receipt 59s old at publication expires two seconds later even
     # though the publication itself is only two seconds old.  Maintenance
@@ -5346,11 +5359,14 @@ def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:
     assert Decimal(str(reward_only_selected["quantity"])) == Decimal("40")
     assert Decimal(str(reward_only_selected["required_capital"])) == Decimal("18.00")
     assert reward_only_exchange.reward_reads == 2
+    # Issue #146 30-second lead: every source past the lead age is refreshed
+    # in the same maintenance pass, so the non-reward readers each run once
+    # more alongside the expired reward read.
     assert (
         reward_only_exchange.account_reads,
         reward_only_exchange.metadata_reads,
         len(reward_only_exchange.book_token_reads),
-    ) == reward_only_counts
+    ) == tuple(value + 1 for value in reward_only_counts)
 
     # When only metadata and books expire, the cached reward spread remains a
     # raw percentage.  A fresh metadata read must normalize it once, so a
