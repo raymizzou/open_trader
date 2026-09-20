@@ -12,7 +12,10 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from open_trader.polymarket_lp import PolymarketLPService
-from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+from open_trader.prediction_arbitrage_store import (
+    LP_RESERVED_MANUAL_SESSION_ID,
+    PredictionArbitrageStore,
+)
 from open_trader.prediction_n_leg import fingerprint
 from open_trader.prediction_n_leg_execution import (
     PartialFillProofRecord,
@@ -3419,3 +3422,31 @@ def test_lp_metadata_cache_store_round_trip_and_prune(tmp_path: Path) -> None:
             ).fetchall()
         }
     assert remaining == {"condition-1", "condition-missing"}
+
+
+def test_lp_latest_session_excludes_reserved_manual_anchor(tmp_path: Path) -> None:
+    """R1: 保留锚点会话永不作为「最新会话」返回。"""
+
+    with_anchor = store(tmp_path / "anchor-real")
+    real_session = with_anchor.lp_create_session(
+        "real-1", "real-key-1", state="complete", payload={"context": "real"}
+    )
+    with_anchor.lp_create_session(
+        LP_RESERVED_MANUAL_SESSION_ID,
+        "manual-anchor",
+        state="complete",
+        payload={"context": "manual_cancel_audit"},
+    )
+    assert with_anchor.lp_latest_session() == real_session
+    latest = with_anchor.lp_latest_session()
+    assert latest is not None
+    assert latest["session_id"] == "real-1"
+
+    anchor_only = store(tmp_path / "anchor-only")
+    anchor_only.lp_create_session(
+        LP_RESERVED_MANUAL_SESSION_ID,
+        "manual-anchor",
+        state="complete",
+        payload={"context": "manual_cancel_audit"},
+    )
+    assert anchor_only.lp_latest_session() is None

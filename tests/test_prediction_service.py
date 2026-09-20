@@ -13474,3 +13474,106 @@ def test_lp_observations_attach_both_side_book_shares(tmp_path: Path) -> None:
         "side_total_quantity": None,
         "book_share_pct": None,
     }
+
+
+class _LpCancelExecution(_ProductionExecution):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancel_calls: list[dict[str, object]] = []
+        self.cancel_result: dict[str, object] = {
+            "requested": 1,
+            "canceled": ["o1"],
+            "not_canceled": {},
+            "skipped": [],
+        }
+
+    def lp_cancel_orders(
+        self, payload: Mapping[str, object]
+    ) -> dict[str, object]:
+        self.cancel_calls.append(dict(payload))
+        return self.cancel_result
+
+
+def _lp_cancel_runtime() -> tuple[_ProductionRuntime, _LpCancelExecution]:
+    runtime = _ProductionRuntime()
+    execution = _LpCancelExecution()
+    runtime.execution = execution  # type: ignore[assignment]
+    return runtime, execution
+
+
+LP_CANCEL_PATH = "/api/prediction-arbitrage/lp/orders/cancel"
+
+
+def test_lp_manual_cancel_endpoint_dispatches_each_selector() -> None:
+    """A1: order_ids/condition_id/scope 三种合法请求各自分发,
+    fake execution 的返回原样作为 200 响应体,调用参数逐字记录。"""
+
+    runtime, execution = _lp_cancel_runtime()
+    bodies = (
+        {"order_ids": ["o1"], "confirm": True},
+        {"condition_id": "0xc1", "confirm": True},
+        {"scope": "all", "confirm": True},
+    )
+    with _production_server(runtime) as (base, _runtime):
+        results = [
+            _response(
+                _production_request(
+                    base, LP_CANCEL_PATH, data=json.dumps(body).encode()
+                )
+            )
+            for body in bodies
+        ]
+
+    assert results == [(200, execution.cancel_result) for _body in bodies]
+    assert execution.cancel_calls == [dict(body) for body in bodies]
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        {"order_ids": ["o1"], "condition_id": "0xc1", "confirm": True},
+        {"scope": "all", "order_ids": ["o1"], "confirm": True},
+        {"confirm": True},
+        {"order_ids": ["o1"]},
+        {"order_ids": ["o1"], "confirm": False},
+        {"order_ids": [], "confirm": True},
+        {"order_ids": ["o1"], "confirm": True, "unexpected": "key"},
+    ),
+)
+def test_lp_manual_cancel_endpoint_rejects_invalid_requests(
+    body: dict[str, object],
+) -> None:
+    """A2: 选择器互斥/必填、confirm 必须为 true、order_ids 非空、
+    未知键——全部 400 且不分发。"""
+
+    runtime, execution = _lp_cancel_runtime()
+    with _production_server(runtime) as (base, _runtime):
+        status, payload = _response(
+            _production_request(
+                base, LP_CANCEL_PATH, data=json.dumps(body).encode()
+            )
+        )
+
+    assert status == 400
+    assert payload["status"] == "error"
+    assert execution.cancel_calls == []
+
+
+def test_lp_manual_cancel_endpoint_is_read_only_in_shadow_mode() -> None:
+    """A3: shadow 模式 → 403 只读拒绝,镜像既有 shadow mutation 用例语义。"""
+
+    with _server(_Runtime()) as base:
+        status, payload = _response(
+            Request(
+                base + LP_CANCEL_PATH,
+                data=json.dumps({"order_ids": ["o1"], "confirm": True}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+        )
+
+    assert status == 403
+    assert payload == {
+        "code": "shadow_read_only",
+        "message": "Shadow Prediction Service is read-only",
+    }

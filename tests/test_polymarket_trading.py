@@ -3168,6 +3168,42 @@ def test_cancel_and_merge_use_official_methods_once() -> None:
     assert merged["transaction_id"] == "merge-transaction"
 
 
+def test_cancel_orders_detailed_returns_canceled_and_not_canceled() -> None:
+    class DetailedCancelClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, ...]] = []
+
+        def cancel_orders(self, **kwargs: object) -> object:
+            order_ids = tuple(kwargs["order_ids"])  # type: ignore[arg-type]
+            self.calls.append(order_ids)
+            return {"canceled": ["a", "b"], "not_canceled": {"c": "not found"}}
+
+    client = DetailedCancelClient()
+    adapter = PolymarketTradingClient(TradingConfig(SIGNER, WALLET), client=client)
+
+    result = adapter.cancel_orders_detailed(("a", "b", "c"))
+
+    assert result["canceled"] == ("a", "b")
+    assert result["not_canceled"] == {"c": "not found"}
+    assert client.calls == [("a", "b", "c")]
+
+
+def test_cancel_orders_detailed_maps_errors_to_safe_code() -> None:
+    class FailingCancelClient:
+        def cancel_orders(self, **kwargs: object) -> object:
+            raise ValueError("raw cancel failure sentinel")
+
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET), client=FailingCancelClient()
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        adapter.cancel_orders_detailed(("a",))
+
+    assert isinstance(exc_info.value, polymarket_trading.PolymarketTradingError)
+    assert getattr(exc_info.value, "error_code", None) == "invalid"
+
+
 def test_merge_without_transaction_reference_is_not_confirmed() -> None:
     adapter, fake = make_adapter()
     fake.merge_wait_value = SimpleNamespace(transaction_hash="", transaction_id="merge-transaction")

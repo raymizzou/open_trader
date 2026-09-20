@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import inspect
 import importlib.metadata
+import logging
 import re
 import sqlite3
 import threading
@@ -61,10 +62,15 @@ from .predict_cross_venue import (
     validate_cross_execution_mode,
 )
 from .predict_trading import PREDICT_BASE_UNITS
-from .prediction_arbitrage_store import PredictionArbitrageStore
+from .prediction_arbitrage_store import (
+    LP_RESERVED_MANUAL_SESSION_ID,
+    PredictionArbitrageStore,
+)
 from .prediction_title_translation import cached_prediction_title_zh
 from .validation_eat_policy import should_eat as _validation_should_eat
 
+
+logger = logging.getLogger(__name__)
 
 PREVIEW_TTL = timedelta(seconds=10)
 LP_REWARD_PERCENTAGE_CACHE_SECONDS = 10.0
@@ -155,6 +161,49 @@ def _decimal(value: object) -> Decimal | None:
     except (InvalidOperation, ValueError):
         return None
     return result if result.is_finite() else None
+
+
+_LP_CANCEL_SAFE_CODES = {
+    "lp_account_reader_unavailable",
+    "lp_account_snapshot_unknown",
+    "lp_dashboard_snapshot_pending",
+}
+
+
+def _safe_lp_cancel_reason(exc: BaseException) -> str:
+    """A short, operator-safe reason for a failed LP cancel request."""
+
+    code = getattr(exc, "error_code", None)
+    if isinstance(code, str) and code:
+        return code
+    message = str(exc).strip()
+    if message in _LP_CANCEL_SAFE_CODES:
+        return message
+    return type(exc).__name__
+
+
+def _lp_cancel_failure_message(
+    canceled: list[str],
+    not_canceled: dict[str, str],
+    skipped: list[dict[str, str]],
+    exc: BaseException | None,
+    titles: Mapping[str, str],
+) -> str:
+    """Short Feishu body: per-order order_id + reason, market title when the
+    dashboard snapshot row provides one; skipped orders stay out of notices."""
+
+    del skipped
+    lines: list[str] = []
+    for order_id, reason in not_canceled.items():
+        title = str(titles.get(order_id) or "").strip()
+        label = f"{order_id}（{title}）" if title else order_id
+        lines.append(f"{label} 未撤:{reason}")
+    if exc is not None:
+        lines.append("撤单请求失败：" + _safe_lp_cancel_reason(exc))
+    if not lines:
+        lines.append("撤单未完成")
+    prefix = f"已撤 {len(canceled)} 笔；" if canceled else ""
+    return prefix + "；".join(lines)
 
 
 def _canonical_decimal(value: Decimal) -> Decimal:
@@ -725,6 +774,10 @@ class PredictionExecutionService:
         self._predict_snapshot_lock = threading.RLock()
         self._predict_snapshot_cache: dict[str, object] | None = None
         self._last_zero_landing_summary: dict[str, object] | None = None
+        # Manual-cancel audit rows live under the reserved
+        # LP_RESERVED_MANUAL_SESSION_ID session; the anchor row is created
+        # once, lazily, before the first audit write.
+        self._lp_manual_audit_ready = False
 
     def lp_preview(self, request: Mapping[str, object]) -> dict[str, object]:
         """Run the LP read-only preflight through the production collaborator."""
@@ -1636,6 +1689,271 @@ class PredictionExecutionService:
         if cached is not None:
             return deepcopy(cached)
         return self._lp_dashboard_pending_payload()
+
+    def lp_cancel_orders(self, request: Mapping[str, object]) -> dict[str, object]:
+        """Cancel operator-selected LP orders from the dashboard.
+
+        Targets resolve against a fresh account read; session-managed orders
+        cancel like any other (no session guard).  Every requested order is
+        reported as canceled, not_canceled, or skipped; the success path
+        refreshes the dashboard snapshot once and any cancellation failure
+        or request-level error notifies Feishu.
+        """
+
+        if request.get("confirm") is not True:
+            raise ValueError("confirm must be true")
+        order_ids_selector = request.get("order_ids")
+        condition_selector = request.get("condition_id")
+        scope_selector = request.get("scope")
+        selector_names = [
+            name
+            for name, value in (
+                ("order_ids", order_ids_selector),
+                ("condition_id", condition_selector),
+                ("scope", scope_selector),
+            )
+            if value is not None
+        ]
+        if len(selector_names) != 1:
+            raise ValueError(
+                "exactly one of order_ids, condition_id, scope is required"
+            )
+        requested_ids: list[str] = []
+        if order_ids_selector is not None:
+            if not isinstance(order_ids_selector, (list, tuple)) or not all(
+                isinstance(item, str) and item.strip()
+                for item in order_ids_selector
+            ):
+                raise ValueError("order_ids must be a non-empty list of strings")
+            requested_ids = list(order_ids_selector)
+        if condition_selector is not None and not str(condition_selector).strip():
+            raise ValueError("condition_id must be a non-empty string")
+        if scope_selector is not None and scope_selector != "all":
+            raise ValueError("scope must be \"all\"")
+        selector_payload: dict[str, object] = {
+            name: request.get(name) for name in selector_names
+        }
+        manual_session_ready = self._lp_manual_audit_ready
+
+        def audit(
+            state: str,
+            canceled: list[str],
+            not_canceled: dict[str, str],
+            skipped: list[dict[str, str]],
+            error: str | None = None,
+        ) -> None:
+            payload: dict[str, object] = {
+                "selector": selector_payload,
+                "canceled": canceled,
+                "not_canceled": not_canceled,
+                "skipped": skipped,
+                "context": "dashboard_manual_cancel",
+            }
+            if error is not None:
+                payload["error"] = error
+            # lp_actions rows reference lp_sessions; the reserved
+            # LP_RESERVED_MANUAL_SESSION_ID anchor session is created once
+            # so the FK holds.  Audit is best-effort: any failure (anchor
+            # creation refused, e.g. an active n-leg batch owns the insert
+            # gate, or a locked store) is logged and swallowed so the
+            # cancel result, dashboard refresh, notifications and the
+            # original error path are never affected by the audit write.
+            nonlocal manual_session_ready
+            try:
+                if not manual_session_ready:
+                    self._store.lp_create_session(
+                        LP_RESERVED_MANUAL_SESSION_ID,
+                        LP_RESERVED_MANUAL_SESSION_ID,
+                        state="complete",
+                        payload={"context": "manual_cancel_audit"},
+                    )
+                    manual_session_ready = True
+                    self._lp_manual_audit_ready = True
+                self._store.lp_upsert_action(
+                    LP_RESERVED_MANUAL_SESSION_ID,
+                    "lp-manual-cancel:" + str(uuid.uuid4()),
+                    state=state,
+                    payload=payload,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "lp cancel audit write skipped (%s): selector=%s "
+                    "canceled=%s not_canceled=%s skipped=%s",
+                    type(exc).__name__,
+                    selector_payload,
+                    canceled,
+                    not_canceled,
+                    skipped,
+                )
+
+        # Fresh account read, mirroring refresh_lp_dashboard_snapshot's
+        # reader resolution and validation.
+        reader = getattr(self._trading, "lp_account_snapshot_shared", None)
+        if not callable(reader):
+            reader = getattr(self._trading, "lp_account_snapshot", None)
+        try:
+            if not callable(reader):
+                raise RuntimeError("lp_account_reader_unavailable")
+            snapshot = _call(reader)
+            if (
+                not isinstance(snapshot, Mapping)
+                or snapshot.get("authenticated") is not True
+                or not isinstance(snapshot.get("open_orders"), (list, tuple))
+            ):
+                raise RuntimeError("lp_account_snapshot_unknown")
+        except Exception as exc:
+            audit("failed", [], {}, [], error=type(exc).__name__)
+            self._deliver_feishu_notification(
+                "LP 撤单失败",
+                "账户读取失败，未撤任何单：" + _safe_lp_cancel_reason(exc),
+            )
+            raise
+
+        # Open-order projection mirrors refresh_lp_dashboard_snapshot's
+        # field aliases so both readers see the same identifiers.
+        open_by_id: dict[str, dict[str, object]] = {}
+        open_in_condition: dict[str, list[dict[str, object]]] = {}
+        for raw_order in snapshot["open_orders"]:
+            if not isinstance(raw_order, Mapping):
+                continue
+            order_id = str(raw_order.get("order_id", raw_order.get("id", "")) or "")
+            filled = _decimal(
+                raw_order.get("size_matched", raw_order.get("filled_quantity"))
+            )
+            remaining = _decimal(
+                raw_order.get("remaining_size", raw_order.get("remaining_quantity"))
+            )
+            quantity = _decimal(
+                raw_order.get("original_size", raw_order.get("quantity"))
+            )
+            if quantity is None and filled is not None and remaining is not None:
+                quantity = filled + remaining
+            if remaining is None and quantity is not None and filled is not None:
+                remaining = max(Decimal("0"), quantity - filled)
+            if not order_id:
+                continue
+            projected: dict[str, object] = {
+                "order_id": order_id,
+                "condition_id": str(
+                    raw_order.get("condition_id", raw_order.get("market", "")) or ""
+                ),
+                "remaining": remaining,
+            }
+            open_by_id[order_id] = projected
+            open_in_condition.setdefault(projected["condition_id"], []).append(
+                projected
+            )
+
+        canceled: list[str] = []
+        not_canceled: dict[str, str] = {}
+        skipped: list[dict[str, str]] = []
+        targets: list[str] = []
+        requested = 0
+
+        def consider(
+            order_id: str, projected: dict[str, object] | None
+        ) -> None:
+            nonlocal requested
+            requested += 1
+            if projected is None:
+                skipped.append(
+                    {"order_id": order_id, "reason": "unknown_order"}
+                )
+                return
+            remaining = projected.get("remaining")
+            if not isinstance(remaining, Decimal) or remaining <= 0:
+                skipped.append(
+                    {"order_id": order_id, "reason": "not_active"}
+                )
+                return
+            targets.append(order_id)
+
+        try:
+            if requested_ids:
+                for order_id in requested_ids:
+                    consider(order_id, open_by_id.get(order_id))
+            elif condition_selector is not None:
+                condition_id = str(condition_selector)
+                for projected in open_in_condition.get(condition_id, []):
+                    consider(str(projected["order_id"]), projected)
+            else:
+                cache = self._lp_dashboard_cache
+                if cache is None:
+                    raise RuntimeError("lp_dashboard_snapshot_pending")
+                rows = cache.get("lp_orders_today")
+                rows = rows if isinstance(rows, (list, tuple)) else []
+                for row in rows:
+                    if not isinstance(row, Mapping):
+                        continue
+                    row_order_id = str(
+                        row.get("order_id", row.get("id", "")) or ""
+                    )
+                    if not row_order_id:
+                        continue
+                    consider(row_order_id, open_by_id.get(row_order_id))
+
+            if targets:
+                detailed = self._trading.cancel_orders_detailed(tuple(targets))
+                raw_canceled = detailed.get("canceled", ())
+                if isinstance(raw_canceled, (list, tuple)):
+                    canceled.extend(str(item) for item in raw_canceled)
+                raw_not_canceled = detailed.get("not_canceled", {})
+                if isinstance(raw_not_canceled, Mapping):
+                    for key, value in raw_not_canceled.items():
+                        not_canceled[str(key)] = str(value)
+        except Exception as exc:
+            audit("failed", canceled, not_canceled, skipped, error=type(exc).__name__)
+            self._deliver_feishu_notification(
+                "LP 撤单失败",
+                _lp_cancel_failure_message(
+                    canceled, not_canceled, skipped, exc,
+                    self._lp_cancel_order_titles(),
+                ),
+            )
+            raise
+
+        result = {
+            "requested": requested,
+            "canceled": canceled,
+            "not_canceled": not_canceled,
+            "skipped": skipped,
+        }
+        audit(
+            "failed" if not_canceled else "completed",
+            canceled,
+            not_canceled,
+            skipped,
+        )
+        self.refresh_lp_dashboard_snapshot()
+        if not_canceled:
+            self._deliver_feishu_notification(
+                "LP 撤单失败",
+                _lp_cancel_failure_message(
+                    canceled, not_canceled, skipped, None,
+                    self._lp_cancel_order_titles(),
+                ),
+            )
+        return result
+
+    def _lp_cancel_order_titles(self) -> dict[str, str]:
+        """order_id → market title from the cached dashboard snapshot rows,
+        used to label Feishu failure lines; missing titles are omitted."""
+
+        cache = self._lp_dashboard_cache
+        if not isinstance(cache, Mapping):
+            return {}
+        rows = cache.get("lp_orders_today")
+        if not isinstance(rows, (list, tuple)):
+            return {}
+        titles: dict[str, str] = {}
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            order_id = str(row.get("order_id", row.get("id", "")) or "")
+            title = str(row.get("market_title") or "").strip()
+            if order_id and title:
+                titles[order_id] = title
+        return titles
 
     def refresh_lp_dashboard_snapshot(self) -> dict[str, object]:
         """Run the LP dashboard read pipeline once into the shared cache.

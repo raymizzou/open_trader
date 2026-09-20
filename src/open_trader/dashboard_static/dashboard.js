@@ -62,6 +62,7 @@ const state = {
     strategy: "yes_no",
     historyKind: "signals",
     error: "",
+    lpCancelSummary: "",
     pollId: null,
     stateRequestInFlight: false,
     lpDashboardRequestInFlight: false,
@@ -3527,12 +3528,17 @@ function lpDashboardTodayMarketOrder(groups, observations) {
   });
 }
 
-function lpDashboardCancelButton(kind) {
+function lpDashboardCancelButton(kind, target) {
   const cancelAll = kind === "all";
+  const source = target && typeof target === "object" ? target : {};
+  const targetAttribute = cancelAll
+    ? "data-action=\"lp-cancel-market\" data-condition-id=\""
+      + escapeHtml(String(source.conditionId || "")) + "\""
+    : "data-action=\"lp-cancel-order\" data-order-id=\""
+      + escapeHtml(String(source.orderId || "")) + "\"";
   return "<button class=\"pm-button lp-cancel" + (cancelAll ? "-all" : "")
-    + "\" type=\"button\" disabled title=\""
-    + (cancelAll ? "整体撤单(预留位,本期无功能)" : "单独撤单(预留位,本期无功能)")
-    + "\">" + (cancelAll ? "撤全部" : "撤单") + "</button>";
+    + "\" type=\"button\" " + targetAttribute + " title=\"撤单即时生效\">"
+    + (cancelAll ? "撤全部" : "撤单") + "</button>";
 }
 
 function lpDashboardTodayOrderQuantity(row) {
@@ -3608,9 +3614,9 @@ function lpDashboardTodayQuantityCell(orders) {
   const fillLine = "已成交 " + formatDisplayNumber(String(filledSum))
     + " · 剩余 " + formatDisplayNumber(String(remainingSum));
   const headlineRight = cancellable.length >= 2
-    ? lpDashboardCancelButton("all")
+    ? lpDashboardCancelButton("all", {conditionId: orders[0]?.condition_id})
     : orders.length === 1 && cancellable.length === 1
-      ? lpDashboardCancelButton("one")
+      ? lpDashboardCancelButton("one", {orderId: orders[0]?.order_id})
       : "";
   let markup = "<div class=\"lp-line\"><div>" + escapeHtml(headline)
     + "<span class=\"sub\">" + escapeHtml(fillLine) + "</span></div>"
@@ -3631,7 +3637,9 @@ function lpDashboardTodayQuantityCell(orders) {
         const filled = Number(row.filled_quantity);
         if (Number.isFinite(filled) && filled > 0) parts.push("已成交 " + formatDisplayNumber(String(filled)));
       }
-      const right = lpDashboardTodayHasActiveOrder(row) ? lpDashboardCancelButton("one") : "";
+      const right = lpDashboardTodayHasActiveOrder(row)
+        ? lpDashboardCancelButton("one", {orderId: row.order_id})
+        : "";
       return "<div class=\"lp-line\"><div>" + parts.map((part) => escapeHtml(part)).join(" · ")
         + "</div>" + right + "</div>";
     }).join("");
@@ -4067,12 +4075,19 @@ function predictionLpCard(payload) {
   const errorMarkup = error
     ? "<p class=\"pm-signal-error\">系统会话状态暂不可用；不会用缺失数据代替零。</p>"
     : "";
+  const cancelSummary = String(state.predictionMarket.lpCancelSummary || "").trim();
+  const cancelSummaryMarkup = cancelSummary
+    ? `<p class="sub" role="status">${escapeHtml(cancelSummary)}</p>`
+    : "";
   return "<section class=\"pm-panel pm-lp-card\" aria-label=\"LP 会话\"><header class=\"pm-panel-heading\">"
     + "<div><h2>流动性提供试验</h2><p>手工挂单 · 收益与风险观察</p></div>"
     + "<div class=\"pm-panel-heading-actions\">" + freshness
     + "<button class=\"pm-button\" type=\"button\" data-action=\"lp-dashboard-refresh\""
-    + (state.predictionMarket.lpDashboardRequestInFlight || state.predictionMarket.lpPreparationRecoveryInFlight || !state.predictionMarket.csrfToken ? " disabled" : "") + ">立即刷新</button></div></header>"
+    + (state.predictionMarket.lpDashboardRequestInFlight || state.predictionMarket.lpPreparationRecoveryInFlight || !state.predictionMarket.csrfToken ? " disabled" : "") + ">立即刷新</button>"
+    + "<button class=\"pm-button danger\" type=\"button\" data-action=\"lp-cancel-all\""
+    + (state.predictionMarket.lpDashboardRequestInFlight || state.predictionMarket.lpPreparationRecoveryInFlight || !state.predictionMarket.csrfToken ? " disabled" : "") + ">撤全部</button></div></header>"
     + errorMarkup
+    + cancelSummaryMarkup
     + snapshotPendingMarkup
     + predictionLpPreparation(dashboard.preparation)
     + budgetLineMarkup
@@ -4080,7 +4095,7 @@ function predictionLpCard(payload) {
     + "<thead><tr><th scope=\"col\">标的</th><th scope=\"col\">LP 收益率(推荐 → 实际)</th><th scope=\"col\">份额占比</th><th scope=\"col\">压力损失(警戒线 10%)</th><th scope=\"col\">委托与成交量</th></tr></thead>"
     + "<tbody>" + todayRowsHtml + "</tbody></table></div>"
     + nonLpFootnote
-    + "<p class=\"sub\">预计 LP 毛奖励；压力损失不含奖励抵扣；10% 是风险警告线；「试挂/正式」由委托数量对比最小计分数量自动标注（买=最小计分数量→试挂；更大→正式；卖出单不标注）。份额预警已全量开启（奖励份额连续 >8% 一分钟语音告警，夜间静音）；撤单按钮为预留位，本期未启用。</p></section>"
+    + "<p class=\"sub\">预计 LP 毛奖励；压力损失不含奖励抵扣；10% 是风险警告线；「试挂/正式」由委托数量对比最小计分数量自动标注（买=最小计分数量→试挂；更大→正式；卖出单不标注）。份额预警已全量开启（奖励份额连续 >8% 一分钟语音告警，夜间静音）；撤单即时生效;已成交部分不可撤。</p></section>"
     + funnelMarkup
     + dataNoticeMarkup
     + lpCurrentRecommendationMarkup(recommendations)
@@ -5942,6 +5957,29 @@ function predictionModalHtml(kind, data = {}) {
     const profitMoney = predictionSignedMoney(Number(market.minimum_profit), String(market.minimum_profit ?? "-"));
     return `<section class="pm-modal" role="dialog" aria-modal="true" aria-labelledby="pm-dialog-title" tabindex="-1"><header class="pm-modal-header"><h2 id="pm-dialog-title">确认 N 腿真实订单</h2><p>确认后进入统一 FIFO 队列；确认与发单前都会取最新盘口复核——方案随行情轮转时，只要仍满足利润门槛与全部安全闸，就按最新合格方案入队并执行（上方数字为点开时参考）；价格超出已证明边界则自动作废退回监控，不会临时改方向或数量。</p></header><div class="pm-order-market"><span>Polymarket · 同所 · 同事件 · 资格 ${escapeHtml(predictionValue(data.qualification_policy_version, "v1"))} · 方案指纹 ${escapeHtml(fingerprint.slice(0, 14) || "-")}</span><strong>${escapeHtml(predictionValue(data.title, "数据未返回"))}</strong></div><div class="pm-order-legs">${legs.map((leg, index) => `<article class="pm-order-leg"><span>第 ${index + 1} 腿 · ${escapeHtml(predictionValue(leg.title, "市场未返回"))} · ${escapeHtml(predictionValue(leg.direction, "BUY"))} · FOK</span><strong>${escapeHtml(String(leg.quantity ?? "-"))} 份 @ 成本上限 ${escapeHtml(predictionPrice(leg.max_price))}</strong><small>最大成本 ${escapeHtml(predictionNLegUnitsMoney(leg.max_cost_units))} · taker 费 ${escapeHtml(predictionNLegUnitsMoney(leg.taker_fee_units))}</small></article>`).join("") || "<div class=\"pm-empty compact\">腿数据未返回</div>"}</div><div class="pm-order-summary"><div><span>含费最大成本</span><strong>${escapeHtml(maxCostMoney)}</strong></div><div><span>最低赔付</span><strong>${escapeHtml(payoutMoney)}</strong></div><div><span>保证最低利润（扣费后）</span><strong class="pm-positive">${escapeHtml(profitMoney)}</strong></div><div><span>资本释放</span><strong>${escapeHtml(String(market.capital_release_at || "-").slice(0, 10))}</strong></div></div><div class="pm-check-list"><div class="pm-check"><span>单笔资金上限</span><strong>${escapeHtml(predictionNLegUnitsMoney(capValues.max_per_trade_cost_units))} · 本次 ${escapeHtml(maxCostMoney)}</strong></div><div class="pm-check"><span>未清资本上限</span><strong>${escapeHtml(predictionNLegUnitsMoney(capValues.max_total_unsettled_capital_units))} · 预留后 ${escapeHtml(predictionNLegUnitsMoney(execution.projected_total_units))}</strong></div><div class="pm-check"><span>部分成交损失上限</span><strong>${escapeHtml(predictionNLegUnitsMoney(capValues.max_partial_fill_loss_units))}</strong></div><div class="pm-check"><span>自动修复损失上限</span><strong>${escapeHtml(predictionNLegUnitsMoney(capValues.max_auto_repair_loss_units))} · 上限确认 v${escapeHtml(predictionValue(caps.acknowledged_version, "-"))}</strong></div><div class="pm-check"><span>成交证明</span><strong>${escapeHtml(predictionValue(execution.partial_fill_proof, "-"))}</strong></div><div class="pm-check"><span>费用状态</span><strong>${escapeHtml(feeLabel)}</strong></div></div><div class="pm-risk-note" role="note"><strong>部分成交会立即触发事故</strong><p>各腿并发提交但不跨交易所原子；任一腿部分成交或回执未知时，全线停止新订单、保持事故态并转为人工处置（自动修复未启用），最坏损失由部分成交损失上限约束。重复点击不会生成第二组订单。</p></div><footer class="pm-modal-actions"><button class="pm-button" type="button" data-modal-action="cancel">取消</button><button class="pm-button primary" type="button" data-modal-action="nleg-confirm">确认入队 · 单笔上限 ${escapeHtml(predictionNLegUnitsMoney(capValues.max_per_trade_cost_units))}</button></footer></section>`;
   }
+  if (kind === "lp_cancel") {
+    // Manual LP cancel: displayed facts come from the current dashboard
+    // snapshot rows; the server re-resolves every target against a fresh
+    // account read before actually cancelling.
+    const scope = String(data.scope || "");
+    const orders = Array.isArray(data.orders) ? data.orders : [];
+    const orderRows = orders.map((row) => {
+      const quantity = lpDashboardTodayOrderQuantity(row);
+      const shares = Number.isFinite(quantity) ? formatDisplayNumber(String(quantity)) : "-";
+      const filled = Number(row.filled_quantity);
+      const filledNote = Number.isFinite(filled) && filled > 0
+        ? ` · 已成交 ${escapeHtml(formatDisplayNumber(String(filled)))}` : "";
+      return `<div class="pm-check"><span>${escapeHtml(predictionValue(row.market_title, "市场未返回"))}</span><strong>${escapeHtml(predictionValue(row.side, "-"))} · ${shares} 份${filledNote} · 剩余 ${escapeHtml(predictionValue(row.remaining_quantity, "-"))}</strong></div>`;
+    }).join("");
+    const scopeLabel = scope === "all"
+      ? "当天 LP 委托全部"
+      : scope === "market" ? "该标的全部可撤委托" : "所选委托";
+    const totalShares = orders.reduce((sum, row) => {
+      const quantity = lpDashboardTodayOrderQuantity(row);
+      return sum + (Number.isFinite(quantity) ? quantity : 0);
+    }, 0);
+    return `<section class="pm-modal" role="dialog" aria-modal="true" aria-labelledby="pm-dialog-title" tabindex="-1"><header class="pm-modal-header"><h2 id="pm-dialog-title">确认撤单</h2><p>${escapeHtml(scopeLabel)} · ${orders.length} 笔 · 合计 ${escapeHtml(formatDisplayNumber(String(totalShares)))} 份。撤单即时生效;已成交部分不可撤。</p></header><div class="pm-check-list">${orderRows || "<div class=\"pm-check\"><span>没有可撤委托</span><strong>-</strong></div>"}</div><div class="pm-risk-note" role="note"><strong>撤单即时生效</strong><p>撤单后该委托不再参与计分；已成交部分不可撤；确认时服务端会用最新账户数据重新核对每一笔。</p></div><footer class="pm-modal-actions"><button class="pm-button" type="button" data-modal-action="cancel">取消</button><button class="pm-button danger" type="button" data-modal-action="lp-cancel-confirm">确认撤单 · ${orders.length} 笔</button></footer></section>`;
+  }
   const reset = kind === "reset";
   const cleanup = kind === "allowance_cleanup";
   const title = cleanup ? "确认清理 Predict 残余授权" : reset ? "确认解除交易熔断" : "确认真实下单";
@@ -6270,6 +6308,14 @@ function handlePredictionMarketChange(event) {
   renderPredictionMarket();
 }
 
+function lpDashboardTodayActiveRows() {
+  const dashboard = state.predictionMarket.lpDashboard;
+  const rows = dashboard && typeof dashboard === "object"
+    && Array.isArray(dashboard.lp_orders_today) ? dashboard.lp_orders_today : [];
+  return rows.filter((row) => row && typeof row === "object"
+    && lpDashboardTodayHasActiveOrder(row));
+}
+
 async function handlePredictionMarketClick(event) {
   const predictionTab = event.target.closest("[data-prediction-tab]");
   if (predictionTab) {
@@ -6303,6 +6349,30 @@ async function handlePredictionMarketClick(event) {
       state.predictionMarket.error = error instanceof Error ? error.message : String(error);
       renderPredictionMarket();
     }
+    return;
+  }
+  const lpCancelOrder = event.target.closest("[data-action='lp-cancel-order']");
+  if (lpCancelOrder && !lpCancelOrder.disabled) {
+    const orderId = String(lpCancelOrder.dataset.orderId || "");
+    const row = lpDashboardTodayActiveRows().find(
+      (item) => String(item.order_id || "") === orderId);
+    if (row) openPredictionModal("lp_cancel", lpCancelOrder, {scope: "order", orders: [row]});
+    return;
+  }
+  const lpCancelMarket = event.target.closest("[data-action='lp-cancel-market']");
+  if (lpCancelMarket && !lpCancelMarket.disabled) {
+    const conditionId = String(lpCancelMarket.dataset.conditionId || "");
+    const orders = lpDashboardTodayActiveRows().filter(
+      (row) => String(row.condition_id || "") === conditionId);
+    if (orders.length) {
+      openPredictionModal("lp_cancel", lpCancelMarket, {scope: "market", conditionId, orders});
+    }
+    return;
+  }
+  const lpCancelAll = event.target.closest("[data-action='lp-cancel-all']");
+  if (lpCancelAll && !lpCancelAll.disabled) {
+    const orders = lpDashboardTodayActiveRows();
+    if (orders.length) openPredictionModal("lp_cancel", lpCancelAll, {scope: "all", orders});
     return;
   }
   const llmProviderButton = event.target.closest("[data-llm-provider]");
@@ -6480,6 +6550,35 @@ async function handlePredictionModalClick(event) {
       }
       closePredictionModal();
       await fetchPredictionState();
+      return;
+    }
+    if (action === "lp-cancel-confirm") {
+      const data = predictionModal.data && typeof predictionModal.data === "object"
+        ? predictionModal.data : {};
+      const orders = Array.isArray(data.orders) ? data.orders : [];
+      const body = {confirm: true};
+      if (data.scope === "order") {
+        body.order_ids = orders.map((row) => String(row.order_id || ""));
+      } else if (data.scope === "market") {
+        body.condition_id = String(data.conditionId || "");
+      } else {
+        body.scope = "all";
+      }
+      const result = await predictionPost(
+        "/api/prediction-arbitrage/lp/orders/cancel", body);
+      const canceled = Array.isArray(result?.canceled) ? result.canceled : [];
+      const notCanceled = result?.not_canceled
+        && typeof result.not_canceled === "object" ? result.not_canceled : {};
+      const failures = Object.entries(notCanceled);
+      state.predictionMarket.lpCancelSummary = canceled.length
+        ? `撤成 ${canceled.length} 笔` : "";
+      if (failures.length) {
+        state.predictionMarket.error = "撤单失败："
+          + failures.map(([orderId, reason]) => `${orderId} ${reason}`).join("；");
+      }
+      closePredictionModal();
+      await fetchPredictionLpDashboard();
+      renderPredictionMarket();
       return;
     }
     if (action === "nleg-confirm") {

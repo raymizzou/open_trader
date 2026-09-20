@@ -21289,3 +21289,131 @@ console.log(JSON.stringify(result));
         "staleDiscarded": True,
         "newerApplied": True,
     }
+
+
+def _lp_cancel_render_dashboard() -> str:
+    return r"""
+const checkedAt = "2026-09-20T02:00:00Z";
+const order = (orderId, conditionId, title, price, quantity, extra) => ({
+  order_id: orderId, condition_id: conditionId,
+  token_id: "token-" + orderId,
+  market_title: title, market_url: "https://polymarket.com/event/" + conditionId,
+  outcome: "YES", side: "BUY", status: "LIVE", price,
+  quantity, filled_quantity: "0", remaining_quantity: quantity,
+  state: "open", purpose: "formal",
+  management: "manual_read_only", read_only: true,
+  scoring_status: "true", scoring_checked_at: checkedAt,
+  ...(extra || {}),
+});
+const dashboard = {
+  state: "ready", stale: false, checked_at: checkedAt, last_success_at: checkedAt,
+  orders: [], positions: [],
+  lp_orders_today: [
+    order("a1", "condition-a", "Market A", "0.23", "650"),
+    order("a2", "condition-a", "Market A", "0.23", "300"),
+    order("b1", "condition-b", "Market B", "0.31", "120"),
+    order("c1", "condition-c", "Market C", "0.45", "60",
+      {status: "MATCHED", state: "filled", filled_quantity: "60",
+       remaining_quantity: "0", last_fill_at: checkedAt, purpose: null}),
+  ],
+  non_lp_row_count: 0, market_rewards: {}, reward_shares: {},
+  lp_observations: {}, recommendations: [], lp_session: {state: "none"},
+};
+const html = predictionLpCard({lp_dashboard: dashboard});
+const orderTable = (html.match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
+const rowSegments = orderTable.split("<tr data-lp-today-market=").slice(1);
+const rowFor = (conditionId) => rowSegments.find(
+  (segment) => segment.startsWith("\"" + conditionId + "\"")) || "";
+const marketARow = rowFor("condition-a");
+const marketBRow = rowFor("condition-b");
+const marketCRow = rowFor("condition-c");
+"""
+
+
+def test_lp_cancel_buttons_render_enabled_per_order_and_market_targets() -> None:
+    """D1/D2/D3: 可撤单行渲染启用的逐笔与组级撤单按钮(带目标、无 disabled、
+    无预留位提示);已成交行不渲染撤单按钮。"""
+    output = run_dashboard_js(_lp_cancel_render_dashboard() + r"""
+console.log(JSON.stringify({
+  perOrderA1: marketARow.includes(
+    'data-action="lp-cancel-order" data-order-id="a1"'),
+  perOrderA2: marketARow.includes(
+    'data-action="lp-cancel-order" data-order-id="a2"'),
+  marketButtonA: marketARow.includes(
+    'data-action="lp-cancel-market" data-condition-id="condition-a"'),
+  noDisabledButtons: !/<button[^>]*lp-cancel[^>]*disabled/.test(orderTable),
+  noPlaceholderTitle: !orderTable.includes("预留位"),
+  singleOrderB1: marketBRow.includes(
+    'data-action="lp-cancel-order" data-order-id="b1"'),
+  filledRowNoCancel: !marketCRow.includes("lp-cancel"),
+}));
+""")
+    rendered = json.loads(output)
+
+    assert rendered == {
+        "perOrderA1": True,
+        "perOrderA2": True,
+        "marketButtonA": True,
+        "noDisabledButtons": True,
+        "noPlaceholderTitle": True,
+        "singleOrderB1": True,
+        "filledRowNoCancel": True,
+    }
+
+
+def test_lp_cancel_all_header_button_and_updated_footer_copy() -> None:
+    """D4: 面板 header 渲染表级撤全部按钮;页脚改为撤单生效说明,
+    不再含占位文案。"""
+    output = run_dashboard_js(_lp_cancel_render_dashboard() + r"""
+const heading = (html.match(/<header class="pm-panel-heading">[\s\S]*?<\/header>/) || [""])[0];
+console.log(JSON.stringify({
+  headerCancelAll: heading.includes('data-action="lp-cancel-all"'),
+  headerCancelNextToRefresh: heading.indexOf("lp-cancel-all") > -1
+    && heading.indexOf("lp-dashboard-refresh") > -1,
+  footerUpdated: html.includes("撤单即时生效;已成交部分不可撤"),
+  placeholderGone: !html.includes("撤单按钮为预留位,本期未启用"),
+}));
+""")
+    rendered = json.loads(output)
+
+    assert rendered == {
+        "headerCancelAll": True,
+        "headerCancelNextToRefresh": True,
+        "footerUpdated": True,
+        "placeholderGone": True,
+    }
+
+
+def test_lp_cancel_modal_html_renders_details_and_confirm_actions() -> None:
+    """D5: lp_cancel 确认模态渲染明细行(标的/笔数/合计份数)与
+    确认/取消动作。"""
+    output = run_dashboard_js(r"""
+const html = predictionModalHtml("lp_cancel", {
+  scope: "market",
+  conditionId: "condition-a",
+  orders: [
+    {order_id: "a1", market_title: "Market A", side: "BUY", status: "LIVE",
+     quantity: "650", filled_quantity: "0", remaining_quantity: "650"},
+    {order_id: "a2", market_title: "Market A", side: "BUY", status: "LIVE",
+     quantity: "300", filled_quantity: "0", remaining_quantity: "300"},
+  ],
+});
+console.log(JSON.stringify({
+  title: html.includes("确认撤单"),
+  detailMarket: html.includes("Market A"),
+  detailOrderCount: html.includes("2 笔"),
+  detailShares: html.includes("950"),
+  confirmAction: html.includes('data-modal-action="lp-cancel-confirm"'),
+  cancelAction: html.includes('data-modal-action="cancel"'),
+}));
+""")
+    rendered = json.loads(output)
+
+    assert rendered == {
+        "title": True,
+        "detailMarket": True,
+        "detailOrderCount": True,
+        "detailShares": True,
+        "confirmAction": True,
+        "cancelAction": True,
+    }

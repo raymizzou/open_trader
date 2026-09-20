@@ -859,6 +859,7 @@ def create_prediction_server(
             lp_candidate_refresh_path = (
                 "/api/prediction-arbitrage/lp/candidates/refresh"
             )
+            lp_cancel_orders_path = "/api/prediction-arbitrage/lp/orders/cancel"
             lp_sessions_prefix = "/api/prediction-arbitrage/lp/sessions/"
             lp_start_path = "/api/prediction-arbitrage/lp/sessions"
             lp_stop_session: str | None = None
@@ -887,6 +888,7 @@ def create_prediction_server(
                 lp_preview_path,
                 lp_candidate_preview_path,
                 lp_candidate_refresh_path,
+                lp_cancel_orders_path,
                 lp_start_path,
             } and lp_stop_session is None:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -929,6 +931,40 @@ def create_prediction_server(
                     if not callable(candidate_preview):
                         raise RuntimeError("LP execution service is unavailable")
                     result = candidate_preview(payload)
+                elif path == lp_cancel_orders_path:
+                    selectors = [
+                        name
+                        for name in ("order_ids", "condition_id", "scope")
+                        if name in payload
+                    ]
+                    if len(selectors) != 1:
+                        raise ValueError(
+                            "exactly one of order_ids, condition_id, scope is required"
+                        )
+                    self._require_schema(
+                        payload, set(selectors) | {"confirm"}
+                    )
+                    if payload.get("confirm") is not True:
+                        raise ValueError("confirm must be true")
+                    order_ids_value = payload.get("order_ids")
+                    if order_ids_value is not None and (
+                        not isinstance(order_ids_value, list)
+                        or not order_ids_value
+                        or not all(
+                            isinstance(item, str) and item.strip()
+                            for item in order_ids_value
+                        )
+                    ):
+                        raise ValueError(
+                            "order_ids must be a non-empty list of strings"
+                        )
+                    scope_value = payload.get("scope")
+                    if scope_value is not None and scope_value != "all":
+                        raise ValueError("scope must be \"all\"")
+                    lp_cancel = getattr(execution, "lp_cancel_orders", None)
+                    if not callable(lp_cancel):
+                        raise RuntimeError("LP execution service is unavailable")
+                    result = lp_cancel(payload)
                 elif path == lp_candidate_refresh_path:
                     if set(payload) - {"manual_recovery"}:
                         raise ValueError("prediction request fields are invalid")

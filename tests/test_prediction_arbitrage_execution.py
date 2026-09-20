@@ -7167,3 +7167,365 @@ def test_read_model_last_execution_exposes_submit_failure_summary(
         csrf_token="",
     )
     assert empty_payload["last_execution"] is None
+
+
+class _CancelLP:
+    def candidate_snapshot(self) -> dict[str, object]:
+        return {
+            "state": "known",
+            "complete": False,
+            "candidates": [],
+            "recommendations": [],
+            "market_rewards": {},
+        }
+
+    def status(self, _session_id: str | None = None) -> dict[str, object]:
+        return {"state": "none"}
+
+
+class _CancelTrading:
+    """Fake trading for lp_cancel_orders: fresh account reads + the cancel
+    primitive, recording every call for seam assertions."""
+
+    def __init__(
+        self,
+        open_orders: list[dict[str, object]],
+        *,
+        cancel_result: dict[str, object] | None = None,
+        cancel_error: Exception | None = None,
+        account_error: Exception | None = None,
+        authenticated: bool = True,
+    ) -> None:
+        self.open_orders = open_orders
+        self.cancel_result = cancel_result
+        self.cancel_error = cancel_error
+        self.account_error = account_error
+        self.authenticated = authenticated
+        self.account_reads = 0
+        self.cancel_calls: list[tuple[str, ...]] = []
+
+    def lp_account_snapshot(self) -> dict[str, object]:
+        self.account_reads += 1
+        if self.account_error is not None:
+            raise self.account_error
+        if self.authenticated is not True:
+            return {
+                "authenticated": False,
+                "checked_at": datetime.now(UTC),
+                "open_orders": [],
+                "positions": [],
+            }
+        return {
+            "authenticated": True,
+            "checked_at": datetime.now(UTC),
+            "open_orders": self.open_orders,
+            "positions": [],
+        }
+
+    def cancel_orders_detailed(
+        self, order_ids: tuple[str, ...]
+    ) -> dict[str, object]:
+        self.cancel_calls.append(tuple(order_ids))
+        if self.cancel_error is not None:
+            raise self.cancel_error
+        if self.cancel_result is not None:
+            return self.cancel_result
+        return {"canceled": tuple(order_ids), "not_canceled": {}}
+
+
+def _cancel_open_order(
+    order_id: str,
+    condition_id: str = "0xc1",
+    *,
+    remaining: str = "5",
+    filled: str = "0",
+) -> dict[str, object]:
+    return {
+        "order_id": order_id,
+        "condition_id": condition_id,
+        "status": "LIVE",
+        "side": "BUY",
+        "price": "0.50",
+        "original_size": str(Decimal(remaining) + Decimal(filled)),
+        "size_matched": filled,
+        "remaining_size": remaining,
+    }
+
+
+def _lp_cancel_service(
+    tmp_path: Path,
+    trading: _CancelTrading,
+    notifier: ChannelNotifier,
+    name: str = "data",
+    lp: object | None = None,
+) -> tuple[PredictionExecutionService, PredictionArbitrageStore, list[int]]:
+    store = PredictionArbitrageStore(tmp_path / name)
+    service = PredictionExecutionService(
+        store=store,
+        monitor=object(),
+        trading=trading,
+        notifier=notifier,
+        lock_path=tmp_path / (name + ".lock"),
+        lp=_CancelLP() if lp is None else lp,
+    )
+    refresh_calls: list[int] = []
+    original_refresh = service.refresh_lp_dashboard_snapshot
+
+    def counting_refresh() -> dict[str, object]:
+        refresh_calls.append(1)
+        return original_refresh()
+
+    service.refresh_lp_dashboard_snapshot = counting_refresh  # type: ignore[method-assign]
+    return service, store, refresh_calls
+
+
+def test_lp_cancel_orders_cancels_single_active_order(tmp_path: Path) -> None:
+    """B1: 单笔撤单——恰撤目标单、结果逐笔、触发刷新、审计 completed。"""
+
+    trading = _CancelTrading([_cancel_open_order("o1")])
+    notifier = ChannelNotifier("feishu")
+    service, store, refresh_calls = _lp_cancel_service(tmp_path, trading, notifier)
+
+    result = service.lp_cancel_orders({"order_ids": ["o1"], "confirm": True})
+
+    assert trading.cancel_calls == [("o1",)]
+    assert result == {
+        "requested": 1,
+        "canceled": ["o1"],
+        "not_canceled": {},
+        "skipped": [],
+    }
+    assert refresh_calls == [1]
+    actions = store.lp_actions("manual")
+    assert len(actions) == 1
+    assert actions[0]["state"] == "completed"
+    assert actions[0]["action_key"].startswith("lp-manual-cancel:")
+    assert actions[0]["session_id"] == "manual"
+    assert notifier.calls == 0
+
+
+def test_lp_cancel_orders_condition_scope_cancels_active_only(tmp_path: Path) -> None:
+    """B2: 标的级撤单——只撤该标的活跃单,不活跃单记 not_active,他标的不碰。"""
+
+    trading = _CancelTrading(
+        [
+            _cancel_open_order("o1", "0xc1"),
+            _cancel_open_order("o2", "0xc1"),
+            _cancel_open_order("o3", "0xc1", remaining="0", filled="5"),
+            _cancel_open_order("o4", "0xc2"),
+        ]
+    )
+    notifier = ChannelNotifier("feishu")
+    service, _store, _refresh_calls = _lp_cancel_service(tmp_path, trading, notifier)
+
+    result = service.lp_cancel_orders({"condition_id": "0xc1", "confirm": True})
+
+    assert trading.cancel_calls == [("o1", "o2")]
+    assert result["skipped"] == [{"order_id": "o3", "reason": "not_active"}]
+    assert result["canceled"] == ["o1", "o2"]
+    assert "o4" not in result["canceled"]
+    assert notifier.calls == 0
+
+
+def test_lp_cancel_orders_unknown_order_is_skipped_without_cancel(
+    tmp_path: Path,
+) -> None:
+    """B3: 未知单只跳过,不调用撤单原语,不抛异常。"""
+
+    trading = _CancelTrading([_cancel_open_order("o1")])
+    notifier = ChannelNotifier("feishu")
+    service, _store, _refresh_calls = _lp_cancel_service(tmp_path, trading, notifier)
+
+    result = service.lp_cancel_orders({"order_ids": ["oX"], "confirm": True})
+
+    assert result["skipped"] == [{"order_id": "oX", "reason": "unknown_order"}]
+    assert trading.cancel_calls == []
+    assert result["canceled"] == []
+
+
+def test_lp_cancel_orders_scope_all_targets_snapshot_rows_only(tmp_path: Path) -> None:
+    """B5: 全撤——以 lp_orders_today 行为可见集,与新鲜 open orders 求交;
+    已消失行记 unknown_order;非 LP 单不碰。"""
+
+    trading = _CancelTrading(
+        [
+            _cancel_open_order("t1", "0xc1"),
+            _cancel_open_order("t2", "0xc2"),
+            _cancel_open_order("nonlp1", "0xc9"),
+        ]
+    )
+    notifier = ChannelNotifier("feishu")
+    service, _store, _refresh_calls = _lp_cancel_service(tmp_path, trading, notifier)
+    service._lp_dashboard_cache = {
+        "lp_orders_today": [
+            {"order_id": "t1", "condition_id": "0xc1", "market_title": "T1"},
+            {"order_id": "t2", "condition_id": "0xc2", "market_title": "T2"},
+            {"order_id": "t3", "condition_id": "0xc3", "market_title": "T3"},
+        ]
+    }
+
+    result = service.lp_cancel_orders({"scope": "all", "confirm": True})
+
+    assert trading.cancel_calls == [("t1", "t2")]
+    assert result["skipped"] == [{"order_id": "t3", "reason": "unknown_order"}]
+    assert result["canceled"] == ["t1", "t2"]
+    assert "nonlp1" not in result["canceled"]
+
+
+def test_lp_cancel_orders_scope_all_requires_dashboard_snapshot(
+    tmp_path: Path,
+) -> None:
+    """B5(续): 快照缓存为 None → RuntimeError("lp_dashboard_snapshot_pending")。"""
+
+    trading = _CancelTrading([_cancel_open_order("t1", "0xc1")])
+    notifier = ChannelNotifier("feishu")
+    service, _store, _refresh_calls = _lp_cancel_service(tmp_path, trading, notifier)
+    service._lp_dashboard_cache = None
+
+    with pytest.raises(RuntimeError, match="lp_dashboard_snapshot_pending"):
+        service.lp_cancel_orders({"scope": "all", "confirm": True})
+
+    assert trading.cancel_calls == []
+
+
+def test_lp_cancel_orders_no_active_targets_skips_cancel_and_notice(
+    tmp_path: Path,
+) -> None:
+    """B6: 目标全不活跃 → 不调撤单原语、无飞书、无异常。"""
+
+    trading = _CancelTrading(
+        [_cancel_open_order("o3", "0xc1", remaining="0", filled="5")]
+    )
+    notifier = ChannelNotifier("feishu")
+    service, _store, _refresh_calls = _lp_cancel_service(tmp_path, trading, notifier)
+
+    result = service.lp_cancel_orders({"order_ids": ["o3"], "confirm": True})
+
+    assert result["canceled"] == []
+    assert result["skipped"] == [{"order_id": "o3", "reason": "not_active"}]
+    assert trading.cancel_calls == []
+    assert notifier.calls == 0
+
+
+def test_lp_cancel_orders_partial_failure_reports_and_notifies(tmp_path: Path) -> None:
+    """B7: 部分失败——结果逐笔透出,飞书通知标题含「撤单」、正文含失败单号。"""
+
+    trading = _CancelTrading(
+        [_cancel_open_order("o1"), _cancel_open_order("o2")],
+        cancel_result={"canceled": ("o1",), "not_canceled": {"o2": "not found"}},
+    )
+    notifier = ChannelNotifier("feishu")
+    service, store, _refresh_calls = _lp_cancel_service(tmp_path, trading, notifier)
+
+    result = service.lp_cancel_orders({"order_ids": ["o1", "o2"], "confirm": True})
+
+    assert result == {
+        "requested": 2,
+        "canceled": ["o1"],
+        "not_canceled": {"o2": "not found"},
+        "skipped": [],
+    }
+    assert len(notifier.messages) == 1
+    title, message = notifier.messages[0]
+    assert "撤单" in title
+    assert "o2" in message
+    actions = store.lp_actions("manual")
+    assert len(actions) == 1
+    assert actions[0]["state"] == "failed"
+
+
+def test_lp_cancel_orders_account_read_failure_raises_and_notifies(
+    tmp_path: Path,
+) -> None:
+    """B8: 账户读失败(未认证/异常)→ RuntimeError 且触发飞书通知。"""
+
+    unauthenticated = _CancelTrading([], authenticated=False)
+    notifier = ChannelNotifier("feishu")
+    service, store, _refresh_calls = _lp_cancel_service(
+        tmp_path, unauthenticated, notifier, name="data-unauth"
+    )
+
+    with pytest.raises(RuntimeError):
+        service.lp_cancel_orders({"order_ids": ["o1"], "confirm": True})
+
+    assert unauthenticated.cancel_calls == []
+    assert len(notifier.messages) == 1
+    assert "撤单" in notifier.messages[0][0]
+    assert store.lp_actions("manual")[0]["state"] == "failed"
+
+    failing = _CancelTrading(
+        [], account_error=RuntimeError("account read unavailable")
+    )
+    failing_notifier = ChannelNotifier("feishu")
+    failing_service, _store, _refresh_calls = _lp_cancel_service(
+        tmp_path, failing, failing_notifier, name="data-error"
+    )
+
+    with pytest.raises(RuntimeError):
+        failing_service.lp_cancel_orders({"order_ids": ["o1"], "confirm": True})
+
+    assert failing.cancel_calls == []
+    assert len(failing_notifier.messages) == 1
+
+
+def test_lp_cancel_orders_audit_write_failure_does_not_fail_cancel(
+    tmp_path: Path,
+) -> None:
+    """R4: 撤单成功后审计写失败(库锁)→ 撤单结果完整、刷新照常、不抛异常。"""
+
+    trading = _CancelTrading([_cancel_open_order("o1")])
+    notifier = ChannelNotifier("feishu")
+    service, store, refresh_calls = _lp_cancel_service(tmp_path, trading, notifier)
+
+    def locked_upsert(*args: object, **kwargs: object) -> dict[str, object]:
+        raise sqlite3.OperationalError("database is locked")
+
+    store.lp_upsert_action = locked_upsert  # type: ignore[method-assign]
+
+    result = service.lp_cancel_orders({"order_ids": ["o1"], "confirm": True})
+
+    assert trading.cancel_calls == [("o1",)]
+    assert result == {
+        "requested": 1,
+        "canceled": ["o1"],
+        "not_canceled": {},
+        "skipped": [],
+    }
+    assert refresh_calls == [1]
+    assert notifier.calls == 0
+
+
+class _SessionOwnedLP(_CancelLP):
+    """LP fake reporting a running session that owns the requested order."""
+
+    def status(self, _session_id: str | None = None) -> dict[str, object]:
+        return {
+            "state": "entry_open",
+            "session_id": "real-1",
+            "entry_order_id": "o1",
+            "owned_order_ids": ["o1"],
+        }
+
+
+def test_lp_cancel_orders_cancels_session_owned_order_without_guard(
+    tmp_path: Path,
+) -> None:
+    """R5/F4(定案 B): 会话托管单照撤——无「活跃会话拒撤」分支。"""
+
+    trading = _CancelTrading([_cancel_open_order("o1")])
+    notifier = ChannelNotifier("feishu")
+    service, _store, refresh_calls = _lp_cancel_service(
+        tmp_path, trading, notifier, lp=_SessionOwnedLP()
+    )
+
+    result = service.lp_cancel_orders({"order_ids": ["o1"], "confirm": True})
+
+    assert trading.cancel_calls == [("o1",)]
+    assert result == {
+        "requested": 1,
+        "canceled": ["o1"],
+        "not_canceled": {},
+        "skipped": [],
+    }
+    assert refresh_calls == [1]
+    assert notifier.calls == 0

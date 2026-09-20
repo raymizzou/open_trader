@@ -31,7 +31,10 @@ from .polymarket_lp_risk import (
     estimate_lp_target_share_yield,
     evaluate_lp_entry,
 )
-from .prediction_arbitrage_store import PredictionArbitrageStore
+from .prediction_arbitrage_store import (
+    LP_RESERVED_MANUAL_SESSION_ID,
+    PredictionArbitrageStore,
+)
 
 
 STOP_LOSS = Decimal("5")
@@ -7043,6 +7046,12 @@ class PolymarketLPService:
         generated_at: datetime,
     ) -> tuple[dict[str, object], bool]:
         from .polymarket_lp_views import lp_report_totals
+
+        # The reserved manual-cancel anchor session is audit bookkeeping,
+        # never reportable LP activity; report it as irrelevant so the
+        # caller's `if not relevant: continue` skips it.
+        if session.get("session_id") == LP_RESERVED_MANUAL_SESSION_ID:
+            return {"session_id": str(session.get("session_id") or "")}, False
 
         events_value = session.get("trade_events")
         events = _items(events_value)

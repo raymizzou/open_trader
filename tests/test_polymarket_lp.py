@@ -28,7 +28,10 @@ from polymarket.models.gamma.market import (
 from open_trader import polymarket_lp
 from open_trader.polymarket_lp import PolymarketLPService
 from open_trader.polymarket_trading import PolymarketTradingClient, TradingConfig
-from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+from open_trader.prediction_arbitrage_store import (
+    LP_RESERVED_MANUAL_SESSION_ID,
+    PredictionArbitrageStore,
+)
 
 
 class _Exchange:
@@ -5870,3 +5873,38 @@ def test_maintenance_refreshes_all_rows_and_reranks_by_new_yield(tmp_path) -> No
         "market-M02", "market-M01", "market-M03",
     ]
     assert all(row["estimate_updated"] is False for row in degraded_rows)
+def test_status_returns_none_when_only_reserved_manual_anchor(tmp_path) -> None:
+    """R2: store 仅含保留锚点会话时,status() 不把锚点当最新会话,报 none。"""
+
+    store = PredictionArbitrageStore(tmp_path)
+    store.lp_create_session(
+        LP_RESERVED_MANUAL_SESSION_ID,
+        "manual-anchor",
+        state="complete",
+        payload={"context": "manual_cancel_audit"},
+    )
+    service = PolymarketLPService(store, _Exchange(), clock=lambda: datetime.now(UTC))
+
+    assert service.status() == {"state": "none", "session_id": None}
+
+
+def test_daily_report_session_excludes_reserved_manual_anchor(tmp_path) -> None:
+    """R3: 日报会话装配对保留锚点会话返回 relevant=False(调用方跳过)。"""
+
+    now = datetime.now(UTC)
+    store = PredictionArbitrageStore(tmp_path)
+    store.lp_create_session(
+        LP_RESERVED_MANUAL_SESSION_ID,
+        "manual-anchor",
+        state="complete",
+        payload={"context": "manual_cancel_audit"},
+    )
+    (anchor_row,) = store.lp_sessions()
+
+    _report, relevant = PolymarketLPService._daily_report_session(
+        anchor_row,
+        period_start=now - timedelta(hours=1),
+        period_end=now + timedelta(hours=1),
+        generated_at=now,
+    )
+    assert relevant is False

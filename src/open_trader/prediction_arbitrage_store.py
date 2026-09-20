@@ -30,6 +30,10 @@ SignalHistoryWindow = Literal["24h", "7d", "30d", "all"]
 logger = logging.getLogger(__name__)
 
 _BUSY_TIMEOUT_MS = 5_000
+# Reserved lp_sessions.session_id holding manual-cancel audit anchor rows.
+# Never returned as a "latest" session and skipped by daily-report assembly;
+# direct reads (lp_session) still work.
+LP_RESERVED_MANUAL_SESSION_ID = "manual"
 _LLM_USAGE_RETENTION = timedelta(days=7)
 _PREVIEW_TTL = timedelta(seconds=10)
 _LP_BOOK_SAMPLE_RETENTION = timedelta(minutes=65)
@@ -2680,11 +2684,16 @@ class PredictionArbitrageStore:
         return None if row is None else self._lp_row_result(row)
 
     def lp_latest_session(self) -> dict[str, object] | None:
-        """Return the most recently created LP session for read-only status."""
+        """Return the most recently created LP session for read-only status.
+
+        The reserved manual-cancel anchor session is never returned here so
+        it cannot leak into "latest session" fallbacks or daily reports.
+        """
 
         with self._read_connection() as connection:
             row = connection.execute(
-                "SELECT * FROM lp_sessions ORDER BY created_at DESC LIMIT 1"
+                "SELECT * FROM lp_sessions WHERE session_id != ? ORDER BY created_at DESC LIMIT 1",
+                (LP_RESERVED_MANUAL_SESSION_ID,),
             ).fetchone()
         return None if row is None else self._lp_row_result(row)
 

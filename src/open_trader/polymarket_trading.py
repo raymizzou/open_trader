@@ -5729,6 +5729,24 @@ class PolymarketTradingClient:
             del exc
             raise PolymarketTradingError(code) from None
 
+    def cancel_orders_detailed(self, order_ids: tuple[str, ...]) -> dict[str, object]:
+        try:
+            response = self._client.cancel_orders(order_ids=order_ids)
+            canceled = _field(response, "canceled", ())
+            not_canceled = _field(response, "not_canceled", {})
+            return {
+                "canceled": tuple(
+                    item for item in canceled if isinstance(item, str)
+                ),
+                "not_canceled": (
+                    dict(not_canceled) if isinstance(not_canceled, Mapping) else {}
+                ),
+            }
+        except Exception as exc:
+            code = _safe_error_code(exc)
+            del exc
+            raise PolymarketTradingError(code) from None
+
     def remediation_options(
         self,
         *,
