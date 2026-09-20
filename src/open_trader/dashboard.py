@@ -2253,27 +2253,18 @@ def _valid_current_trend_risk_contract(
         return False
     summary = payload.get("risk_summary")
     snapshot = payload.get("strategy_snapshot")
-    contract_summary = summary
-    if (
+    nominal_allocation = (
         isinstance(snapshot, dict)
         and uses_nominal_allocation_behavior(
             str((payload.get("metadata") or {}).get("market") or "").upper(),
             snapshot.get("strategy_version"),
         )
-        and summary.get("status_label") == STOP_RISK_AUDIT_ONLY_LABEL
-    ):
-        planned = _dashboard_risk_decimal(summary.get("portfolio_planned_risk"))
-        limit = _dashboard_risk_decimal(summary.get("portfolio_risk_limit"))
-        contract_summary = {
-            **summary,
-            "status_label": (
-                "含最小一手额外风险"
-                if planned is not None and limit is not None and planned > limit
-                else "风险预算内"
-            ),
-        }
+    )
     if not isinstance(summary, dict) or not valid_v4_risk_contract(
-        parameters, contract_summary, expected_nav=expected_nav
+        parameters,
+        summary,
+        expected_nav=expected_nav,
+        allow_audit_only_stop_risk=nominal_allocation,
     ):
         return False
     if not isinstance(parameters, Mapping):
@@ -3278,7 +3269,14 @@ def _valid_v2_risk_items(
                 Decimal("0"),
                 remaining_capacity - item_risk,
             )
-        if (
+        # Nominal sizing keeps stop risk audit-only: existing positions alone
+        # may exceed the portfolio limit with no new planned risk, and the
+        # arithmetic above already pinned summary_new_risk to the buy plan.
+        if not (
+            current_nominal
+            and summary.get("status_label") == STOP_RISK_AUDIT_ONLY_LABEL
+            and summary_new_risk == 0
+        ) and (
             summary.get("status_label") != (
                 STOP_RISK_AUDIT_ONLY_LABEL
                 if current_nominal

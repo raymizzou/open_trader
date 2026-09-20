@@ -8434,6 +8434,323 @@ def test_current_nominal_existing_portfolio_risk_above_limit_is_audit_only() -> 
     ] == [("USNEW", "BUY", True)]
 
 
+def test_us_v14_audit_only_over_limit_without_buys_passes_validation() -> None:
+    allocation = current_nominal_allocation("US")
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "US", "abc123", (622460, 705013), allocation=allocation,
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("881117.726"),
+            available_cash=Decimal("300000"),
+            positions=(
+                AccountPosition(
+                    "USOLD", "存量持仓", "stock", Decimal("1000"),
+                    Decimal("50"), Decimal("50000"),
+                ),
+            ),
+            exceptions=(),
+        ),
+        candidates=(),
+        holding_snapshots={
+            "USOLD": replace(holding("USOLD", asset="美股"), exchange="US"),
+        },
+        bars_by_symbol={"USOLD": bars(close=50)},
+        prior_state={
+            "positions": {
+                "USOLD": {
+                    "initial_line": "5.077033437257024017",
+                    "active_line": "5.077033437257024017",
+                    "atr14": "0.5",
+                    "position_started_for": "2026-07-01",
+                    "updated_for": "2026-07-13",
+                }
+            }
+        },
+        market="US",
+        metadata={"market": "US", "broker": "futu"},
+        strategy_snapshot=strategy,
+        drawdown_summary=active_drawdown_for(strategy, equity="881117.726"),
+        allocation_reference=allocation,
+    )
+
+    assert built.strategy_snapshot["strategy_version"] == "v14"
+    assert built.buy_actions == ()
+    assert built.risk_summary["status"] == "active"
+    assert (
+        built.risk_summary["status_label"]
+        == trend_module.STOP_RISK_AUDIT_ONLY_LABEL
+    )
+    assert built.risk_summary["new_planned_risk"] == Decimal("0")
+    assert (
+        built.risk_summary["existing_planned_risk"]
+        == Decimal("44972.966562742975983")
+    )
+    assert (
+        built.risk_summary["portfolio_risk_limit"] == Decimal("35244.70904")
+    )
+    assert (
+        built.risk_summary["portfolio_planned_risk"]
+        == Decimal("44972.966562742975983")
+    )
+    trend_module.validate_report_strategy_snapshot(built)
+
+
+def test_us_v14_audit_only_over_limit_with_new_buys_passes_validation() -> None:
+    allocation = current_nominal_allocation("US")
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "US", "abc123", (622460, 705013), allocation=allocation,
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("60000"),
+            positions=(
+                AccountPosition(
+                    "USOLD", "存量持仓", "stock", Decimal("4000"),
+                    Decimal("10"), Decimal("40000"),
+                ),
+            ),
+            exceptions=(),
+        ),
+        candidates=(
+            candidate(
+                "USNEW",
+                exchange="US",
+                asset="美股",
+                close="10",
+                atr="0.5",
+                global_strength="90",
+            ),
+        ),
+        holding_snapshots={
+            "USOLD": replace(holding("USOLD", asset="美股"), exchange="US"),
+        },
+        bars_by_symbol={"USOLD": bars()},
+        prior_state={
+            "positions": {
+                "USOLD": {
+                    "initial_line": "9.00975",
+                    "active_line": "9.00975",
+                    "atr14": "0.5",
+                    "position_started_for": "2026-07-01",
+                    "updated_for": "2026-07-13",
+                }
+            }
+        },
+        market="US",
+        metadata={"market": "US", "broker": "futu"},
+        strategy_snapshot=strategy,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+        allocation_reference=allocation,
+    )
+
+    assert built.strategy_snapshot["strategy_version"] == "v14"
+    assert built.buy_actions
+    assert (
+        built.risk_summary["status_label"]
+        == trend_module.STOP_RISK_AUDIT_ONLY_LABEL
+    )
+    assert built.risk_summary["status"] == "active"
+    assert built.risk_summary["new_planned_risk"] > 0
+    assert built.risk_summary["portfolio_planned_risk"] == Decimal("4405")
+    assert built.risk_summary["portfolio_risk_limit"] == Decimal("4000")
+
+    trend_module.validate_report_strategy_snapshot(built)
+
+
+@pytest.mark.parametrize(
+    ("active_line", "existing_risk"),
+    [
+        ("14.80529096", "35244.70904"),
+        ("20.05", "30000"),
+    ],
+    ids=["at_limit", "below_limit"],
+)
+def test_us_v14_audit_only_within_limit_without_buys_passes_validation(
+    active_line: str,
+    existing_risk: str,
+) -> None:
+    allocation = current_nominal_allocation("US")
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "US", "abc123", (622460, 705013), allocation=allocation,
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("881117.726"),
+            available_cash=Decimal("300000"),
+            positions=(
+                AccountPosition(
+                    "USOLD", "存量持仓", "stock", Decimal("1000"),
+                    Decimal("50"), Decimal("50000"),
+                ),
+            ),
+            exceptions=(),
+        ),
+        candidates=(),
+        holding_snapshots={
+            "USOLD": replace(holding("USOLD", asset="美股"), exchange="US"),
+        },
+        bars_by_symbol={"USOLD": bars(close=50)},
+        prior_state={
+            "positions": {
+                "USOLD": {
+                    "initial_line": active_line,
+                    "active_line": active_line,
+                    "atr14": "0.5",
+                    "position_started_for": "2026-07-01",
+                    "updated_for": "2026-07-13",
+                }
+            }
+        },
+        market="US",
+        metadata={"market": "US", "broker": "futu"},
+        strategy_snapshot=strategy,
+        drawdown_summary=active_drawdown_for(strategy, equity="881117.726"),
+        allocation_reference=allocation,
+    )
+
+    assert built.strategy_snapshot["strategy_version"] == "v14"
+    assert built.buy_actions == ()
+    assert (
+        built.risk_summary["status_label"]
+        == trend_module.STOP_RISK_AUDIT_ONLY_LABEL
+    )
+    assert built.risk_summary["status"] == "active"
+    assert built.risk_summary["new_planned_risk"] == Decimal("0")
+    assert (
+        built.risk_summary["existing_planned_risk"] == Decimal(existing_risk)
+    )
+    trend_module.validate_report_strategy_snapshot(built)
+
+
+def test_us_v14_non_nominal_version_forged_audit_only_label_over_limit_is_rejected() -> None:
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "US", "abc123", (622460,),
+    )
+    assert strategy["strategy_version"] == "v8"
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("60000"),
+            positions=(
+                AccountPosition(
+                    "USOLD", "存量持仓", "stock", Decimal("4000"),
+                    Decimal("10"), Decimal("40000"),
+                ),
+            ),
+            exceptions=(),
+        ),
+        candidates=(),
+        holding_snapshots={
+            "USOLD": replace(holding("USOLD", asset="美股"), exchange="US"),
+        },
+        bars_by_symbol={"USOLD": bars()},
+        prior_state={
+            "positions": {
+                "USOLD": {
+                    "initial_line": "9.00975",
+                    "active_line": "9.00975",
+                    "atr14": "0.5",
+                    "position_started_for": "2026-07-01",
+                    "updated_for": "2026-07-13",
+                }
+            }
+        },
+        market="US",
+        metadata={"market": "US", "broker": "futu"},
+        strategy_snapshot=strategy,
+    )
+    assert built.risk_summary["status"] == "paused"
+    forged = replace(
+        built,
+        risk_summary={
+            **built.risk_summary,
+            "status": "active",
+            "pause_reason": "",
+            "status_label": trend_module.STOP_RISK_AUDIT_ONLY_LABEL,
+        },
+    )
+
+    with pytest.raises(
+        ValueError, match="strategy snapshot does not match report actions"
+    ):
+        trend_module.validate_report_strategy_snapshot(forged)
+
+
+def test_us_v14_audit_only_inconsistent_remaining_risk_is_rejected() -> None:
+    allocation = current_nominal_allocation("US")
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "US", "abc123", (622460, 705013), allocation=allocation,
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("881117.726"),
+            available_cash=Decimal("300000"),
+            positions=(
+                AccountPosition(
+                    "USOLD", "存量持仓", "stock", Decimal("1000"),
+                    Decimal("50"), Decimal("50000"),
+                ),
+            ),
+            exceptions=(),
+        ),
+        candidates=(),
+        holding_snapshots={
+            "USOLD": replace(holding("USOLD", asset="美股"), exchange="US"),
+        },
+        bars_by_symbol={"USOLD": bars(close=50)},
+        prior_state={
+            "positions": {
+                "USOLD": {
+                    "initial_line": "5.077033437257024017",
+                    "active_line": "5.077033437257024017",
+                    "atr14": "0.5",
+                    "position_started_for": "2026-07-01",
+                    "updated_for": "2026-07-13",
+                }
+            }
+        },
+        market="US",
+        metadata={"market": "US", "broker": "futu"},
+        strategy_snapshot=strategy,
+        drawdown_summary=active_drawdown_for(strategy, equity="881117.726"),
+        allocation_reference=allocation,
+    )
+    inconsistent = replace(
+        built,
+        risk_summary={
+            **built.risk_summary,
+            "portfolio_remaining_risk": Decimal("123"),
+        },
+    )
+
+    with pytest.raises(
+        ValueError, match="strategy snapshot does not match report actions"
+    ):
+        trend_module.validate_report_strategy_snapshot(inconsistent)
+
+
 def test_full_existing_portfolio_risk_lists_one_lot_with_note_but_no_pause() -> None:
     allocation = allocation_for("CN", rank=1, entry_weight="0.06")
     strategy = trend_module.live_trend_strategy_snapshot(
@@ -13723,8 +14040,6 @@ def test_real_plan_recovery_after_receipt_collision_matches_fresh_control(
     def fetch_recovery() -> dict[str, object]:
         nonlocal fetch_calls
         fetch_calls += 1
-        if fetch_calls == 1:
-            raise AccountHttpError("real account offline")
         return copy.deepcopy(real_snapshot)
 
     monkeypatch.setattr(trend_module, "fetch_account_snapshot", fetch_recovery)
@@ -13757,7 +14072,7 @@ def test_real_plan_recovery_after_receipt_collision_matches_fresh_control(
     )
     first_manifest = json.loads(planning_path.read_text(encoding="utf-8"))
     first_components = first_manifest["components"]
-    assert first_components["real_account"]["status"] == "unavailable"
+    assert first_components["real_account"]["status"] == "complete"
     receipt_path.rmdir()
 
     recovered = run_a_share_trend_report(
@@ -14347,6 +14662,72 @@ def test_a_share_report_pins_one_account_snapshot_through_internal_retries(
     assert fetches == 1
     assert seen == [snapshot, snapshot]
     assert all(item is snapshot for item in seen)
+
+
+def test_a_share_report_entry_retries_account_snapshot_until_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot = copy.deepcopy(ACCOUNT_SNAPSHOT)
+    fetches = 0
+    seen: list[object] = []
+
+    def fetch() -> dict[str, object]:
+        nonlocal fetches
+        fetches += 1
+        if fetches < 3:
+            raise AccountHttpError("account api offline")
+        return snapshot
+
+    monkeypatch.setattr(trend_module, "fetch_account_snapshot", fetch, raising=False)
+
+    def attempt(**kwargs: object) -> AShareTrendRunResult:
+        seen.append(kwargs.get("account_snapshot"))
+        return AShareTrendRunResult("generated", None, None)
+
+    monkeypatch.setattr(trend_module, "_attempt_report", attempt)
+
+    result = run_a_share_trend_report(
+        config=trend_config(tmp_path),
+        run_date="2026-07-14",
+        now_fn=lambda: datetime(2026, 7, 14, 17, tzinfo=SHANGHAI),
+        sleep_fn=lambda _seconds: None,
+    )
+
+    assert result.status == "generated"
+    assert fetches == 3
+    assert seen == [snapshot]
+    assert seen[0] is snapshot
+
+
+def test_a_share_report_entry_account_snapshot_failure_raises_after_bounded_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fetches = 0
+
+    def fetch() -> dict[str, object]:
+        nonlocal fetches
+        fetches += 1
+        raise AccountHttpError("account api offline")
+
+    monkeypatch.setattr(trend_module, "fetch_account_snapshot", fetch, raising=False)
+
+    def forbidden(**_kwargs: object) -> AShareTrendRunResult:
+        raise AssertionError("attempt must not run without account snapshot")
+
+    monkeypatch.setattr(trend_module, "_attempt_report", forbidden)
+
+    sleeps: list[float] = []
+
+    with pytest.raises(AccountHttpError):
+        run_a_share_trend_report(
+            config=trend_config(tmp_path),
+            run_date="2026-07-14",
+            now_fn=lambda: datetime(2026, 7, 14, 17, tzinfo=SHANGHAI),
+            sleep_fn=sleeps.append,
+        )
+
+    assert fetches == 3
+    assert sleeps == [5.0, 5.0]
 
 
 def test_a_share_updates_gap_reports_stale_assets() -> None:
@@ -16316,7 +16697,7 @@ def test_revision_reuses_frozen_account_snapshot_for_real_enrichment(
     assert "模拟盘计划不可用" not in revised.report_path.read_text(encoding="utf-8")
 
 
-def test_account_transport_failure_leaves_real_component_for_same_day_revision(
+def test_account_transport_failure_is_retried_and_revision_reuses_frozen_facts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -16337,16 +16718,14 @@ def test_account_transport_failure_leaves_real_component_for_same_day_revision(
         api_factory=lambda **kwargs: ReadyApi([]),
         quote_factory=lambda **kwargs: ReadyQuote([]),
         notifier=RecordingFeishu(),
+        sleep_fn=lambda _seconds: None,
     )
     assert first.json_path is not None
     first_payload = json.loads(first.json_path.read_text(encoding="utf-8"))
-    assert "account_input" not in first_payload
-    assert first_payload["plan_availability"]["real_account"]["status"] == "unavailable"
+    assert first_payload["account_input"] == ACCOUNT_INPUT
+    assert first_payload["plan_availability"]["real_account"]["status"] == "available"
     real_state_path = config.data_dir / "trend_a_share/real_protection_state.json"
     real_state_path.unlink(missing_ok=True)
-    strict_payload = copy.deepcopy(first_payload)
-    strict_payload["plan_availability"]["real_account"]["status"] = "available"
-    assert not trend_module.valid_frozen_report_contract(strict_payload)
     planning_path = config.data_dir / first_payload["replay_evidence"]["planning_path"]
     before = json.loads(planning_path.read_text(encoding="utf-8"))
 
@@ -16378,7 +16757,7 @@ def test_account_transport_failure_leaves_real_component_for_same_day_revision(
         real_state_path.exists(),
         load_protection_state(real_state_path),
     ) == (True, True, real_state)
-    assert revised_payload["replay_evidence"]["path"] != (
+    assert revised_payload["replay_evidence"]["path"] == (
         first_payload["replay_evidence"]["path"]
     )
     after = json.loads(planning_path.read_text(encoding="utf-8"))
@@ -18226,6 +18605,7 @@ def test_staggered_planning_revisions_recover_remaining_account_component(
         quote_factory=lambda **kwargs: ReadyQuote(api_calls),
         account_factory=StaggeredSimulationAccount,
         notifier=RecordingFeishu(),
+        sleep_fn=lambda _seconds: None,
     )
     assert first.status == "generated"
     first_payload = json.loads(first.json_path.read_text(encoding="utf-8"))
@@ -18241,7 +18621,7 @@ def test_staggered_planning_revisions_recover_remaining_account_component(
     } == {
         "market": "complete",
         "simulated_account": "unavailable",
-        "real_account": "unavailable",
+        "real_account": "complete",
     }
     initial_api_calls = list(api_calls)
 
@@ -18272,12 +18652,12 @@ def test_staggered_planning_revisions_recover_remaining_account_component(
     } == {
         "market": "complete",
         "simulated_account": "complete",
-        "real_account": "unavailable",
+        "real_account": "complete",
     }
     assert first_revision_component_bytes["market"] == first_component_bytes["market"]
     assert first_revision_component_bytes["real_account"] == first_component_bytes["real_account"]
     assert first_revision_payload["plan_availability"]["simulated_account"]["status"] == "available"
-    assert first_revision_payload["plan_availability"]["real_account"]["status"] == "unavailable"
+    assert first_revision_payload["plan_availability"]["real_account"]["status"] == "available"
 
     revised_twice = run_a_share_trend_report(
         config=config,
@@ -18305,7 +18685,7 @@ def test_staggered_planning_revisions_recover_remaining_account_component(
     }
     assert final_component_bytes["market"] == first_revision_component_bytes["market"]
     assert final_component_bytes["simulated_account"] == first_revision_component_bytes["simulated_account"]
-    assert final_component_bytes["real_account"] != first_revision_component_bytes["real_account"]
+    assert final_component_bytes["real_account"] == first_revision_component_bytes["real_account"]
     assert final_payload["plan_availability"]["simulated_account"]["status"] == "available"
     assert final_payload["plan_availability"]["real_account"]["status"] == "available"
     assert simulation_calls == 2

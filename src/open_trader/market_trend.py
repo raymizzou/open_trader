@@ -2111,6 +2111,24 @@ def _attempt_market_report(
             close()
 
 
+ACCOUNT_SNAPSHOT_FETCH_ATTEMPTS = 3
+ACCOUNT_SNAPSHOT_FETCH_RETRY_SECONDS = 5.0
+
+
+def _fetch_account_snapshot_with_retry(
+    *,
+    sleep_fn: Callable[[float], None],
+) -> dict[str, object]:
+    for attempt in range(1, ACCOUNT_SNAPSHOT_FETCH_ATTEMPTS + 1):
+        try:
+            return fetch_account_snapshot()
+        except AccountHttpError:
+            if attempt == ACCOUNT_SNAPSHOT_FETCH_ATTEMPTS:
+                raise
+            sleep_fn(ACCOUNT_SNAPSHOT_FETCH_RETRY_SECONDS)
+    raise AssertionError("unreachable fetch retry state")
+
+
 def run_market_trend_report(
     *,
     config: DailyPremarketConfig,
@@ -2183,10 +2201,9 @@ def run_market_trend_report(
                     ),
                     allocation_reference=allocation_reference,
                 )
-        try:
-            report_dependencies["account_snapshot"] = fetch_account_snapshot()
-        except AccountHttpError:
-            report_dependencies["account_snapshot"] = {}
+        report_dependencies["account_snapshot"] = (
+            _fetch_account_snapshot_with_retry(sleep_fn=sleep_fn)
+        )
         if allocation_reference is not None:
             report_dependencies["allocation_reference"] = allocation_reference
         return _run_market_trend_retry(

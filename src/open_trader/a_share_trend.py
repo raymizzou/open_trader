@@ -337,6 +337,7 @@ def valid_v2_risk_contract(
     summary: object,
     *,
     expected_nav: object,
+    allow_audit_only_stop_risk: bool = False,
 ) -> bool:
     if not isinstance(parameters, Mapping) or not isinstance(summary, Mapping):
         return False
@@ -385,10 +386,15 @@ def valid_v2_risk_contract(
     pause_reason = summary.get("pause_reason")
     status_label = summary.get("status_label")
     data_defect = bool(summary.get("data_defect_reason"))
+    audit_only = (
+        allow_audit_only_stop_risk
+        and summary.get("status_label") == STOP_RISK_AUDIT_ONLY_LABEL
+    )
     if status == "active":
         if (
             not isinstance(status_label, str)
-            or status_label not in {"风险预算内", "含最小一手额外风险"}
+            or not audit_only
+            and status_label not in {"风险预算内", "含最小一手额外风险"}
             or pause_reason != ""
             or status_label == "含最小一手额外风险"
             and (
@@ -463,7 +469,7 @@ def valid_v2_risk_contract(
             and remaining is None
             and remaining_pct is None
         )
-    if status == "active":
+    if status == "active" and not audit_only:
         if planned > portfolio_limit:
             if status_label != "含最小一手额外风险":
                 return False
@@ -483,9 +489,13 @@ def valid_v3_risk_contract(
     *,
     expected_nav: object,
     allow_zero_kelly_audit: bool = False,
+    allow_audit_only_stop_risk: bool = False,
 ) -> bool:
     if not valid_v2_risk_contract(
-        parameters, summary, expected_nav=expected_nav
+        parameters,
+        summary,
+        expected_nav=expected_nav,
+        allow_audit_only_stop_risk=allow_audit_only_stop_risk,
     ) or not isinstance(parameters, Mapping) or not isinstance(summary, Mapping):
         return False
     if {
@@ -575,6 +585,7 @@ def valid_v4_risk_contract(
     *,
     expected_nav: object,
     allow_zero_kelly_audit: bool = False,
+    allow_audit_only_stop_risk: bool = False,
 ) -> bool:
     return (
         valid_v3_risk_contract(
@@ -582,6 +593,7 @@ def valid_v4_risk_contract(
             summary,
             expected_nav=expected_nav,
             allow_zero_kelly_audit=allow_zero_kelly_audit,
+            allow_audit_only_stop_risk=allow_audit_only_stop_risk,
         )
         and isinstance(parameters, Mapping)
         and parameters.get("drawdown_limit") == str(DRAWDOWN_LIMIT)
@@ -9372,39 +9384,19 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
             "v16": valid_v4_risk_contract,
             "v17": valid_v4_risk_contract,
         }[version]
-        contract_summary = report.risk_summary
-        if (
-            _uses_current_nominal_allocation(market, version)
-            and report.risk_summary.get("status_label")
-            == STOP_RISK_AUDIT_ONLY_LABEL
-        ):
-            planned = _nonnegative_risk_decimal(
-                report.risk_summary.get("portfolio_planned_risk")
-            )
-            limit = _nonnegative_risk_decimal(
-                report.risk_summary.get("portfolio_risk_limit")
-            )
-            contract_summary = {
-                **report.risk_summary,
-                "status_label": (
-                    "含最小一手额外风险"
-                    if planned is not None
-                    and limit is not None
-                    and planned > limit
-                    else "风险预算内"
-                ),
-            }
+        current_nominal = _uses_current_nominal_allocation(market, version)
         contract_valid = (
             valid_contract(
                 parameters,
-                contract_summary,
+                report.risk_summary,
                 expected_nav=report.account.net_value,
                 allow_zero_kelly_audit=True,
+                allow_audit_only_stop_risk=True,
             )
-            if _uses_current_nominal_allocation(market, version)
+            if current_nominal
             else valid_contract(
                 parameters,
-                contract_summary,
+                report.risk_summary,
                 expected_nav=report.account.net_value,
             )
         )
@@ -9497,10 +9489,15 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
             report.risk_summary.get("portfolio_planned_risk")
         )
         status_label = report.risk_summary.get("status_label")
+        audit_only_stop_risk_report = (
+            _uses_current_nominal_allocation(market, version)
+            and status_label == STOP_RISK_AUDIT_ONLY_LABEL
+        )
         if (
             report.risk_summary.get("status") == "active"
             and planned_risk is not None
             and planned_risk > portfolio_limit
+            and not audit_only_stop_risk_report
         ):
             existing_risk = _nonnegative_risk_decimal(
                 report.risk_summary.get("existing_planned_risk")
@@ -12649,6 +12646,24 @@ def _attempt_report(
             close()
 
 
+ACCOUNT_SNAPSHOT_FETCH_ATTEMPTS = 3
+ACCOUNT_SNAPSHOT_FETCH_RETRY_SECONDS = 5.0
+
+
+def _fetch_account_snapshot_with_retry(
+    *,
+    sleep_fn: Callable[[float], None],
+) -> dict[str, object]:
+    for attempt in range(1, ACCOUNT_SNAPSHOT_FETCH_ATTEMPTS + 1):
+        try:
+            return fetch_account_snapshot()
+        except AccountHttpError:
+            if attempt == ACCOUNT_SNAPSHOT_FETCH_ATTEMPTS:
+                raise
+            sleep_fn(ACCOUNT_SNAPSHOT_FETCH_RETRY_SECONDS)
+    raise AssertionError("unreachable fetch retry state")
+
+
 def run_a_share_trend_report(
     *,
     config: DailyPremarketConfig,
@@ -12728,10 +12743,7 @@ def run_a_share_trend_report(
         )
         if recovered is not None:
             return recovered
-        try:
-            account_snapshot = fetch_account_snapshot()
-        except AccountHttpError:
-            account_snapshot = {}
+        account_snapshot = _fetch_account_snapshot_with_retry(sleep_fn=sleep_fn)
         version = _process_version(config.repo)
         log_path = config.logs_dir / "trend_a_share" / f"{run_date}.log"
         deadline = datetime.combine(run_day, time(22, 0), tzinfo=SHANGHAI)

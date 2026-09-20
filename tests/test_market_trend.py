@@ -782,6 +782,78 @@ def test_market_report_pins_one_account_snapshot_through_internal_retries(
     assert all(item is snapshot for item in seen)
 
 
+def test_market_report_entry_retries_account_snapshot_until_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot = copy.deepcopy(ACCOUNT_SNAPSHOT)
+    fetches = 0
+    seen: list[object] = []
+
+    def fetch() -> dict[str, object]:
+        nonlocal fetches
+        fetches += 1
+        if fetches < 3:
+            raise AccountHttpError("account api offline")
+        return snapshot
+
+    monkeypatch.setattr(market_trend, "fetch_account_snapshot", fetch)
+
+    def attempt(**kwargs: object) -> AShareTrendRunResult:
+        seen.append(kwargs.get("account_snapshot"))
+        return AShareTrendRunResult("generated", Path("report.md"), Path("report.json"))
+
+    result = run_market_trend_report(
+        config=config(tmp_path),
+        market="US",
+        run_date="2026-07-15",
+        notifier=NullNotifier(),
+        attempt_fn=attempt,
+        now_fn=lambda: datetime(2026, 7, 15, 9, tzinfo=SHANGHAI),
+        sleep_fn=lambda _seconds: None,
+    )
+
+    assert result.status == "generated"
+    assert fetches == 3
+    assert seen == [snapshot]
+    assert seen[0] is snapshot
+
+
+def test_market_report_entry_account_snapshot_failure_raises_after_bounded_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fetches = 0
+
+    def fetch() -> dict[str, object]:
+        nonlocal fetches
+        fetches += 1
+        raise AccountHttpError("account api offline")
+
+    monkeypatch.setattr(market_trend, "fetch_account_snapshot", fetch)
+
+    def forbidden(**_kwargs: object) -> AShareTrendRunResult:
+        raise AssertionError("attempt must not run without account snapshot")
+
+    times = iter([
+        datetime(2026, 7, 15, 9, tzinfo=SHANGHAI),
+        datetime(2026, 7, 15, 22, 1, tzinfo=SHANGHAI),
+    ])
+    sleeps: list[float] = []
+
+    with pytest.raises(AccountHttpError):
+        run_market_trend_report(
+            config=config(tmp_path),
+            market="US",
+            run_date="2026-07-15",
+            notifier=NullNotifier(),
+            attempt_fn=forbidden,
+            now_fn=lambda: next(times),
+            sleep_fn=sleeps.append,
+        )
+
+    assert fetches == 3
+    assert sleeps == [5.0, 5.0]
+
+
 def test_market_report_keeps_retrying_after_old_ten_deadline(
     tmp_path: Path,
 ) -> None:
@@ -5892,6 +5964,7 @@ def test_staggered_planning_revisions_recover_remaining_account_component(
         api_factory=Api,
         quote_factory=Quote,
         account_factory=StaggeredSimulationAccount,
+        sleep_fn=lambda _seconds: None,
     )
     assert first.status == "generated"
     first_payload = json.loads(first.json_path.read_text(encoding="utf-8"))
@@ -5939,12 +6012,12 @@ def test_staggered_planning_revisions_recover_remaining_account_component(
     } == {
         "market": "complete",
         "simulated_account": "complete",
-        "real_account": "unavailable",
+        "real_account": "complete",
     }
     assert first_revision_component_bytes["market"] == first_component_bytes["market"]
-    assert first_revision_component_bytes["real_account"] == first_component_bytes["real_account"]
+    assert first_revision_component_bytes["real_account"] != first_component_bytes["real_account"]
     assert first_revision_payload["plan_availability"]["simulated_account"]["status"] == "available"
-    assert first_revision_payload["plan_availability"]["real_account"]["status"] == "unavailable"
+    assert first_revision_payload["plan_availability"]["real_account"]["status"] == "available"
 
     revised_twice = run_market_trend_report(
         config=cfg,
@@ -5973,7 +6046,7 @@ def test_staggered_planning_revisions_recover_remaining_account_component(
     }
     assert final_component_bytes["market"] == first_revision_component_bytes["market"]
     assert final_component_bytes["simulated_account"] == first_revision_component_bytes["simulated_account"]
-    assert final_component_bytes["real_account"] != first_revision_component_bytes["real_account"]
+    assert final_component_bytes["real_account"] == first_revision_component_bytes["real_account"]
     assert final_payload["plan_availability"]["simulated_account"]["status"] == "available"
     assert final_payload["plan_availability"]["real_account"]["status"] == "available"
     assert simulation_calls == 2

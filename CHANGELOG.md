@@ -3,6 +3,12 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-09-21
+
+- 同一生产故障的 dashboard 侧镜像修复：报告装载校验链与已修复的报告侧校验器存在同款缺陷——nominal「计划止损风险仅审计」报告在「存量计划止损风险超过组合风险限额且当日无新开仓（new_planned_risk=0）」时被 dashboard 判无效，报告在界面上缺失。现把 dashboard 两处站点与报告侧修复对齐为解耦语义：`_valid_current_trend_risk_contract` 删除「含最小一手额外风险/风险预算内」重标分支，改为现行名义仓位制版本调用 `valid_v4_risk_contract` 时传 `allow_audit_only_stop_risk=True`、按原始 summary 校验（非 nominal 调用不变）；`_valid_v2_risk_items` 溢出证据臂对 nominal 且标签为「计划止损风险仅审计」且 `new_planned_risk=0` 的组合放行（存量超限、无新开仓，算术一致性由其余臂照常核对），非 nominal 路径与 nominal+新开仓的既有溢出证据要求不变，执行链未动。验证：`make test TEST='tests/test_dashboard.py'` 全绿（326 通过，既有用例零修改）；新增 4 个用例——生产字面量（NAV=881117.726、存量 44972.966562742975983 > 限额 35244.70904、new=0）经 `_valid_trend_risk_summary`、`_valid_trend_report_payload` 与端到端装载全部接受（先红后绿）、非 nominal v8 伪造 audit-only 标签仍拒绝、nominal 超限带新开仓回归钉保持通过、nominal 超限 new=0 但剩余风险算术不一致拒绝。未做 live 调用、push 或部署。
+
+- 美股/A股/港股趋势报告修复：现行名义仓位制版本（US/HK v14、CN v17）在「存量计划止损风险超过组合风险限额」时，报告校验器 `validate_report_strategy_snapshot` 把「计划止损风险仅审计」标签强制重标为「含最小一手额外风险」（要求新开仓风险>0）或「风险预算内」，存量超限且当日无新开仓时两目标标签均不满足，必报「strategy snapshot does not match report actions」、生产自 2026-09-19 起每轮重试全败。现删除重标分支：风险契约校验器（v2/v3/v4）新增 `allow_audit_only_stop_risk` 开关（仅现行名义仓位制版本开启），nominal 仅审计报告按算术一致性校验——audit-only 标签原样过审，「存量超限 + 当日新名义买入」的设计内状态不再被拒；非现行版本校验保持严格，伪造 audit-only 标签仍被拒绝。同日报告入口（美股/港股 `run_market_trend_report` 与 A股 `run_a_share_trend_report`）的账户快照获取由「失败即空兜底、静默降级出报告」改为有界重试：最多 3 次尝试、间隔 5 秒（sleep 可注入），仍失败则向上抛 `AccountHttpError`（不再产出降级报告），内部快照获取站点不变。验证：`make test TEST='tests/test_a_share_trend.py tests/test_market_trend.py'` 全绿；新增用例（超限零开仓通过、超限带新开仓通过、限额内通过、非现行版本伪造拒绝、算术不一致拒绝、两入口重试成功/重试耗尽抛错）均先红后绿；受影响既有用例（编码已删除重标验收或空快照兜底）已按新语义更新并保持各自意图，无用例被弱化或跳过。未做 live 调用、push 或部署；Candidate Acceptance 由主代理负责。
+
 ## 2026-09-20
 
 - Issue 150: 健康监控现在区分「服务可达性」「N_LEG 功能暂停」「真实业务异常」。预测服务健康端点上报 `n_leg` 暂停契约时，健康检查改报独立的 PAUSED 状态（service/process/n_leg 通过，不读状态接口、不再伪造心跳/行情等业务失败项），通知以「⏸ 服务正常，多腿套利已暂停」一次性告知后保持静默（无 24h 提醒），暂停→运行不触发「已恢复」，`--once` 对 PAUSED 返回 0；检查中途切换暂停会复核 healthz 后归入 PAUSED，healthz 仍报运行中则按矛盾信号报 FAIL（两侧证据写入原因），未知 409 的重试与「服务不可达」折叠行为保持不变；日报将 PAUSED 记为「正常（多腿暂停）」且不计入异常次数。验证：`make test TEST='tests/test_prediction_arbitrage_health.py'` 全绿（既有用例零修改 + 新增 T1–T15 先红后绿）。未进行 live 调用、下单、push 或部署。
