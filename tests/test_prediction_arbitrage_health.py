@@ -823,3 +823,493 @@ def test_dashboard_url_line_only_when_configured() -> None:
     notifier = RecordingServiceNotifier()
     assert send_report(notifier, configured_report) is True
     assert notifier.messages[0][1].count("https://example.test/d") == 1
+
+
+# --- Issue 150: 健康监控区分 N_LEG 暂停与服务不可达 -----------------------------
+
+import email.message
+import io
+import json
+from urllib.error import HTTPError
+
+from open_trader.prediction_arbitrage_health import (
+    NLegPausedError,
+    _classify_state_http_error,
+)
+
+_STATE_URL = "http://127.0.0.1:8766/api/prediction-arbitrage/state"
+
+
+def _http_error(code: int, body: bytes) -> HTTPError:
+    return HTTPError(
+        _STATE_URL,
+        code,
+        "Conflict" if code == 409 else "Server Error",
+        email.message.Message(),
+        io.BytesIO(body),
+    )
+
+
+def test_classify_state_http_error_maps_only_known_pause_contract() -> None:
+    # 生产实测暂停契约（issue #150 票面 2026-09-20）。
+    paused = _http_error(409, b'{"error":"N_LEG_PAUSED","error_code":"N_LEG_PAUSED"}')
+    classified = _classify_state_http_error(paused)
+    assert isinstance(classified, NLegPausedError)
+    assert classified.error_code == "N_LEG_PAUSED"
+
+    other = _http_error(409, b'{"error_code":"OTHER"}')
+    assert _classify_state_http_error(other) is other
+
+    server = _http_error(500, b'{"error_code":"N_LEG_PAUSED"}')
+    assert _classify_state_http_error(server) is server
+
+    bad_body = _http_error(409, b"not-json")
+    assert _classify_state_http_error(bad_body) is bad_body
+
+
+def _paused_healthz(**overrides: object) -> dict[str, object]:
+    payload = _healthz_payload()
+    payload.update(overrides)
+    payload["n_leg"] = {"status": "paused", "code": "N_LEG_PAUSED"}
+    return payload
+
+
+def test_paused_healthz_reports_paused_without_state_fetch() -> None:
+    healthz = _paused_healthz()
+    state_calls = {"count": 0}
+    sleeps: list[float] = []
+
+    def fetch_state(_url: str, _timeout: float):
+        state_calls["count"] += 1
+        raise AssertionError("fetch_state must not be called while paused")
+
+    report = run_health_check(
+        url="http://127.0.0.1:8766",
+        fetch_state=fetch_state,
+        fetch_healthz=lambda *_args: dict(healthz),
+        sleep_fn=sleeps.append,
+    )
+
+    assert report.status == "PAUSED"
+    assert state_calls["count"] == 0
+    assert 30.0 not in sleeps
+    assert all(check.status != "FAIL" for check in report.checks)
+    checks = {check.name: check for check in report.checks}
+    assert checks["service"].status == "PASS"
+    assert checks["process"].status == "PASS"
+    assert checks["n_leg"].status == "PASS"
+    assert report.summary["pid"] == "42"
+    assert report.summary["sha"] == "abc"
+
+
+def test_paused_report_has_no_synthetic_state_checks() -> None:
+    healthz = _paused_healthz()
+    report = run_health_check(
+        url="http://127.0.0.1:8766",
+        fetch_state=lambda *_args: base_state(),
+        fetch_healthz=lambda *_args: dict(healthz),
+        sleep_fn=lambda _seconds: None,
+    )
+
+    assert report.status == "PAUSED"
+    forbidden = {
+        "state_status",
+        "websocket",
+        "thread",
+        "heartbeat",
+        "universe",
+        "breaker",
+        "cross_venue",
+        "universe_retry",
+        "relation_catalog",
+        "readiness",
+        "auto_eat",
+        "llm",
+        "endpoint",
+    }
+    names = {check.name for check in report.checks}
+    assert not (names & forbidden)
+
+
+def test_pause_signal_during_check_rechecks_healthz() -> None:
+    running = _healthz_payload()
+    paused = _paused_healthz()
+    healthz_payloads = [dict(running), dict(paused)]
+    healthz_calls = {"count": 0}
+    state_calls = {"count": 0}
+    sleeps: list[float] = []
+
+    def fetch_healthz(_url: str, _timeout: float):
+        healthz_calls["count"] += 1
+        return healthz_payloads.pop(0)
+
+    def fetch_state(_url: str, _timeout: float):
+        state_calls["count"] += 1
+        raise NLegPausedError("HTTP Error 409: Conflict: N_LEG_PAUSED", error_code="N_LEG_PAUSED")
+
+    report = run_health_check(
+        url="http://127.0.0.1:8766",
+        fetch_state=fetch_state,
+        fetch_healthz=fetch_healthz,
+        sleep_fn=sleeps.append,
+    )
+
+    assert report.status == "PAUSED"
+    assert state_calls["count"] == 1
+    assert healthz_calls["count"] == 2
+    assert 30.0 not in sleeps
+
+
+def test_contradictory_pause_signal_fails_with_both_evidences() -> None:
+    healthz = _healthz_payload()
+    healthz["n_leg"] = {"status": "running", "code": "N_LEG_RUNNING"}
+
+    report = run_health_check(
+        url="http://127.0.0.1:8766",
+        fetch_state=lambda *_args: (
+            _ for _ in ()
+        ).throw(NLegPausedError("HTTP Error 409: Conflict: N_LEG_PAUSED", error_code="N_LEG_PAUSED")),
+        fetch_healthz=lambda *_args: dict(healthz),
+        sleep_fn=lambda _seconds: None,
+    )
+
+    assert report.status == "FAIL"
+    checks = {check.name: check for check in report.checks}
+    assert checks["endpoint"].status == "PASS"
+    failing = [check for check in report.checks if check.status == "FAIL"]
+    assert failing
+    assert any(
+        "N_LEG_PAUSED" in check.reason and "n_leg" in check.reason for check in failing
+    )
+
+    notifier = RecordingNotifier()
+    assert send_report(notifier, report) is True
+    title, _body = notifier.messages[0]
+    assert title.startswith("❌ 预测套利异常")
+    assert "服务不可达" not in title
+
+
+def test_unknown_409_keeps_retry_and_fails_endpoint() -> None:
+    body = json.dumps({"error_code": "OTHER"}).encode("utf-8")
+    state_calls = {"count": 0}
+    sleeps: list[float] = []
+
+    def fetch_state(_url: str, _timeout: float):
+        state_calls["count"] += 1
+        raise _http_error(409, body)
+
+    report = run_health_check(
+        url="http://127.0.0.1:8766",
+        fetch_state=fetch_state,
+        fetch_healthz=lambda *_args: _healthz_payload(),
+        sleep_fn=sleeps.append,
+    )
+
+    assert report.status == "FAIL"
+    checks = {check.name: check for check in report.checks}
+    assert checks["endpoint"].status == "FAIL"
+    assert "409" in checks["endpoint"].reason
+    assert state_calls["count"] == 3
+    assert sleeps == [30.0, 30.0]
+
+
+def _run_paused_check() -> object:
+    healthz = _paused_healthz()
+    return run_health_check(
+        url="http://127.0.0.1:8766",
+        fetch_state=lambda *_args: base_state(),
+        fetch_healthz=lambda *_args: dict(healthz),
+        sleep_fn=lambda _seconds: None,
+    )
+
+
+def test_send_report_paused_uses_quiet_title_and_body() -> None:
+    report = _run_paused_check()
+    notifier = RecordingNotifier()
+
+    assert send_report(notifier, report) is True
+    assert len(notifier.messages) == 1
+    title, body = notifier.messages[0]
+    assert title.startswith("⏸ 预测套利：服务正常，多腿套利已暂停（")
+    assert title.endswith("）")
+    assert "PID 42" in body
+    for text in (title, body):
+        assert "不可达" not in text
+        assert "已恢复" not in text
+        assert "下单就绪" not in text
+
+
+def test_paused_report_formats_and_serializes() -> None:
+    report = _run_paused_check()
+
+    text = format_report(report)
+    assert "多腿套利已暂停" in text
+    assert "N_LEG_PAUSED" in text
+
+    data = report_to_dict(report)
+    assert data["status"] == "PAUSED"
+    assert json.dumps(data, ensure_ascii=False)
+
+
+def test_stable_pause_sends_once_then_stays_silent() -> None:
+    notifier = RecordingServiceNotifier()
+    paused_healthz = _paused_healthz()
+    state_calls = {"count": 0}
+
+    def fetch_state(_url: str, _timeout: float):
+        state_calls["count"] += 1
+        raise AssertionError("paused rounds must not fetch state")
+
+    # run_service_rounds 先休眠一个 interval 再开始第 1 轮，每轮结束后各休眠一次：
+    # 3 轮全暂停共 4 次 7200 秒休眠（与既有 outage 用例 rounds=3 的四个 7200 一致）。
+    sleeps = run_service_rounds(
+        notifier,
+        start=datetime(2026, 9, 9, 18, 24, tzinfo=UTC),  # 北京 02:24，全程无日报
+        rounds=3,
+        fetch_state=fetch_state,
+        fetch_healthz=lambda *_args: dict(paused_healthz),
+    )
+
+    assert len(notifier.messages) == 1
+    title, _body = notifier.messages[0]
+    assert title.startswith("⏸ 预测套利：服务正常，多腿套利已暂停（")
+    assert state_calls["count"] == 0
+    assert sleeps == [7200.0, 7200.0, 7200.0, 7200.0]
+    assert not any(
+        title.startswith(("❌", "✅")) for title, _body in notifier.messages
+    )
+
+
+def test_running_pause_running_sends_single_pause_notice() -> None:
+    notifier = RecordingServiceNotifier()
+    running = _healthz_payload()
+    paused = _paused_healthz()
+    healthz_payloads = [dict(running), dict(paused), dict(running)]
+
+    run_service_rounds(
+        notifier,
+        start=datetime(2026, 9, 9, 18, 24, tzinfo=UTC),  # 北京 02:24，全程无日报
+        rounds=3,
+        fetch_state=lambda *_args: base_state(),
+        fetch_healthz=lambda *_args: healthz_payloads.pop(0),
+    )
+
+    assert len(notifier.messages) == 1
+    assert notifier.messages[0][0].startswith("⏸ 预测套利：服务正常，多腿套利已暂停（")
+    assert not any("已恢复" in title for title, _body in notifier.messages)
+
+
+def test_outage_then_stable_pause_sends_folded_then_pause() -> None:
+    notifier = RecordingServiceNotifier()
+    running = _healthz_payload()
+    paused = _paused_healthz()
+    healthz_payloads = [dict(running), dict(paused), dict(paused)]
+
+    run_service_rounds(
+        notifier,
+        start=datetime(2026, 9, 9, 18, 24, tzinfo=UTC),  # 北京 02:24，全程无日报
+        rounds=3,
+        fetch_state=lambda *_args: (_ for _ in ()).throw(TimeoutError("timed out")),
+        fetch_healthz=lambda *_args: healthz_payloads.pop(0),
+    )
+
+    assert len(notifier.messages) == 2
+    assert notifier.messages[0][0].startswith("❌ 预测套利：服务不可达（")
+    assert notifier.messages[1][0].startswith("⏸ 预测套利：服务正常，多腿套利已暂停（")
+    assert not any("已恢复" in title for title, _body in notifier.messages)
+
+
+def test_outage_pause_running_absorbs_recovery() -> None:
+    notifier = RecordingServiceNotifier()
+    running = _healthz_payload()
+    paused = _paused_healthz()
+    healthz_payloads = [dict(running), dict(paused), dict(running)]
+    state_calls = {"count": 0}
+
+    def fetch_state(_url: str, _timeout: float):
+        state_calls["count"] += 1
+        if state_calls["count"] <= 3:  # first round: 3 timeout attempts
+            raise TimeoutError("timed out")
+        return base_state()
+
+    run_service_rounds(
+        notifier,
+        start=datetime(2026, 9, 9, 18, 24, tzinfo=UTC),  # 北京 02:24，全程无日报
+        rounds=3,
+        fetch_state=fetch_state,
+        fetch_healthz=lambda *_args: healthz_payloads.pop(0),
+    )
+
+    assert len(notifier.messages) == 2
+    assert notifier.messages[0][0].startswith("❌ 预测套利：服务不可达（")
+    assert notifier.messages[1][0].startswith("⏸ 预测套利：服务正常，多腿套利已暂停（")
+    assert not any("已恢复" in title for title, _body in notifier.messages)
+
+
+def test_paused_daily_summary_counts_zero_abnormal() -> None:
+    notifier = RecordingServiceNotifier()
+    paused_healthz = _paused_healthz(pid=4242, sha=_LONG_SHA)
+
+    run_service_rounds(
+        notifier,
+        start=datetime(2026, 9, 9, 15, 0, tzinfo=UTC),  # 北京 2026-09-09 23:00
+        rounds=6,
+        fetch_state=lambda *_args: base_state(),
+        fetch_healthz=lambda *_args: dict(paused_healthz),
+    )
+
+    daily = [
+        message
+        for message in notifier.messages
+        if message[0].startswith("📋 预测套利日报")
+    ]
+    assert len(daily) == 1
+    assert "异常 0 次" in daily[0][0]
+    assert "正常（多腿暂停）" in daily[0][0]
+
+
+def test_once_mode_paused_returns_zero_with_single_notice() -> None:
+    notifier = RecordingServiceNotifier()
+    paused_healthz = _paused_healthz()
+
+    code = run_service(
+        notifier,
+        url="http://127.0.0.1:8766",
+        interval_seconds=7200.0,
+        once=True,
+        fetch_state=lambda *_args: base_state(),
+        fetch_healthz=lambda *_args: dict(paused_healthz),
+        now_fn=lambda: datetime(2026, 9, 10, 1, 0, tzinfo=UTC),
+        sleep_fn=lambda _seconds: None,
+    )
+
+    assert code == 0
+    assert len(notifier.messages) == 1
+    assert notifier.messages[0][0].startswith("⏸ 预测套利：服务正常，多腿套利已暂停（")
+
+
+class FlakyPauseNotifier:
+    """Recording notifier whose pause notice fails the first `fail_times` deliveries."""
+
+    def __init__(self, fail_times: int) -> None:
+        self.messages: list[tuple[str, str]] = []
+        self.pause_failures = 0
+        self._fail_times = fail_times
+
+    def notify(self, title: str, message: str) -> None:
+        if (
+            title.startswith("⏸ 预测套利：服务正常，多腿套利已暂停（")
+            and self._fail_times > 0
+        ):
+            self._fail_times -= 1
+            self.pause_failures += 1
+            raise RuntimeError("feishu transient outage")
+        self.messages.append((title, message))
+
+
+def test_pause_notice_delivery_failure_retries_next_round() -> None:
+    # 验收标准 5：暂停通知投递失败时 last_signature 不更新，下一轮重试；
+    # 成功后持续暂停静默。
+    notifier = FlakyPauseNotifier(fail_times=1)
+    paused_healthz = _paused_healthz()
+
+    def fetch_state(_url: str, _timeout: float):
+        raise AssertionError("paused rounds must not fetch state")
+
+    run_service_rounds(
+        notifier,
+        start=datetime(2026, 9, 9, 18, 24, tzinfo=UTC),  # 北京 02:24，全程无日报
+        rounds=3,
+        fetch_state=fetch_state,
+        fetch_healthz=lambda *_args: dict(paused_healthz),
+    )
+
+    # 第 1 轮投递失败被记录，第 2 轮重试成功恰好补发 1 条，第 3 轮保持静默。
+    assert notifier.pause_failures == 1
+    assert len(notifier.messages) == 1
+    title, _body = notifier.messages[0]
+    assert title.startswith("⏸ 预测套利：服务正常，多腿套利已暂停（")
+    assert not any(
+        title.startswith(("❌", "✅")) for title, _body in notifier.messages
+    )
+
+
+def test_pause_signal_recheck_transport_failure_fails_with_evidence() -> None:
+    # 验收标准 3 第三子句：state 抛 N_LEG_PAUSED 后 healthz 复核传输失败
+    # → FAIL 且证据双侧可见（state 收到 N_LEG_PAUSED + 复核失败原因），
+    # endpoint 不折叠为「服务不可达」。
+    running = _healthz_payload()
+    healthz_calls = {"count": 0}
+    sleeps: list[float] = []
+
+    def fetch_healthz(_url: str, _timeout: float):
+        healthz_calls["count"] += 1
+        if healthz_calls["count"] == 1:
+            return dict(running)
+        raise TimeoutError("healthz recheck timed out")
+
+    report = run_health_check(
+        url="http://127.0.0.1:8766",
+        fetch_state=lambda *_args: (
+            _ for _ in ()
+        ).throw(NLegPausedError("N_LEG_PAUSED", error_code="N_LEG_PAUSED")),
+        fetch_healthz=fetch_healthz,
+        sleep_fn=sleeps.append,
+    )
+
+    assert report.status == "FAIL"
+    checks = {check.name: check for check in report.checks}
+    assert checks["endpoint"].status == "PASS"
+    assert checks["service"].status == "FAIL"
+    assert checks["state_status"].status == "FAIL"
+    assert "N_LEG_PAUSED" in checks["state_status"].reason
+    assert "TimeoutError" in checks["state_status"].reason
+    assert "healthz recheck timed out" in checks["state_status"].reason
+    # 复核走完整传输重试：3 次尝试、间隔 30 秒。
+    assert healthz_calls["count"] == 4
+    assert sleeps == [30.0, 30.0]
+
+    notifier = RecordingNotifier()
+    assert send_report(notifier, report) is True
+    title, _body = notifier.messages[0]
+    assert title.startswith("❌ 预测套利异常")
+    assert "服务不可达" not in title
+
+
+def test_pause_signal_recheck_identity_mismatch_fails_with_evidence() -> None:
+    # 验收标准 3 第三子句：state 抛 N_LEG_PAUSED 后 healthz 复核身份无效
+    # （mode=shadow）→ FAIL，service 失败原因为身份校验，state_status
+    # 仍携带 N_LEG_PAUSED 证据。
+    running = _healthz_payload()
+    shadow = _healthz_payload()
+    shadow["mode"] = "shadow"
+    healthz_payloads = [dict(running), dict(shadow)]
+    sleeps: list[float] = []
+
+    def fetch_healthz(_url: str, _timeout: float):
+        return healthz_payloads.pop(0)
+
+    report = run_health_check(
+        url="http://127.0.0.1:8766",
+        fetch_state=lambda *_args: (
+            _ for _ in ()
+        ).throw(NLegPausedError("N_LEG_PAUSED", error_code="N_LEG_PAUSED")),
+        fetch_healthz=fetch_healthz,
+        sleep_fn=sleeps.append,
+    )
+
+    assert report.status == "FAIL"
+    checks = {check.name: check for check in report.checks}
+    assert checks["service"].status == "FAIL"
+    assert checks["service"].reason == "health mode mismatch"
+    assert checks["state_status"].status == "FAIL"
+    assert "N_LEG_PAUSED" in checks["state_status"].reason
+    assert "health mode mismatch" in checks["state_status"].reason
+    # 复核载荷返回成功（无传输错误），不触发重试休眠。
+    assert sleeps == []
+
+    notifier = RecordingNotifier()
+    assert send_report(notifier, report) is True
+    title, _body = notifier.messages[0]
+    assert title.startswith("❌ 预测套利异常")
+    assert "服务不可达" not in title

@@ -12,7 +12,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, time as datetime_time, timedelta
 from pathlib import Path
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
@@ -31,7 +31,12 @@ FLAPPING_WINDOW_SECONDS = 60 * 60
 FLAPPING_MAX_CHANGE_SENDS = 2
 DAILY_SUMMARY_AFTER_CLOCK = datetime_time(9, 30)
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
-_SUMMARY_STATUS_ZH = {"PASS": "正常", "WARN": "有警告", "FAIL": "异常"}
+_SUMMARY_STATUS_ZH = {
+    "PASS": "正常",
+    "WARN": "有警告",
+    "FAIL": "异常",
+    "PAUSED": "正常（多腿暂停）",
+}
 _STATE_PATH = "api/prediction-arbitrage/state"
 _HEALTHZ_PATH = "healthz"
 PREDICTION_SERVICE_HEALTH_SCHEMA = "open_trader.prediction_service.health.v1"
@@ -54,6 +59,7 @@ _CHECK_LABELS_ZH = {
     "process": "进程",
     "notify": "通知配置",
     "thread": "监控线程",
+    "n_leg": "多腿套利",
 }
 
 _STATUS_VALUE_ZH = {
@@ -127,10 +133,43 @@ def _age(timestamp: object) -> float | None:
     return max((datetime.now(UTC) - parsed.astimezone(UTC)).total_seconds(), 0.0)
 
 
+class NLegPausedError(Exception):
+    """The state endpoint answered the known N_LEG pause contract (409)."""
+
+    def __init__(self, message: str, *, error_code: str) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+
+
+N_LEG_PAUSED_CODE = "N_LEG_PAUSED"
+
+
+def _classify_state_http_error(exc: HTTPError) -> Exception:
+    """Map the well-known N_LEG pause contract to a domain signal.
+
+    Only a 409 whose JSON body carries ``error_code == "N_LEG_PAUSED"`` is the
+    pause contract; every other HTTP error (unknown 409 bodies, other status
+    codes, undecodable bodies) is returned unchanged.
+    """
+
+    if exc.code != 409:
+        return exc
+    try:
+        payload = json.loads(exc.read().decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return exc
+    if isinstance(payload, Mapping) and payload.get("error_code") == N_LEG_PAUSED_CODE:
+        return NLegPausedError(f"{exc}: {N_LEG_PAUSED_CODE}", error_code=N_LEG_PAUSED_CODE)
+    return exc
+
+
 def _fetch_state(url: str, timeout: float) -> Mapping[str, object]:
     request = Request(f"{url.rstrip('/')}/{_STATE_PATH}", headers={"User-Agent": "OpenTrader/1.0"})
-    with urlopen(request, timeout=timeout) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        raise _classify_state_http_error(exc) from exc
     if not isinstance(payload, Mapping):
         raise ValueError("state payload must be an object")
     return payload
@@ -160,6 +199,9 @@ def _fetch_with_retry(
     for attempt in range(attempts):
         try:
             return fetch(url, timeout)
+        except NLegPausedError:
+            # A known pause signal is not a transport fault: never retry it.
+            raise
         except Exception as exc:
             last_exc = exc
             if attempt + 1 < attempts:
@@ -214,6 +256,123 @@ def validate_frontend_gateway_health(payload: object) -> tuple[bool, str]:
     return True, ""
 
 
+def _n_leg_paused(healthz: Mapping[str, object]) -> bool:
+    """True only for the explicit healthz pause contract.
+
+    A missing or malformed ``n_leg`` field means running, so older payloads
+    keep the existing behavior.
+    """
+
+    n_leg = _mapping(healthz.get("n_leg"))
+    return n_leg.get("status") == "paused" and n_leg.get("code") == N_LEG_PAUSED_CODE
+
+
+def _paused_report(
+    *,
+    url: str,
+    healthz: Mapping[str, object],
+    notify_configured: bool,
+    dashboard_url: str,
+) -> HealthReport:
+    """Build the PAUSED report: service alive, feature paused, nothing else."""
+
+    pid_value = healthz.get("pid")
+    pid = str(pid_value) if type(pid_value) is int and pid_value > 0 else "未知"
+    sha = str(healthz.get("git_sha") or "unknown")
+    checks = [
+        Check(name="service", status="PASS", value=url),
+        Check(name="process", status="PASS", value=f"pid={pid} sha={sha}"),
+        Check(name="n_leg", status="PASS", value=N_LEG_PAUSED_CODE),
+    ]
+    if not notify_configured:
+        checks.append(Check(name="notify", status="WARN", reason="飞书通知未配置"))
+    return HealthReport(
+        status="PAUSED",
+        checks=tuple(checks),
+        url=url,
+        dashboard_url=dashboard_url,
+        summary={"pid": pid, "sha": sha, "n_leg_paused": True},
+    )
+
+
+def _resolve_paused_signal(
+    *,
+    url: str,
+    exc: NLegPausedError,
+    fetch_healthz: Callable[[str, float], Mapping[str, object]],
+    timeout: float,
+    sleep_fn: Callable[[float], None],
+    notify_configured: bool,
+    dashboard_url: str,
+) -> HealthReport:
+    """Resolve a pause signal that arrived while the service looked running.
+
+    The state endpoint answered the well-formed pause contract, so the service
+    is reachable; recheck healthz once to confirm the service actually paused.
+    """
+
+    checks: list[Check] = []
+
+    def add(name: str, status: str, value: str = "", reason: str = "") -> None:
+        checks.append(Check(name=name, status=status, value=value, reason=reason))
+
+    add("endpoint", "PASS", value=url)
+    try:
+        recheck_payload = _fetch_with_retry(
+            fetch_healthz, url, timeout, sleep_fn=sleep_fn
+        )
+    except Exception as recheck_exc:
+        healthz_ok = False
+        healthz_reason = f"healthz 复核失败：{type(recheck_exc).__name__}: {recheck_exc}"
+        healthz: Mapping[str, object] = {}
+    else:
+        healthz_ok, healthz_reason = validate_prediction_service_health(recheck_payload)
+        healthz = _mapping(recheck_payload)
+        if healthz_ok and _n_leg_paused(healthz):
+            return _paused_report(
+                url=url,
+                healthz=healthz,
+                notify_configured=notify_configured,
+                dashboard_url=dashboard_url,
+            )
+    pid_value = healthz.get("pid")
+    pid = str(pid_value) if type(pid_value) is int and pid_value > 0 else "未知"
+    sha = str(healthz.get("git_sha") or "unknown")
+    add(
+        "service",
+        "PASS" if healthz_ok else "FAIL",
+        value=url,
+        reason="" if healthz_ok else (healthz_reason or "预测服务身份不可用"),
+    )
+    if healthz_ok:
+        add("process", "PASS", value=f"pid={pid} sha={sha}")
+        add(
+            "state_status",
+            "FAIL",
+            value="paused",
+            reason=(
+                f"state 返回 N_LEG_PAUSED（{exc}），但 healthz n_leg=running：暂停信号矛盾"
+            ),
+        )
+    else:
+        add("process", "FAIL", reason=healthz_reason or "预测服务身份不可用")
+        add(
+            "state_status",
+            "FAIL",
+            value="paused",
+            reason=f"state 收到 N_LEG_PAUSED 409，{healthz_reason}",
+        )
+    if not notify_configured:
+        add("notify", "WARN", reason="飞书通知未配置")
+    return HealthReport(
+        status="FAIL",
+        checks=tuple(checks),
+        url=url,
+        dashboard_url=dashboard_url,
+        summary={"pid": pid, "sha": sha},
+    )
+
+
 def run_health_check(
     *,
     url: str,
@@ -232,7 +391,35 @@ def run_health_check(
         checks.append(Check(name=name, status=status, value=value, reason=reason))
 
     try:
+        healthz_payload = _fetch_with_retry(
+            fetch_healthz, url, timeout, sleep_fn=sleep_fn
+        )
+    except Exception:
+        healthz_payload = {}
+    healthz = _mapping(healthz_payload)
+    healthz_ok, healthz_reason = validate_prediction_service_health(healthz_payload)
+
+    if healthz_ok and _n_leg_paused(healthz):
+        return _paused_report(
+            url=url,
+            healthz=healthz,
+            notify_configured=notify_configured,
+            dashboard_url=dashboard_url,
+        )
+
+    try:
         payload = _fetch_with_retry(fetch_state, url, timeout, sleep_fn=sleep_fn)
+    except NLegPausedError as exc:
+        # The pause contract arrived mid-check: confirm against healthz.
+        return _resolve_paused_signal(
+            url=url,
+            exc=exc,
+            fetch_healthz=fetch_healthz,
+            timeout=timeout,
+            sleep_fn=sleep_fn,
+            notify_configured=notify_configured,
+            dashboard_url=dashboard_url,
+        )
     except Exception as exc:
         payload = {}
         add("endpoint", "FAIL", value=url, reason=f"{type(exc).__name__}: {exc}")
@@ -253,14 +440,6 @@ def run_health_check(
         add("thread", "FAIL", reason="监控线程已停止重启")
     else:
         add("thread", "FAIL", reason="监控线程状态缺失")
-    try:
-        healthz_payload = _fetch_with_retry(
-            fetch_healthz, url, timeout, sleep_fn=sleep_fn
-        )
-    except Exception:
-        healthz_payload = {}
-    healthz = _mapping(healthz_payload)
-    healthz_ok, healthz_reason = validate_prediction_service_health(healthz_payload)
     add(
         "service",
         "PASS" if healthz_ok else "FAIL",
@@ -434,6 +613,13 @@ def format_report(report: HealthReport) -> str:
     summary = report.summary
     heartbeat_age = summary.get("heartbeat_age")
     universe_age = summary.get("universe_age")
+    if report.status == "PAUSED":
+        return "\n".join(
+            (
+                f"多腿套利已暂停（{N_LEG_PAUSED_CODE}） · 服务运行正常",
+                f"PID {summary.get('pid')} · 版本 {_sha7(summary.get('sha'))}",
+            )
+        )
     if report.status == "PASS":
         return "\n".join(
             (
@@ -485,6 +671,8 @@ def send_report(notifier: object, report: HealthReport) -> bool:
     summary = report.summary
     if report.status == "PASS":
         title = f"✅ 预测套利正常（{clock}）"
+    elif report.status == "PAUSED":
+        title = f"⏸ 预测套利：服务正常，多腿套利已暂停（{clock}）"
     elif _endpoint_failed(report):
         # The state endpoint itself is unreachable: fold the notification to
         # the root cause instead of enumerating the dependent check failures.
@@ -596,7 +784,9 @@ def run_service(
                 if not send_report(notifier, report):
                     _log(f"feishu delivery failed status={report.status}")
             else:
-                check_history.append((moment, report.status != "PASS"))
+                check_history.append(
+                    (moment, report.status not in {"PASS", "PAUSED"})
+                )
                 while (
                     check_history
                     and moment - check_history[0][0]
@@ -663,6 +853,22 @@ def run_service(
                             recovery_pending = True
                     elif not recovery_pending:
                         non_pass_since = None
+                elif report.status == "PAUSED":
+                    # Pausing is an expected operator state, not a failure:
+                    # absorb any pending recovery machinery, announce the
+                    # transition once, and stay silent afterwards (no 24h
+                    # reminder, and the next PASS must not send 已恢复).
+                    non_pass_since = None
+                    recovery_pending = False
+                    if signature != last_signature:
+                        if send_report(notifier, report):
+                            last_signature = signature
+                            last_sent_status = report.status
+                            last_sent_at = moment
+                        else:
+                            # Signature stays stale so the next round retries
+                            # the pause notification.
+                            _log(f"feishu delivery failed status={report.status}")
                 else:
                     if recovery_pending:
                         # A newer non-PASS stretch started before the pending
@@ -704,7 +910,11 @@ def run_service(
                         else:
                             last_sent_at = moment
         if once:
-            return 0 if report.status == "PASS" else (1 if report.status == "WARN" else 2)
+            return (
+                0
+                if report.status in {"PASS", "PAUSED"}
+                else (1 if report.status == "WARN" else 2)
+            )
         sleep_fn(interval_seconds)
 
 
@@ -744,7 +954,11 @@ def main(argv: list[str] | None = None) -> int:
         if not args.no_notify and not isinstance(notifier, NullNotifier):
             if not send_report(notifier, report):
                 _log(f"feishu delivery failed status={report.status}")
-        return 0 if report.status == "PASS" else (1 if report.status == "WARN" else 2)
+        return (
+            0
+            if report.status in {"PASS", "PAUSED"}
+            else (1 if report.status == "WARN" else 2)
+        )
     return run_service(
         notifier,
         url=args.url,
