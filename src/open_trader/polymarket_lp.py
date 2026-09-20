@@ -8286,6 +8286,28 @@ class PolymarketLPService:
                     result.append(order_id)
         return result
 
+    @staticmethod
+    def _episode_canceled_remaining(
+        target_remaining: object, canceled_order_ids: list[str]
+    ) -> Decimal | None:
+        """Sum persisted cancel-time remaining over the episode's canceled set.
+
+        Any canceled order without a persisted numeric remaining (unknown at
+        request time, or persisted by an older build) makes the whole total
+        UNKNOWN instead of under-reporting a partial sum (issue 152 review
+        fix).
+        """
+
+        if not isinstance(target_remaining, Mapping):
+            return None if canceled_order_ids else Decimal("0")
+        total = Decimal("0")
+        for order_id in canceled_order_ids:
+            remaining = _maybe_decimal(target_remaining.get(str(order_id)))
+            if remaining is None:
+                return None
+            total += remaining
+        return total
+
     def _request_protection_cancel(
         self,
         session: Mapping[str, object],
@@ -8382,6 +8404,29 @@ class PolymarketLPService:
             protection.get("cancel_targets"), targets
         )
 
+        # Issue 152 review fix: persist every target's cancel-time remaining
+        # at request (intent) time, whether or not this batch's cancel is
+        # later acknowledged, so an order the venue cancels without our
+        # acknowledgment still reports its share in the episode total. A
+        # target without a readable remaining persists as None (UNKNOWN),
+        # never 0. First write wins: retries never overwrite an earlier
+        # batch's persisted value.
+        persisted_remaining: dict[str, object] = {}
+        raw_remaining = protection.get("cancel_target_remaining")
+        if isinstance(raw_remaining, Mapping):
+            for key, value in raw_remaining.items():
+                order_id = str(key or "")
+                if order_id:
+                    persisted_remaining[order_id] = value
+        for order_id in targets:
+            if order_id in persisted_remaining:
+                continue
+            row = rows_by_id.get(order_id)
+            remaining = self._queue_row_remaining(row) if row is not None else None
+            persisted_remaining[order_id] = (
+                None if remaining is None else str(remaining)
+            )
+
         action_key = f"{session_id}:entry-protection-cancel:{entry_order_id}"
         intent_payload: dict[str, object] = {
             "role": "entry-protection-cancel",
@@ -8390,6 +8435,7 @@ class PolymarketLPService:
             "reason": reason,
             "ratio": updated.get("ratio"),
             "data_time": updated.get("data_time"),
+            "cancel_target_remaining": persisted_remaining,
         }
         self.store.lp_upsert_action(
             session_id, action_key, state="pending", payload=intent_payload
@@ -8423,27 +8469,22 @@ class PolymarketLPService:
                 session_id, action_key, state="accepted", payload=receipt_payload
             )
 
-        # Cancel-time remaining is accumulated per newly acknowledged order
-        # (the remaining size of the row the cancel request was issued
-        # against), never re-derived from post-cancel reads.
-        episode_remaining = (
-            _maybe_decimal(protection.get("canceled_remaining")) or Decimal("0")
-        )
-        for order_id in canceled:
-            row = rows_by_id.get(order_id)
-            if row is None:
-                continue
-            remaining = self._queue_row_remaining(row)
-            if remaining is not None:
-                episode_remaining += remaining
+        # Cancel-time remaining is summed from the per-target values
+        # persisted at request time over every order in the episode's
+        # canceled set (acknowledged or receipt-proved), never re-derived
+        # from post-cancel reads.
         episode_canceled = self._merge_order_id_lists(
             protection.get("canceled_order_ids"), canceled
+        )
+        episode_remaining = self._episode_canceled_remaining(
+            persisted_remaining, episode_canceled
         )
 
         updated["state"] = "canceling"
         updated["cancel_reason"] = reason
         updated["cancel_targets"] = episode_targets
         updated["cancel_failed"] = failed
+        updated["cancel_target_remaining"] = persisted_remaining
         updated["canceled_order_ids"] = episode_canceled
         updated["canceled_remaining"] = episode_remaining
         updated["cancel_requested_at"] = _iso(self._now())
@@ -8553,6 +8594,13 @@ class PolymarketLPService:
                 updated.get("canceled_order_ids"), receipt_canceled
             )
             updated["canceled_order_ids"] = canceled
+            # Issue 152 review fix: report the total from the per-target
+            # cancel-time remaining persisted at request time, so orders the
+            # venue canceled without our acknowledgment keep their share
+            # instead of fabricating 0.
+            updated["canceled_remaining"] = self._episode_canceled_remaining(
+                updated.get("cancel_target_remaining"), canceled
+            )
             manual_count = sum(
                 1 for order_id in canceled if order_id != entry_order_id
             )

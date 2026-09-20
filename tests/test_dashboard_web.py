@@ -21607,6 +21607,70 @@ console.log(JSON.stringify({
     }
 
 
+def test_lp_queue_protection_unknown_remaining_renders_unknown(tmp_path) -> None:
+    """R9/R10(UI): 已撤/部分成交副行读到的 canceled_remaining=null（UNKNOWN）时
+    显示「合计余量 UNKNOWN 份」，不得借 Number(null)=0 虚构「合计余量 0 份」。"""
+    output = run_dashboard_js(r'''
+const checkedAt = "2026-09-20T04:00:00Z";
+const dataTime = "2026-09-20T04:00:03Z";
+const row = (orderId, conditionId, extra) => ({
+  order_id: orderId, condition_id: conditionId, token_id: "token-" + orderId,
+  market_title: "Queue market " + conditionId,
+  market_url: "https://polymarket.com/event/" + conditionId,
+  outcome: "YES", side: "BUY", status: "LIVE", price: "0.30",
+  quantity: "2000", filled_quantity: "0", remaining_quantity: "0",
+  state: "open", management: "manual_read_only", read_only: true,
+  scoring_status: "true", anchor: true, ...extra,
+});
+const canceledRow = row("entry-1", "condition-unknown-remaining", {
+  queue_protection: {
+    state: "canceled", threshold: "0.5", ratio: "0.25",
+    reason_codes: [], data_time: dataTime,
+    cancel_targets: ["entry-1", "manual-2"],
+    canceled_order_ids: ["entry-1", "manual-2"],
+    canceled_remaining: null,
+  },
+});
+const partialRow = row("entry-3", "condition-partial-unknown", {
+  queue_protection: {
+    state: "partially_filled", threshold: "0.5", ratio: "0.30",
+    reason_codes: [], data_time: dataTime,
+    partially_filled_quantity: "300",
+    cancel_targets: ["entry-3"], canceled_order_ids: ["entry-3"],
+    canceled_remaining: null,
+  },
+});
+const dashboard = {
+  state: "ready", stale: false, checked_at: checkedAt, last_success_at: checkedAt,
+  orders: [], positions: [],
+  lp_orders_today: [canceledRow, partialRow],
+  non_lp_row_count: 0, market_rewards: [], lp_observations: {},
+};
+const html = predictionLpCard({lp_dashboard: dashboard});
+const orderTable = (html.match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
+const marketRow = (title) => {
+  const start = orderTable.indexOf(title);
+  const end = orderTable.indexOf("</tr>", start);
+  return orderTable.slice(start, end);
+};
+const canceled = marketRow("Queue market condition-unknown-remaining");
+const partial = marketRow("Queue market condition-partial-unknown");
+console.log(JSON.stringify({
+  canceledUnknown: canceled.includes("合计余量 UNKNOWN 份"),
+  canceledNoZero: !canceled.includes("合计余量 0 份"),
+  partialUnknown: partial.includes("已撤余量 UNKNOWN"),
+  partialNoZero: !partial.includes("已撤余量 0"),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered == {
+        "canceledUnknown": True,
+        "canceledNoZero": True,
+        "partialUnknown": True,
+        "partialNoZero": True,
+    }
+
+
 def test_lp_queue_protection_styles_shipped() -> None:
     """T25(视觉): dashboard.css 携带保护副行与 chip 样式，值与批准 mock 一致。"""
     css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")

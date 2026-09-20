@@ -3675,6 +3675,10 @@ function lpDashboardTodayQueueProtectionRow(orders) {
       : targetIds ? targetIds.length : null;
     const persistedRemaining = Number(summary.canceled_remaining);
     const hasPersistedRemaining = Number.isFinite(persistedRemaining);
+    // Issue 152 review: canceled_remaining=null means the episode total is
+    // UNKNOWN (some target had no readable cancel-time remaining); render
+    // UNKNOWN instead of letting Number(null)=0 fabricate a 0 total.
+    const remainingUnknown = summary.canceled_remaining === null;
     const ratioHead = ratioText === "UNKNOWN"
       ? "A UNKNOWN"
       : "A " + escapeHtml(ratioText) + "%";
@@ -3696,7 +3700,9 @@ function lpDashboardTodayQueueProtectionRow(orders) {
     } else if (state === "canceled") {
       const count = persistedCount ?? targetCount;
       const manual = Math.max(count - 1, 0);
-      const remainValue = hasPersistedRemaining ? persistedRemaining : remaining;
+      const remainValue = remainingUnknown
+        ? "UNKNOWN"
+        : (hasPersistedRemaining ? persistedRemaining : remaining);
       data = ratioHead + " 已触发 · "
         + escapeHtml(String(count)) + " 张全撤成功（含 " + escapeHtml(String(manual))
         + " 张手动）· 合计余量 " + escapeHtml(formatDisplayNumber(String(remainValue)))
@@ -3706,7 +3712,9 @@ function lpDashboardTodayQueueProtectionRow(orders) {
       const filledText = Number.isFinite(filled) && filled > 0
         ? formatDisplayNumber(String(filled))
         : "UNKNOWN";
-      const remainValue = hasPersistedRemaining ? persistedRemaining : remaining;
+      const remainValue = remainingUnknown
+        ? "UNKNOWN"
+        : (hasPersistedRemaining ? persistedRemaining : remaining);
       data = "已成交 " + escapeHtml(filledText) + " / 已撤余量 "
         + escapeHtml(formatDisplayNumber(String(remainValue))) + " · 不补买 · "
         + escapeHtml(clock);

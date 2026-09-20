@@ -6727,8 +6727,9 @@ def test_queue_protection_retry_success_notifies_full_episode_once(tmp_path) -> 
 def test_queue_protection_converge_keeps_fill_and_cancel_remaining_apart(
     tmp_path,
 ) -> None:
-    """R6(F2): 部分成交（filled=300）收敛：通知合计余量=撤单时点余量 2000，
-    不把成交量 300 冒充撤单余量；持久化中 300（已成交）与 2000（已撤余量）分列。"""
+    """R6(F2): 部分成交（filled=300）收敛：通知合计余量=各单撤单时点余量之和
+    2000+1000=3000（review fix 口径：manual-2 回执撤但未获确认也按请求时点余量计），
+    不把成交量 300 冒充撤单余量；持久化中 300（已成交）与 3000（已撤余量）分列。"""
     now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
     token_id = "0x" + "1" * 64
     store, exchange, service, started = _queue_running_service(
@@ -6789,10 +6790,162 @@ def test_queue_protection_converge_keeps_fill_and_cancel_remaining_apart(
     protection = final["queue_protection"]
     assert protection["state"] == "partially_filled"
     assert Decimal(str(protection["partially_filled_quantity"])) == Decimal("300")
-    assert Decimal(str(protection["canceled_remaining"])) == Decimal("2000")
+    assert Decimal(str(protection["canceled_remaining"])) == Decimal("3000")
     assert len(notifications) == 1
     title, message, xiaoai = notifications[0]
     assert title == "LP 位置保护撤单"
-    assert "已撤 2 张买单合计余量 2000 份" in message
-    assert "合计余量 300" not in message
+    assert "已撤 2 张买单合计余量 3000 份" in message
+    assert "合计余量 300 份" not in message
+    assert xiaoai == "LP 位置保护撤单，2 张买单已撤"
+
+
+def test_queue_protection_unknown_request_time_remaining_reports_unknown_total(
+    tmp_path,
+) -> None:
+    """R10: 某 target 在请求时点取不到余量（rows 缺 remaining 字段）→ 持久化 null
+    （UNKNOWN，不记 0）；撤单未获确认、下一 tick 回执收敛后通知
+    「合计余量 UNKNOWN 份」，不出现「0 份」也不部分求和冒充全量。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _queue_outage_service(
+        tmp_path, now, key="lp-queue-r10"
+    )
+    notifications: list[tuple[str, str, str]] = []
+    service.set_protection_notifier(
+        lambda title, message, xiaoai: notifications.append((title, message, xiaoai))
+    )
+    entry_id = "order-1"
+    token_id = "0x" + "1" * 64
+
+    exchange.snapshot_value = None
+    exchange.snapshots = []
+    exchange.snapshot_calls = 0
+    for expected in range(1, 10):
+        result = service.tick()
+        assert Decimal(str(result["queue_protection"]["data_failures"])) == expected
+        assert exchange.cancels == []
+
+    # 第 10 次断联 → 保守撤；新账户读取里 manual-2 的行缺任何 remaining 字段。
+    exchange.account_open_orders = [
+        _queue_receipt(entry_id),
+        {
+            "order_id": "manual-2",
+            "token_id": token_id,
+            "side": "BUY",
+            "status": "LIVE",
+            "price": Decimal("0.30"),
+        },
+    ]
+    exchange.cancel_responses = [
+        {"not_canceled": {entry_id: "venue_busy"}},
+        {"not_canceled": {"manual-2": "venue_busy"}},
+    ]
+    conservative = service.tick()
+    protection = conservative["queue_protection"]
+    assert exchange.cancels == [entry_id, "manual-2"]
+    assert protection["cancel_reason"] == "book_unreliable"
+    assert protection["state"] == "canceling"
+    assert notifications == []
+    assert protection["cancel_target_remaining"] == {
+        entry_id: "2000",
+        "manual-2": None,
+    }
+
+    # 下一 tick 恢复读取：回执双双 CANCELED（零成交），episode 收敛。
+    exchange.snapshot_value = _queue_runtime_snapshot(
+        now,
+        bid_size="4000",
+        orders=[
+            _queue_receipt(entry_id, status="CANCELED"),
+            _queue_receipt("manual-2", status="CANCELED", original="1000"),
+        ],
+    )
+    exchange.snapshot_calls = 0
+    final = service.tick()
+    protection = final["queue_protection"]
+    assert protection["state"] == "canceled"
+    assert protection["canceled_remaining"] is None
+    assert len(notifications) == 1
+    title, message, xiaoai = notifications[0]
+    assert title == "LP 位置保护撤单"
+    assert "已撤 2 张买单合计余量 UNKNOWN 份 @ 0.3（含 1 张手动）" in message
+    assert "合计余量 0 份" not in message
+    assert "合计余量 2000 份" not in message
+    assert xiaoai == "LP 位置保护撤单，2 张买单已撤"
+
+
+def test_queue_protection_unacknowledged_cancels_converge_with_request_time_remaining(
+    tmp_path,
+) -> None:
+    """R9: 两张撤单请求均未获确认（not_canceled），下一 tick 回执双双 CANCELED 收敛：
+    通知按请求时点持久化余量报「已撤 2 张买单合计余量 3000 份 @ 0.3（含 1 张手动）」，
+    不再把回执已撤但未获确认的订单冒充余量 0；撤单时点余量映射含两单。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _queue_running_service(
+        tmp_path, now, key="lp-queue-r9"
+    )
+    notifications: list[tuple[str, str, str]] = []
+    service.set_protection_notifier(
+        lambda title, message, xiaoai: notifications.append((title, message, xiaoai))
+    )
+    entry_id = "order-1"
+    open_orders = [
+        _queue_receipt(entry_id),
+        _queue_receipt("manual-2", original="1000"),
+    ]
+    trigger = _queue_runtime_snapshot(now, bid_size="4000", open_orders=open_orders)
+    exchange.snapshots = [trigger]
+    exchange.snapshot_calls = 0
+    # 两张撤单请求都被 venue 拒绝（未获确认），余量 2000+1000 仍在请求时点 rows 中。
+    exchange.cancel_responses = [
+        {"not_canceled": {entry_id: "venue_busy"}},
+        {"not_canceled": {"manual-2": "venue_busy"}},
+    ]
+
+    first = service.tick()
+    protection = first["queue_protection"]
+    assert protection["state"] == "canceling"
+    assert protection["cancel_failed"] == [entry_id, "manual-2"]
+    assert protection["canceled_order_ids"] == []
+    assert notifications == []
+    # 请求（意图/pending）阶段即按 rows 持久化每张目标单的撤单时点余量。
+    assert protection["cancel_target_remaining"] == {
+        entry_id: "2000",
+        "manual-2": "1000",
+    }
+    session_id = str(started["session_id"])
+    (cancel_action,) = [
+        action
+        for action in store.lp_actions(session_id)
+        if action["action_key"].endswith(f"entry-protection-cancel:{entry_id}")
+    ]
+    assert cancel_action["cancel_target_remaining"] == {
+        entry_id: "2000",
+        "manual-2": "1000",
+    }
+
+    # 下一 tick：回执双双 CANCELED（零成交），episode 收敛。
+    converged_snapshot = _queue_runtime_snapshot(
+        now,
+        bid_size="4000",
+        orders=[
+            _queue_receipt(entry_id, status="CANCELED"),
+            _queue_receipt("manual-2", status="CANCELED", original="1000"),
+        ],
+    )
+    exchange.snapshots = [converged_snapshot]
+    exchange.snapshot_calls = 0
+    final = service.tick()
+    protection = final["queue_protection"]
+    assert protection["state"] == "canceled"
+    assert protection["canceled_order_ids"] == [entry_id, "manual-2"]
+    assert protection["cancel_target_remaining"] == {
+        entry_id: "2000",
+        "manual-2": "1000",
+    }
+    assert Decimal(str(protection["canceled_remaining"])) == Decimal("3000")
+    assert len(notifications) == 1
+    title, message, xiaoai = notifications[0]
+    assert title == "LP 位置保护撤单"
+    assert "已撤 2 张买单合计余量 3000 份 @ 0.3（含 1 张手动）" in message
+    assert "合计余量 0 份" not in message
     assert xiaoai == "LP 位置保护撤单，2 张买单已撤"
