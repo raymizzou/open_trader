@@ -2294,6 +2294,42 @@ class PredictionExecutionService:
                             "read_only": not fill_managed,
                         }
                     )
+                # Issue 152: today-order rows carry the queue-protection
+                # anchor flag (is this the registered entry order?) and the
+                # session condition's group attaches the protection summary;
+                # manual-only groups render unanchored with no summary.
+                raw_protection = (
+                    session.get("queue_protection")
+                    if isinstance(session, Mapping)
+                    else None
+                )
+                queue_protection_summary = (
+                    dict(raw_protection)
+                    if isinstance(raw_protection, Mapping)
+                    else None
+                )
+                lp_entry_order_id = (
+                    str(session.get("entry_order_id") or "")
+                    if isinstance(session, Mapping)
+                    else ""
+                )
+                lp_session_condition = (
+                    str(session.get("condition_id") or "")
+                    if isinstance(session, Mapping)
+                    else ""
+                )
+                for today_row in lp_orders_today:
+                    today_row["anchor"] = (
+                        bool(lp_entry_order_id)
+                        and str(today_row.get("order_id") or "") == lp_entry_order_id
+                    )
+                    if (
+                        queue_protection_summary is not None
+                        and lp_session_condition
+                        and str(today_row.get("condition_id") or "")
+                        == lp_session_condition
+                    ):
+                        today_row["queue_protection"] = dict(queue_protection_summary)
                 result = {
                     "state": "ready",
                     "orders": orders,

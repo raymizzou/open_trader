@@ -7529,3 +7529,73 @@ def test_lp_cancel_orders_cancels_session_owned_order_without_guard(
     }
     assert refresh_calls == [1]
     assert notifier.calls == 0
+
+
+def test_lp_dashboard_projects_queue_protection_anchor_and_summary(
+    tmp_path: Path,
+) -> None:
+    """T23/T24: 今日订单行带 anchor；会话标的组附保护摘要；纯手动组无摘要。"""
+
+    store = PredictionArbitrageStore(tmp_path / "data")
+    trading = _CancelTrading(
+        [
+            {**_cancel_open_order("entry-1", "0xc1"), "token_id": "yes-token"},
+            {**_cancel_open_order("manual-same", "0xc1"), "token_id": "yes-token"},
+            _cancel_open_order("manual-other", "0xc2"),
+        ]
+    )
+    service = PredictionExecutionService(
+        store=store,
+        monitor=object(),
+        trading=trading,
+        notifier=ChannelNotifier("feishu"),
+        lock_path=tmp_path / "proj.lock",
+    )
+    store.lp_create_session(
+        "lp-proj-session",
+        "lp-proj-key",
+        state="entry_open",
+        payload={
+            "condition_id": "0xc1",
+            "token_id": "yes-token",
+            "market_id": "market-1",
+            "outcome": "YES",
+            "question": "Will it happen?",
+            "entry_order_id": "entry-1",
+            "queue_protection": {
+                "baseline_front": "10000",
+                "baseline_price": "0.50",
+                "baseline_version": 1,
+                "threshold": "0.5",
+                "data_failures": 0,
+                "state": "monitoring",
+                "notification_sent": False,
+                "cancel_scope": "own_buys_at_level",
+                "front_estimate": "8000",
+                "level_total": "10000",
+                "ratio": "0.8",
+                "reason_codes": [],
+                "data_time": "2026-09-14T12:00:00.000000Z",
+            },
+        },
+    )
+    service._lp = PolymarketLPService(store, object())
+
+    payload = service.refresh_lp_dashboard_snapshot()
+    rows = {row["order_id"]: row for row in payload["lp_orders_today"]}
+    assert rows["entry-1"]["anchor"] is True
+    assert rows["manual-same"]["anchor"] is False
+    summary = rows["manual-same"]["queue_protection"]
+    assert summary["state"] == "monitoring"
+    assert Decimal(str(summary["baseline_front"])) == Decimal("10000")
+    assert summary["cancel_scope"] == "own_buys_at_level"
+    # T24: 纯手动组（无登记锚）不携带 queue_protection 契约字段。
+    other = rows["manual-other"]
+    assert other["anchor"] is False
+    assert "queue_protection" not in other
+
+    status = service.lp_status("lp-proj-session")
+    assert status["queue_protection"]["state"] == "monitoring"
+    assert status["queue_protection"]["cancel_scope"] == "own_buys_at_level"
+    assert Decimal(str(status["queue_protection"]["ratio"])) == Decimal("0.8")
+    assert status["queue_protection"]["front_estimate"] == "8000"
