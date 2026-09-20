@@ -1738,8 +1738,10 @@ def test_partial_retry_pauses_only_failed_items_across_restart(tmp_path: Path) -
     # expired shared facts once (targeted) before qualifying: the queue is
     # consumed, every market is judged live, and all three passers publish.
     assert candidate["candidates"] != []
-    assert candidate["funnel"]["checked"] == 3
-    assert candidate["funnel"]["passed"] == 3
+    # Issue #157: the funnel counters are continuous — the earlier healthy
+    # scan checked a and c (2), this batch judges a, c, and d live (3).
+    assert candidate["funnel"]["checked"] == 5
+    assert candidate["funnel"]["passed"] == 5
     assert candidate["funnel"]["unknown"] == 0
     # Paused condition-b (no history summary) never queues; the three
     # healthy markets a, c, and d are judged live and publish.
@@ -2135,9 +2137,14 @@ def test_failed_group_does_not_block_other_items_or_duplicate_retry_alerts(
     assert len(history_calls) == 9
     assert restart_result.get("alert_pending") is not True
     candidate = restarted.refresh_candidates(force=True)
-    assert "condition-080" in {
-        row["condition_id"] for row in candidate["candidates"]
-    }
+    # Issue #157: the restarted service keeps the honest preparation
+    # semantics — with the retry probe not due the prepared inputs are
+    # unpublished, so the exploration consumes nothing — and the pool rows
+    # restored from the previous process age out by the clock (T+300) even
+    # without a fresh scan.
+    assert candidate["retention_reason"] == "catalog_preparation_pending"
+    assert candidate["candidates"] == []
+    assert candidate["funnel"]["checked"] == 0
     notification_fails[0] = False
     wake_result = restarted.refresh_price_history()
     assert wake_result["preparation_outcome"] != "paused"
@@ -3653,14 +3660,14 @@ def test_due_metadata_retry_dispatches_before_initial_history_pass_finishes(
     assert store.lp_preparation_items() == []
 
     snapshot = service.refresh_candidates(force=True)
-    # Issue 143 repair 2: the token-080 history read advanced the clock by
-    # 300s, so the prepared metadata is outside the 60-second candidate
-    # freshness window; the first batch renews it once (targeted) before
-    # qualifying, and the ten live-qualified passers fill the table and end
-    # the round.
-    assert snapshot["funnel"]["stop_reason"] == "checked_limit"
-    assert snapshot["funnel"]["checked"] == 50
-    assert snapshot["funnel"]["passed"] == 50
+    # Issue 143 repair 2 + 157: the token-080 history read advanced the
+    # clock by 300s, so the prepared metadata is outside the 60-second
+    # candidate freshness window; the exploration batch renews it once
+    # (targeted) before qualifying, and the first ten queued markets are
+    # live-qualified and published.
+    assert snapshot["funnel"]["stop_reason"] is None
+    assert snapshot["funnel"]["checked"] == 10
+    assert snapshot["funnel"]["passed"] == 10
     assert snapshot["funnel"]["unknown"] == 0
     assert len(snapshot["candidates"]) == 10
 

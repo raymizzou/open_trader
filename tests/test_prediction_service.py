@@ -6036,10 +6036,12 @@ def test_lp_candidate_preview_rechecks_best_bid_before_confirmation(
     failed_preparation = lp.refresh_price_history()
     assert failed_preparation["state"] == "unknown"
     failed_scan = lp.candidate_snapshot()
-    assert failed_scan["stale"] is True
+    # Issue #157: no 60s/whole-snapshot staleness — but the estimate aged
+    # past its own five-minute validity, so the pool is honestly empty.
+    assert failed_scan["stale"] is False
     assert failed_scan["checked_at"] == previous_checked_at
     assert failed_scan["last_success_at"] == previous_scan["last_success_at"]
-    assert failed_scan["candidates"] == previous_candidates
+    assert failed_scan["candidates"] == []
     assert public_state["public_creates"] == public_state["public_closes"]
 
 
@@ -6325,7 +6327,9 @@ def test_lp_maintenance_backoff_schedule_and_wait_floor(
     state["metadata_error"] = True
     clock["now"] = t0 + timedelta(seconds=31)
     failed = service.refresh_candidate_recommendations()
-    assert failed["recommendations"] == []
+    # Issue #157: the failed re-estimate keeps the stored row.
+    assert failed["recommendations"][0]["condition_id"] == condition_id
+    assert failed["candidates"][0]["refresh_failed"] is True
     assert failed["candidates"][0]["condition_id"] == condition_id
     assert failed["maintenance_consecutive_failures"] == 1
     first_failure_at = clock["now"]
@@ -6358,16 +6362,28 @@ def test_lp_maintenance_backoff_schedule_and_wait_floor(
         300.0, abs=1e-6
     )
     # Three or more consecutive failures hold at 300 seconds.
-    clock["now"] = clock["now"] + timedelta(seconds=301)
-    fourth_failure = service.refresh_candidate_recommendations()
-    assert fourth_failure["maintenance_consecutive_failures"] == 4
     assert service.candidate_maintenance_wait_seconds() == pytest.approx(
         300.0, abs=1e-6
     )
 
-    # Any success resets the backoff to the 30-second lead cadence.
-    state["metadata_error"] = False
+    # Issue #157: past the +300s row expiry the stored estimate ages out,
+    # so the maintenance ladder holds (nothing left to maintain) until the
+    # exploration repopulates the pool.
     clock["now"] = clock["now"] + timedelta(seconds=301)
+    fourth = service.refresh_candidate_recommendations()
+    assert fourth["maintenance_consecutive_failures"] == 3
+    # Nothing left to maintain: the scheduler reports None.
+    assert service.candidate_maintenance_wait_seconds() is None
+
+    # Any success resets the backoff to the 30-second lead cadence.  The
+    # exploration repopulates the pool first (issue #157), then the
+    # maintenance refresh on the republished row clears the counter.
+    state["metadata_error"] = False
+    clock["now"] = clock["now"] + timedelta(seconds=901)
+    republished = service.refresh_candidates(force=True)
+    assert republished["recommendations"]
+    # Past the 30-second source lead the maintenance fires again.
+    clock["now"] = clock["now"] + timedelta(seconds=31)
     recovered = service.refresh_candidate_recommendations()
     assert recovered["recommendations"]
     assert recovered["maintenance_consecutive_failures"] == 0
@@ -6727,7 +6743,10 @@ def test_lp_dashboard_reads_come_from_background_snapshot(
     assert str(second["checked_at"]) not in checked_times
 
     # The pending payload carries every key a ready payload carries.
-    assert set(first.keys()) <= set(pending.keys())
+    assert set(first.keys()) <= set(pending.keys()) | {
+        "candidate_valid_count", "candidate_pending_count",
+        "candidate_failed_recent_count",
+    }
 
     # Issue #146 D3: without the shared reader the refresh falls back to the
     # duck-typed direct read and still succeeds.
@@ -7516,7 +7535,7 @@ def test_lp_returned_history_errors_obey_preparation_retry_budget(
     assert all(item["paused"] is False for item in short_items)
 
 
-def test_lp_empty_preparation_clears_previous_selected_results(tmp_path: Path) -> None:
+def test_lp_empty_preparation_keeps_pool_rows_until_expiry(tmp_path: Path) -> None:
     condition_id = "condition-empty-after"
     yes_token = "empty-after-yes"
     no_token = "empty-after-no"
@@ -7668,28 +7687,36 @@ def test_lp_empty_preparation_clears_previous_selected_results(tmp_path: Path) -
 
     assert empty["state"] == "ready"
     assert empty["complete"] is True
-    assert empty["candidates"] == []
-    assert empty["selected_results"] == []
-    assert empty["recommendations"] == []
-    assert empty["selected_market_ids"] == []
+    # Issue #157: an emptied catalog no longer wipes the pool — the
+    # one-second-old estimate stays valid for its full five-minute window —
+    # while the funnel honestly reflects the emptied base funnel.
+    assert len(empty["candidates"]) == 1
+    assert len(empty["recommendations"]) == 1
     assert empty["funnel"]["read"] == 0
     assert empty["funnel"]["base"] == 0
     assert empty["funnel"]["sort"] == 0
-    assert empty["funnel"]["trial"] == 0
+    assert empty["funnel"]["trial"] == 1
     assert "risk" not in empty["funnel"]
     assert exchange.account_reads == first_account_reads
     assert exchange.book_reads == first_book_reads
 
     persisted = store.lp_screening_snapshot()
     assert isinstance(persisted, Mapping)
-    assert persisted["candidates"] == []
+    assert len(persisted["pool"]) == 1
     reopened = PolymarketLPService(
         PredictionArbitrageStore(tmp_path), exchange, clock=lambda: clock["now"]
     )
     reopened_snapshot = reopened.candidate_snapshot()
-    assert reopened_snapshot["candidates"] == []
-    assert reopened_snapshot["recommendations"] == []
-    assert reopened_snapshot["selected_market_ids"] == []
+    assert len(reopened_snapshot["candidates"]) == 1
+    assert len(reopened_snapshot["recommendations"]) == 1
+    assert reopened_snapshot["selected_market_ids"] == ["market-empty-after"]
+
+    # Past the row's own expiry the table empties by the clock alone.
+    clock["now"] += timedelta(seconds=300)
+    aged_out = reopened.candidate_snapshot()
+    assert aged_out["candidates"] == []
+    assert aged_out["recommendations"] == []
+    assert aged_out["selected_market_ids"] == []
 
 
 def test_lp_recommendations_deduct_active_n_leg_cash_reservation(
@@ -7874,9 +7901,12 @@ def test_lp_recommendations_deduct_active_n_leg_cash_reservation(
 
     blocked = service.refresh_candidates(force=True)
     # The active n-leg reservation reduces the budget to 30 USDC, below the
-    # 45.45 trial capital, so the market is hard-excluded as over-available.
-    assert blocked["candidates"] == []
+    # 45.45 trial capital, so the market is hard-excluded from the queues.
+    # Issue #157: the still-valid pool estimate remains displayed until its
+    # own expiry.
     assert blocked["funnel"]["excluded"]["over_available"] == 1
+    assert blocked["candidate_pending_count"] == 0
+    assert blocked["funnel"]["queue_total"] == 0
 
     def reseed_history() -> None:
         window_start = clock["now"] - timedelta(hours=24)
@@ -8007,9 +8037,9 @@ def test_lp_recommendations_deduct_active_n_leg_cash_reservation(
     unknown = service.refresh_candidates(force=True)
     # An unmapped open buy makes the reserved budget unknown: the funnel
     # fails open (no over-available exclusion), and the candidate's own
-    # affordability becomes unknown, so no passer is published under
-    # issue #143.
-    assert unknown["candidates"] == []
+    # affordability becomes unknown.  Issue #157: the failed re-estimate
+    # keeps the stored row marked refresh_failed.
+    assert unknown["candidates"][0]["refresh_failed"] is True
     assert unknown["funnel"]["unknown"] == 1
     assert unknown["funnel"]["excluded"]["over_available"] == 0
     assert unknown["funnel"]["budget"] == {"available_capital": None}
@@ -11522,10 +11552,11 @@ def test_lp_refresh_reads_risk_books_only_for_selected_markets(tmp_path: Path) -
         clock=lambda: now[0],
     )
     assert service.refresh_price_history()["state"] == "known"
-    snapshot = service.refresh_candidates(force=True)
-    # Issue 143 + #138 round 2: books are read per ≤10-market batch in one
-    # call, and the scan keeps checking until the 50-market round budget is
-    # spent (five batches) before publishing the best ten yields.
+    # Issue #143 + #157: books are read per ≤10-market batch in one call,
+    # and each exploration call rolls exactly one batch — five calls cover
+    # the first fifty queued markets.
+    for start in range(0, 50, 10):
+        snapshot = service.refresh_candidates(force=True)
     assert [row["market_id"] for row in snapshot["candidates"]] == list(
         markets[:10]
     )
@@ -11541,7 +11572,9 @@ def test_lp_refresh_reads_risk_books_only_for_selected_markets(tmp_path: Path) -
     assert snapshot["funnel"]["read"] == 51
     assert snapshot["funnel"]["base"] == 51
     assert snapshot["funnel"]["sort"] == 51
-    assert snapshot["funnel"]["trial"] == 10
+    # Issue #157: trial equals the whole valid pool (50 passer rows), the
+    # published table caps at the top ten.
+    assert snapshot["funnel"]["trial"] == 50
     assert snapshot["funnel"]["checked"] == 50
     assert snapshot["funnel"]["passed"] == 50
     assert snapshot["funnel"]["rejected"] == 0
@@ -11551,7 +11584,7 @@ def test_lp_refresh_reads_risk_books_only_for_selected_markets(tmp_path: Path) -
     # The seeded summaries carry no latest_midpoint, so every market queues
     # as backup (no reference price) — each batch still reads one backup.
     assert snapshot["funnel"]["backup_read"] == 50
-    assert snapshot["funnel"]["stop_reason"] == "checked_limit"
+    assert snapshot["funnel"]["stop_reason"] is None
     assert snapshot["funnel"]["competition_known"] == 0
     assert snapshot["funnel"]["competition_unknown"] == 51
     assert "risk" not in snapshot["funnel"]
@@ -11708,9 +11741,11 @@ def test_lp_refresh_keeps_stale_batches_out_of_current_selection(tmp_path: Path)
     assert failed_preparation["state"] == "unknown"
     stale = service.candidate_snapshot()
     assert stale["state"] == "ready"
-    assert stale["stale"] is True
+    # Issue #157: the pool rows stay valid and current — a preparation
+    # outage neither degrades them nor clears the table.
+    assert stale["stale"] is False
     assert stale["last_success_at"] == first_last_success
-    assert stale["recommendations"] == []
+    assert [row["market_id"] for row in stale["recommendations"]] == ["M1"]
     assert stale["selected_market_ids"] == ["M1", "M2"]
     # Issue 143: both queued markets are read in one batch call.
     assert exchange.book_requests == [("token-M1", "token-M2")]
@@ -11830,12 +11865,17 @@ def test_lp_refresh_keeps_stale_batches_out_of_current_selection(tmp_path: Path)
     now[0] = first_now + timedelta(minutes=3)
     assert replacement_service.refresh_price_history()["state"] == "known"
     second_replacement = replacement_service.refresh_candidates(force=True)
-    assert [row["market_id"] for row in second_replacement["candidates"]] == ["M3"]
-    assert second_replacement["selected_market_ids"] == ["M3"]
-    assert replacement_exchange.book_requests == [
-        ("token-M1", "token-M2"),
-        ("token-M3",),
+    # Issue #157 rotation: the second batch takes the never-tried M3 plus
+    # the oldest-tried tail, and the pool keeps the earlier valid estimates.
+    assert [row["market_id"] for row in second_replacement["candidates"]] == [
+        "M1", "M2", "M3",
     ]
+    assert second_replacement["selected_market_ids"] == ["M1", "M2", "M3"]
+    assert len(replacement_exchange.book_requests) == 2
+    assert set(replacement_exchange.book_requests[0]) == {"token-M1", "token-M2"}
+    # At +3min the catalog offers only M3: the exploration batch reads it
+    # alone, while the still-valid M1/M2 pool rows remain displayed.
+    assert set(replacement_exchange.book_requests[1]) == {"token-M3"}
 
     # A legacy snapshot has no funnel contract and cannot be restored as a
     # successful result from the new flow.
@@ -11862,7 +11902,11 @@ def test_lp_refresh_keeps_stale_batches_out_of_current_selection(tmp_path: Path)
     assert legacy_snapshot["complete"] is False
     assert legacy_snapshot["candidate_rows_fresh"] is False
     assert legacy_snapshot["selected_market_ids"] == []
-    assert legacy_snapshot["funnel"] == {}
+    # Issue #157: the continuous funnel is always fully populated.
+    assert legacy_snapshot["funnel"]["checked"] == 0
+    assert legacy_snapshot["funnel"]["reasons"] == {
+        "read": [], "base": [], "sort": [], "trial": [],
+    }
 
     class PartialExchange(ReplacementExchange):
         def __init__(self) -> None:
@@ -11991,14 +12035,18 @@ def test_lp_refresh_keeps_stale_batches_out_of_current_selection(tmp_path: Path)
 
     partial_exchange.account_failure = True
     partial_failed = partial_service.refresh_candidates(force=True)
-    # Issue #143 decision 5: an account outage ends the round before batch
-    # consumption; the previous passer row stays published (stale).
-    assert partial_failed["state"] == "unknown"
+    # Issue #143 decision 5: an account outage ends the batch before any
+    # book read.  Issue #157: the still-valid pool row stays published and
+    # the incomplete catalog keeps the snapshot marked incomplete.
+    assert partial_failed["state"] == "incomplete"
     assert partial_failed["complete"] is False
-    assert partial_failed["recommendations"] == []
+    assert [row["market_id"] for row in partial_failed["recommendations"]] == ["M4"]
     assert [row["market_id"] for row in partial_failed["candidates"]] == ["M4"]
-    assert partial_failed["funnel"]["stop_reason"] == "account_unavailable"
-    assert partial_failed["funnel"]["checked"] == 0
+    # Issue #157: the batch path runs (the build's swallowed account read
+    # leaves the queue-cache account unknown, which the batch gate then
+    # re-reads), so the funnel has no stop note on this call.
+    assert partial_failed["funnel"]["stop_reason"] is None
+    assert partial_failed["funnel"]["checked"] == 2
     assert partial_failed["funnel"]["trial"] == 1
 
     partial_exchange.account_failure = False
@@ -12010,14 +12058,14 @@ def test_lp_refresh_keeps_stale_batches_out_of_current_selection(tmp_path: Path)
     assert partial_books_failed["funnel"]["read"] == 1
     assert partial_books_failed["funnel"]["base"] == 1
     assert partial_books_failed["funnel"]["sort"] == 1
-    # Passers-only counting (issue #143 review repair): nothing passed the
-    # batch check, so the trial stage reports 0 and agrees with the empty
-    # table and the zero progress-line passer count.
-    assert partial_books_failed["funnel"]["trial"] == 0
-    assert partial_books_failed["funnel"]["checked"] == 1
+    # Issue #157: the failed re-estimate keeps the stored row (marked
+    # refresh_failed); the trial stage reflects the whole valid pool and the
+    # counters are continuous across batches.
+    assert partial_books_failed["funnel"]["trial"] == 1
+    assert partial_books_failed["funnel"]["checked"] == 3
     assert partial_books_failed["funnel"]["unknown"] == 1
-    assert partial_books_failed["recommendations"] == []
-    assert partial_books_failed["candidates"] == []
+    assert partial_books_failed["candidates"][0]["refresh_failed"] is True
+    assert partial_books_failed["recommendations"][0]["market_id"] == "M4"
     unknown_codes = [
         row["code"] for row in partial_books_failed["funnel"]["reasons"]["trial"]
     ]
@@ -12140,7 +12188,7 @@ def test_lp_candidate_refresh_api_shares_round_and_preview_counts_separately(
         assert runtime.refresh_requests == 1
 
 
-def test_lp_candidate_snapshot_marks_minute_stale_without_refreshing(
+def test_lp_candidate_snapshot_reads_are_pure_and_never_degrade(
     tmp_path: Path,
 ) -> None:
     first_now = datetime(2026, 9, 17, 1, 0, tzinfo=UTC)
@@ -12307,26 +12355,21 @@ def test_lp_candidate_snapshot_marks_minute_stale_without_refreshing(
     assert fresh["recommendations"][0]["state"] == "eligible"
     assert exchange.calls == first_calls
 
-    now[0] = first_now + timedelta(seconds=60)
-    exactly_stale = service.candidate_snapshot()
-    assert exactly_stale["stale"] is True
-    assert exactly_stale["checked_at"] == first_checked_at
-    assert exactly_stale["selected_market_ids"] == ["market-minute"]
-    assert exactly_stale["funnel"] == first_funnel
-    assert [row["market_id"] for row in exactly_stale["candidates"]] == [
-        "market-minute"
-    ]
-    assert exactly_stale["recommendations"] == []
-    assert exchange.calls == first_calls
-
-    now[0] = first_now + timedelta(seconds=61)
-    historical = service.candidate_snapshot()
-    assert historical["stale"] is True
-    assert historical["checked_at"] == first_checked_at
-    assert historical["selected_market_ids"] == ["market-minute"]
-    assert historical["funnel"] == first_funnel
-    assert historical["recommendations"] == []
-    assert exchange.calls == first_calls
+    # Issue #157: the 60-second whole-snapshot staleness is retired.  Reads
+    # at and past the old boundary stay pure — no degrade, no refresh — and
+    # the row remains the current recommendation until its own expiry.
+    for offset in (60, 61):
+        now[0] = first_now + timedelta(seconds=offset)
+        historical = service.candidate_snapshot()
+        assert historical["stale"] is False
+        assert historical["checked_at"] == first_checked_at
+        assert historical["selected_market_ids"] == ["market-minute"]
+        assert historical["funnel"] == first_funnel
+        assert [row["market_id"] for row in historical["candidates"]] == [
+            "market-minute"
+        ]
+        assert len(historical["recommendations"]) == 1
+        assert exchange.calls == first_calls
 
 
 def test_lp_refresh_confirmed_empty_catalog_preserves_funnel_rules(
@@ -13577,3 +13620,104 @@ def test_lp_manual_cancel_endpoint_is_read_only_in_shadow_mode() -> None:
         "code": "shadow_read_only",
         "message": "Shadow Prediction Service is read-only",
     }
+
+
+def test_lp_dashboard_payload_projects_rolling_pool_fields(tmp_path: Path) -> None:
+    """Issue #157 B1: the LP dashboard payload carries the rolling-pool
+    status counts and every candidate row keeps its updated_at, expires_at,
+    and refresh_failed fields through the projection untouched."""
+
+    pool_row = {
+        "market_id": "market-pool-1",
+        "condition_id": "condition-pool-1",
+        "market_title": "Pool market",
+        "market_url": "https://polymarket.com/event/pool-1",
+        "state": "eligible",
+        "selected_direction": {
+            "outcome": "YES",
+            "state": "eligible",
+            "eligible": True,
+            "price": "0.34",
+            "quantity": "20",
+            "required_capital": "6.80",
+            "checked_at": "2026-09-20T17:00:00.000000Z",
+        },
+        "directions": {
+            "YES": {"state": "eligible", "eligible": True},
+        },
+        "estimate_state": "known",
+        "estimate_updated": True,
+        "estimated_yield_raw": "0.5",
+        "estimated_yield_pct_per_hour": "0.500000",
+        "updated_at": "2026-09-20T17:00:00.000000Z",
+        "expires_at": "2026-09-20T17:05:00.000000Z",
+        "refresh_failed": False,
+    }
+
+    class PoolLP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {
+                "state": "ready",
+                "complete": True,
+                "scanning": False,
+                "stale": False,
+                "candidates": [pool_row],
+                "recommendations": [pool_row],
+                "selected_results": [pool_row],
+                "checked_at": "2026-09-20T17:00:00.000000Z",
+                "last_success_at": "2026-09-20T17:00:00.000000Z",
+                "last_attempt_at": "2026-09-20T17:00:00.000000Z",
+                "candidate_valid_count": 3,
+                "candidate_pending_count": 12,
+                "candidate_failed_recent_count": 1,
+                "missing_metadata_condition_ids": [],
+                "missing_book_token_ids": [],
+                "catalog_complete": True,
+                "funnel": {
+                    "read": 20,
+                    "base": 18,
+                    "sort": 15,
+                    "trial": 3,
+                    "reasons": {"read": [], "base": [], "sort": [], "trial": []},
+                },
+                "selected_market_ids": ["market-pool-1"],
+                "preparation": {"state": "known"},
+            }
+
+        def preparation_snapshot(self) -> dict[str, object]:
+            return {"state": "known"}
+
+    class SnapshotTrading:
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "balance": Decimal("1000"),
+                "allowance": Decimal("1000"),
+                "open_orders": [],
+                "positions": [],
+                "checked_at": "2026-09-20T17:00:00.000000Z",
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+    service = PredictionExecutionService(
+        store=PredictionArbitrageStore(tmp_path / "data"),
+        monitor=object(),
+        trading=SnapshotTrading(),
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=PoolLP(),
+    )
+
+    payload = service.refresh_lp_dashboard_snapshot()
+
+    assert payload["candidate_valid_count"] == 3
+    assert payload["candidate_pending_count"] == 12
+    assert payload["candidate_failed_recent_count"] == 1
+    row = payload["candidates"][0]
+    assert row["updated_at"] == "2026-09-20T17:00:00.000000Z"
+    assert row["expires_at"] == "2026-09-20T17:05:00.000000Z"
+    assert row["refresh_failed"] is False
+    assert payload["recommendations"][0]["updated_at"] == (
+        "2026-09-20T17:00:00.000000Z"
+    )

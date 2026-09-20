@@ -1998,12 +1998,12 @@ def test_candidate_monitors_run_independently(
 def test_candidate_monitor_scan_cadence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """S6: the candidate loop forces only the first round and manual wakes.
+    """Issue #157: the exploration loop rolls one batch per wake.
 
-    Ordinary 60-second wakes call refresh_candidates(force=False); the
-    service-level 300-second scan window turns those into snapshot reads.
-    Only queue_lp_candidate_refresh() (a manual page refresh) requests a
-    forced new round.
+    The first wake runs immediately; ordinary wakes wait out the two-second
+    batch floor (no busy loop, no 300-second round gate); only
+    queue_lp_candidate_refresh() (a manual page refresh) interrupts the
+    floor for the next batch.
     """
     import open_trader.prediction_runtime as runtime_module
 
@@ -2082,23 +2082,24 @@ def test_candidate_monitor_scan_cadence(
     runtime.start()
     try:
         assert runtime.lp is not None
-        # Issue #146 D6: the first round is forced; a ready round then waits
-        # out the 300-second scan window instead of polling every minute.
+        # The first exploration batch runs immediately with force=True.
         deadline = time.monotonic() + 5
         while len(runtime.lp.calls) < 1 and time.monotonic() < deadline:
             time.sleep(0.01)
         assert runtime.lp.calls[0] is True
-        time.sleep(2.5)
+        # The ready result holds the loop on the two-second batch floor:
+        # no busy polling and no 300-second round gate.
+        time.sleep(0.8)
         assert len(runtime.lp.calls) == 1
 
-        # A manual page refresh interrupts the window and forces the round.
+        # A manual page refresh wakes the next batch before the floor.
         assert runtime.queue_lp_candidate_refresh() is True
         deadline = time.monotonic() + 5
         while len(runtime.lp.calls) < 2 and time.monotonic() < deadline:
             time.sleep(0.01)
         assert runtime.lp.calls[1] is True
-        # The window restarts after the forced round: no ordinary wake.
-        time.sleep(2.5)
+        # The floor restarts after the manual wake.
+        time.sleep(1.0)
         assert len(runtime.lp.calls) == 2
     finally:
         runtime.stop()
@@ -5944,15 +5945,17 @@ def test_lp_partial_preparation_uses_item_retry_deadline(
                 break
             time.sleep(0.01)
             snapshot = runtime.lp.refresh_candidates(force=True)  # type: ignore[union-attr]
-        # Issue #143 repair 2: after the bounded retry wait the cached
-        # metadata is older than the 60-second candidate freshness window,
-        # so the batch renews it once (targeted) before qualifying and
-        # market-a is judged live and published as the only passer.
+        # Issue #143 repair 2 + #157: after the bounded retry wait the
+        # cached metadata is older than the 60-second candidate freshness
+        # window, so the batch renews it once (targeted) before qualifying
+        # and market-a is judged live and published as the only passer.
+        # The funnel counters are continuous now — the background
+        # exploration keeps re-estimating the queue, so they only grow.
         assert snapshot.get("scanning") is not True
-        assert snapshot["funnel"]["checked"] == 1
-        assert snapshot["funnel"]["passed"] == 1
+        assert snapshot["funnel"]["checked"] >= 1
+        assert snapshot["funnel"]["passed"] >= 1
         assert snapshot["funnel"]["unknown"] == 0
-        assert snapshot["funnel"]["batches"] == 1
+        assert snapshot["funnel"]["batches"] >= 1
         assert [row["condition_id"] for row in snapshot["candidates"]] == [
             "condition-a"
         ]

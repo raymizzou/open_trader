@@ -20762,6 +20762,8 @@ const mkRow = (overrides) => ({
   estimated_yield_pct_per_hour: "0.881557",
   estimated_target_quantity: "98.70", estimated_target_capital_usd: "16.78",
   estimated_hourly_reward_usd: "0.147917", estimate_checked_at: checkedAt,
+  updated_at: checkedAt, expires_at: "2026-09-20T17:05:00Z",
+  refresh_failed: false,
   selected_direction: {
     outcome: "NO", price: "0.17", quantity: "60",
     required_capital: "10.20", estimated_exit_loss: "0.51",
@@ -20803,7 +20805,7 @@ const notUpdated = mkRow({
   token_id: "token-condition-L4-no", outcome: "YES",
   realtime_price: "0.22", realtime_capital: "8.80",
   estimated_yield_pct_per_hour: "0.625",
-  estimate_updated: false,
+  refresh_failed: true,
 });
 // The maintenance re-ranked the table: L2 is the new first row and the
 // current recommendation follows it — not the higher-old-yield L1.
@@ -20848,14 +20850,14 @@ console.log(JSON.stringify({
   pendingCell: rowHtml("condition-L3").includes("待测")
     && rowHtml("condition-L3").includes("估值缺失，不回退奖池上限")
     && !rowHtml("condition-L3").includes("55.5"),
-  footnote: html.includes("检查满 50 个市场或队列耗尽才停")
-    && html.includes("不再因已有 10 个通过而提前停")
+  footnote: html.includes("候选为持续滚动的候选池")
+    && html.includes("每行自带 5 分钟有效期")
     && html.includes("未检查的市场不代表劣于已展示者")
     && !html.includes("假设每小时收益上限"),
   badgeFollowsNewHead: rowHtml("condition-L2").includes("当前推荐")
     && !rowHtml("condition-L1").includes("当前推荐"),
-  notUpdatedDegraded: rowHtml("condition-L4").includes("本轮未更新")
-    && rowHtml("condition-L4").includes("仅供阅读"),
+  refreshFailedDegraded: rowHtml("condition-L4").includes("刷新失败 · 保留至原到期")
+    && rowHtml("condition-L4").includes("值为上次成功估值"),
 }));
 ''')
     rendered = json.loads(output)
@@ -20867,7 +20869,7 @@ console.log(JSON.stringify({
         "pendingCell": True,
         "footnote": True,
         "badgeFollowsNewHead": True,
-        "notUpdatedDegraded": True,
+        "refreshFailedDegraded": True,
     }, rendered
 
 
@@ -20894,6 +20896,8 @@ const row = (overrides) => ({
   estimated_yield_pct_per_hour: "2.083333",
   estimated_target_quantity: "46.00", estimated_target_capital_usd: "20.70",
   estimated_hourly_reward_usd: "0.431429", estimate_checked_at: checkedAt,
+  updated_at: checkedAt, expires_at: "2026-09-19T12:05:00Z",
+  refresh_failed: false,
   selected_direction: selected("NO", "0.45", "9.00", "0.90", "0.10"),
   directions: {NO: {state: "eligible", eligible: true}, YES: {state: "eligible", eligible: true}},
   competition: {state: "known", value: "1", raw_value: "1", checked_at: checkedAt, stale: false, updated: true},
@@ -20915,6 +20919,8 @@ const dashboard = () => ({
   state: "ready", complete: true, scanning: false, checked_at: checkedAt,
   candidate_state: "ready", candidate_stale: false,
   candidate_checked_at: checkedAt, candidate_last_success_at: checkedAt,
+  candidate_valid_count: 10, candidate_pending_count: 14,
+  candidate_failed_recent_count: 0,
   orders: [], positions: [], lp_orders_today: [], market_rewards: {},
   lp_observations: {}, lp_share_watch_state: {}, non_lp_row_count: 0,
   candidates: [row(), second],
@@ -20937,6 +20943,7 @@ const freshHtml = predictionLpCard({lp_dashboard: dashboard()});
 const staleAt = "2026-09-19T11:00:00Z";
 const staleDashboard = dashboard();
 staleDashboard.candidates = [row({realtime_checked_at: staleAt})];
+staleDashboard.candidate_valid_count = 10;
 staleDashboard.candidate_checked_at = staleAt;
 staleDashboard.candidate_last_success_at = staleAt;
 staleDashboard.recommendations = [];
@@ -20950,39 +20957,40 @@ const table = (html) => {
 console.log(JSON.stringify({
   title: freshHtml.includes("待试挂候选") && !freshHtml.includes("查询队列"),
   subtitle: freshHtml.includes("非全市场收益前十") && freshHtml.includes("已排除超可用资金 3 个"),
-  progress: freshHtml.includes("本轮扫描：基础筛选通过 20（正常 18 · 备用 2）")
-    && freshHtml.includes("已检查 20/50")
-    && freshHtml.includes("通过 10 · 拒绝 10 · 未知 0 · 未检查 0")
-    && freshHtml.includes("停止原因：")
-    && freshHtml.includes("已达单轮检查上限 50 个市场")
-    && freshHtml.includes("共 2 批 · 备用已读 2"),
+  poolStatus: freshHtml.includes("候选池持续滚动：有效 10 · 待探索 14 · 刷新失败 0")
+    && !freshHtml.includes("本轮扫描")
+    && !freshHtml.includes("已检查 20/50")
+    && !freshHtml.includes("停止原因"),
   eightColumns: (table(freshHtml).match(/<th scope="col">/g) || []).length === 8
     && table(freshHtml).includes("市场与方向")
     && table(freshHtml).includes("5% 奖励份额 · 预计收益率/小时")
     && !table(freshHtml).includes("假设上限/小时")
     && table(freshHtml).includes("拟挂方案（价 × 份 = 实际占资）")
     && table(freshHtml).includes("压力退出损失（金额 / 比例）")
-    && table(freshHtml).includes("检查时间与状态"),
+    && table(freshHtml).includes("估值时间与状态"),
   estimateCells: freshHtml.includes("≈2.083333%/小时")
     && freshHtml.includes("目标占资 $20.70（46.00 份）")
     && freshHtml.includes("最小试挂 $9.00（20 份）")
     && freshHtml.includes("≈1.822917%/小时")
     && freshHtml.includes("最小试挂 $8.00（20 份）"),
-  currentBadge: freshHtml.includes("当前推荐") && freshHtml.includes("60 秒全行维护重排"),
-  passerBadge: freshHtml.includes("本轮通过") && freshHtml.includes("检查时快照，非当前可执行价"),
+  currentBadge: freshHtml.includes("当前推荐") && freshHtml.includes("有效期剩余"),
+  passerBadge: table(freshHtml).includes("池内有效")
+    && !table(freshHtml).includes("本轮通过"),
   planCell: freshHtml.includes("45¢ × 20 份 = <strong>$9.00</strong>"),
   lossCell: freshHtml.includes("$0.90 · 10%"),
   noLegacy: !freshHtml.includes("整组合计") && !freshHtml.includes("可同时试挂")
     && !freshHtml.includes("仅队首") && !freshHtml.includes("待验证"),
   evidenceKept: freshHtml.includes("筛选与依据"),
-  degraded: staleHtml.includes("仅供阅读") && staleHtml.includes("不再当前有效"),
+  staleRowsStayValid: staleHtml.includes("池内有效")
+    && !staleHtml.includes("仅供阅读")
+    && !staleHtml.includes("pm-lp-candidate-row-expired"),
 }));
 ''')
     rendered = json.loads(output)
     assert rendered == {
         "title": True,
         "subtitle": True,
-        "progress": True,
+        "poolStatus": True,
         "eightColumns": True,
         "estimateCells": True,
         "currentBadge": True,
@@ -20991,7 +20999,7 @@ console.log(JSON.stringify({
         "lossCell": True,
         "noLegacy": True,
         "evidenceKept": True,
-        "degraded": True,
+        "staleRowsStayValid": True,
     }, rendered
 
 
@@ -21065,6 +21073,8 @@ const failedHead = {
   daily_pool_usd: "480", min_quantity: "20",
   queue: "normal", verification: "verified", state: "unknown",
   realtime_checked_at: checkedAt,
+  updated_at: checkedAt, expires_at: "2026-09-19T12:05:00Z",
+  refresh_failed: true,
   selected_direction: null,
   directions: {
     YES: {state: "unknown", eligible: false, reason_codes: ["book_unknown"]},
@@ -21099,9 +21109,11 @@ const html = predictionLpCard({lp_dashboard: dashboard});
 const start = html.indexOf("pm-lp-candidate-table");
 const table = html.slice(start, html.indexOf("</table>", start));
 console.log(JSON.stringify({
-  noPassBadgeOnFailedHead: !table.includes("本轮通过"),
+  noPassBadgeOnFailedHead: !table.includes("本轮通过")
+    && !table.includes("池内有效"),
   failedVisibleDegraded: table.includes("condition-current")
-    && table.includes("维护失败 · 仅供阅读"),
+    && table.includes("刷新失败 · 保留至原到期")
+    && table.includes("值为上次成功估值"),
   diagnosticsKept: html.includes("book_unknown")
     && html.includes("stress_loss_exceeded"),
 }));
@@ -21134,6 +21146,8 @@ const failedHead = (state, conditionId, reasonCodes) => ({
   market_id: "market-" + conditionId, condition_id: conditionId,
   market_title: "Failed head", market_url: "https://polymarket.com/event/" + conditionId,
   outcome: "NO", state, realtime_checked_at: checkedAt, selected_direction: null,
+  updated_at: checkedAt, expires_at: "2026-09-20T03:05:00Z",
+  refresh_failed: true,
   directions: {
     YES: {state, eligible: false, reason_codes: reasonCodes},
     NO: {state, eligible: false, reason_codes: reasonCodes},
@@ -21173,13 +21187,13 @@ const rejectedHtml = render(failedHead(
 const noPlanHtml = render(noPlan, [noPlan, validRunner]);
 console.log(JSON.stringify({
   unknownVisibleDegraded: table(unknownHtml).includes("condition-failed-unknown")
-    && table(unknownHtml).includes("维护失败 · 仅供阅读"),
+    && table(unknownHtml).includes("刷新失败 · 保留至原到期"),
   unknownReasonVisible: unknownHtml.includes("account_freshness_stale")
     && unknownHtml.includes("market_metadata_stale"),
   unknownRunnerKept: table(unknownHtml).includes("condition-runner"),
   unknownRunnerNotCurrent: !table(unknownHtml).includes("当前推荐"),
   rejectedVisibleDegraded: table(rejectedHtml).includes("condition-failed-rejected")
-    && table(rejectedHtml).includes("维护失败 · 仅供阅读"),
+    && table(rejectedHtml).includes("刷新失败 · 保留至原到期"),
   rejectedReasonVisible: rejectedHtml.includes("market_metadata_stale"),
   rejectedRunnerKept: table(rejectedHtml).includes("condition-runner"),
   noPlanHidden: !table(noPlanHtml).includes("condition-no-plan")
@@ -21680,3 +21694,93 @@ def test_lp_queue_protection_styles_shipped() -> None:
     assert ".status-danger { background: #fbeae8; border-color: #e5b5b0; color: var(--danger); }" in css
     assert ".status-unknown { background: var(--surface-soft); border: 1px dashed var(--muted); color: var(--muted); }" in css
     assert ".lp-queue-protection .status-pill { font-size: 11px; min-height: 20px; padding: 0 6px; }" in css
+
+
+def test_lp_candidate_rolling_pool_status_contract() -> None:
+    """Issue #157 B1: the LP candidate table shows the continuous pool
+    status line, per-row validity countdown, and the refresh-failed amber
+    badge; the old per-round scan strings (已检查 X/50, 停止原因,
+    等待下一轮, 候选每 5 分钟扫描一轮, 本轮扫描) are gone."""
+
+    output = run_dashboard_js(r'''
+Date.now = () => Date.parse("2026-09-20T17:01:30Z");
+const checkedAt = "2026-09-20T17:00:00Z";
+const updatedAt = "2026-09-20T17:00:00Z";
+const expiresAt = "2026-09-20T17:05:00Z";
+const mkRow = (overrides) => ({
+  market_id: "market-L1", condition_id: "condition-L1",
+  market_title: "Logitech G", market_url: "https://polymarket.com/event/l1",
+  token_id: "token-condition-L1-no", outcome: "NO",
+  daily_pool_usd: "71", min_quantity: "20",
+  queue: "normal", verification: "verified", state: "eligible",
+  realtime_price: "0.17", realtime_capital: "10.20",
+  realtime_checked_at: updatedAt,
+  estimate_state: "known", estimate_updated: true,
+  estimated_yield_raw: "0.00881557",
+  estimated_yield_pct_per_hour: "0.881557",
+  estimated_target_quantity: "98.70", estimated_target_capital_usd: "16.78",
+  estimated_hourly_reward_usd: "0.147917", estimate_checked_at: checkedAt,
+  updated_at: updatedAt, expires_at: expiresAt, refresh_failed: false,
+  selected_direction: {
+    outcome: "NO", price: "0.17", quantity: "60",
+    required_capital: "10.20", estimated_exit_loss: "0.51",
+    estimated_exit_loss_ratio: "0.05", checked_at: checkedAt,
+  },
+  directions: {NO: {state: "eligible", eligible: true}},
+  competition: {state: "known", value: "1", checked_at: checkedAt, stale: false, updated: true},
+  reason: [], ...overrides,
+});
+const failedRow = mkRow({
+  market_id: "market-L2", condition_id: "condition-L2",
+  market_title: "Second market", market_url: "https://polymarket.com/event/l2",
+  refresh_failed: true,
+});
+const html = predictionLpCard({lp_dashboard: {
+  state: "ready", complete: true, scanning: false,
+  checked_at: checkedAt,
+  candidate_state: "ready", candidate_stale: false,
+  candidate_checked_at: checkedAt, candidate_last_success_at: checkedAt,
+  candidate_valid_count: 12, candidate_pending_count: 34,
+  candidate_failed_recent_count: 1,
+  orders: [], positions: [], lp_orders_today: [], market_rewards: {},
+  lp_observations: {}, lp_share_watch_state: {}, non_lp_row_count: 0,
+  candidates: [mkRow(), failedRow],
+  recommendations: [mkRow()],
+  selected_results: [mkRow(), failedRow],
+  funnel: {
+    read: 46, base: 40, sort: 40, trial: 12,
+    competition_known: 12, competition_unknown: 0,
+    excluded: {competition_empty: 1, over_available: 2},
+    normal_queue_count: 40, backup_queue_count: 6,
+    checked: 46, passed: 12, rejected: 24, unknown: 4, unchecked: 34,
+    batches: 5, backup_read: 6,
+    compared_range: {compared: 12, total: 12, pending: 0},
+    budget: {available_capital: "480.00"},
+    conditions: {}, reasons: {read: [], base: [], sort: [], trial: []},
+  },
+}});
+const start = html.indexOf("pm-lp-candidate-table");
+const table = html.slice(start, html.indexOf("</table>", start));
+console.log(JSON.stringify({
+  statusLine: html.includes("候选池持续滚动：有效 12 · 待探索 34 · 刷新失败 1"),
+  countdown: table.includes("有效期剩余 3分30秒"),
+  failedBadge: table.includes("刷新失败 · 保留至原到期")
+    && table.includes("值为上次成功估值"),
+  currentBadge: table.includes("当前推荐"),
+  noRoundStrings: !html.includes("已检查 ")
+    && !html.includes("/50")
+    && !html.includes("停止原因")
+    && !html.includes("等待下一轮")
+    && !html.includes("本轮扫描")
+    && !html.includes("候选每 5 分钟扫描一轮"),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered == {
+        "statusLine": True,
+        "countdown": True,
+        "failedBadge": True,
+        "currentBadge": True,
+        "noRoundStrings": True,
+    }, rendered
+

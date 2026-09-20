@@ -3909,29 +3909,35 @@ function lpTrialLossCell(row) {
     + "<span class=\"sub\">压力退出情景估算</span></td>";
 }
 
-function lpTrialStatusCell(row, isCurrent, degraded) {
-  const stamp = predictionHasValue(row?.realtime_checked_at)
-    ? predictionHktTimestamp(row.realtime_checked_at) : "UNKNOWN";
-  const notUpdated = row?.estimate_updated === false
-    ? "<span class=\"pm-pill pm-lp-unknown\">本轮未更新</span>" : "";
-  if (degraded) {
-    return "<td data-label=\"检查时间与状态\"><div>" + escapeHtml(stamp) + "</div>"
-      + "<span class=\"pm-pill pm-lp-unknown\">仅供阅读</span>" + notUpdated
-      + "<span class=\"sub\">不再当前有效</span></td>";
+function lpTrialValidityCountdown(row) {
+  // Issue #157: the pool row is valid until its own expires_at; the
+  // remaining time is computed against the current clock at render time.
+  const expiresAt = Date.parse(String(row?.expires_at || ""));
+  if (!Number.isFinite(expiresAt)) return "";
+  const remainingSeconds = Math.floor((expiresAt - Date.now()) / 1000);
+  if (remainingSeconds <= 0) return "已到期";
+  const minutes = Math.floor(remainingSeconds / 60);
+  const seconds = remainingSeconds % 60;
+  return "有效期剩余 " + minutes + "分" + String(seconds).padStart(2, "0") + "秒";
+}
+
+function lpTrialStatusCell(row, isCurrent) {
+  const stamp = predictionHasValue(row?.updated_at)
+    ? predictionHktTimestamp(row.updated_at) : "UNKNOWN";
+  const countdown = lpTrialValidityCountdown(row);
+  const countdownMarkup = countdown
+    ? "<span class=\"sub\">" + escapeHtml(countdown) + "</span>" : "";
+  if (row?.refresh_failed === true) {
+    return "<td data-label=\"估值时间与状态\"><div>" + escapeHtml(stamp) + "</div>"
+      + "<span class=\"pm-pill watch\">刷新失败 · 保留至原到期</span>"
+      + "<span class=\"sub\">值为上次成功估值</span>" + countdownMarkup + "</td>";
   }
   if (isCurrent) {
-    return "<td data-label=\"检查时间与状态\"><div>" + escapeHtml(stamp) + "</div>"
-      + "<span class=\"pm-pill pm-tone-ok\">当前推荐</span>" + notUpdated
-      + "<span class=\"sub\">60 秒全行维护重排</span></td>";
+    return "<td data-label=\"估值时间与状态\"><div>" + escapeHtml(stamp) + "</div>"
+      + "<span class=\"pm-pill pm-tone-ok\">当前推荐</span>" + countdownMarkup + "</td>";
   }
-  if (String(row?.state || "") !== "eligible") {
-    return "<td data-label=\"检查时间与状态\"><div>" + escapeHtml(stamp) + "</div>"
-      + "<span class=\"pm-pill pm-lp-unknown\">维护失败 · 仅供阅读</span>" + notUpdated
-      + "<span class=\"sub\">不再当前有效</span></td>";
-  }
-  return "<td data-label=\"检查时间与状态\"><div>" + escapeHtml(stamp) + "</div>"
-    + "<span class=\"pm-pill\">本轮通过</span>" + notUpdated
-    + "<span class=\"sub\">检查时快照，非当前可执行价</span></td>";
+  return "<td data-label=\"估值时间与状态\"><div>" + escapeHtml(stamp) + "</div>"
+    + "<span class=\"pm-pill\">池内有效</span>" + countdownMarkup + "</td>";
 }
 
 function lpTrialQueryRateCell(row) {
@@ -4054,7 +4060,7 @@ function lpTrialSelectedResultDiagnostics(selectedResults, recommendations) {
     + lpMarketTitleLink(head) + "</p><ul>" + reasonRows + "</ul></details>";
 }
 
-function lpTrialCandidateRow(row, currentConditionId, degraded) {
+function lpTrialCandidateRow(row, currentConditionId) {
   const rowKey = String(row?.condition_id || row?.market_id || "") + ":" + String(row?.outcome || "");
   const isCurrent = Boolean(currentConditionId)
     && String(row?.condition_id || "") === currentConditionId;
@@ -4070,7 +4076,7 @@ function lpTrialCandidateRow(row, currentConditionId, degraded) {
   const queryRate = lpTrialQueryRateCell(row);
   const plan = lpTrialPlanCell(row);
   const loss = lpTrialLossCell(row);
-  const status = lpTrialStatusCell(row, isCurrent, degraded);
+  const status = lpTrialStatusCell(row, isCurrent);
   const url = String(row.market_url || "").trim();
   const action = "<td data-label=\"操作\"><div>"
     + (/^https:\/\/polymarket\.com\//i.test(url)
@@ -4078,8 +4084,7 @@ function lpTrialCandidateRow(row, currentConditionId, degraded) {
         + "\" target=\"_blank\" rel=\"noopener noreferrer\">Polymarket</a>"
       : "<span class=\"pm-lp-unknown\">链接未知</span>")
     + "</div></td>";
-  const rowClass = degraded ? " class=\"pm-lp-candidate-row-expired\"" : "";
-  return "<tr" + rowClass + " data-lp-trial-candidate=\"" + escapeHtml(rowKey) + "\">"
+  return "<tr data-lp-trial-candidate=\"" + escapeHtml(rowKey) + "\">"
     + identity + competition + pool + queryRate + plan + loss + status + action + "</tr>"
     + lpTrialEvidenceRow(row);
 }
@@ -4167,49 +4172,17 @@ function predictionLpCard(payload) {
   const budgetStampAt = dashboard.candidate_last_success_at || dashboard.candidate_checked_at;
   const budgetLineMarkup = lpBudgetLineMarkup(budget, budgetStampAt);
   const gapReason = predictionHasValue(funnel.gap_reason) ? String(funnel.gap_reason) : "";
-  const scanStopLabels = {
-    checked_limit: "已达单轮检查上限 50 个市场",
-    queue_exhausted: "队列耗尽",
-    account_unavailable: "账户事实不可用",
-  };
-  const hasScanFacts = predictionHasValue(funnel.stop_reason)
-    || predictionHasValue(funnel.checked);
-  const baseTotal = predictionHasValue(funnel.normal_queue_count)
-    && predictionHasValue(funnel.backup_queue_count)
-    ? Number(funnel.normal_queue_count) + Number(funnel.backup_queue_count)
-    : null;
-  const stopCode = String(funnel.stop_reason || "");
-  const stopLabel = predictionHasValue(funnel.stop_reason)
-    ? (scanStopLabels[stopCode] || stopCode) : "UNKNOWN";
+  // Issue #157: the exploration is a continuous rolling pool — the status
+  // line reports the pool counts, not a per-round scan progress.
   const scanStamp = predictionHasValue(dashboard.candidate_checked_at)
     ? predictionHktTimestamp(dashboard.candidate_checked_at) : "";
-  const scanProgressMarkup = hasScanFacts
-    ? "<p class=\"pm-lp-scan-progress\">本轮扫描：基础筛选通过 "
-      + escapeHtml(predictionValue(baseTotal, "UNKNOWN"))
-      + "（正常 " + escapeHtml(predictionValue(funnel.normal_queue_count, "UNKNOWN"))
-      + " · 备用 " + escapeHtml(predictionValue(funnel.backup_queue_count, "UNKNOWN"))
-      + "）· 已检查 " + escapeHtml(predictionValue(funnel.checked, "UNKNOWN")) + "/50"
-      + " · 通过 " + escapeHtml(predictionValue(funnel.passed, "UNKNOWN"))
-      + " · 拒绝 " + escapeHtml(predictionValue(funnel.rejected, "UNKNOWN"))
-      + " · 未知 " + escapeHtml(predictionValue(funnel.unknown, "UNKNOWN"))
-      + " · 未检查 " + escapeHtml(predictionValue(funnel.unchecked, "UNKNOWN"))
-      + " · 停止原因：<span title=\"" + escapeHtml(stopCode) + "\">" + escapeHtml(stopLabel) + "</span>"
-      + (predictionHasValue(funnel.batches)
-        ? " · 共 " + escapeHtml(String(funnel.batches)) + " 批" : "")
-      + (predictionHasValue(funnel.backup_read)
-        ? " · 备用已读 " + escapeHtml(String(funnel.backup_read)) : "")
-      + (scanStamp ? " · 数据 " + escapeHtml(scanStamp) : "")
-      + "</p>"
-    : "";
+  const poolStatusMarkup = "<p class=\"pm-lp-pool-status\">候选池持续滚动：有效 "
+    + escapeHtml(predictionValue(dashboard.candidate_valid_count, "UNKNOWN"))
+    + " · 待探索 " + escapeHtml(predictionValue(dashboard.candidate_pending_count, "UNKNOWN"))
+    + " · 刷新失败 " + escapeHtml(predictionValue(dashboard.candidate_failed_recent_count, "UNKNOWN"))
+    + (scanStamp ? " · 最近发布 " + escapeHtml(scanStamp) : "")
+    + "</p>";
   const currentConditionId = String(recommendations[0]?.condition_id || "");
-  const candidateAgeSeconds = (stamp) => {
-    if (!predictionHasValue(stamp)) return null;
-    const ms = Date.now() - Date.parse(String(stamp));
-    return Number.isFinite(ms) ? ms / 1000 : null;
-  };
-  // Issue #138 round 2: qualification flips within the 60-second
-  // maintenance are shown degraded instead of hidden; only rows without
-  // any direction facts have nothing to render.
   const visibleCandidates = candidates.filter((row) => {
     const selected = row?.selected_direction;
     const directions = row?.directions;
@@ -4220,13 +4193,11 @@ function predictionLpCard(payload) {
     ? visibleCandidates.map((row) => lpTrialCandidateRow(
         row,
         currentConditionId,
-        (candidateAgeSeconds(row?.realtime_checked_at || dashboard.candidate_checked_at) ?? 0) > 300
-          || row?.estimate_updated === false,
       )).join("")
     : "<tr><td colspan=\"8\" class=\"pm-observation-empty\">"
       + (dashboard.scanning === true
-        ? "候选扫描中，暂无通过的候选。"
-        : "本轮没有通过实时检查的市场；未检查的市场不代表劣于已展示者。竞争为 0 排除 "
+        ? "候选探索进行中，当前没有有效期内的估值。"
+        : "候选池当前没有有效期内的估值；未检查的市场不代表劣于已展示者。竞争为 0 排除 "
           + escapeHtml(String(competitionEmptyCount))
           + " 个，超可用排除 " + escapeHtml(String(overAvailableCount)) + " 个。")
       + "</td></tr>";
@@ -4235,13 +4206,13 @@ function predictionLpCard(payload) {
     + escapeHtml(String(overAvailableCount)) + " 个"
     + (gapReason ? " · " + escapeHtml(gapReason) : "")
     + "</span></h3>"
-    + scanProgressMarkup
+    + poolStatusMarkup
     + "<div class=\"pm-table-wrap\"><table class=\"pm-table pm-lp-candidate-table\">"
     + "<thead><tr><th scope=\"col\">市场与方向</th><th scope=\"col\">官方竞争</th><th scope=\"col\">日奖池</th>"
     + "<th scope=\"col\">5% 奖励份额 · 预计收益率/小时</th><th scope=\"col\">拟挂方案（价 × 份 = 实际占资）</th>"
     + "<th scope=\"col\">压力退出损失（金额 / 比例）</th><th scope=\"col\">检查时间与状态</th><th scope=\"col\">操作</th></tr></thead>"
     + "<tbody>" + candidateRowsHtml + "</tbody></table></div>"
-    + "<p class=\"sub\">候选每 5 分钟扫描一轮，每批最多 10 个市场（9 正常 + 1 备用交错），检查满 50 个市场或队列耗尽才停，不再因已有 10 个通过而提前停；盘口读取失败不重试；表内按目标 5% 官方奖励份额的预计收益率/小时降序，第 1 名为当前推荐（60 秒维护等权刷新全部行并重排，资格翻转如实降级展示），超过 300 秒的快照仅供阅读、不再当前有效；预计收益率为检查时盘口的估算、非保证收益，缺值显示待测、不回退奖池上限；未检查的市场不代表劣于已展示者；已有委托或持仓的市场不重复推荐；拟挂占资超过可用资金（已扣委托占用）的候选不进入队列；参考价有 1 小时新鲜门，过期进入备用队列；官方竞争仅作并列参考；链接为普通跳转，实际下单前以 Polymarket 页面实时事实为准。</p></section>";
+    + "<p class=\"sub\">候选为持续滚动的候选池：探索线程按基础筛选队列分批轮转（每批最多 10 个市场、一次盘口读），估值成功即入池、每行自带 5 分钟有效期、到期自动让位；维护线程持续为当前展示前十续命；表内按目标 5% 官方奖励份额的预计收益率/小时降序，并列按估值时间新→旧、再按市场身份，第 1 名为当前推荐、退出由下一名自动补位；刷新失败的行保留至原到期并标注，值为上次成功估值；预计收益率为估值时盘口的估算、非保证收益，缺值显示待测、不回退奖池上限；未检查的市场不代表劣于已展示者；已有委托或持仓的市场不重复推荐；拟挂占资超过可用资金（已扣委托占用）的候选不进入队列；参考价有 1 小时新鲜门，过期进入备用队列；官方竞争仅作并列参考；链接为普通跳转，实际下单前以 Polymarket 页面实时事实为准。</p></section>";
   const sessionDetails = activeSession
     ? "<details class=\"pm-lp-session-details\" data-lp-details-key=\"lp-session-details\"><summary>当前系统会话详情 · "
       + escapeHtml(predictionValue(session.market_title || session.market || session.question, "系统会话"))

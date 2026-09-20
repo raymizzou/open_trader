@@ -6,7 +6,7 @@ import math
 import threading
 import uuid
 from copy import deepcopy
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import ROUND_HALF_UP, Decimal
@@ -66,14 +66,22 @@ _CANDIDATE_MAINTENANCE_BACKOFF_SECONDS = (
 # the 300-second scan cadence.
 _CANDIDATE_SCHEDULER_WAIT_FLOOR_SECONDS = 1.0
 _CANDIDATE_SCHEDULER_WAIT_CEILING_SECONDS = 300.0
-# Issue #143 cadence: a full batch scan runs at most once every 300 seconds.
-# refresh_candidates(force=False) inside that window returns the current
-# snapshot with zero external reads; force=True always starts a new round.
-LP_CANDIDATE_SCAN_MIN_INTERVAL_SECONDS = Decimal("300")
-# Issue #143 round budget: one full batch scan checks at most 50 distinct
-# markets (binary markets: at most 100 first-read tokens, one request per
-# token, failures not retried within the round).
-_LP_CANDIDATE_SCAN_MARKET_LIMIT = 50
+# Issue #157 rolling pool: an estimate stays valid for five minutes from its
+# own judgment time; expiry is computed against the current clock on every
+# read and publish, never by a background event.
+LP_CANDIDATE_VALIDITY_SECONDS = Decimal("300")
+# Issue #157: one exploration batch handles at most ten distinct markets in
+# one order-book read (binary markets: at most 20 tokens).
+_LP_CANDIDATE_BATCH_SIZE = 10
+# Issue #157: the exploration loop never polls faster than one batch per two
+# seconds; the runtime scheduler clamps its wait to this floor.
+_LP_CANDIDATE_BATCH_MIN_INTERVAL_SECONDS = 2.0
+# Issue #157: official competition refreshes on its own thread every ten
+# minutes; candidate paths only read the in-memory cache and never block on
+# a competition read.
+_LP_COMPETITION_REFRESH_SECONDS = 600
+# Issue #157: pool publications persist at most once every five seconds.
+_LP_CANDIDATE_SNAPSHOT_SAVE_MIN_INTERVAL_SECONDS = 5.0
 _LP_BOOK_SAMPLE_BATCH_SIZE = 100
 _LP_BOOK_SAMPLE_MAX_CONCURRENCY = 8
 _LP_PRICE_HISTORY_BATCH_SIZE = 20
@@ -468,43 +476,95 @@ def _apply_row_estimate_fields(
     row["estimate_updated"] = True
 
 
+def _candidate_row_updated_at(row: Mapping[str, object]) -> datetime | None:
+    """Parse one pool row's estimate judgment time (issue #157)."""
+
+    value = row.get("updated_at")
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return _timestamp(value, name="candidate_updated_at")
+        except ValueError:
+            return None
+    return None
+
+
+def _candidate_row_expires_at(row: Mapping[str, object]) -> datetime | None:
+    """Parse one pool row's validity deadline (issue #157)."""
+
+    value = row.get("expires_at")
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return _timestamp(value, name="candidate_expires_at")
+        except ValueError:
+            return None
+    return None
+
+
+def _pool_published_value(value: object) -> object:
+    """Normalize one pool row to the published (JSON-like) shape.
+
+    Published candidate rows have always been JSON-round-tripped through
+    the durable store, which renders Decimals as strings and datetimes as
+    ISO stamps; the rolling pool applies the same normalization at record
+    time so in-memory readers and the HTTP projection see one shape.
+    """
+
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, datetime):
+        return _iso(value)
+    if isinstance(value, Mapping):
+        return {str(key): _pool_published_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_pool_published_value(item) for item in value]
+    return value
+
+
+def _candidate_pool_row_expired(row: Mapping[str, object], now: datetime) -> bool:
+    """A pool row leaves the valid set once the current clock passes its
+    expiry; reads never extend it (issue #157)."""
+
+    expires_at = _candidate_row_expires_at(row)
+    return expires_at is None or now >= expires_at
+
+
 def _candidate_yield_sort_key(
     row: Mapping[str, object],
-) -> tuple[int, Decimal, int, Decimal, int, Decimal, str]:
-    """Published-table order (issue #138 round 2): estimated target-share
-    yield descending first; UNKNOWN estimates rank after known ones; the
-    competition, actual capital, and stable identity fallbacks follow.
+) -> tuple[int, Decimal, int, Decimal, str]:
+    """Published-table order (issue #157): estimated target-share yield
+    descending first; UNKNOWN estimates rank after known ones — never as
+    zero; the estimate judgment time (newest first) breaks those ties and
+    the condition id keeps the order stable.  Competition and actual
+    capital left the ranking key: they never reshuffle displayed rows.
     """
 
     raw_yield = _maybe_decimal(row.get("estimated_yield_raw"))
     yield_key = (0, -raw_yield) if raw_yield is not None else (1, Decimal("0"))
-    competition_row = row.get("competition")
-    competition_value = (
-        competition_row.get("value")
-        if isinstance(competition_row, Mapping)
-        else None
-    )
-    if (
-        isinstance(competition_row, Mapping)
-        and competition_row.get("state") == "known"
-        and isinstance(competition_value, Decimal)
-    ):
-        competition_key = (0, competition_value)
+    updated_at = _candidate_row_updated_at(row)
+    if updated_at is not None:
+        updated_key = (0, -Decimal(str(updated_at.timestamp())))
     else:
-        competition_key = (1, Decimal("0"))
-    capital = _maybe_decimal(row.get("realtime_capital"))
-    capital_key = (
-        (0, capital) if capital is not None and capital > 0 else (1, Decimal("0"))
-    )
-    selected = row.get("selected_direction")
-    identity = (
-        str(selected.get("token_id") or "")
-        if isinstance(selected, Mapping)
-        else ""
-    )
-    if not identity:
-        identity = str(row.get("condition_id") or row.get("market_id") or "")
-    return (*yield_key, *competition_key, *capital_key, identity)
+        updated_key = (1, Decimal("0"))
+    identity = str(row.get("condition_id") or row.get("market_id") or "")
+    return (*yield_key, *updated_key, identity)
+
+
+def _new_candidate_funnel_totals() -> dict[str, object]:
+    """Continuous (not per-round) funnel counters for the rolling pool."""
+
+    return {
+        "checked": 0,
+        "passed": 0,
+        "rejected": 0,
+        "unknown": 0,
+        "batches": 0,
+        "backup_read": 0,
+        "unchecked": None,
+    }
 
 
 def _lp_funnel_conditions() -> dict[str, object]:
@@ -590,12 +650,24 @@ class PolymarketLPService:
         self._sample_targets: tuple[tuple[str, str], ...] = ()
         self._sample_target_version = 0
         self._candidate_attempted_at: datetime | None = None
-        self._candidate_scan_completed_at: datetime | None = None
         self._candidate_maintenance_failures = 0
         self._candidate_maintenance_last_finished_at: datetime | None = None
-        self._candidate_publication_generation = 0
         self._candidate_qualification_facts: dict[str, object] = {}
+        # Issue #157 rolling pool: valid estimates keyed by condition_id, a
+        # per-market rotation schedule, and continuous funnel counters.
+        # Publications rewrite pool rows one by one; there is no whole-round
+        # snapshot or publication generation anymore.
+        self._candidate_pool: dict[str, dict[str, object]] = {}
+        self._candidate_rotation: dict[str, dict[str, object]] = {}
+        self._candidate_funnel_totals: dict[str, object] = (
+            _new_candidate_funnel_totals()
+        )
+        self._candidate_queue_funnel: dict[str, object] = {}
+        self._candidate_queue_state: dict[str, object] | None = None
+        self._candidate_pool_last_saved_at: datetime | None = None
+        self._candidate_stop_note: str | None = None
         self._prepared_inputs: dict[str, object] | None = None
+        self._prepared_inputs_version = 0
         self._candidate_snapshot: dict[str, object] = {
             "state": "unknown",
             "complete": False,
@@ -613,6 +685,10 @@ class PolymarketLPService:
             "funnel": {},
             "selected_market_ids": [],
             "candidate_retention_reason": "background_candidates_retired",
+            "candidate_valid_count": 0,
+            "candidate_pending_count": 0,
+            "candidate_failed_recent_count": 0,
+            "stale": False,
         }
         self._preparation: dict[str, object] | None = None
         self._restore_preparation()
@@ -654,6 +730,10 @@ class PolymarketLPService:
         }
         with self._candidate_state_lock:
             self._prepared_inputs = prepared
+            # Issue #157: prepared inputs changed — the cached exploration
+            # queues and direction facts are stale and get rebuilt lazily.
+            self._prepared_inputs_version += 1
+            self._candidate_queue_state = None
 
     def _prepared_input_snapshot(self) -> dict[str, object] | None:
         with self._candidate_state_lock:
@@ -1644,214 +1724,156 @@ class PolymarketLPService:
         return saved if isinstance(saved, Mapping) else None
 
     def candidate_snapshot(self) -> dict[str, object]:
-        """Return the latest cached candidate projection without external reads."""
+        """Project the rolling candidate pool without external reads.
+
+        Issue #157: every valid pool row is one successful estimate with a
+        five-minute validity computed against the current clock; rows are
+        never degraded or cleared because a whole snapshot aged.  The top
+        ten by the yield ranking key are published and the head is always
+        the current recommendation — when it leaves the pool the next row
+        takes its place automatically.
+        """
 
         with self._candidate_state_lock:
+            pool = deepcopy(self._candidate_pool)
             snapshot = deepcopy(self._candidate_snapshot)
-            qualification_facts = deepcopy(self._candidate_qualification_facts)
+            funnel = deepcopy(self._candidate_funnel_totals)
+            queue_funnel = deepcopy(self._candidate_queue_funnel)
+            rotation = deepcopy(self._candidate_rotation)
+            competition_state = deepcopy(self._competition_state)
+        from .polymarket_lp_views import LP_TRIAL_CANDIDATE_LIMIT
+
         now = self._now()
-        checked_at = snapshot.get("checked_at")
-        if isinstance(checked_at, datetime):
-            checked = checked_at
-        elif isinstance(checked_at, str):
-            try:
-                checked = _timestamp(checked_at, name="candidate_checked_at")
-            except ValueError:
-                checked = None
-        else:
-            checked = None
-        if checked is not None:
-            age = Decimal(str((now - checked).total_seconds()))
-            # Candidate guidance is refreshed on the minute cadence.  Keep
-            # the batch counts and timestamp when that cadence is missed, but
-            # present the risk projection as historical at the exact boundary.
-            snapshot["stale"] = age < 0 or age >= LP_RECOMMENDATION_REFRESH_SECONDS
-        else:
-            snapshot["stale"] = True
-        snapshot_state = str(snapshot.get("state") or "")
-        if snapshot_state not in {"ready", "incomplete", "scanning"} or (
-            snapshot.get("state") == "incomplete"
-            and snapshot.get("candidate_rows_fresh") is not True
-        ):
-            snapshot["stale"] = True
-        raw_selected_results = snapshot.get("selected_results")
-        selected_results = (
-            [row for row in raw_selected_results if isinstance(row, dict)]
-            if isinstance(raw_selected_results, (list, tuple))
-            else []
+        valid_rows = [
+            row
+            for row in pool.values()
+            if isinstance(row, Mapping) and not _candidate_pool_row_expired(row, now)
+        ]
+        valid_rows.sort(key=_candidate_yield_sort_key)
+        published = [
+            deepcopy(dict(row)) for row in valid_rows[:LP_TRIAL_CANDIDATE_LIMIT]
+        ]
+        valid_count = len(valid_rows)
+        failed_count = sum(
+            1 for row in valid_rows if row.get("refresh_failed") is True
         )
-        if not selected_results:
-            selected_results = [
-                dict(row)
-                for row in snapshot.get("recommendations", ())
-                if isinstance(row, Mapping)
-            ]
-        projection_available = (
-            snapshot.get("stale") is not True
-            and snapshot.get("state") not in {"stale", "unknown"}
+        tried = sum(
+            1
+            for entry in rotation.values()
+            if isinstance(entry, Mapping) and entry.get("last_attempt_at") is not None
         )
-        current_recommendations: list[dict[str, object]] = []
-        expired_reasons: list[dict[str, object]] = []
-        projection_reasons: list[dict[str, object]] = []
-        direction_counts = {"passed": 0, "rejected": 0, "unknown": 0}
-        market_counts = {"passed": 0, "rejected": 0, "unknown": 0}
-
-        def source_expired(condition_id: object, outcome: object) -> bool:
-            cached = qualification_facts.get(str(condition_id or ""))
-            if not isinstance(cached, Mapping):
-                return True
-            account = cached.get("account")
-            if not isinstance(account, Mapping) or _candidate_source_expired(
-                account.get("checked_at"), now
-            ):
-                return True
-            wanted = str(outcome or "").upper()
-            for raw_direction in cached.get("directions", ()):
-                if not isinstance(raw_direction, Mapping):
+        queue_total = queue_funnel.get("queue_total")
+        pending = (
+            max(0, int(queue_total) - tried)
+            if isinstance(queue_total, int)
+            else 0
+        )
+        # Scheduler hint for the exploration loop: zero while any queue
+        # market is still untried or any tried market is out of backoff,
+        # otherwise the seconds until the earliest backoff expiry.
+        next_batch_wait = 0.0
+        if pending <= 0:
+            waits: list[float] = []
+            for entry in rotation.values():
+                if not isinstance(entry, Mapping):
                     continue
-                market = raw_direction.get("market")
-                if not isinstance(market, Mapping) or str(
-                    market.get("outcome") or ""
-                ).upper() != wanted:
-                    continue
-                return (
-                    _candidate_source_expired(market.get("metadata_checked_at"), now)
-                    or _candidate_source_expired(market.get("fees_checked_at"), now)
-                    or _candidate_source_expired(
-                        raw_direction.get("reward_checked_at"), now
-                    )
-                    or _candidate_source_expired(
-                        raw_direction.get("book", {}).get("received_at")
-                        if isinstance(raw_direction.get("book"), Mapping)
-                        else None,
-                        now,
-                    )
+                failures = entry.get("failures")
+                if not isinstance(failures, int) or failures <= 0:
+                    waits = []
+                    break
+                last_attempt_at = _candidate_row_updated_at(
+                    {"updated_at": entry.get("last_attempt_at")}
                 )
-            return True
-
-        for row in selected_results:
-            directions = row.get("directions")
-            if not isinstance(directions, Mapping):
-                row["state"] = "unknown"
-                market_counts["unknown"] += 1
-                continue
-            has_eligible = False
-            has_unknown = False
-            has_expired = False
-            direction_states: list[str] = []
-            for outcome, raw_direction in directions.items():
-                if not isinstance(raw_direction, dict):
-                    continue
-                direction = raw_direction
-                state = str(direction.get("state") or "unknown")
-                if state == "eligible" and source_expired(
-                    row.get("condition_id"), outcome
-                ):
-                    state = "unknown"
-                    direction["state"] = state
-                    direction["eligible"] = False
-                    direction["reason_codes"] = ["candidate_source_stale"]
-                    projection_reasons.append(
-                        {
-                            "market_id": row.get("market_id"),
-                            "condition_id": row.get("condition_id"),
-                            "outcome": str(outcome),
-                            "code": "candidate_source_stale",
-                        }
+                if last_attempt_at is None:
+                    waits = []
+                    break
+                backoff = _CANDIDATE_MAINTENANCE_BACKOFF_SECONDS[
+                    min(
+                        failures - 1,
+                        len(_CANDIDATE_MAINTENANCE_BACKOFF_SECONDS) - 1,
                     )
-                if state == "eligible" and direction.get("eligible") is True:
-                    guidance = direction.get("guidance")
-                    if not _lp_guidance_is_usable(guidance):
-                        state = "unknown"
-                        direction["state"] = state
-                        direction["eligible"] = False
-                        direction["reason_codes"] = ["guidance_unknown"]
-                        projection_reasons.append(
-                            {
-                                "market_id": row.get("market_id"),
-                                "condition_id": row.get("condition_id"),
-                                "outcome": str(outcome),
-                                "code": "guidance_unknown",
-                            }
-                        )
-                    else:
-                        try:
-                            expires_at = _timestamp(
-                                guidance.get("expires_at"),
-                                name="guidance_expiry",
-                            )
-                        except ValueError:
-                            expires_at = None
-                        if expires_at is None or now >= expires_at:
-                            state = "expired"
-                            direction["state"] = state
-                            direction["eligible"] = False
-                            direction["reason_codes"] = ["guidance_expired"]
-                            has_expired = True
-                            expired_reasons.append(
-                                {
-                                    "market_id": row.get("market_id"),
-                                    "condition_id": row.get("condition_id"),
-                                    "outcome": str(outcome),
-                                    "code": "guidance_expired",
-                                }
-                            )
-                if state == "eligible" and not projection_available:
-                    state = "unknown"
-                    direction["state"] = state
-                    direction["eligible"] = False
-                    direction["reason_codes"] = ["candidate_snapshot_stale"]
-                    projection_reasons.append(
-                        {
-                            "market_id": row.get("market_id"),
-                            "condition_id": row.get("condition_id"),
-                            "outcome": str(outcome),
-                            "code": "candidate_snapshot_stale",
-                        }
-                    )
-                if state == "expired":
-                    has_expired = True
-                if state == "unknown":
-                    has_unknown = True
-                if state == "eligible" and direction.get("eligible") is True and _lp_guidance_is_usable(direction.get("guidance")):
-                    has_eligible = True
-                direction_states.append(state)
-                if state == "eligible" and direction.get("eligible") is True and _lp_guidance_is_usable(direction.get("guidance")):
-                    direction_counts["passed"] += 1
-                elif state == "rejected":
-                    direction_counts["rejected"] += 1
-                elif state in {"unknown", "expired"}:
-                    direction_counts["unknown"] += 1
-            if has_eligible:
-                row["state"] = "eligible"
-                market_counts["passed"] += 1
-                current_recommendations.append(row)
-            elif has_unknown:
-                row["state"] = "unknown"
-                market_counts["unknown"] += 1
-            elif has_expired:
-                row["state"] = "expired"
-                market_counts["unknown"] += 1
-            elif direction_states:
-                row["state"] = "rejected"
-                market_counts["rejected"] += 1
-            else:
-                row["state"] = "unknown"
-                market_counts["unknown"] += 1
-        snapshot["selected_results"] = selected_results
-        # Issue #143: only the merged rank-one row is the current
-        # recommendation.  If that head row is not currently eligible, no
-        # later passer is promoted in its place — the next maintenance or
-        # scan round recovers the head instead.
-        head_is_current = bool(current_recommendations) and bool(selected_results) and str(
-            current_recommendations[0].get("condition_id") or ""
-        ) == str(selected_results[0].get("condition_id") or "")
-        snapshot["recommendations"] = current_recommendations[:1] if head_is_current else []
+                ]
+                remaining = (
+                    last_attempt_at
+                    + timedelta(seconds=float(backoff))
+                    - now
+                ).total_seconds()
+                waits.append(max(0.0, remaining))
+            if waits:
+                next_batch_wait = min(waits)
+        base_state = str(snapshot.get("state") or "")
+        if snapshot.get("scanning") is True:
+            snapshot_state = "scanning"
+        elif base_state in {"ready", "incomplete"}:
+            snapshot_state = base_state
+        elif published or snapshot.get("last_success_at"):
+            # A healthy rolling pool that simply has no valid rows right
+            # now stays ready with an honestly empty table.
+            snapshot_state = "ready"
+        else:
+            snapshot_state = "unknown"
+        last_success_at = snapshot.get("last_success_at")
+        funnel_view = {
+            # Structural defaults first, so a not-yet-built queue funnel
+            # still publishes the shape Hermes and the page expect.
+            "reasons": {"read": [], "base": [], "sort": [], "trial": []},
+            "budget": {"available_capital": None},
+            "excluded": {"competition_empty": 0, "over_available": 0},
+            **queue_funnel,
+            **funnel,
+            "trial": valid_count,
+            "unchecked": pending,
+            "stop_reason": snapshot.get("stop_reason"),
+            "gap_reason": None,
+            "conditions": _lp_funnel_conditions(),
+            "competition_state": competition_state.get("state") or "unknown",
+            "competition_not_updated": list(
+                competition_state.get("not_updated") or ()
+            ),
+        }
+        projection = {
+            "state": snapshot_state,
+            "complete": snapshot.get("complete") is True,
+            "scanning": snapshot.get("scanning") is True,
+            "candidates": published,
+            "recommendations": [deepcopy(published[0])] if published else [],
+            "selected_results": deepcopy(published),
+            "checked_at": snapshot.get("checked_at"),
+            "last_success_at": last_success_at,
+            "last_attempt_at": snapshot.get("last_attempt_at"),
+            "candidate_rows_fresh": bool(published),
+            "missing_metadata_condition_ids": snapshot.get(
+                "missing_metadata_condition_ids", []
+            ),
+            "missing_book_token_ids": snapshot.get("missing_book_token_ids", []),
+            "catalog_complete": snapshot.get("catalog_complete") is True,
+            "event_end_confirmations": snapshot.get("event_end_confirmations", {}),
+            "retention_reason": snapshot.get("retention_reason"),
+            "funnel": funnel_view,
+            "selected_market_ids": [
+                str(row.get("market_id") or "") for row in published
+            ],
+            "candidate_retention_reason": "background_candidates_retired",
+            "candidate_valid_count": valid_count,
+            "candidate_pending_count": pending,
+            "candidate_failed_recent_count": failed_count,
+            "next_batch_wait_seconds": next_batch_wait,
+            "stale": False,
+            "maintenance_consecutive_failures": snapshot.get(
+                "maintenance_consecutive_failures", 0
+            ),
+            "maintenance_next_attempt_at": snapshot.get(
+                "maintenance_next_attempt_at"
+            ),
+            "maintenance_diagnostics": snapshot.get(
+                "maintenance_diagnostics"
+            ),
+        }
         # Keep preparation lifecycle state adjacent to the cached candidate
         # projection.  It is a small durable row, so readers can show a
         # pending/retry/paused reason without re-running the external funnel.
-        snapshot["preparation"] = self.preparation_snapshot()
-        return snapshot
+        projection["preparation"] = self.preparation_snapshot()
+        return projection
 
     def candidate_maintenance_wait_seconds(self) -> float | None:
         """Return seconds until maintenance may run again (issue #146).
@@ -1864,10 +1886,10 @@ class PolymarketLPService:
         """
 
         with self._candidate_state_lock:
-            snapshot = deepcopy(self._candidate_snapshot)
             qualification_facts = deepcopy(self._candidate_qualification_facts)
             failures = self._candidate_maintenance_failures
             last_finished_at = self._candidate_maintenance_last_finished_at
+            pool = deepcopy(self._candidate_pool)
         now = self._now()
         floor = _CANDIDATE_SCHEDULER_WAIT_FLOOR_SECONDS
         ceiling = _CANDIDATE_SCHEDULER_WAIT_CEILING_SECONDS
@@ -1881,12 +1903,16 @@ class PolymarketLPService:
             ).total_seconds()
             if remaining > 0:
                 return min(max(remaining, floor), ceiling)
-        raw_selected = snapshot.get("selected_results")
-        selected_rows = (
-            [row for row in raw_selected if isinstance(row, Mapping)]
-            if isinstance(raw_selected, (list, tuple))
-            else []
-        )
+        # Issue #157: the maintained rows are the valid pool rows (the
+        # currently displayed top ten), not a stored whole-snapshot table.
+        valid_rows = [
+            row
+            for row in pool.values()
+            if isinstance(row, Mapping) and not _candidate_pool_row_expired(row, now)
+        ]
+        selected_rows = sorted(
+            valid_rows, key=_candidate_yield_sort_key
+        )[:_LP_CANDIDATE_BATCH_SIZE]
         if not selected_rows:
             return None
         # Issue #138 round 2: maintenance refreshes the whole published
@@ -3863,6 +3889,14 @@ class PolymarketLPService:
     def _restore_candidate_snapshot(
         self, saved: Mapping[str, object] | None = None
     ) -> None:
+        """Restore the rolling pool, rotation schedule, and confirmations.
+
+        Issue #157: pool rows keep their original ``updated_at`` and
+        ``expires_at``; reads judge expiry against the current clock, so a
+        row saved before a restart ages out exactly when it would have
+        without the restart, and reading never extends its validity.
+        """
+
         if saved is None:
             reader = getattr(self.store, "lp_screening_snapshot", None)
             if not callable(reader):
@@ -3873,260 +3907,117 @@ class PolymarketLPService:
                 return
         if not isinstance(saved, Mapping):
             return
-        # Snapshots written before the light-funnel contract do not carry the
-        # stage counts or selected-market boundary. They cannot be presented
-        # as a successful result from the new flow after a restart.
-        if (
-            "funnel" not in saved
-            or "selected_market_ids" not in saved
-            or not isinstance(saved.get("funnel"), Mapping)
-        ):
+        pool = saved.get("pool")
+        if not isinstance(pool, Mapping) or not pool:
+            # Pre-pool snapshots carry whole-round rows without per-row
+            # judgment times.  They cannot be presented as valid estimates
+            # under the rolling contract, so the pool starts empty.
             with self._candidate_state_lock:
-                self._candidate_snapshot.update(
-                    {
-                        "state": "unknown",
-                        "complete": False,
-                        "scanning": False,
-                        "candidates": [],
-                        "recommendations": [],
-                        "selected_results": [],
-                        "checked_at": None,
-                        "last_success_at": None,
-                        "last_attempt_at": saved.get("last_attempt_at"),
-                        "candidate_rows_fresh": False,
-                        "missing_metadata_condition_ids": [],
-                        "missing_book_token_ids": [],
-                        "catalog_complete": False,
-                        "funnel": {},
-                        "selected_market_ids": [],
-                        "candidate_retention_reason": "legacy_snapshot_unusable",
-                    }
-                )
-            self._candidate_attempted_at = None
+                self._candidate_attempted_at = None
             return
+        restored_pool: dict[str, dict[str, object]] = {}
+        for condition_id, row in pool.items():
+            key = str(condition_id or "").strip()
+            if key and isinstance(row, Mapping):
+                restored_pool[key] = dict(row)
+        raw_rotation = saved.get("rotation")
+        restored_rotation: dict[str, dict[str, object]] = {}
+        if isinstance(raw_rotation, Mapping):
+            for condition_id, entry in raw_rotation.items():
+                key = str(condition_id or "").strip()
+                if key and isinstance(entry, Mapping):
+                    restored_rotation[key] = dict(entry)
         with self._candidate_state_lock:
-            for key in (
-                "state",
-                "complete",
-                "candidates",
-                "recommendations",
-                "selected_results",
-                "checked_at",
-                "last_success_at",
-                "last_attempt_at",
-                "candidate_rows_fresh",
-                "missing_metadata_condition_ids",
-                "missing_book_token_ids",
-                "catalog_complete",
-                "event_end_confirmations",
-                "retention_reason",
-                "scan_started_at",
-                "funnel",
-                "selected_market_ids",
-                "candidate_retention_reason",
-            ):
-                if key in saved:
-                    self._candidate_snapshot[key] = deepcopy(saved[key])
+            self._candidate_pool = restored_pool
+            self._candidate_rotation = restored_rotation
+            confirmations = saved.get("event_end_confirmations")
+            if isinstance(confirmations, Mapping):
+                self._candidate_snapshot["event_end_confirmations"] = deepcopy(
+                    dict(confirmations)
+                )
             self._candidate_snapshot["scanning"] = False
-            started_at = saved.get("scan_started_at")
+            self._candidate_snapshot["last_attempt_at"] = saved.get(
+                "last_attempt_at"
+            )
             try:
                 self._candidate_attempted_at = _timestamp(
-                    started_at, name="scan_started_at"
+                    saved.get("last_attempt_at"), name="last_attempt_at"
                 )
             except ValueError:
                 self._candidate_attempted_at = None
 
-    def refresh_candidates(
-        self,
-        *,
-        stop_event: threading.Event | None = None,
-        force: bool = False,
-    ) -> dict[str, object]:
-        """Refresh the light shortlist, then risk-check only selected markets."""
+    def _candidate_queue_state_build(
+        self, *, stop_event: threading.Event | None = None
+    ) -> dict[str, object] | None:
+        """Build (or reuse) the exploration queues from prepared inputs.
 
-        if not self._candidate_scan_lock.acquire(blocking=False):
-            snapshot = self.candidate_snapshot()
-            snapshot["scanning"] = True
-            return snapshot
-        try:
-            scan_started_at = self._now()
-            with self._candidate_state_lock:
-                last_scan_completed_at = self._candidate_scan_completed_at
-                if (
-                    not force
-                    and last_scan_completed_at is not None
-                    and Decimal(
-                        str(
-                            (
-                                scan_started_at - last_scan_completed_at
-                            ).total_seconds()
-                        )
-                    )
-                    < LP_CANDIDATE_SCAN_MIN_INTERVAL_SECONDS
-                ):
-                    # Issue #143: inside the 300-second scan window a
-                    # non-force refresh is a pure snapshot read.
-                    return self.candidate_snapshot()
-                attempted_at = self._candidate_attempted_at
-                if (
-                    not force
-                    and attempted_at is not None
-                    and Decimal(
-                        str((scan_started_at - attempted_at).total_seconds())
-                    )
-                    < LP_RECOMMENDATION_REFRESH_SECONDS
-                ):
-                    return self.candidate_snapshot()
-                previous = dict(self._candidate_snapshot)
-                self._candidate_attempted_at = scan_started_at
-                self._candidate_snapshot = {
-                    **previous,
-                    "state": "scanning",
-                    "complete": False,
-                    "scanning": True,
-                    "last_attempt_at": scan_started_at,
-                }
+        Issue #157: the base-filter queues and the direction facts behind
+        them are cached in memory keyed by the prepared-inputs version and
+        rebuilt only when those inputs change — batches rotate through the
+        cached order without re-reading the catalog.  Returns ``None``
+        while preparation is pending or the catalog is unusable.
+        """
 
-            if stop_event is not None and stop_event.is_set():
-                return self._finish_candidate_scan(
-                    previous,
-                    state="unknown",
-                    complete=False,
-                    checked_at=scan_started_at,
-                    scan_started_at=scan_started_at,
-                    retention_reason="scan_cancelled",
-                )
-            catalog_reader = getattr(self.exchange, "lp_reward_catalog", None)
-            metadata_reader = getattr(self.exchange, "lp_market_metadata", None)
-            # Issue #146: scan, maintenance, and the dashboard snapshot share
-            # one account read through the trading client's TTL cache.
-            account_reader = getattr(
-                self.exchange, "lp_account_snapshot_shared", None
+        # The available budget feeds the over-available exclusion, so the
+        # reservation signature joins the cache key: a new active
+        # reservation invalidates the cached queues.
+        reservations = self._candidate_reservations()
+        reservation_signature = tuple(
+            (str(entry.get("order_id")), str(entry.get("amount")))
+            for entry in reservations
+        )
+        with self._candidate_state_lock:
+            version = self._prepared_inputs_version
+            cached = self._candidate_queue_state
+        if (
+            cached is not None
+            and cached.get("version") == version
+            and cached.get("reservation_signature") == reservation_signature
+        ):
+            return cached
+        prepared = self._prepared_input_snapshot()
+        if not isinstance(prepared, Mapping):
+            return None
+        catalog = prepared.get("catalog")
+        metadata_value = prepared.get("metadata")
+        if not isinstance(catalog, Mapping):
+            return None
+        raw_markets = (
+            catalog.get("markets") if isinstance(catalog, Mapping) else None
+        )
+        if not isinstance(raw_markets, (list, tuple)):
+            return None
+        market_rows = [dict(row) for row in raw_markets if isinstance(row, Mapping)]
+        if not isinstance(metadata_value, Mapping):
+            return None
+        metadata_by_condition = {
+            str(key): value
+            for key, value in metadata_value.items()
+            if isinstance(key, str) and isinstance(value, Mapping)
+        }
+        catalog_reader = getattr(self.exchange, "lp_reward_catalog", None)
+        account_reader = getattr(
+            self.exchange, "lp_account_snapshot_shared", None
+        )
+        if not callable(account_reader):
+            account_reader = getattr(self.exchange, "lp_account_snapshot", None)
+        if not callable(catalog_reader) or not callable(account_reader):
+            return None
+        condition_ids = tuple(
+            dict.fromkeys(
+                str(row.get("condition_id") or "").strip()
+                for row in market_rows
+                if str(row.get("condition_id") or "").strip()
             )
-            if not callable(account_reader):
-                account_reader = getattr(self.exchange, "lp_account_snapshot", None)
-            books_reader = getattr(self.exchange, "lp_order_books", None)
-            if (
-                not callable(catalog_reader)
-                or not callable(metadata_reader)
-                or not callable(account_reader)
-            ):
-                raise ValueError("candidate_readers_unavailable")
-            prepared = self._prepared_input_snapshot()
-            if not isinstance(prepared, Mapping):
-                return self._finish_candidate_scan(
-                    previous,
-                    state="stale" if previous.get("last_success_at") else "unknown",
-                    complete=False,
-                    checked_at=self._now(),
-                    scan_started_at=scan_started_at,
-                    retention_reason="catalog_preparation_pending",
-                )
-            catalog = prepared.get("catalog")
-            metadata_value = prepared.get("metadata")
-            if not isinstance(catalog, Mapping):
-                return self._finish_candidate_scan(
-                    previous,
-                    state="stale" if previous.get("last_success_at") else "unknown",
-                    complete=False,
-                    checked_at=self._now(),
-                    scan_started_at=scan_started_at,
-                    retention_reason="reward_catalog_unknown",
-                    catalog_complete=False,
-                )
-            catalog_is_known = (
-                isinstance(catalog, Mapping) and catalog.get("state") == "known"
-            )
-            raw_markets = (
-                catalog.get("markets")
-                if isinstance(catalog, Mapping)
-                else None
-            )
-            if not isinstance(raw_markets, (list, tuple)):
-                return self._finish_candidate_scan(
-                    previous,
-                    state="stale" if previous.get("last_success_at") else "unknown",
-                    complete=False,
-                    checked_at=(
-                        catalog.get("checked_at")
-                        if isinstance(catalog, Mapping)
-                        else None
-                    )
-                    or self._now(),
-                    scan_started_at=scan_started_at,
-                    retention_reason="reward_catalog_unknown",
-                    catalog_complete=False,
-                )
-            market_rows = [dict(row) for row in raw_markets if isinstance(row, Mapping)]
-            if not market_rows:
-                if not catalog_is_known or catalog.get("complete") is not True:
-                    return self._finish_candidate_scan(
-                        previous,
-                        state="stale" if previous.get("last_success_at") else "incomplete",
-                        complete=False,
-                        checked_at=(
-                            catalog.get("checked_at")
-                            if isinstance(catalog, Mapping)
-                            else None
-                        )
-                        or self._now(),
-                        scan_started_at=scan_started_at,
-                        retention_reason="reward_catalog_unknown",
-                        catalog_complete=False,
-                    )
-                self._publish_sample_targets(())
-                completed_at = self._now()
-                with self._candidate_state_lock:
-                    self._candidate_scan_completed_at = completed_at
-                return self._finish_candidate_scan(
-                    previous,
-                    state="ready",
-                    complete=True,
-                    checked_at=completed_at,
-                    scan_started_at=scan_started_at,
-                    last_success_at=completed_at,
-                    candidates=[],
-                    recommendations=[],
-                    selected_results=[],
-                    missing_metadata_condition_ids=(),
-                    missing_book_token_ids=(),
-                    catalog_complete=True,
-                    funnel={
-                        "read": 0,
-                        "base": 0,
-                        "sort": 0,
-                        "trial": 0,
-                        "competition_known": 0,
-                        "competition_unknown": 0,
-                        "excluded": {"competition_empty": 0, "over_available": 0},
-                        "gap_reason": None,
-                        "compared_range": {"compared": 0, "total": 0, "pending": 0},
-                        "conditions": _lp_funnel_conditions(),
-                        "reasons": {"read": [], "base": [], "sort": [], "trial": []},
-                    },
-                    selected_market_ids=(),
-                )
-
-            condition_ids = tuple(
-                dict.fromkeys(
-                    str(row.get("condition_id") or "").strip()
-                    for row in market_rows
-                    if str(row.get("condition_id") or "").strip()
-                )
-            )
-            metadata_observed_at = self._now()
-            if not isinstance(metadata_value, Mapping):
-                raise ValueError("candidate_market_facts_unknown")
-            metadata_by_condition = {
-                str(key): value
-                for key, value in metadata_value.items()
-                if isinstance(key, str) and isinstance(value, Mapping)
-            }
-            missing_metadata_condition_ids = tuple(
-                condition_id for condition_id in condition_ids
-                if condition_id not in metadata_by_condition
-            )
-            account: Mapping[str, object] | None = None
+        )
+        missing_metadata_condition_ids = tuple(
+            condition_id
+            for condition_id in condition_ids
+            if condition_id not in metadata_by_condition
+        )
+        account: Mapping[str, object] | None = None
+        if market_rows:
+            # An empty catalog needs no budget facts at all.
             try:
                 account_value = account_reader()
             except Exception:
@@ -4136,779 +4027,1102 @@ class PolymarketLPService:
                 and account_value.get("authenticated") is True
             ):
                 account = account_value
-            if account is None:
-                # Issue #143 decision 5: without a usable account fact the
-                # round never enters batch consumption — zero batch reads,
-                # zero checked markets, the previous rows stay for read-only
-                # display, and the next round or a manual force retries.
-                funnel = dict(previous.get("funnel") or {})
-                funnel["checked"] = 0
-                funnel["passed"] = 0
-                funnel["rejected"] = 0
-                funnel["unknown"] = 0
-                funnel["unchecked"] = None
-                funnel["batches"] = 0
-                funnel["backup_read"] = 0
-                funnel["stop_reason"] = "account_unavailable"
-                return self._finish_candidate_scan(
-                    previous,
-                    state="stale" if previous.get("last_success_at") else "unknown",
-                    complete=False,
-                    checked_at=self._now(),
-                    scan_started_at=scan_started_at,
-                    retention_reason="account_unavailable",
-                    funnel=funnel,
+        checked_at = self._now()
+        cache_batch_reader = getattr(
+            self.store, "lp_price_history_summaries", None
+        )
+        cache_reader = getattr(self.store, "lp_price_history_summary", None)
+        saved_screening = getattr(
+            self.store, "lp_screening_snapshot", lambda: None
+        )()
+        saved_confirmations = (
+            saved_screening.get("event_end_confirmations", {})
+            if isinstance(saved_screening, Mapping)
+            else {}
+        )
+        event_end_confirmations = (
+            deepcopy(dict(saved_confirmations))
+            if isinstance(saved_confirmations, Mapping)
+            else {}
+        )
+        direction_facts: list[dict[str, object]] = []
+        complete = (
+            isinstance(catalog, Mapping)
+            and catalog.get("state") == "known"
+            and catalog.get("complete") is True
+            and not missing_metadata_condition_ids
+        )
+        cache_identities = tuple(
+            (
+                condition_id,
+                str(outcome.get("token_id") or "").strip(),
+            )
+            for reward_market in market_rows
+            for condition_id in (
+                str(reward_market.get("condition_id") or "").strip(),
+            )
+            for market_meta in (metadata_by_condition.get(condition_id),)
+            if isinstance(market_meta, Mapping)
+            and isinstance(market_meta.get("outcomes"), Mapping)
+            for outcome in cast(
+                Mapping[object, object], market_meta["outcomes"]
+            ).values()
+            if isinstance(outcome, Mapping)
+            and str(outcome.get("token_id") or "").strip()
+        )
+        cached_summaries: Mapping[tuple[str, str], Mapping[str, object]] = {}
+        if callable(cache_batch_reader):
+            try:
+                batch_value = cache_batch_reader(cache_identities, now=checked_at)
+            except Exception:
+                batch_value = {}
+            if isinstance(batch_value, Mapping):
+                cached_summaries = batch_value
+        reward_market_by_condition: dict[str, Mapping[str, object]] = {}
+        for reward_market in market_rows:
+            condition_id = str(reward_market.get("condition_id") or "").strip()
+            market_meta = metadata_by_condition.get(condition_id)
+            if market_meta is None:
+                complete = False
+                continue
+            raw_outcomes = market_meta.get("outcomes")
+            if not isinstance(raw_outcomes, Mapping):
+                complete = False
+                continue
+            reward_minimum, reward_spread = _lp_reward_terms(
+                market_meta,
+                reward_market,
+            )
+            if reward_minimum is None or reward_spread is None:
+                complete = False
+            confirmation = event_end_confirmations.get(condition_id)
+            reward_deadline = self._reward_guidance_deadline(reward_market)
+            reward_market_by_condition[condition_id] = reward_market
+            for outcome_key, raw_outcome in raw_outcomes.items():
+                if str(outcome_key).lower() not in {"yes", "no"} or not isinstance(
+                    raw_outcome, Mapping
+                ):
+                    continue
+                token_id = str(raw_outcome.get("token_id") or "").strip()
+                if not token_id:
+                    complete = False
+                    continue
+                summary: Mapping[str, object] | None = None
+                cache_key = (condition_id, token_id)
+                cached_summary = cached_summaries.get(cache_key)
+                if isinstance(cached_summary, Mapping):
+                    summary = cached_summary
+                elif not callable(cache_batch_reader) and callable(cache_reader):
+                    try:
+                        cached = cache_reader(
+                            condition_id, token_id, now=checked_at
+                        )
+                    except Exception:
+                        cached = None
+                    if isinstance(cached, Mapping):
+                        summary = cached
+                direction_facts.append(
+                    _lp_direction_fact(
+                        market_meta,
+                        reward_market,
+                        condition_id=condition_id,
+                        token_id=token_id,
+                        outcome=str(raw_outcome.get("label") or outcome_key).upper(),
+                        reward_checked_at=catalog.get("checked_at"),
+                        reward_guidance_deadline=reward_deadline,
+                        event_end_confirmation=confirmation,
+                        history_summary=summary,
+                        account=account,
+                    )
                 )
-            checked_at = self._now()
-            reservations = self._candidate_reservations()
-            cache_batch_reader = getattr(
-                self.store, "lp_price_history_summaries", None
+
+        from .polymarket_lp_views import lp_trial_candidates
+
+        available_facts: dict[str, object] = {}
+        if account is not None:
+            adjusted_account = _account_after_reservations(
+                account, self._candidate_reservations()
             )
-            cache_reader = getattr(self.store, "lp_price_history_summary", None)
-            saved_screening = getattr(self.store, "lp_screening_snapshot", lambda: None)()
-            saved_confirmations = (
-                saved_screening.get("event_end_confirmations", {})
-                if isinstance(saved_screening, Mapping) else {}
-            )
-            event_end_confirmations = deepcopy(dict(saved_confirmations)) if isinstance(saved_confirmations, Mapping) else {}
-            direction_facts: list[dict[str, object]] = []
-            complete = catalog_is_known and catalog.get("complete") is True
-            complete = complete and not missing_metadata_condition_ids
-            cache_identities = tuple(
-                (
-                    condition_id,
-                    str(
-                        outcome.get("token_id") or ""
-                    ).strip(),
+            if isinstance(adjusted_account, Mapping):
+                adjusted_balance = _maybe_decimal(
+                    adjusted_account.get("balance")
                 )
-                for reward_market in market_rows
-                for condition_id in (str(reward_market.get("condition_id") or "").strip(),)
-                for market_meta in (metadata_by_condition.get(condition_id),)
-                if isinstance(market_meta, Mapping)
-                and isinstance(market_meta.get("outcomes"), Mapping)
-                for outcome in cast(Mapping[object, object], market_meta["outcomes"]).values()
-                if isinstance(outcome, Mapping)
-                and str(outcome.get("token_id") or "").strip()
+                adjusted_allowance = _maybe_decimal(
+                    adjusted_account.get("allowance")
+                )
+                if adjusted_balance is not None and adjusted_allowance is not None:
+                    available_facts["available_capital"] = min(
+                        adjusted_balance, adjusted_allowance
+                    )
+        trial = lp_trial_candidates(
+            direction_facts,
+            competition=self._competition_entries(),
+            account_budget_facts=available_facts,
+            now=checked_at,
+        )
+        queue_normal = [
+            dict(row)
+            for row in (trial.get("queue_normal") or ())
+            if isinstance(row, Mapping)
+        ]
+        queue_backup = [
+            dict(row)
+            for row in (trial.get("queue_backup") or ())
+            if isinstance(row, Mapping)
+        ]
+        directions_by_condition: dict[str, list[Mapping[str, object]]] = {}
+        for direction in direction_facts:
+            if not isinstance(direction, Mapping):
+                continue
+            market = direction.get("market")
+            if not isinstance(market, Mapping):
+                continue
+            direction_condition = str(market.get("condition_id") or "").strip()
+            if direction_condition:
+                directions_by_condition.setdefault(
+                    direction_condition, []
+                ).append(direction)
+        trial_funnel = dict(trial.get("funnel") or {})
+        queue_funnel = {
+            key: deepcopy(trial_funnel.get(key))
+            for key in (
+                "read",
+                "base",
+                "sort",
+                "competition_known",
+                "competition_unknown",
+                "excluded",
+                "normal_queue_count",
+                "backup_queue_count",
+                "reference_price_unknown",
+                "compared_range",
+                "reasons",
+                "budget",
             )
-            cached_summaries: Mapping[tuple[str, str], Mapping[str, object]] = {}
-            if callable(cache_batch_reader):
+            if key in trial_funnel
+        }
+        queue_funnel["compared_range"] = deepcopy(
+            trial.get("compared_range") or {}
+        )
+        queue_funnel["queue_total"] = len(queue_normal) + len(queue_backup)
+        # Keep the published (JSON-like) funnel shape, as the whole-scan
+        # snapshot did through its durable-store round trip.
+        queue_funnel = _pool_published_value(queue_funnel)
+        state = {
+            "version": version,
+            "reservation_signature": reservation_signature,
+            "queue_normal": queue_normal,
+            "queue_backup": queue_backup,
+            "directions_by_condition": directions_by_condition,
+            "metadata_by_condition": metadata_by_condition,
+            "reward_market_by_condition": reward_market_by_condition,
+            "catalog_checked_at": catalog.get("checked_at"),
+            "catalog_is_known": (
+                isinstance(catalog, Mapping)
+                and catalog.get("state") == "known"
+            ),
+            "catalog_complete": (
+                isinstance(catalog, Mapping)
+                and catalog.get("complete") is True
+            ),
+            "complete": complete,
+            "event_end_confirmations": event_end_confirmations,
+            "missing_metadata_condition_ids": missing_metadata_condition_ids,
+            "queue_funnel": queue_funnel,
+            "compared_range": dict(trial.get("compared_range") or {}),
+            "evaluation_account": deepcopy(dict(account))
+            if isinstance(account, Mapping)
+            else None,
+            "built_at": checked_at,
+        }
+        with self._candidate_state_lock:
+            current = self._candidate_queue_state
+            if (
+                current is None
+                or current.get("version") != version
+                or current.get("reservation_signature")
+                != reservation_signature
+            ):
+                self._candidate_queue_state = state
+                self._candidate_queue_funnel = dict(queue_funnel)
+            return self._candidate_queue_state or state
+
+    def _candidate_rotation_entry(
+        self, condition_id: str
+    ) -> dict[str, object]:
+        with self._candidate_state_lock:
+            entry = self._candidate_rotation.get(condition_id)
+        if isinstance(entry, Mapping):
+            return dict(entry)
+        return {"last_attempt_at": None, "failures": 0}
+
+    def _candidate_rotation_due(
+        self, condition_id: str, *, now: datetime
+    ) -> bool:
+        """Whether a tried market's failure backoff has elapsed (issue #157).
+
+        The ladder stays 60/120/300 seconds per market and a success resets
+        it; deterministic rejections and successes never wait.
+        """
+
+        entry = self._candidate_rotation_entry(condition_id)
+        failures = entry.get("failures")
+        last_attempt_at = _candidate_row_updated_at(
+            {"updated_at": entry.get("last_attempt_at")}
+        )
+        if last_attempt_at is None:
+            return True
+        if not isinstance(failures, int) or failures <= 0:
+            return True
+        backoff = _CANDIDATE_MAINTENANCE_BACKOFF_SECONDS[
+            min(failures - 1, len(_CANDIDATE_MAINTENANCE_BACKOFF_SECONDS) - 1)
+        ]
+        return now >= last_attempt_at + timedelta(seconds=float(backoff))
+
+    def _select_candidate_batch(
+        self,
+        queue_state: Mapping[str, object],
+        *,
+        now: datetime,
+    ) -> list[tuple[Mapping[str, object], str]]:
+        """Pick the next exploration batch (issue #157 rotation order).
+
+        Markets never tried come first in the base queue order (normal then
+        backup); the rest follow by oldest attempt time with markets inside
+        their failure backoff skipped.  The batch never exceeds
+        ``_LP_CANDIDATE_BATCH_SIZE`` markets.
+        """
+
+        ordered: list[tuple[Mapping[str, object], str]] = []
+        seen: set[str] = set()
+        for queue in ("queue_normal", "queue_backup"):
+            for candidate in queue_state.get(queue) or ():
+                if not isinstance(candidate, Mapping):
+                    continue
+                condition_id = str(
+                    candidate.get("condition_id") or ""
+                ).strip()
+                if not condition_id or condition_id in seen:
+                    continue
+                seen.add(condition_id)
+                ordered.append((candidate, condition_id))
+        untried: list[tuple[Mapping[str, object], str]] = []
+        due: list[tuple[datetime, Mapping[str, object], str]] = []
+        with self._candidate_state_lock:
+            rotation = deepcopy(self._candidate_rotation)
+        for candidate, condition_id in ordered:
+            entry = rotation.get(condition_id)
+            last_attempt_at = (
+                _candidate_row_updated_at(
+                    {"updated_at": (entry or {}).get("last_attempt_at")}
+                )
+                if isinstance(entry, Mapping)
+                else None
+            )
+            if last_attempt_at is None:
+                untried.append((candidate, condition_id))
+                continue
+            if not self._candidate_rotation_due(condition_id, now=now):
+                continue
+            due.append((last_attempt_at, candidate, condition_id))
+        due.sort(key=lambda item: item[0])
+        batch = [*untried, *[(candidate, cid) for _, candidate, cid in due]]
+        return batch[:_LP_CANDIDATE_BATCH_SIZE]
+
+    def _renew_batch_shared_facts(
+        self,
+        queue_state: MutableMapping[str, object],
+        condition_ids: tuple[str, ...],
+        *,
+        stop_event: threading.Event | None,
+    ) -> Mapping[str, object] | None:
+        """Renew expired shared facts for one batch (issue #143 repair 2).
+
+        The shared facts (metadata+fees, reward catalog, account) come from
+        the cached queue state, but a rolling batch runs long after that
+        build, so every batch re-checks their age on its own clock and
+        renews each expired class once — targeted at that batch's
+        conditions only.  A failed renewal keeps the previous facts and is
+        not retried within the batch.
+        """
+
+        directions_by_condition = cast(
+            dict[str, list[Mapping[str, object]]],
+            queue_state["directions_by_condition"],
+        )
+        metadata_by_condition = cast(
+            dict[str, Mapping[str, object]],
+            queue_state["metadata_by_condition"],
+        )
+        reward_market_by_condition = cast(
+            dict[str, Mapping[str, object]],
+            queue_state["reward_market_by_condition"],
+        )
+        evaluation_account = queue_state.get("evaluation_account")
+        evaluation_account = (
+            deepcopy(dict(evaluation_account))
+            if isinstance(evaluation_account, Mapping)
+            else None
+        )
+        now = self._now()
+        fresh_metadata: dict[str, Mapping[str, object]] = {}
+        stale_metadata_ids = _lp_metadata_stale_conditions(
+            directions_by_condition, condition_ids, now
+        )
+        if stale_metadata_ids:
+            reader = getattr(self.exchange, "lp_market_metadata_fresh", None)
+            if not callable(reader):
+                reader = getattr(self.exchange, "lp_market_metadata", None)
+            raw_metadata: object = None
+            if callable(reader):
                 try:
-                    batch_value = cache_batch_reader(cache_identities, now=checked_at)
+                    raw_metadata = reader(
+                        stale_metadata_ids, stop_event=stop_event
+                    )
+                except TypeError:
+                    try:
+                        raw_metadata = reader(stale_metadata_ids)
+                    except Exception:
+                        raw_metadata = None
                 except Exception:
-                    batch_value = {}
-                if isinstance(batch_value, Mapping):
-                    cached_summaries = batch_value
-            reward_market_by_condition: dict[str, Mapping[str, object]] = {}
-            for reward_market in market_rows:
-                condition_id = str(reward_market.get("condition_id") or "").strip()
-                market_meta = metadata_by_condition.get(condition_id)
-                if market_meta is None:
-                    complete = False
-                    continue
-                raw_outcomes = market_meta.get("outcomes")
-                if not isinstance(raw_outcomes, Mapping):
-                    complete = False
-                    continue
-                reward_minimum, reward_spread = _lp_reward_terms(
-                    market_meta,
-                    reward_market,
-                )
-                if reward_minimum is None or reward_spread is None:
-                    complete = False
-                confirmation = event_end_confirmations.get(condition_id)
-                reward_deadline = self._reward_guidance_deadline(reward_market)
-                reward_market_by_condition[condition_id] = reward_market
-                for outcome_key, raw_outcome in raw_outcomes.items():
-                    if str(outcome_key).lower() not in {"yes", "no"} or not isinstance(raw_outcome, Mapping):
-                        continue
-                    token_id = str(raw_outcome.get("token_id") or "").strip()
-                    if not token_id:
-                        complete = False
-                        continue
-                    summary: Mapping[str, object] | None = None
-                    cache_key = (condition_id, token_id)
-                    cached_summary = cached_summaries.get(cache_key)
-                    if isinstance(cached_summary, Mapping):
-                        summary = cached_summary
-                    elif not callable(cache_batch_reader) and callable(cache_reader):
-                        try:
-                            cached = cache_reader(condition_id, token_id, now=checked_at)
-                        except Exception:
-                            cached = None
-                        if isinstance(cached, Mapping):
-                            summary = cached
-                    direction_facts.append(
-                        _lp_direction_fact(
-                            market_meta,
-                            reward_market,
-                            condition_id=condition_id,
-                            token_id=token_id,
-                            outcome=str(raw_outcome.get("label") or outcome_key).upper(),
-                            reward_checked_at=catalog.get("checked_at"),
-                            reward_guidance_deadline=reward_deadline,
-                            event_end_confirmation=confirmation,
-                            history_summary=summary,
-                            account=account,
-                        )
-                    )
-
-            competition_state = self._refresh_competition(stop_event)
-
-            from .polymarket_lp_views import (
-                LP_TRIAL_CANDIDATE_LIMIT,
-                lp_trial_candidates,
+                    raw_metadata = None
+            metadata_rows = (
+                raw_metadata if isinstance(raw_metadata, Mapping) else {}
             )
+            for condition_id in stale_metadata_ids:
+                row = metadata_rows.get(condition_id)
+                if not isinstance(row, Mapping):
+                    continue
+                observed_at = self._now()
+                if _candidate_source_expired(
+                    row.get("metadata_checked_at"), observed_at
+                ) or _candidate_source_expired(
+                    row.get("fees_checked_at"), observed_at
+                ):
+                    continue
+                fresh_metadata[condition_id] = row
+            metadata_by_condition.update(fresh_metadata)
 
-            available_facts: dict[str, object] = {}
-            if account is not None:
-                adjusted_account = _account_after_reservations(
-                    account, reservations
-                )
-                if isinstance(adjusted_account, Mapping):
-                    adjusted_balance = _maybe_decimal(
-                        adjusted_account.get("balance")
+        fresh_rewards: dict[str, Mapping[str, object]] = {}
+        fresh_reward_stamps: dict[str, object] = {}
+        stale_reward_ids = _lp_reward_stale_conditions(
+            directions_by_condition, condition_ids, now
+        )
+        if stale_reward_ids:
+            catalog_reader = getattr(self.exchange, "lp_reward_catalog", None)
+            raw_reward: object = None
+            if callable(catalog_reader):
+                try:
+                    raw_reward = catalog_reader(
+                        condition_ids=stale_reward_ids, stop_event=stop_event
                     )
-                    adjusted_allowance = _maybe_decimal(
-                        adjusted_account.get("allowance")
-                    )
-                    if adjusted_balance is not None and adjusted_allowance is not None:
-                        available_facts["available_capital"] = min(
-                            adjusted_balance, adjusted_allowance
+                except TypeError:
+                    try:
+                        raw_reward = catalog_reader(
+                            condition_ids=stale_reward_ids
                         )
-            trial = lp_trial_candidates(
-                direction_facts,
-                competition=self._competition_entries(),
-                account_budget_facts=available_facts,
-                now=checked_at,
+                    except Exception:
+                        raw_reward = None
+                except Exception:
+                    raw_reward = None
+            raw_rows = (
+                raw_reward.get("markets")
+                if isinstance(raw_reward, Mapping)
+                else None
             )
-            trial_rows: list[dict[str, object]] = [
-                dict(row)
-                for row in trial.get("rows", ())
-                if isinstance(row, Mapping)
-            ]
+            reward_rows_by_id: dict[str, Mapping[str, object]] = {}
+            if isinstance(raw_rows, Mapping):
+                reward_rows_by_id = {
+                    str(key): value
+                    for key, value in raw_rows.items()
+                    if isinstance(value, Mapping)
+                }
+            elif isinstance(raw_rows, (list, tuple)):
+                for row in raw_rows:
+                    if isinstance(row, Mapping):
+                        reward_rows_by_id.setdefault(
+                            str(row.get("condition_id") or ""), row
+                        )
+            observed_at = self._now()
+            for condition_id in stale_reward_ids:
+                row = reward_rows_by_id.get(condition_id)
+                if (
+                    not isinstance(row, Mapping)
+                    or row.get("state") == "unknown"
+                ):
+                    continue
+                reward_stamp = row.get("reward_checked_at")
+                if reward_stamp is None and isinstance(raw_reward, Mapping):
+                    reward_stamp = raw_reward.get("checked_at")
+                if _candidate_source_expired(reward_stamp, observed_at):
+                    continue
+                fresh_rewards[condition_id] = row
+                fresh_reward_stamps[condition_id] = reward_stamp
 
-            missing_book_token_ids: list[str] = []
-            selected_results: list[dict[str, object]] = []
-            recommendations: list[dict[str, object]] = []
-            # Batch scan (issue #143): consume the full kept queues in batches
-            # of at most ten distinct markets (nine normal + one backup, each
-            # queue topping the other up), read the whole batch's books in one
-            # call, qualify every market in both directions, and keep merging
-            # passers until ten passed, the queues run out, or the round
-            # budget stops the scan.
-            queue_normal = [
-                dict(row)
-                for row in (trial.get("queue_normal") or ())
-                if isinstance(row, Mapping)
-            ]
-            queue_backup = [
-                dict(row)
-                for row in (trial.get("queue_backup") or ())
-                if isinstance(row, Mapping)
-            ]
-            queue_total = len(queue_normal) + len(queue_backup)
-            directions_by_condition: dict[str, list[Mapping[str, object]]] = {}
-            for direction in direction_facts:
+        account_reader = getattr(
+            self.exchange, "lp_account_snapshot_shared", None
+        )
+        if not callable(account_reader):
+            account_reader = getattr(self.exchange, "lp_account_snapshot", None)
+        if evaluation_account is None or _candidate_source_expired(
+            evaluation_account.get("checked_at"), now
+        ):
+            if callable(account_reader):
+                try:
+                    refreshed_account = account_reader()
+                except Exception:
+                    refreshed_account = None
+                if (
+                    isinstance(refreshed_account, Mapping)
+                    and refreshed_account.get("authenticated") is True
+                    and not _candidate_source_expired(
+                        refreshed_account.get("checked_at"), self._now()
+                    )
+                ):
+                    evaluation_account = deepcopy(dict(refreshed_account))
+        queue_state["evaluation_account"] = (
+            deepcopy(dict(evaluation_account))
+            if isinstance(evaluation_account, Mapping)
+            else None
+        )
+
+        renewed_ids = tuple(dict.fromkeys((*fresh_metadata, *fresh_rewards)))
+        for condition_id in renewed_ids:
+            market_meta = (
+                fresh_metadata[condition_id]
+                if condition_id in fresh_metadata
+                else metadata_by_condition.get(condition_id)
+            )
+            reward_row = (
+                fresh_rewards[condition_id]
+                if condition_id in fresh_rewards
+                else reward_market_by_condition.get(condition_id)
+            )
+            if (
+                not isinstance(market_meta, Mapping)
+                or not isinstance(reward_row, Mapping)
+            ):
+                continue
+            reward_deadline = self._reward_guidance_deadline(reward_row)
+            rebuilt: list[Mapping[str, object]] = []
+            for direction in directions_by_condition.get(condition_id, ()):
                 if not isinstance(direction, Mapping):
                     continue
                 market = direction.get("market")
                 if not isinstance(market, Mapping):
                     continue
-                direction_condition = str(market.get("condition_id") or "").strip()
-                if direction_condition:
-                    directions_by_condition.setdefault(
-                        direction_condition, []
-                    ).append(direction)
-            passers: list[dict[str, object]] = []
-            checked_count = 0
-            passed_count = 0
-            rejected_count = 0
-            unknown_count = 0
-            batches_read = 0
-            backup_read_count = 0
-            stop_reason = "queue_exhausted"
-            scan_unknown_reasons: list[dict[str, object]] = []
-            # Reviewer fix 2: qualification facts are collected into this
-            # round-local mapping while batches run and swapped as a whole
-            # under `_candidate_state_lock` when the round publishes, so
-            # `candidate_snapshot()` deep copies never see a resizing dict.
-            round_facts: dict[str, object] = {}
-            # Issue #143 repair 2: the shared facts (metadata+fees, reward
-            # catalog, account) are built once at round start, but a real
-            # round outlives the 60-second fact window, so every batch
-            # re-checks their age on that batch's own clock and renews each
-            # expired class once — targeted at that batch's conditions only.
-            # Fresh (<=60s) facts are reused without another read.  A failed
-            # renewal keeps the previous facts (honest stale unknowns) and is
-            # never retried for the rest of the round; the next round or a
-            # manual force starts over.
-            metadata_renewal_failed = False
-            reward_renewal_failed = False
-            account_renewal_failed = False
-            evaluation_account: Mapping[str, object] | None = account
-
-            def _renew_batch_shared_facts(
-                condition_ids: tuple[str, ...], now: datetime
-            ) -> None:
-                nonlocal metadata_renewal_failed, reward_renewal_failed
-                nonlocal account_renewal_failed, evaluation_account
-
-                fresh_metadata: dict[str, Mapping[str, object]] = {}
-                stale_metadata_ids = _lp_metadata_stale_conditions(
-                    directions_by_condition, condition_ids, now
-                )
-                if stale_metadata_ids and not metadata_renewal_failed:
-                    reader = getattr(self.exchange, "lp_market_metadata_fresh", None)
-                    if not callable(reader):
-                        reader = getattr(self.exchange, "lp_market_metadata", None)
-                    raw_metadata: object = None
-                    if callable(reader):
-                        try:
-                            raw_metadata = reader(
-                                stale_metadata_ids, stop_event=stop_event
-                            )
-                        except TypeError:
-                            try:
-                                raw_metadata = reader(stale_metadata_ids)
-                            except Exception:
-                                raw_metadata = None
-                        except Exception:
-                            raw_metadata = None
-                    metadata_rows = (
-                        raw_metadata if isinstance(raw_metadata, Mapping) else {}
+                outcome = str(market.get("outcome") or "").upper()
+                token_id = str(market.get("token_id") or "").strip()
+                if outcome not in {"YES", "NO"} or not token_id:
+                    continue
+                rebuilt.append(
+                    _lp_direction_fact(
+                        market_meta,
+                        reward_row,
+                        condition_id=condition_id,
+                        token_id=token_id,
+                        outcome=outcome,
+                        reward_checked_at=(
+                            fresh_reward_stamps[condition_id]
+                            if condition_id in fresh_reward_stamps
+                            else direction.get("reward_checked_at")
+                        ),
+                        reward_guidance_deadline=reward_deadline,
+                        event_end_confirmation=direction.get(
+                            "event_end_confirmation"
+                        ),
+                        history_summary=direction.get("history_summary"),
+                        account=evaluation_account,
                     )
-                    response_complete = True
-                    for condition_id in stale_metadata_ids:
-                        row = metadata_rows.get(condition_id)
-                        if not isinstance(row, Mapping):
-                            response_complete = False
-                            continue
-                        observed_at = self._now()
-                        if _candidate_source_expired(
-                            row.get("metadata_checked_at"), observed_at
-                        ) or _candidate_source_expired(
-                            row.get("fees_checked_at"), observed_at
-                        ):
-                            response_complete = False
-                            continue
-                        fresh_metadata[condition_id] = row
-                    if not response_complete:
-                        metadata_renewal_failed = True
-                    metadata_by_condition.update(fresh_metadata)
-
-                fresh_rewards: dict[str, Mapping[str, object]] = {}
-                fresh_reward_stamps: dict[str, object] = {}
-                stale_reward_ids = _lp_reward_stale_conditions(
-                    directions_by_condition, condition_ids, now
                 )
-                if stale_reward_ids and not reward_renewal_failed:
-                    raw_reward: object = None
+            if rebuilt:
+                directions_by_condition[condition_id] = rebuilt
+        return evaluation_account
+
+    def _candidate_pool_record_success(
+        self,
+        condition_id: str,
+        row: Mapping[str, object],
+        *,
+        judged_at: datetime,
+        facts: Mapping[str, object] | None = None,
+    ) -> bool:
+        """Store one successful estimate in the pool (issue #157).
+
+        One-line write protection: the new result wins only when its
+        judgment time is at or after the stored row's ``updated_at`` — a
+        late-arriving older evaluation never overwrites a newer one.  A
+        success also resets the market's rotation failure ladder.
+        """
+
+        stored = _pool_published_value(dict(row))
+        stored["updated_at"] = _iso(judged_at)
+        stored["expires_at"] = _iso(
+            judged_at
+            + timedelta(seconds=float(LP_CANDIDATE_VALIDITY_SECONDS))
+        )
+        stored["refresh_failed"] = False
+        with self._candidate_state_lock:
+            existing = self._candidate_pool.get(condition_id)
+            if existing is not None:
+                existing_updated = _candidate_row_updated_at(existing)
+                if existing_updated is not None and existing_updated > judged_at:
+                    return False
+            self._candidate_pool[condition_id] = stored
+            if facts is not None:
+                self._candidate_qualification_facts[condition_id] = deepcopy(
+                    dict(facts)
+                )
+            entry = self._candidate_rotation.get(condition_id)
+            rotation = dict(entry) if isinstance(entry, Mapping) else {}
+            rotation["last_attempt_at"] = _iso(judged_at)
+            rotation["failures"] = 0
+            self._candidate_rotation[condition_id] = rotation
+        return True
+
+    def _candidate_pool_record_failure(
+        self, condition_id: str, *, attempted_at: datetime
+    ) -> None:
+        """Keep the stored row on a failed re-estimate (issue #157).
+
+        The row keeps its values until its original ``expires_at``, is
+        marked ``refresh_failed``, and its ``updated_at`` never moves; the
+        market's rotation failure ladder advances (60/120/300s).
+        """
+
+        with self._candidate_state_lock:
+            existing = self._candidate_pool.get(condition_id)
+            if existing is not None:
+                existing["refresh_failed"] = True
+            entry = self._candidate_rotation.get(condition_id)
+            rotation = dict(entry) if isinstance(entry, Mapping) else {}
+            rotation["last_attempt_at"] = _iso(attempted_at)
+            failures = rotation.get("failures")
+            rotation["failures"] = (
+                failures + 1 if isinstance(failures, int) else 1
+            )
+            self._candidate_rotation[condition_id] = rotation
+
+    def _candidate_pool_record_rejection(
+        self, condition_id: str, *, judged_at: datetime
+    ) -> None:
+        """Remove a deterministically rejected market from the pool and put
+        it back at the rotation tail (issue #157)."""
+
+        with self._candidate_state_lock:
+            self._candidate_pool.pop(condition_id, None)
+            entry = self._candidate_rotation.get(condition_id)
+            rotation = dict(entry) if isinstance(entry, Mapping) else {}
+            rotation["last_attempt_at"] = _iso(judged_at)
+            rotation["failures"] = 0
+            self._candidate_rotation[condition_id] = rotation
+
+    def _save_candidate_pool(self, *, force: bool = False) -> None:
+        """Persist the pool with the five-second save throttle (issue #157).
+
+        The payload carries the pool rows with their original timestamps,
+        the rotation schedule, and the event-end confirmations.  The save
+        arbiter keeps the newest ``scan_started_at``, which for pool saves
+        is the publish time.
+        """
+
+        writer = getattr(self.store, "lp_save_screening_snapshot", None)
+        if not callable(writer):
+            return
+        now = self._now()
+        with self._candidate_state_lock:
+            last = self._candidate_pool_last_saved_at
+            if not force and last is not None and Decimal(
+                str((now - last).total_seconds())
+            ) < _LP_CANDIDATE_SNAPSHOT_SAVE_MIN_INTERVAL_SECONDS:
+                return
+            snapshot = deepcopy(self._candidate_snapshot)
+            payload = {
+                "pool_version": 2,
+                "scan_started_at": _iso(now),
+                "state": "ready" if self._candidate_pool else "unknown",
+                "complete": True,
+                "pool": deepcopy(self._candidate_pool),
+                "rotation": deepcopy(self._candidate_rotation),
+                "event_end_confirmations": deepcopy(
+                    self._candidate_snapshot.get(
+                        "event_end_confirmations", {}
+                    )
+                ),
+                "last_attempt_at": snapshot.get("last_attempt_at"),
+                "checked_at": snapshot.get("checked_at"),
+                "last_success_at": snapshot.get("last_success_at"),
+            }
+            self._candidate_pool_last_saved_at = now
+        try:
+            writer(payload)
+        except Exception:
+            with self._candidate_state_lock:
+                self._candidate_pool_last_saved_at = None
+
+    def _finish_candidate_scan(
+        self,
+        *,
+        attempted_at: datetime | None = None,
+        checked_at: datetime | None = None,
+        success: bool = False,
+        scanning: bool = False,
+        complete: bool | None = None,
+        state: str | None = None,
+        notes: Mapping[str, object] | None = None,
+        missing_book_token_ids: Sequence[str] | None = None,
+    ) -> dict[str, object]:
+        """Publish the rolling pool incrementally and persist it (issue #157).
+
+        Shared by the exploration and maintenance paths: the pool rows were
+        already rewritten one by one, so this only refreshes the published
+        metadata, reprojects the snapshot, and saves through the throttled
+        pool writer.
+        """
+
+        now = self._now()
+        attempted = attempted_at or now
+        with self._candidate_state_lock:
+            snapshot = deepcopy(self._candidate_snapshot)
+            snapshot["scanning"] = scanning
+            snapshot["last_attempt_at"] = attempted
+            if checked_at is not None:
+                snapshot["checked_at"] = checked_at
+            if success:
+                snapshot["last_success_at"] = checked_at or attempted
+            if complete is not None:
+                snapshot["complete"] = complete
+            if state is not None:
+                snapshot["state"] = state
+            if notes:
+                if "stop_reason" in notes:
+                    self._candidate_stop_note = notes.get("stop_reason")
+                for key, value in notes.items():
+                    snapshot[key] = deepcopy(value)
+            if missing_book_token_ids is not None:
+                snapshot["missing_book_token_ids"] = list(
+                    dict.fromkeys(missing_book_token_ids)
+                )
+            self._candidate_snapshot = snapshot
+        projection = self.candidate_snapshot()
+        self._save_candidate_pool()
+        return projection
+
+    def refresh_candidates(
+        self,
+        *,
+        stop_event: threading.Event | None = None,
+        force: bool = False,
+    ) -> dict[str, object]:
+        """Process one rolling exploration batch (issue #157).
+
+        Each call picks the next batch from the base-filter queues — markets
+        never tried come first in queue order, the rest rotate by oldest
+        attempt — reads the whole batch's books in one call (at most ten
+        markets / 20 tokens), qualifies every market in both directions on
+        the batch's renewed shared facts, and publishes the batch's results
+        into the pool incrementally.  There is no round window, market cap,
+        or whole-table publication anymore; a concurrent call returns the
+        current snapshot with ``scanning`` set.
+        """
+
+        del force  # force only skips the runtime scheduler's wait now.
+        if not self._candidate_scan_lock.acquire(blocking=False):
+            snapshot = self.candidate_snapshot()
+            snapshot["scanning"] = True
+            return snapshot
+        try:
+            attempted_at = self._now()
+            with self._candidate_state_lock:
+                self._candidate_attempted_at = attempted_at
+                self._candidate_snapshot = {
+                    **self._candidate_snapshot,
+                    "scanning": True,
+                    "last_attempt_at": attempted_at,
+                }
+            if stop_event is not None and stop_event.is_set():
+                return self._finish_candidate_scan(
+                    attempted_at=attempted_at,
+                    notes={"stop_reason": "scan_cancelled"},
+                )
+            queue_state = self._candidate_queue_state_build(
+                stop_event=stop_event
+            )
+            if queue_state is None:
+                return self._finish_candidate_scan(
+                    attempted_at=attempted_at,
+                    notes={
+                        "stop_reason": "preparation_pending",
+                        "retention_reason": "catalog_preparation_pending",
+                    },
+                )
+            batch = self._select_candidate_batch(
+                queue_state, now=self._now()
+            )
+            if not batch:
+                queue_total = (queue_state.get("queue_funnel") or {}).get(
+                    "queue_total"
+                )
+                if queue_total == 0:
+                    # A complete catalog whose base filter keeps nothing is
+                    # a valid, honestly empty pool.
+                    return self._finish_candidate_scan(
+                        attempted_at=attempted_at,
+                        complete=queue_state.get("complete") is True,
+                        state=(
+                            "ready"
+                            if queue_state.get("complete") is True
+                            else "incomplete"
+                        ),
+                    )
+                return self._finish_candidate_scan(attempted_at=attempted_at)
+            books_reader = getattr(self.exchange, "lp_order_books", None)
+            batch_tokens: list[str] = []
+            directions_by_condition = cast(
+                dict[str, list[Mapping[str, object]]],
+                queue_state["directions_by_condition"],
+            )
+            for _candidate, condition_id in batch:
+                for direction in directions_by_condition.get(condition_id, ()):
+                    if (
+                        isinstance(direction, Mapping)
+                        and isinstance(direction.get("market"), Mapping)
+                        and str(
+                            direction["market"].get("outcome") or ""
+                        ).upper()
+                        in {"YES", "NO"}
+                    ):
+                        market = direction["market"]
+                        token_id = str(market.get("token_id") or "").strip()
+                        if token_id and token_id not in batch_tokens:
+                            batch_tokens.append(token_id)
+            # Issue #143 decision 5 (kept for #157): without a usable
+            # account fact the batch is not consumed at all — zero book
+            # reads, the stored rows stay for read-only display, and the
+            # next batch or a manual refresh retries.
+            evaluation_account = queue_state.get("evaluation_account")
+            if not isinstance(evaluation_account, Mapping) or (
+                _candidate_source_expired(
+                    evaluation_account.get("checked_at"), self._now()
+                )
+            ):
+                account_reader = getattr(
+                    self.exchange, "lp_account_snapshot_shared", None
+                )
+                if not callable(account_reader):
+                    account_reader = getattr(
+                        self.exchange, "lp_account_snapshot", None
+                    )
+                refreshed_account: object = None
+                if callable(account_reader):
                     try:
-                        raw_reward = catalog_reader(
-                            condition_ids=stale_reward_ids, stop_event=stop_event
-                        )
-                    except TypeError:
-                        try:
-                            raw_reward = catalog_reader(
-                                condition_ids=stale_reward_ids
-                            )
-                        except Exception:
-                            raw_reward = None
+                        refreshed_account = account_reader()
                     except Exception:
-                        raw_reward = None
-                    raw_rows = (
-                        raw_reward.get("markets")
-                        if isinstance(raw_reward, Mapping)
+                        refreshed_account = None
+                if (
+                    isinstance(refreshed_account, Mapping)
+                    and refreshed_account.get("authenticated") is True
+                    and not _candidate_source_expired(
+                        refreshed_account.get("checked_at"), self._now()
+                    )
+                ):
+                    evaluation_account = refreshed_account
+                    queue_state["evaluation_account"] = deepcopy(
+                        dict(refreshed_account)
+                    )
+                else:
+                    evaluation_account = None
+                    return self._finish_candidate_scan(
+                        attempted_at=attempted_at,
+                        notes={
+                            "stop_reason": "account_unavailable",
+                            "retention_reason": "account_unavailable",
+                        },
+                    )
+            try:
+                candidate_books = (
+                    books_reader(tuple(batch_tokens), stop_event=stop_event)
+                    if callable(books_reader)
+                    else {}
+                )
+            except Exception:
+                candidate_books = {}
+            evaluation_account = self._renew_batch_shared_facts(
+                queue_state,
+                tuple(dict.fromkeys(cid for _c, cid in batch)),
+                stop_event=stop_event,
+            )
+            # Issue #157: the batch judgment time is captured before the
+            # reservations read — the last read between the renewed facts
+            # and publication — so a publication that interleaves here with
+            # a later judgment time wins the one-line write protection.
+            evaluation_now = self._now()
+            reservations = self._candidate_reservations()
+            totals = deepcopy(self._candidate_funnel_totals)
+            queue_funnel = deepcopy(
+                queue_state.get("queue_funnel") or {}
+            )
+            missing_book_token_ids: list[str] = []
+            unknown_reasons: list[dict[str, object]] = []
+            checked = passed = rejected = unknown = 0
+            backup_read = 0
+            for candidate, condition_id in batch:
+                checked += 1
+                if candidate.get("queue") == "backup":
+                    backup_read += 1
+                market_directions = [
+                    direction
+                    for direction in directions_by_condition.get(
+                        condition_id, ()
+                    )
+                    if isinstance(direction, Mapping)
+                    and isinstance(direction.get("market"), Mapping)
+                    and str(direction["market"].get("outcome") or "").upper()
+                    in {"YES", "NO"}
+                ]
+                direction_results: dict[str, dict[str, object]] = {}
+                eligible_directions: list[dict[str, object]] = []
+                qualified_directions: list[dict[str, object]] = []
+                for direction in market_directions:
+                    market = direction.get("market")
+                    if not isinstance(market, Mapping):
+                        continue
+                    outcome = str(market.get("outcome") or "").upper()
+                    token_id = str(market.get("token_id") or "").strip()
+                    book = (
+                        candidate_books.get(token_id)
+                        if isinstance(candidate_books, Mapping)
                         else None
                     )
-                    reward_rows_by_id: dict[str, Mapping[str, object]] = {}
-                    if isinstance(raw_rows, Mapping):
-                        reward_rows_by_id = {
-                            str(key): value
-                            for key, value in raw_rows.items()
-                            if isinstance(value, Mapping)
+                    qualified_direction = {**dict(direction)}
+                    if not isinstance(book, Mapping):
+                        missing_book_token_ids.append(token_id)
+                        evaluated: Mapping[str, object] = {
+                            "state": "unknown",
+                            "reason_codes": ["book_unknown"],
+                            "guidance": None,
                         }
-                    elif isinstance(raw_rows, (list, tuple)):
-                        for row in raw_rows:
-                            if isinstance(row, Mapping):
-                                reward_rows_by_id.setdefault(
-                                    str(row.get("condition_id") or ""), row
-                                )
-                    response_complete = True
-                    observed_at = self._now()
-                    for condition_id in stale_reward_ids:
-                        row = reward_rows_by_id.get(condition_id)
-                        if not isinstance(row, Mapping) or row.get("state") == "unknown":
-                            response_complete = False
-                            continue
-                        reward_stamp = row.get("reward_checked_at")
-                        if reward_stamp is None and isinstance(raw_reward, Mapping):
-                            reward_stamp = raw_reward.get("checked_at")
-                        if _candidate_source_expired(reward_stamp, observed_at):
-                            response_complete = False
-                            continue
-                        fresh_rewards[condition_id] = row
-                        fresh_reward_stamps[condition_id] = reward_stamp
-                    if not response_complete:
-                        reward_renewal_failed = True
-
-                if evaluation_account is None or _candidate_source_expired(
-                    evaluation_account.get("checked_at"), now
-                ):
-                    if not account_renewal_failed:
-                        refreshed_account: object = None
-                        try:
-                            refreshed_account = account_reader()
-                        except Exception:
-                            refreshed_account = None
-                        if (
-                            isinstance(refreshed_account, Mapping)
-                            and refreshed_account.get("authenticated") is True
-                            and not _candidate_source_expired(
-                                refreshed_account.get("checked_at"), self._now()
-                            )
-                        ):
-                            # The raw snapshot is kept: eligibility keeps
-                            # applying `_account_after_reservations` once on
-                            # top of it, and the round-start queue budget is
-                            # never rebuilt.
-                            evaluation_account = deepcopy(dict(refreshed_account))
-                        else:
-                            account_renewal_failed = True
-
-                renewed_ids = tuple(dict.fromkeys((*fresh_metadata, *fresh_rewards)))
-                for condition_id in renewed_ids:
-                    market_meta = (
-                        fresh_metadata[condition_id]
-                        if condition_id in fresh_metadata
-                        else metadata_by_condition.get(condition_id)
-                    )
-                    reward_row = (
-                        fresh_rewards[condition_id]
-                        if condition_id in fresh_rewards
-                        else reward_market_by_condition.get(condition_id)
-                    )
-                    if (
-                        not isinstance(market_meta, Mapping)
-                        or not isinstance(reward_row, Mapping)
-                    ):
-                        continue
-                    reward_deadline = self._reward_guidance_deadline(reward_row)
-                    rebuilt: list[Mapping[str, object]] = []
-                    for direction in directions_by_condition.get(condition_id, ()):
-                        if not isinstance(direction, Mapping):
-                            continue
-                        market = direction.get("market")
-                        if not isinstance(market, Mapping):
-                            continue
-                        outcome = str(market.get("outcome") or "").upper()
-                        token_id = str(market.get("token_id") or "").strip()
-                        if outcome not in {"YES", "NO"} or not token_id:
-                            continue
-                        rebuilt.append(
-                            _lp_direction_fact(
-                                market_meta,
-                                reward_row,
-                                condition_id=condition_id,
-                                token_id=token_id,
-                                outcome=outcome,
-                                reward_checked_at=(
-                                    fresh_reward_stamps[condition_id]
-                                    if condition_id in fresh_reward_stamps
-                                    else direction.get("reward_checked_at")
-                                ),
-                                reward_guidance_deadline=reward_deadline,
-                                event_end_confirmation=direction.get(
-                                    "event_end_confirmation"
-                                ),
-                                history_summary=direction.get("history_summary"),
-                                account=evaluation_account,
-                            )
+                    else:
+                        qualified_direction["book"] = deepcopy(dict(book))
+                        evaluated = evaluate_lp_entry(
+                            qualified_direction,
+                            account=evaluation_account or {},
+                            now=evaluation_now,
+                            reservations=reservations,
+                            candidate=True,
                         )
-                    if rebuilt:
-                        directions_by_condition[condition_id] = rebuilt
-
-            if callable(books_reader):
-                normal_index = 0
-                backup_index = 0
-                consumed_conditions: set[str] = set()
-                # Issue #138 round 2: the scan no longer stops once ten
-                # passers are merged — it checks until the round budget (50
-                # markets) is spent or the queues run out, then publishes the
-                # best ten by the estimated target-share yield.
-                while checked_count < _LP_CANDIDATE_SCAN_MARKET_LIMIT:
-                    batch: list[dict[str, object]] = []
-                    if backup_index < len(queue_backup):
-                        batch.append(queue_backup[backup_index])
-                        backup_index += 1
-                    while (
-                        len(batch) < LP_TRIAL_CANDIDATE_LIMIT
-                        and normal_index < len(queue_normal)
-                    ):
-                        batch.append(queue_normal[normal_index])
-                        normal_index += 1
-                    while (
-                        len(batch) < LP_TRIAL_CANDIDATE_LIMIT
-                        and backup_index < len(queue_backup)
-                    ):
-                        batch.append(queue_backup[backup_index])
-                        backup_index += 1
-                    batch = [
-                        candidate
-                        for candidate in batch
-                        if str(candidate.get("condition_id") or "").strip()
-                        not in consumed_conditions
-                    ]
-                    if not batch:
-                        break
-                    if stop_event is not None and stop_event.is_set():
-                        return self._finish_candidate_scan(
-                            previous,
-                            state="stale" if previous.get("last_success_at") else "unknown",
-                            complete=False,
-                            checked_at=self._now(),
-                            scan_started_at=scan_started_at,
-                            retention_reason="scan_cancelled",
-                        )
-                    batches_read += 1
-                    batch_entries: list[tuple[dict[str, object], str]] = []
-                    batch_tokens: list[str] = []
-                    for candidate in batch:
-                        condition_id = str(candidate.get("condition_id") or "").strip()
-                        consumed_conditions.add(condition_id)
-                        checked_count += 1
-                        if candidate.get("queue") == "backup":
-                            backup_read_count += 1
-                        batch_entries.append((candidate, condition_id))
-                        # Directions are resolved again after evaluation (the
-                        # renewal below may rebuild them), but this batch's
-                        # book request covers the tokens as queued.
-                        for direction in directions_by_condition.get(condition_id, ()):
-                            if (
-                                isinstance(direction, Mapping)
-                                and isinstance(direction.get("market"), Mapping)
-                                and str(direction["market"].get("outcome") or "").upper()
-                                in {"YES", "NO"}
-                            ):
-                                market = direction["market"]
-                                token_id = str(market.get("token_id") or "").strip()  # type: ignore[union-attr]
-                                if token_id and token_id not in batch_tokens:
-                                    batch_tokens.append(token_id)
-                    try:
-                        candidate_books = books_reader(
-                            tuple(batch_tokens), stop_event=stop_event
-                        )
-                    except Exception:
-                        candidate_books = {}
-                    # Repair 2: renew expired shared facts for this batch
-                    # once, on this batch's own clock, before qualifying.
-                    # Repair 3: the batch evaluation clock is captured only
-                    # after the renewal reads finish — real reads carry
-                    # network latency, so their stamps postdate a clock
-                    # taken earlier and evaluate_lp_entry's negative-age
-                    # guard would report every renewed fact as stale.
-                    # Renewal staleness detection keeps this pre-renewal
-                    # batch clock unchanged.
-                    _renew_batch_shared_facts(
-                        tuple(
-                            dict.fromkeys(
-                                condition_id for _, condition_id in batch_entries
-                            )
+                    qualified_directions.append(qualified_direction)
+                    result = {
+                        "token_id": token_id,
+                        "outcome": outcome,
+                        "state": evaluated.get("state", "unknown"),
+                        "eligible": evaluated.get("state") == "eligible",
+                        "reason_codes": list(
+                            evaluated.get("reason_codes", ())
                         ),
-                        self._now(),
-                    )
-                    candidate_evaluation_now = self._now()
-                    for candidate, condition_id in batch_entries:
-                        market_directions = [
-                            direction
-                            for direction in directions_by_condition.get(condition_id, ())
-                            if isinstance(direction, Mapping)
-                            and isinstance(direction.get("market"), Mapping)
-                            and str(direction["market"].get("outcome") or "").upper()
-                            in {"YES", "NO"}
-                        ]
-                        direction_results: dict[str, dict[str, object]] = {}
-                        eligible_directions: list[dict[str, object]] = []
-                        qualified_directions: list[dict[str, object]] = []
-                        for direction in market_directions:
-                            market = direction.get("market")
-                            if not isinstance(market, Mapping):
-                                continue
-                            outcome = str(market.get("outcome") or "").upper()
-                            token_id = str(market.get("token_id") or "").strip()
-                            book = (
-                                candidate_books.get(token_id)
-                                if isinstance(candidate_books, Mapping)
-                                else None
-                            )
-                            qualified_direction = {**dict(direction)}
-                            if not isinstance(book, Mapping):
-                                missing_book_token_ids.append(token_id)
-                                evaluated: Mapping[str, object] = {
-                                    "state": "unknown",
-                                    "reason_codes": ["book_unknown"],
-                                    "guidance": None,
-                                }
-                            else:
-                                qualified_direction["book"] = deepcopy(dict(book))
-                                evaluated = evaluate_lp_entry(
-                                    qualified_direction,
-                                    account=evaluation_account or {},
-                                    now=candidate_evaluation_now,
-                                    reservations=reservations,
-                                    candidate=True,
-                                )
-                            qualified_directions.append(qualified_direction)
-                            result = {
-                                "token_id": token_id,
-                                "outcome": outcome,
-                                "state": evaluated.get("state", "unknown"),
-                                "eligible": evaluated.get("state") == "eligible",
-                                "reason_codes": list(evaluated.get("reason_codes", ())),
-                                "guidance": evaluated.get("guidance"),
-                            }
-                            if isinstance(result["guidance"], Mapping):
-                                for field in (
-                                    "price",
-                                    "quantity",
-                                    "required_capital",
-                                    "estimated_exit_loss",
-                                    "estimated_exit_loss_ratio",
-                                    "checked_at",
-                                ):
-                                    if field in result["guidance"]:
-                                        result[field] = result["guidance"][field]
-                            direction_results[outcome] = result
-                            if result["eligible"] is True:
-                                eligible_directions.append(result)
-                                if isinstance(result["guidance"], Mapping):
-                                    # Issue #138 round 2: every eligible
-                                    # direction carries its 5% target-share
-                                    # estimate for the yield comparison.
-                                    result["estimate"] = _lp_direction_estimate(
-                                        qualified_direction,
-                                        result["guidance"],
-                                        now=candidate_evaluation_now,
-                                    )
-                        def _direction_yield_key(result: Mapping[str, object]) -> tuple[Decimal, str]:
-                            # Highest estimated yield first; UNKNOWN estimates
-                            # rank after known ones; the token id keeps ties
-                            # deterministic.
-                            raw = _direction_estimate_raw(result)
-                            return (
-                                -(raw if raw is not None else Decimal("-Infinity")),
-                                str(result.get("token_id") or ""),
+                        "guidance": evaluated.get("guidance"),
+                    }
+                    if isinstance(result["guidance"], Mapping):
+                        for field in (
+                            "price",
+                            "quantity",
+                            "required_capital",
+                            "estimated_exit_loss",
+                            "estimated_exit_loss_ratio",
+                            "checked_at",
+                        ):
+                            if field in result["guidance"]:
+                                result[field] = result["guidance"][field]
+                    direction_results[outcome] = result
+                    if result["eligible"] is True:
+                        eligible_directions.append(result)
+                        if isinstance(result["guidance"], Mapping):
+                            result["estimate"] = _lp_direction_estimate(
+                                qualified_direction,
+                                result["guidance"],
+                                now=evaluation_now,
                             )
 
-                        selected_direction = (
-                            min(
-                                eligible_directions,
-                                key=_direction_yield_key,
-                            )
-                            if eligible_directions
-                            else None
-                        )
-                        row_state = (
-                            "eligible"
-                            if selected_direction is not None
-                            else "unknown"
-                            if any(
-                                result.get("state") == "unknown"
-                                for result in direction_results.values()
-                            )
-                            else "rejected"
-                        )
-                        if row_state == "eligible":
-                            passed_count += 1
-                        elif row_state == "rejected":
-                            rejected_count += 1
-                        else:
-                            unknown_count += 1
-                            unknown_code = next(
-                                (
-                                    str(code)
-                                    for result in direction_results.values()
-                                    if result.get("state") == "unknown"
-                                    for code in (
-                                        result.get("reason_codes") or ()
-                                    )
-                                    if str(code)
-                                ),
-                                "candidate_unknown",
-                            )
-                            scan_unknown_reasons.append(
-                                {
-                                    "market_id": str(
-                                        candidate.get("market_id") or ""
-                                    ),
-                                    "condition_id": condition_id,
-                                    "code": unknown_code,
-                                }
-                            )
-                        if selected_direction is None:
-                            continue
-                        row = dict(candidate)
-                        row["directions"] = direction_results
-                        row["selected_direction"] = selected_direction
-                        row["state"] = row_state
-                        row["verification"] = (
-                            "verified"
-                            if direction_results
-                            and all(
-                                result.get("state") in {"eligible", "rejected"}
-                                for result in direction_results.values()
-                            )
-                            else "partial"
-                        )
-                        if isinstance(selected_direction, Mapping):
-                            guidance = selected_direction.get("guidance")
-                            if isinstance(guidance, Mapping):
-                                row["realtime_price"] = guidance.get("price")
-                                row["realtime_capital"] = guidance.get(
-                                    "required_capital"
-                                )
-                                row["realtime_checked_at"] = guidance.get("checked_at")
-                                row["estimated_exit_loss"] = guidance.get(
-                                    "estimated_exit_loss"
-                                )
-                                row["estimated_exit_loss_ratio"] = guidance.get(
-                                    "estimated_exit_loss_ratio"
-                                )
-                        # Issue #138 round 2: the published row carries the
-                        # selected direction's 5% target-share estimate (the
-                        # old optimistic whole-pool upper bound is gone).
-                        selected_estimate = (
-                            selected_direction.get("estimate")
-                            if isinstance(selected_direction, Mapping)
-                            else None
-                        )
-                        _apply_row_estimate_fields(row, selected_estimate)
-                        round_facts[condition_id] = {
-                            "directions": deepcopy(qualified_directions),
-                            # The account fact this evaluation actually used,
-                            # so the 60-second maintenance path judges its
-                            # age honestly after a mid-round renewal.
-                            "account": deepcopy(dict(evaluation_account))
-                            if isinstance(evaluation_account, Mapping)
-                            else None,
-                            "reservations": deepcopy(reservations),
-                            "checked_at": checked_at,
-                        }
-                        passers.append(row)
-                    # Merge rule (issue #138 round 2): after each batch the
-                    # combined passers are re-ranked by the estimated
-                    # target-share yield and trimmed to the best ten; the
-                    # loop keeps consuming batches until the round budget or
-                    # the queues run out.
-                    passers.sort(key=_candidate_yield_sort_key)
-                    del passers[LP_TRIAL_CANDIDATE_LIMIT:]
-                if checked_count >= _LP_CANDIDATE_SCAN_MARKET_LIMIT:
-                    stop_reason = "checked_limit"
-                else:
-                    stop_reason = "queue_exhausted"
-            trial_rows = [deepcopy(dict(row)) for row in passers]
-            selected_results = [deepcopy(dict(row)) for row in passers]
-            recommendations = (
-                [deepcopy(dict(passers[0]))] if passers else []
-            )
-            funnel = dict(trial.get("funnel") or {})
-            trial_reasons = funnel.get("reasons")
-            if (
-                isinstance(trial_reasons, Mapping)
-                and isinstance(trial_reasons.get("trial"), list)
-                and scan_unknown_reasons
-            ):
-                # Scan-time unknown markets keep their reason codes visible
-                # through the funnel, per market (token ids stay out of the
-                # persisted projection by redaction policy).
-                trial_reasons["trial"].extend(deepcopy(scan_unknown_reasons))
-            # Scan coverage (issue #143): the progress line reports this
-            # round's batch consumption per deduplicated condition, and the
-            # stop reason names why the scan ended.  Published rows are only
-            # live-qualified passers, so the former realtime-capital recheck
-            # is inherently satisfied by each selected direction's own
-            # account funds check.
-            funnel["checked"] = checked_count
-            funnel["passed"] = passed_count
-            # Reviewer fix 5: the published table shows only passers, so the
-            # trial stage reports the published passer count (the view's
-            # preview-batch semantics remain for pre-scan preparation views).
-            funnel["trial"] = len(trial_rows)
-            funnel["rejected"] = rejected_count
-            funnel["unknown"] = unknown_count
-            funnel["unchecked"] = max(0, queue_total - checked_count)
-            funnel["stop_reason"] = stop_reason
-            funnel["batches"] = batches_read
-            funnel["backup_read"] = backup_read_count
-            funnel["gap_reason"] = (
-                None
-                if len(passers) >= LP_TRIAL_CANDIDATE_LIMIT
-                else (
-                    f"合格候选不足 {LP_TRIAL_CANDIDATE_LIMIT} 个"
-                    f"（本轮通过 {passed_count} 个）"
+                def _direction_yield_key(
+                    result: Mapping[str, object]
+                ) -> tuple[Decimal, str]:
+                    raw = _direction_estimate_raw(result)
+                    return (
+                        -(
+                            raw
+                            if raw is not None
+                            else Decimal("-Infinity")
+                        ),
+                        str(result.get("token_id") or ""),
+                    )
+
+                selected_direction = (
+                    min(eligible_directions, key=_direction_yield_key)
+                    if eligible_directions
+                    else None
                 )
-            )
-            funnel["compared_range"] = dict(trial.get("compared_range") or {})
-            funnel["conditions"] = _lp_funnel_conditions()
-            funnel["competition_state"] = competition_state.get("state")
-            funnel["competition_not_updated"] = list(
-                competition_state.get("not_updated") or ()
-            )
-            self._publish_sample_targets(())
-            completed_at = self._now()
-            # The round reached batch consumption: the 300-second scan
-            # window starts now regardless of the published completeness.
-            # The round-local qualification facts swap in as one atomic
-            # reference replacement under the state lock (reviewer fix 2).
+                row_state = (
+                    "eligible"
+                    if selected_direction is not None
+                    else "unknown"
+                    if any(
+                        result.get("state") == "unknown"
+                        for result in direction_results.values()
+                    )
+                    else "rejected"
+                )
+                if row_state == "eligible":
+                    passed += 1
+                elif row_state == "rejected":
+                    rejected += 1
+                else:
+                    unknown += 1
+                    unknown_code = next(
+                        (
+                            str(code)
+                            for result in direction_results.values()
+                            if result.get("state") == "unknown"
+                            for code in (
+                                result.get("reason_codes") or ()
+                            )
+                            if str(code)
+                        ),
+                        "candidate_unknown",
+                    )
+                    unknown_reasons.append(
+                        {
+                            "market_id": str(
+                                candidate.get("market_id") or ""
+                            ),
+                            "condition_id": condition_id,
+                            "code": unknown_code,
+                        }
+                    )
+                if row_state == "rejected":
+                    self._candidate_pool_record_rejection(
+                        condition_id, judged_at=evaluation_now
+                    )
+                    continue
+                if row_state == "unknown":
+                    self._candidate_pool_record_failure(
+                        condition_id, attempted_at=evaluation_now
+                    )
+                    continue
+                row = dict(candidate)
+                row["directions"] = direction_results
+                row["selected_direction"] = selected_direction
+                row["state"] = row_state
+                row["verification"] = (
+                    "verified"
+                    if direction_results
+                    and all(
+                        result.get("state") in {"eligible", "rejected"}
+                        for result in direction_results.values()
+                    )
+                    else "partial"
+                )
+                if isinstance(selected_direction, Mapping):
+                    guidance = selected_direction.get("guidance")
+                    if isinstance(guidance, Mapping):
+                        row["realtime_price"] = guidance.get("price")
+                        row["realtime_capital"] = guidance.get(
+                            "required_capital"
+                        )
+                        row["realtime_checked_at"] = guidance.get(
+                            "checked_at"
+                        )
+                        row["estimated_exit_loss"] = guidance.get(
+                            "estimated_exit_loss"
+                        )
+                        row["estimated_exit_loss_ratio"] = guidance.get(
+                            "estimated_exit_loss_ratio"
+                        )
+                selected_estimate = (
+                    selected_direction.get("estimate")
+                    if isinstance(selected_direction, Mapping)
+                    else None
+                )
+                _apply_row_estimate_fields(row, selected_estimate)
+                self._candidate_pool_record_success(
+                    condition_id,
+                    row,
+                    judged_at=evaluation_now,
+                    facts={
+                        "directions": deepcopy(qualified_directions),
+                        "account": deepcopy(dict(evaluation_account))
+                        if isinstance(evaluation_account, Mapping)
+                        else None,
+                        "reservations": deepcopy(reservations),
+                        "checked_at": queue_state.get("built_at"),
+                    },
+                )
             with self._candidate_state_lock:
-                self._candidate_qualification_facts = round_facts
-                self._candidate_scan_completed_at = completed_at
+                funnel_totals = deepcopy(self._candidate_funnel_totals)
+                funnel_totals["checked"] = (
+                    int(funnel_totals.get("checked") or 0) + checked
+                )
+                funnel_totals["passed"] = (
+                    int(funnel_totals.get("passed") or 0) + passed
+                )
+                funnel_totals["rejected"] = (
+                    int(funnel_totals.get("rejected") or 0) + rejected
+                )
+                funnel_totals["unknown"] = (
+                    int(funnel_totals.get("unknown") or 0) + unknown
+                )
+                funnel_totals["batches"] = (
+                    int(funnel_totals.get("batches") or 0) + 1
+                )
+                funnel_totals["backup_read"] = (
+                    int(funnel_totals.get("backup_read") or 0) + backup_read
+                )
+                self._candidate_funnel_totals = funnel_totals
+                queue_funnel_state = deepcopy(self._candidate_queue_funnel)
+                if unknown_reasons:
+                    reasons = queue_funnel_state.get("reasons")
+                    if (
+                        isinstance(reasons, Mapping)
+                        and isinstance(reasons.get("trial"), list)
+                    ):
+                        reasons["trial"].extend(deepcopy(unknown_reasons))
+                    self._candidate_queue_funnel = queue_funnel_state
+            self._publish_sample_targets(())
             return self._finish_candidate_scan(
-                previous,
-                state="ready" if complete else "incomplete",
-                complete=complete,
-                checked_at=completed_at,
-                scan_started_at=scan_started_at,
-                last_success_at=completed_at if complete else None,
-                candidates=trial_rows,
-                recommendations=recommendations,
-                selected_results=selected_results,
-                missing_metadata_condition_ids=missing_metadata_condition_ids,
-                missing_book_token_ids=tuple(dict.fromkeys(missing_book_token_ids)),
-                catalog_complete=catalog_is_known and catalog.get("complete") is True,
-                event_end_confirmations=event_end_confirmations,
-                funnel=funnel,
-                selected_market_ids=tuple(
-                    str(row.get("market_id") or "") for row in trial_rows
-                ),
+                attempted_at=attempted_at,
+                checked_at=evaluation_now,
+                success=passed > 0,
+                complete=queue_state.get("complete") is True,
+                state="ready" if queue_state.get("complete") is True else "incomplete",
+                notes={
+                    "catalog_complete": queue_state.get(
+                        "catalog_complete"
+                    ) is True,
+                    "missing_metadata_condition_ids": list(
+                        queue_state.get("missing_metadata_condition_ids")
+                        or ()
+                    ),
+                },
+                missing_book_token_ids=missing_book_token_ids,
             )
         except Exception:
-            previous = self.candidate_snapshot()
-            return self._finish_candidate_scan(
-                previous,
-                state="stale" if previous.get("last_success_at") else "unknown",
-                complete=False,
-                checked_at=self._now(),
-                scan_started_at=scan_started_at,
-                retention_reason="candidate_refresh_failed",
-            )
+            return self.candidate_snapshot()
         finally:
             self._candidate_scan_lock.release()
 
     def refresh_candidate_recommendations(
         self, *, stop_event: threading.Event | None = None
     ) -> dict[str, object]:
-        """Refresh every published candidate row on one batch book read.
+        """Refresh the displayed pool rows on one batch book read (issue #157).
 
-        Issue #138 round 2: the 60-second maintenance is an equal-weight
-        refresh of the whole published table (at most ten rows) — one
-        batched book read (at most 20 tokens) plus one account, metadata,
-        and targeted reward read per due source class, a fresh eligibility
-        check and 5% target-share estimate per row, and a whole-table
-        re-rank.  The current recommendation follows the re-ranked head.  A
-        failed row keeps its published values marked not-updated behind the
-        refreshed rows; a failed round degrades the whole table for this
-        cycle and the existing backoff and recovery semantics apply.
+        The maintenance thread keeps the issue-#146 trigger — the oldest
+        source age across the displayed rows with a 30-second lead, plus
+        the 60/120/300s failure backoff — and the whole-table batch read
+        framework (one batched book read plus one account, metadata, and
+        targeted reward read per due source class).  Publication rewrites
+        pool rows one by one: a refreshed row re-enters with its new
+        judgment time, a failed row keeps its values marked
+        ``refresh_failed`` until its original expiry, and a deterministic
+        rejection leaves the pool at once.
         """
 
         if not self._candidate_maintenance_lock.acquire(blocking=False):
@@ -4918,17 +5132,20 @@ class PolymarketLPService:
         try:
             now = self._now()
             with self._candidate_state_lock:
-                previous = deepcopy(self._candidate_snapshot)
-                generation = self._candidate_publication_generation
                 failures = self._candidate_maintenance_failures
                 last_finished_at = self._candidate_maintenance_last_finished_at
                 cached_facts = deepcopy(self._candidate_qualification_facts)
-            raw_selected = previous.get("selected_results")
-            selected_rows = (
-                [row for row in raw_selected if isinstance(row, Mapping)]
-                if isinstance(raw_selected, (list, tuple))
-                else []
-            )
+                pool = deepcopy(self._candidate_pool)
+            # Issue #157: maintenance renews the currently displayed top ten
+            # valid pool rows (whole-table framework, pool publication).
+            valid_rows = [
+                row
+                for row in pool.values()
+                if isinstance(row, Mapping)
+                and not _candidate_pool_row_expired(row, now)
+            ]
+            valid_rows.sort(key=_candidate_yield_sort_key)
+            selected_rows = valid_rows[:_LP_CANDIDATE_BATCH_SIZE]
             if not selected_rows:
                 return self.candidate_snapshot()
 
@@ -5542,131 +5759,93 @@ class PolymarketLPService:
                 return new_row, facts
 
             evaluation_now = self._now()
-            refreshed_rows: list[dict[str, object]] = []
-            not_updated_rows: list[dict[str, object]] = []
-            facts_by_condition: dict[str, dict[str, object]] = {}
-            # The whole-round failure reason (account, metadata, reward, or
-            # the entire book read) degrades every row honestly this cycle.
+            # Issue #157: publication rewrites pool rows one by one.  A
+            # refreshed row re-enters with its new judgment time, a failed
+            # row keeps its values marked refresh_failed until its original
+            # expiry, and a deterministically rejected row leaves the pool
+            # immediately.
             round_failure_reason = (
                 account_error
                 or metadata_error
                 or reward_error
                 or ("book_unknown" if books_failed else None)
             )
+            refreshed_any = False
             for row, cached in row_facts:
+                condition_id = str(row.get("condition_id") or "").strip()
                 new_row: dict[str, object] | None = None
                 facts: dict[str, object] | None = None
                 if cached is not None and not round_failed:
                     new_row, facts = evaluate_row(row, cached, evaluation_now)
-                if new_row is None:
+                if new_row is None or new_row.get("state") == "unknown":
                     # Whole-round failure, missing cached facts, or a row
-                    # whose books never arrived: keep the published values
-                    # (including the old estimate), mark the row
-                    # not-updated, rank it behind every refreshed row, and
-                    # on a round failure show the degraded state with the
-                    # source reason instead of implying the row was
-                    # re-verified.
-                    stale_row = dict(row)
-                    if round_failed:
-                        degraded_directions: dict[str, dict[str, object]] = {}
-                        for direction in (
-                            live_directions(cached) if cached is not None else ()
-                        ):
-                            market = direction.get("market")
-                            outcome = str(
-                                (market or {}).get("outcome") or ""
-                            ).upper()
-                            if not outcome:
-                                continue
-                            degraded_directions[outcome] = {
-                                "token_id": str(
-                                    (market or {}).get("token_id") or ""
-                                ),
-                                "outcome": outcome,
-                                "state": "unknown",
-                                "eligible": False,
-                                "reason_codes": [
-                                    round_failure_reason
-                                    or "candidate_source_stale"
-                                ],
-                                "guidance": None,
-                            }
-                        if degraded_directions:
-                            stale_row["directions"] = degraded_directions
-                        stale_row["state"] = "unknown"
-                        stale_row["selected_direction"] = None
-                        stale_row["verification"] = "partial"
-                        for key in (
-                            "realtime_price",
-                            "realtime_capital",
-                            "realtime_checked_at",
-                        ):
-                            stale_row.pop(key, None)
-                    stale_row["estimate_updated"] = False
-                    not_updated_rows.append(stale_row)
+                    # whose re-read could not produce a verdict: keep the
+                    # stored values until their original expiry and mark
+                    # the row refresh_failed.
+                    self._candidate_pool_record_failure(
+                        condition_id, attempted_at=evaluation_now
+                    )
                     continue
-                refreshed_rows.append(new_row)
-                if facts is not None:
-                    facts_by_condition[
-                        str(row.get("condition_id") or "").strip()
-                    ] = facts
-            refreshed_rows.sort(key=_candidate_yield_sort_key)
-            maintained_candidates = refreshed_rows + not_updated_rows
-            head_row = next(
-                (
-                    row
-                    for row in refreshed_rows
-                    if row.get("state") == "eligible"
-                ),
-                None,
-            )
-            recommendations = [head_row] if head_row is not None else []
+                if new_row.get("state") == "rejected":
+                    self._candidate_pool_record_rejection(
+                        condition_id, judged_at=evaluation_now
+                    )
+                    continue
+                if self._candidate_pool_record_success(
+                    condition_id,
+                    new_row,
+                    judged_at=evaluation_now,
+                    facts=facts,
+                ):
+                    refreshed_any = True
             # Issue #146: the maintenance attempt's backoff bookkeeping is
-            # applied together with its publication, so a publication vetoed
-            # by the generation guard is not counted as a data failure.
-            maintenance_success = head_row is not None
+            # applied together with its publication.
             with self._candidate_state_lock:
-                for condition_id, facts in facts_by_condition.items():
-                    self._candidate_qualification_facts[condition_id] = facts
+                maintenance_finished_at = self._now()
+                self._candidate_maintenance_last_finished_at = (
+                    maintenance_finished_at
+                )
+                if refreshed_any:
+                    self._candidate_maintenance_failures = 0
+                else:
+                    self._candidate_maintenance_failures += 1
+                failures_now = self._candidate_maintenance_failures
+            notes: dict[str, object] = {
+                "maintenance_consecutive_failures": failures_now,
+            }
+            if failures_now > 0:
+                next_backoff = _CANDIDATE_MAINTENANCE_BACKOFF_SECONDS[
+                    min(failures_now - 1, 2)
+                ]
+                notes["maintenance_next_attempt_at"] = _iso(
+                    maintenance_finished_at
+                    + timedelta(seconds=float(next_backoff))
+                )
+            else:
+                notes["maintenance_next_attempt_at"] = None
+            notes["maintenance_diagnostics"] = {
+                "started_at": _iso(now),
+                "finished_at": _iso(evaluation_now),
+                "read_seconds": read_seconds,
+            }
             return self._finish_candidate_scan(
-                previous,
-                state=str(previous.get("state") or "ready"),
-                complete=previous.get("complete") is True,
+                attempted_at=now,
                 checked_at=evaluation_now,
-                # Maintenance refreshes facts inside the current scan round;
-                # it must not claim a newer scan start than a concurrently
-                # in-flight full scan, or the persistence arbiter would let
-                # the maintenance snapshot outrank the scan's publication.
-                scan_started_at=(
-                    previous.get("scan_started_at") or evaluation_now
-                ),
-                last_success_at=evaluation_now,
-                candidates=maintained_candidates,
-                recommendations=recommendations,
-                selected_results=list(maintained_candidates),
-                missing_metadata_condition_ids=previous.get(
-                    "missing_metadata_condition_ids", ()
-                ),
-                missing_book_token_ids=tuple(
-                    dict.fromkeys(missing_book_token_ids)
-                ),
-                catalog_complete=previous.get("catalog_complete") is True,
-                event_end_confirmations=previous.get(
-                    "event_end_confirmations", {}
-                ),
-                funnel=previous.get("funnel", {}),
-                selected_market_ids=previous.get("selected_market_ids", ()),
-                maintenance_publish=True,
-                maintenance_success=maintenance_success,
-                expected_generation=generation,
-                maintenance_diagnostics={
-                    "started_at": _iso(now),
-                    "finished_at": _iso(evaluation_now),
-                    "read_seconds": read_seconds,
-                },
+                success=refreshed_any,
+                notes=notes,
+                missing_book_token_ids=missing_book_token_ids,
             )
         finally:
             self._candidate_maintenance_lock.release()
+
+    def refresh_competition_cache(self) -> dict[str, object]:
+        """Refresh the in-memory competition cache (issue #157).
+
+        Public entry point for the dedicated competition thread: candidate
+        batch paths only read the cache and never block on this read.
+        """
+
+        return self._refresh_competition(None)
 
     def _refresh_competition(
         self, stop_event: threading.Event | None
@@ -5950,78 +6129,6 @@ class PolymarketLPService:
             "confirmed_end_at": _iso(observed_at),
         }
 
-    @staticmethod
-    def _merge_recommendations(
-        previous_rows: object,
-        fresh_rows: Sequence[Mapping[str, object]],
-        *,
-        observations: Mapping[tuple[str, str], Mapping[str, object]],
-        retention_reason: str,
-    ) -> list[dict[str, object]]:
-        current = [deepcopy(dict(row)) for row in fresh_rows if isinstance(row, Mapping)]
-        current_by_condition = {
-            str(row.get("condition_id") or ""): row
-            for row in current
-            if str(row.get("condition_id") or "")
-        }
-        for row in current:
-            directions = row.get("directions")
-            if isinstance(directions, dict):
-                for direction in directions.values():
-                    if isinstance(direction, dict):
-                        direction["eligible"] = direction.get("state") == "eligible"
-
-        previous = (
-            [deepcopy(dict(row)) for row in previous_rows if isinstance(row, Mapping)]
-            if isinstance(previous_rows, (list, tuple))
-            else []
-        )
-        for old_row in previous:
-            condition_id = str(old_row.get("condition_id") or "")
-            if not condition_id:
-                continue
-            old_directions = old_row.get("directions")
-            if not isinstance(old_directions, Mapping):
-                continue
-            new_row = current_by_condition.get(condition_id)
-            if new_row is None:
-                new_row = deepcopy(old_row)
-                new_row["directions"] = {}
-                new_row["state"] = "expired"
-                current.append(new_row)
-                current_by_condition[condition_id] = new_row
-            new_directions = new_row.get("directions")
-            if not isinstance(new_directions, dict):
-                new_directions = {}
-                new_row["directions"] = new_directions
-            for outcome, old_direction in old_directions.items():
-                outcome_key = str(outcome).upper()
-                if outcome_key in new_directions or not isinstance(old_direction, Mapping):
-                    continue
-                expired = deepcopy(dict(old_direction))
-                observed = observations.get((condition_id, outcome_key))
-                reasons = (
-                    list(observed.get("reason_codes", ()))
-                    if isinstance(observed, Mapping)
-                    else []
-                )
-                expired.update(
-                    {
-                        "state": "expired",
-                        "eligible": False,
-                        "reason_codes": reasons or [retention_reason],
-                    }
-                )
-                new_directions[outcome_key] = expired
-            if new_directions and all(
-                not isinstance(direction, Mapping)
-                or direction.get("eligible") is not True
-                for direction in new_directions.values()
-            ):
-                new_row["state"] = "expired"
-
-        return current
-
     def _read_candidate_snapshot(
         self, identity: Mapping[str, object], *, now: datetime
     ) -> dict[str, object]:
@@ -6180,6 +6287,7 @@ class PolymarketLPService:
             "candidate_evaluation": evaluated,
         }
 
+
     def _fresh_candidate_row(
         self,
         identity: Mapping[str, object],
@@ -6204,217 +6312,6 @@ class PolymarketLPService:
             if isinstance(evaluated, Mapping)
             else [],
         }
-
-    def _finish_candidate_scan(
-        self,
-        previous: Mapping[str, object],
-        *,
-        state: str,
-        complete: bool,
-        checked_at: object,
-        scan_started_at: datetime | None = None,
-        last_success_at: object | None = None,
-        candidates: Sequence[Mapping[str, object]] | None = None,
-        recommendations: Sequence[Mapping[str, object]] | None = None,
-        selected_results: Sequence[Mapping[str, object]] | None = None,
-        missing_metadata_condition_ids: Sequence[str] | None = None,
-        missing_book_token_ids: Sequence[str] | None = None,
-        catalog_complete: bool | None = None,
-        event_end_confirmations: Mapping[str, object] | None = None,
-        funnel: Mapping[str, object] | None = None,
-        selected_market_ids: Sequence[str] | None = None,
-        retention_reason: str = "candidate_refresh_failed",
-        maintenance_publish: bool = False,
-        maintenance_success: bool = False,
-        expected_generation: int | None = None,
-        maintenance_diagnostics: Mapping[str, object] | None = None,
-    ) -> dict[str, object]:
-        attempted: datetime
-        try:
-            attempted = _timestamp(checked_at, name="candidate_checked_at")
-        except ValueError:
-            attempted = self._now()
-        has_new_rows = candidates is not None
-        successful = complete and has_new_rows
-        if not has_new_rows and not maintenance_publish:
-            # Issue #146 D9: a scan-failure fallback publish must not roll
-            # the snapshot back to the rows captured before the scan started.
-            # Base it on the newest published snapshot so any head a
-            # concurrent maintenance published mid-scan survives.
-            with self._candidate_state_lock:
-                previous = deepcopy(self._candidate_snapshot)
-        try:
-            last_successful_check = (
-                _timestamp(
-                    previous.get("checked_at"),
-                    name="candidate_checked_at",
-                )
-                if not has_new_rows
-                else attempted
-            )
-        except ValueError:
-            last_successful_check = None
-        rows = (
-            [deepcopy(dict(row)) for row in candidates]
-            if candidates is not None
-            else [
-                deepcopy(dict(row))
-                for row in previous.get("candidates", ())
-                if isinstance(row, Mapping)
-            ]
-        )
-        previous_recommendations = previous.get("recommendations")
-        recommendation_rows = (
-            [deepcopy(dict(row)) for row in recommendations if isinstance(row, Mapping)]
-            if recommendations is not None
-            else self._merge_recommendations(
-                previous_recommendations,
-                (),
-                observations={},
-                retention_reason=retention_reason,
-            )
-        )
-        selected_result_rows = (
-            [
-                deepcopy(dict(row))
-                for row in selected_results
-                if isinstance(row, Mapping)
-            ]
-            if selected_results is not None
-            else [
-                deepcopy(dict(row))
-                for row in previous.get("selected_results", ())
-                if isinstance(row, Mapping)
-            ]
-        )
-        try:
-            scan_started = (
-                scan_started_at.astimezone(UTC)
-                if isinstance(scan_started_at, datetime)
-                else _timestamp(scan_started_at, name="scan_started_at")
-            )
-        except ValueError:
-            scan_started = attempted
-        if missing_metadata_condition_ids is None:
-            missing_metadata = list(previous.get("missing_metadata_condition_ids", ()))
-        else:
-            missing_metadata = list(missing_metadata_condition_ids)
-        if missing_book_token_ids is None:
-            missing_books = list(previous.get("missing_book_token_ids", ()))
-        else:
-            missing_books = list(missing_book_token_ids)
-        previous_confirmations = previous.get("event_end_confirmations")
-        confirmations = (
-            dict(event_end_confirmations)
-            if isinstance(event_end_confirmations, Mapping)
-            else dict(previous_confirmations)
-            if isinstance(previous_confirmations, Mapping)
-            else {}
-        )
-        if catalog_complete is None:
-            catalog_complete = previous.get("catalog_complete") is True
-        prior_success = previous.get("last_success_at")
-        snapshot = {
-            "state": state,
-            "complete": complete,
-            "scanning": False,
-            "candidates": rows,
-            "recommendations": recommendation_rows,
-            "selected_results": selected_result_rows,
-            "checked_at": last_successful_check,
-            "last_success_at": (last_success_at or attempted)
-            if successful
-            else prior_success,
-            "last_attempt_at": self._now(),
-            "candidate_rows_fresh": has_new_rows,
-            "scan_started_at": _iso(scan_started),
-            "missing_metadata_condition_ids": missing_metadata,
-            "missing_book_token_ids": missing_books,
-            "catalog_complete": catalog_complete,
-            "event_end_confirmations": confirmations,
-            "retention_reason": None if recommendations is not None else retention_reason,
-            "funnel": deepcopy(dict(funnel)) if funnel is not None else deepcopy(previous.get("funnel", {})),
-            "selected_market_ids": list(selected_market_ids) if selected_market_ids is not None else list(previous.get("selected_market_ids", ())),
-            "candidate_retention_reason": "background_candidates_retired",
-        }
-        maintenance_failures_now: int | None = None
-        maintenance_finished_at: datetime | None = None
-        publication_baseline = expected_generation
-        if maintenance_publish:
-            # Issue #146: the attempt is "finished" together with its
-            # publication. A publication vetoed by the generation guard never
-            # reaches this point, so a discarded result is not counted as a
-            # data failure.
-            with self._candidate_state_lock:
-                if (
-                    expected_generation is not None
-                    and self._candidate_publication_generation
-                    != expected_generation
-                ):
-                    return self.candidate_snapshot()
-                maintenance_finished_at = self._now()
-                self._candidate_maintenance_last_finished_at = (
-                    maintenance_finished_at
-                )
-                if maintenance_success:
-                    self._candidate_maintenance_failures = 0
-                    self._candidate_publication_generation += 1
-                else:
-                    self._candidate_maintenance_failures += 1
-                maintenance_failures_now = self._candidate_maintenance_failures
-                # The success path just advanced the generation itself; the
-                # final publish check below must compare against that new
-                # baseline, not the one captured before the reads.
-                publication_baseline = self._candidate_publication_generation
-            snapshot["maintenance_consecutive_failures"] = (
-                maintenance_failures_now
-            )
-            if maintenance_diagnostics is not None:
-                snapshot["maintenance_diagnostics"] = deepcopy(
-                    dict(maintenance_diagnostics)
-                )
-            if maintenance_failures_now > 0:
-                assert maintenance_finished_at is not None
-                next_backoff = _CANDIDATE_MAINTENANCE_BACKOFF_SECONDS[
-                    min(maintenance_failures_now - 1, 2)
-                ]
-                snapshot["maintenance_next_attempt_at"] = _iso(
-                    maintenance_finished_at
-                    + timedelta(seconds=float(next_backoff))
-                )
-            else:
-                snapshot["maintenance_next_attempt_at"] = None
-        writer = getattr(self.store, "lp_save_screening_snapshot", None)
-        if callable(writer):
-            try:
-                saved = writer(snapshot)
-            except Exception:
-                saved = None
-            if isinstance(saved, Mapping):
-                try:
-                    saved_started = _timestamp(
-                        saved.get("scan_started_at"), name="scan_started_at"
-                    )
-                except ValueError:
-                    saved_started = scan_started
-                if saved_started > scan_started:
-                    self._restore_candidate_snapshot(saved)
-                    return self.candidate_snapshot()
-                snapshot = deepcopy(dict(saved))
-        with self._candidate_state_lock:
-            if (
-                publication_baseline is not None
-                and self._candidate_publication_generation != publication_baseline
-            ):
-                return self.candidate_snapshot()
-            self._candidate_snapshot = snapshot
-            if not maintenance_publish and successful:
-                # Issue #146 D5: a successful scan publication resets the
-                # maintenance backoff and advances the publication generation.
-                self._candidate_publication_generation += 1
-                self._candidate_maintenance_failures = 0
-                self._candidate_maintenance_last_finished_at = None
-        return self.candidate_snapshot()
 
     def _mutation_allowed(self, action: str = "submit") -> bool:
         owner = self.owner_lock

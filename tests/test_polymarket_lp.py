@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import threading
+import time
 
 import pytest
 from polymarket.models.clob.account import ClobTrade, MakerOrder, OpenOrder
@@ -3017,6 +3018,10 @@ def test_refresh_candidates_projects_trial_funnel_without_risk(tmp_path) -> None
     lp = PolymarketLPService(store, exchange, clock=lambda: now)
     prepared = lp.refresh_price_history()
     assert prepared["state"] == "known"
+    # Issue #157: competition refreshes on its own thread; the candidate
+    # batch path only reads the cache, so the explicit-zero exclusion needs
+    # the cache warmed first.
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     snapshot = lp.refresh_candidates(force=True)
 
@@ -3052,6 +3057,7 @@ def test_refresh_candidates_projects_trial_funnel_without_risk(tmp_path) -> None
     assert len(snapshot["recommendations"]) == 1
     assert snapshot["recommendations"][0]["selected_direction"]["outcome"] == "YES"
     assert snapshot["selected_market_ids"] == ["market-A"]
+    # Only the pre-warm read: batches never call the competition reader.
     assert exchange.competition_reads == 1
 
 
@@ -3210,10 +3216,9 @@ def test_refresh_candidates_drops_rows_whose_realtime_capital_over_available(tmp
     assert funnel["backup_queue_count"] == 0
     assert funnel["reference_price_unknown"] == 0
     # Passers-only publication: the trial stage counts published passers,
-    # so a round whose only market was rejected reports 0, matching the
-    # empty table and the progress line.
+    # so a batch whose only market was rejected reports 0, matching the
+    # empty table and the status line.
     assert funnel["trial"] == 0
-    assert funnel["stop_reason"] == "queue_exhausted"
     assert funnel["checked"] == 1
     assert funnel["passed"] == 0
     assert funnel["rejected"] == 1
@@ -3223,8 +3228,8 @@ def test_refresh_candidates_drops_rows_whose_realtime_capital_over_available(tmp
     assert snapshot["recommendations"] == []
     assert snapshot["selected_results"] == []
     assert snapshot["selected_market_ids"] == []
-    assert funnel["gap_reason"] is not None
-    assert "本轮通过 0 个" in funnel["gap_reason"]
+    # Issue #157: the rolling pool has no per-round shortfall reason.
+    assert funnel["gap_reason"] is None
 
 
 class _LPCandidateQueryExchange:
@@ -3384,21 +3389,20 @@ class _LPCandidateQueryExchange:
 
 
 def test_batch_refresh_reads_books_per_batch_of_ten_markets(tmp_path) -> None:
-    """Issue 143 + #138 round 2: with 12 qualifying markets the scan runs
-    two batches and keeps checking past the first ten passers.
+    """Issue 143 + #157: twelve qualifying markets roll through two batches.
 
-    Batch one reads ten markets (20 tokens) in one call; batch two reads the
-    remaining two (4 tokens); no token is requested twice; the merged table
-    keeps the best ten live-qualified passers and the round ends only when
-    the queue is exhausted.
+    The first call reads ten markets (ten single-outcome tokens) in one
+    call; the second call reads the remaining two; no token is requested
+    twice, and the published table follows the rolling pool.
     """
 
     now = datetime(2026, 9, 17, 3, tzinfo=UTC)
+    current = {"now": now}
     exchange = _LPCandidateQueryExchange(
         now, {f"M{index:02d}": Decimal(200 - index) for index in range(1, 13)}
     )
     lp = PolymarketLPService(
-        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: now
+        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
     )
     prepared = lp.refresh_price_history()
     assert prepared["state"] == "known"
@@ -3417,25 +3421,41 @@ def test_batch_refresh_reads_books_per_batch_of_ten_markets(tmp_path) -> None:
         assert row["verification"] == "verified"
         assert "realtime_price" in row
         assert "realtime_capital" in row
-    # All twelve queued markets are checked (two batch calls); the ten best
-    # estimated yields are published.
-    assert len(exchange.book_token_reads) == 2
-    first = exchange.book_token_reads[0]
-    # Single-outcome fixture: one token per market, one call per batch.
-    assert len(first) == 10
+    # The first batch covers the first ten queued markets in one call.
+    assert len(exchange.book_token_reads) == 1
+    assert len(exchange.book_token_reads[0]) == 10
     funnel = snapshot["funnel"]
-    assert funnel["stop_reason"] == "queue_exhausted"
-    assert funnel["checked"] == 12
-    assert funnel["passed"] == 12
+    assert funnel["checked"] == 10
+    assert funnel["passed"] == 10
+    assert funnel["batches"] == 1
+    assert snapshot["candidate_pending_count"] == 2
+
+    # The second call processes the two remaining never-tried markets plus
+    # the oldest-tried rotation tail (issue #157 rotation order).
+    current["now"] = now + timedelta(seconds=5)
+    exchange.now = current["now"]
+    second = lp.refresh_candidates(force=True)
+    assert len(exchange.book_token_reads) == 2
+    second_tokens = exchange.book_token_reads[1]
+    assert len(second_tokens) == 10
+    assert {
+        "token-condition-M11",
+        "token-condition-M12",
+    } <= set(second_tokens)
+    funnel = second["funnel"]
+    assert funnel["checked"] == 20
+    assert funnel["passed"] == 20
     assert funnel["rejected"] == 0
     assert funnel["unknown"] == 0
     assert funnel["unchecked"] == 0
     assert funnel["batches"] == 2
     assert funnel["backup_read"] == 0
-    assert funnel["trial"] == 10
+    assert funnel["trial"] == 12
     assert funnel["normal_queue_count"] == 12
     assert funnel["backup_queue_count"] == 0
     assert funnel["reference_price_unknown"] == 0
+    assert second["candidate_valid_count"] == 12
+    assert second["candidate_pending_count"] == 0
 
 
 class _LPBatchQueryExchange(_LPCandidateQueryExchange):
@@ -3746,8 +3766,11 @@ def _seed_stale_backup_summaries(
 
 
 def test_batch_refresh_backfills_until_ten_passed(tmp_path) -> None:
-    """S2 acceptance case 1: 3 pass in batch one, batches backfill to ten."""
+    """S2 acceptance case 1, issue #157 rotation: two exploration batches
+    cover the twenty queued markets (normal queue order first, then the
+    backup queue), ten passers publish, and nothing is read twice."""
     now = datetime(2026, 9, 19, 6, tzinfo=UTC)
+    current = {"now": now}
     exchange = _LPBatchQueryExchange(
         now,
         _batch_pools(),
@@ -3758,7 +3781,7 @@ def test_batch_refresh_backfills_until_ten_passed(tmp_path) -> None:
     )
     store = PredictionArbitrageStore(tmp_path)
     _seed_stale_backup_summaries(store, now, ("B1", "B2"))
-    lp = PolymarketLPService(store, exchange, clock=lambda: now)
+    lp = PolymarketLPService(store, exchange, clock=lambda: current["now"])
     # Backup markets keep their stale summaries, so preparation reports
     # partial; the scan proceeds and treats those markets as backup rows.
     assert lp.refresh_price_history()["state"] in {"known", "partial"}
@@ -3766,28 +3789,42 @@ def test_batch_refresh_backfills_until_ten_passed(tmp_path) -> None:
     snapshot = lp.refresh_candidates(force=True)
 
     assert snapshot["state"] == "ready"
-    # Two batches of ten markets each: 9 normal + 1 backup, 20 tokens per
-    # call, no token read twice.
-    assert len(exchange.book_token_reads) == 2
-    first, second = exchange.book_token_reads
-    assert len(first) == len(second) == 20
-    assert len(set(first) | set(second)) == 40
+    # Batch one: the first ten normal-queue markets, 20 tokens in one call.
+    assert len(exchange.book_token_reads) == 1
+    first = exchange.book_token_reads[0]
+    assert len(first) == 20
     first_markets = {
         token.removeprefix("token-").rsplit("-", 1)[0] for token in first
     }
-    second_markets = {
-        token.removeprefix("token-").rsplit("-", 1)[0] for token in second
-    }
     assert first_markets == {
-        *{f"condition-N{index:02d}" for index in range(1, 10)},
-        "condition-B1",
-    }
-    assert second_markets == {
-        *{f"condition-N{index:02d}" for index in range(10, 19)},
-        "condition-B2",
+        f"condition-N{index:02d}" for index in range(1, 11)
     }
     funnel = snapshot["funnel"]
-    assert funnel["stop_reason"] == "queue_exhausted"
+    assert funnel["checked"] == 10
+    assert funnel["passed"] == 4
+    assert funnel["rejected"] == 6
+    assert funnel["batches"] == 1
+    assert snapshot["candidate_valid_count"] == 4
+    assert snapshot["candidate_pending_count"] == 10
+
+    # Batch two: the rest of the normal queue plus both backup markets.
+    current["now"] = now + timedelta(seconds=5)
+    exchange.now = current["now"]
+    second = lp.refresh_candidates(force=True)
+
+    assert len(exchange.book_token_reads) == 2
+    second_tokens = exchange.book_token_reads[1]
+    assert len(second_tokens) == 20
+    assert len(set(first) | set(second_tokens)) == 40
+    second_markets = {
+        token.removeprefix("token-").rsplit("-", 1)[0] for token in second_tokens
+    }
+    assert second_markets == {
+        *{f"condition-N{index:02d}" for index in range(11, 19)},
+        "condition-B1",
+        "condition-B2",
+    }
+    funnel = second["funnel"]
     assert funnel["checked"] == 20
     assert funnel["passed"] == 10
     assert funnel["rejected"] == 10
@@ -3795,7 +3832,7 @@ def test_batch_refresh_backfills_until_ten_passed(tmp_path) -> None:
     assert funnel["unchecked"] == 0
     assert funnel["batches"] == 2
     assert funnel["backup_read"] == 2
-    candidates = snapshot["candidates"]
+    candidates = second["candidates"]
     assert len(candidates) == 10
     passed_markets = {
         "market-N01", "market-N02", "market-N03",
@@ -3808,19 +3845,27 @@ def test_batch_refresh_backfills_until_ten_passed(tmp_path) -> None:
         assert "realtime_capital" in row
         assert row["state"] == "eligible"
         assert row["verification"] == "verified"
-    # Equal actual capital (20 × 0.34 = 6.80): the highest pool among the
-    # passers (N01, pool 499) yields the highest optimistic upper bound.
-    assert candidates[0]["market_id"] == "market-N01"
-    assert snapshot["recommendations"][0]["market_id"] == "market-N01"
-    assert snapshot["selected_results"][0]["market_id"] == "market-N01"
-    assert snapshot["selected_market_ids"] == [
+    # Ranking key (issue #157): equal yields at equal estimate times fall
+    # to the stable identity, so the lowest condition id heads the table.
+    head_id = min(
+        passed_markets,
+        key=lambda market_id: int(market_id.removeprefix("market-N")),
+    )
+    assert candidates[0]["market_id"] == head_id == "market-N01"
+    assert second["recommendations"][0]["market_id"] == head_id
+    assert second["selected_results"][0]["market_id"] == head_id
+    assert second["selected_market_ids"] == [
         row["market_id"] for row in candidates
     ]
 
 
 def test_batch_refresh_stops_at_fifty_markets_checked(tmp_path) -> None:
-    """S3 acceptance case 2: only four pass, the round budget stops at 50."""
+    """S3 acceptance case 2, issue #157 rotation: only four of the queued
+    markets pass and every batch is one capped book read with no repeated
+    token — the old 50-market round budget is gone, batches just keep
+    rolling on the next call."""
     now = datetime(2026, 9, 19, 7, tzinfo=UTC)
+    current = {"now": now}
     pools = {f"N{index:02d}": Decimal(600 - index) for index in range(1, 61)}
     exchange = _LPBatchQueryExchange(
         now,
@@ -3828,7 +3873,7 @@ def test_batch_refresh_stops_at_fifty_markets_checked(tmp_path) -> None:
         reject=frozenset({f"N{index:02d}" for index in range(5, 61)}),
     )
     lp = PolymarketLPService(
-        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: now
+        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
     )
     assert lp.refresh_price_history()["state"] == "known"
 
@@ -3836,26 +3881,39 @@ def test_batch_refresh_stops_at_fifty_markets_checked(tmp_path) -> None:
 
     assert snapshot["state"] == "ready"
     funnel = snapshot["funnel"]
-    assert funnel["stop_reason"] == "checked_limit"
-    assert funnel["checked"] == 50
+    assert funnel["stop_reason"] is None
+    assert funnel["checked"] == 10
     assert funnel["passed"] == 4
-    assert funnel["rejected"] == 46
+    assert funnel["rejected"] == 6
     assert funnel["unknown"] == 0
-    assert funnel["unchecked"] == 60 - 50
-    assert funnel["batches"] == 5
+    assert funnel["unchecked"] == 50
+    assert funnel["batches"] == 1
     assert funnel["backup_read"] == 0
-    # Binary markets: 50 markets × 2 tokens = 100 first-read tokens, each
-    # requested exactly once across five ≤20-token batch calls.
-    all_tokens = [token for batch in exchange.book_token_reads for token in batch]
-    assert len(exchange.book_token_reads) == 5
-    assert len(all_tokens) == 100
-    assert len(set(all_tokens)) == 100
+    # Binary markets: ten markets × 2 tokens in one ≤20-token call.
+    assert len(exchange.book_token_reads) == 1
+    assert len(exchange.book_token_reads[0]) == 20
     candidates = snapshot["candidates"]
     assert [row["market_id"] for row in candidates] == [
         "market-N01", "market-N02", "market-N03", "market-N04",
     ]
     assert all(row["selected_direction"] is not None for row in candidates)
     assert snapshot["recommendations"][0]["market_id"] == "market-N01"
+    assert snapshot["candidate_pending_count"] == 50
+
+    # The roll continues: the next batch reads the following ten markets
+    # (all rejected) without re-reading any earlier token.
+    current["now"] = now + timedelta(seconds=5)
+    exchange.now = current["now"]
+    second = lp.refresh_candidates(force=True)
+    all_tokens = [
+        token for batch in exchange.book_token_reads for token in batch
+    ]
+    assert len(exchange.book_token_reads) == 2
+    assert len(all_tokens) == 40
+    assert len(set(all_tokens)) == 40
+    assert second["funnel"]["checked"] == 20
+    assert second["funnel"]["rejected"] == 16
+    assert second["candidate_valid_count"] == 4
 
 
 def test_batch_refresh_renews_stale_market_facts_mid_round(tmp_path) -> None:
@@ -3880,6 +3938,11 @@ def test_batch_refresh_renews_stale_market_facts_mid_round(tmp_path) -> None:
     )
     assert lp.refresh_price_history()["state"] == "known"
 
+    # Issue #157: each batch is one call.  The advancing clock moves 30s per
+    # book read, so batches 1-2 evaluate inside the 60-second window while
+    # batch 3 crosses it.
+    lp.refresh_candidates(force=True)
+    lp.refresh_candidates(force=True)
     snapshot = lp.refresh_candidates(force=True)
 
     funnel = snapshot["funnel"]
@@ -3888,7 +3951,6 @@ def test_batch_refresh_renews_stale_market_facts_mid_round(tmp_path) -> None:
     assert funnel["rejected"] == 20
     assert funnel["passed"] == 10
     assert funnel["unknown"] == 0
-    assert funnel["stop_reason"] == "queue_exhausted"
     # Batch three (condition-N21..N30) crossed the window and was renewed:
     # exactly one targeted metadata read covering exactly that batch's
     # conditions, one targeted reward read, one account renewal.  Batches
@@ -3935,7 +3997,6 @@ def test_batch_refresh_renews_facts_stale_at_scan_start(tmp_path) -> None:
     assert funnel["batches"] == 1
     assert funnel["passed"] == 10
     assert funnel["unknown"] == 0
-    assert funnel["stop_reason"] == "queue_exhausted"
     # The first batch renewed the expired facts once, targeted at exactly
     # its own conditions.
     assert len(exchange.metadata_fresh_reads) == 1
@@ -4035,7 +4096,6 @@ def test_batch_refresh_renews_stale_reward_and_account_facts(tmp_path) -> None:
     assert account_funnel["passed"] == 10
     assert account_funnel["rejected"] == 0
     assert account_funnel["unknown"] == 0
-    assert account_funnel["stop_reason"] == "queue_exhausted"
     # The account renewed exactly once (round start plus one renewal) and
     # eligibility ran on the renewed receipts; metadata and reward were
     # still fresh and renewed nothing.
@@ -4080,7 +4140,6 @@ def test_batch_renewal_latency_keeps_renewed_facts_evaluable(tmp_path) -> None:
     assert funnel["passed"] == 10
     assert funnel["rejected"] == 0
     assert funnel["unknown"] == 0
-    assert funnel["stop_reason"] == "queue_exhausted"
     # Each expired fact class renewed once, targeted at the batch's own
     # conditions, and the renewed stamps were judged fresh.
     assert len(exchange.metadata_fresh_reads) == 1
@@ -4118,6 +4177,11 @@ def test_batch_refresh_failure_keeps_honest_stale_unknown(tmp_path) -> None:
     )
     assert lp.refresh_price_history()["state"] == "known"
 
+    # Issue #157: four batches, one call each.  Batches 3 and 4 cross the
+    # fact window; their metadata renewal attempts fail while the reward
+    # class renews targeted.
+    for _ in range(3):
+        lp.refresh_candidates(force=True)
     first = lp.refresh_candidates(force=True)
 
     funnel = first["funnel"]
@@ -4126,7 +4190,6 @@ def test_batch_refresh_failure_keeps_honest_stale_unknown(tmp_path) -> None:
     assert funnel["rejected"] == 20
     assert funnel["passed"] == 0
     assert funnel["unknown"] == 20
-    assert funnel["stop_reason"] == "queue_exhausted"
     stale_reasons = {
         row["condition_id"]: row["code"]
         for row in funnel["reasons"]["trial"]
@@ -4142,9 +4205,12 @@ def test_batch_refresh_failure_keeps_honest_stale_unknown(tmp_path) -> None:
     # (their round-start receipts each age past the window).  The account
     # fact is shared across conditions, so its batch-3 renewal covers
     # batch 4 and reads only twice in the round.
-    assert exchange.metadata_fresh_calls == 1
+    # Per-call batches retry the failed class on the next call: one failed
+    # attempt per batch, targeted at that batch's own conditions.
+    assert exchange.metadata_fresh_calls == 2
     assert exchange.metadata_fresh_reads == (
         tuple(f"condition-N{index:02d}" for index in range(21, 31)),
+        tuple(f"condition-N{index:02d}" for index in range(31, 41)),
     )
     assert len(exchange.targeted_reward_reads) == 2
     assert set(exchange.targeted_reward_reads[0]) == {
@@ -4155,29 +4221,28 @@ def test_batch_refresh_failure_keeps_honest_stale_unknown(tmp_path) -> None:
     }
     assert exchange.account_reads == 2
 
-    # The next forced round retries the renewal and recovers.
+    # The next calls retry the renewal and recover: one batch per call,
+    # each renewing its own conditions once (their receipts are the
+    # still-stale prepared stamps).
     exchange.metadata_fresh_mode = "fresh"
+    lp.refresh_candidates(force=True)
+    lp.refresh_candidates(force=True)
+    lp.refresh_candidates(force=True)
     second = lp.refresh_candidates(force=True)
 
     second_funnel = second["funnel"]
-    # Issue #138 round 2: the scan consumes the whole 40-market queue, so
-    # batch four (N31..N40) is checked too even though ten passers merged
-    # in batch three.
-    assert second_funnel["checked"] == 40
-    assert second_funnel["batches"] == 4
+    assert second_funnel["checked"] == 80
+    assert second_funnel["batches"] == 8
     # Batches three and four both pass on the recovered facts: twenty
     # passers merge, and the published table keeps the best ten yields
     # (N21..N30, the highest pools among them).
     assert second_funnel["passed"] == 20
-    assert second_funnel["rejected"] == 20
-    assert second_funnel["unknown"] == 0
-    assert second_funnel["stop_reason"] == "queue_exhausted"
-    # The recovery round renews each batch's own conditions once (its
-    # round-start receipts are the still-stale prepared stamps), so four
-    # further targeted calls — one per batch, never wider than the batch.
-    assert exchange.metadata_fresh_calls == 5
+    assert second_funnel["rejected"] == 40
+    assert second_funnel["unknown"] == 20
+    assert exchange.metadata_fresh_calls == 6
     assert exchange.metadata_fresh_reads == (
         tuple(f"condition-N{index:02d}" for index in range(21, 31)),
+        tuple(f"condition-N{index:02d}" for index in range(31, 41)),
         tuple(f"condition-N{index:02d}" for index in range(1, 11)),
         tuple(f"condition-N{index:02d}" for index in range(11, 21)),
         tuple(f"condition-N{index:02d}" for index in range(21, 31)),
@@ -4212,12 +4277,19 @@ def test_batch_refresh_isolates_missing_books_and_reads_backup_once(tmp_path) ->
     snapshot = lp.refresh_candidates(force=True)
 
     assert snapshot["state"] == "ready"
-    # Batch one: N01..N09 + B1 (its two books are missing from the response).
-    # Batch two: N10, N11 + B2, all passing and ending the round with ten
-    # merged passers.
+    # Batch one (issue #157 rotation): the ten normal-queue markets.
+    assert len(exchange.book_token_reads) == 1
+    assert len(exchange.book_token_reads[0]) == 20
+    funnel = snapshot["funnel"]
+    assert funnel["checked"] == 10
+    assert funnel["passed"] == 10
+
+    # Batch two: N11 plus both backup markets and the oldest-tried rotation
+    # tail; B1's two books are missing from the response and were requested
+    # exactly once, never retried.
+    second = lp.refresh_candidates(force=True)
     assert len(exchange.book_token_reads) == 2
     missing = {"token-condition-B1-yes", "token-condition-B1-no"}
-    # Each missing token was requested exactly once and never retried.
     for token in missing:
         reads = sum(batch.count(token) for batch in exchange.book_token_reads)
         assert reads == 1
@@ -4229,10 +4301,10 @@ def test_batch_refresh_isolates_missing_books_and_reads_backup_once(tmp_path) ->
             if any(f"condition-{suffix}-" in token for token in batch)
         ]
         assert len(batches_with_backup) == 1
-    funnel = snapshot["funnel"]
-    assert funnel["stop_reason"] == "queue_exhausted"
-    assert funnel["checked"] == 13
-    assert funnel["passed"] == 12
+    funnel = second["funnel"]
+    # Rotation: batch two = 3 never-tried + 7 oldest-tried markets.
+    assert funnel["checked"] == 20
+    assert funnel["passed"] == 19
     assert funnel["rejected"] == 0
     assert funnel["unknown"] == 1
     assert funnel["backup_read"] == 2
@@ -4242,7 +4314,7 @@ def test_batch_refresh_isolates_missing_books_and_reads_backup_once(tmp_path) ->
     ]
     assert unknown_reasons
     assert all(row.get("code") == "book_unknown" for row in unknown_reasons)
-    candidates = snapshot["candidates"]
+    candidates = second["candidates"]
     assert len(candidates) == 10
     assert all(row["state"] == "eligible" for row in candidates)
     assert "market-B1" not in {row["market_id"] for row in candidates}
@@ -4267,16 +4339,21 @@ def test_batch_scan_funnel_trial_counts_published_passers(tmp_path) -> None:
 
     funnel = snapshot["funnel"]
     candidates = snapshot["candidates"]
-    # 12 kept markets: the view preview batch is capped at 10, but only 8
-    # markets pass the live batch check (4 reject off-tick) and only passers
-    # are published under the passers-only table.
-    assert funnel["checked"] == 12
-    assert funnel["passed"] == 8
+    # Issue #157 rotation: two batches cover the 12 kept markets; 8 pass
+    # the live check (4 reject off-tick) and only passers enter the pool.
+    second = lp.refresh_candidates(force=True)
+    funnel = second["funnel"]
+    candidates = second["candidates"]
+    assert funnel["checked"] == 20
+    # 8 unique passers: the second batch re-passes five tried markets, so
+    # the cumulative passed counter counts re-estimates too.
+    assert funnel["passed"] == 13
     assert len(candidates) == 8
     assert all(row["state"] == "eligible" for row in candidates)
-    # Funnel, progress line, and table agree on the trial stage.
+    # The funnel's trial stage equals the valid pool, which the table shows
+    # in full here.
     assert funnel["trial"] == 8
-    assert funnel["trial"] == len(candidates)
+    assert funnel["trial"] == second["candidate_valid_count"]
 
 
 def test_candidate_qualification_facts_writes_hold_state_lock() -> None:
@@ -4387,6 +4464,9 @@ def test_batch_refresh_ranks_passers_by_actual_capital_and_maintains_top_one(
     lp = PolymarketLPService(store, exchange, clock=lambda: current["now"])
     assert lp.refresh_price_history()["state"] in {"known", "partial"}
 
+    snapshot = lp.refresh_candidates(force=True)
+    # Issue #157: Z1 rolls in the second exploration batch (it queues last
+    # behind the tied A-group and B1).
     snapshot = lp.refresh_candidates(force=True)
 
     assert snapshot["state"] == "ready"
@@ -4530,7 +4610,9 @@ def test_maintenance_recomputes_upper_bound_from_new_capital(tmp_path) -> None:
 
 
 def test_batch_scan_cadence_and_shared_round_protection(tmp_path) -> None:
-    """S6: 300-second scan gate, shared in-flight rounds, stale writes lose."""
+    """S6 + issue #157: batches roll with no round window, concurrent calls
+    share one in-flight batch, and a newer durable pool wins the save
+    arbiter over an older writer."""
     now = datetime(2026, 9, 19, 10, tzinfo=UTC)
     current = {"now": now}
     pools = {f"N{index:02d}": Decimal(500 - index) for index in range(1, 4)}
@@ -4542,31 +4624,21 @@ def test_batch_scan_cadence_and_shared_round_protection(tmp_path) -> None:
     first = lp.refresh_candidates(force=True)
     assert first["state"] == "ready"
     reads_after_first = len(exchange.book_token_reads)
-    competition_after_first = exchange.competition_reads
     assert reads_after_first == 1
 
-    # Inside the 300-second window a non-force call returns the snapshot
-    # with zero external reads.
+    # Issue #157: there is no 300-second window — the next call rolls the
+    # next batch (the same three markets re-estimate) and reads again.
     current["now"] = now + timedelta(seconds=60)
-    exchanged = lp.refresh_candidates(force=False)
-    assert len(exchange.book_token_reads) == reads_after_first
-    assert exchange.competition_reads == competition_after_first
-    assert (
-        [row["market_id"] for row in exchanged["candidates"]]
-        == [row["market_id"] for row in first["candidates"]]
-    )
-
-    # A manual force starts a new round immediately.
-    current["now"] = now + timedelta(seconds=61)
     exchange.now = current["now"]
-    forced = lp.refresh_candidates(force=True)
+    exchanged = lp.refresh_candidates(force=False)
     assert len(exchange.book_token_reads) == reads_after_first + 1
-    assert exchange.competition_reads == competition_after_first + 1
-    assert forced["funnel"]["batches"] == 1
+    assert exchanged["funnel"]["batches"] == 2
+    # Batches never read the competition reader: it is cache-only.
+    assert exchange.competition_reads == 0
 
-    # Concurrent calls share one in-flight round: while a force round is
-    # blocked inside its batch read, a non-force call returns the scanning
-    # snapshot instead of starting a second round.
+    # Concurrent calls share one in-flight batch: while a batch is blocked
+    # inside its book read, another call returns the scanning snapshot
+    # instead of starting a second batch.
     release = threading.Event()
     entered = threading.Event()
 
@@ -4586,7 +4658,6 @@ def test_batch_scan_cadence_and_shared_round_protection(tmp_path) -> None:
     assert blocked_lp.refresh_price_history()["state"] == "known"
     current["now"] = now + timedelta(seconds=62)
     blocked_exchange.now = current["now"]
-    blocked_reads = len(blocked_exchange.book_token_reads)
     round_result: dict[str, object] = {}
 
     def run_round() -> None:
@@ -4595,37 +4666,46 @@ def test_batch_scan_cadence_and_shared_round_protection(tmp_path) -> None:
     round_thread = threading.Thread(target=run_round)
     round_thread.start()
     assert entered.wait(timeout=5)
+    blocked_reads = len(blocked_exchange.book_token_reads)
     shared = blocked_lp.refresh_candidates(force=False)
     assert shared["scanning"] is True
     assert len(blocked_exchange.book_token_reads) == blocked_reads
 
-    # A snapshot persisted by a newer round wins over this blocked older
-    # round: the stale response must not overwrite the newer result.
+    # A pool persisted by a newer writer wins the durable save arbiter over
+    # this older writer, while the blocked batch keeps its own honest rows
+    # in memory.
     newer_started = current["now"] + timedelta(seconds=3600)
-    marker = {"market_id": "market-newer", "condition_id": "condition-newer"}
+    marker = {
+        "market_id": "market-newer",
+        "condition_id": "condition-newer",
+        "updated_at": _iso_z(newer_started),
+        "expires_at": _iso_z(newer_started + timedelta(seconds=300)),
+        "refresh_failed": False,
+        "state": "eligible",
+    }
     shared_store.lp_save_screening_snapshot(
         {
-            "state": "ready",
-            "complete": True,
-            "candidate_rows_fresh": True,
-            "scan_started_at": newer_started.isoformat().replace("+00:00", "Z"),
-            "funnel": {"checked": 0},
-            "selected_market_ids": ["market-newer"],
-            "candidates": [marker],
-            "recommendations": [],
-            "selected_results": [],
+            "pool_version": 2,
+            "scan_started_at": _iso_z(newer_started),
+            "pool": {"condition-newer": marker},
+            "rotation": {},
+            "event_end_confirmations": {},
         }
     )
     release.set()
     round_thread.join(timeout=5)
     settled = round_result["snapshot"]
-    assert [row["market_id"] for row in settled["candidates"]] == ["market-newer"]
+    assert settled["scanning"] is False
+    assert settled["candidate_valid_count"] == 3
+    durable = shared_store.lp_screening_snapshot()
+    assert "condition-newer" in durable["pool"]
     assert blocked_lp.candidate_snapshot()["scanning"] is False
 
 
 def test_batch_refresh_early_stops_when_account_unavailable(tmp_path) -> None:
     """S7: an unusable account fact ends the round before any batch read."""
     now = datetime(2026, 9, 19, 11, tzinfo=UTC)
+    current = {"now": now}
     pools = {f"N{index:02d}": Decimal(500 - index) for index in range(1, 4)}
 
     class Exchange(_LPBatchQueryExchange):
@@ -4640,7 +4720,7 @@ def test_batch_refresh_early_stops_when_account_unavailable(tmp_path) -> None:
 
     exchange = Exchange(now)
     lp = PolymarketLPService(
-        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: now
+        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
     )
     assert lp.refresh_price_history()["state"] == "known"
     healthy = lp.refresh_candidates(force=True)
@@ -4649,32 +4729,39 @@ def test_batch_refresh_early_stops_when_account_unavailable(tmp_path) -> None:
     ]
     reads_after_healthy = len(exchange.book_token_reads)
 
-    # The account read fails: the round must not consume any queue batch.
+    # The account read fails once the cached receipt ages past the shared
+    # fact window: the batch is not consumed at all.
     exchange.account_mode = "failure"
+    current["now"] = now + timedelta(seconds=65)
+    exchange.now = current["now"]
     failed = lp.refresh_candidates(force=True)
 
-    assert failed["state"] == "stale"
+    # Issue #157: the pool keeps its valid rows, so the snapshot stays
+    # ready; the funnel notes the account gate in the payload only.
+    assert failed["state"] == "ready"
     assert failed["funnel"]["stop_reason"] == "account_unavailable"
-    assert failed["funnel"]["checked"] == 0
-    assert failed["funnel"]["passed"] == 0
-    assert failed["funnel"]["batches"] == 0
+    # Continuous counters: the gate consumed nothing, so the totals still
+    # reflect the healthy batch only.
+    assert failed["funnel"]["checked"] == 3
+    assert failed["funnel"]["passed"] == 3
+    assert failed["funnel"]["batches"] == 1
     assert len(exchange.book_token_reads) == reads_after_healthy
-    assert exchange.competition_reads == 1  # no re-read either
-    # The previous round's rows are kept for read-only display.
+    assert exchange.competition_reads == 0  # batches never read competition
+    # The previous batches' rows are kept for read-only display.
     assert [row["market_id"] for row in failed["candidates"]] == [
         "market-N01", "market-N02", "market-N03",
     ]
 
-    # A forced refresh with the account back recovers immediately.
+    # A refresh with the account back recovers immediately.
     exchange.account_mode = "valid"
-    exchange.now = now
+    current["now"] = now + timedelta(seconds=66)
+    exchange.now = current["now"]
     recovered = lp.refresh_candidates(force=True)
     assert recovered["state"] == "ready"
-    # Only three queue markets exist, so the recovered round ends exhausted,
-    # not filled.
-    assert recovered["funnel"]["stop_reason"] == "queue_exhausted"
-    assert recovered["funnel"]["checked"] == 3
-    assert recovered["funnel"]["passed"] == 3
+    # Only three queue markets exist, so the recovered batch covers them all
+    # (continuous counters: 3 from the healthy batch + 3 now).
+    assert recovered["funnel"]["checked"] == 6
+    assert recovered["funnel"]["passed"] == 6
     assert [row["market_id"] for row in recovered["candidates"]] == [
         "market-N01", "market-N02", "market-N03",
     ]
@@ -4934,14 +5021,15 @@ def test_trial_refresh_qualifies_head_and_selects_lowest_capital(tmp_path) -> No
 
     exchange.phase = "none"
     no_direction = lp.refresh_candidates(force=True)
-    assert no_direction["recommendations"] == []
-    # Both batch markets lost their books: no passer is published and the
-    # scan funnel reports them as unknown with book reasons.
-    assert no_direction["selected_results"] == []
-    assert no_direction["candidates"] == []
-    assert no_direction["funnel"]["checked"] == 2
+    # Issue #157: the failed re-estimate keeps the stored row (marked
+    # refresh_failed) instead of clearing the table.
+    assert no_direction["recommendations"][0]["condition_id"] == "condition-M01"
+    assert no_direction["candidates"][0]["refresh_failed"] is True
+    # The batch funnel reports the two bookless markets as unknown, and the
+    # continuous counters accumulate every batch call.
+    assert no_direction["funnel"]["checked"] == 10
+    assert no_direction["funnel"]["passed"] == 8
     assert no_direction["funnel"]["unknown"] == 2
-    assert no_direction["funnel"]["stop_reason"] == "queue_exhausted"
     unknown_codes = [
         row["code"] for row in no_direction["funnel"]["reasons"]["trial"]
     ]
@@ -5065,7 +5153,8 @@ def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:
     assert lp.refresh_price_history()["state"] == "known"
     first = lp.refresh_candidates(force=True)
     assert first["recommendations"][0]["selected_direction"]["outcome"] == "NO"
-    assert len(exchange.book_token_reads) == 1
+    reads_so_far = len(exchange.book_token_reads)
+    assert len(exchange.book_token_reads) == reads_so_far
     initial_reader_counts = (
         exchange.account_reads,
         exchange.reward_reads,
@@ -5078,7 +5167,7 @@ def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:
     exchange.now = current["now"]
     at_boundary = lp.refresh_candidate_recommendations()
     assert at_boundary["recommendations"]
-    assert len(exchange.book_token_reads) == 1
+    assert len(exchange.book_token_reads) == reads_so_far
     assert (
         exchange.account_reads,
         exchange.reward_reads,
@@ -5090,23 +5179,27 @@ def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:
     exchange.phase = "reverse"
     exchange.account_mode = "insufficient"
     reversed_snapshot = lp.refresh_candidate_recommendations()
+    # Issue #157: the deterministic rejection (insufficient funds) removes
+    # the row from the pool immediately instead of displaying it degraded,
+    # and the attempt counts toward the maintenance backoff ladder.
     assert reversed_snapshot["recommendations"] == []
-    assert reversed_snapshot["selected_results"][0]["state"] == "rejected"
-    assert reversed_snapshot["selected_results"][0]["directions"]["YES"][
-        "reason_codes"
-    ]
+    assert reversed_snapshot["selected_results"] == []
+    assert reversed_snapshot["candidate_valid_count"] == 0
+    assert reversed_snapshot["maintenance_consecutive_failures"] == 1
     assert (
         exchange.account_reads,
         exchange.reward_reads,
         exchange.metadata_reads,
     ) == tuple(value + 1 for value in initial_reader_counts)
-    assert len(exchange.book_token_reads) == 2
+    reads_so_far += 1
+    assert len(exchange.book_token_reads) == reads_so_far
     first_maintenance_counts = (
         exchange.account_reads,
         exchange.reward_reads,
         exchange.metadata_reads,
         len(exchange.book_token_reads),
     )
+    # With the pool empty a retry is a pure snapshot read.
     retry_same_round = lp.refresh_candidate_recommendations()
     assert retry_same_round["recommendations"] == []
     assert (
@@ -5116,20 +5209,15 @@ def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:
         len(exchange.book_token_reads),
     ) == first_maintenance_counts
 
-    # A failed refresh suppresses retries for its 60-second backoff window
-    # (issue #146). Once the window elapses the retry runs and fails again
-    # while the account stays insufficient.
+    # While the account stays insufficient the exploration cannot restore
+    # the market: its re-estimate is rejected again and the pool stays empty.
     current["now"] = now + timedelta(seconds=120, microseconds=2)
     exchange.now = current["now"]
-    no_retry = lp.refresh_candidate_recommendations()
+    no_retry = lp.refresh_candidates(force=True)
     assert no_retry["recommendations"] == []
-    assert no_retry["maintenance_consecutive_failures"] == 2
-    assert (
-        exchange.account_reads,
-        exchange.reward_reads,
-        exchange.metadata_reads,
-        len(exchange.book_token_reads),
-    ) == tuple(value + 1 for value in first_maintenance_counts)
+    assert no_retry["candidate_valid_count"] == 0
+    reads_so_far += 1
+    assert len(exchange.book_token_reads) == reads_so_far
 
     # A new normal scan starts a new round and can restore the candidate.
     exchange.account_mode = "valid"
@@ -5137,7 +5225,8 @@ def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:
     assert lp.refresh_price_history()["state"] == "known"
     recovered_round = lp.refresh_candidates(force=True)
     assert recovered_round["recommendations"][0]["selected_direction"]["outcome"] == "NO"
-    assert len(exchange.book_token_reads) == 4
+    reads_so_far += 1
+    assert len(exchange.book_token_reads) == reads_so_far
 
     # With the whole fact bundle expired, all selected readers run once and
     # the actual returned timestamps permit the reversed direction.
@@ -5147,7 +5236,8 @@ def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:
     refreshed = lp.refresh_candidate_recommendations()
     assert refreshed["recommendations"][0]["selected_direction"]["outcome"] == "YES"
     assert refreshed["recommendations"][0]["realtime_checked_at"] == current["now"].isoformat().replace("+00:00", "Z")
-    assert len(exchange.book_token_reads) == 5
+    reads_so_far += 1
+    assert len(exchange.book_token_reads) == reads_so_far
     successful_refresh_counts = (
         exchange.account_reads,
         exchange.reward_reads,
@@ -5169,19 +5259,21 @@ def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:
     exchange.phase = "initial"
     assert lp.refresh_price_history()["state"] == "known"
     assert lp.refresh_candidates(force=True)["recommendations"][0]["selected_direction"]["outcome"] == "NO"
-    assert len(exchange.book_token_reads) == 6
+    reads_so_far += 1
+    assert len(exchange.book_token_reads) == reads_so_far
 
     current["now"] = now + timedelta(seconds=300, microseconds=3)
     exchange.now = current["now"]
     exchange.phase = "reverse"
     exchange.reward_mode = "failure"
     failed_reward = lp.refresh_candidate_recommendations()
-    assert failed_reward["recommendations"] == []
-    assert failed_reward["selected_results"][0]["directions"]["YES"]["state"] == "unknown"
-    assert "reward" in " ".join(
-        failed_reward["selected_results"][0]["directions"]["YES"]["reason_codes"]
-    )
-    assert len(exchange.book_token_reads) == 7
+    # Issue #157: a failed re-estimate keeps the stored row marked
+    # refresh_failed until its original expiry instead of clearing it.
+    assert failed_reward["recommendations"][0]["market_id"] == "market-M01"
+    assert failed_reward["candidates"][0]["refresh_failed"] is True
+    assert failed_reward["candidate_failed_recent_count"] == 1
+    reads_so_far += 1
+    assert len(exchange.book_token_reads) == reads_so_far
     failed_reward_counts = (
         exchange.account_reads,
         exchange.reward_reads,
@@ -5190,34 +5282,42 @@ def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:
     )
     current["now"] = now + timedelta(seconds=360, microseconds=3)
     exchange.now = current["now"]
-    # The 60-second backoff has elapsed, so the retry runs and fails again.
-    assert lp.refresh_candidate_recommendations()["recommendations"] == []
+    # The 60-second backoff has elapsed, so the retry runs and fails again;
+    # the row still keeps its last successful values.
+    retried = lp.refresh_candidate_recommendations()
+    assert retried["recommendations"][0]["market_id"] == "market-M01"
+    assert retried["candidates"][0]["refresh_failed"] is True
     assert (
         exchange.account_reads,
         exchange.reward_reads,
         exchange.metadata_reads,
         len(exchange.book_token_reads),
     ) == tuple(value + 1 for value in failed_reward_counts)
+    reads_so_far += 1  # the retried maintenance read the batch books once
 
     current["now"] = now + timedelta(seconds=360, microseconds=3)
     exchange.now = current["now"]
     exchange.reward_mode = "valid"
     exchange.phase = "initial"
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #157: the recovery exploration batch is empty at this clock —
+    # the market sits in its per-market failure backoff after the two
+    # failed maintenance attempts — so it reads nothing; the still-valid
+    # stored row keeps the table populated.
     assert lp.refresh_candidates(force=True)["recommendations"][0]["selected_direction"]["outcome"] == "NO"
-    assert len(exchange.book_token_reads) == 9
+    assert len(exchange.book_token_reads) == reads_so_far
 
     current["now"] = now + timedelta(seconds=420, microseconds=4)
     exchange.now = current["now"]
     exchange.phase = "reverse"
     exchange.metadata_mode = "failure"
-    failed_metadata = lp.refresh_candidate_recommendations()
-    assert failed_metadata["recommendations"] == []
-    assert failed_metadata["selected_results"][0]["directions"]["YES"]["state"] == "unknown"
-    assert "market" in " ".join(
-        failed_metadata["selected_results"][0]["directions"]["YES"]["reason_codes"]
-    )
-    assert len(exchange.book_token_reads) == 10
+    suppressed = lp.refresh_candidate_recommendations()
+    # Issue #146/#157: two consecutive failures hold the maintenance for
+    # 120 seconds, so this attempt is suppressed — the stored row keeps its
+    # last successful values and nothing is read.
+    assert suppressed["recommendations"][0]["market_id"] == "market-M01"
+    assert suppressed["candidates"][0]["refresh_failed"] is True
+    assert len(exchange.book_token_reads) == reads_so_far
     failed_metadata_counts = (
         exchange.account_reads,
         exchange.reward_reads,
@@ -5226,8 +5326,11 @@ def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:
     )
     current["now"] = now + timedelta(seconds=480, microseconds=4)
     exchange.now = current["now"]
-    # The 60-second backoff has elapsed, so the retry runs and fails again.
-    assert lp.refresh_candidate_recommendations()["recommendations"] == []
+    # The 120-second backoff has elapsed, so the retry runs and fails
+    # again; the stored row keeps its values.
+    metadata_retry = lp.refresh_candidate_recommendations()
+    assert metadata_retry["recommendations"][0]["market_id"] == "market-M01"
+    assert metadata_retry["candidates"][0]["refresh_failed"] is True
     assert (
         exchange.account_reads,
         exchange.reward_reads,
@@ -5241,42 +5344,59 @@ def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:
     exchange.phase = "initial"
     assert lp.refresh_price_history()["state"] == "known"
     assert lp.refresh_candidates(force=True)["recommendations"][0]["selected_direction"]["outcome"] == "NO"
-    assert len(exchange.book_token_reads) == 12
+    reads_so_far += 1
+    assert len(exchange.book_token_reads) == reads_so_far
 
+    # Issue #157: at +540 the +240 estimate expires (no failed refresh ever
+    # extended it), so the pool is empty and the books failure cannot land
+    # on any row — maintenance is a pure snapshot read.
     current["now"] = now + timedelta(seconds=540, microseconds=5)
     exchange.now = current["now"]
     exchange.phase = "failure"
     failed_books = lp.refresh_candidate_recommendations()
     assert failed_books["recommendations"] == []
-    assert failed_books["selected_results"][0]["directions"]["YES"]["state"] == "unknown"
-    assert failed_books["selected_results"][0]["directions"]["YES"][
-        "reason_codes"
-    ] == ["book_unknown"]
-    assert len(exchange.book_token_reads) == 13
-    failed_books_counts = (
-        exchange.account_reads,
-        exchange.reward_reads,
-        exchange.metadata_reads,
-        len(exchange.book_token_reads),
-    )
+    assert failed_books["candidates"] == []
+    assert len(exchange.book_token_reads) == reads_so_far
+
+    # The per-market ladder (issue #157) now holds until +780: the +300 and
+    # +360 maintenance failures count 60s/120s and the +480 one pushed the
+    # ceiling to 300s, so the exploration consumes nothing and the pool
+    # stays honestly empty.
     current["now"] = now + timedelta(seconds=600, microseconds=5)
     exchange.now = current["now"]
-    # The 60-second backoff has elapsed, so the retry runs and fails again.
-    assert lp.refresh_candidate_recommendations()["recommendations"] == []
-    assert (
-        exchange.account_reads,
-        exchange.reward_reads,
-        exchange.metadata_reads,
-        len(exchange.book_token_reads),
-    ) == tuple(value + 1 for value in failed_books_counts)
+    in_backoff = lp.refresh_candidates(force=True)
+    assert in_backoff["recommendations"] == []
+    assert in_backoff["candidate_valid_count"] == 0
+    assert len(exchange.book_token_reads) == reads_so_far
 
-    current["now"] = now + timedelta(seconds=600, microseconds=6)
+    # Past +780 the exploration re-estimates the market once — the failing
+    # books keep it out of the pool and re-arm the ladder.
+    current["now"] = now + timedelta(seconds=780, microseconds=5)
+    exchange.now = current["now"]
+    books_retry = lp.refresh_candidates(force=True)
+    assert books_retry["recommendations"] == []
+    assert books_retry["candidate_valid_count"] == 0
+    reads_so_far += 1
+    assert len(exchange.book_token_reads) == reads_so_far
+
+    # Inside the fresh 300-second per-market backoff the exploration
+    # consumes nothing again.
+    current["now"] = now + timedelta(seconds=780, microseconds=6)
     exchange.now = current["now"]
     exchange.phase = "initial"
     assert lp.refresh_price_history()["state"] == "known"
     recovered = lp.refresh_candidates(force=True)
+    assert recovered["recommendations"] == []
+    assert recovered["candidate_valid_count"] == 0
+    assert len(exchange.book_token_reads) == reads_so_far
+
+    # Past the ladder the exploration restores the market.
+    current["now"] = now + timedelta(seconds=1080, microseconds=7)
+    exchange.now = current["now"]
+    recovered = lp.refresh_candidates(force=True)
     assert recovered["recommendations"][0]["selected_direction"]["outcome"] == "NO"
-    assert len(exchange.book_token_reads) == 15
+    reads_so_far += 1
+    assert len(exchange.book_token_reads) == reads_so_far
 
     # A source receipt 59s old at publication expires two seconds later even
     # though the publication itself is only two seconds old.  Maintenance
@@ -5487,11 +5607,12 @@ def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:
     inverse_current["now"] = inverse_now + timedelta(seconds=2)
     inverse_exchange.now = inverse_current["now"]
     inverse_refreshed = inverse_lp.refresh_candidate_recommendations()
+    # Issue #157: the deterministic rejection (reward distance invalid on
+    # both directions) removes the row from the pool instead of showing it
+    # degraded; the reads that produced the verdict still ran.
     assert inverse_refreshed["recommendations"] == []
-    for outcome in ("YES", "NO"):
-        assert inverse_refreshed["selected_results"][0]["directions"][outcome][
-            "reason_codes"
-        ] == ["reward_distance_invalid"]
+    assert inverse_refreshed["selected_results"] == []
+    assert inverse_refreshed["candidate_valid_count"] == 0
     assert (
         inverse_exchange.account_reads,
         inverse_exchange.reward_reads,
@@ -5696,12 +5817,14 @@ def test_scan_checks_past_ten_passers_and_ranks_by_target_share_yield(tmp_path) 
     lp = PolymarketLPService(store, exchange, clock=lambda: now)
     assert lp.refresh_price_history()["state"] == "known"
 
+    lp.refresh_candidates(force=True)
+    # Issue #157: the eleventh market rolls in the second exploration batch
+    # (the never-tried head plus the nine oldest-tried markets).
     snapshot = lp.refresh_candidates(force=True)
 
     funnel = snapshot["funnel"]
-    assert funnel["checked"] == 11
-    assert funnel["passed"] == 11
-    assert funnel["stop_reason"] == "queue_exhausted"
+    assert funnel["checked"] == 20
+    assert funnel["passed"] == 20
     assert funnel["gap_reason"] is None
     candidates = snapshot["candidates"]
     head = candidates[0]
@@ -5726,22 +5849,31 @@ def test_scan_checks_fifty_markets_then_publishes_best_ten(tmp_path) -> None:
     the best ten without claiming a passer shortfall."""
 
     now = datetime(2026, 9, 20, 5, tzinfo=UTC)
+    current = {"now": now}
     pools = {f"M{index:02d}": Decimal(index) for index in range(1, 61)}
     exchange = _LPYieldBooksExchange(now, pools)
     store = PredictionArbitrageStore(tmp_path)
-    lp = PolymarketLPService(store, exchange, clock=lambda: now)
+    lp = PolymarketLPService(store, exchange, clock=lambda: current["now"])
     assert lp.refresh_price_history()["state"] == "known"
 
-    snapshot = lp.refresh_candidates(force=True)
+    for _ in range(6):
+        lp.refresh_candidates(force=True)
+        current["now"] = current["now"] + timedelta(seconds=5)
+        exchange.now = current["now"]
+    snapshot = lp.candidate_snapshot()
 
     funnel = snapshot["funnel"]
-    assert funnel["checked"] == 50
-    assert funnel["passed"] == 50
-    assert funnel["stop_reason"] == "checked_limit"
+    assert funnel["checked"] == 60
+    assert funnel["passed"] == 60
     assert funnel["gap_reason"] is None
-    assert funnel["unchecked"] == 10
-    assert funnel["batches"] == 5
-    assert len(exchange.book_token_reads) == 5
+    assert funnel["unchecked"] == 0
+    assert funnel["batches"] == 6
+    assert len(exchange.book_token_reads) == 6
+    all_tokens = [
+        token for batch in exchange.book_token_reads for token in batch
+    ]
+    assert len(all_tokens) == 120
+    assert len(set(all_tokens)) == 120
     candidates = snapshot["candidates"]
     assert [row["market_id"] for row in candidates] == [
         f"market-M{index}" for index in range(60, 50, -1)
@@ -5850,29 +5982,32 @@ def test_maintenance_refreshes_all_rows_and_reranks_by_new_yield(tmp_path) -> No
 
     assert len(exchange.book_token_reads) == reads_before_failure + 1
     rows = failed_row_round["candidates"]
+    # Issue #157: the failed row keeps its values and its OLD estimate time,
+    # so it ranks by its stored yield — above the collapsed M01.
     assert [row["market_id"] for row in rows] == [
-        "market-M02", "market-M01", "market-M03",
+        "market-M02", "market-M03", "market-M01",
     ]
-    stale_row = rows[2]
+    stale_row = rows[1]
     assert stale_row["market_id"] == "market-M03"
-    assert stale_row["estimate_updated"] is False
+    assert stale_row["refresh_failed"] is True
     assert Decimal(str(stale_row["estimated_yield_pct_per_hour"])) == Decimal("2.450980")
     assert Decimal(str(stale_row["estimated_target_capital_usd"])) == Decimal("6.80")
     assert failed_row_round["recommendations"][0]["market_id"] == "market-M02"
 
-    # A whole-round book failure degrades every row: values frozen, original
-    # relative order preserved, and no current recommendation.
+    # A whole-round book failure keeps every stored row marked
+    # refresh_failed with frozen values; the head still auto-fills from the
+    # best valid row.
     exchange.fail_book_reads = True
     current["now"] = current["now"] + timedelta(seconds=65)
     exchange.now = current["now"]
     degraded_round = lp.refresh_candidate_recommendations()
 
-    assert degraded_round["recommendations"] == []
     degraded_rows = degraded_round["candidates"]
     assert [row["market_id"] for row in degraded_rows] == [
-        "market-M02", "market-M01", "market-M03",
+        "market-M02", "market-M03", "market-M01",
     ]
-    assert all(row["estimate_updated"] is False for row in degraded_rows)
+    assert all(row["refresh_failed"] is True for row in degraded_rows)
+    assert degraded_round["recommendations"][0]["market_id"] == "market-M02"
 def test_status_returns_none_when_only_reserved_manual_anchor(tmp_path) -> None:
     """R2: store 仅含保留锚点会话时,status() 不把锚点当最新会话,报 none。"""
 
@@ -6949,3 +7084,831 @@ def test_queue_protection_unacknowledged_cancels_converge_with_request_time_rema
     assert "已撤 2 张买单合计余量 3000 份 @ 0.3（含 1 张手动）" in message
     assert "合计余量 0 份" not in message
     assert xiaoai == "LP 位置保护撤单，2 张买单已撤"
+
+def _iso_z(moment: datetime) -> str:
+    return moment.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+class _LPRollingPoolExchange(_LPCandidateQueryExchange):
+    """Issue #157 rolling-pool fixture: three single-outcome markets quoting
+    0.50, so the min-dominated target is 20.00 shares and capital is $10.00.
+
+    With hourly reward = pool × 5% / 24, the estimated yield per hour in
+    percent is pool / 48: M01 and M02 (pool 57.6) estimate exactly 1.2%/h,
+    M03 (pool 38.4) exactly 0.8%/h.  `omit_conditions` drops a market's books
+    from the response (read failure); `pool_override` swaps a market's daily
+    pool for the next reward read (re-estimate); `flip_competition` inverts
+    the official competition values.
+    """
+
+    def __init__(self, initial_now: datetime) -> None:
+        super().__init__(
+            initial_now,
+            {
+                "M01": Decimal("57.6"),
+                "M02": Decimal("57.6"),
+                "M03": Decimal("38.4"),
+            },
+            book_bid="0.50",
+        )
+        self.omit_conditions: frozenset[str] = frozenset()
+        self.pool_override: dict[str, Decimal | None] = {}
+        self.flip_competition = False
+        self.string_rules_conditions: frozenset[str] = frozenset()
+
+    def lp_market_metadata(self, condition_ids, *, stop_event=None):
+        metadata = super().lp_market_metadata(
+            condition_ids, stop_event=stop_event
+        )
+        if not self.string_rules_conditions:
+            return metadata
+        return {
+            condition_id: (
+                {**dict(row), "reward_min_size": "20"}
+                if condition_id in self.string_rules_conditions
+                else row
+            )
+            for condition_id, row in metadata.items()
+        }
+
+    def lp_order_books(self, token_ids, *, stop_event=None):
+        books = super().lp_order_books(token_ids, stop_event=stop_event)
+        return {
+            token_id: book
+            for token_id, book in books.items()
+            if token_id.removeprefix("token-") not in self.omit_conditions
+        }
+
+    def lp_reward_catalog(self, *, condition_ids=None, stop_event=None):
+        catalog = super().lp_reward_catalog(
+            condition_ids=condition_ids, stop_event=stop_event
+        )
+        if not self.pool_override:
+            return catalog
+        markets = []
+        for row in catalog["markets"]:
+            suffix = str(row.get("condition_id") or "").removeprefix("condition-")
+            markets.append(
+                {
+                    **dict(row),
+                    "daily_pool_usd": self.pool_override.get(
+                        f"condition-{suffix}", row.get("daily_pool_usd")
+                    ),
+                }
+            )
+        return {**dict(catalog), "markets": tuple(markets)}
+
+    def lp_market_competitiveness(self, *, stop_event=None, previous=None):
+        del stop_event, previous
+        values = {
+            "condition-M01": Decimal(1),
+            "condition-M02": Decimal(9),
+            "condition-M03": Decimal(5),
+        }
+        if self.flip_competition:
+            values = {
+                "condition-M01": Decimal(9),
+                "condition-M02": Decimal(1),
+                "condition-M03": Decimal(5),
+            }
+        return {
+            "state": "known",
+            "complete": True,
+            "checked_at": self.now,
+            "round_checked_at": self.now,
+            "competitiveness": {
+                key: (value, self.now) for key, value in values.items()
+            },
+            "not_updated": [],
+        }
+
+
+def test_candidate_pool_ranks_by_yield_then_updated_at(tmp_path) -> None:
+    """Issue #157 A3: the rolling pool ranks by estimated yield descending,
+    then estimate time descending, then stable identity — competition and
+    actual capital leave the ranking key, so flipping competition values
+    alone never reshuffles the displayed order."""
+    now = datetime(2026, 9, 20, 8, tzinfo=UTC)
+    current = {"now": now}
+    exchange = _LPRollingPoolExchange(now)
+    lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
+    )
+    assert lp.refresh_price_history()["state"] == "known"
+
+    first = lp.refresh_candidates(force=True)
+    assert first["state"] == "ready"
+    # 1.2 ties at the same estimate time fall to the stable identity.
+    assert [row["market_id"] for row in first["candidates"]] == [
+        "market-M01", "market-M02", "market-M03",
+    ]
+    assert first["recommendations"][0]["market_id"] == "market-M01"
+
+    # M02 re-estimates at t1; M01/M03 reads fail and keep their old rows.
+    exchange.omit_conditions = frozenset({"condition-M01", "condition-M03"})
+    current["now"] = now + timedelta(seconds=65)
+    exchange.now = current["now"]
+    lp.refresh_candidate_recommendations()
+
+    pool = lp.candidate_snapshot()
+    assert [row["market_id"] for row in pool["candidates"]] == [
+        "market-M02", "market-M01", "market-M03",
+    ]
+    assert pool["recommendations"][0]["market_id"] == "market-M02"
+
+    # Competition values flip (M01 9, M02 1) and both re-estimate at t2:
+    # equal yields at equal estimate times still fall to identity — never
+    # to competition.
+    exchange.omit_conditions = frozenset()
+    exchange.flip_competition = True
+    current["now"] = current["now"] + timedelta(seconds=65)
+    exchange.now = current["now"]
+    lp.refresh_candidate_recommendations()
+
+    flipped = lp.candidate_snapshot()
+    assert [row["market_id"] for row in flipped["candidates"]] == [
+        "market-M01", "market-M02", "market-M03",
+    ]
+    assert flipped["recommendations"][0]["market_id"] == "market-M01"
+
+
+def test_candidate_pool_replaces_dropped_estimate_and_unknown_last(tmp_path) -> None:
+    """Issue #157 A4: a re-estimate replaces the stored value immediately —
+    a market whose yield dropped re-ranks by its new value with no trace of
+    the historical high — and an UNKNOWN estimate ranks after every known
+    value instead of entering the order as zero."""
+    now = datetime(2026, 9, 20, 9, tzinfo=UTC)
+    current = {"now": now}
+    exchange = _LPRollingPoolExchange(now)
+    lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
+    )
+    assert lp.refresh_price_history()["state"] == "known"
+
+    first = lp.refresh_candidates(force=True)
+    assert [row["market_id"] for row in first["candidates"]] == [
+        "market-M01", "market-M02", "market-M03",
+    ]
+
+    # M01's pool drops 57.6 → 24.0: the new estimate is exactly 0.5%/h, so
+    # the previously top-ranked market sinks below M03's 0.8.
+    exchange.pool_override = {"condition-M01": Decimal("24.0")}
+    current["now"] = now + timedelta(seconds=65)
+    exchange.now = current["now"]
+    lp.refresh_candidate_recommendations()
+
+    dropped = lp.candidate_snapshot()
+    assert [row["market_id"] for row in dropped["candidates"]] == [
+        "market-M02", "market-M03", "market-M01",
+    ]
+    dropped_m01 = dropped["candidates"][2]
+    assert Decimal(str(dropped_m01["estimated_yield_raw"])) == Decimal("0.5")
+
+    # M02's refreshed metadata reports its reward minimum as a raw string:
+    # the eligibility gate parses it, but the estimator requires Decimal
+    # rules, so the re-estimate comes back UNKNOWN.  The row keeps its
+    # eligibility and ranks after every known value — never as zero.
+    exchange.pool_override = {"condition-M01": Decimal("24.0")}
+    exchange.string_rules_conditions = frozenset({"condition-M02"})
+    current["now"] = current["now"] + timedelta(seconds=65)
+    exchange.now = current["now"]
+    lp.refresh_candidate_recommendations()
+
+    unknown = lp.candidate_snapshot()
+    assert [row["market_id"] for row in unknown["candidates"]] == [
+        "market-M03", "market-M01", "market-M02",
+    ]
+    unknown_m02 = unknown["candidates"][2]
+    assert unknown_m02["estimate_state"] == "unknown"
+    assert unknown_m02["estimated_yield_raw"] is None
+    assert unknown_m02["state"] == "eligible"
+    assert Decimal(str(unknown["candidates"][0]["estimated_yield_raw"])) == Decimal(
+        "0.8"
+    )
+
+
+def test_candidate_pool_validity_boundary_and_autobackfill(tmp_path) -> None:
+    """Issue #157 A5: an estimate stays valid through second 299 and leaves
+    the published table at second 300 — by the clock alone, with no service
+    calls in between — and the rank-eleven row automatically fills the
+    displayed top ten as the expired rows vacate it.
+
+    Queue order follows the optimistic bound (equal books: pool order), so
+    batch one estimates the ten highest-yield markets at t0 and batch two
+    the next ten at t0+50: the displayed top ten is exactly the batch-one
+    set and expires first, while the younger rank-eleven+ rows survive."""
+    now = datetime(2026, 9, 20, 10, tzinfo=UTC)
+    current = {"now": now}
+    pools = {
+        f"M{index:02d}": Decimal(700 - (index - 1)) for index in range(1, 23)
+    }
+    exchange = _LPYieldBooksExchange(now, pools)
+    lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
+    )
+    assert lp.refresh_price_history()["state"] == "known"
+
+    first = lp.refresh_candidates(force=True)
+    assert [row["market_id"] for row in first["candidates"]] == [
+        f"market-M{index:02d}" for index in range(1, 11)
+    ]
+    # Batch two: the next ten never-tried markets estimate at t0+50.
+    current["now"] = now + timedelta(seconds=50)
+    exchange.now = current["now"]
+    second = lp.refresh_candidates(force=False)
+    assert [row["market_id"] for row in second["candidates"]] == [
+        f"market-M{index:02d}" for index in range(1, 11)
+    ]
+    assert second["candidate_valid_count"] == 20
+
+    # Second 299: the displayed batch-one rows are one second from expiry
+    # and still valid.
+    current["now"] = now + timedelta(seconds=299)
+    at_299 = lp.candidate_snapshot()
+    assert [row["market_id"] for row in at_299["candidates"]] == [
+        f"market-M{index:02d}" for index in range(1, 11)
+    ]
+    assert at_299["candidate_valid_count"] == 20
+
+    # Second 300 — pure time advance, zero calls: the batch-one rows expire
+    # and the batch-two rows fill the displayed table from rank one.
+    current["now"] = now + timedelta(seconds=300)
+    at_300 = lp.candidate_snapshot()
+    assert [row["market_id"] for row in at_300["candidates"]] == [
+        f"market-M{index:02d}" for index in range(11, 21)
+    ]
+    assert at_300["candidate_valid_count"] == 10
+    assert at_300["recommendations"][0]["market_id"] == "market-M11"
+    # Reading never refreshed the surviving rows' validity.
+    assert at_300["candidates"][0]["updated_at"] == (
+        (now + timedelta(seconds=50))
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def test_candidate_pool_failed_refresh_keeps_row_until_original_expiry(
+    tmp_path,
+) -> None:
+    """Issue #157 A6: a failed re-estimate at t=200s keeps the stored row
+    until its original updated_at+300s expiry, marked refresh_failed, and a
+    later successful re-estimate re-enters the table with fresh values."""
+    now = datetime(2026, 9, 20, 11, tzinfo=UTC)
+    current = {"now": now}
+    pools = {"M01": Decimal(600), "M02": Decimal(590)}
+    exchange = _LPYieldBooksExchange(now, pools)
+    lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
+    )
+    assert lp.refresh_price_history()["state"] == "known"
+
+    first = lp.refresh_candidates(force=True)
+    assert [row["market_id"] for row in first["candidates"]] == [
+        "market-M01", "market-M02",
+    ]
+    original_updated = first["candidates"][0]["updated_at"]
+    original_expires = first["candidates"][0]["expires_at"]
+
+    # t=200s: every book read fails — the rows keep their values and are
+    # marked refresh_failed with their timestamps untouched.
+    exchange.omit_tokens = frozenset({
+        "token-condition-M01-yes", "token-condition-M01-no",
+        "token-condition-M02-yes", "token-condition-M02-no",
+    })
+    current["now"] = now + timedelta(seconds=200)
+    exchange.now = current["now"]
+    lp.refresh_candidate_recommendations()
+
+    failed = lp.candidate_snapshot()
+    assert [row["market_id"] for row in failed["candidates"]] == [
+        "market-M01", "market-M02",
+    ]
+    assert all(row["refresh_failed"] is True for row in failed["candidates"])
+    assert failed["candidate_failed_recent_count"] == 2
+    assert failed["candidates"][0]["updated_at"] == original_updated
+    assert failed["candidates"][0]["expires_at"] == original_expires
+
+    # Second 299: still held by the original validity — a failed refresh
+    # never extends it.
+    current["now"] = now + timedelta(seconds=299)
+    at_299 = lp.candidate_snapshot()
+    assert [row["market_id"] for row in at_299["candidates"]] == [
+        "market-M01", "market-M02",
+    ]
+
+    # Second 300: both rows age out exactly at their original expiry.
+    current["now"] = now + timedelta(seconds=300)
+    expired = lp.candidate_snapshot()
+    assert expired["candidates"] == []
+    assert expired["candidate_valid_count"] == 0
+    assert expired["recommendations"] == []
+
+    # After the per-market failure backoff the exploration loop re-estimates
+    # both markets and they re-enter the table with fresh values and the
+    # failure flag cleared.
+    exchange.omit_tokens = frozenset()
+    current["now"] = now + timedelta(seconds=350)
+    exchange.now = current["now"]
+    lp.refresh_candidates()
+
+    recovered = lp.candidate_snapshot()
+    assert [row["market_id"] for row in recovered["candidates"]] == [
+        "market-M01", "market-M02",
+    ]
+    assert all(row["refresh_failed"] is False for row in recovered["candidates"])
+    assert recovered["candidate_failed_recent_count"] == 0
+    assert recovered["candidates"][0]["updated_at"] == (
+        (now + timedelta(seconds=350))
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def test_explore_batches_roll_through_queue_without_round_gates(tmp_path) -> None:
+    """Issue #157 A1: with 60 processable markets, repeated refresh_candidates
+    calls five seconds apart keep reading new markets — the 51st+ markets'
+    tokens are read well inside the old 300-second window, every batch is one
+    ≤20-token book read, no token is read twice, and the full catalog is
+    never re-read (the base queues stay cached)."""
+    now = datetime(2026, 9, 20, 12, tzinfo=UTC)
+    current = {"now": now}
+    pools = {f"N{index:02d}": Decimal(600 - index) for index in range(1, 61)}
+
+    class CountingExchange(_LPBatchQueryExchange):
+        def __init__(self, initial_now: datetime) -> None:
+            super().__init__(initial_now, pools)
+            self.catalog_reads = 0
+
+        def lp_reward_catalog(self, *, condition_ids=None, stop_event=None):
+            self.catalog_reads += 1
+            return super().lp_reward_catalog(
+                condition_ids=condition_ids, stop_event=stop_event
+            )
+
+    exchange = CountingExchange(now)
+    lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
+    )
+    assert lp.refresh_price_history()["state"] == "known"
+
+    snapshot = None
+    reads_after_first = None
+    catalog_after_first = None
+    for step in range(6):
+        snapshot = lp.refresh_candidates(force=True)
+        current["now"] = now + timedelta(seconds=5 * (step + 1))
+        exchange.now = current["now"]
+        if step == 0:
+            reads_after_first = len(exchange.book_token_reads)
+            catalog_after_first = exchange.catalog_reads
+
+    assert snapshot is not None and snapshot["state"] == "ready"
+    # Six batches of ten markets: one book read per call, 20 tokens each.
+    assert len(exchange.book_token_reads) == reads_after_first + 5
+    for batch in exchange.book_token_reads:
+        assert len(batch) <= 20
+    all_tokens = [
+        token for batch in exchange.book_token_reads for token in batch
+    ]
+    assert len(all_tokens) == 120
+    assert len(set(all_tokens)) == 120
+    # The old 300-second round gate never stopped the roll: markets 51-60
+    # were read by the sixth call, 25 seconds after the first.
+    late_tokens = {
+        token
+        for batch in exchange.book_token_reads
+        for token in batch
+        if int(token.removeprefix("token-condition-N").split("-")[0]) >= 51
+    }
+    assert len(late_tokens) == 20
+    # The full catalog was never re-read for later batches.
+    assert exchange.catalog_reads == catalog_after_first
+    funnel = snapshot["funnel"]
+    assert funnel["checked"] == 60
+    assert funnel["passed"] == 60
+    assert funnel["batches"] == 6
+    assert funnel["unchecked"] == 0
+    assert snapshot["candidate_valid_count"] == 60
+    assert snapshot["candidate_pending_count"] == 0
+
+
+def test_explore_batch_failure_isolates_and_backs_off(tmp_path) -> None:
+    """Issue #157 A2: a batch whose book read raises does not touch the
+    batches already published — their rows stay readable with their original
+    timestamps — and the failed batch's markets reschedule on the failure
+    backoff without blocking other batches."""
+    now = datetime(2026, 9, 20, 13, tzinfo=UTC)
+    current = {"now": now}
+    pools = {f"N{index:02d}": Decimal(600 - index) for index in range(1, 21)}
+
+    class FailingBatchExchange(_LPBatchQueryExchange):
+        def __init__(self, initial_now: datetime) -> None:
+            super().__init__(initial_now, pools)
+            self.fail_reads = False
+            self.batch_requests: list[tuple[str, ...]] = []
+
+        def lp_order_books(self, token_ids, *, stop_event=None):
+            self.batch_requests.append(tuple(token_ids))
+            if self.fail_reads:
+                raise RuntimeError("book read failed")
+            return super().lp_order_books(token_ids, stop_event=stop_event)
+
+    exchange = FailingBatchExchange(now)
+    lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
+    )
+    assert lp.refresh_price_history()["state"] == "known"
+
+    first = lp.refresh_candidates(force=True)
+    assert [row["market_id"] for row in first["candidates"]] == [
+        f"market-N{index:02d}" for index in range(1, 11)
+    ]
+    first_updated = first["candidates"][0]["updated_at"]
+
+    # Batch two's book read raises: batch one's rows are untouched and the
+    # batch-two markets enter the failure backoff instead of the pool.
+    exchange.fail_reads = True
+    current["now"] = now + timedelta(seconds=5)
+    exchange.now = current["now"]
+    failed = lp.refresh_candidates(force=True)
+
+    assert failed["candidate_valid_count"] == 10
+    assert [row["market_id"] for row in failed["candidates"]] == [
+        f"market-N{index:02d}" for index in range(1, 11)
+    ]
+    assert failed["candidates"][0]["updated_at"] == first_updated
+    assert failed["candidates"][0]["refresh_failed"] is False
+    assert failed["funnel"]["unknown"] == 10
+
+    # Before the backoff elapses the failed markets are skipped, but the
+    # rolling rotation still re-estimates batch one — no blocking.
+    exchange.fail_reads = False
+    current["now"] = now + timedelta(seconds=30)
+    exchange.now = current["now"]
+    lp.refresh_candidates(force=True)
+
+    def _batch_market_indexes(batch: tuple[str, ...]) -> set[int]:
+        return {
+            int(token.removeprefix("token-condition-N").split("-")[0])
+            for token in batch
+        }
+
+    batch_two_requests = [
+        batch
+        for batch in exchange.batch_requests[2:]
+        if any(index >= 11 for index in _batch_market_indexes(batch))
+    ]
+    assert batch_two_requests == []
+    during = lp.candidate_snapshot()
+    assert during["candidate_valid_count"] == 10
+    assert during["candidates"][0]["updated_at"] != first_updated
+
+    # Once the 60-second backoff has elapsed the failed markets are read
+    # again and join the pool.
+    current["now"] = now + timedelta(seconds=70)
+    exchange.now = current["now"]
+    recovered = lp.refresh_candidates(force=True)
+
+    assert recovered["candidate_valid_count"] == 20
+    assert recovered["candidate_pending_count"] == 0
+    # The recovery batch re-read exactly the failed batch's markets.
+    late_requests = [
+        batch
+        for batch in exchange.batch_requests[3:]
+        if any(index >= 11 for index in _batch_market_indexes(batch))
+    ]
+    assert len(late_requests) == 1
+    assert min(_batch_market_indexes(late_requests[0])) >= 11
+    assert recovered["funnel"]["passed"] == 30
+
+
+def test_candidate_pool_late_write_never_overwrites_newer_result(
+    tmp_path,
+) -> None:
+    """Issue #157 A7: an evaluation judged before another writer's newer
+    result never overwrites it — the one-line write protection rejects the
+    late write — and each market keeps exactly one valid pool row."""
+    now = datetime(2026, 9, 20, 14, tzinfo=UTC)
+    current = {"now": now}
+    pools = {"M01": Decimal(600), "M02": Decimal(590), "M03": Decimal(580)}
+    exchange = _LPYieldBooksExchange(now, pools)
+    store = PredictionArbitrageStore(tmp_path)
+    lp = PolymarketLPService(store, exchange, clock=lambda: current["now"])
+    assert lp.refresh_price_history()["state"] == "known"
+
+    first = lp.refresh_candidates(force=True)
+    assert first["candidate_valid_count"] == 3
+
+    # The reservations read is the last read before the exploration batch
+    # publishes: latch it so the batch publishes only after the maintenance
+    # has published a strictly newer result.
+    latch = threading.Event()
+    released = threading.Event()
+    real_reader = store.lp_active_session
+
+    def latched_reader():
+        if latch.is_set() and not released.is_set():
+            released.set()
+            assert latch.wait(timeout=5)
+        return real_reader()
+
+    store.lp_active_session = latched_reader  # type: ignore[method-assign]
+
+    current["now"] = now + timedelta(seconds=65)
+    exchange.now = current["now"]
+    latch.set()
+    explore_result: dict[str, object] = {}
+
+    def run_explore() -> None:
+        explore_result["snapshot"] = lp.refresh_candidates(force=True)
+
+    explore_thread = threading.Thread(target=run_explore)
+    explore_thread.start()
+    assert released.wait(timeout=5)
+
+    # While the exploration batch is parked before its publication, the
+    # maintenance reads a moved book (bid 0.30) and publishes a strictly
+    # newer judgment for the same markets.
+    moved_book = ([("0.30", "100"), ("0.29", "100")], [("0.32", "100")])
+    exchange.books_by_token = {
+        f"token-condition-{suffix}-{side}": moved_book
+        for suffix in ("M01", "M02", "M03")
+        for side in ("yes", "no")
+    }
+    current["now"] = now + timedelta(seconds=70)
+    exchange.now = current["now"]
+    maintained = lp.refresh_candidate_recommendations()
+    assert maintained["candidates"][0]["updated_at"] == (
+        (now + timedelta(seconds=70))
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+    assert Decimal(str(maintained["candidates"][0]["realtime_price"])) == Decimal(
+        "0.30"
+    )
+
+    latch.set()
+    explore_thread.join(timeout=5)
+    assert not explore_thread.is_alive()
+
+    # The late exploration write (judged at +65s) lost to the newer +70s
+    # result: the pool keeps one row per market stamped by the maintenance.
+    settled = lp.candidate_snapshot()
+    assert settled["candidate_valid_count"] == 3
+    assert len({
+        row["condition_id"] for row in settled["candidates"]
+    }) == 3
+    for row in settled["candidates"]:
+        assert row["updated_at"] == (
+            (now + timedelta(seconds=70))
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z")
+        )
+        # The maintenance's moved-book values survive: the exploration
+        # batch's older-judged 0.34 write was rejected.
+        assert Decimal(str(row["realtime_price"])) == Decimal("0.30")
+
+
+def test_maintenance_renewals_do_not_stall_exploration(tmp_path) -> None:
+    """Issue #157 A8: while the maintenance path keeps renewing the
+    displayed rows between exploration calls, the exploration queue keeps
+    advancing — every exploration call still reads new markets, and the
+    maintenance cadence neither consumes the queue nor trips the
+    exploration locks."""
+    now = datetime(2026, 9, 20, 15, tzinfo=UTC)
+    current = {"now": now}
+    pools = {f"N{index:02d}": Decimal(630 - index) for index in range(1, 31)}
+    exchange = _LPBatchQueryExchange(now, pools)
+    lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
+    )
+    assert lp.refresh_price_history()["state"] == "known"
+
+    def new_market_tokens(reads_before: int) -> set[str]:
+        covered = {
+            token
+            for batch in exchange.book_token_reads[reads_before:]
+            for token in batch
+        }
+        indexes = {
+            int(token.removeprefix("token-condition-N").split("-")[0])
+            for token in covered
+        }
+        return {f"market-N{index:02d}" for index in indexes}
+
+    first = lp.refresh_candidates(force=True)
+    assert len(first["candidates"]) == 10
+
+    for step in range(1, 3):
+        # The maintenance renews the displayed rows (one batch book read of
+        # the same twenty tokens) and never touches the exploration queue.
+        current["now"] = current["now"] + timedelta(seconds=65)
+        exchange.now = current["now"]
+        reads_before_maintenance = len(exchange.book_token_reads)
+        maintained = lp.refresh_candidate_recommendations()
+        maintenance_tokens = {
+            token
+            for batch in exchange.book_token_reads[reads_before_maintenance:]
+            for token in batch
+        }
+        assert len(maintenance_tokens) == 20
+        assert maintained["recommendations"]
+
+        # The exploration call right after still reads the next batch of
+        # never-tried markets.
+        current["now"] = current["now"] + timedelta(seconds=2)
+        exchange.now = current["now"]
+        reads_before_explore = len(exchange.book_token_reads)
+        explored = lp.refresh_candidates()
+        newly_read = new_market_tokens(reads_before_explore)
+        expected = {
+            f"market-N{index:02d}"
+            for index in range(10 * step + 1, 10 * step + 11)
+        }
+        assert newly_read == expected
+        assert explored["funnel"]["batches"] == 1 + step
+        assert explored["candidate_valid_count"] == 10 * (1 + step)
+
+
+def test_hanging_competition_read_never_blocks_candidate_batches(
+    tmp_path,
+) -> None:
+    """Issue #157 A9: a hanging or failing lp_market_competitiveness read
+    never blocks the candidate batch path — batches publish yield results
+    with unknown competition while the dedicated competition thread is the
+    only caller of the reader."""
+    now = datetime(2026, 9, 20, 16, tzinfo=UTC)
+    current = {"now": now}
+    pools = {"M01": Decimal(600), "M02": Decimal(590), "M03": Decimal(580)}
+    exchange = _LPYieldBooksExchange(now, pools)
+
+    latch = threading.Event()
+    competition_calls = {"count": 0}
+
+    def hanging_competition(*, stop_event=None, previous=None):
+        competition_calls["count"] += 1
+        assert latch.wait(timeout=5)
+        raise RuntimeError("competition read failed")
+
+    exchange.lp_market_competitiveness = hanging_competition  # type: ignore[method-assign]
+    lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
+    )
+    assert lp.refresh_price_history()["state"] == "known"
+
+    # The batch path publishes although the competition reader would hang.
+    snapshot = lp.refresh_candidates(force=True)
+
+    assert competition_calls["count"] == 0
+    assert snapshot["candidate_valid_count"] == 3
+    assert [row["market_id"] for row in snapshot["candidates"]] == [
+        "market-M01", "market-M02", "market-M03",
+    ]
+    assert snapshot["funnel"]["competition_state"] == "unknown"
+    for row in snapshot["candidates"]:
+        assert row["competition"]["state"] == "unknown"
+        assert row["state"] == "eligible"
+
+    # The dedicated cache refresh is the only competition caller: it blocks
+    # on the hanging read, keeps the previous cache on failure, and never
+    # propagates the error.
+    competition_thread = threading.Thread(
+        target=lp.refresh_competition_cache
+    )
+    competition_thread.start()
+    deadline = time.monotonic() + 1.0
+    while competition_calls["count"] < 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert competition_calls["count"] == 1
+    assert competition_thread.is_alive()
+    latch.set()
+    competition_thread.join(timeout=5)
+    assert not competition_thread.is_alive()
+    assert lp.candidate_snapshot()["funnel"]["competition_state"] == "unknown"
+    # The published rows are untouched by the failed competition round.
+    assert lp.candidate_snapshot()["candidate_valid_count"] == 3
+
+
+def test_candidate_pool_save_throttle_and_restart_restore(tmp_path) -> None:
+    """Issue #157 A11: pool publications persist at most once every five
+    seconds; a new service instance on the same store restores the pool
+    rows with their original timestamps; the rows age out by the clock and
+    reading never extends their validity."""
+    now = datetime(2026, 9, 20, 17, tzinfo=UTC)
+    current = {"now": now}
+    pools = {"M01": Decimal(600), "M02": Decimal(590), "M03": Decimal(580)}
+    exchange = _LPYieldBooksExchange(now, pools)
+    store = PredictionArbitrageStore(tmp_path)
+
+    class CountingStore:
+        def __init__(self, inner: PredictionArbitrageStore) -> None:
+            self._inner = inner
+            self.save_count = 0
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._inner, name)
+
+        def lp_save_screening_snapshot(self, payload):  # type: ignore[no-untyped-def]
+            self.save_count += 1
+            return self._inner.lp_save_screening_snapshot(payload)
+
+    counting_store = CountingStore(store)
+    lp = PolymarketLPService(
+        counting_store, exchange, clock=lambda: current["now"]
+    )
+    assert lp.refresh_price_history()["state"] == "known"
+
+    lp.refresh_candidates(force=True)
+    first_save_count = counting_store.save_count
+    assert first_save_count == 1
+    saved = store.lp_screening_snapshot()
+    assert saved is not None and saved["pool"]
+    assert set(saved["pool"]) == {
+        "condition-M01", "condition-M02", "condition-M03",
+    }
+    assert saved["rotation"]["condition-M01"]["failures"] == 0
+
+    # A publication one second later is throttled: nothing new persists.
+    current["now"] = now + timedelta(seconds=1)
+    exchange.now = current["now"]
+    lp.refresh_candidates()
+    assert counting_store.save_count == first_save_count
+    assert store.lp_screening_snapshot()["pool"]["condition-M01"][
+        "updated_at"
+    ] == _iso_z(now)
+
+    # After the five-second throttle the next publication persists.
+    current["now"] = now + timedelta(seconds=6)
+    exchange.now = current["now"]
+    lp.refresh_candidates()
+    assert counting_store.save_count == first_save_count + 1
+    assert store.lp_screening_snapshot()["pool"]["condition-M01"][
+        "updated_at"
+    ] == _iso_z(now + timedelta(seconds=6))
+
+    # A new instance on the same store restores the pool with the original
+    # timestamps.
+    current["now"] = now + timedelta(seconds=10)
+    restored = PolymarketLPService(
+        store, exchange, clock=lambda: current["now"]
+    )
+    projection = restored.candidate_snapshot()
+    assert projection["candidate_valid_count"] == 3
+    assert [row["market_id"] for row in projection["candidates"]] == [
+        "market-M01", "market-M02", "market-M03",
+    ]
+    assert projection["candidates"][0]["updated_at"] == _iso_z(
+        now + timedelta(seconds=6)
+    )
+    assert projection["candidates"][0]["expires_at"] == _iso_z(
+        now + timedelta(seconds=306)
+    )
+
+    # The restored rows age out by the clock and reads never refresh them.
+    current["now"] = now + timedelta(seconds=306)
+    aged = restored.candidate_snapshot()
+    assert aged["candidates"] == []
+    assert aged["candidate_valid_count"] == 0
+    assert counting_store.save_count == first_save_count + 1
+
+
+def test_candidate_snapshot_has_no_whole_snapshot_expiry(tmp_path) -> None:
+    """Issue #157 A10: reading the snapshot 61 seconds after publication
+    keeps every row valid — no 60-second whole-snapshot downgrade, no
+    candidate_source_stale / candidate_snapshot_stale reasons — and an
+    empty pool reports the continuous status fields honestly."""
+    now = datetime(2026, 9, 20, 18, tzinfo=UTC)
+    current = {"now": now}
+    pools = {"M01": Decimal(600), "M02": Decimal(590), "M03": Decimal(580)}
+    exchange = _LPYieldBooksExchange(now, pools)
+    lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
+    )
+
+    # Zero candidates before anything ran: honest empty with the
+    # continuous status fields.
+    empty = lp.candidate_snapshot()
+    assert empty["candidates"] == []
+    assert empty["recommendations"] == []
+    assert empty["candidate_valid_count"] == 0
+    assert empty["candidate_pending_count"] == 0
+    assert empty["candidate_failed_recent_count"] == 0
+
+    assert lp.refresh_price_history()["state"] == "known"
+    first = lp.refresh_candidates(force=True)
+    assert first["candidate_valid_count"] == 3
+
+    # 61 seconds after publication — well past the retired 60-second
+    # whole-snapshot window — the rows are still current.
+    current["now"] = now + timedelta(seconds=61)
+    at_61 = lp.candidate_snapshot()
+    assert [row["market_id"] for row in at_61["candidates"]] == [
+        "market-M01", "market-M02", "market-M03",
+    ]
+    assert at_61["candidates"][0]["updated_at"] == _iso_z(now)
+    assert all(row["state"] == "eligible" for row in at_61["candidates"])
+    serialized = repr(at_61)
+    assert "candidate_source_stale" not in serialized
+    assert "candidate_snapshot_stale" not in serialized
+    assert at_61["stale"] is False
+    assert at_61["recommendations"][0]["market_id"] == "market-M01"

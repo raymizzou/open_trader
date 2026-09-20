@@ -2360,6 +2360,15 @@ class PredictionExecutionService:
                     "candidate_checked_at": candidate_snapshot.get("checked_at"),
                     "candidate_last_success_at": candidate_snapshot.get("last_success_at"),
                     "candidate_last_attempt_at": candidate_snapshot.get("last_attempt_at"),
+                    "candidate_valid_count": candidate_snapshot.get(
+                        "candidate_valid_count", 0
+                    ),
+                    "candidate_pending_count": candidate_snapshot.get(
+                        "candidate_pending_count", 0
+                    ),
+                    "candidate_failed_recent_count": candidate_snapshot.get(
+                        "candidate_failed_recent_count", 0
+                    ),
                     "missing_metadata_condition_ids": candidate_snapshot.get(
                         "missing_metadata_condition_ids", []
                     ),
@@ -2460,6 +2469,15 @@ class PredictionExecutionService:
                     "candidate_checked_at": candidate_snapshot.get("checked_at"),
                     "candidate_last_success_at": candidate_snapshot.get("last_success_at"),
                     "candidate_last_attempt_at": candidate_snapshot.get("last_attempt_at"),
+                    "candidate_valid_count": candidate_snapshot.get(
+                        "candidate_valid_count", 0
+                    ),
+                    "candidate_pending_count": candidate_snapshot.get(
+                        "candidate_pending_count", 0
+                    ),
+                    "candidate_failed_recent_count": candidate_snapshot.get(
+                        "candidate_failed_recent_count", 0
+                    ),
                     "missing_metadata_condition_ids": candidate_snapshot.get(
                         "missing_metadata_condition_ids", []
                     ),

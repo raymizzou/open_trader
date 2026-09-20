@@ -18,7 +18,7 @@ from .notifications import NullNotifier
 from .daily_premarket import send_notification_with_results
 from .polymarket_monitor import PolymarketMonitor
 from .polymarket_lp import (
-    LP_CANDIDATE_SCAN_MIN_INTERVAL_SECONDS,
+    _LP_CANDIDATE_BATCH_MIN_INTERVAL_SECONDS,
     PolymarketLPService,
 )
 from .polymarket_relation_discovery import (
@@ -1093,11 +1093,12 @@ class PredictionRuntime:
         self._lp_share_thread.start()
 
     def _start_candidate_scan_monitor(self) -> None:
-        """Run full LP candidate scans on their own thread (issue #146 D6).
+        """Explore the candidate queue continuously on its own thread (#157).
 
-        A successful round waits out the 300-second scan window; a failed
-        round retries after 60 seconds. A manual page refresh interrupts the
-        wait and forces a new round.
+        Each wake processes one rolling exploration batch; the wait is at
+        least the two-second batch floor and never leaves the [1, 300]
+        scheduler band. A manual page refresh wakes the loop for the next
+        batch immediately.
         """
 
         if self.lp is None or self._candidate_scan_thread is not None:
@@ -1106,7 +1107,6 @@ class PredictionRuntime:
         self._lp_candidate_refresh_requested.clear()
 
         def run() -> None:
-            force_candidate_refresh = True
             while not self._reward_stop_event.is_set():
                 lp = self.lp
                 if lp is None:
@@ -1118,30 +1118,31 @@ class PredictionRuntime:
                 try:
                     scan_result = refresh_candidates(
                         stop_event=self._reward_stop_event,
-                        force=force_candidate_refresh,
+                        force=True,
                     )
                 except Exception:
                     logger.exception("prediction_lp_candidate_refresh_failed")
-                force_candidate_refresh = False
                 if self._reward_stop_event.is_set():
                     return
-                scan_wait = 60.0
-                if isinstance(scan_result, Mapping) and (
-                    scan_result.get("complete") is True
-                    or scan_result.get("state") == "ready"
-                ):
-                    scan_wait = float(LP_CANDIDATE_SCAN_MIN_INTERVAL_SECONDS)
-                # A finished round re-anchors the maintenance monitor on the
-                # freshly published snapshot.
+                # A fresh publication re-anchors the maintenance monitor on
+                # the newly refreshed pool rows.
                 self._candidate_maintenance_wakeup.set()
+                wait_seconds = float(_LP_CANDIDATE_BATCH_MIN_INTERVAL_SECONDS)
+                if isinstance(scan_result, Mapping):
+                    next_wait = scan_result.get("next_batch_wait_seconds")
+                    if isinstance(next_wait, (int, float)):
+                        wait_seconds = max(
+                            float(next_wait),
+                            float(_LP_CANDIDATE_BATCH_MIN_INTERVAL_SECONDS),
+                        )
+                wait_seconds = min(max(wait_seconds, 1.0), 300.0)
                 refresh_requested = self._lp_candidate_refresh_requested.wait(
-                    scan_wait
+                    wait_seconds
                 )
                 if self._reward_stop_event.is_set():
                     return
                 if refresh_requested:
                     self._lp_candidate_refresh_requested.clear()
-                    force_candidate_refresh = True
 
         self._candidate_scan_thread = threading.Thread(
             target=run,
