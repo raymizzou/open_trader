@@ -2372,15 +2372,16 @@ def test_lp_trial_maintenance_runs_without_page_and_stops(
         }
         # Issue #146: the published books are already 59 seconds old, so the
         # 30-second source lead makes maintenance fire on its own about a
-        # second after the scan publish; only the head's books are re-read.
+        # second after the scan publish.  Issue #138 round 2: the whole
+        # published table is refreshed with one batched book read.
         assert maintenance_started.wait(timeout=5)
         assert len(book_calls) == 2
-        expected_head = {
-            markets[condition_ids[0]]["yes_token"],
-            markets[condition_ids[0]]["no_token"],
+        expected_all = {
+            markets[condition_id][f"{outcome}_token"]
+            for condition_id in condition_ids
+            for outcome in ("yes", "no")
         }
-        # Maintenance refreshes only the merged rank-one market's books.
-        assert set(book_calls[1]) == expected_head
+        assert set(book_calls[1]) == expected_all
         assert risk_tick_seen.wait(timeout=2)
     finally:
         runtime.stop()

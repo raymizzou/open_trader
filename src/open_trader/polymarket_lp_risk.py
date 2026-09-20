@@ -1134,3 +1134,143 @@ def evaluate_lp_entry(
         else [],
         "guidance": guidance,
     }
+
+
+_TARGET_SHARE_FRACTION = Decimal("0.05")
+_TARGET_SHARE_QUANTUM = Decimal("0.000000000001")
+
+
+def estimate_lp_target_share_yield(
+    book: object,
+    *,
+    price: Decimal,
+    reward_min_size: Decimal,
+    reward_max_spread: Decimal,
+    daily_pool_usd: Decimal,
+    now: datetime,
+) -> dict[str, object]:
+    """Estimate the hourly yield of holding a 5% official reward share.
+
+    Issue #138 round 2: the trial candidate ordering needs a comparable
+    capital-yield figure, not the old whole-pool optimistic upper bound.
+    The model asks how many shares one side of this book must carry to own
+    5% of the market's official reward pool, weights every resting level by
+    its quadratic reward distance ``w(p) = (1 - |p - m|/v)^2``, bounds the
+    competition with ``C = min(A, B) + |A - B|/3`` (no maker grouping is
+    published), and solves ``q*w/3 / (C + q*w/3) = 0.05`` for the target
+    quantity ``q = 3C / (19w)``.  Pure arithmetic: no I/O, no orders.
+
+    All unknown inputs keep the numeric fields None — never zero, and never
+    a fallback to the whole-pool upper bound.
+    """
+
+    unknown: dict[str, object] = {
+        "state": "unknown",
+        "reason_codes": [],
+        "yield_pct_per_hour": None,
+        "yield_pct_per_hour_display": None,
+        "target_quantity": None,
+        "target_capital_usd": None,
+        "hourly_reward_usd": None,
+        "midpoint": None,
+        "competition_upper_bound": None,
+        "checked_at": None,
+    }
+
+    def unknown_with(codes: list[str]) -> dict[str, object]:
+        return {**unknown, "reason_codes": codes}
+
+    if not isinstance(now, datetime) or now.tzinfo is None:
+        return unknown_with(["estimate_time_unknown"])
+    checked_at = now.astimezone(UTC)
+    if not isinstance(book, Mapping):
+        return unknown_with(["book_unknown"])
+    if any(
+        not isinstance(value, Decimal) or value <= 0
+        for value in (reward_min_size, reward_max_spread)
+    ):
+        return unknown_with(["market_rules_invalid"])
+    pool = _maybe_decimal(daily_pool_usd)
+    if pool is None or pool < 0:
+        return unknown_with(["reward_pool_unknown"])
+    quote_price = _maybe_decimal(price)
+    if quote_price is None or quote_price <= 0 or quote_price > 1:
+        return unknown_with(["entry_terms_invalid"])
+    try:
+        bids = _levels(book.get("bids"), "bids")
+        asks = _levels(book.get("asks"), "asks")
+    except ValueError:
+        return unknown_with(["book_unknown"])
+
+    try:
+        # Same midpoint convention as the eligibility gate: cumulative-depth
+        # qualifying quotes, the [0.10, 0.90] midpoint band, and a strictly
+        # positive reward distance for our own quote (w > 0).
+        _bid, _ask, midpoint = _qualify_reward_quote(
+            bids,
+            asks,
+            price=quote_price,
+            reward_min_size=reward_min_size,
+            reward_max_spread=reward_max_spread,
+            require_positive_score=True,
+            cumulative_depth=True,
+        )
+    except ValueError as exc:
+        return unknown_with([str(exc)])
+
+    def unit_weight(level_price: Decimal) -> Decimal | None:
+        distance = abs(level_price - midpoint)
+        if distance >= reward_max_spread:
+            return None
+        weight = Decimal("1") - distance / reward_max_spread
+        return weight * weight
+
+    side_weights: dict[str, Decimal] = {"bid": Decimal("0"), "ask": Decimal("0")}
+    for side, levels in (("bid", bids), ("ask", asks)):
+        total = Decimal("0")
+        for level_price, size in levels:
+            weight = unit_weight(level_price)
+            if weight is not None:
+                total += size * weight
+        side_weights[side] = total
+
+    bid_weight = side_weights["bid"]
+    ask_weight = side_weights["ask"]
+    competition = min(bid_weight, ask_weight) + abs(bid_weight - ask_weight) / Decimal(
+        "3"
+    )
+    if competition <= 0:
+        # Structurally unreachable for a qualified direction (our own price
+        # level already gives A > 0); kept as a defensive honest unknown.
+        return unknown_with(["competition_upper_bound_nonpositive"])
+
+    quote_weight = unit_weight(quote_price)
+    if quote_weight is None or quote_weight <= 0:
+        return unknown_with(["reward_score_zero"])
+
+    target_quantity = (
+        Decimal("3") * competition / (Decimal("19") * quote_weight)
+    ).quantize(_TARGET_SHARE_QUANTUM, rounding=ROUND_HALF_UP)
+    target_quantity = max(target_quantity, reward_min_size)
+    target_quantity = (
+        target_quantity / Decimal("0.01")
+    ).to_integral_value(rounding=ROUND_CEILING) * Decimal("0.01")
+    target_capital = target_quantity * quote_price
+    hourly_reward = pool * _TARGET_SHARE_FRACTION / Decimal("24")
+    yield_pct_per_hour = hourly_reward / target_capital * Decimal("100")
+    return {
+        "state": "known",
+        "reason_codes": [],
+        "yield_pct_per_hour": yield_pct_per_hour,
+        "yield_pct_per_hour_display": yield_pct_per_hour.quantize(
+            Decimal("0.000001"), rounding=ROUND_HALF_UP
+        ),
+        "target_quantity": target_quantity,
+        "target_capital_usd": target_capital,
+        "hourly_reward_usd": hourly_reward.quantize(
+            Decimal("0.000001"), rounding=ROUND_HALF_UP
+        ),
+        "midpoint": midpoint,
+        "competition_upper_bound": competition,
+        "checked_at": checked_at,
+    }

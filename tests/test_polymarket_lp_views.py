@@ -358,6 +358,8 @@ def test_trial_candidates_order_backup_queue_by_pool_then_market_id() -> None:
 def test_trial_candidates_report_query_rate_upper_bound_and_copy() -> None:
     # Independent arithmetic: capital = 20 × 0.45 = 9;
     # 5 / (24 × 9) × 100 = 2.3148148… → ROUND_HALF_UP 6dp → 2.314815.
+    # Issue #138 round 2: the optimistic figure stays an internal queue key
+    # and the row copy no longer presents it as an assumed hourly yield.
     direction = _trial_direction("A", pool="5", latest_midpoint="0.45")
 
     result = _trial([direction], competition={})
@@ -365,10 +367,10 @@ def test_trial_candidates_report_query_rate_upper_bound_and_copy() -> None:
     row = result["rows"][0]
     assert row["query_rate_upper_bound"] == Decimal("2.314815")
     reason = " ".join(str(item) for item in row["reason"])
-    assert "假设" in reason
-    assert "上限" in reason
+    assert "假设" not in reason
+    assert "查询顺序" in reason
     assert "仅决定查询顺序" in reason
-    assert "预计收益" not in reason
+    assert "非预计收益" in reason
 
 
 def test_trial_candidates_derive_min_quantity_and_reference_capital() -> None:

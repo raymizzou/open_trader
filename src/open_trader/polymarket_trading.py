@@ -3362,66 +3362,128 @@ class PolymarketTradingClient:
                         seen_cursors.add(next_cursor)
                         cursor = next_cursor
 
+            # Issue #138 round 2: the authenticated payload's per-source
+            # ``rate_per_day`` values overlap across asset-address
+            # representations of the same reward, so pools never come from
+            # summing the two authenticated sources.  The public selected
+            # reward catalog provides the base pool N and the combined pool
+            # T once per condition; the sponsored increment is S = T − N.
+            catalog = self._lp_selected_reward_catalog(
+                tuple(collected), stop_event=stop_event
+            )
+            raw_catalog_markets = catalog.get("markets")
+            catalog_by_condition: dict[str, Mapping[str, object]] = {}
+            if isinstance(raw_catalog_markets, (list, tuple)):
+                for catalog_row in raw_catalog_markets:
+                    if isinstance(catalog_row, Mapping) and catalog_row.get(
+                        "condition_id"
+                    ):
+                        catalog_by_condition[str(catalog_row["condition_id"])] = (
+                            catalog_row
+                        )
+
+            def share_percentage(source_result: object) -> Decimal | None:
+                if not isinstance(source_result, Mapping):
+                    return None
+                percentages = cast(
+                    list[Decimal | None], source_result["percentages"]
+                )
+                if (
+                    percentages
+                    and percentages[0] is not None
+                    and all(item == percentages[0] for item in percentages)
+                ):
+                    return percentages[0]
+                return None
+
             for market in collected.values():
-                hourly_total = Decimal("0")
                 market_known = True
+                hourly_total = Decimal("0")
+                failure_reason: str | None = None
                 source_rows = cast(dict[str, dict[str, object]], market["sources"])
-                for source in ("native", "sponsored"):
-                    source_result = source_rows.get(source)
-                    if source_result is None:
-                        continue
-                    percentages = cast(list[Decimal | None], source_result["percentages"])
-                    configs = cast(
-                        list[dict[str, object]], source_result["reward_configs"]
-                    )
-                    percentage = (
-                        percentages[0]
-                        if percentages
-                        and percentages[0] is not None
-                        and all(item == percentages[0] for item in percentages)
+                catalog_row = catalog_by_condition.get(
+                    str(market["condition_id"])
+                )
+                if not isinstance(catalog_row, Mapping) or catalog_row.get(
+                    "state"
+                ) != "known":
+                    market_known = False
+                    failure_reason = "reward_pool_unknown"
+                    reason_codes = (
+                        catalog_row.get("reason_codes")
+                        if isinstance(catalog_row, Mapping)
                         else None
                     )
-                    daily_pool = Decimal("0")
-                    source_known = percentage is not None
-                    for config in configs:
-                        asset_address = str(config["asset_address"]).casefold()
-                        if asset_address not in LP_REWARD_ASSET_USD_ADDRESSES:
-                            source_known = False
+                    if (
+                        isinstance(reason_codes, (list, tuple))
+                        and reason_codes
+                        and reason_codes[0]
+                    ):
+                        failure_reason = str(reason_codes[0])
+                else:
+                    pools = (
+                        (
+                            "native",
+                            cast(Decimal, catalog_row["native_daily_pool_usd"]),
+                            cast(Decimal, catalog_row["native_daily_pool_usd"]),
+                        ),
+                        (
+                            "sponsored",
+                            cast(Decimal, catalog_row["sponsored_daily_pool_usd"]),
+                            cast(Decimal, catalog_row["daily_pool_usd"]),
+                        ),
+                    )
+                    for source, increment_pool, reported_pool in pools:
+                        source_result = source_rows.get(source)
+                        percentage = share_percentage(source_result)
+                        if percentage is None and increment_pool > 0:
+                            # A positive reward component must have a valid
+                            # share; a zero component never forces one.
+                            market_known = False
+                            failure_reason = failure_reason or "reward_share_missing"
+                            if source_result is not None:
+                                source_result.update(
+                                    {
+                                        "state": "unknown",
+                                        "earning_percentage": percentage,
+                                        "daily_pool_usd": None,
+                                        "hourly_reward_usd": None,
+                                        "currency": None,
+                                        "checked_at": checked_at,
+                                    }
+                                )
+                                market[source] = source_result
                             continue
-                        daily_pool += cast(Decimal, config["rate_per_day"])
-                    rate = (
-                        daily_pool * percentage / Decimal("100") / Decimal("24")
-                        if source_known and percentage is not None
-                        else None
-                    )
-                    if not source_known or rate is None:
-                        market_known = False
-                        source_result.update(
-                            {
-                                "state": "unknown",
-                                "earning_percentage": percentage,
-                                "daily_pool_usd": None,
-                                "hourly_reward_usd": None,
-                                "currency": None,
-                                "checked_at": checked_at,
-                            }
+                        component = (
+                            increment_pool
+                            * percentage
+                            / Decimal("100")
+                            / Decimal("24")
+                            if percentage is not None
+                            else Decimal("0")
                         )
-                    else:
-                        source_result.update(
-                            {
-                                "state": "known",
-                                "earning_percentage": percentage,
-                                "daily_pool_usd": daily_pool,
-                                "hourly_reward_usd": rate,
-                                "currency": "USD",
-                                "checked_at": checked_at,
-                            }
-                        )
-                        hourly_total += rate
-                    market[source] = source_result
-                market["state"] = "known" if market_known else "unknown"
-                market["hourly_reward_usd"] = hourly_total if market_known else None
-                market["currency"] = "USD" if market_known else None
+                        if source_result is not None:
+                            source_result.update(
+                                {
+                                    "state": "known",
+                                    "earning_percentage": percentage,
+                                    "daily_pool_usd": reported_pool,
+                                    "hourly_reward_usd": component,
+                                    "currency": "USD",
+                                    "checked_at": checked_at,
+                                }
+                            )
+                            market[source] = source_result
+                        hourly_total += component
+                if market_known:
+                    market["state"] = "known"
+                    market["hourly_reward_usd"] = hourly_total
+                    market["currency"] = "USD"
+                else:
+                    market["state"] = "unknown"
+                    market["hourly_reward_usd"] = None
+                    market["currency"] = None
+                    market["reason"] = failure_reason or "reward_rate_unknown"
                 market["checked_at"] = checked_at
                 market["sources"] = tuple(
                     source

@@ -818,14 +818,16 @@ def lp_trial_candidates(
 
     Pipeline: cheap base facts (including event windows), one direction
     representative per market, the hard over-available exclusion, a normal
-    queue (known reference price, ranked by the assumed hourly upper bound
-    daily pool ÷ (24 × reference capital)) and a backup queue (unknown
-    reference price, by daily pool), then the query batch: the first nine
-    normal rows plus backup fill up to ten.  Only the batch head is verified
-    against the live book by the service.  Explicit zero competition means
-    nobody competes and is excluded as a danger signal; unread or stale
-    competition stays unknown, never fills in as 0, and only breaks ties
-    after the assumed upper bound.
+    queue (known reference price, ranked by the internal optimistic query
+    order daily pool ÷ (24 × reference capital)) and a backup queue
+    (unknown reference price, by daily pool), then the query batch: the
+    first nine normal rows plus backup fill up to ten.  The optimistic
+    order only decides the check sequence — published ranking is the
+    service's 5% target-share yield estimate (issue #138 round 2).  Only
+    the batch head is verified against the live book by the service.
+    Explicit zero competition means nobody competes and is excluded as a
+    danger signal; unread or stale competition stays unknown, never fills
+    in as 0, and only breaks ties after the query order.
     """
 
     result: dict[str, object] = {
@@ -1076,16 +1078,14 @@ def lp_trial_candidates(
         candidate["query_rate_upper_bound"] = upper_bound
         candidate["reason"] = [
             (
-                f"竞争 {competition_value}（粗排参考）"
+                f"竞争 {competition_value}（并列参考）"
                 if competition_row.get("state") == "known"
-                else "竞争未知（不填 0；指标并列时排已知之后）"
+                else "竞争未知（不填 0；并列时排已知之后）"
             ),
             (
-                "假设每小时收益上限 "
-                f"{upper_bound}%/小时（参考价格不变且取得全部奖池时的乐观上限，"
-                "仅决定查询顺序）"
+                "日奖池÷参考占资的乐观上限仅决定查询顺序（非预计收益）"
                 if upper_bound is not None
-                else "假设每小时收益上限 未知（参考价缺失或过期；仅决定查询顺序）"
+                else "查询顺序未知（参考价缺失或过期；仅决定检查顺序）"
             ),
             "无已知订单或持仓",
         ]

@@ -1645,6 +1645,53 @@ def test_lp_reward_rates_use_current_scoped_percentages() -> None:
 
     transport = RewardTransport()
 
+    class SelectedPools:
+        """Public per-condition selected-catalog fake for the dedup rates.
+
+        Pools follow the new #138 semantics: the sponsored read returns the
+        combined pool T, the native read returns the base pool N.  The target
+        market uses N=$120 / T=$168, so with equal 1% shares the deduped
+        hourly figure is (120×1% + 48×1%)/24 = $0.07/h where S = T − N = $48.
+        """
+
+        def __init__(self) -> None:
+            self.pools = {
+                condition_id: ("120", "168"),
+                "condition-order-only": ("24", "24"),
+                "condition-other": ("24", "24"),
+                "condition-position-only": ("24", "24"),
+            }
+            self.asset_by_condition: dict[str, str] = {}
+
+        def list_market_rewards(self, *, condition_id: str, sponsored: bool | None = None):
+            assert sponsored is not None
+            native_total, combined_total = self.pools[condition_id]
+            return (
+                {
+                    "condition_id": condition_id,
+                    "rewards_config": [
+                        {
+                            "id": (
+                                f"pool-{condition_id}-"
+                                + ("combined" if sponsored else "native")
+                            ),
+                            "asset_address": self.asset_by_condition.get(
+                                condition_id, native_asset
+                            ),
+                            "rate_per_day": (
+                                combined_total if sponsored else native_total
+                            ),
+                            **_LP_RATES_WINDOW,
+                        }
+                    ],
+                },
+            )
+
+        def close(self) -> None:
+            return None
+
+    selected = SelectedPools()
+
     class RewardClient(FakeClient):
         def __init__(self) -> None:
             super().__init__()
@@ -1652,7 +1699,11 @@ def test_lp_reward_rates_use_current_scoped_percentages() -> None:
                 wallet_type="EOA", secure_clob=transport
             )
 
-    adapter = PolymarketTradingClient(TradingConfig(SIGNER, WALLET), RewardClient())
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        RewardClient(),
+        public_client_factory=lambda: selected,
+    )
 
     rates = adapter.lp_reward_rates()
 
@@ -1709,10 +1760,220 @@ def test_lp_reward_rates_use_current_scoped_percentages() -> None:
 
     for row in target_rows:
         row["earning_percentage"] = "1"
-    native_config["asset_address"] = "0xdeadbeef"
+    # The pools now come from the public selected catalog, so an unknown
+    # reward asset must be injected there to keep the market UNKNOWN.
+    selected.asset_by_condition[condition_id] = "0xdeadbeef"
     unknown_currency = adapter.lp_reward_rates()["markets"][condition_id]
     assert unknown_currency["state"] == "unknown"
     assert unknown_currency["hourly_reward_usd"] is None
+
+
+_LP_RATES_USDC_ASSET = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+_LP_RATES_WINDOW = {"start_date": "2024-01-01", "end_date": "2500-12-31"}
+
+
+def _lp_reward_rates_dedupe_fixture(
+    shares: dict[str, tuple[object, object]],
+    pools: dict[str, tuple[str, str, bool]],
+) -> PolymarketTradingClient:
+    """Dedup acceptance fixture: authenticated share rows plus a public
+    per-condition selected reward catalog reader.
+
+    ``shares`` maps condition id to (native share, sponsored share); ``None``
+    omits the authenticated ``earning_percentage`` field entirely.
+    ``pools`` maps condition id to (native total N, combined total T, fail).
+    Reward clock windows are deliberately far in the future so the real
+    system clock can never invalidate the fixtures.
+    """
+
+    def auth_row(condition_id: str, share: object) -> dict[str, object]:
+        row: dict[str, object] = {
+            "condition_id": condition_id,
+            "rewards_config": [
+                {
+                    "id": f"auth-{condition_id}",
+                    "asset_address": _LP_RATES_USDC_ASSET,
+                    "rate_per_day": "999",
+                    **_LP_RATES_WINDOW,
+                }
+            ],
+        }
+        if share is not None:
+            row["earning_percentage"] = share
+        return row
+
+    class Transport:
+        def get_json(self, path: str, *, params: dict[str, object]) -> object:
+            assert path == "/rewards/user/markets"
+            sponsored = bool(params["sponsored"])
+            orders_scope = (
+                params.get("only_open_orders") is True
+                and params.get("only_open_positions") is False
+            )
+            data = (
+                [
+                    auth_row(condition_id, shares[condition_id][1 if sponsored else 0])
+                    for condition_id in shares
+                ]
+                if orders_scope
+                else []
+            )
+            return {"data": data, "next_cursor": "LTE="}
+
+    class PublicRewards:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, bool]] = []
+
+        def list_market_rewards(self, *, condition_id: str, sponsored: bool | None = None):
+            assert sponsored is not None
+            self.calls.append((condition_id, sponsored))
+            native_total, combined_total, failed = pools[condition_id]
+            if failed:
+                raise RuntimeError("selected reward pool unavailable")
+            return (
+                {
+                    "condition_id": condition_id,
+                    "rewards_max_spread": "0.03",
+                    "rewards_min_size": "20",
+                    "rewards_config": [
+                        {
+                            "id": (
+                                f"pub-{condition_id}-"
+                                + ("combined" if sponsored else "native")
+                            ),
+                            "asset_address": _LP_RATES_USDC_ASSET,
+                            "rate_per_day": combined_total if sponsored else native_total,
+                            **_LP_RATES_WINDOW,
+                        }
+                    ],
+                },
+            )
+
+        def close(self) -> None:
+            return None
+
+    public = PublicRewards()
+
+    class RewardClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self._ctx = SimpleNamespace(wallet_type="EOA", secure_clob=Transport())
+
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        RewardClient(),
+        public_client_factory=lambda: public,
+    )
+    adapter._dedupe_public_calls = public.calls  # type: ignore[attr-defined]
+    return adapter
+
+
+def test_lp_reward_rates_deduplicate_native_and_sponsored_pools() -> None:
+    """A1: N=120, T=120, both shares 10% → $0.50/h, never $1/h.
+
+    The authenticated payload's per-source ``rate_per_day`` values overlap
+    across asset-address representations, so the hourly figure must come
+    from the public selected catalog (N and T) instead of summing the two
+    authenticated sources.
+    """
+
+    condition_id = "condition-dedupe"
+    adapter = _lp_reward_rates_dedupe_fixture(
+        {condition_id: ("10", "10")},
+        {condition_id: ("120", "120", False)},
+    )
+
+    result = adapter.lp_reward_rates()
+
+    assert result["state"] == "known"
+    assert result["complete"] is True
+    market = result["markets"][condition_id]
+    assert market["state"] == "known"
+    assert market["hourly_reward_usd"] == Decimal("0.50")
+    assert market["currency"] == "USD"
+    # The public selected reader supplied both pools once per condition.
+    assert sorted(adapter._dedupe_public_calls) == [  # type: ignore[attr-defined]
+        (condition_id, False),
+        (condition_id, True),
+    ]
+    native = market["native"]
+    assert native["state"] == "known"
+    assert native["earning_percentage"] == Decimal("10")
+    assert native["daily_pool_usd"] == Decimal("120")
+    assert native["hourly_reward_usd"] == Decimal("0.50")
+    sponsored = market["sponsored"]
+    assert sponsored["state"] == "known"
+    assert sponsored["earning_percentage"] == Decimal("10")
+    # Sponsored carries the combined pool T (= N here); its own increment S
+    # is zero, so the sponsored component stays zero instead of doubling.
+    assert sponsored["daily_pool_usd"] == Decimal("120")
+    assert sponsored["hourly_reward_usd"] == Decimal("0")
+
+
+def test_lp_reward_rates_keep_true_sponsored_increment() -> None:
+    """A2: N=$120, T=$168, native 1%, sponsored 2% → $0.09/h.
+
+    Independent arithmetic: S = 168 − 120 = 48;
+    (120×1% + 48×2%)/24 = (1.20 + 0.96)/24 = 0.09.
+    """
+
+    condition_id = "condition-increment"
+    adapter = _lp_reward_rates_dedupe_fixture(
+        {condition_id: ("1", "2")},
+        {condition_id: ("120", "168", False)},
+    )
+
+    market = adapter.lp_reward_rates()["markets"][condition_id]
+
+    assert market["state"] == "known"
+    assert market["hourly_reward_usd"] == Decimal("0.09")
+    assert market["native"]["daily_pool_usd"] == Decimal("120")
+    assert market["native"]["hourly_reward_usd"] == Decimal("0.05")
+    # Sponsored reports the combined pool T; its increment component uses
+    # S = T − N so the native share is never paid twice.
+    assert market["sponsored"]["daily_pool_usd"] == Decimal("168")
+    assert market["sponsored"]["hourly_reward_usd"] == Decimal("0.04")
+
+
+def test_lp_reward_rates_zero_component_needs_no_share_and_isolates_failures() -> None:
+    """A3: zero component without a share stays known; a positive component
+    without a share, and a per-condition pool read failure, degrade only
+    their own market."""
+
+    zero_subsidy = "condition-zero-subsidy"
+    missing_share = "condition-subsidy-missing-share"
+    pool_failure = "condition-pool-failure"
+    healthy = "condition-healthy"
+    adapter = _lp_reward_rates_dedupe_fixture(
+        {
+            zero_subsidy: ("1", None),
+            missing_share: ("1", None),
+            pool_failure: ("1", "1"),
+            healthy: ("1", "1"),
+        },
+        {
+            zero_subsidy: ("120", "120", False),
+            missing_share: ("120", "168", False),
+            pool_failure: ("120", "120", True),
+            healthy: ("120", "120", False),
+        },
+    )
+
+    markets = adapter.lp_reward_rates()["markets"]
+
+    # S = 0: the missing sponsored share must not turn the market UNKNOWN.
+    assert markets[zero_subsidy]["state"] == "known"
+    assert markets[zero_subsidy]["hourly_reward_usd"] == Decimal("0.05")
+    # S = 48 > 0 with no sponsored share: honest UNKNOWN, never zero.
+    assert markets[missing_share]["state"] == "unknown"
+    assert markets[missing_share]["hourly_reward_usd"] is None
+    assert markets[missing_share]["reason"] == "reward_share_missing"
+    # The failing condition's pool read degrades only its own market.
+    assert markets[pool_failure]["state"] == "unknown"
+    assert markets[pool_failure]["hourly_reward_usd"] is None
+    assert markets[pool_failure]["reason"] == "reward_read_failed"
+    assert markets[healthy]["state"] == "known"
+    assert markets[healthy]["hourly_reward_usd"] == Decimal("0.05")
 
 
 def test_lp_rewards_preserve_raw_accrual_when_usd_value_is_unknown() -> None:

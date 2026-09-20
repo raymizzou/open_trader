@@ -1410,6 +1410,34 @@ def _lp_reward_dashboard_service(
             del token_ids
             return []
 
+        def list_market_rewards(
+            self, *, condition_id: str, sponsored: bool | None = None
+        ) -> tuple[dict[str, object], ...]:
+            # Mirror the authenticated row's pool once per condition: the
+            # combined (sponsored=true) read equals the base (native) read,
+            # so the deduped hourly figure keeps the single-pool value.
+            configs = []
+            for row in state.get("reward_markets", ()):  # type: ignore[union-attr]
+                if row.get("condition_id") != condition_id:
+                    continue
+                for config in row.get("rewards_config", ()):
+                    configs.append(
+                        {
+                            "id": (
+                                "pool-"
+                                + ("combined-" if sponsored else "native-")
+                                + str(config.get("id"))
+                            ),
+                            "asset_address": config.get("asset_address"),
+                            "start_date": config.get("start_date"),
+                            "end_date": config.get("end_date"),
+                            "rate_per_day": config.get("rate_per_day"),
+                        }
+                    )
+            if not configs:
+                return ()
+            return ({"condition_id": condition_id, "rewards_config": configs},)
+
         def close(self) -> None:
             pass
 
@@ -1477,6 +1505,55 @@ def test_lp_dashboard_explicit_zero_reward_keeps_zero_not_unknown(
     assert observation["current_hourly_reward_usd"] == "0"
     assert observation["current_yield_pct_per_hour"] == "0"
     assert observation["state"] == "known"
+
+
+def test_lp_dashboard_pool_read_failure_degrades_to_unknown_by_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Seam 5 (#138 round 2): the deduped rates read the official pools via
+    the public selected catalog; a failed pool read degrades only that
+    market's observation to UNKNOWN with the reason carried through — the
+    authenticated payload's overlapping rate can never stand in for it."""
+
+    monkeypatch.setattr(
+        polymarket_trading_module, "signature_type_for", lambda _wallet_type: 0
+    )
+    state = _lp_reward_dashboard_state(earning_percentage="100")
+    service = _lp_reward_dashboard_service(tmp_path, state)
+    # Break only the public pool reader; the authenticated payload stays
+    # healthy, so without dedup the old sum would still answer $0.05/h.
+    original_factory = service._trading._public_client_factory
+
+    real_public = original_factory()
+
+    class FailingPools:
+        # Only the selected reward pool reader fails; every other public
+        # read (metadata, books, ...) still delegates to the real fake SDK.
+        def list_market_rewards(
+            self, *, condition_id: str, sponsored: bool | None = None
+        ):
+            raise RuntimeError("selected reward pool unavailable")
+
+        def __getattr__(self, name: str):
+            return getattr(real_public, name)
+
+    def failing_factory():
+        return FailingPools()
+
+    service._trading._public_client_factory = failing_factory
+
+    refreshed = service.refresh_lp_observations()
+    observation = refreshed["observations"]["condition-1"]
+    assert observation["state"] == "unknown"
+    assert observation["reason"] == "reward_read_failed"
+    assert observation["current_hourly_reward_usd"] is None
+    assert observation["current_yield_pct_per_hour"] is None
+
+    service._trading._public_client_factory = original_factory
+    recovered = service.refresh_lp_observations()
+    recovered_observation = recovered["observations"]["condition-1"]
+    assert recovered_observation["state"] == "known"
+    assert Decimal(str(recovered_observation["current_hourly_reward_usd"])) == Decimal("0.05")
 
 
 def test_lp_dashboard_missing_reward_market_stays_unknown_not_zero(
@@ -11378,9 +11455,14 @@ def test_lp_refresh_reads_risk_books_only_for_selected_markets(tmp_path: Path) -
         ) -> dict[str, dict[str, object]]:
             now[0] = max(now[0], initial_now) + timedelta(seconds=1)
             self.book_requests.append(tuple(token_ids))
-            # Issue 143: books are read per ≤10-market batch; any other
-            # request set (extra tokens or out-of-batch tokens) must fail.
-            expected = tuple(f"token-{market_id}" for market_id in markets[:10])
+            # Issue 143 + #138 round 2: books are read per ≤10-market
+            # batch; any other request set (extra tokens or out-of-batch
+            # tokens) must fail.
+            batch_index = len(self.book_requests) - 1
+            expected = tuple(
+                f"token-{market_id}"
+                for market_id in markets[batch_index * 10:(batch_index + 1) * 10]
+            )
             if tuple(token_ids) != expected:
                 raise AssertionError("books requested outside trial candidates")
             return {
@@ -11441,15 +11523,15 @@ def test_lp_refresh_reads_risk_books_only_for_selected_markets(tmp_path: Path) -
     )
     assert service.refresh_price_history()["state"] == "known"
     snapshot = service.refresh_candidates(force=True)
-    # Issue 141: books are read only for the batch head (1 token), not for
-    # all ten displayed trial candidates.
-    # Issue 143: books are read per ≤10-market batch in one call; batch one
-    # covers M01..M10 and its ten passers fill the table (filled stop).
+    # Issue 143 + #138 round 2: books are read per ≤10-market batch in one
+    # call, and the scan keeps checking until the 50-market round budget is
+    # spent (five batches) before publishing the best ten yields.
     assert [row["market_id"] for row in snapshot["candidates"]] == list(
         markets[:10]
     )
     assert exchange.book_requests == [
-        tuple(f"token-{market_id}" for market_id in markets[:10])
+        tuple(f"token-{market_id}" for market_id in markets[start:start + 10])
+        for start in range(0, 50, 10)
     ]
     candidate_rows = snapshot["candidates"]
     assert len(candidate_rows) == 10
@@ -11460,16 +11542,16 @@ def test_lp_refresh_reads_risk_books_only_for_selected_markets(tmp_path: Path) -
     assert snapshot["funnel"]["base"] == 51
     assert snapshot["funnel"]["sort"] == 51
     assert snapshot["funnel"]["trial"] == 10
-    assert snapshot["funnel"]["checked"] == 10
-    assert snapshot["funnel"]["passed"] == 10
+    assert snapshot["funnel"]["checked"] == 50
+    assert snapshot["funnel"]["passed"] == 50
     assert snapshot["funnel"]["rejected"] == 0
     assert snapshot["funnel"]["unknown"] == 0
-    assert snapshot["funnel"]["unchecked"] == 41
-    assert snapshot["funnel"]["batches"] == 1
+    assert snapshot["funnel"]["unchecked"] == 1
+    assert snapshot["funnel"]["batches"] == 5
     # The seeded summaries carry no latest_midpoint, so every market queues
     # as backup (no reference price) — each batch still reads one backup.
-    assert snapshot["funnel"]["backup_read"] == 10
-    assert snapshot["funnel"]["stop_reason"] == "filled"
+    assert snapshot["funnel"]["backup_read"] == 50
+    assert snapshot["funnel"]["stop_reason"] == "checked_limit"
     assert snapshot["funnel"]["competition_known"] == 0
     assert snapshot["funnel"]["competition_unknown"] == 51
     assert "risk" not in snapshot["funnel"]

@@ -3727,38 +3727,54 @@ function lpTrialLossCell(row) {
 function lpTrialStatusCell(row, isCurrent, degraded) {
   const stamp = predictionHasValue(row?.realtime_checked_at)
     ? predictionHktTimestamp(row.realtime_checked_at) : "UNKNOWN";
+  const notUpdated = row?.estimate_updated === false
+    ? "<span class=\"pm-pill pm-lp-unknown\">本轮未更新</span>" : "";
   if (degraded) {
     return "<td data-label=\"检查时间与状态\"><div>" + escapeHtml(stamp) + "</div>"
-      + "<span class=\"pm-pill pm-lp-unknown\">仅供阅读</span>"
+      + "<span class=\"pm-pill pm-lp-unknown\">仅供阅读</span>" + notUpdated
       + "<span class=\"sub\">不再当前有效</span></td>";
   }
   if (isCurrent) {
     return "<td data-label=\"检查时间与状态\"><div>" + escapeHtml(stamp) + "</div>"
-      + "<span class=\"pm-pill pm-tone-ok\">当前推荐</span>"
-      + "<span class=\"sub\">60 秒持续维护</span></td>";
+      + "<span class=\"pm-pill pm-tone-ok\">当前推荐</span>" + notUpdated
+      + "<span class=\"sub\">60 秒全行维护重排</span></td>";
   }
   if (String(row?.state || "") !== "eligible") {
     return "<td data-label=\"检查时间与状态\"><div>" + escapeHtml(stamp) + "</div>"
-      + "<span class=\"pm-pill pm-lp-unknown\">维护失败 · 仅供阅读</span>"
+      + "<span class=\"pm-pill pm-lp-unknown\">维护失败 · 仅供阅读</span>" + notUpdated
       + "<span class=\"sub\">不再当前有效</span></td>";
   }
   return "<td data-label=\"检查时间与状态\"><div>" + escapeHtml(stamp) + "</div>"
-    + "<span class=\"pm-pill\">本轮通过</span>"
+    + "<span class=\"pm-pill\">本轮通过</span>" + notUpdated
     + "<span class=\"sub\">检查时快照，非当前可执行价</span></td>";
 }
 
 function lpTrialQueryRateCell(row) {
-  const realtimeUpper = row?.realtime_query_rate_upper_bound;
-  const upper = predictionHasValue(realtimeUpper) ? realtimeUpper : row?.query_rate_upper_bound;
-  const basis = predictionHasValue(realtimeUpper) ? "实际占资" : "参考占资";
-  const disclaimer = "假设每小时收益上限 = 日奖池÷(24×占资)，是检查时价格不变且取得全部奖池时的乐观上限，仅决定查询顺序，不是预计收益。";
-  const cell = "<td data-label=\"假设上限/小时（按实际占资重算）\" class=\"num\">";
-  if (!predictionHasValue(upper)) {
-    return cell + "<span class=\"pm-lp-unknown\">UNKNOWN</span><span class=\"sub\" title=\""
-      + escapeHtml(disclaimer) + "\">按" + basis + "重算</span></td>";
+  // Issue #138 round 2: the candidate table shows the estimated hourly
+  // yield of holding a 5% official reward share, with the hypothetical
+  // target plan and the minimum trial plan on separate sub-lines.  A
+  // missing estimate stays 待测 — never zero, never a whole-pool fallback.
+  const cell = "<td data-label=\"5% 奖励份额 · 预计收益率/小时\" class=\"num\">";
+  const hasEstimate = String(row?.estimate_state || "") === "known"
+    && predictionHasValue(row?.estimated_yield_pct_per_hour);
+  const targetCapital = predictionHasValue(row?.estimated_target_capital_usd)
+    ? lpDashboardMoney(row.estimated_target_capital_usd) : "UNKNOWN";
+  const targetQuantity = predictionHasValue(row?.estimated_target_quantity)
+    ? predictionValue(row.estimated_target_quantity, "UNKNOWN") : "UNKNOWN";
+  const selected = row?.selected_direction && typeof row.selected_direction === "object"
+    ? row.selected_direction : null;
+  const minTrial = predictionHasValue(selected?.required_capital)
+    ? lpDashboardMoney(selected.required_capital)
+      + "（" + predictionValue(selected?.quantity, "UNKNOWN") + " 份）"
+    : "UNKNOWN";
+  if (!hasEstimate) {
+    return cell + "<span class=\"pm-lp-unknown\">待测</span>"
+      + "<span class=\"sub\">估值缺失，不回退奖池上限</span></td>";
   }
-  return cell + "<span title=\"" + escapeHtml(disclaimer) + "\">≈" + escapeHtml(String(upper))
-    + "%/小时</span><span class=\"sub\">按" + basis + "重算</span></td>";
+  return cell + "<span>≈" + escapeHtml(String(row.estimated_yield_pct_per_hour)) + "%/小时</span>"
+    + "<span class=\"sub\">目标占资 " + escapeHtml(targetCapital)
+    + "（" + escapeHtml(targetQuantity) + " 份）</span>"
+    + "<span class=\"sub\">最小试挂 " + escapeHtml(minTrial) + "</span></td>";
 }
 
 function lpTrialEvidenceRow(row) {
@@ -3967,7 +3983,6 @@ function predictionLpCard(payload) {
   const budgetLineMarkup = lpBudgetLineMarkup(budget, budgetStampAt);
   const gapReason = predictionHasValue(funnel.gap_reason) ? String(funnel.gap_reason) : "";
   const scanStopLabels = {
-    filled: "已凑满 10 个通过",
     checked_limit: "已达单轮检查上限 50 个市场",
     queue_exhausted: "队列耗尽",
     account_unavailable: "账户事实不可用",
@@ -4007,16 +4022,21 @@ function predictionLpCard(payload) {
     const ms = Date.now() - Date.parse(String(stamp));
     return Number.isFinite(ms) ? ms / 1000 : null;
   };
+  // Issue #138 round 2: qualification flips within the 60-second
+  // maintenance are shown degraded instead of hidden; only rows without
+  // any direction facts have nothing to render.
   const visibleCandidates = candidates.filter((row) => {
     const selected = row?.selected_direction;
-    const state = String(row?.state || "eligible").toLowerCase();
-    return selected && typeof selected === "object" && state === "eligible";
+    const directions = row?.directions;
+    return (selected && typeof selected === "object")
+      || (directions && typeof directions === "object");
   });
   const candidateRowsHtml = visibleCandidates.length
     ? visibleCandidates.map((row) => lpTrialCandidateRow(
         row,
         currentConditionId,
-        (candidateAgeSeconds(row?.realtime_checked_at || dashboard.candidate_checked_at) ?? 0) > 300,
+        (candidateAgeSeconds(row?.realtime_checked_at || dashboard.candidate_checked_at) ?? 0) > 300
+          || row?.estimate_updated === false,
       )).join("")
     : "<tr><td colspan=\"8\" class=\"pm-observation-empty\">"
       + (dashboard.scanning === true
@@ -4033,10 +4053,10 @@ function predictionLpCard(payload) {
     + scanProgressMarkup
     + "<div class=\"pm-table-wrap\"><table class=\"pm-table pm-lp-candidate-table\">"
     + "<thead><tr><th scope=\"col\">市场与方向</th><th scope=\"col\">官方竞争</th><th scope=\"col\">日奖池</th>"
-    + "<th scope=\"col\">假设上限/小时（按实际占资重算）</th><th scope=\"col\">拟挂方案（价 × 份 = 实际占资）</th>"
+    + "<th scope=\"col\">5% 奖励份额 · 预计收益率/小时</th><th scope=\"col\">拟挂方案（价 × 份 = 实际占资）</th>"
     + "<th scope=\"col\">压力退出损失（金额 / 比例）</th><th scope=\"col\">检查时间与状态</th><th scope=\"col\">操作</th></tr></thead>"
     + "<tbody>" + candidateRowsHtml + "</tbody></table></div>"
-    + "<p class=\"sub\">候选每 5 分钟扫描一轮，每批最多 10 个市场（9 正常 + 1 备用交错），单轮最多检查 50 个市场/100 个 token，盘口读取失败不重试；表内只展示本轮实时检查通过的市场：第 1 名为当前推荐（60 秒持续维护），其余行是检查时快照、非当前可执行价，超过 300 秒的快照仅供阅读、不再当前有效；未检查的市场不代表劣于已展示者；已有委托或持仓的市场不重复推荐；拟挂占资超过可用资金（已扣委托占用）的候选不进入队列；参考价有 1 小时新鲜门，过期进入备用队列；官方竞争与假设每小时收益上限仅为排序参考，不是预计收益；链接为普通跳转，实际下单前以 Polymarket 页面实时事实为准。</p></section>";
+    + "<p class=\"sub\">候选每 5 分钟扫描一轮，每批最多 10 个市场（9 正常 + 1 备用交错），检查满 50 个市场或队列耗尽才停，不再因已有 10 个通过而提前停；盘口读取失败不重试；表内按目标 5% 官方奖励份额的预计收益率/小时降序，第 1 名为当前推荐（60 秒维护等权刷新全部行并重排，资格翻转如实降级展示），超过 300 秒的快照仅供阅读、不再当前有效；预计收益率为检查时盘口的估算、非保证收益，缺值显示待测、不回退奖池上限；未检查的市场不代表劣于已展示者；已有委托或持仓的市场不重复推荐；拟挂占资超过可用资金（已扣委托占用）的候选不进入队列；参考价有 1 小时新鲜门，过期进入备用队列；官方竞争仅作并列参考；链接为普通跳转，实际下单前以 Polymarket 页面实时事实为准。</p></section>";
   const sessionDetails = activeSession
     ? "<details class=\"pm-lp-session-details\" data-lp-details-key=\"lp-session-details\"><summary>当前系统会话详情 · "
       + escapeHtml(predictionValue(session.market_title || session.market || session.question, "系统会话"))

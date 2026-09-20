@@ -20545,7 +20545,11 @@ const payload = {
       reference_price: "0.33", reference_capital: "6.60",
       realtime_price: "0.34", realtime_capital: "6.80",
       realtime_checked_at: now,
-      realtime_query_rate_upper_bound: "55.555556",
+      estimate_state: "known", estimate_updated: true,
+      estimated_yield_raw: "55.5555561",
+      estimated_yield_pct_per_hour: "55.555556",
+      estimated_target_quantity: "20.00", estimated_target_capital_usd: "6.80",
+      estimated_hourly_reward_usd: "0.25", estimate_checked_at: now,
       queue: "normal", verification: "verified", state: "eligible",
       selected_direction: {outcome: "YES", price: "0.34", quantity: "20", required_capital: "6.80", estimated_exit_loss: "0.68", estimated_exit_loss_ratio: "0.10", checked_at: now},
       directions: {YES: {state: "eligible", eligible: true}},
@@ -20562,7 +20566,11 @@ const payload = {
       reference_price: "0.27", reference_capital: "5.40",
       realtime_price: "0.27", realtime_capital: "5.40",
       realtime_checked_at: now,
-      realtime_query_rate_upper_bound: "41.666667",
+      estimate_state: "known", estimate_updated: true,
+      estimated_yield_raw: "41.6666672",
+      estimated_yield_pct_per_hour: "41.666667",
+      estimated_target_quantity: "20.00", estimated_target_capital_usd: "5.40",
+      estimated_hourly_reward_usd: "0.1875", estimate_checked_at: now,
       queue: "backup", verification: "verified", state: "eligible",
       selected_direction: {outcome: "NO", price: "0.27", quantity: "20", required_capital: "5.40", estimated_exit_loss: "0.54", estimated_exit_loss_ratio: "0.10", checked_at: now},
       directions: {NO: {state: "eligible", eligible: true}},
@@ -20731,6 +20739,138 @@ console.log(JSON.stringify({
     }, rendered
 
 
+def test_lp_candidate_estimate_column_and_badge_contract() -> None:
+    """Seam 4 (#138 round 2): the candidate table renders the 5% target-share
+    yield column with the target plan and minimum trial on separate sub-lines,
+    shows 待测 without falling back to the pool upper bound, carries the new
+    scan-stop footnote, and the current-recommendation badge follows the
+    re-ranked first row (not-updated rows degrade visibly)."""
+
+    output = run_dashboard_js(r'''
+Date.now = () => Date.parse("2026-09-20T13:40:00Z");
+const checkedAt = "2026-09-20T13:35:00Z";
+const mkRow = (overrides) => ({
+  market_id: "market-L1", condition_id: "condition-L1",
+  market_title: "Logitech G", market_url: "https://polymarket.com/event/l1",
+  token_id: "token-condition-L1-no", outcome: "NO",
+  daily_pool_usd: "71", min_quantity: "20",
+  queue: "normal", verification: "verified", state: "eligible",
+  realtime_price: "0.17", realtime_capital: "10.20",
+  realtime_checked_at: checkedAt,
+  estimate_state: "known", estimate_updated: true,
+  estimated_yield_raw: "0.00881557",
+  estimated_yield_pct_per_hour: "0.881557",
+  estimated_target_quantity: "98.70", estimated_target_capital_usd: "16.78",
+  estimated_hourly_reward_usd: "0.147917", estimate_checked_at: checkedAt,
+  selected_direction: {
+    outcome: "NO", price: "0.17", quantity: "60",
+    required_capital: "10.20", estimated_exit_loss: "0.51",
+    estimated_exit_loss_ratio: "0.05", checked_at: checkedAt,
+  },
+  directions: {NO: {state: "eligible", eligible: true}},
+  competition: {state: "known", value: "1", checked_at: checkedAt, stale: false, updated: true},
+  reason: ["竞争 1（并列参考）", "无已知订单或持仓"],
+  ...overrides,
+});
+const reRankedHead = mkRow({
+  market_id: "market-L2", condition_id: "condition-L2",
+  market_title: "Second market", market_url: "https://polymarket.com/event/l2",
+  token_id: "token-condition-L2-no", outcome: "YES",
+  realtime_price: "0.12", realtime_capital: "9.60",
+  estimated_yield_pct_per_hour: "1.052083",
+  estimated_target_quantity: "20.00", estimated_target_capital_usd: "2.40",
+  estimated_hourly_reward_usd: "0.101042",
+  selected_direction: {
+    outcome: "YES", price: "0.12", quantity: "20",
+    required_capital: "2.40", estimated_exit_loss: "0.05",
+    estimated_exit_loss_ratio: "0.02", checked_at: checkedAt,
+  },
+  directions: {YES: {state: "eligible", eligible: true}},
+});
+const missingEstimate = mkRow({
+  market_id: "market-L3", condition_id: "condition-L3",
+  market_title: "Third market", market_url: "https://polymarket.com/event/l3",
+  token_id: "token-condition-L3-no", outcome: "NO",
+  realtime_price: "0.30", realtime_capital: "6.00",
+  estimate_state: "unknown", estimated_yield_raw: null,
+  estimated_yield_pct_per_hour: null, estimated_target_quantity: null,
+  estimated_target_capital_usd: null, estimated_hourly_reward_usd: null,
+  estimate_checked_at: null,
+});
+const notUpdated = mkRow({
+  market_id: "market-L4", condition_id: "condition-L4",
+  market_title: "Fourth market", market_url: "https://polymarket.com/event/l4",
+  token_id: "token-condition-L4-no", outcome: "YES",
+  realtime_price: "0.22", realtime_capital: "8.80",
+  estimated_yield_pct_per_hour: "0.625",
+  estimate_updated: false,
+});
+// The maintenance re-ranked the table: L2 is the new first row and the
+// current recommendation follows it — not the higher-old-yield L1.
+const payload = {
+  state: "ready", complete: true, scanning: false,
+  checked_at: checkedAt,
+  candidate_state: "ready", candidate_stale: false,
+  candidate_checked_at: checkedAt, candidate_last_success_at: checkedAt,
+  orders: [], positions: [], lp_orders_today: [], market_rewards: {},
+  lp_observations: {}, lp_share_watch_state: {}, non_lp_row_count: 0,
+  candidates: [reRankedHead, mkRow(), missingEstimate, notUpdated],
+  recommendations: [reRankedHead],
+  selected_results: [reRankedHead, mkRow(), missingEstimate, notUpdated],
+  funnel: {
+    read: 20, base: 20, sort: 20, trial: 4,
+    competition_known: 4, competition_unknown: 0,
+    excluded: {competition_empty: 0, over_available: 0},
+    gap_reason: null, compared_range: {compared: 4, total: 4, pending: 0},
+    normal_queue_count: 20, backup_queue_count: 0,
+    checked: 20, passed: 20, rejected: 0, unknown: 0, unchecked: 0,
+    stop_reason: "queue_exhausted", batches: 2, backup_read: 0,
+    budget: {available_capital: "480.00"},
+    conditions: {}, reasons: {read: [], base: [], sort: [], trial: []},
+  },
+};
+const html = predictionLpCard({lp_dashboard: payload});
+const table = (() => {
+  const start = html.indexOf("pm-lp-candidate-table");
+  return html.slice(start, html.indexOf("</table>", start));
+})();
+const rowHtml = (conditionId) => {
+  const marker = "data-lp-trial-candidate=\"" + conditionId + ":";
+  const index = html.indexOf(marker);
+  return html.slice(index, html.indexOf("</tr>", index));
+};
+console.log(JSON.stringify({
+  header: table.includes("5% 奖励份额 · 预计收益率/小时")
+    && !table.includes("假设上限/小时"),
+  mainLine: html.includes("≈0.881557%/小时"),
+  targetPlan: html.includes("目标占资 $16.78（98.70 份）"),
+  minTrial: html.includes("最小试挂 $10.20（60 份）"),
+  pendingCell: rowHtml("condition-L3").includes("待测")
+    && rowHtml("condition-L3").includes("估值缺失，不回退奖池上限")
+    && !rowHtml("condition-L3").includes("55.5"),
+  footnote: html.includes("检查满 50 个市场或队列耗尽才停")
+    && html.includes("不再因已有 10 个通过而提前停")
+    && html.includes("未检查的市场不代表劣于已展示者")
+    && !html.includes("假设每小时收益上限"),
+  badgeFollowsNewHead: rowHtml("condition-L2").includes("当前推荐")
+    && !rowHtml("condition-L1").includes("当前推荐"),
+  notUpdatedDegraded: rowHtml("condition-L4").includes("本轮未更新")
+    && rowHtml("condition-L4").includes("仅供阅读"),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered == {
+        "header": True,
+        "mainLine": True,
+        "targetPlan": True,
+        "minTrial": True,
+        "pendingCell": True,
+        "footnote": True,
+        "badgeFollowsNewHead": True,
+        "notUpdatedDegraded": True,
+    }, rendered
+
+
 def test_lp_batch_candidate_display() -> None:
     """S9: the candidate area renders the approved batch-scan mock."""
     output = run_dashboard_js(r'''
@@ -20749,7 +20889,11 @@ const row = (overrides) => ({
   queue: "normal", verification: "verified", state: "eligible",
   realtime_price: "0.45", realtime_capital: "9.00",
   realtime_checked_at: checkedAt,
-  realtime_query_rate_upper_bound: "222.222222",
+  estimate_state: "known", estimate_updated: true,
+  estimated_yield_raw: "2.0833332",
+  estimated_yield_pct_per_hour: "2.083333",
+  estimated_target_quantity: "46.00", estimated_target_capital_usd: "20.70",
+  estimated_hourly_reward_usd: "0.431429", estimate_checked_at: checkedAt,
   selected_direction: selected("NO", "0.45", "9.00", "0.90", "0.10"),
   directions: {NO: {state: "eligible", eligible: true}, YES: {state: "eligible", eligible: true}},
   competition: {state: "known", value: "1", raw_value: "1", checked_at: checkedAt, stale: false, updated: true},
@@ -20762,7 +20906,8 @@ const second = row({
   market_title: "Rank two market", market_url: "https://polymarket.com/event/r2",
   token_id: "token-condition-R2-no", outcome: "YES",
   realtime_price: "0.40", realtime_capital: "8.00",
-  realtime_query_rate_upper_bound: "111.111111",
+  estimated_yield_pct_per_hour: "1.822917",
+  estimated_target_quantity: "46.00", estimated_target_capital_usd: "18.40",
   selected_direction: selected("YES", "0.40", "8.00", "0.80", "0.10"),
   competition: {state: "unknown", value: null, raw_value: null, checked_at: null, stale: false, updated: null},
 });
@@ -20783,7 +20928,7 @@ const dashboard = () => ({
     compared_range: {compared: 28, total: 30, pending: 2},
     normal_queue_count: 18, backup_queue_count: 2,
     checked: 20, passed: 10, rejected: 10, unknown: 0, unchecked: 0,
-    stop_reason: "filled", batches: 2, backup_read: 2,
+    stop_reason: "checked_limit", batches: 2, backup_read: 2,
     budget: {available_capital: "480.00"},
     conditions: {}, reasons: {read: [], base: [], sort: [], trial: []},
   },
@@ -20809,15 +20954,21 @@ console.log(JSON.stringify({
     && freshHtml.includes("已检查 20/50")
     && freshHtml.includes("通过 10 · 拒绝 10 · 未知 0 · 未检查 0")
     && freshHtml.includes("停止原因：")
-    && freshHtml.includes("已凑满 10 个通过")
+    && freshHtml.includes("已达单轮检查上限 50 个市场")
     && freshHtml.includes("共 2 批 · 备用已读 2"),
   eightColumns: (table(freshHtml).match(/<th scope="col">/g) || []).length === 8
     && table(freshHtml).includes("市场与方向")
-    && table(freshHtml).includes("假设上限/小时（按实际占资重算）")
+    && table(freshHtml).includes("5% 奖励份额 · 预计收益率/小时")
+    && !table(freshHtml).includes("假设上限/小时")
     && table(freshHtml).includes("拟挂方案（价 × 份 = 实际占资）")
     && table(freshHtml).includes("压力退出损失（金额 / 比例）")
     && table(freshHtml).includes("检查时间与状态"),
-  currentBadge: freshHtml.includes("当前推荐") && freshHtml.includes("60 秒持续维护"),
+  estimateCells: freshHtml.includes("≈2.083333%/小时")
+    && freshHtml.includes("目标占资 $20.70（46.00 份）")
+    && freshHtml.includes("最小试挂 $9.00（20 份）")
+    && freshHtml.includes("≈1.822917%/小时")
+    && freshHtml.includes("最小试挂 $8.00（20 份）"),
+  currentBadge: freshHtml.includes("当前推荐") && freshHtml.includes("60 秒全行维护重排"),
   passerBadge: freshHtml.includes("本轮通过") && freshHtml.includes("检查时快照，非当前可执行价"),
   planCell: freshHtml.includes("45¢ × 20 份 = <strong>$9.00</strong>"),
   lossCell: freshHtml.includes("$0.90 · 10%"),
@@ -20833,6 +20984,7 @@ console.log(JSON.stringify({
         "subtitle": True,
         "progress": True,
         "eightColumns": True,
+        "estimateCells": True,
         "currentBadge": True,
         "passerBadge": True,
         "planCell": True,
@@ -20901,8 +21053,8 @@ console.log(JSON.stringify({
 
 
 def test_lp_maintenance_failed_head_row_shows_read_only_badge() -> None:
-    """A maintained head that fails its re-check is hidden from candidates,
-    while its direction reasons remain available in diagnostics."""
+    """Issue #138 round 2: a qualification flip is shown degraded in the
+    table (never hidden); its direction reasons also stay in diagnostics."""
     output = run_dashboard_js(r'''
 Date.now = () => Date.parse("2026-09-19T12:01:00Z");
 const checkedAt = "2026-09-19T12:00:30Z";
@@ -20948,7 +21100,8 @@ const start = html.indexOf("pm-lp-candidate-table");
 const table = html.slice(start, html.indexOf("</table>", start));
 console.log(JSON.stringify({
   noPassBadgeOnFailedHead: !table.includes("本轮通过"),
-  failedHiddenFromTable: !table.includes("condition-current"),
+  failedVisibleDegraded: table.includes("condition-current")
+    && table.includes("维护失败 · 仅供阅读"),
   diagnosticsKept: html.includes("book_unknown")
     && html.includes("stress_loss_exceeded"),
 }));
@@ -20956,13 +21109,14 @@ console.log(JSON.stringify({
     rendered = json.loads(output)
     assert rendered == {
         "noPassBadgeOnFailedHead": True,
-        "failedHiddenFromTable": True,
+        "failedVisibleDegraded": True,
         "diagnosticsKept": True,
     }, rendered
 
 
 def test_lp_failed_candidate_hidden_with_diagnostics() -> None:
     output = run_dashboard_js(r'''
+Date.now = () => Date.parse("2026-09-20T03:00:10Z");
 const checkedAt = "2026-09-20T03:00:00Z";
 const selected = {
   outcome: "YES", price: "0.23", quantity: "50", required_capital: "11.50",
@@ -21018,12 +21172,14 @@ const rejectedHtml = render(failedHead(
 ));
 const noPlanHtml = render(noPlan, [noPlan, validRunner]);
 console.log(JSON.stringify({
-  unknownHidden: !table(unknownHtml).includes("condition-failed-unknown"),
+  unknownVisibleDegraded: table(unknownHtml).includes("condition-failed-unknown")
+    && table(unknownHtml).includes("维护失败 · 仅供阅读"),
   unknownReasonVisible: unknownHtml.includes("account_freshness_stale")
     && unknownHtml.includes("market_metadata_stale"),
   unknownRunnerKept: table(unknownHtml).includes("condition-runner"),
   unknownRunnerNotCurrent: !table(unknownHtml).includes("当前推荐"),
-  rejectedHidden: !table(rejectedHtml).includes("condition-failed-rejected"),
+  rejectedVisibleDegraded: table(rejectedHtml).includes("condition-failed-rejected")
+    && table(rejectedHtml).includes("维护失败 · 仅供阅读"),
   rejectedReasonVisible: rejectedHtml.includes("market_metadata_stale"),
   rejectedRunnerKept: table(rejectedHtml).includes("condition-runner"),
   noPlanHidden: !table(noPlanHtml).includes("condition-no-plan")
@@ -21033,11 +21189,11 @@ console.log(JSON.stringify({
 ''')
     rendered = json.loads(output)
     assert rendered == {
-        "unknownHidden": True,
+        "unknownVisibleDegraded": True,
         "unknownReasonVisible": True,
         "unknownRunnerKept": True,
         "unknownRunnerNotCurrent": True,
-        "rejectedHidden": True,
+        "rejectedVisibleDegraded": True,
         "rejectedReasonVisible": True,
         "rejectedRunnerKept": True,
         "noPlanHidden": True,

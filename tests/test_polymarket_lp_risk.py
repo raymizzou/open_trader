@@ -1090,3 +1090,133 @@ def test_lp_book_share_missing_book_keeps_fields_none_not_zero() -> None:
         "side_total_quantity": None,
         "book_share_pct": None,
     }
+
+
+def _target_share_book(
+    bids: list[tuple[str, str]], asks: list[tuple[str, str]]
+) -> dict[str, object]:
+    return {
+        "condition_id": "condition-a",
+        "token_id": "token-yes",
+        "received_at": NOW,
+        "bids": [
+            {"price": Decimal(price), "size": Decimal(size)}
+            for price, size in bids
+        ],
+        "asks": [
+            {"price": Decimal(price), "size": Decimal(size)}
+            for price, size in asks
+        ],
+    }
+
+
+def _target_share_estimate(book: object, *, price: str = "0.50") -> dict[str, object]:
+    return polymarket_lp_risk.estimate_lp_target_share_yield(
+        book,
+        price=Decimal(price),
+        reward_min_size=Decimal("20"),
+        reward_max_spread=Decimal("0.03"),
+        daily_pool_usd=Decimal("24"),
+        now=NOW,
+    )
+
+
+def test_estimate_target_share_worked_example_one() -> None:
+    """B1: bids .50×570, asks .52×570, v=.03, min 20, T=$24.
+
+    Independent arithmetic (issue #138): midpoint .51; each side's weighted
+    quantity is 570×(1−.01/.03)² = 570×(2/3)², so C = 570×4/9;
+    q = 3C/(19w) with w = 4/9 gives 3×570/19 = 90 shares; capital
+    90×$0.50 = $45; hourly gross reward $24×5%/24 = $0.05; yield
+    0.05/45×100 = 1/9 ≈ 0.111111%/h.
+    """
+
+    result = _target_share_estimate(_target_share_book([("0.50", "570")], [("0.52", "570")]))
+
+    assert result["state"] == "known"
+    assert result["target_quantity"] == Decimal("90")
+    assert result["target_capital_usd"] == Decimal("45")
+    assert result["hourly_reward_usd"] == Decimal("0.05")
+    assert Decimal("0.11111") < result["yield_pct_per_hour"] < Decimal("0.11112")
+    assert result["yield_pct_per_hour_display"] == Decimal("0.111111")
+    assert result["midpoint"] == Decimal("0.51")
+    assert result["competition_upper_bound"] > 0
+    assert result["checked_at"] == NOW
+
+
+def test_estimate_target_share_worked_example_doubled_depth() -> None:
+    """B2: both sides' depth doubled → 180 shares, $90, ≈1/18 %/h.
+
+    C doubles while w stays the same, so q doubles: 3×1140/19 = 180;
+    yield 0.05/90×100 = 1/18 ≈ 0.055556%/h — deeper books earn less per
+    dollar at the same 5% target share.
+    """
+
+    result = _target_share_estimate(
+        _target_share_book([("0.50", "1140")], [("0.52", "1140")])
+    )
+
+    assert result["state"] == "known"
+    assert result["target_quantity"] == Decimal("180")
+    assert result["target_capital_usd"] == Decimal("90")
+    assert Decimal("0.05555") < result["yield_pct_per_hour"] < Decimal("0.05556")
+    assert result["yield_pct_per_hour_display"] == Decimal("0.055556")
+
+
+def test_estimate_target_share_leaves_minimum_trial_to_entry_checks() -> None:
+    """B3: with only $20 available, a passing minimum trial still guides
+    20 shares / $10 — the $45 hypothetical target capital neither rejects
+    the trial nor inflates its quantity (evaluate_lp_entry semantics)."""
+
+    direction = _direction()
+    direction["market"]["tick_size"] = Decimal("0.01")
+    direction["market"]["minimum_order_size"] = Decimal("20")
+    direction["market"]["reward_min_size"] = Decimal("20")
+    direction["market"]["reward_max_spread"] = Decimal("0.03")
+    # A second bid level below the quote keeps the stress-exit depth check
+    # green once the entire best-bid level is removed.
+    direction["book"] = _target_share_book(
+        [("0.50", "570"), ("0.49", "100")], [("0.52", "570")]
+    )
+    account = _account()
+    account["balance"] = Decimal("20")
+    account["allowance"] = Decimal("20")
+
+    result = polymarket_lp_risk.evaluate_lp_entry(
+        direction, account=account, now=NOW
+    )
+
+    assert result["state"] == "eligible"
+    guidance = result["guidance"]
+    assert isinstance(guidance, dict)
+    assert guidance["quantity"] == Decimal("20")
+    assert guidance["required_capital"] == Decimal("10.00")
+
+
+def test_estimate_target_share_unknown_boundary_cases() -> None:
+    """B4: w=0 quote, out-of-range midpoint, and missing book are UNKNOWN
+    with no numeric fallback and never a fake zero."""
+
+    # Quote exactly v away from the midpoint → unit weight zero.
+    far = _target_share_estimate(
+        _target_share_book([("0.48", "570")], [("0.54", "570")]), price="0.48"
+    )
+    # Midpoint (0.04+0.06)/2 = 0.05 outside [0.10, 0.90].
+    low_mid = _target_share_estimate(
+        _target_share_book([("0.04", "570")], [("0.06", "570")]), price="0.04"
+    )
+    # Missing book entirely.
+    no_book = _target_share_estimate(None)
+
+    for result in (far, low_mid, no_book):
+        assert result["state"] == "unknown"
+        assert result["yield_pct_per_hour"] is None
+        assert result["yield_pct_per_hour_display"] is None
+        assert result["target_quantity"] is None
+        assert result["target_capital_usd"] is None
+        assert result["hourly_reward_usd"] is None
+        assert result["midpoint"] is None
+        assert result["competition_upper_bound"] is None
+    assert "reward_score_zero" in far["reason_codes"]
+    assert "midpoint_out_of_range" in low_mid["reason_codes"]
+    assert "book_unknown" in no_book["reason_codes"]

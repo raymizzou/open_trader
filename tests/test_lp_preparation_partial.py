@@ -3658,9 +3658,9 @@ def test_due_metadata_retry_dispatches_before_initial_history_pass_finishes(
     # freshness window; the first batch renews it once (targeted) before
     # qualifying, and the ten live-qualified passers fill the table and end
     # the round.
-    assert snapshot["funnel"]["stop_reason"] == "filled"
-    assert snapshot["funnel"]["checked"] == 10
-    assert snapshot["funnel"]["passed"] == 10
+    assert snapshot["funnel"]["stop_reason"] == "checked_limit"
+    assert snapshot["funnel"]["checked"] == 50
+    assert snapshot["funnel"]["passed"] == 50
     assert snapshot["funnel"]["unknown"] == 0
     assert len(snapshot["candidates"]) == 10
 
