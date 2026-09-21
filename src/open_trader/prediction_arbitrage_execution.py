@@ -80,6 +80,12 @@ LP_REWARD_REFERENCE_PERCENTAGE = Decimal("5")
 LP_REWARD_SHARE_TARGET_MAX = Decimal("8")
 _LP_REWARD_CACHE_SECONDS = 60.0
 _LP_TRADES_CACHE_SECONDS = 60.0
+# Issue 159: two adjacent successful account observations diff into
+# first-seen candidates only when they are at most this far apart; anything
+# wider is an observation gap and the round only rebuilds the baseline set.
+# There is deliberately no other time window: pending registrations retry
+# indefinitely until the observation chain breaks.
+_LP_FIRST_SEEN_GAP_SECONDS = 30.0
 
 _THRESHOLD_ERROR_HINTS = {
     "auth": "签名或钱包身份校验未通过",
@@ -743,6 +749,13 @@ class PredictionExecutionService:
         # scoring read per order id, so a failed poll can still show when the
         # order was last confirmed scoring (or explicitly not scoring).
         self._lp_scoring_observations: dict[str, dict[str, str]] = {}
+        # Issue 159: process-memory state of the 10s account observation
+        # chain.  Never persisted — a restart rebuilds the baseline set on
+        # its first successful round and drops any pending registrations
+        # (permanent position unknown), exactly like a broken chain.
+        self._lp_first_seen_prev_ids: set[str] = set()
+        self._lp_first_seen_prev_at: datetime | None = None
+        self._lp_first_seen_pending: dict[str, dict[str, object]] = {}
         # 当天 LP 委托：按奖励日缓存的成交聚合（我方订单 id → 汇总成交量），
         # 由后台刷新线程补全，lp_dashboard() 读取缓存做 fail-open 装配。
         self._lp_orders_today_fills: dict[str, dict[str, dict[str, object]]] = {}
@@ -1955,6 +1968,184 @@ class PredictionExecutionService:
                 titles[order_id] = title
         return titles
 
+    def _lp_first_seen_detect(
+        self,
+        *,
+        orders: list[dict[str, object]],
+        created_at_by_order: dict[str, object],
+        checked_at: datetime,
+    ) -> None:
+        """Diff two adjacent successful account observations (issue 159).
+
+        A BUY that appears between two adjacent successful rounds (gap at
+        most 30 seconds, side BUY, non-terminal, not system-managed, on a
+        token without an active LP session or first-seen episode) becomes a
+        registration candidate.  The first round after process start and any
+        round over 30 seconds after the previous success only rebuild the
+        baseline set — orders seen there are position unknown by decision
+        and pending registrations die with the broken chain.  Failed
+        registrations park in the in-memory pending set and retry every
+        following round; there is deliberately no time limit.
+        The dashboard pipeline hands ``checked_at`` over as the ISO text it
+        publishes; normalize it once so the gap math and the pending stamps
+        are real datetimes.
+        """
+
+        if isinstance(checked_at, datetime):
+            observed_at = checked_at
+        else:
+            text = str(checked_at).strip()
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            observed_at = datetime.fromisoformat(text)
+            if observed_at.tzinfo is None:
+                observed_at = observed_at.replace(tzinfo=UTC)
+
+        prev_at = self._lp_first_seen_prev_at
+        baseline_only = (
+            prev_at is None
+            or (observed_at - prev_at).total_seconds() > _LP_FIRST_SEEN_GAP_SECONDS
+        )
+        current_ids = {
+            str(row.get("order_id") or "")
+            for row in orders
+            if row.get("order_id")
+        }
+        if baseline_only:
+            self._lp_first_seen_pending = {}
+            self._lp_first_seen_prev_ids = current_ids
+            self._lp_first_seen_prev_at = observed_at
+            return
+
+        active_session: Mapping[str, object] | None = None
+        session_reader = getattr(self._store, "lp_active_session", None)
+        if callable(session_reader):
+            try:
+                active_session = session_reader()
+            except Exception:
+                active_session = None
+        session_token = str((active_session or {}).get("token_id") or "")
+        system_ids: set[str] = set()
+        if isinstance(active_session, Mapping):
+            for key in (
+                "entry_order_id",
+                "passive_exit_order_id",
+                "protected_exit_order_id",
+            ):
+                value = str(active_session.get(key) or "")
+                if value:
+                    system_ids.add(value)
+            raw_owned = active_session.get("owned_order_ids")
+            if isinstance(raw_owned, (list, tuple, set, frozenset)):
+                system_ids.update(str(order_id) for order_id in raw_owned if order_id)
+
+        active_tokens: set[str] = set()
+        episodes_reader = getattr(self._store, "lp_active_first_seen_episodes", None)
+        if callable(episodes_reader):
+            try:
+                active_tokens = {
+                    str(episode.get("token_id") or "")
+                    for episode in episodes_reader()
+                }
+            except Exception:
+                active_tokens = set()
+
+        open_rows = {
+            str(row.get("order_id") or ""): row
+            for row in orders
+            if row.get("order_id")
+        }
+        candidates_by_token: dict[str, list[dict[str, object]]] = {}
+
+        def add_candidate(
+            order_id: str, row: Mapping[str, object], first_seen_at: datetime
+        ) -> None:
+            token_id = str(row.get("token_id") or "")
+            if not token_id:
+                return
+            candidates_by_token.setdefault(token_id, []).append(
+                {
+                    "order_id": order_id,
+                    "token_id": token_id,
+                    "condition_id": str(row.get("condition_id") or ""),
+                    "price": row.get("price"),
+                    "remaining": row.get("remaining_quantity"),
+                    "created_at": created_at_by_order.get(order_id),
+                    "first_seen_at": first_seen_at,
+                }
+            )
+
+        # Pending survivors: still open, still non-terminal; anything that
+        # vanished from the fresh read or went terminal stays position
+        # unknown forever (the chain only moves forward).
+        surviving_pending: dict[str, dict[str, object]] = {}
+        for order_id, record in self._lp_first_seen_pending.items():
+            row = open_rows.get(order_id)
+            if (
+                row is None
+                or str(row.get("status") or "").upper() in TERMINAL_ORDER_STATES
+            ):
+                continue
+            surviving_pending[order_id] = record
+            original_seen = record.get("first_seen_at")
+            first_seen = (
+                original_seen
+                if isinstance(original_seen, datetime)
+                else observed_at
+            )
+            add_candidate(order_id, row, first_seen)
+
+        self._lp_first_seen_pending = surviving_pending
+
+        for row in orders:
+            order_id = str(row.get("order_id") or "")
+            if not order_id or order_id in self._lp_first_seen_prev_ids:
+                continue
+            if str(row.get("side") or "").upper() != "BUY":
+                continue
+            if str(row.get("status") or "").upper() in TERMINAL_ORDER_STATES:
+                continue
+            if order_id in system_ids:
+                continue
+            token_id = str(row.get("token_id") or "")
+            if not token_id or token_id == session_token or token_id in active_tokens:
+                continue
+            self._lp_first_seen_pending[order_id] = {
+                "token_id": token_id,
+                "condition_id": str(row.get("condition_id") or ""),
+                "first_seen_at": observed_at,
+            }
+            add_candidate(order_id, row, observed_at)
+
+        self._lp_first_seen_prev_ids = current_ids
+        self._lp_first_seen_prev_at = observed_at
+
+        register = getattr(self._lp, "register_first_seen_candidates", None)
+        for token_id, token_rows in candidates_by_token.items():
+            if token_id == session_token or token_id in active_tokens:
+                # The session token is covered by the issue 152 exemption,
+                # and tokens with an active episode are covered by that
+                # episode's runtime — neither ever reaches the LP service.
+                continue
+            if not callable(register):
+                break
+            try:
+                result = register(token_rows, now=observed_at)
+            except Exception:
+                logger.warning(
+                    "lp_first_seen_registration_failed", exc_info=True
+                )
+                continue
+            state = str((result or {}).get("state") or "")
+            if state != "registration_failed":
+                # Registered, skipped, or otherwise settled: the batch never
+                # retries.  Only a failed registration (book unavailable or
+                # baseline unresolvable) keeps its orders pending.
+                for token_row in token_rows:
+                    self._lp_first_seen_pending.pop(
+                        str(token_row.get("order_id") or ""), None
+                    )
+
     def refresh_lp_dashboard_snapshot(self) -> dict[str, object]:
         """Run the LP dashboard read pipeline once into the shared cache.
 
@@ -2020,10 +2211,15 @@ class PredictionExecutionService:
                 managed_token = str(session.get("token_id") or "")
 
                 orders: list[dict[str, object]] = []
+                first_seen_created_at: dict[str, object] = {}
                 for raw_order in snapshot["open_orders"]:
                     if not isinstance(raw_order, Mapping):
                         continue
                     order_id = str(raw_order.get("order_id", raw_order.get("id", "")) or "")
+                    if order_id:
+                        # Issue 159: the venue stamp feeds the first-seen
+                        # anchor tie-break; it stays off the dashboard row.
+                        first_seen_created_at[order_id] = raw_order.get("created_at")
                     filled = _decimal(raw_order.get("size_matched", raw_order.get("filled_quantity")))
                     remaining = _decimal(raw_order.get("remaining_size", raw_order.get("remaining_quantity")))
                     quantity = _decimal(raw_order.get("original_size", raw_order.get("quantity")))
@@ -2143,6 +2339,16 @@ class PredictionExecutionService:
                     for order_id, record in self._lp_scoring_observations.items()
                     if order_id in live_manual_order_ids
                 }
+
+                # Issue 159: diff this successful account read against the
+                # previous one and register first-seen baseline episodes for
+                # web-manual BUYs before the today-table projection reads
+                # the episode store.
+                self._lp_first_seen_detect(
+                    orders=orders,
+                    created_at_by_order=first_seen_created_at,
+                    checked_at=checked_at,
+                )
 
                 candidate_reader = getattr(self._lp, "candidate_snapshot", None)
                 try:
@@ -2308,6 +2514,12 @@ class PredictionExecutionService:
                     if isinstance(raw_protection, Mapping)
                     else None
                 )
+                # Issue 152 increment: mark the submit-baseline source so the
+                # UI can distinguish it from the issue 159 first-seen one.
+                if isinstance(queue_protection_summary, dict):
+                    queue_protection_summary.setdefault(
+                        "baseline_source", "submit"
+                    )
                 lp_entry_order_id = (
                     str(session.get("entry_order_id") or "")
                     if isinstance(session, Mapping)
@@ -2318,11 +2530,37 @@ class PredictionExecutionService:
                     if isinstance(session, Mapping)
                     else ""
                 )
+                # Issue 159: active first-seen episodes project their payload
+                # as the protection summary of their own token's rows, and
+                # every registered anchor order is an anchor row.
+                episodes_by_token: dict[str, Mapping[str, object]] = {}
+                episodes_reader = getattr(
+                    self._store, "lp_active_first_seen_episodes", None
+                )
+                if callable(episodes_reader):
+                    try:
+                        for episode in episodes_reader():
+                            token = str(episode.get("token_id") or "")
+                            if token:
+                                episodes_by_token[token] = episode
+                    except Exception:
+                        episodes_by_token = {}
                 for today_row in lp_orders_today:
+                    episode = episodes_by_token.get(
+                        str(today_row.get("token_id") or "")
+                    )
                     today_row["anchor"] = (
                         bool(lp_entry_order_id)
                         and str(today_row.get("order_id") or "") == lp_entry_order_id
                     )
+                    if episode is not None:
+                        anchor_ids = episode.get("anchor_order_ids")
+                        if isinstance(anchor_ids, (list, tuple)) and str(
+                            today_row.get("order_id") or ""
+                        ) in {str(value) for value in anchor_ids}:
+                            today_row["anchor"] = True
+                        today_row["queue_protection"] = dict(episode)
+                        continue
                     if (
                         queue_protection_summary is not None
                         and lp_session_condition
@@ -2405,7 +2643,16 @@ class PredictionExecutionService:
                     reward_date, trade_condition_ids
                 )
                 return result
-            except Exception:
+            except Exception as exc:
+                if str(exc) in {
+                    "lp_account_reader_unavailable",
+                    "lp_account_snapshot_unknown",
+                    "lp_account_timestamp_unknown",
+                }:
+                    # Issue 159: a failed account read breaks the observation
+                    # chain; parked first-seen registrations die with it
+                    # (their position stays unknown permanently).
+                    self._lp_first_seen_pending = {}
                 cached = self._lp_dashboard_cache
                 try:
                     raw_candidate_snapshot = _call(

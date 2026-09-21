@@ -195,7 +195,7 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         assert connection.execute("PRAGMA busy_timeout").fetchone()[0] > 0
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
         names = {
             row[1]
             for row in connection.execute("PRAGMA table_list")
@@ -251,6 +251,7 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
         "observation_pool_members",
         "lp_sessions",
         "lp_actions",
+        "lp_first_seen_episodes",
         "lp_daily_reports",
         "lp_book_samples",
         "lp_price_history_cache",

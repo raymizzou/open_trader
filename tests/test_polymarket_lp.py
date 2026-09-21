@@ -8225,3 +8225,492 @@ def test_healthy_batch_clears_stale_stop_reason(tmp_path) -> None:
     assert recovered["state"] == "ready"
     assert recovered["funnel"]["stop_reason"] is None
     assert recovered["retention_reason"] is None
+
+
+# ---- Issue 159: 首见基线兜底保护（评估层 E1-E7、终态 T） ----
+
+
+class _FirstSeenExchange(_AccountReadExchange):
+    """Issue 159 fake: scripted account open orders plus per-token books."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.books: dict[str, dict[str, object]] = {}
+        self.book_calls: list[str] = []
+
+    def set_book(
+        self,
+        token_id: str,
+        *,
+        level_total: object,
+        now: datetime,
+        condition_id: str = "0x" + "c" * 64,
+        price: object = Decimal("0.30"),
+    ) -> None:
+        self.books[token_id] = {
+            "condition_id": condition_id,
+            "token_id": token_id,
+            "received_at": now,
+            "source_timestamp": "2026-09-21T11:59:59Z",
+            "hash": "book-hash-first-seen",
+            "bids": [{"price": Decimal(str(price)), "size": Decimal(str(level_total))}],
+            "asks": [{"price": Decimal("0.31"), "size": Decimal("100")}],
+        }
+
+    def lp_order_books(
+        self, token_ids: object, *, stop_event: object = None
+    ) -> dict[str, dict[str, object]]:
+        del stop_event
+        result: dict[str, dict[str, object]] = {}
+        for token_id in tuple(token_ids):  # type: ignore[arg-type]
+            self.book_calls.append(str(token_id))
+            book = self.books.get(str(token_id))
+            if book is not None:
+                result[str(token_id)] = book
+        return result
+
+
+_FIRST_SEEN_TOKEN = "0x" + "1" * 64
+_FIRST_SEEN_CONDITION = "0x" + "c" * 64
+
+
+def _first_seen_episode(
+    store: PredictionArbitrageStore,
+    episode_id: str,
+    *,
+    baseline_front: object = "8000",
+    anchors: tuple[str, ...] = ("m-1",),
+    token_id: str = _FIRST_SEEN_TOKEN,
+    condition_id: str = _FIRST_SEEN_CONDITION,
+    price: object = "0.30",
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "token_id": token_id,
+        "condition_id": condition_id,
+        "anchor_order_ids": list(anchors),
+        "anchor_price": str(price),
+        "baseline_front": baseline_front,
+        "baseline_price": str(price),
+        "baseline_book_received_at": "2026-09-21T11:59:58Z",
+        "baseline_book_hash": "book-hash-first-seen",
+        "baseline_source": "first_observation",
+        "baseline_version": 1,
+        "threshold": Decimal("0.5"),
+        "first_seen_at": "2026-09-21T11:59:57Z",
+        "registration_delay": 1.0,
+        "data_failures": 0,
+        "state": "monitoring",
+        "notification_sent": False,
+        "blocked_notified": False,
+        "cancel_scope": "own_buys_at_level",
+        "cancel_targets": [],
+        "canceled_order_ids": [],
+        "cancel_target_remaining": {},
+        "canceled_remaining": None,
+        "partially_filled_quantity": None,
+        "cancel_requested_at": None,
+        "cancel_reason": None,
+        "reason_codes": [],
+    }
+    return store.lp_create_first_seen_episode(
+        episode_id,
+        token_id=token_id,
+        condition_id=condition_id,
+        state="monitoring",
+        payload=payload,
+    )
+
+
+def _first_seen_running_service(
+    tmp_path,
+    now: datetime,
+    *,
+    episode_id: str,
+    level_total: object,
+    open_orders: list[dict[str, object]],
+    baseline_front: object = "8000",
+    anchors: tuple[str, ...] = ("m-1",),
+    notifier: object | None = None,
+    guard: object = None,
+):
+    store = PredictionArbitrageStore(tmp_path)
+    exchange = _FirstSeenExchange()
+    exchange.set_book(
+        _FIRST_SEEN_TOKEN, level_total=level_total, now=now
+    )
+    exchange.account_open_orders = list(open_orders)
+    service = PolymarketLPService(
+        store, exchange, clock=lambda: now, mutation_guard=guard
+    )
+    if notifier is not None:
+        service.set_protection_notifier(notifier)
+    _first_seen_episode(
+        store,
+        episode_id,
+        baseline_front=baseline_front,
+        anchors=anchors,
+    )
+    return store, exchange, service
+
+
+def test_first_seen_examples_one_and_two_monitor_without_cancel(
+    tmp_path,
+) -> None:
+    """E1: 总量 10,000 → 前方 8,000、A=80% 监控不撤；
+    E2: 总量 6,000 → 前方 min(8000,4000)=4,000、A=66.67% 不撤。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    live = _queue_receipt("m-1")
+
+    store, exchange, service = _first_seen_running_service(
+        tmp_path, now, episode_id="ep-e1", level_total="10000",
+        open_orders=[live],
+    )
+    service.tick()
+    episode = store.lp_first_seen_episode("ep-e1")
+    assert episode is not None and episode["state"] == "monitoring"
+    assert Decimal(str(episode["front_estimate"])) == Decimal("8000")
+    assert Decimal(str(episode["level_total"])) == Decimal("10000")
+    assert Decimal(str(episode["ratio"])) == Decimal("0.80")
+    assert exchange.cancels == []
+
+    store2, exchange2, service2 = _first_seen_running_service(
+        tmp_path / "e2", now, episode_id="ep-e2", level_total="6000",
+        open_orders=[live],
+    )
+    service2.tick()
+    episode2 = store2.lp_first_seen_episode("ep-e2")
+    assert episode2 is not None and episode2["state"] == "monitoring"
+    assert Decimal(str(episode2["front_estimate"])) == Decimal("4000")
+    assert Decimal(str(episode2["level_total"])) == Decimal("6000")
+    assert Decimal(str(episode2["ratio"])) == Decimal("4000") / Decimal("6000")
+    assert exchange2.cancels == []
+
+
+def test_first_seen_examples_three_and_four_trigger_at_half(
+    tmp_path,
+) -> None:
+    """E3: 总量 4,000 → A=50% 触发；E4: 总量 16,000（后方新增 6,000）→
+    前方仍 8,000、A=50% 触发，新增不进前方。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    live = _queue_receipt("m-1")
+
+    store, exchange, service = _first_seen_running_service(
+        tmp_path, now, episode_id="ep-e3", level_total="4000",
+        open_orders=[live],
+    )
+    service.tick()
+    episode = store.lp_first_seen_episode("ep-e3")
+    assert episode is not None and episode["state"] == "canceling"
+    assert Decimal(str(episode["ratio"])) == Decimal("0.50")
+    assert exchange.cancels == ["m-1"]
+
+    store2, exchange2, service2 = _first_seen_running_service(
+        tmp_path / "e4", now, episode_id="ep-e4", level_total="16000",
+        open_orders=[live],
+    )
+    service2.tick()
+    episode2 = store2.lp_first_seen_episode("ep-e4")
+    assert episode2 is not None and episode2["state"] == "canceling"
+    assert Decimal(str(episode2["front_estimate"])) == Decimal("8000")
+    assert Decimal(str(episode2["level_total"])) == Decimal("16000")
+    assert Decimal(str(episode2["ratio"])) == Decimal("0.50")
+    assert exchange2.cancels == ["m-1"]
+
+
+def test_first_seen_cancel_scope_is_anchor_price_buys_only(tmp_path) -> None:
+    """E5(范围): SELL、非锚价 BUY 不被撤；同锚价全部自己 BUY 进入撤单。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    anchor = _queue_receipt("m-1")
+    manual_same = _queue_receipt("m-manual", original="1000")
+    other_price = _queue_receipt("m-other-price", price="0.31")
+    sell_row = _queue_receipt("m-sell", side="SELL", original="500")
+    store, exchange, service = _first_seen_running_service(
+        tmp_path, now, episode_id="ep-e5", level_total="4000",
+        open_orders=[anchor, manual_same, other_price, sell_row],
+        anchors=("m-1",),
+    )
+    service.tick()
+    episode = store.lp_first_seen_episode("ep-e5")
+    assert episode is not None and episode["state"] == "canceling"
+    assert exchange.cancels == ["m-1", "m-manual"]
+    assert episode["cancel_targets"] == ["m-1", "m-manual"]
+
+
+def test_first_seen_conservative_cancel_after_ten_book_outages(
+    tmp_path,
+) -> None:
+    """E5(保守撤): 行情连续失效 10 次 → 保守撤（book_unreliable）。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    anchor = _queue_receipt("m-1")
+    manual_same = _queue_receipt("m-manual", original="1000")
+    store, exchange, service = _first_seen_running_service(
+        tmp_path, now, episode_id="ep-e5b", level_total="10000",
+        open_orders=[anchor, manual_same],
+    )
+    exchange.books.clear()  # book read unavailable for every tick
+
+    for expected in range(1, 10):
+        service.tick()
+        episode = store.lp_first_seen_episode("ep-e5b")
+        assert episode is not None
+        assert Decimal(str(episode["data_failures"])) == expected
+        assert exchange.cancels == []
+
+    service.tick()
+    episode = store.lp_first_seen_episode("ep-e5b")
+    assert episode is not None
+    assert episode["state"] == "canceling"
+    assert episode["cancel_reason"] == "book_unreliable"
+    assert exchange.cancels == ["m-1", "m-manual"]
+
+
+def test_first_seen_cancel_episode_closes_with_receipts_and_notice(
+    tmp_path,
+) -> None:
+    """E6(闭环): 触发 → 每目标先 lp_actions pending 再撤；撤中再成交 →
+    partially_filled 如实记账；重复 tick 不重复撤、不扩量；回执后一次性
+    通知（文案含「首见基线」）。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    notes: list[tuple[str, str, str]] = []
+
+    def collect(title: str, message: str, xiaoai_text: str) -> None:
+        notes.append((title, message, xiaoai_text))
+
+    anchor = _queue_receipt("m-1")
+    manual_same = _queue_receipt("m-manual", original="1000")
+    store, exchange, service = _first_seen_running_service(
+        tmp_path, now, episode_id="ep-e6", level_total="4000",
+        open_orders=[anchor, manual_same], anchors=("m-1",),
+        notifier=collect,
+    )
+    service.tick()
+
+    # 每目标先 pending（意图）再撤，回执 accepted。
+    for order_id in ("m-1", "m-manual"):
+        key = f"ep-e6:first-seen-protection-cancel:{order_id}"
+        actions = [
+            action for action in store.lp_actions(LP_RESERVED_MANUAL_SESSION_ID)
+            if action["action_key"] == key
+        ]
+        assert len(actions) == 1
+        assert actions[0]["state"] == "accepted"
+        assert actions[0]["targets"] == [order_id]
+    episode = store.lp_first_seen_episode("ep-e6")
+    assert episode is not None
+    assert episode["cancel_targets"] == ["m-1", "m-manual"]
+
+    # 撤中再成交 500：回执 CANCELED 且 size_matched=500；m-manual 从所有
+    # 读取路径消失 = canceled。
+    filling = _queue_receipt("m-1", status="CANCELED", matched="500")
+    exchange.account_open_orders = [filling]
+    service.tick()
+    episode = store.lp_first_seen_episode("ep-e6")
+    assert episode is not None
+    assert episode["state"] == "partially_filled"
+    assert Decimal(str(episode["partially_filled_quantity"])) == Decimal("500")
+    # 撤单调用仍只有一轮的两笔，不重复撤、不扩量。
+    assert exchange.cancels == ["m-1", "m-manual"]
+    assert len(exchange.posts) == 0
+
+    # 一次性通知：恰一条成功通知，文案含「首见基线」。
+    assert len(notes) == 1
+    title, message, xiaoai_text = notes[0]
+    assert "首见基线" in title
+    assert "首见基线" in message
+
+
+def test_first_seen_guard_and_identity_conflict_block_cancel(
+    tmp_path,
+) -> None:
+    """E7: 熔断开 → blocked、零写调用、一次性受阻通知；身份冲突 → blocked。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    notes: list[tuple[str, str, str]] = []
+
+    def collect(title: str, message: str, xiaoai_text: str) -> None:
+        notes.append((title, message, xiaoai_text))
+
+    anchor = _queue_receipt("m-1")
+    store, exchange, service = _first_seen_running_service(
+        tmp_path, now, episode_id="ep-e7", level_total="4000",
+        open_orders=[anchor], notifier=collect,
+        guard=lambda action: False,
+    )
+    service.tick()
+    episode = store.lp_first_seen_episode("ep-e7")
+    assert episode is not None
+    assert episode["state"] == "blocked"
+    assert "mutation_blocked" in episode["reason_codes"]
+    assert exchange.cancels == []
+    assert exchange.posts == []
+    assert exchange.protected_sells == []
+    assert len(notes) == 1
+    assert "首见基线" in notes[0][0]
+
+    # blocked → 恢复（估算已知）→ 再次受阻：重通知一次。
+    service.set_mutation_guard(lambda action: True)
+    service.tick()
+    episode = store.lp_first_seen_episode("ep-e7")
+    assert episode is not None
+    assert episode["state"] == "canceling"
+    assert exchange.cancels == ["m-1"]
+
+    store2, exchange2, service2 = _first_seen_running_service(
+        tmp_path / "identity", now, episode_id="ep-e7b", level_total="4000",
+        open_orders=[
+            _queue_receipt("m-1", side="SELL"),
+            _queue_receipt("m-manual", original="2000"),
+        ],
+        anchors=("m-1",),
+    )
+    service2.tick()
+    episode2 = store2.lp_first_seen_episode("ep-e7b")
+    assert episode2 is not None
+    assert episode2["state"] == "blocked"
+    assert "identity_conflict" in episode2["reason_codes"]
+    assert exchange2.cancels == []
+
+
+def test_first_seen_anchors_terminal_ends_episode_and_frees_token(
+    tmp_path,
+) -> None:
+    """T: 锚单全部终态 → 该段终态、token 释放；同 token 新 diff 可开新段。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    anchor = _queue_receipt("m-1")
+    store, exchange, service = _first_seen_running_service(
+        tmp_path, now, episode_id="ep-t", level_total="10000",
+        open_orders=[anchor],
+    )
+    # 锚单从所有读取路径消失（网页手动撤掉）。
+    exchange.account_open_orders = []
+    service.tick()
+    episode = store.lp_first_seen_episode("ep-t")
+    assert episode is not None
+    assert episode["state"] == "terminal"
+    assert store.lp_active_first_seen_episodes() == []
+    assert exchange.cancels == []
+
+    # episode 终态后该 token 新出现的 BUY 可开新段（不接锚、不链式）。
+    result = service.register_first_seen_candidates(
+        [
+            {
+                "order_id": "m-new",
+                "token_id": _FIRST_SEEN_TOKEN,
+                "condition_id": _FIRST_SEEN_CONDITION,
+                "price": Decimal("0.30"),
+                "remaining": Decimal("2000"),
+                "created_at": None,
+                "first_seen_at": now,
+            }
+        ],
+        now=now,
+    )
+    assert result["state"] == "registered"
+    episodes = store.lp_active_first_seen_episodes()
+    assert len(episodes) == 1
+    assert episodes[0]["anchor_order_ids"] == ["m-new"]
+    assert episodes[0]["episode_id"] != "ep-t"
+
+
+def test_first_seen_anchor_is_earliest_first_seen_buy(tmp_path) -> None:
+    """R2: 锚=最早首见 BUY。候选 B 的 venue created_at 更早但 first_seen_at
+    更晚，不得夺锚；锚必须是 A（anchor_price=0.30），并列才看 created_at。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    store = PredictionArbitrageStore(tmp_path)
+    exchange = _FirstSeenExchange()
+    exchange.set_book(_FIRST_SEEN_TOKEN, level_total="10000", now=now)
+    exchange.books[_FIRST_SEEN_TOKEN]["bids"].append(
+        {"price": Decimal("0.40"), "size": Decimal("1000")}
+    )
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    result = service.register_first_seen_candidates(
+        [
+            {
+                "order_id": "m-b",
+                "token_id": _FIRST_SEEN_TOKEN,
+                "condition_id": _FIRST_SEEN_CONDITION,
+                "price": Decimal("0.40"),
+                "remaining": Decimal("500"),
+                "created_at": datetime(2026, 9, 21, 11, 59, 0, tzinfo=UTC),
+                "first_seen_at": datetime(2026, 9, 21, 12, 0, 10, tzinfo=UTC),
+            },
+            {
+                "order_id": "m-a",
+                "token_id": _FIRST_SEEN_TOKEN,
+                "condition_id": _FIRST_SEEN_CONDITION,
+                "price": Decimal("0.30"),
+                "remaining": Decimal("2000"),
+                "created_at": datetime(2026, 9, 21, 11, 59, 30, tzinfo=UTC),
+                "first_seen_at": datetime(2026, 9, 21, 12, 0, 0, tzinfo=UTC),
+            },
+        ],
+        now=now,
+    )
+    assert result["state"] == "registered"
+    episodes = store.lp_active_first_seen_episodes()
+    assert len(episodes) == 1
+    episode = episodes[0]
+    assert Decimal(str(episode["anchor_price"])) == Decimal("0.30")
+    assert episode["anchor_order_ids"] == ["m-a"]
+    assert Decimal(str(episode["baseline_front"])) == Decimal("8000")
+
+
+def test_first_seen_anchor_session_refusal_blocks_cancel_and_tick_survives(
+    tmp_path,
+) -> None:
+    """R1: n-leg 批次活动且锚 session 行不存在 → 连续 tick 不抛异常，episode
+    转 blocked 且一次性受阻通知（含原因）、fake exchange 零撤单，同 tick
+    #152 会话保护管线照常评估。"""
+    import sqlite3
+
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    notes: list[tuple[str, str, str]] = []
+
+    def collect(title: str, message: str, xiaoai_text: str) -> None:
+        notes.append((title, message, xiaoai_text))
+
+    anchor = _queue_receipt("m-1")
+    store, exchange, service = _first_seen_running_service(
+        tmp_path, now, episode_id="ep-r1", level_total="4000",
+        open_orders=[anchor], notifier=collect,
+    )
+    # 同一服务上并开一段 #152 会话，验证首见评估受阻之后同 tick 的会话
+    # 管线照常执行（运行时快照与首见账户读是两条独立夹具通道）。
+    exchange.snapshot_value = _queue_runtime_snapshot(
+        now, bid_size="10000", orders=[_queue_receipt("order-1")]
+    )
+    request = {**_request(now), "quantity": Decimal("2000")}
+    preview = service.preview(request)
+    started = service.start(str(preview["preview_id"]), "lp-first-seen-r1")
+    assert started["state"] == "entry_open"
+
+    # n-leg 批次活动；manual 锚 session 行从未创建（登记走 episode 表）。
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "INSERT INTO n_leg_controls(singleton, mode, breaker_open,"
+            " active_batch_id, total_unsettled_capital_units, updated_at)"
+            " VALUES (1, 'MANUAL', 0, 'batch-r1', 0, '2026-09-21T12:00:00Z')"
+            " ON CONFLICT(singleton) DO UPDATE SET active_batch_id='batch-r1'"
+        )
+
+    first = service.tick()
+    episode = store.lp_first_seen_episode("ep-r1")
+    assert episode is not None
+    assert episode["state"] == "blocked"
+    assert "anchor_session_failed" in episode["reason_codes"]
+    assert episode["blocked_notified"] is True
+    assert exchange.cancels == []
+    assert len(notes) == 1
+    assert "首见基线" in notes[0][0]
+    assert "锚点审计会话创建失败" in notes[0][1]
+    assert "active_n_leg_batch" in notes[0][1]
+    # 同 tick：排在首见保护之后的 #152 会话保护管线照常执行。
+    assert first["queue_protection"]["state"] == "monitoring"
+
+    # 连续 tick：不抛异常、不撤单、blocked 期间不重复通知。
+    exchange.books[_FIRST_SEEN_TOKEN]["bids"][0]["size"] = Decimal("10000")
+    for _ in range(2):
+        again = service.tick()
+        assert again["queue_protection"]["state"] == "monitoring"
+        assert store.lp_first_seen_episode("ep-r1") is not None
+        assert exchange.cancels == []
+        assert len(notes) == 1

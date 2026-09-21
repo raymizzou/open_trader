@@ -792,6 +792,20 @@ class PredictionArbitrageStore:
             CREATE INDEX IF NOT EXISTS lp_actions_session
             ON lp_actions(session_id, created_at, action_id);
 
+            CREATE TABLE IF NOT EXISTS lp_first_seen_episodes (
+                episode_id TEXT PRIMARY KEY,
+                token_id TEXT NOT NULL,
+                condition_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS one_active_first_seen_episode
+            ON lp_first_seen_episodes(token_id)
+            WHERE state IN ('monitoring', 'canceling', 'blocked');
+
             CREATE TABLE IF NOT EXISTS lp_book_samples (
                 condition_id TEXT NOT NULL,
                 token_id TEXT NOT NULL,
@@ -958,6 +972,12 @@ class PredictionArbitrageStore:
             connection.execute("DROP TABLE IF EXISTS runtime")
             connection.execute("PRAGMA user_version=14")
             version = 14
+        if version < 15:
+            # Issue #159: first-seen baseline protection episodes for
+            # web-manual BUYs (expand-only; the table itself is CREATE IF NOT
+            # EXISTS above).
+            connection.execute("PRAGMA user_version=15")
+            version = 15
 
     @staticmethod
     def _execution_fields(row: sqlite3.Row) -> dict[str, object]:
@@ -4451,6 +4471,118 @@ class PredictionArbitrageStore:
             ).fetchone()
             assert updated is not None
             return self._lp_row_result(updated)
+
+    @staticmethod
+    def _lp_first_seen_row_result(row: sqlite3.Row) -> dict[str, object]:
+        payload = _load_payload(str(row["payload"]))
+        payload.update(
+            {
+                "episode_id": str(row["episode_id"]),
+                "token_id": str(row["token_id"]),
+                "condition_id": str(row["condition_id"]),
+                "state": str(row["state"]),
+                "created_at": str(row["created_at"]),
+                "updated_at": str(row["updated_at"]),
+            }
+        )
+        return payload
+
+    def lp_create_first_seen_episode(
+        self,
+        episode_id: str,
+        *,
+        token_id: str,
+        condition_id: str,
+        state: str,
+        payload: Mapping[str, object],
+    ) -> dict[str, object]:
+        encoded = _dump_execution_payload(payload)
+        now = _utc_now()
+        with self._transaction() as connection:
+            try:
+                connection.execute(
+                    "INSERT INTO lp_first_seen_episodes(episode_id,token_id,condition_id,state,payload,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+                    (
+                        str(episode_id),
+                        str(token_id),
+                        str(condition_id),
+                        str(state),
+                        encoded,
+                        now,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                if "one_active_first_seen_episode" in str(exc):
+                    raise ValueError("active_first_seen_episode") from exc
+                raise
+            row = connection.execute(
+                "SELECT * FROM lp_first_seen_episodes WHERE episode_id=?",
+                (str(episode_id),),
+            ).fetchone()
+            assert row is not None
+            return self._lp_first_seen_row_result(row)
+
+    def lp_active_first_seen_episodes(self) -> list[dict[str, object]]:
+        """Return every first-seen episode in the active domain, per token."""
+
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM lp_first_seen_episodes
+                WHERE state IN ('monitoring','canceling','blocked')
+                ORDER BY created_at, episode_id
+                """
+            ).fetchall()
+        return [self._lp_first_seen_row_result(row) for row in rows]
+
+    def lp_first_seen_episode(self, episode_id: str) -> dict[str, object] | None:
+        """Return one first-seen episode by id, terminal states included."""
+
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM lp_first_seen_episodes WHERE episode_id=?",
+                (str(episode_id),),
+            ).fetchone()
+        return None if row is None else self._lp_first_seen_row_result(row)
+
+    def lp_update_first_seen_episode(
+        self,
+        episode_id: str,
+        *,
+        state: str | None = None,
+        patch: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        now = _utc_now()
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM lp_first_seen_episodes WHERE episode_id=?",
+                (str(episode_id),),
+            ).fetchone()
+            if row is None:
+                raise ValueError("lp_first_seen_episode_not_found")
+            payload = _load_payload(str(row["payload"]))
+            if patch:
+                payload.update(patch)
+            next_state = str(state or row["state"])
+            # The payload doubles as the projected UI summary, so the column
+            # state and payload["state"] always travel together.
+            payload["state"] = next_state
+            connection.execute(
+                "UPDATE lp_first_seen_episodes SET state=?,payload=?,updated_at=? WHERE episode_id=?",
+                (
+                    next_state,
+                    _dump_execution_payload(payload),
+                    now,
+                    str(episode_id),
+                ),
+            )
+            updated = connection.execute(
+                "SELECT * FROM lp_first_seen_episodes WHERE episode_id=?",
+                (str(episode_id),),
+            ).fetchone()
+            assert updated is not None
+            return self._lp_first_seen_row_result(updated)
 
     def lp_upsert_action(
         self,

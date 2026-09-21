@@ -33,6 +33,7 @@ from .polymarket_lp_risk import (
     estimate_lp_queue_position,
     estimate_lp_target_share_yield,
     evaluate_lp_entry,
+    first_observation_baseline,
 )
 from .prediction_arbitrage_store import (
     LP_RESERVED_MANUAL_SESSION_ID,
@@ -144,6 +145,32 @@ def _iso(moment: datetime) -> str:
     return moment.astimezone(UTC).isoformat(timespec="microseconds").replace(
         "+00:00", "Z"
     )
+
+
+def _first_seen_stamp_key(value: object) -> float:
+    """Anchor tie-break sort key: venue stamps ascend, missing stamps last."""
+
+    stamp = value if isinstance(value, datetime) else None
+    if stamp is None:
+        return float("inf")
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=UTC)
+    return stamp.timestamp()
+
+
+def _first_seen_stamp_value(value: object, *, default: datetime) -> datetime:
+    """Parse a first-seen stamp, accepting ISO strings and datetimes."""
+
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    text = str(value or "").strip()
+    if text:
+        try:
+            stamp = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            return stamp if stamp.tzinfo is not None else stamp.replace(tzinfo=UTC)
+        except ValueError:
+            pass
+    return default
 
 
 def _queue_decimal_text(value: Decimal | None) -> str:
@@ -6638,6 +6665,192 @@ class PolymarketLPService:
             "best_ask_size": ask_size,
         }
 
+    def _first_seen_book_sample(
+        self,
+        *,
+        condition_id: str,
+        token_id: str,
+        book: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        """Build one BBO receipt row for a first-seen registration."""
+
+        if book.get("received_at") is None:
+            return None
+        try:
+            received_at = _timestamp(book.get("received_at"), name="book_received_at")
+            bids = self._levels(book.get("bids"), "bids")
+            asks = self._levels(book.get("asks"), "asks")
+        except ValueError:
+            return None
+        if not bids or not asks:
+            return None
+        bid_price, bid_size = max(bids, key=lambda level: level[0])
+        ask_price, ask_size = min(asks, key=lambda level: level[0])
+        return {
+            "condition_id": condition_id,
+            "token_id": token_id,
+            "received_at": received_at,
+            "source_timestamp": book.get("source_timestamp"),
+            "best_bid_price": bid_price,
+            "best_bid_size": bid_size,
+            "best_ask_price": ask_price,
+            "best_ask_size": ask_size,
+        }
+
+    def register_first_seen_candidates(
+        self, rows: object, *, now: datetime
+    ) -> dict[str, object]:
+        """Register first-seen baseline episodes for web-manual BUYs (issue 159).
+
+        ``rows`` are one token's newly diff-detected own BUY rows (order id,
+        price, remaining, venue created_at, first-seen stamp).  The anchor is
+        the earliest first-seen BUY (ties by venue created_at, then order
+        id); the anchor price's book level minus the own remaining at that
+        price becomes the fallback baseline.  A book that cannot be read or
+        a baseline that cannot be resolved fails the registration so the
+        caller keeps the candidates pending — there is deliberately no time
+        limit on that retry.
+        """
+
+        candidates = [row for row in _items(rows) if isinstance(row, Mapping)]
+        if not candidates:
+            return {"state": "skipped", "reason": "no_candidates"}
+        token_id = str(candidates[0].get("token_id") or "").strip()
+        condition_id = str(candidates[0].get("condition_id") or "").strip()
+        if not token_id or not condition_id:
+            return {"state": "skipped", "reason": "identity_unknown"}
+        if any(
+            str(row.get("token_id") or "").strip() != token_id for row in candidates
+        ):
+            return {"state": "skipped", "reason": "mixed_tokens"}
+        with self._mutex:
+            for episode in self.store.lp_active_first_seen_episodes():
+                if str(episode.get("token_id") or "") == token_id:
+                    return {"state": "skipped", "reason": "episode_exists"}
+            ordered = sorted(
+                candidates,
+                key=lambda row: (
+                    _first_seen_stamp_key(row.get("first_seen_at")),
+                    _first_seen_stamp_key(row.get("created_at")),
+                    str(row.get("order_id") or ""),
+                ),
+            )
+            anchor = ordered[0]
+            anchor_price = _maybe_decimal(anchor.get("price"))
+            if anchor_price is None:
+                return {
+                    "state": "registration_failed",
+                    "reason_codes": ["price_unknown"],
+                    "token_id": token_id,
+                }
+            level_rows = [
+                row
+                for row in ordered
+                if _maybe_decimal(row.get("price")) == anchor_price
+            ]
+            own_remaining = Decimal("0")
+            for row in level_rows:
+                remaining = _maybe_decimal(row.get("remaining"))
+                if remaining is None:
+                    own_remaining = None
+                    break
+                own_remaining += remaining
+            book = self._read_first_seen_book(token_id)
+            baseline = first_observation_baseline(
+                book,
+                price=anchor_price,
+                own_remaining=own_remaining,
+            )
+            if baseline["state"] != "known":
+                return {
+                    "state": "registration_failed",
+                    "reason_codes": list(baseline["reason_codes"]),
+                    "token_id": token_id,
+                }
+            anchor_order_ids = [
+                str(row.get("order_id") or "") for row in level_rows
+            ]
+            anchor_order_ids = [order_id for order_id in anchor_order_ids if order_id]
+            first_seen_at = _first_seen_stamp_value(
+                anchor.get("first_seen_at"), default=now
+            )
+            received_at = _timestamp(
+                baseline["baseline_book_received_at"], name="book_received_at"
+            )
+            registration_delay = (received_at - first_seen_at).total_seconds()
+            episode_id = uuid.uuid4().hex
+            payload: dict[str, object] = {
+                "token_id": token_id,
+                "condition_id": condition_id,
+                "anchor_order_ids": anchor_order_ids,
+                "anchor_price": str(anchor_price),
+                "baseline_front": baseline["baseline_front"],
+                "baseline_price": baseline["baseline_price"],
+                "baseline_book_received_at": baseline["baseline_book_received_at"],
+                "baseline_book_hash": baseline["baseline_book_hash"],
+                "baseline_source": "first_observation",
+                "baseline_version": 1,
+                "threshold": LP_QUEUE_PROTECTION_THRESHOLD,
+                "first_seen_at": _iso(first_seen_at),
+                "registration_delay": registration_delay,
+                "data_failures": 0,
+                "state": "monitoring",
+                "notification_sent": False,
+                "blocked_notified": False,
+                "cancel_scope": "own_buys_at_level",
+                "cancel_targets": [],
+                "canceled_order_ids": [],
+                "cancel_target_remaining": {},
+                "canceled_remaining": None,
+                "partially_filled_quantity": None,
+                "cancel_requested_at": None,
+                "cancel_reason": None,
+                "reason_codes": [],
+            }
+            episode = self.store.lp_create_first_seen_episode(
+                episode_id,
+                token_id=token_id,
+                condition_id=condition_id,
+                state="monitoring",
+                payload=payload,
+            )
+            recorder = getattr(self.store, "lp_record_book_samples", None)
+            if callable(recorder):
+                sample = self._first_seen_book_sample(
+                    condition_id=condition_id, token_id=token_id, book=book
+                )
+                if sample is not None:
+                    try:
+                        recorder([sample], now=now)
+                    except Exception:
+                        pass
+            return {
+                "state": "registered",
+                "episode_id": episode_id,
+                "episode": episode,
+                "token_id": token_id,
+                "anchor_price": str(anchor_price),
+                "baseline_front": baseline["baseline_front"],
+            }
+
+    def _read_first_seen_book(self, token_id: str) -> Mapping[str, object] | None:
+        """Read one token's book through the bounded SDK batch adapter."""
+
+        books_reader = getattr(self.exchange, "lp_order_books", None)
+        if not callable(books_reader):
+            return None
+        try:
+            try:
+                raw_books = books_reader((token_id,), stop_event=None)
+            except TypeError:
+                raw_books = books_reader((token_id,))
+        except Exception:
+            return None
+        if not isinstance(raw_books, Mapping):
+            return None
+        book = raw_books.get(token_id)
+        return book if isinstance(book, Mapping) else None
+
     def start(
         self,
         preview_id: str,
@@ -7661,6 +7874,11 @@ class PolymarketLPService:
         """Run one deterministic monitoring/reconciliation iteration."""
 
         with self._mutex:
+            # Issue 159: first-seen fallback protections for web-manual BUYs
+            # run inside the same one-second tick, serially per episode,
+            # before the LP session pipeline — including when no session is
+            # active at all.
+            self._apply_first_seen_protections()
             session = self.store.lp_active_session()
             if session is None:
                 return {"state": "none", "session_id": None}
@@ -8234,6 +8452,8 @@ class PolymarketLPService:
         canceled_count: int,
         manual_count: int,
         canceled_remaining: Decimal | None,
+        title: str = "LP 位置保护撤单",
+        trigger_prefix: str = "",
     ) -> tuple[str, str, str]:
         ratio = _maybe_decimal(protection.get("ratio"))
         if str(protection.get("cancel_reason") or "") == "book_unreliable":
@@ -8256,7 +8476,7 @@ class PolymarketLPService:
         price = _maybe_decimal(protection.get("baseline_price"))
         message = (
             f"市场：{self._queue_protection_market_title(session)}。\n"
-            f"触发：{trigger}，已撤 {canceled_count} 张买单"
+            f"触发：{trigger_prefix}{trigger}，已撤 {canceled_count} 张买单"
             f"合计余量 {_queue_decimal_text(canceled_remaining)} 份"
             f" @ {_queue_decimal_text(price)}"
             f"（含 {manual_count} 张手动）。\n"
@@ -8264,9 +8484,9 @@ class PolymarketLPService:
             f"{beijing_clock(protection.get('data_time'), seconds=True) or '未知'}。"
         )
         return (
-            "LP 位置保护撤单",
+            title,
             message,
-            f"LP 位置保护撤单，{canceled_count} 张买单已撤",
+            f"{title}，{canceled_count} 张买单已撤",
         )
 
     def _queue_protection_blocked_notification(
@@ -8275,17 +8495,20 @@ class PolymarketLPService:
         session: Mapping[str, object],
         failure_reason: str,
         remaining: Decimal | None,
+        *,
+        title: str = "LP 位置保护撤单受阻",
+        trigger_prefix: str = "",
     ) -> tuple[str, str, str]:
         ratio = _maybe_decimal(protection.get("ratio"))
         message = (
             f"市场：{self._queue_protection_market_title(session)}。\n"
-            f"触发：A 比例 {_queue_ratio_percent_text(ratio)}% ≤ 50%，"
+            f"触发：{trigger_prefix}A 比例 {_queue_ratio_percent_text(ratio)}% ≤ 50%，"
             f"撤单未成功：{failure_reason}，"
             f"残余 {_queue_decimal_text(remaining)} 份待处理。\n"
             f"数据时间：北京时间 "
             f"{beijing_clock(protection.get('data_time'), seconds=True) or '未知'}。"
         )
-        return ("LP 位置保护撤单受阻", message, "LP 位置保护撤单受阻")
+        return (title, message, title)
 
     @staticmethod
     def _merge_order_id_lists(*groups: object) -> list[str]:
@@ -8676,6 +8899,670 @@ class PolymarketLPService:
         if result is not None:
             session = self.store.lp_update_session(session_id, patch=result)
         return session
+
+    # ---- Issue 159: first-seen baseline fallback protections ----
+
+    def _apply_first_seen_protections(self) -> None:
+        """Evaluate every active first-seen episode, serially per token.
+
+        Runs inside the existing one-second monitor tick under the service
+        mutex, even when no LP session is active: web-manual BUYs registered
+        by the dashboard's first-seen diff get the same protection loop as
+        the issue 152 submit-boundary episodes, with no added concurrency.
+        """
+
+        reader = getattr(self.store, "lp_active_first_seen_episodes", None)
+        if not callable(reader):
+            return
+        try:
+            episodes = reader()
+        except Exception:
+            return
+        for episode in episodes:
+            if not isinstance(episode, Mapping):
+                continue
+            if not str(episode.get("episode_id") or ""):
+                continue
+            self._apply_first_seen_protection(episode)
+
+    def _first_seen_rows_by_id(self) -> dict[str, object] | None:
+        """Open-order rows keyed by id from one fresh account read, or None."""
+
+        rows = self._queue_account_open_orders()
+        if rows is None:
+            return None
+        rows_by_id: dict[str, object] = {}
+        for row in rows:
+            order_id = self._order_id(row)
+            if order_id and order_id not in rows_by_id:
+                rows_by_id[order_id] = row
+        return rows_by_id
+
+    @staticmethod
+    def _first_seen_anchor_ids(episode: Mapping[str, object]) -> list[str]:
+        raw = episode.get("anchor_order_ids")
+        if isinstance(raw, Mapping) or not isinstance(raw, (list, tuple)):
+            return []
+        return [str(value) for value in raw if str(value or "")]
+
+    def _first_seen_anchors_all_terminal(
+        self,
+        rows_by_id: dict[str, object] | None,
+        episode: Mapping[str, object],
+    ) -> bool:
+        """True when every registered anchor is gone from every read path.
+
+        A missing row means the order no longer rests anywhere open; a row
+        without a readable status cannot prove terminality and keeps the
+        episode alive.
+        """
+
+        anchor_ids = self._first_seen_anchor_ids(episode)
+        if not anchor_ids:
+            return False
+        for order_id in anchor_ids:
+            row = rows_by_id.get(order_id) if rows_by_id is not None else None
+            if row is None:
+                continue
+            status = str(_field(row, "status", "") or "").upper()
+            if not status:
+                return False
+            if status not in TERMINAL_ORDER_STATES:
+                return False
+        return True
+
+    def _first_seen_gate_open(
+        self,
+        episode: Mapping[str, object],
+        rows_by_id: dict[str, object] | None,
+    ) -> bool:
+        """Issue 159 gate, mirroring ``_queue_protection_gate_open``: at
+        least one registered anchor alive, cancel not yet requested, and no
+        anchor has taken a fill."""
+
+        if episode.get("cancel_requested_at"):
+            return False
+        anchor_ids = self._first_seen_anchor_ids(episode)
+        if not anchor_ids:
+            return False
+        for order_id in anchor_ids:
+            row = rows_by_id.get(order_id) if rows_by_id is not None else None
+            if row is None:
+                continue
+            status = str(_field(row, "status", "") or "").upper()
+            if status and status in TERMINAL_ORDER_STATES:
+                continue
+            matched = _maybe_decimal(_field(row, "size_matched"))
+            if matched is not None and matched > 0:
+                continue
+            return True
+        return False
+
+    def _own_queue_remaining_rows(
+        self,
+        rows_by_id: Mapping[str, object],
+        *,
+        token_id: str,
+        price: Decimal,
+    ) -> Decimal | None:
+        """Sum remaining size of own open BUYs at one token and price.
+
+        Same poisoning rule as ``_own_queue_remaining``: any participating
+        row without a parseable remaining poisons the total to None.
+        """
+
+        total = Decimal("0")
+        for row in rows_by_id.values():
+            row_token = _field(row, "token_id", _field(row, "asset_id"))
+            if row_token not in (None, "", token_id):
+                continue
+            if str(_field(row, "side", "")).upper() != "BUY":
+                continue
+            if _maybe_decimal(_field(row, "price")) != price:
+                continue
+            if str(_field(row, "status", "")).upper() in TERMINAL_ORDER_STATES:
+                continue
+            remaining = self._queue_row_remaining(row)
+            if remaining is None:
+                return None
+            total += remaining
+        return total
+
+    def _first_seen_book(
+        self, token_id: str
+    ) -> tuple[Mapping[str, object] | None, str | None]:
+        """Fresh single-token book read with snapshot freshness semantics.
+
+        Freshness is measured against a clock read taken after the book
+        arrives, so a book we just received is never "negative age" stale.
+        """
+
+        book = self._read_first_seen_book(token_id)
+        if book is None or book.get("received_at") is None:
+            return None, "book_unknown"
+        try:
+            _freshness(
+                book.get("received_at"),
+                self._now(),
+                "book_freshness",
+                max_age=BOOK_FRESHNESS_SECONDS,
+            )
+        except ValueError:
+            return None, "book_freshness_unknown"
+        return book, None
+
+    def _first_seen_data_failure(
+        self,
+        episode: Mapping[str, object],
+        reason: str,
+        *,
+        gate_open: bool,
+    ) -> dict[str, object] | None:
+        """Increment the durable outage counter, mirroring issue 152."""
+
+        if reason not in _QUEUE_DATA_FAILURE_REASONS:
+            return None
+        if str(episode.get("state")) in {"canceling", "canceled", "partially_filled"}:
+            return None
+        updated = dict(episode)
+        if not gate_open:
+            # The episode no longer protects a live anchor: an outage streak
+            # is irrelevant and resets instead of accumulating.
+            updated["data_failures"] = 0
+            return updated
+        failures = _maybe_decimal(updated.get("data_failures")) or Decimal("0")
+        updated["data_failures"] = failures + 1
+        return updated
+
+    def _conservative_first_seen_cancel(
+        self,
+        episode: Mapping[str, object],
+        failures: dict[str, object] | None,
+        *,
+        gate_open: bool,
+    ) -> dict[str, object] | None:
+        """Cancel the protected anchors after ten data outages (issue 159)."""
+
+        if failures is None:
+            return None
+        count = _maybe_decimal(failures.get("data_failures")) or Decimal("0")
+        if count < LP_PROTECTION_DATA_FAILURE_LIMIT:
+            return None
+        if not gate_open:
+            return None
+        return self._request_first_seen_protection_cancel(
+            episode, None, reason="book_unreliable"
+        )
+
+    def _apply_first_seen_protection(self, episode: Mapping[str, object]) -> None:
+        """Run one episode's evaluate/converge/cancel step and persist it."""
+
+        episode_id = str(episode["episode_id"])
+        state = str(episode.get("state") or "")
+        rows_by_id = self._first_seen_rows_by_id()
+
+        if state == "canceling":
+            converged = self._converge_first_seen_protection(episode, rows_by_id)
+            if converged is not None:
+                self.store.lp_update_first_seen_episode(
+                    episode_id,
+                    state=str(converged.get("state")),
+                    patch=converged,
+                )
+                return
+            failed = [
+                str(value)
+                for value in _items(episode.get("cancel_failed"))
+                if str(value or "")
+            ]
+            if failed and rows_by_id is not None:
+                result = self._request_first_seen_protection_cancel(
+                    episode,
+                    rows_by_id,
+                    reason=str(episode.get("cancel_reason") or "queue_ahead_ratio"),
+                    only_order_ids=failed,
+                )
+                if result is not None:
+                    self.store.lp_update_first_seen_episode(
+                        episode_id,
+                        state=str(result.get("state")),
+                        patch=result,
+                    )
+            return
+
+        if rows_by_id is None:
+            # The account read failed: the observation is a data outage and
+            # the anchors cannot be proven dead, so the gate stays open.
+            failures = self._first_seen_data_failure(
+                episode, "external_snapshot_unknown", gate_open=True
+            )
+            conservative = self._conservative_first_seen_cancel(
+                episode, failures, gate_open=True
+            )
+            if conservative is not None:
+                self.store.lp_update_first_seen_episode(
+                    episode_id,
+                    state=str(conservative.get("state")),
+                    patch=conservative,
+                )
+            elif failures is not None:
+                self.store.lp_update_first_seen_episode(
+                    episode_id, patch=failures
+                )
+            return
+
+        if self._first_seen_anchors_all_terminal(rows_by_id, episode):
+            # Every anchor reached a terminal state on its own: the episode
+            # ends and the token's remaining orders return to position
+            # unknown (no chaining, no re-anchoring).
+            self.store.lp_update_first_seen_episode(
+                episode_id, state="terminal"
+            )
+            return
+
+        gate_open = self._first_seen_gate_open(episode, rows_by_id)
+        token_id = str(episode.get("token_id") or "")
+        anchor_price = _maybe_decimal(episode.get("anchor_price"))
+        if anchor_price is None:
+            return
+        book, reason = self._first_seen_book(token_id)
+        if reason is not None:
+            failures = self._first_seen_data_failure(
+                episode, reason, gate_open=gate_open
+            )
+            conservative = self._conservative_first_seen_cancel(
+                episode, failures, gate_open=gate_open
+            )
+            if conservative is not None:
+                self.store.lp_update_first_seen_episode(
+                    episode_id,
+                    state=str(conservative.get("state")),
+                    patch=conservative,
+                )
+            elif failures is not None:
+                self.store.lp_update_first_seen_episode(
+                    episode_id, patch=failures
+                )
+            return
+        if not gate_open:
+            # Nothing protectable and the data is healthy: no write, exactly
+            # like the issue 152 evaluation returning None.
+            return
+
+        own_remaining = self._own_queue_remaining_rows(
+            rows_by_id, token_id=token_id, price=anchor_price
+        )
+        estimate = estimate_lp_queue_position(
+            book,
+            price=anchor_price,
+            own_remaining=own_remaining,
+            baseline_front=_maybe_decimal(episode.get("baseline_front"))
+            or Decimal("0"),
+            threshold=_maybe_decimal(episode.get("threshold"))
+            or LP_QUEUE_PROTECTION_THRESHOLD,
+            condition_id=str(episode.get("condition_id") or "") or None,
+            token_id=token_id or None,
+        )
+        updated = dict(episode)
+        updated.update(
+            {
+                "state": estimate["state"],
+                "front_estimate": estimate["front_estimate"],
+                "level_total": estimate["level_total"],
+                "ratio": estimate["ratio"],
+                "reason_codes": estimate["reason_codes"],
+                "data_time": estimate["data_time"],
+            }
+        )
+        if estimate["state"] != "unknown":
+            updated["data_failures"] = 0
+            if (
+                str(episode.get("state")) == "blocked"
+                and updated.get("blocked_notified") is True
+            ):
+                # blocked → recovered: re-arm the one-shot block notice so a
+                # later block notifies again.
+                updated["blocked_notified"] = False
+        # The column state stays in the episode lifecycle domain; an
+        # UNKNOWN estimate keeps the episode monitoring with reason codes.
+        next_state = (
+            "monitoring"
+            if estimate["state"] in {"monitoring", "unknown", "triggered"}
+            else str(estimate["state"])
+        )
+        episode = self.store.lp_update_first_seen_episode(
+            episode_id, state=next_state, patch=updated
+        )
+        if estimate["state"] != "triggered":
+            return
+        result = self._request_first_seen_protection_cancel(
+            episode, rows_by_id, reason="queue_ahead_ratio"
+        )
+        if result is not None:
+            self.store.lp_update_first_seen_episode(
+                episode_id, state=str(result.get("state")), patch=result
+            )
+
+    def _blocked_first_seen_cancel(
+        self,
+        episode: Mapping[str, object],
+        protection: dict[str, object],
+        reason_code: str,
+        failure_reason: str,
+        remaining: Decimal | None,
+    ) -> dict[str, object]:
+        codes = list(protection.get("reason_codes") or [])
+        if reason_code not in codes:
+            codes.append(reason_code)
+        protection["state"] = "blocked"
+        protection["reason_codes"] = codes
+        if protection.get("blocked_notified") is not True:
+            title, message, xiaoai = self._queue_protection_blocked_notification(
+                protection,
+                episode,
+                failure_reason,
+                remaining,
+                title="LP 位置保护撤单受阻（首见基线）",
+                trigger_prefix="首见基线 · ",
+            )
+            self._notify_protection(title, message, xiaoai)
+            protection["blocked_notified"] = True
+        return protection
+
+    def _converge_first_seen_protection(
+        self,
+        episode: Mapping[str, object],
+        rows_by_id: dict[str, object] | None,
+    ) -> dict[str, object] | None:
+        """Settle a canceling episode from fresh open-order reads (issue 159)."""
+
+        if str(episode.get("state")) != "canceling":
+            return None
+        targets = [
+            str(value)
+            for value in _items(episode.get("cancel_targets"))
+            if str(value or "")
+        ]
+        if not targets or rows_by_id is None:
+            return None
+        filled = Decimal("0")
+        receipt_canceled: list[str] = []
+        for order_id in targets:
+            row = rows_by_id.get(order_id)
+            if row is None:
+                # No resting row anywhere: the order is no longer open on
+                # any read path, i.e. canceled.
+                receipt_canceled.append(order_id)
+                continue
+            status = str(_field(row, "status", "") or "").upper()
+            if not status:
+                return None
+            if status not in TERMINAL_ORDER_STATES:
+                return None
+            if status in {"CANCELED", "CANCELLED"}:
+                receipt_canceled.append(order_id)
+            matched = _maybe_decimal(_field(row, "size_matched"))
+            if matched is not None and matched > 0:
+                filled += matched
+        updated = dict(episode)
+        if filled > 0:
+            updated["state"] = "partially_filled"
+            updated["partially_filled_quantity"] = filled
+        else:
+            updated["state"] = "canceled"
+        if updated.get("notification_sent") is not True:
+            canceled = self._merge_order_id_lists(
+                updated.get("canceled_order_ids"), receipt_canceled
+            )
+            updated["canceled_order_ids"] = canceled
+            updated["canceled_remaining"] = self._episode_canceled_remaining(
+                updated.get("cancel_target_remaining"), canceled
+            )
+            # Every first-seen target is a manual web order.
+            manual_count = len(canceled)
+            title, message, xiaoai = self._queue_protection_success_notification(
+                updated,
+                episode,
+                canceled_count=len(canceled) or len(targets),
+                manual_count=manual_count,
+                canceled_remaining=_maybe_decimal(
+                    updated.get("canceled_remaining")
+                ),
+                title="LP 位置保护撤单（首见基线）",
+                trigger_prefix="首见基线 · ",
+            )
+            self._notify_protection(title, message, xiaoai)
+            updated["notification_sent"] = True
+        return updated
+
+    def _request_first_seen_protection_cancel(
+        self,
+        episode: Mapping[str, object],
+        rows_by_id: dict[str, object] | None,
+        *,
+        reason: str = "queue_ahead_ratio",
+        only_order_ids: list[str] | None = None,
+    ) -> dict[str, object] | None:
+        """Cancel every own BUY resting at the first-seen anchor price.
+
+        Deliberately not routed through the manual cancel audit pipeline;
+        the episode records its own durable per-target actions instead.
+        """
+
+        episode_id = str(episode.get("episode_id") or "")
+        token_id = str(episode.get("token_id") or "")
+        anchor_price = _maybe_decimal(episode.get("anchor_price"))
+        if not episode_id or anchor_price is None:
+            return None
+        updated = dict(episode)
+
+        if rows_by_id is None:
+            # Data-unreliable path: enumerate targets from one fresh
+            # account read; a failed read blocks this tick and retries.
+            rows_by_id = self._first_seen_rows_by_id()
+            if rows_by_id is None:
+                return self._blocked_first_seen_cancel(
+                    episode,
+                    updated,
+                    "account_read_failed",
+                    "账户读取失败",
+                    None,
+                )
+
+        # Identity re-check: every registered anchor receipt must still name
+        # a BUY on the episode's token before any cancel is sent.
+        anchor_set = set(self._first_seen_anchor_ids(episode))
+        for order_id, row in rows_by_id.items():
+            if order_id not in anchor_set:
+                continue
+            row_token = str(_field(row, "token_id", _field(row, "asset_id", "")) or "")
+            side = str(_field(row, "side", "")).upper()
+            if (side and side != "BUY") or (row_token and row_token != token_id):
+                return self._blocked_first_seen_cancel(
+                    episode, updated, "identity_conflict", "回执身份不符", None
+                )
+
+        if not self._mutation_allowed():
+            return self._blocked_first_seen_cancel(
+                episode, updated, "mutation_blocked", "撤单被熔断阻止", None
+            )
+
+        targets: list[str] = []
+        skipped: list[dict[str, object]] = []
+        for order_id in self._first_seen_anchor_ids(episode):
+            targets.append(order_id)
+        for order_id, row in rows_by_id.items():
+            if not order_id or order_id in anchor_set:
+                continue
+            row_token = str(_field(row, "token_id", _field(row, "asset_id", "")) or "")
+            if row_token and row_token != token_id:
+                continue
+            row_price = _maybe_decimal(_field(row, "price"))
+            if row_price is None:
+                skipped.append({"order_id": order_id, "reason": "identity_unknown"})
+                continue
+            if row_price != anchor_price:
+                continue
+            side = str(_field(row, "side", "")).upper()
+            if side != "BUY":
+                skipped.append({"order_id": order_id, "reason": "identity_mismatch"})
+                continue
+            if str(_field(row, "status", "")).upper() in TERMINAL_ORDER_STATES:
+                continue
+            targets.append(order_id)
+
+        if only_order_ids is not None:
+            retry = set(only_order_ids)
+            targets = [order_id for order_id in targets if order_id in retry]
+        # Within one protection episode the target set and the canceled set
+        # accumulate across retries (ordered union), so a retried batch can
+        # never overwrite the earlier episode state.
+        episode_targets = self._merge_order_id_lists(
+            episode.get("cancel_targets"), targets
+        )
+
+        # Persist every target's cancel-time remaining at request (intent)
+        # time; first write wins, unknown stays None, never 0.
+        persisted_remaining: dict[str, object] = {}
+        raw_remaining = episode.get("cancel_target_remaining")
+        if isinstance(raw_remaining, Mapping):
+            for key, value in raw_remaining.items():
+                order_id = str(key or "")
+                if order_id:
+                    persisted_remaining[order_id] = value
+        for order_id in targets:
+            if order_id in persisted_remaining:
+                continue
+            row = rows_by_id.get(order_id)
+            remaining = self._queue_row_remaining(row) if row is not None else None
+            persisted_remaining[order_id] = (
+                None if remaining is None else str(remaining)
+            )
+
+        # One durable action per target: intent first, then the cancel.
+        def action_payload(order_id: str) -> dict[str, object]:
+            return {
+                "role": "first-seen-protection-cancel",
+                "episode_id": episode_id,
+                "targets": [order_id],
+                "skipped": skipped,
+                "reason": reason,
+                "ratio": updated.get("ratio"),
+                "data_time": updated.get("data_time"),
+                "cancel_target_remaining": {
+                    order_id: persisted_remaining.get(order_id)
+                },
+            }
+
+        action_keys = {
+            order_id: f"{episode_id}:first-seen-protection-cancel:{order_id}"
+            for order_id in targets
+        }
+        # lp_actions rows reference lp_sessions; the reserved manual anchor
+        # session (state complete, never active) is created once so the FK
+        # holds for first-seen episode actions, mirroring the dashboard
+        # manual-cancel audit anchor.  Creation is best-effort: while an
+        # n-leg batch owns the insert gate (or the store is unavailable) the
+        # refusal must not escape into the tick — the episode blocks through
+        # the same one-shot path as every other cancel blocker instead of
+        # starving the monitor and the issue 152 session pipeline.
+        try:
+            self.store.lp_create_session(
+                LP_RESERVED_MANUAL_SESSION_ID,
+                LP_RESERVED_MANUAL_SESSION_ID,
+                state="complete",
+                payload={"context": "first_seen_protection_audit"},
+            )
+        except Exception as exc:
+            detail = str(exc).strip() or type(exc).__name__
+            return self._blocked_first_seen_cancel(
+                episode,
+                updated,
+                "anchor_session_failed",
+                f"锚点审计会话创建失败（{detail}）",
+                None,
+            )
+        for order_id in targets:
+            self.store.lp_upsert_action(
+                LP_RESERVED_MANUAL_SESSION_ID,
+                action_keys[order_id],
+                state="pending",
+                payload=action_payload(order_id),
+            )
+
+        canceled: list[str] = []
+        failed: list[str] = []
+        failure_error: str | None = None
+        for order_id in targets:
+            try:
+                if self._cancel_order(order_id):
+                    canceled.append(order_id)
+                else:
+                    failed.append(order_id)
+            except Exception as exc:
+                failed.append(order_id)
+                failure_error = type(exc).__name__
+
+        for order_id in targets:
+            receipt = action_payload(order_id)
+            if order_id in failed:
+                receipt["canceled"] = []
+                receipt["failed"] = [order_id]
+                receipt["error"] = failure_error or "cancel_not_acknowledged"
+                self.store.lp_upsert_action(
+                    LP_RESERVED_MANUAL_SESSION_ID,
+                    action_keys[order_id],
+                    state="pending",
+                    payload=receipt,
+                )
+            else:
+                receipt["canceled"] = [order_id]
+                receipt["failed"] = []
+                self.store.lp_upsert_action(
+                    LP_RESERVED_MANUAL_SESSION_ID,
+                    action_keys[order_id],
+                    state="accepted",
+                    payload=receipt,
+                )
+
+        # Cancel-time remaining is summed from the per-target values
+        # persisted at request time over every order in the episode's
+        # canceled set, never re-derived from post-cancel reads.
+        episode_canceled = self._merge_order_id_lists(
+            episode.get("canceled_order_ids"), canceled
+        )
+        episode_remaining = self._episode_canceled_remaining(
+            persisted_remaining, episode_canceled
+        )
+
+        updated["state"] = "canceling"
+        updated["cancel_reason"] = reason
+        updated["cancel_targets"] = episode_targets
+        updated["cancel_failed"] = failed
+        updated["cancel_target_remaining"] = persisted_remaining
+        updated["canceled_order_ids"] = episode_canceled
+        updated["canceled_remaining"] = episode_remaining
+        updated["cancel_requested_at"] = _iso(self._now())
+        if failed:
+            updated["cancel_failure"] = failure_error or "cancel_not_acknowledged"
+        canceled_set = set(episode_canceled)
+        episode_complete = bool(episode_targets) and all(
+            order_id in canceled_set for order_id in episode_targets
+        )
+        if episode_complete:
+            manual_count = len(episode_canceled)
+            title, message, xiaoai = self._queue_protection_success_notification(
+                updated,
+                episode,
+                canceled_count=len(episode_canceled),
+                manual_count=manual_count,
+                canceled_remaining=episode_remaining,
+                title="LP 位置保护撤单（首见基线）",
+                trigger_prefix="首见基线 · ",
+            )
+            self._notify_protection(title, message, xiaoai)
+            updated["notification_sent"] = True
+        return updated
 
     @staticmethod
     def _session_order_ids(session: Mapping[str, object]) -> list[str]:

@@ -1362,3 +1362,68 @@ def estimate_lp_queue_position(
         "reason_codes": [],
         "data_time": book.get("received_at"),
     }
+
+
+def first_observation_baseline(
+    book: object,
+    *,
+    price: Decimal,
+    own_remaining: Decimal | None,
+) -> dict[str, object]:
+    """Register the first-observation baseline for one web-manual BUY (issue 159).
+
+    The fallback baseline is the anchor price level's size at the moment the
+    system first observes the order, minus the order's own unfilled remainder
+    (the same "no own order at submit, so the level is all queue ahead"
+    semantics as issue 152).  A missing level, an unusable book, or an
+    unresolvable own remaining is an honest UNKNOWN — never a fabricated
+    zero baseline.
+    """
+
+    def unknown(reason: str) -> dict[str, object]:
+        mapping = book if isinstance(book, Mapping) else None
+        return {
+            "state": "unknown",
+            "reason_codes": [reason],
+            "baseline_front": None,
+            "baseline_price": price,
+            "baseline_book_received_at": (
+                mapping.get("received_at") if mapping else None
+            ),
+            "baseline_book_hash": mapping.get("hash") if mapping else None,
+        }
+
+    if not isinstance(book, Mapping) or book.get("received_at") is None:
+        return unknown("book_unknown")
+
+    # Level existence is judged on the raw rows so a level that only
+    # carries zero sizes stays distinguishable from a missing level.
+    level_exists = False
+    for row in _items(book.get("bids")):
+        row_price = _maybe_decimal(_field(row, "price"))
+        if row_price is not None and row_price == price:
+            level_exists = True
+            break
+    if not level_exists:
+        return unknown("book_level_missing")
+
+    try:
+        bids = _levels(book.get("bids"), "bids")
+    except ValueError:
+        return unknown("book_unknown")
+    level_total = sum(
+        (size for row_price, size in bids if row_price == price),
+        Decimal("0"),
+    )
+    if own_remaining is None:
+        return unknown("remaining_unknown")
+    if level_total <= 0 or own_remaining > level_total:
+        return unknown("data_inconsistent")
+    return {
+        "state": "known",
+        "reason_codes": [],
+        "baseline_front": level_total - own_remaining,
+        "baseline_price": price,
+        "baseline_book_received_at": book.get("received_at"),
+        "baseline_book_hash": book.get("hash"),
+    }

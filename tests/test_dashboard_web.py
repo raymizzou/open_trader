@@ -22025,3 +22025,95 @@ console.log(JSON.stringify({
         "noRoundStrings": True,
     }, rendered
 
+
+
+def test_lp_today_renders_first_seen_badge_and_source_chips() -> None:
+    """Issue 159(S/UI): 首见基线副行含「首见 · 估算假设」徽标与逐字 tooltip；
+    锚行 chip=「首见」、非锚行 chip=「手动」、登记基线 chip 保持「登记」。"""
+    output = run_dashboard_js(r'''
+const checkedAt = "2026-09-20T04:00:00Z";
+const dataTime = "2026-09-20T04:00:03Z";
+const row = (orderId, conditionId, extra) => ({
+  order_id: orderId, condition_id: conditionId, token_id: "token-" + orderId,
+  market_title: "First-seen market " + conditionId,
+  market_url: "https://polymarket.com/event/" + conditionId,
+  outcome: "YES", side: "BUY", status: "LIVE", price: "0.30",
+  quantity: "2000", filled_quantity: "0", remaining_quantity: "2000",
+  state: "open", management: "manual_read_only", read_only: true,
+  scoring_status: "true", anchor: false, ...extra,
+});
+const fsSummary = {
+  baseline_source: "first_observation", state: "monitoring",
+  threshold: "0.5", reason_codes: [], data_time: dataTime,
+  anchor_price: "0.30",
+  front_estimate: "8000", level_total: "10000", ratio: "0.8",
+};
+const submitSummary = {
+  baseline_source: "submit", state: "monitoring",
+  threshold: "0.5", reason_codes: [], data_time: dataTime,
+  front_estimate: "9000", level_total: "11000", ratio: "0.81",
+};
+const dashboard = {
+  state: "ready", stale: false, checked_at: checkedAt, last_success_at: checkedAt,
+  orders: [], positions: [],
+  lp_orders_today: [
+    row("m-1", "condition-fs", {anchor: true, queue_protection: fsSummary}),
+    row("m-2", "condition-fs", {queue_protection: fsSummary}),
+    row("entry-9", "condition-submit", {anchor: true, queue_protection: submitSummary}),
+  ],
+  non_lp_row_count: 0, market_rewards: [], lp_observations: {},
+};
+const html = predictionLpCard({lp_dashboard: dashboard});
+const orderTable = (html.match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
+const marketRow = (title) => {
+  const start = orderTable.indexOf(title);
+  const end = orderTable.indexOf("</tr>", start);
+  return orderTable.slice(start, end);
+};
+const fs = marketRow("First-seen market condition-fs");
+const pillIndex = fs.indexOf("位置保护 · 监控中");
+const badgeIndex = fs.indexOf("首见 · 估算假设");
+const dataIndex = fs.indexOf("qp-data");
+console.log(JSON.stringify({
+  badge: fs.includes("首见 · 估算假设"),
+  tooltipVerbatim: fs.includes("首见基线：以系统首次观察到该单时的盘口登记，通常滞后下单不超过一个观察周期（10 秒级）。滞后期间该价位新增挂单全部计入前方，前方估算偏高、触发偏晚，属兜底路径固有偏差。"),
+  badgeFocusable: fs.includes('class="qp-first-seen" tabindex="0"') && fs.includes('role="tooltip"'),
+  badgeBetweenPillAndData: pillIndex !== -1 && pillIndex < badgeIndex && badgeIndex < dataIndex,
+  dataTemplateUnchanged: fs.includes("前方≈8,000") && fs.includes("同价位 10,000")
+    && fs.includes("A 80%") && fs.includes("触发线 50%"),
+  anchorChipFirstSeen: fs.includes("src-chip first-seen") && fs.includes(">首见<"),
+  manualChipUnchanged: fs.includes(">手动<"),
+  registeredChipUnchanged: marketRow("First-seen market condition-submit")
+    .includes("src-chip registered") && orderTable.includes(">登记<"),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered == {
+        "badge": True,
+        "tooltipVerbatim": True,
+        "badgeFocusable": True,
+        "badgeBetweenPillAndData": True,
+        "dataTemplateUnchanged": True,
+        "anchorChipFirstSeen": True,
+        "manualChipUnchanged": True,
+        "registeredChipUnchanged": True,
+    }
+
+
+def test_lp_first_seen_styles_shipped() -> None:
+    """Issue 159(视觉): dashboard.css 携带首见 chip 与徽标样式。"""
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    assert ".src-chip.first-seen { border-color: #b9cbd8; background: #edf4f9; color: #2c5468; }" in css
+    for fragment in (
+        ".qp-first-seen {",
+        "border: 1px solid #b9cbd8;",
+        "border-radius: 999px;",
+        "color: #2c5468;",
+        "min-height: 20px;",
+        "position: relative;",
+        ".qp-first-seen-tip {",
+        "max-width: 300px;",
+        ".qp-first-seen:hover .qp-first-seen-tip,",
+        ".qp-first-seen:focus-visible .qp-first-seen-tip { display: block; }",
+    ):
+        assert fragment in css

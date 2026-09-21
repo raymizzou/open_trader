@@ -7599,3 +7599,447 @@ def test_lp_dashboard_projects_queue_protection_anchor_and_summary(
     assert status["queue_protection"]["cancel_scope"] == "own_buys_at_level"
     assert Decimal(str(status["queue_protection"]["ratio"])) == Decimal("0.8")
     assert status["queue_protection"]["front_estimate"] == "8000"
+
+
+# ---- Issue 159: 网页手动单首见基线兜底（diff 判新 D1-D4、会话并存 C1、并行 C2） ----
+
+
+class _FirstSeenTrading:
+    """Fake trading: authenticated account reads scripted per round."""
+
+    def __init__(
+        self,
+        rounds: list[list[dict[str, object]]],
+        *,
+        clock: list[datetime] | None = None,
+    ) -> None:
+        self.rounds = rounds
+        self.clock = clock
+        self.reads = 0
+        self.fail_next = False
+
+    def lp_account_snapshot(self) -> dict[str, object]:
+        if self.fail_next:
+            raise RuntimeError("lp_account_snapshot_unknown")
+        index = min(self.reads, len(self.rounds) - 1)
+        self.reads += 1
+        checked_at = (
+            self.clock[min(self.reads - 1, len(self.clock) - 1)]
+            if self.clock
+            else datetime.now(UTC)
+        )
+        return {
+            "authenticated": True,
+            "checked_at": checked_at,
+            "open_orders": list(self.rounds[index]),
+            "positions": [],
+        }
+
+
+class _FirstSeenBookExchange:
+    """Fake LP exchange adapter serving per-token books stamped at read time,
+    plus the account read and cancel primitive the protection runtime uses."""
+
+    def __init__(
+        self,
+        levels: dict[str, object],
+        *,
+        condition_by_token: dict[str, str] | None = None,
+    ) -> None:
+        self.levels = levels
+        self.condition_by_token = condition_by_token or {}
+        self.open_orders: list[dict[str, object]] = []
+        self.cancels: list[str] = []
+        self.reads = 0
+
+    def lp_account_snapshot(self) -> dict[str, object]:
+        return {
+            "authenticated": True,
+            "open_orders": list(self.open_orders),
+        }
+
+    def cancel_order(self, order_id: str) -> object:
+        self.cancels.append(order_id)
+        return {"canceled": [order_id], "status": "CANCELED"}
+
+    def lp_order_books(
+        self,
+        token_ids: object,
+        *,
+        stop_event: object = None,
+    ) -> dict[str, dict[str, object]]:
+        del stop_event
+        result: dict[str, dict[str, object]] = {}
+        for token_id in tuple(token_ids):  # type: ignore[arg-type]
+            total = self.levels.get(str(token_id))
+            if total is None:
+                continue
+            result[str(token_id)] = {
+                "condition_id": self.condition_by_token.get(
+                    str(token_id), "0xc1"
+                ),
+                "token_id": token_id,
+                "received_at": datetime.now(UTC),
+                "hash": f"book-hash-{self.reads}",
+                "bids": [{"price": Decimal("0.50"), "size": Decimal(str(total))}],
+                "asks": [{"price": Decimal("0.52"), "size": Decimal("100")}],
+            }
+        self.reads += 1
+        return result
+
+
+def _first_seen_service(
+    tmp_path: Path,
+    trading: _FirstSeenTrading,
+    levels: dict[str, object],
+    *,
+    condition_by_token: dict[str, str] | None = None,
+) -> tuple[PredictionExecutionService, PredictionArbitrageStore]:
+    store = PredictionArbitrageStore(tmp_path / "data")
+    service = PredictionExecutionService(
+        store=store,
+        monitor=object(),
+        trading=trading,
+        notifier=ChannelNotifier("feishu"),
+        lock_path=tmp_path / "first-seen.lock",
+    )
+    service._lp = PolymarketLPService(
+        store,
+        _FirstSeenBookExchange(levels, condition_by_token=condition_by_token),
+    )
+    # The scripted account rounds must not race scheduled background
+    # refresh threads for the dashboard lock: pin the refresh pipeline to
+    # this thread.
+    service._schedule_lp_reward_refresh = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    service._schedule_lp_orders_today_refresh = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    return service, store
+
+
+def _first_seen_open_order(
+    order_id: str,
+    token_id: str,
+    *,
+    condition_id: str = "0xc1",
+    side: str = "BUY",
+    status: str = "LIVE",
+    price: str = "0.50",
+    remaining: str = "2000",
+) -> dict[str, object]:
+    return {
+        "order_id": order_id,
+        "condition_id": condition_id,
+        "token_id": token_id,
+        "side": side,
+        "status": status,
+        "price": price,
+        "original_size": remaining,
+        "size_matched": "0",
+        "remaining_size": remaining,
+    }
+
+
+def test_first_seen_diff_registers_episode_with_baseline(tmp_path: Path) -> None:
+    """D1: 第 N 轮无该单、第 N+1 轮出现 BUY → episode 登记，payload 含
+    first_seen_at / baseline_source / received_at / hash；SELL 出现不登记。"""
+    token = "token-fs-d1"
+    trading = _FirstSeenTrading(
+        [
+            [],
+            [_first_seen_open_order("m-d1", token)],
+        ]
+    )
+    service, store = _first_seen_service(tmp_path, trading, {token: "10000"})
+
+    service.refresh_lp_dashboard_snapshot()
+    service.refresh_lp_dashboard_snapshot()
+
+    episodes = store.lp_active_first_seen_episodes()
+    assert len(episodes) == 1
+    episode = episodes[0]
+    assert episode["episode_id"]
+    assert episode["token_id"] == token
+    assert episode["condition_id"] == "0xc1"
+    assert episode["state"] == "monitoring"
+    assert episode["anchor_order_ids"] == ["m-d1"]
+    assert Decimal(str(episode["anchor_price"])) == Decimal("0.50")
+    assert episode["baseline_source"] == "first_observation"
+    assert episode["first_seen_at"]
+    assert episode["baseline_book_received_at"]
+    assert episode["baseline_book_hash"]
+    # 数字原点：总量 10,000 − 自己余量 2,000 = 前方 8,000。
+    assert Decimal(str(episode["baseline_front"])) == Decimal("8000")
+    assert Decimal(str(episode["threshold"])) == Decimal("0.5")
+
+
+def test_first_seen_sell_order_never_registers(tmp_path: Path) -> None:
+    """D1(续): 相邻两轮 diff 发现 SELL → 不登记。"""
+    token = "token-fs-sell"
+    trading = _FirstSeenTrading(
+        [
+            [],
+            [_first_seen_open_order("s-d1", token, side="SELL", remaining="100")],
+        ]
+    )
+    service, store = _first_seen_service(tmp_path, trading, {token: "10000"})
+
+    service.refresh_lp_dashboard_snapshot()
+    service.refresh_lp_dashboard_snapshot()
+
+    assert store.lp_active_first_seen_episodes() == []
+
+
+def test_first_seen_first_round_builds_baseline_and_survives_restart(
+    tmp_path: Path,
+) -> None:
+    """D2: 启动首轮看到既有 BUY → 全部位置未知、零登记；同 store 重建服务后
+    活动 episode 照常评估（重启语义）。"""
+    token = "token-fs-d2"
+    buy = _first_seen_open_order("m-d2", token)
+
+    trading = _FirstSeenTrading([[], [buy]])
+    service, store = _first_seen_service(tmp_path, trading, {token: "10000"})
+    service.refresh_lp_dashboard_snapshot()
+    service.refresh_lp_dashboard_snapshot()
+    assert len(store.lp_active_first_seen_episodes()) == 1
+
+    # 同 store 重建执行服务与 LP 服务：首轮照旧只建底（不重复登记），
+    # 已持久化的活动 episode 由 LP tick 照常评估。
+    restarted = PredictionExecutionService(
+        store=store,
+        monitor=object(),
+        trading=_FirstSeenTrading([[buy]]),
+        notifier=ChannelNotifier("feishu"),
+        lock_path=tmp_path / "first-seen-restart.lock",
+    )
+    books = _FirstSeenBookExchange({token: "10000"})
+    books.open_orders = [buy]
+    lp_restarted = PolymarketLPService(store, books)
+    restarted._lp = lp_restarted
+
+    restarted.refresh_lp_dashboard_snapshot()
+    episodes = store.lp_active_first_seen_episodes()
+    assert len(episodes) == 1
+
+    lp_restarted.tick()
+    evaluated = store.lp_active_first_seen_episodes()
+    assert len(evaluated) == 1
+    protection = evaluated[0]
+    assert protection["state"] == "monitoring"
+    assert Decimal(str(protection["level_total"])) == Decimal("10000")
+    assert Decimal(str(protection["front_estimate"])) == Decimal("8000")
+    assert Decimal(str(protection["ratio"])) == Decimal("0.80")
+
+
+def test_first_seen_observation_gap_rebuilds_baseline_only(tmp_path: Path) -> None:
+    """D3: 距上一轮成功观察 > 30s → 本轮出现的 BUY 不登记、永久位置未知；
+    30s 内 → 正常登记。"""
+    token = "token-fs-d3"
+    buy = _first_seen_open_order("m-d3", token)
+    t0 = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+
+    # 断档：两轮成功观察相距 31 秒 → 只建底，不登记。
+    trading = _FirstSeenTrading(
+        [[], [buy]],
+        clock=[t0, t0 + timedelta(seconds=31)],
+    )
+    service, store = _first_seen_service(tmp_path, trading, {token: "10000"})
+    service.refresh_lp_dashboard_snapshot()
+    service.refresh_lp_dashboard_snapshot()
+    assert store.lp_active_first_seen_episodes() == []
+
+    # 30 秒内 → 正常登记。
+    timely = _FirstSeenTrading(
+        [[], [buy]],
+        clock=[t0, t0 + timedelta(seconds=5)],
+    )
+    timely_service, timely_store = _first_seen_service(
+        tmp_path / "timely", timely, {token: "10000"}
+    )
+    timely_service.refresh_lp_dashboard_snapshot()
+    timely_service.refresh_lp_dashboard_snapshot()
+    episodes = timely_store.lp_active_first_seen_episodes()
+    assert len(episodes) == 1
+    assert episodes[0]["anchor_order_ids"] == ["m-d3"]
+
+
+def test_first_seen_pending_retries_then_dies_with_broken_chain(
+    tmp_path: Path,
+) -> None:
+    """D4: 检测轮盘口读失败 → pending；下一轮（链未断）补登记成功且
+    registration_delay > 0 如实；链断后 pending 清空、永久位置未知。"""
+    token = "token-fs-d4"
+    buy = _first_seen_open_order("m-d4", token)
+    other = _first_seen_open_order("m-d4b", "token-fs-d4b")
+    levels: dict[str, object] = {}
+    trading = _FirstSeenTrading(
+        [
+            [],
+            [buy],
+            [buy],
+            [buy, other],
+            [buy, other],
+        ]
+    )
+    service, store = _first_seen_service(tmp_path, trading, levels)
+
+    service.refresh_lp_dashboard_snapshot()  # round 1: baseline
+    service.refresh_lp_dashboard_snapshot()  # round 2: detect; book fails
+    assert store.lp_active_first_seen_episodes() == []
+    assert service._lp_first_seen_pending.keys() == {"m-d4"}
+
+    levels[token] = "10000"  # book only becomes readable from here on
+    service.refresh_lp_dashboard_snapshot()  # round 3: pending retry lands
+    episodes = store.lp_active_first_seen_episodes()
+    assert len(episodes) == 1
+    episode = episodes[0]
+    assert episode["anchor_order_ids"] == ["m-d4"]
+    assert Decimal(str(episode["baseline_front"])) == Decimal("8000")
+    assert Decimal(str(episode["registration_delay"])) > 0
+    assert service._lp_first_seen_pending == {}
+
+    # 新 BUY 在盘口读失败的轮次进 pending；随后账户读失败断链 → 清空。
+    service.refresh_lp_dashboard_snapshot()  # round 4: detect m-d4b; book fails
+    assert service._lp_first_seen_pending.keys() == {"m-d4b"}
+
+    trading.fail_next = True
+    service.refresh_lp_dashboard_snapshot()  # account read fails: chain breaks
+    assert service._lp_first_seen_pending == {}
+
+    # 链重建后该单也只是底集一员：永久位置未知，永不登记。
+    trading.fail_next = False
+    levels["token-fs-d4b"] = "10000"
+    service.refresh_lp_dashboard_snapshot()
+    service.refresh_lp_dashboard_snapshot()
+    episodes = store.lp_active_first_seen_episodes()
+    assert len(episodes) == 1
+    assert episodes[0]["token_id"] == token
+
+
+def test_first_seen_session_token_never_registers(tmp_path: Path) -> None:
+    """C1: 活动 LP 会话 token 上新 BUY → 不开 episode（会话锚价位手动单由
+    #152 豁免覆盖，既有行为不回归由既有套件守护）。"""
+    token = "token-fs-c1"
+    buy = _first_seen_open_order("m-c1", token)
+    trading = _FirstSeenTrading([[], [buy]])
+    service, store = _first_seen_service(tmp_path, trading, {token: "10000"})
+    store.lp_create_session(
+        "lp-c1-session",
+        "lp-c1-key",
+        state="entry_open",
+        payload={
+            "condition_id": "0xc1",
+            "token_id": token,
+            "market_id": "market-1",
+            "outcome": "YES",
+            "question": "Will it happen?",
+            "price": "0.50",
+            "quantity": "2000",
+            "review_at": datetime.now(UTC),
+            "entry_order_id": "entry-c1",
+            "owned_order_ids": ["entry-c1"],
+        },
+    )
+
+    service.refresh_lp_dashboard_snapshot()
+    service.refresh_lp_dashboard_snapshot()
+
+    assert store.lp_active_first_seen_episodes() == []
+
+
+def test_first_seen_tokens_trigger_and_converge_independently(
+    tmp_path: Path,
+) -> None:
+    """C2: 两个 token 各自登记、各自独立触发撤单互不串扰；一段终态不影响
+    另一段。"""
+    token_a = "token-fs-c2a"
+    token_b = "token-fs-c2b"
+    buy_a = {
+        **_first_seen_open_order("m-c2a", token_a, condition_id="0xca"),
+    }
+    buy_b = {
+        **_first_seen_open_order("m-c2b", token_b, condition_id="0xcb"),
+    }
+    trading = _FirstSeenTrading([[], [buy_a, buy_b], [buy_a, buy_b]])
+    service, store = _first_seen_service(
+        tmp_path,
+        trading,
+        {token_a: "4000", token_b: "10000"},
+        condition_by_token={token_a: "0xca", token_b: "0xcb"},
+    )
+    service.refresh_lp_dashboard_snapshot()
+    service.refresh_lp_dashboard_snapshot()
+
+    lp_service = service._lp
+    assert lp_service is not None
+    episodes = {episode["token_id"]: episode for episode in (
+        store.lp_active_first_seen_episodes()
+    )}
+    assert set(episodes) == {token_a, token_b}
+
+    # 一秒 LP tick 驱动评估：A 段按其自身基线已触发（总量 4,000 → A=50%），
+    # B 段仍监控。
+    lp_service.exchange.open_orders = [buy_a, buy_b]
+    lp_service.tick()
+    episodes = {episode["token_id"]: episode for episode in (
+        store.lp_active_first_seen_episodes()
+    )}
+    assert episodes[token_a]["state"] == "canceling"
+    assert episodes[token_b]["state"] == "monitoring"
+    assert Decimal(str(episodes[token_b]["ratio"])) == Decimal("0.80")
+    assert lp_service.exchange.cancels == ["m-c2a"]
+
+    # A 段回执收敛到终态不影响 B 段继续评估。
+    episode_a_id = episodes[token_a]["episode_id"]
+    lp_service.exchange.open_orders = [buy_b]
+    lp_service.tick()
+    episodes = {episode["token_id"]: episode for episode in (
+        store.lp_active_first_seen_episodes()
+    )}
+    settled = store.lp_first_seen_episode(str(episode_a_id))
+    assert settled is not None and settled["state"] == "canceled"
+    assert episodes[token_b]["state"] == "monitoring"
+    assert lp_service.exchange.cancels == ["m-c2a"]
+
+
+def test_lp_dashboard_session_summary_marked_submit_baseline(
+    tmp_path: Path,
+) -> None:
+    """Issue 159(投影增量): 会话保护 summary 补 baseline_source="submit"，
+    首见 episode summary 保持 first_observation，互不串写。"""
+    store = PredictionArbitrageStore(tmp_path / "data")
+    trading = _CancelTrading(
+        [
+            {**_cancel_open_order("entry-1", "0xc1"), "token_id": "yes-token"},
+        ]
+    )
+    service = PredictionExecutionService(
+        store=store,
+        monitor=object(),
+        trading=trading,
+        notifier=ChannelNotifier("feishu"),
+        lock_path=tmp_path / "submit-mark.lock",
+    )
+    service._lp = PolymarketLPService(store, object())
+    store.lp_create_session(
+        "lp-submit-session",
+        "lp-submit-key",
+        state="entry_open",
+        payload={
+            "condition_id": "0xc1",
+            "token_id": "yes-token",
+            "market_id": "market-1",
+            "outcome": "YES",
+            "question": "Will it happen?",
+            "entry_order_id": "entry-1",
+            "queue_protection": {
+                "baseline_front": "10000",
+                "baseline_price": "0.50",
+                "state": "monitoring",
+            },
+        },
+    )
+
+    payload = service.refresh_lp_dashboard_snapshot()
+    rows = {row["order_id"]: row for row in payload["lp_orders_today"]}
+    summary = rows["entry-1"]["queue_protection"]
+    assert summary["baseline_source"] == "submit"

@@ -3580,6 +3580,9 @@ const LP_QUEUE_PROTECTION_ABBR_TITLE =
   "保守估算：下单后同价位任何减少均计入前方，不区分成交与撤单；比例为预计值，不承诺防成交";
 const LP_QUEUE_PROTECTION_UNANCHORED_TEXT =
   "位置未知 · 尚未建立位置保护（网页手动挂单，无下单基线）";
+// Issue 159: first-seen baseline fallback badge (verbatim approved copy).
+const LP_FIRST_SEEN_BADGE_TIP =
+  "首见基线：以系统首次观察到该单时的盘口登记，通常滞后下单不超过一个观察周期（10 秒级）。滞后期间该价位新增挂单全部计入前方，前方估算偏高、触发偏晚，属兜底路径固有偏差。";
 
 function lpQueueProtectionPercent(ratio) {
   // Issue 152 review: a missing estimate (null/undefined) must render as
@@ -3615,8 +3618,21 @@ function lpQueueProtectionPill(state) {
   return "<span class=\"status-pill" + pill.tone + "\">" + escapeHtml(pill.label) + "</span>";
 }
 
+function lpQueueProtectionFirstSeenBadge() {
+  // Issue 159: keyboard-focusable badge whose tooltip explains the
+  // first-seen baseline's inherent conservative bias.
+  return "<span class=\"qp-first-seen\" tabindex=\"0\">首见 · 估算假设"
+    + "<span class=\"qp-first-seen-tip\" role=\"tooltip\">"
+    + escapeHtml(LP_FIRST_SEEN_BADGE_TIP) + "</span></span>";
+}
+
 function lpQueueProtectionSourceChip(row) {
   const anchored = row?.anchor === true;
+  // Issue 159: a first-seen anchor row is a web-manual BUY registered by
+  // observation, not by the submit boundary.
+  if (anchored && row?.queue_protection?.baseline_source === "first_observation") {
+    return "<span class=\"src-chip first-seen\">首见</span>";
+  }
   return "<span class=\"src-chip" + (anchored ? " registered" : "") + "\">"
     + (anchored ? "登记" : "手动") + "</span>";
 }
@@ -3733,8 +3749,13 @@ function lpDashboardTodayQueueProtectionRow(orders) {
       data = reason + "位置无法估算 · " + escapeHtml(clock);
     }
     const triggered = ["canceling", "canceled", "blocked", "partially_filled"].includes(state);
+    // Issue 159: the first-seen badge sits between the pill and the data.
+    const firstSeenBadge = String(summary.baseline_source || "") === "first_observation"
+      ? lpQueueProtectionFirstSeenBadge()
+      : "";
     return "<div class=\"lp-queue-protection\">"
       + lpQueueProtectionPill(state)
+      + firstSeenBadge
       + "<span class=\"qp-data num" + (triggered ? " qp-triggered" : "") + "\">" + data + "</span></div>";
   }
   const sellOnly = orders.length > 0 && buys.length === 0;

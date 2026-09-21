@@ -6677,6 +6677,42 @@ button { cursor: pointer; }
   vertical-align: 1px;
 }
 .src-chip.registered { border-color: #e4c98e; background: #fff8e8; color: #6b4a11; }
+/* —— issue 159 新增样式：首见基线来源 chip 与副行徽标 —— */
+.src-chip.first-seen { border-color: #b9cbd8; background: #edf4f9; color: #2c5468; }
+.qp-first-seen {
+  background: #edf4f9;
+  border: 1px solid #b9cbd8;
+  border-radius: 999px;
+  color: #2c5468;
+  cursor: help;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1;
+  min-height: 20px;
+  padding: 2px 7px;
+  position: relative;
+}
+.qp-first-seen-tip {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  color: var(--text);
+  display: none;
+  font-size: 12px;
+  font-weight: 400;
+  left: 0;
+  line-height: 1.45;
+  max-width: 300px;
+  min-width: 240px;
+  padding: 10px;
+  position: absolute;
+  text-align: left;
+  top: calc(100% + 8px);
+  z-index: 5;
+}
+.qp-first-seen:hover .qp-first-seen-tip,
+.qp-first-seen:focus-visible .qp-first-seen-tip { display: block; }
 .lp-queue-protection {
   background: var(--surface-soft);
   border-radius: 6px;

@@ -1442,3 +1442,114 @@ def test_queue_position_bids_at_same_price_aggregate() -> None:
 def test_queue_position_threshold_constant_attached() -> None:
     """附着常量 LP_QUEUE_PROTECTION_THRESHOLD = Decimal("0.5")."""
     assert polymarket_lp_risk.LP_QUEUE_PROTECTION_THRESHOLD == Decimal("0.5")
+
+
+# ---- Issue 159: 网页手动单首见基线兜底保护（纯函数 P1） ----
+
+
+def _first_seen_book(bid_total: Decimal) -> dict[str, object]:
+    return {
+        "condition_id": "condition-a",
+        "token_id": "token-yes",
+        "received_at": NOW,
+        "hash": "book-hash-159",
+        "bids": [
+            {"price": Decimal("0.51"), "size": Decimal("1")},
+            {"price": Decimal("0.50"), "size": bid_total},
+        ],
+        "asks": [{"price": Decimal("0.52"), "size": Decimal("100")}],
+    }
+
+
+def test_first_observation_baseline_subtracts_own_remaining() -> None:
+    """数字原点：首见时同价位总量 10,000、自己新单余量 2,000、无其它自己单
+    → baseline_front = 8,000，且如实携带盘口 received_at 与 hash。"""
+    baseline = polymarket_lp_risk.first_observation_baseline(
+        _first_seen_book(Decimal("10000")),
+        price=Decimal("0.50"),
+        own_remaining=Decimal("2000"),
+    )
+    assert baseline["state"] == "known"
+    assert baseline["reason_codes"] == []
+    assert Decimal(str(baseline["baseline_front"])) == Decimal("8000")
+    assert Decimal(str(baseline["baseline_price"])) == Decimal("0.50")
+    assert baseline["baseline_book_received_at"] == NOW
+    assert baseline["baseline_book_hash"] == "book-hash-159"
+
+
+def test_first_observation_baseline_missing_level_is_unknown_not_zero() -> None:
+    """价位缺失 → 带 reason_codes 的 UNKNOWN，不造 0 基线。"""
+    book = _first_seen_book(Decimal("10000"))
+    book["bids"] = [{"price": Decimal("0.51"), "size": Decimal("1")}]
+    baseline = polymarket_lp_risk.first_observation_baseline(
+        book,
+        price=Decimal("0.50"),
+        own_remaining=Decimal("2000"),
+    )
+    assert baseline["state"] == "unknown"
+    assert baseline["reason_codes"] == ["book_level_missing"]
+    assert baseline["baseline_front"] is None
+
+
+def test_first_observation_baseline_unresolvable_own_remaining_is_unknown() -> None:
+    """own_remaining 不可解析（None）→ UNKNOWN，不造 0 基线。"""
+    baseline = polymarket_lp_risk.first_observation_baseline(
+        _first_seen_book(Decimal("10000")),
+        price=Decimal("0.50"),
+        own_remaining=None,
+    )
+    assert baseline["state"] == "unknown"
+    assert baseline["reason_codes"] == ["remaining_unknown"]
+    assert baseline["baseline_front"] is None
+
+
+def test_first_observation_baseline_inconsistent_data_is_unknown() -> None:
+    """own 余量 > 档位总量、档位存在但总量 ≤ 0（含 own 余量为 0）→
+    data_inconsistent，baseline_front 如实为 None，不造 0 基线。"""
+    inconsistent = polymarket_lp_risk.first_observation_baseline(
+        _first_seen_book(Decimal("2000")),
+        price=Decimal("0.50"),
+        own_remaining=Decimal("2500"),
+    )
+    assert inconsistent["state"] == "unknown"
+    assert inconsistent["reason_codes"] == ["data_inconsistent"]
+    assert inconsistent["baseline_front"] is None
+
+    # 档位在原始行上存在（区别于 book_level_missing）但总量为 0：
+    # own_remaining ≤ 0 与档位总量 ≤ 0 同时成立，同样 data_inconsistent。
+    zero_level = _first_seen_book(Decimal("0"))
+    zero_level["bids"] = [
+        {"price": Decimal("0.51"), "size": Decimal("1")},
+        {"price": Decimal("0.50"), "size": Decimal("0")},
+    ]
+    zero_total = polymarket_lp_risk.first_observation_baseline(
+        zero_level,
+        price=Decimal("0.50"),
+        own_remaining=Decimal("0"),
+    )
+    assert zero_total["state"] == "unknown"
+    assert zero_total["reason_codes"] == ["data_inconsistent"]
+    assert zero_total["baseline_front"] is None
+
+
+def test_first_observation_baseline_unusable_book_is_unknown() -> None:
+    """book 非 Mapping 或缺 received_at → book_unknown，不造 0 基线。"""
+    not_a_book = polymarket_lp_risk.first_observation_baseline(
+        "not-a-book",
+        price=Decimal("0.50"),
+        own_remaining=Decimal("2000"),
+    )
+    assert not_a_book["state"] == "unknown"
+    assert not_a_book["reason_codes"] == ["book_unknown"]
+    assert not_a_book["baseline_front"] is None
+
+    no_stamp = _first_seen_book(Decimal("10000"))
+    no_stamp["received_at"] = None
+    unknown_stamp = polymarket_lp_risk.first_observation_baseline(
+        no_stamp,
+        price=Decimal("0.50"),
+        own_remaining=Decimal("2000"),
+    )
+    assert unknown_stamp["state"] == "unknown"
+    assert unknown_stamp["reason_codes"] == ["book_unknown"]
+    assert unknown_stamp["baseline_front"] is None

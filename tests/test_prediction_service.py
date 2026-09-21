@@ -13759,3 +13759,160 @@ def test_lp_dashboard_payload_projects_rolling_pool_fields(tmp_path: Path) -> No
     assert payload["recommendations"][0]["updated_at"] == (
         "2026-09-20T17:00:00.000000Z"
     )
+
+
+def test_lp_first_seen_protection_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S: 网页手动单出现 → 首见登记 → 盘口变化 → 触发 → 撤单 →
+    /lp/orders/today 投影含 summary / baseline_source=first_observation / anchor。"""
+
+    class RewardTransport:
+        def get_json(self, path: str, *, params: dict[str, object]) -> object:
+            del path, params
+            return {"data": [], "next_cursor": "LTE="}
+
+    reward_transport = RewardTransport()
+    monkeypatch.setattr(
+        polymarket_trading_module, "signature_type_for", lambda _wallet_type: 0
+    )
+
+    class AccountSDK:
+        def __init__(self) -> None:
+            self.order_rows: list[dict[str, object]] = []
+            self.cancellation_calls: list[tuple[str, ...]] = []
+            self._ctx = SimpleNamespace(
+                secure_clob=reward_transport, wallet_type=None
+            )
+            self.environment = SimpleNamespace(standard_exchange="standard-exchange")
+
+        def get_balance_allowance(self, **_kwargs: object) -> object:
+            return SimpleNamespace(
+                balance=30_000_000,
+                allowances={"standard-exchange": 30_000_000},
+            )
+
+        def list_open_orders(self, **_kwargs: object) -> list[object]:
+            return list(self.order_rows)
+
+        def list_account_trades(self, **_kwargs: object) -> list[object]:
+            return []
+
+        def list_positions(self, **_kwargs: object) -> list[object]:
+            return []
+
+        def get_order_scoring(self, *, order_id: str) -> bool:
+            return True
+
+        def cancel_orders(self, **kwargs: object) -> object:
+            order_ids = tuple(kwargs.get("order_ids") or ())
+            self.cancellation_calls.append(order_ids)
+            return {"canceled": list(order_ids), "not_canceled": {}}
+
+    class PublicMarketSDK:
+        def __init__(self) -> None:
+            self.level_total = "10000"
+
+        def list_markets(
+            self, *, condition_ids: object, page_size: int = 100
+        ) -> list[object]:
+            del condition_ids, page_size
+            return []
+
+        def get_order_books(self, *, token_ids: object) -> list[object]:
+            return [
+                {
+                    "condition_id": "condition-1",
+                    "token_id": str(token_ids[0]),
+                    "timestamp": "2026-09-21T12:00:00Z",
+                    "hash": "book-hash-s",
+                    "bids": [{"price": "0.50", "size": self.level_total}],
+                    "asks": [{"price": "0.52", "size": "100"}],
+                }
+                for token_id in tuple(token_ids)
+            ]
+
+        def close(self) -> None:
+            pass
+
+    sdk = AccountSDK()
+    public_market = PublicMarketSDK()
+    service, _trading, store, _monitor = execution_fixture(tmp_path)
+    trading = PolymarketTradingClient(
+        TradingConfig("signer", "wallet"),
+        client=sdk,
+        public_client_factory=lambda: public_market,
+    )
+    service._trading = trading
+    service._lp = PolymarketLPService(store, trading)
+    # The scripted account rounds must not race scheduled background
+    # refresh threads for the dashboard lock.
+    service._schedule_lp_reward_refresh = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    service._schedule_lp_orders_today_refresh = lambda *args, **kwargs: None  # type: ignore[method-assign]
+
+    notes: list[tuple[str, str, str]] = []
+    service._lp.set_protection_notifier(
+        lambda title, message, xiaoai_text: notes.append(
+            (title, message, xiaoai_text)
+        )
+    )
+
+    manual_buy: dict[str, object] = {
+        "id": "m-web-1",
+        "market": "condition-1",
+        "asset_id": "yes-token",
+        "outcome": "YES",
+        "side": "BUY",
+        "status": "LIVE",
+        "price": Decimal("0.50"),
+        "original_size": Decimal("2000"),
+        "size_matched": Decimal("0"),
+    }
+
+    # 第 1 轮：账户里还没有该单 → 只建底。
+    service.refresh_lp_dashboard_snapshot()
+    assert store.lp_active_first_seen_episodes() == []
+
+    # 第 2 轮：网页手动 BUY 出现 → 首见登记（基线 10000 − 2000 = 8000）。
+    sdk.order_rows = [manual_buy]
+    trading._lp_account_shared_cache = None  # expire the shared account TTL
+    service.refresh_lp_dashboard_snapshot()
+    episodes = store.lp_active_first_seen_episodes()
+    assert len(episodes) == 1
+    episode = episodes[0]
+    assert episode["baseline_source"] == "first_observation"
+    assert Decimal(str(episode["baseline_front"])) == Decimal("8000")
+    assert episode["anchor_order_ids"] == ["m-web-1"]
+
+    # 盘口变化（同价位总量降到 4,000）→ 一秒 tick 评估触发 → 撤单。
+    public_market.level_total = "4000"
+    service._lp.tick()
+    episode = store.lp_first_seen_episode(str(episode["episode_id"]))
+    assert episode is not None
+    assert episode["state"] == "canceling"
+    assert sdk.cancellation_calls == [("m-web-1",)]
+
+    # /lp/orders/today 投影：锚行带 summary / baseline_source / anchor。
+    trading._lp_account_shared_cache = None
+    payload = prediction_service._lp_projection_safe_value(
+        service.refresh_lp_dashboard_snapshot()
+    )
+    rows = {
+        str(row["order_id"]): row for row in payload["lp_orders_today"]
+    }
+    projection = rows["m-web-1"]
+    assert projection["anchor"] is True
+    summary = projection["queue_protection"]
+    assert summary["state"] == "canceling"
+    assert summary["baseline_source"] == "first_observation"
+    assert Decimal(str(summary["anchor_price"])) == Decimal("0.50")
+    assert Decimal(str(summary["level_total"])) == Decimal("4000")
+
+    # 回执收敛：订单从所有读取路径消失 → canceled + 一次性首见通知。
+    sdk.order_rows = []
+    service._lp.tick()
+    episode = store.lp_first_seen_episode(str(episode["episode_id"]))
+    assert episode is not None
+    assert episode["state"] == "canceled"
+    assert len(notes) == 1
+    assert "首见基线" in notes[0][0]
