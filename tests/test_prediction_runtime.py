@@ -663,14 +663,25 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
             candidate = runtime.lp.candidate_snapshot()  # type: ignore[union-attr]
         reward_deadline = time.monotonic() + 2
         risk_session = store.lp_session("lp-risk-session")
+        dashboard = runtime.execution.lp_dashboard()  # type: ignore[union-attr]
         while (
-            isinstance(risk_session, dict)
-            and not isinstance(risk_session.get("reward_observation"), dict)
+            (
+                not isinstance(risk_session, dict)
+                or not isinstance(risk_session.get("reward_observation"), dict)
+                or not isinstance(dashboard.get("lp_session"), dict)
+                or not isinstance(
+                    dashboard["lp_session"].get("reward_observation"), dict
+                )
+                or (
+                    dashboard["lp_session"]["reward_observation"].get("status")
+                    != "below"
+                )
+            )
             and time.monotonic() < reward_deadline
         ):
             time.sleep(0.01)
             risk_session = store.lp_session("lp-risk-session")
-        dashboard = runtime.execution.lp_dashboard()  # type: ignore[union-attr]
+            dashboard = runtime.execution.lp_dashboard()  # type: ignore[union-attr]
         assert runtime.solver_server is None
         assert runtime.relation_catalog is None
         assert runtime.live_resolver is None
@@ -777,7 +788,20 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
         dashboard_deadline = time.monotonic() + 3
         restarted_dashboard = restarted.execution.lp_dashboard()  # type: ignore[union-attr]
         while (
-            restarted_dashboard.get("state") != "ready"
+            (
+                restarted_dashboard.get("state") != "ready"
+                or not isinstance(restarted_dashboard.get("lp_session"), dict)
+                or not isinstance(
+                    restarted_dashboard["lp_session"].get("reward_observation"),
+                    dict,
+                )
+                or (
+                    restarted_dashboard["lp_session"]["reward_observation"].get(
+                        "status"
+                    )
+                    != "below"
+                )
+            )
             and time.monotonic() < dashboard_deadline
         ):
             time.sleep(0.01)

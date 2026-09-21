@@ -2329,7 +2329,6 @@ class PredictionExecutionService:
                             "market_url": raw_order.get("market_url"),
                             "token_id": raw_order.get("token_id", raw_order.get("asset_id")),
                             "outcome": raw_order.get("outcome"),
-                            "created_at": raw_order.get("created_at"),
                             "side": raw_order.get("side"),
                             "status": raw_order.get("status"),
                             "price": _decimal(raw_order.get("price")),
