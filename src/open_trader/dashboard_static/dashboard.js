@@ -6147,6 +6147,19 @@ const LP_REPREVIEW_REASONS = new Set([
   "candidate_changed",
 ]);
 
+// 评审修复（定案 10/11）：LP 提交确认（lp_order/lp_augment）的显式失败态集合。
+// 服务端对这两类提交统一返回 HTTP 200，只有 body 携带会话（session_id）且
+// state 不在此集合内才允许按成功收尾（关模态+成功摘要）；幂等重放返既有活动
+// 会话（review/passive_exit/stop_loss_exit/complete 等非失败态且带 session_id）
+// 自然落入成功侧，按「已登记（返既有会话）」呈现。
+const LP_CONFIRM_FAILURE_STATES = new Set([
+  "busy",
+  "locked",
+  "rejected",
+  "entry_rejected",
+  "needs_attention",
+]);
+
 function lpRatioPercent(ratio) {
   const value = Number(ratio);
   if (!Number.isFinite(value)) return "UNKNOWN";
@@ -6192,13 +6205,24 @@ function lpSubmitStateMessage(result) {
     }
     return reason ? `未下单：${reason}` : "未下单。";
   }
+  // 评审修复（定案 10）：HTTP 200 里两类非成功终态必须在模态内如实呈现。
+  if (resultState === "entry_rejected") {
+    return "未登记：交易所拒绝了订单，未产生委托；请重新预检后再试。";
+  }
+  if (resultState === "needs_attention") {
+    return "提交结果未知（回执未确认），请刷新看板核对会话状态后再操作；不要重复提交。";
+  }
   return "";
 }
 
 function lpSubmitOutcomeMarkup(result) {
   const message = lpSubmitStateMessage(result);
   if (!message) return "";
-  return `<div class="pm-alert danger" role="alert"><div class="pm-alert-body"><strong>提交未完成</strong><p>${escapeHtml(message)}</p></div></div>`;
+  // needs_attention 是结果未知而非确定失败，用警示条与「提交未完成」错误条区分。
+  const warning = String(result?.state || "").toLowerCase() === "needs_attention";
+  const severity = warning ? "warning" : "danger";
+  const title = warning ? "提交结果未知" : "提交未完成";
+  return `<div class="pm-alert ${severity}" role="alert"><div class="pm-alert-body"><strong>${title}</strong><p>${escapeHtml(message)}</p></div></div>`;
 }
 
 function lpOrderCaseLine(mode, currentMode, label, disabled) {
@@ -6305,7 +6329,10 @@ function lpOrderModalHtml(data = {}) {
   const echo = `<div class="pm-order-market"><span>买 ${escapeHtml(predictionValue(data.outcome, "UNKNOWN"))} @ ${escapeHtml(String(data.price ?? ""))} × ${escapeHtml(String(data.quantity ?? ""))} 份 · ${modeLabel} · 复核 次日 08:00</span><strong>${title}</strong></div>`;
   const result = data.result && typeof data.result === "object" ? data.result : null;
   const outcome = result ? lpSubmitOutcomeMarkup(result) : "";
-  const needsRepreview = Boolean(result && LP_REPREVIEW_REASONS.has(String(result.reason || "")));
+  // entry_rejected（交易所拒单）与预检类拒绝同样走「重新预检」路径：同幂等键、新 preview_id。
+  const needsRepreview = Boolean(result
+    && (LP_REPREVIEW_REASONS.has(String(result.reason || ""))
+      || String(result.state || "").toLowerCase() === "entry_rejected"));
   const confirmButton = result
     ? (needsRepreview ? `<button class="pm-button primary" type="button" data-modal-action="lp-order-repreview">重新预检</button>` : "")
     : `<button class="pm-button primary" type="button" data-modal-action="lp-order-confirm">确认提交 · 登记受保护</button>`;
@@ -6354,7 +6381,10 @@ function lpAugmentModalHtml(data = {}) {
     : `<div id="lp-augment-estimate">${lpAugmentEstimateMarkup(data, data.quantity)}</div>`;
   const result = data.result && typeof data.result === "object" ? data.result : null;
   const outcome = result ? lpSubmitOutcomeMarkup(result) : "";
-  const needsRepreview = Boolean(result && LP_REPREVIEW_REASONS.has(String(result.reason || "")));
+  // 防御性对称：augment 现不产生 entry_rejected，但若返回同样提供「重新预检」。
+  const needsRepreview = Boolean(result
+    && (LP_REPREVIEW_REASONS.has(String(result.reason || ""))
+      || String(result.state || "").toLowerCase() === "entry_rejected"));
   const confirmButton = result
     ? (needsRepreview ? `<button class="pm-button primary" type="button" data-modal-action="lp-augment-repreview">重新预检</button>` : "")
     : `<button class="pm-button primary" type="button" data-modal-action="lp-augment-confirm">确认加量 · 并入保护伞</button>`;
@@ -7191,8 +7221,11 @@ async function handlePredictionModalClick(event) {
         preview_id: previewId,
         idempotency_key: data.idempotencyKey,
       });
+      // 评审修复（定案 10/11）：显式失败态或未携带会话（session_id）的响应一律
+      // 不按成功收尾——模态内如实呈现，不关模态、不写成功摘要。
       const resultState = String(result?.state || "").toLowerCase();
-      if (["busy", "locked", "rejected"].includes(resultState)) {
+      const hasSession = Boolean(String(result?.session_id || "").trim());
+      if (LP_CONFIRM_FAILURE_STATES.has(resultState) || !hasSession) {
         data.result = result && typeof result === "object" ? result : {state: "rejected", reason: "submit_failed"};
         lpModalRenderIdle();
         return;
@@ -7232,8 +7265,11 @@ async function handlePredictionModalClick(event) {
         `/api/prediction-arbitrage/lp/sessions/${encodeURIComponent(String(data.session?.session_id || ""))}/augment`,
         {preview_id: previewId, idempotency_key: data.idempotencyKey},
       );
+      // 评审修复（定案 10/11）：与 lp_order 同一判定——显式失败态（含防御性的
+      // entry_rejected）或未携带会话（session_id）的响应一律不按成功收尾。
       const resultState = String(result?.state || "").toLowerCase();
-      if (["busy", "locked", "rejected"].includes(resultState)) {
+      const hasSession = Boolean(String(result?.session_id || "").trim());
+      if (LP_CONFIRM_FAILURE_STATES.has(resultState) || !hasSession) {
         data.result = result && typeof result === "object" ? result : {state: "rejected", reason: "submit_failed"};
         lpModalRenderIdle();
         return;

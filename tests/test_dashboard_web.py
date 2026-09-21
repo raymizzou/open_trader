@@ -22568,7 +22568,7 @@ console.log(JSON.stringify({
 
 
 def test_lp_entry_state_message_matrix_t7() -> None:
-    """T7: busy/locked/rejected/preview_expired 文案逐类可读，不崩。"""
+    """T7: busy/locked/rejected/preview_expired 文案逐类可读，不崩；评审扩展——entry_rejected/needs_attention 在模态内如实呈现，不关模态、不写成功摘要。"""
     output = _lp158_interactive(r'''
 state.predictionMarket.csrfToken = "csrf-1";
 globalThis.fetch = async (url, init={}) => {
@@ -22593,11 +22593,26 @@ const run = async (result) => {
   closePredictionModal();
   return html;
 };
+// 评审修复用例（定案 10/11）：额外捕获成功摘要，验证失败态不关模态、不写摘要。
+const runCapture = async (result) => {
+  currentResult = result;
+  openPredictionModal("lp_order", null, lpOrderIntent(candidateRow));
+  await modalClick({modalAction: "lp-order-preview"});
+  await modalClick({modalAction: "lp-order-confirm"});
+  const html = modalRoot.innerHTML;
+  const summary = state.predictionMarket.lpCancelSummary;
+  closePredictionModal();
+  return {html, summary};
+};
 let currentResult;
 const busyHtml = await run({state:"busy", reason:"active_lp_session", session_id:"sess-abc123"});
 const lockedHtml = await run({state:"locked", reason:"circuit_breaker_open"});
 const bidHtml = await run({state:"rejected", reason:"best_bid_changed"});
 const expiredHtml = await run({state:"rejected", reason:"preview_expired"});
+// 交易所拒单：无任何挂单登记、无保护生效（body 为会话字典、无 reason 字段）。
+const entryRejected = await runCapture({state:"entry_rejected", session_id:"sess-rej001", submit_status:"rejected"});
+// 提交结果未知：回执异常/无单号（body 为会话字典）。
+const needsAttention = await runCapture({state:"needs_attention", session_id:"sess-att001", submit_status:"unknown"});
 console.log(JSON.stringify({
   busy: busyHtml.includes("已有活动会话（会话 sess-a）")
     && busyHtml.includes("当天会话于次日 08:00 复核收尾；加量请用 LP 委托表的「加量」按钮"),
@@ -22606,6 +22621,18 @@ console.log(JSON.stringify({
   bidRepreview: bidHtml.includes('data-modal-action="lp-order-repreview"'),
   expired: expiredHtml.includes("预检已过期，未下单"),
   expiredRepreview: expiredHtml.includes('data-modal-action="lp-order-repreview"'),
+  entryRejected: {
+    modalOpen: entryRejected.html !== "",
+    message: entryRejected.html.includes("未登记：交易所拒绝了订单，未产生委托；请重新预检后再试。"),
+    repreview: entryRejected.html.includes('data-modal-action="lp-order-repreview"'),
+    noSuccessSummary: entryRejected.summary === "" && !entryRejected.html.includes("已登记 · 会话"),
+  },
+  needsAttention: {
+    modalOpen: needsAttention.html !== "",
+    warning: needsAttention.html.includes("提交结果未知（回执未确认），请刷新看板核对会话状态后再操作；不要重复提交。"),
+    warningBar: needsAttention.html.includes("pm-alert warning"),
+    noSuccessSummary: needsAttention.summary === "" && !needsAttention.html.includes("已登记 · 会话"),
+  },
 }));
 ''')
     rendered = json.loads(output)
@@ -22615,6 +22642,14 @@ console.log(JSON.stringify({
     assert rendered["bidRepreview"] is True
     assert rendered["expired"] is True
     assert rendered["expiredRepreview"] is True
+    assert rendered["entryRejected"]["modalOpen"] is True
+    assert rendered["entryRejected"]["message"] is True
+    assert rendered["entryRejected"]["repreview"] is True
+    assert rendered["entryRejected"]["noSuccessSummary"] is True
+    assert rendered["needsAttention"]["modalOpen"] is True
+    assert rendered["needsAttention"]["warning"] is True
+    assert rendered["needsAttention"]["warningBar"] is True
+    assert rendered["needsAttention"]["noSuccessSummary"] is True
 
 
 def test_lp_augment_modal_flow_t15f() -> None:
@@ -22685,6 +22720,15 @@ const rejectHtml = modalRoot.innerHTML;
 const noTargetSession = {...session, estimated_target_quantity: null};
 openPredictionModal("lp_augment", null, lpAugmentIntent(groupOrders, noTargetSession));
 const noTargetHtml = modalRoot.innerHTML;
+// 评审修复用例（定案 10/11）：needs_attention 不得按成功收尾——不关模态、
+// 不新增「已加量」成功摘要，警示文案出现。
+confirmResult = {state:"needs_attention", session_id:"sess-abc123", submit_status:"unknown"};
+const summaryBeforeAttention = state.predictionMarket.lpCancelSummary;
+openPredictionModal("lp_augment", null, lpAugmentIntent(groupOrders, session));
+await modalClick({modalAction: "lp-augment-preview"});
+await modalClick({modalAction: "lp-augment-confirm"});
+const attentionHtml = modalRoot.innerHTML;
+const summaryAfterAttention = state.predictionMarket.lpCancelSummary;
 console.log(JSON.stringify({
   priceLocked: htmlForm.includes("0.42（入场价，锁定）"),
   fiveDefault: /value="five" checked/.test(htmlForm) && /value="90"/.test(htmlForm),
@@ -22700,6 +22744,12 @@ console.log(JSON.stringify({
     disabled: /value="five" disabled/.test(noTargetHtml),
     unknownLabel: noTargetHtml.includes("加 5% 单 · 目标量 UNKNOWN"),
   },
+  needsAttention: {
+    modalOpen: attentionHtml !== "",
+    warning: attentionHtml.includes("提交结果未知（回执未确认），请刷新看板核对会话状态后再操作；不要重复提交。"),
+    warningBar: attentionHtml.includes("pm-alert warning"),
+    noNewSuccessSummary: summaryAfterAttention === summaryBeforeAttention,
+  },
 }));
 ''')
     rendered = json.loads(output)
@@ -22713,6 +22763,10 @@ console.log(JSON.stringify({
     assert rendered["noSessionGuide"] is True
     assert rendered["noTargetFive"]["disabled"] is True
     assert rendered["noTargetFive"]["unknownLabel"] is True
+    assert rendered["needsAttention"]["modalOpen"] is True
+    assert rendered["needsAttention"]["warning"] is True
+    assert rendered["needsAttention"]["warningBar"] is True
+    assert rendered["needsAttention"]["noNewSuccessSummary"] is True
 
 
 def test_lp_candidate_table_css_fixes_zero_width_columns() -> None:
