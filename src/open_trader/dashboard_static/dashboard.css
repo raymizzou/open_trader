@@ -6654,13 +6654,16 @@ button { cursor: pointer; }
 .pm-table .sub { color: var(--muted); display: block; font-size: 11px; margin-top: 3px; }
 .pm-lp-order-table, .pm-lp-candidate-table { table-layout: fixed; }
 .pm-lp-order-table th, .pm-lp-order-table td, .pm-lp-order-table .num { text-align: left; }
-.pm-lp-order-table th:nth-child(1), .pm-lp-order-table td:nth-child(1) { width: 26%; }
-.pm-lp-order-table th:nth-child(2), .pm-lp-order-table td:nth-child(2) { width: 16%; }
-.pm-lp-order-table th:nth-child(3), .pm-lp-order-table td:nth-child(3) { width: 17%; }
-.pm-lp-order-table th:nth-child(4), .pm-lp-order-table td:nth-child(4) { width: 16%; }
-.pm-lp-order-table th:nth-child(5), .pm-lp-order-table td:nth-child(5) { width: 25%; }
+.pm-lp-order-table th:nth-child(1), .pm-lp-order-table td:nth-child(1) { width: 22%; }
+.pm-lp-order-table th:nth-child(2), .pm-lp-order-table td:nth-child(2) { width: 14%; }
+.pm-lp-order-table th:nth-child(3), .pm-lp-order-table td:nth-child(3) { width: 15%; }
+.pm-lp-order-table th:nth-child(4), .pm-lp-order-table td:nth-child(4) { width: 15%; }
+.pm-lp-order-table th:nth-child(5), .pm-lp-order-table td:nth-child(5) { width: 14%; }
+.pm-lp-order-table th:nth-child(6), .pm-lp-order-table td:nth-child(6) { width: 20%; }
 .pm-lp-order-table .lp-line { align-items: baseline; display: flex; gap: 8px; justify-content: space-between; }
 .pm-lp-order-table .lp-line > div { min-width: 0; overflow-wrap: anywhere; }
+.pm-lp-order-table tr.lp-today-done td { color: var(--muted); }
+.pm-lp-order-table tr.lp-today-done td a { color: var(--muted); }
 /* —— issue 152 新增样式：LP BUY 队列位置保护副行与来源 chip —— */
 .src-chip {
   border: 1px solid var(--line);

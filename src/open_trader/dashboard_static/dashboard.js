@@ -3514,6 +3514,9 @@ function lpDashboardTodayMarketOrder(groups, observations) {
       && !lpDashboardAccountFactsStale(observation)
       && Number.isFinite(Number(observation.current_yield_pct_per_hour));
     return {
+      // 完结沉底：组内任一委托仍有在挂余量才算活跃；活跃区在前，
+      // 完结区沉底，两区各自沿用收益率降序 → condition_id 字典序。
+      active: group.orders.some((row) => lpDashboardTodayHasActiveOrder(row)),
       known,
       value: known ? Number(observation.current_yield_pct_per_hour) : 0,
       conditionId: group.conditionId,
@@ -3522,6 +3525,7 @@ function lpDashboardTodayMarketOrder(groups, observations) {
   return [...groups].sort((a, b) => {
     const ka = keyOf(a);
     const kb = keyOf(b);
+    if (ka.active !== kb.active) return ka.active ? -1 : 1;
     if (ka.known !== kb.known) return ka.known ? -1 : 1;
     if (ka.known && ka.value !== kb.value) return kb.value - ka.value;
     return ka.conditionId.localeCompare(kb.conditionId);
@@ -3782,6 +3786,20 @@ function lpDashboardTodayQuantityCell(orders) {
     && String(orders[0]?.side || "").toUpperCase() === "BUY"
     ? lpQueueProtectionSourceChip(orders[0])
     : "";
+  // 组级成交状态 pill：三态复用生产 token（中性 / status-partial 琥珀 / status-ok 绿）。
+  const orderedTotal = orders.reduce((sum, row) => {
+    const quantity = lpDashboardTodayOrderQuantity(row);
+    return sum + (Number.isFinite(quantity) ? quantity : 0);
+  }, 0);
+  const groupPill = filledSum > 0
+    ? (filledSum === orderedTotal
+      ? "<span class=\"pm-pill status-ok\">完全成交 "
+        + formatDisplayNumber(String(filledSum)) + "/" + formatDisplayNumber(String(orderedTotal)) + "</span>"
+      : "<span class=\"pm-pill status-partial\">部分成交 "
+        + formatDisplayNumber(String(filledSum)) + "/" + formatDisplayNumber(String(orderedTotal)) + "</span>")
+    : (cancellable.length > 0
+      ? "<span class=\"pm-pill\">挂单中 · 已成交 " + formatDisplayNumber(String(filledSum)) + "</span>"
+      : "<span class=\"pm-pill\">已完结 · 未成交</span>");
   const fillLine = "已成交 " + formatDisplayNumber(String(filledSum))
     + " · 剩余 " + formatDisplayNumber(String(remainingSum));
   const headlineRight = cancellable.length >= 2
@@ -3791,6 +3809,7 @@ function lpDashboardTodayQuantityCell(orders) {
       : "";
   let markup = "<div class=\"lp-line\"><div>" + escapeHtml(headline)
     + (singleBuyChip ? " " + singleBuyChip : "")
+    + (groupPill ? " " + groupPill : "")
     + "<span class=\"sub\">" + escapeHtml(fillLine) + "</span></div>"
     + headlineRight + "</div>";
   if (multi) {
@@ -3810,12 +3829,24 @@ function lpDashboardTodayQuantityCell(orders) {
         const filled = Number(row.filled_quantity);
         if (Number.isFinite(filled) && filled > 0) parts.push("已成交 " + formatDisplayNumber(String(filled)));
       }
+      // 逐笔着色 tag：既有文字全部保留（原文仍以纯文本渲染），pill 只追加颜色状态。
+      const fillPill = lpDashboardTodayFilled(row)
+        ? "<span class=\"pm-pill status-ok\">已成交</span>"
+        : (() => {
+          const filled = Number(row.filled_quantity);
+          if (Number.isFinite(filled) && filled > 0) {
+            return "<span class=\"pm-pill status-partial\">已成交 "
+              + formatDisplayNumber(String(filled)) + "</span>";
+          }
+          return lpDashboardTodayHasActiveOrder(row) ? "<span class=\"pm-pill\">挂单中</span>" : "";
+        })();
       const chip = isBuy ? lpQueueProtectionSourceChip(row) : "";
       const right = lpDashboardTodayHasActiveOrder(row)
         ? lpDashboardCancelButton("one", {orderId: row.order_id})
         : "";
       return "<div class=\"lp-line\"><div>" + parts.map((part) => escapeHtml(part)).join(" · ")
         + (chip ? " · " + chip : "")
+        + (fillPill ? " · " + fillPill : "")
         + "</div>" + right + "</div>";
     }).join("");
   }
@@ -3847,11 +3878,29 @@ function lpDashboardTodayMarketRow(
     )
     : "";
   const subtitle = lpDashboardTodaySubtitle(orders);
-  return "<tr data-lp-today-market=\"" + escapeHtml(identity) + "\">"
+  // 实际占用资金列：observed 口径（持仓均成本 + 在挂买单），只认
+  // occupied_capital_usd 现值；stale 或缺失一律 UNKNOWN，绝不填 0。
+  const capitalStale = observation ? lpDashboardAccountFactsStale(observation) : false;
+  const capitalValue = observation ? observation.occupied_capital_usd : null;
+  const capitalKnown = Boolean(observation) && !capitalStale
+    && predictionHasValue(capitalValue) && Number.isFinite(Number(capitalValue));
+  const capitalMarkup = capitalKnown
+    ? "<div>" + escapeHtml(lpDashboardMoney(capitalValue)) + "</div>"
+      + "<span class=\"sub\">持仓均成本 + 在挂买单</span>"
+    : "<div><span class=\"pm-lp-unknown\">UNKNOWN</span></div>"
+      + "<span class=\"sub\">" + (capitalStale
+        ? "账户数据过期"
+        : "账户数据缺失 · 不以 0 代替") + "</span>";
+  // 完结沉底：组内无任何在挂余量 → 整行加淡化类（CSS 使 td 与链接降为 muted 色）。
+  // class 置于 data-lp-today-market 之后：与既有行的 tr 前缀形状保持一致。
+  const done = !orders.some((row) => lpDashboardTodayHasActiveOrder(row));
+  return "<tr data-lp-today-market=\"" + escapeHtml(identity) + "\""
+    + (done ? " class=\"lp-today-done\"" : "") + ">"
     + "<td>" + lpMarketTitleLink(firstOrder) + "<span class=\"sub\">" + escapeHtml(subtitle)
     + "</span>" + detailsMarkup + "</td>"
     + "<td data-label=\"LP 收益率(推荐 → 实际)\">" + rewardMarkup + "</td>"
     + "<td data-label=\"份额占比\">" + shareMarkup + "</td>"
+    + "<td data-label=\"实际占用资金\" class=\"num\">" + capitalMarkup + "</td>"
     + "<td data-label=\"压力损失(警戒线 10%)\">" + riskMarkup + "</td>"
     + "<td data-label=\"委托与成交量\">" + lpDashboardTodayQuantityCell(orders) + "</td></tr>";
 }
@@ -4141,7 +4190,7 @@ function predictionLpCard(payload) {
     ? todayGroups.map((group) => lpDashboardTodayMarketRow(
       group, rewards, rewardShares, observations, session,
     )).join("")
-    : "<tr><td colspan=\"5\" class=\"pm-observation-empty\">当天暂无 LP 委托。</td></tr>";
+    : "<tr><td colspan=\"6\" class=\"pm-observation-empty\">当天暂无 LP 委托。</td></tr>";
   const nonLpRowCount = Number(dashboard.non_lp_row_count);
   const nonLpFootnote = Number.isFinite(nonLpRowCount) && nonLpRowCount > 0
     ? "<p class=\"sub\">账户另有 " + escapeHtml(String(nonLpRowCount))
@@ -4239,8 +4288,8 @@ function predictionLpCard(payload) {
     + snapshotPendingMarkup
     + predictionLpPreparation(dashboard.preparation)
     + budgetLineMarkup
-    + "<section aria-label=\"当天 LP 委托\"><h3>当天 LP 委托 <span class=\"sub\">· 北京时间 08:00 起 · 按当前小时奖励率降序 · 一标的一行</span></h3><div class=\"pm-table-wrap\"><table class=\"pm-table pm-lp-order-table\">"
-    + "<thead><tr><th scope=\"col\">标的</th><th scope=\"col\">LP 收益率(推荐 → 实际)</th><th scope=\"col\">份额占比</th><th scope=\"col\">压力损失(警戒线 10%)</th><th scope=\"col\">委托与成交量</th></tr></thead>"
+    + "<section aria-label=\"当天 LP 委托\"><h3>当天 LP 委托 <span class=\"sub\">· 北京时间 08:00 起 · 活跃在前 · 已完结沉底 · 各按当前小时奖励率降序 · 一标的一行</span></h3><div class=\"pm-table-wrap\"><table class=\"pm-table pm-lp-order-table\">"
+    + "<thead><tr><th scope=\"col\">标的</th><th scope=\"col\">LP 收益率(推荐 → 实际)</th><th scope=\"col\">份额占比</th><th scope=\"col\">实际占用资金</th><th scope=\"col\">压力损失(警戒线 10%)</th><th scope=\"col\">委托与成交量</th></tr></thead>"
     + "<tbody>" + todayRowsHtml + "</tbody></table></div>"
     + nonLpFootnote
     + "<p class=\"sub\">预计 LP 毛奖励；压力损失不含奖励抵扣；10% 是风险警告线；「试挂/正式」由委托数量对比最小计分数量自动标注（买=最小计分数量→试挂；更大→正式；卖出单不标注）。份额预警已全量开启（奖励份额连续 >8% 一分钟语音告警，夜间静音）；撤单即时生效;已成交部分不可撤。</p></section>"
