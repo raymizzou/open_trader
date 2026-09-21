@@ -6314,6 +6314,244 @@ def test_candidate_rows_project_next_review_at(
 # ---- Issue 158: 加量服务面（augment preview/start） ----
 
 
+def _augment_running_service(
+    tmp_path, now: datetime, *, key: str, clock_cell: list | None = None
+):
+    """Start one registered entry session: quantity 120 at price 0.30."""
+
+    exchange = _Exchange()
+    exchange.snapshot_value = _queue_book_snapshot(now, Decimal("120"))
+    store = PredictionArbitrageStore(tmp_path)
+    current = clock_cell if clock_cell is not None else [now]
+    service = PolymarketLPService(store, exchange, clock=lambda: current[0])
+    request = {**_request(now), "quantity": Decimal("120")}
+    preview = service.preview(request)
+    started = service.start(str(preview["preview_id"]), key)
+    assert started["state"] == "entry_open"
+    return store, exchange, service, started
+
+
+def _augment_preview_snapshot(
+    now: datetime, *, level: Decimal, own_original: Decimal
+) -> dict[str, object]:
+    """Fresh book at the entry price plus the session's resting entry BUY."""
+
+    snapshot = _queue_book_snapshot(now, level)
+    snapshot["account"]["open_orders"] = [
+        _queue_receipt("order-1", original=own_original, matched="0")
+    ]
+    return snapshot
+
+
+def _augment_preview(service: PolymarketLPService, session_id: str, quantity: object):
+    return service.augment_preview({"session_id": session_id, "quantity": quantity})
+
+
+def test_augment_preview_projects_merged_queue_ratio(tmp_path) -> None:
+    """T13: 合并口径 A：front=同价档位−既有 BUY 余量，ratio=front/(front+own+qty)。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _augment_running_service(
+        tmp_path, now, key="lp-aug-t13"
+    )
+    session_id = str(started["session_id"])
+    exchange.snapshot_value = _augment_preview_snapshot(
+        now, level=Decimal("380"), own_original=Decimal("120")
+    )
+
+    preview = _augment_preview(service, session_id, 90)
+    assert preview["state"] == "previewed"
+    assert Decimal(str(preview["price"])) == Decimal("0.30")
+    assert Decimal(str(preview["request"]["quantity"])) == Decimal("90")
+    estimate = preview["queue_protection_estimate"]
+    assert Decimal(str(estimate["baseline_front"])) == Decimal("260")
+    assert Decimal(str(estimate["own_remaining"])) == Decimal("120")
+    assert Decimal(str(estimate["projected_ratio"])) == Decimal("260") / Decimal("470")
+
+    bigger = _augment_preview(service, session_id, 160)
+    assert bigger["state"] == "previewed"
+    assert Decimal(
+        str(bigger["queue_protection_estimate"]["projected_ratio"])
+    ) == Decimal("260") / Decimal("540")
+
+
+def test_augment_submit_registers_order_into_session(tmp_path) -> None:
+    """T14: 恰一单 post-only BUY@入场价；会话 payload 清单+审计；不新建第二会话。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _augment_running_service(
+        tmp_path, now, key="lp-aug-t14"
+    )
+    session_id = str(started["session_id"])
+    exchange.snapshot_value = _augment_preview_snapshot(
+        now, level=Decimal("380"), own_original=Decimal("120")
+    )
+    preview = _augment_preview(service, session_id, 90)
+    assert preview["state"] == "previewed"
+
+    result = service.augment(session_id, str(preview["preview_id"]), "lp-aug-key-1")
+
+    assert result["state"] == "entry_open"
+    assert str(result["augment_order_id"]) == "order-2"
+    assert Decimal(str(result["augment_quantity"])) == Decimal("90")
+    assert len(exchange.posts) == 2
+    posted = exchange.posts[1]
+    assert posted["side"] == "BUY"
+    assert posted["post_only"] is True
+    assert Decimal(str(posted["price"])) == Decimal("0.30")
+    assert Decimal(str(posted["quantity"])) == Decimal("90")
+    session = store.lp_session(session_id)
+    assert session["augment_order_ids"] == ["order-2"]
+    active = store.lp_active_session()
+    assert active is not None and str(active["session_id"]) == session_id
+    (receipt,) = [
+        action
+        for action in store.lp_actions(session_id)
+        if action["action_key"].endswith("augment-submit:order-2")
+    ]
+    assert receipt["state"] == "accepted"
+    assert receipt["order_id"] == "order-2"
+    assert receipt["role"] == "augment"
+
+
+def test_augment_rejection_matrix(tmp_path) -> None:
+    """T15: 无活动会话 / 买一变 / 预检过期 / 同 key 重试不重复挂单。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+
+    # a) 无活动会话：complete 会话与未知会话都拒绝。
+    store_a, exchange_a, service_a, started_a = _augment_running_service(
+        tmp_path / "a", now, key="lp-aug-t15-a"
+    )
+    session_a = str(started_a["session_id"])
+    store_a.lp_update_session(session_a, state="complete")
+    rejected_a = _augment_preview(service_a, session_a, 90)
+    assert rejected_a == {"state": "rejected", "reason": "session_not_active"}
+    assert _augment_preview(service_a, "missing-session", 90) == {
+        "state": "rejected",
+        "reason": "session_not_found",
+    }
+    assert len(exchange_a.posts) == 1  # 仅既有入场单，无加量单
+
+    # b) 买一变化：augment 复核段拒绝，凭证未消费、无下单。
+    cell_b = [now]
+    store_b, exchange_b, service_b, started_b = _augment_running_service(
+        tmp_path / "b", now, key="lp-aug-t15-b", clock_cell=cell_b
+    )
+    session_b = str(started_b["session_id"])
+    exchange_b.snapshot_value = _augment_preview_snapshot(
+        now, level=Decimal("380"), own_original=Decimal("120")
+    )
+    preview_b = _augment_preview(service_b, session_b, 90)
+    assert preview_b["state"] == "previewed"
+    exchange_b.snapshot_value = _queue_book_moved_bid_snapshot(now, Decimal("8000"))
+    moved = service_b.augment(session_b, str(preview_b["preview_id"]), "lp-aug-key-b")
+    assert moved == {"state": "rejected", "reason": "best_bid_changed"}
+    assert store_b.lp_preview(str(preview_b["preview_id"]))["consumed_at"] is None
+    assert len(exchange_b.posts) == 1
+
+    # c) 预检过期：TTL（10 秒）后确认 → preview_expired。
+    cell_c = [now]
+    store_c, exchange_c, service_c, started_c = _augment_running_service(
+        tmp_path / "c", now, key="lp-aug-t15-c", clock_cell=cell_c
+    )
+    session_c = str(started_c["session_id"])
+    exchange_c.snapshot_value = _augment_preview_snapshot(
+        now, level=Decimal("380"), own_original=Decimal("120")
+    )
+    preview_c = _augment_preview(service_c, session_c, 90)
+    cell_c[0] = now + timedelta(seconds=30)
+    expired = service_c.augment(session_c, str(preview_c["preview_id"]), "lp-aug-key-c")
+    assert expired == {"state": "rejected", "reason": "preview_expired"}
+    assert len(exchange_c.posts) == 1
+
+    # d) 同 key 重试：返既有结果，且买一再变也不重复挂单。
+    cell_d = [now]
+    store_d, exchange_d, service_d, started_d = _augment_running_service(
+        tmp_path / "d", now, key="lp-aug-t15-d", clock_cell=cell_d
+    )
+    session_d = str(started_d["session_id"])
+    exchange_d.snapshot_value = _augment_preview_snapshot(
+        now, level=Decimal("380"), own_original=Decimal("120")
+    )
+    preview_d = _augment_preview(service_d, session_d, 90)
+    first = service_d.augment(session_d, str(preview_d["preview_id"]), "lp-aug-key-d")
+    assert first["state"] == "entry_open"
+    assert str(first["augment_order_id"]) == "order-2"
+    exchange_d.snapshot_value = _queue_book_moved_bid_snapshot(now, Decimal("9000"))
+    retry = service_d.augment(session_d, "unknown-preview", "lp-aug-key-d")
+    assert str(retry["augment_order_id"]) == "order-2"
+    assert retry["state"] == "entry_open"
+    assert len(exchange_d.posts) == 2
+
+
+def test_stop_and_review_cancel_entry_and_augment_orders(tmp_path) -> None:
+    """T16: 复核/stop 时入场单+加量单一并请求撤；零成交平仓后会话 complete。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _augment_running_service(
+        tmp_path, now, key="lp-aug-t16"
+    )
+    session_id = str(started["session_id"])
+    exchange.snapshot_value = _augment_preview_snapshot(
+        now, level=Decimal("380"), own_original=Decimal("120")
+    )
+    preview = _augment_preview(service, session_id, 90)
+    result = service.augment(session_id, str(preview["preview_id"]), "lp-aug-key-16")
+    assert result["state"] == "entry_open"
+    assert len(exchange.posts) == 2
+
+    stopped = service.stop(session_id)
+    assert stopped["state"] == "review"
+    assert exchange.cancels == ["order-1", "order-2"]
+
+    # 零成交：两张单均已撤、无持仓 → 复核收尾后会话 complete。
+    zero_fill = _augment_preview_snapshot(
+        now, level=Decimal("380"), own_original=Decimal("0")
+    )
+    zero_fill["account"]["open_orders"] = []
+    zero_fill["orders"] = [
+        _queue_receipt("order-1", original="120", status="CANCELED"),
+        _queue_receipt("order-2", original="90", status="CANCELED"),
+    ]
+    zero_fill["scoring"] = True
+    exchange.snapshot_value = zero_fill
+
+    final = service.tick()
+    assert final["state"] == "complete"
+    assert exchange.cancels == ["order-1", "order-2"]
+
+
+def test_runtime_queue_position_includes_augment_order(tmp_path) -> None:
+    """T17: 加量单入场后 own_remaining 含加量：front 260 / own 210 → A≈0.553 monitoring。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _augment_running_service(
+        tmp_path, now, key="lp-aug-t17"
+    )
+    session_id = str(started["session_id"])
+    exchange.snapshot_value = _augment_preview_snapshot(
+        now, level=Decimal("380"), own_original=Decimal("120")
+    )
+    preview = _augment_preview(service, session_id, 90)
+    result = service.augment(session_id, str(preview["preview_id"]), "lp-aug-key-17")
+    assert result["state"] == "entry_open"
+
+    merged = _augment_preview_snapshot(now, level=Decimal("470"), own_original=Decimal("0"))
+    merged["account"]["open_orders"] = [
+        _queue_receipt("order-1", original="120"),
+        _queue_receipt("order-2", original="90"),
+    ]
+    merged["orders"] = [
+        _queue_receipt("order-1", original="120"),
+        _queue_receipt("order-2", original="90"),
+    ]
+    exchange.snapshot_value = merged
+
+    ticked = service.tick()
+    protection = ticked["queue_protection"]
+    assert protection["state"] == "monitoring"
+    assert Decimal(str(protection["front_estimate"])) == Decimal("260")
+    assert Decimal(str(protection["level_total"])) == Decimal("470")
+    assert Decimal(str(protection["ratio"])) == Decimal("260") / Decimal("470")
+    assert exchange.cancels == []
+
+
 # ---- Issue 152: 队列位置保护运行时闭环（Seam 3）与通知（Seam 6） ----
 
 

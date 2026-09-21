@@ -7,7 +7,7 @@ import math
 import threading
 import uuid
 from copy import deepcopy
-from collections.abc import Callable, Mapping, MutableMapping, Sequence
+from collections.abc import Callable, Collection, Mapping, MutableMapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import ROUND_HALF_UP, Decimal
@@ -6586,6 +6586,366 @@ class PolymarketLPService:
             ),
         }
 
+    @staticmethod
+    def _session_augment_own_order_ids(session: Mapping[str, object]) -> list[str]:
+        """Own resting order ids an augment re-check must tolerate."""
+
+        ids: list[str] = []
+        entry_id = str(session.get("entry_order_id") or "")
+        if entry_id:
+            ids.append(entry_id)
+        for value in _items(session.get("augment_order_ids")):
+            augment_id = str(value or "")
+            if augment_id:
+                ids.append(augment_id)
+        return ids
+
+    def _augment_merge_estimate(
+        self,
+        request: Mapping[str, object],
+        snapshot: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Issue 158 merged share estimate for one augment.
+
+        ``front`` is the same-price level minus the session's own remaining
+        BUY size; the projected ratio is front/(front+own+quantity) so the
+        new order's share is judged on the merged protection umbrella.
+        """
+
+        price = cast(Decimal, request["price"])
+        quantity = cast(Decimal, request["quantity"])
+        token_id = str(request["token_id"])
+        level_total = self._queue_baseline_front(snapshot, price)
+        own_remaining = self._own_queue_remaining(
+            snapshot, token_id=token_id, price=price
+        )
+        if own_remaining is None:
+            return {
+                "baseline_front": None,
+                "own_remaining": None,
+                "projected_ratio": None,
+            }
+        front = level_total - own_remaining
+        if front < 0:
+            front = Decimal("0")
+        denominator = front + own_remaining + quantity
+        projected = (
+            front / denominator if denominator > 0 else Decimal("0")
+        )
+        return {
+            "baseline_front": front,
+            "own_remaining": own_remaining,
+            "projected_ratio": projected,
+        }
+
+    def _augment_session(
+        self, session_id: str
+    ) -> tuple[dict[str, object] | None, str | None]:
+        """Load the augment target session or the rejection reason."""
+
+        session = self.store.lp_session(str(session_id))
+        if session is None:
+            return None, "session_not_found"
+        if str(session.get("state")) in {"complete", "entry_rejected"}:
+            return None, "session_not_active"
+        return session, None
+
+    def augment_preview(self, request: Mapping[str, object]) -> dict[str, object]:
+        """Build a short-lived augment preview locked to the entry price."""
+
+        if not isinstance(request, Mapping):
+            return {"state": "rejected", "reason": "request_invalid"}
+        session_id = _text(request.get("session_id"))
+        if session_id is None:
+            return {"state": "rejected", "reason": "session_id_invalid"}
+        quantity = _maybe_decimal(request.get("quantity"))
+        if quantity is None or quantity <= 0:
+            return {"state": "rejected", "reason": "quantity_invalid"}
+        session, rejection = self._augment_session(session_id)
+        if session is None:
+            return {"state": "rejected", "reason": rejection or "session_not_active"}
+        price = _maybe_decimal(session.get("price"))
+        if price is None or price <= 0:
+            return {"state": "rejected", "reason": "entry_price_unknown"}
+        identity: dict[str, object] = {}
+        for key in ("market_id", "condition_id", "token_id"):
+            value = _text(session.get(key))
+            if value is None:
+                return {"state": "rejected", "reason": f"{key}_invalid"}
+            identity[key] = value
+        outcome = _text(session.get("outcome"))
+        if outcome is None or outcome.upper() not in {"YES", "NO"}:
+            return {"state": "rejected", "reason": "outcome_invalid"}
+        identity["outcome"] = outcome.upper()
+        if session.get("review_at") is None:
+            return {"state": "rejected", "reason": "review_at_unknown"}
+        try:
+            now = self._now()
+            augment_request = self._normalize_request(
+                {**identity, "price": price, "quantity": quantity,
+                 "review_at": session.get("review_at")}
+            )
+            snapshot = self._read_snapshot(augment_request)
+            facts = self._validate_snapshot(
+                augment_request,
+                snapshot,
+                now=now,
+                allowed_open_order_ids=self._session_augment_own_order_ids(session),
+            )
+        except ValueError as exc:
+            return {"state": "rejected", "reason": str(exc)}
+        expires_at = now + timedelta(seconds=PREVIEW_TTL_SECONDS)
+        payload = {**augment_request, "session_id": session_id, "preflight": facts}
+        preview_id = self.store.create_preview(
+            payload,
+            expires_at=_iso(expires_at),
+            created_at=_iso(now),
+        )
+        return {
+            "state": "previewed",
+            "preview_id": preview_id,
+            "expires_at": _iso(expires_at),
+            "request": {"session_id": session_id, "quantity": quantity},
+            "price": price,
+            "preflight": facts,
+            "queue_protection_estimate": self._augment_merge_estimate(
+                augment_request, snapshot
+            ),
+        }
+
+    def _augment_recorded_result(
+        self, session_id: str, key: str
+    ) -> dict[str, object] | None:
+        """Return the durable result of a prior augment with the same key.
+
+        Issue 158: idempotent replays resolve here before any preview read,
+        fresh-facts re-check, or best-bid comparison can run again.
+        """
+
+        intent_key = self._action_key(session_id, f"augment-submit:{key}")
+        for action in self.store.lp_actions(session_id):
+            if str(action.get("action_key") or "") != intent_key:
+                continue
+            state = str(action.get("state") or "")
+            order_id = str(action.get("order_id") or "")
+            if state == "accepted":
+                session = self.store.lp_session(session_id)
+                result = (
+                    self._status_payload(session)
+                    if session is not None
+                    else {"state": "none", "session_id": session_id}
+                )
+                result["augment_order_id"] = order_id
+                return result
+            if state == "rejected":
+                return {
+                    "state": "rejected",
+                    "reason": "augment_submit_rejected",
+                    "session_id": session_id,
+                    "order_id": order_id,
+                }
+            return {
+                "state": "needs_attention",
+                "session_id": session_id,
+                "reason": "augment_submit_unknown",
+            }
+        return None
+
+    def augment(
+        self,
+        session_id: str,
+        preview_id: str,
+        idempotency_key: str | None = None,
+    ) -> dict[str, object]:
+        """Revalidate an augment preview, then submit exactly one more BUY."""
+
+        key = (idempotency_key or "").strip()
+        if not key:
+            return {"state": "rejected", "reason": "idempotency_key_required"}
+        with self._mutex:
+            session, rejection = self._augment_session(str(session_id))
+            if session is None:
+                return {"state": "rejected", "reason": rejection or "session_not_active"}
+            session_id_str = str(session["session_id"])
+            recorded = self._augment_recorded_result(session_id_str, key)
+            if recorded is not None:
+                return recorded
+            if not self._mutation_allowed("submit"):
+                return {"state": "locked", "reason": "mutation_blocked"}
+            preview = self.store.lp_preview(preview_id)
+            if preview is None:
+                return {"state": "rejected", "reason": "preview_not_found"}
+            try:
+                expires_at = _timestamp(preview["expires_at"], name="preview_expiry")
+                if self._now() >= expires_at:
+                    raise ValueError("preview_expired")
+                if str(preview.get("session_id") or "") != session_id_str:
+                    raise ValueError("preview_session_mismatch")
+                request = self._normalize_request(preview)
+                now = self._now()
+                snapshot = self._read_snapshot(request)
+                facts = self._validate_snapshot(
+                    request,
+                    snapshot,
+                    now=now,
+                    allowed_open_order_ids=self._session_augment_own_order_ids(session),
+                )
+                # Issue 158: same submit-time best-bid re-check as start.
+                credential_preflight = preview.get("preflight")
+                credential_best_bid = (
+                    _maybe_decimal(credential_preflight.get("best_bid"))
+                    if isinstance(credential_preflight, Mapping)
+                    else None
+                )
+                if (
+                    credential_best_bid is not None
+                    and credential_best_bid != facts["best_bid"]
+                ):
+                    raise ValueError("best_bid_changed")
+                expiration = expiration_for_review(
+                    _timestamp(request["review_at"], name="review_at"), now=now
+                )
+            except ValueError as exc:
+                return {"state": "rejected", "reason": str(exc)}
+            try:
+                self.store.consume_lp_preview(preview_id)
+            except ValueError as exc:
+                return {"state": "rejected", "reason": str(exc)}
+            price = cast(Decimal, request["price"])
+            quantity = cast(Decimal, request["quantity"])
+            action_base: dict[str, object] = {
+                "role": "augment",
+                "side": "BUY",
+                "token_id": str(request["token_id"]),
+                "idempotency_key": key,
+                "price": price,
+                "quantity": quantity,
+                "expiration": expiration,
+                "submit_requested_at": _iso(now),
+            }
+            intent_key = self._action_key(session_id_str, f"augment-submit:{key}")
+            self.store.lp_upsert_action(
+                session_id_str,
+                intent_key,
+                state="pending",
+                payload={**action_base},
+            )
+            try:
+                signed = self._create_limit(
+                    token_id=str(request["token_id"]),
+                    price=price,
+                    quantity=quantity,
+                    side="BUY",
+                    post_only=True,
+                    expiration=expiration,
+                )
+                response = self._post_limit(signed)
+            except Exception as exc:
+                self.store.lp_upsert_action(
+                    session_id_str,
+                    intent_key,
+                    state="unknown",
+                    payload={**action_base, "error": type(exc).__name__},
+                )
+                return {
+                    "state": "needs_attention",
+                    "session_id": session_id_str,
+                    "reason": "augment_submit_unknown",
+                    "error": type(exc).__name__,
+                }
+            accepted, order_id = self._order_response(response)
+            if not accepted:
+                self.store.lp_upsert_action(
+                    session_id_str,
+                    intent_key,
+                    state="rejected",
+                    payload={
+                        **action_base,
+                        "order_id": order_id or "",
+                        "error": "augment_submit_rejected",
+                    },
+                )
+                return {
+                    "state": "rejected",
+                    "reason": "augment_submit_rejected",
+                    "session_id": session_id_str,
+                    "order_id": order_id or "",
+                }
+            if not order_id:
+                self.store.lp_upsert_action(
+                    session_id_str,
+                    intent_key,
+                    state="unknown",
+                    payload={**action_base, "error": "accepted_without_order_id"},
+                )
+                return {
+                    "state": "needs_attention",
+                    "session_id": session_id_str,
+                    "reason": "augment_submit_unknown",
+                }
+            self.store.lp_upsert_action(
+                session_id_str,
+                self._action_key(session_id_str, f"augment-submit:{order_id}"),
+                state="accepted",
+                payload={
+                    **action_base,
+                    "order_id": order_id,
+                    "submit_receipt_at": _iso(self._now()),
+                },
+            )
+            self.store.lp_upsert_action(
+                session_id_str,
+                intent_key,
+                state="accepted",
+                payload={**action_base, "order_id": order_id},
+            )
+            augment_ids = [
+                str(value) for value in _items(session.get("augment_order_ids"))
+            ]
+            if order_id not in augment_ids:
+                augment_ids.append(order_id)
+            order_history = self._order_history(session)
+            order_history[order_id] = {
+                "order_id": order_id,
+                "token_id": str(request["token_id"]),
+                "side": "BUY",
+                "status": str(_field(response, "status", "LIVE")).upper() or "LIVE",
+                "price": price,
+                "quantity": quantity,
+                "expiration": expiration,
+                "role": "augment",
+            }
+            # Issue 158: the augment joins the session's protection umbrella,
+            # so the registered baseline re-anchors to the merged front
+            # (same-price level minus own remaining BUY size) observed at
+            # this validated snapshot.  States, threshold, and cancel
+            # behavior of the #152 episode are untouched.
+            protection = dict(session.get("queue_protection") or {})
+            merged_estimate = self._augment_merge_estimate(request, snapshot)
+            merged_front = merged_estimate.get("baseline_front")
+            if isinstance(merged_front, Decimal):
+                protection["baseline_front"] = merged_front
+                book = snapshot.get("book")
+                if isinstance(book, Mapping):
+                    protection["baseline_book_received_at"] = book.get(
+                        "received_at"
+                    )
+                    protection["baseline_source_timestamp"] = book.get(
+                        "source_timestamp"
+                    )
+                    protection["baseline_book_hash"] = book.get("hash")
+            updated = self.store.lp_update_session(
+                session_id_str,
+                patch={
+                    "augment_order_ids": augment_ids,
+                    "augment_order_id": order_id,
+                    "augment_quantity": quantity,
+                    "order_history": order_history,
+                    "queue_protection": protection,
+                },
+            )
+            return self._status_payload(updated)
+
     def _queue_baseline_front(
         self, snapshot: Mapping[str, object], price: Decimal
     ) -> Decimal:
@@ -8155,6 +8515,7 @@ class PolymarketLPService:
         snapshot: Mapping[str, object],
         *,
         now: datetime,
+        allowed_open_order_ids: Collection[str] | None = None,
     ) -> dict[str, object]:
         account = snapshot.get("account")
         if not isinstance(account, Mapping):
@@ -8174,7 +8535,15 @@ class PolymarketLPService:
             size = _maybe_decimal(_field(position, "size", _field(position, "quantity", 0)))
             if token == request["token_id"] and size is not None and size > 0:
                 raise ValueError("target_inventory")
+        # Issue 158: an augment re-check must tolerate the session's own
+        # resting orders (entry + earlier augments); every other order on the
+        # token still rejects exactly as before.
+        allowed_ids = {
+            str(value or "") for value in (allowed_open_order_ids or ())
+        }
         for order in _items(account.get("open_orders")):
+            if cls._order_id(order) and cls._order_id(order) in allowed_ids:
+                continue
             token = _field(order, "token_id", _field(order, "asset_id"))
             market = _field(order, "market_id", _field(order, "market"))
             if token == request["token_id"] or market == request["market_id"]:
@@ -9608,6 +9977,8 @@ class PolymarketLPService:
             "protected_exit_order_id",
         ):
             add(session.get(key))
+        for value in _items(session.get("augment_order_ids")):
+            add(value)
         for value in _items(session.get("owned_order_ids")):
             add(value)
         history = session.get("order_history")
@@ -9667,6 +10038,12 @@ class PolymarketLPService:
         }
         for key in ("passive_exit_order_id", "protected_exit_order_id"):
             expected_sides[str(session.get(key) or "")] = "SELL"
+        # Issue 158: augment orders are session-owned BUYs; their receipts
+        # must reconcile like the entry order's.
+        for value in _items(session.get("augment_order_ids")):
+            augment_id = str(value or "")
+            if augment_id:
+                expected_sides[augment_id] = "BUY"
         for order_id in order_ids:
             previous = dict(history.get(order_id, {}))
             order = rows_by_id.get(order_id)
@@ -10435,6 +10812,35 @@ class PolymarketLPService:
             )
             current = self.store.lp_update_session(
                 str(current["session_id"]), patch={requested_key: True}
+            )
+            history = self._order_history(current)
+        # Issue 158: augment orders join the same review/stop cancel sweep so
+        # an entry plus its augments always end (or complete) together.
+        augment_requested = [
+            str(value) for value in _items(current.get("augment_cancel_requested"))
+        ]
+        for value in _items(current.get("augment_order_ids")):
+            order_id = str(value or "")
+            if not order_id or order_id in augment_requested:
+                continue
+            if str(history.get(order_id, {}).get("status") or "").upper() in TERMINAL_ORDER_STATES:
+                continue
+            try:
+                if not self._cancel_order(order_id):
+                    raise RuntimeError("cancel_not_acknowledged")
+            except Exception as exc:
+                errors.append(exc)
+                continue
+            self.store.lp_upsert_action(
+                str(current["session_id"]),
+                self._action_key(str(current["session_id"]), "augment-cancel", order_id),
+                state="accepted",
+                payload={"role": "augment-cancel", "order_id": order_id},
+            )
+            augment_requested = [*augment_requested, order_id]
+            current = self.store.lp_update_session(
+                str(current["session_id"]),
+                patch={"augment_cancel_requested": list(augment_requested)},
             )
             history = self._order_history(current)
         if errors:
