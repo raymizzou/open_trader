@@ -11582,6 +11582,13 @@ class PolymarketLPService:
     def _status_payload(self, session: Mapping[str, object]) -> dict[str, object]:
         result = dict(session)
         result.setdefault("session_id", session.get("session_id"))
+        # Issue 158: informational-only default quantity for the augment
+        # "加 5%" option (the entry candidate row's estimated target).  It is
+        # never validated and never used for order sizing — every augment
+        # quantity goes through augment_preview/augment validation.
+        result["estimated_target_quantity"] = _maybe_decimal(
+            result.get("estimated_target_quantity")
+        )
         result["reward_observation"] = self._reward_status_payload(session)
         for key in (
             "price",

@@ -22425,7 +22425,11 @@ console.log(JSON.stringify({
 
 
 def test_lp_entry_preview_request_body_t4() -> None:
-    """T4: 预检体恰 7 字段（试挂另含 candidate_policy）；行内值原样透传；自定义改价量生效。"""
+    """T4: 预检体恰 7 必填字段（试挂另含 candidate_policy）；行内有目标量时另含 estimated_target_quantity 原样透传，行内无则不含。
+
+    主代理 2026-09-21 修订：加量 5% 可用性修复——预检体新增可选
+    estimated_target_quantity（informational only，服务端存会话供加量模态默认量）。
+    """
     output = _lp158_interactive(r'''
 state.predictionMarket.csrfToken = "csrf-1";
 const requests = [];
@@ -22454,14 +22458,21 @@ modalRoot._qs = {
 };
 await modalClick({modalAction: "lp-order-preview"});
 const customBody = JSON.parse(requests[1].body);
+// 行内无目标量：三模式都不带该字段（试挂模式示例）。
+openPredictionModal("lp_order", null, lpOrderIntent({...candidateRow, estimated_target_quantity: null}));
+await modalClick({modalAction: "lp-order-preview"});
+const noTargetBody = JSON.parse(requests[2].body);
 console.log(JSON.stringify({
   trialKeys: Object.keys(trialBody).sort(),
   trialPolicy: trialBody.candidate_policy,
   trialPassthrough: [trialBody.market_id, trialBody.condition_id, trialBody.token_id,
     trialBody.outcome, trialBody.price, trialBody.quantity, trialBody.review_at],
+  trialTargetVerbatim: trialBody.estimated_target_quantity,
   customKeys: Object.keys(customBody).sort(),
   customValues: [customBody.price, customBody.quantity],
   customNoPolicy: !("candidate_policy" in customBody),
+  customTargetVerbatim: customBody.estimated_target_quantity,
+  noTargetKeys: Object.keys(noTargetBody).sort(),
   reviewPhase: reviewHtml.includes("确认提交 · 登记受保护")
     && reviewHtml.includes("位置保护预估"),
 }));
@@ -22470,18 +22481,25 @@ console.log(JSON.stringify({
     assert rendered["trialKeys"] == sorted([
         "market_id", "condition_id", "token_id", "outcome",
         "price", "quantity", "review_at", "candidate_policy",
+        "estimated_target_quantity",
     ])
     assert rendered["trialPolicy"] == "best_bid_minimum"
     assert rendered["trialPassthrough"] == [
         "market-fed", "condition-fed", "token-fed", "YES", "0.42", "120",
         "2026-09-22T00:00:00Z",
     ]
+    assert rendered["trialTargetVerbatim"] == "90"
     assert rendered["customKeys"] == sorted([
         "market_id", "condition_id", "token_id", "outcome",
-        "price", "quantity", "review_at",
+        "price", "quantity", "review_at", "estimated_target_quantity",
     ])
     assert rendered["customValues"] == ["0.43", "150"]
     assert rendered["customNoPolicy"] is True
+    assert rendered["customTargetVerbatim"] == "90"
+    assert rendered["noTargetKeys"] == sorted([
+        "market_id", "condition_id", "token_id", "outcome",
+        "price", "quantity", "review_at", "candidate_policy",
+    ])
     assert rendered["reviewPhase"] is True
 
 
@@ -22600,11 +22618,12 @@ console.log(JSON.stringify({
 
 
 def test_lp_augment_modal_flow_t15f() -> None:
-    """T15f: 加量模态——入场价锁定、默认 5%=90、160→48.1% 警示、预检/确认体、无会话指引。"""
+    """T15f: 加量模态——入场价锁定、默认 5%=90（候选池不含会话市场的生产形态，取 lp_session.estimated_target_quantity；lp_session 也无值→禁用+UNKNOWN）、160→48.1% 警示、预检/确认体、无会话指引。"""
     output = _lp158_interactive(r'''
 state.predictionMarket.csrfToken = "csrf-1";
 const session = {state:"entry_open", session_id:"sess-abc123",
   condition_id:"condition-fed", price:"0.42", quantity:"120",
+  estimated_target_quantity:"90",
   market_title:"Will the Fed cut rates in Q4?"};
 const groupOrders = [{...sessionRow,
   queue_protection:{state:"monitoring", ratio:0.684, threshold:0.5,
@@ -22635,8 +22654,11 @@ globalThis.fetch = async (url, init={}) => {
   }
   throw new Error("unexpected " + method + " " + u);
 };
+// 主代理 2026-09-21 修订：生产真实形态——会话市场已有 known_participation，
+// 候选漏斗将其排除，候选池不含该标的；5% 默认量改从 lp_session 的
+// estimated_target_quantity 取得。
 state.predictionMarket.lpDashboard = {
-  recommendations: [{condition_id:"condition-fed", estimated_target_quantity:"90"}],
+  recommendations: [],
   candidates: [],
 };
 const intent = lpAugmentIntent(groupOrders, session);
@@ -22659,6 +22681,10 @@ openPredictionModal("lp_augment", null, lpAugmentIntent(groupOrders, session));
 await modalClick({modalAction: "lp-augment-preview"});
 await modalClick({modalAction: "lp-augment-confirm"});
 const rejectHtml = modalRoot.innerHTML;
+// lp_session 也无值（候选池仍不含该标的）→ 5% 选项禁用 + UNKNOWN 文案。
+const noTargetSession = {...session, estimated_target_quantity: null};
+openPredictionModal("lp_augment", null, lpAugmentIntent(groupOrders, noTargetSession));
+const noTargetHtml = modalRoot.innerHTML;
 console.log(JSON.stringify({
   priceLocked: htmlForm.includes("0.42（入场价，锁定）"),
   fiveDefault: /value="five" checked/.test(htmlForm) && /value="90"/.test(htmlForm),
@@ -22670,6 +22696,10 @@ console.log(JSON.stringify({
   confirmUrl: confirmPosts[0].url,
   successSummary: summary,
   noSessionGuide: rejectHtml.includes("请先从候选列表经系统入口下第一单"),
+  noTargetFive: {
+    disabled: /value="five" disabled/.test(noTargetHtml),
+    unknownLabel: noTargetHtml.includes("加 5% 单 · 目标量 UNKNOWN"),
+  },
 }));
 ''')
     rendered = json.loads(output)
@@ -22681,6 +22711,8 @@ console.log(JSON.stringify({
     assert rendered["confirmUrl"] == "/api/prediction-arbitrage/lp/sessions/sess-abc123/augment"
     assert rendered["successSummary"] == "已加量 · 90 份 @ 0.42 · 并入会话 sess-a 保护伞"
     assert rendered["noSessionGuide"] is True
+    assert rendered["noTargetFive"]["disabled"] is True
+    assert rendered["noTargetFive"]["unknownLabel"] is True
 
 
 def test_lp_candidate_table_css_fixes_zero_width_columns() -> None:

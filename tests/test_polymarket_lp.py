@@ -6277,6 +6277,46 @@ def test_start_idempotent_retry_precedes_best_bid_check(tmp_path) -> None:
     assert store.lp_session_by_idempotency("lp-bid-retry-1") is not None
 
 
+# ---- Issue 158: estimated_target_quantity 透传（加量 5% 默认量，informational only） ----
+
+
+def test_entry_estimated_target_quantity_flows_to_session_and_status(tmp_path) -> None:
+    """T18: preview 带 estimated_target_quantity → 会话 payload 存原值，lp_status 投影透出。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    exchange = _Exchange()
+    exchange.snapshot_value = _queue_book_snapshot(now, Decimal("8000"))
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+
+    preview = service.preview({**_request(now), "estimated_target_quantity": "90"})
+    assert preview["state"] == "previewed"
+    started = service.start(str(preview["preview_id"]), "lp-target-qty-1")
+
+    assert started["state"] == "entry_open"
+    stored = store.lp_session(str(started["session_id"]))
+    assert stored is not None
+    assert Decimal(str(stored["estimated_target_quantity"])) == Decimal("90")
+    status = service.status(str(started["session_id"]))
+    assert Decimal(str(status["estimated_target_quantity"])) == Decimal("90")
+
+
+def test_entry_without_estimated_target_quantity_projects_null(tmp_path) -> None:
+    """T18: preview 不带该字段 → start 正常建会话，投影 estimated_target_quantity=null 不炸。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    exchange = _Exchange()
+    exchange.snapshot_value = _queue_book_snapshot(now, Decimal("8000"))
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+
+    preview = service.preview(_request(now))
+    assert preview["state"] == "previewed"
+    started = service.start(str(preview["preview_id"]), "lp-no-target-qty-1")
+
+    assert started["state"] == "entry_open"
+    status = service.status(str(started["session_id"]))
+    assert status["estimated_target_quantity"] is None
+
+
 # ---- Issue 158: 候选行 review_at 投影（下次北京 08:00 → UTC） ----
 
 

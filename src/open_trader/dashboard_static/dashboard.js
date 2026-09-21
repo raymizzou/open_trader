@@ -6398,14 +6398,24 @@ function lpAugmentIntent(orders, session) {
   const own = Number.isFinite(front) && Number.isFinite(levelTotal)
     ? Number((levelTotal - front).toFixed(6)) : null;
   const conditionId = String(session?.condition_id || "");
+  // Issue 158: the candidate funnel marks the session's market
+  // known_participation and excludes it from the pool, so the 加 5% default
+  // first reads the informational-only estimated_target_quantity projected on
+  // the session, then falls back to the candidate pool; when neither has a
+  // value the option renders disabled with the UNKNOWN label.  This value
+  // only pre-fills the modal — every augment quantity is still validated by
+  // the augment preview/confirm endpoints.
+  const sessionTarget = Number(session?.estimated_target_quantity);
   let targetRow = null;
-  const dashboard = state.predictionMarket.lpDashboard;
-  for (const list of [dashboard?.recommendations, dashboard?.candidates]) {
-    if (!Array.isArray(list)) continue;
-    targetRow = list.find((item) => String(item?.condition_id || "") === conditionId) || null;
-    if (targetRow) break;
+  if (!(Number.isFinite(sessionTarget) && sessionTarget > 0)) {
+    const dashboard = state.predictionMarket.lpDashboard;
+    for (const list of [dashboard?.recommendations, dashboard?.candidates]) {
+      if (!Array.isArray(list)) continue;
+      targetRow = list.find((item) => String(item?.condition_id || "") === conditionId) || null;
+      if (targetRow) break;
+    }
   }
-  const target = Number(targetRow?.estimated_target_quantity);
+  const target = targetRow ? Number(targetRow?.estimated_target_quantity) : sessionTarget;
   const fiveQuantity = Number.isFinite(target) && target > 0 ? formatDisplayNumber(String(target)) : "";
   return {
     session: {
@@ -7148,6 +7158,14 @@ async function handlePredictionModalClick(event) {
         quantity: String(data.quantity ?? ""),
         review_at: String(data.reviewAtText ?? ""),
       };
+      // Issue 158: informational-only 加 5% default target from the candidate
+      // row; carried verbatim in all three modes when the row has a value so
+      // the session stores it for the augment modal.  Never validated and
+      // never used for order sizing on the server.
+      const rowTarget = row.estimated_target_quantity;
+      if (rowTarget !== null && rowTarget !== undefined && String(rowTarget).trim() !== "") {
+        body.estimated_target_quantity = String(rowTarget);
+      }
       // 定案 5: only trial mode carries the candidate policy; 5%/custom
       // plans would trip candidate_changed forever.
       if (data.mode === "trial") body.candidate_policy = "best_bid_minimum";
