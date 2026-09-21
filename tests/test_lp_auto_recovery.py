@@ -2255,10 +2255,21 @@ def test_history_probe_has_constant_http_budget_and_rotates(tmp_path: Path) -> N
         )
 
     store = PredictionArbitrageStore(tmp_path / "rotating-history-probe")
+    # 机制实证（2026-09-21，时间炸弹修复）：history 探针解析 token 走
+    # `_cached_lp_token_ids`（polymarket_trading），其 warm load 用真实时钟
+    # `datetime.now(UTC)`（服务注入的 clock 不参与），store 侧过滤是
+    # `WHERE expires_at > :真实now纪元秒`（prediction_arbitrage_store
+    # `lp_metadata_cache_entries`）。旧夹具把 expires_at 固定在注入时钟+24h
+    # （2026-09-21T05:00Z=13:00 HKT）：真实时间一过该边界，warm load 返回
+    # 0 行 → 探针以 `history_probe_token_cache_unknown` 失败、0 次 HTTP
+    # 请求（14:28 HKT 实测红 `assert 0 == 1`；对照组用注入时钟传 now 则
+    # 81 行全部命中）。因此 expires_at 必须相对真实现在开宽窗，而非任何
+    # 固定远期日期（固定日期只是下一颗炸弹）。
+    metadata_expires_at = (datetime.now(UTC) + timedelta(hours=24)).timestamp()
     store.lp_metadata_cache_store_entries(
         {
             condition_id: (
-                (clock[0] + timedelta(hours=24)).timestamp(),
+                metadata_expires_at,
                 {
                     "condition_id": condition_id,
                     "accepting_orders": True,
