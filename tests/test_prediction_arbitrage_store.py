@@ -3488,3 +3488,127 @@ def test_lp_active_sessions_lists_non_terminal_newest_first(tmp_path: Path) -> N
     db.lp_update_session("lp-a", state="complete")
     assert db.lp_active_sessions() == []
     assert db.lp_active_session() is None
+
+
+def test_lp_create_session_allows_one_group_per_market(tmp_path: Path) -> None:
+    """Issue 166: 唯一性从「全局最多一行活动组」改为「同 (condition_id, outcome)
+    最多一组」——不同标的的两个活动组并存；同标的+方向的第二个活动组拒绝
+    lp_session_market_active；同幂等键重放返回原行不视为冲突；终态行不占槽。"""
+
+    db = store(tmp_path)
+    market_a = {"condition_id": "0xa", "outcome": "YES"}
+    market_b = {"condition_id": "0xb", "outcome": "YES"}
+
+    created_a = db.lp_create_session(
+        "lp-a", "lp-key-a", state="entry_open", payload=market_a
+    )
+    created_b = db.lp_create_session(
+        "lp-b", "lp-key-b", state="entry_open", payload=market_b
+    )
+    # 不同标的的两个活动组并存（ Newest first: A 晚于 B 创建则 A 在前；
+    # 这里 A 先建，顺序为 [B, A]——只断言集合不弱化并存事实）。
+    assert {row["session_id"] for row in db.lp_active_sessions()} == {
+        "lp-a",
+        "lp-b",
+    }
+    assert created_a["session_id"] == "lp-a"
+    assert created_b["session_id"] == "lp-b"
+
+    # 同标的+方向、不同幂等键 → 拒绝理由映射 lp_session_market_active。
+    with pytest.raises(ValueError, match="lp_session_market_active"):
+        db.lp_create_session(
+            "lp-c", "lp-key-c", state="entry_open", payload=market_a
+        )
+
+    # 同幂等键重放 → 返回原行，不视为冲突。
+    assert (
+        db.lp_create_session(
+            "lp-a", "lp-key-a", state="entry_open", payload=market_a
+        )
+        == created_a
+    )
+
+    # 同标的、不同方向 → 并存。
+    db.lp_create_session(
+        "lp-d", "lp-key-d", state="entry_open", payload={"condition_id": "0xa", "outcome": "NO"}
+    )
+    assert {row["session_id"] for row in db.lp_active_sessions()} == {
+        "lp-a",
+        "lp-b",
+        "lp-d",
+    }
+
+    # 终态不占槽：A 终态化后同标的+方向可再开一组。
+    db.lp_update_session("lp-a", state="complete")
+    db.lp_create_session(
+        "lp-e", "lp-key-e", state="entry_open", payload=market_a
+    )
+    assert {row["session_id"] for row in db.lp_active_sessions()} == {
+        "lp-b",
+        "lp-d",
+        "lp-e",
+    }
+
+
+def test_legacy_lp_sessions_db_migrates_old_unique_index(tmp_path: Path) -> None:
+    """Issue 166 R3: 存量库迁移——含旧索引 one_active_lp_session 与一行活动
+    会话的库文件用新代码打开后：旧索引被 DROP、one_active_lp_session_market
+    存在、原行仍为活动；同 (condition_id, outcome) 第二组仍拒
+    lp_session_market_active；不同标的第二组可建（旧全局唯一索引若未迁移
+    则此处必然失败）。"""
+
+    data_dir = tmp_path / "data"
+    database_dir = data_dir / "prediction_arbitrage"
+    database_dir.mkdir(parents=True)
+    connection = sqlite3.connect(database_dir / "prediction_arbitrage.sqlite3")
+    connection.executescript(
+        """
+        CREATE TABLE lp_sessions (
+            session_id TEXT PRIMARY KEY,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            state TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX one_active_lp_session
+        ON lp_sessions((1))
+        WHERE state NOT IN ('complete', 'entry_rejected');
+        INSERT INTO lp_sessions VALUES (
+            'lp-legacy', 'lp-key-legacy', 'entry_open',
+            '{"condition_id": "0xa", "outcome": "YES"}',
+            '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z'
+        );
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    db = PredictionArbitrageStore(data_dir)
+    with sqlite3.connect(db.path) as check:
+        indexes = {
+            str(row[1])
+            for row in check.execute("PRAGMA index_list('lp_sessions')")
+        }
+    assert "one_active_lp_session" not in indexes
+    assert "one_active_lp_session_market" in indexes
+
+    active = {row["session_id"] for row in db.lp_active_sessions()}
+    assert active == {"lp-legacy"}
+
+    # 同 (condition_id, outcome) 第二组仍拒 lp_session_market_active。
+    with pytest.raises(ValueError, match="lp_session_market_active"):
+        db.lp_create_session(
+            "lp-same", "lp-key-same", state="entry_open",
+            payload={"condition_id": "0xa", "outcome": "YES"},
+        )
+
+    # 不同标的第二组可建——旧全局唯一索引若未迁移此处必然失败。
+    db.lp_create_session(
+        "lp-other", "lp-key-other", state="entry_open",
+        payload={"condition_id": "0xb", "outcome": "YES"},
+    )
+    assert {row["session_id"] for row in db.lp_active_sessions()} == {
+        "lp-legacy",
+        "lp-other",
+    }

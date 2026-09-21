@@ -6943,3 +6943,7 @@ button { cursor: pointer; }
 .pm-n-leg-report-request { font-size: 12px; margin: 4px 0; color: #3d3226; }
 .pm-n-leg-report-footer { border-top: 1px solid var(--line); color: #8a7f72; font-size: 12px; margin-top: 10px; padding-top: 8px; }
 .pm-n-leg-report-error { color: #a33; }
+
+/* #166 multi-group LP cards: newest on top, finished groups sunk. */
+.lp-session-stack { display: grid; gap: 12px; margin: 10px 0 4px; }
+.lp-session-stack .pm-panel.lp-done { opacity: 0.62; }

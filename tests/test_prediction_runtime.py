@@ -9765,3 +9765,146 @@ def test_candidate_competition_monitor_refreshes_and_stops(
         if thread is not None:
             thread.join(timeout=2)
             runtime._candidate_competition_thread = None
+
+
+def test_lp_monitor_report_waits_until_every_group_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue 166: 日报触发改为「每组都就绪才触发」——聚合报文逐组套用现有
+    就绪判定；任一组未就绪不触发；截止撤销等待例外按组保留。"""
+    import open_trader.prediction_runtime as runtime_module
+
+    stamp = "2026-09-21T12:00:00Z"
+    group_ready = {
+        "state": "entry_open",
+        "session_id": "grp-a",
+        "account_checked_at": stamp,
+        "book_checked_at": stamp,
+    }
+    group_stuck = {
+        "state": "needs_attention",
+        "session_id": "grp-b",
+        "account_checked_at": stamp,
+        "book_checked_at": stamp,
+    }
+    payload_holder: list[dict[str, object]] = []
+    reports: list[str] = []
+    reported = threading.Event()
+
+    class FakeLP:
+        def generate_due_report(self) -> None:
+            reports.append("report")
+            reported.set()
+
+    class FakeExecution:
+        def lp_tick(self) -> dict[str, object]:
+            return payload_holder[0]
+
+    runtime = PredictionRuntime(
+        data_dir=tmp_path,
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+    )
+    runtime.lp = FakeLP()  # type: ignore[assignment]
+    runtime.execution = FakeExecution()  # type: ignore[assignment]
+    monkeypatch.setattr(runtime_module, "_LP_TICK_SECONDS", 0.01)
+
+    runtime._owner.acquire()
+    try:
+        # 一组未就绪：整轮不触发日报。
+        payload_holder.append(
+            {
+                "state": "ok",
+                "session_id": None,
+                "sessions": [group_ready, group_stuck],
+                "account_checked_at": stamp,
+                "book_checked_at": stamp,
+            }
+        )
+        runtime._start_lp_monitor()
+        thread = runtime._lp_thread
+        assert thread is not None
+        assert not reported.wait(timeout=0.3)
+        assert reports == []
+
+        # 截止撤销等待例外按组保留：B 为 needs_attention 但处于
+        # awaiting_reconciliation 的 deadline_cancel_ 等待 → 视为就绪。
+        payload_holder[0] = {
+            "state": "ok",
+            "session_id": None,
+            "sessions": [
+                group_ready,
+                {
+                    **group_stuck,
+                    "review_status": "awaiting_reconciliation",
+                    "reconciliation": "deadline_cancel_RuntimeError",
+                },
+            ],
+            "account_checked_at": stamp,
+            "book_checked_at": stamp,
+        }
+        assert reported.wait(timeout=2)
+        assert reports == ["report"]
+    finally:
+        runtime._lp_stop_event.set()
+        if thread is not None:
+            thread.join(timeout=2)
+            runtime._lp_thread = None
+        runtime._owner.release()
+
+
+def test_reward_monitor_refreshes_every_active_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue 166: 两组在场时一轮刷新对两组各调一次（点名 session_id）；
+    无活动组时保留无 id 调用的 active→latest 只读投影。"""
+    import open_trader.prediction_runtime as runtime_module
+
+    store = PredictionArbitrageStore(tmp_path)
+    store.lp_create_session(
+        "grp-a",
+        "k-a",
+        state="entry_open",
+        payload={"condition_id": "c-a", "outcome": "YES"},
+    )
+    store.lp_create_session(
+        "grp-b",
+        "k-b",
+        state="entry_open",
+        payload={"condition_id": "c-b", "outcome": "YES"},
+    )
+
+    class SpyLP:
+        def __init__(self) -> None:
+            self.calls: list[str | None] = []
+            self.first_round = threading.Event()
+
+        def refresh_rewards(
+            self, session_id: str | None = None, *, stop_event=None
+        ) -> dict[str, object]:
+            self.calls.append(session_id)
+            if len(self.calls) >= 2:
+                self.first_round.set()
+            return {"state": "none"}
+
+    runtime = PredictionRuntime(
+        data_dir=tmp_path,
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+    )
+    spy = SpyLP()
+    runtime.lp = spy  # type: ignore[assignment]
+    runtime.store = store  # type: ignore[assignment]
+    monkeypatch.setattr(runtime_module, "_LP_REWARD_SECONDS", 0.05)
+
+    runtime._start_reward_monitor()
+    thread = runtime._reward_thread
+    try:
+        assert thread is not None
+        assert spy.first_round.wait(timeout=2)
+        assert sorted(spy.calls[:2]) == ["grp-a", "grp-b"]
+    finally:
+        runtime._reward_stop_event.set()
+        if thread is not None:
+            thread.join(timeout=2)
+            runtime._reward_thread = None

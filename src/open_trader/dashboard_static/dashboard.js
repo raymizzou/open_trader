@@ -3512,6 +3512,39 @@ function lpDashboardTodayGroups(rows) {
     .concat(unidentified);
 }
 
+// Issue 166 R2: 行级会话归因按行内订单自带的 session_id 映射 lp_sessions——
+// 恰一组→该组；零组（手动行，或旧快照行未带 session_id）→退回按 condition
+// 取最新组的旧口径；≥2 组→整组返回，由行渲染按组分行、不渲染加量按钮
+// （归属不明不猜测）。
+function lpDashboardRowSessions(group, sessionsById, sessionByCondition) {
+  const found = [];
+  const seen = new Set();
+  (group.orders || []).forEach((order) => {
+    const id = String(order.session_id || "");
+    if (id && sessionsById[id] && !seen.has(id)) {
+      seen.add(id);
+      found.push(sessionsById[id]);
+    }
+  });
+  if (found.length) return found;
+  const legacy = sessionByCondition[group.conditionId];
+  return legacy ? [legacy] : [];
+}
+
+// Issue 166 R2: 同 condition ≥2 组并存时，会话事实按组分行如实显示——
+// 每行以该组 outcome 开头，止损/已实现/持仓状态取自该组自己的会话。
+function lpDashboardMultiSessionRiskCell(sessions) {
+  return sessions.map((entry) => {
+    const own = {
+      token_id: entry.token_id,
+      order_id: entry.entry_order_id,
+      read_only: false,
+    };
+    return "<div><strong>" + escapeHtml(predictionValue(entry.outcome, "UNKNOWN"))
+      + "</strong>" + lpDashboardRiskCell(own, entry) + "</div>";
+  }).join("");
+}
+
 function lpDashboardTodayMarketOrder(groups, observations) {
   const keyOf = (group) => {
     const observation = observations[group.conditionId]
@@ -3774,10 +3807,12 @@ function lpDashboardTodayQueueProtectionRow(orders) {
 // Issue 158: the augment button renders only on the market row that owns the
 // active system session; pure manual web rows never get one.  No preset
 // gating beyond the panel-level read-only rule (design decision 3).
+// Issue 166: the button names its owning group explicitly and renders only
+// while that group is still entry_open — augments only land there.
 function lpDashboardAugmentButtonMarkup(orders, session) {
   if (!session || typeof session !== "object") return "";
   const sessionState = String(session.state || "").toLowerCase();
-  if (sessionState === "none" || session.error) return "";
+  if (sessionState !== "entry_open") return "";
   const conditionId = String(orders[0]?.condition_id || "");
   if (!conditionId || String(session.condition_id || "") !== conditionId) return "";
   // Issue 165: the button names its owning session explicitly so clicks
@@ -3909,8 +3944,12 @@ function lpDashboardTodayQuantityCell(orders, session) {
 }
 
 function lpDashboardTodayMarketRow(
-  group, rewards, rewardShares, observations, session,
+  group, rewards, rewardShares, observations, sessions,
 ) {
+  // Issue 166 R2: sessions 是该行归因出的组会话数组——恰一组用该组，
+  // 零组（手动行/旧载荷）为 null，≥2 组走按组分行、无加量按钮的多组渲染。
+  const rowSessions = Array.isArray(sessions) ? sessions : [];
+  const session = rowSessions.length === 1 ? rowSessions[0] : null;
   const identity = group.conditionId;
   const orders = group.orders;
   const firstOrder = orders[0];
@@ -3922,12 +3961,20 @@ function lpDashboardTodayMarketRow(
     : lpDashboardRewardSummary(firstOrder, rewards);
   const share = rewardShares && typeof rewardShares === "object" ? rewardShares[identity] : null;
   const shareMarkup = lpDashboardShareCell(share || {}, observation);
-  const riskMarkup = lpDashboardExposureRiskCell(firstOrder, session, observation);
+  const multiSession = rowSessions.length > 1;
+  const riskMarkup = multiSession
+    ? (observation && typeof observation === "object"
+        ? lpDashboardExposureRiskCell(firstOrder, null, observation)
+        : "") + lpDashboardMultiSessionRiskCell(rowSessions)
+    : lpDashboardExposureRiskCell(firstOrder, session, observation);
+  const sessionRiskCell = multiSession
+    ? lpDashboardMultiSessionRiskCell(rowSessions)
+    : lpDashboardRiskCell(firstOrder, session);
   const detailsMarkup = observation
     ? lpDashboardObservationDetail(
       observation,
       lpDashboardRewardSummary(firstOrder, rewards),
-      lpDashboardRiskCell(firstOrder, session),
+      sessionRiskCell,
     )
     : "";
   const subtitle = lpDashboardTodaySubtitle(orders);
@@ -4183,9 +4230,30 @@ function predictionLpCard(payload) {
   const rewardShares = lpDashboardRewards(dashboard.reward_shares);
   const observations = lpDashboardObservations(dashboard.lp_observations);
   const session = dashboard.lp_session;
-  const activeSession = session && typeof session === "object"
-    && String(session.state || "").toLowerCase() !== "none"
-    && !session.error;
+  // Issue 166: 组卡列表来自服务端 lp_sessions（最新在前）；旧载荷缺失该键时
+  // 回退旧 lp_session 单卡（旧快照兼容）。无活动组时服务端已放最近完结组。
+  const rawSessionList = Array.isArray(dashboard.lp_sessions)
+    ? dashboard.lp_sessions : [];
+  const sessionList = (rawSessionList.length
+    ? rawSessionList
+    : (session && typeof session === "object"
+      && String(session.state || "").toLowerCase() !== "none"
+      ? [session] : []))
+    .filter((row) => row && typeof row === "object"
+      && String(row.state || "").toLowerCase() !== "none");
+  // 每行当天委托按 condition_id 取自己组的会话数据，不再共用单一 lp_session。
+  const sessionByCondition = {};
+  for (const row of sessionList) {
+    const key = String(row.condition_id || "");
+    if (key && !sessionByCondition[key]) sessionByCondition[key] = row;
+  }
+  // Issue 166 R2: 行内 session_id → 组会话，供行级归因（见 lpDashboardRowSessions）。
+  const sessionsById = {};
+  for (const row of sessionList) {
+    const id = String(row.session_id || "");
+    if (id) sessionsById[id] = row;
+  }
+  const activeSession = sessionList.length > 0;
   const stale = dashboard.stale === true || dashboard.state === "stale";
   const snapshotPending = String(dashboard.state || "") === "snapshot_pending";
   const snapshotPendingMarkup = snapshotPending
@@ -4210,7 +4278,8 @@ function predictionLpCard(payload) {
   );
   const todayRowsHtml = todayGroups.length
     ? todayGroups.map((group) => lpDashboardTodayMarketRow(
-      group, rewards, rewardShares, observations, session,
+      group, rewards, rewardShares, observations,
+      lpDashboardRowSessions(group, sessionsById, sessionByCondition),
     )).join("")
     : "<tr><td colspan=\"6\" class=\"pm-observation-empty\">当天暂无 LP 委托。从上方待试挂候选点「挂单」登记第一笔，提交即受位置保护。</td></tr>";
   const nonLpRowCount = Number(dashboard.non_lp_row_count);
@@ -4284,10 +4353,23 @@ function predictionLpCard(payload) {
     + "<th scope=\"col\">压力退出损失（金额 / 比例）</th><th scope=\"col\">检查时间与状态</th><th scope=\"col\">操作</th></tr></thead>"
     + "<tbody>" + candidateRowsHtml + "</tbody></table></div>"
     + "<p class=\"sub\">候选为持续滚动的候选池：探索线程按基础筛选队列分批轮转（每批最多 10 个市场、一次盘口读），估值成功即入池、每行自带 5 分钟有效期、到期自动让位；维护线程持续为当前展示前十续命；表内按目标 5% 官方奖励份额的预计收益率/小时降序，并列按估值时间新→旧、再按市场身份，第 1 名为当前推荐、退出由下一名自动补位；刷新失败的行保留至原到期并标注，值为上次成功估值；预计收益率为估值时盘口的估算、非保证收益，缺值显示待测、不回退奖池上限；未检查的市场不代表劣于已展示者；已有委托或持仓的市场不重复推荐；拟挂占资超过可用资金（已扣委托占用）的候选不进入队列；参考价有 1 小时新鲜门，过期进入备用队列；官方竞争仅作并列参考；链接为普通跳转，实际下单前以 Polymarket 页面实时事实为准。</p></section>";
+  // Issue 166: 一组沿用原标题；多组标题改「活动组 · N」，卡序=服务端顺序
+  //（最新在前），完结组沉底照常显示。
+  const sessionSummary = sessionList.length > 1
+    ? "活动组 · " + escapeHtml(String(sessionList.length))
+      + "<span class=\"sub\">· 最新在最上 · 完结组沉底 · 每组独立止损 $5、独立复核时间</span>"
+    : "当前系统会话详情 · "
+      + escapeHtml(predictionValue(
+        sessionList[0]?.market_title || sessionList[0]?.market
+          || sessionList[0]?.question, "系统会话"));
   const sessionDetails = activeSession
-    ? "<details class=\"pm-lp-session-details\" data-lp-details-key=\"lp-session-details\"><summary>当前系统会话详情 · "
-      + escapeHtml(predictionValue(session.market_title || session.market || session.question, "系统会话"))
-      + "</summary>" + predictionLpSessionCard({...payload, lp_session: session})
+    ? "<details class=\"pm-lp-session-details\" data-lp-details-key=\"lp-session-details\"><summary>"
+      + sessionSummary
+      + "</summary><div class=\"lp-session-stack\">"
+      + sessionList.map((row) => predictionLpSessionCard(
+        {...payload, lp_session: row},
+      )).join("")
+      + "</div>"
       + "<p class=\"sub\">系统会话仍按北京时间 08:00 复盘并使用原 $5 止损触发线；候选是待测参考，不会创建或管理订单。</p></details>"
     : "";
   const error = payload?.lp_error || (session && session.error);
@@ -6210,7 +6292,7 @@ function lpSubmitStateMessage(result) {
     return `当前状态不允许提交（${reason || "locked"}）。`;
   }
   if (resultState === "busy") {
-    if (reason === "active_lp_session") return "已有活动 LP 会话，本单未提交。";
+    if (reason === "lp_session_market_active") return "该标的已有活动组，本单未提交；换一个标的即可开仓。";
     if (reason === "active_execution") return "已有另一笔交易正在执行，本单未提交。";
     if (reason === "execution_lock") return "已有另一笔操作正在确认，请稍后重新确认。";
     return `系统忙，暂不能提交（${reason || "busy"}）。`;
@@ -6311,6 +6393,15 @@ function lpSubmitToastCopy(result) {
     };
   }
   if (resultState === "busy") {
+    // Issue 166: 同标的已有活动组的拒绝文案点名换标的；其余 busy 理由维持
+    // 既有通用文案。
+    if (String(result?.reason || "") === "lp_session_market_active") {
+      return {
+        kind: "danger",
+        main: "业务忙：该标的已有活动组，本单未提交",
+        sub: "换一个标的即可开仓 · 本单未发出",
+      };
+    }
     return {
       kind: "danger",
       main: "业务忙：已有活动 LP 会话，本单未提交",
@@ -7092,12 +7183,18 @@ async function handlePredictionMarketClick(event) {
   if (lpAugmentEntry && !lpAugmentEntry.disabled) {
     const conditionId = String(lpAugmentEntry.dataset.conditionId || "");
     // Issue 165: the button names its owning session; a click whose
-    // session_id is empty or no longer matches the served lp_session is
-    // ignored (no modal).
+    // session_id is empty or no longer matches the served session list is
+    // ignored (no modal).  Issue 166: the served list is lp_sessions — the
+    // click must land on its own group, not "whatever session is newest".
     const sessionId = String(lpAugmentEntry.dataset.sessionId || "");
     const dashboard = state.predictionMarket.lpDashboard;
-    const session = dashboard?.lp_session;
-    if (!sessionId || String(session?.session_id || "") !== sessionId) {
+    const servedList = Array.isArray(dashboard?.lp_sessions)
+      && dashboard.lp_sessions.length
+      ? dashboard.lp_sessions
+      : (dashboard?.lp_session ? [dashboard.lp_session] : []);
+    const session = servedList.find((row) => row && typeof row === "object"
+      && String(row.session_id || "") === sessionId) || null;
+    if (!sessionId || !session) {
       return;
     }
     const group = lpDashboardTodayGroups(lpDashboardRows(dashboard?.lp_orders_today))

@@ -972,11 +972,31 @@ class PredictionRuntime:
             raise
 
     def _start_lp_monitor(self) -> None:
-        """Keep one active LP session reconciled by the owned runtime."""
+        """Keep every active LP session group reconciled by the owned runtime.
+
+        Issue 166: the tick reports an aggregate payload carrying one entry
+        per active group; the daily-report trigger fires only when every
+        group passes the existing readiness predicate (the deadline-cancel
+        waiting exception stays per group).
+        """
 
         if self.lp is None or self.execution is None or self._lp_thread is not None:
             return
         self._lp_stop_event.clear()
+
+        def group_reconciled(payload: Mapping[str, object]) -> bool:
+            state = str(payload.get("state") or "")
+            cancellation_pending = (
+                state == "needs_attention"
+                and payload.get("review_status") == "awaiting_reconciliation"
+                and str(payload.get("reconciliation") or "").startswith("deadline_cancel_")
+            )
+            return (
+                state not in {"busy", "needs_attention", "error", "failed"}
+                or cancellation_pending
+            ) and payload.get("account_checked_at") is not None and (
+                payload.get("book_checked_at") is not None
+            )
 
         def run() -> None:
             while not self._lp_stop_event.wait(_LP_TICK_SECONDS):
@@ -995,22 +1015,20 @@ class PredictionRuntime:
                     logger.exception("prediction_lp_tick_failed")
                     continue
                 generate_report = getattr(self.lp, "generate_due_report", None)
-                state = str(status.get("state") or "") if isinstance(status, Mapping) else ""
-                cancellation_pending = (
-                    state == "needs_attention"
-                    and isinstance(status, Mapping)
-                    and status.get("review_status") == "awaiting_reconciliation"
-                    and str(status.get("reconciliation") or "").startswith("deadline_cancel_")
-                )
-                reconciliation_ready = state == "none" or (
-                    isinstance(status, Mapping)
-                    and (
-                        state not in {"busy", "needs_attention", "error", "failed"}
-                        or cancellation_pending
+                if not isinstance(status, Mapping):
+                    continue
+                state = str(status.get("state") or "")
+                sessions = status.get("sessions")
+                if state == "none":
+                    reconciliation_ready = True
+                elif isinstance(sessions, (list, tuple)):
+                    reconciliation_ready = bool(sessions) and all(
+                        isinstance(row, Mapping) and group_reconciled(row)
+                        for row in sessions
                     )
-                    and status.get("account_checked_at") is not None
-                    and status.get("book_checked_at") is not None
-                )
+                else:
+                    # Legacy single-group payload without the sessions key.
+                    reconciliation_ready = group_reconciled(status)
                 if callable(generate_report) and reconciliation_ready:
                     try:
                         generate_report()
@@ -1039,12 +1057,46 @@ class PredictionRuntime:
                 refresh_rewards = getattr(lp, "refresh_rewards", None)
                 if not callable(refresh_rewards):
                     return
-                try:
-                    refresh_rewards(stop_event=self._reward_stop_event)
-                except Exception:
-                    # Earnings are read-only and advisory; a failed refresh
-                    # is recorded by the service without touching LP risk.
-                    logger.exception("prediction_lp_reward_refresh_failed")
+                # Issue 166: refresh every active group by name; with no
+                # active group the id-less call keeps the active→latest
+                # read-only projection over the newest historical session.
+                session_ids: list[str] = []
+                sessions_reader = (
+                    getattr(self.store, "lp_active_sessions", None)
+                    if self.store is not None
+                    else None
+                )
+                if callable(sessions_reader):
+                    try:
+                        session_ids = [
+                            str(row.get("session_id") or "")
+                            for row in sessions_reader()
+                            if row.get("session_id")
+                        ]
+                    except Exception:
+                        logger.exception("prediction_lp_reward_group_list_failed")
+                        session_ids = []
+                if session_ids:
+                    for session_id in session_ids:
+                        if self._reward_stop_event.is_set():
+                            return
+                        try:
+                            refresh_rewards(
+                                session_id=session_id,
+                                stop_event=self._reward_stop_event,
+                            )
+                        except Exception:
+                            # Earnings are read-only and advisory; a failed
+                            # refresh is recorded by the service without
+                            # touching LP risk.
+                            logger.exception("prediction_lp_reward_refresh_failed")
+                else:
+                    try:
+                        refresh_rewards(stop_event=self._reward_stop_event)
+                    except Exception:
+                        # Earnings are read-only and advisory; a failed refresh
+                        # is recorded by the service without touching LP risk.
+                        logger.exception("prediction_lp_reward_refresh_failed")
                 if self._reward_stop_event.is_set():
                     return
                 execution = self.execution

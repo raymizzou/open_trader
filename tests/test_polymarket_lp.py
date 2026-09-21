@@ -10191,7 +10191,7 @@ def test_lp163_submit_entry_validation_rejection_no_session_row(tmp_path) -> Non
 
 
 def test_lp163_submit_entry_busy_when_active_session(tmp_path) -> None:
-    """S8: 已有活动会话 → busy/active_lp_session；零快照读、零挂单。"""
+    """S8: 同标的已有活动组 → busy/lp_session_market_active；零快照读、零挂单。"""
     now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
     store, exchange, service, started = _augment_running_service(
         tmp_path, now, key="lp163-s8-entry"
@@ -10207,10 +10207,309 @@ def test_lp163_submit_entry_busy_when_active_session(tmp_path) -> None:
     result = service.submit_entry(request, "lp163-s8")
 
     assert result["state"] == "busy"
-    assert result["reason"] == "active_lp_session"
+    assert result["reason"] == "lp_session_market_active"
     assert str(result["session_id"]) == str(started["session_id"])
     assert exchange.snapshot_calls == before_calls
     assert len(exchange.posts) == 1  # 仅既有入场单
+
+
+def _lp166_market_identity(index: int) -> dict[str, object]:
+    """Issue 166: a distinct market identity (condition/token/market)."""
+
+    return {
+        "market_id": f"market-{index}",
+        "condition_id": "0x" + format(index, "x") * 64,
+        "token_id": "0x" + format(index + 16, "x") * 64,
+        "outcome": "YES",
+    }
+
+
+def _lp166_book(now: datetime, identity: dict[str, object]) -> dict[str, object]:
+    """Fresh book whose market block carries ``identity``."""
+
+    book = _lp163_book(now, Decimal("0.29"))
+    market = dict(book["market"])  # type: ignore[arg-type]
+    market.update(identity)
+    book["market"] = market
+    return book
+
+
+def test_lp166_multi_market_entry_coexistence(tmp_path) -> None:
+    """A: 组 A（标的甲）在仓后，标的乙 submit_entry 成功且两行均非终态；
+    对标的甲同 (condition_id, outcome) 再次提交 → busy/lp_session_market_active
+    且载荷含组 A 的 session_id；同幂等键重放返回原行不报冲突。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    exchange = _Exchange()
+    market_a = _lp166_market_identity(1)
+    market_b = _lp166_market_identity(2)
+    exchange.snapshot_value = _lp166_book(now, market_a)
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+
+    # 组 A 经老两段式入口建仓。
+    preview_a = service.preview(
+        {**market_a, "price": Decimal("0.29"), "quantity": Decimal("20"),
+         "review_at": now + timedelta(minutes=10)}
+    )
+    assert preview_a["state"] == "previewed"
+    started_a = service.start(str(preview_a["preview_id"]), "lp166-a")
+    assert started_a["state"] == "entry_open"
+    session_a = str(started_a["session_id"])
+
+    # 标的乙提交成功，两行均非终态。
+    exchange.snapshot_value = _lp166_book(now, market_b)
+    entry_b = service.submit_entry(
+        {**market_b, "price": Decimal("0.29"), "quantity": Decimal("20"),
+         "review_at": now + timedelta(minutes=10)},
+        "lp166-b",
+    )
+    assert entry_b["state"] == "entry_open"
+    session_b = str(entry_b["session_id"])
+    assert {row["session_id"] for row in store.lp_active_sessions()} == {
+        session_a,
+        session_b,
+    }
+
+    # 对标的甲同 (condition_id, outcome) 再次提交 → busy，指向组 A，零快照读。
+    exchange.snapshot_value = _lp166_book(now, market_a)
+    before_calls = exchange.snapshot_calls
+    conflict = service.submit_entry(
+        {**market_a, "price": Decimal("0.29"), "quantity": Decimal("20"),
+         "review_at": now + timedelta(minutes=10)},
+        "lp166-a-conflict",
+    )
+    assert conflict == {
+        "state": "busy",
+        "reason": "lp_session_market_active",
+        "session_id": session_a,
+    }
+    assert exchange.snapshot_calls == before_calls
+    assert len(exchange.posts) == 2  # 仅组 A、组 B 的入场单
+
+    # 同幂等键重放 → 返回原行（组 B），不报冲突、不加单。
+    replay = service.submit_entry(
+        {**market_b, "price": Decimal("0.29"), "quantity": Decimal("20"),
+         "review_at": now + timedelta(minutes=10)},
+        "lp166-b",
+    )
+    assert replay["state"] == "entry_open"
+    assert str(replay["session_id"]) == session_b
+    assert len(exchange.posts) == 2
+
+
+def test_lp166_start_same_market_store_fallback_rejected(tmp_path) -> None:
+    """A(老两段式): 同标的+方向经 start() 绕过服务门禁时由数据库兜底映射
+    lp_session_market_active；不同标的照常开组。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    exchange = _Exchange()
+    market_a = _lp166_market_identity(1)
+    market_c = _lp166_market_identity(3)
+    exchange.snapshot_value = _lp166_book(now, market_a)
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+
+    preview_a = service.preview(
+        {**market_a, "price": Decimal("0.29"), "quantity": Decimal("20"),
+         "review_at": now + timedelta(minutes=10)}
+    )
+    started_a = service.start(str(preview_a["preview_id"]), "lp166-fb-a")
+    assert started_a["state"] == "entry_open"
+    session_a = str(started_a["session_id"])
+    posts_before = len(exchange.posts)
+
+    # 同标的+方向、新幂等键 → store 兜底映射 lp_session_market_active，无新单。
+    preview_conflict = service.preview(
+        {**market_a, "price": Decimal("0.29"), "quantity": Decimal("20"),
+         "review_at": now + timedelta(minutes=10)}
+    )
+    rejected = service.start(str(preview_conflict["preview_id"]), "lp166-fb-conflict")
+    assert rejected == {"state": "rejected", "reason": "lp_session_market_active"}
+    assert len(exchange.posts) == posts_before
+    assert store.lp_session_by_idempotency("lp166-fb-conflict") is None
+
+    # 不同标的照常开组。
+    exchange.snapshot_value = _lp166_book(now, market_c)
+    preview_c = service.preview(
+        {**market_c, "price": Decimal("0.29"), "quantity": Decimal("20"),
+         "review_at": now + timedelta(minutes=10)}
+    )
+    started_c = service.start(str(preview_c["preview_id"]), "lp166-fb-c")
+    assert started_c["state"] == "entry_open"
+    assert {row["session_id"] for row in store.lp_active_sessions()} == {
+        session_a,
+        str(started_c["session_id"]),
+    }
+
+
+def _lp166_held_position_book(
+    now: datetime,
+    identity: dict[str, object],
+    position: dict[str, object],
+) -> dict[str, object]:
+    """Fresh book for ``identity`` whose account holds one position (no orders)."""
+
+    book = _lp166_book(now, identity)
+    account = dict(book["account"])  # type: ignore[arg-type]
+    account["open_orders"] = []
+    account["positions"] = [position]
+    book["account"] = account
+    return book
+
+
+def test_lp166_submit_entry_rejects_opposite_direction_when_participating(tmp_path) -> None:
+    """B(R1): YES 组入场单全部成交（账户无挂单、持仓在 YES token、组仍活动）后，
+    同 condition 的 NO 方向 submit_entry → rejected/market_already_participating；
+    无新单、无新会话行、组 A 不受影响。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    exchange = _Exchange()
+    market_yes = _lp166_market_identity(1)
+    exchange.snapshot_value = _lp166_book(now, market_yes)
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    started = service.submit_entry(
+        {**market_yes, "price": Decimal("0.29"), "quantity": Decimal("20"),
+         "review_at": now + timedelta(minutes=10)},
+        "lp166-r1-a",
+    )
+    assert started["state"] == "entry_open"
+    session_a = str(started["session_id"])
+    assert len(exchange.posts) == 1
+
+    # 入场单全部成交：账户事实无挂单、仅 YES token 持仓。
+    market_no = {
+        **market_yes,
+        "token_id": "0x" + format(24, "x") * 64,
+        "outcome": "NO",
+    }
+    exchange.snapshot_value = _lp166_held_position_book(
+        now,
+        market_no,
+        {
+            "condition_id": market_yes["condition_id"],
+            "market_id": market_yes["market_id"],
+            "token_id": market_yes["token_id"],
+            "outcome": "YES",
+            "size": Decimal("20"),
+        },
+    )
+    posts_before = len(exchange.posts)
+
+    result = service.submit_entry(
+        {**market_no, "price": Decimal("0.29"), "quantity": Decimal("20"),
+         "review_at": now + timedelta(minutes=10)},
+        "lp166-r1-no",
+    )
+
+    assert result == {"state": "rejected", "reason": "market_already_participating"}
+    assert len(exchange.posts) == posts_before
+    assert store.lp_session_by_idempotency("lp166-r1-no") is None
+    assert {row["session_id"] for row in store.lp_active_sessions()} == {session_a}
+
+
+def test_lp166_submit_entry_participation_check_spares_other_markets(tmp_path) -> None:
+    """B(R1): 参与检查只命中同 condition——YES 持仓在场时，不同标的提交照常 entry_open。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    exchange = _Exchange()
+    market_a = _lp166_market_identity(1)
+    exchange.snapshot_value = _lp166_book(now, market_a)
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    started = service.submit_entry(
+        {**market_a, "price": Decimal("0.29"), "quantity": Decimal("20"),
+         "review_at": now + timedelta(minutes=10)},
+        "lp166-r1-b-a",
+    )
+    assert started["state"] == "entry_open"
+
+    market_b = _lp166_market_identity(2)
+    exchange.snapshot_value = _lp166_held_position_book(
+        now,
+        market_b,
+        {
+            "condition_id": market_a["condition_id"],
+            "market_id": market_a["market_id"],
+            "token_id": market_a["token_id"],
+            "outcome": "YES",
+            "size": Decimal("20"),
+        },
+    )
+
+    result = service.submit_entry(
+        {**market_b, "price": Decimal("0.29"), "quantity": Decimal("20"),
+         "review_at": now + timedelta(minutes=10)},
+        "lp166-r1-b-b",
+    )
+
+    assert result["state"] == "entry_open"
+
+
+def test_lp166_submit_augment_not_blocked_by_participation_check(tmp_path) -> None:
+    """B(R1): 参与检查严禁误伤加量——本组挂单在场（参与检查必命中）时
+    submit_augment 照常追加，不加新组。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _augment_running_service(
+        tmp_path, now, key="lp166-r1-c"
+    )
+    session_id = str(started["session_id"])
+    exchange.snapshot_value = _augment_preview_snapshot(
+        now, level=Decimal("380"), own_original=Decimal("120")
+    )
+    posts_before = len(exchange.posts)
+
+    result = service.submit_augment(session_id, "20", "lp166-r1-c-aug")
+
+    assert result["state"] == "entry_open"
+    assert str(result["augment_order_id"]) == "order-2"
+    assert len(exchange.posts) == posts_before + 1
+    assert store.lp_session(session_id)["augment_order_ids"] == ["order-2"]
+
+
+def test_lp166_start_confirm_rejects_participating_market(tmp_path) -> None:
+    """B(R1): 老 start confirm 路径同口径——preview 时市场干净、confirm 新鲜事实
+    出现同 condition 持仓 → rejected/market_already_participating；无新单、无会话行、
+    preview 未消费。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    exchange = _Exchange()
+    market_a = _lp166_market_identity(1)
+    market_b = _lp166_market_identity(2)
+    exchange.snapshot_value = _lp166_book(now, market_b)
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    # 组 B 先经 submit_entry 在标的乙建仓并成交（持仓在乙）。
+    started_b = service.submit_entry(
+        {**market_b, "price": Decimal("0.29"), "quantity": Decimal("20"),
+         "review_at": now + timedelta(minutes=10)},
+        "lp166-r1-d-b",
+    )
+    assert started_b["state"] == "entry_open"
+
+    # 市场甲 preview 时干净。
+    exchange.snapshot_value = _lp166_book(now, market_a)
+    preview_a = service.preview(
+        {**market_a, "price": Decimal("0.29"), "quantity": Decimal("20"),
+         "review_at": now + timedelta(minutes=10)}
+    )
+    assert preview_a["state"] == "previewed"
+    # confirm 时新鲜事实显示甲上已有同 condition 持仓（组 B 的乙不相关）。
+    exchange.snapshot_value = _lp166_held_position_book(
+        now,
+        market_a,
+        {
+            "condition_id": market_a["condition_id"],
+            "market_id": market_a["market_id"],
+            "token_id": "0x" + format(31, "x") * 64,
+            "outcome": "YES",
+            "size": Decimal("20"),
+        },
+    )
+    posts_before = len(exchange.posts)
+
+    result = service.start(str(preview_a["preview_id"]), "lp166-r1-d-a")
+
+    assert result == {"state": "rejected", "reason": "market_already_participating"}
+    assert len(exchange.posts) == posts_before
+    assert store.lp_session_by_idempotency("lp166-r1-d-a") is None
+    assert store.lp_preview(str(preview_a["preview_id"])) is not None
 
 
 def test_lp163_submit_entry_review_too_soon(tmp_path) -> None:
@@ -10437,3 +10736,548 @@ def test_lp163_submit_augment_idempotency_and_unknown(tmp_path) -> None:
     assert replay_unknown["state"] == "needs_attention"
     assert replay_unknown["reason"] == "augment_submit_unknown"
     assert len(exchange_b.posts) == posts_after_unknown  # 重放不重发
+
+
+def test_lp166_entry_funds_check_nets_all_group_reservations(tmp_path) -> None:
+    """B: 组 A 挂 $50 买单（余额 $120、授权 $200）后，标的乙 $100 提交被拒
+    balance_insufficient（120−50=70＜100）；同场景 $60 通过（70≥60）；
+    无任何活动组时同样的 $100 可以通过（扣占用口径的反事实对照）。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    market_a = _lp166_market_identity(1)
+    market_b = _lp166_market_identity(2)
+
+    def funded_book(identity: dict[str, object]) -> dict[str, object]:
+        book = _lp166_book(now, identity)
+        account = dict(book["account"])  # type: ignore[arg-type]
+        account["balance"] = Decimal("120")
+        account["allowance"] = Decimal("200")
+        book["account"] = account
+        # 0.50/0.52 盘口：0.50 挂单距中点 0.01 ≤ reward_max_spread 0.10。
+        book["book"] = {
+            **book["book"],  # type: ignore[arg-type]
+            "asks": [{"price": Decimal("0.52"), "size": Decimal("1000")}],
+            "bids": [{"price": Decimal("0.50"), "size": Decimal("1000")}],
+        }
+        return book
+
+    # 反事实对照：零活动组时 $100 提交通过。
+    exchange = _Exchange()
+    exchange.snapshot_value = funded_book(market_b)
+    store = PredictionArbitrageStore(tmp_path / "counterfactual")
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    alone = service.submit_entry(
+        {**market_b, "price": Decimal("0.50"), "quantity": Decimal("200"),
+         "review_at": now + timedelta(minutes=10)},
+        "lp166-b-alone",
+    )
+    assert alone["state"] == "entry_open"
+
+    # 组 A：$50 买单（0.50 × 100）在仓，占用 $50。
+    exchange = _Exchange()
+    exchange.snapshot_value = funded_book(market_a)
+    store = PredictionArbitrageStore(tmp_path / "main")
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    group_a = service.submit_entry(
+        {**market_a, "price": Decimal("0.50"), "quantity": Decimal("100"),
+         "review_at": now + timedelta(minutes=10)},
+        "lp166-b-a",
+    )
+    assert group_a["state"] == "entry_open"
+
+    # 标的乙 $100（0.50 × 200）：120−50=70＜100 → balance_insufficient。
+    exchange.snapshot_value = funded_book(market_b)
+    posts_before = len(exchange.posts)
+    rejected = service.submit_entry(
+        {**market_b, "price": Decimal("0.50"), "quantity": Decimal("200"),
+         "review_at": now + timedelta(minutes=10)},
+        "lp166-b-reject",
+    )
+    assert rejected == {"state": "rejected", "reason": "balance_insufficient"}
+    assert len(exchange.posts) == posts_before
+    assert store.lp_session_by_idempotency("lp166-b-reject") is None
+
+    # 同场景 $60（0.50 × 120）：70≥60 → 放行，两行均非终态。
+    accepted = service.submit_entry(
+        {**market_b, "price": Decimal("0.50"), "quantity": Decimal("120"),
+         "review_at": now + timedelta(minutes=10)},
+        "lp166-b-accept",
+    )
+    assert accepted["state"] == "entry_open"
+    assert {row["session_id"] for row in store.lp_active_sessions()} == {
+        str(group_a["session_id"]),
+        str(accepted["session_id"]),
+    }
+
+
+def test_lp166_entry_funds_unknown_reservations_rejected(tmp_path) -> None:
+    """B(未知): 活动组占用金额不可得（缺 price 的存量行）→
+    account_facts_unknown 拒绝，不用未扣占用的余额放行。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    market_a = _lp166_market_identity(1)
+    market_b = _lp166_market_identity(2)
+    exchange = _Exchange()
+    book = _lp166_book(now, market_b)
+    account = dict(book["account"])  # type: ignore[arg-type]
+    account["balance"] = Decimal("120")
+    account["allowance"] = Decimal("200")
+    book["account"] = account
+    book["book"] = {
+        **book["book"],  # type: ignore[arg-type]
+        "asks": [{"price": Decimal("0.52"), "size": Decimal("1000")}],
+        "bids": [{"price": Decimal("0.50"), "size": Decimal("1000")}],
+    }
+    exchange.snapshot_value = book
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    # 直接落一行缺 price 的活动组 → 占用金额不可计算。
+    store.lp_create_session(
+        "lp166-unknown-occupier",
+        "lp166-unknown-key",
+        state="entry_open",
+        payload={"condition_id": market_a["condition_id"], "outcome": "YES"},
+    )
+
+    result = service.submit_entry(
+        {**market_b, "price": Decimal("0.50"), "quantity": Decimal("200"),
+         "review_at": now + timedelta(minutes=10)},
+        "lp166-b-unknown",
+    )
+    assert result == {"state": "rejected", "reason": "account_facts_unknown"}
+    assert exchange.posts == []
+
+
+def test_lp166_submit_augment_blocks_passive_exit_and_entry_pending(tmp_path) -> None:
+    """D: 加量只许 entry_open——passive_exit 拒 session_passive_exit、
+    entry_submit_pending 拒 session_entry_pending；零快照、零挂单。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    cases = [
+        ("passive_exit", "session_passive_exit"),
+        ("entry_submit_pending", "session_entry_pending"),
+    ]
+    for index, (state, expected_reason) in enumerate(cases):
+        store, exchange, service, started = _augment_running_service(
+            tmp_path / f"s166-{index}", now, key=f"lp166-s166-{index}"
+        )
+        session_id = str(started["session_id"])
+        store.lp_update_session(session_id, state=state)
+        calls_before = exchange.snapshot_calls
+        posts_before = len(exchange.posts)
+
+        result = service.submit_augment(session_id, "20", f"lp166-s166-{index}")
+
+        assert result == {"state": "rejected", "reason": expected_reason}
+        assert exchange.snapshot_calls == calls_before
+        assert len(exchange.posts) == posts_before
+
+    # entry_open 放行（同一服务下作正对照）。
+    store, exchange, service, started = _augment_running_service(
+        tmp_path / "s166-open", now, key="lp166-s166-open"
+    )
+    session_id = str(started["session_id"])
+    exchange.snapshot_value = _augment_preview_snapshot(
+        now, level=Decimal("380"), own_original=Decimal("120")
+    )
+    ok = service.submit_augment(session_id, "20", "lp166-s166-open-aug")
+    assert ok["state"] == "entry_open"
+    assert len(exchange.posts) == 2
+
+
+def test_lp166_two_phase_augment_blocks_same_states(tmp_path) -> None:
+    """D: 老两段式加量与 submit_augment 共用同一张拦截表——
+    augment_preview 对 passive_exit / entry_submit_pending / review 三态各拒
+    真实理由；confirm 侧（先出凭证后翻状态）同样被 _augment_session 拦下。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    cases = [
+        ("passive_exit", "session_passive_exit"),
+        ("entry_submit_pending", "session_entry_pending"),
+        ("review", "session_review_exit"),
+    ]
+    for index, (state, expected_reason) in enumerate(cases):
+        store, exchange, service, started = _augment_running_service(
+            tmp_path / f"two-{index}", now, key=f"lp166-two-{index}"
+        )
+        session_id = str(started["session_id"])
+        store.lp_update_session(session_id, state=state)
+        posts_before = len(exchange.posts)
+
+        preview = _augment_preview(service, session_id, 90)
+
+        assert preview == {"state": "rejected", "reason": expected_reason}
+        assert len(exchange.posts) == posts_before
+
+    # confirm 侧：entry_open 时先取凭证，翻到 passive_exit 后 confirm 被拦。
+    store, exchange, service, started = _augment_running_service(
+        tmp_path / "two-confirm", now, key="lp166-two-confirm"
+    )
+    session_id = str(started["session_id"])
+    exchange.snapshot_value = _augment_preview_snapshot(
+        now, level=Decimal("380"), own_original=Decimal("120")
+    )
+    preview = _augment_preview(service, session_id, 90)
+    assert preview["state"] == "previewed"
+    store.lp_update_session(session_id, state="passive_exit")
+    posts_before = len(exchange.posts)
+
+    result = service.augment(session_id, str(preview["preview_id"]), "lp166-two-c")
+
+    assert result == {"state": "rejected", "reason": "session_passive_exit"}
+    assert len(exchange.posts) == posts_before
+
+
+class _PerTokenExchange(_Exchange):
+    """Issue 166: each group reconciles against its own token's snapshot."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.by_token: dict[str, dict[str, object]] = {}
+
+    def lp_snapshot(self, request: dict[str, object]) -> dict[str, object]:
+        self.snapshot_calls += 1
+        token = str(request.get("token_id") or "")
+        snapshot = self.by_token.get(token)
+        if snapshot is None:
+            raise RuntimeError("snapshot unavailable")
+        return snapshot
+
+
+def _lp166_two_groups(now: datetime, tmp_path, exchange) -> tuple:
+    """Start group A (market-1/token-1) and group B (market-2/token-2)."""
+
+    market_a = _lp166_market_identity(1)
+    market_b = _lp166_market_identity(2)
+    exchange.by_token.setdefault(
+        str(market_a["token_id"]), _lp166_book(now, market_a)
+    )
+    exchange.by_token.setdefault(
+        str(market_b["token_id"]), _lp166_book(now, market_b)
+    )
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    entry_a = service.submit_entry(
+        {**market_a, "price": Decimal("0.30"), "quantity": Decimal("10"),
+         "review_at": now + timedelta(minutes=10)},
+        "lp166-tick-a",
+    )
+    assert entry_a["state"] == "entry_open"
+    entry_b = service.submit_entry(
+        {**market_b, "price": Decimal("0.22"), "quantity": Decimal("10"),
+         "review_at": now + timedelta(minutes=10)},
+        "lp166-tick-b",
+    )
+    assert entry_b["state"] == "entry_open", entry_b
+    return store, service, str(entry_a["session_id"]), str(entry_b["session_id"])
+
+
+def test_lp166_tick_zero_groups_payload_unchanged(tmp_path) -> None:
+    """E(零组): 无活动组时 tick 的 none 载荷与现契约逐键一致。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, _Exchange(), clock=lambda: now)
+    assert service.tick() == {"state": "none", "session_id": None}
+
+
+def test_lp166_tick_single_group_keeps_payload_shape(tmp_path) -> None:
+    """E(单组): 顶层保持今天单组载荷形状并附加 sessions 键。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    exchange = _PerTokenExchange()
+    exchange.by_token[_lp166_market_identity(1)["token_id"]] = _lp166_book(
+        now, _lp166_market_identity(1)
+    )
+    store, service, session_a, _session_b = _lp166_two_groups(
+        now, tmp_path / "single", exchange
+    )
+    # 单组场景：把 B 终态化，只剩 A 活动。
+    store.lp_update_session(_session_b, state="complete")
+
+    result = service.tick()
+
+    assert result["state"] == "entry_open"
+    assert str(result["session_id"]) == session_a
+    sessions = result["sessions"]
+    assert isinstance(sessions, list) and len(sessions) == 1
+    without_key = {k: v for k, v in result.items() if k != "sessions"}
+    assert sessions[0] == without_key
+
+
+def test_lp166_tick_two_groups_aggregate_oldest_stamps(tmp_path) -> None:
+    """E(两组): sessions 含两组完整载荷；顶层时间戳取两组最旧；
+    state 取最差态（两组均正常 → ok）；session_id 为 None。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    exchange = _PerTokenExchange()
+    token_a = str(_lp166_market_identity(1)["token_id"])
+    token_b = str(_lp166_market_identity(2)["token_id"])
+    # 两组各自带不同的核对时间戳：account_checked_at 可由账户快照自带；
+    # book_checked_at 取盘口 received_at（须在 10 秒新鲜度内：A 比 B 旧 5 秒）。
+    book_a = _lp166_book(now, _lp166_market_identity(1))
+    book_b = _lp166_book(now, _lp166_market_identity(2))
+    book_b["account_checked_at"] = now
+    exchange.by_token[token_a] = book_a
+    exchange.by_token[token_b] = book_b
+    store, service, session_a, session_b = _lp166_two_groups(
+        now, tmp_path, exchange
+    )
+    book_a["account_checked_at"] = now - timedelta(seconds=60)
+    book_a["book"] = {
+        **book_a["book"],  # type: ignore[arg-type]
+        "received_at": now - timedelta(seconds=5),
+    }
+
+    result = service.tick()
+
+    sessions = result["sessions"]
+    assert {str(row["session_id"]) for row in sessions} == {session_a, session_b}
+    assert all(row["state"] == "entry_open" for row in sessions)
+    assert result["state"] == "ok"
+    assert result["session_id"] is None
+    stamps = {str(row["session_id"]): row["account_checked_at"] for row in sessions}
+    assert stamps[session_a] != stamps[session_b]
+    assert result["account_checked_at"] == min(stamps.values())
+    book_stamps = {
+        str(row["session_id"]): row["book_checked_at"] for row in sessions
+    }
+    assert result["book_checked_at"] == min(book_stamps.values())
+
+
+def test_lp166_tick_two_groups_aggregate_prefers_needs_attention(tmp_path) -> None:
+    """E(聚合优先级): 一组 needs_attention（组 A 快照断联 → 对账置
+    needs_attention，一次故障不触发保守撤）+ 一组正常 → 顶层聚合
+    state == "needs_attention"；sessions 仍含两组完整载荷，顶层 session_id
+    为 None。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    exchange = _PerTokenExchange()
+    token_a = str(_lp166_market_identity(1)["token_id"])
+    token_b = str(_lp166_market_identity(2)["token_id"])
+    exchange.by_token[token_a] = _lp166_book(now, _lp166_market_identity(1))
+    exchange.by_token[token_b] = _lp166_book(now, _lp166_market_identity(2))
+    store, service, session_a, session_b = _lp166_two_groups(
+        now, tmp_path, exchange
+    )
+    # 两组开仓完成后，组 A 的快照读断联 → 对账判 external_snapshot_unknown
+    # → 组 A needs_attention（单次故障未达保守撤阈值）。
+    del exchange.by_token[token_a]
+
+    result = service.tick()
+
+    assert result["state"] == "needs_attention"
+    assert result["session_id"] is None
+    sessions = result["sessions"]
+    assert isinstance(sessions, list) and len(sessions) == 2
+    states = {str(row["session_id"]): str(row["state"]) for row in sessions}
+    assert states[session_a] == "needs_attention"
+    assert states[session_b] == "entry_open"
+    assert exchange.cancels == []
+
+
+def test_lp166_stop_loss_isolated_per_group(tmp_path) -> None:
+    """C(隔离): 组 A 亏至 −$5 触发止损后，组 B 载荷逐字段与触发前一致
+    （订单/仓位/状态）。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    exchange = _PerTokenExchange()
+    token_a = str(_lp166_market_identity(1)["token_id"])
+    token_b = str(_lp166_market_identity(2)["token_id"])
+    market_a = _lp166_market_identity(1)
+    market_b = _lp166_market_identity(2)
+
+    # A 的持有期盘口：0.30 × 100（front=100 → 保护不撤）；B 的持有期盘口：
+    # 0.22 × 1000（B 挂单价 0.22，front 充足不撤）。
+    hold_a = _lp166_book(now, market_a)
+    hold_a["book"] = {
+        **hold_a["book"],  # type: ignore[arg-type]
+        "asks": [{"price": Decimal("0.31"), "size": Decimal("100")}],
+        "bids": [{"price": Decimal("0.30"), "size": Decimal("100")}],
+    }
+    hold_b = _lp166_book(now, market_b)
+    hold_b["book"] = {
+        **hold_b["book"],  # type: ignore[arg-type]
+        "asks": [{"price": Decimal("0.23"), "size": Decimal("1000")}],
+        "bids": [{"price": Decimal("0.22"), "size": Decimal("1000")}],
+    }
+    exchange.by_token[token_a] = hold_a
+    exchange.by_token[token_b] = hold_b
+
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    entry_a = service.submit_entry(
+        {**market_a, "price": Decimal("0.30"), "quantity": Decimal("100"),
+         "review_at": now + timedelta(minutes=10)},
+        "lp166-iso-a",
+    )
+    assert entry_a["state"] == "entry_open", entry_a
+    entry_b = service.submit_entry(
+        {**market_b, "price": Decimal("0.22"), "quantity": Decimal("10"),
+         "review_at": now + timedelta(minutes=10)},
+        "lp166-iso-b",
+    )
+    assert entry_b["state"] == "entry_open"
+    session_a = str(entry_a["session_id"])
+    session_b = str(entry_b["session_id"])
+    fields = (
+        "state", "entry_order_id", "owned_order_ids", "buy_filled_quantity",
+        "buy_cost", "residual_quantity", "review_at", "stop_loss_latched",
+    )
+    before_b = {k: store.lp_session(session_b)[k] for k in fields}
+    # 保护基线锚不得被组 A 的止损重锚；逐 tick 的估计字段（front/ratio 等）
+    # 是 B 自己读数的正常更新，不在此列。
+    anchor_keys = (
+        "baseline_front", "baseline_price", "baseline_source",
+        "baseline_book_received_at", "baseline_source_timestamp",
+        "baseline_book_hash", "baseline_version", "threshold",
+    )
+    before_anchor = {
+        k: store.lp_session(session_b)["queue_protection"][k] for k in anchor_keys
+    }
+
+    # A 成交 100@0.30，随后盘口跌至亏损 ≥ $5 触发止损；B 全程只读自己的盘口。
+    buy_trade = {
+        "trade_id": "buy-a",
+        "token_id": token_a,
+        "side": "BUY",
+        "status": "CONFIRMED",
+        "maker_orders": [{
+            "order_id": str(entry_a["entry_order_id"]),
+            "token_id": token_a,
+            "side": "BUY",
+            "matched_amount": Decimal("100"),
+            "price": Decimal("0.30"),
+            "fee": Decimal("0"),
+        }],
+    }
+    filled_a = {
+        **hold_a,
+        "account": {
+            **hold_a["account"],  # type: ignore[arg-type]
+            "positions": [{"token_id": token_a, "size": Decimal("100")}],
+        },
+        "book": {
+            "timestamp": now,
+            "received_at": now,
+            "asks": [{"price": Decimal("0.31"), "size": Decimal("100")}],
+            "bids": [{"price": Decimal("0.30"), "size": Decimal("100")}],
+        },
+        "trades": [buy_trade],
+        "orders": [{
+            "order_id": str(entry_a["entry_order_id"]), "token_id": token_a,
+            "side": "BUY", "status": "FILLED", "price": Decimal("0.30"),
+            "original_size": Decimal("100"), "size_matched": Decimal("100"),
+        }],
+    }
+    trigger_a = {
+        **filled_a,
+        "book": {
+            "timestamp": now,
+            "received_at": now,
+            "asks": [{"price": Decimal("0.26"), "size": Decimal("100")}],
+            "bids": [{"price": Decimal("0.25"), "size": Decimal("100")}],
+        },
+    }
+    exchange.by_token[token_a] = filled_a
+    first = service.tick()
+    exchange.by_token[token_a] = trigger_a
+    second = service.tick()
+
+    after_a = store.lp_session(session_a)
+    assert after_a["state"] == "stop_loss_exit"
+    assert after_a["stop_loss_latched"] is True
+    # first/second 是聚合报文：两组在场时顶层 session_id 为 None。
+    assert first["session_id"] is None
+    assert second["session_id"] is None
+
+    after_b = store.lp_session(session_b)
+    assert {k: after_b[k] for k in fields} == before_b
+    assert {
+        k: after_b["queue_protection"][k] for k in anchor_keys
+    } == before_anchor
+    assert after_b["state"] == "entry_open"
+    assert Decimal(str(after_b["buy_filled_quantity"])) == Decimal("0")
+
+
+def test_lp166_tick_group_exception_does_not_block_others(tmp_path) -> None:
+    """C(隔离): 注入组 A _reconcile_session 抛错，组 B 照常核对且
+    account_checked_at / book_checked_at 非空。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    exchange = _PerTokenExchange()
+    token_a = str(_lp166_market_identity(1)["token_id"])
+    token_b = str(_lp166_market_identity(2)["token_id"])
+    exchange.by_token[token_a] = _lp166_book(now, _lp166_market_identity(1))
+    exchange.by_token[token_b] = _lp166_book(now, _lp166_market_identity(2))
+    store, service, session_a, session_b = _lp166_two_groups(
+        now, tmp_path, exchange
+    )
+
+    original = service._reconcile_session
+
+    def flaky(session):
+        if str(session.get("session_id")) == session_a:
+            raise RuntimeError("injected")
+        return original(session)
+
+    service._reconcile_session = flaky  # type: ignore[method-assign]
+
+    result = service.tick()
+
+    sessions = {str(row["session_id"]): row for row in result["sessions"]}
+    assert sessions[session_a]["state"] == "error"
+    assert sessions[session_b]["state"] == "entry_open"
+    assert sessions[session_b]["account_checked_at"] is not None
+    assert sessions[session_b]["book_checked_at"] is not None
+
+
+def test_lp166_stop_and_status_semantics_with_two_groups(tmp_path) -> None:
+    """F: 两组时 stop(None) 拒 session_ambiguous 且列全部活动组 id；
+    stop(A) 精准停 A、B 不动；单组 stop(None) 照停；status(None) 回最新活动组；
+    未知显式 id 返回 none 载荷。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    exchange = _PerTokenExchange()
+    exchange.by_token[_lp166_market_identity(1)["token_id"]] = _lp166_book(
+        now, _lp166_market_identity(1)
+    )
+    exchange.by_token[_lp166_market_identity(2)["token_id"]] = _lp166_book(
+        now, _lp166_market_identity(2)
+    )
+    store, service, session_a, session_b = _lp166_two_groups(
+        now, tmp_path, exchange
+    )
+
+    # 两组时 stop(None) → rejected/session_ambiguous，载荷列全部活动组 id
+    #（顺序未定，服务端按最新在前）。
+    ambiguous = service.stop(None)
+    assert ambiguous["state"] == "rejected"
+    assert ambiguous["reason"] == "session_ambiguous"
+    assert len(ambiguous["session_ids"]) == 2
+    assert set(ambiguous["session_ids"]) == {session_a, session_b}
+    assert service.status(session_a)["state"] == "entry_open"
+    assert service.status(session_b)["state"] == "entry_open"
+
+    # stop(A) 精准停 A；B 状态不变。
+    stopped = service.stop(session_a)
+    assert stopped["state"] == "review"
+    assert str(stopped["session_id"]) == session_a
+    assert service.status(session_a)["state"] == "review"
+    assert service.status(session_b)["state"] == "entry_open"
+    assert not store.lp_session(session_b).get("stop_requested")
+
+    # status(None) 回最新活动组（B 比 A 新建）。
+    latest = service.status(None)
+    assert str(latest["session_id"]) == session_b
+
+    # 未知显式 id → none 载荷。
+    assert service.status("missing-session") == {
+        "state": "none",
+        "session_id": None,
+    }
+
+    # B 终态化后单组场景：stop(None) 照停剩余活动组。
+    store.lp_update_session(session_b, state="complete")
+    exchange.by_token[_lp166_market_identity(1)["token_id"]] = _lp166_book(
+        now, _lp166_market_identity(1)
+    )
+    store.lp_update_session(session_a, state="entry_open", patch={
+        "stop_requested": None, "review_status": None, "reconciliation": None,
+    })
+    single = service.stop(None)
+    assert single["state"] == "review"
+    assert str(single["session_id"]) == session_a
+
+    # 零组照旧：none 载荷。
+    store.lp_update_session(session_a, state="complete")
+    assert service.stop(None) == {"state": "none", "session_id": None}

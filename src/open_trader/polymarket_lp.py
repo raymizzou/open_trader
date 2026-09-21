@@ -44,6 +44,17 @@ from .notifications import beijing_clock
 
 STOP_LOSS = Decimal("5")
 SCORING_STALE_SECONDS = Decimal("15")
+# Issue 163 定案 8 / Issue 166: an augment can only land on ``entry_open``.
+# Every other non-terminal state maps to its real rejection reason; the two
+# augment entry points (single-shot submit_augment and the legacy two-phase
+# _augment_session) share this one table so the two paths never drift.
+_LP_AUGMENT_STATE_BLOCKS = {
+    "review": "session_review_exit",
+    "stop_loss_exit": "session_stop_loss_exit",
+    "needs_attention": "session_needs_attention",
+    "passive_exit": "session_passive_exit",
+    "entry_submit_pending": "session_entry_pending",
+}
 SCORING_POLL_SECONDS = Decimal("5")
 SCORING_FAILURE_WINDOW_SECONDS = Decimal("60")
 GTD_REVIEW_BUFFER_SECONDS = 60
@@ -6510,7 +6521,10 @@ class PolymarketLPService:
         try:
             normalized = self._normalize_request(request)
             snapshot = self._read_snapshot(normalized)
-            facts = self._validate_snapshot(normalized, snapshot, now=self._now())
+            facts = self._validate_snapshot(
+                normalized, snapshot, now=self._now(),
+                reservations=self._candidate_reservations(),
+            )
         except ValueError as exc:
             return {"state": "rejected", "reason": str(exc)}
         expires_at = self._now() + timedelta(seconds=PREVIEW_TTL_SECONDS)
@@ -6567,7 +6581,10 @@ class PolymarketLPService:
                     "candidate_policy": "best_bid_minimum",
                 }
             )
-            facts = self._validate_snapshot(request, snapshot, now=now)
+            facts = self._validate_snapshot(
+                request, snapshot, now=now,
+                reservations=self._candidate_reservations(),
+            )
         except ValueError as exc:
             return {"state": "rejected", "reason": str(exc)}
 
@@ -6643,13 +6660,23 @@ class PolymarketLPService:
     def _augment_session(
         self, session_id: str
     ) -> tuple[dict[str, object] | None, str | None]:
-        """Load the augment target session or the rejection reason."""
+        """Load the augment target session or the rejection reason.
+
+        Issue 166: an augment only lands on ``entry_open``.  Terminal states
+        keep the ``session_not_active`` reason; every other non-terminal
+        state maps through the shared table to its real reason, so the
+        single-shot and two-phase augment paths reject with one voice.
+        """
 
         session = self.store.lp_session(str(session_id))
         if session is None:
             return None, "session_not_found"
-        if str(session.get("state")) in {"complete", "entry_rejected"}:
+        state = str(session.get("state"))
+        if state in {"complete", "entry_rejected"}:
             return None, "session_not_active"
+        block = _LP_AUGMENT_STATE_BLOCKS.get(state)
+        if block is not None:
+            return None, block
         return session, None
 
     def augment_preview(self, request: Mapping[str, object]) -> dict[str, object]:
@@ -6693,6 +6720,7 @@ class PolymarketLPService:
                 snapshot,
                 now=now,
                 allowed_open_order_ids=self._session_augment_own_order_ids(session),
+                reservations=self._candidate_reservations(),
             )
         except ValueError as exc:
             return {"state": "rejected", "reason": str(exc)}
@@ -6791,6 +6819,7 @@ class PolymarketLPService:
                     snapshot,
                     now=now,
                     allowed_open_order_ids=self._session_augment_own_order_ids(session),
+                    reservations=self._candidate_reservations(),
                 )
                 # Issue 158: same submit-time best-bid re-check as start.
                 credential_preflight = preview.get("preflight")
@@ -7001,16 +7030,6 @@ class PolymarketLPService:
             if session is None:
                 return {"state": "rejected", "reason": rejection or "session_not_active"}
             session_id_str = str(session["session_id"])
-            # Issue 163 定案 8: a session that is exiting, stopping out,
-            # waiting for manual review, or already finished cannot take a
-            # new order; the rejection names the real state.
-            state_block = {
-                "review": "session_review_exit",
-                "stop_loss_exit": "session_stop_loss_exit",
-                "needs_attention": "session_needs_attention",
-            }.get(str(session.get("state")))
-            if state_block is not None:
-                return {"state": "rejected", "reason": state_block}
             recorded = self._augment_recorded_result(session_id_str, key)
             if recorded is not None:
                 return recorded
@@ -7046,6 +7065,7 @@ class PolymarketLPService:
                     snapshot,
                     now=now,
                     allowed_open_order_ids=self._session_augment_own_order_ids(session),
+                    reservations=self._candidate_reservations(),
                 )
                 expiration = expiration_for_review(
                     _timestamp(request["review_at"], name="review_at"), now=now
@@ -7420,7 +7440,23 @@ class PolymarketLPService:
                         != request["quantity"]
                     ):
                         raise ValueError("candidate_changed")
-                facts = self._validate_snapshot(request, snapshot, now=now)
+                facts = self._validate_snapshot(
+                    request, snapshot, now=now,
+                    reservations=self._candidate_reservations(),
+                )
+                # Issue 166/R1: the submit path must honor the same
+                # participation gate as the preview path — any account order
+                # or position on this condition (either direction) rejects
+                # here, so a same-condition opposite-direction group can only
+                # ever be opened by #168 lifting this gate.  Idempotent
+                # replays returned above and never reach this check, and the
+                # augment paths tolerate their own group's orders because the
+                # check is deliberately NOT inside _validate_snapshot.
+                if _has_market_order(
+                    cast(Mapping[str, object], snapshot.get("account")),
+                    cast(Mapping[str, object], snapshot.get("market")),
+                ):
+                    raise ValueError("market_already_participating")
                 # Issue 158: submit-time re-check — the fresh best bid must
                 # still equal the one recorded in the preview credential.
                 # Idempotent replays returned above before this point, so a
@@ -7670,6 +7706,28 @@ class PolymarketLPService:
         )
         return self._status_payload(session)
 
+    def _lp_market_conflict(
+        self, condition_id: object, outcome: object
+    ) -> dict[str, object] | None:
+        """Issue 166: the active group occupying the same (condition_id, outcome).
+
+        ``None`` means the market is free and admission may proceed; the
+        returned session is the conflict group named by the busy payload.
+        """
+
+        wanted_condition = str(condition_id or "").strip()
+        wanted_outcome = str(outcome or "").strip().upper()
+        if not wanted_condition or not wanted_outcome:
+            return None
+        for session in self.store.lp_active_sessions():
+            if (
+                str(session.get("condition_id") or "").strip() == wanted_condition
+                and str(session.get("outcome") or "").strip().upper()
+                == wanted_outcome
+            ):
+                return session
+        return None
+
     def submit_entry(
         self,
         request: Mapping[str, object],
@@ -7692,21 +7750,37 @@ class PolymarketLPService:
                 return self._status_payload(existing)
             if not self._mutation_allowed("submit"):
                 return {"state": "locked", "reason": "mutation_blocked"}
-            active_lp = self.store.lp_active_session()
-            if active_lp is not None:
-                return {
-                    "state": "busy",
-                    "reason": "active_lp_session",
-                    "session_id": active_lp.get("session_id"),
-                }
             # The request body is operator input: normalization failures are
             # caller errors and surface as exceptions (HTTP 400), while every
             # fact-vs-plan mismatch below is a semantic rejection payload.
             normalized = self._normalize_request(request)
+            # Issue 166: the only admission conflict is another active group
+            # on the same (condition_id, outcome); other markets proceed to
+            # the original gates downstream.
+            conflict = self._lp_market_conflict(
+                normalized.get("condition_id"), normalized.get("outcome")
+            )
+            if conflict is not None:
+                return {
+                    "state": "busy",
+                    "reason": "lp_session_market_active",
+                    "session_id": conflict.get("session_id"),
+                }
             try:
                 now = self._now()
                 snapshot = self._read_snapshot(normalized)
-                facts = self._validate_snapshot(normalized, snapshot, now=now)
+                facts = self._validate_snapshot(
+                    normalized, snapshot, now=now,
+                    reservations=self._candidate_reservations(),
+                )
+                # Issue 166/R1: same participation gate as the preview and
+                # two-phase start paths (see start()) — an account order or
+                # position anywhere on this condition blocks the new group.
+                if _has_market_order(
+                    cast(Mapping[str, object], snapshot.get("account")),
+                    cast(Mapping[str, object], snapshot.get("market")),
+                ):
+                    raise ValueError("market_already_participating")
             except ValueError as exc:
                 # Issue 163: the single-shot trial anchor rejects with the
                 # operator-facing reason instead of the internal candidate
@@ -8432,17 +8506,26 @@ class PolymarketLPService:
         """Stop one session; ``None`` targets the single active session.
 
         Issue 165: with ``session_id=None`` the unique active session is
-        stopped (falling back to the newest historical session as a
-        read-only projection); an explicit id that matches no row returns
-        the none payload and never falls back to the active group.
+        stopped; an explicit id that matches no row returns the none payload
+        and never falls back to the active group.  Issue 166: with two or
+        more active groups the unnamed stop is rejected as ambiguous — the
+        operator must name the group.
         """
 
         with self._mutex:
-            session = (
-                self.store.lp_session(session_id)
-                if session_id
-                else self.store.lp_active_session()
-            )
+            if session_id:
+                session = self.store.lp_session(session_id)
+            else:
+                active = self.store.lp_active_sessions()
+                if len(active) >= 2:
+                    return {
+                        "state": "rejected",
+                        "reason": "session_ambiguous",
+                        "session_ids": [
+                            row.get("session_id") for row in active
+                        ],
+                    }
+                session = active[0] if active else None
             if session is None:
                 return {"state": "none", "session_id": None}
             state = str(session.get("state"))
@@ -8536,8 +8619,12 @@ class PolymarketLPService:
         """Run one deterministic monitoring/reconciliation iteration.
 
         Issue 165: group-level reconciliation is delegated to
-        ``_reconcile_session`` for every active session row; the report of
-        the last reconciled session is returned unchanged.
+        ``_reconcile_session`` for every active session row.  Issue 166:
+        with zero groups the none payload is returned unchanged; with one
+        group the top level keeps today's single-group payload shape plus a
+        ``sessions`` key; with several groups the top level is an aggregate
+        (worst state, oldest check stamps, no session_id) carrying every
+        group's full payload in ``sessions``.
         """
 
         with self._mutex:
@@ -8549,10 +8636,67 @@ class PolymarketLPService:
             sessions = self.store.lp_active_sessions()
             if not sessions:
                 return {"state": "none", "session_id": None}
-            result: dict[str, object] | None = None
+            payloads: list[dict[str, object]] = []
             for session in sessions:
-                result = self._reconcile_session(session)
-            return result if result is not None else {"state": "none", "session_id": None}
+                try:
+                    payloads.append(self._reconcile_session(session))
+                except Exception as exc:
+                    # One group's reconciliation failure must not swallow the
+                    # others: record the failure into that group's payload and
+                    # continue with the remaining groups.
+                    payloads.append(
+                        {
+                            "state": "error",
+                            "session_id": session.get("session_id"),
+                            "error": type(exc).__name__,
+                        }
+                    )
+            return self._lp_tick_aggregate(payloads)
+
+    @staticmethod
+    def _lp_tick_aggregate(
+        payloads: list[dict[str, object]],
+    ) -> dict[str, object]:
+        """Build the tick report per the issue 166 aggregation contract."""
+
+        if len(payloads) == 1:
+            return {**payloads[0], "sessions": list(payloads)}
+        oldest: dict[str, object] = {}
+        for key in ("account_checked_at", "book_checked_at"):
+            oldest[key] = PolymarketLPService._oldest_stamp(
+                [payload.get(key) for payload in payloads]
+            )
+        states = {
+            str(payload.get("state") or "") for payload in payloads
+        }
+        aggregate_state = "ok"
+        for worst in ("needs_attention", "busy", "error", "failed"):
+            if worst in states:
+                aggregate_state = worst
+                break
+        return {
+            "state": aggregate_state,
+            "session_id": None,
+            "sessions": list(payloads),
+            "account_checked_at": oldest["account_checked_at"],
+            "book_checked_at": oldest["book_checked_at"],
+        }
+
+    @staticmethod
+    def _oldest_stamp(values: list[object]) -> object:
+        """Return the oldest parseable stamp; None when none is parseable."""
+
+        best: tuple[datetime, object] | None = None
+        for value in values:
+            if value is None:
+                continue
+            try:
+                moment = _timestamp(value, name="stamp")
+            except ValueError:
+                continue
+            if best is None or moment < best[0]:
+                best = (moment, value)
+        return best[1] if best is not None else None
 
     def _reconcile_session(self, session: Mapping[str, object]) -> dict[str, object]:
         """Run one group-level monitoring/reconciliation iteration (issue 165: split from tick)."""
@@ -8806,6 +8950,7 @@ class PolymarketLPService:
         *,
         now: datetime,
         allowed_open_order_ids: Collection[str] | None = None,
+        reservations: object = None,
     ) -> dict[str, object]:
         account = snapshot.get("account")
         if not isinstance(account, Mapping):
@@ -8846,6 +8991,24 @@ class PolymarketLPService:
             raise ValueError("allowance_unknown")
         balance_d = _decimal(balance, "balance")
         allowance_d = _decimal(allowance, "allowance")
+        # Issue 166: submission competes against the balance/allowance left
+        # after every active group's resting BUY reservation (dedup by order
+        # id inside _account_after_reservations), not the raw wallet fact.
+        # When the occupancy itself cannot be computed the honest answer is
+        # "facts unknown", never an unadjusted pass.
+        if reservations is not None:
+            available_account = _account_after_reservations(account, reservations)
+            if available_account is None:
+                raise ValueError("account_facts_unknown")
+            available_balance = _decimal(
+                available_account.get("balance"), "balance"
+            )
+            available_allowance = _decimal(
+                available_account.get("allowance"), "allowance"
+            )
+        else:
+            available_balance = balance_d
+            available_allowance = allowance_d
         market = snapshot.get("market")
         if not isinstance(market, Mapping):
             raise ValueError("market_unknown")
@@ -8908,7 +9071,12 @@ class PolymarketLPService:
             raise ValueError("price_off_tick")
         if quantity < minimum_d or quantity < reward_min_d:
             raise ValueError("order_size_invalid")
-        if balance_d < 0 or allowance_d < 0 or balance_d < price * quantity or allowance_d < price * quantity:
+        if (
+            available_balance < 0
+            or available_allowance < 0
+            or available_balance < price * quantity
+            or available_allowance < price * quantity
+        ):
             raise ValueError("balance_insufficient")
         book = snapshot.get("book")
         if not isinstance(book, Mapping):

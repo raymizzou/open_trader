@@ -22333,6 +22333,90 @@ console.log(JSON.stringify({
     assert rendered["mismatchIgnored"] is True
 
 
+def test_lp_today_multi_group_row_shows_each_session_and_no_augment() -> None:
+    """Issue 166 R2(P3): 同 condition 两组并存——行级会话事实按行内订单自带的
+    session_id 归因，两组止损状态各自出现；归属不明不渲染加量按钮；
+    「一标的一行」分组粒度不变。"""
+    output = run_dashboard_js(_LP158_FIXTURE + r'''
+state.predictionMarket.csrfToken = "csrf-1";
+const fillA = {
+  order_id:"sys-fill-a", market_id:"market-fed", condition_id:"condition-fed",
+  token_id:"token-fed-yes",
+  market_title:"Will the Fed cut rates in Q4?", market_url:"https://polymarket.com/event/fed",
+  outcome:"YES", side:"BUY", status:"MATCHED", price:"0.42", quantity:"120",
+  filled_quantity:"120", remaining_quantity:"0", state:"filled",
+  anchor:true, management:"system_managed", read_only:false,
+  session_id:"sess-a",
+};
+const openB = {
+  order_id:"sys-order-b", market_id:"market-fed", condition_id:"condition-fed",
+  token_id:"token-fed-no",
+  market_title:"Will the Fed cut rates in Q4?", market_url:"https://polymarket.com/event/fed",
+  outcome:"NO", side:"BUY", status:"LIVE", price:"0.55", quantity:"90",
+  filled_quantity:"0", remaining_quantity:"90", state:"open",
+  anchor:true, management:"system_managed", read_only:false,
+  session_id:"sess-b",
+  queue_protection:queueProtectionShared,
+};
+const html = predictionLpCard({lp_dashboard: buildDashboard({
+  lp_orders_today: [fillA, openB],
+  lp_sessions: [
+    {state:"entry_open", session_id:"sess-b", condition_id:"condition-fed",
+     token_id:"token-fed-no", outcome:"NO", price:"0.55", quantity:"90",
+     stop_loss_latched:false},
+    {state:"review", session_id:"sess-a", condition_id:"condition-fed",
+     token_id:"token-fed-yes", outcome:"YES", stop_loss_latched:true},
+  ],
+})});
+const orderTable = (html.match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
+const rowSegments = orderTable.split("<tr data-lp-today-market=").slice(1);
+console.log(JSON.stringify({
+  fedRows: rowSegments.filter((s) => s.startsWith('"condition-fed"')).length,
+  stopATriggered: orderTable.includes("止损已触发"),
+  stopBHealthy: orderTable.includes("止损未触发"),
+  noAugmentButton: !orderTable.includes('data-action="lp-augment-entry"'),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["fedRows"] == 1
+    assert rendered["stopATriggered"] is True
+    assert rendered["stopBHealthy"] is True
+    assert rendered["noAugmentButton"] is True
+
+
+def test_lp_today_single_group_and_manual_rows_unchanged_by_session_attribution() -> None:
+    """Issue 166 R2 邻居守护：恰一组→按钮照常带该组 session_id、止损状态照常；
+    手动行（零组）照常「位置未知」、无按钮。"""
+    output = run_dashboard_js(_LP158_FIXTURE + r'''
+state.predictionMarket.csrfToken = "csrf-1";
+const singleRow = { ...sessionRow, session_id:"sess-b" };
+const single = predictionLpCard({lp_dashboard: buildDashboard({
+  lp_orders_today: [singleRow],
+  lp_sessions: [
+    {state:"entry_open", session_id:"sess-b", condition_id:"condition-fed",
+     token_id:"token-fed", outcome:"YES", price:"0.42", quantity:"120",
+     stop_loss_latched:false},
+  ],
+})});
+const manual = predictionLpCard({lp_dashboard: buildDashboard({
+  lp_orders_today: [manualRow],
+})});
+console.log(JSON.stringify({
+  singleButton: single.includes('data-action="lp-augment-entry"'),
+  singleSessionId: single.includes('data-session-id="sess-b"'),
+  singleStop: single.includes("止损未触发"),
+  manualUnanchored: manual.includes("位置未知"),
+  manualNoButton: !manual.includes('data-action="lp-augment-entry"'),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["singleButton"] is True
+    assert rendered["singleSessionId"] is True
+    assert rendered["singleStop"] is True
+    assert rendered["manualUnanchored"] is True
+    assert rendered["manualNoButton"] is True
+
+
 _LP158_INTERACTIVE = r'''
 class Element {
   constructor(id){
@@ -22462,7 +22546,7 @@ const run = async (result) => {
   const summary = state.predictionMarket.lpCancelSummary;
   return {modalCleared, toast, summary};
 };
-const busy = await run({state:"busy", reason:"active_lp_session", session_id:"sess-abc123"});
+const busy = await run({state:"busy", reason:"lp_session_market_active", session_id:"sess-abc123"});
 const locked = await run({state:"locked", reason:"circuit_breaker_open"});
 const bid = await run({state:"rejected", reason:"best_bid_changed"});
 // 交易所拒单：无任何挂单登记、无保护生效（body 为会话字典、无 reason 字段）。
@@ -22472,7 +22556,7 @@ const needsAttention = await run({state:"needs_attention", session_id:"sess-att0
 console.log(JSON.stringify({
   busy: busy.modalCleared
     && busy.toast.kind === "danger"
-    && busy.toast.main.includes("业务忙：已有活动 LP 会话，本单未提交"),
+    && busy.toast.main.includes("业务忙：该标的已有活动组，本单未提交"),
   locked: locked.modalCleared
     && locked.toast.main.includes("系统锁定（熔断/维护中），本单未提交"),
   bidChanged: bid.modalCleared
@@ -23089,7 +23173,7 @@ const runCase = async (payload) => {
 };
 const rejectedCard = await runCase({
   state: "entry_rejected", session_id: "sess-rej001", submit_status: "rejected"});
-const busyCard = await runCase({state: "busy", reason: "active_lp_session"});
+const busyCard = await runCase({state: "busy", reason: "lp_session_market_active"});
 // 网络抛错：不登记 handler，fetch 直接抛错。
 resetLp163SubmitState();
 openPredictionModal("lp_order", null, lpOrderIntent(candidateRow));
@@ -23113,7 +23197,7 @@ console.log(JSON.stringify({
     sub: rejectedCard.includes("请重新发起下单（新确认 = 新意图）"),
     noRepreview: !rejectedCard.includes("重新预检"),
   },
-  busy: busyCard.includes("业务忙：已有活动 LP 会话，本单未提交"),
+  busy: busyCard.includes("业务忙：该标的已有活动组，本单未提交"),
   network: {
     unknown: networkCard.includes("结果未知：网络错误，是否已提交未知"),
     noRetry: networkCard.includes("系统不会自动重试"),
@@ -23338,3 +23422,133 @@ console.log(JSON.stringify({
     assert rendered["noTargetFive"]["unknownLabel"] is True
     assert rendered["estimateLocal"] is True
     assert rendered["estimateWarn"] is True
+
+
+def test_lp166_dashboard_renders_one_card_per_group_newest_first() -> None:
+    """J: 两组载荷渲染两张组卡（最新在前），标题改「活动组 · 2」；
+    列表缺失时回退旧 lp_session 单卡（旧标题保持）。"""
+    output = run_dashboard_js(_LP158_FIXTURE + r'''
+state.predictionMarket.csrfToken = "csrf-1";
+const groupB = {state:"entry_open", session_id:"sess-bbb111",
+  condition_id:"condition-fed", token_id:"token-fed",
+  market_title:"Will the Fed cut rates in Q4?", outcome:"YES",
+  price:"0.42", quantity:"120", review_at:"2026-09-22T00:00:00Z"};
+const groupA = {state:"entry_open", session_id:"sess-aaa222",
+  condition_id:"condition-eth", token_id:"token-eth",
+  market_title:"Will ETH flip $6k by Dec 31?", outcome:"NO",
+  price:"0.39", quantity:"200", review_at:"2026-09-22T01:00:00Z"};
+const multiHtml = predictionLpCard({lp_dashboard: buildDashboard({
+  lp_session: groupB,
+  lp_sessions: [groupB, groupA],
+})});
+const stackStart = multiHtml.indexOf('<div class="lp-session-stack">');
+const stack = stackStart >= 0 ? multiHtml.slice(stackStart) : "";
+const cards = stack.match(/<section class="pm-panel pm-lp-card"/g) || [];
+const legacyHtml = predictionLpCard({lp_dashboard: buildDashboard({
+  lp_session: {state:"entry_open", session_id:"sess-abc123",
+    condition_id:"condition-fed", market_title:"Will the Fed cut rates in Q4?"},
+})});
+console.log(JSON.stringify({
+  multiTitle: multiHtml.includes("活动组 · 2"),
+  cardCount: cards.length,
+  newestFirst: stack.indexOf("Will the Fed cut rates in Q4?")
+    < stack.indexOf("Will ETH flip $6k by Dec 31?"),
+  bothMarkets: multiHtml.includes("Will the Fed cut rates in Q4?")
+    && multiHtml.includes("Will ETH flip $6k by Dec 31?"),
+  legacyTitle: legacyHtml.includes("当前系统会话详情 · Will the Fed cut rates in Q4?"),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["multiTitle"] is True
+    assert rendered["cardCount"] == 2
+    assert rendered["newestFirst"] is True
+    assert rendered["bothMarkets"] is True
+    assert rendered["legacyTitle"] is True
+
+
+def test_lp166_augment_button_only_on_entry_open_group_rows() -> None:
+    """J: 加量按钮仅出现在 entry_open 组的行——退出中的组不再渲染；
+    按钮的 data-session-id 是各自行所属组的 id。"""
+    output = run_dashboard_js(_LP158_FIXTURE + r'''
+state.predictionMarket.csrfToken = "csrf-1";
+const fedRow = {...sessionRow};
+const ethRow = {...manualRow, order_id:"sys-eth-1", anchor:true,
+  condition_id:"condition-eth", token_id:"token-eth"};
+const html = predictionLpCard({lp_dashboard: buildDashboard({
+  lp_orders_today: [fedRow, ethRow],
+  lp_session: {state:"entry_open", session_id:"sess-bbb111",
+    condition_id:"condition-fed", price:"0.42", quantity:"120",
+    market_title:"Will the Fed cut rates in Q4?"},
+  lp_sessions: [
+    {state:"entry_open", session_id:"sess-bbb111",
+     condition_id:"condition-fed", token_id:"token-fed",
+     price:"0.42", quantity:"120",
+     market_title:"Will the Fed cut rates in Q4?"},
+    {state:"passive_exit", session_id:"sess-aaa222",
+     condition_id:"condition-eth", token_id:"token-eth",
+     market_title:"Will ETH flip $6k by Dec 31?"},
+  ],
+})});
+const fedButton = html.match(/<button class="pm-button lp-augment"[^>]*data-condition-id="condition-fed"[\s\S]*?<\/button>/) || [];
+const ethButton = html.match(/<button class="pm-button lp-augment"[^>]*data-condition-id="condition-eth"[\s\S]*?<\/button>/) || [];
+console.log(JSON.stringify({
+  fedHasButton: fedButton.length === 1
+    && fedButton[0].includes('data-session-id="sess-bbb111"'),
+  ethHasButton: ethButton.length > 0,
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["fedHasButton"] is True
+    assert rendered["ethHasButton"] is False
+
+
+def test_lp166_today_rows_show_each_group_own_session_facts() -> None:
+    """J: 当天委托行各组显示各组自己的会话数据（止损/已实现来自各组的
+    会话载荷，不再共用单一 lp_session）。"""
+    output = run_dashboard_js(_LP158_FIXTURE + r'''
+state.predictionMarket.csrfToken = "csrf-1";
+const fedRow = {...sessionRow};
+const ethRow = {...manualRow, order_id:"sys-eth-1", anchor:true, management:"system_managed", read_only:false,
+  condition_id:"condition-eth", token_id:"token-eth"};
+const html = predictionLpCard({lp_dashboard: buildDashboard({
+  lp_orders_today: [fedRow, ethRow],
+  lp_session: {state:"entry_open", session_id:"sess-bbb111",
+    condition_id:"condition-fed", token_id:"token-fed",
+    stop_loss_latched:true, trade_pnl:"-1.20", residual_pnl:"-0.30",
+    market_title:"Will the Fed cut rates in Q4?"},
+  lp_sessions: [
+    {state:"stop_loss_exit", session_id:"sess-bbb111",
+     condition_id:"condition-fed", token_id:"token-fed",
+     stop_loss_latched:true, trade_pnl:"-1.20", residual_pnl:"-0.30",
+     market_title:"Will the Fed cut rates in Q4?"},
+    {state:"entry_open", session_id:"sess-aaa222",
+     condition_id:"condition-eth", token_id:"token-eth",
+     stop_loss_latched:false, trade_pnl:"0.00", residual_pnl:"0.00",
+     market_title:"Will ETH flip $6k by Dec 31?"},
+  ],
+})});
+const fedCell = html.split('data-lp-today-market="condition-fed"')[1]
+  .split("</tr>")[0];
+const ethCell = html.split('data-lp-today-market="condition-eth"')[1]
+  .split("</tr>")[0];
+console.log(JSON.stringify({
+  fedStopped: fedCell.includes("止损已触发"),
+  ethNotStopped: ethCell.includes("止损未触发"),
+  fedRealized: fedCell.includes("已实现 -$1.20") || fedCell.includes("已实现 -1.20"),
+  ethRealizedNotFed: ethCell.includes("已实现 $0.00") || ethCell.includes("已实现 0.00"),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["fedStopped"] is True
+    assert rendered["ethNotStopped"] is True
+
+
+def test_lp166_busy_toast_names_same_market_conflict() -> None:
+    """J: busy toast 文案命中 lp_session_market_active（点名换标的）。"""
+    output = run_dashboard_js(r'''
+const message = lpSubmitStateMessage({state:"busy", reason:"lp_session_market_active"});
+console.log(JSON.stringify({text: message}));
+''')
+    rendered = json.loads(output)
+    assert "该标的已有活动组" in rendered["text"]
+    assert "换一个标的即可开仓" in rendered["text"]

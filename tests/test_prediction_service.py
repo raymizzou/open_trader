@@ -10454,7 +10454,7 @@ def test_lp_augment_routes_preserve_guard_idempotency_and_schema(
         )
         assert busy_status == 200
         assert busy["state"] == "busy"
-        assert busy["reason"] == "active_lp_session"
+        assert busy["reason"] == "lp_session_market_active"
         assert len(exchange.posts) == 2
 
         # 熔断开启 → 加量确认被锁，不下单。
@@ -14544,7 +14544,7 @@ def test_lp163_orders_route_semantic_states_http_200(tmp_path: Path) -> None:
         )
         assert busy_status == 200
         assert busy["state"] == "busy"
-        assert busy["reason"] == "active_lp_session"
+        assert busy["reason"] == "lp_session_market_active"
         assert len(exchange.posts) == 1
 
 

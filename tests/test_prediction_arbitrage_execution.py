@@ -8183,3 +8183,258 @@ def test_lp_dashboard_session_summary_marked_submit_baseline(
     rows = {row["order_id"]: row for row in payload["lp_orders_today"]}
     summary = rows["entry-1"]["queue_protection"]
     assert summary["baseline_source"] == "submit"
+
+
+def _lp166_identity(index: int) -> dict[str, object]:
+    """Issue 166: a distinct market identity for admission-gate tests."""
+
+    return {
+        "market_id": f"market-{index}",
+        "condition_id": "0x" + format(index, "x") * 64,
+        "token_id": "0x" + format(index + 16, "x") * 64,
+        "outcome": "YES",
+    }
+
+
+def _lp166_book(now: datetime, identity: dict[str, object]) -> dict[str, object]:
+    """Fresh LP snapshot whose market block carries ``identity``."""
+
+    book = lp_snapshot(now)
+    market = dict(book["market"])  # type: ignore[arg-type]
+    market.update(identity)
+    book["market"] = market
+    return book
+
+
+def _lp166_entry_request(
+    now: datetime, identity: dict[str, object]
+) -> dict[str, object]:
+    return {
+        **identity,
+        "price": Decimal("0.29"),
+        "quantity": Decimal("20"),
+        "review_at": now + timedelta(minutes=10),
+    }
+
+
+def test_lp166_lp_start_and_submit_entry_admit_per_market(tmp_path: Path) -> None:
+    """Issue 166: lp_start 与 lp_submit_entry 的门禁改同标的冲突检查——
+    同标的+方向 → busy/lp_session_market_active 且指向冲突组；
+    不同标的放行并存（两行均非终态）。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    market_a = _lp166_identity(1)
+    market_b = _lp166_identity(2)
+    market_c = _lp166_identity(3)
+    exchange = LPExchange()
+    exchange.snapshot_value = _lp166_book(now, market_a)
+    store = PredictionArbitrageStore(tmp_path / "data")
+    lp = PolymarketLPService(store, exchange, clock=lambda: now)
+    execution = PredictionExecutionService(
+        store=store,
+        monitor=FakeMonitor(_intent()),
+        trading=IncidentTrading(result="unsafe"),
+        notifier=CompositeTestNotifier(ChannelNotifier("macos"), ChannelNotifier("feishu")),
+        lock_path=tmp_path / "execution.lock",
+        lp=lp,
+    )
+    execution._breaker_open = False
+
+    # 组 A 经 lp_start 建仓。
+    preview_a = execution.lp_preview(_lp166_entry_request(now, market_a))
+    assert preview_a["state"] == "previewed"
+    started_a = execution.lp_start(str(preview_a["preview_id"]), "lp166-x-a")
+    assert started_a["state"] == "entry_open"
+    session_a = str(started_a["session_id"])
+
+    # 同标的+方向：lp_start 门禁拒绝并指向组 A（未到服务层、未读快照）。
+    exchange.snapshot_value = _lp166_book(now, market_a)
+    preview_conflict = execution.lp_preview(_lp166_entry_request(now, market_a))
+    conflict = execution.lp_start(str(preview_conflict["preview_id"]), "lp166-x-conflict")
+    assert conflict == {
+        "state": "busy",
+        "reason": "lp_session_market_active",
+        "session_id": session_a,
+    }
+
+    # 不同标的：lp_start 放行，两行并存。
+    exchange.snapshot_value = _lp166_book(now, market_b)
+    preview_b = execution.lp_preview(_lp166_entry_request(now, market_b))
+    started_b = execution.lp_start(str(preview_b["preview_id"]), "lp166-x-b")
+    assert started_b["state"] == "entry_open"
+    session_b = str(started_b["session_id"])
+    assert {row["session_id"] for row in store.lp_active_sessions()} == {
+        session_a,
+        session_b,
+    }
+
+    # lp_submit_entry：同标的甲 → busy 指向组 A；新标的丙 → 放行。
+    conflict_entry = execution.lp_submit_entry(
+        {**_lp166_entry_request(now, market_a), "idempotency_key": "lp166-x-ce"}
+    )
+    assert conflict_entry == {
+        "state": "busy",
+        "reason": "lp_session_market_active",
+        "session_id": session_a,
+    }
+    exchange.snapshot_value = _lp166_book(now, market_c)
+    started_c = execution.lp_submit_entry(
+        {**_lp166_entry_request(now, market_c), "idempotency_key": "lp166-x-c"}
+    )
+    assert started_c["state"] == "entry_open"
+    assert {row["session_id"] for row in store.lp_active_sessions()} == {
+        session_a,
+        session_b,
+        str(started_c["session_id"]),
+    }
+
+
+class _CancelTradingWithPositions(_CancelTrading):
+    """_CancelTrading plus a positions list for managed-token attribution."""
+
+    def __init__(self, open_orders: list[dict[str, object]], positions: list[dict[str, object]]) -> None:
+        super().__init__(open_orders)
+        self.positions = positions
+
+    def lp_account_snapshot(self) -> dict[str, object]:
+        snapshot = super().lp_account_snapshot()
+        snapshot["positions"] = self.positions
+        return snapshot
+
+
+def test_lp166_dashboard_lists_all_group_views_and_attributes_rows(
+    tmp_path: Path,
+) -> None:
+    """G: 两组 → lp_sessions 两张视图（最新在前）、lp_session=最新组；
+    当天委托/open orders 行归属各自 session_id；两组 token 集合归因不塌缩；
+    无活动组 → 列表=最近完结组视图（沉底）。"""
+    store = PredictionArbitrageStore(tmp_path / "data")
+    trading = _CancelTradingWithPositions(
+        [
+            {**_cancel_open_order("entry-a", "0xa"), "token_id": "tok-a"},
+            {**_cancel_open_order("entry-b", "0xb"), "token_id": "tok-b"},
+        ],
+        [
+            {"token_id": "tok-a", "condition_id": "0xa", "size": "5"},
+            {"token_id": "tok-b", "condition_id": "0xb", "size": "5"},
+        ],
+    )
+    service = PredictionExecutionService(
+        store=store,
+        monitor=object(),
+        trading=trading,
+        notifier=ChannelNotifier("feishu"),
+        lock_path=tmp_path / "views.lock",
+    )
+    service._lp = PolymarketLPService(store, object())
+    common = {
+        "market_id": "market-x",
+        "outcome": "YES",
+        "question": "Will it happen?",
+        "review_at": "2099-09-15T00:00:00Z",
+        "queue_protection": {"baseline_front": "10", "baseline_price": "0.30"},
+    }
+    store.lp_create_session(
+        "grp-a",
+        "k-a",
+        state="entry_open",
+        payload={
+            **common,
+            "condition_id": "0xa",
+            "token_id": "tok-a",
+            "entry_order_id": "entry-a",
+            "owned_order_ids": ["entry-a"],
+        },
+    )
+    store.lp_create_session(
+        "grp-b",
+        "k-b",
+        state="entry_open",
+        payload={
+            **common,
+            "condition_id": "0xb",
+            "token_id": "tok-b",
+            "entry_order_id": "entry-b",
+            "owned_order_ids": ["entry-b"],
+        },
+    )
+
+    payload = service.refresh_lp_dashboard_snapshot()
+
+    views = payload["lp_sessions"]
+    assert [view["session_id"] for view in views] == ["grp-b", "grp-a"]
+    assert str(payload["lp_session"]["session_id"]) == "grp-b"
+    rows = {row["order_id"]: row for row in payload["lp_orders_today"]}
+    assert rows["entry-a"]["session_id"] == "grp-a"
+    assert rows["entry-b"]["session_id"] == "grp-b"
+    assert rows["entry-a"]["management"] == "system_managed"
+    assert rows["entry-b"]["management"] == "system_managed"
+    managed_positions = {
+        row["token_id"]: row["management"] for row in payload["positions"]
+    }
+    assert managed_positions == {"tok-a": "system_managed", "tok-b": "system_managed"}
+
+    # 全部终态后：无活动组 → lp_sessions 放最近完结组视图（grp-b 最新）。
+    store.lp_update_session("grp-a", state="complete")
+    store.lp_update_session("grp-b", state="complete")
+    payload = service.refresh_lp_dashboard_snapshot()
+    assert [view["session_id"] for view in payload["lp_sessions"]] == ["grp-b"]
+    assert str(payload["lp_session"]["session_id"]) == "grp-b"
+
+
+def test_lp166_reconcile_startup_recovers_every_group(tmp_path: Path) -> None:
+    """H: reconcile_startup 后两组均恢复、订单归属与 review_at 均与建仓时一致
+    （B 开仓不顺延 A 截止）；就绪由两组共同决定（readiness=lp_active）。"""
+    current = [datetime(2026, 9, 21, 12, 0, tzinfo=UTC)]
+    exchange = LPExchange()
+    store = PredictionArbitrageStore(tmp_path / "data")
+
+    def new_execution() -> PredictionExecutionService:
+        exchange.snapshot_value = _lp166_book(current[0], _lp166_identity(1))
+        lp = PolymarketLPService(store, exchange, clock=lambda: current[0])
+        return PredictionExecutionService(
+            store=store,
+            monitor=FakeMonitor(_intent()),
+            trading=IncidentTrading(result="unsafe"),
+            notifier=CompositeTestNotifier(
+                ChannelNotifier("macos"), ChannelNotifier("feishu")
+            ),
+            lock_path=tmp_path / "execution.lock",
+            lp=lp,
+        )
+
+    first = new_execution()
+    first._breaker_open = False
+    for index, identity in enumerate((_lp166_identity(1), _lp166_identity(2))):
+        exchange.snapshot_value = _lp166_book(current[0], identity)
+        preview = first.lp_preview(_lp166_entry_request(current[0], identity))
+        assert preview["state"] == "previewed"
+        started = first.lp_start(str(preview["preview_id"]), f"lp166-reboot-{index}")
+        assert started["state"] == "entry_open"
+        # B 晚一分钟开仓 → 两组复核截止各不相同。
+        current[0] = current[0] + timedelta(minutes=1)
+
+    store_sessions = store.lp_active_sessions()
+    assert len(store_sessions) == 2
+    before = {
+        str(row["session_id"]): {
+            "review_at": row["review_at"],
+            "entry_order_id": row["entry_order_id"],
+            "state": row["state"],
+        }
+        for row in store_sessions
+    }
+    assert len({row["review_at"] for row in store_sessions}) == 2
+
+    resumed = new_execution().reconcile_startup()
+
+    assert resumed["state"] == "ready"
+    assert resumed["readiness"] == "lp_active"
+    after = {
+        str(row["session_id"]): {
+            "review_at": row["review_at"],
+            "entry_order_id": row["entry_order_id"],
+            "state": row["state"],
+        }
+        for row in store.lp_active_sessions()
+    }
+    assert after == before

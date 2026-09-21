@@ -1707,6 +1707,7 @@ class PredictionExecutionService:
             "lp_share_watch_state": self.lp_share_watch_state(),
             "lp_observations": {},
             "lp_session": {"state": "none"},
+            "lp_sessions": [],
         }
 
     def lp_dashboard(self) -> dict[str, object]:
@@ -2232,63 +2233,76 @@ class PredictionExecutionService:
                 except Exception:
                     session = {"state": "unknown"}
                 # Issue 165: sessions project as views so each dashboard row
-                # can carry its owning session_id.  The view list is built
-                # from the lp_status() active→latest fallback, so today it
-                # holds exactly one view; the managed union below keeps the
-                # pre-refactor values.  A payload without a session_id key
-                # still builds its view (managed_ids/managed_token derive
-                # unconditionally, as before); its rows stay unattributed.
+                # can carry its owning session_id.  Issue 166: one view per
+                # active group (newest first); with no active group the
+                # lp_status() active→latest fallback keeps today's single
+                # most-recently-finished view.  A payload without a
+                # session_id key still builds its view (managed_ids/managed
+                # token-set derive unconditionally, as before); its rows stay
+                # unattributed.
+                try:
+                    active_reader = getattr(self._store, "lp_active_sessions", None)
+                    active_rows = (
+                        [row for row in active_reader() if isinstance(row, Mapping)]
+                        if callable(active_reader)
+                        else []
+                    )
+                except Exception:
+                    active_rows = []
+                view_sources: list[Mapping[str, object]] = (
+                    list(active_rows) if active_rows else [session]
+                )
                 lp_session_views: list[dict[str, object]] = []
-                view_owned_ids: set[str] = {
-                    str(session.get(key) or "")
-                    for key in (
-                        "entry_order_id",
-                        "passive_exit_order_id",
-                        "protected_exit_order_id",
+                for view_source in view_sources:
+                    view_owned_ids: set[str] = {
+                        str(view_source.get(key) or "")
+                        for key in (
+                            "entry_order_id",
+                            "passive_exit_order_id",
+                            "protected_exit_order_id",
+                        )
+                    } - {""}
+                    raw_owned = view_source.get("owned_order_ids")
+                    if isinstance(raw_owned, (list, tuple, set, frozenset)):
+                        view_owned_ids.update(
+                            str(order_id) for order_id in raw_owned if order_id
+                        )
+                    view_protection = view_source.get("queue_protection")
+                    view_summary = (
+                        dict(view_protection)
+                        if isinstance(view_protection, Mapping)
+                        else None
                     )
-                } - {""}
-                raw_owned = session.get("owned_order_ids")
-                if isinstance(raw_owned, (list, tuple, set, frozenset)):
-                    view_owned_ids.update(
-                        str(order_id) for order_id in raw_owned if order_id
+                    # Issue 152 increment: mark the submit-baseline source so
+                    # the UI can distinguish it from the issue 159 first-seen
+                    # one.
+                    if isinstance(view_summary, dict):
+                        view_summary.setdefault("baseline_source", "submit")
+                    lp_session_views.append(
+                        {
+                            "session_id": view_source.get("session_id"),
+                            "state": view_source.get("state"),
+                            "condition_id": str(view_source.get("condition_id") or ""),
+                            "token_id": str(view_source.get("token_id") or ""),
+                            "entry_order_id": str(view_source.get("entry_order_id") or ""),
+                            "augment_order_ids": {
+                                str(value)
+                                for value in view_source.get("augment_order_ids") or ()
+                            },
+                            "owned_ids": view_owned_ids,
+                            "queue_protection": view_summary,
+                        }
                     )
-                view_protection = session.get("queue_protection")
-                view_summary = (
-                    dict(view_protection)
-                    if isinstance(view_protection, Mapping)
-                    else None
-                )
-                # Issue 152 increment: mark the submit-baseline source so
-                # the UI can distinguish it from the issue 159 first-seen
-                # one.
-                if isinstance(view_summary, dict):
-                    view_summary.setdefault("baseline_source", "submit")
-                lp_session_views.append(
-                    {
-                        "session_id": session.get("session_id"),
-                        "state": session.get("state"),
-                        "condition_id": str(session.get("condition_id") or ""),
-                        "token_id": str(session.get("token_id") or ""),
-                        "entry_order_id": str(session.get("entry_order_id") or ""),
-                        "augment_order_ids": {
-                            str(value)
-                            for value in session.get("augment_order_ids") or ()
-                        },
-                        "owned_ids": view_owned_ids,
-                        "queue_protection": view_summary,
-                    }
-                )
                 managed_ids: set[str] = set()
                 for view in lp_session_views:
                     managed_ids.update(view["owned_ids"])  # type: ignore[arg-type]
+                # Issue 166: managed tokens are a set — two groups on two
+                # markets must both keep their positions/rows managed.
                 view_tokens = {
                     str(view["token_id"])
                     for view in lp_session_views
                     if str(view["token_id"])
                 }
-                managed_token = (
-                    next(iter(view_tokens)) if len(view_tokens) == 1 else ""
-                )
 
                 orders: list[dict[str, object]] = []
                 first_seen_created_at: dict[str, object] = {}
@@ -2358,7 +2372,7 @@ class PredictionExecutionService:
                     if not isinstance(raw_position, Mapping):
                         continue
                     token_id = str(raw_position.get("token_id", raw_position.get("asset_id", "")) or "")
-                    managed = bool(managed_token and token_id == managed_token)
+                    managed = token_id in view_tokens
                     positions.append(
                         {
                             "market_id": raw_position.get("market_id"),
@@ -2536,7 +2550,7 @@ class PredictionExecutionService:
                         market_rewards=market_rewards,
                         reward_date=reward_date,
                         managed_order_ids=managed_ids,
-                        managed_token=managed_token,
+                        managed_tokens=view_tokens,
                     )
                 )
                 for order_id, fill in cached_fills.items():
@@ -2557,8 +2571,7 @@ class PredictionExecutionService:
                         continue
                     fill_managed = (
                         str(order_id) in managed_ids
-                        or bool(managed_token)
-                        and str(fill.get("token_id") or "") == managed_token
+                        or str(fill.get("token_id") or "") in view_tokens
                     )
                     # Issue 165: a managed fill attributes to its owning
                     # session view; unmanaged fills stay unattributed.
@@ -2749,6 +2762,12 @@ class PredictionExecutionService:
                         now=_utc_now(),
                     ),
                     "lp_session": session,
+                    # Issue 166: group views newest first; with no active
+                    # group the list carries the most recently finished
+                    # group (sunk to the bottom of the UI).
+                    "lp_sessions": [
+                        dict(row) for row in (active_rows if active_rows else [session])
+                    ],
                 }
                 self._lp_dashboard_cache = result
                 self._schedule_lp_reward_refresh(reward_date, refresh_ids)
@@ -2919,6 +2938,7 @@ class PredictionExecutionService:
                     "lp_share_watch_state": self.lp_share_watch_state(),
                     "lp_observations": {},
                     "lp_session": self.lp_status(),
+                    "lp_sessions": [],
                 }
 
         finally:
@@ -3453,7 +3473,7 @@ class PredictionExecutionService:
         market_rewards: Mapping[str, object],
         reward_date: str,
         managed_order_ids: set[str],
-        managed_token: str,
+        managed_tokens: set[str],
     ) -> tuple[list[dict[str, object]], int, tuple[str, ...]]:
         """Assemble 当天 LP 委托 rows with fail-open LP attribution.
 
@@ -3461,6 +3481,8 @@ class PredictionExecutionService:
         unknown; a row is excluded only when every signal is explicitly
         negative and the row is not managed by the LP session.  Positions
         never become rows here; they only feed the non-LP counter.
+        Issue 166: managed attribution takes the set of tokens owned by any
+        active group view, so two groups never collapse into one.
         """
 
         def reward_record_today(condition_id: str) -> bool:
@@ -3502,9 +3524,7 @@ class PredictionExecutionService:
             today_rows.append({**row, "state": "open", "last_fill_at": None})
         for row in positions:
             condition_id = str(row.get("condition_id") or "")
-            managed = bool(
-                managed_token and str(row.get("token_id") or "") == managed_token
-            )
+            managed = str(row.get("token_id") or "") in managed_tokens
             if (
                 not managed
                 and not row_positive(condition_id, None)
@@ -3970,6 +3990,40 @@ class PredictionExecutionService:
         report = reader(report_date)
         return dict(report) if isinstance(report, Mapping) else None
 
+    def _lp_market_conflict(
+        self, condition_id: object, outcome: object
+    ) -> dict[str, object] | None:
+        """Issue 166: the active LP group on the same (condition_id, outcome).
+
+        ``None`` means no active group owns this market+direction and
+        admission may proceed past the LP busy gate.
+        """
+
+        wanted_condition = str(condition_id or "").strip()
+        wanted_outcome = str(outcome or "").strip().upper()
+        if not wanted_condition or not wanted_outcome:
+            return None
+        for session in self._store.lp_active_sessions():
+            if (
+                str(session.get("condition_id") or "").strip() == wanted_condition
+                and str(session.get("outcome") or "").strip().upper()
+                == wanted_outcome
+            ):
+                return session
+        return None
+
+    def _lp_market_conflict_for_preview(
+        self, preview_id: str
+    ) -> dict[str, object] | None:
+        """Issue 166: same-market conflict for the market a preview describes."""
+
+        preview = self._store.lp_preview(preview_id)
+        if not isinstance(preview, Mapping):
+            return None
+        return self._lp_market_conflict(
+            preview.get("condition_id"), preview.get("outcome")
+        )
+
     def lp_start(self, preview_id: str, idempotency_key: str) -> dict[str, object]:
         """Start one LP session under the shared execution mutex."""
 
@@ -3985,12 +4039,12 @@ class PredictionExecutionService:
             return self.lp_status(str(existing["session_id"]))
         if self._breaker_is_open():
             return {"state": "locked", "reason": "circuit_breaker_open"}
-        active_lp = self._store.lp_active_session()
-        if active_lp is not None:
+        conflict = self._lp_market_conflict_for_preview(str(preview_id))
+        if conflict is not None:
             return {
                 "state": "busy",
-                "reason": "active_lp_session",
-                "session_id": active_lp.get("session_id"),
+                "reason": "lp_session_market_active",
+                "session_id": conflict.get("session_id"),
             }
         active = self._store.active_execution()
         if active is not None:
@@ -4001,24 +4055,24 @@ class PredictionExecutionService:
             }
         lock = self._acquire_global_lock()
         if lock is None:
-            active_lp = self._store.lp_active_session()
-            if active_lp is not None:
+            conflict = self._lp_market_conflict_for_preview(str(preview_id))
+            if conflict is not None:
                 return {
                     "state": "busy",
-                    "reason": "active_lp_session",
-                    "session_id": active_lp.get("session_id"),
+                    "reason": "lp_session_market_active",
+                    "session_id": conflict.get("session_id"),
                 }
             return {"state": "busy", "reason": "execution_lock"}
         try:
             existing = self._store.lp_session_by_idempotency(key)
             if existing is not None:
                 return self.lp_status(str(existing["session_id"]))
-            active_lp = self._store.lp_active_session()
-            if active_lp is not None:
+            conflict = self._lp_market_conflict_for_preview(str(preview_id))
+            if conflict is not None:
                 return {
                     "state": "busy",
-                    "reason": "active_lp_session",
-                    "session_id": active_lp.get("session_id"),
+                    "reason": "lp_session_market_active",
+                    "session_id": conflict.get("session_id"),
                 }
             active = self._store.active_execution()
             if active is not None:
@@ -4109,12 +4163,14 @@ class PredictionExecutionService:
             return self.lp_status(str(existing["session_id"]))
         if self._breaker_is_open():
             return {"state": "locked", "reason": "circuit_breaker_open"}
-        active_lp = self._store.lp_active_session()
-        if active_lp is not None:
+        conflict = self._lp_market_conflict(
+            payload.get("condition_id"), payload.get("outcome")
+        )
+        if conflict is not None:
             return {
                 "state": "busy",
-                "reason": "active_lp_session",
-                "session_id": active_lp.get("session_id"),
+                "reason": "lp_session_market_active",
+                "session_id": conflict.get("session_id"),
             }
         active = self._store.active_execution()
         if active is not None:
@@ -4125,24 +4181,28 @@ class PredictionExecutionService:
             }
         lock = self._acquire_global_lock()
         if lock is None:
-            active_lp = self._store.lp_active_session()
-            if active_lp is not None:
+            conflict = self._lp_market_conflict(
+                payload.get("condition_id"), payload.get("outcome")
+            )
+            if conflict is not None:
                 return {
                     "state": "busy",
-                    "reason": "active_lp_session",
-                    "session_id": active_lp.get("session_id"),
+                    "reason": "lp_session_market_active",
+                    "session_id": conflict.get("session_id"),
                 }
             return {"state": "busy", "reason": "execution_lock"}
         try:
             existing = self._store.lp_session_by_idempotency(key)
             if existing is not None:
                 return self.lp_status(str(existing["session_id"]))
-            active_lp = self._store.lp_active_session()
-            if active_lp is not None:
+            conflict = self._lp_market_conflict(
+                payload.get("condition_id"), payload.get("outcome")
+            )
+            if conflict is not None:
                 return {
                     "state": "busy",
-                    "reason": "active_lp_session",
-                    "session_id": active_lp.get("session_id"),
+                    "reason": "lp_session_market_active",
+                    "session_id": conflict.get("session_id"),
                 }
             active = self._store.active_execution()
             if active is not None:
@@ -6019,18 +6079,23 @@ class PredictionExecutionService:
         if self._store.unacknowledged_incident() is not None:
             return {"state": "locked", "reason": "unacknowledged_incident"}
 
-        # An LP session owns its target order and inventory across process
-        # restarts. Reconcile it before the legacy execution/account checks so
-        # its session-specific recovery runs first.
-        lp_active_reader = getattr(self._store, "lp_active_session", None)
-        lp_active = lp_active_reader() if callable(lp_active_reader) else None
-        if lp_active is not None:
+        # LP sessions own their target orders and inventory across process
+        # restarts (issue 166: there can be several groups at once).  Reconcile
+        # all of them through the aggregate tick before the legacy
+        # execution/account checks so the session-specific recovery runs first.
+        lp_active_reader = getattr(self._store, "lp_active_sessions", None)
+        lp_sessions = (
+            [row for row in lp_active_reader() if isinstance(row, Mapping)]
+            if callable(lp_active_reader)
+            else []
+        )
+        if lp_sessions:
             lp_tick = getattr(self._lp, "tick", None)
             if not callable(lp_tick):
                 return {
                     "state": "locked",
                     "reason": "active_lp_service_unavailable",
-                    "session_id": lp_active.get("session_id"),
+                    "session_id": lp_sessions[0].get("session_id"),
                 }
             try:
                 lp_result = lp_tick()
@@ -6038,11 +6103,20 @@ class PredictionExecutionService:
                 return {
                     "state": "locked",
                     "reason": "active_lp_reconciliation_failed",
-                    "session_id": lp_active.get("session_id"),
+                    "session_id": lp_sessions[0].get("session_id"),
                 }
-            refreshed_lp = lp_active_reader() if callable(lp_active_reader) else lp_active
-            lp_state = str((refreshed_lp or lp_result).get("state", ""))
-            if lp_state not in {"complete", "entry_rejected"}:
+            # Readiness is decided jointly by every group: the LP recovery
+            # path stays in charge while any active group remains.
+            refreshed_sessions = (
+                [
+                    row
+                    for row in lp_active_reader()
+                    if isinstance(row, Mapping)
+                ]
+                if callable(lp_active_reader)
+                else []
+            )
+            if refreshed_sessions:
                 if not self._relayer_ready():
                     return {"state": "locked", "reason": "readiness_unavailable"}
                 if not self._notification_channels_ready():

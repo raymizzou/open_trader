@@ -775,8 +775,8 @@ class PredictionArbitrageStore:
 
             DROP INDEX IF EXISTS one_active_lp_session;
 
-            CREATE UNIQUE INDEX IF NOT EXISTS one_active_lp_session
-            ON lp_sessions((1))
+            CREATE UNIQUE INDEX IF NOT EXISTS one_active_lp_session_market
+            ON lp_sessions(json_extract(payload,'$.condition_id'), json_extract(payload,'$.outcome'))
             WHERE state NOT IN ('complete', 'entry_rejected');
 
             CREATE TABLE IF NOT EXISTS lp_actions (
@@ -4444,8 +4444,11 @@ class PredictionArbitrageStore:
                     (str(session_id), str(idempotency_key), str(state), encoded, now, now),
                 )
             except sqlite3.IntegrityError as exc:
-                if "one_active_lp_session" in str(exc):
-                    raise ValueError("active_lp_session") from exc
+                # Issue 166: uniqueness is per (condition_id, outcome) group,
+                # so the same market+direction is the only store-level
+                # admission conflict left.
+                if "one_active_lp_session_market" in str(exc):
+                    raise ValueError("lp_session_market_active") from exc
                 raise
             row = connection.execute(
                 "SELECT * FROM lp_sessions WHERE session_id=?", (str(session_id),)
