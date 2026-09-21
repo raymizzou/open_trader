@@ -6196,6 +6196,87 @@ def test_queue_protection_baseline_survives_restart(tmp_path) -> None:
     assert exchange.cancels == []
 
 
+# ---- Issue 158: 提交时刻买一校验（start 复核段） ----
+
+
+def _queue_book_moved_bid_snapshot(now: datetime, bid_size: Decimal) -> dict[str, object]:
+    """Same shape as _queue_book_snapshot but the best bid dropped to 0.29."""
+
+    base = _snapshot(now)
+    base["book"] = {
+        "timestamp": now,
+        "received_at": now,
+        "source_timestamp": "2026-09-14T11:59:59Z",
+        "hash": "book-hash-queue-moved",
+        "asks": [{"price": Decimal("0.31"), "size": Decimal("100")}],
+        "bids": [
+            {"price": Decimal("0.29"), "size": bid_size},
+            {"price": Decimal("0.28"), "size": Decimal("100")},
+        ],
+    }
+    return base
+
+
+def test_start_rejects_when_best_bid_moved_since_preview(tmp_path) -> None:
+    """T10: 预检后买一变化 → best_bid_changed 拒；无会话创建、无交易所 POST。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    exchange = _Exchange()
+    exchange.snapshot_value = _queue_book_snapshot(now, Decimal("8000"))
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+
+    preview = service.preview(_request(now))
+    assert preview["state"] == "previewed"
+    assert Decimal(str(preview["preflight"]["best_bid"])) == Decimal("0.30")
+
+    exchange.snapshot_value = _queue_book_moved_bid_snapshot(now, Decimal("8000"))
+    result = service.start(str(preview["preview_id"]), "lp-bid-moved-1")
+
+    assert result == {"state": "rejected", "reason": "best_bid_changed"}
+    assert store.lp_active_session() is None
+    assert store.lp_preview(str(preview["preview_id"]))["consumed_at"] is None
+    assert exchange.posts == []
+
+
+def test_start_accepts_when_best_bid_unchanged(tmp_path) -> None:
+    """T11: 盘口未动 → start 正常建会话（回归：买一校验不误伤）。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    exchange = _Exchange()
+    exchange.snapshot_value = _queue_book_snapshot(now, Decimal("8000"))
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+
+    preview = service.preview(_request(now))
+    started = service.start(str(preview["preview_id"]), "lp-bid-same-1")
+
+    assert started["state"] == "entry_open"
+    assert len(exchange.posts) == 1
+    assert store.lp_active_session() is not None
+
+
+def test_start_idempotent_retry_precedes_best_bid_check(tmp_path) -> None:
+    """T12: 成功后同 key 重试（买一已再变）→ 返既有会话，无第二单。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    exchange = _Exchange()
+    exchange.snapshot_value = _queue_book_snapshot(now, Decimal("8000"))
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+
+    preview = service.preview(_request(now))
+    started = service.start(str(preview["preview_id"]), "lp-bid-retry-1")
+    assert started["state"] == "entry_open"
+    session_id = str(started["session_id"])
+    assert len(exchange.posts) == 1
+
+    exchange.snapshot_value = _queue_book_moved_bid_snapshot(now, Decimal("9000"))
+    retried = service.start(str(preview["preview_id"]), "lp-bid-retry-1")
+
+    assert str(retried["session_id"]) == session_id
+    assert retried["state"] == "entry_open"
+    assert len(exchange.posts) == 1
+    assert store.lp_session_by_idempotency("lp-bid-retry-1") is not None
+
+
 # ---- Issue 152: 队列位置保护运行时闭环（Seam 3）与通知（Seam 6） ----
 
 

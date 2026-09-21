@@ -6899,6 +6899,21 @@ class PolymarketLPService:
                     ):
                         raise ValueError("candidate_changed")
                 facts = self._validate_snapshot(request, snapshot, now=now)
+                # Issue 158: submit-time re-check — the fresh best bid must
+                # still equal the one recorded in the preview credential.
+                # Idempotent replays returned above before this point, so a
+                # retry can never fail here after its session already exists.
+                credential_preflight = preview.get("preflight")
+                credential_best_bid = (
+                    _maybe_decimal(credential_preflight.get("best_bid"))
+                    if isinstance(credential_preflight, Mapping)
+                    else None
+                )
+                if (
+                    credential_best_bid is not None
+                    and credential_best_bid != facts["best_bid"]
+                ):
+                    raise ValueError("best_bid_changed")
                 expiration = expiration_for_review(
                     _timestamp(request["review_at"], name="review_at"), now=now
                 )
