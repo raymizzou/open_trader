@@ -799,21 +799,24 @@ class PolymarketLPService:
         with self._candidate_state_lock:
             snapshot = deepcopy(self._candidate_snapshot)
             facts = deepcopy(self._candidate_qualification_facts)
-        active_session_condition: str | None = None
-        active_session_reader = getattr(self.store, "lp_active_session", None)
-        if callable(active_session_reader):
+        active_session_conditions: set[str] = set()
+        active_sessions_reader = getattr(self.store, "lp_active_sessions", None)
+        if callable(active_sessions_reader):
             try:
-                active_session = active_session_reader()
+                active_sessions = active_sessions_reader()
             except Exception:
-                active_session = None
-            if isinstance(active_session, Mapping):
-                raw_condition = active_session.get("condition_id")
-                if not isinstance(raw_condition, str):
-                    payload = active_session.get("payload")
-                    if isinstance(payload, Mapping):
-                        raw_condition = payload.get("condition_id")
-                if isinstance(raw_condition, str) and raw_condition.strip() in rank:
-                    active_session_condition = raw_condition.strip()
+                active_sessions = None
+            if isinstance(active_sessions, (list, tuple)):
+                for active_session in active_sessions:
+                    if not isinstance(active_session, Mapping):
+                        continue
+                    raw_condition = active_session.get("condition_id")
+                    if not isinstance(raw_condition, str):
+                        payload = active_session.get("payload")
+                        if isinstance(payload, Mapping):
+                            raw_condition = payload.get("condition_id")
+                    if isinstance(raw_condition, str) and raw_condition.strip() in rank:
+                        active_session_conditions.add(raw_condition.strip())
         pool_rows: tuple[Mapping[str, object], ...] = tuple()
         with self._candidate_state_lock:
             pool_rows = tuple(
@@ -860,7 +863,7 @@ class PolymarketLPService:
                     and open_orders
                 ):
                     rank[condition] = 0
-        if active_session_condition is not None:
+        for active_session_condition in active_session_conditions:
             rank[active_session_condition] = 0
         order_index = {condition_id: index for index, condition_id in enumerate(ordered)}
         return tuple(
@@ -6070,8 +6073,7 @@ class PolymarketLPService:
 
     def _candidate_reservations(self) -> tuple[dict[str, object], ...]:
         reservations: list[dict[str, object]] = []
-        session = self.store.lp_active_session()
-        if session is not None:
+        for session in self.store.lp_active_sessions():
             order_id = str(session.get("entry_order_id") or "").strip()
             if not order_id:
                 order_id = f"lp-session:{session.get('session_id', '')}"
@@ -7496,7 +7498,13 @@ class PolymarketLPService:
         *,
         stop_event: threading.Event | None = None,
     ) -> dict[str, object]:
-        """Refresh the persisted platform-earnings observation for one session."""
+        """Refresh the persisted platform-earnings observation for one session.
+
+        Issue 165: with ``session_id=None`` the unique active session is
+        refreshed (falling back to the newest historical session as a
+        read-only projection); an explicit id that matches no row returns
+        the none payload and never falls back to the active group.
+        """
 
         with self._reward_refresh_lock:
             session = self._reward_session(session_id)
@@ -8137,6 +8145,14 @@ class PolymarketLPService:
         return session_report, relevant
 
     def status(self, session_id: str | None = None) -> dict[str, object]:
+        """Report one session; ``None`` targets the single active session.
+
+        Issue 165: with ``session_id=None`` the unique active session is
+        reported (falling back to the newest historical session as a
+        read-only projection); an explicit id that matches no row returns
+        the none payload and never falls back to the active group.
+        """
+
         with self._mutex:
             session = (
                 self.store.lp_session(session_id)
@@ -8160,6 +8176,14 @@ class PolymarketLPService:
             return result
 
     def stop(self, session_id: str | None = None) -> dict[str, object]:
+        """Stop one session; ``None`` targets the single active session.
+
+        Issue 165: with ``session_id=None`` the unique active session is
+        stopped (falling back to the newest historical session as a
+        read-only projection); an explicit id that matches no row returns
+        the none payload and never falls back to the active group.
+        """
+
         with self._mutex:
             session = (
                 self.store.lp_session(session_id)
@@ -8256,7 +8280,12 @@ class PolymarketLPService:
         )
 
     def tick(self) -> dict[str, object]:
-        """Run one deterministic monitoring/reconciliation iteration."""
+        """Run one deterministic monitoring/reconciliation iteration.
+
+        Issue 165: group-level reconciliation is delegated to
+        ``_reconcile_session`` for every active session row; the report of
+        the last reconciled session is returned unchanged.
+        """
 
         with self._mutex:
             # Issue 159: first-seen fallback protections for web-manual BUYs
@@ -8264,186 +8293,194 @@ class PolymarketLPService:
             # before the LP session pipeline — including when no session is
             # active at all.
             self._apply_first_seen_protections()
-            session = self.store.lp_active_session()
-            if session is None:
+            sessions = self.store.lp_active_sessions()
+            if not sessions:
                 return {"state": "none", "session_id": None}
-            state = str(session.get("state"))
-            if state in {"entry_rejected", "complete"}:
+            result: dict[str, object] | None = None
+            for session in sessions:
+                result = self._reconcile_session(session)
+            return result if result is not None else {"state": "none", "session_id": None}
+
+    def _reconcile_session(self, session: Mapping[str, object]) -> dict[str, object]:
+        """Run one group-level monitoring/reconciliation iteration (issue 165: split from tick)."""
+
+        state = str(session.get("state"))
+        if state in {"entry_rejected", "complete"}:
+            return self._status_payload(session)
+        try:
+            request = self._normalize_request(session)
+            snapshot = self._read_snapshot(request)
+        except ValueError as exc:
+            patch: dict[str, object] = {
+                "reconciliation": str(exc),
+                "resume_state": state
+                if state != "needs_attention"
+                else session.get("resume_state"),
+            }
+            failures = self._queue_protection_data_failure(session, str(exc))
+            if failures is not None:
+                patch["queue_protection"] = failures
+            updated = self.store.lp_update_session(
+                str(session["session_id"]),
+                state="needs_attention",
+                patch=patch,
+            )
+            conservative = self._conservative_protection_cancel(updated, failures)
+            if conservative is not None:
+                return self._status_payload(conservative)
+            return self._status_payload(updated)
+        try:
+            patch = self._fill_patch(session, snapshot)
+        except ValueError as exc:
+            outage_patch: dict[str, object] = {
+                "reconciliation": str(exc),
+                "resume_state": state
+                if state != "needs_attention"
+                else session.get("resume_state"),
+            }
+            failures = self._queue_protection_data_failure(session, str(exc))
+            if failures is not None:
+                outage_patch["queue_protection"] = failures
+            updated = self.store.lp_update_session(
+                str(session["session_id"]),
+                state="needs_attention",
+                patch=outage_patch,
+            )
+            conservative = self._conservative_protection_cancel(updated, failures)
+            if conservative is not None:
+                return self._status_payload(conservative)
+            return self._status_payload(updated)
+        ownership_reason = self._unowned_target_order_reason(session, snapshot)
+        if ownership_reason is not None:
+            resume_state = (
+                str(session.get("resume_state") or "")
+                if state == "needs_attention"
+                else state
+            ) or "entry_open"
+            patch.update(
+                {
+                    "reconciliation": ownership_reason,
+                    "resume_state": resume_state,
+                }
+            )
+            updated = self.store.lp_update_session(
+                str(session["session_id"]),
+                state="needs_attention",
+                patch=patch,
+            )
+            return self._status_payload(updated)
+        updated = self.store.lp_update_session(str(session["session_id"]), patch=patch)
+        session = updated
+        try:
+            session = self._sync_order_history(session, snapshot)
+        except ValueError as exc:
+            updated = self.store.lp_update_session(
+                str(session["session_id"]),
+                state="needs_attention",
+                patch={
+                    "reconciliation": str(exc),
+                    "resume_state": state
+                    if state != "needs_attention"
+                    else session.get("resume_state"),
+                },
+            )
+            return self._status_payload(updated)
+        if state == "needs_attention":
+            resume_state = str(session.get("resume_state") or "")
+            if not resume_state:
+                resume_state = "review" if session.get("stop_requested") else "entry_open"
+            if resume_state not in {"entry_open", "passive_exit", "stop_loss_exit", "review"}:
+                resume_state = "review"
+            session = self.store.lp_update_session(
+                str(session["session_id"]),
+                state=resume_state,
+                patch={"reconciliation": None, "resume_state": None},
+            )
+            state = resume_state
+        # Issue 152: queue protection runs inside the existing one-second
+        # monitor tick, before any exit reconciliation can mutate orders.
+        session = self._apply_queue_protection(session, snapshot)
+        session = self._reconcile_protected_exit(session, snapshot)
+        if _decimal(session.get("buy_filled_quantity", 0), "buy_filled_quantity") > 0:
+            entry_terminal = self._order_terminal(
+                snapshot, str(session.get("entry_order_id") or ""), session
+            )
+            if (
+                not bool(session.get("entry_cancel_requested"))
+                and not entry_terminal
+            ):
+                self._request_entry_cancel(session)
+                session = self.store.lp_session(str(session["session_id"])) or session
+            if not entry_terminal:
                 return self._status_payload(session)
+        if state == "review":
+            self._update_scoring(session, snapshot)
+            session = self.store.lp_session(str(session["session_id"])) or session
+            return self._review_iteration(session, snapshot)
+        self._update_scoring(session, snapshot)
+        session = self.store.lp_session(str(session["session_id"])) or session
+        if str(session.get("state")) == "review":
+            return self._review_iteration(session, snapshot)
+        now = self._now()
+        review_at = _timestamp(session["review_at"], name="review_at")
+        residual = _decimal(session.get("residual_quantity", 0), "residual_quantity")
+        loss = self._opening_loss_from_session(session)
+        session = self.store.lp_update_session(
+            str(session["session_id"]),
+            patch={"opening_loss": loss},
+        )
+        # A missing bid, fee, or position reconciliation must not prevent
+        # the absolute review deadline from cancelling known quotes.
+        if now >= review_at:
             try:
-                request = self._normalize_request(session)
-                snapshot = self._read_snapshot(request)
-            except ValueError as exc:
-                patch: dict[str, object] = {
-                    "reconciliation": str(exc),
-                    "resume_state": state
-                    if state != "needs_attention"
-                    else session.get("resume_state"),
-                }
-                failures = self._queue_protection_data_failure(session, str(exc))
-                if failures is not None:
-                    patch["queue_protection"] = failures
-                updated = self.store.lp_update_session(
-                    str(session["session_id"]),
-                    state="needs_attention",
-                    patch=patch,
-                )
-                conservative = self._conservative_protection_cancel(updated, failures)
-                if conservative is not None:
-                    return self._status_payload(conservative)
-                return self._status_payload(updated)
-            try:
-                patch = self._fill_patch(session, snapshot)
-            except ValueError as exc:
-                outage_patch: dict[str, object] = {
-                    "reconciliation": str(exc),
-                    "resume_state": state
-                    if state != "needs_attention"
-                    else session.get("resume_state"),
-                }
-                failures = self._queue_protection_data_failure(session, str(exc))
-                if failures is not None:
-                    outage_patch["queue_protection"] = failures
-                updated = self.store.lp_update_session(
-                    str(session["session_id"]),
-                    state="needs_attention",
-                    patch=outage_patch,
-                )
-                conservative = self._conservative_protection_cancel(updated, failures)
-                if conservative is not None:
-                    return self._status_payload(conservative)
-                return self._status_payload(updated)
-            ownership_reason = self._unowned_target_order_reason(session, snapshot)
-            if ownership_reason is not None:
-                resume_state = (
-                    str(session.get("resume_state") or "")
-                    if state == "needs_attention"
-                    else state
-                ) or "entry_open"
-                patch.update(
-                    {
-                        "reconciliation": ownership_reason,
-                        "resume_state": resume_state,
-                    }
-                )
-                updated = self.store.lp_update_session(
-                    str(session["session_id"]),
-                    state="needs_attention",
-                    patch=patch,
-                )
-                return self._status_payload(updated)
-            updated = self.store.lp_update_session(str(session["session_id"]), patch=patch)
-            session = updated
-            try:
-                session = self._sync_order_history(session, snapshot)
-            except ValueError as exc:
+                self._cancel_owned_orders(session)
+            except Exception as exc:
                 updated = self.store.lp_update_session(
                     str(session["session_id"]),
                     state="needs_attention",
                     patch={
-                        "reconciliation": str(exc),
-                        "resume_state": state
-                        if state != "needs_attention"
-                        else session.get("resume_state"),
+                        "reconciliation": f"deadline_cancel_{type(exc).__name__}",
+                        "resume_state": "review",
+                        "review_status": "awaiting_reconciliation",
                     },
                 )
                 return self._status_payload(updated)
-            if state == "needs_attention":
-                resume_state = str(session.get("resume_state") or "")
-                if not resume_state:
-                    resume_state = "review" if session.get("stop_requested") else "entry_open"
-                if resume_state not in {"entry_open", "passive_exit", "stop_loss_exit", "review"}:
-                    resume_state = "review"
-                session = self.store.lp_update_session(
-                    str(session["session_id"]),
-                    state=resume_state,
-                    patch={"reconciliation": None, "resume_state": None},
-                )
-                state = resume_state
-            # Issue 152: queue protection runs inside the existing one-second
-            # monitor tick, before any exit reconciliation can mutate orders.
-            session = self._apply_queue_protection(session, snapshot)
-            session = self._reconcile_protected_exit(session, snapshot)
-            if _decimal(session.get("buy_filled_quantity", 0), "buy_filled_quantity") > 0:
-                entry_terminal = self._order_terminal(
-                    snapshot, str(session.get("entry_order_id") or ""), session
-                )
-                if (
-                    not bool(session.get("entry_cancel_requested"))
-                    and not entry_terminal
-                ):
-                    self._request_entry_cancel(session)
-                    session = self.store.lp_session(str(session["session_id"])) or session
-                if not entry_terminal:
-                    return self._status_payload(session)
-            if state == "review":
-                self._update_scoring(session, snapshot)
-                session = self.store.lp_session(str(session["session_id"])) or session
-                return self._review_iteration(session, snapshot)
-            self._update_scoring(session, snapshot)
-            session = self.store.lp_session(str(session["session_id"])) or session
-            if str(session.get("state")) == "review":
-                return self._review_iteration(session, snapshot)
-            now = self._now()
-            review_at = _timestamp(session["review_at"], name="review_at")
-            residual = _decimal(session.get("residual_quantity", 0), "residual_quantity")
-            loss = self._opening_loss_from_session(session)
+            updated = self.store.lp_update_session(
+                str(session["session_id"]),
+                state="review",
+                patch={"review_status": "awaiting_reconciliation"},
+            )
+            return self._status_payload(updated)
+        if loss is not None and loss >= STOP_LOSS:
             session = self.store.lp_update_session(
                 str(session["session_id"]),
-                patch={"opening_loss": loss},
+                state="stop_loss_exit",
+                patch=self._stop_loss_latch_patch(session, loss),
             )
-            # A missing bid, fee, or position reconciliation must not prevent
-            # the absolute review deadline from cancelling known quotes.
-            if now >= review_at:
-                try:
-                    self._cancel_owned_orders(session)
-                except Exception as exc:
-                    updated = self.store.lp_update_session(
-                        str(session["session_id"]),
-                        state="needs_attention",
-                        patch={
-                            "reconciliation": f"deadline_cancel_{type(exc).__name__}",
-                            "resume_state": "review",
-                            "review_status": "awaiting_reconciliation",
-                        },
-                    )
-                    return self._status_payload(updated)
-                updated = self.store.lp_update_session(
-                    str(session["session_id"]),
-                    state="review",
-                    patch={"review_status": "awaiting_reconciliation"},
-                )
-                return self._status_payload(updated)
-            if loss is not None and loss >= STOP_LOSS:
+        session = self.store.lp_session(str(session["session_id"])) or session
+        if bool(session.get("stop_loss_latched")) or str(session.get("state")) == "stop_loss_exit":
+            if str(session.get("state")) != "stop_loss_exit":
                 session = self.store.lp_update_session(
                     str(session["session_id"]),
                     state="stop_loss_exit",
-                    patch=self._stop_loss_latch_patch(session, loss),
+                    patch={"stop_loss_latched": True},
                 )
+            session = self._request_passive_cancel(session)
             session = self.store.lp_session(str(session["session_id"])) or session
-            if bool(session.get("stop_loss_latched")) or str(session.get("state")) == "stop_loss_exit":
-                if str(session.get("state")) != "stop_loss_exit":
-                    session = self.store.lp_update_session(
-                        str(session["session_id"]),
-                        state="stop_loss_exit",
-                        patch={"stop_loss_latched": True},
-                    )
-                session = self._request_passive_cancel(session)
-                session = self.store.lp_session(str(session["session_id"])) or session
-                passive_id = str(session.get("passive_exit_order_id") or "")
-                if passive_id and not self._order_terminal(snapshot, passive_id, session):
-                    return self._status_payload(session)
-                residual = _decimal(session.get("residual_quantity", 0), "residual_quantity")
-                if residual > 0 and not session.get("protected_exit_order_id"):
-                    self._submit_protected_exit(session, residual, snapshot)
-                    session = self.store.lp_session(str(session["session_id"])) or session
-                return self._complete_if_flat(session, snapshot)
-            if loss is None:
-                return self._complete_if_flat(session, snapshot)
-            if residual > 0:
-                self._ensure_passive_exit(session, snapshot, residual)
+            passive_id = str(session.get("passive_exit_order_id") or "")
+            if passive_id and not self._order_terminal(snapshot, passive_id, session):
+                return self._status_payload(session)
+            residual = _decimal(session.get("residual_quantity", 0), "residual_quantity")
+            if residual > 0 and not session.get("protected_exit_order_id"):
+                self._submit_protected_exit(session, residual, snapshot)
                 session = self.store.lp_session(str(session["session_id"])) or session
             return self._complete_if_flat(session, snapshot)
+        if loss is None:
+            return self._complete_if_flat(session, snapshot)
+        if residual > 0:
+            self._ensure_passive_exit(session, snapshot, residual)
+            session = self.store.lp_session(str(session["session_id"])) or session
+        return self._complete_if_flat(session, snapshot)
 
     # Public math is intentionally not used by the approved behavior cases;
     # the lifecycle calls this private helper after reading external facts.

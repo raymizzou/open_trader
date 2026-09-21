@@ -9530,6 +9530,9 @@ def test_lp_dashboard_payload_keeps_orders_and_positions_intact(
         "taker_fee_rate": Decimal("0"),
         "management": "manual_read_only",
         "read_only": True,
+        # Issue 165: every open-orders row carries the owning session id;
+        # manual rows stay unattributed.
+        "session_id": None,
         "scoring_status": "false",
     }
     assert dashboard["positions"] == [

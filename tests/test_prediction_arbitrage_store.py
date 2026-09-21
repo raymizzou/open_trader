@@ -3451,3 +3451,40 @@ def test_lp_latest_session_excludes_reserved_manual_anchor(tmp_path: Path) -> No
         payload={"context": "manual_cancel_audit"},
     )
     assert anchor_only.lp_latest_session() is None
+
+
+def test_lp_active_sessions_lists_non_terminal_newest_first(tmp_path: Path) -> None:
+    """Issue 165: 复数选择器只返回非终态会话、按 created_at 倒序；
+    终态行与 manual 锚点不出现；终态化后为空列表。"""
+
+    db = store(tmp_path)
+    payload = {"market_id": "market-a", "outcome": "YES"}
+    # B 最早，终态 complete。
+    db.lp_create_session("lp-b", "lp-key-b", state="entry_open", payload=payload)
+    db.lp_update_session("lp-b", state="complete")
+    # C 终态 entry_rejected。
+    db.lp_create_session("lp-c", "lp-key-c", state="entry_open", payload=payload)
+    db.lp_update_session("lp-c", state="entry_rejected")
+    # manual 锚点（终态 complete，永不进入活动清单）。
+    db.lp_create_session(
+        LP_RESERVED_MANUAL_SESSION_ID,
+        "manual-anchor",
+        state="complete",
+        payload={"context": "manual_cancel_audit"},
+    )
+    # A 最新，活动 entry_open。
+    created_a = db.lp_create_session(
+        "lp-a", "lp-key-a", state="entry_open", payload=payload
+    )
+
+    sessions = db.lp_active_sessions()
+    assert [row["session_id"] for row in sessions] == ["lp-a"]
+    assert sessions == [created_a]
+    active = db.lp_active_session()
+    assert active is not None
+    assert active["session_id"] == "lp-a"
+    assert all(row["session_id"] not in {"lp-b", "lp-c", "manual"} for row in sessions)
+
+    db.lp_update_session("lp-a", state="complete")
+    assert db.lp_active_sessions() == []
+    assert db.lp_active_session() is None

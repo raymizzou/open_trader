@@ -22325,6 +22325,47 @@ console.log(JSON.stringify({
     assert rendered["bothAnchored"] is True
 
 
+def test_lp_today_augment_button_carries_session_id_and_gates_on_match() -> None:
+    """Issue 165: 加量按钮携带 data-session-id；点击仅在 session_id 匹配时
+    打开 lp_augment 弹窗，不一致时忽略本次点击。"""
+    output = run_dashboard_js(_LP158_FIXTURE + r'''
+state.predictionMarket.csrfToken = "csrf-1";
+const html = predictionLpCard({lp_dashboard: buildDashboard({
+  lp_orders_today: [sessionRow],
+  lp_session: {state:"entry_open", session_id:"sess-abc123",
+    condition_id:"condition-fed", price:"0.42", quantity:"120",
+    market_title:"Will the Fed cut rates in Q4?"},
+})});
+const augmentButton = (targetSessionId) => ({
+  disabled:false,
+  dataset:{action:"lp-augment-entry", conditionId:"condition-fed", sessionId:targetSessionId},
+  closest(selector){return selector==="[data-action='lp-augment-entry']" ? this : null;},
+});
+state.predictionMarket.lpDashboard = buildDashboard({
+  lp_orders_today: [sessionRow],
+  lp_session: {state:"entry_open", session_id:"sess-abc123",
+    condition_id:"condition-fed", price:"0.42", quantity:"120",
+    market_title:"Will the Fed cut rates in Q4?"},
+});
+let opened=null;
+openPredictionModal=(...args)=>{opened=args;};
+await handlePredictionMarketClick({target:{closest(selector){return augmentButton("sess-abc123").closest(selector);}}});
+const matched = opened;
+opened=null;
+await handlePredictionMarketClick({target:{closest(selector){return augmentButton("sess-stale").closest(selector);}}});
+const mismatched = opened;
+console.log(JSON.stringify({
+  carriesSessionId: html.includes('data-session-id="sess-abc123"'),
+  matchedOpens: matched !== null && matched[0] === "lp_augment",
+  mismatchIgnored: mismatched === null,
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["carriesSessionId"] is True
+    assert rendered["matchedOpens"] is True
+    assert rendered["mismatchIgnored"] is True
+
+
 _LP158_INTERACTIVE = r'''
 class Element {
   constructor(id){

@@ -2703,6 +2703,15 @@ class PredictionArbitrageStore:
             ).fetchone()
         return None if row is None else self._lp_row_result(row)
 
+    def lp_active_sessions(self) -> list[dict[str, object]]:
+        """Return all non-terminal LP sessions, newest first (issue 165)."""
+
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM lp_sessions WHERE state NOT IN ('complete','entry_rejected') ORDER BY created_at DESC"
+            ).fetchall()
+        return [self._lp_row_result(row) for row in rows]
+
     def lp_latest_session(self) -> dict[str, object] | None:
         """Return the most recently created LP session for read-only status.
 

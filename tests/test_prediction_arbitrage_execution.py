@@ -7601,6 +7601,114 @@ def test_lp_dashboard_projects_queue_protection_anchor_and_summary(
     assert status["queue_protection"]["front_estimate"] == "8000"
 
 
+def test_dashboard_today_rows_carry_owning_session_and_flags(
+    tmp_path: Path,
+) -> None:
+    """Issue 165: today 行携带归属 session_id 与 anchor/augment 标记；
+    会话标的组挂 submit 基线保护摘要；另一市场的手动单不归属。"""
+
+    store = PredictionArbitrageStore(tmp_path / "data")
+    trading = _CancelTrading(
+        [
+            {**_cancel_open_order("entry-1", "0xc1"), "token_id": "yes-token"},
+            {**_cancel_open_order("aug-1", "0xc1"), "token_id": "yes-token"},
+            _cancel_open_order("manual-other", "0xc2"),
+        ]
+    )
+    service = PredictionExecutionService(
+        store=store,
+        monitor=object(),
+        trading=trading,
+        notifier=ChannelNotifier("feishu"),
+        lock_path=tmp_path / "owner.lock",
+    )
+    store.lp_create_session(
+        "lp-owner-session",
+        "lp-owner-key",
+        state="entry_open",
+        payload={
+            "condition_id": "0xc1",
+            "token_id": "yes-token",
+            "market_id": "market-1",
+            "outcome": "YES",
+            "question": "Will it happen?",
+            "entry_order_id": "entry-1",
+            "augment_order_ids": ["aug-1"],
+            "owned_order_ids": ["entry-1", "aug-1"],
+            "queue_protection": {
+                "baseline_front": "10000",
+                "baseline_price": "0.50",
+                "baseline_version": 1,
+                "threshold": "0.5",
+                "data_failures": 0,
+                "state": "monitoring",
+                "notification_sent": False,
+                "cancel_scope": "own_buys_at_level",
+                "front_estimate": "8000",
+                "level_total": "10000",
+                "ratio": "0.8",
+                "reason_codes": [],
+                "data_time": "2026-09-21T12:00:00.000000Z",
+            },
+        },
+    )
+    service._lp = PolymarketLPService(store, object())
+
+    payload = service.refresh_lp_dashboard_snapshot()
+    rows = {row["order_id"]: row for row in payload["lp_orders_today"]}
+    assert rows["entry-1"]["session_id"] == "lp-owner-session"
+    assert rows["entry-1"]["anchor"] is True
+    assert rows["aug-1"]["session_id"] == "lp-owner-session"
+    assert rows["aug-1"]["anchor"] is True
+    assert rows["aug-1"]["augment"] is True
+    assert rows["entry-1"]["queue_protection"]["baseline_source"] == "submit"
+    assert rows["aug-1"]["queue_protection"]["baseline_source"] == "submit"
+    manual = rows["manual-other"]
+    assert manual["session_id"] is None
+    assert manual["management"] == "manual_read_only"
+    assert "queue_protection" not in manual
+
+
+def test_dashboard_completed_latest_session_rows_keep_managed_marking_with_session_id(
+    tmp_path: Path,
+) -> None:
+    """Issue 165 护栏：无活动会话时 lp_status() 的 active→latest 回退保持——
+    完结会话的 entry 委托行仍标 system_managed，并归属其 session_id。"""
+
+    store = PredictionArbitrageStore(tmp_path / "data")
+    trading = _CancelTrading(
+        [{**_cancel_open_order("entry-done", "0xc9"), "token_id": "done-token"}]
+    )
+    service = PredictionExecutionService(
+        store=store,
+        monitor=object(),
+        trading=trading,
+        notifier=ChannelNotifier("feishu"),
+        lock_path=tmp_path / "done.lock",
+    )
+    store.lp_create_session(
+        "lp-done-session",
+        "lp-done-key",
+        state="complete",
+        payload={
+            "condition_id": "0xc9",
+            "token_id": "done-token",
+            "market_id": "market-done",
+            "outcome": "YES",
+            "question": "Will it happen?",
+            "entry_order_id": "entry-done",
+            "owned_order_ids": ["entry-done"],
+        },
+    )
+    service._lp = PolymarketLPService(store, object())
+
+    payload = service.refresh_lp_dashboard_snapshot()
+    rows = {row["order_id"]: row for row in payload["lp_orders_today"]}
+    assert rows["entry-done"]["management"] == "system_managed"
+    assert rows["entry-done"]["read_only"] is False
+    assert rows["entry-done"]["session_id"] == "lp-done-session"
+
+
 # ---- Issue 159: 网页手动单首见基线兜底（diff 判新 D1-D4、会话并存 C1、并行 C2） ----
 
 

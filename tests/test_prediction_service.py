@@ -1972,6 +1972,90 @@ def test_lp_dashboard_http_projection_keeps_today_orders(tmp_path: Path) -> None
     assert row["scoring_status"] == "true"
     assert payload["non_lp_row_count"] == 0
 
+
+def test_lp_dashboard_http_rows_include_session_id(tmp_path: Path) -> None:
+    """Issue 165: lp_orders_today 行的 session_id 键经 HTTP 投影透传。"""
+
+    class FakeTrading:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(
+                wallet_address="0x" + "4" * 40,
+                signer_address="0x" + "5" * 40,
+                predict=None,
+            )
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": datetime.now(UTC),
+                "open_orders": [
+                    {
+                        "order_id": "scoring-order",
+                        "condition_id": "condition-1",
+                        "token_id": "yes-token",
+                        "outcome": "YES",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "price": Decimal("0.50"),
+                        "original_size": Decimal("80"),
+                        "size_matched": Decimal("40"),
+                        "remaining_size": Decimal("40"),
+                        "market_title": "Projected LP market",
+                        "market_url": "https://polymarket.com/event/projected",
+                    }
+                ],
+                "positions": [],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def get_order_scoring(self, _order_id: str) -> bool:
+            return True
+
+    class FakeLP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {
+                "state": "known",
+                "complete": False,
+                "candidates": [],
+                "recommendations": [],
+                "market_rewards": {},
+            }
+
+        def status(self, _session_id: str | None = None) -> dict[str, object]:
+            return {
+                "state": "entry_open",
+                "session_id": "lp-http-session",
+                "condition_id": "condition-1",
+                "token_id": "yes-token",
+                "entry_order_id": "scoring-order",
+                "owned_order_ids": ["scoring-order"],
+            }
+
+    store = PredictionArbitrageStore(tmp_path / "data")
+    service = PredictionExecutionService(
+        store=store,
+        monitor=object(),
+        trading=FakeTrading(),
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=FakeLP(),
+    )
+    runtime = _Runtime()
+    runtime.store = store  # type: ignore[assignment]
+    runtime.monitor = object()
+    runtime.execution = service
+
+    service.refresh_lp_dashboard_snapshot()
+    with _server(runtime) as base:
+        status, payload = _response(base + "/api/prediction-arbitrage/lp/dashboard")
+
+    assert status == 200
+    today = payload["lp_orders_today"]
+    assert [str(row["order_id"]) for row in today] == ["scoring-order"]
+    assert all("session_id" in row for row in today)
+    assert today[0]["session_id"] == "lp-http-session"
+
 def test_lp_dashboard_account_outage_keeps_newer_public_funnel(tmp_path: Path) -> None:
     first_now = datetime(2026, 9, 17, 1, tzinfo=UTC)
     now = [first_now]

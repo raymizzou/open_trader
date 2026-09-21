@@ -3778,8 +3778,11 @@ function lpDashboardAugmentButtonMarkup(orders, session) {
   if (sessionState === "none" || session.error) return "";
   const conditionId = String(orders[0]?.condition_id || "");
   if (!conditionId || String(session.condition_id || "") !== conditionId) return "";
+  // Issue 165: the button names its owning session explicitly so clicks
+  // can be gated against the served lp_session.
   return "<button class=\"pm-button lp-augment\" type=\"button\""
     + " data-action=\"lp-augment-entry\" data-condition-id=\"" + escapeHtml(conditionId) + "\""
+    + " data-session-id=\"" + escapeHtml(String(session.session_id || "")) + "\""
     + " title=\"在会话保护伞内追加一张同价 post-only BUY\""
     + (!state.predictionMarket.csrfToken ? " disabled" : "")
     + ">加量</button>";
@@ -7075,8 +7078,15 @@ async function handlePredictionMarketClick(event) {
   const lpAugmentEntry = event.target.closest("[data-action='lp-augment-entry']");
   if (lpAugmentEntry && !lpAugmentEntry.disabled) {
     const conditionId = String(lpAugmentEntry.dataset.conditionId || "");
+    // Issue 165: the button names its owning session; a click whose
+    // session_id is empty or no longer matches the served lp_session is
+    // ignored (no modal).
+    const sessionId = String(lpAugmentEntry.dataset.sessionId || "");
     const dashboard = state.predictionMarket.lpDashboard;
     const session = dashboard?.lp_session;
+    if (!sessionId || String(session?.session_id || "") !== sessionId) {
+      return;
+    }
     const group = lpDashboardTodayGroups(lpDashboardRows(dashboard?.lp_orders_today))
       .find((item) => item.conditionId === conditionId);
     if (group && session) {

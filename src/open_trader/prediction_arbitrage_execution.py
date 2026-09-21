@@ -2035,25 +2035,37 @@ class PredictionExecutionService:
             self._lp_first_seen_prev_at = observed_at
             return
 
-        active_session: Mapping[str, object] | None = None
-        session_reader = getattr(self._store, "lp_active_session", None)
-        if callable(session_reader):
+        # Issue 165: active sessions project as a list; the system-owned
+        # order ids and the exempt session tokens are the union over the
+        # list (identical values with the single active session today).
+        active_sessions: tuple[Mapping[str, object], ...] = ()
+        sessions_reader = getattr(self._store, "lp_active_sessions", None)
+        if callable(sessions_reader):
             try:
-                active_session = session_reader()
+                raw_sessions = sessions_reader()
             except Exception:
-                active_session = None
-        session_token = str((active_session or {}).get("token_id") or "")
+                raw_sessions = None
+            if isinstance(raw_sessions, (list, tuple)):
+                active_sessions = tuple(
+                    session
+                    for session in raw_sessions
+                    if isinstance(session, Mapping)
+                )
+        session_tokens: set[str] = (
+            {str(session.get("token_id") or "") for session in active_sessions}
+            - {""}
+        )
         system_ids: set[str] = set()
-        if isinstance(active_session, Mapping):
+        for session in active_sessions:
             for key in (
                 "entry_order_id",
                 "passive_exit_order_id",
                 "protected_exit_order_id",
             ):
-                value = str(active_session.get(key) or "")
+                value = str(session.get(key) or "")
                 if value:
                     system_ids.add(value)
-            raw_owned = active_session.get("owned_order_ids")
+            raw_owned = session.get("owned_order_ids")
             if isinstance(raw_owned, (list, tuple, set, frozenset)):
                 system_ids.update(str(order_id) for order_id in raw_owned if order_id)
 
@@ -2126,7 +2138,7 @@ class PredictionExecutionService:
             if order_id in system_ids:
                 continue
             token_id = str(row.get("token_id") or "")
-            if not token_id or token_id == session_token or token_id in active_tokens:
+            if not token_id or token_id in session_tokens or token_id in active_tokens:
                 continue
             self._lp_first_seen_pending[order_id] = {
                 "token_id": token_id,
@@ -2140,7 +2152,7 @@ class PredictionExecutionService:
 
         register = getattr(self._lp, "register_first_seen_candidates", None)
         for token_id, token_rows in candidates_by_token.items():
-            if token_id == session_token or token_id in active_tokens:
+            if token_id in session_tokens or token_id in active_tokens:
                 # The session token is covered by the issue 152 exemption,
                 # and tokens with an active episode are covered by that
                 # episode's runtime — neither ever reaches the LP service.
@@ -2215,7 +2227,15 @@ class PredictionExecutionService:
                     session = dict(raw_session) if isinstance(raw_session, Mapping) else {"state": "unknown"}
                 except Exception:
                     session = {"state": "unknown"}
-                managed_ids = {
+                # Issue 165: sessions project as views so each dashboard row
+                # can carry its owning session_id.  The view list is built
+                # from the lp_status() active→latest fallback, so today it
+                # holds exactly one view; the managed union below keeps the
+                # pre-refactor values.  A payload without a session_id key
+                # still builds its view (managed_ids/managed_token derive
+                # unconditionally, as before); its rows stay unattributed.
+                lp_session_views: list[dict[str, object]] = []
+                view_owned_ids: set[str] = {
                     str(session.get(key) or "")
                     for key in (
                         "entry_order_id",
@@ -2225,8 +2245,46 @@ class PredictionExecutionService:
                 } - {""}
                 raw_owned = session.get("owned_order_ids")
                 if isinstance(raw_owned, (list, tuple, set, frozenset)):
-                    managed_ids.update(str(order_id) for order_id in raw_owned if order_id)
-                managed_token = str(session.get("token_id") or "")
+                    view_owned_ids.update(
+                        str(order_id) for order_id in raw_owned if order_id
+                    )
+                view_protection = session.get("queue_protection")
+                view_summary = (
+                    dict(view_protection)
+                    if isinstance(view_protection, Mapping)
+                    else None
+                )
+                # Issue 152 increment: mark the submit-baseline source so
+                # the UI can distinguish it from the issue 159 first-seen
+                # one.
+                if isinstance(view_summary, dict):
+                    view_summary.setdefault("baseline_source", "submit")
+                lp_session_views.append(
+                    {
+                        "session_id": session.get("session_id"),
+                        "state": session.get("state"),
+                        "condition_id": str(session.get("condition_id") or ""),
+                        "token_id": str(session.get("token_id") or ""),
+                        "entry_order_id": str(session.get("entry_order_id") or ""),
+                        "augment_order_ids": {
+                            str(value)
+                            for value in session.get("augment_order_ids") or ()
+                        },
+                        "owned_ids": view_owned_ids,
+                        "queue_protection": view_summary,
+                    }
+                )
+                managed_ids: set[str] = set()
+                for view in lp_session_views:
+                    managed_ids.update(view["owned_ids"])  # type: ignore[arg-type]
+                view_tokens = {
+                    str(view["token_id"])
+                    for view in lp_session_views
+                    if str(view["token_id"])
+                }
+                managed_token = (
+                    next(iter(view_tokens)) if len(view_tokens) == 1 else ""
+                )
 
                 orders: list[dict[str, object]] = []
                 first_seen_created_at: dict[str, object] = {}
@@ -2246,6 +2304,13 @@ class PredictionExecutionService:
                     if remaining is None and quantity is not None and filled is not None:
                         remaining = max(Decimal("0"), quantity - filled)
                     managed = order_id in managed_ids
+                    # Issue 165: attribute the row to the session whose
+                    # registered orders own it (None for manual rows).
+                    owning_view: dict[str, object] | None = None
+                    for view in lp_session_views:
+                        if order_id in view["owned_ids"]:  # type: ignore[operator]
+                            owning_view = view
+                            break
                     minimum_order_size = _decimal(raw_order.get("minimum_order_size"))
                     reward_min_size = _decimal(raw_order.get("reward_min_size"))
                     min_scoring_size = _lp_min_scoring_size(
@@ -2278,6 +2343,9 @@ class PredictionExecutionService:
                             "taker_fee_rate": _decimal(raw_order.get("taker_fee_rate")),
                             "management": "system_managed" if managed else "manual_read_only",
                             "read_only": not managed,
+                            "session_id": (
+                                owning_view["session_id"] if owning_view else None
+                            ),
                         }
                     )
 
@@ -2488,6 +2556,23 @@ class PredictionExecutionService:
                         or bool(managed_token)
                         and str(fill.get("token_id") or "") == managed_token
                     )
+                    # Issue 165: a managed fill attributes to its owning
+                    # session view; unmanaged fills stay unattributed.
+                    fill_session_id: object = None
+                    if fill_managed:
+                        fill_token = str(fill.get("token_id") or "")
+                        fill_view: dict[str, object] | None = None
+                        for view in lp_session_views:
+                            if str(order_id) in view["owned_ids"]:  # type: ignore[operator]
+                                fill_view = view
+                                break
+                        if fill_view is None and fill_token:
+                            for view in lp_session_views:
+                                if str(view["token_id"]) == fill_token:
+                                    fill_view = view
+                                    break
+                        if fill_view is not None:
+                            fill_session_id = fill_view["session_id"]
                     lp_orders_today.append(
                         {
                             "order_id": order_id,
@@ -2516,50 +2601,17 @@ class PredictionExecutionService:
                                 else "manual_read_only"
                             ),
                             "read_only": not fill_managed,
+                            "session_id": fill_session_id,
                         }
                     )
                 # Issue 152: today-order rows carry the queue-protection
                 # anchor flag (is this the registered entry order?) and the
                 # session condition's group attaches the protection summary;
                 # manual-only groups render unanchored with no summary.
-                raw_protection = (
-                    session.get("queue_protection")
-                    if isinstance(session, Mapping)
-                    else None
-                )
-                queue_protection_summary = (
-                    dict(raw_protection)
-                    if isinstance(raw_protection, Mapping)
-                    else None
-                )
-                # Issue 152 increment: mark the submit-baseline source so the
-                # UI can distinguish it from the issue 159 first-seen one.
-                if isinstance(queue_protection_summary, dict):
-                    queue_protection_summary.setdefault(
-                        "baseline_source", "submit"
-                    )
-                lp_entry_order_id = (
-                    str(session.get("entry_order_id") or "")
-                    if isinstance(session, Mapping)
-                    else ""
-                )
-                lp_session_condition = (
-                    str(session.get("condition_id") or "")
-                    if isinstance(session, Mapping)
-                    else ""
-                )
-                # Issue 158: augment orders are session-registered too, so
-                # they anchor like the entry and carry the augment flag the
-                # dashboard renders as the 加量单 note.
-                lp_augment_order_ids = {
-                    str(value)
-                    for value in (
-                        session.get("augment_order_ids")
-                        if isinstance(session, Mapping)
-                        else ()
-                    )
-                    or ()
-                }
+                # Issue 165: anchor/augment/session attribution and the
+                # summary derive from the session view list instead of the
+                # single status payload; episode rows stay unattributed
+                # because an episode is not a session.
                 # Issue 159: active first-seen episodes project their payload
                 # as the protection summary of their own token's rows, and
                 # every registered anchor order is an anchor row.
@@ -2577,10 +2629,30 @@ class PredictionExecutionService:
                         episodes_by_token = {}
                 for today_row in lp_orders_today:
                     order_id = str(today_row.get("order_id") or "")
+                    row_view: dict[str, object] | None = None
+                    for view in lp_session_views:
+                        if order_id in view["owned_ids"] or order_id in view[
+                            "augment_order_ids"
+                        ]:  # type: ignore[operator]
+                            row_view = view
+                            break
+                    view_entry_order_id = (
+                        str(row_view["entry_order_id"]) if row_view else ""
+                    )
+                    view_augment_ids = (
+                        row_view["augment_order_ids"]
+                        if row_view is not None
+                        else set()
+                    )
                     today_row["anchor"] = (
-                        bool(lp_entry_order_id) and order_id == lp_entry_order_id
-                    ) or order_id in lp_augment_order_ids
-                    today_row["augment"] = order_id in lp_augment_order_ids
+                        bool(view_entry_order_id)
+                        and order_id == view_entry_order_id
+                    ) or order_id in view_augment_ids
+                    today_row["augment"] = order_id in view_augment_ids
+                    if row_view is not None:
+                        today_row["session_id"] = row_view["session_id"]
+                    else:
+                        today_row.setdefault("session_id", None)
                     episode = episodes_by_token.get(
                         str(today_row.get("token_id") or "")
                     )
@@ -2592,13 +2664,19 @@ class PredictionExecutionService:
                             today_row["anchor"] = True
                         today_row["queue_protection"] = dict(episode)
                         continue
-                    if (
-                        queue_protection_summary is not None
-                        and lp_session_condition
-                        and str(today_row.get("condition_id") or "")
-                        == lp_session_condition
-                    ):
-                        today_row["queue_protection"] = dict(queue_protection_summary)
+                    row_condition = str(today_row.get("condition_id") or "")
+                    row_summary: dict[str, object] | None = None
+                    if row_condition:
+                        for view in lp_session_views:
+                            summary = view["queue_protection"]
+                            if (
+                                summary is not None
+                                and str(view["condition_id"]) == row_condition
+                            ):
+                                row_summary = summary
+                                break
+                    if row_summary is not None:
+                        today_row["queue_protection"] = dict(row_summary)
                 result = {
                     "state": "ready",
                     "orders": orders,

@@ -6023,6 +6023,68 @@ def test_status_returns_none_when_only_reserved_manual_anchor(tmp_path) -> None:
     assert service.status() == {"state": "none", "session_id": None}
 
 
+def test_status_and_stop_unknown_session_id_do_not_touch_active(tmp_path) -> None:
+    """Issue 165 护栏：status/stop 传不存在的 session_id 返回 none 载荷，
+    绝不回退到活动会话，也不触碰活动会话及其订单。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _queue_running_service(
+        tmp_path, now, key="lp-unknown-id"
+    )
+    session_id = str(started["session_id"])
+
+    none_payload = {"state": "none", "session_id": None}
+    assert service.status("nope") == none_payload
+    assert service.stop("nope") == none_payload
+
+    active = store.lp_session(session_id)
+    assert active is not None
+    assert active["state"] == "entry_open"
+    assert not active.get("entry_cancel_requested")
+    assert exchange.cancels == []
+
+
+def test_stop_historical_session_leaves_active_untouched(tmp_path) -> None:
+    """Issue 165 护栏：stop 显式指定完结会话只回读其终态载荷，不撤单、
+    不触碰活动会话；默认 stop(None) 仍作用于活动会话。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _queue_running_service(
+        tmp_path, now, key="lp-stop-history"
+    )
+    active_id = str(started["session_id"])
+    store.lp_create_session(
+        "lp-history",
+        "lp-history-key",
+        state="complete",
+        payload={"market_id": "market-history", "outcome": "YES"},
+    )
+    historical = store.lp_session("lp-history")
+    assert historical is not None
+    historical_updated_at = historical["updated_at"]
+
+    stopped = service.stop("lp-history")
+    assert stopped["state"] == "complete"
+    assert stopped == service.status("lp-history")
+    after = store.lp_session("lp-history")
+    assert after is not None
+    assert after["updated_at"] == historical_updated_at
+
+    active = store.lp_session(active_id)
+    assert active is not None
+    assert active["state"] == "entry_open"
+    assert not active.get("entry_cancel_requested")
+    assert exchange.cancels == []
+
+    # 默认行为兼容：stop(None) 仍作用于唯一活动会话。
+    default_stop = service.stop()
+    assert default_stop["state"] == "review"
+    assert default_stop["stop_requested"] is True
+    assert exchange.cancels == ["order-1"]
+    stopped_active = store.lp_session(active_id)
+    assert stopped_active is not None
+    assert stopped_active["state"] == "review"
+    assert stopped_active["stop_requested"] is True
+
+
 def test_daily_report_session_excludes_reserved_manual_anchor(tmp_path) -> None:
     """R3: 日报会话装配对保留锚点会话返回 relevant=False(调用方跳过)。"""
 
@@ -6676,6 +6738,39 @@ def _queue_running_service(
     started = service.start(str(preview["preview_id"]), key)
     assert started["state"] == "entry_open"
     return store, exchange, service, started
+
+
+def test_candidate_reservations_cover_each_active_session(tmp_path) -> None:
+    """Issue 165: 预留输出含活动会话条目（order_id/amount 与既有行为一致）；
+    无活动会话时无 lp 预留条目。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _queue_running_service(
+        tmp_path, now, key="lp-reservations"
+    )
+    session_id = str(started["session_id"])
+    session = store.lp_session(session_id)
+    assert session is not None
+    entry_order_id = str(session["entry_order_id"])
+    assert entry_order_id == "order-1"
+
+    reservations = service._candidate_reservations()
+    lp_entries = [
+        entry
+        for entry in reservations
+        if str(entry["order_id"]) == entry_order_id
+        or str(entry["order_id"]).startswith("lp-session:")
+    ]
+    assert lp_entries == [{"order_id": "order-1", "amount": Decimal("600.00")}]
+
+    # 无活动会话（终态 complete）→ 无任何 lp 预留条目。
+    store.lp_update_session(session_id, state="complete")
+    after = service._candidate_reservations()
+    assert [
+        entry
+        for entry in after
+        if str(entry["order_id"]) == entry_order_id
+        or str(entry["order_id"]).startswith("lp-session:")
+    ] == []
 
 
 def test_queue_protection_triggers_cancel_once_and_converges(tmp_path) -> None:
@@ -7997,10 +8092,11 @@ def test_candidate_pool_late_write_never_overwrites_newer_result(
 
     # The reservations read is the last read before the exploration batch
     # publishes: latch it so the batch publishes only after the maintenance
-    # has published a strictly newer result.
+    # has published a strictly newer result.  (Issue 165: the reservations
+    # read goes through the plural lp_active_sessions selector.)
     latch = threading.Event()
     released = threading.Event()
-    real_reader = store.lp_active_session
+    real_reader = store.lp_active_sessions
 
     def latched_reader():
         if latch.is_set() and not released.is_set():
@@ -8008,7 +8104,7 @@ def test_candidate_pool_late_write_never_overwrites_newer_result(
             assert latch.wait(timeout=5)
         return real_reader()
 
-    store.lp_active_session = latched_reader  # type: ignore[method-assign]
+    store.lp_active_sessions = latched_reader  # type: ignore[method-assign]
 
     current["now"] = now + timedelta(seconds=65)
     exchange.now = current["now"]
@@ -8334,7 +8430,9 @@ def test_refresh_candidates_mid_batch_failure_publishes_honestly(
 
     # The reservations read is the batch's last read before publication:
     # make it raise once, mid-batch, after the books were already read.
-    real_reader = store.lp_active_session
+    # (Issue 165: the reservations read goes through the plural
+    # lp_active_sessions selector.)
+    real_reader = store.lp_active_sessions
     failure = {"on": False}
 
     def failing_reader():
@@ -8342,7 +8440,7 @@ def test_refresh_candidates_mid_batch_failure_publishes_honestly(
             raise RuntimeError("reservations_read_failed")
         return real_reader()
 
-    store.lp_active_session = failing_reader  # type: ignore[method-assign]
+    store.lp_active_sessions = failing_reader  # type: ignore[method-assign]
 
     failure["on"] = True
     current["now"] = now + timedelta(seconds=5)
@@ -8747,6 +8845,45 @@ def _first_seen_running_service(
         anchors=anchors,
     )
     return store, exchange, service
+
+
+def test_tick_without_active_session_runs_first_seen_protections(tmp_path) -> None:
+    """Issue 165 护栏：无活动 LP 会话时 tick() 仍先跑 #159 首见保护，
+    并返回 {"state": "none", "session_id": None}。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    anchor = _queue_receipt("m-1")
+    store, exchange, service = _first_seen_running_service(
+        tmp_path, now, episode_id="ep-none", level_total="4000",
+        open_orders=[anchor],
+    )
+    result = service.tick()
+    assert result == {"state": "none", "session_id": None}
+    episode = store.lp_first_seen_episode("ep-none")
+    assert episode is not None and episode["state"] == "canceling"
+    assert exchange.cancels == ["m-1"]
+
+
+def test_reconcile_session_terminal_guard_returns_status_without_writes(
+    tmp_path,
+) -> None:
+    """Issue 165: 组级对账对终态会话短路——返回与 _status_payload 相等的
+    载荷且不写库（updated_at 不变）。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _queue_running_service(
+        tmp_path, now, key="lp-reconcile-terminal"
+    )
+    session_id = str(started["session_id"])
+    store.lp_update_session(session_id, state="complete")
+    session = store.lp_session(session_id)
+    assert session is not None
+    updated_at_before = session["updated_at"]
+
+    result = service._reconcile_session(session)
+
+    assert result == service._status_payload(session)
+    after = store.lp_session(session_id)
+    assert after is not None
+    assert after["updated_at"] == updated_at_before
 
 
 def test_first_seen_examples_one_and_two_monitor_without_cancel(
