@@ -4069,40 +4069,6 @@ function lpTrialEvidenceRow(row) {
     + evidenceLine + reasonLine + "</ul></details></td></tr>";
 }
 
-function lpCurrentRecommendationMarkup(recommendations) {
-  const rows = lpDashboardRows(recommendations);
-  const row = rows.find((candidate) => (
-    candidate.selected_direction && typeof candidate.selected_direction === "object"
-    && candidate.selected_direction.state !== "rejected"
-  ));
-  if (!row) return "";
-  const selected = row.selected_direction;
-  const price = selected.price;
-  const quantity = selected.quantity;
-  const capital = selected.required_capital;
-  const loss = selected.estimated_exit_loss;
-  const ratio = Number(selected.estimated_exit_loss_ratio);
-  const ratioText = Number.isFinite(ratio)
-    ? `${(ratio * 100).toFixed(2).replace(/\.?0+$/, "")}%`
-    : "UNKNOWN";
-  const checkedAt = selected.checked_at;
-  const timestamp = predictionHasValue(checkedAt)
-    ? predictionHktTimestamp(checkedAt, "UNKNOWN")
-    : "UNKNOWN";
-  return "<section class=\"pm-lp-current-recommendation\" data-lp-current-recommendation=\""
-    + escapeHtml(String(row.condition_id || row.market_id || "current"))
-    + "\" aria-label=\"当前 LP 推荐\"><header class=\"pm-panel-heading\"><div><h3>当前单市场推荐</h3>"
-    + "<p>只显示本轮通过资格检查的方向</p></div><span class=\"pm-pill pm-tone-ok\">已验证</span></header>"
-    + "<div class=\"pm-lp-current-recommendation-title\">" + lpMarketTitleLink(row)
-    + "<span class=\"sub\">方向 " + escapeHtml(predictionValue(selected.outcome, "UNKNOWN")) + "</span></div>"
-    + "<dl class=\"pm-lp-current-recommendation-metrics\"><div><dt>买一</dt><dd>"
-    + escapeHtml(lpDashboardPrice(price)) + "</dd></div><div><dt>数量</dt><dd>"
-    + escapeHtml(predictionValue(quantity, "UNKNOWN")) + " 份</dd></div><div><dt>单项占资</dt><dd>"
-    + escapeHtml(lpDashboardMoney(capital)) + "</dd></div><div><dt>压力损失</dt><dd>"
-    + escapeHtml(lpDashboardMoney(loss)) + " · " + escapeHtml(ratioText)
-    + "</dd></div><div><dt>检查时间</dt><dd>" + escapeHtml(timestamp) + "</dd></div></dl></section>";
-}
-
 function lpTrialSelectedResultDiagnostics(selectedResults, recommendations) {
   if (recommendations.length || !selectedResults.length) return "";
   const head = selectedResults[0];
@@ -4316,7 +4282,6 @@ function predictionLpCard(payload) {
     + "<p class=\"sub\">预计 LP 毛奖励；压力损失不含奖励抵扣；10% 是风险警告线；「试挂/正式」由委托数量对比最小计分数量自动标注（买=最小计分数量→试挂；更大→正式；卖出单不标注）。份额预警已全量开启（奖励份额连续 >8% 一分钟语音告警，夜间静音）；撤单即时生效;已成交部分不可撤。</p></section>"
     + funnelMarkup
     + dataNoticeMarkup
-    + lpCurrentRecommendationMarkup(recommendations)
     + lpTrialSelectedResultDiagnostics(selectedResults, recommendations)
     + candidateSection
     + sessionDetails + "</section>";

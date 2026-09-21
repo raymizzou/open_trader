@@ -20899,6 +20899,7 @@ const recommendation = (outcome, price, capital, loss, ratio) => {
   return {
     market_id: "market-current", condition_id: "condition-current",
     market_title: "Current market", market_url: "https://polymarket.com/event/current",
+    outcome,
     selected_direction: selected,
     directions: {
       [outcome]: {state: "eligible", eligible: true, guidance: selected},
@@ -20935,48 +20936,50 @@ const base = {
     normal_queue_count: 1, backup_queue_count: 0, budget: {available_capital: "50.00"},
   },
 };
+const recYes = recommendation("YES", "0.45", "9.20", "0.92", "0.10");
+const recNo = recommendation("NO", "0.46", "9.20", "0.92", "0.10");
 const first = predictionLpCard({lp_dashboard: {
-  ...base, recommendations: [recommendation("YES", "0.45", "9.20", "0.92", "0.10")],
-  selected_results: [recommendation("YES", "0.45", "9.20", "0.92", "0.10")],
+  ...base, recommendations: [recYes], candidates: [recYes, pending], selected_results: [recYes],
 }});
 const second = predictionLpCard({lp_dashboard: {
-  ...base, recommendations: [recommendation("NO", "0.46", "9.20", "0.92", "0.10")],
-  selected_results: [recommendation("NO", "0.46", "9.20", "0.92", "0.10")],
+  ...base, recommendations: [recNo], candidates: [recNo, pending], selected_results: [recNo],
 }});
 const third = predictionLpCard({lp_dashboard: {
-  ...base, recommendations: [], selected_results: [failedHead],
+  ...base, recommendations: [], selected_results: [failedHead], candidates: [pending],
 }});
-const currentPanel = (html) => (html.match(/data-lp-current-recommendation[\s\S]*?<\/section>/) || [""])[0];
-const firstPanel = currentPanel(first);
-const secondPanel = currentPanel(second);
+const rowFragment = (html, pattern) => (html.match(pattern) || [""])[0];
+const firstRow = rowFragment(first, /data-lp-trial-candidate="condition-current:YES"[\s\S]*?(?=<tr|$)/);
+const secondRow = rowFragment(second, /data-lp-trial-candidate="condition-current:NO"[\s\S]*?(?=<tr|$)/);
 console.log(JSON.stringify({
-  firstSingle: (first.match(/data-lp-current-recommendation/g) || []).length === 1,
-  firstFacts: firstPanel.includes("YES") && firstPanel.includes("45¢")
-    && firstPanel.includes("20 份") && firstPanel.includes("$9.20")
-    && firstPanel.includes("$0.92") && firstPanel.includes("10%")
-    && firstPanel.includes("2026-09-19"),
-  directionUpdated: secondPanel.includes("NO") && secondPanel.includes("46¢")
-    && !secondPanel.includes("YES"),
+  panelRemoved: !first.includes("data-lp-current-recommendation")
+    && !first.includes("当前单市场推荐")
+    && !first.includes("当前 LP 推荐")
+    && !first.includes("只显示本轮通过资格检查的方向")
+    && !first.includes(">已验证<"),
+  rowOneFacts: firstRow.includes("45¢ × 20 份 = ") && firstRow.includes("$9.20")
+    && firstRow.includes("$0.92 · 10%") && firstRow.includes("买 YES")
+    && firstRow.includes("pm-tone-ok\">当前推荐"),
+  directionUpdated: secondRow.includes("买 NO") && secondRow.includes("46¢")
+    && secondRow.includes("$9.20") && !secondRow.includes("买 YES"),
   noDirectionNotice: !second.includes("方向变化") && !second.includes("换方向"),
   noGroupBudget: !second.includes("整组合计") && !second.includes("可同时试挂")
     && !second.includes("预算输入"),
-  clearedWhenUnknown: !third.includes("data-lp-current-recommendation")
-    && third.includes("当前队首校验")
-    && third.includes("book_unknown") && third.includes("fee_unknown")
+  clearedWhenUnknown: third.includes("当前队首校验")
     && (third.match(/book_unknown/g) || []).length === 1
-    && (third.match(/fee_unknown/g) || []).length === 1,
-  pendingLinkHidden: !third.includes("https://polymarket.com/event/pending"),
+    && (third.match(/fee_unknown/g) || []).length === 1
+    && !third.includes("https://polymarket.com/event/pending"),
+  footnoteKept: first.includes("待试挂候选") && first.includes("非全市场收益前十"),
 }));
 ''')
     rendered = json.loads(output)
     assert rendered == {
-        "firstSingle": True,
-        "firstFacts": True,
+        "panelRemoved": True,
+        "rowOneFacts": True,
         "directionUpdated": True,
         "noDirectionNotice": True,
         "noGroupBudget": True,
         "clearedWhenUnknown": True,
-    "pendingLinkHidden": True,
+        "footnoteKept": True,
     }, rendered
 
 
