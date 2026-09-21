@@ -5140,6 +5140,11 @@ class PolymarketLPService:
                 row["directions"] = direction_results
                 row["selected_direction"] = selected_direction
                 row["state"] = row_state
+                # Issue 158: publish the review deadline on the row so the
+                # dashboard's LP entry modal can pass it through unchanged.
+                from .polymarket_lp_views import _next_review_at
+
+                row["review_at"] = _iso(_next_review_at(evaluation_now))
                 row["verification"] = (
                     "verified"
                     if direction_results
@@ -5855,6 +5860,11 @@ class PolymarketLPService:
                     )
                     else "rejected"
                 )
+                # Issue 158: keep the review deadline current on re-qualified
+                # rows (same projection as the scan publication).
+                from .polymarket_lp_views import _next_review_at
+
+                new_row["review_at"] = _iso(_next_review_at(evaluation_now))
                 new_row["verification"] = (
                     "verified"
                     if direction_results

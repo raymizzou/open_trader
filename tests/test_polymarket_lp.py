@@ -6277,6 +6277,43 @@ def test_start_idempotent_retry_precedes_best_bid_check(tmp_path) -> None:
     assert store.lp_session_by_idempotency("lp-bid-retry-1") is not None
 
 
+# ---- Issue 158: 候选行 review_at 投影（下次北京 08:00 → UTC） ----
+
+
+def _candidate_row_review_at(now_utc: datetime, tmp_path) -> object:
+    exchange = _LPCandidateQueryExchange(now_utc, {"M01": Decimal("200")})
+    service = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: now_utc
+    )
+    prepared = service.refresh_price_history()
+    assert prepared["state"] == "known"
+    snapshot = service.refresh_candidates(force=True)
+    assert snapshot["state"] == "ready"
+    assert snapshot["candidates"]
+    return snapshot["candidates"][0].get("review_at")
+
+
+@pytest.mark.parametrize(
+    ("now_utc", "expected_utc"),
+    [
+        (datetime(2026, 9, 22, 2, 0, tzinfo=UTC), datetime(2026, 9, 23, 0, 0, tzinfo=UTC)),
+        (datetime(2026, 9, 21, 23, 30, tzinfo=UTC), datetime(2026, 9, 22, 0, 0, tzinfo=UTC)),
+    ],
+)
+def test_candidate_rows_project_next_review_at(
+    tmp_path, now_utc, expected_utc
+) -> None:
+    """T1: 行内 review_at = 下次北京 08:00；断言解析回 datetime 比瞬间。"""
+
+    raw = _candidate_row_review_at(now_utc, tmp_path)
+    assert isinstance(raw, str) and raw
+    parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    assert parsed == expected_utc
+
+
+# ---- Issue 158: 加量服务面（augment preview/start） ----
+
+
 # ---- Issue 152: 队列位置保护运行时闭环（Seam 3）与通知（Seam 6） ----
 
 
