@@ -4089,6 +4089,107 @@ class PredictionExecutionService:
         finally:
             self._release_global_lock(lock)
 
+    def lp_submit_entry(self, payload: Mapping[str, object]) -> dict[str, object]:
+        """Issue 163: single-shot LP entry under the shared execution mutex.
+
+        Gate order mirrors ``lp_start`` (key replay first, then breaker,
+        then the busy gates, then the global-lock double check) minus the
+        preview plumbing — the payload carries the full order intent.
+        """
+
+        service = self._lp
+        submit = getattr(service, "submit_entry", None)
+        if not callable(submit):
+            return {"state": "rejected", "reason": "lp_unavailable"}
+        key = str(payload.get("idempotency_key") or "").strip()
+        if not key:
+            return {"state": "rejected", "reason": "idempotency_key_required"}
+        existing = self._store.lp_session_by_idempotency(key)
+        if existing is not None:
+            return self.lp_status(str(existing["session_id"]))
+        if self._breaker_is_open():
+            return {"state": "locked", "reason": "circuit_breaker_open"}
+        active_lp = self._store.lp_active_session()
+        if active_lp is not None:
+            return {
+                "state": "busy",
+                "reason": "active_lp_session",
+                "session_id": active_lp.get("session_id"),
+            }
+        active = self._store.active_execution()
+        if active is not None:
+            return {
+                "state": "busy",
+                "reason": "active_execution",
+                "execution_id": active.get("execution_id"),
+            }
+        lock = self._acquire_global_lock()
+        if lock is None:
+            active_lp = self._store.lp_active_session()
+            if active_lp is not None:
+                return {
+                    "state": "busy",
+                    "reason": "active_lp_session",
+                    "session_id": active_lp.get("session_id"),
+                }
+            return {"state": "busy", "reason": "execution_lock"}
+        try:
+            existing = self._store.lp_session_by_idempotency(key)
+            if existing is not None:
+                return self.lp_status(str(existing["session_id"]))
+            active_lp = self._store.lp_active_session()
+            if active_lp is not None:
+                return {
+                    "state": "busy",
+                    "reason": "active_lp_session",
+                    "session_id": active_lp.get("session_id"),
+                }
+            active = self._store.active_execution()
+            if active is not None:
+                return {
+                    "state": "busy",
+                    "reason": "active_execution",
+                    "execution_id": active.get("execution_id"),
+                }
+            return submit(dict(payload), key)
+        finally:
+            self._release_global_lock(lock)
+
+    def lp_submit_augment(self, payload: Mapping[str, object]) -> dict[str, object]:
+        """Issue 163: single-shot named-session augment under the shared mutex.
+
+        Gate order mirrors ``lp_augment``: breaker and active-execution
+        gates only — the augment's target IS the active session, so an
+        active-LP busy gate must not block it.
+        """
+
+        service = self._lp
+        submit = getattr(service, "submit_augment", None)
+        if not callable(submit):
+            return {"state": "rejected", "reason": "lp_unavailable"}
+        key = str(payload.get("idempotency_key") or "").strip()
+        if not key:
+            return {"state": "rejected", "reason": "idempotency_key_required"}
+        session_id = str(payload.get("session_id") or "").strip()
+        if not session_id:
+            return {"state": "rejected", "reason": "session_id_invalid"}
+        if self._breaker_is_open():
+            return {"state": "locked", "reason": "circuit_breaker_open"}
+        active = self._store.active_execution()
+        if active is not None:
+            return {
+                "state": "busy",
+                "reason": "active_execution",
+                "execution_id": active.get("execution_id"),
+            }
+        lock = self._acquire_global_lock()
+        if lock is None:
+            return {"state": "busy", "reason": "execution_lock"}
+        try:
+            return submit(session_id, str(payload.get("quantity") or ""), key)
+        finally:
+            self._release_global_lock(lock)
+
     def lp_tick(self) -> dict[str, object]:
         """Run one LP reconciliation iteration under the shared mutex."""
 

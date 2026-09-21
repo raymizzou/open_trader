@@ -6795,6 +6795,22 @@ button { cursor: pointer; }
 .pm-risk-note { background: #fff5f3; border: 1px solid #efb6af; border-radius: 7px; color: #7a211a; margin-bottom: 12px; padding: 11px 12px; }
 .pm-risk-note strong { display: block; margin-bottom: 3px; }
 .pm-risk-note p { margin: 0; }
+/* Issue 163：单次确认提交——「提交时校验」说明块与结果 toast 栈（样式对齐 mock）。
+   说明块底色用 mock 的软面板字面值 #f2eee7（--surface-soft 同值），
+   不进入 AA 软面板治理契约清单。 */
+.lp-submit-note { background: #f2eee7; border: 1px solid var(--line); border-radius: 7px; color: var(--text); margin-bottom: 12px; padding: 10px 12px; font-size: 12px; }
+.lp-submit-note strong { display: block; margin-bottom: 3px; font-size: 12px; }
+.lp-submit-toasts { display: grid; gap: 8px; margin-bottom: 12px; }
+.lp-toast { align-items: start; border: 1px solid; border-radius: 8px; display: flex; gap: 12px; justify-content: space-between; padding: 10px 12px; font-size: 13px; }
+.lp-toast strong { display: block; margin-bottom: 3px; font-size: 13px; }
+.lp-toast p { margin: 0; font-size: 11px; }
+.lp-toast.submitting { background: #fff8e8; border-color: #e4c98e; color: #6b4a11; }
+.lp-toast.success { background: #edf8f1; border-color: #add4bc; color: #245b39; }
+.lp-toast.danger { background: #fff2f0; border-color: #e7aaa4; color: #7a211a; }
+.lp-toast.unknown { background: #eef6f8; border-color: #a8ccd7; color: #214f5c; }
+.lp-toast.submitting .lp-toast-dots::after { animation: lp-pulse 1s steps(3, end) infinite; content: "···"; display: inline-block; }
+@keyframes lp-pulse { 0% { opacity: .3; } 50% { opacity: 1; } 100% { opacity: .3; } }
+@media (prefers-reduced-motion: reduce) { .lp-toast.submitting .lp-toast-dots::after { animation: none; } }
 .pm-check-list { display: grid; gap: 7px; margin-bottom: 14px; }
 .pm-check { align-items: center; border-bottom: 1px solid var(--line); display: flex; gap: 12px; justify-content: space-between; padding: 8px 0; }
 .pm-check:last-child { border-bottom: 0; }

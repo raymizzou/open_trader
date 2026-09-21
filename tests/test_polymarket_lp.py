@@ -9992,3 +9992,448 @@ def test_first_seen_anchor_session_refusal_blocks_cancel_and_tick_survives(
         assert store.lp_first_seen_episode("ep-r1") is not None
         assert exchange.cancels == []
         assert len(notes) == 1
+
+
+# ---- Issue 163: LP 单次确认提交（submit_entry / submit_augment） ----
+
+
+def _lp163_book(now: datetime, best_bid: Decimal) -> dict[str, object]:
+    """Book whose best bid is exactly ``best_bid`` (ask fixed at 0.31)."""
+
+    base = _snapshot(now)
+    base["book"] = {
+        "timestamp": now,
+        "received_at": now,
+        "source_timestamp": "2026-09-21T06:00:00Z",
+        "hash": "book-hash-lp163",
+        "asks": [{"price": Decimal("0.31"), "size": Decimal("100")}],
+        "bids": [{"price": best_bid, "size": Decimal("100")}],
+    }
+    return base
+
+
+def test_lp163_submit_entry_single_shot_accepted(tmp_path) -> None:
+    """S1: 一次提交=一次新鲜事实+一次完整校验+恰好一张 post-only GTD BUY。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    exchange = _Exchange()
+    exchange.snapshot_value = _lp163_book(now, Decimal("0.29"))
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    request = {
+        **_request(now),
+        "price": Decimal("0.29"),
+        "quantity": Decimal("20"),
+        "candidate_policy": "best_bid_minimum",
+        "estimated_target_quantity": "21",
+    }
+
+    result = service.submit_entry(request, "lp163-s1")
+
+    assert result["state"] == "entry_open"
+    assert len(exchange.posts) == 1
+    posted = exchange.posts[0]
+    assert posted["side"] == "BUY"
+    assert posted["post_only"] is True
+    assert posted.get("expiration") or exchange.limit_orders[0].get("expiration")
+    session = store.lp_session(str(result["session_id"]))
+    assert session is not None
+    assert len(session["owned_order_ids"]) == 1
+    assert session["queue_protection"]["state"] == "registered"
+    assert Decimal(str(session["queue_protection"]["baseline_front"])) == Decimal("100")
+    assert Decimal(str(session["estimated_target_quantity"])) == Decimal("21")
+    assert exchange.snapshot_calls == 1
+
+
+def test_lp163_submit_entry_trial_price_mismatch_rejects(tmp_path) -> None:
+    """S2: 试挂确认价 0.29 ≠ 提交时新鲜买一 0.30 → best_bid_changed；不挂单、无会话行。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    exchange = _Exchange()
+    exchange.snapshot_value = _lp163_book(now, Decimal("0.30"))
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    request = {
+        **_request(now),
+        "price": Decimal("0.29"),
+        "quantity": Decimal("20"),
+        "candidate_policy": "best_bid_minimum",
+    }
+
+    result = service.submit_entry(request, "lp163-s2")
+
+    assert result == {"state": "rejected", "reason": "best_bid_changed"}
+    assert exchange.posts == []
+    assert store.lp_session_by_idempotency("lp163-s2") is None
+    assert store.lp_active_session() is None
+    assert exchange.snapshot_calls == 1
+
+
+def test_lp163_submit_entry_custom_price_allows_offset(tmp_path) -> None:
+    """S3: 5%/自定义模式不锚定买一——0.25 vs 买一 0.29 其余绿 → entry_open。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    exchange = _Exchange()
+    exchange.snapshot_value = _lp163_book(now, Decimal("0.29"))
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    request = {
+        **_request(now),
+        "price": Decimal("0.25"),
+        "quantity": Decimal("20"),
+    }
+
+    result = service.submit_entry(request, "lp163-s3")
+
+    assert result["state"] == "entry_open"
+    assert len(exchange.posts) == 1
+
+
+def test_lp163_submit_entry_same_key_replay(tmp_path) -> None:
+    """S4: 同键二次提交 → 同会话、仍一单、两次结果一致。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    exchange = _Exchange()
+    exchange.snapshot_value = _lp163_book(now, Decimal("0.29"))
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    request = {
+        **_request(now),
+        "price": Decimal("0.29"),
+        "quantity": Decimal("20"),
+        "candidate_policy": "best_bid_minimum",
+    }
+
+    first = service.submit_entry(request, "lp163-s4")
+    second = service.submit_entry(request, "lp163-s4")
+
+    assert first["state"] == second["state"] == "entry_open"
+    assert str(second["session_id"]) == str(first["session_id"])
+    assert second["entry_order_id"] == first["entry_order_id"]
+    assert len(exchange.posts) == 1
+
+
+def test_lp163_submit_entry_exchange_rejection_persists_and_replays(tmp_path) -> None:
+    """S5: 交易所拒单 → entry_rejected 落库带键；同键重放同拒绝、不二次挂单（#158 契约）。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    exchange = _Exchange()
+    exchange.reject_entry = True
+    exchange.snapshot_value = _lp163_book(now, Decimal("0.29"))
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    request = {
+        **_request(now),
+        "price": Decimal("0.29"),
+        "quantity": Decimal("20"),
+        "candidate_policy": "best_bid_minimum",
+    }
+
+    first = service.submit_entry(request, "lp163-s5")
+    assert first["state"] == "entry_rejected"
+    stored = store.lp_session_by_idempotency("lp163-s5")
+    assert stored is not None
+    assert stored["state"] == "entry_rejected"
+    assert len(exchange.posts) == 1
+
+    second = service.submit_entry(request, "lp163-s5")
+
+    assert second["state"] == "entry_rejected"
+    assert str(second["session_id"]) == str(first["session_id"])
+    assert len(exchange.posts) == 1
+
+
+def test_lp163_submit_entry_unknown_needs_attention_no_resubmit(tmp_path) -> None:
+    """S6: 提交回执异常 → needs_attention + submit_status unknown；同键重放不重发。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    exchange = _Exchange()
+    exchange.post_failures = [RuntimeError("post timeout")]
+    exchange.snapshot_value = _lp163_book(now, Decimal("0.29"))
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    request = {
+        **_request(now),
+        "price": Decimal("0.29"),
+        "quantity": Decimal("20"),
+        "candidate_policy": "best_bid_minimum",
+    }
+
+    first = service.submit_entry(request, "lp163-s6")
+    assert first["state"] == "needs_attention"
+    assert first["submit_status"] == "unknown"
+    assert len(exchange.posts) == 1
+
+    second = service.submit_entry(request, "lp163-s6")
+
+    assert second["state"] == "needs_attention"
+    assert second["submit_status"] == "unknown"
+    assert len(exchange.posts) == 1
+
+
+def test_lp163_submit_entry_validation_rejection_no_session_row(tmp_path) -> None:
+    """S7: 余额不足快照 → rejected/balance_insufficient；无会话行、无挂单。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    exchange = _Exchange()
+    snapshot = _lp163_book(now, Decimal("0.29"))
+    snapshot["account"]["balance"] = Decimal("1")
+    snapshot["account"]["allowance"] = Decimal("1")
+    exchange.snapshot_value = snapshot
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    request = {
+        **_request(now),
+        "price": Decimal("0.29"),
+        "quantity": Decimal("20"),
+        "candidate_policy": "best_bid_minimum",
+    }
+
+    result = service.submit_entry(request, "lp163-s7")
+
+    assert result == {"state": "rejected", "reason": "balance_insufficient"}
+    assert store.lp_session_by_idempotency("lp163-s7") is None
+    assert exchange.posts == []
+    assert exchange.snapshot_calls == 1
+
+
+def test_lp163_submit_entry_busy_when_active_session(tmp_path) -> None:
+    """S8: 已有活动会话 → busy/active_lp_session；零快照读、零挂单。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _augment_running_service(
+        tmp_path, now, key="lp163-s8-entry"
+    )
+    request = {
+        **_request(now),
+        "price": Decimal("0.29"),
+        "quantity": Decimal("20"),
+        "candidate_policy": "best_bid_minimum",
+    }
+    before_calls = exchange.snapshot_calls
+
+    result = service.submit_entry(request, "lp163-s8")
+
+    assert result["state"] == "busy"
+    assert result["reason"] == "active_lp_session"
+    assert str(result["session_id"]) == str(started["session_id"])
+    assert exchange.snapshot_calls == before_calls
+    assert len(exchange.posts) == 1  # 仅既有入场单
+
+
+def test_lp163_submit_entry_review_too_soon(tmp_path) -> None:
+    """S10: review_at 过近 → rejected/review_at_too_soon（expiration_for_review 语义），无挂单。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    exchange = _Exchange()
+    exchange.snapshot_value = _lp163_book(now, Decimal("0.29"))
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    request = {
+        **_request(now),
+        "price": Decimal("0.29"),
+        "quantity": Decimal("20"),
+        "candidate_policy": "best_bid_minimum",
+        "review_at": now + timedelta(seconds=30),
+    }
+
+    result = service.submit_entry(request, "lp163-s10")
+
+    assert result == {"state": "rejected", "reason": "review_at_too_soon"}
+    assert exchange.posts == []
+    assert store.lp_session_by_idempotency("lp163-s10") is None
+
+
+def test_lp163_submit_entry_thin_top_book_anchor_consistent(tmp_path) -> None:
+    """S15: 薄顶档盘口锚定口径一致——顶档 0.60×5 < reward_min 100 ≤ 累计 205，
+    奖励资格买一=0.58 ≠ 顶档买一 0.60。
+    a) 确认价=顶档 0.60 → entry_open、恰 1 post、恰 1 次快照读；
+    b) 同盘口确认价=奖励资格档 0.58 → rejected/best_bid_changed、0 post、无会话行。
+    """
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    snapshot = _lp163_book(now, Decimal("0.60"))
+    snapshot["book"]["asks"] = [{"price": Decimal("0.62"), "size": Decimal("100")}]
+    snapshot["book"]["bids"] = [
+        {"price": Decimal("0.60"), "size": Decimal("5")},
+        {"price": Decimal("0.58"), "size": Decimal("200")},
+    ]
+    snapshot["market"]["reward_min_size"] = Decimal("100")
+
+    # a) 确认价=盘口顶档买一（候选行 guidance 价即顶档）→ 必须放行。
+    exchange = _Exchange()
+    exchange.snapshot_value = snapshot
+    store = PredictionArbitrageStore(tmp_path / "a")
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    request = {
+        **_request(now),
+        "price": Decimal("0.60"),
+        "quantity": Decimal("100"),
+        "candidate_policy": "best_bid_minimum",
+    }
+
+    accepted = service.submit_entry(request, "lp163-s15a")
+
+    assert accepted["state"] == "entry_open"
+    assert len(exchange.posts) == 1
+    assert exchange.snapshot_calls == 1
+
+    # b) 同盘口，确认价=奖励资格买一 0.58 ≠ 顶档 0.60 → 以 best_bid_changed 拒绝。
+    exchange_b = _Exchange()
+    exchange_b.snapshot_value = snapshot
+    store_b = PredictionArbitrageStore(tmp_path / "b")
+    service_b = PolymarketLPService(store_b, exchange_b, clock=lambda: now)
+    request_b = {
+        **_request(now),
+        "price": Decimal("0.58"),
+        "quantity": Decimal("100"),
+        "candidate_policy": "best_bid_minimum",
+    }
+
+    rejected = service_b.submit_entry(request_b, "lp163-s15b")
+
+    assert rejected == {"state": "rejected", "reason": "best_bid_changed"}
+    assert exchange_b.posts == []
+    assert store_b.lp_session_by_idempotency("lp163-s15b") is None
+    assert store_b.lp_active_session() is None
+
+
+def test_lp163_submit_augment_appends_and_keeps_deadline(tmp_path) -> None:
+    """S11: 点名会话加量成功——单追加、基线重锚（T14 口径）、复核截止沿用首单不重算。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _augment_running_service(
+        tmp_path, now, key="lp163-s11"
+    )
+    session_id = str(started["session_id"])
+    first_history = dict(store.lp_session(session_id)["order_history"])
+    exchange.snapshot_value = _augment_preview_snapshot(
+        now, level=Decimal("380"), own_original=Decimal("120")
+    )
+    before_calls = exchange.snapshot_calls
+
+    result = service.submit_augment(session_id, "20", "lp163-s11-aug")
+
+    assert result["state"] == "entry_open"
+    assert str(result["augment_order_id"]) == "order-2"
+    assert exchange.snapshot_calls - before_calls == 1
+    assert len(exchange.posts) == 2
+    posted = exchange.posts[1]
+    assert posted["side"] == "BUY"
+    assert posted["post_only"] is True
+    assert Decimal(str(posted["price"])) == Decimal("0.30")
+    assert Decimal(str(posted["quantity"])) == Decimal("20")
+    session = store.lp_session(session_id)
+    # 原单不变，新单追加为新条目。
+    assert session["augment_order_ids"] == ["order-2"]
+    history = session["order_history"]
+    assert set(history) == {"order-1", "order-2"}
+    assert history["order-1"] == first_history["order-1"]
+    # 基线重锚：front = 380 - 120 = 260（对齐 T14 断言口径）。
+    protection = session["queue_protection"]
+    assert Decimal(str(protection["baseline_front"])) == Decimal("260")
+    # 复核截止沿用首单：新单 expiration 与首单相同（未重算）。
+    assert Decimal(str(history["order-2"]["expiration"])) == Decimal(
+        str(history["order-1"]["expiration"])
+    )
+    assert exchange.limit_orders[1]["expiration"] == exchange.limit_orders[0][
+        "expiration"
+    ]
+
+
+def test_lp163_submit_augment_binds_named_session(tmp_path) -> None:
+    """S12: 已完成会话 A 与活动会话 B 并存时点名 A → 拒且 reason 指向 A；绝不写 B、无新单。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    store, exchange, service, started_a = _augment_running_service(
+        tmp_path, now, key="lp163-s12-a"
+    )
+    session_a = str(started_a["session_id"])
+    store.lp_update_session(session_a, state="complete")
+    request = {**_request(now), "quantity": Decimal("30")}
+    preview = service.preview(request)
+    started_b = service.start(str(preview["preview_id"]), "lp163-s12-b")
+    assert started_b["state"] == "entry_open"
+    session_b = str(started_b["session_id"])
+    exchange.snapshot_value = _augment_preview_snapshot(
+        now, level=Decimal("380"), own_original=Decimal("120")
+    )
+    posts_before = len(exchange.posts)
+    calls_before = exchange.snapshot_calls
+
+    result = service.submit_augment(session_a, "20", "lp163-s12")
+
+    assert result["state"] == "rejected"
+    assert result["reason"] == "session_not_active"
+    assert exchange.snapshot_calls == calls_before
+    assert len(exchange.posts) == posts_before
+    untouched = store.lp_session(session_b)
+    assert not untouched.get("augment_order_ids")
+    assert store.lp_active_session()["session_id"] == session_b
+
+
+def test_lp163_submit_augment_blocked_states_matrix(tmp_path) -> None:
+    """S13: 退出中/止损中/待人工核对/已完成/不存在 → 各自真实原因；零快照、零挂单。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    cases = [
+        ("review", "session_review_exit"),
+        ("stop_loss_exit", "session_stop_loss_exit"),
+        ("needs_attention", "session_needs_attention"),
+        ("complete", "session_not_active"),
+    ]
+    for index, (state, expected_reason) in enumerate(cases):
+        store, exchange, service, started = _augment_running_service(
+            tmp_path / f"s13-{index}", now, key=f"lp163-s13-{index}"
+        )
+        session_id = str(started["session_id"])
+        store.lp_update_session(session_id, state=state)
+        calls_before = exchange.snapshot_calls
+        posts_before = len(exchange.posts)
+
+        result = service.submit_augment(session_id, "20", f"lp163-s13-{index}")
+
+        assert result == {"state": "rejected", "reason": expected_reason}
+        assert exchange.snapshot_calls == calls_before
+        assert len(exchange.posts) == posts_before
+
+    store, exchange, service, _started = _augment_running_service(
+        tmp_path / "s13-missing", now, key="lp163-s13-missing"
+    )
+    calls_before = exchange.snapshot_calls
+    missing = service.submit_augment("missing-session", "20", "lp163-s13-x")
+    assert missing == {"state": "rejected", "reason": "session_not_found"}
+    assert exchange.snapshot_calls == calls_before
+
+
+def test_lp163_submit_augment_idempotency_and_unknown(tmp_path) -> None:
+    """S14: 同键重放 → 同 augment_order_id 无新单；提交异常 → 未知挂起，重放不重发。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _augment_running_service(
+        tmp_path / "s14-a", now, key="lp163-s14"
+    )
+    session_id = str(started["session_id"])
+    exchange.snapshot_value = _augment_preview_snapshot(
+        now, level=Decimal("380"), own_original=Decimal("120")
+    )
+    first = service.submit_augment(session_id, "20", "lp163-s14-k")
+    assert first["state"] == "entry_open"
+    assert str(first["augment_order_id"]) == "order-2"
+    # 幂等重放连新鲜盘口都不再读。
+    calls_after_first = exchange.snapshot_calls
+    exchange.snapshot_value = _queue_book_moved_bid_snapshot(now, Decimal("9000"))
+
+    replay = service.submit_augment(session_id, "20", "lp163-s14-k")
+
+    assert str(replay["augment_order_id"]) == "order-2"
+    assert replay["state"] == "entry_open"
+    assert len(exchange.posts) == 2
+    assert exchange.snapshot_calls == calls_after_first
+
+    store_b, exchange_b, service_b, started_b = _augment_running_service(
+        tmp_path / "s14-b", now, key="lp163-s14b"
+    )
+    session_b = str(started_b["session_id"])
+    exchange_b.snapshot_value = _augment_preview_snapshot(
+        now, level=Decimal("380"), own_original=Decimal("120")
+    )
+    exchange_b.post_failures = [RuntimeError("post timeout")]
+    unknown = service_b.submit_augment(session_b, "20", "lp163-s14-unknown")
+    assert unknown["state"] == "needs_attention"
+    assert unknown["reason"] == "augment_submit_unknown"
+    # fake 的 post_order 先记账再抛错：1 张入场单 + 1 次失败的加量尝试。
+    posts_after_unknown = len(exchange_b.posts)
+    assert posts_after_unknown == 2
+
+    replay_unknown = service_b.submit_augment(session_b, "20", "lp163-s14-unknown")
+
+    assert replay_unknown["state"] == "needs_attention"
+    assert replay_unknown["reason"] == "augment_submit_unknown"
+    assert len(exchange_b.posts) == posts_after_unknown  # 重放不重发

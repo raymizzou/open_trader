@@ -22204,39 +22204,6 @@ console.log(JSON.stringify({
     assert rendered["titleStillLinks"] is True
 
 
-def test_lp_entry_initial_a_truth_table_t5() -> None:
-    """T5: 初始 A 真值表——60% 无警示；0% 空档位；28.6% 触发线警示。"""
-    output = run_dashboard_js(r'''
-const normal = lpInitialAEstimateMarkup(
-  {baseline_front:"150", projected_ratio:150/250}, 100);
-const empty = lpInitialAEstimateMarkup(
-  {baseline_front:"0", projected_ratio:0}, 100);
-const warn = lpInitialAEstimateMarkup(
-  {baseline_front:"40", projected_ratio:40/140}, 100);
-console.log(JSON.stringify({
-  normal: {
-    okLine: normal.includes("未触发，正常监控"),
-    noWarn: !normal.includes("≤ 触发线 50%"),
-    shows60: normal.includes("初始 A 60%"),
-  },
-  empty: {
-    emptyText: empty.includes("空档位：提交后立即触发位置保护撤单"),
-    showsZero: empty.includes("初始 A = 0%"),
-  },
-  warn: {
-    warnText: warn.includes("初始 A 28.6% ≤ 触发线 50%：提交后首个监控 tick 即触发位置保护撤单"),
-  },
-}));
-''')
-    rendered = json.loads(output)
-    assert rendered["normal"]["okLine"] is True
-    assert rendered["normal"]["noWarn"] is True
-    assert rendered["normal"]["shows60"] is True
-    assert rendered["empty"]["emptyText"] is True
-    assert rendered["empty"]["showsZero"] is True
-    assert rendered["warn"]["warnText"] is True
-
-
 def test_lp_manual_row_keeps_unanchored_text_t8() -> None:
     """T8: 网页手动单仍渲染「位置未知」原文。"""
     output = run_dashboard_js(_LP158_FIXTURE + r'''
@@ -22465,215 +22432,64 @@ console.log(JSON.stringify({
     assert rendered["fiveUnknown"]["unknownLabel"] is True
 
 
-def test_lp_entry_preview_request_body_t4() -> None:
-    """T4: 预检体恰 7 必填字段（试挂另含 candidate_policy）；行内有目标量时另含 estimated_target_quantity 原样透传，行内无则不含。
+def test_lp_entry_state_message_matrix_t7() -> None:
+    """T7（issue 163 改写）：失败态不再停留在弹窗内——单次确认即关窗，各 state 落 toast。
 
-    主代理 2026-09-21 修订：加量 5% 可用性修复——预检体新增可选
-    estimated_target_quantity（informational only，服务端存会话供加量模态默认量）。
+    主代理 2026-09-21 授权：原 T7 假设失败停留在弹窗内的断言按 toast 新契约改写，
+    语义不弱化——busy/locked/best_bid_changed/entry_rejected/needs_attention 的
+    文案矩阵逐类保留；preview_expired/repreview 断言随预检相删除（新流程无预检凭证）。
     """
     output = _lp158_interactive(r'''
 state.predictionMarket.csrfToken = "csrf-1";
-const requests = [];
+state.predictionMarket.lpDashboard = buildDashboard();
+let currentResult;
 globalThis.fetch = async (url, init={}) => {
   const u = String(url);
-  if (u.startsWith("/api/prediction-arbitrage/lp/preview")) {
-    requests.push({url: u, method: init.method || "GET", body: init.body || ""});
-    return {ok:true, status:200, json: async () => ({
-      state:"previewed", preview_id:"pv-1",
-      preflight:{balance:"100", allowance:"100", tick_size:"0.01",
-        minimum_order_size:"20", reward_min_size:"20", reward_max_spread:"0.10",
-        midpoint:"0.415", best_bid:"0.42", best_ask:"0.43", fee:"0", taker_fee_rate:"0"},
-      queue_protection_estimate:{baseline_front:"150", projected_ratio:0.6},
-    })};
-  }
-  throw new Error("unexpected " + u);
-};
-openPredictionModal("lp_order", null, lpOrderIntent(candidateRow));
-await modalClick({modalAction: "lp-order-preview"});
-const trialBody = JSON.parse(requests[0].body);
-const reviewHtml = modalRoot.innerHTML;
-await modalClick({modalAction: "lp-order-case", caseMode: "custom"});
-modalRoot._qs = {
-  "#lp-order-price": {id:"lp-order-price", value:"0.43"},
-  "#lp-order-quantity": {id:"lp-order-quantity", value:"150"},
-};
-await modalClick({modalAction: "lp-order-preview"});
-const customBody = JSON.parse(requests[1].body);
-// 行内无目标量：三模式都不带该字段（试挂模式示例）。
-openPredictionModal("lp_order", null, lpOrderIntent({...candidateRow, estimated_target_quantity: null}));
-await modalClick({modalAction: "lp-order-preview"});
-const noTargetBody = JSON.parse(requests[2].body);
-console.log(JSON.stringify({
-  trialKeys: Object.keys(trialBody).sort(),
-  trialPolicy: trialBody.candidate_policy,
-  trialPassthrough: [trialBody.market_id, trialBody.condition_id, trialBody.token_id,
-    trialBody.outcome, trialBody.price, trialBody.quantity, trialBody.review_at],
-  trialTargetVerbatim: trialBody.estimated_target_quantity,
-  customKeys: Object.keys(customBody).sort(),
-  customValues: [customBody.price, customBody.quantity],
-  customNoPolicy: !("candidate_policy" in customBody),
-  customTargetVerbatim: customBody.estimated_target_quantity,
-  noTargetKeys: Object.keys(noTargetBody).sort(),
-  reviewPhase: reviewHtml.includes("确认提交 · 登记受保护")
-    && reviewHtml.includes("位置保护预估"),
-}));
-''')
-    rendered = json.loads(output)
-    assert rendered["trialKeys"] == sorted([
-        "market_id", "condition_id", "token_id", "outcome",
-        "price", "quantity", "review_at", "candidate_policy",
-        "estimated_target_quantity",
-    ])
-    assert rendered["trialPolicy"] == "best_bid_minimum"
-    assert rendered["trialPassthrough"] == [
-        "market-fed", "condition-fed", "token-fed", "YES", "0.42", "120",
-        "2026-09-22T00:00:00Z",
-    ]
-    assert rendered["trialTargetVerbatim"] == "90"
-    assert rendered["customKeys"] == sorted([
-        "market_id", "condition_id", "token_id", "outcome",
-        "price", "quantity", "review_at", "estimated_target_quantity",
-    ])
-    assert rendered["customValues"] == ["0.43", "150"]
-    assert rendered["customNoPolicy"] is True
-    assert rendered["customTargetVerbatim"] == "90"
-    assert rendered["noTargetKeys"] == sorted([
-        "market_id", "condition_id", "token_id", "outcome",
-        "price", "quantity", "review_at", "candidate_policy",
-    ])
-    assert rendered["reviewPhase"] is True
-
-
-def test_lp_entry_confirm_idempotency_and_success_t6() -> None:
-    """T6: 确认体恰 {preview_id, idempotency_key}；双击/网络异常重试同 key；成功关模态+摘要+重拉。"""
-    output = _lp158_interactive(r'''
-state.predictionMarket.csrfToken = "csrf-1";
-const previewPosts = [];
-const confirmPosts = [];
-let confirmFail = true;
-globalThis.fetch = async (url, init={}) => {
-  const u = String(url);
-  const method = init.method || "GET";
-  if (u.startsWith("/api/prediction-arbitrage/lp/preview") && method === "POST") {
-    return {ok:true, status:200, json: async () => ({
-      state:"previewed", preview_id:"pv-1",
-      preflight:{}, queue_protection_estimate:{baseline_front:"150", projected_ratio:0.6},
-    })};
-  }
-  if (u === "/api/prediction-arbitrage/lp/sessions" && method === "POST") {
-    confirmPosts.push(JSON.parse(init.body));
-    if (confirmFail) throw new Error("network down");
-    return {ok:true, status:200, json: async () => ({
-      state:"entry_open", session_id:"sess-xyz789",
-    })};
-  }
-  throw new Error("unexpected " + method + " " + u);
-};
-openPredictionModal("lp_order", null, lpOrderIntent(candidateRow));
-await modalClick({modalAction: "lp-order-preview"});
-const confirmTarget = {closest: (s) => s === "[data-modal-action]" ? {dataset: {modalAction: "lp-order-confirm"}} : null};
-// 1) 网络异常：第一次确认抛错，模态保持打开。
-confirmFail = true;
-await handlePredictionModalClick({target: confirmTarget});
-const afterFailure = confirmPosts.length;
-// 2) 双击重试：busy 期间第二次点击被忽略，不产生新的 POST。
-const pending = handlePredictionModalClick({target: confirmTarget});
-await handlePredictionModalClick({target: confirmTarget});
-await pending;
-const afterDoubleClick = confirmPosts.length;
-// 3) 再次重试（confirmFail 仍 true）→ 第三个 POST；然后成功。
-await modalClick({modalAction: "lp-order-confirm"});
-confirmFail = false;
-await modalClick({modalAction: "lp-order-confirm"});
-console.log(JSON.stringify({
-  afterFailure,
-  afterDoubleClick,
-  confirmPostCount: confirmPosts.length,
-  bodies: confirmPosts.map((body) => Object.keys(body).sort()),
-  sameKey: confirmPosts.every((body) => body.idempotency_key === confirmPosts[0].idempotency_key),
-  samePreview: confirmPosts.every((body) => body.preview_id === "pv-1"),
-  modalClosed: modalRoot.innerHTML === "",
-  summary: state.predictionMarket.lpCancelSummary,
-}));
-''')
-    rendered = json.loads(output)
-    assert rendered["afterFailure"] == 1
-    assert rendered["afterDoubleClick"] == 2  # 双击的第二次被 busy 抑制，只发一次
-    assert rendered["confirmPostCount"] == 4  # 失败重试×2 + 成功×1
-    for body_keys in rendered["bodies"]:
-        assert body_keys == ["idempotency_key", "preview_id"]
-    assert rendered["sameKey"] is True
-    assert rendered["samePreview"] is True
-    assert rendered["modalClosed"] is True
-    assert rendered["summary"] == "已登记 · 会话 sess-x · 位置保护已生效"
-
-
-def test_lp_entry_state_message_matrix_t7() -> None:
-    """T7: busy/locked/rejected/preview_expired 文案逐类可读，不崩；评审扩展——entry_rejected（如实呈现、不提供「重新预检」死路、指引关闭重开）/needs_attention 在模态内如实呈现，不关模态、不写成功摘要。"""
-    output = _lp158_interactive(r'''
-state.predictionMarket.csrfToken = "csrf-1";
-globalThis.fetch = async (url, init={}) => {
-  const u = String(url);
-  if (u.startsWith("/api/prediction-arbitrage/lp/preview")) {
-    return {ok:true, status:200, json: async () => ({
-      state:"previewed", preview_id:"pv-1", preflight:{},
-      queue_protection_estimate:{baseline_front:"150", projected_ratio:0.6},
-    })};
-  }
-  if (u === "/api/prediction-arbitrage/lp/sessions") {
+  if (u === "/api/prediction-arbitrage/lp/orders" && (init.method || "GET") === "POST") {
     return {ok:true, status:200, json: async () => currentResult};
   }
-  throw new Error("unexpected " + u);
+  throw new Error("unexpected " + (init.method || "GET") + " " + u);
 };
 const run = async (result) => {
+  state.predictionMarket.lpSubmitToasts = [];
+  state.predictionMarket.lpSubmitCooldown = null;
+  state.predictionMarket.lpCancelSummary = "";
   currentResult = result;
   openPredictionModal("lp_order", null, lpOrderIntent(candidateRow));
-  await modalClick({modalAction: "lp-order-preview"});
   await modalClick({modalAction: "lp-order-confirm"});
-  const html = modalRoot.innerHTML;
-  closePredictionModal();
-  return html;
-};
-// 评审修复用例（定案 10/11）：额外捕获成功摘要，验证失败态不关模态、不写摘要。
-const runCapture = async (result) => {
-  currentResult = result;
-  openPredictionModal("lp_order", null, lpOrderIntent(candidateRow));
-  await modalClick({modalAction: "lp-order-preview"});
-  await modalClick({modalAction: "lp-order-confirm"});
-  const html = modalRoot.innerHTML;
+  const modalCleared = modalRoot.innerHTML === "";
+  const toast = state.predictionMarket.lpSubmitToasts[0] || {};
   const summary = state.predictionMarket.lpCancelSummary;
-  closePredictionModal();
-  return {html, summary};
+  return {modalCleared, toast, summary};
 };
-let currentResult;
-const busyHtml = await run({state:"busy", reason:"active_lp_session", session_id:"sess-abc123"});
-const lockedHtml = await run({state:"locked", reason:"circuit_breaker_open"});
-const bidHtml = await run({state:"rejected", reason:"best_bid_changed"});
-const expiredHtml = await run({state:"rejected", reason:"preview_expired"});
+const busy = await run({state:"busy", reason:"active_lp_session", session_id:"sess-abc123"});
+const locked = await run({state:"locked", reason:"circuit_breaker_open"});
+const bid = await run({state:"rejected", reason:"best_bid_changed"});
 // 交易所拒单：无任何挂单登记、无保护生效（body 为会话字典、无 reason 字段）。
-const entryRejected = await runCapture({state:"entry_rejected", session_id:"sess-rej001", submit_status:"rejected"});
+const entryRejected = await run({state:"entry_rejected", session_id:"sess-rej001", submit_status:"rejected"});
 // 提交结果未知：回执异常/无单号（body 为会话字典）。
-const needsAttention = await runCapture({state:"needs_attention", session_id:"sess-att001", submit_status:"unknown"});
+const needsAttention = await run({state:"needs_attention", session_id:"sess-att001", submit_status:"unknown"});
 console.log(JSON.stringify({
-  busy: busyHtml.includes("已有活动会话（会话 sess-a）")
-    && busyHtml.includes("当天会话于次日 08:00 复核收尾；加量请用 LP 委托表的「加量」按钮"),
-  locked: lockedHtml.includes("交易熔断开启中，禁止新下单；界面保持只读"),
-  bidChanged: bidHtml.includes("买一已变化，未下单"),
-  bidRepreview: bidHtml.includes('data-modal-action="lp-order-repreview"'),
-  expired: expiredHtml.includes("预检已过期，未下单"),
-  expiredRepreview: expiredHtml.includes('data-modal-action="lp-order-repreview"'),
+  busy: busy.modalCleared
+    && busy.toast.kind === "danger"
+    && busy.toast.main.includes("业务忙：已有活动 LP 会话，本单未提交"),
+  locked: locked.modalCleared
+    && locked.toast.main.includes("系统锁定（熔断/维护中），本单未提交"),
+  bidChanged: bid.modalCleared
+    && bid.toast.main.includes("未提交：确认价与提交时买一不一致")
+    && bid.toast.sub.includes("不改价、不改量、不追价"),
   entryRejected: {
-    modalOpen: entryRejected.html !== "",
-    message: entryRejected.html.includes("未登记：交易所拒绝了订单，未产生委托；请关闭后重新发起下单。"),
-    noRepreview: !entryRejected.html.includes('data-modal-action="lp-order-repreview"'),
-    noRepreviewWording: !entryRejected.html.includes("重新预检"),
-    noSuccessSummary: entryRejected.summary === "" && !entryRejected.html.includes("已登记 · 会话"),
+    modalCleared: entryRejected.modalCleared,
+    main: entryRejected.toast.main === "未登记：交易所拒绝了订单，未产生委托",
+    sub: entryRejected.toast.sub.includes("请重新发起下单（新确认 = 新意图）"),
+    noRepreviewWording: !(entryRejected.toast.main + entryRejected.toast.sub).includes("重新预检"),
+    noSuccessSummary: entryRejected.summary === "",
   },
   needsAttention: {
-    modalOpen: needsAttention.html !== "",
-    warning: needsAttention.html.includes("提交结果未知（回执未确认），请刷新看板核对会话状态后再操作；不要重复提交。"),
-    warningBar: needsAttention.html.includes("pm-alert warning"),
-    noSuccessSummary: needsAttention.summary === "" && !needsAttention.html.includes("已登记 · 会话"),
+    modalCleared: needsAttention.modalCleared,
+    unknownKind: needsAttention.toast.kind === "unknown",
+    main: needsAttention.toast.main.includes("结果未知：提交回执未确认"),
+    noSuccessSummary: needsAttention.summary === "",
   },
 }));
 ''')
@@ -22681,135 +22497,15 @@ console.log(JSON.stringify({
     assert rendered["busy"] is True
     assert rendered["locked"] is True
     assert rendered["bidChanged"] is True
-    assert rendered["bidRepreview"] is True
-    assert rendered["expired"] is True
-    assert rendered["expiredRepreview"] is True
-    assert rendered["entryRejected"]["modalOpen"] is True
-    assert rendered["entryRejected"]["message"] is True
-    assert rendered["entryRejected"]["noRepreview"] is True
+    assert rendered["entryRejected"]["modalCleared"] is True
+    assert rendered["entryRejected"]["main"] is True
+    assert rendered["entryRejected"]["sub"] is True
     assert rendered["entryRejected"]["noRepreviewWording"] is True
     assert rendered["entryRejected"]["noSuccessSummary"] is True
-    assert rendered["needsAttention"]["modalOpen"] is True
-    assert rendered["needsAttention"]["warning"] is True
-    assert rendered["needsAttention"]["warningBar"] is True
+    assert rendered["needsAttention"]["modalCleared"] is True
+    assert rendered["needsAttention"]["unknownKind"] is True
+    assert rendered["needsAttention"]["main"] is True
     assert rendered["needsAttention"]["noSuccessSummary"] is True
-
-
-def test_lp_augment_modal_flow_t15f() -> None:
-    """T15f: 加量模态——入场价锁定、默认 5%=90（候选池不含会话市场的生产形态，取 lp_session.estimated_target_quantity；lp_session 也无值→禁用+UNKNOWN）、160→48.1% 警示、预检/确认体、无会话指引。"""
-    output = _lp158_interactive(r'''
-state.predictionMarket.csrfToken = "csrf-1";
-const session = {state:"entry_open", session_id:"sess-abc123",
-  condition_id:"condition-fed", price:"0.42", quantity:"120",
-  estimated_target_quantity:"90",
-  market_title:"Will the Fed cut rates in Q4?"};
-const groupOrders = [{...sessionRow,
-  queue_protection:{state:"monitoring", ratio:0.684, threshold:0.5,
-    front_estimate:"260", level_total:"380", data_time:"2026-09-21T06:32:05Z"}}];
-const previewPosts = [];
-const confirmPosts = [];
-let confirmResult = {state:"entry_open", session_id:"sess-abc123",
-  augment_order_id:"sys-order-2", augment_quantity:"90"};
-globalThis.fetch = async (url, init={}) => {
-  const u = String(url);
-  const method = init.method || "GET";
-  if (u === "/api/prediction-arbitrage/lp/augment/preview" && method === "POST") {
-    previewPosts.push(JSON.parse(init.body));
-    return {ok:true, status:200, json: async () => ({
-      state:"previewed", preview_id:"aug-pv-1", price:"0.42",
-      preflight:{balance:"900", allowance:"900", midpoint:"0.415",
-        best_bid:"0.42", best_ask:"0.43"},
-      queue_protection_estimate:{baseline_front:"260", own_remaining:"120",
-        projected_ratio:260/540},
-    })};
-  }
-  if (u === "/api/prediction-arbitrage/lp/sessions/sess-abc123/augment" && method === "POST") {
-    confirmPosts.push({url: u, body: JSON.parse(init.body)});
-    if (confirmResult.state === "rejected") {
-      return {ok:true, status:200, json: async () => confirmResult};
-    }
-    return {ok:true, status:200, json: async () => confirmResult};
-  }
-  throw new Error("unexpected " + method + " " + u);
-};
-// 主代理 2026-09-21 修订：生产真实形态——会话市场已有 known_participation，
-// 候选漏斗将其排除，候选池不含该标的；5% 默认量改从 lp_session 的
-// estimated_target_quantity 取得。
-state.predictionMarket.lpDashboard = {
-  recommendations: [],
-  candidates: [],
-};
-const intent = lpAugmentIntent(groupOrders, session);
-openPredictionModal("lp_augment", null, intent);
-const htmlForm = modalRoot.innerHTML;
-// 自定义 160 → 实时合并 A ≈ 48.1% 警示。
-await modalClick({modalAction: "lp-augment-case", caseMode: "custom"});
-modalRoot._qs = {"#lp-augment-estimate": {innerHTML: ""}};
-handlePredictionModalInput({target: {id: "lp-augment-quantity", value: "160"}});
-const liveEstimate = modalRoot._qs["#lp-augment-estimate"].innerHTML;
-// 回到默认 5% 并预检。
-await modalClick({modalAction: "lp-augment-case", caseMode: "five"});
-await modalClick({modalAction: "lp-augment-preview"});
-const reviewHtml = modalRoot.innerHTML;
-await modalClick({modalAction: "lp-augment-confirm"});
-const summary = state.predictionMarket.lpCancelSummary;
-// 无会话拒绝指引。
-confirmResult = {state:"rejected", reason:"session_not_active"};
-openPredictionModal("lp_augment", null, lpAugmentIntent(groupOrders, session));
-await modalClick({modalAction: "lp-augment-preview"});
-await modalClick({modalAction: "lp-augment-confirm"});
-const rejectHtml = modalRoot.innerHTML;
-// lp_session 也无值（候选池仍不含该标的）→ 5% 选项禁用 + UNKNOWN 文案。
-const noTargetSession = {...session, estimated_target_quantity: null};
-openPredictionModal("lp_augment", null, lpAugmentIntent(groupOrders, noTargetSession));
-const noTargetHtml = modalRoot.innerHTML;
-// 评审修复用例（定案 10/11）：needs_attention 不得按成功收尾——不关模态、
-// 不新增「已加量」成功摘要，警示文案出现。
-confirmResult = {state:"needs_attention", session_id:"sess-abc123", submit_status:"unknown"};
-const summaryBeforeAttention = state.predictionMarket.lpCancelSummary;
-openPredictionModal("lp_augment", null, lpAugmentIntent(groupOrders, session));
-await modalClick({modalAction: "lp-augment-preview"});
-await modalClick({modalAction: "lp-augment-confirm"});
-const attentionHtml = modalRoot.innerHTML;
-const summaryAfterAttention = state.predictionMarket.lpCancelSummary;
-console.log(JSON.stringify({
-  priceLocked: htmlForm.includes("0.42（入场价，锁定）"),
-  fiveDefault: /value="five" checked/.test(htmlForm) && /value="90"/.test(htmlForm),
-  liveWarn: liveEstimate.includes("48.1%")
-    && liveEstimate.includes("≤ 触发线 50%")
-    && liveEstimate.includes("含既有试挂单"),
-  previewBody: previewPosts[0],
-  confirmBodyKeys: Object.keys(confirmPosts[0].body).sort(),
-  confirmUrl: confirmPosts[0].url,
-  successSummary: summary,
-  noSessionGuide: rejectHtml.includes("请先从候选列表经系统入口下第一单"),
-  noTargetFive: {
-    disabled: /value="five" disabled/.test(noTargetHtml),
-    unknownLabel: noTargetHtml.includes("加 5% 单 · 目标量 UNKNOWN"),
-  },
-  needsAttention: {
-    modalOpen: attentionHtml !== "",
-    warning: attentionHtml.includes("提交结果未知（回执未确认），请刷新看板核对会话状态后再操作；不要重复提交。"),
-    warningBar: attentionHtml.includes("pm-alert warning"),
-    noNewSuccessSummary: summaryAfterAttention === summaryBeforeAttention,
-  },
-}));
-''')
-    rendered = json.loads(output)
-    assert rendered["priceLocked"] is True
-    assert rendered["fiveDefault"] is True
-    assert rendered["liveWarn"] is True
-    assert rendered["previewBody"] == {"session_id": "sess-abc123", "quantity": "90"}
-    assert rendered["confirmBodyKeys"] == ["idempotency_key", "preview_id"]
-    assert rendered["confirmUrl"] == "/api/prediction-arbitrage/lp/sessions/sess-abc123/augment"
-    assert rendered["successSummary"] == "已加量 · 90 份 @ 0.42 · 并入会话 sess-a 保护伞"
-    assert rendered["noSessionGuide"] is True
-    assert rendered["noTargetFive"]["disabled"] is True
-    assert rendered["noTargetFive"]["unknownLabel"] is True
-    assert rendered["needsAttention"]["modalOpen"] is True
-    assert rendered["needsAttention"]["warning"] is True
-    assert rendered["needsAttention"]["warningBar"] is True
-    assert rendered["needsAttention"]["noNewSuccessSummary"] is True
 
 
 def test_lp_candidate_table_css_fixes_zero_width_columns() -> None:
@@ -22882,8 +22578,9 @@ def _lp162_interactive(script: str) -> str:
 
 
 def test_lp162_a8_lp_order_quantity_raw_string() -> None:
-    """A8: lp_order 数量原样——1500 / 1500.125 不加千位逗号、不四舍五入；输入框、选项标签、预检体三处一致。"""
-    output = _lp162_interactive(r'''
+    """A8（issue 163 改写）：lp_order 数量原样——1500 / 1500.125 不加千位逗号、
+    不四舍五入；输入框、选项标签、单次提交请求体三处一致（预检体随预检相删除）。"""
+    output = _lp163_interactive(r"""
 state.predictionMarket.csrfToken = "csrf-1";
 const results = {};
 for (const target of ["1500", "1500.125"]) {
@@ -22891,33 +22588,27 @@ for (const target of ["1500", "1500.125"]) {
   openPredictionModal("lp_order", null, lpOrderIntent(row));
   await modalClick({modalAction: "lp-order-case", caseMode: "five"});
   const htmlFive = modalRoot.innerHTML;
-  deferResponse(lpPreviewMatch).respond(jsonResponse({
-    state: "previewed", preview_id: "pv-" + target,
-    preflight: {}, queue_protection_estimate: {baseline_front: "150", projected_ratio: 0.6},
-  }));
-  await modalClick({modalAction: "lp-order-preview"});
-  const call = fetchCalls.filter((item) => lpPreviewMatch(item.url, item.method)).pop();
+  const handle = deferResponse(lpOrdersSubmitMatch);
+  const confirmPromise = modalClick({modalAction: "lp-order-confirm"});
+  handle.respond(jsonResponse({
+    state: "entry_open", session_id: "sess-qty", entry_order_id: "order-x"}));
+  await confirmPromise;
+  const call = lpOrdersPosts().filter((item) =>
+    JSON.parse(item.body).quantity === target).pop();
   const inputMatch = htmlFive.match(/id="lp-order-quantity"[^>]*value="([^"]*)"/);
   results[target] = {
     inputValue: inputMatch ? inputMatch[1] : null,
     labelOk: htmlFive.includes(`× ${target} 份`),
-    bodyQuantity: JSON.parse(call.body).quantity,
+    bodyQuantity: call ? JSON.parse(call.body).quantity : null,
   };
 }
 console.log(JSON.stringify(results));
-''')
-    rendered = json.loads(output)
-    assert rendered["1500"]["inputValue"] == "1500"
-    assert rendered["1500"]["labelOk"] is True
-    assert rendered["1500"]["bodyQuantity"] == "1500"
-    assert rendered["1500.125"]["inputValue"] == "1500.125"
-    assert rendered["1500.125"]["labelOk"] is True
-    assert rendered["1500.125"]["bodyQuantity"] == "1500.125"
-
+""")
 
 def test_lp162_a9_lp_augment_quantity_raw_string() -> None:
-    """A9: lp_augment 数量原样——默认 5% 量 1500.125 进输入框与预检体；合并预估不再 UNKNOWN。"""
-    output = _lp162_interactive(r'''
+    """A9（issue 163 改写）：lp_augment 数量原样——默认 5% 量 1500.125 进输入框
+    与单次提交请求体；合并预估不再 UNKNOWN（预检体随预检相删除）。"""
+    output = _lp163_interactive(r"""
 state.predictionMarket.csrfToken = "csrf-1";
 const session = {state: "entry_open", session_id: "sess-abc123",
   condition_id: "condition-fed", price: "0.42", quantity: "120",
@@ -22928,29 +22619,21 @@ state.predictionMarket.lpDashboard = {recommendations: [], candidates: []};
 const intent = lpAugmentIntent(groupOrders, session);
 openPredictionModal("lp_augment", null, intent);
 const htmlForm = modalRoot.innerHTML;
-deferResponse(augmentPreviewMatch).respond(jsonResponse({
-  state: "previewed", preview_id: "aug-pv-1", price: "0.42",
-  preflight: {},
-  queue_protection_estimate: {baseline_front: "260", own_remaining: "210", projected_ratio: 0.14},
-}));
-await modalClick({modalAction: "lp-augment-preview"});
-const call = fetchCalls.filter((item) => augmentPreviewMatch(item.url, item.method)).pop();
+const handle = deferResponse(lpAugmentSubmitMatch);
+const confirmPromise = modalClick({modalAction: "lp-augment-confirm"});
+handle.respond(jsonResponse({
+  state: "entry_open", session_id: "sess-abc123", augment_order_id: "aug-x"}));
+await confirmPromise;
+const call = lpAugmentPosts().pop();
 const inputMatch = htmlForm.match(/id="lp-augment-quantity"[^>]*value="([^"]*)"/);
 console.log(JSON.stringify({
   inputValue: inputMatch ? inputMatch[1] : null,
   fiveChecked: /value="five" checked/.test(htmlForm),
   estimateHasAfter: htmlForm.includes("加后 A ≈"),
   estimateNoUnknown: !htmlForm.includes("UNKNOWN"),
-  previewQuantity: JSON.parse(call.body).quantity,
+  submitQuantity: call ? JSON.parse(call.body).quantity : null,
 }));
-''')
-    rendered = json.loads(output)
-    assert rendered["inputValue"] == "1500.125"
-    assert rendered["fiveChecked"] is True
-    assert rendered["estimateHasAfter"] is True
-    assert rendered["estimateNoUnknown"] is True
-    assert rendered["previewQuantity"] == "1500.125"
-
+""")
 
 def test_lp162_a10_lp_order_estimated_cost_three_timings() -> None:
     """A10: 预计占用三时机——初始渲染、改价、改量都按 price*qty 现算（$630.05 / $450.04 / $900.00）。"""
@@ -23099,24 +22782,23 @@ console.log(JSON.stringify({
 
 
 def test_lp162_a5_cross_modal_isolation_and_late_success_report() -> None:
-    """A5: 提交挂起→busy 取消→开 lp_cancel 弹窗 B→A 的提交迟到成功——B 仍开、摘要「已登记」、dashboard 重拉、无串窗。"""
-    output = _lp162_interactive(r'''
+    """A5（issue 163 改写）：提交确认即关窗；迟到成功只更新自己的 toast——已开的
+    lp_cancel 弹窗 B 不受影响、摘要「已登记」、dashboard 重拉、无串窗。
+    原「busy 中取消关窗 + 预检确认」机制随两段式删除；迟到回执隔离语义由本用例
+    与 W6 共同覆盖，语义不弱化。"""
+    output = _lp163_interactive(r"""
 enterLpView();
-deferResponse(lpPreviewMatch).respond(jsonResponse({
-  state: "previewed", preview_id: "pv-1",
-  preflight: {}, queue_protection_estimate: {baseline_front: "150", projected_ratio: 0.6},
-}));
-openPredictionModal("lp_order", null, lpOrderIntent(candidateRow));
-await modalClick({modalAction: "lp-order-preview"});
-const confirmHandle = deferResponse(lpConfirmMatch);
+resetLp163SubmitState();
+state.predictionMarket.payload = {lp_dashboard: buildDashboard({
+  lp_orders_today: [sessionRow], lp_session: lp163Session,
+})};
+const confirmHandle = deferResponse(lpOrdersSubmitMatch);
 const dashHandle = deferResponse(dashboardMatch);
 dashHandle.respond(jsonResponse(buildDashboard()));
+openPredictionModal("lp_order", null, lpOrderIntent(candidateRow));
 const confirmPromise = modalClick({modalAction: "lp-order-confirm"});
-await drain();
-// 定案 4：busy 中「取消」关掉弹窗 A。
-await modalClick({modalAction: "cancel"});
-const aCancelled = predictionModal.kind === "";
-// 打开弹窗 B（lp_cancel）。
+const closedOnConfirm = modalRoot.innerHTML === "" && predictionModal.kind === "";
+// 打开弹窗 B（lp_cancel）——A 的回执仍未到达。
 openPredictionModal("lp_cancel", null, {scope: "all", orders: [sessionRow]});
 const htmlB = modalRoot.innerHTML;
 const dashBefore = dashCount();
@@ -23124,25 +22806,19 @@ const dashBefore = dashCount();
 confirmHandle.respond(jsonResponse({state: "entry_open", session_id: "sess-late99"}));
 await confirmPromise;
 await drain();
+const aToast = state.predictionMarket.lpSubmitToasts[0] || {};
 console.log(JSON.stringify({
-  aCancelled,
+  closedOnConfirm,
   bStillOpen: predictionModal.kind === "lp_cancel",
   bContentIntact: modalRoot.innerHTML === htmlB && modalRoot.innerHTML.includes("确认撤单"),
+  aToastSuccess: aToast.kind === "success" && aToast.main.includes("订单 UNKNOWN 已登记") === false && String(aToast.main).includes("已提交"),
   summaryReported: state.predictionMarket.lpCancelSummary.includes("已登记"),
   dashboardRefetched: dashCount() > dashBefore,
   noCrossWindow: !modalRoot.innerHTML.includes("确认真实下单")
     && !modalRoot.innerHTML.includes("确认 LP 试挂")
     && !modalRoot.innerHTML.includes("确认提交 · 登记受保护"),
 }));
-''')
-    rendered = json.loads(output)
-    assert rendered["aCancelled"] is True
-    assert rendered["bStillOpen"] is True
-    assert rendered["bContentIntact"] is True
-    assert rendered["summaryReported"] is True
-    assert rendered["dashboardRefetched"] is True
-    assert rendered["noCrossWindow"] is True
-
+""")
 
 def test_lp162_a7_empty_kind_and_action_kind_matching() -> None:
     """A7: 未知/空 kind 不再渲染 order 模板；lp_order 弹窗下触发 lp-augment-confirm 不发任何 POST。"""
@@ -23187,3 +22863,478 @@ console.log(JSON.stringify({lpClosedGoingMulti, nlegClosedGoingLp}));
     rendered = json.loads(output)
     assert rendered["lpClosedGoingMulti"] is True
     assert rendered["nlegClosedGoingLp"] is True
+
+
+# ===== Issue 163：LP 单次确认提交（toast + 10 秒共享锁） =====
+
+_LP163_INTERACTIVE = _LP162_INTERACTIVE + r'''
+// ===== Issue 163 harness：捕获 setTimeout/clearTimeout（手动 fire） =====
+// 浏览器环境的 crypto.randomUUID 存根（幂等键铸造路径断言用）。
+globalThis.crypto = {
+  randomUUID: () => {
+    const hex = () => Math.floor(Math.random() * 16).toString(16);
+    const seg = (count) => Array.from({length: count}, hex).join("");
+    const variant = ["8", "9", "a", "b"][Math.floor(Math.random() * 4)];
+    return `${seg(8)}-${seg(4)}-4${seg(3)}-${variant}${seg(3)}-${seg(12)}`;
+  },
+};
+const timeoutCallbacks = new Map();
+let nextLp163TimeoutId = 1;
+window.setTimeout = (callback, delay) => {
+  const id = nextLp163TimeoutId++;
+  timeoutCallbacks.set(id, {callback, delay});
+  return id;
+};
+window.clearTimeout = (id) => { timeoutCallbacks.delete(id); };
+const fireTimeouts = async (delay) => {
+  for (const [id, entry] of [...timeoutCallbacks]) {
+    if (entry.delay !== delay) continue;
+    timeoutCallbacks.delete(id);
+    await entry.callback();
+  }
+};
+const pendingTimeoutCount = () => timeoutCallbacks.size;
+const lpOrdersSubmitMatch = (u, m) => m === "POST" && u.endsWith("/api/prediction-arbitrage/lp/orders");
+const lpAugmentSubmitMatch = (u, m) => m === "POST" && u.endsWith("/api/prediction-arbitrage/lp/augment");
+const lpOrdersPosts = () => fetchCalls.filter((item) => lpOrdersSubmitMatch(item.url, item.method));
+const lpAugmentPosts = () => fetchCalls.filter((item) => lpAugmentSubmitMatch(item.url, item.method));
+const lpPreviewPosts = () => fetchCalls.filter((item) => lpPreviewMatch(item.url, item.method));
+const augmentPreviewPosts = () => fetchCalls.filter((item) => augmentPreviewMatch(item.url, item.method));
+const lp163Session = {state:"entry_open", session_id:"sess-abc163",
+  condition_id:"condition-fed", price:"0.42", quantity:"120",
+  estimated_target_quantity:"90",
+  market_title:"Will the Fed cut rates in Q4?"};
+const lp163Card = () => predictionLpCard({lp_dashboard: buildDashboard({
+  lp_orders_today: [sessionRow],
+  lp_session: state.predictionMarket.lpDashboard
+    && state.predictionMarket.lpDashboard.lp_session
+    ? state.predictionMarket.lpDashboard.lp_session : lp163Session,
+})});
+const resetLp163SubmitState = () => {
+  state.predictionMarket.lpSubmitToasts = [];
+  state.predictionMarket.lpSubmitCooldown = null;
+  state.predictionMarket.lpCancelSummary = "";
+};
+'''
+
+
+def _lp163_interactive(script: str) -> str:
+    return run_dashboard_js(_LP163_INTERACTIVE + script)
+
+
+def test_lp163_entry_modal_zero_server_calls_until_confirm() -> None:
+    """W1: 开窗、三情形切换、custom 改价改量 → 预检/提交 POST 均为 0；预计占用 $5.80 起并随改量重算。"""
+    output = _lp163_interactive(r'''
+enterLpView();
+const row = {...candidateRow,
+  selected_direction: {...candidateRow.selected_direction, price: "0.29", quantity: "20"}};
+openPredictionModal("lp_order", null, lpOrderIntent(row));
+const htmlInitial = modalRoot.innerHTML;
+await modalClick({modalAction: "lp-order-case", caseMode: "five"});
+await modalClick({modalAction: "lp-order-case", caseMode: "custom"});
+modalRoot._qs = {
+  "#lp-order-price": {id: "lp-order-price", value: "0.30"},
+  "#lp-order-quantity": {id: "lp-order-quantity", value: "25"},
+  "#lp-order-cost": {textContent: "-"},
+};
+handlePredictionModalInput({target: {id: "lp-order-price", value: "0.30"}});
+handlePredictionModalInput({target: {id: "lp-order-quantity", value: "25"}});
+const afterEdits = modalRoot._qs["#lp-order-cost"].textContent;
+console.log(JSON.stringify({
+  previewPosts: lpPreviewPosts().length,
+  submitPosts: lpOrdersPosts().length,
+  initialCost580: htmlInitial.includes("$5.80"),
+  afterEdits,
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["previewPosts"] == 0
+    assert rendered["submitPosts"] == 0
+    assert rendered["initialCost580"] is True
+    assert rendered["afterEdits"] == "$7.50"
+
+
+def test_lp163_entry_confirm_single_post_and_lockout() -> None:
+    """W2: 确认 → 弹窗立即清空；恰 1 次 POST /lp/orders（trial 带 candidate_policy、键为 UUID、目标量原样）；两入口禁用；「正在提交」toast 可见。"""
+    output = _lp163_interactive(r'''
+enterLpView();
+state.predictionMarket.payload = {lp_dashboard: buildDashboard({
+  lp_orders_today: [sessionRow], lp_session: lp163Session,
+})};
+const handle = deferResponse(lpOrdersSubmitMatch);  // 先不回应：断言「正在提交」相
+const row = {...candidateRow,
+  selected_direction: {...candidateRow.selected_direction, price: "0.29", quantity: "20"}};
+openPredictionModal("lp_order", null, lpOrderIntent(row));
+// 不立即 await：处理器在 await fetch 处挂起——这正是「正在提交」相。
+const confirmPromise = modalClick({modalAction: "lp-order-confirm"});
+const modalHtml = modalRoot.innerHTML;
+const posts = lpOrdersPosts();
+const body = posts.length ? JSON.parse(posts[0].body) : null;
+const cardHtml = lp163Card();
+handle.respond(jsonResponse({
+  state: "entry_open", session_id: "sess-abc163", entry_order_id: "order-9",
+}));
+await confirmPromise;
+console.log(JSON.stringify({
+  modalCleared: modalHtml === "",
+  postCount: posts.length,
+  body,
+  keyLooksUuid: body ? /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(body.idempotency_key) : false,
+  entryDisabled: /data-action="lp-order-entry"[^>]*disabled/.test(cardHtml),
+  augmentDisabled: /data-action="lp-augment-entry"[^>]*disabled/.test(cardHtml),
+  submittingToast: cardHtml.includes("正在提交 · 买 YES @ 0.29 × 20 份") && cardHtml.includes('role="status"'),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["modalCleared"] is True
+    assert rendered["postCount"] == 1
+    assert rendered["body"] == {
+        "market_id": "market-fed",
+        "condition_id": "condition-fed",
+        "token_id": "token-fed",
+        "outcome": "YES",
+        "price": "0.29",
+        "quantity": "20",
+        "review_at": "2026-09-22T00:00:00Z",
+        "idempotency_key": rendered["body"]["idempotency_key"],
+        "estimated_target_quantity": "90",
+        "candidate_policy": "best_bid_minimum",
+    }
+    assert rendered["keyLooksUuid"] is True
+    assert rendered["entryDisabled"] is True
+    assert rendered["augmentDisabled"] is True
+    assert rendered["submittingToast"] is True
+
+
+def test_lp163_cooldown_fixed_10s() -> None:
+    """W3: 2 秒成功回执 → toast 变成功但按钮仍禁用；手动触发 10 秒定时器 → 解锁。"""
+    output = _lp163_interactive(r'''
+enterLpView();
+resetLp163SubmitState();
+state.predictionMarket.payload = {lp_dashboard: buildDashboard({
+  lp_orders_today: [sessionRow], lp_session: lp163Session,
+})};
+deferResponse(lpOrdersSubmitMatch).respond(jsonResponse({
+  state: "entry_open", session_id: "sess-abc163", entry_order_id: "order-9",
+}));
+openPredictionModal("lp_order", null, lpOrderIntent(candidateRow));
+const confirmPromise = modalClick({modalAction: "lp-order-confirm"});
+await confirmPromise;
+const cardAfterReply = lp163Card();
+const disabledAfterReply = /data-action="lp-order-entry"[^>]*disabled/.test(cardAfterReply)
+  && /data-action="lp-augment-entry"[^>]*disabled/.test(cardAfterReply);
+const successToastShown = cardAfterReply.includes("已提交 · 订单 order-9 已登记");
+await fireTimeouts(10000);
+const cardAfterFire = lp163Card();
+console.log(JSON.stringify({
+  successToastShown,
+  disabledAfterReply,
+  successToastKept: cardAfterFire.includes("已提交 · 订单 order-9 已登记"),
+  unlockedAfterFire: !/data-action="lp-order-entry"[^>]*disabled/.test(cardAfterFire)
+    && !/data-action="lp-augment-entry"[^>]*disabled/.test(cardAfterFire),
+  noTimerLeft: pendingTimeoutCount() === 0,
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["successToastShown"] is True
+    assert rendered["disabledAfterReply"] is True
+    assert rendered["successToastKept"] is True
+    assert rendered["unlockedAfterFire"] is True
+    assert rendered["noTimerLeft"] is True
+
+
+def test_lp163_timeout_unknown_and_unlock() -> None:
+    """W4: 回执永不到 → 触发 10 秒定时器 → toast 含「结果未知」且无 失败/成功/已撤销；按钮解锁。"""
+    output = _lp163_interactive(r'''
+enterLpView();
+resetLp163SubmitState();
+state.predictionMarket.payload = {lp_dashboard: buildDashboard({
+  lp_orders_today: [sessionRow], lp_session: lp163Session,
+})};
+deferResponse(lpOrdersSubmitMatch);  // 永不回应
+openPredictionModal("lp_order", null, lpOrderIntent(candidateRow));
+const confirmPromise = modalClick({modalAction: "lp-order-confirm"});
+await fireTimeouts(10000);
+const card = lp163Card();
+const toastText = (card.match(/class="lp-toast unknown"[^>]*>[\s\S]*?<\/p>/g) || []).join("");
+console.log(JSON.stringify({
+  unknownToast: toastText.includes("结果未知：提交 10 秒未收到回执"),
+  noFailureWords: !toastText.includes("失败") && !toastText.includes("成功") && !toastText.includes("已撤销"),
+  unlocked: !/data-action="lp-order-entry"[^>]*disabled/.test(card)
+    && !/data-action="lp-augment-entry"[^>]*disabled/.test(card),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["unknownToast"] is True
+    assert rendered["noFailureWords"] is True
+    assert rendered["unlocked"] is True
+
+
+def test_lp163_toast_matrix() -> None:
+    """W5: entry_rejected/busy/网络抛错/custom 数量清空——各文案与「无预检字样」约束。"""
+    output = _lp163_interactive(r'''
+enterLpView();
+resetLp163SubmitState();
+state.predictionMarket.payload = {lp_dashboard: buildDashboard({
+  lp_orders_today: [sessionRow], lp_session: lp163Session,
+})};
+const runCase = async (payload) => {
+  resetLp163SubmitState();
+  const handle = deferResponse(lpOrdersSubmitMatch);
+  openPredictionModal("lp_order", null, lpOrderIntent(candidateRow));
+  const confirmPromise = modalClick({modalAction: "lp-order-confirm"});
+  handle.respond(jsonResponse(payload));
+  await confirmPromise;
+  return lp163Card();
+};
+const rejectedCard = await runCase({
+  state: "entry_rejected", session_id: "sess-rej001", submit_status: "rejected"});
+const busyCard = await runCase({state: "busy", reason: "active_lp_session"});
+// 网络抛错：不登记 handler，fetch 直接抛错。
+resetLp163SubmitState();
+openPredictionModal("lp_order", null, lpOrderIntent(candidateRow));
+const networkPromise = modalClick({modalAction: "lp-order-confirm"});
+await networkPromise;
+const networkCard = lp163Card();
+// custom 数量清空：不发请求、不锁、只弹「格式异常」。
+resetLp163SubmitState();
+openPredictionModal("lp_order", null, lpOrderIntent(candidateRow));
+await modalClick({modalAction: "lp-order-case", caseMode: "custom"});
+modalRoot._qs = {
+  "#lp-order-price": {id: "lp-order-price", value: "0.42"},
+  "#lp-order-quantity": {id: "lp-order-quantity", value: ""},
+};
+const postsBefore = lpOrdersPosts().length;
+await modalClick({modalAction: "lp-order-confirm"});
+const formatCard = lp163Card();
+console.log(JSON.stringify({
+  entryRejected: {
+    main: formatCard && rejectedCard.includes("未登记：交易所拒绝了订单，未产生委托"),
+    sub: rejectedCard.includes("请重新发起下单（新确认 = 新意图）"),
+    noRepreview: !rejectedCard.includes("重新预检"),
+  },
+  busy: busyCard.includes("业务忙：已有活动 LP 会话，本单未提交"),
+  network: {
+    unknown: networkCard.includes("结果未知：网络错误，是否已提交未知"),
+    noRetry: networkCard.includes("系统不会自动重试"),
+  },
+  format: {
+    noNewPost: lpOrdersPosts().length === postsBefore,
+    toast: formatCard.includes("格式异常"),
+    stillOpen: predictionModal.kind === "lp_order",
+  },
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["entryRejected"]["main"] is True
+    assert rendered["entryRejected"]["sub"] is True
+    assert rendered["entryRejected"]["noRepreview"] is True
+    assert rendered["busy"] is True
+    assert rendered["network"]["unknown"] is True
+    assert rendered["network"]["noRetry"] is True
+    assert rendered["format"]["noNewPost"] is True
+    assert rendered["format"]["toast"] is True
+    assert rendered["format"]["stillOpen"] is True
+
+
+def test_lp163_toast_no_double_prefix() -> None:
+    """W10（issue 163 评审修复 P3）：rejected 未特判原因（balance_insufficient）
+    → 主行直接采用 lpSubmitStateMessage 完整句「未下单：<reason>」（单一前缀），
+    绝无「未提交：未下单：」双前缀。"""
+    output = _lp163_interactive(r'''
+enterLpView();
+resetLp163SubmitState();
+state.predictionMarket.payload = {lp_dashboard: buildDashboard({
+  lp_orders_today: [sessionRow], lp_session: lp163Session,
+})};
+const handle = deferResponse(lpOrdersSubmitMatch);
+openPredictionModal("lp_order", null, lpOrderIntent(candidateRow));
+const confirmPromise = modalClick({modalAction: "lp-order-confirm"});
+handle.respond(jsonResponse({state: "rejected", reason: "balance_insufficient"}));
+await confirmPromise;
+const toast = state.predictionMarket.lpSubmitToasts[0] || {};
+console.log(JSON.stringify({
+  kind: toast.kind,
+  main: toast.main,
+  noDoublePrefix: !String(toast.main || "").includes("未提交：未下单："),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["kind"] == "danger"
+    assert rendered["main"] == "未下单：balance_insufficient"
+    assert rendered["noDoublePrefix"] is True
+
+
+def test_lp163_late_reply_updates_only_own_toast() -> None:
+    """W6: A 超时未知 → 解锁 → B 确认新 toast → 注入 A 迟到成功：A 变成功、B 逐字不变。"""
+    output = _lp163_interactive(r'''
+enterLpView();
+resetLp163SubmitState();
+state.predictionMarket.payload = {lp_dashboard: buildDashboard({
+  lp_orders_today: [sessionRow], lp_session: lp163Session,
+})};
+const handleA = deferResponse(lpOrdersSubmitMatch);
+openPredictionModal("lp_order", null, lpOrderIntent(candidateRow));
+const confirmA = modalClick({modalAction: "lp-order-confirm"});
+const keyA = JSON.parse(lpOrdersPosts()[0].body).idempotency_key;
+await fireTimeouts(10000);  // A：结果未知并解锁
+const aUnknownAfterTimeout = (state.predictionMarket.lpSubmitToasts.find((t) => t.id === keyA) || {}).kind;
+const handleB = deferResponse(lpOrdersSubmitMatch);
+openPredictionModal("lp_order", null, lpOrderIntent(candidateRow));
+const confirmB = modalClick({modalAction: "lp-order-confirm"});
+const keyB = JSON.parse(lpOrdersPosts()[1].body).idempotency_key;
+handleB.respond(jsonResponse({
+  state: "entry_open", session_id: "sess-bbb163", entry_order_id: "order-10"}));
+await confirmB;
+const toastB = state.predictionMarket.lpSubmitToasts.find((t) => t.id === keyB);
+const bMainBefore = toastB.main;
+const bSubBefore = toastB.sub;
+// 注入 A 的迟到成功回执。
+handleA.respond(jsonResponse({
+  state: "entry_open", session_id: "sess-aaa163", entry_order_id: "order-9"}));
+await confirmA;
+const toastA = state.predictionMarket.lpSubmitToasts.find((t) => t.id === keyA);
+const toastBAfter = state.predictionMarket.lpSubmitToasts.find((t) => t.id === keyB);
+console.log(JSON.stringify({
+  aUnknownAfterTimeout,
+  keysDiffer: keyA !== keyB,
+  aNowSuccess: toastA.kind === "success" && toastA.main.includes("订单 order-9"),
+  aOwnSession: toastA.main.includes("sess-aaa") || toastA.main.includes("sess-aa"),
+  bUnchanged: toastBAfter.main === bMainBefore && toastBAfter.sub === bSubBefore,
+  toastCount: state.predictionMarket.lpSubmitToasts.length,
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["aUnknownAfterTimeout"] == "unknown"
+    assert rendered["keysDiffer"] is True
+    assert rendered["aNowSuccess"] is True
+    assert rendered["bUnchanged"] is True
+    assert rendered["toastCount"] == 2
+
+
+def test_lp163_new_intent_new_key_no_auto_retry() -> None:
+    """W7: A 超时后重开确认 → 新键 ≠ 旧键；/lp/orders 总 POST 数恰 2，无自动重试。"""
+    output = _lp163_interactive(r'''
+enterLpView();
+resetLp163SubmitState();
+state.predictionMarket.payload = {lp_dashboard: buildDashboard({
+  lp_orders_today: [sessionRow], lp_session: lp163Session,
+})};
+deferResponse(lpOrdersSubmitMatch);  // A 永不到
+openPredictionModal("lp_order", null, lpOrderIntent(candidateRow));
+const confirmA = modalClick({modalAction: "lp-order-confirm"});
+const keyA = JSON.parse(lpOrdersPosts()[0].body).idempotency_key;
+await fireTimeouts(10000);
+deferResponse(lpOrdersSubmitMatch);  // B 由测试控制（不回应也不影响计数）
+openPredictionModal("lp_order", null, lpOrderIntent(candidateRow));
+modalClick({modalAction: "lp-order-confirm"});  // 处理器挂在 fetch 处即可，键已铸造
+const keyB = JSON.parse(lpOrdersPosts()[1].body).idempotency_key;
+console.log(JSON.stringify({
+  totalPosts: lpOrdersPosts().length,
+  keysDiffer: keyA !== keyB,
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["totalPosts"] == 2
+    assert rendered["keysDiffer"] is True
+
+
+def test_lp163_augment_single_submit_and_shared_cooldown() -> None:
+    """W8: 加量窗零预检调用；确认恰 1 次 POST /lp/augment（点名会话）；加量同样锁挂单入口；10 秒解锁。"""
+    output = _lp163_interactive(r'''
+enterLpView();
+resetLp163SubmitState();
+state.predictionMarket.payload = {lp_dashboard: buildDashboard({
+  lp_orders_today: [sessionRow], lp_session: lp163Session,
+})};
+state.predictionMarket.lpDashboard = buildDashboard({
+  lp_orders_today: [sessionRow], lp_session: lp163Session,
+});
+const groupOrders = [{...sessionRow}];
+openPredictionModal("lp_augment", null, lpAugmentIntent(groupOrders, lp163Session));
+const previewCalls = augmentPreviewPosts().length;
+const handle = deferResponse(lpAugmentSubmitMatch);
+const confirmPromise = modalClick({modalAction: "lp-augment-confirm"});
+const posts = lpAugmentPosts();
+const body = posts.length ? JSON.parse(posts[0].body) : null;
+const card = lp163Card();
+const sharedLock = /data-action="lp-order-entry"[^>]*disabled/.test(card)
+  && /data-action="lp-augment-entry"[^>]*disabled/.test(card);
+handle.respond(jsonResponse({
+  state: "entry_open", session_id: "sess-abc163", augment_order_id: "aug-9"}));
+await confirmPromise;
+const successCard = lp163Card();
+await fireTimeouts(10000);
+const unlockedCard = lp163Card();
+console.log(JSON.stringify({
+  previewCalls,
+  postCount: posts.length,
+  bodySessionId: body ? body.session_id : null,
+  bodyQuantity: body ? body.quantity : null,
+  keyLooksUuid: body ? /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(body.idempotency_key) : false,
+  sharedLock,
+  successToast: successCard.includes("已加量 · 订单 aug-9 并入会话 sess-a 保护伞"),
+  unlocked: !/data-action="lp-order-entry"[^>]*disabled/.test(unlockedCard)
+    && !/data-action="lp-augment-entry"[^>]*disabled/.test(unlockedCard),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["previewCalls"] == 0
+    assert rendered["postCount"] == 1
+    assert rendered["bodySessionId"] == "sess-abc163"
+    assert rendered["bodyQuantity"] == "90"
+    assert rendered["keyLooksUuid"] is True
+    assert rendered["sharedLock"] is True
+    assert rendered["successToast"] is True
+    assert rendered["unlocked"] is True
+
+
+def test_lp163_augment_timeout_new_key_and_unknown_quantity() -> None:
+    """W9: 加量超时 → 未知 toast+解锁；重确认新键；5% 目标量缺失仍禁用+UNKNOWN；合并估算本地计算不受影响。"""
+    output = _lp163_interactive(r'''
+enterLpView();
+resetLp163SubmitState();
+state.predictionMarket.payload = {lp_dashboard: buildDashboard({
+  lp_orders_today: [sessionRow], lp_session: lp163Session,
+})};
+const groupOrders = [{...sessionRow}];
+deferResponse(lpAugmentSubmitMatch);  // A 永不到
+openPredictionModal("lp_augment", null, lpAugmentIntent(groupOrders, lp163Session));
+const confirmA = modalClick({modalAction: "lp-augment-confirm"});
+const keyA = JSON.parse(lpAugmentPosts()[0].body).idempotency_key;
+await fireTimeouts(10000);
+const card = lp163Card();
+const unknownToast = card.includes("结果未知：提交 10 秒未收到回执");
+const unlocked = !/data-action="lp-order-entry"[^>]*disabled/.test(card);
+deferResponse(lpAugmentSubmitMatch);
+openPredictionModal("lp_augment", null, lpAugmentIntent(groupOrders, lp163Session));
+modalClick({modalAction: "lp-augment-confirm"});  // 处理器挂在 fetch 处即可，键已铸造
+const keyB = JSON.parse(lpAugmentPosts()[1].body).idempotency_key;
+// 5% 目标量缺失的会话：选项禁用 + UNKNOWN 文案；有目标量时合并估算本地现算。
+const noTargetIntent = lpAugmentIntent(groupOrders, {...lp163Session, estimated_target_quantity: null});
+openPredictionModal("lp_augment", null, noTargetIntent);
+const noTargetHtml = modalRoot.innerHTML;
+openPredictionModal("lp_augment", null, lpAugmentIntent(groupOrders, lp163Session));
+const withTargetHtml = modalRoot.innerHTML;
+console.log(JSON.stringify({
+  unknownToast,
+  unlocked,
+  augmentPosts: lpAugmentPosts().length,
+  keysDiffer: keyA !== keyB,
+  noTargetFive: {
+    disabled: /value="five" disabled/.test(noTargetHtml),
+    unknownLabel: noTargetHtml.includes("加 5% 单 · 目标量 UNKNOWN"),
+  },
+  estimateLocal: withTargetHtml.includes("加后 A ≈") && !withTargetHtml.includes("加后 A UNKNOWN"),
+  estimateWarn: withTargetHtml.includes("46.4%"),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["unknownToast"] is True
+    assert rendered["unlocked"] is True
+    assert rendered["augmentPosts"] == 2
+    assert rendered["keysDiffer"] is True
+    assert rendered["noTargetFive"]["disabled"] is True
+    assert rendered["noTargetFive"]["unknownLabel"] is True
+    assert rendered["estimateLocal"] is True
+    assert rendered["estimateWarn"] is True

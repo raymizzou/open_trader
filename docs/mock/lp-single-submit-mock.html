@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mock · #163 LP 首次开仓单次确认提交 + 结果 toast（与现有看板风格一致）</title>
+<style>
+  /* ── 设计令牌：逐项复制自 dashboard.css :root 与相关类，保证风格一致 ── */
+  :root {
+    color-scheme: light;
+    --bg: #f7f5f1;
+    --surface: #fffefa;
+    --surface-soft: #f2eee7;
+    --text: #201d18;
+    --muted: #746e64;
+    --accent: #8b5e34;
+    --line: #d8d2c8;
+    --primary: #24211d;
+    --success: #2f855a;
+    --danger: #b42318;
+    --shadow: 0 8px 30px rgba(68, 55, 38, 0.06);
+    --on-primary: #ffffff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-size: 14px;
+    font-variant-numeric: tabular-nums;
+    padding: 32px 20px 64px;
+  }
+  .mock-wrap { max-width: 880px; margin: 0 auto; display: grid; gap: 12px; }
+  .mock-note { color: var(--muted); font-size: 12px; margin: 0; }
+  button { font: inherit; }
+  button:focus-visible, input:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+
+  /* pm-panel 复刻 */
+  .pm-panel {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    box-shadow: var(--shadow);
+    padding: 14px;
+  }
+  .pm-panel-heading { display: flex; gap: 16px; justify-content: space-between; align-items: start; margin-bottom: 12px; }
+  .pm-panel-heading h2 { margin: 0; font-size: 16px; }
+  .pm-panel-heading p { color: var(--muted); margin: 4px 0 0; font-size: 12px; }
+  .sub { color: var(--muted); font-size: 11px; }
+
+  /* pm-button 复刻 */
+  .pm-button {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 7px;
+    color: var(--text);
+    min-height: 44px;
+    padding: 9px 14px;
+  }
+  .pm-button:hover:not(:disabled) { border-color: var(--accent); }
+  .pm-button.primary { background: var(--primary); border-color: var(--primary); color: var(--on-primary); font-weight: 800; }
+  .pm-button:disabled { cursor: not-allowed; opacity: 0.46; }
+
+  /* ══ 新增：LP 提交 toast 栈（复用 pm-alert 四色语义，紧凑行）══ */
+  .lp-submit-toasts { display: grid; gap: 8px; margin-bottom: 12px; }
+  .lp-toast {
+    align-items: start; border: 1px solid; border-radius: 8px;
+    display: flex; gap: 12px; justify-content: space-between;
+    padding: 10px 12px; font-size: 13px;
+  }
+  .lp-toast strong { display: block; margin-bottom: 3px; font-size: 13px; }
+  .lp-toast p { margin: 0; font-size: 11px; }
+  .lp-toast.submitting { background: #fff8e8; border-color: #e4c98e; color: #6b4a11; }
+  .lp-toast.success { background: #edf8f1; border-color: #add4bc; color: #245b39; }
+  .lp-toast.danger { background: #fff2f0; border-color: #e7aaa4; color: #7a211a; }
+  .lp-toast.unknown { background: #eef6f8; border-color: #a8ccd7; color: #214f5c; }
+  .lp-toast .lp-toast-side { color: inherit; font-size: 11px; opacity: .8; text-align: right; white-space: nowrap; }
+  .lp-toast.submitting .lp-toast-dots::after {
+    content: "···"; display: inline-block; animation: lp-pulse 1s steps(3, end) infinite;
+  }
+  @keyframes lp-pulse { 0% { opacity: .3; } 50% { opacity: 1; } 100% { opacity: .3; } }
+  @media (prefers-reduced-motion: reduce) { .lp-toast.submitting .lp-toast-dots::after { animation: none; } }
+
+  /* 迷你表格：候选行（挂单按钮）与当日行（加量按钮） */
+  .mock-table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  .mock-table th, .mock-table td { border-bottom: 1px solid var(--line); padding: 8px 6px; text-align: left; }
+  .mock-table th { color: var(--muted); font-weight: 600; }
+  .mock-table .num { font-variant-numeric: tabular-nums; }
+  .pm-button.lp-entry { min-height: 30px; padding: 3px 10px; font-size: 11px; }
+
+  /* ══ 弹窗：pm-modal 复刻 ══ */
+  .pm-modal-layer:empty { display: none; }
+  .pm-modal-layer { align-items: center; background: rgba(20, 18, 15, 0.58); display: flex; inset: 0; justify-content: center; padding: 16px; position: fixed; z-index: 2000; }
+  .pm-modal { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 24px 80px rgba(0, 0, 0, 0.28); max-height: calc(100dvh - 32px); max-width: 720px; overflow: auto; padding: 20px; width: 100%; }
+  .pm-modal-header { margin-bottom: 16px; }
+  .pm-modal-header h2 { font-size: 22px; margin: 0 0 5px; }
+  .pm-modal-header p { color: var(--muted); margin: 0; }
+  .pm-order-market { background: #f2eee7; border-radius: 7px; margin-bottom: 12px; padding: 12px; }
+  .pm-order-market span { color: var(--muted); display: block; font-size: 12px; margin-bottom: 5px; }
+  .pm-order-market strong { display: block; line-height: 1.4; }
+  .pm-check-list { display: grid; gap: 7px; margin-bottom: 14px; }
+  .pm-check { align-items: center; border-bottom: 1px solid var(--line); display: flex; gap: 12px; justify-content: space-between; padding: 8px 0; }
+  .pm-check:last-child { border-bottom: 0; }
+  .pm-check span { color: var(--muted); }
+  .pm-check strong { overflow-wrap: anywhere; text-align: right; }
+  .lp-order-input { background: transparent; border: 1px solid var(--line); border-radius: 6px; color: inherit; font: inherit; padding: 3px 8px; width: 90px; }
+  .lp-order-input:read-only { opacity: .75; }
+  .radio-line { align-items: baseline; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; display: flex; gap: 8px; margin-bottom: 8px; padding: 8px 10px; }
+  .radio-line.is-disabled { cursor: not-allowed; opacity: .5; }
+  .pm-risk-note { background: #fff5f3; border: 1px solid #efb6af; border-radius: 7px; color: #7a211a; margin-bottom: 12px; padding: 11px 12px; }
+  .pm-risk-note strong { display: block; margin-bottom: 3px; }
+  .pm-risk-note p { margin: 0; }
+  .lp-submit-note { background: var(--surface-soft); border: 1px solid var(--line); border-radius: 7px; color: var(--text); margin-bottom: 12px; padding: 10px 12px; font-size: 12px; }
+  .lp-submit-note strong { display: block; margin-bottom: 3px; font-size: 12px; }
+  .pm-modal-actions { align-items: center; display: flex; gap: 10px; justify-content: flex-end; }
+  .pm-modal-actions .pm-button { min-width: 150px; }
+
+  /* 演示控制区 */
+  .mock-controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; font-size: 12px; color: var(--muted); }
+  .mock-controls label { display: inline-flex; gap: 4px; align-items: center; cursor: pointer; }
+  .mock-controls .pm-button { min-height: 34px; padding: 4px 10px; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="mock-wrap">
+  <p class="mock-note">Mock · #163「首次开仓单次确认提交」· 数据为模拟值。令牌与弹窗/按钮样式逐项取自 dashboard.css，toast 复用 pm-alert 四色语义。点「打开下单弹窗」走完整演示。</p>
+
+  <section class="pm-panel" aria-label="LP 做市看板卡片（节选）">
+    <header class="pm-panel-heading">
+      <div>
+        <h2>LP 做市 · 今日候选</h2>
+        <p>单次确认提交：填写与查看不发起预检，服务端在提交时按最新事实校验后挂单。</p>
+      </div>
+      <button class="pm-button primary" type="button" id="open-modal">打开下单弹窗</button>
+    </header>
+
+    <!-- ══ 新增：提交结果 toast 栈（替代原预检结果面板的位置，挂在 LP 卡片内）══ -->
+    <div class="lp-submit-toasts" id="toasts" aria-live="polite"></div>
+
+    <table class="mock-table">
+      <thead><tr><th>标的</th><th>方向</th><th>买一</th><th>拟挂</th><th></th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Will X win the 2026 title?</td>
+          <td>YES</td>
+          <td class="num">29¢</td>
+          <td class="num">0.29 × 20 份 · $5.80</td>
+          <td style="text-align:right"><button class="pm-button lp-entry" type="button" id="btn-order-entry">挂单</button></td>
+        </tr>
+        <tr>
+          <td class="sub" colspan="5" style="border-bottom:0">当日已有会话行（示意）：… <button class="pm-button lp-entry" type="button" id="btn-augment-entry">加量</button>（加量流程 #164 前不变，仅共享 10 秒提交锁定）</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="pm-panel" aria-label="演示控制">
+    <div class="mock-controls">
+      <span>模拟服务端结果：</span>
+      <label><input type="radio" name="outcome" value="accepted" checked> 成功</label>
+      <label><input type="radio" name="outcome" value="entry_rejected"> 交易所拒单</label>
+      <label><input type="radio" name="outcome" value="best_bid_changed"> 买一变化拒绝</label>
+      <label><input type="radio" name="outcome" value="busy"> 业务忙</label>
+      <label><input type="radio" name="outcome" value="timeout"> 超时未知</label>
+      <label><input type="radio" name="outcome" value="network"> 网络错误未知</label>
+      <button class="pm-button" type="button" id="fast-forward">快进到 10s 解锁</button>
+      <button class="pm-button" type="button" id="late-reply" hidden>注入迟到回执（成功）</button>
+    </div>
+    <p class="mock-note" style="margin-top:10px">规则演示：最终确认即关弹窗并锁入口 10 秒（提前成功/拒绝不提前解锁）；10 秒无回执报「结果未知」并解锁；迟到回执只更新自己那条 toast，不覆盖新订单。</p>
+  </section>
+</div>
+
+<!-- ══ 弹窗层 ══ -->
+<div class="pm-modal-layer" id="modal-layer"></div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const layer = $("modal-layer");
+  let toasts = [];
+  let cooldown = null;   // {until, tick, intentId}
+  let seq = 0;
+
+  function fmtCost(price, qty) {
+    const n = Number(price) * Number(qty);
+    return Number.isFinite(n) && n > 0 ? "$" + n.toFixed(2) : "-";
+  }
+
+  function renderToasts() {
+    const host = $("toasts");
+    host.innerHTML = toasts.map((t) => `
+      <div class="lp-toast ${t.kind}" role="status" data-id="${t.id}">
+        <div><strong>${t.main}<span class="lp-toast-dots"></span></strong><p>${t.sub}</p></div>
+        <div class="lp-toast-side">${t.side}</div>
+      </div>`).join("");
+  }
+  function upsertToast(id, patch) {
+    const t = toasts.find((x) => x.id === id);
+    if (!t) return;                       // 迟到结果只更新自己那条（按意图键归属）
+    Object.assign(t, patch);
+    renderToasts();
+  }
+
+  function renderCooldown() {
+    const left = cooldown ? Math.max(0, Math.ceil((cooldown.until - Date.now()) / 1000)) : 0;
+    const lock = left > 0;
+    for (const b of [$("btn-order-entry"), $("btn-augment-entry"), $("open-modal")]) {
+      b.disabled = lock;
+      b.title = lock ? `提交冷却中（剩余 ${left}s）` : "";
+    }
+    if (cooldown && cooldown.toastId && left > 0) {
+      upsertToast(cooldown.toastId, { side: `意图 #${cooldown.intentId} · 入口锁定剩余 ${left}s` });
+    }
+  }
+  function startCooldown(toastId, intentId) {
+    cooldown = { until: Date.now() + 10000, toastId, intentId };
+    renderCooldown();
+    cooldown.tick = setInterval(() => {
+      const left = cooldown.until - Date.now();
+      renderCooldown();
+      if (left <= 0) {
+        clearInterval(cooldown.tick);
+        const t = toasts.find((x) => x.id === toastId);
+        if (t && t.kind === "submitting") {   // 10 秒无回执：结果未知，不宣称失败/成功
+          upsertToast(toastId, {
+            kind: "unknown",
+            main: "结果未知：提交 10 秒未收到回执",
+            sub: "订单可能已挂出 · 系统不会自动重试 · 请以看板与会话状态为准",
+            side: `意图 #${intentId}`,
+          });
+        }
+        cooldown = null;
+        renderCooldown();
+        if ($("late-reply").hidden && t && t.kind === "unknown") $("late-reply").hidden = false;
+      }
+    }, 250);
+  }
+
+  const OUTCOMES = {
+    accepted:         { kind: "success", main: "已提交 · 订单 order-7 已登记", sub: "会话 a3f9c2 · #152 位置保护已带基线 · 看板稍后刷新" },
+    entry_rejected:   { kind: "danger",  main: "未登记：交易所拒绝了订单，未产生委托", sub: "请重新发起下单（新确认 = 新意图新幂等键）" },
+    best_bid_changed: { kind: "danger",  main: "未提交：确认价与提交时买一不一致", sub: "不改价、不改量、不追价 · 请核对最新买一后重新确认" },
+    busy:             { kind: "danger",  main: "业务忙：已有活动 LP 会话，本单未提交", sub: "active_lp_session · 请先处理当前会话" },
+    timeout:          null,   // 由 10 秒定时器触发
+    network:          { kind: "unknown", main: "结果未知：网络错误，是否已提交未知", sub: "系统不会自动重试 · 请以看板与会话状态为准" },
+  };
+
+  function openModal() {
+    layer.innerHTML = `
+      <section class="pm-modal" role="dialog" aria-modal="true" aria-labelledby="pm-dialog-title" tabindex="-1">
+        <header class="pm-modal-header">
+          <h2 id="pm-dialog-title">确认 LP 试挂（BUY · post-only）</h2>
+          <p>一次确认即提交：填写与查看不发起预检；服务端按提交时最新事实校验后挂单，结果以提示返回。</p>
+        </header>
+        <div class="pm-order-market">
+          <span>Polymarket · 0x1a2b…c3d4 · 买 YES</span>
+          <strong>Will X win the 2026 title?</strong>
+        </div>
+        <p class="sub" style="margin:0 0 10px">下单情形（单选 · 默认试挂单）</p>
+        <div style="margin-bottom:10px">
+          <label class="radio-line"><input type="radio" name="lp-case" value="trial" checked> 试挂单 · 0.29 × 20 份</label>
+          <label class="radio-line"><input type="radio" name="lp-case" value="five"> 5% 单 · 0.29 × 100 份</label>
+          <label class="radio-line"><input type="radio" name="lp-case" value="custom"> 自定义份额下单（可改价改量，继承当前值）</label>
+        </div>
+        <div class="pm-check-list">
+          <div class="pm-check"><span>挂单价 USDC</span><input class="lp-order-input" id="m-price" type="number" step="0.01" min="0.01" max="0.99" value="0.29" readonly></div>
+          <div class="pm-check"><span>数量（份）</span><span><input class="lp-order-input" id="m-qty" type="number" step="1" min="1" value="20" readonly> <span class="sub">计划口径，锁定</span></span></div>
+          <div class="pm-check"><span>预计占用</span><strong id="m-cost">$5.80</strong></div>
+        </div>
+        <div class="lp-submit-note">
+          <strong>提交时校验（一次新鲜事实）</strong>
+          账户 · 余额/授权 · 标的身份 · 价位/数量 · 盘口新鲜度 · 奖励资格 · 退出深度 · 复核时间；默认试挂单确认价与提交时买一不一致将直接拒绝。
+        </div>
+        <div class="pm-risk-note" role="note">
+          <strong>提交即登记 #152 位置保护</strong>
+          <p>经系统入口提交的单自动带基线：初始 A = 前方份额 ÷ 同价位总量，A ≤ 50% 时自动撤掉该价位全部自己 BUY。</p>
+        </div>
+        <footer class="pm-modal-actions">
+          <button class="pm-button" type="button" data-act="cancel">取消</button>
+          <button class="pm-button primary" type="button" data-act="confirm">确认提交 · 登记受保护</button>
+        </footer>
+      </section>`;
+    layer.querySelectorAll('input[name="lp-case"]').forEach((r) => r.addEventListener("change", () => {
+      const custom = r.value === "custom" && r.checked;
+      layer.querySelector("#m-price").readOnly = !custom;
+      layer.querySelector("#m-qty").readOnly = !custom;
+    }));
+    const recost = () => { layer.querySelector("#m-cost").textContent = fmtCost(layer.querySelector("#m-price").value, layer.querySelector("#m-qty").value); };
+    layer.querySelector("#m-price").addEventListener("input", recost);
+    layer.querySelector("#m-qty").addEventListener("input", recost);
+    layer.querySelector('[data-act="cancel"]').addEventListener("click", () => { layer.innerHTML = ""; });
+    layer.querySelector('[data-act="confirm"]').addEventListener("click", onConfirm);
+    layer.querySelector("#m-price").focus();
+  }
+
+  function onConfirm() {
+    const price = layer.querySelector("#m-price").value;
+    const qty = layer.querySelector("#m-qty").value;
+    layer.innerHTML = "";                       // 最终确认：立即关弹窗
+    const id = `t${++seq}`;
+    const intentId = seq;
+    toasts.unshift({ id, kind: "submitting", main: `正在提交 · 买 YES @ ${price} × ${qty} 份`, sub: "服务端校验通过后即挂 post-only · 期间入口锁定 10 秒", side: `意图 #${intentId}` });
+    toasts = toasts.slice(0, 3);
+    renderToasts();
+    startCooldown(id, intentId);
+
+    const outcome = document.querySelector('input[name="outcome"]:checked').value;
+    const result = OUTCOMES[outcome];
+    if (result) {
+      setTimeout(() => upsertToast(id, { ...result, side: `意图 #${intentId}` }), 1800);
+    } else if (outcome === "timeout") {
+      $("late-reply").hidden = false;          // 演示：10s 定时器到点报未知，之后可注入迟到回执
+    }
+  }
+
+  $("late-reply").addEventListener("click", () => {
+    const unknownToast = toasts.find((t) => t.kind === "unknown");
+    if (!unknownToast) return;
+    upsertToast(unknownToast.id, { kind: "success", main: "迟到回执 · 订单 order-8 已登记", sub: "仅更新本意图 toast · 不影响其后新订单", side: unknownToast.side });
+    $("late-reply").hidden = true;
+  });
+
+  $("open-modal").addEventListener("click", openModal);
+  $("fast-forward").addEventListener("click", () => { if (cooldown) cooldown.until = Date.now() + 200; });
+</script>
+</body>
+</html>

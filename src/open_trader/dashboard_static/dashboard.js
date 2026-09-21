@@ -63,6 +63,8 @@ const state = {
     historyKind: "signals",
     error: "",
     lpCancelSummary: "",
+    lpSubmitToasts: [],
+    lpSubmitCooldown: null,
     pollId: null,
     stateRequestInFlight: false,
     lpDashboardRequestInFlight: false,
@@ -3784,7 +3786,7 @@ function lpDashboardAugmentButtonMarkup(orders, session) {
     + " data-action=\"lp-augment-entry\" data-condition-id=\"" + escapeHtml(conditionId) + "\""
     + " data-session-id=\"" + escapeHtml(String(session.session_id || "")) + "\""
     + " title=\"在会话保护伞内追加一张同价 post-only BUY\""
-    + (!state.predictionMarket.csrfToken ? " disabled" : "")
+    + ((!state.predictionMarket.csrfToken || lpSubmitCooldownActive()) ? " disabled" : "")
     + ">加量</button>";
 }
 
@@ -4150,7 +4152,7 @@ function lpTrialCandidateRow(row, currentConditionId) {
     + "<button class=\"pm-button\" type=\"button\" data-action=\"lp-order-entry\""
     + " data-condition-id=\"" + escapeHtml(String(row?.condition_id || "")) + "\""
     + " data-outcome=\"" + escapeHtml(String(selectedOutcome || "")) + "\""
-    + (!state.predictionMarket.csrfToken ? " disabled" : "")
+    + ((!state.predictionMarket.csrfToken || lpSubmitCooldownActive()) ? " disabled" : "")
     + ">挂单</button>"
     + "</div></td>";
   return "<tr data-lp-trial-candidate=\"" + escapeHtml(rowKey) + "\">"
@@ -4305,6 +4307,7 @@ function predictionLpCard(payload) {
     + (state.predictionMarket.lpDashboardRequestInFlight || state.predictionMarket.lpPreparationRecoveryInFlight || !state.predictionMarket.csrfToken ? " disabled" : "") + ">撤全部</button></div></header>"
     + errorMarkup
     + cancelSummaryMarkup
+    + lpSubmitToastsMarkup()
     + snapshotPendingMarkup
     + predictionLpPreparation(dashboard.preparation)
     + budgetLineMarkup
@@ -6169,36 +6172,11 @@ function predictionPreviewIsComplete(value) {
 
 // ===== Issue 158: LP 手动下单（lp_order）与委托加量（lp_augment）模态 =====
 
-// Rejections the operator resolves by re-running the preflight (same intent,
-// same idempotency key, fresh preview_id).
-const LP_REPREVIEW_REASONS = new Set([
-  "best_bid_changed",
-  "preview_expired",
-  "preview_consumed",
-  "candidate_changed",
-]);
-
-// 评审修复（定案 10/11）：LP 提交确认（lp_order/lp_augment）的显式失败态集合。
-// 服务端对这两类提交统一返回 HTTP 200，只有 body 携带会话（session_id）且
-// state 不在此集合内才允许按成功收尾（关模态+成功摘要）；幂等重放返既有活动
-// 会话（review/passive_exit/stop_loss_exit/complete 等非失败态且带 session_id）
-// 自然落入成功侧，按「已登记（返既有会话）」呈现。
-const LP_CONFIRM_FAILURE_STATES = new Set([
-  "busy",
-  "locked",
-  "rejected",
-  "entry_rejected",
-  "needs_attention",
-]);
-
-// Issue 162（定案 6）：动作→所需 kind 映射。click 处理器在发请求前校验
+// Issue 163：动作→所需 kind 映射。click 处理器在发请求前校验
 // 当前弹窗 kind 匹配，不匹配（含未知动作）直接 return，不发任何请求。
+// 单次确认提交后不再有预检/重预检动作。
 const PREDICTION_MODAL_ACTION_KINDS = {
-  "lp-order-preview": "lp_order",
-  "lp-order-repreview": "lp_order",
   "lp-order-confirm": "lp_order",
-  "lp-augment-preview": "lp_augment",
-  "lp-augment-repreview": "lp_augment",
   "lp-augment-confirm": "lp_augment",
   "lp-cancel-confirm": "lp_cancel",
   "nleg-confirm": "nleg_order",
@@ -6221,6 +6199,8 @@ function lpShortSessionId(value) {
 }
 
 // 定案 10: response-state branch texts (all LP submit responses are HTTP 200).
+// Issue 163: single-shot world — there is no preview to re-run, so every
+// text names what happened and points at a fresh confirmation (新意图新键).
 function lpSubmitStateMessage(result) {
   const resultState = String(result?.state || "").toLowerCase();
   const reason = String(result?.reason || "");
@@ -6230,48 +6210,190 @@ function lpSubmitStateMessage(result) {
     return `当前状态不允许提交（${reason || "locked"}）。`;
   }
   if (resultState === "busy") {
-    if (reason === "active_lp_session") {
-      const dashboard = state.predictionMarket.lpDashboard;
-      const session = dashboard && typeof dashboard === "object" ? dashboard.lp_session : null;
-      const title = session && typeof session === "object" ? lpMarketTitle(session) : "";
-      const sessionId = String(result.session_id || (session && typeof session === "object" ? session.session_id : "") || "");
-      const who = title && title !== "标的未返回"
-        ? `${title} · 会话 ${lpShortSessionId(sessionId)}`
-        : `会话 ${lpShortSessionId(sessionId)}`;
-      return `已有活动会话（${who}）。当天会话于次日 08:00 复核收尾；加量请用 LP 委托表的「加量」按钮。`;
-    }
-    if (reason === "active_execution") return "已有另一笔交易正在执行，请等待完成。";
-    if (reason === "execution_lock") return "已有另一笔操作正在确认，请稍后重试。";
+    if (reason === "active_lp_session") return "已有活动 LP 会话，本单未提交。";
+    if (reason === "active_execution") return "已有另一笔交易正在执行，本单未提交。";
+    if (reason === "execution_lock") return "已有另一笔操作正在确认，请稍后重新确认。";
     return `系统忙，暂不能提交（${reason || "busy"}）。`;
   }
   if (resultState === "rejected") {
-    if (reason === "best_bid_changed") return "买一已变化，未下单。请重新预检后确认。";
-    if (reason === "preview_expired") return "预检已过期，未下单。请重新预检后确认。";
-    if (reason === "preview_consumed") return "预检凭证已被使用，未下单。请重新预检后确认。";
-    if (reason === "candidate_changed") return "候选计划已变化，未下单。请重新预检后确认。";
+    if (reason === "best_bid_changed") return "确认价与提交时买一不一致。";
     if (reason === "session_not_active" || reason === "session_not_found") {
       return "该标的当前无活动系统会话——请先从候选列表经系统入口下第一单。";
     }
+    if (reason === "session_review_exit") return "目标会话正在退出收尾，不能再加量。";
+    if (reason === "session_stop_loss_exit") return "目标会话已触发止损退出，不能再加量。";
+    if (reason === "session_needs_attention") return "目标会话待人工核对，不能再加量。";
+    if (reason === "quantity_invalid") return "数量不是有效正数。";
     return reason ? `未下单：${reason}` : "未下单。";
   }
-  // 评审修复（定案 10）：HTTP 200 里两类非成功终态必须在模态内如实呈现。
   if (resultState === "entry_rejected") {
-    return "未登记：交易所拒绝了订单，未产生委托；请关闭后重新发起下单。";
+    return "交易所拒绝了订单，未产生委托。";
   }
   if (resultState === "needs_attention") {
-    return "提交结果未知（回执未确认），请刷新看板核对会话状态后再操作；不要重复提交。";
+    return "提交回执未确认。";
   }
   return "";
 }
 
-function lpSubmitOutcomeMarkup(result) {
-  const message = lpSubmitStateMessage(result);
-  if (!message) return "";
-  // needs_attention 是结果未知而非确定失败，用警示条与「提交未完成」错误条区分。
-  const warning = String(result?.state || "").toLowerCase() === "needs_attention";
-  const severity = warning ? "warning" : "danger";
-  const title = warning ? "提交结果未知" : "提交未完成";
-  return `<div class="pm-alert ${severity}" role="alert"><div class="pm-alert-body"><strong>${title}</strong><p>${escapeHtml(message)}</p></div></div>`;
+// ===== Issue 163：单次确认提交的结果 toast 栈与 10 秒共享锁 =====
+// toast 一律挂在 LP 卡片内（≤3 条、新的在前），按幂等键归属：无论回执多迟，
+// 只更新自己那条，绝不触碰其它意图的 toast 或任何当前弹窗。四色语义：
+// submitting=黄 / success=绿 / danger=红 / unknown=蓝（对齐 mock）。
+
+function lpSubmitToastPush(entry) {
+  const toasts = Array.isArray(state.predictionMarket.lpSubmitToasts)
+    ? state.predictionMarket.lpSubmitToasts.slice() : [];
+  if (entry.kind !== "submitting") entry.doneAt = Date.now() + 30000;
+  toasts.unshift(entry);
+  state.predictionMarket.lpSubmitToasts = toasts.slice(0, 3);
+}
+
+function lpSubmitToastUpdate(key, patch) {
+  const toast = (state.predictionMarket.lpSubmitToasts || [])
+    .find((item) => item.id === key);
+  if (!toast) return; // 迟到回执只更新自己那条；找不到就静默丢弃。
+  Object.assign(toast, patch);
+  if (patch.kind && patch.kind !== "submitting") toast.doneAt = Date.now() + 30000;
+}
+
+// Map one submit response onto the intent's own toast.  Returns true when
+// the response is a registered session the operator should hear about.
+function lpSubmitToastResult(key, result, role) {
+  const resultState = String(result?.state || "").toLowerCase();
+  const hasSession = Boolean(String(result?.session_id || "").trim());
+  const sessionShort = lpShortSessionId(result?.session_id);
+  if (resultState === "entry_open" && hasSession) {
+    const orderId = String(
+      (role === "augment" ? result?.augment_order_id : result?.entry_order_id) || "",
+    );
+    if (role === "augment") {
+      lpSubmitToastUpdate(key, {
+        kind: "success",
+        main: `已加量 · 订单 ${orderId || "UNKNOWN"} 并入会话 ${sessionShort} 保护伞`,
+        sub: "#152 位置保护基线已重锚 · 复核截止沿用首单 · 看板稍后刷新",
+      });
+    } else {
+      lpSubmitToastUpdate(key, {
+        kind: "success",
+        main: `已提交 · 订单 ${orderId || "UNKNOWN"} 已登记`,
+        sub: `会话 ${sessionShort} · #152 位置保护已带基线 · 看板稍后刷新`,
+      });
+    }
+    return true;
+  }
+  if (hasSession && !["busy", "locked", "rejected", "entry_rejected", "needs_attention"].includes(resultState)) {
+    // 幂等重放命中的既有会话已不在 entry_open（如复核中）——如实报「已登记」。
+    lpSubmitToastUpdate(key, {
+      kind: "success",
+      main: `已登记 · 返既有会话 ${sessionShort}（${predictionValue(resultState, "状态未知")}）`,
+      sub: "以看板与会话状态为准",
+    });
+    return true;
+  }
+  lpSubmitToastUpdate(key, lpSubmitToastCopy(result));
+  return false;
+}
+
+function lpSubmitToastCopy(result) {
+  const resultState = String(result?.state || "").toLowerCase();
+  if (resultState === "entry_rejected") {
+    return {
+      kind: "danger",
+      main: "未登记：交易所拒绝了订单，未产生委托",
+      sub: "请重新发起下单（新确认 = 新意图）",
+    };
+  }
+  if (resultState === "needs_attention") {
+    return {
+      kind: "unknown",
+      main: "结果未知：提交回执未确认",
+      sub: "系统不会自动重试 · 请以看板与会话状态为准",
+    };
+  }
+  if (resultState === "busy") {
+    return {
+      kind: "danger",
+      main: "业务忙：已有活动 LP 会话，本单未提交",
+      sub: "加量请用「加量」入口 · 本单未发出",
+    };
+  }
+  if (resultState === "locked") {
+    return {
+      kind: "danger",
+      main: "系统锁定（熔断/维护中），本单未提交",
+      sub: "解除后需重新确认；系统不会自动重试",
+    };
+  }
+  if (resultState === "rejected") {
+    const reason = String(result?.reason || "");
+    if (reason === "best_bid_changed") {
+      return {
+        kind: "danger",
+        main: "未提交：确认价与提交时买一不一致",
+        sub: "不改价、不改量、不追价 · 请核对最新买一后重新确认",
+      };
+    }
+    // 评审修复 P3：lpSubmitStateMessage 对未特判原因已产出「未下单：<reason>」
+    // 完整句，直接采用；只有它给不出句子时才用「未提交：<reason>」兜底——
+    // 任何情况下主行只出现一个前缀，绝不拼出「未提交：未下单：…」。
+    const stateMessage = lpSubmitStateMessage(result);
+    return {
+      kind: "danger",
+      main: stateMessage || `未提交：${reason || "条件不满足"}`,
+      sub: "请核对后重新发起下单（新确认 = 新意图）",
+    };
+  }
+  return {
+    kind: "unknown",
+    main: "结果未知：响应状态未识别",
+    sub: "系统不会自动重试 · 请以看板与会话状态为准",
+  };
+}
+
+function lpSubmitCooldownActive() {
+  const cooldown = state.predictionMarket.lpSubmitCooldown;
+  return Boolean(cooldown && Number(cooldown.until) > Date.now());
+}
+
+// 定案 7：锁固定 10 秒；提前回执只更新 toast、不提前解锁；到点若该意图仍
+// submitting 则改报「结果未知」（不出现 失败/成功/已撤销 字样），随后解锁。
+function lpSubmitStartCooldown(toastKey) {
+  const previous = state.predictionMarket.lpSubmitCooldown;
+  if (previous && previous.timer) window.clearTimeout(previous.timer);
+  const timer = window.setTimeout(() => {
+    state.predictionMarket.lpSubmitCooldown = null;
+    const toast = (state.predictionMarket.lpSubmitToasts || [])
+      .find((item) => item.id === toastKey);
+    if (toast && toast.kind === "submitting") {
+      lpSubmitToastUpdate(toastKey, {
+        kind: "unknown",
+        main: "结果未知：提交 10 秒未收到回执",
+        sub: "订单可能已挂出 · 系统不会自动重试 · 请以看板与会话状态为准",
+      });
+    }
+    renderPredictionMarket();
+  }, 10000);
+  state.predictionMarket.lpSubmitCooldown = {
+    until: Date.now() + 10000, timer, toastKey,
+  };
+}
+
+// 渲染时顺带清理：完成/失败 toast 满 30 秒后淡出（复用轮询渲染周期）。
+function lpSubmitToastsMarkup() {
+  const toasts = state.predictionMarket.lpSubmitToasts;
+  if (!Array.isArray(toasts) || !toasts.length) return "";
+  const now = Date.now();
+  const live = toasts.filter((item) =>
+    item.kind === "submitting" || Number(item.doneAt || 0) > now);
+  state.predictionMarket.lpSubmitToasts = live;
+  if (!live.length) return "";
+  return `<div class="lp-submit-toasts" aria-live="polite">` + live.map((item) =>
+    `<div class="lp-toast ${item.kind}" role="status" data-lp-toast-key="${escapeHtml(String(item.id || ""))}">`
+    + `<div><strong>${escapeHtml(String(item.main || ""))}`
+    + (item.kind === "submitting" ? `<span class="lp-toast-dots"></span>` : "")
+    + `</strong><p>${escapeHtml(String(item.sub || ""))}</p></div>`
+    + `</div>`
+  ).join("") + `</div>`;
 }
 
 function lpOrderCaseLine(mode, currentMode, label, disabled) {
@@ -6279,40 +6401,6 @@ function lpOrderCaseLine(mode, currentMode, label, disabled) {
   return `<label class="radio-line${disabled ? " is-disabled" : ""}">`
     + `<input type="radio" name="lp-order-case" value="${mode}"${checked ? " checked" : ""}${disabled ? " disabled" : ""}`
     + ` data-modal-action="lp-order-case" data-case-mode="${mode}"> ${label}</label>`;
-}
-
-function lpOrderFactsMarkup(preflight) {
-  const facts = preflight && typeof preflight === "object" ? preflight : {};
-  const num = (value) => escapeHtml(predictionValue(value, "UNKNOWN"));
-  return `<div class="pm-check"><span>余额 / 授权</span><strong>${num(facts.balance)} / ${num(facts.allowance)} USDC</strong></div>`
-    + `<div class="pm-check"><span>tick / 最小下单量</span><strong>${num(facts.tick_size)} / ${num(facts.minimum_order_size)} 份</strong></div>`
-    + `<div class="pm-check"><span>奖励资格</span><strong>min size ${num(facts.reward_min_size)} · max spread ${num(facts.reward_max_spread)}</strong></div>`
-    + `<div class="pm-check"><span>中间价 / 买一 / 卖一</span><strong>${num(facts.midpoint)} / ${num(facts.best_bid)} / ${num(facts.best_ask)}</strong></div>`
-    + `<div class="pm-check"><span>手续费</span><strong>maker ${num(facts.fee)} · taker ${num(facts.taker_fee_rate)}</strong></div>`
-    + `<div class="pm-check"><span>提交时刻校验</span><strong>新鲜盘口 + 买一未变（变了即拒 best_bid_changed）</strong></div>`;
-}
-
-// 定案 1: initial-A truth table — empty level, at/below threshold, above.
-function lpInitialAEstimateMarkup(estimate, quantity) {
-  const ratio = Number(estimate?.projected_ratio);
-  const front = Number(estimate?.baseline_front);
-  const qty = Number(quantity);
-  const frontText = Number.isFinite(front) ? formatDisplayNumber(String(front)) : "UNKNOWN";
-  const levelText = Number.isFinite(front) && Number.isFinite(qty)
-    ? formatDisplayNumber(String(front + qty)) : "UNKNOWN";
-  const head = `<div class="pm-check"><span>位置保护预估</span><strong>基线前方 ${escapeHtml(frontText)} 份`
-    + ` · 提交后档位 ${escapeHtml(levelText)} 份 · 初始 A = ${escapeHtml(lpRatioPercent(ratio))}%（触发线 50%）</strong></div>`;
-  if (!Number.isFinite(ratio)) {
-    return head + `<div class="pm-alert warning" role="alert"><p>位置保护预估 UNKNOWN，无法判断初始 A。</p></div>`;
-  }
-  const pct = lpRatioPercent(ratio);
-  if (ratio <= 0) {
-    return head + `<div class="pm-alert warning" role="alert"><p>空档位：提交后立即触发位置保护撤单。</p></div>`;
-  }
-  if (ratio <= 0.5) {
-    return head + `<div class="pm-alert warning" role="alert"><p>初始 A ${pct}% ≤ 触发线 50%：提交后首个监控 tick 即触发位置保护撤单。</p></div>`;
-  }
-  return head + `<div class="pm-check"><span>触发判断</span><strong>初始 A ${escapeHtml(pct)}% &gt; 触发线 50%：未触发，正常监控。</strong></div>`;
 }
 
 function lpAugmentEstimateMarkup(data, quantity) {
@@ -6335,16 +6423,6 @@ function lpAugmentEstimateMarkup(data, quantity) {
   return head + `<div class="pm-check"><span>触发判断</span><strong>未触发，继续合并监控（保护副行自动覆盖两张单）。</strong></div>`;
 }
 
-function lpAugmentFactsMarkup(preflight, session, existingText) {
-  const facts = preflight && typeof preflight === "object" ? preflight : {};
-  const num = (value) => escapeHtml(predictionValue(value, "UNKNOWN"));
-  return `<div class="pm-check"><span>会话 / 入场价</span><strong>${escapeHtml(lpShortSessionId(session.session_id))} · ${escapeHtml(String(session.price ?? ""))}（锁定）</strong></div>`
-    + `<div class="pm-check"><span>现有委托</span><strong>${escapeHtml(existingText)}</strong></div>`
-    + `<div class="pm-check"><span>余额 / 授权</span><strong>${num(facts.balance)} / ${num(facts.allowance)} USDC</strong></div>`
-    + `<div class="pm-check"><span>中间价 / 买一 / 卖一</span><strong>${num(facts.midpoint)} / ${num(facts.best_bid)} / ${num(facts.best_ask)}</strong></div>`
-    + `<div class="pm-check"><span>提交时刻校验</span><strong>新鲜盘口 + 买一未变 + 会话仍活动</strong></div>`;
-}
-
 // Issue 162（定案 5/7）：预计占用是弹窗内唯一计算值——$ + (price*qty).toFixed(2)；
 // 数量/价格一律原样字符串，空缺或非数值显示 "-"。
 function lpOrderCostText(price, quantity) {
@@ -6356,113 +6434,61 @@ function lpOrderCostText(price, quantity) {
 }
 
 function lpOrderModalHtml(data = {}) {
+  // Issue 163 定案：单相弹窗——填写与查看零服务端调用；「确认提交」一次
+  // 最终确认即关窗、弹 toast、锁入口 10 秒，服务端恰读一次新鲜事实做一次
+  // 完整校验后挂单，结果以 toast 返回。
   const row = data.row && typeof data.row === "object" ? data.row : {};
   const mode = ["trial", "five", "custom"].includes(data.mode) ? data.mode : "trial";
-  const phase = data.phase === "review" ? "review" : "form";
   const title = escapeHtml(lpMarketTitle(row));
   const sub = `Polymarket · ${escapeHtml(predictionValue(row.condition_id, "UNKNOWN"))} · 买 ${escapeHtml(predictionValue(data.outcome, "UNKNOWN"))}`;
-  const header = `<header class="pm-modal-header"><h2 id="pm-dialog-title">确认 LP 试挂（BUY · post-only）</h2><p>三种情形单选；试挂/5% 按配方锁定，只有自定义可改价改量。</p></header>`
+  const header = `<header class="pm-modal-header"><h2 id="pm-dialog-title">确认 LP 试挂（BUY · post-only）</h2><p>一次确认即提交：填写与查看不发起预检；服务端按提交时最新事实校验后挂单，结果以提示返回。</p></header>`
     + `<div class="pm-order-market"><span>${sub}</span><strong>${title}</strong></div>`;
-  if (phase === "form") {
-    const fiveLabel = data.fiveQuantity
-      ? `5% 单 · ${escapeHtml(String(data.trialPrice ?? ""))} × ${escapeHtml(data.fiveQuantity)} 份`
-      : "5% 单 · 目标量 UNKNOWN（本行估算未出）";
-    const cases = lpOrderCaseLine("trial", mode, `试挂单 · ${escapeHtml(String(data.trialPrice ?? ""))} × ${escapeHtml(data.trialQuantity)} 份`, false)
-      + lpOrderCaseLine("five", mode, fiveLabel, !data.fiveQuantity)
-      + lpOrderCaseLine("custom", mode, "自定义份额下单（可改价改量，继承当前值）", false);
-    const locked = mode !== "custom";
-    const hint = mode === "trial" ? "计划口径，锁定" : mode === "five" ? "5% 目标量，锁定" : "自定义：可改";
-    const body = `<p class="sub">下单情形（单选 · 默认试挂单）</p><div style="margin-bottom:10px">${cases}</div>`
-      + `<div class="pm-check-list">`
-      + `<div class="pm-check"><span>挂单价 USDC</span><input class="lp-order-input" id="lp-order-price" type="number" step="0.01" min="0.01" max="0.99" value="${escapeHtml(String(data.price ?? ""))}"${locked ? " readonly" : ""}></div>`
-      + `<div class="pm-check"><span>数量（份）</span><span><input class="lp-order-input" id="lp-order-quantity" type="number" step="1" min="1" value="${escapeHtml(String(data.quantity ?? ""))}"${locked ? " readonly" : ""}> <span class="sub">${hint}</span></span></div>`
-      + `<div class="pm-check"><span>预计占用</span><strong id="lp-order-cost">${lpOrderCostText(data.price, data.quantity)}</strong></div>`
-      + `</div>`
-      + `<div class="pm-risk-note" role="note"><strong>提交即登记 #152 位置保护</strong><p>经系统入口提交的单自动带基线：初始 A = 前方份额 ÷ 同价位总量，A ≤ 50% 时自动撤掉该价位全部自己 BUY。网页手动单显示与行为不变。</p></div>`;
-    const footer = `<footer class="pm-modal-actions"><button class="pm-button" type="button" data-modal-action="cancel">取消</button>`
-      + `<button class="pm-button primary" type="button" data-modal-action="lp-order-preview">预检并预览 →</button></footer>`;
-    return `<section class="pm-modal" role="dialog" aria-modal="true" aria-labelledby="pm-dialog-title" tabindex="-1">${header}${body}${footer}</section>`;
-  }
-  const preview = data.preview && typeof data.preview === "object" ? data.preview : {};
-  const modeLabel = mode === "trial" ? "试挂口径" : mode === "five" ? "5% 目标量" : "自定义";
-  const echo = `<div class="pm-order-market"><span>买 ${escapeHtml(predictionValue(data.outcome, "UNKNOWN"))} @ ${escapeHtml(String(data.price ?? ""))} × ${escapeHtml(String(data.quantity ?? ""))} 份 · ${modeLabel} · 复核 次日 08:00</span><strong>${title}</strong></div>`;
-  const result = data.result && typeof data.result === "object" ? data.result : null;
-  const outcome = result ? lpSubmitOutcomeMarkup(result) : "";
-  // entry_rejected（交易所拒单）不走「重新预检」：被拒会话已按该幂等键落库，
-  // 同键重检只会返回同一结果——真实出路是关闭模态重新发起（新开模态换新键）。
-  const entryRejected = Boolean(result
-    && String(result.state || "").toLowerCase() === "entry_rejected");
-  const needsRepreview = Boolean(result
-    && LP_REPREVIEW_REASONS.has(String(result.reason || "")));
-  const confirmButton = result
-    ? (needsRepreview ? `<button class="pm-button primary" type="button" data-modal-action="lp-order-repreview">重新预检</button>` : "")
-    : `<button class="pm-button primary" type="button" data-modal-action="lp-order-confirm">确认提交 · 登记受保护</button>`;
-  // 「重新预检」字样不进入 entry_rejected 的 UI，避免指向该死路。
-  const preflightHint = entryRejected
-    ? ""
-    : `<p class="sub">预检 10 秒内有效；过期或买一变化时提交将被拒绝，需重新预检。</p>`;
-  const body = `${echo}<div class="pm-check-list">${lpOrderFactsMarkup(preview.preflight)}</div>`
-    + lpInitialAEstimateMarkup(preview.queue_protection_estimate, data.quantity)
-    + preflightHint
-    + outcome;
-  const footer = `<footer class="pm-modal-actions"><button class="pm-button" type="button" data-modal-action="cancel">取消</button>${confirmButton}</footer>`;
+  const fiveLabel = data.fiveQuantity
+    ? `5% 单 · ${escapeHtml(String(data.trialPrice ?? ""))} × ${escapeHtml(data.fiveQuantity)} 份`
+    : "5% 单 · 目标量 UNKNOWN（本行估算未出）";
+  const cases = lpOrderCaseLine("trial", mode, `试挂单 · ${escapeHtml(String(data.trialPrice ?? ""))} × ${escapeHtml(data.trialQuantity)} 份`, false)
+    + lpOrderCaseLine("five", mode, fiveLabel, !data.fiveQuantity)
+    + lpOrderCaseLine("custom", mode, "自定义份额下单（可改价改量，继承当前值）", false);
+  const locked = mode !== "custom";
+  const hint = mode === "trial" ? "计划口径，锁定" : mode === "five" ? "5% 目标量，锁定" : "自定义：可改";
+  const body = `<p class="sub">下单情形（单选 · 默认试挂单）</p><div style="margin-bottom:10px">${cases}</div>`
+    + `<div class="pm-check-list">`
+    + `<div class="pm-check"><span>挂单价 USDC</span><input class="lp-order-input" id="lp-order-price" type="number" step="0.01" min="0.01" max="0.99" value="${escapeHtml(String(data.price ?? ""))}"${locked ? " readonly" : ""}></div>`
+    + `<div class="pm-check"><span>数量（份）</span><span><input class="lp-order-input" id="lp-order-quantity" type="number" step="1" min="1" value="${escapeHtml(String(data.quantity ?? ""))}"${locked ? " readonly" : ""}> <span class="sub">${hint}</span></span></div>`
+    + `<div class="pm-check"><span>预计占用</span><strong id="lp-order-cost">${lpOrderCostText(data.price, data.quantity)}</strong></div>`
+    + `</div>`
+    + `<div class="lp-submit-note" role="note"><strong>提交时校验（一次新鲜事实）</strong>账户 · 余额/授权 · 标的身份 · 价位/数量 · 盘口新鲜度 · 奖励资格 · 退出深度 · 复核时间；默认试挂单确认价与提交时买一不一致将直接拒绝。</div>`
+    + `<div class="pm-risk-note" role="note"><strong>提交即登记 #152 位置保护</strong><p>经系统入口提交的单自动带基线：初始 A = 前方份额 ÷ 同价位总量，A ≤ 50% 时自动撤掉该价位全部自己 BUY。网页手动单显示与行为不变。</p></div>`;
+  const footer = `<footer class="pm-modal-actions"><button class="pm-button" type="button" data-modal-action="cancel">取消</button>`
+    + `<button class="pm-button primary" type="button" data-modal-action="lp-order-confirm">确认提交 · 登记受保护</button></footer>`;
   return `<section class="pm-modal" role="dialog" aria-modal="true" aria-labelledby="pm-dialog-title" tabindex="-1">${header}${body}${footer}</section>`;
 }
 
 function lpAugmentModalHtml(data = {}) {
+  // Issue 163 定案：加量同样单相化——删预检/复核相，确认即一次提交。
   const session = data.session && typeof data.session === "object" ? data.session : {};
   const sessionPrice = String(session.price ?? "");
   const mode = ["five", "custom"].includes(data.mode) ? data.mode : (data.fiveQuantity ? "five" : "custom");
-  const phase = data.phase === "review" ? "review" : "form";
   const title = escapeHtml(session.market_title || "标的未返回");
-  const header = `<header class="pm-modal-header"><h2 id="pm-dialog-title">加量 · 会话入场价锁定</h2><p>在现有会话保护伞内追加一张 post-only BUY；A 按合并口径计算，触发时该价位全部自己 BUY 一并撤。</p></header>`
+  const header = `<header class="pm-modal-header"><h2 id="pm-dialog-title">加量 · 会话入场价锁定</h2><p>一次确认即提交：在现有会话保护伞内追加一张 post-only BUY；A 按合并口径计算，触发时该价位全部自己 BUY 一并撤。</p></header>`
     + `<div class="pm-order-market"><span>Polymarket · 同所 · 会话 ${escapeHtml(lpShortSessionId(session.session_id))}</span><strong>${title}</strong></div>`;
   const existingText = `试挂单 ${escapeHtml(predictionValue(session.quantity, "UNKNOWN"))} 份 @ ${escapeHtml(String(session.price ?? ""))}（入场价，锁定）`;
-  if (phase === "form") {
-    const fiveLabel = data.fiveQuantity
-      ? `加 5% 单 · ${escapeHtml(sessionPrice)} × ${escapeHtml(data.fiveQuantity)} 份`
-      : "加 5% 单 · 目标量 UNKNOWN";
-    const caseLine = (value, label, disabled) => `<label class="radio-line${disabled ? " is-disabled" : ""}">`
-      + `<input type="radio" name="lp-augment-case" value="${value}"${mode === value ? " checked" : ""}${disabled ? " disabled" : ""}`
-      + ` data-modal-action="lp-augment-case" data-case-mode="${value}"> ${label}</label>`;
-    const cases = caseLine("five", fiveLabel, !data.fiveQuantity)
-      + caseLine("custom", `自定义数量 <input class="lp-order-input" id="lp-augment-quantity" type="number" step="1" min="1" value="${escapeHtml(String(data.quantity || ""))}"> 份 @ ${escapeHtml(sessionPrice)}`, false);
-    const body = `<div class="pm-check-list">`
-      + `<div class="pm-check"><span>现有委托</span><strong>${existingText}</strong></div>`
-      + `<div class="pm-check"><span>加量方式</span><span style="display:block">${cases}</span></div>`
-      + `</div>`
-      + `<div id="lp-augment-estimate">${lpAugmentEstimateMarkup(data, data.quantity)}</div>`;
-    const footer = `<footer class="pm-modal-actions"><button class="pm-button" type="button" data-modal-action="cancel">取消</button>`
-      + `<button class="pm-button primary" type="button" data-modal-action="lp-augment-preview">预检并预览 →</button></footer>`;
-    return `<section class="pm-modal" role="dialog" aria-modal="true" aria-labelledby="pm-dialog-title" tabindex="-1">${header}${body}${footer}</section>`;
-  }
-  const preview = data.preview && typeof data.preview === "object" ? data.preview : {};
-  const echo = `<div class="pm-order-market"><span>加量 · ${escapeHtml(sessionPrice)} × ${escapeHtml(String(data.quantity ?? ""))} 份 · 会话 ${escapeHtml(lpShortSessionId(session.session_id))}</span><strong>${title}</strong></div>`;
-  const estimate = preview.queue_protection_estimate && typeof preview.queue_protection_estimate === "object"
-    ? lpAugmentEstimateMarkup(
-      {front: preview.queue_protection_estimate.baseline_front, own: preview.queue_protection_estimate.own_remaining},
-      data.quantity,
-    )
-    : `<div id="lp-augment-estimate">${lpAugmentEstimateMarkup(data, data.quantity)}</div>`;
-  const result = data.result && typeof data.result === "object" ? data.result : null;
-  const outcome = result ? lpSubmitOutcomeMarkup(result) : "";
-  // 防御性对称：augment 现不产生 entry_rejected，但若返回同样不走「重新预检」
-  // （被拒会话已按幂等键落库，同键重检无出路），提示字样一并省去。
-  const entryRejected = Boolean(result
-    && String(result.state || "").toLowerCase() === "entry_rejected");
-  const needsRepreview = Boolean(result
-    && LP_REPREVIEW_REASONS.has(String(result.reason || "")));
-  const confirmButton = result
-    ? (needsRepreview ? `<button class="pm-button primary" type="button" data-modal-action="lp-augment-repreview">重新预检</button>` : "")
-    : `<button class="pm-button primary" type="button" data-modal-action="lp-augment-confirm">确认加量 · 并入保护伞</button>`;
-  const preflightHint = entryRejected
-    ? ""
-    : `<p class="sub">预检 10 秒内有效；过期或买一变化时提交将被拒绝，需重新预检。08:00 复核时入场单+加量单一并收尾。</p>`;
-  const body = `${echo}<div class="pm-check-list">${lpAugmentFactsMarkup(preview.preflight, session, existingText)}</div>`
-    + estimate
-    + preflightHint
-    + outcome;
-  const footer = `<footer class="pm-modal-actions"><button class="pm-button" type="button" data-modal-action="cancel">取消</button>${confirmButton}</footer>`;
+  const fiveLabel = data.fiveQuantity
+    ? `加 5% 单 · ${escapeHtml(sessionPrice)} × ${escapeHtml(data.fiveQuantity)} 份`
+    : "加 5% 单 · 目标量 UNKNOWN";
+  const caseLine = (value, label, disabled) => `<label class="radio-line${disabled ? " is-disabled" : ""}">`
+    + `<input type="radio" name="lp-augment-case" value="${value}"${mode === value ? " checked" : ""}${disabled ? " disabled" : ""}`
+    + ` data-modal-action="lp-augment-case" data-case-mode="${value}"> ${label}</label>`;
+  const cases = caseLine("five", fiveLabel, !data.fiveQuantity)
+    + caseLine("custom", `自定义数量 <input class="lp-order-input" id="lp-augment-quantity" type="number" step="1" min="1" value="${escapeHtml(String(data.quantity || ""))}"> 份 @ ${escapeHtml(sessionPrice)}`, false);
+  const body = `<div class="pm-check-list">`
+    + `<div class="pm-check"><span>现有委托</span><strong>${existingText}</strong></div>`
+    + `<div class="pm-check"><span>加量方式</span><span style="display:block">${cases}</span></div>`
+    + `</div>`
+    + `<div id="lp-augment-estimate">${lpAugmentEstimateMarkup(data, data.quantity)}</div>`
+    + `<p class="sub">服务端按提交时最新事实校验（会话仍活动、盘口新鲜）；成功后新单并入保护伞、复核截止沿用首单。</p>`;
+  const footer = `<footer class="pm-modal-actions"><button class="pm-button" type="button" data-modal-action="cancel">取消</button>`
+    + `<button class="pm-button primary" type="button" data-modal-action="lp-augment-confirm">确认提交</button></footer>`;
   return `<section class="pm-modal" role="dialog" aria-modal="true" aria-labelledby="pm-dialog-title" tabindex="-1">${header}${body}${footer}</section>`;
 }
 
@@ -6476,7 +6502,6 @@ function lpOrderIntent(row) {
   const quantity = String(predictionHasValue(selected.quantity) ? selected.quantity : "");
   return {
     row,
-    phase: "form",
     mode: "trial",
     trialPrice: price,
     trialQuantity: quantity,
@@ -6487,9 +6512,6 @@ function lpOrderIntent(row) {
     fiveQuantity: Number.isFinite(target) && target > 0 ? String(target) : "",
     outcome: String(selected.outcome || ""),
     reviewAtText: String(row?.review_at ?? ""),
-    idempotencyKey: predictionIdempotencyKey(),
-    preview: null,
-    result: null,
   };
 }
 
@@ -6533,10 +6555,6 @@ function lpAugmentIntent(orders, session) {
     fiveQuantity,
     mode: fiveQuantity ? "five" : "custom",
     quantity: fiveQuantity || "",
-    phase: "form",
-    preview: null,
-    result: null,
-    idempotencyKey: predictionIdempotencyKey(),
   };
 }
 
@@ -6544,11 +6562,6 @@ function renderPredictionModal() {
   const root = elements["prediction-market-modal-root"];
   root.innerHTML = predictionModalHtml(predictionModal.kind, predictionModal.data);
   root.querySelector(".pm-modal")?.focus();
-}
-
-function lpModalRenderIdle() {
-  renderPredictionModal();
-  predictionModal.busy = false;
 }
 
 function lpOrderSwitchCase(mode) {
@@ -7272,141 +7285,108 @@ async function handlePredictionModalClick(event) {
   // Issue 162（定案 6）：动作-kind 匹配守卫——映射内动作必须命中当前 kind，
   // 未登记动作视为不匹配；一律 return，不发请求、不进 busy。
   if (PREDICTION_MODAL_ACTION_KINDS[action] !== predictionModal.kind) return;
-  setPredictionModalBusy(true);
-  try {
-    if (action === "lp-order-preview" || action === "lp-order-repreview") {
-      const data = predictionModal.data;
-      const root = elements["prediction-market-modal-root"];
+  // Issue 163 定案 6/7：幂等键在确认点击时铸造；一次最终确认 = 立即关窗 +
+  // 「正在提交」toast + 10 秒共享锁 + 恰一次 POST。回执无论多迟都按键归属
+  // 自己那条 toast，与弹窗世代无关；HTTP 200 不等于成功——一律按 body.state 分支。
+  if (action === "lp-order-confirm" || action === "lp-augment-confirm") {
+    const augment = action === "lp-augment-confirm";
+    const data = predictionModal.data;
+    const root = elements["prediction-market-modal-root"];
+    if (augment) {
+      const qtyInput = root.querySelector("#lp-augment-quantity");
+      if (qtyInput) data.quantity = qtyInput.value;
+    } else {
       const priceInput = root.querySelector("#lp-order-price");
       const qtyInput = root.querySelector("#lp-order-quantity");
       if (priceInput) data.price = priceInput.value;
       if (qtyInput) data.quantity = qtyInput.value;
+    }
+    // 定案 2：本地格式校验不过 → 不发请求、不锁 10 秒，只弹「格式异常」toast。
+    const priceText = String(data.price ?? "").trim();
+    const quantityText = String(data.quantity ?? "").trim();
+    const priceNumber = Number(priceText);
+    const quantityNumber = Number(quantityText);
+    const formatBad = augment
+      ? !quantityText || !Number.isFinite(quantityNumber) || quantityNumber <= 0
+      : !priceText || !quantityText
+        || !Number.isFinite(priceNumber) || !Number.isFinite(quantityNumber);
+    if (formatBad) {
+      lpSubmitToastPush({
+        id: predictionIdempotencyKey(),
+        kind: "danger",
+        main: "格式异常：价格或数量不是有效数字，未提交",
+        sub: "请修正后重新确认；本次未发出请求、未锁定入口",
+      });
+      renderPredictionMarket();
+      return;
+    }
+    const key = predictionIdempotencyKey();
+    let path;
+    let body;
+    let submittingMain;
+    if (augment) {
+      path = "/api/prediction-arbitrage/lp/augment";
+      body = {
+        session_id: String(data.session?.session_id || ""),
+        quantity: quantityText,
+        idempotency_key: key,
+      };
+      submittingMain = `正在提交 · 加量 ${quantityText} 份 @ ${String(data.session?.price ?? "")}`;
+    } else {
       const row = data.row && typeof data.row === "object" ? data.row : {};
-      const body = {
+      path = "/api/prediction-arbitrage/lp/orders";
+      body = {
         market_id: String(row.market_id || ""),
         condition_id: String(row.condition_id || ""),
         token_id: String(row.token_id || ""),
         outcome: String(data.outcome || ""),
-        price: String(data.price ?? ""),
-        quantity: String(data.quantity ?? ""),
+        price: priceText,
+        quantity: quantityText,
         review_at: String(data.reviewAtText ?? ""),
+        idempotency_key: key,
       };
-      // Issue 158: informational-only 加 5% default target from the candidate
-      // row; carried verbatim in all three modes when the row has a value so
-      // the session stores it for the augment modal.  Never validated and
-      // never used for order sizing on the server.
+      // informational-only 加 5% 默认量原样透传（同 #158 预检体约定）。
       const rowTarget = row.estimated_target_quantity;
       if (rowTarget !== null && rowTarget !== undefined && String(rowTarget).trim() !== "") {
         body.estimated_target_quantity = String(rowTarget);
       }
-      // 定案 5: only trial mode carries the candidate policy; 5%/custom
-      // plans would trip candidate_changed forever.
+      // 定案 1：只有默认试挂单带 candidate_policy（5%/custom 不锚定买一）。
       if (data.mode === "trial") body.candidate_policy = "best_bid_minimum";
-      const preview = await predictionPost("/api/prediction-arbitrage/lp/preview", body);
-      if (staleResponse()) return;
-      if (preview && preview.state === "previewed" && String(preview.preview_id || "").trim()) {
-        data.preview = preview;
-        data.phase = "review";
-        data.result = null;
-      } else {
-        data.result = preview && typeof preview === "object" ? preview : {state: "rejected", reason: "preview_unavailable"};
-      }
-      lpModalRenderIdle();
-      return;
+      submittingMain = `正在提交 · 买 ${body.outcome} @ ${priceText} × ${quantityText} 份`;
     }
-    if (action === "lp-order-confirm") {
-      const data = predictionModal.data;
-      const previewId = String(data.preview?.preview_id || "");
-      if (!previewId) throw new Error("预检已失效，请重新预检。");
-      // T6: the confirm body is exactly {preview_id, idempotency_key}; the
-      // idempotency key was minted once when the modal opened, so double
-      // clicks and network-error retries reuse it.
-      const result = await predictionPost("/api/prediction-arbitrage/lp/sessions", {
-        preview_id: previewId,
-        idempotency_key: data.idempotencyKey,
+    closePredictionModal();
+    lpSubmitToastPush({
+      id: key,
+      kind: "submitting",
+      main: submittingMain,
+      sub: "服务端按提交时最新事实校验，通过即挂 post-only · 入口锁定 10 秒",
+    });
+    lpSubmitStartCooldown(key);
+    renderPredictionMarket();
+    try {
+      const result = await predictionPost(path, body);
+      const registered = lpSubmitToastResult(key, result, augment ? "augment" : "entry");
+      if (registered) {
+        const sessionShort = lpShortSessionId(result?.session_id);
+        state.predictionMarket.lpCancelSummary = augment
+          ? `已加量 · ${quantityText} 份 @ ${String(data.session?.price ?? "")} · 并入会话 ${sessionShort} 保护伞`
+          : `已登记 · 会话 ${sessionShort} · 位置保护已生效`;
+        await fetchPredictionLpDashboard();
+      }
+      renderPredictionMarket();
+    } catch (error) {
+      // 网络异常 = 结果未知：按键更新自己的 toast，绝不宣称 失败/成功。
+      lpSubmitToastUpdate(key, {
+        kind: "unknown",
+        main: "结果未知：网络错误，是否已提交未知",
+        sub: "系统不会自动重试 · 请以看板与会话状态为准",
       });
-      // 评审修复（定案 10/11）：显式失败态或未携带会话（session_id）的响应一律
-      // 不按成功收尾——模态内如实呈现，不关模态、不写成功摘要。
-      const resultState = String(result?.state || "").toLowerCase();
-      const hasSession = Boolean(String(result?.session_id || "").trim());
-      if (staleResponse()) {
-        // Issue 162（定案 3 例外）：迟到的确认成功——订单确已落库，仍要写
-        // 摘要并重拉看板报信；但当前弹窗可能已属于别的会话，绝不渲染、
-        // 不关窗、不改 busy。
-        if (hasSession && !LP_CONFIRM_FAILURE_STATES.has(resultState)) {
-          state.predictionMarket.lpCancelSummary =
-            `已登记 · 会话 ${lpShortSessionId(result?.session_id)} · 位置保护已生效`;
-          await fetchPredictionLpDashboard();
-        }
-        return;
-      }
-      if (LP_CONFIRM_FAILURE_STATES.has(resultState) || !hasSession) {
-        data.result = result && typeof result === "object" ? result : {state: "rejected", reason: "submit_failed"};
-        lpModalRenderIdle();
-        return;
-      }
-      closePredictionModal();
-      state.predictionMarket.lpCancelSummary =
-        `已登记 · 会话 ${lpShortSessionId(result?.session_id)} · 位置保护已生效`;
-      await fetchPredictionLpDashboard();
       renderPredictionMarket();
-      return;
     }
-    if (action === "lp-augment-preview" || action === "lp-augment-repreview") {
-      const data = predictionModal.data;
-      const root = elements["prediction-market-modal-root"];
-      const qtyInput = root.querySelector("#lp-augment-quantity");
-      if (qtyInput) data.quantity = qtyInput.value;
-      const body = {
-        session_id: String(data.session?.session_id || ""),
-        quantity: String(data.quantity ?? ""),
-      };
-      const preview = await predictionPost("/api/prediction-arbitrage/lp/augment/preview", body);
-      if (staleResponse()) return;
-      if (preview && preview.state === "previewed" && String(preview.preview_id || "").trim()) {
-        data.preview = preview;
-        data.phase = "review";
-        data.result = null;
-      } else {
-        data.result = preview && typeof preview === "object" ? preview : {state: "rejected", reason: "preview_unavailable"};
-      }
-      lpModalRenderIdle();
-      return;
-    }
-    if (action === "lp-augment-confirm") {
-      const data = predictionModal.data;
-      const previewId = String(data.preview?.preview_id || "");
-      if (!previewId) throw new Error("预检已失效，请重新预检。");
-      const result = await predictionPost(
-        `/api/prediction-arbitrage/lp/sessions/${encodeURIComponent(String(data.session?.session_id || ""))}/augment`,
-        {preview_id: previewId, idempotency_key: data.idempotencyKey},
-      );
-      // 评审修复（定案 10/11）：与 lp_order 同一判定——显式失败态（含防御性的
-      // entry_rejected）或未携带会话（session_id）的响应一律不按成功收尾。
-      const resultState = String(result?.state || "").toLowerCase();
-      const hasSession = Boolean(String(result?.session_id || "").trim());
-      if (staleResponse()) {
-        // Issue 162（定案 3 例外）：与 lp-order-confirm 同一迟到成功报信语义，
-        // 摘要用加量文案（读点击时捕获的 data，绝不写回当前弹窗）。
-        if (hasSession && !LP_CONFIRM_FAILURE_STATES.has(resultState)) {
-          state.predictionMarket.lpCancelSummary =
-            `已加量 · ${String(data.quantity ?? "")} 份 @ ${String(data.session?.price ?? "")} · 并入会话 ${lpShortSessionId(data.session?.session_id)} 保护伞`;
-          await fetchPredictionLpDashboard();
-        }
-        return;
-      }
-      if (LP_CONFIRM_FAILURE_STATES.has(resultState) || !hasSession) {
-        data.result = result && typeof result === "object" ? result : {state: "rejected", reason: "submit_failed"};
-        lpModalRenderIdle();
-        return;
-      }
-      closePredictionModal();
-      state.predictionMarket.lpCancelSummary =
-        `已加量 · ${String(data.quantity ?? "")} 份 @ ${String(data.session?.price ?? "")} · 并入会话 ${lpShortSessionId(data.session?.session_id)} 保护伞`;
-      await fetchPredictionLpDashboard();
-      renderPredictionMarket();
-      return;
-    }
+    return;
+  }
+  setPredictionModalBusy(true);
+  try {
     if (action === "arm-cleanup") {
       predictionModal.data = {...(predictionModal.data || {}), armed: true};
       elements["prediction-market-modal-root"].innerHTML = predictionModalHtml("allowance_cleanup", predictionModal.data);

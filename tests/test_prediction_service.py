@@ -14294,3 +14294,384 @@ def test_lp_first_seen_protection_end_to_end(
     assert episode["state"] == "canceled"
     assert len(notes) == 1
     assert "首见基线" in notes[0][0]
+
+
+# ---- Issue 163: LP 单次确认提交路由（/lp/orders、/lp/augment） ----
+
+
+def _lp163_route_fixture(tmp_path: Path, now: datetime):
+    """Production-mode runtime wired to a counting LP exchange (issue 163)."""
+
+    condition_id = "0x" + "c" * 64
+    token_id = "0x" + "1" * 64
+
+    class Exchange:
+        def __init__(self) -> None:
+            self.posts: list[dict[str, object]] = []
+            self.snapshot_calls = 0
+            self.best_bid = Decimal("0.29")
+            self.snapshot = {
+                "account": {
+                    "authenticated": True,
+                    "balance": Decimal("1000"),
+                    "allowance": Decimal("1000"),
+                    "positions": [],
+                    "open_orders": [],
+                },
+                "market": {
+                    "market_id": "market-1",
+                    "condition_id": condition_id,
+                    "token_id": token_id,
+                    "outcome": "YES",
+                    "accepting_orders": True,
+                    "exchange_type": "CLOB",
+                    "tick_size": Decimal("0.01"),
+                    "minimum_order_size": Decimal("1"),
+                    "fee": Decimal("0"),
+                    "fees_enabled": False,
+                    "reward_min_size": Decimal("1"),
+                    "reward_max_spread": Decimal("0.10"),
+                },
+                "book": {
+                    "timestamp": now,
+                    "received_at": now,
+                    "asks": [{"price": Decimal("0.31"), "size": Decimal("100")}],
+                    "bids": [{"price": self.best_bid, "size": Decimal("100")}],
+                },
+                "trades": [],
+                "orders": [],
+                "orders_terminal": True,
+            }
+
+        def lp_snapshot(self, _request: Mapping[str, object]) -> dict[str, object]:
+            self.snapshot_calls += 1
+            return self.snapshot
+
+        def create_limit_order(self, **kwargs: object) -> dict[str, object]:
+            return dict(kwargs)
+
+        def post_order(self, signed: dict[str, object]) -> dict[str, object]:
+            self.posts.append(dict(signed))
+            return {
+                **signed,
+                "order_id": f"lp-order-{len(self.posts)}",
+                "status": "LIVE",
+            }
+
+        def cancel_order(self, order_id: str) -> dict[str, object]:
+            return {"status": "CANCELED", "order_id": order_id}
+
+    exchange = Exchange()
+    store = PredictionArbitrageStore(tmp_path)
+    lp = PolymarketLPService(store, exchange, clock=lambda: now)
+    execution = PredictionExecutionService(
+        store=store,
+        monitor=_Monitor(),
+        trading=exchange,
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "prediction_arbitrage" / "execution.lock",
+        lp=lp,
+    )
+    execution._breaker_open = False
+    runtime = SimpleNamespace(
+        mode="production",
+        state="RUNNING",
+        production_owner=True,
+        store=store,
+        monitor=_Monitor(),
+        execution=execution,
+        cross_venue_monitor=None,
+    )
+
+    def orders_body(**overrides: object) -> dict[str, object]:
+        body = {
+            "market_id": "market-1",
+            "condition_id": condition_id,
+            "token_id": token_id,
+            "outcome": "YES",
+            "price": "0.29",
+            "quantity": "20",
+            "review_at": (now + timedelta(minutes=10)).isoformat(),
+            "idempotency_key": "lp163-h",
+            "candidate_policy": "best_bid_minimum",
+            "estimated_target_quantity": "21",
+        }
+        body.update(overrides)
+        return body
+
+    return runtime, execution, exchange, store, lp, orders_body
+
+
+def test_lp163_orders_route_auth_precedes(tmp_path: Path) -> None:
+    """H1: 无 cookie/CSRF → 403，先于 body 解析（坏 schema 的 body 也不得触发 400）。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    runtime, _execution, exchange, _store, _lp, orders_body = _lp163_route_fixture(
+        tmp_path, now
+    )
+    with _server(
+        runtime,
+        session_token="session-token",
+        csrf_token="csrf-token",
+        runtime_metadata={"git_sha": "abc123"},
+    ) as base:
+        status, payload = _response(
+            Request(
+                base + "/api/prediction-arbitrage/lp/orders",
+                data=json.dumps({"price": "not-even-a-schema-hit"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+        )
+    assert status == 403
+    assert exchange.posts == []
+    assert exchange.snapshot_calls == 0
+
+
+def test_lp163_orders_route_schema_strict(tmp_path: Path) -> None:
+    """H2: 严格 schema——缺 idempotency_key/多键/价格非十进制各自 400，零挂单。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    runtime, _execution, exchange, _store, _lp, orders_body = _lp163_route_fixture(
+        tmp_path, now
+    )
+    with _server(
+        runtime,
+        session_token="session-token",
+        csrf_token="csrf-token",
+        runtime_metadata={"git_sha": "abc123"},
+    ) as base:
+        missing = dict(orders_body())
+        missing.pop("idempotency_key")
+        missing_status, _missing_payload = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/orders",
+                data=json.dumps(missing).encode("utf-8"),
+            )
+        )
+        extra_status, _extra_payload = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/orders",
+                data=json.dumps({**orders_body(), "preview_id": "pv-x"}).encode(
+                    "utf-8"
+                ),
+            )
+        )
+        bad_price_status, _bad_price_payload = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/orders",
+                data=json.dumps(orders_body(price="abc")).encode("utf-8"),
+            )
+        )
+    assert missing_status == 400
+    assert extra_status == 400
+    assert bad_price_status == 400
+    assert exchange.posts == []
+    assert exchange.snapshot_calls == 0
+
+
+def test_lp163_orders_route_semantic_states_http_200(tmp_path: Path) -> None:
+    """H3: 熔断→locked、活动会话→busy、买一漂移→rejected/best_bid_changed，全部 HTTP 200。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    runtime, execution, exchange, _store, _lp, orders_body = _lp163_route_fixture(
+        tmp_path, now
+    )
+    with _server(
+        runtime,
+        session_token="session-token",
+        csrf_token="csrf-token",
+        runtime_metadata={"git_sha": "abc123"},
+    ) as base:
+        execution._breaker_open = True
+        locked_status, locked = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/orders",
+                data=json.dumps(orders_body(idempotency_key="lp163-h3-locked")).encode(
+                    "utf-8"
+                ),
+            )
+        )
+        assert locked_status == 200
+        assert locked == {"state": "locked", "reason": "circuit_breaker_open"}
+        assert exchange.posts == []
+        assert exchange.snapshot_calls == 0
+
+        execution._breaker_open = False
+        exchange.best_bid = Decimal("0.30")
+        exchange.snapshot["book"]["bids"] = [
+            {"price": Decimal("0.30"), "size": Decimal("100")}
+        ]
+        drifted_status, drifted = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/orders",
+                data=json.dumps(orders_body(idempotency_key="lp163-h3-drift")).encode(
+                    "utf-8"
+                ),
+            )
+        )
+        assert drifted_status == 200
+        assert drifted == {"state": "rejected", "reason": "best_bid_changed"}
+        assert exchange.posts == []
+        assert exchange.snapshot_calls == 1
+
+        exchange.best_bid = Decimal("0.29")
+        exchange.snapshot["book"]["bids"] = [
+            {"price": Decimal("0.29"), "size": Decimal("100")}
+        ]
+        ok_status, ok = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/orders",
+                data=json.dumps(orders_body(idempotency_key="lp163-h3-ok")).encode(
+                    "utf-8"
+                ),
+            )
+        )
+        assert ok_status == 200
+        assert ok["state"] == "entry_open"
+
+        busy_status, busy = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/orders",
+                data=json.dumps(orders_body(idempotency_key="lp163-h3-busy")).encode(
+                    "utf-8"
+                ),
+            )
+        )
+        assert busy_status == 200
+        assert busy["state"] == "busy"
+        assert busy["reason"] == "active_lp_session"
+        assert len(exchange.posts) == 1
+
+
+def test_lp163_orders_route_happy_path(tmp_path: Path) -> None:
+    """H4: 全鉴权一次提交 → 200、entry_open、session_id 与 order id 齐备。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    runtime, _execution, exchange, store, _lp, orders_body = _lp163_route_fixture(
+        tmp_path, now
+    )
+    with _server(
+        runtime,
+        session_token="session-token",
+        csrf_token="csrf-token",
+        runtime_metadata={"git_sha": "abc123"},
+    ) as base:
+        status, payload = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/orders",
+                data=json.dumps(orders_body(idempotency_key="lp163-h4")).encode(
+                    "utf-8"
+                ),
+            )
+        )
+    assert status == 200
+    assert payload["state"] == "entry_open"
+    assert str(payload["session_id"]).strip()
+    assert str(payload["entry_order_id"]).strip()
+    assert len(exchange.posts) == 1
+    posted = exchange.posts[0]
+    assert posted["post_only"] is True
+    stored = store.lp_session_by_idempotency("lp163-h4")
+    assert stored is not None
+    assert Decimal(str(stored["estimated_target_quantity"])) == Decimal("21")
+
+
+def test_lp163_augment_route_contract(tmp_path: Path) -> None:
+    """H5: /lp/augment——缺字段 400、成功 200+augment_order_id、受阻组 200+真实原因、鉴权先行。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    runtime, _execution, exchange, store, lp, orders_body = _lp163_route_fixture(
+        tmp_path, now
+    )
+    with _server(
+        runtime,
+        session_token="session-token",
+        csrf_token="csrf-token",
+        runtime_metadata={"git_sha": "abc123"},
+    ) as base:
+        start_status, started = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/orders",
+                data=json.dumps(orders_body(idempotency_key="lp163-h5-entry")).encode(
+                    "utf-8"
+                ),
+            )
+        )
+        assert start_status == 200
+        assert started["state"] == "entry_open"
+        session_id = str(started["session_id"])
+
+        unauth_status, _unauth = _response(
+            Request(
+                base + "/api/prediction-arbitrage/lp/augment",
+                data=json.dumps(
+                    {"session_id": session_id, "quantity": "20", "idempotency_key": "x"}
+                ).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+        )
+        assert unauth_status == 403
+
+        missing_status, _missing = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/augment",
+                data=json.dumps({"session_id": session_id, "quantity": "20"}).encode(
+                    "utf-8"
+                ),
+            )
+        )
+        assert missing_status == 400
+
+        exchange.snapshot["account"]["open_orders"] = [
+            {
+                "order_id": str(started["entry_order_id"]),
+                "token_id": "0x" + "1" * 64,
+                "side": "BUY",
+                "status": "LIVE",
+                "price": Decimal("0.29"),
+                "original_size": Decimal("20"),
+                "size_matched": Decimal("0"),
+            }
+        ]
+        aug_status, augmented = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/augment",
+                data=json.dumps(
+                    {
+                        "session_id": session_id,
+                        "quantity": "20",
+                        "idempotency_key": "lp163-h5-aug",
+                    }
+                ).encode("utf-8"),
+            )
+        )
+        assert aug_status == 200
+        assert augmented["state"] == "entry_open"
+        assert str(augmented["augment_order_id"]) == "lp-order-2"
+        assert len(exchange.posts) == 2
+
+        store.lp_update_session(session_id, state="complete")
+        blocked_status, blocked = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/augment",
+                data=json.dumps(
+                    {
+                        "session_id": session_id,
+                        "quantity": "20",
+                        "idempotency_key": "lp163-h5-blocked",
+                    }
+                ).encode("utf-8"),
+            )
+        )
+        assert blocked_status == 200
+        assert blocked == {"state": "rejected", "reason": "session_not_active"}
+        assert len(exchange.posts) == 2

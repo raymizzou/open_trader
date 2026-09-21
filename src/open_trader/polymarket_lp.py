@@ -6813,140 +6813,254 @@ class PolymarketLPService:
                 self.store.consume_lp_preview(preview_id)
             except ValueError as exc:
                 return {"state": "rejected", "reason": str(exc)}
-            price = cast(Decimal, request["price"])
-            quantity = cast(Decimal, request["quantity"])
-            action_base: dict[str, object] = {
-                "role": "augment",
-                "side": "BUY",
-                "token_id": str(request["token_id"]),
-                "idempotency_key": key,
-                "price": price,
-                "quantity": quantity,
-                "expiration": expiration,
-                "submit_requested_at": _iso(now),
-            }
-            intent_key = self._action_key(session_id_str, f"augment-submit:{key}")
-            self.store.lp_upsert_action(
-                session_id_str,
-                intent_key,
-                state="pending",
-                payload={**action_base},
+            return self._augment_execute(
+                session=session,
+                session_id=session_id_str,
+                request=request,
+                snapshot=snapshot,
+                now=now,
+                key=key,
+                expiration=expiration,
             )
-            try:
-                signed = self._create_limit(
-                    token_id=str(request["token_id"]),
-                    price=price,
-                    quantity=quantity,
-                    side="BUY",
-                    post_only=True,
-                    expiration=expiration,
-                )
-                response = self._post_limit(signed)
-            except Exception as exc:
-                self.store.lp_upsert_action(
-                    session_id_str,
-                    intent_key,
-                    state="unknown",
-                    payload={**action_base, "error": type(exc).__name__},
-                )
-                return {
-                    "state": "needs_attention",
-                    "session_id": session_id_str,
-                    "reason": "augment_submit_unknown",
-                    "error": type(exc).__name__,
-                }
-            accepted, order_id = self._order_response(response)
-            if not accepted:
-                self.store.lp_upsert_action(
-                    session_id_str,
-                    intent_key,
-                    state="rejected",
-                    payload={
-                        **action_base,
-                        "order_id": order_id or "",
-                        "error": "augment_submit_rejected",
-                    },
-                )
-                return {
-                    "state": "rejected",
-                    "reason": "augment_submit_rejected",
-                    "session_id": session_id_str,
-                    "order_id": order_id or "",
-                }
-            if not order_id:
-                self.store.lp_upsert_action(
-                    session_id_str,
-                    intent_key,
-                    state="unknown",
-                    payload={**action_base, "error": "accepted_without_order_id"},
-                )
-                return {
-                    "state": "needs_attention",
-                    "session_id": session_id_str,
-                    "reason": "augment_submit_unknown",
-                }
+
+    def _augment_execute(
+        self,
+        *,
+        session: Mapping[str, object],
+        session_id: str,
+        request: Mapping[str, object],
+        snapshot: Mapping[str, object],
+        now: datetime,
+        key: str,
+        expiration: int,
+    ) -> dict[str, object]:
+        """Record the augment intent and submit exactly one more BUY.
+
+        Shared tail of the two-phase ``augment`` (issue 158) and the
+        single-shot ``submit_augment`` (issue 163): the caller has already
+        validated fresh facts against the session's own resting orders;
+        this helper owns the action rows, the exchange post, the appended
+        order history, and the #152 baseline re-anchor.
+        """
+
+        price = cast(Decimal, request["price"])
+        quantity = cast(Decimal, request["quantity"])
+        action_base: dict[str, object] = {
+            "role": "augment",
+            "side": "BUY",
+            "token_id": str(request["token_id"]),
+            "idempotency_key": key,
+            "price": price,
+            "quantity": quantity,
+            "expiration": expiration,
+            "submit_requested_at": _iso(now),
+        }
+        intent_key = self._action_key(session_id, f"augment-submit:{key}")
+        self.store.lp_upsert_action(
+            session_id,
+            intent_key,
+            state="pending",
+            payload={**action_base},
+        )
+        try:
+            signed = self._create_limit(
+                token_id=str(request["token_id"]),
+                price=price,
+                quantity=quantity,
+                side="BUY",
+                post_only=True,
+                expiration=expiration,
+            )
+            response = self._post_limit(signed)
+        except Exception as exc:
             self.store.lp_upsert_action(
-                session_id_str,
-                self._action_key(session_id_str, f"augment-submit:{order_id}"),
-                state="accepted",
+                session_id,
+                intent_key,
+                state="unknown",
+                payload={**action_base, "error": type(exc).__name__},
+            )
+            return {
+                "state": "needs_attention",
+                "session_id": session_id,
+                "reason": "augment_submit_unknown",
+                "error": type(exc).__name__,
+            }
+        accepted, order_id = self._order_response(response)
+        if not accepted:
+            self.store.lp_upsert_action(
+                session_id,
+                intent_key,
+                state="rejected",
                 payload={
                     **action_base,
-                    "order_id": order_id,
-                    "submit_receipt_at": _iso(self._now()),
+                    "order_id": order_id or "",
+                    "error": "augment_submit_rejected",
                 },
             )
-            self.store.lp_upsert_action(
-                session_id_str,
-                intent_key,
-                state="accepted",
-                payload={**action_base, "order_id": order_id},
-            )
-            augment_ids = [
-                str(value) for value in _items(session.get("augment_order_ids"))
-            ]
-            if order_id not in augment_ids:
-                augment_ids.append(order_id)
-            order_history = self._order_history(session)
-            order_history[order_id] = {
-                "order_id": order_id,
-                "token_id": str(request["token_id"]),
-                "side": "BUY",
-                "status": str(_field(response, "status", "LIVE")).upper() or "LIVE",
-                "price": price,
-                "quantity": quantity,
-                "expiration": expiration,
-                "role": "augment",
+            return {
+                "state": "rejected",
+                "reason": "augment_submit_rejected",
+                "session_id": session_id,
+                "order_id": order_id or "",
             }
-            # Issue 158: the augment joins the session's protection umbrella,
-            # so the registered baseline re-anchors to the merged front
-            # (same-price level minus own remaining BUY size) observed at
-            # this validated snapshot.  States, threshold, and cancel
-            # behavior of the #152 episode are untouched.
-            protection = dict(session.get("queue_protection") or {})
-            merged_estimate = self._augment_merge_estimate(request, snapshot)
-            merged_front = merged_estimate.get("baseline_front")
-            if isinstance(merged_front, Decimal):
-                protection["baseline_front"] = merged_front
-                book = snapshot.get("book")
-                if isinstance(book, Mapping):
-                    protection["baseline_book_received_at"] = book.get(
-                        "received_at"
-                    )
-                    protection["baseline_source_timestamp"] = book.get(
-                        "source_timestamp"
-                    )
-                    protection["baseline_book_hash"] = book.get("hash")
-            updated = self.store.lp_update_session(
-                session_id_str,
-                patch={
-                    "augment_order_ids": augment_ids,
-                    "augment_order_id": order_id,
-                    "augment_quantity": quantity,
-                    "order_history": order_history,
-                    "queue_protection": protection,
-                },
+        if not order_id:
+            self.store.lp_upsert_action(
+                session_id,
+                intent_key,
+                state="unknown",
+                payload={**action_base, "error": "accepted_without_order_id"},
             )
-            return self._status_payload(updated)
+            return {
+                "state": "needs_attention",
+                "session_id": session_id,
+                "reason": "augment_submit_unknown",
+            }
+        self.store.lp_upsert_action(
+            session_id,
+            self._action_key(session_id, f"augment-submit:{order_id}"),
+            state="accepted",
+            payload={
+                **action_base,
+                "order_id": order_id,
+                "submit_receipt_at": _iso(self._now()),
+            },
+        )
+        self.store.lp_upsert_action(
+            session_id,
+            intent_key,
+            state="accepted",
+            payload={**action_base, "order_id": order_id},
+        )
+        augment_ids = [
+            str(value) for value in _items(session.get("augment_order_ids"))
+        ]
+        if order_id not in augment_ids:
+            augment_ids.append(order_id)
+        order_history = self._order_history(session)
+        order_history[order_id] = {
+            "order_id": order_id,
+            "token_id": str(request["token_id"]),
+            "side": "BUY",
+            "status": str(_field(response, "status", "LIVE")).upper() or "LIVE",
+            "price": price,
+            "quantity": quantity,
+            "expiration": expiration,
+            "role": "augment",
+        }
+        # Issue 158: the augment joins the session's protection umbrella,
+        # so the registered baseline re-anchors to the merged front
+        # (same-price level minus own remaining BUY size) observed at
+        # this validated snapshot.  States, threshold, and cancel
+        # behavior of the #152 episode are untouched.
+        protection = dict(session.get("queue_protection") or {})
+        merged_estimate = self._augment_merge_estimate(request, snapshot)
+        merged_front = merged_estimate.get("baseline_front")
+        if isinstance(merged_front, Decimal):
+            protection["baseline_front"] = merged_front
+            book = snapshot.get("book")
+            if isinstance(book, Mapping):
+                protection["baseline_book_received_at"] = book.get(
+                    "received_at"
+                )
+                protection["baseline_source_timestamp"] = book.get(
+                    "source_timestamp"
+                )
+                protection["baseline_book_hash"] = book.get("hash")
+        updated = self.store.lp_update_session(
+            session_id,
+            patch={
+                "augment_order_ids": augment_ids,
+                "augment_order_id": order_id,
+                "augment_quantity": quantity,
+                "order_history": order_history,
+                "queue_protection": protection,
+            },
+        )
+        return self._status_payload(updated)
+
+    def submit_augment(
+        self,
+        session_id: str,
+        quantity: str,
+        idempotency_key: str | None = None,
+    ) -> dict[str, object]:
+        """Issue 163: single-shot augment bound to one named session.
+
+        The target session is explicit — the request can never land on
+        "whatever session is currently active".  Replays resolve from the
+        recorded action row before any fresh-facts read; the one snapshot
+        read tolerates only this session's own resting orders, and the
+        review deadline stays the session's original one (no re-timer).
+        """
+
+        key = (idempotency_key or "").strip()
+        if not key:
+            return {"state": "rejected", "reason": "idempotency_key_required"}
+        with self._mutex:
+            session, rejection = self._augment_session(str(session_id))
+            if session is None:
+                return {"state": "rejected", "reason": rejection or "session_not_active"}
+            session_id_str = str(session["session_id"])
+            # Issue 163 定案 8: a session that is exiting, stopping out,
+            # waiting for manual review, or already finished cannot take a
+            # new order; the rejection names the real state.
+            state_block = {
+                "review": "session_review_exit",
+                "stop_loss_exit": "session_stop_loss_exit",
+                "needs_attention": "session_needs_attention",
+            }.get(str(session.get("state")))
+            if state_block is not None:
+                return {"state": "rejected", "reason": state_block}
+            recorded = self._augment_recorded_result(session_id_str, key)
+            if recorded is not None:
+                return recorded
+            if not self._mutation_allowed("submit"):
+                return {"state": "locked", "reason": "mutation_blocked"}
+            quantity_d = _maybe_decimal(quantity)
+            if quantity_d is None or quantity_d <= 0:
+                return {"state": "rejected", "reason": "quantity_invalid"}
+            price = _maybe_decimal(session.get("price"))
+            if price is None or price <= 0:
+                return {"state": "rejected", "reason": "entry_price_unknown"}
+            identity: dict[str, object] = {}
+            for identity_key in ("market_id", "condition_id", "token_id"):
+                value = _text(session.get(identity_key))
+                if value is None:
+                    return {"state": "rejected", "reason": f"{identity_key}_invalid"}
+                identity[identity_key] = value
+            outcome = _text(session.get("outcome"))
+            if outcome is None or outcome.upper() not in {"YES", "NO"}:
+                return {"state": "rejected", "reason": "outcome_invalid"}
+            identity["outcome"] = outcome.upper()
+            if session.get("review_at") is None:
+                return {"state": "rejected", "reason": "review_at_unknown"}
+            try:
+                now = self._now()
+                request = self._normalize_request(
+                    {**identity, "price": price, "quantity": quantity_d,
+                     "review_at": session.get("review_at")}
+                )
+                snapshot = self._read_snapshot(request)
+                facts = self._validate_snapshot(
+                    request,
+                    snapshot,
+                    now=now,
+                    allowed_open_order_ids=self._session_augment_own_order_ids(session),
+                )
+                expiration = expiration_for_review(
+                    _timestamp(request["review_at"], name="review_at"), now=now
+                )
+            except ValueError as exc:
+                return {"state": "rejected", "reason": str(exc)}
+            return self._augment_execute(
+                session=session,
+                session_id=session_id_str,
+                request=request,
+                snapshot=snapshot,
+                now=now,
+                key=key,
+                expiration=expiration,
+            )
 
     def _queue_baseline_front(
         self, snapshot: Mapping[str, object], price: Decimal
@@ -7325,208 +7439,311 @@ class PolymarketLPService:
                 expiration = expiration_for_review(
                     _timestamp(request["review_at"], name="review_at"), now=now
                 )
-                reward_date = self._now().date().isoformat()
             except ValueError as exc:
                 return {"state": "rejected", "reason": str(exc)}
             try:
                 self.store.consume_lp_preview(preview_id)
             except ValueError as exc:
                 return {"state": "rejected", "reason": str(exc)}
-            # Issue 152: registration boundary.  Validation just proved the
-            # session owns no order on the token, so the whole price level in
-            # this validated snapshot is queue ahead of the entry order.
-            queue_baseline = self._queue_protection_baseline(request, snapshot)
-            recorder = getattr(self.store, "lp_record_book_samples", None)
-            if callable(recorder):
-                baseline_sample = self._queue_baseline_book_sample(request, snapshot)
-                if baseline_sample is not None:
-                    try:
-                        recorder([baseline_sample], now=now)
-                    except Exception:
-                        pass
-            queue_baseline_summary = {
-                "baseline_front": queue_baseline["baseline_front"],
-                "baseline_price": queue_baseline["baseline_price"],
-            }
-            entry_action_base = {
-                "submit_requested_at": _iso(now),
-                "queue_protection_baseline": queue_baseline_summary,
-            }
-            session_id = uuid.uuid4().hex
-            intent: dict[str, object] = {
-                **request,
-                "preflight": facts,
-                "entry_order_id": None,
-                "entry_expiration": expiration,
-                "entry_cancel_requested": False,
-                "buy_filled_quantity": Decimal("0"),
-                "buy_cost": Decimal("0"),
-                "sold_quantity": Decimal("0"),
-                "sold_revenue": Decimal("0"),
-                "residual_quantity": Decimal("0"),
-                "residual_exit_value": Decimal("0"),
-                "fees": Decimal("0"),
-                "fee_status": "unknown",
-                "opening_loss": None,
-                "position_reconciled": False,
-                "account_checked_at": None,
-                "book_checked_at": None,
-                "stop_loss_latched": False,
-                "stop_loss_triggered_at": None,
-                "stop_loss_triggered_loss": None,
-                "scoring_status": "unknown",
-                "scoring_checked_at": None,
-                "scoring_order_id": None,
-                "scoring_order_role": None,
-                "scoring_lost_at": None,
-                "passive_exit_order_id": None,
-                "passive_exit_price": None,
-                "passive_cancel_requested": False,
-                "passive_exit_attempt_key": None,
-                "passive_exit_attempt_state": None,
-                "passive_exit_retryable": False,
-                "protected_exit_order_id": None,
-                "protected_exit_attempt_key": None,
-                "protected_exit_attempt_state": None,
-                "protected_exit_retryable": False,
-                "protected_exit_submit_quantity": None,
-                "protected_exit_submit_sold_quantity": None,
-                "protected_exit_submit_residual_quantity": None,
-                "owned_order_ids": [],
-                "order_history": {},
-                "orders_terminal": False,
-                "reward_date": reward_date,
-                "reward_status": "unknown",
-                "trade_pnl": None,
-                "total_pnl": None,
-                "queue_protection": {
-                    **queue_baseline,
-                    "baseline_version": 1,
-                    "threshold": LP_QUEUE_PROTECTION_THRESHOLD,
-                    "data_failures": 0,
-                    "state": "registered",
-                    "notification_sent": False,
-                    "cancel_scope": "own_buys_at_level",
-                },
-            }
-            try:
-                session = self.store.lp_create_session(
-                    session_id,
-                    key,
-                    state="entry_submit_pending",
-                    payload=intent,
-                )
-            except ValueError as exc:
-                return {"state": "rejected", "reason": str(exc)}
-            entry_action_key = self._action_key(session_id, "entry-submit")
-            self.store.lp_upsert_action(
-                session_id,
-                entry_action_key,
-                state="pending",
-                payload={
-                    "role": "entry",
-                    "side": "BUY",
-                    "token_id": request["token_id"],
-                    "expiration": expiration,
-                    **entry_action_base,
-                },
+            return self._entry_execute(
+                request=request,
+                snapshot=snapshot,
+                facts=facts,
+                now=now,
+                key=key,
+                expiration=expiration,
             )
-            try:
-                signed = self._create_limit(
-                    token_id=str(request["token_id"]),
-                    price=cast(Decimal, request["price"]),
-                    quantity=cast(Decimal, request["quantity"]),
-                    side="BUY",
-                    post_only=True,
-                    expiration=expiration,
-                )
-                response = self._post_limit(signed)
-            except Exception as exc:
-                self.store.lp_upsert_action(
-                    session_id,
-                    entry_action_key,
-                    state="unknown",
-                    payload={
-                        "role": "entry",
-                        "side": "BUY",
-                        "token_id": request["token_id"],
-                        "expiration": expiration,
-                        "error": type(exc).__name__,
-                        **entry_action_base,
-                    },
-                )
-                session = self.store.lp_update_session(
-                    session_id,
-                    state="needs_attention",
-                    patch={"submit_status": "unknown", "resume_state": "entry_submit_pending"},
-                )
-                return self._status_payload(session)
-            accepted, order_id = self._order_response(response)
-            if not accepted:
-                self.store.lp_upsert_action(
-                    session_id,
-                    entry_action_key,
-                    state="rejected",
-                    payload={
-                        "role": "entry",
-                        "side": "BUY",
-                        "token_id": request["token_id"],
-                        "expiration": expiration,
-                        "order_id": order_id or "",
-                        **entry_action_base,
-                    },
-                )
-                session = self.store.lp_update_session(
-                    session_id,
-                    state="entry_rejected",
-                    patch={"entry_order_id": order_id, "submit_status": "rejected"},
-                )
-                return self._status_payload(session)
-            self.store.lp_upsert_action(
+
+    def _entry_execute(
+        self,
+        *,
+        request: dict[str, object],
+        snapshot: Mapping[str, object],
+        facts: Mapping[str, object],
+        now: datetime,
+        key: str,
+        expiration: int,
+    ) -> dict[str, object]:
+        """Register the session and submit exactly one post-only BUY.
+
+        Shared tail of the two-phase ``start`` (issue 158) and the
+        single-shot ``submit_entry`` (issue 163): the caller has already
+        validated fresh facts and bound the GTD expiration; this helper
+        owns the #152 baseline registration, the durable session row, the
+        exchange post, and every terminal state write.
+        """
+
+        # Issue 152: registration boundary.  Validation just proved the
+        # session owns no order on the token, so the whole price level in
+        # this validated snapshot is queue ahead of the entry order.
+        queue_baseline = self._queue_protection_baseline(request, snapshot)
+        recorder = getattr(self.store, "lp_record_book_samples", None)
+        if callable(recorder):
+            baseline_sample = self._queue_baseline_book_sample(request, snapshot)
+            if baseline_sample is not None:
+                try:
+                    recorder([baseline_sample], now=now)
+                except Exception:
+                    pass
+        queue_baseline_summary = {
+            "baseline_front": queue_baseline["baseline_front"],
+            "baseline_price": queue_baseline["baseline_price"],
+        }
+        entry_action_base = {
+            "submit_requested_at": _iso(now),
+            "queue_protection_baseline": queue_baseline_summary,
+        }
+        reward_date = self._now().date().isoformat()
+        session_id = uuid.uuid4().hex
+        intent: dict[str, object] = {
+            **request,
+            "preflight": facts,
+            "entry_order_id": None,
+            "entry_expiration": expiration,
+            "entry_cancel_requested": False,
+            "buy_filled_quantity": Decimal("0"),
+            "buy_cost": Decimal("0"),
+            "sold_quantity": Decimal("0"),
+            "sold_revenue": Decimal("0"),
+            "residual_quantity": Decimal("0"),
+            "residual_exit_value": Decimal("0"),
+            "fees": Decimal("0"),
+            "fee_status": "unknown",
+            "opening_loss": None,
+            "position_reconciled": False,
+            "account_checked_at": None,
+            "book_checked_at": None,
+            "stop_loss_latched": False,
+            "stop_loss_triggered_at": None,
+            "stop_loss_triggered_loss": None,
+            "scoring_status": "unknown",
+            "scoring_checked_at": None,
+            "scoring_order_id": None,
+            "scoring_order_role": None,
+            "scoring_lost_at": None,
+            "passive_exit_order_id": None,
+            "passive_exit_price": None,
+            "passive_cancel_requested": False,
+            "passive_exit_attempt_key": None,
+            "passive_exit_attempt_state": None,
+            "passive_exit_retryable": False,
+            "protected_exit_order_id": None,
+            "protected_exit_attempt_key": None,
+            "protected_exit_attempt_state": None,
+            "protected_exit_retryable": False,
+            "protected_exit_submit_quantity": None,
+            "protected_exit_submit_sold_quantity": None,
+            "protected_exit_submit_residual_quantity": None,
+            "owned_order_ids": [],
+            "order_history": {},
+            "orders_terminal": False,
+            "reward_date": reward_date,
+            "reward_status": "unknown",
+            "trade_pnl": None,
+            "total_pnl": None,
+            "queue_protection": {
+                **queue_baseline,
+                "baseline_version": 1,
+                "threshold": LP_QUEUE_PROTECTION_THRESHOLD,
+                "data_failures": 0,
+                "state": "registered",
+                "notification_sent": False,
+                "cancel_scope": "own_buys_at_level",
+            },
+        }
+        try:
+            session = self.store.lp_create_session(
                 session_id,
-                entry_action_key,
-                state="accepted",
-                payload={
-                    "role": "entry",
-                    "side": "BUY",
-                    "token_id": request["token_id"],
-                    "expiration": expiration,
-                    "order_id": order_id,
-                    **entry_action_base,
-                    "submit_receipt_at": _iso(self._now()),
-                },
+                key,
+                state="entry_submit_pending",
+                payload=intent,
             )
-            if not order_id:
-                session = self.store.lp_update_session(
-                    session_id,
-                    state="needs_attention",
-                    patch={
-                        "submit_status": "accepted_without_order_id",
-                        "resume_state": "entry_submit_pending",
-                    },
-                )
-                return self._status_payload(session)
-            order_history = self._order_history(session)
-            order_history[order_id] = {
-                "order_id": order_id,
-                "token_id": request["token_id"],
+        except ValueError as exc:
+            return {"state": "rejected", "reason": str(exc)}
+        entry_action_key = self._action_key(session_id, "entry-submit")
+        self.store.lp_upsert_action(
+            session_id,
+            entry_action_key,
+            state="pending",
+            payload={
+                "role": "entry",
                 "side": "BUY",
-                "status": str(_field(response, "status", "LIVE")).upper() or "LIVE",
-                "price": request["price"],
-                "quantity": request["quantity"],
+                "token_id": request["token_id"],
                 "expiration": expiration,
-            }
+                **entry_action_base,
+            },
+        )
+        try:
+            signed = self._create_limit(
+                token_id=str(request["token_id"]),
+                price=cast(Decimal, request["price"]),
+                quantity=cast(Decimal, request["quantity"]),
+                side="BUY",
+                post_only=True,
+                expiration=expiration,
+            )
+            response = self._post_limit(signed)
+        except Exception as exc:
+            self.store.lp_upsert_action(
+                session_id,
+                entry_action_key,
+                state="unknown",
+                payload={
+                    "role": "entry",
+                    "side": "BUY",
+                    "token_id": request["token_id"],
+                    "expiration": expiration,
+                    "error": type(exc).__name__,
+                    **entry_action_base,
+                },
+            )
             session = self.store.lp_update_session(
                 session_id,
-                state="entry_open",
+                state="needs_attention",
+                patch={"submit_status": "unknown", "resume_state": "entry_submit_pending"},
+            )
+            return self._status_payload(session)
+        accepted, order_id = self._order_response(response)
+        if not accepted:
+            self.store.lp_upsert_action(
+                session_id,
+                entry_action_key,
+                state="rejected",
+                payload={
+                    "role": "entry",
+                    "side": "BUY",
+                    "token_id": request["token_id"],
+                    "expiration": expiration,
+                    "order_id": order_id or "",
+                    **entry_action_base,
+                },
+            )
+            session = self.store.lp_update_session(
+                session_id,
+                state="entry_rejected",
+                patch={"entry_order_id": order_id, "submit_status": "rejected"},
+            )
+            return self._status_payload(session)
+        self.store.lp_upsert_action(
+            session_id,
+            entry_action_key,
+            state="accepted",
+            payload={
+                "role": "entry",
+                "side": "BUY",
+                "token_id": request["token_id"],
+                "expiration": expiration,
+                "order_id": order_id,
+                **entry_action_base,
+                "submit_receipt_at": _iso(self._now()),
+            },
+        )
+        if not order_id:
+            session = self.store.lp_update_session(
+                session_id,
+                state="needs_attention",
                 patch={
-                    "entry_order_id": order_id,
-                    "submit_status": "accepted",
-                    "owned_order_ids": [order_id],
-                    "order_history": order_history,
+                    "submit_status": "accepted_without_order_id",
+                    "resume_state": "entry_submit_pending",
                 },
             )
             return self._status_payload(session)
+        order_history = self._order_history(session)
+        order_history[order_id] = {
+            "order_id": order_id,
+            "token_id": request["token_id"],
+            "side": "BUY",
+            "status": str(_field(response, "status", "LIVE")).upper() or "LIVE",
+            "price": request["price"],
+            "quantity": request["quantity"],
+            "expiration": expiration,
+        }
+        session = self.store.lp_update_session(
+            session_id,
+            state="entry_open",
+            patch={
+                "entry_order_id": order_id,
+                "submit_status": "accepted",
+                "owned_order_ids": [order_id],
+                "order_history": order_history,
+            },
+        )
+        return self._status_payload(session)
+
+    def submit_entry(
+        self,
+        request: Mapping[str, object],
+        idempotency_key: str | None = None,
+    ) -> dict[str, object]:
+        """Issue 163: single-shot entry — validate fresh facts, post one BUY.
+
+        No preview session exists: the one fresh snapshot read and the one
+        full validation happen here, under the same guard order as
+        ``start`` (key replay first, then mutation, then facts).  A
+        rejection never creates a session row and never posts.
+        """
+
+        key = (idempotency_key or "").strip()
+        if not key:
+            return {"state": "rejected", "reason": "idempotency_key_required"}
+        with self._mutex:
+            existing = self.store.lp_session_by_idempotency(key)
+            if existing is not None:
+                return self._status_payload(existing)
+            if not self._mutation_allowed("submit"):
+                return {"state": "locked", "reason": "mutation_blocked"}
+            active_lp = self.store.lp_active_session()
+            if active_lp is not None:
+                return {
+                    "state": "busy",
+                    "reason": "active_lp_session",
+                    "session_id": active_lp.get("session_id"),
+                }
+            # The request body is operator input: normalization failures are
+            # caller errors and surface as exceptions (HTTP 400), while every
+            # fact-vs-plan mismatch below is a semantic rejection payload.
+            normalized = self._normalize_request(request)
+            try:
+                now = self._now()
+                snapshot = self._read_snapshot(normalized)
+                facts = self._validate_snapshot(normalized, snapshot, now=now)
+            except ValueError as exc:
+                # Issue 163: the single-shot trial anchor rejects with the
+                # operator-facing reason instead of the internal candidate
+                # mismatch name; freshness tolerance (60s) is preserved by
+                # the candidate_policy passthrough above.
+                if str(exc) == "candidate_best_bid_changed":
+                    return {"state": "rejected", "reason": "best_bid_changed"}
+                return {"state": "rejected", "reason": str(exc)}
+            # Issue 163 定案 1（评审修复 P1）：默认试挂单锚定本次唯一快照的
+            # 盘口顶档买一 max(bids)——与 _validate_snapshot 的 candidate 检查
+            # 同源同口径（候选行 guidance 价与 UI 预填价即顶档）。奖励资格买一
+            # （facts["best_bid"]，自顶档向下累计到 reward_min_size 才落定）在
+            # 薄顶档市场低于顶档，不得用作锚，否则确认价=顶档时两个检查互斥、
+            # 提交被永久锁死。5%/custom plans do not anchor.
+            if normalized.get("candidate_policy") == "best_bid_minimum":
+                book = snapshot.get("book")
+                bids = self._levels(book.get("bids"), "bids")
+                if (
+                    cast(Decimal, normalized["price"])
+                    != max(level_price for level_price, _ in bids)
+                ):
+                    return {"state": "rejected", "reason": "best_bid_changed"}
+            try:
+                expiration = expiration_for_review(
+                    _timestamp(normalized["review_at"], name="review_at"),
+                    now=now,
+                )
+            except ValueError as exc:
+                return {"state": "rejected", "reason": str(exc)}
+            return self._entry_execute(
+                request=normalized,
+                snapshot=snapshot,
+                facts=facts,
+                now=now,
+                key=key,
+                expiration=expiration,
+            )
 
     def refresh_rewards(
         self,

@@ -861,6 +861,10 @@ def create_prediction_server(
                 "/api/prediction-arbitrage/lp/candidates/refresh"
             )
             lp_cancel_orders_path = "/api/prediction-arbitrage/lp/orders/cancel"
+            # Issue 163: single-shot submit endpoints (UI no longer calls the
+            # preview-then-confirm pair, which stays available unchanged).
+            lp_submit_entry_path = "/api/prediction-arbitrage/lp/orders"
+            lp_submit_augment_path = "/api/prediction-arbitrage/lp/augment"
             lp_sessions_prefix = "/api/prediction-arbitrage/lp/sessions/"
             lp_start_path = "/api/prediction-arbitrage/lp/sessions"
             lp_stop_session: str | None = None
@@ -896,6 +900,8 @@ def create_prediction_server(
                 lp_candidate_preview_path,
                 lp_candidate_refresh_path,
                 lp_cancel_orders_path,
+                lp_submit_entry_path,
+                lp_submit_augment_path,
                 lp_start_path,
             } and lp_stop_session is None and lp_augment_session is None:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -1022,6 +1028,43 @@ def create_prediction_server(
                     if not callable(lp_augment_preview):
                         raise RuntimeError("LP execution service is unavailable")
                     result = lp_augment_preview(payload)
+                elif path == lp_submit_entry_path:
+                    # Issue 163: strict schema — eight required fields plus
+                    # the two optional ones; anything missing or extra is a
+                    # 400 before the facade runs.  A non-decimal price or
+                    # quantity raises through _normalize_request and lands
+                    # here as a 400 with the reason.
+                    lp_entry_required = {
+                        "market_id",
+                        "condition_id",
+                        "token_id",
+                        "outcome",
+                        "price",
+                        "quantity",
+                        "review_at",
+                        "idempotency_key",
+                    }
+                    lp_entry_optional = {
+                        "candidate_policy",
+                        "estimated_target_quantity",
+                    }
+                    if not lp_entry_required <= set(payload) or set(payload) - lp_entry_required - lp_entry_optional:
+                        raise ValueError("prediction request fields are invalid")
+                    lp_submit_entry = getattr(execution, "lp_submit_entry", None)
+                    if not callable(lp_submit_entry):
+                        raise RuntimeError("LP execution service is unavailable")
+                    result = lp_submit_entry(payload)
+                elif path == lp_submit_augment_path:
+                    # Issue 163: strict three-field augment submit bound to
+                    # the named session.
+                    self._require_schema(
+                        payload,
+                        {"session_id", "quantity", "idempotency_key"},
+                    )
+                    lp_submit_augment = getattr(execution, "lp_submit_augment", None)
+                    if not callable(lp_submit_augment):
+                        raise RuntimeError("LP execution service is unavailable")
+                    result = lp_submit_augment(payload)
                 elif path == lp_start_path:
                     self._require_schema(payload, {"preview_id", "idempotency_key"})
                     lp_start = getattr(execution, "lp_start", None)
@@ -1245,8 +1288,12 @@ def create_prediction_server(
                 # Issue 158: the LP entry/augment submit responses render
                 # their state branch in the dashboard modal from the body
                 # (busy/locked/rejected text), so they stay HTTP 200.
+                # Issue 163: the single-shot endpoints join that rule — the
+                # dashboard toasts branch on body.state, never on status.
                 lp_submit_state_body = (
-                    path == lp_start_path or lp_augment_session is not None
+                    path == lp_start_path
+                    or lp_augment_session is not None
+                    or path in {lp_submit_entry_path, lp_submit_augment_path}
                 )
                 if (
                     not execution_mutation
