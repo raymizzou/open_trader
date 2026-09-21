@@ -22568,7 +22568,7 @@ console.log(JSON.stringify({
 
 
 def test_lp_entry_state_message_matrix_t7() -> None:
-    """T7: busy/locked/rejected/preview_expired 文案逐类可读，不崩；评审扩展——entry_rejected/needs_attention 在模态内如实呈现，不关模态、不写成功摘要。"""
+    """T7: busy/locked/rejected/preview_expired 文案逐类可读，不崩；评审扩展——entry_rejected（如实呈现、不提供「重新预检」死路、指引关闭重开）/needs_attention 在模态内如实呈现，不关模态、不写成功摘要。"""
     output = _lp158_interactive(r'''
 state.predictionMarket.csrfToken = "csrf-1";
 globalThis.fetch = async (url, init={}) => {
@@ -22623,8 +22623,9 @@ console.log(JSON.stringify({
   expiredRepreview: expiredHtml.includes('data-modal-action="lp-order-repreview"'),
   entryRejected: {
     modalOpen: entryRejected.html !== "",
-    message: entryRejected.html.includes("未登记：交易所拒绝了订单，未产生委托；请重新预检后再试。"),
-    repreview: entryRejected.html.includes('data-modal-action="lp-order-repreview"'),
+    message: entryRejected.html.includes("未登记：交易所拒绝了订单，未产生委托；请关闭后重新发起下单。"),
+    noRepreview: !entryRejected.html.includes('data-modal-action="lp-order-repreview"'),
+    noRepreviewWording: !entryRejected.html.includes("重新预检"),
     noSuccessSummary: entryRejected.summary === "" && !entryRejected.html.includes("已登记 · 会话"),
   },
   needsAttention: {
@@ -22644,7 +22645,8 @@ console.log(JSON.stringify({
     assert rendered["expiredRepreview"] is True
     assert rendered["entryRejected"]["modalOpen"] is True
     assert rendered["entryRejected"]["message"] is True
-    assert rendered["entryRejected"]["repreview"] is True
+    assert rendered["entryRejected"]["noRepreview"] is True
+    assert rendered["entryRejected"]["noRepreviewWording"] is True
     assert rendered["entryRejected"]["noSuccessSummary"] is True
     assert rendered["needsAttention"]["modalOpen"] is True
     assert rendered["needsAttention"]["warning"] is True

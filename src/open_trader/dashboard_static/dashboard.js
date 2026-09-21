@@ -6207,7 +6207,7 @@ function lpSubmitStateMessage(result) {
   }
   // 评审修复（定案 10）：HTTP 200 里两类非成功终态必须在模态内如实呈现。
   if (resultState === "entry_rejected") {
-    return "未登记：交易所拒绝了订单，未产生委托；请重新预检后再试。";
+    return "未登记：交易所拒绝了订单，未产生委托；请关闭后重新发起下单。";
   }
   if (resultState === "needs_attention") {
     return "提交结果未知（回执未确认），请刷新看板核对会话状态后再操作；不要重复提交。";
@@ -6329,16 +6329,22 @@ function lpOrderModalHtml(data = {}) {
   const echo = `<div class="pm-order-market"><span>买 ${escapeHtml(predictionValue(data.outcome, "UNKNOWN"))} @ ${escapeHtml(String(data.price ?? ""))} × ${escapeHtml(String(data.quantity ?? ""))} 份 · ${modeLabel} · 复核 次日 08:00</span><strong>${title}</strong></div>`;
   const result = data.result && typeof data.result === "object" ? data.result : null;
   const outcome = result ? lpSubmitOutcomeMarkup(result) : "";
-  // entry_rejected（交易所拒单）与预检类拒绝同样走「重新预检」路径：同幂等键、新 preview_id。
+  // entry_rejected（交易所拒单）不走「重新预检」：被拒会话已按该幂等键落库，
+  // 同键重检只会返回同一结果——真实出路是关闭模态重新发起（新开模态换新键）。
+  const entryRejected = Boolean(result
+    && String(result.state || "").toLowerCase() === "entry_rejected");
   const needsRepreview = Boolean(result
-    && (LP_REPREVIEW_REASONS.has(String(result.reason || ""))
-      || String(result.state || "").toLowerCase() === "entry_rejected"));
+    && LP_REPREVIEW_REASONS.has(String(result.reason || "")));
   const confirmButton = result
     ? (needsRepreview ? `<button class="pm-button primary" type="button" data-modal-action="lp-order-repreview">重新预检</button>` : "")
     : `<button class="pm-button primary" type="button" data-modal-action="lp-order-confirm">确认提交 · 登记受保护</button>`;
+  // 「重新预检」字样不进入 entry_rejected 的 UI，避免指向该死路。
+  const preflightHint = entryRejected
+    ? ""
+    : `<p class="sub">预检 10 秒内有效；过期或买一变化时提交将被拒绝，需重新预检。</p>`;
   const body = `${echo}<div class="pm-check-list">${lpOrderFactsMarkup(preview.preflight)}</div>`
     + lpInitialAEstimateMarkup(preview.queue_protection_estimate, data.quantity)
-    + `<p class="sub">预检 10 秒内有效；过期或买一变化时提交将被拒绝，需重新预检。</p>`
+    + preflightHint
     + outcome;
   const footer = `<footer class="pm-modal-actions"><button class="pm-button" type="button" data-modal-action="cancel">取消</button>${confirmButton}</footer>`;
   return `<section class="pm-modal" role="dialog" aria-modal="true" aria-labelledby="pm-dialog-title" tabindex="-1">${header}${body}${footer}</section>`;
@@ -6381,16 +6387,21 @@ function lpAugmentModalHtml(data = {}) {
     : `<div id="lp-augment-estimate">${lpAugmentEstimateMarkup(data, data.quantity)}</div>`;
   const result = data.result && typeof data.result === "object" ? data.result : null;
   const outcome = result ? lpSubmitOutcomeMarkup(result) : "";
-  // 防御性对称：augment 现不产生 entry_rejected，但若返回同样提供「重新预检」。
+  // 防御性对称：augment 现不产生 entry_rejected，但若返回同样不走「重新预检」
+  // （被拒会话已按幂等键落库，同键重检无出路），提示字样一并省去。
+  const entryRejected = Boolean(result
+    && String(result.state || "").toLowerCase() === "entry_rejected");
   const needsRepreview = Boolean(result
-    && (LP_REPREVIEW_REASONS.has(String(result.reason || ""))
-      || String(result.state || "").toLowerCase() === "entry_rejected"));
+    && LP_REPREVIEW_REASONS.has(String(result.reason || "")));
   const confirmButton = result
     ? (needsRepreview ? `<button class="pm-button primary" type="button" data-modal-action="lp-augment-repreview">重新预检</button>` : "")
     : `<button class="pm-button primary" type="button" data-modal-action="lp-augment-confirm">确认加量 · 并入保护伞</button>`;
+  const preflightHint = entryRejected
+    ? ""
+    : `<p class="sub">预检 10 秒内有效；过期或买一变化时提交将被拒绝，需重新预检。08:00 复核时入场单+加量单一并收尾。</p>`;
   const body = `${echo}<div class="pm-check-list">${lpAugmentFactsMarkup(preview.preflight, session, existingText)}</div>`
     + estimate
-    + `<p class="sub">预检 10 秒内有效；过期或买一变化时提交将被拒绝，需重新预检。08:00 复核时入场单+加量单一并收尾。</p>`
+    + preflightHint
     + outcome;
   const footer = `<footer class="pm-modal-actions"><button class="pm-button" type="button" data-modal-action="cancel">取消</button>${confirmButton}</footer>`;
   return `<section class="pm-modal" role="dialog" aria-modal="true" aria-labelledby="pm-dialog-title" tabindex="-1">${header}${body}${footer}</section>`;
