@@ -7649,7 +7649,7 @@ console.log(JSON.stringify({
   marketRows: (orderTable.match(/<tr[^>]*data-lp-today-market=/g) || []).length,
   footnote: html.includes("账户另有 9 行非 LP 订单/持仓，不在本表展示。"),
   emptyState: emptyHtml
-    .includes("<td colspan=\"6\" class=\"pm-observation-empty\">当天暂无 LP 委托。</td>"),
+    .includes("<td colspan=\"6\" class=\"pm-observation-empty\">当天暂无 LP 委托。从上方待试挂候选点「挂单」登记第一笔，提交即受位置保护。</td>"),
   legacyEmptyState: legacyHtml.includes("当天暂无 LP 委托。"),
   legacyNoFootnote: !legacyHtml.includes("非 LP 订单/持仓"),
 }));
@@ -22120,3 +22120,579 @@ def test_lp_first_seen_styles_shipped() -> None:
         ".qp-first-seen:focus-visible .qp-first-seen-tip { display: block; }",
     ):
         assert fragment in css
+
+# ---------------------------------------------------------------------------
+# Issue 158: LP 下单入口（lp_order）与委托加量（lp_augment）前端行为
+# ---------------------------------------------------------------------------
+
+_LP158_FIXTURE = r'''
+const queueProtectionShared = {
+  state:"monitoring", ratio:0.55, threshold:0.5,
+  front_estimate:"260", level_total:"470", data_time:"2026-09-21T06:32:05Z",
+  cancel_targets:["sys-order-1","sys-order-2"], canceled_order_ids:null,
+  canceled_remaining:null,
+};
+const sessionRow = {
+  order_id:"sys-order-1", market_id:"market-fed", condition_id:"condition-fed", token_id:"token-fed",
+  market_title:"Will the Fed cut rates in Q4?", market_url:"https://polymarket.com/event/fed",
+  outcome:"YES", side:"BUY", status:"LIVE", price:"0.42", quantity:"120",
+  filled_quantity:"0", remaining_quantity:"120", state:"open",
+  anchor:true,
+  queue_protection:queueProtectionShared,
+};
+const augmentRow = {
+  order_id:"sys-order-2", market_id:"market-fed", condition_id:"condition-fed", token_id:"token-fed",
+  market_title:"Will the Fed cut rates in Q4?", market_url:"https://polymarket.com/event/fed",
+  outcome:"YES", side:"BUY", status:"LIVE", price:"0.42", quantity:"90",
+  filled_quantity:"0", remaining_quantity:"90", state:"open",
+  anchor:true, augment:true,
+  queue_protection:queueProtectionShared,
+};
+const manualRow = {
+  order_id:"man-order-1", market_id:"market-eth", condition_id:"condition-eth", token_id:"token-eth",
+  market_title:"Will ETH flip $6k by Dec 31?", market_url:"https://polymarket.com/event/eth",
+  outcome:"NO", side:"BUY", status:"LIVE", price:"0.39", quantity:"200",
+  filled_quantity:"0", remaining_quantity:"200", state:"open",
+};
+const candidateRow = {
+  market_id:"market-fed", condition_id:"condition-fed", token_id:"token-fed",
+  market_title:"Will the Fed cut rates in Q4?", market_url:"https://polymarket.com/event/fed",
+  outcome:"YES", state:"eligible", daily_pool_usd:"150", min_quantity:"20",
+  estimated_target_quantity:"90", review_at:"2026-09-22T00:00:00Z",
+  selected_direction:{outcome:"YES", price:"0.42", quantity:"120", required_capital:"50.40",
+    estimated_exit_loss:"2.16", estimated_exit_loss_ratio:"0.043",
+    checked_at:"2026-09-21T04:00:00Z"},
+  competition:{value:"12.5", state:"known", stale:false, updated:true},
+  reference_capital:"50.40", reason:[], summary:{},
+};
+const buildDashboard = (overrides={}) => ({
+  state:"ready", stale:false, complete:true, checked_at:"2026-09-21T06:40:00Z",
+  orders:[], positions:[], lp_orders_today:[], non_lp_row_count:0,
+  market_rewards:{}, reward_shares:{}, lp_observations:{}, recommendations:[],
+  candidates:[candidateRow], lp_session:{state:"none"},
+  ...overrides,
+});
+'''
+
+
+def test_lp_candidate_row_renders_entry_button_t2() -> None:
+    """T2: 候选行渲染「挂单」按钮；操作列不再有 Polymarket 链接按钮；无 csrfToken → disabled。"""
+    output = run_dashboard_js(_LP158_FIXTURE + r'''
+const withToken = predictionLpCard({lp_dashboard: buildDashboard()});
+state.predictionMarket.csrfToken = "";
+const withoutToken = predictionLpCard({lp_dashboard: buildDashboard()});
+console.log(JSON.stringify({
+  withToken: {
+    hasEntryButton: withToken.includes('data-action="lp-order-entry"'),
+    label: withToken.includes(">挂单</button>"),
+    notDisabled: !/>挂单<\/button>[^<]*disabled/.test(withToken)
+      && !withToken.includes("lp-order-entry\" disabled"),
+  },
+  withoutToken: {
+    disabled: /data-action="lp-order-entry"[^>]*disabled/.test(withoutToken),
+  },
+  noPolymarketActionLink: !withToken.includes(">Polymarket</a>"),
+  titleStillLinks: withToken.includes('href="https://polymarket.com/event/fed"'),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["withToken"]["hasEntryButton"] is True
+    assert rendered["withToken"]["label"] is True
+    assert rendered["withToken"]["notDisabled"] is True
+    assert rendered["withoutToken"]["disabled"] is True
+    assert rendered["noPolymarketActionLink"] is True
+    assert rendered["titleStillLinks"] is True
+
+
+def test_lp_entry_initial_a_truth_table_t5() -> None:
+    """T5: 初始 A 真值表——60% 无警示；0% 空档位；28.6% 触发线警示。"""
+    output = run_dashboard_js(r'''
+const normal = lpInitialAEstimateMarkup(
+  {baseline_front:"150", projected_ratio:150/250}, 100);
+const empty = lpInitialAEstimateMarkup(
+  {baseline_front:"0", projected_ratio:0}, 100);
+const warn = lpInitialAEstimateMarkup(
+  {baseline_front:"40", projected_ratio:40/140}, 100);
+console.log(JSON.stringify({
+  normal: {
+    okLine: normal.includes("未触发，正常监控"),
+    noWarn: !normal.includes("≤ 触发线 50%"),
+    shows60: normal.includes("初始 A 60%"),
+  },
+  empty: {
+    emptyText: empty.includes("空档位：提交后立即触发位置保护撤单"),
+    showsZero: empty.includes("初始 A = 0%"),
+  },
+  warn: {
+    warnText: warn.includes("初始 A 28.6% ≤ 触发线 50%：提交后首个监控 tick 即触发位置保护撤单"),
+  },
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["normal"]["okLine"] is True
+    assert rendered["normal"]["noWarn"] is True
+    assert rendered["normal"]["shows60"] is True
+    assert rendered["empty"]["emptyText"] is True
+    assert rendered["empty"]["showsZero"] is True
+    assert rendered["warn"]["warnText"] is True
+
+
+def test_lp_manual_row_keeps_unanchored_text_t8() -> None:
+    """T8: 网页手动单仍渲染「位置未知」原文。"""
+    output = run_dashboard_js(_LP158_FIXTURE + r'''
+const html = predictionLpCard({lp_dashboard: buildDashboard({
+  lp_orders_today: [manualRow],
+})});
+console.log(JSON.stringify({
+  unanchored: html.includes(
+    "位置未知 · 尚未建立位置保护（网页手动挂单，无下单基线）"),
+  noAugmentButton: !html.includes('data-action="lp-augment-entry"'),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["unanchored"] is True
+    assert rendered["noAugmentButton"] is True
+
+
+def test_lp_today_session_row_renders_augment_button_t14f() -> None:
+    """T14f: 有活动会话的标的行渲染「加量」按钮；纯网页单行不渲染。"""
+    output = run_dashboard_js(_LP158_FIXTURE + r'''
+state.predictionMarket.csrfToken = "csrf-1";
+const sessionHtml = predictionLpCard({lp_dashboard: buildDashboard({
+  lp_orders_today: [sessionRow],
+  lp_session: {state:"entry_open", session_id:"sess-abc123",
+    condition_id:"condition-fed", price:"0.42", quantity:"120",
+    market_title:"Will the Fed cut rates in Q4?"},
+})});
+const manualHtml = predictionLpCard({lp_dashboard: buildDashboard({
+  lp_orders_today: [manualRow],
+  lp_session: {state:"entry_open", session_id:"sess-abc123",
+    condition_id:"condition-fed"},
+})});
+const otherConditionHtml = predictionLpCard({lp_dashboard: buildDashboard({
+  lp_orders_today: [sessionRow],
+  lp_session: {state:"entry_open", session_id:"sess-abc123",
+    condition_id:"condition-other"},
+})});
+const noSessionHtml = predictionLpCard({lp_dashboard: buildDashboard({
+  lp_orders_today: [sessionRow],
+  lp_session: {state:"none"},
+})});
+console.log(JSON.stringify({
+  sessionRow: {
+    hasButton: sessionHtml.includes('data-action="lp-augment-entry"'),
+    label: sessionHtml.includes(">加量</button>"),
+  },
+  manualRow: {hasButton: manualHtml.includes('data-action="lp-augment-entry"')},
+  otherCondition: {hasButton: otherConditionHtml.includes('data-action="lp-augment-entry"')},
+  noSession: {hasButton: noSessionHtml.includes('data-action="lp-augment-entry"')},
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["sessionRow"]["hasButton"] is True
+    assert rendered["sessionRow"]["label"] is True
+    assert rendered["manualRow"]["hasButton"] is False
+    assert rendered["otherCondition"]["hasButton"] is False
+    assert rendered["noSession"]["hasButton"] is False
+
+
+def test_lp_two_orders_share_protection_subrow_t16f() -> None:
+    """T16f: 双单并存——同市场两条 lp-line + 保护副行 A=55% 覆盖两单。"""
+    output = run_dashboard_js(_LP158_FIXTURE + r'''
+state.predictionMarket.csrfToken = "csrf-1";
+const html = predictionLpCard({lp_dashboard: buildDashboard({
+  lp_orders_today: [sessionRow, augmentRow],
+  lp_session: {state:"entry_open", session_id:"sess-abc123",
+    condition_id:"condition-fed", price:"0.42", quantity:"120",
+    market_title:"Will the Fed cut rates in Q4?"},
+})});
+const orderTable = (html.match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
+console.log(JSON.stringify({
+  lpLineCount: (orderTable.match(/class="lp-line"/g) || []).length,
+  augmentNote: orderTable.includes("加量单"),
+  protectionRow: (orderTable.match(/lp-queue-protection/g) || []).length,
+  covers55: orderTable.includes("A 55%"),
+  twoOrders: orderTable.includes("触发撤同价 <strong>2 张</strong>"),
+  bothAnchored: (orderTable.match(/src-chip registered/g) || []).length >= 2,
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["lpLineCount"] >= 3  # 合计 headline 行 + 两张单明细行
+    assert rendered["augmentNote"] is True
+    assert rendered["protectionRow"] >= 1
+    assert rendered["covers55"] is True
+    assert rendered["twoOrders"] is True
+    assert rendered["bothAnchored"] is True
+
+
+_LP158_INTERACTIVE = r'''
+class Element {
+  constructor(id){
+    this.id = id || "";
+    this.dataset={};this.hidden=false;this.innerHTML="";this.textContent="";this.style={};this.attributes={};this.listeners={};
+    this._qs={};
+    this.classList={toggle(){},add(){},remove(){}};}
+  addEventListener(name, callback){(this.listeners[name] ||= []).push(callback);}
+  setAttribute(name,value){this.attributes[name]=value;}
+  removeAttribute(name){delete this.attributes[name];}
+  querySelector(sel){return this._qs[sel] || null;}
+  querySelectorAll(){return Object.values(this._qs);}
+  focus(){}
+}
+const nodes = {};
+document.getElementById = (id) => nodes[id] || (nodes[id] = new Element(id));
+document.body = new Element("body");
+globalThis.AbortController = class { constructor(){this.signal={};} abort(){} };
+globalThis.requestAnimationFrame = (callback) => { callback(); return 1; };
+globalThis.window = {
+  location: {search:"", pathname:"/", hash:""},
+  setInterval(){return 1;}, clearInterval(){}, setTimeout(){return 1;}, clearTimeout(){},
+};
+Date.now = () => Date.parse("2026-09-21T06:40:00Z");
+bindElements();
+const modalRoot = nodes["prediction-market-modal-root"];
+const drain = async () => { for (let turn=0; turn<30; turn+=1) await Promise.resolve(); };
+const modalClick = async (dataset) => {
+  const target = {closest(selector){return selector === "[data-modal-action]" ? {dataset} : null;}};
+  await handlePredictionModalClick({target});
+};
+''' + _LP158_FIXTURE
+
+
+def _lp158_interactive(script: str) -> str:
+    return run_dashboard_js(_LP158_INTERACTIVE + script)
+
+
+def test_lp_entry_modal_case_switch_locking_t3() -> None:
+    """T3: 默认试挂 0.42/120；切 5% → 量 90 价不变；自定义保留可编辑；试挂恢复锁定。"""
+    output = _lp158_interactive(r'''
+state.predictionMarket.csrfToken = "csrf-1";
+openPredictionModal("lp_order", null, lpOrderIntent(candidateRow));
+const htmlTrial = modalRoot.innerHTML;
+await modalClick({modalAction: "lp-order-case", caseMode: "five"});
+const htmlFive = modalRoot.innerHTML;
+await modalClick({modalAction: "lp-order-case", caseMode: "custom"});
+const htmlCustom = modalRoot.innerHTML;
+await modalClick({modalAction: "lp-order-case", caseMode: "trial"});
+const htmlBackTrial = modalRoot.innerHTML;
+// 5% 目标量缺失的行：选项禁用并标注 UNKNOWN。
+const unknownRow = {...candidateRow, estimated_target_quantity: null};
+openPredictionModal("lp_order", null, lpOrderIntent(unknownRow));
+const htmlUnknown = modalRoot.innerHTML;
+const readonlyCount = (html) => (html.match(/ readonly/g) || []).length;
+console.log(JSON.stringify({
+  fiveUnknown: {
+    disabled: /value="five" disabled/.test(htmlUnknown),
+    unknownLabel: htmlUnknown.includes("5% 单 · 目标量 UNKNOWN（本行估算未出）"),
+  },
+  trial: {
+    trialChecked: /value="trial" checked/.test(htmlTrial),
+    fiveEnabled: !/value="five" disabled/.test(htmlTrial),
+    locked020_120: /id="lp-order-price"[^>]*value="0\.42" readonly/.test(htmlTrial)
+      && /id="lp-order-quantity"[^>]*value="120" readonly/.test(htmlTrial),
+  },
+  five: {
+    fiveChecked: /value="five" checked/.test(htmlFive),
+    qty90Locked: /id="lp-order-quantity"[^>]*value="90" readonly/.test(htmlFive),
+    priceUnchanged: /id="lp-order-price"[^>]*value="0\.42" readonly/.test(htmlFive),
+  },
+  custom: {
+    customChecked: /value="custom" checked/.test(htmlCustom),
+    editable: !htmlCustom.includes("lp-order-price\" type=\"number\" step=\"0.01\" min=\"0.01\" max=\"0.99\" value=\"0.42\" readonly")
+      && !htmlCustom.includes("value=\"0.42\" readonly") && !htmlCustom.includes("value=\"90\" readonly"),
+    keepsValues: /value="0\.42"/.test(htmlCustom) && /value="90"/.test(htmlCustom),
+  },
+  backTrial: {
+    relocked: readonlyCount(htmlBackTrial) === 2,
+    qty120: /value="120"/.test(htmlBackTrial),
+  },
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["trial"]["trialChecked"] is True
+    assert rendered["trial"]["fiveEnabled"] is True
+    assert rendered["trial"]["locked020_120"] is True
+    assert rendered["five"]["fiveChecked"] is True
+    assert rendered["five"]["qty90Locked"] is True
+    assert rendered["five"]["priceUnchanged"] is True
+    assert rendered["custom"]["customChecked"] is True
+    assert rendered["custom"]["editable"] is True
+    assert rendered["custom"]["keepsValues"] is True
+    assert rendered["backTrial"]["relocked"] is True
+    assert rendered["backTrial"]["qty120"] is True
+    assert rendered["fiveUnknown"]["disabled"] is True
+    assert rendered["fiveUnknown"]["unknownLabel"] is True
+
+
+def test_lp_entry_preview_request_body_t4() -> None:
+    """T4: 预检体恰 7 字段（试挂另含 candidate_policy）；行内值原样透传；自定义改价量生效。"""
+    output = _lp158_interactive(r'''
+state.predictionMarket.csrfToken = "csrf-1";
+const requests = [];
+globalThis.fetch = async (url, init={}) => {
+  const u = String(url);
+  if (u.startsWith("/api/prediction-arbitrage/lp/preview")) {
+    requests.push({url: u, method: init.method || "GET", body: init.body || ""});
+    return {ok:true, status:200, json: async () => ({
+      state:"previewed", preview_id:"pv-1",
+      preflight:{balance:"100", allowance:"100", tick_size:"0.01",
+        minimum_order_size:"20", reward_min_size:"20", reward_max_spread:"0.10",
+        midpoint:"0.415", best_bid:"0.42", best_ask:"0.43", fee:"0", taker_fee_rate:"0"},
+      queue_protection_estimate:{baseline_front:"150", projected_ratio:0.6},
+    })};
+  }
+  throw new Error("unexpected " + u);
+};
+openPredictionModal("lp_order", null, lpOrderIntent(candidateRow));
+await modalClick({modalAction: "lp-order-preview"});
+const trialBody = JSON.parse(requests[0].body);
+const reviewHtml = modalRoot.innerHTML;
+await modalClick({modalAction: "lp-order-case", caseMode: "custom"});
+modalRoot._qs = {
+  "#lp-order-price": {id:"lp-order-price", value:"0.43"},
+  "#lp-order-quantity": {id:"lp-order-quantity", value:"150"},
+};
+await modalClick({modalAction: "lp-order-preview"});
+const customBody = JSON.parse(requests[1].body);
+console.log(JSON.stringify({
+  trialKeys: Object.keys(trialBody).sort(),
+  trialPolicy: trialBody.candidate_policy,
+  trialPassthrough: [trialBody.market_id, trialBody.condition_id, trialBody.token_id,
+    trialBody.outcome, trialBody.price, trialBody.quantity, trialBody.review_at],
+  customKeys: Object.keys(customBody).sort(),
+  customValues: [customBody.price, customBody.quantity],
+  customNoPolicy: !("candidate_policy" in customBody),
+  reviewPhase: reviewHtml.includes("确认提交 · 登记受保护")
+    && reviewHtml.includes("位置保护预估"),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["trialKeys"] == sorted([
+        "market_id", "condition_id", "token_id", "outcome",
+        "price", "quantity", "review_at", "candidate_policy",
+    ])
+    assert rendered["trialPolicy"] == "best_bid_minimum"
+    assert rendered["trialPassthrough"] == [
+        "market-fed", "condition-fed", "token-fed", "YES", "0.42", "120",
+        "2026-09-22T00:00:00Z",
+    ]
+    assert rendered["customKeys"] == sorted([
+        "market_id", "condition_id", "token_id", "outcome",
+        "price", "quantity", "review_at",
+    ])
+    assert rendered["customValues"] == ["0.43", "150"]
+    assert rendered["customNoPolicy"] is True
+    assert rendered["reviewPhase"] is True
+
+
+def test_lp_entry_confirm_idempotency_and_success_t6() -> None:
+    """T6: 确认体恰 {preview_id, idempotency_key}；双击/网络异常重试同 key；成功关模态+摘要+重拉。"""
+    output = _lp158_interactive(r'''
+state.predictionMarket.csrfToken = "csrf-1";
+const previewPosts = [];
+const confirmPosts = [];
+let confirmFail = true;
+globalThis.fetch = async (url, init={}) => {
+  const u = String(url);
+  const method = init.method || "GET";
+  if (u.startsWith("/api/prediction-arbitrage/lp/preview") && method === "POST") {
+    return {ok:true, status:200, json: async () => ({
+      state:"previewed", preview_id:"pv-1",
+      preflight:{}, queue_protection_estimate:{baseline_front:"150", projected_ratio:0.6},
+    })};
+  }
+  if (u === "/api/prediction-arbitrage/lp/sessions" && method === "POST") {
+    confirmPosts.push(JSON.parse(init.body));
+    if (confirmFail) throw new Error("network down");
+    return {ok:true, status:200, json: async () => ({
+      state:"entry_open", session_id:"sess-xyz789",
+    })};
+  }
+  throw new Error("unexpected " + method + " " + u);
+};
+openPredictionModal("lp_order", null, lpOrderIntent(candidateRow));
+await modalClick({modalAction: "lp-order-preview"});
+const confirmTarget = {closest: (s) => s === "[data-modal-action]" ? {dataset: {modalAction: "lp-order-confirm"}} : null};
+// 1) 网络异常：第一次确认抛错，模态保持打开。
+confirmFail = true;
+await handlePredictionModalClick({target: confirmTarget});
+const afterFailure = confirmPosts.length;
+// 2) 双击重试：busy 期间第二次点击被忽略，不产生新的 POST。
+const pending = handlePredictionModalClick({target: confirmTarget});
+await handlePredictionModalClick({target: confirmTarget});
+await pending;
+const afterDoubleClick = confirmPosts.length;
+// 3) 再次重试（confirmFail 仍 true）→ 第三个 POST；然后成功。
+await modalClick({modalAction: "lp-order-confirm"});
+confirmFail = false;
+await modalClick({modalAction: "lp-order-confirm"});
+console.log(JSON.stringify({
+  afterFailure,
+  afterDoubleClick,
+  confirmPostCount: confirmPosts.length,
+  bodies: confirmPosts.map((body) => Object.keys(body).sort()),
+  sameKey: confirmPosts.every((body) => body.idempotency_key === confirmPosts[0].idempotency_key),
+  samePreview: confirmPosts.every((body) => body.preview_id === "pv-1"),
+  modalClosed: modalRoot.innerHTML === "",
+  summary: state.predictionMarket.lpCancelSummary,
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["afterFailure"] == 1
+    assert rendered["afterDoubleClick"] == 2  # 双击的第二次被 busy 抑制，只发一次
+    assert rendered["confirmPostCount"] == 4  # 失败重试×2 + 成功×1
+    for body_keys in rendered["bodies"]:
+        assert body_keys == ["idempotency_key", "preview_id"]
+    assert rendered["sameKey"] is True
+    assert rendered["samePreview"] is True
+    assert rendered["modalClosed"] is True
+    assert rendered["summary"] == "已登记 · 会话 sess-x · 位置保护已生效"
+
+
+def test_lp_entry_state_message_matrix_t7() -> None:
+    """T7: busy/locked/rejected/preview_expired 文案逐类可读，不崩。"""
+    output = _lp158_interactive(r'''
+state.predictionMarket.csrfToken = "csrf-1";
+globalThis.fetch = async (url, init={}) => {
+  const u = String(url);
+  if (u.startsWith("/api/prediction-arbitrage/lp/preview")) {
+    return {ok:true, status:200, json: async () => ({
+      state:"previewed", preview_id:"pv-1", preflight:{},
+      queue_protection_estimate:{baseline_front:"150", projected_ratio:0.6},
+    })};
+  }
+  if (u === "/api/prediction-arbitrage/lp/sessions") {
+    return {ok:true, status:200, json: async () => currentResult};
+  }
+  throw new Error("unexpected " + u);
+};
+const run = async (result) => {
+  currentResult = result;
+  openPredictionModal("lp_order", null, lpOrderIntent(candidateRow));
+  await modalClick({modalAction: "lp-order-preview"});
+  await modalClick({modalAction: "lp-order-confirm"});
+  const html = modalRoot.innerHTML;
+  closePredictionModal();
+  return html;
+};
+let currentResult;
+const busyHtml = await run({state:"busy", reason:"active_lp_session", session_id:"sess-abc123"});
+const lockedHtml = await run({state:"locked", reason:"circuit_breaker_open"});
+const bidHtml = await run({state:"rejected", reason:"best_bid_changed"});
+const expiredHtml = await run({state:"rejected", reason:"preview_expired"});
+console.log(JSON.stringify({
+  busy: busyHtml.includes("已有活动会话（会话 sess-a）")
+    && busyHtml.includes("当天会话于次日 08:00 复核收尾；加量请用 LP 委托表的「加量」按钮"),
+  locked: lockedHtml.includes("交易熔断开启中，禁止新下单；界面保持只读"),
+  bidChanged: bidHtml.includes("买一已变化，未下单"),
+  bidRepreview: bidHtml.includes('data-modal-action="lp-order-repreview"'),
+  expired: expiredHtml.includes("预检已过期，未下单"),
+  expiredRepreview: expiredHtml.includes('data-modal-action="lp-order-repreview"'),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["busy"] is True
+    assert rendered["locked"] is True
+    assert rendered["bidChanged"] is True
+    assert rendered["bidRepreview"] is True
+    assert rendered["expired"] is True
+    assert rendered["expiredRepreview"] is True
+
+
+def test_lp_augment_modal_flow_t15f() -> None:
+    """T15f: 加量模态——入场价锁定、默认 5%=90、160→48.1% 警示、预检/确认体、无会话指引。"""
+    output = _lp158_interactive(r'''
+state.predictionMarket.csrfToken = "csrf-1";
+const session = {state:"entry_open", session_id:"sess-abc123",
+  condition_id:"condition-fed", price:"0.42", quantity:"120",
+  market_title:"Will the Fed cut rates in Q4?"};
+const groupOrders = [{...sessionRow,
+  queue_protection:{state:"monitoring", ratio:0.684, threshold:0.5,
+    front_estimate:"260", level_total:"380", data_time:"2026-09-21T06:32:05Z"}}];
+const previewPosts = [];
+const confirmPosts = [];
+let confirmResult = {state:"entry_open", session_id:"sess-abc123",
+  augment_order_id:"sys-order-2", augment_quantity:"90"};
+globalThis.fetch = async (url, init={}) => {
+  const u = String(url);
+  const method = init.method || "GET";
+  if (u === "/api/prediction-arbitrage/lp/augment/preview" && method === "POST") {
+    previewPosts.push(JSON.parse(init.body));
+    return {ok:true, status:200, json: async () => ({
+      state:"previewed", preview_id:"aug-pv-1", price:"0.42",
+      preflight:{balance:"900", allowance:"900", midpoint:"0.415",
+        best_bid:"0.42", best_ask:"0.43"},
+      queue_protection_estimate:{baseline_front:"260", own_remaining:"120",
+        projected_ratio:260/540},
+    })};
+  }
+  if (u === "/api/prediction-arbitrage/lp/sessions/sess-abc123/augment" && method === "POST") {
+    confirmPosts.push({url: u, body: JSON.parse(init.body)});
+    if (confirmResult.state === "rejected") {
+      return {ok:true, status:200, json: async () => confirmResult};
+    }
+    return {ok:true, status:200, json: async () => confirmResult};
+  }
+  throw new Error("unexpected " + method + " " + u);
+};
+state.predictionMarket.lpDashboard = {
+  recommendations: [{condition_id:"condition-fed", estimated_target_quantity:"90"}],
+  candidates: [],
+};
+const intent = lpAugmentIntent(groupOrders, session);
+openPredictionModal("lp_augment", null, intent);
+const htmlForm = modalRoot.innerHTML;
+// 自定义 160 → 实时合并 A ≈ 48.1% 警示。
+await modalClick({modalAction: "lp-augment-case", caseMode: "custom"});
+modalRoot._qs = {"#lp-augment-estimate": {innerHTML: ""}};
+handlePredictionModalInput({target: {id: "lp-augment-quantity", value: "160"}});
+const liveEstimate = modalRoot._qs["#lp-augment-estimate"].innerHTML;
+// 回到默认 5% 并预检。
+await modalClick({modalAction: "lp-augment-case", caseMode: "five"});
+await modalClick({modalAction: "lp-augment-preview"});
+const reviewHtml = modalRoot.innerHTML;
+await modalClick({modalAction: "lp-augment-confirm"});
+const summary = state.predictionMarket.lpCancelSummary;
+// 无会话拒绝指引。
+confirmResult = {state:"rejected", reason:"session_not_active"};
+openPredictionModal("lp_augment", null, lpAugmentIntent(groupOrders, session));
+await modalClick({modalAction: "lp-augment-preview"});
+await modalClick({modalAction: "lp-augment-confirm"});
+const rejectHtml = modalRoot.innerHTML;
+console.log(JSON.stringify({
+  priceLocked: htmlForm.includes("0.42（入场价，锁定）"),
+  fiveDefault: /value="five" checked/.test(htmlForm) && /value="90"/.test(htmlForm),
+  liveWarn: liveEstimate.includes("48.1%")
+    && liveEstimate.includes("≤ 触发线 50%")
+    && liveEstimate.includes("含既有试挂单"),
+  previewBody: previewPosts[0],
+  confirmBodyKeys: Object.keys(confirmPosts[0].body).sort(),
+  confirmUrl: confirmPosts[0].url,
+  successSummary: summary,
+  noSessionGuide: rejectHtml.includes("请先从候选列表经系统入口下第一单"),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["priceLocked"] is True
+    assert rendered["fiveDefault"] is True
+    assert rendered["liveWarn"] is True
+    assert rendered["previewBody"] == {"session_id": "sess-abc123", "quantity": "90"}
+    assert rendered["confirmBodyKeys"] == ["idempotency_key", "preview_id"]
+    assert rendered["confirmUrl"] == "/api/prediction-arbitrage/lp/sessions/sess-abc123/augment"
+    assert rendered["successSummary"] == "已加量 · 90 份 @ 0.42 · 并入会话 sess-a 保护伞"
+    assert rendered["noSessionGuide"] is True
+
+
+def test_lp_candidate_table_css_fixes_zero_width_columns() -> None:
+    """Issue 158: 候选表 8 列均定宽（合计 100%），第 7/8 列不再零宽。"""
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    widths = {}
+    for column in range(1, 9):
+        marker = f".pm-lp-candidate-table td:nth-child({column}) {{ width: "
+        start = css.index(marker) + len(marker)
+        end = css.index("%;", start)
+        widths[column] = int(css[start:end])
+    assert widths[7] > 0 and widths[8] > 0
+    assert sum(widths.values()) == 100
+    assert ".lp-order-input" in css
+    assert ".radio-line" in css

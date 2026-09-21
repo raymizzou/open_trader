@@ -2530,6 +2530,18 @@ class PredictionExecutionService:
                     if isinstance(session, Mapping)
                     else ""
                 )
+                # Issue 158: augment orders are session-registered too, so
+                # they anchor like the entry and carry the augment flag the
+                # dashboard renders as the 加量单 note.
+                lp_augment_order_ids = {
+                    str(value)
+                    for value in (
+                        session.get("augment_order_ids")
+                        if isinstance(session, Mapping)
+                        else ()
+                    )
+                    or ()
+                }
                 # Issue 159: active first-seen episodes project their payload
                 # as the protection summary of their own token's rows, and
                 # every registered anchor order is an anchor row.
@@ -2546,18 +2558,19 @@ class PredictionExecutionService:
                     except Exception:
                         episodes_by_token = {}
                 for today_row in lp_orders_today:
+                    order_id = str(today_row.get("order_id") or "")
+                    today_row["anchor"] = (
+                        bool(lp_entry_order_id) and order_id == lp_entry_order_id
+                    ) or order_id in lp_augment_order_ids
+                    today_row["augment"] = order_id in lp_augment_order_ids
                     episode = episodes_by_token.get(
                         str(today_row.get("token_id") or "")
                     )
-                    today_row["anchor"] = (
-                        bool(lp_entry_order_id)
-                        and str(today_row.get("order_id") or "") == lp_entry_order_id
-                    )
                     if episode is not None:
                         anchor_ids = episode.get("anchor_order_ids")
-                        if isinstance(anchor_ids, (list, tuple)) and str(
-                            today_row.get("order_id") or ""
-                        ) in {str(value) for value in anchor_ids}:
+                        if isinstance(anchor_ids, (list, tuple)) and order_id in {
+                            str(value) for value in anchor_ids
+                        }:
                             today_row["anchor"] = True
                         today_row["queue_protection"] = dict(episode)
                         continue

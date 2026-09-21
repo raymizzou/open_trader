@@ -6735,12 +6735,20 @@ button { cursor: pointer; }
 .status-danger { background: #fbeae8; border-color: #e5b5b0; color: var(--danger); }
 .status-unknown { background: var(--surface-soft); border: 1px dashed var(--muted); color: var(--muted); }
 .pm-button.lp-cancel, .pm-button.lp-cancel-all { flex: 0 0 auto; font-size: 11px; min-height: 26px; padding: 2px 8px; }
-.pm-lp-candidate-table th:nth-child(1), .pm-lp-candidate-table td:nth-child(1) { width: 26%; }
-.pm-lp-candidate-table th:nth-child(2), .pm-lp-candidate-table td:nth-child(2) { width: 12%; }
-.pm-lp-candidate-table th:nth-child(3), .pm-lp-candidate-table td:nth-child(3) { width: 12%; }
-.pm-lp-candidate-table th:nth-child(4), .pm-lp-candidate-table td:nth-child(4) { width: 15%; }
-.pm-lp-candidate-table th:nth-child(5), .pm-lp-candidate-table td:nth-child(5) { width: 21%; }
-.pm-lp-candidate-table th:nth-child(6), .pm-lp-candidate-table td:nth-child(6) { width: 14%; }
+/* —— issue 158 新增样式：LP 下单/加量模态的输入与单选行 —— */
+.lp-order-input { background: transparent; border: 1px solid var(--line); border-radius: 6px; color: inherit; font: inherit; padding: 3px 8px; width: 90px; }
+.lp-order-input:read-only { opacity: .75; }
+.radio-line { align-items: baseline; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; display: flex; gap: 8px; margin-bottom: 8px; padding: 8px 10px; }
+.radio-line.is-disabled { cursor: not-allowed; opacity: .5; }
+/* —— issue 158 修复：候选表 8 列重配（原 1-6 列合计 100% + fixed 布局压扁 7/8 列） —— */
+.pm-lp-candidate-table th:nth-child(1), .pm-lp-candidate-table td:nth-child(1) { width: 22%; }
+.pm-lp-candidate-table th:nth-child(2), .pm-lp-candidate-table td:nth-child(2) { width: 9%; }
+.pm-lp-candidate-table th:nth-child(3), .pm-lp-candidate-table td:nth-child(3) { width: 9%; }
+.pm-lp-candidate-table th:nth-child(4), .pm-lp-candidate-table td:nth-child(4) { width: 14%; }
+.pm-lp-candidate-table th:nth-child(5), .pm-lp-candidate-table td:nth-child(5) { width: 19%; }
+.pm-lp-candidate-table th:nth-child(6), .pm-lp-candidate-table td:nth-child(6) { width: 11%; }
+.pm-lp-candidate-table th:nth-child(7), .pm-lp-candidate-table td:nth-child(7) { width: 8%; }
+.pm-lp-candidate-table th:nth-child(8), .pm-lp-candidate-table td:nth-child(8) { width: 8%; }
 .pm-lp-card .pm-table a { color: inherit; text-decoration-color: currentColor; }
 .pm-signal-table { min-width: 0; table-layout: fixed; }
 .pm-signal-table th:nth-child(1), .pm-signal-table td:nth-child(1) { width: 132px; }
