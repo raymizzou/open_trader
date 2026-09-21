@@ -1057,8 +1057,13 @@ function setWorkspaceView(view) {
   } else {
     stopPredictionPolling();
     stopPredictionSignalPolling();
-    if (previousView === "prediction_market") invalidatePredictionNLegReads();
-    if (previousView === "prediction_market") loadAccountSnapshot();
+    if (previousView === "prediction_market") {
+      // Issue 162（定案 2，行为变化点）：离开 prediction 视图显式关闭全部
+      // 弹窗 kind（含 order）——隐藏视图背后的模态没有存活理由。
+      if (predictionModal?.kind) closePredictionModal();
+      invalidatePredictionNLegReads();
+      loadAccountSnapshot();
+    }
   }
 }
 
@@ -2015,7 +2020,7 @@ function renderKellyParameterDerivation(stats) {
   `;
 }
 
-let predictionModal = {kind: "", previousFocus: null, busy: false, data: null};
+let predictionModal = {kind: "", previousFocus: null, busy: false, epoch: 0, data: null};
 
 function predictionValue(value, fallback = "-") {
   return value === null || value === undefined || value === "" ? fallback : String(value);
@@ -5617,7 +5622,14 @@ function lpRenderFidelityRestore(root, snapshot) {
 function selectPredictionTab(tab) {
   const active = tab === "multi_leg" ? "multi_leg" : "lp";
   if (state.predictionMarket.activeTab === active) return;
-  if (active !== "multi_leg") invalidatePredictionNLegReads();
+  if (active !== "multi_leg") {
+    // 离开 multi_leg：维持现状——失效 N_LEG 读 + 关闭 N_LEG 域弹窗。
+    invalidatePredictionNLegReads();
+    closeNLegDomainPredictionModal();
+  } else if (LP_MODAL_KINDS.has(predictionModal?.kind || "")) {
+    // Issue 162（定案 2）：离开 lp 标签时显式关闭 LP 三类弹窗。
+    closePredictionModal();
+  }
   state.predictionMarket.activeTab = active;
   renderPredictionMarket();
   fetchPredictionVenues();
@@ -5711,6 +5723,18 @@ function predictionNLegReadCurrent(generation, controller) {
     && signal?.aborted !== true;
 }
 
+// Issue 162（定案 1）：LP 三类弹窗豁免后台轮询关闭——5 秒场所摘要轮询在
+// N_LEG 暂停或失败时不得清掉操作者正在填写的下单/加量/撤单表单。
+const LP_MODAL_KINDS = new Set(["lp_order", "lp_augment", "lp_cancel"]);
+
+// 定案 1：N_LEG 域失效路径只关闭非 LP、非 order 的弹窗
+// （nleg_order/nleg_incident/reset/allowance_cleanup，与既有逐 kind 行为一致；
+// order 维持现状豁免）。order 弹窗由 setWorkspaceView 的全量关闭负责。
+function closeNLegDomainPredictionModal() {
+  const kind = predictionModal?.kind || "";
+  if (kind && !LP_MODAL_KINDS.has(kind) && kind !== "order") closePredictionModal();
+}
+
 function invalidatePredictionNLegReads() {
   const prediction = state.predictionMarket;
   prediction.nLegReadGeneration += 1;
@@ -5736,7 +5760,8 @@ function invalidatePredictionNLegReads() {
   }
   prediction.relationReview.open = false;
   prediction.relationReview.detail = null;
-  if (predictionModal?.kind && predictionModal.kind !== "order") closePredictionModal();
+  // Issue 162（定案 1）：本函数不再关闭任何弹窗；关闭策略由调用方决定
+  // （轮询路径走 closeNLegDomainPredictionModal，离开视图走全量关闭）。
 }
 
 async function fetchPredictionLpDashboard() {
@@ -5790,12 +5815,15 @@ async function fetchPredictionVenues() {
     state.predictionMarket.csrfToken = payload.csrf_token || state.predictionMarket.csrfToken;
     const nLegStatus = predictionNLegStatus(payload);
     state.predictionMarket.nLegStatus = nLegStatus;
-    if (nLegStatus !== "running") invalidatePredictionNLegReads();
-    else if (state.predictionMarket.activeTab === "multi_leg") fetchPredictionState();
+    if (nLegStatus !== "running") {
+      invalidatePredictionNLegReads();
+      closeNLegDomainPredictionModal();
+    } else if (state.predictionMarket.activeTab === "multi_leg") fetchPredictionState();
   } catch (error) {
     state.predictionMarket.venuesError = error instanceof Error ? error.message : String(error);
     state.predictionMarket.nLegStatus = "unknown";
     invalidatePredictionNLegReads();
+    closeNLegDomainPredictionModal();
   } finally {
     state.predictionMarket.venuesRequestInFlight = false;
     if (state.workspaceView === "prediction_market") renderPredictionMarket();
@@ -6160,6 +6188,24 @@ const LP_CONFIRM_FAILURE_STATES = new Set([
   "needs_attention",
 ]);
 
+// Issue 162（定案 6）：动作→所需 kind 映射。click 处理器在发请求前校验
+// 当前弹窗 kind 匹配，不匹配（含未知动作）直接 return，不发任何请求。
+const PREDICTION_MODAL_ACTION_KINDS = {
+  "lp-order-preview": "lp_order",
+  "lp-order-repreview": "lp_order",
+  "lp-order-confirm": "lp_order",
+  "lp-augment-preview": "lp_augment",
+  "lp-augment-repreview": "lp_augment",
+  "lp-augment-confirm": "lp_augment",
+  "lp-cancel-confirm": "lp_cancel",
+  "nleg-confirm": "nleg_order",
+  "nleg-incident-unlock": "nleg_incident",
+  "confirm": "order",
+  "cleanup": "allowance_cleanup",
+  "arm-cleanup": "allowance_cleanup",
+  "reset": "reset",
+};
+
 function lpRatioPercent(ratio) {
   const value = Number(ratio);
   if (!Number.isFinite(value)) return "UNKNOWN";
@@ -6278,7 +6324,7 @@ function lpAugmentEstimateMarkup(data, quantity) {
   const pct = lpRatioPercent(ratio);
   const head = `<div class="pm-check"><span>合并预估</span><strong>前方 ${escapeHtml(formatDisplayNumber(String(front)))}`
     + ` · 现有 ${escapeHtml(formatDisplayNumber(String(own)))}`
-    + ` · 新增 ${escapeHtml(formatDisplayNumber(String(qty)))}`
+    + ` · 新增 ${escapeHtml(String(quantity || ""))}`
     + ` → 加后 A ≈ <strong>${escapeHtml(pct)}%</strong>（触发线 50%）</strong></div>`;
   if (ratio <= 0.5) {
     return head + `<div class="pm-alert warning" role="alert"><p>加后 A ${pct}% ≤ 触发线 50%：提交后首个监控 tick 将撤掉该价位全部自己 BUY（含既有试挂单）。</p></div>`;
@@ -6294,6 +6340,16 @@ function lpAugmentFactsMarkup(preflight, session, existingText) {
     + `<div class="pm-check"><span>余额 / 授权</span><strong>${num(facts.balance)} / ${num(facts.allowance)} USDC</strong></div>`
     + `<div class="pm-check"><span>中间价 / 买一 / 卖一</span><strong>${num(facts.midpoint)} / ${num(facts.best_bid)} / ${num(facts.best_ask)}</strong></div>`
     + `<div class="pm-check"><span>提交时刻校验</span><strong>新鲜盘口 + 买一未变 + 会话仍活动</strong></div>`;
+}
+
+// Issue 162（定案 5/7）：预计占用是弹窗内唯一计算值——$ + (price*qty).toFixed(2)；
+// 数量/价格一律原样字符串，空缺或非数值显示 "-"。
+function lpOrderCostText(price, quantity) {
+  const priceText = String(price ?? "").trim();
+  const qtyText = String(quantity ?? "").trim();
+  if (!priceText || !qtyText) return "-";
+  const cost = Number(priceText) * Number(qtyText);
+  return Number.isFinite(cost) ? `$${cost.toFixed(2)}` : "-";
 }
 
 function lpOrderModalHtml(data = {}) {
@@ -6317,7 +6373,7 @@ function lpOrderModalHtml(data = {}) {
       + `<div class="pm-check-list">`
       + `<div class="pm-check"><span>挂单价 USDC</span><input class="lp-order-input" id="lp-order-price" type="number" step="0.01" min="0.01" max="0.99" value="${escapeHtml(String(data.price ?? ""))}"${locked ? " readonly" : ""}></div>`
       + `<div class="pm-check"><span>数量（份）</span><span><input class="lp-order-input" id="lp-order-quantity" type="number" step="1" min="1" value="${escapeHtml(String(data.quantity ?? ""))}"${locked ? " readonly" : ""}> <span class="sub">${hint}</span></span></div>`
-      + `<div class="pm-check"><span>预计占用</span><strong id="lp-order-cost">-</strong></div>`
+      + `<div class="pm-check"><span>预计占用</span><strong id="lp-order-cost">${lpOrderCostText(data.price, data.quantity)}</strong></div>`
       + `</div>`
       + `<div class="pm-risk-note" role="note"><strong>提交即登记 #152 位置保护</strong><p>经系统入口提交的单自动带基线：初始 A = 前方份额 ÷ 同价位总量，A ≤ 50% 时自动撤掉该价位全部自己 BUY。网页手动单显示与行为不变。</p></div>`;
     const footer = `<footer class="pm-modal-actions"><button class="pm-button" type="button" data-modal-action="cancel">取消</button>`
@@ -6423,7 +6479,9 @@ function lpOrderIntent(row) {
     trialQuantity: quantity,
     price,
     quantity,
-    fiveQuantity: Number.isFinite(target) && target > 0 ? formatDisplayNumber(String(target)) : "",
+    // Issue 162: 数量一律原样字符串——formatDisplayNumber 的千位逗号/两位舍入
+    // 是展示口径，进入输入框与请求体会令 Number() 解析 NaN。
+    fiveQuantity: Number.isFinite(target) && target > 0 ? String(target) : "",
     outcome: String(selected.outcome || ""),
     reviewAtText: String(row?.review_at ?? ""),
     idempotencyKey: predictionIdempotencyKey(),
@@ -6457,7 +6515,8 @@ function lpAugmentIntent(orders, session) {
     }
   }
   const target = targetRow ? Number(targetRow?.estimated_target_quantity) : sessionTarget;
-  const fiveQuantity = Number.isFinite(target) && target > 0 ? formatDisplayNumber(String(target)) : "";
+  // Issue 162: 同 lpOrderIntent——5% 默认量原样字符串，不套展示格式。
+  const fiveQuantity = Number.isFinite(target) && target > 0 ? String(target) : "";
   return {
     session: {
       session_id: String(session?.session_id || ""),
@@ -6590,6 +6649,9 @@ function predictionModalHtml(kind, data = {}) {
     const armed = data.armed === true;
     return `<section class="pm-modal" role="dialog" aria-modal="true" aria-labelledby="pm-dialog-title" tabindex="-1"><header class="pm-modal-header"><h2 id="pm-dialog-title">${title}</h2><p>只把 Predict Account 对 spender 的 USDT allowance 清零；不会发起转入、转出、下单或兑付。</p></header><div class="pm-check-list"><div class="pm-check"><span>owner</span><strong>${escapeHtml(predictionValue(data.owner, "-"))}</strong></div><div class="pm-check"><span>spender</span><strong>${escapeHtml(predictionValue(data.spender, "-"))}</strong></div><div class="pm-check"><span>allowance</span><strong>${escapeHtml(predictionMoney(data.before_allowance))} → ${escapeHtml(predictionMoney(data.after_allowance))}</strong></div><div class="pm-check"><span>gas effect</span><strong>${escapeHtml(predictionValue(data.gas_effect, "消耗 Privy signer BNB"))}</strong></div></div><div class="pm-risk-note" role="note"><strong>不转移 USDT</strong><p>这是授权清零交易，不是资金划转；需要二次确认后才会向本地受保护端点发送 {"confirm":true}。</p></div><footer class="pm-modal-actions"><button class="pm-button" type="button" data-modal-action="cancel">取消</button>${armed ? `<button class="pm-button danger" type="button" data-modal-action="cleanup">二次确认 · 授权清零</button>` : `<button class="pm-button danger" type="button" data-modal-action="arm-cleanup">我知道这会消耗 BNB</button>`}</footer></section>`;
   }
+  // Issue 162（定案 6）：兜底 order 模板只对 kind === "order" 渲染；未知/空
+  // kind（含迟到响应里的 ""）一律返回空串，绝不渲染「确认真实下单」空白框。
+  if (kind !== "order") return "";
   const opportunity = predictionPreviewDisplay(data);
   const policy = opportunity.policy_limits || {};
   const walletCap = predictionMoney(policy.max_wallet_balance);
@@ -6626,7 +6688,9 @@ function predictionModalHtml(kind, data = {}) {
 }
 
 function openPredictionModal(kind, trigger, data) {
-  predictionModal = {kind, previousFocus: trigger || document.activeElement, busy: false, data: data || {}};
+  // Issue 162（定案 3）：epoch 是模态世代号——open/close 各递增一次，异步
+  // 响应用它识别自己所属的弹窗是否已被关闭/替换（迟到响应隔离）。
+  predictionModal = {kind, previousFocus: trigger || document.activeElement, busy: false, epoch: (predictionModal?.epoch || 0) + 1, data: data || {}};
   const root = elements["prediction-market-modal-root"];
   root.innerHTML = predictionModalHtml(kind, data);
   document.body.style.overflow = "hidden";
@@ -6635,7 +6699,7 @@ function openPredictionModal(kind, trigger, data) {
 
 function closePredictionModal() {
   const previous = predictionModal.previousFocus;
-  predictionModal = {kind: "", previousFocus: null, busy: false, data: null};
+  predictionModal = {kind: "", previousFocus: null, busy: false, epoch: (predictionModal?.epoch || 0) + 1, data: null};
   elements["prediction-market-modal-root"].innerHTML = "";
   document.body.style.overflow = "";
   if (previous?.matches?.("[data-action='participate']")) previous.disabled = false;
@@ -6644,8 +6708,11 @@ function closePredictionModal() {
 
 function setPredictionModalBusy(busy) {
   predictionModal.busy = busy;
+  // Issue 162（定案 4）：LP 三类弹窗 busy 期间保留「取消」可点——转圈也允许
+  // 放弃；关闭即 epoch 递增，迟到响应按过期静默丢弃。
+  const keepCancel = busy && LP_MODAL_KINDS.has(predictionModal.kind || "");
   elements["prediction-market-modal-root"].querySelectorAll("button").forEach((button) => {
-    button.disabled = busy;
+    button.disabled = busy && !(keepCancel && button.dataset?.modalAction === "cancel");
   });
 }
 
@@ -6654,11 +6721,16 @@ function handlePredictionModalInput(event) {
   if (!predictionModal?.kind || predictionModal.busy) return;
   const root = elements["prediction-market-modal-root"];
   const target = event.target;
-  if (predictionModal.kind === "lp_order" && target?.id === "lp-order-price") {
-    const qty = Number(root.querySelector("#lp-order-quantity")?.value);
-    const cost = Number(target.value) * qty;
+  if (predictionModal.kind === "lp_order"
+    && (target?.id === "lp-order-price" || target?.id === "lp-order-quantity")) {
+    // Issue 162（定案 7）：价格与数量两个输入都实时重算预计占用。
     const node = root.querySelector("#lp-order-cost");
-    if (node) node.textContent = Number.isFinite(cost) ? `$${cost.toFixed(2)}` : "-";
+    if (node) {
+      node.textContent = lpOrderCostText(
+        root.querySelector("#lp-order-price")?.value,
+        root.querySelector("#lp-order-quantity")?.value,
+      );
+    }
   }
   if (predictionModal.kind === "lp_augment" && target?.id === "lp-augment-quantity") {
     const node = root.querySelector("#lp-augment-estimate");
@@ -7166,7 +7238,14 @@ async function handlePredictionMarketClick(event) {
 
 async function handlePredictionModalClick(event) {
   const action = event.target.closest("[data-modal-action]")?.dataset.modalAction;
-  if (!action || predictionModal.busy) return;
+  // Issue 162（定案 4）：LP 三类弹窗在 busy 期间放行「取消」——转圈可放弃。
+  const busyCancelAllowed = action === "cancel" && LP_MODAL_KINDS.has(predictionModal?.kind || "");
+  if ((!action || predictionModal.busy) && !busyCancelAllowed) return;
+  // Issue 162（定案 3）：捕获点击时刻的模态世代与 kind；每个 await 之后先
+  // 校验——弹窗已被关闭/替换（epoch 或 kind 变化）的迟到响应整包丢弃。
+  const modalEpoch = predictionModal.epoch;
+  const modalKind = predictionModal.kind;
+  const staleResponse = () => predictionModal.epoch !== modalEpoch || predictionModal.kind !== modalKind;
   if (action === "cancel") {
     closePredictionModal();
     return;
@@ -7180,6 +7259,9 @@ async function handlePredictionModalClick(event) {
     lpAugmentSwitchCase(String(event.target.closest("[data-modal-action]")?.dataset.caseMode || ""));
     return;
   }
+  // Issue 162（定案 6）：动作-kind 匹配守卫——映射内动作必须命中当前 kind，
+  // 未登记动作视为不匹配；一律 return，不发请求、不进 busy。
+  if (PREDICTION_MODAL_ACTION_KINDS[action] !== predictionModal.kind) return;
   setPredictionModalBusy(true);
   try {
     if (action === "lp-order-preview" || action === "lp-order-repreview") {
@@ -7211,6 +7293,7 @@ async function handlePredictionModalClick(event) {
       // plans would trip candidate_changed forever.
       if (data.mode === "trial") body.candidate_policy = "best_bid_minimum";
       const preview = await predictionPost("/api/prediction-arbitrage/lp/preview", body);
+      if (staleResponse()) return;
       if (preview && preview.state === "previewed" && String(preview.preview_id || "").trim()) {
         data.preview = preview;
         data.phase = "review";
@@ -7236,6 +7319,17 @@ async function handlePredictionModalClick(event) {
       // 不按成功收尾——模态内如实呈现，不关模态、不写成功摘要。
       const resultState = String(result?.state || "").toLowerCase();
       const hasSession = Boolean(String(result?.session_id || "").trim());
+      if (staleResponse()) {
+        // Issue 162（定案 3 例外）：迟到的确认成功——订单确已落库，仍要写
+        // 摘要并重拉看板报信；但当前弹窗可能已属于别的会话，绝不渲染、
+        // 不关窗、不改 busy。
+        if (hasSession && !LP_CONFIRM_FAILURE_STATES.has(resultState)) {
+          state.predictionMarket.lpCancelSummary =
+            `已登记 · 会话 ${lpShortSessionId(result?.session_id)} · 位置保护已生效`;
+          await fetchPredictionLpDashboard();
+        }
+        return;
+      }
       if (LP_CONFIRM_FAILURE_STATES.has(resultState) || !hasSession) {
         data.result = result && typeof result === "object" ? result : {state: "rejected", reason: "submit_failed"};
         lpModalRenderIdle();
@@ -7258,6 +7352,7 @@ async function handlePredictionModalClick(event) {
         quantity: String(data.quantity ?? ""),
       };
       const preview = await predictionPost("/api/prediction-arbitrage/lp/augment/preview", body);
+      if (staleResponse()) return;
       if (preview && preview.state === "previewed" && String(preview.preview_id || "").trim()) {
         data.preview = preview;
         data.phase = "review";
@@ -7280,6 +7375,16 @@ async function handlePredictionModalClick(event) {
       // entry_rejected）或未携带会话（session_id）的响应一律不按成功收尾。
       const resultState = String(result?.state || "").toLowerCase();
       const hasSession = Boolean(String(result?.session_id || "").trim());
+      if (staleResponse()) {
+        // Issue 162（定案 3 例外）：与 lp-order-confirm 同一迟到成功报信语义，
+        // 摘要用加量文案（读点击时捕获的 data，绝不写回当前弹窗）。
+        if (hasSession && !LP_CONFIRM_FAILURE_STATES.has(resultState)) {
+          state.predictionMarket.lpCancelSummary =
+            `已加量 · ${String(data.quantity ?? "")} 份 @ ${String(data.session?.price ?? "")} · 并入会话 ${lpShortSessionId(data.session?.session_id)} 保护伞`;
+          await fetchPredictionLpDashboard();
+        }
+        return;
+      }
       if (LP_CONFIRM_FAILURE_STATES.has(resultState) || !hasSession) {
         data.result = result && typeof result === "object" ? result : {state: "rejected", reason: "submit_failed"};
         lpModalRenderIdle();
@@ -7301,6 +7406,7 @@ async function handlePredictionModalClick(event) {
     }
     if (action === "cleanup") {
       const result = await predictionPost("/api/prediction-arbitrage/predict-allowance/cleanup", {confirm: true});
+      if (staleResponse()) return;
       if (!result || ["locked", "busy", "rejected"].includes(String(result.state || "").toLowerCase())) {
         throw new Error("授权清零未完成，系统继续保持只读。");
       }
@@ -7322,6 +7428,16 @@ async function handlePredictionModalClick(event) {
       }
       const result = await predictionPost(
         "/api/prediction-arbitrage/lp/orders/cancel", body);
+      if (staleResponse()) {
+        // Issue 162（定案 3 例外）：迟到的撤单成功同样报信（摘要+重拉看板），
+        // 不碰当前弹窗；迟到失败静默丢弃。
+        const staleCanceled = Array.isArray(result?.canceled) ? result.canceled : [];
+        if (staleCanceled.length) {
+          state.predictionMarket.lpCancelSummary = `撤成 ${staleCanceled.length} 笔`;
+          await fetchPredictionLpDashboard();
+        }
+        return;
+      }
       const canceled = Array.isArray(result?.canceled) ? result.canceled : [];
       const notCanceled = result?.not_canceled
         && typeof result.not_canceled === "object" ? result.not_canceled : {};
@@ -7346,6 +7462,7 @@ async function handlePredictionModalClick(event) {
         displayed_fingerprint: fingerprint,
         idempotency_key: predictionIdempotencyKey(),
       });
+      if (staleResponse()) return;
       if (!result || String(result.state || "") !== "PENDING") {
         throw new Error("确认未入队，请刷新后重试。");
       }
@@ -7361,6 +7478,7 @@ async function handlePredictionModalClick(event) {
         actor: "operator",
         reconciliation: "fresh_clean",
       });
+      if (staleResponse()) return;
       closePredictionModal();
       await fetchPredictionState();
       return;
@@ -7369,6 +7487,7 @@ async function handlePredictionModalClick(event) {
       const previewId = predictionModal.data?.preview_id || predictionModal.data?.id;
       if (!String(previewId || "").trim()) throw new Error("预览已失效，请重新获取机会。");
       const result = await predictionPost("/api/prediction-arbitrage/executions", {preview_id: String(previewId || ""), idempotency_key: predictionIdempotencyKey()});
+      if (staleResponse()) return;
       if (!result || ["locked", "busy", "rejected"].includes(String(result.state || "").toLowerCase()) || !String(result.execution_id || "").trim()) {
         throw new Error("确认时后台未接受订单，未提交新的执行任务。");
       }
@@ -7380,6 +7499,7 @@ async function handlePredictionModalClick(event) {
     if (action === "reset") {
       const incidentId = predictionModal.data?.incident_id || predictionModal.data?.id;
       const result = await predictionPost("/api/prediction-arbitrage/circuit-breaker/reset", {incident_id: String(incidentId || "")});
+      if (staleResponse()) return;
       if (!result || ["locked", "busy", "rejected"].includes(String(result.state || "").toLowerCase())) {
         const reason = String(result?.reason || "").trim();
         throw new Error(reason ? `事故仍未解除：${predictionReasonLabel(reason)}` : "事故仍未解除，系统继续保持熔断。");
@@ -7388,6 +7508,9 @@ async function handlePredictionModalClick(event) {
       await fetchPredictionState();
     }
   } catch (error) {
+    // Issue 162（定案 3）：弹窗已被关闭/替换的迟到失败——不写 error、不改
+    // busy、不渲染（弹窗此刻可能属于另一个会话）。
+    if (staleResponse()) return;
     state.predictionMarket.error = error instanceof Error ? error.message : String(error);
     setPredictionModalBusy(false);
     renderPredictionMarket();
@@ -7398,7 +7521,9 @@ function handlePredictionModalKeydown(event) {
   if (!predictionModal.kind) return;
   if (event.key === "Escape") {
     event.preventDefault();
-    if (!predictionModal.busy) closePredictionModal();
+    // Issue 162（定案 4）：LP 三类弹窗 busy 期间 Esc 仍可关闭；关闭即让
+    // 迟到响应按 epoch 过期。
+    if (!predictionModal.busy || LP_MODAL_KINDS.has(predictionModal.kind)) closePredictionModal();
     return;
   }
   if (event.key !== "Tab") return;

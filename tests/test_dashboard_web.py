@@ -22784,3 +22784,365 @@ def test_lp_candidate_table_css_fixes_zero_width_columns() -> None:
     assert sum(widths.values()) == 100
     assert ".lp-order-input" in css
     assert ".radio-line" in css
+
+
+# ===== Issue 162：LP 弹窗生命周期与数值保真（A1–A10） =====
+
+_LP162_INTERACTIVE = _LP158_INTERACTIVE + r'''
+// ===== Issue 162 harness：可延迟 fetch + 受控轮询 =====
+// fetch 换成记录器 + 手动 resolve：每个匹配器一个 pending 句柄，测试显式
+// respond 后才放行响应；未登记的端点直接抛错（不调用真实端点）。
+const fetchCalls = [];
+const deferredResponses = [];
+function deferResponse(matcher) {
+  let release;
+  const gate = new Promise((done) => { release = done; });
+  const handle = {
+    match: matcher, consumed: false, payload: null, gate,
+    respond(payload) { this.payload = payload; release(); },
+  };
+  deferredResponses.push(handle);
+  return handle;
+}
+globalThis.fetch = async (url, init = {}) => {
+  const u = String(url);
+  const method = (init && init.method) || "GET";
+  fetchCalls.push({url: u, method, body: String((init && init.body) || "")});
+  const handle = deferredResponses.find((item) => !item.consumed && item.match(u, method));
+  if (!handle) throw new Error("issue162 harness: unexpected fetch " + method + " " + u);
+  handle.consumed = true;
+  await handle.gate;
+  if (handle.payload instanceof Error) throw handle.payload;
+  return handle.payload;
+};
+const jsonResponse = (body) => ({ok: true, status: 200, json: async () => body});
+const venuesBody = (status) => ({n_leg: {status}, csrf_token: "csrf-1"});
+const venuesMatch = (u, m) => m === "GET" && u.includes("/api/prediction-arbitrage/venues");
+const dashboardMatch = (u, m) => m === "GET" && u.includes("/api/prediction-arbitrage/lp/dashboard");
+const lpPreviewMatch = (u, m) => m === "POST" && u.includes("/api/prediction-arbitrage/lp/preview");
+const lpConfirmMatch = (u, m) => m === "POST" && u.includes("/api/prediction-arbitrage/lp/sessions") && !u.includes("/augment");
+const augmentPreviewMatch = (u, m) => m === "POST" && u.includes("/api/prediction-arbitrage/lp/augment/preview");
+// 受控轮询：捕获 setInterval 回调；测试也可直接调用 fetchPredictionVenues 真函数。
+const pollCallbacks = [];
+window.setInterval = (callback) => { pollCallbacks.push(callback); return 1; };
+const pollTick = async () => { await fetchPredictionVenues(); };
+const postCount = () => fetchCalls.filter((item) => item.method === "POST").length;
+const dashCount = () => fetchCalls.filter((item) => dashboardMatch(item.url, item.method)).length;
+const enterLpView = () => {
+  state.workspaceView = "prediction_market";
+  state.predictionMarket.activeTab = "lp";
+  state.predictionMarket.csrfToken = "csrf-1";
+};
+'''
+
+
+def _lp162_interactive(script: str) -> str:
+    return run_dashboard_js(_LP162_INTERACTIVE + script)
+
+
+def test_lp162_a8_lp_order_quantity_raw_string() -> None:
+    """A8: lp_order 数量原样——1500 / 1500.125 不加千位逗号、不四舍五入；输入框、选项标签、预检体三处一致。"""
+    output = _lp162_interactive(r'''
+state.predictionMarket.csrfToken = "csrf-1";
+const results = {};
+for (const target of ["1500", "1500.125"]) {
+  const row = {...candidateRow, estimated_target_quantity: target};
+  openPredictionModal("lp_order", null, lpOrderIntent(row));
+  await modalClick({modalAction: "lp-order-case", caseMode: "five"});
+  const htmlFive = modalRoot.innerHTML;
+  deferResponse(lpPreviewMatch).respond(jsonResponse({
+    state: "previewed", preview_id: "pv-" + target,
+    preflight: {}, queue_protection_estimate: {baseline_front: "150", projected_ratio: 0.6},
+  }));
+  await modalClick({modalAction: "lp-order-preview"});
+  const call = fetchCalls.filter((item) => lpPreviewMatch(item.url, item.method)).pop();
+  const inputMatch = htmlFive.match(/id="lp-order-quantity"[^>]*value="([^"]*)"/);
+  results[target] = {
+    inputValue: inputMatch ? inputMatch[1] : null,
+    labelOk: htmlFive.includes(`× ${target} 份`),
+    bodyQuantity: JSON.parse(call.body).quantity,
+  };
+}
+console.log(JSON.stringify(results));
+''')
+    rendered = json.loads(output)
+    assert rendered["1500"]["inputValue"] == "1500"
+    assert rendered["1500"]["labelOk"] is True
+    assert rendered["1500"]["bodyQuantity"] == "1500"
+    assert rendered["1500.125"]["inputValue"] == "1500.125"
+    assert rendered["1500.125"]["labelOk"] is True
+    assert rendered["1500.125"]["bodyQuantity"] == "1500.125"
+
+
+def test_lp162_a9_lp_augment_quantity_raw_string() -> None:
+    """A9: lp_augment 数量原样——默认 5% 量 1500.125 进输入框与预检体；合并预估不再 UNKNOWN。"""
+    output = _lp162_interactive(r'''
+state.predictionMarket.csrfToken = "csrf-1";
+const session = {state: "entry_open", session_id: "sess-abc123",
+  condition_id: "condition-fed", price: "0.42", quantity: "120",
+  estimated_target_quantity: "1500.125",
+  market_title: "Will the Fed cut rates in Q4?"};
+const groupOrders = [{...sessionRow}];
+state.predictionMarket.lpDashboard = {recommendations: [], candidates: []};
+const intent = lpAugmentIntent(groupOrders, session);
+openPredictionModal("lp_augment", null, intent);
+const htmlForm = modalRoot.innerHTML;
+deferResponse(augmentPreviewMatch).respond(jsonResponse({
+  state: "previewed", preview_id: "aug-pv-1", price: "0.42",
+  preflight: {},
+  queue_protection_estimate: {baseline_front: "260", own_remaining: "210", projected_ratio: 0.14},
+}));
+await modalClick({modalAction: "lp-augment-preview"});
+const call = fetchCalls.filter((item) => augmentPreviewMatch(item.url, item.method)).pop();
+const inputMatch = htmlForm.match(/id="lp-augment-quantity"[^>]*value="([^"]*)"/);
+console.log(JSON.stringify({
+  inputValue: inputMatch ? inputMatch[1] : null,
+  fiveChecked: /value="five" checked/.test(htmlForm),
+  estimateHasAfter: htmlForm.includes("加后 A ≈"),
+  estimateNoUnknown: !htmlForm.includes("UNKNOWN"),
+  previewQuantity: JSON.parse(call.body).quantity,
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["inputValue"] == "1500.125"
+    assert rendered["fiveChecked"] is True
+    assert rendered["estimateHasAfter"] is True
+    assert rendered["estimateNoUnknown"] is True
+    assert rendered["previewQuantity"] == "1500.125"
+
+
+def test_lp162_a10_lp_order_estimated_cost_three_timings() -> None:
+    """A10: 预计占用三时机——初始渲染、改价、改量都按 price*qty 现算（$630.05 / $450.04 / $900.00）。"""
+    output = _lp162_interactive(r'''
+state.predictionMarket.csrfToken = "csrf-1";
+const row = {...candidateRow,
+  selected_direction: {...candidateRow.selected_direction, price: "0.42", quantity: "1500.125"}};
+openPredictionModal("lp_order", null, lpOrderIntent(row));
+const htmlInitial = modalRoot.innerHTML;
+await modalClick({modalAction: "lp-order-case", caseMode: "custom"});
+modalRoot._qs = {
+  "#lp-order-price": {id: "lp-order-price", value: "0.30"},
+  "#lp-order-quantity": {id: "lp-order-quantity", value: "1500.125"},
+  "#lp-order-cost": {textContent: "-"},
+};
+handlePredictionModalInput({target: {id: "lp-order-price", value: "0.30"}});
+const afterPrice = modalRoot._qs["#lp-order-cost"].textContent;
+modalRoot._qs["#lp-order-quantity"].value = "3000";
+handlePredictionModalInput({target: {id: "lp-order-quantity", value: "3000"}});
+const afterQuantity = modalRoot._qs["#lp-order-cost"].textContent;
+console.log(JSON.stringify({
+  initialCost630: htmlInitial.includes("$630.05"),
+  afterPrice,
+  afterQuantity,
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["initialCost630"] is True
+    assert rendered["afterPrice"] == "$450.04"
+    assert rendered["afterQuantity"] == "$900.00"
+
+
+def test_lp162_a1_venue_poll_paused_keeps_lp_modal_open() -> None:
+    """A1: 场所轮询（paused 载荷）不再关闭 LP 弹窗、输入保留；预先打开的 nleg_order 维持被关（暂停限制不变）。"""
+    output = _lp162_interactive(r'''
+enterLpView();
+// 先验证 N_LEG 域回归：nleg_order 弹窗在一轮 paused 轮询后仍被关闭。
+openPredictionModal("nleg_order", null, {});
+deferResponse(venuesMatch).respond(jsonResponse(venuesBody("paused")));
+await pollTick();
+const nlegClosed = predictionModal.kind === "" && modalRoot.innerHTML === "";
+// LP 弹窗（custom 模式已填价量）：同一轮轮询不得关闭。
+openPredictionModal("lp_order", null, lpOrderIntent(candidateRow));
+await modalClick({modalAction: "lp-order-case", caseMode: "custom"});
+deferResponse(venuesMatch).respond(jsonResponse(venuesBody("paused")));
+await pollTick();
+console.log(JSON.stringify({
+  nlegClosed,
+  lpAlive: predictionModal.kind === "lp_order",
+  inputsKept: /id="lp-order-price"[^>]*value="0\.42"/.test(modalRoot.innerHTML)
+    && /id="lp-order-quantity"[^>]*value="120"/.test(modalRoot.innerHTML),
+  nlegStatus: state.predictionMarket.nLegStatus,
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["nlegClosed"] is True
+    assert rendered["lpAlive"] is True
+    assert rendered["inputsKept"] is True
+    assert rendered["nlegStatus"] == "paused"
+
+
+def test_lp162_a2_venue_poll_failure_keeps_lp_modal_open() -> None:
+    """A2: 场所 fetch reject——LP 弹窗与输入保留；失败轮询仍关闭 N_LEG 域弹窗（维持现状）。"""
+    output = _lp162_interactive(r'''
+enterLpView();
+openPredictionModal("nleg_order", null, {});
+deferResponse(venuesMatch).respond(new Error("Venue summary 503"));
+await pollTick();
+const nlegClosedOnFailure = predictionModal.kind === "" && modalRoot.innerHTML === "";
+openPredictionModal("lp_order", null, lpOrderIntent(candidateRow));
+await modalClick({modalAction: "lp-order-case", caseMode: "custom"});
+deferResponse(venuesMatch).respond(new Error("Venue summary 503"));
+await pollTick();
+console.log(JSON.stringify({
+  nlegClosedOnFailure,
+  lpAlive: predictionModal.kind === "lp_order",
+  inputsKept: /id="lp-order-price"[^>]*value="0\.42"/.test(modalRoot.innerHTML)
+    && /id="lp-order-quantity"[^>]*value="120"/.test(modalRoot.innerHTML),
+  venuesError: state.predictionMarket.venuesError,
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["nlegClosedOnFailure"] is True
+    assert rendered["lpAlive"] is True
+    assert rendered["inputsKept"] is True
+    assert rendered["venuesError"] == "Venue summary 503"
+
+
+def test_lp162_a4_late_preview_renders_review_not_blank_order_box() -> None:
+    """A4: 预检挂起期间被场所轮询——弹窗仍在并进入 review；模态根任何时刻不含「确认真实下单」空白框。"""
+    output = _lp162_interactive(r'''
+enterLpView();
+const previewHandle = deferResponse(lpPreviewMatch);
+openPredictionModal("lp_order", null, lpOrderIntent(candidateRow));
+const clickPromise = modalClick({modalAction: "lp-order-preview"});
+await drain();
+// 预检挂起窗口内驱动一轮场所轮询（paused 载荷）。
+deferResponse(venuesMatch).respond(jsonResponse(venuesBody("paused")));
+await pollTick();
+const htmlAfterPoll = modalRoot.innerHTML;
+previewHandle.respond(jsonResponse({
+  state: "previewed", preview_id: "pv-1",
+  preflight: {}, queue_protection_estimate: {baseline_front: "150", projected_ratio: 0.6},
+}));
+await clickPromise;
+await drain();
+const htmlFinal = modalRoot.innerHTML;
+console.log(JSON.stringify({
+  stillOpen: predictionModal.kind === "lp_order",
+  inReview: htmlFinal.includes("确认提交 · 登记受保护"),
+  neverBlankOrderBox: !htmlAfterPoll.includes("确认真实下单")
+    && !htmlFinal.includes("确认真实下单"),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["stillOpen"] is True
+    assert rendered["inReview"] is True
+    assert rendered["neverBlankOrderBox"] is True
+
+
+def test_lp162_a6_late_preview_failure_is_silent_after_close() -> None:
+    """A6: 预检挂起时 busy 中取消关窗→迟到失败响应——模态根为空、不写 error、无任何渲染。"""
+    output = _lp162_interactive(r'''
+state.predictionMarket.csrfToken = "csrf-1";
+const previewHandle = deferResponse(lpPreviewMatch);
+openPredictionModal("lp_order", null, lpOrderIntent(candidateRow));
+const clickPromise = modalClick({modalAction: "lp-order-preview"});
+await drain();
+await modalClick({modalAction: "cancel"});
+const closedDuringBusy = predictionModal.kind === "" && modalRoot.innerHTML === "";
+previewHandle.respond(jsonResponse({state: "rejected", reason: "best_bid_changed"}));
+await clickPromise;
+await drain();
+console.log(JSON.stringify({
+  closedDuringBusy,
+  rootEmpty: modalRoot.innerHTML === "",
+  silentError: state.predictionMarket.error === "",
+  staysClosed: predictionModal.kind === "",
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["closedDuringBusy"] is True
+    assert rendered["rootEmpty"] is True
+    assert rendered["silentError"] is True
+    assert rendered["staysClosed"] is True
+
+
+def test_lp162_a5_cross_modal_isolation_and_late_success_report() -> None:
+    """A5: 提交挂起→busy 取消→开 lp_cancel 弹窗 B→A 的提交迟到成功——B 仍开、摘要「已登记」、dashboard 重拉、无串窗。"""
+    output = _lp162_interactive(r'''
+enterLpView();
+deferResponse(lpPreviewMatch).respond(jsonResponse({
+  state: "previewed", preview_id: "pv-1",
+  preflight: {}, queue_protection_estimate: {baseline_front: "150", projected_ratio: 0.6},
+}));
+openPredictionModal("lp_order", null, lpOrderIntent(candidateRow));
+await modalClick({modalAction: "lp-order-preview"});
+const confirmHandle = deferResponse(lpConfirmMatch);
+const dashHandle = deferResponse(dashboardMatch);
+dashHandle.respond(jsonResponse(buildDashboard()));
+const confirmPromise = modalClick({modalAction: "lp-order-confirm"});
+await drain();
+// 定案 4：busy 中「取消」关掉弹窗 A。
+await modalClick({modalAction: "cancel"});
+const aCancelled = predictionModal.kind === "";
+// 打开弹窗 B（lp_cancel）。
+openPredictionModal("lp_cancel", null, {scope: "all", orders: [sessionRow]});
+const htmlB = modalRoot.innerHTML;
+const dashBefore = dashCount();
+// A 的提交迟到成功（带 session_id）。
+confirmHandle.respond(jsonResponse({state: "entry_open", session_id: "sess-late99"}));
+await confirmPromise;
+await drain();
+console.log(JSON.stringify({
+  aCancelled,
+  bStillOpen: predictionModal.kind === "lp_cancel",
+  bContentIntact: modalRoot.innerHTML === htmlB && modalRoot.innerHTML.includes("确认撤单"),
+  summaryReported: state.predictionMarket.lpCancelSummary.includes("已登记"),
+  dashboardRefetched: dashCount() > dashBefore,
+  noCrossWindow: !modalRoot.innerHTML.includes("确认真实下单")
+    && !modalRoot.innerHTML.includes("确认 LP 试挂")
+    && !modalRoot.innerHTML.includes("确认提交 · 登记受保护"),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["aCancelled"] is True
+    assert rendered["bStillOpen"] is True
+    assert rendered["bContentIntact"] is True
+    assert rendered["summaryReported"] is True
+    assert rendered["dashboardRefetched"] is True
+    assert rendered["noCrossWindow"] is True
+
+
+def test_lp162_a7_empty_kind_and_action_kind_matching() -> None:
+    """A7: 未知/空 kind 不再渲染 order 模板；lp_order 弹窗下触发 lp-augment-confirm 不发任何 POST。"""
+    output = _lp162_interactive(r'''
+const emptyKind = predictionModalHtml("", {});
+const garbageKind = predictionModalHtml("garbage", {});
+enterLpView();
+deferResponse(lpPreviewMatch).respond(jsonResponse({
+  state: "previewed", preview_id: "pv-1",
+  preflight: {}, queue_protection_estimate: {baseline_front: "150", projected_ratio: 0.6},
+}));
+openPredictionModal("lp_order", null, lpOrderIntent(candidateRow));
+await modalClick({modalAction: "lp-order-preview"});
+const postsBefore = postCount();
+// kind 仍是 lp_order：跨动作的 lp-augment-confirm 必须被动作-kind 守卫拦下。
+await modalClick({modalAction: "lp-augment-confirm"});
+console.log(JSON.stringify({
+  emptyKind: emptyKind === "",
+  garbageKind: garbageKind === "",
+  noCrossActionPost: postCount() === postsBefore,
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["emptyKind"] is True
+    assert rendered["garbageKind"] is True
+    assert rendered["noCrossActionPost"] is True
+
+
+def test_lp162_a3_tab_navigation_closes_modals() -> None:
+    """A3: lp→multi_leg 关闭 LP 弹窗；multi_leg→lp 关闭 N_LEG 域弹窗（维持现状）。"""
+    output = _lp162_interactive(r'''
+state.predictionMarket.csrfToken = "csrf-1";
+openPredictionModal("lp_order", null, lpOrderIntent(candidateRow));
+selectPredictionTab("multi_leg");
+const lpClosedGoingMulti = predictionModal.kind === "" && modalRoot.innerHTML === "";
+// 反向：multi_leg→lp 时预先打开的 nleg_order 被关（现状保持）。
+openPredictionModal("nleg_order", null, {});
+selectPredictionTab("lp");
+const nlegClosedGoingLp = predictionModal.kind === "" && modalRoot.innerHTML === "";
+console.log(JSON.stringify({lpClosedGoingMulti, nlegClosedGoingLp}));
+''')
+    rendered = json.loads(output)
+    assert rendered["lpClosedGoingMulti"] is True
+    assert rendered["nlegClosedGoingLp"] is True
