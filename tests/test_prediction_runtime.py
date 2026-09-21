@@ -8090,6 +8090,540 @@ def test_lp_today_orders_maker_fills_exclude_counterparty_taker_order(
     assert rows["our-maker-order"]["side"] == "BUY"
 
 
+def test_lp_today_orders_complementary_fill_uses_own_price_and_token(
+    tmp_path: Path,
+) -> None:
+    """Issue 161: 互补撮合（我方 BUY YES @ 0.29，对手吃 BUY NO @ 0.71）时，
+    已成交行必须显示我方订单自身的价格与合约（YES · 0.29），
+    不得借用对手方的互补价格/合约。交易所账户成交明细真值：
+    BUY · YES · 20 份 · 29¢ · $5.80。"""
+
+    class FakeTrading:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(
+                wallet_address="0x" + "4" * 40,
+                signer_address="0x" + "5" * 40,
+                predict=None,
+            )
+            self.trade_calls: list[tuple[str, ...]] = []
+            self.trades_requested = threading.Event()
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": datetime(2026, 9, 16, 10, tzinfo=UTC),
+                "open_orders": [],
+                "positions": [],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def lp_market_metadata(
+            self, condition_ids: object
+        ) -> dict[str, dict[str, object]]:
+            return {
+                str(condition_id): {
+                    "market_id": "market-1",
+                    "market_title": "Complementary LP market",
+                    "market_url": "https://polymarket.com/event/comp",
+                    "outcomes": {
+                        "yes": {"label": "Yes", "token_id": "yes-token"},
+                        "no": {"label": "No", "token_id": "no-token"},
+                    },
+                }
+                for condition_id in condition_ids  # type: ignore[attr-defined]
+            }
+
+        def lp_account_trades(
+            self, condition_ids: object, *, stop_event: threading.Event | None = None
+        ) -> dict[str, object]:
+            self.trade_calls.append(tuple(str(item) for item in condition_ids))  # type: ignore[attr-defined]
+            self.trades_requested.set()
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": datetime(2026, 9, 16, 10, 5, tzinfo=UTC),
+                "trades": {
+                    "condition-1": [
+                        {
+                            "id": "comp-1",
+                            "condition_id": "condition-1",
+                            # trade 级事实属于对手方的互补成交。
+                            "token_id": "no-token",
+                            "taker_order_id": "counterparty-taker",
+                            "side": "BUY",
+                            "trader_side": "MAKER",
+                            "price": Decimal("0.71"),
+                            "size": Decimal("20"),
+                            "status": "MATCHED",
+                            "matched_at": datetime(2026, 9, 16, 2, 0, tzinfo=UTC),
+                            "maker_orders": [
+                                {
+                                    "order_id": "our-entry-order",
+                                    "token_id": "yes-token",
+                                    "side": "BUY",
+                                    "price": Decimal("0.29"),
+                                    "matched_amount": Decimal("20"),
+                                }
+                            ],
+                        }
+                    ],
+                },
+            }
+
+    class FakeLP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {
+                "state": "known",
+                "complete": True,
+                "candidates": [],
+                "recommendations": [],
+                "market_rewards": {
+                    "condition-1": {
+                        "state": "known",
+                        "reward_date": "2026-09-16",
+                        "condition_id": "condition-1",
+                        "market_amount": Decimal("0.20"),
+                    }
+                },
+            }
+
+        def status(self, _session_id: str | None = None) -> dict[str, object]:
+            return {"state": "none"}
+
+    trading = FakeTrading()
+    service = PredictionExecutionService(
+        store=PredictionArbitrageStore(tmp_path / "data"),
+        monitor=object(),
+        trading=trading,
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=FakeLP(),
+    )
+
+    first = service.refresh_lp_dashboard_snapshot()
+    assert first["lp_orders_today"] == []
+    assert trading.trades_requested.wait(timeout=5)
+    dashboard = first
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        dashboard = service.refresh_lp_dashboard_snapshot()
+        filled_ids = {
+            str(row["order_id"])
+            for row in dashboard["lp_orders_today"]
+            if row["state"] == "filled"
+        }
+        if "our-entry-order" in filled_ids:
+            break
+        time.sleep(0.05)
+    rows = {
+        str(row["order_id"]): row for row in dashboard["lp_orders_today"]
+    }
+    assert "our-entry-order" in rows
+    row = rows["our-entry-order"]
+    assert row["state"] == "filled"
+    # Issue 161: 我方 maker 订单使用自身成交事实，不借对手方的 0.71/no-token。
+    assert row["price"] == Decimal("0.29")
+    assert row["token_id"] == "yes-token"
+    assert row["outcome"] == "Yes"
+    assert row["side"] == "BUY"
+    assert row["filled_quantity"] == Decimal("20")
+    assert row["status"] == "MATCHED"
+
+
+def test_lp_today_orders_maker_fill_missing_price_stays_unknown(
+    tmp_path: Path,
+) -> None:
+    """Issue 161: maker 行自身价格缺失时，成交行价格保持未知（None），
+    不得回退借用 trade 级的对手方互补价格。"""
+
+    class FakeTrading:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(
+                wallet_address="0x" + "4" * 40,
+                signer_address="0x" + "5" * 40,
+                predict=None,
+            )
+            self.trade_calls: list[tuple[str, ...]] = []
+            self.trades_requested = threading.Event()
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": datetime(2026, 9, 16, 10, tzinfo=UTC),
+                "open_orders": [],
+                "positions": [],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def lp_market_metadata(
+            self, condition_ids: object
+        ) -> dict[str, dict[str, object]]:
+            return {
+                str(condition_id): {
+                    "market_id": "market-1",
+                    "market_title": "Complementary LP market",
+                    "market_url": "https://polymarket.com/event/comp",
+                    "outcomes": {
+                        "yes": {"label": "Yes", "token_id": "yes-token"},
+                        "no": {"label": "No", "token_id": "no-token"},
+                    },
+                }
+                for condition_id in condition_ids  # type: ignore[attr-defined]
+            }
+
+        def lp_account_trades(
+            self, condition_ids: object, *, stop_event: threading.Event | None = None
+        ) -> dict[str, object]:
+            self.trade_calls.append(tuple(str(item) for item in condition_ids))  # type: ignore[attr-defined]
+            self.trades_requested.set()
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": datetime(2026, 9, 16, 10, 5, tzinfo=UTC),
+                "trades": {
+                    "condition-1": [
+                        {
+                            "id": "comp-2",
+                            "condition_id": "condition-1",
+                            "token_id": "no-token",
+                            "taker_order_id": "counterparty-taker",
+                            "side": "BUY",
+                            "trader_side": "MAKER",
+                            "price": Decimal("0.71"),
+                            "size": Decimal("20"),
+                            "status": "MATCHED",
+                            "matched_at": datetime(2026, 9, 16, 2, 0, tzinfo=UTC),
+                            "maker_orders": [
+                                {
+                                    "order_id": "our-entry-order",
+                                    "token_id": "yes-token",
+                                    "side": "BUY",
+                                    "price": None,
+                                    "matched_amount": Decimal("20"),
+                                }
+                            ],
+                        }
+                    ],
+                },
+            }
+
+    class FakeLP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {
+                "state": "known",
+                "complete": True,
+                "candidates": [],
+                "recommendations": [],
+                "market_rewards": {
+                    "condition-1": {
+                        "state": "known",
+                        "reward_date": "2026-09-16",
+                        "condition_id": "condition-1",
+                        "market_amount": Decimal("0.20"),
+                    }
+                },
+            }
+
+        def status(self, _session_id: str | None = None) -> dict[str, object]:
+            return {"state": "none"}
+
+    trading = FakeTrading()
+    service = PredictionExecutionService(
+        store=PredictionArbitrageStore(tmp_path / "data"),
+        monitor=object(),
+        trading=trading,
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=FakeLP(),
+    )
+
+    first = service.refresh_lp_dashboard_snapshot()
+    assert first["lp_orders_today"] == []
+    assert trading.trades_requested.wait(timeout=5)
+    dashboard = first
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        dashboard = service.refresh_lp_dashboard_snapshot()
+        filled_ids = {
+            str(row["order_id"])
+            for row in dashboard["lp_orders_today"]
+            if row["state"] == "filled"
+        }
+        if "our-entry-order" in filled_ids:
+            break
+        time.sleep(0.05)
+    rows = {
+        str(row["order_id"]): row for row in dashboard["lp_orders_today"]
+    }
+    assert "our-entry-order" in rows
+    row = rows["our-entry-order"]
+    # Issue 161: 我方价格缺失 → 价格未知，绝不借对手方的 0.71。
+    assert row["price"] is None
+    assert row["filled_quantity"] == Decimal("20")
+    assert row["token_id"] == "yes-token"
+    assert row["outcome"] == "Yes"
+
+
+def test_lp_today_orders_taker_fill_keeps_trade_level_price_and_token(
+    tmp_path: Path,
+) -> None:
+    """Issue 161: 我方是 taker 时，trade 级 price/token 本就是我方事实，
+    成交行继续使用它们。"""
+
+    class FakeTrading:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(
+                wallet_address="0x" + "4" * 40,
+                signer_address="0x" + "5" * 40,
+                predict=None,
+            )
+            self.trade_calls: list[tuple[str, ...]] = []
+            self.trades_requested = threading.Event()
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": datetime(2026, 9, 16, 10, tzinfo=UTC),
+                "open_orders": [],
+                "positions": [],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def lp_market_metadata(
+            self, condition_ids: object
+        ) -> dict[str, dict[str, object]]:
+            return {
+                str(condition_id): {
+                    "market_id": "market-1",
+                    "market_title": "Complementary LP market",
+                    "market_url": "https://polymarket.com/event/comp",
+                    "outcomes": {
+                        "yes": {"label": "Yes", "token_id": "yes-token"},
+                        "no": {"label": "No", "token_id": "no-token"},
+                    },
+                }
+                for condition_id in condition_ids  # type: ignore[attr-defined]
+            }
+
+        def lp_account_trades(
+            self, condition_ids: object, *, stop_event: threading.Event | None = None
+        ) -> dict[str, object]:
+            self.trade_calls.append(tuple(str(item) for item in condition_ids))  # type: ignore[attr-defined]
+            self.trades_requested.set()
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": datetime(2026, 9, 16, 10, 5, tzinfo=UTC),
+                "trades": {
+                    "condition-1": [
+                        {
+                            "id": "taker-1",
+                            "condition_id": "condition-1",
+                            "token_id": "yes-token",
+                            "taker_order_id": "our-taker-order",
+                            "side": "BUY",
+                            "trader_side": "TAKER",
+                            "price": Decimal("0.30"),
+                            "size": Decimal("40"),
+                            "status": "MATCHED",
+                            "matched_at": datetime(2026, 9, 16, 2, 0, tzinfo=UTC),
+                            "maker_orders": [],
+                        }
+                    ],
+                },
+            }
+
+    class FakeLP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {
+                "state": "known",
+                "complete": True,
+                "candidates": [],
+                "recommendations": [],
+                "market_rewards": {
+                    "condition-1": {
+                        "state": "known",
+                        "reward_date": "2026-09-16",
+                        "condition_id": "condition-1",
+                        "market_amount": Decimal("0.20"),
+                    }
+                },
+            }
+
+        def status(self, _session_id: str | None = None) -> dict[str, object]:
+            return {"state": "none"}
+
+    trading = FakeTrading()
+    service = PredictionExecutionService(
+        store=PredictionArbitrageStore(tmp_path / "data"),
+        monitor=object(),
+        trading=trading,
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=FakeLP(),
+    )
+
+    first = service.refresh_lp_dashboard_snapshot()
+    assert first["lp_orders_today"] == []
+    assert trading.trades_requested.wait(timeout=5)
+    dashboard = first
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        dashboard = service.refresh_lp_dashboard_snapshot()
+        filled_ids = {
+            str(row["order_id"])
+            for row in dashboard["lp_orders_today"]
+            if row["state"] == "filled"
+        }
+        if "our-taker-order" in filled_ids:
+            break
+        time.sleep(0.05)
+    rows = {
+        str(row["order_id"]): row for row in dashboard["lp_orders_today"]
+    }
+    assert "our-taker-order" in rows
+    row = rows["our-taker-order"]
+    assert row["price"] == Decimal("0.30")
+    assert row["token_id"] == "yes-token"
+    assert row["side"] == "BUY"
+    assert row["filled_quantity"] == Decimal("40")
+
+
+def test_lp_today_orders_same_contract_maker_fill_price_unchanged(
+    tmp_path: Path,
+) -> None:
+    """Issue 161: 同合约 maker 成交行为不变——行价格取 maker 自身价格。"""
+
+    class FakeTrading:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(
+                wallet_address="0x" + "4" * 40,
+                signer_address="0x" + "5" * 40,
+                predict=None,
+            )
+            self.trade_calls: list[tuple[str, ...]] = []
+            self.trades_requested = threading.Event()
+
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": datetime(2026, 9, 16, 10, tzinfo=UTC),
+                "open_orders": [],
+                "positions": [],
+                "open_orders_complete": True,
+                "positions_complete": True,
+            }
+
+        def lp_market_metadata(
+            self, condition_ids: object
+        ) -> dict[str, dict[str, object]]:
+            return {
+                str(condition_id): {
+                    "market_id": "market-1",
+                    "market_title": "Complementary LP market",
+                    "market_url": "https://polymarket.com/event/comp",
+                    "outcomes": {
+                        "yes": {"label": "Yes", "token_id": "yes-token"},
+                        "no": {"label": "No", "token_id": "no-token"},
+                    },
+                }
+                for condition_id in condition_ids  # type: ignore[attr-defined]
+            }
+
+        def lp_account_trades(
+            self, condition_ids: object, *, stop_event: threading.Event | None = None
+        ) -> dict[str, object]:
+            self.trade_calls.append(tuple(str(item) for item in condition_ids))  # type: ignore[attr-defined]
+            self.trades_requested.set()
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": datetime(2026, 9, 16, 10, 5, tzinfo=UTC),
+                "trades": {
+                    "condition-1": [
+                        {
+                            "id": "same-1",
+                            "condition_id": "condition-1",
+                            "token_id": "yes-token",
+                            "taker_order_id": "",
+                            "side": "BUY",
+                            "trader_side": "MAKER",
+                            "price": Decimal("0.44"),
+                            "size": Decimal("30"),
+                            "status": "MATCHED",
+                            "matched_at": datetime(2026, 9, 16, 2, 0, tzinfo=UTC),
+                            "maker_orders": [
+                                {
+                                    "order_id": "same-contract-order",
+                                    "token_id": "yes-token",
+                                    "side": "BUY",
+                                    "price": Decimal("0.44"),
+                                    "matched_amount": Decimal("30"),
+                                }
+                            ],
+                        }
+                    ],
+                },
+            }
+
+    class FakeLP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {
+                "state": "known",
+                "complete": True,
+                "candidates": [],
+                "recommendations": [],
+                "market_rewards": {
+                    "condition-1": {
+                        "state": "known",
+                        "reward_date": "2026-09-16",
+                        "condition_id": "condition-1",
+                        "market_amount": Decimal("0.20"),
+                    }
+                },
+            }
+
+        def status(self, _session_id: str | None = None) -> dict[str, object]:
+            return {"state": "none"}
+
+    trading = FakeTrading()
+    service = PredictionExecutionService(
+        store=PredictionArbitrageStore(tmp_path / "data"),
+        monitor=object(),
+        trading=trading,
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=FakeLP(),
+    )
+
+    first = service.refresh_lp_dashboard_snapshot()
+    assert first["lp_orders_today"] == []
+    assert trading.trades_requested.wait(timeout=5)
+    dashboard = first
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        dashboard = service.refresh_lp_dashboard_snapshot()
+        filled_ids = {
+            str(row["order_id"])
+            for row in dashboard["lp_orders_today"]
+            if row["state"] == "filled"
+        }
+        if "same-contract-order" in filled_ids:
+            break
+        time.sleep(0.05)
+    rows = {
+        str(row["order_id"]): row for row in dashboard["lp_orders_today"]
+    }
+    assert "same-contract-order" in rows
+    row = rows["same-contract-order"]
+    assert row["price"] == Decimal("0.44")
+    assert row["token_id"] == "yes-token"
+    assert row["filled_quantity"] == Decimal("30")
+
+
 def test_lp_today_orders_fills_skip_failed_trades(tmp_path: Path) -> None:
     """R2: 同市场一笔 CONFIRMED 30 份 + 一笔 FAILED 77 份 → 只聚合 30。"""
 

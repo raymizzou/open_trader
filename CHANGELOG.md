@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-21
 
+- #161：当天 LP 委托的互补撮合成交行改为显示我方订单自身的价格与 YES/NO 归属（此前整笔撮合的 trade 级价格/合约被记到我方 maker 订单头上，我方挂 BUY YES @ 0.29 时误显示 NO · 71¢）；我方价格缺失时成交行价格显示未知（不借对手方互补价格）。修复仅限成交聚合函数 `_lp_aggregate_fills_by_order`：每笔贡献携带自身 price/token_id。验证：`tests/test_prediction_runtime.py` 新增 4 个 today_orders 用例（互补撮合主复现先红 0.71 后绿 0.29、价格缺失保持 None、taker 维持 trade 级事实、同合约行为不变），`make test TEST='tests/test_prediction_runtime.py -k today_orders'` 全绿（13 通过）。未做 live 调用、push 或部署。
+
 - #156：移除 LP 看板「当前单市场推荐」独立面板。#138 第二轮把 60 秒维护改为全表等权刷新重排后，该面板与「待试挂候选」表第 1 行展示同一市场同一组数字，退化为纯冗余。删除前端渲染函数 `lpCurrentRecommendationMarkup` 及其调用点；表内「当前推荐」徽章、表头副注（待试挂候选 · 非全市场收益前十 · 已排除超可用资金 N 个）、60 秒等权刷新与队首校验均不变，后端零改动。验证：唯一契约用例 `test_lp_trial_single_market_qualification_display` 按新契约重写，先红（panelRemoved=False）后绿；`make test TEST='tests/test_dashboard_web.py'` 全绿（495 通过）；无 CSS 清理（dashboard.css 本无面板规则）。未做 live 调用、push 或部署。
 
 - 测试夹具时间炸弹修复（issue 158 阻断，test-only）：`tests/test_lp_auto_recovery.py::test_history_probe_has_constant_http_budget_and_rotates` 自 2026-09-21T05:00Z（13:00 HKT）起稳定红（探针 0 次 HTTP 请求，`assert 0 == 1`）。机制已实证：history 探针解析 token 走 `_cached_lp_token_ids`，其 warm load 用真实时钟 `datetime.now(UTC)`（服务注入 clock 不参与），store 侧按 `WHERE expires_at > :真实now纪元秒` 过滤；旧夹具把元数据缓存 `expires_at` 固定在注入时钟+24h（=2026-09-21T05:00Z），真实时间一过即 warm load 命中 0 行，探针报 `history_probe_token_cache_unknown`。修复仅把该处 `expires_at` 改为相对真实现在 +24h 宽窗（不引入固定远期日期），并在测试注释记录机制；服务行为断言（waiting_retry、轮转、budget）与生产代码零改动。同机制排查：`lp_metadata_cache_store_entries` 全测试面仅此一处暴露（store 自测两侧同注入时钟、trading 侧 monkeypatch `datetime`，均不受威胁）；同文件 :1003/:1066 `valid_until` 与 :1542 `start_ts` 语义不同（按调用方时钟比较），不动。验证：`make test TEST='tests/test_lp_auto_recovery.py'` 全文件全绿。未做 live 调用、push 或部署。

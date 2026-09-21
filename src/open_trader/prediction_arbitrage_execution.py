@@ -399,8 +399,14 @@ def _lp_aggregate_fills_by_order(
     attribute ``matched_amount`` to each remaining maker order; only a trade
     we placed as taker attributes its size to ``taker_order_id`` — when we
     are the maker that id belongs to the counterparty and must never count.
-    Fills whose ``matched_at`` precedes ``day_start`` (the reward day's UTC
-    00:00, i.e. Beijing 08:00) do not participate in the aggregation.
+    Each contribution carries its own fill facts: maker fills use the maker
+    order's own price and token, never the enclosing trade's taker-side
+    price/token — in a complementary match (our BUY YES vs the counterparty's
+    BUY NO) the counterparty's price/contract belong to the other order, and
+    when our price is missing the fill stays unpriced instead of borrowing
+    the counterparty's. Fills whose ``matched_at`` precedes ``day_start``
+    (the reward day's UTC 00:00, i.e. Beijing 08:00) do not participate in
+    the aggregation.
     """
 
     fills: dict[str, dict[str, object]] = {}
@@ -422,14 +428,22 @@ def _lp_aggregate_fills_by_order(
             size = _decimal(trade.get("size"))
             if size is None or size <= 0:
                 continue
-            price = _decimal(trade.get("price"))
+            trade_price = _decimal(trade.get("price"))
+            trade_token_id = str(trade.get("token_id") or "")
             trader_side = str(trade.get("trader_side") or "").upper()
             taker_order_id = str(trade.get("taker_order_id") or "")
-            contributions: list[tuple[str, Decimal, str]] = []
+            contributions: list[tuple[str, Decimal, str, Decimal | None, str]] = []
             if trader_side == "TAKER":
+                # As taker, the trade-level price/token ARE our own facts.
                 if taker_order_id:
                     contributions.append(
-                        (taker_order_id, size, str(trade.get("side") or "").upper())
+                        (
+                            taker_order_id,
+                            size,
+                            str(trade.get("side") or "").upper(),
+                            trade_price,
+                            trade_token_id,
+                        )
                     )
             else:
                 makers = trade.get("maker_orders")
@@ -447,14 +461,18 @@ def _lp_aggregate_fills_by_order(
                             maker_id,
                             amount,
                             str(maker.get("side") or "").upper(),
+                            # Issue 161: each maker order keeps its own price
+                            # and token; no fallback to the trade-level ones.
+                            _decimal(maker.get("price")),
+                            str(maker.get("token_id") or ""),
                         )
                     )
-            for order_id, amount, side in contributions:
+            for order_id, amount, side, price, token_id in contributions:
                 entry = fills.get(order_id)
                 if entry is None:
                     entry = {
                         "condition_id": condition_id,
-                        "token_id": str(trade.get("token_id") or ""),
+                        "token_id": token_id,
                         "side": side or None,
                         "filled_quantity": Decimal("0"),
                         "notional": Decimal("0"),
