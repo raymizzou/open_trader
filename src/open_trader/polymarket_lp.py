@@ -6983,6 +6983,7 @@ class PolymarketLPService:
                 snapshot, cast(Decimal, request["price"])
             ),
             "baseline_price": request["price"],
+            "baseline_source": "submit",
             "baseline_book_received_at": (
                 book_mapping.get("received_at") if book_mapping else None
             ),
@@ -7146,6 +7147,33 @@ class PolymarketLPService:
             first_seen_at = _first_seen_stamp_value(
                 anchor.get("first_seen_at"), default=now
             )
+            order_placement_times: dict[str, object] = {}
+            placement_datetimes: list[datetime] = []
+            for row in level_rows:
+                order_id = str(row.get("order_id") or "")
+                if not order_id:
+                    continue
+                try:
+                    placement = _timestamp(
+                        row.get("created_at"), name="venue_created_at"
+                    )
+                except ValueError:
+                    order_placement_times[order_id] = None
+                else:
+                    order_placement_times[order_id] = _iso(placement)
+                    placement_datetimes.append(placement)
+
+            def first_text(key: str) -> str | None:
+                for row in ordered:
+                    value = _text(row.get(key))
+                    if value is not None:
+                        return value
+                return None
+
+            market_id = first_text("market_id")
+            market_title = first_text("market_title")
+            market_url = first_text("market_url")
+            outcome = first_text("outcome")
             received_at = _timestamp(
                 baseline["baseline_book_received_at"], name="book_received_at"
             )
@@ -7164,6 +7192,14 @@ class PolymarketLPService:
                 "baseline_version": 1,
                 "threshold": LP_QUEUE_PROTECTION_THRESHOLD,
                 "first_seen_at": _iso(first_seen_at),
+                "venue_created_at": (
+                    _iso(min(placement_datetimes)) if placement_datetimes else None
+                ),
+                "order_placement_times": order_placement_times,
+                "market_id": market_id,
+                "market_title": market_title,
+                "market_url": market_url,
+                "outcome": outcome,
                 "registration_delay": registration_delay,
                 "data_failures": 0,
                 "state": "monitoring",
@@ -8866,14 +8902,209 @@ class PolymarketLPService:
         except Exception:
             pass
 
+    def _queue_protection_identity(
+        self, session: Mapping[str, object]
+    ) -> dict[str, str]:
+        """Resolve notification identity from the durable payload or local cache."""
+
+        condition_id = str(session.get("condition_id") or "").strip()
+        token_id = str(session.get("token_id") or "").strip()
+        title = _text(session.get("market_title")) or _text(session.get("question"))
+        market_url = _text(session.get("market_url"))
+        outcome = _text(session.get("outcome"))
+        if not title or not market_url or not outcome:
+            try:
+                entries_reader = getattr(self.store, "lp_metadata_cache_entries", None)
+                entries = (
+                    entries_reader(now=self._now())
+                    if callable(entries_reader)
+                    else {}
+                )
+                entry = entries.get(condition_id) if isinstance(entries, Mapping) else None
+                cached = (
+                    entry[1]
+                    if isinstance(entry, tuple) and len(entry) == 2
+                    else None
+                )
+                if isinstance(cached, Mapping):
+                    title = title or _text(cached.get("market_title")) or _text(
+                        cached.get("question")
+                    ) or _text(cached.get("title"))
+                    market_url = market_url or _text(cached.get("market_url"))
+                    outcome = outcome or _text(cached.get("outcome"))
+                    outcomes = cached.get("outcomes")
+                    if not outcome and isinstance(outcomes, Mapping):
+                        for raw_outcome in outcomes.values():
+                            if not isinstance(raw_outcome, Mapping):
+                                continue
+                            raw_token = str(raw_outcome.get("token_id") or "").strip()
+                            if raw_token and raw_token == token_id:
+                                outcome = _text(raw_outcome.get("label")) or _text(
+                                    raw_outcome.get("outcome")
+                                )
+                                break
+            except Exception:
+                pass
+        if not title:
+            title = (
+                f"未知市场（condition_id={condition_id or '未知'}; "
+                f"token_id={token_id or '未知'}）"
+            )
+        if not outcome:
+            outcome = f"选项未知（token_id={token_id or '未知'}）"
+        return {
+            "title": title,
+            "url": market_url or "",
+            "outcome": outcome,
+            "condition_id": condition_id or "未知",
+            "token_id": token_id or "未知",
+        }
+
     def _queue_protection_market_title(
         self, session: Mapping[str, object]
     ) -> str:
-        question = _text(session.get("question"))
-        if question is not None:
-            return question
-        condition_id = str(session.get("condition_id") or "")
-        return condition_id[:8] if condition_id else "未知市场"
+        return self._queue_protection_identity(session)["title"]
+
+    @staticmethod
+    def _record_order_placement_times(
+        protection: Mapping[str, object],
+        rows_by_id: Mapping[str, object] | None,
+        order_ids: Collection[str],
+    ) -> dict[str, object]:
+        """Carry valid venue placement stamps into the existing payload."""
+
+        result: dict[str, object] = {}
+        raw = protection.get("order_placement_times")
+        if isinstance(raw, Mapping):
+            result.update({str(key): value for key, value in raw.items() if str(key)})
+        for order_id in order_ids:
+            order_id = str(order_id or "")
+            if not order_id:
+                continue
+            row = rows_by_id.get(order_id) if rows_by_id is not None else None
+            raw_created_at = _field(row, "created_at") if row is not None else None
+            if raw_created_at is None:
+                result.setdefault(order_id, None)
+                continue
+            try:
+                created_at = _timestamp(raw_created_at, name="venue_created_at")
+            except ValueError:
+                result.setdefault(order_id, None)
+            else:
+                result[order_id] = _iso(created_at)
+        return result
+
+    @staticmethod
+    def _beijing_datetime_text(value: object) -> str | None:
+        try:
+            return _timestamp(value).astimezone(_BEIJING).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _lifetime_text(start: datetime, end: datetime) -> str | None:
+        seconds = int((end - start).total_seconds())
+        if seconds < 0:
+            return None
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        parts: list[str] = []
+        if hours:
+            parts.append(f"{hours}小时")
+        if minutes:
+            parts.append(f"{minutes}分")
+        if seconds or not parts:
+            parts.append(f"{seconds}秒")
+        return "".join(parts)
+
+    def _queue_protection_lifecycle_lines(
+        self,
+        protection: Mapping[str, object],
+        order_ids: Sequence[str],
+        *,
+        observed_at: object = None,
+    ) -> list[str]:
+        """Describe actual venue lifetime, or clearly label observation fallback."""
+
+        placement_values = protection.get("order_placement_times")
+        confirmation_values = protection.get("order_cancel_confirmed_at")
+        placements: list[datetime] = []
+        confirmations: list[datetime] = []
+        if isinstance(placement_values, Mapping) and isinstance(
+            confirmation_values, Mapping
+        ):
+            for order_id in order_ids:
+                try:
+                    placement = _timestamp(
+                        placement_values.get(order_id), name="venue_created_at"
+                    )
+                    confirmation = _timestamp(
+                        confirmation_values.get(order_id), name="cancel_confirmed_at"
+                    )
+                except (AttributeError, ValueError):
+                    continue
+                if placement > confirmation:
+                    continue
+                placements.append(placement)
+                confirmations.append(confirmation)
+        actual_known = bool(order_ids) and len(placements) == len(order_ids)
+        lines: list[str] = []
+        if actual_known and placements and confirmations:
+            started = min(placements)
+            completed = max(confirmations)
+            lifetime = self._lifetime_text(started, completed)
+            start_text = self._beijing_datetime_text(started)
+            completed_text = self._beijing_datetime_text(completed)
+            if lifetime is not None and start_text and completed_text:
+                lines.extend(
+                    [
+                        f"首次挂单：北京时间 {start_text}",
+                        f"撤单完成：北京时间 {completed_text}",
+                        f"挂单存续：{lifetime}",
+                    ]
+                )
+                return lines
+
+        lines.append("首次挂单：未知（未取得有效的实际交易所下单时间）")
+        completed: datetime | None = None
+        if isinstance(confirmation_values, Mapping):
+            valid_confirmations: list[datetime] = []
+            for value in confirmation_values.values():
+                try:
+                    valid_confirmations.append(
+                        _timestamp(value, name="cancel_confirmed_at")
+                    )
+                except (AttributeError, ValueError):
+                    continue
+            if valid_confirmations:
+                completed = max(valid_confirmations)
+                completed_text = self._beijing_datetime_text(completed)
+                if completed_text:
+                    lines.append(f"撤单完成：北京时间 {completed_text}")
+        try:
+            first_seen = _timestamp(protection.get("first_seen_at"), name="first_seen_at")
+            observed_text = self._beijing_datetime_text(first_seen)
+            observed_lifetime = (
+                self._lifetime_text(first_seen, completed)
+                if completed is not None
+                else None
+            )
+            if observed_text:
+                lines.append(f"首次观察：北京时间 {observed_text}")
+            if observed_lifetime is not None:
+                lines.append(f"观察到的存续时长：{observed_lifetime}")
+        except (TypeError, ValueError):
+            pass
+        return lines
+
+    @staticmethod
+    def _queue_protection_order_ids(
+        protection: Mapping[str, object],
+    ) -> list[str]:
+        values = protection.get("canceled_order_ids")
+        return [str(value) for value in _items(values) if str(value or "")]
 
     def _queue_protection_success_notification(
         self,
@@ -8887,32 +9118,74 @@ class PolymarketLPService:
         trigger_prefix: str = "",
     ) -> tuple[str, str, str]:
         ratio = _maybe_decimal(protection.get("ratio"))
-        if str(protection.get("cancel_reason") or "") == "book_unreliable":
-            trigger = "行情断联超 10 秒，保守撤单"
+        cancel_reason = str(protection.get("cancel_reason") or "")
+        price = _maybe_decimal(protection.get("baseline_price"))
+        if cancel_reason == "book_unreliable":
+            trigger = "行情数据中断超过 10 秒，进入保守撤单保护，因此已撤单"
         else:
             threshold = (
                 _maybe_decimal(protection.get("threshold"))
                 or LP_QUEUE_PROTECTION_THRESHOLD
             )
-            trigger = (
-                f"A 比例 {_queue_ratio_percent_text(ratio)}% ≤ "
-                f"{_queue_ratio_percent_text(threshold)}%"
-            )
             front = _maybe_decimal(protection.get("front_estimate"))
             total = _maybe_decimal(protection.get("level_total"))
-            trigger += (
+            trigger = (
+                f"BUY 买单估计按份额排到 "
+                f"{_queue_decimal_text(price)} 价位买单队列前约"
+                f"{_queue_ratio_percent_text(ratio)}%的位置，进入“前"
+                f"{_queue_ratio_percent_text(threshold)}%自动撤单”的保护范围"
+                "（按份额估计，不是订单数，也不是精确名次），因此已撤单。\n"
+                f"判断证据：A 比例 {_queue_ratio_percent_text(ratio)}% ≤ "
+                f"{_queue_ratio_percent_text(threshold)}%"
                 f"（前方≈{_queue_decimal_text(front)} / "
                 f"同价位 {_queue_decimal_text(total)} 份）"
             )
-        price = _maybe_decimal(protection.get("baseline_price"))
+        identity = self._queue_protection_identity(session)
+        outcome = identity["outcome"]
+        if outcome.upper() in {"YES", "NO"}:
+            outcome = outcome.upper()
+        identity_line = f"市场：{identity['title']}。"
+        if identity["url"]:
+            identity_line += f"\n链接：{identity['url']}。"
+        identity_line += f"\n方向：BUY {outcome}；价格：{_queue_decimal_text(price)}。"
+        order_ids = self._queue_protection_order_ids(protection)
+        remaining_values = protection.get("cancel_target_remaining")
+        order_parts: list[str] = []
+        for order_id in order_ids:
+            remaining = (
+                _maybe_decimal(remaining_values.get(order_id))
+                if isinstance(remaining_values, Mapping)
+                else None
+            )
+            order_parts.append(f"{order_id}={_queue_decimal_text(remaining)}份")
+        order_line = (
+            "撤单订单（撤单时余量）：" + "；".join(order_parts) + "。"
+            if order_parts
+            else "撤单订单（撤单时余量）：未知。"
+        )
+        baseline_source = str(protection.get("baseline_source") or "")
+        if baseline_source == "first_observation":
+            source_line = "盘口基线：首次观察订单时建立的盘口基线。"
+        elif baseline_source == "submit":
+            source_line = "盘口基线：提交时基线。"
+        else:
+            source_line = "盘口基线：未知。"
+        data_time = self._beijing_datetime_text(protection.get("data_time"))
+        if data_time is None:
+            data_time = beijing_clock(protection.get("data_time"), seconds=True)
+        lifecycle = self._queue_protection_lifecycle_lines(protection, order_ids)
         message = (
-            f"市场：{self._queue_protection_market_title(session)}。\n"
-            f"触发：{trigger_prefix}{trigger}，已撤 {canceled_count} 张买单"
+            f"{identity_line}\n"
+            f"触发：{trigger_prefix}{trigger}。\n"
+            f"结果：已撤 {canceled_count} 张买单"
             f"合计余量 {_queue_decimal_text(canceled_remaining)} 份"
             f" @ {_queue_decimal_text(price)}"
             f"（含 {manual_count} 张手动）。\n"
-            f"数据时间：北京时间 "
-            f"{beijing_clock(protection.get('data_time'), seconds=True) or '未知'}。"
+            f"{order_line}\n"
+            f"{source_line}\n"
+            + "\n".join(lifecycle)
+            + "\n"
+            f"数据时间：北京时间 {data_time or '未知'}。"
         )
         return (
             title,
@@ -8931,13 +9204,49 @@ class PolymarketLPService:
         trigger_prefix: str = "",
     ) -> tuple[str, str, str]:
         ratio = _maybe_decimal(protection.get("ratio"))
+        price = _maybe_decimal(protection.get("baseline_price"))
+        identity = self._queue_protection_identity(session)
+        outcome = identity["outcome"]
+        if outcome.upper() in {"YES", "NO"}:
+            outcome = outcome.upper()
+        identity_line = f"市场：{identity['title']}。"
+        if identity["url"]:
+            identity_line += f"\n链接：{identity['url']}。"
+        identity_line += f"\n方向：BUY {outcome}；价格：{_queue_decimal_text(price)}。"
+        cancel_reason = str(protection.get("cancel_reason") or "")
+        if cancel_reason == "book_unreliable" or ratio is None:
+            trigger = (
+                "行情数据中断，无法可靠估计排队位置，进入保守撤单尝试"
+            )
+        else:
+            threshold = (
+                _maybe_decimal(protection.get("threshold"))
+                or LP_QUEUE_PROTECTION_THRESHOLD
+            )
+            trigger = (
+                f"{trigger_prefix}BUY 买单估计按份额排到 "
+                f"{_queue_decimal_text(price)} 价位买单队列前约"
+                f"{_queue_ratio_percent_text(ratio)}%的位置，进入“前"
+                f"{_queue_ratio_percent_text(threshold)}%自动撤单”的保护范围"
+                "（按份额估计，不是订单数，也不是精确名次）"
+            )
+        baseline_source = str(protection.get("baseline_source") or "")
+        if baseline_source == "first_observation":
+            source_line = "盘口基线：首次观察订单时建立的盘口基线。"
+        elif baseline_source == "submit":
+            source_line = "盘口基线：提交时基线。"
+        else:
+            source_line = "盘口基线：未知。"
+        data_time = self._beijing_datetime_text(protection.get("data_time"))
+        if data_time is None:
+            data_time = beijing_clock(protection.get("data_time"), seconds=True)
         message = (
-            f"市场：{self._queue_protection_market_title(session)}。\n"
-            f"触发：{trigger_prefix}A 比例 {_queue_ratio_percent_text(ratio)}% ≤ 50%，"
+            f"{identity_line}\n"
+            f"尝试保护：{trigger}。\n"
             f"撤单未成功：{failure_reason}，"
             f"残余 {_queue_decimal_text(remaining)} 份待处理。\n"
-            f"数据时间：北京时间 "
-            f"{beijing_clock(protection.get('data_time'), seconds=True) or '未知'}。"
+            f"{source_line}\n"
+            f"数据时间：北京时间 {data_time or '未知'}。"
         )
         return (title, message, title)
 
@@ -9035,8 +9344,24 @@ class PolymarketLPService:
                 )
 
         if not self._mutation_allowed():
+            remaining = None
+            anchor_row = rows_by_id.get(entry_order_id)
+            anchor_token = str(
+                _field(anchor_row, "token_id", _field(anchor_row, "asset_id", ""))
+                or ""
+            )
+            if (
+                entry_order_id
+                and anchor_row is not None
+                and str(_field(anchor_row, "side", "") or "").upper() == "BUY"
+                and anchor_token == token_id
+                and _maybe_decimal(_field(anchor_row, "price")) == baseline_price
+            ):
+                remaining = self._own_queue_remaining_rows(
+                    rows_by_id, token_id=token_id, price=baseline_price
+                )
             return self._blocked_protection_cancel(
-                session, updated, "mutation_blocked", "撤单被熔断阻止", None
+                session, updated, "mutation_blocked", "撤单被熔断阻止", remaining
             )
 
         targets: list[str] = []
@@ -9095,6 +9420,15 @@ class PolymarketLPService:
             persisted_remaining[order_id] = (
                 None if remaining is None else str(remaining)
             )
+        placement_times = self._record_order_placement_times(
+            updated, rows_by_id, targets
+        )
+        confirmed_times: dict[str, object] = {}
+        raw_confirmed = updated.get("order_cancel_confirmed_at")
+        if isinstance(raw_confirmed, Mapping):
+            confirmed_times.update(
+                {str(key): value for key, value in raw_confirmed.items() if str(key)}
+            )
 
         action_key = f"{session_id}:entry-protection-cancel:{entry_order_id}"
         intent_payload: dict[str, object] = {
@@ -9117,6 +9451,7 @@ class PolymarketLPService:
             try:
                 if self._cancel_order(order_id):
                     canceled.append(order_id)
+                    confirmed_times.setdefault(order_id, _iso(self._now()))
                 else:
                     failed.append(order_id)
             except Exception as exc:
@@ -9154,6 +9489,8 @@ class PolymarketLPService:
         updated["cancel_targets"] = episode_targets
         updated["cancel_failed"] = failed
         updated["cancel_target_remaining"] = persisted_remaining
+        updated["order_placement_times"] = placement_times
+        updated["order_cancel_confirmed_at"] = confirmed_times
         updated["canceled_order_ids"] = episode_canceled
         updated["canceled_remaining"] = episode_remaining
         updated["cancel_requested_at"] = _iso(self._now())
@@ -9248,21 +9585,35 @@ class PolymarketLPService:
             if matched is not None and matched > 0:
                 filled += matched
         updated = dict(protection)
+        updated["order_placement_times"] = self._record_order_placement_times(
+            updated, rows_by_id, targets
+        )
+        confirmed_times: dict[str, object] = {}
+        raw_confirmed = updated.get("order_cancel_confirmed_at")
+        if isinstance(raw_confirmed, Mapping):
+            confirmed_times.update(
+                {str(key): value for key, value in raw_confirmed.items() if str(key)}
+            )
+        if receipt_canceled:
+            observed_at = _iso(self._now())
+            for order_id in receipt_canceled:
+                confirmed_times.setdefault(order_id, observed_at)
+        updated["order_cancel_confirmed_at"] = confirmed_times
         if filled > 0:
             updated["state"] = "partially_filled"
             updated["partially_filled_quantity"] = filled
         else:
             updated["state"] = "canceled"
-        if updated.get("notification_sent") is not True:
+        # Receipt-proved cancellations join the durable episode set so the
+        # one-shot success notification reports only actually canceled
+        # orders. A fully filled/rejected target has no cancellation success
+        # to announce.
+        canceled = self._merge_order_id_lists(
+            updated.get("canceled_order_ids"), receipt_canceled
+        )
+        updated["canceled_order_ids"] = canceled
+        if updated.get("notification_sent") is not True and canceled:
             entry_order_id = str(session.get("entry_order_id") or "")
-            # Receipt-proved cancellations join the durable episode set so
-            # the one-shot success notification reports the full target set,
-            # and the cancel-time remaining (never the matched volume) is
-            # reported as the canceled remaining.
-            canceled = self._merge_order_id_lists(
-                updated.get("canceled_order_ids"), receipt_canceled
-            )
-            updated["canceled_order_ids"] = canceled
             # Issue 152 review fix: report the total from the per-target
             # cancel-time remaining persisted at request time, so orders the
             # venue canceled without our acknowledgment keep their share
@@ -9276,7 +9627,7 @@ class PolymarketLPService:
             title, message, xiaoai = self._queue_protection_success_notification(
                 updated,
                 session,
-                canceled_count=len(canceled) or len(targets),
+                canceled_count=len(canceled),
                 manual_count=manual_count,
                 canceled_remaining=_maybe_decimal(
                     updated.get("canceled_remaining")
@@ -9650,6 +10001,14 @@ class PolymarketLPService:
             if (
                 str(episode.get("state")) == "blocked"
                 and updated.get("blocked_notified") is True
+                and (
+                    "mutation_blocked"
+                    not in {
+                        str(value)
+                        for value in _items(episode.get("reason_codes"))
+                    }
+                    or self._mutation_allowed()
+                )
             ):
                 # blocked → recovered: re-arm the one-shot block notice so a
                 # later block notifies again.
@@ -9736,16 +10095,33 @@ class PolymarketLPService:
             if matched is not None and matched > 0:
                 filled += matched
         updated = dict(episode)
+        updated["order_placement_times"] = self._record_order_placement_times(
+            updated, rows_by_id, targets
+        )
+        confirmed_times: dict[str, object] = {}
+        raw_confirmed = updated.get("order_cancel_confirmed_at")
+        if isinstance(raw_confirmed, Mapping):
+            confirmed_times.update(
+                {str(key): value for key, value in raw_confirmed.items() if str(key)}
+            )
+        if receipt_canceled:
+            observed_at = _iso(self._now())
+            for order_id in receipt_canceled:
+                confirmed_times.setdefault(order_id, observed_at)
+        updated["order_cancel_confirmed_at"] = confirmed_times
         if filled > 0:
             updated["state"] = "partially_filled"
             updated["partially_filled_quantity"] = filled
         else:
             updated["state"] = "canceled"
-        if updated.get("notification_sent") is not True:
-            canceled = self._merge_order_id_lists(
-                updated.get("canceled_order_ids"), receipt_canceled
-            )
-            updated["canceled_order_ids"] = canceled
+        # Keep the success notice tied to the durable canceled union. A
+        # target that only reached FILLED/another terminal state must not be
+        # presented as a cancellation.
+        canceled = self._merge_order_id_lists(
+            updated.get("canceled_order_ids"), receipt_canceled
+        )
+        updated["canceled_order_ids"] = canceled
+        if updated.get("notification_sent") is not True and canceled:
             updated["canceled_remaining"] = self._episode_canceled_remaining(
                 updated.get("cancel_target_remaining"), canceled
             )
@@ -9754,7 +10130,7 @@ class PolymarketLPService:
             title, message, xiaoai = self._queue_protection_success_notification(
                 updated,
                 episode,
-                canceled_count=len(canceled) or len(targets),
+                canceled_count=len(canceled),
                 manual_count=manual_count,
                 canceled_remaining=_maybe_decimal(
                     updated.get("canceled_remaining")
@@ -9814,8 +10190,31 @@ class PolymarketLPService:
                 )
 
         if not self._mutation_allowed():
+            remaining = None
+            anchor_ids = self._first_seen_anchor_ids(episode)
+            if anchor_ids and all(order_id in rows_by_id for order_id in anchor_ids):
+                anchor_rows_valid = all(
+                    str(_field(rows_by_id[order_id], "side", "") or "").upper()
+                    == "BUY"
+                    and str(
+                        _field(
+                            rows_by_id[order_id],
+                            "token_id",
+                            _field(rows_by_id[order_id], "asset_id", ""),
+                        )
+                        or ""
+                    )
+                    == token_id
+                    and _maybe_decimal(_field(rows_by_id[order_id], "price"))
+                    == anchor_price
+                    for order_id in anchor_ids
+                )
+                if anchor_rows_valid:
+                    remaining = self._own_queue_remaining_rows(
+                        rows_by_id, token_id=token_id, price=anchor_price
+                    )
             return self._blocked_first_seen_cancel(
-                episode, updated, "mutation_blocked", "撤单被熔断阻止", None
+                episode, updated, "mutation_blocked", "撤单被熔断阻止", remaining
             )
 
         targets: list[str] = []
@@ -9871,6 +10270,16 @@ class PolymarketLPService:
             )
 
         # One durable action per target: intent first, then the cancel.
+        placement_times = self._record_order_placement_times(
+            updated, rows_by_id, targets
+        )
+        confirmed_times: dict[str, object] = {}
+        raw_confirmed = updated.get("order_cancel_confirmed_at")
+        if isinstance(raw_confirmed, Mapping):
+            confirmed_times.update(
+                {str(key): value for key, value in raw_confirmed.items() if str(key)}
+            )
+
         def action_payload(order_id: str) -> dict[str, object]:
             return {
                 "role": "first-seen-protection-cancel",
@@ -9928,6 +10337,7 @@ class PolymarketLPService:
             try:
                 if self._cancel_order(order_id):
                     canceled.append(order_id)
+                    confirmed_times.setdefault(order_id, _iso(self._now()))
                 else:
                     failed.append(order_id)
             except Exception as exc:
@@ -9971,6 +10381,8 @@ class PolymarketLPService:
         updated["cancel_targets"] = episode_targets
         updated["cancel_failed"] = failed
         updated["cancel_target_remaining"] = persisted_remaining
+        updated["order_placement_times"] = placement_times
+        updated["order_cancel_confirmed_at"] = confirmed_times
         updated["canceled_order_ids"] = episode_canceled
         updated["canceled_remaining"] = episode_remaining
         updated["cancel_requested_at"] = _iso(self._now())

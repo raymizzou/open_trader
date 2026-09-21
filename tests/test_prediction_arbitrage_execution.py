@@ -7879,6 +7879,38 @@ def test_first_seen_diff_registers_episode_with_baseline(tmp_path: Path) -> None
     assert Decimal(str(episode["threshold"])) == Decimal("0.5")
 
 
+def test_first_seen_registration_preserves_notice_identity_and_venue_time(
+    tmp_path: Path,
+) -> None:
+    """A first-seen registration keeps display identity and venue placement time."""
+
+    token = "token-fs-notice"
+    placed_at = datetime(2026, 9, 21, 10, 7, tzinfo=UTC)
+    observed_at = datetime(2026, 9, 21, 10, 7, 19, tzinfo=UTC)
+    buy = {
+        **_first_seen_open_order("m-notice", token),
+        "market_title": "Treasury yield below 4.20%?",
+        "market_url": "https://polymarket.com/event/treasury-test",
+        "outcome": "Yes",
+        "created_at": placed_at,
+    }
+    trading = _FirstSeenTrading([[], [buy]], clock=[observed_at - timedelta(seconds=19), observed_at])
+    service, store = _first_seen_service(tmp_path, trading, {token: "10000"})
+
+    service.refresh_lp_dashboard_snapshot()
+    service.refresh_lp_dashboard_snapshot()
+
+    episodes = store.lp_active_first_seen_episodes()
+    assert len(episodes) == 1
+    episode = episodes[0]
+    assert episode["market_title"] == "Treasury yield below 4.20%?"
+    assert episode["market_url"] == "https://polymarket.com/event/treasury-test"
+    assert episode["outcome"] == "Yes"
+    assert episode["venue_created_at"] == "2026-09-21T10:07:00.000000Z"
+    assert episode["first_seen_at"] != episode["venue_created_at"]
+    assert Decimal(str(episode["baseline_front"])) == Decimal("8000")
+
+
 def test_first_seen_sell_order_never_registers(tmp_path: Path) -> None:
     """D1(续): 相邻两轮 diff 发现 SELL → 不登记。"""
     token = "token-fs-sell"

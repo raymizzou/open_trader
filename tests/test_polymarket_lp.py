@@ -9052,6 +9052,751 @@ def test_first_seen_cancel_episode_closes_with_receipts_and_notice(
     assert "首见基线" in message
 
 
+def test_first_seen_notice_identifies_orders_and_plain_language_lifetime(
+    tmp_path,
+) -> None:
+    """The first-seen success notice explains shares, orders, and lifetime."""
+
+    class NoticeExchange(_FirstSeenExchange):
+        def __init__(
+            self, acknowledged_at: datetime, clock_cell: list[datetime]
+        ) -> None:
+            super().__init__()
+            self.acknowledged_at = acknowledged_at
+            self.clock_cell = clock_cell
+
+        def cancel_order(self, order_id: str) -> object:
+            self.cancels.append(order_id)
+            self.clock_cell[0] = self.acknowledged_at
+            return {"canceled": [order_id], "status": "CANCELED"}
+
+    token = _FIRST_SEEN_TOKEN
+    condition = _FIRST_SEEN_CONDITION
+    placed_anchor = datetime(2026, 9, 21, 10, 7, tzinfo=UTC)
+    first_seen = datetime(2026, 9, 21, 10, 7, 19, tzinfo=UTC)
+    placed_second = datetime(2026, 9, 21, 10, 20, tzinfo=UTC)
+    placed_third = datetime(2026, 9, 21, 10, 30, tzinfo=UTC)
+    trigger_at = datetime(2026, 9, 21, 11, 8, 10, tzinfo=UTC)
+    acknowledged_at = datetime(2026, 9, 21, 11, 8, 11, tzinfo=UTC)
+
+    def order(
+        order_id: str,
+        quantity: str,
+        placed_at: datetime,
+        *,
+        order_token: str = token,
+        price: str = "0.123",
+        side: str = "BUY",
+    ) -> dict[str, object]:
+        return {
+            "order_id": order_id,
+            "condition_id": condition,
+            "token_id": order_token,
+            "side": side,
+            "status": "LIVE",
+            "price": price,
+            "original_size": quantity,
+            "size_matched": "0",
+            "remaining_size": quantity,
+            "remaining": quantity,
+            "created_at": placed_at,
+            "market_title": "Treasury yield below 4.20%?",
+            "market_url": "https://polymarket.com/event/treasury-test",
+            "outcome": "Yes",
+        }
+
+    anchor = order("notice-anchor", "50", placed_anchor)
+    second = order("notice-second", "150", placed_second)
+    third = order("notice-third", "50", placed_third)
+    unrelated_token = order("notice-other-token", "25", placed_second, order_token="other-token")
+    unrelated_price = order("notice-other-price", "25", placed_second, price="0.124")
+    unrelated_sell = order("notice-sell", "25", placed_second, side="SELL")
+
+    store = PredictionArbitrageStore(tmp_path)
+    clock_cell = [trigger_at]
+    exchange = NoticeExchange(acknowledged_at, clock_cell)
+    exchange.set_book(token, level_total="284", now=first_seen, condition_id=condition, price="0.123")
+    service = PolymarketLPService(store, exchange, clock=lambda: clock_cell[0])
+    notes: list[tuple[str, str, str]] = []
+    service.set_protection_notifier(lambda title, message, voice: notes.append((title, message, voice)))
+
+    registered = service.register_first_seen_candidates(
+        [anchor], now=first_seen
+    )
+    assert registered["state"] == "registered"
+
+    exchange.set_book(token, level_total="384", now=trigger_at, condition_id=condition, price="0.123")
+    exchange.account_open_orders = [
+        anchor,
+        second,
+        third,
+        unrelated_token,
+        unrelated_price,
+        unrelated_sell,
+    ]
+    service.tick()
+
+    assert exchange.cancels == ["notice-anchor", "notice-second", "notice-third"]
+    assert len(notes) == 1
+    title, message, voice = notes[0]
+    assert "Treasury yield below 4.20%?" in message
+    assert "https://polymarket.com/event/treasury-test" in message
+    assert "BUY YES" in message
+    assert "0.123" in message
+    assert "250" in message
+    assert all(order_id in message for order_id in exchange.cancels)
+    assert "50" in message and "150" in message
+    assert "估计" in message
+    assert "前约34.9%" in message
+    assert "前50%" in message and "保护范围" in message
+    assert "按份额" in message and "不是订单数" in message
+    assert "首次挂单：北京时间 2026-09-21 18:07:00" in message
+    assert "撤单完成：北京时间 2026-09-21 19:08:11" in message
+    assert "挂单存续：1小时1分11秒" in message
+    assert "首次观察订单时建立的盘口基线" in message
+    assert "数据时间：北京时间 2026-09-21 19:08:10" in message
+    assert "notice-other-token" not in message
+    assert "notice-other-price" not in message
+    assert "notice-sell" not in message
+    assert "撤单" in title and "首见基线" in title
+    assert voice.startswith(title)
+
+    stored = store.lp_first_seen_episode(str(registered["episode_id"]))
+    assert stored is not None
+    assert stored["order_placement_times"] == {
+        "notice-anchor": "2026-09-21T10:07:00.000000Z",
+        "notice-second": "2026-09-21T10:20:00.000000Z",
+        "notice-third": "2026-09-21T10:30:00.000000Z",
+    }
+    assert stored["order_cancel_confirmed_at"] == {
+        "notice-anchor": "2026-09-21T11:08:11.000000Z",
+        "notice-second": "2026-09-21T11:08:11.000000Z",
+        "notice-third": "2026-09-21T11:08:11.000000Z",
+    }
+
+    restarted = PolymarketLPService(store, exchange, clock=lambda: clock_cell[0])
+    restarted.set_protection_notifier(lambda title, message, voice: notes.append((title, message, voice)))
+    restarted.tick()
+    assert exchange.cancels == ["notice-anchor", "notice-second", "notice-third"]
+    assert len(notes) == 1
+
+
+def test_legacy_first_seen_notice_uses_local_identity_and_observed_lifetime(
+    tmp_path,
+) -> None:
+    """An old episode uses only the non-expired local identity cache."""
+
+    class LegacyExchange(_FirstSeenExchange):
+        def __init__(self, acknowledged_at: datetime, clock_cell: list[datetime]) -> None:
+            super().__init__()
+            self.acknowledged_at = acknowledged_at
+            self.clock_cell = clock_cell
+            self.external_metadata_calls = 0
+
+        def cancel_order(self, order_id: str) -> object:
+            self.cancels.append(order_id)
+            self.clock_cell[0] = self.acknowledged_at
+            return {"canceled": [order_id], "status": "CANCELED"}
+
+        def lp_market_metadata(self, *args: object, **kwargs: object) -> object:
+            del args, kwargs
+            self.external_metadata_calls += 1
+            raise AssertionError("protection must not fetch external metadata")
+
+    token = _FIRST_SEEN_TOKEN
+    condition = _FIRST_SEEN_CONDITION
+    first_seen = datetime(2026, 9, 21, 10, 7, 19, tzinfo=UTC)
+    trigger_at = datetime(2026, 9, 21, 11, 8, 10, tzinfo=UTC)
+    acknowledged_at = datetime(2026, 9, 21, 11, 8, 11, tzinfo=UTC)
+    clock_cell = [trigger_at]
+    store = PredictionArbitrageStore(tmp_path)
+    exchange = LegacyExchange(acknowledged_at, clock_cell)
+    exchange.set_book(token, level_total="4000", now=trigger_at, condition_id=condition)
+    exchange.account_open_orders = [_queue_receipt("m-1")]
+    service = PolymarketLPService(store, exchange, clock=lambda: clock_cell[0])
+    notes: list[tuple[str, str, str]] = []
+    service.set_protection_notifier(
+        lambda title, message, voice: notes.append((title, message, voice))
+    )
+    _first_seen_episode(store, "ep-legacy", baseline_front="8000")
+    store.lp_update_first_seen_episode(
+        "ep-legacy", patch={"first_seen_at": first_seen.isoformat()}
+    )
+    store.lp_metadata_cache_store_entries(
+        {
+            condition: (
+                (trigger_at + timedelta(hours=1)).timestamp(),
+                {
+                    "market_title": "Treasury yield below 4.20%?",
+                    "market_url": "https://polymarket.com/event/treasury-test",
+                    "outcomes": {"yes": {"token_id": token, "label": "Yes"}},
+                },
+            )
+        }
+    )
+
+    service.tick()
+
+    assert exchange.cancels == ["m-1"]
+    assert exchange.external_metadata_calls == 0
+    assert len(notes) == 1
+    _, message, _ = notes[0]
+    assert "Treasury yield below 4.20%?" in message
+    assert "https://polymarket.com/event/treasury-test" in message
+    assert "BUY YES" in message
+    assert "首次挂单：未知" in message
+    assert "首次观察：北京时间 2026-09-21 18:07:19" in message
+    assert "观察到的存续时长：1小时52秒" in message
+    assert "2026-09-21 18:07:19" not in message.split("首次挂单：未知", 1)[0]
+
+
+@pytest.mark.parametrize("placement_kind", ("missing", "invalid", "future"))
+def test_protection_notice_missing_facts_stays_explicit(
+    tmp_path, placement_kind: str
+) -> None:
+    """Receipt convergence keeps missing identity, quantity, and time explicit."""
+
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    order_id = "legacy-case6-order"
+    condition = _FIRST_SEEN_CONDITION
+    token = _FIRST_SEEN_TOKEN
+    first_seen = now - timedelta(seconds=3)
+
+    class LegacyReceiptExchange(_FirstSeenExchange):
+        def __init__(self) -> None:
+            super().__init__()
+            self.external_metadata_calls = 0
+
+        def lp_market_metadata(self, *args: object, **kwargs: object) -> object:
+            del args, kwargs
+            self.external_metadata_calls += 1
+            raise AssertionError("protection must not fetch external metadata")
+
+    live = {
+        "order_id": order_id,
+        "token_id": token,
+        "side": "BUY",
+        "status": "LIVE",
+        "price": Decimal("0.30"),
+    }
+    canceled = {**live, "status": "CANCELED"}
+    exchange = LegacyReceiptExchange()
+    exchange.set_book(token, level_total="4000", now=now, condition_id=condition)
+    exchange.account_open_orders = [live]
+    exchange.cancel_responses = [{"not_canceled": {order_id: "venue_busy"}}]
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    notes: list[tuple[str, str, str]] = []
+    service.set_protection_notifier(
+        lambda title, message, voice: notes.append((title, message, voice))
+    )
+    _first_seen_episode(
+        store, "ep-case6", baseline_front="8000", anchors=(order_id,)
+    )
+    placement_values = {
+        "missing": {},
+        "invalid": {order_id: "not-a-timestamp"},
+        "future": {order_id: "2026-09-21T13:00:00Z"},
+    }
+    store.lp_update_first_seen_episode(
+        "ep-case6",
+        patch={
+            "first_seen_at": first_seen.isoformat(),
+            "order_placement_times": placement_values[placement_kind],
+        },
+    )
+
+    # Existing outage protection reaches the same cancel seam without using
+    # the unavailable per-order remaining field.
+    exchange.books.clear()
+    for _ in range(9):
+        service.tick()
+    episode = store.lp_first_seen_episode("ep-case6")
+    assert episode is not None
+    assert episode["state"] == "monitoring"
+    service.tick()
+    episode = store.lp_first_seen_episode("ep-case6")
+    assert episode is not None
+    assert episode["state"] == "canceling"
+    assert exchange.cancels == [order_id]
+    assert notes == []
+
+    exchange.account_open_orders = [canceled]
+    service.tick()
+
+    assert exchange.external_metadata_calls == 0
+    assert len(notes) == 1
+    _, message, _ = notes[0]
+    assert f"condition_id={condition}" in message
+    assert f"token_id={token}" in message
+    assert "选项未知" in message
+    assert "撤单订单（撤单时余量）：legacy-case6-order=UNKNOWN份" in message
+    assert "合计余量 UNKNOWN 份" in message
+    assert "首次挂单：未知（未取得有效的实际交易所下单时间）" in message
+    assert "撤单完成：北京时间 2026-09-21 20:00:00" in message
+    assert "首次观察：北京时间 2026-09-21 19:59:57" in message
+    assert "观察到的存续时长：3秒" in message
+    assert "挂单存续：" not in message
+    assert "挂单存续：-" not in message
+    assert "A 比例" not in message
+    assert "%" not in message
+
+
+def test_registered_notice_retry_uses_last_confirmation_and_persisted_order_times(
+    tmp_path,
+) -> None:
+    """A retry keeps the first placement and latest successful acknowledgement."""
+
+    setup_at = datetime(2026, 9, 20, 9, 59, tzinfo=UTC)
+    first_ack = datetime(2026, 9, 21, 11, 0, tzinfo=UTC)
+    final_ack = datetime(2026, 9, 21, 11, 8, 11, tzinfo=UTC)
+    clock_cell = [setup_at]
+
+    class RetryExchange(_Exchange):
+        def __init__(self) -> None:
+            super().__init__()
+            self.acknowledgements = [first_ack, final_ack]
+
+        def cancel_order(self, order_id: str) -> object:
+            self.cancels.append(order_id)
+            response = self.cancel_responses.pop(0)
+            if isinstance(response, dict) and response.get("canceled"):
+                clock_cell[0] = self.acknowledgements.pop(0)
+            return response
+
+    condition = "0x" + "c" * 64
+    token = "0x" + "1" * 64
+    title = "Treasury yield below 4.20%?"
+    url = "https://polymarket.com/event/treasury-test"
+
+    def receipt(
+        order_id: str,
+        quantity: str,
+        placed_at: datetime,
+        *,
+        status: str = "LIVE",
+    ) -> dict[str, object]:
+        row = _queue_receipt(order_id, original=quantity, status=status)
+        row.update(
+            {
+                "condition_id": condition,
+                "token_id": token,
+                "created_at": placed_at,
+                "market_title": title,
+                "market_url": url,
+                "outcome": "YES",
+            }
+        )
+        return row
+
+    exchange = RetryExchange()
+    exchange.snapshot_value = _queue_runtime_snapshot(setup_at, bid_size="10000")
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(
+        store, exchange, clock=lambda: clock_cell[0]
+    )
+    request = {
+        **_request(setup_at),
+        "market_title": title,
+        "market_url": url,
+        "outcome": "YES",
+        "quantity": Decimal("2000"),
+        "review_at": final_ack + timedelta(hours=1),
+    }
+    preview = service.preview(request)
+    started = service.start(str(preview["preview_id"]), "lp-notice-retry")
+    assert started["state"] == "entry_open"
+    entry_id = str(started["entry_order_id"])
+    manual_id = "manual-notice"
+    entry = receipt(entry_id, "2000", datetime(2026, 9, 20, 10, 0, tzinfo=UTC))
+    manual = receipt(manual_id, "1000", datetime(2026, 9, 21, 10, 30, tzinfo=UTC))
+    trigger_at = datetime(2026, 9, 21, 11, 0, tzinfo=UTC)
+    exchange.snapshot_value = _queue_runtime_snapshot(
+        trigger_at,
+        bid_size="4000",
+        orders=[entry, manual],
+        open_orders=[entry, manual],
+    )
+    exchange.snapshot_value["scoring"] = True
+    exchange.cancel_responses = [
+        {"canceled": [entry_id], "status": "CANCELED"},
+        {"not_canceled": {manual_id: "venue_busy"}},
+        {"canceled": [manual_id], "status": "CANCELED"},
+    ]
+    clock_cell[0] = trigger_at
+    notes: list[tuple[str, str, str]] = []
+    service.set_protection_notifier(
+        lambda notice_title, message, voice: notes.append(
+            (notice_title, message, voice)
+        )
+    )
+
+    first = service.tick()
+    protection = first["queue_protection"]
+    assert protection["state"] == "canceling"
+    assert protection["cancel_failed"] == [manual_id]
+    assert protection["order_placement_times"] == {
+        entry_id: "2026-09-20T10:00:00.000000Z",
+        manual_id: "2026-09-21T10:30:00.000000Z",
+    }
+    assert protection["order_cancel_confirmed_at"] == {
+        entry_id: "2026-09-21T11:00:00.000000Z",
+    }
+    assert notes == []
+
+    # The entry has disappeared from open orders; its terminal receipt lets
+    # the restarted service converge the completed target and retry manual.
+    clock_cell[0] = final_ack
+    exchange.snapshot_value = _queue_runtime_snapshot(
+        final_ack,
+        bid_size="4000",
+        orders=[receipt(entry_id, "2000", datetime(2026, 9, 20, 10, 0, tzinfo=UTC), status="CANCELED"), manual],
+        open_orders=[manual],
+    )
+    exchange.snapshot_value["scoring"] = True
+    restarted = PolymarketLPService(
+        store, exchange, clock=lambda: clock_cell[0]
+    )
+    restarted.set_protection_notifier(
+        lambda notice_title, message, voice: notes.append(
+            (notice_title, message, voice)
+        )
+    )
+    final = restarted.tick()
+    assert exchange.cancels == [entry_id, manual_id, manual_id]
+    assert final["queue_protection"]["state"] == "canceling"
+    assert final["queue_protection"]["notification_sent"] is True
+    assert final["queue_protection"]["order_cancel_confirmed_at"] == {
+        entry_id: "2026-09-21T11:00:00.000000Z",
+        manual_id: "2026-09-21T11:08:11.000000Z",
+    }
+    assert len(notes) == 1
+    _, message, _ = notes[0]
+    assert title in message and url in message and "BUY YES" in message
+    assert "首次挂单：北京时间 2026-09-20 18:00:00" in message
+    assert "撤单完成：北京时间 2026-09-21 19:08:11" in message
+    assert "挂单存续：25小时8分11秒" in message
+    assert "提交时基线" in message
+    assert "已撤 2 张买单合计余量 3000 份" in message
+    assert entry_id in message and manual_id in message
+
+    exchange.snapshot_value = _queue_runtime_snapshot(
+        final_ack,
+        bid_size="4000",
+        orders=[
+            receipt(
+                entry_id,
+                "2000",
+                datetime(2026, 9, 20, 10, 0, tzinfo=UTC),
+                status="CANCELED",
+            ),
+            receipt(
+                manual_id,
+                "1000",
+                datetime(2026, 9, 21, 10, 30, tzinfo=UTC),
+                status="CANCELED",
+            ),
+        ],
+        open_orders=[],
+    )
+    restarted.tick()
+    assert exchange.cancels == [entry_id, manual_id, manual_id]
+    assert len(notes) == 1
+
+
+@pytest.mark.parametrize("path", ("first_seen", "submit"))
+def test_protection_notice_does_not_report_filled_targets_as_canceled(
+    tmp_path, path: str
+) -> None:
+    """A filled target after an unacknowledged cancel is not reported as canceled."""
+
+    now = datetime(2026, 9, 21, 11, 8, 10, tzinfo=UTC)
+    token = _FIRST_SEEN_TOKEN
+    condition = _FIRST_SEEN_CONDITION
+    order_id = "filled-first" if path == "first_seen" else "order-1"
+    notes: list[tuple[str, str, str]] = []
+
+    if path == "first_seen":
+        store = PredictionArbitrageStore(tmp_path)
+        exchange = _FirstSeenExchange()
+        exchange.set_book(token, level_total="10000", now=now, condition_id=condition)
+        live = _queue_receipt(order_id, original="2000")
+        live.update(
+            {
+                "condition_id": condition,
+                "token_id": token,
+                "created_at": now - timedelta(minutes=1),
+                "market_title": "Treasury yield below 4.20%?",
+                "market_url": "https://polymarket.com/event/treasury-test",
+                "outcome": "Yes",
+            }
+        )
+        exchange.account_open_orders = [live]
+        service = PolymarketLPService(
+            store,
+            exchange,
+            clock=lambda: now,
+            mutation_guard=lambda *args, **kwargs: True,
+        )
+        service.set_protection_notifier(
+            lambda title, message, voice: notes.append((title, message, voice))
+        )
+        registered = service.register_first_seen_candidates(
+            [
+                {
+                    "order_id": order_id,
+                    "condition_id": condition,
+                    "token_id": token,
+                    "price": Decimal("0.30"),
+                    "remaining": Decimal("2000"),
+                    "created_at": live["created_at"],
+                    "first_seen_at": now,
+                    "market_title": live["market_title"],
+                    "market_url": live["market_url"],
+                    "outcome": live["outcome"],
+                }
+            ],
+            now=now,
+        )
+        assert registered["state"] == "registered"
+        exchange.set_book(token, level_total="4000", now=now, condition_id=condition)
+        episode_id = str(registered["episode_id"])
+    else:
+        store = PredictionArbitrageStore(tmp_path)
+        exchange = _Exchange()
+        exchange.snapshot_value = _queue_runtime_snapshot(now, bid_size="10000")
+        service = PolymarketLPService(store, exchange, clock=lambda: now)
+        service.set_protection_notifier(
+            lambda title, message, voice: notes.append((title, message, voice))
+        )
+        request = {
+            **_request(now),
+            "market_title": "Treasury yield below 4.20%?",
+            "market_url": "https://polymarket.com/event/treasury-test",
+            "review_at": now + timedelta(hours=1),
+            "quantity": Decimal("2000"),
+        }
+        preview = service.preview(request)
+        started = service.start(str(preview["preview_id"]), "lp-filled-target")
+        assert started["state"] == "entry_open"
+        entry_id = str(started["entry_order_id"])
+        live = _queue_receipt(entry_id, original="2000")
+        live.update(
+            {
+                "condition_id": condition,
+                "token_id": token,
+                "created_at": now - timedelta(minutes=1),
+            }
+        )
+        trigger = _queue_runtime_snapshot(
+            now, bid_size="4000", orders=[live], open_orders=[live]
+        )
+        trigger["scoring"] = True
+        exchange.snapshot_value = trigger
+        episode_id = str(started["session_id"])
+
+    exchange.cancel_responses = [
+        {"not_canceled": {order_id: "venue_busy"}},
+    ]
+    first = service.tick()
+    if path == "first_seen":
+        episode = store.lp_first_seen_episode(episode_id)
+        assert episode is not None
+        assert episode["state"] == "canceling"
+        assert episode["canceled_order_ids"] == []
+    else:
+        protection = first["queue_protection"]
+        assert protection["state"] == "canceling"
+        assert protection["canceled_order_ids"] == []
+    assert exchange.cancels == [order_id]
+    assert notes == []
+
+    filled = _queue_receipt(order_id, status="FILLED", matched="2000")
+    if path == "first_seen":
+        exchange.account_open_orders = [filled]
+    else:
+        token_id = str(started["token_id"])
+        exchange.snapshot_value = _queue_runtime_snapshot(
+            now,
+            bid_size="4000",
+            orders=[filled],
+            open_orders=[],
+            trades=[
+                {
+                    "trade_id": "filled-target-trade",
+                    "status": "CONFIRMED",
+                    "maker_orders": [
+                        {
+                            "order_id": order_id,
+                            "side": "BUY",
+                            "token_id": token_id,
+                            "matched_amount": Decimal("2000"),
+                            "price": Decimal("0.30"),
+                        }
+                    ],
+                }
+            ],
+            positions=[{"token_id": token_id, "size": Decimal("2000")}],
+        )
+        exchange.snapshot_value["scoring"] = True
+
+    converged = service.tick()
+    if path == "first_seen":
+        episode = store.lp_first_seen_episode(episode_id)
+        assert episode is not None
+        assert episode["state"] == "partially_filled"
+        assert Decimal(str(episode["partially_filled_quantity"])) == Decimal("2000")
+        assert episode["canceled_order_ids"] == []
+    else:
+        protection = converged["queue_protection"]
+        assert protection["state"] == "partially_filled"
+        assert Decimal(str(protection["partially_filled_quantity"])) == Decimal("2000")
+        assert protection["canceled_order_ids"] == []
+    assert notes == []
+
+    service.tick()
+    assert exchange.cancels == [order_id]
+    assert notes == []
+
+
+@pytest.mark.parametrize("path", ("first_seen", "submit"))
+def test_protection_blocked_notice_identifies_order_and_reason(
+    tmp_path, path: str
+) -> None:
+    """Blocked notices identify the protected quote without claiming completion."""
+
+    now = datetime(2026, 9, 21, 11, 8, 10, tzinfo=UTC)
+    condition = _FIRST_SEEN_CONDITION
+    token = _FIRST_SEEN_TOKEN
+    title = "Treasury yield below 4.20%?"
+    url = "https://polymarket.com/event/treasury-test"
+    flags = {"allowed": True}
+    notes: list[tuple[str, str, str]] = []
+
+    if path == "first_seen":
+        store = PredictionArbitrageStore(tmp_path)
+        exchange = _FirstSeenExchange()
+        # Register from the healthy first observation (front=8000 after our
+        # own 2000 shares), then move the book into the trigger state.  This
+        # lets the recovery tick exercise the existing first-seen re-arm
+        # behavior instead of changing the estimator's baseline.
+        exchange.set_book(token, level_total="10000", now=now, condition_id=condition)
+        row = _queue_receipt("blocked-first", original="2000")
+        row.update(
+            {
+                "condition_id": condition,
+                "token_id": token,
+                "created_at": now - timedelta(minutes=1),
+                "market_title": title,
+                "market_url": url,
+                "outcome": "Yes",
+            }
+        )
+        exchange.account_open_orders = [row]
+        service = PolymarketLPService(
+            store,
+            exchange,
+            clock=lambda: now,
+            mutation_guard=lambda *args, **kwargs: flags["allowed"],
+        )
+        service.register_first_seen_candidates([{
+            "order_id": "blocked-first",
+            "condition_id": condition,
+            "token_id": token,
+            "price": Decimal("0.30"),
+            "remaining": Decimal("2000"),
+            "created_at": row["created_at"],
+            "first_seen_at": now,
+            "market_title": title,
+            "market_url": url,
+            "outcome": "Yes",
+        }], now=now)
+        exchange.set_book(token, level_total="4000", now=now, condition_id=condition)
+    else:
+        store = PredictionArbitrageStore(tmp_path)
+        exchange = _Exchange()
+        exchange.snapshot_value = _queue_runtime_snapshot(now, bid_size="10000")
+        service = PolymarketLPService(
+            store,
+            exchange,
+            clock=lambda: now,
+            mutation_guard=lambda *args, **kwargs: flags["allowed"],
+        )
+        request = {
+            **_request(now),
+            "market_title": title,
+            "market_url": url,
+            "review_at": now + timedelta(hours=1),
+            "quantity": Decimal("2000"),
+        }
+        preview = service.preview(request)
+        started = service.start(str(preview["preview_id"]), "lp-blocked-notice")
+        assert started["state"] == "entry_open"
+        entry_id = str(started["entry_order_id"])
+        row = _queue_receipt(entry_id, original="2000")
+        row.update(
+            {
+                "condition_id": condition,
+                "token_id": token,
+                "created_at": now - timedelta(minutes=1),
+                "market_title": title,
+                "market_url": url,
+                "outcome": "YES",
+            }
+        )
+        exchange.snapshot_value = _queue_runtime_snapshot(
+            now, bid_size="4000", orders=[row], open_orders=[row]
+        )
+        exchange.snapshot_value["scoring"] = True
+
+    service.set_protection_notifier(
+        lambda notice_title, message, voice: notes.append(
+            (notice_title, message, voice)
+        )
+    )
+    flags["allowed"] = False
+    first = service.tick()
+    second = service.tick()
+
+    assert exchange.cancels == []
+    assert first is not None
+    assert second is not None
+    assert len(notes) == 1
+    if path == "first_seen":
+        flags["allowed"] = True
+        exchange.set_book(
+            token, level_total="10000", now=now, condition_id=condition
+        )
+        healthy = service.tick()
+        assert healthy is not None
+        assert exchange.cancels == []
+        assert len(notes) == 1
+        flags["allowed"] = False
+        exchange.set_book(
+            token, level_total="4000", now=now, condition_id=condition
+        )
+        recovered_block = service.tick()
+        assert recovered_block is not None
+        assert len(notes) == 2
+    assert exchange.cancels == []
+    notice_title, message, _ = notes[0]
+    assert "受阻" in notice_title
+    assert title in message and url in message
+    assert "BUY YES" in message and "0.3" in message
+    assert "按份额" in message and "保护范围" in message
+    assert "撤单未成功" in message
+    assert "残余 2000 份待处理" in message
+    assert "UNKNOWN" not in message
+    assert "已撤" not in message
+    assert "挂单存续" not in message
+    expected_source = (
+        "首次观察订单时建立的盘口基线"
+        if path == "first_seen"
+        else "提交时基线"
+    )
+    assert expected_source in message
+
+
 def test_first_seen_guard_and_identity_conflict_block_cancel(
     tmp_path,
 ) -> None:
