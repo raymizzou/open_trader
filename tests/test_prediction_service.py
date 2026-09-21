@@ -10145,6 +10145,300 @@ def test_lp_routes_preserve_guard_and_idempotency(tmp_path: Path) -> None:
     assert len(exchange.posts) == 1
 
 
+def test_lp_augment_routes_preserve_guard_idempotency_and_schema(
+    tmp_path: Path,
+) -> None:
+    """Issue 158: 加量路由契约——鉴权、严格 schema、幂等重试、busy 仍 200。"""
+
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    condition_id = "0x" + "c" * 64
+    token_id = "0x" + "1" * 64
+
+    class Exchange:
+        def __init__(self) -> None:
+            self.posts: list[dict[str, object]] = []
+            self.cancels: list[str] = []
+            self.snapshot = {
+                "account": {
+                    "authenticated": True,
+                    "balance": Decimal("1000"),
+                    "allowance": Decimal("1000"),
+                    "positions": [],
+                    "open_orders": [],
+                },
+                "market": {
+                    "market_id": "market-1",
+                    "condition_id": condition_id,
+                    "token_id": token_id,
+                    "outcome": "YES",
+                    "accepting_orders": True,
+                    "exchange_type": "CLOB",
+                    "tick_size": Decimal("0.01"),
+                    "minimum_order_size": Decimal("1"),
+                    "fee": Decimal("0"),
+                    "fees_enabled": False,
+                    "reward_min_size": Decimal("1"),
+                    "reward_max_spread": Decimal("0.10"),
+                },
+                "book": {
+                    "timestamp": now,
+                    "received_at": now,
+                    "asks": [{"price": Decimal("0.31"), "size": Decimal("100")}],
+                    "bids": [{"price": Decimal("0.29"), "size": Decimal("100")}],
+                },
+                "trades": [],
+                "orders": [],
+                "orders_terminal": True,
+            }
+
+        def lp_snapshot(self, _request: Mapping[str, object]) -> dict[str, object]:
+            return self.snapshot
+
+        def create_limit_order(self, **kwargs: object) -> dict[str, object]:
+            return dict(kwargs)
+
+        def post_order(self, signed: dict[str, object]) -> dict[str, object]:
+            self.posts.append(dict(signed))
+            return {
+                **signed,
+                "order_id": f"lp-order-{len(self.posts)}",
+                "status": "LIVE",
+            }
+
+        def cancel_order(self, order_id: str) -> dict[str, object]:
+            self.cancels.append(order_id)
+            return {"status": "CANCELED", "order_id": order_id}
+
+    exchange = Exchange()
+    store = PredictionArbitrageStore(tmp_path)
+    lp = PolymarketLPService(store, exchange, clock=lambda: now)
+    execution = PredictionExecutionService(
+        store=store,
+        monitor=_Monitor(),
+        trading=exchange,
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "prediction_arbitrage" / "execution.lock",
+        lp=lp,
+    )
+    execution._breaker_open = False
+
+    production_runtime = SimpleNamespace(
+        mode="production",
+        state="RUNNING",
+        production_owner=True,
+        store=store,
+        monitor=_Monitor(),
+        execution=execution,
+        cross_venue_monitor=None,
+    )
+
+    request = {
+        "market_id": "market-1",
+        "condition_id": condition_id,
+        "token_id": token_id,
+        "outcome": "YES",
+        "question": "Will it happen?",
+        "price": "0.30",
+        "quantity": "10",
+        "review_at": (now + timedelta(minutes=10)).isoformat(),
+    }
+    with _running_server(
+        production_runtime,
+        session_token="session-token",
+        csrf_token="csrf-token",
+        runtime_metadata={"git_sha": "abc123"},
+    ) as (base, _server_instance):
+        preview_status, preview = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/preview",
+                data=json.dumps(request).encode("utf-8"),
+            )
+        )
+        assert preview_status == 200
+        entry_status, entry = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/sessions",
+                data=json.dumps(
+                    {
+                        "preview_id": preview["preview_id"],
+                        "idempotency_key": "lp-aug-api-entry",
+                    }
+                ).encode("utf-8"),
+            )
+        )
+        assert entry_status == 200
+        assert entry["state"] == "entry_open"
+        session_id = str(entry["session_id"])
+        augment_path = f"/api/prediction-arbitrage/lp/sessions/{session_id}/augment"
+
+        # 严格 schema：恰好 {session_id, quantity}。
+        bad_preview_status, _bad_preview = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/augment/preview",
+                data=json.dumps(
+                    {"session_id": session_id, "quantity": "90", "price": "0.30"}
+                ).encode("utf-8"),
+            )
+        )
+        assert bad_preview_status == 400
+
+        augment_preview_status, augment_preview = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/augment/preview",
+                data=json.dumps(
+                    {"session_id": session_id, "quantity": "90"}
+                ).encode("utf-8"),
+            )
+        )
+        assert augment_preview_status == 200
+        assert augment_preview["state"] == "previewed"
+        assert augment_preview["price"] == "0.30"
+        assert augment_preview["request"]["session_id"] == session_id
+        assert len(exchange.posts) == 1
+
+        start_body = json.dumps(
+            {
+                "preview_id": augment_preview["preview_id"],
+                "idempotency_key": "lp-aug-api-1",
+            }
+        ).encode("utf-8")
+        first_status, first = _response(
+            _production_request(base, augment_path, data=start_body)
+        )
+        assert first_status == 200
+        assert first["state"] == "entry_open"
+        assert first["augment_order_id"] == "lp-order-2"
+        assert len(exchange.posts) == 2
+
+        # 幂等重试：同 key 同 body → 返既有结果，无第二张加量单。
+        retry_status, retry = _response(
+            _production_request(base, augment_path, data=start_body)
+        )
+        assert retry_status == 200
+        assert retry["augment_order_id"] == "lp-order-2"
+        assert len(exchange.posts) == 2
+
+        # 严格 schema：恰好 {preview_id, idempotency_key}。
+        extra_status, _extra = _response(
+            _production_request(
+                base,
+                augment_path,
+                data=json.dumps(
+                    {
+                        "preview_id": augment_preview["preview_id"],
+                        "idempotency_key": "lp-aug-api-2",
+                        "extra": True,
+                    }
+                ).encode("utf-8"),
+            )
+        )
+        assert extra_status == 400
+        missing_status, _missing = _response(
+            _production_request(
+                base,
+                augment_path,
+                data=b'{"preview_id":"x"}',
+            )
+        )
+        assert missing_status == 400
+
+        # busy 分支保持 HTTP 200：既有活动会话时新开 lp/sessions 的响应
+        # 仍是 200，由 body 内 state 分支渲染文案（定案 10）。
+        busy_preview_status, busy_preview = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/preview",
+                data=json.dumps(request).encode("utf-8"),
+            )
+        )
+        assert busy_preview_status == 200
+        busy_status, busy = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/sessions",
+                data=json.dumps(
+                    {
+                        "preview_id": busy_preview["preview_id"],
+                        "idempotency_key": "lp-aug-api-busy",
+                    }
+                ).encode("utf-8"),
+            )
+        )
+        assert busy_status == 200
+        assert busy["state"] == "busy"
+        assert busy["reason"] == "active_lp_session"
+        assert len(exchange.posts) == 2
+
+        # 熔断开启 → 加量确认被锁，不下单。
+        execution._breaker_open = True
+        locked_preview_status, locked_preview = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/augment/preview",
+                data=json.dumps(
+                    {"session_id": session_id, "quantity": "90"}
+                ).encode("utf-8"),
+            )
+        )
+        assert locked_preview_status == 200
+        locked_status, locked = _response(
+            _production_request(
+                base,
+                augment_path,
+                data=json.dumps(
+                    {
+                        "preview_id": locked_preview["preview_id"],
+                        "idempotency_key": "lp-aug-api-3",
+                    }
+                ).encode("utf-8"),
+            )
+        )
+        assert locked_status == 200
+        assert locked == {"state": "locked", "reason": "circuit_breaker_open"}
+        assert len(exchange.posts) == 2
+
+    shadow_runtime = SimpleNamespace(
+        mode="shadow",
+        state="RUNNING",
+        production_owner=False,
+        store=store,
+        monitor=_Monitor(),
+        execution=execution,
+        cross_venue_monitor=None,
+        shadow_evidence={
+            "mode": "shadow",
+            "guard_attempts": [],
+            "first_violation": None,
+            "codex": {"relation": {"calls": 0, "successes": 0}},
+        },
+    )
+
+    with _server(shadow_runtime) as shadow_base:
+        shadow_preview_status, _shadow_preview = _response(
+            _production_request(
+                shadow_base,
+                "/api/prediction-arbitrage/lp/augment/preview",
+                data=json.dumps(
+                    {"session_id": session_id, "quantity": "90"}
+                ).encode("utf-8"),
+            )
+        )
+        shadow_augment_status, _shadow_augment = _response(
+            _production_request(
+                shadow_base,
+                f"/api/prediction-arbitrage/lp/sessions/{session_id}/augment",
+                data=b'{"preview_id":"x","idempotency_key":"k"}',
+            )
+        )
+
+    assert shadow_preview_status == shadow_augment_status == 403
+    assert len(exchange.posts) == 2
+
+
 def test_production_http_confirmation_preserves_execution_idempotency(
     tmp_path: Path,
 ) -> None:

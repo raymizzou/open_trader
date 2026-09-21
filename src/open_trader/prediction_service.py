@@ -853,6 +853,7 @@ def create_prediction_server(
                     self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
                 return
             lp_preview_path = "/api/prediction-arbitrage/lp/preview"
+            lp_augment_preview_path = "/api/prediction-arbitrage/lp/augment/preview"
             lp_candidate_preview_path = (
                 "/api/prediction-arbitrage/lp/candidates/preview"
             )
@@ -867,6 +868,11 @@ def create_prediction_server(
                 candidate = path[len(lp_sessions_prefix) : -len("/stop")]
                 if candidate and "/" not in candidate:
                     lp_stop_session = candidate
+            lp_augment_session: str | None = None
+            if path.startswith(lp_sessions_prefix) and path.endswith("/augment"):
+                candidate = path[len(lp_sessions_prefix) : -len("/augment")]
+                if candidate and "/" not in candidate:
+                    lp_augment_session = candidate
             execution_mutation = path in {
                 "/api/prediction-arbitrage/preview",
                 "/api/prediction-arbitrage/executions",
@@ -886,11 +892,12 @@ def create_prediction_server(
                 "/api/prediction-arbitrage/n-leg/circuit-breaker/reset",
                 "/api/prediction-arbitrage/llm-provider",
                 lp_preview_path,
+                lp_augment_preview_path,
                 lp_candidate_preview_path,
                 lp_candidate_refresh_path,
                 lp_cancel_orders_path,
                 lp_start_path,
-            } and lp_stop_session is None:
+            } and lp_stop_session is None and lp_augment_session is None:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return
             try:
@@ -1007,12 +1014,32 @@ def create_prediction_server(
                     if not callable(lp_preview):
                         raise RuntimeError("LP execution service is unavailable")
                     result = lp_preview(request_payload)
+                elif path == lp_augment_preview_path:
+                    # Issue 158: augment preflight locks quantity and the
+                    # session entry price; the session id comes from the body.
+                    self._require_schema(payload, {"session_id", "quantity"})
+                    lp_augment_preview = getattr(execution, "lp_augment_preview", None)
+                    if not callable(lp_augment_preview):
+                        raise RuntimeError("LP execution service is unavailable")
+                    result = lp_augment_preview(payload)
                 elif path == lp_start_path:
                     self._require_schema(payload, {"preview_id", "idempotency_key"})
                     lp_start = getattr(execution, "lp_start", None)
                     if not callable(lp_start):
                         raise RuntimeError("LP execution service is unavailable")
                     result = lp_start(
+                        self._required_string(payload, "preview_id"),
+                        self._required_string(payload, "idempotency_key"),
+                    )
+                elif lp_augment_session is not None:
+                    # Issue 158: augment submit keeps the strict two-field
+                    # confirm shape of lp/sessions.
+                    self._require_schema(payload, {"preview_id", "idempotency_key"})
+                    lp_augment = getattr(execution, "lp_augment", None)
+                    if not callable(lp_augment):
+                        raise RuntimeError("LP execution service is unavailable")
+                    result = lp_augment(
+                        lp_augment_session,
                         self._required_string(payload, "preview_id"),
                         self._required_string(payload, "idempotency_key"),
                     )
@@ -1215,8 +1242,15 @@ def create_prediction_server(
                         confirm=True, audit=audit
                     )
                 status = HTTPStatus.OK
+                # Issue 158: the LP entry/augment submit responses render
+                # their state branch in the dashboard modal from the body
+                # (busy/locked/rejected text), so they stay HTTP 200.
+                lp_submit_state_body = (
+                    path == lp_start_path or lp_augment_session is not None
+                )
                 if (
                     not execution_mutation
+                    and not lp_submit_state_body
                     and isinstance(result, Mapping)
                     and result.get("state") == "busy"
                 ):

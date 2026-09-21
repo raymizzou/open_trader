@@ -3933,6 +3933,49 @@ class PredictionExecutionService:
         finally:
             self._release_global_lock(lock)
 
+    def lp_augment_preview(self, request: Mapping[str, object]) -> dict[str, object]:
+        """Run the LP augment read-only preflight through the LP service."""
+
+        service = self._lp
+        preview = getattr(service, "augment_preview", None)
+        if not callable(preview):
+            return {"state": "rejected", "reason": "lp_unavailable"}
+        return preview(request)
+
+    def lp_augment(
+        self, session_id: str, preview_id: str, idempotency_key: str
+    ) -> dict[str, object]:
+        """Submit one augment under the shared execution mutex (issue 158).
+
+        Mirrors the lp_start shape: breaker and active-execution gates first,
+        then the global lock.  Unlike lp_start there is deliberately no
+        active-LP-session busy gate — the augment requires the session.
+        """
+
+        service = self._lp
+        augment = getattr(service, "augment", None)
+        if not callable(augment):
+            return {"state": "rejected", "reason": "lp_unavailable"}
+        key = str(idempotency_key).strip()
+        if not key:
+            return {"state": "rejected", "reason": "idempotency_key_required"}
+        if self._breaker_is_open():
+            return {"state": "locked", "reason": "circuit_breaker_open"}
+        active = self._store.active_execution()
+        if active is not None:
+            return {
+                "state": "busy",
+                "reason": "active_execution",
+                "execution_id": active.get("execution_id"),
+            }
+        lock = self._acquire_global_lock()
+        if lock is None:
+            return {"state": "busy", "reason": "execution_lock"}
+        try:
+            return augment(str(session_id), str(preview_id), key)
+        finally:
+            self._release_global_lock(lock)
+
     def lp_tick(self) -> dict[str, object]:
         """Run one LP reconciliation iteration under the shared mutex."""
 
