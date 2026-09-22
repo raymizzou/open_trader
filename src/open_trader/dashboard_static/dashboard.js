@@ -3368,6 +3368,59 @@ function lpDashboardYieldCell(observation) {
     + "</strong>" + note + "</div>";
 }
 
+// LP-TR-1: 当天委托表「今日奖励(累计 · $/小时)」格。累计行与结算卡
+// lpDashboardRewardSummary 同源同值（market_rewards 载荷，市场级合计，
+// 计奖日 UTC 当日累计）：仅 reward.state === "known" 按已知渲染——
+// USD → predictionExactMoney 绿色金额；非 USD → 原始币种串；
+// state 非 known（含读失败保留旧值与 usd_value_unknown 条目）一律
+// UNKNOWN，但保留上次值/上次成功时间，绝不按 0 计。小时行与
+// lpDashboardYieldCell 同一已知判定（state=known 且账户事实未过期），
+// 金额经 lpDashboardMoney。
+function lpDashboardTodayRewardCell(firstOrder, rewards, observation) {
+  const identity = String(firstOrder?.condition_id || "");
+  const reward = identity && rewards[identity] && typeof rewards[identity] === "object"
+    ? rewards[identity] : {};
+  const currency = String(reward.currency || "").toUpperCase();
+  const rawAmount = reward.market_amount_raw ?? reward.raw_amount;
+  const rawAsset = reward.asset || reward.market_asset
+    || (currency !== "USD" ? reward.currency : "");
+  const dataNote = "<span class=\"sub\">数据 "
+    + escapeHtml(predictionHktTimestamp(reward.checked_at || reward.last_success_at, "UNKNOWN"))
+    + " · 计奖日(UTC)当日累计</span>";
+  let amountLine;
+  let noteLine;
+  if (reward.state === "known" && currency === "USD"
+    && predictionHasValue(reward.market_amount)) {
+    amountLine = "今日已赚 <strong class=\"pm-tone-ok\">"
+      + escapeHtml(predictionExactMoney(reward.market_amount, "UNKNOWN")) + "</strong>";
+    noteLine = dataNote;
+  } else if (reward.state === "known" && predictionHasValue(rawAmount)
+    && predictionHasValue(rawAsset)) {
+    amountLine = "今日已赚 <strong class=\"pm-tone-ok\">"
+      + escapeHtml(String(rawAmount) + " " + String(rawAsset)) + "</strong>";
+    noteLine = dataNote;
+  } else {
+    amountLine = "今日已赚 <span class=\"pm-lp-unknown\">UNKNOWN</span>";
+    const retained = predictionHasValue(reward.market_amount)
+      || predictionHasValue(rawAmount)
+      || predictionHasValue(reward.last_success_at);
+    noteLine = retained
+      ? "<span class=\"sub\">上次成功 "
+        + escapeHtml(predictionHktTimestamp(reward.last_success_at || reward.checked_at, "UNKNOWN"))
+        + " · 读到失败先保留旧值</span>"
+      : "<span class=\"sub\">奖励数据未知 · 不按 0 计</span>";
+  }
+  const source = observation && typeof observation === "object" ? observation : null;
+  const hourlyKnown = Boolean(source) && source.state === "known"
+    && !lpDashboardAccountFactsStale(source)
+    && predictionHasValue(source.current_hourly_reward_usd)
+    && Number.isFinite(Number(source.current_hourly_reward_usd));
+  const hourlyLine = hourlyKnown
+    ? "≈<strong>" + escapeHtml(lpDashboardMoney(source.current_hourly_reward_usd)) + "</strong>/小时"
+    : "≈<span class=\"pm-lp-unknown\">UNKNOWN</span>/小时";
+  return "<div class=\"num\">" + amountLine + hourlyLine + noteLine + "</div>";
+}
+
 function lpDashboardRewardSummary(item, rewards) {
   const identity = String(item.condition_id || "");
   const reward = identity && rewards[identity] && typeof rewards[identity] === "object"
@@ -4081,6 +4134,8 @@ function lpDashboardTodayMarketRow(
     + "<td>" + lpMarketTitleLink(firstOrder) + "<span class=\"sub\">" + escapeHtml(subtitle)
     + "</span>" + detailsMarkup + "</td>"
     + "<td data-label=\"LP 收益率(推荐 → 实际)\">" + rewardMarkup + "</td>"
+    + "<td data-label=\"今日奖励(累计 · $/小时)\" class=\"num\">"
+      + lpDashboardTodayRewardCell(firstOrder, rewards, observation) + "</td>"
     + "<td data-label=\"份额占比\">" + shareMarkup + "</td>"
     + "<td data-label=\"实际占用资金\" class=\"num\">" + capitalMarkup + "</td>"
     + "<td data-label=\"压力损失(警戒线 10%)\">" + riskMarkup + "</td>"
@@ -4363,7 +4418,7 @@ function predictionLpCard(payload) {
       group, rewards, rewardShares, observations,
       lpDashboardRowSessions(group, sessionsById, sessionByCondition),
     )).join("")
-    : "<tr><td colspan=\"6\" class=\"pm-observation-empty\">当天暂无 LP 委托。从上方待试挂候选点「挂单」登记第一笔，提交即受位置保护。</td></tr>";
+    : "<tr><td colspan=\"7\" class=\"pm-observation-empty\">当天暂无 LP 委托。从上方待试挂候选点「挂单」登记第一笔，提交即受位置保护。</td></tr>";
   const nonLpRowCount = Number(dashboard.non_lp_row_count);
   const nonLpFootnote = Number.isFinite(nonLpRowCount) && nonLpRowCount > 0
     ? "<p class=\"sub\">账户另有 " + escapeHtml(String(nonLpRowCount))
@@ -4476,7 +4531,7 @@ function predictionLpCard(payload) {
     + predictionLpPreparation(dashboard.preparation)
     + budgetLineMarkup
     + "<section aria-label=\"当天 LP 委托\"><h3>当天 LP 委托 <span class=\"sub\">· 北京时间 08:00 起 · 活跃在前 · 已完结沉底 · 各按当前小时奖励率降序 · 一标的一行</span></h3><div class=\"pm-table-wrap\"><table class=\"pm-table pm-lp-order-table\">"
-    + "<thead><tr><th scope=\"col\">标的</th><th scope=\"col\">LP 收益率(推荐 → 实际)</th><th scope=\"col\">份额占比</th><th scope=\"col\">实际占用资金</th><th scope=\"col\">压力损失(警戒线 10%)</th><th scope=\"col\">委托与成交量</th></tr></thead>"
+    + "<thead><tr><th scope=\"col\">标的</th><th scope=\"col\">LP 收益率(推荐 → 实际)</th><th scope=\"col\">今日奖励(累计 · $/小时)</th><th scope=\"col\">份额占比</th><th scope=\"col\">实际占用资金</th><th scope=\"col\">压力损失(警戒线 10%)</th><th scope=\"col\">委托与成交量</th></tr></thead>"
     + "<tbody>" + todayRowsHtml + "</tbody></table></div>"
     + nonLpFootnote
     + "<p class=\"sub\">预计 LP 毛奖励；压力损失不含奖励抵扣；10% 是风险警告线；「试挂/正式」由委托数量对比最小计分数量自动标注（买=最小计分数量→试挂；更大→正式；卖出单不标注）。份额预警已全量开启（奖励份额连续 >8% 一分钟语音告警，夜间静音）；撤单即时生效;已成交部分不可撤。</p></section>"

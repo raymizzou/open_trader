@@ -6968,7 +6968,7 @@ console.log(JSON.stringify({
 ''')
     rendered = json.loads(output)
     assert rendered == {
-        "headers": ["标的", "LP 收益率(推荐 → 实际)", "份额占比", "实际占用资金", "压力损失(警戒线 10%)", "委托与成交量"],
+        "headers": ["标的", "LP 收益率(推荐 → 实际)", "今日奖励(累计 · $/小时)", "份额占比", "实际占用资金", "压力损失(警戒线 10%)", "委托与成交量"],
         "current": True,
         "baseline": True,
         "addRoom": True,
@@ -6992,6 +6992,226 @@ console.log(JSON.stringify({
         "marketLink": True,
         "marketRows": 4,
         "trialBaselineFromReference": True,
+    }
+
+
+def test_lp_today_orders_show_today_reward_cell_with_hourly_rate() -> None:
+    """B1: 已知奖励 → 该行新格显示 今日已赚 $3.42（pm-tone-ok）＋ ≈$2.39/小时＋
+    「数据 … · 计奖日(UTC)当日累计」小字；表头在 LP 收益率与份额占比之间含新列。"""
+
+    output = run_dashboard_js(r'''
+const checkedAt = "2026-09-22T04:00:00Z";
+const dashboard = {
+  state: "ready", stale: false, checked_at: checkedAt, last_success_at: checkedAt,
+  orders: [], positions: [],
+  lp_orders_today: [
+    {order_id: "order-1", condition_id: "condition-1", token_id: "token-1",
+      market_title: "Reward LP market", market_url: "https://polymarket.com/event/reward",
+      outcome: "YES", side: "BUY", status: "LIVE", price: "0.50", quantity: "40",
+      filled_quantity: "40", remaining_quantity: "0", state: "open",
+      management: "manual_read_only", read_only: true, scoring_status: "true"},
+  ],
+  non_lp_row_count: 0,
+  market_rewards: [{condition_id: "condition-1", market_amount: "3.42", currency: "USD",
+    state: "known", reward_date: "2026-09-22", checked_at: checkedAt,
+    last_success_at: checkedAt, stale: false, paid: false}],
+  lp_observations: {
+    "condition-1": {
+      state: "known", stage: "added", stale: false,
+      current_hourly_reward_usd: "2.39", occupied_capital_usd: "20",
+      current_yield_pct_per_hour: "0.09",
+      trial_baseline: null, qualified: true, risk_state: "known", risk_warning: false,
+      risk_directions: [], add_room: {available: true}, checked_at: checkedAt,
+    },
+  },
+};
+const html = predictionLpCard({lp_dashboard: dashboard});
+const orderTable = (html.match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
+const row = (orderTable.match(/<tr data-lp-today-market="condition-1"[\s\S]*?<\/tr>/) || [""])[0];
+const rewardCell = (row.split("data-label=\"今日奖励(累计 · $/小时)\"")[1] || "").split("</td>")[0];
+console.log(JSON.stringify({
+  headerPresent: orderTable.includes("<th scope=\"col\">今日奖励(累计 · $/小时)</th>"),
+  headerAfterYield: orderTable.indexOf("今日奖励(累计 · $/小时)") > orderTable.indexOf("LP 收益率(推荐 → 实际)")
+    && orderTable.indexOf("今日奖励(累计 · $/小时)") < orderTable.indexOf("份额占比"),
+  cellPresent: rewardCell.length > 0,
+  earnedText: rewardCell.includes("今日已赚"),
+  amountExact: rewardCell.includes("$3.42"),
+  greenTone: rewardCell.includes("pm-tone-ok"),
+  hourlyApprox: rewardCell.includes("≈") && rewardCell.includes("$2.39")
+    && rewardCell.includes("/小时"),
+  dataNote: rewardCell.includes("数据 ") && rewardCell.includes("计奖日(UTC)当日累计"),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered == {
+        "headerPresent": True,
+        "headerAfterYield": True,
+        "cellPresent": True,
+        "earnedText": True,
+        "amountExact": True,
+        "greenTone": True,
+        "hourlyApprox": True,
+        "dataNote": True,
+    }
+
+
+def test_lp_today_orders_reward_cell_never_dresses_zero_when_unknown() -> None:
+    """B2: 无奖励条目＋小时奖励 null → 该格 UNKNOWN、整表不出现 $0、
+    收益率格保持「待更新」语义不变。"""
+
+    output = run_dashboard_js(r'''
+const checkedAt = "2026-09-22T04:00:00Z";
+const dashboard = {
+  state: "ready", stale: false, checked_at: checkedAt, last_success_at: checkedAt,
+  orders: [], positions: [],
+  lp_orders_today: [
+    {order_id: "order-1", condition_id: "condition-1", token_id: "token-1",
+      market_title: "Unknown reward market", market_url: "https://polymarket.com/event/unknown",
+      outcome: "YES", side: "BUY", status: "LIVE", price: "0.50", quantity: "40",
+      filled_quantity: "40", remaining_quantity: "0", state: "open",
+      management: "manual_read_only", read_only: true, scoring_status: "true"},
+  ],
+  non_lp_row_count: 0,
+  market_rewards: [],
+  lp_observations: {
+    "condition-1": {
+      state: "unknown", stage: "added", stale: true, reason: "reward_rates_stale",
+      current_hourly_reward_usd: null, occupied_capital_usd: "20",
+      current_yield_pct_per_hour: null,
+      trial_baseline: null, qualified: null, risk_state: "known", risk_warning: false,
+      risk_directions: [],
+      add_room: {available: false, reason: "current_yield_unknown"},
+      checked_at: checkedAt,
+    },
+  },
+};
+const html = predictionLpCard({lp_dashboard: dashboard});
+const orderTable = (html.match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
+const row = (orderTable.match(/<tr data-lp-today-market="condition-1"[\s\S]*?<\/tr>/) || [""])[0];
+const rewardCell = (row.split("data-label=\"今日奖励(累计 · $/小时)\"")[1] || "").split("</td>")[0];
+const yieldCell = (row.split("data-label=\"LP 收益率(推荐 → 实际)\"")[1] || "").split("</td>")[0];
+console.log(JSON.stringify({
+  cellPresent: rewardCell.length > 0,
+  earnedUnknown: rewardCell.includes("今日已赚") && rewardCell.includes("UNKNOWN"),
+  hourlyUnknown: rewardCell.includes("UNKNOWN") && rewardCell.includes("/小时"),
+  noZeroNote: rewardCell.includes("不按 0 计"),
+  wholeTableNoZero: !orderTable.includes("$0"),
+  yieldPendingKept: yieldCell.includes("待更新") && yieldCell.includes("不按 0 计"),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered == {
+        "cellPresent": True,
+        "earnedUnknown": True,
+        "hourlyUnknown": True,
+        "noZeroNote": True,
+        "wholeTableNoZero": True,
+        "yieldPendingKept": True,
+    }
+
+
+def test_lp_today_orders_reward_cell_survives_same_market_merge() -> None:
+    """B3: 同 condition_id 两笔单仍合并一行（既有分组不破）；「今日已赚」在该行恰出现一次。"""
+
+    output = run_dashboard_js(r'''
+const checkedAt = "2026-09-22T04:00:00Z";
+const order = (orderId) => ({
+  order_id: orderId, condition_id: "condition-1", token_id: "token-1",
+  market_title: "Tracked LP market", market_url: "https://polymarket.com/event/tracked",
+  outcome: "YES", side: "BUY", status: "LIVE", price: "0.50", quantity: "40",
+  filled_quantity: "40", remaining_quantity: "0", state: "open",
+  management: "manual_read_only", read_only: true, scoring_status: "true",
+});
+const dashboard = {
+  state: "ready", stale: false, checked_at: checkedAt, last_success_at: checkedAt,
+  orders: [], positions: [],
+  lp_orders_today: [order("order-1"), order("order-2")],
+  non_lp_row_count: 0,
+  market_rewards: [{condition_id: "condition-1", market_amount: "3.42", currency: "USD",
+    state: "known", reward_date: "2026-09-22", checked_at: checkedAt,
+    last_success_at: checkedAt, stale: false, paid: false}],
+  lp_observations: {
+    "condition-1": {
+      state: "known", stage: "added", stale: false,
+      current_hourly_reward_usd: "2.39", occupied_capital_usd: "20",
+      current_yield_pct_per_hour: "0.09",
+      trial_baseline: null, qualified: true, risk_state: "known", risk_warning: false,
+      risk_directions: [], add_room: {available: true}, checked_at: checkedAt,
+    },
+  },
+};
+const html = predictionLpCard({lp_dashboard: dashboard});
+const orderTable = (html.match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
+const marketRows = (orderTable.match(/<tr data-lp-today-market="condition-1"/g) || []).length;
+const row = (orderTable.match(/<tr data-lp-today-market="condition-1"[\s\S]*?<\/tr>/) || [""])[0];
+console.log(JSON.stringify({
+  marketRows,
+  earnedOnce: row.split("今日已赚").length - 1,
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered == {
+        "marketRows": 1,
+        "earnedOnce": 1,
+    }
+
+
+def test_lp_today_orders_reward_cell_marks_retained_amount_unknown() -> None:
+    """B4: 读失败保留值载荷（state=unknown＋旧 market_amount）→ 该行新格显示
+    今日已赚 UNKNOWN＋「上次成功 … · 读到失败先保留旧值」，不把旧值当新值
+    渲染成绿色 $3.42；小时行 ≈$2.39/小时 与累计行独立、仍显示。"""
+
+    output = run_dashboard_js(r'''
+const checkedAt = "2026-09-22T04:00:00Z";
+const dashboard = {
+  state: "ready", stale: false, checked_at: checkedAt, last_success_at: checkedAt,
+  orders: [], positions: [],
+  lp_orders_today: [
+    {order_id: "order-1", condition_id: "condition-1", token_id: "token-1",
+      market_title: "Reward LP market", market_url: "https://polymarket.com/event/reward",
+      outcome: "YES", side: "BUY", status: "LIVE", price: "0.50", quantity: "40",
+      filled_quantity: "40", remaining_quantity: "0", state: "open",
+      management: "manual_read_only", read_only: true, scoring_status: "true"},
+  ],
+  non_lp_row_count: 0,
+  market_rewards: [{condition_id: "condition-1", state: "unknown", currency: "USD",
+    market_amount: "3.42", reason: "reward_read_unknown", last_success_at: checkedAt,
+    checked_at: checkedAt}],
+  lp_observations: {
+    "condition-1": {
+      state: "known", stage: "added", stale: false,
+      current_hourly_reward_usd: "2.39", occupied_capital_usd: "20",
+      current_yield_pct_per_hour: "0.09",
+      trial_baseline: null, qualified: true, risk_state: "known", risk_warning: false,
+      risk_directions: [], add_room: {available: true}, checked_at: checkedAt,
+    },
+  },
+};
+const html = predictionLpCard({lp_dashboard: dashboard});
+const orderTable = (html.match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
+const row = (orderTable.match(/<tr data-lp-today-market="condition-1"[\s\S]*?<\/tr>/) || [""])[0];
+const rewardCell = (row.split("data-label=\"今日奖励(累计 · $/小时)\"")[1] || "").split("</td>")[0];
+console.log(JSON.stringify({
+  cellPresent: rewardCell.length > 0,
+  earnedText: rewardCell.includes("今日已赚"),
+  earnedUnknown: rewardCell.includes("UNKNOWN"),
+  lastSuccessNote: rewardCell.includes("上次成功")
+    && rewardCell.includes("读到失败先保留旧值"),
+  noGreenTone: !rewardCell.includes("pm-tone-ok"),
+  noStaleAmount: !rewardCell.includes("$3.42"),
+  hourlyApprox: rewardCell.includes("≈") && rewardCell.includes("$2.39")
+    && rewardCell.includes("/小时"),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered == {
+        "cellPresent": True,
+        "earnedText": True,
+        "earnedUnknown": True,
+        "lastSuccessNote": True,
+        "noGreenTone": True,
+        "noStaleAmount": True,
+        "hourlyApprox": True,
     }
 
 
@@ -7106,7 +7326,7 @@ console.log(JSON.stringify({
 """)
     rendered = json.loads(output)
     assert rendered == {
-        "headers": ["标的", "LP 收益率(推荐 → 实际)", "份额占比", "实际占用资金", "压力损失(警戒线 10%)", "委托与成交量"],
+        "headers": ["标的", "LP 收益率(推荐 → 实际)", "今日奖励(累计 · $/小时)", "份额占比", "实际占用资金", "压力损失(警戒线 10%)", "委托与成交量"],
         "rowCount": 2,
         "unifiedHeadline": True,
         "fillLine": True,
@@ -7539,6 +7759,7 @@ console.log(JSON.stringify({
     assert rendered["headers"] == [
         "标的",
         "LP 收益率(推荐 → 实际)",
+        "今日奖励(累计 · $/小时)",
         "份额占比",
         "实际占用资金",
         "压力损失(警戒线 10%)",
@@ -7649,7 +7870,7 @@ console.log(JSON.stringify({
   marketRows: (orderTable.match(/<tr[^>]*data-lp-today-market=/g) || []).length,
   footnote: html.includes("账户另有 9 行非 LP 订单/持仓，不在本表展示。"),
   emptyState: emptyHtml
-    .includes("<td colspan=\"6\" class=\"pm-observation-empty\">当天暂无 LP 委托。从上方待试挂候选点「挂单」登记第一笔，提交即受位置保护。</td>"),
+    .includes("<td colspan=\"7\" class=\"pm-observation-empty\">当天暂无 LP 委托。从上方待试挂候选点「挂单」登记第一笔，提交即受位置保护。</td>"),
   legacyEmptyState: legacyHtml.includes("当天暂无 LP 委托。"),
   legacyNoFootnote: !legacyHtml.includes("非 LP 订单/持仓"),
 }));

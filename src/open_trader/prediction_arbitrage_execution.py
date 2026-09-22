@@ -2666,6 +2666,38 @@ class PredictionExecutionService:
                             "session_id": fill_session_id,
                         }
                     )
+                # LP-TR-1: the first cache snapshot above covers only the
+                # manual conditions; the 当天 LP 委托 table can also carry
+                # system-managed rows and cached fills.  Extend the reward
+                # cache coverage to every remaining market in the assembled
+                # today table (same 60s throttle, same unknown-on-miss
+                # semantics); row sets, ordering, lp_observations,
+                # reward_shares and the explicit-negative gate stay as-is.
+                today_conditions = tuple(
+                    dict.fromkeys(
+                        str(row.get("condition_id") or "").strip()
+                        for row in lp_orders_today
+                        if str(row.get("condition_id") or "").strip()
+                    )
+                )
+                extra_conditions = tuple(
+                    condition_id
+                    for condition_id in today_conditions
+                    if condition_id not in manual_conditions
+                )
+                if extra_conditions:
+                    extra_cached, extra_refresh_ids = (
+                        self._lp_reward_cache_snapshot(
+                            reward_date,
+                            extra_conditions,
+                            previous_rewards=previous_rewards,
+                            candidate_rewards=market_rewards,
+                        )
+                    )
+                    market_rewards.update(extra_cached)
+                    refresh_ids = tuple(
+                        dict.fromkeys((*refresh_ids, *extra_refresh_ids))
+                    )
                 # Issue 152: today-order rows carry the queue-protection
                 # anchor flag (is this the registered entry order?) and the
                 # session condition's group attaches the protection summary;

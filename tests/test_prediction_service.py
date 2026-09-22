@@ -2855,6 +2855,303 @@ def test_lp_dashboard_expires_reward_cache_without_waiting_for_refresh(
     assert reward["market_amount"] == Decimal("0.80")
 
 
+def test_lp_dashboard_covers_today_table_system_markets_in_reward_cache(
+    tmp_path: Path,
+) -> None:
+    """A1: 委托表当天全部市场（含系统托管单）进入奖励缓存覆盖面。
+
+    第一次 _lp_reward_cache_snapshot 只覆盖手动单；系统托管行的市场此前
+    从不进入 market_rewards，也不进刷新队列。改动后第二次覆盖调用把当天
+    委托表里剩余条件并入，后台批量读一次即让载荷携带 known 奖励。
+    """
+
+    class Account:
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": datetime(2026, 9, 16, 12, tzinfo=UTC),
+                "open_orders": [
+                    {
+                        "id": "system-order-1",
+                        "condition_id": "condition-1",
+                        "token_id": "sys-yes",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "original_size": Decimal("2"),
+                        "size_matched": Decimal("0"),
+                    }
+                ],
+                "positions": [],
+            }
+
+        def get_order_scoring(self, *, order_id: str) -> bool:
+            assert order_id == "system-order-1"
+            return True
+
+        def lp_reward_snapshots(
+            self, reward_date: str, condition_ids: object
+        ) -> dict[str, object]:
+            return {
+                str(condition_id): {
+                    "state": "known",
+                    "reward_date": reward_date,
+                    "condition_id": str(condition_id),
+                    "market_amount": "3.42",
+                    "account_amount": "5.00",
+                }
+                for condition_id in condition_ids  # type: ignore[union-attr]
+            }
+
+    class LP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {"state": "ready", "complete": True, "candidates": []}
+
+        def status(self) -> dict[str, object]:
+            return {"state": "none"}
+
+    store = PredictionArbitrageStore(tmp_path / "data")
+    service = PredictionExecutionService(
+        store=store,
+        monitor=object(),
+        trading=Account(),
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=LP(),
+    )
+    # 登记系统组会话：entry_order_id 归属后该行 management=system_managed
+    # （非手动），A1 的覆盖面前提成立。
+    store.lp_create_session(
+        "session-1",
+        "idempotency-1",
+        state="entry_open",
+        payload={
+            "condition_id": "condition-1",
+            "token_id": "sys-yes",
+            "entry_order_id": "system-order-1",
+            "market_title": "System market",
+            "outcome": "YES",
+        },
+    )
+
+    first = service.refresh_lp_dashboard_snapshot()
+    assert first["lp_orders_today"], "system order must appear in today table"
+    assert first["lp_orders_today"][0]["management"] == "system_managed"
+    # Issue #146: join the scheduled reward worker so the batch read lands
+    # before reading the served cache.
+    worker = service._lp_reward_refresh_thread
+    if worker is not None:
+        worker.join(timeout=2)
+    payload = service.lp_dashboard()
+    reward = payload["market_rewards"]["condition-1"]
+    assert reward["state"] == "known"
+    assert reward["market_amount"] == "3.42"
+
+
+def test_lp_reward_cache_throttles_today_table_refetch_within_60s(
+    tmp_path: Path,
+) -> None:
+    """A2: 委托表全部市场的奖励批量读受 60 秒节流——窗口内不重读，过期后才第二次读。"""
+
+    calls = 0
+    clock = [0.0]
+
+    class Account:
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": datetime(2026, 9, 16, 12, tzinfo=UTC),
+                "open_orders": [
+                    {
+                        "id": "system-order-1",
+                        "condition_id": "condition-1",
+                        "token_id": "sys-yes",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "original_size": Decimal("2"),
+                        "size_matched": Decimal("0"),
+                    }
+                ],
+                "positions": [],
+            }
+
+        def get_order_scoring(self, *, order_id: str) -> bool:
+            return True
+
+        def lp_reward_snapshots(
+            self, reward_date: str, condition_ids: object
+        ) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            return {
+                str(condition_id): {
+                    "state": "known",
+                    "reward_date": reward_date,
+                    "condition_id": str(condition_id),
+                    "market_amount": "3.42",
+                }
+                for condition_id in condition_ids  # type: ignore[union-attr]
+            }
+
+    class LP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {"state": "ready", "complete": True, "candidates": []}
+
+        def status(self) -> dict[str, object]:
+            return {"state": "none"}
+
+    store = PredictionArbitrageStore(tmp_path / "data")
+    service = PredictionExecutionService(
+        store=store,
+        monitor=object(),
+        trading=Account(),
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=LP(),
+    )
+    service._clock = lambda: clock[0]  # type: ignore[method-assign]
+    store.lp_create_session(
+        "session-1",
+        "idempotency-1",
+        state="entry_open",
+        payload={
+            "condition_id": "condition-1",
+            "token_id": "sys-yes",
+            "entry_order_id": "system-order-1",
+            "market_title": "System market",
+            "outcome": "YES",
+        },
+    )
+
+    def join_worker() -> None:
+        worker = service._lp_reward_refresh_thread
+        if worker is not None:
+            worker.join(timeout=2)
+
+    def served_reward() -> dict[str, object]:
+        return service.lp_dashboard()["market_rewards"]["condition-1"]
+
+    # 首次快照：未知占位进刷新队列，worker 批量读一次后发布 known。
+    service.refresh_lp_dashboard_snapshot()
+    join_worker()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if served_reward().get("state") == "known":
+            break
+        time.sleep(0.01)
+    assert served_reward()["state"] == "known"
+    assert calls == 1
+
+    # 60 秒内的第二次快照：缓存命中（stale=False），不再触发批量读。
+    service.refresh_lp_dashboard_snapshot()
+    join_worker()
+    assert calls == 1
+
+    # 推进时钟越过 60 秒：缓存过期 → 第二次批量读。
+    clock[0] = 61.0
+    service.refresh_lp_dashboard_snapshot()
+    join_worker()
+    assert calls == 2
+
+
+def test_lp_reward_cache_read_failure_keeps_last_amount_as_unknown(
+    tmp_path: Path,
+) -> None:
+    """A3: 读失败 → 条目转未知、旧 market_amount 保留、不抛异常、有 reason。"""
+
+    state: dict[str, object] = {"fail": False}
+    clock = [0.0]
+
+    class Account:
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": datetime(2026, 9, 16, 12, tzinfo=UTC),
+                "open_orders": [
+                    {
+                        "id": "system-order-1",
+                        "condition_id": "condition-1",
+                        "token_id": "sys-yes",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "original_size": Decimal("2"),
+                        "size_matched": Decimal("0"),
+                    }
+                ],
+                "positions": [],
+            }
+
+        def get_order_scoring(self, *, order_id: str) -> bool:
+            return True
+
+        def lp_reward_snapshots(
+            self, reward_date: str, condition_ids: object
+        ) -> dict[str, object]:
+            if state["fail"] is True:
+                raise RuntimeError("reward read unavailable")
+            return {
+                str(condition_id): {
+                    "state": "known",
+                    "reward_date": reward_date,
+                    "condition_id": str(condition_id),
+                    "market_amount": "3.42",
+                }
+                for condition_id in condition_ids  # type: ignore[union-attr]
+            }
+
+    class LP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {"state": "ready", "complete": True, "candidates": []}
+
+        def status(self) -> dict[str, object]:
+            return {"state": "none"}
+
+    store = PredictionArbitrageStore(tmp_path / "data")
+    service = PredictionExecutionService(
+        store=store,
+        monitor=object(),
+        trading=Account(),
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=LP(),
+    )
+    service._clock = lambda: clock[0]  # type: ignore[method-assign]
+    store.lp_create_session(
+        "session-1",
+        "idempotency-1",
+        state="entry_open",
+        payload={
+            "condition_id": "condition-1",
+            "token_id": "sys-yes",
+            "entry_order_id": "system-order-1",
+            "market_title": "System market",
+            "outcome": "YES",
+        },
+    )
+
+    def join_worker() -> None:
+        worker = service._lp_reward_refresh_thread
+        if worker is not None:
+            worker.join(timeout=2)
+
+    # 先成功一次：known 且 market_amount 落地。
+    service.refresh_lp_dashboard_snapshot()
+    join_worker()
+    reward = service.lp_dashboard()["market_rewards"]["condition-1"]
+    assert reward["state"] == "known"
+    assert reward["market_amount"] == "3.42"
+
+    # 再让批量读抛异常：pipeline 与 worker 都不得向外抛。
+    state["fail"] = True
+    clock[0] = 61.0
+    service.refresh_lp_dashboard_snapshot()
+    join_worker()
+    failed = service.lp_dashboard()["market_rewards"]["condition-1"]
+    assert failed["state"] == "unknown"
+    # 旧值保留：绝不显示 $0。
+    assert failed["market_amount"] == "3.42"
+    assert failed.get("reason")
+
+
 def test_lp_dashboard_drains_new_conditions_through_single_reward_worker(
     tmp_path: Path,
 ) -> None:
