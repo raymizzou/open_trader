@@ -3867,6 +3867,32 @@ function lpDashboardAugmentButtonMarkup(orders, session) {
     + ">追加</button>";
 }
 
+// 「需要核对」文案表：行内说明线、会话卡告警块与后端通知共用同一张表——
+// main 是整句契约文本，counter 仅在数据失败计数为有限数且 >0 时非空。
+function lpNeedsAttentionCopy(session) {
+  const code = String(session?.reconciliation ?? "");
+  let main;
+  if (code === "unowned_target_order") {
+    main = "账户里有一张挂在本市场、但不归本组管理的单（常见：手工挂的单）。"
+      + "系统已暂停本组自动管理，追加暂不可用；那张单撤掉或成交后自动恢复，无需操作。";
+  } else if (code === "external_snapshot_unknown"
+    || code === "book_unknown"
+    || code === "book_freshness_unknown") {
+    main = "市场/账户数据连续读取失败，系统自动重试中。";
+  } else if (code.includes("submit_unknown")) {
+    main = "一笔提交结果未知，需要到 Polymarket 订单页核对该单状态。";
+  } else if (/^(stop_cancel_|deadline_cancel_|group_collect_)/.test(code)) {
+    main = "一次撤单操作失败，系统自动重试中，长时间未恢复需人工核对。";
+  } else {
+    main = "系统暂停了本组的自动管理（原因：" + (code || "unknown") + "）。";
+  }
+  const failures = Number(session?.queue_protection?.data_failures);
+  const counter = Number.isFinite(failures) && failures > 0
+    ? "数据读取失败 " + failures + "/10，满 10 次将保护性撤单。"
+    : "";
+  return { main, counter };
+}
+
 function lpDashboardTodayQuantityCell(orders, session) {
   const filledSum = orders.reduce((sum, row) => {
     const filled = Number(row.filled_quantity);
@@ -3925,6 +3951,18 @@ function lpDashboardTodayQuantityCell(orders, session) {
     : (cancellable.length > 0
       ? "<span class=\"pm-pill\">挂单中 · 已成交 " + formatDisplayNumber(String(filledSum)) + "</span>"
       : "<span class=\"pm-pill\">已完结 · 未成交</span>");
+  // 「需要核对」可见性：needs_attention 时行头加琥珀 pill，行内加原因整句说明线。
+  const attention = session && typeof session === "object"
+    && String(session.state || "").toLowerCase() === "needs_attention"
+    ? lpNeedsAttentionCopy(session)
+    : null;
+  const attentionPill = attention
+    ? "<span class=\"pm-pill status-attention\">需要核对</span>"
+    : "";
+  const attentionLine = attention
+    ? "<div class=\"lp-attention-line\">需要核对 · " + escapeHtml(attention.main)
+      + (attention.counter ? " " + escapeHtml(attention.counter) : "") + "</div>"
+    : "";
   const fillLine = "已成交 " + formatDisplayNumber(String(filledSum))
     + " · 剩余 " + formatDisplayNumber(String(remainingSum));
   const augmentButton = lpDashboardAugmentButtonMarkup(orders, session);
@@ -3939,8 +3977,10 @@ function lpDashboardTodayQuantityCell(orders, session) {
   let markup = "<div class=\"lp-line\"><div>" + escapeHtml(headline)
     + (singleBuyChip ? " " + singleBuyChip : "")
     + (groupPill ? " " + groupPill : "")
+    + (attentionPill ? " " + attentionPill : "")
     + "<span class=\"sub\">" + escapeHtml(fillLine) + "</span></div>"
     + headlineRight + "</div>";
+  if (attentionLine) markup += attentionLine;
   if (multi) {
     const sidesConsistent = new Set(orders.map((row) => String(row.side || "").toUpperCase())).size === 1;
     const purposes = orders.map((row) => lpDashboardTodayPurposeLabel(row));
@@ -4581,7 +4621,16 @@ function predictionLpSessionCard(payload) {
   const exitStatus = source.stop_loss_latched === true
     ? `止损已锁定 · ${protectedOrder}`
     : `${stage} · ${passiveOrder}`;
-  return `<section class="pm-panel pm-lp-card" aria-label="LP 会话"><header class="pm-panel-heading"><div><h2>${escapeHtml(String(market))} · ${escapeHtml(String(outcome))}</h2><p>单市场 LP · ${escapeHtml(stage)}</p></div><span class="pm-pill ${predictionTone(stage)}">${escapeHtml(stage)}</span></header><div class="pm-relation-summary"><span>入场角色 <strong>BUY · post-only GTD</strong></span><span>订单 ${escapeHtml(entryOrder)}</span><span class="${scoringTone}">计分 <strong>${escapeHtml(scoring)}</strong></span><span>${scoringTime}</span></div><div class="pm-metrics pm-lp-metrics"><article class="pm-metric"><span>已买</span><strong>${escapeHtml(predictionValue(source.buy_filled_quantity, "UNKNOWN"))}</strong><small>目标 ${escapeHtml(predictionValue(source.quantity, "UNKNOWN"))} 份</small></article><article class="pm-metric"><span>已卖</span><strong>${escapeHtml(predictionValue(source.sold_quantity, "UNKNOWN"))}</strong><small>成交回款 ${escapeHtml(predictionMoney(source.sold_revenue, "UNKNOWN"))}</small></article><article class="pm-metric"><span>剩余</span><strong>${escapeHtml(predictionValue(source.residual_quantity, "UNKNOWN"))}</strong><small>按账户持仓核对</small></article><article class="pm-metric"><span>退出状态</span><strong>${escapeHtml(exitStatus)}</strong><small>开仓盈亏 ${escapeHtml(loss)}</small></article></div>${lpSessionLevelsBlock(source)}<div class="pm-relation-summary"><span>已实现交易 P&amp;L <strong>${escapeHtml(tradePnl)}</strong></span><span>总净额 <strong>${escapeHtml(total)}</strong></span><span>复盘时间 <strong>${escapeHtml(source.review_at ? predictionHktTimestamp(source.review_at) : "UNKNOWN")}</strong></span></div>${rewardRow}</section>`;
+  // 「需要核对」会话卡告警块：state 为 needs_attention 时置顶显示原因整句
+  // 与数据失败计数，与行内说明线同源文案。
+  let attentionAlert = "";
+  if (rawState === "needs_attention") {
+    const copy = lpNeedsAttentionCopy(source);
+    const body = copy.main + " 恢复后自动继续；恢复前追加不可用。"
+      + (copy.counter ? " " + copy.counter : "");
+    attentionAlert = `<div class="pm-alert warning" role="status"><div class="pm-alert-body"><strong>本组已暂停自动管理</strong><p>${escapeHtml(body)}</p></div></div>`;
+  }
+  return `<section class="pm-panel pm-lp-card" aria-label="LP 会话"><header class="pm-panel-heading"><div><h2>${escapeHtml(String(market))} · ${escapeHtml(String(outcome))}</h2><p>单市场 LP · ${escapeHtml(stage)}</p></div><span class="pm-pill ${predictionTone(stage)}">${escapeHtml(stage)}</span></header>${attentionAlert}<div class="pm-relation-summary"><span>入场角色 <strong>BUY · post-only GTD</strong></span><span>订单 ${escapeHtml(entryOrder)}</span><span class="${scoringTone}">计分 <strong>${escapeHtml(scoring)}</strong></span><span>${scoringTime}</span></div><div class="pm-metrics pm-lp-metrics"><article class="pm-metric"><span>已买</span><strong>${escapeHtml(predictionValue(source.buy_filled_quantity, "UNKNOWN"))}</strong><small>目标 ${escapeHtml(predictionValue(source.quantity, "UNKNOWN"))} 份</small></article><article class="pm-metric"><span>已卖</span><strong>${escapeHtml(predictionValue(source.sold_quantity, "UNKNOWN"))}</strong><small>成交回款 ${escapeHtml(predictionMoney(source.sold_revenue, "UNKNOWN"))}</small></article><article class="pm-metric"><span>剩余</span><strong>${escapeHtml(predictionValue(source.residual_quantity, "UNKNOWN"))}</strong><small>按账户持仓核对</small></article><article class="pm-metric"><span>退出状态</span><strong>${escapeHtml(exitStatus)}</strong><small>开仓盈亏 ${escapeHtml(loss)}</small></article></div>${lpSessionLevelsBlock(source)}<div class="pm-relation-summary"><span>已实现交易 P&amp;L <strong>${escapeHtml(tradePnl)}</strong></span><span>总净额 <strong>${escapeHtml(total)}</strong></span><span>复盘时间 <strong>${escapeHtml(source.review_at ? predictionHktTimestamp(source.review_at) : "UNKNOWN")}</strong></span></div>${rewardRow}</section>`;
 }
 
 function predictionAnnualizedPercent(value, digits = 1) {

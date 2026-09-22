@@ -12368,3 +12368,400 @@ def test_lp167_r1_same_tick_augment_bucket_cancels_merge_union(tmp_path) -> None
     assert levels["0.38"]["state"] == "canceling"
     assert levels["0.38"]["cancel_targets"] == ["order-3"]
     assert levels["0.42"]["state"] == "monitoring"
+
+
+def _lp_attention_raw_order(
+    order_id: str,
+    *,
+    token_id: str,
+    condition_id: str,
+    side: str = "BUY",
+    status: str = "LIVE",
+) -> dict[str, object]:
+    """生产 raw 形状挂单行：CLOB 原始挂单 market_id 键存在但值为 None，
+    market/condition_id 承载本单市场身份；order_id/token_id/side/status 齐全。"""
+
+    return {
+        "order_id": order_id,
+        "token_id": token_id,
+        "market_id": None,
+        "market": condition_id,
+        "condition_id": condition_id,
+        "side": side,
+        "status": status,
+        "price": Decimal("0.30"),
+        "original_size": Decimal("10"),
+        "size_matched": Decimal("0"),
+        "remaining_size": Decimal("10"),
+    }
+
+
+def test_lp_unowned_guard_ignores_cross_market_order_raw_shape(tmp_path) -> None:
+    """A1（2026-09-22 生产复现）：两组会话并存，每组巡检快照的 open_orders
+    同时含两组各自的单（raw 形状：market_id=None、market/condition_id 为
+    本单市场身份）。他组的单是跨市场单，不得触发本组 unowned_target_order；
+    两组均保持 entry_open、reconciliation 为 None。"""
+
+    now = datetime(2026, 9, 22, 20, 0, tzinfo=UTC)
+    exchange = _PerTokenExchange()
+    market_a = _lp166_market_identity(1)
+    market_b = _lp166_market_identity(2)
+    token_a = str(market_a["token_id"])
+    token_b = str(market_b["token_id"])
+    book_a = _lp166_book(now, market_a)
+    book_b = _lp166_book(now, market_b)
+    exchange.by_token[token_a] = book_a
+    exchange.by_token[token_b] = book_b
+    store, service, session_a, session_b = _lp166_two_groups(now, tmp_path, exchange)
+    both_orders = [
+        _lp_attention_raw_order(
+            "order-1", token_id=token_a, condition_id=str(market_a["condition_id"])
+        ),
+        _lp_attention_raw_order(
+            "order-2", token_id=token_b, condition_id=str(market_b["condition_id"])
+        ),
+    ]
+    book_a["account"] = {
+        **book_a["account"],  # type: ignore[arg-type]
+        "open_orders": list(both_orders),
+    }
+    book_b["account"] = {
+        **book_b["account"],  # type: ignore[arg-type]
+        "open_orders": list(both_orders),
+    }
+
+    result = service.tick()
+
+    sessions = result["sessions"]
+    assert {
+        str(row["session_id"]): row.get("reconciliation") for row in sessions
+    } == {session_a: None, session_b: None}
+    assert store.lp_session(session_a)["state"] == "entry_open"
+    assert store.lp_session(session_b)["state"] == "entry_open"
+
+
+def test_lp_unowned_guard_still_flags_same_market_manual_order(tmp_path) -> None:
+    """A2（钉死原意）：同 condition_id、他 token、非豁免形态（SELL）的他方单
+    （raw 形状）仍必须拦下 → needs_attention/unowned_target_order。"""
+
+    now = datetime(2026, 9, 22, 20, 0, tzinfo=UTC)
+    store, exchange, service, started = _queue_running_service(
+        tmp_path, now, key="lp-att-a2"
+    )
+    session_id = str(started["session_id"])
+    snapshot = _queue_runtime_snapshot(
+        now,
+        bid_size=Decimal("10000"),
+        open_orders=[
+            _lp_attention_raw_order(
+                "manual-sell",
+                token_id="0x" + "9" * 64,
+                condition_id="0x" + "c" * 64,
+                side="SELL",
+            ),
+        ],
+    )
+    exchange.snapshot_value = snapshot
+
+    result = service.tick()
+
+    assert store.lp_session(session_id)["state"] == "needs_attention"
+    assert result["reconciliation"] == "unowned_target_order"
+
+
+def test_lp_unowned_guard_still_flags_identity_blank_order(tmp_path) -> None:
+    """A3（钉死原意）：token/market/condition 全空、order_id 非己有的单
+    仍必须拦下——身份缺失读数无法证明该单在本市场之外。"""
+
+    now = datetime(2026, 9, 22, 20, 0, tzinfo=UTC)
+    store, exchange, service, started = _queue_running_service(
+        tmp_path, now, key="lp-att-a3"
+    )
+    session_id = str(started["session_id"])
+    blank = _lp_attention_raw_order(
+        "mystery-row", token_id="", condition_id=""
+    )
+    snapshot = _queue_runtime_snapshot(
+        now, bid_size=Decimal("10000"), open_orders=[blank]
+    )
+    exchange.snapshot_value = snapshot
+
+    result = service.tick()
+
+    assert store.lp_session(session_id)["state"] == "needs_attention"
+    assert result["reconciliation"] == "unowned_target_order"
+
+
+def test_lp_unowned_guard_own_order_raw_shape_stays_open(tmp_path) -> None:
+    """A4：快照仅含本组自有单（raw 形状）→ 不触发守卫，entry_open。"""
+
+    now = datetime(2026, 9, 22, 20, 0, tzinfo=UTC)
+    store, exchange, service, started = _queue_running_service(
+        tmp_path, now, key="lp-att-a4"
+    )
+    session_id = str(started["session_id"])
+    snapshot = _queue_runtime_snapshot(
+        now,
+        bid_size=Decimal("10000"),
+        open_orders=[
+            _lp_attention_raw_order(
+                "order-1", token_id="0x" + "1" * 64, condition_id="0x" + "c" * 64
+            ),
+        ],
+    )
+    exchange.snapshot_value = snapshot
+
+    result = service.tick()
+
+    assert result["state"] == "entry_open"
+    assert result.get("reconciliation") is None
+    assert store.lp_session(session_id)["state"] == "entry_open"
+
+
+def test_lp_needs_attention_notification_five_minute_once(tmp_path) -> None:
+    """N1：进入 needs_attention 满 5 分钟才经 _notify_protection 推一条；
+    未满 5 分钟零调用；同一 episode 内持续停留也只推这一条。"""
+
+    now = datetime(2026, 9, 22, 20, 0, tzinfo=UTC)
+    current = [now]
+
+    class _ClockFreshExchange(_Exchange):
+        """读快照时把盘口 received_at 刷到当前时钟——时钟推进下盘口读数仍新鲜。"""
+
+        def lp_snapshot(self, request: dict[str, object]) -> dict[str, object]:
+            snapshot = super().lp_snapshot(request)
+            book = snapshot.get("book")
+            if isinstance(book, dict):
+                book["timestamp"] = current[0]
+                book["received_at"] = current[0]
+            return snapshot
+
+    exchange = _ClockFreshExchange()
+    exchange.snapshot_value = _queue_runtime_snapshot(now, bid_size=Decimal("10000"))
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: current[0])
+    notifications: list[tuple[str, str, str]] = []
+    service.set_protection_notifier(
+        lambda title, message, xiaoai: notifications.append((title, message, xiaoai))
+    )
+    request = {**_request(now), "quantity": Decimal("2000")}
+    preview = service.preview(request)
+    started = service.start(str(preview["preview_id"]), "lp-att-n1")
+    assert started["state"] == "entry_open"
+    session_id = str(started["session_id"])
+
+    # A2 形态触发：同 condition、他 token、非豁免 SELL（raw 形状）。
+    trigger = _queue_runtime_snapshot(
+        now,
+        bid_size=Decimal("10000"),
+        open_orders=[
+            _lp_attention_raw_order(
+                "manual-sell",
+                token_id="0x" + "9" * 64,
+                condition_id="0x" + "c" * 64,
+                side="SELL",
+            ),
+        ],
+    )
+    exchange.snapshot_value = trigger
+
+    first = service.tick()
+    assert first["state"] == "needs_attention"
+    assert first["reconciliation"] == "unowned_target_order"
+    armed = store.lp_session(session_id)
+    assert armed["needs_attention_since"] is not None
+    assert armed["needs_attention_notified"] is False
+    assert notifications == []
+
+    # 未满 5 分钟：多次 tick 零通知。
+    for seconds in (60, 120, 299):
+        current[0] = now + timedelta(seconds=seconds)
+        service.tick()
+    assert notifications == []
+
+    # 满 5 分钟（300s）：恰一条通知，文案为与前端同源的原因整句（全等，
+    # 该场景 data_failures=0 不拼 counter，中段漂移必须被抓住）。
+    current[0] = now + timedelta(seconds=300)
+    service.tick()
+    assert len(notifications) == 1
+    title, message, xiaoai = notifications[0]
+    assert "LP 需要核对" in title
+    assert message == (
+        "账户里有一张挂在本市场、但不归本组管理的单（常见：手工挂的单）。"
+        "系统已暂停本组自动管理，追加暂不可用；那张单撤掉或成交后自动恢复，无需操作。"
+    )
+    assert xiaoai == "LP 需要核对，本市场有不归系统管理的挂单"
+    assert store.lp_session(session_id)["needs_attention_notified"] is True
+
+    # 仍在状态：再跑多次 tick 仍恰 1 条（同一 episode 不重推）。
+    for seconds in (360, 420):
+        current[0] = now + timedelta(seconds=seconds)
+        service.tick()
+    assert len(notifications) == 1
+
+
+def test_lp_needs_attention_notification_resets_after_recovery(tmp_path) -> None:
+    """N2：恢复 entry_open 时清键（since=None、notified=假）；下次再进入是
+    新 episode——满 5 分钟再推第二条（累计恰 2 条）。"""
+
+    now = datetime(2026, 9, 22, 20, 0, tzinfo=UTC)
+    current = [now]
+
+    class _ClockFreshExchange(_Exchange):
+        """读快照时把盘口 received_at 刷到当前时钟——时钟推进下盘口读数仍新鲜。"""
+
+        def lp_snapshot(self, request: dict[str, object]) -> dict[str, object]:
+            snapshot = super().lp_snapshot(request)
+            book = snapshot.get("book")
+            if isinstance(book, dict):
+                book["timestamp"] = current[0]
+                book["received_at"] = current[0]
+            return snapshot
+
+    exchange = _ClockFreshExchange()
+    exchange.snapshot_value = _queue_runtime_snapshot(now, bid_size=Decimal("10000"))
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: current[0])
+    notifications: list[tuple[str, str, str]] = []
+    service.set_protection_notifier(
+        lambda title, message, xiaoai: notifications.append((title, message, xiaoai))
+    )
+    request = {**_request(now), "quantity": Decimal("2000")}
+    preview = service.preview(request)
+    started = service.start(str(preview["preview_id"]), "lp-att-n2")
+    assert started["state"] == "entry_open"
+    session_id = str(started["session_id"])
+
+    trigger = _queue_runtime_snapshot(
+        now,
+        bid_size=Decimal("10000"),
+        open_orders=[
+            _lp_attention_raw_order(
+                "manual-sell",
+                token_id="0x" + "9" * 64,
+                condition_id="0x" + "c" * 64,
+                side="SELL",
+            ),
+        ],
+    )
+    clean = _queue_runtime_snapshot(
+        now,
+        bid_size=Decimal("10000"),
+        open_orders=[
+            _lp_attention_raw_order(
+                "order-1", token_id="0x" + "1" * 64, condition_id="0x" + "c" * 64
+            ),
+        ],
+    )
+
+    # 第一次 episode：进入 → 满 5 分钟推第一条。
+    exchange.snapshot_value = trigger
+    assert service.tick()["state"] == "needs_attention"
+    current[0] = now + timedelta(seconds=300)
+    service.tick()
+    assert len(notifications) == 1
+
+    # 移除触发单（快照回到干净）→ tick 恢复 entry_open，两键清位。
+    exchange.snapshot_value = clean
+    recovered = service.tick()
+    assert recovered["state"] == "entry_open"
+    stored = store.lp_session(session_id)
+    assert stored["state"] == "entry_open"
+    assert stored["needs_attention_since"] is None
+    assert stored["needs_attention_notified"] is False
+
+    # 第二次 episode：再进入 → 满 5 分钟再推第二条（累计 2），之后不再推。
+    exchange.snapshot_value = trigger
+    current[0] = now + timedelta(seconds=420)
+    assert service.tick()["state"] == "needs_attention"
+    assert store.lp_session(session_id)["needs_attention_notified"] is False
+    assert len(notifications) == 1
+    current[0] = now + timedelta(seconds=720)
+    service.tick()
+    assert len(notifications) == 2
+    current[0] = now + timedelta(seconds=780)
+    service.tick()
+    assert len(notifications) == 2
+
+
+def test_lp_needs_attention_notification_stop_clears_bookkeeping(tmp_path) -> None:
+    """N3：stop 成功转 review 时清两键（since=None、notified=假）；触发单
+    仍在时重新进入 needs_attention 是全新 episode——299 秒不早推、满 300 秒
+    推第二条（残留键会把新 episode 当旧 episode：notified 残留压制通知，
+    旧 since 残留提前推送）。"""
+
+    now = datetime(2026, 9, 22, 20, 0, tzinfo=UTC)
+    current = [now]
+
+    class _ClockFreshExchange(_Exchange):
+        """读快照时把盘口 received_at 刷到当前时钟——时钟推进下盘口读数仍新鲜。"""
+
+        def lp_snapshot(self, request: dict[str, object]) -> dict[str, object]:
+            snapshot = super().lp_snapshot(request)
+            book = snapshot.get("book")
+            if isinstance(book, dict):
+                book["timestamp"] = current[0]
+                book["received_at"] = current[0]
+            return snapshot
+
+    exchange = _ClockFreshExchange()
+    exchange.snapshot_value = _queue_runtime_snapshot(now, bid_size=Decimal("10000"))
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: current[0])
+    notifications: list[tuple[str, str, str]] = []
+    service.set_protection_notifier(
+        lambda title, message, xiaoai: notifications.append((title, message, xiaoai))
+    )
+    request = {**_request(now), "quantity": Decimal("2000")}
+    preview = service.preview(request)
+    started = service.start(str(preview["preview_id"]), "lp-att-n3")
+    assert started["state"] == "entry_open"
+    session_id = str(started["session_id"])
+
+    # A2 形态触发：同 condition、他 token、非豁免 SELL（raw 形状）。
+    trigger = _queue_runtime_snapshot(
+        now,
+        bid_size=Decimal("10000"),
+        open_orders=[
+            _lp_attention_raw_order(
+                "manual-sell",
+                token_id="0x" + "9" * 64,
+                condition_id="0x" + "c" * 64,
+                side="SELL",
+            ),
+        ],
+    )
+    exchange.snapshot_value = trigger
+
+    # 第一次 episode：进入 → 满 5 分钟推第一条（notified 记账为真）。
+    assert service.tick()["state"] == "needs_attention"
+    current[0] = now + timedelta(seconds=300)
+    service.tick()
+    assert len(notifications) == 1
+    assert store.lp_session(session_id)["needs_attention_notified"] is True
+
+    # stop 成功转 review：两键必须清位，否则残留键污染下一轮 episode。
+    stopped = service.stop(session_id)
+    assert stopped["state"] == "review"
+    assert stopped["needs_attention_since"] is None
+    assert not stopped["needs_attention_notified"]
+
+    # 触发单仍在快照里：重新进入 needs_attention，新 episode 锚点重置。
+    current[0] = now + timedelta(seconds=330)
+    rearmed = service.tick()
+    assert rearmed["state"] == "needs_attention"
+    assert store.lp_session(session_id)["needs_attention_notified"] is False
+    assert len(notifications) == 1
+
+    # 新 episode 未满 5 分钟（299s）：不早推，仍恰 1 条。
+    current[0] = now + timedelta(seconds=629)
+    service.tick()
+    assert len(notifications) == 1
+
+    # 满 5 分钟（300s）：推第二条；此后同一 episode 不再推。
+    current[0] = now + timedelta(seconds=630)
+    service.tick()
+    assert len(notifications) == 2
+    current[0] = now + timedelta(seconds=660)
+    service.tick()
+    assert len(notifications) == 2

@@ -23844,3 +23844,117 @@ console.log(JSON.stringify({
         "sub": "稍后再次确认即可 · 本单未发出",
     }
     assert rendered["legacyFree"] is True
+
+
+def test_lp_today_row_needs_attention_pill_and_reason() -> None:
+    """W1：needs_attention 组的当天委托行显示琥珀「需要核对」pill、原因整句
+    说明线与数据失败计数；追加按钮不出现。"""
+    output = run_dashboard_js(r'''
+const row = (orderId, extra) => ({
+  order_id: orderId, condition_id: "condition-att", token_id: "token-" + orderId,
+  session_id: "sess-att-1",
+  market_title: "Attention market", market_url: "https://polymarket.com/event/x",
+  outcome: "YES", side: "BUY", status: "LIVE", price: "0.29",
+  quantity: "2000", filled_quantity: "0", remaining_quantity: "2000",
+  state: "open", anchor: true, ...extra,
+});
+const session = {
+  session_id: "sess-att-1", state: "needs_attention",
+  condition_id: "condition-att", market_title: "Attention market", outcome: "YES",
+  reconciliation: "unowned_target_order",
+  queue_protection: {version: 2, data_failures: 3, levels: {}},
+};
+const dashboard = {
+  state: "ready", stale: false, orders: [], positions: [],
+  lp_orders_today: [row("entry-1", {})],
+  lp_sessions: [session],
+  non_lp_row_count: 0, market_rewards: [], lp_observations: {},
+};
+const html = predictionLpCard({lp_dashboard: dashboard});
+console.log(JSON.stringify({
+  pill: html.includes("需要核对"),
+  line: html.includes("需要核对 · 账户里有一张挂在本市场、但不归本组管理的单（常见：手工挂的单）。系统已暂停本组自动管理，追加暂不可用；那张单撤掉或成交后自动恢复，无需操作。"),
+  counter: html.includes("数据读取失败 3/10，满 10 次将保护性撤单。"),
+  noAugment: !html.includes(">追加<"),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered == {"pill": True, "line": True, "counter": True, "noAugment": True}
+
+
+def test_lp_today_row_entry_open_keeps_augment_button() -> None:
+    """W2（回归）：entry_open 组的行不出现「需要核对」pill，追加按钮照常。"""
+    output = run_dashboard_js(r'''
+const row = (orderId) => ({
+  order_id: orderId, condition_id: "condition-open", token_id: "token-" + orderId,
+  session_id: "sess-open-1",
+  market_title: "Open market", market_url: "https://polymarket.com/event/x",
+  outcome: "YES", side: "BUY", status: "LIVE", price: "0.29",
+  quantity: "2000", filled_quantity: "0", remaining_quantity: "2000",
+  state: "open", anchor: true,
+});
+const session = {
+  session_id: "sess-open-1", state: "entry_open",
+  condition_id: "condition-open", market_title: "Open market", outcome: "YES",
+};
+const dashboard = {
+  state: "ready", stale: false, orders: [], positions: [],
+  lp_orders_today: [row("entry-1")],
+  lp_sessions: [session],
+  non_lp_row_count: 0, market_rewards: [], lp_observations: {},
+};
+const html = predictionLpCard({lp_dashboard: dashboard});
+console.log(JSON.stringify({
+  noAttentionPill: !html.includes("status-attention") && !html.includes("需要核对"),
+  augment: html.includes(">追加<"),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered == {"noAttentionPill": True, "augment": True}
+
+
+def test_lp_needs_attention_copy_unknown_reason_fallback() -> None:
+    """W3：未知原因/缺省 reconciliation 走兜底句（{code} 原样，空码用 unknown）。"""
+    output = run_dashboard_js(r'''
+const mystery = lpNeedsAttentionCopy({
+  state: "needs_attention", reconciliation: "mystery_code",
+});
+const blank = lpNeedsAttentionCopy({state: "needs_attention", reconciliation: ""});
+console.log(JSON.stringify({
+  mysteryMain: mystery.main,
+  mysteryCounter: mystery.counter,
+  blankMain: blank.main,
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["mysteryMain"] == "系统暂停了本组的自动管理（原因：mystery_code）。"
+    assert rendered["blankMain"] == "系统暂停了本组的自动管理（原因：unknown）。"
+    assert rendered["mysteryCounter"] == ""
+
+
+def test_lp_session_card_needs_attention_alert_block() -> None:
+    """W4：needs_attention 组卡含 pm-alert warning 块：标题、恢复句与数据失败计数。"""
+    output = run_dashboard_js(r'''
+const session = {
+  session_id: "sess-card-1", state: "needs_attention",
+  condition_id: "condition-card", market_title: "Card market", outcome: "YES",
+  reconciliation: "unowned_target_order",
+  queue_protection: {version: 2, data_failures: 2, levels: {}},
+};
+const html = predictionLpSessionCard({lp_session: session});
+console.log(JSON.stringify({
+  alertTitle: html.includes("本组已暂停自动管理"),
+  warningBlock: html.includes("pm-alert warning"),
+  recoverSentence: html.includes("恢复后自动继续；恢复前追加不可用。"),
+  reasonSentence: html.includes("账户里有一张挂在本市场、但不归本组管理的单（常见：手工挂的单）。"),
+  counter: html.includes("数据读取失败 2/10，满 10 次将保护性撤单。"),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered == {
+        "alertTitle": True,
+        "warningBlock": True,
+        "recoverSentence": True,
+        "reasonSentence": True,
+        "counter": True,
+    }

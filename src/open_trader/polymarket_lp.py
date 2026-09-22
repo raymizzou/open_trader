@@ -112,6 +112,9 @@ TERMINAL_TRADE_STATES = frozenset({"CONFIRMED", "FAILED"})
 # Issue 152: consecutive tick-level data outages (snapshot/book unknown) turn
 # into a conservative cancel of the protected BUY once this limit is reached.
 LP_PROTECTION_DATA_FAILURE_LIMIT = 10
+# 「需要核对」克制通知：进入该状态满 5 分钟仍未自愈才经 _notify_protection
+# 推一条；同一次进入（episode）只推一条，恢复后清键重置。
+LP_NEEDS_ATTENTION_NOTIFY_SECONDS = 300
 # Issue 152: only these tick early-exit reasons count as data outages;
 # identity/holding conflicts are decision blockers, not data outages.
 _QUEUE_DATA_FAILURE_REASONS = frozenset(
@@ -8774,7 +8777,14 @@ class PolymarketLPService:
             updated = self.store.lp_update_session(
                 str(session["session_id"]),
                 state="review",
-                patch={"stop_requested": True, "review_status": "awaiting_reconciliation"},
+                patch={
+                    "stop_requested": True,
+                    "review_status": "awaiting_reconciliation",
+                    # 停止即结束当前「需要核对」episode：不清键会让残留
+                    # since/notified 把下一轮 episode 当同一轮（不推或早推）。
+                    "needs_attention_since": None,
+                    "needs_attention_notified": False,
+                },
             )
             return self._status_payload(updated)
 
@@ -9053,6 +9063,11 @@ class PolymarketLPService:
             failures = self._queue_protection_data_failure(session, str(exc))
             if failures is not None:
                 patch["queue_protection"] = failures
+            patch.update(
+                self._needs_attention_notify_patch(
+                    session, self._now(), protection=failures
+                )
+            )
             updated = self.store.lp_update_session(
                 str(session["session_id"]),
                 state="needs_attention",
@@ -9074,6 +9089,11 @@ class PolymarketLPService:
             failures = self._queue_protection_data_failure(session, str(exc))
             if failures is not None:
                 outage_patch["queue_protection"] = failures
+            outage_patch.update(
+                self._needs_attention_notify_patch(
+                    session, self._now(), protection=failures
+                )
+            )
             updated = self.store.lp_update_session(
                 str(session["session_id"]),
                 state="needs_attention",
@@ -9096,6 +9116,17 @@ class PolymarketLPService:
                     "resume_state": resume_state,
                 }
             )
+            patch.update(
+                self._needs_attention_notify_patch(
+                    session,
+                    self._now(),
+                    protection=(
+                        patch["queue_protection"]
+                        if isinstance(patch.get("queue_protection"), Mapping)
+                        else None
+                    ),
+                )
+            )
             updated = self.store.lp_update_session(
                 str(session["session_id"]),
                 state="needs_attention",
@@ -9115,6 +9146,7 @@ class PolymarketLPService:
                     "resume_state": state
                     if state != "needs_attention"
                     else session.get("resume_state"),
+                    **self._needs_attention_notify_patch(session, self._now()),
                 },
             )
             return self._status_payload(updated)
@@ -9127,7 +9159,12 @@ class PolymarketLPService:
             session = self.store.lp_update_session(
                 str(session["session_id"]),
                 state=resume_state,
-                patch={"reconciliation": None, "resume_state": None},
+                patch={
+                    "reconciliation": None,
+                    "resume_state": None,
+                    "needs_attention_since": None,
+                    "needs_attention_notified": False,
+                },
             )
             state = resume_state
         # Issue 152: queue protection runs inside the existing one-second
@@ -9717,6 +9754,91 @@ class PolymarketLPService:
             callback(title, message, xiaoai_text)
         except Exception:
             pass
+
+    @staticmethod
+    def _needs_attention_reason_copy(
+        reconciliation: object,
+    ) -> tuple[str, str]:
+        """「需要核对」文案表（与前端 lpNeedsAttentionCopy 同源同句）。
+
+        返回 (整句 main, 小爱原因短句)。
+        """
+
+        code = str(reconciliation or "")
+        if code == "unowned_target_order":
+            return (
+                "账户里有一张挂在本市场、但不归本组管理的单（常见：手工挂的单）。"
+                "系统已暂停本组自动管理，追加暂不可用；那张单撤掉或成交后自动恢复，无需操作。",
+                "本市场有不归系统管理的挂单",
+            )
+        if code in {"external_snapshot_unknown", "book_unknown", "book_freshness_unknown"}:
+            return ("市场/账户数据连续读取失败，系统自动重试中。", "数据读取连续失败")
+        if "submit_unknown" in code:
+            return (
+                "一笔提交结果未知，需要到 Polymarket 订单页核对该单状态。",
+                "有提交结果未知",
+            )
+        if code.startswith(("stop_cancel_", "deadline_cancel_", "group_collect_")):
+            return ("一次撤单操作失败，系统自动重试中，长时间未恢复需人工核对。", "撤单操作失败")
+        fallback = code or "unknown"
+        return (f"系统暂停了本组的自动管理（原因：{fallback}）。", f"原因 {fallback}")
+
+    def _needs_attention_notify_patch(
+        self,
+        session: Mapping[str, object],
+        now: datetime,
+        *,
+        protection: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        """克制的「需要核对」通知记账 patch（复用于四个巡检写分支）。
+
+        进入（会话此前不在该状态或缺 since 键）→ 锚定 since、notified=False；
+        已在状态 → 不动 since（reason 变化也算同一 episode，不重置不重推）；
+        仍未自愈且距进入满 5 分钟且未推过 → 经 _notify_protection 推一条并把
+        needs_attention_notified=True 随本次 patch 落库；发送异常由
+        _notify_protection 吞掉（现有行为）。恢复路径负责清键重置。
+        """
+
+        state = str(session.get("state"))
+        since_raw = session.get("needs_attention_since")
+        if state != "needs_attention" or since_raw is None:
+            return {
+                "needs_attention_since": now.isoformat(),
+                "needs_attention_notified": False,
+            }
+        if bool(session.get("needs_attention_notified")):
+            return {}
+        try:
+            since = _timestamp(since_raw, name="needs_attention_since")
+        except ValueError:
+            return {
+                "needs_attention_since": now.isoformat(),
+                "needs_attention_notified": False,
+            }
+        if (now - since).total_seconds() < LP_NEEDS_ATTENTION_NOTIFY_SECONDS:
+            return {}
+        view = protection if isinstance(protection, Mapping) else None
+        if view is None:
+            raw = session.get("queue_protection")
+            view = raw if isinstance(raw, Mapping) else {}
+        failures = _queue_group_failures_int(view.get("data_failures"))
+        main, xiaoai_reason = self._needs_attention_reason_copy(
+            session.get("reconciliation")
+        )
+        identity = _text(session.get("market_title")) or str(
+            session.get("condition_id") or ""
+        )[:12]
+        message = main + (
+            f" 数据读取失败 {failures}/10，满 10 次将保护性撤单。"
+            if failures > 0
+            else ""
+        )
+        self._notify_protection(
+            f"LP 需要核对 · {identity}",
+            message,
+            f"LP 需要核对，{xiaoai_reason}",
+        )
+        return {"needs_attention_notified": True}
 
     def _queue_protection_identity(
         self, session: Mapping[str, object]
@@ -11563,7 +11685,14 @@ class PolymarketLPService:
         for order in _items(account.get("open_orders")):
             order_id = self._order_id(order)
             token_value = _field(order, "token_id", _field(order, "asset_id", None))
-            market_value = _field(order, "market_id", _field(order, "market", _field(order, "condition_id", None)))
+            # 生产 raw 挂单行恒含 market_id 键但值为 None；_field 是 dict.get，
+            # 键存在值 None 不走 default，嵌套写法的 market/condition_id 兜底
+            # 全成死代码 → 跨市场单被判成本市场单。这里必须是「第一个非空值」。
+            market_value = (
+                _field(order, "market_id")
+                or _field(order, "market")
+                or _field(order, "condition_id")
+            )
             token = str(token_value or "")
             market = str(market_value or "")
             target = token == expected_token or market in {expected_market, str(session.get("condition_id") or "")}
