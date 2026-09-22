@@ -50,7 +50,8 @@ test('loads the dashboard and prediction workspace without mutations', async ({ 
   const nLegStatus = venuesPayload.n_leg?.status;
   await expect(page.getByRole('tab', { name: 'LP 首页', exact: true })).toHaveAttribute('aria-selected', 'true');
   await expect(page.locator('.pm-venue-card')).toHaveCount(2);
-  await expect(page.locator('.pm-lp-card')).toBeVisible();
+  // #166 起活动 LP 会话下外层面板与内嵌组卡同为 .pm-lp-card，冒烟可见性只锚先出现的外层面板。
+  await expect(page.locator('.pm-lp-card').first()).toBeVisible();
   await expect(page.locator('.pm-mode-bar')).toHaveCount(0);
 
   await page.getByRole('tab', { name: '多腿套利', exact: true }).click();
@@ -70,7 +71,8 @@ test('loads the dashboard and prediction workspace without mutations', async ({ 
   if (nLegPaused) {
     await page.getByRole('tab', { name: 'LP 首页', exact: true }).click();
     await expect(page.getByRole('tab', { name: 'LP 首页', exact: true })).toHaveAttribute('aria-selected', 'true');
-    await expect(page.locator('.pm-lp-card')).toBeVisible();
+    // 同上：#166 嵌套同名组卡会使严格模式冲突，只锚外层面板。
+    await expect(page.locator('.pm-lp-card').first()).toBeVisible();
     await page.getByRole('tab', { name: '多腿套利', exact: true }).click();
     await expect(page.getByRole('heading', { name: '多腿套利' })).toBeVisible();
     await page.waitForTimeout(6500);
