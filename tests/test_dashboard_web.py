@@ -22159,7 +22159,7 @@ const candidateRow = {
   market_title:"Will the Fed cut rates in Q4?", market_url:"https://polymarket.com/event/fed",
   outcome:"YES", state:"eligible", daily_pool_usd:"150", min_quantity:"20",
   estimated_target_quantity:"90", review_at:"2026-09-22T00:00:00Z",
-  selected_direction:{outcome:"YES", price:"0.42", quantity:"120", required_capital:"50.40",
+  selected_direction:{outcome:"YES", token_id:"token-fed", price:"0.42", quantity:"120", required_capital:"50.40",
     estimated_exit_loss:"2.16", estimated_exit_loss_ratio:"0.043",
     checked_at:"2026-09-21T04:00:00Z"},
   competition:{value:"12.5", state:"known", stale:false, updated:true},
@@ -22828,6 +22828,84 @@ for (const target of ["1500", "1500.125"]) {
 }
 console.log(JSON.stringify(results));
 """)
+
+
+def test_lp174_entry_body_identity_follows_selected_direction_a1() -> None:
+    """A1（issue 174）：提交体身份同源——候选行顶层 token_id/outcome 是入队评估腿，
+    看板展示与弹窗取 selected_direction（最优腿）；两腿不同时，提交体 token_id
+    与 outcome 均须取弹窗捕获的 selected_direction（与价格/数量同源），
+    market_id/condition_id 仍取行顶层。"""
+    output = _lp163_interactive(r'''
+state.predictionMarket.csrfToken = "csrf-1";
+const mismatchRow = {
+  ...candidateRow,
+  token_id: "token-fed-no",
+  outcome: "NO",
+  selected_direction: {
+    outcome: "YES",
+    token_id: "token-fed-yes",
+    price: "0.42",
+    quantity: "120",
+    required_capital: "50.40",
+    estimated_exit_loss: "2.16",
+    estimated_exit_loss_ratio: "0.043",
+    checked_at: "2026-09-21T04:00:00Z",
+  },
+};
+openPredictionModal("lp_order", null, lpOrderIntent(mismatchRow));
+const handle = deferResponse(lpOrdersSubmitMatch);
+const confirmPromise = modalClick({modalAction: "lp-order-confirm"});
+handle.respond(jsonResponse({
+  state: "entry_open", session_id: "sess-a1", entry_order_id: "order-a1"}));
+await confirmPromise;
+const item = lpOrdersPosts().pop();
+console.log(JSON.stringify(item ? JSON.parse(item.body) : null));
+''')
+    rendered = json.loads(output)
+    assert rendered["token_id"] == "token-fed-yes"
+    assert rendered["outcome"] == "YES"
+    assert rendered["price"] == "0.42"
+    assert rendered["quantity"] == "120"
+    assert rendered["market_id"] == "market-fed"
+    assert rendered["condition_id"] == "condition-fed"
+    assert rendered["candidate_policy"] == "best_bid_minimum"
+
+
+def test_lp174_entry_body_identity_consistent_row_regression_a2() -> None:
+    """A2（issue 174）：同腿行回归——行顶层与 selected_direction 同腿时，
+    提交体 token_id/outcome/价格/数量不变；标的仍取行顶层。"""
+    output = _lp163_interactive(r'''
+state.predictionMarket.csrfToken = "csrf-1";
+const consistentRow = {
+  ...candidateRow,
+  token_id: "token-fed-yes",
+  outcome: "YES",
+  selected_direction: {
+    outcome: "YES",
+    token_id: "token-fed-yes",
+    price: "0.42",
+    quantity: "120",
+    required_capital: "50.40",
+    checked_at: "2026-09-21T04:00:00Z",
+  },
+};
+openPredictionModal("lp_order", null, lpOrderIntent(consistentRow));
+const handle = deferResponse(lpOrdersSubmitMatch);
+const confirmPromise = modalClick({modalAction: "lp-order-confirm"});
+handle.respond(jsonResponse({
+  state: "entry_open", session_id: "sess-a2", entry_order_id: "order-a2"}));
+await confirmPromise;
+const item = lpOrdersPosts().pop();
+console.log(JSON.stringify(item ? JSON.parse(item.body) : null));
+''')
+    rendered = json.loads(output)
+    assert rendered["token_id"] == "token-fed-yes"
+    assert rendered["outcome"] == "YES"
+    assert rendered["price"] == "0.42"
+    assert rendered["quantity"] == "120"
+    assert rendered["market_id"] == "market-fed"
+    assert rendered["condition_id"] == "condition-fed"
+
 
 def test_lp162_a9_lp_augment_quantity_raw_string() -> None:
     """A9（issue 163 改写）：lp_augment 数量原样——默认 5% 量 1500.125 进输入框

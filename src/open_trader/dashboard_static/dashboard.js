@@ -6662,6 +6662,9 @@ function lpOrderIntent(row) {
     // Issue 162: 数量一律原样字符串——formatDisplayNumber 的千位逗号/两位舍入
     // 是展示口径，进入输入框与请求体会令 Number() 解析 NaN。
     fiveQuantity: Number.isFinite(target) && target > 0 ? String(target) : "",
+    // Issue 174: 提交体身份同源——token 与 outcome 同取弹窗捕获的 selected_direction，
+    // 不取行顶层（行顶层是入队评估腿，可与展示所选腿不同）。
+    token: String(selected.token_id || ""),
     outcome: String(selected.outcome || ""),
     reviewAtText: String(row?.review_at ?? ""),
   };
@@ -7492,7 +7495,9 @@ async function handlePredictionModalClick(event) {
       body = {
         market_id: String(row.market_id || ""),
         condition_id: String(row.condition_id || ""),
-        token_id: String(row.token_id || ""),
+        // Issue 174: token 与 outcome 同源——取弹窗捕获的 selected_direction（data.token），
+        // 不取行顶层评估腿；两腿不同时旧取法会发 mismatch 组合被服务端 #163 拒绝。
+        token_id: String(data.token || ""),
         outcome: String(data.outcome || ""),
         price: priceText,
         quantity: quantityText,
