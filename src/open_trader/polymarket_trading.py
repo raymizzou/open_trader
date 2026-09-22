@@ -27,6 +27,7 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Callable, Literal, cast
 from urllib.error import URLError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from polymarket import BuilderApiKey, PRODUCTION, PublicClient, SecureClient
@@ -64,6 +65,14 @@ LP_PRICE_HISTORY_ENDPOINT = "https://clob.polymarket.com/batch-prices-history"
 LP_PRICE_HISTORY_BATCH_SIZE = 20
 LP_PRICE_HISTORY_MAX_CONCURRENCY = 4
 LP_PRICE_HISTORY_TIMEOUT_SECONDS = 20.0
+# Issue #177: the official competition catalog is a public, unauthenticated
+# read; it uses the raw urllib channel (the SDK's default 10s read timeout
+# kept scrapping whole pagination rounds) with a per-page retry budget and
+# an in-memory resume bookmark.
+LP_COMPETITIVENESS_ENDPOINT = "https://clob.polymarket.com/rewards/markets/multi"
+LP_COMPETITIVENESS_TIMEOUT_SECONDS = 15.0
+LP_COMPETITIVENESS_PAGE_ATTEMPTS = 3
+LP_COMPETITIVENESS_RETRY_PAUSE_SECONDS = 1.0
 LP_REWARD_SELECTED_MAX_CONCURRENCY = 4
 # Issue #137: the ~17k-market reward catalog must not be re-read and fully
 # re-validated from gamma on every lp_market_metadata call.  Results live in
@@ -3719,6 +3728,7 @@ class PolymarketTradingClient:
     def lp_market_competitiveness(
         self,
         *,
+        start_cursor: str | None = None,
         stop_event: threading.Event | None = None,
         previous: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
@@ -3727,7 +3737,10 @@ class PolymarketTradingClient:
         The read never raises for transport failures: pages that succeed merge
         into the returned mapping, targets covered by failed pages keep their
         previous value and are flagged in ``not_updated`` so the caller can
-        mark them as stale-this-round.  Explicit zero competitiveness is kept
+        mark them as stale-this-round.  A round stopped early by transport
+        failures carries the last successful page's ``next_cursor`` back as
+        ``resume_cursor`` so the next round resumes instead of restarting;
+        a completed round clears it.  Explicit zero competitiveness is kept
         as zero; the projection owns the danger-signal exclusion.
         """
 
@@ -3742,6 +3755,13 @@ class PolymarketTradingClient:
                     if isinstance(value[0], Decimal) and isinstance(stamp, datetime):
                         previous_map[key] = (value[0], stamp)
 
+        # Issue #177: the bookmark for the next round — the next_cursor of
+        # the last page that was read successfully, or the round's own
+        # start when no page succeeded.  Cleared when the walk completes.
+        cursor: str | None = start_cursor or None
+        resume_cursor: str | None = cursor
+        resumed = cursor is not None
+
         def incomplete(
             state: str, merged: dict[str, tuple[Decimal, datetime]], updated: set[str]
         ) -> dict[str, object]:
@@ -3752,6 +3772,7 @@ class PolymarketTradingClient:
                 "round_checked_at": checked_at,
                 "competitiveness": merged,
                 "not_updated": sorted(key for key in previous_map if key not in updated),
+                "resume_cursor": resume_cursor,
             }
 
         merged: dict[str, tuple[Decimal, datetime]] = {}
@@ -3760,12 +3781,7 @@ class PolymarketTradingClient:
         try:
             if stop_event is not None and stop_event.is_set():
                 raise _RewardReadCancelled
-            context = getattr(self._client, "_ctx", None)
-            transport = getattr(context, "secure_clob", None)
-            get_json = getattr(transport, "get_json", None)
-            if not callable(get_json):
-                raise ValueError("competitiveness_transport_unknown")
-            cursor: str | None = None
+            opener = self._urlopen_fn or urlopen
             seen_cursors: set[str] = set()
             while True:
                 if stop_event is not None and stop_event.is_set():
@@ -3773,7 +3789,49 @@ class PolymarketTradingClient:
                 params: dict[str, object] = {"page_size": 500}
                 if cursor is not None:
                     params["next_cursor"] = cursor
-                payload = get_json("/rewards/markets/multi", params=params)
+                request = Request(
+                    f"{LP_COMPETITIVENESS_ENDPOINT}?{urlencode(params)}",
+                    headers={
+                        "Accept": "application/json",
+                        "User-Agent": "OpenTrader/1.0",
+                    },
+                )
+                payload: object = None
+                page_read = False
+                last_error: Exception | None = None
+                for attempt in range(LP_COMPETITIVENESS_PAGE_ATTEMPTS):
+                    if attempt:
+                        pause = LP_COMPETITIVENESS_RETRY_PAUSE_SECONDS
+                        if stop_event is not None:
+                            # A cooperative stop interrupts the retry wait.
+                            if stop_event.wait(pause):
+                                raise _RewardReadCancelled
+                        elif pause:
+                            time.sleep(pause)
+                        if stop_event is not None and stop_event.is_set():
+                            raise _RewardReadCancelled
+                    try:
+                        with opener(
+                            request, timeout=LP_COMPETITIVENESS_TIMEOUT_SECONDS
+                        ) as response:
+                            raw = response.read()
+                        if isinstance(raw, bytes):
+                            raw = raw.decode("utf-8")
+                        payload = json.loads(raw)
+                        page_read = True
+                        break
+                    except Exception as exc:
+                        last_error = exc
+                if not page_read:
+                    logger.warning(
+                        "lp_market_competitiveness page abandoned after %d "
+                        "attempts: cursor=%r pages_ok=%d error=%r",
+                        LP_COMPETITIVENESS_PAGE_ATTEMPTS,
+                        cursor,
+                        pages_ok,
+                        last_error,
+                    )
+                    raise ValueError("competitiveness_page_unreadable")
                 if stop_event is not None and stop_event.is_set():
                     raise _RewardReadCancelled
                 if not isinstance(payload, Mapping):
@@ -3796,11 +3854,19 @@ class PolymarketTradingClient:
                 pages_ok += 1
                 next_cursor = payload.get("next_cursor")
                 if not isinstance(next_cursor, str) or not next_cursor or next_cursor == "LTE=":
+                    resume_cursor = None
                     break
                 if next_cursor in seen_cursors:
                     raise ValueError("competitiveness_pagination_loop")
                 seen_cursors.add(next_cursor)
                 cursor = next_cursor
+                resume_cursor = next_cursor
+            if resumed:
+                # A resumed round only re-reads from its bookmark onward:
+                # targets before the bookmark keep their previous values and
+                # timestamps instead of being dropped by the fresh tail.
+                for key, value in previous_map.items():
+                    merged.setdefault(key, value)
             return {
                 "state": "known",
                 "complete": True,
@@ -3808,6 +3874,7 @@ class PolymarketTradingClient:
                 "round_checked_at": checked_at,
                 "competitiveness": merged,
                 "not_updated": sorted(key for key in previous_map if key not in updated),
+                "resume_cursor": None,
             }
         except _RewardReadCancelled:
             for key, value in previous_map.items():

@@ -6120,6 +6120,9 @@ class PolymarketLPService:
                 result = reader(
                     stop_event=stop_event,
                     previous=previous.get("competitiveness", {}),
+                    # Issue #177: resume the walk where the last round
+                    # stopped instead of restarting from page one.
+                    start_cursor=previous.get("next_start_cursor"),
                 )
             except Exception:
                 result = None
@@ -6132,6 +6135,7 @@ class PolymarketLPService:
                         result.get("competitiveness") or {}
                     ),
                     "not_updated": list(result.get("not_updated") or []),
+                    "next_start_cursor": result.get("resume_cursor"),
                 }
                 with self._competition_lock:
                     self._competition_state = stored

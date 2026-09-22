@@ -6578,9 +6578,9 @@ def test_lp_same_kind_refreshes_do_not_overlap(
     release = threading.Event()
 
     def blocked_competitiveness(
-        *, stop_event: object = None, previous: object = None
+        *, stop_event: object = None, previous: object = None, start_cursor=None
     ) -> dict[str, object]:
-        del stop_event, previous
+        del stop_event, previous, start_cursor
         entered.set()
         assert release.wait(timeout=5)
         return {
@@ -6637,9 +6637,9 @@ def test_lp_scan_does_not_block_maintenance(
     release = threading.Event()
 
     def blocked_competitiveness(
-        *, stop_event: object = None, previous: object = None
+        *, stop_event: object = None, previous: object = None, start_cursor=None
     ) -> dict[str, object]:
-        del stop_event, previous
+        del stop_event, previous, start_cursor
         entered.set()
         assert release.wait(timeout=5)
         return {

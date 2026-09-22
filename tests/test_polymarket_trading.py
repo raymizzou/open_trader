@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import subprocess
 import sys
@@ -11,6 +12,7 @@ from decimal import ROUND_FLOOR, Decimal
 from pathlib import Path
 from subprocess import CalledProcessError, CompletedProcess
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 import pytest
@@ -2094,56 +2096,11 @@ def test_lp_reward_percentages_reads_official_market_shares(
 def test_lp_market_competitiveness_merges_pages_and_isolates_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class CompetitivenessTransport:
-        def __init__(self) -> None:
-            self.calls: list[tuple[str, dict[str, object]]] = []
-            self.fail_second_page = False
-
-        def get_json(self, path: str, *, params: dict[str, object]) -> object:
-            self.calls.append((path, dict(params)))
-            if params.get("next_cursor") is None:
-                return {
-                    "data": [
-                        {
-                            "condition_id": "condition-a",
-                            "market_competitiveness": 16.6,
-                        },
-                        {
-                            "condition_id": "condition-b",
-                            "market_competitiveness": "0",
-                        },
-                        {
-                            "condition_id": "condition-bad",
-                            "market_competitiveness": "NaN",
-                        },
-                    ],
-                    "next_cursor": "Mg==",
-                    "limit": 500,
-                    "count": 3,
-                }
-            if self.fail_second_page:
-                raise RuntimeError("second page failed")
-            return {
-                "data": [
-                    {
-                        "condition_id": "condition-c",
-                        "market_competitiveness": 39190,
-                    }
-                ],
-                "next_cursor": "LTE=",
-                "limit": 500,
-                "count": 1,
-            }
-
-    transport = CompetitivenessTransport()
-    monkeypatch.setattr(polymarket_trading, "signature_type_for", lambda _: 2)
-
-    class SDK:
-        _ctx = SimpleNamespace(secure_clob=transport, wallet_type="proxy")
-
-    adapter = PolymarketTradingClient(
-        TradingConfig(SIGNER, WALLET), client=SDK()
+    monkeypatch.setattr(
+        polymarket_trading, "LP_COMPETITIVENESS_RETRY_PAUSE_SECONDS", 0.0
     )
+    opener = CompetitionOpener()
+    adapter = make_competition_adapter(opener)
 
     complete = adapter.lp_market_competitiveness()
     assert complete["state"] == "known"
@@ -2161,16 +2118,14 @@ def test_lp_market_competitiveness_merges_pages_and_isolates_failures(
     )
     assert complete["competitiveness"]["condition-c"][0] == Decimal("39190")
     assert "condition-bad" not in complete["competitiveness"]
-    assert [(path, params["page_size"]) for path, params in transport.calls] == [
-        ("/rewards/markets/multi", 500),
-        ("/rewards/markets/multi", 500),
-    ]
-    assert transport.calls[1][1]["next_cursor"] == "Mg=="
+    assert opener.calls == [None, "Mg=="]
+    assert opener.paths == ["/rewards/markets/multi", "/rewards/markets/multi"]
+    assert opener.page_two_calls == 1
 
     # Round 2: page 1 succeeds, page 2 fails.  Page-1 targets update with the
     # new round stamp; page-2 targets keep the old value and are flagged as
     # not updated this round.
-    transport.fail_second_page = True
+    opener.page_two_failures = -1
     partial = adapter.lp_market_competitiveness(
         previous=complete["competitiveness"]
     )
@@ -2191,16 +2146,7 @@ def test_lp_market_competitiveness_merges_pages_and_isolates_failures(
 
     # Total failure stays non-blocking: structure complete, previous values
     # preserved and flagged not updated.
-    class BrokenTransport:
-        def get_json(self, path: str, *, params: dict[str, object]) -> object:
-            raise RuntimeError("transport down")
-
-    class BrokenSDK:
-        _ctx = SimpleNamespace(secure_clob=BrokenTransport(), wallet_type="proxy")
-
-    broken_adapter = PolymarketTradingClient(
-        TradingConfig(SIGNER, WALLET), client=BrokenSDK()
-    )
+    broken_adapter = make_competition_adapter(CompetitionOpener(fail_all=True))
     failed = broken_adapter.lp_market_competitiveness(
         previous=complete["competitiveness"]
     )
@@ -2212,6 +2158,244 @@ def test_lp_market_competitiveness_merges_pages_and_isolates_failures(
     assert failed_empty["state"] == "unknown"
     assert failed_empty["competitiveness"] == {}
     assert failed_empty["not_updated"] == []
+
+
+class CompetitionOpener:
+    """Issue #177 fake raw-urllib channel over the fixed two-page fixture.
+
+    Dispatch is on the request query string: a request without
+    ``next_cursor`` serves page one, anything else serves page two.  Page
+    two raises for the first ``page_two_failures`` calls (negative: always)
+    before succeeding; ``fail_all`` makes every page raise instead.
+    """
+
+    def __init__(
+        self,
+        *,
+        page_two_failures: int = 0,
+        fail_all: bool = False,
+    ) -> None:
+        self.page_two_failures = page_two_failures
+        self.fail_all = fail_all
+        self.calls: list[str | None] = []
+        self.timeouts: list[float] = []
+        self.paths: list[str] = []
+        self.page_sizes: list[str] = []
+        self.page_two_calls = 0
+        self.stop_on_page_two_failure: threading.Event | None = None
+
+    def __call__(self, request: object, *, timeout: float) -> FakeResponse:
+        split = urlsplit(getattr(request, "full_url"))
+        query = parse_qs(split.query)
+        cursor = (query.get("next_cursor") or [None])[0]
+        self.calls.append(cursor)
+        self.timeouts.append(timeout)
+        self.paths.append(split.path)
+        self.page_sizes.append((query.get("page_size") or [""])[0])
+        if self.fail_all:
+            raise RuntimeError("transport down")
+        if cursor is None:
+            return FakeResponse(
+                {
+                    "data": [
+                        {
+                            "condition_id": "condition-a",
+                            "market_competitiveness": 16.6,
+                        },
+                        {
+                            "condition_id": "condition-b",
+                            "market_competitiveness": "0",
+                        },
+                        {
+                            "condition_id": "condition-bad",
+                            "market_competitiveness": "NaN",
+                        },
+                    ],
+                    "next_cursor": "Mg==",
+                    "limit": 500,
+                    "count": 3,
+                }
+            )
+        self.page_two_calls += 1
+        exhausted = self.page_two_failures < 0 or (
+            self.page_two_calls <= self.page_two_failures
+        )
+        if self.page_two_failures and exhausted:
+            if self.stop_on_page_two_failure is not None:
+                self.stop_on_page_two_failure.set()
+            raise RuntimeError("second page failed")
+        return FakeResponse(
+            {
+                "data": [
+                    {
+                        "condition_id": "condition-c",
+                        "market_competitiveness": 39190,
+                    }
+                ],
+                "next_cursor": "LTE=",
+                "limit": 500,
+                "count": 1,
+            }
+        )
+
+
+def make_competition_adapter(
+    opener: CompetitionOpener,
+) -> PolymarketTradingClient:
+    return PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET), client=SimpleNamespace(), urlopen_fn=opener
+    )
+
+
+def test_lp_market_competitiveness_persistent_page_failure_keeps_bookmark_and_warns(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Issue #177: a page that fails on every attempt is retried three
+    times, then the round keeps the earlier pages, exposes the resume
+    bookmark, and warns instead of silently scrapping the pagination."""
+
+    monkeypatch.setattr(
+        polymarket_trading, "LP_COMPETITIVENESS_RETRY_PAUSE_SECONDS", 0.0
+    )
+    opener = CompetitionOpener(page_two_failures=-1)
+    adapter = make_competition_adapter(opener)
+
+    with caplog.at_level(
+        logging.WARNING, logger="open_trader.polymarket_trading"
+    ):
+        partial = adapter.lp_market_competitiveness()
+
+    assert partial["state"] == "partial"
+    assert partial["complete"] is False
+    assert partial["competitiveness"]["condition-a"] == (
+        Decimal("16.6"),
+        partial["round_checked_at"],
+    )
+    assert "condition-bad" not in partial["competitiveness"]
+    assert opener.page_two_calls == 3
+    assert partial["resume_cursor"] == "Mg=="
+    page_two_warnings = [
+        record
+        for record in caplog.records
+        if record.name == "open_trader.polymarket_trading"
+        and record.levelno == logging.WARNING
+    ]
+    assert len(page_two_warnings) == 1
+
+
+def test_lp_market_competitiveness_retries_a_page_until_it_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #177: one transient page failure no longer scraps the round —
+    the page is retried, succeeds, and the walk completes as known."""
+
+    monkeypatch.setattr(
+        polymarket_trading, "LP_COMPETITIVENESS_RETRY_PAUSE_SECONDS", 0.0
+    )
+    opener = CompetitionOpener(page_two_failures=1)
+    adapter = make_competition_adapter(opener)
+
+    complete = adapter.lp_market_competitiveness()
+
+    assert complete["state"] == "known"
+    assert complete["complete"] is True
+    assert complete["competitiveness"]["condition-c"][0] == Decimal("39190")
+    assert opener.page_two_calls == 2
+    assert complete["resume_cursor"] is None
+
+
+def test_lp_market_competitiveness_resumes_from_start_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #177: a start_cursor continues the walk where the previous
+    round stopped — the first request carries it, completed rounds clear
+    the bookmark, and untouched targets keep their previous timestamp."""
+
+    monkeypatch.setattr(
+        polymarket_trading, "LP_COMPETITIVENESS_RETRY_PAUSE_SECONDS", 0.0
+    )
+    opener = CompetitionOpener()
+    adapter = make_competition_adapter(opener)
+    old_stamp = datetime(2026, 9, 20, 12, tzinfo=UTC)
+
+    resumed = adapter.lp_market_competitiveness(
+        start_cursor="Mg==",
+        previous={"condition-a": (Decimal("16.6"), old_stamp)},
+    )
+
+    assert opener.calls == ["Mg=="]
+    assert opener.page_two_calls == 1
+    assert resumed["state"] == "known"
+    assert resumed["complete"] is True
+    assert resumed["resume_cursor"] is None
+    assert resumed["competitiveness"]["condition-a"] == (
+        Decimal("16.6"),
+        old_stamp,
+    )
+    assert resumed["not_updated"] == ["condition-a"]
+
+
+def test_lp_market_competitiveness_stop_interrupts_the_retry_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #177: a cooperative stop raised while a failed page sits in its
+    retry wait ends the round immediately — no further attempts, cancelled
+    state, and the bookmark of the last successful page."""
+
+    opener = CompetitionOpener(page_two_failures=1)
+    stop = threading.Event()
+    opener.stop_on_page_two_failure = stop
+    adapter = make_competition_adapter(opener)
+
+    cancelled = adapter.lp_market_competitiveness(stop_event=stop)
+
+    assert opener.page_two_calls == 1
+    assert cancelled["state"] == "unknown"
+    assert cancelled["complete"] is False
+    assert cancelled["resume_cursor"] == "Mg=="
+
+
+def test_lp_market_competitiveness_total_failure_stays_non_blocking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #177: every page failing on every attempt leaves the previous
+    map untouched, no bookmark (nothing was read), and raises nothing."""
+
+    monkeypatch.setattr(
+        polymarket_trading, "LP_COMPETITIVENESS_RETRY_PAUSE_SECONDS", 0.0
+    )
+    adapter = make_competition_adapter(CompetitionOpener(fail_all=True))
+    old_stamp = datetime(2026, 9, 20, 12, tzinfo=UTC)
+    previous = {"condition-z": (Decimal("9"), old_stamp)}
+
+    failed = adapter.lp_market_competitiveness(previous=previous)
+
+    assert failed["state"] == "unknown"
+    assert failed["complete"] is False
+    assert failed["competitiveness"] == previous
+    assert failed["not_updated"] == ["condition-z"]
+    assert failed["resume_cursor"] is None
+
+
+def test_lp_market_competitiveness_requests_use_the_dedicated_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #177: competition page reads go through the raw urllib channel
+    with the dedicated 15s timeout instead of the SDK's fixed 10s read."""
+
+    monkeypatch.setattr(
+        polymarket_trading, "LP_COMPETITIVENESS_RETRY_PAUSE_SECONDS", 0.0
+    )
+    opener = CompetitionOpener()
+    adapter = make_competition_adapter(opener)
+
+    complete = adapter.lp_market_competitiveness()
+
+    assert complete["state"] == "known"
+    assert opener.timeouts
+    assert opener.timeouts == [15.0, 15.0]
+    assert opener.paths == ["/rewards/markets/multi", "/rewards/markets/multi"]
+    assert opener.page_sizes == ["500", "500"]
 
 
 def make_probe_intent(

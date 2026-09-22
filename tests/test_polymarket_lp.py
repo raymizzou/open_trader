@@ -2978,9 +2978,9 @@ def test_refresh_candidates_projects_trial_funnel_without_risk(tmp_path) -> None
             }
 
         def lp_market_competitiveness(
-            self, *, stop_event=None, previous=None
+            self, *, stop_event=None, previous=None, start_cursor=None
         ) -> dict[str, object]:
-            del stop_event, previous
+            del stop_event, previous, start_cursor
             self.competition_reads += 1
             return {
                 "state": "known",
@@ -3163,9 +3163,9 @@ def test_refresh_candidates_drops_rows_whose_realtime_capital_over_available(tmp
             }
 
         def lp_market_competitiveness(
-            self, *, stop_event=None, previous=None
+            self, *, stop_event=None, previous=None, start_cursor=None
         ) -> dict[str, object]:
-            del stop_event, previous
+            del stop_event, previous, start_cursor
             return {
                 "state": "known",
                 "complete": True,
@@ -3351,9 +3351,9 @@ class _LPCandidateQueryExchange:
         }
 
     def lp_market_competitiveness(
-        self, *, stop_event=None, previous=None
+        self, *, stop_event=None, previous=None, start_cursor=None
     ) -> dict[str, object]:
-        del stop_event, previous
+        del stop_event, previous, start_cursor
         self.competition_reads += 1
         return {
             "state": "known",
@@ -4435,8 +4435,8 @@ def test_batch_refresh_ranks_passers_by_actual_capital_and_maintains_top_one(
                 "condition-B1": 11,
             }
 
-        def lp_market_competitiveness(self, *, stop_event=None, previous=None):
-            del stop_event, previous
+        def lp_market_competitiveness(self, *, stop_event=None, previous=None, start_cursor=None):
+            del stop_event, previous, start_cursor
             return {
                 "state": "known",
                 "complete": True,
@@ -4557,8 +4557,8 @@ def test_maintenance_recomputes_upper_bound_from_new_capital(tmp_path) -> None:
                 "condition-Z1": 10,
             }
 
-        def lp_market_competitiveness(self, *, stop_event=None, previous=None):
-            del stop_event, previous
+        def lp_market_competitiveness(self, *, stop_event=None, previous=None, start_cursor=None):
+            del stop_event, previous, start_cursor
             return {
                 "state": "known",
                 "complete": True,
@@ -7688,8 +7688,8 @@ class _LPRollingPoolExchange(_LPCandidateQueryExchange):
             )
         return {**dict(catalog), "markets": tuple(markets)}
 
-    def lp_market_competitiveness(self, *, stop_event=None, previous=None):
-        del stop_event, previous
+    def lp_market_competitiveness(self, *, stop_event=None, previous=None, start_cursor=None):
+        del stop_event, previous, start_cursor
         values = {
             "condition-M01": Decimal(1),
             "condition-M02": Decimal(9),
@@ -8261,6 +8261,59 @@ def test_maintenance_renewals_do_not_stall_exploration(tmp_path) -> None:
         assert explored["candidate_valid_count"] == 10 * (1 + step)
 
 
+def test_competition_cache_stores_resume_bookmark_and_passes_it_back(
+    tmp_path,
+) -> None:
+    """Issue #177: the LP service keeps the reader's resume bookmark in
+    memory, hands it to the next round's read as its start cursor, and
+    clears it once a round walks to completion."""
+    now = datetime(2026, 9, 20, 16, tzinfo=UTC)
+    calls: list[dict[str, object]] = []
+    rounds = iter(
+        [
+            {
+                "state": "partial",
+                "complete": False,
+                "checked_at": now,
+                "round_checked_at": now,
+                "competitiveness": {},
+                "not_updated": [],
+                "resume_cursor": "Mg==",
+            },
+            {
+                "state": "known",
+                "complete": True,
+                "checked_at": now,
+                "round_checked_at": now,
+                "competitiveness": {},
+                "not_updated": [],
+                "resume_cursor": None,
+            },
+        ]
+    )
+
+    class BookmarkExchange:
+        def lp_market_competitiveness(
+            self, *, stop_event=None, previous=None, start_cursor=None
+        ):
+            calls.append({"start_cursor": start_cursor, "previous": previous})
+            return dict(next(rounds))
+
+    lp = PolymarketLPService(
+        PredictionArbitrageStore(tmp_path), BookmarkExchange()
+    )
+
+    first = lp.refresh_competition_cache()
+
+    assert calls[0]["start_cursor"] is None
+    assert first["next_start_cursor"] == "Mg=="
+
+    second = lp.refresh_competition_cache()
+
+    assert calls[1]["start_cursor"] == "Mg=="
+    assert second["next_start_cursor"] is None
+
+
 def test_hanging_competition_read_never_blocks_candidate_batches(
     tmp_path,
 ) -> None:
@@ -8276,7 +8329,10 @@ def test_hanging_competition_read_never_blocks_candidate_batches(
     latch = threading.Event()
     competition_calls = {"count": 0}
 
-    def hanging_competition(*, stop_event=None, previous=None):
+    def hanging_competition(
+        *, stop_event=None, previous=None, start_cursor=None
+    ):
+        del start_cursor
         competition_calls["count"] += 1
         assert latch.wait(timeout=5)
         raise RuntimeError("competition read failed")
