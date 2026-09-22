@@ -10232,7 +10232,9 @@ def test_lp_routes_preserve_guard_and_idempotency(tmp_path: Path) -> None:
 def test_lp_augment_routes_preserve_guard_idempotency_and_schema(
     tmp_path: Path,
 ) -> None:
-    """Issue 158: 加量路由契约——鉴权、严格 schema、幂等重试、busy 仍 200。"""
+    """Issue 158 加量路由契约 + #167 改写——鉴权、严格 schema、幂等重试、busy 仍 200；
+    两段式预检缺省组价（入场单在挂）按 D1-c 拒 price_level_active，
+    成功/幂等/熔断路径移到单发 /lp/augment 带 price。"""
 
     now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
     condition_id = "0x" + "c" * 64
@@ -10369,6 +10371,8 @@ def test_lp_augment_routes_preserve_guard_idempotency_and_schema(
         )
         assert bad_preview_status == 400
 
+        # #167：两段式预检 schema 严格 {session_id, quantity}，缺省=组价；
+        # 入场单仍在挂 → price_level_active（同价加量退役）。
         augment_preview_status, augment_preview = _response(
             _production_request(
                 base,
@@ -10379,28 +10383,30 @@ def test_lp_augment_routes_preserve_guard_idempotency_and_schema(
             )
         )
         assert augment_preview_status == 200
-        assert augment_preview["state"] == "previewed"
-        assert augment_preview["price"] == "0.30"
-        assert augment_preview["request"]["session_id"] == session_id
+        assert augment_preview == {"state": "rejected", "reason": "price_level_active"}
         assert len(exchange.posts) == 1
 
-        start_body = json.dumps(
+        # 成功：单发路由带 price=0.28（新价位，不高于顶档）。
+        single_body = json.dumps(
             {
-                "preview_id": augment_preview["preview_id"],
+                "session_id": session_id,
+                "quantity": "90",
                 "idempotency_key": "lp-aug-api-1",
+                "price": "0.28",
             }
         ).encode("utf-8")
         first_status, first = _response(
-            _production_request(base, augment_path, data=start_body)
+            _production_request(base, "/api/prediction-arbitrage/lp/augment", data=single_body)
         )
         assert first_status == 200
         assert first["state"] == "entry_open"
         assert first["augment_order_id"] == "lp-order-2"
+        assert Decimal(str(exchange.posts[1]["price"])) == Decimal("0.28")
         assert len(exchange.posts) == 2
 
-        # 幂等重试：同 key 同 body → 返既有结果，无第二张加量单。
+        # 幂等重试：同 key 同 body → 返既有结果，无第二张追加单。
         retry_status, retry = _response(
-            _production_request(base, augment_path, data=start_body)
+            _production_request(base, "/api/prediction-arbitrage/lp/augment", data=single_body)
         )
         assert retry_status == 200
         assert retry["augment_order_id"] == "lp-order-2"
@@ -10413,7 +10419,7 @@ def test_lp_augment_routes_preserve_guard_idempotency_and_schema(
                 augment_path,
                 data=json.dumps(
                     {
-                        "preview_id": augment_preview["preview_id"],
+                        "preview_id": "x",
                         "idempotency_key": "lp-aug-api-2",
                         "extra": True,
                     }
@@ -10457,26 +10463,18 @@ def test_lp_augment_routes_preserve_guard_idempotency_and_schema(
         assert busy["reason"] == "lp_session_market_active"
         assert len(exchange.posts) == 2
 
-        # 熔断开启 → 加量确认被锁，不下单。
+        # 熔断开启 → 单发加量被锁，不下单。
         execution._breaker_open = True
-        locked_preview_status, locked_preview = _response(
-            _production_request(
-                base,
-                "/api/prediction-arbitrage/lp/augment/preview",
-                data=json.dumps(
-                    {"session_id": session_id, "quantity": "90"}
-                ).encode("utf-8"),
-            )
-        )
-        assert locked_preview_status == 200
         locked_status, locked = _response(
             _production_request(
                 base,
-                augment_path,
+                "/api/prediction-arbitrage/lp/augment",
                 data=json.dumps(
                     {
-                        "preview_id": locked_preview["preview_id"],
+                        "session_id": session_id,
+                        "quantity": "90",
                         "idempotency_key": "lp-aug-api-3",
+                        "price": "0.28",
                     }
                 ).encode("utf-8"),
             )
@@ -10521,6 +10519,230 @@ def test_lp_augment_routes_preserve_guard_idempotency_and_schema(
 
     assert shadow_preview_status == shadow_augment_status == 403
     assert len(exchange.posts) == 2
+
+
+def test_lp167_h_augment_route_accepts_price_and_rejects_bad_prices(
+    tmp_path: Path,
+) -> None:
+    """H（issue 167）：/lp/augment 可选 price——新价位成功、高于顶档拒、同价拒；
+    严格 schema 保持（多字段 400）；/lp/orders 契约不变。"""
+
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    condition_id = "0x" + "c" * 64
+    token_id = "0x" + "1" * 64
+
+    class Exchange:
+        def __init__(self) -> None:
+            self.posts: list[dict[str, object]] = []
+            self.snapshot = {
+                "account": {
+                    "authenticated": True,
+                    "balance": Decimal("1000"),
+                    "allowance": Decimal("1000"),
+                    "positions": [],
+                    "open_orders": [],
+                },
+                "market": {
+                    "market_id": "market-1",
+                    "condition_id": condition_id,
+                    "token_id": token_id,
+                    "outcome": "YES",
+                    "accepting_orders": True,
+                    "exchange_type": "CLOB",
+                    "tick_size": Decimal("0.01"),
+                    "minimum_order_size": Decimal("1"),
+                    "fee": Decimal("0"),
+                    "fees_enabled": False,
+                    "reward_min_size": Decimal("1"),
+                    "reward_max_spread": Decimal("0.10"),
+                },
+                "book": {
+                    "timestamp": now,
+                    "received_at": now,
+                    "asks": [{"price": Decimal("0.31"), "size": Decimal("100")}],
+                    "bids": [{"price": Decimal("0.29"), "size": Decimal("100")}],
+                },
+                "trades": [],
+                "orders": [],
+                "orders_terminal": True,
+            }
+
+        def lp_snapshot(self, _request: Mapping[str, object]) -> dict[str, object]:
+            return self.snapshot
+
+        def create_limit_order(self, **kwargs: object) -> dict[str, object]:
+            return dict(kwargs)
+
+        def post_order(self, signed: dict[str, object]) -> dict[str, object]:
+            self.posts.append(dict(signed))
+            return {
+                **signed,
+                "order_id": f"lp-order-{len(self.posts)}",
+                "status": "LIVE",
+            }
+
+        def cancel_order(self, order_id: str) -> dict[str, object]:
+            return {"status": "CANCELED", "order_id": order_id}
+
+    exchange = Exchange()
+    store = PredictionArbitrageStore(tmp_path)
+    lp = PolymarketLPService(store, exchange, clock=lambda: now)
+    execution = PredictionExecutionService(
+        store=store,
+        monitor=_Monitor(),
+        trading=exchange,
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "prediction_arbitrage" / "execution.lock",
+        lp=lp,
+    )
+    execution._breaker_open = False
+
+    production_runtime = SimpleNamespace(
+        mode="production",
+        state="RUNNING",
+        production_owner=True,
+        store=store,
+        monitor=_Monitor(),
+        execution=execution,
+        cross_venue_monitor=None,
+    )
+
+    request = {
+        "market_id": "market-1",
+        "condition_id": condition_id,
+        "token_id": token_id,
+        "outcome": "YES",
+        "question": "Will it happen?",
+        "price": "0.30",
+        "quantity": "10",
+        "review_at": (now + timedelta(minutes=10)).isoformat(),
+    }
+    with _running_server(
+        production_runtime,
+        session_token="session-token",
+        csrf_token="csrf-token",
+        runtime_metadata={"git_sha": "abc123"},
+    ) as (base, _server_instance):
+        preview_status, preview = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/preview",
+                data=json.dumps(request).encode("utf-8"),
+            )
+        )
+        assert preview_status == 200
+        entry_status, entry = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/sessions",
+                data=json.dumps(
+                    {
+                        "preview_id": preview["preview_id"],
+                        "idempotency_key": "lp167-h-entry",
+                    }
+                ).encode("utf-8"),
+            )
+        )
+        assert entry_status == 200
+        assert entry["state"] == "entry_open"
+        session_id = str(entry["session_id"])
+
+        # 新价位追加成功：恰一单 0.28。
+        ok_status, ok = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/augment",
+                data=json.dumps(
+                    {
+                        "session_id": session_id,
+                        "quantity": "5",
+                        "idempotency_key": "lp167-h-aug-1",
+                        "price": "0.28",
+                    }
+                ).encode("utf-8"),
+            )
+        )
+        assert ok_status == 200
+        assert ok["state"] == "entry_open"
+        assert ok["augment_order_id"] == "lp-order-2"
+        assert Decimal(str(exchange.posts[1]["price"])) == Decimal("0.28")
+        assert Decimal(str(exchange.posts[1]["quantity"])) == Decimal("5")
+
+        # 高于同快照顶档买一（0.30）→ price_above_best_bid，无新单。
+        above_status, above = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/augment",
+                data=json.dumps(
+                    {
+                        "session_id": session_id,
+                        "quantity": "5",
+                        "idempotency_key": "lp167-h-aug-2",
+                        "price": "0.50",
+                    }
+                ).encode("utf-8"),
+            )
+        )
+        assert above_status == 200
+        assert above == {
+            "state": "rejected",
+            "reason": "price_above_best_bid",
+        }
+
+        # 组价 0.30（入场单仍在挂）→ price_level_active。
+        same_status, same = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/augment",
+                data=json.dumps(
+                    {
+                        "session_id": session_id,
+                        "quantity": "5",
+                        "idempotency_key": "lp167-h-aug-3",
+                        "price": "0.30",
+                    }
+                ).encode("utf-8"),
+            )
+        )
+        assert same_status == 200
+        assert same == {"state": "rejected", "reason": "price_level_active"}
+
+        # 严格 schema：多余字段 400、缺键 400。
+        extra_status, _extra = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/augment",
+                data=json.dumps(
+                    {
+                        "session_id": session_id,
+                        "quantity": "5",
+                        "idempotency_key": "lp167-h-aug-4",
+                        "extra": True,
+                    }
+                ).encode("utf-8"),
+            )
+        )
+        assert extra_status == 400
+        missing_status, _missing = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/augment",
+                data=b'{"session_id":"x","quantity":"5"}',
+            )
+        )
+        assert missing_status == 400
+        assert len(exchange.posts) == 2
+
+        # /lp/orders 契约不变：多余字段仍 400、无下单。
+        orders_extra_status, _orders_extra = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/orders",
+                data=json.dumps({**request, "idempotency_key": "lp167-h-orders", "extra": True}).encode("utf-8"),
+            )
+        )
+        assert orders_extra_status == 400
+        assert len(exchange.posts) == 2
 
 
 def test_production_http_confirmation_preserves_execution_idempotency(
@@ -14640,6 +14862,25 @@ def test_lp163_augment_route_contract(tmp_path: Path) -> None:
                 "size_matched": Decimal("0"),
             }
         ]
+        # #167 改写：同价补量（缺省组价 0.29，入场单仍在挂）→ price_level_active。
+        same_status, same = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/lp/augment",
+                data=json.dumps(
+                    {
+                        "session_id": session_id,
+                        "quantity": "20",
+                        "idempotency_key": "lp163-h5-aug-same-price",
+                    }
+                ).encode("utf-8"),
+            )
+        )
+        assert same_status == 200
+        assert same == {"state": "rejected", "reason": "price_level_active"}
+        assert len(exchange.posts) == 1
+
+        # 新价位 0.28（不高于顶档买一 0.29）→ 成功恰一单。
         aug_status, augmented = _response(
             _production_request(
                 base,
@@ -14649,6 +14890,7 @@ def test_lp163_augment_route_contract(tmp_path: Path) -> None:
                         "session_id": session_id,
                         "quantity": "20",
                         "idempotency_key": "lp163-h5-aug",
+                        "price": "0.28",
                     }
                 ).encode("utf-8"),
             )
@@ -14656,6 +14898,7 @@ def test_lp163_augment_route_contract(tmp_path: Path) -> None:
         assert aug_status == 200
         assert augmented["state"] == "entry_open"
         assert str(augmented["augment_order_id"]) == "lp-order-2"
+        assert Decimal(str(exchange.posts[1]["price"])) == Decimal("0.28")
         assert len(exchange.posts) == 2
 
         store.lp_update_session(session_id, state="complete")

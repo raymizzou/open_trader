@@ -1055,12 +1055,15 @@ def create_prediction_server(
                         raise RuntimeError("LP execution service is unavailable")
                     result = lp_submit_entry(payload)
                 elif path == lp_submit_augment_path:
-                    # Issue 163: strict three-field augment submit bound to
-                    # the named session.
-                    self._require_schema(
-                        payload,
-                        {"session_id", "quantity", "idempotency_key"},
-                    )
+                    # Issue 163: strict augment submit bound to the named
+                    # session.  Issue 167: the optional ``price`` unlocks the
+                    # level (default = the group price).
+                    lp_augment_required = {"session_id", "quantity", "idempotency_key"}
+                    if (
+                        not lp_augment_required <= set(payload)
+                        or set(payload) - lp_augment_required - {"price"}
+                    ):
+                        raise ValueError("prediction request fields are invalid")
                     lp_submit_augment = getattr(execution, "lp_submit_augment", None)
                     if not callable(lp_submit_augment):
                         raise RuntimeError("LP execution service is unavailable")

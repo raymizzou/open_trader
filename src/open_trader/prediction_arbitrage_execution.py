@@ -27,6 +27,7 @@ from .notifications import (
     render_prediction_opportunity_notification,
     render_yes_no_signal_notification,
 )
+from .polymarket_lp import queue_protection_status_view
 from .polymarket_trading import (
     LegResult,
     PairSubmission,
@@ -174,6 +175,35 @@ _LP_CANCEL_SAFE_CODES = {
     "lp_account_snapshot_unknown",
     "lp_dashboard_snapshot_pending",
 }
+
+
+def _row_level_price(summary: Mapping[str, object], order_id: str) -> str | None:
+    """Issue 167: the protection bucket price an order row belongs to.
+
+    The row's bucket names the order via ``order_id``/``cancel_targets``/
+    ``canceled_order_ids``; a single-bucket view falls back to its one price.
+    """
+
+    levels = summary.get("levels")
+    if isinstance(levels, Mapping) and levels:
+        buckets = [value for value in levels.values() if isinstance(value, Mapping)]
+    else:
+        buckets = [summary]
+    for bucket in buckets:
+        if str(bucket.get("order_id") or "") == order_id:
+            price = bucket.get("baseline_price")
+            return str(price) if price is not None else None
+        for key in ("cancel_targets", "canceled_order_ids"):
+            values = bucket.get(key)
+            if isinstance(values, (list, tuple)) and order_id in {
+                str(value) for value in values
+            }:
+                price = bucket.get("baseline_price")
+                return str(price) if price is not None else None
+    if len(buckets) == 1:
+        price = buckets[0].get("baseline_price")
+        return str(price) if price is not None else None
+    return None
 
 
 def _safe_lp_cancel_reason(exc: BaseException) -> str:
@@ -2268,8 +2298,10 @@ class PredictionExecutionService:
                             str(order_id) for order_id in raw_owned if order_id
                         )
                     view_protection = view_source.get("queue_protection")
+                    # Issue 167: normalize any payload shape into the v2
+                    # per-bucket view (legacy scalars wrap into one bucket).
                     view_summary = (
-                        dict(view_protection)
+                        queue_protection_status_view(view_protection)
                         if isinstance(view_protection, Mapping)
                         else None
                     )
@@ -2277,7 +2309,15 @@ class PredictionExecutionService:
                     # the UI can distinguish it from the issue 159 first-seen
                     # one.
                     if isinstance(view_summary, dict):
-                        view_summary.setdefault("baseline_source", "submit")
+                        levels_map = view_summary["levels"]
+                        for bucket in levels_map.values():
+                            bucket.setdefault("baseline_source", "submit")
+                        if len(levels_map) == 1:
+                            # The merged scalar projection was copied before
+                            # the default landed in the bucket — backfill it.
+                            bucket = next(iter(levels_map.values()))
+                            for key, value in bucket.items():
+                                view_summary.setdefault(key, value)
                     lp_session_views.append(
                         {
                             "session_id": view_source.get("session_id"),
@@ -2693,7 +2733,13 @@ class PredictionExecutionService:
                                 row_summary = summary
                                 break
                     if row_summary is not None:
+                        # Issue 167: rows carry the normalized per-bucket view
+                        # plus the row's own level price (single-bucket views
+                        # keep the legacy scalar projection shape).
                         today_row["queue_protection"] = dict(row_summary)
+                        row_price = _row_level_price(row_summary, order_id)
+                        if row_price is not None:
+                            today_row["queue_protection"]["level_price"] = row_price
                 result = {
                     "state": "ready",
                     "orders": orders,
@@ -4246,7 +4292,10 @@ class PredictionExecutionService:
         if lock is None:
             return {"state": "busy", "reason": "execution_lock"}
         try:
-            return submit(session_id, str(payload.get("quantity") or ""), key)
+            price = payload.get("price")
+            if price is None:
+                return submit(session_id, str(payload.get("quantity") or ""), key)
+            return submit(session_id, str(payload.get("quantity") or ""), key, price)
         finally:
             self._release_global_lock(lock)
 

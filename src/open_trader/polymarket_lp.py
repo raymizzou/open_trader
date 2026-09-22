@@ -205,6 +205,92 @@ def _queue_ratio_percent_text(ratio: Decimal | None) -> str:
     )
 
 
+def _queue_protection_level_buckets(
+    protection: object,
+    *,
+    default_order_id: str = "",
+) -> dict[str, dict[str, object]]:
+    """Issue 167 D6: normalize any queue-protection payload into buckets.
+
+    Three-tier fallback, and it never raises:
+    - missing/invalid payload → ``{}`` (protection not enabled, the old
+      ``.get`` guard semantics);
+    - v2 ``levels`` mapping → per-price buckets; a bucket whose
+      baseline_price or order id is unreadable is marked ``unknown`` alone
+      (its group's other buckets and the group accounting keep working);
+    - legacy scalar shape (baseline_price, no levels) → wrapped as one
+      bucket so old sessions keep running; the next payload write lands in
+      the v2 shape naturally.
+
+    Keys are the canonical ``format(price, "f")`` texts; bucket lookups by
+    price must compare ``baseline_price`` values, not keys.
+    """
+
+    if not isinstance(protection, Mapping):
+        return {}
+    raw_levels = protection.get("levels")
+    if isinstance(raw_levels, Mapping):
+        buckets: dict[str, dict[str, object]] = {}
+        for raw_key, raw_value in raw_levels.items():
+            key = str(raw_key)
+            if not isinstance(raw_value, Mapping):
+                buckets[key] = {
+                    "state": "unknown",
+                    "reason_codes": ["level_payload_invalid"],
+                }
+                continue
+            bucket = dict(raw_value)
+            if (
+                _maybe_decimal(bucket.get("baseline_price")) is None
+                or not str(bucket.get("order_id") or "").strip()
+            ):
+                bucket["state"] = "unknown"
+            buckets[key] = bucket
+        return buckets
+    price = _maybe_decimal(protection.get("baseline_price"))
+    if price is None:
+        return {}
+    bucket = dict(protection)
+    # Group-level keys never live inside a bucket: the v2 payload keeps the
+    # outage counter at the top, and a stale legacy copy must not leak into
+    # the wrapped bucket.
+    bucket.pop("levels", None)
+    bucket.pop("version", None)
+    bucket.pop("data_failures", None)
+    bucket.setdefault("order_id", default_order_id)
+    return {format(price, "f"): bucket}
+
+
+def _queue_group_failures_int(value: object) -> int:
+    """Normalize the group-level outage counter to a durable JSON number."""
+
+    parsed = _maybe_decimal(value)
+    return int(parsed) if parsed is not None else 0
+
+
+def queue_protection_status_view(protection: object) -> dict[str, object]:
+    """Normalized v2 view of a queue-protection payload for read paths.
+
+    ``levels`` carries the per-price buckets (D6 three-tier fallback); with
+    exactly one bucket its scalar keys merge onto the view so the legacy
+    single-bucket external contract keeps working unchanged.
+    """
+
+    levels = _queue_protection_level_buckets(protection)
+    failures = (
+        _maybe_decimal(protection.get("data_failures"))
+        if isinstance(protection, Mapping)
+        else None
+    )
+    view: dict[str, object] = (
+        dict(next(iter(levels.values()))) if len(levels) == 1 else {}
+    )
+    view["version"] = 2
+    view["data_failures"] = failures if failures is not None else 0
+    view["levels"] = levels
+    return view
+
+
 def _report_boundary_iso(moment: datetime) -> str:
     return moment.astimezone(UTC).isoformat(timespec="seconds").replace(
         "+00:00", "Z"
@@ -6680,7 +6766,14 @@ class PolymarketLPService:
         return session, None
 
     def augment_preview(self, request: Mapping[str, object]) -> dict[str, object]:
-        """Build a short-lived augment preview locked to the entry price."""
+        """Build a short-lived augment preview for one price level.
+
+        Issue 167: the optional ``price`` unlocks the level (default = the
+        group price); the shared gate rejects a level that still carries an
+        own resting BUY and a price above the snapshot's best bid.  The
+        estimate projects the chosen level's fresh depth (the issue 158
+        merged same-price basis is retired).
+        """
 
         if not isinstance(request, Mapping):
             return {"state": "rejected", "reason": "request_invalid"}
@@ -6694,6 +6787,11 @@ class PolymarketLPService:
         if session is None:
             return {"state": "rejected", "reason": rejection or "session_not_active"}
         price = _maybe_decimal(session.get("price"))
+        if request.get("price") is not None:
+            requested_price = _maybe_decimal(request.get("price"))
+            if requested_price is None or requested_price <= 0:
+                return {"state": "rejected", "reason": "price_invalid"}
+            price = requested_price
         if price is None or price <= 0:
             return {"state": "rejected", "reason": "entry_price_unknown"}
         identity: dict[str, object] = {}
@@ -6715,6 +6813,9 @@ class PolymarketLPService:
                  "review_at": session.get("review_at")}
             )
             snapshot = self._read_snapshot(augment_request)
+            price_rejection = self._augment_price_rejection(session, snapshot, price)
+            if price_rejection is not None:
+                return {"state": "rejected", "reason": price_rejection}
             facts = self._validate_snapshot(
                 augment_request,
                 snapshot,
@@ -6738,7 +6839,7 @@ class PolymarketLPService:
             "request": {"session_id": session_id, "quantity": quantity},
             "price": price,
             "preflight": facts,
-            "queue_protection_estimate": self._augment_merge_estimate(
+            "queue_protection_estimate": self._queue_protection_preview_estimate(
                 augment_request, snapshot
             ),
         }
@@ -6814,6 +6915,13 @@ class PolymarketLPService:
                 request = self._normalize_request(preview)
                 now = self._now()
                 snapshot = self._read_snapshot(request)
+                # Issue 167: shared augment price gate on the fresh snapshot
+                # (level-active first, then the best-bid ceiling).
+                price_rejection = self._augment_price_rejection(
+                    session, snapshot, cast(Decimal, request["price"])
+                )
+                if price_rejection is not None:
+                    return {"state": "rejected", "reason": price_rejection}
                 facts = self._validate_snapshot(
                     request,
                     snapshot,
@@ -6976,42 +7084,130 @@ class PolymarketLPService:
             "expiration": expiration,
             "role": "augment",
         }
-        # Issue 158: the augment joins the session's protection umbrella,
-        # so the registered baseline re-anchors to the merged front
-        # (same-price level minus own remaining BUY size) observed at
-        # this validated snapshot.  States, threshold, and cancel
-        # behavior of the #152 episode are untouched.
-        protection = dict(session.get("queue_protection") or {})
-        merged_estimate = self._augment_merge_estimate(request, snapshot)
-        merged_front = merged_estimate.get("baseline_front")
-        if isinstance(merged_front, Decimal):
-            protection["baseline_front"] = merged_front
-            book = snapshot.get("book")
-            if isinstance(book, Mapping):
-                protection["baseline_book_received_at"] = book.get(
-                    "received_at"
-                )
-                protection["baseline_source_timestamp"] = book.get(
-                    "source_timestamp"
-                )
-                protection["baseline_book_hash"] = book.get("hash")
+        # Issue 167: the augment registers its own price-level bucket — one
+        # resting order per level, so the issue 158 same-price merged
+        # re-anchor is retired for new orders (_augment_merge_estimate stays
+        # only as a legacy-payload read helper).  A legacy scalar payload
+        # wraps into its single entry bucket here, so the stored shape lands
+        # in the v2 {version, data_failures, levels} form naturally.
+        raw_protection = session.get("queue_protection")
+        levels = _queue_protection_level_buckets(
+            raw_protection,
+            default_order_id=str(session.get("entry_order_id") or ""),
+        )
+        bucket: dict[str, object] = {
+            "order_id": order_id,
+            **self._queue_protection_baseline(request, snapshot),
+            "baseline_version": 1,
+            "threshold": LP_QUEUE_PROTECTION_THRESHOLD,
+            "state": "registered",
+            "notification_sent": False,
+            "blocked_notified": False,
+            "cancel_scope": "own_buys_at_level",
+            "cancel_targets": [],
+            "canceled_order_ids": [],
+            "cancel_target_remaining": {},
+            "canceled_remaining": None,
+            "partially_filled_quantity": None,
+            "reason_codes": [],
+        }
+        levels[format(price, "f")] = bucket
+        protection_payload: dict[str, object] = {
+            "version": 2,
+            "data_failures": _queue_group_failures_int(
+                raw_protection.get("data_failures")
+                if isinstance(raw_protection, Mapping)
+                else None
+            ),
+            "levels": levels,
+        }
+        # Issue 167: the group's ordered BUY ceiling grows by this augment so
+        # the fill accounting never trips opening_quantity_exceeded.
+        prior_group_quantity = _maybe_decimal(session.get("group_buy_quantity")) or (
+            _maybe_decimal(session.get("quantity")) or Decimal("0")
+        )
         updated = self.store.lp_update_session(
             session_id,
             patch={
                 "augment_order_ids": augment_ids,
                 "augment_order_id": order_id,
                 "augment_quantity": quantity,
+                "group_buy_quantity": prior_group_quantity + quantity,
                 "order_history": order_history,
-                "queue_protection": protection,
+                "queue_protection": protection_payload,
             },
         )
         return self._status_payload(updated)
+
+    def _session_price_level_active(
+        self,
+        session: Mapping[str, object],
+        snapshot: Mapping[str, object],
+        price: Decimal,
+    ) -> bool:
+        """Issue 167 D1-c: an own non-terminal BUY still rests at this price.
+
+        Evidence sources mirror ``_session_augment_own_order_ids``: the
+        durable order history first, then the snapshot receipts/account rows.
+        An order whose status is unreadable counts as alive (never proven
+        terminal); an order whose price is unreadable cannot be attributed
+        to any level and does not block.
+        """
+
+        history = self._order_history(session)
+        rows_by_id = self._queue_level_rows(snapshot)
+        for order_id in self._session_augment_own_order_ids(session):
+            record = history.get(order_id)
+            row = rows_by_id.get(order_id)
+            source = (
+                record
+                if isinstance(record, Mapping) and record.get("status")
+                else row
+            )
+            if source is None:
+                continue
+            status = str(_field(source, "status", "") or "").upper()
+            if status and status in TERMINAL_ORDER_STATES:
+                continue
+            order_price = _maybe_decimal(_field(source, "price"))
+            if order_price is not None and order_price == price:
+                return True
+        return False
+
+    def _augment_price_rejection(
+        self,
+        session: Mapping[str, object],
+        snapshot: Mapping[str, object],
+        price: Decimal,
+    ) -> str | None:
+        """Issue 167 D1-c/D2: shared augment price gate for both paths.
+
+        Fixed order: a level with a resting own BUY rejects first (one
+        resting order per price level), then the best-bid ceiling (a price
+        above the same snapshot's top bid can never rest).  An empty bid
+        side has no provable ceiling and rejects too.
+        """
+
+        if self._session_price_level_active(session, snapshot, price):
+            return "price_level_active"
+        book = snapshot.get("book")
+        bids: list[tuple[Decimal, Decimal]] = []
+        if isinstance(book, Mapping):
+            try:
+                bids = self._levels(book.get("bids"), "bids")
+            except ValueError:
+                bids = []
+        best_bid = max((row_price for row_price, _ in bids), default=None)
+        if best_bid is None or price > best_bid:
+            return "price_above_best_bid"
+        return None
 
     def submit_augment(
         self,
         session_id: str,
         quantity: str,
         idempotency_key: str | None = None,
+        price: str | Decimal | None = None,
     ) -> dict[str, object]:
         """Issue 163: single-shot augment bound to one named session.
 
@@ -7020,6 +7216,9 @@ class PolymarketLPService:
         recorded action row before any fresh-facts read; the one snapshot
         read tolerates only this session's own resting orders, and the
         review deadline stays the session's original one (no re-timer).
+        Issue 167: the optional ``price`` unlocks the augment price level
+        (default = the group price); the shared gate rejects a level that
+        still carries an own resting BUY and a price above the best bid.
         """
 
         key = (idempotency_key or "").strip()
@@ -7038,8 +7237,13 @@ class PolymarketLPService:
             quantity_d = _maybe_decimal(quantity)
             if quantity_d is None or quantity_d <= 0:
                 return {"state": "rejected", "reason": "quantity_invalid"}
-            price = _maybe_decimal(session.get("price"))
-            if price is None or price <= 0:
+            price_d = _maybe_decimal(session.get("price"))
+            if price is not None:
+                requested_price = _maybe_decimal(price)
+                if requested_price is None or requested_price <= 0:
+                    return {"state": "rejected", "reason": "price_invalid"}
+                price_d = requested_price
+            if price_d is None or price_d <= 0:
                 return {"state": "rejected", "reason": "entry_price_unknown"}
             identity: dict[str, object] = {}
             for identity_key in ("market_id", "condition_id", "token_id"):
@@ -7056,10 +7260,15 @@ class PolymarketLPService:
             try:
                 now = self._now()
                 request = self._normalize_request(
-                    {**identity, "price": price, "quantity": quantity_d,
+                    {**identity, "price": price_d, "quantity": quantity_d,
                      "review_at": session.get("review_at")}
                 )
                 snapshot = self._read_snapshot(request)
+                price_rejection = self._augment_price_rejection(
+                    session, snapshot, price_d
+                )
+                if price_rejection is not None:
+                    return {"state": "rejected", "reason": price_rejection}
                 facts = self._validate_snapshot(
                     request,
                     snapshot,
@@ -8551,53 +8760,129 @@ class PolymarketLPService:
             )
             return self._status_payload(updated)
 
-    def _queue_protection_gate_open(self, session: Mapping[str, object]) -> bool:
-        """Issue 152: protection applies only while the registered entry is
+    def _queue_protection_levels(
+        self, session: Mapping[str, object]
+    ) -> dict[str, dict[str, object]]:
+        """All per-price protection buckets of one session (D6 read helper)."""
+
+        return _queue_protection_level_buckets(
+            session.get("queue_protection"),
+            default_order_id=str(session.get("entry_order_id") or ""),
+        )
+
+    def _order_cancel_requested(
+        self, session: Mapping[str, object], order_id: str
+    ) -> bool:
+        """True when a cancel was already requested for this own order."""
+
+        if not order_id:
+            return False
+        if str(session.get("entry_order_id") or "") == order_id:
+            return bool(session.get("entry_cancel_requested"))
+        requested = {str(value) for value in _items(session.get("augment_cancel_requested"))}
+        return order_id in requested
+
+    def _bucket_protection_gate_open(
+        self,
+        session: Mapping[str, object],
+        bucket: Mapping[str, object],
+        rows_by_id: Mapping[str, object],
+    ) -> bool:
+        """Issue 167: a bucket is protected only while its own order is
         alive, not yet cancel-requested, and completely unfilled.
+
+        Evidence order mirrors the runtime reads: the durable order history
+        first, then the snapshot receipts.  An order with no readable
+        status anywhere counts as alive (the pre-sync state).
+        """
+
+        order_id = str(bucket.get("order_id") or "")
+        if not order_id:
+            return False
+        if self._order_cancel_requested(session, order_id):
+            return False
+        history = self._order_history(session)
+        record = history.get(order_id)
+        row = rows_by_id.get(order_id) if rows_by_id is not None else None
+        source = (
+            record
+            if isinstance(record, Mapping) and record.get("status")
+            else row
+        )
+        if source is None:
+            return True
+        status = str(_field(source, "status", "") or "").upper()
+        if status and status in TERMINAL_ORDER_STATES:
+            return False
+        matched = _maybe_decimal(_field(source, "size_matched"))
+        if matched is not None and matched > 0:
+            return False
+        return True
+
+    def _queue_protection_gate_open(self, session: Mapping[str, object]) -> bool:
+        """Issue 152/167: protection still applies to at least one bucket.
 
         Shared by the runtime evaluation, the data-outage counter, and the
         conservative cancel so the three can never drift apart.
         """
 
-        entry_order_id = str(session.get("entry_order_id") or "")
-        if not entry_order_id or bool(session.get("entry_cancel_requested")):
-            return False
-        if _maybe_decimal(session.get("buy_filled_quantity", 0)) != 0:
+        buckets = self._queue_protection_levels(session)
+        if not buckets:
             return False
         history = self._order_history(session)
-        entry_status = str(history.get(entry_order_id, {}).get("status") or "").upper()
-        return not entry_status or entry_status not in TERMINAL_ORDER_STATES
+        for bucket in buckets.values():
+            if str(bucket.get("state")) in {"canceling", "canceled", "partially_filled"}:
+                continue
+            order_id = str(bucket.get("order_id") or "")
+            if not order_id or self._order_cancel_requested(session, order_id):
+                continue
+            record = history.get(order_id, {})
+            status = str(record.get("status") or "").upper()
+            if status and status in TERMINAL_ORDER_STATES:
+                continue
+            matched = _maybe_decimal(record.get("size_matched"))
+            if matched is not None and matched > 0:
+                continue
+            return True
+        return False
 
     def _queue_protection_data_failure(
         self, session: Mapping[str, object], reason: str
     ) -> dict[str, object] | None:
-        """Increment the durable outage counter on data-outage early exits."""
+        """Increment the durable group outage counter on data-outage exits."""
 
         protection = session.get("queue_protection")
-        if not isinstance(protection, Mapping):
+        buckets = self._queue_protection_levels(session)
+        if not isinstance(protection, Mapping) or not buckets:
             return None
         if reason not in _QUEUE_DATA_FAILURE_REASONS:
             return None
-        if str(protection.get("state")) in {"canceling", "canceled", "partially_filled"}:
+        if all(
+            str(bucket.get("state")) in {"canceling", "canceled", "partially_filled"}
+            for bucket in buckets.values()
+        ):
             return None
-        updated = dict(protection)
         if not self._queue_protection_gate_open(session):
-            # The episode no longer protects a live entry (filled, cancel
+            # No bucket protects a live order anymore (filled, cancel
             # requested, terminal, or never submitted): an outage streak is
             # irrelevant, so the counter resets instead of accumulating
             # toward a stale conservative cancel.
-            updated["data_failures"] = 0
-            return updated
-        failures = _maybe_decimal(updated.get("data_failures")) or Decimal("0")
-        updated["data_failures"] = failures + 1
-        return updated
+            failures = 0
+        else:
+            failures = _queue_group_failures_int(protection.get("data_failures")) + 1
+        return {
+            "version": 2,
+            "data_failures": failures,
+            "levels": buckets,
+        }
 
     def _conservative_protection_cancel(
         self,
         session: Mapping[str, object],
         failures: dict[str, object] | None,
     ) -> dict[str, object] | None:
-        """Issue 152 D5: cancel the protected BUY after ten data outages."""
+        """Issue 152 D5 / 167 D4: cancel the whole group's own BUYs after
+        ten data outages — one protection cancel per price bucket."""
 
         if failures is None:
             return None
@@ -8606,13 +8891,46 @@ class PolymarketLPService:
             return None
         if not self._queue_protection_gate_open(session):
             return None
-        result = self._request_protection_cancel(
-            session, None, reason="book_unreliable"
-        )
-        if result is None:
+        buckets = failures.get("levels")
+        if not isinstance(buckets, Mapping) or not buckets:
             return None
+        new_levels: dict[str, dict[str, object]] = {}
+        session_patch: dict[str, object] = {}
+        changed = False
+        for key, bucket in buckets.items():
+            if not isinstance(bucket, Mapping):
+                new_levels[str(key)] = dict(bucket) if isinstance(bucket, Mapping) else {}
+                continue
+            bucket_dict = dict(bucket)
+            if str(bucket_dict.get("state")) in {"canceling", "canceled", "partially_filled"}:
+                new_levels[str(key)] = bucket_dict
+                continue
+            if not self._bucket_protection_gate_open(session, bucket_dict, {}):
+                new_levels[str(key)] = bucket_dict
+                continue
+            new_bucket, patch = self._request_bucket_protection_cancel(
+                session, None, bucket_dict, reason="book_unreliable"
+            )
+            new_levels[str(key)] = new_bucket
+            for patch_key, patch_value in patch.items():
+                if patch_key == "augment_cancel_requested":
+                    merged = {
+                        str(value)
+                        for value in _items(session_patch.get(patch_key))
+                    } | {str(value) for value in _items(patch_value)}
+                    session_patch[patch_key] = sorted(merged)
+                else:
+                    session_patch[patch_key] = patch_value
+            changed = True
+        if not changed:
+            return None
+        session_patch["queue_protection"] = {
+            "version": 2,
+            "data_failures": _queue_group_failures_int(failures.get("data_failures")),
+            "levels": new_levels,
+        }
         return self.store.lp_update_session(
-            str(session["session_id"]), patch=result
+            str(session["session_id"]), patch=session_patch
         )
 
     def tick(self) -> dict[str, object]:
@@ -8799,16 +9117,10 @@ class PolymarketLPService:
         session = self._apply_queue_protection(session, snapshot)
         session = self._reconcile_protected_exit(session, snapshot)
         if _decimal(session.get("buy_filled_quantity", 0), "buy_filled_quantity") > 0:
-            entry_terminal = self._order_terminal(
-                snapshot, str(session.get("entry_order_id") or ""), session
-            )
-            if (
-                not bool(session.get("entry_cancel_requested"))
-                and not entry_terminal
-            ):
-                self._request_entry_cancel(session)
-                session = self.store.lp_session(str(session["session_id"])) or session
-            if not entry_terminal:
+            # Issue 167 D3: a fill at any level collects the whole group's
+            # own BUYs; economics stay group-merged.
+            session = self._collect_group_buys(session, snapshot)
+            if not self._group_buys_terminal(session, snapshot):
                 return self._status_payload(session)
         if state == "review":
             self._update_scoring(session, snapshot)
@@ -8842,6 +9154,10 @@ class PolymarketLPService:
                     },
                 )
                 return self._status_payload(updated)
+            # Issue 167: the deadline sweep cancels every own BUY; the price
+            # buckets follow into canceling so receipts settle them.
+            session = self.store.lp_session(str(session["session_id"])) or session
+            session = self._mark_group_buckets_canceling(session, "review_deadline")
             updated = self.store.lp_update_session(
                 str(session["session_id"]),
                 state="review",
@@ -8878,6 +9194,103 @@ class PolymarketLPService:
             self._ensure_passive_exit(session, snapshot, residual)
             session = self.store.lp_session(str(session["session_id"])) or session
         return self._complete_if_flat(session, snapshot)
+
+    def _collect_group_buys(
+        self, session: Mapping[str, object], snapshot: Mapping[str, object]
+    ) -> dict[str, object]:
+        """Issue 167 D3: after any fill, cancel the group's every own BUY.
+
+        Reuses ``_cancel_owned_orders`` (entry + augments).  Buckets whose
+        order the sweep cancel-requests are marked ``canceling`` with reason
+        ``group_fill_collect`` so the receipt convergence settles them; the
+        D5 protection notifications deliberately stay silent for a group
+        collection (no protection trigger fired).
+        """
+
+        history = self._order_history(session)
+        actionable = False
+        for order_id in self._session_augment_own_order_ids(session):
+            if self._order_terminal(snapshot, order_id, session):
+                continue
+            if self._order_cancel_requested(session, order_id):
+                continue
+            actionable = True
+            break
+        if not actionable:
+            return session
+        try:
+            self._cancel_owned_orders(session)
+        except Exception as exc:
+            return self.store.lp_update_session(
+                str(session["session_id"]),
+                state="needs_attention",
+                patch={
+                    "reconciliation": f"group_collect_{type(exc).__name__}",
+                    "resume_state": str(session.get("state") or "entry_open"),
+                },
+            )
+        session = self.store.lp_session(str(session["session_id"])) or session
+        return self._mark_group_buckets_canceling(session, "group_fill_collect")
+
+    def _mark_group_buckets_canceling(
+        self,
+        session: Mapping[str, object],
+        reason: str,
+    ) -> dict[str, object]:
+        """Mark every cancel-requested bucket ``canceling`` with this reason.
+
+        The D5 protection notifications deliberately stay silent for these
+        sweeps (a group collection or the review deadline is not a
+        protection trigger), so ``notification_sent`` is preset and the
+        receipt convergence settles the buckets without announcing.
+        """
+
+        protection = session.get("queue_protection")
+        buckets = self._queue_protection_levels(session)
+        if not isinstance(protection, Mapping) or not buckets:
+            return session
+        changed = False
+        new_levels: dict[str, dict[str, object]] = {}
+        for key, bucket in buckets.items():
+            if str(bucket.get("state")) in {"canceling", "canceled", "partially_filled"}:
+                new_levels[key] = bucket
+                continue
+            order_id = str(bucket.get("order_id") or "")
+            if order_id and self._order_cancel_requested(session, order_id):
+                bucket = {
+                    **bucket,
+                    "state": "canceling",
+                    "cancel_reason": reason,
+                    "cancel_targets": [order_id],
+                    "cancel_requested_at": _iso(self._now()),
+                    "notification_sent": True,
+                }
+                changed = True
+            new_levels[key] = bucket
+        if not changed:
+            return session
+        return self.store.lp_update_session(
+            str(session["session_id"]),
+            patch={
+                "queue_protection": {
+                    "version": 2,
+                    "data_failures": _queue_group_failures_int(
+                        protection.get("data_failures")
+                    ),
+                    "levels": new_levels,
+                }
+            },
+        )
+
+    def _group_buys_terminal(
+        self, session: Mapping[str, object], snapshot: Mapping[str, object]
+    ) -> bool:
+        """True when every own BUY of the group shows a terminal receipt."""
+
+        for order_id in self._session_augment_own_order_ids(session):
+            if not self._order_terminal(snapshot, order_id, session):
+                return False
+        return True
 
     # Public math is intentionally not used by the approved behavior cases;
     # the lifecycle calls this private helper after reading external facts.
@@ -9229,37 +9642,39 @@ class PolymarketLPService:
             total += remaining
         return total
 
-    def _queue_protection_evaluation(
-        self, session: Mapping[str, object], snapshot: Mapping[str, object]
+    def _bucket_queue_protection_evaluation(
+        self,
+        session: Mapping[str, object],
+        bucket: Mapping[str, object],
+        snapshot: Mapping[str, object],
+        rows_by_id: Mapping[str, object],
     ) -> dict[str, object] | None:
-        """Return the queue-protection patch for this tick, or None to skip."""
+        """Return the per-bucket queue-protection patch for this tick, or None
+        when the bucket stays unchanged."""
 
-        protection = session.get("queue_protection")
-        if not isinstance(protection, Mapping):
+        if str(bucket.get("state")) in {"canceling", "canceled", "partially_filled"}:
             return None
-        if str(protection.get("state")) in {"canceling", "canceled", "partially_filled"}:
-            return None
-        baseline_price = _maybe_decimal(protection.get("baseline_price"))
+        baseline_price = _maybe_decimal(bucket.get("baseline_price"))
         if baseline_price is None:
             return None
-        if not self._queue_protection_gate_open(session):
+        if not self._bucket_protection_gate_open(session, bucket, rows_by_id):
             return None
         token_id = str(session.get("token_id") or "")
-        own_remaining = self._own_queue_remaining(
-            snapshot, token_id=token_id, price=baseline_price
+        own_remaining = self._own_queue_remaining_rows(
+            rows_by_id, token_id=token_id, price=baseline_price
         )
         estimate = estimate_lp_queue_position(
             snapshot.get("book"),
             price=baseline_price,
             own_remaining=own_remaining,
-            baseline_front=_maybe_decimal(protection.get("baseline_front"))
+            baseline_front=_maybe_decimal(bucket.get("baseline_front"))
             or Decimal("0"),
-            threshold=_maybe_decimal(protection.get("threshold"))
+            threshold=_maybe_decimal(bucket.get("threshold"))
             or LP_QUEUE_PROTECTION_THRESHOLD,
             condition_id=str(session.get("condition_id") or "") or None,
             token_id=token_id or None,
         )
-        updated = dict(protection)
+        updated = dict(bucket)
         updated.update(
             {
                 "state": estimate["state"],
@@ -9270,8 +9685,6 @@ class PolymarketLPService:
                 "data_time": estimate["data_time"],
             }
         )
-        if estimate["state"] != "unknown":
-            updated["data_failures"] = 0
         return updated
 
     def _notify_protection(
@@ -9671,42 +10084,55 @@ class PolymarketLPService:
             total += remaining
         return total
 
-    def _request_protection_cancel(
+    def _queue_protection_price_title(
+        self, session: Mapping[str, object], bucket: Mapping[str, object], base: str
+    ) -> str:
+        """Issue 167 D5: per-bucket notification title carrying the price."""
+
+        outcome = str(self._queue_protection_identity(session)["outcome"] or "").upper()
+        price = _maybe_decimal(bucket.get("baseline_price"))
+        return f"{outcome} {_queue_decimal_text(price)} {base}"
+
+    def _request_bucket_protection_cancel(
         self,
         session: Mapping[str, object],
         snapshot: Mapping[str, object] | None,
+        bucket: Mapping[str, object],
         *,
         reason: str = "queue_ahead_ratio",
         only_order_ids: list[str] | None = None,
-    ) -> dict[str, object] | None:
-        """Cancel every own BUY resting at the baseline price (issue 152 D4).
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        """Cancel every own BUY resting at this bucket's price (issue 152 D4 /
+        issue 167: one cancel episode per price bucket).
 
         Deliberately not routed through the manual cancel audit pipeline;
         the protection episode records its own durable action instead.
+        Returns the updated bucket plus the session-level cancel flags.
         """
 
-        protection = session.get("queue_protection")
-        if not isinstance(protection, Mapping):
-            return None
         session_id = str(session["session_id"])
         entry_order_id = str(session.get("entry_order_id") or "")
         token_id = str(session.get("token_id") or "")
-        baseline_price = _maybe_decimal(protection.get("baseline_price"))
+        baseline_price = _maybe_decimal(bucket.get("baseline_price"))
+        updated = dict(bucket)
         if baseline_price is None:
-            return None
-        updated = dict(protection)
+            return updated, {}
+        own_order_ids = self._session_augment_own_order_ids(session)
 
         if snapshot is None:
             # Data-unreliable path: enumerate targets from one fresh
             # account read; a failed read blocks this tick and retries.
             rows = self._queue_account_open_orders()
             if rows is None:
-                return self._blocked_protection_cancel(
-                    session,
-                    updated,
-                    "account_read_failed",
-                    "账户读取失败",
-                    None,
+                return (
+                    self._blocked_bucket_protection_cancel(
+                        session,
+                        updated,
+                        "account_read_failed",
+                        "账户读取失败",
+                        None,
+                    ),
+                    {},
                 )
             rows_by_id: dict[str, object] = {}
             for row in rows:
@@ -9716,45 +10142,70 @@ class PolymarketLPService:
         else:
             rows_by_id = self._queue_level_rows(snapshot)
 
-        # Identity re-check: the registered entry receipt must still name a
+        # Identity re-check: every registered own receipt must still name a
         # BUY on the protected token before any cancel is sent.
         for order_id, row in rows_by_id.items():
-            if order_id != entry_order_id:
+            if order_id not in own_order_ids:
                 continue
             row_token = str(_field(row, "token_id", _field(row, "asset_id", "")) or "")
             side = str(_field(row, "side", "")).upper()
             if (side and side != "BUY") or (row_token and row_token != token_id):
-                return self._blocked_protection_cancel(
-                    session, updated, "identity_conflict", "回执身份不符", None
+                return (
+                    self._blocked_bucket_protection_cancel(
+                        session, updated, "identity_conflict", "回执身份不符", None
+                    ),
+                    {},
                 )
 
         if not self._mutation_allowed():
-            remaining = None
-            anchor_row = rows_by_id.get(entry_order_id)
-            anchor_token = str(
-                _field(anchor_row, "token_id", _field(anchor_row, "asset_id", ""))
-                or ""
+            remaining = self._own_queue_remaining_rows(
+                rows_by_id, token_id=token_id, price=baseline_price
             )
-            if (
-                entry_order_id
-                and anchor_row is not None
-                and str(_field(anchor_row, "side", "") or "").upper() == "BUY"
-                and anchor_token == token_id
-                and _maybe_decimal(_field(anchor_row, "price")) == baseline_price
-            ):
-                remaining = self._own_queue_remaining_rows(
-                    rows_by_id, token_id=token_id, price=baseline_price
-                )
-            return self._blocked_protection_cancel(
-                session, updated, "mutation_blocked", "撤单被熔断阻止", remaining
+            return (
+                self._blocked_bucket_protection_cancel(
+                    session, updated, "mutation_blocked", "撤单被熔断阻止", remaining
+                ),
+                {},
             )
 
+        history = self._order_history(session)
+        anchor = str(bucket.get("order_id") or "") or format(baseline_price, "f")
         targets: list[str] = []
         skipped: list[dict[str, object]] = []
-        if entry_order_id:
-            targets.append(entry_order_id)
+        seen_targets: set[str] = set()
+
+        def add_target(order_id: str) -> None:
+            if order_id and order_id not in seen_targets:
+                seen_targets.add(order_id)
+                targets.append(order_id)
+
+        # The bucket's own registered order first, then every other own
+        # order resting at this price (durable history or receipt evidence).
+        add_target(str(bucket.get("order_id") or ""))
+        for order_id in own_order_ids:
+            record = history.get(order_id)
+            row = rows_by_id.get(order_id)
+            source = (
+                record
+                if isinstance(record, Mapping) and record.get("status")
+                else row
+            )
+            if source is None:
+                continue
+            status = str(_field(source, "status", "") or "").upper()
+            if status and status in TERMINAL_ORDER_STATES:
+                continue
+            order_price = _maybe_decimal(_field(source, "price"))
+            if order_price is not None and order_price != baseline_price:
+                continue
+            side = str(_field(source, "side", "BUY") or "BUY").upper()
+            if side != "BUY":
+                continue
+            add_target(order_id)
+        # Then every same-token same-price BUY row visible on the read
+        # (manual same-price orders share the bucket's cancel scope).
         for order_id, row in rows_by_id.items():
-            if not order_id or order_id == entry_order_id:
+            if order_id in seen_targets:
                 continue
             row_token = str(_field(row, "token_id", _field(row, "asset_id", "")) or "")
             if row_token and row_token != token_id:
@@ -9771,7 +10222,7 @@ class PolymarketLPService:
                 continue
             if str(_field(row, "status", "")).upper() in TERMINAL_ORDER_STATES:
                 continue
-            targets.append(order_id)
+            add_target(order_id)
 
         if only_order_ids is not None:
             retry = set(only_order_ids)
@@ -9780,7 +10231,7 @@ class PolymarketLPService:
         # the canceled set accumulate across retries (ordered union), so a
         # retried batch can never overwrite the earlier episode state.
         episode_targets = self._merge_order_id_lists(
-            protection.get("cancel_targets"), targets
+            bucket.get("cancel_targets"), targets
         )
 
         # Issue 152 review fix: persist every target's cancel-time remaining
@@ -9791,7 +10242,7 @@ class PolymarketLPService:
         # never 0. First write wins: retries never overwrite an earlier
         # batch's persisted value.
         persisted_remaining: dict[str, object] = {}
-        raw_remaining = protection.get("cancel_target_remaining")
+        raw_remaining = bucket.get("cancel_target_remaining")
         if isinstance(raw_remaining, Mapping):
             for key, value in raw_remaining.items():
                 order_id = str(key or "")
@@ -9815,7 +10266,7 @@ class PolymarketLPService:
                 {str(key): value for key, value in raw_confirmed.items() if str(key)}
             )
 
-        action_key = f"{session_id}:entry-protection-cancel:{entry_order_id}"
+        action_key = f"{session_id}:entry-protection-cancel:{anchor}"
         intent_payload: dict[str, object] = {
             "role": "entry-protection-cancel",
             "targets": targets,
@@ -9863,7 +10314,7 @@ class PolymarketLPService:
         # canceled set (acknowledged or receipt-proved), never re-derived
         # from post-cancel reads.
         episode_canceled = self._merge_order_id_lists(
-            protection.get("canceled_order_ids"), canceled
+            bucket.get("canceled_order_ids"), canceled
         )
         episode_remaining = self._episode_canceled_remaining(
             persisted_remaining, episode_canceled
@@ -9895,55 +10346,81 @@ class PolymarketLPService:
                 canceled_count=len(episode_canceled),
                 manual_count=manual_count,
                 canceled_remaining=episode_remaining,
+                title=self._queue_protection_price_title(
+                    session, updated, "位置保护已触发撤单"
+                ),
             )
             self._notify_protection(title, message, xiaoai)
             updated["notification_sent"] = True
 
-        patch: dict[str, object] = {"queue_protection": updated}
+        session_patch: dict[str, object] = {}
         if entry_order_id in targets and not bool(session.get("entry_cancel_requested")):
-            patch["entry_cancel_requested"] = True
-        return patch
+            session_patch["entry_cancel_requested"] = True
+        session_augment_ids = {
+            str(value)
+            for value in _items(session.get("augment_order_ids"))
+            if str(value or "")
+        }
+        augment_requested = {
+            str(value) for value in _items(session.get("augment_cancel_requested"))
+        }
+        new_augment = sorted(
+            augment_requested
+            | {
+                order_id
+                for order_id in targets
+                if order_id in session_augment_ids
+            }
+        )
+        if new_augment != sorted(augment_requested):
+            session_patch["augment_cancel_requested"] = new_augment
+        return updated, session_patch
 
-    def _blocked_protection_cancel(
+    def _blocked_bucket_protection_cancel(
         self,
         session: Mapping[str, object],
-        protection: dict[str, object],
+        bucket: dict[str, object],
         reason_code: str,
         failure_reason: str,
         remaining: Decimal | None,
     ) -> dict[str, object]:
-        codes = list(protection.get("reason_codes") or [])
+        codes = list(bucket.get("reason_codes") or [])
         if reason_code not in codes:
             codes.append(reason_code)
-        protection["state"] = "blocked"
-        protection["reason_codes"] = codes
-        if protection.get("blocked_notified") is not True:
+        bucket["state"] = "blocked"
+        bucket["reason_codes"] = codes
+        if bucket.get("blocked_notified") is not True:
             title, message, xiaoai = self._queue_protection_blocked_notification(
-                protection, session, failure_reason, remaining
+                bucket,
+                session,
+                failure_reason,
+                remaining,
+                title=self._queue_protection_price_title(
+                    session, bucket, "位置保护撤单受阻"
+                ),
             )
             self._notify_protection(title, message, xiaoai)
-            protection["blocked_notified"] = True
-        return {"queue_protection": protection}
+            bucket["blocked_notified"] = True
+        return bucket
 
     def _converge_queue_protection(
-        self, session: Mapping[str, object], snapshot: Mapping[str, object]
+        self,
+        session: Mapping[str, object],
+        bucket: Mapping[str, object],
+        rows_by_id: Mapping[str, object],
     ) -> dict[str, object] | None:
-        """Settle a canceling episode from order receipts (issue 152 D4.7)."""
+        """Settle one canceling bucket from order receipts (issue 152 D4.7)."""
 
-        protection = session.get("queue_protection")
-        if not isinstance(protection, Mapping):
-            return None
-        if str(protection.get("state")) != "canceling":
+        if str(bucket.get("state")) != "canceling":
             return None
         targets = [
             str(value)
-            for value in _items(protection.get("cancel_targets"))
+            for value in _items(bucket.get("cancel_targets"))
             if str(value or "")
         ]
         if not targets:
             return None
         history = self._order_history(session)
-        rows_by_id = self._queue_level_rows(snapshot)
         filled = Decimal("0")
         receipt_canceled: list[str] = []
         for order_id in targets:
@@ -9969,7 +10446,7 @@ class PolymarketLPService:
             matched = _maybe_decimal(_field(source, "size_matched"))
             if matched is not None and matched > 0:
                 filled += matched
-        updated = dict(protection)
+        updated = dict(bucket)
         updated["order_placement_times"] = self._record_order_placement_times(
             updated, rows_by_id, targets
         )
@@ -10017,6 +10494,9 @@ class PolymarketLPService:
                 canceled_remaining=_maybe_decimal(
                     updated.get("canceled_remaining")
                 ),
+                title=self._queue_protection_price_title(
+                    session, updated, "位置保护已触发撤单"
+                ),
             )
             self._notify_protection(title, message, xiaoai)
             updated["notification_sent"] = True
@@ -10025,47 +10505,95 @@ class PolymarketLPService:
     def _apply_queue_protection(
         self, session: Mapping[str, object], snapshot: Mapping[str, object]
     ) -> dict[str, object]:
-        """Evaluate queue protection inside the monitor tick and persist it."""
+        """Evaluate every price bucket inside the monitor tick and persist
+        the v2 {version, data_failures, levels} payload (issue 167)."""
 
         protection = session.get("queue_protection")
-        if not isinstance(protection, Mapping):
+        buckets = self._queue_protection_levels(session)
+        if not isinstance(protection, Mapping) or not buckets:
             return dict(session)
         session_id = str(session["session_id"])
-        if str(protection.get("state")) == "canceling":
-            converged = self._converge_queue_protection(session, snapshot)
-            if converged is not None:
-                return self.store.lp_update_session(
-                    session_id, patch={"queue_protection": converged}
+        rows_by_id = self._queue_level_rows(snapshot)
+        failures = _queue_group_failures_int(protection.get("data_failures"))
+        changed = False
+        session_patch: dict[str, object] = {}
+        new_levels: dict[str, dict[str, object]] = {}
+        for key, bucket in buckets.items():
+            if str(bucket.get("state")) == "canceling":
+                converged = self._converge_queue_protection(
+                    session, bucket, rows_by_id
                 )
-            failed = [
-                str(value)
-                for value in _items(protection.get("cancel_failed"))
-                if str(value or "")
-            ]
-            if failed:
-                result = self._request_protection_cancel(
-                    session,
-                    snapshot,
-                    reason=str(protection.get("cancel_reason") or "queue_ahead_ratio"),
-                    only_order_ids=failed,
+                if converged is not None:
+                    new_levels[key] = converged
+                    changed = True
+                    continue
+                failed = [
+                    str(value)
+                    for value in _items(bucket.get("cancel_failed"))
+                    if str(value or "")
+                ]
+                if failed:
+                    bucket, patch = self._request_bucket_protection_cancel(
+                        session,
+                        snapshot,
+                        bucket,
+                        reason=str(bucket.get("cancel_reason") or "queue_ahead_ratio"),
+                        only_order_ids=failed,
+                    )
+                    # Issue 167 review fix: each bucket computes its session
+                    # flags from the same pre-loop session, so a plain
+                    # update() would let the second triggered bucket drop
+                    # the first one's augment ids. Merge set-like keys by
+                    # union (same pattern as _conservative_protection_cancel).
+                    for patch_key, patch_value in patch.items():
+                        if patch_key == "augment_cancel_requested":
+                            merged = {
+                                str(value)
+                                for value in _items(session_patch.get(patch_key))
+                            } | {str(value) for value in _items(patch_value)}
+                            session_patch[patch_key] = sorted(merged)
+                        else:
+                            session_patch[patch_key] = patch_value
+                    new_levels[key] = bucket
+                    changed = True
+                    continue
+                new_levels[key] = bucket
+                continue
+            evaluation = self._bucket_queue_protection_evaluation(
+                session, bucket, snapshot, rows_by_id
+            )
+            if evaluation is not None:
+                bucket = evaluation
+                changed = True
+                if str(bucket.get("state")) not in {"unknown", "registered"}:
+                    failures = 0
+            if str(bucket.get("state")) == "triggered":
+                bucket, patch = self._request_bucket_protection_cancel(
+                    session, snapshot, bucket, reason="queue_ahead_ratio"
                 )
-                if result is not None:
-                    return self.store.lp_update_session(session_id, patch=result)
+                # Same union merge as above: two buckets triggering in one
+                # tick must accumulate their session flags, not overwrite.
+                for patch_key, patch_value in patch.items():
+                    if patch_key == "augment_cancel_requested":
+                        merged = {
+                            str(value)
+                            for value in _items(session_patch.get(patch_key))
+                        } | {str(value) for value in _items(patch_value)}
+                        session_patch[patch_key] = sorted(merged)
+                    else:
+                        session_patch[patch_key] = patch_value
+                new_levels[key] = bucket
+                changed = True
+                continue
+            new_levels[key] = bucket
+        if not changed:
             return dict(session)
-        evaluation = self._queue_protection_evaluation(session, snapshot)
-        if evaluation is None:
-            return dict(session)
-        session = self.store.lp_update_session(
-            session_id, patch={"queue_protection": evaluation}
-        )
-        if evaluation["state"] != "triggered":
-            return session
-        result = self._request_protection_cancel(
-            session, snapshot, reason="queue_ahead_ratio"
-        )
-        if result is not None:
-            session = self.store.lp_update_session(session_id, patch=result)
-        return session
+        session_patch["queue_protection"] = {
+            "version": 2,
+            "data_failures": failures,
+            "levels": new_levels,
+        }
+        return self.store.lp_update_session(session_id, patch=session_patch)
 
     # ---- Issue 159: first-seen baseline fallback protections ----
 
@@ -10974,21 +11502,30 @@ class PolymarketLPService:
     def _queue_level_order_exempt(
         self, session: Mapping[str, object], order: object
     ) -> bool:
-        """Whether a same-token BUY belongs to the active protection episode.
+        """Whether a same-token BUY belongs to the active protection episodes.
 
         Issue 152: manual BUY quotes on the protected token (any price) are
         expected while an episode is open — they are monitored and, on
-        trigger, canceled at the baseline price.  SELL rows and other
-        tokens remain governed by the unowned-order guard, and the submit
-        boundary keeps rejecting outside orders exactly as before.
+        trigger, canceled at the bucket price.  Issue 167: the episodes are
+        the per-price buckets; the exemption stays on while at least one
+        bucket is still live (none settled).  SELL rows and other tokens
+        remain governed by the unowned-order guard, and the submit boundary
+        keeps rejecting outside orders exactly as before.
         """
 
         protection = session.get("queue_protection")
-        if not isinstance(protection, Mapping):
+        buckets = self._queue_protection_levels(session)
+        if not isinstance(protection, Mapping) or not buckets:
             return False
-        if str(protection.get("state")) in {"canceled", "partially_filled"}:
+        if all(
+            str(bucket.get("state")) in {"canceled", "partially_filled"}
+            for bucket in buckets.values()
+        ):
             return False
-        if protection.get("cancel_scope") != "own_buys_at_level":
+        if all(
+            bucket.get("cancel_scope") != "own_buys_at_level"
+            for bucket in buckets.values()
+        ):
             return False
         if str(_field(order, "side", "")).upper() != "BUY":
             return False
@@ -11172,13 +11709,27 @@ class PolymarketLPService:
         _freshness(book_received_at, self._now(), "book_freshness")
         token_id = session["token_id"]
         entry_order_id = str(session.get("entry_order_id") or "")
-        quantity, cost = self._trade_totals(
-            snapshot,
-            entry_order_id,
-            "BUY",
-            token_id=str(token_id),
-        )
         history = self._order_history(session)
+        # Issue 167: BUY economics merge across the group — the entry order
+        # plus every augment order (each price level) feeds buy_filled /
+        # buy_cost, so a fill at any level triggers D3 and the $5 stop loss.
+        buy_order_ids = sorted(
+            order_id
+            for order_id in self._session_order_ids(session)
+            if order_id
+            and str(history.get(order_id, {}).get("side") or "").upper() == "BUY"
+        )
+        quantity = Decimal("0")
+        cost = Decimal("0")
+        for buy_order_id in buy_order_ids:
+            current_quantity, current_cost = self._trade_totals(
+                snapshot,
+                buy_order_id,
+                "BUY",
+                token_id=str(token_id),
+            )
+            quantity += current_quantity
+            cost += current_cost
         sell_order_ids = {
             order_id
             for order_id in self._session_order_ids(session)
@@ -11205,7 +11756,11 @@ class PolymarketLPService:
             fees += projected_fee
         else:
             fees = None
-        requested_quantity = _maybe_decimal(session.get("quantity"))
+        # Issue 167: the ordered ceiling is the group's total BUY quantity
+        # (entry + augments); single-order groups fall back to ``quantity``.
+        requested_quantity = _maybe_decimal(session.get("group_buy_quantity")) or (
+            _maybe_decimal(session.get("quantity"))
+        )
         if requested_quantity is None:
             raise ValueError("opening_quantity_unknown")
         if quantity > requested_quantity:
@@ -12424,6 +12979,12 @@ class PolymarketLPService:
             result.get("estimated_target_quantity")
         )
         result["reward_observation"] = self._reward_status_payload(session)
+        # Issue 167: expose the normalized per-bucket view (v2 + the
+        # single-bucket projection for one-level groups) so every read
+        # path — status, tick aggregation, dashboard — speaks one shape.
+        protection = result.get("queue_protection")
+        if isinstance(protection, Mapping) and protection:
+            result["queue_protection"] = queue_protection_status_view(protection)
         for key in (
             "price",
             "quantity",

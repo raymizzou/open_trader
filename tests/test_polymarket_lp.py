@@ -6445,12 +6445,21 @@ def _augment_preview_snapshot(
     return snapshot
 
 
-def _augment_preview(service: PolymarketLPService, session_id: str, quantity: object):
-    return service.augment_preview({"session_id": session_id, "quantity": quantity})
+def _augment_preview(
+    service: PolymarketLPService,
+    session_id: str,
+    quantity: object,
+    price: object | None = None,
+):
+    request: dict[str, object] = {"session_id": session_id, "quantity": quantity}
+    if price is not None:
+        request["price"] = price
+    return service.augment_preview(request)
 
 
 def test_augment_preview_projects_merged_queue_ratio(tmp_path) -> None:
-    """T13: 合并口径 A：front=同价档位−既有 BUY 余量，ratio=front/(front+own+qty)。"""
+    """T13（#167 改写）：追加价=新价位 → 预检估算按该价档位深度（front/(front+qty)）；
+    同价（组价，入场单仍在挂）预检 → price_level_active 拒（#158 合并重锚语义退役）。"""
     now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
     store, exchange, service, started = _augment_running_service(
         tmp_path, now, key="lp-aug-t13"
@@ -6460,24 +6469,28 @@ def test_augment_preview_projects_merged_queue_ratio(tmp_path) -> None:
         now, level=Decimal("380"), own_original=Decimal("120")
     )
 
-    preview = _augment_preview(service, session_id, 90)
+    preview = _augment_preview(service, session_id, 90, price="0.29")
     assert preview["state"] == "previewed"
-    assert Decimal(str(preview["price"])) == Decimal("0.30")
+    assert Decimal(str(preview["price"])) == Decimal("0.29")
     assert Decimal(str(preview["request"]["quantity"])) == Decimal("90")
     estimate = preview["queue_protection_estimate"]
-    assert Decimal(str(estimate["baseline_front"])) == Decimal("260")
-    assert Decimal(str(estimate["own_remaining"])) == Decimal("120")
-    assert Decimal(str(estimate["projected_ratio"])) == Decimal("260") / Decimal("470")
+    # 新价位口径：front = 该价档位他人量 100，A = 100/(100+90)。
+    assert Decimal(str(estimate["baseline_front"])) == Decimal("100")
+    assert Decimal(str(estimate["projected_ratio"])) == Decimal("100") / Decimal("190")
 
-    bigger = _augment_preview(service, session_id, 160)
+    bigger = _augment_preview(service, session_id, 160, price="0.29")
     assert bigger["state"] == "previewed"
     assert Decimal(
         str(bigger["queue_protection_estimate"]["projected_ratio"])
-    ) == Decimal("260") / Decimal("540")
+    ) == Decimal("100") / Decimal("260")
+
+    # 同价补量：入场单仍在挂 → price_level_active。
+    same = _augment_preview(service, session_id, 90)
+    assert same == {"state": "rejected", "reason": "price_level_active"}
 
 
 def test_augment_submit_registers_order_into_session(tmp_path) -> None:
-    """T14: 恰一单 post-only BUY@入场价；会话 payload 清单+审计；不新建第二会话。"""
+    """T14（#167 改写）：恰一单 post-only BUY@新价位；两价位桶落载荷+审计；不新建第二会话。"""
     now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
     store, exchange, service, started = _augment_running_service(
         tmp_path, now, key="lp-aug-t14"
@@ -6486,7 +6499,7 @@ def test_augment_submit_registers_order_into_session(tmp_path) -> None:
     exchange.snapshot_value = _augment_preview_snapshot(
         now, level=Decimal("380"), own_original=Decimal("120")
     )
-    preview = _augment_preview(service, session_id, 90)
+    preview = _augment_preview(service, session_id, 90, price="0.29")
     assert preview["state"] == "previewed"
 
     result = service.augment(session_id, str(preview["preview_id"]), "lp-aug-key-1")
@@ -6498,10 +6511,15 @@ def test_augment_submit_registers_order_into_session(tmp_path) -> None:
     posted = exchange.posts[1]
     assert posted["side"] == "BUY"
     assert posted["post_only"] is True
-    assert Decimal(str(posted["price"])) == Decimal("0.30")
+    assert Decimal(str(posted["price"])) == Decimal("0.29")
     assert Decimal(str(posted["quantity"])) == Decimal("90")
     session = store.lp_session(session_id)
     assert session["augment_order_ids"] == ["order-2"]
+    protection = session["queue_protection"]
+    assert protection["version"] == 2
+    assert set(protection["levels"]) == {"0.30", "0.29"}
+    assert str(protection["levels"]["0.29"]["order_id"]) == "order-2"
+    assert Decimal(str(protection["levels"]["0.29"]["baseline_front"])) == Decimal("100")
     active = store.lp_active_session()
     assert active is not None and str(active["session_id"]) == session_id
     (receipt,) = [
@@ -6541,7 +6559,7 @@ def test_augment_rejection_matrix(tmp_path) -> None:
     exchange_b.snapshot_value = _augment_preview_snapshot(
         now, level=Decimal("380"), own_original=Decimal("120")
     )
-    preview_b = _augment_preview(service_b, session_b, 90)
+    preview_b = _augment_preview(service_b, session_b, 90, price="0.29")
     assert preview_b["state"] == "previewed"
     exchange_b.snapshot_value = _queue_book_moved_bid_snapshot(now, Decimal("8000"))
     moved = service_b.augment(session_b, str(preview_b["preview_id"]), "lp-aug-key-b")
@@ -6558,7 +6576,7 @@ def test_augment_rejection_matrix(tmp_path) -> None:
     exchange_c.snapshot_value = _augment_preview_snapshot(
         now, level=Decimal("380"), own_original=Decimal("120")
     )
-    preview_c = _augment_preview(service_c, session_c, 90)
+    preview_c = _augment_preview(service_c, session_c, 90, price="0.29")
     cell_c[0] = now + timedelta(seconds=30)
     expired = service_c.augment(session_c, str(preview_c["preview_id"]), "lp-aug-key-c")
     assert expired == {"state": "rejected", "reason": "preview_expired"}
@@ -6573,7 +6591,7 @@ def test_augment_rejection_matrix(tmp_path) -> None:
     exchange_d.snapshot_value = _augment_preview_snapshot(
         now, level=Decimal("380"), own_original=Decimal("120")
     )
-    preview_d = _augment_preview(service_d, session_d, 90)
+    preview_d = _augment_preview(service_d, session_d, 90, price="0.29")
     first = service_d.augment(session_d, str(preview_d["preview_id"]), "lp-aug-key-d")
     assert first["state"] == "entry_open"
     assert str(first["augment_order_id"]) == "order-2"
@@ -6585,7 +6603,7 @@ def test_augment_rejection_matrix(tmp_path) -> None:
 
 
 def test_stop_and_review_cancel_entry_and_augment_orders(tmp_path) -> None:
-    """T16: 复核/stop 时入场单+加量单一并请求撤；零成交平仓后会话 complete。"""
+    """T16（#167 改写）：复核/stop 时入场单+新价位追加单一并请求撤；零成交平仓后会话 complete。"""
     now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
     store, exchange, service, started = _augment_running_service(
         tmp_path, now, key="lp-aug-t16"
@@ -6594,7 +6612,7 @@ def test_stop_and_review_cancel_entry_and_augment_orders(tmp_path) -> None:
     exchange.snapshot_value = _augment_preview_snapshot(
         now, level=Decimal("380"), own_original=Decimal("120")
     )
-    preview = _augment_preview(service, session_id, 90)
+    preview = _augment_preview(service, session_id, 90, price="0.29")
     result = service.augment(session_id, str(preview["preview_id"]), "lp-aug-key-16")
     assert result["state"] == "entry_open"
     assert len(exchange.posts) == 2
@@ -6610,7 +6628,7 @@ def test_stop_and_review_cancel_entry_and_augment_orders(tmp_path) -> None:
     zero_fill["account"]["open_orders"] = []
     zero_fill["orders"] = [
         _queue_receipt("order-1", original="120", status="CANCELED"),
-        _queue_receipt("order-2", original="90", status="CANCELED"),
+        _queue_receipt("order-2", price=Decimal("0.29"), original="90", status="CANCELED"),
     ]
     zero_fill["scoring"] = True
     exchange.snapshot_value = zero_fill
@@ -6621,36 +6639,56 @@ def test_stop_and_review_cancel_entry_and_augment_orders(tmp_path) -> None:
 
 
 def test_runtime_queue_position_includes_augment_order(tmp_path) -> None:
-    """T17: 加量单入场后 own_remaining 含加量：front 260 / own 210 → A≈0.553 monitoring。"""
+    """T17（#167 改写）：加量后逐桶监控——0.30 桶 A=0.80、0.29 桶 A=0.70，均不触发。"""
     now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
-    store, exchange, service, started = _augment_running_service(
+    store, exchange, service, started = _queue_running_service(
         tmp_path, now, key="lp-aug-t17"
     )
     session_id = str(started["session_id"])
-    exchange.snapshot_value = _augment_preview_snapshot(
-        now, level=Decimal("380"), own_original=Decimal("120")
-    )
-    preview = _augment_preview(service, session_id, 90)
+    # 追加预检快照：0.30 顶档 10000（自单 2000 在挂）、0.29 档他人量 224。
+    augment_snapshot = _queue_book_snapshot(now, Decimal("10000"))
+    augment_snapshot["book"]["bids"] = [
+        {"price": Decimal("0.30"), "size": Decimal("10000")},
+        {"price": Decimal("0.29"), "size": Decimal("224")},
+    ]
+    augment_snapshot["account"]["balance"] = Decimal("10000")
+    augment_snapshot["account"]["allowance"] = Decimal("10000")
+    augment_snapshot["account"]["open_orders"] = [
+        _queue_receipt("order-1", original="2000")
+    ]
+    augment_snapshot["orders"] = [_queue_receipt("order-1", original="2000")]
+    exchange.snapshot_value = augment_snapshot
+    preview = _augment_preview(service, session_id, 90, price="0.29")
     result = service.augment(session_id, str(preview["preview_id"]), "lp-aug-key-17")
     assert result["state"] == "entry_open"
 
-    merged = _augment_preview_snapshot(now, level=Decimal("470"), own_original=Decimal("0"))
+    merged = _queue_book_snapshot(now, Decimal("10000"))
+    merged["book"]["bids"] = [
+        {"price": Decimal("0.30"), "size": Decimal("10000")},
+        {"price": Decimal("0.29"), "size": Decimal("320")},
+    ]
     merged["account"]["open_orders"] = [
-        _queue_receipt("order-1", original="120"),
-        _queue_receipt("order-2", original="90"),
+        _queue_receipt("order-1", original="2000"),
+        _queue_receipt("order-2", price=Decimal("0.29"), original="90"),
     ]
     merged["orders"] = [
-        _queue_receipt("order-1", original="120"),
-        _queue_receipt("order-2", original="90"),
+        _queue_receipt("order-1", original="2000"),
+        _queue_receipt("order-2", price=Decimal("0.29"), original="90"),
     ]
     exchange.snapshot_value = merged
 
     ticked = service.tick()
-    protection = ticked["queue_protection"]
-    assert protection["state"] == "monitoring"
-    assert Decimal(str(protection["front_estimate"])) == Decimal("260")
-    assert Decimal(str(protection["level_total"])) == Decimal("470")
-    assert Decimal(str(protection["ratio"])) == Decimal("260") / Decimal("470")
+    levels = ticked["queue_protection"]["levels"]
+    bucket_30 = levels["0.30"]
+    bucket_29 = levels["0.29"]
+    assert bucket_30["state"] == "monitoring"
+    assert Decimal(str(bucket_30["front_estimate"])) == Decimal("8000")
+    assert Decimal(str(bucket_30["level_total"])) == Decimal("10000")
+    assert Decimal(str(bucket_30["ratio"])) == Decimal("8000") / Decimal("10000")
+    assert bucket_29["state"] == "monitoring"
+    assert Decimal(str(bucket_29["front_estimate"])) == Decimal("224")
+    assert Decimal(str(bucket_29["level_total"])) == Decimal("320")
+    assert Decimal(str(bucket_29["ratio"])) == Decimal("224") / Decimal("320")
     assert exchange.cancels == []
 
 
@@ -7031,7 +7069,8 @@ def test_queue_protection_outage_never_fires_after_entry_fill(tmp_path) -> None:
     for index in range(20):
         exchange.snapshot_value = None if index % 2 == 0 else filled
         service.tick()
-        protection = store.lp_session(session_id)["queue_protection"]
+        # #167 改写：读投影视图（原始载荷落 v2 分桶形状，state 在桶内）。
+        protection = service.status(session_id)["queue_protection"]
         assert exchange.cancels == []
         assert Decimal(str(protection["data_failures"])) == 0
         assert protection["state"] != "canceling"
@@ -7176,9 +7215,9 @@ def test_queue_protection_mutation_breaker_blocks_cancel(tmp_path) -> None:
     assert "mutation_blocked" in protection["reason_codes"]
     assert len(notifications) == 1
     title, message, xiaoai = notifications[0]
-    assert title == "LP 位置保护撤单受阻"
+    assert title == "YES 0.3 位置保护撤单受阻"
     assert "撤单未成功" in message
-    assert xiaoai == "LP 位置保护撤单受阻"
+    assert xiaoai == "YES 0.3 位置保护撤单受阻"
 
 
 def test_queue_protection_restart_does_not_repeat_cancel(tmp_path) -> None:
@@ -7284,13 +7323,13 @@ def test_queue_protection_notification_success_template_once(tmp_path) -> None:
     service.tick()
     assert len(notifications) == 1
     title, message, xiaoai = notifications[0]
-    assert title == "LP 位置保护撤单"
+    assert title == "YES 0.3 位置保护已触发撤单"
     assert "市场：Will it happen?" in message
     assert "A 比例 25% ≤ 50%" in message
     assert "前方≈1000 / 同价位 4000 份" in message
     assert "已撤 2 张买单合计余量 3000 份 @ 0.3（含 1 张手动）" in message
     assert "数据时间：北京时间" in message
-    assert xiaoai == "LP 位置保护撤单，2 张买单已撤"
+    assert xiaoai == "YES 0.3 位置保护已触发撤单，2 张买单已撤"
 
     restarted = PolymarketLPService(store, exchange, clock=lambda: now)
     restarted.set_protection_notifier(
@@ -7345,9 +7384,9 @@ def test_queue_protection_retry_success_notifies_full_episode_once(tmp_path) -> 
     assert Decimal(str(protection["canceled_remaining"])) == Decimal("3000")
     assert len(notifications) == 1
     title, message, xiaoai = notifications[0]
-    assert title == "LP 位置保护撤单"
+    assert title == "YES 0.3 位置保护已触发撤单"
     assert "已撤 2 张买单合计余量 3000 份 @ 0.3（含 1 张手动）" in message
-    assert xiaoai == "LP 位置保护撤单，2 张买单已撤"
+    assert xiaoai == "YES 0.3 位置保护已触发撤单，2 张买单已撤"
 
 
 def test_queue_protection_converge_keeps_fill_and_cancel_remaining_apart(
@@ -7419,10 +7458,10 @@ def test_queue_protection_converge_keeps_fill_and_cancel_remaining_apart(
     assert Decimal(str(protection["canceled_remaining"])) == Decimal("3000")
     assert len(notifications) == 1
     title, message, xiaoai = notifications[0]
-    assert title == "LP 位置保护撤单"
+    assert title == "YES 0.3 位置保护已触发撤单"
     assert "已撤 2 张买单合计余量 3000 份" in message
     assert "合计余量 300 份" not in message
-    assert xiaoai == "LP 位置保护撤单，2 张买单已撤"
+    assert xiaoai == "YES 0.3 位置保护已触发撤单，2 张买单已撤"
 
 
 def test_queue_protection_unknown_request_time_remaining_reports_unknown_total(
@@ -7492,11 +7531,11 @@ def test_queue_protection_unknown_request_time_remaining_reports_unknown_total(
     assert protection["canceled_remaining"] is None
     assert len(notifications) == 1
     title, message, xiaoai = notifications[0]
-    assert title == "LP 位置保护撤单"
+    assert title == "YES 0.3 位置保护已触发撤单"
     assert "已撤 2 张买单合计余量 UNKNOWN 份 @ 0.3（含 1 张手动）" in message
     assert "合计余量 0 份" not in message
     assert "合计余量 2000 份" not in message
-    assert xiaoai == "LP 位置保护撤单，2 张买单已撤"
+    assert xiaoai == "YES 0.3 位置保护已触发撤单，2 张买单已撤"
 
 
 def test_queue_protection_unacknowledged_cancels_converge_with_request_time_remaining(
@@ -7571,10 +7610,10 @@ def test_queue_protection_unacknowledged_cancels_converge_with_request_time_rema
     assert Decimal(str(protection["canceled_remaining"])) == Decimal("3000")
     assert len(notifications) == 1
     title, message, xiaoai = notifications[0]
-    assert title == "LP 位置保护撤单"
+    assert title == "YES 0.3 位置保护已触发撤单"
     assert "已撤 2 张买单合计余量 3000 份 @ 0.3（含 1 张手动）" in message
     assert "合计余量 0 份" not in message
-    assert xiaoai == "LP 位置保护撤单，2 张买单已撤"
+    assert xiaoai == "YES 0.3 位置保护已触发撤单，2 张买单已撤"
 
 def _iso_z(moment: datetime) -> str:
     return moment.isoformat(timespec="microseconds").replace("+00:00", "Z")
@@ -10444,8 +10483,8 @@ def test_lp166_submit_entry_participation_check_spares_other_markets(tmp_path) -
 
 
 def test_lp166_submit_augment_not_blocked_by_participation_check(tmp_path) -> None:
-    """B(R1): 参与检查严禁误伤加量——本组挂单在场（参与检查必命中）时
-    submit_augment 照常追加，不加新组。"""
+    """B(R1)（#167 改写）：参与检查严禁误伤追加——本组挂单在场（参与检查必命中）时
+    submit_augment 到新价位照常追加，不加新组。"""
     now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
     store, exchange, service, started = _augment_running_service(
         tmp_path, now, key="lp166-r1-c"
@@ -10456,11 +10495,14 @@ def test_lp166_submit_augment_not_blocked_by_participation_check(tmp_path) -> No
     )
     posts_before = len(exchange.posts)
 
-    result = service.submit_augment(session_id, "20", "lp166-r1-c-aug")
+    result = service.submit_augment(
+        session_id, "20", "lp166-r1-c-aug", price="0.29"
+    )
 
     assert result["state"] == "entry_open"
     assert str(result["augment_order_id"]) == "order-2"
     assert len(exchange.posts) == posts_before + 1
+    assert Decimal(str(exchange.posts[1]["price"])) == Decimal("0.29")
     assert store.lp_session(session_id)["augment_order_ids"] == ["order-2"]
 
 
@@ -10588,7 +10630,8 @@ def test_lp163_submit_entry_thin_top_book_anchor_consistent(tmp_path) -> None:
 
 
 def test_lp163_submit_augment_appends_and_keeps_deadline(tmp_path) -> None:
-    """S11: 点名会话加量成功——单追加、基线重锚（T14 口径）、复核截止沿用首单不重算。"""
+    """S11（#167 改写）：点名会话追加新价位成功——单追加、新价位桶基线=该价档位深度、
+    复核截止沿用首单不重算。"""
     now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
     store, exchange, service, started = _augment_running_service(
         tmp_path, now, key="lp163-s11"
@@ -10600,7 +10643,7 @@ def test_lp163_submit_augment_appends_and_keeps_deadline(tmp_path) -> None:
     )
     before_calls = exchange.snapshot_calls
 
-    result = service.submit_augment(session_id, "20", "lp163-s11-aug")
+    result = service.submit_augment(session_id, "20", "lp163-s11-aug", price="0.29")
 
     assert result["state"] == "entry_open"
     assert str(result["augment_order_id"]) == "order-2"
@@ -10609,7 +10652,7 @@ def test_lp163_submit_augment_appends_and_keeps_deadline(tmp_path) -> None:
     posted = exchange.posts[1]
     assert posted["side"] == "BUY"
     assert posted["post_only"] is True
-    assert Decimal(str(posted["price"])) == Decimal("0.30")
+    assert Decimal(str(posted["price"])) == Decimal("0.29")
     assert Decimal(str(posted["quantity"])) == Decimal("20")
     session = store.lp_session(session_id)
     # 原单不变，新单追加为新条目。
@@ -10617,9 +10660,15 @@ def test_lp163_submit_augment_appends_and_keeps_deadline(tmp_path) -> None:
     history = session["order_history"]
     assert set(history) == {"order-1", "order-2"}
     assert history["order-1"] == first_history["order-1"]
-    # 基线重锚：front = 380 - 120 = 260（对齐 T14 断言口径）。
+    # 新价位桶：基线 = 该价档位深度 100（0.29 档），原 0.30 桶基线不动。
     protection = session["queue_protection"]
-    assert Decimal(str(protection["baseline_front"])) == Decimal("260")
+    assert protection["version"] == 2
+    assert Decimal(
+        str(protection["levels"]["0.29"]["baseline_front"])
+    ) == Decimal("100")
+    assert Decimal(
+        str(protection["levels"]["0.30"]["baseline_front"])
+    ) == Decimal("120")
     # 复核截止沿用首单：新单 expiration 与首单相同（未重算）。
     assert Decimal(str(history["order-2"]["expiration"])) == Decimal(
         str(history["order-1"]["expiration"])
@@ -10693,7 +10742,7 @@ def test_lp163_submit_augment_blocked_states_matrix(tmp_path) -> None:
 
 
 def test_lp163_submit_augment_idempotency_and_unknown(tmp_path) -> None:
-    """S14: 同键重放 → 同 augment_order_id 无新单；提交异常 → 未知挂起，重放不重发。"""
+    """S14（#167 改写）：同键重放 → 同 augment_order_id 无新单；提交异常 → 未知挂起，重放不重发。"""
     now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
     store, exchange, service, started = _augment_running_service(
         tmp_path / "s14-a", now, key="lp163-s14"
@@ -10702,7 +10751,7 @@ def test_lp163_submit_augment_idempotency_and_unknown(tmp_path) -> None:
     exchange.snapshot_value = _augment_preview_snapshot(
         now, level=Decimal("380"), own_original=Decimal("120")
     )
-    first = service.submit_augment(session_id, "20", "lp163-s14-k")
+    first = service.submit_augment(session_id, "20", "lp163-s14-k", price="0.29")
     assert first["state"] == "entry_open"
     assert str(first["augment_order_id"]) == "order-2"
     # 幂等重放连新鲜盘口都不再读。
@@ -10724,7 +10773,7 @@ def test_lp163_submit_augment_idempotency_and_unknown(tmp_path) -> None:
         now, level=Decimal("380"), own_original=Decimal("120")
     )
     exchange_b.post_failures = [RuntimeError("post timeout")]
-    unknown = service_b.submit_augment(session_b, "20", "lp163-s14-unknown")
+    unknown = service_b.submit_augment(session_b, "20", "lp163-s14-unknown", price="0.29")
     assert unknown["state"] == "needs_attention"
     assert unknown["reason"] == "augment_submit_unknown"
     # fake 的 post_order 先记账再抛错：1 张入场单 + 1 次失败的加量尝试。
@@ -10869,7 +10918,7 @@ def test_lp166_submit_augment_blocks_passive_exit_and_entry_pending(tmp_path) ->
         assert exchange.snapshot_calls == calls_before
         assert len(exchange.posts) == posts_before
 
-    # entry_open 放行（同一服务下作正对照）。
+    # entry_open 放行（同一服务下作正对照；新价位 0.29）。
     store, exchange, service, started = _augment_running_service(
         tmp_path / "s166-open", now, key="lp166-s166-open"
     )
@@ -10877,7 +10926,9 @@ def test_lp166_submit_augment_blocks_passive_exit_and_entry_pending(tmp_path) ->
     exchange.snapshot_value = _augment_preview_snapshot(
         now, level=Decimal("380"), own_original=Decimal("120")
     )
-    ok = service.submit_augment(session_id, "20", "lp166-s166-open-aug")
+    ok = service.submit_augment(
+        session_id, "20", "lp166-s166-open-aug", price="0.29"
+    )
     assert ok["state"] == "entry_open"
     assert len(exchange.posts) == 2
 
@@ -10913,7 +10964,7 @@ def test_lp166_two_phase_augment_blocks_same_states(tmp_path) -> None:
     exchange.snapshot_value = _augment_preview_snapshot(
         now, level=Decimal("380"), own_original=Decimal("120")
     )
-    preview = _augment_preview(service, session_id, 90)
+    preview = _augment_preview(service, session_id, 90, price="0.29")
     assert preview["state"] == "previewed"
     store.lp_update_session(session_id, state="passive_exit")
     posts_before = len(exchange.posts)
@@ -11123,8 +11174,9 @@ def test_lp166_stop_loss_isolated_per_group(tmp_path) -> None:
         "baseline_book_received_at", "baseline_source_timestamp",
         "baseline_book_hash", "baseline_version", "threshold",
     )
+    # #167 改写：锚字段读投影视图（原始载荷首次写后自然落 v2 分桶形状）。
     before_anchor = {
-        k: store.lp_session(session_b)["queue_protection"][k] for k in anchor_keys
+        k: service.status(session_b)["queue_protection"][k] for k in anchor_keys
     }
 
     # A 成交 100@0.30，随后盘口跌至亏损 ≥ $5 触发止损；B 全程只读自己的盘口。
@@ -11185,7 +11237,7 @@ def test_lp166_stop_loss_isolated_per_group(tmp_path) -> None:
     after_b = store.lp_session(session_b)
     assert {k: after_b[k] for k in fields} == before_b
     assert {
-        k: after_b["queue_protection"][k] for k in anchor_keys
+        k: service.status(session_b)["queue_protection"][k] for k in anchor_keys
     } == before_anchor
     assert after_b["state"] == "entry_open"
     assert Decimal(str(after_b["buy_filled_quantity"])) == Decimal("0")
@@ -11281,3 +11333,845 @@ def test_lp166_stop_and_status_semantics_with_two_groups(tmp_path) -> None:
     # 零组照旧：none 载荷。
     store.lp_update_session(session_a, state="complete")
     assert service.stop(None) == {"state": "none", "session_id": None}
+
+
+# ---- Issue 167: 同组多价位追加与分价位位置保护 ----
+
+
+def _lp167_book(
+    now: datetime,
+    *,
+    level_42: object = 150,
+    level_40: object | None = None,
+    balance: object = 10000,
+    open_orders: list[dict[str, object]] | None = None,
+    orders: list[dict[str, object]] | None = None,
+    trades: list[dict[str, object]] | None = None,
+    positions: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    """Two-level book: best bid 0.42 with an optional deeper 0.40 level."""
+
+    base = _snapshot(now)
+    base["account"].update(
+        {
+            "balance": Decimal(str(balance)),
+            "allowance": Decimal(str(balance)),
+            "open_orders": list(open_orders or []),
+            "positions": list(positions or []),
+        }
+    )
+    bids: list[dict[str, object]] = [
+        {"price": Decimal("0.42"), "size": Decimal(str(level_42))}
+    ]
+    if level_40 is not None:
+        bids.append({"price": Decimal("0.40"), "size": Decimal(str(level_40))})
+    base["book"] = {
+        "timestamp": now,
+        "received_at": now,
+        "source_timestamp": "2026-09-14T11:59:59Z",
+        "hash": "book-hash-lp167",
+        "asks": [{"price": Decimal("0.43"), "size": Decimal("100")}],
+        "bids": bids,
+    }
+    base["orders"] = list(orders or [])
+    base["trades"] = list(trades or [])
+    return base
+
+
+def _lp167_request(now: datetime) -> dict[str, object]:
+    return {
+        "market_id": "market-1",
+        "condition_id": "0x" + "c" * 64,
+        "token_id": "0x" + "1" * 64,
+        "outcome": "YES",
+        "question": "Will it happen?",
+        "price": Decimal("0.42"),
+        "quantity": Decimal("150"),
+        "review_at": now + timedelta(minutes=10),
+    }
+
+
+def _lp167_running_service(tmp_path, now: datetime, *, key: str):
+    """Start one registered entry session: 150 shares at 0.42 (level 150)."""
+
+    exchange = _Exchange()
+    exchange.snapshot_value = _lp167_book(now, level_42=150)
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    preview = service.preview(_lp167_request(now))
+    started = service.start(str(preview["preview_id"]), key)
+    assert started["state"] == "entry_open"
+    return store, exchange, service, started
+
+
+def test_lp167_s3_augment_price_above_best_bid_rejected(tmp_path) -> None:
+    """S3: 追加价高于同快照顶档买一 → price_above_best_bid；非法价 → price_invalid；无 POST。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _lp167_running_service(
+        tmp_path, now, key="lp167-s3"
+    )
+    session_id = str(started["session_id"])
+
+    result = service.submit_augment(session_id, "100", "lp167-s3-key-1", price="0.50")
+    assert result == {"state": "rejected", "reason": "price_above_best_bid"}
+    assert service.submit_augment(session_id, "100", "lp167-s3-key-2", price="0") == {
+        "state": "rejected",
+        "reason": "price_invalid",
+    }
+    assert len(exchange.posts) == 1  # 仅既有入场单
+    assert [
+        action
+        for action in store.lp_actions(session_id)
+        if "augment-submit" in str(action["action_key"])
+    ] == []
+
+
+def test_lp167_s6_per_bucket_trigger_cancels_only_that_level(tmp_path) -> None:
+    """S6: 分桶评估与触发——0.42 桶 front=130/310≈42%≤50% 触发只撤 0.42（含同价手工单）；
+    0.40 桶 front=min(224,320-100)=220、A≈69% 监控不动。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _lp167_running_service(
+        tmp_path, now, key="lp167-s6"
+    )
+    session_id = str(started["session_id"])
+    exchange.snapshot_value = _lp167_book(
+        now,
+        level_42=380,
+        level_40=224,
+        open_orders=[_queue_receipt("order-1", price=Decimal("0.42"), original="150")],
+    )
+    result = service.submit_augment(session_id, "100", "lp167-s6-aug", price="0.40")
+    assert result["state"] == "entry_open"
+
+    manual = _queue_receipt(
+        "manual-m", price=Decimal("0.42"), original="30"
+    )
+    exchange.snapshot_value = _lp167_book(
+        now,
+        level_42=310,
+        level_40=320,
+        open_orders=[
+            _queue_receipt("order-1", price=Decimal("0.42"), original="150"),
+            _queue_receipt("order-2", price=Decimal("0.40"), original="100"),
+            manual,
+        ],
+    )
+
+    ticked = service.tick()
+
+    assert exchange.cancels == ["order-1", "manual-m"]
+    assert "order-2" not in exchange.cancels
+    levels = ticked["queue_protection"]["levels"]
+    bucket_42 = levels["0.42"]
+    bucket_40 = levels["0.40"]
+    assert bucket_42["state"] == "canceling"
+    assert bucket_42["cancel_targets"] == ["order-1", "manual-m"]
+    assert Decimal(str(bucket_42["front_estimate"])) == Decimal("130")
+    assert Decimal(str(bucket_42["level_total"])) == Decimal("310")
+    assert Decimal(str(bucket_42["ratio"])) == Decimal("130") / Decimal("310")
+    assert bucket_40["state"] == "monitoring"
+    assert Decimal(str(bucket_40["front_estimate"])) == Decimal("220")
+    assert Decimal(str(bucket_40["level_total"])) == Decimal("320")
+    assert Decimal(str(bucket_40["ratio"])) == Decimal("220") / Decimal("320")
+    assert store.lp_session(session_id)["entry_cancel_requested"] is True
+
+
+def _lp167_two_level_group(tmp_path, now: datetime, *, key: str):
+    """One group with two resting levels: 150 @ 0.42 (order-1) + 100 @ 0.40
+    (order-2), group_buy_quantity 250."""
+
+    store, exchange, service, started = _lp167_running_service(
+        tmp_path, now, key=key
+    )
+    session_id = str(started["session_id"])
+    exchange.snapshot_value = _lp167_book(
+        now,
+        level_42=380,
+        level_40=224,
+        open_orders=[_queue_receipt("order-1", price=Decimal("0.42"), original="150")],
+    )
+    result = service.submit_augment(session_id, "100", f"{key}-aug", price="0.40")
+    assert result["state"] == "entry_open"
+    return store, exchange, service, session_id
+
+
+def _lp167_maker_trade(
+    trade_id: str,
+    order_id: str,
+    *,
+    amount: object,
+    price: object,
+    token_id: str = "0x" + "1" * 64,
+) -> dict[str, object]:
+    return {
+        "trade_id": trade_id,
+        "status": "CONFIRMED",
+        "maker_orders": [
+            {
+                "order_id": order_id,
+                "side": "BUY",
+                "token_id": token_id,
+                "matched_amount": Decimal(str(amount)),
+                "price": Decimal(str(price)),
+            }
+        ],
+    }
+
+
+def test_lp167_s7_any_level_fill_collects_whole_group(tmp_path) -> None:
+    """S7: 任一价位成交 → 立即撤组内全部自有 BUY；0.40 桶随组收单落 canceled；
+    不补买。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, session_id = _lp167_two_level_group(
+        tmp_path, now, key="lp167-s7"
+    )
+
+    filling = _lp167_book(
+        now,
+        level_42=310,
+        level_40=320,
+        open_orders=[
+            _queue_receipt("order-1", price=Decimal("0.42"), original="150", matched="60"),
+            _queue_receipt("order-2", price=Decimal("0.40"), original="100"),
+        ],
+        orders=[
+            _queue_receipt("order-1", price=Decimal("0.42"), original="150", matched="60"),
+            _queue_receipt("order-2", price=Decimal("0.40"), original="100"),
+        ],
+        trades=[_lp167_maker_trade("t-1", "order-1", amount="60", price="0.42")],
+        positions=[{"token_id": "0x" + "1" * 64, "size": Decimal("60")}],
+    )
+    exchange.snapshot_value = filling
+    first = service.tick()
+    # 0.42 桶成交 60 → 组内两张 BUY 全撤（跨价位）。
+    assert exchange.cancels == ["order-1", "order-2"]
+    levels = first["queue_protection"]["levels"]
+    assert levels["0.42"]["state"] == "canceling"
+    assert levels["0.42"]["cancel_reason"] == "group_fill_collect"
+    assert levels["0.40"]["state"] == "canceling"
+    assert levels["0.40"]["cancel_reason"] == "group_fill_collect"
+
+    cancelled = _lp167_book(
+        now,
+        level_42=310,
+        level_40=320,
+        open_orders=[],
+        orders=[
+            _queue_receipt(
+                "order-1", price=Decimal("0.42"), original="150",
+                matched="60", status="CANCELED",
+            ),
+            _queue_receipt(
+                "order-2", price=Decimal("0.40"), original="100",
+                status="CANCELED",
+            ),
+        ],
+        trades=[_lp167_maker_trade("t-1", "order-1", amount="60", price="0.42")],
+        positions=[{"token_id": "0x" + "1" * 64, "size": Decimal("60")}],
+    )
+    exchange.snapshot_value = cancelled
+    second = service.tick()
+
+    assert Decimal(str(second["buy_filled_quantity"])) == Decimal("60")
+    levels = second["queue_protection"]["levels"]
+    assert levels["0.42"]["state"] == "partially_filled"
+    assert Decimal(str(levels["0.42"]["partially_filled_quantity"])) == Decimal("60")
+    assert levels["0.40"]["state"] == "canceled"
+    assert levels["0.40"]["cancel_reason"] == "group_fill_collect"
+    # 不补买：BUY 始终只有最初两张。
+    assert len([item for item in exchange.posts if item["side"] == "BUY"]) == 2
+
+
+def test_lp167_s8_cross_level_cost_and_single_stop_loss_latch(tmp_path) -> None:
+    """S8: 两价位各成交一部分 → 组级合并成本 60×0.42+40×0.40=41.20；
+    残值跌价 → 开仓亏损 ≥ $5 一次 latch（triggered_at/loss 不随后续 tick 改写）。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, session_id = _lp167_two_level_group(
+        tmp_path, now, key="lp167-s8"
+    )
+
+    both_filled = _lp167_book(
+        now,
+        level_42=310,
+        level_40=320,
+        open_orders=[
+            _queue_receipt("order-1", price=Decimal("0.42"), original="150", matched="60"),
+            _queue_receipt("order-2", price=Decimal("0.40"), original="100", matched="40"),
+        ],
+        orders=[
+            _queue_receipt("order-1", price=Decimal("0.42"), original="150", matched="60"),
+            _queue_receipt("order-2", price=Decimal("0.40"), original="100", matched="40"),
+        ],
+        trades=[
+            _lp167_maker_trade("t-1", "order-1", amount="60", price="0.42"),
+            _lp167_maker_trade("t-2", "order-2", amount="40", price="0.40"),
+        ],
+        positions=[{"token_id": "0x" + "1" * 64, "size": Decimal("100")}],
+    )
+    exchange.snapshot_value = both_filled
+    assert service.tick()["state"] in {"entry_open", "stop_loss_exit"}
+
+    # 两张单终态：持仓 100， bids 只够 100 份 × ~0.295 → 亏损 ≥ $5 触发止损。
+    cancelled = _lp167_book(
+        now,
+        level_42=310,
+        level_40=320,
+        open_orders=[],
+        orders=[
+            _queue_receipt(
+                "order-1", price=Decimal("0.42"), original="150",
+                matched="60", status="CANCELED",
+            ),
+            _queue_receipt(
+                "order-2", price=Decimal("0.40"), original="100",
+                matched="40", status="CANCELED",
+            ),
+        ],
+        trades=[
+            _lp167_maker_trade("t-1", "order-1", amount="60", price="0.42"),
+            _lp167_maker_trade("t-2", "order-2", amount="40", price="0.40"),
+        ],
+        positions=[{"token_id": "0x" + "1" * 64, "size": Decimal("100")}],
+    )
+    cancelled["book"]["bids"] = [
+        {"price": Decimal("0.30"), "size": Decimal("50")},
+        {"price": Decimal("0.29"), "size": Decimal("50")},
+    ]
+    exchange.snapshot_value = cancelled
+    stop = service.tick()
+
+    assert store.lp_session(session_id)["state"] == "stop_loss_exit"
+    status = service.status(session_id)
+    assert status["stop_loss_latched"] is True
+    assert Decimal(str(status["buy_cost"])) == Decimal("41.20")
+    assert Decimal(str(status["buy_filled_quantity"])) == Decimal("100")
+    latched_loss = Decimal(str(status["stop_loss_triggered_loss"]))
+    assert latched_loss == Decimal("41.20") - Decimal("29.50")
+    assert status["stop_loss_triggered_at"] is not None
+    latched_at = status["stop_loss_triggered_at"]
+
+    # 后续 tick 亏损更大也只保留第一次 latch 证据。
+    deeper = _lp167_book(
+        now,
+        level_42=310,
+        level_40=320,
+        open_orders=[],
+        orders=cancelled["orders"],
+        trades=cancelled["trades"],
+        positions=[{"token_id": "0x" + "1" * 64, "size": Decimal("100")}],
+    )
+    deeper["book"]["bids"] = [{"price": Decimal("0.10"), "size": Decimal("100")}]
+    exchange.snapshot_value = deeper
+    again = service.tick()
+    assert store.lp_session(session_id)["state"] == "stop_loss_exit"
+    status = service.status(session_id)
+    assert Decimal(str(status["stop_loss_triggered_loss"])) == latched_loss
+    assert status["stop_loss_triggered_at"] == latched_at
+
+
+def test_lp167_s10_outage_conservative_cancel_covers_both_levels(tmp_path) -> None:
+    """S10: 组级 data_failures 满 10 → 保守撤组内全部自有 BUY（两价位 + 0.42 手工单）。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    exchange = _AccountReadExchange()
+    exchange.snapshot_value = _lp167_book(now, level_42=150)
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    preview = service.preview(_lp167_request(now))
+    started = service.start(str(preview["preview_id"]), "lp167-s10")
+    session_id = str(started["session_id"])
+    exchange.snapshot_value = _lp167_book(
+        now,
+        level_42=380,
+        level_40=224,
+        open_orders=[_queue_receipt("order-1", price=Decimal("0.42"), original="150")],
+    )
+    assert service.submit_augment(session_id, "100", "lp167-s10-aug", price="0.40")[
+        "state"
+    ] == "entry_open"
+
+    exchange.account_open_orders = [
+        _queue_receipt("order-1", price=Decimal("0.42"), original="150"),
+        _queue_receipt("order-2", price=Decimal("0.40"), original="100"),
+        _queue_receipt("manual-m", price=Decimal("0.42"), original="30"),
+    ]
+    exchange.snapshot_value = None
+    exchange.snapshots = []
+    exchange.snapshot_calls = 0
+
+    for expected_failures in range(1, 10):
+        result = service.tick()
+        assert result["state"] == "needs_attention"
+        protection = result["queue_protection"]
+        assert Decimal(str(protection["data_failures"])) == expected_failures
+        assert exchange.cancels == []
+
+    conservative = service.tick()
+    protection = conservative["queue_protection"]
+    # levels 键经 store sort_keys 落盘 → 桶迭代按价格字典序（0.40 先于 0.42）。
+    assert exchange.cancels == ["order-2", "order-1", "manual-m"]
+    assert store.lp_session(session_id)["entry_cancel_requested"] is True
+    levels = protection["levels"]
+    assert levels["0.40"]["state"] == "canceling"
+    assert levels["0.40"]["cancel_reason"] == "book_unreliable"
+    assert levels["0.40"]["cancel_targets"] == ["order-2"]
+    assert levels["0.42"]["state"] == "canceling"
+    assert levels["0.42"]["cancel_reason"] == "book_unreliable"
+    assert levels["0.42"]["cancel_targets"] == ["order-1", "manual-m"]
+
+
+def test_lp167_s9_review_deadline_collects_both_levels(tmp_path) -> None:
+    """S9: 复核截止（首单 review_at）——一次收掉两价位自有 BUY，桶落 canceling→canceled，
+    会话进 awaiting_reconciliation。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _queue_running_service(
+        tmp_path, now, key="lp167-s9"
+    )
+    session_id = str(started["session_id"])
+    augment_snapshot = _queue_book_snapshot(now, Decimal("10000"))
+    augment_snapshot["book"]["bids"] = [
+        {"price": Decimal("0.30"), "size": Decimal("10000")},
+        {"price": Decimal("0.29"), "size": Decimal("224")},
+    ]
+    augment_snapshot["account"]["balance"] = Decimal("10000")
+    augment_snapshot["account"]["allowance"] = Decimal("10000")
+    augment_snapshot["account"]["open_orders"] = [
+        _queue_receipt("order-1", original="2000")
+    ]
+    augment_snapshot["orders"] = [_queue_receipt("order-1", original="2000")]
+    exchange.snapshot_value = augment_snapshot
+    preview = _augment_preview(service, session_id, 90, price="0.29")
+    assert preview["state"] == "previewed"
+    result = service.augment(session_id, str(preview["preview_id"]), "lp167-s9-aug")
+    assert result["state"] == "entry_open"
+
+    class _Clock:
+        current = now
+
+    service2 = PolymarketLPService(store, exchange, clock=lambda: _Clock.current)
+    _Clock.current = now + timedelta(minutes=11)
+    # 盘口时间戳跟随当前时钟，避免新鲜度门先行拦截。
+    live = _queue_book_snapshot(_Clock.current, Decimal("10000"))
+    live["book"]["bids"] = [
+        {"price": Decimal("0.30"), "size": Decimal("10000")},
+        {"price": Decimal("0.29"), "size": Decimal("320")},
+    ]
+    live["account"]["open_orders"] = [
+        _queue_receipt("order-1", original="2000"),
+        _queue_receipt("order-2", price=Decimal("0.29"), original="90"),
+    ]
+    live["orders"] = [
+        _queue_receipt("order-1", original="2000"),
+        _queue_receipt("order-2", price=Decimal("0.29"), original="90"),
+    ]
+    exchange.snapshot_value = live
+    deadline = service2.tick()
+
+    assert exchange.cancels == ["order-1", "order-2"]
+    assert deadline["state"] == "review"
+    assert deadline["review_status"] == "awaiting_reconciliation"
+    levels = deadline["queue_protection"]["levels"]
+    assert levels["0.30"]["state"] == "canceling"
+    assert levels["0.30"]["cancel_reason"] == "review_deadline"
+    assert levels["0.29"]["state"] == "canceling"
+    assert levels["0.29"]["cancel_reason"] == "review_deadline"
+
+    _Clock.current = now + timedelta(minutes=11, seconds=5)
+    cancelled = _queue_book_snapshot(_Clock.current, Decimal("10000"))
+    cancelled["book"]["bids"] = [
+        {"price": Decimal("0.30"), "size": Decimal("10000")},
+        {"price": Decimal("0.29"), "size": Decimal("320")},
+    ]
+    cancelled["account"]["open_orders"] = []
+    cancelled["orders"] = [
+        _queue_receipt("order-1", original="2000", status="CANCELED"),
+        _queue_receipt(
+            "order-2", price=Decimal("0.29"), original="90", status="CANCELED"
+        ),
+    ]
+    exchange.snapshot_value = cancelled
+    service2.tick()
+
+    levels = store.lp_session(session_id)["queue_protection"]["levels"]
+    assert levels["0.30"]["state"] == "canceled"
+    assert levels["0.29"]["state"] == "canceled"
+    assert store.lp_session(session_id)["review_status"] == "awaiting_reconciliation"
+
+
+def test_lp167_s5_augment_state_gate_six_states_with_price(tmp_path) -> None:
+    """S5: 状态门禁只放行 entry_open——其余五态各回真实原因（显式 price 也不越过门禁）。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    cases = [
+        ("review", "session_review_exit"),
+        ("stop_loss_exit", "session_stop_loss_exit"),
+        ("needs_attention", "session_needs_attention"),
+        ("passive_exit", "session_passive_exit"),
+        ("entry_submit_pending", "session_entry_pending"),
+        ("complete", "session_not_active"),
+    ]
+    for index, (state, expected_reason) in enumerate(cases):
+        store, exchange, service, started = _lp167_running_service(
+            tmp_path / f"s5-{index}", now, key=f"lp167-s5-{index}"
+        )
+        session_id = str(started["session_id"])
+        store.lp_update_session(session_id, state=state)
+        posts_before = len(exchange.posts)
+
+        result = service.submit_augment(
+            session_id, "100", f"lp167-s5-{index}-k", price="0.40"
+        )
+
+        assert result == {"state": "rejected", "reason": expected_reason}
+        assert len(exchange.posts) == posts_before
+
+
+def test_lp167_s2_same_key_replay_produces_single_order(tmp_path) -> None:
+    """S2: 同键重放只产一单——两级价位组上重放返既有结果，买一再变也不重发。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, session_id = _lp167_two_level_group(
+        tmp_path, now, key="lp167-s2"
+    )
+    calls_after_submit = exchange.snapshot_calls
+    exchange.snapshot_value = _queue_book_moved_bid_snapshot(now, Decimal("9000"))
+
+    replay = service.submit_augment(session_id, "100", "lp167-s2-aug")
+
+    assert replay["state"] == "entry_open"
+    assert str(replay["augment_order_id"]) == "order-2"
+    assert len(exchange.posts) == 2
+    assert exchange.snapshot_calls == calls_after_submit  # 重放不再读快照
+
+
+def test_lp167_s12_own_orders_tolerated_foreign_order_blocks(tmp_path) -> None:
+    """S12: 组内自有单（两价位）不算外部冲突；真外部单（同 token 未管理价位）
+    仍令 tick 进 needs_attention/unowned_target_order。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, session_id = _lp167_two_level_group(
+        tmp_path, now, key="lp167-s12"
+    )
+
+    # 自有两价位在挂：tick 照常 entry_open（自有单豁免）。
+    own = _lp167_book(
+        now,
+        level_42=10000,
+        level_40=320,
+        open_orders=[
+            _queue_receipt("order-1", price=Decimal("0.42"), original="150"),
+            _queue_receipt("order-2", price=Decimal("0.40"), original="100"),
+        ],
+        orders=[
+            _queue_receipt("order-1", price=Decimal("0.42"), original="150"),
+            _queue_receipt("order-2", price=Decimal("0.40"), original="100"),
+        ],
+    )
+    exchange.snapshot_value = own
+    assert service.tick()["state"] == "entry_open"
+
+    # 真外部单：同 token SELL（按 #152 设计同 token BUY 属保护伞豁免，SELL 不豁免）。
+    foreign = _lp167_book(
+        now,
+        level_42=10000,
+        level_40=320,
+        open_orders=[
+            _queue_receipt("order-1", price=Decimal("0.42"), original="150"),
+            _queue_receipt("order-2", price=Decimal("0.40"), original="100"),
+            _queue_receipt("stranger-sell", side="SELL", price=Decimal("0.43"), original="500"),
+        ],
+        orders=[
+            _queue_receipt("order-1", price=Decimal("0.42"), original="150"),
+            _queue_receipt("order-2", price=Decimal("0.40"), original="100"),
+            _queue_receipt("stranger-sell", side="SELL", price=Decimal("0.43"), original="500"),
+        ],
+    )
+    exchange.snapshot_value = foreign
+    result = service.tick()
+    assert result["state"] == "needs_attention"
+    assert result["reconciliation"] == "unowned_target_order"
+
+
+def test_lp167_s11_legacy_and_broken_payload_compat(tmp_path) -> None:
+    """S11: 三档兼容兜底——无键不启用保护；老标量读时包成单桶继续跑（写落新形状）；
+    残缺桶仅置 unknown、不影响其他桶与组级核算。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+
+    # a) 无 queue_protection 键：视为未启用保护，tick 照常、不抛错、不落键。
+    exchange_a = _Exchange()
+    exchange_a.snapshot_value = _queue_runtime_snapshot(
+        now, bid_size="10000", orders=[_queue_receipt("order-1")]
+    )
+    store_a = PredictionArbitrageStore(tmp_path / "a")
+    store_a.lp_create_session(
+        "lp167-s11-a",
+        "lp167-s11-a-key",
+        state="entry_open",
+        payload={
+            "market_id": "market-1",
+            "condition_id": "0x" + "c" * 64,
+            "token_id": "0x" + "1" * 64,
+            "outcome": "YES",
+            "question": "Will it happen?",
+            "price": Decimal("0.30"),
+            "quantity": Decimal("2000"),
+            "review_at": now + timedelta(minutes=10),
+            "entry_order_id": "order-1",
+            "order_history": {
+                "order-1": {"order_id": "order-1", "side": "BUY", "status": "LIVE"}
+            },
+        },
+    )
+    service_a = PolymarketLPService(store_a, exchange_a, clock=lambda: now)
+    ticked_a = service_a.tick()
+    assert "queue_protection" not in ticked_a
+    assert exchange_a.cancels == []
+
+    # b) 老标量形状（有 baseline_price 无 levels）：读时包成单价位桶继续跑；
+    # 触发撤单照常，写回载荷自然落 v2 形状。
+    exchange_b = _Exchange()
+    exchange_b.snapshot_value = _queue_runtime_snapshot(
+        now, bid_size="4000", orders=[_queue_receipt("order-1")]
+    )
+    store_b = PredictionArbitrageStore(tmp_path / "b")
+    store_b.lp_create_session(
+        "lp167-s11-b",
+        "lp167-s11-b-key",
+        state="entry_open",
+        payload={
+            "market_id": "market-1",
+            "condition_id": "0x" + "c" * 64,
+            "token_id": "0x" + "1" * 64,
+            "outcome": "YES",
+            "question": "Will it happen?",
+            "price": Decimal("0.30"),
+            "quantity": Decimal("2000"),
+            "review_at": now + timedelta(minutes=10),
+            "entry_order_id": "order-1",
+            "order_history": {
+                "order-1": {"order_id": "order-1", "side": "BUY", "status": "LIVE"}
+            },
+            "queue_protection": {
+                "baseline_price": "0.30",
+                "baseline_front": "10000",
+                "baseline_source": "submit",
+                "threshold": "0.5",
+                "data_failures": 0,
+                "state": "registered",
+                "notification_sent": False,
+                "cancel_scope": "own_buys_at_level",
+                "reason_codes": [],
+            },
+        },
+    )
+    service_b = PolymarketLPService(store_b, exchange_b, clock=lambda: now)
+    ticked_b = service_b.tick()
+    assert exchange_b.cancels == ["order-1"]
+    assert ticked_b["queue_protection"]["state"] == "canceling"
+    stored = store_b.lp_session("lp167-s11-b")["queue_protection"]
+    assert stored["version"] == 2
+    assert set(stored["levels"]) == {"0.30"}
+    assert stored["levels"]["0.30"]["state"] == "canceling"
+
+    # c) v2 某桶字段残缺：仅该桶置 unknown，好桶照常评估，组级核算不动。
+    exchange_c = _Exchange()
+    exchange_c.snapshot_value = _queue_runtime_snapshot(
+        now, bid_size="10000", orders=[_queue_receipt("order-1")]
+    )
+    store_c = PredictionArbitrageStore(tmp_path / "c")
+    store_c.lp_create_session(
+        "lp167-s11-c",
+        "lp167-s11-c-key",
+        state="entry_open",
+        payload={
+            "market_id": "market-1",
+            "condition_id": "0x" + "c" * 64,
+            "token_id": "0x" + "1" * 64,
+            "outcome": "YES",
+            "question": "Will it happen?",
+            "price": Decimal("0.30"),
+            "quantity": Decimal("2000"),
+            "review_at": now + timedelta(minutes=10),
+            "entry_order_id": "order-1",
+            "order_history": {
+                "order-1": {"order_id": "order-1", "side": "BUY", "status": "LIVE"}
+            },
+            "queue_protection": {
+                "version": 2,
+                "data_failures": 0,
+                "levels": {
+                    "0.30": {
+                        "order_id": "order-1",
+                        "baseline_price": "0.30",
+                        "baseline_front": "10000",
+                        "threshold": "0.5",
+                        "state": "registered",
+                        "notification_sent": False,
+                        "reason_codes": [],
+                    },
+                    "broken": {"state": "registered"},
+                },
+            },
+        },
+    )
+    service_c = PolymarketLPService(store_c, exchange_c, clock=lambda: now)
+    ticked_c = service_c.tick()
+    levels = ticked_c["queue_protection"]["levels"]
+    assert levels["broken"]["state"] == "unknown"
+    assert levels["0.30"]["state"] == "monitoring"
+    assert Decimal(str(levels["0.30"]["ratio"])) == Decimal("0.80")
+    assert exchange_c.cancels == []
+
+
+def test_lp167_s1_augment_new_price_level_registers_bucket(tmp_path) -> None:
+    """S1: 追加 0.40 成功：新单号、两桶、review_at 不变、order_history 两键。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _lp167_running_service(
+        tmp_path, now, key="lp167-s1"
+    )
+    session_id = str(started["session_id"])
+    review_at_before = store.lp_session(session_id)["review_at"]
+    exchange.snapshot_value = _lp167_book(
+        now,
+        level_42=380,
+        level_40=224,
+        open_orders=[_queue_receipt("order-1", price=Decimal("0.42"), original="150")],
+    )
+
+    result = service.submit_augment(session_id, "100", "lp167-s1-key-1", price="0.40")
+
+    assert result["state"] == "entry_open"
+    assert str(result["augment_order_id"]) == "order-2"
+    posted = exchange.posts[1]
+    assert posted["side"] == "BUY"
+    assert posted["post_only"] is True
+    assert Decimal(str(posted["price"])) == Decimal("0.40")
+    assert Decimal(str(posted["quantity"])) == Decimal("100")
+
+    after = store.lp_session(session_id)
+    assert after["review_at"] == review_at_before
+    assert after["augment_order_ids"] == ["order-2"]
+    assert set(after["order_history"]) == {"order-1", "order-2"}
+    protection = after["queue_protection"]
+    assert protection["version"] == 2
+    assert set(protection["levels"]) == {"0.42", "0.40"}
+    bucket_42 = protection["levels"]["0.42"]
+    bucket_40 = protection["levels"]["0.40"]
+    assert str(bucket_42["order_id"]) == "order-1"
+    assert Decimal(str(bucket_42["baseline_price"])) == Decimal("0.42")
+    assert Decimal(str(bucket_42["baseline_front"])) == Decimal("150")
+    assert bucket_42["state"] == "registered"
+    assert str(bucket_40["order_id"]) == "order-2"
+    assert Decimal(str(bucket_40["baseline_price"])) == Decimal("0.40")
+    assert Decimal(str(bucket_40["baseline_front"])) == Decimal("224")
+    assert bucket_40["state"] == "registered"
+    assert Decimal(str(bucket_40["threshold"])) == Decimal("0.5")
+    assert protection["data_failures"] == 0
+
+
+def test_lp167_s4_augment_price_level_active_rejected(tmp_path) -> None:
+    """S4: 目标价位仍有非终态自有单（同价补量、缺省组价同因）→ price_level_active。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _lp167_running_service(
+        tmp_path, now, key="lp167-s4"
+    )
+    session_id = str(started["session_id"])
+    exchange.snapshot_value = _lp167_book(
+        now,
+        level_42=380,
+        open_orders=[_queue_receipt("order-1", price=Decimal("0.42"), original="150")],
+    )
+
+    same_price = service.submit_augment(
+        session_id, "90", "lp167-s4-key-1", price="0.42"
+    )
+    assert same_price == {"state": "rejected", "reason": "price_level_active"}
+    # 缺省价 = 组价 = 0.42：入场单仍在挂，同因拒绝。
+    default_price = service.submit_augment(session_id, "90", "lp167-s4-key-2")
+    assert default_price == {"state": "rejected", "reason": "price_level_active"}
+    assert len(exchange.posts) == 1
+    assert [
+        action
+        for action in store.lp_actions(session_id)
+        if "augment-submit" in str(action["action_key"])
+    ] == []
+
+
+def test_lp167_r1_same_tick_augment_bucket_cancels_merge_union(tmp_path) -> None:
+    """R1（issue 167 修复环评审）：同一 tick 两个追加价位桶都触发撤单时，
+    会话级 ``augment_cancel_requested`` 必须按并集合并。评审复现：三价位组
+    （入场 150@0.42 + 追加 100@0.40 + 追加 100@0.38），0.40/0.38 两桶同
+    tick 触发，逐桶 ``session_patch.update(patch)`` 后写覆盖前写，持久化
+    只剩一单；该单随后被误判「未请求撤单」而被重复撤单。断言：并集落盘
+    （不丢单）、场所端每单恰一次撤单（无重复）、两桶各自 canceling 且
+    targets 各归各桶。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    exchange = _Exchange()
+    # 起始 0.42 档 310 → 入场桶基线 front=310，触发 tick 里 230/380>50% 不触发。
+    exchange.snapshot_value = _lp167_book(now, level_42=310)
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    preview = service.preview(_lp167_request(now))
+    started = service.start(str(preview["preview_id"]), "lp167-r1")
+    session_id = str(started["session_id"])
+
+    # 追加 100 @ 0.40：提交时 0.40 档 224 → 桶基线 front=224。
+    exchange.snapshot_value = _lp167_book(
+        now,
+        level_42=380,
+        level_40=224,
+        open_orders=[_queue_receipt("order-1", price=Decimal("0.42"), original="150")],
+    )
+    assert service.submit_augment(session_id, "100", "lp167-r1-aug-40", price="0.40")[
+        "state"
+    ] == "entry_open"
+
+    # 追加 100 @ 0.38：提交时 0.38 档 224 → 桶基线 front=224。
+    augment_book = _lp167_book(
+        now,
+        level_42=380,
+        level_40=320,
+        open_orders=[
+            _queue_receipt("order-1", price=Decimal("0.42"), original="150"),
+            _queue_receipt("order-2", price=Decimal("0.40"), original="100"),
+        ],
+    )
+    augment_book["book"]["bids"].append(
+        {"price": Decimal("0.38"), "size": Decimal("224")}
+    )
+    exchange.snapshot_value = augment_book
+    assert service.submit_augment(session_id, "100", "lp167-r1-aug-38", price="0.38")[
+        "state"
+    ] == "entry_open"
+
+    # 触发 tick：0.42 桶 front=min(310,380-150)=230、A=230/380>50% 监控不动；
+    # 0.40 桶 front=min(224,200-100)=100、A=100/200=50% 触发；
+    # 0.38 桶 front=min(224,180-100)=80、A=80/180≈44% 触发——两个追加桶
+    # 在同一 tick 各自触发撤单。
+    trigger_book = _lp167_book(
+        now,
+        level_42=380,
+        level_40=200,
+        open_orders=[
+            _queue_receipt("order-1", price=Decimal("0.42"), original="150"),
+            _queue_receipt("order-2", price=Decimal("0.40"), original="100"),
+            _queue_receipt("order-3", price=Decimal("0.38"), original="100"),
+        ],
+    )
+    trigger_book["book"]["bids"].append(
+        {"price": Decimal("0.38"), "size": Decimal("180")}
+    )
+    exchange.snapshot_value = trigger_book
+
+    ticked = service.tick()
+
+    # 1. 会话级并集落盘：两张追加单都在（修复前只剩后写桶的一单）。
+    persisted = store.lp_session(session_id)["augment_cancel_requested"]
+    assert persisted == ["order-2", "order-3"]
+    # 2. 场所端每单恰一次撤单请求（无重复）；入场桶不动，order-1 不撤。
+    assert sorted(exchange.cancels) == ["order-2", "order-3"]
+    assert len(exchange.cancels) == len(set(exchange.cancels))
+    assert "order-1" not in exchange.cancels
+    # 3. 两桶各自 state=canceling、targets 各归各桶；入场桶保持 monitoring。
+    levels = ticked["queue_protection"]["levels"]
+    assert levels["0.40"]["state"] == "canceling"
+    assert levels["0.40"]["cancel_targets"] == ["order-2"]
+    assert levels["0.38"]["state"] == "canceling"
+    assert levels["0.38"]["cancel_targets"] == ["order-3"]
+    assert levels["0.42"]["state"] == "monitoring"

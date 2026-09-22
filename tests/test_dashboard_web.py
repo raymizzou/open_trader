@@ -22221,8 +22221,148 @@ console.log(JSON.stringify({
     assert rendered["noAugmentButton"] is True
 
 
+def test_lp167_today_rows_render_one_protection_subrow_per_level() -> None:
+    """W（#167）：v2 分桶摘要 → 每桶一条保护副行，价位标签开头；六态 pill 保留；
+    随组收单副行专用文案；老标量（含首见）回退单桶。"""
+    output = run_dashboard_js(r'''
+const checkedAt = "2026-09-20T04:00:00Z";
+const dataTime = "2026-09-20T04:00:03Z";
+const row = (orderId, conditionId, extra) => ({
+  order_id: orderId, condition_id: conditionId, token_id: "token-" + orderId,
+  market_title: "Levels market " + conditionId,
+  market_url: "https://polymarket.com/event/" + conditionId,
+  outcome: "YES", side: "BUY", status: "LIVE", price: "0.42",
+  quantity: "250", filled_quantity: "0", remaining_quantity: "250",
+  state: "open", management: "manual_read_only", read_only: true,
+  scoring_status: "true", anchor: false, ...extra,
+});
+const levelsView = {
+  version: 2, data_failures: 0,
+  levels: {
+    "0.42": {
+      order_id: "entry-1", baseline_price: "0.42", baseline_front: "288",
+      threshold: "0.5", state: "monitoring", notification_sent: false,
+      front_estimate: "288", level_total: "450", ratio: "0.64",
+      reason_codes: [], data_time: dataTime,
+    },
+    "0.40": {
+      order_id: "order-2", baseline_price: "0.40", baseline_front: "224",
+      threshold: "0.5", state: "canceled", notification_sent: true,
+      cancel_reason: "group_fill_collect",
+      canceled_remaining: "100", cancel_targets: ["order-2"],
+      canceled_order_ids: ["order-2"], reason_codes: [], data_time: dataTime,
+    },
+  },
+};
+const dashboard = {
+  state: "ready", stale: false, checked_at: checkedAt, last_success_at: checkedAt,
+  orders: [], positions: [],
+  lp_orders_today: [
+    row("entry-1", "condition-lv", {anchor: true, queue_protection: levelsView}),
+    row("order-2", "condition-lv", {anchor: true, queue_protection: levelsView}),
+  ],
+  non_lp_row_count: 0, market_rewards: [], lp_observations: {},
+};
+const html = predictionLpCard({lp_dashboard: dashboard});
+const orderTable = (html.match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
+const marketRow = orderTable.split("Levels market condition-lv")[1] || "";
+const subrows = marketRow.match(/<div class="lp-queue-protection">[\s\S]*?<\/div>/g) || [];
+const firstRow = subrows[0] || "";
+const secondRow = subrows[1] || "";
+// 老标量（首见 episode）→ 单桶回退，价位标签仍带出。
+const legacyScalar = {
+  state: "monitoring", baseline_price: "0.30", baseline_source: "first_observation",
+  front_estimate: "180", level_total: "260", ratio: "0.692",
+  threshold: "0.5", reason_codes: [], data_time: dataTime,
+};
+const legacyHtml = predictionLpCard({lp_dashboard: {...dashboard,
+  lp_orders_today: [row("entry-9", "condition-legacy", {anchor: true, queue_protection: legacyScalar})]}});
+const legacyTable = (legacyHtml.match(/<table class="pm-table pm-lp-order-table">[\s\S]*?<\/table>/) || [""])[0];
+const legacyRow = legacyTable.split("Levels market condition-legacy")[1] || "";
+console.log(JSON.stringify({
+  subrowCount: subrows.length,
+  firstPriceChip: firstRow.startsWith('<div class="lp-queue-protection"><span class="qp-price">0.42</span>'),
+  secondPriceChip: secondRow.startsWith('<div class="lp-queue-protection"><span class="qp-price">0.40</span>'),
+  monitoringPill: firstRow.includes("位置保护 · 监控中") && firstRow.includes("A 64%"),
+  canceledPillOnCollect: secondRow.includes("位置保护 · 已撤"),
+  groupCollectCopy: secondRow.includes("随组收单（组内已成交）· 合计余量 100 份"),
+  legacySingleBucket: (legacyRow.match(/<div class="lp-queue-protection">/g) || []).length === 1
+    && legacyRow.includes('<span class="qp-price">0.30</span>')
+    && legacyRow.includes("首见 · 估算假设"),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered == {
+        "subrowCount": 2,
+        "firstPriceChip": True,
+        "secondPriceChip": True,
+        "monitoringPill": True,
+        "canceledPillOnCollect": True,
+        "groupCollectCopy": True,
+        "legacySingleBucket": True,
+    }
+
+
+def test_lp167_session_card_renders_levels_block() -> None:
+    """A（#167）：会话卡价位明细块——每桶一行（价/量/剩余/保护 pill/A 估算），
+    两桶渲染两行；无保护载荷时不渲染。"""
+    output = run_dashboard_js(r'''
+const session = {
+  state: "entry_open", session_id: "sess-lv1",
+  market_title: "Will the Fed cut rates in Q4?", outcome: "YES",
+  entry_order_id: "entry-1", scoring_status: "true",
+  buy_filled_quantity: "0", sold_quantity: "0", residual_quantity: "0",
+  quantity: "250", opening_loss: "$0.00", trade_pnl: "$0.00", total_pnl: "$0.00",
+  review_at: "2026-09-22T00:00:00Z",
+  order_history: {
+    "entry-1": {order_id: "entry-1", side: "BUY", status: "LIVE",
+      price: "0.42", quantity: "150", size_matched: "0"},
+    "order-2": {order_id: "order-2", side: "BUY", status: "LIVE",
+      price: "0.40", quantity: "100", size_matched: "0"},
+  },
+  queue_protection: {
+    version: 2, data_failures: 0,
+    levels: {
+      "0.42": {order_id: "entry-1", baseline_price: "0.42", threshold: "0.5",
+        state: "monitoring", front_estimate: "288", level_total: "450",
+        ratio: "0.64", reason_codes: []},
+      "0.40": {order_id: "order-2", baseline_price: "0.40", threshold: "0.5",
+        state: "canceled", notification_sent: true,
+        cancel_reason: "review_deadline", reason_codes: []},
+    },
+  },
+};
+const html = predictionLpSessionCard({lp_session: session});
+const hasBlock = html.includes('<div class="lp-levels" aria-label="价位明细">');
+const rowCount = (html.match(/<div class="lp-level-row">/g) || []).length;
+const empty = predictionLpSessionCard({lp_session: {...session, queue_protection: undefined}});
+console.log(JSON.stringify({
+  hasBlock,
+  rowCount,
+  priceCell42: html.includes('<span class="lp-level-price">0.42</span>'),
+  priceCell40: html.includes('<span class="lp-level-price">0.40</span>'),
+  quantityRemaining: html.includes("150 份 · 剩余 150")
+    && html.includes("100 份 · 剩余 100"),
+  pills: html.includes("位置保护 · 监控中") && html.includes("位置保护 · 已撤"),
+  estimate: html.includes("前方≈288 / 同价位 450 · A 64%"),
+  hiddenWithoutProtection: !empty.includes("lp-levels"),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered == {
+        "hasBlock": True,
+        "rowCount": 2,
+        "priceCell42": True,
+        "priceCell40": True,
+        "quantityRemaining": True,
+        "pills": True,
+        "estimate": True,
+        "hiddenWithoutProtection": True,
+    }
+
+
 def test_lp_today_session_row_renders_augment_button_t14f() -> None:
-    """T14f: 有活动会话的标的行渲染「加量」按钮；纯网页单行不渲染。"""
+    """T14f（#167 改写）：有活动会话的标的行渲染「追加」按钮；纯网页单行不渲染。"""
     output = run_dashboard_js(_LP158_FIXTURE + r'''
 state.predictionMarket.csrfToken = "csrf-1";
 const sessionHtml = predictionLpCard({lp_dashboard: buildDashboard({
@@ -22248,7 +22388,7 @@ const noSessionHtml = predictionLpCard({lp_dashboard: buildDashboard({
 console.log(JSON.stringify({
   sessionRow: {
     hasButton: sessionHtml.includes('data-action="lp-augment-entry"'),
-    label: sessionHtml.includes(">加量</button>"),
+    label: sessionHtml.includes(">追加</button>"),
   },
   manualRow: {hasButton: manualHtml.includes('data-action="lp-augment-entry"')},
   otherCondition: {hasButton: otherConditionHtml.includes('data-action="lp-augment-entry"')},
@@ -23355,9 +23495,10 @@ console.log(JSON.stringify({
   postCount: posts.length,
   bodySessionId: body ? body.session_id : null,
   bodyQuantity: body ? body.quantity : null,
+  bodyPrice: body ? body.price ?? null : null,
   keyLooksUuid: body ? /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(body.idempotency_key) : false,
   sharedLock,
-  successToast: successCard.includes("已加量 · 订单 aug-9 并入会话 sess-a 保护伞"),
+  successToast: successCard.includes("已追加 · 订单 aug-9 并入会话 sess-a"),
   unlocked: !/data-action="lp-order-entry"[^>]*disabled/.test(unlockedCard)
     && !/data-action="lp-augment-entry"[^>]*disabled/.test(unlockedCard),
 }));
@@ -23367,6 +23508,8 @@ console.log(JSON.stringify({
     assert rendered["postCount"] == 1
     assert rendered["bodySessionId"] == "sess-abc163"
     assert rendered["bodyQuantity"] == "90"
+    # #167：默认价 = 组价 0.42 随 body 一起提交。
+    assert rendered["bodyPrice"] == "0.42"
     assert rendered["keyLooksUuid"] is True
     assert rendered["sharedLock"] is True
     assert rendered["successToast"] is True
@@ -23394,7 +23537,8 @@ deferResponse(lpAugmentSubmitMatch);
 openPredictionModal("lp_augment", null, lpAugmentIntent(groupOrders, lp163Session));
 modalClick({modalAction: "lp-augment-confirm"});  // 处理器挂在 fetch 处即可，键已铸造
 const keyB = JSON.parse(lpAugmentPosts()[1].body).idempotency_key;
-// 5% 目标量缺失的会话：选项禁用 + UNKNOWN 文案；有目标量时合并估算本地现算。
+// 5% 目标量缺失的会话：选项禁用 + UNKNOWN 文案；#167 追加弹窗解锁价位输入
+// （默认组价可改）并带价位规则提示行。
 const noTargetIntent = lpAugmentIntent(groupOrders, {...lp163Session, estimated_target_quantity: null});
 openPredictionModal("lp_augment", null, noTargetIntent);
 const noTargetHtml = modalRoot.innerHTML;
@@ -23409,8 +23553,11 @@ console.log(JSON.stringify({
     disabled: /value="five" disabled/.test(noTargetHtml),
     unknownLabel: noTargetHtml.includes("加 5% 单 · 目标量 UNKNOWN"),
   },
-  estimateLocal: withTargetHtml.includes("加后 A ≈") && !withTargetHtml.includes("加后 A UNKNOWN"),
-  estimateWarn: withTargetHtml.includes("46.4%"),
+  priceUnlocked: withTargetHtml.includes('id="lp-augment-price"')
+    && !/id="lp-augment-price"[^>]*readonly/.test(withTargetHtml)
+    && withTargetHtml.includes('value="0.42"'),
+  levelHint: withTargetHtml.includes("价位须为本组还没有在挂的价格")
+    && withTargetHtml.includes("同价补量请先撤该价位再追加"),
 }));
 ''')
     rendered = json.loads(output)
@@ -23420,8 +23567,8 @@ console.log(JSON.stringify({
     assert rendered["keysDiffer"] is True
     assert rendered["noTargetFive"]["disabled"] is True
     assert rendered["noTargetFive"]["unknownLabel"] is True
-    assert rendered["estimateLocal"] is True
-    assert rendered["estimateWarn"] is True
+    assert rendered["priceUnlocked"] is True
+    assert rendered["levelHint"] is True
 
 
 def test_lp166_dashboard_renders_one_card_per_group_newest_first() -> None:

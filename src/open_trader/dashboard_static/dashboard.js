@@ -3678,6 +3678,18 @@ function lpQueueProtectionSourceChip(row) {
     + (anchored ? "登记" : "手动") + "</span>";
 }
 
+// Issue 167: per-price protection buckets (v2 view); legacy scalars and
+// first-seen episodes render as the single fallback bucket.
+function lpQueueProtectionBuckets(summary) {
+  if (!summary || typeof summary !== "object") return [];
+  if (summary.levels && typeof summary.levels === "object") {
+    return Object.values(summary.levels).filter(
+      (bucket) => bucket && typeof bucket === "object",
+    );
+  }
+  return [summary];
+}
+
 function lpDashboardTodayQueueSummary(orders) {
   for (const row of orders) {
     if (row && typeof row === "object"
@@ -3708,10 +3720,30 @@ function lpQueueProtectionBlockReason(summary) {
   return codes[0] ? String(codes[0]) : "撤单未成功";
 }
 
+// Issue 167: one protection subrow per price bucket; each row leads with
+// its price chip (.qp-price). Legacy scalar payloads (and first-seen
+// episodes) render as the single fallback bucket with no merged scalars.
 function lpDashboardTodayQueueProtectionRow(orders) {
   const summary = lpDashboardTodayQueueSummary(orders);
-  const buys = orders.filter((row) => String(row.side || "").toUpperCase() === "BUY");
   if (summary && typeof summary === "object") {
+    const buckets = lpQueueProtectionBuckets(summary);
+    if (buckets.length) {
+      return buckets
+        .map((bucket) => lpQueueProtectionBucketRow(orders, bucket))
+        .join("");
+    }
+  }
+  const buys = orders.filter((row) => String(row.side || "").toUpperCase() === "BUY");
+  const sellOnly = orders.length > 0 && buys.length === 0;
+  const text = sellOnly ? "不适用（卖出）" : LP_QUEUE_PROTECTION_UNANCHORED_TEXT;
+  return "<div class=\"lp-queue-protection qp-none\">" + escapeHtml(text) + "</div>";
+}
+
+function lpQueueProtectionBucketRow(orders, summary) {
+  const priceText = summary.level_price ?? summary.baseline_price;
+  const priceChip = "<span class=\"qp-price\">"
+    + escapeHtml(String(priceText ?? "UNKNOWN")) + "</span>";
+  const buys = orders.filter((row) => String(row.side || "").toUpperCase() === "BUY");
     const samePrice = lpQueueSamePriceBuyRows(orders, summary);
     const targetCount = samePrice.length;
     const remaining = samePrice.reduce((sum, row) => {
@@ -3744,7 +3776,19 @@ function lpDashboardTodayQueueProtectionRow(orders) {
       ? "A UNKNOWN"
       : "A " + escapeHtml(ratioText) + "%";
     let data = "";
-    if (state === "monitoring") {
+    // Issue 167: buckets collected by a group sweep (any-level fill) or the
+    // review deadline render their own copy instead of a trigger ratio.
+    const sweepReason = String(summary.cancel_reason || "");
+    if (state === "canceling" && sweepReason === "group_fill_collect") {
+      data = "随组收单（组内已成交）· 撤单请求已发，等待回执 · " + escapeHtml(clock);
+    } else if (state === "canceled" && sweepReason === "group_fill_collect") {
+      const remainValue = remainingUnknown
+        ? "UNKNOWN"
+        : (hasPersistedRemaining ? persistedRemaining : remaining);
+      data = "随组收单（组内已成交）· 合计余量 "
+        + escapeHtml(formatDisplayNumber(String(remainValue))) + " 份 · "
+        + escapeHtml(clock);
+    } else if (state === "monitoring") {
       data = "<abbr title=\"" + escapeHtml(LP_QUEUE_PROTECTION_ABBR_TITLE)
         + "\">前方≈" + escapeHtml(formatDisplayNumber(String(summary.front_estimate ?? "UNKNOWN")))
         + "</abbr> / 同价位 " + escapeHtml(formatDisplayNumber(String(summary.level_total ?? "UNKNOWN")))
@@ -3795,13 +3839,10 @@ function lpDashboardTodayQueueProtectionRow(orders) {
       ? lpQueueProtectionFirstSeenBadge()
       : "";
     return "<div class=\"lp-queue-protection\">"
+      + priceChip
       + lpQueueProtectionPill(state)
       + firstSeenBadge
       + "<span class=\"qp-data num" + (triggered ? " qp-triggered" : "") + "\">" + data + "</span></div>";
-  }
-  const sellOnly = orders.length > 0 && buys.length === 0;
-  const text = sellOnly ? "不适用（卖出）" : LP_QUEUE_PROTECTION_UNANCHORED_TEXT;
-  return "<div class=\"lp-queue-protection qp-none\">" + escapeHtml(text) + "</div>";
 }
 
 // Issue 158: the augment button renders only on the market row that owns the
@@ -3817,12 +3858,13 @@ function lpDashboardAugmentButtonMarkup(orders, session) {
   if (!conditionId || String(session.condition_id || "") !== conditionId) return "";
   // Issue 165: the button names its owning session explicitly so clicks
   // can be gated against the served lp_session.
+  // Issue 167: the button renames to「追加」and unlocks the price level.
   return "<button class=\"pm-button lp-augment\" type=\"button\""
     + " data-action=\"lp-augment-entry\" data-condition-id=\"" + escapeHtml(conditionId) + "\""
     + " data-session-id=\"" + escapeHtml(String(session.session_id || "")) + "\""
-    + " title=\"在会话保护伞内追加一张同价 post-only BUY\""
+    + " title=\"追加一张 post-only BUY：价位须为本组还没有在挂的价格（不高于当前买一）；同价补量请先撤该价位再追加\""
     + ((!state.predictionMarket.csrfToken || lpSubmitCooldownActive()) ? " disabled" : "")
-    + ">加量</button>";
+    + ">追加</button>";
 }
 
 function lpDashboardTodayQuantityCell(orders, session) {
@@ -4404,6 +4446,41 @@ function predictionLpCard(payload) {
     + candidateSection
     + sessionDetails + "</section>";
 }
+// Issue 167: per-level detail block on the session card (price / quantity /
+// remaining / protection pill / A estimate) — one row per bucket.
+function lpSessionLevelsBlock(source) {
+  const buckets = lpQueueProtectionBuckets(source?.queue_protection);
+  if (!buckets.length) return "";
+  const history = source?.order_history && typeof source.order_history === "object"
+    ? source.order_history : {};
+  const rows = buckets.map((bucket) => {
+    const price = String(bucket.baseline_price ?? bucket.level_price ?? "UNKNOWN");
+    const orderId = String(bucket.order_id || "");
+    const record = history[orderId] && typeof history[orderId] === "object"
+      ? history[orderId] : {};
+    const quantity = Number(record.quantity);
+    const matched = Number(record.size_matched);
+    const quantityText = Number.isFinite(quantity) && quantity > 0
+      ? formatDisplayNumber(String(quantity)) : "UNKNOWN";
+    const remainingText = Number.isFinite(quantity) && Number.isFinite(matched)
+      ? formatDisplayNumber(String(quantity - matched)) : "UNKNOWN";
+    const pill = lpQueueProtectionPill(String(bucket.state || "unknown"));
+    const ratioText = lpQueueProtectionPercent(bucket.ratio);
+    let estimate = "";
+    if (ratioText !== "UNKNOWN") {
+      estimate = "<span class=\"sub\">前方≈"
+        + escapeHtml(formatDisplayNumber(String(bucket.front_estimate ?? "UNKNOWN")))
+        + " / 同价位 "
+        + escapeHtml(formatDisplayNumber(String(bucket.level_total ?? "UNKNOWN")))
+        + " · A " + escapeHtml(ratioText) + "%</span>";
+    }
+    return "<div class=\"lp-level-row\"><span class=\"lp-level-price\">" + escapeHtml(price)
+      + "</span><span>" + escapeHtml(quantityText) + " 份 · 剩余 " + escapeHtml(remainingText)
+      + "</span>" + pill + estimate + "</div>";
+  }).join("");
+  return "<div class=\"lp-levels\" aria-label=\"价位明细\">" + rows + "</div>";
+}
+
 function predictionLpSessionCard(payload) {
   const source = payload?.lp_session && typeof payload.lp_session === "object"
     ? payload.lp_session
@@ -4504,7 +4581,7 @@ function predictionLpSessionCard(payload) {
   const exitStatus = source.stop_loss_latched === true
     ? `止损已锁定 · ${protectedOrder}`
     : `${stage} · ${passiveOrder}`;
-  return `<section class="pm-panel pm-lp-card" aria-label="LP 会话"><header class="pm-panel-heading"><div><h2>${escapeHtml(String(market))} · ${escapeHtml(String(outcome))}</h2><p>单市场 LP · ${escapeHtml(stage)}</p></div><span class="pm-pill ${predictionTone(stage)}">${escapeHtml(stage)}</span></header><div class="pm-relation-summary"><span>入场角色 <strong>BUY · post-only GTD</strong></span><span>订单 ${escapeHtml(entryOrder)}</span><span class="${scoringTone}">计分 <strong>${escapeHtml(scoring)}</strong></span><span>${scoringTime}</span></div><div class="pm-metrics pm-lp-metrics"><article class="pm-metric"><span>已买</span><strong>${escapeHtml(predictionValue(source.buy_filled_quantity, "UNKNOWN"))}</strong><small>目标 ${escapeHtml(predictionValue(source.quantity, "UNKNOWN"))} 份</small></article><article class="pm-metric"><span>已卖</span><strong>${escapeHtml(predictionValue(source.sold_quantity, "UNKNOWN"))}</strong><small>成交回款 ${escapeHtml(predictionMoney(source.sold_revenue, "UNKNOWN"))}</small></article><article class="pm-metric"><span>剩余</span><strong>${escapeHtml(predictionValue(source.residual_quantity, "UNKNOWN"))}</strong><small>按账户持仓核对</small></article><article class="pm-metric"><span>退出状态</span><strong>${escapeHtml(exitStatus)}</strong><small>开仓盈亏 ${escapeHtml(loss)}</small></article></div><div class="pm-relation-summary"><span>已实现交易 P&amp;L <strong>${escapeHtml(tradePnl)}</strong></span><span>总净额 <strong>${escapeHtml(total)}</strong></span><span>复盘时间 <strong>${escapeHtml(source.review_at ? predictionHktTimestamp(source.review_at) : "UNKNOWN")}</strong></span></div>${rewardRow}</section>`;
+  return `<section class="pm-panel pm-lp-card" aria-label="LP 会话"><header class="pm-panel-heading"><div><h2>${escapeHtml(String(market))} · ${escapeHtml(String(outcome))}</h2><p>单市场 LP · ${escapeHtml(stage)}</p></div><span class="pm-pill ${predictionTone(stage)}">${escapeHtml(stage)}</span></header><div class="pm-relation-summary"><span>入场角色 <strong>BUY · post-only GTD</strong></span><span>订单 ${escapeHtml(entryOrder)}</span><span class="${scoringTone}">计分 <strong>${escapeHtml(scoring)}</strong></span><span>${scoringTime}</span></div><div class="pm-metrics pm-lp-metrics"><article class="pm-metric"><span>已买</span><strong>${escapeHtml(predictionValue(source.buy_filled_quantity, "UNKNOWN"))}</strong><small>目标 ${escapeHtml(predictionValue(source.quantity, "UNKNOWN"))} 份</small></article><article class="pm-metric"><span>已卖</span><strong>${escapeHtml(predictionValue(source.sold_quantity, "UNKNOWN"))}</strong><small>成交回款 ${escapeHtml(predictionMoney(source.sold_revenue, "UNKNOWN"))}</small></article><article class="pm-metric"><span>剩余</span><strong>${escapeHtml(predictionValue(source.residual_quantity, "UNKNOWN"))}</strong><small>按账户持仓核对</small></article><article class="pm-metric"><span>退出状态</span><strong>${escapeHtml(exitStatus)}</strong><small>开仓盈亏 ${escapeHtml(loss)}</small></article></div>${lpSessionLevelsBlock(source)}<div class="pm-relation-summary"><span>已实现交易 P&amp;L <strong>${escapeHtml(tradePnl)}</strong></span><span>总净额 <strong>${escapeHtml(total)}</strong></span><span>复盘时间 <strong>${escapeHtml(source.review_at ? predictionHktTimestamp(source.review_at) : "UNKNOWN")}</strong></span></div>${rewardRow}</section>`;
 }
 
 function predictionAnnualizedPercent(value, digits = 1) {
@@ -6269,12 +6346,6 @@ const PREDICTION_MODAL_ACTION_KINDS = {
   "reset": "reset",
 };
 
-function lpRatioPercent(ratio) {
-  const value = Number(ratio);
-  if (!Number.isFinite(value)) return "UNKNOWN";
-  return String(Number((value * 100).toFixed(1)));
-}
-
 function lpShortSessionId(value) {
   const text = String(value || "").trim();
   return text ? text.slice(0, 6) : "-";
@@ -6306,6 +6377,9 @@ function lpSubmitStateMessage(result) {
     if (reason === "session_stop_loss_exit") return "目标会话已触发止损退出，不能再加量。";
     if (reason === "session_needs_attention") return "目标会话待人工核对，不能再加量。";
     if (reason === "quantity_invalid") return "数量不是有效正数。";
+    if (reason === "price_invalid") return "价格不是有效正数。";
+    if (reason === "price_level_active") return "该价位已有挂单，请先撤该价位再追加。";
+    if (reason === "price_above_best_bid") return "价格不能高于当前买一。";
     return reason ? `未下单：${reason}` : "未下单。";
   }
   if (resultState === "entry_rejected") {
@@ -6351,8 +6425,8 @@ function lpSubmitToastResult(key, result, role) {
     if (role === "augment") {
       lpSubmitToastUpdate(key, {
         kind: "success",
-        main: `已加量 · 订单 ${orderId || "UNKNOWN"} 并入会话 ${sessionShort} 保护伞`,
-        sub: "#152 位置保护基线已重锚 · 复核截止沿用首单 · 看板稍后刷新",
+        main: `已追加 · 订单 ${orderId || "UNKNOWN"} 并入会话 ${sessionShort}`,
+        sub: "新增价位独立位置保护 · 复核截止沿用首单 · 看板稍后刷新",
       });
     } else {
       lpSubmitToastUpdate(key, {
@@ -6494,26 +6568,6 @@ function lpOrderCaseLine(mode, currentMode, label, disabled) {
     + ` data-modal-action="lp-order-case" data-case-mode="${mode}"> ${label}</label>`;
 }
 
-function lpAugmentEstimateMarkup(data, quantity) {
-  const front = Number(data?.front);
-  const own = Number(data?.own);
-  const qty = Number(quantity);
-  if (!Number.isFinite(front) || !Number.isFinite(own) || !Number.isFinite(qty) || front < 0 || own < 0) {
-    return `<div class="pm-check"><span>合并预估</span><strong>前方 UNKNOWN · 现有 UNKNOWN · 新增 ${escapeHtml(String(quantity || ""))} → 加后 A UNKNOWN（触发线 50%）</strong></div>`;
-  }
-  const denom = front + own + qty;
-  const ratio = denom > 0 ? front / denom : 0;
-  const pct = lpRatioPercent(ratio);
-  const head = `<div class="pm-check"><span>合并预估</span><strong>前方 ${escapeHtml(formatDisplayNumber(String(front)))}`
-    + ` · 现有 ${escapeHtml(formatDisplayNumber(String(own)))}`
-    + ` · 新增 ${escapeHtml(String(quantity || ""))}`
-    + ` → 加后 A ≈ <strong>${escapeHtml(pct)}%</strong>（触发线 50%）</strong></div>`;
-  if (ratio <= 0.5) {
-    return head + `<div class="pm-alert warning" role="alert"><p>加后 A ${pct}% ≤ 触发线 50%：提交后首个监控 tick 将撤掉该价位全部自己 BUY（含既有试挂单）。</p></div>`;
-  }
-  return head + `<div class="pm-check"><span>触发判断</span><strong>未触发，继续合并监控（保护副行自动覆盖两张单）。</strong></div>`;
-}
-
 // Issue 162（定案 5/7）：预计占用是弹窗内唯一计算值——$ + (price*qty).toFixed(2)；
 // 数量/价格一律原样字符串，空缺或非数值显示 "-"。
 function lpOrderCostText(price, quantity) {
@@ -6555,15 +6609,21 @@ function lpOrderModalHtml(data = {}) {
   return `<section class="pm-modal" role="dialog" aria-modal="true" aria-labelledby="pm-dialog-title" tabindex="-1">${header}${body}${footer}</section>`;
 }
 
+// Issue 167 D1: the augment modal unlocks the price level (default = the
+// group price); the retired same-price merged estimate makes way for the
+// level rules hint.
+const LP_AUGMENT_PRICE_HINT =
+  "价位须为本组还没有在挂的价格（不高于当前买一）；同价补量请先撤该价位再追加。每个价位至多一张在挂单，各自独立位置保护。";
+
 function lpAugmentModalHtml(data = {}) {
-  // Issue 163 定案：加量同样单相化——删预检/复核相，确认即一次提交。
+  // Issue 163 定案：追加同样单相化——删预检/复核相，确认即一次提交。
   const session = data.session && typeof data.session === "object" ? data.session : {};
   const sessionPrice = String(session.price ?? "");
   const mode = ["five", "custom"].includes(data.mode) ? data.mode : (data.fiveQuantity ? "five" : "custom");
   const title = escapeHtml(session.market_title || "标的未返回");
-  const header = `<header class="pm-modal-header"><h2 id="pm-dialog-title">加量 · 会话入场价锁定</h2><p>一次确认即提交：在现有会话保护伞内追加一张 post-only BUY；A 按合并口径计算，触发时该价位全部自己 BUY 一并撤。</p></header>`
+  const header = `<header class="pm-modal-header"><h2 id="pm-dialog-title">追加 · 解锁价位</h2><p>一次确认即提交：在现有组内追加一张 post-only BUY；每个价位至多一张在挂单，各自独立位置保护。</p></header>`
     + `<div class="pm-order-market"><span>Polymarket · 同所 · 会话 ${escapeHtml(lpShortSessionId(session.session_id))}</span><strong>${title}</strong></div>`;
-  const existingText = `试挂单 ${escapeHtml(predictionValue(session.quantity, "UNKNOWN"))} 份 @ ${escapeHtml(String(session.price ?? ""))}（入场价，锁定）`;
+  const existingText = `试挂单 ${escapeHtml(predictionValue(session.quantity, "UNKNOWN"))} 份 @ ${escapeHtml(sessionPrice)}（首单价）`;
   const fiveLabel = data.fiveQuantity
     ? `加 5% 单 · ${escapeHtml(sessionPrice)} × ${escapeHtml(data.fiveQuantity)} 份`
     : "加 5% 单 · 目标量 UNKNOWN";
@@ -6571,13 +6631,14 @@ function lpAugmentModalHtml(data = {}) {
     + `<input type="radio" name="lp-augment-case" value="${value}"${mode === value ? " checked" : ""}${disabled ? " disabled" : ""}`
     + ` data-modal-action="lp-augment-case" data-case-mode="${value}"> ${label}</label>`;
   const cases = caseLine("five", fiveLabel, !data.fiveQuantity)
-    + caseLine("custom", `自定义数量 <input class="lp-order-input" id="lp-augment-quantity" type="number" step="1" min="1" value="${escapeHtml(String(data.quantity || ""))}"> 份 @ ${escapeHtml(sessionPrice)}`, false);
+    + caseLine("custom", `自定义数量 <input class="lp-order-input" id="lp-augment-quantity" type="number" step="1" min="1" value="${escapeHtml(String(data.quantity || ""))}"> 份`, false);
   const body = `<div class="pm-check-list">`
     + `<div class="pm-check"><span>现有委托</span><strong>${existingText}</strong></div>`
+    + `<div class="pm-check"><span>追加价位 USDC</span><span><input class="lp-order-input" id="lp-augment-price" type="number" step="0.01" min="0.01" max="0.99" value="${escapeHtml(String(data.price ?? sessionPrice))}"> <span class="sub">默认组价，可改</span></span></div>`
     + `<div class="pm-check"><span>加量方式</span><span style="display:block">${cases}</span></div>`
     + `</div>`
-    + `<div id="lp-augment-estimate">${lpAugmentEstimateMarkup(data, data.quantity)}</div>`
-    + `<p class="sub">服务端按提交时最新事实校验（会话仍活动、盘口新鲜）；成功后新单并入保护伞、复核截止沿用首单。</p>`;
+    + `<p class="sub">${escapeHtml(LP_AUGMENT_PRICE_HINT)}</p>`
+    + `<p class="sub">服务端按提交时最新事实校验（会话仍活动、盘口新鲜、价位不高于当前买一）；成功后新价位独立建档保护、复核截止沿用首单。</p>`;
   const footer = `<footer class="pm-modal-actions"><button class="pm-button" type="button" data-modal-action="cancel">取消</button>`
     + `<button class="pm-button primary" type="button" data-modal-action="lp-augment-confirm">确认提交</button></footer>`;
   return `<section class="pm-modal" role="dialog" aria-modal="true" aria-labelledby="pm-dialog-title" tabindex="-1">${header}${body}${footer}</section>`;
@@ -6607,11 +6668,7 @@ function lpOrderIntent(row) {
 }
 
 function lpAugmentIntent(orders, session) {
-  const summary = lpDashboardTodayQueueSummary(orders);
-  const front = Number(summary?.front_estimate);
-  const levelTotal = Number(summary?.level_total);
-  const own = Number.isFinite(front) && Number.isFinite(levelTotal)
-    ? Number((levelTotal - front).toFixed(6)) : null;
+  // Issue 167: price is unlocked — the group price only pre-fills the input.
   const conditionId = String(session?.condition_id || "");
   // Issue 158: the candidate funnel marks the session's market
   // known_participation and excludes it from the pool, so the 加 5% default
@@ -6641,8 +6698,7 @@ function lpAugmentIntent(orders, session) {
       quantity: String(session?.quantity ?? ""),
       market_title: lpMarketTitle(session || {}),
     },
-    front: Number.isFinite(front) ? front : null,
-    own,
+    price: String(session?.price ?? ""),
     fiveQuantity,
     mode: fiveQuantity ? "five" : "custom",
     quantity: fiveQuantity || "",
@@ -6838,10 +6894,6 @@ function handlePredictionModalInput(event) {
         root.querySelector("#lp-order-quantity")?.value,
       );
     }
-  }
-  if (predictionModal.kind === "lp_augment" && target?.id === "lp-augment-quantity") {
-    const node = root.querySelector("#lp-augment-estimate");
-    if (node) node.innerHTML = lpAugmentEstimateMarkup(predictionModal.data, target.value);
   }
 }
 
@@ -7391,7 +7443,9 @@ async function handlePredictionModalClick(event) {
     const root = elements["prediction-market-modal-root"];
     if (augment) {
       const qtyInput = root.querySelector("#lp-augment-quantity");
+      const priceInput = root.querySelector("#lp-augment-price");
       if (qtyInput) data.quantity = qtyInput.value;
+      if (priceInput) data.price = priceInput.value;
     } else {
       const priceInput = root.querySelector("#lp-order-price");
       const qtyInput = root.querySelector("#lp-order-quantity");
@@ -7405,6 +7459,7 @@ async function handlePredictionModalClick(event) {
     const quantityNumber = Number(quantityText);
     const formatBad = augment
       ? !quantityText || !Number.isFinite(quantityNumber) || quantityNumber <= 0
+        || (priceText && (!Number.isFinite(priceNumber) || priceNumber <= 0))
       : !priceText || !quantityText
         || !Number.isFinite(priceNumber) || !Number.isFinite(quantityNumber);
     if (formatBad) {
@@ -7428,7 +7483,9 @@ async function handlePredictionModalClick(event) {
         quantity: quantityText,
         idempotency_key: key,
       };
-      submittingMain = `正在提交 · 加量 ${quantityText} 份 @ ${String(data.session?.price ?? "")}`;
+      // Issue 167 D1：可选价位——默认组价，可改；空值沿用服务端组价缺省。
+      if (priceText) body.price = priceText;
+      submittingMain = `正在提交 · 追加 ${quantityText} 份 @ ${priceText || String(data.session?.price ?? "")}`;
     } else {
       const row = data.row && typeof data.row === "object" ? data.row : {};
       path = "/api/prediction-arbitrage/lp/orders";
@@ -7466,7 +7523,7 @@ async function handlePredictionModalClick(event) {
       if (registered) {
         const sessionShort = lpShortSessionId(result?.session_id);
         state.predictionMarket.lpCancelSummary = augment
-          ? `已加量 · ${quantityText} 份 @ ${String(data.session?.price ?? "")} · 并入会话 ${sessionShort} 保护伞`
+          ? `已追加 · ${quantityText} 份 @ ${String(data.price ?? data.session?.price ?? "")} · 并入会话 ${sessionShort}`
           : `已登记 · 会话 ${sessionShort} · 位置保护已生效`;
         await fetchPredictionLpDashboard();
       }

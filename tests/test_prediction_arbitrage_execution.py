@@ -7669,6 +7669,120 @@ def test_dashboard_today_rows_carry_owning_session_and_flags(
     assert "queue_protection" not in manual
 
 
+def test_lp167_dashboard_rows_carry_per_level_protection(tmp_path: Path) -> None:
+    """issue 167：分桶摘要落组视图与 today 行——行级 queue_protection 带 levels
+    与该行桶价 level_price；老标量载荷归一为单桶投影。"""
+
+    store = PredictionArbitrageStore(tmp_path / "data")
+    trading = _CancelTrading(
+        [
+            {**_cancel_open_order("entry-1", "0xc1"), "token_id": "yes-token"},
+            {**_cancel_open_order("aug-1", "0xc1"), "token_id": "yes-token"},
+            {**_cancel_open_order("legacy-1", "0xc9"), "token_id": "legacy-token"},
+        ]
+    )
+    service = PredictionExecutionService(
+        store=store,
+        monitor=object(),
+        trading=trading,
+        notifier=ChannelNotifier("feishu"),
+        lock_path=tmp_path / "lp167.lock",
+    )
+    store.lp_create_session(
+        "lp167-proj-session",
+        "lp167-proj-key",
+        state="entry_open",
+        payload={
+            "condition_id": "0xc1",
+            "token_id": "yes-token",
+            "market_id": "market-1",
+            "outcome": "YES",
+            "question": "Will it happen?",
+            "entry_order_id": "entry-1",
+            "augment_order_ids": ["aug-1"],
+            "owned_order_ids": ["entry-1", "aug-1"],
+            "queue_protection": {
+                "version": 2,
+                "data_failures": 0,
+                "levels": {
+                    "0.40": {
+                        "order_id": "aug-1",
+                        "baseline_price": "0.40",
+                        "baseline_front": "224",
+                        "threshold": "0.5",
+                        "state": "monitoring",
+                        "notification_sent": False,
+                        "cancel_scope": "own_buys_at_level",
+                        "ratio": "0.7",
+                        "reason_codes": [],
+                    },
+                    "0.42": {
+                        "order_id": "entry-1",
+                        "baseline_price": "0.42",
+                        "baseline_front": "150",
+                        "threshold": "0.5",
+                        "state": "canceling",
+                        "notification_sent": True,
+                        "cancel_scope": "own_buys_at_level",
+                        "ratio": "0.46",
+                        "cancel_reason": "queue_ahead_ratio",
+                        "cancel_targets": ["entry-1"],
+                        "reason_codes": [],
+                    },
+                },
+            },
+        },
+    )
+    service._lp = PolymarketLPService(store, object())
+
+    payload = service.refresh_lp_dashboard_snapshot()
+    rows = {row["order_id"]: row for row in payload["lp_orders_today"]}
+    protection_entry = rows["entry-1"]["queue_protection"]
+    protection_aug = rows["aug-1"]["queue_protection"]
+    assert protection_entry["level_price"] == "0.42"
+    assert protection_aug["level_price"] == "0.40"
+    assert set(protection_entry["levels"]) == {"0.40", "0.42"}
+    assert protection_entry["version"] == 2
+    # 多桶视图不带合并标量键（避免桶间歧义）。
+    assert "state" not in protection_entry
+    # 组视图同样透出分桶结构。
+    view = payload["lp_sessions"][0]
+    assert set(view["queue_protection"]["levels"]) == {"0.40", "0.42"}
+
+    # 老标量载荷归一为单桶投影（对外形状等价 + levels 键）。
+    store.lp_create_session(
+        "lp167-legacy-session",
+        "lp167-legacy-key",
+        state="entry_open",
+        payload={
+            "condition_id": "0xc9",
+            "token_id": "legacy-token",
+            "market_id": "market-9",
+            "outcome": "YES",
+            "question": "Legacy?",
+            "entry_order_id": "legacy-1",
+            "queue_protection": {
+                "baseline_front": "10000",
+                "baseline_price": "0.50",
+                "threshold": "0.5",
+                "state": "monitoring",
+                "notification_sent": False,
+                "cancel_scope": "own_buys_at_level",
+                "ratio": "0.8",
+                "reason_codes": [],
+            },
+        },
+    )
+    payload = service.refresh_lp_dashboard_snapshot()
+    rows = {row["order_id"]: row for row in payload["lp_orders_today"]}
+    legacy = rows["legacy-1"]["queue_protection"]
+    assert legacy["version"] == 2
+    assert set(legacy["levels"]) == {"0.50"}
+    assert legacy["state"] == "monitoring"
+    assert legacy["baseline_price"] == "0.50"
+    assert Decimal(str(legacy["ratio"])) == Decimal("0.8")
+
+
 def test_dashboard_completed_latest_session_rows_keep_managed_marking_with_session_id(
     tmp_path: Path,
 ) -> None:

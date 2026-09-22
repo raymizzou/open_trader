@@ -6727,11 +6727,19 @@ button { cursor: pointer; }
   padding: 5px 8px;
 }
 .lp-queue-protection .status-pill { font-size: 11px; min-height: 20px; padding: 0 6px; }
+.lp-queue-protection + .lp-queue-protection { margin-top: 4px; }
 .lp-queue-protection .qp-data { color: var(--muted); min-width: 0; overflow-wrap: anywhere; }
 .lp-queue-protection .qp-data strong { color: var(--text); font-weight: 700; }
 .lp-queue-protection .qp-triggered strong { color: var(--danger); }
 .lp-queue-protection.qp-none { color: var(--muted); display: block; }
 .lp-queue-protection abbr { cursor: help; text-decoration: underline dotted var(--muted); }
+/* —— issue 167 新增样式：分价位保护副行的价位标签与会话卡价位明细块 —— */
+.lp-queue-protection .qp-price { background: #fff; border: 1px solid var(--line); border-radius: 6px; color: var(--text); display: inline-flex; flex: 0 0 auto; font-size: 11px; font-weight: 800; line-height: 1; padding: 4px 6px; white-space: nowrap; }
+.lp-levels { border: 1px solid var(--line); border-radius: 8px; display: grid; gap: 0; margin: 10px 0; }
+.lp-levels .lp-level-row { align-items: center; border-bottom: 1px solid var(--line); display: flex; flex-wrap: wrap; column-gap: 10px; row-gap: 4px; font-size: 12px; padding: 9px 12px; }
+.lp-levels .lp-level-row:last-child { border-bottom: 0; }
+.lp-levels .lp-level-row .status-pill { font-size: 11px; min-height: 20px; padding: 0 6px; }
+.lp-levels .lp-level-price { font-size: 14px; font-weight: 800; }
 .status-danger { background: #fbeae8; border-color: #e5b5b0; color: var(--danger); }
 .status-unknown { background: var(--surface-soft); border: 1px dashed var(--muted); color: var(--muted); }
 .pm-button.lp-cancel, .pm-button.lp-cancel-all { flex: 0 0 auto; font-size: 11px; min-height: 26px; padding: 2px 8px; }

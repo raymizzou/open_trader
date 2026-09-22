@@ -31,6 +31,7 @@ from open_trader.predict_cross_venue import (
     VenueMarket,
 )
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+from open_trader.polymarket_lp import PolymarketLPService
 from open_trader.prediction_arbitrage_execution import PredictionExecutionService
 
 
@@ -7628,6 +7629,70 @@ def test_lp_history_batches_are_bounded_and_persist_public_summaries(
             event.set()
         driver.join(timeout=8)
         assert not driver.is_alive()
+
+
+def test_lp167_runtime_lp_contract_carries_version_and_levels(tmp_path: Path) -> None:
+    """issue 167 runtime 契约：LP 会话状态与看板组视图透出 queue_protection 的
+    version=2 与 levels 分桶键（多桶视图无合并标量、单桶保留等价投影）。"""
+
+    store = PredictionArbitrageStore(tmp_path / "data")
+    store.lp_create_session(
+        "lp167-runtime-session",
+        "lp167-runtime-key",
+        state="entry_open",
+        payload={
+            "condition_id": "0xc1",
+            "token_id": "yes-token",
+            "market_id": "market-1",
+            "outcome": "YES",
+            "question": "Will it happen?",
+            "entry_order_id": "entry-1",
+            "augment_order_ids": ["aug-1"],
+            "queue_protection": {
+                "version": 2,
+                "data_failures": 0,
+                "levels": {
+                    "0.40": {
+                        "order_id": "aug-1",
+                        "baseline_price": "0.40",
+                        "baseline_front": "224",
+                        "threshold": "0.5",
+                        "state": "monitoring",
+                        "notification_sent": False,
+                        "cancel_scope": "own_buys_at_level",
+                        "reason_codes": [],
+                    },
+                    "0.42": {
+                        "order_id": "entry-1",
+                        "baseline_price": "0.42",
+                        "baseline_front": "150",
+                        "threshold": "0.5",
+                        "state": "registered",
+                        "notification_sent": False,
+                        "cancel_scope": "own_buys_at_level",
+                        "reason_codes": [],
+                    },
+                },
+            },
+        },
+    )
+    service = PredictionExecutionService(
+        store=store,
+        monitor=object(),
+        trading=object(),
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=PolymarketLPService(store, object()),
+    )
+
+    status = service.lp_status("lp167-runtime-session")
+    protection = status["queue_protection"]
+    assert protection["version"] == 2
+    assert set(protection["levels"]) == {"0.40", "0.42"}
+    # 多桶视图不带合并标量键（桶间歧义防护）。
+    assert "state" not in protection
+    assert protection["levels"]["0.42"]["state"] == "registered"
+    assert protection["levels"]["0.40"]["baseline_price"] == "0.40"
 
 
 def test_lp_dashboard_today_orders_fail_open_and_non_lp_count(tmp_path: Path) -> None:
