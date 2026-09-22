@@ -10252,6 +10252,143 @@ def test_lp163_submit_entry_busy_when_active_session(tmp_path) -> None:
     assert len(exchange.posts) == 1  # 仅既有入场单
 
 
+# ---- Issue 176: 提交路径必须在快照读取完成之后取校验时钟（读前取 now 致负年龄必拒） ----
+
+
+def test_lp176_submit_entry_freshness_survives_read_latency_a1(tmp_path) -> None:
+    """A1（#176）：交易所读到盘口后时间前进 3 秒、received_at=推进后时刻——
+    校验时年龄恰为 0，必须放行并恰挂一张单（旧实现读前取 now，年龄恒负必拒）。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    read_done = {"flag": False}
+
+    def clock():
+        # 快照读取完成前返回 T0；交易所读到盘口后时间前进 3 秒（模拟真实读取延迟）
+        return now + timedelta(seconds=3) if read_done["flag"] else now
+
+    exchange = _Exchange()
+    exchange.snapshot_value = _lp163_book(now + timedelta(seconds=3), Decimal("0.29"))
+    original_snapshot = exchange.lp_snapshot
+
+    def snapshot_with_read_latency(request: dict[str, object]) -> dict[str, object]:
+        response = original_snapshot(request)
+        read_done["flag"] = True
+        return response
+
+    exchange.lp_snapshot = snapshot_with_read_latency  # type: ignore[method-assign]
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=clock)
+    request = {
+        **_request(now),
+        "price": Decimal("0.29"),
+        "quantity": Decimal("20"),
+        "candidate_policy": "best_bid_minimum",
+        "estimated_target_quantity": "21",
+    }
+
+    result = service.submit_entry(request, "lp176-a1")
+
+    assert result["state"] == "entry_open"
+    assert len(exchange.posts) == 1
+
+
+def test_lp176_submit_augment_freshness_survives_read_latency_a2(tmp_path) -> None:
+    """A2（#176）：单发加量同款——每次快照读完成时间前进 3 秒、received_at=推进后
+    时刻，加量校验年龄恰为 0 必须放行并恰追加一张新 post（0.29 档已有本组挂单，
+    加量去空闲的 0.28 档）。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    reads = {"count": 0}
+
+    def clock():
+        # 每完成一次快照读，时间前进 3 秒（模拟每次真实读取延迟）
+        return now + timedelta(seconds=3 * reads["count"])
+
+    exchange = _Exchange()
+    original_snapshot = exchange.lp_snapshot
+
+    def snapshot_with_read_latency(request: dict[str, object]) -> dict[str, object]:
+        response = original_snapshot(request)
+        reads["count"] += 1
+        return response
+
+    exchange.lp_snapshot = snapshot_with_read_latency  # type: ignore[method-assign]
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=clock)
+
+    # 先经 submit_entry 建一个 entry_open 会话（received_at=首次读后时刻 T0+3s）。
+    exchange.snapshot_value = _lp163_book(now + timedelta(seconds=3), Decimal("0.29"))
+    entry = service.submit_entry(
+        {
+            **_request(now),
+            "price": Decimal("0.29"),
+            "quantity": Decimal("20"),
+            "candidate_policy": "best_bid_minimum",
+        },
+        "lp176-a2",
+    )
+    assert entry["state"] == "entry_open"
+    session_id = str(entry["session_id"])
+
+    # 加量快照：received_at=第二次读后时刻 T0+6s，含本组挂单回执与空闲 0.28 档。
+    augment_book = _lp163_book(now + timedelta(seconds=6), Decimal("0.29"))
+    augment_book["book"]["bids"].append(
+        {"price": Decimal("0.28"), "size": Decimal("100")}
+    )
+    augment_book["account"]["open_orders"] = [
+        _queue_receipt("order-1", price=Decimal("0.29"), original=Decimal("20"))
+    ]
+    exchange.snapshot_value = augment_book
+    before_calls = exchange.snapshot_calls
+
+    result = service.submit_augment(session_id, "20", "lp176-a2-aug", price="0.28")
+
+    assert result["state"] == "entry_open"
+    assert str(result["augment_order_id"]) == "order-2"
+    assert exchange.snapshot_calls - before_calls == 1
+    assert len(exchange.posts) == 2  # 恰一张新 post
+    posted = exchange.posts[1]
+    assert posted["side"] == "BUY"
+    assert posted["post_only"] is True
+    assert Decimal(str(posted["price"])) == Decimal("0.28")
+    assert Decimal(str(posted["quantity"])) == Decimal("20")
+    assert store.lp_session(session_id)["augment_order_ids"] == ["order-2"]
+
+
+def test_lp176_submit_entry_stale_book_still_rejects_a3(tmp_path) -> None:
+    """A3（#176）：上界守护——读后时钟前进 70 秒、received_at=推进后 3 秒，年龄
+    67 > 60 上限必须仍拒 book_freshness_stale 且零挂单（修复≠删检查）。"""
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    read_done = {"flag": False}
+
+    def clock():
+        # 快照读取完成前返回 T0；读到盘口后时间前进 70 秒（远超 60 秒新鲜度上限）
+        return now + timedelta(seconds=70) if read_done["flag"] else now
+
+    exchange = _Exchange()
+    exchange.snapshot_value = _lp163_book(now + timedelta(seconds=3), Decimal("0.29"))
+    original_snapshot = exchange.lp_snapshot
+
+    def snapshot_with_read_latency(request: dict[str, object]) -> dict[str, object]:
+        response = original_snapshot(request)
+        read_done["flag"] = True
+        return response
+
+    exchange.lp_snapshot = snapshot_with_read_latency  # type: ignore[method-assign]
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=clock)
+    request = {
+        **_request(now),
+        "price": Decimal("0.29"),
+        "quantity": Decimal("20"),
+        "candidate_policy": "best_bid_minimum",
+    }
+
+    result = service.submit_entry(request, "lp176-a3")
+
+    assert result["state"] == "rejected"
+    assert result["reason"] == "book_freshness_stale"
+    assert len(exchange.posts) == 0
+
+
 def _lp166_market_identity(index: int) -> dict[str, object]:
     """Issue 166: a distinct market identity (condition/token/market)."""
 

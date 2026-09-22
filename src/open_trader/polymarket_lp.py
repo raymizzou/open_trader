@@ -6807,12 +6807,15 @@ class PolymarketLPService:
         if session.get("review_at") is None:
             return {"state": "rejected", "reason": "review_at_unknown"}
         try:
-            now = self._now()
             augment_request = self._normalize_request(
                 {**identity, "price": price, "quantity": quantity,
                  "review_at": session.get("review_at")}
             )
             snapshot = self._read_snapshot(augment_request)
+            # Issue 176: the validation clock is taken after the snapshot read
+            # completes; received_at is stamped at read time, so a pre-read
+            # clock yields a negative age and a deterministic stale rejection.
+            now = self._now()
             price_rejection = self._augment_price_rejection(session, snapshot, price)
             if price_rejection is not None:
                 return {"state": "rejected", "reason": price_rejection}
@@ -6913,8 +6916,11 @@ class PolymarketLPService:
                 if str(preview.get("session_id") or "") != session_id_str:
                     raise ValueError("preview_session_mismatch")
                 request = self._normalize_request(preview)
-                now = self._now()
                 snapshot = self._read_snapshot(request)
+                # Issue 176: validation clock taken after the read completes
+                # (received_at stamps at read time — a pre-read clock goes
+                # deterministically stale).
+                now = self._now()
                 # Issue 167: shared augment price gate on the fresh snapshot
                 # (level-active first, then the best-bid ceiling).
                 price_rejection = self._augment_price_rejection(
@@ -7258,12 +7264,15 @@ class PolymarketLPService:
             if session.get("review_at") is None:
                 return {"state": "rejected", "reason": "review_at_unknown"}
             try:
-                now = self._now()
                 request = self._normalize_request(
                     {**identity, "price": price_d, "quantity": quantity_d,
                      "review_at": session.get("review_at")}
                 )
                 snapshot = self._read_snapshot(request)
+                # Issue 176: validation clock taken after the read completes
+                # (received_at stamps at read time — a pre-read clock goes
+                # deterministically stale).
+                now = self._now()
                 price_rejection = self._augment_price_rejection(
                     session, snapshot, price_d
                 )
@@ -7632,14 +7641,16 @@ class PolymarketLPService:
                 if self._now() >= expires_at:
                     raise ValueError("preview_expired")
                 request = self._normalize_request(preview)
-                now = self._now()
+                read_started = self._now()
                 snapshot = (
-                    self._read_candidate_snapshot(request, now=now)
+                    self._read_candidate_snapshot(request, now=read_started)
                     if request.get("candidate_policy") == "best_bid_minimum"
                     else self._read_snapshot(request)
                 )
-                if request.get("candidate_policy") == "best_bid_minimum":
-                    now = self._now()
+                # Issue 176: the validation clock is taken unconditionally
+                # after the snapshot read completes (received_at stamps at
+                # read time — a pre-read clock goes deterministically stale).
+                now = self._now()
                 if request.get("candidate_policy") == "best_bid_minimum":
                     eligible = self._fresh_candidate_row(request, snapshot, now=now)
                     if (
@@ -7976,8 +7987,11 @@ class PolymarketLPService:
                     "session_id": conflict.get("session_id"),
                 }
             try:
-                now = self._now()
                 snapshot = self._read_snapshot(normalized)
+                # Issue 176: validation clock taken after the read completes
+                # (received_at stamps at read time — a pre-read clock goes
+                # deterministically stale).
+                now = self._now()
                 facts = self._validate_snapshot(
                     normalized, snapshot, now=now,
                     reservations=self._candidate_reservations(),
