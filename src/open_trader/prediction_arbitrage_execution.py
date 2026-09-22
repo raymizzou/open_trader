@@ -79,6 +79,11 @@ LP_REWARD_SHARE_STALE_SECONDS = 30.0
 LP_SHARE_WATCH_DURATION_SECONDS = 60.0
 LP_REWARD_REFERENCE_PERCENTAGE = Decimal("5")
 LP_REWARD_SHARE_TARGET_MAX = Decimal("8")
+# Issue 178: lp_submit_entry / lp_submit_augment wait up to this long for the
+# shared execution lock (lp_tick holds it ~most of every second) before giving
+# up with the existing {"state": "busy", "reason": "execution_lock"} body;
+# every other lock site keeps the default zero-wait single attempt.
+_LP_SUBMIT_LOCK_WAIT_SECONDS = 3.0
 _LP_REWARD_CACHE_SECONDS = 60.0
 _LP_TRADES_CACHE_SECONDS = 60.0
 # Issue 159: two adjacent successful account observations diff into
@@ -4225,7 +4230,10 @@ class PredictionExecutionService:
                 "reason": "active_execution",
                 "execution_id": active.get("execution_id"),
             }
-        lock = self._acquire_global_lock()
+        # Issue 178: bounded wait for the shared lock (lp_tick holds it most
+        # of every second); the cheap rejections above must stay ahead of it.
+        wait_started = time.monotonic()
+        lock = self._acquire_global_lock(wait_seconds=_LP_SUBMIT_LOCK_WAIT_SECONDS)
         if lock is None:
             conflict = self._lp_market_conflict(
                 payload.get("condition_id"), payload.get("outcome")
@@ -4236,6 +4244,10 @@ class PredictionExecutionService:
                     "reason": "lp_session_market_active",
                     "session_id": conflict.get("session_id"),
                 }
+            logger.warning(
+                "lp_submit_entry: execution lock still busy after %.2fs wait",
+                time.monotonic() - wait_started,
+            )
             return {"state": "busy", "reason": "execution_lock"}
         try:
             existing = self._store.lp_session_by_idempotency(key)
@@ -4288,8 +4300,15 @@ class PredictionExecutionService:
                 "reason": "active_execution",
                 "execution_id": active.get("execution_id"),
             }
-        lock = self._acquire_global_lock()
+        # Issue 178: bounded wait for the shared lock, mirroring lp_submit_entry.
+        wait_started = time.monotonic()
+        lock = self._acquire_global_lock(wait_seconds=_LP_SUBMIT_LOCK_WAIT_SECONDS)
         if lock is None:
+            logger.warning(
+                "lp_submit_augment: execution lock still busy after %.2fs wait; "
+                "returning execution_lock busy",
+                time.monotonic() - wait_started,
+            )
             return {"state": "busy", "reason": "execution_lock"}
         try:
             price = payload.get("price")
@@ -10978,7 +10997,7 @@ class PredictionExecutionService:
         del action
         return not self._breaker_is_open()
 
-    def _acquire_global_lock(self) -> tuple[threading.Lock, Any] | None:
+    def _acquire_global_lock_once(self) -> tuple[threading.Lock, Any] | None:
         if not self._process_lock.acquire(False):
             return None
         try:
@@ -10994,6 +11013,21 @@ class PredictionExecutionService:
         except Exception:
             self._process_lock.release()
             return None
+
+    def _acquire_global_lock(
+        self, *, wait_seconds: float = 0.0
+    ) -> tuple[threading.Lock, Any] | None:
+        # Issue 178: single retry loop around the non-blocking attempt; the
+        # default ``wait_seconds=0.0`` makes exactly one attempt — identical
+        # to the pre-issue behavior every other call site keeps.
+        deadline = time.monotonic() + max(float(wait_seconds), 0.0)
+        while True:
+            lock = self._acquire_global_lock_once()
+            if lock is not None:
+                return lock
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.05)
 
     @staticmethod
     def _release_global_lock(lock: tuple[threading.Lock, Any]) -> None:

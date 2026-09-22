@@ -23777,3 +23777,70 @@ console.log(JSON.stringify({text: message}));
     rendered = json.loads(output)
     assert "该标的已有活动组" in rendered["text"]
     assert "换一个标的即可开仓" in rendered["text"]
+
+
+def test_lp178_busy_toast_lock_reason_uses_accurate_sentence() -> None:
+    """Issue 178 W1: execution_lock 的 busy toast 复用 lpSubmitStateMessage
+    的准确句子——不再误报「已有活动 LP 会话」；sub 指向再次确认，kind 仍 danger。"""
+    output = run_dashboard_js(r'''
+const toast = lpSubmitToastCopy({state:"busy", reason:"execution_lock"});
+console.log(JSON.stringify(toast));
+''')
+    rendered = json.loads(output)
+    assert "已有另一笔操作正在确认，请稍后重新确认" in rendered["main"]
+    assert "已有活动 LP 会话" not in rendered["main"] + rendered["sub"]
+    assert rendered["kind"] == "danger"
+    assert rendered["sub"] == "稍后再次确认即可 · 本单未发出"
+
+
+def test_lp178_busy_toast_active_execution_reason_uses_accurate_sentence() -> None:
+    """Issue 178 W2: active_execution 的 busy toast 复用 lpSubmitStateMessage
+    的准确句子，不再误报「已有活动 LP 会话」。"""
+    output = run_dashboard_js(r'''
+const toast = lpSubmitToastCopy({state:"busy", reason:"active_execution"});
+console.log(JSON.stringify(toast));
+''')
+    rendered = json.loads(output)
+    assert "已有另一笔交易正在执行，本单未提交" in rendered["main"]
+    assert "已有活动 LP 会话" not in rendered["main"] + rendered["sub"]
+    assert rendered["kind"] == "danger"
+    assert rendered["sub"] == "稍后再次确认即可 · 本单未发出"
+
+
+def test_lp178_busy_toast_market_active_copy_unchanged() -> None:
+    """Issue 178 W3: lp_session_market_active 特判文案与现状一字不差（回归守护）。"""
+    output = run_dashboard_js(r'''
+const toast = lpSubmitToastCopy({
+  state:"busy", reason:"lp_session_market_active", session_id:"sess-1"});
+console.log(JSON.stringify(toast));
+''')
+    rendered = json.loads(output)
+    assert rendered == {
+        "kind": "danger",
+        "main": "业务忙：该标的已有活动组，本单未提交",
+        "sub": "换一个标的即可开仓 · 本单未发出",
+    }
+
+
+def test_lp178_busy_toast_unknown_reason_uses_state_message_and_retires_legacy() -> None:
+    """Issue 178 W4: 未特判 reason 走 lpSubmitStateMessage 兜底句
+    「系统忙，暂不能提交（<reason>）。」；各 busy 输出均不再含退役的
+    「业务忙：已有活动 LP 会话」。"""
+    output = run_dashboard_js(r'''
+const reasons = ["execution_lock", "active_execution",
+  "lp_session_market_active", "data_source_flaky"];
+const toasts = reasons.map((reason) =>
+  lpSubmitToastCopy({state:"busy", reason}));
+console.log(JSON.stringify({
+  flaky: toasts[3],
+  legacyFree: toasts.every((toast) =>
+    !(toast.main + toast.sub).includes("业务忙：已有活动 LP 会话")),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["flaky"] == {
+        "kind": "danger",
+        "main": "系统忙，暂不能提交（data_source_flaky）。",
+        "sub": "稍后再次确认即可 · 本单未发出",
+    }
+    assert rendered["legacyFree"] is True

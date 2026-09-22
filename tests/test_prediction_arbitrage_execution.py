@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -16,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 from open_trader.prediction_arbitrage import PairIntent, ThresholdHedgeIntent, ThresholdHedgeLeg
+import open_trader.prediction_arbitrage_execution as prediction_arbitrage_execution_module
 from open_trader.prediction_arbitrage_execution import PredictionExecutionService, _call
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 from open_trader.polymarket_lp import PolymarketLPService
@@ -31,6 +33,8 @@ from open_trader.polymarket_trading import (
 )
 from open_trader.predict_trading import PredictLegResult, PredictTradingClient
 from tests.test_polymarket_lp import _Exchange as LPExchange
+from tests.test_polymarket_lp import _augment_preview_snapshot
+from tests.test_polymarket_lp import _queue_book_snapshot
 from tests.test_polymarket_lp import _request as lp_request
 from tests.test_polymarket_lp import _snapshot as lp_snapshot
 
@@ -8400,6 +8404,207 @@ def test_lp166_lp_start_and_submit_entry_admit_per_market(tmp_path: Path) -> Non
         session_b,
         str(started_c["session_id"]),
     }
+
+
+def test_lp178_submit_entry_waits_for_lock_and_submits(tmp_path: Path) -> None:
+    """Issue 178 A1: 撞锁后 lp_submit_entry 最多等 _LP_SUBMIT_LOCK_WAIT_SECONDS——
+    占锁线程 0.1 秒后释放，提交应在等待窗内走完全程（结果非 busy）。"""
+    now = datetime(2026, 9, 22, 12, 0, tzinfo=UTC)
+    market_c = _lp166_identity(3)
+    exchange = LPExchange()
+    exchange.snapshot_value = _lp166_book(now, market_c)
+    store = PredictionArbitrageStore(tmp_path / "data")
+    lp = PolymarketLPService(store, exchange, clock=lambda: now)
+    execution = PredictionExecutionService(
+        store=store,
+        monitor=FakeMonitor(_intent()),
+        trading=IncidentTrading(result="unsafe"),
+        notifier=CompositeTestNotifier(ChannelNotifier("macos"), ChannelNotifier("feishu")),
+        lock_path=tmp_path / "execution.lock",
+        lp=lp,
+    )
+    execution._breaker_open = False
+    held = execution._acquire_global_lock()
+    assert held is not None
+    timer = threading.Timer(0.1, execution._release_global_lock, args=(held,))
+    timer.start()
+    started = time.monotonic()
+    try:
+        original_wait = getattr(
+            prediction_arbitrage_execution_module, "_LP_SUBMIT_LOCK_WAIT_SECONDS", 3.0
+        )
+        prediction_arbitrage_execution_module._LP_SUBMIT_LOCK_WAIT_SECONDS = 0.5
+        result = execution.lp_submit_entry(
+            {**_lp166_entry_request(now, market_c), "idempotency_key": "lp178-a1"}
+        )
+    finally:
+        timer.join()
+        prediction_arbitrage_execution_module._LP_SUBMIT_LOCK_WAIT_SECONDS = original_wait
+    elapsed = time.monotonic() - started
+    assert result["state"] == "entry_open"
+    assert elapsed >= 0.1
+
+
+def test_lp178_submit_entry_lock_wait_times_out_with_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Issue 178 A2: 等满窗口仍抢不到锁 → 返回体与今天一字不差（整字典相等）、
+    耗时 ≥ 窗口，并打一行含方法名与实际等待秒数的 WARNING。"""
+    now = datetime(2026, 9, 22, 12, 0, tzinfo=UTC)
+    market_c = _lp166_identity(3)
+    exchange = LPExchange()
+    exchange.snapshot_value = _lp166_book(now, market_c)
+    store = PredictionArbitrageStore(tmp_path / "data")
+    lp = PolymarketLPService(store, exchange, clock=lambda: now)
+    execution = PredictionExecutionService(
+        store=store,
+        monitor=FakeMonitor(_intent()),
+        trading=IncidentTrading(result="unsafe"),
+        notifier=CompositeTestNotifier(ChannelNotifier("macos"), ChannelNotifier("feishu")),
+        lock_path=tmp_path / "execution.lock",
+        lp=lp,
+    )
+    execution._breaker_open = False
+    held = execution._acquire_global_lock()
+    assert held is not None
+    try:
+        original_wait = getattr(
+            prediction_arbitrage_execution_module, "_LP_SUBMIT_LOCK_WAIT_SECONDS", 3.0
+        )
+        prediction_arbitrage_execution_module._LP_SUBMIT_LOCK_WAIT_SECONDS = 0.3
+        with caplog.at_level(
+            logging.WARNING, logger="open_trader.prediction_arbitrage_execution"
+        ):
+            started = time.monotonic()
+            result = execution.lp_submit_entry(
+                {**_lp166_entry_request(now, market_c), "idempotency_key": "lp178-a2"}
+            )
+            elapsed = time.monotonic() - started
+    finally:
+        prediction_arbitrage_execution_module._LP_SUBMIT_LOCK_WAIT_SECONDS = original_wait
+        execution._release_global_lock(held)
+    assert result == {"state": "busy", "reason": "execution_lock"}
+    assert elapsed >= 0.3
+    timeout_warnings = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+        and "lp_submit_entry" in record.getMessage()
+    ]
+    assert timeout_warnings
+    assert any("0.30" in record.getMessage() or "0.3" in record.getMessage() for record in timeout_warnings)
+
+
+def test_lp178_submit_entry_uncontended_leaves_lock_free(tmp_path: Path) -> None:
+    """Issue 178 A3: 无争抢时零等待提交照常成功，锁随即释放（立即可再获取）。"""
+    now = datetime(2026, 9, 22, 12, 0, tzinfo=UTC)
+    market_c = _lp166_identity(3)
+    exchange = LPExchange()
+    exchange.snapshot_value = _lp166_book(now, market_c)
+    store = PredictionArbitrageStore(tmp_path / "data")
+    lp = PolymarketLPService(store, exchange, clock=lambda: now)
+    execution = PredictionExecutionService(
+        store=store,
+        monitor=FakeMonitor(_intent()),
+        trading=IncidentTrading(result="unsafe"),
+        notifier=CompositeTestNotifier(ChannelNotifier("macos"), ChannelNotifier("feishu")),
+        lock_path=tmp_path / "execution.lock",
+        lp=lp,
+    )
+    execution._breaker_open = False
+    result = execution.lp_submit_entry(
+        {**_lp166_entry_request(now, market_c), "idempotency_key": "lp178-a3"}
+    )
+    assert result["state"] == "entry_open"
+    probe = execution._acquire_global_lock()
+    assert probe is not None
+    execution._release_global_lock(probe)
+
+
+def test_lp178_submit_entry_cheap_conflict_rejection_skips_wait(tmp_path: Path) -> None:
+    """Issue 178 A4: 同标的冲突是便宜拒绝，先于等锁——占锁期间仍立即返回
+    lp_session_market_active（<1 秒，默认 3 秒等待窗不生效）。"""
+    now = datetime(2026, 9, 22, 12, 0, tzinfo=UTC)
+    market_a = _lp166_identity(1)
+    exchange = LPExchange()
+    exchange.snapshot_value = _lp166_book(now, market_a)
+    store = PredictionArbitrageStore(tmp_path / "data")
+    lp = PolymarketLPService(store, exchange, clock=lambda: now)
+    execution = PredictionExecutionService(
+        store=store,
+        monitor=FakeMonitor(_intent()),
+        trading=IncidentTrading(result="unsafe"),
+        notifier=CompositeTestNotifier(ChannelNotifier("macos"), ChannelNotifier("feishu")),
+        lock_path=tmp_path / "execution.lock",
+        lp=lp,
+    )
+    execution._breaker_open = False
+    preview_a = execution.lp_preview(_lp166_entry_request(now, market_a))
+    started_a = execution.lp_start(str(preview_a["preview_id"]), "lp178-a4")
+    assert started_a["state"] == "entry_open"
+    held = execution._acquire_global_lock()
+    assert held is not None
+    try:
+        started = time.monotonic()
+        result = execution.lp_submit_entry(
+            {**_lp166_entry_request(now, market_a), "idempotency_key": "lp178-a4-c"}
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        execution._release_global_lock(held)
+    assert result["state"] == "busy"
+    assert result["reason"] == "lp_session_market_active"
+    assert elapsed < 1.0
+
+
+def test_lp178_submit_augment_waits_for_lock_and_submits(tmp_path: Path) -> None:
+    """Issue 178 A5: lp_submit_augment 与 A1 镜像——占锁线程 0.1 秒后释放，
+    加量应在等待窗内走完全程（结果非 busy）。"""
+    now = datetime(2026, 9, 22, 12, 0, tzinfo=UTC)
+    exchange = LPExchange()
+    exchange.snapshot_value = _queue_book_snapshot(now, Decimal("120"))
+    store = PredictionArbitrageStore(tmp_path / "data")
+    lp = PolymarketLPService(store, exchange, clock=lambda: now)
+    execution = PredictionExecutionService(
+        store=store,
+        monitor=FakeMonitor(_intent()),
+        trading=IncidentTrading(result="unsafe"),
+        notifier=CompositeTestNotifier(ChannelNotifier("macos"), ChannelNotifier("feishu")),
+        lock_path=tmp_path / "execution.lock",
+        lp=lp,
+    )
+    execution._breaker_open = False
+    preview = execution.lp_preview({**lp_request(now), "quantity": Decimal("120")})
+    started = execution.lp_start(str(preview["preview_id"]), "lp178-a5")
+    assert started["state"] == "entry_open"
+    session_id = str(started["session_id"])
+    exchange.snapshot_value = _augment_preview_snapshot(
+        now, level=Decimal("380"), own_original=Decimal("120")
+    )
+    held = execution._acquire_global_lock()
+    assert held is not None
+    timer = threading.Timer(0.1, execution._release_global_lock, args=(held,))
+    timer.start()
+    started_at = time.monotonic()
+    try:
+        original_wait = getattr(
+            prediction_arbitrage_execution_module, "_LP_SUBMIT_LOCK_WAIT_SECONDS", 3.0
+        )
+        prediction_arbitrage_execution_module._LP_SUBMIT_LOCK_WAIT_SECONDS = 0.5
+        result = execution.lp_submit_augment(
+            {
+                "session_id": session_id,
+                "quantity": "20",
+                "price": "0.29",
+                "idempotency_key": "lp178-a5-aug",
+            }
+        )
+    finally:
+        timer.join()
+        prediction_arbitrage_execution_module._LP_SUBMIT_LOCK_WAIT_SECONDS = original_wait
+    elapsed = time.monotonic() - started_at
+    assert result["state"] == "entry_open"
+    assert elapsed >= 0.1
 
 
 class _CancelTradingWithPositions(_CancelTrading):

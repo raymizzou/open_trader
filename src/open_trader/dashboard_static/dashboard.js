@@ -6467,8 +6467,8 @@ function lpSubmitToastCopy(result) {
     };
   }
   if (resultState === "busy") {
-    // Issue 166: 同标的已有活动组的拒绝文案点名换标的；其余 busy 理由维持
-    // 既有通用文案。
+    // Issue 166: 同标的已有活动组的拒绝文案点名换标的；Issue 178: 其余 busy
+    // 理由复用 lpSubmitStateMessage 的准确句子，不再笼统误报「已有活动 LP 会话」。
     if (String(result?.reason || "") === "lp_session_market_active") {
       return {
         kind: "danger",
@@ -6476,10 +6476,12 @@ function lpSubmitToastCopy(result) {
         sub: "换一个标的即可开仓 · 本单未发出",
       };
     }
+    const reason = String(result?.reason || "");
+    const stateMessage = lpSubmitStateMessage(result);
     return {
       kind: "danger",
-      main: "业务忙：已有活动 LP 会话，本单未提交",
-      sub: "加量请用「加量」入口 · 本单未发出",
+      main: stateMessage || `业务忙（${reason || "busy"}）`,
+      sub: "稍后再次确认即可 · 本单未发出",
     };
   }
   if (resultState === "locked") {
