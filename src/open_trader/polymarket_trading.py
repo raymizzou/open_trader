@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Callable, Literal, cast
 from urllib.error import URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 from polymarket import BuilderApiKey, PRODUCTION, PublicClient, SecureClient
 from polymarket._internal.wallet import signature_type_for
@@ -73,6 +73,16 @@ LP_COMPETITIVENESS_ENDPOINT = "https://clob.polymarket.com/rewards/markets/multi
 LP_COMPETITIVENESS_TIMEOUT_SECONDS = 15.0
 LP_COMPETITIVENESS_PAGE_ATTEMPTS = 3
 LP_COMPETITIVENESS_RETRY_PAUSE_SECONDS = 1.0
+
+
+def _lp_competition_direct_opener():
+    """Issue #177 R2: stdlib urlopen honors the macOS system proxy and
+    the local proxy stalls the long pagination with trickle reads under
+    the per-recv timeout; pin the direct route the SDK httpx channel
+    (env-var proxies only) always used."""
+    return build_opener(ProxyHandler({})).open
+
+
 LP_REWARD_SELECTED_MAX_CONCURRENCY = 4
 # Issue #137: the ~17k-market reward catalog must not be re-read and fully
 # re-validated from gamma on every lp_market_metadata call.  Results live in
@@ -3781,7 +3791,7 @@ class PolymarketTradingClient:
         try:
             if stop_event is not None and stop_event.is_set():
                 raise _RewardReadCancelled
-            opener = self._urlopen_fn or urlopen
+            opener = self._urlopen_fn or _lp_competition_direct_opener()
             seen_cursors: set[str] = set()
             while True:
                 if stop_event is not None and stop_event.is_set():

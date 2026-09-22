@@ -13,6 +13,7 @@ from pathlib import Path
 from subprocess import CalledProcessError, CompletedProcess
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
+from urllib.request import ProxyHandler
 from uuid import uuid4
 
 import pytest
@@ -2396,6 +2397,45 @@ def test_lp_market_competitiveness_requests_use_the_dedicated_timeout(
     assert opener.timeouts == [15.0, 15.0]
     assert opener.paths == ["/rewards/markets/multi", "/rewards/markets/multi"]
     assert opener.page_sizes == ["500", "500"]
+
+
+def test_lp_market_competitiveness_default_channel_bypasses_system_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #177 R2: with no ``urlopen_fn`` injected, the competition walk
+    goes through the no-proxy direct opener — stdlib ``urlopen`` honors the
+    macOS system proxy, whose trickle reads stall the pagination mid-read
+    under the per-recv timeout."""
+
+    real_factory = polymarket_trading._lp_competition_direct_opener
+    monkeypatch.setattr(
+        polymarket_trading, "LP_COMPETITIVENESS_RETRY_PAUSE_SECONDS", 0.0
+    )
+    opener = CompetitionOpener()
+    monkeypatch.setattr(
+        polymarket_trading, "_lp_competition_direct_opener", lambda: opener
+    )
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET), client=SimpleNamespace()
+    )
+
+    complete = adapter.lp_market_competitiveness()
+
+    assert complete["state"] == "known"
+    assert opener.calls == [None, "Mg=="]
+    assert opener.timeouts == [15.0, 15.0]
+
+    # The real factory must pin the direct route: its opener chain carries
+    # no proxy handler at all.  An empty-proxy ProxyHandler never registers
+    # itself with the director, while a proxy-honoring default opener does
+    # register one (system proxies on macOS), so this really separates the
+    # two channels.
+    director = real_factory().__self__
+    assert not [
+        handler
+        for handler in director.handlers
+        if isinstance(handler, ProxyHandler)
+    ]
 
 
 def make_probe_intent(
