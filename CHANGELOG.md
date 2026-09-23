@@ -3,6 +3,16 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-09-23
+
+- Documentation-only clarification of the verification workflow: use focused
+  `make test TEST=...` checks per changed seam, expand only to affected tests,
+  and run Candidate Acceptance once for the stable candidate after repairs or
+  rebase when normal gates apply. Candidate failures are audited and repaired
+  in batch before focused checks and a new-SHA acceptance rerun; an unchanged
+  accepted SHA does not trigger an extra full test at merge. No gates were run
+  for this documentation update.
+
 ## 2026-09-22
 
 - LP 多组并存误伤修复 + 「需要核对」可见性 + 5 分钟克制通知（polymarket_lp.py + dashboard.js/css）。成因（2026-09-22 晚生产实证）：两组 LP 并存时巡检守卫 `_unowned_target_order_reason` 读市场身份用嵌套 `_field(order,"market_id",_field(...))`，而 CLOB 原始挂单行恒含 `market_id` 键但值为 None（`_field` 即 dict.get，键存在值 None 不走 default），market/condition_id 兜底全成死代码 → 跨市场单被判成本市场单 → 两组一秒内互相误报 unowned_target_order 双双进 needs_attention、追加按钮消失，且界面无任何原因显示。修法三件：一、守卫读市场身份改「第一个非空值」语义（`market_id or market or condition_id`），跨市场单不再触发，同市场外来单与身份全空单照旧拦截（保守兜底零弱化）；二、前端可见性——needs_attention 组的当天委托行头加琥珀「需要核对」pill、行内加原因整句说明线（新 `.lp-attention-line`，含数据失败计数 n/10），组卡置顶 `pm-alert warning` 块（标题「本组已暂停自动管理」，正文=原因句+恢复说明+计数），文案表 `lpNeedsAttentionCopy` 行内/组卡/后端通知三方同源；三、克制通知——会话载荷新增 `needs_attention_since`/`needs_attention_notified` 记账键，进入该状态锚定起点、满 5 分钟仍未自愈才经既有 `_notify_protection` 双通道推一条，同一 episode（含 reason 变化）只推一条，恢复写回 resume_state 与停止端点成功转 review 时均清键重置；追加按钮仍仅 entry_open 显示，`_validate_snapshot`/`_field`/通知生产接线零改动，旧快照缺记账键视为未启用不抛错。验证：新增 A1（两组互见 raw 形状挂单，修复前两组均 needs_attention/unowned_target_order 先红，即生产复现）、A2（同市场他 token SELL 仍拦）、A3（身份全空单仍拦）、A4（自有单 raw 形状不拦）、W1–W4（行 pill+整句+计数、entry_open 追加按钮回归、未知原因兜底句、组卡告警块）、N1（<5 分钟零调用、满 300 秒恰 1 条、episode 内不重推）、N2（恢复清键、二次进入再推恰 1 条累计 2）、N3（stop 成功转 review 清键、no-fix 世界键断言先红；N1 断言加强为 message 整句全等）；`make test TEST='tests/test_polymarket_lp.py'`、`tests/test_dashboard_web.py`、`tests/test_prediction_runtime.py` 三套全绿。未做 push 或部署。

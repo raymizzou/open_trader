@@ -35,6 +35,17 @@ Host Readiness, or Production Smoke; shared modules/dependencies,
 Dashboard/backend runtime, reports, trading, or wider production paths use the
 normal gates. Read the linked runbook before selecting a non-exempt gate.
 
+For production-code changes covered by the normal gates, use focused
+`make test TEST=...` checks for each changed seam during development and expand
+only to the affected tests. Do not run a full `make test` solely as a bookend
+before or after Candidate Acceptance. After known repairs and any required
+rebase, run Candidate Acceptance once for the stable candidate SHA. If it
+fails, audit every reported failure and its downstream dependencies, batch the
+in-scope repairs, rerun the focused checks, and rerun Candidate Acceptance for
+the resulting SHA. When the accepted SHA is unchanged, the `--ff-only` merge
+does not require another full `make test`; exact-SHA evidence, review, rebase,
+exception, and deployment rules still apply as described in the runbook.
+
 ## Review and merge
 
 Before review, update the dated operator-facing entry in `CHANGELOG.md`, then
