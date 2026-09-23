@@ -7169,6 +7169,10 @@ class PolymarketLPService:
             state="accepted",
             payload={**action_base, "order_id": order_id},
         )
+        # The venue post can overlap an off-lock queue-protection cancel.
+        # Re-read after the post so the session merge starts from the latest
+        # durable A/B state instead of the pre-submit snapshot.
+        session = self.store.lp_session(session_id) or session
         augment_ids = [
             str(value) for value in _items(session.get("augment_order_ids"))
         ]
@@ -7227,17 +7231,25 @@ class PolymarketLPService:
         prior_group_quantity = _maybe_decimal(session.get("group_buy_quantity")) or (
             _maybe_decimal(session.get("quantity")) or Decimal("0")
         )
-        updated = self.store.lp_update_session(
-            session_id,
-            patch={
-                "augment_order_ids": augment_ids,
-                "augment_order_id": order_id,
-                "augment_quantity": quantity,
-                "group_buy_quantity": prior_group_quantity + quantity,
-                "order_history": order_history,
-                "queue_protection": protection_payload,
-            },
-        )
+        session_patch = {
+            "augment_order_ids": augment_ids,
+            "augment_order_id": order_id,
+            "augment_quantity": quantity,
+            "group_buy_quantity": prior_group_quantity + quantity,
+            "order_history": order_history,
+        }
+        merger = getattr(self.store, "lp_merge_queue_protection", None)
+        if callable(merger):
+            updated = merger(
+                session_id,
+                queue_protection=protection_payload,
+                patch=session_patch,
+            )
+        else:
+            updated = self.store.lp_update_session(
+                session_id,
+                patch={**session_patch, "queue_protection": protection_payload},
+            )
         return self._status_payload(updated)
 
     def _session_price_level_active(
@@ -9050,6 +9062,24 @@ class PolymarketLPService:
         )
 
     def tick(self) -> dict[str, object]:
+        """Run one deterministic monitoring/reconciliation iteration."""
+
+        return self._tick()
+
+    def tick_with_apply_lock(
+        self,
+        acquire_lock: Callable[[], object | None],
+        release_lock: Callable[[object], None],
+    ) -> dict[str, object]:
+        """Run a tick with the execution lock reserved for short apply work."""
+
+        return self._tick(apply_lock=(acquire_lock, release_lock))
+
+    def _tick(
+        self,
+        *,
+        apply_lock: tuple[Callable[[], object | None], Callable[[object], None]] | None = None,
+    ) -> dict[str, object]:
         """Run one deterministic monitoring/reconciliation iteration.
 
         Issue 165: group-level reconciliation is delegated to
@@ -9061,31 +9091,294 @@ class PolymarketLPService:
         group's full payload in ``sessions``.
         """
 
-        with self._mutex:
-            # Issue 159: first-seen fallback protections for web-manual BUYs
-            # run inside the same one-second tick, serially per episode,
-            # before the LP session pipeline — including when no session is
-            # active at all.
-            self._apply_first_seen_protections()
-            sessions = self.store.lp_active_sessions()
-            if not sessions:
-                return {"state": "none", "session_id": None}
-            payloads: list[dict[str, object]] = []
-            for session in sessions:
+        # Issue 159: first-seen fallback protections remain first and
+        # serialized.  If another execution owns the global lock, skip this
+        # retry and continue with the active-session lane.
+        if apply_lock is None:
+            with self._mutex:
+                self._apply_first_seen_protections()
+        else:
+            first_seen_lock = apply_lock[0]()
+            if first_seen_lock is not None:
                 try:
-                    payloads.append(self._reconcile_session(session))
-                except Exception as exc:
-                    # One group's reconciliation failure must not swallow the
-                    # others: record the failure into that group's payload and
-                    # continue with the remaining groups.
-                    payloads.append(
-                        {
-                            "state": "error",
-                            "session_id": session.get("session_id"),
-                            "error": type(exc).__name__,
-                        }
+                    with self._mutex:
+                        self._apply_first_seen_protections()
+                finally:
+                    apply_lock[1](first_seen_lock)
+
+        active_reader = getattr(
+            self.store, "lp_active_sessions_with_revisions", None
+        )
+        if callable(active_reader):
+            session_pairs = active_reader()
+        else:
+            # Compatibility for lightweight stores used by older callers.
+            session_pairs = []
+            for session in self.store.lp_active_sessions():
+                session_id = str(session.get("session_id") or "")
+                try:
+                    revision = self.store.lp_session_revision(session_id)
+                except Exception:
+                    revision = 0
+                session_pairs.append((session, revision))
+        if not session_pairs:
+            return {"state": "none", "session_id": None}
+
+        payloads: list[dict[str, object]] = []
+        for session, initial_revision in session_pairs:
+            session_id = str(session.get("session_id") or "")
+            snapshot: Mapping[str, object] | None = None
+            snapshot_error: ValueError | None = None
+            snapshot_exception: Exception | None = None
+            try:
+                request = self._normalize_request(session)
+                # The main network read deliberately runs outside both the
+                # service mutex and the execution service's global lock.
+                snapshot = self._read_snapshot(request)
+            except ValueError as exc:
+                snapshot_error = exc
+            except Exception as exc:
+                snapshot_exception = exc
+
+            protected_levels: set[str] = set()
+            protection_writes = 0
+            if snapshot is not None:
+                try:
+                    protected_levels, protection_writes = (
+                        self._apply_triggered_protection_cancel_off_lock(
+                            session, snapshot
+                        )
                     )
-            return self._lp_tick_aggregate(payloads)
+                except Exception:
+                    # A partial protection write is fenced by the durable
+                    # revision below.  If no write happened, the ordinary
+                    # serialized apply can retry the protection operation.
+                    protected_levels = set()
+                    protection_writes = 0
+
+            apply_handle: object | None = None
+            try:
+                if apply_lock is not None:
+                    apply_handle = apply_lock[0]()
+                    if apply_handle is None:
+                        current = self.store.lp_session(session_id) or session
+                        payloads.append(self._status_payload(current))
+                        continue
+                with self._mutex:
+                    if snapshot_exception is not None:
+                        raise snapshot_exception
+                    current_with_revision = getattr(
+                        self.store, "lp_session_with_revision", None
+                    )
+                    if callable(current_with_revision):
+                        current_row = current_with_revision(session_id)
+                    else:
+                        current = self.store.lp_session(session_id)
+                        current_row = (
+                            (current, self.store.lp_session_revision(session_id))
+                            if current is not None
+                            else None
+                        )
+                    if current_row is None:
+                        payloads.append(self._status_payload(session))
+                        continue
+                    current, current_revision = current_row
+                    expected_revision = int(initial_revision) + protection_writes
+                    if current_revision != expected_revision:
+                        # A submit/augment changed this group while its
+                        # snapshot was in flight.  The durable bucket cancel
+                        # remains valid; discard the stale group-wide apply.
+                        payloads.append(self._status_payload(current))
+                        continue
+                    if snapshot_error is not None:
+                        payloads.append(self._handle_snapshot_failure(current, snapshot_error))
+                        continue
+                    if snapshot is None:
+                        raise RuntimeError("lp_tick_snapshot_missing")
+                    reconcile = self._reconcile_session
+                    # Keep lightweight one-argument overrides compatible with
+                    # the long-standing tick seam.  The production method
+                    # receives the prefetched snapshot and protection keys;
+                    # an override owns its own snapshot lifecycle.
+                    if (
+                        getattr(reconcile, "__func__", None)
+                        is PolymarketLPService._reconcile_session
+                    ):
+                        payloads.append(
+                            reconcile(
+                                current,
+                                prefetched_snapshot=snapshot,
+                                protection_skip_keys=protected_levels,
+                            )
+                        )
+                    else:
+                        payloads.append(reconcile(current))
+            except Exception as exc:
+                # One group's reconciliation failure must not swallow the
+                # others: record the failure into that group's payload and
+                # continue with the remaining groups.
+                payloads.append(
+                    {
+                        "state": "error",
+                        "session_id": session_id,
+                        "error": type(exc).__name__,
+                    }
+                )
+            finally:
+                if apply_handle is not None and apply_lock is not None:
+                    apply_lock[1](apply_handle)
+        return self._lp_tick_aggregate(payloads)
+
+    def _apply_triggered_protection_cancel_off_lock(
+        self,
+        session: Mapping[str, object],
+        snapshot: Mapping[str, object],
+    ) -> tuple[set[str], int]:
+        """Issue only triggered protection cancel actions outside the locks.
+
+        Monitoring fields, convergence, outage counters, and every other
+        session update stay in the serialized apply section.  This lane only
+        sends a durable cancel intent for an already-triggered bucket (or a
+        failed cancel retry) and merges that one bucket transactionally.
+        """
+
+        protection = session.get("queue_protection")
+        buckets = self._queue_protection_levels(session)
+        if not isinstance(protection, Mapping) or not buckets:
+            return set(), 0
+        # A confirmed BUY fill is collected by the serialized reconciliation
+        # lane before queue protection is evaluated.  Let that lane mark the
+        # buckets as group_fill_collect instead of racing a queue-ahead cancel
+        # when the session image is still current.  A concurrent augment makes
+        # the snapshot stale; its protection cancel remains independently
+        # actionable while the revision fence discards stale fill facts.
+        current_session = self.store.lp_session(str(session["session_id"]))
+        concurrent_group_change = (
+            isinstance(current_session, Mapping)
+            and set(self._session_order_ids(current_session))
+            != set(self._session_order_ids(session))
+        )
+        if (
+            self._snapshot_has_group_buy_fill(session, snapshot)
+            and not concurrent_group_change
+        ):
+            return set(), 0
+        rows_by_id = self._queue_level_rows(snapshot)
+        session_id = str(session["session_id"])
+        merger = getattr(self.store, "lp_merge_queue_protection_bucket", None)
+        if not callable(merger):
+            merger = getattr(self.store, "lp_merge_queue_protection", None)
+        if not callable(merger):
+            return set(), 0
+
+        protected_levels: set[str] = set()
+        writes = 0
+        for key, bucket in buckets.items():
+            state = str(bucket.get("state") or "")
+            only_order_ids: list[str] | None = None
+            if state == "canceling":
+                only_order_ids = [
+                    str(value)
+                    for value in _items(bucket.get("cancel_failed"))
+                    if str(value or "")
+                ]
+                retryable: list[str] = []
+                for order_id in only_order_ids:
+                    row = rows_by_id.get(order_id)
+                    if row is not None:
+                        status = str(_field(row, "status", "") or "").upper()
+                        matched = _maybe_decimal(_field(row, "size_matched"))
+                        if status in TERMINAL_ORDER_STATES or (
+                            matched is not None and matched > 0
+                        ):
+                            continue
+                    retryable.append(order_id)
+                only_order_ids = retryable
+                if not only_order_ids:
+                    continue
+                next_bucket, patch = self._request_bucket_protection_cancel(
+                    session,
+                    snapshot,
+                    bucket,
+                    reason=str(bucket.get("cancel_reason") or "queue_ahead_ratio"),
+                    only_order_ids=only_order_ids,
+                    notify_blocked=False,
+                )
+            elif state == "triggered":
+                next_bucket, patch = self._request_bucket_protection_cancel(
+                    session,
+                    snapshot,
+                    bucket,
+                    reason="queue_ahead_ratio",
+                    notify_blocked=False,
+                )
+            else:
+                evaluation = self._bucket_queue_protection_evaluation(
+                    session, bucket, snapshot, rows_by_id
+                )
+                if evaluation is None or str(evaluation.get("state")) != "triggered":
+                    continue
+                next_bucket, patch = self._request_bucket_protection_cancel(
+                    session,
+                    snapshot,
+                    evaluation,
+                    reason="queue_ahead_ratio",
+                    notify_blocked=False,
+                )
+
+            if str(next_bucket.get("state") or "") not in {
+                "canceling",
+                "canceled",
+                "partially_filled",
+            }:
+                # Blocked/unknown protection state is ordinary monitoring
+                # state and must be persisted by the serialized apply.
+                continue
+            if hasattr(self.store, "lp_merge_queue_protection_bucket"):
+                merger(
+                    session_id,
+                    level_key=key,
+                    bucket=next_bucket,
+                    patch=patch,
+                )
+            else:
+                merger(
+                    session_id,
+                    queue_protection={
+                        "version": 2,
+                        "levels": {key: next_bucket},
+                    },
+                    patch=patch,
+                )
+            protected_levels.add(key)
+            writes += 1
+        return protected_levels, writes
+
+    def _snapshot_has_group_buy_fill(
+        self,
+        session: Mapping[str, object],
+        snapshot: Mapping[str, object],
+    ) -> bool:
+        """Return whether the snapshot proves a fill for this group's BUY."""
+
+        token_id = str(session.get("token_id") or "")
+        for order_id in self._session_order_ids(session):
+            if not order_id:
+                continue
+            try:
+                quantity, _ = self._trade_totals(
+                    snapshot,
+                    order_id,
+                    "BUY",
+                    token_id=token_id or None,
+                )
+            except ValueError:
+                # An uncertain trade read belongs to the serialized
+                # reconciliation path; do not issue a speculative cancel.
+                return True
+            if quantity > 0:
+                return True
+        return False
 
     @staticmethod
     def _lp_tick_aggregate(
@@ -9132,39 +9425,33 @@ class PolymarketLPService:
                 best = (moment, value)
         return best[1] if best is not None else None
 
-    def _reconcile_session(self, session: Mapping[str, object]) -> dict[str, object]:
-        """Run one group-level monitoring/reconciliation iteration (issue 165: split from tick)."""
+    def _reconcile_session(
+        self,
+        session: Mapping[str, object],
+        *,
+        prefetched_snapshot: Mapping[str, object] | None = None,
+        protection_skip_keys: Collection[str] = (),
+    ) -> dict[str, object]:
+        """Run one group-level monitoring/reconciliation iteration.
+
+        A tick may supply the main snapshot fetched outside ``_mutex``.  The
+        remaining account/fill/scoring work stays in the serialized apply
+        section; already-triggered bucket cancels are skipped there so they
+        cannot be sent twice by the same tick.
+        """
 
         state = str(session.get("state"))
         if state in {"entry_rejected", "complete"}:
             return self._status_payload(session)
         try:
             request = self._normalize_request(session)
-            snapshot = self._read_snapshot(request)
+            snapshot = (
+                prefetched_snapshot
+                if prefetched_snapshot is not None
+                else self._read_snapshot(request)
+            )
         except ValueError as exc:
-            patch: dict[str, object] = {
-                "reconciliation": str(exc),
-                "resume_state": state
-                if state != "needs_attention"
-                else session.get("resume_state"),
-            }
-            failures = self._queue_protection_data_failure(session, str(exc))
-            if failures is not None:
-                patch["queue_protection"] = failures
-            patch.update(
-                self._needs_attention_notify_patch(
-                    session, self._now(), protection=failures
-                )
-            )
-            updated = self.store.lp_update_session(
-                str(session["session_id"]),
-                state="needs_attention",
-                patch=patch,
-            )
-            conservative = self._conservative_protection_cancel(updated, failures)
-            if conservative is not None:
-                return self._status_payload(conservative)
-            return self._status_payload(updated)
+            return self._handle_snapshot_failure(session, exc)
         try:
             patch = self._fill_patch(session, snapshot)
         except ValueError as exc:
@@ -9257,7 +9544,11 @@ class PolymarketLPService:
             state = resume_state
         # Issue 152: queue protection runs inside the existing one-second
         # monitor tick, before any exit reconciliation can mutate orders.
-        session = self._apply_queue_protection(session, snapshot)
+        session = self._apply_queue_protection(
+            session,
+            snapshot,
+            skip_cancel_keys=protection_skip_keys,
+        )
         session = self._reconcile_protected_exit(session, snapshot)
         if _decimal(session.get("buy_filled_quantity", 0), "buy_filled_quantity") > 0:
             # Issue 167 D3: a fill at any level collects the whole group's
@@ -9337,6 +9628,36 @@ class PolymarketLPService:
             self._ensure_passive_exit(session, snapshot, residual)
             session = self.store.lp_session(str(session["session_id"])) or session
         return self._complete_if_flat(session, snapshot)
+
+    def _handle_snapshot_failure(
+        self, session: Mapping[str, object], exc: ValueError
+    ) -> dict[str, object]:
+        """Persist one failed main snapshot read in serialized apply."""
+
+        state = str(session.get("state"))
+        patch: dict[str, object] = {
+            "reconciliation": str(exc),
+            "resume_state": state
+            if state != "needs_attention"
+            else session.get("resume_state"),
+        }
+        failures = self._queue_protection_data_failure(session, str(exc))
+        if failures is not None:
+            patch["queue_protection"] = failures
+        patch.update(
+            self._needs_attention_notify_patch(
+                session, self._now(), protection=failures
+            )
+        )
+        updated = self.store.lp_update_session(
+            str(session["session_id"]),
+            state="needs_attention",
+            patch=patch,
+        )
+        conservative = self._conservative_protection_cancel(updated, failures)
+        if conservative is not None:
+            return self._status_payload(conservative)
+        return self._status_payload(updated)
 
     def _collect_group_buys(
         self, session: Mapping[str, object], snapshot: Mapping[str, object]
@@ -10329,6 +10650,7 @@ class PolymarketLPService:
         *,
         reason: str = "queue_ahead_ratio",
         only_order_ids: list[str] | None = None,
+        notify_blocked: bool = True,
     ) -> tuple[dict[str, object], dict[str, object]]:
         """Cancel every own BUY resting at this bucket's price (issue 152 D4 /
         issue 167: one cancel episode per price bucket).
@@ -10359,6 +10681,7 @@ class PolymarketLPService:
                         "account_read_failed",
                         "账户读取失败",
                         None,
+                        notify=notify_blocked,
                     ),
                     {},
                 )
@@ -10380,7 +10703,12 @@ class PolymarketLPService:
             if (side and side != "BUY") or (row_token and row_token != token_id):
                 return (
                     self._blocked_bucket_protection_cancel(
-                        session, updated, "identity_conflict", "回执身份不符", None
+                        session,
+                        updated,
+                        "identity_conflict",
+                        "回执身份不符",
+                        None,
+                        notify=notify_blocked,
                     ),
                     {},
                 )
@@ -10391,7 +10719,12 @@ class PolymarketLPService:
             )
             return (
                 self._blocked_bucket_protection_cancel(
-                    session, updated, "mutation_blocked", "撤单被熔断阻止", remaining
+                    session,
+                    updated,
+                    "mutation_blocked",
+                    "撤单被熔断阻止",
+                    remaining,
+                    notify=notify_blocked,
                 ),
                 {},
             )
@@ -10611,13 +10944,15 @@ class PolymarketLPService:
         reason_code: str,
         failure_reason: str,
         remaining: Decimal | None,
+        *,
+        notify: bool = True,
     ) -> dict[str, object]:
         codes = list(bucket.get("reason_codes") or [])
         if reason_code not in codes:
             codes.append(reason_code)
         bucket["state"] = "blocked"
         bucket["reason_codes"] = codes
-        if bucket.get("blocked_notified") is not True:
+        if notify and bucket.get("blocked_notified") is not True:
             title, message, xiaoai = self._queue_protection_blocked_notification(
                 bucket,
                 session,
@@ -10731,7 +11066,11 @@ class PolymarketLPService:
         return updated
 
     def _apply_queue_protection(
-        self, session: Mapping[str, object], snapshot: Mapping[str, object]
+        self,
+        session: Mapping[str, object],
+        snapshot: Mapping[str, object],
+        *,
+        skip_cancel_keys: Collection[str] = (),
     ) -> dict[str, object]:
         """Evaluate every price bucket inside the monitor tick and persist
         the v2 {version, data_failures, levels} payload (issue 167)."""
@@ -10746,6 +11085,7 @@ class PolymarketLPService:
         changed = False
         session_patch: dict[str, object] = {}
         new_levels: dict[str, dict[str, object]] = {}
+        skip_keys = {str(value) for value in skip_cancel_keys}
         for key, bucket in buckets.items():
             if str(bucket.get("state")) == "canceling":
                 converged = self._converge_queue_protection(
@@ -10760,7 +11100,7 @@ class PolymarketLPService:
                     for value in _items(bucket.get("cancel_failed"))
                     if str(value or "")
                 ]
-                if failed:
+                if failed and key not in skip_keys:
                     bucket, patch = self._request_bucket_protection_cancel(
                         session,
                         snapshot,
@@ -10796,6 +11136,9 @@ class PolymarketLPService:
                 if str(bucket.get("state")) not in {"unknown", "registered"}:
                     failures = 0
             if str(bucket.get("state")) == "triggered":
+                if key in skip_keys:
+                    new_levels[key] = bucket
+                    continue
                 bucket, patch = self._request_bucket_protection_cancel(
                     session, snapshot, bucket, reason="queue_ahead_ratio"
                 )
@@ -10821,7 +11164,20 @@ class PolymarketLPService:
             "data_failures": failures,
             "levels": new_levels,
         }
-        return self.store.lp_update_session(session_id, patch=session_patch)
+        queue_payload = cast(Mapping[str, object], session_patch.pop("queue_protection"))
+        merger = getattr(self.store, "lp_merge_queue_protection", None)
+        if callable(merger):
+            updated = merger(
+                session_id,
+                queue_protection=queue_payload,
+                patch=session_patch,
+            )
+        else:
+            updated = self.store.lp_update_session(
+                session_id,
+                patch={**session_patch, "queue_protection": queue_payload},
+            )
+        return updated
 
     # ---- Issue 159: first-seen baseline fallback protections ----
 

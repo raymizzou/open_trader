@@ -2676,6 +2676,10 @@ class PredictionArbitrageStore:
     @staticmethod
     def _lp_row_result(row: sqlite3.Row) -> dict[str, object]:
         payload = _load_payload(str(row["payload"]))
+        # The LP write revision is an internal compare-and-observe fence for
+        # concurrent monitor/submit updates.  It never belongs in the public
+        # session payload returned to callers.
+        payload.pop("_lp_revision", None)
         payload.update(
             {
                 "session_id": str(row["session_id"]),
@@ -2694,6 +2698,80 @@ class PredictionArbitrageStore:
                 (str(idempotency_key),),
             ).fetchone()
         return None if row is None else self._lp_row_result(row)
+
+    def lp_session_revision(self, session_id: str) -> int:
+        """Return the durable internal revision for one LP session."""
+
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT payload FROM lp_sessions WHERE session_id=?",
+                (str(session_id),),
+            ).fetchone()
+        if row is None:
+            raise ValueError("lp_session_not_found")
+        payload = _load_payload(str(row["payload"]))
+        value = payload.get("_lp_revision", 0)
+        try:
+            revision = int(value)
+        except (TypeError, ValueError):
+            return 0
+        return max(revision, 0)
+
+    @staticmethod
+    def _lp_payload_revision(payload: Mapping[str, object]) -> int:
+        value = payload.get("_lp_revision", 0)
+        try:
+            revision = int(value)
+        except (TypeError, ValueError):
+            return 0
+        return max(revision, 0)
+
+    def lp_session_with_revision(
+        self, session_id: str
+    ) -> tuple[dict[str, object], int] | None:
+        """Read one LP session image and its fence from one SQLite snapshot."""
+
+        with self._read_connection() as connection:
+            connection.execute("BEGIN")
+            try:
+                row = connection.execute(
+                    "SELECT * FROM lp_sessions WHERE session_id=?",
+                    (str(session_id),),
+                ).fetchone()
+                if row is None:
+                    connection.execute("COMMIT")
+                    return None
+                payload = _load_payload(str(row["payload"]))
+                result = self._lp_row_result(row)
+                revision = self._lp_payload_revision(payload)
+                connection.execute("COMMIT")
+                return result, revision
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+
+    def lp_active_sessions_with_revisions(
+        self,
+    ) -> list[tuple[dict[str, object], int]]:
+        """Read active LP session images and fences from one SQLite snapshot."""
+
+        with self._read_connection() as connection:
+            connection.execute("BEGIN")
+            try:
+                rows = connection.execute(
+                    "SELECT * FROM lp_sessions WHERE state NOT IN ('complete','entry_rejected') ORDER BY created_at DESC"
+                ).fetchall()
+                result: list[tuple[dict[str, object], int]] = []
+                for row in rows:
+                    payload = _load_payload(str(row["payload"]))
+                    result.append(
+                        (self._lp_row_result(row), self._lp_payload_revision(payload))
+                    )
+                connection.execute("COMMIT")
+                return result
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
 
     def lp_session(self, session_id: str) -> dict[str, object] | None:
         with self._read_connection() as connection:
@@ -4496,7 +4574,9 @@ class PredictionArbitrageStore:
         state: str,
         payload: Mapping[str, object],
     ) -> dict[str, object]:
-        encoded = _dump_execution_payload(payload)
+        stored_payload = dict(payload)
+        stored_payload["_lp_revision"] = 0
+        encoded = _dump_execution_payload(stored_payload)
         now = _utc_now()
         with self._transaction() as connection:
             existing = connection.execute(
@@ -4546,9 +4626,365 @@ class PredictionArbitrageStore:
             if patch:
                 payload.update(patch)
             next_state = str(state or row["state"])
+            try:
+                revision = int(payload.get("_lp_revision", 0))
+            except (TypeError, ValueError):
+                revision = 0
+            payload["_lp_revision"] = max(revision, 0) + 1
             connection.execute(
                 "UPDATE lp_sessions SET state=?,payload=?,updated_at=? WHERE session_id=?",
                 (next_state, _dump_execution_payload(payload), now, str(session_id)),
+            )
+            updated = connection.execute(
+                "SELECT * FROM lp_sessions WHERE session_id=?", (str(session_id),)
+            ).fetchone()
+            assert updated is not None
+            return self._lp_row_result(updated)
+
+    @staticmethod
+    def _merge_lp_protection(
+        current: object, incoming: object
+    ) -> object:
+        """Merge one queue-protection write without losing sibling buckets."""
+
+        if not isinstance(current, Mapping) or not isinstance(incoming, Mapping):
+            return incoming
+        current_levels = current.get("levels")
+        incoming_levels = incoming.get("levels")
+        if not isinstance(current_levels, Mapping) or not isinstance(incoming_levels, Mapping):
+            return incoming
+        merged = dict(current)
+        merged.update(
+            {
+                key: value
+                for key, value in incoming.items()
+                if key != "levels"
+            }
+        )
+        state_rank = {
+            "registered": 0,
+            "monitoring": 0,
+            "unknown": 0,
+            "triggered": 1,
+            "canceling": 2,
+            "canceled": 3,
+            "partially_filled": 3,
+        }
+        merged_levels: dict[str, object] = {
+            str(key): dict(value) if isinstance(value, Mapping) else value
+            for key, value in current_levels.items()
+        }
+        for raw_key, raw_value in incoming_levels.items():
+            key = str(raw_key)
+            if not isinstance(raw_value, Mapping):
+                merged_levels[key] = raw_value
+                continue
+            existing = merged_levels.get(key)
+            if not isinstance(existing, Mapping):
+                merged_levels[key] = dict(raw_value)
+                continue
+            existing_state = str(existing.get("state") or "")
+            incoming_state = str(raw_value.get("state") or "")
+            existing_rank = state_rank.get(existing_state, 0)
+            incoming_rank = state_rank.get(incoming_state, 0)
+            cancellation_states = {
+                "canceling",
+                "canceled",
+                "partially_filled",
+            }
+            same_cancel_episode = (
+                existing_state in cancellation_states
+                and incoming_state in cancellation_states
+            )
+            bucket = dict(existing)
+            bucket.update(raw_value)
+            # A stale submit/monitoring write cannot reopen a cancel episode
+            # or clear its durable receipt fields.  A newer retry/convergence
+            # state still replaces the bucket normally.
+            if incoming_rank < existing_rank:
+                bucket = dict(existing)
+            elif incoming_rank == existing_rank and existing_state in {
+                "canceling",
+                "canceled",
+                "partially_filled",
+            } and incoming_state not in {
+                "canceling",
+                "canceled",
+                "partially_filled",
+            }:
+                bucket = dict(existing)
+            for list_key in ("cancel_targets", "canceled_order_ids"):
+                old_items = existing.get(list_key)
+                new_items = raw_value.get(list_key)
+                if isinstance(old_items, (list, tuple)) or isinstance(new_items, (list, tuple)):
+                    bucket[list_key] = list(
+                        dict.fromkeys(
+                            [str(item) for item in (old_items or []) if str(item)]
+                            + [str(item) for item in (new_items or []) if str(item)]
+                        )
+                    )
+            if same_cancel_episode:
+                old_failed = existing.get("cancel_failed")
+                new_failed = raw_value.get("cancel_failed")
+                if isinstance(old_failed, (list, tuple)) or isinstance(
+                    new_failed, (list, tuple)
+                ):
+                    failed = list(
+                        dict.fromkeys(
+                            [str(item) for item in (old_failed or []) if str(item)]
+                            + [str(item) for item in (new_failed or []) if str(item)]
+                        )
+                    )
+                    canceled = {
+                        str(item)
+                        for item in bucket.get("canceled_order_ids", [])
+                        if str(item)
+                    }
+                    bucket["cancel_failed"] = [
+                        order_id for order_id in failed if order_id not in canceled
+                    ]
+
+                # Cancellation evidence and its one-shot notice are
+                # monotonic: a stale same-episode image cannot undo either.
+                bucket["notification_sent"] = bool(
+                    existing.get("notification_sent")
+                ) or bool(raw_value.get("notification_sent"))
+                if "blocked_notified" in existing or "blocked_notified" in raw_value:
+                    bucket["blocked_notified"] = bool(
+                        existing.get("blocked_notified")
+                    ) or bool(raw_value.get("blocked_notified"))
+
+                # Preserve the first durable timing/evidence value while
+                # allowing a newer retry to add evidence for another target.
+                for mapping_key in (
+                    "cancel_target_remaining",
+                    "order_placement_times",
+                    "order_cancel_confirmed_at",
+                ):
+                    old_mapping = existing.get(mapping_key)
+                    new_mapping = raw_value.get(mapping_key)
+                    if not isinstance(old_mapping, Mapping) and not isinstance(
+                        new_mapping, Mapping
+                    ):
+                        continue
+                    merged_mapping = (
+                        dict(old_mapping) if isinstance(old_mapping, Mapping) else {}
+                    )
+                    if isinstance(new_mapping, Mapping):
+                        for map_key, map_value in new_mapping.items():
+                            if map_key not in merged_mapping:
+                                merged_mapping[map_key] = map_value
+                            elif (
+                                mapping_key != "cancel_target_remaining"
+                                and merged_mapping[map_key] is None
+                                and map_value is not None
+                            ):
+                                merged_mapping[map_key] = map_value
+                    bucket[mapping_key] = merged_mapping
+
+                # Keep episode request metadata from regressing to an older
+                # image.  The canceled total is monotonic across one episode
+                # because it is the sum of the request-time target amounts.
+                if "cancel_requested_at" in existing:
+                    bucket["cancel_requested_at"] = existing.get(
+                        "cancel_requested_at"
+                    )
+                incoming_failed = raw_value.get("cancel_failed")
+                canceled_ids = bucket.get("canceled_order_ids")
+                canceled_set = (
+                    {
+                        str(item)
+                        for item in canceled_ids
+                        if str(item)
+                    }
+                    if isinstance(canceled_ids, (list, tuple))
+                    else set()
+                )
+                incoming_failed_unsettled = (
+                    {
+                        str(item)
+                        for item in incoming_failed
+                        if str(item) and str(item) not in canceled_set
+                    }
+                    if isinstance(incoming_failed, (list, tuple))
+                    else set()
+                )
+                if incoming_failed_unsettled and raw_value.get("cancel_failure"):
+                    bucket["cancel_failure"] = raw_value.get("cancel_failure")
+                elif "cancel_failure" in existing:
+                    bucket["cancel_failure"] = existing.get("cancel_failure")
+                if "canceled_remaining" in existing:
+                    old_remaining = existing.get("canceled_remaining")
+                    new_remaining = raw_value.get("canceled_remaining")
+                    existing_canceled_ids = {
+                        str(item)
+                        for item in existing.get("canceled_order_ids", [])
+                        if str(item)
+                    }
+                    incoming_canceled_ids = {
+                        str(item)
+                        for item in raw_value.get("canceled_order_ids", [])
+                        if str(item)
+                    }
+                    newly_canceled_ids = incoming_canceled_ids - existing_canceled_ids
+                    merged_remaining = bucket.get("cancel_target_remaining")
+                    new_canceled_remaining_unknown = (
+                        incoming_rank == existing_rank
+                        and bool(newly_canceled_ids)
+                        and (
+                            not isinstance(merged_remaining, Mapping)
+                            or any(
+                                order_id not in merged_remaining
+                                or merged_remaining.get(order_id) is None
+                                for order_id in newly_canceled_ids
+                            )
+                        )
+                    )
+                    if new_canceled_remaining_unknown:
+                        bucket["canceled_remaining"] = None
+                    elif incoming_rank <= existing_rank:
+                        try:
+                            old_amount = (
+                                None
+                                if old_remaining is None
+                                else Decimal(str(old_remaining))
+                            )
+                            new_amount = (
+                                None
+                                if new_remaining is None
+                                else Decimal(str(new_remaining))
+                            )
+                        except (InvalidOperation, TypeError, ValueError):
+                            old_amount = None
+                            new_amount = None
+                        if old_amount is None or new_amount is None:
+                            bucket["canceled_remaining"] = old_remaining
+                        elif new_amount > old_amount:
+                            bucket["canceled_remaining"] = new_remaining
+                        else:
+                            bucket["canceled_remaining"] = old_remaining
+            merged_levels[key] = bucket
+        merged["levels"] = merged_levels
+        return merged
+
+    def lp_merge_queue_protection(
+        self,
+        session_id: str,
+        *,
+        queue_protection: Mapping[str, object],
+        patch: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        """Atomically merge a protection write with concurrent session state."""
+
+        now = _utc_now()
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM lp_sessions WHERE session_id=?", (str(session_id),)
+            ).fetchone()
+            if row is None:
+                raise ValueError("lp_session_not_found")
+            payload = _load_payload(str(row["payload"]))
+            if patch:
+                for key, value in patch.items():
+                    if key == "augment_cancel_requested":
+                        current_values = payload.get(key)
+                        merged_values = (
+                            [str(item) for item in current_values if str(item)]
+                            if isinstance(current_values, (list, tuple))
+                            else []
+                        )
+                        for item in value if isinstance(value, (list, tuple)) else []:
+                            item_text = str(item)
+                            if item_text and item_text not in merged_values:
+                                merged_values.append(item_text)
+                        payload[key] = sorted(merged_values)
+                    elif key == "entry_cancel_requested":
+                        payload[key] = bool(payload.get(key)) or bool(value)
+                    else:
+                        payload[key] = value
+            payload["queue_protection"] = self._merge_lp_protection(
+                payload.get("queue_protection"), queue_protection
+            )
+            try:
+                revision = int(payload.get("_lp_revision", 0))
+            except (TypeError, ValueError):
+                revision = 0
+            payload["_lp_revision"] = max(revision, 0) + 1
+            connection.execute(
+                "UPDATE lp_sessions SET payload=?,updated_at=? WHERE session_id=?",
+                (_dump_execution_payload(payload), now, str(session_id)),
+            )
+            updated = connection.execute(
+                "SELECT * FROM lp_sessions WHERE session_id=?", (str(session_id),)
+            ).fetchone()
+            assert updated is not None
+            return self._lp_row_result(updated)
+
+    def lp_merge_queue_protection_bucket(
+        self,
+        session_id: str,
+        *,
+        level_key: str,
+        bucket: Mapping[str, object],
+        patch: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        """Atomically merge one protection bucket and session cancel flags.
+
+        The caller may have evaluated the bucket against an older session
+        image.  The transaction preserves every current sibling bucket and
+        applies the state-aware merge only to ``level_key``.
+        """
+
+        now = _utc_now()
+        key = str(level_key)
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM lp_sessions WHERE session_id=?", (str(session_id),)
+            ).fetchone()
+            if row is None:
+                raise ValueError("lp_session_not_found")
+            payload = _load_payload(str(row["payload"]))
+            if patch:
+                for patch_key, value in patch.items():
+                    if patch_key == "augment_cancel_requested":
+                        current_values = payload.get(patch_key)
+                        merged_values = (
+                            [str(item) for item in current_values if str(item)]
+                            if isinstance(current_values, (list, tuple))
+                            else []
+                        )
+                        for item in value if isinstance(value, (list, tuple)) else []:
+                            item_text = str(item)
+                            if item_text and item_text not in merged_values:
+                                merged_values.append(item_text)
+                        payload[patch_key] = sorted(merged_values)
+                    elif patch_key == "entry_cancel_requested":
+                        payload[patch_key] = bool(payload.get(patch_key)) or bool(value)
+                    else:
+                        payload[patch_key] = value
+
+            current = payload.get("queue_protection")
+            if isinstance(current, Mapping):
+                current_levels = current.get("levels")
+            else:
+                current_levels = None
+            if isinstance(current, Mapping) and isinstance(current_levels, Mapping):
+                incoming = {"levels": {key: dict(bucket)}}
+                merged_protection = self._merge_lp_protection(current, incoming)
+            else:
+                merged_protection = dict(current) if isinstance(current, Mapping) else {}
+                levels = dict(
+                    current_levels if isinstance(current_levels, Mapping) else {}
+                )
+                levels[key] = dict(bucket)
+                merged_protection["version"] = 2
+                merged_protection["levels"] = levels
+            payload["queue_protection"] = merged_protection
+            revision = self._lp_payload_revision(payload)
+            payload["_lp_revision"] = revision + 1
+            connection.execute(
+                "UPDATE lp_sessions SET payload=?,updated_at=? WHERE session_id=?",
+                (_dump_execution_payload(payload), now, str(session_id)),
             )
             updated = connection.execute(
                 "SELECT * FROM lp_sessions WHERE session_id=?", (str(session_id),)

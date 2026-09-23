@@ -12646,6 +12646,251 @@ def test_lp167_r1_same_tick_augment_bucket_cancels_merge_union(tmp_path) -> None
     assert levels["0.42"]["state"] == "monitoring"
 
 
+def test_lp179_changed_group_snapshot_cancels_a_without_stale_fill_patch(
+    tmp_path,
+) -> None:
+    """Issue 179: an old A snapshot cannot overwrite a concurrent B augment."""
+
+    now = datetime(2026, 9, 23, 12, 20, tzinfo=UTC)
+    snapshot_started = threading.Event()
+    release_snapshot = threading.Event()
+    cancel_a = threading.Event()
+
+    initial_snapshot = _lp167_book(now, level_42=150)
+    augment_snapshot = _lp167_book(
+        now,
+        level_42=380,
+        level_40=224,
+        open_orders=[_queue_receipt("order-1", price=Decimal("0.42"), original="150")],
+        orders=[_queue_receipt("order-1", price=Decimal("0.42"), original="150")],
+    )
+    stale_trigger_snapshot = _lp167_book(
+        now,
+        level_42=200,
+        level_40=224,
+        open_orders=[
+            _queue_receipt(
+                "order-1",
+                price=Decimal("0.42"),
+                original="150",
+                matched="5",
+            )
+        ],
+        orders=[
+            _queue_receipt(
+                "order-1",
+                price=Decimal("0.42"),
+                original="150",
+                matched="5",
+            )
+        ],
+        trades=[_lp167_maker_trade("stale-trade", "order-1", amount="5", price="0.42")],
+        positions=[{"token_id": "0x" + "1" * 64, "size": Decimal("5")}],
+    )
+
+    class ChangedGroupExchange(_Exchange):
+        trigger_a = False
+
+        def lp_snapshot(self, request: dict[str, object]) -> dict[str, object]:
+            price = Decimal(str(request.get("price") or "0"))
+            if price == Decimal("0.40"):
+                return augment_snapshot
+            if self.trigger_a:
+                snapshot_started.set()
+                assert release_snapshot.wait(timeout=3)
+                return stale_trigger_snapshot
+            return initial_snapshot
+
+        def cancel_order(self, order_id: str) -> object:
+            if order_id == "order-1":
+                cancel_a.set()
+            return super().cancel_order(order_id)
+
+    exchange = ChangedGroupExchange()
+    exchange.snapshot_value = initial_snapshot
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    preview = service.preview(_lp167_request(now))
+    started = service.start(str(preview["preview_id"]), "lp179-stale-a")
+    assert started["state"] == "entry_open"
+    session_id = str(started["session_id"])
+    exchange.trigger_a = True
+
+    augment_result: list[dict[str, object]] = []
+    augment_thread = threading.Thread(
+        target=lambda: augment_result.append(
+            service.submit_augment(
+                session_id,
+                "100",
+                "lp179-stale-b",
+                price="0.40",
+            )
+        )
+    )
+    tick_thread = threading.Thread(target=service.tick)
+    tick_thread.start()
+    assert snapshot_started.wait(timeout=1)
+    augment_thread.start()
+    augment_thread.join(timeout=3)
+    assert not augment_thread.is_alive()
+    assert augment_result and augment_result[0]["state"] == "entry_open"
+
+    try:
+        release_snapshot.set()
+        assert cancel_a.wait(timeout=1)
+    finally:
+        release_snapshot.set()
+        tick_thread.join(timeout=3)
+
+    assert not tick_thread.is_alive()
+    assert exchange.cancels == ["order-1"]
+    session = store.lp_session(session_id)
+    assert session is not None
+    # B's durable augment survived A's protection merge.
+    assert session["augment_order_ids"] == ["order-2"]
+    assert Decimal(str(session["group_buy_quantity"])) == Decimal("250")
+    levels = session["queue_protection"]["levels"]
+    assert levels["0.40"]["state"] == "registered"
+    assert levels["0.40"]["order_id"] == "order-2"
+    assert levels["0.42"]["state"] == "canceling"
+    assert levels["0.42"]["cancel_targets"] == ["order-1"]
+    assert session["entry_cancel_requested"] is True
+    # The stale snapshot's fill/position facts were fenced from the group.
+    assert Decimal(str(session["buy_filled_quantity"])) == Decimal("0")
+    assert Decimal(str(session["buy_cost"])) == Decimal("0")
+    assert Decimal(str(session["residual_quantity"])) == Decimal("0")
+    assert session["position_reconciled"] is False
+
+
+def test_lp179_a_protection_precedes_slow_b_snapshot(tmp_path) -> None:
+    """Issue 179: group A protects before group B's slow snapshot completes."""
+
+    now = datetime(2026, 9, 23, 12, 30, tzinfo=UTC)
+    market_a = _lp166_market_identity(1)
+    market_b = _lp166_market_identity(2)
+    b_snapshot_started = threading.Event()
+    release_b_snapshot = threading.Event()
+    cancel_a = threading.Event()
+
+    def runtime_snapshot(
+        identity: dict[str, object],
+        *,
+        order_id: str,
+        bid_size: Decimal,
+    ) -> dict[str, object]:
+        snapshot = _queue_book_snapshot(now, bid_size)
+        snapshot["market"].update(identity)  # type: ignore[union-attr]
+        for level in snapshot["book"]["bids"]:  # type: ignore[index]
+            if level["price"] == Decimal("0.29"):  # type: ignore[index]
+                level["size"] = bid_size  # type: ignore[index]
+        order = _queue_receipt(order_id, price=Decimal("0.29"), original="20")
+        order["token_id"] = identity["token_id"]
+        snapshot["account"]["open_orders"] = [order]  # type: ignore[index]
+        snapshot["orders"] = [order]
+        return snapshot
+
+    initial_a = _queue_book_snapshot(now, Decimal("100"))
+    initial_a["market"].update(market_a)  # type: ignore[union-attr]
+    initial_b = _queue_book_snapshot(now, Decimal("100"))
+    initial_b["market"].update(market_b)  # type: ignore[union-attr]
+
+    class TwoGroupExchange(_Exchange):
+        hold_b = False
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.initial_by_market = {
+                str(market_a["market_id"]): initial_a,
+                str(market_b["market_id"]): initial_b,
+            }
+            self.runtime_by_market: dict[str, dict[str, object]] = {}
+
+        def lp_snapshot(self, request: dict[str, object]) -> dict[str, object]:
+            market_id = str(request.get("market_id") or "")
+            if self.hold_b and market_id == str(market_b["market_id"]):
+                b_snapshot_started.set()
+                assert release_b_snapshot.wait(timeout=3)
+            self.snapshot_calls += 1
+            if market_id in self.runtime_by_market:
+                return self.runtime_by_market[market_id]
+            return self.initial_by_market[market_id]
+
+        def cancel_order(self, order_id: str) -> object:
+            if order_id == str(entry_a["entry_order_id"]):
+                cancel_a.set()
+            return super().cancel_order(order_id)
+
+    exchange = TwoGroupExchange()
+    exchange.snapshot_value = initial_b
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+
+    # B is created first so A is first in the reader's created_at DESC order.
+    entry_b = service.submit_entry(
+        {
+            **market_b,
+            "price": Decimal("0.29"),
+            "quantity": Decimal("20"),
+            "review_at": now + timedelta(minutes=10),
+        },
+        "lp179-two-b",
+    )
+    assert entry_b["state"] == "entry_open"
+    entry_a = service.submit_entry(
+        {
+            **market_a,
+            "price": Decimal("0.29"),
+            "quantity": Decimal("20"),
+            "review_at": now + timedelta(minutes=10),
+        },
+        "lp179-two-a",
+    )
+    assert entry_a["state"] == "entry_open"
+    session_a = str(entry_a["session_id"])
+    session_b = str(entry_b["session_id"])
+    exchange.runtime_by_market = {
+        str(market_a["market_id"]): runtime_snapshot(
+            market_a,
+            order_id=str(entry_a["entry_order_id"]),
+            bid_size=Decimal("40"),
+        ),
+        str(market_b["market_id"]): runtime_snapshot(
+            market_b,
+            order_id=str(entry_b["entry_order_id"]),
+            bid_size=Decimal("100"),
+        ),
+    }
+    exchange.hold_b = True
+
+    tick_result: list[dict[str, object]] = []
+    tick_errors: list[BaseException] = []
+
+    def run_tick() -> None:
+        try:
+            tick_result.append(service.tick())
+        except BaseException as exc:  # pragma: no cover - assertion aid
+            tick_errors.append(exc)
+
+    tick_thread = threading.Thread(target=run_tick)
+    tick_thread.start()
+    try:
+        assert cancel_a.wait(timeout=1)
+        assert b_snapshot_started.wait(timeout=1)
+        assert not release_b_snapshot.is_set()
+        assert exchange.cancels == [str(entry_a["entry_order_id"])]
+    finally:
+        release_b_snapshot.set()
+        tick_thread.join(timeout=3)
+
+    assert not tick_thread.is_alive()
+    assert not tick_errors
+    assert tick_result
+    aggregate = tick_result[0]
+    sessions = aggregate["sessions"]
+    assert {str(row["session_id"]) for row in sessions} == {session_a, session_b}
+    assert exchange.cancels == [str(entry_a["entry_order_id"])]
+
+
 def _lp_attention_raw_order(
     order_id: str,
     *,

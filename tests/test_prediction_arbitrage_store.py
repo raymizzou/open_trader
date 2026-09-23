@@ -3663,3 +3663,237 @@ def test_legacy_lp_sessions_db_migrates_old_unique_index(tmp_path: Path) -> None
         "lp-legacy",
         "lp-other",
     }
+
+
+def test_lp179_stale_canceling_merge_preserves_successful_retry(tmp_path: Path) -> None:
+    """A stale augment image cannot reopen a successful cancel episode."""
+
+    db = store(tmp_path)
+    session_id = "lp-179-stale-merge"
+    requested_at = "2026-09-23T04:00:00Z"
+    confirmed_at = "2026-09-23T04:00:01Z"
+    placed_at = "2026-09-22T04:00:00Z"
+    db.lp_create_session(
+        session_id,
+        "lp-179-stale-merge-key",
+        state="entry_open",
+        payload={
+            "condition_id": "condition-179",
+            "outcome": "YES",
+            "queue_protection": {
+                "version": 2,
+                "data_failures": 0,
+                "levels": {
+                    "0.30": {
+                        "state": "canceling",
+                        "order_id": "A",
+                        "cancel_targets": ["A"],
+                        "cancel_failed": [],
+                        "canceled_order_ids": ["A"],
+                        "notification_sent": True,
+                        "cancel_requested_at": requested_at,
+                        "canceled_remaining": "20",
+                        "cancel_failure": None,
+                        "order_placement_times": {"A": placed_at},
+                        "order_cancel_confirmed_at": {"A": confirmed_at},
+                    }
+                },
+            },
+        },
+    )
+
+    merged = db.lp_merge_queue_protection(
+        session_id,
+        queue_protection={
+            "version": 2,
+            "data_failures": 0,
+            "levels": {
+                "0.30": {
+                    "state": "canceling",
+                    "order_id": "A",
+                    "cancel_targets": ["A"],
+                    "cancel_failed": ["A"],
+                    "canceled_order_ids": [],
+                    "notification_sent": False,
+                    "cancel_requested_at": "2026-09-23T03:59:00Z",
+                    "canceled_remaining": "0",
+                    "cancel_failure": "venue_busy",
+                    "order_placement_times": {"A": "2026-09-22T03:59:00Z"},
+                    "order_cancel_confirmed_at": {},
+                },
+                "0.29": {
+                    "state": "registered",
+                    "order_id": "B",
+                },
+            },
+        },
+    )
+
+    levels = merged["queue_protection"]["levels"]
+    assert levels["0.30"]["cancel_failed"] == []
+    assert levels["0.30"]["canceled_order_ids"] == ["A"]
+    assert levels["0.30"]["notification_sent"] is True
+    assert levels["0.30"]["cancel_requested_at"] == requested_at
+    assert levels["0.30"]["canceled_remaining"] == "20"
+    assert levels["0.30"]["cancel_failure"] is None
+    assert levels["0.30"]["order_placement_times"] == {"A": placed_at}
+    assert levels["0.30"]["order_cancel_confirmed_at"] == {"A": confirmed_at}
+    assert levels["0.29"]["state"] == "registered"
+    assert levels["0.29"]["order_id"] == "B"
+
+
+def test_lp179_retry_unknown_target_keeps_episode_total_unknown(
+    tmp_path: Path,
+) -> None:
+    """A newly canceled target with unknown request remaining makes the episode total unknown."""
+
+    db = store(tmp_path)
+    session_id = "lp-179-retry-unknown-total"
+    db.lp_create_session(
+        session_id,
+        "lp-179-retry-unknown-total-key",
+        state="entry_open",
+        payload={
+            "condition_id": "condition-179",
+            "outcome": "YES",
+            "queue_protection": {
+                "version": 2,
+                "levels": {
+                    "0.30": {
+                        "state": "canceling",
+                        "order_id": "A",
+                        "cancel_targets": ["A", "B"],
+                        "cancel_failed": ["B"],
+                        "canceled_order_ids": ["A"],
+                        "notification_sent": False,
+                        "cancel_requested_at": "2026-09-23T04:00:00Z",
+                        "canceled_remaining": "20",
+                        "cancel_target_remaining": {"A": "20", "B": None},
+                    }
+                },
+            },
+        },
+    )
+
+    stale = db.lp_merge_queue_protection(
+        session_id,
+        queue_protection={
+            "version": 2,
+            "levels": {
+                "0.30": {
+                    "state": "canceling",
+                    "order_id": "A",
+                    "cancel_targets": ["A", "B"],
+                    "cancel_failed": ["B"],
+                    "canceled_order_ids": ["A"],
+                    "notification_sent": False,
+                    "cancel_requested_at": "2026-09-23T03:59:00Z",
+                    "canceled_remaining": "5",
+                    "cancel_target_remaining": {"A": "5", "B": None},
+                }
+            },
+        },
+    )
+    stale_level = stale["queue_protection"]["levels"]["0.30"]
+    assert stale_level["canceled_remaining"] == "20"
+
+    retried = db.lp_merge_queue_protection(
+        session_id,
+        queue_protection={
+            "version": 2,
+            "levels": {
+                "0.30": {
+                    "state": "canceling",
+                    "order_id": "A",
+                    "cancel_targets": ["A", "B"],
+                    "cancel_failed": [],
+                    "canceled_order_ids": ["A", "B"],
+                    "notification_sent": True,
+                    "cancel_requested_at": "2026-09-23T04:00:02Z",
+                    "canceled_remaining": None,
+                    "cancel_target_remaining": {"A": "20", "B": None},
+                }
+            },
+        },
+    )
+    retried_level = retried["queue_protection"]["levels"]["0.30"]
+    assert retried_level["canceled_order_ids"] == ["A", "B"]
+    assert retried_level["cancel_failed"] == []
+    assert retried_level["canceled_remaining"] is None
+
+
+def test_lp179_retry_upgrades_missing_evidence_without_rewriting_first_remaining(
+    tmp_path: Path,
+) -> None:
+    """Retry receipts fill missing timestamps while request remaining stays first-write."""
+
+    db = store(tmp_path)
+    session_id = "lp-179-retry-evidence"
+    first_placement = "2026-09-23T04:00:00Z"
+    retry_placement = "2026-09-23T04:00:01Z"
+    retry_confirmed = "2026-09-23T04:00:02Z"
+    db.lp_create_session(
+        session_id,
+        "lp-179-retry-evidence-key",
+        state="entry_open",
+        payload={
+            "condition_id": "condition-179",
+            "outcome": "YES",
+            "queue_protection": {
+                "version": 2,
+                "levels": {
+                    "0.30": {
+                        "state": "canceling",
+                        "order_id": "A",
+                        "cancel_targets": ["A", "B"],
+                        "cancel_failed": ["B"],
+                        "canceled_order_ids": ["A"],
+                        "notification_sent": False,
+                        "canceled_remaining": "20",
+                        "cancel_target_remaining": {"A": "20", "B": None},
+                        "order_placement_times": {
+                            "A": first_placement,
+                            "B": None,
+                        },
+                        "order_cancel_confirmed_at": {"A": first_placement},
+                    }
+                },
+            },
+        },
+    )
+
+    merged = db.lp_merge_queue_protection(
+        session_id,
+        queue_protection={
+            "version": 2,
+            "levels": {
+                "0.30": {
+                    "state": "canceling",
+                    "order_id": "A",
+                    "cancel_targets": ["A", "B"],
+                    "cancel_failed": [],
+                    "canceled_order_ids": ["A", "B"],
+                    "notification_sent": True,
+                    "canceled_remaining": "20",
+                    "cancel_target_remaining": {"A": "20", "B": "15"},
+                    "order_placement_times": {"A": first_placement, "B": retry_placement},
+                    "order_cancel_confirmed_at": {
+                        "A": first_placement,
+                        "B": retry_confirmed,
+                    },
+                }
+            },
+        },
+    )
+
+    level = merged["queue_protection"]["levels"]["0.30"]
+    assert level["cancel_target_remaining"] == {"A": "20", "B": None}
+    assert level["canceled_remaining"] is None
+    assert level["order_placement_times"] == {
+        "A": first_placement,
+        "B": retry_placement,
+    }
+    assert level["order_cancel_confirmed_at"] == {
+        "A": first_placement,
+        "B": retry_confirmed,
+    }

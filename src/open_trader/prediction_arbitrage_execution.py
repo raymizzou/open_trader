@@ -4351,9 +4351,23 @@ class PredictionExecutionService:
             self._release_global_lock(lock)
 
     def lp_tick(self) -> dict[str, object]:
-        """Run one LP reconciliation iteration under the shared mutex."""
+        """Run one LP reconciliation iteration.
+
+        The LP service fences its external snapshot reads and its durable
+        protection-cancel lane independently, then reacquires this lock for
+        each ordinary reconciliation apply.  Holding the shared execution
+        mutex around the whole tick would let a slow snapshot delay unrelated
+        submissions and would prevent a triggered cancel from reaching the
+        venue while another submission is in flight.
+        """
 
         service = self._lp
+        tick_with_lock = getattr(service, "tick_with_apply_lock", None)
+        if callable(tick_with_lock):
+            return tick_with_lock(
+                self._acquire_global_lock,
+                self._release_global_lock,
+            )
         tick = getattr(service, "tick", None)
         if not callable(tick):
             return {"state": "none", "session_id": None, "reason": "lp_unavailable"}

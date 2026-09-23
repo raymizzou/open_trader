@@ -5,6 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-23
 
+- Issue 179：LP 巡检按活动组逐组读取与落盘；已触发的位置保护撤单立即提交，普通对账仍短时串行，并用会话修订栅栏丢弃并发提交期间的旧成交/持仓快照，保留同组追加单与多组聚合结果。影响 LP 多组巡检及追加/撤单工作流。验证：Docker focused regression 16 passed（含锁竞争、重试幂等、多组顺序与重启截止回归）。
 - Documentation-only clarification of the verification workflow: use focused
   `make test TEST=...` checks per changed seam, expand only to affected tests,
   and run Candidate Acceptance once for the stable candidate after repairs or
