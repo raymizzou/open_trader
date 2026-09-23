@@ -6535,6 +6535,74 @@ console.log(JSON.stringify({
     }
 
 
+def test_lp_candidate_competition_density_pills_counts_and_observation() -> None:
+    """Issue #181: 竞争列密度化——轻/中 pill、旧值副行、排除计数与观测行。"""
+    output = run_dashboard_js(r"""
+const checkedAt = "2026-09-22T13:00:00Z";
+const storeCheckedAt = "2026-09-21T11:00:00Z";
+const row = (overrides) => ({
+  market_id:"m1", condition_id:"condition-m1", outcome:"YES",
+  daily_pool_usd:"100", min_quantity:"20", reference_capital:"5.40",
+  selected_direction:{outcome:"YES",price:"0.27",quantity:"20",required_capital:"5.40",
+    estimated_exit_loss:"0.54",estimated_exit_loss_ratio:"0.10",checked_at:checkedAt},
+  competition:{state:"known",value:"2",raw_value:"2",checked_at:checkedAt,updated:true},
+  ...overrides,
+});
+const funnel = {
+  read:214, base:63, sort:61, trial:3,
+  competition_known:3, competition_unknown:0,
+  excluded:{competition_missing:7, competition_empty:2, competition_too_thin:3,
+    competition_too_crowded:5, over_available:0},
+  competition_light:1, competition_mid:2,
+  competition_round_checked_at:"2026-09-22T12:30:00Z",
+  gap_reason:null,
+  compared_range:{compared:20, total:214, pending:194},
+  reasons:{read:[],base:[],sort:[],trial:[]},
+};
+const dashboard = {
+  state:"ready", complete:true, checked_at:checkedAt, last_success_at:checkedAt,
+  orders:[], positions:[], recommendations:[],
+  candidates:[
+    row({market_id:"light", condition_id:"condition-light",
+      competition:{state:"known",value:"2",checked_at:checkedAt,updated:true,tier:"light",source:"fresh"}}),
+    row({market_id:"mid", condition_id:"condition-mid",
+      competition:{state:"known",value:"7",checked_at:checkedAt,updated:true,tier:"mid",source:"fresh"}}),
+    row({market_id:"store", condition_id:"condition-store",
+      competition:{state:"known",value:"6",checked_at:storeCheckedAt,updated:null,tier:"mid",source:"store"}}),
+  ],
+  funnel,
+};
+const html = predictionLpCard({lp_dashboard:dashboard});
+const table = (html.match(/<table class="pm-table pm-lp-candidate-table">[\s\S]*?<\/table>/) || [""])[0];
+const empty = predictionLpCard({lp_dashboard:{...dashboard, candidates:[],
+  funnel:{...funnel, trial:0}}});
+console.log(JSON.stringify({
+  header: table.includes("官方竞争 · 密度"),
+  lightPill: /pm-pill lp-tier-light">轻</.test(table),
+  midPill: /pm-pill lp-tier-mid">中</.test(table),
+  storeSub: table.includes("旧 · 2026-09-21"),
+  freshSub: table.includes("数据 2026-09-22"),
+  noRoundNote: !table.includes("本轮未更新"),
+  subtitleCounts: html.includes("重度竞争 5 · 无数据 7 · 过薄 3"),
+  emptyCounts: empty.includes("重度竞争 5 · 无数据 7 · 过薄 3"),
+  observation: html.includes("竞争数据：最近一轮成功")
+    && html.includes("覆盖 3 · 轻 1 · 中 2"),
+}));
+""")
+    rendered = json.loads(output)
+    assert rendered == {
+        "header": True,
+        "lightPill": True,
+        "midPill": True,
+        "storeSub": True,
+        "freshSub": True,
+        "noRoundNote": True,
+        "subtitleCounts": True,
+        "emptyCounts": True,
+        "observation": True,
+    }
+
+
 def test_lp_group_total_skips_unknown_reference_capital_rows() -> None:
     """The candidate card no longer renders a group total."""
     output = run_dashboard_js(r"""

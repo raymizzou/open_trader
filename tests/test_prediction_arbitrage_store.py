@@ -257,6 +257,7 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
         "lp_price_history_cache",
         "lp_screening_snapshot",
         "lp_market_observations",
+        "lp_market_competitiveness",
         "lp_preparation",
         "lp_preparation_items",
     }
@@ -3423,6 +3424,56 @@ def test_lp_metadata_cache_store_round_trip_and_prune(tmp_path: Path) -> None:
             ).fetchall()
         }
     assert remaining == {"condition-1", "condition-missing"}
+
+
+def test_lp_competitiveness_upsert_map_and_count_round_trip(tmp_path: Path) -> None:
+    """Issue #181: 官方竞争值全量持久化——幂等建表、批量 UPSERT 往返与计数。"""
+
+    db = store(tmp_path)
+    assert db.lp_competitiveness_count() == 0
+    assert db.lp_competitiveness_map() == {}
+
+    first = datetime(2026, 9, 22, 12, 0, 1, 500000, tzinfo=UTC)
+    db.lp_competitiveness_upsert(
+        (
+            ("condition-A", Decimal("0"), first),
+            ("condition-B", Decimal("2.5"), first),
+            ("condition-C", Decimal("18.05"), first),
+        )
+    )
+
+    # 同一库目录重开一个 store 实例：幂等建表不炸，数据仍在。
+    reopened = store(tmp_path)
+    assert reopened.lp_competitiveness_map() == {
+        "condition-A": (Decimal("0"), first),
+        "condition-B": (Decimal("2.5"), first),
+        "condition-C": (Decimal("18.05"), first),
+    }
+    assert reopened.lp_competitiveness_count() == 3
+
+    # 覆盖更新：同 condition_id 新值新时间替换旧行，行数不增。
+    second = datetime(2026, 9, 22, 13, tzinfo=UTC)
+    reopened.lp_competitiveness_upsert(
+        (("condition-A", Decimal("1.5"), second),)
+    )
+    assert reopened.lp_competitiveness_map()["condition-A"] == (
+        Decimal("1.5"),
+        second,
+    )
+    assert reopened.lp_competitiveness_count() == 3
+
+    # 时间保真：非 UTC 时区写入后按 UTC 读回同一时刻。
+    zoned = datetime(2026, 9, 22, 21, tzinfo=ZoneInfo("Asia/Shanghai"))
+    reopened.lp_competitiveness_upsert((("condition-D", Decimal("7"), zoned),))
+    assert reopened.lp_competitiveness_map()["condition-D"] == (
+        Decimal("7"),
+        zoned.astimezone(UTC),
+    )
+    assert reopened.lp_competitiveness_count() == 4
+
+    # 空批量是不写事务的 no-op。
+    reopened.lp_competitiveness_upsert([])
+    assert reopened.lp_competitiveness_count() == 4
 
 
 def test_lp_latest_session_excludes_reserved_manual_anchor(tmp_path: Path) -> None:

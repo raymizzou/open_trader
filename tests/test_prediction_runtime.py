@@ -616,6 +616,11 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
     accounting_before = store.n_leg_control()
     session_before = store.lp_session("lp-session")
     risk_before = store.lp_session("lp-risk-session")
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先在库中预置竞争值
+    # （假件无竞争读；运行时自建 store 实例，同一 sqlite 文件可见）。
+    store.lp_competitiveness_upsert(
+        (("candidate-condition", Decimal("2"), datetime.now(UTC)),)
+    )
     assert risk_before is not None
     assert risk_before["state"] == "entry_open"
     assert risk_before["account_checked_at"] == risk_stale_at
@@ -2366,6 +2371,11 @@ def test_lp_trial_maintenance_runs_without_page_and_stops(
         history_waiting.set()
         return stop_event.wait()
 
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先在库中预置竞争值
+    # （假件无竞争读；运行时自建 store 实例，同一 sqlite 文件可见）。
+    PredictionArbitrageStore(tmp_path).lp_competitiveness_upsert(
+        (condition_id, Decimal("2"), clock["now"]) for condition_id in condition_ids
+    )
     runtime = PredictionRuntime(
         data_dir=tmp_path,
         prediction_config_path=tmp_path / "prediction.json",
@@ -2430,6 +2440,10 @@ def test_lp_trial_maintenance_runs_without_page_and_stops(
     maintenance_finished = threading.Event()
     history_waiting = threading.Event()
     risk_tick_seen = threading.Event()
+    # Issue #181 适配：第二个运行时用独立 data_dir，同样预置竞争值。
+    PredictionArbitrageStore(tmp_path / "missing-direction").lp_competitiveness_upsert(
+        (condition_id, Decimal("2"), clock["now"]) for condition_id in condition_ids
+    )
     runtime2 = PredictionRuntime(
         data_dir=tmp_path / "missing-direction",
         prediction_config_path=tmp_path / "missing-direction.json",
@@ -5940,6 +5954,14 @@ def test_lp_partial_preparation_uses_item_retry_deadline(
             return stop_event.is_set()
         raise AssertionError(f"unexpected history wait: {seconds}")
 
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先在库中预置竞争值
+    # （假件无竞争读；运行时自建 store 实例，同一 sqlite 文件可见）。
+    PredictionArbitrageStore(tmp_path / "partial-runtime").lp_competitiveness_upsert(
+        (
+            (condition_id, Decimal("2"), datetime(2026, 9, 18, 11, 0, tzinfo=UTC))
+            for condition_id in ("condition-a", "condition-b")
+        )
+    )
     runtime = PredictionRuntime(
         data_dir=tmp_path / "partial-runtime",
         prediction_config_path=tmp_path / "partial-runtime" / "prediction.json",
@@ -7336,6 +7358,11 @@ def test_lp_minute_risk_does_not_wait_for_hourly_catalog_preparation(
         notify=lambda _title, _message: None,
     )
 
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先在库中预置竞争值
+    # （假件无竞争读；运行时自建 store 实例，同一 sqlite 文件可见）。
+    PredictionArbitrageStore(tmp_path).lp_competitiveness_upsert(
+        (("condition-A", Decimal("2"), now[0]),)
+    )
     runtime = PredictionRuntime(
         data_dir=tmp_path,
         prediction_config_path=tmp_path / "prediction.json",

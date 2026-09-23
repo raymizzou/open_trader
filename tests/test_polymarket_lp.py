@@ -2988,7 +2988,8 @@ def test_refresh_candidates_projects_trial_funnel_without_risk(tmp_path) -> None
                 "checked_at": now,
                 "round_checked_at": now,
                 "competitiveness": {
-                    "condition-A": (Decimal("0.12"), now),
+                    # Issue #181 适配：0.12 落入过薄档会被排除，改取保留区间内的 1.2。
+                    "condition-A": (Decimal("1.2"), now),
                     "condition-B": (Decimal("0"), now),
                     "condition-Z": (Decimal("5"), now),
                 },
@@ -3048,7 +3049,7 @@ def test_refresh_candidates_projects_trial_funnel_without_risk(tmp_path) -> None
     row = candidates[0]
     assert row["min_quantity"] == "20"
     assert row["reference_capital"] == "10.100"  # 20.00 × 0.505 exact
-    assert row["competition"]["value"] == "0.12"
+    assert row["competition"]["value"] == "1.2"
     assert row["competition"]["state"] == "known"
     # The selected candidate's live book is read once and merged in-place.
     assert exchange.book_token_reads == (("token-condition-A",),)
@@ -3172,7 +3173,8 @@ def test_refresh_candidates_drops_rows_whose_realtime_capital_over_available(tmp
                 "checked_at": now,
                 "round_checked_at": now,
                 "competitiveness": {
-                    "condition-A": (Decimal("0.12"), now),
+                    # Issue #181 适配：0.12 落入过薄档会被排除，改取保留区间内的 1.2。
+                    "condition-A": (Decimal("1.2"), now),
                     "condition-Z": (Decimal("5"), now),
                 },
                 "not_updated": [],
@@ -3201,6 +3203,8 @@ def test_refresh_candidates_drops_rows_whose_realtime_capital_over_available(tmp
     lp = PolymarketLPService(store, exchange, clock=lambda: now)
     prepared = lp.refresh_price_history()
     assert prepared["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     snapshot = lp.refresh_candidates(force=True)
 
@@ -3355,6 +3359,8 @@ class _LPCandidateQueryExchange:
     ) -> dict[str, object]:
         del stop_event, previous, start_cursor
         self.competition_reads += 1
+        # Issue #181: values cycle inside the kept light/mid range so any
+        # market count stays density-qualified (no crowded/thin exclusion).
         return {
             "state": "known",
             "complete": True,
@@ -3362,7 +3368,7 @@ class _LPCandidateQueryExchange:
             "round_checked_at": self.now,
             "competitiveness": {
                 f"condition-{suffix}": (
-                    Decimal(index) + Decimal("1"),
+                    Decimal("1") + Decimal(index % 10),
                     self.now,
                 )
                 for index, suffix in enumerate(self.pools)
@@ -3406,6 +3412,8 @@ def test_batch_refresh_reads_books_per_batch_of_ten_markets(tmp_path) -> None:
     )
     prepared = lp.refresh_price_history()
     assert prepared["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     snapshot = lp.refresh_candidates(force=True)
 
@@ -3785,6 +3793,8 @@ def test_batch_refresh_backfills_until_ten_passed(tmp_path) -> None:
     # Backup markets keep their stale summaries, so preparation reports
     # partial; the scan proceeds and treats those markets as backup rows.
     assert lp.refresh_price_history()["state"] in {"known", "partial"}
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     snapshot = lp.refresh_candidates(force=True)
 
@@ -3876,6 +3886,8 @@ def test_batch_refresh_stops_at_fifty_markets_checked(tmp_path) -> None:
         PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
     )
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     snapshot = lp.refresh_candidates(force=True)
 
@@ -3937,6 +3949,8 @@ def test_batch_refresh_renews_stale_market_facts_mid_round(tmp_path) -> None:
         PredictionArbitrageStore(tmp_path), exchange, clock=lambda: exchange.now
     )
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     # Issue #157: each batch is one call.  The advancing clock moves 30s per
     # book read, so batches 1-2 evaluate inside the 60-second window while
@@ -3987,6 +4001,8 @@ def test_batch_refresh_renews_facts_stale_at_scan_start(tmp_path) -> None:
         PredictionArbitrageStore(tmp_path), exchange, clock=lambda: exchange.now
     )
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
     # The prepared snapshot serves a preparation built ten minutes ago.
     exchange.now = now + timedelta(minutes=10)
 
@@ -4040,6 +4056,8 @@ def test_batch_refresh_renews_stale_reward_and_account_facts(tmp_path) -> None:
         clock=lambda: reward_exchange.now,
     )
     assert reward_lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert reward_lp.refresh_competition_cache()["state"] == "known"
     reward_exchange.now = now + timedelta(minutes=10)
 
     reward_snapshot = reward_lp.refresh_candidates(force=True)
@@ -4087,6 +4105,8 @@ def test_batch_refresh_renews_stale_reward_and_account_facts(tmp_path) -> None:
         clock=lambda: account_exchange.now,
     )
     assert account_lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert account_lp.refresh_competition_cache()["state"] == "known"
     account_exchange.now = now + timedelta(minutes=10)
 
     account_snapshot = account_lp.refresh_candidates(force=True)
@@ -4127,6 +4147,8 @@ def test_batch_renewal_latency_keeps_renewed_facts_evaluable(tmp_path) -> None:
         PredictionArbitrageStore(tmp_path), exchange, clock=lambda: exchange.now
     )
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
     # The prepared snapshot is ten minutes old at scan start (the R2-2
     # scenario): batch one must renew its metadata and reward facts, and
     # each renewal read takes one wall-clock second.
@@ -4176,6 +4198,8 @@ def test_batch_refresh_failure_keeps_honest_stale_unknown(tmp_path) -> None:
         PredictionArbitrageStore(tmp_path), exchange, clock=lambda: exchange.now
     )
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     # Issue #157: four batches, one call each.  Batches 3 and 4 cross the
     # fact window; their metadata renewal attempts fail while the reward
@@ -4273,6 +4297,8 @@ def test_batch_refresh_isolates_missing_books_and_reads_backup_once(tmp_path) ->
     _seed_stale_backup_summaries(store, now, ("B1", "B2"))
     lp = PolymarketLPService(store, exchange, clock=lambda: now)
     assert lp.refresh_price_history()["state"] in {"known", "partial"}
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     snapshot = lp.refresh_candidates(force=True)
 
@@ -4334,6 +4360,8 @@ def test_batch_scan_funnel_trial_counts_published_passers(tmp_path) -> None:
     store = PredictionArbitrageStore(tmp_path)
     lp = PolymarketLPService(store, exchange, clock=lambda: now)
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     snapshot = lp.refresh_candidates(force=True)
 
@@ -4463,6 +4491,8 @@ def test_batch_refresh_ranks_passers_by_actual_capital_and_maintains_top_one(
     _seed_stale_backup_summaries(store, now, ("B1",))
     lp = PolymarketLPService(store, exchange, clock=lambda: current["now"])
     assert lp.refresh_price_history()["state"] in {"known", "partial"}
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     snapshot = lp.refresh_candidates(force=True)
     # Issue #157: Z1 rolls in the second exploration batch (it queues last
@@ -4575,6 +4605,8 @@ def test_maintenance_recomputes_upper_bound_from_new_capital(tmp_path) -> None:
     store = PredictionArbitrageStore(tmp_path)
     lp = PolymarketLPService(store, exchange, clock=lambda: current["now"])
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     snapshot = lp.refresh_candidates(force=True)
 
@@ -4620,6 +4652,8 @@ def test_batch_scan_cadence_and_shared_round_protection(tmp_path) -> None:
     store = PredictionArbitrageStore(tmp_path)
     lp = PolymarketLPService(store, exchange, clock=lambda: current["now"])
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     first = lp.refresh_candidates(force=True)
     assert first["state"] == "ready"
@@ -4633,8 +4667,8 @@ def test_batch_scan_cadence_and_shared_round_protection(tmp_path) -> None:
     exchanged = lp.refresh_candidates(force=False)
     assert len(exchange.book_token_reads) == reads_after_first + 1
     assert exchanged["funnel"]["batches"] == 2
-    # Batches never read the competition reader: it is cache-only.
-    assert exchange.competition_reads == 0
+    # Batches never read the competition reader: only the pre-warm read.
+    assert exchange.competition_reads == 1
 
     # Concurrent calls share one in-flight batch: while a batch is blocked
     # inside its book read, another call returns the scanning snapshot
@@ -4656,6 +4690,8 @@ def test_batch_scan_cadence_and_shared_round_protection(tmp_path) -> None:
         clock=lambda: current["now"],
     )
     assert blocked_lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert blocked_lp.refresh_competition_cache()["state"] == "known"
     current["now"] = now + timedelta(seconds=62)
     blocked_exchange.now = current["now"]
     round_result: dict[str, object] = {}
@@ -4723,6 +4759,8 @@ def test_batch_refresh_early_stops_when_account_unavailable(tmp_path) -> None:
         PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
     )
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
     healthy = lp.refresh_candidates(force=True)
     assert [row["market_id"] for row in healthy["candidates"]] == [
         "market-N01", "market-N02", "market-N03",
@@ -4746,7 +4784,7 @@ def test_batch_refresh_early_stops_when_account_unavailable(tmp_path) -> None:
     assert failed["funnel"]["passed"] == 3
     assert failed["funnel"]["batches"] == 1
     assert len(exchange.book_token_reads) == reads_after_healthy
-    assert exchange.competition_reads == 0  # batches never read competition
+    assert exchange.competition_reads == 1  # only the pre-warm read; batches never read competition
     # The previous batches' rows are kept for read-only display.
     assert [row["market_id"] for row in failed["candidates"]] == [
         "market-N01", "market-N02", "market-N03",
@@ -4907,6 +4945,8 @@ def test_trial_refresh_qualifies_head_and_selects_lowest_capital(tmp_path) -> No
         clock=lambda: current["now"],
     )
     assert capital_lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert capital_lp.refresh_competition_cache()["state"] == "known"
     capital_snapshot = capital_lp.refresh_candidates(force=True)
     # Both markets are checked in the same batch and both pass.  M02's cheap
     # NO direction (0.09 × 20 = 1.80) wins the merged ranking by the
@@ -4937,6 +4977,8 @@ def test_trial_refresh_qualifies_head_and_selects_lowest_capital(tmp_path) -> No
         PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
     )
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     snapshot = lp.refresh_candidates(force=True)
 
@@ -5151,6 +5193,8 @@ def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:
         clock=lambda: current["now"],
     )
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
     first = lp.refresh_candidates(force=True)
     assert first["recommendations"][0]["selected_direction"]["outcome"] == "NO"
     reads_so_far = len(exchange.book_token_reads)
@@ -5412,6 +5456,8 @@ def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:
         clock=lambda: boundary_current["now"],
     )
     assert boundary_lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert boundary_lp.refresh_competition_cache()["state"] == "known"
     boundary_first = boundary_lp.refresh_candidates(force=True)
     assert boundary_first["recommendations"][0]["selected_direction"]["outcome"] == "NO"
     boundary_counts = (
@@ -5502,6 +5548,8 @@ def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:
         clock=lambda: reward_only_current["now"],
     )
     assert reward_only_lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert reward_only_lp.refresh_competition_cache()["state"] == "known"
     initial_reward_only = reward_only_lp.refresh_candidates(force=True)
     assert Decimal(
         str(initial_reward_only["recommendations"][0]["selected_direction"]["quantity"])
@@ -5594,6 +5642,8 @@ def test_trial_refresh_expiry_removal_and_next_round_recovery(tmp_path) -> None:
         clock=lambda: inverse_current["now"],
     )
     assert inverse_lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert inverse_lp.refresh_competition_cache()["state"] == "known"
     inverse_first = inverse_lp.refresh_candidates(force=True)
     assert inverse_first["recommendations"]
     inverse_counts = (
@@ -5640,6 +5690,8 @@ def test_refresh_candidates_excludes_reference_capital_over_available(tmp_path) 
         PredictionArbitrageStore(tmp_path), exchange, clock=lambda: now
     )
     prepared = lp.refresh_price_history()
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
     assert prepared["state"] == "known"
 
     snapshot = lp.refresh_candidates(force=True)
@@ -5665,6 +5717,8 @@ def test_refresh_candidates_never_calls_price_history_endpoint(tmp_path) -> None
         PredictionArbitrageStore(tmp_path), exchange, clock=lambda: now
     )
     prepared = lp.refresh_price_history()
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
     assert prepared["state"] == "known"
     assert exchange.history_calls > 0
 
@@ -5696,6 +5750,8 @@ def test_refresh_candidates_keeps_valid_markets_when_metadata_missing(tmp_path) 
         PredictionArbitrageStore(tmp_path), exchange, clock=lambda: now
     )
     lp.refresh_price_history()
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     snapshot = lp.refresh_candidates(force=True)
 
@@ -5816,6 +5872,8 @@ def test_scan_checks_past_ten_passers_and_ranks_by_target_share_yield(tmp_path) 
     store = PredictionArbitrageStore(tmp_path)
     lp = PolymarketLPService(store, exchange, clock=lambda: now)
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     lp.refresh_candidates(force=True)
     # Issue #157: the eleventh market rolls in the second exploration batch
@@ -5855,6 +5913,8 @@ def test_scan_checks_fifty_markets_then_publishes_best_ten(tmp_path) -> None:
     store = PredictionArbitrageStore(tmp_path)
     lp = PolymarketLPService(store, exchange, clock=lambda: current["now"])
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     for _ in range(6):
         lp.refresh_candidates(force=True)
@@ -5905,6 +5965,8 @@ def test_direction_selection_follows_target_share_yield(tmp_path) -> None:
     store = PredictionArbitrageStore(tmp_path)
     lp = PolymarketLPService(store, exchange, clock=lambda: now)
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     snapshot = lp.refresh_candidates(force=True)
 
@@ -5934,6 +5996,8 @@ def test_maintenance_refreshes_all_rows_and_reranks_by_new_yield(tmp_path) -> No
     store = PredictionArbitrageStore(tmp_path)
     lp = PolymarketLPService(store, exchange, clock=lambda: current["now"])
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     snapshot = lp.refresh_candidates(force=True)
     assert [row["market_id"] for row in snapshot["candidates"]] == [
@@ -6389,6 +6453,8 @@ def _candidate_row_review_at(now_utc: datetime, tmp_path) -> object:
     )
     prepared = service.refresh_price_history()
     assert prepared["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert service.refresh_competition_cache()["state"] == "known"
     snapshot = service.refresh_candidates(force=True)
     assert snapshot["state"] == "ready"
     assert snapshot["candidates"]
@@ -7725,6 +7791,8 @@ def test_candidate_pool_ranks_by_yield_then_updated_at(tmp_path) -> None:
         PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
     )
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     first = lp.refresh_candidates(force=True)
     assert first["state"] == "ready"
@@ -7774,6 +7842,8 @@ def test_candidate_pool_replaces_dropped_estimate_and_unknown_last(tmp_path) -> 
         PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
     )
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     first = lp.refresh_candidates(force=True)
     assert [row["market_id"] for row in first["candidates"]] == [
@@ -7837,6 +7907,8 @@ def test_candidate_pool_validity_boundary_and_autobackfill(tmp_path) -> None:
         PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
     )
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     first = lp.refresh_candidates(force=True)
     assert [row["market_id"] for row in first["candidates"]] == [
@@ -7891,6 +7963,8 @@ def test_candidate_pool_failed_refresh_keeps_row_until_original_expiry(
         PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
     )
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     first = lp.refresh_candidates(force=True)
     assert [row["market_id"] for row in first["candidates"]] == [
@@ -7980,6 +8054,8 @@ def test_explore_batches_roll_through_queue_without_round_gates(tmp_path) -> Non
         PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
     )
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     snapshot = None
     reads_after_first = None
@@ -8048,6 +8124,8 @@ def test_explore_batch_failure_isolates_and_backs_off(tmp_path) -> None:
         PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
     )
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     first = lp.refresh_candidates(force=True)
     assert [row["market_id"] for row in first["candidates"]] == [
@@ -8125,6 +8203,8 @@ def test_candidate_pool_late_write_never_overwrites_newer_result(
     store = PredictionArbitrageStore(tmp_path)
     lp = PolymarketLPService(store, exchange, clock=lambda: current["now"])
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     first = lp.refresh_candidates(force=True)
     assert first["candidate_valid_count"] == 3
@@ -8214,6 +8294,8 @@ def test_maintenance_renewals_do_not_stall_exploration(tmp_path) -> None:
         PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
     )
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     def new_market_tokens(reads_before: int) -> set[str]:
         covered = {
@@ -8314,13 +8396,179 @@ def test_competition_cache_stores_resume_bookmark_and_passes_it_back(
     assert second["next_start_cursor"] is None
 
 
+def test_competition_refresh_persists_full_round_to_store(tmp_path) -> None:
+    """Issue #181: 每轮竞争值（含显式 0）全量落库，下一轮覆盖更新。"""
+    now = datetime(2026, 9, 22, 12, tzinfo=UTC)
+    rounds = iter(
+        [
+            {
+                "state": "known",
+                "complete": True,
+                "checked_at": now,
+                "round_checked_at": now,
+                "competitiveness": {
+                    "condition-A": (Decimal("0"), now),
+                    "condition-B": (Decimal("2.5"), now),
+                },
+                "not_updated": [],
+                "resume_cursor": None,
+            },
+            {
+                "state": "known",
+                "complete": True,
+                "checked_at": now,
+                "round_checked_at": now,
+                "competitiveness": {
+                    "condition-A": (Decimal("1.5"), now),
+                    "condition-B": (Decimal("2.5"), now),
+                },
+                "not_updated": [],
+                "resume_cursor": None,
+            },
+        ]
+    )
+
+    class RoundExchange:
+        def lp_market_competitiveness(
+            self, *, stop_event=None, previous=None, start_cursor=None
+        ):
+            del stop_event, previous, start_cursor
+            return dict(next(rounds))
+
+    store = PredictionArbitrageStore(tmp_path)
+    lp = PolymarketLPService(store, RoundExchange())
+    assert lp.refresh_competition_cache()["state"] == "known"
+
+    assert store.lp_competitiveness_map() == {
+        "condition-A": (Decimal("0"), now),
+        "condition-B": (Decimal("2.5"), now),
+    }
+    assert store.lp_competitiveness_count() == 2
+
+    # 第二轮覆盖同 condition_id 的行：值更新、行数不增。
+    lp.refresh_competition_cache()
+    assert store.lp_competitiveness_map()["condition-A"] == (Decimal("1.5"), now)
+    assert store.lp_competitiveness_count() == 2
+
+    # #181: 密度是慢变量，刷新节奏改小时级。
+    assert polymarket_lp._LP_COMPETITION_REFRESH_SECONDS == 3600
+
+
+def test_competition_refresh_survives_store_persistence_failure(tmp_path) -> None:
+    """Issue #181: 落库失败只记警告，内存刷新照常完成。"""
+    now = datetime(2026, 9, 22, 12, tzinfo=UTC)
+
+    class Exchange:
+        def lp_market_competitiveness(
+            self, *, stop_event=None, previous=None, start_cursor=None
+        ):
+            del stop_event, previous, start_cursor
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": now,
+                "round_checked_at": now,
+                "competitiveness": {"condition-A": (Decimal("2.5"), now)},
+                "not_updated": [],
+                "resume_cursor": None,
+            }
+
+    class FailingStore:
+        def lp_competitiveness_upsert(self, entries):
+            del entries
+            raise RuntimeError("store down")
+
+    lp = PolymarketLPService(FailingStore(), Exchange())  # type: ignore[arg-type]
+
+    assert lp.refresh_competition_cache()["state"] == "known"
+
+
+def test_competition_entries_fall_back_to_persisted_store_values(tmp_path) -> None:
+    """Issue #181: 投影时新鲜条目用缓存（fresh），缺失或超龄回库（store）。"""
+    now = datetime(2026, 9, 22, 12, tzinfo=UTC)
+    stale_round = now - timedelta(hours=4)
+    older = now - timedelta(hours=26)
+
+    fresh_round = {
+        "state": "known",
+        "complete": True,
+        "checked_at": now,
+        "round_checked_at": now,
+        "competitiveness": {"condition-B": (Decimal("2.5"), now)},
+        "not_updated": [],
+        "resume_cursor": None,
+    }
+    stale_cache_round = {
+        # 一轮超龄缓存：checked_at 早于 3 小时新鲜门。
+        "state": "known",
+        "complete": True,
+        "checked_at": stale_round,
+        "round_checked_at": stale_round,
+        "competitiveness": {"condition-E": (Decimal("4"), stale_round)},
+        "not_updated": [],
+        "resume_cursor": None,
+    }
+
+    class RoundExchange:
+        def lp_market_competitiveness(
+            self, *, stop_event=None, previous=None, start_cursor=None
+        ):
+            del stop_event, previous, start_cursor
+            return dict(fresh_round)
+
+    store = PredictionArbitrageStore(tmp_path)
+    lp = PolymarketLPService(store, RoundExchange(), clock=lambda: now)
+
+    lp.refresh_competition_cache()
+    fresh = lp._competition_entries()
+    assert fresh["condition-B"]["source"] == "fresh"
+    assert fresh["condition-B"]["value"] == Decimal("2.5")
+    assert fresh["condition-B"]["checked_at"] == now
+    assert fresh["condition-B"]["updated"] is True
+
+    # 清空内存态、库有行 → source="store"，值/时间来自库。
+    store.lp_competitiveness_upsert(
+        (("condition-C", Decimal("7"), older),)
+    )
+    lp._competition_state = {}
+    entries = lp._competition_entries()
+    assert entries["condition-C"] == {
+        "value": Decimal("7"),
+        "checked_at": older,
+        "updated": None,
+        "source": "store",
+    }
+    # 首轮已落库的 B 也以库值回取。
+    assert entries["condition-B"] == {
+        "value": Decimal("2.5"),
+        "checked_at": now,
+        "updated": None,
+        "source": "store",
+    }
+    # 库里也没有的 condition 不出现在 entries。
+    assert "condition-D" not in entries
+
+    # 缓存条目超 3 小时新鲜门 → 同样回库取值。
+    store.lp_competitiveness_upsert(
+        (("condition-E", Decimal("9"), older),)
+    )
+    lp._competition_state = dict(stale_cache_round)
+    stale_entries = lp._competition_entries()
+    assert stale_entries["condition-E"]["source"] == "store"
+    assert stale_entries["condition-E"]["value"] == Decimal("9")
+    assert stale_entries["condition-E"]["checked_at"] == older
+
+
 def test_hanging_competition_read_never_blocks_candidate_batches(
     tmp_path,
 ) -> None:
     """Issue #157 A9: a hanging or failing lp_market_competitiveness read
-    never blocks the candidate batch path — batches publish yield results
-    with unknown competition while the dedicated competition thread is the
-    only caller of the reader."""
+    never blocks the candidate batch path — batches publish their results
+    while the dedicated competition thread is the only caller of the
+    reader.  Issue #181 contract change: the batch still needs competition
+    facts, so this test seeds the persisted store (the fallback the
+    projection reads when the cache is empty) instead of relying on the
+    old unknown-competition rows."""
     now = datetime(2026, 9, 20, 16, tzinfo=UTC)
     current = {"now": now}
     pools = {"M01": Decimal(600), "M02": Decimal(590), "M03": Decimal(580)}
@@ -8338,9 +8586,17 @@ def test_hanging_competition_read_never_blocks_candidate_batches(
         raise RuntimeError("competition read failed")
 
     exchange.lp_market_competitiveness = hanging_competition  # type: ignore[method-assign]
-    lp = PolymarketLPService(
-        PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
+    store = PredictionArbitrageStore(tmp_path)
+    # Seeded persisted competition: the reader never succeeds, so the
+    # projection falls back to these store rows for every batch.
+    store.lp_competitiveness_upsert(
+        (
+            ("condition-M01", Decimal("2"), now),
+            ("condition-M02", Decimal("3"), now),
+            ("condition-M03", Decimal("4"), now),
+        )
     )
+    lp = PolymarketLPService(store, exchange, clock=lambda: current["now"])
     assert lp.refresh_price_history()["state"] == "known"
 
     # The batch path publishes although the competition reader would hang.
@@ -8353,7 +8609,9 @@ def test_hanging_competition_read_never_blocks_candidate_batches(
     ]
     assert snapshot["funnel"]["competition_state"] == "unknown"
     for row in snapshot["candidates"]:
-        assert row["competition"]["state"] == "unknown"
+        # Store-sourced values: kept, labelled, never unknown.
+        assert row["competition"]["state"] == "known"
+        assert row["competition"]["source"] == "store"
         assert row["state"] == "eligible"
 
     # The dedicated cache refresh is the only competition caller: it blocks
@@ -8404,6 +8662,8 @@ def test_candidate_pool_save_throttle_and_restart_restore(tmp_path) -> None:
         counting_store, exchange, clock=lambda: current["now"]
     )
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     lp.refresh_candidates(force=True)
     first_save_count = counting_store.save_count
@@ -8482,6 +8742,8 @@ def test_candidate_snapshot_has_no_whole_snapshot_expiry(tmp_path) -> None:
     assert empty["candidate_failed_recent_count"] == 0
 
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
     first = lp.refresh_candidates(force=True)
     assert first["candidate_valid_count"] == 3
 
@@ -8516,6 +8778,8 @@ def test_refresh_candidates_mid_batch_failure_publishes_honestly(
     store = PredictionArbitrageStore(tmp_path)
     lp = PolymarketLPService(store, exchange, clock=lambda: current["now"])
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     first = lp.refresh_candidates(force=True)
     assert [row["market_id"] for row in first["candidates"]] == [
@@ -8578,6 +8842,8 @@ def test_maintenance_late_failure_never_mislabels_newer_row(tmp_path) -> None:
         PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
     )
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     assert lp.refresh_candidates(force=True)["candidate_valid_count"] == 2
     # A second exploration batch re-judges both markets at +40s; the queue
@@ -8621,6 +8887,8 @@ def test_maintenance_late_rejection_never_evicts_newer_row(tmp_path) -> None:
         PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
     )
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     assert lp.refresh_candidates(force=True)["candidate_valid_count"] == 2
     current["now"] = now + timedelta(seconds=40)
@@ -8656,6 +8924,8 @@ def test_maintenance_guard_rejected_success_is_not_a_failure(tmp_path) -> None:
         PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
     )
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     assert lp.refresh_candidates(force=True)["candidate_valid_count"] == 1
     current["now"] = now + timedelta(seconds=40)
@@ -8689,6 +8959,8 @@ def test_subsequent_publish_evicts_expired_rows_and_facts(tmp_path) -> None:
     store = PredictionArbitrageStore(tmp_path)
     lp = PolymarketLPService(store, exchange, clock=lambda: current["now"])
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     first = lp.refresh_candidates(force=True)
     assert [row["market_id"] for row in first["candidates"]] == [
@@ -8753,6 +9025,8 @@ def test_candidate_pending_count_counts_current_queue_members(tmp_path) -> None:
         PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
     )
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
 
     first = lp.refresh_candidates(force=True)
     assert first["funnel"]["checked"] == 10
@@ -8797,6 +9071,8 @@ def test_healthy_batch_clears_stale_stop_reason(tmp_path) -> None:
         PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current["now"]
     )
     assert lp.refresh_price_history()["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先预热一轮竞争。
+    assert lp.refresh_competition_cache()["state"] == "known"
     assert lp.refresh_candidates(force=True)["state"] == "ready"
 
     exchange.account_mode = "failure"

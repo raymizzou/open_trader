@@ -29,8 +29,13 @@ _BEIJING = ZoneInfo("Asia/Shanghai")
 LP_DAILY_AMPLITUDE_LIMIT = Decimal("0.01")
 LP_SHORTLIST_LIMIT = 50
 LP_TRIAL_CANDIDATE_LIMIT = 10
-LP_COMPETITION_MAX_AGE = timedelta(hours=1)
+LP_COMPETITION_MAX_AGE = timedelta(hours=3)  # Issue #181 定案 A：全量 17.7 万市场单轮 ~44 分钟、周期 ~104 分钟，3 小时窗让「旧」只在真断流时出现。
 LP_REFERENCE_PRICE_MAX_AGE = timedelta(hours=1)
+# Issue #181: 全量分布采样（16,258 个活跃有奖池市场）定稿——
+# 1≈p10（竞争流动性不足一天奖池）、30≈中位数、300≈p90。
+LP_COMPETITION_DENSITY_THIN_FLOOR = Decimal("1")
+LP_COMPETITION_DENSITY_LIGHT_MAX = Decimal("30")
+LP_COMPETITION_DENSITY_MID_MAX = Decimal("300")
 
 
 def _lp_history_summary(direction: Mapping[str, object]) -> Mapping[str, object] | None:
@@ -606,12 +611,19 @@ def lp_candidate_rows(
 
 
 def _lp_competition_entry(entry: object) -> dict[str, object]:
-    """Parse one competition cache entry into value, checked_at, and updated."""
+    """Parse one competition cache entry into value, checked_at, and updated.
 
+    Since #181 the entry also carries its projection source ("fresh" for
+    this round's cache, "store" for the persisted fallback); tuple-shaped
+    raw entries have no source and default to None.
+    """
+
+    source: object = None
     if isinstance(entry, Mapping):
         value = _maybe_decimal(entry.get("value"))
         checked = entry.get("checked_at")
         updated = entry.get("updated")
+        source = entry.get("source")
     elif isinstance(entry, (list, tuple)) and len(entry) == 2:
         value = _maybe_decimal(entry[0])
         checked = entry[1]
@@ -630,6 +642,7 @@ def _lp_competition_entry(entry: object) -> dict[str, object]:
         "value": value,
         "checked_at": checked_at,
         "updated": updated if isinstance(updated, bool) else None,
+        "source": source if source in ("fresh", "store") else None,
     }
 
 
@@ -813,6 +826,7 @@ def lp_trial_candidates(
     competition: object,
     account_budget_facts: object,
     now: datetime,
+    competition_round_checked_at: datetime | None = None,
 ) -> dict[str, object]:
     """Project the at most ten trial candidates shown on the LP dashboard.
 
@@ -825,9 +839,13 @@ def lp_trial_candidates(
     order only decides the check sequence — published ranking is the
     service's 5% target-share yield estimate (issue #138 round 2).  Only
     the batch head is verified against the live book by the service.
-    Explicit zero competition means nobody competes and is excluded as a
-    danger signal; unread or stale competition stays unknown, never fills
-    in as 0, and only breaks ties after the query order.
+    Issue #181: the official ``market_competitiveness`` value is the
+    density (pool-normalised upstream, never divided again here).  Only
+    the light and mid tiers are kept — explicit zero, sub-floor thin,
+    over-cap crowded and missing/no-data markets are all excluded and
+    counted, with no cold-start exemption (an empty store and an empty
+    cache are simply no data).  Competition is a tie-break reference
+    after the query order, unchanged.
     """
 
     result: dict[str, object] = {
@@ -839,7 +857,16 @@ def lp_trial_candidates(
             "trial": 0,
             "competition_known": 0,
             "competition_unknown": 0,
-            "excluded": {"competition_empty": 0, "over_available": 0},
+            "excluded": {
+                "competition_missing": 0,
+                "competition_empty": 0,
+                "competition_too_thin": 0,
+                "competition_too_crowded": 0,
+                "over_available": 0,
+            },
+            "competition_light": 0,
+            "competition_mid": 0,
+            "competition_round_checked_at": competition_round_checked_at,
             "gap_reason": None,
             "reasons": {"read": [], "base": [], "sort": [], "trial": []},
         },
@@ -982,33 +1009,78 @@ def lp_trial_candidates(
         for condition_id in read_conditions
     }
     ranked: list[dict[str, object]] = []
-    empty_competition = 0
+    # Issue #181 density gate: the official value is used as-is (pool
+    # normalisation already happened upstream).  Light and mid tiers are
+    # kept; explicit zero, sub-floor thin, over-cap crowded and missing
+    # values are all excluded and counted.  There is no cold-start
+    # exemption: no entry anywhere is just competition_missing.
+    excluded_density: dict[str, int] = {
+        "competition_missing": 0,
+        "competition_empty": 0,
+        "competition_too_thin": 0,
+        "competition_too_crowded": 0,
+    }
+    tier_counts: dict[str, int] = {"light": 0, "mid": 0}
     for candidate in base_candidates:
         condition_id = str(candidate.get("condition_id") or "")
-        entry = entries.get(condition_id, {
-            "value": None, "checked_at": None, "updated": None,
-        })
-        value = entry["value"]
-        entry_checked = entry["checked_at"]
-        stale = (
-            entry_checked is None
-            or entry_checked > checked_at
-            or (checked_at - entry_checked).total_seconds() >= LP_COMPETITION_MAX_AGE.total_seconds()
+        entry = entries.get(condition_id)
+        if not isinstance(entry, Mapping):
+            entry = {
+                "value": None,
+                "checked_at": None,
+                "updated": None,
+                "source": None,
+            }
+        value = entry.get("value")
+        entry_checked = entry.get("checked_at")
+        usable = (
+            value is not None
+            and isinstance(entry_checked, datetime)
+            and entry_checked.tzinfo is not None
+            and entry_checked <= checked_at
         )
-        known = value is not None and not stale
-        if known and value == 0:
+        if not usable:
+            excluded_density["competition_missing"] += 1
+            add_reason("sort", candidate, "competition_missing")
+            continue
+        if value == 0:
             # Explicit zero means nobody competes on the official market:
             # a danger signal, so the market is dropped, never shown as 0.
-            empty_competition += 1
+            excluded_density["competition_empty"] += 1
             add_reason("sort", candidate, "competition_empty")
             continue
+        if value < LP_COMPETITION_DENSITY_THIN_FLOOR:
+            excluded_density["competition_too_thin"] += 1
+            add_reason("sort", candidate, "competition_too_thin")
+            continue
+        if value >= LP_COMPETITION_DENSITY_MID_MAX:
+            excluded_density["competition_too_crowded"] += 1
+            add_reason("sort", candidate, "competition_too_crowded")
+            continue
+        tier = (
+            "light"
+            if value < LP_COMPETITION_DENSITY_LIGHT_MAX
+            else "mid"
+        )
+        tier_counts[tier] += 1
+        entry_source = entry.get("source")
         candidate["competition"] = {
-            "value": value if known else None,
+            "value": value,
             "raw_value": value,
             "checked_at": _iso(entry_checked) if entry_checked is not None else None,
-            "state": "known" if known else "unknown",
-            "stale": stale and value is not None,
-            "updated": entry["updated"],
+            "state": "known",
+            # Informational only since #181: freshness gating (fresh cache
+            # vs store fallback) happens in the service projection, so a
+            # store-sourced value is kept and labelled regardless of age.
+            "stale": (
+                (checked_at - entry_checked).total_seconds()
+                >= LP_COMPETITION_MAX_AGE.total_seconds()
+            ),
+            "updated": entry.get("updated"),
+            "tier": tier,
+            "source": (
+                entry_source if entry_source in ("fresh", "store") else "fresh"
+            ),
         }
         ranked.append(candidate)
 
@@ -1089,7 +1161,7 @@ def lp_trial_candidates(
             ),
             "无已知订单或持仓",
         ]
-    excluded_counts = {"competition_empty": 0, "over_available": 0}
+    excluded_counts = {"over_available": 0}
 
     def over_available(candidate: Mapping[str, object]) -> bool:
         capital = candidate.get("reference_capital")
@@ -1164,9 +1236,12 @@ def lp_trial_candidates(
             and candidate["competition"].get("state") != "known"
         ),
         "excluded": {
-            "competition_empty": empty_competition,
+            **excluded_density,
             "over_available": excluded_counts["over_available"],
         },
+        "competition_light": tier_counts["light"],
+        "competition_mid": tier_counts["mid"],
+        "competition_round_checked_at": competition_round_checked_at,
         "normal_queue_count": len(kept_normal),
         "backup_queue_count": len(kept_backup),
         "reference_price_unknown": len(kept_backup),

@@ -864,6 +864,12 @@ class PredictionArbitrageStore:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(account_id, condition_id)
             );
+
+            CREATE TABLE IF NOT EXISTS lp_market_competitiveness (
+                condition_id TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                checked_at TEXT NOT NULL
+            );
             """
         )
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
@@ -4356,6 +4362,72 @@ class PredictionArbitrageStore:
             )
             result[condition_id] = payload
         return result
+
+    def lp_competitiveness_upsert(
+        self,
+        entries: Iterable[tuple[str, Decimal, datetime]],
+    ) -> int:
+        """Persist one full competition round in a single transaction (#181).
+
+        Rows are keyed by condition_id; a re-read of the same market replaces
+        its previous value and checked_at instead of stacking a second row.
+        """
+
+        encoded: list[tuple[str, str, str]] = []
+        for condition_id, value, checked_at in entries:
+            condition = str(condition_id).strip()
+            if not condition:
+                raise ValueError("lp_competitiveness_identity_invalid")
+            if not isinstance(value, Decimal):
+                raise ValueError("lp_competitiveness_value_invalid")
+            encoded.append(
+                (
+                    condition,
+                    _decimal_string(value),
+                    _canonical_timestamp(checked_at),
+                )
+            )
+        if not encoded:
+            return 0
+        with self._transaction() as connection:
+            connection.executemany(
+                """
+                INSERT OR REPLACE INTO lp_market_competitiveness
+                (condition_id, value, checked_at)
+                VALUES (?, ?, ?)
+                """,
+                encoded,
+            )
+        return len(encoded)
+
+    def lp_competitiveness_map(self) -> dict[str, tuple[Decimal, datetime]]:
+        """Read every persisted competition value back keyed by condition_id."""
+
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT condition_id, value, checked_at
+                FROM lp_market_competitiveness
+                """
+            ).fetchall()
+        result: dict[str, tuple[Decimal, datetime]] = {}
+        for row in rows:
+            try:
+                value = Decimal(str(row["value"]))
+                checked_at = _parse_timestamp(row["checked_at"])
+            except (ArithmeticError, TypeError, ValueError):
+                continue
+            result[str(row["condition_id"])] = (value, checked_at)
+        return result
+
+    def lp_competitiveness_count(self) -> int:
+        """Count the persisted competition rows."""
+
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM lp_market_competitiveness"
+            ).fetchone()
+        return int(row[0])
 
     @staticmethod
     def _lp_report_date(report_date: str) -> str:

@@ -4143,18 +4143,34 @@ function lpDashboardTodayMarketRow(
 }
 
 function lpTrialCompetitionMarkup(competition) {
+  // Issue #181: 官方竞争列密度化——数值旁标轻/中档位 pill；store 来源的
+  // 行是本轮没拉到、回取数据库上次值，副行以「旧 · 时间」如实标注。
   const comp = competition && typeof competition === "object" ? competition : {};
+  if (comp.state === "known" && predictionHasValue(comp.value)) {
+    const tier = String(comp.tier || "");
+    const pill = tier === "light"
+      ? "<span class=\"pm-pill lp-tier-light\">轻</span>"
+      : tier === "mid"
+        ? "<span class=\"pm-pill lp-tier-mid\">中</span>"
+        : "";
+    const stamp = predictionHasValue(comp.checked_at)
+      ? "<span class=\"sub\">"
+        + (comp.source === "store"
+          ? "旧 · " + escapeHtml(predictionHktTimestamp(comp.checked_at))
+          : "数据 " + escapeHtml(predictionHktTimestamp(comp.checked_at)))
+        + "</span>"
+      : "";
+    const updatedSub = comp.updated === false && comp.source !== "store"
+      ? "<span class=\"sub\">本轮未更新</span>"
+      : "";
+    return "<div class=\"num\"><span>" + escapeHtml(String(comp.value)) + "</span>"
+      + pill + stamp + updatedSub + "</div>";
+  }
   const updatedSub = comp.updated === false
     ? "<span class=\"sub\">本轮未更新</span>"
     : "";
-  if (comp.state === "known" && predictionHasValue(comp.value)) {
-    const stamp = predictionHasValue(comp.checked_at)
-      ? "<span class=\"sub\">数据 " + escapeHtml(predictionHktTimestamp(comp.checked_at)) + "</span>"
-      : "";
-    return "<div class=\"num\">" + escapeHtml(String(comp.value)) + stamp + updatedSub + "</div>";
-  }
   const note = comp.stale === true
-    ? "<span class=\"sub\">超 1 小时未更新</span>"
+    ? "<span class=\"sub\">超 3 小时未更新</span>"
     : "<span class=\"sub\">不填 0 · 指标并列时排已知之后</span>";
   return "<div class=\"num pm-lp-unknown\">未知" + note + updatedSub + "</div>";
 }
@@ -4322,7 +4338,7 @@ function lpTrialCandidateRow(row, currentConditionId) {
   const identity = "<td data-label=\"市场与方向\">" + lpMarketTitleLink(row)
     + "<span class=\"sub\">" + escapeHtml(predictionValue(row.market_id, row.condition_id))
     + " · 买 " + escapeHtml(predictionValue(selectedOutcome, "UNKNOWN")) + "</span></td>";
-  const competition = "<td data-label=\"官方竞争\">" + lpTrialCompetitionMarkup(row.competition) + "</td>";
+  const competition = "<td data-label=\"官方竞争 · 密度\">" + lpTrialCompetitionMarkup(row.competition) + "</td>";
   const pool = "<td data-label=\"日奖池\" class=\"num\">"
     + escapeHtml(lpDashboardMoney(row.daily_pool_usd)) + "</td>";
   const queryRate = lpTrialQueryRateCell(row);
@@ -4445,6 +4461,13 @@ function predictionLpCard(payload) {
   const excluded = funnel.excluded && typeof funnel.excluded === "object" ? funnel.excluded : {};
   const overAvailableCount = Math.max(0, Number(excluded.over_available) || 0);
   const competitionEmptyCount = Math.max(0, Number(excluded.competition_empty) || 0);
+  // Issue #181: 密度排除计数——重度/无数据/过薄，与既有取法同一防御。
+  const competitionCrowdedCount = Math.max(0, Number(excluded.competition_too_crowded) || 0);
+  const competitionMissingCount = Math.max(0, Number(excluded.competition_missing) || 0);
+  const competitionThinCount = Math.max(0, Number(excluded.competition_too_thin) || 0);
+  const densityExcludedCounts = "重度竞争 " + escapeHtml(String(competitionCrowdedCount))
+    + " · 无数据 " + escapeHtml(String(competitionMissingCount))
+    + " · 过薄 " + escapeHtml(String(competitionThinCount));
   const budget = funnel.budget && typeof funnel.budget === "object" ? funnel.budget : {};
   const budgetStampAt = dashboard.candidate_last_success_at || dashboard.candidate_checked_at;
   const budgetLineMarkup = lpBudgetLineMarkup(budget, budgetStampAt);
@@ -4474,22 +4497,33 @@ function predictionLpCard(payload) {
     : "<tr><td colspan=\"8\" class=\"pm-observation-empty\">"
       + (dashboard.scanning === true
         ? "候选探索进行中，当前没有有效期内的估值。"
-        : "候选池当前没有有效期内的估值；未检查的市场不代表劣于已展示者。竞争为 0 排除 "
-          + escapeHtml(String(competitionEmptyCount))
+        : "候选池当前没有有效期内的估值；未检查的市场不代表劣于已展示者。"
+          + escapeHtml(densityExcludedCounts)
+          + " · 竞争为 0 排除 " + escapeHtml(String(competitionEmptyCount))
           + " 个，超可用排除 " + escapeHtml(String(overAvailableCount)) + " 个。")
       + "</td></tr>";
+  const competitionRoundAt = funnel.competition_round_checked_at;
+  const competitionObservationMarkup = "<p class=\"pm-lp-competition-status sub\">竞争数据：最近一轮成功 "
+    + escapeHtml(predictionHasValue(competitionRoundAt)
+      ? predictionHktTimestamp(competitionRoundAt) : "UNKNOWN")
+    + " · 覆盖 " + escapeHtml(String(Math.max(0, Number(funnel.competition_known) || 0)))
+    + " · 轻 " + escapeHtml(String(Math.max(0, Number(funnel.competition_light) || 0)))
+    + " · 中 " + escapeHtml(String(Math.max(0, Number(funnel.competition_mid) || 0)))
+    + "</p>";
   const candidateSection = "<section aria-label=\"LP 待试挂候选\"><h3>待试挂候选"
     + "<span class=\"sub\">· 非全市场收益前十 · 已排除超可用资金 "
     + escapeHtml(String(overAvailableCount)) + " 个"
+    + " · " + densityExcludedCounts
     + (gapReason ? " · " + escapeHtml(gapReason) : "")
     + "</span></h3>"
     + poolStatusMarkup
+    + competitionObservationMarkup
     + "<div class=\"pm-table-wrap\"><table class=\"pm-table pm-lp-candidate-table\">"
-    + "<thead><tr><th scope=\"col\">市场与方向</th><th scope=\"col\">官方竞争</th><th scope=\"col\">日奖池</th>"
+    + "<thead><tr><th scope=\"col\">市场与方向</th><th scope=\"col\">官方竞争 · 密度</th><th scope=\"col\">日奖池</th>"
     + "<th scope=\"col\">5% 奖励份额 · 预计收益率/小时</th><th scope=\"col\">拟挂方案（价 × 份 = 实际占资）</th>"
     + "<th scope=\"col\">压力退出损失（金额 / 比例）</th><th scope=\"col\">检查时间与状态</th><th scope=\"col\">操作</th></tr></thead>"
     + "<tbody>" + candidateRowsHtml + "</tbody></table></div>"
-    + "<p class=\"sub\">候选为持续滚动的候选池：探索线程按基础筛选队列分批轮转（每批最多 10 个市场、一次盘口读），估值成功即入池、每行自带 5 分钟有效期、到期自动让位；维护线程持续为当前展示前十续命；表内按目标 5% 官方奖励份额的预计收益率/小时降序，并列按估值时间新→旧、再按市场身份，第 1 名为当前推荐、退出由下一名自动补位；刷新失败的行保留至原到期并标注，值为上次成功估值；预计收益率为估值时盘口的估算、非保证收益，缺值显示待测、不回退奖池上限；未检查的市场不代表劣于已展示者；已有委托或持仓的市场不重复推荐；拟挂占资超过可用资金（已扣委托占用）的候选不进入队列；参考价有 1 小时新鲜门，过期进入备用队列；官方竞争仅作并列参考；链接为普通跳转，实际下单前以 Polymarket 页面实时事实为准。</p></section>";
+    + "<p class=\"sub\">候选为持续滚动的候选池：探索线程按基础筛选队列分批轮转（每批最多 10 个市场、一次盘口读），估值成功即入池、每行自带 5 分钟有效期、到期自动让位；维护线程持续为当前展示前十续命；表内按目标 5% 官方奖励份额的预计收益率/小时降序，并列按估值时间新→旧、再按市场身份，第 1 名为当前推荐、退出由下一名自动补位；刷新失败的行保留至原到期并标注，值为上次成功估值；预计收益率为估值时盘口的估算、非保证收益，缺值显示待测、不回退奖池上限；未检查的市场不代表劣于已展示者；已有委托或持仓的市场不重复推荐；拟挂占资超过可用资金（已扣委托占用）的候选不进入队列；参考价有 1 小时新鲜门，过期进入备用队列；官方竞争按密度分档筛选，仅保留轻（[1,30)）中（[30,300)）两档，重度/过薄/零竞争/无数据市场整行排除并计入排除数；链接为普通跳转，实际下单前以 Polymarket 页面实时事实为准。</p></section>";
   // Issue 166: 一组沿用原标题；多组标题改「活动组 · N」，卡序=服务端顺序
   //（最新在前），完结组沉底照常显示。
   const sessionSummary = sessionList.length > 1
@@ -5322,7 +5356,7 @@ function predictionLpFunnel(payload) {
       (numeric(read("trial")) || 0) > 0 ? "good" : "drop",
     ),
   ].join("");
-  return `<section class="pm-panel pm-relation-funnel pm-lp-funnel" aria-label="LP 标的评估"><header class="pm-funnel-header"><div><h2>LP 标的评估</h2><p>读取市场 → 基础筛选 → 排序 → 待测候选</p></div><span class="pm-pill ${stale ? "watch" : scanning ? "watch" : ""}">${escapeHtml(status)}</span></header><div class="pm-funnel-lane"><div class="pm-funnel-grid pm-funnel-grid-catalog pm-lp-funnel-grid">${stages}</div></div><div class="pm-funnel-meta"><span>官方竞争仅在指标并列时决定先后；缺失或超 1 小时显示未知、不填 0</span><span>最低占资超过可用资金的候选不展示，计入排除数</span>${reasons}</div></section>`;
+  return `<section class="pm-panel pm-relation-funnel pm-lp-funnel" aria-label="LP 标的评估"><header class="pm-funnel-header"><div><h2>LP 标的评估</h2><p>读取市场 → 基础筛选 → 排序 → 待测候选</p></div><span class="pm-pill ${stale ? "watch" : scanning ? "watch" : ""}">${escapeHtml(status)}</span></header><div class="pm-funnel-lane"><div class="pm-funnel-grid pm-funnel-grid-catalog pm-lp-funnel-grid">${stages}</div></div><div class="pm-funnel-meta"><span>官方竞争密度分档筛选只留轻中（并列时按值升序）；缺失/重度/过薄/零竞争整行排除，不填 0</span><span>最低占资超过可用资金的候选不展示，计入排除数</span>${reasons}</div></section>`;
 }
 
 function predictionLpPreparation(preparation) {

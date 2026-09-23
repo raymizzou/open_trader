@@ -89,10 +89,10 @@ _LP_CANDIDATE_BATCH_SIZE = 10
 # Issue #157: the exploration loop never polls faster than one batch per two
 # seconds; the runtime scheduler clamps its wait to this floor.
 _LP_CANDIDATE_BATCH_MIN_INTERVAL_SECONDS = 2.0
-# Issue #157: official competition refreshes on its own thread every ten
-# minutes; candidate paths only read the in-memory cache and never block on
-# a competition read.
-_LP_COMPETITION_REFRESH_SECONDS = 600
+# Issue #157: official competition refreshes on its own thread; candidate
+# paths only read the in-memory cache and never block on a competition read.
+# #181: 密度是慢变量，小时级节奏。
+_LP_COMPETITION_REFRESH_SECONDS = 3600
 # Issue #157: pool publications persist at most once every five seconds.
 _LP_CANDIDATE_SNAPSHOT_SAVE_MIN_INTERVAL_SECONDS = 5.0
 _LP_BOOK_SAMPLE_BATCH_SIZE = 100
@@ -714,7 +714,7 @@ def _lp_funnel_conditions() -> dict[str, object]:
         },
         "sort": {
             "主排序": "假设每小时收益上限（日奖池÷(24×最低参考占资)）降序；乐观上限仅决定查询顺序，不是预计收益",
-            "并列": "官方竞争仅在指标并列时决定先后：≤1 小时已知按值升序，缺失或超 1 小时为未知、不填 0、排已知之后；竞争为 0 是危险信号直接排除",
+            "并列": "官方竞争按密度分档筛选，仅保留轻（[1,30)）、中（[30,300)）两档；重度（≥300）、过薄（<1）、零竞争、无数据整市场排除并计数；库存回退值标「旧」（3 小时窗、无年龄上限）；两档内部并列时按竞争值升序",
             "再排": "参考占资升序；兜底 market_id 升序",
             "备用": "参考价超 1 小时或缺失的进备用队列，按日奖池降序",
         },
@@ -4326,6 +4326,9 @@ class PolymarketLPService:
             competition=self._competition_entries(),
             account_budget_facts=available_facts,
             now=checked_at,
+            competition_round_checked_at=(
+                self._competition_state.get("round_checked_at")
+            ),
         )
         queue_normal = [
             dict(row)
@@ -4359,6 +4362,9 @@ class PolymarketLPService:
                 "competition_known",
                 "competition_unknown",
                 "excluded",
+                "competition_light",
+                "competition_mid",
+                "competition_round_checked_at",
                 "normal_queue_count",
                 "backup_queue_count",
                 "reference_price_unknown",
@@ -6110,9 +6116,11 @@ class PolymarketLPService:
     ) -> dict[str, object]:
         """Pull official competitiveness into the in-process cache.
 
-        The cache is pure memory: never persisted, never a table.  A failed
-        read keeps the previous values (the reader already merges them) and
-        never blocks the candidate funnel.
+        #181: every full round is also persisted to the store (explicit
+        zeros included) so later rounds can fall back to the last known
+        value for markets the current round did not pull.  A failed read
+        keeps the previous values (the reader already merges them) and a
+        failed persistence only logs — neither blocks the candidate funnel.
         """
 
         reader = getattr(self.exchange, "lp_market_competitiveness", None)
@@ -6142,15 +6150,63 @@ class PolymarketLPService:
                 }
                 with self._competition_lock:
                     self._competition_state = stored
+                self._persist_competition(stored)
         with self._competition_lock:
             return deepcopy(self._competition_state)
 
+    def _persist_competition(self, stored: Mapping[str, object]) -> None:
+        """Write one full round's competitiveness to the store (#181)."""
+
+        upsert = getattr(self.store, "lp_competitiveness_upsert", None)
+        if not callable(upsert):
+            return
+        raw_map = stored.get("competitiveness")
+        if not isinstance(raw_map, Mapping):
+            return
+        entries: list[tuple[str, Decimal, datetime]] = []
+        for condition_id, value in raw_map.items():
+            if not isinstance(condition_id, str) or not condition_id.strip():
+                continue
+            if isinstance(value, tuple) and len(value) == 2:
+                entry_value, checked_at = value
+            elif isinstance(value, Mapping):
+                entry_value = value.get("value")
+                checked_at = value.get("checked_at")
+            else:
+                continue
+            if not isinstance(entry_value, Decimal):
+                continue
+            if not isinstance(checked_at, datetime) or checked_at.tzinfo is None:
+                continue
+            entries.append((condition_id, entry_value, checked_at))
+        if not entries:
+            return
+        try:
+            upsert(entries)
+        except Exception:
+            logger.warning(
+                "lp competition persistence failed: rows=%d", len(entries)
+            )
+
     def _competition_entries(self) -> dict[str, object]:
-        """Project the cached competition map for the trial-candidate view."""
+        """Project the competition map for the trial-candidate view (#181).
+
+        Fresh cache entries (inside the one-hour competition freshness gate)
+        win with ``source="fresh"``; everything else — a missing cache or an
+        entry older than the gate — falls back to the last persisted round
+        with ``source="store"`` and the store's own checked_at.  Conditions
+        present in neither source are left out entirely: the view owns the
+        missing-data exclusion and there is no cold-start exemption.
+        """
+
+        # Lazy import: polymarket_lp_views imports this module at load time.
+        from .polymarket_lp_views import LP_COMPETITION_MAX_AGE
 
         state = self._competition_state
         round_checked_at = state.get("round_checked_at")
+        now = self.clock()
         entries: dict[str, object] = {}
+        fresh_conditions: set[str] = set()
         raw_map = state.get("competitiveness")
         if isinstance(raw_map, Mapping):
             for condition_id, value in raw_map.items():
@@ -6163,6 +6219,13 @@ class PolymarketLPService:
                     checked_at = value.get("checked_at")
                 else:
                     continue
+                fresh = False
+                if isinstance(checked_at, datetime) and checked_at.tzinfo is not None:
+                    age = (now - checked_at).total_seconds()
+                    fresh = 0 <= age < LP_COMPETITION_MAX_AGE.total_seconds()
+                if not fresh:
+                    continue
+                fresh_conditions.add(condition_id)
                 entries[condition_id] = {
                     "value": entry_value,
                     "checked_at": checked_at,
@@ -6172,8 +6235,33 @@ class PolymarketLPService:
                         and isinstance(round_checked_at, datetime)
                         else None
                     ),
+                    "source": "fresh",
+                }
+        store_map = self._competition_store_map()
+        if store_map:
+            for condition_id, (value, checked_at) in store_map.items():
+                if condition_id in fresh_conditions:
+                    continue
+                entries[condition_id] = {
+                    "value": value,
+                    "checked_at": checked_at,
+                    "updated": None,
+                    "source": "store",
                 }
         return entries
+
+    def _competition_store_map(self) -> dict[str, tuple[Decimal, datetime]]:
+        """Read the persisted competition map, tolerating store failures."""
+
+        reader = getattr(self.store, "lp_competitiveness_map", None)
+        if not callable(reader):
+            return {}
+        try:
+            store_map = reader()
+        except Exception:
+            logger.warning("lp competition store read failed")
+            return {}
+        return store_map if isinstance(store_map, dict) else {}
 
     def _candidate_reservations(self) -> tuple[dict[str, object], ...]:
         reservations: list[dict[str, object]] = []

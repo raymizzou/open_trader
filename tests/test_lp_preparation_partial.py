@@ -144,6 +144,10 @@ def test_history_batch_failure_keeps_later_batches_and_partial_results(
 
     exchange = HistoryExchange()
     db = PredictionArbitrageStore(tmp_path / "data")
+    # Issue #181 适配：候选需竞争值过密度门，预置全目录保留档（轻档）行。
+    db.lp_competitiveness_upsert(
+        (condition_id, Decimal("2.5"), T) for condition_id in conditions
+    )
     service = PolymarketLPService(db, exchange, clock=lambda: T)
 
     result = service.refresh_price_history()
@@ -348,6 +352,11 @@ def test_partial_metadata_keeps_successful_markets_screenable(
 
     exchange = PartialMetadataExchange()
     db = PredictionArbitrageStore(tmp_path / "data")
+    # Issue #181 适配：候选需竞争值过密度门，预置目录条件的保留档（轻档）行。
+    db.lp_competitiveness_upsert(
+        (condition_id, Decimal("2.5"), T)
+        for condition_id in (*catalog_condition_ids, "condition-d")
+    )
     service = PolymarketLPService(db, exchange, clock=lambda: current[0])
 
     first = service.refresh_price_history()
@@ -712,6 +721,8 @@ def test_metadata_retry_with_valid_history_cache_finishes_budget(
         {"t": int(T.timestamp()), "p": Decimal("0.505")},
     ]
     store = PredictionArbitrageStore(tmp_path / "data")
+    # Issue #181 适配：候选需竞争值过密度门，预置保留档（轻档）行。
+    store.lp_competitiveness_upsert((("condition-b", Decimal("2.5"), T),))
     store.lp_save_price_history(
         "condition-b",
         "token-b",
@@ -1389,6 +1400,13 @@ def test_preparation_can_publish_valid_results_before_slow_batch_finishes(
             }
 
     db = PredictionArbitrageStore(tmp_path / "data")
+    # Issue #181 适配：候选需竞争值过密度门，预置保留档（轻档）行。
+    db.lp_competitiveness_upsert(
+        (
+            ("condition-ready", Decimal("2.5"), T),
+            ("condition-waiting", Decimal("2.5"), T),
+        )
+    )
     checked_at = T - timedelta(minutes=5)
     db.lp_save_price_history(
         "condition-ready",
@@ -1687,6 +1705,11 @@ def test_partial_retry_pauses_only_failed_items_across_restart(tmp_path: Path) -
             }
 
     store = PredictionArbitrageStore(tmp_path / "data")
+    # Issue #181 适配：候选需竞争值过密度门，预置目录条件的保留档（轻档）行。
+    store.lp_competitiveness_upsert(
+        (condition_id, Decimal("2.5"), T)
+        for condition_id in ("condition-a", "condition-b", "condition-c", "condition-d")
+    )
     service = PolymarketLPService(store, Exchange(), clock=lambda: current[0])
 
     first = service.refresh_price_history()
@@ -2046,6 +2069,10 @@ def test_failed_group_does_not_block_other_items_or_duplicate_retry_alerts(
             }
 
     store = PredictionArbitrageStore(tmp_path / "data")
+    # Issue #181 适配：候选需竞争值过密度门，预置全目录保留档（轻档）行。
+    store.lp_competitiveness_upsert(
+        (condition_id, Decimal("2.5"), T) for condition_id in conditions
+    )
     service = PolymarketLPService(store, Exchange(), clock=lambda: current[0])
     first = service.refresh_price_history()
     assert first["preparation_outcome"] == "failure"
@@ -2316,6 +2343,10 @@ def test_market_retry_budget_is_shared_across_preparation_stages(
             }
 
     store = PredictionArbitrageStore(tmp_path / "data")
+    # Issue #181 适配：候选需竞争值过密度门，预置保留档（轻档）行。
+    store.lp_competitiveness_upsert(
+        (("condition-b", Decimal("2.5"), T), ("condition-c", Decimal("2.5"), T))
+    )
     service = PolymarketLPService(store, Exchange(), clock=lambda: current[0])
     first = service.refresh_price_history()
     assert first["preparation_outcome"] == "waiting_retry"
@@ -3645,6 +3676,10 @@ def test_due_metadata_retry_dispatches_before_initial_history_pass_finishes(
     condition_ids_all = condition_ids
     exchange = Exchange()
     store = PredictionArbitrageStore(tmp_path / "data")
+    # Issue #181 适配：候选需竞争值过密度门，预置全目录保留档（轻档）行。
+    store.lp_competitiveness_upsert(
+        (condition_id, Decimal("2.5"), T) for condition_id in condition_ids
+    )
     service = PolymarketLPService(store, exchange, clock=lambda: current[0])
 
     result = service.refresh_price_history()

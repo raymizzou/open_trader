@@ -2269,6 +2269,14 @@ def test_lp_dashboard_account_outage_keeps_newer_public_funnel(tmp_path: Path) -
     lp = PolymarketLPService(store, exchange, clock=lambda: now[0])
     first_prepared = lp.refresh_price_history()
     assert first_prepared["state"] == "known"
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先在库中预置竞争值
+    # （第二轮目录轮换为 B/C，三者都要有值，队列才能重建并触发账户门）。
+    store.lp_competitiveness_upsert(
+        (
+            (f"condition-{market_id}", Decimal("2"), now[0])
+            for market_id in ("A", "B", "C")
+        )
+    )
     first_scan = lp.refresh_candidates(force=True)
     assert first_scan["state"] == "ready"
     assert first_scan["complete"] is True
@@ -6206,6 +6214,8 @@ def test_lp_candidate_preview_rechecks_best_bid_before_confirmation(
         public_client_factory=PublicMarketSDK,
     )
     store = PredictionArbitrageStore(tmp_path)
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先在库中预置竞争值。
+    store.lp_competitiveness_upsert(((condition_id, Decimal("2"), clock_state["now"]),))
     lp = PolymarketLPService(store, trading, clock=lambda: clock_state["now"])
     prepared = lp.refresh_price_history()
     assert prepared["state"] == "known"
@@ -6548,6 +6558,10 @@ def test_lp_trial_reads_share_current_refresh_and_ignore_late_results(
     # released.
     trading.lp_order_books = original_books  # type: ignore[method-assign]
     late_store = PredictionArbitrageStore(tmp_path / "late-publication")
+    # Issue #181 适配：新库同样预置竞争值（交易假件无竞争读）。
+    late_store.lp_competitiveness_upsert(
+        ((condition_id, Decimal("2"), clock["now"]),)
+    )
     late_initial = PolymarketLPService(
         late_store, trading, clock=lambda: clock["now"]
     )
@@ -7708,6 +7722,11 @@ def _lp_adapter_service_fixture(
         public_client_factory=PublicSDK,
     )
     store = PredictionArbitrageStore(tmp_path)
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，交易假件不提供竞争
+    # 读，直接在库中预置保留区间内的竞争值（store 回退路径）。
+    store.lp_competitiveness_upsert(
+        (str(row["condition_id"]), Decimal("2"), clock["now"]) for row in markets
+    )
     service = PolymarketLPService(store, trading, clock=lambda: clock["now"])
     return clock, state, store, trading, service
 
@@ -8092,6 +8111,8 @@ def test_lp_empty_preparation_keeps_pool_rows_until_expiry(tmp_path: Path) -> No
     store = PredictionArbitrageStore(tmp_path)
     exchange = Exchange()
     service = PolymarketLPService(store, exchange, clock=lambda: clock["now"])
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先在库中预置竞争值。
+    store.lp_competitiveness_upsert(((condition_id, Decimal("2"), clock["now"]),))
 
     prepared = service.refresh_price_history()
     assert prepared["state"] == "known"
@@ -12483,6 +12504,10 @@ def test_lp_refresh_reads_risk_books_only_for_selected_markets(tmp_path: Path) -
         exchange,
         clock=lambda: now[0],
     )
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先在库中预置竞争值。
+    store.lp_competitiveness_upsert(
+        (f"condition-{market_id}", Decimal("2"), now[0]) for market_id in markets
+    )
     assert service.refresh_price_history()["state"] == "known"
     # Issue #143 + #157: books are read per ≤10-market batch in one call,
     # and each exploration call rolls exactly one batch — five calls cover
@@ -12517,8 +12542,10 @@ def test_lp_refresh_reads_risk_books_only_for_selected_markets(tmp_path: Path) -
     # as backup (no reference price) — each batch still reads one backup.
     assert snapshot["funnel"]["backup_read"] == 50
     assert snapshot["funnel"]["stop_reason"] is None
-    assert snapshot["funnel"]["competition_known"] == 0
-    assert snapshot["funnel"]["competition_unknown"] == 51
+    # Issue #181: every seeded market carries usable competition, so the
+    # kept rows are all competition-known and none stay unknown.
+    assert snapshot["funnel"]["competition_known"] == 51
+    assert snapshot["funnel"]["competition_unknown"] == 0
     assert "risk" not in snapshot["funnel"]
     assert snapshot["funnel"]["conditions"] == _lp_funnel_conditions()
 
@@ -12663,6 +12690,10 @@ def test_lp_refresh_keeps_stale_batches_out_of_current_selection(tmp_path: Path)
         )
     exchange = Exchange()
     service = PolymarketLPService(store, exchange, clock=lambda: now[0])
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先在库中预置竞争值。
+    store.lp_competitiveness_upsert(
+        (f"condition-M{index}", Decimal("2"), first_now) for index in (1, 2)
+    )
     assert service.refresh_price_history()["state"] == "known"
     first = service.refresh_candidates(force=True)
     assert first["state"] == "ready"
@@ -12790,6 +12821,14 @@ def test_lp_refresh_keeps_stale_batches_out_of_current_selection(tmp_path: Path)
     replacement_exchange = ReplacementExchange()
     replacement_service = PolymarketLPService(
         replacement_store, replacement_exchange, clock=lambda: now[0]
+    )
+    # Issue #181 适配：新库同样预置竞争值（交易假件无竞争读；+3min 目录
+    # 只剩 M3，M1-M3 都要有值）。
+    replacement_store.lp_competitiveness_upsert(
+        (
+            (f"condition-M{index}", Decimal("2"), first_now)
+            for index in (1, 2, 3)
+        )
     )
     assert replacement_service.refresh_price_history()["state"] == "known"
     first_replacement = replacement_service.refresh_candidates(force=True)
@@ -12942,6 +12981,10 @@ def test_lp_refresh_keeps_stale_batches_out_of_current_selection(tmp_path: Path)
     partial_exchange = PartialExchange()
     partial_service = PolymarketLPService(
         partial_store, partial_exchange, clock=lambda: now[0]
+    )
+    # Issue #181 适配：新库同样预置竞争值（交易假件无竞争读）。
+    partial_store.lp_competitiveness_upsert(
+        (("condition-M4", Decimal("2"), first_now),)
     )
     partial_preparation = partial_service.refresh_price_history()
     assert partial_preparation["state"] == "known"
@@ -13267,6 +13310,8 @@ def test_lp_candidate_snapshot_reads_are_pure_and_never_degrade(
     )
     exchange = Exchange()
     service = PolymarketLPService(store, exchange, clock=lambda: now[0])
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先在库中预置竞争值。
+    store.lp_competitiveness_upsert((("condition-minute", Decimal("2"), now[0]),))
 
     prepared = service.refresh_price_history()
     assert prepared["state"] == "known"
@@ -13740,6 +13785,10 @@ def test_lp_history_progress_does_not_block_ready_candidates(tmp_path: Path) -> 
         },
     )
     service = PolymarketLPService(store, Exchange(), clock=lambda: now)
+    # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先在库中预置竞争值。
+    store.lp_competitiveness_upsert(
+        (("condition-ready", Decimal("2"), now), ("condition-waiting", Decimal("2"), now))
+    )
     refresh_result: dict[str, object] = {}
 
     def refresh() -> None:
