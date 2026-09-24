@@ -81,6 +81,28 @@ FROZEN_PREDICTION_MUTATION_PATHS = (
 )
 
 
+def _seed_lp_history_summary(
+    store: PredictionArbitrageStore,
+    *,
+    condition_id: str,
+    token_id: str,
+    now: datetime,
+) -> None:
+    """Provide the approved local history fact for a successful LP submit."""
+
+    store.lp_save_price_history(
+        condition_id,
+        token_id,
+        [],
+        {
+            "state": "known",
+            "amplitude": Decimal("0.005"),
+            "checked_at": now,
+            "valid_until": now + timedelta(hours=24),
+        },
+    )
+
+
 class _Runtime:
     def __init__(self, *, state: str = "RUNNING", violation: dict[str, object] | None = None) -> None:
         self.state = state
@@ -10374,6 +10396,9 @@ def test_lp_routes_preserve_guard_and_idempotency(tmp_path: Path) -> None:
 
     exchange = Exchange()
     store = PredictionArbitrageStore(tmp_path)
+    _seed_lp_history_summary(
+        store, condition_id=condition_id, token_id=token_id, now=now
+    )
     lp = PolymarketLPService(store, exchange, clock=lambda: now)
     execution = PredictionExecutionService(
         store=store,
@@ -10615,6 +10640,9 @@ def test_lp_augment_routes_preserve_guard_idempotency_and_schema(
 
     exchange = Exchange()
     store = PredictionArbitrageStore(tmp_path)
+    _seed_lp_history_summary(
+        store, condition_id=condition_id, token_id=token_id, now=now
+    )
     lp = PolymarketLPService(store, exchange, clock=lambda: now)
     execution = PredictionExecutionService(
         store=store,
@@ -10904,6 +10932,9 @@ def test_lp167_h_augment_route_accepts_price_and_rejects_bad_prices(
 
     exchange = Exchange()
     store = PredictionArbitrageStore(tmp_path)
+    _seed_lp_history_summary(
+        store, condition_id=condition_id, token_id=token_id, now=now
+    )
     lp = PolymarketLPService(store, exchange, clock=lambda: now)
     execution = PredictionExecutionService(
         store=store,
@@ -12285,6 +12316,9 @@ def test_lp_candidate_review_time_is_next_beijing_eight(
         return datetime.fromisoformat(text).astimezone(UTC)
 
     store = PredictionArbitrageStore(tmp_path / "next-review")
+    _seed_lp_history_summary(
+        store, condition_id=condition_id, token_id=token_id, now=now[0]
+    )
     sdk = AccountSDK()
     runtime, _lp = make_runtime(store, sdk)
     expected_review = datetime(2026, 9, 16, 0, 0, tzinfo=UTC)
@@ -14931,6 +14965,9 @@ def _lp163_route_fixture(tmp_path: Path, now: datetime):
 
     exchange = Exchange()
     store = PredictionArbitrageStore(tmp_path)
+    _seed_lp_history_summary(
+        store, condition_id=condition_id, token_id=token_id, now=now
+    )
     lp = PolymarketLPService(store, exchange, clock=lambda: now)
     execution = PredictionExecutionService(
         store=store,

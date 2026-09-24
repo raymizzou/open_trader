@@ -189,7 +189,7 @@ def test_history_batch_failure_keeps_later_batches_and_partial_results(
     assert all(row["condition_id"] not in failed_ids for row in snapshot["candidates"])
     assert any(
         reason["condition_id"] in failed_ids
-        and reason["code"] == "history_summary_unknown"
+        and reason["code"] == "history_latest_refresh_failed"
         for reason in snapshot["funnel"]["reasons"]["base"]
     )
 
@@ -2086,7 +2086,7 @@ def test_failed_group_does_not_block_other_items_or_duplicate_retry_alerts(
     }
     assert any(
         reason["condition_id"] in {f"condition-{index:03d}" for index in range(80)}
-        and reason["code"] == "history_summary_unknown"
+        and reason["code"] == "history_latest_refresh_failed"
         for reason in first_snapshot["funnel"]["reasons"]["base"]
     )
     current[0] = T + timedelta(seconds=299)

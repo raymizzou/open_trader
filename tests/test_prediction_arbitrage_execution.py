@@ -39,6 +39,26 @@ from tests.test_polymarket_lp import _request as lp_request
 from tests.test_polymarket_lp import _snapshot as lp_snapshot
 
 
+def _seed_lp_history(
+    store: PredictionArbitrageStore,
+    request: Mapping[str, object],
+    now: datetime,
+) -> None:
+    """Provide the approved local history fact for a successful LP submit."""
+
+    store.lp_save_price_history(
+        str(request["condition_id"]),
+        str(request["token_id"]),
+        [],
+        {
+            "state": "known",
+            "amplitude": Decimal("0.005"),
+            "checked_at": now,
+            "valid_until": now + timedelta(hours=24),
+        },
+    )
+
+
 def _intent() -> PairIntent:
     return PairIntent(
         event_id="event-1",
@@ -5978,6 +5998,7 @@ def test_lp_restart_preserves_order_until_original_review(tmp_path: Path) -> Non
     exchange = RestartExchange()
     trading = IncidentTrading(result="unsafe")
     store = PredictionArbitrageStore(tmp_path / "data")
+    _seed_lp_history(store, lp_request(current[0]), current[0])
     notifier = CompositeTestNotifier(
         ChannelNotifier("macos"), ChannelNotifier("feishu")
     )
@@ -8346,6 +8367,8 @@ def test_lp166_lp_start_and_submit_entry_admit_per_market(tmp_path: Path) -> Non
     exchange = LPExchange()
     exchange.snapshot_value = _lp166_book(now, market_a)
     store = PredictionArbitrageStore(tmp_path / "data")
+    for identity in (market_a, market_b, market_c):
+        _seed_lp_history(store, _lp166_entry_request(now, identity), now)
     lp = PolymarketLPService(store, exchange, clock=lambda: now)
     execution = PredictionExecutionService(
         store=store,
@@ -8414,6 +8437,7 @@ def test_lp178_submit_entry_waits_for_lock_and_submits(tmp_path: Path) -> None:
     exchange = LPExchange()
     exchange.snapshot_value = _lp166_book(now, market_c)
     store = PredictionArbitrageStore(tmp_path / "data")
+    _seed_lp_history(store, _lp166_entry_request(now, market_c), now)
     lp = PolymarketLPService(store, exchange, clock=lambda: now)
     execution = PredictionExecutionService(
         store=store,
@@ -8502,6 +8526,7 @@ def test_lp178_submit_entry_uncontended_leaves_lock_free(tmp_path: Path) -> None
     exchange = LPExchange()
     exchange.snapshot_value = _lp166_book(now, market_c)
     store = PredictionArbitrageStore(tmp_path / "data")
+    _seed_lp_history(store, _lp166_entry_request(now, market_c), now)
     lp = PolymarketLPService(store, exchange, clock=lambda: now)
     execution = PredictionExecutionService(
         store=store,
@@ -8529,6 +8554,7 @@ def test_lp178_submit_entry_cheap_conflict_rejection_skips_wait(tmp_path: Path) 
     exchange = LPExchange()
     exchange.snapshot_value = _lp166_book(now, market_a)
     store = PredictionArbitrageStore(tmp_path / "data")
+    _seed_lp_history(store, _lp166_entry_request(now, market_a), now)
     lp = PolymarketLPService(store, exchange, clock=lambda: now)
     execution = PredictionExecutionService(
         store=store,
@@ -8564,6 +8590,7 @@ def test_lp178_submit_augment_waits_for_lock_and_submits(tmp_path: Path) -> None
     exchange = LPExchange()
     exchange.snapshot_value = _queue_book_snapshot(now, Decimal("120"))
     store = PredictionArbitrageStore(tmp_path / "data")
+    _seed_lp_history(store, lp_request(now), now)
     lp = PolymarketLPService(store, exchange, clock=lambda: now)
     execution = PredictionExecutionService(
         store=store,
@@ -8635,6 +8662,8 @@ def test_lp179_slow_snapshot_does_not_block_unrelated_submit(tmp_path: Path) -> 
     exchange = SlowSnapshotExchange()
     exchange.snapshot_value = _lp166_book(now, market_a)
     store = PredictionArbitrageStore(tmp_path / "data")
+    for identity in (market_a, market_c):
+        _seed_lp_history(store, _lp166_entry_request(now, identity), now)
     lp = PolymarketLPService(store, exchange, clock=lambda: now)
     execution = PredictionExecutionService(
         store=store,
@@ -8737,6 +8766,8 @@ def test_lp179_triggered_cancel_bypasses_other_group_submit(tmp_path: Path) -> N
     exchange = ConcurrentExchange()
     exchange.snapshot_value = _lp166_book(now, market_a)
     store = PredictionArbitrageStore(tmp_path / "data")
+    for identity in (market_a, market_b):
+        _seed_lp_history(store, _lp166_entry_request(now, identity), now)
     lp = PolymarketLPService(store, exchange, clock=lambda: now)
     execution = PredictionExecutionService(
         store=store,
@@ -8868,6 +8899,7 @@ def test_lp179_same_group_augment_does_not_delay_or_overwrite_a_cancel(
     exchange = SameGroupExchange()
     exchange.snapshot_value = initial_snapshot
     store = PredictionArbitrageStore(tmp_path / "data")
+    _seed_lp_history(store, _lp166_entry_request(now, market_a), now)
     lp = PolymarketLPService(store, exchange, clock=lambda: now)
     execution = PredictionExecutionService(
         store=store,
@@ -9026,6 +9058,10 @@ def test_lp166_reconcile_startup_recovers_every_group(tmp_path: Path) -> None:
     current = [datetime(2026, 9, 21, 12, 0, tzinfo=UTC)]
     exchange = LPExchange()
     store = PredictionArbitrageStore(tmp_path / "data")
+    for index in (1, 2):
+        _seed_lp_history(
+            store, _lp166_entry_request(current[0], _lp166_identity(index)), current[0]
+        )
 
     def new_execution() -> PredictionExecutionService:
         exchange.snapshot_value = _lp166_book(current[0], _lp166_identity(1))
