@@ -54,6 +54,77 @@ def _lp_summary_amplitude(summary: Mapping[str, object]) -> Decimal | None:
     return _maybe_decimal(summary.get("amplitude"))
 
 
+def lp_history_eligibility(
+    summary: object,
+    *,
+    now: datetime | None = None,
+    condition_id: object | None = None,
+    token_id: object | None = None,
+) -> str | None:
+    """Return the persisted local history rejection reason, if any.
+
+    The summary is keyed by the caller's ``(condition_id, token_id)``.  When
+    persisted identity fields are present, they must agree with that key as
+    well; this keeps a fact for one direction from authorizing its opposite.
+    ``last_error`` and a later ``last_attempt_at`` are the durable marker for
+    the latest refresh failure.  A successful write replaces that summary and
+    clears both markers without changing the 24-hour validity rule.
+    """
+
+    if not isinstance(summary, Mapping):
+        return "history_summary_unknown"
+    expected_condition = str(condition_id or "").strip()
+    expected_token = str(token_id or "").strip()
+    stored_condition = str(summary.get("condition_id") or "").strip()
+    stored_token = str(summary.get("token_id") or "").strip()
+    if (
+        (stored_condition and expected_condition and stored_condition != expected_condition)
+        or (stored_token and expected_token and stored_token != expected_token)
+    ):
+        return "history_identity_mismatch"
+    last_error = summary.get("last_error")
+    if last_error not in (None, ""):
+        return "history_latest_refresh_failed"
+    state = str(summary.get("state") or "").lower()
+    if state == "expired":
+        return "history_summary_expired"
+    if state not in {"known", "ready", "eligible"}:
+        return "history_summary_unknown"
+    checked_value = summary.get("checked_at", summary.get("updated_at"))
+    try:
+        checked_at = _timestamp(checked_value, name="history_checked_at")
+    except (TypeError, ValueError):
+        return "history_time_unknown"
+    try:
+        attempt_value = summary.get("last_attempt_at")
+        if attempt_value is not None and _timestamp(
+            attempt_value, name="history_last_attempt_at"
+        ) > checked_at:
+            return "history_latest_refresh_failed"
+    except (TypeError, ValueError):
+        return "history_time_unknown"
+    amplitude = _lp_summary_amplitude(summary)
+    if amplitude is None:
+        return "history_amplitude_unknown"
+    if amplitude < 0 or amplitude > LP_DAILY_AMPLITUDE_LIMIT:
+        return "history_amplitude_exceeded"
+    if now is not None:
+        if not isinstance(now, datetime) or now.tzinfo is None:
+            return "history_time_unknown"
+        current = now.astimezone(UTC)
+        age = (current - checked_at).total_seconds()
+        if age < 0 or age >= _LP_PRICE_HISTORY_WINDOW.total_seconds():
+            return "history_summary_expired"
+        valid_until = summary.get("valid_until")
+        if valid_until is not None:
+            try:
+                if current >= _timestamp(valid_until, name="history_valid_until"):
+                    return "history_summary_expired"
+            except (TypeError, ValueError):
+                return "history_time_unknown"
+    return None
+
+
 def _lp_shortlist_rows(
     direction_facts: object,
     *,
@@ -83,27 +154,13 @@ def _lp_shortlist_rows(
         if any(direction.get(key) is True or market.get(key) is True for key in ("participating", "already_participating", "known_participation")):
             continue
         summary = _lp_history_summary(direction)
-        if summary is None or str(summary.get("state") or "").lower() not in {"known", "ready", "eligible"}:
+        if lp_history_eligibility(
+            summary,
+            now=checked_at,
+            condition_id=condition_id,
+            token_id=market.get("token_id", direction.get("token_id")),
+        ) is not None:
             continue
-        amplitude = _lp_summary_amplitude(summary)
-        if amplitude is None or amplitude < 0 or amplitude > LP_DAILY_AMPLITUDE_LIMIT:
-            continue
-        if checked_at is not None:
-            checked_value = summary.get("checked_at", summary.get("updated_at"))
-            try:
-                checked_summary_at = _timestamp(checked_value, name="history_checked_at")
-            except ValueError:
-                continue
-            age = (checked_at - checked_summary_at).total_seconds()
-            if age < 0 or age >= _LP_PRICE_HISTORY_WINDOW.total_seconds():
-                continue
-            valid_until = summary.get("valid_until")
-            if valid_until is not None:
-                try:
-                    if checked_at >= _timestamp(valid_until, name="history_valid_until"):
-                        continue
-                except ValueError:
-                    continue
         row = markets.setdefault(
             condition_id,
             {
@@ -705,6 +762,15 @@ def _lp_trial_direction_row(
         rounding=ROUND_CEILING
     ) * Decimal("0.01")
     summary = direction.get("history_summary")
+    market_condition = market.get("condition_id")
+    market_token = market.get("token_id", direction.get("token_id"))
+    if lp_history_eligibility(
+        summary,
+        now=now,
+        condition_id=market_condition,
+        token_id=market_token,
+    ) is not None:
+        return None
     price_state, price_checked_at = _lp_reference_price_state(summary, now=now)
     reference_price: Decimal | None = None
     if price_state == "known" and isinstance(summary, Mapping):
@@ -788,36 +854,12 @@ def _lp_base_rejection_code(
     ):
         return "market_already_participating"
     summary = _lp_history_summary(direction)
-    if summary is None or str(summary.get("state") or "").lower() not in {
-        "known",
-        "ready",
-        "eligible",
-    }:
-        return "history_summary_unknown"
-    amplitude = _lp_summary_amplitude(summary)
-    if amplitude is None:
-        return "history_amplitude_unknown"
-    if amplitude < 0 or amplitude > LP_DAILY_AMPLITUDE_LIMIT:
-        return "history_amplitude_exceeded"
-    checked_value = summary.get("checked_at", summary.get("updated_at"))
-    try:
-        checked_summary_at = _timestamp(checked_value, name="history_checked_at")
-    except ValueError:
-        return "history_time_unknown"
-    if now is not None:
-        # Mirror the shortlist gates: an over-age or past-valid_until summary
-        # is dropped there, so the base stage must report why.
-        age = (now - checked_summary_at).total_seconds()
-        if age < 0 or age >= _LP_PRICE_HISTORY_WINDOW.total_seconds():
-            return "history_summary_expired"
-        valid_until = summary.get("valid_until")
-        if valid_until is not None:
-            try:
-                if now >= _timestamp(valid_until, name="history_valid_until"):
-                    return "history_summary_expired"
-            except ValueError:
-                return "history_summary_expired"
-    return None
+    return lp_history_eligibility(
+        summary,
+        now=now,
+        condition_id=market.get("condition_id"),
+        token_id=market.get("token_id", direction.get("token_id")),
+    )
 
 
 def lp_trial_candidates(

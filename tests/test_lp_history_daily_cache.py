@@ -498,3 +498,175 @@ def test_daily_history_failure_preserves_cache_and_per_market_budget(
     assert updated_a is not None and updated_a["checked_at"] == "2026-09-19T01:00:00.000000Z"
     assert updated_c is not None and updated_c["state"] == "known"
     assert exchange.history_calls.count(("token-b",)) == 3
+
+
+def test_latest_failed_refresh_blocks_valid_old_summary_until_success(
+    tmp_path: Path,
+) -> None:
+    """A latest failed read blocks an otherwise still-valid old summary."""
+
+    current = [T + timedelta(hours=1)]
+    store = PredictionArbitrageStore(tmp_path)
+    old_summary = {
+        "state": "known",
+        "amplitude": Decimal("0.005"),
+        "checked_at": T,
+        "window_start": T - timedelta(hours=24),
+        "window_end": T,
+        "sample_count": 2,
+        "valid_until": T + timedelta(hours=24),
+        "last_attempt_at": T,
+        "last_error": "previous_failure",
+    }
+    good_summary = {key: value for key, value in old_summary.items() if key != "last_error"}
+    store.lp_save_price_history("condition-fail", "token-fail", [], old_summary)
+    store.lp_save_price_history(
+        "condition-fail-two", "token-fail-two", [], old_summary
+    )
+    store.lp_save_price_history(
+        "condition-good", "token-good", [], good_summary
+    )
+
+    class HistoryExchange:
+        def __init__(self) -> None:
+            self.failed = True
+            self.history_calls: list[tuple[str, ...]] = []
+
+        def lp_reward_catalog(self, *, stop_event=None):
+            del stop_event
+            return {
+                "state": "known",
+                "complete": True,
+                "checked_at": current[0],
+                "markets": [
+                    {
+                        "condition_id": "condition-fail",
+                        "daily_pool_usd": Decimal("100"),
+                        "reward_active": True,
+                    },
+                    {
+                        "condition_id": "condition-fail-two",
+                        "daily_pool_usd": Decimal("100"),
+                        "reward_active": True,
+                    },
+                    {
+                        "condition_id": "condition-good",
+                        "daily_pool_usd": Decimal("100"),
+                        "reward_active": True,
+                    },
+                ],
+            }
+
+        def lp_market_metadata(self, condition_ids, *, stop_event=None):
+            del stop_event
+            return {
+                condition_id: {
+                    "market_id": f"market-{condition_id.removeprefix('condition-')}",
+                    "condition_id": condition_id,
+                    "accepting_orders": True,
+                    "outcomes": {
+                        "yes": {
+                            "label": "YES",
+                            "token_id": f"token-{condition_id.removeprefix('condition-')}",
+                        }
+                    },
+                }
+                for condition_id in condition_ids
+            }
+
+        def lp_price_history(
+            self,
+            token_ids,
+            *,
+            start_ts,
+            end_ts,
+            fidelity,
+            stop_event=None,
+        ):
+            del fidelity, stop_event
+            self.history_calls.append(tuple(token_ids))
+            if self.failed and "token-fail" in token_ids:
+                raise IncompleteRead(b"partial")
+            return {
+                "state": "known",
+                "history": {
+                    token_id: [
+                        {"t": start_ts, "p": Decimal("0.500")},
+                        {"t": end_ts, "p": Decimal("0.505")},
+                    ]
+                    for token_id in token_ids
+                },
+            }
+
+    exchange = HistoryExchange()
+    service = PolymarketLPService(store, exchange, clock=lambda: current[0])
+    failed = service.refresh_price_history()
+    assert failed["preparation_outcome"] == "failure"
+    assert exchange.history_calls == [("token-fail", "token-fail-two")]
+    failed_summaries = {
+        (condition_id, token_id): store.lp_price_history_summary(
+            condition_id, token_id, now=current[0]
+        )
+        for condition_id, token_id in (
+            ("condition-fail", "token-fail"),
+            ("condition-fail-two", "token-fail-two"),
+        )
+    }
+    assert all(summary is not None for summary in failed_summaries.values())
+    assert all(
+        summary["checked_at"] == T.isoformat().replace("+00:00", ".000000Z")
+        and summary["last_attempt_at"] == current[0].isoformat().replace(
+            "+00:00", ".000000Z"
+        )
+        and summary["last_error"] == "IncompleteRead"
+        for summary in failed_summaries.values()
+        if summary is not None
+    )
+    failed_summary = failed_summaries[("condition-fail", "token-fail")]
+    good = store.lp_price_history_summary("condition-good", "token-good", now=current[0])
+    assert failed_summary is not None and good is not None
+    assert good["state"] == "known" and "last_error" not in good
+
+    fail_direction = _direction("condition-fail", failed_summary)
+    fail_direction["market"]["token_id"] = "token-fail"  # type: ignore[index]
+    fail_two_summary = failed_summaries[("condition-fail-two", "token-fail-two")]
+    assert fail_two_summary is not None
+    fail_two_direction = _direction("condition-fail-two", fail_two_summary)
+    fail_two_direction["market"]["token_id"] = "token-fail-two"  # type: ignore[index]
+    good_direction = _direction("condition-good", good)
+    good_direction["market"]["token_id"] = "token-good"  # type: ignore[index]
+    assert {row["condition_id"] for row in lp_shortlist(
+        [fail_direction, fail_two_direction, good_direction], now=current[0]
+    )} == {"condition-good"}
+
+    exchange.failed = False
+    current[0] = T + timedelta(hours=2)
+    recovered = service.refresh_price_history()
+    assert recovered["preparation_outcome"] == "success"
+    assert exchange.history_calls == [
+        ("token-fail", "token-fail-two"),
+        ("token-fail", "token-fail-two"),
+    ]
+    recovered_summary = store.lp_price_history_summary(
+        "condition-fail", "token-fail", now=current[0]
+    )
+    recovered_two_summary = store.lp_price_history_summary(
+        "condition-fail-two", "token-fail-two", now=current[0]
+    )
+    assert recovered_summary is not None and recovered_two_summary is not None
+    assert all(
+        Decimal(str(summary["amplitude"])) == Decimal("0.005")
+        and "last_error" not in summary
+        for summary in (recovered_summary, recovered_two_summary)
+    )
+    assert {
+        row["condition_id"]
+        for row in lp_shortlist(
+            [
+                _direction("condition-fail", recovered_summary),
+                _direction("condition-fail-two", recovered_two_summary),
+                good_direction,
+            ],
+            now=current[0],
+        )
+    } == {"condition-fail", "condition-fail-two", "condition-good"}

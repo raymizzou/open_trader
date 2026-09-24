@@ -158,6 +158,136 @@ def _request(now: datetime) -> dict[str, object]:
     }
 
 
+def _issue_172_contract(test):
+    """Opt a contract test out of the legacy history seeding fixture."""
+
+    test._issue_172_contract = True
+    return test
+
+
+def _instrument_lp_submit_reads(monkeypatch, service, exchange):
+    """Observe public snapshot/history/post boundaries for one submit call."""
+
+    events: list[str] = []
+    original_snapshot = exchange.lp_snapshot
+    original_history = service.store.lp_price_history_summary
+    original_create_session = service.store.lp_create_session
+    original_upsert_action = service.store.lp_upsert_action
+    original_post = exchange.post_order
+
+    def snapshot(*args, **kwargs):
+        events.append("snapshot")
+        return original_snapshot(*args, **kwargs)
+
+    def history(*args, **kwargs):
+        events.append("history")
+        return original_history(*args, **kwargs)
+
+    def post(*args, **kwargs):
+        events.append("post")
+        return original_post(*args, **kwargs)
+
+    def action(*args, **kwargs):
+        events.append("action")
+        return original_upsert_action(*args, **kwargs)
+
+    def create_session(*args, **kwargs):
+        events.append("action")
+        return original_create_session(*args, **kwargs)
+
+    monkeypatch.setattr(exchange, "lp_snapshot", snapshot)
+    monkeypatch.setattr(service.store, "lp_price_history_summary", history)
+    monkeypatch.setattr(service.store, "lp_create_session", create_session)
+    monkeypatch.setattr(service.store, "lp_upsert_action", action)
+    monkeypatch.setattr(exchange, "post_order", post)
+    return events
+
+
+def _assert_lp_submit_events(
+    events: list[str], *, submits: int, posts: int
+) -> None:
+    """Require one local history read after each snapshot and before effects."""
+
+    assert events.count("snapshot") == submits
+    assert events.count("history") == submits
+    assert events.count("post") == posts
+    snapshot_positions = [
+        index for index, event in enumerate(events) if event == "snapshot"
+    ]
+    history_positions = [
+        index for index, event in enumerate(events) if event == "history"
+    ]
+    assert events[:2] == ["snapshot", "history"]
+    for snapshot_index, history_index in zip(
+        snapshot_positions, history_positions, strict=True
+    ):
+        assert events[snapshot_index : history_index + 1] == [
+            "snapshot",
+            "history",
+        ]
+
+
+@pytest.fixture(autouse=True)
+def _seed_default_lp_history_for_legacy_submits(monkeypatch, request) -> None:
+    """Give pre-history tests the persisted fact required by submit gates."""
+
+    if getattr(request.function, "_issue_172_contract", False):
+        return
+
+    def seed(service: PolymarketLPService, request) -> None:
+        if not isinstance(request, dict):
+            return
+        condition_id = str(request.get("condition_id") or "").strip()
+        token_id = str(request.get("token_id") or "").strip()
+        if not condition_id or not token_id:
+            return
+        now = service.clock().astimezone(UTC)
+        if service.store.lp_price_history_summary(
+            condition_id, token_id, now=now
+        ) is not None:
+            return
+        service.store.lp_save_price_history(
+            condition_id,
+            token_id,
+            [],
+            {
+                "state": "known",
+                "amplitude": Decimal("0.005"),
+                "checked_at": now,
+                "valid_until": now + timedelta(hours=24),
+            },
+        )
+
+    original_start = PolymarketLPService.start
+    original_submit_entry = PolymarketLPService.submit_entry
+    original_augment = PolymarketLPService.augment
+    original_submit_augment = PolymarketLPService.submit_augment
+
+    def start(service, *args, **kwargs):
+        preview = service.store.lp_preview(str(args[0])) if args else None
+        seed(service, preview)
+        return original_start(service, *args, **kwargs)
+
+    def submit_entry(service, *args, **kwargs):
+        seed(service, args[0] if args else kwargs.get("request"))
+        return original_submit_entry(service, *args, **kwargs)
+
+    def augment(service, *args, **kwargs):
+        session = service.store.lp_session(str(args[0])) if args else None
+        seed(service, session)
+        return original_augment(service, *args, **kwargs)
+
+    def submit_augment(service, *args, **kwargs):
+        session = service.store.lp_session(str(args[0])) if args else None
+        seed(service, session)
+        return original_submit_augment(service, *args, **kwargs)
+
+    monkeypatch.setattr(PolymarketLPService, "start", start)
+    monkeypatch.setattr(PolymarketLPService, "submit_entry", submit_entry)
+    monkeypatch.setattr(PolymarketLPService, "augment", augment)
+    monkeypatch.setattr(PolymarketLPService, "submit_augment", submit_augment)
+
+
 def test_reward_threshold_uses_current_unrounded_daily_amount(tmp_path) -> None:
     now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
     amounts = iter(("0.99999", "1.00000", "1.10", "0.97"))
@@ -6758,7 +6888,406 @@ def test_runtime_queue_position_includes_augment_order(tmp_path) -> None:
     assert exchange.cancels == []
 
 
+@_issue_172_contract
+def test_lp_candidate_history_change_suppresses_old_side_until_requalification(
+    tmp_path,
+) -> None:
+    """A changed persisted fact removes the old recommendation immediately."""
+
+    now = datetime(2026, 9, 20, 3, tzinfo=UTC)
+    exchange = _LPBatchQueryExchange(
+        now,
+        {"A": Decimal("100")},
+        omit_tokens=frozenset({"token-condition-A-no"}),
+    )
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+
+    assert service.refresh_price_history()["state"] == "known"
+    assert service.refresh_competition_cache()["state"] == "known"
+    initial = service.refresh_candidates(force=True)
+    assert initial["recommendations"][0]["selected_direction"]["outcome"] == "YES"
+
+    summary = store.lp_price_history_summary(
+        "condition-A", "token-condition-A-yes", now=now
+    )
+    assert summary is not None
+    store.lp_save_price_history(
+        "condition-A",
+        "token-condition-A-yes",
+        [],
+        {
+            **summary,
+            "amplitude": Decimal("0.025"),
+            "checked_at": now,
+            "valid_until": now + timedelta(hours=24),
+            "last_attempt_at": now,
+        },
+    )
+
+    suppressed = service.candidate_snapshot()
+    assert suppressed["recommendations"] == []
+    assert any(
+        item["code"] == "history_amplitude_exceeded"
+        for item in suppressed["funnel"]["reasons"]["trial"]
+    )
+    assert service.candidate_snapshot()["recommendations"] == []
+    assert service.refresh_candidate_recommendations()["recommendations"] == []
+
+
+@_issue_172_contract
+def test_lp_submit_entry_rechecks_history_once_and_rejects_invalid(
+    tmp_path, monkeypatch
+) -> None:
+    """Final entry admission uses one local fact and keeps the boundary inclusive."""
+
+    now = datetime(2026, 9, 20, 4, tzinfo=UTC)
+
+    def service_for(amplitude: str, path: Path):
+        exchange = _Exchange()
+        exchange.snapshot_value = _snapshot(now)
+        store = PredictionArbitrageStore(path)
+        store.lp_save_price_history(
+            str(_request(now)["condition_id"]),
+            str(_request(now)["token_id"]),
+            [],
+            {
+                "state": "known",
+                "amplitude": Decimal(amplitude),
+                "checked_at": now,
+                "valid_until": now + timedelta(hours=24),
+            },
+        )
+        return store, exchange, PolymarketLPService(
+            store, exchange, clock=lambda: now
+        )
+
+    store, exchange, service = service_for("0.025", tmp_path / "over")
+    events = _instrument_lp_submit_reads(monkeypatch, service, exchange)
+    rejected = service.submit_entry(_request(now), "history-entry-over")
+    assert rejected == {
+        "state": "rejected",
+        "reason": "history_amplitude_exceeded",
+    }
+    assert store.lp_session_by_idempotency("history-entry-over") is None
+    assert exchange.posts == []
+    assert events == ["snapshot", "history"]
+
+    store, exchange, service = service_for("0.010", tmp_path / "boundary")
+    events = _instrument_lp_submit_reads(monkeypatch, service, exchange)
+    accepted = service.submit_entry(_request(now), "history-entry-boundary")
+    assert accepted["state"] == "entry_open"
+    assert len(exchange.posts) == 1
+    _assert_lp_submit_events(events, submits=1, posts=1)
+
+
+@_issue_172_contract
+def test_lp_start_rejects_invalidated_history_and_consumes_old_preview(
+    tmp_path, monkeypatch
+) -> None:
+    """A history rejection consumes the old credential and requires re-preview."""
+
+    now = datetime(2026, 9, 20, 5, tzinfo=UTC)
+    request = _request(now)
+    store = PredictionArbitrageStore(tmp_path)
+    exchange = _Exchange()
+    exchange.snapshot_value = _snapshot(now)
+    identity = (str(request["condition_id"]), str(request["token_id"]))
+
+    def save_history(amplitude: str) -> None:
+        store.lp_save_price_history(
+            *identity,
+            [],
+            {
+                "state": "known",
+                "amplitude": Decimal(amplitude),
+                "checked_at": now,
+                "valid_until": now + timedelta(hours=24),
+            },
+        )
+
+    save_history("0.005")
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    preview = service.preview(request)
+    assert preview["state"] == "previewed"
+    preview_id = str(preview["preview_id"])
+    events = _instrument_lp_submit_reads(monkeypatch, service, exchange)
+
+    save_history("0.025")
+    rejected = service.start(preview_id, "history-start-1")
+    assert rejected == {
+        "state": "rejected",
+        "reason": "history_amplitude_exceeded",
+    }
+    assert exchange.posts == []
+    assert events == ["snapshot", "history"]
+    assert store.lp_session_by_idempotency("history-start-1") is None
+    consumed = store.lp_preview(preview_id)
+    assert consumed is not None and consumed["consumed_at"] is not None
+
+    save_history("0.005")
+    replay = service.start(preview_id, "history-start-1-retry")
+    assert replay == {"state": "rejected", "reason": "preview_consumed"}
+    assert exchange.posts == []
+
+    fresh_preview = service.preview(request)
+    assert fresh_preview["state"] == "previewed"
+    events.clear()
+    started = service.start(str(fresh_preview["preview_id"]), "history-start-2")
+    assert started["state"] == "entry_open"
+    assert len(exchange.posts) == 1
+    _assert_lp_submit_events(events, submits=1, posts=1)
+
+
+@_issue_172_contract
+def test_lp_augment_final_submit_rejects_history_without_changing_existing_group(
+    tmp_path, monkeypatch
+) -> None:
+    """An invalid add BUY leaves the existing LP group untouched."""
+
+    now = datetime(2026, 9, 20, 6, tzinfo=UTC)
+    request = _request(now)
+    store = PredictionArbitrageStore(tmp_path)
+    exchange = _Exchange()
+    exchange.snapshot_value = _queue_book_snapshot(now, Decimal("120"))
+    identity = (str(request["condition_id"]), str(request["token_id"]))
+
+    def save_history(amplitude: str) -> None:
+        store.lp_save_price_history(
+            *identity,
+            [],
+            {
+                "state": "known",
+                "amplitude": Decimal(amplitude),
+                "checked_at": now,
+                "valid_until": now + timedelta(hours=24),
+            },
+        )
+
+    save_history("0.005")
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    preview = service.preview({**request, "quantity": Decimal("120")})
+    started = service.start(str(preview["preview_id"]), "history-augment-base")
+    assert started["state"] == "entry_open"
+    session_id = str(started["session_id"])
+    events = _instrument_lp_submit_reads(monkeypatch, service, exchange)
+    exchange.snapshot_value = _augment_preview_snapshot(
+        now, level=Decimal("380"), own_original=Decimal("120")
+    )
+
+    save_history("0.025")
+    rejected = service.submit_augment(
+        session_id, "90", "history-augment-over", price="0.29"
+    )
+    assert rejected["state"] == "rejected"
+    assert rejected["reason"] == "history_amplitude_exceeded"
+    assert len(exchange.posts) == 1
+    assert events == ["snapshot", "history"]
+    unchanged = store.lp_session(session_id)
+    assert unchanged is not None
+    assert unchanged.get("augment_order_ids") in (None, [])
+
+    save_history("0.005")
+    events.clear()
+    accepted = service.submit_augment(
+        session_id, "90", "history-augment-ok", price="0.29"
+    )
+    assert accepted["state"] == "entry_open"
+    assert len(exchange.posts) == 2
+    _assert_lp_submit_events(events, submits=1, posts=1)
+
+
 # ---- Issue 152: 队列位置保护运行时闭环（Seam 3）与通知（Seam 6） ----
+
+
+@_issue_172_contract
+def test_lp_augment_legacy_confirmation_uses_final_history_only(
+    tmp_path, monkeypatch
+) -> None:
+    """Legacy augment preview stays local; confirmation admits one fresh fact."""
+
+    now = datetime(2026, 9, 20, 7, tzinfo=UTC)
+    request = _request(now)
+    store = PredictionArbitrageStore(tmp_path)
+    exchange = _Exchange()
+    exchange.snapshot_value = _queue_book_snapshot(now, Decimal("120"))
+    identity = (str(request["condition_id"]), str(request["token_id"]))
+
+    def save_history(amplitude: str) -> None:
+        store.lp_save_price_history(
+            *identity,
+            [],
+            {
+                "state": "known",
+                "amplitude": Decimal(amplitude),
+                "checked_at": now,
+                "valid_until": now + timedelta(hours=24),
+            },
+        )
+
+    save_history("0.005")
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    entry_preview = service.preview({**request, "quantity": Decimal("120")})
+    started = service.start(str(entry_preview["preview_id"]), "legacy-augment-base")
+    assert started["state"] == "entry_open"
+    session_id = str(started["session_id"])
+
+    exchange.snapshot_value = _augment_preview_snapshot(
+        now, level=Decimal("380"), own_original=Decimal("120")
+    )
+    augment_preview = _augment_preview(service, session_id, 90, price="0.29")
+    assert augment_preview["state"] == "previewed"
+    preview_id = str(augment_preview["preview_id"])
+    events = _instrument_lp_submit_reads(monkeypatch, service, exchange)
+
+    save_history("0.025")
+    rejected = service.augment(session_id, preview_id, "legacy-augment-over")
+    assert rejected == {
+        "state": "rejected",
+        "reason": "history_amplitude_exceeded",
+    }
+    assert len(exchange.posts) == 1
+    assert events == ["snapshot", "history"]
+    consumed = store.lp_preview(preview_id)
+    assert consumed is not None and consumed["consumed_at"] is not None
+
+    save_history("0.005")
+    replay = service.augment(session_id, preview_id, "legacy-augment-retry")
+    assert replay == {"state": "rejected", "reason": "preview_consumed"}
+    assert len(exchange.posts) == 1
+
+    fresh = _augment_preview(service, session_id, 90, price="0.29")
+    assert fresh["state"] == "previewed"
+    events.clear()
+    accepted = service.augment(
+        session_id, str(fresh["preview_id"]), "legacy-augment-ok"
+    )
+    assert accepted["state"] == "entry_open"
+    assert len(exchange.posts) == 2
+    _assert_lp_submit_events(events, submits=1, posts=1)
+
+
+@_issue_172_contract
+def test_lp_history_preview_paths_do_not_read_history(tmp_path, monkeypatch) -> None:
+    """Preview endpoints remain local-only; final confirmation owns the gate."""
+
+    now = datetime(2026, 9, 20, 8, tzinfo=UTC)
+    request = _request(now)
+    store = PredictionArbitrageStore(tmp_path)
+    exchange = _Exchange()
+    exchange.snapshot_value = _snapshot(now)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    events = _instrument_lp_submit_reads(monkeypatch, service, exchange)
+
+    entry_preview = service.preview(request)
+    assert entry_preview["state"] == "previewed"
+    assert events == ["snapshot"]
+
+    store.lp_save_price_history(
+        str(request["condition_id"]),
+        str(request["token_id"]),
+        [],
+        {
+            "state": "known",
+            "amplitude": Decimal("0.005"),
+            "checked_at": now,
+            "valid_until": now + timedelta(hours=24),
+        },
+    )
+    events.clear()
+    started = service.start(str(entry_preview["preview_id"]), "history-preview-base")
+    assert started["state"] == "entry_open"
+
+    exchange.snapshot_value = _augment_preview_snapshot(
+        now, level=Decimal("380"), own_original=Decimal("10")
+    )
+    store.lp_save_price_history(
+        str(request["condition_id"]),
+        str(request["token_id"]),
+        [],
+        {
+            "state": "unknown",
+            "checked_at": None,
+            "last_attempt_at": now,
+            "last_error": "IncompleteRead",
+        },
+    )
+    events.clear()
+    augment_preview = _augment_preview(
+        service, str(started["session_id"]), 90, price="0.29"
+    )
+    assert augment_preview["state"] == "previewed"
+    assert events == ["snapshot"]
+
+
+@_issue_172_contract
+def test_lp_final_history_reasons_fail_closed_without_post(tmp_path, monkeypatch) -> None:
+    """Each persisted history failure has its own public rejection reason."""
+
+    now = datetime(2026, 9, 20, 9, tzinfo=UTC)
+    request = _request(now)
+    condition_id = str(request["condition_id"])
+    token_id = str(request["token_id"])
+    base = {
+        "state": "known",
+        "amplitude": Decimal("0.005"),
+        "checked_at": now,
+        "valid_until": now + timedelta(hours=24),
+    }
+    cases = (
+        ("missing", None, "history_summary_unknown"),
+        (
+            "expired",
+            {
+                **base,
+                "checked_at": now - timedelta(hours=25),
+                "valid_until": now + timedelta(hours=1),
+            },
+            "history_summary_expired",
+        ),
+        (
+            "latest-failed",
+            {**base, "last_attempt_at": now, "last_error": "IncompleteRead"},
+            "history_latest_refresh_failed",
+        ),
+        (
+            "initial-refresh-failed",
+            {
+                "state": "unknown",
+                "checked_at": None,
+                "last_attempt_at": now,
+                "last_error": "IncompleteRead",
+            },
+            "history_latest_refresh_failed",
+        ),
+        (
+            "identity-mismatch",
+            {**base, "condition_id": "wrong-condition"},
+            "history_identity_mismatch",
+        ),
+        (
+            "over-limit",
+            {**base, "amplitude": Decimal("0.025")},
+            "history_amplitude_exceeded",
+        ),
+    )
+    for label, summary, expected_reason in cases:
+        case_path = tmp_path / label
+        store = PredictionArbitrageStore(case_path)
+        exchange = _Exchange()
+        exchange.snapshot_value = _snapshot(now)
+        if summary is not None:
+            store.lp_save_price_history(condition_id, token_id, [], summary)
+        service = PolymarketLPService(store, exchange, clock=lambda: now)
+        events = _instrument_lp_submit_reads(monkeypatch, service, exchange)
+
+        result = service.submit_entry(request, f"history-reason-{label}")
+
+        assert result == {"state": "rejected", "reason": expected_reason}
+        assert store.lp_active_session() is None
+        assert store.lp_sessions() == []
+        assert exchange.posts == []
+        assert events == ["snapshot", "history"]
 
 
 class _AccountReadExchange(_Exchange):

@@ -23756,6 +23756,35 @@ console.log(JSON.stringify({
     assert rendered["noDoublePrefix"] is True
 
 
+def test_lp_history_submit_rejection_shows_chinese_toast_reason() -> None:
+    """History admission failures show concise Chinese guidance in the toast."""
+    output = run_dashboard_js(r'''
+const reasons = [
+  "history_amplitude_exceeded",
+  "history_latest_refresh_failed",
+  "history_summary_expired",
+];
+const toasts = reasons.map((reason) =>
+  lpSubmitToastCopy({state:"rejected", reason}));
+const text = toasts.map((toast) => toast.main + toast.sub).join(" ");
+console.log(JSON.stringify({
+  danger: toasts.every((toast) => toast.kind === "danger"),
+  chinese: toasts.every((toast) => /[\u4e00-\u9fff]/.test(toast.main)),
+  semantic: toasts[0].main.includes("历史波动不符合要求")
+    && toasts[1].main.includes("历史数据刷新失败")
+    && toasts[2].main.includes("历史数据已失效"),
+  noRawReason: !text.includes("history_"),
+  noNumericOrTimeDetail: !/[0-9]/.test(text),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["danger"] is True
+    assert rendered["chinese"] is True
+    assert rendered["semantic"] is True
+    assert rendered["noRawReason"] is True
+    assert rendered["noNumericOrTimeDetail"] is True
+
+
 def test_lp163_late_reply_updates_only_own_toast() -> None:
     """W6: A 超时未知 → 解锁 → B 确认新 toast → 注入 A 迟到成功：A 变成功、B 逐字不变。"""
     output = _lp163_interactive(r'''

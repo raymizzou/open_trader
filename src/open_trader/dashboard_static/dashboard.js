@@ -6507,6 +6507,18 @@ function lpSubmitStateMessage(result) {
     return `系统忙，暂不能提交（${reason || "busy"}）。`;
   }
   if (resultState === "rejected") {
+    if (reason === "history_amplitude_exceeded") {
+      return "未提交：该方向历史波动不符合要求";
+    }
+    if (reason === "history_latest_refresh_failed") {
+      return "未提交：该方向历史数据刷新失败";
+    }
+    if (reason === "history_summary_expired") {
+      return "未提交：该方向历史数据已失效";
+    }
+    if (reason.startsWith("history_")) {
+      return "未提交：该方向历史数据不可用";
+    }
     if (reason === "best_bid_changed") return "确认价与提交时买一不一致。";
     if (reason === "session_not_active" || reason === "session_not_found") {
       return "该标的当前无活动系统会话——请先从候选列表经系统入口下第一单。";

@@ -921,6 +921,36 @@ def test_trial_candidates_report_expired_history_base_rejection() -> None:
     assert base_codes.count("history_summary_expired") == 2
 
 
+def test_trial_candidates_only_use_history_eligible_direction() -> None:
+    """A market's passing side cannot authorize its other token."""
+
+    yes = _trial_direction("A", outcome="YES", latest_midpoint="0.50")
+    no = _trial_direction("A", outcome="NO", latest_midpoint="0.10")
+    no["market"]["token_id"] = "a-no"  # type: ignore[index]
+    no["history_summary"]["amplitude"] = Decimal("0.025")  # type: ignore[index]
+
+    result = _trial(
+        [yes, no],
+        competition=_trial_competition("A"),
+    )
+
+    assert [(row["outcome"], row["token_id"]) for row in result["rows"]] == [
+        ("YES", "a-yes")
+    ]
+
+    yes["history_summary"]["amplitude"] = Decimal("0.025")  # type: ignore[index]
+    no["history_summary"]["amplitude"] = Decimal("0.005")  # type: ignore[index]
+    yes["market"]["token_id"] = "a-yes"  # type: ignore[index]
+    result = _trial(
+        [yes, no],
+        competition=_trial_competition("A"),
+    )
+
+    assert [(row["outcome"], row["token_id"]) for row in result["rows"]] == [
+        ("NO", "a-no")
+    ]
+
+
 def test_trial_candidates_report_event_window_base_rejections() -> None:
     """In-progress and starting-soon markets are base-stage rejections."""
     in_progress = _trial_direction("G", event_start=NOW)

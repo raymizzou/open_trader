@@ -3,6 +3,10 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-09-24
+
+- Issue 172：LP 推荐与开仓/追加单提交统一按方向校验 24 小时历史振幅（≤$0.01）；最新历史刷新失败时 fail-closed，拒绝提交并由 Dashboard Toast 显示简短中文原因。旧委托与持仓不受影响。验证：LP、候选视图、历史缓存与 Toast 定向回归全绿（216/25/5/1）；未做 push 或部署。
+
 ## 2026-09-23
 
 - Issue 179：LP 巡检按活动组逐组读取与落盘；已触发的位置保护撤单立即提交，普通对账仍短时串行，并用会话修订栅栏丢弃并发提交期间的旧成交/持仓快照，保留同组追加单与多组聚合结果。影响 LP 多组巡检及追加/撤单工作流。验证：Docker focused regression 16 passed（含锁竞争、重试幂等、多组顺序与重启截止回归）。

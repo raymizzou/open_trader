@@ -1870,6 +1870,65 @@ class PolymarketLPService:
         )
         return saved if isinstance(saved, Mapping) else None
 
+    def _lp_history_fact(
+        self,
+        condition_id: object,
+        token_id: object,
+        *,
+        now: datetime,
+    ) -> tuple[Mapping[str, object] | None, str | None]:
+        """Read and judge one persisted history fact without network work."""
+
+        from .polymarket_lp_views import lp_history_eligibility
+
+        condition = str(condition_id or "").strip()
+        token = str(token_id or "").strip()
+        if not condition or not token:
+            return None, "history_identity_mismatch"
+        reader = getattr(self.store, "lp_price_history_summary", None)
+        if not callable(reader):
+            return None, "history_summary_unknown"
+        try:
+            summary = reader(condition, token, now=now)
+        except TypeError:
+            try:
+                summary = reader(condition, token)
+            except Exception:
+                return None, "history_summary_unknown"
+        except Exception:
+            return None, "history_summary_unknown"
+        reason = lp_history_eligibility(
+            summary,
+            now=now,
+            condition_id=condition,
+            token_id=token,
+        )
+        return (
+            dict(summary) if isinstance(summary, Mapping) else None,
+            reason,
+        )
+
+    def _candidate_history_reason(
+        self, row: Mapping[str, object], *, now: datetime
+    ) -> str | None:
+        selected = row.get("selected_direction")
+        if not isinstance(selected, Mapping):
+            return None
+        return self._lp_history_fact(
+            row.get("condition_id"), selected.get("token_id"), now=now
+        )[1]
+
+    def _require_lp_history(
+        self, request: Mapping[str, object], *, now: datetime
+    ) -> None:
+        """Fail closed on the one selected token's persisted history fact."""
+
+        _summary, reason = self._lp_history_fact(
+            request.get("condition_id"), request.get("token_id"), now=now
+        )
+        if reason is not None:
+            raise ValueError(reason)
+
     def candidate_snapshot(self) -> dict[str, object]:
         """Project the rolling candidate pool without external reads.
 
@@ -1892,11 +1951,22 @@ class PolymarketLPService:
         from .polymarket_lp_views import LP_TRIAL_CANDIDATE_LIMIT
 
         now = self._now()
-        valid_rows = [
-            row
-            for row in pool.values()
-            if isinstance(row, Mapping) and not _candidate_pool_row_expired(row, now)
-        ]
+        history_reasons: list[dict[str, object]] = []
+        valid_rows: list[Mapping[str, object]] = []
+        for row in pool.values():
+            if not isinstance(row, Mapping) or _candidate_pool_row_expired(row, now):
+                continue
+            history_reason = self._candidate_history_reason(row, now=now)
+            if history_reason is not None:
+                history_reasons.append(
+                    {
+                        "market_id": str(row.get("market_id") or ""),
+                        "condition_id": str(row.get("condition_id") or ""),
+                        "code": history_reason,
+                    }
+                )
+                continue
+            valid_rows.append(row)
         valid_rows.sort(key=_candidate_yield_sort_key)
         published = [
             deepcopy(dict(row)) for row in valid_rows[:LP_TRIAL_CANDIDATE_LIMIT]
@@ -1981,6 +2051,11 @@ class PolymarketLPService:
                 competition_state.get("not_updated") or ()
             ),
         }
+        reasons_view = funnel_view.get("reasons")
+        if isinstance(reasons_view, Mapping):
+            trial_reasons = reasons_view.get("trial")
+            if isinstance(trial_reasons, list):
+                trial_reasons.extend(history_reasons)
         projection = {
             "state": snapshot_state,
             "complete": snapshot.get("complete") is True,
@@ -3106,19 +3181,36 @@ class PolymarketLPService:
                 for offset in range(0, len(targets), _LP_PRICE_HISTORY_BATCH_SIZE)
             )
 
+            def history_summary_reusable(
+                summary: Mapping[str, object] | None,
+            ) -> bool:
+                if not (
+                    summary
+                    and str(summary.get("state") or "").lower()
+                    in {"known", "ready", "eligible"}
+                    and summary.get("checked_at") is not None
+                ):
+                    return False
+                if summary.get("last_error") not in (None, ""):
+                    return False
+                try:
+                    checked_at = _timestamp(
+                        summary.get("checked_at"), name="history_checked_at"
+                    )
+                    last_attempt_at = summary.get("last_attempt_at")
+                    if last_attempt_at is not None and _timestamp(
+                        last_attempt_at, name="history_last_attempt_at"
+                    ) > checked_at:
+                        return False
+                except (TypeError, ValueError):
+                    return False
+                return True
+
             def cached_facts(
                 identities: tuple[tuple[str, str], ...],
             ) -> tuple[dict[tuple[str, str], Mapping[str, object]], dict[tuple[str, str], list[dict[str, object]]]]:
                 summaries: dict[tuple[str, str], Mapping[str, object]] = {}
                 samples: dict[tuple[str, str], list[dict[str, object]]] = {}
-
-                def reusable(summary: Mapping[str, object] | None) -> bool:
-                    return bool(
-                        summary
-                        and str(summary.get("state") or "").lower()
-                        in {"known", "ready", "eligible"}
-                        and summary.get("checked_at") is not None
-                    )
 
                 if callable(summary_reader):
                     try:
@@ -3142,7 +3234,7 @@ class PolymarketLPService:
                 sample_identities = tuple(
                     identity
                     for identity in identities
-                    if not reusable(summaries.get(identity))
+                    if not history_summary_reusable(summaries.get(identity))
                 )
                 if callable(sample_reader) and sample_identities:
                     try:
@@ -3606,11 +3698,7 @@ class PolymarketLPService:
                     for identity in identity_batch:
                         summary = summaries.get(identity)
                         state = str(summary.get("state") or "").lower() if summary else ""
-                        if (
-                            state in {"known", "ready", "eligible"}
-                            and summary is not None
-                            and summary.get("checked_at") is not None
-                        ):
+                        if history_summary_reusable(summary):
                             completed_identities.add(identity)
                             successful_identities.add(identity)
                         else:
@@ -5132,7 +5220,20 @@ class PolymarketLPService:
                         else None
                     )
                     qualified_direction = {**dict(direction)}
-                    if not isinstance(book, Mapping):
+                    if isinstance(book, Mapping):
+                        qualified_direction["book"] = deepcopy(dict(book))
+                    history_summary, history_reason = self._lp_history_fact(
+                        condition_id, token_id, now=evaluation_now
+                    )
+                    if history_summary is not None:
+                        qualified_direction["history_summary"] = history_summary
+                    if history_reason is not None:
+                        evaluated: Mapping[str, object] = {
+                            "state": "rejected",
+                            "reason_codes": [history_reason],
+                            "guidance": None,
+                        }
+                    elif not isinstance(book, Mapping):
                         missing_book_token_ids.append(token_id)
                         evaluated: Mapping[str, object] = {
                             "state": "unknown",
@@ -5140,7 +5241,6 @@ class PolymarketLPService:
                             "guidance": None,
                         }
                     else:
-                        qualified_direction["book"] = deepcopy(dict(book))
                         evaluated = evaluate_lp_entry(
                             qualified_direction,
                             account=evaluation_account or {},
@@ -5744,6 +5844,7 @@ class PolymarketLPService:
                 eligible_directions: list[dict[str, object]] = []
                 row_missing_books = 0
                 row_directions = 0
+                history_rejections = 0
                 for direction in directions:
                     market_value = direction.get("market")
                     if not isinstance(market_value, Mapping):
@@ -5857,9 +5958,21 @@ class PolymarketLPService:
                         if book_due
                         else maintenance_direction.get("book")
                     )
-                    if book_due and isinstance(book, Mapping):
+                    if isinstance(book, Mapping):
                         maintenance_direction["book"] = dict(book)
-                    if not isinstance(book, Mapping):
+                    history_summary, history_reason = self._lp_history_fact(
+                        condition_id, token_id, now=evaluation_now
+                    )
+                    if history_summary is not None:
+                        maintenance_direction["history_summary"] = history_summary
+                    if history_reason is not None:
+                        history_rejections += 1
+                        evaluated: Mapping[str, object] = {
+                            "state": "rejected",
+                            "reason_codes": [history_reason],
+                            "guidance": None,
+                        }
+                    if history_reason is None and not isinstance(book, Mapping):
                         row_missing_books += 1
                         missing_book_token_ids.append(token_id)
                         evaluated: Mapping[str, object] = {
@@ -5867,7 +5980,7 @@ class PolymarketLPService:
                             "reason_codes": ["book_unknown"],
                             "guidance": None,
                         }
-                    else:
+                    elif history_reason is None:
                         if _candidate_source_expired(
                             market.get("metadata_checked_at"), evaluation_now
                         ) or _candidate_source_expired(
@@ -5930,7 +6043,9 @@ class PolymarketLPService:
                     if result["eligible"] is True:
                         eligible_directions.append(result)
 
-                if row_directions == 0 or row_missing_books == row_directions:
+                if row_directions == 0 or (
+                    row_missing_books == row_directions and history_rejections == 0
+                ):
                     # None of the row's directions could be re-read: the row
                     # keeps its published values this round.
                     return None, None
@@ -7030,6 +7145,7 @@ class PolymarketLPService:
                     allowed_open_order_ids=self._session_augment_own_order_ids(session),
                     reservations=self._candidate_reservations(),
                 )
+                self._require_lp_history(request, now=now)
                 # Issue 158: same submit-time best-bid re-check as start.
                 credential_preflight = preview.get("preflight")
                 credential_best_bid = (
@@ -7046,6 +7162,11 @@ class PolymarketLPService:
                     _timestamp(request["review_at"], name="review_at"), now=now
                 )
             except ValueError as exc:
+                if str(exc).startswith("history_"):
+                    try:
+                        self.store.consume_lp_preview(preview_id)
+                    except ValueError:
+                        pass
                 return {"state": "rejected", "reason": str(exc)}
             try:
                 self.store.consume_lp_preview(preview_id)
@@ -7392,6 +7513,7 @@ class PolymarketLPService:
                     allowed_open_order_ids=self._session_augment_own_order_ids(session),
                     reservations=self._candidate_reservations(),
                 )
+                self._require_lp_history(request, now=now)
                 expiration = expiration_for_review(
                     _timestamp(request["review_at"], name="review_at"), now=now
                 )
@@ -7784,6 +7906,7 @@ class PolymarketLPService:
                     cast(Mapping[str, object], snapshot.get("market")),
                 ):
                     raise ValueError("market_already_participating")
+                self._require_lp_history(request, now=now)
                 # Issue 158: submit-time re-check — the fresh best bid must
                 # still equal the one recorded in the preview credential.
                 # Idempotent replays returned above before this point, so a
@@ -7803,6 +7926,11 @@ class PolymarketLPService:
                     _timestamp(request["review_at"], name="review_at"), now=now
                 )
             except ValueError as exc:
+                if str(exc).startswith("history_"):
+                    try:
+                        self.store.consume_lp_preview(preview_id)
+                    except ValueError:
+                        pass
                 return {"state": "rejected", "reason": str(exc)}
             try:
                 self.store.consume_lp_preview(preview_id)
@@ -8111,6 +8239,7 @@ class PolymarketLPService:
                     cast(Mapping[str, object], snapshot.get("market")),
                 ):
                     raise ValueError("market_already_participating")
+                self._require_lp_history(normalized, now=now)
             except ValueError as exc:
                 # Issue 163: the single-shot trial anchor rejects with the
                 # operator-facing reason instead of the internal candidate
