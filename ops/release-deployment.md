@@ -50,6 +50,9 @@ exact-SHA 已验收。
 正式安装的前置条件是 Candidate Acceptance `PASS`、Host Readiness `READY` 和单独明确的
 部署授权。`RELEASE_SERVICES` 只决定 readiness/Smoke 的检查范围；每个 installer 仍须
 使用与范围匹配的脚本和 `--mode`，不会由 Makefile 自动执行安装。
+全新主机上尚无旧实例时，用 `make host-readiness FIRST_DEPLOY=1`：必须没有任何
+`com.open-trader.*` launchd 服务或 plist，且所选服务的监听端口均未被占用。
+该模式仅跳过旧 Account 状态检查，其他预检仍须通过；现有主机沿用默认模式。
 
 每个脚本先 `--dry-run` 核对输出,确认无误后去掉 `--dry-run` 正式执行。
 以脚本实际参数为准(先读脚本 usage);不要凭记忆抄参数。

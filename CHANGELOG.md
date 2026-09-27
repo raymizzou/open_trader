@@ -3,6 +3,10 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-09-27
+
+- Mac Air 首次部署可用 `make host-readiness FIRST_DEPLOY=1`：只有本机不存在 Open Trader launchd 服务及所选端口监听时，跳过尚未启动的旧 Account 状态检查；钱包、安装器、浏览器、Futu 与存储检查照常执行。验证：部署预检定向回归和真实 Mac Air 首次部署预检。
+
 ## 2026-09-24
 
 - Issue 172：LP 推荐与开仓/追加单提交统一按方向校验 24 小时历史振幅（≤$0.01）；最新历史刷新失败时 fail-closed，拒绝提交并由 Dashboard Toast 显示简短中文原因。旧委托与持仓不受影响。验证：LP、候选视图、历史缓存与 Toast 定向回归全绿（216/25/5/1）；未做 push 或部署。

@@ -36,6 +36,11 @@ SHA named by its gate.
   `FAIL`. It is backend-only, excludes `pressure` and `browser`, and excludes
   only `LIVE-*` scenarios from the portable prediction suite.
 - `make host-readiness` is read-only and must end with `READY` or `BLOCKED`.
+  On a fresh host with no Open Trader launchd agent or selected-service
+  listener, use `FIRST_DEPLOY=1`. This checks that no managed agent or selected
+  listener exists, skips only the old Account status probe, and retains the
+  installer, wallet, browser, storage, and Futu checks. The default mode still
+  requires running selected-service listeners and Account status.
   It performs read-only macOS checks of system Chrome for the five marked
   Python browser regressions and checks the installed repository Playwright
   runner with cached Chromium. A missing host runner or browser is `BLOCKED`.

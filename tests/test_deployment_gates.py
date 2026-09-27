@@ -282,6 +282,10 @@ def _run_host_readiness(
     browser_available: bool,
     services: str = DEFAULT_RELEASE_SERVICES,
     fail_components: bool = False,
+    first_deploy: bool = False,
+    existing_listener: bool = False,
+    existing_plist: bool = False,
+    loaded_label: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(parents=True)
@@ -305,9 +309,13 @@ exit 0
 """,
     )
     lsof_mode = (
-        'case "$*" in *8766*) exit 0 ;; *) exit 1 ;; esac'
-        if fail_components
-        else "exit 0"
+        "exit 1"
+        if first_deploy and not existing_listener
+        else (
+            'case "$*" in *8766*) exit 0 ;; *) exit 1 ;; esac'
+            if fail_components
+            else "exit 0"
+        )
     )
     _write_executable(
         fake_bin / "lsof",
@@ -318,6 +326,18 @@ exit 0
         '#!/bin/sh\necho "node $*" >> "$FAKE_CALLS"\nexit %s\n'
         % ("0" if browser_available else "1"),
     )
+    _write_executable(
+        fake_bin / "launchctl",
+        '#!/bin/sh\necho "launchctl $*" >> "$FAKE_CALLS"\n'
+        + ('printf "1\\t0\\tcom.open-trader.account-api\\n"\n' if loaded_label else '')
+        + 'exit 0\n',
+    )
+
+    fake_home = tmp_path / "home"
+    launch_agents = fake_home / "Library" / "LaunchAgents"
+    launch_agents.mkdir(parents=True)
+    if existing_plist:
+        (launch_agents / "com.open-trader.account-api.plist").write_text("old")
 
     runtime_root = tmp_path / "runtime"
     playwright_bin = runtime_root / "node_modules" / ".bin" / "playwright"
@@ -340,6 +360,7 @@ exit 0
     environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
     environment["TMPDIR"] = str(tmp_path)
     environment["FAKE_CALLS"] = str(calls)
+    environment["HOME"] = str(fake_home)
     return subprocess.run(
         [
             "make",
@@ -349,6 +370,7 @@ exit 0
             f"REPOSITORY_ROOT={runtime_root}",
             f"PLAYWRIGHT_NODE_PATH={runtime_root / 'node_modules'}",
             f"DAILY_CONFIG={daily_config}",
+            f"FIRST_DEPLOY={int(first_deploy)}",
         ],
         cwd=ROOT,
         env=environment,
@@ -364,6 +386,49 @@ def test_host_readiness_does_not_require_old_prediction_state(tmp_path: Path) ->
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout.rstrip().endswith("READY")
+
+
+def test_first_deploy_readiness_accepts_empty_host_without_old_account(
+    tmp_path: Path,
+) -> None:
+    result = _run_host_readiness(
+        tmp_path, browser_available=True, first_deploy=True
+    )
+    calls = (tmp_path / "calls").read_text(encoding="utf-8")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "fresh host ownership: PASS" in result.stdout
+    assert "loopback listeners absent: PASS" in result.stdout
+    assert "account status:" not in result.stdout
+    assert "account-sync-status" not in calls
+    assert "prediction-arb wallet" in calls
+    assert result.stdout.rstrip().endswith("READY")
+
+
+@pytest.mark.parametrize(
+    "blocker", ("existing_listener", "existing_plist", "loaded_label")
+)
+def test_first_deploy_readiness_rejects_existing_owner(
+    tmp_path: Path, blocker: str
+) -> None:
+    result = _run_host_readiness(
+        tmp_path, browser_available=True, first_deploy=True, **{blocker: True}
+    )
+
+    assert result.returncode != 0
+    assert result.stdout.rstrip().endswith("BLOCKED")
+
+
+def test_first_deploy_readiness_keeps_wallet_and_futu_gates(tmp_path: Path) -> None:
+    result = _run_host_readiness(
+        tmp_path, browser_available=True, first_deploy=True, fail_components=True
+    )
+
+    assert "fresh host ownership: PASS" in result.stdout
+    assert "loopback listeners absent: PASS" in result.stdout
+    assert "prediction wallet: BLOCKED" in result.stdout
+    assert "Futu connectivity: BLOCKED" in result.stdout
+    assert result.stdout.rstrip().endswith("BLOCKED")
 
 
 def test_host_readiness_still_blocks_missing_browser(tmp_path: Path) -> None:

@@ -25,6 +25,7 @@ N_LEG_PAUSED ?= 0
 PREDICTION_CONFIG ?= $(REPOSITORY_ROOT)/config/prediction_arbitrage.json
 DAILY_CONFIG ?= $(REPOSITORY_ROOT)/config/daily_premarket.env
 RELEASE_SERVICES ?= gateway legacy account prediction
+FIRST_DEPLOY ?= 0
 
 test:
 	$(DOCKER_BUILD)
@@ -76,6 +77,8 @@ acceptance: candidate-acceptance
 host-readiness:
 	@set -u; \
 	services='$(strip $(RELEASE_SERVICES))'; \
+	first_deploy='$(FIRST_DEPLOY)'; \
+	case "$$first_deploy" in 0|1) ;; *) echo "FIRST_DEPLOY must be 0 or 1" >&2; echo BLOCKED; exit 2 ;; esac; \
 	set -f; \
 	if [ -z "$$services" ]; then echo "RELEASE_SERVICES must name one or more of: gateway legacy account prediction" >&2; echo BLOCKED; exit 2; fi; \
 	set -- $$services; \
@@ -83,6 +86,9 @@ host-readiness:
 	for service in "$$@"; do case "$$service" in gateway) gateway_selected=1 ;; legacy) legacy_selected=1 ;; account) account_selected=1 ;; prediction) prediction_selected=1 ;; *) echo "unknown RELEASE_SERVICES entry: $$service" >&2; echo BLOCKED; exit 2 ;; esac; done; \
 	status=0; \
 	check() { label="$$1"; shift; if "$$@" >/dev/null 2>&1; then echo "$$label: PASS"; else echo "$$label: BLOCKED"; status=1; fi; }; \
+	if [ "$$first_deploy" = 1 ]; then \
+		check "fresh host ownership" sh -c 'command -v launchctl >/dev/null || exit 1; listed="$$(launchctl list 2>/dev/null)" || exit 1; case "$$listed" in *com.open-trader.*) exit 1 ;; esac; for plist in "$$HOME"/Library/LaunchAgents/com.open-trader.*.plist; do [ ! -e "$$plist" ] && [ ! -L "$$plist" ] || exit 1; done'; \
+	fi; \
 	if [ $$gateway_selected -eq 1 ]; then \
 		if [ $$legacy_selected -eq 1 ]; then \
 			check "dashboard launchd dry-run" "$(WORKTREE_ROOT)/scripts/install_dashboard_launchd.sh" --dry-run --mode stack --repo-root "$(WORKTREE_ROOT)" --runtime-root "$(REPOSITORY_ROOT)"; \
@@ -104,7 +110,7 @@ host-readiness:
 			--live-catalog /dev/null 2>/dev/null \
 			| "$(PYTHON_BIN)" -c 'import json,sys; p=json.load(sys.stdin); ok=(p.get("replay") or {}).get("status")=="PASS" and (p.get("live") or {}).get("reason")=="LIVE_CATALOG_UNAVAILABLE"; raise SystemExit(0 if ok else 1)'; \
 	}; \
-	if [ $$account_selected -eq 1 ]; then check "account status" "$(PYTHON_BIN)" -m open_trader account-sync-status --account-url "$(ACCOUNT_API_URL)" --json; fi; \
+	if [ $$account_selected -eq 1 ] && [ "$$first_deploy" = 0 ]; then check "account status" "$(PYTHON_BIN)" -m open_trader account-sync-status --account-url "$(ACCOUNT_API_URL)" --json; fi; \
 	if [ $$prediction_selected -eq 1 ]; then \
 		check "prediction wallet" "$(PYTHON_BIN)" -m open_trader prediction-arb wallet status --config "$(PREDICTION_CONFIG)"; \
 		if nleg_replay_passes >/dev/null 2>&1; then echo "prediction n-leg replay validation: PASS"; else echo "prediction n-leg replay validation: BLOCKED"; status=1; fi; \
@@ -116,7 +122,11 @@ host-readiness:
 	if [ $$legacy_selected -eq 1 ]; then listener_ports="$$listener_ports 8767"; fi; \
 	if [ $$account_selected -eq 1 ]; then listener_ports="$$listener_ports 8768"; fi; \
 	if [ $$prediction_selected -eq 1 ]; then listener_ports="$$listener_ports 8769"; fi; \
-	check "loopback listeners" sh -c 'command -v lsof >/dev/null && for port do lsof -nP -iTCP:"$$port" -sTCP:LISTEN >/dev/null || exit 1; done' sh $$listener_ports; \
+	if [ "$$first_deploy" = 1 ]; then \
+		check "loopback listeners absent" sh -c 'command -v lsof >/dev/null || exit 1; for port do if lsof -nP -iTCP:"$$port" -sTCP:LISTEN >/dev/null 2>&1; then exit 1; fi; done' sh $$listener_ports; \
+	else \
+		check "loopback listeners" sh -c 'command -v lsof >/dev/null && for port do lsof -nP -iTCP:"$$port" -sTCP:LISTEN >/dev/null || exit 1; done' sh $$listener_ports; \
+	fi; \
 	check "storage" df -P "$(REPOSITORY_ROOT)"; \
 	if [ $$legacy_selected -eq 1 ]; then check "Futu connectivity" "$(PYTHON_BIN)" -c 'import socket; s = socket.create_connection(("127.0.0.1", 11111), 2); s.close()'; fi; \
 	if [ $$status -eq 0 ]; then echo READY; else echo BLOCKED; exit 2; fi
