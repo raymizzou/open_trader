@@ -5,6 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-27
 
+- LP 停止回归改为在解除 SDK 阻塞后有界等待份额监控线程实际退出，补齐测试替身时钟；保留首次停止超时、资源保留和再次停止释放检查，生产关闭逻辑不变。验证：停止、调度、控制与真实 LP／日报集成定向回归 56 passed；完整 Candidate 另按最终 SHA 验收。
 - Mac Air 首次部署可用 `make host-readiness FIRST_DEPLOY=1`：只有本机不存在 Open Trader launchd 服务及所选端口监听时，跳过尚未启动的旧 Account 状态检查；钱包、安装器、浏览器、Futu 与存储检查照常执行。验证：部署预检定向回归和真实 Mac Air 首次部署预检。
 - #195/#196/#197 联合接线：现有 LP 卡片展示真实自动资金、订单归属与自然日报；增加真实 SQLite/LP 生命周期联调，覆盖重启、暂停并发、跨日补位、回执恢复、卖出回款、只读接口和独立出报。最终 Candidate 结果以共同提交 SHA 的验收记录为准。
 - Issue 196：自动 LP 补位接入独立每分钟检查，启用/恢复立即核对，暂停保留已有 BUY、保护与退出；新增页面控制和 `prediction-arb lp-auto pause`，终端仅收到持久化确认才报告成功。调度、控制 API、CLI 和页面定向测试已覆盖跨日、非重叠、失败重试和不可达确认；真实资金/归属核心由 #195 提供，联合验收另记。未启用真实交易、push 或部署。

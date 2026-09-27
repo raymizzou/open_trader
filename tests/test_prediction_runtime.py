@@ -3217,6 +3217,9 @@ def test_lp_share_watch_runs_without_dashboard_and_stops_with_runtime(
         def __init__(self, *_args: object, **_kwargs: object) -> None:
             pass
 
+        def _now(self) -> datetime:
+            return datetime.now(UTC)
+
         def set_mutation_guard(self, _guard: object) -> None:
             pass
 
@@ -3531,11 +3534,15 @@ def test_lp_share_watch_runs_without_dashboard_and_stops_with_runtime(
         assert not probe.trading_closed.is_set()
         assert not probe.lp_closed.is_set()
 
+        share_worker = runtime._lp_share_thread
+        assert share_worker is not None and share_worker.is_alive()
         probe.orders_blocked = False
         probe.orders_release.set()
         wait_for(lambda: probe.active_order_reads == 0)
         reads_after_release = probe.order_reads
-        time.sleep(0.05)
+        # The SDK read can finish before the worker's final SQLite updates.
+        share_worker.join(timeout=2)
+        assert not share_worker.is_alive()
         assert probe.order_reads == reads_after_release
         assert probe.percentage_reads == percentage_reads_at_stop
         runtime.stop()
