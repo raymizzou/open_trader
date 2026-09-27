@@ -133,3 +133,37 @@ def test_real_reconciliation_block_does_not_delay_paused_auto_daily_report(tmp_p
             runtime._lp_thread.join(2)
         if runtime._lp_report_thread:
             runtime._lp_report_thread.join(2)
+
+
+def test_real_sell_receipt_loss_and_recovery_changes_pending_without_new_acceptance(tmp_path, monkeypatch):
+    engine, exchange, lp, store = pool.setup(tmp_path)
+    engine.lp_auto_configure({"budget_usd": "100", "target_buy_count": 1})
+    engine.lp_auto_set_desired_running(True)
+    engine.lp_auto_run_once(round_id="receipt-report")
+    exchange.orders[0].update(status="FILLED", size_matched="20")
+    exchange.positions = [dict(token_id="m00", condition_id="m00", size="20")]
+    exchange.trades = [dict(trade_id="buy-fill", status="CONFIRMED", matched_at="2026-09-27T08:00:01Z",
+                           maker_orders=[dict(order_id="o1", token_id="m00", side="BUY",
+                                              matched_amount="20", price=".40", fee="0")])]
+    monkeypatch.setattr(pool, "NOW", moment("2026-09-27T08:00:02Z"))
+    engine.lp_tick()
+    assert len(exchange.posts) == 2 and exchange.posts[1]["side"] == "SELL"
+    engine.lp_auto_reconcile_unknown()
+    sell = exchange.orders.pop()
+    monkeypatch.setattr(pool, "NOW", moment("2026-09-27T08:01:00Z"))
+    engine.lp_auto_run_once(round_id="missing-sell")
+    reporter = AutoDailyReports(store, engine.lp_auto_report_facts, engine.lp_auto_state, now=lambda: pool.NOW)
+    missing = reporter.today()
+    key = f"receipt_unknown:{sell['order_id']}"
+    assert any(row["event_id"] == key for row in missing["pending"])
+    assert missing["closing_orders_status"] == "unknown"
+    assert missing["funds"]["available_usd"] is None
+    assert len(exchange.posts) == 2
+    exchange.orders.append(sell)
+    monkeypatch.setattr(pool, "NOW", moment("2026-09-27T08:02:00Z"))
+    engine.lp_auto_reconcile_unknown()
+    recovered = reporter.today()
+    assert not any(row["event_id"] == key for row in recovered["pending"])
+    assert recovered["closing_orders_status"] == "from_saved_events"
+    assert recovered["metrics"]["accepted_count"] == missing["metrics"]["accepted_count"] == 2
+    assert len(exchange.posts) == 2

@@ -93,6 +93,33 @@ def test_new_day_unknown_submission_is_not_a_previous_day_pending_order():
     assert report["metrics"]["intent_count"] == 0
 
 
+def test_receipt_uncertainty_after_acceptance_stays_pending_until_explicit_recovery(tmp_path):
+    from open_trader.polymarket_lp_reports import AutoDailyReports
+    clock = [moment("2026-09-26T16:05:00Z")]
+    missing = event("receipt_unknown:o1", "unknown", None, side="SELL",
+                    reason="order_receipt_unknown", observed_at="2026-09-26T15:59:00Z")
+    source = facts([event("i", "intent", "2026-09-26T15:00:00Z", side="SELL"),
+                    event("a", "accepted", "2026-09-26T15:00:01Z", side="SELL", quantity="10"), missing])
+    reports = AutoDailyReports(PredictionArbitrageStore(tmp_path), lambda **_: source,
+                               lambda: source["state"], now=lambda: clock[0])
+    saved = reports.generate_due()[0]
+    assert saved["metrics"]["accepted_count"] == 1
+    assert saved["metrics"]["unknown_count"] == 0  # Acceptance is known; current order state is not.
+    assert saved["closing_orders_status"] == "unknown"
+    assert saved["closing_orders"][0]["state"] == "unknown"
+    assert any(row["event_id"] == missing["event_id"] for row in saved["pending"])
+    assert reports.today()["closing_orders_status"] == "unknown"
+    missing["resolved_at"] = "2026-09-26T16:06:00Z"
+    assert reports.today()["closing_orders_status"] == "unknown"  # Future recovery is not evidence yet.
+    clock[0] = moment("2026-09-26T16:06:00Z")
+    recovered = reports.today()
+    assert recovered["pending"] == []
+    assert recovered["closing_orders_status"] == "from_saved_events"
+    assert recovered["metrics"]["accepted_count"] == 0
+    assert recovered["closing_orders"][0]["remaining_quantity"] == "10"
+    assert reports.report("2026-09-26") == saved
+
+
 def test_cross_day_stocks_and_late_ack_are_not_new_daily_orders():
     from open_trader.polymarket_lp_reports import build_auto_report
     events = [event("i", "intent", "2026-09-25T15:00:00Z"),

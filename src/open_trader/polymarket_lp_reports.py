@@ -87,8 +87,13 @@ def build_auto_report(
         and (occurred := _stamp(row.get("occurred_at"))) is not None and occurred < end
     }
     for row in events.values():
-        if row.get("kind") == "unknown" and row.get("intent_id") in observed_resolutions:
-            continue
+        if row.get("kind") == "unknown":
+            if row.get("reason") == "order_receipt_unknown":
+                recovered = _stamp(row.get("resolved_at"))
+                if recovered is not None and recovered <= now:
+                    continue
+            elif row.get("intent_id") in observed_resolutions:
+                continue
         occurred = _stamp(row.get("occurred_at"))
         if occurred is None:
             if row.get("intent_id") in future_intents:
