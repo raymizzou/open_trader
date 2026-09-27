@@ -189,3 +189,30 @@ N-Leg state 契约。除既有的
 失败处理，先做只读审计，再决定 fix-forward 或回滚；不要在未通过时宣称部署完成。
 
 `RELEASE_SERVICES` 只改变检查和部署范围，不改变交易语义或任何业务规则。
+
+
+## 迁移前存量持仓恢复
+
+旧主机状态库无法恢复、启动因 `unknown_external_state` 阻断时，先由操作者明确
+确认哪些持仓属于自行管理的迁移前存量。不要删除事故或伪造策略执行记录。
+生产服务停止且发布版本通过部署门禁后，在该发布的源码环境执行：
+
+```bash
+PYTHONPATH=<新发布>/src <运行时根>/.venv/bin/python -m open_trader prediction-arb recover-external-positions \
+  --config <运行时根>/config/prediction_arbitrage.json --data-dir <运行时根>/data \
+  --incident-id <事故ID> --position <token_id>=<当前数量> \
+  --note '操作者已确认迁移前存量由其自行管理' --confirm
+```
+
+`--position` 可重复；必须精确匹配事故及最新账户的正持仓，钱包身份必须一致，
+且没有活动策略执行或 LP 会话。默认拒绝任何挂单；若操作者确认原样保留旧仓的
+现有卖单，可重复传入 `--external-sell-order-id <订单ID>`。完整挂单集合必须与确认
+ID 一致，且最新认证快照证明全部为该钱包上述存量的 SELL、剩余数量合计不超过
+存量；任何 BUY、未确认订单、不完整快照或变化均拒绝。不会撤单或修改卖单。
+命令持有运行时所有权锁及执行锁，拒绝在
+生产运行期间登记。登记保存在原事故的 acknowledgement 中，保留事故原始证据；
+不下单、撤单、卖出、发送通知或自动启用策略。随后按正常生产安装流程启动。
+
+登记仅允许同钱包、同 token 且不超过确认数量的存量通过启动/事故恢复校验；
+新 token 或超过确认数量上限仍阻断。原始持仓仍显示在账户中、仍排除同市场 LP 新买入，
+不进入自动策略资金或库存账本。其余 readiness 和交易门禁照常执行。

@@ -6245,6 +6245,28 @@ class PredictionExecutionService:
             if callable(lp_active_reader)
             else []
         )
+        registrations = self._external_registrations()
+        external_limits = self._external_position_limits(snapshot)
+        if registrations:
+            account_id = self._external_snapshot_account(snapshot)
+            if not account_id or any(ack.get("account_id") != account_id for ack in registrations):
+                return {"state": "locked", "reason": "account_mismatch"}
+            external_ids = self._external_sell_ids(registrations) & set(snapshot["open_order_ids"])
+            if self._external_sell_evidence(snapshot, external_limits, external_ids) is None:
+                return {"state": "locked", "reason": "external_orders_changed"}
+            # LP-owned inventory remains the session's responsibility; externally
+            # registered tokens never inherit that exemption or an unlimited cap.
+            known = self._known_holding_tokens() | {
+                str(row.get("token_id")) for row in lp_sessions if row.get("token_id")
+            }
+            active_for_external = self._store.active_execution()
+            active_intent_for_external = self._intent_from_payload(active_for_external.get("intent")) if active_for_external else None
+            totals = self._position_totals(
+                snapshot, active_intent_for_external, known_tokens=known - external_limits.keys(),
+                external_limits=external_limits,
+            )
+            if totals["unknown"]:
+                return {"state": "locked", "reason": "unknown_external_state"}
         if lp_sessions:
             lp_tick = getattr(self._lp, "tick", None)
             if not callable(lp_tick):
@@ -6336,6 +6358,7 @@ class PredictionExecutionService:
             snapshot,
             active_intent,
             known_tokens=self._known_holding_tokens(),
+            external_limits=self._external_position_limits(snapshot),
         )
         if totals["unknown"]:
             evidence = {"phase": "startup_unknown_state", "positions": totals["unknown"]}
@@ -6439,6 +6462,161 @@ class PredictionExecutionService:
         self._breaker_open = False
         return {"state": "ready", "readiness": "fresh"}
 
+    def register_external_positions(
+        self, incident_id: str, positions: Mapping[str, str], *, confirm: bool, note: str,
+        external_sell_order_ids: tuple[str, ...] = (),
+    ) -> dict[str, object]:
+        """Record operator-owned migration inventory; never adopt or trade it."""
+        if confirm is not True or not isinstance(note, str) or not note.strip():
+            return {"state": "locked", "reason": "confirmation_required"}
+        try:
+            expected = {str(token): Decimal(str(qty)) for token, qty in positions.items()}
+            if not expected or any(not token.strip() or not q.is_finite() or q <= 0
+                                   for token, q in expected.items()):
+                raise ValueError("invalid positions")
+        except (AttributeError, ValueError, InvalidOperation):
+            return {"state": "locked", "reason": "positions_invalid"}
+        lock = self._acquire_global_lock()
+        if lock is None:
+            return {"state": "locked", "reason": "execution_busy"}
+        try:
+            incident = self._store.unacknowledged_incident()
+            if (incident is None or incident.get("incident_id") != incident_id
+                    or incident.get("reason") != "unknown_external_state"
+                    or incident.get("phase") != "startup_unknown_state"
+                    or incident.get("recovery") is not True):
+                return {"state": "locked", "reason": "incident_not_recoverable"}
+            if self._store.active_execution() is not None or self._store.lp_active_sessions():
+                return {"state": "locked", "reason": "active_execution"}
+            snapshot = self._fresh_account_snapshot()
+            if snapshot is None or (_age_seconds(snapshot.get("checked_at")) or 0) < 0:
+                return {"state": "locked", "reason": "account_unavailable"}
+            account_id = self._external_snapshot_account(snapshot)
+            if account_id is None:
+                return {"state": "locked", "reason": "account_mismatch"}
+            approved_orders = set(external_sell_order_ids)
+            if (len(approved_orders) != len(external_sell_order_ids)
+                    or any(not isinstance(oid, str) or not oid.strip() for oid in approved_orders)
+                    or set(snapshot["open_order_ids"]) != approved_orders):
+                return {"state": "locked", "reason": "open_orders"}
+            external_orders = self._external_sell_evidence(snapshot, expected, approved_orders)
+            if external_orders is None:
+                return {"state": "locked", "reason": "external_orders_changed"}
+            # Match the precise positive inventory both now and in the incident.
+            # No wildcard token whitelist: an increased balance needs a new review.
+            for rows in (snapshot["positions"], incident.get("positions", [])):
+                if not isinstance(rows, (list, tuple)):
+                    return {"state": "locked", "reason": "positions_changed"}
+                actual = {}
+                unknown = self._position_totals({"positions": rows}, None,
+                                               known_tokens=self._known_holding_tokens(),
+                                               external_limits=self._external_position_limits(snapshot))["unknown"]
+                for row in unknown:
+                    if not isinstance(row, Mapping):
+                        return {"state": "locked", "reason": "positions_changed"}
+                    row_wallet = row.get("wallet", row.get("wallet_address"))
+                    if row_wallet is not None and str(row_wallet).strip().casefold() != str(snapshot["wallet_address"]).strip().casefold():
+                        return {"state": "locked", "reason": "account_mismatch"}
+                    token = row.get("token_id", row.get("tokenId", row.get("asset_id")))
+                    qty = _decimal(row.get("size", row.get("quantity", row.get("shares"))))
+                    if not isinstance(token, str) or qty is None or qty < 0 or token in actual:
+                        return {"state": "locked", "reason": "positions_changed"}
+                    if qty > 0:
+                        actual[token] = qty
+                if actual != expected:
+                    return {"state": "locked", "reason": "positions_changed"}
+            self._store.acknowledge_incident(incident_id, {
+                "reconciliation": "external_positions_registered",
+                "acknowledged_by": "operator", "acknowledged_at": _timestamp(_utc_now()),
+                "account_id": account_id, "note": note.strip(),
+                "positions": [{"token_id": token, "quantity": str(qty)} for token, qty in expected.items()],
+                "external_sell_orders": external_orders,
+                "management": "external", "checked_at": snapshot["checked_at"],
+            })
+            # Startup must still check every other readiness gate before trading.
+            return {"state": "registered", "incident_id": incident_id}
+        finally:
+            self._release_global_lock(lock)
+
+    def _external_registrations(self) -> list[Mapping[str, object]]:
+        return [row["acknowledgement"] for row in self._store.histories("incidents")
+                if row.get("acknowledged") is True and isinstance(row.get("acknowledgement"), Mapping)
+                and row["acknowledgement"].get("reconciliation") == "external_positions_registered"]
+
+    @staticmethod
+    def _external_sell_ids(registrations: list[Mapping[str, object]]) -> set[str]:
+        return {row["order_id"] for ack in registrations
+                for row in ack.get("external_sell_orders", [])
+                if isinstance(row, Mapping) and isinstance(row.get("order_id"), str)}
+
+    def _external_sell_evidence(
+        self, snapshot: Mapping[str, object], limits: Mapping[str, Decimal], order_ids: set[str],
+    ) -> list[dict[str, object]] | None:
+        """Validate remaining explicitly registered SELLs without managing them.
+
+        Closed external orders need no adoption; other orders retain their usual
+        LP/manual ownership rules. Registration/reset separately reject extra IDs.
+        """
+        if not order_ids:
+            return []
+        try:
+            orders = _call(getattr(self._trading, "lp_open_orders_snapshot", None))
+        except Exception:
+            return None
+        age = _age_seconds(orders.get("checked_at")) if isinstance(orders, Mapping) else None
+        if (not isinstance(orders, Mapping) or orders.get("authenticated") is not True
+                or orders.get("open_orders_complete") is not True or age is None or not 0 <= age <= 60
+                or self._external_snapshot_account(orders) != self._external_snapshot_account(snapshot)):
+            return None
+        rows = orders.get("open_orders")
+        if (not isinstance(rows, (list, tuple)) or any(not isinstance(row, Mapping) for row in rows)
+                or any(not isinstance(row.get("order_id"), str) for row in rows)):
+            return None
+        observed_ids = [row["order_id"] for row in rows]
+        if (len(observed_ids) != len(set(observed_ids))
+                or set(observed_ids) != set(snapshot["open_order_ids"]) or not order_ids <= set(observed_ids)):
+            return None
+        evidence, remaining = [], dict(limits)
+        for row in rows:
+            if row["order_id"] not in order_ids:
+                continue
+            token = row.get("token_id")
+            quantity, price = _decimal(row.get("remaining_size")), _decimal(row.get("price"))
+            if (not isinstance(token, str) or row.get("side") != "SELL"
+                    or quantity is None or not 0 < quantity <= remaining.get(token, Decimal("0"))
+                    or price is None or not 0 < price <= 1 or row.get("status") != "LIVE"):
+                return None
+            remaining[token] -= quantity
+            evidence.append({key: row[key] for key in
+                             ("order_id", "token_id", "side", "price", "remaining_size", "status")})
+        return evidence
+
+    def _external_snapshot_account(self, snapshot: Mapping[str, object]) -> str | None:
+        wallet = snapshot.get("wallet_address")
+        if not isinstance(wallet, str) or not wallet.strip():
+            return None
+        account_id = hashlib.sha256(wallet.strip().casefold().encode("utf-8")).hexdigest()
+        return account_id if account_id == self._lp_account_id() else None
+
+    def _external_position_limits(self, snapshot: Mapping[str, object]) -> dict[str, Decimal]:
+        account_id = self._external_snapshot_account(snapshot)
+        if account_id is None:
+            return {}
+        limits = {}
+        for ack in self._external_registrations():
+            if ack.get("account_id") != account_id:
+                continue
+            rows = ack.get("positions")
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    continue
+                token, quantity = row.get("token_id"), _decimal(row.get("quantity"))
+                if isinstance(token, str) and quantity is not None and quantity > 0:
+                    limits.setdefault(token, quantity)
+        return limits
+
     def reset_breaker(
         self,
         incident_id: str,
@@ -6497,6 +6675,7 @@ class PredictionExecutionService:
             ),
             None,
         )
+        external_registration = False
         if incident is not None and incident.get("acknowledged") is True:
             acknowledgement = incident.get("acknowledgement")
             if (
@@ -6509,7 +6688,12 @@ class PredictionExecutionService:
                     "reason": "reset_confirmed",
                     "incident_id": str(incident_id),
                 }
-            incident = None
+            external_registration = (
+                isinstance(acknowledgement, Mapping)
+                and acknowledgement.get("reconciliation") == "external_positions_registered"
+            )
+            if not external_registration:
+                incident = None
         if incident is None:
             self._breaker_open = True
             return {"state": "locked", "reason": "incident_not_found", "incident_id": str(incident_id)}
@@ -6530,6 +6714,8 @@ class PredictionExecutionService:
         if snapshot is None:
             reasons.append("account_unavailable")
         else:
+            if external_registration and self._external_snapshot_account(snapshot) != acknowledgement.get("account_id"):
+                reasons.append("account_mismatch")
             checked_age = _age_seconds(snapshot.get("checked_at"))
             if checked_age is None or checked_age > 60:
                 reasons.append("account_stale")
@@ -6538,12 +6724,19 @@ class PredictionExecutionService:
             elif not self._snapshot_collections_valid(snapshot):
                 reasons.append("account_malformed")
             open_orders = self._order_ids(snapshot.get("open_order_ids", ()))
-            if open_orders:
+            registrations = self._external_registrations()
+            allowed_ids = self._external_sell_ids(registrations)
+            if registrations and any(ack.get("account_id") != self._external_snapshot_account(snapshot) for ack in registrations):
+                reasons.append("account_mismatch")
+            if set(open_orders) - allowed_ids:
                 reasons.append("open_orders")
+            elif self._external_sell_evidence(snapshot, self._external_position_limits(snapshot), set(open_orders)) is None:
+                reasons.append("external_orders_changed")
             active = self._store.active_execution()
             intent = self._intent_from_payload(active.get("intent")) if active else None
             totals = self._position_totals(
-                snapshot, intent, known_tokens=self._known_holding_tokens()
+                snapshot, intent, known_tokens=self._known_holding_tokens(),
+                external_limits=self._external_position_limits(snapshot),
             )
             holding_imbalances = self._holding_imbalances(snapshot)
             if totals["unknown"]:
@@ -6581,6 +6774,11 @@ class PredictionExecutionService:
                 "blocking_reasons": reasons,
                 "incident_id": str(incident_id),
             }
+        if external_registration:
+            # Keep the inventory registration durable; never replace it with a
+            # fictitious clean/flat acknowledgement or bypass fresh checks.
+            self._breaker_open = False
+            return {"state": "ready", "reason": "external_positions_registered", "incident_id": str(incident_id)}
         payload = {
             "incident_id": str(incident_id),
             "acknowledged_by": "operator",
@@ -9094,6 +9292,7 @@ class PredictionExecutionService:
         intent: ExecutionIntent | None,
         *,
         known_tokens: set[str] | None = None,
+        external_limits: Mapping[str, Decimal] | None = None,
     ) -> dict[str, object]:
         positions = snapshot.get("positions", ())
         totals: dict[str, object] = {"yes": Decimal("0"), "no": Decimal("0"), "unknown": []}
@@ -9120,6 +9319,7 @@ class PredictionExecutionService:
             yes_token = intent.yes_token_id if intent else None
             no_token = intent.no_token_id if intent else None
         known = known_tokens or set()
+        external_remaining = dict(external_limits or {})
         for position in positions:
             if not isinstance(position, Mapping):
                 totals["unknown"].append(str(position))
@@ -9143,6 +9343,8 @@ class PredictionExecutionService:
                 totals["no"] = totals["no"] + quantity
             elif token in known and quantity > 0:
                 continue
+            elif 0 < quantity <= external_remaining.get(token, Decimal("0")):
+                external_remaining[token] -= quantity
             elif quantity > 0:
                 totals["unknown"].append(PredictionExecutionService._safe_mapping(position))
         return totals
