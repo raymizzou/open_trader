@@ -363,7 +363,7 @@ def test_default_gates_run_backend_suite_and_keep_explicit_pressure_and_browser_
     repo_root = Path(__file__).parents[1]
     plans = {
         target: subprocess.run(
-            ["make", "-n", target],
+            ["make", "-n", target, *(["SERVICE=legacy"] if target == "test" else [])],
             cwd=repo_root,
             check=True,
             capture_output=True,
@@ -400,6 +400,9 @@ def test_default_gates_run_backend_suite_and_keep_explicit_pressure_and_browser_
 
     assert (
         '-m "not pressure and not browser"' in normalized["test"]
+        and "tests/test_dashboard_acceptance.py" in normalized["test"]
+        and "tests/test_frontend_gateway.py" not in normalized["test"]
+        and "tests/test_prediction_service.py" not in normalized["test"]
         and '-m "not pressure and not browser"' in normalized["acceptance"]
         and 'acceptance/test_prediction_arbitrage_scenarios.py -k "not LIVE"'
         in normalized["acceptance"]
@@ -482,7 +485,7 @@ def test_candidate_acceptance_owns_container_backend_gate() -> None:
         "test-pressure:", 1
     )[0]
     assert "BACKEND_PYTEST :=" in makefile
-    assert "$(DOCKER_RUN) $(BACKEND_PYTEST) $(TEST)" in makefile
+    assert "$(DOCKER_RUN) $(BACKEND_PYTEST) $(if $(strip $(TEST))" in makefile
     assert candidate_recipe.count("$(DOCKER_BUILD)") == 1
     assert candidate_recipe.count("$(DOCKER_RUN)") == 1
     assert "$(MAKE) test" not in candidate_recipe
@@ -9639,7 +9642,7 @@ def test_container_and_runtime_gates_keep_python_interpreter_selection_explicit(
         "$(REPOSITORY_ROOT)/.venv/bin/python)"
     ) in makefile
     assert 'BACKEND_PYTEST := env PYTHONSAFEPATH=1 PYTHONPATH=/workspace:/workspace/src' in makefile
-    assert '$(DOCKER_RUN) $(BACKEND_PYTEST) $(TEST)' in makefile
+    assert '$(DOCKER_RUN) $(BACKEND_PYTEST) $(if $(strip $(TEST))' in makefile
     assert '"$(PYTHON_BIN)" -m pytest -q -m pressure' in makefile
     assert '"$(PYTHON_BIN)" -m open_trader' in makefile
     assert 'OPEN_TRADER_PYTHON="$(PYTHON_BIN)"' not in makefile

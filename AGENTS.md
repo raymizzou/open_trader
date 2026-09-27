@@ -35,11 +35,12 @@ Host Readiness, or Production Smoke; shared modules/dependencies,
 Dashboard/backend runtime, reports, trading, or wider production paths use the
 normal gates. Read the linked runbook before selecting a non-exempt gate.
 
-For production-code changes covered by the normal gates, use focused
-`make test TEST=...` checks for each changed seam during development and expand
-only to the affected tests. Do not run a full `make test` solely as a bookend
-before or after Candidate Acceptance. After known repairs and any required
-rebase, complete focused checks and independent review before local merge.
+For production-code changes covered by the normal gates, run
+`make test SERVICE=<gateway|legacy|account|prediction>` for the affected backend
+service. Use multiple service names for shared changes and `TEST=...` for a
+narrower seam. Do not run the full backend suite during development. After
+known repairs and any required rebase, complete affected-service checks and
+independent review before local merge.
 Candidate Acceptance runs only after the candidate is merged into local
 `main`, when preparing an explicitly authorized deployment. Do not run it
 during development, review, before merge, or automatically after a local merge.

@@ -166,13 +166,16 @@ Run one real daily check for a market:
 
 Use four explicit stages; a local merge is not a deployment:
 
-1. **Docker dev** — `make test` (or `make test TEST='tests/path.py::test_name'`) builds
-   the worktree-specific Python/backend image and runs the backend pytest suite
-   with `-m 'not pressure and not browser'`. The image includes the Node runtime
+1. **Docker dev** — `make test SERVICE=prediction` or
+   `make test TEST='tests/path.py::test_name'` builds the worktree-specific
+   Python/backend image and runs only the selected backend tests with
+   `-m 'not pressure and not browser'`. Use space-separated service names for
+   shared changes; unscoped `make test` fails. The image includes the Node runtime
    and `procps`, but excludes npm, Python/JS Playwright, Chromium/browser assets,
    host mounts, network, published ports, Docker socket, home directory, and
    credentials. It has zero browser cost.
-2. **Candidate Acceptance** — `make candidate-acceptance` builds once and runs
+2. **Predeployment Candidate Acceptance** — only when preparing a deployment,
+   run `make candidate-acceptance` for the exact SHA to deploy. It builds once and runs
    only the backend target: the full suite with `pressure` and `browser` excluded,
    then `acceptance/test_prediction_arbitrage_scenarios.py -k 'not LIVE'` with
    the same marker exclusions. It never

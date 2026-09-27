@@ -201,12 +201,15 @@ watchlist 使用市场、标的和 Trend Animals 业务标识：
 
 四个阶段彼此独立；本地合并不等于部署：
 
-1. **Docker 开发**：`make test`（或 `make test TEST='tests/path.py::test_name'`）只构建
-   当前 worktree 专属的 Python/backend 镜像；镜像包含 Node 运行时和 `procps`，但不包含
+1. **Docker 开发**：`make test SERVICE=prediction` 或
+   `make test TEST='tests/path.py::test_name'` 只构建当前 worktree 专属的 Python/backend 镜像，
+   并只运行所选服务的后台测试；跨服务改动可用空格分隔多个服务，不带范围的 `make test`
+   会直接失败。镜像包含 Node 运行时和 `procps`，但不包含
    npm、Python/JS Playwright、Chromium/浏览器资产，也没有宿主机挂载、网络、发布端口、
    Docker socket、home 目录或凭据。容器运行 `-m 'not pressure and not browser'` backend
    pytest，浏览器成本为零。
-2. **Candidate Acceptance**：`make candidate-acceptance` 只构建一次并运行 backend 目标，
+2. **部署前 Candidate Acceptance**：仅在准备实际部署时，对目标 SHA 运行
+   `make candidate-acceptance`；它只构建一次并运行 backend 目标，
    依次执行排除 `pressure`、`browser` 的完整套件和同样排除这两类测试的
    `acceptance/test_prediction_arbitrage_scenarios.py -k 'not LIVE'`。它绝不启动
    Playwright、访问 macOS 或外部依赖，也不会把缺少 Keychain、Futu 或当前行情变成 skip

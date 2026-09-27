@@ -3,6 +3,14 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-09-28
+
+- Development Docker tests now require an affected backend `SERVICE` (gateway,
+  legacy, account, or prediction) or an explicit `TEST` selector; unscoped
+  `make test` fails. The existing predeployment-only Candidate rule is retained.
+  Verified scoped Gateway, Legacy, and Prediction Docker suites plus routing
+  checks. No Candidate run, push, or deployment for this change.
+
 ## 2026-09-27
 
 - 迁移恢复 CLI 集成修复：离线数据库访问与所有权锁统一由 Prediction runtime 承接，CLI 仅转发操作；移除局部导入对趋势回撤命令 `NullNotifier` 的遮蔽，保留全部交易恢复规则与原断言。

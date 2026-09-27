@@ -7,16 +7,20 @@ merge, or deployment. Documentation and configuration-only work does not run
 
 ## Development verification
 
-`make test` builds only the `dev` target of the worktree-specific
-`Dockerfile.dev` image and runs the existing backend pytest suite with
-`-m "not pressure and not browser"`. Use `TEST='path::test_name'` for a
-focused selector during development; prefer that focused `make test TEST=...`
-form for each changed seam. Candidate Acceptance owns the complete backend
-coverage only when preparing an explicitly authorized deployment, after the
-candidate is merged into local `main`. Do not run it during development,
-review, before merge, or automatically after a local merge. There is no
-mandatory consecutive full `make test` solely before or after that gate.
-The image includes Node and `procps`, and excludes npm,
+`make test SERVICE=prediction` builds only the `dev` target of the
+worktree-specific `Dockerfile.dev` image and runs that service's backend test
+files with `-m "not pressure and not browser"`. Valid services are `gateway`,
+`legacy`, `account`, and `prediction`; space-separated names cover shared
+changes, for example `SERVICE='gateway prediction'`. `TEST='path::test_name'`
+selects a narrower seam instead. Unscoped `make test` fails before building.
+Gateway contains `frontend_gateway` tests; Legacy contains Dashboard and the
+remaining shared backend test files. Update the Makefile prefixes when adding
+a service-specific test family. During
+development and local merge, run only the affected service tests. Candidate
+Acceptance owns complete backend coverage only when preparing an explicitly
+authorized deployment, after the candidate is merged into local `main`.
+Do not run it during development, review, before merge, or automatically
+after a local merge. The image includes Node and `procps`, and excludes npm,
 Python/JS Playwright, Chromium/browser assets, host mounts, network, published
 ports, the Docker socket, the home directory, and credentials. Do not add
 dependencies or weaken existing skips/xfails. Playwright is a host-only
@@ -108,7 +112,7 @@ receive any development validation relevant to their own scope.
 ## Merge, live processes, and deployment
 
 The synchronous local-main `--ff-only` merge path does not deploy. Local merge
-gates are relevant focused checks, staged independent review, the dated
+gates are affected-service backend checks, staged independent review, the dated
 `CHANGELOG.md` entry, any required rebase and reverification, and `--ff-only`.
 Candidate Acceptance is not a local-merge gate. Run it only after local merge
 when preparing an explicitly authorized deployment, for the exact SHA to be
