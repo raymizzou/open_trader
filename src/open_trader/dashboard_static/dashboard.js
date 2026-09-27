@@ -4441,6 +4441,71 @@ async function controlLpAuto(action) {
   }
 }
 
+function predictionLpDailySummary(data) {
+  if (!data?.today) return "<section aria-label=\"自动自然日汇总\"><h3>自动运行 · 自然日汇总</h3><p>数据待核对，尚无可用汇总。</p></section>";
+  const render = (report, title) => {
+    const value = (v) => escapeHtml(predictionValue(v, "未知"));
+    const stamp = (v) => escapeHtml(predictionHktTimestamp(v, "未知"));
+    const money = (v) => escapeHtml(lpDashboardMoney(v));
+    const metrics = report.metrics || {};
+    const funds = report.funds || {};
+    const financial = report.financial_period || {};
+    const runtime = report.runtime || {};
+    const coverage = report.coverage || {};
+    const metricRows = [["提交意图", "intent_count"], ["确认受理", "accepted_count"], ["确认拒绝", "rejected_count"], ["未决意图", "unknown_count"], ["发生过成交的订单", "filled_order_count"], ["成交数量", "filled_quantity"], ["确认撤单", "cancelled_order_count"]];
+    const actionNames = {intent: "提交意图", accepted: "确认受理", rejected: "确认拒绝", unknown: "未决", fill: "成交", cancel: "确认撤单", cancel_requested: "请求撤单", open: "挂单中", cancel_pending: "撤单中"};
+    const eventRows = (rows) => (rows || []).map((row) => `<tr><td>${value(row.market_title || row.condition_id || row.session_id)}</td><td>${value(row.order_id || "无可靠订单 ID")}<span class="sub">意图 ${value(row.intent_id)}</span></td><td>${value(row.status === "EXPIRED" ? "已到期" : actionNames[row.kind] || actionNames[row.state] || row.state || row.reason)}${row.carried_in ? " · 跨日存量" : ""}</td><td>${value(row.side)} @ ${value(row.price)}</td><td>${value(row.quantity ?? row.remaining_quantity)}</td><td>${stamp(row.occurred_at)}<span class="sub">观察 ${stamp(row.observed_at)}</span></td></tr>`).join("");
+    const table = (rows) => `<div class="pm-table-wrap"><table class="pm-table"><thead><tr><th>标的</th><th>订单／意图</th><th>状态</th><th>方向／价格</th><th>数量</th><th>发生／观察时间</th></tr></thead><tbody>${eventRows(rows)}</tbody></table></div>`;
+    const closing = report.closing_orders || [];
+    const rewards = report.rewards?.observations || [];
+    const rewardRows = rewards.map((row) => `<li>${value(row.condition_id)} · 平台计奖日 ${value(row.reward_date)} · 平台累计 ${money(row.market_amount)} · ${value(row.status || row.state || "unknown")} · 更新 ${stamp(row.last_attempt_at || row.checked_at)}</li>`).join("");
+    const financialKnown = financial.status === "known";
+    const inventories = Array.isArray(financial.inventories) ? financial.inventories : [];
+    const detailKey = escapeHtml(`auto-report-${report.state}-${report.report_date}`);
+    const runtimeLabel = {running: "运行中", paused: "人工暂停", blocked: "受阻", needs_attention: "待核对", disabled: "未启用"}[runtime.runtime_state] || runtime.runtime_state || "未知";
+    return `<section class="pm-lp-natural-report" aria-label="${escapeHtml(title)}"><h4>${escapeHtml(title)}</h4>
+      <p>北京时间 ${stamp(report.period_start)} 至 ${stamp(report.period_end)}（不含结束时刻） · 数据更新 ${stamp(report.data_updated_at)}</p>
+      <p>首次启用 ${stamp(coverage.enabled_at)} · 实际覆盖起点 ${stamp(coverage.actual_start)} · ${value(runtimeLabel)}（状态更新 ${stamp(runtime.updated_at)}） · ${value(runtime.reason || (runtime.block_reasons || []).join("、") || "无阻塞原因")}</p>
+      <p>${metricRows.map(([label, key]) => `${label} <strong>${value(metrics[key])}</strong>`).join(" · ")}</p>
+      <p class="sub">按确认的发生时间归日；意图和订单去重，请求次数不计订单。部分成交后撤余量同时计入成交与撤单。未核实时间见待核对，不能当作零。</p>
+      <p>策略资金 ${money(funds.total_usd)} · 挂单／在途总占用 ${money(funds.buy_reserved_usd)} · 其中在途 ${money(funds.pending_reserved_usd)} · 库存占用 ${money(funds.inventory_cost_usd)} · 可用 ${money(funds.available_usd)}</p>
+      <p class="sub">资金为最近已核实投影（${value(funds.status)}），更新时间 ${stamp(funds.as_of)}；不是历史日末资金。奖励不进入可循环资金。</p>
+      <p>本日已核实交易盈亏 ${money(financialKnown ? financial.realized_pnl_usd : null)} · 期末库存成本 ${money(financialKnown ? financial.inventory_cost_usd : null)} · 期末库存数量 ${value(financialKnown ? financial.inventory_quantity : null)} · ${value(financial.reason || financial.status || "待核对")}</p>
+      ${inventories.length ? `<ul>${inventories.map((row) => `<li>${value(row.market_title || row.condition_id || row.session_id)} · ${value(row.quantity)} 份 · 成本 ${money(row.cost_usd)}</li>`).join("")}</ul>` : ""}
+      <p>期末剩余挂单 ${value(report.closing_orders_status === "unknown" ? null : closing.filter((row) => row.state === "open").length)} · 撤单中 ${value(report.closing_orders_status === "unknown" ? null : closing.filter((row) => row.state === "cancel_pending").length)}。跨日订单是期末存量，不算当日新增。</p>
+      ${closing.length ? table(closing.map((row) => ({...row, kind: null, quantity: row.remaining_quantity}))) : ""}
+      <details data-lp-details-key="${detailKey}-events"><summary>当日订单动作与成交 (${(report.events || []).length})</summary>${table(report.events)}</details>
+      <details data-lp-details-key="${detailKey}-pending"${report.pending?.length ? " open" : ""}><summary>待核对 (${(report.pending || []).length})</summary>${table(report.pending)}</details>
+      ${report.late_events?.length ? `<details data-lp-details-key="${detailKey}-late"><summary>迟到事实 (${report.late_events.length}) · 归属时间与观察时间</summary>${table(report.late_events)}</details>` : ""}
+      <details data-lp-details-key="${detailKey}-rewards"><summary>奖励读取结果 · 与交易盈亏分列</summary><p>平台按市场／计奖日累计，可能包含手动活动或其他时段；无法可靠分摊自动奖励，不提供自动合计，累计不代表到账。</p>${rewards.length ? `<ul>${rewardRows}</ul>` : "<p>奖励未知，等待平台读取。</p>"}</details>
+      <p class="sub">保存／生成 ${stamp(report.generated_at)}${report.late_generated ? ` · 迟生成 ${value(report.generation_delay_seconds)} 秒／覆盖待核对` : ""} · ${value((coverage.gaps || []).join("、") || "仅覆盖已保存事实，缺失事实仍待核对")}</p>
+    </section>`;
+  };
+  const reports = Array.isArray(data.reports) ? data.reports : [];
+  const selected = state.predictionMarket.lpAutoReport;
+  const selectedMatches = selected && selected.account_id === data.today.account_id && selected.auto_run_id === data.today.auto_run_id;
+  return `<section aria-label="自动自然日汇总"><h3>自动运行 · 自然日汇总</h3>${render(data.today, "北京时间今天截至现在")}
+    <details data-lp-details-key="auto-report-history"><summary>历史自然日日报 (${reports.length}) · 每天 00:05 保存前一天</summary><p>历史报告保留生成时事实；后续核对看当前状态。现有 08:00 财务日报口径保留。</p>${reports.map((report) => `<button type="button" class="pm-button" data-action="lp-auto-report-load" data-report-date="${escapeHtml(report.report_date)}">${escapeHtml(report.report_date)}${report.late_generated ? " · 迟生成" : ""}</button>`).join("") || "<p>暂无已保存日报。</p>"}${selectedMatches ? (selected.data ? render(selected.data, selected.report_date) : `<p role="status">${escapeHtml(selected.error || "正在读取日报…")}</p>`) : ""}</details></section>`;
+}
+
+async function loadLpAutoReport(day) {
+  const today = state.predictionMarket.lpDashboard?.auto_summary?.today;
+  if (!today) return;
+  const selection = {account_id: today.account_id, auto_run_id: today.auto_run_id, report_date: day};
+  state.predictionMarket.lpAutoReport = selection;
+  renderPredictionMarket();
+  try {
+    const response = await fetch(predictionRequestUrl("/api/prediction-arbitrage/lp/auto/reports/" + encodeURIComponent(day)), {cache: "no-store", credentials: "same-origin"});
+    if (!response.ok) throw new Error("日报读取失败 " + response.status);
+    const report = await response.json();
+    if (report.account_id !== selection.account_id || report.auto_run_id !== selection.auto_run_id) throw new Error("自动运行身份已变化，请刷新");
+    selection.data = report;
+  } catch (error) {
+    selection.error = error instanceof Error ? error.message : String(error);
+  }
+  if (state.predictionMarket.lpAutoReport === selection) renderPredictionMarket();
+}
+
 function predictionLpCard(payload) {
   const dashboard = payload?.lp_dashboard && typeof payload.lp_dashboard === "object"
     ? payload.lp_dashboard : {};
@@ -4627,6 +4692,7 @@ function predictionLpCard(payload) {
     + (state.predictionMarket.lpDashboardRequestInFlight || state.predictionMarket.lpPreparationRecoveryInFlight || !state.predictionMarket.csrfToken ? " disabled" : "") + ">立即刷新</button>"
     + "<button class=\"pm-button danger\" type=\"button\" data-action=\"lp-cancel-all\""
     + (state.predictionMarket.lpDashboardRequestInFlight || state.predictionMarket.lpPreparationRecoveryInFlight || !state.predictionMarket.csrfToken ? " disabled" : "") + ">撤全部</button></div></header>"
+    + predictionLpDailySummary(dashboard.auto_summary)
     + errorMarkup
     + cancelSummaryMarkup
     + lpSubmitToastsMarkup()
@@ -7393,6 +7459,8 @@ async function handlePredictionMarketClick(event) {
     await controlLpAuto(autoAction.dataset.lpAutoAction);
     return;
   }
+  const lpAutoReport = event.target.closest("[data-action='lp-auto-report-load']");
+  if (lpAutoReport) { await loadLpAutoReport(lpAutoReport.dataset.reportDate || ""); return; }
   const predictionTab = event.target.closest("[data-prediction-tab]");
   if (predictionTab) {
     selectPredictionTab(predictionTab.dataset.predictionTab || "lp");

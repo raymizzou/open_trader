@@ -457,6 +457,8 @@ class PredictionRuntime:
         self._lp_stop_event = threading.Event()
         self._lp_thread: threading.Thread | None = None
         self._lp_auto_scheduler: LPAutoScheduler | None = None
+        self._lp_report_stop_event = threading.Event()
+        self._lp_report_thread: threading.Thread | None = None
         self._book_sample_stop_event = threading.Event()
         self._book_sampler_thread: threading.Thread | None = None
         self._history_stop_event = threading.Event()
@@ -956,6 +958,7 @@ class PredictionRuntime:
                 self.n_leg_order_queue_driver.start()
             self._start_lp_monitor()
             self._start_lp_auto_monitor()
+            self._start_lp_daily_report_monitor()
             self._start_history_monitor()
             self._start_candidate_scan_monitor()
             self._start_candidate_maintenance_monitor()
@@ -1078,6 +1081,29 @@ class PredictionRuntime:
             daemon=True,
         )
         self._lp_thread.start()
+
+    def _start_lp_daily_report_monitor(self) -> None:
+        """Natural-day clock is independent of trading, pause and reconciliation."""
+        if self.execution is None or self._lp_report_thread is not None:
+            return
+        generate = getattr(self.execution, "lp_generate_due_auto_reports", None)
+        if not callable(generate):
+            return
+        self._lp_report_stop_event.clear()
+
+        def run() -> None:
+            while not self._lp_report_stop_event.is_set():
+                try:
+                    generate()
+                except Exception:
+                    logger.exception("prediction_lp_auto_daily_report_failed")
+                if self._lp_report_stop_event.wait(30):
+                    return
+
+        self._lp_report_thread = threading.Thread(
+            target=run, name="prediction-lp-natural-day-reports", daemon=True,
+        )
+        self._lp_report_thread.start()
 
     def _start_reward_monitor(self) -> None:
         """Refresh platform LP earnings without sharing the risk-loop thread."""
@@ -1845,6 +1871,7 @@ class PredictionRuntime:
         self._lp_candidate_refresh_requested.set()
         self._candidate_maintenance_wakeup.set()
         self._lp_stop_event.set()
+        self._lp_report_stop_event.set()
         self._book_sample_stop_event.set()
         if self._lp_auto_scheduler is not None:
             try:
@@ -1866,6 +1893,7 @@ class PredictionRuntime:
             else:
                 self._history_thread = None
         for attr, label in (
+            ("_lp_report_thread", "LP natural-day report monitor"),
             ("_candidate_scan_thread", "candidate scan monitor"),
             ("_candidate_maintenance_thread", "candidate maintenance monitor"),
             ("_candidate_competition_thread", "candidate competition monitor"),
