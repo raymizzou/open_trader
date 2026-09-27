@@ -547,6 +547,7 @@ def create_prediction_server(
                 "/api/prediction-arbitrage/n-leg/mode",
                 "/api/prediction-arbitrage/n-leg/report",
                 "/api/prediction-arbitrage/lp/dashboard",
+                "/api/prediction-arbitrage/lp/auto/state",
                 "/api/prediction-arbitrage/lp/sessions/current",
             }:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -628,6 +629,12 @@ def create_prediction_server(
                     set_session=mode == "production",
                 )
                 return
+            if parsed.path == "/api/prediction-arbitrage/lp/auto/state":
+                try:
+                    self._send_json(HTTPStatus.OK, _lp_projection_safe_value(runtime.lp_auto_state()))
+                except (sqlite3.Error, OSError, RuntimeError) as exc:
+                    self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+                return
             if parsed.path == "/api/prediction-arbitrage/lp/sessions/current":
                 execution = getattr(runtime, "execution", None)
                 if execution is None or not callable(getattr(execution, "lp_status", None)):
@@ -655,6 +662,9 @@ def create_prediction_server(
                     return
                 try:
                     result = execution.lp_dashboard()
+                    auto_state = getattr(runtime, "lp_auto_state", None)
+                    if callable(auto_state):
+                        result = {**result, "auto": auto_state()}
                     safe_result = _lp_projection_safe_value(result)
                     if not isinstance(safe_result, Mapping):
                         raise RuntimeError("LP dashboard result is invalid")
@@ -867,6 +877,8 @@ def create_prediction_server(
             lp_submit_augment_path = "/api/prediction-arbitrage/lp/augment"
             lp_sessions_prefix = "/api/prediction-arbitrage/lp/sessions/"
             lp_start_path = "/api/prediction-arbitrage/lp/sessions"
+            lp_auto_prefix = "/api/prediction-arbitrage/lp/auto/"
+            lp_auto_paths = {lp_auto_prefix + action for action in ("config", "enable", "pause", "resume")}
             lp_stop_session: str | None = None
             if path.startswith(lp_sessions_prefix) and path.endswith("/stop"):
                 candidate = path[len(lp_sessions_prefix) : -len("/stop")]
@@ -903,7 +915,7 @@ def create_prediction_server(
                 lp_submit_entry_path,
                 lp_submit_augment_path,
                 lp_start_path,
-            } and lp_stop_session is None and lp_augment_session is None:
+            } and path not in lp_auto_paths and lp_stop_session is None and lp_augment_session is None:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return
             try:
@@ -916,7 +928,19 @@ def create_prediction_server(
                     if execution_mutation
                     else self._audit_context()
                 )
-                if path == "/api/prediction-arbitrage/llm-provider":
+                if path in lp_auto_paths:
+                    if path == lp_auto_prefix + "config":
+                        expected = {"budget_usd", "target_buy_count"}
+                        if "expected_config_version" in payload:
+                            expected.add("expected_config_version")
+                        self._require_schema(payload, expected)
+                        result = execution.lp_auto_configure(payload, audit=audit)
+                    else:
+                        self._require_confirm(payload)
+                        result = runtime.lp_auto_set_desired_running(
+                            path != lp_auto_prefix + "pause", audit=audit
+                        )
+                elif path == "/api/prediction-arbitrage/llm-provider":
                     self._require_schema(payload, {"provider"})
                     provider = self._required_string(payload, "provider").strip().lower()
                     if provider not in PROVIDER_IDS:

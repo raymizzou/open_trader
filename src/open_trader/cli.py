@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import ipaddress
+from http.cookiejar import CookieJar
 from getpass import getpass
 import math
 import os
@@ -17,7 +19,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, HTTPCookieProcessor, ProxyHandler, Request, build_opener, urlopen
 
 from .a_share_trend import (
     _process_version,
@@ -1498,6 +1500,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Attempt the apply even when the post-drop set does not compile",
     )
 
+    lp_auto_parser = prediction_commands.add_parser(
+        "lp-auto", help="Pause new automatic LP BUYs through the running service"
+    )
+    lp_auto_commands = lp_auto_parser.add_subparsers(dest="lp_auto_command", required=True)
+    lp_auto_pause = lp_auto_commands.add_parser("pause", help="Persist pause and wait for service confirmation; existing orders remain")
+    lp_auto_pause.add_argument("--url", default="http://127.0.0.1:8769")
+    lp_auto_pause.add_argument("--timeout", type=positive_float, default=15.0)
+
     cross_auto_parser = prediction_commands.add_parser(
         "cross-auto", help="Inspect Service-owned cross-venue execution state"
     )
@@ -1546,6 +1556,43 @@ def _account_status_projection(snapshot: dict[str, object]) -> dict[str, object]
             if isinstance(source, dict)
         },
     }
+
+
+class _NoPredictionRedirects(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _pause_lp_auto(url: str, timeout: float) -> dict[str, object]:
+    parsed = urlparse(url)
+    if (
+        parsed.scheme != "http" or parsed.username or parsed.password
+        or parsed.path not in {"", "/"} or parsed.query or parsed.fragment
+        or not ipaddress.ip_address(parsed.hostname or "").is_loopback
+        or not math.isfinite(timeout) or timeout <= 0
+    ):
+        raise ValueError("LP control requires an HTTP loopback service URL and finite timeout")
+    base = url.rstrip("/")
+    opener = build_opener(ProxyHandler({}), HTTPCookieProcessor(CookieJar()), _NoPredictionRedirects())
+    deadline = time.monotonic() + timeout
+    with opener.open(base + "/api/prediction-arbitrage/venues", timeout=timeout) as response:
+        bootstrap = json.load(response)
+    csrf = bootstrap.get("csrf_token") if isinstance(bootstrap, dict) else None
+    if not isinstance(csrf, str) or not csrf:
+        raise ValueError("LP service authentication unavailable")
+    request = Request(
+        base + "/api/prediction-arbitrage/lp/auto/pause",
+        data=b'{"confirm":true}', method="POST",
+        headers={"Content-Type": "application/json", "Origin": base, "X-CSRF-Token": csrf},
+    )
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("LP pause confirmation timed out")
+    with opener.open(request, timeout=remaining) as response:
+        result = json.load(response)
+    if not isinstance(result, dict) or result.get("desired_running") is not False or result.get("pause_confirmed") is not True:
+        raise ValueError("LP pause result is unconfirmed")
+    return result
 
 
 def _prediction_service_state(url: str, timeout: float = 5.0) -> dict[str, object]:
@@ -1687,6 +1734,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "prediction-arb":
+        if args.prediction_command == "lp-auto":
+            try:
+                _pause_lp_auto(args.url, args.timeout)
+            except (OSError, ValueError) as exc:
+                print(f"reason: {type(exc).__name__}: {exc}")
+                print("result: UNKNOWN — pause was not confirmed")
+                return 2
+            print("result: PAUSED — new automatic BUYs paused; existing orders and protection remain")
+            return 0
         if args.prediction_command == "cross-auto":
             if args.cross_auto_command == "status":
                 try:

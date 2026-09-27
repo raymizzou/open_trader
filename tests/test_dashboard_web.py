@@ -7023,7 +7023,7 @@ console.log(JSON.stringify({
       trialBaselineFromReference: orderTable.includes("Trial LP market") && orderTable.includes("试挂基准 0.25%／小时"),
       capitalLabel: orderTable.includes("占用本金"),
       capitalAligned: orderTable.includes("占用本金 $60.00"),
-      subtitle: html.includes("手工挂单 · 收益与风险观察"),
+      subtitle: html.includes("手工挂单 · 自动补位 · 收益与风险观察"),
       managedFootnote: managed.includes("$5 止损触发线") && managed.includes("当前系统会话详情"),
       detailsAvailable: details.length >= 2 && details.some((item) => item.includes("累计") && item.includes("试挂基准")),
       alertTextEscaped: orderTable.includes("飞书与语音原文：LP 风险警告 &lt;stored&gt;") && orderTable.includes("当前风险 &lt;10% &amp; 未成交买单"),

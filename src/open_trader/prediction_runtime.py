@@ -17,6 +17,7 @@ from typing import Callable, Literal
 from .notifications import NullNotifier
 from .daily_premarket import send_notification_with_results
 from .polymarket_monitor import PolymarketMonitor
+from .polymarket_lp_scheduler import LPAutoScheduler
 from .polymarket_lp import (
     _LP_CANDIDATE_BATCH_MIN_INTERVAL_SECONDS,
     _LP_COMPETITION_REFRESH_SECONDS,
@@ -455,6 +456,7 @@ class PredictionRuntime:
         self._cross_validator: object | None = None
         self._lp_stop_event = threading.Event()
         self._lp_thread: threading.Thread | None = None
+        self._lp_auto_scheduler: LPAutoScheduler | None = None
         self._book_sample_stop_event = threading.Event()
         self._book_sampler_thread: threading.Thread | None = None
         self._history_stop_event = threading.Event()
@@ -953,6 +955,7 @@ class PredictionRuntime:
                 )
                 self.n_leg_order_queue_driver.start()
             self._start_lp_monitor()
+            self._start_lp_auto_monitor()
             self._start_history_monitor()
             self._start_candidate_scan_monitor()
             self._start_candidate_maintenance_monitor()
@@ -970,6 +973,40 @@ class PredictionRuntime:
             self._state = "FAILED"
             self._cleanup_resources()
             raise
+
+    def _start_lp_auto_monitor(self) -> None:
+        if self.execution is None or self._lp_auto_scheduler is not None:
+            return
+        self._lp_auto_scheduler = LPAutoScheduler(self.execution)
+        self._lp_auto_scheduler.start()
+
+    def lp_auto_state(self) -> dict[str, object]:
+        if self.execution is None:
+            raise RuntimeError("LP automatic execution service is unavailable")
+        return {
+            **self.execution.lp_auto_state(),
+            **(self._lp_auto_scheduler.snapshot() if self._lp_auto_scheduler else {
+                "scheduler_running": False, "last_check_at": None,
+                "next_check_at": None, "check_in_progress": False,
+                "last_check_error": None, "check_interval_seconds": 60,
+            }),
+        }
+
+    def lp_auto_set_desired_running(
+        self, running: bool, *, audit: Mapping[str, object] | None = None
+    ) -> dict[str, object]:
+        if self.execution is None or (running and self._lp_auto_scheduler is None):
+            raise RuntimeError("LP automatic scheduler is unavailable")
+        result = self.execution.lp_auto_set_desired_running(running, audit=audit)
+        if result.get("desired_running") is not running or (
+            not running and result.get("pause_confirmed") is not True
+        ):
+            raise RuntimeError("LP automatic control result is unconfirmed")
+        if running:
+            self._lp_auto_scheduler.request_check()
+        return {**result, **(self._lp_auto_scheduler.snapshot() if self._lp_auto_scheduler else {
+            "scheduler_running": False,
+        })}
 
     def _start_lp_monitor(self) -> None:
         """Keep every active LP session group reconciled by the owned runtime.
@@ -1809,6 +1846,14 @@ class PredictionRuntime:
         self._candidate_maintenance_wakeup.set()
         self._lp_stop_event.set()
         self._book_sample_stop_event.set()
+        if self._lp_auto_scheduler is not None:
+            try:
+                self._lp_auto_scheduler.stop()
+            except RuntimeError as exc:
+                errors.append(exc)
+                uncertain_thread = True
+            else:
+                self._lp_auto_scheduler = None
         history_thread = self._history_thread
         if history_thread is not None:
             history_thread.join(timeout=_LP_REWARD_STOP_GRACE_SECONDS)
@@ -1965,6 +2010,9 @@ class PredictionRuntime:
                 errors.append(exc)
             finally:
                 self._shadow_guards = None
+        if self._lp_auto_scheduler is not None:
+            # A pending exchange read/send still owns these collaborators.
+            return errors
         for resource in (
             ("n_leg_shadow", self.n_leg_shadow),
             ("solver_server", self.solver_server),

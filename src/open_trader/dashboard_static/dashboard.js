@@ -63,6 +63,9 @@ const state = {
     historyKind: "signals",
     error: "",
     lpCancelSummary: "",
+    lpAutoDraft: null,
+    lpAutoBusy: false,
+    lpAutoMessage: "",
     lpSubmitToasts: [],
     lpSubmitCooldown: null,
     pollId: null,
@@ -288,6 +291,7 @@ function bindEvents() {
   elements["prediction-market-root"].addEventListener("click", handlePredictionMarketClick);
   elements["prediction-market-root"].addEventListener("keydown", handlePredictionTabKeydown);
   elements["prediction-market-root"].addEventListener("change", handlePredictionMarketChange);
+  elements["prediction-market-root"].addEventListener("input", handleLpAutoInput);
   elements["prediction-market-modal-root"].addEventListener("click", handlePredictionModalClick);
   elements["prediction-market-modal-root"].addEventListener("input", handlePredictionModalInput);
   document.addEventListener("keydown", handlePredictionModalKeydown);
@@ -4372,6 +4376,71 @@ function lpBudgetLineMarkup(budget, checkedAt) {
   return "<p class=\"pm-lp-budget-line\">" + availableText + stamp + "</p>";
 }
 
+function predictionLpAutoControls(auto, stale) {
+  if (!auto || typeof auto !== "object") return "<p class=\"sub\">自动补位状态 UNKNOWN</p>";
+  const prediction = state.predictionMarket;
+  const running = auto.desired_running === true;
+  const schedulerRunning = auto.scheduler_running === true;
+  const busy = prediction.lpAutoBusy || !prediction.csrfToken;
+  const blocked = Array.isArray(auto.block_reasons) ? auto.block_reasons : [];
+  const draft = prediction.lpAutoDraft || auto;
+  const locked = busy || stale || running || auto.pause_confirmed !== true || auto.slots?.occupied !== 0;
+  const action = running ? "pause" : auto.ever_enabled ? "resume" : "enable";
+  const actionLabel = running ? "暂停新增" : auto.ever_enabled ? "恢复新增" : "启用自动补位";
+  const status = !schedulerRunning ? "调度未运行" : running ? "持续运行" : auto.ever_enabled ? "新增已暂停" : "尚未启用";
+  const reasons = blocked.length ? ` · 系统受阻：${escapeHtml(blocked.join("、"))}` : "";
+  return `<section aria-label="自动补位控制"><h3>自动补位 · ${status}</h3>
+    <p>人工意愿：${running ? "运行" : "暂停"}${reasons}${stale ? " · 状态已过期" : ""}</p>
+    <p class="sub">每分钟检查，跨日持续。暂停保留 BUY；挂单保护、库存退出和在途核对继续。</p>
+    <button type="button" class="pm-button" data-lp-auto-action="${action}"${busy || (!running && (stale || !schedulerRunning)) ? " disabled" : ""}>${actionLabel}</button>
+    <div class="pm-check"><label>策略总资金（USDC） <input data-lp-auto-field="budget_usd" aria-label="策略总资金" type="number" min="0" step="0.01" value="${escapeHtml(String(draft.budget_usd ?? ""))}"${locked ? " disabled" : ""}></label>
+    <label>目标 BUY 数 <input data-lp-auto-field="target_buy_count" aria-label="目标 BUY 数" type="number" min="0" step="1" value="${escapeHtml(String(draft.target_buy_count ?? 0))}"${locked ? " disabled" : ""}></label>
+    <button type="button" class="pm-button" data-lp-auto-action="config"${locked ? " disabled" : ""}>保存配置</button></div>
+    <p class="sub">保存不交易。修改前须人工暂停，且自动 BUY（含撤单中）和未决提交全部终结。0 不撤单。</p>
+    <p class="sub">最近检查 ${escapeHtml(predictionHktTimestamp(auto.last_check_at, "尚未检查"))} · 下次 ${escapeHtml(predictionHktTimestamp(auto.next_check_at, "等待本轮结束"))}${auto.check_in_progress ? " · 检查中" : ""}${auto.last_check_error ? ` · 检查失败：${escapeHtml(auto.last_check_error)}` : ""}</p>
+    <p role="status">${escapeHtml(prediction.lpAutoMessage)}</p></section>`;
+}
+
+function handleLpAutoInput(event) {
+  const field = event.target.closest?.("[data-lp-auto-field]");
+  if (!field) return;
+  const prediction = state.predictionMarket;
+  if (!prediction.lpAutoDraft) {
+    const auto = prediction.lpDashboard?.auto || {};
+    prediction.lpAutoDraft = {budget_usd: auto.budget_usd ?? "", target_buy_count: auto.target_buy_count ?? 0, expected_config_version: auto.config_version};
+  }
+  prediction.lpAutoDraft[field.dataset.lpAutoField] = field.value;
+}
+
+async function controlLpAuto(action) {
+  const prediction = state.predictionMarket;
+  if (prediction.lpAutoBusy) return;
+  prediction.lpAutoBusy = true;
+  prediction.lpAutoMessage = "等待服务确认…";
+  let body = {confirm: true};
+  if (action === "config") {
+    const auto = prediction.lpDashboard?.auto || {};
+    const draft = prediction.lpAutoDraft || {budget_usd: auto.budget_usd, target_buy_count: auto.target_buy_count, expected_config_version: auto.config_version};
+    body = {...draft, target_buy_count: Number(draft.target_buy_count)};
+  }
+  renderPredictionMarket();
+  try {
+    const result = await predictionPost(`/api/prediction-arbitrage/lp/auto/${action}`, body);
+    if (action === "pause" && (result.desired_running !== false || result.pause_confirmed !== true)) throw new Error("暂停未获可靠确认");
+    if ((action === "enable" || action === "resume") && result.desired_running !== true) throw new Error("运行意愿未获确认");
+    prediction.lpDashboardRequestSeq = (prediction.lpDashboardRequestSeq || 0) + 1;
+    prediction.lpDashboard = {...prediction.lpDashboard, auto: {...prediction.lpDashboard?.auto, ...result}};
+    if (action === "config") prediction.lpAutoDraft = null;
+    prediction.lpAutoMessage = action === "pause" ? "新增已暂停；已有挂单和仓位继续保护。" : action === "config" ? "配置已保存，未触发交易。" : "运行意愿已保存，立即核对；系统受阻时等待核清。";
+  } catch (error) {
+    prediction.lpAutoMessage = `操作未确认：${error instanceof Error ? error.message : String(error)}`;
+  } finally {
+    prediction.lpAutoBusy = false;
+    await fetchPredictionLpDashboard();
+    renderPredictionMarket();
+  }
+}
+
 function predictionLpCard(payload) {
   const dashboard = payload?.lp_dashboard && typeof payload.lp_dashboard === "object"
     ? payload.lp_dashboard : {};
@@ -4552,7 +4621,7 @@ function predictionLpCard(payload) {
     ? `<p class="sub" role="status">${escapeHtml(cancelSummary)}</p>`
     : "";
   return "<section class=\"pm-panel pm-lp-card\" aria-label=\"LP 会话\"><header class=\"pm-panel-heading\">"
-    + "<div><h2>流动性提供试验</h2><p>手工挂单 · 收益与风险观察</p></div>"
+    + "<div><h2>流动性提供试验</h2><p>手工挂单 · 自动补位 · 收益与风险观察</p></div>"
     + "<div class=\"pm-panel-heading-actions\">" + freshness
     + "<button class=\"pm-button\" type=\"button\" data-action=\"lp-dashboard-refresh\""
     + (state.predictionMarket.lpDashboardRequestInFlight || state.predictionMarket.lpPreparationRecoveryInFlight || !state.predictionMarket.csrfToken ? " disabled" : "") + ">立即刷新</button>"
@@ -4564,6 +4633,7 @@ function predictionLpCard(payload) {
     + snapshotPendingMarkup
     + predictionLpPreparation(dashboard.preparation)
     + budgetLineMarkup
+    + predictionLpAutoControls(dashboard.auto, dashboard.stale === true)
     + "<section aria-label=\"当天 LP 委托\"><h3>当天 LP 委托 <span class=\"sub\">· 北京时间 08:00 起 · 活跃在前 · 已完结沉底 · 各按当前小时奖励率降序 · 一标的一行</span></h3><div class=\"pm-table-wrap\"><table class=\"pm-table pm-lp-order-table\">"
     + "<thead><tr><th scope=\"col\">标的</th><th scope=\"col\">LP 收益率(推荐 → 实际)</th><th scope=\"col\">今日奖励(累计 · $/小时)</th><th scope=\"col\">份额占比</th><th scope=\"col\">实际占用资金</th><th scope=\"col\">压力损失(警戒线 10%)</th><th scope=\"col\">委托与成交量</th></tr></thead>"
     + "<tbody>" + todayRowsHtml + "</tbody></table></div>"
@@ -5902,7 +5972,8 @@ function lpRenderFidelitySnapshot(root) {
   }
   const anchor = typeof window !== "undefined" && Number.isFinite(window.scrollY)
     ? window.scrollY : 0;
-  return {open, anchor};
+  const autoField = typeof document !== "undefined" ? document.activeElement?.dataset?.lpAutoField : null;
+  return {open, anchor, autoField};
 }
 
 function lpRenderFidelityRestore(root, snapshot) {
@@ -5916,6 +5987,9 @@ function lpRenderFidelityRestore(root, snapshot) {
       element.open = true;
     }
   });
+  if (["budget_usd", "target_buy_count"].includes(snapshot.autoField)) {
+    root.querySelector(`[data-lp-auto-field="${snapshot.autoField}"]`)?.focus({preventScroll: true});
+  }
   if (snapshot.anchor > 0 && typeof window !== "undefined"
     && Number.isFinite(window.scrollY) && typeof window.scrollTo === "function") {
     window.scrollTo(0, snapshot.anchor);
@@ -6069,7 +6143,7 @@ function invalidatePredictionNLegReads() {
 
 async function fetchPredictionLpDashboard() {
   if (state.workspaceView !== "prediction_market" || state.predictionMarket.activeTab !== "lp"
-    || state.predictionMarket.lpDashboardRequestInFlight) return;
+    || state.predictionMarket.lpDashboardRequestInFlight || state.predictionMarket.lpAutoBusy) return;
   const requestSeq = (state.predictionMarket.lpDashboardRequestSeq || 0) + 1;
   state.predictionMarket.lpDashboardRequestSeq = requestSeq;
   state.predictionMarket.lpDashboardRequestInFlight = true;
@@ -7314,6 +7388,11 @@ function lpDashboardTodayActiveRows() {
 }
 
 async function handlePredictionMarketClick(event) {
+  const autoAction = event.target.closest("[data-lp-auto-action]");
+  if (autoAction && !autoAction.disabled) {
+    await controlLpAuto(autoAction.dataset.lpAutoAction);
+    return;
+  }
   const predictionTab = event.target.closest("[data-prediction-tab]");
   if (predictionTab) {
     selectPredictionTab(predictionTab.dataset.predictionTab || "lp");
