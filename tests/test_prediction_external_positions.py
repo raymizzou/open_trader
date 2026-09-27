@@ -95,8 +95,9 @@ def test_registration_requires_confirmation(tmp_path):
 def test_offline_cli_recovers_only_without_live_runtime(tmp_path, monkeypatch, busy):
     from open_trader import cli
     from open_trader.prediction_runtime import _RuntimeOwnershipLock
+    from open_trader import prediction_runtime
     service, trading, store, incident = setup_incident(tmp_path)
-    monkeypatch.setattr(cli, 'load_trading_config', lambda path: trading.config)
+    monkeypatch.setattr(prediction_runtime, 'load_trading_config', lambda path: trading.config)
     calls = []
     def client(config):
         calls.append(config)

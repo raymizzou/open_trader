@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-27
 
+- 迁移恢复 CLI 集成修复：离线数据库访问与所有权锁统一由 Prediction runtime 承接，CLI 仅转发操作；移除局部导入对趋势回撤命令 `NullNotifier` 的遮蔽，保留全部交易恢复规则与原断言。
+
 - Mac Air 迁移恢复：新增离线 `prediction-arb recover-external-positions`，需显式确认事故 ID、钱包当前持仓及数量；生产运行时必须停止；可显式登记并原样保留精确 ID 的旧仓卖单，其他挂单仍阻断，已结算零值仓沿用原过滤。将旧仓登记为人工管理存量并保留原事故证据，不伪造策略归属或清仓事实。重启仅豁免已确认钱包与数量上限内的存量，同市场 LP 排除、资金归属及其他交易门禁保持。新持仓或超过确认数量上限仍阻断。
 
 - 验收时机按用户要求调整：Candidate 仅在候选已合入本地 main、准备明确授权的部署时运行，不作为开发、评审或本地合并门禁，也不因合并完成自动启动；部署仍要求目标 SHA 的 Candidate PASS，Host／Smoke 和 push／部署授权边界不变。本轮未完成的 Candidate 已取消，文档改动仅做独立复审。

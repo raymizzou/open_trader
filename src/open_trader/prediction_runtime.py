@@ -145,6 +145,31 @@ class _RuntimeOwnershipLock:
         return self._handle is not None
 
 
+def recover_external_positions(
+    *, data_dir: Path, prediction_config_path: Path, incident_id: str,
+    positions: Mapping[str, str], confirm: bool, note: str,
+    external_sell_order_ids: tuple[str, ...] = (),
+) -> dict[str, object]:
+    """Offline operator recovery owned by the runtime, never a CLI DB reader."""
+    data_dir = data_dir.expanduser().resolve()
+    if not (data_dir / "prediction_arbitrage" / "prediction_arbitrage.sqlite3").is_file():
+        raise ValueError("existing recovery database required")
+    ownership = _RuntimeOwnershipLock(data_dir / "prediction_arbitrage" / "runtime.lock")
+    try:
+        ownership.acquire()
+        client = PolymarketTradingClient.from_keychain(load_trading_config(prediction_config_path.expanduser()))
+        execution = PredictionExecutionService(
+            store=PredictionArbitrageStore(data_dir), monitor=None, trading=client,
+            notifier=NullNotifier(), lock_path=data_dir / "prediction_arbitrage" / "execution.lock",
+        )
+        return execution.register_external_positions(
+            incident_id, positions, confirm=confirm, note=note,
+            external_sell_order_ids=external_sell_order_ids,
+        )
+    finally:
+        ownership.release()
+
+
 class _UnavailableCrossVenueMonitor:
     def __init__(self, reason: str) -> None:
         self._reason = reason

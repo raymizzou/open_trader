@@ -1746,13 +1746,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "prediction-arb":
         if args.prediction_command == "recover-external-positions":
-            from .notifications import NullNotifier
-            from .prediction_arbitrage_execution import PredictionExecutionService
-            from .prediction_arbitrage_store import PredictionArbitrageStore
-            from .prediction_runtime import _RuntimeOwnershipLock, PredictionRuntimeOwnershipError
+            from .prediction_runtime import recover_external_positions, PredictionRuntimeOwnershipError
 
-            data_dir = args.data_dir.expanduser().resolve()
-            ownership = _RuntimeOwnershipLock(data_dir / "prediction_arbitrage" / "runtime.lock")
             try:
                 positions = {}
                 for item in args.position:
@@ -1760,16 +1755,10 @@ def main(argv: list[str] | None = None) -> int:
                     if not token.strip() or token in positions:
                         raise ValueError("duplicate or empty token")
                     positions[token] = quantity
-                if not (data_dir / "prediction_arbitrage" / "prediction_arbitrage.sqlite3").is_file():
-                    raise ValueError("existing recovery database required")
-                ownership.acquire()
-                client = PolymarketTradingClient.from_keychain(load_trading_config(args.config.expanduser()))
-                execution = PredictionExecutionService(
-                    store=PredictionArbitrageStore(data_dir), monitor=None, trading=client,
-                    notifier=NullNotifier(), lock_path=data_dir / "prediction_arbitrage" / "execution.lock",
-                )
-                result = execution.register_external_positions(
-                    args.incident_id, positions, confirm=args.confirm, note=args.note,
+                result = recover_external_positions(
+                    data_dir=args.data_dir, prediction_config_path=args.config,
+                    incident_id=args.incident_id, positions=positions,
+                    confirm=args.confirm, note=args.note,
                     external_sell_order_ids=tuple(args.external_sell_order_id),
                 )
                 print(json.dumps(result, ensure_ascii=False))
@@ -1777,8 +1766,6 @@ def main(argv: list[str] | None = None) -> int:
             except (OSError, ValueError, KeychainError, PolymarketTradingError, PredictionRuntimeOwnershipError) as exc:
                 print(json.dumps({"state": "locked", "reason": getattr(exc, "error_code", type(exc).__name__)}))
                 return 2
-            finally:
-                ownership.release()
         if args.prediction_command == "lp-auto":
             try:
                 _pause_lp_auto(args.url, args.timeout)
