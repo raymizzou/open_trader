@@ -773,6 +773,14 @@ class PredictionArbitrageStore:
                 generated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS lp_auto_daily_reports (
+                account_id TEXT NOT NULL,
+                auto_run_id TEXT NOT NULL,
+                report_date TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                PRIMARY KEY(account_id, auto_run_id, report_date)
+            );
+
             DROP INDEX IF EXISTS one_active_lp_session;
 
             CREATE UNIQUE INDEX IF NOT EXISTS one_active_lp_session_market
@@ -4517,6 +4525,55 @@ class PredictionArbitrageStore:
         if parsed.isoformat() != value:
             raise ValueError("lp_report_date_invalid")
         return value
+
+    def lp_auto_daily_reports(
+        self, account_id: str, auto_run_id: str, *, summaries: bool = False,
+    ) -> list[dict[str, object]]:
+        columns = (
+            "report_date, json_extract(payload,'$.generated_at') AS generated_at, json_extract(payload,'$.late_generated') AS late_generated"
+            if summaries else "payload"
+        )
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                f"SELECT {columns} FROM lp_auto_daily_reports WHERE account_id=? AND auto_run_id=? ORDER BY report_date DESC",
+                (account_id, auto_run_id),
+            ).fetchall()
+        if summaries:
+            return [dict(row) for row in rows]
+        return [_load_payload(str(row["payload"])) for row in rows]
+
+    def lp_auto_daily_report(
+        self, account_id: str, auto_run_id: str, report_date: str,
+    ) -> dict[str, object] | None:
+        key = self._lp_report_date(report_date)
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT payload FROM lp_auto_daily_reports WHERE account_id=? AND auto_run_id=? AND report_date=?",
+                (account_id, auto_run_id, key),
+            ).fetchone()
+        return None if row is None else _load_payload(str(row["payload"]))
+
+    def lp_save_auto_daily_report(
+        self, account_id: str, auto_run_id: str, report_date: str,
+        payload: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Freeze natural-day facts once; independent of legacy 08:00 reports."""
+        key = self._lp_report_date(report_date)
+        if not account_id.strip() or not auto_run_id.strip():
+            raise ValueError("lp_auto_report_identity_required")
+        _parse_timestamp(payload.get("generated_at"))
+        value = {**payload, "account_id": account_id, "auto_run_id": auto_run_id, "report_date": key}
+        with self._transaction() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO lp_auto_daily_reports(account_id,auto_run_id,report_date,payload) VALUES (?,?,?,?)",
+                (account_id, auto_run_id, key, _dump_execution_payload(value)),
+            )
+            row = connection.execute(
+                "SELECT payload FROM lp_auto_daily_reports WHERE account_id=? AND auto_run_id=? AND report_date=?",
+                (account_id, auto_run_id, key),
+            ).fetchone()
+        assert row is not None
+        return _load_payload(str(row["payload"]))
 
     def lp_daily_report(self, report_date: str) -> dict[str, object] | None:
         key = self._lp_report_date(report_date)

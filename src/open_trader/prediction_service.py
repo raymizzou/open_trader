@@ -501,6 +501,34 @@ def create_prediction_server(
                 except (sqlite3.Error, OSError, RuntimeError) as exc:
                     self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
                 return
+            auto_report_path = "/api/prediction-arbitrage/lp/auto/reports"
+            if parsed.path == auto_report_path or parsed.path.startswith(auto_report_path + "/"):
+                report_date = parsed.path[len(auto_report_path):].removeprefix("/") or None
+                try:
+                    if parsed.query or (report_date is not None and date.fromisoformat(report_date).isoformat() != report_date):
+                        raise ValueError("LP report date is invalid")
+                except ValueError as exc:
+                    self._send_error(HTTPStatus.BAD_REQUEST, exc)
+                    return
+                if (mode == "shadow" and not _is_available(runtime)
+                        or mode == "production" and not _is_production_available(runtime)):
+                    self._send_unavailable()
+                    return
+                reader = getattr(getattr(runtime, "execution", None), "lp_auto_report", None)
+                if not callable(reader):
+                    self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "LP auto reports are unavailable"})
+                    return
+                try:
+                    result = reader(report_date)
+                    if result is None:
+                        self._send_json(HTTPStatus.NOT_FOUND, {"error": "LP auto report not found"})
+                    else:
+                        self._send_json(HTTPStatus.OK, _lp_projection_safe_value(result))
+                except ValueError as exc:
+                    self._send_error(HTTPStatus.BAD_REQUEST, exc)
+                except (sqlite3.Error, OSError, RuntimeError) as exc:
+                    self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+                return
             lp_report_prefix = "/api/prediction-arbitrage/lp/reports/"
             if parsed.path.startswith(lp_report_prefix):
                 report_date = parsed.path.removeprefix(lp_report_prefix)
@@ -655,6 +683,12 @@ def create_prediction_server(
                     return
                 try:
                     result = execution.lp_dashboard()
+                    summary = getattr(execution, "lp_auto_report", None)
+                    if callable(summary):
+                        try:
+                            result = {**result, "auto_summary": summary()}
+                        except (sqlite3.Error, OSError, RuntimeError):
+                            result = {**result, "auto_summary": {"state": "unknown", "reason": "report_read_failed"}}
                     safe_result = _lp_projection_safe_value(result)
                     if not isinstance(safe_result, Mapping):
                         raise RuntimeError("LP dashboard result is invalid")

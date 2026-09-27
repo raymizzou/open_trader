@@ -4064,6 +4064,21 @@ class PredictionExecutionService:
         }
 
 
+    def _lp_auto_reports(self):
+        from .polymarket_lp_reports import AutoDailyReports
+
+        return AutoDailyReports(self._store, self.lp_auto_report_facts, self.lp_auto_state)
+
+    def lp_auto_summary(self) -> dict[str, object]:
+        return self._lp_auto_reports().today()
+
+    def lp_auto_report(self, report_date: str | None = None):
+        reports = self._lp_auto_reports()
+        return reports.history() if report_date is None else reports.report(report_date)
+
+    def lp_generate_due_auto_reports(self) -> list[dict]:
+        return self._lp_auto_reports().generate_due()
+
     def lp_report(self, report_date: str) -> dict[str, object] | None:
         """Read one immutable stored LP daily report."""
 
