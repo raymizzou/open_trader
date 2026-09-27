@@ -442,6 +442,11 @@ class PredictionArbitrageStore:
     def _create_schema(connection: sqlite3.Connection) -> None:
         connection.executescript(
             """
+            CREATE TABLE IF NOT EXISTS lp_auto_pool (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                payload TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS service_flags (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 payload TEXT NOT NULL,
@@ -4565,6 +4570,13 @@ class PredictionArbitrageStore:
             {"report_date": key, "generated_at": str(row["generated_at"])}
         )
         return saved
+
+    def lp_auto_owns_session(self, session_id: str) -> bool:
+        with self._read_connection() as connection:
+            row = connection.execute("SELECT payload FROM lp_auto_pool WHERE singleton=1").fetchone()
+        if row is None:
+            return False
+        return any(i.get("session_id") == session_id for i in json.loads(row[0]).get("intents", {}).values())
 
     def lp_create_session(
         self,

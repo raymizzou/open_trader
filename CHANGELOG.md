@@ -6,6 +6,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 ## 2026-09-27
 
 - Mac Air 首次部署可用 `make host-readiness FIRST_DEPLOY=1`：只有本机不存在 Open Trader launchd 服务及所选端口监听时，跳过尚未启动的旧 Account 状态检查；钱包、安装器、浏览器、Futu 与存储检查照常执行。验证：部署预检定向回归和真实 Mac Air 首次部署预检。
+- #195：自动 LP 单轮补位持久保存运行意愿、配置版本和服务端订单归属，复用 LP 会话事实核算已实现盈亏与库存成本；提交前预留并重查，未知回执阻止全池新增。默认不启用，暂停保留已有 BUY。行情读取、签名及发送不占用旧组保护锁；回执落盘使用短时全局锁，停止请求和已核实成交不会被迟到回执覆盖，冲突订单 ID 与已受理订单缺失回执均阻止新增，恢复核对有独立观察时间；SELL 子意图与真实成交时点供日报消费。共享成交核算保留已验证的累计事实，避免滚动窗口回退。验证：自动核心与共享 LP、execution、trading、store Docker focused 回归通过（既有 Keychain 用例跳过）；完整 Candidate Acceptance 由 #196 在三票最终集成 SHA 统一执行。未做实盘启用、push 或部署。
 
 ## 2026-09-24
 

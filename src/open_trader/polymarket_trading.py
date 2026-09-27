@@ -1188,6 +1188,11 @@ def _lp_order(value: object) -> dict[str, object] | None:
         "price": _lp_decimal(row.get("price")),
         "original_size": original_size,
         "size_matched": matched,
+        "fill_quantity_known": _lp_decimal(row.get("size_matched", row.get("matched_amount"))) is not None,
+        "average_price": _lp_decimal(row.get("average_price", row.get("average_fill_price"))),
+        "fee": _lp_decimal(row.get("fee", row.get("fees"))),
+        "matched_at": _venue_timestamp(row.get("matched_at", row.get("match_time"))),
+        "updated_at": _venue_timestamp(row.get("updated_at")),
         "remaining_size": max(Decimal("0"), original_size - matched),
         "size": max(Decimal("0"), original_size - matched),
         "outcome": row.get("outcome"),
@@ -4059,6 +4064,7 @@ class PolymarketTradingClient:
             }
             account_facts = {
                 "authenticated": True,
+                "wallet_address": self.config.wallet_address,
                 "balance": account.p_usd_balance,
                 "allowance": account.p_usd_allowance,
                 "positions": list(account.positions),
