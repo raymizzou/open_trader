@@ -39,11 +39,14 @@ For production-code changes covered by the normal gates, use focused
 `make test TEST=...` checks for each changed seam during development and expand
 only to the affected tests. Do not run a full `make test` solely as a bookend
 before or after Candidate Acceptance. After known repairs and any required
-rebase, run Candidate Acceptance once for the stable candidate SHA. If it
-fails, audit every reported failure and its downstream dependencies, batch the
-in-scope repairs, rerun the focused checks, and rerun Candidate Acceptance for
-the resulting SHA. When the accepted SHA is unchanged, the `--ff-only` merge
-does not require another full `make test`; exact-SHA evidence, review, rebase,
+rebase, complete focused checks and independent review before local merge.
+Candidate Acceptance runs only after the candidate is merged into local
+`main`, when preparing an explicitly authorized deployment. Do not run it
+during development, review, before merge, or automatically after a local merge.
+It is not a local-merge gate. If a deployment candidate fails, audit every
+reported failure and its downstream dependencies, batch the in-scope repairs,
+then repeat focused checks, review, and local merge before rerunning Candidate
+Acceptance for the resulting deployment SHA. Exact-SHA evidence, rebase,
 exception, and deployment rules still apply as described in the runbook.
 
 ## Review and merge

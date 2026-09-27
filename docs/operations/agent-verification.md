@@ -12,8 +12,11 @@ merge, or deployment. Documentation and configuration-only work does not run
 `-m "not pressure and not browser"`. Use `TEST='path::test_name'` for a
 focused selector during development; prefer that focused `make test TEST=...`
 form for each changed seam. Candidate Acceptance owns the complete backend
-coverage, so there is no mandatory consecutive full `make test` or acceptance
-rerun solely before or after that gate. The image includes Node and `procps`, and excludes npm,
+coverage only when preparing an explicitly authorized deployment, after the
+candidate is merged into local `main`. Do not run it during development,
+review, before merge, or automatically after a local merge. There is no
+mandatory consecutive full `make test` solely before or after that gate.
+The image includes Node and `procps`, and excludes npm,
 Python/JS Playwright, Chromium/browser assets, host mounts, network, published
 ports, the Docker socket, the home directory, and credentials. Do not add
 dependencies or weaken existing skips/xfails. Playwright is a host-only
@@ -105,8 +108,11 @@ receive any development validation relevant to their own scope.
 ## Merge, live processes, and deployment
 
 The synchronous local-main `--ff-only` merge path does not deploy. Local merge
-gates are Candidate Acceptance `PASS`, staged independent review, the dated
+gates are relevant focused checks, staged independent review, the dated
 `CHANGELOG.md` entry, any required rebase and reverification, and `--ff-only`.
+Candidate Acceptance is not a local-merge gate. Run it only after local merge
+when preparing an explicitly authorized deployment, for the exact SHA to be
+deployed; a local merge alone never starts it.
 Host Readiness is separate and read-only; it does not mutate launchd, data, or
 production.
 
@@ -126,7 +132,8 @@ restarts, rolls back, or submits. `ROLLBACK` is evidence only.
 Candidate `FAIL` or Host `BLOCKED` blocks deployment. For a Candidate failure,
 first complete one read-only audit of every reported error and its downstream
 dependencies. Then make one batched fix-forward, rerun focused checks and
-Candidate Acceptance, and do not mutate production. Stop without edits for a
+independent review, merge locally, and rerun Candidate Acceptance for the
+resulting deployment SHA; do not mutate production. Stop without edits for a
 business-rule or architecture decision, an external credentials/services/
 market/browser/data blocker, dirty or non-main state, a changed SHA, a
 non-reproducible failure, or any repair requiring test weakening or scope

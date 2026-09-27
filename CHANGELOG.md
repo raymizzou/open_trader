@@ -5,6 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-27
 
+- 验收时机按用户要求调整：Candidate 仅在候选已合入本地 main、准备明确授权的部署时运行，不作为开发、评审或本地合并门禁，也不因合并完成自动启动；部署仍要求目标 SHA 的 Candidate PASS，Host／Smoke 和 push／部署授权边界不变。本轮未完成的 Candidate 已取消，文档改动仅做独立复审。
 - LP 停止回归改为在解除 SDK 阻塞后有界等待份额监控线程实际退出，补齐测试替身时钟；保留首次停止超时、资源保留和再次停止释放检查，生产关闭逻辑不变。验证：停止、调度、控制与真实 LP／日报集成定向回归 56 passed；完整 Candidate 另按最终 SHA 验收。
 - Mac Air 首次部署可用 `make host-readiness FIRST_DEPLOY=1`：只有本机不存在 Open Trader launchd 服务及所选端口监听时，跳过尚未启动的旧 Account 状态检查；钱包、安装器、浏览器、Futu 与存储检查照常执行。验证：部署预检定向回归和真实 Mac Air 首次部署预检。
 - #195/#196/#197 联合接线：现有 LP 卡片展示真实自动资金、订单归属与自然日报；增加真实 SQLite/LP 生命周期联调，覆盖重启、暂停并发、跨日补位、回执恢复、卖出回款、只读接口和独立出报。最终 Candidate 结果以共同提交 SHA 的验收记录为准。
