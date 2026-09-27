@@ -250,6 +250,7 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
         "partial_fill_proofs",
         "observation_pool_members",
         "lp_sessions",
+        "lp_auto_pool",
         "lp_actions",
         "lp_first_seen_episodes",
         "lp_daily_reports",

@@ -136,6 +136,8 @@ def test_real_reconciliation_block_does_not_delay_paused_auto_daily_report(tmp_p
 
 
 def test_real_sell_receipt_loss_and_recovery_changes_pending_without_new_acceptance(tmp_path, monkeypatch):
+    from open_trader import prediction_arbitrage_store
+    monkeypatch.setattr(prediction_arbitrage_store, "_utc_now", lambda: pool.NOW.isoformat())
     engine, exchange, lp, store = pool.setup(tmp_path)
     engine.lp_auto_configure({"budget_usd": "100", "target_buy_count": 1})
     engine.lp_auto_set_desired_running(True)

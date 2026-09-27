@@ -845,6 +845,33 @@ class PredictionExecutionService:
         # once, lazily, before the first audit write.
         self._lp_manual_audit_ready = False
 
+    def _lp_auto_pool(self):
+        from .polymarket_lp_auto import LPAutoPool
+        with self._lp_dashboard_lock:
+            if not hasattr(self, "_auto_pool"):
+                if self._lp is None:
+                    raise ValueError("lp_unavailable")
+                self._auto_pool = LPAutoPool(self)
+            return self._auto_pool
+
+    def lp_auto_state(self):
+        return self._lp_auto_pool().state()
+
+    def lp_auto_configure(self, payload, *, audit=None):
+        return self._lp_auto_pool().configure(payload, audit=audit)
+
+    def lp_auto_set_desired_running(self, running, *, audit=None):
+        return self._lp_auto_pool().set_desired_running(running, audit=audit)
+
+    def lp_auto_run_once(self, *, round_id=None):
+        return self._lp_auto_pool().run_once(round_id=round_id)
+
+    def lp_auto_reconcile_unknown(self):
+        return self._lp_auto_pool().reconcile_unknown()
+
+    def lp_auto_report_facts(self, period_start=None, period_end=None):
+        return self._lp_auto_pool().report_facts(period_start, period_end)
+
     def lp_preview(self, request: Mapping[str, object]) -> dict[str, object]:
         """Run the LP read-only preflight through the production collaborator."""
 

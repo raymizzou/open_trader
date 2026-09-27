@@ -124,6 +124,10 @@ _QUEUE_DATA_FAILURE_REASONS = frozenset(
 logger = logging.getLogger(__name__)
 
 
+class AutoEntryNotSent(ValueError):
+    """A pre-POST guard proved that the automatic entry was not sent."""
+
+
 class _MutationBlocked(RuntimeError):
     """The shared execution guard currently forbids an exchange mutation."""
 
@@ -6378,12 +6382,17 @@ class PolymarketLPService:
             return {}
         return store_map if isinstance(store_map, dict) else {}
 
-    def _candidate_reservations(self) -> tuple[dict[str, object], ...]:
+    def _candidate_reservations(self, *, ignore_session_id=None) -> tuple[dict[str, object], ...]:
         reservations: list[dict[str, object]] = []
         for session in self.store.lp_active_sessions():
+            if session.get("session_id") == ignore_session_id:
+                continue
             order_id = str(session.get("entry_order_id") or "").strip()
             if not order_id:
                 order_id = f"lp-session:{session.get('session_id', '')}"
+            history = self._order_history(session)
+            if str(history.get(order_id, {}).get("status") or "").upper() in TERMINAL_ORDER_STATES:
+                continue
             price = _maybe_decimal(session.get("price"))
             quantity = _maybe_decimal(session.get("quantity"))
             filled = _maybe_decimal(session.get("buy_filled_quantity")) or Decimal("0")
@@ -6594,7 +6603,7 @@ class PolymarketLPService:
         }
 
     def _read_candidate_snapshot(
-        self, identity: Mapping[str, object], *, now: datetime
+        self, identity: Mapping[str, object], *, now: datetime, ignore_session_id=None
     ) -> dict[str, object]:
         """Read and qualify one candidate market through selected adapters only."""
 
@@ -6731,7 +6740,7 @@ class PolymarketLPService:
             direction,
             account=account,
             now=evaluation_now,
-            reservations=self._candidate_reservations(),
+            reservations=self._candidate_reservations(ignore_session_id=ignore_session_id),
             candidate=True,
         )
         if evaluated.get("state") != "eligible":
@@ -6967,6 +6976,8 @@ class PolymarketLPService:
         session = self.store.lp_session(str(session_id))
         if session is None:
             return None, "session_not_found"
+        if self.store.lp_auto_owns_session(session_id):
+            return None, "automatic_session_augmentation_disabled"
         state = str(session.get("state"))
         if state in {"complete", "entry_rejected"}:
             return None, "session_not_active"
@@ -7954,6 +7965,10 @@ class PolymarketLPService:
         now: datetime,
         key: str,
         expiration: int,
+        session_id: str | None = None,
+        post: Callable[[object], object] | None = None,
+        release_preparation_lock: Callable[[], None] | None = None,
+        apply_lock: tuple[Callable[[], object | None], Callable[[object], None]] | None = None,
     ) -> dict[str, object]:
         """Register the session and submit exactly one post-only BUY.
 
@@ -7985,7 +8000,7 @@ class PolymarketLPService:
             "queue_protection_baseline": queue_baseline_summary,
         }
         reward_date = self._now().date().isoformat()
-        session_id = uuid.uuid4().hex
+        session_id = session_id or uuid.uuid4().hex
         intent: dict[str, object] = {
             **request,
             "preflight": facts,
@@ -8064,6 +8079,8 @@ class PolymarketLPService:
                 **entry_action_base,
             },
         )
+        if release_preparation_lock is not None:
+            release_preparation_lock()
         try:
             signed = self._create_limit(
                 token_id=str(request["token_id"]),
@@ -8073,7 +8090,19 @@ class PolymarketLPService:
                 post_only=True,
                 expiration=expiration,
             )
-            response = self._post_limit(signed)
+            signed_order_id = str(_field(signed, "order_id", "") or "")
+            if post is not None and signed_order_id:
+                self.store.lp_update_session(session_id,
+                    patch={"entry_order_id": signed_order_id, "owned_order_ids": [signed_order_id]})
+                self.store.lp_upsert_action(session_id, entry_action_key, state="pending",
+                    payload={"role": "entry", "side": "BUY", "order_id": signed_order_id, **entry_action_base})
+            response = (post or self._post_limit)(signed)
+        except AutoEntryNotSent as exc:
+            self.store.lp_upsert_action(session_id, entry_action_key, state="rejected",
+                payload={"role": "entry", "side": "BUY", "reason": str(exc), **entry_action_base})
+            session = self.store.lp_update_session(session_id, state="entry_rejected",
+                patch={"submit_status": "rejected", "reason": str(exc)})
+            return self._status_payload(session)
         except Exception as exc:
             self.store.lp_upsert_action(
                 session_id,
@@ -8095,6 +8124,23 @@ class PolymarketLPService:
             )
             return self._status_payload(session)
         accepted, order_id = self._order_response(response)
+        if post is not None and signed_order_id and order_id and signed_order_id != order_id:
+            conflict = {"prepared_order_id": signed_order_id, "response_order_id": order_id}
+            self.store.lp_upsert_action(session_id, entry_action_key, state="unknown",
+                payload={"role": "entry", "side": "BUY", **conflict, **entry_action_base,
+                         "submit_receipt_at": _iso(self._now())})
+            session = self.store.lp_update_session(session_id, state="needs_attention",
+                patch={"submit_status": "unknown", "order_identity_conflict": conflict,
+                       "reconciliation": "order_identity_conflict"})
+            return self._status_payload(session)
+        if not accepted and not (
+            _field(response, "accepted", None) is False
+            or _field(response, "ok", None) is False
+            or str(_field(response, "status", "")).upper() in {"REJECTED", "FAILED"}
+        ):
+            session = self.store.lp_update_session(session_id, state="needs_attention",
+                patch={"submit_status": "unknown", "resume_state": "entry_submit_pending"})
+            return self._status_payload(session)
         if not accepted:
             self.store.lp_upsert_action(
                 session_id,
@@ -8139,27 +8185,42 @@ class PolymarketLPService:
                 },
             )
             return self._status_payload(session)
-        order_history = self._order_history(session)
-        order_history[order_id] = {
-            "order_id": order_id,
-            "token_id": request["token_id"],
-            "side": "BUY",
-            "status": str(_field(response, "status", "LIVE")).upper() or "LIVE",
-            "price": request["price"],
-            "quantity": request["quantity"],
-            "expiration": expiration,
-        }
-        session = self.store.lp_update_session(
-            session_id,
-            state="entry_open",
-            patch={
-                "entry_order_id": order_id,
-                "submit_status": "accepted",
-                "owned_order_ids": [order_id],
-                "order_history": order_history,
-            },
-        )
-        return self._status_payload(session)
+        receipt_lock = apply_lock[0]() if apply_lock is not None else None
+        if apply_lock is not None and receipt_lock is None:
+            # The accepted action above durably holds the exact venue ID.
+            # Reconciliation will apply it after the existing writer finishes.
+            return {**self._status_payload(session), "reason": "receipt_apply_pending"}
+        try:
+            with self._mutex:
+                session = self.store.lp_session(session_id) or session
+                order_history = self._order_history(session)
+                observed = order_history.get(order_id, {})
+                order_history[order_id] = {
+                    "order_id": order_id,
+                    "token_id": request["token_id"],
+                    "side": "BUY",
+                    "status": str(_field(response, "status", "LIVE")).upper() or "LIVE",
+                    "price": request["price"],
+                    "quantity": request["quantity"],
+                    "expiration": expiration,
+                    **observed,
+                }
+                if str(observed.get("status") or "UNKNOWN").upper() == "UNKNOWN":
+                    order_history[order_id]["status"] = str(_field(response, "status", "LIVE")).upper() or "LIVE"
+                session = self.store.lp_update_session(
+                    session_id,
+                    state="review" if session.get("stop_requested") or session.get("entry_cancel_requested") else "entry_open",
+                    patch={
+                        "entry_order_id": order_id,
+                        "submit_status": "accepted",
+                        "owned_order_ids": list(dict.fromkeys([*self._session_order_ids(session), order_id])),
+                        "order_history": order_history,
+                    },
+                )
+                return self._status_payload(session)
+        finally:
+            if apply_lock is not None and receipt_lock is not None:
+                apply_lock[1](receipt_lock)
 
     def _lp_market_conflict(
         self, condition_id: object, outcome: object
@@ -9569,6 +9630,8 @@ class PolymarketLPService:
         cannot be sent twice by the same tick.
         """
 
+        if session.get("order_identity_conflict"):
+            return self._status_payload(session)
         state = str(session.get("state"))
         if state in {"entry_rejected", "complete"}:
             return self._status_payload(session)
@@ -10794,6 +10857,11 @@ class PolymarketLPService:
         token_id = str(session.get("token_id") or "")
         baseline_price = _maybe_decimal(bucket.get("baseline_price"))
         updated = dict(bucket)
+        current = self.store.lp_session(session_id) or session
+        if current.get("order_identity_conflict"):
+            return self._blocked_bucket_protection_cancel(
+                session, updated, "order_identity_conflict", "订单身份冲突，等待核对",
+                None, notify=notify_blocked), {}
         if baseline_price is None:
             return updated, {}
         own_order_ids = self._session_augment_own_order_ids(session)
@@ -12156,6 +12224,10 @@ class PolymarketLPService:
                 "size",
                 "quantity",
                 "expiration",
+                "matched_at",
+                "updated_at",
+                "average_price",
+                "fee",
             ):
                 value = _field(order, name, None)
                 if value is not None:
@@ -12412,6 +12484,70 @@ class PolymarketLPService:
             return None
         return sum((fee for fee in fees if fee is not None), Decimal("0"))
 
+    def _verified_order_fills(self, session, snapshot, trade_events):
+        """One cumulative fact per owned order, merging streams and receipts.
+
+        A later stream replaces receipt coverage, never adds it. Only an exact
+        authenticated order ID with verified execution price can fill a gap.
+        """
+        previous = session.get("verified_order_fills") or {}
+        automatic = self.store.lp_auto_owns_session(str(session["session_id"]))
+        facts = {}
+        history = self._order_history(session)
+        market = snapshot.get("market") or {}
+        for order_id in self._session_order_ids(session):
+            side = str(history.get(order_id, {}).get("side") or (
+                "BUY" if order_id == session.get("entry_order_id") else "SELL"))
+            self._trade_totals(snapshot, order_id, side, token_id=str(session["token_id"]))
+            events = [e for e in trade_events if e["order_id"] == order_id]
+            quantity = sum((_decimal(e["quantity"], "fill_quantity") for e in events), Decimal(0))
+            value = sum((_decimal(e["quantity"], "fill_quantity") * _decimal(e["price"], "fill_price") for e in events), Decimal(0))
+            fee = self._report_fee_total(events, side)
+            matched_at = events[0].get("matched_at") if len(events) == 1 else None
+            old = previous.get(order_id, {})
+            old_quantity = _maybe_decimal(old.get("quantity")) or Decimal(0)
+            source = "trades"
+            if old_quantity > quantity:
+                source = old.get("source", "receipt")
+                quantity, value = old_quantity, _decimal(old["value"], "fill_value")
+                fee, matched_at = _maybe_decimal(old.get("fee")), old.get("matched_at")
+            for order in _items(snapshot.get("orders")):
+                if self._order_id(order) != order_id:
+                    continue
+                matched = _maybe_decimal(_field(order, "size_matched", None))
+                status = str(_field(order, "status", "")).upper()
+                if automatic and _field(order, "fill_quantity_known", True) is False:
+                    raise ValueError("owned_fill_quantity_unknown")
+                if matched is None:
+                    if status in {"MATCHED", "FILLED"} and quantity == 0:
+                        raise ValueError("owned_fill_quantity_unknown")
+                    continue
+                if matched < 0:
+                    raise ValueError("owned_fill_quantity_invalid")
+                if matched <= quantity:
+                    continue
+                token = str(_field(order, "token_id", _field(order, "asset_id", "")))
+                order_side = str(_field(order, "side", "")).upper()
+                if token != str(session["token_id"]) or order_side != side:
+                    raise ValueError("owned_fill_identity_unknown")
+                # Entry and passive exit are explicitly post-only. Protected
+                # taker exits need an actual execution-average price.
+                maker = order_id == session.get("entry_order_id") or order_id == session.get("passive_exit_order_id") or order_id in (session.get("augment_order_ids") or [])
+                price = _maybe_decimal(_field(order, "average_price", _field(order, "average_fill_price", None)))
+                if price is None and maker:
+                    price = _maybe_decimal(_field(order, "price", None))
+                if price is None or not 0 < price < 1:
+                    raise ValueError("owned_fill_price_unknown")
+                quantity, value = matched, matched * price
+                source = "receipt"
+                fee = _maybe_decimal(_field(order, "fee", _field(order, "fees", None)))
+                if fee is None and (market.get("fees_enabled") is False or (maker and _maybe_decimal(market.get("fee")) == 0)):
+                    fee = Decimal(0)
+                matched_at = _field(order, "matched_at", None)
+            facts[order_id] = dict(order_id=order_id, side=side, quantity=quantity,
+                value=value, price=value/quantity if quantity else None, fee=fee, matched_at=matched_at, source=source)
+        return facts
+
     def _fill_patch(
         self, session: Mapping[str, object], snapshot: Mapping[str, object]
     ) -> dict[str, object]:
@@ -12428,48 +12564,20 @@ class PolymarketLPService:
             raise ValueError("book_freshness_unknown")
         _freshness(book_received_at, self._now(), "book_freshness")
         token_id = session["token_id"]
-        entry_order_id = str(session.get("entry_order_id") or "")
-        history = self._order_history(session)
-        # Issue 167: BUY economics merge across the group — the entry order
-        # plus every augment order (each price level) feeds buy_filled /
-        # buy_cost, so a fill at any level triggers D3 and the $5 stop loss.
-        buy_order_ids = sorted(
-            order_id
-            for order_id in self._session_order_ids(session)
-            if order_id
-            and str(history.get(order_id, {}).get("side") or "").upper() == "BUY"
-        )
-        quantity = Decimal("0")
-        cost = Decimal("0")
-        for buy_order_id in buy_order_ids:
-            current_quantity, current_cost = self._trade_totals(
-                snapshot,
-                buy_order_id,
-                "BUY",
-                token_id=str(token_id),
-            )
-            quantity += current_quantity
-            cost += current_cost
-        sell_order_ids = {
-            order_id
-            for order_id in self._session_order_ids(session)
-            if order_id != entry_order_id
-            and str(history.get(order_id, {}).get("side") or "SELL").upper() == "SELL"
-        }
-        sold_quantity = Decimal("0")
-        sold_revenue = Decimal("0")
-        for order_id in sell_order_ids - {""}:
-            current_quantity, current_revenue = self._trade_totals(
-                snapshot, order_id, "SELL", token_id=str(token_id)
-            )
-            sold_quantity += current_quantity
-            sold_revenue += current_revenue
+        trade_events = self._merge_report_trade_events(session, snapshot)
+        verified = self._verified_order_fills(session, snapshot, trade_events)
+        buys = [f for f in verified.values() if f["side"] == "BUY"]
+        sells = [f for f in verified.values() if f["side"] == "SELL"]
+        quantity = sum((f["quantity"] for f in buys), Decimal(0))
+        cost = sum((f["value"] for f in buys), Decimal(0))
+        sold_quantity = sum((f["quantity"] for f in sells), Decimal(0))
+        sold_revenue = sum((f["value"] for f in sells), Decimal(0))
+        def fees_for(rows):
+            return None if any(f["fee"] is None for f in rows) else sum((f["fee"] for f in rows), Decimal(0))
+        buy_fees, sell_fees = fees_for(buys), fees_for(sells)
+        fees = None if buy_fees is None or sell_fees is None else buy_fees + sell_fees
         residual = self._position_quantity(account, str(token_id))
         residual_value = self._executable_bid_value(snapshot, residual)
-        trade_events = self._merge_report_trade_events(session, snapshot)
-        buy_fees = self._report_fee_total(trade_events, "BUY")
-        sell_fees = self._report_fee_total(trade_events, "SELL")
-        fees = self._known_trade_fees(snapshot, session, token_id=str(token_id))
         projected_fee = self._projected_taker_fee(snapshot, residual)
         fees_known = fees is not None and projected_fee is not None
         if fees is not None and projected_fee is not None:
@@ -12500,6 +12608,7 @@ class PolymarketLPService:
             "residual_exit_value": residual_value,
             "projected_exit_fee": projected_fee,
             "trade_events": trade_events,
+            "verified_order_fills": verified,
             "fees": fees,
             "fee_status": "known" if fees_known else "unknown",
             "position_reconciled": position_reconciled,
@@ -12893,7 +13002,9 @@ class PolymarketLPService:
         )
 
     def _cancel_owned_orders(self, session: Mapping[str, object]) -> None:
-        current = dict(session)
+        current = dict(self.store.lp_session(str(session["session_id"])) or session)
+        if current.get("order_identity_conflict"):
+            raise ValueError("order_identity_conflict")
         history = self._order_history(current)
         errors: list[BaseException] = []
         for key, requested_key, role in (

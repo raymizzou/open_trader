@@ -1520,6 +1520,19 @@ def test_review_keeps_stop_loss_and_no_repeat_entry(tmp_path) -> None:
         protected_status="FILLED",
         position_flat=True,
     )
+    # Retain the 40-share passive fill and add only the 60-share protected
+    # remainder. A second order filled for 100 would oversell the opening.
+    flat["trades"] = with_bid["trades"] + [{
+        "trade_id": "protected-sell-2", "token_id": "0x" + "1" * 64,
+        "side": "SELL", "status": "CONFIRMED", "maker_orders": [{
+            "order_id": "stop-1", "token_id": "0x" + "1" * 64,
+            "side": "SELL", "matched_amount": Decimal("60"),
+            "price": Decimal("0.225"), "fee": Decimal("0"),
+        }],
+    }]
+    for order in flat["orders"]:
+        if order["order_id"] == "stop-1":
+            order.update(original_size=Decimal("60"), size_matched=Decimal("60"))
     exchange.snapshot_value = flat
     completed = service.tick()
     assert completed["state"] == "complete"
@@ -2907,6 +2920,11 @@ def test_production_adapter_normalizes_sdk_account_market_book_and_trades() -> N
             "price": Decimal("0.31"),
             "original_size": Decimal("100"),
             "size_matched": Decimal("25"),
+            "fill_quantity_known": True,
+            "average_price": None,
+            "fee": None,
+            "matched_at": None,
+            "updated_at": None,
             "remaining_size": Decimal("75"),
             "size": Decimal("75"),
             "outcome": "YES",
@@ -13815,3 +13833,32 @@ def test_lp_needs_attention_notification_stop_clears_bookkeeping(tmp_path) -> No
     current[0] = now + timedelta(seconds=660)
     service.tick()
     assert len(notifications) == 2
+
+
+def test_manual_cumulative_fills_survive_trade_window_and_restart(tmp_path):
+    now = datetime(2026, 9, 14, 12, tzinfo=UTC)
+    exchange = _Exchange()
+    exchange.snapshot_value = _snapshot(now)
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    preview = service.preview({**_request(now), 'quantity': Decimal('100')})
+    service.start(preview['preview_id'], 'manual-window')
+    exchange.snapshot_value = _inventory_snapshot(now, buy_quantity=Decimal('100'),
+        buy_cost=Decimal('30'), residual=Decimal('100'), residual_value=Decimal('29'))
+    service.tick()
+    exchange.snapshot_value = _inventory_snapshot(now, buy_quantity=Decimal('100'),
+        buy_cost=Decimal('30'), residual=Decimal('60'), residual_value=Decimal('17.4'),
+        sold_quantity=Decimal('40'), sold_revenue=Decimal('11.6'), passive_status='LIVE')
+    before = service.tick()
+    assert before['buy_filled_quantity'] == Decimal('100')
+    assert before['sold_quantity'] == Decimal('40')
+    exchange.snapshot_value['trades'] = []
+    # The page/window no longer supplies old fills or cumulative receipts.
+    for order in exchange.snapshot_value['orders']:
+        order.pop('size_matched', None)
+    restarted = PolymarketLPService(store, exchange, clock=lambda: now)
+    after = restarted.tick()
+    assert after['buy_filled_quantity'] == Decimal('100')
+    assert after['sold_quantity'] == Decimal('40')
+    assert after['buy_cost'] == Decimal('30')
+    assert after['sold_revenue'] == Decimal('11.6')

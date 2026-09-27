@@ -975,6 +975,9 @@ def test_lp_dashboard_scoring_status_preserves_official_false(tmp_path: Path) ->
             }
 
     class FakeLP:
+        def _now(self) -> datetime:
+            return datetime.now(UTC)
+
         def candidate_snapshot(self) -> dict[str, object]:
             return {
                 "state": "known",
@@ -1345,6 +1348,9 @@ def _lp_reward_order(
 
 
 class _LPDashboardFakeLP:
+    def _now(self) -> datetime:
+        return datetime.now(UTC)
+
     def candidate_snapshot(self) -> dict[str, object]:
         return {
             "state": "known",
@@ -1950,6 +1956,9 @@ def test_lp_dashboard_http_projection_keeps_today_orders(tmp_path: Path) -> None
             }
 
     class FakeLP:
+        def _now(self) -> datetime:
+            return datetime.now(UTC)
+
         def candidate_snapshot(self) -> dict[str, object]:
             return {
                 "state": "known",
@@ -2035,6 +2044,9 @@ def test_lp_dashboard_http_rows_include_session_id(tmp_path: Path) -> None:
             return True
 
     class FakeLP:
+        def _now(self) -> datetime:
+            return datetime.now(UTC)
+
         def candidate_snapshot(self) -> dict[str, object]:
             return {
                 "state": "known",
