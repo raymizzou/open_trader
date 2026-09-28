@@ -6845,4 +6845,226 @@ def test_restart_resets_universe_retry_state(
     assert monitor._universe_refresh_attempts == 0
     assert monitor._universe_failed is False
     assert monitor._universe_retry_exhausted is False
-    assert monitor._universe_failure_notification_scheduled is True
+    assert monitor._universe_failure_notification_scheduled is False
+
+
+def test_universe_timeout_recovers_after_exhaustion(tmp_path, monkeypatch):
+    from open_trader.polymarket_monitor import UNIVERSE_REFRESH_SECONDS
+
+    monitor = make_monitor(tmp_path, relation_discovery=None, relation_validator=None)
+    clock = [0.0]
+    calls = []
+    notifications = []
+    monkeypatch.setattr(monitor, "_monotonic", lambda: clock[0])
+    monitor.set_failure_observer(lambda payload: notifications.append(payload))
+
+    async def refresh(_client, **kwargs):
+        calls.append(clock[0])
+        if len(calls) <= 6:
+            raise TimeoutError()
+        monitor._universe_at = NOW
+
+    monkeypatch.setattr(monitor, "_refresh_universe_bounded", refresh)
+
+    async def scenario():
+        due = 0.0
+        for current in (0, 5, 10, 15, 20):
+            clock[0] = current
+            due, succeeded = await monitor._refresh_universe_if_due(
+                object(), current=current, next_refresh=due
+            )
+            assert not succeeded
+        assert due == 20 + UNIVERSE_REFRESH_SECONDS
+        for current in (25, due - 1, due, due + UNIVERSE_REFRESH_SECONDS):
+            clock[0] = current
+            due, succeeded = await monitor._refresh_universe_if_due(
+                object(), current=current, next_refresh=due
+            )
+        assert succeeded
+        assert len(calls) == 7
+        assert not monitor._universe_failed
+        assert not monitor._universe_retry_exhausted
+        assert monitor._universe_refresh_attempts == 0
+        await monitor._universe_failure_notification_task
+        assert len(notifications) == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('stage,method', [
+    ('events', 'list_events'), ('readiness', '_refresh_readiness'),
+    ('books', '_confirm_market'), ('subscription', '_refresh_subscription_if_dirty'),
+])
+def test_universe_timeout_reports_stage_without_advancing_success(
+    tmp_path, monkeypatch, stage, method, caplog,
+):
+    from open_trader import polymarket_monitor
+
+    setup_public([event('event-1', markets=(market('market-1'),))])
+    monitor = make_monitor(tmp_path, relation_discovery=None, relation_validator=None)
+    client = FakePublicClient()
+    previous = NOW - timedelta(minutes=11)
+    monitor._universe_at = previous
+    cancelled = []
+
+    async def blocked(*args, **kwargs):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.append(True)
+
+    monkeypatch.setattr(client if stage == 'events' else monitor, method, blocked)
+    monkeypatch.setattr(polymarket_monitor, 'PUBLIC_REFRESH_TIMEOUT_SECONDS', 0.05)
+
+    async def scenario():
+        with pytest.raises(TimeoutError):
+            await monitor._refresh_universe_bounded(client, block_observation_status=False)
+        assert cancelled == [True]
+        assert monitor._universe_at == previous
+        assert monitor._universe_failed
+        assert 'universe_stale' in monitor.snapshot()['health']['degraded_reasons']
+        progress = monitor.snapshot()['diagnostics']['universe_refresh']
+        assert progress['stage'] == stage
+        assert progress['error_type'] == 'TimeoutError'
+        assert progress['elapsed_seconds'] >= 0.05
+        assert f'stage={stage}' in caplog.text
+
+    asyncio.run(scenario())
+
+
+def test_universe_recovery_probe_requires_complete_refresh(tmp_path, monkeypatch):
+    from open_trader import polymarket_monitor
+
+    setup_public([event('event-1', markets=(market('market-1'),))])
+    monitor = make_monitor(tmp_path, relation_discovery=None, relation_validator=None)
+    client = FakePublicClient()
+    monitor._universe_refresh_attempts = 5
+    monitor._universe_retry_exhausted = True
+    monitor._universe_retry_pending = True
+    monitor._universe_failed = True
+    subscribe = monitor._refresh_subscription_if_dirty
+    monkeypatch.setattr(polymarket_monitor, 'PUBLIC_REFRESH_TIMEOUT_SECONDS', 0.05)
+
+    async def blocked(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    async def scenario():
+        monkeypatch.setattr(monitor, '_refresh_subscription_if_dirty', blocked)
+        due, succeeded = await monitor._refresh_universe_if_due(client, current=0, next_refresh=0)
+        assert not succeeded
+        assert monitor._universe_at is None
+        assert monitor._universe_retry_exhausted
+        assert not monitor.snapshot()['health']['actionable']
+        monkeypatch.setattr(monitor, '_refresh_subscription_if_dirty', subscribe)
+        _, succeeded = await monitor._refresh_universe_if_due(client, current=due, next_refresh=due)
+        assert succeeded
+        assert monitor._universe_at == NOW
+        assert not monitor._universe_retry_exhausted
+        assert monitor.snapshot()['health']['actionable']
+        await monitor._close_stream()
+
+    asyncio.run(scenario())
+
+
+def test_universe_cooldown_does_not_delay_stop_and_cleanup(tmp_path, monkeypatch):
+    setup_public([])
+    monitor = make_monitor(tmp_path, relation_discovery=None, relation_validator=None)
+    monitor._universe_refresh_attempts = 4
+    calls = []
+    closed = []
+
+    async def fail(*args, **kwargs):
+        calls.append(True)
+        raise TimeoutError()
+
+    async def stop_on_stream(*args):
+        assert monitor._universe_retry_pending
+        monitor._stop_event.set()
+        raise StopAsyncIteration()
+
+    async def close(client):
+        closed.append(True)
+
+    monkeypatch.setattr(monitor, '_refresh_universe_bounded', fail)
+    monkeypatch.setattr(monitor, '_stream_next', stop_on_stream)
+    monkeypatch.setattr(FakePublicClient, 'close', close, raising=False)
+    asyncio.run(asyncio.wait_for(monitor._run_forever_once(), timeout=1))
+    assert calls == [True]
+    assert closed == [True]
+    assert monitor._client is None
+    assert monitor._stream_handle is None
+
+
+@pytest.mark.parametrize('recover_first', [False, True])
+def test_universe_notifications_deduplicate_episode_and_escalation(
+    tmp_path, monkeypatch, recover_first,
+):
+    monitor = make_monitor(tmp_path, relation_discovery=None, relation_validator=None)
+    outcome = [TimeoutError]
+    notifications = []
+    release = threading.Event()
+    entered = threading.Event()
+    now = [0.0]
+    monkeypatch.setattr(monitor, '_monotonic', lambda: now[0])
+
+    async def refresh(*args, **kwargs):
+        if outcome[0] is not None:
+            raise outcome[0]()
+        monitor._universe_at = NOW
+
+    def observer(payload):
+        notifications.append(dict(payload))
+        if len(notifications) == 1:
+            entered.set()
+            assert release.wait(timeout=5)
+        return {'state': 'sent'}
+
+    monitor.set_failure_observer(observer)
+    monkeypatch.setattr(monitor, '_refresh_universe_bounded', refresh)
+
+    async def scenario():
+        due = 0.0
+
+        async def tick():
+            nonlocal due
+            now[0] = due
+            due, succeeded = await monitor._refresh_universe_if_due(
+                object(), current=due, next_refresh=due,
+            )
+            return succeeded
+
+        try:
+            for _ in range(6):
+                assert not await tick()
+            assert await asyncio.to_thread(entered.wait, 1)
+            first_task = monitor._universe_failure_notification_task
+            assert len(notifications) == 1
+            if recover_first:
+                outcome[0] = None
+                assert await tick()
+                outcome[0] = TimeoutError
+                for _ in range(6):
+                    assert not await tick()
+            else:
+                outcome[0] = ValueError
+                for _ in range(3):
+                    assert not await tick()
+                assert not monitor._universe_retry_pending
+            # A blocked delivery must not be replaced or run concurrently.
+            assert monitor._universe_failure_notification_task is first_task
+            assert len(notifications) == 1
+            assert monitor._universe_failure_notification_pending is not None
+            release.set()
+            await first_task
+            monitor._reap_universe_failure_notification_task()
+            await monitor._universe_failure_notification_task
+            monitor._reap_universe_failure_notification_task()
+            assert len(notifications) == 2
+            assert notifications[0]['retry_seconds'] == 300
+            assert notifications[1]['error_type'] == ('TimeoutError' if recover_first else 'ValueError')
+            assert ('retry_seconds' in notifications[1]) is recover_first
+            assert monitor._universe_failure_notification_task is None
+        finally:
+            release.set()
+
+    asyncio.run(scenario())

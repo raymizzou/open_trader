@@ -1065,7 +1065,7 @@ def test_notify_monitor_failure_uses_feishu_only_and_operator_copy(
     assert "自动重试已停止" in message
     assert "TransportError" in message
     assert "上次成功刷新 20:00" in message
-    assert "请重启 Dashboard 服务并检查 Polymarket 连接。" in message
+    assert "请检查 Prediction Service 的刷新阶段日志及 Polymarket 连接。" in message
 
 
 def test_notify_monitor_failure_sanitizes_error_and_reports_delivery_failure(
@@ -9119,3 +9119,13 @@ def test_lp166_reconcile_startup_recovers_every_group(tmp_path: Path) -> None:
         for row in store.lp_active_sessions()
     }
     assert after == before
+
+
+def test_notify_monitor_timeout_recovery_copy(tmp_path: Path) -> None:
+    service, _trading, _store, _monitor, _macos, feishu = standard_notification_fixture(tmp_path)
+    service.notify_monitor_failure({"attempts": 5, "error_type": "TimeoutError", "retry_seconds": 300})
+    title, message = feishu.messages[-1]
+    assert "等待自动恢复" in title
+    assert "每 5 分钟自动探测恢复" in message
+    assert "Prediction Service" in message
+    assert "重试已停止" not in message

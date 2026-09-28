@@ -3884,6 +3884,7 @@ const exhausted = {
 console.log(JSON.stringify({
   retrying:predictionExecutionAlert(retrying),
   exhausted:predictionExecutionAlert(exhausted),
+  recovering:predictionExecutionAlert({...exhausted, health:{...exhausted.health, universe_retry_pending:true}}),
   retryingHeader:predictionUnifiedPageHeader(retrying),
   exhaustedHeader:predictionUnifiedPageHeader(exhausted),
   retryingYesNo:predictionTradingAvailable(retrying, "yes_no"),
@@ -3894,7 +3895,8 @@ console.log(JSON.stringify({
     rendered = json.loads(output)
 
     assert "监控市场刷新失败，正在自动重试（3/5）" in rendered["retrying"]
-    assert "监控市场连续 5 次刷新失败，已停止自动重试；请重启承载预测监控的 Dashboard 服务并检查 Polymarket 连接。" in rendered["exhausted"]
+    assert "监控市场连续 5 次刷新失败，已停止自动重试；请检查 Prediction Service 的刷新阶段日志及 Polymarket 连接。" in rendered["exhausted"]
+    assert "每 5 分钟自动探测恢复" in rendered["recovering"]
     assert "Watcher 正常" in rendered["retryingHeader"]
     assert "Watcher 正常" in rendered["exhaustedHeader"]
     assert rendered["retryingYesNo"] is False

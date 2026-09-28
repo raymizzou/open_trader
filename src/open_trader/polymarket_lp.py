@@ -41,6 +41,7 @@ from .prediction_arbitrage_store import (
     PredictionArbitrageStore,
 )
 from .notifications import beijing_clock
+from .polymarket_trading import _lp_read_stage
 
 
 STOP_LOSS = Decimal("5")
@@ -9340,11 +9341,18 @@ class PolymarketLPService:
                 flight.update(monitor=True, apply_lock=apply_lock)
             future = flight['future']
         if not owner:
-            return future.result()
+            with _lp_read_stage("facts_join_wait"):
+                return future.result()
+        timings, failed = {}, False
         try:
             self._facts_owner.session_id = session_id
-            with self._facts_capacity:
-                result = self._reconcile_facts_once(session_id, apply_lock=apply_lock, report_only=report_only)
+            with _lp_read_stage("facts_capacity_wait", timings):
+                self._facts_capacity.acquire()
+            try:
+                result = self._reconcile_facts_once(session_id, apply_lock=apply_lock, report_only=report_only, timings=timings)
+                failed = result[3] is not None
+            finally:
+                self._facts_capacity.release()
             with self._facts_lock:
                 if not flight['monitor']:
                     # Finish atomically with request registration, so a joining
@@ -9361,6 +9369,7 @@ class PolymarketLPService:
                 future.set_result(result)
             return result
         except ValueError as exc:
+            failed = True
             if str(exc) != 'session_changed':
                 future.set_exception(exc)
                 raise
@@ -9369,15 +9378,19 @@ class PolymarketLPService:
             future.set_result(result)
             return result
         except BaseException as exc:
+            failed = True
             future.set_exception(exc)
             raise
         finally:
+            if failed or sum(timings.values()) >= 60:
+                logger.warning("lp_facts_timing outcome=%s stages=%s thread=%s",
+                               "failed" if failed else "slow", timings, threading.get_ident())
             self._facts_owner.session_id = None
             with self._facts_lock:
                 if self._facts_inflight.get(session_id) is flight:
                     self._facts_inflight.pop(session_id)
 
-    def _reconcile_facts_once(self, session_id, *, apply_lock, report_only):
+    def _reconcile_facts_once(self, session_id, *, apply_lock, report_only, timings=None):
         row = self.store.lp_session_with_revision(session_id, trading=True)
         if row is None:
             raise ValueError('lp_session_not_found')
@@ -9395,31 +9408,38 @@ class PolymarketLPService:
                     'submit_status': 'unknown'})
         snapshot, error = None, None
         try:
-            snapshot = self._read_snapshot(self._normalize_request(session))
+            with _lp_read_stage("facts_read", timings):
+                snapshot = self._read_snapshot(self._normalize_request(session))
             if self._facts_validator and not report_only:
-                self._facts_validator(session, snapshot)
+                with _lp_read_stage("facts_validate", timings):
+                    self._facts_validator(session, snapshot)
         except (ValueError, RuntimeError, OSError) as exc:
             error = str(exc)
         if error and not report_only:
             # A failed read only removes permission to spend; an occupied
             # execution lock must not hide that failure behind an old lease.
             try:
-                session, _ = self.store.lp_publish_facts(
-                    session_id, revision, patch={'facts_error': error},
-                    publish=self._facts_publisher, error=error)
+                with _lp_read_stage("facts_failure_publish", timings):
+                    session, _ = self.store.lp_publish_facts(
+                        session_id, revision, patch={'facts_error': error},
+                        publish=self._facts_publisher, error=error)
             except ValueError as exc:
                 if str(exc) != 'session_changed':
                     raise
                 error = str(exc)
             return session, snapshot, revision, error
-        self._facts_apply_lock.acquire()
-        lock = apply_lock[0]() if apply_lock else None
+        with _lp_read_stage("facts_apply_wait", timings):
+            self._facts_apply_lock.acquire()
+        with _lp_read_stage("facts_execution_lock", timings):
+            lock = apply_lock[0]() if apply_lock else None
         if apply_lock and lock is None:
             self._facts_apply_lock.release()
             return session, snapshot, revision, "execution_lock"
         changed = False
         try:
-            with self._mutex:
+            with _lp_read_stage("facts_mutex_wait", timings):
+                self._mutex.acquire()
+            try:
                 current, current_revision = self.store.lp_session_with_revision(session_id, trading=True)
                 if current_revision != revision:
                     return session, snapshot, revision, "session_changed"
@@ -9428,8 +9448,9 @@ class PolymarketLPService:
                     if not error:
                         patch['trade_events'] = self._merge_report_trade_events(current, snapshot)
                     patch.update(report_checked_at=self._now(), report_error=error)
-                    current, _ = self.store.lp_publish_facts(
-                        session_id, revision, patch=patch, publish=self._facts_publisher)
+                    with _lp_read_stage("facts_report_publish", timings):
+                        current, _ = self.store.lp_publish_facts(
+                            session_id, revision, patch=patch, publish=self._facts_publisher)
                     return current, snapshot, revision, error
                 if not error:
                     try:
@@ -9463,14 +9484,17 @@ class PolymarketLPService:
                         if targets and all(statuses.get(oid) in TERMINAL_ORDER_STATES for oid in targets):
                             resolved_cancels.append(action['action_id'])
                 try:
-                    current, changed = self.store.lp_publish_facts(
-                        session_id, revision, patch=patch, state=state,
-                        publish=self._facts_publisher, error=error, resolved_cancels=resolved_cancels,
-                    )
+                    with _lp_read_stage("facts_publish", timings):
+                        current, changed = self.store.lp_publish_facts(
+                            session_id, revision, patch=patch, state=state,
+                            publish=self._facts_publisher, error=error, resolved_cancels=resolved_cancels,
+                        )
                 except ValueError as exc:
                     if str(exc) != 'session_changed':
                         raise
                     return session, snapshot, revision, 'session_changed'
+            finally:
+                self._mutex.release()
         finally:
             if apply_lock and lock is not None:
                 apply_lock[1](lock)

@@ -5726,16 +5726,18 @@ class PredictionExecutionService:
             if isinstance(attempts, int) and not isinstance(attempts, bool)
             else "5"
         )
+        retrying = failure.get("retry_seconds") == 300
+        retry_text = "暂时超时，改为每 5 分钟自动探测恢复。" if retrying else "自动重试已停止。"
         message = "\n".join(
             (
-                f"连续 {attempts_text} 次刷新失败，自动重试已停止。",
+                f"连续 {attempts_text} 次刷新失败，{retry_text}",
                 f"最后错误 {error_type} · 上次成功刷新 {last_success_clock or '从未成功'}",
-                "请重启 Dashboard 服务并检查 Polymarket 连接。",
+                "请检查 Prediction Service 的刷新阶段日志及 Polymarket 连接。",
             )
         )
         now_clock = beijing_clock(datetime.now(UTC)) or "未知"
         if self._deliver_feishu_notification(
-            f"❌ 行情刷新连续失败，需人工干预（{now_clock}）", message
+            f"❌ 行情刷新连续失败，{'等待自动恢复' if retrying else '需人工干预'}（{now_clock}）", message
         ):
             return {"state": "sent"}
         return {"state": "failed", "reason": "notification_failed"}

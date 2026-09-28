@@ -17,6 +17,7 @@ import subprocess
 import threading
 import time
 from copy import deepcopy
+from contextlib import contextmanager
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
@@ -548,6 +549,31 @@ def _safe_read_error_chain(exc: BaseException) -> tuple[str, ...]:
             cause = current.__context__
         current = cause if isinstance(cause, BaseException) else None
     return tuple(chain)
+
+
+@contextmanager
+def _lp_read_stage(stage: str, timings: dict[str, float] | None = None):
+    """Log failed or minute-long reads without messages, payloads or identities.
+
+    SDK pagination includes transport and decoding; its exception class chain
+    distinguishes those failures. Thread identity links nested stage timings.
+    """
+    started = time.monotonic()
+    error_types = ()
+    try:
+        yield
+    except Exception as exc:
+        error_types = _safe_read_error_chain(exc)
+        raise
+    finally:
+        elapsed = time.monotonic() - started
+        if timings is not None:
+            timings[stage] = round(elapsed, 3)
+        if error_types or elapsed >= 60:
+            logger.warning(
+                "lp_snapshot_stage stage=%s elapsed_seconds=%.3f error_types=%s thread=%s",
+                stage, elapsed, ">".join(error_types) or "none", threading.get_ident(),
+            )
 
 
 def _safe_history_response_facts(exc: BaseException) -> dict[str, object]:
@@ -1513,22 +1539,26 @@ class PolymarketTradingClient:
         self,
     ) -> tuple[Decimal, Decimal, tuple[object, ...], tuple[object, ...], datetime]:
         try:
-            p_usd_balance, p_usd_allowance = self._collateral_balance_allowance()
+            with _lp_read_stage("account_balance"):
+                p_usd_balance, p_usd_allowance = self._collateral_balance_allowance()
             checked_at = datetime.now(UTC)
-            raw_orders = self._client.list_open_orders()
-            if raw_orders is None:
-                raise ValueError("open_orders_unknown")
-            orders = tuple(_collect(raw_orders))
+            with _lp_read_stage("account_orders"):
+                raw_orders = self._client.list_open_orders()
+                if raw_orders is None:
+                    raise ValueError("open_orders_unknown")
+                orders = tuple(_collect(raw_orders))
             # This read is intentionally performed even though the snapshot only
             # stores open-order data; the authenticated preflight must prove it.
-            raw_trades = self._client.list_account_trades()
-            if raw_trades is None:
-                raise ValueError("account_trades_unknown")
-            _collect(raw_trades)
-            raw_positions = self._client.list_positions()
-            if raw_positions is None:
-                raise ValueError("positions_unknown")
-            positions = tuple(_collect(raw_positions))
+            with _lp_read_stage("account_trades"):
+                raw_trades = self._client.list_account_trades()
+                if raw_trades is None:
+                    raise ValueError("account_trades_unknown")
+                _collect(raw_trades)
+            with _lp_read_stage("account_positions"):
+                raw_positions = self._client.list_positions()
+                if raw_positions is None:
+                    raise ValueError("positions_unknown")
+                positions = tuple(_collect(raw_positions))
             return p_usd_balance, p_usd_allowance, orders, positions, checked_at
         except Exception as exc:
             code = _safe_error_code(exc)
@@ -3988,12 +4018,14 @@ class PolymarketTradingClient:
         if not market_id or not condition_id or not token_id:
             raise ValueError("external_snapshot_unknown")
         try:
-            account = self._lp_account_facts()
+            with _lp_read_stage("account"):
+                account = self._lp_account_facts()
             open_orders = account['open_orders']
-            raw_trades = self._client.list_account_trades(token_id=token_id, market=condition_id)
-            if raw_trades is None:
-                raise ValueError("external_snapshot_unknown")
-            trades = tuple(_collect(raw_trades))
+            with _lp_read_stage("session_trades"):
+                raw_trades = self._client.list_account_trades(token_id=token_id, market=condition_id)
+                if raw_trades is None:
+                    raise ValueError("external_snapshot_unknown")
+                trades = tuple(_collect(raw_trades))
             order_facts: list[object] = list(open_orders)
             known_ids = {
                 str(_field(order, "id", _field(order, "order_id", "")))
@@ -4013,7 +4045,8 @@ class PolymarketTradingClient:
                 if not callable(get_order):
                     continue
                 try:
-                    order = get_order(order_id=order_id)
+                    with _lp_read_stage("required_order"):
+                        order = get_order(order_id=order_id)
                 except Exception:
                     continue
                 normalized = _lp_order(order)
@@ -4021,21 +4054,26 @@ class PolymarketTradingClient:
                     order_facts.append(normalized)
                     known_ids.add(order_id)
 
-            public = self._public_client_factory()
+            with _lp_read_stage("public_client"):
+                public = self._public_client_factory()
             try:
-                market_model = public.get_market(id=market_id)
-                book_model = public.get_order_book(token_id=token_id)
-                # Capture local receipt time at the successful REST boundary;
-                # the venue timestamp remains source metadata on the book.
-                book_received_at = datetime.now(UTC)
+                with _lp_read_stage("market"):
+                    market_model = public.get_market(id=market_id)
+                with _lp_read_stage("book"):
+                    book_model = public.get_order_book(token_id=token_id)
+                    # Capture local receipt time at the successful REST boundary;
+                    # the venue timestamp remains source metadata on the book.
+                    book_received_at = datetime.now(UTC)
             finally:
                 close = getattr(public, "close", None)
                 if callable(close):
-                    close()
-            market = _model_dict(market_model)
-            book = _lp_book(book_model)
-            if market is None or book is None:
-                raise ValueError("external_snapshot_unknown")
+                    with _lp_read_stage("public_close"):
+                        close()
+            with _lp_read_stage("market_book_normalize"):
+                market = _model_dict(market_model)
+                book = _lp_book(book_model)
+                if market is None or book is None:
+                    raise ValueError("external_snapshot_unknown")
             book["received_at"] = book_received_at
             state = _model_dict(market.get("state")) or {}
             outcomes = _model_dict(market.get("outcomes")) or {}
@@ -4050,7 +4088,8 @@ class PolymarketTradingClient:
             if reward_min is None or reward_spread is None:
                 reward_reader = getattr(self._client, "list_market_rewards", None)
                 if callable(reward_reader):
-                    reward_rows = tuple(_collect(reward_reader(condition_id=condition_id)))
+                    with _lp_read_stage("market_rewards"):
+                        reward_rows = tuple(_collect(reward_reader(condition_id=condition_id)))
                     if reward_rows:
                         reward = _model_dict(reward_rows[0]) or {}
                         reward_min = reward.get("rewards_min_size")
@@ -4060,8 +4099,9 @@ class PolymarketTradingClient:
             taker_rate = fee_schedule.get("rate")
             if taker_rate is None:
                 taker_rate = market.get("taker_fee_rate")
-            if taker_rate is None and fees_enabled is not False:
-                raise ValueError("fee_rate_unknown")
+            with _lp_read_stage("market_validate"):
+                if taker_rate is None and fees_enabled is not False:
+                    raise ValueError("fee_rate_unknown")
             raw_reward_spread = _lp_decimal(reward_spread)
             normalized_reward_spread = (
                 None
@@ -4111,9 +4151,10 @@ class PolymarketTradingClient:
                 }
                 for order_id in order_ids
             )
-            trade_rows = [_lp_trade(trade) for trade in trades]
-            if any(row is None for row in trade_rows):
-                raise ValueError("external_snapshot_unknown")
+            with _lp_read_stage("trades_normalize"):
+                trade_rows = [_lp_trade(trade) for trade in trades]
+                if any(row is None for row in trade_rows):
+                    raise ValueError("external_snapshot_unknown")
             result: dict[str, object] = {
                 "account": account_facts,
                 "market": market_facts,

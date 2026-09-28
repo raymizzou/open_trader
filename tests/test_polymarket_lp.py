@@ -13864,3 +13864,142 @@ def test_manual_cumulative_fills_survive_trade_window_and_restart(tmp_path):
     assert after['sold_quantity'] == Decimal('40')
     assert after['buy_cost'] == Decimal('30')
     assert after['sold_revenue'] == Decimal('11.6')
+
+
+@pytest.mark.parametrize('failure', ['account_trades', 'market_transport', 'market_parse'])
+def test_snapshot_diagnostics_survive_error_translation_without_secrets(tmp_path, monkeypatch, caplog, failure):
+    import httpx
+    from polymarket import PublicClient
+    from polymarket.errors import TransportError
+    from open_trader import polymarket_trading
+
+    now = datetime.now(UTC)
+    secret = 'private-key=do-not-log Authorization=do-not-log account-order-id'
+    account = _SDKAccountClient(now)
+    public = PublicClient()
+    public._ctx.gamma._client.close()
+
+    def response(request):
+        if failure == 'market_transport':
+            raise httpx.ReadTimeout(secret, request=request)
+        return httpx.Response(200, json={'id': secret}, request=request)
+
+    public._ctx.gamma._client = httpx.Client(
+        base_url=public.environment.gamma_url, transport=httpx.MockTransport(response))
+    if failure == 'account_trades':
+        def failed_trades(**kwargs):
+            def pages():
+                try:
+                    raise httpx.ReadTimeout(secret)
+                except httpx.ReadTimeout as exc:
+                    raise TransportError(secret) from exc
+                yield  # lazy SDK pagination fails during collection
+            return pages()
+        monkeypatch.setattr(account, 'list_account_trades', failed_trades)
+    adapter = PolymarketTradingClient(
+        TradingConfig('0x' + '1' * 40, '0x' + '2' * 40), account,
+        public_client_factory=lambda: public)
+    service = PolymarketLPService(PredictionArbitrageStore(tmp_path / 'diagnostic.db'), adapter)
+    try:
+        with pytest.raises(ValueError, match='^external_snapshot_unknown$'):
+            service._read_snapshot(_request(now))
+    finally:
+        public.close()
+    records = [r for r in caplog.records if r.name == polymarket_trading.__name__]
+    assert records
+    message = '\n'.join(r.getMessage() for r in records)
+    assert f'stage={"account_trades" if failure == "account_trades" else "market"}' in message
+    assert 'elapsed_seconds=' in message
+    assert 'error_types=' in message
+    assert ('TransportError>ReadTimeout' if failure != 'market_parse' else 'ValidationError') in message
+    assert secret not in caplog.text
+    assert 'http' not in message
+    assert all(r.exc_info is None for r in records)
+
+
+def test_failed_reconcile_diagnostics_separate_capacity_read_and_publish(tmp_path, monkeypatch, caplog):
+    from open_trader import polymarket_trading
+
+    now = datetime.now(UTC)
+    store = PredictionArbitrageStore(tmp_path)
+    store.lp_create_session('session-secret', 'key-secret', state='entry_open',
+                            payload={**_request(now), 'entry_order_id': 'order-secret'})
+    exchange = _Exchange()
+    service = PolymarketLPService(store, exchange)
+    ticks = [0.0]
+    monkeypatch.setattr(polymarket_trading, 'time', SimpleNamespace(monotonic=lambda: ticks[0]))
+
+    class Capacity:
+        released = False
+        def acquire(self):
+            ticks[0] += 12
+        def release(self):
+            self.released = True
+
+    capacity = Capacity()
+    service._facts_capacity = capacity
+    def fail(request):
+        ticks[0] += 3
+        raise OSError('Authorization=secret')
+    monkeypatch.setattr(exchange, 'lp_snapshot', fail)
+    publish = store.lp_publish_facts
+    def delayed_publish(*args, **kwargs):
+        ticks[0] += 2
+        return publish(*args, **kwargs)
+    monkeypatch.setattr(store, 'lp_publish_facts', delayed_publish)
+
+    result = service.reconcile_facts('session-secret')
+    assert result[3] == 'external_snapshot_unknown'
+    assert store.lp_session('session-secret')['facts_error'] == 'external_snapshot_unknown'
+    assert capacity.released
+    summary = next(r.getMessage() for r in caplog.records if r.getMessage().startswith('lp_facts_timing'))
+    assert "'facts_capacity_wait': 12.0" in summary
+    assert "'facts_read': 3.0" in summary
+    assert "'facts_failure_publish': 2.0" in summary
+    assert 'secret' not in caplog.text
+
+
+def test_healthy_snapshot_diagnostics_remain_quiet(tmp_path, caplog):
+    now = datetime.now(UTC)
+    adapter = PolymarketTradingClient(
+        TradingConfig('0x' + '1' * 40, '0x' + '2' * 40), _SDKAccountClient(now),
+        public_client_factory=lambda: _SDKPublicClient(now))
+    service = PolymarketLPService(PredictionArbitrageStore(tmp_path), adapter)
+    assert service._read_snapshot(_request(now))['account']['authenticated'] is True
+    assert not [r for r in caplog.records if r.getMessage().startswith(('lp_snapshot_stage', 'lp_facts_timing'))]
+
+
+def test_slow_publication_diagnostics_release_locks(tmp_path, monkeypatch, caplog):
+    from open_trader import polymarket_trading
+
+    now = datetime.now(UTC)
+    store = PredictionArbitrageStore(tmp_path)
+    store.lp_create_session('session-secret', 'key-secret', state='entry_open',
+                            payload={**_request(now), 'entry_order_id': 'order-secret'})
+    exchange = _Exchange()
+    exchange.snapshot_value = _snapshot(now)
+    service = PolymarketLPService(store, exchange)
+    ticks = [0.0]
+    monkeypatch.setattr(polymarket_trading, 'time', SimpleNamespace(monotonic=lambda: ticks[0]))
+    publish = store.lp_publish_facts
+    def delayed_publish(*args, **kwargs):
+        ticks[0] += 61
+        return publish(*args, **kwargs)
+    monkeypatch.setattr(store, 'lp_publish_facts', delayed_publish)
+
+    result = service.reconcile_facts('session-secret', report_only=True)
+    assert result[3] is None
+    assert 'stage=facts_report_publish elapsed_seconds=61.000 error_types=none' in caplog.text
+    assert 'outcome=slow' in caplog.text
+    assert 'secret' not in caplog.text
+    assert service._facts_apply_lock.acquire(blocking=False)
+    service._facts_apply_lock.release()
+    acquired = []
+    def acquire_from_other_thread():
+        acquired.append(service._mutex.acquire(blocking=False))
+        if acquired[-1]:
+            service._mutex.release()
+    worker = threading.Thread(target=acquire_from_other_thread)
+    worker.start()
+    worker.join(timeout=2)
+    assert acquired == [True]

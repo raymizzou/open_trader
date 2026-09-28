@@ -2226,7 +2226,7 @@ function predictionFailureReasonLabel(payload) {
     universe_unavailable: "监控市场数据未返回",
     universe_stale: "监控市场数据已过期",
     universe_refresh_failed: "监控市场刷新失败",
-    universe_retry_exhausted: "监控市场连续刷新失败，已停止自动重试",
+    universe_retry_exhausted: "监控市场连续刷新失败",
     books_stale: "可参与盘口已过期",
     readiness_stale: "交易账户检查已过期",
     readiness_unavailable: "交易账户检查不可用",
@@ -5095,7 +5095,10 @@ function predictionExecutionAlert(payload, strategy = "yes_no") {
     const universeExhausted = health.universe_retry_exhausted === true
       || degradedReasons.includes("universe_retry_exhausted");
     if (strategy !== "llm_hedge" && universeExhausted) {
-      return `<section class="pm-alert danger" role="alert"><div class="pm-alert-body"><strong>监控市场连续 5 次刷新失败</strong><p>监控市场连续 5 次刷新失败，已停止自动重试；请重启承载预测监控的 Dashboard 服务并检查 Polymarket 连接。</p></div><span class="pm-pill watch">失败关闭</span></section>`;
+      const recovery = health.universe_retry_pending === true
+        ? "暂时超时，每 5 分钟自动探测恢复"
+        : "已停止自动重试";
+      return `<section class="pm-alert danger" role="alert"><div class="pm-alert-body"><strong>监控市场连续 5 次刷新失败</strong><p>监控市场连续 5 次刷新失败，${recovery}；请检查 Prediction Service 的刷新阶段日志及 Polymarket 连接。</p></div><span class="pm-pill watch">失败关闭</span></section>`;
     }
     if (
       strategy !== "llm_hedge"

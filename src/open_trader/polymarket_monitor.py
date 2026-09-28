@@ -528,7 +528,9 @@ class PolymarketMonitor:
         self._universe_failed = False
         self._universe_refresh_attempts = 0
         self._universe_retry_exhausted = False
+        self._universe_retry_pending = False
         self._universe_failure_notification_scheduled = False
+        self._universe_failure_notification_pending: dict[str, object] | None = None
         self._universe_failure_notification_task: asyncio.Task[object] | None = None
         self._relations_failed = False
         self._stream_message_at: datetime | None = None
@@ -1946,6 +1948,8 @@ class PolymarketMonitor:
         self._universe_refresh_attempts = 0
         self._universe_failed = False
         self._universe_retry_exhausted = False
+        self._universe_retry_pending = False
+        self._universe_failure_notification_pending = None
         self._catalog_scan_started_at = None
         self._activity_scan_started_at = None
 
@@ -2034,6 +2038,7 @@ class PolymarketMonitor:
             # Cancel pending follow-ups before activity-scan cleanup can schedule them.
             self._full_scan_pending = False
             self._activity_catchup_requested = False
+            self._universe_failure_notification_pending = None
             try:
                 tasks = []
                 for task_name in (
@@ -2088,14 +2093,31 @@ class PolymarketMonitor:
         subscribe: bool = True,
         block_observation_status: bool = True,
     ) -> None:
-        await asyncio.wait_for(
-            self._refresh_universe(
-                client,
-                subscribe=subscribe,
-                block_observation_status=block_observation_status,
-            ),
-            timeout=PUBLIC_REFRESH_TIMEOUT_SECONDS,
-        )
+        started = time.monotonic()
+        try:
+            await asyncio.wait_for(
+                self._refresh_universe(
+                    client,
+                    subscribe=subscribe,
+                    block_observation_status=block_observation_status,
+                ),
+                timeout=PUBLIC_REFRESH_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            self._record_error(exc, "universe")
+            with self._lock:
+                progress = self._diagnostics.get("universe_refresh", {})
+                progress.update(
+                    error_type=type(exc).__name__,
+                    elapsed_seconds=round(time.monotonic() - started, 3),
+                )
+            logger.warning(
+                "prediction_universe_refresh_failed stage=%s elapsed_seconds=%s "
+                "error_type=%s completed_stage_seconds=%s",
+                progress.get("stage"), progress.get("elapsed_seconds"),
+                type(exc).__name__, progress.get("completed_stage_seconds"),
+            )
+            raise
 
     async def _refresh_universe_if_due(
         self,
@@ -2104,7 +2126,9 @@ class PolymarketMonitor:
         current: float,
         next_refresh: float,
     ) -> tuple[float, bool]:
-        if self._universe_retry_exhausted or current < next_refresh:
+        if current < next_refresh or (
+            self._universe_retry_exhausted and not self._universe_retry_pending
+        ):
             return next_refresh, False
         try:
             await self._refresh_universe_bounded(
@@ -2118,11 +2142,19 @@ class PolymarketMonitor:
             )
             if self._universe_refresh_attempts >= UNIVERSE_MAX_ATTEMPTS:
                 self._universe_retry_exhausted = True
+                # Only proven transient deadline failures get recovery probes.
+                retry_pending = isinstance(exc, TimeoutError)
+                if self._universe_retry_pending and not retry_pending:
+                    self._universe_failure_notification_scheduled = False
+                self._universe_retry_pending = retry_pending
                 self._schedule_universe_failure_notification(exc)
+                return self._monotonic() + UNIVERSE_REFRESH_SECONDS, False
             return self._monotonic() + UNIVERSE_RETRY_SECONDS, False
         self._universe_failed = False
         self._universe_refresh_attempts = 0
         self._universe_retry_exhausted = False
+        self._universe_retry_pending = False
+        self._universe_failure_notification_scheduled = False
         if self._thread_recovery_pending:
             self._thread_recovery_pending = False
             self._thread_consecutive_crashes = 0
@@ -2182,28 +2214,38 @@ class PolymarketMonitor:
                 self._universe_at.isoformat() if self._universe_at is not None else None
             ),
         }
-        self._universe_failure_notification_task = asyncio.create_task(
-            asyncio.to_thread(observer, payload)
-        )
+        if self._universe_retry_pending:
+            payload["retry_seconds"] = UNIVERSE_REFRESH_SECONDS
+        # ponytail: latest pending episode only; use a durable outbox if every episode must survive stalled delivery.
+        self._universe_failure_notification_pending = payload
+        self._reap_universe_failure_notification_task()
 
     def _reap_universe_failure_notification_task(self) -> None:
         task = self._universe_failure_notification_task
-        if task is None or not task.done():
-            return
-        self._universe_failure_notification_task = None
-        try:
-            result = task.result()
-        except asyncio.CancelledError:
-            return
-        except Exception as exc:
-            self._diagnostics["universe_notification_error"] = type(exc).__name__
-            return
-        if isinstance(result, Mapping) and result.get("state") != "sent":
-            reason = str(result.get("reason") or "notification_failed")
-            self._diagnostics["universe_notification_error"] = "".join(
-                character if character.isalnum() or character in "_-" else "_"
-                for character in reason
-            )[:80]
+        if task is not None:
+            if not task.done():
+                return
+            self._universe_failure_notification_task = None
+            try:
+                result = task.result()
+            except asyncio.CancelledError:
+                result = None
+            except Exception as exc:
+                self._diagnostics["universe_notification_error"] = type(exc).__name__
+                result = None
+            if isinstance(result, Mapping) and result.get("state") != "sent":
+                reason = str(result.get("reason") or "notification_failed")
+                self._diagnostics["universe_notification_error"] = "".join(
+                    character if character.isalnum() or character in "_-" else "_"
+                    for character in reason
+                )[:80]
+        payload = self._universe_failure_notification_pending
+        observer = self._failure_observer
+        if payload is not None and observer is not None and not self._stop_event.is_set():
+            self._universe_failure_notification_pending = None
+            self._universe_failure_notification_task = asyncio.create_task(
+                asyncio.to_thread(observer, payload)
+            )
 
     def _schedule_llm_failure_notification(self, validation: object) -> None:
         observer = self._failure_observer
@@ -2388,6 +2430,19 @@ class PolymarketMonitor:
         subscribe: bool = True,
         block_observation_status: bool = True,
     ) -> None:
+        progress: dict[str, Any] = {"stage": "events", "completed_stage_seconds": {}}
+        with self._lock:
+            self._diagnostics["universe_refresh"] = progress
+        stage_started = time.monotonic()
+
+        def phase(name: str) -> None:
+            nonlocal stage_started
+            now = time.monotonic()
+            with self._lock:
+                progress["completed_stage_seconds"][progress["stage"]] = round(now - stage_started, 3)
+                progress["stage"] = name
+            stage_started = now
+
         list_events = getattr(client, "list_events", None)
         if not callable(list_events):
             raise RuntimeError("public client has no list_events")
@@ -2400,6 +2455,7 @@ class PolymarketMonitor:
             page_size=TOP_EVENT_LIMIT,
         )
         rows = await _collect_first_page(raw)
+        phase("normalize")
         normalized: list[dict[str, object]] = []
         malformed_events = 0
         for row in rows:
@@ -2449,8 +2505,6 @@ class PolymarketMonitor:
             self._markets = markets
             self._market_by_token = token_map
             self._diagnostics["malformed_events"] = malformed_events
-            self._universe_at = self._now()
-            self._universe_failed = False
             current_union = (
                 set(self._market_by_token)
                 | set(self._relation_by_token)
@@ -2460,7 +2514,9 @@ class PolymarketMonitor:
                 self._subscription_dirty = True
         self._apply_cached_title_projections()
         self._enqueue_title_translations(normalized)
+        phase("readiness")
         await self._refresh_readiness()
+        phase("books")
         semaphore = asyncio.Semaphore(PUBLIC_BOOK_CONCURRENCY)
 
         async def confirm(
@@ -2480,12 +2536,15 @@ class PolymarketMonitor:
         for opportunity in confirmed:
             if opportunity is not None:
                 current_opportunities[str(opportunity["opportunity_id"])] = opportunity
+        phase("observation")
         if block_observation_status:
             await self._refresh_observation_network_bounded(client)
         else:
             self._schedule_observation_source_status(client)
+        phase("subscription")
         if subscribe:
             await self._refresh_subscription_if_dirty(client)
+        phase("publish")
         with self._lock:
             current_opportunities.update(
                 {
@@ -2543,6 +2602,10 @@ class PolymarketMonitor:
                     scope="refresh",
                     reason=type(exc).__name__,
                 )
+        with self._lock:
+            self._universe_at = self._now()
+            self._universe_failed = False
+        phase("complete")
         self._emit_health_log(force=True)
 
     def _log_relation_scan(self, **fields: object) -> None:
@@ -5876,6 +5939,7 @@ class PolymarketMonitor:
             "readiness_age_seconds": _display_age(_age(now, readiness_at if isinstance(readiness_at, datetime) else None)),
             "universe_refresh_attempts": self._universe_refresh_attempts,
             "universe_retry_exhausted": self._universe_retry_exhausted,
+            "universe_retry_pending": self._universe_retry_pending,
         }
 
     def _now(self) -> datetime:
