@@ -109,6 +109,10 @@ if command == "launchctl":
     if action == "bootout":
         case = state["case"]
         old_pid = state["pid"]
+        if state.get("runtime_lock_directory_after_bootout"):
+            lock_path = Path(os.environ["FAKE_DATA_DIR"]) / "prediction_arbitrage/runtime.lock"
+            lock_path.unlink()
+            lock_path.mkdir()
         state.setdefault("bootout_pids", []).append(old_pid)
         grace_polls = int(state.get("bootout_grace_polls", 0))
         state.update(loaded=False, pid=0, cwd="", listener=False,
@@ -968,6 +972,107 @@ def test_same_sha_ready_install_is_a_noop(release_harness: ReleaseHarness) -> No
     assert "already ready" in result.stdout
     assert all(" bootout " not in f" {call} " for call in release_harness.calls.all())
     assert all(" bootstrap " not in f" {call} " for call in release_harness.calls.all())
+
+
+def test_managed_owner_lock_contention_is_a_quiet_probe(
+    release_harness: ReleaseHarness,
+) -> None:
+    release_harness.install(mode="production", check=True)
+    lock_path = release_harness.runtime_root / "data/prediction_arbitrage/runtime.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = release_harness.install(mode="production", owner_probe=False)
+
+    assert result.returncode == 0
+    assert "already ready" in result.stdout
+    assert result.stderr == ""
+
+
+def test_unmanaged_owner_lock_contention_blocks_install(
+    release_harness: ReleaseHarness,
+) -> None:
+    release_harness.configure("unknown_owner")
+    lock_path = release_harness.runtime_root / "data/prediction_arbitrage/runtime.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = release_harness.install(mode="production", owner_probe=False)
+
+    assert result.returncode == 1
+    assert "prediction runtime owner is held by an unknown process" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert all(
+        "bootout" not in call and "bootstrap" not in call
+        for call in release_harness.calls.named("launchctl")
+    )
+
+
+def test_owner_lock_probe_error_blocks_install(
+    release_harness: ReleaseHarness,
+) -> None:
+    lock_path = release_harness.runtime_root / "data/prediction_arbitrage/runtime.lock"
+    lock_path.mkdir(parents=True)
+
+    result = release_harness.install(mode="production", owner_probe=False)
+
+    assert result.returncode == 1
+    assert "prediction runtime ownership probe failed: IsADirectoryError" in result.stderr
+    assert all(
+        "bootout" not in call and "bootstrap" not in call
+        for call in release_harness.calls.named("launchctl")
+    )
+
+
+def test_owner_lock_probe_io_cause_is_reported(
+    release_harness: ReleaseHarness,
+) -> None:
+    checkout = release_harness.candidate
+    runtime_source = checkout.path / "src/open_trader/prediction_runtime.py"
+    source = runtime_source.read_text(encoding="utf-8")
+    source = source.replace(
+        "fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)",
+        "raise OSError(5, 'synthetic flock I/O failure')", 1,
+    )
+    runtime_source.write_text(source, encoding="utf-8")
+    subprocess.run(["git", "-C", str(checkout.path), "add", str(runtime_source)], check=True)
+    subprocess.run(
+        ["git", "-C", str(checkout.path), "-c", "user.name=test", "-c",
+         "user.email=test@example.com", "commit", "-qm", "synthetic lock I/O error"],
+        check=True,
+    )
+
+    result = release_harness.install(owner_probe=False)
+
+    assert result.returncode == 1
+    assert "prediction runtime ownership probe failed: OSError: [Errno 5] synthetic flock I/O failure" in result.stderr
+    assert all("bootstrap" not in call for call in release_harness.calls.named("launchctl"))
+
+
+def test_owner_lock_probe_error_after_bootout_records_failure(
+    release_harness: ReleaseHarness,
+) -> None:
+    old = release_harness.candidate
+    new = release_harness.make_checkout("new-candidate")
+    release_harness.install(old, check=True)
+    release_harness.calls.clear()
+    state = release_harness.state
+    state["runtime_lock_directory_after_bootout"] = True
+    release_harness.state_path.write_text(json.dumps(state), encoding="utf-8")
+    lock_path = release_harness.runtime_root / "data/prediction_arbitrage/runtime.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = release_harness.install(new, owner_probe=False)
+
+    assert result.returncode == 1
+    assert "prediction runtime ownership probe failed: IsADirectoryError" in result.stderr
+    assert "candidate_cleanup_not_proven" in result.stderr
+    record = release_harness.runtime_record
+    assert record is not None
+    assert record["state"] == "failed"
+    assert record["failure_reason"] == "candidate_cleanup_not_proven"
+    assert all("bootstrap" not in call for call in release_harness.calls.named("launchctl"))
 
 
 @pytest.mark.parametrize("field", ["reader_generation", "contract_generation"])

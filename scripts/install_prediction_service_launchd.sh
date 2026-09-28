@@ -486,14 +486,29 @@ PY
     "$OWNER_PROBE_BIN" "$DATA_DIR"
     return
   fi
-  PYTHONPATH="$MANAGER_SRC" "$PYTHON_BIN" - "$DATA_DIR" <<'PY'
+  local status
+  if PYTHONPATH="$MANAGER_SRC" "$PYTHON_BIN" - "$DATA_DIR" <<'PY'; then
 from pathlib import Path
 import sys
-from open_trader.prediction_runtime import _RuntimeOwnershipLock
-lock = _RuntimeOwnershipLock(Path(sys.argv[1]) / "prediction_arbitrage" / "runtime.lock")
-lock.acquire()
-lock.release()
+try:
+    from open_trader.prediction_runtime import PredictionRuntimeOwnershipError, _RuntimeOwnershipLock
+    lock = _RuntimeOwnershipLock(Path(sys.argv[1]) / "prediction_arbitrage" / "runtime.lock")
+    try:
+        lock.acquire()
+    except PredictionRuntimeOwnershipError as exc:
+        if isinstance(exc.__cause__, BlockingIOError):
+            raise SystemExit(1)
+        raise exc.__cause__ or exc
+    lock.release()
+except Exception as exc:
+    print(f"prediction runtime ownership probe failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+    raise SystemExit(2)
 PY
+    return 0
+  else
+    status=$?
+  fi
+  return "$status"
 }
 
 remove_managed_plist() {
@@ -776,7 +791,12 @@ if [[ "$LABEL_LOADED" -eq 1 ]]; then
 fi
 
 OWNER_AVAILABLE=0
-if owner_available; then OWNER_AVAILABLE=1; fi
+if owner_available; then
+  OWNER_AVAILABLE=1
+else
+  OWNER_PROBE_STATUS=$?
+  [[ "$OWNER_PROBE_STATUS" -eq 1 ]] || preflight_fail "prediction runtime ownership probe failed"
+fi
 LOCK_OWNER_PIDS=""
 if [[ "$LABEL_LOADED" -eq 1 ]]; then
   LOCK_OWNER_PIDS="$(lock_owner_pids || true)"
@@ -1116,7 +1136,12 @@ PY
     return 1
   fi
   fresh_owner_available=0
-  if owner_available; then fresh_owner_available=1; fi
+  if owner_available; then
+    fresh_owner_available=1
+  else
+    status=$?
+    [[ "$status" -eq 1 ]] || return 1
+  fi
   [[ "$fresh_owner_available" -eq 0 ]] || return 1
   fresh_lock_pids="$(lock_owner_pids || true)"
   [[ "$fresh_lock_pids" == "$LOCK_OWNER_PIDS" ]] || return 1
