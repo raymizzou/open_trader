@@ -84,6 +84,8 @@ RELATION_VALIDATION_RETRY_SECONDS = LLM_NO_BALANCE_RETRY_SECONDS
 RELATION_VALIDATION_TRANSIENT_RETRY_SECONDS = LLM_CIRCUIT_COOLDOWN_SECONDS
 RELATION_RESCAN_MIN_INTERVAL_SECONDS = 2.0
 MONITOR_THREAD_MAX_CONSECUTIVE_CRASHES = 10
+MONITOR_THREAD_RECOVERY_SECONDS = 300.0
+MONITOR_CLEANUP_CHECK_SECONDS = 5.0
 MONITOR_THREAD_CRASH_NOTIFY_INTERVAL_SECONDS = 300.0
 MONITOR_THREAD_BACKOFF_MAX_SECONDS = 60.0
 
@@ -1871,34 +1873,12 @@ class PolymarketMonitor:
                 self._thread_last_crash_at = self._now()
                 self._thread_last_crash_error_type = type(exc).__name__
                 self._thread_recovery_pending = True
-                if (
-                    self._thread_consecutive_crashes
-                    >= MONITOR_THREAD_MAX_CONSECUTIVE_CRASHES
-                ):
-                    observer = self._failure_observer
-                    if observer is not None:
-                        try:
-                            await asyncio.to_thread(
-                                observer,
-                                {
-                                    "component": "monitor_thread",
-                                    "event": "gave_up",
-                                    "error_type": self._thread_last_crash_error_type,
-                                    "crashed_at": self._thread_last_crash_at.isoformat(),
-                                    "consecutive": self._thread_consecutive_crashes,
-                                    "restarts": self._thread_restarts,
-                                },
-                            )
-                        except Exception as notify_exc:
-                            self._diagnostics["thread_notification_error"] = type(
-                                notify_exc
-                            ).__name__
-                    self._thread_status = "gave_up"
-                    return
-                delay = min(
-                    2 ** (self._thread_consecutive_crashes - 1),
-                    MONITOR_THREAD_BACKOFF_MAX_SECONDS,
+                delay = (
+                    MONITOR_THREAD_RECOVERY_SECONDS
+                    if self._thread_consecutive_crashes >= MONITOR_THREAD_MAX_CONSECUTIVE_CRASHES
+                    else min(2 ** (self._thread_consecutive_crashes - 1), MONITOR_THREAD_BACKOFF_MAX_SECONDS)
                 )
+                self._thread_status = 'cooling_down'
                 observer = self._failure_observer
                 notified_at = self._thread_last_crash_notified_at
                 rate_limited = (
@@ -1929,10 +1909,12 @@ class PolymarketMonitor:
                 if self._stop_event.is_set():
                     return
                 self._reset_dead_loop_state()
+                self._thread_status = "running"
 
     def _reset_dead_loop_state(self) -> None:
         for task_name in (
             "_full_scan_task",
+            "_thread_notification_task",
             "_activity_scan_task",
             "_codex_task",
             "_notification_task",
@@ -1950,6 +1932,8 @@ class PolymarketMonitor:
         self._universe_retry_exhausted = False
         self._universe_retry_pending = False
         self._universe_failure_notification_pending = None
+        self._universe_failure_notification_scheduled = False
+        self._universe_last_error_type = None
         self._catalog_scan_started_at = None
         self._activity_scan_started_at = None
 
@@ -2043,6 +2027,7 @@ class PolymarketMonitor:
                 tasks = []
                 for task_name in (
                     "_full_scan_task",
+                    "_thread_notification_task",
                     "_activity_scan_task",
                     "_codex_task",
                     "_notification_task",
@@ -2055,8 +2040,24 @@ class PolymarketMonitor:
                     task = getattr(self, task_name)
                     setattr(self, task_name, None)
                     if task is not None:
-                        task.cancel()
+                        # Cancelling to_thread only cancels its wrapper. Drain
+                        # real actions/notifications before creating successors.
+                        if task_name not in {
+                            '_codex_task', '_auto_eat_task', '_notification_task',
+                            '_universe_failure_notification_task', '_llm_failure_notification_task',
+                            '_thread_notification_task',
+                        }:
+                            task.cancel()
                         tasks.append((task_name, task))
+                pending = {task for _, task in tasks}
+                while pending:
+                    _, pending = await asyncio.wait(pending, timeout=MONITOR_CLEANUP_CHECK_SECONDS)
+                    if pending:
+                        self._thread_status = 'cleanup_blocked'
+                        self._diagnostics['cleanup_pending_tasks'] = len(pending)
+                        # Do not start a replacement while old tasks can still
+                        # publish or submit. Health remains explicit meanwhile.
+                self._diagnostics.pop('cleanup_pending_tasks', None)
                 results = await asyncio.gather(*(task for _, task in tasks), return_exceptions=True)
                 cleanup_error = None
                 for (task_name, _), result in zip(tasks, results):
@@ -2079,7 +2080,14 @@ class PolymarketMonitor:
                     if callable(close):
                         original_error = sys.exception()
                         try:
-                            await _call(close)
+                            closing = asyncio.create_task(_call(close))
+                            while not closing.done():
+                                _, pending = await asyncio.wait({closing}, timeout=MONITOR_CLEANUP_CHECK_SECONDS)
+                                if pending:
+                                    self._thread_status = 'cleanup_blocked'
+                                    self._diagnostics['cleanup_pending_tasks'] = 1
+                            closing.result()
+                            self._diagnostics.pop('cleanup_pending_tasks', None)
                         except Exception as close_error:
                             logger.exception("prediction_monitor_client_close_failed")
                             if original_error is None:
@@ -2126,9 +2134,7 @@ class PolymarketMonitor:
         current: float,
         next_refresh: float,
     ) -> tuple[float, bool]:
-        if current < next_refresh or (
-            self._universe_retry_exhausted and not self._universe_retry_pending
-        ):
+        if current < next_refresh:
             return next_refresh, False
         try:
             await self._refresh_universe_bounded(
@@ -2136,17 +2142,18 @@ class PolymarketMonitor:
             )
         except Exception as exc:
             self._record_error(exc, "universe")
+            error_type = type(exc).__name__
+            if getattr(self, '_universe_last_error_type', None) not in (None, error_type):
+                self._universe_failure_notification_scheduled = False
+            self._universe_last_error_type = error_type
             self._universe_refresh_attempts = min(
                 self._universe_refresh_attempts + 1,
                 UNIVERSE_MAX_ATTEMPTS,
             )
             if self._universe_refresh_attempts >= UNIVERSE_MAX_ATTEMPTS:
                 self._universe_retry_exhausted = True
-                # Only proven transient deadline failures get recovery probes.
-                retry_pending = isinstance(exc, TimeoutError)
-                if self._universe_retry_pending and not retry_pending:
-                    self._universe_failure_notification_scheduled = False
-                self._universe_retry_pending = retry_pending
+                # Read errors affect cadence, never future read-only probes.
+                self._universe_retry_pending = True
                 self._schedule_universe_failure_notification(exc)
                 return self._monotonic() + UNIVERSE_REFRESH_SECONDS, False
             return self._monotonic() + UNIVERSE_RETRY_SECONDS, False
@@ -2155,6 +2162,7 @@ class PolymarketMonitor:
         self._universe_retry_exhausted = False
         self._universe_retry_pending = False
         self._universe_failure_notification_scheduled = False
+        self._universe_last_error_type = None
         if self._thread_recovery_pending:
             self._thread_recovery_pending = False
             self._thread_consecutive_crashes = 0
@@ -5900,6 +5908,8 @@ class PolymarketMonitor:
 
     def _health(self, now: datetime) -> dict[str, object]:
         reasons: list[str] = []
+        if self._thread_recovery_pending or self._thread_status == 'cleanup_blocked':
+            reasons.append('monitor_recovering')
         if self._store_failed:
             reasons.append("store_write_failed")
         if self._universe_at is None:

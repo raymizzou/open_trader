@@ -104,7 +104,7 @@ def test_default_configure_enable_and_idempotent_round(tmp_path):
         e.lp_auto_configure(dict(budget_usd='120',target_buy_count=5))
 
 
-def test_full_pool_manual_exclusion_unknown_blocks_and_restart(tmp_path):
+def test_full_pool_manual_exclusion_unknown_isolated_and_restart(tmp_path):
     e,x,lp,s=setup(tmp_path,13)
     x.orders=[dict(order_id=f'manual{i}',condition_id=f'm{i:02}',token_id=f'm{i:02}',side='BUY',
                    status='LIVE',price='.4',original_size='1',size_matched='0') for i in range(11)]
@@ -112,15 +112,15 @@ def test_full_pool_manual_exclusion_unknown_blocks_and_restart(tmp_path):
     e.lp_auto_set_desired_running(True)
     x.fail=True
     r=e.lp_auto_run_once()
-    assert len(x.posts)==1, r['last_round']
-    assert x.posts[0]['token_id']=='m11'
-    assert r['slots']['occupied']==1
+    assert len(x.posts)==2, r['last_round']
+    assert [p['token_id'] for p in x.posts] == ['m11', 'm12']
+    assert r['slots']['occupied']==2
     assert 'submission_unknown' in r['block_reasons']
     e.lp_auto_run_once()
-    assert len(x.posts)==1
+    assert len(x.posts)==2
     e2=PredictionExecutionService(store=s,monitor=SimpleNamespace(),trading=x,notifier=SimpleNamespace(),lock_path=tmp_path/'execution.lock',lp=lp)
     e2.lp_auto_run_once()
-    assert len(x.posts)==1
+    assert len(x.posts)==2
     assert e2.lp_auto_state()['run_id']==r['run_id']
 
 
@@ -233,18 +233,19 @@ def test_unknown_with_reliable_id_reconciles_without_resubmit(tmp_path):
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=2))
     e.lp_auto_set_desired_running(True)
     create=x.lp_create_limit_order
-    x.lp_create_limit_order=lambda **kwargs:{**create(**kwargs),'order_id':'known-id'}
+    x.lp_create_limit_order=lambda **kwargs:{**create(**kwargs),'order_id':'known-' + kwargs['token_id']}
     x.fail=True
     r=e.lp_auto_run_once()
-    assert len(x.posts)==1
+    assert len(x.posts)==2
     assert 'submission_unknown' in r['block_reasons']
     e.lp_auto_set_desired_running(False)
-    x.orders.append(dict(order_id='known-id',token_id='m00',condition_id='m00',side='BUY',status='LIVE',price='.4',original_size='20',size_matched='0'))
+    for token in ('m00', 'm01'):
+        x.orders.append(dict(order_id='known-' + token,token_id=token,condition_id=token,side='BUY',status='LIVE',price='.4',original_size='20',size_matched='0'))
     x.fail=False
     r=e.lp_auto_run_once()
     assert 'submission_unknown' not in r['block_reasons']
     assert r['desired_running'] is False
-    assert len(x.posts)==1
+    assert len(x.posts)==2
 
 
 def test_partial_buy_cancel_releases_only_unfilled_and_config_deficit(tmp_path):
@@ -366,7 +367,7 @@ def test_account_switch_cannot_reconcile_another_wallets_pool(tmp_path):
     assert 'account_identity_unknown' in e.lp_auto_reconcile_unknown()['block_reasons']
     e.lp_auto_run_once()
     after=e.lp_auto_report_facts()
-    assert after['funds']==before['funds']
+    assert after['funds'] == {**before['funds'], 'spendable_usd': None}
     assert after['events']==before['events']
     assert len(x.posts)==1
     with pytest.raises(ValueError,match='account_identity'):

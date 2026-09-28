@@ -781,3 +781,115 @@ def test_slow_dashboard_does_not_block_session_and_funds_publication(tmp_path):
         finally:
             release.set()
         dashboard.result(timeout=5)
+
+
+def test_slow_session_does_not_block_another_market_buy(tmp_path):
+    execution, exchange, lp, _ = setup(tmp_path, 2)
+    second = lp._candidate_pool.pop('m01')
+    execution.lp_auto_configure(dict(budget_usd='100', target_buy_count=2))
+    execution.lp_auto_set_desired_running(True)
+    execution.lp_auto_run_once()
+    lp._candidate_pool['m01'] = second
+    entered, release = Event(), Event()
+    read = exchange.lp_snapshot
+    calls = []
+
+    def delayed(request):
+        if request['token_id'] == 'm00':
+            calls.append('m00')
+            entered.set()
+            assert release.wait(5)
+        return read(request)
+
+    exchange.lp_snapshot = delayed
+    with ThreadPoolExecutor(1) as workers:
+        result = workers.submit(execution.lp_auto_run_once)
+        try:
+            assert entered.wait(2)
+            state = result.result(timeout=2)
+            assert [p['token_id'] for p in exchange.posts] == ['m00', 'm01']
+            assert Decimal(state['funds']['buy_reserved_usd']) >= 16
+            execution.lp_auto_run_once()
+            assert calls == ['m00'], 'do not stack reads behind the stalled session'
+        finally:
+            release.set()
+        result.result(timeout=5)
+
+
+def test_failed_session_keeps_capital_but_allows_other_market_buy(tmp_path):
+    execution, exchange, lp, _ = setup(tmp_path, 2)
+    second = lp._candidate_pool.pop('m01')
+    execution.lp_auto_configure(dict(budget_usd='16', target_buy_count=2))
+    execution.lp_auto_set_desired_running(True)
+    execution.lp_auto_run_once()
+    lp._candidate_pool['m01'] = second
+    read = exchange.lp_snapshot
+
+    def failed(request):
+        if request['token_id'] == 'm00':
+            raise ValueError('order_schema_unknown')
+        return read(request)
+
+    exchange.lp_snapshot = failed
+    state = execution.lp_auto_run_once()
+    assert [p['token_id'] for p in exchange.posts] == ['m00', 'm01']
+    assert Decimal(state['funds']['buy_reserved_usd']) >= 16
+    assert state['funds']['status'] == 'unknown', 'do not present partial facts as complete'
+    assert Decimal(state['funds']['spendable_usd']) == 0
+
+
+def test_market_read_timeout_discards_late_result_and_preserves_other_capacity(tmp_path):
+    _, exchange, lp, _ = setup(tmp_path, 2)
+    lp._market_read_timeout = .02
+    lp._facts_owner.session_id = 'test-session'
+    entered, release, finished = Event(), Event(), Event()
+    original = exchange.lp_snapshot
+    calls = []
+
+    def delayed(request):
+        if request['token_id'] == 'm00':
+            calls.append('m00')
+            entered.set()
+            assert release.wait(5)
+            finished.set()
+        return original(request)
+
+    exchange.lp_snapshot = delayed
+    slow = dict(condition_id='m00', token_id='m00')
+    try:
+        with pytest.raises(ValueError, match='market_read_timeout'):
+            lp._read_snapshot(slow)
+        assert entered.is_set()
+        with pytest.raises(ValueError, match='market_read_in_progress'):
+            lp._read_snapshot(slow)
+        assert lp._read_snapshot(dict(condition_id='m01', token_id='m01'))['market']['token_id'] == 'm01'
+        assert calls == ['m00']
+    finally:
+        release.set()
+    assert finished.wait(2)
+    with pytest.raises(ValueError, match='market_read_cooling_down'):
+        lp._read_snapshot(slow)
+    lp._market_read_retry['m00'] = 0
+    assert lp._read_snapshot(slow)['market']['token_id'] == 'm00'
+    assert calls == ['m00', 'm00'], 'late abandoned result must not become fresh facts'
+
+
+def test_order_identity_mismatch_cannot_use_isolated_funds(tmp_path):
+    execution, exchange, lp, _ = setup(tmp_path, 2)
+    second = lp._candidate_pool.pop('m01')
+    execution.lp_auto_configure(dict(budget_usd='100', target_buy_count=2))
+    execution.lp_auto_set_desired_running(True)
+    execution.lp_auto_run_once()
+    lp._candidate_pool['m01'] = second
+    read = exchange.lp_snapshot
+
+    def conflict(request):
+        snapshot = read(request)
+        snapshot['orders'] = [{**order, 'token_id': 'wrong-token'} for order in snapshot['orders']]
+        return snapshot
+
+    exchange.lp_snapshot = conflict
+    state = execution.lp_auto_run_once()
+    assert len(exchange.posts) == 1
+    assert 'unbounded_financial_uncertainty' in state['admission_block_reasons']
+    assert state['funds']['spendable_usd'] is None

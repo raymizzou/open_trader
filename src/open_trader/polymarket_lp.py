@@ -6,6 +6,7 @@ import logging
 import math
 import threading
 import uuid
+from time import monotonic
 from copy import deepcopy
 from contextlib import nullcontext
 from collections.abc import Callable, Collection, Mapping, MutableMapping, Sequence
@@ -774,6 +775,10 @@ class PolymarketLPService:
         self._facts_apply_lock = threading.Lock()
         self._facts_inflight: dict[str, dict] = {}
         self._facts_capacity = threading.BoundedSemaphore(2)
+        self._market_reads_lock = threading.Lock()
+        self._market_reads = {}
+        self._market_read_retry = {}
+        self._market_read_timeout = 10.0
         self._facts_publisher = None
         self._facts_validator = None
         self._facts_wakeup = None
@@ -6658,6 +6663,9 @@ class PolymarketLPService:
     ) -> dict[str, object]:
         """Read market facts shared by entry qualification and resting BUY ranking."""
 
+        return self._market_read(identity, lambda: self._fetch_candidate_facts(identity))
+
+    def _fetch_candidate_facts(self, identity):
         condition_id = str(identity.get("condition_id") or "").strip()
         token_id = str(identity.get("token_id") or "").strip()
         outcome = str(identity.get("outcome") or "").upper()
@@ -10253,6 +10261,51 @@ class PolymarketLPService:
         return result
 
     def _read_snapshot(self, request: Mapping[str, object]) -> Mapping[str, object]:
+        if getattr(self._facts_owner, 'session_id', None):
+            return self._market_read(request, lambda: self._fetch_snapshot(request))
+        return self._fetch_snapshot(request)
+
+    def _market_read(self, identity, read):
+        """Bound waiting without pretending a Python thread can be cancelled.
+
+        Workers only return read data. An abandoned result is never applied;
+        the existing trading revision still fences accepted session snapshots.
+        """
+        key = str(identity.get('condition_id') or identity.get('token_id') or '')
+        with self._market_reads_lock:
+            existing = self._market_reads.get(key)
+            if existing is not None:
+                if not existing.done():
+                    raise ValueError('market_read_in_progress')
+                self._market_reads.pop(key)
+            if monotonic() < self._market_read_retry.get(key, 0):
+                raise ValueError('market_read_cooling_down')
+            if sum(not job.done() for job in self._market_reads.values()) >= 2:
+                raise ValueError('market_read_capacity')
+            future = Future()
+            self._market_reads[key] = future
+        owner_session = getattr(self._facts_owner, 'session_id', None)
+        def run():
+            self._facts_owner.session_id = owner_session
+            try:
+                future.set_result(read())
+            except BaseException as exc:
+                future.set_exception(exc)
+            finally:
+                self._facts_owner.session_id = None
+        threading.Thread(target=run, daemon=True, name='lp-market-read').start()
+        try:
+            return future.result(timeout=self._market_read_timeout)
+        except TimeoutError as exc:
+            with self._market_reads_lock:
+                self._market_read_retry[key] = monotonic() + 300
+            raise ValueError('market_read_timeout') from exc
+        finally:
+            with self._market_reads_lock:
+                if future.done() and self._market_reads.get(key) is future:
+                    self._market_reads.pop(key)
+
+    def _fetch_snapshot(self, request):
         for name in ("lp_snapshot", "snapshot"):
             method = getattr(self.exchange, name, None)
             if not callable(method):
@@ -12459,6 +12512,7 @@ class PolymarketLPService:
                 previous_status = str(previous.get("status") or "").upper()
                 if previous_status not in TERMINAL_ORDER_STATES:
                     previous["status"] = "UNKNOWN"
+                    previous['read_error'] = (snapshot.get('order_read_errors') or {}).get(order_id, 'order_receipt_unknown')
                 previous.setdefault("order_id", order_id)
                 history[order_id] = previous
                 continue
@@ -12473,6 +12527,7 @@ class PolymarketLPService:
             if not status:
                 raise ValueError("owned_order_status_unknown")
             current = dict(previous)
+            current.pop('read_error', None)
             current.update(
                 {
                     "order_id": order_id,

@@ -14003,3 +14003,30 @@ def test_slow_publication_diagnostics_release_locks(tmp_path, monkeypatch, caplo
     worker.start()
     worker.join(timeout=2)
     assert acquired == [True]
+
+
+@pytest.mark.parametrize('wrapped', [False, True])
+def test_null_order_response_stays_unknown_with_specific_reason(tmp_path, monkeypatch, wrapped):
+    from polymarket.models.clob.account import OpenOrder
+    now = datetime.now(UTC)
+    account = _SDKAccountClient(now)
+
+    def unavailable(**kwargs):
+        return OpenOrder.parse_response(None) if wrapped else None
+
+    monkeypatch.setattr(account, 'get_order', unavailable, raising=False)
+    adapter = PolymarketTradingClient(
+        TradingConfig('0x' + '1' * 40, '0x' + '2' * 40), account,
+        public_client_factory=lambda: _SDKPublicClient(now))
+    request = {**_request(now), 'owned_order_ids': ['missing-receipt']}
+    snapshot = adapter.lp_snapshot(request)
+    assert snapshot['order_read_errors']['missing-receipt'] == 'order_lookup_unavailable'
+    assert snapshot['orders_terminal'] is False
+    service = PolymarketLPService(PredictionArbitrageStore(tmp_path), adapter)
+    session = {**request, 'order_history': {'missing-receipt': {'status': 'LIVE'}}}
+    patch = service._order_history_patch(session, snapshot)
+    assert patch['order_history']['missing-receipt']['status'] == 'UNKNOWN'
+    assert patch['order_history']['missing-receipt']['read_error'] == 'order_lookup_unavailable'
+    # A persisted exact terminal receipt is not erased by an unavailable lookup.
+    session['order_history']['missing-receipt']['status'] = 'CANCELED'
+    assert service._order_history_patch(session, snapshot)['order_history']['missing-receipt']['status'] == 'CANCELED'

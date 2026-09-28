@@ -6315,6 +6315,7 @@ def test_universe_failure_observer_is_scheduled_once_on_attempt_five(
             "attempts": 5,
             "error_type": "TransportError",
             "last_success_at": None,
+            "retry_seconds": 300,
         }
     ]
     assert monitor._universe_failure_notification_task is None
@@ -6721,35 +6722,26 @@ def test_crash_notification_rate_limited(
     assert len(crashed) == 1
 
 
-def test_supervisor_gives_up_after_ten_consecutive_crashes(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_supervisor_keeps_recovering_after_ten_consecutive_crashes(tmp_path, monkeypatch):
     import open_trader.polymarket_monitor as monitor_module
 
     monkeypatch.setattr(monitor_module, "MONITOR_THREAD_BACKOFF_MAX_SECONDS", 0.0)
+    monkeypatch.setattr(monitor_module, "MONITOR_THREAD_RECOVERY_SECONDS", 0.0)
     setup_public([threshold_event()])
     monitor = make_monitor(tmp_path)
-    payloads: list[dict[str, object]] = []
-    monitor.set_failure_observer(lambda payload: payloads.append(dict(payload)))
-    _crash_injection(monitor, lambda index: True)
+    _crash_injection(monitor, lambda index: index < 12)
 
-    async def scenario() -> None:
+    async def scenario():
         task = asyncio.create_task(monitor.run_forever())
-        await asyncio.wait_for(task, timeout=30)
+        try:
+            assert await _wait_until(lambda: monitor._thread_last_recovery_at is not None)
+            assert monitor._thread_restarts == 12
+            assert monitor._thread_consecutive_crashes == 0
+        finally:
+            monitor._stop_event.set()
+            await asyncio.wait_for(task, timeout=10)
 
     asyncio.run(scenario())
-
-    gave_up = [p for p in payloads if p.get("event") == "gave_up"]
-    assert len(gave_up) == 1
-    assert gave_up[0]["component"] == "monitor_thread"
-    crashed = [p for p in payloads if p.get("event") == "crashed"]
-    assert len(crashed) <= 1
-    thread = monitor.snapshot()["thread"]
-    assert thread["status"] == "gave_up"
-    assert thread["consecutive_crashes"] == 10
-    assert thread["restarts"] == 10
-    assert "retry_in_seconds" not in gave_up[0]
 
 
 def test_consecutive_crash_counter_resets_on_recovery(
@@ -6791,7 +6783,7 @@ def test_consecutive_crash_counter_resets_on_recovery(
     asyncio.run(scenario())
 
     thread = monitor.snapshot()["thread"]
-    assert thread["status"] == "running"
+    assert thread["status"] == "cooling_down"
     assert thread["restarts"] == 3
     assert thread["consecutive_crashes"] == 1
     assert not any(p.get("event") == "gave_up" for p in payloads)
@@ -6841,7 +6833,7 @@ def test_restart_resets_universe_retry_state(
 
     asyncio.run(scenario())
 
-    assert observed[0] == (0, False, False, True)
+    assert observed[0] == (0, False, False, False)
     assert monitor._universe_refresh_attempts == 0
     assert monitor._universe_failed is False
     assert monitor._universe_retry_exhausted is False
@@ -7049,7 +7041,7 @@ def test_universe_notifications_deduplicate_episode_and_escalation(
                 outcome[0] = ValueError
                 for _ in range(3):
                     assert not await tick()
-                assert not monitor._universe_retry_pending
+                assert monitor._universe_retry_pending
             # A blocked delivery must not be replaced or run concurrently.
             assert monitor._universe_failure_notification_task is first_task
             assert len(notifications) == 1
@@ -7062,9 +7054,73 @@ def test_universe_notifications_deduplicate_episode_and_escalation(
             assert len(notifications) == 2
             assert notifications[0]['retry_seconds'] == 300
             assert notifications[1]['error_type'] == ('TimeoutError' if recover_first else 'ValueError')
-            assert ('retry_seconds' in notifications[1]) is recover_first
+            assert notifications[1]['retry_seconds'] == 300
             assert monitor._universe_failure_notification_task is None
         finally:
             release.set()
+
+    asyncio.run(scenario())
+
+
+def test_wrapped_timeout_keeps_universe_recovery_probe(tmp_path):
+    monitor = make_monitor(tmp_path, relation_discovery=None, relation_validator=None)
+    monitor._universe_refresh_attempts = 4
+    calls = []
+
+    async def refresh(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            try:
+                raise TimeoutError('read deadline')
+            except TimeoutError as exc:
+                raise RuntimeError('SDK transport wrapper') from exc
+
+    monitor._refresh_universe_bounded = refresh
+
+    async def scenario():
+        due, _ = await monitor._refresh_universe_if_due(None, current=0, next_refresh=0)
+        assert monitor._universe_retry_pending
+        _, recovered = await monitor._refresh_universe_if_due(None, current=due, next_refresh=due)
+        assert recovered
+        assert len(calls) == 2
+        assert not monitor._universe_retry_exhausted
+
+    asyncio.run(scenario())
+
+
+def test_cleanup_reports_stalled_task_without_starting_replacement(tmp_path, monkeypatch):
+    import open_trader.polymarket_monitor as module
+    monkeypatch.setattr(module, 'MONITOR_CLEANUP_CHECK_SECONDS', .01)
+    monitor = make_monitor(tmp_path, relation_discovery=None, relation_validator=None)
+
+    async def scenario():
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def stubborn():
+            entered.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                await release.wait()
+
+        async def fail(_client):
+            raise RuntimeError('readiness failed')
+
+        monitor._full_scan_task = asyncio.create_task(stubborn())
+        await entered.wait()
+        monitor._poll_relation_validation = fail
+        task = asyncio.create_task(monitor._run_forever_once())
+        try:
+            assert await _wait_until(lambda: monitor._thread_status == 'cleanup_blocked')
+            assert not task.done()
+            assert monitor._diagnostics['cleanup_pending_tasks'] == 1
+            assert monitor._thread_restarts == 0
+            assert not monitor.snapshot()['health']['actionable']
+            assert 'monitor_recovering' in monitor.snapshot()['health']['degraded_reasons']
+        finally:
+            release.set()
+        with pytest.raises(RuntimeError, match='readiness failed'):
+            await asyncio.wait_for(task, 2)
+        assert 'cleanup_pending_tasks' not in monitor._diagnostics
 
     asyncio.run(scenario())

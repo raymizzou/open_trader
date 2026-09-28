@@ -77,7 +77,7 @@ def test_full_pool_replaces_every_market_outside_top_five_without_threshold(tmp_
     assert Decimal(state['funds']['buy_reserved_usd']) == 40
 
 
-def test_rotation_registers_all_victims_before_network_and_waits_for_every_terminal(tmp_path, monkeypatch):
+def test_rotation_registers_all_victims_and_isolates_unresolved_terminal(tmp_path, monkeypatch):
     engine, exchange, lp, store = setup(tmp_path, monkeypatch)
     intents = engine.lp_auto_state()['intents']
     revisions = {i['session_id']: store.lp_session_revision(i['session_id'], trading=True) for i in intents}
@@ -119,9 +119,10 @@ def test_rotation_registers_all_victims_before_network_and_waits_for_every_termi
     for order in exchange.orders[:4]:
         order['status'] = 'CANCELED'
     state = engine.lp_auto_run_once()
-    assert len(exchange.posts) == 5
-    assert state['slots']['occupied'] == 1
-    assert Decimal(state['funds']['buy_reserved_usd']) == 8
+    assert len(exchange.posts) == 9
+    assert state['slots']['occupied'] == 5
+    assert Decimal(state['funds']['buy_reserved_usd']) == 40
+    assert exchange.orders[4]['status'] == 'LIVE'
     exchange.orders[4]['status'] = 'CANCELED'
     state = engine.lp_auto_run_once()
     assert len(exchange.posts) == 10
@@ -526,3 +527,26 @@ def test_cancel_recovery_waits_when_session_is_missing(tmp_path, monkeypatch):
     assert state['intents'][0]['reconcile_reason'] == 'rotation_session_missing'
     assert exchange.cancels == ['o1']
     assert len(exchange.posts) == 1
+
+
+def test_failed_market_does_not_block_healthy_market_rotation(tmp_path, monkeypatch):
+    engine, exchange, lp, _ = setup(tmp_path, monkeypatch, count=3, target=2)
+    exchange.rewards['m02'] = Decimal('30')
+    refresh(lp, exchange, 3)
+    read = exchange.lp_snapshot
+
+    def unavailable(request):
+        if request['token_id'] == 'm00':
+            raise ValueError('order_read_failed')
+        return read(request)
+
+    exchange.lp_snapshot = unavailable
+    state = engine.lp_auto_run_once()
+    assert exchange.cancels == ['o2'], 'only the healthy market may rotate'
+    assert len(exchange.posts) == 2
+    assert Decimal(state['funds']['buy_reserved_usd']) == 16
+    exchange.orders[1]['status'] = 'CANCELED'
+    state = engine.lp_auto_run_once()
+    assert [p['token_id'] for p in exchange.posts] == ['m00', 'm01', 'm02']
+    assert state['slots']['occupied'] == 2
+    assert Decimal(state['funds']['buy_reserved_usd']) == 16

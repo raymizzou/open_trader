@@ -4038,6 +4038,7 @@ class PolymarketTradingClient:
                     *_collect(request.get("owned_order_ids")),
                 ) if value
             }
+            order_read_errors = {}
             for order_id in sorted(order_ids):
                 if order_id in known_ids:
                     continue
@@ -4047,12 +4048,26 @@ class PolymarketTradingClient:
                 try:
                     with _lp_read_stage("required_order"):
                         order = get_order(order_id=order_id)
-                except Exception:
+                except Exception as exc:
+                    # SDK 0.2 parses HTTP 200 JSON null as OpenOrder and wraps
+                    # the root ValidationError. Null is unavailable, not terminal.
+                    from pydantic import ValidationError
+                    cause = exc.__cause__
+                    null_response = isinstance(cause, ValidationError) and any(
+                        row.get('loc') == () and row.get('type') == 'model_type'
+                        and 'input' in row and row['input'] is None
+                        for row in cause.errors(include_url=False))
+                    order_read_errors[order_id] = ('order_lookup_unavailable' if null_response
+                        else 'order_response_invalid' if isinstance(cause, ValidationError)
+                        else 'order_read_failed')
                     continue
                 normalized = _lp_order(order)
                 if normalized is not None:
                     order_facts.append(normalized)
                     known_ids.add(order_id)
+                else:
+                    order_read_errors[order_id] = ('order_lookup_unavailable' if order is None
+                                                  else 'order_response_invalid')
 
             with _lp_read_stage("public_client"):
                 public = self._public_client_factory()
@@ -4160,6 +4175,7 @@ class PolymarketTradingClient:
                 "market": market_facts,
                 "book": book,
                 "orders": order_rows,
+                "order_read_errors": order_read_errors,
                 "trades": trade_rows,
                 "orders_terminal": orders_terminal,
                 "position_flat": not any(
