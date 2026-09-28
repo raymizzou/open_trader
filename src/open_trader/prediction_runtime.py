@@ -54,6 +54,7 @@ from .prediction_arbitrage_store import (
     PredictionArbitrageStore,
     read_minimum_reader_generation,
 )
+from .prediction_websocket_compat import install_proxy_cleanup
 from .relation_auto_confirm import (
     RelationAutoConfirmRunner,
     load_auto_confirm_policy_file,
@@ -652,6 +653,7 @@ class PredictionRuntime:
     def start(self) -> None:
         if self._state != "NEW":
             raise RuntimeError(f"prediction runtime cannot start from {self._state}")
+        install_proxy_cleanup()
         self._owner_thread_id = threading.get_ident()
         self._state = "STARTING"
         if self._mode == "shadow":

@@ -10,6 +10,7 @@ import inspect
 import json
 import logging
 import math
+import sys
 import threading
 import time
 from collections import deque
@@ -2028,27 +2029,56 @@ class PolymarketMonitor:
                     self._record_error(exc, "stream_event")
                 self._emit_health_log()
         finally:
-            for task_name in (
-                "_full_scan_task",
-                "_activity_scan_task",
-                "_codex_task",
-                "_notification_task",
-                "_universe_failure_notification_task",
-                "_llm_failure_notification_task",
-                "_title_translation_task",
-                "_auto_eat_task",
-                "_observation_source_status_task",
-            ):
-                task = getattr(self, task_name)
-                setattr(self, task_name, None)
-                if task is not None and not task.done():
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-            await self._close_stream()
-            self._client = None
+            original_error = sys.exception()
+            # Cancel pending follow-ups before activity-scan cleanup can schedule them.
+            self._full_scan_pending = False
+            self._activity_catchup_requested = False
+            try:
+                tasks = []
+                for task_name in (
+                    "_full_scan_task",
+                    "_activity_scan_task",
+                    "_codex_task",
+                    "_notification_task",
+                    "_universe_failure_notification_task",
+                    "_llm_failure_notification_task",
+                    "_title_translation_task",
+                    "_auto_eat_task",
+                    "_observation_source_status_task",
+                ):
+                    task = getattr(self, task_name)
+                    setattr(self, task_name, None)
+                    if task is not None:
+                        task.cancel()
+                        tasks.append((task_name, task))
+                results = await asyncio.gather(*(task for _, task in tasks), return_exceptions=True)
+                cleanup_error = None
+                for (task_name, _), result in zip(tasks, results):
+                    if isinstance(result, Exception):
+                        logger.error(
+                            "prediction_monitor_task_cleanup_failed task=%s", task_name,
+                            exc_info=(type(result), result, result.__traceback__),
+                        )
+                        cleanup_error = cleanup_error or result
+                if cleanup_error is not None:
+                    if original_error is None:
+                        raise cleanup_error
+                    original_error.add_note(f"Task cleanup failed: {type(cleanup_error).__name__}")
+            finally:
+                try:
+                    await self._close_stream()
+                finally:
+                    self._client = None
+                    close = getattr(client, "close", None)
+                    if callable(close):
+                        original_error = sys.exception()
+                        try:
+                            await _call(close)
+                        except Exception as close_error:
+                            logger.exception("prediction_monitor_client_close_failed")
+                            if original_error is None:
+                                raise
+                            original_error.add_note(f"Client close failed: {type(close_error).__name__}")
 
     async def _refresh_universe_bounded(
         self,
@@ -2217,7 +2247,7 @@ class PolymarketMonitor:
             try:
                 await _call(close)
             except Exception:
-                pass
+                logger.exception("prediction_monitor_stream_close_failed")
 
     def _disconnect_stream(self, exc: BaseException) -> None:
         self._stream_disconnected_at = self._now()

@@ -1598,7 +1598,7 @@ def test_completion_requires_terminal_orders_and_flat_position(tmp_path) -> None
     assert service.status()["state"] == "complete"
 
 
-def test_flat_completion_preserves_unknown_economics(tmp_path) -> None:
+def test_flat_session_waits_for_known_economics(tmp_path) -> None:
     now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
 
     def flat_snapshot(passive_status: str) -> dict[str, object]:
@@ -1644,11 +1644,12 @@ def test_flat_completion_preserves_unknown_economics(tmp_path) -> None:
     assert entered["state"] == "passive_exit"
     exchange.snapshot_value = flat_snapshot("FILLED")
     completed = service.tick()
-    assert completed["state"] == "complete"
+    assert completed["state"] == "passive_exit"
+    assert completed["fee_status"] == "unknown"
     assert completed["trade_pnl"] is None
     assert completed["total_pnl"] is None
     assert completed["reward_status"] == "unknown"
-    assert service.status(started["session_id"])["state"] == "complete"
+    assert service.status(started["session_id"])["state"] == "passive_exit"
     assert len([item for item in exchange.limit_orders if item["side"] == "SELL"]) == 1
 
     review_exchange = _Exchange()
@@ -1677,7 +1678,8 @@ def test_flat_completion_preserves_unknown_economics(tmp_path) -> None:
     assert stopped["state"] == "review"
     review_exchange.snapshot_value = flat_snapshot("CANCELED")
     reviewed = review_service.tick()
-    assert reviewed["state"] == "complete"
+    assert reviewed["state"] == "review"
+    assert reviewed["fee_status"] == "unknown"
     assert reviewed["trade_pnl"] is None
     assert reviewed["total_pnl"] is None
 

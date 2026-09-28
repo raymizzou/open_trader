@@ -9,13 +9,15 @@ import logging
 import math
 import re
 import sqlite3
+import sys
 import threading
 import uuid
 import zlib
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from time import monotonic
 from typing import Any, Callable, Iterable, Iterator, Literal, Mapping
 from zoneinfo import ZoneInfo
 
@@ -30,6 +32,7 @@ SignalHistoryWindow = Literal["24h", "7d", "30d", "all"]
 logger = logging.getLogger(__name__)
 
 _BUSY_TIMEOUT_MS = 5_000
+_SLOW_TRANSACTION_SECONDS = 1.0
 # Reserved lp_sessions.session_id holding manual-cancel audit anchor rows.
 # Never returned as a "latest" session and skipped by daily-report assembly;
 # direct reads (lp_session) still work.
@@ -428,15 +431,43 @@ class PredictionArbitrageStore:
     @contextmanager
     def _transaction(self, *, immediate: bool = True) -> Iterator[sqlite3.Connection]:
         connection = self._connection()
+        operation = sys._getframe(2).f_code.co_qualname
+        started = monotonic()
+        acquired = None
+        phase = "begin"
         try:
             connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+            acquired = monotonic()
+            phase = "body"
             yield connection
+            phase = "commit"
             connection.execute("COMMIT")
-        except Exception:
-            connection.execute("ROLLBACK")
+            phase = "complete"
+        except BaseException as error:
+            if isinstance(error, sqlite3.Error):
+                logger.warning(
+                    "prediction_store_transaction_failed operation=%s phase=%s sqlite_error=%s thread=%s",
+                    operation, phase, getattr(error, "sqlite_errorname", type(error).__name__),
+                    threading.current_thread().name,
+                )
+            if connection.in_transaction:
+                try:
+                    connection.execute("ROLLBACK")
+                except sqlite3.Error as rollback_error:
+                    error.add_note(f"Rollback failed: {type(rollback_error).__name__}")
+                    logger.exception("prediction_store_rollback_failed operation=%s", operation)
             raise
         finally:
+            finished = monotonic()
             connection.close()
+            if finished - started >= _SLOW_TRANSACTION_SECONDS:
+                logger.warning(
+                    "prediction_store_transaction_slow operation=%s phase=%s wait_seconds=%.3f hold_seconds=%.3f thread=%s",
+                    operation, phase,
+                    (acquired if acquired is not None else finished) - started,
+                    finished - acquired if acquired is not None else 0.0,
+                    threading.current_thread().name,
+                )
 
     @staticmethod
     def _create_schema(connection: sqlite3.Connection) -> None:
@@ -2693,6 +2724,7 @@ class PredictionArbitrageStore:
         # concurrent monitor/submit updates.  It never belongs in the public
         # session payload returned to callers.
         payload.pop("_lp_revision", None)
+        payload.pop("_lp_trade_revision", None)
         payload.update(
             {
                 "session_id": str(row["session_id"]),
@@ -2712,7 +2744,7 @@ class PredictionArbitrageStore:
             ).fetchone()
         return None if row is None else self._lp_row_result(row)
 
-    def lp_session_revision(self, session_id: str) -> int:
+    def lp_session_revision(self, session_id: str, *, trading: bool = False) -> int:
         """Return the durable internal revision for one LP session."""
 
         with self._read_connection() as connection:
@@ -2723,7 +2755,7 @@ class PredictionArbitrageStore:
         if row is None:
             raise ValueError("lp_session_not_found")
         payload = _load_payload(str(row["payload"]))
-        value = payload.get("_lp_revision", 0)
+        value = payload.get("_lp_trade_revision" if trading else "_lp_revision", 0)
         try:
             revision = int(value)
         except (TypeError, ValueError):
@@ -2740,7 +2772,7 @@ class PredictionArbitrageStore:
         return max(revision, 0)
 
     def lp_session_with_revision(
-        self, session_id: str
+        self, session_id: str, *, trading: bool = False
     ) -> tuple[dict[str, object], int] | None:
         """Read one LP session image and its fence from one SQLite snapshot."""
 
@@ -2756,7 +2788,7 @@ class PredictionArbitrageStore:
                     return None
                 payload = _load_payload(str(row["payload"]))
                 result = self._lp_row_result(row)
-                revision = self._lp_payload_revision(payload)
+                revision = int(payload.get("_lp_trade_revision", 0)) if trading else self._lp_payload_revision(payload)
                 connection.execute("COMMIT")
                 return result, revision
             except Exception:
@@ -5173,6 +5205,69 @@ class PredictionArbitrageStore:
             assert updated is not None
             return self._lp_first_seen_row_result(updated)
 
+    @staticmethod
+    def _lp_register_trade_change(connection: sqlite3.Connection, session_id: str) -> None:
+        row = connection.execute(
+            "SELECT payload FROM lp_sessions WHERE session_id=?", (str(session_id),)
+        ).fetchone()
+        if row is None:
+            raise ValueError("lp_session_not_found")
+        payload = _load_payload(str(row["payload"]))
+        payload["_lp_trade_revision"] = int(payload.get("_lp_trade_revision", 0)) + 1
+        payload["facts_error"] = payload.get("facts_error") or "trade_change_pending"
+        pool = connection.execute("SELECT payload FROM lp_auto_pool WHERE singleton=1").fetchone()
+        if pool:
+            document = _load_payload(str(pool[0]))
+            changed = False
+            for intent in document.get("intents", {}).values():
+                if intent.get("session_id") == session_id and intent.get("state") != "reserved":
+                    intent.update(financial_status="unknown", reconcile_reason="trade_change_pending", settled=False)
+                    changed = True
+            if changed:
+                connection.execute("UPDATE lp_auto_pool SET payload=? WHERE singleton=1",
+                                   (_dump_execution_payload(document),))
+        connection.execute(
+            "UPDATE lp_sessions SET payload=? WHERE session_id=?",
+            (_dump_execution_payload(payload), str(session_id)),
+        )
+
+    def lp_register_trade_change(self, session_id: str) -> None:
+        """Fence in-flight facts before a durable trading intent is executed."""
+        with self._transaction() as connection:
+            self._lp_register_trade_change(connection, session_id)
+
+    def lp_publish_facts(self, session_id, revision, *, patch=None, state=None,
+                         publish=None, error=None, resolved_cancels=()):
+        """Commit one fenced observation and its automatic ledger atomically.
+
+        The publisher receives this connection; it must not open a nested
+        write transaction or perform external I/O.
+        """
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM lp_sessions WHERE session_id=?", (str(session_id),)
+            ).fetchone()
+            if row is None:
+                raise ValueError("lp_session_not_found")
+            payload = _load_payload(str(row["payload"]))
+            if int(payload.get("_lp_trade_revision", 0)) != revision:
+                raise ValueError("session_changed")
+            for action_id in resolved_cancels:
+                connection.execute("UPDATE lp_actions SET state='accepted',updated_at=? WHERE action_id=? AND session_id=? AND state IN ('pending','unknown')",
+                                   (_utc_now(), action_id, str(session_id)))
+            payload.update(patch or {})
+            payload["_lp_revision"] = self._lp_payload_revision(payload) + 1
+            connection.execute(
+                "UPDATE lp_sessions SET state=?,payload=?,updated_at=? WHERE session_id=?",
+                (state or row["state"], _dump_execution_payload(payload), _utc_now(), str(session_id)),
+            )
+            row = connection.execute(
+                "SELECT * FROM lp_sessions WHERE session_id=?", (str(session_id),)
+            ).fetchone()
+            session = self._lp_row_result(row)
+            changed = publish(session, connection=connection, error=error) if publish else False
+        return session, changed
+
     def lp_upsert_action(
         self,
         session_id: str,
@@ -5185,6 +5280,9 @@ class PredictionArbitrageStore:
         now = _utc_now()
         action_id = _new_id()
         with self._transaction() as connection:
+            # Trading actions own this sequence; ordinary observations never
+            # advance it, regardless of which display fields are added later.
+            self._lp_register_trade_change(connection, session_id)
             connection.execute(
                 "INSERT INTO lp_actions(action_id,session_id,action_key,state,payload,created_at,updated_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(action_key) DO UPDATE SET state=excluded.state,payload=excluded.payload,updated_at=excluded.updated_at",
                 (action_id, str(session_id), str(action_key), str(state), encoded, now, now),
@@ -5206,8 +5304,8 @@ class PredictionArbitrageStore:
         )
         return result
 
-    def lp_actions(self, session_id: str) -> list[dict[str, object]]:
-        with self._read_connection() as connection:
+    def lp_actions(self, session_id: str, *, connection=None) -> list[dict[str, object]]:
+        with (self._read_connection() if connection is None else nullcontext(connection)) as connection:
             rows = connection.execute(
                 "SELECT * FROM lp_actions WHERE session_id=? ORDER BY created_at,action_id",
                 (str(session_id),),

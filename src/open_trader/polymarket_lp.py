@@ -7,8 +7,9 @@ import math
 import threading
 import uuid
 from copy import deepcopy
+from contextlib import nullcontext
 from collections.abc import Callable, Collection, Mapping, MutableMapping, Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, cast
@@ -767,6 +768,14 @@ class PolymarketLPService:
         self._mutation_guard = mutation_guard
         self._protection_notifier: Callable[..., object] | None = None
         self._mutex = threading.RLock()
+        self._facts_owner = threading.local()
+        self._facts_lock = threading.Lock()
+        self._facts_apply_lock = threading.Lock()
+        self._facts_inflight: dict[str, dict] = {}
+        self._facts_capacity = threading.BoundedSemaphore(2)
+        self._facts_publisher = None
+        self._facts_validator = None
+        self._facts_wakeup = None
         self._reward_refresh_lock = threading.Lock()
         self._price_history_refresh_lock = threading.Lock()
         self._report_lock = threading.Lock()
@@ -6602,10 +6611,10 @@ class PolymarketLPService:
             "confirmed_end_at": _iso(observed_at),
         }
 
-    def _read_candidate_snapshot(
-        self, identity: Mapping[str, object], *, now: datetime, ignore_session_id=None
+    def _read_candidate_facts(
+        self, identity: Mapping[str, object]
     ) -> dict[str, object]:
-        """Read and qualify one candidate market through selected adapters only."""
+        """Read market facts shared by entry qualification and resting BUY ranking."""
 
         condition_id = str(identity.get("condition_id") or "").strip()
         token_id = str(identity.get("token_id") or "").strip()
@@ -6735,6 +6744,13 @@ class PolymarketLPService:
             ),
             "reward_guidance_deadline": self._reward_guidance_deadline(reward_market),
         }
+        return {"account": dict(account), "direction": direction}
+
+    def _read_candidate_snapshot(
+        self, identity: Mapping[str, object], *, now: datetime, ignore_session_id=None
+    ) -> dict[str, object]:
+        facts = self._read_candidate_facts(identity)
+        account, direction = facts["account"], facts["direction"]
         evaluation_now = self._now()
         evaluated = evaluate_lp_entry(
             direction,
@@ -6755,8 +6771,8 @@ class PolymarketLPService:
             raise ValueError(reason)
         return {
             "account": dict(account),
-            "market": market,
-            "book": dict(book),
+            "market": direction["market"],
+            "book": dict(direction["book"]),
             "candidate_evaluation": evaluated,
         }
 
@@ -8096,6 +8112,7 @@ class PolymarketLPService:
                     patch={"entry_order_id": signed_order_id, "owned_order_ids": [signed_order_id]})
                 self.store.lp_upsert_action(session_id, entry_action_key, state="pending",
                     payload={"role": "entry", "side": "BUY", "order_id": signed_order_id, **entry_action_base})
+            submit_revision = self.store.lp_session_revision(session_id, trading=True)
             response = (post or self._post_limit)(signed)
         except AutoEntryNotSent as exc:
             self.store.lp_upsert_action(session_id, entry_action_key, state="rejected",
@@ -8207,10 +8224,17 @@ class PolymarketLPService:
                 }
                 if str(observed.get("status") or "UNKNOWN").upper() == "UNKNOWN":
                     order_history[order_id]["status"] = str(_field(response, "status", "LIVE")).upper() or "LIVE"
+                # The accepted action advances this intent once. A concurrent
+                # cancel/stop/submit must still require fresh account facts.
+                receipt_patch = {}
+                if (self.store.lp_session_revision(session_id, trading=True) == submit_revision + 1
+                        and session.get("facts_error") == "trade_change_pending"):
+                    receipt_patch["facts_error"] = None
                 session = self.store.lp_update_session(
                     session_id,
                     state="review" if session.get("stop_requested") or session.get("entry_cancel_requested") else "entry_open",
                     patch={
+                        **receipt_patch,
                         "entry_order_id": order_id,
                         "submit_status": "accepted",
                         "owned_order_ids": list(dict.fromkeys([*self._session_order_ids(session), order_id])),
@@ -9051,6 +9075,9 @@ class PolymarketLPService:
             state = str(session.get("state"))
             if state in {"complete", "entry_rejected", "review"}:
                 return self._status_payload(session)
+            self.store.lp_register_trade_change(str(session["session_id"]))
+            if self._facts_wakeup:
+                self._facts_wakeup()
             try:
                 self._cancel_owned_orders(session)
             except Exception as exc:
@@ -9256,6 +9283,161 @@ class PolymarketLPService:
 
         return self._tick()
 
+    def reconcile_facts(self, session_id, *, apply_lock=None, report_only=False, monitor=False):
+        """Join the one read/apply operation for this session.
+
+        Only trading intents fence this operation. Its short apply publishes
+        the session and automatic ledger together; observation writers cannot
+        invalidate account facts, and no external read owns the apply mutex.
+        """
+        with self._facts_lock:
+            flight = self._facts_inflight.get(session_id)
+            owner = flight is None
+            if owner:
+                flight = self._facts_inflight[session_id] = dict(future=Future(), monitor=False)
+            if monitor:
+                flight.update(monitor=True, apply_lock=apply_lock)
+            future = flight['future']
+        if not owner:
+            return future.result()
+        try:
+            self._facts_owner.session_id = session_id
+            with self._facts_capacity:
+                result = self._reconcile_facts_once(session_id, apply_lock=apply_lock, report_only=report_only)
+            with self._facts_lock:
+                if not flight['monitor']:
+                    # Finish atomically with request registration, so a joining
+                    # tick is either included or starts the next operation.
+                    self._facts_inflight.pop(session_id)
+                    future.set_result((*result, None))
+                    return future.result()
+            status = self._apply_tick_snapshot(*result, apply_lock=flight['apply_lock'])
+            if self._facts_wakeup and self.store.lp_session_revision(session_id, trading=True) != result[2]:
+                self._facts_wakeup()
+            result = (*result, status)
+            with self._facts_lock:
+                self._facts_inflight.pop(session_id)
+                future.set_result(result)
+            return result
+        except ValueError as exc:
+            if str(exc) != 'session_changed':
+                future.set_exception(exc)
+                raise
+            current = self.store.lp_session(session_id) or {'session_id': session_id, 'state': 'needs_attention'}
+            result = (current, None, None, 'session_changed', self._status_payload(current))
+            future.set_result(result)
+            return result
+        except BaseException as exc:
+            future.set_exception(exc)
+            raise
+        finally:
+            self._facts_owner.session_id = None
+            with self._facts_lock:
+                if self._facts_inflight.get(session_id) is flight:
+                    self._facts_inflight.pop(session_id)
+
+    def _reconcile_facts_once(self, session_id, *, apply_lock, report_only):
+        row = self.store.lp_session_with_revision(session_id, trading=True)
+        if row is None:
+            raise ValueError('lp_session_not_found')
+        session, revision = row
+        if session.get('order_identity_conflict'):
+            return session, None, revision, 'order_identity_conflict'
+        if not session.get('entry_order_id'):
+            actions = self.store.lp_actions(session_id)
+            accepted_ids = {a.get('order_id') for a in actions
+                            if a.get('role') == 'entry' and a.get('state') == 'accepted' and a.get('order_id')}
+            if len(accepted_ids) == 1:
+                order_id = accepted_ids.pop()
+                session, _ = self.store.lp_publish_facts(session_id, revision, patch={
+                    'entry_order_id': order_id, 'owned_order_ids': list(dict.fromkeys([*self._session_order_ids(session), order_id])),
+                    'submit_status': 'unknown'})
+        snapshot, error = None, None
+        try:
+            snapshot = self._read_snapshot(self._normalize_request(session))
+            if self._facts_validator and not report_only:
+                self._facts_validator(session, snapshot)
+        except (ValueError, RuntimeError, OSError) as exc:
+            error = str(exc)
+        if error and not report_only:
+            # A failed read only removes permission to spend; an occupied
+            # execution lock must not hide that failure behind an old lease.
+            try:
+                session, _ = self.store.lp_publish_facts(
+                    session_id, revision, patch={'facts_error': error},
+                    publish=self._facts_publisher, error=error)
+            except ValueError as exc:
+                if str(exc) != 'session_changed':
+                    raise
+                error = str(exc)
+            return session, snapshot, revision, error
+        self._facts_apply_lock.acquire()
+        lock = apply_lock[0]() if apply_lock else None
+        if apply_lock and lock is None:
+            self._facts_apply_lock.release()
+            return session, snapshot, revision, "execution_lock"
+        changed = False
+        try:
+            with self._mutex:
+                current, current_revision = self.store.lp_session_with_revision(session_id, trading=True)
+                if current_revision != revision:
+                    return session, snapshot, revision, "session_changed"
+                patch, state = {}, None
+                if report_only:
+                    if not error:
+                        patch['trade_events'] = self._merge_report_trade_events(current, snapshot)
+                    patch.update(report_checked_at=self._now(), report_error=error)
+                    current, _ = self.store.lp_publish_facts(
+                        session_id, revision, patch=patch, publish=self._facts_publisher)
+                    return current, snapshot, revision, error
+                if not error:
+                    try:
+                        patch.update(self._order_history_patch(current, snapshot))
+                        current = {**current, **patch}
+                        patch.update(self._fill_patch(current, snapshot))
+                        current = {**current, **patch}
+                        receipt = self._order_history(current).get(str(current.get('entry_order_id')), {})
+                        if receipt.get('status') not in (None, '', 'UNKNOWN') and current.get('submit_status') in ('unknown','accepted_without_order_id',None):
+                            patch.update(submit_status='accepted',resume_state=None)
+                            current.update(patch)
+                            state = 'review' if current.get('stop_requested') else 'entry_open'
+                        completion = self._completion_patch(current)
+                        if completion is not None:
+                            patch.update(completion)
+                            state = 'complete'
+                        patch['facts_checked_at'] = snapshot.get('account_checked_at') or (snapshot.get('account') or {}).get('checked_at') or self._now()
+                    except ValueError as exc:
+                        patch, state, error = {}, None, str(exc)
+                patch['facts_error'] = error
+                resolved_cancels = []
+                if not error:
+                    statuses = {self._order_id(row): str(_field(row, 'status', '')).upper()
+                                for row in _items(snapshot.get('orders'))}
+                    statuses.update({oid: str(row.get('status', '')).upper()
+                                     for oid, row in self._order_history(current).items()})
+                    for action in self.store.lp_actions(session_id):
+                        if action.get('state') not in {'pending', 'unknown'} or 'cancel' not in str(action.get('action_key')):
+                            continue
+                        targets = action.get('targets') or [action.get('order_id')]
+                        if targets and all(statuses.get(oid) in TERMINAL_ORDER_STATES for oid in targets):
+                            resolved_cancels.append(action['action_id'])
+                try:
+                    current, changed = self.store.lp_publish_facts(
+                        session_id, revision, patch=patch, state=state,
+                        publish=self._facts_publisher, error=error, resolved_cancels=resolved_cancels,
+                    )
+                except ValueError as exc:
+                    if str(exc) != 'session_changed':
+                        raise
+                    return session, snapshot, revision, 'session_changed'
+        finally:
+            if apply_lock and lock is not None:
+                apply_lock[1](lock)
+            self._facts_apply_lock.release()
+        if changed and self._facts_wakeup:
+            self._facts_wakeup()
+        return current, snapshot, revision, error
+
     def tick_with_apply_lock(
         self,
         acquire_lock: Callable[[], object | None],
@@ -9313,111 +9495,109 @@ class PolymarketLPService:
                 session_pairs.append((session, revision))
         if not session_pairs:
             return {"state": "none", "session_id": None}
+        if getattr(self._facts_owner, 'session_id', None):
+            return self._lp_tick_aggregate([self._status_payload(session) for session, _ in session_pairs])
 
-        payloads: list[dict[str, object]] = []
-        for session, initial_revision in session_pairs:
-            session_id = str(session.get("session_id") or "")
-            snapshot: Mapping[str, object] | None = None
-            snapshot_error: ValueError | None = None
-            snapshot_exception: Exception | None = None
-            try:
-                request = self._normalize_request(session)
-                # The main network read deliberately runs outside both the
-                # service mutex and the execution service's global lock.
-                snapshot = self._read_snapshot(request)
-            except ValueError as exc:
-                snapshot_error = exc
-            except Exception as exc:
-                snapshot_exception = exc
-
-            protected_levels: set[str] = set()
-            protection_writes = 0
-            if snapshot is not None:
-                try:
-                    protected_levels, protection_writes = (
-                        self._apply_triggered_protection_cancel_off_lock(
-                            session, snapshot
-                        )
-                    )
-                except Exception:
-                    # A partial protection write is fenced by the durable
-                    # revision below.  If no write happened, the ordinary
-                    # serialized apply can retry the protection operation.
-                    protected_levels = set()
-                    protection_writes = 0
-
-            apply_handle: object | None = None
-            try:
-                if apply_lock is not None:
-                    apply_handle = apply_lock[0]()
-                    if apply_handle is None:
-                        current = self.store.lp_session(session_id) or session
-                        payloads.append(self._status_payload(current))
-                        continue
-                with self._mutex:
-                    if snapshot_exception is not None:
-                        raise snapshot_exception
-                    current_with_revision = getattr(
-                        self.store, "lp_session_with_revision", None
-                    )
-                    if callable(current_with_revision):
-                        current_row = current_with_revision(session_id)
-                    else:
-                        current = self.store.lp_session(session_id)
-                        current_row = (
-                            (current, self.store.lp_session_revision(session_id))
-                            if current is not None
-                            else None
-                        )
-                    if current_row is None:
-                        payloads.append(self._status_payload(session))
-                        continue
-                    current, current_revision = current_row
-                    expected_revision = int(initial_revision) + protection_writes
-                    if current_revision != expected_revision:
-                        # A submit/augment changed this group while its
-                        # snapshot was in flight.  The durable bucket cancel
-                        # remains valid; discard the stale group-wide apply.
-                        payloads.append(self._status_payload(current))
-                        continue
-                    if snapshot_error is not None:
-                        payloads.append(self._handle_snapshot_failure(current, snapshot_error))
-                        continue
-                    if snapshot is None:
-                        raise RuntimeError("lp_tick_snapshot_missing")
-                    reconcile = self._reconcile_session
-                    # Keep lightweight one-argument overrides compatible with
-                    # the long-standing tick seam.  The production method
-                    # receives the prefetched snapshot and protection keys;
-                    # an override owns its own snapshot lifecycle.
-                    if (
-                        getattr(reconcile, "__func__", None)
-                        is PolymarketLPService._reconcile_session
-                    ):
-                        payloads.append(
-                            reconcile(
-                                current,
-                                prefetched_snapshot=snapshot,
-                                protection_skip_keys=protected_levels,
-                            )
-                        )
-                    else:
-                        payloads.append(reconcile(current))
-            except Exception as exc:
-                # One group's reconciliation failure must not swallow the
-                # others: record the failure into that group's payload and
-                # continue with the remaining groups.
-                payloads.append(
-                    {
-                        "state": "error",
-                        "session_id": session_id,
-                        "error": type(exc).__name__,
-                    }
-                )
-            finally:
-                if apply_handle is not None and apply_lock is not None:
-                    apply_lock[1](apply_handle)
+        # ponytail: two account reads at a time; raise only with venue capacity evidence.
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            futures = [workers.submit(self._tick_session, pair, apply_lock=apply_lock)
+                       for pair in session_pairs]
+            payloads = [future.result() for future in futures]
         return self._lp_tick_aggregate(payloads)
+
+    def _tick_session(self, session_pair, *, apply_lock):
+        session, _ = session_pair
+        session_id = str(session['session_id'])
+        try:
+            result = self.reconcile_facts(session_id, apply_lock=apply_lock, monitor=True)
+            return result[4] or self._status_payload(result[0])
+        except Exception as exc:
+            return {'state': 'error', 'session_id': session_id, 'error': type(exc).__name__}
+
+    def _apply_tick_snapshot(self, session, snapshot, initial_revision, reason, *, apply_lock):
+        session_id = str(session['session_id'])
+        if reason == 'order_identity_conflict':
+            return self._status_payload(session)
+        snapshot_error = ValueError(reason) if reason and reason not in {'execution_lock', 'session_changed'} else None
+        protected_levels: set[str] = set()
+        protection_writes = 0
+        if snapshot is not None:
+            try:
+                protected_levels, protection_writes = (
+                    self._apply_triggered_protection_cancel_off_lock(
+                        session, snapshot
+                    )
+                )
+            except Exception:
+                # A partial protection write is fenced by the durable
+                # revision below.  If no write happened, the ordinary
+                # serialized apply can retry the protection operation.
+                protected_levels = set()
+                protection_writes = 0
+
+        apply_handle: object | None = None
+        try:
+            if apply_lock is not None:
+                apply_handle = apply_lock[0]()
+                if apply_handle is None:
+                    current = self.store.lp_session(session_id) or session
+                    return self._status_payload(current)
+            with self._mutex:
+                current_with_revision = getattr(
+                    self.store, "lp_session_with_revision", None
+                )
+                if callable(current_with_revision):
+                    current_row = current_with_revision(session_id, trading=True)
+                else:
+                    current = self.store.lp_session(session_id)
+                    current_row = (
+                        (current, self.store.lp_session_revision(session_id))
+                        if current is not None
+                        else None
+                    )
+                if current_row is None:
+                    return self._status_payload(session)
+                current, current_revision = current_row
+                expected_revision = int(initial_revision)
+                if current_revision != expected_revision:
+                    # A local protective cancel invalidates financial facts,
+                    # but other unchanged price buckets may still be observed.
+                    if protected_levels and set(self._session_order_ids(current)) == set(self._session_order_ids(session)):
+                        current = self._apply_queue_protection(current, snapshot, skip_cancel_keys=protected_levels)
+                    return self._status_payload(current)
+                if snapshot_error is not None:
+                    return self._handle_snapshot_failure(current, snapshot_error)
+                if snapshot is None:
+                    raise RuntimeError("lp_tick_snapshot_missing")
+                reconcile = self._reconcile_session
+                # Keep lightweight one-argument overrides compatible with
+                # the long-standing tick seam.  The production method
+                # receives the prefetched snapshot and protection keys;
+                # an override owns its own snapshot lifecycle.
+                if (
+                    getattr(reconcile, "__func__", None)
+                    is PolymarketLPService._reconcile_session
+                ):
+                    return reconcile(
+                        current,
+                        prefetched_snapshot=snapshot,
+                        protection_skip_keys=protected_levels,
+                        facts_applied=True,
+                    )
+                else:
+                    return reconcile(current)
+        except Exception as exc:
+            # One group's reconciliation failure must not swallow the
+            # others: record the failure into that group's payload and
+            # continue with the remaining groups.
+            return {
+                "state": "error",
+                "session_id": session_id,
+                "error": type(exc).__name__,
+            }
+        finally:
+            if apply_handle is not None and apply_lock is not None:
+                apply_lock[1](apply_handle)
 
     def _apply_triggered_protection_cancel_off_lock(
         self,
@@ -9621,6 +9801,7 @@ class PolymarketLPService:
         *,
         prefetched_snapshot: Mapping[str, object] | None = None,
         protection_skip_keys: Collection[str] = (),
+        facts_applied: bool = False,
     ) -> dict[str, object]:
         """Run one group-level monitoring/reconciliation iteration.
 
@@ -9634,6 +9815,8 @@ class PolymarketLPService:
             return self._status_payload(session)
         state = str(session.get("state"))
         if state in {"entry_rejected", "complete"}:
+            if facts_applied and prefetched_snapshot is not None:
+                session = self._apply_queue_protection(session, prefetched_snapshot, skip_cancel_keys=protection_skip_keys)
             return self._status_payload(session)
         try:
             request = self._normalize_request(session)
@@ -9645,7 +9828,7 @@ class PolymarketLPService:
         except ValueError as exc:
             return self._handle_snapshot_failure(session, exc)
         try:
-            patch = self._fill_patch(session, snapshot)
+            patch = {} if facts_applied else self._fill_patch(session, snapshot)
         except ValueError as exc:
             outage_patch: dict[str, object] = {
                 "reconciliation": str(exc),
@@ -9700,10 +9883,10 @@ class PolymarketLPService:
                 patch=patch,
             )
             return self._status_payload(updated)
-        updated = self.store.lp_update_session(str(session["session_id"]), patch=patch)
+        updated = session if facts_applied else self.store.lp_update_session(str(session["session_id"]), patch=patch)
         session = updated
         try:
-            session = self._sync_order_history(session, snapshot)
+            session = session if facts_applied else self._sync_order_history(session, snapshot)
         except ValueError as exc:
             updated = self.store.lp_update_session(
                 str(session["session_id"]),
@@ -12153,6 +12336,13 @@ class PolymarketLPService:
     def _sync_order_history(
         self, session: Mapping[str, object], snapshot: Mapping[str, object]
     ) -> dict[str, object]:
+        return self.store.lp_update_session(
+            str(session['session_id']), patch=self._order_history_patch(session, snapshot)
+        )
+
+    def _order_history_patch(
+        self, session: Mapping[str, object], snapshot: Mapping[str, object]
+    ) -> dict[str, object]:
         """Merge exact owned order receipts without trusting aggregate hints.
 
         The authenticated adapter may expose only open orders on one read and
@@ -12161,7 +12351,6 @@ class PolymarketLPService:
         can never prove that all orders ended.
         """
 
-        session_id = str(session["session_id"])
         order_ids = self._session_order_ids(session)
         history = self._order_history(session)
         rows_by_id: dict[str, object] = {}
@@ -12238,14 +12427,7 @@ class PolymarketLPService:
             in TERMINAL_ORDER_STATES
             for order_id in order_ids
         )
-        return self.store.lp_update_session(
-            session_id,
-            patch={
-                "owned_order_ids": order_ids,
-                "order_history": history,
-                "orders_terminal": terminal,
-            },
-        )
+        return dict(owned_order_ids=order_ids, order_history=history, orders_terminal=terminal)
 
     def _create_limit(self, **kwargs: object) -> object:
         self._require_mutation()
@@ -12525,6 +12707,10 @@ class PolymarketLPService:
                 if matched < 0:
                     raise ValueError("owned_fill_quantity_invalid")
                 if matched <= quantity:
+                    if matched == quantity and fee is None:
+                        fee = _maybe_decimal(_field(order, "fee", _field(order, "fees", None)))
+                        if fee is None and market.get("fees_enabled") is False:
+                            fee = Decimal(0)
                     continue
                 token = str(_field(order, "token_id", _field(order, "asset_id", "")))
                 order_side = str(_field(order, "side", "")).upper()
@@ -12544,7 +12730,8 @@ class PolymarketLPService:
                 if fee is None and (market.get("fees_enabled") is False or (maker and _maybe_decimal(market.get("fee")) == 0)):
                     fee = Decimal(0)
                 matched_at = _field(order, "matched_at", None)
-            facts[order_id] = dict(order_id=order_id, side=side, quantity=quantity,
+            quantity_known = not (quantity == 0 and str(history.get(order_id, {}).get("status", "")).upper() in {"FILLED", "MATCHED"})
+            facts[order_id] = dict(order_id=order_id, side=side, quantity=quantity, quantity_known=quantity_known,
                 value=value, price=value/quantity if quantity else None, fee=fee, matched_at=matched_at, source=source)
         return facts
 
@@ -12554,6 +12741,8 @@ class PolymarketLPService:
         account = snapshot.get("account")
         if not isinstance(account, Mapping):
             raise ValueError("account_unknown")
+        if account.get("positions_complete") is False or account.get("open_orders_complete") is False:
+            raise ValueError("account_facts_incomplete")
         if "positions" not in account or account.get("positions") is None:
             raise ValueError("position_unknown")
         book = snapshot.get("book")
@@ -12566,6 +12755,7 @@ class PolymarketLPService:
         token_id = session["token_id"]
         trade_events = self._merge_report_trade_events(session, snapshot)
         verified = self._verified_order_fills(session, snapshot, trade_events)
+        fills_known = all(f['quantity_known'] for f in verified.values())
         buys = [f for f in verified.values() if f["side"] == "BUY"]
         sells = [f for f in verified.values() if f["side"] == "SELL"]
         quantity = sum((f["quantity"] for f in buys), Decimal(0))
@@ -12579,7 +12769,7 @@ class PolymarketLPService:
         residual = self._position_quantity(account, str(token_id))
         residual_value = self._executable_bid_value(snapshot, residual)
         projected_fee = self._projected_taker_fee(snapshot, residual)
-        fees_known = fees is not None and projected_fee is not None
+        fees_known = fills_known and fees is not None and projected_fee is not None
         if fees is not None and projected_fee is not None:
             fees += projected_fee
         else:
@@ -12596,7 +12786,7 @@ class PolymarketLPService:
         if sold_quantity > quantity:
             raise ValueError("sold_quantity_exceeded")
         expected_residual = quantity - sold_quantity
-        position_reconciled = (quantity == 0 and residual == 0) or residual == expected_residual
+        position_reconciled = fills_known and residual == expected_residual
         patch: dict[str, object] = {
             "buy_filled_quantity": quantity,
             "buy_cost": cost,
@@ -12617,7 +12807,7 @@ class PolymarketLPService:
             "orders_terminal": bool(session.get("orders_terminal")),
         }
         if not position_reconciled:
-            patch["reconciliation"] = "position_mismatch"
+            patch["reconciliation"] = "position_mismatch" if fills_known else "owned_fill_quantity_unknown"
         reward = snapshot.get("reward_status")
         if reward in {"known", "unknown"}:
             patch["reward_status"] = reward
@@ -13107,17 +13297,54 @@ class PolymarketLPService:
             return str(response_id or "") == target and status in TERMINAL_ORDER_STATES
         return target in {str(value) for value in values}
 
-    def _cancel_order(self, order_id: str) -> bool:
+    def begin_order_cancel(self, order_ids: Collection[str], *, serialized=True):
+        """Persist exact owned cancel attempts before allowing network I/O."""
+        attempts = []
+        with self._mutex if serialized else nullcontext():
+            targets = set(order_ids)
+            for session in self.store.lp_sessions():
+                for order_id in targets.intersection(self._session_order_ids(session)):
+                    session_id = str(session['session_id'])
+                    key = self._action_key(session_id, 'reconciliation-cancel', uuid.uuid4().hex)
+                    payload = dict(role='reconciliation_cancel', order_id=order_id,
+                                   submit_requested_at=_iso(self._now()))
+                    self.store.lp_upsert_action(session_id, key, state='pending', payload=payload)
+                    attempts.append((session_id, key, payload))
+        return attempts
+
+    def finish_order_cancel(self, attempts, canceled, *, serialized=True):
+        with self._mutex if serialized else nullcontext():
+            for session_id, key, payload in attempts:
+                # An exact terminal venue receipt may have settled this action
+                # while the cancel reply was still in flight. Keep that proof.
+                if any(a['action_key'] == key and a['state'] == 'accepted'
+                       for a in self.store.lp_actions(session_id)):
+                    continue
+                self.store.lp_upsert_action(session_id, key,
+                    state='accepted' if payload['order_id'] in canceled else 'unknown', payload=payload)
+        if attempts and self._facts_wakeup:
+            self._facts_wakeup()
+
+    def _cancel_order(self, order_id: str, *, attempts=None) -> bool:
         self._require_mutation()
-        direct = getattr(self.exchange, "cancel_order", None)
-        if callable(direct):
-            response = direct(order_id)
-            return self._cancel_acknowledged(response, order_id)
-        method = getattr(self.exchange, "cancel_orders", None)
-        if callable(method):
-            response = method((order_id,))
-            return self._cancel_acknowledged(response, order_id)
-        raise RuntimeError("cancel_adapter_unavailable")
+        # The shared session lane already serializes internal protection.
+        # Its urgent cancel must bypass an unrelated submit holding _mutex.
+        if attempts is None:
+            attempts = self.begin_order_cancel((order_id,), serialized=False)
+        acknowledged = False
+        try:
+            direct = getattr(self.exchange, "cancel_order", None)
+            if callable(direct):
+                response = direct(order_id)
+            else:
+                method = getattr(self.exchange, "cancel_orders", None)
+                if not callable(method):
+                    raise RuntimeError("cancel_adapter_unavailable")
+                response = method((order_id,))
+            acknowledged = self._cancel_acknowledged(response, order_id)
+            return acknowledged
+        finally:
+            self.finish_order_cancel(attempts, (order_id,) if acknowledged else (), serialized=False)
 
     @staticmethod
     def _has_unresolved_submission(session: Mapping[str, object]) -> bool:
@@ -13768,12 +13995,9 @@ class PolymarketLPService:
             updated = self.store.lp_session(str(session["session_id"])) or updated
         return self._complete_if_flat(updated, snapshot)
 
-    def _complete_if_flat(
-        self, session: Mapping[str, object], snapshot: Mapping[str, object]
-    ) -> dict[str, object]:
-        del snapshot
+    def _completion_patch(self, session):
         if self._has_unresolved_submission(session):
-            return self._status_payload(session)
+            return None
         residual = _decimal(session.get("residual_quantity", 0), "residual_quantity")
         bought = _decimal(session.get("buy_filled_quantity", 0), "buy_filled_quantity")
         sold = _decimal(session.get("sold_quantity", 0), "sold_quantity")
@@ -13782,6 +14006,7 @@ class PolymarketLPService:
             and bought == sold
             and bool(session.get("position_reconciled"))
             and bool(session.get("orders_terminal"))
+            and session.get("fee_status") == "known"
         ):
             sold_revenue = _maybe_decimal(session.get("sold_revenue"))
             buy_cost = _maybe_decimal(session.get("buy_cost"))
@@ -13791,12 +14016,15 @@ class PolymarketLPService:
                 if sold_revenue is not None and buy_cost is not None and fees is not None
                 else None
             )
-            updated = self.store.lp_update_session(
-                str(session["session_id"]),
-                state="complete",
-                patch={"trade_pnl": pnl, "total_pnl": None},
-            )
-            return self._status_payload(updated)
+            return {"trade_pnl": pnl, "total_pnl": None}
+        return None
+
+    def _complete_if_flat(
+        self, session: Mapping[str, object], snapshot: Mapping[str, object]
+    ) -> dict[str, object]:
+        patch = self._completion_patch(session)
+        if patch is not None:
+            session = self.store.lp_update_session(str(session['session_id']), state='complete', patch=patch)
         return self._status_payload(session)
 
     def _status_payload(self, session: Mapping[str, object]) -> dict[str, object]:

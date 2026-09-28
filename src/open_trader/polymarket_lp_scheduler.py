@@ -22,6 +22,9 @@ class LPAutoScheduler:
         self._next_check_at = self.clock()
         self._checking = False
         self._error: str | None = None
+        register = getattr(execution, "set_lp_auto_wakeup", None)
+        if callable(register):
+            register(self.request_check)
 
     def snapshot(self) -> dict[str, object]:
         with self._state:
@@ -54,7 +57,8 @@ class LPAutoScheduler:
             try:
                 # This always reconciles, including while manually paused.
                 # Only the core may decide whether a new BUY can be sent.
-                self.execution.lp_auto_run_once()
+                check = getattr(self.execution, "lp_auto_scheduled_check", self.execution.lp_auto_run_once)
+                check()
             except Exception as exc:
                 with self._state:
                     self._error = type(exc).__name__

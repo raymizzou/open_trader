@@ -185,8 +185,9 @@ def test_recycled_pnl_partial_sale_late_stream_and_restart(tmp_path):
     x.trades=[dict(trade_id=f't{side}',status='CONFIRMED',matched_at=NOW.isoformat(),
               maker_orders=[dict(order_id=oid,token_id='m00',side=side,matched_amount='20',price=price,fee='0')])
               for side,oid,price in [('BUY','o1','.40'),('SELL','sell1','.25')]]
-    e.lp_auto_reconcile_unknown()
-    e.lp_auto_reconcile_unknown()
+    s.lp_update_session(sid,patch=dict(facts_checked_at=NOW-timedelta(seconds=301)))
+    e.lp_generate_due_auto_reports()
+    e.lp_generate_due_auto_reports()
     r=e.lp_auto_state()
     assert Decimal(r['funds']['total_usd'])==97
     fills=[f for f in e.lp_auto_report_facts()['events'] if f['kind']=='fill']
@@ -215,6 +216,8 @@ def test_manual_origin_does_not_own_funds_and_unknown_fees_block(tmp_path):
     x.lp_snapshot=unknown
     assert e.lp_auto_reconcile_unknown()['funds']['status']=='unknown'
     assert e.lp_auto_state()['funds']['available_usd'] is None
+    assert Decimal(e.lp_auto_state()['funds']['buy_reserved_usd']) == 8
+    assert e.lp_auto_state()['slots']['occupied'] == 1
 
 
 def test_concurrent_configuration_is_atomic_target_total(tmp_path):
@@ -477,6 +480,8 @@ def test_stop_of_same_inflight_session_survives_late_receipt(tmp_path,stage):
         assert r['slots']['occupied']==0
     else:
         assert s.lp_session(sid)['state']=='review'
+        assert r['funds']['status']=='unknown'
+        assert Decimal(r['funds']['buy_reserved_usd'])==8
         canceled=[]
         x.cancel_order=lambda oid:canceled.append(oid) or {'canceled':[oid]}
         e.lp_tick()
@@ -500,8 +505,13 @@ def test_late_live_receipt_preserves_already_verified_fill(tmp_path):
     r=e.lp_auto_run_once()
     session=s.lp_session(r['intents'][0]['session_id'])
     assert session['order_history']['o1']['status']=='FILLED'
-    assert r['slots']['occupied']==0
+    assert r['funds']['status']=='unknown'  # A SELL changed the trading generation before the late BUY reply.
+    assert r['slots']['occupied']==1
     assert Decimal(r['funds']['inventory_cost_usd'])==8
+    recovered=e.lp_auto_reconcile_unknown()
+    assert recovered['funds']['status']=='known'
+    assert recovered['slots']['occupied']==0
+    assert Decimal(recovered['funds']['inventory_cost_usd'])==8
 
 
 @pytest.mark.parametrize('signed_id',[False,True])
@@ -530,13 +540,13 @@ def test_receipt_apply_respects_another_service_tick_lock(tmp_path,signed_id):
         assert return_receipt.wait(5)
         return response
     x.lp_post_order=delayed
-    update=other_store.lp_update_session
+    update=other_store.lp_publish_facts
     def hold_apply(*args,**kwargs):
         if not tick_holds_lock.is_set():
             tick_holds_lock.set()
             assert release_tick.wait(5)
         return update(*args,**kwargs)
-    other_store.lp_update_session=hold_apply
+    other_store.lp_publish_facts=hold_apply
     with ThreadPoolExecutor(2) as pool:
         automatic=pool.submit(e.lp_auto_run_once)
         try:
@@ -595,7 +605,7 @@ def test_accepted_sell_missing_receipt_blocks_new_buys_until_exact_id_recovers(t
     r=e.lp_auto_run_once()
     assert 'submission_unknown' in r['block_reasons']
     assert r['funds']['available_usd'] is None
-    assert r['slots']['occupied']==0  # Only BUY orders occupy these slots.
+    assert r['slots']['occupied']==1  # Unresolved owned SELL facts keep the session fenced.
     assert len(x.posts)==2
     events=e.lp_auto_report_facts()['events']
     assert any(v['kind']=='unknown' and v['side']=='SELL' and v['order_id']==sell['order_id'] for v in events)

@@ -10,14 +10,15 @@ import fcntl
 import json
 import hashlib
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
 from .polymarket_lp_risk import (
-    TERMINAL_ORDER_STATES, _decimal as _money, _freshness,
+    TERMINAL_ORDER_STATES, _account_after_reservations, _decimal as _money, _freshness, _levels,
     _maybe_decimal, _timestamp, evaluate_lp_entry, estimate_lp_target_share_yield,
 )
 
@@ -36,7 +37,7 @@ def _json(value):
     raise TypeError(type(value).__name__)
 
 
-def minimum_order_estimate(direction, guidance, now):
+def minimum_order_estimate(direction, guidance, now, *, resting_quantity=ZERO):
     """Reuse reward weights, recompute the share at the actual legal quantity."""
     market = direction['market']
     estimate = estimate_lp_target_share_yield(
@@ -45,14 +46,36 @@ def minimum_order_estimate(direction, guidance, now):
         reward_max_spread=_decimal(market['reward_max_spread']),
         daily_pool_usd=_decimal(direction.get('daily_pool_usd')), now=now,
     )
+    price, quantity = _decimal(guidance['price']), _decimal(guidance['quantity'])
+    # Callers already validate fresh, complete current entry facts. Only these
+    # conclusive failures of the actual resting quote mean zero, not unknown.
+    if resting_quantity and ((estimate['state'] == 'known' and quantity < _decimal(market['reward_min_size']))
+            or set(estimate.get('reason_codes', [])) in ({'reward_distance_invalid'}, {'reward_score_zero'})):
+        return dict(state='known', basis='resting_non_scoring_order', quantity=quantity,
+                    price=price, capital_usd=price*quantity, hourly_reward_usd=ZERO,
+                    yield_pct_per_hour=ZERO, checked_at=now)
     if estimate['state'] != 'known':
         return estimate
-    price, quantity = _decimal(guidance['price']), _decimal(guidance['quantity'])
     weight = (1 - abs(price - estimate['midpoint']) / _decimal(market['reward_max_spread'])) ** 2
+    competition = estimate['competition_upper_bound']
+    if resting_quantity:
+        bids = _levels(direction['book'].get('bids'), 'bids')
+        if sum((size for p, size in bids if p == price), ZERO) < resting_quantity:
+            return dict(state='unknown', reason_codes=['own_order_depth_unknown'])
+        # Keep the observed reward midpoint; remove our score from competition,
+        # since public depth already contains this resting order.
+        scores = []
+        for side in ('bids', 'asks'):
+            scores.append(sum((size * (1 - abs(p - estimate['midpoint']) /
+                _decimal(market['reward_max_spread'])) ** 2
+                for p, size in _levels(direction['book'].get(side), side)
+                if abs(p - estimate['midpoint']) < _decimal(market['reward_max_spread'])), ZERO))
+        scores[0] -= resting_quantity * weight
+        competition = min(scores) + abs(scores[0] - scores[1]) / 3
     own_score = quantity * weight / 3
-    share = own_score / (estimate['competition_upper_bound'] + own_score)
+    share = own_score / (competition + own_score)
     reward = _decimal(direction['daily_pool_usd']) * share / 24
-    return dict(state='known', basis='minimum_scoring_order', quantity=quantity,
+    return dict(state='known', basis='resting_scoring_order' if resting_quantity else 'minimum_scoring_order', quantity=quantity,
                 price=price, capital_usd=price*quantity, hourly_reward_usd=reward,
                 yield_pct_per_hour=reward/(price*quantity)*100, checked_at=now)
 
@@ -82,10 +105,10 @@ class LPAutoPool:
             row=c.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
             return json.loads(row[0]) if row else self._default()
 
-    def _update(self, fn):
+    def _update(self, fn, *, connection=None):
         # ponytail: one SQLite document serializes this single-account MVP;
         # split event rows if retained history makes document rewrites material.
-        with self.store._transaction() as c:
+        with (self.store._transaction() if connection is None else nullcontext(connection)) as c:
             row = c.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
             d = json.loads(row[0]) if row else self._default()
             result = fn(d)
@@ -127,6 +150,15 @@ class LPAutoPool:
         elif previous:
             previous.setdefault('resolved_at',self._stamp())
 
+    def _funds_fresh(self, intent):
+        if intent.get('settled') or intent['state'] in ('aborted', 'rejected', 'reserved'):
+            return True
+        try:
+            _freshness(intent.get('checked_at'), self._now(), 'financial_facts', max_age=Decimal(60))
+            return True
+        except ValueError:
+            return False
+
     def _projection(self, d):
         intents = list(d['intents'].values())
         occupied = [i for i in intents if i['state'] not in ('terminal','rejected','aborted')]
@@ -137,7 +169,7 @@ class LPAutoPool:
         reserved = sum((_decimal(i['reserved_usd']) for i in occupied), ZERO)
         allocated = sum((_decimal(a['amount_usd']) for a in d['allocations']), ZERO)
         total = allocated + pnl
-        financial_unknown = any(i.get('financial_status')=='unknown' for i in intents)
+        financial_unknown = any(i.get('financial_status')=='unknown' or not self._funds_fresh(i) for i in intents)
         reasons = []
         if not self.execution.lp_mutation_allowed():
             reasons.append('circuit_breaker_open')
@@ -227,7 +259,7 @@ class LPAutoPool:
                 return True
         return False
 
-    def candidates(self):
+    def candidates(self, *, releasing=()):
         """Consume the entire qualified pool before exclusion, never the UI top ten."""
         from .polymarket_lp import _candidate_pool_row_expired
         with self.lp._candidate_state_lock:
@@ -238,8 +270,8 @@ class LPAutoPool:
             if self._excluded(condition_id):
                 continue
             for direction in cached.get('directions',[]):
-                evaluated=evaluate_lp_entry(direction,account=cached.get('account') or {},
-                    now=self._now(),reservations=self.lp._candidate_reservations(),candidate=True)
+                evaluated=evaluate_lp_entry(direction,account=self._ranking_account(cached.get('account') or {}, releasing),
+                    now=self._now(),reservations=self._ranking_reservations(releasing),candidate=True)
                 if evaluated.get('state')!='eligible':
                     continue
                 guidance=evaluated['guidance']
@@ -249,11 +281,269 @@ class LPAutoPool:
                 result.append({**guidance,'minimum_order_estimate':estimate})
         return sorted(result,key=lambda r:(-_decimal(r['minimum_order_estimate']['yield_pct_per_hour']),str(r['condition_id']),str(r['token_id'])))
 
-    def _record_session(self, intent_id, session, *, error=None):
+    def _ranking_account(self, account, releasing):
+        if not isinstance(account.get('open_orders'), (list, tuple)):
+            return dict(account)
+        ids = {i['order_id'] for i in releasing}
+        return {**account, 'open_orders': [o for o in account.get('open_orders', [])
+                if self.lp._order_id(o) not in ids]}
+
+    def _ranking_reservations(self, releasing):
+        ids = {i['order_id'] for i in releasing}
+        return tuple(r for r in self.lp._candidate_reservations() if r['order_id'] not in ids)
+
+    def _rotation_session(self, intent):
+        session = self.store.lp_session(intent['session_id'])
+        if (intent['state'] != 'active' or not session or session.get('state') != 'entry_open'
+                or session.get('entry_cancel_requested') or session.get('stop_requested')
+                or session.get('stop_loss_latched') or session.get('order_identity_conflict')
+                or self.lp._has_unresolved_submission(session)
+                or _decimal(session.get('buy_filled_quantity', 0))
+                or any(str(session.get(k)) != str(intent[k]) for k in ('condition_id', 'token_id'))
+                or session.get('entry_order_id') != intent['order_id']
+                or self.lp._session_order_ids(session) != [intent['order_id']]
+                or self.lp._order_history(session).get(intent['order_id'], {}).get('status') != 'LIVE'):
+            raise ValueError('rotation_awaiting_reconciliation')
+        if self._now() >= _timestamp(session.get('review_at')):
+            raise ValueError('review_deadline')
+        if any(b.get('state') not in ('registered', 'monitoring')
+               for b in self.lp._queue_protection_levels(session).values()):
+            raise ValueError('rotation_protection_active')
+        return session
+
+    def _ranked_buys(self, state):
+        """One market per slot, including existing BUYs, on the same yield basis."""
+        active = [i for i in state['intents'] if i['state'] not in ('terminal', 'rejected', 'aborted')]
+        if not active:
+            candidates = self.candidates()
+            return candidates, [], candidates
+        rows = []
+        for intent in active:
+            self._rotation_session(intent)
+            facts = self.lp._read_candidate_facts(intent)
+            account, direction = facts['account'], facts['direction']
+            wallet = str(account.get('wallet_address') or '').strip().casefold()
+            if not wallet or hashlib.sha256(wallet.encode()).hexdigest() != state['account_id']:
+                raise ValueError('account_identity_mismatch')
+            current = [o for o in (account.get('open_orders') or []) if self.lp._order_id(o) == intent['order_id']]
+            if (len(current) != 1 or current[0].get('side') != 'BUY'
+                    or str(current[0].get('status')).upper() != 'LIVE'
+                    or str(current[0].get('token_id')) != intent['token_id']
+                    or _maybe_decimal(current[0].get('size_matched')) != ZERO
+                    or _maybe_decimal(current[0].get('price')) != _decimal(intent['price'])
+                    or self.lp._queue_row_remaining(current[0]) != _decimal(intent['quantity'])):
+                raise ValueError('rotation_order_changed')
+            evaluated = evaluate_lp_entry(direction, account=self._ranking_account(account, active),
+                now=self._now(), reservations=self._ranking_reservations(active), candidate=True)
+            if evaluated.get('state') != 'eligible':
+                raise ValueError('rotation_yield_unknown')
+            estimate = minimum_order_estimate(direction, intent, self._now(), resting_quantity=_decimal(intent['quantity']))
+            if estimate['state'] != 'known':
+                raise ValueError('rotation_yield_unknown')
+            rows.append({**intent, 'minimum_order_estimate': estimate,
+                         'ranking_account': account, 'ranking_book_at': direction['book']['received_at'],
+                         'ranking_reward_at': direction['reward_checked_at']})
+        candidates = self.candidates(releasing=active)
+        rows.extend(candidates)
+        refreshed = {(r['condition_id'], r['token_id']) for r in rows if r.get('intent_id')}
+        while True:
+            rows.sort(key=lambda r: (-_decimal(r['minimum_order_estimate']['yield_pct_per_hour']),
+                not bool(r.get('intent_id')), str(r['condition_id']), str(r['token_id'])))
+            unique = {}
+            for row in rows:
+                unique.setdefault(row['condition_id'], row)
+            targets = list(unique.values())[:state['target_buy_count']]
+            pending = next((r for r in targets if (r['condition_id'], r['token_id']) not in refreshed), None)
+            if pending is None:
+                break
+            facts = self.lp._read_candidate_facts(pending)
+            account, direction = facts['account'], facts['direction']
+            evaluated = evaluate_lp_entry(direction, account=self._ranking_account(account, active),
+                now=self._now(), reservations=self._ranking_reservations(active), candidate=True)
+            if evaluated.get('state') != 'eligible':
+                if evaluated.get('state') == 'rejected':
+                    rows.remove(pending)
+                    candidates.remove(pending)
+                    continue
+                raise ValueError('ranking_changed')
+            self.lp._require_lp_history(pending, now=self._now())
+            estimate = minimum_order_estimate(direction, evaluated['guidance'], self._now())
+            if estimate['state'] != 'known':
+                raise ValueError('ranking_yield_unknown')
+            pending.update(evaluated['guidance'], minimum_order_estimate=estimate, ranking_account=account,
+                           ranking_book_at=direction['book']['received_at'], ranking_reward_at=direction['reward_checked_at'])
+            refreshed.add((pending['condition_id'], pending['token_id']))
+        for row in targets:
+            self._ranking_fresh(row)
+        victims = [r for r in rows if r.get('intent_id') and r['condition_id'] not in {t['condition_id'] for t in targets}]
+        if victims:
+            capital = sum((_decimal(r['minimum_order_estimate']['capital_usd']) for r in targets), ZERO)
+            available = _decimal(state['funds']['total_usd']) - _decimal(state['funds']['inventory_cost_usd'])
+            for row in targets:
+                account = _account_after_reservations(self._ranking_account(row['ranking_account'], active),
+                                                     self._ranking_reservations(active))
+                if account is None:
+                    raise ValueError('account_facts_unknown')
+                available = min(available, _decimal(account['balance']), _decimal(account['allowance']))
+            if capital > available:
+                raise ValueError('top_yield_funds_insufficient')
+        candidates.sort(key=lambda r: (-_decimal(r['minimum_order_estimate']['yield_pct_per_hour']), str(r['condition_id']), str(r['token_id'])))
+        return targets, victims, candidates
+
+    def _ranking_fresh(self, row):
+        wallet = str(row['ranking_account'].get('wallet_address') or '').strip().casefold()
+        if not wallet or hashlib.sha256(wallet.encode()).hexdigest() != self.execution._lp_account_id():
+            raise ValueError('account_identity_mismatch')
+        for stamp in (row['ranking_account'].get('checked_at'), row['ranking_book_at'], row['ranking_reward_at']):
+            _freshness(stamp, self._now(), 'ranking_freshness', max_age=60)
+
+    def _rotate_out(self, victims, targets, version):
+        """Validate and fence the whole batch before any exact-ID cancel."""
+        from .polymarket_lp import expiration_for_review
+        from .polymarket_lp_views import _next_review_at
+        with self._send_barrier():
+            lock = self.execution._acquire_global_lock()
+            if lock is None:
+                raise ValueError('execution_lock')
+            try:
+                with self.lp._mutex:
+                    state = self.state()
+                    if not state['desired_running'] or state['block_reasons'] or state['config_version'] != version:
+                        raise ValueError(state['reason'] or 'config_version_changed')
+                    if self.store.active_execution() is not None:
+                        raise ValueError('active_execution')
+                    expiration_for_review(_next_review_at(self._now()), now=self._now())
+                    for target in [*victims, *targets]:
+                        self._ranking_fresh(target)
+                        if target.get('intent_id'):
+                            self._rotation_session(target)
+                    capital = sum((_decimal(t['minimum_order_estimate']['capital_usd']) for t in targets), ZERO)
+                    if capital > _decimal(state['funds']['total_usd']) - _decimal(state['funds']['inventory_cost_usd']):
+                        raise ValueError('top_yield_funds_insufficient')
+                    def record(d):
+                        for row in victims:
+                            intent = d['intents'][row['intent_id']]
+                            intent.update(state='canceling', rotation_requested_at=self._stamp(),
+                                          rotation_last_attempt_at=self._stamp(), rotation_cancel_acknowledged=False)
+                            self._event(d, intent, 'rotation_requested', occurred_at=self._stamp(),
+                                target_conditions=[t['condition_id'] for t in targets],
+                                previous_yield=row['minimum_order_estimate']['yield_pct_per_hour'])
+                    self._update(record)
+                    attempts = self.lp.begin_order_cancel([r['order_id'] for r in victims], serialized=False)
+                    for row in victims:
+                        session = self.store.lp_update_session(row['session_id'], patch={'entry_cancel_requested': True})
+                        self.lp._mark_group_buckets_canceling(session, 'yield_rotation')
+            finally:
+                self.execution._release_global_lock(lock)
+            actions = []
+            for row in victims:
+                acknowledged = self._send_rotation_cancel(row, [a for a in attempts if a[2]['order_id'] == row['order_id']])
+                actions.append(dict(condition_id=row['condition_id'], order_id=row['order_id'], state='canceling',
+                                    reason='yield_rotation' if acknowledged else 'rotation_cancel_unknown'))
+            return actions
+
+    def _send_rotation_cancel(self, intent, attempts):
+        # Caller holds the send barrier; no global lock, LP mutex or DB transaction.
+        try:
+            acknowledged = self.lp._cancel_order(intent['order_id'], attempts=attempts)
+        except Exception:
+            acknowledged = False
+        self._update(lambda d: d['intents'][intent['intent_id']].update(rotation_cancel_acknowledged=acknowledged))
+        return acknowledged
+
+    def _retry_rotation_cancel(self, intent):
+        """At most one retry per new authoritative LIVE receipt; never free a slot."""
+        try:
+            account = self.lp.exchange.lp_account_snapshot()
+        except Exception:
+            return
+        try:
+            if not isinstance(account, dict):
+                return
+            receipts = account.get('open_orders')
+            if (not isinstance(receipts, (list, tuple))
+                    or any(not isinstance(o, dict) for o in receipts)):
+                return
+            wallet = str(account.get('wallet_address') or '').strip().casefold()
+            checked_at = _timestamp(account.get('checked_at'))
+            _freshness(checked_at, self._now(), 'account_freshness', max_age=60)
+            orders = [o for o in receipts if self.lp._order_id(o) == intent['order_id']]
+            if (not wallet or hashlib.sha256(wallet.encode()).hexdigest() != self.execution._lp_account_id()
+                    or account.get('authenticated') is not True or account.get('open_orders_complete') is not True
+                    or account.get('positions_complete') is not True or len(orders) != 1):
+                return
+            order = orders[0]
+            matched = _maybe_decimal(order.get('size_matched'))
+            if (order.get('status') != 'LIVE' or order.get('side') != 'BUY'
+                    or order.get('token_id') != intent['token_id'] or order.get('fill_quantity_known') is False
+                    or _maybe_decimal(order.get('original_size')) != _decimal(intent['quantity'])
+                    or _maybe_decimal(order.get('price')) != _decimal(intent['price'])
+                    or matched is None or not ZERO <= matched < _decimal(intent['quantity'])):
+                return
+            with self._send_barrier():
+                lock = self.execution._acquire_global_lock()
+                if lock is None:
+                    return
+                try:
+                    with self.lp._mutex:
+                        _freshness(checked_at, self._now(), 'account_freshness', max_age=60)
+                        current = self._read()['intents'][intent['intent_id']]
+                        session = self.store.lp_session(intent['session_id'])
+                        if (current.get('rotation_cancel_acknowledged') or current.get('rotation_settled_at')
+                                or current['state'] in ('terminal', 'aborted', 'rejected') or not session
+                                or session.get('order_identity_conflict')
+                                or any(session.get(k) != intent[k] for k in ('condition_id', 'token_id'))
+                                or session.get('entry_order_id') != intent['order_id']
+                                or self.lp._order_history(session).get(intent['order_id'], {}).get('status') != 'LIVE'
+                                or checked_at <= _timestamp(current['rotation_last_attempt_at'])):
+                            return
+                        self._update(lambda d: d['intents'][intent['intent_id']].update(rotation_last_attempt_at=self._stamp()))
+                        attempts = self.lp.begin_order_cancel((intent['order_id'],), serialized=False)
+                        session = self.store.lp_update_session(intent['session_id'], patch={'entry_cancel_requested': True})
+                        self.lp._mark_group_buckets_canceling(session, 'yield_rotation')
+                finally:
+                    self.execution._release_global_lock(lock)
+                self._send_rotation_cancel(intent, attempts)
+        except (ValueError, RuntimeError, OSError):
+            return
+
+    def _settle_rotations(self):
+        retries = []
+        def apply(d):
+            reason = None
+            for intent in d['intents'].values():
+                if not intent.get('rotation_requested_at') or intent.get('rotation_settled_at'):
+                    continue
+                if intent['state'] != 'terminal' or intent.get('financial_status') != 'known':
+                    reason = reason or 'rotation_awaiting_reconciliation'
+                    if not intent.get('rotation_cancel_acknowledged') and intent['state'] not in ('terminal', 'aborted', 'rejected'):
+                        retries.append(deepcopy(intent))
+                    continue
+                intent['rotation_settled_at'] = self._stamp()
+                filled = _decimal(intent.get('filled_quantity', 0))
+                self._event(d, intent, 'rotation_ended', occurred_at=self._stamp(), filled_quantity=str(filled))
+                if filled:
+                    reason = 'rotation_filled'
+            return reason
+        reason = self._update(apply)
+        for intent in retries:
+            self._retry_rotation_cancel(intent)
+        return reason
+
+    def _record_session(self, intent_id, session, *, error=None, connection=None):
+        if connection is None:
+            # Receipt callers may race a cancel after reading the session.
+            # Derive their ledger update from the same SQLite write snapshot.
+            with self.store._transaction() as connection:
+                row = connection.execute('SELECT * FROM lp_sessions WHERE session_id=?',
+                                         (session['session_id'],)).fetchone()
+                current = self.store._lp_row_result(row) if row else session
+                return self._record_session(intent_id, current, connection=connection,
+                                            error=error if row else 'session_missing')
         def apply(d):
             i=d['intents'][intent_id]
             if error:
-                if i['state']=='terminal' and i.get('financial_status')=='known' and _decimal(i.get('inventory_cost_usd',0))==0:
+                if i.get('settled') and i.get('financial_status')=='known':
                     return
                 i['financial_status']='unknown'
                 i['reconcile_reason']=error
@@ -296,20 +586,27 @@ class LPAutoPool:
             # A fresh, unfilled accepted order needs no position/fee inference.
             if quantity==0 and sold==0 and not session.get('account_checked_at') and order_state=='LIVE':
                 known=True
-            i['submission_unknown']=self.lp._has_unresolved_submission(session) or any(
+            actions=self.store.lp_actions(str(session['session_id']), connection=connection)
+            pending_cancel = any(a.get('state') in ('pending', 'unknown')
+                                 and 'cancel' in str(a.get('action_key')) for a in actions)
+            i['submission_unknown']=pending_cancel or self.lp._has_unresolved_submission(session) or any(
                 str(owned.get('status') or 'UNKNOWN').upper()=='UNKNOWN' for owned in history.values())
-            known=known and not i['submission_unknown']
+            known=known and not i['submission_unknown'] and not session.get('facts_error')
             if known:
                 acquired=cost+buy_fees
                 released=acquired*sold/quantity if quantity else ZERO
                 i.update(realized_pnl_usd=str(revenue-sell_fees-released),inventory_cost_usd=str(acquired-released),financial_status='known')
             else:
                 i['financial_status']='unknown'
-            i['reserved_usd']=str(ZERO if terminal else max(ZERO,_decimal(i['quantity'])-quantity)*_decimal(i['price']))
-            i['state']='terminal' if terminal else 'canceling' if session.get('entry_cancel_requested') else 'active'
+            if known:
+                i['reserved_usd']=str(ZERO if terminal else max(ZERO,_decimal(i['quantity'])-quantity)*_decimal(i['price']))
+                i['state']='terminal' if terminal else 'canceling' if session.get('entry_cancel_requested') else 'active'
+            else:
+                # A terminal BUY receipt alone cannot account for unknown
+                # fills/fees/positions. Keep its last reservation and slot.
+                i['state']='canceling' if session.get('entry_cancel_requested') else 'unknown'
             i['filled_quantity']=str(quantity)
             i['reconcile_reason']=None if known else 'position_or_fee_unknown'
-            actions=self.store.lp_actions(str(session['session_id']))
             bindings={order_id:i}
             for action in actions:
                 oid=action.get('order_id')
@@ -371,77 +668,97 @@ class LPAutoPool:
                         price=fact.get('price'),fee=None,source='order_receipt_remainder')
                 else:
                     d['events'].pop(identity,None)
-            i['checked_at']=self._stamp()
-        self._update(apply)
+            i['settled'] = (known and terminal and session.get('orders_terminal') is True
+                            and quantity == sold and _decimal(session.get('residual_quantity', 0)) == 0)
+            i['report_pending'] = any(e.get('session_id') == session['session_id']
+                and e.get('kind') == 'fill' and not e.get('occurred_at') for e in d['events'].values())
+            i['checked_at'] = session.get('facts_checked_at') or session.get('submit_receipt_at') or i['created_at']
+        self._update(apply,connection=connection)
 
-    def _reconcile_unknown(self):
+    def publish_session(self, session, *, connection, error=None):
+        row=connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
+        if row is None:
+            return False
+        document=json.loads(row[0])
+        intent=next((i for i in document['intents'].values() if i['session_id']==session['session_id']),None)
+        if intent is None:
+            return False
+        def identity(i):
+            return (i.get('financial_status'), i['state'], self._funds_fresh(i),
+                    i.get('reserved_usd'), i.get('inventory_cost_usd'), i.get('realized_pnl_usd'))
+        before=identity(intent)
+        self._record_session(intent['intent_id'],session,error=error,connection=connection)
+        updated=json.loads(connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()[0])
+        intent=updated['intents'][intent['intent_id']]
+        return not error and before != identity(intent)
+
+    def _reconcile_unknown(self, *, reuse=False):
         d=self._read()
         if not d['account_id'] or d['account_id']!=self.execution._lp_account_id():
             return self._projection(d)
-        for i in d['intents'].values():
-            if i['state'] in ('aborted','rejected'):
-                continue
-            session=self.store.lp_session(i['session_id'])
-            if session is None:
-                # The session is persisted before signing/posting. No session
-                # proves this reserved intent never reached the exchange lane.
-                self._update(lambda doc:doc['intents'][i['intent_id']].update(state='aborted',reserved_usd='0'))
-                continue
-            if session.get('order_identity_conflict'):
-                self._record_session(i['intent_id'],session)
-                continue
-            if not session.get('entry_order_id'):
-                lock=self.execution._acquire_global_lock()
-                if lock is None:
-                    self._record_session(i['intent_id'],session,error='execution_lock')
-                    continue
-                try:
-                    with self.lp._mutex:
-                        session=self.store.lp_session(i['session_id'])
-                        actions=self.store.lp_actions(i['session_id'])
-                        ids={a.get('order_id') for a in actions if a.get('role')=='entry' and a.get('state')=='accepted' and a.get('order_id')}
-                        if len(ids)==1 and not session.get('entry_order_id'):
-                            oid=ids.pop()
-                            session=self.store.lp_update_session(i['session_id'],patch=dict(entry_order_id=oid,owned_order_ids=[oid],submit_status='unknown'))
-                finally:
-                    self.execution._release_global_lock(lock)
-                if not session.get('entry_order_id'):
-                    self._record_session(i['intent_id'],session)
-                    continue
-            try:
-                session,revision=self.store.lp_session_with_revision(i['session_id'])
-                snapshot=self.lp._read_snapshot(session)
-                wallet=str((snapshot.get('account') or {}).get('wallet_address') or '').strip().casefold()
-                if not wallet or hashlib.sha256(wallet.encode()).hexdigest()!=d['account_id']:
-                    raise ValueError('account_identity_mismatch')
-                lock=self.execution._acquire_global_lock()
-                if lock is None:
-                    self._record_session(i['intent_id'],session,error='execution_lock')
-                    continue
-                try:
-                    with self.lp._mutex:
-                        if self.store.lp_session_revision(i['session_id'])!=revision:
-                            self._record_session(i['intent_id'],session,error='session_changed')
-                            continue
-                        session=self.lp._sync_order_history(session,snapshot)
-                        receipt=self.lp._order_history(session).get(str(session.get('entry_order_id')), {})
-                        if receipt.get('status') not in (None, '', 'UNKNOWN') and session.get('submit_status') in ('unknown','accepted_without_order_id',None):
-                            session=self.store.lp_update_session(i['session_id'],state='review' if session.get('stop_requested') else 'entry_open',
-                                patch=dict(submit_status='accepted',resume_state=None))
-                        patch=self.lp._fill_patch(session,snapshot)
-                        session=self.store.lp_update_session(i['session_id'],patch=patch)
-                        session=self.lp._complete_if_flat(session,snapshot)
-                        self._record_session(i['intent_id'],session)
-                finally:
-                    self.execution._release_global_lock(lock)
-            except (ValueError,RuntimeError,OSError) as exc:
-                self._record_session(i['intent_id'],session,error=str(exc))
+        intents = [i for i in d['intents'].values() if not i.get('settled')]
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            futures = [workers.submit(self._reconcile_intent, i, reuse=reuse) for i in intents]
+            for future in futures:
+                future.result()
         def finish(doc):
             doc['last_checked_at']=self._stamp()
             if all(i.get('financial_status')=='known' and i['state']!='unknown' for i in doc['intents'].values()):
                 doc['last_reconciled_at']=self._stamp()
         self._update(finish)
         return self.state()
+
+    def reconcile_reports(self):
+        # Reuse the natural-day report worker. One historical read at a time
+        # leaves the other shared read slot available to active sessions.
+        if not self.lp._report_lock.acquire(blocking=False):
+            return
+        try:
+            d = self._read()
+            if not d['account_id'] or d['account_id'] != self.execution._lp_account_id():
+                return
+            for intent in d['intents'].values():
+                if intent.get('settled') and intent.get('report_pending'):
+                    self._reconcile_intent(intent, reuse=True)
+        finally:
+            self.lp._report_lock.release()
+
+    def _reconcile_intent(self, i, *, reuse):
+        if i['state'] in ('aborted','rejected'):
+            return
+        session=self.store.lp_session(i['session_id'])
+        if session is None:
+            untouched = (i['state'] == 'reserved' and not i.get('order_id')
+                         and not i.get('rotation_requested_at') and not self.store.lp_actions(i['session_id']))
+            def missing(doc):
+                intent = doc['intents'][i['intent_id']]
+                if untouched:
+                    intent.update(state='aborted', reserved_usd='0', financial_status='known')
+                else:
+                    intent.update(state='unknown', financial_status='unknown', reconcile_reason='rotation_session_missing' if intent.get('rotation_requested_at') else 'session_missing')
+            self._update(missing)
+            return
+        if reuse and i.get('financial_status') == 'known' and not session.get('facts_error'):
+            if i.get('settled'):
+                if not i.get('report_pending'):
+                    return
+                stamp = session.get('report_checked_at') or session.get('facts_checked_at')
+                if stamp and (self._now() - _timestamp(stamp, name='report_checked_at')).total_seconds() < 300:
+                    return
+            elif session.get('facts_checked_at') and self._funds_fresh(i):
+                # Reuse the just-published tick result; the minute scheduler
+                # still polls even while the 60-second funds lease is valid.
+                try:
+                    _freshness(session['facts_checked_at'], self._now(), 'shared_facts')
+                    return
+                except ValueError:
+                    pass
+        if session.get('order_identity_conflict'):
+            self._record_session(i['intent_id'],session)
+            return
+        self.lp.reconcile_facts(
+            i['session_id'], report_only=i.get('settled', False),
+            apply_lock=(self.execution._acquire_global_lock, self.execution._release_global_lock))
 
     def _guard(self, intent_id, snapshot):
         d=self._read()
@@ -546,7 +863,7 @@ class LPAutoPool:
                                 raise ValueError('active_execution')
                         except ValueError as exc:
                             raise AutoEntryNotSent(str(exc)) from exc
-                        self._update(lambda d:d['intents'][intent_id].update(state='sending'))
+                        self._update(lambda d:d['intents'][intent_id].update(state='sending', financial_status='unknown', reconcile_reason='submission_pending'))
                 finally:
                     self.execution._release_global_lock(lock)
                 return self.lp._post_limit(signed)
@@ -581,14 +898,15 @@ class LPAutoPool:
         with self._round_barrier() as locked:
             return self._reconcile_unknown() if locked else {**self.state(),'round_reason':'round_in_progress'}
 
-    def run_once(self, *, round_id=None):
+    def run_once(self, *, round_id=None, reuse_facts=False):
         with self._round_barrier() as locked:
             if not locked:
                 return {**self.state(),'round_reason':'round_in_progress'}
-            return self._run_once(round_id=round_id)
+            return self._run_once(round_id=round_id, reuse_facts=reuse_facts)
 
-    def _run_once(self, *, round_id=None):
-        self._reconcile_unknown()
+    def _run_once(self, *, round_id=None, reuse_facts=False):
+        self._reconcile_unknown(reuse=reuse_facts)
+        rotation_reason = self._settle_rotations()
         d=self._read()
         round_id=round_id or uuid.uuid4().hex
         if not isinstance(round_id,str) or not round_id or len(round_id)>128:
@@ -599,14 +917,24 @@ class LPAutoPool:
         deficit=max(0,d['target_buy_count']-state['slots']['occupied'])
         actions=[]
         candidates=[]
+        targets=[]
+        reason=state['reason'] or rotation_reason
         self._update(lambda doc:doc['rounds'].update({round_id:dict(started_at=self._stamp())}))
-        if state['desired_running'] and not state['block_reasons'] and deficit and self.execution.lp_mutation_allowed():
+        if state['desired_running'] and not reason and not state['block_reasons'] and self.execution.lp_mutation_allowed():
+            try:
+                targets, victims, candidates = self._ranked_buys(state)
+                if victims:
+                    actions.extend(self._rotate_out(victims, targets, d['config_version']))
+                    reason = 'rotation_awaiting_reconciliation'
+            except ValueError as exc:
+                reason = str(exc)
             submitted=0
             seen=set()
-            candidates=self.candidates()
-            for index,row in enumerate(candidates):
+            for index,row in enumerate(targets if not reason else []):
                 if submitted>=deficit:
                     break
+                if row.get('intent_id'):
+                    continue
                 if row['condition_id'] in seen:
                     continue
                 if not self.state()['desired_running'] or 'submission_unknown' in self.state()['block_reasons']:
@@ -620,8 +948,11 @@ class LPAutoPool:
                 except ValueError as exc:
                     actions.append(dict(condition_id=row['condition_id'],state='rejected',reason=str(exc)))
         self._update(lambda doc:doc.update(last_round=dict(round_id=round_id,checked_at=self._stamp(),actions=actions,
-            candidates=candidates[:10],candidate_count=len(candidates),
-            reason=state['reason'] or ('candidates_or_funds_insufficient' if self._projection(doc)['slots']['occupied']<doc['target_buy_count'] else 'target_filled'))))
+            candidates=[{k: r[k] for k in ('condition_id','token_id','outcome','price','quantity','minimum_order_estimate')}
+                        for r in candidates[:10]],candidate_count=len(candidates),
+            targets=[{k: r[k] for k in ('condition_id','token_id','price','quantity','minimum_order_estimate')}
+                     for r in targets[:d['target_buy_count']]],
+            reason=reason or ('candidates_or_funds_insufficient' if self._projection(doc)['slots']['occupied']<doc['target_buy_count'] else 'target_filled'))))
         return self.state()
 
     def report_facts(self, period_start=None, period_end=None):

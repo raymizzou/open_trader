@@ -7195,6 +7195,12 @@ def test_read_model_last_execution_exposes_submit_failure_summary(
 
 
 class _CancelLP:
+    def begin_order_cancel(self, order_ids):
+        return tuple(order_ids)
+
+    def finish_order_cancel(self, attempts, canceled):
+        assert set(canceled).issubset(attempts)
+
     def candidate_snapshot(self) -> dict[str, object]:
         return {
             "state": "known",

@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-28
 
+- #198/#199/#200 整合：轮换先在同一锁内校验并登记全部榜外 BUY，再释放执行锁和 LP 锁按精确订单 ID 撤单，复用持久化撤单动作与交易事实序号；第一笔引入的 UNKNOWN 不阻断同批风险降低。未核清撤单保留全部预占，真实成交仍记录在会话中，终态核清后才计入自动库存成本并重选补位。保留连接生命周期修复及三票原有约束，补充批次登记、锁外发送、全部终态前不补位和真实适配器完整性组合回归。轻量挂单读取拒绝缺失列表；成交缺状态、缺订单归属或含无法解析的 maker 子记录时保持未知，保留正常未确认和失败成交语义。登记中途异常仍不发网络请求、不释放预占，恢复后按新鲜事实继续撤单。
+
 - N-leg 套利暂停期间，按服务运行的开发测试默认暂缓 32 个 N-leg 专属文件，
   包含 solver benchmark；保留 LP、共享模型／存储／服务、发布及暂停保护检查。
   `TEST_N_LEG=1` 恢复完整服务测试，显式 `TEST=...` 始终执行指定测试。
@@ -18,6 +20,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
   修复并行运行暴露的测试同步问题：HTTP 合并请求等待完整到达，后台扫描
   用受控阻塞验证不阻塞前台刷新，避免依赖 50/100 毫秒的机器耗时。
   验证：测试路由和既有 gate 契约 5 项定向检查通过；未 push 或部署。
+- #200：自动 LP 满额后也将本自动池 BUY 与合格候选按同口径的新鲜预计每小时资金收益率排序，追齐目标数量的前 N 个市场（目标 5 即前 5）；同收益保留已有单，不设提升门槛、最短挂单或冷却。榜外 BUY 先登记并撤单，终态和资金核清后重选当前候选补位；撤单失败凭更新的完整 LIVE 回执重试，新鲜事实证实旧价量失去计奖资格时按零收益排名。撤单前检查目标组合占资和既有 GTD，有成交则保留库存成本，暂停、未知和保护优先，不触碰人工订单。保留完整候选池计数与预览。离线验证排名替换、撤单恢复、重启、资金及保护边界；未合并、push、部署或操作实盘。整合依赖 #198 的统一核对契约。
+
 - Configured engineering skills for GitHub Issues, the five default triage
   labels, and the existing domain context map via `docs/agents/`. Documentation
   only; checked references and staged whitespace. No runtime changes.
@@ -27,6 +31,18 @@ operator-facing: what changed, which workflow is affected, and what was verified
   `make test` fails. The existing predeployment-only Candidate rule is retained.
   Verified scoped Gateway, Legacy, and Prediction Docker suites plus routing
   checks. No Candidate run, push, or deployment for this change.
+
+- #198：LP 巡检与自动调度共用逐会话核对入口，同会话合并在途读取、不同会话最多两个并行；交易变更与奖励观察分开计序，会话和自动资金同事务发布。撤单前立即使旧资金事实失效，刷新期间保留尚未过期的已确认事实，超过 60 秒或读取失败阻止新 BUY；完整核对恢复后合并唤醒原调度。结清历史退出高频核对，报表缺口低频补读。保留精确订单归属、原行情门禁和未知费用保护；不接管人工旧仓。新增并发、失效、回滚、账户完整性和历史复用回归，服务检查结果以本次提交记录为准。未合并、push 或部署。
+- Prediction #199: failed SQLite transactions retain the original error even
+  when BEGIN or rollback fails; slow transactions report writer operation,
+  thread, lock wait and hold time without changing timeouts or retrying writes.
+  Prediction installs a websockets 15.0.1-only HTTP proxy cleanup fix for
+  cancelled handshakes, late replies and repeated EOF. Monitor shutdown cancels
+  pending follow-up scans, drains background tasks and closes its public client
+  on the owning loop, retaining cleanup failure evidence. Verified offline
+  lifecycle regressions and affected store/monitor/runtime tests. The historical
+  production lock holder remains UNKNOWN; this change does not establish that
+  lock contention is resolved.
 
 ## 2026-09-27
 

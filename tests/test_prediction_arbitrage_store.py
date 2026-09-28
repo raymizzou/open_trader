@@ -3021,6 +3021,8 @@ def test_lp_price_history_cache_survives_restart_without_fabricating_books(
             "price": Decimal("0.50"),
         },
     )
+    # A submitted action invalidates trading facts before this cache write.
+    session_before = first.lp_session("lp-history-preserved")
     first.lp_save_price_history(
         "condition-history",
         "token-history",

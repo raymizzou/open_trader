@@ -834,6 +834,11 @@ class PredictionExecutionService:
         set_lp_guard = getattr(self._lp, "set_mutation_guard", None)
         if callable(set_lp_guard):
             set_lp_guard(self.lp_mutation_allowed)
+        if self._lp is not None:
+            from .polymarket_lp_auto import LPAutoPool
+            self._auto_pool = LPAutoPool(self)
+            self._lp._facts_publisher = self._auto_pool.publish_session
+            self._lp._facts_validator = self._validate_lp_facts
         self._threads: dict[str, threading.Thread] = {}
         self._clock = time.monotonic
         self._sleep = time.sleep
@@ -846,22 +851,38 @@ class PredictionExecutionService:
         self._lp_manual_audit_ready = False
 
     def _lp_auto_pool(self):
-        from .polymarket_lp_auto import LPAutoPool
-        with self._lp_dashboard_lock:
-            if not hasattr(self, "_auto_pool"):
-                if self._lp is None:
-                    raise ValueError("lp_unavailable")
-                self._auto_pool = LPAutoPool(self)
-            return self._auto_pool
+        if self._lp is None:
+            raise ValueError("lp_unavailable")
+        return self._auto_pool
 
     def lp_auto_state(self):
         return self._lp_auto_pool().state()
+
+    def set_lp_auto_wakeup(self, wakeup):
+        if self._lp is not None:
+            self._lp._facts_wakeup = wakeup
+
+    def _validate_lp_facts(self, session, snapshot):
+        if self._store.lp_auto_owns_session(str(session['session_id'])):
+            wallet=str((snapshot.get('account') or {}).get('wallet_address') or '').strip().casefold()
+            if not wallet or hashlib.sha256(wallet.encode()).hexdigest()!=self._lp_account_id():
+                raise ValueError('account_identity_mismatch')
+            account = snapshot['account']
+            if (account.get('authenticated') is not True
+                    or account.get('positions_complete') is not True
+                    or account.get('open_orders_complete') is not True):
+                raise ValueError('account_facts_incomplete')
+            from .polymarket_lp_risk import _freshness
+            _freshness(account.get('checked_at'), self._lp._now(), 'account_facts', max_age=Decimal(60))
 
     def lp_auto_configure(self, payload, *, audit=None):
         return self._lp_auto_pool().configure(payload, audit=audit)
 
     def lp_auto_set_desired_running(self, running, *, audit=None):
         return self._lp_auto_pool().set_desired_running(running, audit=audit)
+
+    def lp_auto_scheduled_check(self):
+        return self._lp_auto_pool().run_once(reuse_facts=True)
 
     def lp_auto_run_once(self, *, round_id=None):
         return self._lp_auto_pool().run_once(round_id=round_id)
@@ -1987,14 +2008,19 @@ class PredictionExecutionService:
                     consider(row_order_id, open_by_id.get(row_order_id))
 
             if targets:
-                detailed = self._trading.cancel_orders_detailed(tuple(targets))
-                raw_canceled = detailed.get("canceled", ())
-                if isinstance(raw_canceled, (list, tuple)):
-                    canceled.extend(str(item) for item in raw_canceled)
-                raw_not_canceled = detailed.get("not_canceled", {})
-                if isinstance(raw_not_canceled, Mapping):
-                    for key, value in raw_not_canceled.items():
-                        not_canceled[str(key)] = str(value)
+                attempts = self._lp.begin_order_cancel(targets) if self._lp is not None else []
+                try:
+                    detailed = self._trading.cancel_orders_detailed(tuple(targets))
+                    raw_canceled = detailed.get("canceled", ())
+                    if isinstance(raw_canceled, (list, tuple)):
+                        canceled.extend(str(item) for item in raw_canceled)
+                    raw_not_canceled = detailed.get("not_canceled", {})
+                    if isinstance(raw_not_canceled, Mapping):
+                        for key, value in raw_not_canceled.items():
+                            not_canceled[str(key)] = str(value)
+                finally:
+                    if self._lp is not None:
+                        self._lp.finish_order_cancel(attempts, canceled)
         except Exception as exc:
             audit("failed", canceled, not_canceled, skipped, error=type(exc).__name__)
             self._deliver_feishu_notification(
@@ -4104,7 +4130,9 @@ class PredictionExecutionService:
         return reports.history() if report_date is None else reports.report(report_date)
 
     def lp_generate_due_auto_reports(self) -> list[dict]:
-        return self._lp_auto_reports().generate_due()
+        reports = self._lp_auto_reports().generate_due()
+        self._lp_auto_pool().reconcile_reports()
+        return reports
 
     def lp_report(self, report_date: str) -> dict[str, object] | None:
         """Read one immutable stored LP daily report."""

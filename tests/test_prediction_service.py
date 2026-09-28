@@ -5875,8 +5875,6 @@ def test_lp_reward_share_survives_background_reward_refresh(tmp_path: Path) -> N
     service, _trading, store, monitor = execution_fixture(tmp_path)
     account = Account()
     notifier = CounterNotifier()
-    service._trading = account
-    service._notifier = notifier
     store.lp_save_screening_snapshot(
         {
             "state": "ready",
@@ -5894,7 +5892,14 @@ def test_lp_reward_share_survives_background_reward_refresh(tmp_path: Path) -> N
             "missing_book_token_ids": [],
         }
     )
-    service._lp = PolymarketLPService(store, account)
+    service = PredictionExecutionService(
+        store=store,
+        monitor=monitor,
+        trading=account,
+        notifier=notifier,
+        lock_path=tmp_path / "execution.lock",
+        lp=PolymarketLPService(store, account),
+    )
     service._clock = lambda: 0.0
     runtime = _Runtime()
     runtime.store = store  # type: ignore[assignment]

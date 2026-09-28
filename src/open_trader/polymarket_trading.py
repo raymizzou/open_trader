@@ -1277,14 +1277,20 @@ def _lp_trade(value: object) -> dict[str, object] | None:
         return None
     makers: list[dict[str, object]] = []
     raw_makers = row.get("maker_orders", ())
-    if isinstance(raw_makers, Sequence) and not isinstance(raw_makers, (str, bytes)):
-        for maker in raw_makers:
-            normalized = _lp_maker_order(maker)
-            if normalized is not None:
-                makers.append(normalized)
-    status = str(row.get("status", "")).upper()
+    if not isinstance(raw_makers, Sequence) or isinstance(raw_makers, (str, bytes)):
+        return None
+    for maker in raw_makers:
+        normalized = _lp_maker_order(maker)
+        if normalized is None:
+            # Dropping a malformed maker can erase an owned order's fill.
+            return None
+        makers.append(normalized)
+    status = str(row.get("status") or "").strip().upper()
     if status.startswith("TRADE_STATUS_"):
         status = status[len("TRADE_STATUS_") :]
+    taker_order_id = str(row.get("taker_order_id") or "").strip()
+    if not status or (not taker_order_id and not makers):
+        return None
     return {
         "id": str(trade_id),
         "trade_id": str(trade_id),
@@ -1292,7 +1298,7 @@ def _lp_trade(value: object) -> dict[str, object] | None:
         "condition_id": row.get("condition_id", row.get("market")),
         "token_id": str(token_id),
         "asset_id": str(token_id),
-        "taker_order_id": str(row.get("taker_order_id", "")),
+        "taker_order_id": taker_order_id,
         "side": str(row.get("side", "")).upper(),
         "trader_side": str(row.get("trader_side", "")).upper(),
         "price": _lp_decimal(row.get("price")),
@@ -1508,12 +1514,22 @@ class PolymarketTradingClient:
     ) -> tuple[Decimal, Decimal, tuple[object, ...], tuple[object, ...], datetime]:
         try:
             p_usd_balance, p_usd_allowance = self._collateral_balance_allowance()
-            orders = tuple(_collect(self._client.list_open_orders()))
+            checked_at = datetime.now(UTC)
+            raw_orders = self._client.list_open_orders()
+            if raw_orders is None:
+                raise ValueError("open_orders_unknown")
+            orders = tuple(_collect(raw_orders))
             # This read is intentionally performed even though the snapshot only
             # stores open-order data; the authenticated preflight must prove it.
-            _collect(self._client.list_account_trades())
-            positions = tuple(_collect(self._client.list_positions()))
-            return p_usd_balance, p_usd_allowance, orders, positions, datetime.now(UTC)
+            raw_trades = self._client.list_account_trades()
+            if raw_trades is None:
+                raise ValueError("account_trades_unknown")
+            _collect(raw_trades)
+            raw_positions = self._client.list_positions()
+            if raw_positions is None:
+                raise ValueError("positions_unknown")
+            positions = tuple(_collect(raw_positions))
+            return p_usd_balance, p_usd_allowance, orders, positions, checked_at
         except Exception as exc:
             code = _safe_error_code(exc)
             del exc
@@ -1582,6 +1598,25 @@ class PolymarketTradingClient:
 
     def lp_account_snapshot(self) -> dict[str, object]:
         """Return current account orders and holdings for the read-only LP panel."""
+        account = self._lp_account_facts()
+        order_rows, position_rows = account['open_orders'], account['positions']
+        condition_ids = tuple(
+            dict.fromkeys(
+                str(row.get("condition_id") or "")
+                for row in (*order_rows, *position_rows)
+                if row.get("condition_id")
+            )
+        )
+        metadata = self.lp_market_metadata(condition_ids)
+        for row in (*order_rows, *position_rows):
+            market = metadata.get(str(row.get("condition_id") or ""))
+            if market is not None:
+                row.update(market)
+                row["condition_id"] = market.get("condition_id")
+        return account
+
+    def _lp_account_facts(self) -> dict[str, object]:
+        """Normalize complete authenticated lists before any display enrichment."""
 
         lp_checked_at = datetime.now(UTC)
         balance, allowance, orders, positions, account_checked_at = self._account_read_facts()
@@ -1632,19 +1667,6 @@ class PolymarketTradingClient:
             ):
                 positions_complete = False
             position_rows.append(row)
-        condition_ids = tuple(
-            dict.fromkeys(
-                str(row.get("condition_id") or "")
-                for row in (*order_rows, *position_rows)
-                if row.get("condition_id")
-            )
-        )
-        metadata = self.lp_market_metadata(condition_ids)
-        for row in (*order_rows, *position_rows):
-            market = metadata.get(str(row.get("condition_id") or ""))
-            if market is not None:
-                row.update(market)
-                row["condition_id"] = market.get("condition_id")
         return {
             "authenticated": True,
             "wallet_address": self.config.wallet_address,
@@ -1662,7 +1684,10 @@ class PolymarketTradingClient:
 
         checked_at = datetime.now(UTC)
         try:
-            orders = tuple(_collect(self._client.list_open_orders()))
+            raw_orders = self._client.list_open_orders()
+            if raw_orders is None:
+                raise ValueError("open_orders_unknown")
+            orders = tuple(_collect(raw_orders))
         except Exception:
             return {
                 "authenticated": False,
@@ -3963,24 +3988,26 @@ class PolymarketTradingClient:
         if not market_id or not condition_id or not token_id:
             raise ValueError("external_snapshot_unknown")
         try:
-            account = self.account_snapshot()
-            open_orders = tuple(_collect(self._client.list_open_orders()))
-            trades = tuple(
-                _collect(
-                    self._client.list_account_trades(
-                        token_id=token_id,
-                        market=condition_id,
-                    )
-                )
-            )
+            account = self._lp_account_facts()
+            open_orders = account['open_orders']
+            raw_trades = self._client.list_account_trades(token_id=token_id, market=condition_id)
+            if raw_trades is None:
+                raise ValueError("external_snapshot_unknown")
+            trades = tuple(_collect(raw_trades))
             order_facts: list[object] = list(open_orders)
             known_ids = {
                 str(_field(order, "id", _field(order, "order_id", "")))
                 for order in order_facts
             }
-            for key in ("entry_order_id", "passive_exit_order_id", "protected_exit_order_id"):
-                order_id = str(request.get(key) or "")
-                if not order_id or order_id in known_ids:
+            order_ids = {
+                str(value) for value in (
+                    *(request.get(key) for key in ("entry_order_id", "passive_exit_order_id", "protected_exit_order_id")),
+                    *_collect(request.get("augment_order_ids")),
+                    *_collect(request.get("owned_order_ids")),
+                ) if value
+            }
+            for order_id in sorted(order_ids):
+                if order_id in known_ids:
                     continue
                 get_order = getattr(self._client, "get_order", None)
                 if not callable(get_order):
@@ -3989,8 +4016,10 @@ class PolymarketTradingClient:
                     order = get_order(order_id=order_id)
                 except Exception:
                     continue
-                order_facts.append(order)
-                known_ids.add(order_id)
+                normalized = _lp_order(order)
+                if normalized is not None:
+                    order_facts.append(normalized)
+                    known_ids.add(order_id)
 
             public = self._public_client_factory()
             try:
@@ -4062,28 +4091,8 @@ class PolymarketTradingClient:
                 "reward_min_size": _lp_decimal(reward_min),
                 "reward_max_spread": normalized_reward_spread,
             }
-            account_facts = {
-                "authenticated": True,
-                "wallet_address": self.config.wallet_address,
-                "balance": account.p_usd_balance,
-                "allowance": account.p_usd_allowance,
-                "positions": list(account.positions),
-                "open_orders": [
-                    normalized
-                    for order in order_facts
-                    if (normalized := _lp_order(order)) is not None
-                ],
-                "checked_at": account.checked_at,
-            }
-            order_rows = [
-                normalized
-                for order in order_facts
-                if (normalized := _lp_order(order)) is not None
-            ]
-            order_ids = {
-                str(request.get(key) or "")
-                for key in ("entry_order_id", "passive_exit_order_id", "protected_exit_order_id")
-            } - {""}
+            account_facts = {**account, "open_orders": list(open_orders)}
+            order_rows = order_facts
             order_statuses = {
                 str(_field(order, "id", _field(order, "order_id", ""))): str(
                     _field(order, "status", "")
@@ -4102,11 +4111,9 @@ class PolymarketTradingClient:
                 }
                 for order_id in order_ids
             )
-            trade_rows = [
-                normalized
-                for trade in trades
-                if (normalized := _lp_trade(trade)) is not None
-            ]
+            trade_rows = [_lp_trade(trade) for trade in trades]
+            if any(row is None for row in trade_rows):
+                raise ValueError("external_snapshot_unknown")
             result: dict[str, object] = {
                 "account": account_facts,
                 "market": market_facts,
@@ -4118,9 +4125,9 @@ class PolymarketTradingClient:
                     str(_field(position, "token_id", _field(position, "asset_id", "")))
                     == token_id
                     and (_decimal(_field(position, "size", 0)) > 0)
-                    for position in account.positions
+                    for position in account["positions"]
                 ),
-                "account_checked_at": account.checked_at,
+                "account_checked_at": account["checked_at"],
                 "book_checked_at": book.get("received_at"),
             }
             return result
