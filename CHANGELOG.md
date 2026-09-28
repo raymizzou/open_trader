@@ -5,6 +5,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-28
 
+- Prediction 开发测试使用 pytest-xdist 按用例动态分配，默认 6 个 worker；
+  `TEST_WORKERS=4` 可降低并发，`TEST_WORKERS=1` 可恢复串行诊断。
+  服务选取和跳过规则不变，Candidate Acceptance 仍仅在授权部署前串行运行。
+  验证：测试路由和既有 gate 契约 5 项定向检查通过；未 push 或部署。
 - Configured engineering skills for GitHub Issues, the five default triage
   labels, and the existing domain context map via `docs/agents/`. Documentation
   only; checked references and staged whitespace. No runtime changes.

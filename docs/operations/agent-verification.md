@@ -13,6 +13,11 @@ files with `-m "not pressure and not browser"`. Valid services are `gateway`,
 `legacy`, `account`, and `prediction`; space-separated names cover shared
 changes, for example `SERVICE='gateway prediction'`. `TEST='path::test_name'`
 selects a narrower seam instead. Unscoped `make test` fails before building.
+Scopes containing `prediction` default to six pytest-xdist workers with
+`--dist=worksteal`, distributing individual tests across workers. Set
+`TEST_WORKERS=4` to reduce concurrency or `TEST_WORKERS=1` for serial diagnosis.
+Other services and explicit `TEST=...` selections default to serial execution;
+they also accept `TEST_WORKERS`. Candidate Acceptance remains serial.
 Gateway contains `frontend_gateway` tests; Legacy contains Dashboard and the
 remaining shared backend test files. Update the Makefile prefixes when adding
 a service-specific test family. During
@@ -22,8 +27,9 @@ authorized deployment, after the candidate is merged into local `main`.
 Do not run it during development, review, before merge, or automatically
 after a local merge. The image includes Node and `procps`, and excludes npm,
 Python/JS Playwright, Chromium/browser assets, host mounts, network, published
-ports, the Docker socket, the home directory, and credentials. Do not add
-dependencies or weaken existing skips/xfails. Playwright is a host-only
+ports, the Docker socket, the home directory, and credentials. The approved
+pytest-xdist dependency is pinned in the dev image and development extras.
+Do not add further dependencies or weaken existing skips/xfails. Playwright is a host-only
 Production Smoke prerequisite; ordinary development and Candidate Acceptance
 have zero browser cost.
 

@@ -13,6 +13,7 @@ BUILDX_CONFIG ?= /tmp/open-trader-buildx-$(WORKTREE_HASH)
 DOCKER_BUILD = BUILDX_CONFIG="$(BUILDX_CONFIG)" $(DOCKER) build --target dev --file "$(WORKTREE_ROOT)/$(DOCKERFILE)" --tag "$(DOCKER_IMAGE)" "$(WORKTREE_ROOT)"
 DOCKER_RUN = $(DOCKER) run --rm --init --network none --cap-drop ALL --security-opt no-new-privileges "$(DOCKER_IMAGE)"
 BACKEND_PYTEST := env PYTHONSAFEPATH=1 PYTHONPATH=/workspace:/workspace/src pytest -q -m "not pressure and not browser" -o cache_dir=/tmp/open-trader-pytest-cache --basetemp=/tmp/open-trader-pytest
+TEST_WORKERS ?= $(if $(filter prediction,$(SERVICE)),6,1)
 # ponytail: filename routing; add new service prefixes here when a test family lands.
 SERVICE_TESTS_gateway := $(wildcard tests/test_frontend_gateway*.py)
 SERVICE_TESTS_account := $(wildcard tests/test_account*.py tests/test_futu_account.py tests/test_tiger_account.py tests/test_holding_snapshot*.py tests/test_statement_import.py tests/test_real_holding_input.py tests/test_fx.py tests/test_cutover_us_tiger_to_futu.py)
@@ -37,7 +38,7 @@ test:
 	$(if $(filter-out gateway legacy account prediction,$(SERVICE)),$(error Unknown SERVICE: $(SERVICE)))
 	$(if $(and $(strip $(SERVICE)),$(strip $(TEST))),$(error Use SERVICE or TEST, not both))
 	$(DOCKER_BUILD)
-	$(DOCKER_RUN) $(BACKEND_PYTEST) $(if $(strip $(TEST)),$(TEST),$(sort $(foreach service,$(SERVICE),$(SERVICE_TESTS_$(service)))))
+	$(DOCKER_RUN) $(BACKEND_PYTEST) $(if $(strip $(TEST)),$(TEST),$(sort $(foreach service,$(SERVICE),$(SERVICE_TESTS_$(service))))) $(if $(filter 1,$(TEST_WORKERS)),,-n $(TEST_WORKERS) --dist=worksteal)
 
 test-trend-curve:
 	$(MAKE) test TEST='$(if $(TEST),$(TEST),tests/test_trend_curve_research.py tests/test_trend_curve_backtest.py tests/test_trend_curve_cli.py)'

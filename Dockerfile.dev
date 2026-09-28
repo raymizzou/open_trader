@@ -53,7 +53,7 @@ COPY pyproject.toml /tmp/open-trader-metadata/pyproject.toml
 COPY src/open_trader/__init__.py /tmp/open-trader-metadata/src/open_trader/__init__.py
 RUN python -m venv "$VIRTUAL_ENV" \
     && python -m pip install --no-cache-dir --upgrade pip \
-    && python -m pip install --no-cache-dir -e "/tmp/open-trader-metadata" "pytest>=8.0"
+    && python -m pip install --no-cache-dir -e "/tmp/open-trader-metadata" "pytest>=8.0" "pytest-xdist==3.8.0"
 
 COPY . /workspace
 RUN python -m pip install --no-cache-dir --no-deps -e . \

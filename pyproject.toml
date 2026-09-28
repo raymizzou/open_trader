@@ -23,6 +23,7 @@ dependencies = [
 dev = [
     "playwright>=1.52",
     "pytest>=8.0",
+    "pytest-xdist==3.8.0",
 ]
 
 [project.scripts]

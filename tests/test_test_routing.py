@@ -71,3 +71,33 @@ def test_backend_tests_require_an_explicit_scope() -> None:
     ).stdout
     assert "tests/test_test_routing.py" in focused
     assert "tests/test_account_api.py" not in focused
+
+
+def test_prediction_parallelism_preserves_scope_and_serial_override() -> None:
+    for scope, workers, expected in (
+        ("SERVICE=prediction", None, "-n 6 --dist=worksteal"),
+        ("SERVICE=prediction", "4", "-n 4 --dist=worksteal"),
+        ("SERVICE=prediction", "1", None),
+        ("SERVICE=account", None, None),
+        ("TEST=tests/test_prediction_service.py", None, None),
+        ("TEST=tests/test_prediction_service.py", "6", "-n 6 --dist=worksteal"),
+    ):
+        command = ["make", "-n", "test", scope]
+        if workers is not None:
+            command.append(f"TEST_WORKERS={workers}")
+        preview = subprocess.run(
+            command, cwd=ROOT, capture_output=True, text=True, check=True,
+        ).stdout
+        if expected is None:
+            assert "--dist=" not in preview
+        else:
+            assert expected in preview
+        if "prediction" in scope:
+            assert "tests/test_prediction_service.py" in preview
+            assert "tests/test_account_api.py" not in preview
+
+    candidate = subprocess.run(
+        ["make", "-n", "candidate-acceptance", "TEST_WORKERS=6"],
+        cwd=ROOT, capture_output=True, text=True, check=True,
+    ).stdout
+    assert "--dist=" not in candidate
