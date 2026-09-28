@@ -5,8 +5,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-28
 
-- Prediction 开发测试使用 pytest-xdist 按用例动态分配，默认 6 个 worker；
-  `TEST_WORKERS=4` 可降低并发，`TEST_WORKERS=1` 可恢复串行诊断。
+- Prediction 开发测试使用 pytest-xdist 按用例动态分配，默认 4 个 worker；
+  `TEST_WORKERS=1` 可恢复串行诊断，按机器资源调整 `TEST_WORKERS`。
+  Python 字节码缓存放在测试容器 `/tmp`，减少发布脚本重复启动解释器的开销。
   服务选取和跳过规则不变，Candidate Acceptance 仍仅在授权部署前串行运行。
   修复并行运行暴露的测试同步问题：HTTP 合并请求等待完整到达，后台扫描
   用受控阻塞验证不阻塞前台刷新，避免依赖 50/100 毫秒的机器耗时。

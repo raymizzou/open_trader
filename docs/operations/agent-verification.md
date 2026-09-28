@@ -13,11 +13,13 @@ files with `-m "not pressure and not browser"`. Valid services are `gateway`,
 `legacy`, `account`, and `prediction`; space-separated names cover shared
 changes, for example `SERVICE='gateway prediction'`. `TEST='path::test_name'`
 selects a narrower seam instead. Unscoped `make test` fails before building.
-Scopes containing `prediction` default to six pytest-xdist workers with
+Scopes containing `prediction` default to four pytest-xdist workers with
 `--dist=worksteal`, distributing individual tests across workers. Set
-`TEST_WORKERS=4` to reduce concurrency or `TEST_WORKERS=1` for serial diagnosis.
+`TEST_WORKERS=1` for serial diagnosis; tune `TEST_WORKERS` to available capacity.
 Other services and explicit `TEST=...` selections default to serial execution;
 they also accept `TEST_WORKERS`. Candidate Acceptance remains serial.
+Python bytecode is cached under `/tmp/open-trader-bytecache` inside each test
+container, reducing repeated interpreter startup without changing source trees.
 Gateway contains `frontend_gateway` tests; Legacy contains Dashboard and the
 remaining shared backend test files. Update the Makefile prefixes when adding
 a service-specific test family. During
