@@ -5,6 +5,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-28
 
+- Configured engineering skills for GitHub Issues, the five default triage
+  labels, and the existing domain context map via `docs/agents/`. Documentation
+  only; checked references and staged whitespace. No runtime changes.
+
 - Development Docker tests now require an affected backend `SERVICE` (gateway,
   legacy, account, or prediction) or an explicit `TEST` selector; unscoped
   `make test` fails. The existing predeployment-only Candidate rule is retained.

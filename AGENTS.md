@@ -72,3 +72,20 @@ explicit user authorization and the exact gates in the linked runbook.
 
 Screenshots are optional unless requested. Clean up only after local merge,
 user confirmation, and a clean worktree; never delete a dirty worktree.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs live in GitHub Issues for `raymizzou/open_trader`.
+See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the five default triage labels.
+See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Use the existing multi-context layout through `CONTEXT-MAP.md`.
+See `docs/agents/domain.md`.
