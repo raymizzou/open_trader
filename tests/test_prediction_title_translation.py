@@ -135,14 +135,15 @@ def test_cache_hit_does_not_invoke_completer(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize("provider", ["zhipu", "zhipu_max"])
 def test_miss_uses_selected_engine_and_caches_valid_translation(
-    tmp_path: Path,
+    tmp_path: Path, provider: str,
 ) -> None:
     target = store(tmp_path)
     complete, calls = title_completer("比特币高于九万美元吗？")
 
     translator = LlmTitleTranslator(
-        target, default_provider="zhipu", completers=completers_for(complete)
+        target, default_provider=provider, completers=completers_for(complete)
     )
 
     assert translator.translate("Bitcoin above $90?") == "比特币高于九万美元吗？"
@@ -150,7 +151,7 @@ def test_miss_uses_selected_engine_and_caches_valid_translation(
     system, user = calls[0]
     assert "untrusted" in system.lower()
     assert user == "Bitcoin above $90?"
-    assert target.llm_usage_24h_by_provider()["zhipu"] == {
+    assert target.llm_usage_24h_by_provider()[provider] == {
         "calls": 1,
         "successes": 1,
         "failures": 0,
@@ -174,7 +175,7 @@ def test_failed_engine_does_not_fallback_and_switch_restores_translation(
     translator = LlmTitleTranslator(
         target,
         default_provider="zhipu",
-        completers={"codex": codex, "deepseek": codex, "zhipu": zhipu},
+        completers={"codex": codex, "deepseek": codex, "zhipu": zhipu, "zhipu_max": zhipu},
     )
 
     assert translator.current_provider() == "zhipu"

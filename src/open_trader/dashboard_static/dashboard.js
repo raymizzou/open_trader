@@ -5635,6 +5635,7 @@ const PREDICTION_LLM_PROVIDERS = [
   {id: "codex", name: "Codex", sub: "CLI"},
   {id: "deepseek", name: "DeepSeek", sub: ""},
   {id: "zhipu", name: "智谱 GLM", sub: ""},
+  {id: "zhipu_max", name: "GLM 5.3 Max", sub: ""},
 ];
 
 const PREDICTION_LLM_CHECK_SVG = "<svg width=\"12\" height=\"12\" viewBox=\"0 0 16 16\" fill=\"none\" aria-hidden=\"true\"><path d=\"m3.5 8.5 3 3 6-7\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>";
@@ -5662,7 +5663,7 @@ function predictionLlmEngineHtml(discovery) {
     return `<span class="pm-funnel-chip${active ? " active" : failing ? " failing" : ""}">${label} 24h ${escapeHtml(predictionNumber(item.calls, "0"))} calls · ${escapeHtml(predictionNumber(item.failures, "0"))} fail · ${escapeHtml(predictionNumber(item.cache_hits, "0"))} cache</span>`;
   };
   const selectedName = PREDICTION_LLM_PROVIDERS.find((item) => item.id === selected)?.name || selected;
-  return `<div class="pm-llm-engine"><div class="pm-llm-engine-label">LLM 校验引擎</div><div class="pm-llm-segment" role="group" aria-label="选择 LLM 校验引擎">${buttons}</div><div class="pm-llm-status"><div class="pm-llm-current">当前 ${escapeHtml(selectedName)} · ${escapeHtml(String(models[selected] || ""))} <small>· 选中失败即停止新下单（不降级），恢复后自动重审</small></div></div><div class="pm-llm-usage">${usageChip("zhipu", "智谱")}${usageChip("codex", "Codex")}${usageChip("deepseek", "DeepSeek")}</div><p class="pm-llm-hint">切换立即生效：下一次校验走新引擎；已批准/已拒绝的缓存结论跨引擎复用，不重审。</p></div>`;
+  return `<div class="pm-llm-engine"><div class="pm-llm-engine-label">LLM 校验引擎</div><div class="pm-llm-segment" role="group" aria-label="选择 LLM 校验引擎">${buttons}</div><div class="pm-llm-status"><div class="pm-llm-current">当前 ${escapeHtml(selectedName)} · ${escapeHtml(String(models[selected] || ""))} <small>· 选中失败即停止新下单（不降级），恢复后自动重审</small></div></div><div class="pm-llm-usage">${usageChip("zhipu", "智谱")}${usageChip("zhipu_max", "GLM 5.3 Max")}${usageChip("codex", "Codex")}${usageChip("deepseek", "DeepSeek")}</div><p class="pm-llm-hint">切换立即生效：下一次校验走新引擎；已批准/已拒绝的缓存结论跨引擎复用，不重审。</p></div>`;
 }
 
 async function switchPredictionLlmProvider(provider) {

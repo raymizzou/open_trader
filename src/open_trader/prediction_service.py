@@ -21,7 +21,7 @@ from typing import Any, Callable, Mapping
 from urllib.parse import parse_qs, urlparse
 
 from .daily_premarket import build_notifier, load_env_config
-from .llm_providers import PROVIDER_IDS, resolve_provider
+from .llm_providers import PROVIDER_IDS, provider_credentials_configured, resolve_provider
 from .prediction_read_model import (
     PREDICTION_HISTORY_KINDS,
     _prediction_safe_value,
@@ -274,11 +274,7 @@ def _llm_provider_payload(runtime: PredictionRuntime) -> dict[str, object]:
                 info = dict(candidate)
         except Exception:
             info = {}
-    credentials = {
-        "codex": True,
-        "deepseek": bool(os.environ.get("DEEPSEEK_API_KEY")),
-        "zhipu": bool(os.environ.get("ZHIPU_API_KEY")),
-    }
+    credentials = provider_credentials_configured()
     usage: dict[str, dict[str, int]] = {}
     try:
         if store is not None:

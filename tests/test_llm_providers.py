@@ -39,11 +39,12 @@ SCHEMA = (
 
 
 def test_resolve_provider_accepts_known_ids_case_insensitively() -> None:
-    assert PROVIDER_IDS == ("codex", "deepseek", "zhipu")
+    assert PROVIDER_IDS == ("codex", "deepseek", "zhipu", "zhipu_max")
     assert DEFAULT_PROVIDER == "deepseek"
     assert resolve_provider("codex") == "codex"
     assert resolve_provider(" DeepSeek ") == "deepseek"
     assert resolve_provider("ZHIPU") == "zhipu"
+    assert resolve_provider(" ZHIPU_MAX ") == "zhipu_max"
 
 
 @pytest.mark.parametrize("value", ["", None, "unknown", "gpt", "codex2", 0])
@@ -83,6 +84,7 @@ def test_provider_credentials_configured_reads_env(
         "codex": True,
         "deepseek": False,
         "zhipu": False,
+        "zhipu_max": False,
     }
 
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
@@ -92,6 +94,7 @@ def test_provider_credentials_configured_reads_env(
         "codex": True,
         "deepseek": True,
         "zhipu": True,
+        "zhipu_max": True,
     }
 
 
@@ -109,6 +112,7 @@ def test_provider_model_reads_env_and_keeps_shipped_defaults(
         "codex": CODEX_DEFAULT_MODEL,
         "deepseek": DEEPSEEK_DEFAULT_MODEL,
         "zhipu": ZHIPU_DEFAULT_MODEL,
+        "zhipu_max": "glm-5.3",
     }
 
     monkeypatch.setenv("OPEN_TRADER_CODEX_MODEL", "gpt-custom")
@@ -137,6 +141,8 @@ def test_provider_model_reads_env_and_keeps_shipped_defaults(
         ("ZHIPU_BUDGET_EXHAUSTED", "智谱 GLM 校验额度已耗尽"),
         ("ZHIPU_CONNECTION_FAILED", "智谱 GLM 网络连接失败"),
         ("ZHIPU_RATE_LIMITED", "智谱 GLM 限流"),
+        ("ZHIPU_MAX_OUTPUT_INVALID", "GLM 5.3 Max 返回的结构化结果无效"),
+        ("ZHIPU_MAX_CIRCUIT_OPEN", "GLM 5.3 Max 连续失败已临时熔断"),
     ],
 )
 def test_reason_summary_renders_provider_prefixed_codes(
@@ -571,6 +577,39 @@ def test_zhipu_completion_success_passes_thinking_body(
         "thinking": {"type": "disabled"},
         "max_tokens": 1024,
     }
+
+
+@pytest.mark.parametrize("factory", [validation_completers, title_completers])
+def test_zhipu_max_uses_shared_credentials_and_explicit_max_reasoning(
+    factory, fake_openai: type[FakeOpenAI], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ZHIPU_API_KEY", "zhipu-test")
+    monkeypatch.setenv("OPEN_TRADER_ZHIPU_MODEL", "glm-5.3-flash")
+    monkeypatch.setenv("OPEN_TRADER_ZHIPU_BASE_URL", "https://example.test/v4")
+    monkeypatch.setenv("OPEN_TRADER_ZHIPU_TIMEOUT_SECONDS", "77")
+
+    completion = factory(SCHEMA)["zhipu_max"]("system", "user")
+
+    assert completion.content == '{"ok": true}'
+    assert completion.reason is None
+    assert provider_model("zhipu") == "glm-5.3-flash"
+    assert provider_model("zhipu_max") == "glm-5.3"
+    assert fake_openai.init_kwargs[0] == {
+        "api_key": "zhipu-test",
+        "base_url": "https://example.test/v4",
+        "timeout": 77.0,
+    }
+    request = fake_openai.create_kwargs[0]
+    assert request["model"] == "glm-5.3"
+    assert request["extra_body"]["reasoning_effort"] == "max"
+    assert request["extra_body"]["thinking"] == {"type": "enabled"}
+    assert request["response_format"] == {"type": "json_object"}
+
+    monkeypatch.delenv("ZHIPU_API_KEY")
+    missing_key = factory(SCHEMA)["zhipu_max"]("system", "user")
+    assert missing_key.content is None
+    assert missing_key.reason == "ZHIPU_KEY_MISSING"
+    assert len(fake_openai.create_kwargs) == 1
 
 
 def test_zhipu_base_url_defaults_to_standard_endpoint(

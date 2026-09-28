@@ -5033,6 +5033,36 @@ console.log(JSON.stringify({html, funnel}));
     assert "已批准/已拒绝的缓存结论跨引擎复用" in rendered["html"]
 
 
+def test_prediction_glm_max_option_tracks_selection_credentials_and_usage() -> None:
+    output = run_dashboard_js(r'''
+const discovery = {
+  llm_provider: {selected: "zhipu_max", models: {zhipu: "glm-5.3-flash", zhipu_max: "glm-5.3"}, configured: {zhipu: true, zhipu_max: true}},
+  llm_usage_24h_by_provider: {zhipu_max: {calls: 7, failures: 1, cache_hits: 3}},
+};
+const selected = predictionLlmEngineHtml(discovery);
+discovery.llm_provider.selected = "zhipu";
+const available = predictionLlmEngineHtml(discovery);
+discovery.llm_provider.configured.zhipu_max = false;
+const unavailable = predictionLlmEngineHtml(discovery);
+const requests = [];
+renderPredictionMarket = () => {};
+fetchPredictionState = async () => {};
+predictionPost = async (path, payload) => requests.push({path, payload});
+await handlePredictionMarketClick({target: {closest: selector => selector === "[data-llm-provider]" ? {disabled: false, dataset: {llmProvider: "zhipu_max"}} : null}});
+console.log(JSON.stringify({selected, available, unavailable, requests}));
+''')
+    rendered = json.loads(output)
+    assert "当前 GLM 5.3 Max · glm-5.3" in rendered["selected"]
+    assert 'data-llm-provider="zhipu_max" aria-pressed="true" disabled' in rendered["selected"]
+    assert "GLM 5.3 Max 24h 7 calls · 1 fail · 3 cache" in rendered["selected"]
+    assert 'data-llm-provider="zhipu_max" aria-pressed="false">' in rendered["available"]
+    assert 'data-llm-provider="zhipu_max" aria-pressed="false" disabled' in rendered["unavailable"]
+    assert rendered["requests"] == [{
+        "path": "/api/prediction-arbitrage/llm-provider",
+        "payload": {"provider": "zhipu_max"},
+    }]
+
+
 def test_prediction_relation_funnel_handles_scanning_empty_and_history_states() -> None:
     output = run_dashboard_js(r'''
 const base = {relation_discovery:{

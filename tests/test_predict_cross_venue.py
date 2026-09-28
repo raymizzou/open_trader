@@ -350,8 +350,9 @@ def cross_completers_for(
     return {provider: complete for provider in PROVIDER_IDS}
 
 
+@pytest.mark.parametrize("provider", ["codex", "zhipu_max"])
 def test_equivalence_approval_uses_shared_cache_key_and_records_usage(
-    tmp_path: Path,
+    tmp_path: Path, provider: str,
 ) -> None:
     pair = explicit_pair()
     complete, calls = cross_completer(equivalence_result(pair))
@@ -359,7 +360,7 @@ def test_equivalence_approval_uses_shared_cache_key_and_records_usage(
     store = PredictionArbitrageStore(tmp_path / "data")
     validator = LlmCrossVenueEquivalenceValidator(
         store,
-        default_provider="codex",
+        default_provider=provider,
         completers=cross_completers_for(complete),
     )
 
@@ -379,7 +380,7 @@ def test_equivalence_approval_uses_shared_cache_key_and_records_usage(
     assert CROSS_EXCHANGE_YES_NO_EQUIVALENCE_PROMPT_VERSION == (
         "cross-exchange-yes-no-equivalence-v4"
     )
-    assert store.llm_usage_24h_by_provider()["codex"] == {
+    assert store.llm_usage_24h_by_provider()[provider] == {
         "calls": 1,
         "successes": 1,
         "failures": 0,
@@ -429,7 +430,7 @@ def test_cross_venue_selected_engine_failure_is_strict_without_fallback(
     validator = LlmCrossVenueEquivalenceValidator(
         store,
         default_provider="codex",
-        completers={"codex": codex, "deepseek": deepseek, "zhipu": deepseek},
+        completers={"codex": codex, "deepseek": deepseek, "zhipu": deepseek, "zhipu_max": deepseek},
     )
 
     first = validator.validate(pair)
@@ -460,7 +461,7 @@ def test_cross_venue_circuit_breaker_skips_selected_engine_after_failures(
     validator = LlmCrossVenueEquivalenceValidator(
         store,
         default_provider="codex",
-        completers={"codex": codex, "deepseek": deepseek, "zhipu": codex},
+        completers={"codex": codex, "deepseek": deepseek, "zhipu": codex, "zhipu_max": codex},
     )
 
     for _ in range(3):
@@ -534,7 +535,7 @@ def test_cross_venue_approved_verdict_is_shared_across_engines(
     validator = LlmCrossVenueEquivalenceValidator(
         store,
         default_provider="codex",
-        completers={"codex": codex, "deepseek": codex, "zhipu": zhipu},
+        completers={"codex": codex, "deepseek": codex, "zhipu": zhipu, "zhipu_max": zhipu},
     )
 
     assert validator.validate(pair).approved is True
@@ -3192,7 +3193,7 @@ def test_balance_cooldown_does_not_spend_cross_venue_budget_or_trip_breaker(tmp_
     skipped = lambda *_: LlmCompletion(None, "DEEPSEEK_NO_BALANCE", {}, attempted=False)
     validator = LlmCrossVenueEquivalenceValidator(
         store, default_provider="deepseek", max_llm_calls=1,
-        completers={provider: skipped for provider in ("codex", "deepseek", "zhipu")},
+        completers={provider: skipped for provider in PROVIDER_IDS},
     )
     for _ in range(4):
         result = validator.validate(explicit_pair())

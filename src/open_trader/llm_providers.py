@@ -1,11 +1,12 @@
 """Selectable LLM providers for prediction-market semantic validation.
 
-Three interchangeable transports share one completion contract so operators
+Selectable engines share one completion contract so operators
 can switch the active provider at runtime:
 
 - codex: local Codex CLI subprocess (login-based auth, no API key)
 - deepseek: DeepSeek OpenAI-compatible HTTP API (DEEPSEEK_API_KEY)
 - zhipu: Zhipu GLM OpenAI-compatible HTTP API (ZHIPU_API_KEY)
+- zhipu_max: GLM 5.3 with max reasoning, sharing the Zhipu transport and key
 
 Every adapter returns an :class:`LlmCompletion` with either content or a
 provider-prefixed failure reason (CODEX_*, DEEPSEEK_*, ZHIPU_*), never both
@@ -31,12 +32,13 @@ _deepseek_no_balance_until = 0.0
 _deepseek_balance_probe = False
 _deepseek_balance_lock = threading.Lock()
 
-PROVIDER_IDS = ("codex", "deepseek", "zhipu")
+PROVIDER_IDS = ("codex", "deepseek", "zhipu", "zhipu_max")
 DEFAULT_PROVIDER = "deepseek"
 PROVIDER_LABELS = {
     "codex": "Codex",
     "deepseek": "DeepSeek",
     "zhipu": "智谱 GLM",
+    "zhipu_max": "GLM 5.3 Max",
 }
 
 CODEX_DEFAULT_MODEL = "gpt-5.6-sol"
@@ -102,12 +104,15 @@ def provider_credentials_configured() -> dict[str, bool]:
         "codex": True,
         "deepseek": bool(os.environ.get("DEEPSEEK_API_KEY")),
         "zhipu": bool(os.environ.get("ZHIPU_API_KEY")),
+        "zhipu_max": bool(os.environ.get("ZHIPU_API_KEY")),
     }
 
 
 def provider_model(provider: str) -> str:
     """Resolve one provider's model from env with its shipped default."""
 
+    if provider == "zhipu_max":
+        return "glm-5.3"
     if provider not in PROVIDER_IDS:
         raise ValueError(f"unknown llm provider: {provider}")
     default = _PROVIDER_DEFAULT_MODEL[provider]
@@ -167,7 +172,6 @@ def reason_summary(reason_code: str) -> str | None:
             template = REASON_SUMMARIES.get(reason_code[len(prefix) :])
             if template is not None:
                 return template.format(label=PROVIDER_LABELS[provider])
-            return None
     return None
 
 
@@ -426,6 +430,7 @@ def zhipu_completion(
     timeout_seconds: float = 60.0,
     thinking: bool = True,
     max_tokens: int = 16384,
+    reasoning_effort: str | None = None,
 ) -> LlmCompletion:
     """Call the Zhipu GLM OpenAI-compatible chat API once (one empty retry)."""
 
@@ -442,6 +447,12 @@ def zhipu_completion(
         )
 
         def create() -> object:
+            extra_body: dict[str, object] = {
+                "thinking": {"type": "enabled" if thinking else "disabled"},
+                "max_tokens": max_tokens,
+            }
+            if reasoning_effort:
+                extra_body["reasoning_effort"] = reasoning_effort
             return client.chat.completions.create(
                 model=model,
                 messages=[
@@ -449,10 +460,7 @@ def zhipu_completion(
                     {"role": "user", "content": user},
                 ],
                 response_format={"type": "json_object"},
-                extra_body={
-                    "thinking": {"type": "enabled" if thinking else "disabled"},
-                    "max_tokens": max_tokens,
-                },
+                extra_body=extra_body,
                 timeout=timeout_seconds,
             )
 
@@ -470,6 +478,14 @@ def zhipu_completion(
         return LlmCompletion(
             None, _http_failure_reason("ZHIPU", exc), _normalized_usage(None)
         )
+
+
+def _zhipu_max_completion(system: str, user: str) -> LlmCompletion:
+    # GLM 5.3 requires thinking even for translation; keep the reasoning budget.
+    return zhipu_completion(
+        system, user, model=provider_model("zhipu_max"),
+        timeout_seconds=zhipu_validation_timeout(), reasoning_effort="max",
+    )
 
 
 def validation_completers(
@@ -497,6 +513,7 @@ def validation_completers(
             model=provider_model("zhipu"),
             timeout_seconds=zhipu_validation_timeout(),
         ),
+        "zhipu_max": _zhipu_max_completion,
     }
 
 
@@ -533,4 +550,5 @@ def title_completers(output_schema: Path) -> dict[str, Completion]:
             thinking=False,
             max_tokens=1024,
         ),
+        "zhipu_max": _zhipu_max_completion,
     }

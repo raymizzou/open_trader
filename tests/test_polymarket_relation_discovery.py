@@ -876,7 +876,7 @@ def test_current_provider_prefers_store_row_over_env_and_defaults(
         "selected": "deepseek",
         "models": dict(env_default.models),
         "default": "codex",
-        "configured": {"codex": True, "deepseek": False, "zhipu": False},
+        "configured": {"codex": True, "deepseek": False, "zhipu": False, "zhipu_max": False},
         "fallback": "",
     }
 
@@ -896,15 +896,16 @@ def test_selected_provider_rejects_unknown_completers_and_models(
         LlmRelationValidator(db, max_llm_calls=-1)
 
 
+@pytest.mark.parametrize(("provider", "model"), [("codex", "gpt-test"), ("zhipu_max", "glm-5.3")])
 def test_llm_approve_uses_selected_engine_and_records_usage(
-    tmp_path: Path,
+    tmp_path: Path, provider, model,
 ) -> None:
     complete, calls = make_completer(codex_result())
     db = codex_store(tmp_path)
     validator = LlmRelationValidator(
         db,
         models={"codex": "gpt-test"},
-        default_provider="codex",
+        default_provider=provider,
         completers=all_providers(complete),
     )
 
@@ -914,8 +915,8 @@ def test_llm_approve_uses_selected_engine_and_records_usage(
     assert result.decision == "APPROVE"
     assert result.relation == "B_IMPLIES_A"
     assert result.cached is False
-    assert result.provider == "codex"
-    assert result.model == "gpt-test"
+    assert result.provider == provider
+    assert result.model == model
     assert len(calls) == 1
     system, user = calls[0]
     assert "untrusted" in system.lower()
@@ -947,7 +948,7 @@ def test_llm_approve_uses_selected_engine_and_records_usage(
         "output_tokens": 20,
         "reasoning_output_tokens": 5,
     }
-    assert db.llm_usage_24h_by_provider()["codex"] == {
+    assert db.llm_usage_24h_by_provider()[provider] == {
         "calls": 1,
         "successes": 1,
         "failures": 0,
@@ -1291,7 +1292,7 @@ def test_selected_engine_failure_is_strict_without_fallback(
     validator = LlmRelationValidator(
         db,
         default_provider="codex",
-        completers={"codex": codex, "deepseek": deepseek, "zhipu": zhipu},
+        completers={"codex": codex, "deepseek": deepseek, "zhipu": zhipu, "zhipu_max": zhipu},
     )
 
     first = validator.validate(relation)
@@ -1340,6 +1341,7 @@ def test_failure_verdict_keeps_the_model_of_the_engine_that_failed(
             "codex": make_completer()[0],
             "deepseek": make_completer()[0],
             "zhipu": zhipu_fails,
+            "zhipu_max": zhipu_fails,
         },
     )
 
@@ -1361,7 +1363,7 @@ def test_approved_verdict_is_shared_across_engines(tmp_path: Path) -> None:
     validator = LlmRelationValidator(
         db,
         default_provider="codex",
-        completers={"codex": codex, "deepseek": codex, "zhipu": zhipu},
+        completers={"codex": codex, "deepseek": codex, "zhipu": zhipu, "zhipu_max": zhipu},
     )
 
     assert validator.validate(relation).status == "approved"
@@ -1427,7 +1429,7 @@ def test_circuit_breaker_is_independent_per_provider(tmp_path: Path) -> None:
     validator = LlmRelationValidator(
         db,
         default_provider="codex",
-        completers={"codex": codex, "deepseek": deepseek, "zhipu": codex},
+        completers={"codex": codex, "deepseek": deepseek, "zhipu": codex, "zhipu_max": codex},
     )
 
     for _ in range(3):
@@ -1839,7 +1841,7 @@ def test_fallback_provider_takes_over_after_output_invalid(
     validator = LlmRelationValidator(
         db,
         default_provider="deepseek",
-        completers={"codex": zhipu, "deepseek": deepseek, "zhipu": zhipu},
+        completers={"codex": zhipu, "deepseek": deepseek, "zhipu": zhipu, "zhipu_max": zhipu},
         fallback_provider="zhipu",
         output_retries=0,
     )
@@ -1889,7 +1891,7 @@ def test_fallback_stays_disabled_without_configuration(
     validator = LlmRelationValidator(
         db,
         default_provider="deepseek",
-        completers={"codex": zhipu, "deepseek": deepseek, "zhipu": zhipu},
+        completers={"codex": zhipu, "deepseek": deepseek, "zhipu": zhipu, "zhipu_max": zhipu},
         output_retries=0,
         **fallback_kwargs,
     )
@@ -1921,7 +1923,7 @@ def test_fallback_failure_keeps_both_reason_codes(
     validator = LlmRelationValidator(
         db,
         default_provider="deepseek",
-        completers={"codex": zhipu, "deepseek": deepseek, "zhipu": zhipu},
+        completers={"codex": zhipu, "deepseek": deepseek, "zhipu": zhipu, "zhipu_max": zhipu},
         fallback_provider="zhipu",
     )
 

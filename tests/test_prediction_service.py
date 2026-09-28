@@ -11274,6 +11274,7 @@ class _ProviderSnapshotValidator:
                 "codex": "gpt-test",
                 "deepseek": "deepseek-test",
                 "zhipu": "glm-5",
+                "zhipu_max": "glm-5.3",
             },
             "default": default,
             "configured": {"codex": True, "deepseek": False, "zhipu": False},
@@ -11342,6 +11343,8 @@ def test_llm_provider_get_reports_selection_and_provider_cards(
     assert by_provider["codex"]["credentials_configured"] is True
     assert by_provider["deepseek"]["credentials_configured"] is False
     assert by_provider["zhipu"]["usage_24h"] == {}
+    assert by_provider["zhipu_max"]["model"] == "glm-5.3"
+    assert by_provider["zhipu_max"]["credentials_configured"] is False
     assert handler_errors == []
 
 
@@ -11369,14 +11372,15 @@ def test_llm_provider_get_reports_fallback_key_and_usage_passthrough(
     assert handler_errors == []
 
 
+@pytest.mark.parametrize("provider", ["zhipu", "zhipu_max"])
 def test_llm_provider_post_switches_engine_without_handler_errors(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str
 ) -> None:
     # Env default codex + empty selection table: the first click on zhipu
     # must durably win (no swallowed no-op) and the handler thread must
     # survive the response (no fall-through past the branch).
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
-    monkeypatch.delenv("ZHIPU_API_KEY", raising=False)
+    monkeypatch.setenv("ZHIPU_API_KEY", "zhipu-test")
     monkeypatch.setenv("OPEN_TRADER_PREDICTION_LLM_PROVIDER", "codex")
     db = PredictionArbitrageStore(tmp_path / "data")
     runtime = _ProviderRuntime(db)
@@ -11388,7 +11392,7 @@ def test_llm_provider_post_switches_engine_without_handler_errors(
             _production_request(
                 base,
                 "/api/prediction-arbitrage/llm-provider",
-                data=b'{"provider":"zhipu"}',
+                data=json.dumps({"provider": provider}).encode(),
             )
         )
         after_status, after = _response(
@@ -11405,9 +11409,11 @@ def test_llm_provider_post_switches_engine_without_handler_errors(
     assert before_status == after_status == 200
     assert before["selected"] == "codex"
     assert switch_status == 200
-    assert switched["selected"] == "zhipu"
-    assert after["selected"] == "zhipu"
-    assert db.get_llm_provider(default="codex") == "zhipu"
+    assert switched["selected"] == provider
+    assert after["selected"] == provider
+    by_provider = {item["provider"]: item for item in after["providers"]}
+    assert by_provider[provider]["credentials_configured"] is True
+    assert PredictionArbitrageStore(tmp_path / "data").get_llm_provider() == provider
     assert invalid_status == 400
     assert handler_errors == []
 
