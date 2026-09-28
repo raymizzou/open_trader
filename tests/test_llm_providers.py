@@ -404,6 +404,8 @@ def fake_openai(monkeypatch: pytest.MonkeyPatch) -> type[FakeOpenAI]:
     import openai
 
     monkeypatch.setattr(openai, "OpenAI", FakeOpenAI)
+    monkeypatch.setattr(llm_providers, "_deepseek_no_balance_until", 0.0)
+    monkeypatch.setattr(llm_providers, "_deepseek_balance_probe", False)
     FakeOpenAI.responses = []
     FakeOpenAI.error = None
     FakeOpenAI.init_kwargs = []
@@ -672,6 +674,8 @@ def test_deepseek_no_balance_body_classifies_insufficient_balance(
         == "DEEPSEEK_NO_BALANCE"
     )
 
+    # The next real attempt occurs only after the billing cooldown.
+    monkeypatch.setattr(llm_providers, "_balance_clock", lambda: float("inf"))
     fake_openai.error = _FakeApiError(401)
     assert (
         deepseek_completion("sys", "user", model="deepseek-v4-flash").reason
@@ -743,3 +747,101 @@ def test_title_completers_cover_all_providers(
     assert set(completers) == set(PROVIDER_IDS)
     assert completers["deepseek"]("sys", "user").reason == "DEEPSEEK_KEY_MISSING"
     assert completers["zhipu"]("sys", "user").reason == "ZHIPU_KEY_MISSING"
+
+
+@pytest.mark.parametrize("body", [
+    {"error": {"message": "Insufficient Balance", "code": "invalid_request_error"}},
+    {"error": {"message": "billing unavailable"}},
+])
+def test_deepseek_402_sdk_body_and_shared_cooldown(monkeypatch, tmp_path, body):
+    import httpx
+    import openai
+    from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+    from open_trader.prediction_title_translation import LlmTitleTranslator
+
+    real_openai = openai.OpenAI
+    calls = []
+    clock = [100.0]
+    monkeypatch.setattr(llm_providers, "_deepseek_no_balance_until", 0.0, raising=False)
+    monkeypatch.setattr(llm_providers, "_deepseek_balance_probe", False, raising=False)
+    monkeypatch.setattr(llm_providers, "_balance_clock", lambda: clock[0], raising=False)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-only")
+
+    def respond(request):
+        calls.append(request)
+        if len(calls) in (1, 2, 4):
+            return httpx.Response(402, json=body)
+        return httpx.Response(200, json={
+            "id": "test", "object": "chat.completion", "created": 0,
+            "model": "deepseek-test", "choices": [{"index": 0,
+            "message": {"role": "assistant", "content": '{"title_zh": "测试标题"}'},
+            "finish_reason": "stop"}],
+        })
+
+    def client(**kwargs):
+        return real_openai(**kwargs, http_client=httpx.Client(
+            transport=httpx.MockTransport(respond)))
+
+    monkeypatch.setattr(openai, "OpenAI", client)
+    translator = LlmTitleTranslator(PredictionArbitrageStore(tmp_path), default_provider="deepseek")
+    assert translator.translate("Title one") is None
+    validator = validation_completers(SCHEMA)["deepseek"]
+    result = validator("system", "different validation input")
+    assert result.reason == "DEEPSEEK_NO_BALANCE"
+    assert not result.attempted
+    assert len(calls) == 1  # another consumer and title must share the cooldown
+    assert translator.translate("Title two") is None
+    assert len(calls) == 1
+    clock[0] += 3600
+    assert validator("system", "probe").reason == "DEEPSEEK_NO_BALANCE"
+    assert len(calls) == 2
+    assert translator.translate("Title three") is None
+    assert len(calls) == 2
+    clock[0] += 3600
+    assert translator.translate("Title one") == "测试标题"
+    assert len(calls) == 3
+    assert translator.translate("Title one") == "测试标题"
+    assert len(calls) == 3  # successful cache remains usable
+    assert translator.translate("New title") is None
+    assert len(calls) == 4
+    assert translator.translate("Title one") == "测试标题"
+    assert len(calls) == 4  # cache is available even during a new billing failure
+    assert translator.store.llm_usage_24h()["calls"] == 3
+
+
+def test_deepseek_balance_recovery_probe_is_single_flight(fake_openai, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-only")
+    fake_openai.error = _FakeApiError(402)
+    assert deepseek_completion("sys", "first", model="test").reason == "DEEPSEEK_NO_BALANCE"
+    deadline = llm_providers._deepseek_no_balance_until
+    monkeypatch.setattr(llm_providers, "_balance_clock", lambda: deadline)
+    entered, release = threading.Event(), threading.Event()
+
+    def probe(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return LlmCompletion('{"ok": true}', None, {})
+
+    monkeypatch.setattr(llm_providers, "_deepseek_completion", probe)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(deepseek_completion, "sys", "probe", model="test")
+        try:
+            assert entered.wait(5)
+            assert deepseek_completion("sys", "other caller", model="test").reason == "DEEPSEEK_NO_BALANCE"
+        finally:
+            release.set()
+        assert pending.result().content is not None
+    assert llm_providers._deepseek_no_balance_until == 0
+    assert not llm_providers._deepseek_balance_probe
+
+
+def test_deepseek_transient_failure_does_not_trigger_balance_cooldown(fake_openai, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-only")
+    fake_openai.error = _FakeApiError(500)
+    assert deepseek_completion("sys", "first", model="test").reason == "DEEPSEEK_HTTP_ERROR"
+    fake_openai.error = None
+    assert deepseek_completion("sys", "second", model="test").content is not None
+    assert len(fake_openai.create_kwargs) == 2

@@ -2111,3 +2111,18 @@ def test_mechanical_group_codec_parses_gamma_fee_fields() -> None:
     assert by_condition["condition-m1"].fee_rate is None
     assert by_condition["condition-m2"].fees_enabled is None
     assert by_condition["condition-m2"].fee_rate is None
+
+
+def test_balance_cooldown_does_not_spend_relation_budget_or_trip_breaker(tmp_path):
+    store = PredictionArbitrageStore(tmp_path)
+    validator = LlmRelationValidator(
+        store, default_provider="deepseek", max_llm_calls=1, fallback_provider="",
+        completers=all_providers(lambda *_: LlmCompletion(
+            None, "DEEPSEEK_NO_BALANCE", {}, attempted=False)),
+    )
+    for _ in range(4):
+        result = validator.validate(threshold_relation())
+        assert result.status == "llm_unavailable"
+        assert result.reason_codes == ("DEEPSEEK_NO_BALANCE",)
+    assert validator.llm_calls == 0
+    assert store.llm_usage_24h()["calls"] == 0

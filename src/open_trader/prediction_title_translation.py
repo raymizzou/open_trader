@@ -234,6 +234,8 @@ class LlmTitleTranslator:
             return cached
         model = provider_model(provider)
         completion = self.completers[provider](_PROMPT, normalized)
+        if not completion.attempted:
+            return None
         if completion.content is not None:
             result = _parse_structured(completion.content)
             translated = _valid_translation(

@@ -18,9 +18,18 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
+from time import monotonic as _balance_clock
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+
+# Match the monitor's existing one-hour retry for insufficient balance.
+LLM_NO_BALANCE_RETRY_SECONDS = 3600.0
+# ponytail: process-local cooldown; persist it if restarts become a retry source.
+_deepseek_no_balance_until = 0.0
+_deepseek_balance_probe = False
+_deepseek_balance_lock = threading.Lock()
 
 PROVIDER_IDS = ("codex", "deepseek", "zhipu")
 DEFAULT_PROVIDER = "deepseek"
@@ -65,6 +74,7 @@ class LlmCompletion:
     content: str | None
     reason: str | None
     usage: dict[str, int]
+    attempted: bool = True
 
 
 def resolve_provider(value: object, *, default: str = DEFAULT_PROVIDER) -> str:
@@ -288,7 +298,7 @@ def _error_body_indicates_no_balance(body: object) -> bool:
 
     if not isinstance(body, Mapping):
         return False
-    error = body.get("error")
+    error = body.get("error", body)
     if not isinstance(error, Mapping):
         return False
     if str(error.get("code")) == "1113":
@@ -302,6 +312,8 @@ def _error_body_indicates_no_balance(body: object) -> bool:
 
 def _http_failure_reason(prefix: str, exc: BaseException) -> str:
     status = getattr(exc, "status_code", None)
+    if prefix == "DEEPSEEK" and status == 402:
+        return "DEEPSEEK_NO_BALANCE"
     if (
         status in (429, 402)
         and _error_body_indicates_no_balance(getattr(exc, "body", None))
@@ -328,7 +340,41 @@ def deepseek_completion(
     timeout_seconds: float = 60.0,
     reasoning_effort: str | None = None,
 ) -> LlmCompletion:
-    """Call the DeepSeek OpenAI-compatible chat API once (one empty retry)."""
+    """Share balance backoff across translation and both validation consumers."""
+
+    global _deepseek_no_balance_until, _deepseek_balance_probe
+    with _deepseek_balance_lock:
+        if _deepseek_balance_probe or _balance_clock() < _deepseek_no_balance_until:
+            return LlmCompletion(
+                None, "DEEPSEEK_NO_BALANCE", _normalized_usage(None), attempted=False
+            )
+        probing = _deepseek_no_balance_until > 0
+        if probing:
+            _deepseek_balance_probe = True
+    # Normal requests remain concurrent; only recovery probes are single-flight.
+    completion = _deepseek_completion(
+        system, user, model=model, timeout_seconds=timeout_seconds,
+        reasoning_effort=reasoning_effort,
+    )
+    with _deepseek_balance_lock:
+        if completion.reason == "DEEPSEEK_NO_BALANCE":
+            _deepseek_no_balance_until = _balance_clock() + LLM_NO_BALANCE_RETRY_SECONDS
+        elif probing:
+            _deepseek_no_balance_until = 0.0
+        if probing:
+            _deepseek_balance_probe = False
+    return completion
+
+
+def _deepseek_completion(
+    system: str,
+    user: str,
+    *,
+    model: str,
+    timeout_seconds: float,
+    reasoning_effort: str | None,
+) -> LlmCompletion:
+    """One HTTP attempt, with one retry only for empty successful content."""
 
     api_key = os.environ.get("DEEPSEEK_API_KEY")
     if not api_key:

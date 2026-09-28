@@ -204,6 +204,64 @@ def test_incomplete_account_cannot_release_a_canceled_order(tmp_path):
     assert execution.lp_auto_reconcile_unknown()['funds']['status'] == 'known'
 
 
+def test_slow_scoring_does_not_discard_another_sessions_fresh_funds(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta
+    from tests import test_lp_auto_pool as venue
+
+    execution, exchange, lp, store = setup(tmp_path, 2)
+    execution.lp_auto_configure(dict(budget_usd='100', target_buy_count=2))
+    execution.lp_auto_set_desired_running(True)
+    intents = execution.lp_auto_run_once()['intents']
+    execution.lp_auto_set_desired_running(False)
+    first, second = [store.lp_session(intent['session_id']) for intent in intents]
+    entered, release = Event(), Event()
+
+    def scoring(order_id):
+        if order_id == first['entry_order_id']:
+            entered.set()
+            assert release.wait(5)
+        return True
+
+    exchange.get_order_scoring = scoring
+    apply_lock = (execution._acquire_global_lock, execution._release_global_lock)
+    with ThreadPoolExecutor(1) as workers:
+        monitoring = workers.submit(lp._tick_session, (first, 0), apply_lock=apply_lock)
+        try:
+            assert entered.wait(2)
+            monkeypatch.setattr(venue, 'NOW', venue.NOW + timedelta(seconds=61))
+            result = lp.reconcile_facts(second['session_id'], apply_lock=apply_lock)
+            assert result[3] is None, 'scoring must not occupy the facts apply lock'
+            refreshed = next(row for row in execution.lp_auto_state()['intents']
+                             if row['session_id'] == second['session_id'])
+            assert refreshed['financial_status'] == 'known'
+            assert datetime.fromisoformat(str(refreshed['checked_at'])) == venue.NOW
+            assert not monitoring.done()
+        finally:
+            release.set()
+        monitoring.result(timeout=5)
+    assert len(exchange.posts) == 2
+
+
+def test_partial_fill_collects_remaining_buy_before_scoring(tmp_path):
+    execution, exchange, _, _ = setup(tmp_path)
+    execution.lp_auto_configure(dict(budget_usd='100', target_buy_count=1))
+    execution.lp_auto_set_desired_running(True)
+    execution.lp_auto_run_once()
+    exchange.orders[0]['size_matched'] = '5'
+    exchange.positions = [dict(token_id='m00', condition_id='m00', size='5')]
+    calls = []
+
+    def cancel(order_id):
+        calls.append('cancel')
+        return dict(canceled=[order_id], status='CANCELED')
+
+    exchange.cancel_order = cancel
+    exchange.get_order_scoring = lambda order_id: calls.append('scoring') or True
+    execution.lp_tick()
+    assert calls == ['cancel'], 'fill cleanup must not wait on a scoring read'
+    assert len(exchange.posts) == 1
+
+
 def test_scheduler_reuses_published_facts_and_leaves_settled_history_alone(tmp_path):
     execution, exchange, _, _ = setup(tmp_path)
     execution.lp_auto_configure(dict(budget_usd='100', target_buy_count=1))
@@ -668,11 +726,11 @@ def test_unknown_cancel_recovers_from_exact_terminal_receipt_after_restart(tmp_p
     assert cancels == ['o1'] and len(exchange.posts) == 1
 
 
-def test_manual_cancel_registration_serializes_with_monitor_apply(tmp_path):
-    execution, exchange, _, _ = setup(tmp_path)
+def test_manual_cancel_during_scoring_fences_monitor_apply(tmp_path):
+    execution, exchange, _, store = setup(tmp_path)
     execution.lp_auto_configure(dict(budget_usd='100', target_buy_count=1))
     execution.lp_auto_set_desired_running(True)
-    execution.lp_auto_run_once()
+    sid = execution.lp_auto_run_once()['intents'][0]['session_id']
     scoring, release, canceled = Event(), Event(), Event()
     def score(order_id):
         scoring.set()
@@ -689,12 +747,14 @@ def test_manual_cancel_registration_serializes_with_monitor_apply(tmp_path):
         try:
             assert scoring.wait(2)
             manual = workers.submit(execution.lp_cancel_orders, dict(confirm=True, order_ids=['o1']))
-            assert not canceled.wait(.2)
+            assert canceled.wait(2), 'read-only scoring must not block manual cancellation'
         finally:
             release.set()
         tick.result(timeout=5)
         manual.result(timeout=5)
     assert canceled.is_set()
+    assert store.lp_session(sid).get('scoring_status') != 'true'
+    assert execution.lp_auto_state()['funds']['status'] == 'unknown'
     assert len(exchange.posts) == 1
 
 

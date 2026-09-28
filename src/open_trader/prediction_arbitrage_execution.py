@@ -5708,7 +5708,7 @@ class PredictionExecutionService:
             )
             now_clock = beijing_clock(datetime.now(UTC)) or "未知"
             if self._deliver_feishu_notification(
-                f"⚠️ LLM 校验不可用，暂停自动下单（{now_clock}）", message
+                f"⚠️ LLM 校验不可用，新关系校验受阻（{now_clock}）", message
             ):
                 return {"state": "sent"}
             return {"state": "failed", "reason": "notification_failed"}

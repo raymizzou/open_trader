@@ -470,6 +470,14 @@ def test_dependency_probe_is_bounded_and_respects_retry_after(
         ("http429", {"error_type": "RateLimitError", "status": 429}, False, (), 429),
         ("connection_reset", {"error_type": "ConnectionResetError"}, False, (), None),
         (
+            "body_timeout_after_200",
+            {"error_type": "TransportError", "error_chain": ["TransportError", "ReadTimeout"], "status": 200},
+            False,
+            ("TransportError", "ReadTimeout"),
+            200,
+        ),
+        ("schema_after_200", {"error_type": "SchemaError", "status": 200}, True, (), 200),
+        (
             "wrapped_certificate",
             {
                 "error_type": "TransportError",
@@ -539,6 +547,11 @@ def test_error_classification_preserves_operator_blockers(
     if status is not None:
         assert preparation["last_error_status"] == status
     assert "secret-token" not in repr(preparation)
+    if expected_paused:
+        restarted = PolymarketLPService(
+            service.store, Exchange(), clock=lambda: clock[0]
+        )
+        assert restarted.refresh_price_history()["preparation_outcome"] == "paused"
 
     if label in {"http503", "wrapped_certificate"}:
         def boundary_handler(request: httpx.Request) -> httpx.Response:
@@ -642,6 +655,76 @@ def test_error_classification_preserves_operator_blockers(
         invalid_items = invalid_store.lp_preparation_items()
         assert invalid_items[0]["condition_id"] == "market-invalid"
         assert invalid_items[0]["state"] == "waiting_retry"
+
+
+@pytest.mark.parametrize("pause_age,retry_after", [(0, None), (3600, None), (0, 90000)])
+def test_catalog_body_timeout_retries_and_recovers_persisted_pause(
+    tmp_path, pause_age, retry_after
+) -> None:
+    clock = [datetime(2026, 9, 28, tzinfo=UTC)]
+    requests = []
+
+    class TimedOutBody(httpx.SyncByteStream):
+        def __iter__(self):
+            raise httpx.ReadTimeout("body stalled after headers")
+            yield b""  # Make the failure occur while consuming the response body.
+
+    def handler(request):
+        requests.append(request.url.path)
+        headers = {} if retry_after is None else {"Retry-After": str(retry_after)}
+        return httpx.Response(200, headers=headers, stream=TimedOutBody(), request=request)
+
+    def public_factory():
+        public = PublicClient(PRODUCTION)
+        public._ctx.clob._client = httpx.Client(
+            base_url=PRODUCTION.clob_url, transport=httpx.MockTransport(handler)
+        )
+        return public
+
+    adapter = PolymarketTradingClient(
+        TradingConfig("0x" + "1" * 40, "0x" + "2" * 40),
+        client=object(), public_client_factory=public_factory,
+    )
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, adapter, clock=lambda: clock[0])
+    result = service.refresh_price_history()
+    preparation = result["preparation"]
+    assert preparation["last_error_status"] == 200
+    assert tuple(preparation["last_error_chain"]) == ("TransportError", "ReadTimeout")
+    assert preparation["state"] == "waiting_retry"
+    assert preparation["paused"] is False
+    assert preparation["last_success_at"] is None
+
+    # The deployed version has already persisted this timeout as a manual pause.
+    store.lp_save_preparation({
+        **preparation, "state": "paused", "paused": True,
+        "last_error_category": "operator_attention", "next_retry_at": None,
+        "next_probe_at": None,
+    })
+    clock[0] += timedelta(seconds=pause_age)
+    restarted = PolymarketLPService(store, adapter, clock=lambda: clock[0])
+    before = len(requests)
+    if pause_age == 0:
+        assert restarted.refresh_price_history()["preparation_outcome"] == "waiting_retry"
+        assert len(requests) == before
+        if retry_after is not None:
+            deadline = clock[0] + timedelta(seconds=retry_after)
+            assert datetime.fromisoformat(restarted.preparation_snapshot()["next_probe_at"]) == deadline
+            assert datetime.fromisoformat(restarted.preparation_snapshot()["next_retry_at"]) == deadline
+            clock[0] = deadline - timedelta(seconds=1)
+            assert restarted.refresh_price_history()["preparation_outcome"] == "waiting_retry"
+            assert len(requests) == before
+            clock[0] = deadline
+        else:
+            clock[0] += timedelta(seconds=300)
+    result = restarted.refresh_price_history()
+    assert len(requests) > before
+    assert result["preparation"]["state"] == "waiting_retry"
+    assert result["preparation"]["last_success_at"] is None
+    assert result["preparation"]["last_error_category"] == "transient"
+    before = len(requests)
+    assert restarted.refresh_price_history()["preparation_outcome"] == "waiting_retry"
+    assert len(requests) == before
 
 
 def test_metadata_probe_captures_retry_after_from_gamma_transport() -> None:

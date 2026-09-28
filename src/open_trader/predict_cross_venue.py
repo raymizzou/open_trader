@@ -1334,11 +1334,13 @@ class LlmCrossVenueEquivalenceValidator:
         breaker = self._breakers[provider]
         if breaker.disabled(time.monotonic()):
             return self._result(pair, f"{provider.upper()}_CIRCUIT_OPEN")
-        self.llm_calls += 1
         completion = self.completers[provider](
             _cross_equivalence_prompt(),
             json.dumps({'predict': _equivalence_market_payload(pair.predict), 'polymarket': _equivalence_market_payload(pair.polymarket)}, ensure_ascii=False, sort_keys=True, separators=(',', ':')),
         )
+        if not completion.attempted:
+            return self._result(pair, completion.reason or f"{provider.upper()}_FAILED")
+        self.llm_calls += 1
         if completion.content is None:
             breaker.record_failure(time.monotonic())
             self.store.record_llm_call(status="failed", usage={**completion.usage, "provider": provider})

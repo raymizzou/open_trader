@@ -1298,7 +1298,8 @@ class PolymarketLPService:
         )
         operator_blocker = any(marker in joined for marker in operator_markers)
         automatically_recoverable = False
-        if status is not None:
+        # A successful header does not make a later body/page timeout permanent.
+        if status is not None and not 200 <= status < 300:
             if status in {401, 403} or 400 <= status < 500 and status != 429:
                 operator_blocker = True
             elif status == 429 or 500 <= status <= 599:
@@ -2378,6 +2379,46 @@ class PolymarketLPService:
                 and str(item.get("condition_id") or "").strip()
                 for item in existing_preparation_items
             )
+            # Reclassify the persisted catalog pause produced by the old 2xx
+            # precedence, keeping the original failure and its retry deadline.
+            status = preparation.get("last_error_status")
+            if (
+                not manual_recovery
+                and preparation.get("paused") is True
+                and preparation.get("stage") == "catalog"
+                and type(status) is int
+                and 200 <= status < 300
+                and self._automatic_recovery_error({
+                    "error_type": preparation.get("last_error"),
+                    "error_chain": preparation.get("last_error_chain"),
+                    "status": status,
+                })
+            ):
+                try:
+                    failed_at = _timestamp(
+                        preparation.get("last_failure_at"), name="last_failure_at"
+                    )
+                except ValueError:
+                    failed_at = now
+                failures = preparation.get("failure_count")
+                failures = failures if type(failures) is int else 1
+                delay_index = min(
+                    max(failures - 1, 0), len(_LP_PREPARATION_RETRY_DELAYS_SECONDS) - 1
+                )
+                retry_at = failed_at + timedelta(
+                    seconds=_LP_PREPARATION_RETRY_DELAYS_SECONDS[delay_index]
+                )
+                probe_at = now + timedelta(seconds=60)
+                retry_after_at, _ = self._retry_after_deadline(failed_at, preparation)
+                if retry_after_at is not None:
+                    retry_at = max(retry_at, retry_after_at)
+                    probe_at = max(probe_at, retry_after_at)
+                preparation = self._save_preparation({
+                    "state": "waiting_retry", "paused": False,
+                    "last_error_category": "transient",
+                    "next_retry_at": max(now, retry_at),
+                    "next_probe_at": probe_at,
+                }, expected_generation=preparation.get("generation"))
             if manual_recovery:
                 if preparation.get("paused") is not True:
                     return self._preparation_result(
@@ -9535,6 +9576,15 @@ class PolymarketLPService:
                 protected_levels = set()
                 protection_writes = 0
 
+        # Scoring is a read, not a trading action. Keep its network wait out
+        # of both apply locks so other sessions can publish fresh funds.
+        # A partial fill must collect remaining BUYs before any scoring read.
+        scoring = {}
+        if snapshot is not None and not reason and not (
+            _decimal(session.get("buy_filled_quantity", 0), "buy_filled_quantity") > 0
+            and not self._group_buys_terminal(session, snapshot)
+        ):
+            scoring = self._read_scoring(session)
         apply_handle: object | None = None
         try:
             if apply_lock is not None:
@@ -9583,6 +9633,7 @@ class PolymarketLPService:
                         prefetched_snapshot=snapshot,
                         protection_skip_keys=protected_levels,
                         facts_applied=True,
+                        scoring=scoring,
                     )
                 else:
                     return reconcile(current)
@@ -9802,13 +9853,14 @@ class PolymarketLPService:
         prefetched_snapshot: Mapping[str, object] | None = None,
         protection_skip_keys: Collection[str] = (),
         facts_applied: bool = False,
+        scoring: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         """Run one group-level monitoring/reconciliation iteration.
 
-        A tick may supply the main snapshot fetched outside ``_mutex``.  The
-        remaining account/fill/scoring work stays in the serialized apply
-        section; already-triggered bucket cancels are skipped there so they
-        cannot be sent twice by the same tick.
+        A tick may supply the main snapshot fetched outside ``_mutex``.
+        Scoring reads also arrive prefetched; their order identity is checked
+        before applying. Already-triggered bucket cancels are skipped here
+        so they cannot be sent twice by the same tick.
         """
 
         if session.get("order_identity_conflict"):
@@ -9932,10 +9984,10 @@ class PolymarketLPService:
             if not self._group_buys_terminal(session, snapshot):
                 return self._status_payload(session)
         if state == "review":
-            self._update_scoring(session, snapshot)
+            self._update_scoring(session, scoring)
             session = self.store.lp_session(str(session["session_id"])) or session
             return self._review_iteration(session, snapshot)
-        self._update_scoring(session, snapshot)
+        self._update_scoring(session, scoring)
         session = self.store.lp_session(str(session["session_id"])) or session
         if str(session.get("state")) == "review":
             return self._review_iteration(session, snapshot)
@@ -13044,8 +13096,8 @@ class PolymarketLPService:
             "scoring_lost_at": None,
         }
 
-    def _update_scoring(self, session: Mapping[str, object], snapshot: Mapping[str, object]) -> None:
-        del snapshot
+    @staticmethod
+    def _scoring_target(session: Mapping[str, object]) -> tuple[str, str]:
         state = str(session.get("state") or "")
         entry_id = str(session.get("entry_order_id") or "")
         passive_id = str(session.get("passive_exit_order_id") or "")
@@ -13058,7 +13110,10 @@ class PolymarketLPService:
             order_id, role = protected_id, "protected_exit"
         else:
             order_id, role = "", ""
+        return order_id, role
 
+    def _read_scoring(self, session: Mapping[str, object]) -> dict[str, object]:
+        order_id, role = self._scoring_target(session)
         now = self._now()
         previous_id = str(session.get("scoring_order_id") or "")
         previous_role = str(session.get("scoring_order_role") or "")
@@ -13093,6 +13148,20 @@ class PolymarketLPService:
                         value = previous_status == "true"
                 except ValueError:
                     value = None
+        return dict(order_id=order_id, role=role, value=value, checked_at=checked_at,
+                    queried=queried, observed_at=now)
+
+    def _update_scoring(self, session: Mapping[str, object], scoring: Mapping[str, object] | None) -> None:
+        if scoring is None:
+            return
+        order_id, role = self._scoring_target(session)
+        if (scoring.get('order_id'), scoring.get('role')) != (order_id, role):
+            # Reconciliation may have changed the exit stage or order since
+            # the read; never attach evidence for a different order.
+            return
+        value, checked_at = scoring['value'], scoring['checked_at']
+        now = scoring['observed_at']
+        queried = scoring['queried']
         status = "true" if value is True else "false" if value is False else "unknown"
         lost_at = session.get("scoring_lost_at")
         if role != "entry":
@@ -13100,7 +13169,7 @@ class PolymarketLPService:
         elif value is True:
             # Only fresh evidence for this exact current order can clear the
             # continuous-loss window.
-            if queried or (previous_checked is not None and status == "true"):
+            if queried or (checked_at is not None and status == "true"):
                 lost_at = None
         elif lost_at is None:
             lost_at = _iso(now)

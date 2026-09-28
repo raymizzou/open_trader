@@ -2677,11 +2677,12 @@ class LlmRelationValidator:
                 provider=primary_provider,
             )
         fallback_model = self.models[fallback]
-        self.llm_calls += 1
         completion = self.completers[fallback](
             _relation_audit_prompt(),
             _canonical_json(_relation_payload(relation)),
         )
+        if completion.attempted:
+            self.llm_calls += 1
         structured = (
             _parse_structured(completion.content)
             if completion.content is not None
@@ -2730,12 +2731,13 @@ class LlmRelationValidator:
                 )
             return validation
         if completion.content is None:
-            self._breakers[fallback].record_failure(time.monotonic())
-            self._record_llm_call(
-                status="failed",
-                usage={**completion.usage, "provider": fallback},
-                reason=completion.reason,
-            )
+            if completion.attempted:
+                self._breakers[fallback].record_failure(time.monotonic())
+                self._record_llm_call(
+                    status="failed",
+                    usage={**completion.usage, "provider": fallback},
+                    reason=completion.reason,
+                )
             fallback_reason = completion.reason or f"{fallback.upper()}_FAILED"
         else:
             fallback_violation = (
@@ -2805,18 +2807,20 @@ class LlmRelationValidator:
             user_payload = _canonical_json(_relation_payload(relation))
             if attempt >= 2 and violation is not None:
                 user_payload += "\n\n" + output_repair_directive(violation)
-            self.llm_calls += 1
             completion = self.completers[provider](
                 _relation_audit_prompt(),
                 user_payload,
             )
+            if completion.attempted:
+                self.llm_calls += 1
             if completion.content is None:
-                breaker.record_failure(time.monotonic())
-                self._record_llm_call(
-                    status="failed",
-                    usage={**completion.usage, "provider": provider},
-                    reason=completion.reason,
-                )
+                if completion.attempted:
+                    breaker.record_failure(time.monotonic())
+                    self._record_llm_call(
+                        status="failed",
+                        usage={**completion.usage, "provider": provider},
+                        reason=completion.reason,
+                    )
                 return self._fail_over(
                     relation,
                     cache_key,

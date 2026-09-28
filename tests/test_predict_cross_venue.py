@@ -3185,3 +3185,18 @@ def test_cross_venue_prompt_states_output_contract() -> None:
     assert "schema_version must be the JSON number 2" in prompt
     assert "EXACTLY these top-level keys" in prompt
     assert "direct_outcome_mapping" in prompt
+
+
+def test_balance_cooldown_does_not_spend_cross_venue_budget_or_trip_breaker(tmp_path):
+    store = PredictionArbitrageStore(tmp_path)
+    skipped = lambda *_: LlmCompletion(None, "DEEPSEEK_NO_BALANCE", {}, attempted=False)
+    validator = LlmCrossVenueEquivalenceValidator(
+        store, default_provider="deepseek", max_llm_calls=1,
+        completers={provider: skipped for provider in ("codex", "deepseek", "zhipu")},
+    )
+    for _ in range(4):
+        result = validator.validate(explicit_pair())
+        assert not result.approved
+        assert result.reason == "DEEPSEEK_NO_BALANCE"
+    assert validator.llm_calls == 0
+    assert store.llm_usage_24h()["calls"] == 0
