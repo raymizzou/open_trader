@@ -14010,8 +14010,12 @@ def test_null_order_response_stays_unknown_with_specific_reason(tmp_path, monkey
     from polymarket.models.clob.account import OpenOrder
     now = datetime.now(UTC)
     account = _SDKAccountClient(now)
+    calls, clock = [], [0.]
+    from open_trader import polymarket_trading
+    monkeypatch.setattr(polymarket_trading, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
 
     def unavailable(**kwargs):
+        calls.append(1)
         return OpenOrder.parse_response(None) if wrapped else None
 
     monkeypatch.setattr(account, 'get_order', unavailable, raising=False)
@@ -14022,6 +14026,11 @@ def test_null_order_response_stays_unknown_with_specific_reason(tmp_path, monkey
     snapshot = adapter.lp_snapshot(request)
     assert snapshot['order_read_errors']['missing-receipt'] == 'order_lookup_unavailable'
     assert snapshot['orders_terminal'] is False
+    adapter.lp_snapshot(request)
+    assert calls == [1], 'persistent missing orders must not be hammered on every LP tick'
+    clock[0] = 301
+    adapter.lp_snapshot(request)
+    assert calls == [1, 1]
     service = PolymarketLPService(PredictionArbitrageStore(tmp_path), adapter)
     session = {**request, 'order_history': {'missing-receipt': {'status': 'LIVE'}}}
     patch = service._order_history_patch(session, snapshot)

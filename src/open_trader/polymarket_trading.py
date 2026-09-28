@@ -1452,6 +1452,8 @@ class PolymarketTradingClient:
             str, tuple[float, dict[str, object] | None]
         ] = {}
         self._metadata_lock = threading.Lock()
+        self._lp_order_read_lock = threading.Lock()
+        self._lp_order_read_failures = {}
         self._lp_account_shared_lock = threading.Lock()
         self._lp_account_shared_cache: dict[str, object] | None = None
         self._metadata_warm_loaded = False
@@ -4041,6 +4043,13 @@ class PolymarketTradingClient:
             order_read_errors = {}
             for order_id in sorted(order_ids):
                 if order_id in known_ids:
+                    with self._lp_order_read_lock:
+                        self._lp_order_read_failures.pop(order_id, None)
+                    continue
+                with self._lp_order_read_lock:
+                    failure = self._lp_order_read_failures.get(order_id)
+                if failure and time.monotonic() < failure[1]:
+                    order_read_errors[order_id] = failure[0]
                     continue
                 get_order = getattr(self._client, "get_order", None)
                 if not callable(get_order):
@@ -4060,14 +4069,20 @@ class PolymarketTradingClient:
                     order_read_errors[order_id] = ('order_lookup_unavailable' if null_response
                         else 'order_response_invalid' if isinstance(cause, ValidationError)
                         else 'order_read_failed')
+                    with self._lp_order_read_lock:
+                        self._lp_order_read_failures[order_id] = (order_read_errors[order_id], time.monotonic() + 300)
                     continue
                 normalized = _lp_order(order)
                 if normalized is not None:
                     order_facts.append(normalized)
                     known_ids.add(order_id)
+                    with self._lp_order_read_lock:
+                        self._lp_order_read_failures.pop(order_id, None)
                 else:
                     order_read_errors[order_id] = ('order_lookup_unavailable' if order is None
                                                   else 'order_response_invalid')
+                    with self._lp_order_read_lock:
+                        self._lp_order_read_failures[order_id] = (order_read_errors[order_id], time.monotonic() + 300)
 
             with _lp_read_stage("public_client"):
                 public = self._public_client_factory()
