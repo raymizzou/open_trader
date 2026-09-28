@@ -64,6 +64,9 @@ from open_trader.prediction_solver_worker import WorkerOutcome, WorkerResponse
 from test_prediction_solver import BruteForceBackend, benchmark_limits
 
 
+# ponytail: reuse the full-handoff cache in one worker; split if this group becomes the tail.
+pytestmark = pytest.mark.xdist_group("solver_benchmark")
+
 ROOT = Path(__file__).resolve().parents[1]
 CANONICAL_FIXTURE = ROOT / "tests" / "fixtures" / "prediction_n_leg_v1.json"
 SYNTHETIC_CORPUS = ROOT / "benchmarks" / "prediction_solver" / "corpus" / "synthetic_v1.json"

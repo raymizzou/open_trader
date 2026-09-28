@@ -38,7 +38,7 @@ test:
 	$(if $(filter-out gateway legacy account prediction,$(SERVICE)),$(error Unknown SERVICE: $(SERVICE)))
 	$(if $(and $(strip $(SERVICE)),$(strip $(TEST))),$(error Use SERVICE or TEST, not both))
 	$(DOCKER_BUILD)
-	$(DOCKER_RUN) $(BACKEND_PYTEST) $(if $(strip $(TEST)),$(TEST),$(sort $(foreach service,$(SERVICE),$(SERVICE_TESTS_$(service))))) $(if $(filter 1,$(TEST_WORKERS)),,-n $(TEST_WORKERS) --dist=worksteal)
+	$(DOCKER_RUN) $(BACKEND_PYTEST) $(if $(strip $(TEST)),$(TEST),$(sort $(foreach service,$(SERVICE),$(SERVICE_TESTS_$(service))))) $(if $(filter 1,$(TEST_WORKERS)),,-n $(TEST_WORKERS) --dist=loadgroup)
 
 test-trend-curve:
 	$(MAKE) test TEST='$(if $(TEST),$(TEST),tests/test_trend_curve_research.py tests/test_trend_curve_backtest.py tests/test_trend_curve_cli.py)'

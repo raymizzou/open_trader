@@ -14,8 +14,9 @@ files with `-m "not pressure and not browser"`. Valid services are `gateway`,
 changes, for example `SERVICE='gateway prediction'`. `TEST='path::test_name'`
 selects a narrower seam instead. Unscoped `make test` fails before building.
 Scopes containing `prediction` default to four pytest-xdist workers with
-`--dist=worksteal`, distributing individual tests across workers. Set
-`TEST_WORKERS=1` for serial diagnosis; tune `TEST_WORKERS` to available capacity.
+`--dist=loadgroup`, distributing individual tests across workers. Solver
+benchmark tests share one worker to reuse their full-handoff fixture cache.
+Set `TEST_WORKERS=1` for serial diagnosis; tune `TEST_WORKERS` to available capacity.
 Other services and explicit `TEST=...` selections default to serial execution;
 they also accept `TEST_WORKERS`. Candidate Acceptance remains serial.
 Python bytecode is cached under `/tmp/open-trader-bytecache` inside each test
