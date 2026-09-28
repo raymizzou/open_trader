@@ -2606,24 +2606,39 @@ def test_bounded_top_twenty_refresh_does_not_wait_for_relation_activity(
         relation_validator=FakeRelationValidator(),
     )
     asyncio.run(monitor._run_full_relation_scan(FakePublicClient()))
+    entered = asyncio.Event()
+    release = asyncio.Event()
 
     async def slow_relation_activity(
         client: object, *, resubscribe: bool = True,
     ) -> None:
         del client, resubscribe
-        await asyncio.sleep(0.2)
+        entered.set()
+        await release.wait()
 
     monkeypatch.setattr(
         monitor, "_refresh_relation_activity", slow_relation_activity
     )
     monkeypatch.setattr(
-        polymarket_monitor, "PUBLIC_REFRESH_TIMEOUT_SECONDS", 0.05
+        polymarket_monitor, "PUBLIC_REFRESH_TIMEOUT_SECONDS", 5.0
     )
 
-    started = time.monotonic()
-    asyncio.run(monitor._refresh_universe_bounded(FakePublicClient()))
+    async def exercise() -> None:
+        client = FakePublicClient()
+        monitor._activity_next_scan_at = NOW
+        monitor._maybe_schedule_activity_scan(client)
+        activity = monitor._activity_scan_task
+        assert activity is not None
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            await monitor._refresh_universe_bounded(client)
+            assert not activity.done()
+        finally:
+            release.set()
+            await asyncio.wait_for(activity, timeout=5)
 
-    assert time.monotonic() - started < 0.1
+    asyncio.run(exercise())
+
     assert monitor.snapshot()["diagnostics"]["last_error"] is None
 
 

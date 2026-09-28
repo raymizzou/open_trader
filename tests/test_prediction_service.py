@@ -9123,7 +9123,9 @@ def test_history_single_flight_reuses_identical_inflight_requests(
                     for _ in range(8)
                 ]
                 assert leader_entered.wait(timeout=5)
-                for _ in range(100):
+                # Connection retries and worker scheduling can exceed one second.
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
                     if server.http_load_snapshot()["history_cache_hits"] == 7:  # type: ignore[attr-defined]
                         break
                     time.sleep(0.01)
