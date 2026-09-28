@@ -5,8 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-28
 
-- Prediction 开发测试使用 pytest-xdist 按用例动态分配，默认 4 个 worker；
-  `TEST_WORKERS=1` 可恢复串行诊断，按机器资源调整 `TEST_WORKERS`。
+- Prediction 开发测试使用 pytest-xdist 按用例动态分配，默认 6 个 worker；
+  繁忙主机可设 `TEST_WORKERS=4`，`TEST_WORKERS=1` 恢复串行诊断。
   Python 字节码缓存放在测试容器 `/tmp`，减少发布脚本重复启动解释器的开销。
   Solver benchmark 用例分为一组优先执行并复用完整样本缓存，其余用例逐项并行。
   服务选取和跳过规则不变，Candidate Acceptance 仍仅在授权部署前串行运行。

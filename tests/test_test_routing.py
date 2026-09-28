@@ -75,7 +75,8 @@ def test_backend_tests_require_an_explicit_scope() -> None:
 
 def test_prediction_parallelism_preserves_scope_and_serial_override() -> None:
     for scope, workers, expected in (
-        ("SERVICE=prediction", None, "-n 4 --dist=loadgroup"),
+        ("SERVICE=prediction", None, "-n 6 --dist=loadgroup"),
+        ("SERVICE=prediction", "4", "-n 4 --dist=loadgroup"),
         ("SERVICE=prediction", "6", "-n 6 --dist=loadgroup"),
         ("SERVICE=prediction", "1", None),
         ("SERVICE=account", None, None),
