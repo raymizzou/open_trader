@@ -13,6 +13,17 @@ files with `-m "not pressure and not browser"`. Valid services are `gateway`,
 `legacy`, `account`, and `prediction`; space-separated names cover shared
 changes, for example `SERVICE='gateway prediction'`. `TEST='path::test_name'`
 selects a narrower seam instead. Unscoped `make test` fails before building.
+While N-leg arbitrage is paused, service-scoped development tests default to
+`TEST_N_LEG=0`: the dedicated N-leg execution, validation, solver, resolver,
+selection and scheduler files listed in Makefile `N_LEG_TESTS` are omitted.
+LP, shared models/storage/runtime/service, release and pause-protection tests
+remain active. This is a temporary test-selection policy, independent of the
+production `N_LEG_PAUSED` setting. Set `TEST_N_LEG=1` to restore the complete
+service suite; explicit `TEST=...` always runs the requested tests. Changes to
+an omitted N-leg component must use its explicit `TEST` selection or
+`TEST_N_LEG=1`. Run the complete Prediction suite before re-enabling N-leg.
+Candidate Acceptance keeps its complete backend coverage regardless of this
+development-only switch.
 Scopes containing `prediction` default to six pytest-xdist workers with
 `--dist=loadgroup`, distributing individual tests across workers. Solver
 benchmark tests share one worker to reuse their full-handoff fixture cache.

@@ -14,6 +14,9 @@ DOCKER_BUILD = BUILDX_CONFIG="$(BUILDX_CONFIG)" $(DOCKER) build --target dev --f
 DOCKER_RUN = $(DOCKER) run --rm --init --network none --cap-drop ALL --security-opt no-new-privileges "$(DOCKER_IMAGE)"
 BACKEND_PYTEST := env PYTHONSAFEPATH=1 PYTHONPATH=/workspace:/workspace/src PYTHONDONTWRITEBYTECODE= PYTHONPYCACHEPREFIX=/tmp/open-trader-bytecache pytest -q -m "not pressure and not browser" -o cache_dir=/tmp/open-trader-pytest-cache --basetemp=/tmp/open-trader-pytest
 TEST_WORKERS ?= $(if $(filter prediction,$(SERVICE)),6,1)
+TEST_N_LEG ?= 0
+# N-leg is paused operationally. Keep shared model, service, LP and pause guards active.
+N_LEG_TESTS := $(wildcard tests/test_prediction_n_leg_*.py tests/test_prediction_solver*.py tests/test_run_nleg*.py tests/test_prediction_executable_cost.py tests/test_prediction_live_resolver.py tests/test_prediction_market_solution.py tests/test_prediction_monitor_selection*.py tests/test_prediction_partial_fill.py tests/test_prediction_snapshot_scheduler.py)
 # ponytail: filename routing; add new service prefixes here when a test family lands.
 SERVICE_TESTS_gateway := $(wildcard tests/test_frontend_gateway*.py)
 SERVICE_TESTS_account := $(wildcard tests/test_account*.py tests/test_futu_account.py tests/test_tiger_account.py tests/test_holding_snapshot*.py tests/test_statement_import.py tests/test_real_holding_input.py tests/test_fx.py tests/test_cutover_us_tiger_to_futu.py)
@@ -37,8 +40,10 @@ test:
 	$(if $(strip $(SERVICE)$(TEST)),,$(error Specify SERVICE or TEST))
 	$(if $(filter-out gateway legacy account prediction,$(SERVICE)),$(error Unknown SERVICE: $(SERVICE)))
 	$(if $(and $(strip $(SERVICE)),$(strip $(TEST))),$(error Use SERVICE or TEST, not both))
+	$(if $(and $(filter 1,$(words $(TEST_N_LEG))),$(filter 0 1,$(TEST_N_LEG))),,$(error TEST_N_LEG must be 0 or 1))
+	$(if $(and $(filter prediction,$(SERVICE)),$(filter 0,$(TEST_N_LEG))),@echo "N-leg dedicated tests paused ($(words $(N_LEG_TESTS)) files); use TEST_N_LEG=1 to include them.")
 	$(DOCKER_BUILD)
-	$(DOCKER_RUN) $(BACKEND_PYTEST) $(if $(strip $(TEST)),$(TEST),$(sort $(foreach service,$(SERVICE),$(SERVICE_TESTS_$(service))))) $(if $(filter 1,$(TEST_WORKERS)),,-n $(TEST_WORKERS) --dist=loadgroup)
+	$(DOCKER_RUN) $(BACKEND_PYTEST) $(if $(strip $(TEST)),$(TEST),$(filter-out $(if $(filter 0,$(TEST_N_LEG)),$(N_LEG_TESTS)),$(sort $(foreach service,$(SERVICE),$(SERVICE_TESTS_$(service)))))) $(if $(filter 1,$(TEST_WORKERS)),,-n $(TEST_WORKERS) --dist=loadgroup)
 
 test-trend-curve:
 	$(MAKE) test TEST='$(if $(TEST),$(TEST),tests/test_trend_curve_research.py tests/test_trend_curve_backtest.py tests/test_trend_curve_cli.py)'

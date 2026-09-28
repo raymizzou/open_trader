@@ -5,6 +5,11 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-28
 
+- N-leg 套利暂停期间，按服务运行的开发测试默认暂缓 32 个 N-leg 专属文件，
+  包含 solver benchmark；保留 LP、共享模型／存储／服务、发布及暂停保护检查。
+  `TEST_N_LEG=1` 恢复完整服务测试，显式 `TEST=...` 始终执行指定测试。
+  修改被暂缓的模块或恢复 N-leg 前须补齐对应验证；部署前 Candidate 覆盖保持完整。
+  验证：暂停／恢复路由与既有 gate 契约共 6 项 Docker 定向检查通过。
 - Prediction 开发测试使用 pytest-xdist 按用例动态分配，默认 6 个 worker；
   繁忙主机可设 `TEST_WORKERS=4`，`TEST_WORKERS=1` 恢复串行诊断。
   Python 字节码缓存放在测试容器 `/tmp`，减少发布脚本重复启动解释器的开销。

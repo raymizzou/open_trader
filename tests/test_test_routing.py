@@ -14,7 +14,7 @@ def test_backend_tests_require_an_explicit_scope() -> None:
         ("prediction", "tests/test_prediction_service.py", "tests/test_account_api.py"),
     ):
         preview = subprocess.run(
-            ["make", "-n", "test", f"SERVICE={service}"],
+            ["make", "-n", "test", f"SERVICE={service}", "TEST_N_LEG=1"],
             cwd=ROOT,
             capture_output=True,
             text=True,
@@ -25,7 +25,7 @@ def test_backend_tests_require_an_explicit_scope() -> None:
 
     suites = {
         service: set(re.findall(r"tests/test_\w+\.py", subprocess.run(
-            ["make", "-n", "test", f"SERVICE={service}"],
+            ["make", "-n", "test", f"SERVICE={service}", "TEST_N_LEG=1"],
             cwd=ROOT, capture_output=True, text=True, check=True,
         ).stdout))
         for service in ("gateway", "legacy", "account", "prediction")
@@ -102,3 +102,48 @@ def test_prediction_parallelism_preserves_scope_and_serial_override() -> None:
         cwd=ROOT, capture_output=True, text=True, check=True,
     ).stdout
     assert "--dist=" not in candidate
+
+
+def test_n_leg_development_pause_is_reversible_and_preserves_active_services() -> None:
+    def preview(*arguments: str) -> str:
+        return subprocess.run(
+            ["make", "-n", *arguments], cwd=ROOT,
+            capture_output=True, text=True, check=True,
+        ).stdout
+
+    active = preview("test", "SERVICE=prediction")
+    restored = preview("test", "SERVICE=prediction", "TEST_N_LEG=1")
+    for filename in (
+        "test_prediction_n_leg_execution.py", "test_run_nleg_no_submit_validation.py",
+        "test_prediction_solver_benchmark.py", "test_prediction_solver_worker.py",
+        "test_prediction_live_resolver.py", "test_prediction_partial_fill.py",
+        "test_prediction_monitor_selection_driver.py",
+    ):
+        assert f"tests/{filename}" not in active
+        assert f"tests/{filename}" in restored
+    for filename in (
+        "test_polymarket_lp.py", "test_prediction_runtime.py",
+        "test_prediction_service.py", "test_prediction_arbitrage_store.py",
+        "test_prediction_release_launchd.py", "test_prediction_n_leg.py",
+    ):
+        assert f"tests/{filename}" in active
+    assert "N-leg dedicated tests paused" in active
+    assert "N-leg dedicated tests paused" not in restored
+    assert active == preview("test", "SERVICE=prediction", "TEST_N_LEG=0")
+    assert "tests/test_prediction_n_leg_execution.py" not in preview(
+        "test", "SERVICE=gateway prediction"
+    )
+    assert "tests/test_frontend_gateway.py" in preview("test", "SERVICE=gateway prediction")
+    focused = preview("test", "TEST=tests/test_prediction_n_leg_execution.py")
+    assert "tests/test_prediction_n_leg_execution.py" in focused
+    assert "N-leg dedicated tests paused" not in focused
+    assert preview("candidate-acceptance", "TEST_N_LEG=0") == preview(
+        "candidate-acceptance", "TEST_N_LEG=1"
+    )
+    for value in ("", "bad", "0 1"):
+        invalid = subprocess.run(
+            ["make", "test", "SERVICE=prediction", f"TEST_N_LEG={value}", "DOCKER=true"],
+            cwd=ROOT, capture_output=True, text=True,
+        )
+        assert invalid.returncode != 0
+        assert "TEST_N_LEG must be 0 or 1" in invalid.stdout + invalid.stderr
