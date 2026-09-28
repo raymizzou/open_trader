@@ -6616,6 +6616,52 @@ def test_supervisor_survives_failure_observer_exception(
     assert monitor._diagnostics["thread_notification_error"] == "RuntimeError"
 
 
+@pytest.mark.parametrize(('task_name', 'diagnostic'), [
+    ('_thread_notification_task', 'thread_notification_error'),
+    ('_universe_failure_notification_task', 'universe_notification_error'),
+    ('_llm_failure_notification_task', 'llm_notification_error'),
+    ('_notification_task', None),
+    ('_auto_eat_task', None),
+])
+def test_cleanup_drains_and_isolates_only_notification_failures(
+    tmp_path, monkeypatch, task_name, diagnostic,
+):
+    import open_trader.polymarket_monitor as module
+    monkeypatch.setattr(module, 'MONITOR_CLEANUP_CHECK_SECONDS', .01)
+    setup_public([])
+    monitor = make_monitor(tmp_path, relation_discovery=None, relation_validator=None)
+    entered, release = threading.Event(), threading.Event()
+
+    def worker():
+        entered.set()
+        assert release.wait(5)
+        raise RuntimeError('worker failed')
+
+    async def scenario():
+        worker_task = asyncio.create_task(asyncio.to_thread(worker))
+        setattr(monitor, task_name, worker_task)
+        monitor._stop_event.set()
+        cleanup = asyncio.create_task(monitor._run_forever_once())
+        try:
+            assert await asyncio.to_thread(entered.wait, 1)
+            assert await _wait_until(lambda: monitor._thread_status == 'cleanup_blocked')
+            assert not cleanup.done()
+            assert not worker_task.cancelled()
+        finally:
+            release.set()
+        if diagnostic is None:
+            with pytest.raises(RuntimeError, match='worker failed'):
+                await asyncio.wait_for(cleanup, 2)
+        else:
+            await asyncio.wait_for(cleanup, 2)
+            assert monitor._diagnostics[diagnostic] == 'RuntimeError'
+        assert worker_task.done() and not worker_task.cancelled()
+        assert getattr(monitor, task_name) is None
+        assert monitor._thread_restarts == 0
+
+    asyncio.run(scenario())
+
+
 def test_supervisor_clears_stale_task_refs_from_dead_loop(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

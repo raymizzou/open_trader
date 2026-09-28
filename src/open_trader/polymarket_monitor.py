@@ -2062,6 +2062,16 @@ class PolymarketMonitor:
                 cleanup_error = None
                 for (task_name, _), result in zip(tasks, results):
                     if isinstance(result, Exception):
+                        # Pure failure alerts remain diagnostic during shutdown.
+                        # _notification_task may run a trading-capable observer.
+                        notification_error = {
+                            '_thread_notification_task': 'thread_notification_error',
+                            '_universe_failure_notification_task': 'universe_notification_error',
+                            '_llm_failure_notification_task': 'llm_notification_error',
+                        }.get(task_name)
+                        if notification_error is not None:
+                            self._diagnostics[notification_error] = type(result).__name__
+                            continue
                         logger.error(
                             "prediction_monitor_task_cleanup_failed task=%s", task_name,
                             exc_info=(type(result), result, result.__traceback__),
