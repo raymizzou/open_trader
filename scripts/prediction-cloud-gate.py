@@ -9,8 +9,8 @@ import subprocess
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'src'))
-from open_trader.prediction_cloud import load_config
-from open_trader.prediction_client import client_operation, client_release, validate
+from open_trader.prediction_cloud import credential_backend, load_config
+from open_trader.prediction_client import client_operation, client_ports, client_release, validate
 from open_trader.prediction_release import inspect_prediction_release_checkout
 
 
@@ -35,12 +35,21 @@ def main():
         local = json.loads(args.client_config.read_text())
         validate(local)
         cloud = load_config(args.service_config)
+        if cloud.mode != local['mode']:
+            raise ValueError('client and cloud service modes mismatch')
         evidence = json.loads(args.operator_evidence.read_text())
         if cloud.expected_sha != local['expected_sha'] or evidence.get('git_sha') != cloud.expected_sha:
             raise ValueError('two-host SHA or operator evidence mismatch')
-        # These are explicit operator attestations, not automated proof. They are
-        # recorded separately from process, browser and business-state checks.
-        for field in ('old_owner_stopped', 'metadata_isolation_verified', 'resources_reviewed'):
+        # These are explicit operator attestations, not automated proof. Credentialless
+        # paused Shadow replaces owner-cutover/metadata attestations with an exact
+        # independent-runtime match; the remote component profile is checked below.
+        if credential_backend(cloud) == 'disabled':
+            if evidence.get('independent_runtime_root') != str(cloud.runtime_root):
+                raise ValueError('independent Shadow runtime evidence mismatch')
+            required_attestations = ('resources_reviewed',)
+        else:
+            required_attestations = ('old_owner_stopped', 'metadata_isolation_verified', 'resources_reviewed')
+        for field in required_attestations:
             if evidence.get(field) is not True or not evidence.get(field+'_evidence'):
                 raise ValueError('operator handoff/isolation/resource evidence missing')
         if not Path(args.remote_config).is_absolute():
@@ -58,10 +67,14 @@ def main():
         result = json.loads(output)
         if result.get('release_root') != str(cloud.release_root) or result.get('runtime_root') != str(cloud.runtime_root):
             raise ValueError('remote release/runtime root mismatch')
-        if result.get('git_sha') != cloud.expected_sha or result.get('status') != ('PRECHECK_OK' if action == 'preflight' else 'BACKEND_SMOKE_OK'):
+        if (result.get('mode') != cloud.mode or result.get('git_sha') != cloud.expected_sha
+            or result.get('n_leg_paused') != cloud.n_leg_paused
+            or result.get('credential_backend') != credential_backend(cloud)
+            or result.get('status') != ('PRECHECK_OK' if action == 'preflight' else 'BACKEND_SMOKE_OK')):
             raise ValueError('remote gate evidence mismatch')
         env = {**os.environ, 'PYTHONSAFEPATH':'1', 'PYTHONPATH':str(release)+':'+str(release/'src'),
-               'NODE_PATH':str(args.browser_runtime/'node_modules'), 'OPEN_TRADER_SMOKE_URL':'http://127.0.0.1:8766'}
+               'NODE_PATH':str(args.browser_runtime/'node_modules'),
+               'OPEN_TRADER_SMOKE_URL':f"http://127.0.0.1:{client_ports(local)[0]}/"}
         runner = args.browser_runtime/'node_modules/.bin/playwright'
         if args.action == 'readiness':
             checked([local['python'],'-c', 'from playwright.sync_api import sync_playwright; p=sync_playwright().start(); b=p.chromium.launch(channel="chrome",headless=True); b.close(); p.stop()'],cwd=release,env=env)

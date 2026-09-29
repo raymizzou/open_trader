@@ -14,14 +14,32 @@ from .prediction_cloud import read_json, run
 from .prediction_release import RELEASE_SCHEMA, inspect_prediction_release_checkout
 
 
+_HEALTH_MISSING = object()
+
+
+def client_ports(c):
+    defaults = {'production':(8766,8769), 'shadow':(8876,8879)}
+    gateway_port = c.get('gateway_port', defaults[c['mode']][0])
+    tunnel_port = c.get('tunnel_port', defaults[c['mode']][1])
+    if (type(gateway_port) is not int or type(tunnel_port) is not int
+        or not 1024 <= gateway_port <= 65535 or not 1024 <= tunnel_port <= 65535
+        or gateway_port == tunnel_port):
+        raise ValueError('distinct loopback client ports required')
+    return gateway_port, tunnel_port
+
+
 def validate(c):
-    if set(c) != {'release_root','runtime_root','python','ssh_alias','expected_sha'}:
+    if not {'release_root','runtime_root','python','ssh_alias','expected_sha','mode'} <= set(c) \
+       or set(c) - {'release_root','runtime_root','python','ssh_alias','expected_sha','mode','gateway_port','tunnel_port'}:
         raise ValueError('invalid client config keys')
     for key in ('release_root','runtime_root','python'):
         if not re.fullmatch(r'/[A-Za-z0-9_./-]+', c[key]) or '..' in Path(c[key]).parts:
             raise ValueError('absolute paths without whitespace required')
-    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', c['ssh_alias']) or not re.fullmatch(r'[0-9a-f]{40}', c['expected_sha']):
-        raise ValueError('SSH alias and exact SHA required')
+    if (not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', c['ssh_alias'])
+        or not re.fullmatch(r'[0-9a-f]{40}', c['expected_sha'])
+        or c['mode'] not in {'production','shadow'}):
+        raise ValueError('SSH alias and explicit production or shadow mode required')
+    client_ports(c)
     a, b = Path(c['release_root']).resolve(), Path(c['runtime_root']).resolve()
     if a.is_relative_to(b) or b.is_relative_to(a):
         raise ValueError('separate client runtime required')
@@ -72,7 +90,8 @@ def stop_owned(state):
     alive = {key: same_process(state[key]) for key in ('gateway','ssh') if state.get(key)}
     if not state:
         return
-    ports_absent(tuple(port for key, port in (('gateway',8766),('ssh',8769)) if not alive.get(key)))
+    gateway_port, tunnel_port = client_ports(state['config'])
+    ports_absent(tuple(port for key, port in (('gateway',gateway_port),('ssh',tunnel_port)) if not alive.get(key)))
     for key in ('gateway','ssh'):
         if not alive.get(key):
             continue
@@ -84,7 +103,7 @@ def stop_owned(state):
             if time.monotonic() >= deadline:
                 raise ValueError('owned process did not stop; state retained')
             time.sleep(.1)
-    ports_absent()  # A surviving unknown listener must retain the recovery record.
+    ports_absent((gateway_port,tunnel_port))  # A surviving unknown listener retains the record.
 
 
 def client_release(c):
@@ -97,7 +116,8 @@ def client_release(c):
 def status(c, state):
     if any(not state.get(k) or not same_process(state[k]) for k in ('ssh','gateway')):
         raise ValueError('client process missing')
-    gateway, backend = read_json(8766), read_json(8769)
+    gateway_port, tunnel_port = client_ports(c)
+    gateway, backend = read_json(gateway_port), read_json(tunnel_port)
     if (gateway.get('pid') != state['gateway']['pid'] or gateway.get('prediction_only') is not True
         or gateway.get('prediction_upstream_status') != 'ok'
         or gateway.get('prediction_route_mode') != 'service'
@@ -108,20 +128,25 @@ def status(c, state):
         if health.get('git_sha') != c['expected_sha'] or health.get('source_state') != 'clean':
             raise ValueError('client/backend release mismatch')
     manifest = client_release(c)
-    required = dict(module='prediction_service',status='running',mode='production',
-        schema_version='open_trader.prediction_service.health.v1',production_owner=True,mutations='enabled',
+    mode_identity = (
+        dict(mode='shadow',production_owner=False,mutations='prohibited',first_violation=None)
+        if c['mode'] == 'shadow' else
+        dict(mode='production',production_owner=True,mutations='enabled')
+    )
+    required = dict(module='prediction_service',status='running',
+        schema_version='open_trader.prediction_service.health.v1',**mode_identity,
         release_schema_version=RELEASE_SCHEMA,
         reader_generation=manifest['reader_generation'],contract_generation=manifest['contract_generation'])
     backend_root = Path(backend.get('cwd',''))
-    if (any(backend.get(key) != value for key,value in required.items())
+    if (any((backend[key] if key in backend else _HEALTH_MISSING) != value for key,value in required.items())
         or any(not isinstance(health.get('started_at'),str) or not health['started_at'] for health in (gateway,backend))
         or type(backend.get('pid')) is not int or backend['pid'] <= 0
         or not backend_root.is_absolute() or backend.get('code_root') != str(backend_root/'src')):
-        raise ValueError('backend production identity unavailable')
+        raise ValueError('backend health identity unavailable')
     client_release(c)  # Health metadata can outlive a changed checkout.
     return {'status':'CONNECTED', 'git_sha':c['expected_sha'], 'backend_mode':backend.get('mode'),
             'gateway_pid':state['gateway']['pid'], 'ssh_pid':state['ssh']['pid'],
-            'url':'http://127.0.0.1:8766/'}
+            'url':f'http://127.0.0.1:{gateway_port}/', 'gateway_port':gateway_port, 'tunnel_port':tunnel_port}
 
 
 def client_operation(c, action):
@@ -148,7 +173,8 @@ def client_operation(c, action):
             if not state:
                 return {'status':'STOPPED', 'scope':'local client only'}
             return status(c, state)
-        ports_absent()
+        gateway_port, tunnel_port = client_ports(c)
+        ports_absent((gateway_port,tunnel_port))
         route = root/'prediction-route.json'
         route.write_text(json.dumps(dict(schema_version='open_trader.frontend_gateway.prediction_route.v1',
             mode='service',operation_id='prediction-cloud-client',updated_at=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()))))
@@ -156,8 +182,11 @@ def client_operation(c, action):
             'ssh':['ssh','-NT','-o','ControlMaster=no','-o','ControlPath=none','-o','BatchMode=yes','-o','StrictHostKeyChecking=yes',
                    '-o','ForwardAgent=no','-o','ExitOnForwardFailure=yes','-o','ConnectTimeout=10',
                    '-o','ServerAliveInterval=30','-o','ServerAliveCountMax=3',
-                   '-L','127.0.0.1:8769:127.0.0.1:8769',c['ssh_alias']],
+                   '-L',f'127.0.0.1:{tunnel_port}:127.0.0.1:8769',c['ssh_alias']],
             'gateway':[c['python'],'-m','open_trader','frontend-gateway','--prediction-only',
+                       '--host','127.0.0.1','--port',str(gateway_port),
+                       '--public-origin',f'http://127.0.0.1:{gateway_port}',
+                       '--prediction-upstream-port',str(tunnel_port),
                        '--prediction-route-state',str(route),'--static-dir',c['release_root']+'/src/open_trader/dashboard_static'],
         }
         state = {'config':c}
@@ -178,7 +207,7 @@ def client_operation(c, action):
                     deadline = time.monotonic()+15
                     while True:
                         try:
-                            health = read_json(8769)
+                            health = read_json(tunnel_port)
                             if health.get('git_sha') != c['expected_sha']:
                                 raise ValueError('backend SHA mismatch')
                             break

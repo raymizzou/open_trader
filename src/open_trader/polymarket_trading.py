@@ -352,6 +352,8 @@ def _load_keychain_password(
     run: Callable[..., subprocess.CompletedProcess[str]] | None,
 ) -> str:
     backend = os.environ.get("OPEN_TRADER_CREDENTIAL_BACKEND", "keychain")
+    if backend == "disabled":
+        raise KeychainError()
     if backend == "tencent-ssm":
         from .prediction_ssm import load_ssm_secret
         try:

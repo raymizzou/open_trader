@@ -129,7 +129,7 @@ rollback. This is an operator-authorized provisioning step, not done by the gate
 Create `/etc/open-trader/prediction-cloud.json` (root-owned `0600`, non-secret).
 The unit scopes Git `safe.directory` to this exact root-owned release; it never
 changes global Git trust. Preflight verifies Git identity as the service user.
-Example:
+A credentialless paused-Shadow example is:
 
 ```json
 {
@@ -138,18 +138,24 @@ Example:
   "python": "/opt/open-trader/venvs/<SHA>/bin/python",
   "user": "prediction",
   "expected_sha": "<SHA>",
-  "region": "<verified-SSM-region>",
-  "secret": "open-trader-prediction",
-  "version": "v1",
-  "role": "prediction-ssm-reader",
+  "mode": "shadow",
   "n_leg_paused": 1
 }
 ```
 
-The cloud config accepts simple alphanumeric/dash/underscore SSM references and
-absolute paths without spaces or systemd specifiers. Use those names when
-creating the dedicated credential. Retain the prior N-leg pause policy explicitly;
-this example does not authorize enabling any trading strategy.
+The cloud config requires an explicit `"mode": "production"` or
+`"mode": "shadow"`; a missing or unknown value fails closed. The selected mode
+is pinned into ExecStart and echoed by remote evidence. Modes never change
+automatically, and selecting another mode requires the matching stopped-owner,
+credential, readiness and authorization gates. The helper also accepts simple
+alphanumeric/dash/underscore SSM references and absolute paths without spaces or
+systemd specifiers. Use those names when creating the dedicated credential.
+Production and non-paused Shadow require those four SSM references.
+Credentialless paused Shadow requires them to be omitted, pins
+`OPEN_TRADER_CREDENTIAL_BACKEND=disabled`, and never touches Keychain, SSM or
+instance metadata.
+Retain the prior N-leg pause policy explicitly; this example does not authorize
+enabling any trading strategy.
 
 Copy the authoritative non-secret `config/prediction_arbitrage.json` and data into
 the runtime only after the ownership handoff above. Notification and LLM provider
@@ -168,9 +174,11 @@ scripts/prediction-systemd.sh status
 scripts/prediction-systemd.sh stop
 ```
 
-`render` prints the complete unit. `preflight` is read-only, runs wallet status as
-the service user, checks immutable release, stopped owner, SDK, reader generation
-and storage, and returns only `PRECHECK_OK`; that is not full Host Readiness.
+`render` prints the complete unit. `preflight` is read-only. It checks the
+immutable release, stopped owner, SDK, reader generation and storage and returns
+only `PRECHECK_OK`; that is not full Host Readiness. Explicit paused Shadow
+skips the wallet-status credential read; non-paused/production still requires
+wallet status as the service user.
 `install` requires root, verifies the unit with systemd-analyze, preserves the old
 unit, writes the complete unit and reloads systemd. It leaves the service stopped.
 `start` requires a matching installed/stopped record; production startup may
@@ -202,12 +210,24 @@ Create `~/.config/open-trader/prediction-client.json`:
   "runtime_root": "/absolute/user-owned/prediction-client",
   "python": "/absolute/python3.12",
   "ssh_alias": "open-trader-hk",
-  "expected_sha": "<SHA>"
+  "expected_sha": "<SHA>",
+  "mode": "shadow"
 }
 ```
 
 Set `OPEN_TRADER_PYTHON` to the client interpreter when `python3` is not 3.12+.
 The client runtime must be private (`0700`) and separate from the release.
+
+The client requires explicit `mode: "production"` or `"mode": "shadow"` and
+verifies the same mode in health. Production must report
+`production_owner=true` and `mutations=enabled`; Shadow must report the reverse
+and a null `first_violation`. Every real Shadow UI is labeled read-only;
+paused Shadow additionally marks LP realtime data unavailable. All Shadow views
+disable order, augment, cancel and automatic controls while retaining
+read-model rows and details. If an already identified service or a
+Prediction-only view cannot refresh its venues identity, the UI fails closed as
+UNKNOWN and blocks writes until a successful venues response restores valid
+identity.
 
 ```sh
 ./scripts/prediction-client.sh start
@@ -215,10 +235,16 @@ The client runtime must be private (`0700`) and separate from the release.
 ./scripts/prediction-client.sh stop
 ```
 
-Open `http://127.0.0.1:8766/`. These commands manage only their recorded Gateway
+For a parallel Shadow client, set `"gateway_port": 8876` and
+`"tunnel_port": 8879` explicitly and open
+`http://127.0.0.1:8876/`. The local tunnel forwards only
+`127.0.0.1:8879 -> remote 127.0.0.1:8769`. Production retains its original
+`8766/8769` defaults; Shadow defaults to the parallel ports so it cannot silently
+claim the production listeners. These commands manage only their recorded Gateway
 and dedicated SSH process; they never stop an existing local Prediction, reuse
-an unrelated SSH master, or call remote start/stop. An occupied 8766/8769 blocks
-startup. Repeating start returns the current verified connection. An ambiguous or
+an unrelated SSH master, or call remote start/stop. An occupied selected port
+blocks startup; an occupied production port does not stop or replace that process.
+Repeating start returns the current verified connection. An ambiguous or
 changed PID blocks signaling. A broken connection reports BLOCKED; inspect
 `gateway.log` and `ssh.log` (replaced on each new client session), then stop the owned client and start it again.
 Closing the browser or stopping this client leaves the cloud service running.
@@ -230,13 +256,16 @@ commands for local deployments. Both are read-only and need local config copies,
 remote config path and the exact same SHA. They must be run from the accepted
 local immutable release, with the local browser dependencies already installed.
 
-The operator evidence JSON contains `git_sha` and three explicit attestations:
-`old_owner_stopped`, `metadata_isolation_verified`, `resources_reviewed` (all true),
-with corresponding `*_evidence` strings describing actual observations and their
-locations/timestamps. These are manual handoff/security/resource evidence, not
-claims manufactured by the gate. Review shared-host memory headroom under real
-load; 2 GiB total memory alone does not prove capacity. Never mark these true
-without the underlying observations.
+The operator evidence JSON contains `git_sha` and explicit attestations with
+corresponding `*_evidence` strings describing actual observations and their
+locations/timestamps. Production and non-paused Shadow require
+`old_owner_stopped`, `metadata_isolation_verified` and `resources_reviewed`
+(all true). Credentialless paused Shadow requires `resources_reviewed` and an
+exact `independent_runtime_root`; the gate separately rejects a remote component
+whose mode, pause policy or credential backend differs. These are manual
+handoff/security/resource evidence, not claims manufactured by the gate. Review
+shared-host memory headroom under real load; 2 GiB total memory alone does not
+prove capacity. Never mark these true without the underlying observations.
 
 ```sh
 make prediction-cloud-host-readiness \
@@ -252,11 +281,18 @@ make prediction-cloud-smoke \
   CLOUD_OPERATOR_EVIDENCE=/path/operator-evidence.json
 ```
 
-Readiness combines the stopped remote preflight with local Chrome and cached
-Playwright checks. Smoke combines remote systemd/process/lock/log/business
+Readiness combines the stopped remote preflight and its mode/pause/credential
+component profile with local Chrome and cached Playwright checks. Smoke combines
+remote systemd/process/lock/log/business
 identity, the owned local Gateway/tunnel, the existing five marked Python browser
-regressions and the read-only production browser scenario. Missing evidence ends
-BLOCKED or ROLLBACK. Neither target installs a browser, starts a fixture server,
+regressions and the read-only browser scenario, adapting its Prediction-only entry point
+without changing ordinary production smoke. Missing evidence ends
+BLOCKED or ROLLBACK. Client, service and remote evidence modes must match; a
+Shadow guard violation or unavailable backend cannot pass.
+For credentialless paused Shadow, smoke also verifies the actual unit/process
+environment remains disabled and read-only; do not manufacture an owner-stop
+attestation or stop an unrelated local production process.
+Neither target installs a browser, starts a fixture server,
 mutates an account or restarts services. Candidate Acceptance remains separate
 and required before an authorized deployment. Report real cloud validation as
 UNKNOWN until these gates run on the actual accepted release.

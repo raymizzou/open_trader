@@ -575,18 +575,23 @@ def create_prediction_server(
                 self._send_unavailable()
                 return
             if parsed.path == "/api/prediction-arbitrage/venues":
+                venues = prediction_venues_payload(
+                    store=getattr(runtime, "store", None),
+                    monitor=getattr(runtime, "monitor", None),
+                    execution=getattr(runtime, "execution", None),
+                    csrf_token="" if mode == "shadow" else prediction_csrf,
+                    cross_venue_monitor=getattr(
+                        runtime, "cross_venue_monitor", None
+                    ),
+                    n_leg_paused=_n_leg_paused(runtime),
+                )
+                venues["mode"] = mode
+                venues["mutations"] = (
+                    "prohibited" if mode == "shadow" else "enabled"
+                )
                 self._send_json(
                     HTTPStatus.OK,
-                    prediction_venues_payload(
-                        store=getattr(runtime, "store", None),
-                        monitor=getattr(runtime, "monitor", None),
-                        execution=getattr(runtime, "execution", None),
-                        csrf_token="" if mode == "shadow" else prediction_csrf,
-                        cross_venue_monitor=getattr(
-                            runtime, "cross_venue_monitor", None
-                        ),
-                        n_leg_paused=_n_leg_paused(runtime),
-                    ),
+                    venues,
                     set_session=mode == "production",
                 )
                 return

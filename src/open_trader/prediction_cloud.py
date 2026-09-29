@@ -22,6 +22,7 @@ from .prediction_release import RELEASE_SCHEMA, inspect_prediction_release_check
 
 UNIT = 'open-trader-prediction.service'
 UNIT_PATH = Path('/etc/systemd/system') / UNIT
+_HEALTH_MISSING = object()
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,7 @@ class CloudConfig:
     secret: str
     version: str
     role: str
+    mode: str
     n_leg_paused: int
 
     @property
@@ -48,11 +50,24 @@ class CloudConfig:
 
 def load_config(path: Path) -> CloudConfig:
     data = json.loads(path.read_text())
+    if data.get('mode') not in {'production', 'shadow'}:
+        raise ValueError('cloud service mode must be explicit production or shadow')
+    credential_fields = ('region', 'secret', 'version', 'role')
+    if data.get('mode') == 'shadow' and data.get('n_leg_paused') == 1:
+        if any(field in data for field in credential_fields):
+            raise ValueError('credentialless paused Shadow must omit credential references')
+        data.update({field:'' for field in credential_fields})
+    elif any(field not in data for field in credential_fields):
+        raise ValueError('credential references are required for this mode')
     for field in ('release_root', 'runtime_root', 'python'):
         data[field] = Path(data[field])
     cfg = CloudConfig(**data)
     render_unit(cfg)
     return cfg
+
+
+def credential_backend(c: CloudConfig) -> str:
+    return 'disabled' if c.mode == 'shadow' and c.n_leg_paused == 1 else 'tencent-ssm'
 
 
 def trusted_root_path(path: Path) -> None:
@@ -104,13 +119,32 @@ def render_unit(c: CloudConfig) -> str:
             raise ValueError('absolute paths without whitespace or systemd specifiers required')
     if c.release_root.is_relative_to(c.runtime_root) or c.runtime_root.is_relative_to(c.release_root):
         raise ValueError('release and runtime roots must be separate')
-    for value in (c.user, c.region, c.secret, c.version, c.role):
+    for value in (c.user,):
         if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', value):
             raise ValueError('invalid cloud reference')
-    if c.user == 'root' or c.version == 'SSM_Current':
-        raise ValueError('dedicated user and pinned secret version required')
+    if c.user == 'root':
+        raise ValueError('dedicated non-root service user required')
+    if c.mode not in {'production', 'shadow'}:
+        raise ValueError('cloud service mode must be explicit production or shadow')
     if not re.fullmatch(r'[0-9a-f]{40}', c.expected_sha) or type(c.n_leg_paused) is not int or c.n_leg_paused not in (0, 1):
         raise ValueError('exact SHA and explicit N-leg setting required')
+    if credential_backend(c) == 'disabled':
+        if any((c.region, c.secret, c.version, c.role)):
+            raise ValueError('credentialless paused Shadow must not configure credential references')
+        credential_env = f'Environment=OPEN_TRADER_CREDENTIAL_BACKEND={credential_backend(c)}\n'
+    else:
+        for value in (c.region, c.secret, c.version, c.role):
+            if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', value):
+                raise ValueError('invalid cloud reference')
+        if c.version == 'SSM_Current':
+            raise ValueError('dedicated user and pinned secret version required')
+        credential_env = f'Environment=OPEN_TRADER_CREDENTIAL_BACKEND={credential_backend(c)}\n'
+        credential_env += ''.join([
+            f'Environment=OPEN_TRADER_SSM_REGION={c.region}\n',
+            f'Environment=OPEN_TRADER_SSM_SECRET={c.secret}\n',
+            f'Environment=OPEN_TRADER_SSM_VERSION={c.version}\n',
+            f'Environment=OPEN_TRADER_SSM_ROLE={c.role}\n',
+        ])
     return f'''[Unit]
 Description=OpenTrader Prediction
 After=network-online.target
@@ -129,13 +163,9 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=GIT_CONFIG_COUNT=1
 Environment=GIT_CONFIG_KEY_0=safe.directory
 Environment=GIT_CONFIG_VALUE_0={c.release_root}
-Environment=OPEN_TRADER_CREDENTIAL_BACKEND=tencent-ssm
-Environment=OPEN_TRADER_SSM_REGION={c.region}
-Environment=OPEN_TRADER_SSM_SECRET={c.secret}
-Environment=OPEN_TRADER_SSM_VERSION={c.version}
-Environment=OPEN_TRADER_SSM_ROLE={c.role}
+{credential_env}Environment=OPEN_TRADER_NLEG_PAUSED={c.n_leg_paused}
 Environment=OPEN_TRADER_NLEG_PAUSED={c.n_leg_paused}
-ExecStart={c.python} -m open_trader prediction-service --mode production --data-dir {c.runtime_root}/data --config {c.runtime_root}/config/prediction_arbitrage.json --host 127.0.0.1 --port 8769 --release-manifest {c.release_root}/ops/prediction-service-release.json
+ExecStart={c.python} -m open_trader prediction-service --mode {c.mode} --data-dir {c.runtime_root}/data --config {c.runtime_root}/config/prediction_arbitrage.json --host 127.0.0.1 --port 8769 --release-manifest {c.release_root}/ops/prediction-service-release.json
 Restart=on-failure
 RestartSec=30
 TimeoutStopSec=90
@@ -235,6 +265,15 @@ def read_json(port: int, path: str = '/healthz') -> dict:
         connection.close()
 
 
+def read_status(port: int, path: str) -> int:
+    connection = http.client.HTTPConnection('127.0.0.1', port, timeout=10)
+    try:
+        connection.request('GET', path)
+        return connection.getresponse().status
+    finally:
+        connection.close()
+
+
 def installed_unit(c: CloudConfig) -> None:
     trusted_root_path(UNIT_PATH)
     if UNIT_PATH.is_symlink() or UNIT_PATH.read_text() != render_unit(c):
@@ -276,12 +315,18 @@ def live_identity(c: CloudConfig) -> dict:
     if args != expected:
         raise ValueError('loaded command mismatch')
     health = read_json(8769)
+    mode_identity = (
+        dict(mode='shadow', production_owner=False, mutations='prohibited',
+             first_violation=None)
+        if c.mode == 'shadow' else
+        dict(mode='production', production_owner=True, mutations='enabled')
+    )
     required = dict(module='prediction_service', schema_version='open_trader.prediction_service.health.v1',
         pid=pid, git_sha=c.expected_sha, source_state='clean', cwd=str(c.release_root),
-        status='running', mode='production', production_owner=True, mutations='enabled',
-        release_schema_version=RELEASE_SCHEMA,
+        status='running', **mode_identity, release_schema_version=RELEASE_SCHEMA,
         reader_generation=identity['reader_generation'], contract_generation=identity['contract_generation'])
-    if (any(health.get(key) != value for key, value in required.items())
+    if (any((health[key] if key in health else _HEALTH_MISSING) != value
+            for key, value in required.items())
         or not isinstance(health.get('started_at'),str) or not health['started_at']):
         raise ValueError('health release identity mismatch')
     if Path(str(health.get('code_root', ''))).resolve() != (c.release_root/'src').resolve():
@@ -297,7 +342,8 @@ def preflight(c: CloudConfig) -> None:
     release_identity(c)
     absent(c)
     trusted_layout(c)
-    run(str(c.python), '-c', 'import sys; assert sys.version_info >= (3,12); import tencentcloud.ssm.v20190923.ssm_client')
+    run(str(c.python), '-c', 'import sys; assert sys.version_info >= (3,12)' +
+        ('' if credential_backend(c) == 'disabled' else '; import tencentcloud.ssm.v20190923.ssm_client'))
     from .prediction_arbitrage_store import read_minimum_reader_generation
     if read_minimum_reader_generation(c.runtime_root/'data') > release_identity(c)['reader_generation']:
         raise ValueError('release cannot read this database')
@@ -306,9 +352,12 @@ def preflight(c: CloudConfig) -> None:
                   if line.startswith('Environment=')]
     if run('runuser', '-u', c.user, '--', 'env', *references, 'git', '-C', str(c.release_root), 'rev-parse', 'HEAD') != c.expected_sha:
         raise ValueError('service user cannot verify release SHA')
-    run('runuser', '-u', c.user, '--', 'env', *references, str(c.python), '-m', 'open_trader',
-        'prediction-arb', 'wallet', 'status', '--config',
-        str(c.runtime_root/'config/prediction_arbitrage.json'), timeout=60)
+    # Paused Shadow initializes neither execution nor LP and therefore must not
+    # make a credential request merely to prove a read-only startup.
+    if c.mode != 'shadow' or not c.n_leg_paused:
+        run('runuser', '-u', c.user, '--', 'env', *references, str(c.python), '-m', 'open_trader',
+            'prediction-arb', 'wallet', 'status', '--config',
+            str(c.runtime_root/'config/prediction_arbitrage.json'), timeout=60)
     if os.statvfs(c.runtime_root).f_bavail * os.statvfs(c.runtime_root).f_frsize < 1024**3:
         raise ValueError('less than 1 GiB free runtime storage')
 
@@ -334,7 +383,8 @@ def verified_record(c: CloudConfig, states: tuple[str, ...]) -> dict:
 def operate(c: CloudConfig, action: str) -> dict:
     if action == 'preflight':
         preflight(c)
-        return {'status': 'PRECHECK_OK', 'git_sha': c.expected_sha}
+        return {'status': 'PRECHECK_OK', 'git_sha': c.expected_sha, 'mode': c.mode,
+                'n_leg_paused': c.n_leg_paused, 'credential_backend': credential_backend(c)}
     if action == 'status' and unit_state()['MainPID'] == '0':
         absent(c)
         installed_unit(c)
@@ -349,9 +399,13 @@ def operate(c: CloudConfig, action: str) -> dict:
             if c.n_leg_paused:
                 if nleg.get('status') != 'paused' or nleg.get('code') != 'N_LEG_PAUSED':
                     raise ValueError('N-leg pause contract mismatch')
-                lp = read_json(8769, '/api/prediction-arbitrage/lp/dashboard')
-                if lp.get('state') != 'ready' or any(not isinstance(lp.get(k), list) for k in ('orders','positions','recommendations')):
-                    raise ValueError('LP read model not ready')
+                if c.mode == 'shadow':
+                    if read_status(8769, '/api/prediction-arbitrage/lp/dashboard') != 503:
+                        raise ValueError('paused Shadow LP read model must be unavailable')
+                else:
+                    lp = read_json(8769, '/api/prediction-arbitrage/lp/dashboard')
+                    if lp.get('state') != 'ready' or any(not isinstance(lp.get(k), list) for k in ('orders','positions','recommendations')):
+                        raise ValueError('LP read model not ready')
             else:
                 if nleg.get('status') != 'running' or nleg.get('code') != 'N_LEG_RUNNING':
                     raise ValueError('N-leg running contract mismatch')
@@ -369,7 +423,10 @@ def operate(c: CloudConfig, action: str) -> dict:
                 raise ValueError('runtime logs missing or contain errors')
             if live_identity(c) != evidence:
                 raise ValueError('owner changed during smoke')
-        return {'status': 'RUNNING' if action == 'status' else 'BACKEND_SMOKE_OK', **evidence}
+        component = {'mode': c.mode, 'n_leg_paused': c.n_leg_paused,
+                     'credential_backend': credential_backend(c)}
+        return {'status': 'RUNNING' if action == 'status' else 'BACKEND_SMOKE_OK',
+                **evidence, **component}
     if os.geteuid() != 0:
         raise ValueError('systemd mutations require root')
     # Same global lock for all runtime roots/configurations of this unit.
@@ -447,6 +504,7 @@ def main(argv=None):
             print(render_unit(config), end='')
         else:
             print(json.dumps({**operate(config, args.action),
+                              'mode': config.mode,
                               'release_root': str(config.release_root),
                               'runtime_root': str(config.runtime_root)}))
         return 0

@@ -68,6 +68,28 @@ def test_unknown_backend_fails_closed_without_keychain(monkeypatch):
     assert calls == []
 
 
+def test_disabled_backend_fails_closed_without_keychain_ssm_or_metadata(monkeypatch):
+    monkeypatch.setenv('OPEN_TRADER_CREDENTIAL_BACKEND', 'disabled')
+    monkeypatch.setenv('OPEN_TRADER_SSM_REGION', 'forbidden-region')
+    monkeypatch.setenv('OPEN_TRADER_SSM_SECRET', 'forbidden-secret')
+    monkeypatch.setenv('OPEN_TRADER_SSM_VERSION', 'v1')
+    monkeypatch.setenv('OPEN_TRADER_SSM_ROLE', 'forbidden-role')
+    calls = []
+
+    def forbidden(*args, **kwargs):
+        calls.append(args)
+        raise AssertionError('disabled backend must not read credentials')
+
+    monkeypatch.setattr('subprocess.run', forbidden)
+    monkeypatch.setattr(requests.Session, 'request', forbidden)
+    monkeypatch.setattr('http.client.HTTPConnection', forbidden)
+    with pytest.raises(KeychainError):
+        load_keychain_secret('signing-private-key', run=forbidden)
+    with pytest.raises(KeychainError):
+        load_predict_api_key(run=forbidden)
+    assert calls == []
+
+
 @pytest.mark.parametrize('failure', ['denied', 'expired', 'missing', 'wrong-version'])
 def test_ssm_failure_is_redacted_and_never_uses_keychain(monkeypatch, failure, caplog):
     for key, value in dict(CREDENTIAL_BACKEND='tencent-ssm', SSM_REGION='ap-hongkong',

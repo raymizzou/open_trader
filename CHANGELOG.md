@@ -11,6 +11,24 @@ operator-facing: what changed, which workflow is affected, and what was verified
   手动恢复必须从恢复当天建立新的报告起点，不得直接恢复旧的 enabled_at 历史追补循环；
   暂停期间不补报。开发验证覆盖暂停入口、原有数据保留及自动交易路径；未部署。
 
+- Prediction cloud startup and local clients now require an explicit
+  production or shadow mode and fail closed on missing/unknown or mismatched
+  modes. Production retains owner-enabled health and LP gates; Shadow retains
+  read-only health and requires a null guard violation. Paused Shadow preflight
+  skips only the unnecessary wallet credential read; production and non-paused
+  credential checks remain required. Prediction UI now learns mode/mutations
+  from the service response: every actual Shadow is labeled read-only and
+  disables LP order, augment, cancel and automatic controls while preserving
+  read-model rows; paused Shadow marks LP realtime unavailable; and
+  unavailable or contradictory service identity fails closed as UNKNOWN until
+  the next successful venues read. Parallel Shadow clients select independent
+  8876/8879 loopback ports while production keeps 8766/8769. Credentialless
+  paused Shadow omits SSM references, pins the explicit disabled backend, and
+  gates verify the remote mode/pause/credential profile and independent runtime
+  without inventing an owner-stop handoff. Two-host gates reject client/service
+  mismatches before SSH and remote evidence mismatches after an authenticated
+  read. Focused Docker tests pass; no cloud command, merge, push, deployment,
+  or trading action.
 - LP 今日奖励区分平台原币累计、美元估值未知和读取失败；系统托管订单复用精确订单 ID 对应的新鲜计分事实，过期或不匹配仍显示 UNKNOWN，不把估计收益当作到账奖励。
 - LP 满额轮换保留逐标的阻塞原因，资金事实未知或过期不再误报目标已满；排名读取在任一共享读取名额释放后有界继续，普通提交读取保留原容量保护。补充真实并发读取、恢复轮换和未知占位回归。
 - LP 订单详情缺失时，仅经订单归属、买卖方向、原始数量、完整成交及费用核验后恢复终态，并经现有零库存核对结清；缺可靠订单 ID 的会话继续保留占位。看板分开展示有效 BUY、待核对及总占位，补充完整成交释放补位和错误方向不释放回归。本次未部署生产。

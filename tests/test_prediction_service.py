@@ -10257,9 +10257,13 @@ def test_venues_endpoint_serves_cached_cards_and_bootstraps_lp_auth(
             "monitor_subscription",
             "csrf_token",
             "n_leg",
+            "mode",
+            "mutations",
         }
         assert payload["n_leg"] == {"status": "running", "code": "N_LEG_RUNNING"}
         assert payload["csrf_token"] == "csrf-token"
+        assert payload["mode"] == "production"
+        assert payload["mutations"] == "enabled"
         venues = payload["venues"]
         assert isinstance(venues, list) and len(venues) == 2
         assert venues[0]["venue"] == "polymarket"

@@ -34,21 +34,40 @@ test('loads the dashboard and prediction workspace without mutations', async ({ 
   page.on('requestfailed', clearPendingNLegRead);
   page.on('pageerror', (error) => pageErrors.push(error.message));
 
+  const venuesResponsePromise = page.waitForResponse((response) => (
+    new URL(response.url()).pathname === '/api/prediction-arbitrage/venues'
+  ));
   const documentResponse = await page.goto('/', { waitUntil: 'domcontentloaded' });
   expect(documentResponse?.status()).toBe(200);
   await expect(page.locator('#dashboard-shell')).toBeVisible();
 
-  const venuesResponsePromise = page.waitForResponse((response) => (
-    new URL(response.url()).pathname === '/api/prediction-arbitrage/venues'
-  ));
-  await page.getByRole('button', { name: '预测市场', exact: true }).click();
+  const predictionOnly = await page.evaluate(
+    () => document.body?.dataset.predictionOnly === 'true',
+  );
+  if (!predictionOnly) {
+    await page.getByRole('button', { name: '预测市场', exact: true }).click();
+  }
   await expect(page.locator('#prediction-market-workspace')).toBeVisible();
   await expect(page.getByRole('heading', { name: '预测市场' })).toBeVisible();
   const venuesResponse = await venuesResponsePromise;
   expect(venuesResponse.ok()).toBe(true);
-  const venuesPayload = await venuesResponse.json() as { n_leg?: { status?: string } };
+  const venuesPayload = await venuesResponse.json() as {
+    mode?: string; mutations?: string; n_leg?: { status?: string };
+  };
   const nLegStatus = venuesPayload.n_leg?.status;
   await expect(page.getByRole('tab', { name: 'LP 首页', exact: true })).toHaveAttribute('aria-selected', 'true');
+  const shadowPaused = venuesPayload.mode === 'shadow'
+    && venuesPayload.mutations === 'prohibited'
+    && nLegStatus === 'paused';
+  if (shadowPaused) {
+    await expect(page.locator('[data-shadow-status]')).toHaveText('Shadow 只读');
+    await expect(page.locator('[data-lp-realtime-status]')).toHaveText(
+      'LP 实时数据暂不可用',
+    );
+    await expect(page.locator('[data-lp-realtime-note]')).toHaveText(
+      '这不是生产正常交易看板；写操作不可用。',
+    );
+  }
   await expect(page.locator('.pm-venue-card')).toHaveCount(2);
   // #166 起活动 LP 会话下外层面板与内嵌组卡同为 .pm-lp-card，冒烟可见性只锚先出现的外层面板。
   await expect(page.locator('.pm-lp-card').first()).toBeVisible();

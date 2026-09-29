@@ -2692,7 +2692,9 @@ function predictionUnifiedOpportunityCard(row, mode, legacyRetired) {
     "不可下单",
   );
   const unifiedActionLine = `<div class="pm-opportunity-action"><p>order_ready ${orderReady ? "是" : "否"} · ${escapeHtml(orderReadyReason)} · ${orderReady ? "可人工确认" : "不可下单"}。</p></div>`;
-  const action = legacyRetired === true
+  const action = predictionWritesBlocked()
+    ? `<div class="pm-opportunity-action"><p>order_ready ${orderReady ? "是" : "否"} · ${escapeHtml(orderReadyReason)} · ${escapeHtml(predictionServiceIdentity().label)} · 写操作不可用。</p></div>`
+    : legacyRetired === true
     ? (nLegReady
       ? `<div class="pm-opportunity-action"><p>order_ready ${orderReady ? "是" : "否"} · ${escapeHtml(orderReadyReason)} · ${orderReady ? "可人工确认" : "不可下单"}。</p><button type="button" class="pm-button primary" data-action="nleg-confirm" data-opportunity-id="${escapeHtml(predictionValue(opportunity.opportunity_id, ""))}">人工确认下单</button></div>`
       : unifiedActionLine)
@@ -3063,7 +3065,7 @@ function predictionNLegIncidentPanel(payload) {
   if (!incident || typeof incident !== "object") return "";
   const legs = Array.isArray(incident.legs) ? incident.legs : [];
   const legRows = legs.map((leg) => `<div class="pm-check"><span>第 ${Number(leg.index)} 腿 · ${leg.direction === "BUY_YES" ? "买 YES" : "买 NO"} · ${escapeHtml(predictionValue(leg.title, "市场未返回"))}</span><strong>${leg.state === "FILLED" ? `已成交 ${escapeHtml(String(leg.filled_quantity))}/${escapeHtml(String(leg.quantity))} 份 · 成本 ${escapeHtml(predictionNLegUnitsMoney(leg.cost_units))}` : leg.state === "REJECTED" ? "未成交（FOK 全撤，未花钱）" : escapeHtml(String(leg.state))}</strong></div>`).join("");
-  return `<section class="pm-alert danger" role="alert" aria-label="N_LEG 执行事故"><div class="pm-alert-body"><strong>N_LEG 执行事故 · 已停止全部新订单</strong><p>${incident.reason === "PARTIAL_FILL" ? "部分成交" : escapeHtml(String(incident.reason ?? "-"))} · 批次 ${escapeHtml(predictionValue(incident.execution_batch_id))} · 发生时间 ${escapeHtml(predictionValue(incident.happened_at))}</p>${legRows}<div class="pm-check"><span>已付现金</span><strong>${escapeHtml(predictionNLegUnitsMoney(incident.paid_cash_units))}</strong></div><small>处置：在系统外（Polymarket）处理未对冲敞口——补买另一腿或等待结算；完成后回此解除事故门。下单队列已清空，解除后恢复。</small></div><button class="pm-button danger" type="button" data-action="nleg-incident-unlock">对账完成，解除事故门</button></section>`;
+  return `<section class="pm-alert danger" role="alert" aria-label="N_LEG 执行事故"><div class="pm-alert-body"><strong>N_LEG 执行事故 · 已停止全部新订单</strong><p>${incident.reason === "PARTIAL_FILL" ? "部分成交" : escapeHtml(String(incident.reason ?? "-"))} · 批次 ${escapeHtml(predictionValue(incident.execution_batch_id))} · 发生时间 ${escapeHtml(predictionValue(incident.happened_at))}</p>${legRows}<div class="pm-check"><span>已付现金</span><strong>${escapeHtml(predictionNLegUnitsMoney(incident.paid_cash_units))}</strong></div><small>处置：在系统外（Polymarket）处理未对冲敞口——补买另一腿或等待结算；完成后回此解除事故门。下单队列已清空，解除后恢复。</small></div>${predictionWritesBlocked() ? `<p class="sub" role="status">${escapeHtml(predictionServiceIdentity().label)} · 写操作不可用。</p>` : `<button class="pm-button danger" type="button" data-action="nleg-incident-unlock">对账完成，解除事故门</button>`}</section>`;
 }
 
 function predictionUnifiedPage(payload, filter) {
@@ -3095,12 +3097,18 @@ function predictionMarketTabs() {
 
 function predictionWorkspacePage() {
   const active = state.predictionMarket.activeTab === "multi_leg" ? "multi_leg" : "lp";
+  const identity = predictionServiceIdentity();
+  const serviceNotice = identity.state === "unknown"
+    ? `<section class="pm-readiness" aria-label="Prediction 服务身份状态"><article class="pm-readiness-item"><span>服务身份</span><strong data-service-identity-status>服务身份 UNKNOWN</strong><small>mode/mutations 不一致或不可用；写操作已阻止。</small></article></section>`
+    : predictionServiceReadOnly()
+      ? `<section class="pm-readiness" aria-label="Shadow 模式状态"><article class="pm-readiness-item"><span>运行模式</span><strong data-shadow-status>Shadow 只读</strong><small>${state.predictionMarket.nLegStatus === "paused" ? "LP 实时数据暂不可用；这不是生产正常交易看板。" : "写操作已阻止；这不是生产正常交易看板。"}</small></article></section>`
+      : "";
   const pane = active === "multi_leg"
     ? predictionUnifiedPage(state.predictionMarket.payload || {status: "loading", events: [], opportunities: []})
     : predictionLpCard({lp_dashboard: state.predictionMarket.lpDashboard, lp_error: state.predictionMarket.lpDashboardError});
   const panelId = active === "multi_leg" ? "prediction-market-panel-multi-leg" : "prediction-market-panel-lp";
   const tabId = active === "multi_leg" ? "prediction-market-tab-multi-leg" : "prediction-market-tab-lp";
-  return `<header class="pm-page-head"><div><h1>预测市场</h1></div></header>${predictionVenueSummary()}${predictionMarketTabs()}<section id="${panelId}" role="tabpanel" aria-labelledby="${tabId}">${pane}</section>`;
+  return `<header class="pm-page-head"><div><h1>预测市场</h1></div></header>${serviceNotice}${predictionVenueSummary()}${predictionMarketTabs()}<section id="${panelId}" role="tabpanel" aria-labelledby="${tabId}">${pane}</section>`;
 }
 
 function lpDashboardRows(value) {
@@ -3660,7 +3668,8 @@ function lpDashboardCancelButton(kind, target) {
     : "data-action=\"lp-cancel-order\" data-order-id=\""
       + escapeHtml(String(source.orderId || "")) + "\"";
   return "<button class=\"pm-button lp-cancel" + (cancelAll ? "-all" : "")
-    + "\" type=\"button\" " + targetAttribute + " title=\"撤单即时生效\">"
+    + "\" type=\"button\" " + targetAttribute + " title=\"撤单即时生效\""
+    + (predictionWritesBlocked() ? " disabled" : "") + ">"
     + (cancelAll ? "撤全部" : "撤单") + "</button>";
 }
 
@@ -3941,7 +3950,7 @@ function lpDashboardAugmentButtonMarkup(orders, session) {
     + " data-action=\"lp-augment-entry\" data-condition-id=\"" + escapeHtml(conditionId) + "\""
     + " data-session-id=\"" + escapeHtml(String(session.session_id || "")) + "\""
     + " title=\"追加一张 post-only BUY：价位须为本组还没有在挂的价格（不高于当前买一）；同价补量请先撤该价位再追加\""
-    + ((!state.predictionMarket.csrfToken || lpSubmitCooldownActive()) ? " disabled" : "")
+    + ((predictionWritesBlocked() || !state.predictionMarket.csrfToken || lpSubmitCooldownActive()) ? " disabled" : "")
     + ">追加</button>";
 }
 
@@ -4377,7 +4386,7 @@ function lpTrialCandidateRow(row, currentConditionId) {
     + "<button class=\"pm-button\" type=\"button\" data-action=\"lp-order-entry\""
     + " data-condition-id=\"" + escapeHtml(String(row?.condition_id || "")) + "\""
     + " data-outcome=\"" + escapeHtml(String(selectedOutcome || "")) + "\""
-    + ((!state.predictionMarket.csrfToken || lpSubmitCooldownActive()) ? " disabled" : "")
+    + ((predictionWritesBlocked() || !state.predictionMarket.csrfToken || lpSubmitCooldownActive()) ? " disabled" : "")
     + ">挂单</button>"
     + "</div></td>";
   return "<tr data-lp-trial-candidate=\"" + escapeHtml(rowKey) + "\">"
@@ -4402,7 +4411,8 @@ function predictionLpAutoControls(auto, stale) {
   const prediction = state.predictionMarket;
   const running = auto.desired_running === true;
   const schedulerRunning = auto.scheduler_running === true;
-  const busy = prediction.lpAutoBusy || !prediction.csrfToken;
+  const serviceBlocked = predictionWritesBlocked();
+  const busy = prediction.lpAutoBusy || !prediction.csrfToken || serviceBlocked;
   const blocked = Array.isArray(auto.block_reasons) ? auto.block_reasons : [];
   const draft = prediction.lpAutoDraft || auto;
   const locked = busy || stale || running || auto.pause_confirmed !== true || auto.slots?.occupied !== 0;
@@ -4706,13 +4716,18 @@ function predictionLpCard(payload) {
   const cancelSummaryMarkup = cancelSummary
     ? `<p class="sub" role="status">${escapeHtml(cancelSummary)}</p>`
     : "";
+  const readonlyLpUnavailable = predictionServiceReadOnly()
+    && state.predictionMarket.nLegStatus === "paused"
+    ? `<section class="pm-alert warning" role="status"><div class="pm-alert-body"><strong data-lp-realtime-status>LP 实时数据暂不可用</strong><p data-lp-realtime-note>这不是生产正常交易看板；写操作不可用。</p></div></section>`
+    : "";
   return "<section class=\"pm-panel pm-lp-card\" aria-label=\"LP 会话\"><header class=\"pm-panel-heading\">"
     + "<div><h2>流动性提供试验</h2><p>手工挂单 · 自动补位 · 收益与风险观察</p></div>"
     + "<div class=\"pm-panel-heading-actions\">" + freshness
     + "<button class=\"pm-button\" type=\"button\" data-action=\"lp-dashboard-refresh\""
-    + (state.predictionMarket.lpDashboardRequestInFlight || state.predictionMarket.lpPreparationRecoveryInFlight || !state.predictionMarket.csrfToken ? " disabled" : "") + ">立即刷新</button>"
+    + (predictionWritesBlocked() || state.predictionMarket.lpDashboardRequestInFlight || state.predictionMarket.lpPreparationRecoveryInFlight || !state.predictionMarket.csrfToken ? " disabled" : "") + ">立即刷新</button>"
     + "<button class=\"pm-button danger\" type=\"button\" data-action=\"lp-cancel-all\""
-    + (state.predictionMarket.lpDashboardRequestInFlight || state.predictionMarket.lpPreparationRecoveryInFlight || !state.predictionMarket.csrfToken ? " disabled" : "") + ">撤全部</button></div></header>"
+    + (predictionWritesBlocked() || state.predictionMarket.lpDashboardRequestInFlight || state.predictionMarket.lpPreparationRecoveryInFlight || !state.predictionMarket.csrfToken ? " disabled" : "") + ">撤全部</button></div></header>"
+    + readonlyLpUnavailable
     + errorMarkup
     + cancelSummaryMarkup
     + lpSubmitToastsMarkup()
@@ -5561,7 +5576,7 @@ function predictionLpPreparation(preparation) {
   const recoverablePartial = rawState === "partial"
     && Number(preparation.paused_market_count) > 0;
   const recoveryButton = rawState === "paused" || recoverablePartial
-    ? `<button class="pm-button" type="button" data-action="lp-preparation-recovery"${recoveryBusy || !state.predictionMarket.csrfToken ? " disabled" : ""}>${recoverablePartial ? "恢复暂停项" : "恢复准备"}</button>`
+    ? `<button class="pm-button" type="button" data-action="lp-preparation-recovery"${predictionWritesBlocked() || recoveryBusy || !state.predictionMarket.csrfToken ? " disabled" : ""}>${recoverablePartial ? "恢复暂停项" : "恢复准备"}</button>`
     : "";
   const failure = predictionHasValue(preparation.last_error)
     ? `<p class="pm-signal-error" role="${rawState === "paused" ? "alert" : "status"}">最近失败：${escapeHtml(String(preparation.last_error))}</p>`
@@ -5982,6 +5997,7 @@ function predictionLegacyControlsRetired(payload) {
 
 function predictionModeBar(payload) {
   if (state.predictionMarket.nLegStatus === "paused") return "";
+  if (predictionWritesBlocked()) return `<div class="pm-mode-bar" aria-label="执行模式"><span class="pm-mode-stats">${escapeHtml(predictionServiceIdentity().label)} · 写操作不可用</span></div>`;
   const nleg = payload?.n_leg && typeof payload.n_leg === "object" ? payload.n_leg : {};
   const gates = nleg.execution_gates && typeof nleg.execution_gates === "object" ? nleg.execution_gates : {};
   const contractMode = String(nleg.mode || "");
@@ -5998,6 +6014,7 @@ function predictionModeBar(payload) {
 }
 
 function predictionCrossAutoStatus(payload) {
+  if (predictionWritesBlocked()) return `<span class="pm-mode-stats">${escapeHtml(predictionServiceIdentity().label)} · 写操作不可用</span>`;
   if (predictionLegacyControlsRetired(payload)) return "";
   const auto = payload?.cross_auto && typeof payload.cross_auto === "object" ? payload.cross_auto : {};
   if (auto.configured_mode !== "auto_submit") return "";
@@ -6014,7 +6031,7 @@ function predictionCrossAutoStatus(payload) {
       ? `<span class="pm-mode-stats">已提交双边订单 · ${escapeHtml(predictionValue(attempt.reason_zh))} · ${escapeHtml(predictionHktTimestamp(attemptedAt))}</span>`
       : "";
   const pause = active
-    ? `<button class="pm-button danger" type="button" data-action="pause-cross-auto">紧急暂停自动下单</button>`
+    ? predictionWritesBlocked() ? "" : `<button class="pm-button danger" type="button" data-action="pause-cross-auto">紧急暂停自动下单</button>`
     : "";
   return `<span class="pm-mode-stats" data-cross-auto-status>跨所自动下单 · ${active ? "已启用" : "已暂停"} · 当日新本金 ${escapeHtml(predictionMoney(daily.current))} / ${escapeHtml(predictionMoney(daily.limit))}${pauseReason}</span>${attemptStatus}${pause}`;
 }
@@ -6162,6 +6179,30 @@ function predictionNLegStatus(payload) {
   return status === "paused" ? "paused" : status === "running" ? "running" : "unknown";
 }
 
+function predictionServiceReadOnly() {
+  return predictionServiceIdentity().state === "shadow";
+}
+
+function predictionServiceIdentity() {
+  const payload = state.predictionMarket.venuesPayload;
+  if (String(payload?.mode || "") === "shadow" && String(payload?.mutations || "") === "prohibited") {
+    return {state: "shadow", label: "Shadow 只读"};
+  }
+  if (String(payload?.mode || "") === "production" && String(payload?.mutations || "") === "enabled") {
+    return {state: "production", label: "Production"};
+  }
+  // Cloud/Prediction-only views must fail closed. A normal legacy route with
+  // no service identity fields retains its existing compatibility behavior.
+  if (predictionOnly() || payload?.mode !== undefined || payload?.mutations !== undefined) {
+    return {state: "unknown", label: "服务身份 UNKNOWN"};
+  }
+  return {state: "legacy", label: ""};
+}
+
+function predictionWritesBlocked() {
+  return ["shadow", "unknown"].includes(predictionServiceIdentity().state);
+}
+
 function predictionNLegReadAllowed() {
   return state.workspaceView === "prediction_market"
     && state.predictionMarket.activeTab === "multi_leg"
@@ -6269,6 +6310,7 @@ async function fetchPredictionLpDashboard() {
 
 async function fetchPredictionVenues() {
   if (state.workspaceView !== "prediction_market" || state.predictionMarket.venuesRequestInFlight) return;
+  const previousPayload = state.predictionMarket.venuesPayload;
   state.predictionMarket.venuesRequestInFlight = true;
   try {
     const response = await fetch(predictionRequestUrl("/api/prediction-arbitrage/venues"), {
@@ -6287,6 +6329,9 @@ async function fetchPredictionVenues() {
       closeNLegDomainPredictionModal();
     } else if (state.predictionMarket.activeTab === "multi_leg") fetchPredictionState();
   } catch (error) {
+    if (predictionOnly() || previousPayload?.mode !== undefined || previousPayload?.mutations !== undefined) {
+      state.predictionMarket.venuesPayload = {mode: "unknown", mutations: "unknown"};
+    }
     state.predictionMarket.venuesError = error instanceof Error ? error.message : String(error);
     state.predictionMarket.nLegStatus = "unknown";
     invalidatePredictionNLegReads();
@@ -6454,6 +6499,8 @@ function renderPredictionSignalPanel() {
 }
 
 async function predictionPost(path, body) {
+  if (predictionServiceIdentity().state === "unknown") throw new Error("prediction service identity UNKNOWN，写操作不可用");
+  if (predictionServiceReadOnly()) throw new Error("Shadow 只读，写操作不可用");
   if (predictionNLegPath(path) && !predictionNLegReadAllowed()) throw new Error("N_LEG_PAUSED");
   const response = await fetch(predictionRequestUrl(path), {method: "POST", credentials: "same-origin", headers: {"Content-Type": "application/json", "X-CSRF-Token": state.predictionMarket.csrfToken}, body: JSON.stringify(body)});
   if (!response.ok) {
@@ -7275,7 +7322,7 @@ function relationDetailHtml(detail) {
   const detailMarkets = `<div class="pm-relation-markets">${endpoints.map((market, index) => `<article class="pm-relation-detail-market"><strong>${escapeHtml(predictionValue(market?.title, "标题未返回"))}</strong>${letters.length === 2 ? `<span class="pm-relation-market-role">市场 ${letters[index]} · ${letters[index] === antecedentLetter ? "前件" : "后件"}</span>` : ""}<dl><div><dt>交易所</dt><dd>${escapeHtml(predictionValue(market?.venue, "-"))}</dd></div><div><dt>Native ID</dt><dd>${escapeHtml(predictionValue(market?.contract_id, "-"))}</dd></div><div><dt>市场日期</dt><dd>${escapeHtml(predictionHktTimestamp(market?.market_date))}</dd></div><div><dt>到期日</dt><dd>${escapeHtml(predictionHktTimestamp(market?.expires_at))}</dd></div><div><dt>结算依据</dt><dd>${escapeHtml(predictionValue(market?.settlement_observation_key, "-"))}</dd></div></dl></article>`).join("")}</div>`;
   const evidence = Array.isArray(detail?.evidence) ? detail.evidence.map((item) => `<li>${escapeHtml(JSON.stringify(item?.source_evidence || item))}</li>`).join("") : "";
   const expected = relationExpected(detail);
-  const actions = detail?.status === "PENDING" && expected ? `<div class="pm-relation-actions"><button class="pm-button" type="button" data-action="reject-relation" data-relation-version-id="${escapeHtml(expected.version_id)}">拒绝</button><button class="pm-button primary" type="button" data-action="approve-relation" data-relation-version-id="${escapeHtml(expected.version_id)}">确认并尝试激活</button></div>` : detail?.activation === "ACTIVE" && expected ? `<div class="pm-relation-actions"><button class="pm-button danger" type="button" data-action="revoke-relation" data-relation-version-id="${escapeHtml(expected.version_id)}">撤销当前关系</button></div>` : "";
+  const actions = predictionWritesBlocked() ? "" : detail?.status === "PENDING" && expected ? `<div class="pm-relation-actions"><button class="pm-button" type="button" data-action="reject-relation" data-relation-version-id="${escapeHtml(expected.version_id)}">拒绝</button><button class="pm-button primary" type="button" data-action="approve-relation" data-relation-version-id="${escapeHtml(expected.version_id)}">确认并尝试激活</button></div>` : detail?.activation === "ACTIVE" && expected ? `<div class="pm-relation-actions"><button class="pm-button danger" type="button" data-action="revoke-relation" data-relation-version-id="${escapeHtml(expected.version_id)}">撤销当前关系</button></div>` : "";
   const decision = `<label class="pm-relation-reason">决定原因<select data-relation-reason><option value="source_evidence_insufficient">来源证据不足</option><option value="relation_semantics_wrong">关系语义错误</option><option value="model_incomplete_or_wrong">模型不完整或错误</option><option value="identity_mismatch">身份不匹配</option><option value="rules_changed">规则已变化</option><option value="other">其他</option></select><textarea data-relation-note maxlength="1000" placeholder="备注（可选）"></textarea></label>`;
   return `<section class="pm-relation-detail" data-relation-detail><button type="button" class="pm-relation-back" data-action="relation-back">收起详情</button><h2>${escapeHtml(predictionValue(detail?.statement, "关系表述未返回"))}</h2><p>版本 ${escapeHtml(predictionValue(detail?.version_id, "-"))} · 发现 ${escapeHtml(predictionHktTimestamp(detail?.discovered_at))} · 来源 ${escapeHtml(predictionValue(detail?.discovery_source, "-"))}</p>${detailMarkets}<section><h3>来源证据</h3><ul class="pm-relation-evidence">${evidence}</ul></section>${decision}${actions}</section>`;
 }
