@@ -12757,7 +12757,7 @@ def test_lp166_tick_two_groups_aggregate_prefers_needs_attention(tmp_path) -> No
     assert exchange.cancels == []
 
 
-def test_lp166_stop_loss_isolated_per_group(tmp_path) -> None:
+def test_lp166_stop_loss_isolated_per_group(tmp_path, monkeypatch) -> None:
     """C(隔离): 组 A 亏至 −$5 触发止损后，组 B 载荷逐字段与触发前一致
     （订单/仓位/状态）。"""
     now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
@@ -12863,7 +12863,37 @@ def test_lp166_stop_loss_isolated_per_group(tmp_path) -> None:
     exchange.by_token[token_a] = filled_a
     first = service.tick()
     exchange.by_token[token_a] = trigger_a
-    second = service.tick()
+    b_read = threading.Event()
+    a_changed = threading.Event()
+    read = service._read_snapshot
+    notify = store._notify_lp_trade_change
+    generations = []
+    b_reads = []
+    b_actions = store.lp_actions(session_b)
+    last_good = store.lp_session(session_b)["facts_checked_at"]
+
+    def ordered_read(request, **kwargs):
+        snapshot = read(request, **kwargs)
+        if request["token_id"] == token_b:
+            b_reads.append(snapshot)
+            generations.append(store.lp_trade_generation())
+            b_read.set()
+            assert a_changed.wait(timeout=5)
+        else:
+            assert b_read.wait(timeout=5)
+        return snapshot
+
+    def changed(session_id):
+        notify(session_id)
+        if session_id == session_a and b_read.is_set():
+            a_changed.set()
+
+    with monkeypatch.context() as race:
+        race.setattr(service, "_read_snapshot", ordered_read)
+        race.setattr(store, "_notify_lp_trade_change", changed)
+        second = service.tick()
+    assert len(b_reads) == 1
+    assert store.lp_trade_generation() > generations[0]
 
     after_a = store.lp_session(session_a)
     assert after_a["state"] == "stop_loss_exit"
@@ -12879,6 +12909,30 @@ def test_lp166_stop_loss_isolated_per_group(tmp_path) -> None:
     } == before_anchor
     assert after_b["state"] == "entry_open"
     assert Decimal(str(after_b["buy_filled_quantity"])) == Decimal("0")
+
+
+    assert after_b["facts_error"] == "account_round_invalid"
+    assert after_b["fee_status"] == "unknown"
+    assert after_b["position_reconciled"] is False
+    assert after_b["publication_pending"] is True
+    assert after_b["facts_checked_at"] == last_good
+    assert store.lp_actions(session_b) == b_actions
+    from open_trader.prediction_arbitrage_execution import PredictionExecutionService
+    projection = SimpleNamespace(_store=store, _lp=service, _lp_auto_scheduler=None)
+    progress = PredictionExecutionService._lp_session_progress(projection, after_b)
+    assert progress["next_action"] == "read_only_reconcile"
+    assert progress["reason"] == "account_round_invalid"
+    assert progress["last_good_check_at"] == last_good
+
+    # Only a fresh-generation read may restore the financial facts.
+    recovered, _, _, error, _ = service.reconcile_facts(session_b)
+    assert error is None
+    assert recovered["facts_error"] is None
+    assert recovered["publication_pending"] is False
+    assert recovered["fee_status"] == "known"
+    assert recovered["position_reconciled"] is True
+    assert {k: recovered[k] for k in fields} == before_b
+    assert PredictionExecutionService._lp_session_progress(projection, recovered)["next_action"] == "review_deadline"
 
 
 def test_lp166_tick_group_exception_does_not_block_others(tmp_path) -> None:

@@ -2002,3 +2002,88 @@ def test_stale_protected_exit_intent_fails_closed_before_submit(tmp_path) -> Non
     intent = auto["intents"][0]
     assert intent["session_id"] == "session-01"
     assert intent["financial_status"] == "unknown"
+
+
+@pytest.mark.parametrize("state", ["entry_open", "needs_attention"])
+@pytest.mark.parametrize("boundary", ["read", "pre_use", "scoring", "apply_lock", "busy_publication", "mutex", "legacy_handler", "fenced_handler"])
+def test_account_version_wait_preserves_business_state_and_fault_episode(
+    tmp_path, monkeypatch, state, boundary,
+) -> None:
+    service, _account, _public = _service(tmp_path, NOW)
+    service.clock = lambda: NOW
+    store = service.store
+    prior = {
+        "facts_checked_at": NOW,
+        "fee_status": "known",
+        "position_reconciled": True,
+        "reconciliation": "external_snapshot_unknown" if state == "needs_attention" else None,
+        "resume_state": "entry_open" if state == "needs_attention" else None,
+        "needs_attention_episode": "original-fault" if state == "needs_attention" else None,
+        "needs_attention_verified_recovery_episode": None,
+        "needs_attention_recovery_due": False,
+        "queue_protection": {"data_failures": 3, "state": "monitoring"},
+    }
+    store.lp_update_session("session-01", state=state, patch=prior)
+    session, revision = store.lp_session_with_revision("session-01", trading=True)
+    snapshot = dict(service._read_snapshot(_request(NOW, index=1)))
+    snapshot["_lp_trade_generation"] = store.lp_trade_generation()
+    last_good = session["facts_checked_at"]
+    original_check = service._account_bundle_is_current
+    checks = 0
+
+    def check_then_invalidate(bundle):
+        nonlocal checks
+        checks += 1
+        # Force invalidation at the final check inside the session mutex.
+        if boundary == "mutex" and checks == 4:
+            assert service._invalidate_lp_trade_generation(store.lp_trade_generation())
+        return original_check(bundle)
+
+    def scoring(_session):
+        if boundary == "scoring":
+            assert service._invalidate_lp_trade_generation(store.lp_trade_generation())
+        return {}
+
+    def acquire():
+        assert service._invalidate_lp_trade_generation(store.lp_trade_generation())
+        return object()
+
+    monkeypatch.setattr(service, "_account_bundle_is_current", check_then_invalidate)
+    monkeypatch.setattr(service, "_read_scoring", scoring)
+    # The guard must prevent all strategy application from this stale read.
+    monkeypatch.setattr(service, "_reconcile_session", lambda *_args, **_kwargs: pytest.fail("stale strategy apply"))
+    if boundary == "read":
+        def invalid_read(*_args, **_kwargs):
+            raise ValueError("account_round_invalid")
+        monkeypatch.setattr(service, "_read_snapshot", invalid_read)
+        service.reconcile_facts("session-01", monitor=True)
+    elif boundary == "busy_publication":
+        def busy_after_trade_change():
+            assert service._invalidate_lp_trade_generation(store.lp_trade_generation())
+            return None
+        service.reconcile_facts(
+            "session-01", monitor=True,
+            apply_lock=(busy_after_trade_change, lambda _handle: pytest.fail("no lock acquired")),
+        )
+    elif boundary == "legacy_handler":
+        service._handle_snapshot_failure(session, ValueError("account_round_invalid"))
+    elif boundary == "fenced_handler":
+        service._handle_snapshot_failure_fenced(session, ValueError("account_round_invalid"), revision, None)
+    else:
+        if boundary == "pre_use":
+            assert service._invalidate_lp_trade_generation(store.lp_trade_generation())
+        service._apply_tick_snapshot(
+            session, snapshot, revision, None,
+            apply_lock=(acquire, lambda _handle: None) if boundary == "apply_lock" else None,
+        )
+    row = store.lp_session("session-01")
+    assert row["state"] == state
+    assert row["facts_error"] == "account_round_invalid"
+    assert row["publication_pending"] is True
+    assert "session-01" not in service._pending_facts
+    assert row["fee_status"] == "unknown" and row["position_reconciled"] is False
+    assert row["facts_checked_at"] == last_good
+    for key in ("reconciliation", "resume_state", "needs_attention_episode",
+                "needs_attention_verified_recovery_episode", "needs_attention_recovery_due", "queue_protection"):
+        assert row.get(key) == session.get(key)
+    assert store.lp_actions("session-01") == []

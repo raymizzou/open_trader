@@ -9562,6 +9562,8 @@ class PolymarketLPService:
     def _publish_account_round_rejected(self, session_id: str) -> dict[str, object]:
         """Atomically reject account facts in the session and auto ledger."""
 
+        with self._facts_lock:
+            self._pending_facts.pop(session_id, None)
         for _ in range(3):
             row = self.store.lp_session_with_revision(session_id, trading=True)
             if row is None:
@@ -9573,6 +9575,8 @@ class PolymarketLPService:
                     current_revision,
                     patch={
                         'facts_error': 'account_round_invalid',
+                        'reconcile_reason': 'account_round_invalid',
+                        'publication_pending': True,
                         'fee_status': 'unknown',
                         'position_reconciled': False,
                     },
@@ -9696,6 +9700,9 @@ class PolymarketLPService:
                     observed_trade_generation = snapshot_generation
         if snapshot is not None:
             snapshot = {**snapshot, "_lp_observed_trade_generation": observed_trade_generation}
+        if error == "account_round_invalid" and not report_only:
+            session = self._publish_account_round_rejected(session_id)
+            return session, None, revision, error
         if error and not report_only:
             # A failed read only removes permission to spend; an occupied
             # execution lock must not hide that failure behind an old lease.
@@ -9752,6 +9759,9 @@ class PolymarketLPService:
                     error="execution_lock",
                 )
             except ValueError as exc:
+                if str(exc) == "account_round_invalid":
+                    session = self._publish_account_round_rejected(session_id)
+                    return session, None, revision, "account_round_invalid"
                 if str(exc) != "session_changed":
                     raise
             finally:
@@ -9992,9 +10002,7 @@ class PolymarketLPService:
             # The bundle was valid at publication, but a trade registered
             # before this post-publication boundary. Never score, protect, or
             # complete strategy work from that old bundle.
-            session = self._publish_account_round_rejected(session_id)
-            snapshot = None
-            snapshot_error = ValueError("account_round_invalid")
+            return self._status_payload(self._publish_account_round_rejected(session_id))
         protected_levels: set[str] = set()
         protection_writes = 0
         if snapshot is not None:
@@ -10026,6 +10034,8 @@ class PolymarketLPService:
             and not self._group_buys_terminal(session, snapshot)
         ):
             scoring = self._read_scoring(session)
+        if snapshot is not None and not self._account_bundle_is_current(snapshot):
+            return self._status_payload(self._publish_account_round_rejected(session_id))
         if snapshot is not None and not reason:
             generation = snapshot.get("_lp_trade_generation", snapshot.get("_lp_observed_trade_generation"))
             if isinstance(generation, int):
@@ -10048,9 +10058,7 @@ class PolymarketLPService:
                     return self._status_payload(current)
             if snapshot is not None and not self._account_bundle_is_current(snapshot):
                 # Close the window opened while the scoring network read ran.
-                session = self._publish_account_round_rejected(session_id)
-                snapshot = None
-                snapshot_error = ValueError("account_round_invalid")
+                return self._status_payload(self._publish_account_round_rejected(session_id))
             with self._mutex:
                 current_with_revision = getattr(
                     self.store, "lp_session_with_revision", None
@@ -10068,9 +10076,7 @@ class PolymarketLPService:
                     return self._status_payload(session)
                 current, current_revision = current_row
                 if snapshot is not None and not self._account_bundle_is_current(snapshot):
-                    session = self._publish_account_round_rejected(session_id)
-                    snapshot = None
-                    snapshot_error = ValueError("account_round_invalid")
+                    return self._status_payload(self._publish_account_round_rejected(session_id))
                 expected_revision = int(initial_revision)
                 if current_revision != expected_revision:
                     if protected_levels and set(self._session_order_ids(current)) == set(self._session_order_ids(session)):
@@ -10958,6 +10964,10 @@ class PolymarketLPService:
     ) -> dict[str, object]:
         """Persist one failed main snapshot read in serialized apply."""
 
+        if str(exc) == "account_round_invalid":
+            return self._status_payload(
+                self._publish_account_round_rejected(str(session["session_id"]))
+            )
         state = str(session.get("state"))
         patch: dict[str, object] = {
             "reconciliation": str(exc),
@@ -10992,6 +11002,10 @@ class PolymarketLPService:
     ) -> dict[str, object]:
         """Publish a failed read from the current durable session image."""
 
+        if str(exc) == "account_round_invalid":
+            return self._status_payload(
+                self._publish_account_round_rejected(str(session["session_id"]))
+            )
         session_id = str(session["session_id"])
         failures = None
         generation_reader = getattr(self.store, "lp_trade_generation", None)

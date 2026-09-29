@@ -1834,7 +1834,7 @@ class PredictionExecutionService:
             or session.get("facts_error")
             or session.get("financial_block_reason")
         )
-        if session.get("facts_error") in {"facts_read_capacity", "facts_read_in_progress"}:
+        if session.get("facts_error") in {"facts_read_capacity", "facts_read_in_progress", "account_round_invalid"}:
             reason = session["facts_error"]
         retry_at = ledger_retry_at or session.get("reconcile_retry_at")
         market_retry = getattr(self._lp, "market_read_retry_at", None)
@@ -1865,7 +1865,7 @@ class PredictionExecutionService:
         )
         if manual_attention:
             action = "manual_review"
-        elif state == "needs_attention":
+        elif state == "needs_attention" or session.get("facts_error") == "account_round_invalid":
             action = "read_only_reconcile"
         elif state == "stop_loss_exit":
             action = "protected_exit"
