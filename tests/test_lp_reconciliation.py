@@ -684,9 +684,12 @@ def test_slow_settled_report_does_not_block_active_recovery_or_new_buy(tmp_path)
         return read(request)
     exchange.lp_snapshot = delayed
     with ThreadPoolExecutor(2) as workers:
-        report = workers.submit(execution.lp_generate_due_auto_reports)
+        assert execution.lp_generate_due_auto_reports() == []
+        assert not entered.is_set()
+        # Exercise the retained offline primitive without re-enabling its worker.
+        report = workers.submit(execution._lp_auto_pool().reconcile_reports)
         try:
-            assert entered.wait(2), 'existing report worker must own the low-priority read'
+            assert entered.wait(2), 'offline report reconciliation must own the low-priority read'
             active = workers.submit(execution.lp_auto_run_once)
             result = active.result(timeout=2)
             assert len(exchange.posts) == 2

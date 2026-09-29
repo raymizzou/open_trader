@@ -510,20 +510,10 @@ def create_prediction_server(
                         or mode == "production" and not _is_production_available(runtime)):
                     self._send_unavailable()
                     return
-                reader = getattr(getattr(runtime, "execution", None), "lp_auto_report", None)
-                if not callable(reader):
-                    self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "LP auto reports are unavailable"})
-                    return
-                try:
-                    result = reader(report_date)
-                    if result is None:
-                        self._send_json(HTTPStatus.NOT_FOUND, {"error": "LP auto report not found"})
-                    else:
-                        self._send_json(HTTPStatus.OK, _lp_projection_safe_value(result))
-                except ValueError as exc:
-                    self._send_error(HTTPStatus.BAD_REQUEST, exc)
-                except (sqlite3.Error, OSError, RuntimeError) as exc:
-                    self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+                # Stale clients receive an explicit pause without DB/venue reads.
+                self._send_json(HTTPStatus.OK, {
+                    "state": "paused", "reason": "lp_auto_reporting_paused",
+                })
                 return
             lp_report_prefix = "/api/prediction-arbitrage/lp/reports/"
             if parsed.path.startswith(lp_report_prefix):
@@ -689,12 +679,6 @@ def create_prediction_server(
                     auto_state = getattr(runtime, "lp_auto_state", None)
                     if callable(auto_state):
                         result = {**result, "auto": auto_state()}
-                    summary = getattr(execution, "lp_auto_report", None)
-                    if callable(summary):
-                        try:
-                            result = {**result, "auto_summary": summary()}
-                        except (sqlite3.Error, OSError, RuntimeError):
-                            result = {**result, "auto_summary": {"state": "unknown", "reason": "report_read_failed"}}
                     safe_result = _lp_projection_safe_value(result)
                     if not isinstance(safe_result, Mapping):
                         raise RuntimeError("LP dashboard result is invalid")

@@ -4153,16 +4153,16 @@ class PredictionExecutionService:
         return AutoDailyReports(self._store, self.lp_auto_report_facts, self.lp_auto_state)
 
     def lp_auto_summary(self) -> dict[str, object]:
-        return self._lp_auto_reports().today()
+        return self.lp_auto_report()
 
     def lp_auto_report(self, report_date: str | None = None):
-        reports = self._lp_auto_reports()
-        return reports.history() if report_date is None else reports.report(report_date)
+        # Operator pause: retain stored reports without computing or reading them.
+        return {"state": "paused", "reason": "lp_auto_reporting_paused"}
 
     def lp_generate_due_auto_reports(self) -> list[dict]:
-        reports = self._lp_auto_reports().generate_due()
-        self._lp_auto_pool().reconcile_reports()
-        return reports
+        # No generation or settled-session report reconciliation while paused.
+        # Manual restoration must exclude the paused interval from backfill.
+        return []
 
     def lp_report(self, report_date: str) -> dict[str, object] | None:
         """Read one immutable stored LP daily report."""

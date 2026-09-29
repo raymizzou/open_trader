@@ -1110,27 +1110,12 @@ class PredictionRuntime:
         self._lp_thread.start()
 
     def _start_lp_daily_report_monitor(self) -> None:
-        """Natural-day clock is independent of trading, pause and reconciliation."""
-        if self.execution is None or self._lp_report_thread is not None:
-            return
-        generate = getattr(self.execution, "lp_generate_due_auto_reports", None)
-        if not callable(generate):
-            return
-        self._lp_report_stop_event.clear()
+        """Operator-paused: no report worker or historical report-only API reads.
 
-        def run() -> None:
-            while not self._lp_report_stop_event.is_set():
-                try:
-                    generate()
-                except Exception:
-                    logger.exception("prediction_lp_auto_daily_report_failed")
-                if self._lp_report_stop_event.wait(30):
-                    return
-
-        self._lp_report_thread = threading.Thread(
-            target=run, name="prediction-lp-natural-day-reports", daemon=True,
-        )
-        self._lp_report_thread.start()
+        Manual restoration must establish a new reporting start date; do not
+        backfill the paused interval. Trading/history workers remain independent.
+        """
+        return
 
     def _start_reward_monitor(self) -> None:
         """Refresh platform LP earnings without sharing the risk-loop thread."""

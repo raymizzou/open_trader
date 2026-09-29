@@ -5813,7 +5813,8 @@ globalThis.fetch = async (url, options = {}) => {
   }
   throw new Error("Unexpected request: " + request.method + " " + request.url);
 };
-const direct = (value) => predictionLpCard({lp_dashboard:value});
+// Retained renderer is tested independently while its dashboard mount is paused.
+const direct = (value) => predictionLpPreparation(value.preparation);
 const preparingHtml = direct(dashboard(preparing));
 const waitingHtml = direct(dashboard(waitingRetry));
 const pausedHtml = direct(dashboard(paused));
@@ -5845,14 +5846,14 @@ state.predictionMarket.lpDashboardRequestInFlight = false;
 state.predictionMarket.lpPreparationRecoveryInFlight = false;
 state.predictionMarket.csrfToken = "";
 renderPredictionMarket();
-const noCsrfHtml = nodes["prediction-market-root"].innerHTML;
+const noCsrfHtml = predictionLpPreparation(paused);
 await handlePredictionMarketClick({target:{closest(selector) {
   return selector === "[data-action='lp-preparation-recovery']" ? {disabled:true} : null;
 }}});
 state.predictionMarket.csrfToken = "csrf-token";
 state.predictionMarket.lpDashboardRequestInFlight = true;
 renderPredictionMarket();
-const busyHtml = nodes["prediction-market-root"].innerHTML;
+const busyHtml = predictionLpPreparation(paused);
 await handlePredictionMarketClick({target:{closest(selector) {
   return selector === "[data-action='lp-preparation-recovery']" ? {disabled:true} : null;
 }}});

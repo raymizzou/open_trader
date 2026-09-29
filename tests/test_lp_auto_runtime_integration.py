@@ -265,7 +265,7 @@ def test_paused_inventory_exit_continues_and_confirmed_proceeds_fund_next_buy(tm
     assert Decimal(state["funds"]["available_usd"]) == Decimal("0.20")
 
 
-def test_existing_lp_card_mounts_real_auto_funds_orders_controls_and_daily_summary(tmp_path):
+def test_existing_lp_card_keeps_real_auto_trading_controls_without_daily_summary(tmp_path):
     import json
     from tests.test_dashboard_web import run_dashboard_js
 
@@ -282,4 +282,4 @@ def test_existing_lp_card_mounts_real_auto_funds_orders_controls_and_daily_summa
     assert "策略总资金" in html and "BUY 总预留" in html
     assert auto["intents"][0]["intent_id"] in html
     assert auto["intents"][0]["order_id"] in html
-    assert "自然日汇总" in html
+    assert "自然日汇总" not in html

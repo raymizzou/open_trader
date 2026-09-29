@@ -186,8 +186,12 @@ def test_recycled_pnl_partial_sale_late_stream_and_restart(tmp_path):
               maker_orders=[dict(order_id=oid,token_id='m00',side=side,matched_amount='20',price=price,fee='0')])
               for side,oid,price in [('BUY','o1','.40'),('SELL','sell1','.25')]]
     s.lp_update_session(sid,patch=dict(facts_checked_at=NOW-timedelta(seconds=301)))
-    e.lp_generate_due_auto_reports()
-    e.lp_generate_due_auto_reports()
+    before_events=e.lp_auto_report_facts()["events"]
+    assert e.lp_generate_due_auto_reports()==[]
+    assert e.lp_auto_report_facts()["events"]==before_events
+    # Retained offline repair primitive; the paused production worker never calls it.
+    e._lp_auto_pool().reconcile_reports()
+    e._lp_auto_pool().reconcile_reports()
     r=e.lp_auto_state()
     assert Decimal(r['funds']['total_usd'])==97
     fills=[f for f in e.lp_auto_report_facts()['events'] if f['kind']=='fill']

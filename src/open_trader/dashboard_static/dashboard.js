@@ -4713,12 +4713,10 @@ function predictionLpCard(payload) {
     + (state.predictionMarket.lpDashboardRequestInFlight || state.predictionMarket.lpPreparationRecoveryInFlight || !state.predictionMarket.csrfToken ? " disabled" : "") + ">立即刷新</button>"
     + "<button class=\"pm-button danger\" type=\"button\" data-action=\"lp-cancel-all\""
     + (state.predictionMarket.lpDashboardRequestInFlight || state.predictionMarket.lpPreparationRecoveryInFlight || !state.predictionMarket.csrfToken ? " disabled" : "") + ">撤全部</button></div></header>"
-    + predictionLpDailySummary(dashboard.auto_summary)
     + errorMarkup
     + cancelSummaryMarkup
     + lpSubmitToastsMarkup()
     + snapshotPendingMarkup
-    + predictionLpPreparation(dashboard.preparation)
     + budgetLineMarkup
     + predictionLpAutoControls(dashboard.auto, dashboard.stale === true)
     + lpAutoFundsAndOrders(dashboard.auto)

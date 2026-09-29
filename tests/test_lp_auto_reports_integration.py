@@ -72,17 +72,17 @@ def test_produced_auto_facts_drive_daily_cutoffs_without_reconciling_on_read(tmp
     runtime.execution = engine
     with _production_server(runtime) as (base, _):
         status, history = _response(base + "/api/prediction-arbitrage/lp/auto/reports")
-        assert status == 200 and history["today"]["metrics"]["filled_quantity"] == "8"
-        assert "events" not in history["reports"][0]
+        assert status == 200 and history["state"] == "paused"
         status, detail = _response(base + "/api/prediction-arbitrage/lp/auto/reports/2026-09-27")
-        assert status == 200 and detail == saved
+        assert status == 200 and detail["state"] == "paused"
+        assert reporter.report("2026-09-27") == saved
         status, dashboard = _response(base + "/api/prediction-arbitrage/lp/dashboard")
-        assert status == 200 and dashboard["auto_summary"] == history
+        assert status == 200 and "auto_summary" not in dashboard
     output = run_dashboard_js(
         "state.predictionMarket.lpAutoReport = " + json.dumps({
             "account_id": saved["account_id"], "auto_run_id": saved["auto_run_id"],
-            "report_date": saved["report_date"], "data": detail,
-        }) + "; console.log(predictionLpDailySummary(" + json.dumps(dashboard["auto_summary"]) + "));"
+            "report_date": saved["report_date"], "data": saved,
+        }) + "; console.log(predictionLpDailySummary(" + json.dumps(reporter.history()) + "));"
     )
     assert "成交数量 <strong>8</strong>" in output and "成交数量 <strong>12</strong>" in output
     assert "期末库存成本 $4.80" in output and "库存占用 $8.00" in output
@@ -90,7 +90,7 @@ def test_produced_auto_facts_drive_daily_cutoffs_without_reconciling_on_read(tmp
     assert engine.lp_auto_state() == state and len(exchange.posts) == 1
 
 
-def test_real_reconciliation_block_does_not_delay_paused_auto_daily_report(tmp_path, monkeypatch):
+def test_real_reconciliation_remains_independent_of_reporting_pause(tmp_path, monkeypatch):
     from open_trader import prediction_runtime
     engine, exchange, lp, store = pool.setup(tmp_path)
     engine.lp_auto_configure({"budget_usd": "100", "target_buy_count": 1})
@@ -119,10 +119,9 @@ def test_real_reconciliation_block_does_not_delay_paused_auto_daily_report(tmp_p
         runtime._start_lp_monitor()
         assert blocked.wait(2)
         runtime._start_lp_daily_report_monitor()
-        assert generated.wait(2) and not release.is_set()
-        saved = reporter.report("2026-09-27")
-        assert saved["runtime"]["desired_running"] is False
-        assert saved["metrics"]["accepted_count"] == 1
+        assert runtime._lp_report_thread is None
+        assert not generated.is_set() and not release.is_set()
+        assert reporter.report("2026-09-27") is None
         assert engine.lp_auto_state()["desired_running"] is False and len(exchange.posts) == 1
         assert store.lp_daily_report("2026-09-27") is None
     finally:

@@ -250,7 +250,7 @@ def test_fact_read_failure_still_freezes_unknown_report(tmp_path):
     assert reports.history()["today"]["metrics"]["filled_quantity"] is None
 
 
-def test_report_thread_is_independent_of_a_blocked_reconciliation(tmp_path, monkeypatch):
+def test_paused_report_worker_does_not_interrupt_reconciliation(tmp_path, monkeypatch):
     import threading
     from types import SimpleNamespace
     from open_trader import prediction_runtime
@@ -276,18 +276,17 @@ def test_report_thread_is_independent_of_a_blocked_reconciliation(tmp_path, monk
         runtime._start_lp_monitor()
         assert blocked.wait(2)
         runtime._start_lp_daily_report_monitor()
-        assert generated.wait(2)
-        thread = runtime._lp_report_thread
-        runtime._start_lp_daily_report_monitor()
-        assert runtime._lp_report_thread is thread
-        assert store.lp_auto_daily_report("account-a", "auto-1", "2026-09-26") is not None
+        assert runtime._lp_report_thread is None
+        assert not generated.is_set()
+        assert store.lp_auto_daily_report("account-a", "auto-1", "2026-09-26") is None
         assert not release.is_set()
     finally:
         runtime._lp_stop_event.set()
         runtime._lp_report_stop_event.set()
         release.set()
         runtime._lp_thread.join(2)
-        runtime._lp_report_thread.join(2)
+        if runtime._lp_report_thread:
+            runtime._lp_report_thread.join(2)
 
 
 def test_auto_report_http_and_dashboard_are_read_only_and_keep_unknowns(tmp_path):
@@ -304,14 +303,13 @@ def test_auto_report_http_and_dashboard_are_read_only_and_keep_unknowns(tmp_path
     )
     with _production_server(runtime) as (base, _):
         status, body = _response(base + "/api/prediction-arbitrage/lp/auto/reports")
-        assert status == 200 and body["today"]["funds"]["available_usd"] is None
-        assert len(body["reports"]) == 1
-        assert "events" not in body["reports"][0]  # Five-second polling reads metadata only.
+        assert status == 200 and body["state"] == "paused"
         assert _response(base + "/api/prediction-arbitrage/lp/auto/reports/2026-09-26")[0] == 200
-        assert _response(base + "/api/prediction-arbitrage/lp/auto/reports/2026-09-25")[0] == 404
+        assert _response(base + "/api/prediction-arbitrage/lp/auto/reports/2026-09-25")[0] == 200
         assert _response(base + "/api/prediction-arbitrage/lp/auto/reports/2026-09-99")[0] == 400
         status, body = _response(base + "/api/prediction-arbitrage/lp/dashboard")
-        assert status == 200 and body["auto_summary"]["today"]["runtime"]["desired_running"] is False
+        assert status == 200 and "auto_summary" not in body
+        assert reporter.report("2026-09-26") is not None  # Stored history survives.
 
 
 def test_natural_day_panel_renders_unknown_pending_identity_and_history():
