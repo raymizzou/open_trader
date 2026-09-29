@@ -17,7 +17,7 @@ class ControlExecution:
         self.state = {"desired_running": False, "pause_confirmed": True}
         self.calls = []
 
-    def lp_auto_state(self):
+    def lp_auto_state(self, *, include_intents=True):
         return dict(self.state)
 
     def lp_auto_set_desired_running(self, running, **kwargs):
@@ -40,6 +40,36 @@ def runtime_for(tmp_path):
     runtime.execution = ControlExecution()
     runtime._lp_auto_scheduler = LPAutoScheduler(runtime.execution)
     return runtime
+
+
+def test_dashboard_omits_intents_without_materializing_detail_projection(tmp_path, monkeypatch):
+    from open_trader import polymarket_lp_auto
+    from tests.test_lp_auto_pool import setup
+
+    runtime = runtime_for(tmp_path)
+    engine, exchange, lp, store = setup(tmp_path)
+    runtime.execution = engine
+    engine.lp_auto_configure({"budget_usd": "100", "target_buy_count": 1})
+    engine.lp_auto_set_desired_running(True)
+    engine.lp_auto_run_once()
+    before = engine._lp_auto_pool()._read()
+    expected = runtime.lp_auto_state()
+    assert expected.pop("intents") and len(exchange.posts) == 1
+    monkeypatch.setattr(engine, "lp_dashboard", lambda: {"state": "ready"})
+    copy = polymarket_lp_auto.deepcopy
+
+    def reject_intent_copy(value):
+        if isinstance(value, list) and any("intent_id" in row for row in value):
+            raise AssertionError("paused intent detail projection performed work")
+        return copy(value)
+
+    with _server(runtime) as base:
+        assert _response(base + "/api/prediction-arbitrage/lp/auto/state")[1]["intents"]
+        monkeypatch.setattr(polymarket_lp_auto, "deepcopy", reject_intent_copy)
+        status, body = _response(base + "/api/prediction-arbitrage/lp/dashboard")
+    assert status == 200 and body["auto"] == expected
+    assert engine._lp_auto_pool()._read() == before
+    assert len(exchange.posts) == 1
 
 
 def test_auto_api_controls_schema_auth_and_confirmation(tmp_path):

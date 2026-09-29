@@ -280,6 +280,7 @@ def test_existing_lp_card_keeps_real_auto_trading_controls_without_daily_summary
     )
     assert 'data-lp-auto-action="pause"' in html
     assert "策略总资金" in html and "BUY 总预留" in html
-    assert auto["intents"][0]["intent_id"] in html
-    assert auto["intents"][0]["order_id"] in html
+    assert auto["intents"][0]["intent_id"] not in html
+    assert auto["intents"][0]["order_id"] not in html
+    assert "自动订单 / 意图" not in html
     assert "自然日汇总" not in html

@@ -855,8 +855,8 @@ class PredictionExecutionService:
             raise ValueError("lp_unavailable")
         return self._auto_pool
 
-    def lp_auto_state(self):
-        return self._lp_auto_pool().state()
+    def lp_auto_state(self, *, include_intents=True):
+        return self._lp_auto_pool().state(include_intents=include_intents)
 
     def set_lp_auto_wakeup(self, wakeup):
         if self._lp is not None:

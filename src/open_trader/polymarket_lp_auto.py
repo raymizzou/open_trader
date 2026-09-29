@@ -175,7 +175,7 @@ class LPAutoPool:
         return not any(a.get('side') == 'BUY' and a.get('role') != 'entry'
                        for a in self.store.lp_actions(intent['session_id']))
 
-    def _projection(self, d):
+    def _projection(self, d, *, include_intents=True):
         intents = list(d['intents'].values())
         occupied = [i for i in intents if i['state'] not in ('terminal','rejected','aborted')]
         pending = [i for i in occupied if i['state'] in ('reserved','sending','unknown')]
@@ -234,10 +234,11 @@ class LPAutoPool:
                     reason=manual_reason or (reasons[0] if reasons else None), funds=funds,
                     slots=dict(active=len(occupied)-len(pending)-len(canceling),pending=len(pending),
                                pending_review=len(pending_review),canceling=len(canceling),
-                               occupied=len(occupied)), intents=deepcopy(intents))
+                               occupied=len(occupied)),
+                    **({'intents': deepcopy(intents)} if include_intents else {}))
 
-    def state(self):
-        return self._projection(self._read())
+    def state(self, *, include_intents=True):
+        return self._projection(self._read(), include_intents=include_intents)
 
     def configure(self, payload, *, audit=None):
         if not isinstance(payload, dict) or set(payload)-{'budget_usd','target_buy_count','expected_config_version'}:

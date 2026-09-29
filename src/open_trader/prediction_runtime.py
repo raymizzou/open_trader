@@ -1010,11 +1010,11 @@ class PredictionRuntime:
         self._lp_auto_scheduler = LPAutoScheduler(self.execution)
         self._lp_auto_scheduler.start()
 
-    def lp_auto_state(self) -> dict[str, object]:
+    def lp_auto_state(self, *, include_intents: bool = True) -> dict[str, object]:
         if self.execution is None:
             raise RuntimeError("LP automatic execution service is unavailable")
         return {
-            **self.execution.lp_auto_state(),
+            **self.execution.lp_auto_state(include_intents=include_intents),
             **(self._lp_auto_scheduler.snapshot() if self._lp_auto_scheduler else {
                 "scheduler_running": False, "last_check_at": None,
                 "next_check_at": None, "check_in_progress": False,

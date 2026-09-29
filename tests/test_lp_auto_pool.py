@@ -403,7 +403,7 @@ def test_send_time_cash_recheck_and_automatic_augment_block(tmp_path):
     assert lp.submit_augment(sid,'1','manual-augment')['reason']=='automatic_session_augmentation_disabled'
 
 
-def test_automatic_ui_escapes_identity_and_distinguishes_no_order_id():
+def test_automatic_ui_skips_intent_reads_and_keeps_funds_and_slots():
     import subprocess
     from pathlib import Path
     source=Path('src/open_trader/dashboard_static/dashboard.js').read_text()
@@ -414,8 +414,10 @@ def test_automatic_ui_escapes_identity_and_distinguishes_no_order_id():
     function lpDashboardPrice(v){return v;}
     function predictionValue(v,f){return v??f;}
     '''+fn+'''
-    const html=lpAutoFundsAndOrders({target_buy_count:5,slots:{active:3,pending:2,pending_review:2,occupied:5},funds:{status:'unknown'},intents:[{intent_id:'<script>',condition_id:'<img>',state:'unknown'}]});
-    if(html.includes('<script>')||html.includes('<img>')||!html.includes('无可靠订单 ID')||!html.includes('UNKNOWN')||!html.includes('自动'))process.exit(1);
+    const auto={target_buy_count:5,slots:{active:3,pending:2,pending_review:2,occupied:5},funds:{status:'unknown'},last_round:{reason:'<script>'}};
+    Object.defineProperty(auto, 'intents', {get(){throw Error('paused intent list read');}});
+    const html=lpAutoFundsAndOrders(auto);
+    if(html.includes('自动订单')||html.includes('data-auto-intent')||html.includes('<script>')||!html.includes('&lt;script>')||!html.includes('UNKNOWN'))process.exit(1);
     if(!html.includes('目标 5 · 有效 BUY 3 · 待核对占位 2')||!html.includes('共占位 5'))process.exit(1);
     '''
     subprocess.run(['node','-e',code],check=True)

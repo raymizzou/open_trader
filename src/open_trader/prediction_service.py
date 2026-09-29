@@ -683,7 +683,8 @@ def create_prediction_server(
                     result = execution.lp_dashboard()
                     auto_state = getattr(runtime, "lp_auto_state", None)
                     if callable(auto_state):
-                        result = {**result, "auto": auto_state()}
+                        # The automatic order/intent list is paused on the dashboard.
+                        result = {**result, "auto": auto_state(include_intents=False)}
                     safe_result = _lp_projection_safe_value(result)
                     if not isinstance(safe_result, Mapping):
                         raise RuntimeError("LP dashboard result is invalid")
