@@ -11774,6 +11774,149 @@ raise SystemExit(service.serve_prediction_service(
 
 
 @pytest.mark.parametrize(
+    ("manifest_payload", "expected_release"),
+    [
+        (
+            {
+                "schema_version": "open_trader.prediction_service.release.v1",
+                "reader_generation": 7,
+                "contract_generation": 9,
+            },
+            {
+                "release_schema_version": "open_trader.prediction_service.release.v1",
+                "reader_generation": 7,
+                "contract_generation": 9,
+            },
+        ),
+        (None, {}),
+    ],
+)
+def test_shadow_startup_health_uses_release_manifest_exactly_when_passed(
+    tmp_path: Path,
+    manifest_payload: dict[str, object] | None,
+    expected_release: dict[str, object],
+) -> None:
+    release_manifest = tmp_path / "release.json"
+    runtime_kwargs = tmp_path / "runtime-kwargs.json"
+    if manifest_payload is not None:
+        release_manifest.write_text(json.dumps(manifest_payload), encoding="utf-8")
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    script = f'''\
+import json
+from pathlib import Path
+import open_trader.prediction_service as service
+
+runtime_kwargs = Path({str(runtime_kwargs)!r})
+
+class FakeRuntime:
+    def __init__(self, **kwargs):
+        runtime_kwargs.write_text(
+            json.dumps(dict(mode=kwargs["mode"], reader_generation=kwargs["reader_generation"])),
+            encoding="utf-8",
+        )
+        self.state = "NEW"
+        self.mode = kwargs["mode"]
+        self.production_owner = False
+        self.shadow_evidence = {{"mode": self.mode, "first_violation": None, "codex": {{}}}}
+    def start(self):
+        self.state = "RUNNING"
+    def poll_shadow_failure(self):
+        return None
+    def stop(self):
+        self.state = "STOPPED"
+
+service.PredictionRuntime = FakeRuntime
+raise SystemExit(service.serve_prediction_service(
+    data_dir=Path({str(tmp_path)!r}),
+    prediction_config_path=Path({str(tmp_path / "prediction.json")!r}),
+    port={port},
+    mode="shadow",
+    release_manifest_path={f"Path({str(release_manifest)!r})" if manifest_payload is not None else "None"},
+))
+'''
+    process = subprocess.Popen(
+        [sys.executable, "-c", script],
+        env={"PYTHONPATH": str(Path(__file__).parents[1] / "src")},
+    )
+    try:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                    break
+            except OSError:
+                if process.poll() is not None:
+                    raise AssertionError("shadow service exited before binding")
+                time.sleep(0.05)
+        else:
+            raise AssertionError("shadow service did not bind")
+
+        with urlopen(f"http://127.0.0.1:{port}/healthz", timeout=5) as response:
+            assert response.status == 200
+            health = json.load(response)
+        assert health["mode"] == "shadow"
+        assert health["production_owner"] is False
+        assert health["mutations"] == "prohibited"
+        for key, value in expected_release.items():
+            assert health[key] == value
+        for key in ("release_schema_version", "reader_generation", "contract_generation"):
+            if key not in expected_release:
+                assert key not in health
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        assert process.wait(timeout=5) == 0
+
+    captured = json.loads(runtime_kwargs.read_text(encoding="utf-8"))
+    assert captured["mode"] == "shadow"
+    assert captured["reader_generation"] == expected_release.get("reader_generation")
+
+
+def test_shadow_startup_rejects_an_invalid_explicit_manifest_without_binding(
+    tmp_path: Path,
+) -> None:
+    release_manifest = tmp_path / "release.json"
+    release_manifest.write_text(
+        json.dumps({"schema_version": "wrong", "reader_generation": 1, "contract_generation": 1}),
+        encoding="utf-8",
+    )
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    script = f'''\
+from pathlib import Path
+import open_trader.prediction_service as service
+
+class ForbiddenRuntime:
+    def __init__(self, **_kwargs):
+        raise AssertionError("runtime constructed")
+
+service.PredictionRuntime = ForbiddenRuntime
+raise SystemExit(service.serve_prediction_service(
+    data_dir=Path({str(tmp_path)!r}),
+    prediction_config_path=Path({str(tmp_path / "prediction.json")!r}),
+    port={port},
+    mode="shadow",
+    release_manifest_path=Path({str(release_manifest)!r}),
+))
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env={"PYTHONPATH": str(Path(__file__).parents[1] / "src")},
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode != 0
+    assert "runtime constructed" not in result.stderr
+    with pytest.raises(OSError):
+        with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+            pass
+
+
+@pytest.mark.parametrize(
     ("state", "owner"),
     (("NOT_READY", True), ("FAILED", True), ("RUNNING", False)),
 )

@@ -1517,17 +1517,17 @@ def serve_prediction_service(
     if mode not in {"shadow", "production"}:
         raise ValueError("prediction service mode is invalid")
     release = None
+    notifier = None
+    if release_manifest_path is not None:
+        release = load_prediction_release_manifest(release_manifest_path)
     if mode == "production":
         if release_manifest_path is None:
             raise ValueError("production release manifest is required")
-        release = load_prediction_release_manifest(release_manifest_path)
         notifier = (
             None
             if notifier_config_path is None
             else build_notifier(load_env_config(notifier_config_path, dry_run=False))
         )
-    else:
-        notifier = None
     metadata = _runtime_metadata()
     if release is not None:
         metadata.update(

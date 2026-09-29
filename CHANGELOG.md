@@ -5,6 +5,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-29
 
+- Prediction services now validate an explicitly supplied release manifest in
+  Shadow as well as Production, publish its release generations in health, and
+  pass the reader generation to runtime; Shadow without a manifest retains its
+  original behavior and Production still requires a manifest. Real startup and
+  health regressions cover valid, invalid and omitted Shadow manifests. No
+  credentials, notifier, trading or pause behavior changed; not deployed.
 - 隐藏 LP「自动订单 / 意图」列表，看板接口停止生成和传输该列表明细；保留资金、占位摘要及交易核对。
   开发回归覆盖前端不读取明细、接口省略明细和账本不变；未部署。
 
