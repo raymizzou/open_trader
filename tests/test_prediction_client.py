@@ -119,3 +119,13 @@ def test_process_identity_keeps_the_entire_long_command(monkeypatch):
         assert process_identity(process.pid).endswith(marker)
     finally:
         process.terminate();process.wait(timeout=5)
+
+
+def test_process_identity_rechecks_a_torn_ps_exit_snapshot(monkeypatch):
+    import subprocess
+    from open_trader.prediction_client import same_process
+    # Observed on Linux: cmdline disappears while the sampled status is still R.
+    responses=iter(['Rs Tue Sep 29 10:40:37 2026 [python]\n',
+                    'Zs Tue Sep 29 10:40:37 2026 [python] <defunct>\n'])
+    monkeypatch.setattr(subprocess,'run',lambda *a,**k:subprocess.CompletedProcess(a,0,next(responses),''))
+    assert not same_process({'pid':123,'identity':'Tue Sep 29 10:40:37 2026 /python owned-client'})

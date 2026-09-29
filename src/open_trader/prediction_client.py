@@ -42,6 +42,10 @@ def process_identity(pid):
 
 def same_process(proc):
     observed = process_identity(proc['pid'])
+    if observed is not None and observed != proc['identity']:
+        # ps can sample R before exit and read an already-cleared cmdline.
+        # Recheck the contradiction; never signal a persistently different PID.
+        observed = process_identity(proc['pid'])
     if observed is None:
         return False
     if observed != proc['identity']:
