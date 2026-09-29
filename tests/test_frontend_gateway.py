@@ -1016,3 +1016,34 @@ def test_gateway_returns_503_when_upstream_times_out(tmp_path: Path) -> None:
         error.value.read()
 
     assert error.value.code == 503
+
+
+def test_prediction_only_gateway_never_contacts_stock_backends(tmp_path):
+    static = tmp_path / 'static'
+    _write_static_files(static)
+    (static / 'index.html').write_text('<body><h1>Prediction</h1></body>')
+    route = tmp_path / 'route.json'
+    _write_route(route, 'service')
+    with _running(_Upstream()) as stocks, _running(_Upstream()) as prediction:
+        prediction.health_body = json.dumps({'module': 'prediction_service', 'status': 'running'}).encode()
+        config = FrontendGatewayConfig(static_dir=static, prediction_route_path=route,
+            prediction_only=True, upstream_port=stocks.server_port,
+            account_upstream_port=stocks.server_port, prediction_upstream_port=prediction.server_port)
+        with _running(create_frontend_gateway(config=config, host='127.0.0.1', port=0)) as gateway:
+            base = f'http://127.0.0.1:{gateway.server_port}'
+            with urllib.request.urlopen(base + '/healthz') as response:
+                health = json.load(response)
+            assert health['prediction_only'] is True
+            assert health['legacy_upstream_status'] == health['account_upstream_status'] == 'disabled'
+            with urllib.request.urlopen(base + "/") as response:
+                assert b'data-prediction-only="true"' in response.read()
+            for path in ('/api/dashboard', '/api/v1/account/snapshot'):
+                with pytest.raises(urllib.error.HTTPError) as error:
+                    urllib.request.urlopen(base + path)
+                assert error.value.code == 404
+            _prediction_request(base, 'GET', '/api/prediction-arbitrage/venues')
+            _write_route(route, 'legacy')
+            with pytest.raises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(base + '/api/prediction-arbitrage/venues')
+            assert error.value.code == 503
+        assert stocks.requests == []

@@ -192,6 +192,10 @@ const REASON_LABELS = {
 document.addEventListener("DOMContentLoaded", () => {
   bindElements();
   bindEvents();
+  if (predictionOnly()) {
+    setWorkspaceView("prediction_market");
+    return;
+  }
   loadDashboard();
   scheduleAccountPolling();
 });
@@ -1049,7 +1053,12 @@ function renderDashboard() {
   renderConnectionPanel();
 }
 
+function predictionOnly() {
+  return document.body?.dataset?.predictionOnly === "true";
+}
+
 function setWorkspaceView(view) {
+  if (predictionOnly()) view = "prediction_market";
   const previousView = state.workspaceView;
   state.workspaceView = WORKSPACE_VIEWS.has(view) ? view : "portfolio";
   renderWorkspaceChrome();
@@ -1078,8 +1087,8 @@ function renderWorkspaceChrome() {
   document.body?.classList?.toggle?.("prediction-market-active", view === "prediction_market");
   const toolView = view !== "portfolio";
   elements["dashboard-shell"].classList.toggle("tool-workspace-view", toolView);
-  elements["return-to-portfolio"].hidden = !toolView;
-  elements["return-to-portfolio"].classList.toggle("hidden", !toolView);
+  elements["return-to-portfolio"].hidden = !toolView || predictionOnly();
+  elements["return-to-portfolio"].classList.toggle("hidden", !toolView || predictionOnly());
   elements["dashboard-header"]?.classList.toggle("hidden", view === "prediction_market");
   elements["workspace-grid"].classList.toggle("hidden", view === "standard_backtest" || view === "trend_report" || view === "prediction_market");
   elements["holdings-panel"].classList.toggle("hidden", view !== "portfolio");
@@ -1096,6 +1105,8 @@ function renderWorkspaceChrome() {
     ? elements["main-navigation"].querySelectorAll("[data-workspace]")
     : [];
   navigationButtons.forEach((button) => {
+    button.hidden = predictionOnly() && button.dataset.workspace !== "prediction_market";
+    button.classList.toggle("hidden", button.hidden);
     const active = button.dataset.workspace === view;
     button.setAttribute("aria-current", active ? "page" : "false");
   });

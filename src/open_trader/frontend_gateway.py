@@ -53,6 +53,7 @@ class FrontendGatewayConfig:
     public_origin: str = "http://127.0.0.1:8766"
     upstream_timeout_seconds: float = 30.0
     max_request_body_bytes: int = 20 * 1024 * 1024
+    prediction_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -149,7 +150,7 @@ def create_frontend_gateway(
                 self._send_file(config.static_dir / filename, content_type)
                 return
             if path == "/healthz":
-                legacy_upstream_status = self._legacy_upstream_status()
+                legacy_upstream_status = "disabled" if config.prediction_only else self._legacy_upstream_status()
                 prediction_route, prediction_inflight_requests = (
                     prediction_controller.snapshot()
                 )
@@ -161,7 +162,8 @@ def create_frontend_gateway(
                         "code_root": str(Path(__file__).resolve().parent.parent),
                         "upstream_status": legacy_upstream_status,
                         "legacy_upstream_status": legacy_upstream_status,
-                        "account_upstream_status": self._account_upstream_status(),
+                        "account_upstream_status": "disabled" if config.prediction_only else self._account_upstream_status(),
+                        "prediction_only": config.prediction_only,
                         "prediction_route_mode": prediction_route.mode,
                         "prediction_inflight_requests": prediction_inflight_requests,
                         "prediction_upstream_status": self._prediction_upstream_status(
@@ -183,10 +185,13 @@ def create_frontend_gateway(
 
         def _proxy(self) -> None:
             path = urlsplit(self.path).path
+            if config.prediction_only and not _is_prediction_path(path):
+                self._send_error(HTTPStatus.NOT_FOUND, "not_found", "Not found")
+                return
             prediction_route = (
                 prediction_controller.begin() if _is_prediction_path(path) else None
             )
-            if prediction_route is not None and prediction_route.mode == "maintenance":
+            if prediction_route is not None and (prediction_route.mode == "maintenance" or (config.prediction_only and prediction_route.mode != "service")):
                 prediction_controller.end()
                 self._send_error(
                     HTTPStatus.SERVICE_UNAVAILABLE,
@@ -422,6 +427,8 @@ def create_frontend_gateway(
                 self._send_error(HTTPStatus.NOT_FOUND, "not_found", "Not found")
                 return
             body = path.read_bytes()
+            if config.prediction_only and path.name == "index.html":
+                body = body.replace(b"<body>", b'<body data-prediction-only="true">', 1)
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
@@ -505,6 +512,7 @@ def serve_frontend_gateway(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="open-trader frontend-gateway")
+    parser.add_argument("--prediction-only", action="store_true")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--upstream-host", default="127.0.0.1")
@@ -525,6 +533,7 @@ def main(argv: list[str] | None = None) -> int:
     serve_frontend_gateway(
         config=FrontendGatewayConfig(
             static_dir=args.static_dir,
+            prediction_only=args.prediction_only,
             upstream_host=args.upstream_host,
             upstream_port=args.upstream_port,
             account_upstream_host=args.account_upstream_host,

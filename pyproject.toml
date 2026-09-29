@@ -20,6 +20,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+cloud-ssm = [
+    "tencentcloud-sdk-python-ssm==3.1.160",
+    "tencentcloud-sdk-python-common==3.1.182",
+]
 dev = [
     "playwright>=1.52",
     "pytest>=8.0",

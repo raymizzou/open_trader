@@ -274,6 +274,8 @@ def _store_keychain_password(
     secret: str,
     run: Callable[..., subprocess.CompletedProcess[str]] | None,
 ) -> None:
+    if os.environ.get("OPEN_TRADER_CREDENTIAL_BACKEND", "keychain") != "keychain":
+        raise KeychainError()
     args = [
         SECURITY,
         "add-generic-password",
@@ -349,6 +351,15 @@ def _load_keychain_password(
     service: str,
     run: Callable[..., subprocess.CompletedProcess[str]] | None,
 ) -> str:
+    backend = os.environ.get("OPEN_TRADER_CREDENTIAL_BACKEND", "keychain")
+    if backend == "tencent-ssm":
+        from .prediction_ssm import load_ssm_secret
+        try:
+            return load_ssm_secret(service, account)
+        except Exception:
+            raise KeychainError() from None
+    if backend != "keychain":
+        raise KeychainError()
     runner = run or _run_security
     args = [
         SECURITY,

@@ -207,3 +207,10 @@ production-smoke:
 		if (cd "$$expected_root" && NODE_PATH="$(PLAYWRIGHT_NODE_PATH)" OPEN_TRADER_SMOKE_URL="$(DASHBOARD_URL)" "$(REPOSITORY_ROOT)/node_modules/.bin/playwright" test tests/e2e/production-smoke.spec.ts --config=playwright.config.ts --project=chromium); then echo "browser smoke: PASS"; else echo "browser smoke: BLOCKED"; status=1; fi; \
 	fi; \
 	if [ $$status -eq 0 ]; then echo HEALTHY; else echo ROLLBACK; exit 1; fi
+
+.PHONY: prediction-cloud-host-readiness prediction-cloud-smoke
+prediction-cloud-host-readiness:
+	"$(PYTHON_BIN)" scripts/prediction-cloud-gate.py readiness --client-config "$(CLOUD_CLIENT_CONFIG)" --service-config "$(CLOUD_SERVICE_CONFIG)" --remote-config "$(CLOUD_REMOTE_CONFIG)" --operator-evidence "$(CLOUD_OPERATOR_EVIDENCE)" --browser-runtime "$(REPOSITORY_ROOT)"
+
+prediction-cloud-smoke:
+	"$(PYTHON_BIN)" scripts/prediction-cloud-gate.py smoke --client-config "$(CLOUD_CLIENT_CONFIG)" --service-config "$(CLOUD_SERVICE_CONFIG)" --remote-config "$(CLOUD_REMOTE_CONFIG)" --operator-evidence "$(CLOUD_OPERATOR_EVIDENCE)" --browser-runtime "$(REPOSITORY_ROOT)"

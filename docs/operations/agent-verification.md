@@ -44,7 +44,10 @@ after a local merge. The image includes Node and `procps`, and excludes npm,
 Python/JS Playwright, Chromium/browser assets, host mounts, network, published
 ports, the Docker socket, the home directory, and credentials. The approved
 pytest-xdist dependency is pinned in the dev image and development extras.
-Do not add further dependencies or weaken existing skips/xfails. Playwright is a host-only
+The 2026-09-29 approved cloud credential exception permits only the optional
+`cloud-ssm` extra (pinned Tencent SSM SDK and common SDK); Docker development
+installs it for offline SDK transport tests. Do not add other dependencies or
+weaken existing skips/xfails. Playwright is a host-only
 Production Smoke prerequisite; ordinary development and Candidate Acceptance
 have zero browser cost.
 
@@ -168,3 +171,14 @@ Deployment requires the exact-SHA Candidate `PASS`, Host `READY`, and explicit
 user authorization. Production Smoke must report `HEALTHY` for that same SHA.
 Local merge, remote push, and remote deployment remain separate actions; never
 automate push or deployment.
+
+## Prediction-only Linux cloud topology
+
+For CVM Prediction with a local Prediction-only Gateway, use the additional
+`prediction-cloud-host-readiness` and `prediction-cloud-smoke` targets documented
+in [prediction-cloud.md](prediction-cloud.md). They retain the exact-SHA,
+read-only browser and independent ownership requirements across both machines.
+The systemd helper's `PRECHECK_OK` and `BACKEND_SMOKE_OK` are component results,
+not substitutes for READY and HEALTHY. Candidate Acceptance timing, deployment
+and trading authorization remain unchanged. Operator handoff, metadata isolation
+and shared-host resource evidence must be explicit; the gate does not invent it.
