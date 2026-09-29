@@ -2866,6 +2866,93 @@ class _SDKPublicClient:
         return None
 
 
+def test_lp_snapshot_reuses_connections_but_refreshes_facts_after_read_failure() -> None:
+    now = datetime.now(UTC)
+    clients, reads = [], []
+
+    class Public(_SDKPublicClient):
+        closed = 0
+
+        def get_order_book(self, *, token_id):
+            assert not self.closed
+            reads.append(token_id)
+            if len(reads) == 2:
+                raise OSError("temporary read failure")
+            self.source_timestamp = now + timedelta(seconds=len(reads))
+            return super().get_order_book(token_id=token_id)
+
+        def close(self):
+            self.closed += 1
+
+    def factory():
+        client = Public(now)
+        clients.append(client)
+        return client
+
+    adapter = PolymarketTradingClient(
+        TradingConfig('0x' + '1' * 40, '0x' + '2' * 40), _SDKAccountClient(now),
+        public_client_factory=factory)
+    first = adapter.lp_snapshot(_request(now))
+    with pytest.raises(ValueError, match='^external_snapshot_unknown$'):
+        adapter.lp_snapshot(_request(now))
+    third = adapter.lp_snapshot(_request(now))
+    assert len(clients) == 1, 'reuse the client across successful and failed reads'
+    assert clients[0].closed == 0
+    assert first['book']['timestamp'] == now + timedelta(seconds=1)
+    assert third['book']['timestamp'] == now + timedelta(seconds=3)
+    adapter.close()
+    adapter.close()
+    assert clients[0].closed == 1
+    with pytest.raises(ValueError, match='^external_snapshot_unknown$'):
+        adapter.lp_snapshot(_request(now))
+    assert len(clients) == 1, 'a stopped adapter must not reopen connections'
+
+
+def test_lp_snapshot_shares_client_across_workers_and_defers_close() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    now = datetime.now(UTC)
+    entered = threading.Barrier(3)
+    release = threading.Event()
+    clients = []
+
+    class Public(_SDKPublicClient):
+        closed = 0
+
+        def get_order_book(self, *, token_id):
+            entered.wait(timeout=5)
+            assert release.wait(timeout=5)
+            assert not self.closed, 'shutdown must let in-flight reads finish'
+            return super().get_order_book(token_id=token_id)
+
+        def close(self):
+            self.closed += 1
+
+    def factory():
+        client = Public(now)
+        clients.append(client)
+        return client
+
+    adapter = PolymarketTradingClient(
+        TradingConfig('0x' + '1' * 40, '0x' + '2' * 40), _SDKAccountClient(now),
+        public_client_factory=factory)
+    with ThreadPoolExecutor(2) as workers:
+        pending = [workers.submit(adapter.lp_snapshot, _request(now)) for _ in range(2)]
+        try:
+            entered.wait(timeout=5)
+            assert len(clients) == 1
+            adapter.close()
+            assert clients[0].closed == 0
+            with pytest.raises(ValueError, match='^external_snapshot_unknown$'):
+                adapter.lp_snapshot(_request(now))
+        finally:
+            release.set()
+        assert all(job.result(timeout=5)['book'] for job in pending)
+    assert clients[0].closed == 1
+    adapter.close()
+    assert clients[0].closed == 1
+
+
 def test_production_adapter_normalizes_sdk_account_market_book_and_trades() -> None:
     now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
     account_client = _SDKAccountClient(now)

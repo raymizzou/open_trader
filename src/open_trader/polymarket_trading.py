@@ -1447,6 +1447,10 @@ class PolymarketTradingClient:
         self._client = client
         self._urlopen_fn = urlopen_fn
         self._public_client_factory = public_client_factory or PublicClient
+        self._lp_public_client: object | None = None
+        self._lp_public_client_lock = threading.Lock()
+        self._lp_public_closed = False
+        self._lp_public_readers = 0
         self._metadata_cache = metadata_cache
         self._metadata_entries: dict[
             str, tuple[float, dict[str, object] | None]
@@ -1462,6 +1466,38 @@ class PolymarketTradingClient:
         self._threshold_readiness_key: ThresholdHedgeIntent | None = None
         self._cross_leg_readiness_key: object | None = None
         self._last_submit_error: dict[str, str] | None = None
+
+    @contextmanager
+    def _lp_snapshot_public_client(self):
+        with _lp_read_stage("public_client"), self._lp_public_client_lock:
+            if self._lp_public_closed:
+                raise RuntimeError("LP snapshot client is closed")
+            if self._lp_public_client is None:
+                self._lp_public_client = self._public_client_factory()
+            public = self._lp_public_client
+            self._lp_public_readers += 1
+        try:
+            yield public
+        finally:
+            with self._lp_public_client_lock:
+                self._lp_public_readers -= 1
+                closing = self._lp_public_closed
+            if closing:
+                self.close()
+
+    def close(self) -> None:
+        """Release the public connections owned by LP snapshots."""
+        with self._lp_public_client_lock:
+            self._lp_public_closed = True
+            # Timed-out market workers can still be reading. The final reader
+            # releases the connections; shutdown prevents any new borrowers.
+            if self._lp_public_readers:
+                return
+            public, self._lp_public_client = self._lp_public_client, None
+        close = getattr(public, "close", None)
+        if callable(close):
+            with _lp_read_stage("public_close"):
+                close()
 
     def attach_metadata_cache(self, cache: object | None) -> None:
         """Attach a duck-typed persistent backing store before first use."""
@@ -4084,9 +4120,7 @@ class PolymarketTradingClient:
                     with self._lp_order_read_lock:
                         self._lp_order_read_failures[order_id] = (order_read_errors[order_id], time.monotonic() + 300)
 
-            with _lp_read_stage("public_client"):
-                public = self._public_client_factory()
-            try:
+            with self._lp_snapshot_public_client() as public:
                 with _lp_read_stage("market"):
                     market_model = public.get_market(id=market_id)
                 with _lp_read_stage("book"):
@@ -4094,11 +4128,6 @@ class PolymarketTradingClient:
                     # Capture local receipt time at the successful REST boundary;
                     # the venue timestamp remains source metadata on the book.
                     book_received_at = datetime.now(UTC)
-            finally:
-                close = getattr(public, "close", None)
-                if callable(close):
-                    with _lp_read_stage("public_close"):
-                        close()
             with _lp_read_stage("market_book_normalize"):
                 market = _model_dict(market_model)
                 book = _lp_book(book_model)
