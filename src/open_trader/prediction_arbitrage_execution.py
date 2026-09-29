@@ -809,6 +809,7 @@ class PredictionExecutionService:
         self._lp_first_seen_prev_ids: set[str] = set()
         self._lp_first_seen_prev_at: datetime | None = None
         self._lp_first_seen_pending: dict[str, dict[str, object]] = {}
+        self._lp_auto_scheduler: object | None = None
         # 当天 LP 委托：按奖励日缓存的成交聚合（我方订单 id → 汇总成交量），
         # 由后台刷新线程补全，lp_dashboard() 读取缓存做 fail-open 装配。
         self._lp_orders_today_fills: dict[str, dict[str, dict[str, object]]] = {}
@@ -839,6 +840,7 @@ class PredictionExecutionService:
             self._auto_pool = LPAutoPool(self)
             self._lp._facts_publisher = self._auto_pool.publish_session
             self._lp._facts_validator = self._validate_lp_facts
+            self._lp._facts_attention_flusher = self._auto_pool.flush_attention
         self._threads: dict[str, threading.Thread] = {}
         self._clock = time.monotonic
         self._sleep = time.sleep
@@ -862,18 +864,22 @@ class PredictionExecutionService:
         if self._lp is not None:
             self._lp._facts_wakeup = wakeup
 
+    def set_lp_auto_scheduler(self, scheduler):
+        self._lp_auto_scheduler = scheduler
+
     def _validate_lp_facts(self, session, snapshot):
-        if self._store.lp_auto_owns_session(str(session['session_id'])):
-            wallet=str((snapshot.get('account') or {}).get('wallet_address') or '').strip().casefold()
-            if not wallet or hashlib.sha256(wallet.encode()).hexdigest()!=self._lp_account_id():
-                raise ValueError('account_identity_mismatch')
-            account = snapshot['account']
-            if (account.get('authenticated') is not True
-                    or account.get('positions_complete') is not True
-                    or account.get('open_orders_complete') is not True):
-                raise ValueError('account_facts_incomplete')
-            from .polymarket_lp_risk import _freshness
-            _freshness(account.get('checked_at'), self._lp._now(), 'account_facts', max_age=Decimal(60))
+        # Every financial publication — automatic or manual — must prove the
+        # same account identity, completeness, and freshness.
+        wallet=str((snapshot.get('account') or {}).get('wallet_address') or '').strip().casefold()
+        if not wallet or hashlib.sha256(wallet.encode()).hexdigest()!=self._lp_account_id():
+            raise ValueError('account_identity_mismatch')
+        account = snapshot['account']
+        if (account.get('authenticated') is not True
+                or account.get('positions_complete') is not True
+                or account.get('open_orders_complete') is not True):
+            raise ValueError('account_facts_incomplete')
+        from .polymarket_lp_risk import _freshness
+        _freshness(account.get('checked_at'), self._lp._now(), 'account_facts', max_age=Decimal(60))
 
     def lp_auto_configure(self, payload, *, audit=None):
         return self._lp_auto_pool().configure(payload, audit=audit)
@@ -1791,6 +1797,94 @@ class PredictionExecutionService:
             "lp_observations": {},
             "lp_session": {"state": "none"},
             "lp_sessions": [],
+        }
+
+    def _lp_session_progress(self, session: Mapping[str, object]) -> dict[str, object]:
+        """Compact per-session reservation/retry view; no hidden intent list."""
+        session_id = str(session.get("session_id") or "")
+        reserved = None
+        ledger_reason = None
+        ledger_retry_at = None
+        retry_source = None
+        ledger_manual_attention = False
+        pool_reader = getattr(self._auto_pool, "_read", None)
+        owns_session = getattr(self._store, "lp_auto_owns_session", None)
+        if callable(pool_reader) and callable(owns_session) and owns_session(session_id):
+            document = pool_reader()
+            intents = document.get("intents") if isinstance(document, Mapping) else {}
+            intent = next(
+                (
+                    row
+                    for row in (intents.values() if isinstance(intents, Mapping) else ())
+                    if isinstance(row, Mapping)
+                    and str(row.get("session_id") or "") == session_id
+                ),
+                None,
+            )
+            if intent is not None:
+                value = intent.get("reserved_usd")
+                reserved = None if value is None else str(value)
+                ledger_reason = intent.get("reconcile_reason")
+                ledger_retry_at = intent.get("reconcile_retry_at")
+                retry_source = intent.get("reconcile_retry_source")
+                ledger_manual_attention = bool(intent.get("manual_attention"))
+        reason = (
+            ledger_reason
+            or session.get("reconciliation")
+            or session.get("facts_error")
+            or session.get("financial_block_reason")
+        )
+        if session.get("facts_error") in {"facts_read_capacity", "facts_read_in_progress"}:
+            reason = session["facts_error"]
+        retry_at = ledger_retry_at or session.get("reconcile_retry_at")
+        market_retry = getattr(self._lp, "market_read_retry_at", None)
+        if retry_at is None and callable(market_retry):
+            retry_at = market_retry(str(session.get("condition_id") or ""))
+        if retry_at is None:
+            scheduler = getattr(self._lp_auto_scheduler, "snapshot", None)
+            if callable(scheduler):
+                scheduled = scheduler()
+                retry_at = scheduled.get("next_check_at")
+                if scheduled.get("check_in_progress"):
+                    retry_at = None
+                    retry_source = "scheduler_check_in_progress"
+        if reason in {"facts_read_capacity", "facts_read_in_progress"}:
+            retry_at, retry_source = None, reason
+        state = str(session.get("state") or "")
+        manual_attention = bool(
+            ledger_manual_attention
+            or session.get("manual_attention")
+            or reason
+            in {
+                "account_identity_mismatch",
+                "credential_invalid",
+                "missing_reliable_order_id",
+                "duplicate_order_identity",
+                "order_identity_conflict",
+            }
+        )
+        if manual_attention:
+            action = "manual_review"
+        elif state == "needs_attention":
+            action = "read_only_reconcile"
+        elif state == "stop_loss_exit":
+            action = "protected_exit"
+        elif state == "passive_exit":
+            action = "passive_exit"
+        elif retry_at is not None:
+            action = "reconcile_retry"
+        elif session.get("review_at"):
+            action = "review_deadline"
+        else:
+            action = "monitor"
+        return {
+            "reserved_usd": str(reserved) if reserved is not None else None,
+            "reason": str(reason) if reason else None,
+            "last_good_check_at": session.get("facts_checked_at"),
+            "next_action": action,
+            "retry_at": retry_at,
+            "retry_source": retry_source,
+            "manual_attention": manual_attention,
         }
 
     def lp_dashboard(self) -> dict[str, object]:
@@ -2932,7 +3026,11 @@ class PredictionExecutionService:
                     # group the list carries the most recently finished
                     # group (sunk to the bottom of the UI).
                     "lp_sessions": [
-                        dict(row) for row in (active_rows if active_rows else [session])
+                        {
+                            **dict(row),
+                            "lp_progress": self._lp_session_progress(row),
+                        }
+                        for row in (active_rows if active_rows else [session])
                     ],
                 }
                 self._lp_dashboard_cache = result
@@ -4269,19 +4367,13 @@ class PredictionExecutionService:
             self._release_global_lock(lock)
 
     def lp_stop(self, session_id: str | None = None) -> dict[str, object]:
-        """Cancel only this LP session's open orders under the shared mutex."""
+        """Claim one stop durably, then cancel outside the shared locks."""
 
         service = self._lp
         stop = getattr(service, "stop", None)
         if not callable(stop):
             return {"state": "none", "session_id": None, "reason": "lp_unavailable"}
-        lock = self._acquire_global_lock()
-        if lock is None:
-            return {"state": "busy", "reason": "execution_lock"}
-        try:
-            return stop(session_id)
-        finally:
-            self._release_global_lock(lock)
+        return stop(session_id)
 
     def lp_augment_preview(self, request: Mapping[str, object]) -> dict[str, object]:
         """Run the LP augment read-only preflight through the LP service."""

@@ -3966,6 +3966,24 @@ function lpNeedsAttentionCopy(session) {
     || code === "book_unknown"
     || code === "book_freshness_unknown") {
     main = "市场/账户数据连续读取失败，系统自动重试中。";
+  } else if (code === "execution_lock") {
+    main = "等待其他交易操作完成，随后自动继续核对。";
+  } else if (code === "market_read_timeout"
+    || code === "market_read_in_progress"
+    || code === "market_read_cooling_down"
+    || code === "market_read_capacity"
+    || code === "account_read_cooling_down"
+    || code === "facts_read_capacity"
+    || code === "facts_read_in_progress") {
+    main = "市场/账户读取暂时受限，系统按计划重试。";
+  } else if (code === "credential_invalid" || code === "account_identity_mismatch") {
+    main = "账户身份或凭据需要人工确认，核对完成前继续保留占资。";
+  } else if (code === "account_facts_stale"
+    || code === "account_round_invalid"
+    || code === "session_changed"
+    || code === "trade_change_pending"
+    || code === "account_facts_incomplete") {
+    main = "账户事实已变化或未完整返回，系统重新读取中。";
   } else if (code.includes("submit_unknown")) {
     main = "一笔提交结果未知，需要到 Polymarket 订单页核对该单状态。";
   } else if (/^(stop_cancel_|deadline_cancel_|group_collect_)/.test(code)) {
@@ -4068,6 +4086,63 @@ function lpDashboardTodayQuantityCell(orders, session) {
     + "<span class=\"sub\">" + escapeHtml(fillLine) + "</span></div>"
     + headlineRight + "</div>";
   if (attentionLine) markup += attentionLine;
+  const progress = session?.lp_progress;
+  if (progress && typeof progress === "object") {
+    const actionText = {
+      manual_review: "人工核对",
+      read_only_reconcile: "只读重试核对",
+      protected_exit: "保护卖出",
+      passive_exit: "被动卖出",
+      reconcile_retry: "重试核对",
+      review_deadline: "到期复核",
+      monitor: "持续监控"
+    }[String(progress.next_action || "")] || "下一步未知";
+    const reserved = predictionHasValue(progress.reserved_usd)
+      ? lpDashboardMoney(progress.reserved_usd)
+      : "UNKNOWN";
+    const reasonCode = String(progress.reason || "");
+    const reason = reasonCode === "execution_lock"
+      ? "等待其他交易操作完成"
+      : reasonCode === "market_read_timeout" || reasonCode === "external_snapshot_unknown"
+        ? "市场/账户读取未完成，下一轮继续核对"
+      : reasonCode === "market_read_capacity" || reasonCode === "facts_read_capacity"
+        ? "核对通道已占用，等待可用执行容量"
+      : reasonCode === "facts_read_in_progress"
+        ? "账户核对正在读取，等待返回"
+      : reasonCode === "market_read_in_progress"
+        ? "市场数据正在读取，等待返回"
+      : reasonCode === "market_read_cooling_down" || reasonCode === "account_read_cooling_down"
+        ? "数据服务要求等待，按限流期限重试"
+      : ["account_facts_stale", "account_round_invalid", "session_changed", "trade_change_pending"].includes(reasonCode)
+        ? "账户事实已变化，重新读取中"
+      : reasonCode === "account_identity_mismatch" || reasonCode === "credential_invalid"
+        ? "账户身份或凭据需要人工确认"
+      : reasonCode === "missing_reliable_order_id"
+        ? "缺少可靠订单编号，需要人工核对"
+      : reasonCode === "duplicate_order_identity" || reasonCode === "order_identity_conflict"
+        ? "订单归属冲突，需要人工核对"
+      : reasonCode
+        ? lpNeedsAttentionCopy({reconciliation: reasonCode}).main
+        : "正常核对中";
+    const checked = predictionHasValue(progress.last_good_check_at)
+      ? predictionHktTimestamp(progress.last_good_check_at)
+      : "UNKNOWN";
+    const retry = predictionHasValue(progress.retry_at)
+      ? predictionHktTimestamp(progress.retry_at)
+      : null;
+    markup += "<div class=\"sub lp-session-progress\">保留 "
+      + escapeHtml(reserved)
+      + " · 原因 " + escapeHtml(reason)
+      + " · 上次核对 " + escapeHtml(checked)
+      + " · " + escapeHtml(actionText)
+      + (retry ? " · " + escapeHtml(retry)
+        : progress.retry_source === "scheduler_check_in_progress" ? " · 当前核对进行中，完成后安排重试"
+        : reasonCode === "market_read_capacity" || reasonCode === "facts_read_capacity" ? " · 暂无可用核对容量"
+        : reasonCode === "facts_read_in_progress" ? " · 等待本次读取完成"
+        : " · 等待下一轮调度")
+      + (progress.manual_attention ? " · 需要人工处理" : "")
+      + "</div>";
+  }
   if (multi) {
     const sidesConsistent = new Set(orders.map((row) => String(row.side || "").toUpperCase())).size === 1;
     const purposes = orders.map((row) => lpDashboardTodayPurposeLabel(row));

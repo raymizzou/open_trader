@@ -3,7 +3,21 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-09-30
+
+- #201：补齐真实 SDK 账户余额、订单、成交及持仓读取的限流响应捕获，保留服务端重试期限和认证失败原因；
+  手动会话优先展示当前容量/读取等待，原故障诊断保留。离线真实 SDK 回归覆盖限流、认证、响应脱敏和 hook 清理；未部署。
+
 ## 2026-09-29
+
+- #201：LP 核对在短暂发布竞争后复用仍有效的读取结果，交易变化或过期时重新核对；
+  复用共享账户交易版本与动作登记，网络请求移出发布锁，未知提交不重发、未知资金继续占资。
+  财务结清与新单行情准入分开，行情限流遵守固定重试期限；既有委托行显示占资、阻塞及核对进度。
+  连续故障五分钟提醒，真实恢复后按已送达渠道通知；部分发送重试与迟到回调保持故障身份隔离。
+  账户认证失败保留人工处理原因，账户读取同样遵守服务端限流期限；容量等待可见。
+  手动重新准备重置故障计时，停止订单本身不触发恢复通知；缺失渠道回执不算送达。
+  定向回归覆盖账户 round、核对/轮换、重启/迟到回执、通知、存储、runtime、scheduler 与 Dashboard；
+  自动意图、日报和准备面板继续隐藏。未部署。
 
 - Prediction services now validate an explicitly supplied release manifest in
   Shadow as well as Production, publish its release generations in health, and

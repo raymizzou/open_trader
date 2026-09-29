@@ -139,7 +139,8 @@ _SAFE_ERROR_CODES = {
 class PolymarketTradingError(RuntimeError):
     """An intentionally redacted adapter error."""
 
-    def __init__(self, error_code: str) -> None:
+    def __init__(self, error_code: str, *, response_facts: Mapping[str, object] | None = None) -> None:
+        self.response_facts = dict(response_facts or {})
         safe_code = error_code if error_code in _SAFE_ERROR_CODES else "sdk_error"
         self.error_code = safe_code
         super().__init__(f"polymarket trading error: {safe_code}")
@@ -835,14 +836,17 @@ def _install_lp_response_fact_hook(
     *,
     path: str,
     facts: dict[str, object],
+    transport_name: str | None = None,
 ) -> Callable[[], None] | None:
     """Capture safe response facts before the SDK turns them into exceptions."""
 
     try:
         context = getattr(public, "_ctx")
         preferred = "gamma" if path == "/markets/keyset" else "clob"
-        transport_names = (preferred,) + tuple(
-            name for name in ("clob", "gamma", "data") if name != preferred
+        transport_names = (transport_name,) if transport_name is not None else (
+            (preferred,) + tuple(
+                name for name in ("clob", "gamma", "data") if name != preferred
+            )
         )
         transport = next(
             getattr(context, name)
@@ -856,10 +860,16 @@ def _install_lp_response_fact_hook(
     if not isinstance(response_hooks, list):
         return None
 
+    owner_thread = threading.get_ident()
+
     def on_response(response: object) -> None:
+        if threading.get_ident() != owner_thread:
+            return
         url = getattr(getattr(response, "request", None), "url", None)
         if getattr(url, "path", None) != path:
             return
+        for field in ("status", "retry_after_seconds", "retry_after_at"):
+            facts.pop(field, None)
         status = getattr(response, "status_code", None)
         if type(status) is int:
             facts["status"] = status
@@ -1605,6 +1615,14 @@ class LpNewerAccountFacts(ValueError):
         self.observed_trade_generation = observed_trade_generation
 
 
+class LpAccountReadError(ValueError):
+    """Safe LP account failure with the provider's fixed retry deadline."""
+
+    def __init__(self, reason: str, retry_at: datetime | None = None) -> None:
+        super().__init__(reason)
+        self.retry_at = retry_at
+
+
 class PolymarketTradingClient:
     """A narrow, redacted wrapper around the official synchronous SDK."""
 
@@ -1625,6 +1643,12 @@ class PolymarketTradingClient:
         self._lp_public_client_lock = threading.Lock()
         self._lp_public_closed = False
         self._lp_public_readers = 0
+        self._lp_account_read_lock = threading.Lock()
+        self._lp_account_read_retry = None
+        self._lp_public_read_timeout = 1.0
+        self._lp_public_reads_lock = threading.Lock()
+        self._lp_public_reads: dict[str, Future] = {}
+        self._lp_public_read_retry: dict[str, tuple[float, dict[str, object]]] = {}
         self._metadata_cache = metadata_cache
         self._metadata_entries: dict[
             str, tuple[float, dict[str, object] | None]
@@ -1658,6 +1682,136 @@ class PolymarketTradingClient:
                 closing = self._lp_public_closed
             if closing:
                 self.close()
+
+    def _lp_public_retry_after(self, error: Mapping[str, object]) -> float | None:
+        seconds = error.get("retry_after_seconds")
+        if isinstance(seconds, (int, float)) and not isinstance(seconds, bool):
+            if math.isfinite(float(seconds)) and seconds >= 0:
+                return time.monotonic() + float(seconds)
+        retry_at = error.get("retry_after_at")
+        if isinstance(retry_at, datetime):
+            moment = retry_at if retry_at.tzinfo else retry_at.replace(tzinfo=UTC)
+            return max(0.0, (moment - datetime.now(UTC)).total_seconds() + time.monotonic())
+        return None
+
+    def _lp_public_error_at_deadline_locked(
+        self, key: str, error: Mapping[str, object], *, create: bool
+    ) -> tuple[float, dict[str, object]] | None:
+        """Read/create the in-memory Retry-After fence; caller holds its lock."""
+        existing = self._lp_public_read_retry.get(key)
+        if existing is not None:
+            return existing[0], self._lp_public_retry_projection(existing)
+        deadline = self._lp_public_retry_after(error)
+        if deadline is None or not create:
+            return None
+        self._lp_public_read_retry[key] = (deadline, dict(error))
+        return deadline, dict(error)
+
+    @staticmethod
+    def _lp_public_retry_projection(
+        entry: tuple[float, dict[str, object]],
+    ) -> dict[str, object]:
+        deadline, error = entry
+        remaining = max(0.0, deadline - time.monotonic())
+        projected = dict(error)
+        projected["retry_after_seconds"] = (
+            int(remaining) if remaining.is_integer() else remaining
+        )
+        projected["retry_after_at"] = datetime.fromtimestamp(
+            time.time() + remaining, UTC
+        )
+        return projected
+
+    def _read_lp_public_snapshot(
+        self, key: str, market_id: str, token_id: str, *, wait: bool = True
+    ) -> tuple[object | None, object | None, datetime | None, dict[str, object] | None]:
+        """Bounded single-flight public read with a durable Retry-After fence."""
+        with self._lp_public_reads_lock:
+            retry = self._lp_public_read_retry.get(key)
+            if retry is not None and time.monotonic() < retry[0]:
+                return None, None, None, self._lp_public_retry_projection(retry)
+            if retry is not None:
+                self._lp_public_read_retry.pop(key, None)
+                expired = self._lp_public_reads.get(key)
+                if expired is not None and expired.done():
+                    self._lp_public_reads.pop(key, None)
+            existing = self._lp_public_reads.get(key)
+            if existing is not None:
+                if not existing.done():
+                    return None, None, None, {
+                        "error_type": "market_read_in_progress",
+                        "stage": "market_book",
+                    }
+                try:
+                    cached_market, cached_token, market_model, book_model, received_at = existing.result()
+                except Exception as exc:
+                    self._lp_public_reads.pop(key, None)
+                    recorded = self._lp_public_error_at_deadline_locked(
+                        key, _safe_history_response_facts(exc), create=False
+                    )
+                    error = recorded[1] if recorded is not None else _safe_history_response_facts(exc)
+                    return None, None, None, error
+                fresh = (
+                    cached_market == market_id
+                    and cached_token == token_id
+                    and received_at is not None
+                    and 0 <= (datetime.now(UTC) - received_at).total_seconds() <= 60
+                )
+                if self._lp_public_reads.get(key) is existing:
+                    self._lp_public_reads.pop(key)
+                if fresh:
+                    return market_model, book_model, received_at, None
+            if len([job for job in self._lp_public_reads.values() if not job.done()]) >= 2:
+                return None, None, None, {
+                    "error_type": "market_read_capacity",
+                    "stage": "market_book",
+                }
+            future: Future = Future()
+            self._lp_public_reads[key] = future
+
+        def run():
+            try:
+                with self._lp_snapshot_public_client() as public:
+                    with _lp_read_stage("market"):
+                        market_model = public.get_market(id=market_id)
+                    with _lp_read_stage("book"):
+                        book_model = public.get_order_book(token_id=token_id)
+                        received_at = datetime.now(UTC)
+                future.set_result((market_id, token_id, market_model, book_model, received_at))
+            except BaseException as exc:
+                error = _safe_history_response_facts(exc)
+                with self._lp_public_reads_lock:
+                    self._lp_public_error_at_deadline_locked(key, error, create=True)
+                future.set_exception(exc)
+
+        threading.Thread(target=run, daemon=True, name=f"lp-public-read:{key}").start()
+        if not wait:
+            return None, None, None, {
+                "error_type": "market_read_in_progress",
+                "stage": "market_book",
+            }
+        try:
+            _, _, market_model, book_model, received_at = future.result(
+                timeout=self._lp_public_read_timeout
+            )
+        except FuturesTimeoutError:
+            return None, None, None, {
+                "error_type": "TimeoutError",
+                "stage": "market_book",
+            }
+        except Exception as exc:
+            with self._lp_public_reads_lock:
+                if self._lp_public_reads.get(key) is future:
+                    self._lp_public_reads.pop(key)
+                recorded = self._lp_public_error_at_deadline_locked(
+                    key, _safe_history_response_facts(exc), create=False
+                )
+            error = recorded[1] if recorded is not None else _safe_history_response_facts(exc)
+            return None, None, None, error
+        with self._lp_public_reads_lock:
+            if self._lp_public_reads.get(key) is future:
+                self._lp_public_reads.pop(key)
+        return market_model, book_model, received_at, None
 
     def close(self) -> None:
         """Release the public connections owned by LP snapshots."""
@@ -1747,7 +1901,22 @@ class PolymarketTradingClient:
         except Exception:
             return False
 
-    def _account_read_facts(
+    def _account_read_facts(self):
+        with self._lp_account_read_lock:
+            retry = self._lp_account_read_retry
+            if retry is not None and time.monotonic() < retry[0]:
+                raise PolymarketTradingError("network", response_facts=self._lp_public_retry_projection(retry))
+            self._lp_account_read_retry = None
+            try:
+                return self._account_read_facts_once()
+            except PolymarketTradingError as exc:
+                deadline = self._lp_public_retry_after(exc.response_facts)
+                if deadline is not None:
+                    self._lp_account_read_retry = (deadline, exc.response_facts)
+                    exc.response_facts = self._lp_public_retry_projection(self._lp_account_read_retry)
+                raise
+
+    def _account_read_facts_once(
         self,
     ) -> tuple[
         Decimal,
@@ -1758,7 +1927,21 @@ class PolymarketTradingClient:
         tuple[object, ...],
         bool,
     ]:
+        response_facts: dict[str, object] = {}
+        remove_hooks = []
         try:
+            for transport_name, path in (
+                ("secure_clob", "/balance-allowance"),
+                ("secure_clob", "/data/orders"),
+                ("secure_clob", "/data/trades"),
+                ("data", "/positions"),
+            ):
+                remove = _install_lp_response_fact_hook(
+                    self._client, path=path, facts=response_facts,
+                    transport_name=transport_name,
+                )
+                if remove is not None:
+                    remove_hooks.append(remove)
             with _lp_read_stage("account_balance"):
                 p_usd_balance, p_usd_allowance = self._collateral_balance_allowance()
             checked_at = datetime.now(UTC)
@@ -1790,8 +1973,12 @@ class PolymarketTradingClient:
             )
         except Exception as exc:
             code = _safe_error_code(exc)
-            del exc
-            raise PolymarketTradingError(code) from None
+            raise PolymarketTradingError(
+                code, response_facts={**_safe_history_response_facts(exc), **response_facts}
+            ) from None
+        finally:
+            for remove in reversed(remove_hooks):
+                remove()
 
     def account_snapshot(self) -> AccountSnapshot:
         (
@@ -1996,15 +2183,24 @@ class PolymarketTradingClient:
         """Normalize complete authenticated lists before any display enrichment."""
 
         lp_checked_at = datetime.now(UTC)
-        (
-            balance,
-            allowance,
-            orders,
-            positions,
-            account_checked_at,
-            raw_trades,
-            trades_complete,
-        ) = self._account_read_facts()
+        try:
+            (
+                balance,
+                allowance,
+                orders,
+                positions,
+                account_checked_at,
+                raw_trades,
+                trades_complete,
+            ) = self._account_read_facts()
+        except PolymarketTradingError as exc:
+            facts = exc.response_facts
+            if facts.get("status") == 401:
+                raise LpAccountReadError("credential_invalid") from None
+            retry_at = facts.get("retry_after_at")
+            if isinstance(retry_at, datetime):
+                raise LpAccountReadError("account_read_cooling_down", retry_at) from None
+            raise
         checked_at = (
             account_checked_at
             if isinstance(account_checked_at, datetime)
@@ -4364,6 +4560,67 @@ class PolymarketTradingClient:
             seen_cursors.add(next_cursor)
             cursor = next_cursor
 
+    def _lp_market_facts(
+        self,
+        request: Mapping[str, object],
+        condition_id: str,
+        market: Mapping[str, object],
+        book: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Normalize market admission facts after financial facts are ready."""
+        state = _model_dict(market.get("state")) or {}
+        outcomes = _model_dict(market.get("outcomes")) or {}
+        selected = str(request.get("outcome") or "").lower()
+        selected_outcome = _model_dict(outcomes.get(selected)) or {}
+        trading = _model_dict(market.get("trading")) or {}
+        rewards = _model_dict(market.get("rewards")) or {}
+        fee_schedule = _model_dict(trading.get("fee_schedule")) or {}
+        fees_enabled = trading.get("fees_enabled")
+        reward_min = rewards.get("rewards_min_size")
+        reward_spread = rewards.get("rewards_max_spread")
+        if reward_min is None or reward_spread is None:
+            reward_reader = getattr(self._client, "list_market_rewards", None)
+            if callable(reward_reader):
+                with _lp_read_stage("market_rewards"):
+                    reward_rows = tuple(_collect(reward_reader(condition_id=condition_id)))
+                if reward_rows:
+                    reward = _model_dict(reward_rows[0]) or {}
+                    reward_min = reward.get("rewards_min_size")
+                    reward_spread = reward.get("rewards_max_spread")
+        tick_size = book.get("tick_size", trading.get("minimum_tick_size"))
+        minimum_order_size = book.get("min_order_size", trading.get("minimum_order_size"))
+        taker_rate = fee_schedule.get("rate")
+        if taker_rate is None:
+            taker_rate = market.get("taker_fee_rate")
+        with _lp_read_stage("market_validate"):
+            if taker_rate is None and fees_enabled is not False:
+                raise ValueError("fee_rate_unknown")
+        raw_reward_spread = _lp_decimal(reward_spread)
+        normalized_reward_spread = (
+            None if raw_reward_spread is None else raw_reward_spread / Decimal("100")
+        )
+        fee_value: Decimal | None
+        if fees_enabled is False or fee_schedule.get("taker_only") is True:
+            fee_value = Decimal("0")
+        else:
+            fee_value = None
+        return {
+            "market_id": market.get("id"),
+            "condition_id": market.get("condition_id"),
+            "token_id": selected_outcome.get("token_id"),
+            "outcome": str(selected_outcome.get("label") or request.get("outcome") or "").upper(),
+            "accepting_orders": state.get("accepting_orders"),
+            "exchange_type": "CLOB",
+            "tick_size": _lp_decimal(tick_size),
+            "minimum_order_size": _lp_decimal(minimum_order_size),
+            "fee": fee_value,
+            "fees_enabled": fees_enabled,
+            "fee_exponent": _lp_decimal(fee_schedule.get("exponent", 1)),
+            "taker_fee_rate": _lp_decimal(taker_rate),
+            "reward_min_size": _lp_decimal(reward_min),
+            "reward_max_spread": normalized_reward_spread,
+        }
+
     def lp_snapshot(self, request: Mapping[str, object]) -> dict[str, object]:
         """Read the authenticated and public facts used by one LP session.
 
@@ -4456,7 +4713,7 @@ class PolymarketTradingClient:
                         else 'order_response_invalid' if isinstance(cause, ValidationError)
                         else 'order_read_failed')
                     with self._lp_order_read_lock:
-                        self._lp_order_read_failures[order_id] = (order_read_errors[order_id], time.monotonic() + 300)
+                        self._lp_order_read_failures[order_id] = (order_read_errors[order_id], time.monotonic() + 60)
                     continue
                 normalized = _lp_order(order)
                 if normalized is not None:
@@ -4497,78 +4754,10 @@ class PolymarketTradingClient:
                     order_read_errors[order_id] = ('order_lookup_unavailable' if order is None
                                                   else 'order_response_invalid')
                     with self._lp_order_read_lock:
-                        self._lp_order_read_failures[order_id] = (order_read_errors[order_id], time.monotonic() + 300)
+                        self._lp_order_read_failures[order_id] = (order_read_errors[order_id], time.monotonic() + 60)
 
-            with self._lp_snapshot_public_client() as public:
-                with _lp_read_stage("market"):
-                    market_model = public.get_market(id=market_id)
-                with _lp_read_stage("book"):
-                    book_model = public.get_order_book(token_id=token_id)
-                    # Capture local receipt time at the successful REST boundary;
-                    # the venue timestamp remains source metadata on the book.
-                    book_received_at = datetime.now(UTC)
-            with _lp_read_stage("market_book_normalize"):
-                market = _model_dict(market_model)
-                book = _lp_book(book_model)
-                if market is None or book is None:
-                    raise ValueError("external_snapshot_unknown")
-            book["received_at"] = book_received_at
-            state = _model_dict(market.get("state")) or {}
-            outcomes = _model_dict(market.get("outcomes")) or {}
-            selected = str(request.get("outcome") or "").lower()
-            selected_outcome = _model_dict(outcomes.get(selected)) or {}
-            trading = _model_dict(market.get("trading")) or {}
-            rewards = _model_dict(market.get("rewards")) or {}
-            fee_schedule = _model_dict(trading.get("fee_schedule")) or {}
-            fees_enabled = trading.get("fees_enabled")
-            reward_min = rewards.get("rewards_min_size")
-            reward_spread = rewards.get("rewards_max_spread")
-            if reward_min is None or reward_spread is None:
-                reward_reader = getattr(self._client, "list_market_rewards", None)
-                if callable(reward_reader):
-                    with _lp_read_stage("market_rewards"):
-                        reward_rows = tuple(_collect(reward_reader(condition_id=condition_id)))
-                    if reward_rows:
-                        reward = _model_dict(reward_rows[0]) or {}
-                        reward_min = reward.get("rewards_min_size")
-                        reward_spread = reward.get("rewards_max_spread")
-            tick_size = book.get("tick_size", trading.get("minimum_tick_size"))
-            minimum_order_size = book.get("min_order_size", trading.get("minimum_order_size"))
-            taker_rate = fee_schedule.get("rate")
-            if taker_rate is None:
-                taker_rate = market.get("taker_fee_rate")
-            with _lp_read_stage("market_validate"):
-                if taker_rate is None and fees_enabled is not False:
-                    raise ValueError("fee_rate_unknown")
-            raw_reward_spread = _lp_decimal(reward_spread)
-            normalized_reward_spread = (
-                None
-                if raw_reward_spread is None
-                else raw_reward_spread / Decimal("100")
-            )
-            fee_value: Decimal | None
-            if fees_enabled is False or fee_schedule.get("taker_only") is True:
-                fee_value = Decimal("0")
-            else:
-                fee_value = None
-            market_facts = {
-                "market_id": market.get("id"),
-                "condition_id": market.get("condition_id"),
-                "token_id": selected_outcome.get("token_id"),
-                "outcome": str(
-                    selected_outcome.get("label") or request.get("outcome") or ""
-                ).upper(),
-                "accepting_orders": state.get("accepting_orders"),
-                "exchange_type": "CLOB",
-                "tick_size": _lp_decimal(tick_size),
-                "minimum_order_size": _lp_decimal(minimum_order_size),
-                "fee": fee_value,
-                "fees_enabled": fees_enabled,
-                "fee_exponent": _lp_decimal(fee_schedule.get("exponent", 1)),
-                "taker_fee_rate": _lp_decimal(taker_rate),
-                "reward_min_size": _lp_decimal(reward_min),
-                "reward_max_spread": normalized_reward_spread,
-            }
+            # Normalize complete financial facts before the optional public
+            # lane can fail; settlement and market admission stay separate.
             account_facts = {
                 key: value
                 for key, value in account.items()
@@ -4584,13 +4773,8 @@ class PolymarketTradingClient:
             }
             orders_terminal = not order_ids or all(
                 order_statuses.get(order_id) in {
-                    "FILLED",
-                    "MATCHED",
-                    "CANCELED",
-                    "CANCELLED",
-                    "REJECTED",
-                    "EXPIRED",
-                    "FAILED",
+                    "FILLED", "MATCHED", "CANCELED", "CANCELLED",
+                    "REJECTED", "EXPIRED", "FAILED",
                 }
                 for order_id in order_ids
             )
@@ -4598,22 +4782,57 @@ class PolymarketTradingClient:
                 trade_rows = [_lp_trade(trade) for trade in trades]
                 if any(row is None for row in trade_rows):
                     raise ValueError("external_snapshot_unknown")
+            position_flat = not any(
+                str(_field(position, "token_id", _field(position, "asset_id", "")))
+                == token_id
+                and (_decimal(_field(position, "size", 0)) > 0)
+                for position in account["positions"]
+            )
+            market_facts = None
+            book = None
+            public_read_errors: dict[str, object] = {}
+            market_model, book_model, book_received_at, public_error = (
+                self._read_lp_public_snapshot(
+                    f"{condition_id}\0{token_id}",
+                    market_id,
+                    token_id,
+                    wait=request.get("lp_public_wait") is not False,
+                )
+            )
+            if public_error is not None:
+                public_read_errors[condition_id] = public_error
+            else:
+                try:
+                    with _lp_read_stage("market_book_normalize"):
+                        market = _model_dict(market_model)
+                        book = _lp_book(book_model)
+                        if market is None or book is None:
+                            raise ValueError("market_response_invalid")
+                        book["received_at"] = book_received_at
+                    market_facts = self._lp_market_facts(
+                        request, condition_id, market, book
+                    )
+                except Exception as exc:
+                    public_read_errors[condition_id] = {
+                        "error_type": (
+                            str(exc)
+                            if isinstance(exc, ValueError) and str(exc)
+                            else type(exc).__name__
+                        ),
+                        "stage": "market_book",
+                    }
             result: dict[str, object] = {
                 "account": account_facts,
                 "market": market_facts,
                 "book": book,
                 "orders": order_rows,
                 "order_read_errors": order_read_errors,
+                "market_read_errors": public_read_errors,
                 "trades": trade_rows,
                 "orders_terminal": orders_terminal,
-                "position_flat": not any(
-                    str(_field(position, "token_id", _field(position, "asset_id", "")))
-                    == token_id
-                    and (_decimal(_field(position, "size", 0)) > 0)
-                    for position in account["positions"]
-                ),
+                "position_flat": position_flat,
                 "account_checked_at": account["checked_at"],
-                "book_checked_at": book.get("received_at"),
+                "book_checked_at": book.get("received_at") if book else None,
                 "_lp_trade_generation": bundle_trade_generation,
             }
             if account_round is not None:

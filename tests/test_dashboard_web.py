@@ -24294,6 +24294,50 @@ console.log(JSON.stringify({
     assert rendered == {"pill": True, "line": True, "counter": True, "noAugment": True}
 
 
+def test_lp_today_row_compact_session_progress() -> None:
+    """#201：既有委托行展示保留金额、业务原因、核对/重试与人工需求。"""
+    output = run_dashboard_js(r'''
+const order = {
+  order_id: "entry-progress", condition_id: "condition-progress",
+  token_id: "token-progress", session_id: "sess-progress",
+  market_title: "Progress market", market_url: "https://polymarket.com/event/x",
+  outcome: "YES", side: "BUY", status: "LIVE", price: "0.29",
+  quantity: "2000", filled_quantity: "100", remaining_quantity: "1900",
+  state: "open", anchor: true,
+};
+const session = {
+  session_id: "sess-progress", state: "needs_attention",
+  reconciliation: "execution_lock",
+  lp_progress: {
+    reserved_usd: "5.51", reason: "execution_lock",
+    last_good_check_at: "2026-09-29T10:20:00Z",
+    next_action: "reconcile_retry", retry_at: "2026-09-29T10:21:00Z",
+    manual_attention: false,
+  },
+};
+const html = lpDashboardTodayQuantityCell([order], session);
+console.log(JSON.stringify({
+  reserved: html.includes("保留 $5.51"),
+  businessReason: html.includes("原因 等待其他交易操作完成"),
+  checked: html.includes("上次核对"),
+  retry: html.includes("重试核对"),
+  waiting: html.includes("等待下一轮调度"),
+  noRawCode: !html.includes("execution_lock"),
+  noManual: !html.includes("需要人工处理"),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered == {
+        "reserved": True,
+        "businessReason": True,
+        "checked": True,
+        "retry": True,
+        "waiting": False,
+        "noRawCode": True,
+        "noManual": True,
+    }
+
+
 def test_lp_today_row_entry_open_keeps_augment_button() -> None:
     """W2（回归）：entry_open 组的行不出现「需要核对」pill，追加按钮照常。"""
     output = run_dashboard_js(r'''
@@ -24370,3 +24414,30 @@ console.log(JSON.stringify({
         "reasonSentence": True,
         "counter": True,
     }
+
+
+@pytest.mark.parametrize('reason,copy', [
+    ('account_round_invalid', '账户事实已变化'),
+    ('market_read_capacity', '暂无可用核对容量'),
+    ('market_read_in_progress', '市场数据正在读取'),
+    ('market_read_cooling_down', '按限流期限重试'),
+])
+def test_lp_progress_uses_business_copy_for_read_waits(reason, copy):
+    output = run_dashboard_js('''
+const html = lpDashboardTodayQuantityCell([], {lp_progress: {
+  reason: %s, retry_source: "scheduler_check_in_progress", next_action: "reconcile_retry"
+}});
+console.log(JSON.stringify(html));
+''' % json.dumps(reason))
+    html = json.loads(output)
+    assert (copy if reason != 'market_read_capacity' else '等待可用执行容量') in html
+    assert reason not in html
+    assert '当前核对进行中，完成后安排重试' in html
+
+
+@pytest.mark.parametrize('reason', ['credential_invalid', 'account_read_cooling_down', 'facts_read_capacity', 'facts_read_in_progress'])
+def test_lp_review_read_failures_never_show_internal_codes(reason):
+    output = run_dashboard_js("console.log(JSON.stringify(lpNeedsAttentionCopy({reconciliation: %s})));" % json.dumps(reason))
+    copy = json.loads(output)['main']
+    assert reason not in copy
+    assert '账户' in copy

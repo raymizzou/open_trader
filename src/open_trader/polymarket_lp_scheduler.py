@@ -69,7 +69,14 @@ class LPAutoScheduler:
             finally:
                 with self._state:
                     self._checking = False
-                    self._next_check_at = self.clock() + timedelta(seconds=60)
+                    now = self.clock()
+                    # The 60-second budget starts when the check starts. A
+                    # slower check becomes due immediately rather than adding
+                    # its own latency on top of another full interval.
+                    self._next_check_at = max(
+                        now,
+                        (self._last_check_at or now) + timedelta(seconds=60),
+                    )
             return True
         finally:
             self._cycle.release()

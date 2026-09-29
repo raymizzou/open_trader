@@ -15,14 +15,16 @@ from time import monotonic
 from contextlib import contextmanager, nullcontext
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import Mapping
 
 from .polymarket_lp_risk import (
     TERMINAL_ORDER_STATES, _account_after_reservations, _decimal as _money, _freshness, _levels,
     _maybe_decimal, _timestamp, evaluate_lp_entry, estimate_lp_target_share_yield,
 )
+from .daily_premarket import send_notification_with_results
 
 ZERO = Decimal('0')
 
@@ -64,6 +66,34 @@ def _json(value):
     if isinstance(value, datetime):
         return value.astimezone(UTC).isoformat()
     raise TypeError(type(value).__name__)
+
+
+def _maybe_datetime(value: object) -> datetime | None:
+    try:
+        return _timestamp(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _reconcile_retry_plan(
+    error: object,
+    now: datetime,
+    previous: object = None,
+    scheduled_at: datetime | None = None,
+) -> tuple[datetime, str]:
+    """Return the real future deadline and its source; never extend it to 60s."""
+    candidates: list[tuple[datetime, str]] = []
+    previous_at = _maybe_datetime(previous)
+    if previous_at is not None and previous_at > now:
+        candidates.append((previous_at, "existing_plan"))
+    scheduled = _maybe_datetime(scheduled_at)
+    if scheduled is not None and scheduled > now:
+        # Provider rate limits and scheduler deadlines are lower bounds; a
+        # normal 30-second plan must still display and execute at 30 seconds.
+        candidates.append((scheduled, str(error or "scheduled")))
+    if candidates:
+        return max(candidates, key=lambda item: item[0])
+    return now + timedelta(seconds=60), "fallback_minute"
 
 
 def minimum_order_estimate(direction, guidance, now, *, resting_quantity=ZERO):
@@ -117,6 +147,7 @@ class LPAutoPool:
         self.send_path = Path(str(self.store.path) + '.lp-auto-send.lock')
         self._reconcile_jobs = {}
         self._reconcile_jobs_lock = threading.Lock()
+        self._attention_delivery_lock = threading.Lock()
 
     def _begin_account_round(self) -> _AccountRoundLease | None:
         begin = getattr(self.lp.exchange, 'lp_account_round_begin', None)
@@ -654,6 +685,197 @@ class LPAutoPool:
             self._retry_rotation_cancel(intent)
         return reason
 
+    def _deliver_attention(self, intent_id: str, *, recovery: bool = False) -> None:
+        """Send one persisted episode notice; delivery is explicit, not assumed."""
+        # One process-wide delivery lock prevents duplicate sends. It never
+        # guards fact reads, SQLite publication, or trading.
+        with self._attention_delivery_lock:
+            document=self._read()
+            intent=document['intents'].get(intent_id)
+            if intent is None:
+                return
+            now=self._now()
+            retry_at=intent.get('attention_send_retry_at')
+            if retry_at and now < _timestamp(retry_at,name='attention_send_retry_at'):
+                return
+            if recovery:
+                if not intent.get('attention_recovery_due'):
+                    return
+                episode=intent.get('attention_episode') or intent.get('attention_since')
+                title, message='LP 核对已恢复', 'LP 资金核对已恢复，自动调度保持原运行/暂停设置。'
+            else:
+                if not intent.get('attention_due'):
+                    return
+                episode=intent.get('attention_episode') or intent.get('attention_since')
+                reason=intent.get('reconcile_error') or intent.get('reconcile_reason') or 'unknown'
+                title='LP 核对持续失败'
+                message=f'LP 核对已连续 5 分钟无有效进展：{reason}。系统继续只读核对并保留资金边界。'
+            if not episode:
+                return
+            # Persist the attempt before network I/O so restart cannot reset
+            # the episode and immediately repeat it.
+            def claim(d):
+                current=d['intents'].get(intent_id)
+                if current is None or (current.get('attention_episode') or current.get('attention_since')) != str(episode):
+                    return False
+                if recovery:
+                    if not current.get('attention_recovery_due'):
+                        return False
+                elif not current.get('attention_due'):
+                    return False
+                current.update(
+                    attention_episode=str(episode),
+                    attention_sending=True,
+                    attention_send_retry_at=(now+timedelta(seconds=60)).isoformat(),
+                )
+                return True
+            if not self._update(claim):
+                return
+            fault_key, recovery_key=('attention_attempted_channels','attention_recovery_attempted_channels')
+            attempted={str(v) for v in (intent.get(recovery_key if recovery else fault_key) or ())}
+            if recovery and not attempted:
+                attempted.update(intent.get('attention_delivered_channels') or ())
+            delivered_channels={str(v) for v in (intent.get(
+                'attention_recovery_delivered_channels' if recovery
+                else 'attention_delivered_channels') or ())}
+            missing=(attempted-delivered_channels) if attempted else None
+            delivery_unknown=False
+            try:
+                attempts=send_notification_with_results(
+                    self.execution._notifier,title,message,channels=missing)
+            except Exception:
+                # The remote result is unknown, not failed or delivered. A
+                # future retry may duplicate; that is safer than losing the
+                # only notice while reservations remain held.
+                attempts=()
+                delivery_unknown=True
+            attempted.update(str(a.channel) for a in attempts)
+            delivered_channels.update(
+                str(a.channel) for a in attempts if a.success)
+            delivered=bool(attempted) and delivered_channels >= attempted
+            attempted_key=('attention_recovery_attempted_channels' if recovery
+                           else 'attention_attempted_channels')
+            delivered_key=('attention_recovery_delivered_channels' if recovery
+                           else 'attention_delivered_channels')
+            def apply(d):
+                intent=d['intents'].get(intent_id)
+                if intent is None or intent.get('attention_episode') != str(episode):
+                    return
+                intent['attention_sending']=False
+                intent[attempted_key]=sorted(attempted)
+                intent[delivered_key]=sorted(delivered_channels)
+                if delivery_unknown:
+                    intent['attention_delivery_unknown']=True
+                if recovery:
+                    intent['attention_recovery_due']=not delivered
+                    if delivered:
+                        for key in ('attention_since','attention_notified','attention_due','attention_episode',
+                                    'attention_recovery_due','attention_send_error','attention_send_retry_at',
+                                    'attention_delivery_unknown',
+                                    'attention_attempted_channels','attention_delivered_channels',
+                                    'attention_recovery_attempted_channels','attention_recovery_delivered_channels',
+                                    'attention_recovered_at'):
+                            intent.pop(key,None)
+                    else:
+                        intent['attention_send_error']='notification_delivery_failed'
+                else:
+                    if intent.get('attention_recovered_at'):
+                        intent['attention_due']=False
+                        intent['attention_recovery_due']=bool(delivered_channels)
+                        intent.pop('attention_send_retry_at',None)
+                        return
+                    intent['attention_due']=not delivered
+                    if delivered:
+                        intent['attention_notified']=True
+                        intent.pop('attention_send_error',None)
+                        intent.pop('attention_delivery_unknown',None)
+                        if (
+                            intent.get('financial_status') == 'known'
+                            and not intent.get('reconcile_error')
+                            and not intent.get('reconcile_reason')
+                        ):
+                            intent['attention_recovery_due']=True
+                    else:
+                        intent['attention_notified']=False
+                        intent['attention_send_error']='notification_delivery_failed'
+            self._update(apply)
+
+    def flush_attention(self, session_id: str | None = None) -> None:
+        """Deliver persisted notices only after their fact transaction commits."""
+        document=self._read()
+        intents=document['intents'].values()
+        selected=[i for i in intents if session_id is None or i.get('session_id')==session_id]
+        for intent in selected:
+            if intent.get('attention_recovery_due'):
+                self._deliver_attention(intent['intent_id'],recovery=True)
+            elif intent.get('attention_due'):
+                self._deliver_attention(intent['intent_id'])
+                current = self._read()['intents'].get(intent['intent_id'], {})
+                if current.get('attention_recovery_due'):
+                    self._deliver_attention(intent['intent_id'],recovery=True)
+
+    def _mark_attention(self, i: dict, error: object, session: Mapping[str, object], now: datetime) -> None:
+        if (
+            i.get('attention_recovery_due')
+            or i.get('attention_recovered_at')
+        ) and i.get('attention_episode'):
+            # A genuinely recovered fault followed by a new failure is
+            # a new episode.  Reset its timer/channels; the blocked old
+            # recovery completion is fenced by the previous identity.
+            for key in (
+                'attention_episode', 'attention_notified', 'attention_due',
+                'attention_sending', 'attention_send_error',
+                'attention_send_retry_at', 'attention_delivery_unknown',
+                'attention_attempted_channels', 'attention_delivered_channels',
+                'attention_recovery_attempted_channels',
+                'attention_recovery_delivered_channels',
+                'attention_recovered_at',
+            ):
+                i.pop(key, None)
+            i['attention_since'] = now.isoformat()
+            i['attention_episode'] = f"fault:{now.isoformat()}"
+            i['attention_notified'] = False
+            i['attention_due'] = False
+        i.pop('attention_recovery_due',None)
+        reason=str(error or 'unknown')
+        previous=i.get('reconcile_retry_at') if i.get('reconcile_error')==reason else None
+        snapshot={}
+        if reason == 'account_read_cooling_down':
+            scheduled=_maybe_datetime(session.get('reconcile_retry_at'))
+        elif reason == 'market_read_cooling_down':
+            scheduled=self.lp.market_read_retry_at(str(session.get('condition_id') or ''))
+        else:
+            scheduler=getattr(self.execution,'_lp_auto_scheduler',None)
+            snapshot=scheduler.snapshot() if scheduler is not None and callable(getattr(scheduler,'snapshot',None)) else {}
+            try:
+                scheduled=_timestamp(snapshot.get('next_check_at'),name='scheduler_next_check_at') if snapshot.get('next_check_at') else None
+            except ValueError:
+                scheduled=None
+        retry_at,retry_source=_reconcile_retry_plan(reason,now,previous,scheduled)
+        if scheduled is None and snapshot.get('check_in_progress') is True:
+            retry_at,retry_source=None,'scheduler_check_in_progress'
+        if reason in {'facts_read_capacity', 'facts_read_in_progress'}:
+            retry_at, retry_source = None, reason
+        i['reconcile_retry_source']=retry_source
+        if reason != 'execution_lock':
+            i['financial_status']='unknown'
+        i['publication_pending']=True
+        i['reconcile_reason']=reason
+        i['reconcile_error']=reason
+        if retry_at is None:
+            i.pop('reconcile_retry_at',None)
+        else:
+            i['reconcile_retry_at']=retry_at.isoformat()
+        i['manual_attention']=reason in {'account_identity_mismatch','credential_invalid'}
+        i.setdefault('attention_since',now.isoformat())
+        i.setdefault('attention_episode',i['attention_since'])
+        i.setdefault('attention_notified',False)
+        if (now-_timestamp(i['attention_since'],name='attention_since')).total_seconds() >= 300:
+            send_retry=i.get('attention_send_retry_at')
+            due_now = not i.get('attention_notified') and (
+                not send_retry or now >= _timestamp(send_retry,name='attention_send_retry_at'))
+            i['attention_due']=bool(due_now or i.get('attention_sending'))
+
     def _record_session(self, intent_id, session, *, error=None, connection=None):
         if connection is None:
             # Receipt callers may race a cancel after reading the session.
@@ -662,25 +884,33 @@ class LPAutoPool:
                 row = connection.execute('SELECT * FROM lp_sessions WHERE session_id=?',
                                          (session['session_id'],)).fetchone()
                 current = self.store._lp_row_result(row) if row else session
-                return self._record_session(intent_id, current, connection=connection,
-                                            error=error if row else 'session_missing')
+                result = self._record_session(intent_id, current, connection=connection,
+                                              error=error if row else 'session_missing')
+            # Never wait on notification channels while a facts worker or the
+            # ledger write is occupied; the durable due flag wakes the LP lane.
+            self.lp._schedule_session_attention(str(current['session_id']))
+            return result
         def apply(d):
             i=d['intents'][intent_id]
+            now=self._now()
             if error:
                 if i.get('settled') and i.get('financial_status')=='known':
                     return
-                i['financial_status']='unknown'
-                i['reconcile_reason']=error
+                self._mark_attention(i,error,session,now)
                 return
+            i['attention_due']=False
             if session.get('order_identity_conflict'):
                 i.update(state='unknown',financial_status='unknown',reconcile_reason='order_identity_conflict',
                     order_identity_conflict=session['order_identity_conflict'])
+                self._mark_attention(i,'order_identity_conflict',session,now)
                 self._event(d,i,'unknown',**session['order_identity_conflict'])
                 return
             order_id=session.get('entry_order_id')
             if order_id:
                 if any(other.get('order_id')==order_id and other['intent_id']!=intent_id for other in d['intents'].values()):
-                    i.update(state='unknown',financial_status='unknown',reconcile_reason='order_identity_conflict')
+                    i.update(state='unknown',financial_status='unknown',reconcile_reason='duplicate_order_identity')
+                    self._mark_attention(i,'duplicate_order_identity',session,now)
+                    i['manual_attention']=True
                     return
                 i['order_id']=order_id
             status=session.get('submit_status')
@@ -690,6 +920,7 @@ class LPAutoPool:
                 return
             if not order_id:
                 i.update(state='unknown',financial_status='unknown',reconcile_reason='missing_reliable_order_id')
+                self._mark_attention(i,'missing_reliable_order_id',session,now)
                 self._event(d,i,'unknown')
                 return
             history=self.lp._order_history(session)
@@ -697,6 +928,7 @@ class LPAutoPool:
             order_state=str(entry.get('status') or '').upper()
             if order_state in ('', 'UNKNOWN'):
                 i.update(state='unknown', financial_status='unknown', reconcile_reason='order_receipt_unknown')
+                self._mark_attention(i,'order_receipt_unknown',session,now)
                 self._receipt_uncertainty(d,i,True)
                 return
             terminal=order_state in TERMINAL_ORDER_STATES
@@ -730,9 +962,27 @@ class LPAutoPool:
                 # fills/fees/positions. Keep its last reservation and slot.
                 i['state']='canceling' if session.get('entry_cancel_requested') else 'unknown'
             i['filled_quantity']=str(quantity)
-            i['reconcile_reason'] = (None if known else session.get('facts_error')
+            reason = (None if known else session.get('facts_error')
                 or next((h['read_error'] for h in history.values() if h.get('read_error') and h.get('status') == 'UNKNOWN'), None)
+                or session.get('financial_block_reason')
                 or ('order_receipt_unknown' if i['submission_unknown'] else 'position_or_fee_unknown'))
+            i['reconcile_reason'] = reason
+            i['reconcile_error'] = reason
+            i['publication_pending'] = bool(reason)
+            recovered=bool(i.get('attention_since')) and (
+                bool(i.get('attention_notified'))
+                or bool(i.get('attention_delivered_channels'))
+            ) and known and reason is None
+            if reason:
+                self._mark_attention(i,reason,session,now)
+            else:
+                for key in ('reconcile_retry_at','manual_attention','attention_send_error','attention_send_retry_at'):
+                    i.pop(key,None)
+                i['attention_recovery_due']=recovered
+                if i.get('attention_since'):
+                    i['attention_recovered_at']=now.isoformat()
+                else:
+                    i.pop('attention_recovered_at',None)
             bindings={order_id:i}
             for action in actions:
                 oid=action.get('order_id')
@@ -911,10 +1161,14 @@ class LPAutoPool:
                          and not i.get('rotation_requested_at') and not self.store.lp_actions(i['session_id']))
             def missing(doc):
                 intent = doc['intents'][i['intent_id']]
+                reason=('rotation_session_missing' if intent.get('rotation_requested_at')
+                        else 'session_missing')
                 if untouched:
                     intent.update(state='aborted', reserved_usd='0', financial_status='known')
                 else:
-                    intent.update(state='unknown', financial_status='unknown', reconcile_reason='rotation_session_missing' if intent.get('rotation_requested_at') else 'session_missing')
+                    intent.update(state='unknown', financial_status='unknown', reconcile_reason=reason)
+                    self._mark_attention(intent,reason,{'session_id':i['session_id']},self._now())
+                    intent['manual_attention']=True
             self._update(missing)
             return
         if reuse and i.get('financial_status') == 'known' and not session.get('facts_error'):

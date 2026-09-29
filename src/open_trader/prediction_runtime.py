@@ -325,6 +325,55 @@ def _cross_venue_gamma_lookup(
         client.close()
 
 
+def _deliver_lp_protection_with_runtime(
+    execution: object,
+    notifier: object,
+    title: str,
+    message: str,
+    xiaoai_text: str,
+    *,
+    channels: set[str] | None = None,
+) -> dict[str, bool]:
+    results: dict[str, bool] = {}
+    deliver = getattr(execution, "_deliver_feishu_notification", None)
+    if callable(deliver) and (channels is None or "feishu" in channels):
+        try:
+            results["feishu"] = deliver(title, message) is True
+        except Exception:
+            results["feishu"] = False
+            logger.warning("lp_protection_feishu_delivery_failed", exc_info=True)
+    if notifier is None:
+        if channels is None:
+            results.setdefault("xiaoai", False)
+            results.setdefault("feishu", False)
+        elif "xiaoai" in channels:
+            results["xiaoai"] = False
+        elif "feishu" in channels:
+            results.setdefault("feishu", False)
+        return results
+    if channels is not None and "xiaoai" not in channels:
+        if "feishu" in channels:
+            results.setdefault("feishu", False)
+        return results
+    try:
+        attempts = send_notification_with_results(
+            notifier,
+            title,
+            xiaoai_text,
+            channels={"xiaoai"} if channels is None else channels & {"xiaoai"},
+        )
+    except Exception:
+        logger.warning("lp_protection_xiaoai_delivery_failed", exc_info=True)
+        results["xiaoai"] = False
+    else:
+        results["xiaoai"] = bool(attempts) and all(
+            attempt.success for attempt in attempts
+        )
+    if channels is None or "feishu" in channels:
+        results.setdefault("feishu", False)
+    return results
+
+
 def _build_cross_venue_monitor(
     *,
     trading_config: object,
@@ -769,33 +818,18 @@ class PredictionRuntime:
             # delivery path, xiaoai as the second hop in the same callback).
             set_protection_notifier = getattr(self.lp, "set_protection_notifier", None)
             if callable(set_protection_notifier):
-                def _deliver_lp_protection_notification(
-                    title: str, message: str, xiaoai_text: str
-                ) -> None:
-                    deliver = getattr(
-                        self.execution, "_deliver_feishu_notification", None
+                set_protection_notifier(
+                    lambda title, message, voice, channels=None: (
+                        _deliver_lp_protection_with_runtime(
+                            self.execution,
+                            self._notifier,
+                            title,
+                            message,
+                            voice,
+                            channels=channels,
+                        )
                     )
-                    if callable(deliver):
-                        try:
-                            deliver(title, message)
-                        except Exception:
-                            logger.warning(
-                                "lp_protection_feishu_delivery_failed",
-                                exc_info=True,
-                            )
-                    notifier = getattr(self, "_notifier", None)
-                    if notifier is None:
-                        return
-                    try:
-                        send_notification_with_results(
-                            notifier, title, xiaoai_text, channels={"xiaoai"}
-                        )
-                    except Exception:
-                        logger.warning(
-                            "lp_protection_xiaoai_delivery_failed", exc_info=True
-                        )
-
-                set_protection_notifier(_deliver_lp_protection_notification)
+                )
             if not self._n_leg_paused and not self.legacy_retired:
                 # Issue #109: legacy ready/observation alerts retire with the
                 # legacy engine at the N_LEG fence; the monitor keeps both
@@ -1008,6 +1042,9 @@ class PredictionRuntime:
         if self.execution is None or self._lp_auto_scheduler is not None:
             return
         self._lp_auto_scheduler = LPAutoScheduler(self.execution)
+        set_scheduler = getattr(self.execution, "set_lp_auto_scheduler", None)
+        if callable(set_scheduler):
+            set_scheduler(self._lp_auto_scheduler)
         self._lp_auto_scheduler.start()
 
     def lp_auto_state(self, *, include_intents: bool = True) -> dict[str, object]:
@@ -1893,6 +1930,9 @@ class PredictionRuntime:
                 uncertain_thread = True
             else:
                 self._lp_auto_scheduler = None
+                set_scheduler = getattr(self.execution, "set_lp_auto_scheduler", None)
+                if callable(set_scheduler):
+                    set_scheduler(None)
         history_thread = self._history_thread
         if history_thread is not None:
             history_thread.join(timeout=_LP_REWARD_STOP_GRACE_SECONDS)

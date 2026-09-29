@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import math
 import threading
@@ -42,7 +43,7 @@ from .prediction_arbitrage_store import (
     PredictionArbitrageStore,
 )
 from .notifications import beijing_clock
-from .polymarket_trading import LpNewerAccountFacts, _lp_read_stage
+from .polymarket_trading import LpAccountReadError, LpNewerAccountFacts, _lp_read_stage
 
 
 STOP_LOSS = Decimal("5")
@@ -776,8 +777,18 @@ class PolymarketLPService:
         self._facts_owner = threading.local()
         self._facts_lock = threading.Lock()
         self._facts_apply_lock = threading.Lock()
+        self._first_seen_apply_lock = threading.Lock()
+        self._deferred_protection_notices = threading.local()
         self._facts_inflight: dict[str, dict] = {}
+        self._pending_facts: dict[
+            str, tuple[Mapping[str, object], int, Mapping[str, object], int]
+        ] = {}
         self._facts_capacity = threading.BoundedSemaphore(2)
+        self._facts_attention_flusher = None
+        self._attention_queue_lock = threading.Lock()
+        self._attention_delivery_lock = threading.Lock()
+        self._attention_pending: set[str] = set()
+        self._attention_thread: threading.Thread | None = None
         self._market_reads_lock = threading.Lock()
         self._market_reads = {}
         self._market_read_retry = {}
@@ -1184,6 +1195,8 @@ class PolymarketLPService:
             },
             expected_generation=generation,
         )
+        if claimed.get("generation") != generation or claimed.get("fault_alert_state") != "claimed":
+            return None
         claimed["fault_alert_claimed_now"] = True
         return claimed
 
@@ -1235,6 +1248,8 @@ class PolymarketLPService:
             },
             expected_generation=generation,
         )
+        if claimed.get("generation") != generation or claimed.get("recovery_alert_state") != "claimed":
+            return None
         claimed["recovery_alert_claimed_now"] = True
         return claimed
 
@@ -1844,6 +1859,16 @@ class PolymarketLPService:
                 "last_probe_at": None,
                 "last_probe_state": None,
                 "retry_after_seconds": None,
+                "fault_started_at": None,
+                "fault_alert_attempts": 0,
+                "fault_alert_state": None,
+                "fault_alert_next_at": None,
+                "fault_alert_sent_at": None,
+                "recovery_alert_state": None,
+                "recovery_alert_attempts": 0,
+                "recovery_alert_next_at": None,
+                "recovery_alert_claimed_at": None,
+                "recovery_alert_sent_at": None,
             },
             expected_generation=generation,
         )
@@ -1864,6 +1889,8 @@ class PolymarketLPService:
         """Record the result of the already-claimed operator notification."""
 
         current = self.preparation_snapshot()
+        if current.get("generation") != generation:
+            return current
         if current.get("fault_alert_state") == "claimed":
             attempts = current.get("fault_alert_attempts")
             attempts = attempts if type(attempts) is int and attempts >= 1 else 1
@@ -1914,6 +1941,8 @@ class PolymarketLPService:
         """Record delivery of one validated recovery notification."""
 
         current = self.preparation_snapshot()
+        if current.get("generation") != generation:
+            return current
         if current.get("recovery_alert_state") != "claimed":
             return current
         attempts = current.get("recovery_alert_attempts")
@@ -9150,13 +9179,9 @@ class PolymarketLPService:
     def stop(self, session_id: str | None = None) -> dict[str, object]:
         """Stop one session; ``None`` targets the single active session.
 
-        Issue 165: with ``session_id=None`` the unique active session is
-        stopped; an explicit id that matches no row returns the none payload
-        and never falls back to the active group.  Issue 166: with two or
-        more active groups the unnamed stop is rejected as ambiguous — the
-        operator must name the group.
+        Session selection is serialized, while the already-authorized cancel
+        sweep and its receipts stay outside the common publication mutex.
         """
-
         with self._mutex:
             if session_id:
                 session = self.store.lp_session(session_id)
@@ -9166,45 +9191,49 @@ class PolymarketLPService:
                     return {
                         "state": "rejected",
                         "reason": "session_ambiguous",
-                        "session_ids": [
-                            row.get("session_id") for row in active
-                        ],
+                        "session_ids": [row.get("session_id") for row in active],
                     }
                 session = active[0] if active else None
             if session is None:
                 return {"state": "none", "session_id": None}
-            state = str(session.get("state"))
-            if state in {"complete", "entry_rejected", "review"}:
+            if str(session.get("state")) in {"complete", "entry_rejected", "review"}:
                 return self._status_payload(session)
-            self.store.lp_register_trade_change(str(session["session_id"]))
-            if self._facts_wakeup:
-                self._facts_wakeup()
-            try:
-                self._cancel_owned_orders(session)
-            except Exception as exc:
-                updated = self.store.lp_update_session(
-                    str(session["session_id"]),
-                    state="needs_attention",
-                    patch={
-                        "stop_requested": True,
-                        "reconciliation": f"stop_cancel_{type(exc).__name__}",
-                        "resume_state": "review",
-                    },
+            if not session.get("stop_requested"):
+                self.store.lp_register_trade_change(str(session["session_id"]))
+                session = self.store.lp_update_session(
+                    str(session["session_id"]), patch={"stop_requested": True}
                 )
-                return self._status_payload(updated)
+            session = dict(session)
+        try:
+            self._cancel_owned_orders(session)
+        except Exception as exc:
             updated = self.store.lp_update_session(
                 str(session["session_id"]),
-                state="review",
+                state="needs_attention",
                 patch={
                     "stop_requested": True,
-                    "review_status": "awaiting_reconciliation",
-                    # 停止即结束当前「需要核对」episode：不清键会让残留
-                    # since/notified 把下一轮 episode 当同一轮（不推或早推）。
-                    "needs_attention_since": None,
-                    "needs_attention_notified": False,
+                    "reconciliation": f"stop_cancel_{type(exc).__name__}",
+                    "resume_state": "review",
+                    **self._needs_attention_notify_patch(session, self._now()),
                 },
             )
             return self._status_payload(updated)
+        updated = self.store.lp_update_session(
+            str(session["session_id"]),
+            state="review",
+            patch={
+                "stop_requested": True,
+                "review_status": "awaiting_reconciliation",
+                "needs_attention_since": None,
+                "needs_attention_notified": False,
+                "needs_attention_due": False,
+                "needs_attention_channel_status": {},
+                "needs_attention_send_error": None,
+                "needs_attention_sending": False,
+                "needs_attention_send_retry_at": None,
+            },
+        )
+        return self._status_payload(updated)
 
     def _queue_protection_levels(
         self, session: Mapping[str, object]
@@ -9355,7 +9384,8 @@ class PolymarketLPService:
                 new_levels[str(key)] = bucket_dict
                 continue
             new_bucket, patch = self._request_bucket_protection_cancel(
-                session, None, bucket_dict, reason="book_unreliable"
+                session, None, bucket_dict, reason="book_unreliable",
+                bucket_key=str(key),
             )
             new_levels[str(key)] = new_bucket
             for patch_key, patch_value in patch.items():
@@ -9383,6 +9413,57 @@ class PolymarketLPService:
         """Run one deterministic monitoring/reconciliation iteration."""
 
         return self._tick()
+
+    def _schedule_session_attention(self, session_id: str) -> None:
+        """Hand durable notices to one finite background delivery lane."""
+        with self._attention_queue_lock:
+            self._attention_pending.add(session_id)
+            start = self._attention_thread is None
+            if start:
+                self._attention_thread = threading.Thread(
+                    target=self._attention_delivery_loop,
+                    name="lp-session-attention",
+                    daemon=True,
+                )
+                self._attention_thread.start()
+
+    def _attention_delivery_loop(self) -> None:
+        while True:
+            with self._attention_queue_lock:
+                if not self._attention_pending:
+                    self._attention_thread = None
+                    return
+                session_id = self._attention_pending.pop()
+            try:
+                callback = self._facts_attention_flusher
+                if callback is not None:
+                    callback(session_id)
+                self.flush_session_attention(session_id)
+                self.flush_session_recovery(session_id)
+            except Exception:
+                logger.exception("lp_session_attention_delivery_failed")
+
+    def _flush_session_attention(self, session_id: str) -> None:
+        callback = self._facts_attention_flusher
+        if callback is not None:
+            callback(session_id)
+        self.flush_session_attention(session_id)
+        self.flush_session_recovery(session_id)
+
+    def _publish_facts_wait(self, session_id: str, reason: str) -> None:
+        row = self.store.lp_session_with_revision(session_id, trading=True)
+        if row is None:
+            return
+        try:
+            self.store.lp_publish_facts(
+                session_id, row[1],
+                patch={"facts_error": reason, "reconcile_reason": reason,
+                       "publication_pending": True, "reconcile_retry_at": None},
+                publish=self._facts_publisher, error=reason,
+            )
+        except ValueError as exc:
+            if str(exc) != "session_changed":
+                raise
 
     def reconcile_facts(
         self,
@@ -9413,9 +9494,15 @@ class PolymarketLPService:
         timings, failed = {}, False
         try:
             self._facts_owner.session_id = session_id
+            waited_for_capacity = not self._facts_capacity.acquire(blocking=False)
+            if waited_for_capacity and not report_only:
+                self._publish_facts_wait(session_id, "facts_read_capacity")
             with _lp_read_stage("facts_capacity_wait", timings):
-                self._facts_capacity.acquire()
+                if waited_for_capacity:
+                    self._facts_capacity.acquire()
             try:
+                if waited_for_capacity and not report_only:
+                    self._publish_facts_wait(session_id, "facts_read_in_progress")
                 result = self._reconcile_facts_once(
                     session_id,
                     apply_lock=apply_lock,
@@ -9426,8 +9513,12 @@ class PolymarketLPService:
                 failed = result[3] is not None
             finally:
                 self._facts_capacity.release()
+            if failed:
+                self._schedule_session_attention(session_id)
             with self._facts_lock:
                 if not flight['monitor']:
+                    if not failed:
+                        self._schedule_session_attention(session_id)
                     # Finish atomically with request registration, so a joining
                     # tick is either included or starts the next operation.
                     self._facts_inflight.pop(session_id)
@@ -9441,6 +9532,7 @@ class PolymarketLPService:
             if self._facts_wakeup and self.store.lp_session_revision(session_id, trading=True) != result[2]:
                 self._facts_wakeup()
             result = (*result, status)
+            self._schedule_session_attention(session_id)
             with self._facts_lock:
                 self._facts_inflight.pop(session_id)
                 future.set_result(result)
@@ -9507,6 +9599,38 @@ class PolymarketLPService:
         except (TypeError, ValueError, RuntimeError):
             return False
 
+    def _take_pending_facts(
+        self, session: Mapping[str, object], revision: int, trade_generation: int
+    ):
+        """Reuse one retained read only while its durable fences match."""
+        session_id = str(session["session_id"])
+        with self._facts_lock:
+            pending = self._pending_facts.pop(session_id, None)
+        if pending is None or pending[1] != revision or pending[3] != trade_generation:
+            return None
+        if any(
+            pending[2].get(key) != session.get(key)
+            for key in ("condition_id", "token_id", "entry_order_id", "owned_order_ids")
+        ):
+            return None
+        return pending[0]
+
+    def _retain_pending_facts(
+        self,
+        session: Mapping[str, object],
+        snapshot: Mapping[str, object],
+        revision: int,
+        trade_generation: int,
+    ) -> None:
+        with self._facts_lock:
+            identity = {
+                key: session.get(key)
+                for key in ("condition_id", "token_id", "entry_order_id", "owned_order_ids")
+            }
+            self._pending_facts[str(session["session_id"])] = (
+                snapshot, revision, identity, trade_generation,
+            )
+
     def _reconcile_facts_once(
         self,
         session_id,
@@ -9520,6 +9644,10 @@ class PolymarketLPService:
         if row is None:
             raise ValueError('lp_session_not_found')
         session, revision = row
+        generation_reader = getattr(self.store, "lp_trade_generation", None)
+        observed_trade_generation = (
+            int(generation_reader()) if callable(generation_reader) else None
+        )
         if session.get('order_identity_conflict'):
             return session, None, revision, 'order_identity_conflict'
         if not session.get('entry_order_id'):
@@ -9532,32 +9660,58 @@ class PolymarketLPService:
                     'entry_order_id': order_id, 'owned_order_ids': list(dict.fromkeys([*self._session_order_ids(session), order_id])),
                     'submit_status': 'unknown'})
         snapshot, error = None, None
-        observed_trade_generation = None
+        retry_at = None
+        if not report_only:
+            snapshot = self._take_pending_facts(
+                session, revision, observed_trade_generation
+            )
+        if snapshot is not None and self._facts_validator and not report_only:
+            try:
+                with _lp_read_stage("facts_validate", timings):
+                    self._facts_validator(session, snapshot)
+            except (ValueError, RuntimeError, OSError):
+                snapshot = None
         try:
             with _lp_read_stage("facts_read", timings):
-                snapshot = self._read_snapshot(
-                    self._normalize_request(session), account_round=account_round
-                )
+                if snapshot is None:
+                    snapshot = self._read_snapshot(
+                        {
+                            **self._normalize_request(session),
+                            "lp_public_wait": False,
+                        },
+                        account_round=account_round,
+                    )
             if self._facts_validator and not report_only:
                 with _lp_read_stage("facts_validate", timings):
                     self._facts_validator(session, snapshot)
         except (ValueError, RuntimeError, OSError) as exc:
             error = str(exc)
-            if account_round is not None:
-                observed_trade_generation = getattr(
-                    account_round, "trade_generation", None
-                )
-        if not error and account_round is not None:
-            observed_trade_generation = snapshot.get("_lp_trade_generation")
-            if not isinstance(observed_trade_generation, int):
-                error = "account_round_invalid"
+            retry_at = exc.retry_at if isinstance(exc, LpAccountReadError) else None
+        if not error and snapshot is not None:
+            snapshot_generation = snapshot.get("_lp_trade_generation")
+            if snapshot_generation is not None:
+                if not isinstance(snapshot_generation, int):
+                    error = "account_round_invalid"
+                else:
+                    observed_trade_generation = snapshot_generation
+        if snapshot is not None:
+            snapshot = {**snapshot, "_lp_observed_trade_generation": observed_trade_generation}
         if error and not report_only:
             # A failed read only removes permission to spend; an occupied
             # execution lock must not hide that failure behind an old lease.
             try:
                 with _lp_read_stage("facts_failure_publish", timings):
                     session, _ = self.store.lp_publish_facts(
-                        session_id, revision, patch={'facts_error': error},
+                        session_id,
+                        revision,
+                        patch={
+                            'facts_error': error,
+                            'reconcile_reason': error,
+                            'reconcile_retry_at': retry_at,
+                            'manual_attention': error in {
+                                'account_identity_mismatch', 'credential_invalid'
+                            },
+                        },
                         trade_generation=observed_trade_generation,
                         publish=self._facts_publisher, error=error)
             except ValueError as exc:
@@ -9571,10 +9725,37 @@ class PolymarketLPService:
             return session, snapshot, revision, error
         with _lp_read_stage("facts_apply_wait", timings):
             self._facts_apply_lock.acquire()
-        with _lp_read_stage("facts_execution_lock", timings):
-            lock = apply_lock[0]() if apply_lock else None
-        if apply_lock and lock is None:
+        lock = None
+        try:
+            with _lp_read_stage("facts_execution_lock", timings):
+                lock = apply_lock[0]() if apply_lock else None
+        except BaseException:
             self._facts_apply_lock.release()
+            raise
+        if apply_lock and lock is None:
+            try:
+                if snapshot is not None and observed_trade_generation is not None:
+                    self._retain_pending_facts(
+                        session, snapshot, revision, observed_trade_generation
+                    )
+                session, _ = self.store.lp_publish_facts(
+                    session_id,
+                    revision,
+                    patch={
+                        "facts_error": "execution_lock",
+                        "reconcile_reason": "execution_lock",
+                        "publication_pending": True,
+                        "manual_attention": False,
+                    },
+                    trade_generation=observed_trade_generation,
+                    publish=self._facts_publisher,
+                    error="execution_lock",
+                )
+            except ValueError as exc:
+                if str(exc) != "session_changed":
+                    raise
+            finally:
+                self._facts_apply_lock.release()
             return session, snapshot, revision, "execution_lock"
         changed = False
         try:
@@ -9585,16 +9766,25 @@ class PolymarketLPService:
                 if current_revision != revision:
                     return session, snapshot, revision, "session_changed"
                 patch, state = {}, None
+                if not error and self._facts_validator is not None:
+                    try:
+                        self._facts_validator(current, snapshot)
+                    except ValueError as exc:
+                        error = str(exc) or "account_facts_stale"
                 if report_only:
                     if not error:
                         patch['trade_events'] = self._merge_report_trade_events(current, snapshot)
                     patch.update(report_checked_at=self._now(), report_error=error)
-                    with _lp_read_stage("facts_report_publish", timings):
-                        current, _ = self.store.lp_publish_facts(
-                        session_id, revision, patch=patch,
-                        trade_generation=observed_trade_generation,
-                        publish=self._facts_publisher)
-                    if error == 'account_round_invalid':
+                    try:
+                        with _lp_read_stage("facts_report_publish", timings):
+                            current, _ = self.store.lp_publish_facts(
+                                session_id, revision, patch=patch,
+                                trade_generation=observed_trade_generation,
+                                publish=self._facts_publisher)
+                    except ValueError as exc:
+                        if str(exc) not in {'account_round_invalid', 'session_changed'}:
+                            raise
+                        error = str(exc)
                         snapshot = None
                     return current, snapshot, revision, error
                 if not error:
@@ -9615,7 +9805,15 @@ class PolymarketLPService:
                         patch['facts_checked_at'] = snapshot.get('account_checked_at') or (snapshot.get('account') or {}).get('checked_at') or self._now()
                     except ValueError as exc:
                         patch, state, error = {}, None, str(exc)
-                patch['facts_error'] = error
+                patch.update({
+                    "facts_error": error,
+                    "reconcile_reason": error or patch.get("financial_block_reason"),
+                    "manual_attention": error in {
+                        "account_identity_mismatch", "credential_invalid"
+                    },
+                    "reconcile_retry_at": None,
+                    "publication_pending": bool(error),
+                })
                 resolved_cancels = []
                 if not error:
                     statuses = {self._order_id(row): str(_field(row, 'status', '')).upper()
@@ -9647,9 +9845,11 @@ class PolymarketLPService:
             finally:
                 self._mutex.release()
         finally:
-            if apply_lock and lock is not None:
-                apply_lock[1](lock)
-            self._facts_apply_lock.release()
+            try:
+                if apply_lock and lock is not None:
+                    apply_lock[1](lock)
+            finally:
+                self._facts_apply_lock.release()
         if changed and self._facts_wakeup:
             self._facts_wakeup()
         return current, snapshot, revision, error
@@ -9679,20 +9879,12 @@ class PolymarketLPService:
         group's full payload in ``sessions``.
         """
 
-        # Issue 159: first-seen fallback protections remain first and
-        # serialized.  If another execution owns the global lock, skip this
-        # retry and continue with the active-session lane.
-        if apply_lock is None:
-            with self._mutex:
-                self._apply_first_seen_protections()
-        else:
-            first_seen_lock = apply_lock[0]()
-            if first_seen_lock is not None:
-                try:
-                    with self._mutex:
-                        self._apply_first_seen_protections()
-                finally:
-                    apply_lock[1](first_seen_lock)
+        # First-seen fallback protections remain serialized in their own lane.
+        # Their reads and protection sends never own the common publication or
+        # execution locks; unrelated sessions can continue reconciling.
+        # they must not own the common publication mutex or execution lock.
+        with self._first_seen_apply_lock:
+            self._apply_first_seen_protections()
 
         active_reader = getattr(
             self.store, "lp_active_sessions_with_revisions", None
@@ -9767,7 +9959,37 @@ class PolymarketLPService:
         session_id = str(session['session_id'])
         if reason == 'order_identity_conflict':
             return self._status_payload(session)
+        if reason == "execution_lock":
+            return self._status_payload(session)
         snapshot_error = ValueError(reason) if reason and reason not in {'execution_lock', 'session_changed'} else None
+        if snapshot_error is not None:
+            return self._handle_snapshot_failure_fenced(
+                session,
+                snapshot_error,
+                int(initial_revision),
+                snapshot.get("_lp_trade_generation") if isinstance(snapshot, Mapping) else None,
+            )
+        if snapshot is not None:
+            ownership_reason = self._unowned_target_order_reason(session, snapshot)
+            if ownership_reason:
+                state = str(session.get("state") or "")
+                resume_state = (
+                    str(session.get("resume_state") or "")
+                    if state == "needs_attention"
+                    else state
+                ) or "entry_open"
+                if resume_state not in {"entry_open", "passive_exit", "stop_loss_exit", "review"}:
+                    resume_state = "review"
+                updated = self.store.lp_update_session(
+                    session_id,
+                    state="needs_attention",
+                    patch={
+                        "reconciliation": ownership_reason,
+                        "resume_state": resume_state,
+                        **self._needs_attention_notify_patch(session, self._now()),
+                    },
+                )
+                return self._status_payload(updated)
         if snapshot is not None and not self._account_bundle_is_current(snapshot):
             # The bundle was valid at publication, but a trade registered
             # before this post-publication boundary. Never score, protect, or
@@ -9800,8 +10022,21 @@ class PolymarketLPService:
             and not self._group_buys_terminal(session, snapshot)
         ):
             scoring = self._read_scoring(session)
+        if snapshot is not None and not reason:
+            generation = snapshot.get("_lp_trade_generation", snapshot.get("_lp_observed_trade_generation"))
+            if isinstance(generation, int):
+                self._prepare_reconcile_actions_off_lock(
+                    session, snapshot, scoring, int(initial_revision), int(generation)
+                )
+                prepared = self.store.lp_session(session_id)
+                if prepared and prepared.get("state") == "review" and session.get("state") != "review":
+                    return self._status_payload(prepared)
         apply_handle: object | None = None
-        try:
+        deferred_notices: list[tuple[str, str, str, Callable[[], None]]] = []
+        production_reconcile = True
+
+        def apply_locked() -> dict[str, object]:
+            nonlocal apply_handle, production_reconcile, session, snapshot, snapshot_error
             if apply_lock is not None:
                 apply_handle = apply_lock[0]()
                 if apply_handle is None:
@@ -9829,15 +10064,11 @@ class PolymarketLPService:
                     return self._status_payload(session)
                 current, current_revision = current_row
                 if snapshot is not None and not self._account_bundle_is_current(snapshot):
-                    # The mutation fence is transactional; this last check is
-                    # aligned with the same mutex that guards strategy apply.
                     session = self._publish_account_round_rejected(session_id)
                     snapshot = None
                     snapshot_error = ValueError("account_round_invalid")
                 expected_revision = int(initial_revision)
                 if current_revision != expected_revision:
-                    # A local protective cancel invalidates financial facts,
-                    # but other unchanged price buckets may still be observed.
                     if protected_levels and set(self._session_order_ids(current)) == set(self._session_order_ids(session)):
                         current = self._apply_queue_protection(
                             current,
@@ -9851,10 +10082,6 @@ class PolymarketLPService:
                 if snapshot is None:
                     raise RuntimeError("lp_tick_snapshot_missing")
                 reconcile = self._reconcile_session
-                # Keep lightweight one-argument overrides compatible with
-                # the long-standing tick seam.  The production method
-                # receives the prefetched snapshot and protection keys;
-                # an override owns its own snapshot lifecycle.
                 if (
                     getattr(reconcile, "__func__", None)
                     is PolymarketLPService._reconcile_session
@@ -9871,20 +10098,387 @@ class PolymarketLPService:
                             else None
                         ),
                     )
-                else:
-                    return reconcile(current)
+                production_reconcile = False
+                return reconcile(current)
+
+        self._deferred_protection_notices.notices = deferred_notices
+        self._facts_apply_lock.acquire()
+        try:
+            result = apply_locked()
         except Exception as exc:
-            # One group's reconciliation failure must not swallow the
-            # others: record the failure into that group's payload and
-            # continue with the remaining groups.
-            return {
+            # One group's reconciliation failure must not swallow the others.
+            result = {
                 "state": "error",
                 "session_id": session_id,
                 "error": type(exc).__name__,
             }
         finally:
-            if apply_handle is not None and apply_lock is not None:
-                apply_lock[1](apply_handle)
+            try:
+                if apply_handle is not None and apply_lock is not None:
+                    apply_lock[1](apply_handle)
+            finally:
+                self._deferred_protection_notices.notices = None
+                self._facts_apply_lock.release()
+        for title, message, xiaoai, mark_delivered in deferred_notices:
+            if self._notify_protection(title, message, xiaoai):
+                mark_delivered()
+        if production_reconcile and str(result.get("session_id")) == session_id:
+            current = self.store.lp_session(session_id)
+            if current is not None:
+                result = self._status_payload(current)
+        return result
+
+    def _prepare_reconcile_actions_off_lock(
+        self,
+        session: Mapping[str, object],
+        snapshot: Mapping[str, object],
+        scoring: Mapping[str, object],
+        initial_revision: int,
+        trade_generation: int,
+    ) -> None:
+        """Claim reconcile trades atomically, then send only the claimed intent."""
+        current = self.store.lp_session(str(session["session_id"]))
+        if current is None:
+            return
+        session_id = str(current["session_id"])
+        reason = "monitor"
+        try:
+            review_at = _timestamp(current.get("review_at"), name="review_at")
+        except (TypeError, ValueError):
+            review_at = None
+        if review_at is not None and self._now() >= review_at and str(current.get("state")) not in {"review", "complete", "entry_rejected"}:
+            reason = "review_deadline"
+        elif str(current.get("state")) == "review" and (
+            current.get("stop_requested") is True
+            or current.get("review_status") == "awaiting_reconciliation"
+        ):
+            reason = "review_reconcile"
+        elif _decimal(
+            current.get("buy_filled_quantity", 0), "buy_filled_quantity"
+        ) > 0 and not self._group_buys_terminal(current, snapshot):
+            reason = "group_fill_collect"
+        elif (
+            scoring.get("role") == "entry"
+            and scoring.get("value") is not True
+            and not current.get("entry_cancel_requested")
+        ):
+            try:
+                lost_at = _timestamp(
+                    current.get("scoring_lost_at"), name="scoring_lost_at"
+                )
+            except (TypeError, ValueError):
+                lost_at = None
+            if lost_at is not None and (
+                self._now() - lost_at
+            ).total_seconds() >= float(SCORING_FAILURE_WINDOW_SECONDS):
+                reason = "scoring_failure"
+        if reason != "monitor":
+            self._claim_and_send_owned_cancels_off_lock(
+                current,
+                snapshot,
+                initial_revision=initial_revision,
+                trade_generation=trade_generation,
+                reason=reason,
+                allow_history=True,
+            )
+            if reason == "review_deadline":
+                after_cancel = self.store.lp_session(session_id) or current
+                if str(after_cancel.get("reconciliation") or "").startswith("deadline_cancel_"):
+                    return
+                self.store.lp_update_session(
+                    session_id, state="review", patch={"review_status": "awaiting_reconciliation"}
+                )
+                return
+            if self.store.lp_session_revision(session_id, trading=True) != initial_revision:
+                return
+        current = self.store.lp_session(session_id) or current
+        if self.store.lp_session_revision(session_id, trading=True) != initial_revision:
+            return
+        convergence_patch: dict[str, object] = {}
+        try:
+            convergence_patch = self._order_history_patch(current, snapshot)
+            current = {**current, **convergence_patch}
+            fill_patch = self._fill_patch(current, snapshot)
+            convergence_patch.update(fill_patch)
+            current = {**current, **fill_patch}
+        except ValueError:
+            return
+        current = self._reconcile_protected_exit(current, snapshot)
+        rows_by_id = self._queue_level_rows(snapshot)
+        for key, bucket in self._queue_protection_levels(current).items():
+            converged = self._converge_queue_protection(
+                current, bucket, rows_by_id, bucket_key=key
+            )
+            if converged is not None:
+                current = self.store.lp_merge_queue_protection_bucket(
+                    session_id, level_key=key, bucket=converged
+                )
+        protection = current.get("queue_protection")
+        canceling = any(
+            str(bucket.get("state")) == "canceling"
+            for bucket in self._queue_protection_levels(current).values()
+            if isinstance(bucket, Mapping)
+        ) or (
+            isinstance(protection, Mapping)
+            and str(protection.get("state")) == "canceling"
+        )
+        if canceling and not self._group_buys_terminal(current, snapshot):
+            return
+        residual = _decimal(current.get("residual_quantity", 0), "residual_quantity")
+        loss = self._opening_loss_from_session(current)
+        business_patch: dict[str, object] = {"opening_loss": loss}
+        if loss is not None and loss >= STOP_LOSS:
+            business_patch.update(self._stop_loss_latch_patch(current, loss))
+            business_patch["state"] = "stop_loss_exit"
+        stop_loss_exit = (
+            bool(current.get("stop_loss_latched"))
+            or str(current.get("state")) == "stop_loss_exit"
+            or business_patch.get("state") == "stop_loss_exit"
+        )
+        if stop_loss_exit:
+            if str(current.get("state")) != "stop_loss_exit":
+                business_patch.update({"state": "stop_loss_exit", "stop_loss_latched": True})
+            current = {**current, **business_patch}
+            passive_id = str(current.get("passive_exit_order_id") or "")
+            if passive_id and not self._order_terminal(snapshot, passive_id, current):
+                patch = {**convergence_patch, **business_patch}
+                patch.pop("state", None)
+                self._request_passive_cancel(
+                    current,
+                    expected_generation=trade_generation,
+                    expected_trade_revision=initial_revision,
+                    claim_patch=patch,
+                    claim_state="stop_loss_exit",
+                )
+                return
+            if residual > 0 and not current.get("protected_exit_order_id"):
+                claim_state = (
+                    str(business_patch["state"])
+                    if business_patch.get("state")
+                    else None
+                )
+                patch = {**convergence_patch, **business_patch}
+                patch.pop("state", None)
+                self._submit_protected_exit(
+                    current,
+                    residual,
+                    snapshot,
+                    trade_generation=trade_generation,
+                    expected_trade_revision=initial_revision,
+                    claim_patch=patch,
+                    claim_state=claim_state,
+                )
+            return
+        if residual > 0 and str(current.get("state")) != "review":
+            self._ensure_passive_exit(
+                current,
+                snapshot,
+                residual,
+                trade_generation=trade_generation,
+                expected_trade_revision=initial_revision,
+            )
+
+    def _claim_trade_action(
+        self,
+        session: Mapping[str, object],
+        action_key: str,
+        payload: Mapping[str, object],
+        patch: Mapping[str, object],
+        *,
+        trade_generation: int,
+        expected_trade_revision: int | None = None,
+        claim_state: str | None = None,
+    ) -> Mapping[str, object] | None:
+        """CAS-claim one submit intent; manual and monitor share this boundary."""
+        claim_method = getattr(self.store, "lp_claim_trade_actions", None)
+        if not callable(claim_method) or expected_trade_revision is None:
+            return None
+        generation_reader = getattr(self.store, "lp_trade_generation", None)
+        generation = (
+            int(trade_generation)
+            if trade_generation is not None
+            else int(generation_reader())
+            if callable(generation_reader)
+            else None
+        )
+        if generation is None:
+            return None
+        with self._mutex:
+            claims = claim_method(
+                str(session["session_id"]),
+                trade_revision=int(expected_trade_revision),
+                trade_generation=generation,
+                actions=[(action_key, payload)],
+                patch=patch,
+                state=claim_state,
+            )
+        if not claims:
+            if (
+                self.store.lp_session_revision(str(session["session_id"]), trading=True) != expected_trade_revision
+                or self.store.lp_trade_generation() != generation
+            ):
+                self._publish_account_round_rejected(str(session["session_id"]))
+            return None
+        return self.store.lp_session(str(session["session_id"])) or session
+
+    def _claim_and_send_owned_cancels_off_lock(
+        self,
+        session: Mapping[str, object],
+        snapshot: Mapping[str, object],
+        *,
+        initial_revision: int,
+        trade_generation: int,
+        reason: str,
+        allow_history: bool = False,
+    ) -> None:
+        session_id = str(session["session_id"])
+        claims: list[tuple[str, str, Mapping[str, object]]] = []
+        requested_by_order: dict[str, str] = {}
+        error_prefix = "deadline" if reason == "review_deadline" else reason
+        with self._mutex:
+            row = self.store.lp_session_with_revision(session_id, trading=True)
+            if row is None:
+                return
+            current, current_revision = row
+            if current_revision != initial_revision:
+                return
+            current, _ = row
+            history = self._order_history(current)
+            venue_statuses = {
+                self._order_id(order): str(_field(order, "status", "")).upper()
+                for order in _items(snapshot.get("orders"))
+            }
+
+            def order_status(order_id: str) -> str:
+                status = venue_statuses.get(order_id)
+                if not status and allow_history:
+                    status = str(
+                        history.get(order_id, {}).get("status") or "UNKNOWN"
+                    ).upper()
+                return status
+
+            blocked_orders = self._recent_pending_cancel_order_ids(session_id)
+            targets: list[str] = []
+            patch: dict[str, object] = {}
+            for key, requested_key in (
+                ("entry_order_id", "entry_cancel_requested"),
+                ("passive_exit_order_id", "passive_cancel_requested"),
+            ):
+                order_id = str(current.get(key) or "")
+                if (
+                    order_id
+                    and not bool(current.get(requested_key))
+                    and order_status(order_id)
+                    and order_status(order_id) not in TERMINAL_ORDER_STATES
+                    and order_id not in blocked_orders
+                ):
+                    targets.append(order_id)
+                    requested_by_order[order_id] = requested_key
+            requested_augments = {
+                str(value) for value in _items(current.get("augment_cancel_requested"))
+            }
+            for value in _items(current.get("augment_order_ids")):
+                order_id = str(value or "")
+                if (
+                    order_id
+                    and order_id not in requested_augments
+                    and order_status(order_id)
+                    and order_status(order_id) not in TERMINAL_ORDER_STATES
+                    and order_id not in blocked_orders
+                ):
+                    targets.append(order_id)
+            if targets:
+                claim_method = getattr(self.store, "lp_claim_trade_actions", None)
+                if callable(claim_method):
+                    claims = claim_method(
+                        session_id,
+                        trade_revision=initial_revision,
+                        trade_generation=trade_generation,
+                        actions=[
+                            (
+                                f"{session_id}:reconcile-cancel:{reason}:{order_id}:{uuid.uuid4().hex}",
+                                {
+                                    "role": "reconciliation_cancel",
+                                    "reason": reason,
+                                    "order_id": order_id,
+                                    "submit_requested_at": _iso(self._now()),
+                                },
+                            )
+                            for order_id in targets
+                        ],
+                        patch=patch,
+                    )
+        for _session_id, _action_key, payload in claims:
+            order_id = str(payload["order_id"])
+            try:
+                acknowledged = self._cancel_order(
+                    order_id,
+                    attempts=[(_session_id, _action_key, dict(payload))],
+                )
+            except Exception as exc:
+                self.store.lp_update_session(
+                    session_id,
+                    state="needs_attention",
+                    patch={
+                        "reconciliation": f"{error_prefix}_cancel_{type(exc).__name__}",
+                        "resume_state": "review",
+                        "review_status": "awaiting_reconciliation",
+                    },
+                )
+                continue
+            if not acknowledged:
+                self.store.lp_update_session(
+                    session_id,
+                    state="needs_attention",
+                    patch={
+                        "reconciliation": f"{error_prefix}_cancel_not_acknowledged",
+                        "resume_state": "review",
+                        "review_status": "awaiting_reconciliation",
+                    },
+                )
+                continue
+            current = self.store.lp_session(session_id) or session
+            requested_key = requested_by_order.get(order_id)
+            if requested_key:
+                patch = {requested_key: True}
+            else:
+                patch = {
+                    "augment_cancel_requested": sorted(
+                        {str(value) for value in _items(current.get("augment_cancel_requested"))}
+                        | {order_id}
+                    )
+                }
+            if reason in {"review_deadline", "review_reconcile", "scoring_failure"}:
+                current = self.store.lp_update_session(
+                    session_id,
+                    state="review",
+                    patch={**patch, "review_status": "awaiting_reconciliation"},
+                )
+            else:
+                current = self.store.lp_update_session(session_id, patch=patch)
+            self._mark_group_buckets_canceling(current, reason)
+
+    def _recent_pending_cancel_order_ids(self, session_id: str) -> set[str]:
+        """Exact IDs whose durable cancel intent is still awaiting a reply."""
+        now = self._now()
+        blocked: set[str] = set()
+        for action in self.store.lp_actions(session_id):
+            if "cancel" not in str(action.get("role")) and "cancel" not in str(action.get("action_key")):
+                continue
+            if str(action.get("state")) != "pending":
+                continue
+            order_id = str(action.get("order_id") or "")
+            if not order_id:
+                continue
+            try:
+                pending_recent = (
+                    now - _timestamp(action.get("updated_at"), name="updated_at")
+                ).total_seconds() < 60
+            except (TypeError, ValueError):
+                pending_recent = True
+            if pending_recent:
+                blocked.add(order_id)
+        return blocked
 
     def _apply_triggered_protection_cancel_off_lock(
         self,
@@ -9982,7 +10576,7 @@ class PolymarketLPService:
         writes = 0
         for key, bucket, plan in plans:
             next_bucket, patch = self._execute_bucket_protection_cancel(
-                session, snapshot, bucket, plan
+                session, snapshot, bucket, plan, bucket_key=str(key)
             )
             if str(next_bucket.get("state") or "") not in {
                 "canceling",
@@ -10207,6 +10801,45 @@ class PolymarketLPService:
                     "resume_state": None,
                     "needs_attention_since": None,
                     "needs_attention_notified": False,
+                    "needs_attention_due": False,
+                    "needs_attention_channel_status": {},
+                    "needs_attention_send_error": None,
+                    "needs_attention_sending": False,
+                    "needs_attention_send_retry_at": None,
+                    "needs_attention_recovery_due": bool(
+                        session.get("needs_attention_notified")
+                        or (
+                            isinstance(
+                                session.get("needs_attention_channel_status"),
+                                Mapping,
+                            )
+                            and any(
+                                bool(value)
+                                for value in session[
+                                    "needs_attention_channel_status"
+                                ].values()
+                            )
+                        )
+                    ),
+                    "needs_attention_recovery_episode": str(
+                        session.get("needs_attention_episode") or ""
+                    ),
+                    "needs_attention_verified_recovery_episode": str(
+                        session.get("needs_attention_episode") or ""
+                    ),
+                    "needs_attention_recovery_channels": sorted(
+                        {"feishu", "xiaoai"}
+                        if session.get("needs_attention_notified")
+                        else {
+                            str(key)
+                            for key, value in (
+                                session.get("needs_attention_channel_status") or {}
+                            ).items()
+                            if value
+                        }
+                    ),
+                    "needs_attention_recovery_channel_status": {},
+                    "needs_attention_recovery_retry_at": None,
                 },
             )
             state = resume_state
@@ -10345,6 +10978,64 @@ class PolymarketLPService:
         if conservative is not None:
             return self._status_payload(conservative)
         return self._status_payload(updated)
+
+    def _handle_snapshot_failure_fenced(
+        self,
+        session: Mapping[str, object],
+        exc: ValueError,
+        initial_revision: int,
+        trade_generation: int | None,
+    ) -> dict[str, object]:
+        """Publish a failed read from the current durable session image."""
+
+        session_id = str(session["session_id"])
+        failures = None
+        generation_reader = getattr(self.store, "lp_trade_generation", None)
+        generation = (
+            int(trade_generation)
+            if trade_generation is not None
+            else int(generation_reader())
+            if callable(generation_reader)
+            else None
+        )
+        with self._mutex:
+            row = self.store.lp_session_with_revision(session_id, trading=True)
+            if row is None:
+                return self._status_payload(session)
+            current, current_revision = row
+            if current_revision != initial_revision:
+                return self._status_payload(current)
+            state = str(current.get("state"))
+            patch: dict[str, object] = {
+                "reconciliation": str(exc),
+                "resume_state": state
+                if state != "needs_attention"
+                else current.get("resume_state"),
+            }
+            failures = self._queue_protection_data_failure(current, str(exc))
+            if failures is not None:
+                patch["queue_protection"] = failures
+            patch.update(
+                self._needs_attention_notify_patch(
+                    current, self._now(), protection=failures
+                )
+            )
+            try:
+                current, _ = self.store.lp_publish_facts(
+                    session_id,
+                    initial_revision,
+                    state="needs_attention",
+                    patch=patch,
+                    publish=self._facts_publisher,
+                    error=str(exc),
+                    trade_generation=generation,
+                )
+            except ValueError:
+                current = self.store.lp_session(session_id) or current
+        conservative = self._conservative_protection_cancel(current, failures)
+        if conservative is not None:
+            return self._status_payload(conservative)
+        return self._status_payload(current)
 
     def _collect_group_buys(
         self,
@@ -10575,12 +11266,20 @@ class PolymarketLPService:
             raise ValueError("external_snapshot_unknown") from exc
         except TimeoutError as exc:
             with self._market_reads_lock:
-                self._market_read_retry[key] = monotonic() + 300
+                self._market_read_retry[key] = monotonic() + 60
             raise ValueError('market_read_timeout') from exc
         finally:
             with self._market_reads_lock:
                 if future.done() and self._market_reads.get(key) is future:
                     self._market_reads.pop(key)
+
+    def market_read_retry_at(self, condition_id: str) -> datetime | None:
+        """Expose the actual local read backoff as a wall-clock deadline."""
+        with self._market_reads_lock:
+            retry_monotonic = self._market_read_retry.get(str(condition_id))
+        if retry_monotonic is None:
+            return None
+        return self._now() + timedelta(seconds=max(0, retry_monotonic - monotonic()))
 
     def _fetch_snapshot(
         self,
@@ -10600,11 +11299,11 @@ class PolymarketLPService:
             except TypeError:
                 try:
                     value = method()
-                except LpNewerAccountFacts:
+                except (LpAccountReadError, LpNewerAccountFacts):
                     raise
                 except Exception as exc:
                     raise ValueError("external_snapshot_unknown") from exc
-            except LpNewerAccountFacts:
+            except (LpAccountReadError, LpNewerAccountFacts):
                 raise
             except Exception as exc:
                 raise ValueError("external_snapshot_unknown") from exc
@@ -10954,28 +11653,103 @@ class PolymarketLPService:
         )
         return updated
 
-    def _notify_protection(
-        self, title: str, message: str, xiaoai_text: str
-    ) -> None:
-        """Deliver one protection notification through both channels."""
-
+    def _deliver_protection_details(
+        self,
+        title: str,
+        message: str,
+        xiaoai_text: str,
+        *,
+        channels: set[str] | None = None,
+    ) -> dict[str, bool]:
+        """Return per-channel delivery facts without turning partial success true."""
         callback = self._protection_notifier
         if callback is None:
-            return
+            if channels is None:
+                return {"feishu": False, "xiaoai": False}
+            return {name: False for name in channels}
+        kwargs = {}
+        if channels is not None:
+            try:
+                inspect.signature(callback).bind(
+                    title, message, xiaoai_text, channels=channels
+                )
+            except (TypeError, ValueError):
+                pass
+            else:
+                kwargs["channels"] = channels
         try:
-            callback(title, message, xiaoai_text)
+            result = callback(title, message, xiaoai_text, **kwargs)
         except Exception:
-            pass
+            if channels is None:
+                return {"feishu": False, "xiaoai": False}
+            return {name: False for name in channels}
+        if isinstance(result, Mapping):
+            return {
+                str(key): bool(result.get(key))
+                for key in (channels if channels is not None else {"feishu", "xiaoai"})
+            }
+        delivered = result is True
+        if channels is None:
+            return {"feishu": delivered, "xiaoai": delivered}
+        return {name: delivered for name in channels}
+
+    def _notify_protection(
+        self, title: str, message: str, xiaoai_text: str
+    ) -> bool:
+        """Deliver one protection notification through both channels."""
+        results = self._deliver_protection_details(title, message, xiaoai_text)
+        return bool(results) and all(results.values())
+
+    def _notify_bucket_protection(
+        self,
+        session: Mapping[str, object],
+        bucket: Mapping[str, object],
+        bucket_key: str,
+        field: str,
+        title: str,
+        message: str,
+        xiaoai_text: str,
+    ) -> bool:
+        """Send one bucket notice outside locks after durable episode arming."""
+        session_id = str(session["session_id"])
+        episode = str(bucket.get("notification_episode") or uuid.uuid4().hex)
+        bucket = {**bucket, "notification_episode": episode}
+        arm = getattr(self.store, "lp_arm_queue_protection_notification", None)
+        if callable(arm) and not arm(
+            session_id,
+            level_key=bucket_key,
+            episode=episode,
+            order_id=str(bucket.get("order_id") or ""),
+        ):
+            return False
+
+        def mark_delivered() -> None:
+            marker = getattr(
+                self.store, "lp_mark_queue_protection_notified", None
+            )
+            if callable(marker):
+                marker(
+                    session_id,
+                    level_key=bucket_key,
+                    field=field,
+                    episode=episode,
+                    order_id=str(bucket.get("order_id") or ""),
+                )
+
+        queue = getattr(self._deferred_protection_notices, "notices", None)
+        if queue is not None:
+            queue.append((title, message, xiaoai_text, mark_delivered))
+            return False
+        if not self._notify_protection(title, message, xiaoai_text):
+            return False
+        mark_delivered()
+        return True
 
     @staticmethod
     def _needs_attention_reason_copy(
         reconciliation: object,
     ) -> tuple[str, str]:
-        """「需要核对」文案表（与前端 lpNeedsAttentionCopy 同源同句）。
-
-        返回 (整句 main, 小爱原因短句)。
-        """
-
+        """Return durable operator copy for the current reconciliation reason."""
         code = str(reconciliation or "")
         if code == "unowned_target_order":
             return (
@@ -10983,8 +11757,16 @@ class PolymarketLPService:
                 "系统已暂停本组自动管理，追加暂不可用；那张单撤掉或成交后自动恢复，无需操作。",
                 "本市场有不归系统管理的挂单",
             )
-        if code in {"external_snapshot_unknown", "book_unknown", "book_freshness_unknown"}:
+        if code in {
+            "external_snapshot_unknown", "book_unknown", "book_freshness_unknown",
+            "market_read_timeout", "market_read_in_progress",
+            "market_read_cooling_down", "market_read_capacity",
+        }:
             return ("市场/账户数据连续读取失败，系统自动重试中。", "数据读取连续失败")
+        if code in {"account_facts_stale", "account_facts_incomplete"}:
+            return ("账户事实已变化或未完整返回，系统重新读取中。", "账户事实不完整")
+        if code == "execution_lock":
+            return ("等待其他交易操作完成，随后自动继续核对。", "等待交易锁")
         if "submit_unknown" in code:
             return (
                 "一笔提交结果未知，需要到 Polymarket 订单页核对该单状态。",
@@ -11002,22 +11784,29 @@ class PolymarketLPService:
         *,
         protection: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
-        """克制的「需要核对」通知记账 patch（复用于四个巡检写分支）。
-
-        进入（会话此前不在该状态或缺 since 键）→ 锚定 since、notified=False；
-        已在状态 → 不动 since（reason 变化也算同一 episode，不重置不重推）；
-        仍未自愈且距进入满 5 分钟且未推过 → 经 _notify_protection 推一条并把
-        needs_attention_notified=True 随本次 patch 落库；发送异常由
-        _notify_protection 吞掉（现有行为）。恢复路径负责清键重置。
-        """
-
+        """Arm one durable five-minute attention episode; never send here."""
+        owns_reader = getattr(self.store, "lp_auto_owns_session", None)
+        if callable(owns_reader) and owns_reader(str(session.get("session_id"))):
+            return {}
         state = str(session.get("state"))
         since_raw = session.get("needs_attention_since")
         if state != "needs_attention" or since_raw is None:
             return {
+                "needs_attention_episode": uuid.uuid4().hex,
+                "needs_attention_verified_recovery_episode": None,
                 "needs_attention_since": now.isoformat(),
                 "needs_attention_notified": False,
+                "needs_attention_due": False,
+                "needs_attention_recovery_due": False,
+                "needs_attention_channel_status": {},
+                "needs_attention_recovery_channel_status": {},
+                "needs_attention_send_error": None,
+                "needs_attention_sending": False,
+                "needs_attention_send_retry_at": None,
+                "needs_attention_recovery_retry_at": None,
             }
+        if not str(session.get("needs_attention_episode") or ""):
+            return {"needs_attention_episode": uuid.uuid4().hex}
         if bool(session.get("needs_attention_notified")):
             return {}
         try:
@@ -11029,28 +11818,115 @@ class PolymarketLPService:
             }
         if (now - since).total_seconds() < LP_NEEDS_ATTENTION_NOTIFY_SECONDS:
             return {}
-        view = protection if isinstance(protection, Mapping) else None
-        if view is None:
-            raw = session.get("queue_protection")
-            view = raw if isinstance(raw, Mapping) else {}
-        failures = _queue_group_failures_int(view.get("data_failures"))
-        main, xiaoai_reason = self._needs_attention_reason_copy(
-            session.get("reconciliation")
-        )
-        identity = _text(session.get("market_title")) or str(
-            session.get("condition_id") or ""
-        )[:12]
-        message = main + (
-            f" 数据读取失败 {failures}/10，满 10 次将保护性撤单。"
-            if failures > 0
-            else ""
-        )
-        self._notify_protection(
-            f"LP 需要核对 · {identity}",
-            message,
-            f"LP 需要核对，{xiaoai_reason}",
-        )
-        return {"needs_attention_notified": True}
+        retry = session.get("needs_attention_send_retry_at")
+        if retry and now < _timestamp(retry, name="needs_attention_send_retry_at"):
+            return {}
+        return {"needs_attention_due": True}
+
+    def flush_session_attention(self, session_id: str) -> None:
+        """Deliver one persisted session episode outside every critical section."""
+        with self._attention_delivery_lock:
+            session = self.store.lp_session(session_id)
+            if session is None or str(session.get("state")) != "needs_attention":
+                return
+            now = self._now()
+            retry = session.get("needs_attention_send_retry_at")
+            if retry and now < _timestamp(retry, name="needs_attention_send_retry_at"):
+                return
+            if not session.get("needs_attention_due"):
+                return
+            episode = str(session.get("needs_attention_episode") or "")
+            view = session.get("queue_protection")
+            failures = _queue_group_failures_int(
+                view.get("data_failures") if isinstance(view, Mapping) else 0
+            )
+            main, xiaoai_reason = self._needs_attention_reason_copy(
+                session.get("reconciliation")
+            )
+            identity = _text(session.get("market_title")) or str(
+                session.get("condition_id") or ""
+            )[:12]
+            message = main + (
+                f" 数据读取失败 {failures}/10，满 10 次将保护性撤单。"
+                if failures > 0
+                else ""
+            )
+            self.store.lp_update_session(session_id, patch={
+                "needs_attention_sending": True,
+                "needs_attention_send_retry_at": (
+                    now + timedelta(seconds=60)
+                ).isoformat(),
+            })
+            prior_status = (
+                session.get("needs_attention_channel_status")
+                if isinstance(session.get("needs_attention_channel_status"), Mapping)
+                else {}
+            )
+            pending = {
+                channel
+                for channel, delivered in (
+                    (str(key), bool(value)) for key, value in prior_status.items()
+                )
+                if channel in {"feishu", "xiaoai"} and not delivered
+            } or {"feishu", "xiaoai"}
+            results = self._deliver_protection_details(
+                f"LP 需要核对 · {identity}",
+                message,
+                f"LP 需要核对，{xiaoai_reason}",
+                channels=pending,
+            )
+            self.store.lp_finish_attention_notification(
+                session_id, recovery=False, episode=episode, results=results
+            )
+
+    def flush_session_recovery(self, session_id: str) -> None:
+        """Deliver the one recovery notice after the recovery transaction."""
+        with self._attention_delivery_lock:
+            session = self.store.lp_session(session_id)
+            if session is None or not session.get("needs_attention_recovery_due"):
+                return
+            episode = str(session.get("needs_attention_recovery_episode") or "")
+            now = self._now()
+            retry = session.get("needs_attention_recovery_retry_at")
+            if retry and now < _timestamp(
+                retry, name="needs_attention_recovery_retry_at"
+            ):
+                return
+            self.store.lp_update_session(session_id, patch={
+                "needs_attention_sending": True,
+                "needs_attention_recovery_retry_at": (
+                    now + timedelta(seconds=60)
+                ).isoformat(),
+            })
+            prior_status = (
+                session.get("needs_attention_recovery_channel_status")
+                if isinstance(
+                    session.get("needs_attention_recovery_channel_status"), Mapping
+                )
+                else {}
+            )
+            raw_channels = session.get("needs_attention_recovery_channels")
+            requested = {
+                str(value)
+                for value in _items(raw_channels)
+                if str(value) in {"feishu", "xiaoai"}
+            } or {"feishu", "xiaoai"}
+            pending = requested - {
+                channel
+                for channel, delivered in (
+                    (str(key), bool(value)) for key, value in prior_status.items()
+                )
+                if delivered
+            }
+            results = self._deliver_protection_details(
+                "LP 需要核对已恢复",
+                "LP 会话核对已恢复；自动运行/暂停设置保持不变。",
+                "LP 需要核对已恢复",
+                channels=pending,
+            )
+            self.store.lp_finish_attention_notification(
+                session_id, recovery=True, episode=episode, results=results
+            )
 
     def _queue_protection_identity(
         self, session: Mapping[str, object]
@@ -11454,6 +12330,7 @@ class PolymarketLPService:
         reason: str = "queue_ahead_ratio",
         only_order_ids: list[str] | None = None,
         notify_blocked: bool = True,
+        bucket_key: str | None = None,
     ) -> tuple[dict[str, object] | None, dict[str, object], dict[str, object]]:
         """Plan one protection cancel without committing or cancelling.
 
@@ -11470,7 +12347,7 @@ class PolymarketLPService:
         if current.get("order_identity_conflict"):
             return None, self._blocked_bucket_protection_cancel(
                 session, updated, "order_identity_conflict", "订单身份冲突，等待核对",
-                None, notify=notify_blocked
+                None, notify=notify_blocked, bucket_key=bucket_key
             ), {}
         if baseline_price is None:
             return None, updated, {}
@@ -11488,6 +12365,7 @@ class PolymarketLPService:
                     "账户读取失败",
                     None,
                     notify=notify_blocked,
+                    bucket_key=bucket_key,
                 ), {}
             rows_by_id: dict[str, object] = {}
             for row in rows:
@@ -11512,6 +12390,7 @@ class PolymarketLPService:
                     "回执身份不符",
                     None,
                     notify=notify_blocked,
+                    bucket_key=bucket_key,
                 ), {}
 
         if not self._mutation_allowed():
@@ -11525,6 +12404,7 @@ class PolymarketLPService:
                 "撤单被熔断阻止",
                 remaining,
                 notify=notify_blocked,
+                bucket_key=bucket_key,
             ), {}
 
         history = self._order_history(session)
@@ -11654,6 +12534,8 @@ class PolymarketLPService:
         snapshot: Mapping[str, object],
         bucket: Mapping[str, object],
         plan: dict[str, object],
+        *,
+        bucket_key: str | None = None,
     ) -> tuple[dict[str, object], dict[str, object]]:
         """Send one already-committed cancel plan and persist its receipt."""
 
@@ -11739,8 +12621,16 @@ class PolymarketLPService:
                     session, updated, "位置保护已触发撤单"
                 ),
             )
-            self._notify_protection(title, message, xiaoai)
-            updated["notification_sent"] = True
+            if self._notify_bucket_protection(
+                session,
+                updated,
+                bucket_key or str(bucket.get("order_id") or ""),
+                "notification_sent",
+                title,
+                message,
+                xiaoai,
+            ):
+                updated["notification_sent"] = True
 
         session_patch: dict[str, object] = {}
         if entry_order_id in targets and not bool(session.get("entry_cancel_requested")):
@@ -11775,12 +12665,14 @@ class PolymarketLPService:
         only_order_ids: list[str] | None = None,
         notify_blocked: bool = True,
         expected_trade_revision: int | None = None,
+        bucket_key: str | None = None,
     ) -> tuple[dict[str, object], dict[str, object]]:
         """Plan, fence one bucket, then send its registered cancel intent."""
 
         plan, blocked, patch = self._plan_bucket_protection_cancel(
             session, snapshot, bucket, reason=reason,
             only_order_ids=only_order_ids, notify_blocked=notify_blocked,
+            bucket_key=bucket_key,
         )
         if plan is None:
             return blocked, patch
@@ -11809,7 +12701,9 @@ class PolymarketLPService:
                 self._publish_account_round_rejected(str(session["session_id"]))
                 return dict(bucket), {}
             raise
-        return self._execute_bucket_protection_cancel(session, snapshot, bucket, plan)
+        return self._execute_bucket_protection_cancel(
+            session, snapshot, bucket, plan, bucket_key=bucket_key
+        )
 
     def _blocked_bucket_protection_cancel(
         self,
@@ -11820,6 +12714,7 @@ class PolymarketLPService:
         remaining: Decimal | None,
         *,
         notify: bool = True,
+        bucket_key: str | None = None,
     ) -> dict[str, object]:
         codes = list(bucket.get("reason_codes") or [])
         if reason_code not in codes:
@@ -11836,8 +12731,16 @@ class PolymarketLPService:
                     session, bucket, "位置保护撤单受阻"
                 ),
             )
-            self._notify_protection(title, message, xiaoai)
-            bucket["blocked_notified"] = True
+            if self._notify_bucket_protection(
+                session,
+                bucket,
+                bucket_key or str(bucket.get("order_id") or ""),
+                "blocked_notified",
+                title,
+                message,
+                xiaoai,
+            ):
+                bucket["blocked_notified"] = True
         return bucket
 
     def _converge_queue_protection(
@@ -11845,6 +12748,8 @@ class PolymarketLPService:
         session: Mapping[str, object],
         bucket: Mapping[str, object],
         rows_by_id: Mapping[str, object],
+        *,
+        bucket_key: str | None = None,
     ) -> dict[str, object] | None:
         """Settle one canceling bucket from order receipts (issue 152 D4.7)."""
 
@@ -11935,8 +12840,16 @@ class PolymarketLPService:
                     session, updated, "位置保护已触发撤单"
                 ),
             )
-            self._notify_protection(title, message, xiaoai)
-            updated["notification_sent"] = True
+            if self._notify_bucket_protection(
+                session,
+                updated,
+                bucket_key or str(bucket.get("order_id") or ""),
+                "notification_sent",
+                title,
+                message,
+                xiaoai,
+            ):
+                updated["notification_sent"] = True
         return updated
 
     def _apply_queue_protection(
@@ -11964,7 +12877,7 @@ class PolymarketLPService:
         for key, bucket in buckets.items():
             if str(bucket.get("state")) == "canceling":
                 converged = self._converge_queue_protection(
-                    session, bucket, rows_by_id
+                    session, bucket, rows_by_id, bucket_key=key
                 )
                 if converged is not None:
                     new_levels[key] = converged
@@ -11983,6 +12896,7 @@ class PolymarketLPService:
                         reason=str(bucket.get("cancel_reason") or "queue_ahead_ratio"),
                         only_order_ids=failed,
                         expected_trade_revision=trade_revision,
+                        bucket_key=key,
                     )
                     # Issue 167 review fix: each bucket computes its session
                     # flags from the same pre-loop session, so a plain
@@ -12021,6 +12935,7 @@ class PolymarketLPService:
                     bucket,
                     reason="queue_ahead_ratio",
                     expected_trade_revision=trade_revision,
+                    bucket_key=key,
                 )
                 # Same union merge as above: two buckets triggering in one
                 # tick must accumulate their session flags, not overwrite.
@@ -13334,13 +14249,6 @@ class PolymarketLPService:
             raise ValueError("account_facts_incomplete")
         if "positions" not in account or account.get("positions") is None:
             raise ValueError("position_unknown")
-        book = snapshot.get("book")
-        if not isinstance(book, Mapping):
-            raise ValueError("book_unknown")
-        book_received_at = book.get("received_at")
-        if book_received_at is None:
-            raise ValueError("book_freshness_unknown")
-        _freshness(book_received_at, self._now(), "book_freshness")
         token_id = session["token_id"]
         trade_events = self._merge_report_trade_events(session, snapshot)
         verified = self._verified_order_fills(session, snapshot, trade_events)
@@ -13356,9 +14264,36 @@ class PolymarketLPService:
         buy_fees, sell_fees = fees_for(buys), fees_for(sells)
         fees = None if buy_fees is None or sell_fees is None else buy_fees + sell_fees
         residual = self._position_quantity(account, str(token_id))
-        residual_value = self._executable_bid_value(snapshot, residual)
-        projected_fee = self._projected_taker_fee(snapshot, residual)
-        fees_known = fills_known and fees is not None and projected_fee is not None
+        book = snapshot.get("book")
+        book_received_at = book.get("received_at") if isinstance(book, Mapping) else None
+        book_ready = False
+        if book_received_at is not None:
+            try:
+                _freshness(book_received_at, self._now(), "book_freshness")
+                book_ready = True
+            except ValueError:
+                book_ready = False
+        # A positive inventory cannot inherit zero from the helper when the
+        # executable book is absent; valuation is market-purpose only.
+        residual_value = (
+            Decimal("0") if residual == 0
+            else self._executable_bid_value(snapshot, residual) if book_ready
+            else None
+        )
+        market = snapshot.get("market")
+        if residual == 0:
+            projected_fee = Decimal("0")
+        elif isinstance(market, Mapping) and market.get("fees_enabled") is False:
+            projected_fee = Decimal("0")
+        elif book_ready:
+            projected_fee = self._projected_taker_fee(snapshot, residual)
+        else:
+            projected_fee = None
+        historical_fees_known = fees is not None
+        # Financial settlement uses executed order facts. A live book is only
+        # admission/exit valuation input, except a non-empty residual needs a
+        # reliable projected exit fee to describe the full fee boundary.
+        fees_known = fills_known and historical_fees_known and projected_fee is not None
         if fees is not None and projected_fee is not None:
             fees += projected_fee
         else:
@@ -13376,6 +14311,16 @@ class PolymarketLPService:
             raise ValueError("sold_quantity_exceeded")
         expected_residual = quantity - sold_quantity
         position_reconciled = fills_known and residual == expected_residual
+        inventory_valuation_known = residual == 0 or residual_value is not None
+        financial_block_reason = None
+        if not fills_known:
+            financial_block_reason = "owned_fill_quantity_unknown"
+        elif not historical_fees_known:
+            financial_block_reason = "trade_fee_unknown"
+        elif not position_reconciled:
+            financial_block_reason = "position_mismatch"
+        elif not inventory_valuation_known:
+            financial_block_reason = "inventory_valuation_unknown"
         patch: dict[str, object] = {
             "buy_filled_quantity": quantity,
             "buy_cost": cost,
@@ -13392,7 +14337,10 @@ class PolymarketLPService:
             "fee_status": "known" if fees_known else "unknown",
             "position_reconciled": position_reconciled,
             "account_checked_at": snapshot.get("account_checked_at", self._now()),
-            "book_checked_at": book_received_at,
+            "book_checked_at": book_received_at if book_ready else None,
+            "book_admission_ready": book_ready,
+            "inventory_valuation_status": "known" if inventory_valuation_known else "unknown",
+            "financial_block_reason": financial_block_reason,
             "orders_terminal": bool(session.get("orders_terminal")),
         }
         if not position_reconciled:
@@ -13732,17 +14680,7 @@ class PolymarketLPService:
         # The window ends the opening stage.  Loss/account reconciliation
         # remains independent and is handled by the normal tick path.
         current = self.store.lp_session(str(session["session_id"])) or updated
-        try:
-            self._cancel_entry_order(current)
-        except Exception as exc:
-            self.store.lp_update_session(
-                str(session["session_id"]),
-                state="needs_attention",
-                patch={
-                    "reconciliation": f"scoring_cancel_{type(exc).__name__}",
-                    "resume_state": "entry_open",
-                },
-            )
+        if not current.get("entry_cancel_requested"):
             return
         self.store.lp_update_session(
             str(session["session_id"]),
@@ -13786,6 +14724,8 @@ class PolymarketLPService:
         *,
         expected_generation: int | None = None,
         expected_trade_revision: int | None = None,
+        claim_patch: Mapping[str, object] | None = None,
+        claim_state: str | None = None,
     ) -> dict[str, object]:
         order_id = str(session.get("passive_exit_order_id") or "")
         if not order_id or bool(session.get("passive_cancel_requested")):
@@ -13818,6 +14758,8 @@ class PolymarketLPService:
                 }],
                 expected_generation=expected_generation,
                 expected_trade_revision=expected_trade_revision,
+                patch=claim_patch,
+                state=claim_state,
             )
         except ValueError as exc:
             if str(exc) == "account_round_invalid":
@@ -13851,13 +14793,14 @@ class PolymarketLPService:
             raise ValueError("order_identity_conflict")
         session_id = str(current["session_id"])
         history = self._order_history(current)
+        pending_cancels = self._recent_pending_cancel_order_ids(session_id)
         specs: list[tuple[str, str, str]] = []
         for key, requested_key, role in (
             ("entry_order_id", "entry_cancel_requested", "entry"),
             ("passive_exit_order_id", "passive_cancel_requested", "passive_exit"),
         ):
             order_id = str(current.get(key) or "")
-            if not order_id or bool(current.get(requested_key)):
+            if not order_id or bool(current.get(requested_key)) or order_id in pending_cancels:
                 continue
             if str(history.get(order_id, {}).get("status") or "").upper() in TERMINAL_ORDER_STATES:
                 continue
@@ -13870,7 +14813,7 @@ class PolymarketLPService:
         ]
         for value in _items(current.get("augment_order_ids")):
             order_id = str(value or "")
-            if not order_id or order_id in augment_requested:
+            if not order_id or order_id in augment_requested or order_id in pending_cancels:
                 continue
             if str(history.get(order_id, {}).get("status") or "").upper() in TERMINAL_ORDER_STATES:
                 continue
@@ -14060,6 +15003,8 @@ class PolymarketLPService:
         quantity: Decimal,
         *,
         trade_revision: int | None = None,
+        trade_generation: int | None = None,
+        expected_trade_revision: int | None = None,
     ) -> None:
         # A submit that may have reached the venue is durable before the POST.
         # Pending, unknown, and accepted-without-ID states are never safe to
@@ -14101,8 +15046,8 @@ class PolymarketLPService:
             if not bool(session.get("passive_cancel_requested")):
                 self._request_passive_cancel(
                     session,
-                    expected_generation=snapshot.get("_lp_trade_generation"),
-                    expected_trade_revision=trade_revision,
+                    expected_generation=trade_generation if trade_generation is not None else snapshot.get("_lp_trade_generation"),
+                    expected_trade_revision=expected_trade_revision if expected_trade_revision is not None else trade_revision,
                 )
                 return
             if not self._order_terminal(snapshot, old_order, session):
@@ -14129,41 +15074,37 @@ class PolymarketLPService:
             "price": price,
             "quantity": quantity,
         }
-        expected_generation = snapshot.get("_lp_trade_generation")
-        if expected_generation is not None and not isinstance(trade_revision, int):
-            # A shared account bundle cannot authorize a new order without
-            # the session revision captured at its read/apply boundary.
+        expected_generation = (
+            int(trade_generation)
+            if trade_generation is not None
+            else snapshot.get("_lp_trade_generation")
+        )
+        expected_revision = (
+            int(expected_trade_revision)
+            if expected_trade_revision is not None
+            else trade_revision
+        )
+        if expected_generation is not None and not isinstance(expected_revision, int):
             self._publish_account_round_rejected(session_id)
             return
-        try:
-            self.store.lp_register_fenced_actions(
-                session_id,
-                [{
-                    "action_key": attempt_key,
-                    "payload": intent_payload,
-                }],
-                expected_generation=(
-                    int(expected_generation)
-                    if expected_generation is not None
-                    else None
-                ),
-                expected_trade_revision=trade_revision,
-            )
-        except ValueError as exc:
-            if str(exc) == "account_round_invalid":
-                self._publish_account_round_rejected(session_id)
-                return
-            raise
-        self.store.lp_update_session(
-            session_id,
-            state="passive_exit",
-            patch={
+        claimed = self._claim_trade_action(
+            session,
+            attempt_key,
+            intent_payload,
+            {
                 "passive_exit_attempt_key": attempt_key,
                 "passive_exit_attempt_state": "pending",
                 "passive_exit_retryable": False,
+                "opening_loss": self._opening_loss_from_session(session),
                 **self._scoring_reset_patch(),
             },
+            trade_generation=int(expected_generation or 0),
+            expected_trade_revision=expected_revision,
+            claim_state="passive_exit",
         )
+        if claimed is None:
+            return
+        session = claimed
         try:
             signed = self._create_limit(
                 token_id=str(session["token_id"]),
@@ -14406,6 +15347,10 @@ class PolymarketLPService:
         snapshot: Mapping[str, object] | None = None,
         *,
         trade_revision: int | None = None,
+        trade_generation: int | None = None,
+        expected_trade_revision: int | None = None,
+        claim_patch: Mapping[str, object] | None = None,
+        claim_state: str | None = None,
     ) -> None:
         method = getattr(self.exchange, "submit_protected_sell", None)
         if quantity <= 0 or session.get("protected_exit_order_id"):
@@ -14533,46 +15478,42 @@ class PolymarketLPService:
             "min_price": min_price,
         }
         expected_generation = (
-            snapshot.get("_lp_trade_generation")
+            int(trade_generation)
+            if trade_generation is not None
+            else snapshot.get("_lp_trade_generation")
             if isinstance(snapshot, Mapping)
             else None
         )
-        if expected_generation is not None and not isinstance(trade_revision, int):
-            # A protected exit consumes a shared bundle; its captured revision
-            # is part of authorization, not optional metadata.
+        expected_revision = (
+            int(expected_trade_revision)
+            if expected_trade_revision is not None
+            else trade_revision
+        )
+        if expected_generation is not None and not isinstance(expected_revision, int):
             self._publish_account_round_rejected(session_id)
             return
-        try:
-            self.store.lp_register_fenced_actions(
-                session_id,
-                [{
-                    "action_key": attempt_key,
-                    "payload": intent_payload,
-                }],
-                expected_generation=(
-                    int(expected_generation)
-                    if expected_generation is not None
-                    else None
-                ),
-                expected_trade_revision=trade_revision,
-            )
-        except ValueError as exc:
-            if str(exc) == "account_round_invalid":
-                self._publish_account_round_rejected(session_id)
-                return
-            raise
-        self.store.lp_update_session(
-            session_id,
-            patch={
-                "protected_exit_attempt_key": attempt_key,
-                "protected_exit_attempt_state": "pending",
-                "protected_exit_retryable": False,
-                "protected_exit_submit_quantity": submit_quantity,
-                "protected_exit_submit_sold_quantity": prior_sold,
-                "protected_exit_submit_residual_quantity": prior_residual,
-                **self._scoring_reset_patch(),
-            },
+        patch = {
+            "protected_exit_attempt_key": attempt_key,
+            "protected_exit_attempt_state": "pending",
+            "protected_exit_retryable": False,
+            "protected_exit_submit_quantity": submit_quantity,
+            "protected_exit_submit_sold_quantity": prior_sold,
+            "protected_exit_submit_residual_quantity": prior_residual,
+            **self._scoring_reset_patch(),
+            **(dict(claim_patch) if claim_patch is not None else {}),
+        }
+        claimed = self._claim_trade_action(
+            session,
+            attempt_key,
+            intent_payload,
+            patch,
+            trade_generation=int(expected_generation or 0),
+            expected_trade_revision=expected_revision,
+            claim_state=claim_state,
         )
+        if claimed is None:
+            return
+        session = claimed
         try:
             response = method(
                 token_id=str(session["token_id"]),

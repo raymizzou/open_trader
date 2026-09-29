@@ -831,6 +831,10 @@ def test_next_real_tick_reads_a_new_account_bundle(tmp_path) -> None:
     service, account, public = _service(tmp_path)
 
     service.tick()
+    # Market reads are independent: finish them before the next financial
+    # round consumes their fresh result instead of launching duplicate I/O.
+    for future in tuple(service.exchange._lp_public_reads.values()):
+        future.result(timeout=5)
     service.tick()
 
     assert account.calls == {
@@ -841,14 +845,10 @@ def test_next_real_tick_reads_a_new_account_bundle(tmp_path) -> None:
     }
     assert sorted(public.market_calls) == [
         "market-1",
-        "market-1",
-        "market-2",
         "market-2",
     ]
     assert sorted(public.book_calls) == [
         "0x" + "01" * 64,
-        "0x" + "01" * 64,
-        "0x" + "02" * 64,
         "0x" + "02" * 64,
     ]
 
@@ -1301,10 +1301,14 @@ def test_auto_bounded_round_waits_for_launched_jobs(tmp_path) -> None:
         assert public.max_active_books == 2
         assert len(public.books_entered) == 2
 
-        # run_once returned while both jobs still owned the round lease.
-        public.release_books.set()
-        futures = tuple(pool._reconcile_jobs.values())
+        # Public reads retain their own jobs; financial publication and its
+        # shared-account round finish without waiting for either book.
+        assert all(future.done() for future in pool._reconcile_jobs.values())
+        assert all(intent['financial_status'] == 'known' for intent in pool.state()['intents'])
+        futures = tuple(adapter._lp_public_reads.values())
         assert len(futures) == 2
+        assert all(not future.done() for future in futures)
+        public.release_books.set()
         for future in futures:
             future.result(timeout=5)
     finally:

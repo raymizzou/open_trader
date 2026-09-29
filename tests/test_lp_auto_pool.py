@@ -1,6 +1,9 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
+from threading import Event
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -8,8 +11,29 @@ import pytest
 from open_trader.polymarket_lp import PolymarketLPService
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 from open_trader.prediction_arbitrage_execution import PredictionExecutionService
+from open_trader.polymarket_lp_risk import _maybe_decimal
 
 NOW = datetime(2026, 9, 27, 8, tzinfo=UTC)
+
+
+def _maybe_datetime(value):
+    if value is None:
+        return None
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+def _manual_request(now):
+    return {
+        "market_id": "market-1",
+        "condition_id": "m00",
+        "token_id": "m00",
+        "outcome": "YES",
+        "price": Decimal("0.40"),
+        "quantity": Decimal("10"),
+        "review_at": now + timedelta(minutes=10),
+        "reserved_usd": Decimal("4"),
+    }
+
 
 
 class Exchange:
@@ -731,3 +755,666 @@ def test_conflicting_identity_stays_quarantined_in_public_tick_and_stop(tmp_path
     assert s.lp_session(sid)['reconciliation']=='order_identity_conflict'
     assert e.lp_stop(sid)['state']=='needs_attention'
     assert not cancellations and len(x.posts)==1
+
+
+def test_slow_deadline_cancel_does_not_block_other_fact_publication(tmp_path):
+    e,x,lp,s=setup(tmp_path,2)
+    e.lp_auto_configure(dict(budget_usd='100',target_buy_count=2))
+    e.lp_auto_set_desired_running(True)
+    created=e.lp_auto_run_once()
+    rows=created['intents']
+    sid_a,sid_b=rows[0]['session_id'],rows[1]['session_id']
+    s.lp_update_session(sid_a,patch=dict(review_at=NOW))
+    entered,release=Event(),Event()
+    def slow_cancel(order_id):
+        if order_id == 'o1':
+            entered.set()
+            assert release.wait(5)
+        return {'canceled':[order_id]}
+    x.cancel_order=slow_cancel
+    locks=(e._acquire_global_lock,e._release_global_lock)
+    with ThreadPoolExecutor(2) as pool:
+        slow=pool.submit(lp.reconcile_facts,sid_a,monitor=True,apply_lock=locks)
+        try:
+            assert entered.wait(5)
+            other=pool.submit(lp.reconcile_facts,sid_b,monitor=True,apply_lock=locks)
+            result=other.result(timeout=2)
+            assert result[3] is None, result[3]
+            assert _maybe_datetime(s.lp_session(sid_b)['facts_checked_at'])==NOW
+        finally:
+            release.set()
+        slow.result(timeout=5)
+
+
+def test_slow_public_lp_stop_does_not_block_other_fact_publication(tmp_path):
+    e,x,lp,s=setup(tmp_path,2)
+    e.lp_auto_configure(dict(budget_usd='100',target_buy_count=2))
+    e.lp_auto_set_desired_running(True)
+    rows=e.lp_auto_run_once()['intents']
+    sid_a,sid_b=rows[0]['session_id'],rows[1]['session_id']
+    entered,release=Event(),Event()
+    def slow_cancel(order_id):
+        if order_id == 'o1':
+            entered.set()
+            assert release.wait(5)
+        return {'canceled':[order_id]}
+    x.cancel_order=slow_cancel
+    with ThreadPoolExecutor(2) as pool:
+        slow=pool.submit(e.lp_stop,sid_a)
+        try:
+            assert entered.wait(5)
+            other=pool.submit(lp.reconcile_facts,sid_b)
+            result=other.result(timeout=2)
+            assert result[3] is None, result[3]
+            assert _maybe_datetime(s.lp_session(sid_b)['facts_checked_at'])==NOW
+        finally:
+            release.set()
+        assert slow.result(timeout=5)['state']=='review'
+
+
+def test_publication_lock_wait_arms_durable_attention_progress(tmp_path, monkeypatch):
+    from tests import test_lp_auto_pool as venue
+    from copy import deepcopy
+
+    from threading import Event as ThreadEvent
+    class Notifier:
+        def __init__(self):
+            self.calls=[]; self.done=ThreadEvent()
+        def notify(self,title,message):
+            self.calls.append((title,message)); self.done.set()
+
+    e,x,lp,s=setup(tmp_path)
+    notifier=Notifier(); e._notifier=notifier
+    e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
+    e.lp_auto_set_desired_running(True)
+    row=e.lp_auto_run_once()['intents'][0]
+    intent_id,sid=row['intent_id'],row['session_id']
+    read=x.lp_snapshot
+    base_now=NOW
+    monkeypatch.setattr(venue,'NOW',base_now)
+    lp.clock=lambda:venue.NOW
+    locks=(lambda:None,lambda handle:None)
+    result=lp.reconcile_facts(sid,monitor=True,apply_lock=locks)
+    assert result[3]=='execution_lock'
+    intent=e._auto_pool._read()['intents'][intent_id]
+    assert intent['financial_status']=='known', 'a valid facts lease must survive a publication wait'
+    assert intent['reconcile_reason']=='execution_lock'
+    assert intent['publication_pending'] is True
+    assert intent['attention_since']==base_now.isoformat()
+    assert intent['attention_due'] is False and not notifier.calls
+    assert _maybe_datetime(intent['reconcile_retry_at'])==base_now+timedelta(seconds=60)
+    assert intent['reconcile_retry_source']=='fallback_minute'
+
+    monkeypatch.setattr(venue,'NOW',base_now+timedelta(seconds=301))
+    def fresh(request):
+        snapshot=deepcopy(read(request))
+        snapshot['account']['checked_at']=venue.NOW
+        return snapshot
+    x.lp_snapshot=fresh
+    result=lp.reconcile_facts(sid,monitor=True,apply_lock=locks)
+    assert result[3]=='execution_lock'
+    assert notifier.done.wait(2)
+    for _ in range(50):
+        intent=e._auto_pool._read()['intents'][intent_id]
+        if intent.get('attention_due') is False:
+            break
+        time.sleep(.01)
+    intent=e._auto_pool._read()['intents'][intent_id]
+    assert intent['attention_due'] is False
+    assert intent['attention_notified'] is True
+    assert len(notifier.calls)==1
+
+
+def test_trade_claim_advances_both_fences_and_rejects_stale_claim(tmp_path):
+    e,x,lp,s=setup(tmp_path)
+    sid='claim-session'
+    s.lp_create_session(sid,sid,state='entry_open',payload=dict(condition_id='a',token_id='a'))
+    session=s.lp_session(sid)
+    before_trade=s.lp_session_revision(sid,trading=True)
+    before_generation=s.lp_trade_generation()
+    claims=s.lp_claim_trade_actions(
+        sid,trade_revision=before_trade,trade_generation=before_generation,
+        actions=[(f'{sid}:test-cancel:o1',dict(role='reconciliation_cancel',order_id='o1'))],
+        patch=dict(entry_cancel_requested=True))
+    assert len(claims)==1
+    assert s.lp_session_revision(sid,trading=True)==before_trade+1
+    assert s.lp_trade_generation()==before_generation+1
+    assert s.lp_session(sid)['facts_error']=='trade_change_pending'
+    assert s.lp_claim_trade_actions(
+        sid,trade_revision=before_trade,trade_generation=before_generation,
+        actions=[(f'{sid}:test-cancel:o2',dict(role='reconciliation_cancel',order_id='o2'))],
+        patch=dict(entry_cancel_requested=True))==[]
+    assert s.lp_session_revision(sid,trading=True)==before_trade+1
+    assert s.lp_trade_generation()==before_generation+1
+
+
+def test_concurrent_monitor_and_manual_protected_sell_claim_one_intent(tmp_path):
+    from threading import Event
+    e,x,lp,s=setup(tmp_path)
+    sid='sell-session'; now=NOW; request=_manual_request(now)
+    s.lp_create_session(sid,sid,state='stop_loss_exit',payload={
+        **request,'position_reconciled':True,'residual_quantity':Decimal('10'),
+        'entry_order_id':'old-buy','owned_order_ids':['old-buy']})
+    row=s.lp_session_with_revision(sid,trading=True)
+    assert row is not None
+    session,expected_revision=row
+    generation=s.lp_trade_generation()
+    snapshot=dict(book=dict(received_at=now,bids=[dict(price='.40',size='100')]))
+    entered,release=Event(),Event()
+    def sell(**kwargs):
+        entered.set(); assert release.wait(5)
+        return {'order_id':'sell-one','status':'LIVE'}
+    x.submit_protected_sell=sell
+    with ThreadPoolExecutor(2) as pool:
+        sender=pool.submit(lp._submit_protected_exit,session,Decimal('10'),snapshot,
+                           trade_generation=generation,
+                           expected_trade_revision=expected_revision)
+        assert entered.wait(5)
+        stale=pool.submit(lp._submit_protected_exit,session,Decimal('10'),snapshot,
+                          trade_generation=generation,
+                          expected_trade_revision=expected_revision)
+        try:
+            assert stale.result(timeout=2) is None
+        finally:
+            release.set()
+        sender.result(timeout=5)
+    submits=[a for a in s.lp_actions(sid) if a.get('role')=='protected_exit']
+    assert len(submits)==1 and submits[0]['state']=='accepted'
+    assert submits[0]['order_id']=='sell-one'
+
+
+def test_retry_plan_uses_actual_future_not_expired_previous(tmp_path):
+    from open_trader.polymarket_lp_auto import _reconcile_retry_plan
+    assert _reconcile_retry_plan('read_failed',NOW,previous=NOW+timedelta(seconds=120)) == (
+        NOW+timedelta(seconds=120),'existing_plan')
+    assert _reconcile_retry_plan('read_failed',NOW,previous=NOW-timedelta(seconds=120),
+                                 scheduled_at=NOW+timedelta(seconds=30)) == (
+        NOW+timedelta(seconds=30),'read_failed')
+    fallback=_reconcile_retry_plan('read_failed',NOW,previous=NOW-timedelta(seconds=120))
+    assert fallback==(NOW+timedelta(seconds=60),'fallback_minute')
+    assert _reconcile_retry_plan('rate_limited',NOW,scheduled_at=NOW+timedelta(seconds=459)) == (
+        NOW+timedelta(seconds=459),'rate_limited')
+
+
+def test_local_trade_change_invalidates_retained_shared_facts(tmp_path):
+    e,x,lp,s=setup(tmp_path,2)
+    sid='session-a'; other='session-b'
+    s.lp_create_session(sid,sid,state='entry_open',payload=dict(condition_id='a',token_id='a'))
+    s.lp_create_session(other,other,state='entry_open',payload=dict(condition_id='b',token_id='b'))
+    for _ in range(100):
+        s.lp_register_trade_change(sid)
+    snapshot={'account':{'checked_at':NOW}}
+    generation=s.lp_trade_generation()
+    lp._retain_pending_facts(s.lp_session(sid),snapshot,1,generation)
+    assert lp._take_pending_facts(s.lp_session(sid),1,generation)==snapshot
+    lp._retain_pending_facts(s.lp_session(sid),snapshot,1,generation)
+    s.lp_register_trade_change(other)
+    changed_generation=s.lp_trade_generation()
+    assert changed_generation>generation
+    assert lp._take_pending_facts(s.lp_session(sid),1,changed_generation) is None
+
+
+def test_manual_stale_account_cannot_settle_zero_position(tmp_path):
+    now=NOW
+    class Exchange:
+        config=SimpleNamespace(wallet_address='test-wallet')
+        def lp_snapshot(self,request):
+            d=dict(account=dict(authenticated=True,wallet_address='test-wallet',balance='100',allowance='100',
+                 checked_at=now-timedelta(seconds=61),open_orders=[],positions=[],
+                 open_orders_complete=True,positions_complete=True),
+                 market=None,book=None,orders=[],trades=[],
+                 market_read_errors={'m00':{'error_type':'OSError'}})
+            return d
+    store=PredictionArbitrageStore(tmp_path/'state.sqlite')
+    exchange=Exchange()
+    lp=PolymarketLPService(store,exchange,clock=lambda:now)
+    engine=PredictionExecutionService(store=store,monitor=SimpleNamespace(),trading=exchange,
+        notifier=SimpleNamespace(),lock_path=tmp_path/'execution.lock',lp=lp)
+    request={**_manual_request(now),'entry_order_id':'o1','owned_order_ids':['o1'],
+             'submit_status':'accepted'}
+    store.lp_create_session('manual','manual',state='entry_open',payload=request)
+    result=lp.reconcile_facts('manual')
+    assert result[3]=='account_facts_stale'
+    session=store.lp_session('manual')
+    assert session['state']=='entry_open'
+    assert session['facts_error']=='account_facts_stale'
+    assert _maybe_decimal(session.get('reserved_usd')) == Decimal('4')
+
+
+def test_session_missing_and_duplicate_identity_arm_attention(tmp_path):
+    e,x,lp,s=setup(tmp_path)
+    e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
+    e.lp_auto_set_desired_running(True)
+    pool=e._auto_pool
+    class Notifier:
+        def __init__(self): self.calls=[]
+        def notify(self,title,message): self.calls.append((title,message))
+    notifier=Notifier(); e._notifier=notifier
+    def add_missing(d):
+        d['intents']['missing']={
+            'intent_id':'missing','session_id':'absent','state':'active',
+            'created_at':NOW.isoformat(),'reserved_usd':'0',
+        }
+    pool._update(add_missing)
+    pool._reconcile_intent(pool._read()['intents']['missing'],reuse=False)
+    intent=pool._read()['intents']['missing']
+    assert intent['reconcile_reason']=='session_missing'
+    assert intent['manual_attention'] is True
+    assert intent['attention_since']==NOW.isoformat()
+
+    pool._update(lambda d:d['intents'].pop('missing',None))
+    row=e.lp_auto_run_once()['intents'][0]
+    sid=row['session_id']; intent_id=row['intent_id']
+    session=s.lp_session(sid)
+    assert session is not None and session.get('entry_order_id')
+    def add_duplicate(d):
+        other=dict(d['intents'][intent_id]); other['intent_id']='other'
+        other['order_id']=session['entry_order_id']
+        d['intents']['other']=other
+    pool._update(add_duplicate)
+    pool._record_session(intent_id,s.lp_session(sid))
+    intents=pool._read()['intents']
+    assert intents[intent_id]['reconcile_reason']=='duplicate_order_identity'
+    assert intents[intent_id]['manual_attention'] is True
+    assert intents[intent_id]['attention_since']==NOW.isoformat()
+
+
+def test_reconciliation_attention_notifies_once_then_recovery_once(tmp_path, monkeypatch):
+    from tests import test_lp_auto_pool as venue
+    from copy import deepcopy
+
+    class Notifier:
+        def __init__(self): self.calls=[]
+        def notify(self,title,message): self.calls.append((title,message))
+
+    e,x,lp,s=setup(tmp_path)
+    notifier=Notifier()
+    e._notifier=notifier
+    e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
+    e.lp_auto_set_desired_running(True)
+    r=e.lp_auto_run_once()
+    intent_id=r['intents'][0]['intent_id']
+    sid=r['intents'][0]['session_id']
+    read=x.lp_snapshot
+    base_now=NOW
+    monkeypatch.setattr(venue,'NOW',base_now)
+    lp.clock=lambda:venue.NOW
+    x.lp_snapshot=lambda request: (_ for _ in ()).throw(OSError('account unavailable'))
+    e.lp_auto_reconcile_unknown()
+    d=e._auto_pool._read()['intents'][intent_id]
+    assert d['attention_since'] and d['attention_due'] is False
+    assert not d.get('attention_notified') and not notifier.calls
+
+    monkeypatch.setattr(venue,'NOW',base_now+timedelta(seconds=301))
+    e.lp_auto_reconcile_unknown()
+    thread = lp._attention_thread
+    if thread is not None:
+        thread.join(timeout=2)
+    d=e._auto_pool._read()['intents'][intent_id]
+    assert d['attention_due'] is False
+    assert d['attention_notified'] is True and len(notifier.calls)==1
+
+    monkeypatch.setattr(venue,'NOW',base_now+timedelta(seconds=302))
+    e.lp_auto_reconcile_unknown()
+    assert len(notifier.calls)==1, 'a continuing episode must not repeat'
+
+    recovery_now=base_now+timedelta(seconds=303)
+    monkeypatch.setattr(venue,'NOW',recovery_now)
+    def fresh_read(request):
+        snapshot=deepcopy(read(request))
+        snapshot['account']['checked_at']=recovery_now
+        return snapshot
+    x.lp_snapshot=fresh_read
+    e.lp_auto_reconcile_unknown()
+    thread = lp._attention_thread
+    if thread is not None:
+        thread.join(timeout=2)
+    d=e._auto_pool._read()['intents'][intent_id]
+    assert d['financial_status']=='known'
+    assert not d.get('attention_since') and not d.get('attention_notified')
+    assert len(notifier.calls)==2
+    assert '恢复' in notifier.calls[1][1]
+
+
+def test_reconciliation_attention_send_failure_retries_then_recovers(tmp_path, monkeypatch):
+    from tests import test_lp_auto_pool as venue
+    from copy import deepcopy
+
+    class Notifier:
+        def __init__(self): self.calls=[]; self.fail=True
+        def notify(self,title,message):
+            self.calls.append((title,message))
+            if self.fail: raise RuntimeError('channel unavailable')
+
+    e,x,lp,s=setup(tmp_path)
+    notifier=Notifier(); e._notifier=notifier
+    e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
+    e.lp_auto_set_desired_running(True)
+    r=e.lp_auto_run_once(); intent_id=r['intents'][0]['intent_id']
+    read=x.lp_snapshot; base_now=NOW
+    monkeypatch.setattr(venue,'NOW',base_now); lp.clock=lambda:venue.NOW
+    fail=lambda request: (_ for _ in ()).throw(OSError('account unavailable'))
+    x.lp_snapshot=fail
+
+    def wait_for_attention():
+        thread=lp._attention_thread
+        if thread is not None:
+            thread.join(timeout=2)
+
+    e.lp_auto_reconcile_unknown()
+    monkeypatch.setattr(venue,'NOW',base_now+timedelta(seconds=301))
+    e.lp_auto_reconcile_unknown(); wait_for_attention()
+    d=e._auto_pool._read()['intents'][intent_id]
+    assert d['attention_notified'] is False and d['attention_due'] is True
+    assert d['attention_send_error']=='notification_delivery_failed'
+    assert len(notifier.calls)==1
+
+    monkeypatch.setattr(venue,'NOW',base_now+timedelta(seconds=302))
+    e.lp_auto_reconcile_unknown(); wait_for_attention()
+    assert len(notifier.calls)==1
+
+    notifier.fail=False
+    monkeypatch.setattr(venue,'NOW',base_now+timedelta(seconds=362))
+    e.lp_auto_reconcile_unknown(); wait_for_attention()
+    d=e._auto_pool._read()['intents'][intent_id]
+    assert d['attention_notified'] is True and d['attention_due'] is False
+    assert len(notifier.calls)==2
+
+    monkeypatch.setattr(venue,'NOW',base_now+timedelta(seconds=363))
+    e.lp_auto_reconcile_unknown(); wait_for_attention()
+    assert len(notifier.calls)==2
+
+    recovery_now=base_now+timedelta(seconds=364)
+    monkeypatch.setattr(venue,'NOW',recovery_now)
+    def fresh_read(request):
+        snapshot=deepcopy(read(request)); snapshot['account']['checked_at']=recovery_now
+        return snapshot
+    x.lp_snapshot=fresh_read
+    e.lp_auto_reconcile_unknown(); wait_for_attention()
+    d=e._auto_pool._read()['intents'][intent_id]
+    assert d['financial_status']=='known' and not d.get('attention_since')
+    assert len(notifier.calls)==3 and '恢复' in notifier.calls[2][1]
+
+
+def test_blocked_recovery_callback_cannot_overwrite_new_fault_episode(tmp_path, monkeypatch):
+    from tests import test_lp_auto_pool as venue
+    from copy import deepcopy
+
+    e,x,lp,s=setup(tmp_path)
+    entered,release=Event(),Event()
+    class Notifier:
+        def __init__(self): self.calls=[]
+        def notify(self,title,message):
+            if '恢复' in title:
+                entered.set()
+                assert release.wait(5)
+            self.calls.append((title,message))
+    e._notifier=Notifier()
+    e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
+    e.lp_auto_set_desired_running(True)
+    r=e.lp_auto_run_once(); intent_id=r['intents'][0]['intent_id']
+    read=x.lp_snapshot; base_now=NOW
+    monkeypatch.setattr(venue,'NOW',base_now); lp.clock=lambda:venue.NOW
+    fail=lambda request: (_ for _ in ()).throw(OSError('account unavailable'))
+    x.lp_snapshot=fail
+    e.lp_auto_reconcile_unknown()
+    monkeypatch.setattr(venue,'NOW',base_now+timedelta(seconds=301))
+    e.lp_auto_reconcile_unknown()
+    thread=lp._attention_thread
+    if thread is not None: thread.join(timeout=2)
+    assert len(e._notifier.calls)==1
+
+    recovery_now=base_now+timedelta(seconds=302)
+    monkeypatch.setattr(venue,'NOW',recovery_now)
+    def fresh_read(request):
+        snapshot=deepcopy(read(request)); snapshot['account']['checked_at']=recovery_now
+        return snapshot
+    x.lp_snapshot=fresh_read
+    e.lp_auto_reconcile_unknown()
+    assert entered.wait(2)
+    monkeypatch.setattr(venue,'NOW',base_now+timedelta(seconds=303))
+    x.lp_snapshot=fail
+    e.lp_auto_reconcile_unknown()
+    current=e._auto_pool._read()['intents'][intent_id]
+    assert current['financial_status']=='unknown'
+    assert not current.get('attention_recovery_due')
+    assert current['attention_since']==(base_now+timedelta(seconds=303)).isoformat()
+    assert current.get('attention_notified') is False
+
+    thread=lp._attention_thread
+    release.set()
+    if thread is not None: thread.join(timeout=2)
+    after=e._auto_pool._read()['intents'][intent_id]
+    assert after['financial_status']=='unknown'
+    assert after.get('attention_since')
+    assert not after.get('attention_recovery_due')
+
+    monkeypatch.setattr(venue,'NOW',base_now+timedelta(seconds=604))
+    e.lp_auto_reconcile_unknown()
+    thread=lp._attention_thread
+    if thread is not None: thread.join(timeout=2)
+    final=e._auto_pool._read()['intents'][intent_id]
+    assert [title for title,message in e._notifier.calls] == [
+        'LP 核对持续失败', 'LP 核对已恢复', 'LP 核对持续失败'
+    ]
+    assert final['attention_since']==(base_now+timedelta(seconds=303)).isoformat()
+    assert final['attention_notified'] is True and final['attention_due'] is False
+
+    monkeypatch.setattr(venue,'NOW',base_now+timedelta(seconds=605))
+    e.lp_auto_reconcile_unknown()
+    thread=lp._attention_thread
+    if thread is not None: thread.join(timeout=2)
+    assert len(e._notifier.calls)==3
+
+
+def test_partial_fault_recovery_gives_new_fault_its_own_episode(
+    tmp_path, monkeypatch
+):
+    from copy import deepcopy
+
+    from open_trader.notifications import (
+        CompositeNotifier,
+        FeishuWebhookNotifier,
+        XiaoaiSSHNotifier,
+    )
+
+    class Feishu(FeishuWebhookNotifier):
+        def __init__(self, calls):
+            self.calls = calls
+
+        def notify(self, title, message):
+            self.calls.append(title)
+
+    class Xiaoai(XiaoaiSSHNotifier):
+        def __init__(self, calls):
+            super().__init__(host="fake", ssh_key=Path("/tmp/key"))
+            self.calls = calls
+            self.fail = True
+
+        def notify(self, title, message):
+            if self.fail:
+                raise RuntimeError("voice channel unavailable")
+            self.calls.append(title)
+
+    e, x, lp, s = setup(tmp_path)
+    calls: list[str] = []
+    voice = Xiaoai(calls)
+    e._notifier = CompositeNotifier([Feishu(calls), voice])
+    e.lp_auto_configure(dict(budget_usd="100", target_buy_count=1))
+    e.lp_auto_set_desired_running(True)
+    row = e.lp_auto_run_once()
+    intent_id = row["intents"][0]["intent_id"]
+    read = x.lp_snapshot
+    base_now = NOW
+    from tests import test_lp_auto_pool as venue
+
+    monkeypatch.setattr(venue, "NOW", base_now)
+    lp.clock = lambda: venue.NOW
+
+    def wait_for_calls(count):
+        thread = lp._attention_thread
+        if thread is not None:
+            thread.join(timeout=2)
+        assert len(calls) == count
+
+    def failed_read(_request):
+        raise OSError("account unavailable")
+
+    x.lp_snapshot = failed_read
+    e.lp_auto_reconcile_unknown()
+    monkeypatch.setattr(venue, "NOW", base_now + timedelta(seconds=300))
+    e.lp_auto_reconcile_unknown()
+    wait_for_calls(1)
+    current = e._auto_pool._read()["intents"][intent_id]
+    assert current["attention_notified"] is False
+    assert current["attention_delivered_channels"] == ["feishu"]
+    assert calls == ["LP 核对持续失败"]
+
+    voice.fail = False
+    recovery_now = base_now + timedelta(seconds=301)
+    monkeypatch.setattr(venue, "NOW", recovery_now)
+
+    def fresh_read(request):
+        snapshot = deepcopy(read(request))
+        snapshot["account"]["checked_at"] = recovery_now
+        return snapshot
+
+    x.lp_snapshot = fresh_read
+    e.lp_auto_reconcile_unknown()
+    wait_for_calls(2)
+    recovered = e._auto_pool._read()["intents"][intent_id]
+    assert recovered["financial_status"] == "known"
+    assert not recovered.get("attention_since")
+    assert calls == ["LP 核对持续失败", "LP 核对已恢复"]
+
+    monkeypatch.setattr(venue, "NOW", base_now + timedelta(seconds=302))
+    lp.clock = lambda: venue.NOW
+    x.lp_snapshot = failed_read
+    e.lp_auto_reconcile_unknown()
+    renewed = e._auto_pool._read()["intents"][intent_id]
+    assert renewed["attention_since"] == (
+        base_now + timedelta(seconds=302)
+    ).isoformat()
+    assert renewed["attention_notified"] is False
+
+    monkeypatch.setattr(venue, "NOW", base_now + timedelta(seconds=601))
+    e.lp_auto_reconcile_unknown()
+    assert calls == ["LP 核对持续失败", "LP 核对已恢复"]
+
+    monkeypatch.setattr(venue, "NOW", base_now + timedelta(seconds=602))
+    e.lp_auto_reconcile_unknown()
+    wait_for_calls(4)
+    final = e._auto_pool._read()["intents"][intent_id]
+    assert calls == [
+        "LP 核对持续失败",
+        "LP 核对已恢复",
+        "LP 核对持续失败",  # New episode reaches both channels once.
+        "LP 核对持续失败",
+    ]
+    assert final["attention_since"] == (
+        base_now + timedelta(seconds=302)
+    ).isoformat()
+    assert final["attention_notified"] is True
+
+
+def test_attention_worker_exception_is_restartable(tmp_path, monkeypatch):
+    from tests import test_lp_auto_pool as venue
+
+    e,x,lp,s=setup(tmp_path)
+    calls=[]
+    class Notifier:
+        def notify(self,title,message): calls.append((title,message))
+    e._notifier=Notifier()
+    e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
+    e.lp_auto_set_desired_running(True)
+    r=e.lp_auto_run_once(); row=r['intents'][0]
+    pool=e._auto_pool
+    pool._update(lambda d:d['intents'][row['intent_id']].update(
+        attention_since=(NOW-timedelta(seconds=301)).isoformat(),
+        attention_due=True,reconcile_error='account_unavailable'))
+    original=pool._read; failures=[True]
+    def broken_read():
+        if failures:
+            failures.pop(); raise RuntimeError('transient ledger read')
+        return original()
+    monkeypatch.setattr(pool,'_read',broken_read)
+    lp._schedule_session_attention(row['session_id'])
+    thread=lp._attention_thread
+    if thread is not None: thread.join(timeout=2)
+    assert calls==[] and lp._attention_thread is None
+
+    lp._schedule_session_attention(row['session_id'])
+    thread=lp._attention_thread
+    if thread is not None: thread.join(timeout=2)
+    assert len(calls)==1
+
+
+def test_session_progress_uses_exact_hidden_ledger_reservation(tmp_path):
+    e,x,lp,s=setup(tmp_path)
+    e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
+    e.lp_auto_set_desired_running(True)
+    row=e.lp_auto_run_once()['intents'][0]
+    progress=e._lp_session_progress(s.lp_session(row['session_id']))
+    assert Decimal(progress['reserved_usd'])==Decimal(row['reserved_usd'])==Decimal('8')
+    assert progress['reason'] is None
+    assert progress['next_action']=='review_deadline'
+    assert progress['manual_attention'] is False
+    projected=e.lp_auto_state(include_intents=False)
+    assert 'intents' not in projected
+
+
+@pytest.mark.parametrize('partial', [False, True])
+def test_recovery_during_fault_send_delivers_recovery_to_successful_channels(tmp_path, monkeypatch, partial):
+    from copy import deepcopy
+    from open_trader.notifications import CompositeNotifier, FeishuWebhookNotifier, XiaoaiSSHNotifier
+    from tests import test_lp_auto_pool as venue
+
+    engine, exchange, lp, _ = setup(tmp_path)
+    entered, release = Event(), Event()
+    calls = []
+
+    class Feishu(FeishuWebhookNotifier):
+        def __init__(self): pass
+        def notify(self, title, message):
+            if title == 'LP 核对持续失败':
+                entered.set()
+                assert release.wait(5)
+            calls.append(('feishu', title))
+
+    class Voice(XiaoaiSSHNotifier):
+        def __init__(self): pass
+        def notify(self, title, message):
+            if partial:
+                raise RuntimeError('voice unavailable')
+            calls.append(('xiaoai', title))
+
+    engine._notifier = CompositeNotifier([Feishu(), Voice()])
+    engine.lp_auto_configure(dict(budget_usd='100', target_buy_count=1))
+    engine.lp_auto_set_desired_running(True)
+    intent_id = engine.lp_auto_run_once()['intents'][0]['intent_id']
+    read = exchange.lp_snapshot
+    base = venue.NOW
+    lp.clock = lambda: venue.NOW
+    exchange.lp_snapshot = lambda request: (_ for _ in ()).throw(OSError('account unavailable'))
+    engine.lp_auto_reconcile_unknown()
+    monkeypatch.setattr(venue, 'NOW', base + timedelta(seconds=300))
+    engine.lp_auto_reconcile_unknown()
+    try:
+        assert entered.wait(2)
+        monkeypatch.setattr(venue, 'NOW', base + timedelta(seconds=301))
+        def recovered_snapshot(request):
+            snapshot = deepcopy(read(request))
+            snapshot['account']['checked_at'] = venue.NOW
+            return snapshot
+        exchange.lp_snapshot = recovered_snapshot
+        engine.lp_auto_reconcile_unknown()
+        assert engine._auto_pool._read()['intents'][intent_id]['financial_status'] == 'known'
+    finally:
+        release.set()
+        thread = lp._attention_thread
+        if thread is not None:
+            thread.join(timeout=3)
+    channels = ['feishu'] if partial else ['feishu', 'xiaoai']
+    assert calls == [(channel, title) for title in ('LP 核对持续失败', 'LP 核对已恢复') for channel in channels]
+    intent = engine._auto_pool._read()['intents'][intent_id]
+    assert not intent.get('attention_due') and not intent.get('attention_recovery_due')

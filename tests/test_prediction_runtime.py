@@ -20,11 +20,17 @@ from open_trader.prediction_runtime import (
     PredictionRuntime,
     PredictionRuntimeOwnershipError,
     _CrossVenueRuntime,
+    _deliver_lp_protection_with_runtime,
     _UnavailableCrossVenueMonitor,
     _RuntimeOwnershipLock,
 )
 from open_trader.llm_providers import PROVIDER_IDS, LlmCompletion
-from open_trader.notifications import FeishuWebhookNotifier, NullNotifier
+from open_trader.notifications import (
+    CompositeNotifier,
+    FeishuWebhookNotifier,
+    NullNotifier,
+    XiaoaiSSHNotifier,
+)
 from open_trader.predict_cross_venue import (
     LlmCrossVenueEquivalenceValidator,
     ExplicitMarketPair,
@@ -274,6 +280,89 @@ def test_runtime_constructor_is_side_effect_free(tmp_path: Path) -> None:
     assert runtime.execution is None
 
 
+def test_lp_runtime_notification_reports_each_channel() -> None:
+    voice_calls: list[str] = []
+
+    class _Xiaoai(XiaoaiSSHNotifier):
+        def notify(self, title: str, message: str) -> None:
+            voice_calls.append(message)
+
+    feishu_calls: list[str] = []
+    execution = SimpleNamespace(
+        _deliver_feishu_notification=lambda title, message: (
+            feishu_calls.append(message) or True
+        )
+    )
+    notifier = CompositeNotifier([_Xiaoai(host="fake", ssh_key=Path("/tmp/key"))])
+
+    both = _deliver_lp_protection_with_runtime(
+        execution, notifier, "title", "message", "voice"
+    )
+    only_voice = _deliver_lp_protection_with_runtime(
+        execution,
+        notifier,
+        "title",
+        "retry",
+        "voice-retry",
+        channels={"xiaoai"},
+    )
+
+    assert both == {"feishu": True, "xiaoai": True}
+    assert only_voice == {"xiaoai": True}
+    assert feishu_calls == ["message"]
+    assert voice_calls == ["voice", "voice-retry"]
+    assert _deliver_lp_protection_with_runtime(
+        execution, None, "title", "message", "voice", channels={"xiaoai"}
+    ) == {"xiaoai": False}
+    assert _deliver_lp_protection_with_runtime(
+        SimpleNamespace(_deliver_feishu_notification=lambda *_args: False),
+        notifier,
+        "title",
+        "message",
+        "voice",
+        channels={"feishu"},
+    ) == {"feishu": False}
+
+
+def test_runtime_wires_lp_auto_scheduler_to_execution(tmp_path: Path) -> None:
+    checked = threading.Event()
+
+    class FakeExecution:
+        def __init__(self) -> None:
+            self.scheduler = None
+            self.wakeup = None
+
+        def set_lp_auto_scheduler(self, scheduler: object) -> None:
+            self.scheduler = scheduler
+
+        def set_lp_auto_wakeup(self, wakeup: object) -> None:
+            self.wakeup = wakeup
+
+        def lp_auto_scheduled_check(self) -> None:
+            checked.set()
+
+        def lp_auto_run_once(self) -> None:
+            self.lp_auto_scheduled_check()
+
+    runtime = PredictionRuntime(
+        data_dir=tmp_path,
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+    )
+    execution = FakeExecution()
+    runtime.execution = execution  # type: ignore[assignment]
+    runtime._start_lp_auto_monitor()
+    scheduler = runtime._lp_auto_scheduler
+    try:
+        assert scheduler is not None
+        assert execution.scheduler is scheduler
+        assert execution.wakeup == scheduler.request_check
+        assert scheduler.snapshot()["scheduler_running"] is True
+        assert checked.wait(2)
+    finally:
+        scheduler.stop()
+
+
 def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -353,6 +442,10 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
             now = datetime.now(UTC)
             return {
                 "account": {
+                    "wallet_address": "0xwallet",
+                    "open_orders_complete": True,
+                    "positions_complete": True,
+                    "checked_at": datetime.now(UTC),
                     "authenticated": True,
                     "balance": Decimal("100"),
                     "allowance": Decimal("100"),
@@ -1281,6 +1374,7 @@ def test_lp_report_waits_for_restart_reconciliation(
     now = FrozenDateTime(2026, 9, 15, 0, 3, tzinfo=UTC)
 
     class Trading:
+        config = SimpleNamespace(wallet_address="0x2222222222222222222222222222222222222222")
         def __init__(self) -> None:
             self.snapshot_started = threading.Event()
             self.release_snapshot = threading.Event()
@@ -1291,6 +1385,10 @@ def test_lp_report_waits_for_restart_reconciliation(
             assert self.release_snapshot.wait(timeout=5)
             return {
                 "account": {
+                    "wallet_address": "0x2222222222222222222222222222222222222222",
+                    "open_orders_complete": True,
+                    "positions_complete": True,
+                    "checked_at": now,
                     "authenticated": True,
                     "balance": Decimal("100"),
                     "allowance": Decimal("100"),
@@ -1501,6 +1599,7 @@ def test_lp_dashboard_refresh_cannot_block_risk_monitor(
             self._lock = threading.Lock()
 
     class FakeTrading:
+        config = SimpleNamespace(wallet_address="0x2222222222222222222222222222222222222222")
         def __init__(self, probe: RewardProbe) -> None:
             self.probe = probe
 
@@ -1512,6 +1611,10 @@ def test_lp_dashboard_refresh_cannot_block_risk_monitor(
                 self.probe.risk_snapshot_started.set()
             return {
                 "account": {
+                    "wallet_address": "0x2222222222222222222222222222222222222222",
+                    "open_orders_complete": True,
+                    "positions_complete": True,
+                    "checked_at": datetime.now(UTC),
                     "authenticated": True,
                     "open_orders": [
                         {

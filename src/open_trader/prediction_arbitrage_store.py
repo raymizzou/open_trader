@@ -4254,6 +4254,16 @@ class PredictionArbitrageStore:
                     "alert_state": None,
                     "last_error": None,
                     "next_retry_at": None,
+                    "fault_started_at": None,
+                    "fault_alert_attempts": 0,
+                    "fault_alert_state": None,
+                    "fault_alert_next_at": None,
+                    "fault_alert_sent_at": None,
+                    "recovery_alert_state": None,
+                    "recovery_alert_attempts": 0,
+                    "recovery_alert_next_at": None,
+                    "recovery_alert_claimed_at": None,
+                    "recovery_alert_sent_at": None,
                 }
             )
             connection.execute(
@@ -5109,6 +5119,107 @@ class PredictionArbitrageStore:
             assert updated is not None
             return self._lp_row_result(updated)
 
+    def lp_mark_queue_protection_notified(
+        self,
+        session_id: str,
+        *,
+        level_key: str,
+        field: str,
+        episode: str,
+        order_id: str,
+    ) -> dict[str, object]:
+        """Mark exactly the still-present bucket that armed this episode."""
+        now = _utc_now()
+        key = str(level_key)
+        field = str(field)
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM lp_sessions WHERE session_id=?", (str(session_id),)
+            ).fetchone()
+            if row is None:
+                raise ValueError("lp_session_not_found")
+            payload = _load_payload(str(row["payload"]))
+            current = payload.get("queue_protection")
+            levels = current.get("levels") if isinstance(current, Mapping) else None
+            if not isinstance(current, Mapping) or not isinstance(levels, Mapping):
+                return self._lp_row_result(row)
+            bucket = levels.get(key)
+            if not isinstance(bucket, Mapping):
+                return self._lp_row_result(row)
+            if (
+                bucket.get(field) is True
+                or str(bucket.get("notification_episode") or "") != str(episode)
+                or str(bucket.get("order_id") or "") != str(order_id)
+            ):
+                return self._lp_row_result(row)
+            merged_levels = dict(levels)
+            merged_bucket = dict(bucket)
+            merged_bucket[field] = True
+            merged_levels[key] = merged_bucket
+            payload["queue_protection"] = {**current, "levels": merged_levels}
+            payload["_lp_revision"] = self._lp_payload_revision(payload) + 1
+            connection.execute(
+                "UPDATE lp_sessions SET payload=?,updated_at=? WHERE session_id=?",
+                (_dump_execution_payload(payload), now, str(session_id)),
+            )
+            updated = connection.execute(
+                "SELECT * FROM lp_sessions WHERE session_id=?", (str(session_id),)
+            ).fetchone()
+            assert updated is not None
+            return self._lp_row_result(updated)
+
+    def lp_arm_queue_protection_notification(
+        self,
+        session_id: str,
+        *,
+        level_key: str,
+        episode: str,
+        order_id: str,
+    ) -> bool:
+        """Persist a bucket notice identity before any network send."""
+        now = _utc_now()
+        key = str(level_key)
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM lp_sessions WHERE session_id=?", (str(session_id),)
+            ).fetchone()
+            if row is None:
+                return False
+            payload = _load_payload(str(row["payload"]))
+            current = payload.get("queue_protection")
+            levels = current.get("levels") if isinstance(current, Mapping) else None
+            if isinstance(current, Mapping) and "levels" not in current:
+                # Existing single-price sessions are normalized on their first
+                # write; an explicitly empty/deleted levels map stays empty.
+                if str(current.get("baseline_price")) != key:
+                    return False
+                legacy = dict(current)
+                legacy.setdefault("order_id", payload.get("entry_order_id"))
+                levels = {key: legacy}
+            if not isinstance(current, Mapping) or not isinstance(levels, Mapping):
+                return False
+            bucket = levels.get(key)
+            if not isinstance(bucket, Mapping):
+                return False
+            if bucket.get("notification_sent") is True:
+                return True
+            if (
+                str(bucket.get("notification_episode") or "") not in {"", str(episode)}
+                or str(bucket.get("order_id") or "") != str(order_id)
+            ):
+                return False
+            merged_levels = dict(levels)
+            merged_bucket = dict(bucket)
+            merged_bucket["notification_episode"] = str(episode)
+            merged_levels[key] = merged_bucket
+            payload["queue_protection"] = {**current, "version": 2, "levels": merged_levels}
+            payload["_lp_revision"] = self._lp_payload_revision(payload) + 1
+            connection.execute(
+                "UPDATE lp_sessions SET payload=?,updated_at=? WHERE session_id=?",
+                (_dump_execution_payload(payload), now, str(session_id)),
+            )
+            return True
+
     @staticmethod
     def _lp_first_seen_row_result(row: sqlite3.Row) -> dict[str, object]:
         payload = _load_payload(str(row["payload"]))
@@ -5342,16 +5453,19 @@ class PredictionArbitrageStore:
         *,
         expected_generation: int | None = None,
         expected_trade_revision: int | None = None,
+        patch: Mapping[str, object] | None = None,
+        state: str | None = None,
+        reject_existing: bool = False,
     ) -> list[dict[str, object]]:
-        """Atomically authorize a batch of pending trading actions.
+        """Authorize trading actions and optionally patch their session atomically.
 
         A shared-bundle caller must pass its observed generation. Pass a
         captured session revision where that action's contract requires it;
-        each supplied fence is checked. The checks and every pending insert
-        share one SQLite transaction, so a lost race cannot leave one action
-        authorized while another is rejected.
-        Existing action payload fields (including ``targets`` and
-        ``order_id``) are preserved for recovery consumers.
+        each supplied fence is checked. The checks, session patch, and every
+        action insert share one SQLite transaction, so a lost race cannot leave
+        one action authorized while another is rejected. ``reject_existing``
+        is the claim boundary for result-unknown BUY/SELL intents; the default
+        preserves the existing exact-ID retry/upsert contract.
         """
 
         if not actions:
@@ -5378,15 +5492,43 @@ class PredictionArbitrageStore:
                 raise ValueError("lp_session_not_found")
             session_payload = _load_payload(str(row["payload"]))
             trade_revision = int(session_payload.get("_lp_trade_revision", 0))
-            if expected_trade_revision is not None and trade_revision != int(expected_trade_revision):
-                raise ValueError("account_round_invalid")
-            if expected_generation is not None:
+            stale = (
+                expected_trade_revision is not None
+                and trade_revision != int(expected_trade_revision)
+            )
+            if not stale and expected_generation is not None:
                 generation_row = connection.execute(
                     "SELECT generation FROM lp_trade_generation WHERE singleton=1"
                 ).fetchone()
-                if generation_row is None or int(generation_row["generation"]) != int(expected_generation):
-                    raise ValueError("account_round_invalid")
+                stale = (
+                    generation_row is None
+                    or int(generation_row["generation"]) != int(expected_generation)
+                )
+            if stale:
+                if reject_existing:
+                    return []
+                raise ValueError("account_round_invalid")
+            if reject_existing:
+                placeholders = ",".join("?" for _ in encoded)
+                existing = connection.execute(
+                    f"SELECT 1 FROM lp_actions WHERE action_key IN ({placeholders})",
+                    tuple(key for key, _ in encoded),
+                ).fetchone()
+                if existing is not None:
+                    return []
             self._lp_register_trade_change(connection, str(session_id))
+            if patch is not None or state is not None:
+                fenced = connection.execute(
+                    "SELECT payload FROM lp_sessions WHERE session_id=?",
+                    (str(session_id),),
+                ).fetchone()
+                assert fenced is not None
+                fenced_payload = _load_payload(str(fenced["payload"]))
+                fenced_payload.update(patch or {})
+                connection.execute(
+                    "UPDATE lp_sessions SET payload=?,state=COALESCE(?,state) WHERE session_id=?",
+                    (_dump_execution_payload(fenced_payload), state, str(session_id)),
+                )
             registered: list[dict[str, object]] = []
             for action_key, encoded_payload in encoded:
                 connection.execute(
@@ -5414,6 +5556,145 @@ class PredictionArbitrageStore:
                 registered.append(result)
         self._notify_lp_trade_change(str(session_id))
         return registered
+
+    def lp_claim_trade_actions(
+        self,
+        session_id: str,
+        *,
+        trade_revision: int,
+        trade_generation: int,
+        actions: Iterable[tuple[str, Mapping[str, object]]],
+        patch: Mapping[str, object],
+        state: str | None = None,
+    ) -> list[tuple[str, str, Mapping[str, object]]]:
+        """Thin claim entry over the one fenced-action transaction."""
+        rows = [
+            {"action_key": str(key), "payload": dict(payload)}
+            for key, payload in actions
+        ]
+        try:
+            registered = self.lp_register_fenced_actions(
+                str(session_id),
+                rows,
+                expected_generation=int(trade_generation),
+                expected_trade_revision=int(trade_revision),
+                patch=patch,
+                state=state,
+                reject_existing=True,
+            )
+        except ValueError as exc:
+            if str(exc) == "account_round_invalid":
+                return []
+            raise
+        metadata = {
+            "action_id", "session_id", "action_key", "state",
+            "created_at", "updated_at",
+        }
+        return [
+            (
+                str(row["session_id"]),
+                str(row["action_key"]),
+                {key: value for key, value in row.items() if key not in metadata},
+            )
+            for row in registered
+        ]
+
+    def lp_finish_attention_notification(
+        self,
+        session_id: str,
+        *,
+        recovery: bool,
+        episode: str,
+        results: Mapping[str, bool],
+    ) -> dict[str, object] | None:
+        """Complete the exact durable notification episode after I/O."""
+        now = _utc_now()
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM lp_sessions WHERE session_id=?", (str(session_id),)
+            ).fetchone()
+            if row is None:
+                return None
+            payload = _load_payload(str(row["payload"]))
+            incoming = {str(key): bool(value) for key, value in results.items()}
+            if recovery:
+                if str(payload.get("needs_attention_recovery_episode") or "") != str(episode):
+                    return self._lp_row_result(row)
+                if not payload.get("needs_attention_recovery_due"):
+                    return self._lp_row_result(row)
+                status_key = "needs_attention_recovery_channel_status"
+                due_key = "needs_attention_recovery_due"
+                channels_key = "needs_attention_recovery_channels"
+            else:
+                if str(payload.get("needs_attention_episode") or "") != str(episode):
+                    return self._lp_row_result(row)
+                status_key = "needs_attention_channel_status"
+                channels_key = None
+                if str(row["state"]) != "needs_attention" or not payload.get("needs_attention_due"):
+                    current = payload.get(status_key)
+                    status = {
+                        **{"feishu": False, "xiaoai": False},
+                        **(
+                            {str(key): bool(value) for key, value in current.items()}
+                            if isinstance(current, Mapping) else {}
+                        ),
+                        **incoming,
+                    }
+                    payload["needs_attention_sending"] = False
+                    payload[status_key] = status
+                    succeeded = sorted(key for key, value in status.items() if value)
+                    if succeeded and payload.get("needs_attention_verified_recovery_episode") == str(episode):
+                        payload.update(
+                            needs_attention_recovery_episode=str(episode),
+                            needs_attention_recovery_due=True,
+                            needs_attention_recovery_channels=succeeded,
+                            needs_attention_recovery_channel_status={},
+                            needs_attention_recovery_retry_at=None,
+                        )
+                    connection.execute(
+                        "UPDATE lp_sessions SET payload=?,updated_at=? WHERE session_id=?",
+                        (_dump_execution_payload(payload), now, str(session_id)),
+                    )
+                    updated = connection.execute(
+                        "SELECT * FROM lp_sessions WHERE session_id=?", (str(session_id),)
+                    ).fetchone()
+                    assert updated is not None
+                    return self._lp_row_result(updated)
+                if not payload.get("needs_attention_due"):
+                    return self._lp_row_result(row)
+                due_key = "needs_attention_due"
+            current = payload.get(status_key)
+            status = {
+                **{"feishu": False, "xiaoai": False},
+                **(
+                    {str(key): bool(value) for key, value in current.items()}
+                    if isinstance(current, Mapping) else {}
+                ),
+                **incoming,
+            }
+            raw_channels = payload.get(channels_key) if channels_key else None
+            channels = (
+                [str(value) for value in raw_channels if str(value) in {"feishu", "xiaoai"}]
+                if raw_channels is not None else ["feishu", "xiaoai"]
+            ) or ["feishu", "xiaoai"]
+            delivered = all(status[channel] for channel in channels)
+            payload["needs_attention_sending"] = False
+            payload[status_key] = status
+            payload[due_key] = not delivered
+            if not recovery:
+                payload["needs_attention_notified"] = delivered
+            payload["needs_attention_send_error"] = (
+                None if delivered else "notification_delivery_failed"
+            )
+            connection.execute(
+                "UPDATE lp_sessions SET payload=?,updated_at=? WHERE session_id=?",
+                (_dump_execution_payload(payload), now, str(session_id)),
+            )
+            updated = connection.execute(
+                "SELECT * FROM lp_sessions WHERE session_id=?", (str(session_id),)
+            ).fetchone()
+            assert updated is not None
+            return self._lp_row_result(updated)
 
     def lp_upsert_action(
         self,

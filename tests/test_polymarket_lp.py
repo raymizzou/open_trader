@@ -570,6 +570,14 @@ def test_stop_loss_is_per_opening_and_includes_partial_exits(tmp_path) -> None:
     service = PolymarketLPService(
         PredictionArbitrageStore(tmp_path), exchange, clock=lambda: now
     )
+    cancel = exchange.cancel_order
+
+    def unlocked_cancel(order_id):
+        assert not service._mutex._is_owned(), "venue cancel must not hold publication mutex"
+        assert not service._facts_apply_lock.locked(), "venue cancel must not hold facts apply lock"
+        return cancel(order_id)
+
+    exchange.cancel_order = unlocked_cancel
     preview = service.preview(request)
     started = service.start(str(preview["preview_id"]), "lp-stop-loss-1")
     assert started["state"] in {"entry_open", "entry_submit_pending"}
@@ -906,6 +914,14 @@ def test_scoring_loss_requires_continuous_window(tmp_path) -> None:
     service = PolymarketLPService(
         PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current[0]
     )
+    cancel = exchange.cancel_order
+
+    def unlocked_cancel(order_id):
+        assert not service._mutex._is_owned(), "venue cancel must not hold publication mutex"
+        assert not service._facts_apply_lock.locked(), "venue cancel must not hold facts apply lock"
+        return cancel(order_id)
+
+    exchange.cancel_order = unlocked_cancel
     preview = service.preview(_request(now))
     started = service.start(str(preview["preview_id"]), "lp-scoring-1")
 
@@ -2893,18 +2909,22 @@ def test_lp_snapshot_reuses_connections_but_refreshes_facts_after_read_failure()
         TradingConfig('0x' + '1' * 40, '0x' + '2' * 40), _SDKAccountClient(now),
         public_client_factory=factory)
     first = adapter.lp_snapshot(_request(now))
-    with pytest.raises(ValueError, match='^external_snapshot_unknown$'):
-        adapter.lp_snapshot(_request(now))
+    second = adapter.lp_snapshot(_request(now))
     third = adapter.lp_snapshot(_request(now))
     assert len(clients) == 1, 'reuse the client across successful and failed reads'
     assert clients[0].closed == 0
     assert first['book']['timestamp'] == now + timedelta(seconds=1)
+    assert second['market'] is None and second['book'] is None
+    assert second['market_read_errors']['0x' + 'c' * 64]['error_type'] == 'OSError'
+    assert second['account']['authenticated'] is True
     assert third['book']['timestamp'] == now + timedelta(seconds=3)
     adapter.close()
     adapter.close()
     assert clients[0].closed == 1
-    with pytest.raises(ValueError, match='^external_snapshot_unknown$'):
-        adapter.lp_snapshot(_request(now))
+    stopped = adapter.lp_snapshot(_request(now))
+    assert stopped['market'] is None and stopped['book'] is None
+    assert stopped['market_read_errors']['0x' + 'c' * 64]['error_type'] == 'RuntimeError'
+    assert stopped['account']['authenticated'] is True
     assert len(clients) == 1, 'a stopped adapter must not reopen connections'
 
 
@@ -2912,7 +2932,7 @@ def test_lp_snapshot_shares_client_across_workers_and_defers_close() -> None:
     from concurrent.futures import ThreadPoolExecutor
 
     now = datetime.now(UTC)
-    entered = threading.Barrier(3)
+    entered = threading.Event()
     release = threading.Event()
     clients = []
 
@@ -2920,7 +2940,7 @@ def test_lp_snapshot_shares_client_across_workers_and_defers_close() -> None:
         closed = 0
 
         def get_order_book(self, *, token_id):
-            entered.wait(timeout=5)
+            entered.set()
             assert release.wait(timeout=5)
             assert not self.closed, 'shutdown must let in-flight reads finish'
             return super().get_order_book(token_id=token_id)
@@ -2939,18 +2959,159 @@ def test_lp_snapshot_shares_client_across_workers_and_defers_close() -> None:
     with ThreadPoolExecutor(2) as workers:
         pending = [workers.submit(adapter.lp_snapshot, _request(now)) for _ in range(2)]
         try:
-            entered.wait(timeout=5)
+            assert entered.wait(timeout=5)
             assert len(clients) == 1
             adapter.close()
             assert clients[0].closed == 0
-            with pytest.raises(ValueError, match='^external_snapshot_unknown$'):
-                adapter.lp_snapshot(_request(now))
+            joining = adapter.lp_snapshot(_request(now))
+            assert joining['market'] is None and joining['book'] is None
+            assert joining['market_read_errors']['0x' + 'c' * 64]['error_type'] == (
+                'market_read_in_progress'
+            )
+            assert joining['account']['authenticated'] is True
         finally:
             release.set()
-        assert all(job.result(timeout=5)['book'] for job in pending)
+        first_result, joined_result = [job.result(timeout=5) for job in pending]
+        assert first_result['book'] is not None
+        assert joined_result['market'] is None and joined_result['book'] is None
     assert clients[0].closed == 1
     adapter.close()
     assert clients[0].closed == 1
+
+def test_lp_public_snapshot_reuses_only_matching_fresh_completed_read() -> None:
+    """A late book is not discarded: the matching key is consumed once and
+    removed, while another token under the same condition starts a new read."""
+    entered, release = threading.Event(), threading.Event()
+    reads = []
+    first_market, first_book = object(), object()
+    second_market, second_book = object(), object()
+
+    class Public:
+        def get_market(self, *, id: str):
+            reads.append(("market", id))
+            return second_market if reads.count(("market", id)) > 1 else first_market
+
+        def get_order_book(self, *, token_id: str):
+            reads.append(("book", token_id))
+            if token_id == "0x" + "1" * 64:
+                entered.set()
+                assert release.wait(5)
+                return first_book
+            return second_book
+
+    adapter = PolymarketTradingClient(
+        TradingConfig("0x" + "1" * 40, "0x" + "2" * 40),
+        _SDKAccountClient(datetime.now(UTC)),
+        public_client_factory=Public,
+    )
+    adapter._lp_public_read_timeout = 1.0
+    key = "condition\0token"
+    _, _, _, first_error = adapter._read_lp_public_snapshot(
+        key, "market-1", "0x" + "1" * 64
+    )
+    assert first_error == {
+        "error_type": "TimeoutError",
+        "stage": "market_book",
+    }
+    entered.wait(timeout=5)
+    # The caller has left; the future remains joinable for the next caller.
+    pending = adapter._lp_public_reads[key]
+    release.set()
+    pending.result(timeout=5)
+
+    market, book, received_at, error = adapter._read_lp_public_snapshot(
+        key, "market-1", "0x" + "1" * 64
+    )
+    assert error is None
+    assert market is first_market and book is first_book
+    assert received_at is not None
+    assert key not in adapter._lp_public_reads, "consume the completed result"
+
+    market, book, _, _ = adapter._read_lp_public_snapshot(
+        key, "market-1", "0x" + "2" * 64
+    )
+    assert market is second_market and book is second_book
+    assert key not in adapter._lp_public_reads
+
+
+def test_lp_public_retry_after_uses_fixed_deadline_and_keeps_financial_lane() -> None:
+    from email.message import Message
+    from urllib.error import HTTPError
+
+    from open_trader import polymarket_trading
+
+    now = datetime.now(UTC)
+    public_reads = []
+    account_reads = []
+    account = _SDKAccountClient(now)
+    original_list_orders = account.list_open_orders
+
+    def counting_list_orders():
+        account_reads.append("orders")
+        return original_list_orders()
+
+    account.list_open_orders = counting_list_orders
+
+    class Public(_SDKPublicClient):
+        def get_market(self, *, id: str):
+            public_reads.append(id)
+            if len(public_reads) == 1:
+                headers = Message()
+                headers["Retry-After"] = "120"
+                raise HTTPError(
+                    "https://example.invalid/market", 429, "rate limited", headers, None
+                )
+            return super().get_market(id=id)
+
+    adapter = PolymarketTradingClient(
+        TradingConfig("0x" + "1" * 40, "0x" + "2" * 40),
+        account,
+        public_client_factory=lambda: Public(now),
+    )
+    request = _request(now)
+    key = f"{request['condition_id']}\0{request['token_id']}"
+    clock = {"monotonic": 1000.0}
+    fake_time = SimpleNamespace(
+        monotonic=lambda: clock["monotonic"],
+        time=lambda: datetime.now(UTC).timestamp(),
+    )
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(polymarket_trading, "time", fake_time)
+        first = adapter._read_lp_public_snapshot(
+            key, "market-1", "0x" + "1" * 64, wait=False
+        )
+        assert first[3]["error_type"] == "market_read_in_progress"
+        with pytest.raises(HTTPError):
+            adapter._lp_public_reads[key].result(timeout=5)
+        assert len(public_reads) == 1
+
+        clock["monotonic"] += 60
+        late = adapter._read_lp_public_snapshot(
+            key, "market-1", "0x" + "1" * 64, wait=True
+        )
+        assert late[3]["status"] == 429
+        assert late[3]["retry_after_seconds"] == 60
+        assert len(public_reads) == 1
+
+        financial = adapter.lp_snapshot(
+            {**request, "lp_public_wait": False}
+        )
+        assert financial["account"]["authenticated"] is True
+        assert financial["market_read_errors"]["0x" + "c" * 64]["retry_after_seconds"] == 60
+        assert len(account_reads) >= 1
+        assert len(public_reads) == 1
+
+        clock["monotonic"] += 61
+        market, book, received_at, error = adapter._read_lp_public_snapshot(
+            key, "market-1", "0x" + "1" * 64, wait=True
+        )
+        assert error is None and market is not None and book is not None
+        assert received_at is not None
+        assert len(public_reads) == 2
+    finally:
+        monkeypatch.undo()
+        adapter.close()
 
 
 def test_production_adapter_normalizes_sdk_account_market_book_and_trades() -> None:
@@ -3035,6 +3196,249 @@ def test_production_adapter_normalizes_sdk_account_market_book_and_trades() -> N
     assert snapshot["trades"][0]["matched_at"] == now  # type: ignore[index]
     assert snapshot["trades"][0]["updated_at"] == now  # type: ignore[index]
 
+
+def test_production_adapter_market_failure_still_publishes_settled_financial_facts(
+    tmp_path,
+) -> None:
+    now = datetime(2026, 9, 29, 8, tzinfo=UTC)
+    account_client = _SDKAccountClient(now)
+    account_client.open_order = account_client.open_order.model_copy(
+        update={"status": "CANCELED", "size_matched": Decimal("0"), "side": "BUY", "price": Decimal("0.30"), "original_size": Decimal("10")}
+    )
+    account_client.list_account_trades = lambda **kwargs: []
+
+    class MarketUnavailable(_SDKPublicClient):
+        def get_market(self, *, id: str) -> object:
+            del id
+            raise OSError("market unavailable")
+
+    adapter = PolymarketTradingClient(
+        TradingConfig(
+            "0x1111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222",
+        ),
+        account_client,
+        public_client_factory=lambda: MarketUnavailable(now),
+    )
+    request = _request(now)
+    snapshot = adapter.lp_snapshot({**request, "entry_order_id": "order-open"})
+    assert snapshot["market"] is None
+    assert snapshot["book"] is None
+    assert snapshot["market_read_errors"]["0x" + "c" * 64]["error_type"] == "OSError"
+
+    store = PredictionArbitrageStore(tmp_path)
+    store.lp_create_session(
+        "financial",
+        "financial",
+        state="entry_open",
+        payload={
+            **request,
+            "entry_order_id": "order-open",
+            "owned_order_ids": ["order-open"],
+            "submit_status": "accepted",
+        },
+    )
+    service = PolymarketLPService(store, adapter, clock=lambda: now)
+    service.tick()
+    session = store.lp_session("financial")
+    assert session["state"] == "complete"
+    assert session["facts_error"] is None
+    assert session["book_admission_ready"] is False
+    assert session["inventory_valuation_status"] == "known"
+
+
+def test_production_adapter_malformed_public_payload_keeps_financial_facts(
+    tmp_path,
+) -> None:
+    now = datetime(2026, 9, 29, 8, tzinfo=UTC)
+    account_client = _SDKAccountClient(now)
+    account_client.open_order = account_client.open_order.model_copy(
+        update={
+            "status": "CANCELED",
+            "size_matched": Decimal("0"),
+            "side": "BUY",
+            "price": Decimal("0.30"),
+            "original_size": Decimal("10"),
+        }
+    )
+    account_client.list_account_trades = lambda **kwargs: []
+
+    class MalformedPublic(_SDKPublicClient):
+        def get_market(self, *, id: str) -> object:
+            del id
+            return object()
+
+        def get_order_book(self, *, token_id: str) -> object:
+            del token_id
+            return object()
+
+    adapter = PolymarketTradingClient(
+        TradingConfig(
+            "0x1111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222",
+        ),
+        account_client,
+        public_client_factory=lambda: MalformedPublic(now),
+    )
+    request = _request(now)
+    snapshot = adapter.lp_snapshot({**request, "entry_order_id": "order-open"})
+    assert snapshot["market"] is None and snapshot["book"] is None
+    assert snapshot["market_read_errors"]["0x" + "c" * 64]["error_type"] == (
+        "market_response_invalid"
+    )
+    assert snapshot["orders"][0]["status"] == "CANCELED"
+
+    store = PredictionArbitrageStore(tmp_path)
+    store.lp_create_session(
+        "financial",
+        "financial",
+        state="entry_open",
+        payload={
+            **request,
+            "entry_order_id": "order-open",
+            "owned_order_ids": ["order-open"],
+            "submit_status": "accepted",
+        },
+    )
+    service = PolymarketLPService(store, adapter, clock=lambda: now)
+    service.tick()
+    session = store.lp_session("financial")
+    assert session["state"] == "complete"
+    assert session["facts_error"] is None
+    assert session["book_admission_ready"] is False
+
+
+def test_production_adapter_slow_book_returns_financial_before_snapshot_boundary(
+    tmp_path,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    now = datetime(2026, 9, 29, 8, tzinfo=UTC)
+    account_client = _SDKAccountClient(now)
+    account_client.open_order = account_client.open_order.model_copy(
+        update={
+            "status": "CANCELED",
+            "size_matched": Decimal("0"),
+            "side": "BUY",
+            "price": Decimal("0.30"),
+            "original_size": Decimal("10"),
+        }
+    )
+    account_client.list_account_trades = lambda **kwargs: []
+    entered, release = threading.Event(), threading.Event()
+
+    class SlowBook(_SDKPublicClient):
+        def get_order_book(self, *, token_id: str) -> object:
+            entered.set()
+            assert release.wait(5)
+            return super().get_order_book(token_id=token_id)
+
+    adapter = PolymarketTradingClient(
+        TradingConfig(
+            "0x1111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222",
+        ),
+        account_client,
+        public_client_factory=lambda: SlowBook(now),
+    )
+    adapter._lp_public_read_timeout = 0.05
+    request = _request(now)
+    store = PredictionArbitrageStore(tmp_path)
+    store.lp_create_session(
+        "financial",
+        "financial",
+        state="entry_open",
+        payload={
+            **request,
+            "entry_order_id": "order-open",
+            "owned_order_ids": ["order-open"],
+            "submit_status": "accepted",
+        },
+    )
+    service = PolymarketLPService(store, adapter, clock=lambda: now)
+    service._market_read_timeout = 1.0
+    with ThreadPoolExecutor(1) as workers:
+        tick = workers.submit(service.tick)
+        try:
+            assert entered.wait(2)
+            assert tick.result(timeout=0.8)["state"] == "complete"
+        finally:
+            release.set()
+        tick.result(timeout=2)
+    session = store.lp_session("financial")
+    assert session["state"] == "complete"
+    assert session["book_admission_ready"] is False
+    assert session["inventory_valuation_status"] == "known"
+
+
+def test_slow_financial_read_is_not_discarded_by_optional_public_wait(
+    tmp_path,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    now = datetime(2026, 9, 29, 8, tzinfo=UTC)
+    account_client = _SDKAccountClient(now)
+    account_client.open_order = account_client.open_order.model_copy(
+        update={
+            "status": "CANCELED",
+            "size_matched": Decimal("0"),
+            "side": "BUY",
+            "price": Decimal("0.30"),
+            "original_size": Decimal("10"),
+        }
+    )
+    account_client.list_account_trades = lambda **kwargs: []
+    original_positions = account_client.list_positions
+
+    def slow_positions(**kwargs):
+        time.sleep(0.8)
+        return original_positions(**kwargs)
+
+    account_client.list_positions = slow_positions
+    entered, release = threading.Event(), threading.Event()
+
+    class SlowBook(_SDKPublicClient):
+        def get_order_book(self, *, token_id: str) -> object:
+            entered.set()
+            assert release.wait(5)
+            return super().get_order_book(token_id=token_id)
+
+    adapter = PolymarketTradingClient(
+        TradingConfig(
+            "0x1111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222",
+        ),
+        account_client,
+        public_client_factory=lambda: SlowBook(now),
+    )
+    adapter._lp_public_read_timeout = 0.5
+    request = _request(now)
+    store = PredictionArbitrageStore(tmp_path)
+    store.lp_create_session(
+        "financial-deadline",
+        "financial-deadline",
+        state="entry_open",
+        payload={
+            **request,
+            "entry_order_id": "order-open",
+            "owned_order_ids": ["order-open"],
+            "submit_status": "accepted",
+        },
+    )
+    service = PolymarketLPService(store, adapter, clock=lambda: now)
+    service._market_read_timeout = 1.0
+    with ThreadPoolExecutor(1) as workers:
+        tick = workers.submit(service.tick)
+        try:
+            assert entered.wait(2)
+            assert tick.result(timeout=0.15)["state"] == "complete"
+        finally:
+            release.set()
+        tick.result(timeout=2)
+    session = store.lp_session("financial-deadline")
+    assert session["state"] == "complete"
+    assert session["facts_error"] is None
+    assert session["book_admission_ready"] is False
 class _NoOpenOrdersSDKAccountClient(_SDKAccountClient):
     def list_open_orders(self, **_kwargs: object) -> list[object]:
         return []
@@ -7901,7 +8305,7 @@ def test_queue_protection_mutation_breaker_blocks_cancel(tmp_path) -> None:
     )
     notifications: list[tuple[str, str, str]] = []
     service.set_protection_notifier(
-        lambda title, message, xiaoai: notifications.append((title, message, xiaoai))
+        lambda title, message, xiaoai: notifications.append((title, message, xiaoai)) or True
     )
     flags["allowed"] = False
     live_receipt = _queue_receipt("order-1")
@@ -8003,7 +8407,7 @@ def test_queue_protection_notification_success_template_once(tmp_path) -> None:
     )
     notifications: list[tuple[str, str, str]] = []
     service.set_protection_notifier(
-        lambda title, message, xiaoai: notifications.append((title, message, xiaoai))
+        lambda title, message, xiaoai: notifications.append((title, message, xiaoai)) or True
     )
     entry_id = "order-1"
     open_orders = [
@@ -8035,11 +8439,140 @@ def test_queue_protection_notification_success_template_once(tmp_path) -> None:
 
     restarted = PolymarketLPService(store, exchange, clock=lambda: now)
     restarted.set_protection_notifier(
-        lambda title, message, xiaoai: notifications.append((title, message, xiaoai))
+        lambda title, message, xiaoai: notifications.append((title, message, xiaoai)) or True
     )
     service.tick()
     restarted.tick()
     assert len(notifications) == 1
+
+
+@pytest.mark.parametrize("delivered", [True, False])
+def test_queue_protection_notification_does_not_hold_apply_mutex(
+    tmp_path, delivered: bool
+) -> None:
+    """收敛通知在锁外投递；成功才去重，失败保持可重试。"""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _queue_running_service(
+        tmp_path, now, key="lp-queue-notify-lock"
+    )
+    entered, release = threading.Event(), threading.Event()
+    notes: list[tuple[str, str, str]] = []
+
+    def notify(title: str, message: str, xiaoai: str) -> bool:
+        entered.set()
+        assert release.wait(2)
+        notes.append((title, message, xiaoai))
+        return delivered
+
+    service.set_protection_notifier(notify)
+    open_orders = [
+        _queue_receipt("order-1"),
+        _queue_receipt("manual-2", original="1000"),
+    ]
+    trigger = _queue_runtime_snapshot(now, bid_size="4000", open_orders=open_orders)
+    cancelled = _queue_runtime_snapshot(
+        now,
+        bid_size="4000",
+        open_orders=open_orders,
+        orders=[
+            _queue_receipt("order-1", status="CANCELED"),
+            _queue_receipt("manual-2", status="CANCELED", original="1000"),
+        ],
+    )
+    exchange.snapshot_value = trigger
+    assert service.tick()["queue_protection"]["state"] == "canceling"
+    exchange.snapshot_value = cancelled
+    tick_results: list[dict[str, object]] = []
+    worker = threading.Thread(target=lambda: tick_results.append(service.tick()))
+    worker.start()
+    try:
+        assert entered.wait(2)
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            if service._mutex.acquire(blocking=False):
+                service._mutex.release()
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("notification network wait held the LP apply mutex")
+    finally:
+        release.set()
+        worker.join(2)
+    assert len(notes) == 1
+    assert tick_results[0]["queue_protection"]["notification_sent"] is delivered
+    protection = store.lp_session(str(started["session_id"]))["queue_protection"]
+    assert protection["levels"]["0.30"]["notification_sent"] is delivered
+
+
+def test_queue_protection_notification_mark_preserves_sibling_and_episode(
+    tmp_path,
+) -> None:
+    """延迟通知写回不能覆盖 sibling bucket 或新一代保护 episode。"""
+
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _queue_running_service(
+        tmp_path, now, key="lp-queue-notify-atomic"
+    )
+    session_id = str(started["session_id"])
+    entered, release = threading.Event(), threading.Event()
+
+    def notify(_title: str, _message: str, _voice: str) -> bool:
+        entered.set()
+        assert release.wait(2)
+        return True
+
+    service.set_protection_notifier(notify)
+    open_orders = [
+        _queue_receipt("order-1"),
+        _queue_receipt("manual-2", original="1000"),
+    ]
+    trigger = _queue_runtime_snapshot(now, bid_size="4000", open_orders=open_orders)
+    cancelled = _queue_runtime_snapshot(
+        now,
+        bid_size="4000",
+        open_orders=open_orders,
+        orders=[
+            _queue_receipt("order-1", status="CANCELED"),
+            _queue_receipt("manual-2", status="CANCELED", original="1000"),
+        ],
+    )
+    exchange.snapshot_value = trigger
+    assert service.tick()["queue_protection"]["state"] == "canceling"
+    exchange.snapshot_value = cancelled
+    worker = threading.Thread(target=service.tick)
+    worker.start()
+    try:
+        assert entered.wait(2)
+        store.lp_merge_queue_protection_bucket(
+            session_id,
+            level_key="0.30",
+            bucket={
+                "state": "canceled",
+                "notification_episode": "new-episode",
+                "notification_sent": False,
+            },
+        )
+        store.lp_merge_queue_protection_bucket(
+            session_id,
+            level_key="0.40",
+            bucket={
+                "state": "canceled",
+                "order_id": "sibling-order",
+                "notification_episode": "sibling-episode",
+                "notification_sent": False,
+            },
+        )
+        replaced = store.lp_session(session_id)["queue_protection"]
+        assert replaced["levels"]["0.30"]["notification_episode"] == "new-episode"
+    finally:
+        release.set()
+        worker.join(2)
+    assert not worker.is_alive()
+    protection = store.lp_session(session_id)["queue_protection"]
+    assert protection["levels"]["0.30"]["notification_episode"] == "new-episode"
+    assert protection["levels"]["0.30"]["notification_sent"] is False
+    assert protection["levels"]["0.40"]["order_id"] == "sibling-order"
+    assert protection["levels"]["0.40"]["notification_sent"] is False
 
 
 def test_queue_protection_retry_success_notifies_full_episode_once(tmp_path) -> None:
@@ -8051,7 +8584,7 @@ def test_queue_protection_retry_success_notifies_full_episode_once(tmp_path) -> 
     )
     notifications: list[tuple[str, str, str]] = []
     service.set_protection_notifier(
-        lambda title, message, xiaoai: notifications.append((title, message, xiaoai))
+        lambda title, message, xiaoai: notifications.append((title, message, xiaoai)) or True
     )
     entry_id = "order-1"
     open_orders = [
@@ -8104,7 +8637,7 @@ def test_queue_protection_converge_keeps_fill_and_cancel_remaining_apart(
     )
     notifications: list[tuple[str, str, str]] = []
     service.set_protection_notifier(
-        lambda title, message, xiaoai: notifications.append((title, message, xiaoai))
+        lambda title, message, xiaoai: notifications.append((title, message, xiaoai)) or True
     )
     entry_id = "order-1"
     open_orders = [
@@ -8178,7 +8711,7 @@ def test_queue_protection_unknown_request_time_remaining_reports_unknown_total(
     )
     notifications: list[tuple[str, str, str]] = []
     service.set_protection_notifier(
-        lambda title, message, xiaoai: notifications.append((title, message, xiaoai))
+        lambda title, message, xiaoai: notifications.append((title, message, xiaoai)) or True
     )
     entry_id = "order-1"
     token_id = "0x" + "1" * 64
@@ -8252,7 +8785,7 @@ def test_queue_protection_unacknowledged_cancels_converge_with_request_time_rema
     )
     notifications: list[tuple[str, str, str]] = []
     service.set_protection_notifier(
-        lambda title, message, xiaoai: notifications.append((title, message, xiaoai))
+        lambda title, message, xiaoai: notifications.append((title, message, xiaoai)) or True
     )
     entry_id = "order-1"
     open_orders = [
@@ -10125,7 +10658,7 @@ def test_first_seen_notice_identifies_orders_and_plain_language_lifetime(
     exchange.set_book(token, level_total="284", now=first_seen, condition_id=condition, price="0.123")
     service = PolymarketLPService(store, exchange, clock=lambda: clock_cell[0])
     notes: list[tuple[str, str, str]] = []
-    service.set_protection_notifier(lambda title, message, voice: notes.append((title, message, voice)))
+    service.set_protection_notifier(lambda title, message, voice: notes.append((title, message, voice)) or True)
 
     registered = service.register_first_seen_candidates(
         [anchor], now=first_seen
@@ -10182,7 +10715,7 @@ def test_first_seen_notice_identifies_orders_and_plain_language_lifetime(
     }
 
     restarted = PolymarketLPService(store, exchange, clock=lambda: clock_cell[0])
-    restarted.set_protection_notifier(lambda title, message, voice: notes.append((title, message, voice)))
+    restarted.set_protection_notifier(lambda title, message, voice: notes.append((title, message, voice)) or True)
     restarted.tick()
     assert exchange.cancels == ["notice-anchor", "notice-second", "notice-third"]
     assert len(notes) == 1
@@ -10223,7 +10756,7 @@ def test_legacy_first_seen_notice_uses_local_identity_and_observed_lifetime(
     service = PolymarketLPService(store, exchange, clock=lambda: clock_cell[0])
     notes: list[tuple[str, str, str]] = []
     service.set_protection_notifier(
-        lambda title, message, voice: notes.append((title, message, voice))
+        lambda title, message, voice: notes.append((title, message, voice)) or True
     )
     _first_seen_episode(store, "ep-legacy", baseline_front="8000")
     store.lp_update_first_seen_episode(
@@ -10295,7 +10828,7 @@ def test_protection_notice_missing_facts_stays_explicit(
     service = PolymarketLPService(store, exchange, clock=lambda: now)
     notes: list[tuple[str, str, str]] = []
     service.set_protection_notifier(
-        lambda title, message, voice: notes.append((title, message, voice))
+        lambda title, message, voice: notes.append((title, message, voice)) or True
     )
     _first_seen_episode(
         store, "ep-case6", baseline_front="8000", anchors=(order_id,)
@@ -10435,7 +10968,7 @@ def test_registered_notice_retry_uses_last_confirmation_and_persisted_order_time
     service.set_protection_notifier(
         lambda notice_title, message, voice: notes.append(
             (notice_title, message, voice)
-        )
+        ) or True
     )
 
     first = service.tick()
@@ -10467,7 +11000,7 @@ def test_registered_notice_retry_uses_last_confirmation_and_persisted_order_time
     restarted.set_protection_notifier(
         lambda notice_title, message, voice: notes.append(
             (notice_title, message, voice)
-        )
+        ) or True
     )
     final = restarted.tick()
     assert exchange.cancels == [entry_id, manual_id, manual_id]
@@ -10546,7 +11079,7 @@ def test_protection_notice_does_not_report_filled_targets_as_canceled(
             mutation_guard=lambda *args, **kwargs: True,
         )
         service.set_protection_notifier(
-            lambda title, message, voice: notes.append((title, message, voice))
+            lambda title, message, voice: notes.append((title, message, voice)) or True
         )
         registered = service.register_first_seen_candidates(
             [
@@ -10574,7 +11107,7 @@ def test_protection_notice_does_not_report_filled_targets_as_canceled(
         exchange.snapshot_value = _queue_runtime_snapshot(now, bid_size="10000")
         service = PolymarketLPService(store, exchange, clock=lambda: now)
         service.set_protection_notifier(
-            lambda title, message, voice: notes.append((title, message, voice))
+            lambda title, message, voice: notes.append((title, message, voice)) or True
         )
         request = {
             **_request(now),
@@ -10759,7 +11292,7 @@ def test_protection_blocked_notice_identifies_order_and_reason(
     service.set_protection_notifier(
         lambda notice_title, message, voice: notes.append(
             (notice_title, message, voice)
-        )
+        ) or True
     )
     flags["allowed"] = False
     first = service.tick()
@@ -11742,7 +12275,7 @@ def test_lp163_submit_augment_appends_and_keeps_deadline(tmp_path) -> None:
         tmp_path, now, key="lp163-s11"
     )
     session_id = str(started["session_id"])
-    first_history = dict(store.lp_session(session_id)["order_history"])
+    first_history = dict(store.lp_session(str(started["session_id"]))["order_history"])
     exchange.snapshot_value = _augment_preview_snapshot(
         now, level=Decimal("380"), own_original=Decimal("120")
     )
@@ -13675,6 +14208,34 @@ def test_lp_unowned_guard_own_order_raw_shape_stays_open(tmp_path) -> None:
     assert store.lp_session(session_id)["state"] == "entry_open"
 
 
+def test_monitor_tick_preserves_open_entry_orders(tmp_path) -> None:
+    now = datetime(2026, 9, 22, 20, 0, tzinfo=UTC)
+    exchange = _Exchange()
+    exchange.snapshot_value = _queue_runtime_snapshot(
+        now, bid_size=Decimal("10000")
+    )
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: now)
+    request = {**_request(now), "quantity": Decimal("2000")}
+    preview = service.preview(request)
+    started = service.start(str(preview["preview_id"]), "lp-monitor-open")
+
+    result = service.tick()
+
+    assert result["state"] == "entry_open"
+    assert result["entry_cancel_requested"] is False
+    assert exchange.cancels == []
+    stored = store.lp_session(str(started["session_id"]))
+    assert stored["state"] == "entry_open"
+    assert stored["entry_cancel_requested"] is False
+
+
+def _wait_for_lp_attention(service: PolymarketLPService) -> None:
+    thread = service._attention_thread
+    if thread is not None:
+        thread.join(timeout=2)
+
+
 def test_lp_needs_attention_notification_five_minute_once(tmp_path) -> None:
     """N1：进入 needs_attention 满 5 分钟才经 _notify_protection 推一条；
     未满 5 分钟零调用；同一 episode 内持续停留也只推这一条。"""
@@ -13699,7 +14260,7 @@ def test_lp_needs_attention_notification_five_minute_once(tmp_path) -> None:
     service = PolymarketLPService(store, exchange, clock=lambda: current[0])
     notifications: list[tuple[str, str, str]] = []
     service.set_protection_notifier(
-        lambda title, message, xiaoai: notifications.append((title, message, xiaoai))
+        lambda title, message, xiaoai: notifications.append((title, message, xiaoai)) or True
     )
     request = {**_request(now), "quantity": Decimal("2000")}
     preview = service.preview(request)
@@ -13740,6 +14301,7 @@ def test_lp_needs_attention_notification_five_minute_once(tmp_path) -> None:
     # 该场景 data_failures=0 不拼 counter，中段漂移必须被抓住）。
     current[0] = now + timedelta(seconds=300)
     service.tick()
+    _wait_for_lp_attention(service)
     assert len(notifications) == 1
     title, message, xiaoai = notifications[0]
     assert "LP 需要核对" in title
@@ -13758,8 +14320,8 @@ def test_lp_needs_attention_notification_five_minute_once(tmp_path) -> None:
 
 
 def test_lp_needs_attention_notification_resets_after_recovery(tmp_path) -> None:
-    """N2：恢复 entry_open 时清键（since=None、notified=假）；下次再进入是
-    新 episode——满 5 分钟再推第二条（累计恰 2 条）。"""
+    """N2：已通知 episode 恢复时补一条恢复通知；下次再进入是新 episode，
+    满 5 分钟再推第二条异常通知。"""
 
     now = datetime(2026, 9, 22, 20, 0, tzinfo=UTC)
     current = [now]
@@ -13781,7 +14343,7 @@ def test_lp_needs_attention_notification_resets_after_recovery(tmp_path) -> None
     service = PolymarketLPService(store, exchange, clock=lambda: current[0])
     notifications: list[tuple[str, str, str]] = []
     service.set_protection_notifier(
-        lambda title, message, xiaoai: notifications.append((title, message, xiaoai))
+        lambda title, message, xiaoai: notifications.append((title, message, xiaoai)) or True
     )
     request = {**_request(now), "quantity": Decimal("2000")}
     preview = service.preview(request)
@@ -13814,31 +14376,163 @@ def test_lp_needs_attention_notification_resets_after_recovery(tmp_path) -> None
     # 第一次 episode：进入 → 满 5 分钟推第一条。
     exchange.snapshot_value = trigger
     assert service.tick()["state"] == "needs_attention"
+    persistent = service.tick()
+    assert persistent["state"] == "needs_attention"
+    assert store.lp_session(session_id)["resume_state"] == "entry_open"
     current[0] = now + timedelta(seconds=300)
     service.tick()
+    _wait_for_lp_attention(service)
     assert len(notifications) == 1
 
-    # 移除触发单（快照回到干净）→ tick 恢复 entry_open，两键清位。
+    # 移除触发单（快照回到干净）→ tick 恢复 entry_open，补一条恢复通知。
     exchange.snapshot_value = clean
     recovered = service.tick()
     assert recovered["state"] == "entry_open"
+    _wait_for_lp_attention(service)
     stored = store.lp_session(session_id)
     assert stored["state"] == "entry_open"
     assert stored["needs_attention_since"] is None
     assert stored["needs_attention_notified"] is False
+    assert stored["needs_attention_recovery_due"] is False
+    assert len(notifications) == 2
 
-    # 第二次 episode：再进入 → 满 5 分钟再推第二条（累计 2），之后不再推。
+    # 第二次 episode：再进入 → 满 5 分钟再推异常通知（累计 3），之后不再推。
     exchange.snapshot_value = trigger
     current[0] = now + timedelta(seconds=420)
     assert service.tick()["state"] == "needs_attention"
     assert store.lp_session(session_id)["needs_attention_notified"] is False
-    assert len(notifications) == 1
+    assert len(notifications) == 2
     current[0] = now + timedelta(seconds=720)
     service.tick()
-    assert len(notifications) == 2
+    _wait_for_lp_attention(service)
+    assert len(notifications) == 3
     current[0] = now + timedelta(seconds=780)
     service.tick()
-    assert len(notifications) == 2
+    _wait_for_lp_attention(service)
+    assert len(notifications) == 3
+
+
+def test_lp_manual_attention_retries_failed_channel_and_fences_old_recovery(
+    tmp_path,
+) -> None:
+    """手动 episode 分渠道重试；旧恢复完成不能覆盖新故障计时。"""
+
+    now = datetime(2026, 9, 22, 20, 0, tzinfo=UTC)
+    current = [now]
+
+    class _ClockFreshExchange(_Exchange):
+        def lp_snapshot(self, request: dict[str, object]) -> dict[str, object]:
+            snapshot = super().lp_snapshot(request)
+            book = snapshot.get("book")
+            if isinstance(book, dict):
+                book["timestamp"] = current[0]
+                book["received_at"] = current[0]
+            return snapshot
+
+    exchange = _ClockFreshExchange()
+    exchange.snapshot_value = _queue_runtime_snapshot(
+        now, bid_size=Decimal("10000")
+    )
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: current[0])
+    calls: list[tuple[str, object]] = []
+    recovery_entered, release = threading.Event(), threading.Event()
+
+    def notify(title: str, _message: str, _voice: str, *, channels=None):
+        calls.append((title, channels))
+        if title.startswith("LP 需要核对 ·"):
+            fault_calls = [call for call in calls if call[0].startswith("LP 需要核对 ·")]
+            if len(fault_calls) == 1:
+                return {"feishu": True, "xiaoai": False}
+            if len(fault_calls) == 2:
+                assert channels == {"xiaoai"}
+                return {"xiaoai": True}
+            return {"feishu": True, "xiaoai": True}
+        recovery_entered.set()
+        assert release.wait(5)
+        return {"feishu": True, "xiaoai": True}
+
+    service.set_protection_notifier(notify)
+    request = {**_request(now), "quantity": Decimal("2000")}
+    preview = service.preview(request)
+    started = service.start(str(preview["preview_id"]), "lp-att-channel")
+    session_id = str(started["session_id"])
+    trigger = _queue_runtime_snapshot(
+        now,
+        bid_size=Decimal("10000"),
+        open_orders=[
+            _lp_attention_raw_order(
+                "manual-sell",
+                token_id="0x" + "9" * 64,
+                condition_id="0x" + "c" * 64,
+                side="SELL",
+            ),
+        ],
+    )
+    clean = _queue_runtime_snapshot(
+        now,
+        bid_size=Decimal("10000"),
+        open_orders=[
+            _lp_attention_raw_order(
+                "order-1", token_id="0x" + "1" * 64, condition_id="0x" + "c" * 64
+            ),
+        ],
+    )
+
+    exchange.snapshot_value = trigger
+    assert service.tick()["state"] == "needs_attention"
+    first_episode = str(store.lp_session(session_id)["needs_attention_episode"])
+    current[0] = now + timedelta(seconds=300)
+    service.tick()
+    _wait_for_lp_attention(service)
+    partial = store.lp_session(session_id)
+    assert partial["needs_attention_channel_status"] == {
+        "feishu": True,
+        "xiaoai": False,
+    }
+    assert partial["needs_attention_notified"] is False
+
+    current[0] = now + timedelta(seconds=360)
+    service.tick()
+    _wait_for_lp_attention(service)
+    assert store.lp_session(session_id)["needs_attention_notified"] is True
+
+    exchange.snapshot_value = clean
+    current[0] = now + timedelta(seconds=361)
+    assert service.tick()["state"] == "entry_open"
+    assert recovery_entered.wait(5)
+    exchange.snapshot_value = trigger
+    current[0] = now + timedelta(seconds=362)
+    assert service.tick()["state"] == "needs_attention"
+    new_fault = store.lp_session(session_id)
+    assert new_fault["needs_attention_episode"] != first_episode
+    assert new_fault["needs_attention_recovery_due"] is False
+    assert new_fault["needs_attention_notified"] is False
+
+    try:
+        release.set()
+        _wait_for_lp_attention(service)
+        fenced = store.lp_session(session_id)
+        assert fenced["state"] == "needs_attention"
+        assert fenced["needs_attention_episode"] != first_episode
+        assert fenced["needs_attention_notified"] is False
+
+        current[0] = now + timedelta(seconds=662)
+        service.tick()
+        _wait_for_lp_attention(service)
+        assert store.lp_session(session_id)["needs_attention_notified"] is True
+        current[0] = now + timedelta(seconds=663)
+        service.tick()
+        _wait_for_lp_attention(service)
+    finally:
+        release.set()
+    assert len(calls) == 4
+    assert [channel for _, channel in calls] == [
+        {"feishu", "xiaoai"},
+        {"xiaoai"},
+        {"feishu", "xiaoai"},
+        {"feishu", "xiaoai"},
+    ]
 
 
 def test_lp_needs_attention_notification_stop_clears_bookkeeping(tmp_path) -> None:
@@ -13867,7 +14561,7 @@ def test_lp_needs_attention_notification_stop_clears_bookkeeping(tmp_path) -> No
     service = PolymarketLPService(store, exchange, clock=lambda: current[0])
     notifications: list[tuple[str, str, str]] = []
     service.set_protection_notifier(
-        lambda title, message, xiaoai: notifications.append((title, message, xiaoai))
+        lambda title, message, xiaoai: notifications.append((title, message, xiaoai)) or True
     )
     request = {**_request(now), "quantity": Decimal("2000")}
     preview = service.preview(request)
@@ -13894,6 +14588,7 @@ def test_lp_needs_attention_notification_stop_clears_bookkeeping(tmp_path) -> No
     assert service.tick()["state"] == "needs_attention"
     current[0] = now + timedelta(seconds=300)
     service.tick()
+    _wait_for_lp_attention(service)
     assert len(notifications) == 1
     assert store.lp_session(session_id)["needs_attention_notified"] is True
 
@@ -13913,14 +14608,17 @@ def test_lp_needs_attention_notification_stop_clears_bookkeeping(tmp_path) -> No
     # 新 episode 未满 5 分钟（299s）：不早推，仍恰 1 条。
     current[0] = now + timedelta(seconds=629)
     service.tick()
+    _wait_for_lp_attention(service)
     assert len(notifications) == 1
 
     # 满 5 分钟（300s）：推第二条；此后同一 episode 不再推。
     current[0] = now + timedelta(seconds=630)
     service.tick()
+    _wait_for_lp_attention(service)
     assert len(notifications) == 2
     current[0] = now + timedelta(seconds=660)
     service.tick()
+    _wait_for_lp_attention(service)
     assert len(notifications) == 2
 
 
@@ -13988,8 +14686,17 @@ def test_snapshot_diagnostics_survive_error_translation_without_secrets(tmp_path
         public_client_factory=lambda: public)
     service = PolymarketLPService(PredictionArbitrageStore(tmp_path / 'diagnostic.db'), adapter)
     try:
-        with pytest.raises(ValueError, match='^external_snapshot_unknown$'):
-            service._read_snapshot(_request(now))
+        if failure == 'account_trades':
+            with pytest.raises(ValueError, match='^external_snapshot_unknown$'):
+                service._read_snapshot(_request(now))
+        else:
+            snapshot = service._read_snapshot(_request(now))
+            error = snapshot['market_read_errors']['0x' + 'c' * 64]
+            assert snapshot['account']['authenticated'] is True
+            assert error['error_type'] == (
+                'TransportError' if failure == 'market_transport'
+                else 'UnexpectedResponseError'
+            )
     finally:
         public.close()
     records = [r for r in caplog.records if r.name == polymarket_trading.__name__]
@@ -14018,8 +14725,11 @@ def test_failed_reconcile_diagnostics_separate_capacity_read_and_publish(tmp_pat
 
     class Capacity:
         released = False
-        def acquire(self):
+        def acquire(self, blocking=True):
+            if not blocking:
+                return False
             ticks[0] += 12
+            return True
         def release(self):
             self.released = True
 
@@ -14201,3 +14911,68 @@ def test_wrong_direction_verified_fill_keeps_missing_augment_receipt_unknown(tmp
         assert patch['order_history']['augment']['status'] == 'UNKNOWN'
         assert patch['order_history']['augment']['read_error'] == 'order_lookup_unavailable'
         assert patch['orders_terminal'] is False
+
+
+@pytest.mark.parametrize("kind", ["bound", "local", "callable", "kwargs", "raises"])
+def test_protection_callback_signature_is_adapted_before_single_send(tmp_path, kind):
+    service = PolymarketLPService(PredictionArbitrageStore(tmp_path), _Exchange())
+    calls = []
+
+    class Callback:
+        def legacy(self, title, message, voice):
+            calls.append(None)
+            return True
+
+        def __call__(self, title, message, voice, *, channels):
+            calls.append(channels)
+            return {channel: True for channel in channels}
+
+    def local(title, message, voice):
+        channels = "local variable, not a parameter"
+        calls.append(None)
+        return bool(channels)
+
+    def kwargs(title, message, voice, **options):
+        calls.append(options["channels"])
+        if kind == "raises":
+            raise TypeError("failure after delivery")
+        return True
+
+    callback = Callback()
+    service.set_protection_notifier({
+        "bound": callback.legacy, "local": local, "callable": callback,
+        "kwargs": kwargs, "raises": kwargs,
+    }[kind])
+    result = service._deliver_protection_details("title", "message", "voice", channels={"xiaoai"})
+    assert calls == ([None] if kind in {"bound", "local"} else [{"xiaoai"}])
+    assert result == {"xiaoai": kind != "raises"}
+
+
+def test_review_partial_callback_mapping_is_not_full_delivery(tmp_path):
+    service = PolymarketLPService(PredictionArbitrageStore(tmp_path), _Exchange())
+    calls = []
+    service.set_protection_notifier(lambda *args: calls.append(args) or {'feishu': True})
+    assert service._notify_protection('title', 'body', 'voice') is False
+    assert len(calls) == 1
+
+
+def test_review_preparation_rearm_resets_fault_and_rejects_old_claim(tmp_path):
+    now = datetime.now(UTC)
+    current = [now]
+    service = PolymarketLPService(PredictionArbitrageStore(tmp_path), _Exchange(), clock=lambda: current[0])
+    old = service._save_preparation({'generation':1,'paused':True,'state':'paused', **service._ensure_fault_episode(now-timedelta(seconds=301)), 'fault_alert_state':'sent'})
+    rearmed = service.recover_preparation()
+    assert rearmed['generation'] == 2
+    assert rearmed.get('fault_started_at') is None
+    assert rearmed.get('recovery_alert_state') is None
+    stale = {**old, 'fault_alert_state':None}
+    assert service._claim_fault_alert_if_due(stale) is None
+    assert service.preparation_snapshot().get('fault_alert_state') is None
+    current[0] += timedelta(seconds=1)
+    state = service._save_preparation(service._ensure_fault_episode(current[0]), expected_generation=2)
+    assert service._claim_fault_alert_if_due(state) is None
+    current[0] += timedelta(seconds=300)
+    claimed = service._claim_fault_alert_if_due(service.preparation_snapshot())
+    assert claimed['fault_alert_claimed_now'] is True
+    service.finish_preparation_alert(generation=1, success=True)
+    assert service.preparation_snapshot()['fault_alert_state'] == 'claimed'
