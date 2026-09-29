@@ -7155,6 +7155,67 @@ console.log(JSON.stringify({
     }
 
 
+def test_lp_today_reward_cell_separates_known_raw_amount_from_unknown_usd() -> None:
+    """原币奖励已知时不得因 USD 估值 UNKNOWN 而隐藏平台累计。"""
+
+    output = run_dashboard_js(r'''
+const checkedAt = "2026-09-29T00:17:09.331778Z";
+const order = (conditionId) => ({
+  order_id: "order-" + conditionId, condition_id: conditionId,
+  token_id: "token-" + conditionId, market_title: "Market " + conditionId,
+  market_url: "https://polymarket.com/event/" + conditionId,
+  outcome: "YES", side: "BUY", status: "LIVE", price: "0.50", quantity: "40",
+  filled_quantity: "40", remaining_quantity: "0", state: "open",
+  management: "manual_read_only", read_only: true, scoring_status: "true",
+});
+const reward = (extra) => ({
+  state: "unknown", reason: "usd_value_unknown", stale: false,
+  currency: "USD", paid: false, checked_at: checkedAt,
+  last_success_at: checkedAt, ...extra,
+});
+const dashboard = {
+  state: "ready", stale: false, checked_at: checkedAt, last_success_at: checkedAt,
+  orders: [], positions: [],
+  lp_orders_today: [
+    order("fresh"), order("stale"), order("failed"), order("failed-raw"),
+  ],
+  non_lp_row_count: 0,
+  market_rewards: {
+    fresh: reward({market_amount_raw: "0.004487", market_asset: "USDC.e"}),
+    stale: reward({stale: true, market_amount_raw: "0.003000", market_asset: "USDC.e"}),
+    failed: reward({reason: "reward_read_unknown", market_amount_raw: null,
+      market_asset: null, market_amount: null,
+      last_success_at: "2026-09-29T00:10:00Z"}),
+    "failed-raw": reward({reason: "reward_read_unknown",
+      market_amount_raw: "0.002000", market_asset: "USDC.e",
+      last_success_at: "2026-09-29T00:10:00Z"}),
+  },
+  lp_observations: {}, reward_shares: {}, recommendations: [],
+  lp_session: {state: "none"},
+};
+const html = predictionLpCard({lp_dashboard: dashboard});
+const cell = (conditionId) => (
+  html.match(new RegExp('data-lp-today-market="' + conditionId + '"[\\s\\S]*?</tr>')) || [""]
+)[0].split('data-label="今日奖励(累计 · $/小时)"')[1].split("</td>")[0];
+console.log(JSON.stringify({
+  fresh: cell("fresh"), stale: cell("stale"), failed: cell("failed"),
+  failedRaw: cell("failed-raw"),
+}));
+''')
+    rendered = json.loads(output)
+    assert "平台累计 <strong>0.004487 USDC.e</strong>" in rendered["fresh"]
+    assert "USD 估值 UNKNOWN" in rendered["fresh"]
+    assert "未核实到账" in rendered["fresh"]
+    assert "读取失败" not in rendered["fresh"]
+    assert "陈旧保留 <strong>0.003000 USDC.e</strong>" in rendered["stale"]
+    assert "USD 估值 UNKNOWN" in rendered["stale"]
+    assert "UNKNOWN" in rendered["failed"]
+    assert "读取失败先保留旧值" in rendered["failed"]
+    assert "UNKNOWN" in rendered["failedRaw"]
+    assert "读取失败先保留旧值" in rendered["failedRaw"]
+    assert "平台累计" not in rendered["failedRaw"]
+
+
 def test_lp_today_orders_reward_cell_never_dresses_zero_when_unknown() -> None:
     """B2: 无奖励条目＋小时奖励 null → 该格 UNKNOWN、整表不出现 $0、
     收益率格保持「待更新」语义不变。"""
@@ -7296,7 +7357,7 @@ console.log(JSON.stringify({
   earnedText: rewardCell.includes("今日已赚"),
   earnedUnknown: rewardCell.includes("UNKNOWN"),
   lastSuccessNote: rewardCell.includes("上次成功")
-    && rewardCell.includes("读到失败先保留旧值"),
+    && rewardCell.includes("读取失败先保留旧值"),
   noGreenTone: !rewardCell.includes("pm-tone-ok"),
   noStaleAmount: !rewardCell.includes("$3.42"),
   hourlyApprox: rewardCell.includes("≈") && rewardCell.includes("$2.39")

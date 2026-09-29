@@ -3391,6 +3391,9 @@ function lpDashboardTodayRewardCell(firstOrder, rewards, observation) {
   const dataNote = "<span class=\"sub\">数据 "
     + escapeHtml(predictionHktTimestamp(reward.checked_at || reward.last_success_at, "UNKNOWN"))
     + " · 计奖日(UTC)当日累计</span>";
+  const rewardReadFailed = reward.state !== "known"
+    && ["reward_read_unknown", "reward_read_failed", "reward_catalog_read_failed"]
+      .includes(String(reward.reason || ""));
   let amountLine;
   let noteLine;
   if (reward.state === "known" && currency === "USD"
@@ -3398,11 +3401,18 @@ function lpDashboardTodayRewardCell(firstOrder, rewards, observation) {
     amountLine = "今日已赚 <strong class=\"pm-tone-ok\">"
       + escapeHtml(predictionExactMoney(reward.market_amount, "UNKNOWN")) + "</strong>";
     noteLine = dataNote;
-  } else if (reward.state === "known" && predictionHasValue(rawAmount)
-    && predictionHasValue(rawAsset)) {
-    amountLine = "今日已赚 <strong class=\"pm-tone-ok\">"
-      + escapeHtml(String(rawAmount) + " " + String(rawAsset)) + "</strong>";
-    noteLine = dataNote;
+  } else if (predictionHasValue(rawAmount) && predictionHasValue(rawAsset)
+    && reward.stale !== true && !rewardReadFailed) {
+    const amount = escapeHtml(String(rawAmount) + " " + String(rawAsset));
+    amountLine = "平台累计 <strong>" + amount + "</strong>";
+    const usdNote = reward.state === "known" ? "" : "USD 估值 UNKNOWN · ";
+    noteLine = "<span class=\"sub\">" + usdNote
+      + (reward.paid === true ? "已核实到账" : "未核实到账") + "</span>" + dataNote;
+  } else if (predictionHasValue(rawAmount) && predictionHasValue(rawAsset)
+    && reward.stale === true) {
+    const amount = escapeHtml(String(rawAmount) + " " + String(rawAsset));
+    amountLine = "陈旧保留 <strong>" + amount + "</strong>";
+    noteLine = "<span class=\"sub\">USD 估值 UNKNOWN · 未核实到账</span>" + dataNote;
   } else {
     amountLine = "今日已赚 <span class=\"pm-lp-unknown\">UNKNOWN</span>";
     const retained = predictionHasValue(reward.market_amount)
@@ -3411,7 +3421,7 @@ function lpDashboardTodayRewardCell(firstOrder, rewards, observation) {
     noteLine = retained
       ? "<span class=\"sub\">上次成功 "
         + escapeHtml(predictionHktTimestamp(reward.last_success_at || reward.checked_at, "UNKNOWN"))
-        + " · 读到失败先保留旧值</span>"
+        + " · 读取失败先保留旧值</span>"
       : "<span class=\"sub\">奖励数据未知 · 不按 0 计</span>";
   }
   const source = observation && typeof observation === "object" ? observation : null;
@@ -14997,6 +15007,8 @@ function lpAutoFundsAndOrders(auto) {
   if (!auto || typeof auto !== "object") return "";
   const funds = auto.funds || {};
   const slots = auto.slots || {};
+  const pendingReview = Number(slots.pending_review ?? slots.unknown ?? 0);
+  const pendingSubmitting = Math.max(0, Number(slots.pending ?? 0) - pendingReview);
   const money = (value) => predictionHasValue(value) ? lpDashboardMoney(value) : "UNKNOWN";
   const status = {reserved: "在途", sending: "提交中", unknown: "待核对", active: "挂单中", canceling: "撤单中", terminal: "已终结", rejected: "已拒绝", aborted: "未发送"};
   const intents = Array.isArray(auto.intents) ? auto.intents : [];
@@ -15012,7 +15024,7 @@ function lpAutoFundsAndOrders(auto) {
     return `<tr><td>${escapeHtml(row.condition_id || "—")}</td><td>${escapeHtml(predictionValue(estimate.quantity, "UNKNOWN"))}</td><td>${escapeHtml(money(estimate.capital_usd))}</td><td>${escapeHtml(money(estimate.hourly_reward_usd))}</td><td>${escapeHtml(predictionValue(estimate.yield_pct_per_hour, "UNKNOWN"))}%</td></tr>`;
   }).join("");
   return `<div class="pm-lp-auto-funds">
-    <p class="pm-lp-budget-line">目标 ${escapeHtml(String(auto.target_buy_count ?? 0))} · 活跃 ${escapeHtml(String(slots.active ?? 0))} · 在途 ${escapeHtml(String(slots.pending ?? 0))} · 撤单中 ${escapeHtml(String(slots.canceling ?? 0))} · 共占位 ${escapeHtml(String(slots.occupied ?? 0))}</p>
+    <p class="pm-lp-budget-line">目标 ${escapeHtml(String(auto.target_buy_count ?? 0))} · 有效 BUY ${escapeHtml(String(slots.active ?? 0))} · 待核对占位 ${escapeHtml(String(pendingReview))} · 提交中 ${escapeHtml(String(pendingSubmitting))} · 撤单中 ${escapeHtml(String(slots.canceling ?? 0))} · 共占位 ${escapeHtml(String(slots.occupied ?? 0))}</p>
     <p>策略总资金 <strong>${escapeHtml(money(funds.total_usd))}</strong> · 可用 <strong>${escapeHtml(money(funds.available_usd))}</strong> · 库存成本 ${escapeHtml(money(funds.inventory_cost_usd))} · BUY 总预留 ${escapeHtml(money(funds.buy_reserved_usd))}（其中在途 ${escapeHtml(money(funds.pending_reserved_usd))}）</p>
     <p>净分配 ${escapeHtml(money(funds.net_allocation_usd))} · 已核实交易盈亏 ${escapeHtml(money(funds.realized_pnl_usd))} · 资金缺口 ${escapeHtml(money(funds.deficit_usd))} · ${funds.status === "known" ? "账本已核对" : "账本待核对"} · 奖励本期不复投</p>
     <details open><summary>自动订单 / 意图（${intents.length}）</summary><div class="table-wrap"><table><thead><tr><th>归属 / 市场</th><th>订单 ID / 意图</th><th>价格 × 数量</th><th>成交量</th><th>状态</th></tr></thead><tbody>${rows || '<tr><td colspan="5">暂无自动订单</td></tr>'}</tbody></table></div></details>

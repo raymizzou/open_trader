@@ -248,6 +248,67 @@ def test_unknown_with_reliable_id_reconciles_without_resubmit(tmp_path):
     assert len(x.posts)==2
 
 
+def test_full_verified_sell_releases_slot_and_wakes_refill_beside_missing_identity(tmp_path):
+    e,x,lp,s=setup(tmp_path,5)
+    e.lp_auto_configure(dict(budget_usd='100',target_buy_count=5))
+    e.lp_auto_set_desired_running(True)
+    initial=e.lp_auto_run_once()
+    completed=[i for i in initial['intents'] if i['order_id']=='o1'][0]
+    unknown=[i for i in initial['intents'] if i['order_id']=='o2'][0]
+
+    x.orders[0].update(status='FILLED',size_matched='20')
+    x.orders.append(dict(order_id='sell-full',token_id='m00',condition_id='m00',side='SELL',
+                         status='FILLED',price='.25',original_size='20',size_matched='20'))
+    x.trades=[dict(trade_id=f't{side}',status='CONFIRMED',matched_at=NOW.isoformat(),
+               maker_orders=[dict(order_id=oid,token_id='m00',side=side,matched_amount='20',price=price,fee='0')])
+              for side,oid,price in [('BUY','o1','.40'),('SELL','sell-full','.25')]]
+    s.lp_update_session(completed['session_id'],patch=dict(
+        passive_exit_order_id='sell-full',owned_order_ids=['o1','sell-full']))
+    lp.tick()
+    x.orders[:] = [row for row in x.orders if row['order_id'] != 'sell-full']
+    session=s.lp_session(completed['session_id'])
+    receipt=session['order_history']['sell-full']
+    s.lp_update_session(completed['session_id'],state='needs_attention',patch={
+        'orders_terminal': False,
+        'order_history': {'sell-full': {**receipt, 'status': 'UNKNOWN', 'read_error': 'order_lookup_unavailable'}},
+    })
+    e._lp_auto_pool()._update(lambda d:d['intents'][completed['intent_id']].update(
+        state='unknown',financial_status='unknown',submission_unknown=True,
+        reconcile_reason='order_lookup_unavailable',settled=False))
+
+    s.lp_update_session(unknown['session_id'],state='needs_attention',patch={
+        'entry_order_id': None,'owned_order_ids': [], 'order_history': {},
+        'submit_status': 'unknown', 'resume_state': 'entry_submit_pending',
+    })
+    for action in s.lp_actions(unknown['session_id']):
+        if action.get('role') == 'entry':
+            s.lp_upsert_action(unknown['session_id'],action['action_key'],state='unknown',
+                payload={key:value for key,value in action.items()
+                         if key not in {'action_id','action_key','state','order_id'}})
+    x.orders[:] = [row for row in x.orders if row.get('order_id') != unknown['order_id']]
+    e._lp_auto_pool()._update(lambda d:d['intents'][unknown['intent_id']].update(
+        state='unknown',financial_status='unknown',submission_unknown=True,
+        reconcile_reason='missing_reliable_order_id',settled=False))
+
+    lp._candidate_pool_record_success('m05',dict(condition_id='m05'),judged_at=NOW,
+        facts=dict(directions=[x.direction('m05')],account=x.lp_account_snapshot()))
+    s.lp_save_price_history('m05','m05',[],dict(state='known',amplitude=Decimal('.005'),
+        checked_at=NOW,valid_until=NOW+timedelta(days=1)))
+    state=e.lp_auto_run_once()
+    assert state['slots'] == dict(active=4,pending=1,pending_review=1,canceling=0,occupied=5)
+    assert state['slots']['pending_review'] == 1
+    assert [p['token_id'] for p in x.posts[-1:]] == ['m05']
+    unresolved=next(i for i in state['intents'] if i['session_id']==unknown['session_id'])
+    settled=next(i for i in state['intents'] if i['session_id']==completed['session_id'])
+    assert unresolved['reconcile_reason'] == 'missing_reliable_order_id'
+    assert unresolved['submission_unknown'] is True
+    assert Decimal(unresolved['reserved_usd']) == 8
+    assert settled['state'] == 'terminal'
+    assert settled['settled'] is True
+    assert settled['financial_status'] == 'known'
+    assert Decimal(settled['reserved_usd']) == 0
+
+
 def test_partial_buy_cancel_releases_only_unfilled_and_config_deficit(tmp_path):
     e,x,lp,s=setup(tmp_path)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
@@ -349,8 +410,9 @@ def test_automatic_ui_escapes_identity_and_distinguishes_no_order_id():
     function lpDashboardPrice(v){return v;}
     function predictionValue(v,f){return v??f;}
     '''+fn+'''
-    const html=lpAutoFundsAndOrders({target_buy_count:1,funds:{status:'unknown'},intents:[{intent_id:'<script>',condition_id:'<img>',state:'unknown'}]});
+    const html=lpAutoFundsAndOrders({target_buy_count:5,slots:{active:3,pending:2,pending_review:2,occupied:5},funds:{status:'unknown'},intents:[{intent_id:'<script>',condition_id:'<img>',state:'unknown'}]});
     if(html.includes('<script>')||html.includes('<img>')||!html.includes('无可靠订单 ID')||!html.includes('UNKNOWN')||!html.includes('自动'))process.exit(1);
+    if(!html.includes('目标 5 · 有效 BUY 3 · 待核对占位 2')||!html.includes('共占位 5'))process.exit(1);
     '''
     subprocess.run(['node','-e',code],check=True)
 

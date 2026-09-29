@@ -10,7 +10,7 @@ from time import monotonic
 from copy import deepcopy
 from contextlib import nullcontext
 from collections.abc import Callable, Collection, Mapping, MutableMapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, cast
@@ -6659,11 +6659,15 @@ class PolymarketLPService:
         }
 
     def _read_candidate_facts(
-        self, identity: Mapping[str, object]
+        self, identity: Mapping[str, object], *, wait_for_capacity: bool = False
     ) -> dict[str, object]:
         """Read market facts shared by entry qualification and resting BUY ranking."""
 
-        return self._market_read(identity, lambda: self._fetch_candidate_facts(identity))
+        return self._market_read(
+            identity,
+            lambda: self._fetch_candidate_facts(identity),
+            wait_for_capacity=wait_for_capacity,
+        )
 
     def _fetch_candidate_facts(self, identity):
         condition_id = str(identity.get("condition_id") or "").strip()
@@ -10265,25 +10269,40 @@ class PolymarketLPService:
             return self._market_read(request, lambda: self._fetch_snapshot(request))
         return self._fetch_snapshot(request)
 
-    def _market_read(self, identity, read):
+    def _market_read(self, identity, read, *, wait_for_capacity=False):
         """Bound waiting without pretending a Python thread can be cancelled.
 
         Workers only return read data. An abandoned result is never applied;
         the existing trading revision still fences accepted session snapshots.
         """
         key = str(identity.get('condition_id') or identity.get('token_id') or '')
-        with self._market_reads_lock:
-            existing = self._market_reads.get(key)
-            if existing is not None:
-                if not existing.done():
-                    raise ValueError('market_read_in_progress')
-                self._market_reads.pop(key)
-            if monotonic() < self._market_read_retry.get(key, 0):
-                raise ValueError('market_read_cooling_down')
-            if sum(not job.done() for job in self._market_reads.values()) >= 2:
+        deadline = monotonic() + self._market_read_timeout
+        while True:
+            blockers = None
+            with self._market_reads_lock:
+                existing = self._market_reads.get(key)
+                if existing is not None:
+                    if not existing.done():
+                        raise ValueError('market_read_in_progress')
+                    self._market_reads.pop(key)
+                if monotonic() < self._market_read_retry.get(key, 0):
+                    raise ValueError('market_read_cooling_down')
+                unfinished = [job for job in self._market_reads.values() if not job.done()]
+                if len(unfinished) >= 2:
+                    if not wait_for_capacity:
+                        raise ValueError('market_read_capacity')
+                    blockers = tuple(unfinished)
+                else:
+                    future = Future()
+                    self._market_reads[key] = future
+                    break
+            done, _ = wait(
+                blockers,
+                timeout=max(0, deadline - monotonic()),
+                return_when=FIRST_COMPLETED,
+            )
+            if not done:
                 raise ValueError('market_read_capacity')
-            future = Future()
-            self._market_reads[key] = future
         owner_session = getattr(self._facts_owner, 'session_id', None)
         def run():
             self._facts_owner.session_id = owner_session
@@ -12553,12 +12572,50 @@ class PolymarketLPService:
                 if value is not None:
                     current[name] = value
             history[order_id] = current
+        for order_id in order_ids:
+            receipt = history.get(order_id, {})
+            if (str(receipt.get("status") or "").upper() != "UNKNOWN"
+                    or not self._verified_fill_completed(session, order_id, receipt)):
+                continue
+            receipt["status"] = "MATCHED"
+            receipt.pop("read_error", None)
+            history[order_id] = receipt
         terminal = bool(order_ids) and all(
             str(history.get(order_id, {}).get("status") or "").upper()
             in TERMINAL_ORDER_STATES
             for order_id in order_ids
         )
         return dict(owned_order_ids=order_ids, order_history=history, orders_terminal=terminal)
+
+    @staticmethod
+    def _verified_fill_completed(session, order_id, receipt):
+        fact = (session.get("verified_order_fills") or {}).get(order_id)
+        if not isinstance(fact, Mapping) or fact.get("order_id") != order_id:
+            return False
+        side = str(receipt.get("side") or "").upper()
+        expected_side = ("BUY" if order_id == session.get("entry_order_id")
+                         else "SELL" if order_id in {
+                             session.get("passive_exit_order_id"),
+                             session.get("protected_exit_order_id"),
+                         } else "BUY" if any(
+                             order_id == str(value)
+                             for value in _items(session.get("augment_order_ids"))
+                         ) else None)
+        fact_side = str(fact.get("side") or "").upper()
+        original = next((_maybe_decimal(receipt.get(key)) for key in ("original_size", "size", "quantity")
+                         if receipt.get(key) is not None), None)
+        quantity = _maybe_decimal(fact.get("quantity"))
+        return (
+            str(fact.get("source") or "") in {"trades", "receipt"}
+            and fact.get("quantity_known") is True
+            and expected_side is not None
+            and side == expected_side
+            and fact_side == expected_side
+            and str(receipt.get("token_id") or "") == str(session.get("token_id") or "")
+            and original is not None and original > 0
+            and quantity is not None and quantity == original
+            and _maybe_decimal(fact.get("fee")) is not None
+        )
 
     def _create_limit(self, **kwargs: object) -> object:
         self._require_mutation()

@@ -4,7 +4,7 @@ import pytest
 
 from decimal import Decimal
 from concurrent.futures import ThreadPoolExecutor
-from threading import Event
+from threading import Event, Thread
 
 from tests.test_lp_auto_pool import setup
 
@@ -836,6 +836,40 @@ def test_failed_session_keeps_capital_but_allows_other_market_buy(tmp_path):
     assert Decimal(state['funds']['buy_reserved_usd']) >= 16
     assert state['funds']['status'] == 'unknown', 'do not present partial facts as complete'
     assert Decimal(state['funds']['spendable_usd']) == 0
+
+
+def test_market_read_capacity_remains_fail_fast_for_shared_snapshot_callers(tmp_path):
+    _, exchange, lp, _ = setup(tmp_path, 2)
+    first_entered, second_entered = Event(), Event()
+    release = Event()
+    snapshot = exchange.lp_snapshot
+    def blocked(request):
+        event = first_entered if request['token_id'] == 'm00' else second_entered
+        event.set()
+        assert release.wait(5)
+        return snapshot(request)
+    exchange.lp_snapshot = blocked
+    def shared_read(identity):
+        lp._facts_owner.session_id = 'test-session'
+        try:
+            lp._read_snapshot(identity)
+        finally:
+            lp._facts_owner.session_id = None
+    reads = [Thread(target=shared_read, args=(identity,))
+             for identity in (dict(condition_id='m00', token_id='m00'),
+                              dict(condition_id='m01', token_id='m01'))]
+    for read in reads:
+        read.start()
+    assert first_entered.wait(2) and second_entered.wait(2)
+    try:
+        lp._facts_owner.session_id = 'test-session'
+        with pytest.raises(ValueError, match='market_read_capacity'):
+            lp._read_snapshot(dict(condition_id='m02', token_id='m02'))
+    finally:
+        lp._facts_owner.session_id = None
+        release.set()
+        for read in reads:
+            read.join(2)
 
 
 def test_market_read_timeout_discards_late_result_and_preserves_other_capacity(tmp_path):

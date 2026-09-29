@@ -2,6 +2,7 @@
 from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -75,6 +76,130 @@ def test_full_pool_replaces_every_market_outside_top_five_without_threshold(tmp_
         'm05', 'm06', 'm07', 'm08', 'm09'}
     assert state['slots']['occupied'] == 5
     assert Decimal(state['funds']['buy_reserved_usd']) == 40
+
+
+def test_rotation_waits_for_first_real_shared_read_and_recovers_without_overbuying(tmp_path, monkeypatch):
+    engine, exchange, lp, _ = setup(tmp_path, monkeypatch, count=2, target=1)
+    exchange.rewards['m01'] = Decimal('25')
+    refresh(lp, exchange, 2)
+    engine.lp_auto_reconcile_unknown()
+
+    slow_entered, fast_entered = threading.Event(), threading.Event()
+    slow_release, fast_release = threading.Event(), threading.Event()
+    metadata = exchange.lp_market_metadata_fresh
+    def blocked_metadata(ids, **kwargs):
+        values = {str(value) for value in ids}
+        if 'm10' in values:
+            slow_entered.set()
+            assert slow_release.wait(5)
+        if 'm11' in values:
+            fast_entered.set()
+            assert fast_release.wait(5)
+        return metadata(ids, **kwargs)
+    exchange.lp_market_metadata_fresh = blocked_metadata
+
+    def read(identity):
+        try:
+            lp._read_candidate_facts(identity)
+        except ValueError:
+            pass
+    slow = threading.Thread(target=read, args=(dict(condition_id='m10', token_id='m10', outcome='YES'),))
+    slow.start()
+    assert slow_entered.wait(2)
+    fast = threading.Thread(target=read, args=(dict(condition_id='m11', token_id='m11', outcome='YES'),))
+    fast.start()
+    assert fast_entered.wait(2)
+    lp._market_read_timeout = 1
+
+    from open_trader import polymarket_lp as lp_module
+    original_wait = lp_module.wait
+    wait_entered = threading.Event()
+    def observed_wait(futures, **kwargs):
+        wait_entered.set()
+        return original_wait(futures, **kwargs)
+    monkeypatch.setattr(lp_module, 'wait', observed_wait)
+
+    try:
+        state = engine.lp_auto_scheduled_check()
+        assert state['last_round']['reason'] == 'market_read_capacity'
+        assert [row['condition_id'] for row in state['last_round']['blocked']] == ['m00']
+        assert exchange.cancels == []
+        assert len(exchange.posts) == 1
+
+        wait_entered.clear()
+        checked = []
+        def check():
+            checked.append(engine.lp_auto_scheduled_check())
+        round_thread = threading.Thread(target=check)
+        round_thread.start()
+        assert wait_entered.wait(2)
+        fast_release.set()
+        round_thread.join(5)
+        assert checked
+        state = checked[0]
+        assert exchange.cancels == ['o1']
+        assert len(exchange.posts) == 1
+        assert state['slots']['occupied'] == 1
+        assert state['funds']['status'] == 'unknown'
+        assert state['funds']['available_usd'] is None
+        assert state['last_round']['reason'] == 'rotation_awaiting_reconciliation'
+    finally:
+        lp._market_read_timeout = 10
+        fast_release.set()
+        slow_release.set()
+        slow.join(2)
+        fast.join(2)
+
+    for order in exchange.orders:
+        order['status'] = 'CANCELED'
+    state = engine.lp_auto_scheduled_check()
+    assert {o['token_id'] for o in exchange.orders if o['status'] == 'LIVE'} == {'m01'}
+    assert state['slots']['occupied'] == 1
+    assert Decimal(state['funds']['buy_reserved_usd']) == 8
+
+
+def test_rotation_reports_exact_block_when_financial_facts_expire(tmp_path, monkeypatch):
+    engine, exchange, lp, _ = setup(tmp_path, monkeypatch, count=2, target=1)
+    exchange.rewards['m01'] = Decimal('25')
+    refresh(lp, exchange, 2)
+    intent = engine.lp_auto_state()['intents'][0]
+    intent_id = intent['intent_id']
+    engine._auto_pool._update(lambda d: d['intents'][intent_id].update(
+        checked_at=(pool.NOW - timedelta(seconds=61)).isoformat()))
+    engine._auto_pool._reconcile_unknown = lambda **kwargs: engine._auto_pool.state()
+
+    state = engine.lp_auto_run_once()
+    assert exchange.cancels == []
+    assert len(exchange.posts) == 1
+    assert state['slots']['occupied'] == 1
+    assert state['last_round']['reason'] == 'financial_facts_stale'
+    assert state['last_round']['blocked'] == [
+        {'condition_id': 'm00', 'token_id': 'm00', 'reason': 'financial_facts_stale'}]
+
+
+def test_rotation_keeps_unknown_occupied_slots_blocked_and_ranks_known_actives(tmp_path, monkeypatch):
+    engine, exchange, lp, _ = setup(tmp_path, monkeypatch, count=3, target=2)
+    exchange.rewards['m02'] = Decimal('25')
+    refresh(lp, exchange, 3)
+    intents = engine.lp_auto_state()['intents']
+    engine._auto_pool._update(lambda d: d['intents'][intents[0]['intent_id']].update(
+        state='unknown', financial_status='unknown', reconcile_reason='missing_reliable_order_id'))
+    targets, _, _, blocked = engine._auto_pool._ranked_buys(engine._auto_pool.state())
+    assert blocked == [{'condition_id': 'm00', 'token_id': 'm00', 'reason': 'missing_reliable_order_id'}]
+    assert targets and targets[0]['condition_id'] == 'm02'
+
+    def all_unknown(document):
+        for intent in document['intents'].values():
+            intent.update(state='unknown', financial_status='unknown',
+                          reconcile_reason='missing_reliable_order_id')
+    engine._auto_pool._update(all_unknown)
+    engine._auto_pool._reconcile_unknown = lambda **kwargs: engine._auto_pool.state()
+    state = engine.lp_auto_run_once()
+    assert len(exchange.posts) == 2
+    assert state['slots']['occupied'] == 2
+    assert state['last_round']['reason'] == 'missing_reliable_order_id'
+    assert [row['reason'] for row in state['last_round']['blocked']] == [
+        'missing_reliable_order_id', 'missing_reliable_order_id']
 
 
 def test_rotation_registers_all_victims_and_isolates_unresolved_terminal(tmp_path, monkeypatch):
@@ -234,9 +359,13 @@ def test_rotation_keeps_existing_buy_when_guard_blocks(tmp_path, monkeypatch, gu
     else:
         exchange.orders[0]['status'] = 'UNKNOWN'
 
-    engine.lp_auto_run_once()
+    state = engine.lp_auto_run_once()
     assert exchange.cancels == []
     assert len(exchange.posts) == 1
+    if guard == 'stale_reward':
+        assert state['last_round']['reason'] == 'rotation_yield_unknown'
+        assert state['last_round']['blocked'] == [
+            {'condition_id': 'm00', 'token_id': 'm00', 'reason': 'rotation_yield_unknown'}]
 
 
 def test_equal_yields_keep_resting_orders_without_counting_them_as_competition(tmp_path, monkeypatch):

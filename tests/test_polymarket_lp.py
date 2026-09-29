@@ -14039,3 +14039,78 @@ def test_null_order_response_stays_unknown_with_specific_reason(tmp_path, monkey
     # A persisted exact terminal receipt is not erased by an unavailable lookup.
     session['order_history']['missing-receipt']['status'] = 'CANCELED'
     assert service._order_history_patch(session, snapshot)['order_history']['missing-receipt']['status'] == 'CANCELED'
+
+
+def test_full_verified_fill_closes_missing_order_receipt_without_guessing(tmp_path):
+    service = object.__new__(PolymarketLPService)
+    base = {
+        'token_id': 'token',
+        'entry_order_id': 'buy',
+        'passive_exit_order_id': 'sell',
+        'owned_order_ids': ['buy', 'sell'],
+        'order_history': {
+            'buy': {'order_id': 'buy', 'status': 'MATCHED', 'side': 'BUY', 'token_id': 'token'},
+            'sell': {
+                'order_id': 'sell', 'status': 'UNKNOWN', 'read_error': 'order_lookup_unavailable',
+                'side': 'SELL', 'token_id': 'token', 'original_size': '50',
+            },
+        },
+        'verified_order_fills': {
+            'sell': {
+                'order_id': 'sell', 'side': 'SELL', 'quantity': '50',
+                'quantity_known': True, 'fee': '0', 'source': 'trades',
+            },
+        },
+    }
+    snapshot = {'orders': [], 'order_read_errors': {'sell': 'order_lookup_unavailable'}}
+
+    patch = service._order_history_patch(base, snapshot)
+    assert patch['order_history']['sell']['status'] == 'MATCHED'
+    assert 'read_error' not in patch['order_history']['sell']
+    assert patch['orders_terminal'] is True
+
+    for fact, history in (
+        ({**base['verified_order_fills']['sell'], 'quantity': '49'}, {}),
+        ({**base['verified_order_fills']['sell'], 'fee': None}, {}),
+        ({**base['verified_order_fills']['sell'], 'quantity_known': False}, {}),
+        (base['verified_order_fills']['sell'], {'original_size': None}),
+    ):
+        variant = {**base, 'verified_order_fills': {'sell': fact}, 'order_history': {
+            'buy': base['order_history']['buy'],
+            'sell': {**base['order_history']['sell'], **history},
+        }}
+        patch = service._order_history_patch(variant, snapshot)
+        assert patch['order_history']['sell']['status'] == 'UNKNOWN'
+        assert patch['orders_terminal'] is False
+
+
+def test_wrong_direction_verified_fill_keeps_missing_augment_receipt_unknown(tmp_path):
+    service = object.__new__(PolymarketLPService)
+    base = {
+        'token_id': 'token',
+        'entry_order_id': 'entry',
+        'augment_order_ids': ['augment'],
+        'owned_order_ids': ['entry', 'augment'],
+        'order_history': {
+            'entry': {'order_id': 'entry', 'status': 'MATCHED', 'side': 'BUY', 'token_id': 'token'},
+            'augment': {
+                'order_id': 'augment', 'status': 'UNKNOWN', 'read_error': 'order_lookup_unavailable',
+                'side': 'BUY', 'token_id': 'token', 'original_size': '20',
+            },
+        },
+    }
+    fact = {
+        'order_id': 'augment', 'side': 'SELL', 'quantity': '20',
+        'quantity_known': True, 'fee': '0', 'source': 'trades',
+    }
+    snapshot = {'orders': [], 'order_read_errors': {'augment': 'order_lookup_unavailable'}}
+
+    for receipt_side in ('SELL', 'BUY'):
+        session = {**base, 'verified_order_fills': {'augment': fact}, 'order_history': {
+            'entry': base['order_history']['entry'],
+            'augment': {**base['order_history']['augment'], 'side': receipt_side},
+        }}
+        patch = service._order_history_patch(session, snapshot)
+        assert patch['order_history']['augment']['status'] == 'UNKNOWN'
+        assert patch['order_history']['augment']['read_error'] == 'order_lookup_unavailable'
+        assert patch['orders_terminal'] is False

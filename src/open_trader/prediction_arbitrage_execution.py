@@ -27,7 +27,7 @@ from .notifications import (
     render_prediction_opportunity_notification,
     render_yes_no_signal_notification,
 )
-from .polymarket_lp import queue_protection_status_view
+from .polymarket_lp import SCORING_STALE_SECONDS, queue_protection_status_view
 from .polymarket_trading import (
     LegResult,
     PairSubmission,
@@ -2492,11 +2492,41 @@ class PredictionExecutionService:
                         }
                     )
 
+                session_scoring_by_order: dict[
+                    str, tuple[str, str | None, str | None]
+                ] = {}
+                for view_source in view_sources:
+                    order_id = str(view_source.get("scoring_order_id") or "")
+                    status = str(view_source.get("scoring_status") or "unknown")
+                    checked_scoring_at = _lp_share_datetime(
+                        view_source.get("scoring_checked_at")
+                    )
+                    if (
+                        order_id
+                        and status in {"true", "false"}
+                        and checked_scoring_at is not None
+                        and 0
+                        <= (checked - checked_scoring_at).total_seconds()
+                        <= float(SCORING_STALE_SECONDS)
+                    ):
+                        session_scoring_by_order[order_id] = (
+                            status,
+                            view_source.get("scoring_checked_at"),
+                            view_source.get("scoring_last_success_at"),
+                        )
                 scoring_reader = getattr(self._trading, "get_order_scoring", None)
                 scoring_by_order: dict[str, tuple[str, str | None, str | None]] = {}
                 for order in orders:
                     order_id = str(order.get("order_id") or "")
+                    if order_id in session_scoring_by_order:
+                        order["scoring_status"], order["scoring_checked_at"], order[
+                            "scoring_last_success_at"
+                        ] = session_scoring_by_order[order_id]
+                        continue
                     if order.get("management") != "manual_read_only" or not order_id:
+                        order["scoring_status"] = "unknown"
+                        order["scoring_checked_at"] = None
+                        order["scoring_last_success_at"] = None
                         continue
                     if order_id not in scoring_by_order:
                         attempted_at = _timestamp(datetime.now(UTC))

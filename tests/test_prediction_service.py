@@ -2989,6 +2989,117 @@ def test_lp_dashboard_covers_today_table_system_markets_in_reward_cache(
     assert reward["market_amount"] == "3.42"
 
 
+def test_lp_dashboard_reuses_fresh_session_scoring_for_exact_system_order(
+    tmp_path: Path,
+) -> None:
+    """系统托管单复用会话的精确订单计分；错位事实保持 UNKNOWN。"""
+
+    checked_at = datetime.now(UTC)
+    checked_at_text = checked_at.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+    class Account:
+        def lp_account_snapshot(self) -> dict[str, object]:
+            return {
+                "authenticated": True,
+                "checked_at": checked_at,
+                "open_orders": [
+                    {
+                        "id": "system-order-1",
+                        "condition_id": "condition-1",
+                        "token_id": "sys-yes",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "original_size": Decimal("2"),
+                        "size_matched": Decimal("0"),
+                    },
+                    {
+                        "id": "system-order-2",
+                        "condition_id": "condition-2",
+                        "token_id": "sys-no",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "original_size": Decimal("2"),
+                        "size_matched": Decimal("0"),
+                    },
+                    {
+                        "id": "system-order-3",
+                        "condition_id": "condition-3",
+                        "token_id": "sys-third",
+                        "side": "BUY",
+                        "status": "LIVE",
+                        "original_size": Decimal("2"),
+                        "size_matched": Decimal("0"),
+                    },
+                ],
+                "positions": [],
+            }
+
+        def lp_reward_snapshots(
+            self, reward_date: str, condition_ids: object
+        ) -> dict[str, object]:
+            return {}
+
+    class LP:
+        def candidate_snapshot(self) -> dict[str, object]:
+            return {"state": "ready", "complete": True, "candidates": []}
+
+        def status(self) -> dict[str, object]:
+            return {"state": "none"}
+
+    store = PredictionArbitrageStore(tmp_path / "data")
+    for session_id, order_id, condition_id, token_id, scoring_target, scoring_at in (
+        ("session-1", "system-order-1", "condition-1", "sys-yes", "system-order-1", checked_at),
+        (
+            "session-2",
+            "system-order-2",
+            "condition-2",
+            "sys-no",
+            "system-order-2",
+            checked_at - timedelta(seconds=16),
+        ),
+        ("session-3", "system-order-3", "condition-3", "sys-third", "different-order", checked_at),
+    ):
+        store.lp_create_session(
+            session_id,
+            "idempotency-" + session_id,
+            state="entry_open",
+            payload={
+                "condition_id": condition_id,
+                "token_id": token_id,
+                "entry_order_id": order_id,
+                "scoring_order_id": scoring_target,
+                "scoring_status": "true",
+                "scoring_checked_at": scoring_at.isoformat(timespec="microseconds").replace(
+                    "+00:00", "Z"
+                ),
+                "scoring_last_success_at": scoring_at.isoformat(timespec="microseconds").replace(
+                    "+00:00", "Z"
+                ),
+            },
+        )
+    service = PredictionExecutionService(
+        store=store,
+        monitor=object(),
+        trading=Account(),
+        notifier=NullNotifier(),
+        lock_path=tmp_path / "execution.lock",
+        lp=LP(),
+    )
+
+    payload = service.refresh_lp_dashboard_snapshot()
+    by_order = {row["order_id"]: row for row in payload["lp_orders_today"]}
+
+    assert by_order["system-order-1"]["scoring_status"] == "true"
+    assert by_order["system-order-1"]["scoring_checked_at"] == checked_at_text
+    assert by_order["system-order-1"]["scoring_last_success_at"] == checked_at_text
+    assert by_order["system-order-2"]["scoring_status"] == "unknown"
+    assert by_order["system-order-2"]["scoring_checked_at"] is None
+    assert by_order["system-order-2"]["scoring_last_success_at"] is None
+    assert by_order["system-order-3"]["scoring_status"] == "unknown"
+    assert by_order["system-order-3"]["scoring_checked_at"] is None
+    assert by_order["system-order-3"]["scoring_last_success_at"] is None
+
+
 def test_lp_reward_cache_throttles_today_table_refetch_within_60s(
     tmp_path: Path,
 ) -> None:

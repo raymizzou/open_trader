@@ -179,6 +179,7 @@ class LPAutoPool:
         intents = list(d['intents'].values())
         occupied = [i for i in intents if i['state'] not in ('terminal','rejected','aborted')]
         pending = [i for i in occupied if i['state'] in ('reserved','sending','unknown')]
+        pending_review = [i for i in pending if i['state']=='unknown']
         canceling = [i for i in occupied if i['state']=='canceling']
         pnl = sum((_decimal(i.get('realized_pnl_usd',0)) for i in intents), ZERO)
         inventory = sum((_decimal(i.get('inventory_cost_usd',0)) for i in intents), ZERO)
@@ -232,7 +233,8 @@ class LPAutoPool:
                     runtime_state='paused' if not d['desired_running'] else 'blocked' if admission_reasons else 'running',
                     reason=manual_reason or (reasons[0] if reasons else None), funds=funds,
                     slots=dict(active=len(occupied)-len(pending)-len(canceling),pending=len(pending),
-                               canceling=len(canceling),occupied=len(occupied)), intents=deepcopy(intents))
+                               pending_review=len(pending_review),canceling=len(canceling),
+                               occupied=len(occupied)), intents=deepcopy(intents))
 
     def state(self):
         return self._projection(self._read())
@@ -348,15 +350,34 @@ class LPAutoPool:
         active = [i for i in state['intents'] if i['state'] not in ('terminal', 'rejected', 'aborted')]
         if len(active) < state['target_buy_count']:
             candidates = self.candidates()
-            return candidates, [], candidates
+            return candidates, [], candidates, []
         occupied_count = len(active)
-        active = [i for i in active if i['state'] == 'active'
-                  and i.get('financial_status') == 'known' and self._funds_fresh(i)]
+        blocked = []
+        rankable = []
+        state_reasons = {'reserved': 'submission_pending', 'sending': 'submission_pending',
+                         'unknown': 'submission_unknown', 'canceling': 'rotation_awaiting_reconciliation'}
+        for intent in active:
+            if intent['state'] != 'active':
+                blocked.append({'condition_id': intent['condition_id'], 'token_id': intent['token_id'],
+                                'reason': intent.get('reconcile_reason') or state_reasons[intent['state']]})
+                continue
+            if intent.get('financial_status') != 'known':
+                blocked.append({'condition_id': intent['condition_id'], 'token_id': intent['token_id'],
+                                'reason': 'financial_facts_unknown'})
+                continue
+            try:
+                _freshness(intent.get('checked_at'), self._now(), 'financial_facts', max_age=Decimal(60))
+            except ValueError as exc:
+                blocked.append({'condition_id': intent['condition_id'], 'token_id': intent['token_id'],
+                                'reason': str(exc)})
+                continue
+            rankable.append(intent)
+        active = rankable
         rows = []
         for intent in active:
             try:
                 self._rotation_session(intent)
-                facts = self.lp._read_candidate_facts(intent)
+                facts = self.lp._read_candidate_facts(intent, wait_for_capacity=True)
                 account, direction = facts['account'], facts['direction']
                 wallet = str(account.get('wallet_address') or '').strip().casefold()
                 if not wallet or hashlib.sha256(wallet.encode()).hexdigest() != state['account_id']:
@@ -376,17 +397,20 @@ class LPAutoPool:
                 estimate = minimum_order_estimate(direction, intent, self._now(), resting_quantity=_decimal(intent['quantity']))
                 if estimate['state'] != 'known':
                     raise ValueError('rotation_yield_unknown')
-                rows.append({**intent, 'minimum_order_estimate': estimate,
-                             'ranking_account': account, 'ranking_book_at': direction['book']['received_at'],
-                             'ranking_reward_at': direction['reward_checked_at']})
+                row = {**intent, 'minimum_order_estimate': estimate,
+                       'ranking_account': account, 'ranking_book_at': direction['book']['received_at'],
+                       'ranking_reward_at': direction['reward_checked_at']}
+                self._ranking_fresh(row)
+                rows.append(row)
             except ValueError as exc:
                 if 'identity' in str(exc):
                     raise
+                blocked.append({'condition_id': intent['condition_id'], 'token_id': intent['token_id'], 'reason': str(exc)})
                 continue
         active = [i for i in active if any(r['intent_id'] == i['intent_id'] for r in rows)]
         slots = state['target_buy_count'] - (occupied_count - len(active))
         if slots <= 0:
-            return [], [], []
+            return [], [], [], blocked
         candidates = self.candidates(releasing=active)
         rows.extend(candidates)
         refreshed = {(r['condition_id'], r['token_id']) for r in rows if r.get('intent_id')}
@@ -401,7 +425,7 @@ class LPAutoPool:
             if pending is None:
                 break
             try:
-                facts = self.lp._read_candidate_facts(pending)
+                facts = self.lp._read_candidate_facts(pending, wait_for_capacity=True)
                 account, direction = facts['account'], facts['direction']
                 evaluated = evaluate_lp_entry(direction, account=self._ranking_account(account, active),
                     now=self._now(), reservations=self._ranking_reservations(active), candidate=True)
@@ -417,10 +441,12 @@ class LPAutoPool:
                     raise ValueError('ranking_yield_unknown')
                 pending.update(evaluated['guidance'], minimum_order_estimate=estimate, ranking_account=account,
                                ranking_book_at=direction['book']['received_at'], ranking_reward_at=direction['reward_checked_at'])
+                self._ranking_fresh(pending)
                 refreshed.add((pending['condition_id'], pending['token_id']))
             except ValueError as exc:
                 if 'identity' in str(exc):
                     raise
+                blocked.append({'condition_id': pending['condition_id'], 'token_id': pending['token_id'], 'reason': str(exc)})
                 rows.remove(pending)
                 candidates.remove(pending)
         for row in targets:
@@ -438,7 +464,7 @@ class LPAutoPool:
             if capital > available:
                 raise ValueError('top_yield_funds_insufficient')
         candidates.sort(key=lambda r: (-_decimal(r['minimum_order_estimate']['yield_pct_per_hour']), str(r['condition_id']), str(r['token_id'])))
-        return targets, victims, candidates
+        return targets, victims, candidates, blocked
 
     def _ranking_fresh(self, row):
         wallet = str(row['ranking_account'].get('wallet_address') or '').strip().casefold()
@@ -1001,11 +1027,14 @@ class LPAutoPool:
         actions=[]
         candidates=[]
         targets=[]
+        blocked=[]
         reason=(state['admission_block_reasons'] or [None])[0] or (rotation_reason if rotation_reason == 'rotation_filled' else None)
         self._update(lambda doc:doc['rounds'].update({round_id:dict(started_at=self._stamp())}))
         if state['desired_running'] and not reason and not state['admission_block_reasons'] and self.execution.lp_mutation_allowed():
             try:
-                targets, victims, candidates = self._ranked_buys(state)
+                targets, victims, candidates, blocked = self._ranked_buys(state)
+                if not targets and blocked:
+                    reason = blocked[0]['reason']
                 if victims:
                     actions.extend(self._rotate_out(victims, targets, d['config_version']))
                     reason = 'rotation_awaiting_reconciliation'
@@ -1035,7 +1064,7 @@ class LPAutoPool:
                         for r in candidates[:10]],candidate_count=len(candidates),
             targets=[{k: r[k] for k in ('condition_id','token_id','price','quantity','minimum_order_estimate')}
                      for r in targets[:d['target_buy_count']]],
-            reason=reason or rotation_reason or ('candidates_or_funds_insufficient' if self._projection(doc)['slots']['occupied']<doc['target_buy_count'] else 'target_filled'))))
+            reason=reason or rotation_reason or ('candidates_or_funds_insufficient' if self._projection(doc)['slots']['occupied']<doc['target_buy_count'] else 'target_filled'),blocked=blocked)))
         return self.state()
 
     def report_facts(self, period_start=None, period_end=None):
