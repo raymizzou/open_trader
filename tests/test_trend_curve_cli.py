@@ -11,6 +11,7 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
@@ -4460,8 +4461,11 @@ def test_daily_enforces_request_interval_and_post_sleep_deadline(
                 "data": {"encryptedData": healthy_response},
             }
 
-        monkeypatch.setattr(trend_curve_research.time, "monotonic", clock_now)
-        monkeypatch.setattr(trend_curve_research.time, "sleep", sleep)
+        monkeypatch.setattr(
+            trend_curve_research,
+            "time",
+            SimpleNamespace(monotonic=clock_now, sleep=sleep, time_ns=time.time_ns),
+        )
         monkeypatch.setattr(
             trend_curve_research, "_default_curve_transport", curve_transport
         )
