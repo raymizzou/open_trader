@@ -625,7 +625,7 @@ def test_rotation_retry_uses_real_adapter_account_completeness(tmp_path, monkeyp
             orders[0]['size_matched'] = '8'
             positions = [dict(token_id='m00', condition_id='m00', size='8')]
         checked_at = pool.NOW - timedelta(seconds=61) if raw_facts == 'stale' else pool.NOW
-        return Decimal('1000'), Decimal('1000'), orders, positions, checked_at
+        return Decimal('1000'), Decimal('1000'), orders, positions, checked_at, (), True
 
     adapter = PolymarketTradingClient(TradingConfig('test-signer', 'test-wallet'), SimpleNamespace())
     adapter._account_read_facts = read_account

@@ -20,6 +20,7 @@ from copy import deepcopy
 from contextlib import contextmanager
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from datetime import UTC, date as Date, datetime
@@ -1312,10 +1313,10 @@ def _lp_trade(value: object) -> dict[str, object] | None:
         return None
     trade_id = row.get("id", row.get("trade_id"))
     token_id = row.get("token_id", row.get("asset_id"))
+    raw_makers = row.get("maker_orders", ())
     if trade_id in (None, "") or token_id in (None, ""):
         return None
     makers: list[dict[str, object]] = []
-    raw_makers = row.get("maker_orders", ())
     if not isinstance(raw_makers, Sequence) or isinstance(raw_makers, (str, bytes)):
         return None
     for maker in raw_makers:
@@ -1397,6 +1398,145 @@ def _trade_timestamp(value: object) -> datetime | None:
     return None
 
 
+def _lp_full_trade_is_relevant(
+    value: object,
+    *,
+    condition_id: str,
+    token_id: str,
+    exact_order_ids: set[str],
+) -> bool:
+    """Decide relevance before parsing, without trusting only top-level IDs."""
+
+    row = _model_dict(value)
+    if row is None:
+        # An unnormalizable row has no proof it is unrelated. Preserve the
+        # original fail-closed behavior instead of silently discarding it.
+        return True
+    top_condition = str(
+        _field(row, "condition_id", _field(row, "market", "")) or ""
+    )
+    top_token = str(
+        _field(row, "token_id", _field(row, "asset_id", "")) or ""
+    )
+    exact_ids = {str(_field(row, "taker_order_id", "") or "")}
+    ambiguous_maker = False
+    matching_maker_token = False
+    for maker in _collect(row.get("maker_orders")):
+        maker_row = _model_dict(maker)
+        if maker_row is not None:
+            exact_ids.add(
+                str(_field(maker_row, "order_id", _field(maker_row, "id", "")) or "")
+            )
+            maker_token = str(
+                _field(maker_row, "token_id", _field(maker_row, "asset_id", "")) or ""
+            )
+            if maker_token in ("", token_id):
+                matching_maker_token = True
+        else:
+            ambiguous_maker = True
+    if exact_order_ids & exact_ids:
+        return True
+    if top_condition not in ("", condition_id):
+        return False
+    if matching_maker_token or ambiguous_maker:
+        return True
+    # A missing top-level token is ambiguous only when the condition itself
+    # matches; maker legs still determine attribution after normalization.
+    return top_token in ("", token_id)
+
+
+_LP_BUNDLE_FILL_STATUSES = frozenset({"CONFIRMED", "MATCHED", "FILLED"})
+
+
+def _lp_bundle_receipt_facts(
+    raw_trades: object,
+) -> dict[str, tuple[Decimal | None, set[str]]]:
+    """Aggregate exact-order fills from one complete trade bundle."""
+
+    observed: dict[tuple[str, str], list[Decimal]] = {}
+    trade_ids_by_order: dict[str, set[str]] = {}
+    ambiguous_orders: set[str] = set()
+    all_order_ids: set[str] = set()
+    for raw in _collect(raw_trades):
+        row = _model_dict(raw)
+        if row is None:
+            continue
+        status = str(_field(row, "status", "") or "").upper()
+        if status.startswith("TRADE_STATUS_"):
+            status = status[len("TRADE_STATUS_") :]
+        trade_id = str(_field(row, "id", _field(row, "trade_id", "")) or "")
+        taker_id = str(_field(row, "taker_order_id", "") or "")
+        row_order_ids: set[str] = set()
+        if taker_id:
+            row_order_ids.add(taker_id)
+        for maker in _collect(row.get("maker_orders")):
+            maker_row = _model_dict(maker)
+            if maker_row is None:
+                continue
+            maker_id = str(
+                _field(maker_row, "order_id", _field(maker_row, "id", "")) or ""
+            )
+            if maker_id:
+                row_order_ids.add(maker_id)
+        # Failed and pending identities are not fill quantity, but the venue
+        # may still reference them from an exact order receipt. Record their
+        # presence so a known FAILED trade cannot masquerade as newly observed.
+        if trade_id:
+            for order_id in row_order_ids:
+                trade_ids_by_order.setdefault(order_id, set()).add(trade_id)
+                all_order_ids.add(order_id)
+        if status not in _LP_BUNDLE_FILL_STATUSES:
+            # FAILED and unknown states are not evidence of a successful fill.
+            continue
+        if not trade_id:
+            # Without a venue identity, repeated pages cannot be distinguished
+            # from additional fills.
+            # Scope ambiguity to the exact orders carried by this malformed
+            # row; earlier unrelated rows must not become UNKNOWN.
+            ambiguous_orders.update(row_order_ids)
+            continue
+        amounts: list[tuple[str, Decimal]] = []
+        taker_quantity = _lp_decimal(row.get("size"))
+        if taker_id and taker_quantity is not None:
+            amounts.append((taker_id, taker_quantity))
+        for maker in _collect(row.get("maker_orders")):
+            maker_row = _model_dict(maker)
+            if maker_row is None:
+                continue
+            maker_id = str(
+                _field(maker_row, "order_id", _field(maker_row, "id", "")) or ""
+            )
+            amount = _lp_decimal(
+                maker_row.get("matched_amount", maker_row.get("size"))
+            )
+            if not maker_id or amount is None:
+                continue
+            amounts.append((maker_id, amount))
+        for order_id, amount in amounts:
+            observed.setdefault((order_id, trade_id), []).append(amount)
+            trade_ids_by_order.setdefault(order_id, set()).add(trade_id)
+            all_order_ids.add(order_id)
+
+    quantities: dict[str, Decimal] = {}
+    for (order_id, _trade_id), amounts in observed.items():
+        if any(amount is None for amount in amounts):
+            ambiguous_orders.add(order_id)
+            continue
+        unique = set(amounts)
+        if len(unique) != 1:
+            ambiguous_orders.add(order_id)
+            continue
+        quantities[order_id] = quantities.get(order_id, Decimal("0")) + unique.pop()
+
+    fills: dict[str, tuple[Decimal | None, set[str]]] = {}
+    for order_id in all_order_ids:
+        fills[order_id] = (
+            None if order_id in ambiguous_orders else quantities.get(order_id, Decimal("0")),
+            trade_ids_by_order.get(order_id, set()),
+        )
+    return fills
+
+
 def _string_refs(value: object) -> set[str]:
     if isinstance(value, str):
         return {value} if value.strip() else set()
@@ -1442,6 +1582,27 @@ def _reward_amount(
             return None
         total += value
     return total
+
+
+@dataclass(eq=False)
+class _LpAccountRound:
+    """One explicitly ended, read-only reconciliation scope."""
+
+    client: "PolymarketTradingClient"
+    lock: threading.Lock
+    active: bool = True
+    generation: int = 0
+    trade_generation_provider: Callable[[], int] | None = None
+    trade_generation: int | None = None
+    future: "Future[Mapping[str, object]] | None" = None
+
+
+class LpNewerAccountFacts(ValueError):
+    """Exact account evidence that the observed DB trade generation is old."""
+
+    def __init__(self, *, observed_trade_generation: int) -> None:
+        super().__init__("external_snapshot_unknown")
+        self.observed_trade_generation = observed_trade_generation
 
 
 class PolymarketTradingClient:
@@ -1588,7 +1749,15 @@ class PolymarketTradingClient:
 
     def _account_read_facts(
         self,
-    ) -> tuple[Decimal, Decimal, tuple[object, ...], tuple[object, ...], datetime]:
+    ) -> tuple[
+        Decimal,
+        Decimal,
+        tuple[object, ...],
+        tuple[object, ...],
+        datetime,
+        tuple[object, ...],
+        bool,
+    ]:
         try:
             with _lp_read_stage("account_balance"):
                 p_usd_balance, p_usd_allowance = self._collateral_balance_allowance()
@@ -1599,27 +1768,41 @@ class PolymarketTradingClient:
                     raise ValueError("open_orders_unknown")
                 orders = tuple(_collect(raw_orders))
             # This read is intentionally performed even though the snapshot only
-            # stores open-order data; the authenticated preflight must prove it.
+            # formerly discarded it; the round now preserves the complete list.
             with _lp_read_stage("account_trades"):
                 raw_trades = self._client.list_account_trades()
                 if raw_trades is None:
                     raise ValueError("account_trades_unknown")
-                _collect(raw_trades)
+                trades = tuple(_collect(raw_trades))
             with _lp_read_stage("account_positions"):
                 raw_positions = self._client.list_positions()
                 if raw_positions is None:
                     raise ValueError("positions_unknown")
                 positions = tuple(_collect(raw_positions))
-            return p_usd_balance, p_usd_allowance, orders, positions, checked_at
+            return (
+                p_usd_balance,
+                p_usd_allowance,
+                orders,
+                positions,
+                checked_at,
+                trades,
+                True,
+            )
         except Exception as exc:
             code = _safe_error_code(exc)
             del exc
             raise PolymarketTradingError(code) from None
 
     def account_snapshot(self) -> AccountSnapshot:
-        p_usd_balance, p_usd_allowance, orders, positions, checked_at = (
-            self._account_read_facts()
-        )
+        (
+            p_usd_balance,
+            p_usd_allowance,
+            orders,
+            positions,
+            checked_at,
+            _raw_trades,
+            _trades_complete,
+        ) = self._account_read_facts()
         open_order_ids = tuple(
             _safe_string(order_id)
             for order in orders
@@ -1696,11 +1879,132 @@ class PolymarketTradingClient:
                 row["condition_id"] = market.get("condition_id")
         return account
 
-    def _lp_account_facts(self) -> dict[str, object]:
+    def lp_account_round_begin(
+        self, trade_generation_provider: Callable[[], int] | None = None
+    ) -> _LpAccountRound:
+        """Start an empty account scope; no network work occurs until a read."""
+
+        return _LpAccountRound(
+            client=self,
+            lock=threading.Lock(),
+            trade_generation_provider=trade_generation_provider,
+        )
+
+    def lp_account_round_end(self, token: object) -> None:
+        """Discard the scope so a late reader can never refill or serve it."""
+
+        if not isinstance(token, _LpAccountRound) or token.client is not self:
+            raise ValueError("lp_account_round_invalid")
+        with token.lock:
+            token.active = False
+            token.generation += 1
+            token.future = None
+
+    def lp_account_round_invalidate(self, token: object) -> None:
+        """Begin a new generation without waiting for an in-flight read."""
+
+        if not isinstance(token, _LpAccountRound) or token.client is not self:
+            raise ValueError("lp_account_round_invalid")
+        with token.lock:
+            if not token.active:
+                return
+            token.generation += 1
+            # Clear only the slot owned at this invalidation instant. A later
+            # generation owns a different Future and is never erased here.
+            token.future = None
+
+    def _lp_account_snapshot_for_round(
+        self, token: _LpAccountRound
+    ) -> tuple[Mapping[str, object], int, int | None]:
+        """Return one shared account bundle, scope generation, and DB fence."""
+
+        future: Future[tuple[Mapping[str, object], int | None]] | None
+        generation: int
+        owner = False
+        with token.lock:
+            if not token.active:
+                raise ValueError("lp_account_round_invalid")
+            generation = token.generation
+            future = token.future
+            if future is None:
+                future = Future()
+                token.future = future
+                owner = True
+        if owner:
+            provider = token.trade_generation_provider
+            try:
+                before_generation = provider() if callable(provider) else None
+                snapshot: Mapping[str, object] = deepcopy(
+                    self._lp_account_facts(include_raw_trades=True)
+                )
+                after_generation = provider() if callable(provider) else before_generation
+            except BaseException as exc:
+                with token.lock:
+                    if token.future is future:
+                        token.future = None
+                future.set_exception(exc)
+                raise
+            if before_generation != after_generation:
+                with token.lock:
+                    if token.future is future:
+                        token.future = None
+                future.set_exception(ValueError("lp_account_round_invalid"))
+                raise ValueError("lp_account_round_invalid")
+            with token.lock:
+                future.set_result((snapshot, after_generation))
+                if token.future is future:
+                    token.trade_generation = after_generation
+                if (
+                    token.future is future
+                    and (not token.active or token.generation != generation)
+                ):
+                    token.future = None
+            if not token.active or token.generation != generation:
+                raise ValueError("lp_account_round_invalid")
+            return snapshot, generation, after_generation
+        snapshot, trade_generation = future.result()
+        with token.lock:
+            if not token.active or token.generation != generation:
+                raise ValueError("lp_account_round_invalid")
+        return deepcopy(snapshot), generation, trade_generation
+
+    def _lp_account_round_matches(
+        self, token: _LpAccountRound, generation: int
+    ) -> None:
+        with token.lock:
+            if not token.active or token.generation != generation:
+                raise ValueError("lp_account_round_invalid")
+
+    def lp_open_orders_for_round(self, token: object) -> list[dict[str, object]]:
+        """Return the shared bundle's complete normalized open-order facts."""
+
+        if (
+            not isinstance(token, _LpAccountRound)
+            or token.client is not self
+        ):
+            raise ValueError("lp_account_round_invalid")
+        account, generation, _trade_generation = self._lp_account_snapshot_for_round(token)
+        self._lp_account_round_matches(token, generation)
+        if account.get("open_orders_complete") is not True:
+            # A dropped malformed row is not an empty list. Reuse the
+            # authenticated list's existing unknown read semantics so the
+            # caller treats it as an outage instead of proving anchors gone.
+            raise ValueError("open_orders_unknown")
+        return deepcopy(list(account.get("open_orders", ())))
+
+    def _lp_account_facts(self, *, include_raw_trades: bool = False) -> dict[str, object]:
         """Normalize complete authenticated lists before any display enrichment."""
 
         lp_checked_at = datetime.now(UTC)
-        balance, allowance, orders, positions, account_checked_at = self._account_read_facts()
+        (
+            balance,
+            allowance,
+            orders,
+            positions,
+            account_checked_at,
+            raw_trades,
+            trades_complete,
+        ) = self._account_read_facts()
         checked_at = (
             account_checked_at
             if isinstance(account_checked_at, datetime)
@@ -1758,6 +2062,11 @@ class PolymarketTradingClient:
             "checked_at": checked_at,
             "open_orders_complete": open_orders_complete,
             "positions_complete": positions_complete,
+            # Normalize only session-relevant raw rows in lp_snapshot.  A bad
+            # unrelated historical row must not poison every active market.
+            "trades": (),
+            "trades_complete": trades_complete,
+            **({"raw_trades": raw_trades} if include_raw_trades else {}),
         }
 
     def lp_open_orders_snapshot(self) -> dict[str, object]:
@@ -4069,14 +4378,25 @@ class PolymarketTradingClient:
         if not market_id or not condition_id or not token_id:
             raise ValueError("external_snapshot_unknown")
         try:
+            account_round = request.get("_lp_account_round")
+            account_generation: int | None = None
+            bundle_trade_generation: int | None = None
             with _lp_read_stage("account"):
-                account = self._lp_account_facts()
+                if account_round is None:
+                    account = self._lp_account_facts(include_raw_trades=True)
+                else:
+                    if (
+                        not isinstance(account_round, _LpAccountRound)
+                        or account_round.client is not self
+                    ):
+                        raise ValueError("lp_account_round_invalid")
+                    account, account_generation, bundle_trade_generation = (
+                        self._lp_account_snapshot_for_round(account_round)
+                    )
+                    account = deepcopy(account)
             open_orders = account['open_orders']
-            with _lp_read_stage("session_trades"):
-                raw_trades = self._client.list_account_trades(token_id=token_id, market=condition_id)
-                if raw_trades is None:
-                    raise ValueError("external_snapshot_unknown")
-                trades = tuple(_collect(raw_trades))
+            if account.get("trades_complete") is not True:
+                raise ValueError("external_snapshot_unknown")
             order_facts: list[object] = list(open_orders)
             known_ids = {
                 str(_field(order, "id", _field(order, "order_id", "")))
@@ -4089,7 +4409,24 @@ class PolymarketTradingClient:
                     *_collect(request.get("owned_order_ids")),
                 ) if value
             }
+            raw_trades = account.get("raw_trades", ())
+            trades = tuple(
+                trade
+                for trade in raw_trades
+                if _lp_full_trade_is_relevant(
+                    trade,
+                    condition_id=condition_id,
+                    token_id=token_id,
+                    exact_order_ids=order_ids,
+                )
+            )
             order_read_errors = {}
+            missing_order_ids = order_ids - known_ids
+            bundle_receipt_facts = (
+                _lp_bundle_receipt_facts(account.get("raw_trades", ()))
+                if missing_order_ids
+                else {}
+            )
             for order_id in sorted(order_ids):
                 if order_id in known_ids:
                     with self._lp_order_read_lock:
@@ -4123,6 +4460,35 @@ class PolymarketTradingClient:
                     continue
                 normalized = _lp_order(order)
                 if normalized is not None:
+                    if account_round is not None:
+                        raw_receipt = _model_dict(order) or {}
+                        receipt_matched = _lp_decimal(
+                            normalized.get("size_matched")
+                        )
+                        receipt_trades = {
+                            str(value)
+                            for value in _collect(raw_receipt.get("associate_trades"))
+                            if value
+                        }
+                        bundle_matched, bundle_trades = bundle_receipt_facts.get(
+                            str(normalized.get("order_id") or ""),
+                            (Decimal("0"), set()),
+                        )
+                        if receipt_matched is None or bundle_matched is None:
+                            # Exact consistency cannot be proven; the consumer
+                            # must stay UNKNOWN without guessing chronology.
+                            # The get_order response itself was valid. Do not
+                            # cool it down like a transport or parse failure;
+                            # fresh complete history can resolve immediately.
+                            order_read_errors[order_id] = "order_receipt_unknown"
+                            continue
+                        if receipt_matched > bundle_matched or receipt_trades - bundle_trades:
+                            self._lp_account_round_matches(
+                                account_round, account_generation or 0
+                            )
+                            raise LpNewerAccountFacts(
+                                observed_trade_generation=bundle_trade_generation or 0
+                            )
                     order_facts.append(normalized)
                     known_ids.add(order_id)
                     with self._lp_order_read_lock:
@@ -4203,7 +4569,12 @@ class PolymarketTradingClient:
                 "reward_min_size": _lp_decimal(reward_min),
                 "reward_max_spread": normalized_reward_spread,
             }
-            account_facts = {**account, "open_orders": list(open_orders)}
+            account_facts = {
+                key: value
+                for key, value in account.items()
+                if key not in {"raw_trades", "trades", "trades_complete"}
+            }
+            account_facts["open_orders"] = list(open_orders)
             order_rows = order_facts
             order_statuses = {
                 str(_field(order, "id", _field(order, "order_id", ""))): str(
@@ -4243,7 +4614,10 @@ class PolymarketTradingClient:
                 ),
                 "account_checked_at": account["checked_at"],
                 "book_checked_at": book.get("received_at"),
+                "_lp_trade_generation": bundle_trade_generation,
             }
+            if account_round is not None:
+                self._lp_account_round_matches(account_round, account_generation)
             return result
         except PolymarketTradingError:
             raise ValueError("external_snapshot_unknown") from None

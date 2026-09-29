@@ -42,7 +42,7 @@ from .prediction_arbitrage_store import (
     PredictionArbitrageStore,
 )
 from .notifications import beijing_clock
-from .polymarket_trading import _lp_read_stage
+from .polymarket_trading import LpNewerAccountFacts, _lp_read_stage
 
 
 STOP_LOSS = Decimal("5")
@@ -768,6 +768,9 @@ class PolymarketLPService:
         self.clock = clock
         self.owner_lock = owner_lock
         self._mutation_guard = mutation_guard
+        listener = getattr(store, "set_lp_trade_change_listener", None)
+        if callable(listener):
+            listener(self._invalidate_lp_account_round)
         self._protection_notifier: Callable[..., object] | None = None
         self._mutex = threading.RLock()
         self._facts_owner = threading.local()
@@ -779,6 +782,8 @@ class PolymarketLPService:
         self._market_reads = {}
         self._market_read_retry = {}
         self._market_read_timeout = 10.0
+        self._lp_account_rounds: set[object] = set()
+        self._lp_account_rounds_lock = threading.Lock()
         self._facts_publisher = None
         self._facts_validator = None
         self._facts_wakeup = None
@@ -850,6 +855,48 @@ class PolymarketLPService:
         """Attach the existing execution breaker to exchange writes."""
 
         self._mutation_guard = guard
+
+    def track_lp_account_round(self, token: object) -> None:
+        """Register an externally owned round for trade invalidation."""
+
+        begin = getattr(self.exchange, "lp_account_round_begin", None)
+        if callable(begin):
+            with self._lp_account_rounds_lock:
+                self._lp_account_rounds.add(token)
+
+    def untrack_lp_account_round(self, token: object) -> None:
+        with self._lp_account_rounds_lock:
+            self._lp_account_rounds.discard(token)
+
+    def _invalidate_lp_account_round(self, session_id: str) -> None:
+        """Invalidate the shared bundle after any durable trade fence."""
+
+        del session_id
+        invalidate = getattr(self.exchange, "lp_account_round_invalidate", None)
+        if callable(invalidate):
+            with self._lp_account_rounds_lock:
+                tokens = tuple(self._lp_account_rounds)
+            for token in tokens:
+                invalidate(token)
+
+    def _invalidate_lp_trade_generation(self, expected: int) -> bool:
+        """Advance the shared DB fence from exact newer account evidence."""
+
+        advance = getattr(self.store, "lp_advance_trade_generation", None)
+        if not callable(advance):
+            return False
+        # The DB conditional advance is authoritative.  Do not serialize it
+        # behind strategy work: urgent off-lock actions may legitimately be
+        # in flight while newer evidence arrives.
+        with self._lp_account_rounds_lock:
+            if not advance(expected):
+                return False
+            tokens = tuple(self._lp_account_rounds)
+        invalidate = getattr(self.exchange, "lp_account_round_invalidate", None)
+        if callable(invalidate):
+            for token in tokens:
+                invalidate(token)
+        return True
 
     def set_protection_notifier(self, callback: Callable[..., object] | None) -> None:
         """Attach the two-channel (feishu + xiaoai) protection notifier."""
@@ -9337,7 +9384,15 @@ class PolymarketLPService:
 
         return self._tick()
 
-    def reconcile_facts(self, session_id, *, apply_lock=None, report_only=False, monitor=False):
+    def reconcile_facts(
+        self,
+        session_id,
+        *,
+        apply_lock=None,
+        report_only=False,
+        monitor=False,
+        account_round=None,
+    ):
         """Join the one read/apply operation for this session.
 
         Only trading intents fence this operation. Its short apply publishes
@@ -9361,7 +9416,13 @@ class PolymarketLPService:
             with _lp_read_stage("facts_capacity_wait", timings):
                 self._facts_capacity.acquire()
             try:
-                result = self._reconcile_facts_once(session_id, apply_lock=apply_lock, report_only=report_only, timings=timings)
+                result = self._reconcile_facts_once(
+                    session_id,
+                    apply_lock=apply_lock,
+                    report_only=report_only,
+                    timings=timings,
+                    account_round=account_round,
+                )
                 failed = result[3] is not None
             finally:
                 self._facts_capacity.release()
@@ -9372,7 +9433,11 @@ class PolymarketLPService:
                     self._facts_inflight.pop(session_id)
                     future.set_result((*result, None))
                     return future.result()
-            status = self._apply_tick_snapshot(*result, apply_lock=flight['apply_lock'])
+            status = self._apply_tick_snapshot(
+                *result,
+                apply_lock=flight['apply_lock'],
+                account_round=account_round,
+            )
             if self._facts_wakeup and self.store.lp_session_revision(session_id, trading=True) != result[2]:
                 self._facts_wakeup()
             result = (*result, status)
@@ -9402,7 +9467,55 @@ class PolymarketLPService:
                 if self._facts_inflight.get(session_id) is flight:
                     self._facts_inflight.pop(session_id)
 
-    def _reconcile_facts_once(self, session_id, *, apply_lock, report_only, timings=None):
+    def _publish_account_round_rejected(self, session_id: str) -> dict[str, object]:
+        """Atomically reject account facts in the session and auto ledger."""
+
+        for _ in range(3):
+            row = self.store.lp_session_with_revision(session_id, trading=True)
+            if row is None:
+                raise ValueError('lp_session_not_found')
+            current, current_revision = row
+            try:
+                session, _ = self.store.lp_publish_facts(
+                    session_id,
+                    current_revision,
+                    patch={
+                        'facts_error': 'account_round_invalid',
+                        'fee_status': 'unknown',
+                        'position_reconciled': False,
+                    },
+                    publish=self._facts_publisher,
+                    error='account_round_invalid',
+                )
+                return session
+            except ValueError as exc:
+                if str(exc) != 'session_changed':
+                    raise
+        raise ValueError('session_changed')
+
+    def _account_bundle_is_current(self, snapshot: Mapping[str, object]) -> bool:
+        """Check a bundle's observed DB generation at a use boundary."""
+
+        generation = snapshot.get("_lp_trade_generation")
+        reader = getattr(self.store, "lp_trade_generation", None)
+        if not callable(reader):
+            return True
+        if not isinstance(generation, int):
+            return True
+        try:
+            return int(generation) == int(reader())
+        except (TypeError, ValueError, RuntimeError):
+            return False
+
+    def _reconcile_facts_once(
+        self,
+        session_id,
+        *,
+        apply_lock,
+        report_only,
+        timings=None,
+        account_round=None,
+    ):
         row = self.store.lp_session_with_revision(session_id, trading=True)
         if row is None:
             raise ValueError('lp_session_not_found')
@@ -9419,14 +9532,25 @@ class PolymarketLPService:
                     'entry_order_id': order_id, 'owned_order_ids': list(dict.fromkeys([*self._session_order_ids(session), order_id])),
                     'submit_status': 'unknown'})
         snapshot, error = None, None
+        observed_trade_generation = None
         try:
             with _lp_read_stage("facts_read", timings):
-                snapshot = self._read_snapshot(self._normalize_request(session))
+                snapshot = self._read_snapshot(
+                    self._normalize_request(session), account_round=account_round
+                )
             if self._facts_validator and not report_only:
                 with _lp_read_stage("facts_validate", timings):
                     self._facts_validator(session, snapshot)
         except (ValueError, RuntimeError, OSError) as exc:
             error = str(exc)
+            if account_round is not None:
+                observed_trade_generation = getattr(
+                    account_round, "trade_generation", None
+                )
+        if not error and account_round is not None:
+            observed_trade_generation = snapshot.get("_lp_trade_generation")
+            if not isinstance(observed_trade_generation, int):
+                error = "account_round_invalid"
         if error and not report_only:
             # A failed read only removes permission to spend; an occupied
             # execution lock must not hide that failure behind an old lease.
@@ -9434,9 +9558,14 @@ class PolymarketLPService:
                 with _lp_read_stage("facts_failure_publish", timings):
                     session, _ = self.store.lp_publish_facts(
                         session_id, revision, patch={'facts_error': error},
+                        trade_generation=observed_trade_generation,
                         publish=self._facts_publisher, error=error)
             except ValueError as exc:
-                if str(exc) != 'session_changed':
+                if str(exc) == 'account_round_invalid':
+                    snapshot = None
+                    error = str(exc)
+                    session = self._publish_account_round_rejected(session_id)
+                elif str(exc) != 'session_changed':
                     raise
                 error = str(exc)
             return session, snapshot, revision, error
@@ -9462,7 +9591,11 @@ class PolymarketLPService:
                     patch.update(report_checked_at=self._now(), report_error=error)
                     with _lp_read_stage("facts_report_publish", timings):
                         current, _ = self.store.lp_publish_facts(
-                            session_id, revision, patch=patch, publish=self._facts_publisher)
+                        session_id, revision, patch=patch,
+                        trade_generation=observed_trade_generation,
+                        publish=self._facts_publisher)
+                    if error == 'account_round_invalid':
+                        snapshot = None
                     return current, snapshot, revision, error
                 if not error:
                     try:
@@ -9499,10 +9632,16 @@ class PolymarketLPService:
                     with _lp_read_stage("facts_publish", timings):
                         current, changed = self.store.lp_publish_facts(
                             session_id, revision, patch=patch, state=state,
+                            trade_generation=observed_trade_generation,
                             publish=self._facts_publisher, error=error, resolved_cancels=resolved_cancels,
                         )
                 except ValueError as exc:
-                    if str(exc) != 'session_changed':
+                    if str(exc) == 'account_round_invalid':
+                        snapshot = None
+                        error = str(exc)
+                        session = self._publish_account_round_rejected(session_id)
+                        return session, snapshot, revision, error
+                    elif str(exc) != 'session_changed':
                         raise
                     return session, snapshot, revision, 'session_changed'
             finally:
@@ -9576,26 +9715,66 @@ class PolymarketLPService:
             return self._lp_tick_aggregate([self._status_payload(session) for session, _ in session_pairs])
 
         # ponytail: two account reads at a time; raise only with venue capacity evidence.
-        with ThreadPoolExecutor(max_workers=2) as workers:
-            futures = [workers.submit(self._tick_session, pair, apply_lock=apply_lock)
-                       for pair in session_pairs]
-            payloads = [future.result() for future in futures]
+        round_begin = getattr(self.exchange, "lp_account_round_begin", None)
+        round_end = getattr(self.exchange, "lp_account_round_end", None)
+        trade_generation_reader = getattr(self.store, "lp_trade_generation", None)
+        account_round = (
+            round_begin(trade_generation_reader)
+            if callable(round_begin)
+            else None
+        )
+        try:
+            if account_round is not None:
+                with self._lp_account_rounds_lock:
+                    self._lp_account_rounds.add(account_round)
+            with ThreadPoolExecutor(max_workers=2) as workers:
+                futures = [
+                    workers.submit(
+                        self._tick_session,
+                        pair,
+                        apply_lock=apply_lock,
+                        account_round=account_round,
+                    )
+                    for pair in session_pairs
+                ]
+                payloads = [future.result() for future in futures]
+        finally:
+            if account_round is not None:
+                with self._lp_account_rounds_lock:
+                    self._lp_account_rounds.discard(account_round)
+            if account_round is not None and callable(round_end):
+                round_end(account_round)
         return self._lp_tick_aggregate(payloads)
 
-    def _tick_session(self, session_pair, *, apply_lock):
+    def _tick_session(self, session_pair, *, apply_lock, account_round=None):
         session, _ = session_pair
         session_id = str(session['session_id'])
         try:
-            result = self.reconcile_facts(session_id, apply_lock=apply_lock, monitor=True)
+            result = self.reconcile_facts(
+                session_id,
+                apply_lock=apply_lock,
+                monitor=True,
+                account_round=account_round,
+            )
             return result[4] or self._status_payload(result[0])
         except Exception as exc:
             return {'state': 'error', 'session_id': session_id, 'error': type(exc).__name__}
 
-    def _apply_tick_snapshot(self, session, snapshot, initial_revision, reason, *, apply_lock):
+    def _apply_tick_snapshot(
+        self, session, snapshot, initial_revision, reason, *,
+        apply_lock, account_round=None,
+    ):
         session_id = str(session['session_id'])
         if reason == 'order_identity_conflict':
             return self._status_payload(session)
         snapshot_error = ValueError(reason) if reason and reason not in {'execution_lock', 'session_changed'} else None
+        if snapshot is not None and not self._account_bundle_is_current(snapshot):
+            # The bundle was valid at publication, but a trade registered
+            # before this post-publication boundary. Never score, protect, or
+            # complete strategy work from that old bundle.
+            session = self._publish_account_round_rejected(session_id)
+            snapshot = None
+            snapshot_error = ValueError("account_round_invalid")
         protected_levels: set[str] = set()
         protection_writes = 0
         if snapshot is not None:
@@ -9628,6 +9807,11 @@ class PolymarketLPService:
                 if apply_handle is None:
                     current = self.store.lp_session(session_id) or session
                     return self._status_payload(current)
+            if snapshot is not None and not self._account_bundle_is_current(snapshot):
+                # Close the window opened while the scoring network read ran.
+                session = self._publish_account_round_rejected(session_id)
+                snapshot = None
+                snapshot_error = ValueError("account_round_invalid")
             with self._mutex:
                 current_with_revision = getattr(
                     self.store, "lp_session_with_revision", None
@@ -9644,12 +9828,23 @@ class PolymarketLPService:
                 if current_row is None:
                     return self._status_payload(session)
                 current, current_revision = current_row
+                if snapshot is not None and not self._account_bundle_is_current(snapshot):
+                    # The mutation fence is transactional; this last check is
+                    # aligned with the same mutex that guards strategy apply.
+                    session = self._publish_account_round_rejected(session_id)
+                    snapshot = None
+                    snapshot_error = ValueError("account_round_invalid")
                 expected_revision = int(initial_revision)
                 if current_revision != expected_revision:
                     # A local protective cancel invalidates financial facts,
                     # but other unchanged price buckets may still be observed.
                     if protected_levels and set(self._session_order_ids(current)) == set(self._session_order_ids(session)):
-                        current = self._apply_queue_protection(current, snapshot, skip_cancel_keys=protected_levels)
+                        current = self._apply_queue_protection(
+                            current,
+                            snapshot,
+                            skip_cancel_keys=protected_levels,
+                            trade_revision=expected_revision,
+                        )
                     return self._status_payload(current)
                 if snapshot_error is not None:
                     return self._handle_snapshot_failure(current, snapshot_error)
@@ -9670,6 +9865,11 @@ class PolymarketLPService:
                         protection_skip_keys=protected_levels,
                         facts_applied=True,
                         scoring=scoring,
+                        trade_revision=(
+                            expected_revision
+                            if isinstance(snapshot.get('_lp_trade_generation'), int)
+                            else None
+                        ),
                     )
                 else:
                     return reconcile(current)
@@ -9691,24 +9891,12 @@ class PolymarketLPService:
         session: Mapping[str, object],
         snapshot: Mapping[str, object],
     ) -> tuple[set[str], int]:
-        """Issue only triggered protection cancel actions outside the locks.
-
-        Monitoring fields, convergence, outage counters, and every other
-        session update stay in the serialized apply section.  This lane only
-        sends a durable cancel intent for an already-triggered bucket (or a
-        failed cancel retry) and merges that one bucket transactionally.
-        """
+        """Plan and authorize every triggered bucket before any venue call."""
 
         protection = session.get("queue_protection")
         buckets = self._queue_protection_levels(session)
         if not isinstance(protection, Mapping) or not buckets:
             return set(), 0
-        # A confirmed BUY fill is collected by the serialized reconciliation
-        # lane before queue protection is evaluated.  Let that lane mark the
-        # buckets as group_fill_collect instead of racing a queue-ahead cancel
-        # when the session image is still current.  A concurrent augment makes
-        # the snapshot stale; its protection cancel remains independently
-        # actionable while the revision fence discards stale fill facts.
         current_session = self.store.lp_session(str(session["session_id"]))
         concurrent_group_change = (
             isinstance(current_session, Mapping)
@@ -9728,8 +9916,7 @@ class PolymarketLPService:
         if not callable(merger):
             return set(), 0
 
-        protected_levels: set[str] = set()
-        writes = 0
+        plans: list[tuple[str, Mapping[str, object], dict[str, object]]] = []
         for key, bucket in buckets.items():
             state = str(bucket.get("state") or "")
             only_order_ids: list[str] | None = None
@@ -9753,43 +9940,55 @@ class PolymarketLPService:
                 only_order_ids = retryable
                 if not only_order_ids:
                     continue
-                next_bucket, patch = self._request_bucket_protection_cancel(
-                    session,
-                    snapshot,
-                    bucket,
-                    reason=str(bucket.get("cancel_reason") or "queue_ahead_ratio"),
-                    only_order_ids=only_order_ids,
-                    notify_blocked=False,
-                )
-            elif state == "triggered":
-                next_bucket, patch = self._request_bucket_protection_cancel(
-                    session,
-                    snapshot,
-                    bucket,
-                    reason="queue_ahead_ratio",
-                    notify_blocked=False,
-                )
-            else:
+            elif state != "triggered":
                 evaluation = self._bucket_queue_protection_evaluation(
                     session, bucket, snapshot, rows_by_id
                 )
                 if evaluation is None or str(evaluation.get("state")) != "triggered":
                     continue
-                next_bucket, patch = self._request_bucket_protection_cancel(
-                    session,
-                    snapshot,
-                    evaluation,
-                    reason="queue_ahead_ratio",
-                    notify_blocked=False,
-                )
+                bucket = evaluation
+            plan, _blocked, _patch = self._plan_bucket_protection_cancel(
+                session,
+                snapshot,
+                bucket,
+                reason=str(bucket.get("cancel_reason") or "queue_ahead_ratio"),
+                only_order_ids=only_order_ids,
+                notify_blocked=False,
+            )
+            if plan is not None:
+                plans.append((str(key), bucket, plan))
 
+        if not plans:
+            return set(), 0
+        actions = [
+            {
+                "action_key": plan["action_key"],
+                "payload": plan["intent_payload"],
+            }
+            for _key, _bucket, plan in plans
+        ]
+        try:
+            self.store.lp_register_fenced_actions(
+                session_id,
+                actions,
+                expected_generation=snapshot.get("_lp_trade_generation"),
+            )
+        except ValueError as exc:
+            if str(exc) == "account_round_invalid":
+                return set(), 0
+            raise
+
+        protected_levels: set[str] = set()
+        writes = 0
+        for key, bucket, plan in plans:
+            next_bucket, patch = self._execute_bucket_protection_cancel(
+                session, snapshot, bucket, plan
+            )
             if str(next_bucket.get("state") or "") not in {
                 "canceling",
                 "canceled",
                 "partially_filled",
             }:
-                # Blocked/unknown protection state is ordinary monitoring
-                # state and must be persisted by the serialized apply.
                 continue
             if hasattr(self.store, "lp_merge_queue_protection_bucket"):
                 merger(
@@ -9890,6 +10089,7 @@ class PolymarketLPService:
         protection_skip_keys: Collection[str] = (),
         facts_applied: bool = False,
         scoring: Mapping[str, object] | None = None,
+        trade_revision: int | None = None,
     ) -> dict[str, object]:
         """Run one group-level monitoring/reconciliation iteration.
 
@@ -9904,7 +10104,12 @@ class PolymarketLPService:
         state = str(session.get("state"))
         if state in {"entry_rejected", "complete"}:
             if facts_applied and prefetched_snapshot is not None:
-                session = self._apply_queue_protection(session, prefetched_snapshot, skip_cancel_keys=protection_skip_keys)
+                session = self._apply_queue_protection(
+                session,
+                prefetched_snapshot,
+                skip_cancel_keys=protection_skip_keys,
+                trade_revision=trade_revision,
+            )
             return self._status_payload(session)
         try:
             request = self._normalize_request(session)
@@ -10011,22 +10216,29 @@ class PolymarketLPService:
             session,
             snapshot,
             skip_cancel_keys=protection_skip_keys,
+            trade_revision=trade_revision,
         )
         session = self._reconcile_protected_exit(session, snapshot)
         if _decimal(session.get("buy_filled_quantity", 0), "buy_filled_quantity") > 0:
             # Issue 167 D3: a fill at any level collects the whole group's
             # own BUYs; economics stay group-merged.
-            session = self._collect_group_buys(session, snapshot)
+            session = self._collect_group_buys(
+                session, snapshot, trade_revision=trade_revision
+            )
             if not self._group_buys_terminal(session, snapshot):
                 return self._status_payload(session)
         if state == "review":
             self._update_scoring(session, scoring)
             session = self.store.lp_session(str(session["session_id"])) or session
-            return self._review_iteration(session, snapshot)
+            return self._review_iteration(
+                session, snapshot, trade_revision=trade_revision
+            )
         self._update_scoring(session, scoring)
         session = self.store.lp_session(str(session["session_id"])) or session
         if str(session.get("state")) == "review":
-            return self._review_iteration(session, snapshot)
+            return self._review_iteration(
+                session, snapshot, trade_revision=trade_revision
+            )
         now = self._now()
         review_at = _timestamp(session["review_at"], name="review_at")
         residual = _decimal(session.get("residual_quantity", 0), "residual_quantity")
@@ -10039,7 +10251,11 @@ class PolymarketLPService:
         # the absolute review deadline from cancelling known quotes.
         if now >= review_at:
             try:
-                self._cancel_owned_orders(session)
+                self._cancel_owned_orders(
+                    session,
+                    expected_generation=snapshot.get("_lp_trade_generation"),
+                    expected_trade_revision=trade_revision,
+                )
             except Exception as exc:
                 updated = self.store.lp_update_session(
                     str(session["session_id"]),
@@ -10075,20 +10291,28 @@ class PolymarketLPService:
                     state="stop_loss_exit",
                     patch={"stop_loss_latched": True},
                 )
-            session = self._request_passive_cancel(session)
+            session = self._request_passive_cancel(
+                session,
+                expected_generation=snapshot.get("_lp_trade_generation"),
+                expected_trade_revision=trade_revision,
+            )
             session = self.store.lp_session(str(session["session_id"])) or session
             passive_id = str(session.get("passive_exit_order_id") or "")
             if passive_id and not self._order_terminal(snapshot, passive_id, session):
                 return self._status_payload(session)
             residual = _decimal(session.get("residual_quantity", 0), "residual_quantity")
             if residual > 0 and not session.get("protected_exit_order_id"):
-                self._submit_protected_exit(session, residual, snapshot)
+                self._submit_protected_exit(
+                    session, residual, snapshot, trade_revision=trade_revision
+                )
                 session = self.store.lp_session(str(session["session_id"])) or session
             return self._complete_if_flat(session, snapshot)
         if loss is None:
             return self._complete_if_flat(session, snapshot)
         if residual > 0:
-            self._ensure_passive_exit(session, snapshot, residual)
+            self._ensure_passive_exit(
+                session, snapshot, residual, trade_revision=trade_revision
+            )
             session = self.store.lp_session(str(session["session_id"])) or session
         return self._complete_if_flat(session, snapshot)
 
@@ -10123,18 +10347,19 @@ class PolymarketLPService:
         return self._status_payload(updated)
 
     def _collect_group_buys(
-        self, session: Mapping[str, object], snapshot: Mapping[str, object]
-    ) -> dict[str, object]:
-        """Issue 167 D3: after any fill, cancel the group's every own BUY.
+        self,
+        session: Mapping[str, object],
+        snapshot: Mapping[str, object],
+        *,
+        trade_revision: int | None = None,
+    ) -> Mapping[str, object]:
+        """Issue 167 D3: after any fill, cancel every owned sweep target.
 
-        Reuses ``_cancel_owned_orders`` (entry + augments).  Buckets whose
-        order the sweep cancel-requests are marked ``canceling`` with reason
-        ``group_fill_collect`` so the receipt convergence settles them; the
-        D5 protection notifications deliberately stay silent for a group
-        collection (no protection trigger fired).
+        ``_cancel_owned_orders`` preserves review/stop semantics for entry,
+        passive, and augment targets while authorizing the complete actual
+        batch before its first venue cancel.
         """
 
-        history = self._order_history(session)
         actionable = False
         for order_id in self._session_augment_own_order_ids(session):
             if self._order_terminal(snapshot, order_id, session):
@@ -10146,7 +10371,15 @@ class PolymarketLPService:
         if not actionable:
             return session
         try:
-            self._cancel_owned_orders(session)
+            self._cancel_owned_orders(
+                session,
+                expected_generation=snapshot.get("_lp_trade_generation"),
+                expected_trade_revision=trade_revision,
+            )
+        except ValueError as exc:
+            if str(exc) == "account_round_invalid":
+                return self._publish_account_round_rejected(str(session["session_id"]))
+            raise
         except Exception as exc:
             return self.store.lp_update_session(
                 str(session["session_id"]),
@@ -10264,12 +10497,29 @@ class PolymarketLPService:
         result["review_at"] = _timestamp(result.get("review_at"), name="review_at")
         return result
 
-    def _read_snapshot(self, request: Mapping[str, object]) -> Mapping[str, object]:
+    def _read_snapshot(
+        self,
+        request: Mapping[str, object],
+        *,
+        account_round: object | None = None,
+    ) -> Mapping[str, object]:
         if getattr(self._facts_owner, 'session_id', None):
-            return self._market_read(request, lambda: self._fetch_snapshot(request))
-        return self._fetch_snapshot(request)
+            return self._market_read(
+                request,
+                lambda: self._fetch_snapshot(request, account_round=account_round),
+                on_newer_facts=self._invalidate_lp_trade_generation,
+            )
+        try:
+            return self._fetch_snapshot(request, account_round=account_round)
+        except LpNewerAccountFacts as exc:
+            if self._invalidate_lp_trade_generation(exc.observed_trade_generation):
+                raise ValueError("account_round_invalid") from exc
+            raise ValueError("external_snapshot_unknown") from exc
 
-    def _market_read(self, identity, read, *, wait_for_capacity=False):
+    def _market_read(
+        self, identity, read, *,
+        wait_for_capacity=False, on_newer_facts=None,
+    ):
         """Bound waiting without pretending a Python thread can be cancelled.
 
         Workers only return read data. An abandoned result is never applied;
@@ -10315,6 +10565,14 @@ class PolymarketLPService:
         threading.Thread(target=run, daemon=True, name='lp-market-read').start()
         try:
             return future.result(timeout=self._market_read_timeout)
+        except LpNewerAccountFacts as exc:
+            # The caller received this result within the read deadline; the
+            # authoritative transaction runs here, outside the SDK thread.
+            if callable(on_newer_facts) and on_newer_facts(
+                exc.observed_trade_generation
+            ):
+                raise ValueError("account_round_invalid") from exc
+            raise ValueError("external_snapshot_unknown") from exc
         except TimeoutError as exc:
             with self._market_reads_lock:
                 self._market_read_retry[key] = monotonic() + 300
@@ -10324,18 +10582,30 @@ class PolymarketLPService:
                 if future.done() and self._market_reads.get(key) is future:
                     self._market_reads.pop(key)
 
-    def _fetch_snapshot(self, request):
+    def _fetch_snapshot(
+        self,
+        request: Mapping[str, object],
+        *,
+        account_round: object | None = None,
+    ):
+        snapshot_request = dict(request)
+        if account_round is not None:
+            snapshot_request["_lp_account_round"] = account_round
         for name in ("lp_snapshot", "snapshot"):
             method = getattr(self.exchange, name, None)
             if not callable(method):
                 continue
             try:
-                value = method(dict(request))
+                value = method(snapshot_request)
             except TypeError:
                 try:
                     value = method()
+                except LpNewerAccountFacts:
+                    raise
                 except Exception as exc:
                     raise ValueError("external_snapshot_unknown") from exc
+            except LpNewerAccountFacts:
+                raise
             except Exception as exc:
                 raise ValueError("external_snapshot_unknown") from exc
             if isinstance(value, Mapping):
@@ -10576,10 +10846,20 @@ class PolymarketLPService:
             return original - matched
         return None
 
-    def _queue_account_open_orders(self) -> list[object] | None:
+    def _queue_account_open_orders(
+        self, account_round: object | None = None
+    ) -> list[object] | None:
         """Read open orders through one fresh account read (issue 152 D5)."""
 
         for name in ("lp_account_snapshot", "account_snapshot"):
+            if account_round is not None and name == "lp_account_snapshot":
+                reader = getattr(self.exchange, "lp_open_orders_for_round", None)
+                if not callable(reader):
+                    return None
+                try:
+                    return list(reader(account_round))
+                except Exception:
+                    return None
             reader = getattr(self.exchange, name, None)
             if not callable(reader):
                 continue
@@ -11165,7 +11445,7 @@ class PolymarketLPService:
         price = _maybe_decimal(bucket.get("baseline_price"))
         return f"{outcome} {_queue_decimal_text(price)} {base}"
 
-    def _request_bucket_protection_cancel(
+    def _plan_bucket_protection_cancel(
         self,
         session: Mapping[str, object],
         snapshot: Mapping[str, object] | None,
@@ -11174,13 +11454,11 @@ class PolymarketLPService:
         reason: str = "queue_ahead_ratio",
         only_order_ids: list[str] | None = None,
         notify_blocked: bool = True,
-    ) -> tuple[dict[str, object], dict[str, object]]:
-        """Cancel every own BUY resting at this bucket's price (issue 152 D4 /
-        issue 167: one cancel episode per price bucket).
+    ) -> tuple[dict[str, object] | None, dict[str, object], dict[str, object]]:
+        """Plan one protection cancel without committing or cancelling.
 
-        Deliberately not routed through the manual cancel audit pipeline;
-        the protection episode records its own durable action instead.
-        Returns the updated bucket plus the session-level cancel flags.
+        A ``snapshot=None`` fallback may perform its existing read-only
+        account lookup to enumerate targets; it never places or cancels.
         """
 
         session_id = str(session["session_id"])
@@ -11190,11 +11468,12 @@ class PolymarketLPService:
         updated = dict(bucket)
         current = self.store.lp_session(session_id) or session
         if current.get("order_identity_conflict"):
-            return self._blocked_bucket_protection_cancel(
+            return None, self._blocked_bucket_protection_cancel(
                 session, updated, "order_identity_conflict", "订单身份冲突，等待核对",
-                None, notify=notify_blocked), {}
+                None, notify=notify_blocked
+            ), {}
         if baseline_price is None:
-            return updated, {}
+            return None, updated, {}
         own_order_ids = self._session_augment_own_order_ids(session)
 
         if snapshot is None:
@@ -11202,17 +11481,14 @@ class PolymarketLPService:
             # account read; a failed read blocks this tick and retries.
             rows = self._queue_account_open_orders()
             if rows is None:
-                return (
-                    self._blocked_bucket_protection_cancel(
-                        session,
-                        updated,
-                        "account_read_failed",
-                        "账户读取失败",
-                        None,
-                        notify=notify_blocked,
-                    ),
-                    {},
-                )
+                return None, self._blocked_bucket_protection_cancel(
+                    session,
+                    updated,
+                    "account_read_failed",
+                    "账户读取失败",
+                    None,
+                    notify=notify_blocked,
+                ), {}
             rows_by_id: dict[str, object] = {}
             for row in rows:
                 order_id = self._order_id(row)
@@ -11229,33 +11505,27 @@ class PolymarketLPService:
             row_token = str(_field(row, "token_id", _field(row, "asset_id", "")) or "")
             side = str(_field(row, "side", "")).upper()
             if (side and side != "BUY") or (row_token and row_token != token_id):
-                return (
-                    self._blocked_bucket_protection_cancel(
-                        session,
-                        updated,
-                        "identity_conflict",
-                        "回执身份不符",
-                        None,
-                        notify=notify_blocked,
-                    ),
-                    {},
-                )
+                return None, self._blocked_bucket_protection_cancel(
+                    session,
+                    updated,
+                    "identity_conflict",
+                    "回执身份不符",
+                    None,
+                    notify=notify_blocked,
+                ), {}
 
         if not self._mutation_allowed():
             remaining = self._own_queue_remaining_rows(
                 rows_by_id, token_id=token_id, price=baseline_price
             )
-            return (
-                self._blocked_bucket_protection_cancel(
-                    session,
-                    updated,
-                    "mutation_blocked",
-                    "撤单被熔断阻止",
-                    remaining,
-                    notify=notify_blocked,
-                ),
-                {},
-            )
+            return None, self._blocked_bucket_protection_cancel(
+                session,
+                updated,
+                "mutation_blocked",
+                "撤单被熔断阻止",
+                remaining,
+                notify=notify_blocked,
+            ), {}
 
         history = self._order_history(session)
         anchor = str(bucket.get("order_id") or "") or format(baseline_price, "f")
@@ -11354,7 +11624,6 @@ class PolymarketLPService:
             confirmed_times.update(
                 {str(key): value for key, value in raw_confirmed.items() if str(key)}
             )
-
         action_key = f"{session_id}:entry-protection-cancel:{anchor}"
         intent_payload: dict[str, object] = {
             "role": "entry-protection-cancel",
@@ -11365,10 +11634,39 @@ class PolymarketLPService:
             "data_time": updated.get("data_time"),
             "cancel_target_remaining": persisted_remaining,
         }
-        self.store.lp_upsert_action(
-            session_id, action_key, state="pending", payload=intent_payload
-        )
+        plan = {
+            "session_id": session_id,
+            "entry_order_id": entry_order_id,
+            "action_key": action_key,
+            "intent_payload": intent_payload,
+            "targets": targets,
+            "episode_targets": episode_targets,
+            "persisted_remaining": persisted_remaining,
+            "placement_times": placement_times,
+            "confirmed_times": confirmed_times,
+            "updated": updated,
+        }
+        return plan, updated, {}
 
+    def _execute_bucket_protection_cancel(
+        self,
+        session: Mapping[str, object],
+        snapshot: Mapping[str, object],
+        bucket: Mapping[str, object],
+        plan: dict[str, object],
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        """Send one already-committed cancel plan and persist its receipt."""
+
+        session_id = str(plan["session_id"])
+        entry_order_id = str(plan["entry_order_id"])
+        action_key = str(plan["action_key"])
+        intent_payload = dict(plan["intent_payload"])
+        targets = list(plan["targets"])
+        episode_targets = list(plan["episode_targets"])
+        persisted_remaining = dict(plan["persisted_remaining"])
+        placement_times = dict(plan["placement_times"])
+        confirmed_times = dict(plan["confirmed_times"])
+        updated = dict(plan["updated"])
         canceled: list[str] = []
         failed: list[str] = []
         failure_error: str | None = None
@@ -11388,6 +11686,8 @@ class PolymarketLPService:
             "canceled": canceled,
             "failed": failed,
         }
+        # An authorized action's real receipt always survives, even if a newer
+        # account fence lands while its venue call is in flight.
         if failed:
             receipt_payload["error"] = failure_error or "cancel_not_acknowledged"
             self.store.lp_upsert_action(
@@ -11410,7 +11710,7 @@ class PolymarketLPService:
         )
 
         updated["state"] = "canceling"
-        updated["cancel_reason"] = reason
+        updated["cancel_reason"] = str(intent_payload["reason"])
         updated["cancel_targets"] = episode_targets
         updated["cancel_failed"] = failed
         updated["cancel_target_remaining"] = persisted_remaining
@@ -11464,6 +11764,52 @@ class PolymarketLPService:
         if new_augment != sorted(augment_requested):
             session_patch["augment_cancel_requested"] = new_augment
         return updated, session_patch
+
+    def _request_bucket_protection_cancel(
+        self,
+        session: Mapping[str, object],
+        snapshot: Mapping[str, object] | None,
+        bucket: Mapping[str, object],
+        *,
+        reason: str = "queue_ahead_ratio",
+        only_order_ids: list[str] | None = None,
+        notify_blocked: bool = True,
+        expected_trade_revision: int | None = None,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        """Plan, fence one bucket, then send its registered cancel intent."""
+
+        plan, blocked, patch = self._plan_bucket_protection_cancel(
+            session, snapshot, bucket, reason=reason,
+            only_order_ids=only_order_ids, notify_blocked=notify_blocked,
+        )
+        if plan is None:
+            return blocked, patch
+        expected_generation = (
+            snapshot.get("_lp_trade_generation")
+            if isinstance(snapshot, Mapping)
+            else None
+        )
+        if expected_generation is not None and not isinstance(
+            expected_trade_revision, int
+        ):
+            self._publish_account_round_rejected(str(session["session_id"]))
+            return dict(bucket), {}
+        actions = [{
+            "action_key": plan["action_key"],
+            "payload": plan["intent_payload"],
+        }]
+        try:
+            self.store.lp_register_fenced_actions(
+                str(session["session_id"]), actions,
+                expected_generation=expected_generation,
+                expected_trade_revision=expected_trade_revision,
+            )
+        except ValueError as exc:
+            if str(exc) == "account_round_invalid":
+                self._publish_account_round_rejected(str(session["session_id"]))
+                return dict(bucket), {}
+            raise
+        return self._execute_bucket_protection_cancel(session, snapshot, bucket, plan)
 
     def _blocked_bucket_protection_cancel(
         self,
@@ -11599,6 +11945,7 @@ class PolymarketLPService:
         snapshot: Mapping[str, object],
         *,
         skip_cancel_keys: Collection[str] = (),
+        trade_revision: int | None = None,
     ) -> dict[str, object]:
         """Evaluate every price bucket inside the monitor tick and persist
         the v2 {version, data_failures, levels} payload (issue 167)."""
@@ -11635,6 +11982,7 @@ class PolymarketLPService:
                         bucket,
                         reason=str(bucket.get("cancel_reason") or "queue_ahead_ratio"),
                         only_order_ids=failed,
+                        expected_trade_revision=trade_revision,
                     )
                     # Issue 167 review fix: each bucket computes its session
                     # flags from the same pre-loop session, so a plain
@@ -11668,7 +12016,11 @@ class PolymarketLPService:
                     new_levels[key] = bucket
                     continue
                 bucket, patch = self._request_bucket_protection_cancel(
-                    session, snapshot, bucket, reason="queue_ahead_ratio"
+                    session,
+                    snapshot,
+                    bucket,
+                    reason="queue_ahead_ratio",
+                    expected_trade_revision=trade_revision,
                 )
                 # Same union merge as above: two buckets triggering in one
                 # tick must accumulate their session flags, not overwrite.
@@ -11725,17 +12077,38 @@ class PolymarketLPService:
             episodes = reader()
         except Exception:
             return
-        for episode in episodes:
-            if not isinstance(episode, Mapping):
-                continue
-            if not str(episode.get("episode_id") or ""):
-                continue
-            self._apply_first_seen_protection(episode)
+        valid_episodes = [
+            episode
+            for episode in episodes
+            if isinstance(episode, Mapping) and str(episode.get("episode_id") or "")
+        ]
+        if not valid_episodes:
+            return
+        begin = getattr(self.exchange, "lp_account_round_begin", None)
+        end = getattr(self.exchange, "lp_account_round_end", None)
+        reader_generation = getattr(self.store, "lp_trade_generation", None)
+        account_round = (
+            begin(reader_generation)
+            if callable(begin)
+            else None
+        )
+        if account_round is not None:
+            self.track_lp_account_round(account_round)
+        try:
+            for episode in valid_episodes:
+                self._apply_first_seen_protection(episode, account_round)
+        finally:
+            if account_round is not None:
+                self.untrack_lp_account_round(account_round)
+                if callable(end):
+                    end(account_round)
 
-    def _first_seen_rows_by_id(self) -> dict[str, object] | None:
+    def _first_seen_rows_by_id(
+        self, account_round: object | None = None
+    ) -> dict[str, object] | None:
         """Open-order rows keyed by id from one fresh account read, or None."""
 
-        rows = self._queue_account_open_orders()
+        rows = self._queue_account_open_orders(account_round)
         if rows is None:
             return None
         rows_by_id: dict[str, object] = {}
@@ -11898,15 +12271,19 @@ class PolymarketLPService:
         if not gate_open:
             return None
         return self._request_first_seen_protection_cancel(
-            episode, None, reason="book_unreliable"
+            episode, None, reason="book_unreliable", expected_generation=None
         )
 
-    def _apply_first_seen_protection(self, episode: Mapping[str, object]) -> None:
+    def _apply_first_seen_protection(
+        self,
+        episode: Mapping[str, object],
+        account_round: object | None = None,
+    ) -> None:
         """Run one episode's evaluate/converge/cancel step and persist it."""
 
         episode_id = str(episode["episode_id"])
         state = str(episode.get("state") or "")
-        rows_by_id = self._first_seen_rows_by_id()
+        rows_by_id = self._first_seen_rows_by_id(account_round)
 
         if state == "canceling":
             converged = self._converge_first_seen_protection(episode, rows_by_id)
@@ -11928,6 +12305,8 @@ class PolymarketLPService:
                     rows_by_id,
                     reason=str(episode.get("cancel_reason") or "queue_ahead_ratio"),
                     only_order_ids=failed,
+                    account_round=account_round,
+                    expected_generation=getattr(account_round, "trade_generation", None),
                 )
                 if result is not None:
                     self.store.lp_update_first_seen_episode(
@@ -12051,7 +12430,11 @@ class PolymarketLPService:
         if estimate["state"] != "triggered":
             return
         result = self._request_first_seen_protection_cancel(
-            episode, rows_by_id, reason="queue_ahead_ratio"
+            episode,
+            rows_by_id,
+            reason="queue_ahead_ratio",
+            account_round=account_round,
+            expected_generation=getattr(account_round, "trade_generation", None),
         )
         if result is not None:
             self.store.lp_update_first_seen_episode(
@@ -12174,6 +12557,8 @@ class PolymarketLPService:
         *,
         reason: str = "queue_ahead_ratio",
         only_order_ids: list[str] | None = None,
+        account_round: object | None = None,
+        expected_generation: int | None = None,
     ) -> dict[str, object] | None:
         """Cancel every own BUY resting at the first-seen anchor price.
 
@@ -12191,7 +12576,7 @@ class PolymarketLPService:
         if rows_by_id is None:
             # Data-unreliable path: enumerate targets from one fresh
             # account read; a failed read blocks this tick and retries.
-            rows_by_id = self._first_seen_rows_by_id()
+            rows_by_id = self._first_seen_rows_by_id(account_round)
             if rows_by_id is None:
                 return self._blocked_first_seen_cancel(
                     episode,
@@ -12347,13 +12732,29 @@ class PolymarketLPService:
                 f"锚点审计会话创建失败（{detail}）",
                 None,
             )
-        for order_id in targets:
-            self.store.lp_upsert_action(
+        actions = [
+            {
+                "action_key": action_keys[order_id],
+                "payload": action_payload(order_id),
+            }
+            for order_id in targets
+        ]
+        try:
+            self.store.lp_register_fenced_actions(
                 LP_RESERVED_MANUAL_SESSION_ID,
-                action_keys[order_id],
-                state="pending",
-                payload=action_payload(order_id),
+                actions,
+                expected_generation=expected_generation,
             )
+        except ValueError as exc:
+            if str(exc) == "account_round_invalid":
+                return self._blocked_first_seen_cancel(
+                    episode,
+                    updated,
+                    "account_round_invalid",
+                    "共享账户事实已失效",
+                    None,
+                )
+            raise
 
         canceled: list[str] = []
         failed: list[str] = []
@@ -13379,58 +13780,91 @@ class PolymarketLPService:
         if order_id:
             self._cancel_order(order_id)
 
-    def _request_passive_cancel(self, session: Mapping[str, object]) -> dict[str, object]:
+    def _request_passive_cancel(
+        self,
+        session: Mapping[str, object],
+        *,
+        expected_generation: int | None = None,
+        expected_trade_revision: int | None = None,
+    ) -> dict[str, object]:
         order_id = str(session.get("passive_exit_order_id") or "")
         if not order_id or bool(session.get("passive_cancel_requested")):
             return dict(session)
+        session_id = str(session["session_id"])
+        attempt_key = self._action_key(session_id, "passive-cancel", order_id)
+        attempt_payload = {
+            "role": "passive_exit_cancel",
+            "order_id": order_id,
+            "targets": [order_id],
+        }
         try:
-            if not self._cancel_order(order_id):
+            self._require_mutation()
+        except Exception as exc:
+            return self.store.lp_update_session(
+                session_id,
+                state="needs_attention",
+                patch={"reconciliation": f"passive_cancel_{type(exc).__name__}"},
+            )
+        if expected_generation is not None and not isinstance(
+            expected_trade_revision, int
+        ):
+            return self._publish_account_round_rejected(session_id)
+        try:
+            self.store.lp_register_fenced_actions(
+                session_id,
+                [{
+                    "action_key": attempt_key,
+                    "payload": attempt_payload,
+                }],
+                expected_generation=expected_generation,
+                expected_trade_revision=expected_trade_revision,
+            )
+        except ValueError as exc:
+            if str(exc) == "account_round_invalid":
+                return self._publish_account_round_rejected(session_id)
+            raise
+        try:
+            if not self._cancel_order(
+                order_id,
+                attempts=[(session_id, attempt_key, dict(attempt_payload))],
+            ):
                 raise RuntimeError("cancel_not_acknowledged")
         except Exception as exc:
             return self.store.lp_update_session(
-                str(session["session_id"]),
+                session_id,
                 state="needs_attention",
                 patch={"reconciliation": f"passive_cancel_{type(exc).__name__}"},
             )
         return self.store.lp_update_session(
-            str(session["session_id"]), patch={"passive_cancel_requested": True}
+            session_id, patch={"passive_cancel_requested": True}
         )
 
-    def _cancel_owned_orders(self, session: Mapping[str, object]) -> None:
+    def _cancel_owned_orders(
+        self,
+        session: Mapping[str, object],
+        *,
+        expected_generation: int | None = None,
+        expected_trade_revision: int | None = None,
+    ) -> None:
         current = dict(self.store.lp_session(str(session["session_id"])) or session)
         if current.get("order_identity_conflict"):
             raise ValueError("order_identity_conflict")
+        session_id = str(current["session_id"])
         history = self._order_history(current)
-        errors: list[BaseException] = []
+        specs: list[tuple[str, str, str]] = []
         for key, requested_key, role in (
             ("entry_order_id", "entry_cancel_requested", "entry"),
             ("passive_exit_order_id", "passive_cancel_requested", "passive_exit"),
         ):
             order_id = str(current.get(key) or "")
-            if not order_id:
-                continue
-            if bool(current.get(requested_key)):
+            if not order_id or bool(current.get(requested_key)):
                 continue
             if str(history.get(order_id, {}).get("status") or "").upper() in TERMINAL_ORDER_STATES:
                 continue
-            try:
-                if not self._cancel_order(order_id):
-                    raise RuntimeError("cancel_not_acknowledged")
-            except Exception as exc:
-                errors.append(exc)
-                continue
-            self.store.lp_upsert_action(
-                str(current["session_id"]),
-                self._action_key(str(current["session_id"]), f"{role}-cancel", order_id),
-                state="accepted",
-                payload={"role": role, "order_id": order_id},
-            )
-            current = self.store.lp_update_session(
-                str(current["session_id"]), patch={requested_key: True}
-            )
-            history = self._order_history(current)
-        # Issue 158: augment orders join the same review/stop cancel sweep so
-        # an entry plus its augments always end (or complete) together.
+            specs.append((order_id, requested_key, role))
+        # Augment orders join the same review/stop/collect sweep so an entry
+        # plus its augments always end together.  The full target set is fixed
+        # before authorization; a target appearing later waits for a new pass.
         augment_requested = [
             str(value) for value in _items(current.get("augment_cancel_requested"))
         ]
@@ -13440,22 +13874,66 @@ class PolymarketLPService:
                 continue
             if str(history.get(order_id, {}).get("status") or "").upper() in TERMINAL_ORDER_STATES:
                 continue
+            specs.append((order_id, "augment_cancel_requested", "augment-cancel"))
+        if not specs:
+            return
+        self._require_mutation()
+        if expected_generation is not None and not isinstance(expected_trade_revision, int):
+            self._publish_account_round_rejected(session_id)
+            raise ValueError("account_round_invalid")
+        actions = [
+            {
+                "action_key": self._action_key(
+                    session_id, "owned-cancel", uuid.uuid4().hex
+                ),
+                "payload": {
+                    "role": role,
+                    "order_id": order_id,
+                    "targets": [order_id],
+                    "source": "owned_cancel_sweep",
+                },
+            }
+            for order_id, _requested_key, role in specs
+        ]
+        try:
+            registered = self.store.lp_register_fenced_actions(
+                session_id,
+                actions,
+                expected_generation=expected_generation,
+                expected_trade_revision=expected_trade_revision,
+            )
+        except ValueError as exc:
+            if str(exc) == "account_round_invalid":
+                self._publish_account_round_rejected(session_id)
+            raise
+        attempts = {
+            order_id: (session_id, str(row["action_key"]), dict(row))
+            for (order_id, _requested_key, _role), row in zip(specs, registered)
+        }
+        errors: list[BaseException] = []
+        for order_id, requested_key, role in specs:
             try:
-                if not self._cancel_order(order_id):
+                if not self._cancel_order(order_id, attempts=[attempts[order_id]]):
                     raise RuntimeError("cancel_not_acknowledged")
             except Exception as exc:
                 errors.append(exc)
                 continue
             self.store.lp_upsert_action(
-                str(current["session_id"]),
-                self._action_key(str(current["session_id"]), "augment-cancel", order_id),
+                session_id,
+                self._action_key(
+                    session_id,
+                    role if role == "augment-cancel" else f"{role}-cancel",
+                    order_id,
+                ),
                 state="accepted",
-                payload={"role": "augment-cancel", "order_id": order_id},
+                payload={"role": role, "order_id": order_id},
             )
-            augment_requested = [*augment_requested, order_id]
-            current = self.store.lp_update_session(
-                str(current["session_id"]),
-                patch={"augment_cancel_requested": list(augment_requested)},
+            patch = {requested_key: True}
+            if role == "augment-cancel":
+                augment_requested = [*augment_requested, order_id]
+                patch["augment_cancel_requested"] = list(augment_requested)
+            current = dict(
+                self.store.lp_update_session(session_id, patch=patch)
             )
             history = self._order_history(current)
         if errors:
@@ -13532,8 +14010,9 @@ class PolymarketLPService:
 
     def _cancel_order(self, order_id: str, *, attempts=None) -> bool:
         self._require_mutation()
-        # The shared session lane already serializes internal protection.
-        # Its urgent cancel must bypass an unrelated submit holding _mutex.
+        # Cancel intent/receipt persistence is serialized with strategy and
+        # generation fences; the venue request between those short sections is
+        # deliberately off the mutex.
         if attempts is None:
             attempts = self.begin_order_cancel((order_id,), serialized=False)
         acknowledged = False
@@ -13549,7 +14028,9 @@ class PolymarketLPService:
             acknowledged = self._cancel_acknowledged(response, order_id)
             return acknowledged
         finally:
-            self.finish_order_cancel(attempts, (order_id,) if acknowledged else (), serialized=False)
+            self.finish_order_cancel(
+                attempts, (order_id,) if acknowledged else (), serialized=False
+            )
 
     @staticmethod
     def _has_unresolved_submission(session: Mapping[str, object]) -> bool:
@@ -13573,7 +14054,12 @@ class PolymarketLPService:
         )
 
     def _ensure_passive_exit(
-        self, session: Mapping[str, object], snapshot: Mapping[str, object], quantity: Decimal
+        self,
+        session: Mapping[str, object],
+        snapshot: Mapping[str, object],
+        quantity: Decimal,
+        *,
+        trade_revision: int | None = None,
     ) -> None:
         # A submit that may have reached the venue is durable before the POST.
         # Pending, unknown, and accepted-without-ID states are never safe to
@@ -13613,19 +14099,10 @@ class PolymarketLPService:
             return
         if old_order:
             if not bool(session.get("passive_cancel_requested")):
-                try:
-                    if not self._cancel_order(old_order):
-                        raise RuntimeError("cancel_not_acknowledged")
-                except Exception as exc:
-                    self.store.lp_update_session(
-                        str(session["session_id"]),
-                        state="needs_attention",
-                        patch={"reconciliation": f"passive_cancel_{type(exc).__name__}"},
-                    )
-                    return
-                self.store.lp_update_session(
-                    str(session["session_id"]),
-                    patch={"passive_cancel_requested": True},
+                self._request_passive_cancel(
+                    session,
+                    expected_generation=snapshot.get("_lp_trade_generation"),
+                    expected_trade_revision=trade_revision,
                 )
                 return
             if not self._order_terminal(snapshot, old_order, session):
@@ -13645,18 +14122,38 @@ class PolymarketLPService:
         attempt_key = self._action_key(
             session_id, "passive-submit", uuid.uuid4().hex
         )
-        self.store.lp_upsert_action(
-            session_id,
-            attempt_key,
-            state="pending",
-            payload={
-                "role": "passive_exit",
-                "side": "SELL",
-                "token_id": session["token_id"],
-                "price": price,
-                "quantity": quantity,
-            },
-        )
+        intent_payload: dict[str, object] = {
+            "role": "passive_exit",
+            "side": "SELL",
+            "token_id": session["token_id"],
+            "price": price,
+            "quantity": quantity,
+        }
+        expected_generation = snapshot.get("_lp_trade_generation")
+        if expected_generation is not None and not isinstance(trade_revision, int):
+            # A shared account bundle cannot authorize a new order without
+            # the session revision captured at its read/apply boundary.
+            self._publish_account_round_rejected(session_id)
+            return
+        try:
+            self.store.lp_register_fenced_actions(
+                session_id,
+                [{
+                    "action_key": attempt_key,
+                    "payload": intent_payload,
+                }],
+                expected_generation=(
+                    int(expected_generation)
+                    if expected_generation is not None
+                    else None
+                ),
+                expected_trade_revision=trade_revision,
+            )
+        except ValueError as exc:
+            if str(exc) == "account_round_invalid":
+                self._publish_account_round_rejected(session_id)
+                return
+            raise
         self.store.lp_update_session(
             session_id,
             state="passive_exit",
@@ -13907,6 +14404,8 @@ class PolymarketLPService:
         session: Mapping[str, object],
         quantity: Decimal,
         snapshot: Mapping[str, object] | None = None,
+        *,
+        trade_revision: int | None = None,
     ) -> None:
         method = getattr(self.exchange, "submit_protected_sell", None)
         if quantity <= 0 or session.get("protected_exit_order_id"):
@@ -14026,18 +14525,42 @@ class PolymarketLPService:
         )
         prior_sold = _maybe_decimal(session.get("sold_quantity"))
         prior_residual = _maybe_decimal(session.get("residual_quantity"))
-        self.store.lp_upsert_action(
-            session_id,
-            attempt_key,
-            state="pending",
-            payload={
-                "role": "protected_exit",
-                "side": "SELL",
-                "token_id": session["token_id"],
-                "quantity": submit_quantity,
-                "min_price": min_price,
-            },
+        intent_payload: dict[str, object] = {
+            "role": "protected_exit",
+            "side": "SELL",
+            "token_id": session["token_id"],
+            "quantity": submit_quantity,
+            "min_price": min_price,
+        }
+        expected_generation = (
+            snapshot.get("_lp_trade_generation")
+            if isinstance(snapshot, Mapping)
+            else None
         )
+        if expected_generation is not None and not isinstance(trade_revision, int):
+            # A protected exit consumes a shared bundle; its captured revision
+            # is part of authorization, not optional metadata.
+            self._publish_account_round_rejected(session_id)
+            return
+        try:
+            self.store.lp_register_fenced_actions(
+                session_id,
+                [{
+                    "action_key": attempt_key,
+                    "payload": intent_payload,
+                }],
+                expected_generation=(
+                    int(expected_generation)
+                    if expected_generation is not None
+                    else None
+                ),
+                expected_trade_revision=trade_revision,
+            )
+        except ValueError as exc:
+            if str(exc) == "account_round_invalid":
+                self._publish_account_round_rejected(session_id)
+                return
+            raise
         self.store.lp_update_session(
             session_id,
             patch={
@@ -14154,14 +14677,22 @@ class PolymarketLPService:
         )
 
     def _review_iteration(
-        self, session: Mapping[str, object], snapshot: Mapping[str, object]
+        self,
+        session: Mapping[str, object],
+        snapshot: Mapping[str, object],
+        *,
+        trade_revision: int | None = None,
     ) -> dict[str, object]:
         if (
             session.get("stop_requested") is True
             or session.get("review_status") == "awaiting_reconciliation"
         ):
             try:
-                self._cancel_owned_orders(session)
+                self._cancel_owned_orders(
+                    session,
+                    expected_generation=snapshot.get("_lp_trade_generation"),
+                    expected_trade_revision=trade_revision,
+                )
             except Exception as exc:
                 updated = self.store.lp_update_session(
                     str(session["session_id"]),
@@ -14190,12 +14721,17 @@ class PolymarketLPService:
                 state="stop_loss_exit",
                 patch=self._stop_loss_latch_patch(updated, loss),
             )
-            updated = self._request_passive_cancel(updated)
+            updated = self._request_passive_cancel(
+                updated,
+                expected_generation=snapshot.get("_lp_trade_generation"),
+                expected_trade_revision=trade_revision,
+            )
             if not updated.get("passive_exit_order_id") or bool(updated.get("orders_terminal")):
                 self._submit_protected_exit(
                     updated,
                     _decimal(updated.get("residual_quantity", 0), "residual_quantity"),
                     snapshot,
+                    trade_revision=trade_revision,
                 )
             updated = self.store.lp_session(str(session["session_id"])) or updated
         return self._complete_if_flat(updated, snapshot)

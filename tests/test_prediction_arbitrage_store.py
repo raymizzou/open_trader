@@ -195,7 +195,7 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         assert connection.execute("PRAGMA busy_timeout").fetchone()[0] > 0
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
         names = {
             row[1]
             for row in connection.execute("PRAGMA table_list")
@@ -260,9 +260,10 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
         "lp_screening_snapshot",
         "lp_market_observations",
         "lp_market_competitiveness",
-        "lp_preparation",
-        "lp_preparation_items",
-    }
+            "lp_preparation",
+            "lp_preparation_items",
+            "lp_trade_generation",
+        }
     assert "signals_market_started_at" in indexes
     assert "signals_started_at" in indexes
     assert "signals_open_started_at" in indexes
@@ -3901,3 +3902,63 @@ def test_lp179_retry_upgrades_missing_evidence_without_rewriting_first_remaining
         "A": first_placement,
         "B": retry_confirmed,
     }
+
+
+def test_lp_register_fenced_actions_is_atomic(tmp_path: Path) -> None:
+    db = store(tmp_path)
+    session_id = "fenced-actions"
+    db.lp_create_session(
+        session_id,
+        "fenced-actions-key",
+        state="entry_open",
+        payload={"condition_id": "condition-1", "outcome": "YES"},
+    )
+    actions = [
+        {
+            "action_key": f"{session_id}:batch:A",
+            "payload": {
+                "role": "entry-protection-cancel",
+                "targets": ["A"],
+                "reason": "queue_ahead_ratio",
+            },
+        },
+        {
+            "action_key": f"{session_id}:batch:B",
+            "payload": {
+                "role": "entry-protection-cancel",
+                "targets": ["B"],
+                "reason": "queue_ahead_ratio",
+            },
+        },
+    ]
+
+    with pytest.raises(ValueError, match="account_round_invalid"):
+        db.lp_register_fenced_actions(
+            session_id,
+            actions,
+            expected_generation=1,
+            expected_trade_revision=0,
+        )
+    assert db.lp_actions(session_id) == []
+    assert db.lp_trade_generation() == 0
+    _, revision = db.lp_session_with_revision(session_id, trading=True)
+    assert revision == 0
+
+    registered = db.lp_register_fenced_actions(
+        session_id,
+        actions,
+        expected_generation=0,
+        expected_trade_revision=0,
+    )
+    assert [row["action_key"] for row in registered] == [
+        f"{session_id}:batch:A",
+        f"{session_id}:batch:B",
+    ]
+    assert all(row["state"] == "pending" for row in registered)
+    assert all(
+        row["targets"] == target
+        for row, target in zip(registered, (["A"], ["B"]))
+    )
+    assert db.lp_trade_generation() == 1
+    _, revision = db.lp_session_with_revision(session_id, trading=True)
+    assert revision == 1

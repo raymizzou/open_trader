@@ -436,7 +436,9 @@ def test_production_trade_structure_preserves_funds_until_reconciled(tmp_path, m
                           get_order=lambda **kwargs: exchange.orders[0])
     adapter = PolymarketTradingClient(TradingConfig('signer', 'test-wallet'), sdk,
                                     public_client_factory=lambda: public)
-    adapter._account_read_facts = lambda: (Decimal(1000), Decimal(1000), [], [], NOW)
+    adapter._account_read_facts = lambda: (
+        Decimal(1000), Decimal(1000), [], [], NOW, (trade,), True
+    )
     lp.exchange = adapter
     result = execution.lp_auto_reconcile_unknown()
     if trade_kind != 'failed':

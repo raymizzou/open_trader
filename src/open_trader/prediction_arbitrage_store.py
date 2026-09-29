@@ -391,6 +391,8 @@ class PredictionArbitrageStore:
         self._lp_preparation_owner_mutex = threading.Lock()
         self._lp_metadata_cache_ready = False
         self._lp_metadata_cache_schema_lock = threading.Lock()
+        self._lp_trade_change_listener: Callable[[str], None] | None = None
+        self._lp_trade_change_listener_lock = threading.Lock()
         self.prune_llm_usage()
         self._truncate_wal()
 
@@ -803,6 +805,15 @@ class PredictionArbitrageStore:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS lp_trade_generation (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                generation INTEGER NOT NULL CHECK (generation >= 0)
+            );
+
+            INSERT INTO lp_trade_generation(singleton, generation)
+            VALUES (1, 0)
+            ON CONFLICT(singleton) DO NOTHING;
+
             CREATE TABLE IF NOT EXISTS lp_daily_reports (
                 report_date TEXT PRIMARY KEY,
                 payload TEXT NOT NULL,
@@ -1028,6 +1039,11 @@ class PredictionArbitrageStore:
             # EXISTS above).
             connection.execute("PRAGMA user_version=15")
             version = 15
+        if version < 16:
+            # LP same-round reuse needs a durable trade-generation fence so a
+            # cached account bundle cannot be published across a mutation.
+            connection.execute("PRAGMA user_version=16")
+            version = 16
 
     @staticmethod
     def _execution_fields(row: sqlite3.Row) -> dict[str, object]:
@@ -5207,6 +5223,9 @@ class PredictionArbitrageStore:
 
     @staticmethod
     def _lp_register_trade_change(connection: sqlite3.Connection, session_id: str) -> None:
+        connection.execute(
+            "UPDATE lp_trade_generation SET generation=generation+1 WHERE singleton=1"
+        )
         row = connection.execute(
             "SELECT payload FROM lp_sessions WHERE session_id=?", (str(session_id),)
         ).fetchone()
@@ -5235,9 +5254,51 @@ class PredictionArbitrageStore:
         """Fence in-flight facts before a durable trading intent is executed."""
         with self._transaction() as connection:
             self._lp_register_trade_change(connection, session_id)
+        self._notify_lp_trade_change(session_id)
+
+    def lp_advance_trade_generation(self, expected: int) -> bool:
+        """Advance the shared fence only from the caller's observed generation."""
+
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT generation FROM lp_trade_generation WHERE singleton=1"
+            ).fetchone()
+            if row is None or int(row["generation"]) != int(expected):
+                return False
+            connection.execute(
+                "UPDATE lp_trade_generation SET generation=generation+1 "
+                "WHERE singleton=1 AND generation=?",
+                (int(expected),),
+            )
+        return True
+
+    def lp_trade_generation(self) -> int:
+        """Authoritative durable fence shared by every LP account consumer."""
+
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT generation FROM lp_trade_generation WHERE singleton=1"
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("lp_trade_generation_unknown")
+        return int(row["generation"])
+
+    def set_lp_trade_change_listener(self, callback: Callable[[str], None] | None) -> None:
+        """Receive one callback after each durable trade-generation fence."""
+
+        with self._lp_trade_change_listener_lock:
+            self._lp_trade_change_listener = callback
+
+    def _notify_lp_trade_change(self, session_id: str) -> None:
+        with self._lp_trade_change_listener_lock:
+            listener = self._lp_trade_change_listener
+        if listener is None:
+            return
+        listener(session_id)
 
     def lp_publish_facts(self, session_id, revision, *, patch=None, state=None,
-                         publish=None, error=None, resolved_cancels=()):
+                         publish=None, error=None, resolved_cancels=(),
+                         trade_generation=None):
         """Commit one fenced observation and its automatic ledger atomically.
 
         The publisher receives this connection; it must not open a nested
@@ -5252,6 +5313,12 @@ class PredictionArbitrageStore:
             payload = _load_payload(str(row["payload"]))
             if int(payload.get("_lp_trade_revision", 0)) != revision:
                 raise ValueError("session_changed")
+            if trade_generation is not None:
+                observed = connection.execute(
+                    "SELECT generation FROM lp_trade_generation WHERE singleton=1"
+                ).fetchone()
+                if observed is None or int(observed["generation"]) != int(trade_generation):
+                    raise ValueError("account_round_invalid")
             for action_id in resolved_cancels:
                 connection.execute("UPDATE lp_actions SET state='accepted',updated_at=? WHERE action_id=? AND session_id=? AND state IN ('pending','unknown')",
                                    (_utc_now(), action_id, str(session_id)))
@@ -5267,6 +5334,86 @@ class PredictionArbitrageStore:
             session = self._lp_row_result(row)
             changed = publish(session, connection=connection, error=error) if publish else False
         return session, changed
+
+    def lp_register_fenced_actions(
+        self,
+        session_id: str,
+        actions: list[Mapping[str, object]],
+        *,
+        expected_generation: int | None = None,
+        expected_trade_revision: int | None = None,
+    ) -> list[dict[str, object]]:
+        """Atomically authorize a batch of pending trading actions.
+
+        A shared-bundle caller must pass its observed generation. Pass a
+        captured session revision where that action's contract requires it;
+        each supplied fence is checked. The checks and every pending insert
+        share one SQLite transaction, so a lost race cannot leave one action
+        authorized while another is rejected.
+        Existing action payload fields (including ``targets`` and
+        ``order_id``) are preserved for recovery consumers.
+        """
+
+        if not actions:
+            return []
+        encoded: list[tuple[str, str]] = []
+        seen_keys: set[str] = set()
+        for action in actions:
+            action_key = str(action.get("action_key") or "")
+            if not action_key or action_key in seen_keys:
+                raise ValueError("action_key_invalid")
+            seen_keys.add(action_key)
+            payload: dict[str, object] = dict(action.get("payload") or {})
+            if "targets" in action:
+                payload["targets"] = list(action["targets"] or ())
+            if not str(payload.get("role") or ""):
+                raise ValueError("action_role_invalid")
+            encoded.append((action_key, _dump_execution_payload(payload)))
+        now = _utc_now()
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM lp_sessions WHERE session_id=?", (str(session_id),)
+            ).fetchone()
+            if row is None:
+                raise ValueError("lp_session_not_found")
+            session_payload = _load_payload(str(row["payload"]))
+            trade_revision = int(session_payload.get("_lp_trade_revision", 0))
+            if expected_trade_revision is not None and trade_revision != int(expected_trade_revision):
+                raise ValueError("account_round_invalid")
+            if expected_generation is not None:
+                generation_row = connection.execute(
+                    "SELECT generation FROM lp_trade_generation WHERE singleton=1"
+                ).fetchone()
+                if generation_row is None or int(generation_row["generation"]) != int(expected_generation):
+                    raise ValueError("account_round_invalid")
+            self._lp_register_trade_change(connection, str(session_id))
+            registered: list[dict[str, object]] = []
+            for action_key, encoded_payload in encoded:
+                connection.execute(
+                    "INSERT INTO lp_actions(action_id,session_id,action_key,state,payload,created_at,updated_at) "
+                    "VALUES (?,?,?,?,?,?,?) "
+                    "ON CONFLICT(action_key) DO UPDATE SET state=excluded.state,payload=excluded.payload,updated_at=excluded.updated_at",
+                    (
+                        _new_id(), str(session_id), action_key, "pending", encoded_payload,
+                        now, now,
+                    ),
+                )
+                stored = connection.execute(
+                    "SELECT * FROM lp_actions WHERE action_key=?", (action_key,)
+                ).fetchone()
+                assert stored is not None
+                result = _load_payload(str(stored["payload"]))
+                result.update({
+                    "action_id": str(stored["action_id"]),
+                    "session_id": str(stored["session_id"]),
+                    "action_key": action_key,
+                    "state": str(stored["state"]),
+                    "created_at": str(stored["created_at"]),
+                    "updated_at": str(stored["updated_at"]),
+                })
+                registered.append(result)
+        self._notify_lp_trade_change(str(session_id))
+        return registered
 
     def lp_upsert_action(
         self,
@@ -5302,6 +5449,7 @@ class PredictionArbitrageStore:
                 "updated_at": str(row["updated_at"]),
             }
         )
+        self._notify_lp_trade_change(session_id)
         return result
 
     def lp_actions(self, session_id: str, *, connection=None) -> list[dict[str, object]]:
