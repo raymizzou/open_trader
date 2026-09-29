@@ -5733,6 +5733,37 @@ class PredictionArbitrageStore:
         self._notify_lp_trade_change(session_id)
         return result
 
+    def lp_finish_cancel(
+        self, session_id: str, action_key: str, *, state: str,
+        payload: Mapping[str, object],
+    ) -> None:
+        """Record a cancel receipt without downgrading terminal account proof."""
+        with self._transaction() as connection:
+            changed = connection.execute(
+                "UPDATE lp_actions SET state=?,payload=?,updated_at=? "
+                "WHERE session_id=? AND action_key=? "
+                "AND (state!='accepted' OR ?='accepted')",
+                (state, _dump_execution_payload(payload), _utc_now(),
+                 str(session_id), str(action_key), state),
+            ).rowcount
+            if changed:
+                self._lp_register_trade_change(connection, session_id)
+        if changed:
+            self._notify_lp_trade_change(session_id)
+
+    def lp_reject_pending_cancel(self, session_id: str, action_key: str) -> None:
+        """Reject a definitely unsent cancel without overwriting receipt facts."""
+        with self._transaction() as connection:
+            changed = connection.execute(
+                "UPDATE lp_actions SET state='rejected',updated_at=? "
+                "WHERE session_id=? AND action_key=? AND state='pending'",
+                (_utc_now(), str(session_id), str(action_key)),
+            ).rowcount
+            if changed:
+                self._lp_register_trade_change(connection, session_id)
+        if changed:
+            self._notify_lp_trade_change(session_id)
+
     def lp_actions(self, session_id: str, *, connection=None) -> list[dict[str, object]]:
         with (self._read_connection() if connection is None else nullcontext(connection)) as connection:
             rows = connection.execute(

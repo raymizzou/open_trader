@@ -9959,8 +9959,6 @@ class PolymarketLPService:
         session_id = str(session['session_id'])
         if reason == 'order_identity_conflict':
             return self._status_payload(session)
-        if reason == "execution_lock":
-            return self._status_payload(session)
         snapshot_error = ValueError(reason) if reason and reason not in {'execution_lock', 'session_changed'} else None
         if snapshot_error is not None:
             return self._handle_snapshot_failure_fenced(
@@ -10012,6 +10010,12 @@ class PolymarketLPService:
                 # serialized apply can retry the protection operation.
                 protected_levels = set()
                 protection_writes = 0
+
+        if reason == "execution_lock":
+            # Exact-owned protection has its own fence; financial publication
+            # still waits for the execution lock and reuses the pending facts.
+            current = self.store.lp_session(session_id) or session
+            return self._status_payload(current)
 
         # Scoring is a read, not a trading action. Keep its network wait out
         # of both apply locks so other sessions can publish fresh funds.
@@ -12551,6 +12555,7 @@ class PolymarketLPService:
         updated = dict(plan["updated"])
         canceled: list[str] = []
         failed: list[str] = []
+        unsent: list[str] = []
         failure_error: str | None = None
         for order_id in targets:
             try:
@@ -12559,6 +12564,10 @@ class PolymarketLPService:
                     confirmed_times.setdefault(order_id, _iso(self._now()))
                 else:
                     failed.append(order_id)
+            except _MutationBlocked as exc:
+                unsent.append(order_id)
+                failed.append(order_id)
+                failure_error = type(exc).__name__
             except Exception as exc:
                 failed.append(order_id)
                 failure_error = type(exc).__name__
@@ -12570,13 +12579,15 @@ class PolymarketLPService:
         }
         # An authorized action's real receipt always survives, even if a newer
         # account fence lands while its venue call is in flight.
-        if failed:
+        if targets and len(unsent) == len(targets):
+            self.store.lp_reject_pending_cancel(session_id, action_key)
+        elif failed:
             receipt_payload["error"] = failure_error or "cancel_not_acknowledged"
-            self.store.lp_upsert_action(
+            self.store.lp_finish_cancel(
                 session_id, action_key, state="pending", payload=receipt_payload
             )
         else:
-            self.store.lp_upsert_action(
+            self.store.lp_finish_cancel(
                 session_id, action_key, state="accepted", payload=receipt_payload
             )
 
@@ -13673,6 +13684,7 @@ class PolymarketLPService:
 
         canceled: list[str] = []
         failed: list[str] = []
+        unsent: set[str] = set()
         failure_error: str | None = None
         for order_id in targets:
             try:
@@ -13681,17 +13693,26 @@ class PolymarketLPService:
                     confirmed_times.setdefault(order_id, _iso(self._now()))
                 else:
                     failed.append(order_id)
+            except _MutationBlocked as exc:
+                unsent.add(order_id)
+                failed.append(order_id)
+                failure_error = type(exc).__name__
+                self.store.lp_reject_pending_cancel(
+                    LP_RESERVED_MANUAL_SESSION_ID, action_keys[order_id]
+                )
             except Exception as exc:
                 failed.append(order_id)
                 failure_error = type(exc).__name__
 
         for order_id in targets:
+            if order_id in unsent:
+                continue
             receipt = action_payload(order_id)
             if order_id in failed:
                 receipt["canceled"] = []
                 receipt["failed"] = [order_id]
                 receipt["error"] = failure_error or "cancel_not_acknowledged"
-                self.store.lp_upsert_action(
+                self.store.lp_finish_cancel(
                     LP_RESERVED_MANUAL_SESSION_ID,
                     action_keys[order_id],
                     state="pending",
@@ -13700,7 +13721,7 @@ class PolymarketLPService:
             else:
                 receipt["canceled"] = [order_id]
                 receipt["failed"] = []
-                self.store.lp_upsert_action(
+                self.store.lp_finish_cancel(
                     LP_RESERVED_MANUAL_SESSION_ID,
                     action_keys[order_id],
                     state="accepted",
@@ -14941,18 +14962,20 @@ class PolymarketLPService:
     def finish_order_cancel(self, attempts, canceled, *, serialized=True):
         with self._mutex if serialized else nullcontext():
             for session_id, key, payload in attempts:
-                # An exact terminal venue receipt may have settled this action
-                # while the cancel reply was still in flight. Keep that proof.
-                if any(a['action_key'] == key and a['state'] == 'accepted'
-                       for a in self.store.lp_actions(session_id)):
-                    continue
-                self.store.lp_upsert_action(session_id, key,
+                self.store.lp_finish_cancel(session_id, key,
                     state='accepted' if payload['order_id'] in canceled else 'unknown', payload=payload)
         if attempts and self._facts_wakeup:
             self._facts_wakeup()
 
     def _cancel_order(self, order_id: str, *, attempts=None) -> bool:
-        self._require_mutation()
+        try:
+            self._require_mutation()
+        except _MutationBlocked:
+            # The guard ran before any venue call: a preclaimed intent was
+            # definitely not sent and must not suppress the next cancel.
+            for session_id, key, _payload in attempts or ():
+                self.store.lp_reject_pending_cancel(session_id, key)
+            raise
         # Cancel intent/receipt persistence is serialized with strategy and
         # generation fences; the venue request between those short sections is
         # deliberately off the mutex.

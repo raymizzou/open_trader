@@ -1807,7 +1807,7 @@ class PredictionExecutionService:
         ledger_retry_at = None
         retry_source = None
         ledger_manual_attention = False
-        pool_reader = getattr(self._auto_pool, "_read", None)
+        pool_reader = getattr(getattr(self, "_auto_pool", None), "_read", None)
         owns_session = getattr(self._store, "lp_auto_owns_session", None)
         if callable(pool_reader) and callable(owns_session) and owns_session(session_id):
             document = pool_reader()

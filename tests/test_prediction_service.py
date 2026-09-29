@@ -220,15 +220,24 @@ def test_prediction_service_entry_logging_carries_iso_timestamps() -> None:
 
 
 def test_socket_fd_count_does_not_leak_non_socket_descriptors() -> None:
-    read_fd, write_fd = os.pipe()
-    try:
-        before = len(os.listdir("/dev/fd"))
-        for _ in range(3):
-            _socket_fd_count()
-        assert len(os.listdir("/dev/fd")) == before
-    finally:
-        os.close(read_fd)
-        os.close(write_fd)
+    # Other tests' background workers may open/close process-wide descriptors.
+    script = f"""
+import os
+import sys
+sys.path.insert(0, {str(Path(__file__).parent)!r})
+from tests.test_prediction_service import _socket_fd_count
+
+read_fd, write_fd = os.pipe()
+try:
+    before = len(os.listdir("/dev/fd"))
+    for _ in range(3):
+        _socket_fd_count()
+    assert len(os.listdir("/dev/fd")) == before
+finally:
+    os.close(read_fd)
+    os.close(write_fd)
+"""
+    subprocess.run([sys.executable, "-c", script], check=True, timeout=30)
 
 
 def _handler_thread_ids() -> set[int | None]:
@@ -4065,6 +4074,9 @@ def test_lp_add_room_requires_current_aligned_reward_and_risk(tmp_path: Path) ->
     service, _trading, store, monitor = execution_fixture(tmp_path)
     trading = ReadOnlyTrading()
     service._trading = trading
+    # Scripted account changes must not race background dashboard readers.
+    service._schedule_lp_reward_refresh = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    service._schedule_lp_orders_today_refresh = lambda *args, **kwargs: None  # type: ignore[method-assign]
     notifier = CountingNotifier()
     service._notifier = notifier  # type: ignore[assignment]
     state["orders"] = [order(Decimal("200"))]

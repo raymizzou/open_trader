@@ -7,6 +7,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
@@ -5930,6 +5931,222 @@ def test_startup_preserves_orders_and_locks_unresolved_execution(tmp_path: Path)
     assert service.preview("opp-1")["state"] == "locked"
 
 
+@pytest.mark.parametrize(
+    ("prior_state", "allowed", "expected_state", "expected_calls"),
+    [
+        ("pending", False, "rejected", 0),
+        ("unknown", False, "unknown", 0),
+        ("accepted", False, "accepted", 0),
+        ("pending", True, "unknown", 1),
+    ],
+)
+def test_lp_cancel_guard_distinguishes_unsent_from_unknown(
+    tmp_path: Path, prior_state: str, allowed: bool,
+    expected_state: str, expected_calls: int,
+) -> None:
+    class TimeoutExchange(LPExchange):
+        def cancel_order(self, order_id: str) -> object:
+            self.cancels.append(order_id)
+            raise OSError("cancel_reply_lost")
+
+    store = PredictionArbitrageStore(tmp_path / "data")
+    store.lp_create_session("session", "key", state="entry_open", payload={})
+    payload = {"role": "reconciliation_cancel", "order_id": "order-1"}
+    store.lp_upsert_action("session", "cancel", state=prior_state, payload=payload)
+    exchange = TimeoutExchange()
+    lp = PolymarketLPService(store, exchange, mutation_guard=lambda *_: allowed)
+    with pytest.raises((RuntimeError, OSError)):
+        lp._cancel_order("order-1", attempts=[("session", "cancel", payload)])
+    assert len(exchange.cancels) == expected_calls
+    assert store.lp_actions("session")[0]["state"] == expected_state
+
+
+@pytest.mark.parametrize(
+    ("prior_state", "target_session", "target_key", "changed"),
+    [
+        ("pending", "session", "cancel", True),
+        ("accepted", "session", "cancel", False),
+        ("unknown", "session", "cancel", False),
+        ("pending", "other", "cancel", False),
+        ("pending", "session", "other", False),
+    ],
+)
+def test_lp_reject_pending_cancel_only_invalidates_when_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prior_state: str,
+    target_session: str, target_key: str, changed: bool,
+) -> None:
+    store = PredictionArbitrageStore(tmp_path / "data")
+    store.lp_create_session("session", "key", state="entry_open", payload={})
+    payload = {"role": "reconciliation_cancel", "order_id": "order-1", "proof": "keep"}
+    store.lp_upsert_action("session", "cancel", state=prior_state, payload=payload)
+    before = store.lp_actions("session")[0]
+    generation = store.lp_trade_generation()
+    revision = store.lp_session_revision("session", trading=True)
+    notified = []
+
+    def notify(session_id):
+        # A separate connection sees the committed state before notification.
+        assert store.lp_actions(session_id)[0]["state"] == "rejected"
+        notified.append(session_id)
+
+    monkeypatch.setattr(store, "_notify_lp_trade_change", notify)
+    store.lp_reject_pending_cancel(target_session, target_key)
+    after = store.lp_actions("session")[0]
+    assert store.lp_trade_generation() == generation + int(changed)
+    assert store.lp_session_revision("session", trading=True) == revision + int(changed)
+    assert notified == (["session"] if changed else [])
+    if changed:
+        assert after["state"] == "rejected"
+        assert {k: v for k, v in after.items() if k not in {"state", "updated_at"}} == {
+            k: v for k, v in before.items() if k not in {"state", "updated_at"}
+        }
+    else:
+        assert after == before
+
+
+@pytest.mark.parametrize("boundary", ["reject", "unknown_completion", "pending_completion"])
+def test_lp_cancel_guard_preserves_terminal_facts_winning_reject_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str,
+) -> None:
+    store = PredictionArbitrageStore(tmp_path / "data")
+    store.lp_create_session("session", "key", state="entry_open", payload={})
+    payload = {"role": "reconciliation_cancel", "order_id": "order-1"}
+    store.lp_upsert_action("session", "cancel", state="pending", payload=payload)
+    pending = store.lp_actions("session")[0]
+    assert pending["state"] == "pending"
+    transaction = store._transaction
+    terminal_published = False
+    terminal_facts = {}
+
+    @contextmanager
+    def publish_terminal_before_reject():
+        nonlocal terminal_published
+        if not terminal_published:
+            terminal_published = True
+            store.lp_publish_facts(
+                "session", store.lp_session_revision("session", trading=True),
+                patch={"orders_terminal": True},
+                resolved_cancels=[pending["action_id"]],
+            )
+            terminal_facts.update(
+                action=store.lp_actions("session")[0],
+                generation=store.lp_trade_generation(),
+                revision=store.lp_session_revision("session", trading=True),
+            )
+        with transaction() as connection:
+            yield connection
+
+    monkeypatch.setattr(store, "_transaction", publish_terminal_before_reject)
+    exchange = LPExchange()
+    lp = PolymarketLPService(store, exchange, mutation_guard=lambda *_: False)
+    if boundary == "reject":
+        with pytest.raises(RuntimeError, match="mutation_blocked"):
+            lp._cancel_order("order-1", attempts=[("session", "cancel", payload)])
+    elif boundary == "unknown_completion":
+        lp.finish_order_cancel([("session", "cancel", payload)], ())
+    else:
+        store.lp_finish_cancel("session", "cancel", state="pending", payload=payload)
+    assert terminal_published
+    assert exchange.cancels == []
+    assert store.lp_actions("session")[0]["state"] == "accepted"
+    assert store.lp_actions("session")[0] == terminal_facts["action"]
+    assert store.lp_trade_generation() == terminal_facts["generation"]
+    assert store.lp_session_revision("session", trading=True) == terminal_facts["revision"]
+
+
+@pytest.mark.parametrize("lane", ["bucket", "first_seen"])
+@pytest.mark.parametrize("outcome", ["blocked", "partial_ack", "partial_unknown", "accepted", "unknown", "terminal"])
+def test_lp_protection_guard_closes_after_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str, outcome: str,
+) -> None:
+    from tests.test_polymarket_lp import (
+        _first_seen_running_service, _queue_receipt,
+        _queue_running_service, _queue_runtime_snapshot,
+    )
+
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    allowed = True
+    if lane == "bucket":
+        _seed_lp_history(PredictionArbitrageStore(tmp_path), lp_request(now), now)
+        store, exchange, lp, _ = _queue_running_service(
+            tmp_path, now, key="guard-race", guard=lambda *_: allowed,
+        )
+        exchange.snapshot_value = _queue_runtime_snapshot(
+            now, bid_size="4000",
+            orders=[_queue_receipt("order-1"), _queue_receipt("manual-2")],
+        )
+    else:
+        store, exchange, lp = _first_seen_running_service(
+            tmp_path, now, episode_id="guard-race", level_total="4000",
+            open_orders=[_queue_receipt("m-1"), _queue_receipt("manual-2")],
+            guard=lambda *_: allowed,
+        )
+    register = store.lp_register_fenced_actions
+    cancel = exchange.cancel_order
+    claims = []
+
+    def register_then_close(session_id, actions, **kwargs):
+        nonlocal allowed
+        result = register(session_id, actions, **kwargs)
+        if any("protection-cancel" in str(action["payload"].get("role")) for action in actions):
+            claims.extend((session_id, row["action_key"]) for row in result)
+            if outcome in {"accepted", "unknown"}:
+                for row in result:
+                    store.lp_upsert_action(session_id, row["action_key"], state=outcome, payload=row)
+            if not outcome.startswith("partial") and outcome != "terminal":
+                allowed = False
+        return result
+
+    def cancel_then_close(order_id):
+        nonlocal allowed
+        result = cancel(order_id)
+        allowed = False
+        if outcome == "partial_unknown":
+            raise OSError("cancel_reply_lost")
+        if outcome == "terminal":
+            for sid in {sid for sid, _ in claims}:
+                store.lp_publish_facts(
+                    sid, store.lp_session_revision(sid, trading=True),
+                    patch={"orders_terminal": True},
+                    resolved_cancels=[row["action_id"] for row in store.lp_actions(sid)],
+                )
+            return {"not_canceled": {order_id: "reply_unknown"}}
+        return result
+
+    monkeypatch.setattr(store, "lp_register_fenced_actions", register_then_close)
+    monkeypatch.setattr(exchange, "cancel_order", cancel_then_close)
+    lp.tick()
+    assert claims
+    states = [
+        next(row["state"] for row in store.lp_actions(sid) if row["action_key"] == key)
+        for sid, key in claims
+    ]
+    if outcome == "terminal":
+        assert len(exchange.cancels) == 1
+        assert states == ["accepted"] * len(claims)
+    elif outcome.startswith("partial"):
+        assert len(exchange.cancels) == 1
+        if lane == "bucket":
+            assert states == ["pending"]
+        else:
+            assert states == ["accepted" if outcome == "partial_ack" else "pending", "rejected"]
+    else:
+        assert exchange.cancels == []
+        assert states == [outcome if outcome in {"accepted", "unknown"} else "rejected"] * len(claims)
+
+
+def _lp_complete_account(snapshot: dict[str, object], now: datetime) -> dict[str, object]:
+    account = snapshot["account"]
+    assert isinstance(account, dict)
+    account.update(
+        wallet_address="0x" + "1" * 40,
+        open_orders_complete=True,
+        positions_complete=True,
+        checked_at=now,
+    )
+    return snapshot
+
+
 def test_lp_restart_preserves_order_until_original_review(tmp_path: Path) -> None:
     current = [datetime(2026, 9, 15, 23, 50, tzinfo=UTC)]
     review_at = datetime(2026, 9, 16, 0, 0, tzinfo=UTC)
@@ -5957,7 +6174,7 @@ def test_lp_restart_preserves_order_until_original_review(tmp_path: Path) -> Non
             self.venue_orders = [dict(manual_order)]
 
         def lp_snapshot(self, request: dict[str, object]) -> dict[str, object]:
-            snapshot = lp_snapshot(current[0])
+            snapshot = _lp_complete_account(lp_snapshot(current[0]), current[0])
             snapshot["orders"] = [dict(order) for order in self.venue_orders]
             snapshot["scoring"] = True
             account = snapshot["account"]
@@ -5997,6 +6214,7 @@ def test_lp_restart_preserves_order_until_original_review(tmp_path: Path) -> Non
 
     exchange = RestartExchange()
     trading = IncidentTrading(result="unsafe")
+    trading.config = SimpleNamespace(wallet_address="0x" + "1" * 40)
     store = PredictionArbitrageStore(tmp_path / "data")
     _seed_lp_history(store, lp_request(current[0]), current[0])
     notifier = CompositeTestNotifier(
@@ -6052,6 +6270,11 @@ def test_lp_restart_preserves_order_until_original_review(tmp_path: Path) -> Non
     # Startup keeps the breaker open for its tick; the public monitor tick
     # applies the original deadline after startup has restored readiness.
     assert exchange.cancels == []
+
+    assert not any(
+        action.get("state") == "pending" and "cancel" in str(action.get("action_key"))
+        for action in store.lp_actions(session_id)
+    )
 
     reviewed = after_review.lp_tick()
     assert reviewed["state"] == "review"
@@ -8727,7 +8950,7 @@ def test_lp179_triggered_cancel_bypasses_other_group_submit(tmp_path: Path) -> N
         bid_size: Decimal,
         order_id: str | None = None,
     ) -> dict[str, object]:
-        snapshot = _queue_book_snapshot(now, bid_size)
+        snapshot = _lp_complete_account(_queue_book_snapshot(now, bid_size), now)
         snapshot["market"].update(identity)  # type: ignore[union-attr]
         for level in snapshot["book"]["bids"]:  # type: ignore[index]
             if level["price"] == Decimal("0.29"):  # type: ignore[index]
@@ -8755,8 +8978,8 @@ def test_lp179_triggered_cancel_bypasses_other_group_submit(tmp_path: Path) -> N
             if self.trigger_a and market_id == str(market_a["market_id"]):
                 return runtime_snapshot(market_a, bid_size=Decimal("40"), order_id="order-1")
             if market_id == str(market_a["market_id"]):
-                return _lp166_book(now, market_a)
-            return _lp166_book(now, market_b)
+                return _lp_complete_account(_lp166_book(now, market_a), now)
+            return _lp_complete_account(_lp166_book(now, market_b), now)
 
         def post_order(self, signed: dict[str, object]) -> dict[str, object]:
             if block_b.is_set() and signed.get("token_id") == market_b["token_id"]:
@@ -8771,6 +8994,8 @@ def test_lp179_triggered_cancel_bypasses_other_group_submit(tmp_path: Path) -> N
 
     exchange = ConcurrentExchange()
     exchange.snapshot_value = _lp166_book(now, market_a)
+    trading = IncidentTrading(result="unsafe")
+    trading.config = SimpleNamespace(wallet_address="0x" + "1" * 40)
     store = PredictionArbitrageStore(tmp_path / "data")
     for identity in (market_a, market_b):
         _seed_lp_history(store, _lp166_entry_request(now, identity), now)
@@ -8778,7 +9003,7 @@ def test_lp179_triggered_cancel_bypasses_other_group_submit(tmp_path: Path) -> N
     execution = PredictionExecutionService(
         store=store,
         monitor=FakeMonitor(_intent()),
-        trading=IncidentTrading(result="unsafe"),
+        trading=trading,
         notifier=CompositeTestNotifier(ChannelNotifier("macos"), ChannelNotifier("feishu")),
         lock_path=tmp_path / "execution.lock",
         lp=lp,
@@ -8852,7 +9077,7 @@ def test_lp179_same_group_augment_does_not_delay_or_overwrite_a_cancel(
         bid_at_augment: Decimal,
         orders: list[dict[str, object]],
     ) -> dict[str, object]:
-        snapshot = _lp166_book(now, market_a)
+        snapshot = _lp_complete_account(_lp166_book(now, market_a), now)
         snapshot["book"] = {
             "timestamp": now,
             "received_at": now,
@@ -8904,13 +9129,15 @@ def test_lp179_same_group_augment_does_not_delay_or_overwrite_a_cancel(
 
     exchange = SameGroupExchange()
     exchange.snapshot_value = initial_snapshot
+    trading = IncidentTrading(result="unsafe")
+    trading.config = SimpleNamespace(wallet_address="0x" + "1" * 40)
     store = PredictionArbitrageStore(tmp_path / "data")
     _seed_lp_history(store, _lp166_entry_request(now, market_a), now)
     lp = PolymarketLPService(store, exchange, clock=lambda: now)
     execution = PredictionExecutionService(
         store=store,
         monitor=FakeMonitor(_intent()),
-        trading=IncidentTrading(result="unsafe"),
+        trading=trading,
         notifier=CompositeTestNotifier(ChannelNotifier("macos"), ChannelNotifier("feishu")),
         lock_path=tmp_path / "execution.lock",
         lp=lp,
@@ -9063,6 +9290,8 @@ def test_lp166_reconcile_startup_recovers_every_group(tmp_path: Path) -> None:
     （B 开仓不顺延 A 截止）；就绪由两组共同决定（readiness=lp_active）。"""
     current = [datetime(2026, 9, 21, 12, 0, tzinfo=UTC)]
     exchange = LPExchange()
+    trading = IncidentTrading(result="unsafe")
+    trading.config = SimpleNamespace(wallet_address="0x" + "1" * 40)
     store = PredictionArbitrageStore(tmp_path / "data")
     for index in (1, 2):
         _seed_lp_history(
@@ -9070,12 +9299,14 @@ def test_lp166_reconcile_startup_recovers_every_group(tmp_path: Path) -> None:
         )
 
     def new_execution() -> PredictionExecutionService:
-        exchange.snapshot_value = _lp166_book(current[0], _lp166_identity(1))
+        exchange.snapshot_value = _lp_complete_account(
+            _lp166_book(current[0], _lp166_identity(1)), current[0]
+        )
         lp = PolymarketLPService(store, exchange, clock=lambda: current[0])
         return PredictionExecutionService(
             store=store,
             monitor=FakeMonitor(_intent()),
-            trading=IncidentTrading(result="unsafe"),
+            trading=trading,
             notifier=CompositeTestNotifier(
                 ChannelNotifier("macos"), ChannelNotifier("feishu")
             ),
@@ -9086,7 +9317,7 @@ def test_lp166_reconcile_startup_recovers_every_group(tmp_path: Path) -> None:
     first = new_execution()
     first._breaker_open = False
     for index, identity in enumerate((_lp166_identity(1), _lp166_identity(2))):
-        exchange.snapshot_value = _lp166_book(current[0], identity)
+        exchange.snapshot_value = _lp_complete_account(_lp166_book(current[0], identity), current[0])
         preview = first.lp_preview(_lp166_entry_request(current[0], identity))
         assert preview["state"] == "previewed"
         started = first.lp_start(str(preview["preview_id"]), f"lp166-reboot-{index}")
