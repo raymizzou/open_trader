@@ -1,0 +1,49 @@
+name: Development dependency acceptance
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+    paths:
+      - .github/workflows/dev-dependencies.yml
+      - Dockerfile.dev
+      - .dockerignore
+      - Makefile
+      - pyproject.toml
+      - uv.lock
+      - scripts/dev_dependency_manifest.py
+      - scripts/verify_dev_dependencies.sh
+      - tests/test_dev_dependencies.py
+      - tests/test_dependency_workflow.py
+      - tests/test_prediction_ssm.py
+      - docs/operations/dependency-reproducibility.md
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dev-dependencies-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  dependency-acceptance:
+    if: github.head_ref == 'fix/212-locked-dev' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Verify clean builds and offline containers
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/dev-dependency-evidence
+        run: bash scripts/verify_dev_dependencies.sh "$EVIDENCE_DIR"
+      - name: Preserve dependency and isolation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dev-dependencies-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/dev-dependency-evidence
+          retention-days: 3
+          if-no-files-found: error

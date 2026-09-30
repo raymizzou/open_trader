@@ -5,6 +5,13 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-30
 
+- #212：开发环境严格消费 uv.lock，分离普通测试与 host-only browser extra，
+  固定 Python/uv 镜像摘要及构建后端；补锁文件失配、依赖清单和测试隔离契约回归。
+  两个独立缓存/干净宿主环境安装的 98 项 Python 依赖一致；定向宿主测试通过。
+  增加仅 #212 分支 PR 触发的标准 Linux runner 验收：双次无缓存构建、依赖比对、容器隔离及聚焦测试，保留三天证据。
+  工作流文件使用功能名称 `dev-dependencies.yml`，不在文件名中包含票号。
+  本地无 Docker，真实镜像及隔离结果以对应提交的 Actions 证据为准；未部署。
+
 - #201：账户版本失效仅进入财务待只读核对，保留占资、原业务状态与真实故障记录，禁止旧快照驱动交易；
   看板显示重新核对，保留最后有效检查时间，新一代有效事实后清除等待。固定并发回归覆盖跨组止损隔离及读取、发布、使用边界。未部署。
 

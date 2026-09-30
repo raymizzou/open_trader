@@ -1,10 +1,20 @@
-FROM python:3.12-slim AS dev
+FROM astral/uv:0.12.19@sha256:04d046b13e60d6bcec73cbc5e1cad25d680dea90c8573340950a0ac2d1aef424 AS uv
+FROM python:3.12.14-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e AS dev
+
+COPY --from=uv /uv /usr/local/bin/uv
+LABEL org.open-trader.image-role="test-only"
+ARG SOURCE_SHA=unknown
+ARG SOURCE_STATE=unknown
+ENV OPEN_TRADER_TEST_SOURCE_SHA=$SOURCE_SHA \
+    OPEN_TRADER_TEST_SOURCE_STATE=$SOURCE_STATE
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     OPENSSL_armcap=0 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     TZ=Asia/Shanghai \
+    UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_PYTHON_DOWNLOADS=never \
     VIRTUAL_ENV=/opt/venv \
     PATH=/opt/venv/bin:$PATH
 
@@ -47,16 +57,14 @@ RUN apt-get update \
     && chmod 0755 /usr/libexec/PlistBuddy \
     && rm -rf /var/lib/apt/lists/*
 
-# Install dependencies from stable metadata first; source edits only rebuild
-# the small editable-install layer below.
-COPY pyproject.toml /tmp/open-trader-metadata/pyproject.toml
-COPY src/open_trader/__init__.py /tmp/open-trader-metadata/src/open_trader/__init__.py
-RUN python -m venv "$VIRTUAL_ENV" \
-    && python -m pip install --no-cache-dir --upgrade pip \
-    && python -m pip install --no-cache-dir -e "/tmp/open-trader-metadata[cloud-ssm]" "pytest>=8.0" "pytest-xdist==3.8.0"
+# Bootstrap only the locked build backend before building locked source archives
+# (futu-api ships no wheel). No isolated build can download unreviewed tooling.
+COPY pyproject.toml uv.lock /workspace/
+RUN uv sync --locked --only-group build --no-build \
+    && uv sync --locked --no-default-groups --group build --extra dev --extra cloud-ssm --no-install-project --no-build-isolation
 
 COPY . /workspace
-RUN python -m pip install --no-cache-dir --no-deps -e . \
+RUN uv sync --locked --offline --no-default-groups --group build --extra dev --extra cloud-ssm --no-build-isolation \
     && git init --quiet /workspace \
     && git -C /workspace config user.name "open-trader-test" \
     && git -C /workspace config user.email "open-trader-test@example.invalid" \

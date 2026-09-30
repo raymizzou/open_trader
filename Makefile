@@ -10,7 +10,9 @@ DOCKERFILE ?= Dockerfile.dev
 WORKTREE_HASH := $(shell printf '%s' "$(WORKTREE_ROOT)" | shasum -a 256 | cut -c1-12)
 DOCKER_IMAGE ?= open-trader-dev:$(WORKTREE_HASH)
 BUILDX_CONFIG ?= /tmp/open-trader-buildx-$(WORKTREE_HASH)
-DOCKER_BUILD = BUILDX_CONFIG="$(BUILDX_CONFIG)" $(DOCKER) build --target dev --file "$(WORKTREE_ROOT)/$(DOCKERFILE)" --tag "$(DOCKER_IMAGE)" "$(WORKTREE_ROOT)"
+SOURCE_SHA := $(shell git rev-parse HEAD)
+SOURCE_STATE := $(if $(shell git status --porcelain --untracked-files=all),dirty,clean)
+DOCKER_BUILD = BUILDX_CONFIG="$(BUILDX_CONFIG)" $(DOCKER) build --build-arg SOURCE_SHA="$(SOURCE_SHA)" --build-arg SOURCE_STATE="$(SOURCE_STATE)" --target dev --file "$(WORKTREE_ROOT)/$(DOCKERFILE)" --tag "$(DOCKER_IMAGE)" "$(WORKTREE_ROOT)"
 DOCKER_RUN = $(DOCKER) run --rm --init --network none --cap-drop ALL --security-opt no-new-privileges "$(DOCKER_IMAGE)"
 BACKEND_PYTEST := env PYTHONSAFEPATH=1 PYTHONPATH=/workspace:/workspace/src PYTHONDONTWRITEBYTECODE= PYTHONPYCACHEPREFIX=/tmp/open-trader-bytecache pytest -q -m "not pressure and not browser" -o cache_dir=/tmp/open-trader-pytest-cache --basetemp=/tmp/open-trader-pytest
 TEST_WORKERS ?= $(if $(filter prediction,$(SERVICE)),6,1)

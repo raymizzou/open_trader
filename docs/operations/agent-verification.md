@@ -43,7 +43,9 @@ Do not run it during development, review, before merge, or automatically
 after a local merge. The image includes Node and `procps`, and excludes npm,
 Python/JS Playwright, Chromium/browser assets, host mounts, network, published
 ports, the Docker socket, the home directory, and credentials. The approved
-pytest-xdist dependency is pinned in the dev image and development extras.
+pytest-xdist dependency is pinned in the development extras and consumed from
+`uv.lock` by the dev image. See [dependency reproducibility](dependency-reproducibility.md)
+for the locked Python/build-tool baseline and clean-build evidence.
 The 2026-09-29 approved cloud credential exception permits only the optional
 `cloud-ssm` extra (pinned Tencent SSM SDK and common SDK); Docker development
 installs it for offline SDK transport tests. Do not add other dependencies or
