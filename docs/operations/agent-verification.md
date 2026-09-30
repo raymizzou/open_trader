@@ -59,6 +59,69 @@ require the full suite, Candidate Acceptance, Host Readiness, or Production
 Smoke. Changes to shared modules or dependencies, Dashboard/backend runtime,
 reports, trading behavior, or wider production paths use the normal gates.
 
+## Test design and stability
+
+These principles apply to all tests, including new tests and stability repairs;
+they do not change the scope-specific verification routes above.
+
+### Preserve the contract
+
+- State the behavior being protected before changing a test. Keep success,
+  boundary, and negative assertions: expired facts must still fail, and a
+  service must remain unavailable until all required recovery work completes.
+- Preserve production deadlines, fail-closed checks, ordering, cancellation,
+  and resource-cleanup guarantees. A stability repair must not silently change
+  business behavior; obtain explicit user approval for a contract change.
+- Do not skip/xfail failures, weaken assertions, inflate business deadlines or
+  test timeouts, remove coverage, or add retry-until-green logic merely to make
+  a run pass. Existing approved scope exemptions remain unchanged.
+
+### Separate business time from scheduling
+
+- Use an injected or narrowly scoped controllable clock for expiry, cooldown,
+  and other business-time boundaries; advance it deliberately across the
+  boundary and verify both sides. Do not make a valid fixture expire just
+  because startup, CI load, or worker scheduling consumed a tiny real budget.
+- Coordinate concurrent work with observable completion events, barriers, or
+  conditions tied to the actual state transition. Arbitrary sleeps are not
+  proof that work started or finished; bounded polling is acceptable when no
+  completion signal is available and checks the real condition.
+- Keep a bounded real-time watchdog independent of the controlled clock so
+  hangs still fail. Separate startup/synchronization budgets from the business
+  deadline being asserted; justify any watchdog adjustment with evidence while
+  preserving the original contract, rather than simply increasing a timeout.
+- Isolate clock overrides and restore them during teardown. Do not globally
+  patch shared clock functions in ways that affect unrelated threads, event
+  loops, subprocess supervision, or watchdogs. Release waiters and reclaim
+  threads/processes/resources on failure as well as success.
+- Retain real integration and separate timeout, cancellation, and cleanup
+  tests. When elapsed time, scheduling, latency, or throughput is itself the
+  contract, test it with real time and justified bounds/environment assumptions;
+  controlled time must not replace that evidence. Fake clocks are not required
+  for tests that do not benefit from them.
+
+### Diagnose and verify repairs
+
+1. Keep the original failure, exact SHA, command, environment, worker count,
+   and logs. Reproduce and distinguish a product defect, invalid fixture,
+   scheduling dependency, or environmental blocker before choosing a repair.
+   A tight timeout or one green rerun alone does not prove a test is flaky;
+   report an unconfirmed diagnosis as such.
+2. After an authorized repair, show regression/negative evidence that the test
+   still rejects the original wrong behavior. Where needed, use a temporary
+   targeted mutation or fault injection and verify that it fails; do not publish
+   the mutation. For example, accepting expired data or declaring readiness
+   before every recovery worker finishes must still fail the test.
+3. Repeat the affected tests with reproducible settings in serial and relevant
+   supported concurrency (including two workers for Prediction CI). Exercise
+   controlled scheduling delays/alternate interleavings, then run the required
+   affected-scope checks. Record repetition counts, settings, and every outcome;
+   a later pass does not erase a failed attempt, and repetition alone does not
+   prove correctness. Diagnostic retries must not turn failures into success.
+4. Report all failures and any remaining uncertainty or blocked verification.
+   Restage the exact changes and obtain independent review before publication;
+   existing exact-SHA, rebase, CI, and approval requirements still apply.
+
 ## Four separate gates
 
 The results are independent: Docker development, Candidate Acceptance,

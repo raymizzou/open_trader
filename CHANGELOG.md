@@ -5,6 +5,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-30
 
+- 为全仓测试补充稳定性原则：保留业务契约与负向断言，将可控业务时钟、完成事件和
+  独立真实 watchdog 分开；保留真实集成、超时、取消、清理及性能验证，避免全局时钟污染。
+  失败先取证，修复须证明错误行为仍会失败，并重复串行及相关并发/调度场景；禁止靠
+  跳过、放宽断言、单纯加超时或重试到绿掩盖失败。仅修改 AGENTS 与验证手册；
+  静态差异、文档链接和既有 CI 文档路由核验，未修改测试或生产逻辑，未部署。
+
 - 交付文档统一为独立分支/worktree → 开发验证 → 独立审查 → 分支推送 → Draft PR →
   CI → 用户批准 GitHub 合并；本地 main 只同步远端。Candidate 仅用于明确授权部署的
   最终 GitHub main SHA，PR head/合成 merge SHA 证据不转用；修复重新走 PR。
