@@ -1,9 +1,16 @@
 # Changelog
 
-Every push to `main` must add one dated entry here. Keep entries short and
+Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
 ## 2026-09-30
+
+- 交付文档统一为独立分支/worktree → 开发验证 → 独立审查 → 分支推送 → Draft PR →
+  CI → 用户批准 GitHub 合并；本地 main 只同步远端。Candidate 仅用于明确授权部署的
+  最终 GitHub main SHA，PR head/合成 merge SHA 证据不转用；修复重新走 PR。
+  补充尚未启用的 main/tag 保护设计和精确 `required` / GitHub Actions 来源；
+  旧的 local-main-first 记录保留为历史，由当前验证手册取代。仅文档静态核验与独立审查；
+  既有 CI 路由保持不变，真实 CI 结果以该 PR Actions 证据为准。未变更仓库设置、未部署。
 
 - PR/main 开发 CI 增加确定性服务路由、N-leg 显式补测及固定 CI / required 汇总；
   文档豁免有解释，共享/未知改动扩大覆盖，失败/取消/异常跳过按失败处理。

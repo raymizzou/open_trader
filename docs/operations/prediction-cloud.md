@@ -2,7 +2,8 @@
 
 This workflow deploys only Prediction. It does not install OpenD, Legacy,
 Account, Nginx, Docker or a new OS. Existing CRS, Nginx, V2Ray and x-ui remain
-outside the operation. Local merge, push, cloud provisioning, deployment and
+outside the operation. Branch push, Draft PR, GitHub merge, release/tag creation,
+cloud provisioning, deployment and
 trading authorization are separate. The client never starts the cloud backend.
 
 ## Credentials: Tencent SSM and an instance role
@@ -95,8 +96,12 @@ trading resumes. Stopping the service does not cancel exchange orders.
 ## Acceptance boundary
 
 Development uses affected-service Docker checks and independent staged review.
-Candidate Acceptance runs only after local merge for an explicitly authorized
-deployment SHA. The old macOS launchd gate is not evidence for systemd.
+Use the [PR-first delivery flow](agent-verification.md): reviewed branch, Draft
+PR, exact CI evidence, user-approved GitHub merge. Local `main` only synchronizes
+the remote. Candidate Acceptance runs only after GitHub merge, on the selected
+final GitHub `main` SHA for an explicitly authorized deployment. PR-head or
+synthetic PR merge checks cannot be reused as final-SHA Candidate evidence;
+fixes return through a new PR. The old macOS launchd gate is not evidence for systemd.
 Production verification must include the remote systemd PID, `/proc` cwd and
 command, listener and runtime lock, actual `code_root`, release SHA and manifest,
 logs since service start, N-leg pause contract and the LP read model. Health HTTP

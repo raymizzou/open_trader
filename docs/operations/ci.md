@@ -1,15 +1,27 @@
 # PR and main development CI
 
 `.github/workflows/ci.yml` runs on every PR targeting `main` and every push to
-`main`, including documentation-only changes. The stable aggregate is **CI /
-required** (workflow `CI`, job `required`). No branch protection or repository
-settings are changed by this workflow.
+`main`, including documentation-only changes. The stable aggregate appears as
+**CI / required** in the UI (workflow `CI`, job `required`), but its exact API
+check-run/context name is **`required`**, emitted by **GitHub Actions**, app ID
+**15368**. A future required-check rule must bind that exact name and source,
+not the display string or an arbitrary same-named status. No branch protection
+or repository settings are changed by this workflow. The
+[repository protection design](repository-protection.md) is proposed, not active.
 
 ## Identity and selection
 
 PR jobs check out `github.sha`, GitHub's candidate merge commit, so they test the
 proposed integration with the PR base. This is deliberately different from the
 PR head SHA. On `main` pushes the same value is the exact pushed main commit.
+The final GitHub main SHA after merge may differ from both the PR head and
+synthetic merge SHA (including squash/rebase or a changed base). Record the PR
+head, base, synthetic merge SHA and Actions run together. Any head/base change
+requires fresh applicable verification; stale or cancelled runs do not qualify.
+After the user authorizes GitHub merge, inspect the main-push run for the exact
+final SHA. Only that selected final main SHA is eligible for separately
+authorized predeployment Candidate Acceptance; CI never substitutes for it.
+
 The plan and service artifacts identify the checked-out SHA; each service also
 records the SHA-256 of `uv.lock`, dependency manifest, image identity and complete
 build/test log. Artifacts expire after three days. Download them from the Actions
@@ -81,3 +93,17 @@ path filter that would leave a required check permanently pending.
 This is affected-service development CI, not a new every-PR full-backend or
 browser gate. Broad coverage occurs only for shared/unknown paths; Candidate
 Acceptance and deployment remain separate, explicitly authorized operations.
+
+## Documentation routing and delivery
+
+The local pure-documentation `make test` exemption is not a workflow path filter.
+At this revision `README.zh-CN.md` and `ops/release-deployment.md` are not in the
+planner's documentation allowlist; changing them selects all four backend
+services with `TEST_N_LEG=1`. A docs-only PR touching those paths must wait for
+those existing checks. This migration does not change the planner or workflow.
+
+Follow the [PR-first verification runbook](agent-verification.md): reviewed
+isolated branch, authorized push, Draft PR, latest required-check success, and
+explicit user approval before GitHub merge. Local main only synchronizes the
+remote. Merge is separate from release/tag creation, Candidate Acceptance and
+deployment; no CI job grants production or trading authorization.

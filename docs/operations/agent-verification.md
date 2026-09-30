@@ -36,11 +36,11 @@ container, reducing repeated interpreter startup without changing source trees.
 Gateway contains `frontend_gateway` tests; Legacy contains Dashboard and the
 remaining shared backend test files. Update the Makefile prefixes when adding
 a service-specific test family. During
-development and local merge, run only the affected service tests. Candidate
+development and PR review, run only the affected service tests. Candidate
 Acceptance owns complete backend coverage only when preparing an explicitly
-authorized deployment, after the candidate is merged into local `main`.
-Do not run it during development, review, before merge, or automatically
-after a local merge. The image includes Node and `procps`, and excludes npm,
+authorized deployment, after GitHub PR merge, for the selected final GitHub
+`main` SHA. Do not run it during development, review, before merge, or
+automatically after merge. The image includes Node and `procps`, and excludes npm,
 Python/JS Playwright, Chromium/browser assets, host mounts, network, published
 ports, the Docker socket, the home directory, and credentials. The approved
 pytest-xdist dependency is pinned in the development extras and consumed from
@@ -137,12 +137,31 @@ receive any development validation relevant to their own scope.
 
 ## Merge, live processes, and deployment
 
-The synchronous local-main `--ff-only` merge path does not deploy. Local merge
-gates are affected-service backend checks, staged independent review, the dated
-`CHANGELOG.md` entry, any required rebase and reverification, and `--ff-only`.
-Candidate Acceptance is not a local-merge gate. Run it only after local merge
-when preparing an explicitly authorized deployment, for the exact SHA to be
-deployed; a local merge alone never starts it.
+The delivery path is isolated branch/worktree from freshly fetched
+`origin/main` → affected-scope development checks → staged independent review
+(including a dated `CHANGELOG.md` entry) → authorized branch push → Draft PR
+→ latest CI success → explicit user approval → GitHub merge. Local `main` is
+only a synchronized copy of GitHub `main`, never an integration or repair path.
+When the base advances, fetch/rebase, rerun affected checks and independent
+review, and inspect fresh CI; conflicts or behavior changes require a new
+approved plan. Never force-push `main`. A reviewed branch rewrite also requires
+authorized publication; do not discard another worker's commits.
+
+There are three distinct identities: the reviewed PR head; GitHub's synthetic
+PR merge commit (`github.sha` for PR CI); and the final GitHub `main` commit
+after merge. Record the PR head, base and tested merge SHA with the Actions run.
+Inspect the exact check-run name `required` from GitHub Actions (app ID 15368),
+not only a green UI label; see [ci.md](ci.md). PR CI success never establishes
+Candidate Acceptance for a different final SHA. Recheck CI for the final main
+SHA, and run Candidate Acceptance only for that selected final GitHub `main`
+SHA when preparing an explicitly authorized deployment. It is not a PR merge
+gate, and merging alone never starts it. A later SHA invalidates earlier
+exact-SHA acceptance evidence.
+
+Branch/tag settings in [repository-protection.md](repository-protection.md)
+are a proposed, separately approved next stage, not active enforcement. Older
+dated plans, reports and changelog entries describing local-main-first delivery
+are historical evidence; this runbook supersedes their delivery instructions.
 Host Readiness is separate and read-only; it does not mutate launchd, data, or
 production.
 
@@ -162,17 +181,22 @@ restarts, rolls back, or submits. `ROLLBACK` is evidence only.
 Candidate `FAIL` or Host `BLOCKED` blocks deployment. For a Candidate failure,
 first complete one read-only audit of every reported error and its downstream
 dependencies. Then make one batched fix-forward, rerun focused checks and
-independent review, merge locally, and rerun Candidate Acceptance for the
-resulting deployment SHA; do not mutate production. Stop without edits for a
+independent review, submit a repair PR, pass CI, obtain user merge approval,
+and merge on GitHub. Rerun Candidate Acceptance for the resulting final main
+deployment SHA; do not mutate production. Stop without edits for a
 business-rule or architecture decision, an external credentials/services/
-market/browser/data blocker, dirty or non-main state, a changed SHA, a
+market/browser/data blocker, a dirty or invalid candidate checkout, a candidate
+SHA not verified as the selected final GitHub main commit, a changed SHA, a
 non-reproducible failure, or any repair requiring test weakening or scope
-expansion.
+expansion. An isolated repair branch and a clean detached immutable release
+checkout are expected; neither is required to be named `main`.
 
 Deployment requires the exact-SHA Candidate `PASS`, Host `READY`, and explicit
 user authorization. Production Smoke must report `HEALTHY` for that same SHA.
-Local merge, remote push, and remote deployment remain separate actions; never
-automate push or deployment.
+Branch push, Draft PR, GitHub merge, release/tag creation and deployment remain
+separate authorization boundaries. Do not infer release or deployment permission
+from push or merge approval. Preserve the exact accepted SHA, immutable root,
+`code_root`, service owner and rollback evidence throughout the handoff.
 
 ## Prediction-only Linux cloud topology
 

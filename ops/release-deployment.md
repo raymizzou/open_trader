@@ -19,6 +19,21 @@ install 脚本为准;任何一步失败即停止,不要临场发明替代做法�
 > 必须同时指向同一发布目录的键**,逐项手改极易漏改其中之一,造成"服务跑旧代码、
 > 冒烟全绿"的假部署(#110/#113)。核对 plist 只读,不手改。
 
+## PR 合并与发布边界
+
+正式交付先按[验证手册](../docs/operations/agent-verification.md)完成独立
+分支/worktree、开发检查、staged 独立审查、授权推送、Draft PR、CI 和用户批准的
+GitHub 合并。本地 `main` 只同步远端，不能通过本地合并或直接推送绕过 PR。
+PR head、GitHub 合成 PR merge commit、最终 GitHub `main` commit 是不同身份；
+发布选定最后一种完整 SHA，核对其 CI 后，在明确授权的部署准备中运行 Candidate
+Acceptance。PR CI 不能代替该 SHA 的 Candidate `PASS`，合并不自动运行验收或部署。
+
+验收失败时先审计全部错误及下游影响，修复走独立分支、检查、审查、PR、CI、用户
+批准合并，再对新的最终 main SHA 验收；不直接修补 main 或生产。发布/tag 创建、
+生产变更、owner 切换、回滚各按其授权范围执行。保留不可变目录、精确 SHA/
+`code_root`、单一 owner、备份与回滚证据；`ROLLBACK` 结果本身不授权执行回滚。
+[仓库保护设计](../docs/operations/repository-protection.md)尚未启用，另行审批。
+
 ## 四步发布流程
 
 以下记号:`<SHA>` 为待发布 40 位 commit SHA;`<新发布>` 为不可变发布目录;

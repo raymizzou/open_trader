@@ -170,7 +170,16 @@ Run one real daily check for a market:
 
 ## Development and release gates
 
-Use four explicit stages; a local merge is not a deployment:
+Delivery is PR-first: start an isolated branch/worktree from freshly fetched
+`origin/main`, develop and verify, obtain independent staged review, push the
+authorized branch, open a Draft PR, pass CI, then obtain user approval to merge
+on GitHub. Local `main` only synchronizes the remote. Merge does not authorize
+release/tag creation or deployment. See the binding
+[verification runbook](docs/operations/agent-verification.md),
+[CI identity and exact required check](docs/operations/ci.md), and
+[proposed, not active repository protections](docs/operations/repository-protection.md).
+
+Use four explicit stages with exact-SHA evidence:
 
 1. **Docker dev** — `make test SERVICE=prediction` or
    `make test TEST='tests/path.py::test_name'` builds the worktree-specific
@@ -180,8 +189,11 @@ Use four explicit stages; a local merge is not a deployment:
    and `procps`, but excludes npm, Python/JS Playwright, Chromium/browser assets,
    host mounts, network, published ports, Docker socket, home directory, and
    credentials. It has zero browser cost.
-2. **Predeployment Candidate Acceptance** — only when preparing a deployment,
-   run `make candidate-acceptance` for the exact SHA to deploy. It builds once and runs
+2. **Predeployment Candidate Acceptance** — only after GitHub PR merge when
+   preparing an explicitly authorized deployment, run `make candidate-acceptance`
+   for the selected final GitHub `main` SHA. PR head and synthetic PR merge SHA
+   evidence do not transfer to this SHA. Merging alone does not start acceptance.
+   It builds once and runs
    only the backend target: the full suite with `pressure` and `browser` excluded,
    then `acceptance/test_prediction_arbitrage_scenarios.py -k 'not LIVE'` with
    the same marker exclusions. It never
@@ -1243,8 +1255,8 @@ Package CLI entrypoint:
 open-trader --help
 ```
 
-Before pushing `main`, add one dated entry to `CHANGELOG.md` for the change
-being pushed. The entry should summarize user-visible behavior, affected
+Before staged review and PR merge into GitHub `main`, add one dated entry to
+`CHANGELOG.md` for the proposed change. The entry should summarize user-visible behavior, affected
 workflows, and verification.
 
 ## License
