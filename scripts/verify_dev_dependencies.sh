@@ -20,13 +20,13 @@ git archive HEAD | tar -x -C "$context"
 printf 'fake-only\n' > "$context/.env"
 mkdir -p "$context/.aws" "$context/data" "$context/config"
 printf 'fake-only\n' > "$context/.aws/credentials"
-printf 'fake-only\n' > "$context/data/issue212-private.txt"
+printf 'fake-only\n' > "$context/data/dev-private.txt"
 printf 'fake-only\n' > "$context/config/prediction_arbitrage.json"
-export OPEN_TRADER_ISSUE212_HOST_SENTINEL=fake-only
+export OPEN_TRADER_DEV_HOST_SENTINEL=fake-only
 printf '%s\n' "$sha" > "$evidence/source-sha.txt"
 sha256sum uv.lock > "$evidence/lock-before.txt"
 for n in 1 2; do
-  image="open-trader-212:$n"
+  image="open-trader-dev-acceptance:$n"
   docker build --no-cache --target dev --progress plain -f "$context/Dockerfile.dev" \
     --build-arg SOURCE_SHA="$sha" --build-arg SOURCE_STATE=clean \
     -t "$image" "$context" 2>&1 | tee "$evidence/build-$n.log"
@@ -41,9 +41,9 @@ for n in 1 2; do
     --security-opt no-new-privileges "$image" python -c '
 from pathlib import Path
 import importlib.util, os, socket
-for path in ["/workspace/.env", "/workspace/.aws/credentials", "/workspace/data/issue212-private.txt", "/workspace/config/prediction_arbitrage.json", "/var/run/docker.sock"]:
+for path in ["/workspace/.env", "/workspace/.aws/credentials", "/workspace/data/dev-private.txt", "/workspace/config/prediction_arbitrage.json", "/var/run/docker.sock"]:
     assert not Path(path).exists(), path
-assert "OPEN_TRADER_ISSUE212_HOST_SENTINEL" not in os.environ
+assert "OPEN_TRADER_DEV_HOST_SENTINEL" not in os.environ
 assert importlib.util.find_spec("playwright") is None
 s = socket.socket(); s.settimeout(1)
 assert s.connect_ex(("1.1.1.1", 443)) != 0
@@ -79,4 +79,4 @@ make test TEST='tests/test_dev_dependencies.py tests/test_dependency_workflow.py
 sha256sum uv.lock > "$evidence/lock-after.txt"
 cmp "$evidence/lock-before.txt" "$evidence/lock-after.txt"
 git diff --exit-code -- pyproject.toml uv.lock
-printf 'Issue 212 dependency acceptance: PASS for %s\n' "$sha" | tee "$evidence/result.txt"
+printf 'Development dependency acceptance: PASS for %s\n' "$sha" | tee "$evidence/result.txt"

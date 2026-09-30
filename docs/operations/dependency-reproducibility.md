@@ -59,7 +59,7 @@ the focused `make test TEST=...` entry point. It records build, lock, image,
 container, isolation, and test evidence outside the checkout; failures stop
 verification and do not print PASS.
 
-The `Issue 212 dependency acceptance` workflow runs only for same-repository
+The `Development dependency acceptance` workflow runs only for same-repository
 pull requests from `fix/212-locked-dev` to main that touch its listed files.
 It checks out the PR's exact head SHA with no persisted credentials, uses a
 standard `ubuntu-24.04` runner with read-only contents permission and a 30-minute

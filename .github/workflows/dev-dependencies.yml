@@ -1,11 +1,11 @@
-name: Issue 212 dependency acceptance
+name: Development dependency acceptance
 
 on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened]
     paths:
-      - .github/workflows/issue-212-dependencies.yml
+      - .github/workflows/dev-dependencies.yml
       - Dockerfile.dev
       - .dockerignore
       - Makefile
@@ -22,7 +22,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: issue-212-${{ github.event.pull_request.number }}
+  group: dev-dependencies-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
@@ -37,13 +37,13 @@ jobs:
           persist-credentials: false
       - name: Verify clean builds and offline containers
         env:
-          EVIDENCE_DIR: ${{ runner.temp }}/issue-212-evidence
+          EVIDENCE_DIR: ${{ runner.temp }}/dev-dependency-evidence
         run: bash scripts/verify_dev_dependencies.sh "$EVIDENCE_DIR"
       - name: Preserve dependency and isolation evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: issue-212-${{ github.event.pull_request.head.sha }}
-          path: ${{ runner.temp }}/issue-212-evidence
+          name: dev-dependencies-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/dev-dependency-evidence
           retention-days: 3
           if-no-files-found: error

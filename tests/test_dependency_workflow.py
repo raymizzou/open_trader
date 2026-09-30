@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class DependencyWorkflowTests(unittest.TestCase):
     def test_workflow_is_ticket_scoped_and_least_privilege(self):
-        workflow = (ROOT / '.github/workflows/issue-212-dependencies.yml').read_text()
+        workflow = (ROOT / '.github/workflows/dev-dependencies.yml').read_text()
         self.assertIn("github.head_ref == 'fix/212-locked-dev'", workflow)
         self.assertIn('runs-on: ubuntu-24.04', workflow)
         self.assertIn('contents: read', workflow)
