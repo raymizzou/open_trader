@@ -2371,7 +2371,15 @@ def test_regular_refresh_prepares_distinct_three_way_groups(tmp_path: Path) -> N
     assert "football-00-dropped" not in prepared_event_ids
     assert prepared_event_ids == {"football-one"}
     assert len(FakePublicClient.list_events_calls) == 1
-    assert len(FakePublicClient.book_calls) == 6
+    assert len(FakePublicClient.book_calls) == 1
+    first_tokens = {
+        outcome["token_id"]
+        for row in (first_event, bad_event)
+        for raw_market in row["markets"][:3]
+        for outcome in raw_market["outcomes"]
+    }
+    assert len(first_tokens) == 12
+    assert FakePublicClient.book_calls[0] == sorted(first_tokens)
 
     set_raw_events([first_event, second_event])
     second_snapshot = monitor.refresh_once()
@@ -2385,7 +2393,15 @@ def test_regular_refresh_prepares_distinct_three_way_groups(tmp_path: Path) -> N
         for endpoint in row["endpoints"]
     } == {"football-one", "football-two"}
     assert len(FakePublicClient.list_events_calls) == 2
-    assert len(FakePublicClient.book_calls) == 12
+    assert len(FakePublicClient.book_calls) == 2
+    second_tokens = {
+        outcome["token_id"]
+        for row in (first_event, second_event)
+        for raw_market in row["markets"]
+        for outcome in raw_market["outcomes"]
+    }
+    assert len(second_tokens) == 12
+    assert FakePublicClient.book_calls[1] == sorted(second_tokens)
 
     class FailingCatalog:
         def prepared_relation_identities(self) -> set[str]:
@@ -5428,10 +5444,10 @@ def test_only_execution_eligible_active_binary_markets_are_subscribed(
     snapshot = monitor.snapshot()
 
     assert FakePublicClient.book_calls == [
-        ["yes-good", "no-good"],
-        ["yes-fee", "no-fee"],
-        ["yes-unknown", "no-unknown"],
-        ["yes-neg", "no-neg"],
+        sorted([
+            "yes-good", "no-good", "yes-fee", "no-fee",
+            "yes-unknown", "no-unknown", "yes-neg", "no-neg",
+        ]),
     ]
     assert tuple(FakePublicClient.subscribe_specs[-1].token_ids) == (
         "no-good",
@@ -5654,6 +5670,7 @@ def test_targeted_standard_refresh_rechecks_live_market_metadata(
     monitor = make_monitor(tmp_path)
     monitor.refresh_once()
     assert monitor.opportunity("e:m") is not None
+    FakePublicClient.book_calls.clear()
     monitor._subscription_dirty = False
     FakePublicClient.get_event_calls.clear()
     FakePublicClient.events = [
@@ -5664,6 +5681,7 @@ def test_targeted_standard_refresh_rechecks_live_market_metadata(
 
     assert refreshed is None
     assert FakePublicClient.get_event_calls == ["e"]
+    assert FakePublicClient.book_calls == [["yes-1", "no-1"]]
     assert monitor.opportunity("e:m") is None
     assert monitor._market_by_token == {}
     assert monitor._subscription_dirty is True
@@ -6062,26 +6080,26 @@ def test_runtime_refresh_applies_total_timeout(
     assert snapshot["diagnostics"]["last_error"] == "universe:TimeoutError"
 
 
-def test_runtime_confirms_books_with_bounded_concurrency(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from open_trader import polymarket_monitor
-    from open_trader.polymarket_monitor import PolymarketMonitor
-
-    class SlowBookClient(FakePublicClient):
-        active = 0
-        max_active = 0
+def test_universe_batches_unique_tokens_with_bounded_concurrency(tmp_path: Path) -> None:
+    class BarrierBookClient(FakePublicClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.active = 0
+            self.max_active = 0
+            self.first_wave = asyncio.Event()
 
         async def get_order_books(
             self, *, token_ids: list[str]
         ) -> tuple[object, ...]:
-            type(self).active += 1
-            type(self).max_active = max(type(self).max_active, type(self).active)
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
             try:
-                await asyncio.sleep(0.02)
+                if self.active == 8:
+                    self.first_wave.set()
+                await self.first_wave.wait()
                 return await super().get_order_books(token_ids=token_ids)
             finally:
-                type(self).active -= 1
+                self.active -= 1
 
     rows = tuple(
         market(
@@ -6090,22 +6108,165 @@ def test_runtime_confirms_books_with_bounded_concurrency(
             no=f"no-{i:02d}",
             fees_enabled=True,
         )
-        for i in range(20)
-    )
+        for i in range(450)
+    ) + (market("duplicate-pair", yes="yes-00", no="no-00", fees_enabled=True),)
     setup_public([event("e", markets=rows)])
-    monkeypatch.setattr(polymarket_monitor, "PUBLIC_REFRESH_TIMEOUT_SECONDS", 0.15)
-    monitor = PolymarketMonitor(
-        store=PredictionArbitrageStore(tmp_path / "data"),
-        trading=FakeTrading(),
-        public_client_factory=SlowBookClient,
-        clock=lambda: NOW,
-    )
+    monitor = make_monitor(tmp_path, relation_discovery=None)
+    client = BarrierBookClient()
 
-    snapshot = monitor.refresh_once()
+    asyncio.run(monitor._refresh_universe_bounded(client))
+    snapshot = monitor.snapshot()
 
     assert snapshot["health"]["status"] == "healthy", snapshot["health"]
-    assert SlowBookClient.max_active == 8
-    assert len(SlowBookClient.book_calls) == 20
+    assert len(client.book_calls) == 9
+    assert all(len(chunk) <= 100 for chunk in client.book_calls)
+    assert sorted(token for chunk in client.book_calls for token in chunk) == sorted(FakePublicClient.books)
+    assert client.max_active == 8
+    confirmed = snapshot["events"][0]["markets"]
+    assert len(confirmed) == 451
+    assert all(row["confirmed_at"] == NOW for row in confirmed)
+    assert all(row["gross_upper_bound"] == Decimal("0.07") for row in confirmed)
+    assert all(row["eligibility_reason"] == "fee_unverified_or_enabled" for row in confirmed)
+
+
+@pytest.mark.parametrize("failure", ["missing", "chunk", "timeout", "empty"])
+def test_universe_partial_books_do_not_reuse_old_confirmation(
+    tmp_path: Path, failure: str,
+) -> None:
+    rows = tuple(
+        market(f"m-{i:03d}", yes=f"yes-{i:03d}", no=f"no-{i:03d}")
+        for i in range(51)
+    )
+    setup_public([event("e", markets=rows)])
+    monitor = make_monitor(tmp_path, relation_discovery=None)
+    asyncio.run(monitor._refresh_universe(FakePublicClient()))
+    assert len(monitor.snapshot()["opportunities"]) == 51
+    FakePublicClient.book_calls.clear()
+
+    class PartialClient(FakePublicClient):
+        async def get_order_books(self, *, token_ids: list[str]) -> tuple[object, ...]:
+            self.book_calls.append(list(token_ids))
+            if failure in {"chunk", "timeout"} and "yes-050" in token_ids:
+                raise (ConnectionError if failure == "chunk" else TimeoutError)("sentinel book failure")
+            if failure == "empty":
+                return ()
+            return tuple(
+                self.books[token] for token in reversed(token_ids)
+                if failure != "missing" or token != "yes-050"
+            )
+
+    asyncio.run(monitor._refresh_universe(PartialClient()))
+    snapshot = monitor.snapshot()
+    assert len(FakePublicClient.book_calls) == 2
+    assert sorted(token for chunk in FakePublicClient.book_calls for token in chunk) == sorted(FakePublicClient.books)
+    missing = (
+        {"m-050"} if failure == "missing" else
+        {"m-049", "m-050"} if failure in {"chunk", "timeout"} else
+        {f"m-{i:03d}" for i in range(51)}
+    )
+    for row in snapshot["events"][0]["markets"]:
+        if row["market_id"] in missing:
+            assert row["eligibility_reason"] == "book_token_mismatch"
+            assert row["actionable"] is False
+            assert row.get("confirmed_at") is None
+        else:
+            assert row["actionable"] is True
+            assert row["confirmed_at"] == NOW
+    assert {row["market_id"] for row in snapshot["opportunities"]} == {f"m-{i:03d}" for i in range(51)} - missing
+    assert snapshot["diagnostics"]["last_error"] == (
+        "books:ConnectionError" if failure == "chunk" else
+        "books:TimeoutError" if failure == "timeout" else None
+    )
+    assert set(FakePublicClient.subscribe_specs[-1].token_ids) == set(FakePublicClient.books)
+
+
+def test_universe_bulk_mapping_preserves_sdk_book_facts(tmp_path: Path) -> None:
+    row = market("m")
+    row.trading.minimum_order_size = None
+    row.trading.minimum_tick_size = None
+    setup_public([event("e", markets=(row,))])
+    FakePublicClient.books["yes-1"].min_order_size = Decimal("5")
+    FakePublicClient.books["yes-1"].tick_size = Decimal("0.001")
+    FakePublicClient.books["yes-1"].timestamp = NOW - timedelta(minutes=1)
+    for book in FakePublicClient.books.values():
+        del book.token_id
+        del book.asset_id
+
+    class MappingClient(FakePublicClient):
+        async def get_order_books(self, *, token_ids: list[str]) -> Mapping[str, object]:
+            self.book_calls.append(list(token_ids))
+            return {token: self.books[token] for token in reversed(token_ids)}
+
+    monitor = make_monitor(tmp_path, relation_discovery=None)
+    asyncio.run(monitor._refresh_universe(MappingClient()))
+    opportunity = monitor.opportunity("e:m")
+    assert opportunity is not None
+    assert opportunity["actionable"] is True
+    assert opportunity["tick_size"] == Decimal("0.001")
+    assert opportunity["quantity"] >= Decimal("5")
+    assert opportunity["book_timestamp_a"] == NOW - timedelta(minutes=1)
+    assert opportunity["book_timestamp_b"] == NOW
+    assert opportunity["yes_max_price"] == Decimal("0.45")
+    assert opportunity["no_max_price"] == Decimal("0.48")
+    FakePublicClient.books["yes-1"].min_order_size = Decimal("1000")
+    asyncio.run(monitor._refresh_universe(MappingClient()))
+    assert monitor.opportunity("e:m") is None
+    assert monitor.snapshot()["events"][0]["markets"][0]["eligibility_reason"] == "no_threshold_candidate"
+
+
+@pytest.mark.parametrize("failure", ["cancel", "deadline"])
+def test_universe_bulk_cancellation_and_timeout_do_not_publish_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    from open_trader import polymarket_monitor
+
+    setup_public([event("e", markets=tuple(
+        market(f"m-{i}", yes=f"yes-{i}", no=f"no-{i}", fees_enabled=True)
+        for i in range(450)
+    ))])
+    monitor = make_monitor(tmp_path, relation_discovery=None)
+    previous = NOW - timedelta(minutes=11)
+    monitor._universe_at = previous
+
+    class InterruptedClient(FakePublicClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+            self.active = 0
+            self.cancelled = 0
+
+        async def get_order_books(self, *, token_ids: list[str]) -> tuple[object, ...]:
+            del token_ids
+            self.active += 1
+            if self.active == 8:
+                self.started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.active -= 1
+                self.cancelled += 1
+
+    if failure == "deadline":
+        monkeypatch.setattr(polymarket_monitor, "PUBLIC_REFRESH_TIMEOUT_SECONDS", 0.05)
+
+    async def exercise() -> None:
+        client = InterruptedClient()
+        refresh = asyncio.create_task(monitor._refresh_universe_bounded(client))
+        await asyncio.wait_for(client.started.wait(), timeout=1)
+        if failure == "cancel":
+            refresh.cancel()
+        with pytest.raises(asyncio.CancelledError if failure == "cancel" else TimeoutError):
+            await refresh
+        assert client.active == 0
+        assert client.cancelled == 8
+        assert monitor._universe_at == previous
+        assert monitor.snapshot()["diagnostics"]["universe_refresh"]["stage"] == "books"
+        assert monitor.snapshot()["health"]["actionable"] is False
+        assert FakePublicClient.subscribe_specs == []
+        if failure == "deadline":
+            assert monitor.snapshot()["diagnostics"]["last_error"] == "universe:TimeoutError"
+
+    asyncio.run(exercise())
 
 
 def test_title_translation_worker_is_fifo_and_does_not_block_english_snapshot(

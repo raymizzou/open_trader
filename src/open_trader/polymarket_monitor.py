@@ -2441,6 +2441,42 @@ class PolymarketMonitor:
             return
         await self._subscribe(client)
 
+    async def _fetch_universe_books(
+        self, client: object, tokens: Sequence[str]
+    ) -> dict[str, object]:
+        if not tokens:
+            return {}
+        get_books = getattr(client, "get_order_books", None)
+        if not callable(get_books):
+            raise RuntimeError("public client has no paired order-book read")
+        chunks = [
+            tokens[index : index + THRESHOLD_BOOK_BATCH_SIZE]
+            for index in range(0, len(tokens), THRESHOLD_BOOK_BATCH_SIZE)
+        ]
+        semaphore = asyncio.Semaphore(PUBLIC_BOOK_CONCURRENCY)
+
+        async def fetch(chunk: Sequence[str]) -> dict[str, object]:
+            async with semaphore:
+                try:
+                    raw_books = await _call(get_books, token_ids=list(chunk))
+                except Exception as exc:
+                    self._record_error(exc, "books")
+                    return {}
+                if isinstance(raw_books, Mapping):
+                    return {
+                        str(token): book for token, book in raw_books.items()
+                        if str(token) in chunk
+                    }
+                books: dict[str, object] = {}
+                for item in _items(raw_books):
+                    token = _value(item, "token_id", "asset_id", "assetId", default=None)
+                    if isinstance(token, str) and token in chunk:
+                        books[token] = item
+                return books
+
+        fetched = await asyncio.gather(*(fetch(chunk) for chunk in chunks))
+        return {token: book for batch in fetched for token, book in batch.items()}
+
     async def _refresh_universe(
         self,
         client: object,
@@ -2535,6 +2571,12 @@ class PolymarketMonitor:
         phase("readiness")
         await self._refresh_readiness()
         phase("books")
+        tokens = sorted({
+            str(market_row[key])
+            for market_row in markets.values()
+            for key in ("yes_token_id", "no_token_id")
+        })
+        prefetched_books = await self._fetch_universe_books(client, tokens)
         semaphore = asyncio.Semaphore(PUBLIC_BOOK_CONCURRENCY)
 
         async def confirm(
@@ -2542,7 +2584,9 @@ class PolymarketMonitor:
         ) -> dict[str, object] | None:
             async with semaphore:
                 try:
-                    return await self._confirm_market(client, market_row)
+                    return await self._confirm_market(
+                        client, market_row, prefetched_books=prefetched_books
+                    )
                 except Exception as exc:
                     self._record_error(exc, "books")
                     return None
@@ -4787,26 +4831,34 @@ class PolymarketMonitor:
                 result[name] = item
         return result
 
-    async def _confirm_market(self, client: object, market_row: dict[str, object]) -> dict[str, object] | None:
+    async def _confirm_market(
+        self,
+        client: object,
+        market_row: dict[str, object],
+        *,
+        prefetched_books: Mapping[str, object] | None = None,
+    ) -> dict[str, object] | None:
         market_id = str(market_row["market_id"])
         if market_row.get("fees_enabled") is not False:
             market_row["eligibility_reason"] = "fee_unverified_or_enabled"
         if market_row.get("neg_risk") is True:
             market_row["eligibility_reason"] = "neg_risk"
-        get_books = getattr(client, "get_order_books", None)
-        if not callable(get_books):
-            raise RuntimeError("public client has no paired order-book read")
         yes_token = str(market_row["yes_token_id"])
         no_token = str(market_row["no_token_id"])
-        raw_books = await _call(get_books, token_ids=[yes_token, no_token])
-        books_by_token: dict[str, object] = {}
-        if isinstance(raw_books, Mapping):
-            books_by_token = {str(key): item for key, item in raw_books.items()}
-        else:
-            for item in _items(raw_books):
-                token = _value(item, "token_id", "asset_id", "assetId", default=None)
-                if isinstance(token, str):
-                    books_by_token[token] = item
+        books_by_token = prefetched_books
+        if books_by_token is None:
+            get_books = getattr(client, "get_order_books", None)
+            if not callable(get_books):
+                raise RuntimeError("public client has no paired order-book read")
+            raw_books = await _call(get_books, token_ids=[yes_token, no_token])
+            if isinstance(raw_books, Mapping):
+                books_by_token = {str(key): item for key, item in raw_books.items()}
+            else:
+                books_by_token = {}
+                for item in _items(raw_books):
+                    token = _value(item, "token_id", "asset_id", "assetId", default=None)
+                    if isinstance(token, str):
+                        books_by_token[token] = item
         yes_book = books_by_token.get(yes_token)
         no_book = books_by_token.get(no_token)
         if yes_book is None or no_book is None:

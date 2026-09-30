@@ -128,7 +128,8 @@ class _TriggerPublicClient:
         self.now = now
         self.book_entered = book_entered or threading.Event()
         self.release_book = release_book or threading.Event()
-        self.release_book.set()
+        if release_book is None:
+            self.release_book.set()
 
     def get_order_books(self, *, token_ids: list[str]) -> list[dict[str, object]]:
         token_id = token_ids[0]
@@ -377,7 +378,9 @@ def test_round_lifecycle_without_consumer_makes_no_network_calls() -> None:
     assert all(value == 0 for value in account.calls.values())
 
 
-def test_service_preserves_wait_semantics_for_an_ended_real_round(tmp_path) -> None:
+def test_service_preserves_wait_semantics_for_an_ended_real_round(tmp_path, caplog) -> None:
+    import logging
+    caplog.set_level(logging.INFO, logger="open_trader.polymarket_trading")
     service, account, _public = _service(tmp_path, NOW)
     service.clock = lambda: NOW
     token = service.exchange.lp_account_round_begin()
@@ -394,6 +397,12 @@ def test_service_preserves_wait_semantics_for_an_ended_real_round(tmp_path) -> N
     assert row["publication_pending"] is True
     assert account.calls == {"balance": 0, "orders": 0, "trades": 0, "positions": 0}
     assert service.store.lp_actions("session-01") == []
+    records = [row for row in caplog.records if row.name == "open_trader.polymarket_trading"]
+    assert records
+    assert all(row.levelno == logging.INFO for row in records)
+    assert any("lp_read_wait stage=account" in row.getMessage() for row in records)
+    assert any("lp_read_wait stage=facts_read" in row.getMessage() for row in records)
+    assert all("reason=account_round_invalid" in row.getMessage() for row in records)
 
 
 def test_service_preserves_wait_semantics_for_round_invalidated_while_reading(
@@ -676,7 +685,9 @@ def test_trade_after_scoring_blocks_old_bundle_apply(tmp_path) -> None:
         worker.join(timeout=2)
 
 
-def test_exact_order_newer_evidence_advances_shared_fence(tmp_path) -> None:
+def test_exact_order_newer_evidence_advances_shared_fence(tmp_path, caplog) -> None:
+    import logging
+    caplog.set_level(logging.INFO, logger="open_trader.polymarket_trading")
     now = datetime.now(UTC)
     account = _CountingAccountClient(now)
     public = _TwoMarketPublicClient(now)
@@ -794,6 +805,10 @@ def test_exact_order_newer_evidence_advances_shared_fence(tmp_path) -> None:
     finally:
         validator_release.set()
         worker.join(timeout=2)
+    records = [row for row in caplog.records if row.name == "open_trader.polymarket_trading"]
+    assert not any("LpNewerAccountFacts" in row.getMessage() for row in records)
+    assert any(row.levelno == logging.INFO and "lp_read_wait stage=facts_read" in row.getMessage()
+               and "reason=account_round_invalid" in row.getMessage() for row in records)
 
 
 def test_real_tick_shares_one_account_bundle_across_sessions(tmp_path) -> None:
@@ -1275,6 +1290,7 @@ def test_book_read_invalidation_waits_then_next_real_round_can_cancel(
     public = _TriggerPublicClient(
         now, book_entered=book_entered, release_book=release_book
     )
+    assert not release_book.is_set(), "Explicit read barrier must stay closed until invalidation"
     adapter = PolymarketTradingClient(
         TradingConfig("0x" + "1" * 40, "0x" + "2" * 40),
         account,

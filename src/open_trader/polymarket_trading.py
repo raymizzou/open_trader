@@ -597,24 +597,40 @@ def _safe_metadata_failure(
     return facts
 
 
-def _safe_read_error_chain(exc: BaseException) -> tuple[str, ...]:
-    """Return exception class names without retaining exception messages."""
-
-    chain: list[str] = []
+def _read_exception_chain(exc: BaseException) -> tuple[BaseException, ...]:
+    """Bound explicit causes and unsuppressed contexts; stop at cycles."""
+    chain: list[BaseException] = []
     seen: set[int] = set()
     current: BaseException | None = exc
     for _ in range(8):
         if current is None or id(current) in seen:
             break
         seen.add(id(current))
-        name = type(current).__name__
-        if name not in chain and name.replace("_", "").isalnum():
-            chain.append(name)
+        chain.append(current)
         cause = current.__cause__
         if cause is None and not current.__suppress_context__:
             cause = current.__context__
         current = cause if isinstance(cause, BaseException) else None
     return tuple(chain)
+
+
+def _safe_read_error_chain(exc: BaseException) -> tuple[str, ...]:
+    """Return exception class names without retaining exception messages."""
+    return tuple(dict.fromkeys(
+        name for error in _read_exception_chain(exc)
+        if (name := type(error).__name__).replace("_", "").isalnum()
+    ))
+
+
+def _null_order_response(exc: BaseException) -> bool:
+    from pydantic import ValidationError
+
+    cause = exc.__cause__
+    return isinstance(cause, ValidationError) and any(
+        row.get("loc") == () and row.get("type") == "model_type"
+        and "input" in row and row["input"] is None
+        for row in cause.errors(include_url=False)
+    )
 
 
 @contextmanager
@@ -626,19 +642,54 @@ def _lp_read_stage(stage: str, timings: dict[str, float] | None = None):
     """
     started = time.monotonic()
     error_types = ()
+    wait_reason = None
+    details = ""
     try:
         yield
     except Exception as exc:
         error_types = _safe_read_error_chain(exc)
+        if any(isinstance(error, (LpAccountRoundInvalid, LpNewerAccountFacts)) for error in _read_exception_chain(exc)):
+            wait_reason = "account_round_invalid"
+        elif stage == "required_order" and _null_order_response(exc):
+            wait_reason = "order_lookup_unavailable"
+        else:
+            try:
+                facts = _safe_history_response_facts(exc)
+                response_facts = getattr(exc, "response_facts", None)
+                if isinstance(response_facts, Mapping):
+                    facts.update({key: response_facts[key] for key in (
+                        "status", "retry_after_seconds", "retry_after_at",
+                    ) if key in response_facts})
+                status = facts.get("status")
+                if type(status) is int and 100 <= status <= 599:
+                    details += f" status={status}"
+                retry = facts.get("retry_after_seconds")
+                if type(retry) in {int, float} and math.isfinite(retry) and retry >= 0:
+                    details += f" retry_after_seconds={retry}"
+                retry_at = facts.get("retry_after_at")
+                if isinstance(retry_at, datetime) and retry_at.tzinfo is not None:
+                    details += f" retry_after_at={retry_at.isoformat()}"
+            except Exception:
+                details = ""
         raise
     finally:
         elapsed = time.monotonic() - started
         if timings is not None:
             timings[stage] = round(elapsed, 3)
-        if error_types or elapsed >= 60:
+        if wait_reason is not None:
+            logger.info(
+                "lp_read_wait stage=%s elapsed_seconds=%.3f reason=%s thread=%s",
+                stage, elapsed, wait_reason, threading.get_ident(),
+            )
+        elif error_types:
             logger.warning(
-                "lp_snapshot_stage stage=%s elapsed_seconds=%.3f error_types=%s thread=%s",
-                stage, elapsed, ">".join(error_types) or "none", threading.get_ident(),
+                "lp_snapshot_stage stage=%s elapsed_seconds=%.3f error_types=%s thread=%s%s",
+                stage, elapsed, ">".join(error_types), threading.get_ident(), details,
+            )
+        elif elapsed >= 60:
+            logger.warning(
+                "lp_read_slow stage=%s elapsed_seconds=%.3f thread=%s",
+                stage, elapsed, threading.get_ident(),
             )
 
 
@@ -2941,6 +2992,7 @@ class PolymarketTradingClient:
         *,
         public: object,
         stop_event: threading.Event | None = None,
+        closed_query: bool = False,
     ) -> tuple[dict[str, dict[str, object]], dict[str, object], frozenset[str]]:
         """Fetch LP market facts while preserving each completed sub-read."""
 
@@ -2962,7 +3014,10 @@ class PolymarketTradingClient:
                 return (), False
             return (
                 _collect_lp_market_pages(
-                    public.list_markets(condition_ids=batch, page_size=100),
+                    public.list_markets(
+                        condition_ids=batch, page_size=100,
+                        **({"closed": True} if closed_query else {}),
+                    ),
                     set(batch),
                 ),
                 True,
@@ -3245,7 +3300,21 @@ class PolymarketTradingClient:
             condition_id
             for condition_id in completed_market_ids
             if condition_id not in result and condition_id not in failed_ids
+            and not (stop_event is not None and stop_event.is_set())
         )
+        if confirmed_absent_ids and not closed_query:
+            missing = tuple(value for value in requested if value in confirmed_absent_ids)
+            try:
+                closed_markets, closed_failed, confirmed_absent_ids = self._fetch_lp_market_metadata(
+                    missing, public=public, stop_event=stop_event, closed_query=True,
+                )
+            except Exception as exc:
+                reason = _safe_metadata_failure("market", exc)
+                closed_markets = {}
+                closed_failed = dict.fromkeys(missing, reason)
+                confirmed_absent_ids = frozenset()
+            result.update(closed_markets)
+            failed_ids.update(closed_failed)
         return result, failed_ids, confirmed_absent_ids
 
     def lp_order_books(
@@ -4887,11 +4956,7 @@ class PolymarketTradingClient:
                     # the root ValidationError. Null is unavailable, not terminal.
                     from pydantic import ValidationError
                     cause = exc.__cause__
-                    null_response = isinstance(cause, ValidationError) and any(
-                        row.get('loc') == () and row.get('type') == 'model_type'
-                        and 'input' in row and row['input'] is None
-                        for row in cause.errors(include_url=False))
-                    order_read_errors[order_id] = ('order_lookup_unavailable' if null_response
+                    order_read_errors[order_id] = ('order_lookup_unavailable' if _null_order_response(exc)
                         else 'order_response_invalid' if isinstance(cause, ValidationError)
                         else 'order_read_failed')
                     with self._lp_order_read_lock:

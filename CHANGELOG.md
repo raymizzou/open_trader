@@ -3,6 +3,21 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-01
+
+- #207 集成测试补充：元数据预热的 SDK fake 支持 closed 精确补查，确认缺失标的经默认与 closed 两次读取，正缓存不重读；保留 1500/1501 完成量、原 TTL、重试及停止/并发断言。目标单例 RED→GREEN，1 passed；未改生产代码、未重跑全服务。
+
+- Prediction universe 盘口按去重 token 每批 100 个原生读取，保留 8 并发、30 秒整轮时限与 TOP20 覆盖；
+  复用原市场确认逻辑和原始 SDK 字段，单机会与 stream 仍配对读取。缺失/失败批次不沿用旧机会，
+  保留 books 故障诊断及订阅，整轮取消/超时继续传播。只读实测 592 tokens 从 296 次请求/17.893 秒
+  降为 6 次/1.019 秒；冷连接 494 tokens 为 5 次/3.613 秒，无错误。定向 monitor 回归 195 passed，覆盖批量与失败边界；未部署。
+
+- #207 运行修复：精确 condition 查询未找到时批量补查 closed 市场，历史真实成交仍按返回的 market/token/outcome 纳管；失败或取消保持 UNKNOWN。负缓存仅信任两轮完整缺失的 `closed_checked:true` 证明，旧无证明负缓存重新读取，正缓存和原 TTL 保留。
+- 活动组索引先创建规范 account/token 约束，成功后才删除旧索引；重复身份阻塞迁移且保留旧约束和原行。旧无 ID 占位保留 UNKNOWN、原 payload 和占资。旧精确订单 ID 经 Store 验证后恢复原归属，同 token 新 ID 可加入已证实活动组，已完成历史组不吸收新生命周期，其他账户不并入。
+- #210 诊断：既有 typed 轮次失效和 required_order 精确 null 记 INFO 等待；真实 schema、网络、认证和限流仍记故障。慢阶段不再带伪错误字段，诊断元数据异常不替换原业务异常，日志不输出秘密正文。
+- Smoke 保留精确发布、进程、工具和浏览器检查；最后 200 行内仅健康 JSON 的 `last_error:null` 字段免于误匹配。仅双引号键开头的 JSON-object-looking 记录严格解析，所有合法 JSON 统一检查解析后的 payload 与完整原 prefix，防止转义字段或 Error 漏检；普通计时 Python dict 仍全文检查错误信号。JSON-looking 畸形、重复键、NaN/Infinity、窗口内解码或读取失败仍阻塞。此前 8 个窄文件 711 passed、1 skipped（macOS Keychain）；格式与转义边界补充仅复跑 deployment_gates，60 passed，其余 7 文件无改动。尚未部署。
+- 迁移兼容边界：旧无 ID 占位与规范账户组可并存，旧版重建 `(condition_id,outcome)` 唯一索引可能失败，不能仅切旧代码回滚。部署前保留 SQLite 在线 backup 的一致性快照及来源 SHA；恢复仍按既有停 owner、核对流程执行。
+
 ## 2026-09-30
 
 - #204 云端启动修复：SDK 受保护时间戳经 ISO 标量还原后进入共享账户/盘口缓存，

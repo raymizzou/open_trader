@@ -5002,6 +5002,7 @@ class _LpMetadataProbe:
                 *,
                 condition_ids: tuple[str, ...],
                 page_size: int | None = None,
+                closed: bool | None = None,
             ) -> tuple[object, ...]:
                 assert self.closed is False
                 requested_ids = tuple(condition_ids)
@@ -5268,6 +5269,57 @@ def _lp_market_page_response(request, rows, *, next_cursor=None):
     if next_cursor is not None:
         payload["next_cursor"] = next_cursor
     return httpx.Response(200, json=payload, request=request)
+
+
+@pytest.mark.parametrize("fallback", ["failed", "absent", "cancelled"])
+def test_lp_metadata_closed_fallback_preserves_known_and_only_caches_proven_absence(fallback) -> None:
+    import httpx
+
+    present, missing = "0x" + "a" * 64, "0x" + "b" * 64
+    stop = threading.Event()
+    requests = []
+    backing = _LpMetadataBackingStore({})
+
+    def handler(request):
+        assert request.method == "GET"
+        assert request.url.path == "/markets/keyset"
+        closed = request.url.params.get("closed") == "true"
+        requests.append(closed)
+        if closed:
+            if fallback == "failed":
+                raise httpx.ReadTimeout("offline closed lookup timeout", request=request)
+            if fallback == "cancelled":
+                stop.set()
+            return _lp_market_page_response(request, ())
+        return _lp_market_page_response(request, (_lp_market_payload(present),))
+
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET), client=object(),
+        public_client_factory=lambda: _lp_mock_public_client(handler), metadata_cache=backing,
+    )
+    result = adapter.lp_market_metadata_batch((present, missing), stop_event=stop)
+    assert requests == [False, True]
+    assert set(result["markets"]) == {present}
+    assert present in backing.rows
+    if fallback == "absent":
+        assert result["state"] == "known"
+        assert result["confirmed_absent_ids"] == (missing,)
+        assert backing.rows[missing][1] is None
+        assert result["failed_ids"] == {}
+    else:
+        assert result["confirmed_absent_ids"] == ()
+        assert missing not in backing.rows
+        if fallback == "failed":
+            assert result["state"] == "partial"
+            assert set(result["failed_ids"]) == {missing}
+        else:
+            assert result["state"] == "cancelled"
+            assert result["deferred_ids"] == (missing,)
+    previous_reads = len(requests)
+    stop.clear()
+    again = adapter.lp_market_metadata_batch((present, missing), stop_event=stop)
+    assert set(again["markets"]) == {present}
+    assert requests[previous_reads:] == ([] if fallback == "absent" else [False, True])
 
 
 def test_lp_metadata_continues_until_requested_ids_are_accounted() -> None:
@@ -5861,7 +5913,7 @@ def test_lp_metadata_negative_ttl_requeries_after_expiry(
     first = adapter.lp_market_metadata((condition_present, condition_absent))
     assert set(first) == {condition_present}
     queries_after_first = len(probe.market_queries)
-    assert queries_after_first == 1
+    assert queries_after_first == 2
 
     read_at["value"] = read_at["value"] + timedelta(
         seconds=polymarket_trading.LP_METADATA_NEGATIVE_TTL_SECONDS - 1
@@ -6039,6 +6091,7 @@ def test_lp_metadata_batches_preserve_success_and_distinguish_absence_from_failu
             *,
             condition_ids: tuple[str, ...],
             page_size: int | None = None,
+            closed: bool | None = None,
         ) -> tuple[object, ...]:
             assert self.closed is False
             assert page_size == 100
@@ -6228,14 +6281,18 @@ def test_lp_metadata_cache_keeps_original_twelve_hour_expiry(
         (condition_present, condition_absent)
     )
     assert set(after_negative_expiry) == {condition_present}
-    assert len(probe.market_queries) == queries_after_warm + 1
+    # Absence after expiry requires complete default and closed reads.
+    assert len(probe.market_queries) == queries_after_warm + 2
+    assert probe.market_queries[queries_after_warm:] == [
+        ((condition_absent,), 100), ((condition_absent,), 100),
+    ]
     assert backing.rows[condition_absent][0] == clock_at["value"].timestamp() + 3600
     assert backing.rows[condition_absent][1] is None
 
     clock_at["value"] = read_at + timedelta(seconds=43199)
     before_positive_expiry = rebuilt.lp_market_metadata((condition_present,))
     assert set(before_positive_expiry) == {condition_present}
-    assert len(probe.market_queries) == queries_after_warm + 1
+    assert len(probe.market_queries) == queries_after_warm + 2
 
     stored_before_failure = len(backing.stored)
     probe.fail_market_reads = True

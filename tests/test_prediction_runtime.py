@@ -6911,6 +6911,7 @@ def test_lp_metadata_warmup_advances_beyond_one_batch(
     positive_ids = frozenset(condition_ids[:1499])
     request_lock = threading.Lock()
     metadata_requests: list[tuple[str, ...]] = []
+    closed_queries: list[tuple[str, ...]] = []
     dispatch_after_stop_signal: list[tuple[str, ...]] = []
     fail_last_once = [True]
     hold_next_metadata = [False]
@@ -6994,7 +6995,8 @@ def test_lp_metadata_warmup_advances_beyond_one_batch(
             return [reward_row(condition_id)] if condition_id in condition_ids else []
 
         def list_markets(
-            self, *, condition_ids: object, page_size: int = 100
+            self, *, condition_ids: object, page_size: int = 100,
+            closed: bool | None = None,
         ) -> list[object]:
             assert page_size == 100
             batch = tuple(str(value) for value in condition_ids)  # type: ignore[arg-type]
@@ -7006,6 +7008,10 @@ def test_lp_metadata_warmup_advances_beyond_one_batch(
                 if stop_event is not None and stop_event.is_set():
                     dispatch_after_stop_signal.append(batch)
                 metadata_requests.append(batch)
+                if closed is True:
+                    assert batch == (absent_id,)
+                    closed_queries.append(batch)
+                    return []
                 if batch == (failed_id,) and fail_last_once[0]:
                     fail_last_once[0] = False
                     should_fail = True
@@ -7189,15 +7195,17 @@ def test_lp_metadata_warmup_advances_beyond_one_batch(
         assert preparation["total_count"] == 0
         with request_lock:
             retry_requests = tuple(metadata_requests)
-        assert len(retry_requests) == 17
+        assert len(retry_requests) == 18
         assert retry_requests[-1] == (failed_id,)
-        assert sum(len(batch) for batch in retry_requests) == 1502
+        assert sum(len(batch) for batch in retry_requests) == 1503
         assert sum(failed_id in batch for batch in retry_requests) == 2
         assert all(len(batch) <= 100 for batch in retry_requests)
         assert all(
             sum(condition_id in batch for batch in retry_requests) == 1
-            for condition_id in initial_ids
+            for condition_id in positive_ids
         )
+        assert sum(absent_id in batch for batch in retry_requests) == 2
+        assert closed_queries == [(absent_id,)]
         assert set(
             condition_id
             for batch in retry_requests

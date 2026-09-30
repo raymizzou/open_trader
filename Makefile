@@ -200,7 +200,7 @@ production-smoke:
 			if printf '%s' "$$state_payload" | "$(PYTHON_BIN)" -c 'import json,sys; p=json.load(sys.stdin); n_leg=p.get("n_leg") or {}; scopes=n_leg.get("execution_scopes") or {}; scope=scopes.get("SAME_EVENT_SAME_VENUE") or {}; rows=p.get("opportunities") or []; ok=(n_leg.get("contract_generation")==2 and n_leg.get("mode")=="MANUAL" and scope.get("capability")=="OBSERVE_ONLY" and all(row.get("engine_owner")=="N_LEG" for row in rows if isinstance(row,dict))); raise SystemExit(0 if ok else 1)' >/dev/null 2>&1; then echo "n-leg state: PASS"; else echo "n-leg state: BLOCKED"; status=1; fi; \
 		fi; \
 	fi; \
-	check_log() { log="$$1"; if [ ! -f "$$log" ]; then echo "log missing: $$log"; status=1; elif tail -n 200 "$$log" | rg -qi 'traceback|fatal|exception|error'; then echo "log error: $$log"; status=1; else echo "log clean: $$log"; fi; }; \
+	check_log() { log="$$1"; if ! command -v rg >/dev/null 2>&1 || ! rg --version >/dev/null 2>&1; then echo "log checker unavailable"; status=1; elif "$(PYTHON_BIN)" "$$expected_root/scripts/check_production_log.py" "$$log"; then echo "log clean: $$log"; else echo "log check blocked: $$log"; status=1; fi; }; \
 	if [ $$gateway_selected -eq 1 ]; then check_log "$$expected_root/logs/frontend_gateway/launchd.err.log"; fi; \
 	if [ $$legacy_selected -eq 1 ]; then check_log "$$expected_root/logs/legacy_dashboard/launchd.err.log"; fi; \
 	if [ $$account_selected -eq 1 ]; then check_log "$$expected_root/logs/account_api/launchd.err.log"; fi; \

@@ -3546,14 +3546,22 @@ def test_lp_active_sessions_lists_non_terminal_newest_first(tmp_path: Path) -> N
     assert db.lp_active_session() is None
 
 
-def test_lp_create_session_allows_one_group_per_market(tmp_path: Path) -> None:
-    """Issue 166: 唯一性从「全局最多一行活动组」改为「同 (condition_id, outcome)
-    最多一组」——不同标的的两个活动组并存；同标的+方向的第二个活动组拒绝
-    lp_session_market_active；同幂等键重放返回原行不视为冲突；终态行不占槽。"""
+@pytest.mark.parametrize("proof", ["{}", '{"closed_checked":false}', '{"closed_checked":1}', '{"closed_checked":"true"}', "bad-json"])
+def test_unproven_negative_metadata_cache_is_not_loaded(tmp_path: Path, proof: str) -> None:
+    db = store(tmp_path)
+    expiry = (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp()
+    db.lp_metadata_cache_store_entries({"missing": (expiry, None)})
+    with sqlite3.connect(db.path) as connection:
+        connection.execute("UPDATE lp_market_metadata_cache SET payload=? WHERE condition_id='missing'", (proof,))
+    assert db.lp_metadata_cache_entries() == {}
+
+
+def test_lp_create_session_allows_one_group_per_account_token(tmp_path: Path) -> None:
+    """Canonical account/token is unique; other accounts/tokens and terminal rows coexist."""
 
     db = store(tmp_path)
-    market_a = {"condition_id": "0xa", "outcome": "YES"}
-    market_b = {"condition_id": "0xb", "outcome": "YES"}
+    market_a = {"account_id": " Account-A ", "token_id": "token-a", "condition_id": "0xa", "outcome": "YES"}
+    market_b = {**market_a, "token_id": "token-b"}
 
     created_a = db.lp_create_session(
         "lp-a", "lp-key-a", state="entry_open", payload=market_a
@@ -3561,8 +3569,7 @@ def test_lp_create_session_allows_one_group_per_market(tmp_path: Path) -> None:
     created_b = db.lp_create_session(
         "lp-b", "lp-key-b", state="entry_open", payload=market_b
     )
-    # 不同标的的两个活动组并存（ Newest first: A 晚于 B 创建则 A 在前；
-    # 这里 A 先建，顺序为 [B, A]——只断言集合不弱化并存事实）。
+    # Different tokens coexist even with the same condition/outcome.
     assert {row["session_id"] for row in db.lp_active_sessions()} == {
         "lp-a",
         "lp-b",
@@ -3570,10 +3577,11 @@ def test_lp_create_session_allows_one_group_per_market(tmp_path: Path) -> None:
     assert created_a["session_id"] == "lp-a"
     assert created_b["session_id"] == "lp-b"
 
-    # 同标的+方向、不同幂等键 → 拒绝理由映射 lp_session_market_active。
+    # Whitespace/case variants cannot evade canonical identity uniqueness.
     with pytest.raises(ValueError, match="lp_session_market_active"):
         db.lp_create_session(
-            "lp-c", "lp-key-c", state="entry_open", payload=market_a
+            "lp-c", "lp-key-c", state="entry_open",
+            payload={**market_a, "account_id": "account-a", "token_id": " token-a ", "condition_id": "0xc"},
         )
 
     # 同幂等键重放 → 返回原行，不视为冲突。
@@ -3584,9 +3592,9 @@ def test_lp_create_session_allows_one_group_per_market(tmp_path: Path) -> None:
         == created_a
     )
 
-    # 同标的、不同方向 → 并存。
+    # An explicitly different account has its own token group.
     db.lp_create_session(
-        "lp-d", "lp-key-d", state="entry_open", payload={"condition_id": "0xa", "outcome": "NO"}
+        "lp-d", "lp-key-d", state="entry_open", payload={**market_a, "account_id": "account-b"}
     )
     assert {row["session_id"] for row in db.lp_active_sessions()} == {
         "lp-a",
@@ -3606,12 +3614,40 @@ def test_lp_create_session_allows_one_group_per_market(tmp_path: Path) -> None:
     }
 
 
+def test_lp_account_token_migration_rejects_duplicates_without_dropping_old_index(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    database = data_dir / "prediction_arbitrage/prediction_arbitrage.sqlite3"
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as connection:
+        connection.executescript("""
+            CREATE TABLE lp_sessions (
+                session_id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL, payload TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX one_active_lp_session_market
+            ON lp_sessions(json_extract(payload,'$.condition_id'), json_extract(payload,'$.outcome'))
+            WHERE state NOT IN ('complete', 'entry_rejected');
+        """)
+        for session_id, account, token in (("legacy-a", " ACCOUNT-A ", "token-a"), ("legacy-b", "account-a", " token-a ")):
+            connection.execute("INSERT INTO lp_sessions VALUES (?,?,?,?,?,?)", (
+                session_id, session_id, "needs_attention",
+                json.dumps({"condition_id": session_id, "outcome": "YES", "account_id": account,
+                            "token_id": token, "submit_status": "unknown"}),
+                "2026-10-01T00:00:00Z", "2026-10-01T00:00:00Z",
+            ))
+        before = connection.execute("SELECT * FROM lp_sessions ORDER BY session_id").fetchall()
+    with pytest.raises(sqlite3.IntegrityError, match="one_active_lp_session_account_token"):
+        PredictionArbitrageStore(data_dir)
+    with sqlite3.connect(database) as connection:
+        indexes = {row[1] for row in connection.execute("PRAGMA index_list('lp_sessions')")}
+        assert "one_active_lp_session_market" in indexes
+        assert "one_active_lp_session_account_token" not in indexes
+        assert connection.execute("SELECT * FROM lp_sessions ORDER BY session_id").fetchall() == before
+
+
 def test_legacy_lp_sessions_db_migrates_old_unique_index(tmp_path: Path) -> None:
-    """Issue 166 R3: 存量库迁移——含旧索引 one_active_lp_session 与一行活动
-    会话的库文件用新代码打开后：旧索引被 DROP、one_active_lp_session_market
-    存在、原行仍为活动；同 (condition_id, outcome) 第二组仍拒
-    lp_session_market_active；不同标的第二组可建（旧全局唯一索引若未迁移
-    则此处必然失败）。"""
+    """Startup replaces the legacy index without rewriting legacy identity or state."""
 
     data_dir = tmp_path / "data"
     database_dir = data_dir / "prediction_arbitrage"
@@ -3632,7 +3668,7 @@ def test_legacy_lp_sessions_db_migrates_old_unique_index(tmp_path: Path) -> None
         WHERE state NOT IN ('complete', 'entry_rejected');
         INSERT INTO lp_sessions VALUES (
             'lp-legacy', 'lp-key-legacy', 'entry_open',
-            '{"condition_id": "0xa", "outcome": "YES"}',
+            '{"condition_id": "0xa", "outcome": "YES", "token_id": "token-a"}',
             '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z'
         );
         """
@@ -3647,22 +3683,23 @@ def test_legacy_lp_sessions_db_migrates_old_unique_index(tmp_path: Path) -> None
             for row in check.execute("PRAGMA index_list('lp_sessions')")
         }
     assert "one_active_lp_session" not in indexes
-    assert "one_active_lp_session_market" in indexes
+    assert "one_active_lp_session_market" not in indexes
+    assert "one_active_lp_session_account_token" in indexes
 
     active = {row["session_id"] for row in db.lp_active_sessions()}
     assert active == {"lp-legacy"}
 
-    # 同 (condition_id, outcome) 第二组仍拒 lp_session_market_active。
+    # The empty-account legacy namespace remains unique for its token.
     with pytest.raises(ValueError, match="lp_session_market_active"):
         db.lp_create_session(
             "lp-same", "lp-key-same", state="entry_open",
-            payload={"condition_id": "0xa", "outcome": "YES"},
+            payload={"account_id": " ", "condition_id": "0xb", "outcome": "NO", "token_id": " token-a "},
         )
 
-    # 不同标的第二组可建——旧全局唯一索引若未迁移此处必然失败。
+    # A canonical account can register the same token independently.
     db.lp_create_session(
         "lp-other", "lp-key-other", state="entry_open",
-        payload={"condition_id": "0xb", "outcome": "YES"},
+        payload={"account_id": "account-a", "condition_id": "0xa", "outcome": "YES", "token_id": "token-a"},
     )
     assert {row["session_id"] for row in db.lp_active_sessions()} == {
         "lp-legacy",

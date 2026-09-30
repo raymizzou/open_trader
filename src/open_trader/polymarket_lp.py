@@ -8181,7 +8181,7 @@ class PolymarketLPService:
         owned_ids = {
             order_id
             for session in self.store.lp_sessions()
-            if str(session.get("account_id") or "").strip().casefold() == account_id
+            if str(session.get("account_id") or "").strip().casefold() in {"", account_id}
             for order_id in self._session_order_ids(session)
         }
         for token, token_rows in groups.items():

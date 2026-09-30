@@ -14845,7 +14845,8 @@ def test_slow_publication_diagnostics_release_locks(tmp_path, monkeypatch, caplo
 
     result = service.reconcile_facts('session-secret', report_only=True)
     assert result[3] is None
-    assert 'stage=facts_report_publish elapsed_seconds=61.000 error_types=none' in caplog.text
+    assert 'lp_read_slow stage=facts_report_publish elapsed_seconds=61.000' in caplog.text
+    assert 'error_types=none' not in caplog.text
     assert 'outcome=slow' in caplog.text
     assert 'secret' not in caplog.text
     assert service._facts_apply_lock.acquire(blocking=False)
@@ -14862,7 +14863,9 @@ def test_slow_publication_diagnostics_release_locks(tmp_path, monkeypatch, caplo
 
 
 @pytest.mark.parametrize('wrapped', [False, True])
-def test_null_order_response_stays_unknown_with_specific_reason(tmp_path, monkeypatch, wrapped):
+def test_null_order_response_stays_unknown_with_specific_reason(tmp_path, monkeypatch, caplog, wrapped):
+    import logging
+    caplog.set_level(logging.INFO, logger="open_trader.polymarket_trading")
     from polymarket.models.clob.account import OpenOrder
     now = datetime.now(UTC)
     account = _SDKAccountClient(now)
@@ -14895,6 +14898,88 @@ def test_null_order_response_stays_unknown_with_specific_reason(tmp_path, monkey
     # A persisted exact terminal receipt is not erased by an unavailable lookup.
     session['order_history']['missing-receipt']['status'] = 'CANCELED'
     assert service._order_history_patch(session, snapshot)['order_history']['missing-receipt']['status'] == 'CANCELED'
+    records = [row for row in caplog.records if row.name == 'open_trader.polymarket_trading']
+    assert not [row for row in records if row.levelno >= logging.WARNING]
+    if wrapped:
+        assert any('lp_read_wait stage=required_order' in row.getMessage()
+                   and 'reason=order_lookup_unavailable' in row.getMessage() for row in records)
+
+
+@pytest.mark.parametrize('failure', ['schema', 'transport', 'rate_limit', 'auth', 'value_error'])
+def test_required_order_real_failures_stay_logged_unknown_and_redacted(tmp_path, monkeypatch, caplog, failure):
+    import httpx
+    import logging
+    from polymarket.errors import RequestRejectedError, TransportError
+    from polymarket.models.clob.account import OpenOrder
+    from open_trader import polymarket_trading
+
+    now = datetime.now(UTC)
+    secret = 'Authorization=diagnostic-secret private-key=diagnostic-secret'
+    account = _SDKAccountClient(now)
+
+    def failed_lookup(**kwargs):
+        if failure == 'schema':
+            return OpenOrder.parse_response({'id': secret})
+        if failure == 'transport':
+            try:
+                raise httpx.ReadTimeout(secret)
+            except httpx.ReadTimeout as cause:
+                raise TransportError(secret) from cause
+        if failure in {'rate_limit', 'auth'}:
+            error = RequestRejectedError(secret, status=429 if failure == 'rate_limit' else 401)
+            error.headers = {'Retry-After': '7', 'Authorization': secret}
+            raise error
+        raise ValueError(secret)
+
+    monkeypatch.setattr(account, 'get_order', failed_lookup, raising=False)
+    adapter = PolymarketTradingClient(
+        TradingConfig('0x' + '1' * 40, '0x' + '2' * 40), account,
+        public_client_factory=lambda: _SDKPublicClient(now))
+    try:
+        request = {**_request(now), 'owned_order_ids': ['missing-receipt']}
+        snapshot = adapter.lp_snapshot(request)
+        assert snapshot['orders_terminal'] is False
+        expected = 'order_response_invalid' if failure == 'schema' else 'order_read_failed'
+        assert snapshot['order_read_errors']['missing-receipt'] == expected
+        service = PolymarketLPService(PredictionArbitrageStore(tmp_path), adapter)
+        patch = service._order_history_patch({**request, 'order_history': {'missing-receipt': {'status': 'LIVE'}}}, snapshot)
+        assert patch['order_history']['missing-receipt']['status'] == 'UNKNOWN'
+        records = [r for r in caplog.records if r.name == polymarket_trading.__name__]
+        assert any(r.levelno >= logging.WARNING and 'stage=required_order' in r.getMessage()
+                   and 'error_types=' in r.getMessage() for r in records)
+        assert not any('lp_read_wait' in r.getMessage() for r in records)
+        if failure == 'rate_limit':
+            assert 'status=429' in caplog.text
+            assert 'retry_after_seconds=7' in caplog.text
+        assert secret not in caplog.text
+        assert all(r.exc_info is None for r in records)
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize('metadata', ['raising', 'huge_retry'])
+def test_diagnostic_metadata_failure_preserves_original_exception_and_secrets(metadata, caplog):
+    from polymarket.errors import RequestRejectedError
+    from open_trader.polymarket_trading import _lp_read_stage
+
+    secret = 'Authorization=malicious-retry-secret'
+
+    class PoisonedReadError(RequestRejectedError):
+        @property
+        def response_facts(self):
+            if metadata == 'raising':
+                raise RuntimeError(secret)
+            return {'status': 429, 'retry_after_seconds': 10 ** 10000, 'secret': secret}
+
+    original = PoisonedReadError(secret, status=429)
+    with pytest.raises(PoisonedReadError) as captured:
+        with _lp_read_stage('required_order'):
+            raise original
+    assert captured.value is original
+    assert 'error_types=PoisonedReadError' in caplog.text
+    assert 'lp_read_wait' not in caplog.text
+    assert 'retry_after_seconds=' not in caplog.text
+    assert secret not in caplog.text
 
 
 def test_full_verified_fill_closes_missing_order_receipt_without_guessing(tmp_path):

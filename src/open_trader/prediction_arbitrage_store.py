@@ -834,11 +834,12 @@ class PredictionArbitrageStore:
                 PRIMARY KEY(account_id, auto_run_id, report_date)
             );
 
-            DROP INDEX IF EXISTS one_active_lp_session;
-
-            CREATE UNIQUE INDEX IF NOT EXISTS one_active_lp_session_market
-            ON lp_sessions(json_extract(payload,'$.condition_id'), json_extract(payload,'$.outcome'))
+            CREATE UNIQUE INDEX IF NOT EXISTS one_active_lp_session_account_token
+            ON lp_sessions(lower(trim(coalesce(json_extract(payload,'$.account_id'),''))), trim(json_extract(payload,'$.token_id')))
             WHERE state NOT IN ('complete', 'entry_rejected');
+
+            DROP INDEX IF EXISTS one_active_lp_session;
+            DROP INDEX IF EXISTS one_active_lp_session_market;
 
             CREATE TABLE IF NOT EXISTS lp_actions (
                 action_id TEXT PRIMARY KEY,
@@ -3331,12 +3332,13 @@ class PredictionArbitrageStore:
         for row in rows:
             condition_id = str(row["condition_id"])
             expires_at = float(row["expires_at"])
-            if not int(row["present"]):
-                result[condition_id] = (expires_at, None)
-                continue
             try:
                 payload = _load_payload(str(row["payload"]))
             except ValueError:
+                continue
+            if not int(row["present"]):
+                if payload.get("closed_checked") is True:
+                    result[condition_id] = (expires_at, None)
                 continue
             result[condition_id] = (expires_at, payload)
         return result
@@ -3360,7 +3362,7 @@ class PredictionArbitrageStore:
                 raise ValueError("lp_metadata_cache_entry_invalid")
             expires_at = float(raw_expires_at)
             if raw_payload is None:
-                encoded.append((condition, "{}", expires_at, 0))
+                encoded.append((condition, '{"closed_checked":true}', expires_at, 0))
                 continue
             if not isinstance(raw_payload, Mapping):
                 raise ValueError("lp_metadata_cache_entry_invalid")
@@ -4729,10 +4731,8 @@ class PredictionArbitrageStore:
                     (str(session_id), str(idempotency_key), str(state), encoded, now, now),
                 )
             except sqlite3.IntegrityError as exc:
-                # Issue 166: uniqueness is per (condition_id, outcome) group,
-                # so the same market+direction is the only store-level
-                # admission conflict left.
-                if "one_active_lp_session_market" in str(exc):
+                # Preserve the public conflict code for canonical account/token groups.
+                if "one_active_lp_session_account_token" in str(exc):
                     raise ValueError("lp_session_market_active") from exc
                 raise
             row = connection.execute(
@@ -5056,8 +5056,11 @@ class PredictionArbitrageStore:
             active_candidates = [
                 item
                 for item in loaded
-                if str(item[1].get("token_id") or "") == canonical_token
-                and str(item[1].get("account_id") or "").strip().casefold() == canonical_account
+                if str(item[1].get("token_id") or "").strip() == canonical_token
+                and (
+                    str(item[1].get("account_id") or "").strip().casefold() == canonical_account
+                    or str(item[0]["session_id"]) in legacy_takeovers
+                )
                 and str(item[0]["state"]) not in {"complete", "entry_rejected"}
             ]
             if len(active_candidates) > 1:
@@ -5242,7 +5245,7 @@ class PredictionArbitrageStore:
                         ),
                     )
                 except sqlite3.IntegrityError as exc:
-                    if "one_active_lp_session_market" in str(exc):
+                    if "one_active_lp_session_account_token" in str(exc):
                         raise ValueError("lp_session_market_active") from exc
                     raise
                 if episode_id:
