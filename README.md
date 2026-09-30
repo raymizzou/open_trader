@@ -107,12 +107,18 @@ Kalshi, Predict.fun, and cross-venue arbitrage are deferred.
 
 ## Quick Start
 
-Create a Python 3.12 virtual environment and install the project:
+Create a clean Python 3.12.14 environment using uv 0.12.19 and the reviewed lock:
 
 ```bash
-python3.12 -m venv .venv
-.venv/bin/python -m pip install -e ".[dev]"
+uv lock --check --python 3.12.14 --no-python-downloads
+uv sync --locked --python 3.12.14 --no-python-downloads --only-group build --no-build
+uv sync --locked --python 3.12.14 --no-python-downloads --no-default-groups --group build --extra dev --extra cloud-ssm --no-install-project --no-build-isolation
+uv sync --locked --python 3.12.14 --no-python-downloads --offline --no-default-groups --group build --extra dev --extra cloud-ssm --no-build-isolation
 ```
+
+Ordinary development excludes browsers; host browser tooling uses the explicit
+`browser` extra. See [dependency reproducibility](docs/operations/dependency-reproducibility.md)
+for clean-build acceptance, isolation checks, and deliberate lock/base updates.
 
 Prepare daily automation config:
 

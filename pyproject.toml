@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=80"]
+requires = ["setuptools==80.9.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -24,11 +24,17 @@ cloud-ssm = [
     "tencentcloud-sdk-python-ssm==3.1.160",
     "tencentcloud-sdk-python-common==3.1.182",
 ]
-dev = [
+browser = [
     "playwright>=1.52",
+]
+dev = [
     "pytest>=8.0",
     "pytest-xdist==3.8.0",
 ]
+
+[dependency-groups]
+# Install the reviewed backend before the offline editable build.
+build = ["setuptools==80.9.0"]
 
 [project.scripts]
 open-trader = "open_trader.__main__:main"
