@@ -5,6 +5,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-01
 
+- #205 monitor 诊断按操作来源及精确 event/relation/validation 刷新目标恢复：操作开始捕获当前故障 marker，仅在同一操作完整成功且 marker 未被后续错误替换时清除 `last_error`；合法 unavailable book 不阻止 transport 恢复，兄弟操作、重复新错误、部分发布、持久化/订阅失败与 APR 超限仍保留诊断及历史记录。Universe 完整恢复复用同一保护，原失败 flags 与业务判断保留。
+- 定向 Docker RED→GREEN，完整 `test_polymarket_monitor.py` 232 passed（37.30 秒），覆盖并发、身份/目标集合隔离、发布失败、APR 限制与既有 universe 恢复。Validation 已 terminal 后的机会刷新故障缺少普通同来源重试出口，保守保留；原非 terminal 校验重试完整成功可恢复自己的诊断，LLM 调度保持原语义。
+
 - LP 内部 CAS、轮次与读取容量等待使用轻量 typed exception，固定允许原因记 INFO；同文本普通异常、真实超时、身份/结构/认证及 active 404 保持故障。精确 market/condition/token 验证且 `closed is True` 时不请求盘口，保留账户、订单、成交、库存与 UNKNOWN 占资，以固定 60 秒本地期限复查，明确 local 来源。
 - 已安装账户 validator、完整新鲜挂单列表与当前交易代次共同证明旧历史 ID 不在挂单中时，前置和后续收单 sweep 共用过滤，停止反复生成 cancel 意图；当前正向 LIVE/OPEN/ACCEPTED/PENDING 回执仍可撤单，unknown ack 可重试，旧 UNKNOWN 意图、订单历史和资金语义保留。Universe 完整发布成功仅清当前 universe diagnostic，其他 component 与历史 warning 保留。
 - 定向 Docker RED→GREEN：4 个受影响文件 633 passed，覆盖固定重试截止、闭市不读 book、真实 SDK null/后续 LIVE、三类取消目标及无效 absence proof；Prediction 服务检查 3189 passed、1 skipped（179.48 秒）。真实账户数据副本验证 27 个历史组：0 新撤单意图、0 generation 变化、0 venue 写入；未跑 Candidate，未提交、合并或部署。

@@ -553,6 +553,7 @@ class PolymarketMonitor:
             "universe_notification_error": None,
             "llm_notification_error": None,
         }
+        self._last_error_marker: tuple[tuple[str, ...], str] | None = None
         self._relation_scan_logs: deque[dict[str, object]] = deque(
             maxlen=RELATION_SCAN_LOG_LIMIT
         )
@@ -2313,7 +2314,7 @@ class PolymarketMonitor:
     def _disconnect_stream(self, exc: BaseException) -> None:
         self._stream_disconnected_at = self._now()
         self._stream_token_ids = set()
-        self._diagnostics["last_error"] = f"stream:{type(exc).__name__}"
+        self._set_error(f"stream:{type(exc).__name__}", ("stream",))
         # The handle is closed by the next event-loop pass.  We deliberately do
         # not retain stream messages in the store.
         self._stream_handle = None
@@ -2484,6 +2485,7 @@ class PolymarketMonitor:
         subscribe: bool = True,
         block_observation_status: bool = True,
     ) -> None:
+        prior_error = self._capture_error(("universe",))
         progress: dict[str, Any] = {"stage": "events", "completed_stage_seconds": {}}
         with self._lock:
             self._diagnostics["universe_refresh"] = progress
@@ -2667,8 +2669,7 @@ class PolymarketMonitor:
         with self._lock:
             self._universe_at = self._now()
             self._universe_failed = False
-            if str(self._diagnostics.get("last_error") or "").partition(":")[0] == "universe":
-                self._diagnostics["last_error"] = None
+            self._clear_error(prior_error)
         phase("complete")
         self._emit_health_log(force=True)
 
@@ -2763,6 +2764,8 @@ class PolymarketMonitor:
     _maybe_schedule_relation_activity = _maybe_schedule_activity_scan
 
     async def _run_activity_scan(self, client: object) -> None:
+        error_source = ("activity_scan",)
+        prior_error = self._capture_error(error_source)
         try:
             await self._refresh_relation_activity(client, resubscribe=False)
             if self._activity.get("status") == "healthy":
@@ -2778,10 +2781,11 @@ class PolymarketMonitor:
                     and row.get("actionable") is True
                     for row in self._opportunities.values()
                 )
+                self._clear_error(prior_error)
         except Exception as exc:
             self._activity = {**self._activity, "status": "degraded"}
             self._relations_failed = True
-            self._record_error(exc, "relations")
+            self._record_error(exc, "relations", source=error_source)
         finally:
             catchup = self._activity_catchup_requested
             self._activity_catchup_requested = False
@@ -2863,6 +2867,9 @@ class PolymarketMonitor:
             return None
 
     def _load_relation_catalog(self) -> None:
+        error_source = ("catalog_load",)
+        prior_error = self._capture_error(error_source)
+        history_complete = True
         self._catalog_loaded = True
         if self._relation_discovery is None:
             self._catalog_status = "unavailable"
@@ -2915,6 +2922,7 @@ class PolymarketMonitor:
                     runs = history(limit=20)
                 except Exception:
                     runs = ()
+                    history_complete = False
                 for run in runs:
                     if not isinstance(run, Mapping):
                         continue
@@ -2985,10 +2993,12 @@ class PolymarketMonitor:
                 else "stale"
             )
             self._relations_failed = False
+            if history_complete:
+                self._clear_error(prior_error)
         except Exception as exc:
             self._catalog_status = "degraded"
             self._relations_failed = True
-            self._record_error(exc, "relations")
+            self._record_error(exc, "relations", source=error_source)
 
     def _relation_catalog_snapshot(self, now: datetime) -> dict[str, object]:
         status = self._catalog_status
@@ -3016,6 +3026,9 @@ class PolymarketMonitor:
         }
 
     async def _run_full_relation_scan(self, client: object) -> None:
+        error_source = ("full",)
+        prior_error = self._capture_error(error_source)
+        publication_complete = True
         started = self._now()
         self._catalog_last_attempt_at = started
         self._catalog_scan_started_at = started
@@ -3071,6 +3084,7 @@ class PolymarketMonitor:
                         fingerprint=candidate_report.get("fingerprint"),
                     )
                 except Exception as exc:
+                    publication_complete = False
                     self._log_relation_scan(
                         phase="candidate_prepared",
                         status="failed",
@@ -3102,6 +3116,7 @@ class PolymarketMonitor:
                         fingerprint=mechanical_report.get("fingerprint"),
                     )
                 except Exception as exc:
+                    publication_complete = False
                     self._log_relation_scan(
                         phase="mechanical_candidate_prepared",
                         status="failed",
@@ -3165,6 +3180,7 @@ class PolymarketMonitor:
                 try:
                     lifecycle_report = lifecycle_observer()
                 except Exception as exc:
+                    publication_complete = False
                     self._log_relation_scan(
                         phase="lifecycle",
                         status="failed",
@@ -3178,6 +3194,8 @@ class PolymarketMonitor:
                         scope="full",
                         report=lifecycle_report,
                     )
+            if publication_complete:
+                self._clear_error(prior_error)
         except Exception as exc:
             completed = self._now()
             self._catalog_scan_duration_seconds = max(
@@ -3185,7 +3203,7 @@ class PolymarketMonitor:
             )
             self._catalog_status = "degraded"
             self._relations_failed = True
-            self._record_error(exc, "relations")
+            self._record_error(exc, "relations", source=error_source)
             self._catalog_last_full_run = {
                 "scope": "full",
                 "status": "failed",
@@ -3281,6 +3299,8 @@ class PolymarketMonitor:
 
     async def _refresh_relation_event(self, client: object, event_id: str) -> bool:
         event_id = str(event_id).strip()
+        error_source = ("event", event_id)
+        prior_error = self._capture_error(error_source)
         activity_task = self._activity_scan_task
         if activity_task is not None and not activity_task.done():
             await activity_task
@@ -3398,7 +3418,7 @@ class PolymarketMonitor:
             completed = self._now()
             self._catalog_status = "degraded"
             self._relations_failed = True
-            self._record_error(exc, "relations")
+            self._record_error(exc, "relations", source=error_source)
             self._catalog_last_event_run = {
                 "scope": "event",
                 "event_id": event_id,
@@ -3432,6 +3452,8 @@ class PolymarketMonitor:
             await self._subscribe(client)
         except Exception as exc:
             self._record_error(exc, "stream")
+        if not self._subscription_dirty:
+            self._clear_error(prior_error)
         return True
 
     async def _refresh_relation_books(
@@ -3676,6 +3698,8 @@ class PolymarketMonitor:
 
         if self._relation_discovery is None:
             return
+        error_source = ("activity",)
+        prior_error = self._capture_error(error_source)
         started = self._now()
         self._activity_scan_started_at = started
         previous = copy.deepcopy(self._activity)
@@ -3821,7 +3845,7 @@ class PolymarketMonitor:
                 activity["status"] = "degraded"
                 self._activity = activity
                 self._relations_failed = True
-                self._diagnostics["last_error"] = "relations:apr_target_limit"
+                self._set_error("relations:apr_target_limit", error_source)
                 try:
                     self._store.record_relation_scan(
                         scope="activity",
@@ -3887,10 +3911,12 @@ class PolymarketMonitor:
                 relation_count=len(relations),
                 active_count=len(relation_ids),
             )
+            if not resubscribe or not self._subscription_dirty:
+                self._clear_error(prior_error)
         except Exception as exc:
             self._activity = {**previous, "status": "degraded"}
             self._relations_failed = True
-            self._record_error(exc, "relations")
+            self._record_error(exc, "relations", source=error_source)
             completed = self._now()
             self._activity_next_scan_at = started + timedelta(
                 seconds=RELATION_ACTIVITY_REFRESH_SECONDS
@@ -3985,7 +4011,7 @@ class PolymarketMonitor:
             if relation_id in self._relation_rule_failures
         }
 
-    def _persist_relation_metadata(self, relation: ThresholdRelation) -> None:
+    def _persist_relation_metadata(self, relation: ThresholdRelation) -> bool:
         """Publish fresher unchanged event metadata without a second fetch."""
 
         self._relations[relation.relation_id] = relation
@@ -3993,7 +4019,7 @@ class PolymarketMonitor:
         self._relation_rule_failure_fingerprints.pop(relation.relation_id, None)
         full_scanned_at = self._catalog_full_scanned_at or self._stored_full_scanned_at()
         if full_scanned_at is None:
-            return
+            return False
         try:
             self._store.save_relation_state(
                 {
@@ -4007,12 +4033,16 @@ class PolymarketMonitor:
         except Exception as exc:
             self._store_failed = True
             self._record_error(exc, "store")
+            return False
+        return True
 
     async def _verify_relation_rules(
         self, client: object, relation: ThresholdRelation
     ) -> tuple[datetime, str] | None:
         """Fetch and rediscover the exact source event before first positivity."""
 
+        error_source = ("rules", relation.relation_id)
+        prior_error = self._capture_error(error_source)
         current_fingerprint = _relation_fingerprint(relation)
         verified = self._relation_rule_verifications.get(relation.relation_id)
         if verified is not None and verified[1] == current_fingerprint:
@@ -4052,11 +4082,11 @@ class PolymarketMonitor:
         try:
             raw_event = await _call(get_event, id=relation.event_id)
         except (ConnectionError, OSError, TimeoutError, asyncio.TimeoutError) as exc:
-            self._record_error(exc, "relations")
+            self._record_error(exc, "relations", source=error_source)
             self._close_signal(relation.relation_id, "data_unavailable")
             return None
         except Exception as exc:
-            self._record_error(exc, "relations")
+            self._record_error(exc, "relations", source=error_source)
             self._close_signal(relation.relation_id, "data_unavailable")
             return None
         try:
@@ -4090,15 +4120,18 @@ class PolymarketMonitor:
                 verified_at,
                 current_fingerprint,
             )
-            if refreshed != relation:
-                self._persist_relation_metadata(refreshed)
+            metadata_published = refreshed == relation
+            if not metadata_published:
+                metadata_published = self._persist_relation_metadata(refreshed)
+            if _event_id(raw_event) == relation.event_id and metadata_published:
+                self._clear_error(prior_error)
             return verified_at, current_fingerprint
         except (ConnectionError, OSError, TimeoutError, asyncio.TimeoutError) as exc:
-            self._record_error(exc, "relations")
+            self._record_error(exc, "relations", source=error_source)
             self._close_signal(relation.relation_id, "data_unavailable")
             return None
         except Exception as exc:
-            self._record_error(exc, "relations")
+            self._record_error(exc, "relations", source=error_source)
             self._close_signal(relation.relation_id, "data_unavailable")
             return None
 
@@ -4394,13 +4427,16 @@ class PolymarketMonitor:
                 self._rebuild_relation_subscriptions()
                 self._update_activity_codex_counts()
                 if client is not None and relation_id in self._active_relation_ids:
+                    error_source = ("validation_opportunities", relation_id)
+                    prior_error = self._capture_error(error_source)
                     try:
                         rows = await self._refresh_relation_opportunities(
                             client, {relation_id}
                         )
                         self._merge_relation_rows(rows, {relation_id})
+                        self._clear_error(prior_error)
                     except Exception as exc:
-                        self._record_error(exc, "relations")
+                        self._record_error(exc, "relations", source=error_source)
             return
         validator = self._relation_validator
         if validator is None:
@@ -4471,13 +4507,16 @@ class PolymarketMonitor:
             candidates.append((candidate.net_edge, relation_id, relation))
             self._codex_wait_started_at.setdefault(relation_id, now)
         if client is not None and restored_relation_ids:
+            error_source = ("validation_opportunities", *sorted(restored_relation_ids))
+            prior_error = self._capture_error(error_source)
             try:
                 rows = await self._refresh_relation_opportunities(
                     client, restored_relation_ids
                 )
                 self._merge_relation_rows(rows, restored_relation_ids)
+                self._clear_error(prior_error)
             except Exception as exc:
-                self._record_error(exc, "relations")
+                self._record_error(exc, "relations", source=error_source)
         if not candidates:
             self._rebuild_relation_subscriptions()
             self._update_activity_codex_counts()
@@ -5741,8 +5780,35 @@ class PolymarketMonitor:
             return max(left_decimal, right_decimal)
         return left_decimal if left_decimal is not None else right_decimal
 
-    def _record_error(self, exc: BaseException, component: str) -> None:
-        self._diagnostics["last_error"] = f"{component}:{type(exc).__name__}"
+    def _set_error(self, value: str, source: tuple[str, ...]) -> None:
+        with self._lock:
+            self._diagnostics["last_error"] = value
+            # Each fault gets a new tuple, including identical repeated faults.
+            self._last_error_marker = (source, value)
+
+    def _capture_error(
+        self, source: tuple[str, ...]
+    ) -> tuple[tuple[str, ...], str] | None:
+        with self._lock:
+            marker = self._last_error_marker
+            if marker is not None and marker[0] == source and (
+                self._diagnostics.get("last_error") == marker[1]
+            ):
+                return marker
+            return None
+
+    def _clear_error(self, marker: tuple[tuple[str, ...], str] | None) -> None:
+        with self._lock:
+            if marker is not None and self._last_error_marker is marker and (
+                self._diagnostics.get("last_error") == marker[1]
+            ):
+                self._diagnostics["last_error"] = None
+                self._last_error_marker = None
+
+    def _record_error(
+        self, exc: BaseException, component: str, *, source: tuple[str, ...] | None = None
+    ) -> None:
+        self._set_error(f"{component}:{type(exc).__name__}", source or (component,))
         if component == "universe":
             self._universe_failed = True
         if component == "relations":
