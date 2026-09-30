@@ -5,6 +5,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-30
 
+- #204 部署前 Smoke 修复：split 看板分别核验云端只读 LP 快照和 Air 执行身份/暂停状态；
+  两主机冒烟前后分别验证快照，仅允许 display_snapshot 刷新，仍严格核对发布、进程、根目录、
+  模式、暂停和凭据 profile。补齐离线 split/standalone 浏览器 fixtures 与缺失/变更身份回归，未部署。
+
 - #204：完整 Air Dashboard 可通过独立 SSH 隧道显示云端 paused Shadow 的 LP/账户快照；
   Air 保留所有写操作、实时预检、N-leg 状态/历史和执行状态；自动控制及现有资金/轮次区同读 Air，
   云端 cookie/CSRF 不进入本地授权。客户端退出期间允许 ps 短暂撕裂后再核对，持续 PID 不匹配仍拒绝停止。

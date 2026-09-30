@@ -538,3 +538,81 @@ def test_cloud_display_smoke_accepts_reward_usd_unknown_and_records_source_evide
     assert evidence['history']['state'] == 'ready'
     for change in ({'stale':True},{'authenticated':False},{'checked_at':(datetime.now(UTC)-timedelta(seconds=61)).isoformat()}):
         with pytest.raises(ValueError): display_snapshot_evidence({**snapshot,**change})
+
+
+@pytest.mark.parametrize('change', [
+    'refresh', 'pid', 'started_at', 'systemd_started_at', 'git_sha', 'mode',
+    'release_root', 'runtime_root', 'n_leg_paused', 'credential_backend', 'status',
+    'missing_pid', 'missing_started_at', 'missing_systemd_started_at',
+    'missing_git_sha', 'missing_mode', 'missing_release_root', 'missing_runtime_root',
+    'missing_n_leg_paused', 'missing_credential_backend', 'missing_status',
+    'missing_display_snapshot', 'stale_display_snapshot', 'missing_snapshot_account',
+    'missing_snapshot_time', 'changed_extra_identity',
+])
+@pytest.mark.parametrize('observation', ['before', 'after'])
+def test_two_host_smoke_revalidates_refresh_and_stable_identity(tmp_path, monkeypatch, capsys, change, observation):
+    import importlib.util
+    import sys
+    from datetime import UTC, datetime, timedelta
+    spec = importlib.util.spec_from_file_location('cloud_gate',
+        Path(__file__).resolve().parents[1]/'scripts/prediction-cloud-gate.py')
+    gate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gate)
+    cfg = CloudConfig(tmp_path/'release', tmp_path/'remote', tmp_path/'python',
+        'prediction', 'a'*40, '', '', '', '', 'shadow', 1, 'file', '/private/wallet.json')
+    local = dict(release_root=str(cfg.release_root), runtime_root=str(tmp_path/'client'),
+        python=str(cfg.python), ssh_alias='fixture', expected_sha='b'*40,
+        cloud_expected_sha=cfg.expected_sha, execution_port=8769,
+        execution_expected_sha='c'*40, gateway_port=8766, tunnel_port=8879, mode='shadow')
+    client_config = tmp_path/'client.json'; client_config.write_text(json.dumps(local))
+    operator = tmp_path/'evidence.json'; operator.write_text(json.dumps(dict(
+        git_sha=cfg.expected_sha, independent_runtime_root=str(cfg.runtime_root),
+        resources_reviewed=True, resources_reviewed_evidence='offline fixture')))
+    cfg.runtime_root.mkdir()
+    Path(local['runtime_root']).mkdir()
+    (Path(local['runtime_root'])/'gateway.log').write_text('frontend_gateway_runtime: started\n')
+    monkeypatch.setattr(gate, 'load_config', lambda path: cfg)
+    monkeypatch.setattr(gate, 'validate', lambda value: None)
+    monkeypatch.setattr(gate, 'inspect_prediction_release_checkout', lambda path: {'git_sha':local['expected_sha']})
+    monkeypatch.setattr(gate, 'client_release', lambda value: None)
+    monkeypatch.setattr(gate, 'client_operation', lambda value, action: dict(
+        status='CONNECTED', execution_status='ok', execution_git_sha=local['execution_expected_sha']))
+    before = dict(status='BACKEND_SMOKE_OK', pid=123, started_at='process-start',
+        systemd_started_at='systemd-start', git_sha=cfg.expected_sha, mode='shadow',
+        release_root=str(cfg.release_root), runtime_root=str(cfg.runtime_root),
+        n_leg_paused=1, credential_backend='file', display_snapshot=dict(
+            account={'checked_at':datetime.now(UTC).isoformat()}, catalog={'complete':True},
+            candidates={'candidate_state':'unknown'}, history=None,
+            rewards={'condition':{'state':'unknown','reason':'usd_value_unknown'}}))
+    after = json.loads(json.dumps(before))
+    after['display_snapshot']['account']['checked_at'] = datetime.now(UTC).isoformat()
+    after['display_snapshot']['catalog']['complete'] = False
+    changed = before if observation == 'before' else after
+    if change == 'missing_snapshot_account':
+        changed['display_snapshot'].pop('account')
+    elif change == 'missing_snapshot_time':
+        changed['display_snapshot']['account'].pop('checked_at')
+    elif change == 'changed_extra_identity':
+        changed['extra_identity'] = 'changed'
+    elif change.startswith('missing_'):
+        changed.pop(change.removeprefix('missing_'))
+    elif change == 'stale_display_snapshot':
+        changed['display_snapshot']['account']['checked_at'] = (datetime.now(UTC)-timedelta(seconds=61)).isoformat()
+    elif change != 'refresh':
+        changed[change] = {'pid':124, 'n_leg_paused':0}.get(change, 'changed')
+    remote_results = iter([before, after]); ssh_calls = []
+    def checked(command, **kwargs):
+        if command[0] == 'ssh':
+            ssh_calls.append(command)
+            return json.dumps(next(remote_results))
+        if command[0] == 'git': return 'HEAD\n'
+        return ''
+    monkeypatch.setattr(gate, 'checked', checked)
+    monkeypatch.setattr(sys, 'argv', ['gate', 'smoke', '--client-config',str(client_config),
+        '--service-config',str(tmp_path/'unused'), '--remote-config','/etc/cloud.json',
+        '--operator-evidence',str(operator), '--browser-runtime',str(tmp_path)])
+    assert gate.main() == (0 if change == 'refresh' else 2)
+    assert capsys.readouterr().out.endswith('HEALTHY\n' if change == 'refresh' else 'ROLLBACK\n')
+    early_rejection = observation == 'before' and change not in {
+        'refresh', 'pid', 'started_at', 'systemd_started_at', 'changed_extra_identity'}
+    assert len(ssh_calls) == (1 if early_rejection else 2)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from datetime import UTC, datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1178,7 +1179,21 @@ class Handler(BaseHTTPRequestHandler):
             if requested_scenario:
                 type(self).prediction_scenario = requested_scenario
                 type(self).prediction_state_calls = 0
-            self._send_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
+            if type(self).prediction_scenario.startswith("smoke-"):
+                body = (STATIC_DIR / "index.html").read_text().replace("<body>",
+                    '<body data-prediction-split="true">' if "split" in type(self).prediction_scenario
+                    else '<body data-prediction-only="true">')
+                if type(self).prediction_scenario == "smoke-split-mutation":
+                    body += "<script>fetch('/fixture-mutation', {method: 'POST'}).catch(() => {});</script>"
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(body.encode())
+            else:
+                self._send_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
+            return
+        if path == "/healthz":
+            self._send_json({"status": "running"})
             return
         if path == "/static/dashboard.css":
             self._send_file(STATIC_DIR / "dashboard.css", "text/css; charset=utf-8")
@@ -1204,8 +1219,23 @@ class Handler(BaseHTTPRequestHandler):
                 }
             )
             return
-        if path == "/api/prediction-arbitrage/venues":
+        if path in {"/api/prediction-arbitrage/venues", "/api/prediction-arbitrage/execution/identity"}:
             payload = _prediction_payload(type(self).prediction_scenario)
+            scenario = type(self).prediction_scenario
+            smoke_identity = {}
+            if scenario.startswith("smoke-"):
+                if path.endswith("/execution/identity") and scenario == "smoke-split-air-missing":
+                    self.send_response(HTTPStatus.SERVICE_UNAVAILABLE)
+                    self.end_headers()
+                    return
+                cloud = "split" in scenario and path.endswith("/venues")
+                shadow = cloud or "shadow" in scenario
+                paused = cloud or scenario.endswith("paused")
+                smoke_identity = {"mode": "shadow" if shadow else "production",
+                    "mutations": "prohibited" if shadow else "enabled",
+                    "n_leg": {"status": "paused" if paused else "running"}}
+                if path.endswith("/execution/identity") and scenario == "smoke-split-air-unknown":
+                    smoke_identity = {"mode": "unknown", "mutations": "unknown"}
             self._send_json({
                 "venues": payload.get("venues", []),
                 "n_leg": payload.get("n_leg", {"status": "running", "code": "N_LEG_RUNNING"}),
@@ -1214,19 +1244,29 @@ class Handler(BaseHTTPRequestHandler):
                     "n_leg_cross_venue_token_count": 0,
                 },
                 "csrf_token": payload.get("csrf_token", ""),
+                **smoke_identity,
             })
             return
         if path == "/api/prediction-arbitrage/lp/dashboard":
+            if type(self).prediction_scenario == "smoke-shadow-paused":
+                self.send_response(HTTPStatus.SERVICE_UNAVAILABLE)
+                self.end_headers()
+                return
             self._send_json({
                 "state": "ready",
-                "stale": False,
+                "stale": type(self).prediction_scenario == "smoke-split-stale",
                 "complete": True,
-                "checked_at": "2026-07-28T08:17:40Z",
+                "checked_at": datetime.now(UTC).isoformat() if type(self).prediction_scenario.startswith("smoke-") else "2026-07-28T08:17:40Z",
                 "orders": [],
                 "positions": [],
                 "market_rewards": [],
                 "candidates": [],
+                **({"authenticated": True, "recommendations": []}
+                   if type(self).prediction_scenario.startswith("smoke-") else {}),
             })
+            return
+        if path == "/api/prediction-arbitrage/lp/auto/state":
+            self._send_json({"state": "disabled", "slots": []})
             return
         if path == "/api/prediction-arbitrage/state":
             if type(self).prediction_scenario == "observation-fetch-error":

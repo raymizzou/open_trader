@@ -21,6 +21,34 @@ def checked(command, *, cwd=None, env=None):
     return result.stdout
 
 
+def remote_identity(result, cloud, action):
+    """Validate each remote observation; only display snapshots may move."""
+    expected = dict(release_root=str(cloud.release_root), runtime_root=str(cloud.runtime_root),
+        mode=cloud.mode, git_sha=cloud.expected_sha, n_leg_paused=cloud.n_leg_paused,
+        credential_backend=credential_backend(cloud),
+        status='PRECHECK_OK' if action == 'preflight' else 'BACKEND_SMOKE_OK')
+    if any(key not in result or result[key] != value for key, value in expected.items()):
+        raise ValueError('remote gate evidence mismatch')
+    if action == 'smoke':
+        if (type(result.get('pid')) is not int or result['pid'] <= 0
+            or any(not isinstance(result.get(key), str) or not result[key]
+                   for key in ('started_at', 'systemd_started_at'))):
+            raise ValueError('remote process identity missing')
+        if cloud.mode == 'shadow' and cloud.n_leg_paused and credential_backend(cloud) != 'disabled':
+            from datetime import UTC, datetime
+            from decimal import Decimal
+            from open_trader.polymarket_lp_risk import _freshness
+            snapshot = result.get('display_snapshot')
+            if (not isinstance(snapshot, dict)
+                or any(not isinstance(snapshot.get(key), dict)
+                       for key in ('account', 'catalog', 'candidates', 'rewards'))
+                or 'history' not in snapshot):
+                raise ValueError('remote display snapshot evidence missing')
+            _freshness(snapshot['account'].get('checked_at'), datetime.now(UTC),
+                       'account_facts', max_age=Decimal(60))
+    return {key:value for key,value in result.items() if key != 'display_snapshot'}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['readiness','smoke'])
@@ -65,13 +93,7 @@ def main():
         output = checked(['ssh','-o','BatchMode=yes','-o','StrictHostKeyChecking=yes','-o','ForwardAgent=no',
                           '-o','ConnectTimeout=10',local['ssh_alias'],remote])
         result = json.loads(output)
-        if result.get('release_root') != str(cloud.release_root) or result.get('runtime_root') != str(cloud.runtime_root):
-            raise ValueError('remote release/runtime root mismatch')
-        if (result.get('mode') != cloud.mode or result.get('git_sha') != cloud.expected_sha
-            or result.get('n_leg_paused') != cloud.n_leg_paused
-            or result.get('credential_backend') != credential_backend(cloud)
-            or result.get('status') != ('PRECHECK_OK' if action == 'preflight' else 'BACKEND_SMOKE_OK')):
-            raise ValueError('remote gate evidence mismatch')
+        identity_before = remote_identity(result, cloud, action)
         env = {**os.environ, 'PYTHONSAFEPATH':'1', 'PYTHONPATH':str(release)+':'+str(release/'src'),
                'NODE_PATH':str(args.browser_runtime/'node_modules'),
                'OPEN_TRADER_SMOKE_URL':f"http://127.0.0.1:{client_ports(local)[0]}/"}
@@ -99,7 +121,7 @@ def main():
                 raise ValueError('client changed during browser smoke')
             after = json.loads(checked(['ssh','-o','BatchMode=yes','-o','StrictHostKeyChecking=yes',
                 '-o','ForwardAgent=no','-o','ConnectTimeout=10',local['ssh_alias'],remote]))
-            if after != result:
+            if remote_identity(after, cloud, action) != identity_before:
                 raise ValueError('backend changed during browser smoke')
             client_release(local)
             print('HEALTHY')

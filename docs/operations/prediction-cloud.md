@@ -441,6 +441,11 @@ regressions and the read-only browser scenario, adapting its Prediction-only ent
 without changing ordinary production smoke. Missing evidence ends
 BLOCKED or ROLLBACK. Client, service and remote evidence modes must match; a
 Shadow guard violation or unavailable backend cannot pass.
+In split mode the browser checks cloud `/venues` and a fresh read-only LP
+snapshot, while `/execution/identity` supplies Air's production identity and
+N-leg pause/running state. Both remote smoke observations validate the display
+evidence; only `display_snapshot` may change between them. Release, process,
+start time, roots, mode, pause and credential profile must remain identical.
 For credentialless paused Shadow, smoke also verifies the actual unit/process
 environment remains disabled and read-only; do not manufacture an owner-stop
 attestation or stop an unrelated local production process.
