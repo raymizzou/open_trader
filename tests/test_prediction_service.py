@@ -11592,7 +11592,10 @@ def test_production_server_refuses_to_bind_without_running_owner(
         )
 
 
-def test_owner_loop_keeps_failed_shadow_listener_for_observability(tmp_path: Path) -> None:
+@pytest.mark.parametrize("startup_delay", (0, 6))
+def test_owner_loop_keeps_failed_shadow_listener_for_observability(
+    tmp_path: Path, startup_delay: int
+) -> None:
     trigger = tmp_path / "violate"
     stopped = tmp_path / "stopped"
     violation = {"venue": "predict", "kind": "mutation", "method": "submit_order", "call_chain": []}
@@ -11601,6 +11604,9 @@ def test_owner_loop_keeps_failed_shadow_listener_for_observability(tmp_path: Pat
         port = listener.getsockname()[1]
     script = f'''\
 from pathlib import Path
+import time
+# Deliberately exceed the old total startup budget before loading the service.
+time.sleep({startup_delay})
 import open_trader.prediction_service as service
 
 trigger = Path({str(trigger)!r})
@@ -11634,15 +11640,18 @@ raise SystemExit(service.serve_prediction_service(
         env={"PYTHONPATH": str(Path(__file__).parents[1] / "src")},
     )
     try:
-        deadline = time.monotonic() + 5
+        # Initial bind includes cold Python imports; behavior budgets start after it.
+        deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise AssertionError(f"service exited before binding: exit={process.returncode}")
             try:
                 with socket.create_connection(("127.0.0.1", port), timeout=0.1):
                     break
             except OSError:
                 time.sleep(0.05)
         else:
-            raise AssertionError("shadow service did not bind")
+            raise AssertionError(f"service did not bind within 30s: exit={process.poll()}")
         trigger.write_text("violate", encoding="utf-8")
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
@@ -11669,13 +11678,19 @@ raise SystemExit(service.serve_prediction_service(
     assert stopped.read_text(encoding="utf-8") == "stopped"
 
 
-def test_signal_handler_is_installed_before_runtime_start(tmp_path: Path) -> None:
+@pytest.mark.parametrize("startup_delay", (0, 6))
+def test_signal_handler_is_installed_before_runtime_start(
+    tmp_path: Path, startup_delay: int
+) -> None:
     started = tmp_path / "started"
     stopped = tmp_path / "stopped"
     script = f'''\
 from pathlib import Path
 import os
 import signal
+import time
+# Exercise cold startup independently of the post-start signal shutdown budget.
+time.sleep({startup_delay})
 import open_trader.prediction_service as service
 
 started = Path({str(started)!r})
@@ -11706,14 +11721,28 @@ raise SystemExit(service.serve_prediction_service(
         [sys.executable, "-c", script],
         env={"PYTHONPATH": str(Path(__file__).parents[1] / "src")},
     )
-    assert process.wait(timeout=5) == 0
-    assert started.read_text(encoding="utf-8") == "started"
-    assert stopped.read_text(encoding="utf-8") == "stopped"
+    try:
+        # The invariant starts inside FakeRuntime.start, after cold module imports.
+        # Keep a separate bounded startup allowance and the strict shutdown budget.
+        deadline = time.monotonic() + 30
+        while not started.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert started.exists(), (
+            f"runtime start marker missing; child exit={process.poll()}"
+        )
+        assert process.wait(timeout=5) == 0
+        assert started.read_text(encoding="utf-8") == "started"
+        assert stopped.read_text(encoding="utf-8") == "stopped"
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
 
 
+@pytest.mark.parametrize("startup_delay", (0, 6))
 @pytest.mark.parametrize("mode", ("shadow", "production"))
 def test_sigterm_stops_prediction_runtime_and_releases_its_lock(
-    tmp_path: Path, mode: str
+    tmp_path: Path, mode: str, startup_delay: int
 ) -> None:
     lock_path = tmp_path / "prediction_arbitrage" / "runtime.lock"
     marker = tmp_path / "stopped"
@@ -11725,6 +11754,9 @@ def test_sigterm_stops_prediction_runtime_and_releases_its_lock(
         port = listener.getsockname()[1]
     script = f'''\
 from pathlib import Path
+import time
+# Deliberately exceed the old total startup budget before loading the service.
+time.sleep({startup_delay})
 from open_trader.prediction_runtime import _RuntimeOwnershipLock
 import open_trader.prediction_service as service
 
@@ -11763,15 +11795,18 @@ raise SystemExit(service.serve_prediction_service(
         env={"PYTHONPATH": str(Path(__file__).parents[1] / "src")},
     )
     try:
-        deadline = time.monotonic() + 5
+        # Initial bind includes cold Python imports; behavior budgets start after it.
+        deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise AssertionError(f"service exited before binding: exit={process.returncode}")
             try:
                 with socket.create_connection(("127.0.0.1", port), timeout=0.1):
                     break
             except OSError:
                 time.sleep(0.05)
         else:
-            raise AssertionError("shadow service did not bind")
+            raise AssertionError(f"service did not bind within 30s: exit={process.poll()}")
         process.terminate()
         assert process.wait(timeout=5) == 0
     finally:

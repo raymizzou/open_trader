@@ -5,6 +5,15 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-30
 
+- PR/main 开发 CI 增加确定性服务路由、N-leg 显式补测及固定 CI / required 汇总；
+  文档豁免有解释，共享/未知改动扩大覆盖，失败/取消/异常跳过按失败处理。
+  复用锁定 Docker 环境与断网测试，标准 Linux runner 保留提交、lock 和失败日志；
+  路由与汇总回归已通过；Linux 首跑发现非 Prediction 并行导入 SDK 的竞态，
+  恢复既有串行策略；趋势修订测试夹具使用不同时间戳/SHA，消除目录枚举顺序依赖，
+  保留严格 r2 断言与生产逻辑；信号测试分开冷启动等待与既有五秒退出预算，失败回收子进程。
+  相邻监听观测/锁释放测试同样隔离冷启动预算，保留五秒状态转换/退出断言并补慢启动回归。
+  真实 Docker 结果以对应 Actions 提交证据为准。未部署。
+
 - #212：开发环境严格消费 uv.lock，分离普通测试与 host-only browser extra，
   固定 Python/uv 镜像摘要及构建后端；补锁文件失配、依赖清单和测试隔离契约回归。
   两个独立缓存/干净宿主环境安装的 98 项 Python 依赖一致；定向宿主测试通过。

@@ -1,0 +1,167 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      plan: ${{ steps.route.outputs.plan }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Test routing and fail-closed aggregation
+        run: python3 -m unittest discover -s tests -p 'test_ci_*.py' -v
+      - name: Route changed paths
+        id: route
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python3 scripts/ci_plan.py plan
+
+  gateway:
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.plan).scopes, 'gateway')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Run offline gateway development tests
+        env:
+          TEST_N_LEG: ${{ fromJSON(needs.plan.outputs.plan).test_n_leg }}
+        run: bash scripts/run_ci_service.sh "gateway" "$TEST_N_LEG" "${{ runner.temp }}/ci-evidence"
+      - name: Preserve exact-SHA test and dependency evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ci-gateway-${{ github.sha }}
+          path: ${{ runner.temp }}/ci-evidence
+          retention-days: 3
+          if-no-files-found: error
+
+  legacy:
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.plan).scopes, 'legacy')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Run offline legacy development tests
+        env:
+          TEST_N_LEG: ${{ fromJSON(needs.plan.outputs.plan).test_n_leg }}
+        run: bash scripts/run_ci_service.sh "legacy" "$TEST_N_LEG" "${{ runner.temp }}/ci-evidence"
+      - name: Preserve exact-SHA test and dependency evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ci-legacy-${{ github.sha }}
+          path: ${{ runner.temp }}/ci-evidence
+          retention-days: 3
+          if-no-files-found: error
+
+  account:
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.plan).scopes, 'account')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Run offline account development tests
+        env:
+          TEST_N_LEG: ${{ fromJSON(needs.plan.outputs.plan).test_n_leg }}
+        run: bash scripts/run_ci_service.sh "account" "$TEST_N_LEG" "${{ runner.temp }}/ci-evidence"
+      - name: Preserve exact-SHA test and dependency evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ci-account-${{ github.sha }}
+          path: ${{ runner.temp }}/ci-evidence
+          retention-days: 3
+          if-no-files-found: error
+
+  prediction:
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.plan).scopes, 'prediction')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Run offline prediction development tests
+        env:
+          TEST_N_LEG: ${{ fromJSON(needs.plan.outputs.plan).test_n_leg }}
+        run: bash scripts/run_ci_service.sh "prediction" "$TEST_N_LEG" "${{ runner.temp }}/ci-evidence"
+      - name: Preserve exact-SHA test and dependency evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ci-prediction-${{ github.sha }}
+          path: ${{ runner.temp }}/ci-evidence
+          retention-days: 3
+          if-no-files-found: error
+
+  trend_curve:
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.plan).scopes, 'trend-curve')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Run offline trend-curve development tests
+        env:
+          TEST_N_LEG: ${{ fromJSON(needs.plan.outputs.plan).test_n_leg }}
+        run: bash scripts/run_ci_service.sh "trend-curve" "$TEST_N_LEG" "${{ runner.temp }}/ci-evidence"
+      - name: Preserve exact-SHA test and dependency evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ci-trend-curve-${{ github.sha }}
+          path: ${{ runner.temp }}/ci-evidence
+          retention-days: 3
+          if-no-files-found: error
+
+  required:
+    name: required
+    if: always()
+    needs: [plan, gateway, legacy, account, prediction, trend_curve]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require every selected job to succeed
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$NEEDS_JSON" | python3 scripts/ci_plan.py required | tee -a "$GITHUB_STEP_SUMMARY"
