@@ -5,6 +5,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-01
 
+- Candidate 测试 fixture 修复：readiness 使用局部可控 mono/wall 时钟和真实 monitor 循环，保留生产 30/60 秒阈值，验证 0→29→31→61→91 的到期读取、最新 checked_at 与正常停止；移除 80ms/40ms 机器速度依赖，外层时限仅防挂起。Trend 登录恢复测试用一致的长 numeric UID 哨兵，递增 time_ns 保持报告唯一并固定无关 `222` 路径碰撞；整段输出 token/UID 不出现、禁付费端点与禁直接通知断言完整保留。
+- 定向 Docker RED→GREEN：旧 fixture 在 120ms 启动及无关路径数字下 2 failed，修复后 2 passed；指定 monitor、trend CLI、imported-exit 与 multi-sell 四文件 277 passed（52.33 秒）。未复现的 imported-exit 首 tick 断言仅追加 durable session 诊断，原 12 组和 once-only/资金/ID/GTD 检查保留；未改生产文件、生产阈值/超时或门禁，未提交、合并或部署。
+
 - #205 monitor 诊断按操作来源及精确 event/relation/validation 刷新目标恢复：操作开始捕获当前故障 marker，仅在同一操作完整成功且 marker 未被后续错误替换时清除 `last_error`；合法 unavailable book 不阻止 transport 恢复，兄弟操作、重复新错误、部分发布、持久化/订阅失败与 APR 超限仍保留诊断及历史记录。Universe 完整恢复复用同一保护，原失败 flags 与业务判断保留。
 - 定向 Docker RED→GREEN，完整 `test_polymarket_monitor.py` 232 passed（37.30 秒），覆盖并发、身份/目标集合隔离、发布失败、APR 限制与既有 universe 恢复。Validation 已 terminal 后的机会刷新故障缺少普通同来源重试出口，保守保留；原非 terminal 校验重试完整成功可恢复自己的诊断，LLM 调度保持原语义。
 

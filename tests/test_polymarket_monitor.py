@@ -5910,33 +5910,62 @@ def test_background_monitor_refreshes_readiness_before_it_becomes_stale(
 ) -> None:
     import open_trader.polymarket_monitor as monitor_module
 
+    interval = monitor_module.READINESS_REFRESH_SECONDS
+    freshness = monitor_module.READINESS_FRESHNESS_SECONDS
+    assert (interval, freshness) == (30, 60)
+    assert interval < freshness
+    elapsed = 0
+    steps = iter((interval - 1, interval + 1, 2 * interval + 1, 3 * interval + 1))
+    readiness_calls: list[int] = []
+    turns: list[tuple[int, tuple[int, ...]]] = []
+    monkeypatch.setattr(monitor_module, "time", ns(monotonic=lambda: elapsed))
+
     class LiveTrading(FakeTrading):
         def readiness_snapshot(self) -> dict[str, object]:
+            readiness_calls.append(elapsed)
             value = super().readiness_snapshot()
-            value["checked_at"] = datetime.now(UTC)
+            value["checked_at"] = NOW + timedelta(seconds=elapsed)
             return value
 
     class LiveStream(FakeStream):
         async def __anext__(self) -> object:
-            await asyncio.sleep(0.005)
-            return object()
+            nonlocal elapsed
+            turns.append((elapsed, tuple(readiness_calls)))
+            next_step = next(steps, None)
+            if next_step is None:
+                monitor._stop_event.set()
+            else:
+                elapsed = next_step
+            # Keep book facts fresh through the existing SDK/stream pipeline.
+            for book in FakePublicClient.books.values():
+                book.timestamp = NOW + timedelta(seconds=elapsed)
+            await asyncio.sleep(0)
+            return ns(token_id="yes-1")
 
-    monkeypatch.setattr(monitor_module, "READINESS_FRESHNESS_SECONDS", 0.04)
-    monkeypatch.setattr(
-        monitor_module,
-        "READINESS_REFRESH_SECONDS",
-        0.01,
-        raising=False,
-    )
     setup_public([event("e", markets=(market("m"),))])
-    FakePublicClient.streams = [LiveStream()]
+    stream = LiveStream()
+    FakePublicClient.streams = [stream]
     monitor = make_monitor(tmp_path, trading=LiveTrading())
-    monitor._clock = lambda: datetime.now(UTC)
+    monitor._clock = lambda: NOW + timedelta(seconds=elapsed)
 
-    with pytest.raises(asyncio.TimeoutError):
-        asyncio.run(asyncio.wait_for(monitor.run_forever(), timeout=0.08))
+    # Completion uses normal stop; this wall-time limit only catches hangs.
+    asyncio.run(asyncio.wait_for(monitor.run_forever(), timeout=10))
 
-    assert monitor.snapshot()["health"]["status"] == "healthy"
+    assert turns == [
+        (0, (0,)),
+        (interval - 1, (0,)),
+        (interval + 1, (0, interval + 1)),
+        (2 * interval + 1, (0, interval + 1, 2 * interval + 1)),
+        (3 * interval + 1, (0, interval + 1, 2 * interval + 1, 3 * interval + 1)),
+    ]
+    assert readiness_calls == [0, interval + 1, 2 * interval + 1, 3 * interval + 1]
+    assert elapsed > freshness
+    snapshot = monitor.snapshot()
+    assert snapshot["readiness"]["checked_at"] == NOW + timedelta(seconds=elapsed)
+    assert snapshot["health"]["readiness_age_seconds"] == 0
+    assert snapshot["health"]["status"] == "healthy"
+    assert monitor._stop_event.is_set()
+    assert stream.closed is True
 
 
 def test_connected_quiet_stream_does_not_degrade_monitor_health(tmp_path: Path) -> None:

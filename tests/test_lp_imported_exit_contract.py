@@ -270,7 +270,7 @@ def test_imported_passive_replacement_lifecycle(
                 assert account.cancel_calls == []
             return
 
-        assert len(account.limit_orders) == 1
+        assert len(account.limit_orders) == 1, store.lp_session("imported-a")
         assert len(account.posts) == 1
         signed = account.limit_orders[0]
         assert signed["token_id"] == TOKEN_ID
