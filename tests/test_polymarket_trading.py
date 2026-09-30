@@ -1489,6 +1489,140 @@ def test_lp_account_snapshot_shared_single_flight_and_ttl() -> None:
         polymarket_trading.time = original_realtime  # type: ignore[misc]
 
 
+def test_guarded_sdk_timestamps_survive_shared_account_cache(monkeypatch):
+    from polymarket.models import OpenOrder, ClobTrade
+    from open_trader.prediction_read_only import PolymarketReadOnlyGuard, guard_polymarket_client, ReadOnlyViolation
+    stamp = '2026-09-30T16:01:02.123456+05:30'
+    expected = datetime.fromisoformat(stamp).astimezone(UTC)
+    condition = '0x' + 'ab'*32
+    order = OpenOrder.model_validate(dict(id='order-1', market=condition, asset_id='123',
+        owner='owner', maker_address=WALLET, side='BUY', price='0.5', original_size='10',
+        size_matched='0', outcome='YES', order_type='GTD', status='LIVE',
+        created_at=stamp, expiration=int(expected.timestamp())))
+    trade = ClobTrade.model_validate(dict(id='trade-1', market=condition, asset_id='123',
+        owner='owner', maker_address=WALLET, taker_order_id='order-1', side='BUY',
+        trader_side='TAKER', price='0.5', size='1', outcome='YES', status='MATCHED',
+        fee_rate_bps='0', bucket_index=0, transaction_hash='0x'+'cd'*32, maker_orders=[],
+        match_time=stamp, last_update=stamp))
+    sdk = FakeClient()
+    monkeypatch.setattr(sdk, 'list_open_orders', lambda **kwargs: [order])
+    monkeypatch.setattr(sdk, 'list_account_trades', lambda **kwargs: [trade])
+    monkeypatch.setattr(sdk, 'list_positions', lambda **kwargs: [])
+    adapter = PolymarketTradingClient(TradingConfig(SIGNER, WALLET), sdk)
+    monkeypatch.setattr(adapter, 'lp_market_metadata', lambda ids: {})
+    guard = PolymarketReadOnlyGuard()
+    with guard_polymarket_client(adapter, guard):
+        first = adapter.lp_account_snapshot_shared()
+        second = adapter.lp_account_snapshot_shared()
+        for field in ('created_at', 'expiration'):
+            assert type(first['open_orders'][0][field]) is datetime
+            assert first['open_orders'][0][field] == (expected if field == 'created_at'
+                else expected.replace(microsecond=0))
+        for field in ('matched_at', 'updated_at'):
+            assert type(first['account_trades'][0][field]) is datetime
+            assert first['account_trades'][0][field] == expected
+        assert first['open_orders_complete'] is True and first['positions_complete'] is True
+        assert first['display_trades_complete'] is True
+        first['open_orders'][0]['price'] = Decimal('0.1')
+        first['account_trades'][0]['price'] = Decimal('0.1')
+        assert second['open_orders'][0]['price'] == Decimal('0.5')
+        assert second['account_trades'][0]['price'] == Decimal('0.5')
+        assert guard.attempts == []
+        # Raw execution-round models remain protected, never deepcopy-compatible.
+        account_round = adapter.lp_account_round_begin()
+        try:
+            with pytest.raises(ReadOnlyViolation):
+                adapter.lp_open_orders_for_round(account_round)
+        finally:
+            adapter.lp_account_round_end(account_round)
+        assert guard.attempts[-1]['method'] == 'raw_internal'
+
+
+@pytest.mark.parametrize('selected', [False, True])
+@pytest.mark.parametrize('empty_page', [False, True])
+def test_reward_catalog_cancels_at_sdk_page_boundary(selected, empty_page):
+    from polymarket.pagination import Page, Paginator
+    stop = threading.Event()
+    fetched = []
+    clients = []
+    class Public:
+        def __init__(self):
+            self.closed = False
+            clients.append(self)
+        def rewards(self, sponsored):
+            def fetch(cursor):
+                fetched.append((sponsored, cursor))
+                if cursor is not None:
+                    return Page(items=(), has_more=False)
+                stop.set()
+                return Page(items=() if empty_page else ({'condition_id':'condition-a'},),
+                            has_more=True, next_cursor='next')
+            return Paginator(fetch)
+        def list_current_rewards(self, *, sponsored):
+            return self.rewards(sponsored)
+        def list_market_rewards(self, *, condition_id, sponsored):
+            return self.rewards(sponsored)
+        def close(self):
+            self.closed = True
+    adapter = PolymarketTradingClient(TradingConfig(SIGNER, WALLET), FakeClient(),
+                                     public_client_factory=Public)
+    # One worker keeps the selected-source cancellation boundary deterministic.
+    from unittest.mock import patch
+    with patch.object(polymarket_trading, 'LP_REWARD_SELECTED_MAX_CONCURRENCY', 1):
+        result = adapter.lp_reward_catalog(stop_event=stop,
+            **({'condition_ids':('condition-a',)} if selected else {}))
+    assert fetched == [(False, None)]
+    assert all(client.closed for client in clients)
+    assert result['state'] == 'unknown' and result['complete'] is False
+    if selected:
+        assert 'reward_read_cancelled' in result['markets'][0]['reason_codes']
+    else:
+        assert result['reason'] == 'cancelled'
+
+
+def test_guarded_sdk_book_timestamp_copies_as_scalar():
+    from copy import deepcopy
+    from polymarket.models import OrderBook
+    from open_trader.prediction_read_only import PolymarketReadOnlyGuard
+    book = OrderBook.model_validate(dict(market='0x'+'ab'*32, asset_id='123',
+        timestamp='1790750000123', bids=[], asks=[], min_order_size='5', tick_size='0.01',
+        neg_risk=False, hash='book-hash'))
+    guard = PolymarketReadOnlyGuard()
+    normalized = polymarket_trading._lp_book(guard.protect(book))
+    copied = deepcopy(normalized)
+    assert type(copied['timestamp']) is datetime
+    assert type(copied['source_timestamp']) is datetime
+    assert copied['timestamp'] == book.timestamp
+    assert copied['source_timestamp'] == book.timestamp
+    assert guard.attempts == []
+
+
+@pytest.mark.parametrize('reader', ['iter_items', 'all', 'pages_without_iter'])
+def test_reward_catalog_cancellation_keeps_legacy_iterator_compatibility(reader):
+    stop = threading.Event()
+    closed = []
+    class Rows:
+        def items(self):
+            stop.set()
+            yield {'condition_id':'condition-a'}
+            raise AssertionError('cancelled iterator advanced')
+    setattr(Rows, 'all' if reader == 'all' else 'iter_items', Rows.items)
+    if reader == 'pages_without_iter':
+        Rows.first_page = lambda self: (_ for _ in ()).throw(AssertionError('unexpected first_page'))
+    class Public:
+        def list_current_rewards(self, *, sponsored):
+            assert not sponsored
+            return Rows()
+        def close(self):
+            closed.append(True)
+    adapter = PolymarketTradingClient(TradingConfig(SIGNER, WALLET), FakeClient(),
+                                     public_client_factory=Public)
+    result = adapter.lp_reward_catalog(stop_event=stop)
+    assert result['state'] == 'unknown' and result['complete'] is False
+    assert result['reason'] == 'cancelled'
+    assert closed == [True]
+
+
 def test_lp_reward_snapshot_preserves_identity_assets_and_scope() -> None:
     class RewardTransport:
         def __init__(self) -> None:

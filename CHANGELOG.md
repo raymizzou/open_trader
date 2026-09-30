@@ -5,6 +5,11 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-30
 
+- #204 云端启动修复：SDK 受保护时间戳经 ISO 标量还原后进入共享账户/盘口缓存，
+  保留时区瞬间与精度；订单过期时间同样规范化，原始 SDK 执行对象仍不可复制或解包。
+  全量及指定市场奖励目录在行/页边界响应停止信号，含空页；取消保持 UNKNOWN/不完整并关闭资源，
+  不延长停止超时、不改只读 guard。回归重现真实 raw_internal 与停止后续页读取；尚未重新部署验证。
+
 - #204 部署前 Smoke 修复：split 看板分别核验云端只读 LP 快照和 Air 执行身份/暂停状态；
   两主机冒烟前后分别验证快照，仅允许 display_snapshot 刷新，仍严格核对发布、进程、根目录、
   模式、暂停和凭据 profile。补齐离线 split/standalone 浏览器 fixtures 与缺失/变更身份回归，未部署。

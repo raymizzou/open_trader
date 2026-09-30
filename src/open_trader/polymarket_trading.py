@@ -989,20 +989,48 @@ def _submit_error_detail(exc: BaseException) -> dict[str, str]:
     }
 
 
-def _collect(value: object) -> tuple[object, ...]:
+def _collect(
+    value: object, *, stop_event: threading.Event | None = None
+) -> tuple[object, ...]:
+    def cancellable(items):
+        iterator = iter(items)
+        while True:
+            if stop_event.is_set():
+                raise _RewardReadCancelled
+            try:
+                item = next(iterator)
+            except StopIteration:
+                return
+            if stop_event.is_set():
+                raise _RewardReadCancelled
+            yield item
+
+    if stop_event is not None and stop_event.is_set():
+        raise _RewardReadCancelled
     if value is None:
         return ()
     if isinstance(value, (str, bytes, Mapping)):
         return (value,)
+    # SDK iter_items() hides empty pages. Walk pages so cancellation is
+    # checked before each request, including an empty continuation page.
+    if (stop_event is not None and callable(getattr(value, "first_page", None))
+        and callable(getattr(value, "iter_items", None))):
+        try:
+            pages = iter(value)
+        except TypeError:
+            pass  # Older read adapters expose iter_items() without page iteration.
+        else:
+            return tuple(item for page in cancellable(pages)
+                         for item in cancellable(_field(page, "items", ())))
     for method_name in ("iter_items", "all"):
         method = getattr(value, method_name, None)
         if callable(method):
             try:
-                return tuple(method())
+                return tuple(cancellable(method()) if stop_event is not None else method())
             except TypeError:
                 continue
     try:
-        return tuple(cast(Sequence[object], value))
+        return tuple(cancellable(value) if stop_event is not None else cast(Sequence[object], value))
     except TypeError:
         return (value,)
 
@@ -1244,7 +1272,7 @@ def _lp_book(value: object) -> dict[str, object] | None:
         "condition_id": row.get("condition_id", row.get("market")),
         "token_id": row.get("token_id", row.get("asset_id")),
         "timestamp": timestamp,
-        "source_timestamp": row.get("timestamp"),
+        "source_timestamp": timestamp if isinstance(row.get("timestamp"), datetime) else row.get("timestamp"),
         "bids": [
             {"price": price, "size": size}
             for price, size in sorted(bids.items())
@@ -1299,7 +1327,11 @@ def _lp_order(value: object) -> dict[str, object] | None:
         "outcome": row.get("outcome"),
         "order_type": row.get("order_type"),
         "status": str(row.get("status", "")).upper(),
-        "expiration": row.get("expiration", row.get("expires_at")),
+        "expiration": (
+            _venue_timestamp(row.get("expiration", row.get("expires_at")))
+            if isinstance(row.get("expiration", row.get("expires_at")), datetime)
+            else row.get("expiration", row.get("expires_at"))
+        ),
         "created_at": _venue_timestamp(row.get("created_at")),
     }
 
@@ -1414,7 +1446,9 @@ def _lp_trade(value: object) -> dict[str, object] | None:
 
 def _venue_timestamp(value: object) -> datetime | None:
     if isinstance(value, datetime):
-        moment = value
+        # Guarded SDK datetimes are capability proxies; reconstruct a scalar
+        # before caching facts, without accessing any protected raw internals.
+        moment = datetime.fromisoformat(value.isoformat())
     elif isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
         try:
             number = Decimal(str(value))
@@ -3411,7 +3445,7 @@ class PolymarketTradingClient:
                 if not callable(reader):
                     raise ValueError("selected_reward_reader_unavailable")
                 return condition_id, sponsored, _collect(
-                    reader(condition_id=condition_id, sponsored=sponsored)
+                    reader(condition_id=condition_id, sponsored=sponsored), stop_event=stop_event
                 ), None
             except _RewardReadCancelled:
                 return condition_id, sponsored, (), "reward_read_cancelled"
@@ -3660,8 +3694,8 @@ class PolymarketTradingClient:
                     facts=response_facts,
                 )
                 reward_rows = (
-                    (False, _collect(public.list_current_rewards(sponsored=False))),
-                    (True, _collect(public.list_current_rewards(sponsored=True))),
+                    (False, _collect(public.list_current_rewards(sponsored=False), stop_event=stop_event)),
+                    (True, _collect(public.list_current_rewards(sponsored=True), stop_event=stop_event)),
                 )
             finally:
                 if remove_response_hook is not None:
