@@ -97,6 +97,77 @@ class _GatedAccountClient(_CountingAccountClient):
         return _SDKAccountClient.list_open_orders(self, **kwargs)
 
 
+class _TriggerAccountClient(_CountingAccountClient):
+    def __init__(self, now: datetime) -> None:
+        super().__init__(now)
+        self.open_order = self.open_order.model_copy(
+            update={
+                "side": "BUY",
+                "price": Decimal("0.30"),
+                "original_size": Decimal("10"),
+                "size_matched": Decimal("0"),
+                "status": "LIVE",
+            }
+        )
+        self.open_orders_read = threading.Event()
+
+    def list_positions(self, **kwargs: object) -> list[object]:
+        rows = super().list_positions(**kwargs)
+        self.open_orders_read.set()
+        return rows
+
+
+class _TriggerPublicClient:
+    def __init__(
+        self,
+        now: datetime,
+        *,
+        book_entered: threading.Event | None = None,
+        release_book: threading.Event | None = None,
+    ) -> None:
+        self.now = now
+        self.book_entered = book_entered or threading.Event()
+        self.release_book = release_book or threading.Event()
+        self.release_book.set()
+
+    def get_order_books(self, *, token_ids: list[str]) -> list[dict[str, object]]:
+        token_id = token_ids[0]
+        assert token_id == "0x" + "1" * 64
+        self.book_entered.set()
+        assert self.release_book.wait(timeout=2)
+        self.release_book.set()
+        return [
+            {
+                "market": "0x" + "c" * 64,
+                "condition_id": "0x" + "c" * 64,
+                "asset_id": token_id,
+                "token_id": token_id,
+                "timestamp": self.now,
+                "bids": [{"price": Decimal("0.30"), "size": Decimal("16020")}],
+                "asks": [{"price": Decimal("0.31"), "size": Decimal("100")}],
+                "min_order_size": 1,
+                "tick_size": 0.001,
+                "neg_risk": False,
+                "hash": "book-trigger",
+            }
+        ]
+
+    def close(self) -> None:
+        return None
+
+
+class _FirstReadFailingAccountClient(_TriggerAccountClient):
+    def __init__(self, now: datetime) -> None:
+        super().__init__(now)
+        self.fail_reads = True
+
+    def get_balance_allowance(self, **kwargs: object) -> object:
+        self.calls["balance"] += 1
+        if self.fail_reads:
+            raise OSError("sdk_account_unavailable")
+        return _SDKAccountClient.get_balance_allowance(self, **kwargs)
+
+
 class _ScoringGatedAccountClient(_CountingAccountClient):
     def __init__(self, now: datetime) -> None:
         super().__init__(now)
@@ -304,6 +375,86 @@ def test_round_lifecycle_without_consumer_makes_no_network_calls() -> None:
     adapter.lp_account_round_end(token)
 
     assert all(value == 0 for value in account.calls.values())
+
+
+def test_service_preserves_wait_semantics_for_an_ended_real_round(tmp_path) -> None:
+    service, account, _public = _service(tmp_path, NOW)
+    service.clock = lambda: NOW
+    token = service.exchange.lp_account_round_begin()
+    service.exchange.lp_account_round_end(token)
+
+    result = service.reconcile_facts("session-01", monitor=True, account_round=token)
+
+    assert result[3] == "account_round_invalid"
+    row = service.store.lp_session("session-01")
+    assert row is not None
+    assert row["state"] == "entry_open"
+    assert row["facts_error"] == "account_round_invalid"
+    assert row["reconcile_reason"] == "account_round_invalid"
+    assert row["publication_pending"] is True
+    assert account.calls == {"balance": 0, "orders": 0, "trades": 0, "positions": 0}
+    assert service.store.lp_actions("session-01") == []
+
+
+def test_service_preserves_wait_semantics_for_round_invalidated_while_reading(
+    tmp_path,
+) -> None:
+    adapter, account, _public = _round_adapter()
+    store = PredictionArbitrageStore(tmp_path)
+    store.lp_create_session(
+        "session-01",
+        "session-01-key",
+        state="entry_open",
+        payload=_request(NOW, index=1),
+    )
+    service = PolymarketLPService(store, adapter)
+    service.clock = lambda: NOW
+    token = service.exchange.lp_account_round_begin()
+
+    result_container: list[tuple[object, ...]] = []
+
+    def reconcile() -> None:
+        result_container.append(
+            service.reconcile_facts("session-01", monitor=True, account_round=token)
+        )
+
+    worker = threading.Thread(target=reconcile)
+    worker.start()
+    try:
+        assert account.first_order_started.wait(timeout=2)
+        service.exchange.lp_account_round_invalidate(token)
+        account.release_first_order.set()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+    finally:
+        account.release_first_order.set()
+        worker.join(timeout=2)
+        service.exchange.lp_account_round_end(token)
+
+    result = result_container[0]
+    assert result[3] == "account_round_invalid"
+    row = store.lp_session("session-01")
+    assert row is not None
+    assert row["state"] == "entry_open"
+    assert row["facts_error"] == "account_round_invalid"
+    assert account.calls["balance"] == 1
+
+
+def test_service_keeps_non_round_value_errors_external(tmp_path, monkeypatch) -> None:
+    service, _account, _public = _service(tmp_path, NOW)
+    service.clock = lambda: NOW
+
+    def malformed_snapshot(_request):
+        raise ValueError("account_response_shape_invalid")
+
+    monkeypatch.setattr(service.exchange, "lp_snapshot", malformed_snapshot)
+    result = service.reconcile_facts("session-01", monitor=True)
+
+    assert result[3] == "external_snapshot_unknown"
+    row = service.store.lp_session("session-01")
+    assert row is not None
+    assert row["state"] == "needs_attention"
+    assert row["facts_error"] == "external_snapshot_unknown"
 
 
 @pytest.mark.parametrize("finish", ["end", "invalidate"])
@@ -710,6 +861,481 @@ def test_first_seen_episodes_share_one_service_account_round(tmp_path) -> None:
         episode = store.lp_first_seen_episode(f"episode-{index:02d}")
         assert episode is not None
         assert episode["state"] == "monitoring"
+
+
+def test_first_seen_protection_waits_for_an_ended_real_round(tmp_path) -> None:
+    from tests.test_polymarket_lp import _first_seen_episode
+
+    adapter, account, _public = _round_adapter()
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, adapter)
+    episode = _first_seen_episode(store, "ep-ended", anchors=("order-open",))
+    token = adapter.lp_account_round_begin()
+    adapter.lp_account_round_end(token)
+
+    service._apply_first_seen_protection(episode, token)
+
+    unchanged = store.lp_first_seen_episode("ep-ended")
+    assert unchanged is not None
+    assert unchanged["state"] == "monitoring"
+    assert Decimal(str(unchanged["data_failures"])) == 0
+    assert unchanged["reason_codes"] == []
+    assert unchanged["cancel_targets"] == []
+    assert unchanged["cancel_requested_at"] is None
+    assert store.lp_actions(LP_RESERVED_MANUAL_SESSION_ID) == []
+    assert all(value == 0 for value in account.calls.values())
+
+
+def test_ended_round_does_not_converge_first_seen_canceling_state(tmp_path) -> None:
+    from tests.test_polymarket_lp import _first_seen_episode
+
+    adapter, account, _public = _round_adapter()
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, adapter)
+    _first_seen_episode(store, "ep-canceling", anchors=("order-open",))
+    store.lp_update_first_seen_episode(
+        "ep-canceling",
+        state="canceling",
+        patch={"cancel_targets": ["order-open"], "cancel_failed": []},
+    )
+    token = adapter.lp_account_round_begin()
+    adapter.lp_account_round_end(token)
+
+    episode = store.lp_first_seen_episode("ep-canceling")
+    assert episode is not None
+    service._apply_first_seen_protection(episode, token)
+
+    unchanged = store.lp_first_seen_episode("ep-canceling")
+    assert unchanged is not None
+    assert unchanged["state"] == "canceling"
+    assert unchanged["cancel_targets"] == ["order-open"]
+    assert unchanged["canceled_order_ids"] == []
+    assert store.lp_actions(LP_RESERVED_MANUAL_SESSION_ID) == []
+    assert all(value == 0 for value in account.calls.values())
+
+
+def test_first_seen_protection_waits_for_real_round_invalidated_while_reading(
+    tmp_path,
+) -> None:
+    from tests.test_polymarket_lp import _first_seen_episode
+
+    adapter, account, _public = _round_adapter()
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, adapter)
+    _first_seen_episode(store, "ep-invalidated", anchors=("order-open",))
+    cancels: list[str] = []
+    adapter.cancel_order = lambda order_id: cancels.append(order_id) or True
+
+    results: list[object] = []
+
+    def tick() -> None:
+        results.append(service.tick())
+
+    worker = threading.Thread(target=tick)
+    worker.start()
+    try:
+        assert account.first_order_started.wait(timeout=2)
+        adapter.lp_account_round_invalidate(service._lp_account_rounds.copy().pop())
+        account.release_first_order.set()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+    finally:
+        account.release_first_order.set()
+        worker.join(timeout=2)
+
+    assert results == [{"state": "none", "session_id": None}]
+    unchanged = store.lp_first_seen_episode("ep-invalidated")
+    assert unchanged is not None
+    assert unchanged["state"] == "monitoring"
+    assert Decimal(str(unchanged["data_failures"])) == 0
+    assert unchanged["reason_codes"] == []
+    assert unchanged["cancel_targets"] == []
+    assert unchanged["cancel_requested_at"] is None
+    assert store.lp_actions(LP_RESERVED_MANUAL_SESSION_ID) == []
+    assert cancels == []
+    assert account.calls["balance"] == 1
+    assert account.calls["orders"] == 1
+
+
+def test_store_first_seen_update_fence_rejects_in_one_transaction(tmp_path) -> None:
+    from tests.test_polymarket_lp import _first_seen_episode
+
+    store = PredictionArbitrageStore(tmp_path)
+    _first_seen_episode(store, "ep-store-fence")
+    episode = store.lp_update_first_seen_episode(
+        "ep-store-fence", patch={"data_failures": 3}
+    )
+    assert store.lp_advance_trade_generation(store.lp_trade_generation())
+
+    with pytest.raises(ValueError, match="^account_round_invalid$"):
+        store.lp_update_first_seen_episode(
+            "ep-store-fence",
+            patch={"data_failures": 99},
+            expected_generation=0,
+        )
+
+    unchanged = store.lp_first_seen_episode("ep-store-fence")
+    assert unchanged == episode
+    updated = store.lp_update_first_seen_episode(
+        "ep-store-fence",
+        patch={"data_failures": 4},
+        expected_generation=1,
+    )
+    assert updated["data_failures"] == 4
+
+
+class _FailingPublicClient:
+    def get_order_books(self, *, token_ids: list[str]) -> list[dict[str, object]]:
+        raise OSError("sdk_book_unavailable")
+
+    def close(self) -> None:
+        return None
+
+
+def test_successful_cancel_retry_receipt_survives_its_own_generation_fence(
+    tmp_path,
+) -> None:
+    from tests.test_polymarket_lp import _first_seen_episode
+
+    now = datetime.now(UTC)
+    account = _TriggerAccountClient(now)
+    public = _TriggerPublicClient(now)
+    adapter = PolymarketTradingClient(
+        TradingConfig("0x" + "1" * 40, "0x" + "2" * 40),
+        account,
+        public_client_factory=lambda: public,
+    )
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, adapter, clock=lambda: datetime.now(UTC))
+    _first_seen_episode(store, "ep-retry", anchors=("order-open",))
+    before = store.lp_update_first_seen_episode(
+        "ep-retry",
+        state="canceling",
+        patch={
+            "cancel_targets": ["order-open"],
+            "cancel_failed": ["order-open"],
+            "blocked_notified": False,
+        },
+    )
+    notifications: list[object] = []
+    cancels: list[str] = []
+
+    def cancel_order(order_id: str) -> object:
+        cancels.append(order_id)
+        return {"canceled": [order_id], "not_canceled": {}}
+
+    adapter.cancel_order = cancel_order
+    service.set_protection_notifier(lambda *_args, **_kwargs: notifications.append(1))
+    token = adapter.lp_account_round_begin(store.lp_trade_generation)
+
+    service._apply_first_seen_protection(before, token)
+
+    after = store.lp_first_seen_episode("ep-retry")
+    assert after is not None
+    assert after["state"] == "canceling"
+    assert after["cancel_failed"] == []
+    assert after["canceled_order_ids"] == ["order-open"]
+    assert after["cancel_requested_at"] is not None
+    assert after["notification_sent"] is True
+    assert cancels == ["order-open"]
+    assert notifications
+    assert store.lp_actions(LP_RESERVED_MANUAL_SESSION_ID)
+
+
+def test_conservative_cancel_receipt_survives_its_own_generation_fence(
+    tmp_path,
+) -> None:
+    from tests.test_polymarket_lp import _first_seen_episode
+
+    now = datetime.now(UTC)
+    account = _TriggerAccountClient(now)
+    adapter = PolymarketTradingClient(
+        TradingConfig("0x" + "1" * 40, "0x" + "2" * 40),
+        account,
+        public_client_factory=_FailingPublicClient,
+    )
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, adapter, clock=lambda: datetime.now(UTC))
+    _first_seen_episode(store, "ep-conservative", anchors=("order-open",))
+    before = store.lp_update_first_seen_episode(
+        "ep-conservative",
+        patch={"data_failures": 9, "blocked_notified": False},
+    )
+    notifications: list[object] = []
+    cancels: list[str] = []
+
+    def cancel_order(order_id: str) -> object:
+        cancels.append(order_id)
+        return {"canceled": [order_id], "not_canceled": {}}
+
+    adapter.cancel_order = cancel_order
+    service.set_protection_notifier(lambda *_args, **_kwargs: notifications.append(1))
+    token = adapter.lp_account_round_begin(store.lp_trade_generation)
+
+    service._apply_first_seen_protection(before, token)
+
+    after = store.lp_first_seen_episode("ep-conservative")
+    assert after is not None
+    assert after["state"] == "canceling"
+    assert after["cancel_reason"] == "book_unreliable"
+    assert after["cancel_failed"] == []
+    assert after["canceled_order_ids"] == ["order-open"]
+    assert after["cancel_requested_at"] is not None
+    assert after["notification_sent"] is True
+    assert cancels == ["order-open"]
+    assert notifications
+    assert store.lp_actions(LP_RESERVED_MANUAL_SESSION_ID)
+
+
+def test_post_read_invalidation_cannot_relabel_returned_rows(
+    tmp_path, monkeypatch,
+) -> None:
+    from tests.test_polymarket_lp import _first_seen_episode
+
+    now = datetime.now(UTC)
+    account = _TriggerAccountClient(now)
+    public = _TriggerPublicClient(now)
+    adapter = PolymarketTradingClient(
+        TradingConfig("0x" + "1" * 40, "0x" + "2" * 40),
+        account,
+        public_client_factory=lambda: public,
+    )
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, adapter, clock=lambda: datetime.now(UTC))
+    before = _first_seen_episode(
+        store,
+        "ep-post-read",
+        anchors=("order-open",),
+    )
+    before = store.lp_update_first_seen_episode(
+        "ep-post-read",
+        patch={"data_failures": 3, "blocked_notified": True},
+    )
+    notifications: list[object] = []
+    cancels: list[str] = []
+    original_read = adapter.lp_open_orders_for_round
+
+    def read_then_invalidate(token: object) -> list[dict[str, object]]:
+        rows = original_read(token)
+        adapter.lp_account_round_invalidate(token)
+        return rows
+
+    adapter.lp_open_orders_for_round = read_then_invalidate
+    adapter.cancel_order = lambda order_id: cancels.append(order_id) or True
+    service.set_protection_notifier(lambda *_args, **_kwargs: notifications.append(1))
+    token = adapter.lp_account_round_begin(store.lp_trade_generation)
+
+    service._apply_first_seen_protection(before, token)
+
+    unchanged = store.lp_first_seen_episode("ep-post-read")
+    assert unchanged == before
+    assert cancels == []
+    assert notifications == []
+    assert store.lp_actions(LP_RESERVED_MANUAL_SESSION_ID) == []
+
+
+def test_invalid_round_after_external_read_failure_waits_without_unscoped_retry(
+    tmp_path, monkeypatch,
+) -> None:
+    from tests.test_polymarket_lp import _first_seen_episode
+
+    now = datetime.now(UTC)
+    account = _FirstReadFailingAccountClient(now)
+    public = _TriggerPublicClient(now)
+    adapter = PolymarketTradingClient(
+        TradingConfig("0x" + "1" * 40, "0x" + "2" * 40),
+        account,
+        public_client_factory=lambda: public,
+    )
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, adapter, clock=lambda: datetime.now(UTC))
+    before = _first_seen_episode(
+        store,
+        "ep-external-invalid",
+        anchors=("order-open",),
+        baseline_front="12000",
+    )
+    before = store.lp_update_first_seen_episode(
+        "ep-external-invalid",
+        patch={"data_failures": 9, "blocked_notified": False},
+    )
+    notifications: list[object] = []
+    cancels: list[str] = []
+    adapter.cancel_order = lambda order_id: cancels.append(order_id) or True
+    service.set_protection_notifier(lambda *_args, **_kwargs: notifications.append(1))
+    token = adapter.lp_account_round_begin(store.lp_trade_generation)
+    original_failure = service._first_seen_data_failure
+
+    def fail_then_invalidate(episode, reason, *, gate_open):
+        result = original_failure(episode, reason, gate_open=gate_open)
+        adapter.lp_account_round_invalidate(token)
+        return result
+
+    monkeypatch.setattr(
+        service, "_first_seen_data_failure", fail_then_invalidate
+    )
+
+    service._apply_first_seen_protection(before, token)
+
+    unchanged = store.lp_first_seen_episode("ep-external-invalid")
+    assert unchanged == before
+    assert account.calls["balance"] == 1
+    assert cancels == []
+    assert notifications == []
+    assert store.lp_actions(LP_RESERVED_MANUAL_SESSION_ID) == []
+
+    account.fail_reads = False
+    fresh_token = adapter.lp_account_round_begin(store.lp_trade_generation)
+    service._apply_first_seen_protection(unchanged, fresh_token)
+
+    recovered = store.lp_first_seen_episode("ep-external-invalid")
+    assert recovered is not None
+    assert recovered["state"] == "monitoring"
+    assert recovered["data_failures"] == 0
+    assert account.calls["balance"] == 2
+    assert account.calls["orders"] == 1
+    assert cancels == []
+
+
+@pytest.mark.parametrize("blocked_notified", [False, True])
+def test_register_fence_rejection_waits_without_touching_first_seen_episode(
+    tmp_path, monkeypatch, blocked_notified,
+) -> None:
+    from tests.test_polymarket_lp import _first_seen_episode
+
+    now = datetime.now(UTC)
+    account = _TriggerAccountClient(now)
+    public = _TriggerPublicClient(now)
+    adapter = PolymarketTradingClient(
+        TradingConfig("0x" + "1" * 40, "0x" + "2" * 40),
+        account,
+        public_client_factory=lambda: public,
+    )
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, adapter, clock=lambda: datetime.now(UTC))
+    episode = _first_seen_episode(
+        store,
+        "ep-register-fence",
+        anchors=("order-open",),
+    )
+    episode = store.lp_update_first_seen_episode(
+        "ep-register-fence",
+        patch={
+            "data_failures": 3,
+            "blocked_notified": blocked_notified,
+        },
+    )
+    notifications: list[object] = []
+    cancels: list[str] = []
+    adapter.cancel_order = lambda order_id: cancels.append(order_id) or True
+    service.set_protection_notifier(lambda *_args, **_kwargs: notifications.append(1))
+    original_register = store.lp_register_fenced_actions
+    register_injections = 0
+
+    def advance_then_register(*args: object, **kwargs: object):
+        nonlocal register_injections
+        register_injections += 1
+        assert store.lp_advance_trade_generation(store.lp_trade_generation())
+        return original_register(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(store, "lp_register_fenced_actions", advance_then_register)
+
+    results: list[object] = []
+
+    def tick() -> None:
+        results.append(service.tick())
+
+    worker = threading.Thread(target=tick)
+    worker.start()
+    try:
+        assert account.open_orders_read.wait(timeout=2)
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+    finally:
+        worker.join(timeout=2)
+
+    assert results == [{"state": "none", "session_id": None}]
+    assert register_injections == 1
+    unchanged = store.lp_first_seen_episode("ep-register-fence")
+    assert unchanged == episode
+    assert notifications == []
+    assert cancels == []
+    assert store.lp_actions(LP_RESERVED_MANUAL_SESSION_ID) == []
+
+
+def test_book_read_invalidation_waits_then_next_real_round_can_cancel(
+    tmp_path, monkeypatch,
+) -> None:
+    from tests.test_polymarket_lp import _first_seen_episode
+
+    now = datetime.now(UTC)
+    account = _TriggerAccountClient(now)
+    book_entered = threading.Event()
+    release_book = threading.Event()
+    public = _TriggerPublicClient(
+        now, book_entered=book_entered, release_book=release_book
+    )
+    adapter = PolymarketTradingClient(
+        TradingConfig("0x" + "1" * 40, "0x" + "2" * 40),
+        account,
+        public_client_factory=lambda: public,
+    )
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, adapter, clock=lambda: datetime.now(UTC))
+    original = _first_seen_episode(
+        store,
+        "ep-book-fence",
+        anchors=("order-open",),
+    )
+    original = store.lp_update_first_seen_episode(
+        "ep-book-fence",
+        patch={"data_failures": 3, "blocked_notified": True},
+    )
+    notifications: list[object] = []
+    cancels: list[str] = []
+    def cancel_order(order_id: str) -> object:
+        cancels.append(order_id)
+        return {"canceled": [order_id], "not_canceled": {}}
+
+    adapter.cancel_order = cancel_order
+    service.set_protection_notifier(lambda *_args, **_kwargs: notifications.append(1))
+    token = adapter.lp_account_round_begin(store.lp_trade_generation)
+
+    result_container: list[BaseException | None] = []
+
+    def apply_stale() -> None:
+        try:
+            service._apply_first_seen_protection(original, token)
+            result_container.append(None)
+        except BaseException as exc:
+            result_container.append(exc)
+
+    worker = threading.Thread(target=apply_stale)
+    worker.start()
+    try:
+        assert book_entered.wait(timeout=2)
+        adapter.lp_account_round_invalidate(token)
+    finally:
+        release_book.set()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+
+    assert result_container == [None]
+    unchanged = store.lp_first_seen_episode("ep-book-fence")
+    assert unchanged == original
+    assert notifications == []
+    assert cancels == []
+    assert store.lp_actions(LP_RESERVED_MANUAL_SESSION_ID) == []
+
+    fresh_token = adapter.lp_account_round_begin(store.lp_trade_generation)
+    service._apply_first_seen_protection(unchanged, fresh_token)
+
+    updated = store.lp_first_seen_episode("ep-book-fence")
+    assert updated is not None
+    assert updated["state"] == "canceling"
+    assert updated["cancel_targets"] == ["order-open"]
+    assert cancels == ["order-open"]
+    assert store.lp_actions(LP_RESERVED_MANUAL_SESSION_ID)
 
 
 def test_incomplete_shared_orders_block_first_seen_until_complete(tmp_path) -> None:

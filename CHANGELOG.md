@@ -14,6 +14,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
   两主机冒烟前后分别验证快照，仅允许 display_snapshot 刷新，仍严格核对发布、进程、根目录、
   模式、暂停和凭据 profile。补齐离线 split/standalone 浏览器 fixtures 与缺失/变更身份回归，未部署。
 
+### LP 交易所订单事实修复（#206、#209）
+
+- 下单在真正调用 POST 前记录发送阶段；本地失败释放占位，发送后的不确定结果保留待核对状态。
+- 账户轮次失效只等待下一轮，不误计外部故障、不发布旧事实；已发送撤单的真实回执仍持久化。
+- 账户读取失败后的保守撤单同样校验原轮次；失效时保留已有状态，下一轮恢复后继续保护。
+
 - #204：完整 Air Dashboard 可通过独立 SSH 隧道显示云端 paused Shadow 的 LP/账户快照；
   Air 保留所有写操作、实时预检、N-leg 状态/历史和执行状态；自动控制及现有资金/轮次区同读 Air，
   云端 cookie/CSRF 不进入本地授权。客户端退出期间允许 ps 短暂撕裂后再核对，持续 PID 不匹配仍拒绝停止。

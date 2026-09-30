@@ -5300,9 +5300,18 @@ class PredictionArbitrageStore:
         *,
         state: str | None = None,
         patch: Mapping[str, object] | None = None,
+        expected_generation: int | None = None,
     ) -> dict[str, object]:
         now = _utc_now()
         with self._transaction() as connection:
+            if expected_generation is not None:
+                generation = connection.execute(
+                    "SELECT generation FROM lp_trade_generation WHERE singleton=1"
+                ).fetchone()
+                if generation is None or int(generation["generation"]) != int(
+                    expected_generation
+                ):
+                    raise ValueError("account_round_invalid")
             row = connection.execute(
                 "SELECT * FROM lp_first_seen_episodes WHERE episode_id=?",
                 (str(episode_id),),

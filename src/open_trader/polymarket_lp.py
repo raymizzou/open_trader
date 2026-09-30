@@ -43,7 +43,13 @@ from .prediction_arbitrage_store import (
     PredictionArbitrageStore,
 )
 from .notifications import beijing_clock
-from .polymarket_trading import LpAccountReadError, LpNewerAccountFacts, _lp_read_stage
+from .polymarket_trading import (
+    LpAccountReadError,
+    LpAccountRoundInvalid,
+    LpNewerAccountFacts,
+    _lp_read_stage,
+    _safe_read_error_chain,
+)
 
 
 STOP_LOSS = Decimal("5")
@@ -130,6 +136,18 @@ logger = logging.getLogger(__name__)
 
 class AutoEntryNotSent(ValueError):
     """A pre-POST guard proved that the automatic entry was not sent."""
+
+
+def _submit_failure_facts(exc: BaseException) -> dict[str, object]:
+    """Persist safe submit failure facts without SDK messages or secrets."""
+
+    chain = _safe_read_error_chain(exc)
+    status = getattr(exc, "status", None)
+    return {
+        "submit_error_chain": chain,
+        "submit_status_code": status if type(status) is int and 100 <= status <= 599 else None,
+        "submit_timeout": bool({"TimeoutError", "ReadTimeout"} & set(chain)),
+    }
 
 
 class _MutationBlocked(RuntimeError):
@@ -8112,7 +8130,7 @@ class PolymarketLPService:
         key: str,
         expiration: int,
         session_id: str | None = None,
-        post: Callable[[object], object] | None = None,
+        post: Callable[[object, Callable[[], None]], object] | None = None,
         release_preparation_lock: Callable[[], None] | None = None,
         apply_lock: tuple[Callable[[], object | None], Callable[[object], None]] | None = None,
     ) -> dict[str, object]:
@@ -8143,6 +8161,11 @@ class PolymarketLPService:
         }
         entry_action_base = {
             "submit_requested_at": _iso(now),
+            "submit_stage": "preparing",
+            "post_started": False,
+            "submit_post_started_at": None,
+            "submit_finished_at": None,
+            "submit_timeout": False,
             "queue_protection_baseline": queue_baseline_summary,
         }
         reward_date = self._now().date().isoformat()
@@ -8227,6 +8250,33 @@ class PolymarketLPService:
         )
         if release_preparation_lock is not None:
             release_preparation_lock()
+        post_started = False
+        post_started_at = None
+        send_receipt_base = dict(entry_action_base)
+
+        def mark_post_started() -> None:
+            nonlocal post_started, post_started_at, send_receipt_base
+            boundary_at = _iso(self._now())
+            # Persist before the adapter call. A failed boundary write therefore
+            # remains a provable pre-POST failure instead of a fabricated send.
+            self.store.lp_update_session(session_id, patch={
+                "submit_stage": "sending", "post_started": True,
+                "submit_post_started_at": boundary_at,
+            })
+            post_started = True
+            post_started_at = boundary_at
+            send_receipt_base = {
+                **send_receipt_base,
+                "submit_stage": "sending",
+                "post_started": True,
+                "submit_post_started_at": boundary_at,
+            }
+
+        def execute_post(signed: object) -> object:
+            if post is None:
+                return self._post_limit(signed, on_post_started=mark_post_started)
+            return post(signed, mark_post_started)
+
         try:
             signed = self._create_limit(
                 token_id=str(request["token_id"]),
@@ -8239,18 +8289,53 @@ class PolymarketLPService:
             signed_order_id = str(_field(signed, "order_id", "") or "")
             if post is not None and signed_order_id:
                 self.store.lp_update_session(session_id,
-                    patch={"entry_order_id": signed_order_id, "owned_order_ids": [signed_order_id]})
+                    patch={
+                        "entry_order_id": signed_order_id,
+                        "owned_order_ids": [signed_order_id],
+                        "submit_stage": "pre_send",
+                    })
                 self.store.lp_upsert_action(session_id, entry_action_key, state="pending",
-                    payload={"role": "entry", "side": "BUY", "order_id": signed_order_id, **entry_action_base})
+                    payload={
+                        "role": "entry", "side": "BUY", "order_id": signed_order_id,
+                        **entry_action_base, "submit_stage": "pre_send",
+                    })
             submit_revision = self.store.lp_session_revision(session_id, trading=True)
-            response = (post or self._post_limit)(signed)
+            response = execute_post(signed)
         except AutoEntryNotSent as exc:
+            stage = str(getattr(exc, "submit_stage", "pre_send_rejected"))
+            failure = _submit_failure_facts(exc)
             self.store.lp_upsert_action(session_id, entry_action_key, state="rejected",
-                payload={"role": "entry", "side": "BUY", "reason": str(exc), **entry_action_base})
+                payload={
+                    "role": "entry", "side": "BUY", "reason": str(exc),
+                    **send_receipt_base, "submit_stage": stage,
+                    "submit_finished_at": _iso(self._now()), **failure,
+                })
             session = self.store.lp_update_session(session_id, state="entry_rejected",
-                patch={"submit_status": "rejected", "reason": str(exc)})
+                patch={
+                    "submit_status": "rejected", "reason": str(exc),
+                    **send_receipt_base, "submit_stage": stage,
+                    "submit_finished_at": _iso(self._now()),
+                    **failure,
+                })
             return self._status_payload(session)
         except Exception as exc:
+            if not post_started:
+                failure = _submit_failure_facts(exc)
+                self.store.lp_upsert_action(session_id, entry_action_key, state="rejected",
+                    payload={
+                        "role": "entry", "side": "BUY", "reason": "prepare_failed",
+                        "error": type(exc).__name__, **send_receipt_base,
+                        "submit_stage": "prepare_failed",
+                        "submit_finished_at": _iso(self._now()), **failure,
+                    })
+                session = self.store.lp_update_session(session_id, state="entry_rejected",
+                    patch={
+                        "submit_status": "rejected", "reason": "prepare_failed",
+                        **send_receipt_base, "submit_stage": "prepare_failed",
+                        "submit_finished_at": _iso(self._now()), **failure,
+                    })
+                return self._status_payload(session)
+            failure = _submit_failure_facts(exc)
             self.store.lp_upsert_action(
                 session_id,
                 entry_action_key,
@@ -8261,34 +8346,56 @@ class PolymarketLPService:
                     "token_id": request["token_id"],
                     "expiration": expiration,
                     "error": type(exc).__name__,
-                    **entry_action_base,
+                    **send_receipt_base, "submit_stage": "send_unknown",
+                    "submit_finished_at": _iso(self._now()),
+                    **failure,
                 },
             )
             session = self.store.lp_update_session(
                 session_id,
                 state="needs_attention",
-                patch={"submit_status": "unknown", "resume_state": "entry_submit_pending"},
+                patch={
+                    "submit_status": "unknown",
+                    "resume_state": "entry_submit_pending",
+                    **send_receipt_base, "submit_stage": "send_unknown",
+                    "submit_finished_at": _iso(self._now()),
+                    **failure,
+                },
             )
             return self._status_payload(session)
         accepted, order_id = self._order_response(response)
+        response_at = _iso(self._now())
         if post is not None and signed_order_id and order_id and signed_order_id != order_id:
             conflict = {"prepared_order_id": signed_order_id, "response_order_id": order_id}
             self.store.lp_upsert_action(session_id, entry_action_key, state="unknown",
-                payload={"role": "entry", "side": "BUY", **conflict, **entry_action_base,
-                         "submit_receipt_at": _iso(self._now())})
+                payload={"role": "entry", "side": "BUY", **conflict,
+                         **send_receipt_base, "submit_stage": "receipt_conflict",
+                         "submit_finished_at": response_at,
+                         "submit_receipt_at": response_at})
             session = self.store.lp_update_session(session_id, state="needs_attention",
                 patch={"submit_status": "unknown", "order_identity_conflict": conflict,
-                       "reconciliation": "order_identity_conflict"})
+                       "reconciliation": "order_identity_conflict",
+                       **send_receipt_base, "submit_stage": "receipt_conflict",
+                       "submit_finished_at": response_at,
+                       "submit_receipt_at": response_at})
             return self._status_payload(session)
         if not accepted and not (
             _field(response, "accepted", None) is False
             or _field(response, "ok", None) is False
             or str(_field(response, "status", "")).upper() in {"REJECTED", "FAILED"}
         ):
+            self.store.lp_upsert_action(session_id, entry_action_key, state="unknown",
+                payload={"role": "entry", "side": "BUY", "token_id": request["token_id"],
+                         "expiration": expiration, **send_receipt_base,
+                         "submit_stage": "send_unknown",
+                         "submit_finished_at": response_at})
             session = self.store.lp_update_session(session_id, state="needs_attention",
-                patch={"submit_status": "unknown", "resume_state": "entry_submit_pending"})
+                patch={"submit_status": "unknown", "resume_state": "entry_submit_pending",
+                       **send_receipt_base, "submit_stage": "send_unknown",
+                       "submit_finished_at": response_at})
             return self._status_payload(session)
         if not accepted:
+            rejected_at = response_at
             self.store.lp_upsert_action(
                 session_id,
                 entry_action_key,
@@ -8299,13 +8406,19 @@ class PolymarketLPService:
                     "token_id": request["token_id"],
                     "expiration": expiration,
                     "order_id": order_id or "",
-                    **entry_action_base,
+                    **send_receipt_base,
+                    "submit_stage": "exchange_rejected",
+                    "submit_finished_at": rejected_at,
+                    "submit_receipt_at": rejected_at,
                 },
             )
             session = self.store.lp_update_session(
                 session_id,
                 state="entry_rejected",
-                patch={"entry_order_id": order_id, "submit_status": "rejected"},
+                patch={"entry_order_id": order_id, "submit_status": "rejected",
+                       **send_receipt_base, "submit_stage": "exchange_rejected",
+                       "submit_finished_at": rejected_at,
+                       "submit_receipt_at": rejected_at},
             )
             return self._status_payload(session)
         self.store.lp_upsert_action(
@@ -8318,8 +8431,10 @@ class PolymarketLPService:
                 "token_id": request["token_id"],
                 "expiration": expiration,
                 "order_id": order_id,
-                **entry_action_base,
-                "submit_receipt_at": _iso(self._now()),
+                **send_receipt_base,
+                "submit_stage": "receipt_received",
+                "submit_finished_at": response_at,
+                "submit_receipt_at": response_at,
             },
         )
         if not order_id:
@@ -8329,6 +8444,10 @@ class PolymarketLPService:
                 patch={
                     "submit_status": "accepted_without_order_id",
                     "resume_state": "entry_submit_pending",
+                    **send_receipt_base,
+                    "submit_stage": "receipt_received",
+                    "submit_finished_at": response_at,
+                    "submit_receipt_at": response_at,
                 },
             )
             return self._status_payload(session)
@@ -8369,6 +8488,10 @@ class PolymarketLPService:
                         "submit_status": "accepted",
                         "owned_order_ids": list(dict.fromkeys([*self._session_order_ids(session), order_id])),
                         "order_history": order_history,
+                        **send_receipt_base,
+                        "submit_stage": "receipt_received",
+                        "submit_finished_at": response_at,
+                        "submit_receipt_at": response_at,
                     },
                 )
                 return self._status_payload(session)
@@ -11212,14 +11335,16 @@ class PolymarketLPService:
         *,
         account_round: object | None = None,
     ) -> Mapping[str, object]:
-        if getattr(self._facts_owner, 'session_id', None):
-            return self._market_read(
-                request,
-                lambda: self._fetch_snapshot(request, account_round=account_round),
-                on_newer_facts=self._invalidate_lp_trade_generation,
-            )
         try:
+            if getattr(self._facts_owner, 'session_id', None):
+                return self._market_read(
+                    request,
+                    lambda: self._fetch_snapshot(request, account_round=account_round),
+                    on_newer_facts=self._invalidate_lp_trade_generation,
+                )
             return self._fetch_snapshot(request, account_round=account_round)
+        except LpAccountRoundInvalid as exc:
+            raise ValueError("account_round_invalid") from exc
         except LpNewerAccountFacts as exc:
             if self._invalidate_lp_trade_generation(exc.observed_trade_generation):
                 raise ValueError("account_round_invalid") from exc
@@ -11317,11 +11442,11 @@ class PolymarketLPService:
             except TypeError:
                 try:
                     value = method()
-                except (LpAccountReadError, LpNewerAccountFacts):
+                except (LpAccountReadError, LpAccountRoundInvalid, LpNewerAccountFacts):
                     raise
                 except Exception as exc:
                     raise ValueError("external_snapshot_unknown") from exc
-            except (LpAccountReadError, LpNewerAccountFacts):
+            except (LpAccountReadError, LpAccountRoundInvalid, LpNewerAccountFacts):
                 raise
             except Exception as exc:
                 raise ValueError("external_snapshot_unknown") from exc
@@ -11575,6 +11700,8 @@ class PolymarketLPService:
                     return None
                 try:
                     return list(reader(account_round))
+                except LpAccountRoundInvalid:
+                    raise
                 except Exception:
                     return None
             reader = getattr(self.exchange, name, None)
@@ -13200,6 +13327,9 @@ class PolymarketLPService:
         failures: dict[str, object] | None,
         *,
         gate_open: bool,
+        account_round: object | None = None,
+        expected_generation: int | None = None,
+        expected_round_generation: int | None = None,
     ) -> dict[str, object] | None:
         """Cancel the protected anchors after ten data outages (issue 159)."""
 
@@ -13211,8 +13341,57 @@ class PolymarketLPService:
         if not gate_open:
             return None
         return self._request_first_seen_protection_cancel(
-            episode, None, reason="book_unreliable", expected_generation=None
+            episode,
+            None,
+            reason="book_unreliable",
+            account_round=account_round,
+            expected_generation=expected_generation,
+            expected_round_generation=expected_round_generation,
         )
+
+    def _first_seen_round_is_current(
+        self,
+        account_round: object | None,
+        round_generation: int | None,
+        trade_generation: int | None,
+    ) -> bool:
+        """Check both the in-memory read generation and durable fence."""
+
+        if account_round is None:
+            return True
+        matches = getattr(self.exchange, "_lp_account_round_matches", None)
+        if not callable(matches):
+            return False
+        try:
+            matches(account_round, round_generation)
+        except LpAccountRoundInvalid:
+            return False
+        reader = getattr(self.store, "lp_trade_generation", None)
+        if trade_generation is None or not callable(reader):
+            return True
+        return int(reader()) == int(trade_generation)
+
+    def _update_first_seen_episode(
+        self,
+        episode_id: str,
+        *,
+        state: str | None = None,
+        patch: Mapping[str, object] | None = None,
+        expected_generation: int | None = None,
+    ) -> dict[str, object] | None:
+        """Persist one account-derived observation or reject it as stale."""
+
+        try:
+            return self.store.lp_update_first_seen_episode(
+                episode_id,
+                state=state,
+                patch=patch,
+                expected_generation=expected_generation,
+            )
+        except ValueError as exc:
+            if str(exc) == "account_round_invalid":
+                return None
+            raise
 
     def _apply_first_seen_protection(
         self,
@@ -13223,15 +13402,45 @@ class PolymarketLPService:
 
         episode_id = str(episode["episode_id"])
         state = str(episode.get("state") or "")
-        rows_by_id = self._first_seen_rows_by_id(account_round)
+        read_round_generation: int | None = None
+        read_trade_generation: int | None = None
+        failure_trade_generation: int | None = None
+        if account_round is not None:
+            # Sample before the call: invalidation after the adapter returns
+            # must never relabel old rows with the next generation.
+            read_round_generation = getattr(account_round, "generation", None)
+            reader = getattr(self.store, "lp_trade_generation", None)
+            failure_trade_generation = (
+                int(reader()) if callable(reader) else None
+            )
+        try:
+            rows_by_id = self._first_seen_rows_by_id(account_round)
+        except LpAccountRoundInvalid:
+            # An ended or superseded read is only a wait: do not turn it
+            # into an outage or authorize protection from stale facts.
+            return
+        if account_round is not None:
+            # This is the fact version established by the completed read.
+            read_trade_generation = getattr(
+                account_round, "trade_generation", None
+            )
+        if not self._first_seen_round_is_current(
+            account_round, read_round_generation, read_trade_generation
+        ):
+            return
 
         if state == "canceling":
             converged = self._converge_first_seen_protection(episode, rows_by_id)
             if converged is not None:
-                self.store.lp_update_first_seen_episode(
+                if not self._first_seen_round_is_current(
+                    account_round, read_round_generation, read_trade_generation
+                ):
+                    return
+                self._update_first_seen_episode(
                     episode_id,
                     state=str(converged.get("state")),
                     patch=converged,
+                    expected_generation=read_trade_generation,
                 )
                 return
             failed = [
@@ -13246,13 +13455,19 @@ class PolymarketLPService:
                     reason=str(episode.get("cancel_reason") or "queue_ahead_ratio"),
                     only_order_ids=failed,
                     account_round=account_round,
-                    expected_generation=getattr(account_round, "trade_generation", None),
+                    expected_generation=read_trade_generation,
+                    expected_round_generation=read_round_generation,
                 )
                 if result is not None:
-                    self.store.lp_update_first_seen_episode(
+                    self._update_first_seen_episode(
                         episode_id,
                         state=str(result.get("state")),
                         patch=result,
+                        expected_generation=(
+                            read_trade_generation
+                            if result.get("state") == "blocked"
+                            else None
+                        ),
                     )
             return
 
@@ -13262,18 +13477,42 @@ class PolymarketLPService:
             failures = self._first_seen_data_failure(
                 episode, "external_snapshot_unknown", gate_open=True
             )
+            if not self._first_seen_round_is_current(
+                account_round,
+                read_round_generation,
+                failure_trade_generation,
+            ):
+                return
             conservative = self._conservative_first_seen_cancel(
-                episode, failures, gate_open=True
+                episode,
+                failures,
+                gate_open=True,
+                account_round=account_round,
+                expected_generation=failure_trade_generation,
+                expected_round_generation=read_round_generation,
             )
             if conservative is not None:
-                self.store.lp_update_first_seen_episode(
+                self._update_first_seen_episode(
                     episode_id,
                     state=str(conservative.get("state")),
                     patch=conservative,
+                    expected_generation=(
+                        failure_trade_generation
+                        if conservative.get("state") == "blocked"
+                        else None
+                    ),
                 )
             elif failures is not None:
-                self.store.lp_update_first_seen_episode(
-                    episode_id, patch=failures
+                if not self._first_seen_round_is_current(
+                    account_round,
+                    read_round_generation,
+                    failure_trade_generation,
+                ):
+                    return
+                self._update_first_seen_episode(
+                    episode_id,
+                    patch=failures,
+                    expected_generation=failure_trade_generation,
                 )
             return
 
@@ -13281,8 +13520,14 @@ class PolymarketLPService:
             # Every anchor reached a terminal state on its own: the episode
             # ends and the token's remaining orders return to position
             # unknown (no chaining, no re-anchoring).
-            self.store.lp_update_first_seen_episode(
-                episode_id, state="terminal"
+            if not self._first_seen_round_is_current(
+                account_round, read_round_generation, read_trade_generation
+            ):
+                return
+            self._update_first_seen_episode(
+                episode_id,
+                state="terminal",
+                expected_generation=read_trade_generation,
             )
             return
 
@@ -13292,22 +13537,42 @@ class PolymarketLPService:
         if anchor_price is None:
             return
         book, reason = self._first_seen_book(token_id)
+        if not self._first_seen_round_is_current(
+            account_round, read_round_generation, read_trade_generation
+        ):
+            return
         if reason is not None:
             failures = self._first_seen_data_failure(
                 episode, reason, gate_open=gate_open
             )
             conservative = self._conservative_first_seen_cancel(
-                episode, failures, gate_open=gate_open
+                episode,
+                failures,
+                gate_open=gate_open,
+                account_round=account_round,
+                expected_generation=read_trade_generation,
+                expected_round_generation=read_round_generation,
             )
             if conservative is not None:
-                self.store.lp_update_first_seen_episode(
+                self._update_first_seen_episode(
                     episode_id,
                     state=str(conservative.get("state")),
                     patch=conservative,
+                    expected_generation=(
+                        read_trade_generation
+                        if conservative.get("state") == "blocked"
+                        else None
+                    ),
                 )
             elif failures is not None:
-                self.store.lp_update_first_seen_episode(
-                    episode_id, patch=failures
+                if not self._first_seen_round_is_current(
+                    account_round, read_round_generation, read_trade_generation
+                ):
+                    return
+                self._update_first_seen_episode(
+                    episode_id,
+                    patch=failures,
+                    expected_generation=read_trade_generation,
                 )
             return
         if not gate_open:
@@ -13364,21 +13629,41 @@ class PolymarketLPService:
             if estimate["state"] in {"monitoring", "unknown", "triggered"}
             else str(estimate["state"])
         )
-        episode = self.store.lp_update_first_seen_episode(
-            episode_id, state=next_state, patch=updated
-        )
         if estimate["state"] != "triggered":
+            if not self._first_seen_round_is_current(
+                account_round, read_round_generation, read_trade_generation
+            ):
+                return
+            self._update_first_seen_episode(
+                episode_id,
+                state=next_state,
+                patch=updated,
+                expected_generation=read_trade_generation,
+            )
             return
+        if not self._first_seen_round_is_current(
+            account_round, read_round_generation, read_trade_generation
+        ):
+            return
+        updated["state"] = next_state
         result = self._request_first_seen_protection_cancel(
-            episode,
+            updated,
             rows_by_id,
             reason="queue_ahead_ratio",
             account_round=account_round,
-            expected_generation=getattr(account_round, "trade_generation", None),
+            expected_generation=read_trade_generation,
+            expected_round_generation=read_round_generation,
         )
         if result is not None:
-            self.store.lp_update_first_seen_episode(
-                episode_id, state=str(result.get("state")), patch=result
+            self._update_first_seen_episode(
+                episode_id,
+                state=str(result.get("state")),
+                patch=result,
+                expected_generation=(
+                    read_trade_generation
+                    if result.get("state") == "blocked"
+                    else None
+                ),
             )
 
     def _blocked_first_seen_cancel(
@@ -13499,6 +13784,7 @@ class PolymarketLPService:
         only_order_ids: list[str] | None = None,
         account_round: object | None = None,
         expected_generation: int | None = None,
+        expected_round_generation: int | None = None,
     ) -> dict[str, object] | None:
         """Cancel every own BUY resting at the first-seen anchor price.
 
@@ -13513,10 +13799,27 @@ class PolymarketLPService:
             return None
         updated = dict(episode)
 
+        if account_round is not None and expected_round_generation is not None:
+            if not self._first_seen_round_is_current(
+                account_round,
+                expected_round_generation,
+                expected_generation,
+            ):
+                return None
+
         if rows_by_id is None:
-            # Data-unreliable path: enumerate targets from one fresh
-            # account read; a failed read blocks this tick and retries.
-            rows_by_id = self._first_seen_rows_by_id(account_round)
+            # Data-unreliable path: retry only inside the caller's original
+            # scoped round; never sample a newer generation for these rows.
+            try:
+                rows_by_id = self._first_seen_rows_by_id(account_round)
+            except LpAccountRoundInvalid:
+                return None
+            if not self._first_seen_round_is_current(
+                account_round,
+                expected_round_generation,
+                expected_generation,
+            ):
+                return None
             if rows_by_id is None:
                 return self._blocked_first_seen_cancel(
                     episode,
@@ -13687,13 +13990,7 @@ class PolymarketLPService:
             )
         except ValueError as exc:
             if str(exc) == "account_round_invalid":
-                return self._blocked_first_seen_cancel(
-                    episode,
-                    updated,
-                    "account_round_invalid",
-                    "共享账户事实已失效",
-                    None,
-                )
+                return None
             raise
 
         canceled: list[str] = []
@@ -13978,15 +14275,21 @@ class PolymarketLPService:
             raise RuntimeError("limit_order_adapter_unavailable")
         return method(**kwargs)
 
-    def _post_limit(self, signed: object) -> object:
+    def _post_limit(
+        self,
+        signed: object,
+        *,
+        on_post_started: Callable[[], None] | None = None,
+    ) -> object:
         self._require_mutation()
         direct = getattr(self.exchange, "lp_post_order", None)
-        if callable(direct):
-            return direct(signed)
         method = getattr(self.exchange, "post_order", None)
-        if not callable(method):
+        adapter = direct if callable(direct) else method if callable(method) else None
+        if adapter is None:
             raise RuntimeError("order_post_adapter_unavailable")
-        return method(signed)
+        if on_post_started is not None:
+            on_post_started()
+        return adapter(signed)
 
     @staticmethod
     def _order_response(response: object) -> tuple[bool, str]:

@@ -24,7 +24,7 @@ from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 from open_trader.notifications import FeishuWebhookNotifier
 
 
-def _hold_preparation_lock_then_exit(path: str, ready: object) -> None:
+def _hold_preparation_lock_then_exit(path: str, ready: object, release: object) -> None:
     import fcntl
 
     lock_path = Path(path)
@@ -32,7 +32,7 @@ def _hold_preparation_lock_then_exit(path: str, ready: object) -> None:
     with lock_path.open("a+") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         ready.set()  # type: ignore[attr-defined]
-        time.sleep(0.2)
+        assert release.wait(timeout=30)  # type: ignore[attr-defined]
 
 
 def test_transient_outage_recovers_after_more_than_two_failures(tmp_path) -> None:
@@ -1945,7 +1945,6 @@ def test_runtime_wakes_probe_deadline_and_retries_failed_feishu_delivery(
     monkeypatch.setattr(runtime_module, "_LP_TICK_SECONDS", 0.005)
     monkeypatch.setattr(runtime_module, "_LP_REWARD_SECONDS", 3600)
     monkeypatch.setattr(runtime_module, "_LP_SHARE_WATCH_SECONDS", 3600)
-    monkeypatch.setattr(runtime_module, "_LP_REWARD_STOP_GRACE_SECONDS", 0.1)
 
     def history_wait(stop_event: threading.Event, seconds: float) -> bool:
         history_wait_calls.append(seconds)
@@ -1981,7 +1980,8 @@ def test_runtime_wakes_probe_deadline_and_retries_failed_feishu_delivery(
     try:
         runtime.start()
         started = True
-        assert history_done.wait(timeout=3)
+        # This bounds the test runner, not the virtual 60s/300s business clock.
+        assert history_done.wait(timeout=30)
         assert not invalid_wait.is_set(), history_wait_calls[-5:]
         assert history_wait_calls
         retry_index = history_wait_calls.index(300.0)
@@ -2297,16 +2297,18 @@ def test_live_preparation_owner_cannot_be_reclaimed(tmp_path: Path) -> None:
     lock_path = data_dir / "prediction_arbitrage" / "lp-preparation.lock"
     context = multiprocessing.get_context("spawn")
     ready = context.Event()
+    release_owner = context.Event()
     owner = context.Process(
         target=_hold_preparation_lock_then_exit,
-        args=(str(lock_path), ready),
+        args=(str(lock_path), ready, release_owner),
     )
     owner.start()
     try:
-        assert ready.wait(3)
+        assert ready.wait(30)
         assert store_b.lp_normalize_interrupted_preparation_items() == 0
     finally:
-        owner.join(3)
+        release_owner.set()
+        owner.join(30)
         assert owner.exitcode == 0
 
     assert store_b.lp_normalize_interrupted_preparation_items() == 1

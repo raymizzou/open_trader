@@ -1700,6 +1700,10 @@ class LpNewerAccountFacts(ValueError):
         self.observed_trade_generation = observed_trade_generation
 
 
+class LpAccountRoundInvalid(ValueError):
+    """The reconciliation scope ended or advanced; facts are only stale."""
+
+
 class LpAccountReadError(ValueError):
     """Safe LP account failure with the provider's fixed retry deadline."""
 
@@ -2210,7 +2214,7 @@ class PolymarketTradingClient:
         """Discard the scope so a late reader can never refill or serve it."""
 
         if not isinstance(token, _LpAccountRound) or token.client is not self:
-            raise ValueError("lp_account_round_invalid")
+            raise LpAccountRoundInvalid("lp_account_round_invalid")
         with token.lock:
             token.active = False
             token.generation += 1
@@ -2220,7 +2224,7 @@ class PolymarketTradingClient:
         """Begin a new generation without waiting for an in-flight read."""
 
         if not isinstance(token, _LpAccountRound) or token.client is not self:
-            raise ValueError("lp_account_round_invalid")
+            raise LpAccountRoundInvalid("lp_account_round_invalid")
         with token.lock:
             if not token.active:
                 return
@@ -2239,7 +2243,7 @@ class PolymarketTradingClient:
         owner = False
         with token.lock:
             if not token.active:
-                raise ValueError("lp_account_round_invalid")
+                raise LpAccountRoundInvalid("lp_account_round_invalid")
             generation = token.generation
             future = token.future
             if future is None:
@@ -2264,8 +2268,8 @@ class PolymarketTradingClient:
                 with token.lock:
                     if token.future is future:
                         token.future = None
-                future.set_exception(ValueError("lp_account_round_invalid"))
-                raise ValueError("lp_account_round_invalid")
+                future.set_exception(LpAccountRoundInvalid("lp_account_round_invalid"))
+                raise LpAccountRoundInvalid("lp_account_round_invalid")
             with token.lock:
                 future.set_result((snapshot, after_generation))
                 if token.future is future:
@@ -2276,12 +2280,12 @@ class PolymarketTradingClient:
                 ):
                     token.future = None
             if not token.active or token.generation != generation:
-                raise ValueError("lp_account_round_invalid")
+                raise LpAccountRoundInvalid("lp_account_round_invalid")
             return snapshot, generation, after_generation
         snapshot, trade_generation = future.result()
         with token.lock:
             if not token.active or token.generation != generation:
-                raise ValueError("lp_account_round_invalid")
+                raise LpAccountRoundInvalid("lp_account_round_invalid")
         return deepcopy(snapshot), generation, trade_generation
 
     def _lp_account_round_matches(
@@ -2289,7 +2293,7 @@ class PolymarketTradingClient:
     ) -> None:
         with token.lock:
             if not token.active or token.generation != generation:
-                raise ValueError("lp_account_round_invalid")
+                raise LpAccountRoundInvalid("lp_account_round_invalid")
 
     def lp_open_orders_for_round(self, token: object) -> list[dict[str, object]]:
         """Return the shared bundle's complete normalized open-order facts."""
@@ -2298,7 +2302,7 @@ class PolymarketTradingClient:
             not isinstance(token, _LpAccountRound)
             or token.client is not self
         ):
-            raise ValueError("lp_account_round_invalid")
+            raise LpAccountRoundInvalid("lp_account_round_invalid")
         account, generation, _trade_generation = self._lp_account_snapshot_for_round(token)
         self._lp_account_round_matches(token, generation)
         if account.get("open_orders_complete") is not True:
@@ -4780,7 +4784,7 @@ class PolymarketTradingClient:
                         not isinstance(account_round, _LpAccountRound)
                         or account_round.client is not self
                     ):
-                        raise ValueError("lp_account_round_invalid")
+                        raise LpAccountRoundInvalid("lp_account_round_invalid")
                     account, account_generation, bundle_trade_generation = (
                         self._lp_account_snapshot_for_round(account_round)
                     )

@@ -1274,7 +1274,7 @@ class LPAutoPool:
             d['intents'][intent_id]=i
             self._event(d,i,'intent',occurred_at=self._stamp(),quantity=i['quantity'],price=i['price'])
         self._update(reserve)
-        def post(signed):
+        def post(signed, mark_post_started):
             from .polymarket_lp import AutoEntryNotSent
             try:
                 latest = self.lp._read_candidate_snapshot(request, now=self._now(), ignore_session_id=session_id)
@@ -1301,7 +1301,7 @@ class LPAutoPool:
                         self._update(lambda d:d['intents'][intent_id].update(state='sending', financial_status='unknown', reconcile_reason='submission_pending'))
                 finally:
                     self.execution._release_global_lock(lock)
-                return self.lp._post_limit(signed)
+                return self.lp._post_limit(signed, on_post_started=mark_post_started)
         result=self.lp._entry_execute(request=request,snapshot=snapshot,facts=facts,now=self._now(),
             key=f'lp-auto:{intent_id}',expiration=expiration_for_review(request['review_at'],now=self._now()),
             session_id=session_id,post=post,release_preparation_lock=release,
