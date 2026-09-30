@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-30
 
+- Docker 测试构建排除 UI 设计稿、macOS Finder 元数据和配置备份，减少无关文件引起的镜像重建；保留依赖层、Git 测试快照及测试所需文档和 fixtures。验证构建缓存复用及单文件变化增量，未部署。
+
 - 为全仓测试补充稳定性原则：保留业务契约与负向断言，将可控业务时钟、完成事件和
   独立真实 watchdog 分开；保留真实集成、超时、取消、清理及性能验证，避免全局时钟污染。
   失败先取证，修复须证明错误行为仍会失败，并重复串行及相关并发/调度场景；禁止靠
