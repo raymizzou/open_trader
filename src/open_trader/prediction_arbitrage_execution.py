@@ -2670,7 +2670,9 @@ class PredictionExecutionService:
                             "scoring_last_success_at"
                         ] = session_scoring_by_order[order_id]
                         continue
-                    if order.get("management") != "manual_read_only" or not order_id:
+                    # Newly imported and additional group orders may not have
+                    # a session observation yet; read their exact venue IDs.
+                    if not order_id:
                         order["scoring_status"] = "unknown"
                         order["scoring_checked_at"] = None
                         order["scoring_last_success_at"] = None
@@ -2680,7 +2682,7 @@ class PredictionExecutionService:
                         status = "unknown"
                         # Deliberately not named `checked_at`: that name is
                         # already the dashboard's account snapshot timestamp.
-                        scoring_read_at: str | None = attempted_at
+                        scoring_read_at: str | None = attempted_at if callable(scoring_reader) else None
                         last_success_at = (
                             self._lp_scoring_observations.get(order_id, {}).get(
                                 "scoring_last_success_at"
@@ -2707,16 +2709,15 @@ class PredictionExecutionService:
                     order["scoring_status"], order["scoring_checked_at"], order[
                         "scoring_last_success_at"
                     ] = scoring_by_order[order_id]
-                live_manual_order_ids = {
+                live_order_ids = {
                     str(order.get("order_id") or "")
                     for order in orders
-                    if order.get("management") == "manual_read_only"
-                    and order.get("order_id")
+                    if order.get("order_id")
                 }
                 self._lp_scoring_observations = {
                     order_id: record
                     for order_id, record in self._lp_scoring_observations.items()
-                    if order_id in live_manual_order_ids
+                    if order_id in live_order_ids
                 }
 
                 # Issue 159: diff this successful account read against the

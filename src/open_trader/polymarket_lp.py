@@ -16264,19 +16264,10 @@ class PolymarketLPService:
             old_passive_record = dict(history.get(old_order) or {})
         expiration: int | None
         expiration_error: str | None = None
-        if session.get("review_at") is not None:
-            try:
-                expiration = expiration_for_review(
-                    _timestamp(session["review_at"], name="review_at"),
-                    now=self._now(),
-                )
-            except ValueError:
-                expiration = None
-                expiration_error = "passive_expiration_too_soon"
-        elif old_passive_record:
+        if old_passive_record and (old_passive_record.get("order_type") or old_passive_record.get("expiration") is not None):
             # An imported replacement inherits only the exact old order's
             # lifecycle type. It can never turn GTD into GTC or extend expiry.
-            order_type = str(old_passive_record.get("order_type") or "").upper()
+            order_type = str(old_passive_record.get("order_type") or "GTD").upper()
             if order_type == "GTC":
                 expiration = None
             elif order_type == "GTD":
@@ -16298,6 +16289,18 @@ class PolymarketLPService:
             else:
                 expiration = None
                 expiration_error = "passive_expiration_invalid"
+        elif session.get("review_at") is not None:
+            try:
+                expiration = expiration_for_review(
+                    _timestamp(session["review_at"], name="review_at"),
+                    now=self._now(),
+                )
+            except ValueError:
+                expiration = None
+                expiration_error = "passive_expiration_too_soon"
+        elif old_passive_record:
+            expiration = None
+            expiration_error = "passive_expiration_invalid"
         else:
             # First managed exit for a BUY-only imported group keeps the
             # existing GTC policy.

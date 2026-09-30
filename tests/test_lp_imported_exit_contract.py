@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -189,6 +189,7 @@ def _active_payload(old_receipt: OpenOrder) -> dict[str, object]:
     }
 
 
+@pytest.mark.parametrize("session_review", [False, True])
 @pytest.mark.parametrize(
     ("order_type", "ttl_seconds"),
     (
@@ -198,7 +199,7 @@ def _active_payload(old_receipt: OpenOrder) -> dict[str, object]:
     ),
 )
 def test_imported_passive_replacement_lifecycle(
-    tmp_path, monkeypatch, order_type: str, ttl_seconds: int | None
+    tmp_path, monkeypatch, order_type: str, ttl_seconds: int | None, session_review: bool
 ) -> None:
     """Valid imports replace once with the original expiry; expired ones wait."""
 
@@ -230,9 +231,12 @@ def test_imported_passive_replacement_lifecycle(
     public = _ImportedExitBook(datetime.now(UTC), bid_price="0.40")
     adapter._public_client_factory = lambda: public
 
+    payload = _active_payload(old_receipt)
+    if session_review:
+        payload["review_at"] = datetime.now(UTC) + timedelta(minutes=30)
     store.lp_create_session(
         "imported-a", "imported-a", state="entry_open",
-        payload=_active_payload(old_receipt),
+        payload=payload,
     )
 
     try:

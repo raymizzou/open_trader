@@ -4832,6 +4832,7 @@ class PredictionArbitrageStore:
         for field in (
             "owned_order_ids",
             "augment_order_ids",
+            "augment_order_id",
             "entry_order_id",
             "passive_exit_order_id",
             "protected_exit_order_id",
@@ -5025,6 +5026,28 @@ class PredictionArbitrageStore:
                 if owner is None:
                     unknown.append(record)
                     continue
+                owner_payload = owner[1]
+                owner_token = str(owner_payload.get("token_id") or "").strip()
+                if not owner_token:
+                    raise ValueError("order_identity_unknown")
+                if owner_token != record["token_id"]:
+                    raise ValueError("order_identity_conflict")
+                order_id = record["order_id"]
+                roles = set()
+                buy_ids = {
+                    str(owner_payload.get("entry_order_id") or ""),
+                    str(owner_payload.get("augment_order_id") or ""),
+                    *(str(value) for value in _items(owner_payload.get("augment_order_ids"))),
+                }
+                if order_id in buy_ids:
+                    roles.add("BUY")
+                if order_id in {
+                    str(owner_payload.get("passive_exit_order_id") or ""),
+                    str(owner_payload.get("protected_exit_order_id") or ""),
+                }:
+                    roles.add("SELL")
+                if roles and roles != {record["side"]}:
+                    raise ValueError("order_identity_conflict")
                 session_id = str(owner[0]["session_id"])
                 first_owner_id = first_owner_id or session_id
                 routed.setdefault(session_id, []).append(record)

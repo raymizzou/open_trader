@@ -293,6 +293,32 @@ def _runtime(tmp_path, **adapter_kwargs):
     return store, adapter, account, lp, execution
 
 
+def test_newly_managed_orders_read_their_own_scoring_before_first_tick(tmp_path):
+    store, adapter, account, lp, execution = _runtime(tmp_path, orders=(
+        _open_order("scoring-a", "BUY", price="0.40", original="10"),
+        _open_order("scoring-b", "BUY", price="0.40", original="10"),
+    ))
+    reads = []
+
+    def scoring(*, order_id):
+        reads.append(order_id)
+        return order_id == "scoring-a"
+
+    account.get_order_scoring = scoring
+    try:
+        dashboard = execution.refresh_lp_dashboard_snapshot()
+        assert dashboard["state"] == "ready"
+        assert len(store.lp_active_sessions()) == 1
+        assert {row["management"] for row in dashboard["orders"]} == {"system_managed"}
+        assert {row["order_id"]: row["scoring_status"] for row in dashboard["orders"]} == {
+            "scoring-a": "true", "scoring-b": "false",
+        }
+        assert sorted(reads) == ["scoring-a", "scoring-b"]
+        assert account.posts == []
+    finally:
+        adapter.close()
+
+
 def test_shared_snapshot_cache_follows_trade_generation(tmp_path) -> None:
     """One generation reuses endpoint reads; a real generation forces a new one."""
 

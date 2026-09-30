@@ -57,6 +57,7 @@ from open_trader.prediction_read_model import (
 )
 from open_trader.prediction_service import create_prediction_server
 from tests.test_prediction_arbitrage_execution import (
+    _ProjectionOnlyLP,
     _cross_service,
     execution_fixture,
     threshold_execution_fixture,
@@ -2309,7 +2310,7 @@ def test_lp_dashboard_account_outage_keeps_newer_public_funnel(tmp_path: Path) -
     save_history(store, "B", first_now + timedelta(seconds=10))
     save_history(store, "C", first_now + timedelta(seconds=10))
     exchange = Exchange()
-    lp = PolymarketLPService(store, exchange, clock=lambda: now[0])
+    lp = _ProjectionOnlyLP(store, exchange, clock=lambda: now[0])
     first_prepared = lp.refresh_price_history()
     assert first_prepared["state"] == "known"
     # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先在库中预置竞争值
@@ -4745,7 +4746,7 @@ def test_lp_dashboard_reward_share_target_status_is_market_scoped(
             "outcome": "YES",
         },
     )
-    service._lp = PolymarketLPService(
+    service._lp = _ProjectionOnlyLP(
         store, object(), clock=lambda: controlled_now[0]
     )
     account_id = service._lp_account_id()
@@ -4840,7 +4841,7 @@ def test_lp_dashboard_reward_share_target_status_is_market_scoped(
             notifier=NullNotifier(),
             lock_path=tmp_path / "share-boundary.lock",
         )
-        boundary_service._lp = PolymarketLPService(
+        boundary_service._lp = _ProjectionOnlyLP(
             store, object(), clock=lambda: datetime.now(UTC)
         )
         boundary_service._clock = lambda: clock[0]
@@ -4906,7 +4907,7 @@ def test_lp_dashboard_reward_share_target_status_is_market_scoped(
             notifier=NullNotifier(),
             lock_path=tmp_path / "share-fresh-boundary.lock",
         )
-        fresh_service._lp = PolymarketLPService(
+        fresh_service._lp = _ProjectionOnlyLP(
             store, object(), clock=lambda: controlled_now[0]
         )
         fresh_service._clock = lambda: clock[0]
@@ -4931,7 +4932,7 @@ def test_lp_dashboard_reward_share_target_status_is_market_scoped(
             notifier=NullNotifier(),
             lock_path=tmp_path / "share-exact-boundary.lock",
         )
-        exact_service._lp = PolymarketLPService(
+        exact_service._lp = _ProjectionOnlyLP(
             store, object(), clock=lambda: controlled_now[0]
         )
         exact_service._clock = lambda: clock[0]
@@ -5580,7 +5581,7 @@ def test_lp_dashboard_share_failures_preserve_unknown_without_order_writes(
             "outcome": "YES",
         },
     )
-    service._lp = PolymarketLPService(
+    service._lp = _ProjectionOnlyLP(
         store, object(), clock=lambda: datetime.now(UTC)
     )
     clock = [0.0]
@@ -5792,7 +5793,7 @@ def test_lp_dashboard_share_failures_preserve_unknown_without_order_writes(
         trading=restart_account,
         notifier=NullNotifier(),
         lock_path=tmp_path / "execution-restart-a.lock",
-        lp=PolymarketLPService(store, restart_account),
+        lp=_ProjectionOnlyLP(store, restart_account),
     )
     restart_service._breaker_open = False
     restart_runtime = _Runtime()
@@ -5820,7 +5821,7 @@ def test_lp_dashboard_share_failures_preserve_unknown_without_order_writes(
         trading=restarted_account,
         notifier=NullNotifier(),
         lock_path=tmp_path / "execution-restarted-a.lock",
-        lp=PolymarketLPService(store, restarted_account),
+        lp=_ProjectionOnlyLP(store, restarted_account),
     )
     restarted_runtime = _Runtime()
     restarted_runtime.store = store  # type: ignore[assignment]
@@ -5849,7 +5850,7 @@ def test_lp_dashboard_share_failures_preserve_unknown_without_order_writes(
         trading=account_b,
         notifier=NullNotifier(),
         lock_path=tmp_path / "execution-restart-b.lock",
-        lp=PolymarketLPService(store, account_b),
+        lp=_ProjectionOnlyLP(store, account_b),
     )
     runtime_b = _Runtime()
     runtime_b.store = store  # type: ignore[assignment]
@@ -6021,7 +6022,7 @@ def test_lp_reward_share_survives_background_reward_refresh(tmp_path: Path) -> N
         trading=account,
         notifier=notifier,
         lock_path=tmp_path / "execution.lock",
-        lp=PolymarketLPService(store, account),
+        lp=_ProjectionOnlyLP(store, account),
     )
     service._clock = lambda: 0.0
     runtime = _Runtime()
@@ -9519,6 +9520,8 @@ def test_paused_n_leg_routes_reject_before_business_work(
                 "original_size": Decimal("100"),
                 "size_matched": Decimal("0"),
                 "remaining_size": Decimal("100"),
+                "order_type": "GTC",
+                "expiration": None,
             }
 
         def readiness_snapshot(self) -> dict[str, object]:
@@ -9538,15 +9541,27 @@ def test_paused_n_leg_routes_reject_before_business_work(
                 "checked_at": datetime.now(UTC),
             }
 
-        def lp_account_snapshot(self) -> dict[str, object]:
+        def lp_account_snapshot(self, *, trade_generation_provider=None) -> dict[str, object]:
+            now = datetime.now(UTC)
             external_calls.append(("lp_account_snapshot", None))
             return {
                 "authenticated": True,
+                "wallet_address": self.config.wallet_address,
+                "account_id": self.config.wallet_address.casefold(),
+                "balance_complete": True,
+                "open_orders_complete": True,
+                "positions_complete": True,
+                "trades_complete": True,
+                "pagination_complete": True,
+                "raw_trades": (),
+                "read_started_at": now,
+                "read_ended_at": now,
+                "trade_generation": trade_generation_provider() if callable(trade_generation_provider) else None,
                 "balance": Decimal("100"),
                 "allowance": Decimal("100"),
                 "open_orders": (dict(self.order),),
                 "positions": (),
-                "checked_at": datetime.now(UTC),
+                "checked_at": now,
             }
 
         def get_order_scoring(self, _order_id: str) -> bool:
@@ -9737,9 +9752,12 @@ def test_paused_n_leg_routes_reject_before_business_work(
     assert lp_status == 200
     assert lp_payload["orders"], sorted(lp_payload) and lp_payload.get("state")
     assert lp_payload["orders"][0]["order_id"] == "manual-order"
-    assert lp_payload["orders"][0]["management"] == "manual_read_only"
+    assert lp_payload["orders"][0]["management"] == "system_managed"
     assert session_status == 200
-    assert session_payload["state"] == "complete"
+    assert session_payload["session_id"] == lp_payload["orders"][0]["session_id"]
+    assert store.lp_session(session_payload["session_id"])["owned_order_ids"] == ["manual-order"]
+    assert store.lp_session("lp-session")["state"] == "complete"
+    assert len(store.lp_sessions()) == 2
     assert report_status == 404
     assert report_payload == {"error": "LP report not found"}
     assert lp_post_status == 202
@@ -9781,15 +9799,27 @@ def test_paused_n_leg_requests_do_not_hold_lp_or_health_responses(
                 "checked_at": datetime.now(UTC),
             }
 
-        def lp_account_snapshot(self) -> dict[str, object]:
+        def lp_account_snapshot(self, *, trade_generation_provider=None) -> dict[str, object]:
+            now = datetime.now(UTC)
             external_calls.append("lp_account_snapshot")
             return {
                 "authenticated": True,
+                "wallet_address": self.config.wallet_address,
+                "account_id": self.config.wallet_address.casefold(),
+                "balance_complete": True,
+                "open_orders_complete": True,
+                "positions_complete": True,
+                "trades_complete": True,
+                "pagination_complete": True,
+                "raw_trades": (),
+                "read_started_at": now,
+                "read_ended_at": now,
+                "trade_generation": trade_generation_provider() if callable(trade_generation_provider) else None,
                 "balance": Decimal("100"),
                 "allowance": Decimal("100"),
                 "open_orders": (),
                 "positions": (),
-                "checked_at": datetime.now(UTC),
+                "checked_at": now,
             }
 
         def lp_reward_catalog(

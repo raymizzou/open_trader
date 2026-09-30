@@ -4,6 +4,8 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from types import SimpleNamespace
 
+import pytest
+
 from open_trader.polymarket_trading import (
     PolymarketTradingClient,
     TradingConfig,
@@ -440,6 +442,49 @@ def test_registered_partial_fill_and_remaining_do_not_regress(tmp_path) -> None:
         assert record["status"] == expected_status
         assert Decimal(str(record["remaining_size"])) == Decimal(expected_remaining)
         assert Decimal(str(record["size_matched"])) == 10 - Decimal(expected_remaining)
+        store = PredictionArbitrageStore(tmp_path)
+
+
+@pytest.mark.parametrize("role, side, token", [
+    ("entry_order_id", "SELL", "token-1"),
+    ("augment_order_ids", "SELL", "token-1"),
+    ("passive_exit_order_id", "BUY", "token-1"),
+    ("protected_exit_order_id", "BUY", "token-1"),
+    ("entry_order_id", "BUY", "other-token"),
+])
+def test_legacy_identity_conflict_rolls_back_without_order_history(tmp_path, role, side, token):
+    store = PredictionArbitrageStore(tmp_path)
+    value = ["legacy-id"] if role.endswith("ids") else "legacy-id"
+    store.lp_create_session("legacy", "legacy", state="entry_open", payload={
+        "account_id": WALLET, "token_id": "token-1", "condition_id": "condition-1",
+        role: value, "order_history": {},
+    })
+    before = store.lp_session("legacy")
+    with pytest.raises(ValueError, match="order_identity_(conflict|unknown)"):
+        store.lp_register_exchange_orders(WALLET, token, [{
+            "order_id": "legacy-id", "token_id": token, "side": side,
+            "status": "LIVE", "price": "0.4", "original_size": "10", "size_matched": "0",
+        }])
+    assert store.lp_session("legacy") == before
+    assert len(store.lp_sessions()) == 1
+
+
+@pytest.mark.parametrize("side", ["BUY", "SELL"])
+def test_owned_only_legacy_id_recovers_real_side_once_across_restart(tmp_path, side):
+    store = PredictionArbitrageStore(tmp_path)
+    store.lp_create_session("legacy", "legacy", state="entry_open", payload={
+        "account_id": WALLET, "token_id": "token-1", "condition_id": "condition-1",
+        "owned_order_ids": ["legacy-id"], "order_history": {},
+    })
+    for _ in range(2):
+        result = store.lp_register_exchange_orders(WALLET, "token-1", [{
+            "order_id": "legacy-id", "token_id": "token-1", "side": side,
+            "status": "LIVE", "price": "0.4", "original_size": "10", "size_matched": "0",
+        }])
+        assert result["session"]["session_id"] == "legacy"
+        assert result["session"]["order_history"]["legacy-id"]["side"] == side
+        assert result["session"]["owned_order_ids"] == ["legacy-id"]
+        assert len(store.lp_sessions()) == 1
         store = PredictionArbitrageStore(tmp_path)
 
 
