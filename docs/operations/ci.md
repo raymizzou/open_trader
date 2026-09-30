@@ -57,7 +57,8 @@ regression checks route/Makefile selection parity across all backend test files.
 ## Execution and verdict
 
 Each selected service reuses `make test SERVICE=...` and the locked Docker dev
-image, with two xdist workers appropriate for a standard Linux runner. Image
+image. Non-Prediction scopes retain Makefile's serial default; Prediction uses
+two xdist workers appropriate for a standard Linux runner. Image
 builds can download locked dependencies; test execution uses the existing
 network-disabled container, no host mounts, forwarded credentials, Docker socket
 or published ports. There are no real account credentials, trading requests,

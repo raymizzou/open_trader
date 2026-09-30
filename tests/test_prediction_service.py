@@ -11669,13 +11669,19 @@ raise SystemExit(service.serve_prediction_service(
     assert stopped.read_text(encoding="utf-8") == "stopped"
 
 
-def test_signal_handler_is_installed_before_runtime_start(tmp_path: Path) -> None:
+@pytest.mark.parametrize("startup_delay", (0, 6))
+def test_signal_handler_is_installed_before_runtime_start(
+    tmp_path: Path, startup_delay: int
+) -> None:
     started = tmp_path / "started"
     stopped = tmp_path / "stopped"
     script = f'''\
 from pathlib import Path
 import os
 import signal
+import time
+# Exercise cold startup independently of the post-start signal shutdown budget.
+time.sleep({startup_delay})
 import open_trader.prediction_service as service
 
 started = Path({str(started)!r})
@@ -11706,9 +11712,22 @@ raise SystemExit(service.serve_prediction_service(
         [sys.executable, "-c", script],
         env={"PYTHONPATH": str(Path(__file__).parents[1] / "src")},
     )
-    assert process.wait(timeout=5) == 0
-    assert started.read_text(encoding="utf-8") == "started"
-    assert stopped.read_text(encoding="utf-8") == "stopped"
+    try:
+        # The invariant starts inside FakeRuntime.start, after cold module imports.
+        # Keep a separate bounded startup allowance and the strict shutdown budget.
+        deadline = time.monotonic() + 30
+        while not started.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert started.exists(), (
+            f"runtime start marker missing; child exit={process.poll()}"
+        )
+        assert process.wait(timeout=5) == 0
+        assert started.read_text(encoding="utf-8") == "started"
+        assert stopped.read_text(encoding="utf-8") == "stopped"
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
 
 
 @pytest.mark.parametrize("mode", ("shadow", "production"))

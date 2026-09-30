@@ -1911,9 +1911,23 @@ def write_report(
         as_of_date="2026-07-17", execution_date="2026-07-20", buy=buy
     )
     if revision:
-        report["generated_at"] = "2026-07-17T18:01:00+08:00"
+        # Distinct immutable revisions need distinct report identities. Otherwise
+        # the legacy test adapter's hash lookup depends on filesystem glob order.
+        report["generated_at"] = (
+            datetime.fromisoformat("2026-07-17T18:00:00+08:00")
+            + timedelta(minutes=revision)
+        ).isoformat()
     path.write_text(json.dumps(report), encoding="utf-8")
     return path, report
+
+
+def test_report_fixture_revisions_have_distinct_identities(tmp_path: Path) -> None:
+    config = controller_config(tmp_path)
+    r1_path, r1 = write_report(config, revision=1)
+    r2_path, r2 = write_report(config, revision=2)
+    assert r1_path != r2_path
+    assert _report_hash(r1) != _report_hash(r2)
+    assert datetime.fromisoformat(r1["generated_at"]) < datetime.fromisoformat(r2["generated_at"])
 
 
 def write_v2_controller_report(

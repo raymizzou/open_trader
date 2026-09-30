@@ -17,10 +17,13 @@ printf 'source_sha=%s\nscope=%s\nTEST_N_LEG=%s\n' "$sha" "$scope" "$nleg" | tee 
 sha256sum uv.lock | tee "$evidence/lock-sha256.txt"
 image="open-trader-ci:$scope"
 status=0
+# Preserve Makefile serial defaults outside Prediction; SDK imports share state.
+workers=1
+[[ "$scope" != prediction ]] || workers=2
 if [[ "$scope" == trend-curve ]]; then
-  make test-trend-curve DOCKER_IMAGE="$image" TEST_WORKERS=2 2>&1 | tee "$evidence/test.log" || status=$?
+  make test-trend-curve DOCKER_IMAGE="$image" TEST_WORKERS="$workers" 2>&1 | tee "$evidence/test.log" || status=$?
 else
-  make test SERVICE="$scope" TEST_N_LEG="$nleg" TEST_WORKERS=2 DOCKER_IMAGE="$image" \
+  make test SERVICE="$scope" TEST_N_LEG="$nleg" TEST_WORKERS="$workers" DOCKER_IMAGE="$image" \
     2>&1 | tee "$evidence/test.log" || status=$?
 fi
 # Preserve build and lock identities even if pytest failed, without masking failure.
