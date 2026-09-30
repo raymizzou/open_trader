@@ -5,6 +5,14 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-30
 
+- #215：增加 exact-SHA Git bundle、原始 uv.lock、独立发布清单与校验文件；
+  版本 tag 绑定 main 历史和同 SHA 的可信 CI / required（GitHub Actions 15368），
+  缺失或过期证据拒绝发布。只读构建/恢复验证与 Draft Release 上传分离，完整资产
+  复核后仍由人工发布；记录 Ubuntu 24.04 x86_64 / Python 3.12.14 / uv 0.12.19
+  验证基线，保留 Prediction 三键清单及既有 Candidate 部署门禁。增加来源、完整性、
+  恢复与工作流边界回归；实际检查结果以本 PR 证据为准。#214 保护未启用及
+  immutable release 设置未知仍阻断正式发布；未创建 tag/Release、未改设置、未部署。
+
 - 交付文档统一为独立分支/worktree → 开发验证 → 独立审查 → 分支推送 → Draft PR →
   CI → 用户批准 GitHub 合并；本地 main 只同步远端。Candidate 仅用于明确授权部署的
   最终 GitHub main SHA，PR head/合成 merge SHA 证据不转用；修复重新走 PR。
