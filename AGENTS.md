@@ -21,9 +21,10 @@ or external gate solely to fill the gap unless the current request requires it.
 
 ## Worktree and approval
 
-Start every implementation or repository-change task from the current local
-`main` in an isolated branch and worktree. Do not use an unrelated or dirty
-checkout. Code and behavior changes require a concrete plan and explicit user
+Start every implementation or repository-change task from freshly fetched
+`origin/main` in an isolated branch and worktree. Local `main` only synchronizes
+GitHub `main`; never integrate task branches or create delivery commits there.
+Do not use an unrelated or dirty checkout. Code and behavior changes require a concrete plan and explicit user
 approval; follow the global worker and TDD contract after approval.
 
 ## Verification routing
@@ -40,15 +41,16 @@ For production-code changes covered by the normal gates, run
 service. Use multiple service names for shared changes and `TEST=...` for a
 narrower seam. Do not run the full backend suite during development. After
 known repairs and any required rebase, complete affected-service checks and
-independent review before local merge.
-Candidate Acceptance runs only after the candidate is merged into local
-`main`, when preparing an explicitly authorized deployment. Do not run it
-during development, review, before merge, or automatically after a local merge.
-It is not a local-merge gate. If a deployment candidate fails, audit every
-reported failure and its downstream dependencies, batch the in-scope repairs,
-then repeat focused checks, review, and local merge before rerunning Candidate
-Acceptance for the resulting deployment SHA. Exact-SHA evidence, rebase,
-exception, and deployment rules still apply as described in the runbook.
+independent review before publishing the task branch and opening a Draft PR.
+Candidate Acceptance runs only for the final GitHub `main` SHA selected for an
+explicitly authorized deployment, after GitHub PR merge. Do not run it during
+development, review, before merge, or automatically after merge. It is not a PR
+merge gate. If a deployment candidate fails, audit every reported failure and
+its downstream dependencies, batch the in-scope repairs on an isolated branch,
+then repeat focused checks, review, Draft PR, CI, and authorized GitHub merge
+before rerunning Candidate Acceptance for the new final deployment SHA.
+Exact-SHA evidence, rebase, exception, and deployment rules still apply as
+described in the runbook.
 
 ## Review and merge
 
@@ -58,19 +60,25 @@ After any post-review change, restage only the exact task files, rerun relevant
 verification, and obtain a fresh review.
 Use a fresh independent reviewer for the initial review; reuse that reviewer
 for in-scope repairs after restaging and rerunning relevant verification. A
-new reviewer is needed when scope or architecture changes. If local `main`
-advances, rebase task commits onto it and rerun the required worktree checks
-and review. Conflicts or behavior changes require a new approved plan. Merge
-into local `main` with `--ff-only`, only after the dated changelog entry is
-included.
+new reviewer is needed when scope or architecture changes. If GitHub `main`
+advances, fetch and rebase task commits onto `origin/main`, then rerun required
+worktree checks and review. Conflicts or behavior changes require a new approved
+plan. Publish only the reviewed tree to the authorized task branch, open a
+Draft PR targeting `main`, and inspect the latest exact-SHA CI evidence. Require
+the `required` check from GitHub Actions, then obtain explicit user approval
+before merging on GitHub. Do not integrate through local `main` or direct push.
+See [CI identity](docs/operations/ci.md) and the
+[proposed repository protections](docs/operations/repository-protection.md);
+documented settings are not evidence that protection is enabled.
 
 ## Delivery boundaries
 
-Local merge, remote push, and remote deployment are separate actions. Local
-merge does not deploy. Never automate push or deployment; each requires
-explicit user authorization and the exact gates in the linked runbook.
+Branch push, Draft PR, GitHub merge, release/tag creation, and deployment are
+separate actions requiring their applicable explicit authorization. A merged PR
+does not release or deploy. Neither PR-head checks nor GitHub's synthetic PR
+merge SHA substitute for Candidate evidence on the final GitHub `main` SHA.
 
-Screenshots are optional unless requested. Clean up only after local merge,
+Screenshots are optional unless requested. Clean up only after GitHub merge,
 user confirmation, and a clean worktree; never delete a dirty worktree.
 
 ## Agent skills

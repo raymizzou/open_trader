@@ -199,7 +199,15 @@ watchlist 使用市场、标的和 Trend Animals 业务标识：
 
 ## 开发与发布四阶段门禁
 
-四个阶段彼此独立；本地合并不等于部署：
+正式交付采用 PR-first：从最新拉取的 `origin/main` 建立独立分支/worktree，
+开发与验证、独立 staged review 后，按授权推送分支并创建 Draft PR；CI 通过后，
+由用户明确批准在 GitHub 合并。本地 `main` 只同步远端，不再用于集成任务分支。
+合并不代表发布、创建 tag 或部署授权。详见
+[验证手册](docs/operations/agent-verification.md)、
+[CI 与精确 required 检查](docs/operations/ci.md)及
+[尚未启用的仓库保护设计](docs/operations/repository-protection.md)。
+
+四个阶段彼此独立，证据均绑定精确 SHA：
 
 1. **Docker 开发**：`make test SERVICE=prediction` 或
    `make test TEST='tests/path.py::test_name'` 只构建当前 worktree 专属的 Python/backend 镜像，
@@ -208,8 +216,10 @@ watchlist 使用市场、标的和 Trend Animals 业务标识：
    npm、Python/JS Playwright、Chromium/浏览器资产，也没有宿主机挂载、网络、发布端口、
    Docker socket、home 目录或凭据。容器运行 `-m 'not pressure and not browser'` backend
    pytest，浏览器成本为零。
-2. **部署前 Candidate Acceptance**：仅在准备实际部署时，对目标 SHA 运行
-   `make candidate-acceptance`；它只构建一次并运行 backend 目标，
+2. **部署前 Candidate Acceptance**：仅在 GitHub PR 合并后准备明确授权的部署时，
+   对选定的最终 GitHub `main` SHA 运行 `make candidate-acceptance`；PR head 和
+   GitHub 合成 PR merge SHA 的证据不能转用，合并本身不会自动触发验收；
+   它只构建一次并运行 backend 目标，
    依次执行排除 `pressure`、`browser` 的完整套件和同样排除这两类测试的
    `acceptance/test_prediction_arbitrage_scenarios.py -k 'not LIVE'`。它绝不启动
    Playwright、访问 macOS 或外部依赖，也不会把缺少 Keychain、Futu 或当前行情变成 skip
@@ -600,8 +610,8 @@ Candidate Acceptance 的 Docker 别名：它只运行 Docker backend 的
 Chrome 回归用例由 macOS Smoke 的 `-m browser` 阶段负责。
 
 部署前必须先单独运行 `make host-readiness`，它只读既有 dry-run、status/preflight、
-端口、存储、连接性和缓存 Chromium 先决条件，并输出 `READY` 或 `BLOCKED`。本地 `main` 的
-`--ff-only` 合并不是部署，也不能用 curl 或单元测试替代这些阶段。
+端口、存储、连接性和缓存 Chromium 先决条件，并输出 `READY` 或 `BLOCKED`。GitHub PR
+合并不是部署；本地 `main` 只同步远端，不能用 curl 或单元测试替代这些阶段。
 
 Host Readiness 和 Production Smoke 通过 `RELEASE_SERVICES` 选择发布范围，值必须是非空的
 空格分隔列表：`gateway`、`legacy`、`account`、`prediction`，默认值为
@@ -959,7 +969,8 @@ data/latest/US/decision_facts.json
 open-trader --help
 ```
 
-每次推送 `main` 前，都必须在 `CHANGELOG.md` 增加一条带日期的记录。记录应说明
+每次 staged review 及 PR 合并到 GitHub `main` 前，都必须在 `CHANGELOG.md` 增加
+一条带日期的记录。记录应说明
 用户可见变化、影响的流程和已经做过的验证。
 
 ## 许可证
