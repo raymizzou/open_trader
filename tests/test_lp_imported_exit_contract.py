@@ -191,6 +191,7 @@ def _active_payload(old_receipt: OpenOrder) -> dict[str, object]:
     }
 
 
+@pytest.mark.parametrize("legacy_sell_history", [False, True])
 @pytest.mark.parametrize("session_review", [False, True])
 @pytest.mark.parametrize(
     ("order_type", "ttl_seconds"),
@@ -201,7 +202,8 @@ def _active_payload(old_receipt: OpenOrder) -> dict[str, object]:
     ),
 )
 def test_imported_passive_replacement_lifecycle(
-    tmp_path, monkeypatch, order_type: str, ttl_seconds: int | None, session_review: bool
+    tmp_path, monkeypatch, order_type: str, ttl_seconds: int | None,
+    session_review: bool, legacy_sell_history: bool
 ) -> None:
     """Valid imports replace once with the original expiry; expired ones wait."""
 
@@ -234,6 +236,8 @@ def test_imported_passive_replacement_lifecycle(
     adapter._public_client_factory = lambda: public
 
     payload = _active_payload(old_receipt)
+    if legacy_sell_history:
+        payload["order_history"].pop("S1")
     if session_review:
         payload["review_at"] = datetime.now(UTC) + timedelta(minutes=30)
     store.lp_create_session(

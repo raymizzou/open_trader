@@ -14960,6 +14960,7 @@ class PolymarketLPService:
                 "remaining_size",
                 "size",
                 "quantity",
+                "order_type",
                 "expiration",
                 "matched_at",
                 "updated_at",
