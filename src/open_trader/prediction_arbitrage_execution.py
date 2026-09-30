@@ -2448,23 +2448,18 @@ class PredictionExecutionService:
                     self._lp, "register_account_snapshot", None
                 )
                 if callable(registration_reader) and not getattr(self, "_display_only", False):
-                    try:
-                        registration = _call(registration_reader, snapshot)
-                        if isinstance(registration, Mapping) and (
-                            registration.get("reason") == "account_round_invalid"
-                            or any(
-                                isinstance(item, Mapping)
-                                and item.get("reason") == "account_round_invalid"
-                                for item in registration.get("tokens", ())
-                            )
-                        ):
-                            raise LpAccountRoundInvalid("lp_account_round_invalid")
-                    except LpAccountRoundInvalid:
-                        raise
-                    except Exception:
-                        logger.warning(
-                            "lp_order_sync_registration_failed", exc_info=True
+                    registration = _call(registration_reader, snapshot)
+                    if isinstance(registration, Mapping) and (
+                        registration.get("reason") == "account_round_invalid"
+                        or any(
+                            isinstance(item, Mapping)
+                            and item.get("reason") == "account_round_invalid"
+                            for item in registration.get("tokens", ())
                         )
+                    ):
+                        raise LpAccountRoundInvalid("lp_account_round_invalid")
+                    if not isinstance(registration, Mapping) or registration.get("state") != "registered":
+                        raise ValueError("account_order_sync_unknown")
 
                 session: dict[str, object]
                 try:
@@ -3270,11 +3265,13 @@ class PredictionExecutionService:
                         "lp_orders_today": degraded_today_orders,
                         "state": "stale",
                         "stale": True,
+                        "reason": "account_order_sync_unknown" if getattr(self._lp, "_account_order_sync_error", None) else "account_read_failed",
                         "lp_share_watch_state": self.lp_share_watch_state(),
                     }
                     return deepcopy(self._lp_dashboard_cache)
                 self._lp_dashboard_cache = {
                     "state": "unknown",
+                    "reason": "account_order_sync_unknown" if getattr(self._lp, "_account_order_sync_error", None) else "account_read_failed",
                     "orders": [],
                     "positions": [],
                     "lp_orders_today": [],

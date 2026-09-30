@@ -4778,6 +4778,8 @@ class PredictionArbitrageStore:
     def _lp_order_state_rank(status: object) -> int:
         value = str(status or "").upper()
         if value in TERMINAL_ORDER_STATES:
+            return 3
+        if value == "PARTIALLY_FILLED":
             return 2
         if value in {"LIVE", "OPEN", "ACCEPTED", "PENDING"}:
             return 1
@@ -4888,9 +4890,17 @@ class PredictionArbitrageStore:
         for field in ("order_type", "expiration", "created_at"):
             if base.get(field) in (None, "") and incoming.get(field) not in (None, ""):
                 base[field] = incoming.get(field)
-        for field in ("remaining_size", "queue_baseline"):
-            if base.get(field) in (None, "") and incoming.get(field) not in (None, ""):
-                base[field] = incoming.get(field)
+        remaining = [value for value in (
+            _maybe_decimal(base.get("remaining_size")),
+            _maybe_decimal(incoming.get("remaining_size")),
+        ) if value is not None]
+        if base["quantity"] is not None and matched is not None:
+            if matched > base["quantity"]:
+                raise ValueError("order_fill_exceeds_quantity")
+            remaining.append(base["quantity"] - matched)
+        base["remaining_size"] = min(remaining) if remaining else None
+        if base.get("queue_baseline") in (None, ""):
+            base["queue_baseline"] = incoming.get("queue_baseline")
         base["order_id"] = incoming["order_id"]
         old_fills = base.get("fills", ())
         new_fills = incoming.get("fills", ())

@@ -414,6 +414,35 @@ def test_restarted_store_normalizes_amounts_and_updates_vwap_once(tmp_path) -> N
     assert len(record["fills"]) == 2
 
 
+def test_registered_partial_fill_and_remaining_do_not_regress(tmp_path) -> None:
+    store = PredictionArbitrageStore(tmp_path)
+    session = {
+        "session_id": "partial", "condition_id": "condition-1",
+        "token_id": "token-1", "outcome": "YES", "state": "entry_open",
+    }
+    order = {
+        "order_id": "partial-buy", "token_id": "token-1", "side": "BUY",
+        "original_size": "10", "price": "0.50",
+    }
+    for status, matched, remaining, expected_status, expected_remaining in (
+        ("LIVE", "0", "10", "LIVE", "10"),
+        ("PARTIALLY_FILLED", "5", "5", "PARTIALLY_FILLED", "5"),
+        ("LIVE", "0", "10", "PARTIALLY_FILLED", "5"),
+        ("FILLED", "10", "0", "FILLED", "0"),
+        ("PARTIALLY_FILLED", "5", "5", "FILLED", "0"),
+    ):
+        result = store.lp_register_exchange_orders(
+            WALLET, "token-1", [{**order, "status": status,
+                "size_matched": matched, "remaining_size": remaining}],
+            session=session,
+        )
+        record = result["session"]["order_history"]["partial-buy"]
+        assert record["status"] == expected_status
+        assert Decimal(str(record["remaining_size"])) == Decimal(expected_remaining)
+        assert Decimal(str(record["size_matched"])) == 10 - Decimal(expected_remaining)
+        store = PredictionArbitrageStore(tmp_path)
+
+
 def test_first_seen_conversion_rolls_back_with_registration_transaction(tmp_path) -> None:
     store = PredictionArbitrageStore(tmp_path)
     _first_seen_episode(store, "legacy", anchors=("manual-buy",))
@@ -590,8 +619,9 @@ def test_dashboard_sync_view_marks_discovered_order_managed(tmp_path) -> None:
         lp=lp,
     )
     engine._breaker_open = False
-    adapter_snapshot = adapter.lp_account_snapshot()
-    adapter_snapshot["trade_generation"] = store.lp_trade_generation()
+    adapter_snapshot = adapter.lp_account_snapshot_shared(
+        trade_generation_provider=store.lp_trade_generation
+    )
     registration = lp.register_account_snapshot(adapter_snapshot)
     assert registration["state"] == "registered", registration
     assert registration["tokens"][0].get("reason") is None

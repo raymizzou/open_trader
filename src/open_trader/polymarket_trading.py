@@ -2212,6 +2212,9 @@ class PolymarketTradingClient:
             normalized_trades.append(row)
         account.update(account_trades=tuple(normalized_trades),
             display_trades_complete=complete, account_trades_total=len(raw_trades))
+        if account_round is None:
+            # Raw own-fill evidence is internal to a fenced registration round.
+            account.pop("raw_trades", None)
         order_rows, position_rows = account['open_orders'], account['positions']
         condition_ids = tuple(
             dict.fromkeys(

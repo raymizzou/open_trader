@@ -871,13 +871,6 @@ def test_lp_dashboard_shows_manual_orders_without_managing_them(
         client=sdk,
         public_client_factory=lambda: public_market,
     )
-    trading.lp_market_metadata = lambda condition_ids, **kwargs: {
-        condition_ids[0]: {
-            "market_id": "market-1",
-            "condition_id": condition_ids[0],
-            "outcome": "YES",
-        }
-    }
     service._trading = trading
     runtime = _Runtime()
     runtime.store = store  # type: ignore[assignment]
@@ -10498,6 +10491,7 @@ def test_lp_routes_preserve_guard_and_idempotency(tmp_path: Path) -> None:
 
     class Exchange:
         def __init__(self) -> None:
+            self.config = SimpleNamespace(wallet_address="wallet")
             self.posts: list[dict[str, object]] = []
             self.cancels: list[str] = []
             self.snapshot = {
@@ -10738,6 +10732,7 @@ def test_lp_augment_routes_preserve_guard_idempotency_and_schema(
 
     class Exchange:
         def __init__(self) -> None:
+            self.config = SimpleNamespace(wallet_address="wallet")
             self.posts: list[dict[str, object]] = []
             self.cancels: list[str] = []
             self.snapshot = {
@@ -11032,6 +11027,7 @@ def test_lp167_h_augment_route_accepts_price_and_rejects_bad_prices(
 
     class Exchange:
         def __init__(self) -> None:
+            self.config = SimpleNamespace(wallet_address="wallet")
             self.posts: list[dict[str, object]] = []
             self.snapshot = {
                 "account": {
@@ -15318,6 +15314,7 @@ def _lp163_route_fixture(tmp_path: Path, now: datetime):
 
     class Exchange:
         def __init__(self) -> None:
+            self.config = SimpleNamespace(wallet_address="wallet")
             self.posts: list[dict[str, object]] = []
             self.snapshot_calls = 0
             self.best_bid = Decimal("0.29")

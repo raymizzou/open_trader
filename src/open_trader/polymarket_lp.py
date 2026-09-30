@@ -798,6 +798,8 @@ class PolymarketLPService:
         self._facts_lock = threading.Lock()
         self._facts_apply_lock = threading.Lock()
         self._first_seen_apply_lock = threading.Lock()
+        self._account_registration_attempt = 0
+        self._account_order_sync_error: str | None = None
         self._deferred_protection_notices = threading.local()
         self._facts_inflight: dict[str, dict] = {}
         self._pending_facts: dict[
@@ -7407,7 +7409,7 @@ class PolymarketLPService:
                 post_only=True,
                 expiration=expiration,
             )
-            response = self._post_limit(signed)
+            response = self._post_limit(signed, side="BUY")
         except Exception as exc:
             self.store.lp_upsert_action(
                 session_id,
@@ -7471,7 +7473,7 @@ class PolymarketLPService:
         # Re-read after the post so the session merge starts from the latest
         # durable A/B state instead of the pre-submit snapshot.
         session = self.store.lp_session(session_id) or session
-        session, receipt_changed = self._register_direct_receipt(
+        registered_session, receipt_changed = self._register_direct_receipt(
             session,
             order_id=order_id,
             response=response,
@@ -7480,6 +7482,12 @@ class PolymarketLPService:
             quantity=quantity,
             expiration=expiration,
         )
+        if str(registered_session.get("session_id") or "") != session_id:
+            return {
+                **self._status_payload(session),
+                "reason": "receipt_owned_by_other_session",
+            }
+        session = registered_session
         # A replayed receipt that was already adopted by sync has no new
         # lifecycle and must never re-anchor its existing protection.
         protection_payload = None
@@ -8060,6 +8068,7 @@ class PolymarketLPService:
         price: object,
         quantity: object,
         expiration: object = None,
+        order_type: str | None = None,
     ) -> tuple[dict[str, object], bool]:
         """Adopt one accepted exchange receipt through the shared Store seam."""
 
@@ -8075,6 +8084,9 @@ class PolymarketLPService:
             "original_size": quantity,
             "size_matched": _field(response, "size_matched"),
             "expiration": expiration,
+            "order_type": _field(response, "order_type") or order_type or (
+                "GTD" if expiration is not None else None
+            ),
         }
         result = self.store.lp_register_exchange_orders(
             str(session.get("account_id") or configured),
@@ -8084,7 +8096,7 @@ class PolymarketLPService:
         )
         return result["session"], bool(result["changed"])
 
-    def register_account_snapshot(self, snapshot: Mapping[str, object]) -> dict[str, object]:
+    def _register_account_snapshot(self, snapshot: Mapping[str, object]) -> dict[str, object]:
         """Register every account-owned order in one complete sync bundle.
 
         One LP session owns one token; a newly discovered SELL joins that
@@ -8135,11 +8147,23 @@ class PolymarketLPService:
             _freshness(checked_at, self._now(), "account_freshness")
         except ValueError:
             return {"state": "skipped", "reason": "account_snapshot_stale"}
-        raw_orders = [
-            row for row in _items(snapshot.get("open_orders"))
-            if isinstance(row, Mapping) and _field(row, "order_id", _field(row, "id", ""))
-        ]
-        owned_fills = self._owned_sync_order_rows(snapshot.get("raw_trades", ()), wallet)
+        open_orders = snapshot.get("open_orders")
+        if not isinstance(open_orders, (list, tuple)):
+            return {"state": "failed", "reason": "account_open_orders_unknown"}
+        for row in open_orders:
+            if (
+                not isinstance(row, Mapping)
+                or not _field(row, "order_id", _field(row, "id", ""))
+                or not _field(row, "token_id", _field(row, "asset_id", ""))
+            ):
+                return {
+                    "state": "failed",
+                    "reason": "account_order_identity_unknown",
+                }
+        if "raw_trades" not in snapshot or not isinstance(snapshot["raw_trades"], (list, tuple)):
+            return {"state": "failed", "reason": "account_raw_trades_unknown"}
+        raw_orders = [row for row in open_orders if isinstance(row, Mapping)]
+        owned_fills = self._owned_sync_order_rows(snapshot["raw_trades"], wallet)
         known_ids = {
             str(_field(row, "order_id", _field(row, "id", "")) or "") for row in raw_orders
         }
@@ -8149,8 +8173,9 @@ class PolymarketLPService:
         groups: dict[str, list[Mapping[str, object]]] = {}
         for row in rows:
             token = str(_field(row, "token_id", _field(row, "asset_id", "")) or "")
-            if token:
-                groups.setdefault(token, []).append(row)
+            if not token:
+                return {"state": "failed", "reason": "account_order_identity_unknown"}
+            groups.setdefault(token, []).append(row)
         created = joined = 0
         token_results: list[dict[str, object]] = []
         owned_ids = {
@@ -8223,6 +8248,43 @@ class PolymarketLPService:
             "created": created,
             "joined": joined,
         }
+
+    def register_account_snapshot(
+        self, snapshot: Mapping[str, object]
+    ) -> dict[str, object]:
+        """Publish the latest completed account-registration outcome."""
+
+        with self._first_seen_apply_lock:
+            self._account_registration_attempt += 1
+            attempt = self._account_registration_attempt
+
+        try:
+            result = self._register_account_snapshot(snapshot)
+        except LpAccountRoundInvalid:
+            raise
+        except Exception:
+            with self._first_seen_apply_lock:
+                if self._account_registration_attempt == attempt:
+                    self._account_order_sync_error = "account_order_sync_unknown"
+            raise
+        with self._first_seen_apply_lock:
+            if (result.get("state") == "registered"
+                    and snapshot.get("trade_generation") != self.store.lp_trade_generation()):
+                result = {"state": "skipped", "reason": "account_round_invalid"}
+            invalid = result.get("reason") == "account_round_invalid" or any(
+                item.get("reason") == "account_round_invalid"
+                for item in result.get("tokens", ()) if isinstance(item, Mapping)
+            )
+            if self._account_registration_attempt == attempt:
+                if invalid:
+                    # A generation race is #209 waiting evidence, not a new
+                    # mutation-blocking registration fault.
+                    pass
+                elif result.get("state") == "registered":
+                    self._account_order_sync_error = None
+                else:
+                    self._account_order_sync_error = "account_order_sync_unknown"
+        return result
 
     def _create_sync_session(
         self,
@@ -8868,9 +8930,11 @@ class PolymarketLPService:
                 "submit_post_started_at": boundary_at,
             }
 
-        def execute_post(signed: object) -> object:
+        def execute_post(signed: object, *, side: str | None = None) -> object:
             if post is None:
-                return self._post_limit(signed, on_post_started=mark_post_started)
+                return self._post_limit(
+                    signed, side=side, on_post_started=mark_post_started
+                )
             return post(signed, mark_post_started)
 
         try:
@@ -8883,7 +8947,7 @@ class PolymarketLPService:
                 expiration=expiration,
             )
             submit_revision = self.store.lp_session_revision(session_id, trading=True)
-            response = execute_post(signed)
+            response = execute_post(signed, side="BUY")
         except AutoEntryNotSent as exc:
             stage = str(getattr(exc, "submit_stage", "pre_send_rejected"))
             failure = _submit_failure_facts(exc)
@@ -9032,7 +9096,7 @@ class PolymarketLPService:
                     session_id, trading=True
                 )
                 preflight_reconciled = session.get("position_reconciled")
-                session, receipt_changed = self._register_direct_receipt(
+                registered_session, receipt_changed = self._register_direct_receipt(
                     session,
                     order_id=order_id,
                     response=response,
@@ -9041,6 +9105,12 @@ class PolymarketLPService:
                     quantity=request["quantity"],
                     expiration=expiration,
                 )
+                if str(registered_session.get("session_id") or "") != session_id:
+                    return {
+                        **self._status_payload(session),
+                        "reason": "receipt_owned_by_other_session",
+                    }
+                session = registered_session
                 # The accepted action advances this intent once. A concurrent
                 # cancel/stop/submit must still require fresh account facts.
                 receipt_patch = {}
@@ -10371,9 +10441,10 @@ class PolymarketLPService:
             )
             ordered = [entry_receipt] if entry_receipt else []
             ordered.extend(action for action in late_receipts if action is not entry_receipt)
+            registered_entry = False
             for action in ordered:
                 role = str(action.get('role') or '')
-                session, _receipt_changed = self._register_direct_receipt(
+                registered_session, _receipt_changed = self._register_direct_receipt(
                     session,
                     order_id=str(action['order_id']),
                     response=action,
@@ -10381,7 +10452,15 @@ class PolymarketLPService:
                     price=action.get('price', action.get('min_price')),
                     quantity=action.get('quantity'),
                     expiration=action.get('expiration'),
+                    order_type=action.get('order_type') or (
+                        'FOK' if role == 'protected_exit' else None
+                    ),
                 )
+                if str(registered_session.get("session_id") or "") != session_id:
+                    continue
+                session = registered_session
+                if role == 'entry':
+                    registered_entry = True
                 role_patch = {
                     'entry': {'entry_order_id': action['order_id']},
                     'passive_exit': {'passive_exit_order_id': action['order_id']},
@@ -10393,7 +10472,7 @@ class PolymarketLPService:
             if row is None:
                 raise ValueError('lp_session_not_found')
             session, revision = row
-            if entry_receipt:
+            if entry_receipt and registered_entry:
                 session, _ = self.store.lp_publish_facts(
                     session_id,
                     revision,
@@ -10401,14 +10480,6 @@ class PolymarketLPService:
                 )
                 row = self.store.lp_session_with_revision(session_id, trading=True)
                 session, revision = row
-            actions = self.store.lp_actions(session_id)
-            accepted_ids = {a.get('order_id') for a in actions
-                            if a.get('role') == 'entry' and a.get('state') == 'accepted' and a.get('order_id')}
-            if len(accepted_ids) == 1:
-                order_id = accepted_ids.pop()
-                session, _ = self.store.lp_publish_facts(session_id, revision, patch={
-                    'entry_order_id': order_id, 'owned_order_ids': list(dict.fromkeys([*self._session_order_ids(session), order_id])),
-                    'submit_status': 'unknown'})
         snapshot, error = None, None
         retry_at = None
         if not report_only:
@@ -14946,6 +15017,11 @@ class PolymarketLPService:
 
     def _create_limit(self, **kwargs: object) -> object:
         self._require_mutation()
+        if (
+            str(kwargs.get("side") or "").upper() == "BUY"
+            and self._account_order_sync_error is not None
+        ):
+            raise _MutationBlocked(self._account_order_sync_error)
         direct = getattr(self.exchange, "lp_create_limit_order", None)
         if callable(direct):
             return direct(**kwargs)
@@ -14958,9 +15034,15 @@ class PolymarketLPService:
         self,
         signed: object,
         *,
+        side: str | None = None,
         on_post_started: Callable[[], None] | None = None,
     ) -> object:
         self._require_mutation()
+        if (
+            str(side or "").upper() == "BUY"
+            and self._account_order_sync_error is not None
+        ):
+            raise _MutationBlocked(self._account_order_sync_error)
         direct = getattr(self.exchange, "lp_post_order", None)
         method = getattr(self.exchange, "post_order", None)
         adapter = direct if callable(direct) else method if callable(method) else None
@@ -16164,38 +16246,74 @@ class PolymarketLPService:
         price = asks[0][0]
         old_price = _maybe_decimal(session.get("passive_exit_price"))
         old_order = str(session.get("passive_exit_order_id") or "")
-        if (
-            old_order
-            and old_price == price
-            and not bool(session.get("passive_cancel_requested"))
-            and not self._order_terminal(snapshot, old_order, session)
-        ):
-            return
+        old_passive_record: dict[str, object] = {}
         if old_order:
-            if not bool(session.get("passive_cancel_requested")):
-                self._request_passive_cancel(
-                    session,
-                    expected_generation=trade_generation if trade_generation is not None else snapshot.get("_lp_trade_generation"),
-                    expected_trade_revision=expected_trade_revision if expected_trade_revision is not None else trade_revision,
+            old_terminal = self._order_terminal(snapshot, old_order, session)
+            if not old_terminal:
+                if old_price == price and not session.get("passive_cancel_requested"):
+                    return
+                if not bool(session.get("passive_cancel_requested")):
+                    self._request_passive_cancel(
+                        session,
+                        expected_generation=trade_generation if trade_generation is not None else snapshot.get("_lp_trade_generation"),
+                        expected_trade_revision=expected_trade_revision if expected_trade_revision is not None else trade_revision,
+                    )
+                return
+            # Preserve the legacy exact-ID record before clearing the role.
+            # Its GTD facts remain the only source for replacement expiration.
+            old_passive_record = dict(history.get(old_order) or {})
+        expiration: int | None
+        expiration_error: str | None = None
+        if session.get("review_at") is not None:
+            try:
+                expiration = expiration_for_review(
+                    _timestamp(session["review_at"], name="review_at"),
+                    now=self._now(),
                 )
-                return
-            if not self._order_terminal(snapshot, old_order, session):
-                return
-            session = self.store.lp_update_session(
+            except ValueError:
+                expiration = None
+                expiration_error = "passive_expiration_too_soon"
+        elif old_passive_record:
+            # An imported replacement inherits only the exact old order's
+            # lifecycle type. It can never turn GTD into GTC or extend expiry.
+            order_type = str(old_passive_record.get("order_type") or "").upper()
+            if order_type == "GTC":
+                expiration = None
+            elif order_type == "GTD":
+                parsed = _maybe_decimal(old_passive_record.get("expiration"))
+                if parsed is None or parsed <= 0 or parsed != parsed.to_integral_value():
+                    expiration = None
+                    expiration_error = "passive_expiration_invalid"
+                else:
+                    expiration = int(parsed)
+                    try:
+                        expires_at = datetime.fromtimestamp(expiration, tz=UTC)
+                    except (OverflowError, OSError, ValueError):
+                        expiration = None
+                        expiration_error = "passive_expiration_invalid"
+                    else:
+                        if expires_at <= self._now() + timedelta(seconds=SDK_MIN_EXPIRATION_SECONDS):
+                            expiration = None
+                            expiration_error = "passive_expiration_too_soon"
+            else:
+                expiration = None
+                expiration_error = "passive_expiration_invalid"
+        else:
+            # First managed exit for a BUY-only imported group keeps the
+            # existing GTC policy.
+            expiration = None
+        if expiration_error is not None:
+            self.store.lp_update_session(
                 str(session["session_id"]),
+                state="needs_attention",
                 patch={
-                    "passive_exit_order_id": None,
-                    "passive_exit_price": None,
-                    "passive_cancel_requested": False,
+                    "reconciliation": expiration_error,
+                    "resume_state": "passive_exit",
                 },
             )
-        expiration = (
-            None
-            if session.get("review_at") is None
-            else expiration_for_review(
-                _timestamp(session["review_at"], name="review_at"), now=self._now()
-            )
-        )
+            return
+        # Keep the old identity and expiry until a new accepted receipt replaces
+        # them. A rejected/stale claim must not turn the next retry into GTC.
         session_id = str(session["session_id"])
         attempt_key = self._action_key(
             session_id, "passive-submit", uuid.uuid4().hex
@@ -16206,6 +16324,8 @@ class PolymarketLPService:
             "token_id": session["token_id"],
             "price": price,
             "quantity": quantity,
+            "expiration": expiration,
+            "order_type": "GTD" if expiration is not None else "GTC",
         }
         expected_generation = (
             int(trade_generation)
@@ -16310,15 +16430,6 @@ class PolymarketLPService:
                 },
             )
             return
-        session, _receipt_changed = self._register_direct_receipt(
-            session,
-            order_id=order_id,
-            response=response,
-            side="SELL",
-            price=price,
-            quantity=quantity,
-            expiration=expiration,
-        )
         self.store.lp_upsert_action(
             session_id,
             attempt_key,
@@ -16329,8 +16440,23 @@ class PolymarketLPService:
                 "order_id": order_id,
                 "price": price,
                 "quantity": quantity,
+                "expiration": expiration,
+                "order_type": "GTD" if expiration is not None else "GTC",
             },
         )
+        registered_session, _receipt_changed = self._register_direct_receipt(
+            session,
+            order_id=order_id,
+            response=response,
+            side="SELL",
+            price=price,
+            quantity=quantity,
+            expiration=expiration,
+            order_type="GTD" if expiration is not None else "GTC",
+        )
+        if str(registered_session.get("session_id") or "") != session_id:
+            return
+        session = registered_session
         self.store.lp_update_session(
             session_id,
             state="passive_exit",
@@ -16713,14 +16839,6 @@ class PolymarketLPService:
                 },
             )
             return
-        session, _receipt_changed = self._register_direct_receipt(
-            session,
-            order_id=order_id,
-            response=response,
-            side="SELL",
-            price=min_price,
-            quantity=submit_quantity,
-        )
         self.store.lp_upsert_action(
             session_id,
             attempt_key,
@@ -16733,6 +16851,18 @@ class PolymarketLPService:
                 "min_price": min_price,
             },
         )
+        registered_session, _receipt_changed = self._register_direct_receipt(
+            session,
+            order_id=order_id,
+            response=response,
+            side="SELL",
+            price=min_price,
+            quantity=submit_quantity,
+            order_type="FOK",
+        )
+        if str(registered_session.get("session_id") or "") != session_id:
+            return
+        session = registered_session
         self.store.lp_update_session(
             session_id,
             patch={

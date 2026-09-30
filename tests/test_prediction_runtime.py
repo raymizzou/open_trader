@@ -3237,7 +3237,7 @@ def test_lp_share_watch_runs_without_dashboard_and_stops_with_runtime(
         def __init__(self) -> None:
             super().__init__(config, FakeSDK())
 
-        def lp_account_snapshot(self) -> dict[str, object]:
+        def lp_account_snapshot(self, account_round=None) -> dict[str, object]:
             return {
                 "authenticated": True,
                 "checked_at": datetime.now(UTC),
