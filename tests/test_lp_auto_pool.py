@@ -109,6 +109,22 @@ def setup(tmp_path, count=1):
     return engine,ex,lp,store
 
 
+def _fresh_registration_bundle(x, lp):
+    snapshot = x.lp_account_snapshot()
+    snapshot.update(
+        account_id='test-wallet',
+        read_started_at=NOW,
+        read_ended_at=NOW,
+        checked_at=NOW,
+        balance_complete=True,
+        trades_complete=True,
+        pagination_complete=True,
+        raw_trades=x.trades,
+        trade_generation=lp.store.lp_trade_generation(),
+    )
+    return snapshot
+
+
 def test_default_configure_enable_and_idempotent_round(tmp_path):
     e,x,lp,s=setup(tmp_path,5)
     assert e.lp_auto_state()['desired_running'] is False
@@ -476,23 +492,31 @@ def test_concurrent_configuration_is_atomic_target_total(tmp_path):
     assert e.lp_auto_state()['config_version']==2
 
 
-def test_unknown_with_reliable_id_reconciles_without_resubmit(tmp_path):
+def test_sync_manages_exchange_ids_without_precomputed_match(tmp_path):
     e,x,lp,s=setup(tmp_path,2)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=2))
     e.lp_auto_set_desired_running(True)
     create=x.lp_create_limit_order
-    x.lp_create_limit_order=lambda **kwargs:{**create(**kwargs),'order_id':'known-' + kwargs['token_id']}
+    x.lp_create_limit_order=lambda **kwargs:{**create(**kwargs),'order_id':'audit-' + kwargs['token_id']}
     x.fail=True
     r=e.lp_auto_run_once()
     assert len(x.posts)==2
     assert 'submission_unknown' in r['block_reasons']
     e.lp_auto_set_desired_running(False)
     for token in ('m00', 'm01'):
-        x.orders.append(dict(order_id='known-' + token,token_id=token,condition_id=token,side='BUY',status='LIVE',price='.4',original_size='20',size_matched='0'))
+        x.orders.append(dict(order_id='venue-' + token,token_id=token,condition_id=token,side='BUY',status='LIVE',price='.4',original_size='20',size_matched='0'))
     x.fail=False
-    r=e.lp_auto_run_once()
-    assert 'submission_unknown' not in r['block_reasons']
-    assert r['desired_running'] is False
+    first=lp.register_account_snapshot(_fresh_registration_bundle(x,lp))
+    assert first['state']=='registered', first
+    sessions=s.lp_active_sessions()
+    assert {session['token_id'] for session in sessions}=={'m00','m01'}
+    assert sorted(order_id for session in sessions for order_id in session['owned_order_ids'])==['venue-m00','venue-m01']
+    assert all('audit-' not in order_id for session in sessions for order_id in session['owned_order_ids'])
+    assert e.lp_auto_state()['funds']['status']=='unknown'
+    assert e.lp_auto_state()['desired_running'] is False
+    repeat=lp.register_account_snapshot(_fresh_registration_bundle(x,lp))
+    assert repeat['state']=='registered', repeat
+    assert len(s.lp_active_sessions())==2
     assert len(x.posts)==2
 
 
@@ -805,13 +829,12 @@ def test_late_live_receipt_preserves_already_verified_fill(tmp_path):
     e,x,lp,s=setup(tmp_path)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
     e.lp_auto_set_desired_running(True)
-    create=x.lp_create_limit_order
-    x.lp_create_limit_order=lambda **kwargs:{**create(**kwargs),'order_id':'o1'}
     post=x.lp_post_order
     def delayed_receipt(signed):
         response=dict(post(signed))
         x.orders[0].update(status='FILLED',size_matched='20')
         x.positions=[dict(token_id='m00',condition_id='m00',size='20')]
+        assert lp.register_account_snapshot(_fresh_registration_bundle(x,lp))['state']=='registered'
         e.lp_tick()
         return response
     x.lp_post_order=delayed_receipt
@@ -883,23 +906,23 @@ def test_receipt_apply_respects_another_service_tick_lock(tmp_path,signed_id):
     assert Decimal(r['funds']['inventory_cost_usd'])==(8 if signed_id else 0)
 
 
-def test_conflicting_signed_and_receipt_ids_remain_unknown(tmp_path):
+def test_exchange_receipt_id_is_owner_when_signed_id_differs(tmp_path):
     e,x,lp,s=setup(tmp_path,2)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=2))
     e.lp_auto_set_desired_running(True)
     create=x.lp_create_limit_order
     x.lp_create_limit_order=lambda **kwargs:{**create(**kwargs),'order_id':'signed-id'}
     r=e.lp_auto_run_once()
-    assert 'submission_unknown' in r['block_reasons']
-    assert r['funds']['available_usd'] is None
-    assert len(x.posts)==1
-    session=s.lp_session(r['intents'][0]['session_id'])
-    assert session['order_identity_conflict']=={'prepared_order_id':'signed-id','response_order_id':'o1'}
-    assert 'o1' not in session['owned_order_ids']
-    x.orders.append(dict(order_id='signed-id',token_id='m00',condition_id='m00',side='BUY',status='LIVE',price='.4',original_size='20',size_matched='0'))
-    assert 'submission_unknown' in e.lp_auto_reconcile_unknown()['block_reasons']
+    assert 'submission_unknown' not in r['block_reasons']
+    assert len(x.posts)==2
+    sessions=[s.lp_session(row['session_id']) for row in r['intents']]
+    assert {row['session_id'] for row in r['intents']}=={row['session_id'] for row in sessions}
+    assert sorted(order_id for session in sessions for order_id in session['owned_order_ids'])==['o1','o2']
+    assert all('order_identity_conflict' not in session for session in sessions)
+    assert all('signed-id' not in session['owned_order_ids'] for session in sessions)
+    assert e.lp_auto_state()['slots']['occupied']==2
     e.lp_auto_run_once()
-    assert len(x.posts)==1
+    assert len(x.posts)==2
 
 
 def test_accepted_sell_missing_receipt_blocks_new_buys_until_exact_id_recovers(tmp_path):
@@ -954,7 +977,7 @@ def test_known_buy_receipt_uncertainty_resolves_and_reopens_without_new_intent(t
     assert len([v for v in events if v['kind']=='intent'])==1
 
 
-def test_conflicting_identity_stays_quarantined_in_public_tick_and_stop(tmp_path):
+def test_signed_id_does_not_quarantine_venue_order_in_public_tick_and_stop(tmp_path):
     e,x,lp,s=setup(tmp_path)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
     e.lp_auto_set_desired_running(True)
@@ -963,18 +986,20 @@ def test_conflicting_identity_stays_quarantined_in_public_tick_and_stop(tmp_path
     sid=e.lp_auto_run_once()['intents'][0]['session_id']
     cancellations=[]
     x.cancel_order=lambda oid:cancellations.append(oid) or {'canceled':[oid]}
-    assert e.lp_tick()['state']=='needs_attention'
-    x.orders=[dict(order_id='prepared-id',token_id='m00',condition_id='m00',side='BUY',status='LIVE',price='.4',original_size='20',size_matched='0')]
+    assert e.lp_tick()['state']=='entry_open'
+    session=s.lp_session(sid)
+    assert session['owned_order_ids']==['o1']
+    assert 'order_identity_conflict' not in session
     original=x.direction
     def depleted(n):
         d=original(n)
         d['book']['bids'][0]['size']='20'
         return d
     x.direction=depleted
-    assert e.lp_tick()['state']=='needs_attention'
-    assert s.lp_session(sid)['reconciliation']=='order_identity_conflict'
-    assert e.lp_stop(sid)['state']=='needs_attention'
-    assert not cancellations and len(x.posts)==1
+    assert e.lp_stop(sid)['state']=='review'
+    assert cancellations==['o1']
+    assert 'prepared-id' not in cancellations
+    assert len(x.posts)==1
 
 
 def test_slow_deadline_cancel_does_not_block_other_fact_publication(tmp_path):

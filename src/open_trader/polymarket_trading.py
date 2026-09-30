@@ -2043,9 +2043,12 @@ class PolymarketTradingClient:
         datetime,
         tuple[object, ...],
         bool,
+        datetime,
+        datetime,
     ]:
         response_facts: dict[str, object] = {}
         remove_hooks = []
+        read_started_at = datetime.now(UTC)
         try:
             for transport_name, path in (
                 ("secure_clob", "/balance-allowance"),
@@ -2087,6 +2090,8 @@ class PolymarketTradingClient:
                 checked_at,
                 trades,
                 True,
+                read_started_at,
+                datetime.now(UTC),
             )
         except Exception as exc:
             code = _safe_error_code(exc)
@@ -2106,6 +2111,8 @@ class PolymarketTradingClient:
             checked_at,
             _raw_trades,
             _trades_complete,
+            _read_started_at,
+            _read_ended_at,
         ) = self._account_read_facts()
         open_order_ids = tuple(
             _safe_string(order_id)
@@ -2130,7 +2137,10 @@ class PolymarketTradingClient:
         )
 
     def lp_account_snapshot_shared(
-        self, max_age_seconds: float = 10.0
+        self,
+        max_age_seconds: float = 10.0,
+        *,
+        trade_generation_provider: Callable[[], int] | None = None,
     ) -> dict[str, object]:
         """Return a shared LP account snapshot within the TTL window.
 
@@ -2155,19 +2165,38 @@ class PolymarketTradingClient:
                     isinstance(snapshot, Mapping)
                     and age is not None
                     and age <= max_age_seconds
+                    and (
+                        trade_generation_provider is None
+                        or (
+                            isinstance(snapshot.get("trade_generation"), int)
+                            and snapshot["trade_generation"] == trade_generation_provider()
+                        )
+                    )
                 ):
                     return deepcopy(dict(snapshot))
-            snapshot = self.lp_account_snapshot()
+            if trade_generation_provider is None:
+                snapshot = self.lp_account_snapshot()
+            else:
+                token = self.lp_account_round_begin(trade_generation_provider)
+                try:
+                    snapshot = self.lp_account_snapshot(account_round=token)
+                finally:
+                    self.lp_account_round_end(token)
             self._lp_account_shared_cache = {
                 "snapshot": deepcopy(snapshot),
                 "fetched_at": time.monotonic(),
             }
             return deepcopy(snapshot)
 
-    def lp_account_snapshot(self) -> dict[str, object]:
+    def lp_account_snapshot(
+        self, account_round: object | None = None
+    ) -> dict[str, object]:
         """Return current account orders and holdings for the read-only LP panel."""
-        account = self._lp_account_facts(include_raw_trades=True)
-        raw_trades = account.pop("raw_trades", ())
+        if account_round is None:
+            account = self._lp_account_facts(include_raw_trades=True)
+        else:
+            account = dict(self._lp_account_snapshot_for_round(account_round)[0])
+        raw_trades = account.get("raw_trades", ())
         normalized_trades = []
         complete = account.get("trades_complete") is True
         for raw in raw_trades:
@@ -2270,6 +2299,10 @@ class PolymarketTradingClient:
                         token.future = None
                 future.set_exception(LpAccountRoundInvalid("lp_account_round_invalid"))
                 raise LpAccountRoundInvalid("lp_account_round_invalid")
+            snapshot = {
+                **snapshot,
+                "trade_generation": after_generation,
+            }
             with token.lock:
                 future.set_result((snapshot, after_generation))
                 if token.future is future:
@@ -2317,15 +2350,10 @@ class PolymarketTradingClient:
 
         lp_checked_at = datetime.now(UTC)
         try:
-            (
-                balance,
-                allowance,
-                orders,
-                positions,
-                account_checked_at,
-                raw_trades,
-                trades_complete,
-            ) = self._account_read_facts()
+            facts = tuple(self._account_read_facts())
+            balance, allowance, orders, positions, account_checked_at, raw_trades, trades_complete = facts[:7]
+            read_started_at = facts[7] if len(facts) > 7 else account_checked_at
+            read_ended_at = facts[8] if len(facts) > 8 else datetime.now(UTC)
         except PolymarketTradingError as exc:
             facts = exc.response_facts
             if facts.get("status") == 401:
@@ -2384,18 +2412,29 @@ class PolymarketTradingClient:
         return {
             "authenticated": True,
             "wallet_address": self.config.wallet_address,
+            "account_id": (
+                self.config.wallet_address.strip().casefold()
+                if isinstance(self.config.wallet_address, str)
+                else ""
+            ),
+            "read_started_at": read_started_at,
             "balance": balance,
             "allowance": allowance,
+            "balance_complete": True,
             "open_orders": tuple(order_rows),
             "positions": tuple(position_rows),
             "checked_at": checked_at,
+            "read_ended_at": read_ended_at,
+            "pagination_complete": (
+                open_orders_complete and positions_complete and trades_complete
+            ),
             "open_orders_complete": open_orders_complete,
             "positions_complete": positions_complete,
             # Normalize only session-relevant raw rows in lp_snapshot.  A bad
             # unrelated historical row must not poison every active market.
             "trades": (),
             "trades_complete": trades_complete,
-            **({"raw_trades": raw_trades} if include_raw_trades else {}),
+            "raw_trades": raw_trades,
         }
 
     def lp_open_orders_snapshot(self) -> dict[str, object]:
@@ -4818,7 +4857,9 @@ class PolymarketTradingClient:
             order_read_errors = {}
             missing_order_ids = order_ids - known_ids
             bundle_receipt_facts = (
-                _lp_bundle_receipt_facts(account.get("raw_trades", ()))
+                _lp_bundle_receipt_facts(
+                    account.get("raw_trades", ()),
+                )
                 if missing_order_ids
                 else {}
             )
@@ -4996,9 +5037,10 @@ class PolymarketTradingClient:
             post_only=post_only is True,
             expiration=cast(int | None, expiration),
         )
-        if post_only is not True or expiration is None:
+        if post_only is not True:
             raise PolymarketTradingError("order_shape_mismatch")
-        if _field(signed, "post_only") is not True or str(_field(signed, "order_type", "")).upper() != "GTD":
+        expected_type = "GTC" if expiration is None else "GTD"
+        if _field(signed, "post_only") is not True or str(_field(signed, "order_type", "")).upper() != expected_type:
             raise PolymarketTradingError("order_shape_mismatch")
         return signed
 

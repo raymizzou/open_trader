@@ -25,6 +25,12 @@ from open_trader.llm_providers import DEFAULT_PROVIDER, PROVIDER_IDS
 from open_trader.prediction_arbitrage import MAX_CROSS_UNSETTLED_PRINCIPAL
 from open_trader.prediction_n_leg import fingerprint as canonical_fingerprint
 from open_trader.prediction_n_leg_episodes import CLOSE_NO_QUALIFIED_OPPORTUNITY
+from open_trader.polymarket_lp_risk import (
+    LP_QUEUE_PROTECTION_THRESHOLD,
+    TERMINAL_ORDER_STATES,
+    _items,
+    _maybe_decimal,
+)
 
 StoreHistoryKind = Literal["signals", "executions", "incidents"]
 SignalHistoryWindow = Literal["24h", "7d", "30d", "all"]
@@ -4766,7 +4772,768 @@ class PredictionArbitrageStore:
                 "SELECT * FROM lp_sessions WHERE session_id=?", (str(session_id),)
             ).fetchone()
             assert updated is not None
-            return self._lp_row_result(updated)
+        return self._lp_row_result(updated)
+
+    @staticmethod
+    def _lp_order_state_rank(status: object) -> int:
+        value = str(status or "").upper()
+        if value in TERMINAL_ORDER_STATES:
+            return 2
+        if value in {"LIVE", "OPEN", "ACCEPTED", "PENDING"}:
+            return 1
+        return 0
+
+    @classmethod
+    def _lp_register_order_record(cls, raw: Mapping[str, object]) -> dict[str, object]:
+        order_id = str(raw.get("order_id") or raw.get("id") or "").strip()
+        token_id = str(raw.get("token_id") or raw.get("asset_id") or "").strip()
+        side = str(raw.get("side") or "").strip().upper()
+        if not order_id or not token_id or side not in {"BUY", "SELL"}:
+            raise ValueError("order_identity_unknown")
+
+        def decimal(name: str) -> Decimal | None:
+            value = raw.get(name)
+            if value is None or value == "":
+                return None
+            try:
+                parsed = value if isinstance(value, Decimal) else Decimal(str(value))
+            except (InvalidOperation, ValueError) as exc:
+                raise ValueError(f"{name}_invalid") from exc
+            if not parsed.is_finite() or parsed < 0:
+                raise ValueError(f"{name}_invalid")
+            return parsed
+
+        return {
+            "order_id": order_id,
+            "token_id": token_id,
+            "side": side,
+            "status": str(raw.get("status") or "UNKNOWN").upper(),
+            "price": decimal("price"),
+            "quantity": decimal("original_size") if "original_size" in raw else decimal("quantity"),
+            "size_matched": decimal("size_matched"),
+            "average_price": decimal("average_price"),
+            "order_type": raw.get("order_type"),
+            "expiration": raw.get("expiration", raw.get("expires_at")),
+            "created_at": raw.get("created_at"),
+            "fills": raw.get("fills", ()),
+            "remaining_size": decimal("remaining_size"),
+            "queue_baseline": raw.get("_queue_baseline", raw.get("queue_baseline")),
+        }
+
+    @staticmethod
+    def _lp_owned_session_ids(payload: Mapping[str, object]) -> set[str]:
+        history = payload.get("order_history")
+        ids = {
+            str(key)
+            for key in (history.keys() if isinstance(history, Mapping) else ())
+        }
+        for field in (
+            "owned_order_ids",
+            "augment_order_ids",
+            "entry_order_id",
+            "passive_exit_order_id",
+            "protected_exit_order_id",
+        ):
+            value = payload.get(field)
+            if isinstance(value, (list, tuple)):
+                ids.update(str(item) for item in value if item)
+            elif value:
+                ids.add(str(value))
+        return ids
+
+    @classmethod
+    def _lp_merge_order_record(
+        cls, current: object, incoming: Mapping[str, object]
+    ) -> dict[str, object]:
+        base = dict(current) if isinstance(current, Mapping) else {}
+        if base and base.get("order_id") != incoming["order_id"]:
+            raise ValueError("order_identity_conflict")
+        for field in ("token_id", "side"):
+            known = str(base.get(field) or "").strip()
+            value = str(incoming.get(field) or "").strip()
+            if known and value and known.upper() != value.upper():
+                raise ValueError("order_identity_conflict")
+            base[field] = known or incoming[field]
+        current_rank = cls._lp_order_state_rank(base.get("status"))
+        incoming_rank = cls._lp_order_state_rank(incoming.get("status"))
+        if current_rank >= incoming_rank:
+            base["status"] = base.get("status") or incoming["status"]
+        else:
+            base["status"] = incoming["status"]
+        # SQLite JSON reads money/quantity fields as strings.  Normalize
+        # before any comparison or a restarted process would let a stale
+        # lower cumulative fill overwrite the durable higher value.
+        old_price = _maybe_decimal(base.get("price"))
+        new_price = _maybe_decimal(incoming.get("price"))
+        base["price"] = old_price if old_price is not None else new_price
+        old_quantity = _maybe_decimal(base.get("quantity"))
+        new_quantity = _maybe_decimal(incoming.get("quantity"))
+        base["quantity"] = old_quantity if old_quantity is not None else new_quantity
+        old_matched = _maybe_decimal(base.get("size_matched"))
+        new_matched = _maybe_decimal(incoming.get("size_matched"))
+        matched = max(
+            value for value in (old_matched, new_matched) if value is not None
+        ) if old_matched is not None or new_matched is not None else None
+        base["size_matched"] = matched
+        old_average = _maybe_decimal(base.get("average_price"))
+        new_average = _maybe_decimal(incoming.get("average_price"))
+        if new_average is not None and (
+            old_average is None
+            or (matched is not None and old_matched is not None and matched > old_matched)
+            or (matched is not None and old_matched is None)
+        ):
+            base["average_price"] = new_average
+        else:
+            base["average_price"] = old_average if old_average is not None else new_average
+        for field in ("order_type", "expiration", "created_at"):
+            if base.get(field) in (None, "") and incoming.get(field) not in (None, ""):
+                base[field] = incoming.get(field)
+        for field in ("remaining_size", "queue_baseline"):
+            if base.get(field) in (None, "") and incoming.get(field) not in (None, ""):
+                base[field] = incoming.get(field)
+        base["order_id"] = incoming["order_id"]
+        old_fills = base.get("fills", ())
+        new_fills = incoming.get("fills", ())
+        if isinstance(old_fills, (list, tuple)) and isinstance(new_fills, (list, tuple)):
+            fills = {
+                str(item.get("trade_id")): dict(item)
+                for item in old_fills
+                if isinstance(item, Mapping) and item.get("trade_id")
+            }
+            for item in new_fills:
+                if not isinstance(item, Mapping) or not item.get("trade_id"):
+                    continue
+                key = str(item["trade_id"])
+                existing = fills.get(key)
+                if existing is not None and not cls._lp_fill_facts_equal(existing, item):
+                    raise ValueError("trade_fill_conflict")
+                fills[key] = dict(item)
+            base["fills"] = list(fills.values())
+        return base
+
+    @staticmethod
+    def _lp_fill_facts_equal(left: object, right: object) -> bool:
+        """Compare persisted fill numbers without JSON Decimal/string drift."""
+
+        if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+            return left == right
+        for key in set(left) | set(right):
+            old = left.get(key)
+            new = right.get(key)
+            if key in {"quantity", "price", "notional", "size"}:
+                old_value = _maybe_decimal(old)
+                new_value = _maybe_decimal(new)
+                if old_value != new_value:
+                    return False
+            elif old != new:
+                return False
+        return True
+
+    def lp_register_exchange_orders(
+        self,
+        account_id: str,
+        token_id: str,
+        orders: object,
+        *,
+        session: Mapping[str, object] | None = None,
+        connection: sqlite3.Connection | None = None,
+        expected_generation: int | None = None,
+    ) -> dict[str, object]:
+        """Atomically adopt exchange IDs into their canonical LP owners.
+
+        Ownership is rechecked from the latest database value inside this
+        transaction.  Known IDs return to their original sessions; only IDs
+        absent from every account-owned session may create or join the active
+        token group.  When ``connection`` is supplied the caller owns commit
+        and rollback.
+        """
+
+        by_id: dict[str, dict[str, object]] = {}
+        for raw in (orders if isinstance(orders, (list, tuple)) else []):
+            if not isinstance(raw, Mapping):
+                continue
+            record = self._lp_register_order_record(raw)
+            previous = by_id.get(record["order_id"])
+            by_id[record["order_id"]] = (
+                self._lp_merge_order_record(previous, record)
+                if previous is not None
+                else record
+            )
+        records = list(by_id.values())
+        if not records:
+            raise ValueError("orders_empty")
+        canonical_account = str(account_id or "").strip().casefold()
+        canonical_token = str(token_id or "").strip()
+        if not canonical_account or not canonical_token:
+            raise ValueError("account_identity_unknown")
+        if any(record["token_id"] != canonical_token for record in records):
+            raise ValueError("order_identity_conflict")
+
+        cm = self._transaction() if connection is None else nullcontext(connection)
+        with cm as tx:
+            if expected_generation is not None:
+                generation = tx.execute(
+                    "SELECT generation FROM lp_trade_generation WHERE singleton=1"
+                ).fetchone()
+                if generation is None or int(generation["generation"]) != int(expected_generation):
+                    raise ValueError("account_round_invalid")
+
+            loaded = [
+                (row, _load_payload(str(row["payload"])))
+                for row in tx.execute(
+                    "SELECT * FROM lp_sessions ORDER BY updated_at,session_id"
+                ).fetchall()
+            ]
+            explicit_owners: dict[tuple[str, str], tuple[sqlite3.Row, dict[str, object]]] = {}
+            legacy_owners: dict[str, tuple[sqlite3.Row, dict[str, object]]] = {}
+            for row, payload in loaded:
+                account = str(payload.get("account_id") or "").strip().casefold()
+                if account:
+                    for order_id in self._lp_owned_session_ids(payload):
+                        previous = explicit_owners.get((account, order_id))
+                        if previous is not None and previous[0]["session_id"] != row["session_id"]:
+                            raise ValueError("order_identity_conflict")
+                        explicit_owners[(account, order_id)] = (row, payload)
+                else:
+                    for order_id in self._lp_owned_session_ids(payload):
+                        previous = legacy_owners.get(order_id)
+                        if previous is not None and previous[0]["session_id"] != row["session_id"]:
+                            raise ValueError("legacy_order_ambiguous")
+                        legacy_owners[order_id] = (row, payload)
+
+            routed: dict[str, list[dict[str, object]]] = {}
+            routed_rows: dict[str, sqlite3.Row] = {}
+            legacy_takeovers: set[str] = set()
+            unknown: list[dict[str, object]] = []
+            first_owner_id: str | None = None
+            for record in records:
+                owner = explicit_owners.get((canonical_account, record["order_id"]))
+                if owner is None:
+                    owner = legacy_owners.get(record["order_id"])
+                    if owner is not None:
+                        legacy_takeovers.add(str(owner[0]["session_id"]))
+                if owner is None:
+                    unknown.append(record)
+                    continue
+                session_id = str(owner[0]["session_id"])
+                first_owner_id = first_owner_id or session_id
+                routed.setdefault(session_id, []).append(record)
+                routed_rows[session_id] = owner[0]
+
+            active_candidates = [
+                item
+                for item in loaded
+                if str(item[1].get("token_id") or "") == canonical_token
+                and str(item[1].get("account_id") or "").strip().casefold() == canonical_account
+                and str(item[0]["state"]) not in {"complete", "entry_rejected"}
+            ]
+            if len(active_candidates) > 1:
+                raise ValueError("lp_session_group_ambiguous")
+            active = active_candidates[-1] if active_candidates else None
+            active_id = str(active[0]["session_id"]) if active is not None else None
+            candidate_id = str((session or {}).get("session_id") or "")
+            candidate_item = next(
+                (item for item in loaded if str(item[0]["session_id"]) == candidate_id),
+                None,
+            )
+            if candidate_item is not None:
+                candidate_payload = candidate_item[1]
+                candidate_account = str(candidate_payload.get("account_id") or "").strip().casefold()
+                if (
+                    str(candidate_payload.get("token_id") or "") != canonical_token
+                    or (
+                        candidate_account
+                        and candidate_account != canonical_account
+                    )
+                ):
+                    raise ValueError("account_order_conflict")
+                candidate_is_active = str(candidate_item[0]["state"]) not in {
+                    "complete", "entry_rejected"
+                }
+                if unknown and candidate_is_active:
+                    active_id = candidate_id
+                    active = candidate_item
+            if unknown and active_id is not None:
+                routed.setdefault(active_id, []).extend(unknown)
+                routed_rows[active_id] = active[0]
+            elif unknown and routed:
+                # A completed historical owner must never absorb a new
+                # lifecycle.  New IDs require the caller to supply a candidate
+                # when this account/token has no active group.
+                if session is None:
+                    raise ValueError("lp_session_candidate_required")
+
+            updated: list[dict[str, object]] = []
+            changed_any = False
+            fallback_owner_id = next(iter(routed), None)
+            for session_id, session_records in routed.items():
+                row = routed_rows[session_id]
+                payload = next(item[1] for item in loaded if str(item[0]["session_id"]) == session_id)
+                changed = self._lp_merge_registered_orders(payload, session_records)
+                if session_id in legacy_takeovers and str(payload.get("account_id") or "").casefold() != canonical_account:
+                    payload["account_id"] = canonical_account
+                    changed = True
+                if not changed:
+                    continue
+                changed_any = True
+                # Account-sync observations are not fresh-enough financial
+                # facts: they only establish identity, so previously verified
+                # economics must wait for reconciliation. A direct receipt
+                # follows a durable accepted action; its existing trade fence
+                # already blocks spend/resend, so identity merge preserves the
+                # prior as-of financial flags instead of fabricating new ones.
+                if (
+                    expected_generation is not None
+                    and payload.get("position_reconciled") is True
+                ):
+                    payload["position_reconciled"] = False
+                    payload["facts_error"] = "trade_change_pending"
+                payload["_lp_trade_revision"] = int(payload.get("_lp_trade_revision", 0) or 0) + 1
+                payload["_lp_revision"] = self._lp_payload_revision(payload) + 1
+                tx.execute(
+                    "UPDATE lp_sessions SET payload=?,updated_at=? WHERE session_id=?",
+                    (_dump_execution_payload(payload), _utc_now(), session_id),
+                )
+                refreshed = tx.execute(
+                    "SELECT * FROM lp_sessions WHERE session_id=?", (session_id,)
+                ).fetchone()
+                assert refreshed is not None
+                updated.append(self._lp_row_result(refreshed))
+
+            episode_id = str((session or {}).get("_first_seen_episode_id") or "")
+            episode_target_id = active_id or next(iter(routed), None)
+            if episode_id and episode_target_id:
+                episode_row = tx.execute(
+                    "SELECT * FROM lp_first_seen_episodes WHERE episode_id=?",
+                    (episode_id,),
+                ).fetchone()
+                if episode_row is not None and episode_row["state"] in {
+                    "monitoring", "canceling", "blocked"
+                }:
+                    target_item = next(
+                        (
+                            item for item in loaded
+                            if str(item[0]["session_id"]) == episode_target_id
+                        ),
+                        None,
+                    )
+                    if target_item is None:
+                        raise ValueError("lp_first_seen_episode_not_found")
+                    target_payload = target_item[1]
+                    episode_payload = _load_payload(str(episode_row["payload"]))
+                    if self._lp_merge_first_seen_protection(target_payload, episode_payload):
+                        target_payload["_lp_trade_revision"] = int(
+                            target_payload.get("_lp_trade_revision", 0) or 0
+                        ) + 1
+                        target_payload["_lp_revision"] = self._lp_payload_revision(
+                            target_payload
+                        ) + 1
+                        tx.execute(
+                            "UPDATE lp_sessions SET payload=?,updated_at=? WHERE session_id=?",
+                            (
+                                _dump_execution_payload(target_payload),
+                                _utc_now(),
+                                episode_target_id,
+                            ),
+                        )
+                        refreshed = tx.execute(
+                            "SELECT * FROM lp_sessions WHERE session_id=?",
+                            (episode_target_id,),
+                        ).fetchone()
+                        assert refreshed is not None
+                        updated[:] = [
+                            item for item in updated
+                            if item.get("session_id") != episode_target_id
+                        ]
+                        updated.append(self._lp_row_result(refreshed))
+                        changed_any = True
+                    converted = tx.execute(
+                        "UPDATE lp_first_seen_episodes "
+                        "SET state='converted',payload=json_set(payload,'$.converted_reason','exchange_registration'),updated_at=? "
+                        "WHERE episode_id=? AND state IN ('monitoring','canceling','blocked')",
+                        (_utc_now(), episode_id),
+                    )
+                    if converted.rowcount != 1:
+                        raise ValueError("lp_first_seen_episode_not_found")
+
+            created_session = None
+            if unknown and active_id is None:
+                prepared = dict(session or {})
+                if not prepared:
+                    raise ValueError("lp_session_candidate_required")
+                episode_id = str(prepared.pop("_first_seen_episode_id", "") or "")
+                prepared["account_id"] = canonical_account
+                prepared["token_id"] = canonical_token
+                unknown_ids = {record["order_id"] for record in unknown}
+                candidate_history = (
+                    prepared.get("order_history")
+                    if isinstance(prepared.get("order_history"), Mapping)
+                    else {}
+                )
+                prepared["order_history"] = {
+                    order_id: record
+                    for order_id, record in candidate_history.items()
+                    if str(order_id) in unknown_ids
+                }
+                prepared["owned_order_ids"] = [
+                    order_id
+                    for order_id in prepared.get("owned_order_ids", ())
+                    if str(order_id) in unknown_ids
+                ]
+                if prepared.get("entry_order_id") not in unknown_ids:
+                    prepared["entry_order_id"] = None
+                if prepared.get("passive_exit_order_id") not in unknown_ids:
+                    prepared["passive_exit_order_id"] = None
+                prepared["augment_order_ids"] = []
+                self._lp_merge_registered_orders(prepared, unknown)
+                session_id = str(prepared.get("session_id") or uuid.uuid4().hex)
+                prepared["session_id"] = session_id
+                prepared.pop("_lp_revision", None)
+                prepared.pop("_lp_trade_revision", None)
+                state = str(prepared.pop("state", "entry_open") or "entry_open")
+                idempotency_key = str(
+                    prepared.pop("idempotency_key", f"lp-sync:{session_id}")
+                    or f"lp-sync:{session_id}"
+                )
+                try:
+                    tx.execute(
+                        "INSERT INTO lp_sessions(session_id,idempotency_key,state,payload,created_at,updated_at) "
+                        "VALUES (?,?,?,?,?,?)",
+                        (
+                            session_id,
+                            idempotency_key,
+                            state,
+                            _dump_execution_payload({**prepared, "_lp_revision": 0}),
+                            _utc_now(),
+                            _utc_now(),
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    if "one_active_lp_session_market" in str(exc):
+                        raise ValueError("lp_session_market_active") from exc
+                    raise
+                if episode_id:
+                    converted = tx.execute(
+                        "UPDATE lp_first_seen_episodes "
+                        "SET state='converted',payload=json_set(payload,'$.converted_reason','exchange_registration'),updated_at=? "
+                        "WHERE episode_id=? AND state NOT IN ('converted','cancelled')",
+                        (_utc_now(), episode_id),
+                    )
+                    if converted.rowcount != 1:
+                        raise ValueError("lp_first_seen_episode_not_found")
+                result = tx.execute(
+                    "SELECT * FROM lp_sessions WHERE session_id=?", (session_id,)
+                ).fetchone()
+                assert result is not None
+                created_session = self._lp_row_result(result)
+
+            primary = created_session
+            if primary is None and not unknown and first_owner_id is not None:
+                primary = next(
+                    (item for item in updated if item.get("session_id") == first_owner_id),
+                    None,
+                )
+                if primary is None:
+                    row = tx.execute(
+                        "SELECT * FROM lp_sessions WHERE session_id=?", (first_owner_id,)
+                    ).fetchone()
+                    primary = None if row is None else self._lp_row_result(row)
+            if primary is None and unknown and active_id is None and fallback_owner_id is not None:
+                primary = next(
+                    (item for item in updated if item.get("session_id") == fallback_owner_id),
+                    None,
+                )
+                if primary is None:
+                    row = tx.execute(
+                        "SELECT * FROM lp_sessions WHERE session_id=?", (fallback_owner_id,)
+                    ).fetchone()
+                    primary = None if row is None else self._lp_row_result(row)
+            if primary is None and active_id is not None:
+                primary = next(
+                    (item for item in updated if item.get("session_id") == active_id),
+                    None,
+                )
+                if primary is None:
+                    row = tx.execute(
+                        "SELECT * FROM lp_sessions WHERE session_id=?", (active_id,)
+                    ).fetchone()
+                    primary = None if row is None else self._lp_row_result(row)
+            elif primary is None and updated:
+                primary = updated[-1]
+            if primary is None:
+                raise ValueError("lp_session_not_found")
+        return {
+            "session": primary,
+            "updated_sessions": updated,
+            "created": created_session is not None,
+            "changed": changed_any or created_session is not None,
+        }
+
+    @staticmethod
+    def _lp_merge_first_seen_protection(
+        payload: dict[str, object], episode_payload: Mapping[str, object]
+    ) -> bool:
+        """Fill only missing/UNKNOWN buckets from a legacy first-seen anchor."""
+
+        price = _maybe_decimal(episode_payload.get("baseline_price"))
+        if price is None:
+            return False
+        anchors = episode_payload.get("anchor_order_ids")
+        anchor = (
+            episode_payload.get("order_id")
+            or (str(anchors[0]) if isinstance(anchors, (list, tuple)) and anchors else "")
+            or payload.get("entry_order_id")
+            or ""
+        )
+        bucket = dict(episode_payload)
+        for group_field in ("version", "levels", "data_failures"):
+            bucket.pop(group_field, None)
+        bucket["order_id"] = str(anchor)
+        key = format(price, "f")
+        current = payload.get("queue_protection")
+        current_levels = current.get("levels") if isinstance(current, Mapping) else None
+        if isinstance(current_levels, Mapping):
+            merged = dict(current_levels)
+            existing = merged.get(key)
+            if isinstance(existing, Mapping) and str(existing.get("state") or "") not in {
+                "", "unknown"
+            }:
+                return False
+            merged[key] = bucket
+            payload["queue_protection"] = {
+                **(current if isinstance(current, Mapping) else {}),
+                "version": 2,
+                "levels": merged,
+            }
+            return True
+        if isinstance(current, Mapping) and str(current.get("state") or "") not in {
+            "", "unknown"
+        }:
+            return False
+        payload["queue_protection"] = {
+            "version": 2,
+            "data_failures": _queue_group_failures_int(
+                current.get("data_failures") if isinstance(current, Mapping) else None
+            ),
+            "levels": {key: bucket},
+        }
+        return True
+
+    @classmethod
+    def _lp_merge_registered_orders(
+        cls, payload: dict[str, object], records: list[dict[str, object]]
+    ) -> bool:
+        """Merge exact-ID facts into the latest payload and derive group roles."""
+
+        changed = False
+        old_ids = cls._lp_owned_session_ids(payload)
+        def amount(record: Mapping[str, object], field: str) -> Decimal:
+            return _maybe_decimal(record.get(field)) or Decimal("0")
+
+        history = dict(
+            payload.get("order_history")
+            if isinstance(payload.get("order_history"), Mapping)
+            else {}
+        )
+        for record in records:
+            record["token_id"] = record["token_id"] or str(payload.get("token_id") or "")
+            existing = history.get(record["order_id"])
+            history[record["order_id"]] = cls._lp_merge_order_record(
+                existing, record
+            )
+            if cls._lp_order_record_changed(existing, history[record["order_id"]]):
+                changed = True
+            if record["order_id"] not in old_ids:
+                payload.setdefault("owned_order_ids", []).append(record["order_id"])
+                changed = True
+        payload["order_history"] = history
+        buys = {
+            order_id: record
+            for order_id, record in history.items()
+            if str(record.get("side") or "").upper() == "BUY"
+        }
+        sells = {
+            order_id: record
+            for order_id, record in history.items()
+            if str(record.get("side") or "").upper() == "SELL"
+        }
+        entry = str(payload.get("entry_order_id") or "")
+        if entry not in buys:
+            entry = next(iter(buys), "")
+        if entry and payload.get("entry_order_id") != entry:
+            payload["entry_order_id"] = entry
+            changed = True
+        passive = str(payload.get("passive_exit_order_id") or "")
+        if passive not in sells:
+            passive = next(iter(sells), "")
+        if passive and payload.get("passive_exit_order_id") != passive:
+            payload["passive_exit_order_id"] = passive
+            changed = True
+        augment = [order_id for order_id in buys if order_id != entry]
+        if payload.get("augment_order_ids") != augment:
+            payload["augment_order_ids"] = augment
+            changed = True
+        protection = payload.get("queue_protection")
+        if isinstance(protection, Mapping):
+            levels = protection.get("levels")
+            try:
+                baseline_price = Decimal(str(protection.get("baseline_price")))
+            except (InvalidOperation, ValueError, TypeError):
+                baseline_price = None
+            if not isinstance(levels, Mapping) and baseline_price is not None:
+                price = baseline_price
+                bucket = dict(protection)
+                for group_field in ("version", "levels", "data_failures"):
+                    bucket.pop(group_field, None)
+                anchors = _items(protection.get("anchor_order_ids"))
+                anchor = (
+                    protection.get("order_id")
+                    or (str(anchors[0]) if anchors else "")
+                    or payload.get("entry_order_id")
+                    or ""
+                )
+                bucket.setdefault("order_id", str(anchor or ""))
+                levels = {
+                    format(price, "f") if price is not None else "unknown": bucket
+                }
+                protection = {
+                    **protection,
+                    "version": 2,
+                    "levels": levels,
+                }
+            if isinstance(levels, Mapping):
+                merged_levels = {
+                    str(key): dict(value) if isinstance(value, Mapping) else value
+                    for key, value in levels.items()
+                }
+                for order_id, record in buys.items():
+                    if (
+                        str(record.get("status") or "").upper() in TERMINAL_ORDER_STATES
+                        or amount(record, "remaining_size") <= 0
+                    ):
+                        continue
+                    price = _maybe_decimal(record.get("price"))
+                    key = format(price, "f") if price is not None else "unknown"
+                    baseline = record.get("queue_baseline")
+                    if not (
+                        isinstance(baseline, Mapping)
+                        and baseline.get("state") == "known"
+                    ):
+                        if key in merged_levels and isinstance(
+                            merged_levels[key], Mapping
+                        ):
+                            existing_bucket = merged_levels[key]
+                            if str(existing_bucket.get("state") or "") != "unknown":
+                                continue
+                        continue
+                    if key in merged_levels and isinstance(merged_levels[key], Mapping):
+                        existing_bucket = merged_levels[key]
+                        if str(existing_bucket.get("state") or "") != "unknown":
+                            continue
+                        # A fresh first observation can complete an explicitly
+                        # UNKNOWN bucket. Terminal, canceling, notification,
+                        # and baseline evidence never enter this branch.
+                        merged_levels[key] = {
+                            **existing_bucket,
+                            **baseline,
+                            "order_id": str(
+                                existing_bucket.get("order_id") or order_id
+                            ),
+                            "baseline_source": "first_observation",
+                            "baseline_version": 1,
+                            "threshold": LP_QUEUE_PROTECTION_THRESHOLD,
+                            "state": "registered",
+                            "notification_sent": existing_bucket.get(
+                                "notification_sent", False
+                            ),
+                            "blocked_notified": existing_bucket.get(
+                                "blocked_notified", False
+                            ),
+                            "cancel_scope": existing_bucket.get(
+                                "cancel_scope", "own_buys_at_level"
+                            ),
+                        }
+                        changed = True
+                        continue
+                    bucket = (
+                        dict(baseline)
+                        if isinstance(baseline, Mapping) and baseline.get("state") == "known"
+                        else {
+                            "state": "unknown",
+                            "baseline_price": price,
+                            "baseline_source": "account_sync",
+                            "reason_codes": ["baseline_unknown"],
+                        }
+                    )
+                    own_remaining = sum(
+                        amount(level_buy, "remaining_size")
+                        for level_order_id, level_buy in buys.items()
+                        if level_order_id == order_id or _maybe_decimal(level_buy.get("price")) == price
+                    )
+                    merged_levels[key] = {
+                        **bucket,
+                        "order_id": order_id,
+                        "own_remaining": own_remaining,
+                        "baseline_version": 1,
+                        "threshold": LP_QUEUE_PROTECTION_THRESHOLD,
+                        "data_failures": 0,
+                        "notification_sent": False,
+                        "blocked_notified": False,
+                        "cancel_scope": "own_buys_at_level",
+                        "cancel_targets": [],
+                        "canceled_order_ids": [],
+                        "cancel_target_remaining": {},
+                        "canceled_remaining": None,
+                        "partially_filled_quantity": None,
+                        "reason_codes": [],
+                    }
+                    changed = True
+                payload["queue_protection"] = {**protection, "levels": merged_levels}
+
+        group_quantity = sum(
+            amount(record, "quantity") or amount(record, "size_matched")
+            for record in buys.values()
+        )
+        if group_quantity > 0:
+            payload["quantity"] = group_quantity
+            payload["group_buy_quantity"] = group_quantity
+        payload["orders_terminal"] = all(
+            str(record.get("status") or "").upper() in TERMINAL_ORDER_STATES
+            for record in history.values()
+        )
+        return changed
+
+    @classmethod
+    def _lp_order_record_changed(cls, left: object, right: object) -> bool:
+        """Return whether a merge added or semantically changed durable facts.
+
+        Fields present only in the older durable record are preserved and do
+        not make every later sparse replay look like a new revision.
+        """
+
+        if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+            return left != right
+        if any(right.get(key) not in (None, "", (), []) for key in set(right) - set(left)):
+            return True
+        for key in set(left) & set(right):
+            old = left.get(key)
+            new = right.get(key)
+            if key == "fills":
+                old_items = old if isinstance(old, (list, tuple)) else ()
+                new_items = new if isinstance(new, (list, tuple)) else ()
+                if len(old_items) != len(new_items):
+                    return True
+                if any(
+                    not cls._lp_fill_facts_equal(old_item, new_item)
+                    for old_item, new_item in zip(old_items, new_items)
+                ):
+                    return True
+            elif key in {"price", "quantity", "size_matched", "average_price", "remaining_size"}:
+                if _maybe_decimal(old) != _maybe_decimal(new):
+                    return True
+            elif str(old or "") != str(new or ""):
+                return True
+        return False
 
     @staticmethod
     def _merge_lp_protection(

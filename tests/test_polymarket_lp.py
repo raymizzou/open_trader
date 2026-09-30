@@ -37,6 +37,7 @@ from open_trader.prediction_arbitrage_store import (
 
 class _Exchange:
     def __init__(self) -> None:
+        self.config = SimpleNamespace(wallet_address="wallet")
         self.snapshot_value: dict[str, object] | None = None
         self.snapshots: list[dict[str, object]] = []
         self.snapshot_calls = 0
@@ -114,6 +115,7 @@ def _snapshot(now: datetime) -> dict[str, object]:
     return {
         "account": {
             "authenticated": True,
+            "wallet_address": "wallet",
             "balance": Decimal("100"),
             "allowance": Decimal("100"),
             "positions": [],
@@ -2872,6 +2874,9 @@ class _SDKPublicClient:
             neg_risk=False,
             hash="book-hash",
         )
+
+    def get_order_books(self, *, token_ids: list[str]) -> list[object]:
+        return [self.get_order_book(token_id=token_id) for token_id in token_ids]
 
     def get_order_scoring(self, *, order_id: str) -> bool:
         self.scoring_calls += 1

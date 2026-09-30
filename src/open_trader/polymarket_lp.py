@@ -47,7 +47,9 @@ from .polymarket_trading import (
     LpAccountReadError,
     LpAccountRoundInvalid,
     LpNewerAccountFacts,
+    _lp_maker_order_is_self,
     _lp_read_stage,
+    _lp_trade,
     _safe_read_error_chain,
 )
 
@@ -7469,73 +7471,58 @@ class PolymarketLPService:
         # Re-read after the post so the session merge starts from the latest
         # durable A/B state instead of the pre-submit snapshot.
         session = self.store.lp_session(session_id) or session
-        augment_ids = [
-            str(value) for value in _items(session.get("augment_order_ids"))
-        ]
-        if order_id not in augment_ids:
-            augment_ids.append(order_id)
-        order_history = self._order_history(session)
-        order_history[order_id] = {
-            "order_id": order_id,
-            "token_id": str(request["token_id"]),
-            "side": "BUY",
-            "status": str(_field(response, "status", "LIVE")).upper() or "LIVE",
-            "price": price,
-            "quantity": quantity,
-            "expiration": expiration,
-            "role": "augment",
-        }
-        # Issue 167: the augment registers its own price-level bucket — one
-        # resting order per level, so the issue 158 same-price merged
-        # re-anchor is retired for new orders (_augment_merge_estimate stays
-        # only as a legacy-payload read helper).  A legacy scalar payload
-        # wraps into its single entry bucket here, so the stored shape lands
-        # in the v2 {version, data_failures, levels} form naturally.
-        raw_protection = session.get("queue_protection")
-        levels = _queue_protection_level_buckets(
-            raw_protection,
-            default_order_id=str(session.get("entry_order_id") or ""),
+        session, receipt_changed = self._register_direct_receipt(
+            session,
+            order_id=order_id,
+            response=response,
+            side="BUY",
+            price=price,
+            quantity=quantity,
+            expiration=expiration,
         )
-        bucket: dict[str, object] = {
-            "order_id": order_id,
-            **self._queue_protection_baseline(request, snapshot),
-            "baseline_version": 1,
-            "threshold": LP_QUEUE_PROTECTION_THRESHOLD,
-            "state": "registered",
-            "notification_sent": False,
-            "blocked_notified": False,
-            "cancel_scope": "own_buys_at_level",
-            "cancel_targets": [],
-            "canceled_order_ids": [],
-            "cancel_target_remaining": {},
-            "canceled_remaining": None,
-            "partially_filled_quantity": None,
-            "reason_codes": [],
-        }
-        levels[format(price, "f")] = bucket
-        protection_payload: dict[str, object] = {
-            "version": 2,
-            "data_failures": _queue_group_failures_int(
-                raw_protection.get("data_failures")
-                if isinstance(raw_protection, Mapping)
-                else None
-            ),
-            "levels": levels,
-        }
-        # Issue 167: the group's ordered BUY ceiling grows by this augment so
-        # the fill accounting never trips opening_quantity_exceeded.
-        prior_group_quantity = _maybe_decimal(session.get("group_buy_quantity")) or (
-            _maybe_decimal(session.get("quantity")) or Decimal("0")
-        )
+        # A replayed receipt that was already adopted by sync has no new
+        # lifecycle and must never re-anchor its existing protection.
+        protection_payload = None
+        if receipt_changed:
+            raw_protection = session.get("queue_protection")
+            levels = _queue_protection_level_buckets(
+                raw_protection,
+                default_order_id=str(session.get("entry_order_id") or ""),
+            )
+            bucket: dict[str, object] = {
+                "order_id": order_id,
+                **self._queue_protection_baseline(request, snapshot),
+                "baseline_version": 1,
+                "threshold": LP_QUEUE_PROTECTION_THRESHOLD,
+                "state": "registered",
+                "notification_sent": False,
+                "blocked_notified": False,
+                "cancel_scope": "own_buys_at_level",
+                "cancel_targets": [],
+                "canceled_order_ids": [],
+                "cancel_target_remaining": {},
+                "canceled_remaining": None,
+                "partially_filled_quantity": None,
+                "reason_codes": [],
+            }
+            levels[format(price, "f")] = bucket
+            protection_payload = {
+                "version": 2,
+                "data_failures": _queue_group_failures_int(
+                    raw_protection.get("data_failures")
+                    if isinstance(raw_protection, Mapping)
+                    else None
+                ),
+                "levels": levels,
+            }
         session_patch = {
-            "augment_order_ids": augment_ids,
             "augment_order_id": order_id,
             "augment_quantity": quantity,
-            "group_buy_quantity": prior_group_quantity + quantity,
-            "order_history": order_history,
         }
         merger = getattr(self.store, "lp_merge_queue_protection", None)
-        if callable(merger):
+        if protection_payload is None:
+            updated = self.store.lp_update_session(session_id, patch=session_patch)
+        elif callable(merger):
             updated = merger(
                 session_id,
                 queue_protection=protection_payload,
@@ -7825,6 +7812,607 @@ class PolymarketLPService:
             "best_ask_price": ask_price,
             "best_ask_size": ask_size,
         }
+
+    @staticmethod
+    def _owned_sync_order_rows(
+        raw_trades: object, wallet_address: str
+    ) -> list[dict[str, object]]:
+        """Project only account-owned fills absent from an open-order list."""
+
+        # Key by (trade_id, order_id), so a paginated/repeated fill is
+        # idempotent while a contradictory page is a hard fact conflict.
+        fills: dict[str, dict[str, tuple[Decimal, Decimal]]] = {}
+        identities: dict[str, tuple[str, str, str]] = {}
+
+        def record(
+            *,
+            order_id: str,
+            condition_id: object,
+            token_id: object,
+            side: object,
+            price: object,
+            quantity: object,
+            trade_id: str,
+        ) -> None:
+            identity = (
+                str(condition_id or ""),
+                str(token_id or ""),
+                str(side or "").upper(),
+            )
+            known_identity = identities.setdefault(order_id, identity)
+            if known_identity != identity:
+                raise ValueError("order_identity_conflict")
+            parsed_price = _maybe_decimal(price)
+            parsed_quantity = _maybe_decimal(quantity)
+            if parsed_price is None or parsed_price <= 0 or parsed_quantity is None or parsed_quantity <= 0:
+                raise ValueError("trade_fill_unknown")
+            notional = parsed_price * parsed_quantity
+            trades = fills.setdefault(order_id, {})
+            previous = trades.get(trade_id)
+            if previous is not None:
+                if previous != (parsed_quantity, notional):
+                    raise ValueError("trade_fill_conflict")
+                return
+            trades[trade_id] = (parsed_quantity, notional)
+
+        for raw in _items(raw_trades):
+            trade = _lp_trade(raw)
+            if trade is None:
+                raise ValueError("trade_fact_invalid")
+            trade_id = str(trade.get("id") or "")
+            condition_id = trade.get("condition_id", trade.get("market"))
+            if trade.get("status") not in {"CONFIRMED", "MATCHED", "FILLED"}:
+                continue
+            if (
+                trade.get("trader_side") == "TAKER"
+                and trade.get("taker_order_id")
+            ):
+                record(
+                    order_id=str(trade["taker_order_id"]),
+                    condition_id=condition_id,
+                    token_id=trade.get("token_id", trade.get("asset_id")),
+                    side=trade.get("side"),
+                    price=trade.get("price"),
+                    quantity=trade.get("size"),
+                    trade_id=trade_id,
+                )
+            for maker in _items(trade.get("maker_orders", ())):
+                if not isinstance(maker, Mapping):
+                    continue
+                maker_id = str(maker.get("order_id") or "")
+                if not maker_id or not _lp_maker_order_is_self(maker, wallet_address):
+                    continue
+                record(
+                    order_id=maker_id,
+                    condition_id=condition_id,
+                    token_id=maker.get("token_id", maker.get("asset_id")),
+                    side=maker.get("side"),
+                    price=maker.get("price"),
+                    quantity=maker.get("matched_amount"),
+                    trade_id=trade_id,
+                )
+
+        rows: list[dict[str, object]] = []
+        for order_id in sorted(fills):
+            condition_id, token_id, side = identities[order_id]
+            trades = fills[order_id]
+            quantity = sum((amount for amount, _ in trades.values()), Decimal("0"))
+            notional = sum((amount for _, amount in trades.values()), Decimal("0"))
+            average_price = notional / quantity
+            rows.append(
+                {
+                    "order_id": order_id,
+                    "condition_id": condition_id,
+                    "token_id": token_id,
+                    "side": side,
+                    "price": average_price,
+                    "average_price": average_price,
+                    # Fills prove volume, not the original order size or
+                    # terminal lifecycle.  The existing lp_snapshot get_order
+                    # path supplies those facts through exact order IDs.
+                    "original_size": None,
+                    "quantity": None,
+                    "remaining_size": None,
+                    "size_matched": quantity,
+                    "status": "UNKNOWN",
+                    "fills": tuple(
+                        {
+                            "trade_id": trade_id,
+                            "quantity": amount,
+                            "price": amount_price,
+                            "notional": amount_notional,
+                        }
+                        for trade_id, (amount, amount_notional) in trades.items()
+                        for amount_price in [amount_notional / amount]
+                    ),
+                }
+            )
+        return rows
+
+    @staticmethod
+    def _sync_order_history_row(row: Mapping[str, object]) -> dict[str, object]:
+        order_id = str(_field(row, "order_id", _field(row, "id", "")) or "")
+        return {
+            "order_id": order_id,
+            "token_id": str(_field(row, "token_id", _field(row, "asset_id", "")) or ""),
+            "side": str(_field(row, "side", "") or "").upper(),
+            "status": str(_field(row, "status", "") or "").upper(),
+            "price": _maybe_decimal(_field(row, "price")),
+            "quantity": _maybe_decimal(_field(row, "original_size", _field(row, "size"))),
+            "size_matched": _maybe_decimal(_field(row, "size_matched", _field(row, "matched_amount"))),
+            "average_price": _maybe_decimal(_field(row, "average_price")),
+            "order_type": _field(row, "order_type"),
+            "expiration": _field(row, "expiration", _field(row, "expires_at")),
+            "created_at": _field(row, "created_at"),
+        }
+
+    def _existing_token_session(self, token_id: str) -> Mapping[str, object] | None:
+        account_id = str(
+            getattr(getattr(self.exchange, "config", None), "wallet_address", "") or ""
+        ).strip().casefold()
+        return next(
+            (
+                session
+                for session in self.store.lp_active_sessions()
+                if str(session.get("token_id") or "") == token_id
+                and str(session.get("account_id") or "").strip().casefold() == account_id
+            ),
+            None,
+        )
+
+    def _prepare_sync_queue_baselines(
+        self, token_id: str, rows: list[Mapping[str, object]]
+    ) -> None:
+        """Attach one fresh first-observation baseline per resting BUY level."""
+
+        resting = [
+            row
+            for row in rows
+            if str(_field(row, "side", "") or "").upper() == "BUY"
+            and str(_field(row, "status", "") or "").upper()
+            in {"LIVE", "OPEN", "ACCEPTED", "PENDING"}
+            and (_maybe_decimal(_field(row, "remaining_size", _field(row, "size"))) or Decimal("0")) > 0
+        ]
+        if not resting:
+            return
+        existing = self._existing_token_session(token_id)
+        if existing is not None:
+            buckets = _queue_protection_level_buckets(existing.get("queue_protection"))
+            prices = {
+                _maybe_decimal(_field(row, "price"))
+                for row in resting
+            } - {None}
+            known_prices = {
+                _maybe_decimal(bucket.get("baseline_price"))
+                for bucket in buckets.values()
+                if isinstance(bucket, Mapping)
+                and bucket.get("state") not in {None, "", "unknown"}
+            }
+            if prices <= known_prices:
+                return
+        reader = getattr(self.exchange, "lp_order_books", None)
+        if not callable(reader):
+            return
+        try:
+            books = reader((token_id,))
+        except Exception:
+            return
+        book = books.get(token_id) if isinstance(books, Mapping) else None
+        if not isinstance(book, Mapping) or not book.get("received_at"):
+            return
+        try:
+            _freshness(book.get("received_at"), self._now(), "book_freshness")
+        except ValueError:
+            return
+        grouped: dict[Decimal, list[Mapping[str, object]]] = {}
+        for row in resting:
+            price = _maybe_decimal(_field(row, "price"))
+            if price is not None:
+                grouped.setdefault(price, []).append(row)
+        for price, level_rows in grouped.items():
+            own_remaining = Decimal("0")
+            own_remaining_known = True
+            for row in level_rows:
+                remaining = _maybe_decimal(
+                    _field(row, "remaining_size", _field(row, "size"))
+                )
+                if remaining is None:
+                    own_remaining_known = False
+                    break
+                own_remaining += remaining
+            baseline = first_observation_baseline(
+                book,
+                price=price,
+                own_remaining=own_remaining if own_remaining_known else None,
+            )
+            if baseline.get("state") != "known":
+                continue
+            for row in level_rows:
+                # Mappings are immutable only by convention here; sync owns
+                # this freshly constructed row list before registration.
+                row["queue_baseline"] = {
+                    **baseline,
+                    "baseline_source_timestamp": book.get("source_timestamp"),
+                }
+
+    def _join_token_session(
+        self,
+        session: Mapping[str, object],
+        rows: list[Mapping[str, object]],
+    ) -> dict[str, object]:
+        configured = str(
+            getattr(getattr(self.exchange, "config", None), "wallet_address", "") or ""
+        ).strip().casefold()
+        result = self.store.lp_register_exchange_orders(
+            str(session.get("account_id") or configured),
+            str(session.get("token_id") or ""),
+            rows,
+        )
+        return result["session"]
+
+    def _register_direct_receipt(
+        self,
+        session: Mapping[str, object],
+        *,
+        order_id: str,
+        response: Mapping[str, object],
+        side: str,
+        price: object,
+        quantity: object,
+        expiration: object = None,
+    ) -> tuple[dict[str, object], bool]:
+        """Adopt one accepted exchange receipt through the shared Store seam."""
+
+        configured = str(
+            getattr(getattr(self.exchange, "config", None), "wallet_address", "") or ""
+        ).strip().casefold()
+        record = {
+            "order_id": order_id,
+            "token_id": session.get("token_id"),
+            "side": side,
+            "status": str(_field(response, "status", "LIVE") or "LIVE").upper(),
+            "price": price,
+            "original_size": quantity,
+            "size_matched": _field(response, "size_matched"),
+            "expiration": expiration,
+        }
+        result = self.store.lp_register_exchange_orders(
+            str(session.get("account_id") or configured),
+            str(session.get("token_id") or ""),
+            [record],
+            session=session,
+        )
+        return result["session"], bool(result["changed"])
+
+    def register_account_snapshot(self, snapshot: Mapping[str, object]) -> dict[str, object]:
+        """Register every account-owned order in one complete sync bundle.
+
+        One LP session owns one token; a newly discovered SELL joins that
+        session instead of creating a second seller for the same inventory.
+        """
+
+        if not isinstance(snapshot, Mapping) or snapshot.get("authenticated") is not True:
+            return {"state": "skipped", "reason": "account_snapshot_unknown"}
+        required = (
+            "balance_complete", "open_orders_complete",
+            "positions_complete", "trades_complete", "pagination_complete",
+        )
+        if any(snapshot.get(key) is not True for key in required):
+            return {"state": "skipped", "reason": "account_snapshot_incomplete"}
+        wallet = str(snapshot.get("wallet_address") or "").strip()
+        config = getattr(self.exchange, "config", None)
+        configured = str(getattr(config, "wallet_address", "") or "").strip()
+        snapshot_account = str(snapshot.get("account_id") or "").strip()
+        if (
+            not wallet
+            or not configured
+            or not snapshot_account
+            or wallet.casefold() != configured.casefold()
+            or snapshot_account.casefold() != configured.casefold()
+        ):
+            return {"state": "skipped", "reason": "account_identity_mismatch"}
+        account_id = snapshot_account.casefold()
+        if not str(snapshot.get("wallet_address") or "").strip() or not snapshot.get("read_started_at") or not snapshot.get("read_ended_at"):
+            return {"state": "skipped", "reason": "account_snapshot_incomplete"}
+        generation = snapshot.get("trade_generation")
+        generation_reader = getattr(self.store, "lp_trade_generation", None)
+        if (
+            not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or not callable(generation_reader)
+            or generation != generation_reader()
+        ):
+            return {"state": "skipped", "reason": "account_round_invalid"}
+        try:
+            read_started = _timestamp(snapshot["read_started_at"], name="read_started_at")
+            read_ended = _timestamp(snapshot["read_ended_at"], name="read_ended_at")
+            checked_at = _timestamp(snapshot["checked_at"], name="checked_at")
+            if read_started > read_ended:
+                raise ValueError("account_read_order_invalid")
+            if not read_started <= checked_at <= read_ended:
+                raise ValueError("account_read_order_invalid")
+            _freshness(read_ended, self._now(), "account_freshness")
+            _freshness(checked_at, self._now(), "account_freshness")
+        except ValueError:
+            return {"state": "skipped", "reason": "account_snapshot_stale"}
+        raw_orders = [
+            row for row in _items(snapshot.get("open_orders"))
+            if isinstance(row, Mapping) and _field(row, "order_id", _field(row, "id", ""))
+        ]
+        owned_fills = self._owned_sync_order_rows(snapshot.get("raw_trades", ()), wallet)
+        known_ids = {
+            str(_field(row, "order_id", _field(row, "id", "")) or "") for row in raw_orders
+        }
+        rows = [*raw_orders, *(row for row in owned_fills if str(row.get("order_id")) not in known_ids)]
+        if not rows:
+            return {"state": "registered", "tokens": [], "created": 0, "joined": 0}
+        groups: dict[str, list[Mapping[str, object]]] = {}
+        for row in rows:
+            token = str(_field(row, "token_id", _field(row, "asset_id", "")) or "")
+            if token:
+                groups.setdefault(token, []).append(row)
+        created = joined = 0
+        token_results: list[dict[str, object]] = []
+        owned_ids = {
+            order_id
+            for session in self.store.lp_sessions()
+            if str(session.get("account_id") or "").strip().casefold() == account_id
+            for order_id in self._session_order_ids(session)
+        }
+        for token, token_rows in groups.items():
+            try:
+                self._prepare_sync_queue_baselines(token, token_rows)
+                existing = self._existing_token_session(token)
+                candidate = None
+                unknown_rows = [
+                    row
+                    for row in token_rows
+                    if str(_field(row, "order_id", _field(row, "id", "")) or "")
+                    not in owned_ids
+                ]
+                episode = next(
+                    (
+                        item
+                        for item in self.store.lp_active_first_seen_episodes()
+                        if str(item.get("token_id") or "") == token
+                    ),
+                    None,
+                )
+                if existing is None and unknown_rows:
+                    candidate = self._create_sync_session(
+                        snapshot, token, unknown_rows, episode
+                    )
+                    if candidate is None:
+                        token_results.append(
+                            {"token_id": token, "state": "failed", "reason": "baseline_unknown"}
+                        )
+                        continue
+                elif existing is not None and episode is not None:
+                    candidate = {
+                        "session_id": existing["session_id"],
+                        "_first_seen_episode_id": episode["episode_id"],
+                    }
+                with self._first_seen_apply_lock:
+                    result = self.store.lp_register_exchange_orders(
+                        account_id,
+                        token,
+                        token_rows,
+                        session=candidate,
+                        expected_generation=generation,
+                    )
+                # The canonical account identity is already fixed above.  The
+                # Store rechecks ownership inside the transaction; this short
+                # apply lane keeps legacy first-seen conversion serialized.
+                if existing is not None:
+                    joined += 1
+                    token_results.append({"token_id": token, "state": "joined"})
+                else:
+                    created += 1
+                    token_results.append(
+                        {
+                            "token_id": token,
+                            "state": "created",
+                            "session_id": result["session"]["session_id"],
+                        }
+                    )
+            except ValueError as exc:
+                token_results.append({"token_id": token, "state": "failed", "reason": str(exc)})
+        return {
+            "state": "registered" if all(item["state"] != "failed" for item in token_results) else "partial",
+            "tokens": token_results,
+            "created": created,
+            "joined": joined,
+        }
+
+    def _create_sync_session(
+        self,
+        snapshot: Mapping[str, object],
+        token_id: str,
+        rows: list[Mapping[str, object]],
+        protection: Mapping[str, object] | None,
+    ) -> Mapping[str, object] | None:
+        condition_id = str(_field(rows[0], "condition_id", "") or "")
+        market_id = str(_field(rows[0], "market_id", "") or "")
+        outcome = str(_field(rows[0], "outcome", "") or "").upper()
+        if condition_id:
+            metadata_reader = getattr(self.exchange, "lp_market_metadata", None)
+            metadata = metadata_reader((condition_id,)) if callable(metadata_reader) else {}
+            market = metadata.get(condition_id) if isinstance(metadata, Mapping) else None
+            if isinstance(market, Mapping):
+                market_id = market_id or str(market.get("market_id") or "")
+                outcomes = market.get("outcomes")
+                if isinstance(outcomes, Mapping):
+                    metadata_outcome: str | None = None
+                    for direction in ("YES", "NO"):
+                        leg = outcomes.get(direction.lower())
+                        if (
+                            isinstance(leg, Mapping)
+                            and str(leg.get("token_id") or "") == token_id
+                        ):
+                            metadata_outcome = direction
+                            break
+                    if outcome and metadata_outcome and outcome != metadata_outcome:
+                        raise ValueError("order_identity_conflict")
+                    outcome = metadata_outcome or outcome
+        if not condition_id or not market_id or outcome not in {"YES", "NO"}:
+            raise ValueError("order_identity_unknown")
+        buys = [row for row in rows if str(_field(row, "side", "") or "").upper() == "BUY"]
+        sells = [row for row in rows if str(_field(row, "side", "") or "").upper() == "SELL"]
+        entry = buys[0] if buys else None
+        passive = sells[0] if sells else None
+        price = _maybe_decimal(_field((entry or passive or rows[0]), "price"))
+        if price is None:
+            raise ValueError("price_unknown")
+        payload_marker: dict[str, object] = {}
+        resting_buys = [
+            row
+            for row in buys
+            if str(_field(row, "status", "") or "").upper()
+            in {"LIVE", "OPEN", "ACCEPTED", "PENDING"}
+            and (_maybe_decimal(_field(row, "remaining_size", _field(row, "size"))) or Decimal("0")) > 0
+        ]
+        if protection is None:
+            levels: dict[str, object] = {}
+            for row in resting_buys:
+                row_price = _maybe_decimal(_field(row, "price"))
+                key = format(row_price, "f") if row_price is not None else "unknown"
+                if key in levels:
+                    continue
+                baseline = row.get("queue_baseline")
+                remaining = _maybe_decimal(
+                    _field(row, "remaining_size", _field(row, "size"))
+                )
+                if isinstance(baseline, Mapping) and baseline.get("state") == "known":
+                    bucket = {
+                        **baseline,
+                        "baseline_source": "first_observation",
+                        "baseline_version": 1,
+                        "threshold": LP_QUEUE_PROTECTION_THRESHOLD,
+                        "state": "registered",
+                        "notification_sent": False,
+                        "cancel_scope": "own_buys_at_level",
+                    }
+                else:
+                    bucket = {
+                        "state": "unknown",
+                        "baseline_price": row_price,
+                        "baseline_source": "account_sync",
+                        "own_remaining": remaining,
+                        "reason_codes": ["baseline_unknown"],
+                        "notification_sent": False,
+                        "cancel_scope": "own_buys_at_level",
+                    }
+                levels[key] = {
+                    **bucket,
+                    "order_id": _field(row, "order_id", ""),
+                }
+            # Fill evidence alone does not prove a resting order; do not
+            # invent a queue position for it.
+            queue_protection = {
+                "version": 2,
+                "data_failures": 0,
+                "levels": levels,
+            }
+        else:
+            queue_protection = dict(protection or {})
+            if protection and protection.get("episode_id"):
+                payload_marker["_first_seen_episode_id"] = protection["episode_id"]
+        history: dict[str, dict[str, object]] = {}
+        owned: list[str] = []
+        buy_filled = Decimal("0")
+        sold_quantity = Decimal("0")
+        for row in rows:
+            order_id = str(_field(row, "order_id", "") or "")
+            if not order_id:
+                raise ValueError("order_identity_unknown")
+            record = self._sync_order_history_row(row)
+            queue_baseline = row.get("queue_baseline")
+            if isinstance(queue_baseline, Mapping):
+                record["queue_baseline"] = dict(queue_baseline)
+            history[order_id] = record
+            owned.append(order_id)
+            matched = _maybe_decimal(record.get("size_matched")) or Decimal("0")
+            side = str(record.get("side") or "").upper()
+            if side == "BUY":
+                buy_filled += matched
+            elif side == "SELL":
+                sold_quantity += matched
+        positions = [
+            row for row in _items(snapshot.get("positions"))
+            if isinstance(row, Mapping)
+            and str(_field(row, "token_id", _field(row, "asset_id", "")) or "") == token_id
+        ]
+        residual = _maybe_decimal(_field(positions[0], "size")) if positions else Decimal("0")
+        if residual is None:
+            raise ValueError("position_quantity_unknown")
+        session_id = uuid.uuid4().hex
+        augment = [order_id for order_id in owned[1:] if order_id != str(entry and _field(entry, "order_id", ""))]
+        payload: dict[str, object] = {
+            "account_id": str(snapshot.get("account_id") or ""),
+            "source": "account_sync",
+            "sync_read_started_at": snapshot.get("read_started_at"),
+            "sync_read_ended_at": snapshot.get("read_ended_at"),
+            "market_id": market_id,
+            "condition_id": condition_id,
+            "token_id": token_id,
+            "outcome": outcome,
+            "question": str(_field(rows[0], "market_title", "") or ""),
+            "market_url": str(_field(rows[0], "market_url", "") or ""),
+            "price": price,
+            "quantity": sum((_maybe_decimal(_field(row, "original_size", _field(row, "size"))) or Decimal("0") for row in rows), Decimal("0")),
+            "review_at": None,
+            "preflight": {},
+            "entry_order_id": str(_field(entry, "order_id", "")) if entry else None,
+            "entry_expiration": _field(entry, "expiration") if entry else None,
+            "entry_cancel_requested": False,
+            "buy_filled_quantity": buy_filled,
+            "buy_cost": None,
+            "sold_quantity": sold_quantity,
+            "sold_revenue": None,
+            "residual_quantity": residual,
+            "residual_exit_value": Decimal("0") if residual == 0 else None,
+            "fees": None,
+            "fee_status": "unknown",
+            "opening_loss": None,
+            "position_reconciled": False,
+            "account_checked_at": snapshot.get("checked_at"),
+            "book_checked_at": None,
+            "stop_loss_latched": False,
+            "stop_loss_triggered_at": None,
+            "stop_loss_triggered_loss": None,
+            "scoring_status": "unknown",
+            "scoring_checked_at": None,
+            "scoring_order_id": None,
+            "scoring_order_role": None,
+            "scoring_lost_at": None,
+            "passive_exit_order_id": str(_field(passive, "order_id", "")) if passive else None,
+            "passive_exit_price": _maybe_decimal(_field(passive, "price")) if passive else None,
+            "passive_cancel_requested": False,
+            "passive_exit_attempt_key": None,
+            "passive_exit_attempt_state": None,
+            "passive_exit_retryable": False,
+            "protected_exit_order_id": None,
+            "protected_exit_attempt_key": None,
+            "protected_exit_attempt_state": None,
+            "protected_exit_retryable": False,
+            "protected_exit_submit_quantity": None,
+            "protected_exit_submit_sold_quantity": None,
+            "protected_exit_submit_residual_quantity": None,
+            "owned_order_ids": owned,
+            "augment_order_ids": [order_id for order_id in augment if order_id],
+            "order_history": history,
+            "orders_terminal": all(str(record.get("status") or "").upper() in TERMINAL_ORDER_STATES for record in history.values()),
+            "reward_date": self._now().date().isoformat(),
+            "reward_status": "unknown",
+            "trade_pnl": None,
+            "total_pnl": None,
+            "queue_protection": queue_protection,
+        }
+        payload["session_id"] = session_id
+        payload["idempotency_key"] = f"lp-sync:{session_id}"
+        payload["state"] = "entry_open"
+        payload.update(payload_marker)
+        return payload
 
     def register_first_seen_candidates(
         self, rows: object, *, now: datetime
@@ -8143,6 +8731,13 @@ class PolymarketLPService:
         exchange post, and every terminal state write.
         """
 
+        configured_account = str(
+            getattr(getattr(self.exchange, "config", None), "wallet_address", "") or ""
+        ).strip().casefold()
+        account = _field(_field(snapshot, "account"), "wallet_address")
+        account_id = str(account or snapshot.get("wallet_address") or configured_account or "").strip().casefold()
+        if not account_id:
+            return {"state": "rejected", "reason": "account_identity_unknown"}
         # Issue 152: registration boundary.  Validation just proved the
         # session owns no order on the token, so the whole price level in
         # this validated snapshot is queue ahead of the entry order.
@@ -8172,6 +8767,7 @@ class PolymarketLPService:
         session_id = session_id or uuid.uuid4().hex
         intent: dict[str, object] = {
             **request,
+            "account_id": account_id,
             "preflight": facts,
             "entry_order_id": None,
             "entry_expiration": expiration,
@@ -8286,19 +8882,6 @@ class PolymarketLPService:
                 post_only=True,
                 expiration=expiration,
             )
-            signed_order_id = str(_field(signed, "order_id", "") or "")
-            if post is not None and signed_order_id:
-                self.store.lp_update_session(session_id,
-                    patch={
-                        "entry_order_id": signed_order_id,
-                        "owned_order_ids": [signed_order_id],
-                        "submit_stage": "pre_send",
-                    })
-                self.store.lp_upsert_action(session_id, entry_action_key, state="pending",
-                    payload={
-                        "role": "entry", "side": "BUY", "order_id": signed_order_id,
-                        **entry_action_base, "submit_stage": "pre_send",
-                    })
             submit_revision = self.store.lp_session_revision(session_id, trading=True)
             response = execute_post(signed)
         except AutoEntryNotSent as exc:
@@ -8365,20 +8948,6 @@ class PolymarketLPService:
             return self._status_payload(session)
         accepted, order_id = self._order_response(response)
         response_at = _iso(self._now())
-        if post is not None and signed_order_id and order_id and signed_order_id != order_id:
-            conflict = {"prepared_order_id": signed_order_id, "response_order_id": order_id}
-            self.store.lp_upsert_action(session_id, entry_action_key, state="unknown",
-                payload={"role": "entry", "side": "BUY", **conflict,
-                         **send_receipt_base, "submit_stage": "receipt_conflict",
-                         "submit_finished_at": response_at,
-                         "submit_receipt_at": response_at})
-            session = self.store.lp_update_session(session_id, state="needs_attention",
-                patch={"submit_status": "unknown", "order_identity_conflict": conflict,
-                       "reconciliation": "order_identity_conflict",
-                       **send_receipt_base, "submit_stage": "receipt_conflict",
-                       "submit_finished_at": response_at,
-                       "submit_receipt_at": response_at})
-            return self._status_payload(session)
         if not accepted and not (
             _field(response, "accepted", None) is False
             or _field(response, "ok", None) is False
@@ -8459,41 +9028,51 @@ class PolymarketLPService:
         try:
             with self._mutex:
                 session = self.store.lp_session(session_id) or session
-                order_history = self._order_history(session)
-                observed = order_history.get(order_id, {})
-                order_history[order_id] = {
-                    "order_id": order_id,
-                    "token_id": request["token_id"],
-                    "side": "BUY",
-                    "status": str(_field(response, "status", "LIVE")).upper() or "LIVE",
-                    "price": request["price"],
-                    "quantity": request["quantity"],
-                    "expiration": expiration,
-                    **observed,
-                }
-                if str(observed.get("status") or "UNKNOWN").upper() == "UNKNOWN":
-                    order_history[order_id]["status"] = str(_field(response, "status", "LIVE")).upper() or "LIVE"
+                registration_before = self.store.lp_session_revision(
+                    session_id, trading=True
+                )
+                preflight_reconciled = session.get("position_reconciled")
+                session, receipt_changed = self._register_direct_receipt(
+                    session,
+                    order_id=order_id,
+                    response=response,
+                    side="BUY",
+                    price=request["price"],
+                    quantity=request["quantity"],
+                    expiration=expiration,
+                )
                 # The accepted action advances this intent once. A concurrent
                 # cancel/stop/submit must still require fresh account facts.
                 receipt_patch = {}
-                if (self.store.lp_session_revision(session_id, trading=True) == submit_revision + 1
-                        and session.get("facts_error") == "trade_change_pending"):
-                    receipt_patch["facts_error"] = None
-                session = self.store.lp_update_session(
-                    session_id,
-                    state="review" if session.get("stop_requested") or session.get("entry_cancel_requested") else "entry_open",
-                    patch={
-                        **receipt_patch,
-                        "entry_order_id": order_id,
-                        "submit_status": "accepted",
-                        "owned_order_ids": list(dict.fromkeys([*self._session_order_ids(session), order_id])),
-                        "order_history": order_history,
-                        **send_receipt_base,
-                        "submit_stage": "receipt_received",
-                        "submit_finished_at": response_at,
-                        "submit_receipt_at": response_at,
-                    },
+                registration_after = self.store.lp_session_revision(
+                    session_id, trading=True
                 )
+                own_registration = (
+                    registration_before == submit_revision + 1
+                    and registration_after == registration_before + int(receipt_changed)
+                    and str(session.get("session_id") or "") == session_id
+                    and str(session.get("state") or "") not in {"complete", "entry_rejected"}
+                )
+                if own_registration:
+                    # This accepted-entry binding is the only write observed.
+                    # Keep the pre-submit financial lease; account sync and any
+                    # concurrent/cancel action retain the invalidation below.
+                    receipt_patch["facts_error"] = None
+                    if receipt_changed:
+                        receipt_patch["position_reconciled"] = preflight_reconciled
+                if str(session.get("state") or "") not in {"complete", "entry_rejected"}:
+                    session = self.store.lp_update_session(
+                        session_id,
+                        state="review" if session.get("stop_requested") or session.get("entry_cancel_requested") else "entry_open",
+                        patch={
+                            **receipt_patch,
+                            "submit_status": "accepted",
+                            **send_receipt_base,
+                            "submit_stage": "receipt_received",
+                            "submit_finished_at": response_at,
+                            "submit_receipt_at": response_at,
+                        },
+                    )
                 return self._status_payload(session)
         finally:
             if apply_lock is not None and receipt_lock is not None:
@@ -9777,7 +10356,51 @@ class PolymarketLPService:
         )
         if session.get('order_identity_conflict'):
             return session, None, revision, 'order_identity_conflict'
-        if not session.get('entry_order_id'):
+        late_receipts = [
+            action
+            for action in self.store.lp_actions(session_id)
+            if action.get('state') == 'accepted'
+            and action.get('order_id')
+            and action.get('order_id') not in self._session_order_ids(session)
+            and action.get('role') in {'entry', 'augment', 'passive_exit', 'protected_exit'}
+        ]
+        if late_receipts:
+            entry_receipt = next(
+                (action for action in late_receipts if action.get('role') == 'entry'),
+                None,
+            )
+            ordered = [entry_receipt] if entry_receipt else []
+            ordered.extend(action for action in late_receipts if action is not entry_receipt)
+            for action in ordered:
+                role = str(action.get('role') or '')
+                session, _receipt_changed = self._register_direct_receipt(
+                    session,
+                    order_id=str(action['order_id']),
+                    response=action,
+                    side=str(action.get('side') or ('BUY' if role in {'entry', 'augment'} else 'SELL')).upper(),
+                    price=action.get('price', action.get('min_price')),
+                    quantity=action.get('quantity'),
+                    expiration=action.get('expiration'),
+                )
+                role_patch = {
+                    'entry': {'entry_order_id': action['order_id']},
+                    'passive_exit': {'passive_exit_order_id': action['order_id']},
+                    'protected_exit': {'protected_exit_order_id': action['order_id']},
+                }.get(role, {})
+                if role_patch:
+                    session = self.store.lp_update_session(session_id, patch=role_patch)
+            row = self.store.lp_session_with_revision(session_id, trading=True)
+            if row is None:
+                raise ValueError('lp_session_not_found')
+            session, revision = row
+            if entry_receipt:
+                session, _ = self.store.lp_publish_facts(
+                    session_id,
+                    revision,
+                    patch={'submit_status': 'unknown'},
+                )
+                row = self.store.lp_session_with_revision(session_id, trading=True)
+                session, revision = row
             actions = self.store.lp_actions(session_id)
             accepted_ids = {a.get('order_id') for a in actions
                             if a.get('role') == 'entry' and a.get('state') == 'accepted' and a.get('order_id')}
@@ -10372,8 +10995,7 @@ class PolymarketLPService:
             if str(current.get("state")) != "stop_loss_exit":
                 business_patch.update({"state": "stop_loss_exit", "stop_loss_latched": True})
             current = {**current, **business_patch}
-            passive_id = str(current.get("passive_exit_order_id") or "")
-            if passive_id and not self._order_terminal(snapshot, passive_id, current):
+            if not self._owned_sells_terminal(current, snapshot):
                 patch = {**convergence_patch, **business_patch}
                 patch.pop("state", None)
                 self._request_passive_cancel(
@@ -10493,6 +11115,7 @@ class PolymarketLPService:
             blocked_orders = self._recent_pending_cancel_order_ids(session_id)
             targets: list[str] = []
             patch: dict[str, object] = {}
+            protected_id = str(current.get("protected_exit_order_id") or "")
             for key, requested_key in (
                 ("entry_order_id", "entry_cancel_requested"),
                 ("passive_exit_order_id", "passive_cancel_requested"),
@@ -10507,6 +11130,21 @@ class PolymarketLPService:
                 ):
                     targets.append(order_id)
                     requested_by_order[order_id] = requested_key
+            owned_requested = {
+                str(value) for value in _items(current.get("owned_cancel_requested"))
+            }
+            for order_id, record in history.items():
+                if (
+                    not order_id
+                    or order_id == protected_id
+                    or order_id in targets
+                    or str(record.get("side") or "").upper() != "SELL"
+                    or order_id in owned_requested
+                    or order_id in blocked_orders
+                    or order_status(order_id) in TERMINAL_ORDER_STATES
+                ):
+                    continue
+                targets.append(order_id)
             requested_augments = {
                 str(value) for value in _items(current.get("augment_cancel_requested"))
             }
@@ -10574,10 +11212,22 @@ class PolymarketLPService:
             requested_key = requested_by_order.get(order_id)
             if requested_key:
                 patch = {requested_key: True}
-            else:
+            elif order_id in {
+                str(value) for value in _items(current.get("augment_order_ids"))
+            }:
                 patch = {
                     "augment_cancel_requested": sorted(
-                        {str(value) for value in _items(current.get("augment_cancel_requested"))}
+                        {
+                            str(value)
+                            for value in _items(current.get("augment_cancel_requested"))
+                        }
+                        | {order_id}
+                    )
+                }
+            else:
+                patch = {
+                    "owned_cancel_requested": sorted(
+                        {str(value) for value in _items(current.get("owned_cancel_requested"))}
                         | {order_id}
                     )
                 }
@@ -11006,7 +11656,11 @@ class PolymarketLPService:
                 session, snapshot, trade_revision=trade_revision
             )
         now = self._now()
-        review_at = _timestamp(session["review_at"], name="review_at")
+        review_at = (
+            None
+            if session.get("review_at") is None
+            else _timestamp(session["review_at"], name="review_at")
+        )
         residual = _decimal(session.get("residual_quantity", 0), "residual_quantity")
         loss = self._opening_loss_from_session(session)
         session = self.store.lp_update_session(
@@ -11015,7 +11669,7 @@ class PolymarketLPService:
         )
         # A missing bid, fee, or position reconciliation must not prevent
         # the absolute review deadline from cancelling known quotes.
-        if now >= review_at:
+        if review_at is not None and now >= review_at:
             try:
                 self._cancel_owned_orders(
                     session,
@@ -11063,8 +11717,7 @@ class PolymarketLPService:
                 expected_trade_revision=trade_revision,
             )
             session = self.store.lp_session(str(session["session_id"])) or session
-            passive_id = str(session.get("passive_exit_order_id") or "")
-            if passive_id and not self._order_terminal(snapshot, passive_id, session):
+            if not self._owned_sells_terminal(session, snapshot):
                 return self._status_payload(session)
             residual = _decimal(session.get("residual_quantity", 0), "residual_quantity")
             if residual > 0 and not session.get("protected_exit_order_id"):
@@ -11284,6 +11937,27 @@ class PolymarketLPService:
                 return False
         return True
 
+    def _owned_sells_terminal(
+        self, session: Mapping[str, object], snapshot: Mapping[str, object]
+    ) -> bool:
+        """True only when every owned SELL has exact terminal evidence."""
+
+        history = self._order_history(session)
+        sells = [
+            order_id
+            for order_id, record in history.items()
+            if str(record.get("side") or "").upper() == "SELL"
+        ]
+        # Legacy sessions may carry the exact passive SELL identity before its
+        # first receipt is persisted. Missing history is UNKNOWN, not absence.
+        for field in ("passive_exit_order_id", "protected_exit_order_id"):
+            order_id = str(session.get(field) or "")
+            if order_id and order_id not in sells:
+                sells.append(order_id)
+        return all(
+            self._order_terminal(snapshot, order_id, session) for order_id in sells
+        )
+
     # Public math is intentionally not used by the approved behavior cases;
     # the lifecycle calls this private helper after reading external facts.
     def _opening_loss_from_session(self, session: Mapping[str, object]) -> Decimal | None:
@@ -11326,7 +12000,11 @@ class PolymarketLPService:
             result[key] = _decimal(result.get(key), key)
         if cast(Decimal, result["price"]) <= 0 or cast(Decimal, result["quantity"]) <= 0:
             raise ValueError("quantity_or_price_invalid")
-        result["review_at"] = _timestamp(result.get("review_at"), name="review_at")
+        result["review_at"] = (
+            None
+            if result.get("review_at") is None
+            else _timestamp(result.get("review_at"), name="review_at")
+        )
         return result
 
     def _read_snapshot(
@@ -12922,7 +13600,8 @@ class PolymarketLPService:
             row = rows_by_id.get(order_id)
             source = (
                 record
-                if isinstance(record, Mapping) and record.get("status")
+                if isinstance(record, Mapping)
+                and record.get("status")
                 else row
             )
             if source is None:
@@ -14597,6 +15276,26 @@ class PolymarketLPService:
         cost = sum((f["value"] for f in buys), Decimal(0))
         sold_quantity = sum((f["quantity"] for f in sells), Decimal(0))
         sold_revenue = sum((f["value"] for f in sells), Decimal(0))
+        # Reconcile against the latest exact-ID receipts, not a stale planned
+        # quantity. An unknown original size contributes its observed fill as
+        # a lower bound; UNKNOWN remains UNKNOWN for lifecycle completion.
+        history = self._order_history(session)
+        owned_buys = [
+            record
+            for record in history.values()
+            if str(record.get("side") or "").upper() == "BUY"
+        ]
+        requested_quantity = sum(
+            (
+                _maybe_decimal(record.get("quantity"))
+                if _maybe_decimal(record.get("quantity")) is not None
+                else _maybe_decimal(record.get("size_matched")) or Decimal("0")
+            )
+            for record in owned_buys
+        ) or (
+            _maybe_decimal(session.get("group_buy_quantity"))
+            or _maybe_decimal(session.get("quantity"))
+        )
         def fees_for(rows):
             return None if any(f["fee"] is None for f in rows) else sum((f["fee"] for f in rows), Decimal(0))
         buy_fees, sell_fees = fees_for(buys), fees_for(sells)
@@ -14636,15 +15335,8 @@ class PolymarketLPService:
             fees += projected_fee
         else:
             fees = None
-        # Issue 167: the ordered ceiling is the group's total BUY quantity
-        # (entry + augments); single-order groups fall back to ``quantity``.
-        requested_quantity = _maybe_decimal(session.get("group_buy_quantity")) or (
-            _maybe_decimal(session.get("quantity"))
-        )
         if requested_quantity is None:
             raise ValueError("opening_quantity_unknown")
-        if quantity > requested_quantity:
-            raise ValueError("opening_quantity_exceeded")
         if sold_quantity > quantity:
             raise ValueError("sold_quantity_exceeded")
         expected_residual = quantity - sold_quantity
@@ -15065,16 +15757,49 @@ class PolymarketLPService:
         claim_patch: Mapping[str, object] | None = None,
         claim_state: str | None = None,
     ) -> dict[str, object]:
-        order_id = str(session.get("passive_exit_order_id") or "")
-        if not order_id or bool(session.get("passive_cancel_requested")):
-            return dict(session)
         session_id = str(session["session_id"])
-        attempt_key = self._action_key(session_id, "passive-cancel", order_id)
-        attempt_payload = {
-            "role": "passive_exit_cancel",
-            "order_id": order_id,
-            "targets": [order_id],
+        history = self._order_history(session)
+        protected_id = str(session.get("protected_exit_order_id") or "")
+        expected_token = str(session.get("token_id") or "")
+        passive_id = str(session.get("passive_exit_order_id") or "")
+        passive_record = history.get(passive_id)
+        if isinstance(passive_record, Mapping):
+            record_side = str(passive_record.get("side") or "").upper()
+            record_token = str(passive_record.get("token_id") or "")
+            if record_side and record_side != "SELL":
+                raise ValueError("owned_order_side_mismatch")
+            if record_token and expected_token and record_token != expected_token:
+                raise ValueError("owned_order_token_mismatch")
+        owned_requested = {
+            str(value) for value in _items(session.get("owned_cancel_requested"))
         }
+        pending = self._recent_pending_cancel_order_ids(session_id)
+        specs: list[tuple[str, str]] = []
+        if (
+            passive_id
+            and passive_id != protected_id
+            and not isinstance(passive_record, Mapping)
+            and not bool(session.get("passive_cancel_requested"))
+            and passive_id not in pending
+        ):
+            specs.append((passive_id, "passive_exit_cancel"))
+        for order_id, record in history.items():
+            if (
+                not order_id
+                or order_id == protected_id
+                or str(record.get("side") or "").upper() != "SELL"
+                or str(record.get("status") or "").upper() in TERMINAL_ORDER_STATES
+                or order_id in pending
+            ):
+                continue
+            if order_id == passive_id:
+                if bool(session.get("passive_cancel_requested")):
+                    continue
+                specs.append((order_id, "passive_exit_cancel"))
+            elif order_id not in owned_requested:
+                specs.append((order_id, "owned_sell_cancel"))
+        if not specs:
+            return dict(session)
         try:
             self._require_mutation()
         except Exception as exc:
@@ -15090,10 +15815,19 @@ class PolymarketLPService:
         try:
             self.store.lp_register_fenced_actions(
                 session_id,
-                [{
-                    "action_key": attempt_key,
-                    "payload": attempt_payload,
-                }],
+                [
+                    {
+                        "action_key": self._action_key(
+                            session_id, "passive-cancel", order_id
+                        ),
+                        "payload": {
+                            "role": role,
+                            "order_id": order_id,
+                            "targets": [order_id],
+                        },
+                    }
+                    for order_id, role in specs
+                ],
                 expected_generation=expected_generation,
                 expected_trade_revision=expected_trade_revision,
                 patch=claim_patch,
@@ -15103,21 +15837,36 @@ class PolymarketLPService:
             if str(exc) == "account_round_invalid":
                 return self._publish_account_round_rejected(session_id)
             raise
-        try:
-            if not self._cancel_order(
-                order_id,
-                attempts=[(session_id, attempt_key, dict(attempt_payload))],
-            ):
-                raise RuntimeError("cancel_not_acknowledged")
-        except Exception as exc:
-            return self.store.lp_update_session(
+        current = dict(session)
+        owned_requested = set(owned_requested)
+        for order_id, role in specs:
+            action_key = self._action_key(session_id, "passive-cancel", order_id)
+            try:
+                if not self._cancel_order(
+                    order_id,
+                    attempts=[(session_id, action_key, {"role": role, "order_id": order_id})],
+                ):
+                    raise RuntimeError("cancel_not_acknowledged")
+            except Exception as exc:
+                return self.store.lp_update_session(
+                    session_id,
+                    state="needs_attention",
+                    patch={"reconciliation": f"passive_cancel_{type(exc).__name__}"},
+                )
+            self.store.lp_upsert_action(
                 session_id,
-                state="needs_attention",
-                patch={"reconciliation": f"passive_cancel_{type(exc).__name__}"},
+                action_key,
+                state="accepted",
+                payload={"role": role, "order_id": order_id},
             )
-        return self.store.lp_update_session(
-            session_id, patch={"passive_cancel_requested": True}
-        )
+            patch: dict[str, object] = {}
+            if order_id == passive_id:
+                patch["passive_cancel_requested"] = True
+            else:
+                owned_requested.add(order_id)
+                patch["owned_cancel_requested"] = sorted(owned_requested)
+            current = dict(self.store.lp_update_session(session_id, patch=patch))
+        return current
 
     def _cancel_owned_orders(
         self,
@@ -15149,6 +15898,25 @@ class PolymarketLPService:
         augment_requested = [
             str(value) for value in _items(current.get("augment_cancel_requested"))
         ]
+        owned_requested = [
+            str(value) for value in _items(current.get("owned_cancel_requested"))
+        ]
+        managed = {
+            str(current.get("entry_order_id") or ""),
+            str(current.get("passive_exit_order_id") or ""),
+            *augment_requested,
+        }
+        for order_id, record in history.items():
+            if (
+                str(record.get("side") or "").upper() != "SELL"
+                or not order_id
+                or order_id in managed
+                or order_id in owned_requested
+                or order_id in pending_cancels
+                or str(record.get("status") or "").upper() in TERMINAL_ORDER_STATES
+            ):
+                continue
+            specs.append((order_id, "owned_cancel_requested", "owned-sell-cancel"))
         for value in _items(current.get("augment_order_ids")):
             order_id = str(value or "")
             if not order_id or order_id in augment_requested or order_id in pending_cancels:
@@ -15199,6 +15967,7 @@ class PolymarketLPService:
             except Exception as exc:
                 errors.append(exc)
                 continue
+            patch: dict[str, object] = {}
             self.store.lp_upsert_action(
                 session_id,
                 self._action_key(
@@ -15209,10 +15978,19 @@ class PolymarketLPService:
                 state="accepted",
                 payload={"role": role, "order_id": order_id},
             )
-            patch = {requested_key: True}
             if role == "augment-cancel":
                 augment_requested = [*augment_requested, order_id]
                 patch["augment_cancel_requested"] = list(augment_requested)
+            elif role == "owned-sell-cancel":
+                patch[requested_key] = sorted(
+                    {
+                        str(value)
+                        for value in _items(current.get(requested_key))
+                    }
+                    | {order_id}
+                )
+            else:
+                patch[requested_key] = True
             current = dict(
                 self.store.lp_update_session(session_id, patch=patch)
             )
@@ -15351,6 +16129,17 @@ class PolymarketLPService:
         # replay merely because a monitoring process restarted.
         if self._has_unresolved_submission(session):
             return
+        history = self._order_history(session)
+        managed_passive = str(session.get("passive_exit_order_id") or "")
+        blocking_sells = [
+            order_id
+            for order_id, record in history.items()
+            if order_id != managed_passive
+            and str(record.get("side") or "").upper() == "SELL"
+            and str(record.get("status") or "").upper() not in TERMINAL_ORDER_STATES
+        ]
+        if blocking_sells:
+            return
         attempt_state = str(session.get("passive_exit_attempt_state") or "")
         if attempt_state in {"pending", "unknown", "accepted_without_order_id"}:
             return
@@ -15400,8 +16189,12 @@ class PolymarketLPService:
                     "passive_cancel_requested": False,
                 },
             )
-        expiration = expiration_for_review(
-            _timestamp(session["review_at"], name="review_at"), now=self._now()
+        expiration = (
+            None
+            if session.get("review_at") is None
+            else expiration_for_review(
+                _timestamp(session["review_at"], name="review_at"), now=self._now()
+            )
         )
         session_id = str(session["session_id"])
         attempt_key = self._action_key(
@@ -15517,19 +16310,15 @@ class PolymarketLPService:
                 },
             )
             return
-        history = self._order_history(session)
-        history[order_id] = {
-            "order_id": order_id,
-            "token_id": session["token_id"],
-            "side": "SELL",
-            "status": str(_field(response, "status", "LIVE")).upper() or "LIVE",
-            "price": price,
-            "quantity": quantity,
-            "expiration": expiration,
-        }
-        order_ids = self._session_order_ids(session)
-        if order_id not in order_ids:
-            order_ids.append(order_id)
+        session, _receipt_changed = self._register_direct_receipt(
+            session,
+            order_id=order_id,
+            response=response,
+            side="SELL",
+            price=price,
+            quantity=quantity,
+            expiration=expiration,
+        )
         self.store.lp_upsert_action(
             session_id,
             attempt_key,
@@ -15553,8 +16342,6 @@ class PolymarketLPService:
                 "passive_exit_attempt_state": "accepted",
                 "passive_exit_retryable": False,
                 **self._scoring_reset_patch(order_id, "passive_exit"),
-                "owned_order_ids": order_ids,
-                "order_history": history,
             },
         )
 
@@ -15706,6 +16493,15 @@ class PolymarketLPService:
                     "protected_exit_retryable": False,
                 },
             )
+            return
+        history = self._order_history(session)
+        protected_id = str(session.get("protected_exit_order_id") or "")
+        if any(
+            order_id != protected_id
+            and str(record.get("side") or "").upper() == "SELL"
+            and not self._order_terminal(snapshot, order_id, session)
+            for order_id, record in history.items()
+        ):
             return
         attempt_state = str(session.get("protected_exit_attempt_state") or "")
         if attempt_state in {"pending", "unknown", "accepted_without_order_id"}:
@@ -15917,18 +16713,14 @@ class PolymarketLPService:
                 },
             )
             return
-        history = self._order_history(session)
-        history[order_id] = {
-            "order_id": order_id,
-            "token_id": session["token_id"],
-            "side": "SELL",
-            "status": str(_field(response, "status", "LIVE")).upper() or "LIVE",
-            "quantity": submit_quantity,
-            "min_price": min_price,
-        }
-        order_ids = self._session_order_ids(session)
-        if order_id not in order_ids:
-            order_ids.append(order_id)
+        session, _receipt_changed = self._register_direct_receipt(
+            session,
+            order_id=order_id,
+            response=response,
+            side="SELL",
+            price=min_price,
+            quantity=submit_quantity,
+        )
         self.store.lp_upsert_action(
             session_id,
             attempt_key,
@@ -15952,8 +16744,6 @@ class PolymarketLPService:
                 "protected_exit_submit_sold_quantity": prior_sold,
                 "protected_exit_submit_residual_quantity": prior_residual,
                 **self._scoring_reset_patch(order_id, "protected_exit"),
-                "owned_order_ids": order_ids,
-                "order_history": history,
             },
         )
 
@@ -16007,7 +16797,7 @@ class PolymarketLPService:
                 expected_generation=snapshot.get("_lp_trade_generation"),
                 expected_trade_revision=trade_revision,
             )
-            if not updated.get("passive_exit_order_id") or bool(updated.get("orders_terminal")):
+            if self._owned_sells_terminal(updated, snapshot):
                 self._submit_protected_exit(
                     updated,
                     _decimal(updated.get("residual_quantity", 0), "residual_quantity"),

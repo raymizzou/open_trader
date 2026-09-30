@@ -29,6 +29,7 @@ from .notifications import (
 )
 from .polymarket_lp import SCORING_STALE_SECONDS, queue_protection_status_view
 from .polymarket_trading import (
+    LpAccountRoundInvalid,
     LegResult,
     PairSubmission,
     PolymarketTradingClient,
@@ -2419,7 +2420,10 @@ class PredictionExecutionService:
             try:
                 if not callable(reader):
                     raise RuntimeError("lp_account_reader_unavailable")
-                snapshot = _call(reader)
+                snapshot = _call(
+                    reader,
+                    trade_generation_provider=self._store.lp_trade_generation,
+                )
                 if (
                     not isinstance(snapshot, Mapping)
                     or snapshot.get("authenticated") is not True
@@ -2439,6 +2443,28 @@ class PredictionExecutionService:
                 if not isinstance(checked, datetime) or checked.tzinfo is None:
                     raise RuntimeError("lp_account_timestamp_unknown")
                 checked_at = _timestamp(checked)
+
+                registration_reader = getattr(
+                    self._lp, "register_account_snapshot", None
+                )
+                if callable(registration_reader) and not getattr(self, "_display_only", False):
+                    try:
+                        registration = _call(registration_reader, snapshot)
+                        if isinstance(registration, Mapping) and (
+                            registration.get("reason") == "account_round_invalid"
+                            or any(
+                                isinstance(item, Mapping)
+                                and item.get("reason") == "account_round_invalid"
+                                for item in registration.get("tokens", ())
+                            )
+                        ):
+                            raise LpAccountRoundInvalid("lp_account_round_invalid")
+                    except LpAccountRoundInvalid:
+                        raise
+                    except Exception:
+                        logger.warning(
+                            "lp_order_sync_registration_failed", exc_info=True
+                        )
 
                 session: dict[str, object]
                 try:
@@ -3089,6 +3115,15 @@ class PredictionExecutionService:
                     reward_date, trade_condition_ids
                 )
                 return result
+            except LpAccountRoundInvalid:
+                previous = self._lp_dashboard_cache or self._lp_dashboard_pending_payload()
+                self._lp_dashboard_cache = {
+                    **previous,
+                    "state": "waiting",
+                    "stale": True,
+                    "reason": "account_round_invalid",
+                }
+                return deepcopy(self._lp_dashboard_cache)
             except Exception as exc:
                 if self._lp_account_trades_cache is not None:
                     self._lp_account_trades_cache = {**self._lp_account_trades_cache,

@@ -871,6 +871,13 @@ def test_lp_dashboard_shows_manual_orders_without_managing_them(
         client=sdk,
         public_client_factory=lambda: public_market,
     )
+    trading.lp_market_metadata = lambda condition_ids, **kwargs: {
+        condition_ids[0]: {
+            "market_id": "market-1",
+            "condition_id": condition_ids[0],
+            "outcome": "YES",
+        }
+    }
     service._trading = trading
     runtime = _Runtime()
     runtime.store = store  # type: ignore[assignment]
@@ -11635,9 +11642,13 @@ raise SystemExit(service.serve_prediction_service(
     port={port},
 ))
 '''
+    # 保留开发runner字节码缓存，冷编译不计入服务信号/退出时限。
     process = subprocess.Popen(
         [sys.executable, "-c", script],
-        env={"PYTHONPATH": str(Path(__file__).parents[1] / "src")},
+        env={
+            "PYTHONPATH": str(Path(__file__).parents[1] / "src"),
+            "PYTHONPYCACHEPREFIX": sys.pycache_prefix or "",
+        },
     )
     try:
         # Initial bind includes cold Python imports; behavior budgets start after it.
@@ -11717,9 +11728,13 @@ raise SystemExit(service.serve_prediction_service(
     port=0,
 ))
 '''
+    # 保留开发runner字节码缓存，冷编译不计入服务信号/退出时限。
     process = subprocess.Popen(
         [sys.executable, "-c", script],
-        env={"PYTHONPATH": str(Path(__file__).parents[1] / "src")},
+        env={
+            "PYTHONPATH": str(Path(__file__).parents[1] / "src"),
+            "PYTHONPYCACHEPREFIX": sys.pycache_prefix or "",
+        },
     )
     try:
         # The invariant starts inside FakeRuntime.start, after cold module imports.
@@ -11790,9 +11805,13 @@ raise SystemExit(service.serve_prediction_service(
     release_manifest_path=Path({str(release_manifest)!r}),
 ))
 '''
+    # 保留开发runner字节码缓存，冷编译不计入服务信号/退出时限。
     process = subprocess.Popen(
         [sys.executable, "-c", script],
-        env={"PYTHONPATH": str(Path(__file__).parents[1] / "src")},
+        env={
+            "PYTHONPATH": str(Path(__file__).parents[1] / "src"),
+            "PYTHONPYCACHEPREFIX": sys.pycache_prefix or "",
+        },
     )
     try:
         # Initial bind includes cold Python imports; behavior budgets start after it.
@@ -15087,9 +15106,14 @@ def test_lp_first_seen_protection_end_to_end(
         polymarket_trading_module, "signature_type_for", lambda _wallet_type: 0
     )
 
+    market_id = "market-1"
+    condition_id = "condition-1"
+    yes_token = "yes-token"
+
     class AccountSDK:
         def __init__(self) -> None:
             self.order_rows: list[dict[str, object]] = []
+            self.order_receipts: dict[str, dict[str, object]] = {}
             self.cancellation_calls: list[tuple[str, ...]] = []
             self._ctx = SimpleNamespace(
                 secure_clob=reward_transport, wallet_type=None
@@ -15111,36 +15135,67 @@ def test_lp_first_seen_protection_end_to_end(
         def list_positions(self, **_kwargs: object) -> list[object]:
             return []
 
+        def get_order(self, *, order_id: str) -> object:
+            return self.order_receipts.get(order_id)
+
         def get_order_scoring(self, *, order_id: str) -> bool:
             return True
 
         def cancel_orders(self, **kwargs: object) -> object:
             order_ids = tuple(kwargs.get("order_ids") or ())
             self.cancellation_calls.append(order_ids)
+            for order_id in order_ids:
+                receipt = self.order_receipts.get(str(order_id))
+                if receipt is not None:
+                    receipt["status"] = "CANCELED"
+                    receipt["size_matched"] = Decimal("0")
+                    receipt["remaining_size"] = Decimal("0")
             return {"canceled": list(order_ids), "not_canceled": {}}
 
     class PublicMarketSDK:
         def __init__(self) -> None:
             self.level_total = "10000"
 
+        def get_market(self, *, id: str) -> object:
+            assert id == market_id
+            return {
+                "id": market_id,
+                "condition_id": condition_id,
+                "state": {"accepting_orders": True},
+                "outcomes": {
+                    "yes": {"label": "YES", "token_id": yes_token},
+                    "no": {"label": "NO", "token_id": "no-token"},
+                },
+                "trading": {
+                    "minimum_tick_size": Decimal("0.01"),
+                    "minimum_order_size": Decimal("1"),
+                    "fees_enabled": False,
+                },
+                "rewards": {
+                    "rewards_min_size": Decimal("20"),
+                    "rewards_max_spread": Decimal("10"),
+                },
+            }
+
         def list_markets(
             self, *, condition_ids: object, page_size: int = 100
         ) -> list[object]:
-            del condition_ids, page_size
-            return []
+            assert page_size == 100
+            assert tuple(condition_ids) == (condition_id,)  # type: ignore[arg-type]
+            return [self.get_market(id=market_id)]
+
+        def get_order_book(self, *, token_id: str) -> object:
+            assert token_id in (yes_token, "no-token")
+            return {
+                "condition_id": condition_id,
+                "token_id": token_id,
+                "timestamp": datetime.now(UTC),
+                "bids": [{"price": Decimal("0.50"), "size": self.level_total}],
+                "asks": [{"price": Decimal("0.52"), "size": Decimal("100")}],
+            }
 
         def get_order_books(self, *, token_ids: object) -> list[object]:
-            return [
-                {
-                    "condition_id": "condition-1",
-                    "token_id": str(token_ids[0]),
-                    "timestamp": "2026-09-21T12:00:00Z",
-                    "hash": "book-hash-s",
-                    "bids": [{"price": "0.50", "size": self.level_total}],
-                    "asks": [{"price": "0.52", "size": "100"}],
-                }
-                for token_id in tuple(token_ids)
-            ]
+            return [self.get_order_book(token_id=str(token_id)) for token_id in token_ids]
 
         def close(self) -> None:
             pass
@@ -15161,11 +15216,12 @@ def test_lp_first_seen_protection_end_to_end(
     service._schedule_lp_orders_today_refresh = lambda *args, **kwargs: None  # type: ignore[method-assign]
 
     notes: list[tuple[str, str, str]] = []
-    service._lp.set_protection_notifier(
-        lambda title, message, xiaoai_text: notes.append(
-            (title, message, xiaoai_text)
-        )
-    )
+
+    def record_protection_note(title: str, message: str, xiaoai_text: str) -> bool:
+        notes.append((title, message, xiaoai_text))
+        return True
+
+    service._lp.set_protection_notifier(record_protection_note)
 
     manual_buy: dict[str, object] = {
         "id": "m-web-1",
@@ -15185,22 +15241,42 @@ def test_lp_first_seen_protection_end_to_end(
 
     # 第 2 轮：网页手动 BUY 出现 → 首见登记（基线 10000 − 2000 = 8000）。
     sdk.order_rows = [manual_buy]
+    sdk.order_receipts[str(manual_buy["id"])] = dict(manual_buy)
     trading._lp_account_shared_cache = None  # expire the shared account TTL
     service.refresh_lp_dashboard_snapshot()
-    episodes = store.lp_active_first_seen_episodes()
-    assert len(episodes) == 1
-    episode = episodes[0]
-    assert episode["baseline_source"] == "first_observation"
-    assert Decimal(str(episode["baseline_front"])) == Decimal("8000")
-    assert episode["anchor_order_ids"] == ["m-web-1"]
+    sessions = store.lp_active_sessions()
+    assert len(sessions) == 1
+    session = sessions[0]
+    session_id = str(session["session_id"])
+    assert session["entry_order_id"] == "m-web-1"
+    assert session["owned_order_ids"] == ["m-web-1"]
+    first_bucket = session["queue_protection"]["levels"]["0.50"]
+    assert first_bucket["baseline_source"] == "first_observation"
+    assert Decimal(str(first_bucket["baseline_front"])) == Decimal("8000")
+    assert store.lp_active_first_seen_episodes() == []
 
     # 盘口变化（同价位总量降到 4,000）→ 一秒 tick 评估触发 → 撤单。
     public_market.level_total = "4000"
+    public_key = f"{condition_id}\0{yes_token}"
+    with trading._lp_public_reads_lock:
+        trading._lp_public_reads.pop(public_key, None)
+        trading._lp_public_read_retry.pop(public_key, None)
+    _market_model, _book_model, _received_at, public_error = (
+        trading._read_lp_public_snapshot(
+            public_key, market_id, yes_token, wait=False
+        )
+    )
+    public_future = trading._lp_public_reads.get(public_key)
+    assert public_future is not None
+    public_future.result(timeout=10)
+    assert public_future.done()
     service._lp.tick()
-    episode = store.lp_first_seen_episode(str(episode["episode_id"]))
-    assert episode is not None
-    assert episode["state"] == "canceling"
+    session = store.lp_session(session_id)
+    assert session is not None
+    queue_bucket = next(iter(session["queue_protection"]["levels"].values()))
+    assert queue_bucket["state"] == "canceling", session["queue_protection"]
     assert sdk.cancellation_calls == [("m-web-1",)]
+    assert queue_bucket["notification_sent"] is True
 
     # /lp/orders/today 投影：锚行带 summary / baseline_source / anchor。
     trading._lp_account_shared_cache = None
@@ -15215,17 +15291,20 @@ def test_lp_first_seen_protection_end_to_end(
     summary = projection["queue_protection"]
     assert summary["state"] == "canceling"
     assert summary["baseline_source"] == "first_observation"
-    assert Decimal(str(summary["anchor_price"])) == Decimal("0.50")
-    assert Decimal(str(summary["level_total"])) == Decimal("4000")
+    assert Decimal(str(summary["baseline_price"])) == Decimal("0.50")
+    assert summary["order_id"] == "m-web-1"
 
     # 回执收敛：订单从所有读取路径消失 → canceled + 一次性首见通知。
     sdk.order_rows = []
+    trading._lp_account_shared_cache = None  # force the receipt read to see it
     service._lp.tick()
-    episode = store.lp_first_seen_episode(str(episode["episode_id"]))
-    assert episode is not None
-    assert episode["state"] == "canceled"
+    session = store.lp_session(session_id)
+    assert session is not None
+    queue_bucket = next(iter(session["queue_protection"]["levels"].values()))
+    assert queue_bucket["state"] == "canceled"
+
     assert len(notes) == 1
-    assert "首见基线" in notes[0][0]
+    assert "位置保护已触发撤单" in notes[0][0]
 
 
 # ---- Issue 163: LP 单次确认提交路由（/lp/orders、/lp/augment） ----
