@@ -36,6 +36,14 @@ _STATIC_ROUTES = {
     ),
 }
 
+# Explicit display ownership; execution GETs and every POST stay on Air.
+_PREDICTION_DISPLAY_PATHS = frozenset({
+    "/api/prediction-arbitrage/venues",
+    "/api/prediction-arbitrage/lp/dashboard",
+    "/api/prediction-arbitrage/lp/account/trades",
+})
+
+
 _PREDICTION_ROUTE_SCHEMA = "open_trader.frontend_gateway.prediction_route.v1"
 _PREDICTION_ROUTE_MODES = {"legacy", "maintenance", "service"}
 
@@ -54,6 +62,7 @@ class FrontendGatewayConfig:
     upstream_timeout_seconds: float = 30.0
     max_request_body_bytes: int = 20 * 1024 * 1024
     prediction_only: bool = False
+    prediction_display_upstream_port: int | None = None
 
 
 @dataclass(frozen=True)
@@ -123,6 +132,11 @@ def create_frontend_gateway(
         and 1 <= config.prediction_upstream_port <= 65535
     ):
         raise ValueError("ports must be between 1 and 65535")
+    if config.prediction_display_upstream_port is not None and (
+        not 1 <= config.prediction_display_upstream_port <= 65535
+        or config.prediction_display_upstream_port == config.prediction_upstream_port
+    ):
+        raise ValueError("distinct loopback display and execution ports required")
     if config.upstream_timeout_seconds <= 0:
         raise ValueError("upstream timeout must be positive")
     if config.max_request_body_bytes < 0:
@@ -164,6 +178,8 @@ def create_frontend_gateway(
                         "legacy_upstream_status": legacy_upstream_status,
                         "account_upstream_status": "disabled" if config.prediction_only else self._account_upstream_status(),
                         "prediction_only": config.prediction_only,
+                        "prediction_split": config.prediction_display_upstream_port is not None,
+                        "prediction_display_upstream_port": config.prediction_display_upstream_port,
                         "prediction_route_mode": prediction_route.mode,
                         "prediction_inflight_requests": prediction_inflight_requests,
                         "prediction_upstream_status": self._prediction_upstream_status(
@@ -191,7 +207,9 @@ def create_frontend_gateway(
             prediction_route = (
                 prediction_controller.begin() if _is_prediction_path(path) else None
             )
-            if prediction_route is not None and (prediction_route.mode == "maintenance" or (config.prediction_only and prediction_route.mode != "service")):
+            display_route = (config.prediction_display_upstream_port is not None
+                and self.command == "GET" and path in _PREDICTION_DISPLAY_PATHS)
+            if not display_route and prediction_route is not None and (prediction_route.mode == "maintenance" or (config.prediction_only and prediction_route.mode != "service")):
                 prediction_controller.end()
                 self._send_error(
                     HTTPStatus.SERVICE_UNAVAILABLE,
@@ -238,6 +256,13 @@ def create_frontend_gateway(
                     "Legacy Dashboard is unavailable",
                 )
             )
+            if display_route:
+                target_host = "127.0.0.1"
+                target_port = config.prediction_display_upstream_port
+                target_authority = _host_port(target_host, target_port)
+                target_origin = f"http://{target_authority}"
+                unavailable_code = "prediction_display_unavailable"
+                unavailable_message = "Prediction display is unavailable"
             origin = self.headers.get("Origin", "")
             try:
                 if self.command == "POST" and origin and origin != public_origin:
@@ -265,15 +290,21 @@ def create_frontend_gateway(
                     target_origin=target_origin,
                     account_route=account_route,
                 )
+                if display_route:
+                    request_headers = {name: value for name, value in request_headers.items()
+                        if name.lower() not in {"cookie", "x-csrf-token", "authorization"}}
                 connection = http.client.HTTPConnection(
                     target_host,
                     target_port,
                     timeout=config.upstream_timeout_seconds,
                 )
                 try:
+                    upstream_path = self.path
+                    if self.command == "GET" and path == "/api/prediction-arbitrage/execution/identity":
+                        upstream_path = self.path.replace("/execution/identity", "/venues", 1)
                     connection.request(
                         self.command,
-                        self.path,
+                        upstream_path,
                         body=body if self.command == "POST" else None,
                         headers=request_headers,
                     )
@@ -293,6 +324,8 @@ def create_frontend_gateway(
                     connection.close()
 
                 excluded = _hop_by_hop_names(response_headers) | {"content-length"}
+                if display_route:
+                    excluded.add("set-cookie")
                 self.send_response_only(status, reason)
                 for name, value in response_headers:
                     if name.lower() not in excluded:
@@ -429,6 +462,8 @@ def create_frontend_gateway(
             body = path.read_bytes()
             if config.prediction_only and path.name == "index.html":
                 body = body.replace(b"<body>", b'<body data-prediction-only="true">', 1)
+            if config.prediction_display_upstream_port is not None and path.name == "index.html":
+                body = body.replace(b"<body>", b'<body data-prediction-split="true">', 1)
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
@@ -513,6 +548,7 @@ def serve_frontend_gateway(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="open-trader frontend-gateway")
     parser.add_argument("--prediction-only", action="store_true")
+    parser.add_argument("--prediction-display-upstream-port", type=int)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--upstream-host", default="127.0.0.1")
@@ -534,6 +570,7 @@ def main(argv: list[str] | None = None) -> int:
         config=FrontendGatewayConfig(
             static_dir=args.static_dir,
             prediction_only=args.prediction_only,
+            prediction_display_upstream_port=args.prediction_display_upstream_port,
             upstream_host=args.upstream_host,
             upstream_port=args.upstream_port,
             account_upstream_host=args.account_upstream_host,

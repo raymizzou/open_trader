@@ -2128,7 +2128,23 @@ class PolymarketTradingClient:
 
     def lp_account_snapshot(self) -> dict[str, object]:
         """Return current account orders and holdings for the read-only LP panel."""
-        account = self._lp_account_facts()
+        account = self._lp_account_facts(include_raw_trades=True)
+        raw_trades = account.pop("raw_trades", ())
+        normalized_trades = []
+        complete = account.get("trades_complete") is True
+        for raw in raw_trades:
+            row = _lp_trade(raw)
+            if row is None:
+                complete = False
+                continue
+            row["maker_orders"] = [maker for maker in row["maker_orders"]
+                if _lp_maker_order_is_self(maker, self.config.wallet_address)]
+            if not row["taker_order_id"] and not row["maker_orders"]:
+                complete = False
+                continue
+            normalized_trades.append(row)
+        account.update(account_trades=tuple(normalized_trades),
+            display_trades_complete=complete, account_trades_total=len(raw_trades))
         order_rows, position_rows = account['open_orders'], account['positions']
         condition_ids = tuple(
             dict.fromkeys(

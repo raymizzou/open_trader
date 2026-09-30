@@ -520,3 +520,21 @@ def test_cloud_layout_checks_service_identity_and_private_configuration(tmp_path
     user.pw_gid=1001;user.pw_uid=0
     with pytest.raises(ValueError,match='non-root'): cloud.trusted_layout(cfg)
     with pytest.raises(ValueError,match='non-root'): cloud.live_identity(cfg)
+
+
+def test_cloud_display_smoke_accepts_reward_usd_unknown_and_records_source_evidence():
+    from datetime import UTC, datetime, timedelta
+    from open_trader.prediction_cloud import display_snapshot_evidence
+    snapshot = dict(authenticated=True,stale=False,checked_at=datetime.now(UTC).isoformat(),
+        orders=[],positions=[],recommendations=[],catalog_complete=True,
+        open_orders_complete=True,positions_complete=True,trades_complete=False,
+        candidate_state='unknown',candidate_stale=True,
+        preparation={'state':'ready','checked_at':'source-time'},
+        market_rewards={'condition':{'state':'unknown','reason':'usd_value_unknown','usd_value':None}})
+    evidence = display_snapshot_evidence(snapshot)
+    assert evidence['rewards']['condition']['reason'] == 'usd_value_unknown'
+    assert evidence['account']['trades_complete'] is False
+    assert evidence['candidates']['candidate_state'] == 'unknown'
+    assert evidence['history']['state'] == 'ready'
+    for change in ({'stale':True},{'authenticated':False},{'checked_at':(datetime.now(UTC)-timedelta(seconds=61)).isoformat()}):
+        with pytest.raises(ValueError): display_snapshot_evidence({**snapshot,**change})

@@ -281,8 +281,9 @@ The client runtime must be private (`0700`) and separate from the release.
 The client requires explicit `mode: "production"` or `"mode": "shadow"` and
 verifies the same mode in health. Production must report
 `production_owner=true` and `mutations=enabled`; Shadow must report the reverse
-and a null `first_violation`. Every real Shadow UI is labeled read-only;
-paused Shadow additionally marks LP realtime data unavailable. All Shadow views
+and a null `first_violation`. A standalone Shadow UI is labeled read-only. Credentialless paused Shadow
+keeps its existing no-reader/LP-503 contract; explicit file credentials enable
+background LP display reads even with N-leg paused. All Shadow views
 disable order, augment, cancel and automatic controls while retaining
 read-model rows and details. If an already identified service or a
 Prediction-only view cannot refresh its venues identity, the UI fails closed as
@@ -308,6 +309,94 @@ Repeating start returns the current verified connection. An ambiguous or
 changed PID blocks signaling. A broken connection reports BLOCKED; inspect
 `gateway.log` and `ssh.log` (replaced on each new client session), then stop the owned client and start it again.
 Closing the browser or stopping this client leaves the cloud service running.
+
+## #204: cloud display with Air execution
+
+The complete Air Dashboard can use a paused, authenticated cloud Shadow for
+selected display reads while the existing Air Prediction remains the sole
+production execution owner. Cloud uses #202's private file credentials; invalid
+or missing credentials fail startup without a public-only fallback. `disabled`
+retains no LP reader startup even when a prediction config exists.
+
+| Browser request | Owner |
+| --- | --- |
+| GET `/venues`, `/lp/dashboard`, `/lp/account/trades` | Cloud snapshots |
+| GET `/execution/identity` | Gateway alias to Air's existing `/venues` |
+| GET `/state`, `/lp/auto/state`, `/lp/sessions/current` | Air execution |
+| GET all N-leg history (signals/executions/incidents), relations, modes and reports | Air engine records/IDs |
+| All Prediction POSTs, including preflight, refresh and cancellation | Air |
+| Other Dashboard pages and APIs | Existing Legacy/Account connections |
+
+The display routes never forward browser Cookie, Authorization or CSRF to the
+cloud and never return cloud Set-Cookie to the browser. Cloud venues cannot
+replace Air identity or CSRF. The identity alias permits using the existing Air
+immutable release: no new Air API is required for split display. Air's current
+preflight, reservations, protection and recovery remain authoritative.
+
+For the split client add these non-secret fields to the configuration above:
+
+```json
+{
+  "mode": "shadow",
+  "gateway_port": 8766,
+  "tunnel_port": 8879,
+  "execution_port": 8769,
+  "execution_expected_sha": "<existing Air 40-character SHA>",
+  "cloud_expected_sha": "<cloud 40-character SHA>"
+}
+```
+
+`expected_sha` identifies the local immutable Gateway checkout; the other SHAs
+identify their respective services independently. Without `cloud_expected_sha`,
+the cloud SHA defaults to `expected_sha`. The split client defaults to 8766/8879
+and requires Shadow cloud health with N-leg paused. It starts the complete
+Gateway and its own independent SSH tunnel, never a Prediction backend. Start,
+status and stop use the same `prediction-client.sh` commands. Existing listeners
+block startup; replacing the managed Air Gateway requires its separately
+authorized deployment procedure. Do not stop Air Prediction to free a port.
+
+Status verifies local Gateway and cloud identities and reports Air execution
+identity separately. Air offline may report `CONNECTED` with
+`execution_status=unavailable`: cloud browsing continues, but the browser clears
+Air authorization and disables writers. A responding wrong Air SHA/mode is an
+identity failure. Cloud outage remains a display outage, with no fallback to Air
+snapshots and no automatic strategy stop/start. With healthy Air, display stale,
+failure or a pending cloud request does not block existing Air submissions or
+cancellations; Air still performs its own real-time checks. Auto controls and their existing funds/slots/round details
+poll the same Air payload independently and do not use cloud Dashboard `auto` data.
+Air identity also supplies the N-leg execution/pause state; cloud paused or
+offline cannot suppress healthy Air state/history reads. Cloud N-leg remains
+paused, so its history handler is not relaxed to serve Air-engine signal IDs.
+
+Cloud reuses the existing LP history, candidate scan/maintenance/competition,
+book sampling, reward/observation and Dashboard snapshot workers. History keeps
+its persisted retry scheduling but skips preparation notifications and their
+notification-only deadlines. No trading/protection tick, automatic scheduler,
+N-leg worker, report worker or share-watch notification loop starts. Snapshots
+retain genuine completeness, read errors and UNKNOWN; `usd_value_unknown`
+remains an accepted display limitation. The 60-second cloud account freshness
+boundary and bounded (maximum 100 rows) trade pages are checked without upstream
+HTTP reads in request handlers. Failed background reads publish stale snapshots.
+Cloud independently persists existing history/catalog/observation data; no Air
+SQLite migration or cross-host synchronization occurs.
+
+Cloud Smoke keeps disabled-profile LP 503 validation. Authenticated paused
+Shadow instead requires a real, fresh background account snapshot and records
+account, catalog, candidate, history and reward source evidence. It does not
+require every reward's derived USD value to be known. Two-host Smoke checks the
+configured independent cloud/local SHAs and a healthy exact Air execution SHA;
+its result does not grant live mutation authorization. Record both hosts' SHA,
+PID/root, connection ports, snapshot times/scope and measured resources in the
+operator evidence when an actual deployment is authorized. Development tests
+are offline evidence only, not proof of live supply or deployment.
+
+To return to local display, stop the client using its original saved config
+(first preserving its owned-process identity check), then restore the existing
+local Gateway configuration without `--prediction-display-upstream-port` and
+with `--prediction-upstream-port 8769` through the authorized Gateway deployment
+workflow. Air Prediction and its runtime/owner remain running. No page switch,
+writer failover, balance alignment, order overlay or missing-history marker is
+introduced; selected cloud content is displayed as returned.
 
 ## Two-host gates
 

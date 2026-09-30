@@ -38,7 +38,7 @@ def main():
         if cloud.mode != local['mode']:
             raise ValueError('client and cloud service modes mismatch')
         evidence = json.loads(args.operator_evidence.read_text())
-        if cloud.expected_sha != local['expected_sha'] or evidence.get('git_sha') != cloud.expected_sha:
+        if cloud.expected_sha != local.get('cloud_expected_sha',local['expected_sha']) or evidence.get('git_sha') != cloud.expected_sha:
             raise ValueError('two-host SHA or operator evidence mismatch')
         # Shadow reads never take trading ownership, even with SSM credentials.
         if cloud.mode == 'shadow':
@@ -56,7 +56,7 @@ def main():
             raise ValueError('absolute remote config required')
         release = Path(local['release_root'])
         identity = inspect_prediction_release_checkout(release)
-        if identity['git_sha'] != cloud.expected_sha or checked(['git','-C',str(release),'rev-parse','--abbrev-ref','HEAD']).strip() != 'HEAD':
+        if identity['git_sha'] != local['expected_sha'] or checked(['git','-C',str(release),'rev-parse','--abbrev-ref','HEAD']).strip() != 'HEAD':
             raise ValueError('local immutable release mismatch')
         action = 'preflight' if args.action == 'readiness' else 'smoke'
         remote = ('cd '+shlex.quote(str(cloud.release_root))+' && '+shlex.join([
@@ -84,6 +84,9 @@ def main():
             print('READY')
         else:
             before = client_operation(local,'status')
+            if 'execution_port' in local and (before.get('execution_status') != 'ok'
+                or before.get('execution_git_sha') != local['execution_expected_sha']):
+                raise ValueError('Air execution unavailable or identity mismatch')
             if before['status'] != 'CONNECTED':
                 raise ValueError('local client not connected')
             log = Path(local['runtime_root'])/'gateway.log'

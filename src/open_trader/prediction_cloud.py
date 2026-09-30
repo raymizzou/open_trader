@@ -403,6 +403,29 @@ def verified_record(c: CloudConfig, states: tuple[str, ...]) -> dict:
     return saved
 
 
+def display_snapshot_evidence(snapshot: dict) -> dict:
+    """Prove a published background read without requiring derived USD facts."""
+    from datetime import UTC, datetime
+    from decimal import Decimal
+    from .polymarket_lp_risk import _freshness
+    if (snapshot.get("authenticated") is not True or snapshot.get("stale") is not False
+        or any(not isinstance(snapshot.get(key), list) for key in ("orders", "positions", "recommendations"))):
+        raise ValueError("cloud display account snapshot unavailable or stale")
+    _freshness(snapshot.get("checked_at"), datetime.now(UTC), "account_facts", max_age=Decimal(60))
+    rewards = snapshot.get("market_rewards") or {}
+    return {
+        "account": {key:snapshot.get(key) for key in
+            ("checked_at", "last_success_at", "open_orders_complete", "positions_complete", "trades_complete")},
+        "catalog": {"complete":snapshot.get("catalog_complete")},
+        "candidates": {key:snapshot.get(key) for key in
+            ("candidate_state", "candidate_checked_at", "candidate_last_success_at", "candidate_stale",
+             "missing_metadata_condition_ids", "missing_book_token_ids")},
+        "history": snapshot.get("preparation"),
+        "rewards": {condition:{key:row.get(key) for key in ("state", "reason", "checked_at")}
+            for condition,row in rewards.items() if isinstance(row,dict)},
+    }
+
+
 def operate(c: CloudConfig, action: str) -> dict:
     if action == 'preflight':
         preflight(c)
@@ -416,13 +439,17 @@ def operate(c: CloudConfig, action: str) -> dict:
     if action in ('status', 'smoke'):
         verified_record(c, ('ready',))
         evidence = live_identity(c)
+        display_evidence = {}
         if action == 'smoke':
             health = read_json(8769)
             nleg = health.get('n_leg', {})
             if c.n_leg_paused:
                 if nleg.get('status') != 'paused' or nleg.get('code') != 'N_LEG_PAUSED':
                     raise ValueError('N-leg pause contract mismatch')
-                if c.mode == 'shadow':
+                if c.mode == 'shadow' and credential_backend(c) != 'disabled':
+                    display_evidence = display_snapshot_evidence(
+                        read_json(8769, '/api/prediction-arbitrage/lp/dashboard'))
+                elif c.mode == 'shadow':
                     if read_status(8769, '/api/prediction-arbitrage/lp/dashboard') != 503:
                         raise ValueError('paused Shadow LP read model must be unavailable')
                 else:
@@ -449,7 +476,7 @@ def operate(c: CloudConfig, action: str) -> dict:
         component = {'mode': c.mode, 'n_leg_paused': c.n_leg_paused,
                      'credential_backend': credential_backend(c)}
         return {'status': 'RUNNING' if action == 'status' else 'BACKEND_SMOKE_OK',
-                **evidence, **component}
+                **evidence, **component, **({'display_snapshot':display_evidence} if display_evidence else {})}
     if os.geteuid() != 0:
         raise ValueError('systemd mutations require root')
     # Same global lock for all runtime roots/configurations of this unit.

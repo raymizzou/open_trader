@@ -556,6 +556,7 @@ def create_prediction_server(
                 return
             if parsed.path not in {
                 "/api/prediction-arbitrage/venues",
+                "/api/prediction-arbitrage/lp/account/trades",
                 "/api/prediction-arbitrage/state",
                 "/api/prediction-arbitrage/history",
                 "/api/prediction-arbitrage/n-leg/mode",
@@ -648,6 +649,18 @@ def create_prediction_server(
                     set_session=mode == "production",
                 )
                 return
+            if parsed.path == "/api/prediction-arbitrage/lp/account/trades":
+                try:
+                    query = parse_qs(parsed.query)
+                    result = runtime.execution.lp_account_trades_page(
+                        offset=_query_int(query, "offset", 0),
+                        limit=_query_int(query, "limit", 100))
+                    self._send_json(HTTPStatus.OK, _lp_projection_safe_value(result))
+                except ValueError as exc:
+                    self._send_error(HTTPStatus.BAD_REQUEST, exc)
+                except (AttributeError, sqlite3.Error, OSError, RuntimeError) as exc:
+                    self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+                return
             if parsed.path == "/api/prediction-arbitrage/lp/auto/state":
                 try:
                     self._send_json(HTTPStatus.OK, _lp_projection_safe_value(runtime.lp_auto_state()))
@@ -682,7 +695,7 @@ def create_prediction_server(
                 try:
                     result = execution.lp_dashboard()
                     auto_state = getattr(runtime, "lp_auto_state", None)
-                    if callable(auto_state):
+                    if callable(auto_state) and mode != "shadow":
                         # The automatic order/intent list is paused on the dashboard.
                         result = {**result, "auto": auto_state(include_intents=False)}
                     safe_result = _lp_projection_safe_value(result)

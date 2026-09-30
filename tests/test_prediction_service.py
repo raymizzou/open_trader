@@ -15631,3 +15631,35 @@ def test_lp163_augment_route_contract(tmp_path: Path) -> None:
         assert blocked_status == 200
         assert blocked == {"state": "rejected", "reason": "session_not_active"}
         assert len(exchange.posts) == 2
+
+
+def test_shadow_display_http_reads_only_snapshots_and_retains_unknown(tmp_path):
+    now = datetime.now(UTC).isoformat()
+    calls = []
+    class Execution:
+        def lp_dashboard(self):
+            calls.append('dashboard')
+            return {'state':'ready','authenticated':True,'stale':False,'checked_at':now,
+                'orders':[], 'positions':[], 'recommendations':[],
+                'balance':Decimal('12'), 'allowance':Decimal('10'),
+                'open_orders_complete':True, 'positions_complete':True,
+                'market_rewards':{'condition':{'state':'unknown','reason':'usd_value_unknown','usd_value':None}}}
+        def lp_account_trades_page(self, **kwargs):
+            if not 1 <= kwargs['limit'] <= 100: raise ValueError('invalid account trades page')
+            calls.append(('trades',kwargs))
+            return {'state':'unknown','complete':False,'items':[], 'total':None}
+    runtime = SimpleNamespace(state='RUNNING',mode='shadow',production_owner=False,
+        n_leg_paused=True,shadow_evidence={'mode':'shadow','first_violation':None},
+        execution=Execution(),store=None,monitor=None,
+        lp_auto_state=lambda **kwargs: pytest.fail('Shadow dashboard must not project execution auto state'))
+    with _server(runtime) as base:
+        status, dashboard = _response(base+'/api/prediction-arbitrage/lp/dashboard')
+        assert status == 200 and 'auto' not in dashboard
+        assert dashboard['market_rewards']['condition']['usd_value'] is None
+        status, venues = _response(base+'/api/prediction-arbitrage/venues')
+        assert status == 200 and venues['venues'][0]['balance']['value'] == '12'
+        status, trades = _response(base+'/api/prediction-arbitrage/lp/account/trades?limit=1&offset=2')
+        assert status == 200 and trades['state'] == 'unknown' and trades['total'] is None
+        status, _ = _response(base+'/api/prediction-arbitrage/lp/account/trades?limit=101')
+        assert status == 400
+    assert ('trades',{'offset':2,'limit':1}) in calls

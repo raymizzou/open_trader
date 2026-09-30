@@ -19,18 +19,20 @@ _HEALTH_MISSING = object()
 
 def client_ports(c):
     defaults = {'production':(8766,8769), 'shadow':(8876,8879)}
+    if 'execution_port' in c:
+        defaults['shadow'] = (8766,8879)
     gateway_port = c.get('gateway_port', defaults[c['mode']][0])
     tunnel_port = c.get('tunnel_port', defaults[c['mode']][1])
     if (type(gateway_port) is not int or type(tunnel_port) is not int
         or not 1024 <= gateway_port <= 65535 or not 1024 <= tunnel_port <= 65535
-        or gateway_port == tunnel_port):
+        or gateway_port == tunnel_port or c.get('execution_port') in (gateway_port, tunnel_port)):
         raise ValueError('distinct loopback client ports required')
     return gateway_port, tunnel_port
 
 
 def validate(c):
     if not {'release_root','runtime_root','python','ssh_alias','expected_sha','mode'} <= set(c) \
-       or set(c) - {'release_root','runtime_root','python','ssh_alias','expected_sha','mode','gateway_port','tunnel_port'}:
+       or set(c) - {'release_root','runtime_root','python','ssh_alias','expected_sha','mode','gateway_port','tunnel_port','execution_port','execution_expected_sha','cloud_expected_sha'}:
         raise ValueError('invalid client config keys')
     for key in ('release_root','runtime_root','python'):
         if not re.fullmatch(r'/[A-Za-z0-9_./-]+', c[key]) or '..' in Path(c[key]).parts:
@@ -39,6 +41,13 @@ def validate(c):
         or not re.fullmatch(r'[0-9a-f]{40}', c['expected_sha'])
         or c['mode'] not in {'production','shadow'}):
         raise ValueError('SSH alias and explicit production or shadow mode required')
+    if 'cloud_expected_sha' in c and not re.fullmatch(r'[0-9a-f]{40}', c['cloud_expected_sha']):
+        raise ValueError('explicit cloud SHA required')
+    if 'execution_port' in c or 'execution_expected_sha' in c:
+        if (c['mode'] != 'shadow' or type(c.get('execution_port')) is not int
+            or not 1024 <= c['execution_port'] <= 65535
+            or not re.fullmatch(r'[0-9a-f]{40}', c.get('execution_expected_sha', ''))):
+            raise ValueError('split display requires Shadow and explicit Air execution port/SHA')
     client_ports(c)
     a, b = Path(c['release_root']).resolve(), Path(c['runtime_root']).resolve()
     if a.is_relative_to(b) or b.is_relative_to(a):
@@ -62,7 +71,8 @@ def same_process(proc):
     observed = process_identity(proc['pid'])
     if observed is not None and observed != proc['identity']:
         # ps can sample R before exit and read an already-cleared cmdline.
-        # Recheck the contradiction; never signal a persistently different PID.
+        # Let exit settle before rechecking; never signal a different PID.
+        time.sleep(0.05)
         observed = process_identity(proc['pid'])
     if observed is None:
         return False
@@ -118,14 +128,17 @@ def status(c, state):
         raise ValueError('client process missing')
     gateway_port, tunnel_port = client_ports(c)
     gateway, backend = read_json(gateway_port), read_json(tunnel_port)
-    if (gateway.get('pid') != state['gateway']['pid'] or gateway.get('prediction_only') is not True
-        or gateway.get('prediction_upstream_status') != 'ok'
+    split = 'execution_port' in c
+    if (gateway.get('pid') != state['gateway']['pid'] or gateway.get('prediction_only') is not (not split)
+        or (split and (gateway.get('prediction_split') is not True
+            or gateway.get('prediction_display_upstream_port') != tunnel_port))
+        or (not split and gateway.get('prediction_upstream_status') != 'ok')
         or gateway.get('prediction_route_mode') != 'service'
         or gateway.get('cwd') != c['release_root']
         or Path(gateway.get('code_root','')).resolve() != Path(c['release_root'])/'src'):
         raise ValueError('Gateway identity or upstream mismatch')
-    for health in (gateway,backend):
-        if health.get('git_sha') != c['expected_sha'] or health.get('source_state') != 'clean':
+    for health, expected in ((gateway, c['expected_sha']), (backend, c.get('cloud_expected_sha', c['expected_sha']))):
+        if health.get('git_sha') != expected or health.get('source_state') != 'clean':
             raise ValueError('client/backend release mismatch')
     manifest = client_release(c)
     mode_identity = (
@@ -143,8 +156,23 @@ def status(c, state):
         or type(backend.get('pid')) is not int or backend['pid'] <= 0
         or not backend_root.is_absolute() or backend.get('code_root') != str(backend_root/'src')):
         raise ValueError('backend health identity unavailable')
+    execution = {}
+    if split:
+        if backend.get('n_leg', {}).get('status') != 'paused':
+            raise ValueError('cloud display must keep N-leg paused')
+        try:
+            air = read_json(c['execution_port'])
+        except (OSError, ValueError):
+            execution = {'execution_status':'unavailable', 'execution_git_sha':None}
+        else:
+            if (air.get('module') != 'prediction_service' or air.get('mode') != 'production'
+                or air.get('production_owner') is not True or air.get('mutations') != 'enabled'
+                or air.get('git_sha') != c['execution_expected_sha'] or air.get('source_state') != 'clean'):
+                raise ValueError('Air execution identity mismatch')
+            execution = {'execution_status':'ok', 'execution_git_sha':air['git_sha'], 'execution_pid':air.get('pid')}
     client_release(c)  # Health metadata can outlive a changed checkout.
-    return {'status':'CONNECTED', 'git_sha':c['expected_sha'], 'backend_mode':backend.get('mode'),
+    return {'status':'CONNECTED', 'git_sha':c['expected_sha'], 'cloud_git_sha':backend.get('git_sha'),
+            **execution, 'backend_mode':backend.get('mode'),
             'gateway_pid':state['gateway']['pid'], 'ssh_pid':state['ssh']['pid'],
             'url':f'http://127.0.0.1:{gateway_port}/', 'gateway_port':gateway_port, 'tunnel_port':tunnel_port}
 
@@ -183,10 +211,12 @@ def client_operation(c, action):
                    '-o','ForwardAgent=no','-o','ExitOnForwardFailure=yes','-o','ConnectTimeout=10',
                    '-o','ServerAliveInterval=30','-o','ServerAliveCountMax=3',
                    '-L',f'127.0.0.1:{tunnel_port}:127.0.0.1:8769',c['ssh_alias']],
-            'gateway':[c['python'],'-m','open_trader','frontend-gateway','--prediction-only',
+            'gateway':[c['python'],'-m','open_trader','frontend-gateway',
+                       *([] if 'execution_port' in c else ['--prediction-only']),
                        '--host','127.0.0.1','--port',str(gateway_port),
                        '--public-origin',f'http://127.0.0.1:{gateway_port}',
-                       '--prediction-upstream-port',str(tunnel_port),
+                       '--prediction-upstream-port',str(c.get('execution_port', tunnel_port)),
+                       *(['--prediction-display-upstream-port',str(tunnel_port)] if 'execution_port' in c else []),
                        '--prediction-route-state',str(route),'--static-dir',c['release_root']+'/src/open_trader/dashboard_static'],
         }
         state = {'config':c}
@@ -208,7 +238,7 @@ def client_operation(c, action):
                     while True:
                         try:
                             health = read_json(tunnel_port)
-                            if health.get('git_sha') != c['expected_sha']:
+                            if health.get('git_sha') != c.get('cloud_expected_sha', c['expected_sha']):
                                 raise ValueError('backend SHA mismatch')
                             break
                         except (OSError,ValueError):

@@ -87,7 +87,8 @@ def test_client_ports_default_by_mode_and_reject_collisions():
             client_ports(bad)
 
 
-def test_client_start_status_stop_with_real_gateway_and_fake_ssh(tmp_path, monkeypatch):
+@pytest.mark.parametrize("split", [False, True])
+def test_client_start_status_stop_with_real_gateway_and_fake_ssh(tmp_path, monkeypatch, split):
     import os, shutil, socket, subprocess, sys
     if sys.platform != 'linux':
         pytest.skip('fixed production ports tested only in isolated Linux Docker')
@@ -117,7 +118,7 @@ class Handler(BaseHTTPRequestHandler):
   guard_path={str(tmp_path/'guard')!r};production_path={str(tmp_path/'production')!r}
   guard=Path(guard_path).exists();production=Path(production_path).exists()
   violation=None if not guard else 'guarded'
-  body=json.dumps(dict(module='prediction_service',status='unavailable' if guard else 'running',mode='production' if production else 'shadow',git_sha={sha!r},source_state='clean',schema_version='open_trader.prediction_service.health.v1',release_schema_version='open_trader.prediction_service.release.v1',started_at='fixture-start',production_owner=production,mutations='enabled' if production else 'prohibited',first_violation=violation,pid=os.getpid(),cwd='/opt/release',code_root='/opt/release/src',reader_generation=2,contract_generation=2)).encode()
+  body=json.dumps(dict(module='prediction_service',status='unavailable' if guard else 'running',mode='production' if production else 'shadow',git_sha={sha!r},source_state='clean',schema_version='open_trader.prediction_service.health.v1',release_schema_version='open_trader.prediction_service.release.v1',started_at='fixture-start',production_owner=production,mutations='enabled' if production else 'prohibited',first_violation=violation,pid=os.getpid(),cwd='/opt/release',code_root='/opt/release/src',reader_generation=2,contract_generation=2,n_leg=dict(status='paused',code='N_LEG_PAUSED'))).encode()
   status=503 if guard else 200;self.send_response(status);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
  def log_message(self,*a):pass
 HTTPServer(('127.0.0.1',8879),Handler).serve_forever()
@@ -127,6 +128,17 @@ HTTPServer(('127.0.0.1',8879),Handler).serve_forever()
     cfg = dict(release_root=str(release),runtime_root=str(tmp_path/'client'),python=sys.executable,
                ssh_alias='open-trader-test',expected_sha=sha,mode='shadow',
                gateway_port=8876,tunnel_port=8879)
+    air = None
+    if split:
+        import threading
+        from tests.test_frontend_gateway import _Upstream
+        air = _Upstream()
+        air.health_body = json.dumps(dict(module='prediction_service',mode='production',
+            production_owner=True,mutations='enabled',git_sha=sha,source_state='clean',pid=os.getpid())).encode()
+        air.response_body = json.dumps(dict(mode='production',mutations='enabled',csrf_token='air-csrf')).encode()
+        air_thread = threading.Thread(target=air.serve_forever,daemon=True)
+        air_thread.start()
+        cfg.update(execution_port=air.server_address[1],execution_expected_sha=sha)
     try:
         original_owner = socket.socket()
         original_owner.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
@@ -135,6 +147,15 @@ HTTPServer(('127.0.0.1',8879),Handler).serve_forever()
         assert first['status']=='CONNECTED'
         assert client_operation(cfg,'start')['gateway_pid']==first['gateway_pid']
         assert client_operation(cfg,'status')['ssh_pid']==first['ssh_pid']
+        if split:
+            from urllib.request import urlopen
+            with urlopen('http://127.0.0.1:8876/') as response:
+                html = response.read()
+                assert b'data-prediction-split="true"' in html
+                assert b'data-prediction-only="true"' not in html
+            with urlopen('http://127.0.0.1:8876/api/prediction-arbitrage/execution/identity') as response:
+                assert json.load(response)['csrf_token'] == 'air-csrf'
+            assert air.requests[-1]['path'] == '/api/prediction-arbitrage/venues'
         (tmp_path/'production').touch()
         with pytest.raises(ValueError,match='health identity'): client_operation(cfg,'status')
         (tmp_path/'production').unlink()
@@ -145,6 +166,9 @@ HTTPServer(('127.0.0.1',8879),Handler).serve_forever()
         with pytest.raises(ValueError,match='dirty'): client_operation(cfg,'status')
         init.write_text(saved)
         assert client_operation(cfg,'stop')['status']=='STOPPED'
+        if split:
+            from open_trader.prediction_cloud import read_json
+            assert read_json(cfg['execution_port'])['git_sha'] == sha
         assert client_operation(cfg,'stop')['status']=='STOPPED'
         assert client_operation(cfg,'status')['status']=='STOPPED'
         with socket.socket() as occupied:
@@ -156,6 +180,8 @@ HTTPServer(('127.0.0.1',8879),Handler).serve_forever()
     finally:
         client_operation(cfg,'stop')
         original_owner.close()
+        if air is not None:
+            air.shutdown(); air.server_close(); air_thread.join(timeout=5)
 
 
 def test_client_missing_pid_with_unknown_listener_retains_record(tmp_path, monkeypatch):
@@ -195,7 +221,46 @@ def test_process_identity_rechecks_a_torn_ps_exit_snapshot(monkeypatch):
     import subprocess
     from open_trader.prediction_client import same_process
     # Observed on Linux: cmdline disappears while the sampled status is still R.
+    sleeps = []
+    monkeypatch.setattr('open_trader.prediction_client.time.sleep', sleeps.append)
     responses=iter(['Rs Tue Sep 29 10:40:37 2026 [python]\n',
                     'Zs Tue Sep 29 10:40:37 2026 [python] <defunct>\n'])
     monkeypatch.setattr(subprocess,'run',lambda *a,**k:subprocess.CompletedProcess(a,0,next(responses),''))
     assert not same_process({'pid':123,'identity':'Tue Sep 29 10:40:37 2026 /python owned-client'})
+    assert sleeps == [0.05]
+
+
+def test_split_client_validates_independent_air_cloud_identities_and_ports(tmp_path, monkeypatch):
+    import open_trader.prediction_client as client
+    base = dict(release_root=str(tmp_path/'release'),runtime_root=str(tmp_path/'client'),
+        python='/usr/bin/python3',ssh_alias='test',expected_sha='a'*40,mode='shadow',
+        execution_port=8769,execution_expected_sha='b'*40,cloud_expected_sha='c'*40)
+    validate(base)
+    assert client_ports(base) == (8766,8879)
+    for change in ({'tunnel_port':8769}, {'execution_port':True}, {'mode':'production'}, {'execution_expected_sha':''}):
+        with pytest.raises(ValueError): validate({**base, **change})
+    state = {'gateway':{'pid':4242,'identity':'owned'},'ssh':{'pid':4243,'identity':'owned'}}
+    monkeypatch.setattr(client,'same_process',lambda _:True)
+    monkeypatch.setattr(client,'client_release',lambda c:{'reader_generation':2,'contract_generation':2})
+    gateway = dict(pid=4242,git_sha='a'*40,source_state='clean',started_at='fixture',
+        prediction_only=False,prediction_split=True,prediction_display_upstream_port=8879,
+        prediction_upstream_status='ok',prediction_route_mode='service',
+        cwd=base['release_root'],code_root=base['release_root']+'/src')
+    cloud = dict(module='prediction_service',status='running',git_sha='c'*40,source_state='clean',
+        mode='shadow',production_owner=False,mutations='prohibited',first_violation=None,
+        n_leg={'status':'paused'},pid=4243,started_at='fixture',cwd='/opt/release',code_root='/opt/release/src',
+        schema_version='open_trader.prediction_service.health.v1',release_schema_version=client.RELEASE_SCHEMA,
+        reader_generation=2,contract_generation=2)
+    air = dict(module='prediction_service',mode='production',production_owner=True,mutations='enabled',
+        git_sha='b'*40,source_state='clean',pid=4244)
+    def reader(port): return {8766:gateway,8879:cloud,8769:air}[port]
+    monkeypatch.setattr(client,'read_json',reader)
+    result = status(base,state)
+    assert result['execution_git_sha'] == 'b'*40 and result['cloud_git_sha'] == 'c'*40
+    air['git_sha']='d'*40
+    with pytest.raises(ValueError,match='Air execution identity'): status(base,state)
+    def offline(port):
+        if port == 8769: raise OSError('offline')
+        return reader(port)
+    monkeypatch.setattr(client,'read_json',offline)
+    assert status(base,state)['execution_status'] == 'unavailable'

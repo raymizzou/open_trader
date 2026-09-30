@@ -1756,6 +1756,21 @@ def prediction_venues_payload(
             if isinstance(value, str) and value.startswith("0x"):
                 readiness[field] = _prediction_mask_wallet(value)
 
+    if n_leg_paused and execution is not None:
+        reader = getattr(execution, "lp_dashboard", None)
+        lp_snapshot = _prediction_safe_value(reader() if callable(reader) else {})
+        if isinstance(lp_snapshot, Mapping):
+            complete = (lp_snapshot.get("authenticated") is True
+                and lp_snapshot.get("open_orders_complete") is True
+                and lp_snapshot.get("positions_complete") is True
+                and lp_snapshot.get("stale") is False)
+            readiness = {"status": "ready" if complete else "unknown",
+                "reason": None if complete else "account_facts_incomplete_or_stale",
+                "p_usd_balance": lp_snapshot.get("balance"),
+                "p_usd_allowance": lp_snapshot.get("allowance"),
+                "checked_at": lp_snapshot.get("checked_at"),
+                "last_success_at": lp_snapshot.get("last_success_at")}
+
     raw_readiness = snapshot.get("readiness")
     wallet_address = ""
     if isinstance(raw_readiness, Mapping):
@@ -1799,6 +1814,9 @@ def prediction_venues_payload(
         cross_venue_monitor=cross_venue_monitor,
         cross_venue={},
     )
+    if n_leg_paused:
+        venues[0].update(rest=readiness.get("status", "unknown"), ws="unavailable",
+            last_success=readiness.get("last_success_at"), reason=readiness.get("reason"))
     result: dict[str, object] = {"venues": venues, "csrf_token": csrf_token}
     monitor_subscription = _prediction_monitor_subscription(safe_snapshot)
     if monitor_subscription is not None and not n_leg_paused:

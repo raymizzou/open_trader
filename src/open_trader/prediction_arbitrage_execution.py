@@ -790,6 +790,7 @@ class PredictionExecutionService:
         self._lp_share_watch_notification_lock = threading.Lock()
         self._lp_share_watch_seen: set[str] = set()
         self._lp_dashboard_cache: dict[str, object] | None = None
+        self._lp_account_trades_cache: dict[str, object] | None = None
         self._lp_reward_percentage_cache: dict[str, object] | None = None
         self._lp_reward_share_observations: dict[str, dict[str, object]] = {}
         self._lp_reward_share_active: dict[str, bool] = {}
@@ -1791,6 +1792,9 @@ class PredictionExecutionService:
             "checked_at": None,
             "last_success_at": None,
             "authenticated": False,
+            "balance": None,
+            "allowance": None,
+            "trades_complete": False,
             "open_orders_complete": False,
             "positions_complete": False,
             "lp_share_watch_state": self.lp_share_watch_state(),
@@ -1896,8 +1900,36 @@ class PredictionExecutionService:
 
         cached = self._lp_dashboard_cache
         if cached is not None:
-            return deepcopy(cached)
+            result = deepcopy(cached)
+            if getattr(self, "_display_only", False) and self._lp_account_snapshot_expired(result.get("checked_at")):
+                result.update(state="stale", stale=True, reason="account_snapshot_expired")
+            return result
         return self._lp_dashboard_pending_payload()
+
+    @staticmethod
+    def _lp_account_snapshot_expired(checked_at: object) -> bool:
+        from .polymarket_lp_risk import _freshness
+        try:
+            _freshness(checked_at, _utc_now(), "account_facts", max_age=Decimal(60))
+            return False
+        except ValueError:
+            return True
+
+    def lp_account_trades_page(self, *, offset: int, limit: int) -> dict[str, object]:
+        """Serve bounded display details from the shared background round."""
+        if offset < 0 or not 1 <= limit <= 100:
+            raise ValueError("invalid account trades page")
+        cached = self._lp_account_trades_cache
+        if cached is None:
+            return {"state": "unknown", "complete": False, "stale": True,
+                "reason": "account_snapshot_pending", "items": [], "total": None,
+                "offset": offset, "limit": limit}
+        rows = cached["items"]
+        result = {**cached, "items": deepcopy(list(rows[offset:offset + limit])),
+            "offset": offset, "limit": limit, "has_more": offset + limit < len(rows)}
+        if self._lp_account_snapshot_expired(result.get("checked_at")):
+            result.update(state="unknown", stale=True, reason="account_snapshot_expired")
+        return result
 
     def lp_cancel_orders(self, request: Mapping[str, object]) -> dict[str, object]:
         """Cancel operator-selected LP orders from the dashboard.
@@ -2954,8 +2986,13 @@ class PredictionExecutionService:
                         row_price = _row_level_price(row_summary, order_id)
                         if row_price is not None:
                             today_row["queue_protection"]["level_price"] = row_price
+                account_complete = (snapshot.get("open_orders_complete") is True
+                    and snapshot.get("positions_complete") is True)
+                # Air keeps its established pipeline status; cloud display
+                # distinguishes incomplete account facts without changing Air rules.
+                display_complete = account_complete or not getattr(self, "_display_only", False)
                 result = {
-                    "state": "ready",
+                    "state": "ready" if display_complete else "unknown",
                     "orders": orders,
                     "positions": positions,
                     "lp_orders_today": lp_orders_today,
@@ -3004,9 +3041,14 @@ class PredictionExecutionService:
                         "retention_reason"
                     ),
                     "checked_at": checked_at,
-                    "last_success_at": checked_at,
-                    "stale": False,
+                    "last_success_at": checked_at if display_complete else (
+                        previous_dashboard.get("last_success_at")
+                        if isinstance(previous_dashboard, Mapping) else None),
+                    "stale": not display_complete,
                     "authenticated": True,
+                    "balance": snapshot.get("balance"),
+                    "allowance": snapshot.get("allowance"),
+                    "trades_complete": snapshot.get("display_trades_complete") is True,
                     "open_orders_complete": snapshot.get("open_orders_complete") is True,
                     "positions_complete": snapshot.get("positions_complete") is True,
                     "lp_share_watch_state": self.lp_share_watch_state(),
@@ -3034,12 +3076,23 @@ class PredictionExecutionService:
                     ],
                 }
                 self._lp_dashboard_cache = result
+                trades_complete = snapshot.get("display_trades_complete") is True
+                self._lp_account_trades_cache = {
+                    "state": "ready" if trades_complete else "unknown",
+                    "complete": trades_complete, "stale": False,
+                    "checked_at": checked_at, "source": "same-wallet CLOB trades",
+                    "total": snapshot.get("account_trades_total"),
+                    "items": tuple(snapshot.get("account_trades", ())),
+                }
                 self._schedule_lp_reward_refresh(reward_date, refresh_ids)
                 self._schedule_lp_orders_today_refresh(
                     reward_date, trade_condition_ids
                 )
                 return result
             except Exception as exc:
+                if self._lp_account_trades_cache is not None:
+                    self._lp_account_trades_cache = {**self._lp_account_trades_cache,
+                        "state": "unknown", "stale": True, "reason": "account_read_failed"}
                 if str(exc) in {
                     "lp_account_reader_unavailable",
                     "lp_account_snapshot_unknown",
@@ -3175,7 +3228,7 @@ class PredictionExecutionService:
                         if isinstance(cached_today_orders, (list, tuple))
                         else cached_today_orders
                     )
-                    return {
+                    self._lp_dashboard_cache = {
                         **cached,
                         **candidate_projection,
                         "orders": degraded_orders,
@@ -3184,7 +3237,8 @@ class PredictionExecutionService:
                         "stale": True,
                         "lp_share_watch_state": self.lp_share_watch_state(),
                     }
-                return {
+                    return deepcopy(self._lp_dashboard_cache)
+                self._lp_dashboard_cache = {
                     "state": "unknown",
                     "orders": [],
                     "positions": [],
@@ -3195,6 +3249,9 @@ class PredictionExecutionService:
                     "market_rewards": {},
                     "checked_at": None,
                     "authenticated": False,
+                    "balance": None,
+                    "allowance": None,
+                    "trades_complete": False,
                     "open_orders_complete": False,
                     "positions_complete": False,
                     "last_success_at": None,
@@ -3204,6 +3261,7 @@ class PredictionExecutionService:
                     "lp_session": self.lp_status(),
                     "lp_sessions": [],
                 }
+                return deepcopy(self._lp_dashboard_cache)
 
         finally:
             self._lp_dashboard_lock.release()

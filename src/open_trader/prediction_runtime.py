@@ -1448,7 +1448,7 @@ class PredictionRuntime:
         )
         self._lp_dashboard_thread.start()
 
-    def _start_history_monitor(self) -> None:
+    def _start_history_monitor(self, *, data_only: bool = False) -> None:
         """Refresh the bounded LP price-history cache hourly."""
 
         if self.lp is None or self._history_thread is not None:
@@ -1471,6 +1471,8 @@ class PredictionRuntime:
             return True
 
         def preparation_alert(result: Mapping[str, object]) -> None:
+            if data_only:
+                return
             fault_pending = result.get("alert_pending") is True
             recovery_pending = result.get("recovery_alert_pending") is True
             if not fault_pending and not recovery_pending:
@@ -1548,11 +1550,11 @@ class PredictionRuntime:
             # deadline. Include it so delivery retries do not wait behind a
             # later full preparation retry; a sent/claimed episode has no
             # independent wake-up requirement.
-            if preparation.get("fault_alert_state") not in {"sent", "claimed"}:
+            if not data_only and preparation.get("fault_alert_state") not in {"sent", "claimed"}:
                 due = parse_deadline(preparation.get("fault_alert_next_at"))
                 if due is not None:
                     deadlines.append(due)
-            if preparation.get("recovery_alert_state") == "failed":
+            if not data_only and preparation.get("recovery_alert_state") == "failed":
                 due = parse_deadline(preparation.get("recovery_alert_next_at"))
                 if due is not None:
                     deadlines.append(due)
@@ -1575,7 +1577,7 @@ class PredictionRuntime:
                     if not callable(refresh_history):
                         return
                     result: object = None
-                    claim_recovery = getattr(
+                    claim_recovery = None if data_only else getattr(
                         lp, "claim_due_preparation_recovery_alert", None
                     )
                     if callable(claim_recovery):
@@ -1696,6 +1698,39 @@ class PredictionRuntime:
             self._owner.acquire()
             if self._n_leg_paused:
                 self.store = PredictionArbitrageStore(self._data_dir)
+                backend = os.environ.get("OPEN_TRADER_CREDENTIAL_BACKEND", "keychain")
+                if backend in {"file", "tencent-ssm"}:
+                    # File authentication is fail-closed; never mask an invalid
+                    # credential file with an unauthenticated public reader.
+                    trading_config = load_trading_config(self._prediction_config_path)
+                    self._prediction_trading = PolymarketTradingClient.from_keychain(
+                        trading_config, read_only=True
+                    )
+                    self._shadow_guards = ExitStack()
+                    self._shadow_guards.enter_context(guard_polymarket_client(
+                        self._prediction_trading,
+                        PolymarketReadOnlyGuard(self._record_shadow_violation),
+                    ))
+                    attach_cache = getattr(self._prediction_trading, "attach_metadata_cache", None)
+                    if callable(attach_cache):
+                        attach_cache(self.store)
+                    self.lp = PolymarketLPService(self.store, self._prediction_trading, owner_lock=self._owner)
+                    self.monitor = PolymarketMonitor(store=self.store, trading=self._prediction_trading)
+                    self.execution = PredictionExecutionService(
+                        store=self.store, monitor=self.monitor, trading=self._prediction_trading,
+                        notifier=NullNotifier(),
+                        lock_path=self._data_dir / "prediction_arbitrage" / "execution.lock",
+                        dashboard_url=self._dashboard_url, lp=self.lp,
+                    )
+                    self.execution._n_leg_paused = True
+                    self.execution._display_only = True
+                    self._start_history_monitor(data_only=True)
+                    self._start_candidate_scan_monitor()
+                    self._start_candidate_maintenance_monitor()
+                    self._start_candidate_competition_monitor()
+                    self._start_lp_dashboard_monitor()
+                    self._start_reward_monitor()
+                    self._start_book_sampler()
                 self._state = "RUNNING"
                 logger.info(
                     "prediction_runtime_state state=RUNNING mode=shadow n_leg_paused=true pid=%s data_dir=%s",

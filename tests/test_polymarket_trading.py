@@ -6561,3 +6561,22 @@ def test_lp_metadata_event_read_failure_not_cached(
         for condition_id in ids
     }
     assert direct_re_queried == {condition_direct}
+
+
+def test_display_account_trades_keep_malformed_rows_unknown_without_poisoning_trading(monkeypatch):
+    adapter = PolymarketTradingClient(TradingConfig(SIGNER, WALLET), client=object())
+    raw = {'id':'trade-1','asset_id':'token-1','market':'condition-1','status':'CONFIRMED',
+        'side':'BUY','trader_side':'TAKER','taker_order_id':'order-1','price':'0.4','size':'20',
+        'match_time':'2026-09-30T00:00:00Z','maker_orders':[]}
+    monkeypatch.setattr(adapter, '_lp_account_facts', lambda **kwargs:{
+        'authenticated':True,'checked_at':datetime.now(UTC),'open_orders':(), 'positions':(),
+        'trades':(), 'trades_complete':True,'raw_trades':(raw, {'bad':'row'}),
+        'balance':Decimal('12'), 'allowance':Decimal('10')})
+    monkeypatch.setattr(adapter, 'lp_market_metadata', lambda _: {})
+    snapshot = adapter.lp_account_snapshot()
+    assert snapshot['trades_complete'] is True
+    assert snapshot['trades'] == ()
+    assert snapshot['display_trades_complete'] is False
+    assert snapshot['account_trades_total'] == 2
+    assert snapshot['account_trades'][0]['trade_id'] == 'trade-1'
+    assert 'raw_trades' not in snapshot

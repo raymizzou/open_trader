@@ -3081,7 +3081,8 @@ function predictionVenueSummary() {
   const summary = Array.isArray(payload?.venues) && payload.venues.length
     ? predictionReadinessStrip(payload)
     : `<section class="pm-readiness pm-venue-readiness" aria-label="交易所连接与账户状态"><article class="pm-readiness-item"><span>平台状态</span><strong>UNKNOWN</strong><small>${escapeHtml(error || "等待首次同步")}</small></article></section>`;
-  const pauseNotice = nLeg.status === "paused"
+  const nLegStatus = predictionSplit() ? state.predictionMarket.nLegStatus : nLeg.status;
+  const pauseNotice = nLegStatus === "paused"
     ? `<p class="pm-signal-error" role="status">多腿套利已暂停 · 仅保留 LP 请求</p>`
     : "";
   const stale = error
@@ -4512,7 +4513,7 @@ function handleLpAutoInput(event) {
   if (!field) return;
   const prediction = state.predictionMarket;
   if (!prediction.lpAutoDraft) {
-    const auto = prediction.lpDashboard?.auto || {};
+    const auto = predictionLpAutoState() || {};
     prediction.lpAutoDraft = {budget_usd: auto.budget_usd ?? "", target_buy_count: auto.target_buy_count ?? 0, expected_config_version: auto.config_version};
   }
   prediction.lpAutoDraft[field.dataset.lpAutoField] = field.value;
@@ -4525,7 +4526,7 @@ async function controlLpAuto(action) {
   prediction.lpAutoMessage = "等待服务确认…";
   let body = {confirm: true};
   if (action === "config") {
-    const auto = prediction.lpDashboard?.auto || {};
+    const auto = predictionLpAutoState() || {};
     const draft = prediction.lpAutoDraft || {budget_usd: auto.budget_usd, target_buy_count: auto.target_buy_count, expected_config_version: auto.config_version};
     body = {...draft, target_buy_count: Number(draft.target_buy_count)};
   }
@@ -4535,7 +4536,11 @@ async function controlLpAuto(action) {
     if (action === "pause" && (result.desired_running !== false || result.pause_confirmed !== true)) throw new Error("暂停未获可靠确认");
     if ((action === "enable" || action === "resume") && result.desired_running !== true) throw new Error("运行意愿未获确认");
     prediction.lpDashboardRequestSeq = (prediction.lpDashboardRequestSeq || 0) + 1;
-    prediction.lpDashboard = {...prediction.lpDashboard, auto: {...prediction.lpDashboard?.auto, ...result}};
+    if (predictionSplit()) {
+      prediction.lpAutoRequestSeq = (prediction.lpAutoRequestSeq || 0) + 1;
+      prediction.lpAutoPayload = {...prediction.lpAutoPayload, ...result};
+      prediction.lpAutoError = "";
+    } else prediction.lpDashboard = {...prediction.lpDashboard, auto: {...prediction.lpDashboard?.auto, ...result}};
     if (action === "config") prediction.lpAutoDraft = null;
     prediction.lpAutoMessage = action === "pause" ? "新增已暂停；已有挂单和仓位继续保护。" : action === "config" ? "配置已保存，未触发交易。" : "运行意愿已保存，立即核对；系统受阻时等待核清。";
   } catch (error) {
@@ -4799,17 +4804,17 @@ function predictionLpCard(payload) {
     + "<div><h2>流动性提供试验</h2><p>手工挂单 · 自动补位 · 收益与风险观察</p></div>"
     + "<div class=\"pm-panel-heading-actions\">" + freshness
     + "<button class=\"pm-button\" type=\"button\" data-action=\"lp-dashboard-refresh\""
-    + (predictionWritesBlocked() || state.predictionMarket.lpDashboardRequestInFlight || state.predictionMarket.lpPreparationRecoveryInFlight || !state.predictionMarket.csrfToken ? " disabled" : "") + ">立即刷新</button>"
+    + (predictionWritesBlocked() || predictionLpDisplayBusy() || state.predictionMarket.lpPreparationRecoveryInFlight || !state.predictionMarket.csrfToken ? " disabled" : "") + ">立即刷新</button>"
     + "<button class=\"pm-button danger\" type=\"button\" data-action=\"lp-cancel-all\""
-    + (predictionWritesBlocked() || state.predictionMarket.lpDashboardRequestInFlight || state.predictionMarket.lpPreparationRecoveryInFlight || !state.predictionMarket.csrfToken ? " disabled" : "") + ">撤全部</button></div></header>"
+    + (predictionWritesBlocked() || predictionLpDisplayBusy() || state.predictionMarket.lpPreparationRecoveryInFlight || !state.predictionMarket.csrfToken ? " disabled" : "") + ">撤全部</button></div></header>"
     + readonlyLpUnavailable
     + errorMarkup
     + cancelSummaryMarkup
     + lpSubmitToastsMarkup()
     + snapshotPendingMarkup
     + budgetLineMarkup
-    + predictionLpAutoControls(dashboard.auto, dashboard.stale === true)
-    + lpAutoFundsAndOrders(dashboard.auto)
+    + predictionLpAutoControls(predictionSplit() ? predictionLpAutoState() : dashboard.auto, predictionSplit() ? Boolean(state.predictionMarket.lpAutoError) : dashboard.stale === true)
+    + lpAutoFundsAndOrders(predictionSplit() ? predictionLpAutoState() : dashboard.auto)
     + "<section aria-label=\"当天 LP 委托\"><h3>当天 LP 委托 <span class=\"sub\">· 北京时间 08:00 起 · 活跃在前 · 已完结沉底 · 各按当前小时奖励率降序 · 一标的一行</span></h3><div class=\"pm-table-wrap\"><table class=\"pm-table pm-lp-order-table\">"
     + "<thead><tr><th scope=\"col\">标的</th><th scope=\"col\">LP 收益率(推荐 → 实际)</th><th scope=\"col\">今日奖励(累计 · $/小时)</th><th scope=\"col\">份额占比</th><th scope=\"col\">实际占用资金</th><th scope=\"col\">压力损失(警戒线 10%)</th><th scope=\"col\">委托与成交量</th></tr></thead>"
     + "<tbody>" + todayRowsHtml + "</tbody></table></div>"
@@ -6258,8 +6263,20 @@ function predictionServiceReadOnly() {
   return predictionServiceIdentity().state === "shadow";
 }
 
+function predictionSplit() {
+  return document.body?.dataset?.predictionSplit === "true";
+}
+
+function predictionLpDisplayBusy() {
+  return !predictionSplit() && state.predictionMarket.lpDashboardRequestInFlight;
+}
+
+function predictionLpAutoState() {
+  return predictionSplit() ? state.predictionMarket.lpAutoPayload : state.predictionMarket.lpDashboard?.auto;
+}
+
 function predictionServiceIdentity() {
-  const payload = state.predictionMarket.venuesPayload;
+  const payload = predictionSplit() ? state.predictionMarket.executionPayload : state.predictionMarket.venuesPayload;
   if (String(payload?.mode || "") === "shadow" && String(payload?.mutations || "") === "prohibited") {
     return {state: "shadow", label: "Shadow 只读"};
   }
@@ -6268,7 +6285,7 @@ function predictionServiceIdentity() {
   }
   // Cloud/Prediction-only views must fail closed. A normal legacy route with
   // no service identity fields retains its existing compatibility behavior.
-  if (predictionOnly() || payload?.mode !== undefined || payload?.mutations !== undefined) {
+  if (predictionSplit() || predictionOnly() || payload?.mode !== undefined || payload?.mutations !== undefined) {
     return {state: "unknown", label: "服务身份 UNKNOWN"};
   }
   return {state: "legacy", label: ""};
@@ -6348,6 +6365,7 @@ function invalidatePredictionNLegReads() {
 }
 
 async function fetchPredictionLpDashboard() {
+  if (predictionSplit()) fetchPredictionLpAutoState();
   if (state.workspaceView !== "prediction_market" || state.predictionMarket.activeTab !== "lp"
     || state.predictionMarket.lpDashboardRequestInFlight || state.predictionMarket.lpAutoBusy) return;
   const requestSeq = (state.predictionMarket.lpDashboardRequestSeq || 0) + 1;
@@ -6383,7 +6401,60 @@ async function fetchPredictionLpDashboard() {
   }
 }
 
+function updatePredictionNLegStatus(payload) {
+  const nLegStatus = predictionNLegStatus(payload);
+  state.predictionMarket.nLegStatus = nLegStatus;
+  if (nLegStatus !== "running") {
+    invalidatePredictionNLegReads();
+    closeNLegDomainPredictionModal();
+  } else if (state.predictionMarket.activeTab === "multi_leg") fetchPredictionState();
+}
+
+async function fetchPredictionExecutionIdentity() {
+  const prediction = state.predictionMarket;
+  if (prediction.executionRequestInFlight) return;
+  prediction.executionRequestInFlight = true;
+  try {
+    const response = await fetch(predictionRequestUrl("/api/prediction-arbitrage/execution/identity"), {cache: "no-store", credentials: "same-origin"});
+    if (!response.ok) throw new Error("Air execution " + response.status);
+    prediction.executionPayload = await response.json();
+    prediction.csrfToken = prediction.executionPayload.csrf_token || "";
+    updatePredictionNLegStatus(prediction.executionPayload);
+  } catch (error) {
+    prediction.executionPayload = {mode: "unknown", mutations: "unknown"};
+    prediction.csrfToken = "";
+    updatePredictionNLegStatus({});
+  } finally {
+    prediction.executionRequestInFlight = false;
+    if (state.workspaceView === "prediction_market") renderPredictionMarket();
+  }
+}
+
+async function fetchPredictionLpAutoState() {
+  const prediction = state.predictionMarket;
+  if (state.workspaceView !== "prediction_market" || prediction.lpAutoRequestInFlight || prediction.lpAutoBusy) return;
+  const requestSeq = (prediction.lpAutoRequestSeq || 0) + 1;
+  prediction.lpAutoRequestSeq = requestSeq;
+  prediction.lpAutoRequestInFlight = true;
+  try {
+    const response = await fetch(predictionRequestUrl("/api/prediction-arbitrage/lp/auto/state"), {cache: "no-store", credentials: "same-origin"});
+    if (!response.ok) throw new Error("Air auto state " + response.status);
+    const payload = await response.json();
+    if (requestSeq !== prediction.lpAutoRequestSeq) return;
+    prediction.lpAutoPayload = payload;
+    prediction.lpAutoError = "";
+  } catch (error) {
+    if (requestSeq !== prediction.lpAutoRequestSeq) return;
+    prediction.lpAutoPayload = null;
+    prediction.lpAutoError = error instanceof Error ? error.message : String(error);
+  } finally {
+    prediction.lpAutoRequestInFlight = false;
+    if (state.workspaceView === "prediction_market" && prediction.activeTab === "lp") renderPredictionMarket();
+  }
+}
+
 async function fetchPredictionVenues() {
+  if (predictionSplit()) fetchPredictionExecutionIdentity();
   if (state.workspaceView !== "prediction_market" || state.predictionMarket.venuesRequestInFlight) return;
   const previousPayload = state.predictionMarket.venuesPayload;
   state.predictionMarket.venuesRequestInFlight = true;
@@ -6396,21 +6467,14 @@ async function fetchPredictionVenues() {
     const payload = await response.json();
     state.predictionMarket.venuesPayload = {...payload};
     state.predictionMarket.venuesError = "";
-    state.predictionMarket.csrfToken = payload.csrf_token || state.predictionMarket.csrfToken;
-    const nLegStatus = predictionNLegStatus(payload);
-    state.predictionMarket.nLegStatus = nLegStatus;
-    if (nLegStatus !== "running") {
-      invalidatePredictionNLegReads();
-      closeNLegDomainPredictionModal();
-    } else if (state.predictionMarket.activeTab === "multi_leg") fetchPredictionState();
+    if (!predictionSplit()) state.predictionMarket.csrfToken = payload.csrf_token || state.predictionMarket.csrfToken;
+    if (!predictionSplit()) updatePredictionNLegStatus(payload);
   } catch (error) {
-    if (predictionOnly() || previousPayload?.mode !== undefined || previousPayload?.mutations !== undefined) {
+    if (!predictionSplit() && (predictionOnly() || previousPayload?.mode !== undefined || previousPayload?.mutations !== undefined)) {
       state.predictionMarket.venuesPayload = {mode: "unknown", mutations: "unknown"};
     }
     state.predictionMarket.venuesError = error instanceof Error ? error.message : String(error);
-    state.predictionMarket.nLegStatus = "unknown";
-    invalidatePredictionNLegReads();
-    closeNLegDomainPredictionModal();
+    if (!predictionSplit()) updatePredictionNLegStatus({});
   } finally {
     state.predictionMarket.venuesRequestInFlight = false;
     if (state.workspaceView === "prediction_market") renderPredictionMarket();
@@ -6442,7 +6506,7 @@ async function fetchPredictionState() {
     };
     state.predictionMarket.relationReview.pendingCount = Number(payload?.relation_review?.pending_count || 0);
     state.predictionMarket.error = "";
-    state.predictionMarket.csrfToken = payload.csrf_token || state.predictionMarket.csrfToken;
+    if (!predictionSplit()) state.predictionMarket.csrfToken = payload.csrf_token || state.predictionMarket.csrfToken;
     if (!["signals", "executions", "incidents"].includes(state.predictionMarket.historyKind)) {
       state.predictionMarket.historyKind = "signals";
     }

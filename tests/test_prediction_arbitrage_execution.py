@@ -9360,3 +9360,49 @@ def test_notify_monitor_timeout_recovery_copy(tmp_path: Path) -> None:
     assert "每 5 分钟自动探测恢复" in message
     assert "Prediction Service" in message
     assert "重试已停止" not in message
+
+
+def test_cloud_display_cache_publishes_failures_expiration_and_bounded_trades(tmp_path, monkeypatch):
+    import open_trader.prediction_arbitrage_execution as module
+    now = datetime.now(UTC)
+    class Trading(_CancelTrading):
+        complete = True
+        def lp_account_snapshot(self):
+            return {**super().lp_account_snapshot(), 'checked_at':now,
+                'open_orders_complete':self.complete, 'positions_complete':self.complete,
+                'balance':Decimal('12'), 'allowance':Decimal('10'),
+                'account_trades':tuple({'trade_id':str(i)} for i in range(102)),
+                'account_trades_total':102, 'display_trades_complete':True}
+    trading = Trading([])
+    service = PredictionExecutionService(store=PredictionArbitrageStore(tmp_path/'data'),
+        monitor=object(), trading=trading, notifier=ChannelNotifier("feishu"), lock_path=tmp_path/'lock')
+    service._display_only = True
+    service.refresh_lp_dashboard_snapshot()
+    assert service.lp_dashboard()['balance'] == Decimal('12')
+    assert service.lp_dashboard()['state'] == 'ready'
+    assert len(service.lp_account_trades_page(offset=0,limit=100)['items']) == 100
+    assert service.lp_account_trades_page(offset=100,limit=100)['items'] == [{'trade_id':'100'},{'trade_id':'101'}]
+    trading.complete = False
+    service.refresh_lp_dashboard_snapshot()
+    assert service.lp_dashboard()['state'] == 'unknown' and service.lp_dashboard()['stale'] is True
+    service._display_only = False
+    service.refresh_lp_dashboard_snapshot()
+    assert service.lp_dashboard()['state'] == 'ready' and service.lp_dashboard()['stale'] is False
+    assert service.lp_dashboard()['open_orders_complete'] is False
+    service._display_only = True
+    trading.complete = True
+    service.refresh_lp_dashboard_snapshot()
+    reads = trading.account_reads
+    for _ in range(2): service.lp_dashboard();service.lp_account_trades_page(offset=0,limit=1)
+    assert trading.account_reads == reads
+    monkeypatch.setattr(module, '_utc_now', lambda: now + timedelta(seconds=61))
+    assert service.lp_dashboard()['stale'] is True
+    assert service.lp_account_trades_page(offset=0,limit=1)['reason'] == 'account_snapshot_expired'
+    monkeypatch.setattr(module, '_utc_now', lambda: now)
+    trading.account_error = RuntimeError('lp_account_snapshot_unknown')
+    service.refresh_lp_dashboard_snapshot()
+    assert service.lp_dashboard()['state'] == 'stale'
+    assert service.lp_dashboard()['balance'] == Decimal('12')
+    assert service.lp_account_trades_page(offset=0,limit=1)['state'] == 'unknown'
+    for limit in (0,101):
+        with pytest.raises(ValueError): service.lp_account_trades_page(offset=0,limit=limit)

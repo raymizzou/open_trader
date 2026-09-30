@@ -5,6 +5,13 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-30
 
+- #204：完整 Air Dashboard 可通过独立 SSH 隧道显示云端 paused Shadow 的 LP/账户快照；
+  Air 保留所有写操作、实时预检、N-leg 状态/历史和执行状态；自动控制及现有资金/轮次区同读 Air，
+  云端 cookie/CSRF 不进入本地授权。客户端退出期间允许 ps 短暂撕裂后再核对，持续 PID 不匹配仍拒绝停止。
+  文件凭据供数复用现有 LP 后台线程，禁交易/保护/N-leg/日报/通知；disabled 仍不启动读取。
+  读取失败发布 stale，云端账户快照按既有 60 秒边界过期，成交详情有界；奖励美元 UNKNOWN 保留。
+  配置分别核验 Gateway/云端/Air SHA，Cloud Smoke 记录逐源快照事实。未部署、未切换交易 owner。
+
 - #202：LP 奖励份额读取不再因返回行内嵌 rewards_config 在本地日期不活跃而丢弃已返回的
   earning_percentage；正池仍缺真实来源份额时保留 UNKNOWN，禁止补零或跨来源替代。
   新增回归分别覆盖“上游真缺失保持 UNKNOWN”与“返回份额但 config 过期应保留”两种形态。

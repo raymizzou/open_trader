@@ -10110,3 +10110,81 @@ def test_reward_monitor_refreshes_every_active_group(
         if thread is not None:
             thread.join(timeout=2)
             runtime._reward_thread = None
+
+
+def test_paused_file_shadow_starts_guarded_display_workers_only(tmp_path, monkeypatch):
+    import open_trader.prediction_runtime as module
+    config = tmp_path / 'prediction.json'
+    config.write_text('{}')
+    monkeypatch.setenv('OPEN_TRADER_CREDENTIAL_BACKEND', 'file')
+    monkeypatch.setattr(module, 'load_trading_config', lambda _: object())
+    events = []
+    trading = SimpleNamespace(attach_metadata_cache=lambda _: events.append('metadata'))
+    monkeypatch.setattr(module.PolymarketTradingClient, 'from_keychain',
+        lambda config, **kwargs: (events.append(('auth', kwargs)), trading)[1])
+    monkeypatch.setattr(module, 'PolymarketLPService', lambda *a, **k: SimpleNamespace())
+    monkeypatch.setattr(module, 'PolymarketMonitor', lambda **k: SimpleNamespace(stop=lambda: events.append('monitor-stop')))
+    monkeypatch.setattr(module, 'PredictionExecutionService', lambda **k: SimpleNamespace())
+    @contextmanager
+    def guarded(*args):
+        events.append('guard-enter')
+        yield
+        events.append('guard-exit')
+    monkeypatch.setattr(module, 'guard_polymarket_client', guarded)
+    workers = ('_start_history_monitor', '_start_candidate_scan_monitor',
+        '_start_candidate_maintenance_monitor', '_start_candidate_competition_monitor',
+        '_start_lp_dashboard_monitor', '_start_reward_monitor', '_start_book_sampler')
+    for name in workers:
+        monkeypatch.setattr(PredictionRuntime, name,
+            lambda self, _name=name, **kwargs: events.append((_name, kwargs)))
+    for name in ('_start_lp_monitor', '_start_lp_auto_monitor', '_start_lp_daily_report_monitor', '_start_lp_share_watch'):
+        monkeypatch.setattr(PredictionRuntime, name, lambda self: pytest.fail('execution worker started'))
+    runtime = PredictionRuntime(data_dir=tmp_path/'data', prediction_config_path=config,
+        dashboard_url='http://127.0.0.1:8766/', mode='shadow', n_leg_paused=True)
+    runtime.start()
+    try:
+        assert ('auth', {'read_only': True}) in events
+        assert runtime.execution is not None and runtime.lp is not None
+        assert runtime.production_owner is False and runtime.solver_server is None
+        assert [event[0] for event in events if isinstance(event, tuple) and event[0] in workers] == list(workers)
+        assert events.index('guard-enter') < events.index(('_start_history_monitor', {'data_only': True}))
+        with pytest.raises(RuntimeError, match='cannot start'):
+            runtime.start()
+    finally:
+        runtime.stop()
+    assert events[-1] == 'guard-exit'
+
+
+def test_paused_file_shadow_authentication_failure_does_not_fallback(tmp_path, monkeypatch):
+    import open_trader.prediction_runtime as module
+    monkeypatch.setenv('OPEN_TRADER_CREDENTIAL_BACKEND', 'file')
+    monkeypatch.setattr(module, 'load_trading_config', lambda _: object())
+    def invalid(*args, **kwargs):
+        raise ValueError('credential_file_invalid')
+    monkeypatch.setattr(module.PolymarketTradingClient, 'from_keychain', invalid)
+    runtime = PredictionRuntime(data_dir=tmp_path/'data', prediction_config_path=tmp_path/'missing.json',
+        dashboard_url='http://127.0.0.1:8766/', mode='shadow', n_leg_paused=True)
+    with pytest.raises(ValueError, match='credential_file_invalid'):
+        runtime.start()
+    assert runtime.state == 'FAILED'
+    assert runtime.lp is None and runtime.execution is None and runtime._prediction_trading is None
+    assert runtime.production_owner is False and not runtime._owner.held
+
+
+def test_paused_disabled_shadow_with_config_remains_credentialless(tmp_path, monkeypatch):
+    import open_trader.prediction_runtime as module
+    config = tmp_path / 'prediction.json'
+    config.write_text('{}')
+    monkeypatch.setenv('OPEN_TRADER_CREDENTIAL_BACKEND', 'disabled')
+    def forbidden(*a, **k):
+        pytest.fail('disabled paused Shadow must not load config or initialize readers')
+    monkeypatch.setattr(module, 'load_trading_config', forbidden)
+    monkeypatch.setattr(module.PolymarketTradingClient, 'from_keychain', forbidden)
+    runtime = PredictionRuntime(data_dir=tmp_path/'data', prediction_config_path=config,
+        dashboard_url='http://127.0.0.1:8766/', mode='shadow', n_leg_paused=True)
+    runtime.start()
+    try:
+        assert runtime.lp is None and runtime.execution is None
+        assert runtime._candidate_scan_thread is None and runtime._history_thread is None
+    finally:
+        runtime.stop()
