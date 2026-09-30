@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-01
 
+- Smoke 暂停 N-leg 集成 fixture 补齐真实日志 checker 和 `rg --version`，保留 N-leg/LP 契约与只读请求断言，新增 rg 不可用仍阻塞回归；目标 RED→GREEN，三个局部文件 1016 passed、8 deselected，未改生产代码、未部署。
+
 - #207 集成测试补充：元数据预热的 SDK fake 支持 closed 精确补查，确认缺失标的经默认与 closed 两次读取，正缓存不重读；保留 1500/1501 完成量、原 TTL、重试及停止/并发断言。目标单例 RED→GREEN，1 passed；未改生产代码、未重跑全服务。
 
 - Prediction universe 盘口按去重 token 每批 100 个原生读取，保留 8 并发、30 秒整轮时限与 TOP20 覆盖；
