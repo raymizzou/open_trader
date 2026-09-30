@@ -2667,6 +2667,8 @@ class PolymarketMonitor:
         with self._lock:
             self._universe_at = self._now()
             self._universe_failed = False
+            if str(self._diagnostics.get("last_error") or "").partition(":")[0] == "universe":
+                self._diagnostics["last_error"] = None
         phase("complete")
         self._emit_health_log(force=True)
 

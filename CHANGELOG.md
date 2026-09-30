@@ -5,6 +5,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-01
 
+- LP 内部 CAS、轮次与读取容量等待使用轻量 typed exception，固定允许原因记 INFO；同文本普通异常、真实超时、身份/结构/认证及 active 404 保持故障。精确 market/condition/token 验证且 `closed is True` 时不请求盘口，保留账户、订单、成交、库存与 UNKNOWN 占资，以固定 60 秒本地期限复查，明确 local 来源。
+- 已安装账户 validator、完整新鲜挂单列表与当前交易代次共同证明旧历史 ID 不在挂单中时，前置和后续收单 sweep 共用过滤，停止反复生成 cancel 意图；当前正向 LIVE/OPEN/ACCEPTED/PENDING 回执仍可撤单，unknown ack 可重试，旧 UNKNOWN 意图、订单历史和资金语义保留。Universe 完整发布成功仅清当前 universe diagnostic，其他 component 与历史 warning 保留。
+- 定向 Docker RED→GREEN：4 个受影响文件 633 passed，覆盖固定重试截止、闭市不读 book、真实 SDK null/后续 LIVE、三类取消目标及无效 absence proof；Prediction 服务检查 3189 passed、1 skipped（179.48 秒）。真实账户数据副本验证 27 个历史组：0 新撤单意图、0 generation 变化、0 venue 写入；未跑 Candidate，未提交、合并或部署。
+
 - Smoke 暂停 N-leg 集成 fixture 补齐真实日志 checker 和 `rg --version`，保留 N-leg/LP 契约与只读请求断言，新增 rg 不可用仍阻塞回归；目标 RED→GREEN，三个局部文件 1016 passed、8 deselected，未改生产代码、未部署。
 
 - #207 集成测试补充：元数据预热的 SDK fake 支持 closed 精确补查，确认缺失标的经默认与 closed 两次读取，正缓存不重读；保留 1500/1501 完成量、原 TTL、重试及停止/并发断言。目标单例 RED→GREEN，1 passed；未改生产代码、未重跑全服务。

@@ -2729,3 +2729,202 @@ def test_account_version_wait_preserves_business_state_and_fault_episode(
                 "needs_attention_verified_recovery_episode", "needs_attention_recovery_due", "queue_protection"):
         assert row.get(key) == session.get(key)
     assert store.lp_actions("session-01") == []
+
+
+def _historical_cancel_service(tmp_path):
+    from tests.test_polymarket_lp import _SDKPublicClient, _request as sdk_request
+    now = datetime.now(UTC)
+
+    class Account(_SDKAccountClient):
+        live = None
+        in_open_list = False
+        cancels = []
+
+        def list_open_orders(self, **kwargs):
+            return [self.live] if self.live is not None and self.in_open_list else []
+
+        def get_order(self, *, order_id):
+            if self.live is not None and self.live.id == order_id:
+                return self.live
+            return OpenOrder.parse_response(None)
+
+        def list_positions(self, **kwargs):
+            return [{'asset': '0x' + '1' * 64, 'conditionId': '0x' + 'c' * 64, 'size': Decimal('100')}]
+
+        def cancel_orders(self, *, order_ids):
+            self.cancels.extend(order_ids)
+            # Preserve unknown acknowledgements; a still-live order can retry.
+            return SimpleNamespace(canceled=(), not_canceled={oid: 'unknown' for oid in order_ids})
+
+    class ClosedPublic(_SDKPublicClient):
+        def get_market(self, *, id):
+            row = super().get_market(id=id)
+            return row.model_copy(update={'state': row.state.model_copy(update={'closed': True})})
+
+    account = Account(now)
+    wallet = str(account.open_order.maker_address)
+    adapter = PolymarketTradingClient(TradingConfig(wallet, wallet), account,
+                                     public_client_factory=lambda: ClosedPublic(now))
+    store = PredictionArbitrageStore(tmp_path)
+    request = sdk_request(now)
+    history = {
+        oid: {'order_id': oid, 'side': side, 'token_id': request['token_id'],
+              'price': '0.30', 'quantity': '200', 'original_size': '200',
+              'status': 'UNKNOWN', 'size_matched': '100' if oid == 'order-1' else '0'}
+        for oid, side in [('order-1', 'BUY'), ('augment-old', 'BUY'), ('sell-old', 'SELL')]}
+    store.lp_create_session('historical', 'historical', state='entry_open', payload={
+        **request, 'quantity': '200', 'group_buy_quantity': '400',
+        'entry_order_id': 'order-1', 'augment_order_ids': ['augment-old'],
+        'owned_order_ids': list(history), 'order_history': history,
+        'submit_status': 'accepted', 'reserved_usd': '120'})
+    for oid in history:
+        store.lp_upsert_action('historical', f'old-cancel:{oid}', state='unknown', payload={
+            'role': 'reconciliation_cancel', 'reason': 'group_fill_collect', 'order_id': oid})
+    service = PolymarketLPService(store, adapter)
+    engine = PredictionExecutionService(store=store, monitor=SimpleNamespace(), trading=adapter,
+                                       notifier=SimpleNamespace(), lock_path=tmp_path/'execution.lock', lp=service)
+    engine._breaker_open = False
+    # Complete the closed-market read before ticks; account data remains fresh each round.
+    adapter.lp_snapshot({**request, 'owned_order_ids': list(history)})
+    return engine, service, adapter, account, store
+
+
+def test_historical_null_receipts_do_not_create_cancel_storm_or_release_funds(tmp_path):
+    engine, service, adapter, account, store = _historical_cancel_service(tmp_path)
+    before = store.lp_actions('historical')
+    generation = store.lp_trade_generation()
+    try:
+        for _ in range(3):
+            engine.lp_tick()
+        assert account.cancels == []
+        assert store.lp_actions('historical') == before
+        assert store.lp_trade_generation() == generation
+        row = store.lp_session('historical')
+        assert row['state'] != 'complete'
+        assert row['owned_order_ids'] == ['order-1', 'augment-old', 'sell-old']
+        assert row['reserved_usd'] == '120'
+        assert row['order_history']['order-1']['status'] == 'UNKNOWN'
+        assert row['fee_status'] == 'unknown'
+        assert row['orders_terminal'] is False
+        assert all(action['state'] == 'unknown' for action in store.lp_actions('historical'))
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize('order_id,side', [('order-1', 'BUY'), ('augment-old', 'BUY'), ('sell-old', 'SELL')])
+@pytest.mark.parametrize('source', ['receipt', 'open_list'])
+def test_later_live_exact_id_overrides_empty_list_and_unknown_cancel_can_retry(tmp_path, monkeypatch, order_id, side, source):
+    from open_trader import polymarket_trading
+    engine, service, adapter, account, store = _historical_cancel_service(tmp_path)
+    advance = [0.0]
+    real_monotonic = time.monotonic
+    monkeypatch.setattr(polymarket_trading, 'time', SimpleNamespace(
+        monotonic=lambda: real_monotonic() + advance[0], time=time.time))
+    try:
+        engine.lp_tick()
+        generation = store.lp_trade_generation()
+        assert account.cancels == []
+        advance[0] = 61  # Expire the real adapter's null-receipt retry fence.
+        account.live = account.open_order.model_copy(update={
+            'id': order_id, 'side': side, 'status': 'LIVE', 'associate_trades': (),
+            'original_size': Decimal('200'),
+            'size_matched': Decimal('100') if order_id == 'order-1' else Decimal('0')})
+        account.in_open_list = source == 'open_list'
+        engine.lp_tick()
+        assert account.cancels == [order_id]
+        assert store.lp_trade_generation() > generation
+        new_actions = [a for a in store.lp_actions('historical') if not a['action_key'].startswith('old-cancel:')]
+        assert new_actions and all(a['order_id'] == order_id and a['state'] == 'unknown' for a in new_actions)
+        # Unknown acknowledgement cannot suppress a still-positively-live order.
+        engine.lp_tick()
+        assert account.cancels == [order_id, order_id]
+        assert store.lp_session('historical')['reserved_usd'] == '120'
+        assert all(a['state'] == 'unknown' for a in store.lp_actions('historical'))
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize('invalid', ['missing_generation', 'bool_generation', 'generation_mismatch', 'stale_generation',
+                                    'missing_validator', 'missing_wallet', 'wrong_wallet', 'unauthenticated',
+                                    'missing_complete', 'incomplete', 'missing_list', 'invalid_list',
+                                    'malformed_row', 'missing_id', 'nonstring_id', 'missing_token', 'nonstring_token', 'expired', 'future'])
+def test_invalid_account_proof_cannot_skip_historical_cancel_targets(tmp_path, invalid):
+    engine, service, adapter, account, store = _historical_cancel_service(tmp_path)
+    session, revision = store.lp_session_with_revision('historical', trading=True)
+    generation = store.lp_trade_generation()
+    token = adapter.lp_account_round_begin(store.lp_trade_generation)
+    try:
+        snapshot = adapter.lp_snapshot({**session, '_lp_account_round': token})
+        snapshot['account'] = dict(snapshot['account'])
+        facts = snapshot['account']
+        if invalid == 'missing_generation':
+            snapshot.pop('_lp_trade_generation')
+        elif invalid == 'bool_generation':
+            snapshot['_lp_trade_generation'] = bool(generation)
+        elif invalid in {'generation_mismatch', 'stale_generation'}:
+            snapshot['_lp_trade_generation'] = generation + 1
+        elif invalid == 'missing_validator':
+            service._facts_validator = None
+        elif invalid in {'missing_wallet', 'wrong_wallet'}:
+            facts['wallet_address'] = None if invalid == 'missing_wallet' else '0x' + '9' * 40
+        elif invalid == 'unauthenticated':
+            facts['authenticated'] = False
+        elif invalid in {'missing_complete', 'incomplete'}:
+            facts['open_orders_complete'] = None if invalid == 'missing_complete' else False
+        elif invalid == 'missing_list':
+            facts.pop('open_orders')
+        elif invalid == 'invalid_list':
+            facts['open_orders'] = {}
+        elif invalid in {'malformed_row', 'missing_id', 'nonstring_id', 'missing_token', 'nonstring_token'}:
+            valid = {'order_id': 'unrelated', 'token_id': session['token_id']}
+            facts['open_orders'] = [
+                object() if invalid == 'malformed_row' else
+                {'token_id': session['token_id']} if invalid == 'missing_id' else
+                {**valid, 'order_id': 123} if invalid == 'nonstring_id' else
+                {'order_id': 'unrelated'} if invalid == 'missing_token' else
+                {**valid, 'token_id': 123}
+            ]
+        elif invalid in {'expired', 'future'}:
+            facts['checked_at'] = datetime.now(UTC) + timedelta(seconds=-61 if invalid == 'expired' else 60)
+        passed_generation = generation + 1 if invalid == 'stale_generation' else generation
+        before = len(store.lp_actions('historical'))
+        service._claim_and_send_owned_cancels_off_lock(session, snapshot, initial_revision=revision,
+            trade_generation=passed_generation, reason='group_fill_collect', allow_history=True)
+        if invalid == 'stale_generation':
+            # Old bundle cannot grant absence and the original Store CAS also rejects it.
+            assert account.cancels == []
+            assert len(store.lp_actions('historical')) == before
+        else:
+            assert set(account.cancels) == {'order-1', 'augment-old', 'sell-old'}
+            assert len(store.lp_actions('historical')) == before + 3
+    finally:
+        adapter.lp_account_round_end(token)
+        adapter.close()
+
+
+@pytest.mark.parametrize('lane', ['off_lock', 'owned_sweep'])
+def test_old_live_history_is_not_current_positive_cancel_evidence(tmp_path, lane):
+    engine, service, adapter, account, store = _historical_cancel_service(tmp_path)
+    session = store.lp_session('historical')
+    history = {oid: {**row, 'status': 'LIVE'} for oid, row in session['order_history'].items()}
+    store.lp_update_session('historical', patch={'order_history': history})
+    session, revision = store.lp_session_with_revision('historical', trading=True)
+    generation = store.lp_trade_generation()
+    before = store.lp_actions('historical')
+    token = adapter.lp_account_round_begin(store.lp_trade_generation)
+    try:
+        snapshot = adapter.lp_snapshot({**session, '_lp_account_round': token})
+        if lane == 'off_lock':
+            service._claim_and_send_owned_cancels_off_lock(session, snapshot,
+                initial_revision=revision, trade_generation=generation,
+                reason='group_fill_collect', allow_history=True)
+        else:
+            service._cancel_owned_orders(session, snapshot=snapshot,
+                expected_generation=generation, expected_trade_revision=revision)
+        assert account.cancels == []
+        assert store.lp_actions('historical') == before
+        assert store.lp_trade_generation() == generation
+        assert store.lp_session('historical')['order_history'] == history
+    finally:
+        adapter.lp_account_round_end(token)
+        adapter.close()

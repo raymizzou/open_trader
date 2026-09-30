@@ -21,6 +21,7 @@ from time import monotonic
 from typing import Any, Callable, Iterable, Iterator, Literal, Mapping
 from zoneinfo import ZoneInfo
 
+from .polymarket_lp_errors import LpObservationWait
 from open_trader.llm_providers import DEFAULT_PROVIDER, PROVIDER_IDS
 from open_trader.prediction_arbitrage import MAX_CROSS_UNSETTLED_PRINCIPAL
 from open_trader.prediction_n_leg import fingerprint as canonical_fingerprint
@@ -4987,7 +4988,7 @@ class PredictionArbitrageStore:
                     "SELECT generation FROM lp_trade_generation WHERE singleton=1"
                 ).fetchone()
                 if generation is None or int(generation["generation"]) != int(expected_generation):
-                    raise ValueError("account_round_invalid")
+                    raise LpObservationWait("account_round_invalid")
 
             loaded = [
                 (row, _load_payload(str(row["payload"])))
@@ -6114,7 +6115,7 @@ class PredictionArbitrageStore:
                 if generation is None or int(generation["generation"]) != int(
                     expected_generation
                 ):
-                    raise ValueError("account_round_invalid")
+                    raise LpObservationWait("account_round_invalid")
             row = connection.execute(
                 "SELECT * FROM lp_first_seen_episodes WHERE episode_id=?",
                 (str(episode_id),),
@@ -6235,13 +6236,13 @@ class PredictionArbitrageStore:
                 raise ValueError("lp_session_not_found")
             payload = _load_payload(str(row["payload"]))
             if int(payload.get("_lp_trade_revision", 0)) != revision:
-                raise ValueError("session_changed")
+                raise LpObservationWait("session_changed")
             if trade_generation is not None:
                 observed = connection.execute(
                     "SELECT generation FROM lp_trade_generation WHERE singleton=1"
                 ).fetchone()
                 if observed is None or int(observed["generation"]) != int(trade_generation):
-                    raise ValueError("account_round_invalid")
+                    raise LpObservationWait("account_round_invalid")
             for action_id in resolved_cancels:
                 connection.execute("UPDATE lp_actions SET state='accepted',updated_at=? WHERE action_id=? AND session_id=? AND state IN ('pending','unknown')",
                                    (_utc_now(), action_id, str(session_id)))
@@ -6319,7 +6320,7 @@ class PredictionArbitrageStore:
             if stale:
                 if reject_existing:
                     return []
-                raise ValueError("account_round_invalid")
+                raise LpObservationWait("account_round_invalid")
             if reject_existing:
                 placeholders = ",".join("?" for _ in encoded)
                 existing = connection.execute(

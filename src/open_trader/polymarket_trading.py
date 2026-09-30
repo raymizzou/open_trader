@@ -36,6 +36,7 @@ from urllib.request import ProxyHandler, Request, build_opener, urlopen
 from polymarket import BuilderApiKey, PRODUCTION, PublicClient, SecureClient
 from polymarket._internal.wallet import signature_type_for
 
+from .polymarket_lp_errors import LpObservationWait
 from .prediction_arbitrage import (
     MAX_NORMAL_COST,
     MAX_WALLET_BALANCE,
@@ -650,6 +651,14 @@ def _lp_read_stage(stage: str, timings: dict[str, float] | None = None):
         error_types = _safe_read_error_chain(exc)
         if any(isinstance(error, (LpAccountRoundInvalid, LpNewerAccountFacts)) for error in _read_exception_chain(exc)):
             wait_reason = "account_round_invalid"
+        elif typed_wait := next((
+            str(error) for error in _read_exception_chain(exc)
+            if isinstance(error, LpObservationWait) and str(error) in {
+                "session_changed", "account_round_invalid", "market_read_in_progress",
+                "market_read_cooling_down", "market_read_capacity", "market_closed",
+            }
+        ), None):
+            wait_reason = typed_wait
         elif stage == "required_order" and _null_order_response(exc):
             wait_reason = "order_lookup_unavailable"
         else:
@@ -1855,7 +1864,7 @@ class PolymarketTradingClient:
     def _lp_public_error_at_deadline_locked(
         self, key: str, error: Mapping[str, object], *, create: bool
     ) -> tuple[float, dict[str, object]] | None:
-        """Read/create the in-memory Retry-After fence; caller holds its lock."""
+        """Read/create the provider or local retry fence; caller holds its lock."""
         existing = self._lp_public_read_retry.get(key)
         if existing is not None:
             return existing[0], self._lp_public_retry_projection(existing)
@@ -1880,10 +1889,22 @@ class PolymarketTradingClient:
         )
         return projected
 
+    @staticmethod
+    def _lp_public_error_facts(exc: BaseException) -> dict[str, object]:
+        if isinstance(exc, LpObservationWait) and str(exc) == "market_closed":
+            return {
+                "error_type": "market_closed",
+                "stage": "market_book",
+                "retry_after_seconds": 60,
+                "retry_source": "local_closed_market_recheck",
+            }
+        return _safe_history_response_facts(exc)
+
     def _read_lp_public_snapshot(
-        self, key: str, market_id: str, token_id: str, *, wait: bool = True
+        self, key: str, market_id: str, token_id: str, *, wait: bool = True,
+        condition_id: str | None = None,
     ) -> tuple[object | None, object | None, datetime | None, dict[str, object] | None]:
-        """Bounded single-flight public read with a durable Retry-After fence."""
+        """Bounded single-flight public read with a fixed in-memory retry fence."""
         with self._lp_public_reads_lock:
             retry = self._lp_public_read_retry.get(key)
             if retry is not None and time.monotonic() < retry[0]:
@@ -1905,9 +1926,9 @@ class PolymarketTradingClient:
                 except Exception as exc:
                     self._lp_public_reads.pop(key, None)
                     recorded = self._lp_public_error_at_deadline_locked(
-                        key, _safe_history_response_facts(exc), create=False
+                        key, self._lp_public_error_facts(exc), create=False
                     )
-                    error = recorded[1] if recorded is not None else _safe_history_response_facts(exc)
+                    error = recorded[1] if recorded is not None else self._lp_public_error_facts(exc)
                     return None, None, None, error
                 fresh = (
                     cached_market == market_id
@@ -1932,12 +1953,26 @@ class PolymarketTradingClient:
                 with self._lp_snapshot_public_client() as public:
                     with _lp_read_stage("market"):
                         market_model = public.get_market(id=market_id)
+                        market = _model_dict(market_model) or {}
+                        state = _model_dict(market.get("state")) or {}
+                        outcomes = _model_dict(market.get("outcomes")) or {}
+                        if (
+                            state.get("closed") is True
+                            and market.get("id") == market_id
+                            and condition_id is not None
+                            and market.get("condition_id") == condition_id
+                            and any(
+                                (_model_dict(outcomes.get(side)) or {}).get("token_id") == token_id
+                                for side in ("yes", "no")
+                            )
+                        ):
+                            raise LpObservationWait("market_closed")
                     with _lp_read_stage("book"):
                         book_model = public.get_order_book(token_id=token_id)
                         received_at = datetime.now(UTC)
                 future.set_result((market_id, token_id, market_model, book_model, received_at))
             except BaseException as exc:
-                error = _safe_history_response_facts(exc)
+                error = self._lp_public_error_facts(exc)
                 with self._lp_public_reads_lock:
                     self._lp_public_error_at_deadline_locked(key, error, create=True)
                 future.set_exception(exc)
@@ -1962,9 +1997,9 @@ class PolymarketTradingClient:
                 if self._lp_public_reads.get(key) is future:
                     self._lp_public_reads.pop(key)
                 recorded = self._lp_public_error_at_deadline_locked(
-                    key, _safe_history_response_facts(exc), create=False
+                    key, self._lp_public_error_facts(exc), create=False
                 )
-            error = recorded[1] if recorded is not None else _safe_history_response_facts(exc)
+            error = recorded[1] if recorded is not None else self._lp_public_error_facts(exc)
             return None, None, None, error
         with self._lp_public_reads_lock:
             if self._lp_public_reads.get(key) is future:
@@ -5044,6 +5079,7 @@ class PolymarketTradingClient:
                     market_id,
                     token_id,
                     wait=request.get("lp_public_wait") is not False,
+                    condition_id=condition_id,
                 )
             )
             if public_error is not None:

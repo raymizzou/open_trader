@@ -38,6 +38,7 @@ from .polymarket_lp_risk import (
     evaluate_lp_entry,
     first_observation_baseline,
 )
+from .polymarket_lp_errors import LpObservationWait
 from .prediction_arbitrage_store import (
     LP_RESERVED_MANUAL_SESSION_ID,
     PredictionArbitrageStore,
@@ -10359,7 +10360,7 @@ class PolymarketLPService:
             except ValueError as exc:
                 if str(exc) != 'session_changed':
                     raise
-        raise ValueError('session_changed')
+        raise LpObservationWait('session_changed')
 
     def _account_bundle_is_current(self, snapshot: Mapping[str, object]) -> bool:
         """Check a bundle's observed DB generation at a use boundary."""
@@ -11147,6 +11148,47 @@ class PolymarketLPService:
             return None
         return self.store.lp_session(str(session["session_id"])) or session
 
+    def _current_cancel_order_ids(
+        self, session: Mapping[str, object], snapshot: Mapping[str, object],
+        trade_generation: int | None,
+    ) -> set[str] | None:
+        """Prove absence for cancel selection only; never infer terminality."""
+        generation = snapshot.get("_lp_trade_generation")
+        account = snapshot.get("account")
+        if (
+            type(generation) is not int or generation != trade_generation
+            or not callable(self._facts_validator)
+            or not isinstance(account, Mapping)
+            or account.get("authenticated") is not True
+            or account.get("open_orders_complete") is not True
+        ):
+            return None
+        orders = account.get("open_orders")
+        if not isinstance(orders, (list, tuple)):
+            return None
+        order_ids: set[str] = set()
+        for order in orders:
+            if not isinstance(order, Mapping):
+                return None
+            order_id = _field(order, "order_id", _field(order, "id", ""))
+            token_id = _field(order, "token_id", _field(order, "asset_id", ""))
+            if (
+                not isinstance(order_id, str) or not order_id.strip()
+                or not isinstance(token_id, str) or not token_id.strip()
+            ):
+                return None
+            order_ids.add(order_id)
+        try:
+            self._facts_validator(session, snapshot)
+        except (ValueError, RuntimeError, OSError):
+            return None
+        if not self._account_bundle_is_current(snapshot):
+            return None
+        return order_ids | {
+            self._order_id(order) for order in _items(snapshot.get("orders"))
+            if str(_field(order, "status", "")).upper() in {"LIVE", "OPEN", "ACCEPTED", "PENDING"}
+        }
+
     def _claim_and_send_owned_cancels_off_lock(
         self,
         session: Mapping[str, object],
@@ -11229,6 +11271,12 @@ class PolymarketLPService:
                     and order_id not in blocked_orders
                 ):
                     targets.append(order_id)
+            if allow_history:
+                current_order_ids = self._current_cancel_order_ids(
+                    current, snapshot, trade_generation
+                )
+                if current_order_ids is not None:
+                    targets = [order_id for order_id in targets if order_id in current_order_ids]
             if targets:
                 claim_method = getattr(self.store, "lp_claim_trade_actions", None)
                 if callable(claim_method):
@@ -11744,6 +11792,7 @@ class PolymarketLPService:
             try:
                 self._cancel_owned_orders(
                     session,
+                    snapshot=snapshot,
                     expected_generation=snapshot.get("_lp_trade_generation"),
                     expected_trade_revision=trade_revision,
                 )
@@ -11929,6 +11978,7 @@ class PolymarketLPService:
         try:
             self._cancel_owned_orders(
                 session,
+                snapshot=snapshot,
                 expected_generation=snapshot.get("_lp_trade_generation"),
                 expected_trade_revision=trade_revision,
             )
@@ -12093,10 +12143,10 @@ class PolymarketLPService:
                 )
             return self._fetch_snapshot(request, account_round=account_round)
         except LpAccountRoundInvalid as exc:
-            raise ValueError("account_round_invalid") from exc
+            raise LpObservationWait("account_round_invalid") from exc
         except LpNewerAccountFacts as exc:
             if self._invalidate_lp_trade_generation(exc.observed_trade_generation):
-                raise ValueError("account_round_invalid") from exc
+                raise LpObservationWait("account_round_invalid") from exc
             raise ValueError("external_snapshot_unknown") from exc
 
     def _market_read(
@@ -12116,14 +12166,14 @@ class PolymarketLPService:
                 existing = self._market_reads.get(key)
                 if existing is not None:
                     if not existing.done():
-                        raise ValueError('market_read_in_progress')
+                        raise LpObservationWait('market_read_in_progress')
                     self._market_reads.pop(key)
                 if monotonic() < self._market_read_retry.get(key, 0):
-                    raise ValueError('market_read_cooling_down')
+                    raise LpObservationWait('market_read_cooling_down')
                 unfinished = [job for job in self._market_reads.values() if not job.done()]
                 if len(unfinished) >= 2:
                     if not wait_for_capacity:
-                        raise ValueError('market_read_capacity')
+                        raise LpObservationWait('market_read_capacity')
                     blockers = tuple(unfinished)
                 else:
                     future = Future()
@@ -12135,7 +12185,7 @@ class PolymarketLPService:
                 return_when=FIRST_COMPLETED,
             )
             if not done:
-                raise ValueError('market_read_capacity')
+                raise LpObservationWait('market_read_capacity')
         owner_session = getattr(self._facts_owner, 'session_id', None)
         def run():
             self._facts_owner.session_id = owner_session
@@ -12154,7 +12204,7 @@ class PolymarketLPService:
             if callable(on_newer_facts) and on_newer_facts(
                 exc.observed_trade_generation
             ):
-                raise ValueError("account_round_invalid") from exc
+                raise LpObservationWait("account_round_invalid") from exc
             raise ValueError("external_snapshot_unknown") from exc
         except TimeoutError as exc:
             with self._market_reads_lock:
@@ -15955,6 +16005,7 @@ class PolymarketLPService:
         self,
         session: Mapping[str, object],
         *,
+        snapshot: Mapping[str, object] | None = None,
         expected_generation: int | None = None,
         expected_trade_revision: int | None = None,
     ) -> None:
@@ -16007,12 +16058,18 @@ class PolymarketLPService:
             if str(history.get(order_id, {}).get("status") or "").upper() in TERMINAL_ORDER_STATES:
                 continue
             specs.append((order_id, "augment_cancel_requested", "augment-cancel"))
+        if snapshot is not None:
+            current_order_ids = self._current_cancel_order_ids(
+                current, snapshot, expected_generation
+            )
+            if current_order_ids is not None:
+                specs = [spec for spec in specs if spec[0] in current_order_ids]
         if not specs:
             return
         self._require_mutation()
         if expected_generation is not None and not isinstance(expected_trade_revision, int):
             self._publish_account_round_rejected(session_id)
-            raise ValueError("account_round_invalid")
+            raise LpObservationWait("account_round_invalid")
         actions = [
             {
                 "action_key": self._action_key(
@@ -16901,6 +16958,7 @@ class PolymarketLPService:
             try:
                 self._cancel_owned_orders(
                     session,
+                    snapshot=snapshot,
                     expected_generation=snapshot.get("_lp_trade_generation"),
                     expected_trade_revision=trade_revision,
                 )

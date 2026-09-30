@@ -1378,7 +1378,10 @@ def test_failed_session_keeps_capital_but_allows_other_market_buy(tmp_path):
     assert Decimal(state['funds']['spendable_usd']) == 0
 
 
-def test_market_read_capacity_remains_fail_fast_for_shared_snapshot_callers(tmp_path):
+def test_market_read_capacity_remains_fail_fast_for_shared_snapshot_callers(tmp_path, caplog):
+    import logging
+    from open_trader.polymarket_trading import _lp_read_stage
+    caplog.set_level(logging.INFO, logger="open_trader.polymarket_trading")
     _, exchange, lp, _ = setup(tmp_path, 2)
     first_entered, second_entered = Event(), Event()
     release = Event()
@@ -1404,7 +1407,11 @@ def test_market_read_capacity_remains_fail_fast_for_shared_snapshot_callers(tmp_
     try:
         lp._facts_owner.session_id = 'test-session'
         with pytest.raises(ValueError, match='market_read_capacity'):
-            lp._read_snapshot(dict(condition_id='m02', token_id='m02'))
+            with _lp_read_stage('facts_read'):
+                lp._read_snapshot(dict(condition_id='m02', token_id='m02'))
+        assert 'lp_read_wait stage=facts_read' in caplog.text
+        assert 'reason=market_read_capacity' in caplog.text
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
     finally:
         lp._facts_owner.session_id = None
         release.set()
@@ -1412,7 +1419,10 @@ def test_market_read_capacity_remains_fail_fast_for_shared_snapshot_callers(tmp_
             read.join(2)
 
 
-def test_market_read_timeout_discards_late_result_and_preserves_other_capacity(tmp_path):
+def test_market_read_timeout_discards_late_result_and_preserves_other_capacity(tmp_path, caplog):
+    import logging
+    from open_trader.polymarket_trading import _lp_read_stage
+    caplog.set_level(logging.INFO, logger="open_trader.polymarket_trading")
     _, exchange, lp, _ = setup(tmp_path, 2)
     lp._market_read_timeout = .02
     lp._facts_owner.session_id = 'test-session'
@@ -1432,17 +1442,26 @@ def test_market_read_timeout_discards_late_result_and_preserves_other_capacity(t
     slow = dict(condition_id='m00', token_id='m00')
     try:
         with pytest.raises(ValueError, match='market_read_timeout'):
-            lp._read_snapshot(slow)
+            with _lp_read_stage('facts_read'):
+                lp._read_snapshot(slow)
+        assert 'lp_snapshot_stage stage=facts_read' in caplog.text
+        caplog.clear()
         assert entered.is_set()
         with pytest.raises(ValueError, match='market_read_in_progress'):
-            lp._read_snapshot(slow)
+            with _lp_read_stage('facts_read'):
+                lp._read_snapshot(slow)
+        assert 'reason=market_read_in_progress' in caplog.text
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert lp._read_snapshot(dict(condition_id='m01', token_id='m01'))['market']['token_id'] == 'm01'
         assert calls == ['m00']
     finally:
         release.set()
     assert finished.wait(2)
     with pytest.raises(ValueError, match='market_read_cooling_down'):
-        lp._read_snapshot(slow)
+        with _lp_read_stage('facts_read'):
+            lp._read_snapshot(slow)
+    assert 'reason=market_read_cooling_down' in caplog.text
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
     lp._market_read_retry['m00'] = 0
     assert lp._read_snapshot(slow)['market']['token_id'] == 'm00'
     assert calls == ['m00', 'm00'], 'late abandoned result must not become fresh facts'
@@ -1780,3 +1799,45 @@ def test_real_sdk_account_response_facts_survive_transport(tmp_path, monkeypatch
     finally:
         adapter.close()
         sdk.close()
+
+
+@pytest.mark.parametrize('conflict', ['revision', 'generation'])
+def test_store_publish_conflict_logs_wait_without_applying_facts(tmp_path, caplog, conflict):
+    import logging
+    from open_trader.polymarket_trading import _lp_read_stage
+    from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+    caplog.set_level(logging.INFO, logger="open_trader.polymarket_trading")
+    store = PredictionArbitrageStore(tmp_path)
+    store.lp_create_session('s', 's', state='entry_open', payload={'owned_order_ids': ['order'], 'reserved_usd': '8'})
+    before = store.lp_session('s')
+    reason = 'session_changed' if conflict == 'revision' else 'account_round_invalid'
+    with pytest.raises(ValueError, match=reason):
+        with _lp_read_stage('facts_publish'):
+            store.lp_publish_facts('s', 1 if conflict == 'revision' else 0,
+                                   trade_generation=1 if conflict == 'generation' else None,
+                                   patch={'reserved_usd': '0'}, state='complete')
+    assert store.lp_session('s') == before
+    assert store.lp_actions('s') == []
+    assert f'reason={reason}' in caplog.text
+    assert 'lp_read_wait stage=facts_publish' in caplog.text
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+@pytest.mark.parametrize('reason', ['session_changed', 'account_round_invalid', 'market_read_capacity', 'market_read_in_progress', 'market_read_cooling_down', 'market_closed'])
+def test_untyped_same_message_is_still_a_fault(reason, caplog):
+    from open_trader.polymarket_trading import _lp_read_stage
+    with pytest.raises(ValueError, match=reason):
+        with _lp_read_stage('facts_read'):
+            raise ValueError(reason)
+    assert 'lp_snapshot_stage stage=facts_read' in caplog.text
+    assert 'lp_read_wait' not in caplog.text
+
+
+def test_unlisted_typed_wait_reason_remains_fault(caplog):
+    from open_trader.polymarket_lp_errors import LpObservationWait
+    from open_trader.polymarket_trading import _lp_read_stage
+    with pytest.raises(LpObservationWait):
+        with _lp_read_stage('market'):
+            raise LpObservationWait('market_read_timeout')
+    assert 'lp_snapshot_stage stage=market' in caplog.text
+    assert 'lp_read_wait' not in caplog.text

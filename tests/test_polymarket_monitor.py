@@ -7331,3 +7331,43 @@ def test_cleanup_reports_stalled_task_without_starting_replacement(tmp_path, mon
         assert 'cleanup_pending_tasks' not in monitor._diagnostics
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('retained', [None, 'books:TimeoutError', 'relations:ConnectionError', 'stream:TransportError', 'auth:RequestRejectedError', 'universe_other:TimeoutError'])
+def test_complete_universe_recovery_clears_only_its_current_fault(tmp_path, monkeypatch, caplog, retained):
+    from open_trader import polymarket_monitor
+
+    class RecoveringClient(FakePublicClient):
+        stalled = True
+
+        async def list_events(self, **kwargs):
+            if self.stalled:
+                await asyncio.sleep(.1)
+            return await super().list_events(**kwargs)
+
+    setup_public([event('e', markets=(market('m'),))])
+    monkeypatch.setattr(polymarket_monitor, 'PUBLIC_REFRESH_TIMEOUT_SECONDS', .01)
+    monitor = make_monitor(tmp_path, relation_discovery=None)
+    client = RecoveringClient()
+
+    async def exercise():
+        with pytest.raises(TimeoutError):
+            await monitor._refresh_universe_bounded(client)
+        assert monitor.snapshot()['diagnostics']['last_error'] == 'universe:TimeoutError'
+        assert monitor.snapshot()['diagnostics']['universe_refresh']['stage'] != 'complete'
+        # Another failed round must retain the fault until full publication.
+        with pytest.raises(TimeoutError):
+            await monitor._refresh_universe_bounded(client)
+        assert monitor.snapshot()['diagnostics']['last_error'] == 'universe:TimeoutError'
+        if retained is not None:
+            monitor._diagnostics['last_error'] = retained
+        client.stalled = False
+        monkeypatch.setattr(polymarket_monitor, 'PUBLIC_REFRESH_TIMEOUT_SECONDS', 30)
+        await monitor._refresh_universe_bounded(client)
+
+    asyncio.run(exercise())
+    snapshot = monitor.snapshot()
+    assert snapshot['diagnostics']['universe_refresh']['stage'] == 'complete'
+    assert snapshot['diagnostics']['last_error'] == retained
+    assert snapshot['health']['status'] == 'healthy'
+    assert 'prediction_universe_refresh_failed' in caplog.text
