@@ -28,6 +28,12 @@ WALLET = "0x" + "a" * 40
 NEW_SELL_ID = "imported-sell-1"
 
 
+def _expiry_seconds(value):
+    if value is None or isinstance(value, (int, float)):
+        return value
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+
+
 class _ImportedExitAccount(_ExitAccount):
     """SDK account with exact imported receipts and a real limit boundary."""
 
@@ -77,11 +83,8 @@ class _ImportedExitAccount(_ExitAccount):
             price=str(signed["price"]),
             original=str(signed["size"]),
             status="LIVE",
-        ).model_copy(
-            update={
-                "order_type": signed["order_type"],
-                "expiration": signed["expiration"],
-            }
+            order_type=signed["order_type"],
+            expiration=signed["expiration"],
         )
         self.orders = (*self.orders, receipt)
         return {
@@ -125,9 +128,8 @@ def _old_receipt(
     """Build the exact SDK terminal receipt with its lifecycle facts."""
 
     return _open_order(
-        "S1", "SELL", price="0.45", original="15", status="CANCELED"
-    ).model_copy(
-        update={"order_type": order_type, "expiration": expiration}
+        "S1", "SELL", price="0.45", original="15", status="CANCELED",
+        order_type=order_type, expiration=expiration,
     )
 
 
@@ -140,7 +142,7 @@ def _assert_retained_old(
     assert record["side"] == "SELL"
     assert record["status"] == "CANCELED"
     assert record["order_type"] == order_type
-    assert record["expiration"] == expiration
+    assert _expiry_seconds(record.get("expiration")) == expiration
     assert Decimal(str(record["price"])) == Decimal("0.45")
     assert Decimal(str(record["original_size"])) == Decimal("15")
     assert Decimal(str(record["size_matched"])) == Decimal("0")
@@ -183,7 +185,7 @@ def _active_payload(old_receipt: OpenOrder) -> dict[str, object]:
                 "original_size": Decimal("15"),
                 "size_matched": Decimal("0"),
                 "order_type": old_receipt.order_type,
-                "expiration": old_receipt.expiration,
+                "expiration": old_receipt.expires_at,
             },
         },
     }
@@ -290,7 +292,7 @@ def test_imported_passive_replacement_lifecycle(
         assert new_record["side"] == "SELL"
         assert new_record["status"] == "LIVE"
         assert new_record["order_type"] == order_type
-        assert new_record.get("expiration") == expiration
+        assert _expiry_seconds(new_record.get("expiration")) == expiration
         assert account.cancel_calls == []
 
         for _ in range(2):
@@ -306,7 +308,7 @@ def test_imported_passive_replacement_lifecycle(
             new_record = session["order_history"][NEW_SELL_ID]
             assert new_record["status"] == "LIVE"
             assert new_record["order_type"] == order_type
-            assert new_record.get("expiration") == expiration
+            assert _expiry_seconds(new_record.get("expiration")) == expiration
             assert len(account.limit_orders) == 1
             assert len(account.posts) == 1
             assert account.cancel_calls == []

@@ -16271,21 +16271,27 @@ class PolymarketLPService:
             if order_type == "GTC":
                 expiration = None
             elif order_type == "GTD":
-                parsed = _maybe_decimal(old_passive_record.get("expiration"))
-                if parsed is None or parsed <= 0 or parsed != parsed.to_integral_value():
+                raw_expiration = old_passive_record.get("expiration")
+                parsed = _maybe_decimal(raw_expiration)
+                try:
+                    if parsed is None:
+                        # The SDK exposes expires_at as a datetime; durable
+                        # history stores the same instant as an ISO string.
+                        expires_at = _timestamp(raw_expiration, name="expiration")
+                    else:
+                        if parsed != parsed.to_integral_value():
+                            raise ValueError("expiration_invalid")
+                        expires_at = datetime.fromtimestamp(int(parsed), tz=UTC)
+                    expiration = int(expires_at.timestamp())
+                    if expiration <= 0 or expires_at.microsecond:
+                        raise ValueError("expiration_invalid")
+                except (OverflowError, OSError, ValueError):
                     expiration = None
                     expiration_error = "passive_expiration_invalid"
                 else:
-                    expiration = int(parsed)
-                    try:
-                        expires_at = datetime.fromtimestamp(expiration, tz=UTC)
-                    except (OverflowError, OSError, ValueError):
+                    if expires_at <= self._now() + timedelta(seconds=SDK_MIN_EXPIRATION_SECONDS):
                         expiration = None
-                        expiration_error = "passive_expiration_invalid"
-                    else:
-                        if expires_at <= self._now() + timedelta(seconds=SDK_MIN_EXPIRATION_SECONDS):
-                            expiration = None
-                            expiration_error = "passive_expiration_too_soon"
+                        expiration_error = "passive_expiration_too_soon"
             else:
                 expiration = None
                 expiration_error = "passive_expiration_invalid"

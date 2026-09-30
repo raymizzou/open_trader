@@ -232,6 +232,8 @@ def _open_order(
     original: str,
     matched: str = "0",
     status: str = "LIVE",
+    order_type: str = "GTC",
+    expiration: int | None = None,
 ) -> OpenOrder:
     return OpenOrder(
         id=order_id,
@@ -244,7 +246,8 @@ def _open_order(
         original_size=Decimal(original),
         size_matched=Decimal(matched),
         outcome="YES",
-        order_type="GTC",
+        order_type=order_type,
+        expiration=expiration,
         status=status,
         associate_trades=(),
         created_at=NOW,
