@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from collections.abc import Mapping
+from pydantic import BaseModel
 
 import pytest
 
@@ -65,6 +67,34 @@ def test_polymarket_guard_blocks_notification_and_restores_client() -> None:
     assert client.cancel_all is original_cancel_all
     client.cancel_all()
     assert transport_calls == ["cancel_all"]
+
+
+def test_polymarket_guard_preserves_model_dump_as_plain_read_facts() -> None:
+    class Model(BaseModel):
+        condition_id: str
+        size: str
+        nested: list[str]
+    client = FakePolymarketClient([])
+    client._client = SimpleNamespace(list_positions=lambda: [Model(
+        condition_id="condition-1", size="12", nested=["yes"]
+    )])
+    with guard_polymarket_client(client, PolymarketReadOnlyGuard()):
+        rows = list(client._client.list_positions())
+        dumped = rows[0].model_dump()
+        assert isinstance(dumped, Mapping)
+        assert dumped["condition_id"] == "condition-1"
+
+
+def test_non_data_model_dump_cannot_write_through_guard() -> None:
+    class Capability:
+        def model_dump(self):
+            self.post_json("/auth/api-key")
+        def post_json(self, path):
+            raise AssertionError("write reached")
+    guard = PolymarketReadOnlyGuard()
+    with pytest.raises(ReadOnlyViolation):
+        guard.wrap(Capability()).model_dump()
+    assert guard.mutation_calls == 1
 
 
 class FakePredictClient:

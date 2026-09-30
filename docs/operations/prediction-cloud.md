@@ -6,9 +6,25 @@ outside the operation. Branch push, Draft PR, GitHub merge, release/tag creation
 cloud provisioning, deployment and
 trading authorization are separate. The client never starts the cloud backend.
 
-## Credentials: Tencent SSM and an instance role
+## Credentials: service-owned file or Tencent SSM
 
-Install the optional `cloud-ssm` extra in the release's Python 3.12 virtualenv.
+For the #202 paused Shadow API probe, use an operator-imported JSON bundle at
+`/var/lib/open-trader/prediction-credentials/polymarket.json`. The parent directory
+must be owned by `prediction` with mode `0700`; the regular file must be owned
+by `prediction` with mode `0600`. The reader rejects symlinks, invalid owners,
+permissions and fields. Keep the bundle outside Git, the release, logs and
+systemd environment; the unit contains only its path. The source credentials
+are in the Mac Keychain; `prediction_arbitrage.json` does not contain them.
+The operator performs the separate one-time private import. Do not run wallet
+setup or create, replace or revoke an API key for this probe.
+
+The file backend is explicit: `OPEN_TRADER_CREDENTIAL_BACKEND=file` and
+`OPEN_TRADER_CREDENTIAL_FILE=/var/lib/open-trader/prediction-credentials/polymarket.json`.
+Missing or invalid files fail closed with no fallback. The process only opens
+the file for reading. No instance role or metadata isolation attestation is
+needed for this file profile. Existing SSM profiles remain available:
+
+Install the optional `cloud-ssm` extra only for an SSM profile in the release's Python 3.12 virtualenv.
 The approved pins are `tencentcloud-sdk-python-ssm==3.1.160` and
 `tencentcloud-sdk-python-common==3.1.182`. Ordinary macOS use keeps Keychain.
 
@@ -69,7 +85,12 @@ Official references:
 - [SSM resource permissions](https://intl.cloud.tencent.com/zh/document/product/598/57154)
 - [Official Python SDK](https://github.com/TencentCloud/tencentcloud-sdk-python)
 
-## Ownership and backups before cutover
+## Ownership and backups before a future trading cutover
+
+The #202 paused Shadow probe uses a separate runtime, leaves the local
+production owner running and does not migrate its history or runtime data.
+The following handoff procedure applies only to a later authorized trading
+cutover under #203.
 
 A filesystem lock protects one host only. Before a new production owner starts,
 identify the old service, immutable SHA, wallet addresses and authoritative
@@ -128,7 +149,7 @@ Release/config/venv paths and their ancestors must be root-owned and not
 group/world-writable; release symlinks are rejected. Venv symlinks, including
 the standard Python interpreter link, must resolve to trusted root-owned paths.
 Create a Python 3.12 venv outside the code checkout, install the accepted release
-with its `cloud-ssm` extra, and retain that environment with the release for
+(add `cloud-ssm` only for SSM), and retain that environment with the release for
 rollback. This is an operator-authorized provisioning step, not done by the gates.
 
 Create `/etc/open-trader/prediction-cloud.json` (root-owned `0600`, non-secret).
@@ -148,6 +169,20 @@ A credentialless paused-Shadow example is:
 }
 ```
 
+For the #202 same-wallet probe, add these non-secret fields to that paused
+Shadow config after the operator has privately imported the credential file:
+
+```json
+{
+  "credential_backend": "file",
+  "credentials_file": "/var/lib/open-trader/prediction-credentials/polymarket.json"
+}
+```
+
+These fields extend the complete example above; they are not a standalone
+config. File credentials are accepted only with `mode: shadow` and
+`n_leg_paused: 1`. The service remains read-only in an independent runtime.
+
 The cloud config requires an explicit `"mode": "production"` or
 `"mode": "shadow"`; a missing or unknown value fails closed. The selected mode
 is pinned into ExecStart and echoed by remote evidence. Modes never change
@@ -155,17 +190,18 @@ automatically, and selecting another mode requires the matching stopped-owner,
 credential, readiness and authorization gates. The helper also accepts simple
 alphanumeric/dash/underscore SSM references and absolute paths without spaces or
 systemd specifiers. Use those names when creating the dedicated credential.
-Production and non-paused Shadow require those four SSM references.
+Production and non-paused Shadow continue to require those four SSM references.
 Credentialless paused Shadow requires them to be omitted, pins
 `OPEN_TRADER_CREDENTIAL_BACKEND=disabled`, and never touches Keychain, SSM or
 instance metadata.
 Retain the prior N-leg pause policy explicitly; this example does not authorize
 enabling any trading strategy.
 
-Copy the authoritative non-secret `config/prediction_arbitrage.json` and data into
-the runtime only after the ownership handoff above. Notification and LLM provider
-configuration are not automatically imported from the Mac; verify the required
-features and their separate credentials before claiming functional parity.
+For #202, supply only the same-wallet non-secret
+`config/prediction_arbitrage.json` in the independent runtime; do not copy
+local history or trading runtime data. A later #203 trading cutover requires
+the ownership handoff and consistent data backup described above. Notification
+and LLM provider configuration are not automatically imported from the Mac.
 
 From the accepted release on CVM, with `OPEN_TRADER_PYTHON` set to that release's
 venv Python, the operator can run:
@@ -182,8 +218,27 @@ scripts/prediction-systemd.sh stop
 `render` prints the complete unit. `preflight` is read-only. It checks the
 immutable release, stopped owner, SDK, reader generation and storage and returns
 only `PRECHECK_OK`; that is not full Host Readiness. Explicit paused Shadow
-skips the wallet-status credential read; non-paused/production still requires
-wallet status as the service user.
+without credentials skips the wallet read. A credentialed profile runs
+`wallet read-auth` as the service user, separating GET-only credential
+derivation from complete authenticated account reads. The installed SDK's
+ordinary `create()` can create credentials or deploy a wallet, so it is not
+used by this read-only probe. Production and non-paused SSM Shadow preflight
+also passes `--require-trading-region`, retaining the existing geoblock gate;
+paused Shadow API probes omit the trading-region requirement.
+
+Using the accepted release's Python and non-secret runtime config as the
+`prediction` user, run `prediction-arb wallet read-auth --config <runtime-config>`
+and `prediction-arb data-check --config <runtime-config> --sample 5` with the
+same explicit backend/path environment as the unit. `read-auth` requires a
+complete same-wallet order, position, trade and balance/allowance read; it
+reports guard attempts separately. `data-check` reads the complete paginated
+reward catalog, then a bounded sample of its current markets, token books,
+24-hour price history and same-wallet reward/account categories. It reports
+scope, time, source, completeness and an unknown reason for each category.
+Its best result is `PARTIAL`: an API probe is not full product-pool coverage
+or the #204 continuous-feed acceptance. Investigate every `BLOCKED` category;
+do not treat empty rows or a successful public request as account proof.
+Record only the redacted JSON report, never SDK payloads or credentials.
 `install` requires root, verifies the unit with systemd-analyze, preserves the old
 unit, writes the complete unit and reloads systemd. It leaves the service stopped.
 `start` requires a matching installed/stopped record; production startup may
@@ -263,14 +318,17 @@ local immutable release, with the local browser dependencies already installed.
 
 The operator evidence JSON contains `git_sha` and explicit attestations with
 corresponding `*_evidence` strings describing actual observations and their
-locations/timestamps. Production and non-paused Shadow require
-`old_owner_stopped`, `metadata_isolation_verified` and `resources_reviewed`
-(all true). Credentialless paused Shadow requires `resources_reviewed` and an
-exact `independent_runtime_root`; the gate separately rejects a remote component
+locations/timestamps. Production requires `old_owner_stopped`,
+`metadata_isolation_verified` and `resources_reviewed` (all true). Shadow
+requires `resources_reviewed` and an exact `independent_runtime_root`;
+SSM-backed Shadow additionally requires `metadata_isolation_verified`.
+The gate separately rejects a remote component
 whose mode, pause policy or credential backend differs. These are manual
 handoff/security/resource evidence, not claims manufactured by the gate. Review
 shared-host memory headroom under real load; 2 GiB total memory alone does not
 prove capacity. Never mark these true without the underlying observations.
+File-backed preflight additionally requires a complete service-user
+`read-auth`.
 
 ```sh
 make prediction-cloud-host-readiness \
@@ -297,6 +355,9 @@ Shadow guard violation or unavailable backend cannot pass.
 For credentialless paused Shadow, smoke also verifies the actual unit/process
 environment remains disabled and read-only; do not manufacture an owner-stop
 attestation or stop an unrelated local production process.
+Cloud Smoke checks release identity, process, pause and read-only state; it
+does not turn a `PARTIAL` API report into a complete #204 feed or Dashboard
+acceptance.
 Neither target installs a browser, starts a fixture server,
 mutates an account or restarts services. Candidate Acceptance remains separate
 and required before an authorized deployment. Report real cloud validation as

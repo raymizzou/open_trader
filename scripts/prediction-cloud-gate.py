@@ -40,13 +40,13 @@ def main():
         evidence = json.loads(args.operator_evidence.read_text())
         if cloud.expected_sha != local['expected_sha'] or evidence.get('git_sha') != cloud.expected_sha:
             raise ValueError('two-host SHA or operator evidence mismatch')
-        # These are explicit operator attestations, not automated proof. Credentialless
-        # paused Shadow replaces owner-cutover/metadata attestations with an exact
-        # independent-runtime match; the remote component profile is checked below.
-        if credential_backend(cloud) == 'disabled':
+        # Shadow reads never take trading ownership, even with SSM credentials.
+        if cloud.mode == 'shadow':
             if evidence.get('independent_runtime_root') != str(cloud.runtime_root):
                 raise ValueError('independent Shadow runtime evidence mismatch')
-            required_attestations = ('resources_reviewed',)
+            required_attestations = ('resources_reviewed',) + (
+                ('metadata_isolation_verified',) if credential_backend(cloud) == 'tencent-ssm' else ()
+            )
         else:
             required_attestations = ('old_owner_stopped', 'metadata_isolation_verified', 'resources_reviewed')
         for field in required_attestations:

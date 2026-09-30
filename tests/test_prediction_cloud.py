@@ -28,7 +28,7 @@ def test_systemd_unit_pins_all_code_paths_and_keeps_secrets_out(tmp_path):
     assert '--mode production' in render_unit(production)
     assert 'OPEN_TRADER_CREDENTIAL_BACKEND=tencent-ssm' in render_unit(production)
     assert credential_backend(production) == 'tencent-ssm'
-    with pytest.raises(ValueError, match='credentialless'):
+    with pytest.raises(ValueError, match='invalid cloud reference'):
         render_unit(CloudConfig(**{**cfg.__dict__, 'region':'placeholder'}))
     missing = tmp_path/'cloud.json'; missing.write_text('{}')
     with pytest.raises(ValueError, match='explicit production or shadow'):
@@ -39,6 +39,25 @@ def test_systemd_unit_pins_all_code_paths_and_keeps_secrets_out(tmp_path):
         'mode':'shadow','n_leg_paused':1}))
     credentialless = load_config(missing)
     assert credential_backend(credentialless) == 'disabled'
+    with_credentials = {**json.loads(missing.read_text()), 'region':'ap-hongkong',
+                        'secret':'wallet', 'version':'v1', 'role':'reader'}
+    missing.write_text(json.dumps(with_credentials))
+    readonly = load_config(missing)
+    assert credential_backend(readonly) == 'tencent-ssm'
+    assert 'OPEN_TRADER_CREDENTIAL_BACKEND=tencent-ssm' in render_unit(readonly)
+    with_file = {key: value for key, value in json.loads(missing.read_text()).items()
+                 if key not in {'region', 'secret', 'version', 'role'}}
+    with_file.update(credential_backend='file',
+                     credentials_file='/var/lib/open-trader/prediction-credentials/polymarket.json')
+    missing.write_text(json.dumps(with_file))
+    file_shadow = load_config(missing)
+    file_unit = render_unit(file_shadow)
+    assert credential_backend(file_shadow) == 'file'
+    assert 'OPEN_TRADER_CREDENTIAL_BACKEND=file' in file_unit
+    assert 'OPEN_TRADER_CREDENTIAL_FILE=/var/lib/open-trader/prediction-credentials/polymarket.json' in file_unit
+    assert 'OPEN_TRADER_SSM_' not in file_unit
+    with pytest.raises(ValueError):
+        render_unit(CloudConfig(**{**file_shadow.__dict__, 'mode': 'production'}))
     missing.write_text(json.dumps({
         'release_root':str(tmp_path/'release'),'runtime_root':str(tmp_path/'runtime'),
         'python':str(tmp_path/'venv/bin/python'),'user':'prediction','expected_sha':'a'*40,
@@ -98,8 +117,31 @@ def test_cloud_preflight_does_not_touch_wallet_for_paused_shadow(tmp_path, monke
     assert 'OPEN_TRADER_CREDENTIAL_BACKEND=disabled' in git_command
 
 
+def test_cloud_preflight_file_shadow_uses_safe_auth_without_ssm(tmp_path, monkeypatch):
+    import os
+    from types import SimpleNamespace
+    import open_trader.prediction_arbitrage_store as store_module
+    import open_trader.prediction_cloud as cloud
+    cfg = CloudConfig(tmp_path/'release', tmp_path/'runtime', tmp_path/'python',
+                      'prediction', 'a'*40, '', '', '', '', 'shadow', 1,
+                      'file', '/var/lib/open-trader/prediction-credentials/polymarket.json')
+    commands = []
+    monkeypatch.setattr(cloud, 'release_identity', lambda c: {'reader_generation': 2})
+    monkeypatch.setattr(cloud, 'absent', lambda c: {})
+    monkeypatch.setattr(cloud, 'trusted_layout', lambda c: None)
+    monkeypatch.setattr(store_module, 'read_minimum_reader_generation', lambda path: 1)
+    monkeypatch.setattr(cloud, 'run', lambda *args, **kwargs: commands.append(args) or
+                        (cfg.expected_sha if args[-1] == 'HEAD' else 'ok'))
+    monkeypatch.setattr(os, 'statvfs', lambda path: SimpleNamespace(f_bavail=2, f_frsize=1024**3))
+    cloud.preflight(cfg)
+    assert any('read-auth' in args for args in commands)
+    assert not any('--require-trading-region' in args for args in commands)
+    assert not any('import tencentcloud' in ' '.join(args) for args in commands)
+    assert any('OPEN_TRADER_CREDENTIAL_FILE='+cfg.credentials_file in args for args in commands)
+
+
 @pytest.mark.parametrize(('mode','n_leg_paused'), [
-    ('production', 1), ('production', 0), ('shadow', 0),
+    ('production', 1), ('production', 0), ('shadow', 0), ('shadow', 1),
 ])
 def test_cloud_preflight_reads_wallet_except_paused_shadow(tmp_path, monkeypatch, mode, n_leg_paused):
     import os
@@ -122,6 +164,12 @@ def test_cloud_preflight_reads_wallet_except_paused_shadow(tmp_path, monkeypatch
         f_bavail=2, f_frsize=1024**3))
     cloud.preflight(cfg)
     assert any('wallet' in ' '.join(args) for args in commands)
+    assert not any('wallet status' in ' '.join(args) for args in commands)
+    assert any('read-auth' in args for args in commands)
+    if mode == 'production' or not n_leg_paused:
+        assert any('--require-trading-region' in args for args in commands)
+    else:
+        assert not any('--require-trading-region' in args for args in commands)
 
 
 def test_two_host_gate_blocks_missing_operator_evidence_before_ssh(tmp_path):
@@ -181,9 +229,11 @@ print(json.dumps({{
     evidence = tmp_path/'evidence.json'; evidence.write_text(json.dumps({
         'git_sha':sha, 'independent_runtime_root':str(remote_runtime),
         'resources_reviewed':True, 'resources_reviewed_evidence':'observed'}))
-    def write_configs(client_mode, service_mode):
+    def write_configs(client_mode, service_mode, *, file_profile=False):
         client.write_text(json.dumps({**client_base, 'mode':client_mode}))
-        cloud.write_text(json.dumps({**cloud_base, 'mode':service_mode}))
+        cloud.write_text(json.dumps({**cloud_base, 'mode':service_mode, **(
+            {'credential_backend':'file', 'credentials_file':'/var/lib/open-trader/prediction-credentials/polymarket.json'}
+            if file_profile else {})}))
     fake_python = fakebin/'python'; fake_python.write_text('''#!/bin/sh
 if [ -n "$OPEN_TRADER_SMOKE_URL" ]; then printf '%s\\n' "$OPEN_TRADER_SMOKE_URL" >> "$GATE_URL_LOG"; fi
 exit 0
@@ -209,11 +259,11 @@ exit 0
         evidence.write_text(json.dumps({
             'git_sha':sha, 'independent_runtime_root':str(remote_runtime),
             'resources_reviewed':True, 'resources_reviewed_evidence':'observed'}))
-    def run(client_mode, service_mode, remote_mode, remote_backend='disabled'):
+    def run(client_mode, service_mode, remote_mode, remote_backend='disabled', *, file_profile=False):
         (tmp_path/'ssh-count').unlink(missing_ok=True)
         (tmp_path/'remote-mode').write_text(remote_mode)
         monkeypatch.setenv('GATE_REMOTE_BACKEND',remote_backend)
-        write_configs(client_mode, service_mode)
+        write_configs(client_mode, service_mode, file_profile=file_profile)
         return subprocess.run([sys.executable,str(gate),'readiness','--client-config',str(client),
             '--service-config',str(cloud),'--remote-config','/etc/open-trader/cloud.json',
             '--operator-evidence',str(evidence),'--browser-runtime',str(tmp_path)],
@@ -234,6 +284,8 @@ exit 0
     result = run('shadow','shadow','shadow',remote_backend='tencent-ssm')
     assert result.returncode == 2 and result.stdout.endswith('BLOCKED\n')
     assert (tmp_path/'ssh-count').read_text() == '1'
+    result = run('shadow','shadow','shadow',remote_backend='file',file_profile=True)
+    assert result.returncode == 0 and result.stdout.endswith('READY\n'), result.stdout + result.stderr
     result = run('shadow','shadow','production')
     assert result.returncode == 2 and result.stdout.endswith('BLOCKED\n')
     assert (tmp_path/'ssh-count').exists(), result.stdout + result.stderr

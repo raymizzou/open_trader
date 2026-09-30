@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from collections.abc import Mapping
 from decimal import Decimal
 import traceback
 from types import MethodType
 from typing import Callable, Iterator
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+from pydantic import BaseModel
 
 
 class ReadOnlyViolation(RuntimeError):
@@ -153,6 +155,9 @@ class PolymarketReadOnlyGuard:
             return value
         if isinstance(value, (_GuardedCallable, _GuardedPolymarketValue)):
             return value
+        if isinstance(value, Mapping):
+            return {key: self.protect(item, notification_scope=notification_scope)
+                    for key, item in value.items()}
         if isinstance(value, MethodType):
             if value.__name__.lower() in {"request", "send", "create_market_order"}:
                 return _GuardedCallable(self, target=value)
@@ -231,6 +236,9 @@ class _GuardedPolymarketValue:
         if name.lower() == "send" and notification_scope:
             return lambda *args, **kwargs: guard.violation(name, kind="notification")
         value = getattr(object.__getattribute__(self, "_value"), name)
+        if name == "model_dump" and isinstance(object.__getattribute__(self, "_value"), BaseModel):
+            model = object.__getattribute__(self, "_value")
+            return lambda *args, **kwargs: guard.protect(BaseModel.model_dump(model, *args, **kwargs))
         if name.lower() == "request" and callable(value):
             guarded = guard.protect(value, notification_scope=notification_scope)
             return lambda *args, **kwargs: guard.call(name, guarded, *args, **kwargs)

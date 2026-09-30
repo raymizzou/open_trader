@@ -5,6 +5,25 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-09-30
 
+- #202：LP 奖励份额读取不再因返回行内嵌 rewards_config 在本地日期不活跃而丢弃已返回的
+  earning_percentage；正池仍缺真实来源份额时保留 UNKNOWN，禁止补零或跨来源替代。
+  新增回归分别覆盖“上游真缺失保持 UNKNOWN”与“返回份额但 config 过期应保留”两种形态。
+
+- #202 云端同钱包 API 探针：paused Shadow 可显式使用服务用户私有的
+  `0600` JSON 凭据文件（父目录 `0700`），只传非秘密路径，拒绝错误权限、属主、
+  符号链接和结构且不回退 Keychain/SSM；原 disabled/SSM 配置仍可用。
+  `wallet read-auth` 通过 GET 派生已有 L2 身份，再独立验证完整账户读取；
+  `data-check` 逐类报告有界市场样本、完整目录分页、账户/奖励状态及未知原因，
+  抽样至多标为 PARTIAL。旧 production/非暂停 SSM 预检仍要求地区可交易，
+  paused Shadow 的只读探针不加交易地区限制；空目录和各类不完整读取明确为 UNKNOWN，
+  各项记录选取范围、时间窗口和 reader 可证的分页状态。奖励费率即使分页完整，
+  逐市场 share/pool 事实未知仍单独报 UNKNOWN 及脱敏原因计数；完整空集保留真实零值。
+  Shadow 保持交易和通知禁止，云端门禁要求独立运行时，
+  文件 profile 不要求 SSM 实例角色。feature branch `24878b3` 已完成云端 Shadow
+  部署验收及同钱包真实 API 探针；美元奖励换算仍为 UNKNOWN，作为已接受的非阻塞限制保留，
+  不补零、不改换算口径。本次仅整合到 main，保留 #201 的账户读取错误分类；
+  不切换 Air 运行版本或云端发布，不启用交易。
+
 - Docker 测试构建排除 UI 设计稿、macOS Finder 元数据和配置备份，减少无关文件引起的镜像重建；保留依赖层、Git 测试快照及测试所需文档和 fixtures。验证构建缓存复用及单文件变化增量，未部署。
 
 - 为全仓测试补充稳定性原则：保留业务契约与负向断言，将可控业务时钟、完成事件和

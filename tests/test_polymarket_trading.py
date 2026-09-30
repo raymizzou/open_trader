@@ -410,6 +410,263 @@ def test_from_keychain_uses_official_factory_without_redacted_credentials(
     assert "builder-secret-sentinel" not in repr(captured["api_key"])
 
 
+def test_read_only_auth_derives_existing_l2_without_sdk_create(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secrets = {"signing-private-key": "private-sentinel", "builder-key": "builder-key",
+               "builder-secret": "builder-secret", "builder-passphrase": "builder-passphrase"}
+    monkeypatch.setattr(polymarket_trading, "load_keychain_secret", lambda account, **_: secrets[account])
+    monkeypatch.setattr(polymarket_trading, "_derive_existing_clob_credentials",
+                        lambda private_key: "existing-l2")
+    captured = {}
+    def factory(**kwargs):
+        captured.update(kwargs)
+        return FakeClient()
+    PolymarketTradingClient.from_keychain(TradingConfig(SIGNER, WALLET),
+                                          client_factory=factory, read_only=True)
+    assert captured["credentials"] == "existing-l2"
+    assert "api_key" in captured
+
+
+def test_read_only_auth_real_sdk_never_creates_key_or_deploys_wallet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+    from eth_account import Account
+    from polymarket._internal.wallet import derive_beacon_deposit_wallet_address
+    from polymarket.clients._transport import SyncTransport
+
+    private_key = "0x" + "11" * 32
+    signer = Account.from_key(private_key).address
+    wallet = derive_beacon_deposit_wallet_address(signer, PRODUCTION.wallet_derivation)
+    secrets = {"signing-private-key": private_key, "builder-key": "builder-key",
+               "builder-secret": "builder-secret", "builder-passphrase": "builder-passphrase"}
+    monkeypatch.setattr(polymarket_trading, "load_keychain_secret", lambda account, **_: secrets[account])
+    requests = []
+    def request(self, method, path, **kwargs):
+        requests.append((method, path))
+        if method != "GET" or path != "/auth/derive-api-key":
+            raise AssertionError("read-only bootstrap attempted a non-derivation request")
+        # Structurally valid but revoked L2 material. A validation fallback
+        # would POST /auth/api-key; construction must not enter that path.
+        return httpx.Response(200, json={"apiKey":"revoked", "secret":"c2VjcmV0",
+                                         "passphrase":"revoked"}, request=httpx.Request("GET", "https://clob.polymarket.com" + path))
+    monkeypatch.setattr(SyncTransport, "_request", request)
+    monkeypatch.setattr(SecureClient, "_ensure_wallet_ready",
+                        lambda self: (_ for _ in ()).throw(AssertionError("wallet deployment path")))
+    adapter = PolymarketTradingClient.from_keychain(
+        TradingConfig(signer, wallet), read_only=True
+    )
+    try:
+        assert requests == [("GET", "/auth/derive-api-key")]
+        assert adapter.config.wallet_address == wallet
+    finally:
+        adapter.close()
+
+
+def test_file_credentials_require_private_owned_regular_bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    private.chmod(0o700)
+    bundle = private / "polymarket.json"
+    accounts = {account: f"value-{account}" for account in polymarket_trading.KEYCHAIN_ACCOUNTS}
+    bundle.write_text(json.dumps({KEYCHAIN_SERVICE: accounts}))
+    bundle.chmod(0o600)
+    monkeypatch.setenv("OPEN_TRADER_CREDENTIAL_BACKEND", "file")
+    monkeypatch.setenv("OPEN_TRADER_CREDENTIAL_FILE", str(bundle))
+    assert load_keychain_secret("builder-key") == "value-builder-key"
+    bundle.chmod(0o644)
+    with pytest.raises(Exception) as error:
+        load_keychain_secret("builder-key")
+    assert "value-builder-key" not in str(error.value)
+    bundle.chmod(0o600)
+    private.chmod(0o755)
+    with pytest.raises(Exception):
+        load_keychain_secret("builder-key")
+    private.chmod(0o700)
+    bundle.write_text(json.dumps({KEYCHAIN_SERVICE: {"builder-key": "only-one"}}))
+    with pytest.raises(Exception):
+        load_keychain_secret("builder-key")
+    bundle.write_text(json.dumps({KEYCHAIN_SERVICE: accounts}))
+    link = private / "linked.json"
+    link.symlink_to(bundle)
+    monkeypatch.setenv("OPEN_TRADER_CREDENTIAL_FILE", str(link))
+    with pytest.raises(Exception):
+        load_keychain_secret("builder-key")
+    directory_link = tmp_path / "linked-private"
+    directory_link.symlink_to(private, target_is_directory=True)
+    monkeypatch.setenv("OPEN_TRADER_CREDENTIAL_FILE", str(directory_link / "polymarket.json"))
+    with pytest.raises(Exception):
+        load_keychain_secret("builder-key")
+    monkeypatch.setenv("OPEN_TRADER_CREDENTIAL_FILE", str(bundle))
+    owner = polymarket_trading.os.geteuid()
+    monkeypatch.setattr(polymarket_trading.os, "geteuid", lambda: owner + 1)
+    with pytest.raises(Exception):
+        load_keychain_secret("builder-key")
+
+
+def test_file_credentials_never_fall_back_to_keychain(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPEN_TRADER_CREDENTIAL_BACKEND", "file")
+    monkeypatch.setenv("OPEN_TRADER_CREDENTIAL_FILE", str(tmp_path / "missing.json"))
+    with pytest.raises(Exception):
+        load_keychain_secret("builder-key", run=lambda *a, **k: pytest.fail("Keychain fallback"))
+
+
+@pytest.mark.parametrize("rate_market_unknown", (False, True))
+def test_data_check_samples_current_catalog_without_mixing_old_account_markets(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], rate_market_unknown: bool
+) -> None:
+    from contextlib import nullcontext
+
+    metadata_reads = []
+    class Reader:
+        def close(self): pass
+        def _lp_account_facts(self, **_):
+            return {"open_orders": ({"condition_id": "old"},), "positions": (), "raw_trades": (),
+                    "balance": Decimal("0"), "allowance": Decimal("0"), "open_orders_complete": True,
+                    "positions_complete": True, "trades_complete": True, "checked_at": datetime.now(UTC)}
+        def lp_reward_catalog(self):
+            return {"state": "known", "complete": True,
+                    "markets": ({"condition_id": "a"}, {"condition_id": "b"}),
+                    "checked_at": datetime.now(UTC)}
+        def lp_market_metadata_batch(self, ids):
+            metadata_reads.extend(ids)
+            return {"state": "known", "markets": {cid: {"outcomes": {"yes": {"token_id": cid+"-yes"}}} for cid in ids},
+                    "failed_ids": {}, "deferred_ids": (), "confirmed_absent_ids": ()}
+        def lp_order_books(self, ids): return {tid: {} for tid in ids}
+        def lp_price_history(self, ids, **_): return {"state": "known", "history": {tid: [] for tid in ids}, "unknown_token_ids": []}
+        def lp_account_trades(self, ids): return {"state": "known", "complete": True, "trades": {cid: () for cid in ids}}
+        def lp_reward_rates(self):
+            markets = ({"a": {"state": "unknown", "reason": "reward_share_missing"}}
+                       if rate_market_unknown else {})
+            return {"state": "known", "complete": True, "markets": markets}
+        def lp_reward_snapshots(self, day, ids): return {cid: {"state": "known"} for cid in ids}
+        def lp_reward_percentages(self): return {"state": "known", "percentages": {}}
+
+    monkeypatch.setattr(cli, "load_trading_config", lambda _: TradingConfig(SIGNER, WALLET))
+    monkeypatch.setattr(cli.PolymarketTradingClient, "from_keychain", lambda *_, **__: Reader())
+    monkeypatch.setattr(cli, "guard_polymarket_client", lambda *_, **__: nullcontext())
+    monkeypatch.setenv("OPEN_TRADER_CREDENTIAL_BACKEND", "keychain")
+    assert cli._prediction_data_check(Path("unused"), sample=1) == (2 if rate_market_unknown else 0)
+    sample = json.loads(capsys.readouterr().out)
+    assert sample["result"] == ("BLOCKED" if rate_market_unknown else "PARTIAL")
+    assert metadata_reads == ["a"]
+    assert sample["scope"]["market_sample_count"] == 1
+    assert sample["scope"]["history_window_utc"][1] - sample["scope"]["history_window_utc"][0] == 86400
+    assert sample["checks"]["reward_catalog"]["pagination"] == "complete"
+    assert sample["checks"]["account_trades"]["pagination"] == "complete"
+    assert sample["checks"]["market_rules"]["pagination"] == "not_reported"
+    assert all(row["scope"] and row["pagination"] for row in sample["checks"].values())
+    rates = sample["checks"]["reward_rates"]
+    assert rates["pagination"] == "complete"
+    assert rates["complete"] is True
+    assert rates["unknown_market_count"] == (1 if rate_market_unknown else 0)
+    if rate_market_unknown:
+        assert rates["status"] == "unknown"
+        assert rates["reason"] == "reward_market_facts_unknown"
+        assert rates["unknown_reason_counts"] == {"reward_share_missing": 1}
+    else:
+        assert rates["status"] == "ready"
+        assert rates["count"] == 0
+
+
+def test_data_check_requires_explicit_credential_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OPEN_TRADER_CREDENTIAL_BACKEND", raising=False)
+    monkeypatch.setattr(cli, "load_trading_config", lambda _: TradingConfig(SIGNER, WALLET))
+    monkeypatch.setattr(cli.PolymarketTradingClient, "from_keychain",
+                        lambda *a, **k: pytest.fail("implicit Keychain fallback"))
+    with pytest.raises(ValueError, match="credential_backend_unset"):
+        cli._prediction_data_check(Path("unused"), sample=1)
+
+
+def test_read_auth_separates_initialization_and_account_read(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from contextlib import nullcontext
+    class Reader:
+        def close(self): pass
+        def _lp_account_facts(self, **_):
+            return {"open_orders": ("one",), "positions": ("one",), "raw_trades": (),
+                    "balance": Decimal("0"), "allowance": Decimal("0"),
+                    "open_orders_complete": True, "positions_complete": True,
+                    "trades_complete": True, "checked_at": datetime.now(UTC)}
+    monkeypatch.setenv("OPEN_TRADER_CREDENTIAL_BACKEND", "file")
+    monkeypatch.setenv("OPEN_TRADER_CREDENTIAL_FILE", "/private/credentials.json")
+    monkeypatch.setattr(cli, "load_trading_config", lambda _: TradingConfig(SIGNER, WALLET))
+    monkeypatch.setattr(cli.PolymarketTradingClient, "from_keychain", lambda *_, **__: Reader())
+    monkeypatch.setattr(cli, "guard_polymarket_client", lambda *_, **__: nullcontext())
+    assert cli._prediction_read_auth(Path("unused")) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["initialization"]["status"] == "ready"
+    assert result["account_read"]["status"] == "ready"
+    assert result["guard"] == {"mutation_attempts": 0, "notification_attempts": 0}
+
+
+def test_read_auth_trading_region_is_optional_for_paused_shadow(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from contextlib import nullcontext
+    class Reader:
+        def close(self): pass
+        def geoblock_allowed(self): return False
+        def _lp_account_facts(self, **_):
+            return {"open_orders": (), "positions": (), "raw_trades": (),
+                    "balance": Decimal("0"), "allowance": Decimal("0"),
+                    "open_orders_complete": True, "positions_complete": True,
+                    "trades_complete": True, "checked_at": datetime.now(UTC)}
+    monkeypatch.setenv("OPEN_TRADER_CREDENTIAL_BACKEND", "keychain")
+    monkeypatch.setattr(cli, "load_trading_config", lambda _: TradingConfig(SIGNER, WALLET))
+    monkeypatch.setattr(cli.PolymarketTradingClient, "from_keychain", lambda *_, **__: Reader())
+    monkeypatch.setattr(cli, "guard_polymarket_client", lambda *_, **__: nullcontext())
+    assert cli._prediction_read_auth(Path("unused")) == 0
+    capsys.readouterr()
+    assert cli._prediction_read_auth(Path("unused"), require_trading_region=True) == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result["initialization"]["status"] == "ready"
+    assert result["account_read"]["status"] == "ready"
+    assert result["trading_region"] == {"status": "blocked", "reason": "geoblock_denied_or_unavailable"}
+
+
+@pytest.mark.parametrize("catalog_complete", (False, True))
+def test_data_check_empty_catalog_blocks_downstream_with_reasons_and_scope(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], catalog_complete: bool
+) -> None:
+    from contextlib import nullcontext
+    class Reader:
+        def close(self): pass
+        def _lp_account_facts(self, **_):
+            return {"open_orders": (), "positions": (), "raw_trades": (),
+                    "balance": None, "allowance": None, "open_orders_complete": False,
+                    "positions_complete": False, "trades_complete": False,
+                    "checked_at": datetime.now(UTC)}
+        def lp_reward_catalog(self):
+            return {"state": "known" if catalog_complete else "unknown", "complete": catalog_complete, "markets": (),
+                    "reason": "reward_catalog_read_failed", "checked_at": datetime.now(UTC)}
+        def lp_market_metadata_batch(self, ids):
+            pytest.fail("empty catalog must not read market metadata")
+        def lp_order_books(self, ids): return {}
+        def lp_price_history(self, ids, **_): return {"state": "unknown", "history": {}, "unknown_token_ids": []}
+        def lp_reward_rates(self): return {"complete": False, "markets": {}, "checked_at": datetime.now(UTC)}
+        def lp_reward_percentages(self): return {"state": "unknown", "percentages": {}, "checked_at": datetime.now(UTC)}
+        def lp_reward_snapshots(self, day, ids): return {}
+    monkeypatch.setenv("OPEN_TRADER_CREDENTIAL_BACKEND", "keychain")
+    monkeypatch.setattr(cli, "load_trading_config", lambda _: TradingConfig(SIGNER, WALLET))
+    monkeypatch.setattr(cli.PolymarketTradingClient, "from_keychain", lambda *_, **__: Reader())
+    monkeypatch.setattr(cli, "guard_polymarket_client", lambda *_, **__: nullcontext())
+    assert cli._prediction_data_check(Path("unused"), sample=1) == 2
+    report = json.loads(capsys.readouterr().out)
+    assert report["result"] == "BLOCKED"
+    assert report["checks"]["market_rules"]["status"] == "unknown"
+    assert report["checks"]["market_rules"]["reason"] == "reward_catalog_unavailable_or_empty"
+    if not catalog_complete:
+        assert report["checks"]["reward_catalog"]["reason"] == "reward_catalog_read_failed"
+    for name, row in report["checks"].items():
+        if row["status"] == "unknown":
+            assert row["reason"]
+        assert row["scope"]
+        assert row["pagination"]
+
+
 @pytest.mark.parametrize("identity", (False,))
 def test_from_keychain_rejects_missing_client_identity(
     monkeypatch: pytest.MonkeyPatch, identity: bool
@@ -1504,6 +1761,20 @@ def test_lp_reward_snapshots_reads_account_total_once_for_multiple_conditions() 
     assert all(params["maker_address"] == WALLET for _, params in calls)
 
 
+def test_lp_reward_snapshot_failure_reports_only_safe_reason() -> None:
+    class FailingTransport:
+        def get_json(self, path, *, params):
+            raise ValueError("secret-sentinel")
+    class RewardClient(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self._ctx = SimpleNamespace(wallet_type="EOA", secure_clob=FailingTransport())
+    adapter = PolymarketTradingClient(TradingConfig(SIGNER, WALLET), RewardClient())
+    result = adapter.lp_reward_snapshots("2026-09-29", ("condition-one",))
+    assert result["condition-one"]["reason"] == "ValueError"
+    assert "secret-sentinel" not in repr(result)
+
+
 def test_lp_reward_rates_use_current_scoped_percentages() -> None:
     today = datetime.now(UTC).date()
     date_text = today.isoformat()
@@ -1977,6 +2248,118 @@ def test_lp_reward_rates_zero_component_needs_no_share_and_isolates_failures() -
     assert markets[pool_failure]["reason"] == "reward_read_failed"
     assert markets[healthy]["state"] == "known"
     assert markets[healthy]["hourly_reward_usd"] == Decimal("0.05")
+
+
+def test_lp_reward_rates_keep_returned_share_when_embedded_config_inactive() -> None:
+    """#202: a returned row's ``earning_percentage`` is authoritative for its
+    sponsored scope; an inactive embedded ``rewards_config`` window must not
+    drop it.  Genuine upstream absence still stays UNKNOWN."""
+
+    condition_id = "condition-inactive-config"
+    today = datetime.now(UTC).date()
+    expired_window = {
+        "start_date": (today - timedelta(days=2)).isoformat(),
+        "end_date": (today - timedelta(days=1)).isoformat(),
+    }
+    native_share = "24"
+
+    def build_adapter(*, native_row: bool) -> PolymarketTradingClient:
+        native_rows = (
+            [
+                {
+                    "condition_id": condition_id,
+                    "earning_percentage": native_share,
+                    "rewards_config": [
+                        {
+                            "id": "native-expired",
+                            "asset_address": _LP_RATES_USDC_ASSET,
+                            "rate_per_day": "1",
+                            **expired_window,
+                        }
+                    ],
+                }
+            ]
+            if native_row
+            else []
+        )
+        sponsored_rows = [
+            {
+                "condition_id": condition_id,
+                "earning_percentage": "0",
+                "rewards_config": [
+                    {
+                        "id": "sponsored-active",
+                        "asset_address": _LP_RATES_USDC_ASSET,
+                        "rate_per_day": "0",
+                        **_LP_RATES_WINDOW,
+                    }
+                ],
+            }
+        ]
+
+        class Transport:
+            def get_json(self, path: str, *, params: dict[str, object]) -> object:
+                assert path == "/rewards/user/markets"
+                data = (
+                    native_rows
+                    if params["sponsored"] is False
+                    else sponsored_rows
+                )
+                return {"data": data, "next_cursor": "LTE="}
+
+        class PublicRewards:
+            def list_market_rewards(
+                self, *, condition_id: str, sponsored: bool | None = None
+            ):
+                assert sponsored is not None
+                # N=$1/day and T=$1/day, so S=0 — the #202 pool shape.
+                return (
+                    {
+                        "condition_id": condition_id,
+                        "rewards_config": [
+                            {
+                                "id": f"pub-{sponsored}",
+                                "asset_address": _LP_RATES_USDC_ASSET,
+                                "rate_per_day": "1",
+                                **_LP_RATES_WINDOW,
+                            }
+                        ],
+                    },
+                )
+
+            def close(self) -> None:
+                return None
+
+        class RewardClient(FakeClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self._ctx = SimpleNamespace(
+                    wallet_type="EOA", secure_clob=Transport()
+                )
+
+        return PolymarketTradingClient(
+            TradingConfig(SIGNER, WALLET),
+            RewardClient(),
+            public_client_factory=lambda: PublicRewards(),
+        )
+
+    # Confirmed #202 safety shape: genuine native absence stays UNKNOWN.
+    missing = build_adapter(native_row=False).lp_reward_rates()["markets"][condition_id]
+    assert missing["state"] == "unknown"
+    assert missing["hourly_reward_usd"] is None
+    assert missing["reason"] == "reward_share_missing"
+    assert missing["sources"] == ("sponsored",)
+
+    # Confirmed parser defect: the returned native share must survive even
+    # though its embedded config window ended yesterday.
+    dropped = build_adapter(native_row=True).lp_reward_rates()["markets"][condition_id]
+    assert dropped["state"] == "known"
+    assert dropped["hourly_reward_usd"] == Decimal("0.01")
+    assert dropped["sources"] == ("native", "sponsored")
+    assert dropped["native"]["state"] == "known"
+    assert dropped["native"]["earning_percentage"] == Decimal(native_share)
+    assert dropped["native"]["hourly_reward_usd"] == Decimal("0.01")
+    assert dropped["sponsored"]["earning_percentage"] == Decimal("0")
 
 
 def test_lp_rewards_preserve_raw_accrual_when_usd_value_is_unknown() -> None:

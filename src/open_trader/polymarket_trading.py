@@ -13,6 +13,7 @@ import math
 import os
 import pty
 import re
+import stat
 import subprocess
 import threading
 import time
@@ -348,6 +349,51 @@ def load_keychain_secret(
     return _load_keychain_password(account, KEYCHAIN_SERVICE, run)
 
 
+def _load_file_secret(service: str, account: str) -> str:
+    path = Path(os.environ["OPEN_TRADER_CREDENTIAL_FILE"])
+    if not path.is_absolute():
+        raise ValueError
+    if any(stat.S_ISLNK(part.lstat().st_mode) for part in path.parents):
+        raise ValueError
+    directory = path.parent.lstat()
+    file = path.lstat()
+    owner = os.geteuid()
+    if (not stat.S_ISDIR(directory.st_mode) or directory.st_uid != owner
+        or stat.S_IMODE(directory.st_mode) != 0o700
+        or not stat.S_ISREG(file.st_mode) or file.st_uid != owner
+        or stat.S_IMODE(file.st_mode) != 0o600):
+        raise ValueError
+    dirfd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        opened_dir = os.fstat(dirfd)
+        if (opened_dir.st_dev, opened_dir.st_ino) != (directory.st_dev, directory.st_ino):
+            raise ValueError
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
+        with os.fdopen(fd, "rb") as stream:
+            opened_file = os.fstat(stream.fileno())
+            if (opened_file.st_dev, opened_file.st_ino) != (file.st_dev, file.st_ino):
+                raise ValueError
+            raw = stream.read(16385)
+    finally:
+        os.close(dirfd)
+    if len(raw) > 16384:
+        raise ValueError
+    bundle = json.loads(raw)
+    allowed = {
+        KEYCHAIN_SERVICE: set(KEYCHAIN_ACCOUNTS),
+        PREDICT_KEYCHAIN_SERVICE: {PREDICT_API_KEY_ACCOUNT, PREDICT_PRIVATE_KEY_ACCOUNT},
+    }
+    if (not isinstance(bundle, dict) or not set(bundle) <= set(allowed)
+        or KEYCHAIN_SERVICE not in bundle):
+        raise ValueError
+    for name, values in bundle.items():
+        if (not isinstance(values, dict) or not set(values) <= allowed[name]
+            or (name == KEYCHAIN_SERVICE and set(values) != allowed[name])
+            or any(not isinstance(value, str) or not value.strip() for value in values.values())):
+            raise ValueError
+    return bundle[service][account]
+
+
 def _load_keychain_password(
     account: str,
     service: str,
@@ -356,6 +402,11 @@ def _load_keychain_password(
     backend = os.environ.get("OPEN_TRADER_CREDENTIAL_BACKEND", "keychain")
     if backend == "disabled":
         raise KeychainError()
+    if backend == "file":
+        try:
+            return _load_file_secret(service, account)
+        except Exception:
+            raise KeychainError() from None
     if backend == "tencent-ssm":
         from .prediction_ssm import load_ssm_secret
         try:
@@ -1623,6 +1674,24 @@ class LpAccountReadError(ValueError):
         self.retry_at = retry_at
 
 
+def _derive_existing_clob_credentials(private_key: str) -> object:
+    """GET-only L2 derivation; never use the SDK's create-first bootstrap."""
+    from eth_account import Account
+    from polymarket._internal.actions.auth import derive_api_key_sync
+    from polymarket._internal.l1_auth import sign_api_key_auth
+    from polymarket.clients._transport import SyncTransport
+
+    signer = Account.from_key(private_key)
+    transport = SyncTransport(base_url=PRODUCTION.clob_url)
+    try:
+        signature = sign_api_key_auth(
+            signer, chain_id=PRODUCTION.chain_id, timestamp=int(time.time()), nonce=0
+        )
+        return derive_api_key_sync(transport, signature)
+    finally:
+        transport.close()
+
+
 class PolymarketTradingClient:
     """A narrow, redacted wrapper around the official synchronous SDK."""
 
@@ -1853,14 +1922,19 @@ class PolymarketTradingClient:
         run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
         public_client_factory: Callable[[], object] | None = None,
         metadata_cache: object | None = None,
+        read_only: bool = False,
     ) -> "PolymarketTradingClient":
         private_key = load_keychain_secret("signing-private-key", run=run)
         builder_key = load_keychain_secret("builder-key", run=run)
         builder_secret = load_keychain_secret("builder-secret", run=run)
         builder_passphrase = load_keychain_secret("builder-passphrase", run=run)
-        factory = client_factory or SecureClient.create
         try:
-            client = factory(
+            # SDK create(credentials=None) POSTs /auth/api-key first, and
+            # create() may deploy a missing wallet. Read-only startup derives
+            # an existing key with GET and skips the wallet deployment step.
+            credentials = _derive_existing_clob_credentials(private_key) if read_only else None
+            factory = client_factory or (SecureClient._create if read_only else SecureClient.create)
+            kwargs = dict(
                 private_key=private_key,
                 wallet=config.wallet_address,
                 api_key=BuilderApiKey(
@@ -1869,6 +1943,11 @@ class PolymarketTradingClient:
                     passphrase=builder_passphrase,
                 ),
             )
+            if read_only:
+                kwargs["credentials"] = credentials
+                if client_factory is None:
+                    kwargs["validate_credentials"] = False
+            client = factory(**kwargs)
         except Exception as exc:
             code = _safe_error_code(exc)
             del exc
@@ -3947,8 +4026,6 @@ class PolymarketTradingClient:
                                 normalized["sponsored"] = sponsored
                                 normalized["source"] = source
                                 active_configs.append(normalized)
-                            if not active_configs:
-                                continue
                             market = collected.setdefault(
                                 condition_id,
                                 {"condition_id": condition_id, "sources": {}},
@@ -4265,16 +4342,23 @@ class PolymarketTradingClient:
                     }
                 except _RewardReadCancelled:
                     raise
-                except Exception:
-                    results[condition_id] = dict(unknown[condition_id])
+                except Exception as exc:
+                    reason = str(exc) if isinstance(exc, ValueError) and str(exc) in {
+                        "reward_market_unknown", "reward_total_unknown"
+                    } else type(exc).__name__
+                    results[condition_id] = {**unknown[condition_id], "reason": reason}
             return {condition_id: results.get(condition_id, unknown[condition_id]) for condition_id in requested}
         except _RewardReadCancelled:
             return {
                 condition_id: {**unknown[condition_id], "reason": "cancelled"}
                 for condition_id in requested
             }
-        except Exception:
-            return unknown
+        except Exception as exc:
+            reason = str(exc) if isinstance(exc, ValueError) and str(exc) in {
+                "reward_market_unknown", "reward_total_unknown", "reward_total_shape_unknown"
+            } else type(exc).__name__
+            return {condition_id: {**row, "reason": reason}
+                    for condition_id, row in unknown.items()}
 
 
     def lp_reward_snapshot(
