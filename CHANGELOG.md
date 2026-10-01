@@ -5,6 +5,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-01
 
+- PR #224 的既有 16 个提交 rebase 到 origin/main `3f023fce`；保留双方 dated changelog，
+  云端验收沿用 PR-first policy。静态核验 `src` 与原发布 `4f82836f` 完全一致，
+  远端 CI、锁定依赖与测试稳定性变更保留；无新增生产行为，服务门禁与独立审查由 root 完成。
+
 - Candidate 测试 fixture 修复：readiness 使用局部可控 mono/wall 时钟和真实 monitor 循环，保留生产 30/60 秒阈值，验证 0→29→31→61→91 的到期读取、最新 checked_at 与正常停止；移除 80ms/40ms 机器速度依赖，外层时限仅防挂起。Trend 登录恢复测试用一致的长 numeric UID 哨兵，递增 time_ns 保持报告唯一并固定无关 `222` 路径碰撞；整段输出 token/UID 不出现、禁付费端点与禁直接通知断言完整保留。
 - 定向 Docker RED→GREEN：旧 fixture 在 120ms 启动及无关路径数字下 2 failed，修复后 2 passed；指定 monitor、trend CLI、imported-exit 与 multi-sell 四文件 277 passed（52.33 秒）。未复现的 imported-exit 首 tick 断言仅追加 durable session 诊断，原 12 组和 once-only/资金/ID/GTD 检查保留；未改生产文件、生产阈值/超时或门禁，未提交、合并或部署。
 
