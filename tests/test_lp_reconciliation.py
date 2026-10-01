@@ -9,6 +9,23 @@ from threading import Event, Thread
 from tests.test_lp_auto_pool import setup
 
 
+def _observe_facts_join(lp, monkeypatch):
+    """Observe selection of the existing lane, not just thread submission."""
+    with lp._facts_lock:
+        flights = tuple(lp._facts_inflight.values())
+    assert len(flights) == 1
+    future = flights[0]['future']
+    joined = Event()
+    original = future.result
+
+    def result(*args, **kwargs):
+        joined.set()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(future, 'result', result)
+    return joined
+
+
 def test_reward_refresh_during_account_read_does_not_invalidate_funds(tmp_path):
     execution, exchange, lp, _ = setup(tmp_path)
     execution.lp_auto_configure(dict(budget_usd="100", target_buy_count=1))
@@ -129,8 +146,8 @@ def test_rejected_account_identity_cannot_authorize_queue_cancel(
 
 
 @pytest.mark.parametrize("auto_first", [False, True])
-def test_tick_and_auto_share_one_inflight_venue_read(tmp_path, auto_first):
-    execution, exchange, _, _ = setup(tmp_path)
+def test_tick_and_auto_share_one_inflight_venue_read(tmp_path, auto_first, monkeypatch):
+    execution, exchange, lp, _ = setup(tmp_path)
     execution.lp_auto_configure(dict(budget_usd="100", target_buy_count=1))
     execution.lp_auto_set_desired_running(True)
     execution.lp_auto_run_once()
@@ -152,8 +169,10 @@ def test_tick_and_auto_share_one_inflight_venue_read(tmp_path, auto_first):
         tick = workers.submit(first)
         try:
             assert entered.wait(2)
+            joined = _observe_facts_join(lp, monkeypatch)
             automatic = workers.submit(second)
-            assert not duplicate.wait(.2), "two independent account reads raced"
+            assert joined.wait(2), "second consumer must join the in-flight lane"
+            assert not duplicate.is_set(), "two independent account reads raced"
         finally:
             release.set()
         tick.result(timeout=5)
@@ -161,6 +180,7 @@ def test_tick_and_auto_share_one_inflight_venue_read(tmp_path, auto_first):
     assert execution.lp_auto_state()["funds"]["status"] == "known"
     assert len(exchange.posts) == 1
     assert scored == ["o1"], "joining tick must still apply its monitoring work"
+    assert not duplicate.is_set(), "drained consumers must still have shared one read"
 
 
 def test_manual_cancel_invalidates_funds_before_network_and_fences_old_read(tmp_path):
@@ -1093,8 +1113,8 @@ def test_fresh_read_during_manual_cancel_cannot_restore_known_funds(tmp_path):
     assert len(exchange.posts) == 1
 
 
-def test_session_lane_stays_owned_through_post_read_monitoring(tmp_path):
-    execution, exchange, _, _ = setup(tmp_path)
+def test_session_lane_stays_owned_through_post_read_monitoring(tmp_path, monkeypatch):
+    execution, exchange, lp, _ = setup(tmp_path)
     execution.lp_auto_configure(dict(budget_usd='100', target_buy_count=1))
     execution.lp_auto_set_desired_running(True)
     execution.lp_auto_run_once()
@@ -1119,13 +1139,17 @@ def test_session_lane_stays_owned_through_post_read_monitoring(tmp_path):
         tick = workers.submit(execution.lp_tick)
         try:
             assert entered.wait(2)
+            joined = _observe_facts_join(lp, monkeypatch)
             automatic = workers.submit(execution.lp_auto_reconcile_unknown)
-            assert not duplicate.wait(.2), 'a second owner started before monitoring finished'
+            assert joined.wait(2), 'second consumer must reach the held lane'
+            assert not duplicate.is_set(), 'a second owner started before monitoring finished'
         finally:
             release.set()
         tick.result(timeout=5)
         automatic.result(timeout=5)
     assert len(exchange.posts) == 1
+    assert calls == ['m00'], 'drain must not hide a second venue read'
+    assert not duplicate.is_set()
 
 
 def test_flat_session_with_unknown_fees_stays_in_tick_reconciliation(tmp_path):
@@ -1419,34 +1443,52 @@ def test_market_read_capacity_remains_fail_fast_for_shared_snapshot_callers(tmp_
             read.join(2)
 
 
-def test_market_read_timeout_discards_late_result_and_preserves_other_capacity(tmp_path, caplog):
+def test_market_read_timeout_discards_late_result_and_preserves_other_capacity(tmp_path, caplog, monkeypatch):
     import logging
+    from concurrent.futures import Future
+    from open_trader import polymarket_lp
     from open_trader.polymarket_trading import _lp_read_stage
     caplog.set_level(logging.INFO, logger="open_trader.polymarket_trading")
     _, exchange, lp, _ = setup(tmp_path, 2)
-    lp._market_read_timeout = .02
+    healthy_timeout = lp._market_read_timeout
     lp._facts_owner.session_id = 'test-session'
-    entered, release, finished = Event(), Event(), Event()
+    entered, release = Event(), Event()
     original = exchange.lp_snapshot
-    calls = []
+    calls, futures = [], []
+    clock = [100.0]
+    monkeypatch.setattr(polymarket_lp, 'monotonic', lambda: clock[0])
+
+    class ObservedFuture(Future):
+        def __init__(self):
+            super().__init__()
+            futures.append(self)
+
+        def result(self, timeout=None):
+            if self is futures[0] and not self.done():
+                assert entered.wait(2), 'timeout coverage must reach the blocked read'
+            return super().result(timeout=timeout)
+
+    monkeypatch.setattr(polymarket_lp, 'Future', ObservedFuture)
 
     def delayed(request):
         if request['token_id'] == 'm00':
             calls.append('m00')
             entered.set()
             assert release.wait(5)
-            finished.set()
         return original(request)
 
     exchange.lp_snapshot = delayed
     slow = dict(condition_id='m00', token_id='m00')
     try:
+        # Keep a real timeout against a definitely running blocked worker.
+        lp._market_read_timeout = .02
         with pytest.raises(ValueError, match='market_read_timeout'):
             with _lp_read_stage('facts_read'):
                 lp._read_snapshot(slow)
         assert 'lp_snapshot_stage stage=facts_read' in caplog.text
         caplog.clear()
         assert entered.is_set()
+        lp._market_read_timeout = healthy_timeout
         with pytest.raises(ValueError, match='market_read_in_progress'):
             with _lp_read_stage('facts_read'):
                 lp._read_snapshot(slow)
@@ -1456,13 +1498,16 @@ def test_market_read_timeout_discards_late_result_and_preserves_other_capacity(t
         assert calls == ['m00']
     finally:
         release.set()
-    assert finished.wait(2)
+        lp._market_read_timeout = healthy_timeout
+    # The worker's signal before returning is insufficient; await the real Future.
+    futures[0].result(timeout=2)
+    clock[0] = 159.999
     with pytest.raises(ValueError, match='market_read_cooling_down'):
         with _lp_read_stage('facts_read'):
             lp._read_snapshot(slow)
     assert 'reason=market_read_cooling_down' in caplog.text
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
-    lp._market_read_retry['m00'] = 0
+    clock[0] = 160.0
     assert lp._read_snapshot(slow)['market']['token_id'] == 'm00'
     assert calls == ['m00', 'm00'], 'late abandoned result must not become fresh facts'
 

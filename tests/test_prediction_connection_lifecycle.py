@@ -19,6 +19,11 @@ from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 from open_trader.prediction_websocket_compat import install_proxy_cleanup
 
 
+async def _run_lifecycle_scenario(scenario):
+    # Real-loop watchdog; business deadlines inside the scenario stay intact.
+    return await asyncio.wait_for(scenario, timeout=5)
+
+
 def test_busy_begin_preserves_sqlite_error_and_releases_connection(tmp_path, monkeypatch, caplog):
     store = PredictionArbitrageStore(tmp_path)
     monkeypatch.setattr(store_module, "_BUSY_TIMEOUT_MS", 30)
@@ -163,7 +168,7 @@ class TestProxyHandshake:
                 protocol.connection_lost(ConnectionResetError("late connection loss"))
                 previous = transport
                 ready.clear()
-                retry = asyncio.create_task(handshake())
+                retry = asyncio.create_task(ws_client.connect_http_proxy(proxy, uri))
                 await ready.wait()
                 protocol.data_received(b"HTTP/1.1 200 Connection established\r\n\r\n")
                 assert await retry is transport
@@ -188,7 +193,7 @@ class TestProxyHandshake:
                 assert await task is transport
                 assert not transport.closed
 
-        asyncio.run(scenario())
+        asyncio.run(_run_lifecycle_scenario(scenario()))
 
 
 def test_proxy_patch_is_version_scoped_and_idempotent(monkeypatch):
@@ -281,7 +286,7 @@ def test_monitor_closes_owned_client_on_its_loop(tmp_path, monkeypatch, caplog, 
         if ending == "cleanup_error":
             assert "prediction_monitor_task_cleanup_failed task=_full_scan_task" in caplog.text
 
-    asyncio.run(scenario())
+    asyncio.run(_run_lifecycle_scenario(scenario()))
 
 
 def test_monitor_close_failure_is_logged_and_propagated(tmp_path, caplog):
@@ -372,4 +377,4 @@ def test_monitor_cleanup_does_not_spawn_replacement_scan(tmp_path, monkeypatch, 
             assert set(closed) == set(clients)
             assert not monitor._stop_event.is_set()
 
-    asyncio.run(scenario())
+    asyncio.run(_run_lifecycle_scenario(scenario()))

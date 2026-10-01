@@ -12,6 +12,9 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+import open_trader.notifications as notifications_module
+from tests.contended_lock_support import observe_flock_contention
+from tests.timing_support import run_test_in_subprocess
 
 from open_trader.daily_premarket import send_notification_with_results
 from open_trader.notifications import (
@@ -1081,7 +1084,16 @@ def test_xiaoai_voice_notifier_reports_redacted_transport_failure(
     assert captured.value.__context__ is None
 
 
-def test_xiaoai_voice_notifier_serializes_process_playback(tmp_path: Path) -> None:
+def test_xiaoai_voice_notifier_serializes_process_playback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    if run_test_in_subprocess(request):
+        return
+
+    contended = observe_flock_contention(monkeypatch, notifications_module, tmp_path / "voice.lock")
+    errors: list[BaseException] = []
     entered: list[str] = []
     first_entered = threading.Event()
     release_first = threading.Event()
@@ -1090,28 +1102,36 @@ def test_xiaoai_voice_notifier_serializes_process_playback(tmp_path: Path) -> No
         entered.append(command[-1])
         if len(entered) == 1:
             first_entered.set()
-            assert release_first.wait(timeout=1)
+            release_first.wait()
         return subprocess.CompletedProcess(command, 0)
 
     def play(message: str) -> None:
-        XiaoaiSSHNotifier(
-            host="speaker.local",
-            ssh_key=tmp_path / "key",
-            run_command=fake_run,
-            lock_path=tmp_path / "voice.lock",
-            now_fn=ALLOWED_NOW,
-        ).notify("Open Trader 测试通知", message)
+        try:
+            XiaoaiSSHNotifier(
+                host="speaker.local",
+                ssh_key=tmp_path / "key",
+                run_command=fake_run,
+                lock_path=tmp_path / "voice.lock",
+                now_fn=ALLOWED_NOW,
+            ).notify("Open Trader 测试通知", message)
+        except BaseException as exc:
+            errors.append(exc)
 
     first = threading.Thread(target=play, args=("first",))
     second = threading.Thread(target=play, args=("second",))
     first.start()
-    assert first_entered.wait(timeout=1)
-    second.start()
-    time.sleep(0.05)
-    assert len(entered) == 1
-    release_first.set()
-    first.join(timeout=1)
-    second.join(timeout=1)
+    try:
+        assert first_entered.wait(timeout=1)
+        second.start()
+        assert contended.wait(timeout=1), "second playback never contended on the held lock"
+        assert len(entered) == 1
+    finally:
+        release_first.set()
+        first.join(timeout=1)
+        if second.ident is not None:
+            second.join(timeout=1)
+    assert not first.is_alive() and not second.is_alive()
+    assert errors == []
 
     assert [shlex.split(command)[1] for command in entered] == ["first", "second"]
 

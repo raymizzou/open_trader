@@ -5,6 +5,14 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-01
 
+- 测试时序修复：用局部业务时钟、真实完成信号、显式 owner 放行和独立进程 watchdog
+  替代调度假设；覆盖 monitor、runtime、LP、solver、账户/前端及趋势用例。
+  保留过期拒绝、恢复前不可用、single-flight、真实超时/取消/清理与性能断言；
+  全部 211 条审查记录逐项处置，详见测试时序修复说明与追踪清单。
+  两项历史 CI 失败及额外调度竞态经过受控延迟复现，修复包含反向变异与串行/双 worker 验证。
+  宿主诊断不能替代 Docker 门禁，最终结果以本 PR 精确提交的 GitHub Actions 为准。
+  未修改生产业务代码，未合并、发布或部署。
+
 - PR #224 的既有 16 个提交 rebase 到 origin/main `3f023fce`；保留双方 dated changelog，
   云端验收沿用 PR-first policy。静态核验 `src` 与原发布 `4f82836f` 完全一致，
   远端 CI、锁定依赖与测试稳定性变更保留；无新增生产行为，服务门禁与独立审查由 root 完成。

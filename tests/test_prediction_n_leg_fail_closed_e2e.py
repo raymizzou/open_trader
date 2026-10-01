@@ -778,6 +778,22 @@ LIVE_TEST_QUANTITY_CAP = 20
 LIVE_TEST_BOOK_DEPTH = 200
 
 
+
+@pytest.fixture(autouse=True)
+def _fixed_live_business_time(monkeypatch):
+    now = datetime.now(UTC)
+    original = datetime
+
+    class BusinessDatetime(original):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz is not None else now.replace(tzinfo=None)
+
+    # Only this fixture module's clock binding changes. Native solver budgets,
+    # HTTP, polling and parent process watchdogs all retain real time.
+    monkeypatch.setitem(globals(), "datetime", BusinessDatetime)
+
+
 class _LiveBooksMonitor:
     """Read-only book seam keyed to the resolver's 30s ``SNAPSHOT_FRESHNESS``
     harness window; production ``PolymarketMonitor.cross_venue_books`` omits
@@ -786,9 +802,10 @@ class _LiveBooksMonitor:
 
     def __init__(self, books: dict[str, ThresholdOrderBook]) -> None:
         self.books = dict(books)
+        self.now = datetime.now(UTC)
 
     def _fresh(self) -> dict[str, ThresholdOrderBook]:
-        now = datetime.now(UTC)
+        now = self.now
         return {
             token: book
             for token, book in self.books.items()
@@ -1142,9 +1159,11 @@ def _build_live_resolver(
         store=_LiveStore(),
         execution=execution if execution is not None else _LiveExecution(),
         poll_interval=0.01,
+        now_fn=lambda: monitor.now,
         budget=LIVE_TEST_BUDGET,
         limits=LIVE_TEST_LIMITS,
     )
+    resolver._scheduler._now_fn = lambda: monitor.now
     return resolver, [component.component_id for component in components]
 
 

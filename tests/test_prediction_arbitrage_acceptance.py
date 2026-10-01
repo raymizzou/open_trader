@@ -1207,12 +1207,18 @@ def test_browser_handoff_nonce_is_missing_wrong_or_replayed_blocked(tmp_path: Pa
 def test_direct_runner_with_arbitrary_handoff_without_pipeline_nonce_is_blocked(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    now = time.time()
+    now = 1_800_000_000.0
     handoff_path = write_browser_handoff(
         tmp_path,
         created_at=now,
         expires_at=now + 60,
     )
+    original_readiness = acceptance.run_live_readiness
+
+    def fixed_readiness(*args, **kwargs):
+        return original_readiness(*args, **kwargs, browser_now_fn=lambda: now)
+
+    monkeypatch.setattr(acceptance, "run_live_readiness", fixed_readiness)
     monkeypatch.setattr(acceptance, "_git_commit", lambda _root: "test-commit")
     monkeypatch.setattr(acceptance, "_dashboard_is_reachable", lambda _url: False)
 

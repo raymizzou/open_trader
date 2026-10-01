@@ -17,6 +17,7 @@ from urllib.request import ProxyHandler
 from uuid import uuid4
 
 import pytest
+from timing_support import run_test_in_subprocess
 from polymarket import PRODUCTION, PublicClient, SecureClient
 
 import open_trader.cli as cli
@@ -1429,9 +1430,14 @@ def test_lp_trial_selected_facts_preserve_identity_and_time() -> None:
     assert account["open_orders"][0]["condition_id"] == "condition-a"
 
 
-def test_lp_account_snapshot_shared_single_flight_and_ttl() -> None:
+def test_lp_account_snapshot_shared_single_flight_and_ttl(request) -> None:
     """Issue #146 A7: scan, maintenance, and dashboard snapshot share one
     account read per TTL window; concurrent callers coalesce into one read."""
+    if run_test_in_subprocess(request):
+        return
+
+    entered, release = threading.Event(), threading.Event()
+    attempted = threading.Event()
 
     class SharedAccountClient(FakeClient):
         def __init__(self) -> None:
@@ -1442,6 +1448,9 @@ def test_lp_account_snapshot_shared_single_flight_and_ttl() -> None:
         def list_open_orders(self, **kwargs: object) -> list[object]:
             with self._read_lock:
                 self.account_reads += 1
+            if self.account_reads == 1:
+                entered.set()
+                assert release.wait(5)
             return []
 
         def list_positions(self, **kwargs: object) -> list[object]:
@@ -1456,6 +1465,23 @@ def test_lp_account_snapshot_shared_single_flight_and_ttl() -> None:
         client=client,
         public_client_factory=PublicClient,
     )
+    real_lock = adapter._lp_account_shared_lock
+    attempts_lock = threading.Lock()
+    attempts = 0
+
+    class ObservedLock:
+        def __enter__(self):
+            nonlocal attempts
+            with attempts_lock:
+                attempts += 1
+                if attempts == 3:
+                    attempted.set()
+            return real_lock.__enter__()
+
+        def __exit__(self, *args):
+            return real_lock.__exit__(*args)
+
+    adapter._lp_account_shared_lock = ObservedLock()
     monotonic = {"now": 1000.0}
     original_realtime = polymarket_trading.time
 
@@ -1467,9 +1493,15 @@ def test_lp_account_snapshot_shared_single_flight_and_ttl() -> None:
     polymarket_trading.time = FakeTime  # type: ignore[misc]
     try:
         with ThreadPoolExecutor(max_workers=3) as pool:
-            concurrent = list(
-                pool.map(lambda _: adapter.lp_account_snapshot_shared(), range(3))
-            )
+            owner = pool.submit(adapter.lp_account_snapshot_shared)
+            try:
+                assert entered.wait(2)
+                joiners = [pool.submit(adapter.lp_account_snapshot_shared) for _ in range(2)]
+                assert attempted.wait(2), "both joiners must attempt the held cache lock"
+                assert client.account_reads == 1
+            finally:
+                release.set()
+            concurrent = [future.result(timeout=5) for future in [owner, *joiners]]
         sequential = [adapter.lp_account_snapshot_shared() for _ in range(3)]
         assert client.account_reads == 1
         assert all(row["authenticated"] is True for row in concurrent)
@@ -1486,6 +1518,7 @@ def test_lp_account_snapshot_shared_single_flight_and_ttl() -> None:
         adapter.lp_account_snapshot_shared(max_age_seconds=1.0)
         assert client.account_reads == 3
     finally:
+        release.set()
         polymarket_trading.time = original_realtime  # type: ignore[misc]
 
 

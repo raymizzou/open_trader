@@ -5,6 +5,7 @@ from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import os
 from pathlib import Path
 
 import pytest
@@ -915,6 +916,15 @@ def test_load_latest_statement_candidate_uses_statement_period_not_run_mtime(
         statement_id="2026-10-01-futu",
         symbol="IGNORED",
     )
+
+    # Deliberately reverse filesystem recency and statement business recency.
+    for name, stamp in (("older-directory", 1_700_000_000), ("newer-directory", 1_700_010_000),
+                        ("eastmoney-older-directory", 1_700_000_000), ("eastmoney-newer-directory", 1_700_010_000)):
+        directory = data_dir / "runs" / name
+        for path in [*directory.rglob("*"), directory]:
+            os.utime(path, (stamp, stamp))
+    assert (data_dir / "runs/newer-directory").stat().st_mtime > (data_dir / "runs/older-directory").stat().st_mtime
+    assert (data_dir / "runs/eastmoney-newer-directory").stat().st_mtime > (data_dir / "runs/eastmoney-older-directory").stat().st_mtime
 
     phillips = load_latest_statement_candidate(data_dir, "phillips")
     eastmoney = load_latest_statement_candidate(data_dir, "eastmoney")

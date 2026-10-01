@@ -10,6 +10,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -208,9 +209,10 @@ class FakeCatalog:
 class FakeMonitor:
     def __init__(self, books: dict[str, ThresholdOrderBook] | None = None) -> None:
         self.books = books or {}
+        self.now_fn = lambda: datetime.now(UTC)
 
     def cross_venue_books(self, token_ids: tuple[str, ...]) -> dict[str, ThresholdOrderBook]:
-        now = datetime.now(UTC)
+        now = self.now_fn()
         return {
             token: book
             for token, book in self.books.items()
@@ -1087,6 +1089,7 @@ def test_native_candidate_reaches_quote_evaluation(tmp_path: Path) -> None:
     current outcome-token asks. The worker evidence is produced by the real
     solver codec so the assertions cover the public resolver/verifier chain.
     """
+    now = datetime(2026, 9, 22, 12, tzinfo=UTC)
     for case, no_ask, expected_profit, qualified in (
         ("positive", "0.52", 50_000, True),
         ("negative", "0.58", -10_000, False),
@@ -1145,17 +1148,18 @@ def test_native_candidate_reaches_quote_evaluation(tmp_path: Path) -> None:
             "yes-native-live",
             (BookLevel(Decimal("0.43"), Decimal("1")),),
             (BookLevel(Decimal("0.31"), Decimal("1")),),
-            datetime.now(UTC),
+            now,
         )
         no_book = ThresholdOrderBook(
             "no-native-live",
             (BookLevel(Decimal(no_ask), Decimal("1")),),
             (BookLevel(Decimal("0.17"), Decimal("1")),),
-            datetime.now(UTC),
+            now,
         )
         monitor = RecordingMonitor(
             {"yes-native-live": yes_book, "no-native-live": no_book}
         )
+        monitor.now_fn = lambda: now
         server = FakeServer()
         selection_store = MonitorSelectionStore(run_dir)
         selection_store.save(selected)
@@ -1168,8 +1172,10 @@ def test_native_candidate_reaches_quote_evaluation(tmp_path: Path) -> None:
             store=FakeStore(),
             execution=FakeExecution(AccountView(2_000_000, 2_000_000, 0)),
             poll_interval=0.01,
+            now_fn=lambda: now,
             budget=OracleBudget(16, 25, 1),
         )
+        instance._scheduler._now_fn = lambda: now
         try:
             instance.start()
             deadline = time.monotonic() + 5
@@ -1713,21 +1719,34 @@ def test_normalize_problem_fails_closed_on_unknown_payout_scale() -> None:
         normalize_problem(scaled_dollar)
 
 
-def test_start_stop_idempotent_and_per_tick_exception_isolation(
-    tmp_path: Path,
-) -> None:
+def test_start_stop_idempotent_and_per_tick_exception_isolation(tmp_path: Path, monkeypatch) -> None:
     rows = {"r:a": row("r:a", raw_problem())}
     instance, server, catalog = resolver(tmp_path, rows=rows)
-    instance.start()
-    thread = instance._thread
-    assert thread is not None
-    instance.start()
-    assert instance._thread is thread
-    catalog.fail = True
-    time.sleep(0.08)
-    assert instance._thread is not None and instance._thread.is_alive()
-    instance.stop()
-    instance.stop()
+    failed_tick, next_tick = Event(), Event()
+    original = catalog.current_generation
+
+    def generation():
+        if not failed_tick.is_set():
+            failed_tick.set()
+            raise RuntimeError("catalog refresh failed")
+        result = original()
+        next_tick.set()
+        return result
+
+    # The graph captures the catalog callback at construction.
+    monkeypatch.setattr(instance._graph, "_generation_source", generation)
+    try:
+        instance.start()
+        thread = instance._thread
+        assert thread is not None
+        instance.start()
+        assert instance._thread is thread
+        assert failed_tick.wait(5), "resolver did not execute the failing tick"
+        assert next_tick.wait(5), "resolver did not recover on the next tick"
+        assert instance._thread is not None and instance._thread.is_alive()
+    finally:
+        instance.stop()
+        instance.stop()
     assert instance._thread is None
 
 

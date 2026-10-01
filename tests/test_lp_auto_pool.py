@@ -2,11 +2,12 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from threading import Event
+from threading import Barrier, Event
 import time
 from types import SimpleNamespace
 
 import pytest
+from timing_support import run_test_in_subprocess
 
 from open_trader.polymarket_lp import PolymarketLPService
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
@@ -395,12 +396,18 @@ def test_terminal_receipt_facts_match_session_and_action(tmp_path,accepted):
     assert r['slots']['occupied']==(1 if accepted else 0)
 
 
-def test_concurrent_rounds_single_reservation(tmp_path):
+def test_concurrent_rounds_single_reservation(tmp_path, request):
+    if run_test_in_subprocess(request):
+        return
     e,x,lp,s=setup(tmp_path)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
     e.lp_auto_set_desired_running(True)
+    start = Barrier(2)
+    def run_round(_):
+        start.wait(timeout=5)
+        return e.lp_auto_run_once(round_id='same')
     with ThreadPoolExecutor(2) as pool:
-        list(pool.map(lambda _:e.lp_auto_run_once(round_id='same'), range(2)))
+        list(pool.map(run_round, range(2)))
     assert len(x.posts)==1
     assert len(e.lp_auto_state()['intents'])==1
 
@@ -484,10 +491,16 @@ def test_manual_origin_does_not_own_funds_and_unknown_fees_block(tmp_path):
     assert e.lp_auto_state()['slots']['occupied'] == 1
 
 
-def test_concurrent_configuration_is_atomic_target_total(tmp_path):
+def test_concurrent_configuration_is_atomic_target_total(tmp_path, request):
+    if run_test_in_subprocess(request):
+        return
     e,x,lp,s=setup(tmp_path)
+    start = Barrier(2)
+    def configure(_):
+        start.wait(timeout=5)
+        return e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
     with ThreadPoolExecutor(2) as pool:
-        list(pool.map(lambda _:e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1)),range(2)))
+        list(pool.map(configure, range(2)))
     assert e.lp_auto_state()['funds']['total_usd']=='100'
     assert e.lp_auto_state()['config_version']==2
 
@@ -712,7 +725,7 @@ def test_account_switch_cannot_reconcile_another_wallets_pool(tmp_path):
 
 @pytest.mark.parametrize('stage',['snapshot','sign','post'])
 def test_slow_automatic_network_does_not_block_existing_session_cancel(tmp_path,stage):
-    from threading import Event
+    from threading import Barrier, Event
     e,x,lp,s=setup(tmp_path)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=2))
     e.lp_auto_set_desired_running(True)
@@ -852,7 +865,7 @@ def test_late_live_receipt_preserves_already_verified_fill(tmp_path):
 
 @pytest.mark.parametrize('signed_id',[False,True])
 def test_receipt_apply_respects_another_service_tick_lock(tmp_path,signed_id):
-    from threading import Event, Lock
+    from threading import Barrier, Event, Lock
     e,x,lp,s=setup(tmp_path)
     other_store=PredictionArbitrageStore(s.data_dir)
     other_lp=PolymarketLPService(other_store,x,clock=lambda:NOW)
@@ -1061,7 +1074,7 @@ def test_publication_lock_wait_arms_durable_attention_progress(tmp_path, monkeyp
     from tests import test_lp_auto_pool as venue
     from copy import deepcopy
 
-    from threading import Event as ThreadEvent
+    from threading import Barrier, Event as ThreadEvent
     class Notifier:
         def __init__(self):
             self.calls=[]; self.done=ThreadEvent()
@@ -1134,7 +1147,7 @@ def test_trade_claim_advances_both_fences_and_rejects_stale_claim(tmp_path):
 
 
 def test_concurrent_monitor_and_manual_protected_sell_claim_one_intent(tmp_path):
-    from threading import Event
+    from threading import Barrier, Event
     e,x,lp,s=setup(tmp_path)
     sid='sell-session'; now=NOW; request=_manual_request(now)
     s.lp_create_session(sid,sid,state='stop_loss_exit',payload={

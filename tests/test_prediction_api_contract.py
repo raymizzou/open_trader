@@ -434,43 +434,46 @@ def test_state_reads_cached_coverage_without_evaluation(tmp_path: Path) -> None:
     runtime.store = observation_store
     runtime.execution = BoundaryExecution()
     observation.start()
-    assert source_entered.wait(5)
-    calls_while_blocked = (catalog_calls[0], source_calls[0])
-    server = create_prediction_server(
-        runtime=runtime,  # type: ignore[arg-type]
-        port=0,
-        session_token="session-token",
-        csrf_token="csrf-token",
-        runtime_metadata={"git_sha": "abc123"},
-    )
-    read_connection = sqlite3.connect(
-        observation_store.path, isolation_level=None
-    )
-
-    def sqlite_state() -> tuple[int, list[tuple[object, ...]]]:
-        data_version = int(
-            read_connection.execute("PRAGMA data_version").fetchone()[0]
-        )
-        records = [
-            tuple(row)
-            for row in read_connection.execute(
-                "SELECT identity, relation_type, version_id, "
-                "version_fingerprint, rules_fingerprint, entered_at "
-                "FROM observation_pool_members ORDER BY identity"
-            ).fetchall()
-        ]
-        return data_version, records
-
+    read_connection = None
     try:
+        assert source_entered.wait(5)
+        calls_while_blocked = (catalog_calls[0], source_calls[0])
+        server = create_prediction_server(
+            runtime=runtime,  # type: ignore[arg-type]
+            port=0,
+            session_token="session-token",
+            csrf_token="csrf-token",
+            runtime_metadata={"git_sha": "abc123"},
+        )
+        read_connection = sqlite3.connect(
+            observation_store.path, isolation_level=None
+        )
+
+        def sqlite_state() -> tuple[int, list[tuple[object, ...]]]:
+            data_version = int(
+                read_connection.execute("PRAGMA data_version").fetchone()[0]
+            )
+            records = [
+                tuple(row)
+                for row in read_connection.execute(
+                    "SELECT identity, relation_type, version_id, "
+                    "version_fingerprint, rules_fingerprint, entered_at "
+                    "FROM observation_pool_members ORDER BY identity"
+                ).fetchall()
+            ]
+            return data_version, records
+
         with _serve(server) as base:
             before_sqlite = sqlite_state()
             first_status, _, first = _json_response(base + "/api/prediction-arbitrage/state")
             second_status, _, second = _json_response(base + "/api/prediction-arbitrage/state")
             after_sqlite = sqlite_state()
     finally:
-        read_connection.close()
+        if read_connection is not None:
+            read_connection.close()
         release_source.set()
         observation.stop()
+        assert not observation.thread_alive
     assert first_status == second_status == 200
     assert first["n_leg_coverage"]["latest_count"] == 1
     assert first["n_leg_coverage"] == second["n_leg_coverage"]

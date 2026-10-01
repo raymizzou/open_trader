@@ -2933,8 +2933,17 @@ def test_lp_snapshot_reuses_connections_but_refreshes_facts_after_read_failure()
     assert len(clients) == 1, 'a stopped adapter must not reopen connections'
 
 
-def test_lp_snapshot_shares_client_across_workers_and_defers_close() -> None:
-    from concurrent.futures import ThreadPoolExecutor
+def test_lp_snapshot_shares_client_across_workers_and_defers_close(monkeypatch) -> None:
+    from concurrent.futures import Future, ThreadPoolExecutor
+    from open_trader import polymarket_trading
+
+    class CompletionFuture(Future):
+        def result(self, timeout=None):
+            # This test controls owner lifetime. Real public-read deadlines are
+            # exercised separately; this is an independent completion watchdog.
+            return super().result(timeout=5)
+
+    monkeypatch.setattr(polymarket_trading, "Future", CompletionFuture)
 
     now = datetime.now(UTC)
     entered = threading.Event()
@@ -2962,9 +2971,15 @@ def test_lp_snapshot_shares_client_across_workers_and_defers_close() -> None:
         TradingConfig('0x' + '1' * 40, '0x' + '2' * 40), _SDKAccountClient(now),
         public_client_factory=factory)
     with ThreadPoolExecutor(2) as workers:
-        pending = [workers.submit(adapter.lp_snapshot, _request(now)) for _ in range(2)]
+        owner = workers.submit(adapter.lp_snapshot, _request(now))
         try:
             assert entered.wait(timeout=5)
+            joiner = workers.submit(adapter.lp_snapshot, _request(now))
+            joined_result = joiner.result(timeout=5)
+            assert joined_result['market'] is None and joined_result['book'] is None
+            assert joined_result['market_read_errors']['0x' + 'c' * 64]['error_type'] == (
+                'market_read_in_progress'
+            )
             assert len(clients) == 1
             adapter.close()
             assert clients[0].closed == 0
@@ -2976,7 +2991,7 @@ def test_lp_snapshot_shares_client_across_workers_and_defers_close() -> None:
             assert joining['account']['authenticated'] is True
         finally:
             release.set()
-        first_result, joined_result = [job.result(timeout=5) for job in pending]
+        first_result = owner.result(timeout=5)
         assert first_result['book'] is not None
         assert joined_result['market'] is None and joined_result['book'] is None
     assert clients[0].closed == 1
@@ -3377,9 +3392,22 @@ def test_production_adapter_slow_book_returns_financial_before_snapshot_boundary
 
 
 def test_slow_financial_read_is_not_discarded_by_optional_public_wait(
-    tmp_path,
+    tmp_path, monkeypatch,
 ) -> None:
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import Future, ThreadPoolExecutor
+    from open_trader import polymarket_trading
+
+    pending_waits = []
+    track_waits = [True]
+
+    class PublicFuture(Future):
+        def result(self, timeout=None):
+            if track_waits[0] and not self.done():
+                pending_waits.append(timeout)
+                raise AssertionError("financial settlement must not wait on a pending public read")
+            return super().result(timeout=timeout)
+
+    monkeypatch.setattr(polymarket_trading, "Future", PublicFuture)
 
     now = datetime(2026, 9, 29, 8, tzinfo=UTC)
     account_client = _SDKAccountClient(now)
@@ -3395,8 +3423,11 @@ def test_slow_financial_read_is_not_discarded_by_optional_public_wait(
     account_client.list_account_trades = lambda **kwargs: []
     original_positions = account_client.list_positions
 
+    financial_entered, release_financial = threading.Event(), threading.Event()
+
     def slow_positions(**kwargs):
-        time.sleep(0.8)
+        financial_entered.set()
+        assert release_financial.wait(5)
         return original_positions(**kwargs)
 
     account_client.list_positions = slow_positions
@@ -3416,7 +3447,14 @@ def test_slow_financial_read_is_not_discarded_by_optional_public_wait(
         account_client,
         public_client_factory=lambda: SlowBook(now),
     )
-    adapter._lp_public_read_timeout = 0.5
+    public_waits = []
+    read_public = adapter._read_lp_public_snapshot
+
+    def observed_public(*args, **kwargs):
+        public_waits.append(kwargs.get("wait", True))
+        return read_public(*args, **kwargs)
+
+    adapter._read_lp_public_snapshot = observed_public
     request = _request(now)
     store = PredictionArbitrageStore(tmp_path)
     store.lp_create_session(
@@ -3431,15 +3469,29 @@ def test_slow_financial_read_is_not_discarded_by_optional_public_wait(
         },
     )
     service = PolymarketLPService(store, adapter, clock=lambda: now)
-    service._market_read_timeout = 1.0
     with ThreadPoolExecutor(1) as workers:
         tick = workers.submit(service.tick)
         try:
+            assert financial_entered.wait(2)
+            assert not tick.done()
+            assert not entered.is_set(), "public work cannot precede the financial read"
+            release_financial.set()
             assert entered.wait(2)
-            assert tick.result(timeout=0.15)["state"] == "complete"
+            assert tick.result(timeout=2)["state"] == "complete"
+            assert pending_waits == [], "optional book waiting must not delay financial completion"
+            assert public_waits == [False], "optional public work must never consume the financial deadline"
+            assert not release.is_set()
+            published = store.lp_session("financial-deadline")
+            public_futures = tuple(adapter._lp_public_reads.values())
+            assert public_futures and all(not job.done() for job in public_futures)
         finally:
+            track_waits[0] = False
+            release_financial.set()
             release.set()
         tick.result(timeout=2)
+        for future in public_futures:
+            future.result(timeout=2)
+        assert store.lp_session("financial-deadline") == published, "late book must not republish financial facts"
     session = store.lp_session("financial-deadline")
     assert session["state"] == "complete"
     assert session["facts_error"] is None
@@ -3449,8 +3501,22 @@ class _NoOpenOrdersSDKAccountClient(_SDKAccountClient):
         return []
 
 
-def test_fresh_local_receipt_accepts_unchanged_source_book(tmp_path) -> None:
-    before = datetime.now(UTC)
+def test_fresh_local_receipt_accepts_unchanged_source_book(tmp_path, monkeypatch) -> None:
+    from open_trader import polymarket_trading
+
+    before = datetime(2026, 9, 29, 8, tzinfo=UTC)
+    clock = [before]
+
+    class ClockMeta(type):
+        def __instancecheck__(cls, value):
+            return isinstance(value, datetime)
+
+    class Clock(datetime, metaclass=ClockMeta):
+        @classmethod
+        def now(cls, tz=None):
+            return clock[0].astimezone(tz)
+
+    monkeypatch.setattr(polymarket_trading, "datetime", Clock)
     source_timestamp = before - timedelta(minutes=10)
     account_client = _NoOpenOrdersSDKAccountClient(source_timestamp)
     adapter = PolymarketTradingClient(
@@ -3470,12 +3536,12 @@ def test_fresh_local_receipt_accepts_unchanged_source_book(tmp_path) -> None:
         "outcome": "YES",
     }
     snapshot = adapter.lp_snapshot(request)
-    after = datetime.now(UTC)
+    after = clock[0]
     book = snapshot["book"]
     assert book["timestamp"] == source_timestamp  # type: ignore[index]
     assert before <= book["received_at"] <= after  # type: ignore[index]
 
-    now = datetime.now(UTC)
+    now = clock[0]
     service_request = {
         **request,
         "question": "Will it happen?",
@@ -3488,7 +3554,7 @@ def test_fresh_local_receipt_accepts_unchanged_source_book(tmp_path) -> None:
     service = PolymarketLPService(
         PredictionArbitrageStore(tmp_path),
         fresh_exchange,
-        clock=lambda: datetime.now(UTC),
+        clock=lambda: clock[0],
     )
     preview = service.preview(service_request)
     assert preview["state"] == "previewed"
@@ -3499,7 +3565,7 @@ def test_fresh_local_receipt_accepts_unchanged_source_book(tmp_path) -> None:
         **snapshot,
         "book": {
             **snapshot["book"],  # type: ignore[dict-item]
-            "received_at": datetime.now(UTC) - timedelta(seconds=30),
+            "received_at": clock[0] - timedelta(seconds=30),
         },
     }
     stale_exchange = _Exchange()
@@ -3507,7 +3573,7 @@ def test_fresh_local_receipt_accepts_unchanged_source_book(tmp_path) -> None:
     stale_service = PolymarketLPService(
         PredictionArbitrageStore(tmp_path / "stale"),
         stale_exchange,
-        clock=lambda: datetime.now(UTC),
+        clock=lambda: clock[0],
     )
     assert stale_service.preview(service_request)["reason"] == "book_freshness_stale"
 
@@ -3520,9 +3586,14 @@ def test_fresh_local_receipt_accepts_unchanged_source_book(tmp_path) -> None:
     missing_service = PolymarketLPService(
         PredictionArbitrageStore(tmp_path / "missing"),
         missing_exchange,
-        clock=lambda: datetime.now(UTC),
+        clock=lambda: clock[0],
     )
     assert missing_service.preview(service_request)["reason"] == "book_freshness_unknown"
+
+    clock[0] = before + timedelta(seconds=10)
+    assert service.preview(service_request)["state"] == "previewed"
+    clock[0] += timedelta(microseconds=1)
+    assert service.preview(service_request)["reason"] == "book_freshness_stale"
 
 
 def test_refresh_candidates_projects_trial_funnel_without_risk(tmp_path) -> None:

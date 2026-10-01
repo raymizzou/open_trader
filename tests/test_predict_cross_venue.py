@@ -5,6 +5,8 @@ import json
 import hashlib
 import subprocess
 import threading
+import time
+from unittest.mock import patch
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -1360,12 +1362,88 @@ def rejected_polymarket_row() -> dict[str, object]:
     }
 
 
-async def wait_until(predicate, *, attempts: int = 500) -> None:
-    for _ in range(attempts):
-        if predicate():
-            return
+async def wait_until(predicate, *, timeout: float = 0.5) -> None:
+    # A real watchdog is independent of the monitor's injected business clock.
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"condition was not reached within {timeout}s")
         await asyncio.sleep(0.001)
-    raise AssertionError("condition was not reached")
+
+
+class _AsyncioProxy:
+    """Override a module-local seam without mutating shared asyncio."""
+
+    def __init__(self, **overrides):
+        self.__dict__.update(overrides)
+
+    def __getattr__(self, name):
+        return getattr(asyncio, name)
+
+
+class _ObservationTasks:
+    def __init__(self, monkeypatch):
+        self.tasks = []
+        original = PredictCrossVenueMonitor._persist_observation
+
+        def create_task(coroutine, **kwargs):
+            task = asyncio.create_task(coroutine, **kwargs)
+            self.tasks.append(task)
+            return task
+
+        def persist(monitor, opportunity):
+            # This seam is synchronous: only tasks scheduled by this observation
+            # are captured, never the long-running monitor/discovery tasks.
+            with patch.object(predict_cross_venue, "asyncio", _AsyncioProxy(create_task=create_task)):
+                return original(monitor, opportunity)
+
+        monkeypatch.setattr(PredictCrossVenueMonitor, "_persist_observation", persist)
+
+    async def drain(self):
+        while self.tasks:
+            pending, self.tasks = self.tasks, []
+            await asyncio.wait_for(asyncio.gather(*pending), timeout=0.5)
+
+
+class _DiscoveryCycles:
+    def __init__(self, monkeypatch):
+        self.release = asyncio.Queue()
+        self.completed = 0
+        self.waiting = 0
+        original = PredictCrossVenueMonitor._discover_after_interval
+
+        async def sleep(seconds):
+            if seconds == 15 * 60:
+                self.waiting += 1
+                try:
+                    await self.release.get()
+                finally:
+                    self.waiting -= 1
+            else:
+                await asyncio.sleep(seconds)
+
+        async def discover(monitor):
+            await original(monitor)
+            self.completed += 1
+
+        monkeypatch.setattr(predict_cross_venue, "asyncio", _AsyncioProxy(sleep=sleep))
+        monkeypatch.setattr(PredictCrossVenueMonitor, "_discover_after_interval", discover)
+
+    def trigger(self):
+        self.release.put_nowait(None)
+
+    async def next(self):
+        await wait_until(lambda: self.waiting == 1)
+        expected = self.completed + 1
+        self.trigger()
+        await wait_until(lambda: self.completed == expected)
+
+
+async def _drain_books(predict, monitor):
+    await asyncio.wait_for(predict.queue.join(), timeout=0.5)
+    tasks = tuple(monitor._confirmation_tasks.values())
+    if tasks:
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=0.5)
 
 
 class FakeCrossVenueValidator:
@@ -1703,9 +1781,12 @@ class FakeCrossVenuePredict:
         try:
             while True:
                 book = await self.queue.get()
-                if book is None:
-                    return
-                yield book
+                try:
+                    if book is None:
+                        return
+                    yield book
+                finally:
+                    self.queue.task_done()
         finally:
             self.active_subscriptions.discard(subscription)
 
@@ -1806,75 +1887,80 @@ def test_monitor_validates_before_subscription_and_confirms_both_rest_books_conc
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
 
-        await monitor.start()
-        await wait_until(lambda: bool(predict.subscriptions))
-        assert predict.subscriptions == [
-            ("predict-market-1", "predict-market-rejected")
-        ]
-        assert polymarket.token_sets[-1] == (
-            "poly-no-1",
-            "poly-no-rejected",
-            "poly-yes-1",
-            "poly-yes-rejected",
-        )
-        assert len(validator.calls) == 2
+        try:
+            await monitor.start()
+            await wait_until(lambda: bool(predict.subscriptions))
+            assert predict.subscriptions == [
+                ("predict-market-1", "predict-market-rejected")
+            ]
+            assert polymarket.token_sets[-1] == (
+                "poly-no-1",
+                "poly-no-rejected",
+                "poly-yes-1",
+                "poly-yes-rejected",
+            )
+            assert len(validator.calls) == 2
 
-        await predict.queue.put(monitor_predict_book())
-        await wait_until(
-            lambda: predict.rest_started.is_set() and polymarket.confirm_started.is_set()
-        )
-        assert monitor.snapshot()["opportunities"] == []
-        assert polymarket.confirm_calls == 1
-        polymarket.release.set()
-        await wait_until(lambda: len(monitor.snapshot()["opportunities"]) == 2)
+            await predict.queue.put(monitor_predict_book())
+            await wait_until(
+                lambda: predict.rest_started.is_set() and polymarket.confirm_started.is_set()
+            )
+            assert monitor.snapshot()["opportunities"] == []
+            assert polymarket.confirm_calls == 1
+            polymarket.release.set()
+            await wait_until(lambda: len(monitor.snapshot()["opportunities"]) == 2)
 
-        snapshot = monitor.snapshot()
-        assert snapshot["status"] == "ready"
-        assert snapshot["mode"] == "observe_only"
-        assert snapshot["funnel"] == {
-            "matched_pairs": 2,
-            "monitored_pairs": 2,
-            "codex_approved_pairs": 1,
-            "arbitrage_space_pairs": 1,
-            "clear_signal_pairs": 1,
-            "manual_eligible_pairs": 1,
-            "manual_pending_pairs": 0,
-        }
-        assert {row["direction"] for row in snapshot["opportunities"]} == {
-            "PREDICT_YES_POLYMARKET_NO",
-            "POLYMARKET_YES_PREDICT_NO",
-        }
-        assert snapshot["opportunities"][0]["codex_approval"]["decision"] == "APPROVE"
-        assert set(snapshot["opportunities"][0]["rules_fingerprints"]) == {"predict.fun", "polymarket"}
-        assert set(snapshot["opportunities"][0]["approved_candidates"]) == {
-            "predict.fun", "polymarket"
-        }
-        assert isinstance(snapshot["opportunities"][0]["confirmed_at"], datetime)
-        assert snapshot["opportunities"][0]["confirmed_age_seconds"] == Decimal("0")
-        assert all(
-            row["market_type"] == "cross_venue_yes_no"
-            and row["execution_mode"] == "observe_only"
-            and row["actionable"] is True
-            and row["clear_signal"] is True
-            for row in snapshot["opportunities"]
-        )
+            snapshot = monitor.snapshot()
+            assert snapshot["status"] == "ready"
+            assert snapshot["mode"] == "observe_only"
+            assert snapshot["funnel"] == {
+                "matched_pairs": 2,
+                "monitored_pairs": 2,
+                "codex_approved_pairs": 1,
+                "arbitrage_space_pairs": 1,
+                "clear_signal_pairs": 1,
+                "manual_eligible_pairs": 1,
+                "manual_pending_pairs": 0,
+            }
+            assert {row["direction"] for row in snapshot["opportunities"]} == {
+                "PREDICT_YES_POLYMARKET_NO",
+                "POLYMARKET_YES_PREDICT_NO",
+            }
+            assert snapshot["opportunities"][0]["codex_approval"]["decision"] == "APPROVE"
+            assert set(snapshot["opportunities"][0]["rules_fingerprints"]) == {"predict.fun", "polymarket"}
+            assert set(snapshot["opportunities"][0]["approved_candidates"]) == {
+                "predict.fun", "polymarket"
+            }
+            assert isinstance(snapshot["opportunities"][0]["confirmed_at"], datetime)
+            assert snapshot["opportunities"][0]["confirmed_age_seconds"] == Decimal("0")
+            assert all(
+                row["market_type"] == "cross_venue_yes_no"
+                and row["execution_mode"] == "observe_only"
+                and row["actionable"] is True
+                and row["clear_signal"] is True
+                for row in snapshot["opportunities"]
+            )
 
-        opportunity_id = str(snapshot["opportunities"][0]["opportunity_id"])
-        validator_calls = len(validator.calls)
-        predict_list_calls = predict.list_calls
-        refreshed = await monitor.refresh_opportunity(opportunity_id)
-        assert refreshed is not None
-        assert refreshed["opportunity_id"] == opportunity_id
-        assert refreshed["confirmed_age_seconds"] == Decimal("0")
-        assert PredictionExecutionService._intent_from_payload(refreshed["intent"]) is not None
-        assert predict.list_calls == predict_list_calls + 1
-        assert len(validator.calls) == validator_calls
+            opportunity_id = str(snapshot["opportunities"][0]["opportunity_id"])
+            validator_calls = len(validator.calls)
+            predict_list_calls = predict.list_calls
+            refreshed = await monitor.refresh_opportunity(opportunity_id)
+            assert refreshed is not None
+            assert refreshed["opportunity_id"] == opportunity_id
+            assert refreshed["confirmed_age_seconds"] == Decimal("0")
+            assert PredictionExecutionService._intent_from_payload(refreshed["intent"]) is not None
+            assert predict.list_calls == predict_list_calls + 1
+            assert len(validator.calls) == validator_calls
 
-        await predict.queue.put(monitor_predict_book())
-        await asyncio.sleep(0.01)
-        assert len(validator.calls) == 2
-        assert polymarket.confirm_calls == 2
-        await monitor.stop()
+            await predict.queue.put(monitor_predict_book())
+            await _drain_books(predict, monitor)
+            assert len(validator.calls) == 2
+            assert polymarket.confirm_calls == 2
+            await monitor.stop()
+
+        finally:
+            polymarket.release.set()
+            await monitor.stop()
 
     asyncio.run(exercise())
 
@@ -2338,7 +2424,7 @@ def test_monitor_signal_episode_persists_refreshes_and_rotates_on_reopen(
 
 
 def test_monitor_stage_five_observer_dedupes_restart_and_rearms_after_stale_recovery(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class ReconnectingPredict(FakeCrossVenuePredict):
         def __init__(self) -> None:
@@ -2370,6 +2456,8 @@ def test_monitor_stage_five_observer_dedupes_restart_and_rearms_after_stale_reco
             finally:
                 self.active_subscriptions.discard(subscription)
 
+    tasks = _ObservationTasks(monkeypatch)
+
     async def exercise() -> None:
         store = PredictionArbitrageStore(tmp_path / "data")
         polymarket = FakeCrossVenuePolymarket()
@@ -2389,64 +2477,79 @@ def test_monitor_stage_five_observer_dedupes_restart_and_rearms_after_stale_reco
             ),
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
-        await first_monitor.start()
-        await wait_until(lambda: bool(first_monitor.snapshot()["opportunities"]))
-        first = next(iter(first_monitor.snapshot()["opportunities"]))
-        opportunity_id = str(first["opportunity_id"])
-        original_signal_id = str(first["signal_episode_id"])
-        await wait_until(lambda: len(first_monitor_notifications) == 1)
-        await first_monitor.stop()
+        restarted = None
+        restarted_predict = None
+        try:
+            await first_monitor.start()
+            await wait_until(lambda: bool(first_monitor.snapshot()["opportunities"]))
+            first = next(iter(first_monitor.snapshot()["opportunities"]))
+            opportunity_id = str(first["opportunity_id"])
+            original_signal_id = str(first["signal_episode_id"])
+            await wait_until(lambda: len(first_monitor_notifications) == 1)
+            await first_monitor.stop()
 
-        restarted_notifications: list[tuple[str, str]] = []
-        restarted_predict = ReconnectingPredict()
-        restarted = PredictCrossVenueMonitor(
-            predict_source=restarted_predict,
-            polymarket_monitor=polymarket,
-            validator=FakeCrossVenueValidator(),
-            gamma_lookup=monitor_gamma,
-            predict_quote_fn=predict_quote(),
-            store=store,
-            ready_observer=lambda opportunity_id, signal_id: restarted_notifications.append(
-                (opportunity_id, signal_id)
-            ),
-            clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
-        )
-        await restarted.start()
-        await wait_until(lambda: bool(restarted.snapshot()["opportunities"]))
-        assert restarted_notifications == []
-        assert restarted.snapshot()["opportunities"][0]["signal_episode_id"] == original_signal_id
+            restarted_notifications: list[tuple[str, str]] = []
+            restarted_predict = ReconnectingPredict()
+            restarted = PredictCrossVenueMonitor(
+                predict_source=restarted_predict,
+                polymarket_monitor=polymarket,
+                validator=FakeCrossVenueValidator(),
+                gamma_lookup=monitor_gamma,
+                predict_quote_fn=predict_quote(),
+                store=store,
+                ready_observer=lambda opportunity_id, signal_id: restarted_notifications.append(
+                    (opportunity_id, signal_id)
+                ),
+                clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+            )
+            await restarted.start()
+            await wait_until(lambda: bool(restarted.snapshot()["opportunities"]))
+            await tasks.drain()
+            assert restarted_notifications == []
+            assert restarted.snapshot()["opportunities"][0]["signal_episode_id"] == original_signal_id
 
-        restarted_predict.disconnect.set()
-        await restarted_predict.disconnected.wait()
-        await wait_until(lambda: polymarket.token_sets[-1] == ())
-        assert restarted.snapshot()["opportunities"] == []
-        assert store.open_signal_history()[0]["signal_id"] == original_signal_id
+            restarted_predict.disconnect.set()
+            await asyncio.wait_for(restarted_predict.disconnected.wait(), timeout=0.5)
+            await wait_until(lambda: polymarket.token_sets[-1] == ())
+            assert restarted.snapshot()["opportunities"] == []
+            assert store.open_signal_history()[0]["signal_id"] == original_signal_id
 
-        restarted_predict.reconnect.set()
-        await wait_until(lambda: polymarket.token_sets[-1] == ("poly-no-1", "poly-yes-1"))
-        await wait_until(lambda: bool(restarted.snapshot()["opportunities"]))
-        await asyncio.sleep(0)
-        assert restarted_notifications == []
+            restarted_predict.reconnect.set()
+            await wait_until(lambda: polymarket.token_sets[-1] == ("poly-no-1", "poly-yes-1"))
+            await wait_until(lambda: bool(restarted.snapshot()["opportunities"]))
+            await tasks.drain()
+            assert restarted_notifications == []
 
-        polymarket.books = {}
-        await restarted_predict.queue.put(monitor_predict_book())
-        await wait_until(lambda: restarted.snapshot()["opportunities"] == [])
+            polymarket.books = {}
+            await restarted_predict.queue.put(monitor_predict_book())
+            await wait_until(lambda: restarted.snapshot()["opportunities"] == [])
 
-        polymarket.books = {"poly-no-1": monitor_polymarket_books()["poly-no-1"]}
-        await restarted_predict.queue.put(monitor_predict_book())
-        await wait_until(lambda: len(restarted_notifications) == 1)
-        new_signal_id = restarted_notifications[0][1]
-        assert restarted_notifications[0][0] == opportunity_id
-        assert new_signal_id != original_signal_id
-        await restarted_predict.queue.put(None)
-        await restarted.stop()
+            polymarket.books = {"poly-no-1": monitor_polymarket_books()["poly-no-1"]}
+            await restarted_predict.queue.put(monitor_predict_book())
+            await wait_until(lambda: len(restarted_notifications) == 1)
+            new_signal_id = restarted_notifications[0][1]
+            assert restarted_notifications[0][0] == opportunity_id
+            assert new_signal_id != original_signal_id
+            await restarted_predict.queue.put(None)
+            await restarted.stop()
+
+        finally:
+            first_predict.reconnect.set()
+            await first_monitor.stop()
+            if restarted_predict is not None:
+                restarted_predict.reconnect.set()
+            if restarted is not None:
+                await restarted.stop()
+            await tasks.drain()
 
     asyncio.run(exercise())
 
 
 def test_monitor_notifies_only_first_cross_stage_5_per_dedupe_identity(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    tasks = _ObservationTasks(monkeypatch)
+
     async def exercise() -> None:
         predict = FakeCrossVenuePredict(
             (monitor_predict_market(external_ids=("poly-condition",)),)
@@ -2503,7 +2606,7 @@ def test_monitor_notifies_only_first_cross_stage_5_per_dedupe_identity(
             monitor._persist_observation(
                 {**base, "funnel_stage": stage, "actionable": False, "clear_signal": False}
             )
-        await asyncio.sleep(0)
+        await tasks.drain()
         assert notifications == []
 
         signal = store.open_signal_history()[0]
@@ -2528,7 +2631,7 @@ def test_monitor_notifies_only_first_cross_stage_5_per_dedupe_identity(
         assert notifications == [(opportunity_id, signal["signal_id"])]
 
         monitor._persist_observation(stage_five)
-        await asyncio.sleep(0)
+        await tasks.drain()
         assert len(notifications) == 1
 
         fresh_base = {
@@ -2542,7 +2645,7 @@ def test_monitor_notifies_only_first_cross_stage_5_per_dedupe_identity(
         monitor._persist_observation(
             {**fresh_base, "funnel_stage": 4, "actionable": False, "clear_signal": False}
         )
-        await asyncio.sleep(0)
+        await tasks.drain()
         assert len(notifications) == 1
         rotated_signal = store.open_signal_history()[0]
         assert rotated_signal["signal_id"] != signal["signal_id"]
@@ -2633,8 +2736,10 @@ def test_monitor_candidate_identity_rotation_closes_old_episode_and_creates_new_
 
 
 def test_monitor_fingerprint_rotation_isolates_in_flight_notification_lease(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    tasks = _ObservationTasks(monkeypatch)
+
     async def exercise() -> None:
         store = PredictionArbitrageStore(tmp_path / "data")
         calls: list[str] = []
@@ -2650,7 +2755,7 @@ def test_monitor_fingerprint_rotation_isolates_in_flight_notification_lease(
             lease_id = str(reservation["lease_id"])
             if len(calls) == 1:
                 old_started.set()
-                assert release_old.wait(timeout=2)
+                release_old.wait()
             result = store.complete_notification_attempt(
                 signal_id, lease_id, success=True
             )
@@ -2693,36 +2798,44 @@ def test_monitor_fingerprint_rotation_isolates_in_flight_notification_lease(
                 },
             }
 
-        monitor._persist_observation(stage("predict-fingerprint-1", 5, True))
-        await wait_until(old_started.is_set)
-        old_signal = store.open_signal_history()[0]
-        old_signal_id = str(old_signal["signal_id"])
+        try:
+            monitor._persist_observation(stage("predict-fingerprint-1", 5, True))
+            await wait_until(old_started.is_set)
+            old_signal = store.open_signal_history()[0]
+            old_signal_id = str(old_signal["signal_id"])
 
-        monitor._persist_observation(stage("predict-fingerprint-2", 4, False))
-        rotated_signal = store.open_signal_history()[0]
-        rotated_signal_id = str(rotated_signal["signal_id"])
-        assert rotated_signal_id != old_signal_id
+            monitor._persist_observation(stage("predict-fingerprint-2", 4, False))
+            rotated_signal = store.open_signal_history()[0]
+            rotated_signal_id = str(rotated_signal["signal_id"])
+            assert rotated_signal_id != old_signal_id
 
-        monitor._persist_observation(stage("predict-fingerprint-2", 5, True))
-        await wait_until(new_completed.is_set)
-        assert calls == [old_signal_id, rotated_signal_id]
-        assert store.signal(rotated_signal_id)["notification_state"] == "sent"  # type: ignore[index]
+            monitor._persist_observation(stage("predict-fingerprint-2", 5, True))
+            await wait_until(new_completed.is_set)
+            assert calls == [old_signal_id, rotated_signal_id]
+            assert store.signal(rotated_signal_id)["notification_state"] == "sent"  # type: ignore[index]
 
-        release_old.set()
-        await wait_until(lambda: len(completions) == 2)
-        completion_by_signal = dict(completions)
-        assert completion_by_signal[old_signal_id]["state"] == "closed"
-        assert completion_by_signal[rotated_signal_id]["state"] == "sent"
-        assert store.signal(rotated_signal_id)["notification_state"] == "sent"  # type: ignore[index]
+            release_old.set()
+            await wait_until(lambda: len(completions) == 2)
+            completion_by_signal = dict(completions)
+            assert completion_by_signal[old_signal_id]["state"] == "closed"
+            assert completion_by_signal[rotated_signal_id]["state"] == "sent"
+            assert store.signal(rotated_signal_id)["notification_state"] == "sent"  # type: ignore[index]
 
-        monitor._persist_observation(stage("predict-fingerprint-2", 5, True))
-        await asyncio.sleep(0)
-        assert calls == [old_signal_id, rotated_signal_id]
+            monitor._persist_observation(stage("predict-fingerprint-2", 5, True))
+            await tasks.drain()
+            assert calls == [old_signal_id, rotated_signal_id]
+
+        finally:
+            release_old.set()
+            await tasks.drain()
+            await monitor.stop()
 
     asyncio.run(exercise())
 
 
-def test_cross_venue_qualified_signal_schedules_ready_before_shadow(tmp_path: Path) -> None:
+def test_cross_venue_qualified_signal_schedules_ready_before_shadow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    tasks = _ObservationTasks(monkeypatch)
+
     async def exercise() -> None:
         store = PredictionArbitrageStore(tmp_path / "data")
         events: list[str] = []
@@ -2755,7 +2868,7 @@ def test_cross_venue_qualified_signal_schedules_ready_before_shadow(tmp_path: Pa
                 "codex_approval": {"decision": "APPROVE"},
             }
         )
-        await asyncio.sleep(0)
+        await tasks.drain()
         assert events == ["ready", "shadow"]
         assert shadow[0][0] == "cross:pair:PREDICT_YES_POLYMARKET_NO"
 
@@ -2864,9 +2977,7 @@ def test_monitor_uses_fixed_fifteen_minute_discovery_and_invalidates_changed_fin
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def exercise() -> None:
-        from open_trader import predict_cross_venue as module
-
-        monkeypatch.setattr(module, "CROSS_VENUE_DISCOVERY_SECONDS", 0.02)
+        cycles = _DiscoveryCycles(monkeypatch)
         original = monitor_predict_market(external_ids=("poly-condition",))
         changed = replace(original, rules_fingerprint="changed-fingerprint")
         predict = FakeCrossVenuePredict((original,))
@@ -2881,7 +2992,7 @@ def test_monitor_uses_fixed_fifteen_minute_discovery_and_invalidates_changed_fin
             def validate(self, pair: ExplicitMarketPair) -> CrossVenueValidation:
                 if self.calls:
                     self.second_started.set()
-                    self.release_second.wait(timeout=1)
+                    self.release_second.wait()
                 return super().validate(pair)
 
         validator = BlockingValidator()
@@ -2894,22 +3005,32 @@ def test_monitor_uses_fixed_fifteen_minute_discovery_and_invalidates_changed_fin
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
 
-        await monitor.start()
-        await wait_until(lambda: bool(predict.subscriptions))
-        assert len(validator.calls) == 1
-        for _ in range(3):
-            await predict.queue.put(monitor_predict_book())
-        monitor.snapshot()
-        await asyncio.sleep(0.005)
-        assert len(validator.calls) == 1
-        predict.markets = (changed,)
-        await wait_until(validator.second_started.is_set)
-        assert polymarket.token_sets[-1] == ()
-        await wait_until(lambda: ("predict-market-1",) not in predict.active_subscriptions)
-        assert validator.release_second.is_set() is False
-        validator.release_second.set()
-        await wait_until(lambda: len(validator.calls) == 2)
-        await monitor.stop()
+        try:
+            await monitor.start()
+            await wait_until(lambda: cycles.waiting == 1)
+            await wait_until(lambda: bool(predict.subscriptions))
+            assert len(validator.calls) == 1
+            for _ in range(3):
+                await predict.queue.put(monitor_predict_book())
+            monitor.snapshot()
+            polymarket.release.set()
+            await _drain_books(predict, monitor)
+            assert len(validator.calls) == 1
+            predict.markets = (changed,)
+            cycles.trigger()
+            await wait_until(validator.second_started.is_set)
+            assert polymarket.token_sets[-1] == ()
+            await wait_until(lambda: ("predict-market-1",) not in predict.active_subscriptions)
+            assert validator.release_second.is_set() is False
+            validator.release_second.set()
+            await wait_until(lambda: cycles.completed == 1)
+            assert len(validator.calls) == 2
+            await monitor.stop()
+
+        finally:
+            validator.release_second.set()
+            polymarket.release.set()
+            await monitor.stop()
 
     assert predict_cross_venue.CROSS_VENUE_DISCOVERY_SECONDS == 15 * 60
     asyncio.run(exercise())
@@ -2928,9 +3049,7 @@ def test_monitor_discovery_evicts_before_one_re_admission_for_changed_inputs(
     monkeypatch: pytest.MonkeyPatch, mutate,
 ) -> None:
     async def exercise() -> None:
-        from open_trader import predict_cross_venue as module
-
-        monkeypatch.setattr(module, "CROSS_VENUE_DISCOVERY_SECONDS", 0.02)
+        cycles = _DiscoveryCycles(monkeypatch)
         original = monitor_predict_market(external_ids=("poly-condition",))
         predict = FakeCrossVenuePredict((original,))
         polymarket = FakeCrossVenuePolymarket()
@@ -2944,7 +3063,7 @@ def test_monitor_discovery_evicts_before_one_re_admission_for_changed_inputs(
             def validate(self, pair: ExplicitMarketPair) -> CrossVenueValidation:
                 if self.calls:
                     self.second_started.set()
-                    self.release_second.wait(timeout=1)
+                    self.release_second.wait()
                 return super().validate(pair)
 
         validator = BlockingValidator()
@@ -2958,17 +3077,26 @@ def test_monitor_discovery_evicts_before_one_re_admission_for_changed_inputs(
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
 
-        await monitor.start()
-        await wait_until(lambda: len(validator.calls) == 1)
-        predict.markets = (mutate(original),)
-        await wait_until(validator.second_started.is_set)
-        assert monitor.snapshot()["funnel"]["codex_approved_pairs"] == 0
-        validator.release_second.set()
-        await wait_until(lambda: len(validator.calls) == 2)
-        assert monitor.snapshot()["funnel"]["codex_approved_pairs"] == 1
-        await asyncio.sleep(0.005)
-        assert len(validator.calls) == 2
-        await monitor.stop()
+        try:
+            await monitor.start()
+            await wait_until(lambda: cycles.waiting == 1)
+            await wait_until(lambda: monitor.snapshot()["funnel"]["codex_approved_pairs"] == 1)
+            predict.markets = (mutate(original),)
+            cycles.trigger()
+            await wait_until(validator.second_started.is_set)
+            assert monitor.snapshot()["funnel"]["codex_approved_pairs"] == 0
+            validator.release_second.set()
+            await wait_until(lambda: cycles.completed == 1)
+            assert len(validator.calls) == 2
+            assert monitor.snapshot()["funnel"]["codex_approved_pairs"] == 1
+            await cycles.next()
+            assert len(validator.calls) == 2
+            await monitor.stop()
+
+        finally:
+            validator.release_second.set()
+            polymarket.release.set()
+            await monitor.stop()
 
     asyncio.run(exercise())
 
@@ -2977,9 +3105,7 @@ def test_monitor_discovery_re_admits_once_when_prompt_version_changes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def exercise() -> None:
-        from open_trader import predict_cross_venue as module
-
-        monkeypatch.setattr(module, "CROSS_VENUE_DISCOVERY_SECONDS", 0.02)
+        cycles = _DiscoveryCycles(monkeypatch)
         predict = FakeCrossVenuePredict((monitor_predict_market(external_ids=("poly-condition",)),))
         polymarket = FakeCrossVenuePolymarket()
 
@@ -2993,7 +3119,7 @@ def test_monitor_discovery_re_admits_once_when_prompt_version_changes(
             def validate(self, pair: ExplicitMarketPair) -> CrossVenueValidation:
                 if self.calls:
                     self.second_started.set()
-                    self.release_second.wait(timeout=1)
+                    self.release_second.wait()
                 return super().validate(pair)
 
         validator = BlockingValidator()
@@ -3004,17 +3130,26 @@ def test_monitor_discovery_re_admits_once_when_prompt_version_changes(
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
 
-        await monitor.start()
-        await wait_until(lambda: len(validator.calls) == 1)
-        validator.prompt_version = "v2"
-        await wait_until(validator.second_started.is_set)
-        assert monitor.snapshot()["funnel"]["codex_approved_pairs"] == 0
-        validator.release_second.set()
-        await wait_until(lambda: len(validator.calls) == 2)
-        assert monitor.snapshot()["funnel"]["codex_approved_pairs"] == 1
-        await asyncio.sleep(0.005)
-        assert len(validator.calls) == 2
-        await monitor.stop()
+        try:
+            await monitor.start()
+            await wait_until(lambda: cycles.waiting == 1)
+            await wait_until(lambda: monitor.snapshot()["funnel"]["codex_approved_pairs"] == 1)
+            validator.prompt_version = "v2"
+            cycles.trigger()
+            await wait_until(validator.second_started.is_set)
+            assert monitor.snapshot()["funnel"]["codex_approved_pairs"] == 0
+            validator.release_second.set()
+            await wait_until(lambda: cycles.completed == 1)
+            assert len(validator.calls) == 2
+            assert monitor.snapshot()["funnel"]["codex_approved_pairs"] == 1
+            await cycles.next()
+            assert len(validator.calls) == 2
+            await monitor.stop()
+
+        finally:
+            validator.release_second.set()
+            polymarket.release.set()
+            await monitor.stop()
 
     asyncio.run(exercise())
 
@@ -3059,20 +3194,25 @@ def test_monitor_suspends_during_hidden_predict_reconnect_and_rearms_after_fresh
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
 
-        await monitor.start()
-        await wait_until(lambda: bool(monitor.snapshot()["opportunities"]))
-        predict.disconnect.set()
-        await predict.disconnected.wait()
+        try:
+            await monitor.start()
+            await wait_until(lambda: bool(monitor.snapshot()["opportunities"]))
+            predict.disconnect.set()
+            await asyncio.wait_for(predict.disconnected.wait(), timeout=0.5)
 
-        await wait_until(lambda: polymarket.token_sets[-1] == ())
-        assert monitor.snapshot()["opportunities"] == []
-        assert predict.active_subscriptions == {("predict-market-1",)}
+            await wait_until(lambda: polymarket.token_sets[-1] == ())
+            assert monitor.snapshot()["opportunities"] == []
+            assert predict.active_subscriptions == {("predict-market-1",)}
 
-        predict.reconnect.set()
-        await wait_until(lambda: polymarket.token_sets[-1] == ("poly-no-1", "poly-yes-1"))
-        await wait_until(lambda: bool(monitor.snapshot()["opportunities"]))
-        assert predict.subscriptions == [("predict-market-1",)]
-        await monitor.stop()
+            predict.reconnect.set()
+            await wait_until(lambda: polymarket.token_sets[-1] == ("poly-no-1", "poly-yes-1"))
+            await wait_until(lambda: bool(monitor.snapshot()["opportunities"]))
+            assert predict.subscriptions == [("predict-market-1",)]
+            await monitor.stop()
+
+        finally:
+            predict.reconnect.set()
+            await monitor.stop()
 
     asyncio.run(exercise())
 
@@ -3081,9 +3221,7 @@ def test_monitor_slow_codex_validation_does_not_pause_hot_books(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def exercise() -> None:
-        from open_trader import predict_cross_venue as module
-
-        monkeypatch.setattr(module, "CROSS_VENUE_DISCOVERY_SECONDS", 0.02)
+        cycles = _DiscoveryCycles(monkeypatch)
         original = monitor_predict_market(external_ids=("poly-condition",))
         predict = FakeCrossVenuePredict((original,))
         polymarket = FakeCrossVenuePolymarket()
@@ -3098,7 +3236,7 @@ def test_monitor_slow_codex_validation_does_not_pause_hot_books(
             def validate(self, pair: ExplicitMarketPair) -> CrossVenueValidation:
                 if self.calls:
                     self.second_started.set()
-                    self.release_second.wait(timeout=1)
+                    self.release_second.wait()
                 return super().validate(pair)
 
         validator = BlockingValidator()
@@ -3111,17 +3249,25 @@ def test_monitor_slow_codex_validation_does_not_pause_hot_books(
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
 
-        await monitor.start()
-        await wait_until(lambda: bool(predict.subscriptions))
-        predict.markets = (original, rejected_predict_market())
-        await wait_until(validator.second_started.is_set)
+        try:
+            await monitor.start()
+            await wait_until(lambda: cycles.waiting == 1)
+            await wait_until(lambda: bool(predict.subscriptions))
+            predict.markets = (original, rejected_predict_market())
+            cycles.trigger()
+            await wait_until(validator.second_started.is_set)
 
-        await predict.queue.put(monitor_predict_book())
+            await predict.queue.put(monitor_predict_book())
 
-        await wait_until(lambda: bool(monitor.snapshot()["opportunities"]))
-        assert validator.release_second.is_set() is False
-        validator.release_second.set()
-        await monitor.stop()
+            await wait_until(lambda: bool(monitor.snapshot()["opportunities"]))
+            assert validator.release_second.is_set() is False
+            validator.release_second.set()
+            await monitor.stop()
+
+        finally:
+            validator.release_second.set()
+            polymarket.release.set()
+            await monitor.stop()
 
     asyncio.run(exercise())
 

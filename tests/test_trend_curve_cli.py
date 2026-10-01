@@ -10,6 +10,7 @@ import os
 import subprocess
 import sqlite3
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -106,6 +107,64 @@ def _write_daily_hermes_success(path: Path) -> None:
         encoding="utf-8",
     )
     path.chmod(path.stat().st_mode | 0o111)
+
+
+class _DailyModuleProxy:
+    """Keep subprocess and clock overrides local to the researched module."""
+
+    def __init__(self, module, **overrides):
+        self._module = module
+        self.__dict__.update(overrides)
+
+    def __getattr__(self, name):
+        return getattr(self._module, name)
+
+
+@pytest.fixture
+def daily_hermes_runner(monkeypatch: pytest.MonkeyPatch):
+    """Exercise CLI business rules and real receipt parsing without spawn speed.
+
+    Only registered Hermes executables are intercepted. OpenSSL and explicit
+    fresh-process persistence checks remain real; process protocol/deadlines
+    have separate integration tests below.
+    """
+    routes = {}
+
+    def register(executable, *, capture=None, capture_kind="run", receipt=None, timeout=1.0):
+        routes[str(executable.resolve())] = (capture, capture_kind, receipt, timeout)
+
+    def run(argv, **kwargs):
+        route = routes.get(str(argv[0]))
+        if route is None:
+            return subprocess.run(argv, **kwargs)
+        capture, capture_kind, receipt, timeout = route
+        assert kwargs == {
+            "capture_output": True, "check": False, "text": True,
+            "timeout": timeout, "shell": False,
+        }
+        summary = Path(argv[7])
+        assert argv == [
+            str(Path(argv[0]).resolve()), "send", "--to", "feishu",
+            "--subject", "Trend curve daily", "--file", str(summary.resolve()), "--json",
+        ]
+        summary_text = summary.read_text(encoding="utf-8")
+        assert json.loads(summary_text)["delivery_status"] == "unknown"
+        if capture is not None:
+            if capture_kind == "summary":
+                capture.write_text(summary_text, encoding="utf-8")
+            else:
+                captured = json.dumps(argv[1:]) if capture_kind == "argv" else capture_kind
+                with capture.open("a", encoding="utf-8") as handle:
+                    handle.write(captured + "\n")
+        payload = receipt(argv, timeout) if callable(receipt) else receipt
+        if payload is None:
+            payload = {"success": True, "platform": "feishu", "message_id": "test-message"}
+        return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+
+    monkeypatch.setattr(
+        trend_curve_research, "subprocess", _DailyModuleProxy(subprocess, run=run),
+    )
+    return register
 
 
 def _write_cli_inputs(database: Path, prices: Path) -> None:
@@ -944,6 +1003,7 @@ def test_daily_recovers_after_login_without_waiting_for_tomorrow(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    daily_hermes_runner,
 ) -> None:
     mappings_root = tmp_path / "mappings"
     mapping_rows = {
@@ -981,14 +1041,8 @@ def test_daily_recovers_after_login_without_waiting_for_tomorrow(
 
     hermes_capture = tmp_path / "hermes.log"
     hermes = tmp_path / "hermes-fake"
-    hermes.write_text(
-        f"#!{sys.executable}\n"
-        "import pathlib, sys\n"
-        f"pathlib.Path({str(hermes_capture)!r}).open('a', encoding='utf-8').write('run\\n')\n"
-        "print('{\"success\": true, \"platform\": \"feishu\", \"message_id\": \"m\"}')\n",
-        encoding="utf-8",
-    )
-    hermes.chmod(hermes.stat().st_mode | 0o111)
+    _write_daily_hermes_success(hermes)
+    daily_hermes_runner(hermes, capture=hermes_capture)
 
     # Reproduce unrelated "222" digits while keeping every report path unique.
     summary_stamps = count(1790804822251748795)
@@ -1141,6 +1195,7 @@ def test_daily_catches_up_once_after_missed_noon(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    daily_hermes_runner,
 ) -> None:
     mappings_root = tmp_path / "mappings"
     mapping = {
@@ -1158,14 +1213,8 @@ def test_daily_catches_up_once_after_missed_noon(
     )
     hermes_capture = tmp_path / "hermes.log"
     hermes = tmp_path / "hermes-fake"
-    hermes.write_text(
-        f"#!{sys.executable}\n"
-        "import pathlib\n"
-        f"pathlib.Path({str(hermes_capture)!r}).open('a', encoding='utf-8').write('run\\n')\n"
-        "print('{\"success\": true, \"platform\": \"feishu\", \"message_id\": \"m\"}')\n",
-        encoding="utf-8",
-    )
-    hermes.chmod(hermes.stat().st_mode | 0o111)
+    _write_daily_hermes_success(hermes)
+    daily_hermes_runner(hermes, capture=hermes_capture)
     database = tmp_path / "history.sqlite3"
     config = tmp_path / "daily.json"
     config.write_text(
@@ -1284,6 +1333,7 @@ def test_daily_checks_wait_after_stable_failure_but_continue_budget(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    daily_hermes_runner,
 ) -> None:
     mappings_root = tmp_path / "mappings"
     mapping_rows = {
@@ -1335,6 +1385,7 @@ def test_daily_checks_wait_after_stable_failure_but_continue_budget(
         config = tmp_path / f"failure-{mode}.json"
         hermes_capture = tmp_path / f"failure-{mode}-hermes.log"
         hermes = tmp_path / f"failure-{mode}-hermes"
+        # Keep real child-process capture if a forbidden send is attempted.
         hermes.write_text(
             f"#!{sys.executable}\n"
             "import pathlib\n"
@@ -1343,6 +1394,7 @@ def test_daily_checks_wait_after_stable_failure_but_continue_budget(
             encoding="utf-8",
         )
         hermes.chmod(hermes.stat().st_mode | 0o111)
+        daily_hermes_runner(hermes, capture=hermes_capture, capture_kind="send")
         config.write_text(
             json.dumps(
                 {
@@ -1468,6 +1520,7 @@ def test_daily_checks_wait_after_stable_failure_but_continue_budget(
     budget_hermes_capture = tmp_path / "budget-hermes.log"
     budget_hermes = tmp_path / "budget-hermes"
     _write_daily_hermes_success(budget_hermes)
+    daily_hermes_runner(budget_hermes)
     budget_config.write_text(
         json.dumps(
             {
@@ -1532,6 +1585,7 @@ def test_daily_prioritizes_previous_uncovered_targets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    daily_hermes_runner,
 ) -> None:
     mappings_root = tmp_path / "mappings"
     mapping_rows = {
@@ -1567,12 +1621,8 @@ def test_daily_prioritizes_previous_uncovered_targets(
             json.dumps(row), encoding="utf-8"
         )
     hermes = tmp_path / "hermes-fake"
-    hermes.write_text(
-        f"#!{sys.executable}\n"
-        "print('{\"success\": true, \"platform\": \"feishu\", \"message_id\": \"m\"}')\n",
-        encoding="utf-8",
-    )
-    hermes.chmod(hermes.stat().st_mode | 0o111)
+    _write_daily_hermes_success(hermes)
+    daily_hermes_runner(hermes)
     database = tmp_path / "history.sqlite3"
     config = tmp_path / "daily.json"
     config_payload = {
@@ -1737,6 +1787,7 @@ def test_daily_prioritizes_uncovered_targets_after_missed_days(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    daily_hermes_runner,
 ) -> None:
     mappings_root = tmp_path / "mappings"
     mapping_rows = {
@@ -1776,14 +1827,8 @@ def test_daily_prioritizes_uncovered_targets_after_missed_days(
     config = tmp_path / "daily.json"
     hermes_capture = tmp_path / "hermes.log"
     hermes = tmp_path / "hermes-fake"
-    hermes.write_text(
-        f"#!{sys.executable}\n"
-        "import pathlib\n"
-        f"pathlib.Path({str(hermes_capture)!r}).open('a', encoding='utf-8').write('run\\n')\n"
-        "print('{\"success\": true, \"platform\": \"feishu\", \"message_id\": \"m\"}')\n",
-        encoding="utf-8",
-    )
-    hermes.chmod(hermes.stat().st_mode | 0o111)
+    _write_daily_hermes_success(hermes)
+    daily_hermes_runner(hermes, capture=hermes_capture)
     config_payload = {
         "coverage": "cached",
         "database": str(database),
@@ -1923,6 +1968,7 @@ def test_daily_prioritizes_gaps_using_each_prior_frozen_scope(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    daily_hermes_runner,
 ) -> None:
     mapping_rows = {
         "CN": {
@@ -2021,6 +2067,7 @@ def test_daily_prioritizes_gaps_using_each_prior_frozen_scope(
 
     hermes = tmp_path / "hermes-fake"
     _write_daily_hermes_success(hermes)
+    daily_hermes_runner(hermes)
     healthy_response = _daily_encrypted_curve_payload(_daily_supplier_payload())
     requests: list[int] = []
 
@@ -2210,6 +2257,7 @@ def test_manual_pause_overrides_all_automatic_triggers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    daily_hermes_runner,
 ) -> None:
     mappings_root = tmp_path / "mappings"
     mapping_rows = {
@@ -2238,6 +2286,7 @@ def test_manual_pause_overrides_all_automatic_triggers(
         )
     hermes_capture = tmp_path / "hermes.log"
     hermes = tmp_path / "hermes-fake"
+    # Keep real child-process capture if a forbidden send is attempted.
     hermes.write_text(
         f"#!{sys.executable}\n"
         f"import pathlib\npathlib.Path({str(hermes_capture)!r}).open('a', encoding='utf-8').write('run\\n')\n"
@@ -2245,6 +2294,7 @@ def test_manual_pause_overrides_all_automatic_triggers(
         encoding="utf-8",
     )
     hermes.chmod(hermes.stat().st_mode | 0o111)
+    daily_hermes_runner(hermes, capture=hermes_capture)
     database = tmp_path / "history.sqlite3"
     config = tmp_path / "daily.json"
     config.write_text(
@@ -3182,6 +3232,7 @@ def test_daily_freezes_mapping_scope_and_resumes_by_observation_day(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    daily_hermes_runner,
 ) -> None:
     mappings_root = tmp_path / "mappings"
     mapping_rows = {
@@ -3221,6 +3272,7 @@ def test_daily_freezes_mapping_scope_and_resumes_by_observation_day(
     config_path = tmp_path / "trend-curve-daily.json"
     hermes = tmp_path / "hermes-fake"
     _write_daily_hermes_success(hermes)
+    daily_hermes_runner(hermes)
     config_path.write_text(
         json.dumps(
             {
@@ -3502,6 +3554,7 @@ def test_daily_auth_block_waits_for_changed_credentials(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    daily_hermes_runner,
 ) -> None:
     mappings_root = tmp_path / "mappings"
     mapping_rows = {
@@ -3541,6 +3594,7 @@ def test_daily_auth_block_waits_for_changed_credentials(
     config_path = tmp_path / "trend-curve-daily.json"
     hermes = tmp_path / "hermes-fake"
     _write_daily_hermes_success(hermes)
+    daily_hermes_runner(hermes)
     config_path.write_text(
         json.dumps(
             {
@@ -3736,6 +3790,7 @@ def test_daily_auth_block_survives_observation_day_change(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    daily_hermes_runner,
 ) -> None:
     mappings_root = tmp_path / "mappings"
     mapping_rows = {
@@ -3775,6 +3830,7 @@ def test_daily_auth_block_survives_observation_day_change(
     config_path = tmp_path / "trend-curve-daily.json"
     hermes = tmp_path / "hermes-fake"
     _write_daily_hermes_success(hermes)
+    daily_hermes_runner(hermes)
     config_path.write_text(
         json.dumps(
             {
@@ -4039,6 +4095,7 @@ def test_daily_budget_preserves_progress_and_sends_one_summary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    daily_hermes_runner,
 ) -> None:
     mappings_root = tmp_path / "mappings"
     mapping_rows = {
@@ -4076,23 +4133,21 @@ def test_daily_budget_preserves_progress_and_sends_one_summary(
 
     hermes_capture = tmp_path / "hermes-argv.log"
     hermes = tmp_path / "hermes-fake"
-    hermes.write_text(
-        f"#!{sys.executable}\n"
-        "import json, os, pathlib, sys, time\n"
-        "capture = pathlib.Path(os.environ['OPEN_TRADER_TEST_HERMES_CAPTURE'])\n"
-        "with capture.open('a', encoding='utf-8') as handle:\n"
-        "    handle.write(json.dumps(sys.argv[1:]) + '\\n')\n"
-        "mode = os.environ.get('OPEN_TRADER_TEST_HERMES_MODE', 'success')\n"
-        "if mode == 'timeout':\n"
-        "    time.sleep(1.0)\n"
-        "elif mode == 'failed':\n"
-        "    print(json.dumps({'success': True, 'platform': 'feishu',\n"
-        "        'message_id': '', 'error': os.environ.get('OPEN_TRADER_TEST_HERMES_SECRET')}))\n"
-        "else:\n"
-        "    print(json.dumps({'success': True, 'platform': 'feishu', 'message_id': 'fake-message'}))\n",
-        encoding="utf-8",
+    _write_daily_hermes_success(hermes)
+
+    def hermes_receipt(argv, timeout):
+        mode = os.environ.get("OPEN_TRADER_TEST_HERMES_MODE", "success")
+        if mode == "timeout":
+            raise subprocess.TimeoutExpired(argv, timeout)
+        if mode == "failed":
+            return {"success": True, "platform": "feishu", "message_id": "",
+                    "error": os.environ.get("OPEN_TRADER_TEST_HERMES_SECRET")}
+        return {"success": True, "platform": "feishu", "message_id": "fake-message"}
+
+    daily_hermes_runner(
+        hermes, capture=hermes_capture, capture_kind="argv",
+        receipt=hermes_receipt, timeout=0.5,
     )
-    hermes.chmod(hermes.stat().st_mode | 0o111)
     monkeypatch.setenv("OPEN_TRADER_TEST_HERMES_CAPTURE", str(hermes_capture))
     hermes_secret = "hermes-secret-token-user-987654321"
     monkeypatch.setenv("OPEN_TRADER_TEST_HERMES_SECRET", hermes_secret)
@@ -4332,12 +4387,14 @@ def test_daily_budget_preserves_progress_and_sends_one_summary(
             "data": {"encryptedData": healthy_response},
         }
 
-    monkeypatch.setattr(trend_curve_research.time, "monotonic", deadline_clock)
+    real_monotonic, real_sleep = time.monotonic, time.sleep
     monkeypatch.setattr(
-        trend_curve_research.time,
-        "sleep",
-        lambda seconds: sleeps.append(seconds),
+        trend_curve_research, "time", _DailyModuleProxy(
+            time, monotonic=deadline_clock, sleep=lambda seconds: sleeps.append(seconds),
+        ),
     )
+    assert time.monotonic is real_monotonic
+    assert time.sleep is real_sleep
     monkeypatch.setattr(trend_curve_research, "_default_curve_transport", deadline_transport)
     monkeypatch.setenv("OPEN_TRADER_TEST_HERMES_MODE", "success")
     deadline_exit = cli.main(
@@ -4395,6 +4452,7 @@ def test_daily_enforces_request_interval_and_post_sleep_deadline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    daily_hermes_runner,
 ) -> None:
     mappings_root = tmp_path / "mappings"
     for market, symbol, trend_symbol, futu_symbol, tm_id in (
@@ -4418,6 +4476,7 @@ def test_daily_enforces_request_interval_and_post_sleep_deadline(
     healthy_response = _daily_encrypted_curve_payload(_daily_supplier_payload())
     hermes = tmp_path / "hermes-fake"
     _write_daily_hermes_success(hermes)
+    daily_hermes_runner(hermes)
     current_now = datetime(2026, 9, 9, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
     monkeypatch.setattr(cli, "_trend_curve_daily_now", lambda: current_now)
     monkeypatch.setattr(
@@ -4543,6 +4602,7 @@ def test_daily_summary_keeps_large_gap_details_out_of_message(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    daily_hermes_runner,
 ) -> None:
     mappings_root = tmp_path / "mappings"
     for index in range(13):
@@ -4565,15 +4625,8 @@ def test_daily_summary_keeps_large_gap_details_out_of_message(
     config = tmp_path / "daily.json"
     notification_capture = tmp_path / "notification.json"
     hermes = tmp_path / "hermes-fake"
-    hermes.write_text(
-        f"#!{sys.executable}\n"
-        "import json, pathlib, sys\n"
-        "summary = pathlib.Path(sys.argv[sys.argv.index('--file') + 1])\n"
-        f"pathlib.Path({str(notification_capture)!r}).write_text(summary.read_text(encoding='utf-8'), encoding='utf-8')\n"
-        "print(json.dumps({'success': True, 'platform': 'feishu', 'message_id': 'm'}))\n",
-        encoding="utf-8",
-    )
-    hermes.chmod(hermes.stat().st_mode | 0o111)
+    _write_daily_hermes_success(hermes)
+    daily_hermes_runner(hermes, capture=notification_capture, capture_kind="summary")
     config.write_text(
         json.dumps(
             {
@@ -4680,6 +4733,7 @@ def test_daily_rejects_contradictory_hermes_receipts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    daily_hermes_runner,
 ) -> None:
     mappings_root = tmp_path / "mappings"
     mapping_directory = mappings_root / "CN"
@@ -4700,14 +4754,11 @@ def test_daily_rejects_contradictory_hermes_receipts(
     response = _daily_encrypted_curve_payload(_daily_supplier_payload())
     hermes_capture = tmp_path / "hermes-invocations.log"
     hermes = tmp_path / "hermes-fake"
-    hermes.write_text(
-        f"#!{sys.executable}\n"
-        "import json, os, pathlib\n"
-        "pathlib.Path(os.environ['OPEN_TRADER_TEST_HERMES_CAPTURE']).open('a', encoding='utf-8').write('run\\n')\n"
-        "print(os.environ['OPEN_TRADER_TEST_HERMES_RECEIPT'])\n",
-        encoding="utf-8",
+    _write_daily_hermes_success(hermes)
+    daily_hermes_runner(
+        hermes, capture=hermes_capture,
+        receipt=lambda *_: json.loads(os.environ["OPEN_TRADER_TEST_HERMES_RECEIPT"]),
     )
-    hermes.chmod(hermes.stat().st_mode | 0o111)
     monkeypatch.setattr(
         trend_curve_research,
         "read_wechat_mini_credentials",
@@ -4921,3 +4972,113 @@ def test_daily_preserves_unknown_delivery_on_interruption(
             complete_payload["delivery_status"],
             len(invocations),
         ) == (0, "", "complete", "not_run", index + 1)
+
+
+@pytest.fixture
+def daily_real_processes(monkeypatch: pytest.MonkeyPatch):
+    """Observe stdlib child ownership; a separate real watchdog prevents leaks."""
+    children = []
+    watchdog_expired = threading.Event()
+    real_popen = subprocess.Popen
+
+    def recording_popen(*args, **kwargs):
+        child = real_popen(*args, **kwargs)
+        children.append(child)
+        return child
+
+    def stop_stalled_children():
+        watchdog_expired.set()
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+
+    # subprocess.run resolves Popen in its own module. This observes process
+    # creation only; no clock, timeout or communicate behavior is overridden.
+    monkeypatch.setattr(subprocess, "Popen", recording_popen)
+    watchdog = threading.Timer(5.0, stop_stalled_children)
+    watchdog.start()
+    try:
+        yield children, watchdog_expired
+    finally:
+        watchdog.cancel()
+        watchdog.join(timeout=2)
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=2)
+            for handle in (child.stdin, child.stdout, child.stderr):
+                if handle is not None:
+                    handle.close()
+
+
+@pytest.mark.parametrize("contradictory", [False, True])
+def test_daily_hermes_real_cold_start_protocol(
+    tmp_path: Path, daily_real_processes, contradictory: bool,
+) -> None:
+    """Keep the original 1s local cold-start budget as real integration coverage."""
+    summary = tmp_path / "summary.json"
+    summary.write_text(json.dumps({"delivery_status": "unknown", "completed_count": 1}))
+    capture = tmp_path / "capture.json"
+    hermes = tmp_path / "hermes-real-protocol"
+    receipt = {"success": True, "platform": "feishu", "message_id": "real-child"}
+    if contradictory:
+        receipt["error"] = "contradictory"
+    hermes.write_text(
+        f"#!{sys.executable}\n"
+        "import json, pathlib, sys\n"
+        "summary = pathlib.Path(sys.argv[sys.argv.index('--file') + 1])\n"
+        f"pathlib.Path({str(capture)!r}).write_text(json.dumps({{'argv': sys.argv[1:], 'summary': json.loads(summary.read_text())}}))\n"
+        f"print({json.dumps(receipt)!r})\n",
+        encoding="utf-8",
+    )
+    hermes.chmod(hermes.stat().st_mode | 0o111)
+    children, watchdog_expired = daily_real_processes
+
+    result = trend_curve_research._daily_delivery_status(hermes, summary, 1.0)
+
+    assert result == ("failed" if contradictory else "accepted")
+    captured = json.loads(capture.read_text())
+    assert captured == {
+        "argv": ["send", "--to", "feishu", "--subject", "Trend curve daily",
+                 "--file", str(summary.resolve()), "--json"],
+        "summary": {"delivery_status": "unknown", "completed_count": 1},
+    }
+    assert len(children) == 1
+    assert children[0].returncode == 0
+    assert children[0].stdout.closed and children[0].stderr.closed
+    assert not watchdog_expired.is_set()
+
+
+def test_daily_hermes_startup_inclusive_timeout_kills_and_reaps_child(
+    tmp_path: Path, daily_real_processes,
+) -> None:
+    """The real 0.5s timeout includes cold startup; no ready-phase warmup."""
+    summary = tmp_path / "summary.json"
+    summary.write_text(json.dumps({"delivery_status": "unknown"}))
+    hermes = tmp_path / "hermes-real-timeout"
+    hermes.write_text(
+        f"#!{sys.executable}\n"
+        "import threading\n"
+        "threading.Event().wait()\n",
+        encoding="utf-8",
+    )
+    hermes.chmod(hermes.stat().st_mode | 0o111)
+    children, watchdog_expired = daily_real_processes
+    started = time.monotonic()
+
+    result = trend_curve_research._daily_delivery_status(hermes, summary, 0.5)
+
+    assert result == "unknown"
+    assert time.monotonic() - started >= 0.5
+    assert len(children) == 1
+    assert children[0].returncode is not None and children[0].returncode != 0
+    assert children[0].stdout.closed and children[0].stderr.closed
+    assert not watchdog_expired.is_set(), "The production timeout did not reclaim its child"
+
+
+def test_daily_hermes_process_start_failure_is_failed(tmp_path: Path) -> None:
+    summary = tmp_path / "summary.json"
+    summary.write_text(json.dumps({"delivery_status": "unknown"}))
+    assert trend_curve_research._daily_delivery_status(
+        tmp_path / "missing-hermes", summary, 1.0,
+    ) == "failed"

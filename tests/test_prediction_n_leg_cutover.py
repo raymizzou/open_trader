@@ -14,6 +14,7 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -62,8 +63,11 @@ def _create_plain_execution(
     }
     if total_max_cost is not None:
         payload["total_max_cost"] = total_max_cost
-    preview_id = store.create_preview(payload, expires_at=_preview_expiry())
-    execution = store.consume_preview_and_create_execution(preview_id, f"key-{market_id}")
+    now = datetime.now(UTC)
+    with patch("open_trader.prediction_arbitrage_store._utc_now", return_value=now.isoformat()):
+        preview_id = store.create_preview(payload, expires_at=_preview_expiry())
+        execution = store.consume_preview_and_create_execution(preview_id, f"key-{market_id}")
+
     return str(execution["execution_id"])
 
 

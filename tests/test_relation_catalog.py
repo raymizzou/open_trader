@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -10,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from timing_support import run_test_in_subprocess
 
 import open_trader.cli as cli
 from open_trader.relation_catalog import (
@@ -633,8 +635,9 @@ def test_cli_catalog_cleanup_apply(
 
 
 def test_concurrent_readers_on_shared_catalog_do_not_nest_transactions(
-    tmp_path: Path,
-) -> None:
+    tmp_path: Path, request) -> None:
+    if run_test_in_subprocess(request):
+        return
     catalog = RelationCatalog(tmp_path)
     version_id = catalog.ingest(discovery())["version_id"]
     catalog.approve(version_id, {"version_id": version_id}, actor="op", git_sha="a" * 40)
@@ -647,7 +650,10 @@ def test_concurrent_readers_on_shared_catalog_do_not_nest_transactions(
         _ = catalog._store["generation_number"]
         _ = catalog._store["versions"]
 
+    start = Barrier(6)
+
     def reader() -> None:
+        start.wait(timeout=5)
         for _ in range(100):
             try:
                 read_once()

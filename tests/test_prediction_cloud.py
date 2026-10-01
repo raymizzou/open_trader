@@ -330,7 +330,9 @@ class Handler(BaseHTTPRequestHandler):
    body=json.dumps(dict(state='ready',orders=[],positions=[],recommendations=[])).encode();self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body);return
   body=json.dumps(state).encode();self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
  def log_message(self,*a):pass
-HTTPServer(('127.0.0.1',8769),Handler).serve_forever()
+server=HTTPServer(('127.0.0.1',0),Handler)
+(runtime/'listener.json').write_text(json.dumps(dict(pid=os.getpid(),port=server.server_port)))
+server.serve_forever()
 ''')
     for args in [('init','-q'),('add','.'),('-c','user.name=Test','-c','user.email=t@example.invalid','commit','-qm','fixture'),('checkout','--detach')]:
         subprocess.run(['git','-C',str(release),*args],check=True,capture_output=True)
@@ -348,6 +350,21 @@ HTTPServer(('127.0.0.1',8769),Handler).serve_forever()
                   release_schema_version=cloud.RELEASE_SCHEMA,
                   n_leg=dict(status='paused',code='N_LEG_PAUSED'))
     healthfile=runtime/'health.json';healthfile.write_text(json.dumps(health))
+    # Let the fixture process own its ephemeral listener. The production
+    # contract still uses logical port 8769; only local HTTP transport maps it.
+    listener_file = runtime/'listener.json'
+    def fixture_port():
+        try:
+            value = json.loads(listener_file.read_text())
+        except (OSError, ValueError) as exc:
+            raise OSError('fixture listener is not ready') from exc
+        if value['pid'] != proc.pid:
+            raise OSError('stale fixture listener identity')
+        return value['port']
+    original_read_json, original_read_status = cloud.read_json, cloud.read_status
+    monkeypatch.setattr(cloud, 'read_json', lambda _port, path='/healthz': original_read_json(fixture_port(), path))
+    monkeypatch.setattr(cloud, 'read_status', lambda _port, path: original_read_status(fixture_port(), path))
+
     command=render_unit(cfg).split('ExecStart=',1)[1].splitlines()[0].split()
     def launch():
         references=dict(line.removeprefix('Environment=').split('=',1) for line in render_unit(cfg).splitlines() if line.startswith('Environment='))
@@ -381,11 +398,24 @@ HTTPServer(('127.0.0.1',8769),Handler).serve_forever()
         elif args[0]=='journalctl':stdout='prediction_runtime_state state=RUNNING'
         else:return original_run(args,**kwargs)
         return subprocess.CompletedProcess(args,0,stdout,'')
+    def wait_ready():
+        deadline = time.monotonic() + 2.5
+        last = None
+        while time.monotonic() < deadline:
+            assert proc.poll() is None, f"fixture exited before readiness: {proc.returncode}"
+            try:
+                value = cloud.read_json(8769)
+                if value.get('pid') == proc.pid and value.get('git_sha') == sha:
+                    return value
+                last = value
+            except OSError as exc:
+                last = exc
+            time.sleep(.05)
+        raise AssertionError(f"fixture pid={proc.pid} did not become ready: {last!r}")
+
     monkeypatch.setattr(subprocess,'run',external)
     try:
-        for _ in range(50):
-            try: cloud.read_json(8769);break
-            except OSError:time.sleep(.05)
+        wait_ready()
         with pytest.raises(ValueError,match='transition record'):
             cloud.operate(cfg,'status')
         cloud.record(cfg,'ready')
@@ -405,9 +435,7 @@ HTTPServer(('127.0.0.1',8769),Handler).serve_forever()
         proc.terminate();proc.wait(timeout=5)
         command=render_unit(cfg).split('ExecStart=',1)[1].splitlines()[0].split()
         proc=launch()
-        for _ in range(50):
-            try: cloud.read_json(8769);break
-            except OSError:time.sleep(.05)
+        wait_ready()
         cloud.record(cfg,'ready')
         assert cloud.operate(cfg,'status')['status']=='RUNNING'
         assert cloud.operate(cfg,'smoke')['status']=='BACKEND_SMOKE_OK'
@@ -417,17 +445,13 @@ HTTPServer(('127.0.0.1',8769),Handler).serve_forever()
         proc.terminate();proc.wait(timeout=5)
         command=render_unit(cfg).split('ExecStart=',1)[1].splitlines()[0].split()
         proc=launch()
-        for _ in range(50):
-            try: cloud.read_json(8769);break
-            except OSError:time.sleep(.05)
+        wait_ready()
         healthfile.write_text(json.dumps({**production_health,'production_owner':False,
                                           'mutations':'prohibited'}))
         cloud.record(cfg,'ready')
         with pytest.raises(ValueError,match='identity mismatch'): cloud.operate(cfg,'status')
         healthfile.write_text(json.dumps(health))
-        for _ in range(50):
-            try: cloud.read_json(8769);break
-            except OSError:time.sleep(.05)
+        wait_ready()
         user.pw_gid=999999
         with pytest.raises(ValueError,match='user/group mismatch'): cloud.operate(cfg,'status')
         user.pw_gid=os.getgid()
@@ -462,8 +486,13 @@ HTTPServer(('127.0.0.1',8769),Handler).serve_forever()
         assert mutations==['stop','start']
         assert cloud.operate(cfg,'stop')['status']=='STOPPED'
     finally:
-        if proc.poll() is None:proc.terminate()
-        proc.wait(timeout=5)
+        if proc.poll() is None:
+            proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
 
 
 def test_cloud_trust_rejects_writable_and_symlinked_paths(tmp_path):
