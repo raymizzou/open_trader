@@ -5,6 +5,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-01
 
+- Smoke 暂停 N-leg 负向检查补齐 split 模式 Air 身份同步：先排空切页读取，
+  再同时观察新一轮 venues/执行身份请求及前端应用完成，保留无 N-leg 请求断言。
+  完成后立即核对暂停状态，拒绝被捕获的 JSON 错误；受控延迟、错误读取及屏障变异
+  均被覆盖，相关 22 项串行/双 worker 各三轮通过；
+  浏览器仅完成静态收集，实际 Smoke 仍待授权验证，未改生产行为或部署。
+
 - PR #225 审查修复：三个提交重放到 main `4fbddaae`，保留双方变更日志、Smoke 场景、
   完整账户事实与 LP 观察日志断言；readiness 使用实际 30/60 秒阈值，批量盘口保留
   100-token 分批、8 并发和去重验证，并接入显式完成信号。生产源码与 main 一致。
