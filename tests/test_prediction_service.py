@@ -751,7 +751,6 @@ def test_lp_dashboard_shows_manual_orders_without_managing_them(
     class RewardTransport:
         def __init__(self) -> None:
             self.calls: list[tuple[str, dict[str, object]]] = []
-            self.completed = threading.Event()
 
         def get_json(self, path: str, *, params: dict[str, object]) -> object:
             self.calls.append((path, dict(params)))
@@ -771,8 +770,6 @@ def test_lp_dashboard_shows_manual_orders_without_managing_them(
                 }
             else:
                 result = {"data": [], "next_cursor": "LTE="}
-            if len(self.calls) == 3:
-                self.completed.set()
             return result
 
     reward_transport = RewardTransport()
@@ -886,7 +883,12 @@ def test_lp_dashboard_shows_manual_orders_without_managing_them(
     first = prediction_service._lp_projection_safe_value(
         service.refresh_lp_dashboard_snapshot()
     )
-    assert reward_transport.completed.wait(timeout=2)
+    reward_worker = service._lp_reward_refresh_thread
+    if reward_worker is not None:
+        reward_worker.join(timeout=2)
+        assert not reward_worker.is_alive(), "reward publication did not finish"
+    assert not service._lp_reward_refresh_pending
+    assert not service._lp_reward_refresh_active
     # Issue #146 D3: the dashboard refresh shares the trading client's
     # account TTL cache; expire it so this refresh genuinely re-attempts the
     # external read (which fails) and the stale-degradation path is kept.
@@ -1117,6 +1119,7 @@ def test_lp_dashboard_scoring_failure_keeps_last_success(tmp_path: Path) -> None
     reward_worker = service._lp_reward_refresh_thread
     if reward_worker is not None:
         reward_worker.join(timeout=2)
+        assert not reward_worker.is_alive(), "background publication did not finish"
     second = service.refresh_lp_dashboard_snapshot()
     second_order = second["orders"][0]
     assert second_order["scoring_status"] == "unknown"
@@ -1207,6 +1210,7 @@ def test_lp_dashboard_stale_cache_downgrades_scoring_unknown(tmp_path: Path) -> 
     worker = service._lp_reward_refresh_thread
     if worker is not None:
         worker.join(timeout=2)
+        assert not worker.is_alive(), "background publication did not finish"
     stale = service.refresh_lp_dashboard_snapshot()
     assert stale["state"] == "stale"
     assert stale["stale"] is True
@@ -1301,6 +1305,7 @@ def test_lp_dashboard_stale_cache_downgrades_today_orders_scoring(
     worker = service._lp_reward_refresh_thread
     if worker is not None:
         worker.join(timeout=2)
+        assert not worker.is_alive(), "background publication did not finish"
     stale = service.refresh_lp_dashboard_snapshot()
     assert stale["state"] == "stale"
     stale_row = stale["lp_orders_today"][0]
@@ -2993,6 +2998,7 @@ def test_lp_dashboard_covers_today_table_system_markets_in_reward_cache(
     worker = service._lp_reward_refresh_thread
     if worker is not None:
         worker.join(timeout=2)
+        assert not worker.is_alive(), "background publication did not finish"
     payload = service.lp_dashboard()
     reward = payload["market_rewards"]["condition-1"]
     assert reward["state"] == "known"
@@ -3189,6 +3195,7 @@ def test_lp_reward_cache_throttles_today_table_refetch_within_60s(
         worker = service._lp_reward_refresh_thread
         if worker is not None:
             worker.join(timeout=2)
+            assert not worker.is_alive(), "background publication did not finish"
 
     def served_reward() -> dict[str, object]:
         return service.lp_dashboard()["market_rewards"]["condition-1"]
@@ -3295,6 +3302,7 @@ def test_lp_reward_cache_read_failure_keeps_last_amount_as_unknown(
         worker = service._lp_reward_refresh_thread
         if worker is not None:
             worker.join(timeout=2)
+            assert not worker.is_alive(), "background publication did not finish"
 
     # 先成功一次：known 且 market_amount 落地。
     service.refresh_lp_dashboard_snapshot()
@@ -4792,6 +4800,7 @@ def test_lp_dashboard_reward_share_target_status_is_market_scoped(
             worker = service._lp_reward_refresh_thread
             if worker is not None:
                 worker.join(timeout=2)
+                assert not worker.is_alive(), "background publication did not finish"
             payload = prediction_service._lp_projection_safe_value(
                 service.refresh_lp_dashboard_snapshot()
             )
@@ -4855,6 +4864,7 @@ def test_lp_dashboard_reward_share_target_status_is_market_scoped(
             worker = getattr(execution, "_lp_reward_refresh_thread", None)
             if worker is not None:
                 worker.join(timeout=2)
+                assert not worker.is_alive(), "background publication did not finish"
             dashboard = prediction_service._lp_projection_safe_value(
                 execution.refresh_lp_dashboard_snapshot()
             )
@@ -5598,6 +5608,7 @@ def test_lp_dashboard_share_failures_preserve_unknown_without_order_writes(
         worker = getattr(service, "_lp_reward_refresh_thread", None)
         if worker is not None:
             worker.join(timeout=2)
+            assert not worker.is_alive(), "background publication did not finish"
         payload = prediction_service._lp_projection_safe_value(
             service.refresh_lp_dashboard_snapshot()
         )
@@ -7032,16 +7043,18 @@ def test_lp_same_kind_refreshes_do_not_overlap(
         daemon=True,
     )
     maintenance.start()
-    assert entered.wait(timeout=5)
-    started = time.monotonic()
-    second = service.refresh_candidate_recommendations()
-    elapsed = time.monotonic() - started
-    assert elapsed < 2
-    assert second["scanning"] is True
-    assert len(book_calls) == 1
-    release.set()
-    maintenance.join(timeout=5)
-    assert not maintenance.is_alive()
+    try:
+        assert entered.wait(timeout=5)
+        started = time.monotonic()
+        second = service.refresh_candidate_recommendations()
+        elapsed = time.monotonic() - started
+        assert elapsed < 2
+        assert second["scanning"] is True
+        assert len(book_calls) == 1
+    finally:
+        release.set()
+        maintenance.join(timeout=5)
+        assert not maintenance.is_alive()
     assert len(book_calls) == 1
 
     # The scan behaves the same way: one in-flight scan, second call returns
@@ -7073,15 +7086,17 @@ def test_lp_same_kind_refreshes_do_not_overlap(
         daemon=True,
     )
     scan.start()
-    assert entered.wait(timeout=5)
-    started = time.monotonic()
-    again = service.refresh_candidates()
-    elapsed = time.monotonic() - started
-    assert elapsed < 2
-    assert again["scanning"] is True
-    release.set()
-    scan.join(timeout=5)
-    assert not scan.is_alive()
+    try:
+        assert entered.wait(timeout=5)
+        started = time.monotonic()
+        again = service.refresh_candidates()
+        elapsed = time.monotonic() - started
+        assert elapsed < 2
+        assert again["scanning"] is True
+    finally:
+        release.set()
+        scan.join(timeout=5)
+        assert not scan.is_alive()
 
 
 def test_lp_scan_does_not_block_maintenance(
@@ -9216,7 +9231,20 @@ def test_lp_refresh_queues_work_without_trading_or_waiting_for_catalog(
             assert probe.sponsored_catalog_calls == 1
             assert probe.catalog_active == 0
             assert probe.max_catalog_active == 1
-            assert not probe.unexpected_catalog.wait(timeout=0.1)
+            # Observe the business operation itself, after preparation has
+            # published. An earlier cycle reaching idle cannot satisfy this.
+            refresh_completed = threading.Event()
+            original_refresh = runtime.lp.refresh_candidates
+
+            def observed_refresh(**kwargs):
+                result = original_refresh(**kwargs)
+                refresh_completed.set()
+                return result
+
+            monkeypatch.setattr(runtime.lp, "refresh_candidates", observed_refresh)
+            assert runtime.queue_lp_candidate_refresh() is True
+            assert refresh_completed.wait(timeout=3)
+            assert not probe.unexpected_catalog.is_set()
             assert probe.writes == []
     finally:
         probe.release_first_catalog.set()
@@ -9276,6 +9304,7 @@ def test_history_cache_ttl_expires_and_keeps_pagination_keys_separate(
 ) -> None:
     calls = 0
     clock = [0.0]
+    real_monotonic = time.monotonic
 
     def controlled_history(_store: object, **_kwargs: object) -> dict[str, object]:
         nonlocal calls
@@ -9283,7 +9312,10 @@ def test_history_cache_ttl_expires_and_keeps_pagination_keys_separate(
         return {"call": calls}
 
     monkeypatch.setattr(prediction_service, "prediction_history_payload", controlled_history)
-    monkeypatch.setattr(prediction_service.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        prediction_service, "time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    assert time.monotonic is real_monotonic
     with _running_server(_Runtime()) as (base, server):
         def get_history(query: str) -> tuple[int, dict[str, object]]:
             return _response(base + "/api/prediction-arbitrage/history?" + query)
@@ -9322,7 +9354,7 @@ def test_history_flight_failure_wakes_followers_and_recomputes(
             call = calls
         if call == 1:
             leader_entered.set()
-            assert release_leader.wait(timeout=5)
+            release_leader.wait()
             raise sqlite3.OperationalError("database is locked")
         return {"call": call}
 
@@ -9332,23 +9364,30 @@ def test_history_flight_failure_wakes_followers_and_recomputes(
     with _running_server(_Runtime()) as (base, server):
         try:
             with ThreadPoolExecutor(max_workers=8) as clients:
-                requests = [
-                    clients.submit(
-                        _response,
-                        base + "/api/prediction-arbitrage/history?" + query,
-                    )
-                    for _ in range(8)
-                ]
-                assert leader_entered.wait(timeout=5)
-                for _ in range(100):
-                    if server.http_load_snapshot()["history_cache_hits"] == 7:  # type: ignore[attr-defined]
-                        break
-                    time.sleep(0.01)
-                release_leader.set()
+                try:
+                    requests = [
+                        clients.submit(
+                            _response,
+                            base + "/api/prediction-arbitrage/history?" + query,
+                        )
+                        for _ in range(8)
+                    ]
+                    assert leader_entered.wait(timeout=5)
+                    # Match the entry watchdog used by the success-path sibling;
+                    # all seven followers must join before the leader may fail.
+                    deadline = time.monotonic() + 3
+                    while time.monotonic() < deadline:
+                        if server.http_load_snapshot()["history_cache_hits"] == 7:  # type: ignore[attr-defined]
+                            break
+                        time.sleep(0.01)
+                    assert server.http_load_snapshot()["history_cache_hits"] == 7
+                    release_leader.set()
 
-                assert [future.result(timeout=5) for future in requests] == [
-                    (503, {"error": "prediction history unavailable"})
-                ] * 8
+                    assert [future.result(timeout=5) for future in requests] == [
+                        (503, {"error": "prediction history unavailable"})
+                    ] * 8
+                finally:
+                    release_leader.set()
             assert calls == 1
             assert key not in server._history_cache  # type: ignore[attr-defined]
             assert _response(base + "/api/prediction-arbitrage/history?" + query) == (
@@ -9414,6 +9453,7 @@ def test_history_cache_never_serves_expired_payload_after_recompute_failure(
 ) -> None:
     calls = 0
     clock = [0.0]
+    real_monotonic = time.monotonic
 
     def stale_history(_store: object, **_kwargs: object) -> dict[str, object]:
         nonlocal calls
@@ -9423,7 +9463,10 @@ def test_history_cache_never_serves_expired_payload_after_recompute_failure(
         return {"call": calls}
 
     monkeypatch.setattr(prediction_service, "prediction_history_payload", stale_history)
-    monkeypatch.setattr(prediction_service.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        prediction_service, "time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    assert time.monotonic is real_monotonic
     with _running_server(_Runtime()) as (base, _server_instance):
         path = base + "/api/prediction-arbitrage/history?kind=signals&limit=1&offset=0"
         assert _response(path) == (200, {"call": 1})
@@ -14205,32 +14248,34 @@ def test_lp_history_progress_does_not_block_ready_candidates(tmp_path: Path) -> 
 
     worker = threading.Thread(target=refresh)
     worker.start()
-    assert history_started.wait(timeout=2)
-    preparation = service.preparation_snapshot()
-    assert preparation["state"] == "preparing"
-    assert preparation["completed_count"] == 1
-    assert preparation["total_count"] == 2
+    try:
+        assert history_started.wait(timeout=2)
+        preparation = service.preparation_snapshot()
+        assert preparation["state"] == "preparing"
+        assert preparation["completed_count"] == 1
+        assert preparation["total_count"] == 2
 
-    snapshot = service.refresh_candidates(force=True)
-    ready = next(
-        row for row in snapshot["candidates"] if row["condition_id"] == "condition-ready"
-    )
-    assert ready["market_id"] == "market-condition-ready"
-    assert any(
-        row["condition_id"] == "condition-waiting"
-        and row["code"] == "history_summary_unknown"
-        for row in snapshot["funnel"]["reasons"]["base"]
-    )
-    retained = store.lp_price_history_summary(
-        "condition-ready", "token-ready", now=now
-    )
-    assert retained is not None
-    assert retained["checked_at"] == checked_at.isoformat(timespec="microseconds").replace("+00:00", "Z")
-    assert retained["valid_until"] == valid_until.isoformat(timespec="microseconds").replace("+00:00", "Z")
+        snapshot = service.refresh_candidates(force=True)
+        ready = next(
+            row for row in snapshot["candidates"] if row["condition_id"] == "condition-ready"
+        )
+        assert ready["market_id"] == "market-condition-ready"
+        assert any(
+            row["condition_id"] == "condition-waiting"
+            and row["code"] == "history_summary_unknown"
+            for row in snapshot["funnel"]["reasons"]["base"]
+        )
+        retained = store.lp_price_history_summary(
+            "condition-ready", "token-ready", now=now
+        )
+        assert retained is not None
+        assert retained["checked_at"] == checked_at.isoformat(timespec="microseconds").replace("+00:00", "Z")
+        assert retained["valid_until"] == valid_until.isoformat(timespec="microseconds").replace("+00:00", "Z")
 
-    release_history.set()
-    worker.join(timeout=2)
-    assert not worker.is_alive()
+    finally:
+        release_history.set()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
     assert refresh_result["preparation_outcome"] == "success"
 
 

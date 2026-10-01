@@ -370,6 +370,28 @@ def test_old_owner_completion_cannot_replace_newer_bundle() -> None:
         adapter.lp_account_round_end(token)
 
 
+def _observe_round_waiters(token, expected: int, monkeypatch):
+    """Signal only when consumers have selected the owner's shared Future."""
+    with token.lock:
+        future = token.future
+    assert future is not None
+    original_result = future.result
+    lock = threading.Lock()
+    arrived = threading.Event()
+    count = 0
+
+    def result(*args, **kwargs):
+        nonlocal count
+        with lock:
+            count += 1
+            if count == expected:
+                arrived.set()
+        return original_result(*args, **kwargs)
+
+    monkeypatch.setattr(future, "result", result)
+    return arrived
+
+
 def test_round_lifecycle_without_consumer_makes_no_network_calls() -> None:
     adapter, account, _public = _round_adapter()
     token = adapter.lp_account_round_begin()
@@ -467,7 +489,7 @@ def test_service_keeps_non_round_value_errors_external(tmp_path, monkeypatch) ->
 
 
 @pytest.mark.parametrize("finish", ["end", "invalidate"])
-def test_late_snapshot_rejects_end_or_invalidation(finish: str) -> None:
+def test_late_snapshot_rejects_end_or_invalidation(finish: str, monkeypatch) -> None:
     adapter, account, _public = _round_adapter()
     token = adapter.lp_account_round_begin()
     captures: dict[str, tuple[object, BaseException | None]] = {}
@@ -482,19 +504,22 @@ def test_late_snapshot_rejects_end_or_invalidation(finish: str) -> None:
     assert account.first_order_started.wait(timeout=1)
     waiters: list[threading.Thread] = []
     try:
+        joined = _observe_round_waiters(token, 2, monkeypatch)
         waiter_a = threading.Thread(target=reader)
         waiter_b = threading.Thread(target=reader)
         waiter_a.start()
         waiter_b.start()
         waiters = [waiter_a, waiter_b]
-        time.sleep(0.05)
+        assert joined.wait(timeout=2), "both waiters must select the old generation"
 
-        started = time.monotonic()
         if finish == "end":
             adapter.lp_account_round_end(token)
         else:
             adapter.lp_account_round_invalidate(token)
-        assert time.monotonic() - started < 0.1
+        # Ending/invalidation returned while the account owner remains blocked.
+        # This proves nonblocking lifecycle behavior without a scheduler deadline.
+        assert owner.is_alive()
+        assert not account.release_first_order.is_set()
         account.release_first_order.set()
         _join_snapshot_workers([owner, *waiters], captures)
 
@@ -748,11 +773,12 @@ def test_exact_order_newer_evidence_advances_shared_fence(tmp_path, caplog) -> N
             # Hold A's exact lookup until B has crossed the adapter/validator
             # boundary. A then returns a newer fill through the normal service
             # read; authoritative fencing happens at that caller boundary.
-            assert validator_entered.wait(timeout=3)
+            assert exact_order_release.wait(timeout=3)
             return receipt(order_id, Decimal("100"))
         return receipt(order_id, Decimal("0"))
 
     account.get_order = get_order
+    exact_order_release = threading.Event()
     validator_entered = threading.Event()
     validator_release = threading.Event()
 
@@ -768,6 +794,7 @@ def test_exact_order_newer_evidence_advances_shared_fence(tmp_path, caplog) -> N
     try:
         assert validator_entered.wait(timeout=2)
         assert store.lp_trade_generation() == 0
+        exact_order_release.set()
         for _ in range(100):
             if store.lp_trade_generation() == 1:
                 break
@@ -803,6 +830,7 @@ def test_exact_order_newer_evidence_advances_shared_fence(tmp_path, caplog) -> N
         auto = engine.lp_auto_state()
         assert auto["intents"][0]["financial_status"] == "known"
     finally:
+        exact_order_release.set()
         validator_release.set()
         worker.join(timeout=2)
     records = [row for row in caplog.records if row.name == "open_trader.polymarket_trading"]
@@ -1987,7 +2015,7 @@ def test_auto_bounded_round_waits_for_launched_jobs(tmp_path) -> None:
         assert session["facts_error"] is None
 
 
-def test_provider_failure_completes_round_waiters() -> None:
+def test_provider_failure_completes_round_waiters(monkeypatch) -> None:
     adapter, account, _public = _round_adapter()
     provider_entered = threading.Event()
     release_provider = threading.Event()
@@ -2012,9 +2040,10 @@ def test_provider_failure_completes_round_waiters() -> None:
     owner.start()
     try:
         assert provider_entered.wait(timeout=2)
+        joined = _observe_round_waiters(token, 1, monkeypatch)
         waiter = threading.Thread(target=reader)
         waiter.start()
-        time.sleep(0.05)
+        assert joined.wait(timeout=2), "waiter must share the in-flight provider Future"
         assert waiter.is_alive()
 
         release_provider.set()
@@ -2032,6 +2061,7 @@ def test_provider_failure_completes_round_waiters() -> None:
         )
         with token.lock:
             assert token.future is None
+        assert provider_calls == 1, "all consumers must share one provider failure"
         # The failed provider fence ran before any external account request.
         assert all(value == 0 for value in account.calls.values())
     finally:

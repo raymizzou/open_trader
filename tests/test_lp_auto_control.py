@@ -249,27 +249,63 @@ def test_pause_can_persist_when_scheduler_is_unavailable(tmp_path):
         runtime.lp_auto_set_desired_running(True)
 
 
-def test_cli_uses_one_deadline_for_bootstrap_and_pause(tmp_path, monkeypatch, capsys):
+def test_cli_uses_one_deadline_for_bootstrap_and_pause(monkeypatch, capsys):
+    from io import BytesIO
+
+    clock = [100.0]
+    calls = []
+
+    class Opener:
+        def open(self, request, *, timeout):
+            calls.append((request, timeout))
+            if len(calls) == 1:
+                clock[0] += 0.15  # bootstrap consumes half of the shared budget
+                return BytesIO(b'{"csrf_token":"test-token"}')
+            assert request.method == "POST"
+            # The pause needs another 250ms; only 150ms must remain.
+            assert timeout == pytest.approx(0.15)
+            raise TimeoutError("pause exceeded the remaining shared deadline")
+
+    monkeypatch.setattr(cli, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(cli, "build_opener", lambda *args: Opener())
+    assert cli.main(["prediction-arb", "lp-auto", "pause", "--url", "http://127.0.0.1:8769", "--timeout", "0.3"]) == 2
+    output = capsys.readouterr().out
+    assert "UNKNOWN" in output and "PAUSED" not in output
+    assert len(calls) == 2
+    assert calls[0][1] == pytest.approx(0.3)
+
+
+def test_cli_real_deadline_expires_during_unconfirmed_pause(tmp_path, monkeypatch, capsys):
+    from concurrent.futures import ThreadPoolExecutor
     from open_trader import prediction_service
 
     runtime = runtime_for(tmp_path)
+    bootstrap_done, pause_entered, release_pause = (threading.Event() for _ in range(3))
 
     def bootstrap(**kwargs):
-        time.sleep(0.15)
+        bootstrap_done.set()
         return {"csrf_token": kwargs["csrf_token"], "venues": []}
 
     pause = runtime.execution.lp_auto_set_desired_running
 
-    def slow_pause(running, **kwargs):
-        time.sleep(0.25)
+    def blocked_pause(running, **kwargs):
+        pause_entered.set()
+        assert release_pause.wait(3)
         return pause(running, **kwargs)
 
     monkeypatch.setattr(prediction_service, "prediction_venues_payload", bootstrap)
-    runtime.execution.lp_auto_set_desired_running = slow_pause
-    with _server(runtime) as base:
-        assert cli.main(["prediction-arb", "lp-auto", "pause", "--url", base, "--timeout", "0.3"]) == 2
-        output = capsys.readouterr().out
-        assert "UNKNOWN" in output and "PAUSED" not in output
+    runtime.execution.lp_auto_set_desired_running = blocked_pause
+    with _server(runtime) as base, ThreadPoolExecutor(1) as workers:
+        result = workers.submit(cli.main, ["prediction-arb", "lp-auto", "pause", "--url", base, "--timeout", "0.3"])
+        try:
+            assert bootstrap_done.wait(2)
+            assert pause_entered.wait(2), "real timeout must exercise the pause response"
+            assert result.result(timeout=2) == 2
+            output = capsys.readouterr().out
+            assert "UNKNOWN" in output and "PAUSED" not in output
+            assert not release_pause.is_set()
+        finally:
+            release_pause.set()
 
 
 def test_cli_loopback_pause_does_not_use_environment_proxy(tmp_path, monkeypatch, capsys):

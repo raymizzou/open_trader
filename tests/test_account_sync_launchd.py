@@ -4,6 +4,7 @@ import json
 import os
 import plistlib
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -188,6 +189,27 @@ def test_installer_waits_for_bootout_before_bootstrap_and_matching_status(
     assert result.stderr == ""
 
 
+def _stop_test_process(process: subprocess.Popen) -> None:
+    # Kill the entire test-owned session, including shell/Python descendants.
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=5)
+
+
+def _wait_for_file(path: Path, process: subprocess.Popen, *, timeout: float = 5) -> None:
+    deadline = time.monotonic() + timeout
+    while not path.exists():
+        assert process.poll() is None, f"process exited before {path.name}: {process.returncode}"
+        assert time.monotonic() < deadline, f"timed out waiting for {path.name}"
+        time.sleep(0.01)
+
+
 def test_installer_waits_for_writer_lock_release_before_bootstrap(tmp_path: Path) -> None:
     repo = _copy_repo(tmp_path)
     agents = tmp_path / "LaunchAgents"
@@ -203,6 +225,21 @@ def test_installer_waits_for_writer_lock_release_before_bootstrap(tmp_path: Path
     lock_acquired = tmp_path / "lock-acquired"
     release_lock = tmp_path / "release-lock"
     loaded = tmp_path / "loaded"
+    lock_blocked = tmp_path / "lock-blocked"
+    retry_probe = tmp_path / "retry-probe"
+    python_wrapper = bin_dir / "python-wrapper"
+    python_wrapper.write_text(
+        f"#!{sys.executable}\n"
+        "import pathlib, subprocess, sys, time\n"
+        "code = sys.stdin.read() if sys.argv[1:2] == ['-'] else None\n"
+        "result = subprocess.run([sys.executable, *sys.argv[1:]], input=code, text=True)\n"
+        f"if sys.argv[1:] == ['-', {str(lock_path)!r}] and result.returncode != 0:\n"
+        f"    pathlib.Path({str(lock_blocked)!r}).touch()\n"
+        f"    while not pathlib.Path({str(retry_probe)!r}).exists(): time.sleep(.01)\n"
+        "raise SystemExit(result.returncode)\n",
+        encoding="utf-8",
+    )
+    python_wrapper.chmod(0o755)
     expected_sha = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
     ).stdout.strip()
@@ -224,7 +261,8 @@ def test_installer_waits_for_writer_lock_release_before_bootstrap(tmp_path: Path
             str(bootout),
             str(lock_acquired),
             str(release_lock),
-        ]
+        ],
+        start_new_session=True,
     )
     launchctl.write_text(
         "#!/bin/sh\n"
@@ -260,9 +298,10 @@ def test_installer_waits_for_writer_lock_release_before_bootstrap(tmp_path: Path
         [
             str(repo / "scripts/install_account_sync_launchd.sh"),
             "--repo-root", str(repo), "--runtime-root", str(runtime),
-            "--python", sys.executable, "--launch-agents-dir", str(agents),
+            "--python", str(python_wrapper), "--launch-agents-dir", str(agents),
             "--wait-seconds", "2",
         ],
+        start_new_session=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -281,16 +320,19 @@ def test_installer_waits_for_writer_lock_release_before_bootstrap(tmp_path: Path
         },
     )
     try:
-        while not lock_acquired.exists():
-            time.sleep(0.01)
-        time.sleep(0.1)
+        _wait_for_file(lock_blocked, installer)
+        assert lock_acquired.exists()
+        assert locker.poll() is None
         assert not bootstrap_count.exists()
         release_lock.touch()
+        locker.wait(timeout=5)
+        retry_probe.touch()
         stdout, stderr = installer.communicate(timeout=5)
     finally:
         release_lock.touch()
-        locker.terminate()
-        locker.wait(timeout=5)
+        retry_probe.touch()
+        _stop_test_process(installer)
+        _stop_test_process(locker)
 
     assert installer.returncode == 0
     assert f"installed launchd agent: {LABEL}" in stdout
@@ -323,7 +365,8 @@ def test_installer_fails_closed_when_writer_lock_stays_held(tmp_path: Path) -> N
             "    acquired.touch()\n"
             "    while not release.exists(): time.sleep(.01)\n",
             str(lock_path), str(bootout), str(lock_acquired), str(release_lock),
-        ]
+        ],
+        start_new_session=True,
     )
     launchctl.write_text(
         "#!/bin/sh\n"
@@ -337,15 +380,17 @@ def test_installer_fails_closed_when_writer_lock_stays_held(tmp_path: Path) -> N
         encoding="utf-8",
     )
     launchctl.chmod(0o755)
+    installer = None
     try:
-        result = subprocess.run(
+        installer = subprocess.Popen(
             [
                 str(repo / "scripts/install_account_sync_launchd.sh"),
                 "--repo-root", str(repo), "--runtime-root", str(runtime),
                 "--python", sys.executable, "--launch-agents-dir", str(agents),
                 "--wait-seconds", "1",
             ],
-            capture_output=True,
+            start_new_session=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True,
             env={
                 **os.environ,
@@ -355,13 +400,15 @@ def test_installer_fails_closed_when_writer_lock_stays_held(tmp_path: Path) -> N
                 "FAKE_LOCK_ACQUIRED": str(lock_acquired),
             },
         )
+        stdout, stderr = installer.communicate(timeout=10)
     finally:
         release_lock.touch()
-        locker.terminate()
-        locker.wait(timeout=5)
+        if installer is not None:
+            _stop_test_process(installer)
+        _stop_test_process(locker)
 
-    assert result.returncode != 0
-    assert "account sync writer lock is still held" in result.stderr
+    assert installer.returncode != 0
+    assert "account sync writer lock is still held" in stderr
     assert not bootstrap_count.exists()
 
 

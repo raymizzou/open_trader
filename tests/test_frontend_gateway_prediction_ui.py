@@ -25,6 +25,21 @@ const sandbox={document,window,console,URLSearchParams,AbortController,
   fetch:async (url)=>{requests.push(url); return {ok:true,json:async()=>({state:'ready',n_leg:{status:'paused',code:'N_LEG_PAUSED'},venues:[],orders:[],positions:[],recommendations:[]})};}};
 vm.createContext(sandbox);
 vm.runInContext(fs.readFileSync(process.argv[1],'utf8'),sandbox);
+vm.runInContext(`
+  const pending = new Set();
+  for (const name of ['loadDashboard', 'fetchPredictionVenues', 'fetchPredictionLpDashboard', 'fetchPredictionState']) {
+    const original = globalThis[name];
+    globalThis[name] = (...args) => {
+      const promise = original(...args);
+      pending.add(promise);
+      Promise.resolve(promise).finally(() => pending.delete(promise));
+      return promise;
+    };
+  }
+  globalThis.drainBootstrap = async () => {
+    while (pending.size) await Promise.all([...pending]);
+  };
+`, sandbox);
 boot();
 setImmediate(()=>{
   assert.equal(vm.runInContext('state.workspaceView',sandbox),'prediction_market');
@@ -35,7 +50,7 @@ setImmediate(()=>{
   assert.equal(nodes['return-to-portfolio'].hidden,true);
 });
 '''
-    result = subprocess.run(['node', '-e', script, str(js)], capture_output=True, text=True)
+    result = subprocess.run(['node', '-e', script, str(js)], capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
 
 
@@ -110,12 +125,28 @@ const sandbox={document,window,console,URLSearchParams,AbortController,
   }};
 vm.createContext(sandbox);
 vm.runInContext(fs.readFileSync(process.argv[1],'utf8'),sandbox);
+vm.runInContext(`
+  const pending = new Set();
+  for (const name of ['loadDashboard', 'fetchPredictionVenues', 'fetchPredictionLpDashboard', 'fetchPredictionState']) {
+    const original = globalThis[name];
+    globalThis[name] = (...args) => {
+      const promise = original(...args);
+      pending.add(promise);
+      Promise.resolve(promise).finally(() => pending.delete(promise));
+      return promise;
+    };
+  }
+  globalThis.drainBootstrap = async () => {
+    while (pending.size) await Promise.all([...pending]);
+  };
+`, sandbox);
 boot();
-setTimeout(async()=>{
-  await new Promise(resolve=>setImmediate(resolve));
+const keepAlive = setInterval(() => {}, 1000);
+(async()=>{
+  await sandbox.drainBootstrap();
   if (process.env.BODY_PREDICTION_ONLY !== 'true') {
     vm.runInContext('setWorkspaceView("prediction_market");',sandbox);
-    await new Promise(resolve=>setImmediate(resolve));
+    await sandbox.drainBootstrap();
   }
   vm.runInContext('renderPredictionMarket();',sandbox);
   const html=nodes['prediction-market-root'].innerHTML;
@@ -174,9 +205,10 @@ setTimeout(async()=>{
     assert.equal(requests.some(request=>request.method==='POST'),true);
   }
   process.exit(0);
-},10);
+})().catch(error => { console.error(error); process.exitCode = 1; })
+  .finally(() => clearInterval(keepAlive));
 '''
-    result = subprocess.run(['node', '-e', script, str(js)], capture_output=True, text=True, env={
+    result = subprocess.run(['node', '-e', script, str(js)], capture_output=True, text=True, timeout=10, env={
         **os.environ, 'SERVICE_MODE': service_mode, 'SERVICE_MUTATIONS': mutations,
         'N_LEG': n_leg, 'EXPECTED_STATE': expected_state,
         'BODY_PREDICTION_ONLY': body_prediction_only})
@@ -219,9 +251,25 @@ const sandbox={document,window,console,URLSearchParams,AbortController,
   }};
 vm.createContext(sandbox);
 vm.runInContext(fs.readFileSync(process.argv[1],'utf8'),sandbox);
+vm.runInContext(`
+  const pending = new Set();
+  for (const name of ['loadDashboard', 'fetchPredictionVenues', 'fetchPredictionLpDashboard', 'fetchPredictionState']) {
+    const original = globalThis[name];
+    globalThis[name] = (...args) => {
+      const promise = original(...args);
+      pending.add(promise);
+      Promise.resolve(promise).finally(() => pending.delete(promise));
+      return promise;
+    };
+  }
+  globalThis.drainBootstrap = async () => {
+    while (pending.size) await Promise.all([...pending]);
+  };
+`, sandbox);
 boot();
-setTimeout(async()=>{
-  await new Promise(resolve=>setImmediate(resolve));
+const keepAlive = setInterval(() => {}, 1000);
+(async()=>{
+  await sandbox.drainBootstrap();
   assert.equal(vm.runInContext('predictionServiceIdentity().state',sandbox),'production');
   vm.runInContext('state.predictionMarket.activeTab="multi_leg";',sandbox);
   await vm.runInContext('predictionPost("/api/prediction-arbitrage/mode",{mode:"auto"})',sandbox);
@@ -247,9 +295,10 @@ setTimeout(async()=>{
   await vm.runInContext('predictionPost("/api/prediction-arbitrage/mode",{mode:"auto"})',sandbox);
   assert.equal(requests.filter(request=>request.method==='POST').length,2);
   process.exit(0);
-},10);
+})().catch(error => { console.error(error); process.exitCode = 1; })
+  .finally(() => clearInterval(keepAlive));
 '''
-    result = subprocess.run(['node', '-e', script, str(js)], capture_output=True, text=True)
+    result = subprocess.run(['node', '-e', script, str(js)], capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
 
 

@@ -7,6 +7,7 @@ from io import BytesIO
 import json
 import multiprocessing
 from pathlib import Path
+from queue import Queue, Empty
 import ssl
 import threading
 import time
@@ -15,6 +16,7 @@ from urllib.error import HTTPError, URLError
 
 import httpx
 import pytest
+from lp_timing_support import hold_preparation_lock
 from polymarket import PRODUCTION, PublicClient
 
 from open_trader.polymarket_lp import PolymarketLPService
@@ -23,16 +25,6 @@ from open_trader.polymarket_trading import PolymarketTradingClient, TradingConfi
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 from open_trader.notifications import FeishuWebhookNotifier
 
-
-def _hold_preparation_lock_then_exit(path: str, ready: object, release: object) -> None:
-    import fcntl
-
-    lock_path = Path(path)
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        ready.set()  # type: ignore[attr-defined]
-        assert release.wait(timeout=30)  # type: ignore[attr-defined]
 
 
 def test_transient_outage_recovers_after_more_than_two_failures(tmp_path) -> None:
@@ -1879,11 +1871,12 @@ def test_runtime_wakes_probe_deadline_and_retries_failed_feishu_delivery(
 
         def lp_tick(self) -> dict[str, object]:
             risk_ticks.append(clock[0])
-            risk_started.set()
             # This read stands in for the public risk reconciliation boundary;
             # the test proves it continues while history waits on its own clock.
             trading.lp_account_snapshot()
             trading.lp_order_books(("token-risk",))
+            if len(risk_ticks) >= 2:
+                risk_started.set()
             return {"state": "none"}
 
         def refresh_lp_observations(
@@ -1946,6 +1939,9 @@ def test_runtime_wakes_probe_deadline_and_retries_failed_feishu_delivery(
     monkeypatch.setattr(runtime_module, "_LP_REWARD_SECONDS", 3600)
     monkeypatch.setattr(runtime_module, "_LP_SHARE_WATCH_SECONDS", 3600)
 
+    advances: Queue[tuple[float, threading.Event]] = Queue()
+    releases: list[threading.Event] = []
+
     def history_wait(stop_event: threading.Event, seconds: float) -> bool:
         history_wait_calls.append(seconds)
         if seconds >= 3600 and delivery_done.is_set():
@@ -1955,8 +1951,10 @@ def test_runtime_wakes_probe_deadline_and_retries_failed_feishu_delivery(
             invalid_wait.set()
             history_done.set()
             return True
-        clock[0] += timedelta(seconds=float(seconds))
-        threading.Event().wait(0.01)
+        resume = threading.Event()
+        releases.append(resume)
+        advances.put((float(seconds), resume))
+        assert resume.wait(3), "controller must acknowledge each history-clock advance"
         if delivery_done.is_set():
             history_done.set()
             return True
@@ -1980,8 +1978,18 @@ def test_runtime_wakes_probe_deadline_and_retries_failed_feishu_delivery(
     try:
         runtime.start()
         started = True
-        # This bounds the test runner, not the virtual 60s/300s business clock.
-        assert history_done.wait(timeout=30)
+        # The history worker is parked at a business deadline while the
+        # independent risk loop actually completes two reconciliations.
+        assert risk_started.wait(timeout=2)
+        deadline = time.monotonic() + 30
+        while not history_done.is_set():
+            assert time.monotonic() < deadline, "history worker failed to finish"
+            try:
+                seconds, resume = advances.get(timeout=0.1)
+            except Empty:
+                continue
+            clock[0] += timedelta(seconds=seconds)
+            resume.set()
         assert not invalid_wait.is_set(), history_wait_calls[-5:]
         assert history_wait_calls
         retry_index = history_wait_calls.index(300.0)
@@ -2003,6 +2011,8 @@ def test_runtime_wakes_probe_deadline_and_retries_failed_feishu_delivery(
         assert probe_calls
         assert delivery_done.is_set()
     finally:
+        for resume in releases:
+            resume.set()
         if started and runtime.state not in {"STOPPED", "FAILED"}:
             runtime.stop()
         assert runtime.state == "STOPPED"
@@ -2176,7 +2186,8 @@ def test_runtime_suppresses_short_fault_notification(
             thread.join(timeout=2)
 
 
-def test_live_preparation_owner_cannot_be_reclaimed(tmp_path: Path) -> None:
+@pytest.mark.parametrize("controller_delay", [0, 0.3])
+def test_live_preparation_owner_cannot_be_reclaimed(tmp_path: Path, controller_delay) -> None:
     """A live preparation owner fences a second service until it exits."""
 
     clock = [datetime(2026, 9, 20, 5, 0, tzinfo=UTC)]
@@ -2276,6 +2287,7 @@ def test_live_preparation_owner_cannot_be_reclaimed(tmp_path: Path) -> None:
 
     release_first_read.set()
     first_thread.join(timeout=3)
+    assert not first_thread.is_alive()
     assert first_result and first_result[0]["preparation_outcome"] == "success"
     assert catalog_calls[0] == 1
 
@@ -2299,16 +2311,23 @@ def test_live_preparation_owner_cannot_be_reclaimed(tmp_path: Path) -> None:
     ready = context.Event()
     release_owner = context.Event()
     owner = context.Process(
-        target=_hold_preparation_lock_then_exit,
+        target=hold_preparation_lock,
         args=(str(lock_path), ready, release_owner),
     )
     owner.start()
     try:
         assert ready.wait(30)
+        # Reproduce a parent descheduled beyond the old 200ms auto-release.
+        time.sleep(controller_delay)
+        assert owner.is_alive()
         assert store_b.lp_normalize_interrupted_preparation_items() == 0
     finally:
         release_owner.set()
-        owner.join(30)
+        owner.join(3)
+        if owner.is_alive():
+            owner.terminate()
+            owner.join(3)
+            pytest.fail("preparation lock owner did not exit after release")
         assert owner.exitcode == 0
 
     assert store_b.lp_normalize_interrupted_preparation_items() == 1

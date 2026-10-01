@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Page } from './fixtures';
 
 async function openPrediction(page: Page, state = 'ready') {
   await page.goto(`/?prediction_state=${state}`, { waitUntil: 'networkidle' });
@@ -7,6 +7,22 @@ async function openPrediction(page: Page, state = 'ready') {
   await expect(page.getByRole('heading', { name: '预测市场' })).toBeVisible();
   await page.getByRole('tab', { name: '多腿套利', exact: true }).click();
   await expect(page.getByRole('heading', { name: '多腿套利' })).toBeVisible();
+}
+
+async function controlledStateFailure(page: Page) {
+  let failed = false;
+  await page.route('**/api/prediction-arbitrage/state**', async route => {
+    if (failed) await route.fulfill({ status: 503, body: '' });
+    else await route.continue();
+  });
+  return async () => {
+    failed = true;
+    const failure = page.waitForResponse(response =>
+      new URL(response.url()).pathname === '/api/prediction-arbitrage/state'
+      && response.status() === 503);
+    await page.evaluate(async () => { await fetchPredictionState(); });
+    await (await failure).finished();
+  };
 }
 
 test.describe('unified N_LEG opportunity page', () => {
@@ -111,15 +127,14 @@ test.describe('unified N_LEG opportunity page', () => {
 
   test('observation coverage retains rows after a failed state fetch as stale and not current', async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 1100 });
+    const failState = await controlledStateFailure(page);
     await openPrediction(page, 'observation-fetch-error');
     const coverage = page.locator('[aria-label="观测覆盖"]');
     await expect(coverage.locator('[data-observation-status]')).toHaveText('已就绪');
     await expect(coverage).toContainText(/新鲜\s*2/);
     await expect(coverage).toContainText('同条件 YES/NO 观察市场');
 
-    await page.evaluate(async () => {
-      await fetchPredictionState();
-    });
+    await failState();
 
     await expect(coverage.locator('[data-observation-status]')).toHaveText('读取失败');
     await expect(coverage).toContainText(/新鲜\s*0/);
@@ -308,13 +323,12 @@ test.describe('unified N_LEG opportunity page', () => {
     await expect(errorTable.locator('tbody tr').first()).toContainText('上次结果');
     await expect(errorTable.locator('tbody tr').first().locator('[data-label="当前状态"]')).toContainText('读取失败');
 
+    const failState = await controlledStateFailure(page);
     await openPrediction(page, 'observation-fetch-error');
     const fetchErrorCoverage = page.locator('[aria-label="观测覆盖"]');
     const fetchErrorTable = fetchErrorCoverage.locator('table[aria-label="观测结果"]');
     await expect(fetchErrorTable.locator('tbody tr')).toHaveCount(2);
-    await page.evaluate(async () => {
-      await fetchPredictionState();
-    });
+    await failState();
     await expect(fetchErrorCoverage.locator('[data-observation-status]')).toHaveText('读取失败');
     await expect(fetchErrorTable.locator('tbody tr')).toHaveCount(2);
     await expect(fetchErrorTable.locator('tbody tr').first()).toContainText('上次结果');

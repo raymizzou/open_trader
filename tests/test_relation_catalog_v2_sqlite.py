@@ -10,8 +10,10 @@ from __future__ import annotations
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import pytest
+from timing_support import run_test_in_subprocess
 
 from open_trader.relation_catalog import RelationCatalog
 from open_trader.relation_catalog_v2 import RelationCatalogV2, SqliteCatalogStore
@@ -117,7 +119,9 @@ def test_sqlite_v1_tables_ignored(tmp_path) -> None:
     assert catalog.current_generation() == {}
 
 
-def test_sqlite_concurrent_writer_reader_see_complete_generations(tmp_path) -> None:
+def test_sqlite_concurrent_writer_reader_see_complete_generations(tmp_path, request) -> None:
+    if run_test_in_subprocess(request):
+        return
     db_path = str(tmp_path / "catalog.db")
     writer = _catalog(db_path)
     g1_payloads = [
@@ -136,12 +140,16 @@ def test_sqlite_concurrent_writer_reader_see_complete_generations(tmp_path) -> N
     snapshots: list[frozenset[str]] = []
     errors: list[BaseException] = []
 
+    start = Barrier(3)
+
     def writer_loop() -> None:
+        start.wait(timeout=5)
         for _ in range(20):
             writer.replace(g1_payloads, actor="auditor", git_sha="a" * 40)
             writer.replace(g2_payloads, actor="auditor", git_sha="a" * 40)
 
     def reader_loop() -> None:
+        start.wait(timeout=5)
         for _ in range(60):
             try:
                 snapshots.append(frozenset(reader.current_generation()))
@@ -179,7 +187,9 @@ def test_sqlite_read_rolls_back_when_commit_raises(tmp_path) -> None:
     assert catalog.current_generation() == {}
 
 
-def test_sqlite_thread_local_readers_share_one_catalog(tmp_path) -> None:
+def test_sqlite_thread_local_readers_share_one_catalog(tmp_path, request) -> None:
+    if run_test_in_subprocess(request):
+        return
     db_path = str(tmp_path / "catalog.db")
     catalog = _catalog(db_path)
     _approve(catalog, _payload())
@@ -187,7 +197,10 @@ def test_sqlite_thread_local_readers_share_one_catalog(tmp_path) -> None:
     snapshots: list[dict[str, dict]] = []
     errors: list[BaseException] = []
 
+    start = Barrier(8)
+
     def read_loop() -> None:
+        start.wait(timeout=5)
         for _ in range(100):
             try:
                 snapshots.append(catalog.current_generation())
@@ -203,7 +216,9 @@ def test_sqlite_thread_local_readers_share_one_catalog(tmp_path) -> None:
     assert snapshots == [expected] * len(snapshots)
 
 
-def test_sqlite_thread_local_writers_fail_cleanly(tmp_path) -> None:
+def test_sqlite_thread_local_writers_fail_cleanly(tmp_path, request) -> None:
+    if run_test_in_subprocess(request):
+        return
     db_path = str(tmp_path / "catalog.db")
     catalog = _catalog(db_path)
     payloads = [
@@ -219,7 +234,10 @@ def test_sqlite_thread_local_writers_fail_cleanly(tmp_path) -> None:
     results: list[dict[str, object]] = []
     errors: list[BaseException] = []
 
+    start = Barrier(8)
+
     def write_loop(payload: dict[str, object]) -> None:
+        start.wait(timeout=5)
         try:
             results.append(catalog.ingest(payload))
         except BaseException as exc:
@@ -239,7 +257,9 @@ def test_sqlite_thread_local_writers_fail_cleanly(tmp_path) -> None:
     assert len(_catalog(db_path).store["versions"]) == len(results)
 
 
-def test_sqlite_thread_local_mixed_reads_and_writes(tmp_path) -> None:
+def test_sqlite_thread_local_mixed_reads_and_writes(tmp_path, request) -> None:
+    if run_test_in_subprocess(request):
+        return
     db_path = str(tmp_path / "catalog.db")
     catalog = _catalog(db_path)
     _approve(catalog, _payload())
@@ -258,7 +278,13 @@ def test_sqlite_thread_local_mixed_reads_and_writes(tmp_path) -> None:
     read_errors: list[BaseException] = []
     write_errors: list[BaseException] = []
 
+    start = Barrier(8)
+    from threading import Lock
+    entry_lock = Lock()
+    writers_started = 0
+
     def read_loop() -> None:
+        start.wait(timeout=5)
         for _ in range(100):
             try:
                 snapshots.append(catalog.current_generation())
@@ -266,6 +292,12 @@ def test_sqlite_thread_local_mixed_reads_and_writes(tmp_path) -> None:
                 read_errors.append(exc)
 
     def write_loop(payload: dict[str, object]) -> None:
+        nonlocal writers_started
+        with entry_lock:
+            writers_started += 1
+            first_wave = writers_started <= 4
+        if first_wave:
+            start.wait(timeout=5)
         try:
             catalog.ingest(payload)
         except BaseException as exc:

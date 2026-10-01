@@ -1,4 +1,4 @@
-import { expect, test, type Locator } from '@playwright/test';
+import { expect, test, type Locator } from './fixtures';
 
 async function expectNoEditableControls(scope: Locator) {
   await expect(scope.locator('input, textarea, select, [contenteditable]:not([contenteditable="false"])')).toHaveCount(0);

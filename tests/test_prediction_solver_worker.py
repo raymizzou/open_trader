@@ -215,33 +215,41 @@ def test_timing_backend_sums_only_native_backend_solve_durations() -> None:
 
 def test_handshake_is_strict_and_protocol_only() -> None:
     process = subprocess.Popen(
-        _test_command("ok"),
-        cwd=ROOT,
+        _test_command("ok"), cwd=ROOT,
         env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         start_new_session=True,
     )
-    assert process.stdout is not None
-    handshake_line = process.stdout.readline()
-    handshake = decode_handshake_line(handshake_line)
-    assert handshake.protocol == BENCHMARK_PROTOCOL_V1
-    assert handshake.backend == "test"
-    assert handshake.version == "1"
-    assert handshake.solver_version is None
-    assert handshake.pid == process.pid
-
-    assert process.stdin is not None
-    process.stdin.write(encode_request_line(_request()))
-    process.stdin.flush()
-    response_line = process.stdout.readline()
-    response = decode_response_line(response_line, expected_request_id="request-1")
-    assert response.status == "OK"
-    process.stdin.close()
-    assert process.wait(timeout=2) == 0
-    assert process.stderr is not None
-    assert process.stderr.read() == b""
+    reader = _PipeReader(process, MAX_LINE_BYTES)
+    try:
+        handshake = decode_handshake_line(reader.read_stdout_line(time.monotonic() + 2))
+        assert handshake.protocol == BENCHMARK_PROTOCOL_V1
+        assert handshake.backend == "test"
+        assert handshake.version == "1"
+        assert handshake.solver_version is None
+        assert handshake.pid == process.pid
+        reader.write_stdin(encode_request_line(_request()), time.monotonic() + 2)
+        response = decode_response_line(
+            reader.read_stdout_line(time.monotonic() + 2), expected_request_id="request-1"
+        )
+        assert response.status == "OK"
+        assert process.stdin is not None
+        process.stdin.close()
+        process.stdin = None
+        stdout, stderr = process.communicate(timeout=2)
+        assert process.returncode == 0
+        assert bytes(reader.stdout_buffer) + stdout == b""
+        assert bytes(reader.stderr_buffer) + stderr == b""
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=2)
+        reader.close()
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
 
 
 def test_handshake_v2_carries_solver_version_without_redefining_version() -> None:
@@ -353,8 +361,8 @@ def test_write_stdin_checks_deadline_and_rss_on_successful_partial_writes(monkey
     writes: list[bytes] = []
     monotonic_values = iter((0.0, 0.4, 0.8, 1.1))
 
-    monkeypatch.setattr(worker_module.os, "write", lambda _fd, data: writes.append(bytes(data)) or min(2, len(data)))
-    monkeypatch.setattr(worker_module.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(worker_module, "os", _ModuleProxy(os, write=lambda _fd, data: writes.append(bytes(data)) or min(2, len(data))))
+    monkeypatch.setattr(worker_module, "time", SimpleNamespace(monotonic=lambda: next(monotonic_values)))
     try:
         with pytest.raises(TimeoutError, match="writing request"):
             reader.write_stdin(b"abcdefgh", deadline=1.0)
@@ -796,3 +804,129 @@ def test_reused_worker_resets_peak_rss_for_each_request(monkeypatch) -> None:
 def test_line_bound_is_enforced_before_json_decode() -> None:
     with pytest.raises(WorkerProtocolError, match="line limit"):
         decode_request_line(b"{" + b"x" * MAX_LINE_BYTES + b"}\n")
+
+
+class _ModuleProxy:
+    def __init__(self, module, **overrides):
+        self._module = module
+        self.__dict__.update(overrides)
+
+    def __getattr__(self, name):
+        return getattr(self._module, name)
+
+
+def _warm_then_hang_command(watchdog_path: Path, *, child: bool = False) -> list[str]:
+    # Stdlib-only fake completes one request using the SAME memory-limit config.
+    # A child-ready pipe is acknowledged before OK; no sleep guesses startup.
+    code = """
+import json, os, signal, subprocess, sys
+owned_pgid = os.getpid()
+assert os.getpgrp() == owned_pgid, 'fixture must own its process group'
+child = None
+
+def watchdog_expired(*args):
+    assert os.getpgrp() == owned_pgid, 'fixture process group changed'
+    with open(WATCHDOG_PATH, 'w') as marker:
+        json.dump({'pid': os.getpid(), 'pgid': owned_pgid,
+                   'child_pid': None if child is None else child.pid}, marker)
+    # Independent real-time fallback, never a successful production timeout.
+    # Kill the detached worker's whole owned group, not just the pytest group.
+    os.killpg(owned_pgid, signal.SIGKILL)
+
+signal.signal(signal.SIGALRM, watchdog_expired)
+if CHILD:
+    ready_read, ready_write = os.pipe()
+    child = subprocess.Popen(
+        [sys.executable, '-c', 'import os,signal,sys; os.write(int(sys.argv[1]), b"R"); signal.pause()', str(ready_write)],
+        pass_fds=(ready_write,),
+    )
+    os.close(ready_write)
+    assert os.read(ready_read, 1) == b'R'
+    os.close(ready_read)
+    def stop(*args):
+        # Reap the descendant ourselves so the contract is independent of the
+        # host's PID-1 reaping policy, while the harness still kills the group.
+        child.wait(timeout=2)
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, stop)
+print(json.dumps(dict(backend='test', pid=os.getpid(), protocol=PROTOCOL, version='1')), flush=True)
+request = json.loads(sys.stdin.readline())
+# Arm only after startup/child readiness, before acknowledging the warm request.
+signal.setitimer(signal.ITIMER_REAL, 5)
+print(json.dumps(dict(backend='test', diagnostics=[], evidence={'child_pid': None if child is None else child.pid},
+    phase_timings_ns={name: 0 for name in PHASES}, protocol=PROTOCOL,
+    request_id=request['request_id'], status='OK')), flush=True)
+while True:
+    signal.pause()
+"""
+    return [sys.executable, "-c", f"CHILD={child!r}; WATCHDOG_PATH={str(watchdog_path)!r}; PROTOCOL={BENCHMARK_PROTOCOL_V1!r}; PHASES={WORKER_PHASE_NAMES!r}\n" + code]
+
+
+def test_blocked_stdin_deadline_after_successful_same_limit_warmup(tmp_path, monkeypatch):
+    import open_trader.prediction_solver_worker as worker_module
+
+    written = []
+    blocked = []
+    original_write = os.write
+
+    def write(fd, payload):
+        try:
+            count = original_write(fd, payload)
+        except BlockingIOError:
+            blocked.append(True)
+            raise
+        written.append(count)
+        return count
+
+    payload = _request("blocked-after-warmup", hard_time_limit_ms=100)
+    payload["request"]["problem"]["problem_id"] = "x" * 200_000
+    request = decode_request_line(encode_request_line(payload))
+    watchdog = tmp_path / "blocked-stdin.watchdog.json"
+    with WorkerHarness(_warm_then_hang_command(watchdog), request_timeout_ms=5_000,
+                       startup_timeout_ms=5_000, cleanup_grace_seconds=0.1) as harness:
+        warm = harness.submit(decode_request_line(encode_request_line(_request("warm"))))
+        assert warm.status == "OK"
+        harness.request_timeout_ms = 500
+        monkeypatch.setattr(worker_module, "os", _ModuleProxy(os, write=write))
+        started = time.monotonic()
+        result = harness.submit(request)
+        elapsed = time.monotonic() - started
+    assert worker_module._ps_group_rows(result.pgid) == {}
+    assert not watchdog.exists(), "independent worker watchdog expired; production deadline was not enforced"
+    assert result.worker_pid == warm.worker_pid
+    assert harness.start_count == 1
+    assert written and 0 < sum(written) < len(encode_request_line(payload))
+    assert blocked, "the target request never reached a full stdin pipe"
+    assert result.status == "UNKNOWN"
+    assert result.termination == "HARD_TIMEOUT"
+    assert result.cleanup_proven is True
+    assert elapsed < 1.0
+    assert worker_module._ps_group_rows(result.pgid) == {}
+
+
+def test_twenty_phase_proven_hard_failures_reap_ready_descendants(tmp_path):
+    import open_trader.prediction_solver_worker as worker_module
+
+    rss = []
+    watchdog = tmp_path / "descendant.watchdog.json"
+    with WorkerHarness(_warm_then_hang_command(watchdog, child=True), request_timeout_ms=5_000,
+                       startup_timeout_ms=5_000) as harness:
+        for index in range(20):
+            harness.request_timeout_ms = 5_000
+            warm = harness.submit(decode_request_line(encode_request_line(_request(f"warm-{index}"))))
+            assert warm.status == "OK"
+            child_pid = warm.response.evidence["child_pid"]
+            assert os.getpgid(child_pid) == warm.pgid
+            assert set(worker_module._ps_group_rows(warm.pgid)) == {warm.worker_pid, child_pid}
+            harness.request_timeout_ms = 250
+            result = harness.submit(decode_request_line(encode_request_line(_request(f"hang-{index}"))))
+            assert worker_module._ps_group_rows(result.pgid) == {}
+            assert not watchdog.exists(), "independent worker watchdog expired; production deadline was not enforced"
+            assert result.worker_pid == warm.worker_pid
+            assert result.status == "UNKNOWN"
+            assert result.termination == "HARD_TIMEOUT"
+            assert result.cleanup_proven is True
+            assert worker_module._ps_group_rows(result.pgid) == {}
+            rss.append(process_group_rss_kib(result.pgid))
+    assert rss == [0] * 20
+    assert harness.start_count == 20

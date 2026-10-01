@@ -9510,6 +9510,7 @@ def test_controlled_account_outage_waits_for_label_and_listener_before_probe(
     state = {"label_present": True, "listener_present": True}
     fetch_calls: list[str] = []
     sleep_calls = 0
+    clock = [0.0]
 
     monkeypatch.setattr(
         dashboard_acceptance,
@@ -9537,6 +9538,7 @@ def test_controlled_account_outage_waits_for_label_and_listener_before_probe(
     def sleep(_seconds: float) -> None:
         nonlocal sleep_calls
         sleep_calls += 1
+        clock[0] += _seconds
         assert fetch_calls == []
         if sleep_calls == 1:
             state["label_present"] = False
@@ -9544,7 +9546,9 @@ def test_controlled_account_outage_waits_for_label_and_listener_before_probe(
             state["listener_present"] = False
 
     monkeypatch.setattr(dashboard_acceptance.subprocess, "run", run)
-    monkeypatch.setattr(dashboard_acceptance.time, "sleep", sleep)
+    monkeypatch.setattr(dashboard_acceptance, "time", SimpleNamespace(
+        monotonic=lambda: clock[0], sleep=sleep,
+    ))
 
     def fetch(_url: str, path: str) -> tuple[int, object]:
         fetch_calls.append(path)
@@ -10373,3 +10377,48 @@ def test_acceptance_cli_has_no_test_only_config_or_expected_cn_options() -> None
 
     assert "config" not in destinations
     assert "expected_cn" not in destinations
+
+
+@pytest.mark.parametrize("absent_at_deadline", [True, False])
+def test_controlled_account_outage_uses_exact_deadline_and_never_probes_live_listener(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, absent_at_deadline: bool,
+) -> None:
+    clock = [0.0]
+    probes: list[str] = []
+    commands: list[list[str]] = []
+    deadline = dashboard_acceptance.ACCOUNT_API_OUTAGE_WAIT_SECONDS
+
+    def run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        commands.append(command)
+        if command[:2] == ["launchctl", "print"]:
+            return SimpleNamespace(returncode=113, stdout="", stderr="Could not find service")
+        if command[0] == "lsof":
+            absent = absent_at_deadline and clock[0] == deadline
+            return SimpleNamespace(returncode=1 if absent else 0, stdout="" if absent else "listener", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def sleep(_seconds: float) -> None:
+        assert probes == []
+        clock[0] = float(deadline)
+
+    def fetch(_url: str, path: str) -> tuple[int, object]:
+        probes.append(path)
+        assert absent_at_deadline and clock[0] == deadline
+        if path == dashboard_acceptance.ACCOUNT_SNAPSHOT_PATH:
+            return 503, {"code": "account_module_unavailable"}
+        if path == "/healthz":
+            return 200, {"prediction_route_mode": "service", "prediction_upstream_status": "ok", "legacy_upstream_status": "ok"}
+        return 200, {"holding_enrichment": []}
+
+    monkeypatch.setattr(dashboard_acceptance, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep))
+    monkeypatch.setattr(dashboard_acceptance, "subprocess", SimpleNamespace(run=run))
+    monkeypatch.setattr(dashboard_acceptance, "_project_data_dir", lambda _root: tmp_path / "runtime/data")
+    monkeypatch.setattr(dashboard_acceptance, "_fetch_status_payload", fetch)
+    errors = dashboard_acceptance._controlled_account_outage_errors("http://gateway.test", tmp_path)
+    if absent_at_deadline:
+        assert errors == []
+        assert probes
+    else:
+        assert probes == []
+        assert any("label/listener remained after bootout" in error for error in errors)
+    assert any("install_account_api_launchd.sh" in command[0] for command in commands)

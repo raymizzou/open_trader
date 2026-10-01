@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import signal
 import subprocess
 import sys
 import time
@@ -1519,6 +1520,79 @@ def test_vipr_helper_missing_or_failed_checker_is_not_proof(tmp_path: Path) -> N
     assert result.completed_certificate_sha256 is None
 
 
+
+
+def _vipr_fixture_watchdog(watchdog_path: Path) -> str:
+    """The fixture owns this session; SIGALRM is independent of product wait()."""
+    return (
+        "import json,os,signal\n"
+        "owned_pgid = os.getpid()\n"
+        "assert os.getpgrp() == owned_pgid, 'fixture must own its process group'\n"
+        "def watchdog_expired(*args):\n"
+        "    assert os.getpgrp() == owned_pgid, 'fixture process group changed'\n"
+        f"    with open({str(watchdog_path)!r}, 'w') as marker:\n"
+        "        json.dump({'pid': os.getpid(), 'pgid': owned_pgid}, marker)\n"
+        "    os.killpg(owned_pgid, signal.SIGKILL)\n"
+        "signal.signal(signal.SIGALRM, watchdog_expired)\n"
+    )
+
+
+def _assert_vipr_fixture_groups_empty(processes):
+    deadline = time.monotonic() + 2
+    for process in processes:
+        while True:
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                break
+            assert time.monotonic() < deadline, f"fixture process group {process.pid} remains"
+            time.sleep(0.001)
+
+
+def _gate_vipr_process_wait_on_ready(monkeypatch, ready_paths):
+    """Prove the target phase before its unchanged real subprocess timeout.
+
+    Cold process-start timeout coverage remains in the formal exact CLI tests.
+    The independent 2s readiness watchdog fails explicitly if a fixture cannot
+    start; it never reports a startup failure as a successful checker timeout.
+    """
+    processes = []
+
+    class ReadyProcess:
+        def __init__(self, command, **kwargs):
+            self.process = subprocess.Popen(command, **kwargs)
+            self.ready_path = ready_paths[str(command[0])]
+            self.first_wait = True
+            processes.append(self.process)
+
+        def __getattr__(self, name):
+            return getattr(self.process, name)
+
+        def wait(self, timeout=None):
+            if self.first_wait:
+                self.first_wait = False
+                deadline = time.monotonic() + 2
+                while not self.ready_path.exists():
+                    if self.process.poll() is not None or time.monotonic() >= deadline:
+                        try:
+                            os.killpg(self.process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        self.process.wait(timeout=2)
+                        raise AssertionError(f"VIPR fixture did not reach phase: {self.ready_path.name}")
+                    time.sleep(0.001)
+            return self.process.wait(timeout=timeout)
+
+    class SubprocessProxy:
+        Popen = ReadyProcess
+
+        def __getattr__(self, name):
+            return getattr(subprocess, name)
+
+    monkeypatch.setattr(solver_backends, "subprocess", SubprocessProxy())
+    return processes
+
+
 def test_vipr_helper_maps_missing_certificate_and_checker_timeout_to_failure(tmp_path: Path) -> None:
     missing = check_vipr_certificate(tmp_path / "missing.vipr", tmp_path, timeout_ms=10_000)
     assert missing.checker_succeeded is False
@@ -1544,34 +1618,100 @@ def test_vipr_helper_maps_missing_certificate_and_checker_timeout_to_failure(tmp
     assert timed_out.error == "VIPR subprocess timed out"
 
 
-def test_vipr_timeout_reaps_descendant_after_leader_exits_on_sigterm(tmp_path: Path) -> None:
+
+def test_vipr_helper_maps_missing_certificate_and_checker_timeout_to_failure_after_phase_ready(tmp_path: Path, monkeypatch) -> None:
+    missing = check_vipr_certificate(tmp_path / "missing.vipr", tmp_path, timeout_ms=10_000)
+    assert missing.checker_succeeded is False
+    assert missing.error == "certificate is missing"
+
+    original = tmp_path / "original.vipr"
+    original.write_bytes(b"corrupt")
+    completed = tmp_path / "completion.ready"
+    checker_ready = tmp_path / "checker.ready"
+    watchdog = tmp_path / "checker.watchdog.json"
+    comp = _write_executable(
+        tmp_path / "viprcomp",
+        "#!/usr/bin/env python3\nfrom pathlib import Path\nimport sys\n"
+        "source = Path(sys.argv[-1])\n"
+        "source.with_name(source.stem + '_complete' + source.suffix).write_bytes(source.read_bytes() + b' completed')\n"
+        f"Path({str(completed)!r}).touch()\n",
+    )
+    chk = _write_executable(
+        tmp_path / "viprchk",
+        "#!/usr/bin/env python3\nfrom pathlib import Path\n"
+        + _vipr_fixture_watchdog(watchdog)
+        + "signal.setitimer(signal.ITIMER_REAL, 5)\n"
+        + f"Path({str(checker_ready)!r}).touch()\n"
+        "while True: signal.pause()\n",
+    )
+    processes = _gate_vipr_process_wait_on_ready(monkeypatch, {str(comp): completed, str(chk): checker_ready})
+    timed_out = check_vipr_certificate(
+        original, tmp_path, viprcomp=str(comp), viprchk=str(chk), timeout_ms=1_000
+    )
+    _assert_vipr_fixture_groups_empty(processes)
+    assert not watchdog.exists(), "independent VIPR watchdog expired; production deadline was not enforced"
+    assert completed.exists() and checker_ready.exists()
+    assert timed_out.completion_exit_code == 0
+    assert timed_out.check_ns > 0
+    assert timed_out.checker_succeeded is False
+    assert timed_out.checker_exit_code is None
+    assert timed_out.error == "VIPR subprocess timed out"
+
+
+def test_vipr_timeout_reaps_descendant_after_leader_exits_on_sigterm(tmp_path: Path, monkeypatch) -> None:
     marker = tmp_path / "late-marker"
-    pid_file = tmp_path / "descendant.pid"
+    release = tmp_path / "write-marker.release"
+    ready = tmp_path / "descendant.ready"
+    armed = tmp_path / "launcher.ready"
+    watchdog = tmp_path / "launcher.watchdog.json"
+    child_code = (
+        "import os,pathlib,signal,sys,time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "ready, release, marker = map(pathlib.Path, sys.argv[1:])\n"
+        "ready.write_text(str(os.getpid()))\n"
+        "while not release.exists(): time.sleep(0.001)\n"
+        "marker.write_text('late')\n"
+    )
     launcher = _write_executable(
         tmp_path / "launcher",
-        "#!/usr/bin/env python3\n"
-        "import os, signal, subprocess, sys, time\n"
-        f"marker = {str(marker)!r}\n"
-        f"pid_file = {str(pid_file)!r}\n"
-        "descendant = subprocess.Popen([sys.executable, '-c', "
-        "\"import pathlib, signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(3.0); pathlib.Path(__import__('sys').argv[1]).write_text('late')\", marker])\n"
-        "pathlib = __import__('pathlib')\n"
-        "pathlib.Path(pid_file).write_text(str(descendant.pid))\n"
-        "def stop(*_):\n"
-        "    raise SystemExit(0)\n"
+        "#!/usr/bin/env python3\nimport subprocess,sys,time\nfrom pathlib import Path\n"
+        + _vipr_fixture_watchdog(watchdog)
+        + "def stop(*args): raise SystemExit(0)\n"
         "signal.signal(signal.SIGTERM, stop)\n"
-        "while True: time.sleep(1)\n",
+        f"subprocess.Popen([sys.executable, '-c', {child_code!r}, {str(ready)!r}, {str(release)!r}, {str(marker)!r}])\n"
+        f"while not Path({str(ready)!r}).exists(): time.sleep(0.001)\n"
+        "signal.setitimer(signal.ITIMER_REAL, 5)\n"
+        f"Path({str(armed)!r}).touch()\n"
+        "while True: signal.pause()\n",
     )
-
-    exit_code, _, error = solver_backends._run_vipr_process([str(launcher)], cwd=tmp_path, timeout_ms=2_000)
-
-    assert exit_code is None
-    assert error == "VIPR subprocess timed out"
-    time.sleep(3.5)
-    assert not marker.exists()
-    descendant_pid = int(pid_file.read_text())
-    with pytest.raises(ProcessLookupError):
-        os.kill(descendant_pid, 0)
+    processes = _gate_vipr_process_wait_on_ready(monkeypatch, {str(launcher): armed})
+    try:
+        exit_code, _, error = solver_backends._run_vipr_process([str(launcher)], cwd=tmp_path, timeout_ms=2_000)
+        _assert_vipr_fixture_groups_empty(processes)
+        assert not watchdog.exists(), "independent VIPR watchdog expired; production deadline was not enforced"
+        assert exit_code is None
+        assert error == "VIPR subprocess timed out"
+        descendant_pid = int(ready.read_text())
+        release.touch()  # A surviving child would now write the forbidden marker.
+        deadline = time.monotonic() + 2
+        while True:
+            assert not marker.exists(), "descendant survived group cleanup"
+            try:
+                os.kill(descendant_pid, 0)
+            except ProcessLookupError:
+                break
+            assert time.monotonic() < deadline, "descendant was not reaped"
+            time.sleep(0.001)
+        assert not marker.exists()
+        with pytest.raises(ProcessLookupError):
+            os.killpg(processes[0].pid, 0)
+    finally:
+        for process in processes:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=2)
 
 
 def test_vipr_helper_rejects_certificate_outside_request_artifact_dir(tmp_path: Path) -> None:

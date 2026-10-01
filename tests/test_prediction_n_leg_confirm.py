@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+from timing_support import run_test_in_subprocess
+
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 from open_trader.prediction_n_leg import canonical_payload, fingerprint
 from open_trader.prediction_n_leg_confirm import (
@@ -298,8 +300,10 @@ def test_p2_enqueue_rejects_full_queue_inside_the_transaction(
 
 
 def test_p2_concurrent_confirms_same_component_exactly_one_wins(
-    tmp_path: Path,
+    tmp_path: Path, request,
 ) -> None:
+    if run_test_in_subprocess(request):
+        return
     import threading
 
     store = _caps_store(tmp_path)
@@ -307,22 +311,31 @@ def test_p2_concurrent_confirms_same_component_exactly_one_wins(
     barrier = threading.Barrier(2)
     results: list[tuple[str, str]] = []
 
+    errors: list[BaseException] = []
+
     def worker(key: str) -> None:
-        barrier.wait()
         try:
+            barrier.wait(timeout=5)
             row = _confirm(store, [entry], idempotency_key=key)
             results.append(("ok", str(row["request_id"])))
         except NLegConfirmRejected as exc:
             results.append(("rejected", exc.reason))
+        except BaseException as exc:
+            errors.append(exc)
 
     threads = [
         threading.Thread(target=worker, args=(key,))
         for key in ("idem-t1", "idem-t2")
     ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+        assert all(not thread.is_alive() for thread in threads), "contender did not finish"
+        assert not errors, errors
+    finally:
+        barrier.abort()
 
     assert sorted(kind for kind, _ in results) == ["ok", "rejected"]
     assert [reason for kind, reason in results if kind == "rejected"] == [

@@ -52,7 +52,7 @@ class _Harness:
                 type(self).running.append(request.request_id)
                 if len(type(self).running) == 2:
                     type(self).started.set()
-            assert type(self).release.wait(2)
+            type(self).release.wait()
         return WorkerOutcome(
             request.request_id, "OK", "COMPLETED", None, None, 0, False,
             not type(self).unproven,
@@ -113,6 +113,7 @@ def test_two_slot_server_queues_one_third_task_then_bounds_pending_work() -> Non
         assert second.result(timeout=2).status == "OK"
         assert third.result(timeout=2).status == "OK"
     finally:
+        _Harness.release.set()
         server.close()
 
 

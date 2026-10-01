@@ -8,10 +8,14 @@ from decimal import Decimal
 from pathlib import Path
 from threading import Barrier
 from zoneinfo import ZoneInfo
+from unittest.mock import patch
+
+from timing_support import run_test_in_subprocess
 
 import pytest
 
 from open_trader.polymarket_lp import PolymarketLPService
+import open_trader.prediction_arbitrage_store as store_module
 from open_trader.prediction_arbitrage_store import (
     LP_RESERVED_MANUAL_SESSION_ID,
     PredictionArbitrageStore,
@@ -24,6 +28,13 @@ from open_trader.prediction_n_leg_execution import (
 
 
 UTC = timezone.utc
+
+
+@pytest.fixture
+def store_clock(monkeypatch):
+    clock = [datetime(2026, 9, 22, 12, tzinfo=UTC)]
+    monkeypatch.setattr("open_trader.prediction_arbitrage_store._utc_now", lambda: iso(clock[0]))
+    return clock
 
 
 def iso(moment: datetime) -> str:
@@ -178,12 +189,13 @@ def create_execution(
     expires_at: str | None = None,
     idempotency_key: str = "request-1",
 ) -> tuple[PredictionArbitrageStore, dict[str, object]]:
-    current = datetime.now(UTC)
+    current = datetime.fromisoformat(store_module._utc_now().replace("Z", "+00:00"))
     db = store(tmp_path)
-    preview_id = db.create_preview(
-        preview_payload(), expires_at=expires_at or iso(current + timedelta(seconds=10))
-    )
-    return db, db.consume_preview_and_create_execution(preview_id, idempotency_key)
+    with patch("open_trader.prediction_arbitrage_store._utc_now", return_value=iso(current)):
+        preview_id = db.create_preview(
+            preview_payload(), expires_at=expires_at or iso(current + timedelta(seconds=10))
+        )
+        return db, db.consume_preview_and_create_execution(preview_id, idempotency_key)
 
 
 def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> None:
@@ -1138,33 +1150,34 @@ def test_observation_notification_is_independent_and_completes_after_close(
     assert db.reserve_notification_attempt(signal_id)["state"] == "closed"
 
 
-def test_preview_expires_after_ten_seconds_and_is_idempotent(tmp_path: Path) -> None:
+def test_preview_expires_after_ten_seconds_and_is_idempotent(tmp_path: Path, store_clock) -> None:
     db = store(tmp_path)
-    now = datetime.now(UTC)
-    preview_id = db.create_preview(
-        preview_payload(), expires_at=iso(now + timedelta(seconds=10))
-    )
+    now = store_clock[0]
+    preview_id = db.create_preview(preview_payload(), expires_at=iso(now + timedelta(seconds=10)))
+    boundary_id = db.create_preview(preview_payload(market_id="market-2"), expires_at=iso(now + timedelta(seconds=10)))
+    store_clock[0] = now + timedelta(seconds=10, microseconds=-1)
     execution = db.consume_preview_and_create_execution(preview_id, "request-1")
     assert execution["preview_id"] == preview_id
     assert db.consume_preview_and_create_execution(preview_id, "request-2") == execution
+    db.transition_execution(execution["execution_id"], state="complete", evidence={})
+    for offset in (timedelta(seconds=10), timedelta(seconds=10, microseconds=1)):
+        store_clock[0] = now + offset
+        with pytest.raises(ValueError, match="expired"):
+            db.consume_preview_and_create_execution(boundary_id, "request-expired")
 
-    expired_id = db.create_preview(preview_payload(market_id="market-2"), expires_at=iso(now - timedelta(microseconds=1)))
-    with pytest.raises(ValueError, match="expired"):
-        db.consume_preview_and_create_execution(expired_id, "request-3")
 
-
-def test_duplicate_idempotency_key_returns_existing_execution(tmp_path: Path) -> None:
+def test_duplicate_idempotency_key_returns_existing_execution(tmp_path: Path, store_clock) -> None:
     db = store(tmp_path)
-    now = datetime.now(UTC)
+    now = store_clock[0]
     preview_id = db.create_preview(preview_payload(), expires_at=iso(now + timedelta(seconds=10)))
     first = db.consume_preview_and_create_execution(preview_id, "same-request")
     second = db.consume_preview_and_create_execution("not-used", "same-request")
     assert second == first
 
 
-def test_only_one_nonterminal_execution_is_allowed(tmp_path: Path) -> None:
+def test_only_one_nonterminal_execution_is_allowed(tmp_path: Path, store_clock) -> None:
     db = store(tmp_path)
-    now = datetime.now(UTC)
+    now = store_clock[0]
     first_preview = db.create_preview(preview_payload(), expires_at=iso(now + timedelta(seconds=10)))
     db.consume_preview_and_create_execution(first_preview, "request-1")
     second_preview = db.create_preview(preview_payload(market_id="market-2"), expires_at=iso(now + timedelta(seconds=10)))
@@ -1178,10 +1191,10 @@ def test_only_one_nonterminal_execution_is_allowed(tmp_path: Path) -> None:
     assert db.consume_preview_and_create_execution(second_preview, "request-2")["state"] == "validating"
 
 
-def test_concurrent_instances_consume_preview_once(tmp_path: Path) -> None:
+def test_concurrent_instances_consume_preview_once(tmp_path: Path, store_clock) -> None:
     setup = store(tmp_path)
     preview_id = setup.create_preview(
-        preview_payload(), expires_at=iso(datetime.now(UTC) + timedelta(seconds=10))
+        preview_payload(), expires_at=iso(store_clock[0] + timedelta(seconds=10))
     )
     stores = [PredictionArbitrageStore(tmp_path / "data"), PredictionArbitrageStore(tmp_path / "data")]
 
@@ -1937,10 +1950,10 @@ def test_cross_release_sweep_requires_the_persisted_post_fill_baseline(
     assert db.cross_unsettled_principal() == Decimal("10.50")
 
 
-def test_legacy_preview_execution_payload_has_no_cross_reservation(tmp_path: Path) -> None:
+def test_legacy_preview_execution_payload_has_no_cross_reservation(tmp_path: Path, store_clock) -> None:
     db = store(tmp_path)
     preview_id = db.create_preview(
-        preview_payload(), expires_at=iso(datetime.now(UTC) + timedelta(seconds=10))
+        preview_payload(), expires_at=iso(store_clock[0] + timedelta(seconds=10))
     )
 
     execution = db.consume_preview_and_create_execution(preview_id, "legacy-request")
@@ -2362,15 +2375,16 @@ def test_llm_usage_prune_keeps_recent_calls_only(
     assert db2.llm_usage_24h()["cache_hits"] == 0
 
 
-def test_histories_are_newest_first_for_all_kinds(tmp_path: Path) -> None:
+def test_histories_are_newest_first_for_all_kinds(tmp_path: Path, store_clock) -> None:
     db = store(tmp_path)
-    now = datetime.now(UTC)
+    now = store_clock[0]
     db.upsert_signal(signal_payload("market-1", iso(now - timedelta(minutes=2))))
     db.upsert_signal(signal_payload("market-2", iso(now - timedelta(minutes=1))))
     assert db.histories("signals")[0]["market_id"] == "market-2"
     db2, execution = create_execution(tmp_path, idempotency_key="history-request")
     db2.transition_execution(execution["execution_id"], state="complete", evidence={"step": "done"})
     incident_1 = db2.open_incident(execution["execution_id"], {"kind": "merge"})
+    store_clock[0] += timedelta(microseconds=1)
     incident_2 = db2.open_incident(execution["execution_id"], {"kind": "restart"})
     assert db2.histories("executions")[0]["execution_id"] == execution["execution_id"]
     assert db2.histories("incidents")[0]["incident_id"] == incident_2
@@ -2792,7 +2806,9 @@ def _admission_batch_payload() -> dict[str, object]:
     }
 
 
-def test_lp_and_n_leg_admission_share_one_active_slot(tmp_path: Path) -> None:
+def test_lp_and_n_leg_admission_share_one_active_slot(tmp_path: Path, request) -> None:
+    if run_test_in_subprocess(request):
+        return
     lp_payload = {"market_id": "market-a", "outcome": "YES"}
     n_leg_payload = _admission_batch_payload()
 
@@ -2835,7 +2851,7 @@ def test_lp_and_n_leg_admission_share_one_active_slot(tmp_path: Path) -> None:
     barrier = Barrier(2)
 
     def admit_lp() -> str:
-        barrier.wait()
+        barrier.wait(timeout=5)
         try:
             lp_store.lp_create_session(
                 "lp-concurrent",
@@ -2848,7 +2864,7 @@ def test_lp_and_n_leg_admission_share_one_active_slot(tmp_path: Path) -> None:
             return str(exc)
 
     def admit_n_leg() -> str:
-        barrier.wait()
+        barrier.wait(timeout=5)
         try:
             n_leg_store.n_leg_create_batch(
                 {
@@ -3999,3 +4015,10 @@ def test_lp_register_fenced_actions_is_atomic(tmp_path: Path) -> None:
     assert db.lp_trade_generation() == 1
     _, revision = db.lp_session_with_revision(session_id, trading=True)
     assert revision == 1
+
+
+def test_incident_history_equal_timestamps_uses_descending_id(tmp_path: Path, store_clock):
+    db, execution = create_execution(tmp_path)
+    first = db.open_incident(execution["execution_id"], {"kind": "first"})
+    second = db.open_incident(execution["execution_id"], {"kind": "second"})
+    assert [row["incident_id"] for row in db.histories("incidents")] == sorted((first, second), reverse=True)

@@ -21,6 +21,19 @@ USDT = "0x55d398326f99059fF775485246999027B3197955"
 CTF_EXCHANGE = "0x8BC070BEdAB741406F4B1Eb65A72bee27894B689"
 
 
+@pytest.fixture
+def quote_now(monkeypatch):
+    now = datetime(2026, 9, 22, 12, tzinfo=UTC)
+
+    class QuoteDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz is not None else now.replace(tzinfo=None)
+
+    monkeypatch.setattr("open_trader.predict_trading.datetime", QuoteDatetime)
+    return now
+
+
 class FakeResponse:
     def __init__(self, payload: object, status: int = 200) -> None:
         self.payload = payload
@@ -290,9 +303,9 @@ def test_preflight_signs_market_fok_without_order_request() -> None:
     assert not any("/v1/orders" in request.full_url for request in requests)
 
 
-def test_cross_entry_rejects_a_moved_quote_above_approved_ceiling_without_post() -> None:
+def test_cross_entry_rejects_a_moved_quote_above_approved_ceiling_without_post(quote_now) -> None:
     requests = []
-    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    now_ms = int(quote_now.timestamp() * 1000)
 
     def urlopen_fn(request, **kwargs):
         requests.append(request)
@@ -325,15 +338,16 @@ def test_cross_entry_rejects_a_moved_quote_above_approved_ceiling_without_post()
 
     assert result.accepted is False
     assert result.status == "rejected"
+    assert client._builder.quote_calls == 1  # The quote was checked, not rejected as stale.
     assert not any(
         request.full_url.endswith("/v1/orders") and request.get_method() == "POST"
         for request in requests
     )
 
 
-def test_cross_entry_posts_only_the_preflight_bound_order() -> None:
+def test_cross_entry_posts_only_the_preflight_bound_order(quote_now) -> None:
     requests = []
-    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    now_ms = int(quote_now.timestamp() * 1000)
 
     def urlopen_fn(request, **kwargs):
         requests.append(request)
@@ -371,8 +385,8 @@ def test_cross_entry_posts_only_the_preflight_bound_order() -> None:
     ) == 1
 
 
-def test_cross_entry_accepts_official_eighteen_decimal_sdk_quote() -> None:
-    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+def test_cross_entry_accepts_official_eighteen_decimal_sdk_quote(quote_now) -> None:
+    now_ms = int(quote_now.timestamp() * 1000)
 
     def urlopen_fn(request, **kwargs):
         if request.full_url.endswith("/v1/markets/896/orderbook"):
@@ -406,9 +420,9 @@ def test_cross_entry_accepts_official_eighteen_decimal_sdk_quote() -> None:
     assert result.accepted is True
 
 
-def test_cross_entry_rejects_unknown_zero_gas_without_post() -> None:
+def test_cross_entry_rejects_unknown_zero_gas_without_post(quote_now) -> None:
     requests = []
-    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    now_ms = int(quote_now.timestamp() * 1000)
 
     def urlopen_fn(request, **kwargs):
         requests.append(request)
@@ -436,6 +450,8 @@ def test_cross_entry_rejects_unknown_zero_gas_without_post() -> None:
     }
 
     assert client.no_submit_cross_buy_preflight(order).accepted is False
+    assert client._builder.quote_calls == 0
+    assert requests == []  # Invalid gas is rejected before fetching a book.
     assert not any(
         request.full_url.endswith("/v1/orders") and request.get_method() == "POST"
         for request in requests
@@ -902,7 +918,7 @@ def test_submit_uses_fresh_server_fee_rate() -> None:
     assert client._builder.last_order_input.fee_rate_bps == "201"
 
 
-def test_cross_remediation_option_and_submit_bind_a_fresh_predict_buy_quote() -> None:
+def test_cross_remediation_option_and_submit_bind_a_fresh_predict_buy_quote(quote_now) -> None:
     requests = []
 
     def urlopen_fn(request, **kwargs):
@@ -912,7 +928,7 @@ def test_cross_remediation_option_and_submit_bind_a_fresh_predict_buy_quote() ->
                 {
                     "data": {
                         "marketId": 896,
-                        "updateTimestampMs": int(datetime.now(UTC).timestamp() * 1000),
+                        "updateTimestampMs": int(quote_now.timestamp() * 1000),
                         "asks": [["0.51", "3"]],
                         "bids": [["0.50", "2"]],
                     }

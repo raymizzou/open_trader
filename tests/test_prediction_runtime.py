@@ -41,6 +41,50 @@ from open_trader.polymarket_lp import PolymarketLPService
 from open_trader.prediction_arbitrage_execution import PredictionExecutionService
 
 
+
+class _ControlledRuntimeEvent:
+    """Drive one runtime wait at a time without replacing any process clock."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._set = False
+        self._expirations = 0
+        self.waits: list[float | None] = []
+
+    def set(self) -> None:
+        with self._condition:
+            self._set = True
+            self._condition.notify_all()
+
+    def clear(self) -> None:
+        with self._condition:
+            self._set = False
+
+    def is_set(self) -> bool:
+        with self._condition:
+            return self._set
+
+    def wait(self, timeout: float | None = None) -> bool:
+        with self._condition:
+            self.waits.append(timeout)
+            self._condition.notify_all()
+            self._condition.wait_for(lambda: self._set or self._expirations > 0)
+            if self._set:
+                return True
+            self._expirations -= 1
+            return False
+
+    def expire(self) -> None:
+        with self._condition:
+            self._expirations += 1
+            self._condition.notify_all()
+
+    def wait_until_waiting(self, count: int) -> None:
+        with self._condition:
+            assert self._condition.wait_for(lambda: len(self.waits) >= count, timeout=5), (
+                f"runtime entered {len(self.waits)} waits; expected {count}"
+            )
+
 def _shadow_cross_pair(index: int) -> ExplicitMarketPair:
     now = datetime(2026, 1, 1, tzinfo=UTC)
     finish = datetime(2027, 1, 1, tzinfo=UTC)
@@ -241,8 +285,10 @@ def _hold_owner_lock(path: str, ready: object, release: object) -> None:
     lock = _RuntimeOwnershipLock(Path(path))
     lock.acquire()
     ready.set()  # type: ignore[attr-defined]
-    release.wait(10)  # type: ignore[attr-defined]
-    lock.release()
+    try:
+        release.wait()  # type: ignore[attr-defined]
+    finally:
+        lock.release()
 
 
 def _hold_owner_lock_then_exit(path: str, marker_path: str) -> None:
@@ -368,6 +414,19 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
 ) -> None:
     import open_trader.prediction_runtime as runtime_module
 
+    import open_trader.prediction_arbitrage_execution as execution_module
+
+    business_now = [datetime(2026, 9, 16, 12, tzinfo=UTC)]
+
+    class BusinessDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = business_now[0]
+            return value.astimezone(tz) if tz is not None else value.replace(tzinfo=None)
+
+    business_now[0] = BusinessDatetime.fromtimestamp(business_now[0].timestamp(), tz=UTC)
+    monkeypatch.setattr(execution_module, "datetime", BusinessDatetime)
+    monkeypatch.setattr(runtime_module, "datetime", BusinessDatetime)
     calls: list[tuple[str, object]] = []
     lp_events = {
         name: threading.Event()
@@ -407,19 +466,19 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
                 "original_size": Decimal("20"),
                 "size_matched": Decimal("0"),
                 "remaining_size": Decimal("20"),
-                "expiration": (datetime.now(UTC) + timedelta(hours=1)),
+                "expiration": (business_now[0] + timedelta(hours=1)),
             }
 
         def readiness_snapshot(self) -> dict[str, object]:
             return {
-                "checked_at": datetime.now(UTC),
+                "checked_at": business_now[0],
                 "relayer_ready": True,
                 "merge_ready": True,
             }
 
         def account_snapshot(self) -> dict[str, object]:
             return {
-                "checked_at": datetime.now(UTC),
+                "checked_at": business_now[0],
                 "open_order_ids": ("manual-order", "lp-order"),
                 "positions": (),
             }
@@ -428,7 +487,7 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
             self, *, trade_generation_provider=None
         ) -> dict[str, object]:
             lp_events["account"].set()
-            now = datetime.now(UTC)
+            now = business_now[0]
             provider = trade_generation_provider
             return {
                 "authenticated": True,
@@ -454,13 +513,13 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
             return order_id == "lp-order"
 
         def lp_snapshot(self, _request: object) -> dict[str, object]:
-            now = datetime.now(UTC)
+            now = business_now[0]
             return {
                 "account": {
                     "wallet_address": "0xwallet",
                     "open_orders_complete": True,
                     "positions_complete": True,
-                    "checked_at": datetime.now(UTC),
+                    "checked_at": business_now[0],
                     "authenticated": True,
                     "balance": Decimal("100"),
                     "allowance": Decimal("100"),
@@ -504,7 +563,7 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
             return {
                 "state": "known",
                 "complete": True,
-                "checked_at": datetime.now(UTC),
+                "checked_at": business_now[0],
                 "daily_pool_usd": Decimal("100"),
                 "markets": ({
                     "condition_id": "candidate-condition",
@@ -520,7 +579,7 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
         def lp_market_metadata(self, condition_ids: object, **_kwargs: object) -> dict[str, dict[str, object]]:
             del condition_ids
             lp_events["metadata"].set()
-            checked_at = datetime.now(UTC)
+            checked_at = business_now[0]
             return {
                 "candidate-condition": {
                     "market_id": "candidate-market",
@@ -531,7 +590,7 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
                     "metadata_checked_at": checked_at,
                     "fees_checked_at": checked_at,
                     "event_ended": False,
-                    "event_start_time": datetime.now(UTC) + timedelta(hours=2),
+                    "event_start_time": business_now[0] + timedelta(hours=2),
                     "accepting_orders": True,
                     "minimum_order_size": Decimal("1"),
                     "tick_size": Decimal("0.01"),
@@ -579,7 +638,7 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
         def lp_order_books(self, token_ids: object, *, stop_event: threading.Event | None = None) -> dict[str, dict[str, object]]:
             del stop_event
             lp_events["books"].set()
-            now = datetime.now(UTC)
+            now = business_now[0]
             return {
                 token: {
                     "token_id": token,
@@ -667,11 +726,11 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
         payload={
             "market_id": "manual-market", "condition_id": "manual-condition",
             "token_id": "manual-token", "outcome": "NO", "price": "0.36",
-            "quantity": "100", "review_at": (datetime.now(UTC).replace(microsecond=0)).isoformat(),
+            "quantity": "100", "review_at": (business_now[0].replace(microsecond=0)).isoformat(),
         },
     )
-    risk_stale_at = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
-    risk_expiry = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+    risk_stale_at = (business_now[0] - timedelta(minutes=5)).isoformat()
+    risk_expiry = (business_now[0] + timedelta(hours=1)).isoformat()
     store.lp_create_session(
         "lp-risk-session", "lp-risk-idempotency", state="entry_open",
         payload={
@@ -716,7 +775,7 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
             "scoring_order_role": "entry",
             "account_checked_at": risk_stale_at,
             "book_checked_at": risk_stale_at,
-            "reward_date": datetime.now(UTC).date().isoformat(),
+            "reward_date": business_now[0].date().isoformat(),
             "trade_pnl": Decimal("0"),
             "paid_rewards": Decimal("0"),
         },
@@ -727,7 +786,7 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
     # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先在库中预置竞争值
     # （假件无竞争读；运行时自建 store 实例，同一 sqlite 文件可见）。
     store.lp_competitiveness_upsert(
-        (("candidate-condition", Decimal("2"), datetime.now(UTC)),)
+        (("candidate-condition", Decimal("2"), business_now[0]),)
     )
     assert risk_before is not None
     assert risk_before["state"] == "entry_open"
@@ -743,6 +802,7 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
     def make_runtime() -> PredictionRuntime:
         return PredictionRuntime(
             data_dir=tmp_path,
+            history_clock=lambda: business_now[0],
             prediction_config_path=tmp_path / "prediction.json",
             dashboard_url="http://127.0.0.1:8766/",
             notifier=SimpleNamespace(_notifiers=(ExternalNotifier("macos"), ExternalNotifier("feishu"))),
@@ -873,7 +933,7 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
     preparation_before_restart = runtime.lp.preparation_snapshot()  # type: ignore[union-attr]
     last_attempt_before_restart = preparation_before_restart["last_attempt_at"]
     summary_before_restart = store.lp_price_history_summary(
-        "candidate-condition", "candidate-yes", now=datetime.now(UTC)
+        "candidate-condition", "candidate-yes", now=business_now[0]
     )
     assert summary_before_restart is not None
     summary_timestamps_before_restart = {
@@ -882,7 +942,8 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
     }
     for event in lp_events.values():
         event.clear()
-    warm_restart_started_at = datetime.now(UTC)
+    business_now[0] += timedelta(seconds=1)
+    warm_restart_started_at = business_now[0]
     restarted = make_runtime()
     try:
         restarted.start()
@@ -906,9 +967,7 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
         restarted_attempt_at = datetime.fromisoformat(
             str(restarted_preparation["last_attempt_at"]).replace("Z", "+00:00")
         )
-        assert warm_restart_started_at <= restarted_attempt_at <= (
-            warm_restart_started_at + timedelta(seconds=2)
-        )
+        assert restarted_attempt_at == warm_restart_started_at
         dashboard_deadline = time.monotonic() + 3
         restarted_dashboard = restarted.execution.lp_dashboard()  # type: ignore[union-attr]
         while (
@@ -956,7 +1015,7 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
             == "below"
         )
         summary_after_restart = store.lp_price_history_summary(
-            "candidate-condition", "candidate-yes", now=datetime.now(UTC)
+            "candidate-condition", "candidate-yes", now=business_now[0]
         )
         assert summary_after_restart is not None
         assert {
@@ -1392,6 +1451,10 @@ def test_lp_restart_owns_one_session_and_preserves_monitoring(
         prediction_config_path=tmp_path / "prediction.json",
         dashboard_url="http://127.0.0.1:8766/",
     )
+    first_wait = _ControlledRuntimeEvent()
+    second_wait = _ControlledRuntimeEvent()
+    first._lp_stop_event = first_wait
+    second._lp_stop_event = second_wait
     first_lp = FakeLP()
     second_lp = FakeLP()
     first.store = store
@@ -1407,7 +1470,10 @@ def test_lp_restart_owns_one_session_and_preserves_monitoring(
         first._start_lp_monitor()
         first_thread = first._lp_thread
         assert first_thread is not None
-        assert first_lp.tick_seen.wait(timeout=2)
+        first_wait.wait_until_waiting(1)
+        first_wait.expire()
+        first_wait.wait_until_waiting(2)
+        assert first_lp.tick_seen.is_set()
         first._start_lp_monitor()
         assert first._lp_thread is first_thread
         assert first_lp.session_ids == ["lp-session"]
@@ -1427,7 +1493,10 @@ def test_lp_restart_owns_one_session_and_preserves_monitoring(
         second._start_lp_monitor()
         second_thread = second._lp_thread
         assert second_thread is not None
-        assert second_lp.tick_seen.wait(timeout=2)
+        second_wait.wait_until_waiting(1)
+        second_wait.expire()
+        second_wait.wait_until_waiting(2)
+        assert second_lp.tick_seen.is_set()
         assert second_lp.session_ids == ["lp-session"]
         assert store.lp_active_session()["session_id"] == "lp-session"  # type: ignore[index]
     finally:
@@ -1436,6 +1505,7 @@ def test_lp_restart_owns_one_session_and_preserves_monitoring(
             thread = runtime._lp_thread
             if thread is not None:
                 thread.join(timeout=2)
+                assert not thread.is_alive()
                 runtime._lp_thread = None
             runtime._owner.release()
 
@@ -2109,7 +2179,7 @@ def test_candidate_monitors_run_independently(
             del stop_event
             self.scan_forces.append(force)
             scan_entered.set()
-            assert scan_release.wait(timeout=10)
+            scan_release.wait()
             return {"state": "unknown", "scanning": False}
 
         def refresh_candidate_recommendations(
@@ -2178,6 +2248,8 @@ def test_candidate_monitors_run_independently(
         n_leg_paused=True,
         enable_n_leg_background=False,
     )
+    wake = _ControlledRuntimeEvent()
+    runtime._lp_candidate_refresh_requested = wake
     runtime.start()
     try:
         assert runtime.lp is not None
@@ -2194,17 +2266,13 @@ def test_candidate_monitors_run_independently(
         # The dashboard snapshot thread ran on its own cadence.
         assert len(dashboard_calls) >= 1
 
-        # Releasing the scan lets it finish; the failed (non-ready) round
-        # waits 60 seconds, so the next scan round comes from the manual
-        # page refresh and runs with force=True.
+        # A non-ready round uses the same two-second floor. Park that
+        # wait explicitly so unrelated real maintenance timing cannot race it.
         scan_release.set()
-        deadline = time.monotonic() + 5
-        while len(runtime.lp.scan_forces) < 1 and time.monotonic() < deadline:
-            time.sleep(0.01)
+        wake.wait_until_waiting(1)
+        assert wake.waits == [2.0]
         assert runtime.queue_lp_candidate_refresh() is True
-        deadline = time.monotonic() + 5
-        while len(runtime.lp.scan_forces) < 2 and time.monotonic() < deadline:
-            time.sleep(0.01)
+        wake.wait_until_waiting(2)
         assert len(runtime.lp.scan_forces) == 2
         assert runtime.lp.scan_forces[0] is True
         assert runtime.lp.scan_forces[1] is True
@@ -2298,28 +2366,27 @@ def test_candidate_monitor_scan_cadence(
         n_leg_paused=True,
         enable_n_leg_background=False,
     )
+    wake = _ControlledRuntimeEvent()
+    runtime._lp_candidate_refresh_requested = wake
     runtime.start()
     try:
         assert runtime.lp is not None
-        # The first exploration batch runs immediately with force=True.
-        deadline = time.monotonic() + 5
-        while len(runtime.lp.calls) < 1 and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert runtime.lp.calls[0] is True
-        # The ready result holds the loop on the two-second batch floor:
-        # no busy polling and no 300-second round gate.
-        time.sleep(0.8)
-        assert len(runtime.lp.calls) == 1
+        # Waiting is reached only after the preceding batch has completed.
+        wake.wait_until_waiting(1)
+        assert runtime.lp.calls == [True]
+        assert wake.waits == [2.0]
 
-        # A manual page refresh wakes the next batch before the floor.
+        # Explicitly expire an ordinary floor, then park the next batch.
+        wake.expire()
+        wake.wait_until_waiting(2)
+        assert runtime.lp.calls == [True, True]
+        assert wake.waits == [2.0, 2.0]
+
+        # Manual refresh interrupts the floor and starts exactly one batch.
         assert runtime.queue_lp_candidate_refresh() is True
-        deadline = time.monotonic() + 5
-        while len(runtime.lp.calls) < 2 and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert runtime.lp.calls[1] is True
-        # The floor restarts after the manual wake.
-        time.sleep(1.0)
-        assert len(runtime.lp.calls) == 2
+        wake.wait_until_waiting(3)
+        assert runtime.lp.calls == [True, True, True]
+        assert wake.waits == [2.0, 2.0, 2.0]
     finally:
         runtime.stop()
     assert runtime.state == "STOPPED"
@@ -2643,6 +2710,10 @@ def test_lp_trial_maintenance_runs_without_page_and_stops(
         history_clock=read_clock,
         history_wait=wait_for_history,
     )
+    maintenance_wait = _ControlledRuntimeEvent()
+    scan_wait = _ControlledRuntimeEvent()
+    runtime2._candidate_maintenance_wakeup = maintenance_wait
+    runtime2._lp_candidate_refresh_requested = scan_wait
     runtime2.start()
     try:
         assert runtime2.state == "RUNNING"
@@ -2660,9 +2731,12 @@ def test_lp_trial_maintenance_runs_without_page_and_stops(
         # the published books are already 59 seconds old.
         assert maintenance_finished.wait(timeout=5)
         assert len(book_calls) == 2
-        reads_after_partial_refresh = clock_reads
-        time.sleep(0.35)
-        assert clock_reads - reads_after_partial_refresh <= 10
+        # The next idle wait is a post-publication barrier. Both candidate
+        # loops remain parked while their requested cadence is inspected.
+        scan_wait.wait_until_waiting(1)
+        maintenance_wait.wait_until_waiting(2)
+        assert all(interval >= 1.0 for interval in maintenance_wait.waits)
+        assert len(book_calls) == 2
     finally:
         runtime2.stop()
     assert runtime2.state == "STOPPED"
@@ -3271,6 +3345,23 @@ def test_lp_share_watch_runs_without_dashboard_and_stops_with_runtime(
         config.wallet_address.casefold().encode("utf-8")
     ).hexdigest()
     controlled_clock = [0.0]
+    inspected = threading.Condition()
+    inspected_times: list[float] = []
+    dashboard_contended = threading.Event()
+
+    class ObservedPercentageLock:
+        def __init__(self) -> None:
+            self.lock = threading.Lock()
+
+        def __enter__(self):
+            if not self.lock.acquire(blocking=False):
+                if threading.current_thread().name == "timing-dashboard-refresh":
+                    dashboard_contended.set()
+                self.lock.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            self.lock.release()
     probe = SimpleNamespace(
         lock=threading.Lock(),
         order_reads=0,
@@ -3493,6 +3584,15 @@ def test_lp_share_watch_runs_without_dashboard_and_stops_with_runtime(
         def __init__(self, *args: object, **kwargs: object) -> None:
             super().__init__(*args, **kwargs)
             self._clock = lambda: controlled_clock[0]
+            self._lp_reward_percentage_lock = ObservedPercentageLock()
+
+        def refresh_lp_share_watch(self, **kwargs):
+            sampled_at = controlled_clock[0]
+            result = super().refresh_lp_share_watch(**kwargs)
+            with inspected:
+                inspected_times.append(sampled_at)
+                inspected.notify_all()
+            return result
 
         def reconcile_startup(self) -> dict[str, object]:
             return {"state": "ready"}
@@ -3575,6 +3675,7 @@ def test_lp_share_watch_runs_without_dashboard_and_stops_with_runtime(
             time.sleep(0.005)
         assert predicate()  # type: ignore[operator]
 
+    dashboard_thread = None
     try:
         runtime.start()
         assert runtime.state == "RUNNING"
@@ -3585,7 +3686,8 @@ def test_lp_share_watch_runs_without_dashboard_and_stops_with_runtime(
         wait_for(probe.reward_rate_started.is_set)
 
         controlled_clock[0] = 5.0
-        time.sleep(0.05)
+        with inspected:
+            assert inspected.wait_for(lambda: 5.0 in inspected_times, timeout=2)
         assert probe.percentage_reads == 1
 
         controlled_clock[0] = 10.0
@@ -3611,9 +3713,12 @@ def test_lp_share_watch_runs_without_dashboard_and_stops_with_runtime(
             )
             dashboard_done.set()
 
-        dashboard_thread = threading.Thread(target=read_dashboard)
+        dashboard_thread = threading.Thread(
+            target=read_dashboard, name="timing-dashboard-refresh"
+        )
         dashboard_thread.start()
-        assert not dashboard_done.wait(timeout=0.05)
+        assert dashboard_contended.wait(timeout=2)
+        assert not dashboard_done.is_set()
         controlled_clock[0] = 35.0
         probe.percentage_release.set()
         dashboard_thread.join(timeout=1)
@@ -3767,6 +3872,10 @@ def test_lp_share_watch_runs_without_dashboard_and_stops_with_runtime(
             probe.percentage_release.set()
             runtime.stop()
 
+        if dashboard_thread is not None:
+            dashboard_thread.join(timeout=2)
+            assert not dashboard_thread.is_alive()
+
 
 def test_runtime_owner_lock_excludes_a_real_second_process(tmp_path: Path) -> None:
     context = multiprocessing.get_context("spawn")
@@ -3778,11 +3887,13 @@ def test_runtime_owner_lock_excludes_a_real_second_process(tmp_path: Path) -> No
         target=_hold_owner_lock,
         args=(str(path), ready, release),
     )
+    children = [first]
     first.start()
     try:
         assert ready.wait(5)
         second = context.Process(target=_try_owner_lock, args=(str(path), result))
         second.start()
+        children.append(second)
         second.join(5)
         assert second.exitcode == 0
         assert result.get(timeout=1) == "blocked"
@@ -3793,12 +3904,23 @@ def test_runtime_owner_lock_excludes_a_real_second_process(tmp_path: Path) -> No
 
         third = context.Process(target=_try_owner_lock, args=(str(path), result))
         third.start()
+        children.append(third)
         third.join(5)
         assert third.exitcode == 0
         assert result.get(timeout=1) == "acquired"
     finally:
         release.set()
-        first.join(5)
+        for child in children:
+            child.join(5)
+            if child.is_alive():
+                child.terminate()
+                child.join(5)
+            if child.is_alive():
+                child.kill()
+                child.join(5)
+            assert not child.is_alive()
+        result.close()
+        result.join_thread()
 
 
 def test_runtime_owner_lock_releases_after_owner_process_exit(tmp_path: Path) -> None:
@@ -4709,18 +4831,27 @@ def test_cross_runtime_start_timeout_is_reported(
 ) -> None:
     import open_trader.prediction_runtime as runtime_module
 
+    stopped = threading.Event()
+
     class SlowCrossMonitor:
         async def start(self) -> None:
-            await asyncio.sleep(0.05)
+            # Only the real startup-timeout path may release this startup.
+            await asyncio.to_thread(runtime._stop_requested.wait)
 
         async def stop(self) -> None:
-            pass
+            stopped.set()
 
     monkeypatch.setattr(runtime_module, "_CROSS_VENUE_START_TIMEOUT", 0.001)
     runtime = _CrossVenueRuntime(SlowCrossMonitor())
 
-    with pytest.raises(RuntimeError, match="did not start"):
-        runtime.start()
+    try:
+        with pytest.raises(RuntimeError, match="did not start"):
+            runtime.start()
+    finally:
+        runtime._stop_requested.set()
+        if runtime._thread is not None:
+            runtime._thread.join(timeout=5)
+    assert stopped.is_set()
     assert not runtime.thread_alive
 
 
@@ -4944,40 +5075,46 @@ def test_shadow_runtime_stops_on_first_guard_violation_from_owner_thread(
         mode="shadow",
     )
     runtime._owner = Owner()  # type: ignore[assignment]
-    runtime.start()
-    assert runtime.mode == "shadow"
-    assert runtime.production_owner is False
+    try:
+        runtime.start()
+        assert runtime.mode == "shadow"
+        assert runtime.production_owner is False
 
-    with pytest.raises(RuntimeError, match="blocked"):
-        runtime._prediction_trading.cancel_all()  # type: ignore[union-attr]
-    with pytest.raises(RuntimeError, match="blocked"):
-        runtime._prediction_trading.place_order()  # type: ignore[union-attr]
-    assert network_calls == []
-    callback_result: list[dict[str, object] | None] = []
-    callback_thread = threading.Thread(
-        target=lambda: callback_result.append(runtime.poll_shadow_failure())
-    )
-    callback_thread.start()
-    callback_thread.join()
-    assert callback_result == [None]
-    assert runtime.state == "RUNNING"
-    assert runtime.poll_shadow_failure() == {
-        "venue": "polymarket",
-        "kind": "mutation",
-        "method": "cancel_all",
-        "call_chain": [f"frame-{index}" for index in range(12)],
-    }
-    assert runtime.state == "STOPPED"
-    assert runtime.shadow_evidence["guard_attempts"][0]["method"] == "cancel_all"
-    assert runtime.shadow_evidence["guard_attempts"][1]["method"] == "place_order"
-    assert validator_kwargs[0]["max_llm_calls"] == 3
-    assert cross_kwargs[0]["holding_reconciler"] is None
-    assert events == [
-        "shadow_owner.acquire", "shadow_store.open", "clients.open", "guards.enter",
-        "predict_guard.enter", "monitor.start", "cross.start", "cross.stop", "monitor.stop",
-        "predict_guard.exit", "guards.exit",
-        "execution.close", "polymarket.close", "shadow_store.close", "shadow_owner.release",
-    ]
+        with pytest.raises(RuntimeError, match="blocked"):
+            runtime._prediction_trading.cancel_all()  # type: ignore[union-attr]
+        with pytest.raises(RuntimeError, match="blocked"):
+            runtime._prediction_trading.place_order()  # type: ignore[union-attr]
+        assert network_calls == []
+        callback_result: list[dict[str, object] | None] = []
+        callback_thread = threading.Thread(
+            target=lambda: callback_result.append(runtime.poll_shadow_failure()),
+            daemon=True,
+        )
+        callback_thread.start()
+        callback_thread.join(timeout=5)
+        assert not callback_thread.is_alive()
+        assert callback_result == [None]
+        assert runtime.state == "RUNNING"
+        assert runtime.poll_shadow_failure() == {
+            "venue": "polymarket",
+            "kind": "mutation",
+            "method": "cancel_all",
+            "call_chain": [f"frame-{index}" for index in range(12)],
+        }
+        assert runtime.state == "STOPPED"
+        assert runtime.shadow_evidence["guard_attempts"][0]["method"] == "cancel_all"
+        assert runtime.shadow_evidence["guard_attempts"][1]["method"] == "place_order"
+        assert validator_kwargs[0]["max_llm_calls"] == 3
+        assert cross_kwargs[0]["holding_reconciler"] is None
+        assert events == [
+            "shadow_owner.acquire", "shadow_store.open", "clients.open", "guards.enter",
+            "predict_guard.enter", "monitor.start", "cross.start", "cross.stop", "monitor.stop",
+            "predict_guard.exit", "guards.exit",
+            "execution.close", "polymarket.close", "shadow_store.close", "shadow_owner.release",
+        ]
+
+    finally:
+        runtime.stop()
 
 
 def test_shadow_evidence_codex_counters_come_from_llm_attributes(
@@ -9389,7 +9526,7 @@ def test_lp_today_orders_cached_fills_follow_market_gate_and_session_management(
 
 
 def test_lp_today_orders_trade_reads_throttled_until_ttl_expires(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """R5: 同一奖励日内按市场节流成交重读；TTL 内不再调用 lp_account_trades，
     过期后重新入队。"""
@@ -9402,8 +9539,10 @@ def test_lp_today_orders_trade_reads_throttled_until_ttl_expires(
                 predict=None,
             )
             self.trade_calls: list[tuple[str, ...]] = []
+            self.account_reads = 0
 
         def lp_account_snapshot(self) -> dict[str, object]:
+            self.account_reads += 1
             return {
                 "authenticated": True,
                 "checked_at": datetime(2026, 9, 16, 10, tzinfo=UTC),
@@ -9494,26 +9633,57 @@ def test_lp_today_orders_trade_reads_throttled_until_ttl_expires(
     clock = {"now": 1000.0}
     service._clock = lambda: clock["now"]  # type: ignore[method-assign]
 
-    def wait_for_reads(count: int) -> None:
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            if len(trading.trade_calls) >= count:
-                return
-            time.sleep(0.02)
-        raise AssertionError(f"expected {count} trade reads, got {len(trading.trade_calls)}")
+    # Both producers publish under the dashboard lock. Capture their real
+    # handles while the scheduling call still owns that lock: the service may
+    # clear its thread field just before the thread's final cleanup completes.
+    workers: list[threading.Thread] = []
+    for schedule_name, worker_attribute in (
+        ("_schedule_lp_reward_refresh", "_lp_reward_refresh_thread"),
+        ("_schedule_lp_orders_today_refresh", "_lp_orders_today_refresh_thread"),
+    ):
+        schedule = getattr(service, schedule_name)
 
-    # 第一次装配触发首次成交读取。
-    service.refresh_lp_dashboard_snapshot()
-    wait_for_reads(1)
-    # TTL 内的后续装配不再重读该市场。
-    service.refresh_lp_dashboard_snapshot()
-    service.refresh_lp_dashboard_snapshot()
-    time.sleep(0.3)
+        def schedule_and_capture(
+            *args, _schedule=schedule, _worker_attribute=worker_attribute, **kwargs
+        ):
+            _schedule(*args, **kwargs)
+            worker = getattr(service, _worker_attribute)
+            if worker is not None and worker not in workers:
+                workers.append(worker)
+
+        monkeypatch.setattr(service, schedule_name, schedule_and_capture)
+
+    def refresh_and_drain() -> None:
+        account_reads = trading.account_reads
+        service.refresh_lp_dashboard_snapshot()
+        # One independent real watchdog covers completion of every producer,
+        # including reward publication that can coalesce a subsequent refresh.
+        deadline = time.monotonic() + 5
+        for worker in workers:
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+            assert not worker.is_alive(), f"{worker.name} did not publish and exit"
+        assert not service._lp_orders_today_pending
+        assert not service._lp_reward_refresh_pending
+        assert not service._lp_reward_refresh_active
+        # A cached/coalesced response is not evidence that this TTL was checked.
+        assert trading.account_reads == account_reads + 1
+
+    key = ("2026-09-16", "condition-1")
+    # 第一次装配触发首次成交读取，且两个后台发布任务都已退出。
+    refresh_and_drain()
     assert len(trading.trade_calls) == 1
-    # 注入时钟越过 TTL 后重新入队。
-    clock["now"] += 61.0
-    service.refresh_lp_dashboard_snapshot()
-    wait_for_reads(2)
+    assert service._lp_orders_today_trades_read_at == {key: 1000.0}
+    # TTL 内的后续装配不再重读该市场，包括紧邻到期前的边界。
+    refresh_and_drain()
+    clock["now"] = 1059.999
+    refresh_and_drain()
+    assert len(trading.trade_calls) == 1
+    assert service._lp_orders_today_trades_read_at == {key: 1000.0}
+    # 注入时钟越过 TTL 后重新入队，并等待真实完成后检查更新时间。
+    clock["now"] = 1061.0
+    refresh_and_drain()
+    assert len(trading.trade_calls) == 2
+    assert service._lp_orders_today_trades_read_at == {key: 1061.0}
     assert trading.trade_calls[0] == ("condition-1",)
     assert trading.trade_calls[1] == ("condition-1",)
 
@@ -10126,6 +10296,9 @@ def test_lp_monitor_report_waits_until_every_group_ready(
     runtime.execution = FakeExecution()  # type: ignore[assignment]
     monkeypatch.setattr(runtime_module, "_LP_TICK_SECONDS", 0.01)
 
+    tick_wait = _ControlledRuntimeEvent()
+    runtime._lp_stop_event = tick_wait
+    thread = None
     runtime._owner.acquire()
     try:
         # 一组未就绪：整轮不触发日报。
@@ -10141,7 +10314,10 @@ def test_lp_monitor_report_waits_until_every_group_ready(
         runtime._start_lp_monitor()
         thread = runtime._lp_thread
         assert thread is not None
-        assert not reported.wait(timeout=0.3)
+        tick_wait.wait_until_waiting(1)
+        tick_wait.expire()
+        tick_wait.wait_until_waiting(2)
+        assert not reported.is_set()
         assert reports == []
 
         # 截止撤销等待例外按组保留：B 为 needs_attention 但处于
@@ -10160,12 +10336,15 @@ def test_lp_monitor_report_waits_until_every_group_ready(
             "account_checked_at": stamp,
             "book_checked_at": stamp,
         }
-        assert reported.wait(timeout=2)
+        tick_wait.expire()
+        tick_wait.wait_until_waiting(3)
+        assert reported.is_set()
         assert reports == ["report"]
     finally:
         runtime._lp_stop_event.set()
         if thread is not None:
             thread.join(timeout=2)
+            assert not thread.is_alive()
             runtime._lp_thread = None
         runtime._owner.release()
 

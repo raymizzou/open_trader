@@ -1476,7 +1476,14 @@ def test_daily_runner_blocks_unhealthy_published_portfolio_before_premarket(
     monkeypatch.setattr(
         daily_premarket, "TigerAccountClient", unexpected_broker_client, raising=False
     )
-    now = datetime.now(timezone(timedelta(hours=8)))
+    now = datetime(2026, 7, 30, 8, tzinfo=timezone(timedelta(hours=8)))
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz is not None else now.replace(tzinfo=None)
+
+    monkeypatch.setattr(daily_premarket, "datetime", FixedDatetime)
     config = _daily_config(tmp_path)
     _write_published_account_state(
         config,
@@ -1521,7 +1528,14 @@ def test_daily_runner_blocks_unhealthy_published_quotes_before_premarket(
     monkeypatch.setattr(
         daily_premarket, "OpenAIClassifierClient", lambda **_: object()
     )
-    now = datetime.now(timezone(timedelta(hours=8)))
+    now = datetime(2026, 7, 30, 8, tzinfo=timezone(timedelta(hours=8)))
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz is not None else now.replace(tzinfo=None)
+
+    monkeypatch.setattr(daily_premarket, "datetime", FixedDatetime)
     config = _daily_config(tmp_path)
     _write_published_account_state(config, now=now)
     quotes_path = config.data_dir / "latest/quotes.json"
@@ -6029,3 +6043,28 @@ def test_launchd_installer_renders_and_installs_allocation_before_market_control
     ]
     assert payload["RunAtLoad"] is True and payload["KeepAlive"] is True
     assert "verified launchd allocation: pid=4242" in result.stdout
+
+
+@pytest.mark.parametrize("source,age,allowed", [
+    ("controller", 14.999, True), ("controller", 15.0, True), ("controller", 15.001, False),
+    ("quotes", 14.999, True), ("quotes", 15.0, True), ("quotes", 15.001, False),
+])
+def test_published_premarket_inputs_preserve_exact_freshness_boundaries(
+    tmp_path: Path, source: str, age: float, allowed: bool,
+) -> None:
+    now = datetime(2026, 7, 30, 8, tzinfo=timezone(timedelta(hours=8)))
+    config = _daily_config(tmp_path)
+    _write_published_account_state(
+        config, now=now,
+        controller_heartbeat=now - timedelta(seconds=age if source == "controller" else 0),
+    )
+    (config.data_dir / "latest/quotes.json").write_text(json.dumps({
+        "status": "ok", "stale": False, "quotes": {},
+        "last_success_at": (now - timedelta(seconds=age if source == "quotes" else 0)).isoformat(),
+    }), encoding="utf-8")
+    kwargs = dict(data_dir=config.data_dir, portfolio_path=config.portfolio, market="US", now=now)
+    if allowed:
+        assert daily_premarket.require_published_portfolio(**kwargs) == config.portfolio
+    else:
+        with pytest.raises(RuntimeError, match="stale"):
+            daily_premarket.require_published_portfolio(**kwargs)

@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+import open_trader.backtest_prices as backtest_prices
+
 from open_trader.backtest_prices import (
     BacktestDateRange,
     ensure_backtest_price_range,
@@ -386,8 +388,15 @@ class LatestDiscoveryProvider:
         return [DailyKlineBar(date=start, close=100, volume=1000), DailyKlineBar(date=self.latest.isoformat(), close=101, volume=1000)]
 
 
-def test_resolved_range_uses_last_trading_bar_for_default_end(tmp_path: Path) -> None:
-    latest = date.today() - timedelta(days=2)
+@pytest.mark.parametrize("today", [date(2024, 2, 29), date(2026, 1, 1), date(2026, 12, 31)])
+def test_resolved_range_uses_last_trading_bar_for_default_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, today: date) -> None:
+    class FixedDate(date):
+        @classmethod
+        def today(cls) -> date:
+            return today
+
+    monkeypatch.setattr(backtest_prices, "date", FixedDate)
+    latest = today - timedelta(days=2)
     provider = LatestDiscoveryProvider(latest)
     result = ensure_resolved_backtest_price_range(
         data_dir=tmp_path, market="US", symbol="MSFT", preset="1Y",
@@ -395,11 +404,18 @@ def test_resolved_range_uses_last_trading_bar_for_default_end(tmp_path: Path) ->
     )
     assert result.date_range.requested_end == latest
     assert result.price_range.actual_end == latest
-    assert provider.requests[0][2] == date.today().isoformat()
+    assert provider.requests[0][2] == today.isoformat()
 
 
-def test_resolved_range_refetches_when_recomputed_warmup_is_earlier(tmp_path: Path) -> None:
-    latest = date.today() - timedelta(days=2)
+@pytest.mark.parametrize("today", [date(2024, 2, 29), date(2026, 1, 1), date(2026, 12, 31)])
+def test_resolved_range_refetches_when_recomputed_warmup_is_earlier(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, today: date) -> None:
+    class FixedDate(date):
+        @classmethod
+        def today(cls) -> date:
+            return today
+
+    monkeypatch.setattr(backtest_prices, "date", FixedDate)
+    latest = today - timedelta(days=2)
     provider = LatestDiscoveryProvider(latest)
     result = ensure_resolved_backtest_price_range(
         data_dir=tmp_path, market="US", symbol="MSFT", preset="3Y",
@@ -422,13 +438,20 @@ def test_resolved_custom_end_preserves_request_and_clamps_effective_end(tmp_path
     assert result.price_range.actual_end == latest
 
 
-def test_resolved_range_propagates_chinese_empty_provider_error(tmp_path: Path) -> None:
+@pytest.mark.parametrize("today", [date(2024, 2, 29), date(2026, 1, 1), date(2026, 12, 31)])
+def test_resolved_range_propagates_chinese_empty_provider_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, today: date) -> None:
+    class FixedDate(date):
+        @classmethod
+        def today(cls) -> date:
+            return today
+
+    monkeypatch.setattr(backtest_prices, "date", FixedDate)
     provisional = resolve_backtest_range(
-        preset="1Y", custom_start=None, custom_end=None, latest_available=date.today()
+        preset="1Y", custom_start=None, custom_end=None, latest_available=today
     )
     message = (
         f"US\\.MSFT 在请求日期区间 {provisional.warmup_start.isoformat()} "
-        f"至 {date.today().isoformat()} 没有返回日线数据"
+        f"至 {today.isoformat()} 没有返回日线数据"
     )
     with pytest.raises(ValueError, match=f"^{message}$"):
         ensure_resolved_backtest_price_range(

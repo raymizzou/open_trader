@@ -14,10 +14,13 @@ import sys
 import threading
 import time
 from typing import Iterator
+from types import SimpleNamespace
 import urllib.error
 import urllib.request
 
 import pytest
+import open_trader.holding_snapshot_workflow as workflow_module
+from tests.timing_support import run_test_in_subprocess
 
 import open_trader.account_api as account_api
 from open_trader.account_http import fetch_account_snapshot
@@ -838,8 +841,28 @@ def _unused_port() -> int:
 )
 def test_submit_real_api_worker_and_report_lineage(
     tmp_path: Path, broker: str, market: str, symbol: str, name: str, currency: str,
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest,
 ) -> None:
+    if run_test_in_subprocess(request):
+        return
     from tests.test_account_api import _write_publication
+
+    staged_ready = threading.Event()
+    publication_ready = threading.Event()
+    clock = [0.0]
+    original_stage = HoldingSnapshotImportService.stage_snapshot
+
+    def stage_snapshot(self, *args, **kwargs):
+        result = original_stage(self, *args, **kwargs)
+        staged_ready.set()
+        return result
+
+    monkeypatch.setattr(HoldingSnapshotImportService, "stage_snapshot", stage_snapshot)
+    # Only workflow business time is frozen. Socket and supervisor deadlines
+    # retain real time, and the poll waits for the worker's publication phase.
+    monkeypatch.setattr(workflow_module, "time", SimpleNamespace(
+        monotonic=lambda: clock[0], sleep=lambda _seconds: publication_ready.wait(),
+    ))
 
     data_dir = tmp_path / "data"
     _write_publication(data_dir, worker_sha="a" * 40)
@@ -874,21 +897,22 @@ def test_submit_real_api_worker_and_report_lineage(
     api_thread.start()
     account_url = f"http://127.0.0.1:{server.server_address[1]}"
     result_holder: dict[str, object] = {}
+    errors: list[BaseException] = []
+    submit_thread = None
     try:
         def submit() -> None:
-            result_holder["result"] = submit_confirmed_snapshot(
-                broker, payload, account_url=account_url, receipt_path=receipt_path,
-                timeout_seconds=5, poll_seconds=0.02,
-            )
+            try:
+                result_holder["result"] = submit_confirmed_snapshot(
+                    broker, payload, account_url=account_url, receipt_path=receipt_path,
+                    timeout_seconds=5, poll_seconds=0.02,
+                )
+            except BaseException as exc:
+                errors.append(exc)
 
         submit_thread = threading.Thread(target=submit, daemon=True)
         submit_thread.start()
-        staged: dict[str, object] | None = None
-        for _ in range(100):
-            staged = load_staged_holding_snapshot(data_dir, broker)
-            if staged is not None:
-                break
-            time.sleep(0.01)
+        assert staged_ready.wait(timeout=5), f"staging did not complete: {errors}"
+        staged = load_staged_holding_snapshot(data_dir, broker)
         assert staged is not None
         worker = AccountSyncWorker(AccountSyncWorkerConfig(
             data_dir=data_dir,
@@ -899,8 +923,10 @@ def test_submit_real_api_worker_and_report_lineage(
             account_interval_seconds=0, quote_interval_seconds=0,
         ))
         worker.sync_accounts_once()
+        publication_ready.set()
         submit_thread.join(timeout=5)
         assert not submit_thread.is_alive()
+        assert errors == []
         result = result_holder["result"]
         assert isinstance(result, dict)
         assert result["status"] == "published", result
@@ -919,6 +945,12 @@ def test_submit_real_api_worker_and_report_lineage(
         assert rerun["status"] == "published"
         assert rerun["holding_generation"] == generation
     finally:
+        clock[0] = 10.0
+        publication_ready.set()
+        if submit_thread is not None:
+            submit_thread.join(timeout=5)
+            assert not submit_thread.is_alive(), "snapshot submission did not terminate"
         server.shutdown()
         server.server_close()
         api_thread.join(timeout=2)
+        assert not api_thread.is_alive()

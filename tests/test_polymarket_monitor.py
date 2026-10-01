@@ -45,6 +45,83 @@ THRESHOLD_RULES = (
 )
 
 
+# These are real watchdogs, separate from any controlled business clock.
+# They bound synchronization, not service latency or the production deadline.
+_TEST_WATCHDOG_SECONDS = 2.0
+_REAL_MONOTONIC = time.monotonic
+
+
+class _ModuleProxy:
+    """Override only this module's reference, never shared time/asyncio globals."""
+
+    def __init__(self, module, **overrides):
+        self._module = module
+        self.__dict__.update(overrides)
+
+    def __getattr__(self, name):
+        return getattr(self._module, name)
+
+
+async def _finish_task(task):
+    assert task is not None, "Expected background work to have been scheduled"
+    return await asyncio.wait_for(task, timeout=_TEST_WATCHDOG_SECONDS)
+
+
+async def _drain_notification(monitor, attribute="_notification_task"):
+    task = getattr(monitor, attribute)
+    if task is not None:
+        await _finish_task(task)
+
+
+async def _cancel_task(task):
+    if task is not None:
+        if not task.done():
+            task.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(task, return_exceptions=True),
+            timeout=_TEST_WATCHDOG_SECONDS,
+        )
+
+
+def _isolate_functional_deadlines(monkeypatch):
+    """Functional tests use a watchdog; dedicated tests exercise real deadlines."""
+    import open_trader.polymarket_monitor as module
+
+    async def wait_for_completion(operation, timeout):
+        del timeout
+        return await asyncio.wait_for(operation, timeout=_TEST_WATCHDOG_SECONDS)
+
+    monkeypatch.setattr(module, "asyncio", _ModuleProxy(asyncio, wait_for=wait_for_completion))
+
+
+def _stage_deadline(monkeypatch, elapsed, expire):
+    """Cancel only the universe operation when the test reaches its target stage."""
+    import open_trader.polymarket_monitor as module
+
+    enabled = [True]
+
+    async def controlled_wait(operation, timeout):
+        if getattr(getattr(operation, "cr_code", None), "co_name", None) != "_refresh_universe":
+            return await asyncio.wait_for(operation, timeout)
+        assert timeout == 0.05
+        if not enabled[0]:
+            return await asyncio.wait_for(operation, _TEST_WATCHDOG_SECONDS)
+        task = asyncio.create_task(operation)
+        try:
+            await asyncio.wait_for(expire.wait(), _TEST_WATCHDOG_SECONDS)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await _finish_task(task)
+            raise TimeoutError
+        finally:
+            await _cancel_task(task)
+
+    monkeypatch.setattr(module, "time", _ModuleProxy(time, monotonic=lambda: elapsed[0]))
+    monkeypatch.setattr(module, "asyncio", _ModuleProxy(asyncio, wait_for=controlled_wait))
+    monkeypatch.setattr(module, "PUBLIC_REFRESH_TIMEOUT_SECONDS", 0.05)
+    return enabled
+
+
 def ns(**values: object) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
@@ -786,54 +863,53 @@ def test_snapshot_uses_metrics_refreshed_outside_monitor_lock(tmp_path: Path) ->
     assert summary_calls == 2
 
 
-def test_concurrent_snapshot_metric_refresh_coalesces_after_expiry(
-    tmp_path: Path,
-) -> None:
+def test_concurrent_snapshot_metric_refresh_coalesces_after_expiry(tmp_path: Path) -> None:
     monitor = make_monitor(tmp_path)
     monotonic = [0.0]
     summary_calls = 0
     priming = True
-    first_entered = threading.Event()
-    second_entered = threading.Event()
+    first_entered, contending, release = (threading.Event() for _ in range(3))
+    lock = monitor._snapshot_metrics_refresh_lock
 
-    def usage() -> dict[str, int]:
-        return {
-            "calls": 0,
-            "successes": 0,
-            "failures": 0,
-            "cache_hits": 0,
-            "input_tokens": 0,
-            "cached_input_tokens": 0,
-            "output_tokens": 0,
-            "reasoning_output_tokens": 0,
-        }
+    class ObservedLock:
+        def __enter__(self):
+            # Signal the second request at the actual lock contention point.
+            if not lock.acquire(blocking=False):
+                contending.set()
+                assert lock.acquire(timeout=_TEST_WATCHDOG_SECONDS)
+            return self
+
+        def __exit__(self, *args):
+            lock.release()
 
     def summary() -> dict[str, object]:
         nonlocal summary_calls
         summary_calls += 1
-        if priming:
-            return {"signals_24h": 1, "annualized_yields": {"7d": [], "30d": []}}
-        if summary_calls == 2:
+        if not priming:
             first_entered.set()
-            second_entered.wait(timeout=0.5)
-        else:
-            second_entered.set()
+            assert release.wait(timeout=_TEST_WATCHDOG_SECONDS)
         return {"signals_24h": 1, "annualized_yields": {"7d": [], "30d": []}}
 
     monitor._monotonic = lambda: monotonic[0]
-    monitor._store.llm_usage_24h = usage  # type: ignore[method-assign]
+    monitor._snapshot_metrics_refresh_lock = ObservedLock()
+    monitor._store.llm_usage_24h = lambda: {}  # type: ignore[method-assign]
     monitor._store.llm_usage_24h_by_provider = lambda: {}  # type: ignore[method-assign]
     monitor._store.signal_metric_summary = summary  # type: ignore[method-assign]
-
     monitor.refresh_snapshot_metrics()
     priming = False
     monotonic[0] = 61.0
     with ThreadPoolExecutor(max_workers=2) as workers:
-        futures = [workers.submit(monitor.refresh_snapshot_metrics) for _ in range(2)]
-        assert first_entered.wait(timeout=1)
-        for future in futures:
-            future.result(timeout=2)
-
+        first = workers.submit(monitor.refresh_snapshot_metrics)
+        try:
+            assert first_entered.wait(timeout=_TEST_WATCHDOG_SECONDS)
+            second = workers.submit(monitor.refresh_snapshot_metrics)
+            assert contending.wait(timeout=_TEST_WATCHDOG_SECONDS)
+            assert summary_calls == 2
+            assert not first.done() and not second.done()
+        finally:
+            release.set()
+        first.result(timeout=_TEST_WATCHDOG_SECONDS)
+        second.result(timeout=_TEST_WATCHDOG_SECONDS)
     assert summary_calls == 2
 
 
@@ -1070,6 +1146,7 @@ def test_observation_replenishment_is_bounded_and_keeps_stream_live(
     """Observation REST recovery stays bounded and cannot pause WS delivery."""
 
     clock = [NOW]
+    cadence = [0.0]
     assert PUBLIC_REFRESH_TIMEOUT_SECONDS == 30.0
 
     class LiveStream:
@@ -1140,7 +1217,7 @@ def test_observation_replenishment_is_bounded_and_keeps_stream_live(
             return [self.status_rows[key] for key in sorted(requested) if key in self.status_rows]
 
         async def get_order_books(self, *, token_ids: list[str]) -> list[object]:
-            call = (time.monotonic(), tuple(token_ids))
+            call = (cadence[0], tuple(token_ids))
             self.book_calls.append(call)
             observation_call = any(token.startswith("obs-") for token in token_ids)
             if observation_call:
@@ -1195,6 +1272,10 @@ def test_observation_replenishment_is_bounded_and_keeps_stream_live(
     monitor.set_cross_venue_tokens(("cross-b", "overlap"))
     monitor.set_observation_tokens(observation_tokens)
     monitor.set_observation_conditions(observation_conditions)
+    # Freeze only observation cadence. Each phase explicitly advances one
+    # five-second slot; scheduler load cannot add an unplanned fifth batch.
+    # The separate real-cadence test below retains wall-clock rate-limit proof.
+    monitor._monotonic = lambda: cadence[0]
     monitor.start()
     stopped = False
     try:
@@ -1270,7 +1351,7 @@ def test_observation_replenishment_is_bounded_and_keeps_stream_live(
         client.book_tick = Decimal("0.02")
         clock[0] = NOW + timedelta(seconds=301)
         client.block_books.set()
-        time.sleep(5.1)
+        cadence[0] += 5.1
         client.stream.push(
             ns(
                 type="price_change",
@@ -1318,11 +1399,15 @@ def test_observation_replenishment_is_bounded_and_keeps_stream_live(
         assert "obs-29" in restored
         assert restored["obs-0"]["tick_size"] == Decimal("0.02")
         assert restored["obs-0"]["fresh"] is True
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and monitor._observation_source_status_task is not None:
+            time.sleep(0.01)
+        assert monitor._observation_source_status_task is None
 
         # A blocked external refresh is bounded by the public deadline.  The
         # stream remains installed while that one task times out, and a later
         # setter-triggered refresh cannot create a second in-flight batch.
-        time.sleep(5.1)
+        cadence[0] += 5.1
         monkeypatch.setattr(
             "open_trader.polymarket_monitor.PUBLIC_REFRESH_TIMEOUT_SECONDS", 0.1
         )
@@ -1344,6 +1429,11 @@ def test_observation_replenishment_is_bounded_and_keeps_stream_live(
         assert client.book_refresh_started.is_set()
         assert monitor.snapshot()["observation"]["source_status_error"]
         assert client.max_active_observation_books <= 1
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and monitor._observation_source_status_task is not None:
+            time.sleep(0.01)
+        assert monitor._observation_source_status_task is None
+        assert client.active_observation_books == 0
         monkeypatch.setattr(
             "open_trader.polymarket_monitor.PUBLIC_REFRESH_TIMEOUT_SECONDS", 30.0
         )
@@ -1354,13 +1444,15 @@ def test_observation_replenishment_is_bounded_and_keeps_stream_live(
         # the external REST call to finish.
         client.book_refresh_started.clear()
         client.release_books.clear()
-        time.sleep(5.1)
+        cadence[0] += 5.1
         clock[0] = NOW + timedelta(seconds=320)
         assert client.book_refresh_started.wait(2)
         stopped_at = time.monotonic()
         monitor.stop()
         stopped = True
         assert time.monotonic() - stopped_at < 4
+        assert monitor._thread is not None and not monitor._thread.is_alive()
+        assert client.active_observation_books == 0
     finally:
         client.release_books.set()
         if not stopped:
@@ -1371,7 +1463,7 @@ def test_observation_replenishment_is_bounded_and_keeps_stream_live(
         for started, tokens in client.book_calls
         if any(token.startswith("obs-") for token in tokens)
     ]
-    assert len(observation_calls) <= 4
+    assert len(observation_calls) == 4
     assert len(client.status_calls) <= 4
     assert len(client.status_calls) % 2 == 0
     for offset in range(0, len(client.status_calls), 2):
@@ -2987,8 +3079,13 @@ def test_background_monitor_refreshes_top_twenty_while_bulk_scan_is_running(
         async def blocked_bulk_scan() -> None:
             await asyncio.Event().wait()
 
-        monitor._activity_scan_task = asyncio.create_task(blocked_bulk_scan())
-        await monitor.run_forever()
+        bulk = asyncio.create_task(blocked_bulk_scan())
+        monitor._activity_scan_task = bulk
+        try:
+            await _finish_task(monitor.run_forever())
+            assert bulk.done()
+        finally:
+            await _cancel_task(bulk)
 
     monkeypatch.setattr(monitor, "_refresh_universe_bounded", refresh_universe)
     monkeypatch.setattr(monitor, "_maybe_schedule_full_scan", schedule_full)
@@ -3146,16 +3243,23 @@ def test_due_full_scan_runs_before_activity_catchup(
             monitor._run_activity_scan(FakePublicClient())
         )
         monitor._activity_scan_task = activity
-        await entered.wait()
-        monitor._activity_catchup_requested = True
-        monitor._maybe_schedule_full_scan(FakePublicClient())
-        assert monitor._full_scan_pending is True
-        assert monitor._full_scan_task is None
-        release.set()
-        await activity
-        assert monitor._full_scan_task is not None
-        assert monitor._activity_scan_task is None
-        await monitor._full_scan_task
+        try:
+            await asyncio.wait_for(entered.wait(), _TEST_WATCHDOG_SECONDS)
+            monitor._activity_catchup_requested = True
+            monitor._maybe_schedule_full_scan(FakePublicClient())
+            assert monitor._full_scan_pending is True
+            assert monitor._full_scan_task is None
+            release.set()
+            await _finish_task(activity)
+            assert monitor._full_scan_task is not None
+            assert monitor._activity_scan_task is None
+            await _finish_task(monitor._full_scan_task)
+        finally:
+            release.set()
+            monitor._full_scan_pending = False
+            monitor._activity_catchup_requested = False
+            await _cancel_task(activity)
+            await _cancel_task(monitor._full_scan_task)
 
     asyncio.run(exercise())
 
@@ -3325,10 +3429,14 @@ def test_activity_scan_does_not_mark_daily_catalog_scanning(tmp_path: Path) -> N
 
     async def exercise() -> None:
         task = asyncio.create_task(monitor._refresh_relation_activity(FakePublicClient()))
-        await entered.wait()
-        assert monitor.snapshot()["relation_discovery"]["catalog"]["status"] == "healthy"
-        release.set()
-        await task
+        try:
+            await asyncio.wait_for(entered.wait(), _TEST_WATCHDOG_SECONDS)
+            assert monitor.snapshot()["relation_discovery"]["catalog"]["status"] == "healthy"
+            release.set()
+            await _finish_task(task)
+        finally:
+            release.set()
+            await _cancel_task(task)
 
     asyncio.run(exercise())
 
@@ -3455,7 +3563,7 @@ def test_qualified_yes_no_schedules_ready_before_nonblocking_shadow(
                 "estimated_profit": Decimal("0.11"),
             }
         )
-        await asyncio.sleep(0.01)
+        await _drain_notification(monitor)
         monitor._reap_notification_task()
         assert signal_id
         return events, shadow_calls, signal_id
@@ -3585,10 +3693,10 @@ def test_ready_observer_is_called_once_for_order_ready_episode(tmp_path: Path) -
         await monitor._refresh_relation_activity(client)
         await monitor._drain_relation_validation(client)
         await monitor._refresh_relation_opportunities(client, set(monitor._active_relation_ids))
-        await asyncio.sleep(0.05)
+        await _drain_notification(monitor)
         monitor._reap_notification_task()
         await monitor._refresh_relation_opportunities(client, set(monitor._active_relation_ids))
-        await asyncio.sleep(0.01)
+        await _drain_notification(monitor)
         monitor._reap_notification_task()
         return calls
 
@@ -3635,7 +3743,7 @@ def test_observation_alert_delivered_after_actionable_signal_closes(
         signal_id = str(monitor._store.open_signal_history()[0]["signal_id"])
         market_id = str(monitor._store.signal(signal_id)["market_id"])
         monitor._close_signal(market_id, "data_unavailable")
-        await asyncio.sleep(0.05)
+        await _drain_notification(monitor)
         monitor._reap_notification_task()
         return calls, monitor._store.signal(signal_id)
 
@@ -3685,12 +3793,12 @@ def test_observation_alert_then_order_ready_both_fire_once_per_episode(
         await monitor._refresh_relation_opportunities(
             client, set(monitor._active_relation_ids)
         )
-        await asyncio.sleep(0.05)
+        await _drain_notification(monitor)
         monitor._reap_notification_task()
         await monitor._refresh_relation_opportunities(
             client, set(monitor._active_relation_ids)
         )
-        await asyncio.sleep(0.01)
+        await _drain_notification(monitor)
         monitor._reap_notification_task()
         return observations, ready
 
@@ -3733,7 +3841,7 @@ def test_schedule_ready_notification_calls_standard_without_rule_or_codex(
                 "actionable": True,
             },
         )
-        await asyncio.sleep(0.01)
+        await _drain_notification(monitor)
         monitor._reap_notification_task()
         return calls
 
@@ -4003,6 +4111,7 @@ def test_activity_scheduler_marks_lagging_and_runs_one_catchup(
     monitor._clock = lambda: now[0]
     entered = asyncio.Event()
     release = asyncio.Event()
+    catchup_entered, catchup_release = asyncio.Event(), asyncio.Event()
     starts = 0
 
     async def blocked_activity(
@@ -4011,8 +4120,12 @@ def test_activity_scheduler_marks_lagging_and_runs_one_catchup(
         del client, resubscribe
         nonlocal starts
         starts += 1
-        entered.set()
-        await release.wait()
+        if starts == 1:
+            entered.set()
+            await release.wait()
+        else:
+            catchup_entered.set()
+            await catchup_release.wait()
 
     monitor._refresh_relation_activity = blocked_activity  # type: ignore[method-assign]
     monitor._activity_next_scan_at = NOW
@@ -4020,20 +4133,30 @@ def test_activity_scheduler_marks_lagging_and_runs_one_catchup(
     async def exercise() -> None:
         client = FakePublicClient()
         await monitor._tick_relation_activity(client)
-        await entered.wait()
-        now[0] = NOW + timedelta(seconds=61)
-        await monitor._tick_relation_activity(client)
-        await monitor._tick_relation_activity(client)
-        assert starts == 1
-        assert monitor.snapshot()["relation_discovery"]["activity"]["status"] == "lagging"
-        release.set()
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
-        assert starts == 2
-        release.set()
-        task = monitor._activity_scan_task
-        if task is not None:
-            await task
+        first = monitor._activity_scan_task
+        catchup = None
+        try:
+            await asyncio.wait_for(entered.wait(), _TEST_WATCHDOG_SECONDS)
+            now[0] = NOW + timedelta(seconds=61)
+            await monitor._tick_relation_activity(client)
+            await monitor._tick_relation_activity(client)
+            assert starts == 1
+            assert monitor.snapshot()["relation_discovery"]["activity"]["status"] == "lagging"
+            release.set()
+            await _finish_task(first)
+            await asyncio.wait_for(catchup_entered.wait(), _TEST_WATCHDOG_SECONDS)
+            assert starts == 2
+            catchup = monitor._activity_scan_task
+            catchup_release.set()
+            await _finish_task(catchup)
+            assert starts == 2
+            assert monitor._activity_catchup_requested is False
+        finally:
+            release.set()
+            catchup_release.set()
+            monitor._activity_catchup_requested = False
+            await _cancel_task(first)
+            await _cancel_task(catchup or monitor._activity_scan_task)
 
     asyncio.run(exercise())
 
@@ -4067,18 +4190,20 @@ def test_activity_scheduler_does_not_treat_its_own_due_time_as_lagging(
     async def exercise() -> None:
         client = FakePublicClient()
         await monitor._tick_relation_activity(client)
-        await entered.wait()
-        await monitor._tick_relation_activity(client)
-
-        assert starts == 1
-        assert monitor._activity_catchup_requested is False
-        assert monitor.snapshot()["relation_discovery"]["activity"]["status"] != "lagging"
-
-        release.set()
         task = monitor._activity_scan_task
-        assert task is not None
-        await task
-        assert starts == 1
+        try:
+            await asyncio.wait_for(entered.wait(), _TEST_WATCHDOG_SECONDS)
+            await monitor._tick_relation_activity(client)
+            assert starts == 1
+            assert monitor._activity_catchup_requested is False
+            assert monitor.snapshot()["relation_discovery"]["activity"]["status"] != "lagging"
+            release.set()
+            await _finish_task(task)
+            assert starts == 1
+        finally:
+            release.set()
+            monitor._activity_catchup_requested = False
+            await _cancel_task(task)
 
     asyncio.run(exercise())
 
@@ -4121,7 +4246,7 @@ def test_codex_worker_selects_highest_edge_then_reaps_one_at_a_time(
         # past the window before the next rescan can start a second verdict.
         now[0] = NOW + timedelta(seconds=3)
         await monitor._poll_relation_validation(client)
-        await asyncio.sleep(0.01)
+        await _finish_task(monitor._codex_task)
         assert len(validator.relation_ids) == 2
         assert validator.relation_ids[0] == expected
 
@@ -4224,7 +4349,7 @@ def test_transient_codex_failure_retries_once_at_the_retry_boundary(
         # (which rescanned at +59 s), so the retry becomes due at +61 s.
         now[0] = NOW + timedelta(seconds=61)
         await monitor._poll_relation_validation(client)
-        await asyncio.sleep(0.01)
+        await _finish_task(monitor._codex_task)
         assert validator.calls == 2
 
     asyncio.run(tick())
@@ -4296,7 +4421,7 @@ def test_validation_task_exception_marks_error_without_failure_notification(
         with pytest.raises(sqlite3.OperationalError):
             await task
         await monitor._poll_relation_validation(None)
-        await asyncio.sleep(0.01)
+        assert monitor._llm_failure_notification_task is None
         monitor._reap_llm_failure_notification_task()
 
     asyncio.run(exercise())
@@ -4340,7 +4465,7 @@ def test_llm_provider_failure_notifies_observer_with_provider_reason_codes(
         assert monitor._codex_task is not None
         await monitor._codex_task
         await monitor._poll_relation_validation(client)
-        await asyncio.sleep(0.01)
+        await _finish_task(monitor._llm_failure_notification_task)
         monitor._reap_llm_failure_notification_task()
 
     asyncio.run(exercise())
@@ -4380,7 +4505,7 @@ def test_llm_unavailable_notifies_failure_observer_once_and_resets_on_success(
         assert monitor._codex_task is not None
         await monitor._codex_task
         await monitor._poll_relation_validation(client)
-        await asyncio.sleep(0.01)
+        await _finish_task(monitor._llm_failure_notification_task)
         monitor._reap_llm_failure_notification_task()
         assert len(calls) == 1
         assert calls[0]["component"] == "llm_validation"
@@ -4407,7 +4532,7 @@ def test_llm_unavailable_notifies_failure_observer_once_and_resets_on_success(
         assert monitor._codex_task is not None
         await monitor._codex_task
         await monitor._poll_relation_validation(client)
-        await asyncio.sleep(0.01)
+        await _finish_task(monitor._llm_failure_notification_task)
         monitor._reap_llm_failure_notification_task()
         assert len(calls) == 2
 
@@ -4872,11 +4997,17 @@ def test_apr_target_anomaly_preserves_last_pool_and_blocks_relation_actions(
 def test_codex_worker_does_not_block_activity_or_price_refresh(tmp_path: Path) -> None:
     setup_public([threshold_event()])
     setup_threshold_books(low_ask="0.50", high_no_ask="0.51")
-    validator = FakeRelationValidator()
-    validator.block = threading.Event()
+    entered, release = threading.Event(), threading.Event()
+
+    class GatedValidator(FakeRelationValidator):
+        def validate(self, relation):
+            entered.set()
+            assert release.wait(timeout=5), "Test did not release the validator"
+            return super().validate(relation)
+
+    validator = GatedValidator()
     monitor = make_monitor(
-        tmp_path,
-        relation_discovery=discover_threshold_relations,
+        tmp_path, relation_discovery=discover_threshold_relations,
         relation_validator=validator,
     )
     client = FakePublicClient()
@@ -4886,20 +5017,22 @@ def test_codex_worker_does_not_block_activity_or_price_refresh(tmp_path: Path) -
 
     async def exercise() -> None:
         await monitor._poll_relation_validation(client)
-        assert monitor._codex_task is not None
-        await asyncio.sleep(0.01)
-        await asyncio.gather(
-            monitor._refresh_relation_activity(client),
-            monitor._process_stream_event(
-                client,
-                ns(
+        task = monitor._codex_task
+        assert task is not None
+        try:
+            assert await asyncio.to_thread(entered.wait, _TEST_WATCHDOG_SECONDS)
+            await asyncio.wait_for(asyncio.gather(
+                monitor._refresh_relation_activity(client),
+                monitor._process_stream_event(client, ns(
                     type="price_change",
                     payload=ns(asset_id=relation.buy_leg_a.token_id, price_changes=()),
-                ),
-            ),
-        )
-        validator.block.set()
-        await monitor._codex_task
+                )),
+            ), _TEST_WATCHDOG_SECONDS)
+            assert not task.done()
+            assert not release.is_set()
+        finally:
+            release.set()
+            await _finish_task(task)
         await monitor._poll_relation_validation(client)
 
     asyncio.run(exercise())
@@ -5600,11 +5733,16 @@ def test_subscription_keeps_dirty_when_tokens_change_during_connect(
 
     async def exercise() -> None:
         task = asyncio.create_task(monitor._subscribe(DelayedClient()))
-        await entered.wait()
-        monitor._relation_by_token = {"new-relation-token": {"relation"}}
-        monitor._subscription_dirty = True
-        release.set()
-        await task
+        try:
+            await asyncio.wait_for(entered.wait(), _TEST_WATCHDOG_SECONDS)
+            monitor._relation_by_token = {"new-relation-token": {"relation"}}
+            monitor._subscription_dirty = True
+            release.set()
+            await _finish_task(task)
+        finally:
+            release.set()
+            await _cancel_task(task)
+            await monitor._close_stream()
 
     asyncio.run(exercise())
 
@@ -5905,67 +6043,76 @@ def test_healthy_quiet_is_distinct_from_degraded_and_runtime_is_throttled(tmp_pa
 
 
 def test_background_monitor_refreshes_readiness_before_it_becomes_stale(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import open_trader.polymarket_monitor as monitor_module
 
     interval = monitor_module.READINESS_REFRESH_SECONDS
     freshness = monitor_module.READINESS_FRESHNESS_SECONDS
     assert (interval, freshness) == (30, 60)
-    assert interval < freshness
-    elapsed = 0
-    steps = iter((interval - 1, interval + 1, 2 * interval + 1, 3 * interval + 1))
-    readiness_calls: list[int] = []
-    turns: list[tuple[int, tuple[int, ...]]] = []
-    monkeypatch.setattr(monitor_module, "time", ns(monotonic=lambda: elapsed))
+    elapsed = [0.0]
+    now = [NOW]
+    checked_at: list[datetime] = []
 
     class LiveTrading(FakeTrading):
         def readiness_snapshot(self) -> dict[str, object]:
-            readiness_calls.append(elapsed)
             value = super().readiness_snapshot()
-            value["checked_at"] = NOW + timedelta(seconds=elapsed)
+            value["checked_at"] = now[0]
+            checked_at.append(now[0])
             return value
 
-    class LiveStream(FakeStream):
+    class SteppedStream(FakeStream):
+        def __init__(self):
+            super().__init__()
+            self.requests = asyncio.Queue()
+            self.messages = asyncio.Queue()
+
         async def __anext__(self) -> object:
-            nonlocal elapsed
-            turns.append((elapsed, tuple(readiness_calls)))
-            next_step = next(steps, None)
-            if next_step is None:
-                monitor._stop_event.set()
-            else:
-                elapsed = next_step
-            # Keep book facts fresh through the existing SDK/stream pipeline.
-            for book in FakePublicClient.books.values():
-                book.timestamp = NOW + timedelta(seconds=elapsed)
-            await asyncio.sleep(0)
-            return ns(token_id="yes-1")
+            self.requests.put_nowait(None)
+            return await self.messages.get()
 
+    monkeypatch.setattr(monitor_module, "time", _ModuleProxy(time, monotonic=lambda: elapsed[0]))
     setup_public([event("e", markets=(market("m"),))])
-    stream = LiveStream()
+    stream = SteppedStream()
     FakePublicClient.streams = [stream]
-    monitor = make_monitor(tmp_path, trading=LiveTrading())
-    monitor._clock = lambda: NOW + timedelta(seconds=elapsed)
+    monitor = make_monitor(tmp_path, trading=LiveTrading(), clock=lambda: now[0])
 
-    # Completion uses normal stop; this wall-time limit only catches hangs.
-    asyncio.run(asyncio.wait_for(monitor.run_forever(), timeout=10))
+    async def scenario():
+        task = asyncio.create_task(monitor.run_forever())
+        try:
+            await asyncio.wait_for(stream.requests.get(), _TEST_WATCHDOG_SECONDS)
+            assert checked_at == [NOW]
+            steps = (
+                (interval - 1, (0,)),
+                (interval, (0, interval)),
+                (interval + 1, (0, interval)),
+                (2 * interval + 1, (0, interval, 2 * interval + 1)),
+                (3 * interval + 1, (0, interval, 2 * interval + 1, 3 * interval + 1)),
+            )
+            for seconds, calls in steps:
+                elapsed[0] = seconds
+                now[0] = NOW + timedelta(seconds=seconds)
+                for book in FakePublicClient.books.values():
+                    book.timestamp = now[0]
+                stream.messages.put_nowait(ns(token_id="yes-1"))
+                await asyncio.wait_for(stream.requests.get(), _TEST_WATCHDOG_SECONDS)
+                assert checked_at == [NOW + timedelta(seconds=value) for value in calls]
+                snapshot = monitor.snapshot()
+                assert snapshot["readiness"]["checked_at"] == checked_at[-1]
+                assert snapshot["health"]["status"] == "healthy"
+            assert elapsed[0] > freshness
+            assert monitor.snapshot()["health"]["readiness_age_seconds"] == 0
+            monitor._stop_event.set()
+            stream.messages.put_nowait(ns(token_id="yes-1"))
+            await _finish_task(task)
+            assert stream.closed is True
+        finally:
+            await _cancel_task(task)
+        now[0] += timedelta(seconds=freshness + 1)
+        assert "readiness_stale" in monitor.snapshot()["health"]["degraded_reasons"]
 
-    assert turns == [
-        (0, (0,)),
-        (interval - 1, (0,)),
-        (interval + 1, (0, interval + 1)),
-        (2 * interval + 1, (0, interval + 1, 2 * interval + 1)),
-        (3 * interval + 1, (0, interval + 1, 2 * interval + 1, 3 * interval + 1)),
-    ]
-    assert readiness_calls == [0, interval + 1, 2 * interval + 1, 3 * interval + 1]
-    assert elapsed > freshness
-    snapshot = monitor.snapshot()
-    assert snapshot["readiness"]["checked_at"] == NOW + timedelta(seconds=elapsed)
-    assert snapshot["health"]["readiness_age_seconds"] == 0
-    assert snapshot["health"]["status"] == "healthy"
-    assert monitor._stop_event.is_set()
-    assert stream.closed is True
+    asyncio.run(scenario())
+
 
 
 def test_connected_quiet_stream_does_not_degrade_monitor_health(tmp_path: Path) -> None:
@@ -6019,9 +6166,10 @@ def test_start_stop_owns_one_daemon_async_thread(tmp_path: Path) -> None:
     assert monitor._thread.daemon is True
 
 
-def test_monitor_once_diagnostic_is_public_and_non_mutating() -> None:
+def test_monitor_once_diagnostic_is_public_and_non_mutating(monkeypatch: pytest.MonkeyPatch) -> None:
     from open_trader.polymarket_monitor import monitor_once_diagnostic
 
+    _isolate_functional_deadlines(monkeypatch)
     setup_public([event(f"event-{i:02d}", markets=(market(f"m-{i:02d}"),)) for i in range(20)])
     FakePublicClient.streams = [FakeStream([object()])]
     report = monitor_once_diagnostic(timeout=0.2, public_client_factory=FakePublicClient)
@@ -6036,9 +6184,10 @@ def test_monitor_once_diagnostic_is_public_and_non_mutating() -> None:
     }
 
 
-def test_monitor_once_accepts_fewer_events_than_the_limit() -> None:
+def test_monitor_once_accepts_fewer_events_than_the_limit(monkeypatch: pytest.MonkeyPatch) -> None:
     from open_trader.polymarket_monitor import monitor_once_diagnostic
 
+    _isolate_functional_deadlines(monkeypatch)
     setup_public([
         event(f"event-{i:02d}", markets=(market(f"m-{i:02d}"),))
         for i in range(18)
@@ -6066,18 +6215,30 @@ def test_monitor_once_diagnostic_converts_public_failures_to_blocked() -> None:
 def test_monitor_once_diagnostic_applies_total_timeout() -> None:
     from open_trader.polymarket_monitor import monitor_once_diagnostic
 
+    entered, cancelled, finished = [], [], []
+
     class SlowPublicClient(FakePublicClient):
         async def list_events(self, **kwargs: object) -> list[object]:
             del kwargs
-            await asyncio.sleep(0.2)
-            return []
+            entered.append(True)
+            try:
+                # A missing production timeout must fail, not hang the suite.
+                await asyncio.wait_for(asyncio.Event().wait(), _TEST_WATCHDOG_SECONDS)
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+            finally:
+                finished.append(True)
 
     started = time.monotonic()
     report = monitor_once_diagnostic(
         timeout=0.01, public_client_factory=SlowPublicClient
     )
 
+    # Retain the existing real 100ms responsiveness envelope. This is a local
+    # offline latency check, separate from the proof of deadline cancellation.
     assert time.monotonic() - started < 0.1
+    assert entered == cancelled == finished == [True]
     assert report["result"] == "BLOCKED"
     assert report["mutations"] == 0
 
@@ -6088,11 +6249,20 @@ def test_runtime_refresh_applies_total_timeout(
     from open_trader import polymarket_monitor
     from open_trader.polymarket_monitor import PolymarketMonitor
 
+    entered, cancelled, finished = [], [], []
+
     class SlowPublicClient(FakePublicClient):
         async def list_events(self, **kwargs: object) -> list[object]:
             del kwargs
-            await asyncio.sleep(0.2)
-            return []
+            entered.append(True)
+            try:
+                # A missing production timeout must fail, not hang the suite.
+                await asyncio.wait_for(asyncio.Event().wait(), _TEST_WATCHDOG_SECONDS)
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+            finally:
+                finished.append(True)
 
     monkeypatch.setattr(polymarket_monitor, "PUBLIC_REFRESH_TIMEOUT_SECONDS", 0.01)
     monitor = PolymarketMonitor(
@@ -6104,7 +6274,10 @@ def test_runtime_refresh_applies_total_timeout(
     started = time.monotonic()
     snapshot = monitor.refresh_once()
 
+    # Retain the existing real 100ms responsiveness envelope. This is a local
+    # offline latency check, separate from the proof of deadline cancellation.
     assert time.monotonic() - started < 0.1
+    assert entered == cancelled == finished == [True]
     assert snapshot["health"]["actionable"] is False
     assert snapshot["diagnostics"]["last_error"] == "universe:TimeoutError"
 
@@ -6115,7 +6288,9 @@ def test_universe_batches_unique_tokens_with_bounded_concurrency(tmp_path: Path)
             super().__init__()
             self.active = 0
             self.max_active = 0
-            self.first_wave = asyncio.Event()
+            self.entered = asyncio.Queue()
+            self.release = asyncio.Queue()
+            self.finished = asyncio.Queue()
 
         async def get_order_books(
             self, *, token_ids: list[str]
@@ -6123,12 +6298,12 @@ def test_universe_batches_unique_tokens_with_bounded_concurrency(tmp_path: Path)
             self.active += 1
             self.max_active = max(self.max_active, self.active)
             try:
-                if self.active == 8:
-                    self.first_wave.set()
-                await self.first_wave.wait()
+                self.entered.put_nowait(tuple(token_ids))
+                await self.release.get()
                 return await super().get_order_books(token_ids=token_ids)
             finally:
                 self.active -= 1
+                self.finished.put_nowait(None)
 
     rows = tuple(
         market(
@@ -6143,7 +6318,23 @@ def test_universe_batches_unique_tokens_with_bounded_concurrency(tmp_path: Path)
     monitor = make_monitor(tmp_path, relation_discovery=None)
     client = BarrierBookClient()
 
-    asyncio.run(monitor._refresh_universe_bounded(client))
+    async def scenario():
+        task = asyncio.create_task(monitor._refresh_universe_bounded(client))
+        try:
+            for batch in (8, 1):
+                for _ in range(batch):
+                    await asyncio.wait_for(client.entered.get(), _TEST_WATCHDOG_SECONDS)
+                assert client.active == batch
+                assert client.entered.empty(), "A ninth concurrent batch bypassed the limiter"
+                for _ in range(batch):
+                    client.release.put_nowait(None)
+                for _ in range(batch):
+                    await asyncio.wait_for(client.finished.get(), _TEST_WATCHDOG_SECONDS)
+            await _finish_task(task)
+        finally:
+            await _cancel_task(task)
+
+    asyncio.run(scenario())
     snapshot = monitor.snapshot()
 
     assert snapshot["health"]["status"] == "healthy", snapshot["health"]
@@ -6151,6 +6342,7 @@ def test_universe_batches_unique_tokens_with_bounded_concurrency(tmp_path: Path)
     assert all(len(chunk) <= 100 for chunk in client.book_calls)
     assert sorted(token for chunk in client.book_calls for token in chunk) == sorted(FakePublicClient.books)
     assert client.max_active == 8
+    assert client.active == 0
     confirmed = snapshot["events"][0]["markets"]
     assert len(confirmed) == 451
     assert all(row["confirmed_at"] == NOW for row in confirmed)
@@ -6495,7 +6687,7 @@ def test_universe_failure_observer_is_scheduled_once_on_attempt_five(
             next_refresh, _succeeded = await monitor._refresh_universe_if_due(
                 object(), current=current, next_refresh=next_refresh
             )
-        await asyncio.sleep(0.01)
+        await _finish_task(monitor._universe_failure_notification_task)
         monitor._reap_universe_failure_notification_task()
 
     asyncio.run(scenario())
@@ -6599,12 +6791,11 @@ def _crash_injection(monitor: PolymarketMonitor, plan):
 
 
 async def _wait_until(predicate, *, timeout: float = 10.0) -> bool:
-    waited = 0.0
-    while waited < timeout:
+    deadline = _REAL_MONOTONIC() + timeout
+    while _REAL_MONOTONIC() < deadline:
         if predicate():
             return True
-        await asyncio.sleep(0.01)
-        waited += 0.01
+        await asyncio.sleep(min(0.01, max(0, deadline - _REAL_MONOTONIC())))
     return bool(predicate())
 
 
@@ -6760,14 +6951,34 @@ def test_recovery_notification_fires_after_universe_refresh(
 
 
 def test_run_forever_external_cancellation_is_not_a_crash(tmp_path: Path) -> None:
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+
+    class WaitingStream(FakeStream):
+        async def __anext__(self):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
     setup_public([threshold_event()])
+    FakePublicClient.streams = [WaitingStream()]
     monitor = make_monitor(tmp_path)
     payloads: list[dict[str, object]] = []
     monitor.set_failure_observer(lambda payload: payloads.append(dict(payload)))
 
-    with pytest.raises(asyncio.TimeoutError):
-        asyncio.run(asyncio.wait_for(monitor.run_forever(), timeout=0.05))
+    async def scenario():
+        task = asyncio.create_task(monitor.run_forever())
+        try:
+            await asyncio.wait_for(entered.wait(), _TEST_WATCHDOG_SECONDS)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await _finish_task(task)
+            assert cancelled.is_set()
+        finally:
+            await _cancel_task(task)
 
+    asyncio.run(scenario())
     assert payloads == []
     assert monitor.snapshot()["thread"]["restarts"] == 0
 
@@ -7126,43 +7337,53 @@ def test_universe_timeout_recovers_after_exhaustion(tmp_path, monkeypatch):
 def test_universe_timeout_reports_stage_without_advancing_success(
     tmp_path, monkeypatch, stage, method, caplog,
 ):
-    from open_trader import polymarket_monitor
-
     setup_public([event('event-1', markets=(market('market-1'),))])
     monitor = make_monitor(tmp_path, relation_discovery=None, relation_validator=None)
     client = FakePublicClient()
     previous = NOW - timedelta(minutes=11)
     monitor._universe_at = previous
-    cancelled = []
+    entered, expire = asyncio.Event(), asyncio.Event()
+    elapsed, cancelled = [0.0], []
+    _stage_deadline(monkeypatch, elapsed, expire)
 
     async def blocked(*args, **kwargs):
+        entered.set()
         try:
             await asyncio.Event().wait()
         finally:
             cancelled.append(True)
 
     monkeypatch.setattr(client if stage == 'events' else monitor, method, blocked)
-    monkeypatch.setattr(polymarket_monitor, 'PUBLIC_REFRESH_TIMEOUT_SECONDS', 0.05)
 
     async def scenario():
-        with pytest.raises(TimeoutError):
-            await monitor._refresh_universe_bounded(client, block_observation_status=False)
-        assert cancelled == [True]
-        assert monitor._universe_at == previous
-        assert monitor._universe_failed
-        assert 'universe_stale' in monitor.snapshot()['health']['degraded_reasons']
-        progress = monitor.snapshot()['diagnostics']['universe_refresh']
-        assert progress['stage'] == stage
-        assert progress['error_type'] == 'TimeoutError'
-        assert progress['elapsed_seconds'] >= 0.05
-        assert f'stage={stage}' in caplog.text
+        task = asyncio.create_task(monitor._refresh_universe_bounded(
+            client, block_observation_status=False,
+        ))
+        try:
+            await asyncio.wait_for(entered.wait(), _TEST_WATCHDOG_SECONDS)
+            assert not task.done()
+            assert monitor._universe_at == previous
+            elapsed[0] = 0.05
+            expire.set()
+            with pytest.raises(TimeoutError):
+                await _finish_task(task)
+            assert cancelled == [True]
+            assert monitor._universe_at == previous
+            assert monitor._universe_failed
+            assert 'universe_stale' in monitor.snapshot()['health']['degraded_reasons']
+            progress = monitor.snapshot()['diagnostics']['universe_refresh']
+            assert progress['stage'] == stage
+            assert progress['error_type'] == 'TimeoutError'
+            assert progress['elapsed_seconds'] >= 0.05
+            assert f'stage={stage}' in caplog.text
+        finally:
+            expire.set()
+            await _cancel_task(task)
 
     asyncio.run(scenario())
 
 
 def test_universe_recovery_probe_requires_complete_refresh(tmp_path, monkeypatch):
-    from open_trader import polymarket_monitor
-
     setup_public([event('event-1', markets=(market('market-1'),))])
     monitor = make_monitor(tmp_path, relation_discovery=None, relation_validator=None)
     client = FakePublicClient()
@@ -7171,25 +7392,63 @@ def test_universe_recovery_probe_requires_complete_refresh(tmp_path, monkeypatch
     monitor._universe_retry_pending = True
     monitor._universe_failed = True
     subscribe = monitor._refresh_subscription_if_dirty
-    monkeypatch.setattr(polymarket_monitor, 'PUBLIC_REFRESH_TIMEOUT_SECONDS', 0.05)
+    entered, release, expire = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    elapsed = [0.0]
+    deadline_enabled = _stage_deadline(monkeypatch, elapsed, expire)
+    cancelled = []
 
     async def blocked(*args, **kwargs):
-        await asyncio.Event().wait()
+        entered.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+        await subscribe(*args, **kwargs)
+
+    monkeypatch.setattr(monitor, '_refresh_subscription_if_dirty', blocked)
 
     async def scenario():
-        monkeypatch.setattr(monitor, '_refresh_subscription_if_dirty', blocked)
-        due, succeeded = await monitor._refresh_universe_if_due(client, current=0, next_refresh=0)
-        assert not succeeded
-        assert monitor._universe_at is None
-        assert monitor._universe_retry_exhausted
-        assert not monitor.snapshot()['health']['actionable']
-        monkeypatch.setattr(monitor, '_refresh_subscription_if_dirty', subscribe)
-        _, succeeded = await monitor._refresh_universe_if_due(client, current=due, next_refresh=due)
-        assert succeeded
-        assert monitor._universe_at == NOW
-        assert not monitor._universe_retry_exhausted
-        assert monitor.snapshot()['health']['actionable']
-        await monitor._close_stream()
+        task = asyncio.create_task(monitor._refresh_universe_if_due(
+            client, current=0, next_refresh=0,
+        ))
+        try:
+            await asyncio.wait_for(entered.wait(), _TEST_WATCHDOG_SECONDS)
+            assert not task.done()
+            assert monitor._universe_at is None
+            assert monitor._universe_retry_exhausted
+            assert not monitor.snapshot()['health']['actionable']
+            elapsed[0] = 0.05
+            expire.set()
+            due, succeeded = await _finish_task(task)
+            assert not succeeded
+            assert cancelled == [True]
+            assert monitor._universe_at is None
+            assert monitor._universe_retry_exhausted
+            assert not monitor.snapshot()['health']['actionable']
+            # Recovery is a full operation, held at its final prerequisite.
+            # Its success is independent of the intentional 50ms failure budget.
+            entered.clear()
+            deadline_enabled[0] = False
+            task = asyncio.create_task(monitor._refresh_universe_if_due(
+                client, current=due, next_refresh=due,
+            ))
+            await asyncio.wait_for(entered.wait(), _TEST_WATCHDOG_SECONDS)
+            assert not task.done()
+            assert monitor._universe_at is None
+            assert monitor._universe_retry_exhausted
+            assert not monitor.snapshot()['health']['actionable']
+            release.set()
+            _, succeeded = await _finish_task(task)
+            assert succeeded
+            assert monitor._universe_at == NOW
+            assert not monitor._universe_retry_exhausted
+            assert monitor.snapshot()['health']['actionable']
+        finally:
+            release.set()
+            expire.set()
+            await _cancel_task(task)
+            await monitor._close_stream()
 
     asyncio.run(scenario())
 
@@ -7342,22 +7601,78 @@ def test_cleanup_reports_stalled_task_without_starting_replacement(tmp_path, mon
         async def fail(_client):
             raise RuntimeError('readiness failed')
 
-        monitor._full_scan_task = asyncio.create_task(stubborn())
-        await entered.wait()
-        monitor._poll_relation_validation = fail
-        task = asyncio.create_task(monitor._run_forever_once())
+        stubborn_task = asyncio.create_task(stubborn())
+        monitor._full_scan_task = stubborn_task
+        task = None
         try:
+            await asyncio.wait_for(entered.wait(), _TEST_WATCHDOG_SECONDS)
+            monitor._poll_relation_validation = fail
+            task = asyncio.create_task(monitor._run_forever_once())
             assert await _wait_until(lambda: monitor._thread_status == 'cleanup_blocked')
             assert not task.done()
             assert monitor._diagnostics['cleanup_pending_tasks'] == 1
             assert monitor._thread_restarts == 0
             assert not monitor.snapshot()['health']['actionable']
             assert 'monitor_recovering' in monitor.snapshot()['health']['degraded_reasons']
+            release.set()
+            with pytest.raises(RuntimeError, match='readiness failed'):
+                await _finish_task(task)
+            assert 'cleanup_pending_tasks' not in monitor._diagnostics
         finally:
             release.set()
-        with pytest.raises(RuntimeError, match='readiness failed'):
-            await asyncio.wait_for(task, 2)
-        assert 'cleanup_pending_tasks' not in monitor._diagnostics
+            await _cancel_task(task)
+            await _cancel_task(stubborn_task)
+
+    asyncio.run(scenario())
+
+
+def test_observation_replenishment_retains_real_five_second_cadence(tmp_path: Path) -> None:
+    """Offline integration: an expired book cannot bypass the real 5s limiter."""
+    monitor = make_monitor(tmp_path, relation_discovery=None, relation_validator=None)
+    calls = []
+    decision_times = []
+
+    def decision_clock():
+        # Observe the real timestamp used by the production scheduling decision.
+        # Neither task startup nor descheduling across the boundary changes it.
+        decision_times.append(_REAL_MONOTONIC())
+        return decision_times[-1]
+
+    async def refresh(_client, *, force=False):
+        calls.append(_REAL_MONOTONIC())
+
+    monitor._monotonic = decision_clock
+    monitor._refresh_observation_network_bounded = refresh
+    monitor._observation_books_need_refresh = lambda now=None: True
+
+    async def scenario():
+        try:
+            monitor._schedule_observation_source_status(object())
+            first_scheduled = decision_times[-1]
+            deadline = monitor._observation_source_status_next_allowed
+            assert deadline == first_scheduled + 5.0
+            await _finish_task(monitor._observation_source_status_task)
+            assert len(calls) == 1
+            # Use the timestamp sampled inside each scheduling decision. A
+            # pre-call clock check could cross the deadline while descheduled.
+            while True:
+                previous_samples = len(decision_times)
+                monitor._schedule_observation_source_status(object())
+                assert len(decision_times) == previous_samples + 1
+                scheduled_at = decision_times[-1]
+                task = monitor._observation_source_status_task
+                if scheduled_at < deadline:
+                    assert len(calls) == 1
+                    assert task is None
+                    await asyncio.sleep(min(0.01, max(0, deadline - _REAL_MONOTONIC())))
+                    continue
+                assert scheduled_at - first_scheduled >= 5.0
+                assert monitor._observation_source_status_next_allowed == scheduled_at + 5.0
+                await _finish_task(task)
+                assert len(calls) == 2
+                break
+        finally:
+            await _cancel_task(monitor._observation_source_status_task)
 
     asyncio.run(scenario())
 
