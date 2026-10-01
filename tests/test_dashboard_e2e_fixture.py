@@ -4,7 +4,17 @@ import importlib.util
 import json
 from pathlib import Path
 import threading
-from urllib.request import HTTPCookieProcessor, Request, build_opener
+from urllib.request import HTTPCookieProcessor, ProxyHandler, Request, build_opener
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def unexpected_system_proxy(monkeypatch):
+    # Force proxy routing unless each local client explicitly bypasses it.
+    monkeypatch.setattr("urllib.request.getproxies", lambda: {"http": "http://127.0.0.1:1"})
+    monkeypatch.setattr("urllib.request.proxy_bypass", lambda _host: False)
+    monkeypatch.setattr("urllib.request._opener", None)
 
 
 def test_browser_fixture_contexts_keep_independent_scenarios_and_mutations() -> None:
@@ -18,7 +28,10 @@ def test_browser_fixture_contexts_keep_independent_scenarios_and_mutations() -> 
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     base = f"http://127.0.0.1:{server.server_port}"
-    first, second = (build_opener(HTTPCookieProcessor(CookieJar())) for _ in range(2))
+    first, second = (
+        build_opener(ProxyHandler({}), HTTPCookieProcessor(CookieJar()))
+        for _ in range(2)
+    )
 
     def get(client, path):
         with client.open(base + path, timeout=5) as response:
@@ -51,7 +64,8 @@ def test_browser_fixture_processes_report_distinct_owned_dynamic_listeners() -> 
     import select
     import subprocess
     import sys
-    from urllib.request import urlopen
+
+    client = build_opener(ProxyHandler({}))
 
     script = Path(__file__).parent / "e2e/serve_dashboard_fixture.py"
     processes = []
@@ -70,7 +84,7 @@ def test_browser_fixture_processes_report_distinct_owned_dynamic_listeners() -> 
             url = line.removeprefix("fixture_dashboard_url: ")
             assert not url.endswith(":0")
             urls.append(url)
-            with urlopen(url, timeout=5) as response:
+            with client.open(url, timeout=5) as response:
                 assert response.status == 200
             assert process.poll() is None
         assert len(set(urls)) == 2

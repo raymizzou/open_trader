@@ -14,6 +14,44 @@ Disposition totals: **197 fixed/hardened; 14 intentionally unchanged; 0 deferred
 Implementation status is separate from validation: the browser and root-owned
 fixture limitations below remain UNKNOWN until their supported gates run.
 
+## PR 225 review repair and current-main integration
+
+The original three PR commits were replayed onto local main
+`4fbddaae061e95cbbbb3db4d5793e40e33ec2cae`. The six conflicting files preserve
+both intents: both dated changelog histories, session-isolated Smoke scenarios,
+complete current account facts, LP observation-stage logging, and explicit
+business-clock/completion controls. Production source, dependency manifests,
+locks, and CI workflow remain identical to that main revision.
+
+Readiness now keeps the actual 30-second refresh and 60-second freshness
+constants. Explicit stream turns cover 0/29/30/31/61/91 seconds, the exact
+refresh boundary, latest checked-at values, normal stop and closed stream, and
+stale readiness after refreshing stops. The current bulk-book integration keeps
+900 distinct tokens, a duplicate market, nine batches of at most 100 tokens,
+eight concurrent batches, and all 451 market confirmation assertions. Admission,
+release and completion queues observe the actual 8+1 waves.
+
+Both offline browser-fixture tests explicitly use `ProxyHandler({})`. An
+autouse regression injects an unavailable system HTTP proxy, disables bypass
+discovery, and resets the cached default opener; the tests still exercise real
+HTTP, independent cookies, dynamic listener ownership and process cleanup.
+The original clients failed both tests under that controlled proxy.
+
+Review diagnostics on the original head had 7 passes and 3 failures: the
+local HTTP probe reached a configured macOS system proxy, and two direct
+shebang launches stalled at `/usr/bin/env`. Direct HTTP/no-proxy requests
+returned 200 and explicit interpreter launches ran the same scripts normally.
+The original Docker attempt stopped before tests at a Pillow TLS download
+error. These attempts remain evidence, not passes for this repair.
+
+The first repair host selection completed 16 cases, including both proxy
+regressions, then stalled while loading a native Python module. A macOS process
+sample showed dyld code-signature mapping blocked in `fcntl`; no lock-owner
+assertion had executed. The owned test process was terminated (exit 137).
+Host diagnostics do not replace Docker gates. Historical runs and hashes below
+refer to the original PR revisions and do not transfer to this rebased tree;
+fresh scoped verification and independent review are required before publication.
+
 ## What changed
 
 - Monitor and runtime tests distinguish business-clock boundaries from thread,

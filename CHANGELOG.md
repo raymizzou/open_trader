@@ -5,6 +5,13 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-01
 
+- PR #225 审查修复：三个提交重放到 main `4fbddaae`，保留双方变更日志、Smoke 场景、
+  完整账户事实与 LP 观察日志断言；readiness 使用实际 30/60 秒阈值，批量盘口保留
+  100-token 分批、8 并发和去重验证，并接入显式完成信号。生产源码与 main 一致。
+  本地 HTTP 夹具显式绕过系统代理，两个真实集成用例注入不可用代理作为回归；
+  受控原实现 2 failed，宿主聚焦运行完成 16 项后被动态库加载阻塞，不能作为 Docker 门禁。
+  本次精确提交的服务验证和独立复审另行记录，未更新远端 PR。
+
 - 测试时序修复：用局部业务时钟、真实完成信号、显式 owner 放行和独立进程 watchdog
   替代调度假设；覆盖 monitor、runtime、LP、solver、账户/前端及趋势用例。
   保留过期拒绝、恢复前不可用、single-flight、真实超时/取消/清理与性能断言；
