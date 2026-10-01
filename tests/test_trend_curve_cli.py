@@ -4,6 +4,7 @@ from base64 import b64encode
 import csv
 from datetime import datetime, timezone
 import hashlib
+from itertools import count
 import json
 import os
 import subprocess
@@ -989,10 +990,21 @@ def test_daily_recovers_after_login_without_waiting_for_tomorrow(
     )
     hermes.chmod(hermes.stat().st_mode | 0o111)
 
+    # Reproduce unrelated "222" digits while keeping every report path unique.
+    summary_stamps = count(1790804822251748795)
+    monkeypatch.setattr(
+        trend_curve_research,
+        "time",
+        SimpleNamespace(
+            **{**vars(trend_curve_research.time), "time_ns": lambda: next(summary_stamps)}
+        ),
+    )
+
     healthy_response = _daily_encrypted_curve_payload(_daily_supplier_payload())
     curve_requests: list[int] = []
     credential_reads: list[tuple[str, int]] = []
-    credentials: tuple[str, int] = ("before-login-token", 111)
+    before_uid, after_uid = 4503599627370111, 4503599627370222
+    credentials: tuple[str, int] = ("before-login-token", before_uid)
     response_mode = "auth-block-b"
 
     def read_credentials(*_args: object, **_kwargs: object) -> tuple[str, int]:
@@ -1083,7 +1095,7 @@ def test_daily_recovers_after_login_without_waiting_for_tomorrow(
         hermes_capture.read_text(encoding="utf-8").splitlines(),
     ) == (1, "", "auth_blocked", 0, "not_run", [101, 202], ["run"])
 
-    credentials = ("after-login-token", 222)
+    credentials = ("after-login-token", after_uid)
     response_mode = "healthy"
     third_exit = cli.main(command)
     third_output = capsys.readouterr()
@@ -1105,7 +1117,7 @@ def test_daily_recovers_after_login_without_waiting_for_tomorrow(
         hermes_capture.read_text(encoding="utf-8").splitlines(),
         completed_items,
         credential_reads,
-        all(secret not in third_output.out for secret in ("before-login-token", "after-login-token", "111", "222")),
+        all(secret not in third_output.out for secret in ("before-login-token", "after-login-token", str(before_uid), str(after_uid))),
     ) == (
         0,
         "",
@@ -1117,9 +1129,9 @@ def test_daily_recovers_after_login_without_waiting_for_tomorrow(
         ["run", "run"],
         [("CN", "600000", completed_items[0][2]), ("HK", "00700", completed_items[1][2]), ("US", "AAPL", completed_items[2][2])],
         [
-            ("before-login-token", 111),
-            ("before-login-token", 111),
-            ("after-login-token", 222),
+            ("before-login-token", before_uid),
+            ("before-login-token", before_uid),
+            ("after-login-token", after_uid),
         ],
         True,
     )

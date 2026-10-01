@@ -40,6 +40,17 @@ from tests.test_polymarket_lp import _request as lp_request
 from tests.test_polymarket_lp import _snapshot as lp_snapshot
 
 
+class _ProjectionOnlyLP(PolymarketLPService):
+    """Projection/legacy first-seen component tests; no account registrar.
+
+    These cases exercise pre-seeded Store state and the legacy first-seen
+    component.  Full registration-cycle coverage remains in
+    tests/test_lp_order_registration_contract.py with the real SDK boundary.
+    """
+
+    register_account_snapshot = None
+
+
 def _seed_lp_history(
     store: PredictionArbitrageStore,
     request: Mapping[str, object],
@@ -7833,7 +7844,7 @@ def test_lp_dashboard_projects_queue_protection_anchor_and_summary(
             },
         },
     )
-    service._lp = PolymarketLPService(store, object())
+    service._lp = _ProjectionOnlyLP(store, object())
 
     payload = service.refresh_lp_dashboard_snapshot()
     rows = {row["order_id"]: row for row in payload["lp_orders_today"]}
@@ -7906,7 +7917,7 @@ def test_dashboard_today_rows_carry_owning_session_and_flags(
             },
         },
     )
-    service._lp = PolymarketLPService(store, object())
+    service._lp = _ProjectionOnlyLP(store, object())
 
     payload = service.refresh_lp_dashboard_snapshot()
     rows = {row["order_id"]: row for row in payload["lp_orders_today"]}
@@ -7987,7 +7998,7 @@ def test_lp167_dashboard_rows_carry_per_level_protection(tmp_path: Path) -> None
             },
         },
     )
-    service._lp = PolymarketLPService(store, object())
+    service._lp = _ProjectionOnlyLP(store, object())
 
     payload = service.refresh_lp_dashboard_snapshot()
     rows = {row["order_id"]: row for row in payload["lp_orders_today"]}
@@ -8068,7 +8079,7 @@ def test_dashboard_completed_latest_session_rows_keep_managed_marking_with_sessi
             "owned_order_ids": ["entry-done"],
         },
     )
-    service._lp = PolymarketLPService(store, object())
+    service._lp = _ProjectionOnlyLP(store, object())
 
     payload = service.refresh_lp_dashboard_snapshot()
     rows = {row["order_id"]: row for row in payload["lp_orders_today"]}
@@ -8179,7 +8190,7 @@ def _first_seen_service(
         notifier=ChannelNotifier("feishu"),
         lock_path=tmp_path / "first-seen.lock",
     )
-    service._lp = PolymarketLPService(
+    service._lp = _ProjectionOnlyLP(
         store,
         _FirstSeenBookExchange(levels, condition_by_token=condition_by_token),
     )
@@ -8321,7 +8332,7 @@ def test_first_seen_first_round_builds_baseline_and_survives_restart(
     )
     books = _FirstSeenBookExchange({token: "10000"})
     books.open_orders = [buy]
-    lp_restarted = PolymarketLPService(store, books)
+    lp_restarted = _ProjectionOnlyLP(store, books)
     restarted._lp = lp_restarted
 
     restarted.refresh_lp_dashboard_snapshot()
@@ -8527,7 +8538,7 @@ def test_lp_dashboard_session_summary_marked_submit_baseline(
         notifier=ChannelNotifier("feishu"),
         lock_path=tmp_path / "submit-mark.lock",
     )
-    service._lp = PolymarketLPService(store, object())
+    service._lp = _ProjectionOnlyLP(store, object())
     store.lp_create_session(
         "lp-submit-session",
         "lp-submit-key",
@@ -9229,7 +9240,7 @@ def test_lp166_dashboard_lists_all_group_views_and_attributes_rows(
         notifier=ChannelNotifier("feishu"),
         lock_path=tmp_path / "views.lock",
     )
-    service._lp = PolymarketLPService(store, object())
+    service._lp = _ProjectionOnlyLP(store, object())
     common = {
         "market_id": "market-x",
         "outcome": "YES",
@@ -9360,3 +9371,49 @@ def test_notify_monitor_timeout_recovery_copy(tmp_path: Path) -> None:
     assert "每 5 分钟自动探测恢复" in message
     assert "Prediction Service" in message
     assert "重试已停止" not in message
+
+
+def test_cloud_display_cache_publishes_failures_expiration_and_bounded_trades(tmp_path, monkeypatch):
+    import open_trader.prediction_arbitrage_execution as module
+    now = datetime.now(UTC)
+    class Trading(_CancelTrading):
+        complete = True
+        def lp_account_snapshot(self):
+            return {**super().lp_account_snapshot(), 'checked_at':now,
+                'open_orders_complete':self.complete, 'positions_complete':self.complete,
+                'balance':Decimal('12'), 'allowance':Decimal('10'),
+                'account_trades':tuple({'trade_id':str(i)} for i in range(102)),
+                'account_trades_total':102, 'display_trades_complete':True}
+    trading = Trading([])
+    service = PredictionExecutionService(store=PredictionArbitrageStore(tmp_path/'data'),
+        monitor=object(), trading=trading, notifier=ChannelNotifier("feishu"), lock_path=tmp_path/'lock')
+    service._display_only = True
+    service.refresh_lp_dashboard_snapshot()
+    assert service.lp_dashboard()['balance'] == Decimal('12')
+    assert service.lp_dashboard()['state'] == 'ready'
+    assert len(service.lp_account_trades_page(offset=0,limit=100)['items']) == 100
+    assert service.lp_account_trades_page(offset=100,limit=100)['items'] == [{'trade_id':'100'},{'trade_id':'101'}]
+    trading.complete = False
+    service.refresh_lp_dashboard_snapshot()
+    assert service.lp_dashboard()['state'] == 'unknown' and service.lp_dashboard()['stale'] is True
+    service._display_only = False
+    service.refresh_lp_dashboard_snapshot()
+    assert service.lp_dashboard()['state'] == 'ready' and service.lp_dashboard()['stale'] is False
+    assert service.lp_dashboard()['open_orders_complete'] is False
+    service._display_only = True
+    trading.complete = True
+    service.refresh_lp_dashboard_snapshot()
+    reads = trading.account_reads
+    for _ in range(2): service.lp_dashboard();service.lp_account_trades_page(offset=0,limit=1)
+    assert trading.account_reads == reads
+    monkeypatch.setattr(module, '_utc_now', lambda: now + timedelta(seconds=61))
+    assert service.lp_dashboard()['stale'] is True
+    assert service.lp_account_trades_page(offset=0,limit=1)['reason'] == 'account_snapshot_expired'
+    monkeypatch.setattr(module, '_utc_now', lambda: now)
+    trading.account_error = RuntimeError('lp_account_snapshot_unknown')
+    service.refresh_lp_dashboard_snapshot()
+    assert service.lp_dashboard()['state'] == 'stale'
+    assert service.lp_dashboard()['balance'] == Decimal('12')
+    assert service.lp_account_trades_page(offset=0,limit=1)['state'] == 'unknown'
+    for limit in (0,101):
+        with pytest.raises(ValueError): service.lp_account_trades_page(offset=0,limit=limit)

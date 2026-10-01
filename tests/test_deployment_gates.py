@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import shutil
 
 import pytest
 
@@ -24,6 +25,9 @@ DEFAULT_RELEASE_SERVICES = "gateway legacy account prediction"
 def _create_release_fixture(tmp_path: Path, *, failure: str | None = None) -> tuple[Path, str, Path]:
     release = tmp_path / "release"
     release.mkdir()
+    checker = ROOT / "scripts/check_production_log.py"
+    (release / "scripts").mkdir()
+    shutil.copyfile(checker, release / "scripts/check_production_log.py")
     for service in SERVICE_PORTS:
         log_dir = release / "logs" / {
             "gateway": "frontend_gateway",
@@ -89,9 +93,18 @@ def _run_smoke(
     prediction_n_leg: tuple[str, str] = ("running", "N_LEG_RUNNING"),
     unselected_prediction_paused: bool = False,
     lp_payload: str = '{"state":"ready","orders":[],"positions":[],"recommendations":[]}',
+    log_content: str | bytes | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     selected_services = services or DEFAULT_RELEASE_SERVICES
     release, sha, runtime = _create_release_fixture(tmp_path, failure=failure)
+    prediction_log = runtime / "logs/prediction_service/launchd.err.log"
+    if log_content is not None:
+        prediction_log.write_bytes(log_content.encode("utf-8") if isinstance(log_content, str) else log_content)
+    if failure == "log_missing":
+        prediction_log.unlink()
+    elif failure == "log_read":
+        prediction_log.unlink()
+        prediction_log.mkdir()
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(parents=True)
     calls = tmp_path / "calls"
@@ -227,7 +240,7 @@ def _run_smoke(
     )
     _write_executable(
         fake_bin / "rg",
-        "#!/bin/sh\nexec grep -E \"$@\"\n",
+        "#!/bin/sh\n" + ("exit 127\n" if failure == "rg_missing" else "exec grep -E \"$@\"\n"),
     )
     playwright = runtime / "node_modules/.bin/playwright"
     playwright.parent.mkdir(parents=True)
@@ -571,6 +584,63 @@ def test_scoped_smoke_preserves_prediction_pause_contract(
     else:
         assert result.returncode != 0
         assert result.stdout.rstrip().endswith("ROLLBACK")
+
+
+@pytest.mark.parametrize("log_content, healthy", [
+    ("plain clean startup\n", True),
+    ('{"level":"INFO","status":"healthy","degraded_reasons":[],"last_error":null}\n', True),
+    ('2026-10-01 12:00:00 INFO prediction: {"level":"INFO","status":"healthy","degraded_reasons":[],"last_error":null}\n', True),
+    ('{"level":"INFO","status":"healthy","degraded_reasons":[],"last_error":"relations:TransportError"}\n', False),
+    (r'{"level":"INFO","status":"healthy","degraded_reasons":[],"last_\u0065rror":"transport failed"}', False),
+    (r'{"level":"INFO","status":"healthy","degraded_reasons":[],"message":"\u0045rror"}', False),
+    (r'{"level":"INFO","status":"healthy","degraded_reasons":[],"last_\u0065rror":null}', True),
+    ('ERROR prefix {"level":"INFO","status":"healthy","degraded_reasons":[],"last_error":null}\n', False),
+    ('{"level":"INFO","status":"healthy","degraded_reasons":[],"last_error":null,"other_error":null}\n', False),
+    ('{"level":"INFO","status":"healthy","degraded_reasons":["unknown"],"last_error":null}\n', False),
+    ('{"level":"WARNING","status":"healthy","degraded_reasons":[],"last_error":null}\n', False),
+    ('{"level":"INFO","status":"healthy","degraded_reasons":[],"last_error":null', False),
+    ('{"broken-json', False),
+    ('{broken-json', True),
+    ('{"level":"INFO","status":"healthy","degraded_reasons":[],"last_error":null,"metric":NaN}\n', False),
+    ('{"level":"INFO","status":"healthy","degraded_reasons":[],"last_error":null,"metric":Infinity}\n', False),
+    ('{"level":"INFO","status":"healthy","degraded_reasons":[],"last_error":null,"metric":-Infinity}\n', False),
+    ('{"level":"INFO","status":"healthy","degraded_reasons":[],"last_error":null,"last_error":null}\n', False),
+    ('Traceback (most recent call last):\n', False),
+    ('FATAL worker stopped\n', False),
+    ('Unhandled exception\n', False),
+    (b'\xff\xfe\n', False),
+    ('ERROR outside retained window\n' + 'clean\n' * 200, True),
+    (b'\xff\n' + b'clean\n' * 200, True),
+])
+def test_smoke_log_checker_only_exempts_proven_healthy_null(tmp_path, log_content, healthy):
+    result, calls = _run_smoke(tmp_path, services="prediction", log_content=log_content)
+    assert (result.returncode == 0) is healthy, result.stdout + result.stderr
+    assert result.stdout.rstrip().endswith("HEALTHY" if healthy else "ROLLBACK")
+    assert any(call.startswith("playwright ") for call in calls) is healthy
+    assert "relations:TransportError" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("details, healthy", [
+    ("{'facts_read': 0.003}", True),
+    ("{'facts_read': 0.003, 'error': 'unavailable'}", False),
+    ("{'facts_read': 'Exception'}", False),
+])
+def test_smoke_timing_dict_text_keeps_full_error_check(tmp_path, details, healthy):
+    result, calls = _run_smoke(
+        tmp_path, services="prediction",
+        log_content=f"2026-10-01 12:00:00 WARNING prediction: lp_facts_timing outcome=failed stages={details} thread=123\n",
+    )
+    assert (result.returncode == 0) is healthy, result.stdout + result.stderr
+    assert result.stdout.rstrip().endswith("HEALTHY" if healthy else "ROLLBACK")
+    assert any(call.startswith("playwright ") for call in calls) is healthy
+
+
+@pytest.mark.parametrize("failure", ["log_missing", "log_read", "rg_missing"])
+def test_smoke_log_checker_read_and_tool_failures_block(tmp_path, failure):
+    result, calls = _run_smoke(tmp_path, services="prediction", failure=failure)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert result.stdout.rstrip().endswith("ROLLBACK")
+    assert not any(call.startswith("playwright ") for call in calls)
 
 
 def test_gateway_scope_ignores_unselected_prediction_pause(tmp_path: Path) -> None:

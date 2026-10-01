@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 from types import ModuleType, SimpleNamespace
@@ -1205,6 +1206,11 @@ def test_production_smoke_validates_paused_n_leg_without_state_request(tmp_path:
     repo_root = Path(__file__).parents[1]
     expected_root = tmp_path / "release"
     expected_root.mkdir()
+    (expected_root / "scripts").mkdir()
+    shutil.copyfile(
+        repo_root / "scripts/check_production_log.py",
+        expected_root / "scripts/check_production_log.py",
+    )
     runtime_root = tmp_path / "runtime"
     (runtime_root / "logs/prediction_service").mkdir(parents=True)
     (runtime_root / "logs/prediction_service/launchd.err.log").write_text("clean\n", encoding="utf-8")
@@ -1255,7 +1261,14 @@ def test_production_smoke_validates_paused_n_leg_without_state_request(tmp_path:
     ps = fake_bin / "ps"
     ps.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     ripgrep = fake_bin / "rg"
-    ripgrep.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    ripgrep.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$#\" = 1 ] && [ \"$1\" = \"--version\" ] && [ \"${FAKE_RG_UNAVAILABLE:-0}\" = 0 ]; then\n"
+        "  echo 'ripgrep fixture'; exit 0\n"
+        "fi\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
     for command in (python_wrapper, curl, lsof, ps, ripgrep):
         command.chmod(0o755)
     playwright = expected_root / "node_modules/.bin/playwright"
@@ -1293,6 +1306,7 @@ def test_production_smoke_validates_paused_n_leg_without_state_request(tmp_path:
         *,
         missing_n_leg: bool = False,
         missing_lp: bool = False,
+        unavailable_rg: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         calls.unlink(missing_ok=True)
         return subprocess.run(
@@ -1314,6 +1328,7 @@ def test_production_smoke_validates_paused_n_leg_without_state_request(tmp_path:
                 "FAKE_NLEG_CODE": code,
                 "FAKE_NLEG_MISSING": "1" if missing_n_leg else "0",
                 "FAKE_LP_MISSING": "1" if missing_lp else "0",
+                "FAKE_RG_UNAVAILABLE": "1" if unavailable_rg else "0",
             },
             capture_output=True,
             text=True,
@@ -1353,6 +1368,15 @@ def test_production_smoke_validates_paused_n_leg_without_state_request(tmp_path:
     missing_lp = run_smoke("1", "paused", "N_LEG_PAUSED", missing_lp=True)
     assert missing_lp.returncode != 0
     assert "lp dashboard: BLOCKED" in missing_lp.stdout
+    assert not any(
+        path.endswith("/api/prediction-arbitrage/state")
+        for path in calls.read_text(encoding="utf-8").splitlines()
+    )
+
+    unavailable_rg = run_smoke("1", "paused", "N_LEG_PAUSED", unavailable_rg=True)
+    assert unavailable_rg.returncode != 0
+    assert "log checker unavailable" in unavailable_rg.stdout
+    assert "ROLLBACK" in unavailable_rg.stdout
     assert not any(
         path.endswith("/api/prediction-arbitrage/state")
         for path in calls.read_text(encoding="utf-8").splitlines()

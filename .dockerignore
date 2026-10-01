@@ -18,6 +18,7 @@ Library
 config/daily_premarket.env
 config/prediction_arbitrage.json
 config/*.env
+config/*.backup-*
 !config/*.env.example
 !config/*.json.example
 data/*
@@ -49,6 +50,8 @@ playwright-report
 output
 docs/superpowers/specs
 docs/superpowers/plans
+docs/superpowers/mockups
+**/.DS_Store
 *.key
 *.pem
 *.crt

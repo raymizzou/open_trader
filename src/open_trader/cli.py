@@ -13,7 +13,8 @@ import subprocess
 import sys
 import time
 from dataclasses import replace
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from contextlib import nullcontext
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -114,6 +115,7 @@ from .polymarket_trading import (
     store_keychain_secret,
     store_predict_api_key,
 )
+from .prediction_read_only import PolymarketReadOnlyGuard, guard_polymarket_client
 from .polymarket_monitor import monitor_once_diagnostic
 from .prediction_arbitrage_health import (
     validate_frontend_gateway_health,
@@ -1361,6 +1363,19 @@ def build_parser() -> argparse.ArgumentParser:
     wallet_status.add_argument(
         "--config", type=Path, default=Path("config/prediction_arbitrage.json")
     )
+    wallet_read = wallet_commands.add_parser(
+        "read-auth", help="Verify existing L2 credentials with GET-only derivation"
+    )
+    wallet_read.add_argument(
+        "--config", type=Path, default=Path("config/prediction_arbitrage.json")
+    )
+    wallet_read.add_argument("--require-trading-region", action="store_true")
+    data_check = prediction_commands.add_parser(
+        "data-check", help="Check bounded public and same-wallet data without trading"
+    )
+    data_check.add_argument("--config", type=Path, default=Path("config/prediction_arbitrage.json"))
+    data_check.add_argument("--sample", type=positive_int, default=5,
+                            help="Current reward-market sample size (1-20; default 5)")
     predict_parser = prediction_commands.add_parser(
         "predict", help="Manage the read-only Predict source"
     )
@@ -1545,6 +1560,278 @@ def build_parser() -> argparse.ArgumentParser:
     health_parser.add_argument("--json", action="store_true")
 
     return parser
+
+
+def _prediction_probe_backend() -> str:
+    backend = os.environ.get("OPEN_TRADER_CREDENTIAL_BACKEND")
+    if backend not in {"keychain", "file", "tencent-ssm"}:
+        raise ValueError("credential_backend_unset")
+    if backend == "file" and not os.environ.get("OPEN_TRADER_CREDENTIAL_FILE"):
+        raise ValueError("credential_file_unset")
+    if backend == "tencent-ssm" and any(
+        not os.environ.get(f"OPEN_TRADER_SSM_{field}")
+        for field in ("REGION", "SECRET", "VERSION", "ROLE")
+    ):
+        raise ValueError("ssm_references_incomplete")
+    return backend
+
+
+def _prediction_read_auth(config_path: Path, *, require_trading_region: bool = False) -> int:
+    backend = _prediction_probe_backend()
+    client = None
+    guard = PolymarketReadOnlyGuard()
+    result: dict[str, object] = {
+        "initialization": {"status": "unknown", "path": "GET /auth/derive-api-key", "backend": backend},
+        "account_read": {"status": "unknown", "source": "same-wallet CLOB L2 + Data API"},
+    }
+    try:
+        client = PolymarketTradingClient.from_keychain(load_trading_config(config_path), read_only=True)
+        result["initialization"]["status"] = "ready"
+        with guard_polymarket_client(client, guard):
+            account = client._lp_account_facts(include_raw_trades=True)
+            if require_trading_region:
+                region_allowed = client.geoblock_allowed()
+        complete = (account.get("open_orders_complete") is True
+                    and account.get("positions_complete") is True
+                    and account.get("trades_complete") is True
+                    and account.get("balance") is not None
+                    and account.get("allowance") is not None)
+        result["account_read"] = {
+            "status": "ready" if complete else "unknown", "complete": complete,
+            "orders": len(account["open_orders"]), "positions": len(account["positions"]),
+            "trades": len(account["raw_trades"]), "balance_read": account.get("balance") is not None,
+            "checked_at": str(account.get("checked_at")),
+        }
+        if require_trading_region:
+            result["trading_region"] = ({"status": "allowed"} if region_allowed else
+                                        {"status": "blocked", "reason": "geoblock_denied_or_unavailable"})
+    except Exception as exc:
+        result["account_read"] = {"status": "unknown", "reason": type(exc).__name__}
+        if require_trading_region:
+            result["trading_region"] = {"status": "unknown", "reason": "region_read_unavailable"}
+    finally:
+        if client is not None:
+            client.close()
+    result["guard"] = {"mutation_attempts": guard.mutation_calls,
+                       "notification_attempts": guard.live_notifications}
+    result["result"] = "PASS" if (result["account_read"]["status"] == "ready" and not guard.attempts
+                                  and (not require_trading_region or result["trading_region"]["status"] == "allowed")) else "BLOCKED"
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if result["result"] == "PASS" else 2
+
+
+def _prediction_data_check(config_path: Path, *, sample: int = 5) -> int:
+    backend = _prediction_probe_backend()
+    if not 1 <= sample <= 20:
+        raise ValueError("sample_out_of_range")
+    config = load_trading_config(config_path)
+    client = None
+    authenticated = False
+    try:
+        client = PolymarketTradingClient.from_keychain(config, read_only=True)
+        authenticated = True
+    except (ValueError, KeychainError, PolymarketTradingError):
+        client = PolymarketTradingClient(config, None)
+
+    report: dict[str, object] = {
+        "schema_version": "open_trader.prediction_data_check.v1",
+        "authentication": {"initialization": "ready" if authenticated else "unknown",
+                           "initialization_path": "GET /auth/derive-api-key",
+                           "backend": backend,
+                           "account_read": "pending" if authenticated else "unknown"},
+        "checks": {},
+    }
+    checks = report["checks"]
+    assert isinstance(checks, dict)
+
+    def check(name: str, source: str, read, summarize) -> object | None:
+        started = time.monotonic()
+        try:
+            value = read()
+            summary = summarize(value)
+            status, count, complete, checked_at = summary[:4]
+            checks[name] = {"status": status, "source": source, "count": count,
+                            "complete": complete, "checked_at": str(checked_at) if checked_at else None,
+                            "elapsed_seconds": round(time.monotonic() - started, 2)}
+            if status != "ready":
+                checks[name]["reason"] = summary[4] if len(summary) > 4 and summary[4] else "reader_incomplete"
+            return value
+        except Exception as exc:
+            checks[name] = {"status": "unknown", "source": source, "count": None,
+                            "complete": False, "checked_at": None,
+                            "elapsed_seconds": round(time.monotonic() - started, 2),
+                            "reason": type(exc).__name__}
+            return None
+
+    guard = PolymarketReadOnlyGuard()
+    try:
+        with (guard_polymarket_client(client, guard)
+              if authenticated else nullcontext()):
+            account = check("account", "CLOB L2 + Data API", lambda: client._lp_account_facts(include_raw_trades=True),
+                            lambda v: ("ready" if v["open_orders_complete"] and v["positions_complete"] and v["trades_complete"] and v.get("balance") is not None and v.get("allowance") is not None else "unknown",
+                                       {"orders": len(v["open_orders"]), "positions": len(v["positions"]), "trades": len(v["raw_trades"]),
+                                        "balance_read": v.get("balance") is not None},
+                                       v["open_orders_complete"] and v["positions_complete"] and v["trades_complete"] and v.get("balance") is not None and v.get("allowance") is not None, v["checked_at"],
+                                       "account_facts_incomplete")) if authenticated else None
+            if not authenticated:
+                checks["account"] = {"status":"unknown", "source":"CLOB L2 + Data API", "complete":False,
+                                     "reason":"authentication_unavailable"}
+            report["authentication"]["account_read"] = checks["account"]["status"]
+            if isinstance(account, dict) and checks["account"]["status"] != "ready":
+                checks["account"]["incomplete_fields"] = [
+                    name for name, known in (
+                        ("open_orders", account.get("open_orders_complete") is True),
+                        ("positions", account.get("positions_complete") is True),
+                        ("trades", account.get("trades_complete") is True),
+                        ("balance", account.get("balance") is not None),
+                        ("allowance", account.get("allowance") is not None),
+                    ) if not known
+                ]
+            catalog = check("reward_catalog", "CLOB /rewards/markets/current native+sponsored",
+                            client.lp_reward_catalog,
+                            lambda v: ("ready" if v.get("complete") is True else "unknown", len(v.get("markets", ())),
+                                       v.get("complete") is True, v.get("checked_at"),
+                                       v.get("reason") if v.get("reason") in {"cancelled", "reward_catalog_read_failed"}
+                                       else "reward_catalog_incomplete"))
+            account_ids = [str(row.get("condition_id") or "") for row in
+                           ((*account.get("open_orders", ()), *account.get("positions", ())) if isinstance(account, dict) else ())]
+            catalog_ids = [str(row.get("condition_id") or "") for row in
+                           (catalog.get("markets", ()) if isinstance(catalog, dict) else ()) if isinstance(row, dict)]
+            condition_ids = tuple(dict.fromkeys(value for value in catalog_ids[:sample] if value))
+
+            def read_metadata():
+                combined = {"markets": {}, "failed_ids": {}, "deferred_ids": [],
+                            "confirmed_absent_ids": [], "checked_at": datetime.now(UTC)}
+                batch = client.lp_market_metadata_batch(condition_ids)
+                combined["markets"].update(batch.get("markets", {}))
+                combined["failed_ids"].update(batch.get("failed_ids", {}))
+                combined["deferred_ids"].extend(batch.get("deferred_ids", ()))
+                combined["confirmed_absent_ids"].extend(batch.get("confirmed_absent_ids", ()))
+                combined["state"] = "known" if not combined["failed_ids"] and not combined["deferred_ids"] else "unknown"
+                return combined
+
+            metadata = check("market_rules", "Gamma + CLOB metadata", read_metadata,
+                             lambda v: ("ready" if condition_ids and v.get("state") == "known" and len(v.get("markets", {})) == len(condition_ids) else "unknown",
+                                        len(v.get("markets", {})), bool(condition_ids) and v.get("state") == "known" and len(v.get("markets", {})) == len(condition_ids), v.get("checked_at"),
+                                        "market_confirmed_absent" if v.get("confirmed_absent_ids") else "market_read_incomplete")) if condition_ids else None
+            if not condition_ids:
+                checks["market_rules"] = {"status": "unknown", "source": "Gamma + CLOB metadata",
+                                          "complete": False, "reason": "reward_catalog_unavailable_or_empty"}
+            if isinstance(metadata, dict):
+                checks["market_rules"]["confirmed_absent_count"] = len(metadata["confirmed_absent_ids"])
+                checks["market_rules"]["failed_count"] = len(metadata["failed_ids"])
+                checks["market_rules"]["deferred_count"] = len(metadata["deferred_ids"])
+            markets = metadata.get("markets", {}) if isinstance(metadata, dict) else {}
+            token_ids = tuple(dict.fromkeys(str(outcome.get("token_id")) for market in markets.values()
+                                            for outcome in (market.get("outcomes") or {}).values()
+                                            if isinstance(outcome, dict) and outcome.get("token_id")))
+            if token_ids:
+                check("order_books", "CLOB books", lambda: client.lp_order_books(token_ids),
+                      lambda v: ("ready" if len(v) == len(token_ids) else "unknown", len(v),
+                                 len(v) == len(token_ids), datetime.now(UTC), "book_missing_or_invalid"))
+            else:
+                checks["order_books"] = {"status": "unknown", "source": "CLOB books", "complete": False,
+                                         "reason": "market_rules_unavailable_or_empty"}
+            end_ts = int(time.time())
+            if token_ids:
+                history = check("price_history", "CLOB bounded 24h history", lambda: client.lp_price_history(token_ids, start_ts=end_ts-86400, end_ts=end_ts),
+                      lambda v: ("ready" if v.get("state") == "known" and not v.get("unknown_token_ids") else "unknown",
+                                 len(v.get("history", {})), v.get("state") == "known" and not v.get("unknown_token_ids"), datetime.now(UTC),
+                                 "history_incomplete"))
+                if isinstance(history, dict) and checks["price_history"]["status"] != "ready":
+                    checks["price_history"]["unknown_token_count"] = len(history.get("unknown_token_ids", ()))
+            else:
+                checks["price_history"] = {"status": "unknown", "source": "CLOB bounded 24h history",
+                                           "complete": False, "reason": "market_rules_unavailable_or_empty"}
+            account_condition_ids = tuple(dict.fromkeys(value for value in account_ids if value))
+            scoped_account_ids = account_condition_ids[:sample]
+            if authenticated and scoped_account_ids:
+                check("account_trades", "CLOB L2 account trades", lambda: client.lp_account_trades(scoped_account_ids),
+                      lambda v: ("ready" if v.get("complete") is True else "unknown",
+                                 sum(len(rows) for rows in v.get("trades", {}).values()),
+                                 v.get("complete") is True, v.get("checked_at"), "account_trade_read_incomplete"))
+            elif authenticated:
+                checks["account_trades"] = {"status": "ready" if account and account.get("trades_complete") is True else "unknown",
+                                             "source": "CLOB L2 complete account trades",
+                                             "count": len(account["raw_trades"]) if account else None,
+                                             "complete": bool(account and account.get("trades_complete") is True),
+                                             "checked_at": str(account.get("checked_at")) if account else None}
+                if checks["account_trades"]["status"] != "ready":
+                    checks["account_trades"]["reason"] = "account_trade_read_incomplete"
+            rates = check("reward_rates", "CLOB L2 reward rates", client.lp_reward_rates,
+                  lambda v: ("ready" if v.get("complete") is True and all(
+                      isinstance(row, dict) and row.get("state") == "known"
+                      for row in v.get("markets", {}).values()) else "unknown",
+                             len(v.get("markets", {})), v.get("complete") is True, v.get("checked_at"),
+                             "reward_market_facts_unknown" if v.get("complete") is True else "reward_rates_incomplete")) if authenticated else None
+            if isinstance(rates, dict) and isinstance(rates.get("markets"), dict):
+                safe_reasons = {"reward_pool_unknown", "reward_share_missing", "reward_rate_unknown",
+                                "reward_identity_unknown", "reward_config_unknown", "reward_asset_unknown",
+                                "reward_total_unknown", "reward_totals_inconsistent", "reward_read_cancelled",
+                                "reward_read_failed"}
+                reason_counts: dict[str, int] = {}
+                unknown_count = 0
+                for row in rates["markets"].values():
+                    if not isinstance(row, dict) or row.get("state") != "known":
+                        unknown_count += 1
+                        reason = row.get("reason") if isinstance(row, dict) else None
+                        code = reason if isinstance(reason, str) and reason in safe_reasons else "reward_rate_unknown"
+                        reason_counts[code] = reason_counts.get(code, 0) + 1
+                checks["reward_rates"]["unknown_market_count"] = unknown_count
+                checks["reward_rates"]["unknown_reason_counts"] = reason_counts
+            check("reward_percentages", "CLOB L2 account percentages", client.lp_reward_percentages,
+                  lambda v: ("ready" if v.get("state") == "known" else "unknown", len(v.get("percentages", {})),
+                             v.get("state") == "known", v.get("checked_at"), "reward_percentages_unknown")) if authenticated else None
+            catalog_id_set = set(catalog_ids)
+            reward_scope = tuple(cid for cid in account_condition_ids if cid in catalog_id_set)[:sample]
+            if not reward_scope:
+                reward_scope = condition_ids[:1]
+            reward_date = (datetime.now(UTC).date() - timedelta(days=1)).isoformat()
+            check("reward_snapshots", "CLOB L2 personal rewards",
+                  lambda: client.lp_reward_snapshots(reward_date, reward_scope),
+                  lambda v: ("ready" if v and all(row.get("state") == "known" for row in v.values()) else "unknown",
+                             len(v), bool(v) and all(row.get("state") == "known" for row in v.values()), datetime.now(UTC),
+                             next((str(row.get("reason") or "reward_read_unknown") for row in v.values()
+                                   if row.get("state") != "known"), "reward_scope_empty"))) if authenticated and reward_scope else None
+            if authenticated and not reward_scope:
+                checks["reward_snapshots"] = {"status": "unknown", "source": "CLOB L2 personal rewards",
+                                              "complete": False, "reason": "reward_scope_empty"}
+            if not authenticated:
+                for name in ("account_trades", "reward_rates", "reward_snapshots", "reward_percentages"):
+                    checks[name] = {"status": "unknown", "source": "CLOB L2 same-wallet",
+                                    "complete": False, "reason": "authentication_unavailable"}
+            scoped_checks = {
+                "account": ("same wallet, all orders/positions/trades and balance", "reader_complete"),
+                "reward_catalog": ("all current native and sponsored reward markets", "reader_complete"),
+                "market_rules": (f"{len(condition_ids)} sampled current reward markets", "not_reported"),
+                "order_books": (f"{len(token_ids)} tokens from sampled market rules", "not_reported"),
+                "price_history": (f"{len(token_ids)} tokens, UTC [{end_ts-86400}, {end_ts}]", "not_reported"),
+                "account_trades": (f"{len(scoped_account_ids)} sampled account markets; all account trades if zero", "reader_complete"),
+                "reward_rates": ("same wallet, all open-order/open-position reward markets", "reader_complete"),
+                "reward_percentages": ("same wallet, all reported percentages", "not_reported"),
+                "reward_snapshots": (f"{len(reward_scope)} sampled markets, UTC date {reward_date}", "not_reported"),
+            }
+            for name, (scope, pagination) in scoped_checks.items():
+                checks[name]["scope"] = scope
+                checks[name]["pagination"] = ("complete" if checks[name].get("complete") is True else "unknown") if pagination == "reader_complete" else pagination
+            report["scope"] = {"market_sample_count": len(condition_ids), "token_ids": len(token_ids),
+                               "account_market_count": len(account_condition_ids),
+                               "account_trade_market_sample_count": len(scoped_account_ids),
+                               "reward_snapshot_market_count": len(reward_scope),
+                               "reward_date_utc": reward_date,
+                               "history_window_utc": [end_ts - 86400, end_ts],
+                               "reward_catalog_market_count": len(catalog_ids),
+                               "reward_catalog_pagination": "complete" if isinstance(catalog, dict) and catalog.get("complete") is True else "unknown",
+                               "coverage": "bounded current reward-market sample",
+                               "sample_limit": sample}
+    finally:
+        client.close()
+    report["guard"] = {"mutation_attempts": guard.mutation_calls,
+                       "notification_attempts": guard.live_notifications}
+    all_ready = authenticated and all(row.get("status") == "ready" for row in checks.values())
+    report["result"] = "PARTIAL" if all_ready and not guard.attempts else "BLOCKED"
+    print(json.dumps(report, ensure_ascii=False))
+    return 0 if report["result"] == "PARTIAL" else 2
 
 
 def _account_status_projection(snapshot: dict[str, object]) -> dict[str, object]:
@@ -1885,6 +2172,25 @@ def main(argv: list[str] | None = None) -> int:
             except (FileNotFoundError, ValueError, KeychainError, PolymarketTradingError) as exc:
                 code = getattr(exc, "error_code", "unavailable")
                 print(f"result: BLOCKED\nerror_code: {code}", file=sys.stderr)
+                return 2
+
+        if args.prediction_command == "wallet" and args.wallet_command == "read-auth":
+            try:
+                return _prediction_read_auth(args.config.expanduser(),
+                                             require_trading_region=args.require_trading_region)
+            except (FileNotFoundError, ValueError) as exc:
+                print(json.dumps({"result": "BLOCKED", "reason": str(exc)
+                                  if str(exc) in {"credential_backend_unset", "credential_file_unset", "ssm_references_incomplete"}
+                                  else "configuration_unavailable"}))
+                return 2
+
+        if args.prediction_command == "data-check":
+            try:
+                return _prediction_data_check(args.config.expanduser(), sample=args.sample)
+            except (FileNotFoundError, ValueError) as exc:
+                print(json.dumps({"result": "BLOCKED", "reason": str(exc)
+                                  if str(exc) in {"credential_backend_unset", "credential_file_unset", "ssm_references_incomplete", "sample_out_of_range"}
+                                  else "configuration_unavailable"}))
                 return 2
 
         if args.prediction_command == "preflight":

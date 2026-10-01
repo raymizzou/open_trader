@@ -391,6 +391,8 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
                 "original_size": Decimal("100"),
                 "size_matched": Decimal("0"),
                 "remaining_size": Decimal("100"),
+                "order_type": "GTC",
+                "expiration": None,
             }
             self.lp_order = {
                 "order_id": "lp-order",
@@ -422,17 +424,30 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
                 "positions": (),
             }
 
-        def lp_account_snapshot(self) -> dict[str, object]:
+        def lp_account_snapshot(
+            self, *, trade_generation_provider=None
+        ) -> dict[str, object]:
             lp_events["account"].set()
+            now = datetime.now(UTC)
+            provider = trade_generation_provider
             return {
                 "authenticated": True,
+                "wallet_address": self.config.wallet_address,
+                "account_id": str(self.config.wallet_address).casefold(),
                 "balance": Decimal("100"),
                 "allowance": Decimal("100"),
                 "open_orders": (dict(self.order), dict(self.lp_order)),
                 "positions": (),
-                "checked_at": datetime.now(UTC),
+                "raw_trades": (),
+                "balance_complete": True,
                 "open_orders_complete": True,
                 "positions_complete": True,
+                "trades_complete": True,
+                "pagination_complete": True,
+                "read_started_at": now,
+                "checked_at": now,
+                "read_ended_at": now,
+                "trade_generation": provider() if callable(provider) else None,
             }
 
         def get_order_scoring(self, order_id: str) -> bool:
@@ -721,6 +736,10 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
     solver_calls: list[str] = []
     predict_calls: list[str] = []
 
+    def risk_dashboard_view(source: dict[str, object]) -> dict[str, object]:
+        return next((row for row in source.get("lp_sessions", ())
+                     if row.get("session_id") == "lp-risk-session"), {})
+
     def make_runtime() -> PredictionRuntime:
         return PredictionRuntime(
             data_dir=tmp_path,
@@ -767,12 +786,13 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
             (
                 not isinstance(risk_session, dict)
                 or not isinstance(risk_session.get("reward_observation"), dict)
-                or not isinstance(dashboard.get("lp_session"), dict)
+                or not isinstance(dashboard.get("lp_sessions"), list)
+                or not isinstance(risk_dashboard_view(dashboard), dict)
                 or not isinstance(
-                    dashboard["lp_session"].get("reward_observation"), dict
+                    risk_dashboard_view(dashboard).get("reward_observation"), dict
                 )
                 or (
-                    dashboard["lp_session"]["reward_observation"].get("status")
+                    risk_dashboard_view(dashboard)["reward_observation"].get("status")
                     != "below"
                 )
             )
@@ -787,7 +807,10 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
         assert runtime.observation_monitor is None
         assert runtime.predict_snapshot_refresher is None
         assert dashboard["orders"][0]["order_id"] == "manual-order"
-        assert dashboard["orders"][0]["management"] == "manual_read_only"
+        assert dashboard["orders"][0]["management"] == "system_managed"
+        manual_owner_id = dashboard["orders"][0]["session_id"]
+        assert store.lp_session(manual_owner_id)["owned_order_ids"] == ["manual-order"]
+        assert len(store.lp_sessions()) == 3
         assert candidate["state"] == "ready"
         assert candidate["complete"] is True
         assert candidate["catalog_complete"] is True
@@ -814,8 +837,10 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
         assert risk_session["book_checked_at"] != risk_stale_at
         assert risk_session["scoring_status"] == "true"
         assert risk_session["scoring_checked_at"] != risk_stale_at
-        assert dashboard["lp_session"]["state"] == "entry_open"
-        reward_observation = dashboard["lp_session"]["reward_observation"]
+        risk_view = risk_dashboard_view(dashboard)
+        assert risk_view["session_id"] == "lp-risk-session"
+        assert risk_view["state"] == "entry_open"
+        reward_observation = risk_view["reward_observation"]
         assert reward_observation["status"] == "below"
         assert Decimal(str(reward_observation["market_amount"])) == Decimal("0.25")
         assert Decimal(str(reward_observation["account_amount"])) == Decimal("0.25")
@@ -889,15 +914,18 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
         while (
             (
                 restarted_dashboard.get("state") != "ready"
-                or not isinstance(restarted_dashboard.get("lp_session"), dict)
+                or not isinstance(restarted_dashboard.get("lp_sessions"), list)
+                or not isinstance(risk_dashboard_view(restarted_dashboard), dict)
                 or not isinstance(
-                    restarted_dashboard["lp_session"].get("reward_observation"),
+                    risk_dashboard_view(restarted_dashboard).get(
+                        "reward_observation"
+                    ),
                     dict,
                 )
                 or (
-                    restarted_dashboard["lp_session"]["reward_observation"].get(
-                        "status"
-                    )
+                    risk_dashboard_view(restarted_dashboard)[
+                        "reward_observation"
+                    ].get("status")
                     != "below"
                 )
             )
@@ -912,14 +940,21 @@ def test_n_leg_pause_keeps_lp_running_without_n_leg_requests(
         assert restarted.observation_monitor is None
         assert restarted.predict_snapshot_refresher is None
         assert restarted_dashboard["orders"][0]["order_id"] == "manual-order"
-        assert restarted_dashboard["orders"][0]["management"] == "manual_read_only"
+        assert restarted_dashboard["orders"][0]["management"] == "system_managed"
+        assert restarted_dashboard["orders"][0]["session_id"] == manual_owner_id
+        assert len(store.lp_sessions()) == 3
         restarted_risk = store.lp_session("lp-risk-session")
         assert restarted_risk is not None
         assert restarted_risk["state"] == "entry_open"
         assert restarted_risk["owned_order_ids"] == ["lp-order"]
         assert Decimal(str(restarted_risk["paid_rewards"])) == Decimal("0")
         assert Decimal(str(restarted_risk["trade_pnl"])) == Decimal("0")
-        assert restarted_dashboard["lp_session"]["reward_observation"]["status"] == "below"
+        assert (
+            risk_dashboard_view(restarted_dashboard)[
+                "reward_observation"
+            ]["status"]
+            == "below"
+        )
         summary_after_restart = store.lp_price_history_summary(
             "candidate-condition", "candidate-yes", now=datetime.now(UTC)
         )
@@ -1046,6 +1081,9 @@ def test_restart_preserves_manual_orders_and_resumes_monitoring(
     )
 
     class FakeTrading:
+        def __init__(self) -> None:
+            self.config = config
+
         def account_snapshot(self) -> dict[str, object]:
             return {
                 "wallet_address": config.wallet_address,
@@ -1064,14 +1102,45 @@ def test_restart_preserves_manual_orders_and_resumes_monitoring(
                 "checked_at": datetime.now(UTC),
             }
 
-        def lp_account_snapshot(self) -> dict[str, object]:
+        def lp_account_snapshot(
+            self, *, trade_generation_provider=None
+        ) -> dict[str, object]:
+            now = datetime.now(UTC)
+            provider = trade_generation_provider
+            rows = []
+            for row in account_orders:
+                normalized = {
+                    **row,
+                    "order_id": str(row["id"]),
+                    "condition_id": str(row["market"]),
+                    "token_id": str(row["asset_id"]),
+                    "market_id": f"manual-market-{str(row['asset_id']).removesuffix('-token')}",
+                    "order_type": "GTC",
+                    "expiration": None,
+                    "remaining_size": (
+                        Decimal(str(row["original_size"]))
+                        - Decimal(str(row["size_matched"]))
+                    ),
+                }
+                rows.append(normalized)
             return {
                 "authenticated": True,
+                "wallet_address": self.config.wallet_address,
+                "account_id": str(self.config.wallet_address).casefold(),
                 "balance": Decimal("100"),
                 "allowance": Decimal("100"),
-                "open_orders": tuple(dict(row) for row in account_orders),
+                "open_orders": tuple(rows),
                 "positions": (),
-                "checked_at": datetime.now(UTC),
+                "raw_trades": (),
+                "balance_complete": True,
+                "open_orders_complete": True,
+                "positions_complete": True,
+                "trades_complete": True,
+                "pagination_complete": True,
+                "read_started_at": now,
+                "checked_at": now,
+                "read_ended_at": now,
+                "trade_generation": provider() if callable(provider) else None,
             }
 
         def get_order_scoring(self, _order_id: str) -> bool:
@@ -1190,10 +1259,11 @@ def test_restart_preserves_manual_orders_and_resumes_monitoring(
     monkeypatch.setattr(monitor_module, "AsyncPublicClient", FakePublicClient)
 
     expected_orders = [
-        ("manual-no-order", "BUY", "0.36", "100", "manual_read_only", True),
-        ("manual-yes-order", "BUY", "0.27", "100", "manual_read_only", True),
+        ("manual-no-order", "BUY", "0.36", "100", "system_managed", False),
+        ("manual-yes-order", "BUY", "0.27", "100", "system_managed", False),
     ]
     observations: list[dict[str, object]] = []
+    owners_by_run: list[dict[str, str]] = []
     for _ in range(2):
         runtime = PredictionRuntime(
             data_dir=tmp_path,
@@ -1218,6 +1288,21 @@ def test_restart_preserves_manual_orders_and_resumes_monitoring(
                 runtime.execution.refresh_lp_dashboard_snapshot()
                 dashboard = runtime.execution.lp_dashboard()
                 time.sleep(0.05)
+            owner_counts: dict[str, set[str]] = {}
+            for session in runtime.store.lp_sessions():
+                session_id = str(session.get("session_id"))
+                for order_id in session.get("owned_order_ids") or []:
+                    owner_counts.setdefault(str(order_id), set()).add(session_id)
+            expected_owner_ids = {"manual-no-order", "manual-yes-order"}
+            assert set(owner_counts) == expected_owner_ids
+            assert len(runtime.store.lp_sessions()) == 2
+            assert all(len(session_ids) == 1 for session_ids in owner_counts.values())
+            owners_by_run.append(
+                {
+                    order_id: next(iter(session_ids))
+                    for order_id, session_ids in owner_counts.items()
+                }
+            )
             observations.append(
                 {
                     "state": runtime.state,
@@ -1249,6 +1334,7 @@ def test_restart_preserves_manual_orders_and_resumes_monitoring(
         "incidents": 0,
     }
     assert observations == [expected, expected]
+    assert owners_by_run[0] == owners_by_run[1]
     assert mutations == []
 
 
@@ -2913,6 +2999,7 @@ def test_lp_observations_refresh_without_dashboard_and_stop_with_runtime(
     isolation_probe = IsolationProbe()
     isolation_order = {
         "order_id": "manual-order",
+        "market_id": "market-1",
         "condition_id": "condition-1",
         "token_id": "yes-token",
         "outcome": "YES",
@@ -2952,17 +3039,37 @@ def test_lp_observations_refresh_without_dashboard_and_stop_with_runtime(
                 "checked_at": datetime.now(UTC),
             }
 
-        def lp_account_snapshot(self) -> dict[str, object]:
+        def lp_account_snapshot(
+            self, *, trade_generation_provider=None
+        ) -> dict[str, object]:
             isolation_probe.read_started()
             try:
                 isolation_probe.observation_cycle.set()
+                now = datetime.now(UTC)
+                provider = trade_generation_provider
+                normalized = {
+                    **isolation_order,
+                    "order_type": "GTC",
+                    "expiration": None,
+                }
                 return {
                     "authenticated": True,
-                    "checked_at": datetime.now(UTC),
-                    "open_orders": [dict(isolation_order)],
+                    "wallet_address": self.config.wallet_address,
+                    "account_id": str(self.config.wallet_address).casefold(),
+                    "balance": Decimal("100"),
+                    "allowance": Decimal("100"),
+                    "open_orders": [normalized],
                     "positions": [],
-                    "open_orders_complete": True,
+                    "raw_trades": (),
+                    "balance_complete": True,
+                        "open_orders_complete": True,
                     "positions_complete": True,
+                    "trades_complete": True,
+                    "pagination_complete": True,
+                    "read_started_at": now,
+                    "checked_at": now,
+                    "read_ended_at": now,
+                    "trade_generation": provider() if callable(provider) else None,
                 }
             finally:
                 isolation_probe.read_finished()
@@ -3237,7 +3344,7 @@ def test_lp_share_watch_runs_without_dashboard_and_stops_with_runtime(
         def __init__(self) -> None:
             super().__init__(config, FakeSDK())
 
-        def lp_account_snapshot(self) -> dict[str, object]:
+        def lp_account_snapshot(self, account_round=None) -> dict[str, object]:
             return {
                 "authenticated": True,
                 "checked_at": datetime.now(UTC),
@@ -6804,6 +6911,7 @@ def test_lp_metadata_warmup_advances_beyond_one_batch(
     positive_ids = frozenset(condition_ids[:1499])
     request_lock = threading.Lock()
     metadata_requests: list[tuple[str, ...]] = []
+    closed_queries: list[tuple[str, ...]] = []
     dispatch_after_stop_signal: list[tuple[str, ...]] = []
     fail_last_once = [True]
     hold_next_metadata = [False]
@@ -6887,7 +6995,8 @@ def test_lp_metadata_warmup_advances_beyond_one_batch(
             return [reward_row(condition_id)] if condition_id in condition_ids else []
 
         def list_markets(
-            self, *, condition_ids: object, page_size: int = 100
+            self, *, condition_ids: object, page_size: int = 100,
+            closed: bool | None = None,
         ) -> list[object]:
             assert page_size == 100
             batch = tuple(str(value) for value in condition_ids)  # type: ignore[arg-type]
@@ -6899,6 +7008,10 @@ def test_lp_metadata_warmup_advances_beyond_one_batch(
                 if stop_event is not None and stop_event.is_set():
                     dispatch_after_stop_signal.append(batch)
                 metadata_requests.append(batch)
+                if closed is True:
+                    assert batch == (absent_id,)
+                    closed_queries.append(batch)
+                    return []
                 if batch == (failed_id,) and fail_last_once[0]:
                     fail_last_once[0] = False
                     should_fail = True
@@ -7082,15 +7195,17 @@ def test_lp_metadata_warmup_advances_beyond_one_batch(
         assert preparation["total_count"] == 0
         with request_lock:
             retry_requests = tuple(metadata_requests)
-        assert len(retry_requests) == 17
+        assert len(retry_requests) == 18
         assert retry_requests[-1] == (failed_id,)
-        assert sum(len(batch) for batch in retry_requests) == 1502
+        assert sum(len(batch) for batch in retry_requests) == 1503
         assert sum(failed_id in batch for batch in retry_requests) == 2
         assert all(len(batch) <= 100 for batch in retry_requests)
         assert all(
             sum(condition_id in batch for batch in retry_requests) == 1
-            for condition_id in initial_ids
+            for condition_id in positive_ids
         )
+        assert sum(absent_id in batch for batch in retry_requests) == 2
+        assert closed_queries == [(absent_id,)]
         assert set(
             condition_id
             for batch in retry_requests
@@ -10110,3 +10225,81 @@ def test_reward_monitor_refreshes_every_active_group(
         if thread is not None:
             thread.join(timeout=2)
             runtime._reward_thread = None
+
+
+def test_paused_file_shadow_starts_guarded_display_workers_only(tmp_path, monkeypatch):
+    import open_trader.prediction_runtime as module
+    config = tmp_path / 'prediction.json'
+    config.write_text('{}')
+    monkeypatch.setenv('OPEN_TRADER_CREDENTIAL_BACKEND', 'file')
+    monkeypatch.setattr(module, 'load_trading_config', lambda _: object())
+    events = []
+    trading = SimpleNamespace(attach_metadata_cache=lambda _: events.append('metadata'))
+    monkeypatch.setattr(module.PolymarketTradingClient, 'from_keychain',
+        lambda config, **kwargs: (events.append(('auth', kwargs)), trading)[1])
+    monkeypatch.setattr(module, 'PolymarketLPService', lambda *a, **k: SimpleNamespace())
+    monkeypatch.setattr(module, 'PolymarketMonitor', lambda **k: SimpleNamespace(stop=lambda: events.append('monitor-stop')))
+    monkeypatch.setattr(module, 'PredictionExecutionService', lambda **k: SimpleNamespace())
+    @contextmanager
+    def guarded(*args):
+        events.append('guard-enter')
+        yield
+        events.append('guard-exit')
+    monkeypatch.setattr(module, 'guard_polymarket_client', guarded)
+    workers = ('_start_history_monitor', '_start_candidate_scan_monitor',
+        '_start_candidate_maintenance_monitor', '_start_candidate_competition_monitor',
+        '_start_lp_dashboard_monitor', '_start_reward_monitor', '_start_book_sampler')
+    for name in workers:
+        monkeypatch.setattr(PredictionRuntime, name,
+            lambda self, _name=name, **kwargs: events.append((_name, kwargs)))
+    for name in ('_start_lp_monitor', '_start_lp_auto_monitor', '_start_lp_daily_report_monitor', '_start_lp_share_watch'):
+        monkeypatch.setattr(PredictionRuntime, name, lambda self: pytest.fail('execution worker started'))
+    runtime = PredictionRuntime(data_dir=tmp_path/'data', prediction_config_path=config,
+        dashboard_url='http://127.0.0.1:8766/', mode='shadow', n_leg_paused=True)
+    runtime.start()
+    try:
+        assert ('auth', {'read_only': True}) in events
+        assert runtime.execution is not None and runtime.lp is not None
+        assert runtime.production_owner is False and runtime.solver_server is None
+        assert [event[0] for event in events if isinstance(event, tuple) and event[0] in workers] == list(workers)
+        assert events.index('guard-enter') < events.index(('_start_history_monitor', {'data_only': True}))
+        with pytest.raises(RuntimeError, match='cannot start'):
+            runtime.start()
+    finally:
+        runtime.stop()
+    assert events[-1] == 'guard-exit'
+
+
+def test_paused_file_shadow_authentication_failure_does_not_fallback(tmp_path, monkeypatch):
+    import open_trader.prediction_runtime as module
+    monkeypatch.setenv('OPEN_TRADER_CREDENTIAL_BACKEND', 'file')
+    monkeypatch.setattr(module, 'load_trading_config', lambda _: object())
+    def invalid(*args, **kwargs):
+        raise ValueError('credential_file_invalid')
+    monkeypatch.setattr(module.PolymarketTradingClient, 'from_keychain', invalid)
+    runtime = PredictionRuntime(data_dir=tmp_path/'data', prediction_config_path=tmp_path/'missing.json',
+        dashboard_url='http://127.0.0.1:8766/', mode='shadow', n_leg_paused=True)
+    with pytest.raises(ValueError, match='credential_file_invalid'):
+        runtime.start()
+    assert runtime.state == 'FAILED'
+    assert runtime.lp is None and runtime.execution is None and runtime._prediction_trading is None
+    assert runtime.production_owner is False and not runtime._owner.held
+
+
+def test_paused_disabled_shadow_with_config_remains_credentialless(tmp_path, monkeypatch):
+    import open_trader.prediction_runtime as module
+    config = tmp_path / 'prediction.json'
+    config.write_text('{}')
+    monkeypatch.setenv('OPEN_TRADER_CREDENTIAL_BACKEND', 'disabled')
+    def forbidden(*a, **k):
+        pytest.fail('disabled paused Shadow must not load config or initialize readers')
+    monkeypatch.setattr(module, 'load_trading_config', forbidden)
+    monkeypatch.setattr(module.PolymarketTradingClient, 'from_keychain', forbidden)
+    runtime = PredictionRuntime(data_dir=tmp_path/'data', prediction_config_path=config,
+        dashboard_url='http://127.0.0.1:8766/', mode='shadow', n_leg_paused=True)
+    runtime.start()
+    try:
+        assert runtime.lp is None and runtime.execution is None
+        assert runtime._candidate_scan_thread is None and runtime._history_thread is None
+    finally:
+        runtime.stop()

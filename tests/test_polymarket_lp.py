@@ -37,6 +37,7 @@ from open_trader.prediction_arbitrage_store import (
 
 class _Exchange:
     def __init__(self) -> None:
+        self.config = SimpleNamespace(wallet_address="wallet")
         self.snapshot_value: dict[str, object] | None = None
         self.snapshots: list[dict[str, object]] = []
         self.snapshot_calls = 0
@@ -114,6 +115,7 @@ def _snapshot(now: datetime) -> dict[str, object]:
     return {
         "account": {
             "authenticated": True,
+            "wallet_address": "wallet",
             "balance": Decimal("100"),
             "allowance": Decimal("100"),
             "positions": [],
@@ -2872,6 +2874,9 @@ class _SDKPublicClient:
             neg_risk=False,
             hash="book-hash",
         )
+
+    def get_order_books(self, *, token_ids: list[str]) -> list[object]:
+        return [self.get_order_book(token_id=token_id) for token_id in token_ids]
 
     def get_order_scoring(self, *, order_id: str) -> bool:
         self.scoring_calls += 1
@@ -14840,7 +14845,8 @@ def test_slow_publication_diagnostics_release_locks(tmp_path, monkeypatch, caplo
 
     result = service.reconcile_facts('session-secret', report_only=True)
     assert result[3] is None
-    assert 'stage=facts_report_publish elapsed_seconds=61.000 error_types=none' in caplog.text
+    assert 'lp_read_slow stage=facts_report_publish elapsed_seconds=61.000' in caplog.text
+    assert 'error_types=none' not in caplog.text
     assert 'outcome=slow' in caplog.text
     assert 'secret' not in caplog.text
     assert service._facts_apply_lock.acquire(blocking=False)
@@ -14857,7 +14863,9 @@ def test_slow_publication_diagnostics_release_locks(tmp_path, monkeypatch, caplo
 
 
 @pytest.mark.parametrize('wrapped', [False, True])
-def test_null_order_response_stays_unknown_with_specific_reason(tmp_path, monkeypatch, wrapped):
+def test_null_order_response_stays_unknown_with_specific_reason(tmp_path, monkeypatch, caplog, wrapped):
+    import logging
+    caplog.set_level(logging.INFO, logger="open_trader.polymarket_trading")
     from polymarket.models.clob.account import OpenOrder
     now = datetime.now(UTC)
     account = _SDKAccountClient(now)
@@ -14890,6 +14898,88 @@ def test_null_order_response_stays_unknown_with_specific_reason(tmp_path, monkey
     # A persisted exact terminal receipt is not erased by an unavailable lookup.
     session['order_history']['missing-receipt']['status'] = 'CANCELED'
     assert service._order_history_patch(session, snapshot)['order_history']['missing-receipt']['status'] == 'CANCELED'
+    records = [row for row in caplog.records if row.name == 'open_trader.polymarket_trading']
+    assert not [row for row in records if row.levelno >= logging.WARNING]
+    if wrapped:
+        assert any('lp_read_wait stage=required_order' in row.getMessage()
+                   and 'reason=order_lookup_unavailable' in row.getMessage() for row in records)
+
+
+@pytest.mark.parametrize('failure', ['schema', 'transport', 'rate_limit', 'auth', 'value_error'])
+def test_required_order_real_failures_stay_logged_unknown_and_redacted(tmp_path, monkeypatch, caplog, failure):
+    import httpx
+    import logging
+    from polymarket.errors import RequestRejectedError, TransportError
+    from polymarket.models.clob.account import OpenOrder
+    from open_trader import polymarket_trading
+
+    now = datetime.now(UTC)
+    secret = 'Authorization=diagnostic-secret private-key=diagnostic-secret'
+    account = _SDKAccountClient(now)
+
+    def failed_lookup(**kwargs):
+        if failure == 'schema':
+            return OpenOrder.parse_response({'id': secret})
+        if failure == 'transport':
+            try:
+                raise httpx.ReadTimeout(secret)
+            except httpx.ReadTimeout as cause:
+                raise TransportError(secret) from cause
+        if failure in {'rate_limit', 'auth'}:
+            error = RequestRejectedError(secret, status=429 if failure == 'rate_limit' else 401)
+            error.headers = {'Retry-After': '7', 'Authorization': secret}
+            raise error
+        raise ValueError(secret)
+
+    monkeypatch.setattr(account, 'get_order', failed_lookup, raising=False)
+    adapter = PolymarketTradingClient(
+        TradingConfig('0x' + '1' * 40, '0x' + '2' * 40), account,
+        public_client_factory=lambda: _SDKPublicClient(now))
+    try:
+        request = {**_request(now), 'owned_order_ids': ['missing-receipt']}
+        snapshot = adapter.lp_snapshot(request)
+        assert snapshot['orders_terminal'] is False
+        expected = 'order_response_invalid' if failure == 'schema' else 'order_read_failed'
+        assert snapshot['order_read_errors']['missing-receipt'] == expected
+        service = PolymarketLPService(PredictionArbitrageStore(tmp_path), adapter)
+        patch = service._order_history_patch({**request, 'order_history': {'missing-receipt': {'status': 'LIVE'}}}, snapshot)
+        assert patch['order_history']['missing-receipt']['status'] == 'UNKNOWN'
+        records = [r for r in caplog.records if r.name == polymarket_trading.__name__]
+        assert any(r.levelno >= logging.WARNING and 'stage=required_order' in r.getMessage()
+                   and 'error_types=' in r.getMessage() for r in records)
+        assert not any('lp_read_wait' in r.getMessage() for r in records)
+        if failure == 'rate_limit':
+            assert 'status=429' in caplog.text
+            assert 'retry_after_seconds=7' in caplog.text
+        assert secret not in caplog.text
+        assert all(r.exc_info is None for r in records)
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize('metadata', ['raising', 'huge_retry'])
+def test_diagnostic_metadata_failure_preserves_original_exception_and_secrets(metadata, caplog):
+    from polymarket.errors import RequestRejectedError
+    from open_trader.polymarket_trading import _lp_read_stage
+
+    secret = 'Authorization=malicious-retry-secret'
+
+    class PoisonedReadError(RequestRejectedError):
+        @property
+        def response_facts(self):
+            if metadata == 'raising':
+                raise RuntimeError(secret)
+            return {'status': 429, 'retry_after_seconds': 10 ** 10000, 'secret': secret}
+
+    original = PoisonedReadError(secret, status=429)
+    with pytest.raises(PoisonedReadError) as captured:
+        with _lp_read_stage('required_order'):
+            raise original
+    assert captured.value is original
+    assert 'error_types=PoisonedReadError' in caplog.text
+    assert 'lp_read_wait' not in caplog.text
+    assert 'retry_after_seconds=' not in caplog.text
+    assert secret not in caplog.text
 
 
 def test_full_verified_fill_closes_missing_order_receipt_without_guessing(tmp_path):
@@ -15030,3 +15120,134 @@ def test_review_preparation_rearm_resets_fault_and_rejects_old_claim(tmp_path):
     assert claimed['fault_alert_claimed_now'] is True
     service.finish_preparation_alert(generation=1, success=True)
     assert service.preparation_snapshot()['fault_alert_state'] == 'claimed'
+
+
+def test_closed_sdk_market_keeps_unknown_financial_lane_and_fixed_local_recheck(tmp_path, monkeypatch, caplog):
+    import logging
+    from open_trader import polymarket_trading
+    now = datetime.now(UTC)
+    current = [100.0]
+    monkeypatch.setattr(polymarket_trading, 'time', SimpleNamespace(
+        monotonic=lambda: current[0], time=lambda: now.timestamp() + current[0] - 100))
+    caplog.set_level(logging.INFO, logger=polymarket_trading.__name__)
+
+    class ClosedPublic(_SDKPublicClient):
+        closed = True
+        market_calls = 0
+        book_calls = 0
+
+        def get_market(self, *, id):
+            self.market_calls += 1
+            row = super().get_market(id=id)
+            return row.model_copy(update={'state': row.state.model_copy(update={'closed': self.closed})})
+
+        def get_order_book(self, *, token_id):
+            self.book_calls += 1
+            return super().get_order_book(token_id=token_id)
+
+    public = ClosedPublic(now)
+    account = _SDKAccountClient(now)
+    account.list_positions = lambda **kw: [{'asset': '0x' + '1' * 64, 'conditionId': '0x' + 'c' * 64, 'size': Decimal('100')}]
+    mutations = []
+    account.post_order = lambda *a, **kw: mutations.append('post')
+    account.cancel_order = lambda *a, **kw: mutations.append('cancel')
+    account.create_limit_order = lambda *a, **kw: mutations.append('create')
+    adapter = PolymarketTradingClient(TradingConfig('0x' + '1' * 40, '0x' + '2' * 40), account,
+                                     public_client_factory=lambda: public)
+    request = {**_request(now), 'entry_order_id': 'order-1', 'passive_exit_order_id': 'order-open',
+               'owned_order_ids': ['order-1', 'order-open']}
+    try:
+        snapshot = adapter.lp_snapshot(request)
+        assert public.book_calls == 0
+        assert snapshot['market'] is None and snapshot['book'] is None
+        error = snapshot['market_read_errors'][request['condition_id']]
+        assert error['error_type'] == 'market_closed'
+        assert error['retry_source'] == 'local_closed_market_recheck'
+        assert 0 < error['retry_after_seconds'] <= 60
+        assert error['retry_after_at'] == now + timedelta(seconds=60)
+        assert 'status' not in error
+        assert snapshot['orders_terminal'] is False
+        assert snapshot['orders'][0]['order_id'] == 'order-open'
+        assert snapshot['trades'][0]['trade_id'] == 'trade-1'
+        assert snapshot['account']['authenticated'] is True
+        assert snapshot['account']['positions'][0]['size'] == Decimal('100')
+        store = PredictionArbitrageStore(tmp_path)
+        store.lp_create_session('closed', 'closed', state='passive_exit', payload={
+            **request, 'submit_status': 'accepted', 'reserved_usd': '30'})
+        service = PolymarketLPService(store, adapter, clock=lambda: datetime.now(UTC))
+        service.reconcile_facts('closed')
+        row = store.lp_session('closed')
+        assert row['state'] != 'complete'
+        assert row['owned_order_ids'] == ['order-1', 'order-open']
+        assert row['reserved_usd'] == '30'
+        assert row['inventory_valuation_status'] == 'unknown'
+        assert row['book_admission_ready'] is False
+        assert store.lp_actions('closed') == []
+        assert mutations == []
+        key = f"{request['condition_id']}\0{request['token_id']}"
+        deadline = adapter._lp_public_read_retry[key][0]
+        assert deadline == 160
+        for instant in (120, 159):
+            current[0] = instant
+            retry = adapter.lp_snapshot(request)['market_read_errors'][request['condition_id']]
+            assert retry['retry_after_seconds'] == 160 - instant
+            assert retry['retry_after_at'] == now + timedelta(seconds=60)
+            assert adapter._lp_public_read_retry[key][0] == deadline
+        assert public.market_calls == 1 and public.book_calls == 0
+        assert 'reason=market_closed' in caplog.text
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        current[0] = 160
+        public.closed = False
+        reopened = adapter.lp_snapshot(request)
+        assert reopened['market_read_errors'] == {}
+        assert reopened['book'] is not None
+        assert public.market_calls == 2 and public.book_calls == 1
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize('variant', ['market_id', 'condition_id', 'token_id', 'missing_closed', 'nonbool_closed', 'active_404'])
+def test_unverified_closed_or_active_sdk_market_keeps_book_fault(variant, caplog):
+    from polymarket.errors import RequestRejectedError
+    now = datetime.now(UTC)
+
+    class Public(_SDKPublicClient):
+        book_calls = 0
+
+        def get_market(self, *, id):
+            row = super().get_market(id=id)
+            state = row.state.model_copy(update={'closed': False if variant == 'active_404' else True})
+            row = row.model_copy(update={'state': state})
+            if variant in {'market_id', 'condition_id'}:
+                return row.model_copy(update={('id' if variant == 'market_id' else variant): 'wrong'})
+            if variant == 'token_id':
+                return row.model_copy(update={'outcomes': row.outcomes.model_copy(update={
+                    'yes': row.outcomes.yes.model_copy(update={'token_id': 'wrong'})})})
+            if variant == 'missing_closed':
+                payload = row.model_dump()
+                payload['state'].pop('closed')
+                return payload
+            if variant == 'nonbool_closed':
+                return row.model_copy(update={'state': state.model_copy(update={'closed': 'true'})})
+            return row
+
+        def get_order_book(self, *, token_id):
+            self.book_calls += 1
+            raise RequestRejectedError('sensitive book body', status=404)
+
+    public = Public(now)
+    adapter = PolymarketTradingClient(TradingConfig('0x' + '1' * 40, '0x' + '2' * 40), _SDKAccountClient(now),
+                                     public_client_factory=lambda: public)
+    try:
+        snapshot = adapter.lp_snapshot(_request(now))
+        assert public.book_calls == 1
+        error = snapshot['market_read_errors']['0x' + 'c' * 64]
+        assert error['status'] == 404
+        assert error['error_type'] == 'RequestRejectedError'
+        assert 'retry_source' not in error
+        assert snapshot['market'] is None and snapshot['book'] is None
+        assert 'lp_snapshot_stage stage=book' in caplog.text
+        assert 'lp_read_wait' not in caplog.text
+        assert 'sensitive book body' not in caplog.text
+    finally:
+        adapter.close()

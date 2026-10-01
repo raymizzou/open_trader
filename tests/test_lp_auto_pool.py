@@ -109,6 +109,22 @@ def setup(tmp_path, count=1):
     return engine,ex,lp,store
 
 
+def _fresh_registration_bundle(x, lp):
+    snapshot = x.lp_account_snapshot()
+    snapshot.update(
+        account_id='test-wallet',
+        read_started_at=NOW,
+        read_ended_at=NOW,
+        checked_at=NOW,
+        balance_complete=True,
+        trades_complete=True,
+        pagination_complete=True,
+        raw_trades=x.trades,
+        trade_generation=lp.store.lp_trade_generation(),
+    )
+    return snapshot
+
+
 def test_default_configure_enable_and_idempotent_round(tmp_path):
     e,x,lp,s=setup(tmp_path,5)
     assert e.lp_auto_state()['desired_running'] is False
@@ -148,6 +164,83 @@ def test_full_pool_manual_exclusion_unknown_isolated_and_restart(tmp_path):
     assert e2.lp_auto_state()['run_id']==r['run_id']
 
 
+def test_prepare_transport_error_is_determinate_not_sent(tmp_path):
+    from polymarket.errors import TransportError
+    from polymarket.models.clob import SignedOrder
+
+    def sdk_signed(**kwargs):
+        return SignedOrder(
+            builder='0x1', expiration=int(kwargs['expiration']), maker='0x2',
+            maker_amount=1, metadata='0x3', order_type='GTD', salt=1,
+            side='BUY', signature='0x4', signature_type=0, signer='0x5',
+            taker_amount=1, timestamp=1, token_id=str(kwargs['token_id']),
+            post_only=True,
+        )
+
+    def prepare_then_transport(**kwargs):
+        sdk_signed(**kwargs)
+        raise TransportError('private')
+
+    e,x,lp,s=setup(tmp_path)
+    e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
+    e.lp_auto_set_desired_running(True)
+    x.lp_create_limit_order=prepare_then_transport
+    r=e.lp_auto_run_once()
+    sid=r['intents'][0]['session_id']
+    session=s.lp_session(sid)
+    action=next(a for a in s.lp_actions(sid) if a['role']=='entry')
+    assert not x.posts
+    assert session['state']=='entry_rejected'
+    assert session['submit_status']=='rejected'
+    assert session['submit_stage']=='prepare_failed'
+    assert session['submit_post_started_at'] is None
+    assert session['submit_error_chain']==['TransportError']
+    assert action['state']=='rejected'
+    assert action['submit_error_chain']==['TransportError']
+    assert r['slots']['occupied']==0
+    assert r['funds']['status']=='known'
+    assert Decimal(r['funds']['buy_reserved_usd'])==0
+
+
+def test_post_timeout_keeps_one_temporary_reservation_without_retry(tmp_path):
+    e,x,lp,s=setup(tmp_path)
+    e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
+    e.lp_auto_set_desired_running(True)
+    def sdk_signed(**kwargs):
+        from polymarket.models.clob import SignedOrder
+        return SignedOrder(
+            builder='0x1', expiration=int(kwargs['expiration']), maker='0x2',
+            maker_amount=1, metadata='0x3', order_type='GTD', salt=1,
+            side='BUY', signature='0x4', signature_type=0, signer='0x5',
+            taker_amount=1, timestamp=1, token_id=str(kwargs['token_id']),
+            post_only=True,
+        )
+    x.lp_create_limit_order=sdk_signed
+    def timeout(signed):
+        x.posts.append(signed)
+        raise TimeoutError('private')
+    x.lp_post_order=timeout
+    r=e.lp_auto_run_once()
+    sid=r['intents'][0]['session_id']
+    session=s.lp_session(sid)
+    action=next(a for a in s.lp_actions(sid) if a['role']=='entry')
+    assert len(x.posts)==1
+    assert session['state']=='needs_attention'
+    assert session['submit_status']=='unknown'
+    assert session['submit_stage']=='send_unknown'
+    assert session['submit_post_started_at']
+    assert session['submit_finished_at']
+    assert session['submit_timeout'] is True
+    assert action['state']=='unknown'
+    assert action['post_started'] is True
+    e2=PredictionExecutionService(store=s,monitor=SimpleNamespace(),trading=x,
+                notifier=SimpleNamespace(),lock_path=tmp_path/'execution.lock',lp=lp)
+    e2._breaker_open=False
+    assert len(e2.lp_auto_run_once()['intents'])==1
+    assert len(x.posts)==1
+    assert r['slots']['occupied']==1
+
+
 def test_pause_during_signing_prevents_post(tmp_path):
     e,x,lp,s=setup(tmp_path)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
@@ -157,6 +250,149 @@ def test_pause_during_signing_prevents_post(tmp_path):
     assert not x.posts
     assert r['pause_confirmed'] is True
     assert r['slots']['occupied']==0
+    sid=r['intents'][0]['session_id']
+    session=s.lp_session(sid)
+    action=next(a for a in s.lp_actions(sid) if a['role']=='entry')
+    for fact in (session,action):
+        assert fact['submit_stage']=='pre_send_rejected'
+        assert fact['post_started'] is False
+        assert fact['submit_post_started_at'] is None
+
+
+def test_callback_read_failure_before_post_releases_reservation(tmp_path):
+    e,x,lp,s=setup(tmp_path)
+    e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
+    e.lp_auto_set_desired_running(True)
+    original=lp._read_candidate_snapshot
+    reads=0
+    def read(request,**kwargs):
+        nonlocal reads
+        reads+=1
+        if reads==1:
+            return original(request,**kwargs)
+        raise RuntimeError('private pre-send failure')
+    lp._read_candidate_snapshot=read
+    r=e.lp_auto_run_once()
+    sid=r['intents'][0]['session_id']
+    session=s.lp_session(sid)
+    action=next(a for a in s.lp_actions(sid) if a['role']=='entry')
+    assert reads==2 and not x.posts
+    assert session['state']=='entry_rejected'
+    assert session['submit_stage']=='prepare_failed'
+    assert session['submit_error_chain']==['RuntimeError']
+    assert session['post_started'] is False
+    assert action['submit_stage']=='prepare_failed'
+    assert r['slots']['occupied']==0
+    assert r['funds']['status']=='known'
+
+
+def test_callback_lock_failure_before_post_releases_reservation(tmp_path):
+    e,x,lp,s=setup(tmp_path)
+    e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
+    e.lp_auto_set_desired_running(True)
+    original=e._acquire_global_lock
+    granted=[]
+    def acquire():
+        lock=original()
+        if len(granted)==1:
+            if lock is not None:
+                e._release_global_lock(lock)
+            granted.append(False)
+            return None
+        granted.append(lock is not None)
+        if lock is not None:
+            return lock
+        return lock
+    e._acquire_global_lock=acquire
+    r=e.lp_auto_run_once()
+    sid=r['intents'][0]['session_id']
+    session=s.lp_session(sid)
+    action=next(a for a in s.lp_actions(sid) if a['role']=='entry')
+    assert granted==[True,False] and not x.posts
+    assert session['state']=='entry_rejected'
+    assert session['submit_stage']=='pre_send_rejected'
+    assert session['reason']=='execution_lock'
+    assert session['post_started'] is False
+    assert action['submit_stage']=='pre_send_rejected'
+    assert r['slots']['occupied']==0
+
+
+def test_second_mutation_guard_before_post_releases_reservation(tmp_path):
+    e,x,lp,s=setup(tmp_path)
+    e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
+    e.lp_auto_set_desired_running(True)
+    guards=0
+    original=lp._require_mutation
+    def guard():
+        nonlocal guards
+        guards+=1
+        if guards==2:
+            from open_trader.polymarket_lp import _MutationBlocked
+            raise _MutationBlocked('mutation_blocked')
+        original()
+    lp._require_mutation=guard
+    r=e.lp_auto_run_once()
+    sid=r['intents'][0]['session_id']
+    session=s.lp_session(sid)
+    action=next(a for a in s.lp_actions(sid) if a['role']=='entry')
+    assert guards==2 and not x.posts
+    assert session['state']=='entry_rejected'
+    assert session['submit_stage']=='prepare_failed'
+    assert session['submit_error_chain']==['_MutationBlocked']
+    assert session['post_started'] is False
+    assert action['submit_stage']=='prepare_failed'
+    assert r['slots']['occupied']==0
+    assert r['funds']['status']=='known'
+    assert Decimal(r['funds']['buy_reserved_usd'])==0
+
+
+def test_missing_post_adapter_before_post_releases_reservation(tmp_path):
+    e,x,lp,s=setup(tmp_path)
+    e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
+    e.lp_auto_set_desired_running(True)
+    x.lp_post_order=None
+    r=e.lp_auto_run_once()
+    sid=r['intents'][0]['session_id']
+    session=s.lp_session(sid)
+    action=next(a for a in s.lp_actions(sid) if a['role']=='entry')
+    assert not x.posts
+    assert session['state']=='entry_rejected'
+    assert session['submit_stage']=='prepare_failed'
+    assert session['submit_error_chain']==['RuntimeError']
+    assert session['post_started'] is False
+    assert action['submit_stage']=='prepare_failed'
+    assert r['slots']['occupied']==0
+    assert r['funds']['status']=='known'
+
+
+@pytest.mark.parametrize('accepted', [True, False])
+def test_terminal_receipt_facts_match_session_and_action(tmp_path,accepted):
+    e,x,lp,s=setup(tmp_path)
+    e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
+    e.lp_auto_set_desired_running(True)
+    if not accepted:
+        x.lp_post_order=lambda signed:x.posts.append(signed) or {
+            'accepted':False,'ok':False,'status':'REJECTED','order_id':'rejected-1'}
+    r=e.lp_auto_run_once()
+    sid=r['intents'][0]['session_id']
+    session=s.lp_session(sid)
+    action=next(a for a in s.lp_actions(sid) if a['role']=='entry')
+    expected_stage='receipt_received' if accepted else 'exchange_rejected'
+    assert session['state']==('entry_open' if accepted else 'entry_rejected')
+    assert session['submit_status']==('accepted' if accepted else 'rejected')
+    assert action['state']==('accepted' if accepted else 'rejected')
+    for name in ('submit_stage','post_started','submit_post_started_at',
+                 'submit_finished_at','submit_receipt_at','submit_timeout'):
+        assert session[name]==action[name]==({
+            'submit_stage':expected_stage,
+            'post_started':True,
+            'submit_post_started_at':session['submit_post_started_at'],
+            'submit_finished_at':session['submit_finished_at'],
+            'submit_receipt_at':session['submit_receipt_at'],
+            'submit_timeout':False,
+        }[name])
+    assert len(x.posts)==1
+    assert r['slots']['occupied']==(1 if accepted else 0)
 
 
 def test_concurrent_rounds_single_reservation(tmp_path):
@@ -256,23 +492,31 @@ def test_concurrent_configuration_is_atomic_target_total(tmp_path):
     assert e.lp_auto_state()['config_version']==2
 
 
-def test_unknown_with_reliable_id_reconciles_without_resubmit(tmp_path):
+def test_sync_manages_exchange_ids_without_precomputed_match(tmp_path):
     e,x,lp,s=setup(tmp_path,2)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=2))
     e.lp_auto_set_desired_running(True)
     create=x.lp_create_limit_order
-    x.lp_create_limit_order=lambda **kwargs:{**create(**kwargs),'order_id':'known-' + kwargs['token_id']}
+    x.lp_create_limit_order=lambda **kwargs:{**create(**kwargs),'order_id':'audit-' + kwargs['token_id']}
     x.fail=True
     r=e.lp_auto_run_once()
     assert len(x.posts)==2
     assert 'submission_unknown' in r['block_reasons']
     e.lp_auto_set_desired_running(False)
     for token in ('m00', 'm01'):
-        x.orders.append(dict(order_id='known-' + token,token_id=token,condition_id=token,side='BUY',status='LIVE',price='.4',original_size='20',size_matched='0'))
+        x.orders.append(dict(order_id='venue-' + token,token_id=token,condition_id=token,side='BUY',status='LIVE',price='.4',original_size='20',size_matched='0'))
     x.fail=False
-    r=e.lp_auto_run_once()
-    assert 'submission_unknown' not in r['block_reasons']
-    assert r['desired_running'] is False
+    first=lp.register_account_snapshot(_fresh_registration_bundle(x,lp))
+    assert first['state']=='registered', first
+    sessions=s.lp_active_sessions()
+    assert {session['token_id'] for session in sessions}=={'m00','m01'}
+    assert sorted(order_id for session in sessions for order_id in session['owned_order_ids'])==['venue-m00','venue-m01']
+    assert all('audit-' not in order_id for session in sessions for order_id in session['owned_order_ids'])
+    assert e.lp_auto_state()['funds']['status']=='unknown'
+    assert e.lp_auto_state()['desired_running'] is False
+    repeat=lp.register_account_snapshot(_fresh_registration_bundle(x,lp))
+    assert repeat['state']=='registered', repeat
+    assert len(s.lp_active_sessions())==2
     assert len(x.posts)==2
 
 
@@ -585,13 +829,12 @@ def test_late_live_receipt_preserves_already_verified_fill(tmp_path):
     e,x,lp,s=setup(tmp_path)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
     e.lp_auto_set_desired_running(True)
-    create=x.lp_create_limit_order
-    x.lp_create_limit_order=lambda **kwargs:{**create(**kwargs),'order_id':'o1'}
     post=x.lp_post_order
     def delayed_receipt(signed):
         response=dict(post(signed))
         x.orders[0].update(status='FILLED',size_matched='20')
         x.positions=[dict(token_id='m00',condition_id='m00',size='20')]
+        assert lp.register_account_snapshot(_fresh_registration_bundle(x,lp))['state']=='registered'
         e.lp_tick()
         return response
     x.lp_post_order=delayed_receipt
@@ -663,23 +906,23 @@ def test_receipt_apply_respects_another_service_tick_lock(tmp_path,signed_id):
     assert Decimal(r['funds']['inventory_cost_usd'])==(8 if signed_id else 0)
 
 
-def test_conflicting_signed_and_receipt_ids_remain_unknown(tmp_path):
+def test_exchange_receipt_id_is_owner_when_signed_id_differs(tmp_path):
     e,x,lp,s=setup(tmp_path,2)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=2))
     e.lp_auto_set_desired_running(True)
     create=x.lp_create_limit_order
     x.lp_create_limit_order=lambda **kwargs:{**create(**kwargs),'order_id':'signed-id'}
     r=e.lp_auto_run_once()
-    assert 'submission_unknown' in r['block_reasons']
-    assert r['funds']['available_usd'] is None
-    assert len(x.posts)==1
-    session=s.lp_session(r['intents'][0]['session_id'])
-    assert session['order_identity_conflict']=={'prepared_order_id':'signed-id','response_order_id':'o1'}
-    assert 'o1' not in session['owned_order_ids']
-    x.orders.append(dict(order_id='signed-id',token_id='m00',condition_id='m00',side='BUY',status='LIVE',price='.4',original_size='20',size_matched='0'))
-    assert 'submission_unknown' in e.lp_auto_reconcile_unknown()['block_reasons']
+    assert 'submission_unknown' not in r['block_reasons']
+    assert len(x.posts)==2
+    sessions=[s.lp_session(row['session_id']) for row in r['intents']]
+    assert {row['session_id'] for row in r['intents']}=={row['session_id'] for row in sessions}
+    assert sorted(order_id for session in sessions for order_id in session['owned_order_ids'])==['o1','o2']
+    assert all('order_identity_conflict' not in session for session in sessions)
+    assert all('signed-id' not in session['owned_order_ids'] for session in sessions)
+    assert e.lp_auto_state()['slots']['occupied']==2
     e.lp_auto_run_once()
-    assert len(x.posts)==1
+    assert len(x.posts)==2
 
 
 def test_accepted_sell_missing_receipt_blocks_new_buys_until_exact_id_recovers(tmp_path):
@@ -734,7 +977,7 @@ def test_known_buy_receipt_uncertainty_resolves_and_reopens_without_new_intent(t
     assert len([v for v in events if v['kind']=='intent'])==1
 
 
-def test_conflicting_identity_stays_quarantined_in_public_tick_and_stop(tmp_path):
+def test_signed_id_does_not_quarantine_venue_order_in_public_tick_and_stop(tmp_path):
     e,x,lp,s=setup(tmp_path)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
     e.lp_auto_set_desired_running(True)
@@ -743,18 +986,20 @@ def test_conflicting_identity_stays_quarantined_in_public_tick_and_stop(tmp_path
     sid=e.lp_auto_run_once()['intents'][0]['session_id']
     cancellations=[]
     x.cancel_order=lambda oid:cancellations.append(oid) or {'canceled':[oid]}
-    assert e.lp_tick()['state']=='needs_attention'
-    x.orders=[dict(order_id='prepared-id',token_id='m00',condition_id='m00',side='BUY',status='LIVE',price='.4',original_size='20',size_matched='0')]
+    assert e.lp_tick()['state']=='entry_open'
+    session=s.lp_session(sid)
+    assert session['owned_order_ids']==['o1']
+    assert 'order_identity_conflict' not in session
     original=x.direction
     def depleted(n):
         d=original(n)
         d['book']['bids'][0]['size']='20'
         return d
     x.direction=depleted
-    assert e.lp_tick()['state']=='needs_attention'
-    assert s.lp_session(sid)['reconciliation']=='order_identity_conflict'
-    assert e.lp_stop(sid)['state']=='needs_attention'
-    assert not cancellations and len(x.posts)==1
+    assert e.lp_stop(sid)['state']=='review'
+    assert cancellations==['o1']
+    assert 'prepared-id' not in cancellations
+    assert len(x.posts)==1
 
 
 def test_slow_deadline_cancel_does_not_block_other_fact_publication(tmp_path):

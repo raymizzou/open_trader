@@ -57,6 +57,7 @@ from open_trader.prediction_read_model import (
 )
 from open_trader.prediction_service import create_prediction_server
 from tests.test_prediction_arbitrage_execution import (
+    _ProjectionOnlyLP,
     _cross_service,
     execution_fixture,
     threshold_execution_fixture,
@@ -2309,7 +2310,7 @@ def test_lp_dashboard_account_outage_keeps_newer_public_funnel(tmp_path: Path) -
     save_history(store, "B", first_now + timedelta(seconds=10))
     save_history(store, "C", first_now + timedelta(seconds=10))
     exchange = Exchange()
-    lp = PolymarketLPService(store, exchange, clock=lambda: now[0])
+    lp = _ProjectionOnlyLP(store, exchange, clock=lambda: now[0])
     first_prepared = lp.refresh_price_history()
     assert first_prepared["state"] == "known"
     # Issue #181 适配：密度契约下候选只来自竞争缓存/库，先在库中预置竞争值
@@ -4745,7 +4746,7 @@ def test_lp_dashboard_reward_share_target_status_is_market_scoped(
             "outcome": "YES",
         },
     )
-    service._lp = PolymarketLPService(
+    service._lp = _ProjectionOnlyLP(
         store, object(), clock=lambda: controlled_now[0]
     )
     account_id = service._lp_account_id()
@@ -4840,7 +4841,7 @@ def test_lp_dashboard_reward_share_target_status_is_market_scoped(
             notifier=NullNotifier(),
             lock_path=tmp_path / "share-boundary.lock",
         )
-        boundary_service._lp = PolymarketLPService(
+        boundary_service._lp = _ProjectionOnlyLP(
             store, object(), clock=lambda: datetime.now(UTC)
         )
         boundary_service._clock = lambda: clock[0]
@@ -4906,7 +4907,7 @@ def test_lp_dashboard_reward_share_target_status_is_market_scoped(
             notifier=NullNotifier(),
             lock_path=tmp_path / "share-fresh-boundary.lock",
         )
-        fresh_service._lp = PolymarketLPService(
+        fresh_service._lp = _ProjectionOnlyLP(
             store, object(), clock=lambda: controlled_now[0]
         )
         fresh_service._clock = lambda: clock[0]
@@ -4931,7 +4932,7 @@ def test_lp_dashboard_reward_share_target_status_is_market_scoped(
             notifier=NullNotifier(),
             lock_path=tmp_path / "share-exact-boundary.lock",
         )
-        exact_service._lp = PolymarketLPService(
+        exact_service._lp = _ProjectionOnlyLP(
             store, object(), clock=lambda: controlled_now[0]
         )
         exact_service._clock = lambda: clock[0]
@@ -5580,7 +5581,7 @@ def test_lp_dashboard_share_failures_preserve_unknown_without_order_writes(
             "outcome": "YES",
         },
     )
-    service._lp = PolymarketLPService(
+    service._lp = _ProjectionOnlyLP(
         store, object(), clock=lambda: datetime.now(UTC)
     )
     clock = [0.0]
@@ -5792,7 +5793,7 @@ def test_lp_dashboard_share_failures_preserve_unknown_without_order_writes(
         trading=restart_account,
         notifier=NullNotifier(),
         lock_path=tmp_path / "execution-restart-a.lock",
-        lp=PolymarketLPService(store, restart_account),
+        lp=_ProjectionOnlyLP(store, restart_account),
     )
     restart_service._breaker_open = False
     restart_runtime = _Runtime()
@@ -5820,7 +5821,7 @@ def test_lp_dashboard_share_failures_preserve_unknown_without_order_writes(
         trading=restarted_account,
         notifier=NullNotifier(),
         lock_path=tmp_path / "execution-restarted-a.lock",
-        lp=PolymarketLPService(store, restarted_account),
+        lp=_ProjectionOnlyLP(store, restarted_account),
     )
     restarted_runtime = _Runtime()
     restarted_runtime.store = store  # type: ignore[assignment]
@@ -5849,7 +5850,7 @@ def test_lp_dashboard_share_failures_preserve_unknown_without_order_writes(
         trading=account_b,
         notifier=NullNotifier(),
         lock_path=tmp_path / "execution-restart-b.lock",
-        lp=PolymarketLPService(store, account_b),
+        lp=_ProjectionOnlyLP(store, account_b),
     )
     runtime_b = _Runtime()
     runtime_b.store = store  # type: ignore[assignment]
@@ -6021,7 +6022,7 @@ def test_lp_reward_share_survives_background_reward_refresh(tmp_path: Path) -> N
         trading=account,
         notifier=notifier,
         lock_path=tmp_path / "execution.lock",
-        lp=PolymarketLPService(store, account),
+        lp=_ProjectionOnlyLP(store, account),
     )
     service._clock = lambda: 0.0
     runtime = _Runtime()
@@ -9519,6 +9520,8 @@ def test_paused_n_leg_routes_reject_before_business_work(
                 "original_size": Decimal("100"),
                 "size_matched": Decimal("0"),
                 "remaining_size": Decimal("100"),
+                "order_type": "GTC",
+                "expiration": None,
             }
 
         def readiness_snapshot(self) -> dict[str, object]:
@@ -9538,15 +9541,27 @@ def test_paused_n_leg_routes_reject_before_business_work(
                 "checked_at": datetime.now(UTC),
             }
 
-        def lp_account_snapshot(self) -> dict[str, object]:
+        def lp_account_snapshot(self, *, trade_generation_provider=None) -> dict[str, object]:
+            now = datetime.now(UTC)
             external_calls.append(("lp_account_snapshot", None))
             return {
                 "authenticated": True,
+                "wallet_address": self.config.wallet_address,
+                "account_id": self.config.wallet_address.casefold(),
+                "balance_complete": True,
+                "open_orders_complete": True,
+                "positions_complete": True,
+                "trades_complete": True,
+                "pagination_complete": True,
+                "raw_trades": (),
+                "read_started_at": now,
+                "read_ended_at": now,
+                "trade_generation": trade_generation_provider() if callable(trade_generation_provider) else None,
                 "balance": Decimal("100"),
                 "allowance": Decimal("100"),
                 "open_orders": (dict(self.order),),
                 "positions": (),
-                "checked_at": datetime.now(UTC),
+                "checked_at": now,
             }
 
         def get_order_scoring(self, _order_id: str) -> bool:
@@ -9737,9 +9752,12 @@ def test_paused_n_leg_routes_reject_before_business_work(
     assert lp_status == 200
     assert lp_payload["orders"], sorted(lp_payload) and lp_payload.get("state")
     assert lp_payload["orders"][0]["order_id"] == "manual-order"
-    assert lp_payload["orders"][0]["management"] == "manual_read_only"
+    assert lp_payload["orders"][0]["management"] == "system_managed"
     assert session_status == 200
-    assert session_payload["state"] == "complete"
+    assert session_payload["session_id"] == lp_payload["orders"][0]["session_id"]
+    assert store.lp_session(session_payload["session_id"])["owned_order_ids"] == ["manual-order"]
+    assert store.lp_session("lp-session")["state"] == "complete"
+    assert len(store.lp_sessions()) == 2
     assert report_status == 404
     assert report_payload == {"error": "LP report not found"}
     assert lp_post_status == 202
@@ -9781,15 +9799,27 @@ def test_paused_n_leg_requests_do_not_hold_lp_or_health_responses(
                 "checked_at": datetime.now(UTC),
             }
 
-        def lp_account_snapshot(self) -> dict[str, object]:
+        def lp_account_snapshot(self, *, trade_generation_provider=None) -> dict[str, object]:
+            now = datetime.now(UTC)
             external_calls.append("lp_account_snapshot")
             return {
                 "authenticated": True,
+                "wallet_address": self.config.wallet_address,
+                "account_id": self.config.wallet_address.casefold(),
+                "balance_complete": True,
+                "open_orders_complete": True,
+                "positions_complete": True,
+                "trades_complete": True,
+                "pagination_complete": True,
+                "raw_trades": (),
+                "read_started_at": now,
+                "read_ended_at": now,
+                "trade_generation": trade_generation_provider() if callable(trade_generation_provider) else None,
                 "balance": Decimal("100"),
                 "allowance": Decimal("100"),
                 "open_orders": (),
                 "positions": (),
-                "checked_at": datetime.now(UTC),
+                "checked_at": now,
             }
 
         def lp_reward_catalog(
@@ -10491,6 +10521,7 @@ def test_lp_routes_preserve_guard_and_idempotency(tmp_path: Path) -> None:
 
     class Exchange:
         def __init__(self) -> None:
+            self.config = SimpleNamespace(wallet_address="wallet")
             self.posts: list[dict[str, object]] = []
             self.cancels: list[str] = []
             self.snapshot = {
@@ -10731,6 +10762,7 @@ def test_lp_augment_routes_preserve_guard_idempotency_and_schema(
 
     class Exchange:
         def __init__(self) -> None:
+            self.config = SimpleNamespace(wallet_address="wallet")
             self.posts: list[dict[str, object]] = []
             self.cancels: list[str] = []
             self.snapshot = {
@@ -11025,6 +11057,7 @@ def test_lp167_h_augment_route_accepts_price_and_rejects_bad_prices(
 
     class Exchange:
         def __init__(self) -> None:
+            self.config = SimpleNamespace(wallet_address="wallet")
             self.posts: list[dict[str, object]] = []
             self.snapshot = {
                 "account": {
@@ -11635,9 +11668,13 @@ raise SystemExit(service.serve_prediction_service(
     port={port},
 ))
 '''
+    # 保留开发runner字节码缓存，冷编译不计入服务信号/退出时限。
     process = subprocess.Popen(
         [sys.executable, "-c", script],
-        env={"PYTHONPATH": str(Path(__file__).parents[1] / "src")},
+        env={
+            "PYTHONPATH": str(Path(__file__).parents[1] / "src"),
+            "PYTHONPYCACHEPREFIX": sys.pycache_prefix or "",
+        },
     )
     try:
         # Initial bind includes cold Python imports; behavior budgets start after it.
@@ -11717,9 +11754,13 @@ raise SystemExit(service.serve_prediction_service(
     port=0,
 ))
 '''
+    # 保留开发runner字节码缓存，冷编译不计入服务信号/退出时限。
     process = subprocess.Popen(
         [sys.executable, "-c", script],
-        env={"PYTHONPATH": str(Path(__file__).parents[1] / "src")},
+        env={
+            "PYTHONPATH": str(Path(__file__).parents[1] / "src"),
+            "PYTHONPYCACHEPREFIX": sys.pycache_prefix or "",
+        },
     )
     try:
         # The invariant starts inside FakeRuntime.start, after cold module imports.
@@ -11790,9 +11831,13 @@ raise SystemExit(service.serve_prediction_service(
     release_manifest_path=Path({str(release_manifest)!r}),
 ))
 '''
+    # 保留开发runner字节码缓存，冷编译不计入服务信号/退出时限。
     process = subprocess.Popen(
         [sys.executable, "-c", script],
-        env={"PYTHONPATH": str(Path(__file__).parents[1] / "src")},
+        env={
+            "PYTHONPATH": str(Path(__file__).parents[1] / "src"),
+            "PYTHONPYCACHEPREFIX": sys.pycache_prefix or "",
+        },
     )
     try:
         # Initial bind includes cold Python imports; behavior budgets start after it.
@@ -15087,9 +15132,14 @@ def test_lp_first_seen_protection_end_to_end(
         polymarket_trading_module, "signature_type_for", lambda _wallet_type: 0
     )
 
+    market_id = "market-1"
+    condition_id = "condition-1"
+    yes_token = "yes-token"
+
     class AccountSDK:
         def __init__(self) -> None:
             self.order_rows: list[dict[str, object]] = []
+            self.order_receipts: dict[str, dict[str, object]] = {}
             self.cancellation_calls: list[tuple[str, ...]] = []
             self._ctx = SimpleNamespace(
                 secure_clob=reward_transport, wallet_type=None
@@ -15111,36 +15161,67 @@ def test_lp_first_seen_protection_end_to_end(
         def list_positions(self, **_kwargs: object) -> list[object]:
             return []
 
+        def get_order(self, *, order_id: str) -> object:
+            return self.order_receipts.get(order_id)
+
         def get_order_scoring(self, *, order_id: str) -> bool:
             return True
 
         def cancel_orders(self, **kwargs: object) -> object:
             order_ids = tuple(kwargs.get("order_ids") or ())
             self.cancellation_calls.append(order_ids)
+            for order_id in order_ids:
+                receipt = self.order_receipts.get(str(order_id))
+                if receipt is not None:
+                    receipt["status"] = "CANCELED"
+                    receipt["size_matched"] = Decimal("0")
+                    receipt["remaining_size"] = Decimal("0")
             return {"canceled": list(order_ids), "not_canceled": {}}
 
     class PublicMarketSDK:
         def __init__(self) -> None:
             self.level_total = "10000"
 
+        def get_market(self, *, id: str) -> object:
+            assert id == market_id
+            return {
+                "id": market_id,
+                "condition_id": condition_id,
+                "state": {"accepting_orders": True},
+                "outcomes": {
+                    "yes": {"label": "YES", "token_id": yes_token},
+                    "no": {"label": "NO", "token_id": "no-token"},
+                },
+                "trading": {
+                    "minimum_tick_size": Decimal("0.01"),
+                    "minimum_order_size": Decimal("1"),
+                    "fees_enabled": False,
+                },
+                "rewards": {
+                    "rewards_min_size": Decimal("20"),
+                    "rewards_max_spread": Decimal("10"),
+                },
+            }
+
         def list_markets(
             self, *, condition_ids: object, page_size: int = 100
         ) -> list[object]:
-            del condition_ids, page_size
-            return []
+            assert page_size == 100
+            assert tuple(condition_ids) == (condition_id,)  # type: ignore[arg-type]
+            return [self.get_market(id=market_id)]
+
+        def get_order_book(self, *, token_id: str) -> object:
+            assert token_id in (yes_token, "no-token")
+            return {
+                "condition_id": condition_id,
+                "token_id": token_id,
+                "timestamp": datetime.now(UTC),
+                "bids": [{"price": Decimal("0.50"), "size": self.level_total}],
+                "asks": [{"price": Decimal("0.52"), "size": Decimal("100")}],
+            }
 
         def get_order_books(self, *, token_ids: object) -> list[object]:
-            return [
-                {
-                    "condition_id": "condition-1",
-                    "token_id": str(token_ids[0]),
-                    "timestamp": "2026-09-21T12:00:00Z",
-                    "hash": "book-hash-s",
-                    "bids": [{"price": "0.50", "size": self.level_total}],
-                    "asks": [{"price": "0.52", "size": "100"}],
-                }
-                for token_id in tuple(token_ids)
-            ]
+            return [self.get_order_book(token_id=str(token_id)) for token_id in token_ids]
 
         def close(self) -> None:
             pass
@@ -15161,11 +15242,12 @@ def test_lp_first_seen_protection_end_to_end(
     service._schedule_lp_orders_today_refresh = lambda *args, **kwargs: None  # type: ignore[method-assign]
 
     notes: list[tuple[str, str, str]] = []
-    service._lp.set_protection_notifier(
-        lambda title, message, xiaoai_text: notes.append(
-            (title, message, xiaoai_text)
-        )
-    )
+
+    def record_protection_note(title: str, message: str, xiaoai_text: str) -> bool:
+        notes.append((title, message, xiaoai_text))
+        return True
+
+    service._lp.set_protection_notifier(record_protection_note)
 
     manual_buy: dict[str, object] = {
         "id": "m-web-1",
@@ -15185,22 +15267,42 @@ def test_lp_first_seen_protection_end_to_end(
 
     # 第 2 轮：网页手动 BUY 出现 → 首见登记（基线 10000 − 2000 = 8000）。
     sdk.order_rows = [manual_buy]
+    sdk.order_receipts[str(manual_buy["id"])] = dict(manual_buy)
     trading._lp_account_shared_cache = None  # expire the shared account TTL
     service.refresh_lp_dashboard_snapshot()
-    episodes = store.lp_active_first_seen_episodes()
-    assert len(episodes) == 1
-    episode = episodes[0]
-    assert episode["baseline_source"] == "first_observation"
-    assert Decimal(str(episode["baseline_front"])) == Decimal("8000")
-    assert episode["anchor_order_ids"] == ["m-web-1"]
+    sessions = store.lp_active_sessions()
+    assert len(sessions) == 1
+    session = sessions[0]
+    session_id = str(session["session_id"])
+    assert session["entry_order_id"] == "m-web-1"
+    assert session["owned_order_ids"] == ["m-web-1"]
+    first_bucket = session["queue_protection"]["levels"]["0.50"]
+    assert first_bucket["baseline_source"] == "first_observation"
+    assert Decimal(str(first_bucket["baseline_front"])) == Decimal("8000")
+    assert store.lp_active_first_seen_episodes() == []
 
     # 盘口变化（同价位总量降到 4,000）→ 一秒 tick 评估触发 → 撤单。
     public_market.level_total = "4000"
+    public_key = f"{condition_id}\0{yes_token}"
+    with trading._lp_public_reads_lock:
+        trading._lp_public_reads.pop(public_key, None)
+        trading._lp_public_read_retry.pop(public_key, None)
+    _market_model, _book_model, _received_at, public_error = (
+        trading._read_lp_public_snapshot(
+            public_key, market_id, yes_token, wait=False
+        )
+    )
+    public_future = trading._lp_public_reads.get(public_key)
+    assert public_future is not None
+    public_future.result(timeout=10)
+    assert public_future.done()
     service._lp.tick()
-    episode = store.lp_first_seen_episode(str(episode["episode_id"]))
-    assert episode is not None
-    assert episode["state"] == "canceling"
+    session = store.lp_session(session_id)
+    assert session is not None
+    queue_bucket = next(iter(session["queue_protection"]["levels"].values()))
+    assert queue_bucket["state"] == "canceling", session["queue_protection"]
     assert sdk.cancellation_calls == [("m-web-1",)]
+    assert queue_bucket["notification_sent"] is True
 
     # /lp/orders/today 投影：锚行带 summary / baseline_source / anchor。
     trading._lp_account_shared_cache = None
@@ -15215,17 +15317,20 @@ def test_lp_first_seen_protection_end_to_end(
     summary = projection["queue_protection"]
     assert summary["state"] == "canceling"
     assert summary["baseline_source"] == "first_observation"
-    assert Decimal(str(summary["anchor_price"])) == Decimal("0.50")
-    assert Decimal(str(summary["level_total"])) == Decimal("4000")
+    assert Decimal(str(summary["baseline_price"])) == Decimal("0.50")
+    assert summary["order_id"] == "m-web-1"
 
     # 回执收敛：订单从所有读取路径消失 → canceled + 一次性首见通知。
     sdk.order_rows = []
+    trading._lp_account_shared_cache = None  # force the receipt read to see it
     service._lp.tick()
-    episode = store.lp_first_seen_episode(str(episode["episode_id"]))
-    assert episode is not None
-    assert episode["state"] == "canceled"
+    session = store.lp_session(session_id)
+    assert session is not None
+    queue_bucket = next(iter(session["queue_protection"]["levels"].values()))
+    assert queue_bucket["state"] == "canceled"
+
     assert len(notes) == 1
-    assert "首见基线" in notes[0][0]
+    assert "位置保护已触发撤单" in notes[0][0]
 
 
 # ---- Issue 163: LP 单次确认提交路由（/lp/orders、/lp/augment） ----
@@ -15239,6 +15344,7 @@ def _lp163_route_fixture(tmp_path: Path, now: datetime):
 
     class Exchange:
         def __init__(self) -> None:
+            self.config = SimpleNamespace(wallet_address="wallet")
             self.posts: list[dict[str, object]] = []
             self.snapshot_calls = 0
             self.best_bid = Decimal("0.29")
@@ -15631,3 +15737,35 @@ def test_lp163_augment_route_contract(tmp_path: Path) -> None:
         assert blocked_status == 200
         assert blocked == {"state": "rejected", "reason": "session_not_active"}
         assert len(exchange.posts) == 2
+
+
+def test_shadow_display_http_reads_only_snapshots_and_retains_unknown(tmp_path):
+    now = datetime.now(UTC).isoformat()
+    calls = []
+    class Execution:
+        def lp_dashboard(self):
+            calls.append('dashboard')
+            return {'state':'ready','authenticated':True,'stale':False,'checked_at':now,
+                'orders':[], 'positions':[], 'recommendations':[],
+                'balance':Decimal('12'), 'allowance':Decimal('10'),
+                'open_orders_complete':True, 'positions_complete':True,
+                'market_rewards':{'condition':{'state':'unknown','reason':'usd_value_unknown','usd_value':None}}}
+        def lp_account_trades_page(self, **kwargs):
+            if not 1 <= kwargs['limit'] <= 100: raise ValueError('invalid account trades page')
+            calls.append(('trades',kwargs))
+            return {'state':'unknown','complete':False,'items':[], 'total':None}
+    runtime = SimpleNamespace(state='RUNNING',mode='shadow',production_owner=False,
+        n_leg_paused=True,shadow_evidence={'mode':'shadow','first_violation':None},
+        execution=Execution(),store=None,monitor=None,
+        lp_auto_state=lambda **kwargs: pytest.fail('Shadow dashboard must not project execution auto state'))
+    with _server(runtime) as base:
+        status, dashboard = _response(base+'/api/prediction-arbitrage/lp/dashboard')
+        assert status == 200 and 'auto' not in dashboard
+        assert dashboard['market_rewards']['condition']['usd_value'] is None
+        status, venues = _response(base+'/api/prediction-arbitrage/venues')
+        assert status == 200 and venues['venues'][0]['balance']['value'] == '12'
+        status, trades = _response(base+'/api/prediction-arbitrage/lp/account/trades?limit=1&offset=2')
+        assert status == 200 and trades['state'] == 'unknown' and trades['total'] is None
+        status, _ = _response(base+'/api/prediction-arbitrage/lp/account/trades?limit=101')
+        assert status == 400
+    assert ('trades',{'offset':2,'limit':1}) in calls

@@ -1047,3 +1047,40 @@ def test_prediction_only_gateway_never_contacts_stock_backends(tmp_path):
                 urllib.request.urlopen(base + '/api/prediction-arbitrage/venues')
             assert error.value.code == 503
         assert stocks.requests == []
+
+
+def test_split_prediction_routes_responsibility_and_isolates_authorization(tmp_path):
+    static = tmp_path / 'static'
+    _write_static_files(static)
+    route = tmp_path / 'route.json'
+    _write_route(route, 'service')
+    air, cloud, legacy = _Upstream(), _Upstream(), _Upstream()
+    cloud.response_headers = [('Set-Cookie', 'ot_prediction_session=cloud')]
+    config = FrontendGatewayConfig(static_dir=static, prediction_route_path=route,
+        upstream_port=legacy.server_address[1], account_upstream_port=legacy.server_address[1],
+        prediction_upstream_port=air.server_address[1],
+        prediction_display_upstream_port=cloud.server_address[1])
+    server = create_frontend_gateway(config=config, host='127.0.0.1', port=0)
+    with _running(air), _running(cloud), _running(legacy), _running(server):
+        base = f'http://127.0.0.1:{server.server_address[1]}'
+        for path in ('/venues', '/lp/dashboard', '/lp/account/trades'):
+            request = urllib.request.Request(base+'/api/prediction-arbitrage'+path,
+                headers={'Cookie':'ot_prediction_session=air', 'X-CSRF-Token':'air-csrf'})
+            with urllib.request.urlopen(request) as response:
+                assert response.headers.get('Set-Cookie') is None
+        for method, path in (('GET','/lp/auto/state'), ('GET','/execution/identity'),
+                             ('GET','/state'), ('GET','/lp/sessions/current'),
+                             ('GET','/history?kind=signals'), ('GET','/history?kind=executions'), ('GET','/history?kind=incidents'),
+                             ('GET','/history?kind=signals&kind=executions'),
+                             ('GET','/relations/cloud-record'), ('GET','/n-leg/report'),
+                             ('POST','/lp/orders'), ('POST','/lp/orders/cancel')):
+            _prediction_request(base, method, '/api/prediction-arbitrage'+path)
+        _prediction_request(base, 'POST', '/api/prediction-arbitrage/lp/dashboard')
+        _prediction_request(base, 'GET', '/api/portfolio')
+    assert [row['path'] for row in cloud.requests] == [
+        '/api/prediction-arbitrage/venues', '/api/prediction-arbitrage/lp/dashboard',
+        '/api/prediction-arbitrage/lp/account/trades']
+    assert all('Cookie' not in row['headers'] and 'X-CSRF-Token' not in row['headers'] for row in cloud.requests)
+    assert len(air.requests) == 13
+    assert air.requests[1]['path'] == '/api/prediction-arbitrage/venues'
+    assert [row['path'] for row in legacy.requests] == ['/api/portfolio']

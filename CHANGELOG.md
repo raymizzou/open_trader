@@ -3,7 +3,90 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-01
+
+- PR #224 的既有 16 个提交 rebase 到 origin/main `3f023fce`；保留双方 dated changelog，
+  云端验收沿用 PR-first policy。静态核验 `src` 与原发布 `4f82836f` 完全一致，
+  远端 CI、锁定依赖与测试稳定性变更保留；无新增生产行为，服务门禁与独立审查由 root 完成。
+
+- Candidate 测试 fixture 修复：readiness 使用局部可控 mono/wall 时钟和真实 monitor 循环，保留生产 30/60 秒阈值，验证 0→29→31→61→91 的到期读取、最新 checked_at 与正常停止；移除 80ms/40ms 机器速度依赖，外层时限仅防挂起。Trend 登录恢复测试用一致的长 numeric UID 哨兵，递增 time_ns 保持报告唯一并固定无关 `222` 路径碰撞；整段输出 token/UID 不出现、禁付费端点与禁直接通知断言完整保留。
+- 定向 Docker RED→GREEN：旧 fixture 在 120ms 启动及无关路径数字下 2 failed，修复后 2 passed；指定 monitor、trend CLI、imported-exit 与 multi-sell 四文件 277 passed（52.33 秒）。未复现的 imported-exit 首 tick 断言仅追加 durable session 诊断，原 12 组和 once-only/资金/ID/GTD 检查保留；未改生产文件、生产阈值/超时或门禁，未提交、合并或部署。
+
+- #205 monitor 诊断按操作来源及精确 event/relation/validation 刷新目标恢复：操作开始捕获当前故障 marker，仅在同一操作完整成功且 marker 未被后续错误替换时清除 `last_error`；合法 unavailable book 不阻止 transport 恢复，兄弟操作、重复新错误、部分发布、持久化/订阅失败与 APR 超限仍保留诊断及历史记录。Universe 完整恢复复用同一保护，原失败 flags 与业务判断保留。
+- 定向 Docker RED→GREEN，完整 `test_polymarket_monitor.py` 232 passed（37.30 秒），覆盖并发、身份/目标集合隔离、发布失败、APR 限制与既有 universe 恢复。Validation 已 terminal 后的机会刷新故障缺少普通同来源重试出口，保守保留；原非 terminal 校验重试完整成功可恢复自己的诊断，LLM 调度保持原语义。
+
+- LP 内部 CAS、轮次与读取容量等待使用轻量 typed exception，固定允许原因记 INFO；同文本普通异常、真实超时、身份/结构/认证及 active 404 保持故障。精确 market/condition/token 验证且 `closed is True` 时不请求盘口，保留账户、订单、成交、库存与 UNKNOWN 占资，以固定 60 秒本地期限复查，明确 local 来源。
+- 已安装账户 validator、完整新鲜挂单列表与当前交易代次共同证明旧历史 ID 不在挂单中时，前置和后续收单 sweep 共用过滤，停止反复生成 cancel 意图；当前正向 LIVE/OPEN/ACCEPTED/PENDING 回执仍可撤单，unknown ack 可重试，旧 UNKNOWN 意图、订单历史和资金语义保留。Universe 完整发布成功仅清当前 universe diagnostic，其他 component 与历史 warning 保留。
+- 定向 Docker RED→GREEN：4 个受影响文件 633 passed，覆盖固定重试截止、闭市不读 book、真实 SDK null/后续 LIVE、三类取消目标及无效 absence proof；Prediction 服务检查 3189 passed、1 skipped（179.48 秒）。真实账户数据副本验证 27 个历史组：0 新撤单意图、0 generation 变化、0 venue 写入；未跑 Candidate，未提交、合并或部署。
+
+- Smoke 暂停 N-leg 集成 fixture 补齐真实日志 checker 和 `rg --version`，保留 N-leg/LP 契约与只读请求断言，新增 rg 不可用仍阻塞回归；目标 RED→GREEN，三个局部文件 1016 passed、8 deselected，未改生产代码、未部署。
+
+- #207 集成测试补充：元数据预热的 SDK fake 支持 closed 精确补查，确认缺失标的经默认与 closed 两次读取，正缓存不重读；保留 1500/1501 完成量、原 TTL、重试及停止/并发断言。目标单例 RED→GREEN，1 passed；未改生产代码、未重跑全服务。
+
+- Prediction universe 盘口按去重 token 每批 100 个原生读取，保留 8 并发、30 秒整轮时限与 TOP20 覆盖；
+  复用原市场确认逻辑和原始 SDK 字段，单机会与 stream 仍配对读取。缺失/失败批次不沿用旧机会，
+  保留 books 故障诊断及订阅，整轮取消/超时继续传播。只读实测 592 tokens 从 296 次请求/17.893 秒
+  降为 6 次/1.019 秒；冷连接 494 tokens 为 5 次/3.613 秒，无错误。定向 monitor 回归 195 passed，覆盖批量与失败边界；未部署。
+
+- #207 运行修复：精确 condition 查询未找到时批量补查 closed 市场，历史真实成交仍按返回的 market/token/outcome 纳管；失败或取消保持 UNKNOWN。负缓存仅信任两轮完整缺失的 `closed_checked:true` 证明，旧无证明负缓存重新读取，正缓存和原 TTL 保留。
+- 活动组索引先创建规范 account/token 约束，成功后才删除旧索引；重复身份阻塞迁移且保留旧约束和原行。旧无 ID 占位保留 UNKNOWN、原 payload 和占资。旧精确订单 ID 经 Store 验证后恢复原归属，同 token 新 ID 可加入已证实活动组，已完成历史组不吸收新生命周期，其他账户不并入。
+- #210 诊断：既有 typed 轮次失效和 required_order 精确 null 记 INFO 等待；真实 schema、网络、认证和限流仍记故障。慢阶段不再带伪错误字段，诊断元数据异常不替换原业务异常，日志不输出秘密正文。
+- Smoke 保留精确发布、进程、工具和浏览器检查；最后 200 行内仅健康 JSON 的 `last_error:null` 字段免于误匹配。仅双引号键开头的 JSON-object-looking 记录严格解析，所有合法 JSON 统一检查解析后的 payload 与完整原 prefix，防止转义字段或 Error 漏检；普通计时 Python dict 仍全文检查错误信号。JSON-looking 畸形、重复键、NaN/Infinity、窗口内解码或读取失败仍阻塞。此前 8 个窄文件 711 passed、1 skipped（macOS Keychain）；格式与转义边界补充仅复跑 deployment_gates，60 passed，其余 7 文件无改动。尚未部署。
+- 迁移兼容边界：旧无 ID 占位与规范账户组可并存，旧版重建 `(condition_id,outcome)` 唯一索引可能失败，不能仅切旧代码回滚。部署前保留 SQLite 在线 backup 的一致性快照及来源 SHA；恢复仍按既有停 owner、核对流程执行。
+
 ## 2026-09-30
+
+- #204 云端启动修复：SDK 受保护时间戳经 ISO 标量还原后进入共享账户/盘口缓存，
+  保留时区瞬间与精度；订单过期时间同样规范化，原始 SDK 执行对象仍不可复制或解包。
+  全量及指定市场奖励目录在行/页边界响应停止信号，含空页；取消保持 UNKNOWN/不完整并关闭资源，
+  不延长停止超时、不改只读 guard。回归重现真实 raw_internal 与停止后续页读取；尚未重新部署验证。
+
+- #204 部署前 Smoke 修复：split 看板分别核验云端只读 LP 快照和 Air 执行身份/暂停状态；
+  两主机冒烟前后分别验证快照，仅允许 display_snapshot 刷新，仍严格核对发布、进程、根目录、
+  模式、暂停和凭据 profile。补齐离线 split/standalone 浏览器 fixtures 与缺失/变更身份回归，未部署。
+
+### LP 交易所订单统一登记（#207）
+
+- 直接回执与完整账户同步按账户、交易所订单 ID 纳管，保留手动单、成交历史和已有 SELL；不再匹配签名前订单号。
+- 同 token 订单在现有存储事务内归集，重复、并发和迟到回执保持唯一归属；保护基准按价位首次新鲜观察建立并跨重启保留。
+- 多个旧 SELL 全部确认终态后才允许替代退出；轮次失效保留上次展示并等待下一轮，云端只读展示不启动订单管理。
+- 部分成交量和剩余量跨重启保持单向更新；已终态 SELL 不再卡住替代退出，导入 GTD 保留原到期时间，过期不自动续期。
+- 登记失败保留上次展示与检查时间，并阻止新增 BUY；下一轮完整登记成功后恢复，历史订单的迟到回执不会转挂当前管理组。
+- 旧会话的已知方向和标的冲突拒绝纳管；缺失历史可由同账户的真实订单补齐。新增纳管订单按各自 ID 查询计奖资格，已有自动会话的复查时间不覆盖导入 SELL 的原期限。
+
+### LP 交易所订单事实修复（#206、#209）
+
+- 下单在真正调用 POST 前记录发送阶段；本地失败释放占位，发送后的不确定结果保留待核对状态。
+- 账户轮次失效只等待下一轮，不误计外部故障、不发布旧事实；已发送撤单的真实回执仍持久化。
+- 账户读取失败后的保守撤单同样校验原轮次；失效时保留已有状态，下一轮恢复后继续保护。
+
+- #204：完整 Air Dashboard 可通过独立 SSH 隧道显示云端 paused Shadow 的 LP/账户快照；
+  Air 保留所有写操作、实时预检、N-leg 状态/历史和执行状态；自动控制及现有资金/轮次区同读 Air，
+  云端 cookie/CSRF 不进入本地授权。客户端退出期间允许 ps 短暂撕裂后再核对，持续 PID 不匹配仍拒绝停止。
+  文件凭据供数复用现有 LP 后台线程，禁交易/保护/N-leg/日报/通知；disabled 仍不启动读取。
+  读取失败发布 stale，云端账户快照按既有 60 秒边界过期，成交详情有界；奖励美元 UNKNOWN 保留。
+  配置分别核验 Gateway/云端/Air SHA，Cloud Smoke 记录逐源快照事实。未部署、未切换交易 owner。
+
+- #202：LP 奖励份额读取不再因返回行内嵌 rewards_config 在本地日期不活跃而丢弃已返回的
+  earning_percentage；正池仍缺真实来源份额时保留 UNKNOWN，禁止补零或跨来源替代。
+  新增回归分别覆盖“上游真缺失保持 UNKNOWN”与“返回份额但 config 过期应保留”两种形态。
+
+- #202 云端同钱包 API 探针：paused Shadow 可显式使用服务用户私有的
+  `0600` JSON 凭据文件（父目录 `0700`），只传非秘密路径，拒绝错误权限、属主、
+  符号链接和结构且不回退 Keychain/SSM；原 disabled/SSM 配置仍可用。
+  `wallet read-auth` 通过 GET 派生已有 L2 身份，再独立验证完整账户读取；
+  `data-check` 逐类报告有界市场样本、完整目录分页、账户/奖励状态及未知原因，
+  抽样至多标为 PARTIAL。旧 production/非暂停 SSM 预检仍要求地区可交易，
+  paused Shadow 的只读探针不加交易地区限制；空目录和各类不完整读取明确为 UNKNOWN，
+  各项记录选取范围、时间窗口和 reader 可证的分页状态。奖励费率即使分页完整，
+  逐市场 share/pool 事实未知仍单独报 UNKNOWN 及脱敏原因计数；完整空集保留真实零值。
+  Shadow 保持交易和通知禁止，云端门禁要求独立运行时，
+  文件 profile 不要求 SSM 实例角色。feature branch `24878b3` 已完成云端 Shadow
+  部署验收及同钱包真实 API 探针；美元奖励换算仍为 UNKNOWN，作为已接受的非阻塞限制保留，
+  不补零、不改换算口径。本次仅整合到 main，保留 #201 的账户读取错误分类；
+  不切换 Air 运行版本或云端发布，不启用交易。
+
+- Docker 测试构建排除 UI 设计稿、macOS Finder 元数据和配置备份，减少无关文件引起的镜像重建；保留依赖层、Git 测试快照及测试所需文档和 fixtures。验证构建缓存复用及单文件变化增量，未部署。
 
 - 为全仓测试补充稳定性原则：保留业务契约与负向断言，将可控业务时钟、完成事件和
   独立真实 watchdog 分开；保留真实集成、超时、取消、清理及性能验证，避免全局时钟污染。

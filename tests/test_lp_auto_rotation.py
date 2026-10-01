@@ -445,7 +445,8 @@ def test_concurrent_session_changes_are_checked_by_trading_facts(tmp_path, monke
             patch = {'stop_requested': True}
         else:
             protection = store.lp_session(session_id)['queue_protection']
-            protection['state'] = 'triggered'
+            for bucket in protection.get('levels', {'entry': protection}).values():
+                bucket['state'] = 'triggered'
             patch = {'queue_protection': protection}
         store.lp_update_session(session_id, patch=patch)
         return read(**kwargs)
