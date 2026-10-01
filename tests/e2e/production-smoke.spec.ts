@@ -1,4 +1,5 @@
 import { expect, test, type Request } from '@playwright/test';
+import { waitForPredictionPoll } from './prediction-poll-barrier.cjs';
 
 test('loads the dashboard and prediction workspace without mutations', async ({ page }) => {
   const unsafeMethods: string[] = [];
@@ -127,16 +128,10 @@ test('loads the dashboard and prediction workspace without mutations', async ({ 
     await expect(page.locator('.pm-lp-card').first()).toBeVisible();
     await page.getByRole('tab', { name: '多腿套利', exact: true }).click();
     await expect(page.getByRole('heading', { name: '多腿套利' })).toBeVisible();
-    // Drain the tab-triggered read, then observe a new real polling request.
-    // A response alone could belong to the click rather than a polling tick.
-    await page.waitForFunction(() => !state.predictionMarket.venuesRequestInFlight);
-    const nextPollRequest = await page.waitForRequest(request =>
-      new URL(request.url()).pathname === '/api/prediction-arbitrage/venues');
-    const nextPoll = await nextPollRequest.response();
-    expect(nextPoll).not.toBeNull();
-    expect(nextPoll!.ok()).toBe(true);
-    await nextPoll!.finished();
-    await page.waitForFunction(() => !state.predictionMarket.venuesRequestInFlight);
+    await waitForPredictionPoll(page, split);
+    // Check this cycle immediately; a later poll must not hide a caught body error.
+    expect(await page.evaluate(() => state.predictionMarket.nLegStatus)).toBe('paused');
+    await expect(page.getByRole('status').filter({ hasText: '多腿套利已暂停' })).toBeVisible();
     expect(nLegReadRequests).toEqual([]);
     expect(pendingNLegReads.size).toBe(0);
   }
