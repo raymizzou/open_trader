@@ -9526,7 +9526,7 @@ def test_lp_today_orders_cached_fills_follow_market_gate_and_session_management(
 
 
 def test_lp_today_orders_trade_reads_throttled_until_ttl_expires(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """R5: 同一奖励日内按市场节流成交重读；TTL 内不再调用 lp_account_trades，
     过期后重新入队。"""
@@ -9539,8 +9539,10 @@ def test_lp_today_orders_trade_reads_throttled_until_ttl_expires(
                 predict=None,
             )
             self.trade_calls: list[tuple[str, ...]] = []
+            self.account_reads = 0
 
         def lp_account_snapshot(self) -> dict[str, object]:
+            self.account_reads += 1
             return {
                 "authenticated": True,
                 "checked_at": datetime(2026, 9, 16, 10, tzinfo=UTC),
@@ -9631,30 +9633,57 @@ def test_lp_today_orders_trade_reads_throttled_until_ttl_expires(
     clock = {"now": 1000.0}
     service._clock = lambda: clock["now"]  # type: ignore[method-assign]
 
-    def drain_trade_worker() -> None:
-        worker = service._lp_orders_today_refresh_thread
-        if worker is not None:
-            worker.join(timeout=5)
-            assert not worker.is_alive(), "today-order worker did not publish and exit"
-        with service._lp_dashboard_lock:
-            assert not service._lp_orders_today_pending
+    # Both producers publish under the dashboard lock. Capture their real
+    # handles while the scheduling call still owns that lock: the service may
+    # clear its thread field just before the thread's final cleanup completes.
+    workers: list[threading.Thread] = []
+    for schedule_name, worker_attribute in (
+        ("_schedule_lp_reward_refresh", "_lp_reward_refresh_thread"),
+        ("_schedule_lp_orders_today_refresh", "_lp_orders_today_refresh_thread"),
+    ):
+        schedule = getattr(service, schedule_name)
 
-    # 第一次装配触发首次成交读取。
-    service.refresh_lp_dashboard_snapshot()
-    drain_trade_worker()
+        def schedule_and_capture(
+            *args, _schedule=schedule, _worker_attribute=worker_attribute, **kwargs
+        ):
+            _schedule(*args, **kwargs)
+            worker = getattr(service, _worker_attribute)
+            if worker is not None and worker not in workers:
+                workers.append(worker)
+
+        monkeypatch.setattr(service, schedule_name, schedule_and_capture)
+
+    def refresh_and_drain() -> None:
+        account_reads = trading.account_reads
+        service.refresh_lp_dashboard_snapshot()
+        # One independent real watchdog covers completion of every producer,
+        # including reward publication that can coalesce a subsequent refresh.
+        deadline = time.monotonic() + 5
+        for worker in workers:
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+            assert not worker.is_alive(), f"{worker.name} did not publish and exit"
+        assert not service._lp_orders_today_pending
+        assert not service._lp_reward_refresh_pending
+        assert not service._lp_reward_refresh_active
+        # A cached/coalesced response is not evidence that this TTL was checked.
+        assert trading.account_reads == account_reads + 1
+
+    key = ("2026-09-16", "condition-1")
+    # 第一次装配触发首次成交读取，且两个后台发布任务都已退出。
+    refresh_and_drain()
     assert len(trading.trade_calls) == 1
-    assert service._lp_orders_today_trades_read_at
-    # TTL 内的后续装配不再重读该市场。
-    service.refresh_lp_dashboard_snapshot()
-    drain_trade_worker()
-    service.refresh_lp_dashboard_snapshot()
-    drain_trade_worker()
+    assert service._lp_orders_today_trades_read_at == {key: 1000.0}
+    # TTL 内的后续装配不再重读该市场，包括紧邻到期前的边界。
+    refresh_and_drain()
+    clock["now"] = 1059.999
+    refresh_and_drain()
     assert len(trading.trade_calls) == 1
-    # 注入时钟越过 TTL 后重新入队。
-    clock["now"] += 61.0
-    service.refresh_lp_dashboard_snapshot()
-    drain_trade_worker()
+    assert service._lp_orders_today_trades_read_at == {key: 1000.0}
+    # 注入时钟越过 TTL 后重新入队，并等待真实完成后检查更新时间。
+    clock["now"] = 1061.0
+    refresh_and_drain()
     assert len(trading.trade_calls) == 2
+    assert service._lp_orders_today_trades_read_at == {key: 1061.0}
     assert trading.trade_calls[0] == ("condition-1",)
     assert trading.trade_calls[1] == ("condition-1",)
 

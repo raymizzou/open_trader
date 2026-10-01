@@ -112,6 +112,43 @@ new-fixture errors, baseline environment failures, and expected negative runs:
 - Existing optional-dependency and platform skips are reported as such. No new
   skip, xfail, retry-to-green logic, or weakened business assertion was added
 
+## First PR CI and follow-up repairs
+
+[Run 36839602608](https://github.com/raymizzou/open_trader/actions/runs/36839602608)
+tested head `8ab4a761b1d6b14a3338e1ffa2e8fb71930df1bf`, base
+`3f023fce39d55b5792eddb17dd2fb4dbf7065bb0`, and synthetic merge
+`f9041a57c3ca3f8d94348d45a0daed494b7a4d1b`. Gateway (55 tests), Account
+(355), and Legacy (5,083 plus 31 subtests) passed their offline Docker gates.
+Prediction with two workers and `TEST_N_LEG=1` had 4,107 passed, 5 existing
+skips, and two failures; the exact Actions `required` check correctly failed.
+The failed run remains evidence, not a retry-to-green candidate.
+
+- The downstream canary report imported the real-chain fixture without its
+  module's autouse clock. In the local reproduction on the published head,
+  refreshed books were 1.459s ahead of the frozen monitor time, so the real
+  driver correctly rejected them as `BOOK_UNAVAILABLE`.
+  The helper and both complete-chain consumers now share one business instant
+  for books, resolver/scheduler, confirmation, driver, and reconciliation.
+  Original ledger/profit/conservation/report assertions remain, with explicit
+  submitted-summary and exactly-two-order assertions. All three consumer files
+  pass 58 tests each in two serial and two two-worker runs. Local +/-61s clock
+  jumps and a 50ms setup delay pass; future/stale books and omitted
+  reconciliation still reject the positive chain
+- The runtime TTL test drained its trade reader but not a sibling reward
+  publisher. A controlled legal interleaving reproduces the exact 1-versus-2
+  assertion when the reward publisher holds the dashboard lock and the next
+  refresh returns cached data. The original CI schedule itself was not traced.
+  Capture and join both real producers under the existing 5s watchdog, then
+  verify each requested refresh actually read its account input. The test checks
+  committed timestamps at 0s, just before 60s, and after 61s. Three serial and
+  three two-worker related runs pass 10 tests each; the full runtime file passes
+  71 tests. The same forced interleaving passes, and TTL=0/120 mutations fail
+
+These are tests-only follow-up repairs. The original 211-record inventory is
+unchanged; the newly exposed canary consumer is documented here and in its
+shared-helper record. Host follow-up evidence requires independent re-review
+and fresh exact-candidate Docker CI; PR status carries that latest verdict.
+
 ## Reproducing affected checks
 
 Use the repository's normal Docker development routes from

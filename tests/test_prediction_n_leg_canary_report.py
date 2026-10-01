@@ -40,9 +40,15 @@ def _completed_real_chain_store(tmp_path: Path):
 
     store, resolver, monitor, component_id = _issue64_real_chain(tmp_path)
     try:
+        # This module does not inherit the helper module's autouse fixture.
+        # Confirmation, refresh, driver and reconciliation share its clock.
+        now = monitor.now
         entries = resolver.solutions()
+        assert len(entries) == 1
         entry = entries[0]
         material = resolver.driver_execution_source(component_id)
+        assert material is not None
+        assert material["source"].now == now
         displayed = fingerprint(canonical_payload(entry["execution"]))
         result = confirm_enqueue(
             store,
@@ -50,7 +56,7 @@ def _completed_real_chain_store(tmp_path: Path):
             component_id=component_id,
             displayed_fingerprint=displayed,
             idempotency_key="canary-report-1",
-            now=datetime.now(UTC),
+            now=now,
             partial_fill_proof=material["partial_fill_proof"],
             execution_source={
                 "market": material["market"],
@@ -67,7 +73,6 @@ def _completed_real_chain_store(tmp_path: Path):
 
         def recon_factory(batch_id):
             batch = store.n_leg_batch(batch_id)
-            now = datetime.now(UTC)
             account = replace(material["source"].account_snapshot, captured_at=now)
             flows, holdings = [], []
             for leg in batch["legs"]:
@@ -126,9 +131,12 @@ def _completed_real_chain_store(tmp_path: Path):
             reconciliation_context_factory=recon_factory,
         )
         monitor.books = {
-            c: _live_book(c, "0.40") for c in ("real-a", "real-b")
+            c: _live_book(c, "0.40", confirmed_at=now)
+            for c in ("real-a", "real-b")
         }
-        summary = driver.tick(now=datetime.now(UTC))
+        summary = driver.tick(now=now)
+        assert "submitted" in summary, summary
+        assert len(trading.calls) == 2
         batch = store.n_leg_batch(str(summary["submitted"]))
         assert str(batch["state"]).startswith("RECONCILED")
         return store
