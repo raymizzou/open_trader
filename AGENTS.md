@@ -52,6 +52,22 @@ before rerunning Candidate Acceptance for the new final deployment SHA.
 Exact-SHA evidence, rebase, exception, and deployment rules still apply as
 described in the runbook.
 
+## Test design and stability
+
+All tests must preserve the intended contract and fail for incorrect behavior,
+without relying on machine speed or accidental scheduling. Use controlled
+clocks for business deadlines and explicit events/barriers for synchronization,
+with independent real-time watchdogs and isolated clock overrides. Keep real
+integration, timeout, cancellation, cleanup, and performance coverage when
+those behaviors are the subject; fake time is not mandatory everywhere.
+Diagnose failures from evidence before calling them flaky. Stability repairs
+must retain negative assertions, prove the regression still catches wrong
+behavior, and repeat relevant serial/concurrent runs with controlled scheduling
+delays. Do not hide failures by skipping, weakening assertions, inflating
+timeouts, or retrying until green; report every failed attempt. Contract changes
+require explicit user approval. Follow the detailed
+[test stability guidance](docs/operations/agent-verification.md#test-design-and-stability).
+
 ## Review and merge
 
 Before review, update the dated operator-facing entry in `CHANGELOG.md`, then
