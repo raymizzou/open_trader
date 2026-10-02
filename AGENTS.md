@@ -10,8 +10,8 @@ and configuration-only tasks may use the stated exemption.
 
 On the first repository action of each session, silently verify the repository
 root, current worktree, branch, HEAD SHA, and working-tree status. Treat the
-Docker Dev, Candidate Acceptance, Host Readiness, Production Smoke, merge,
-push, and deployment boundaries in the linked runbook as standing rules.
+Development Verification, Candidate Acceptance, Host Readiness, Production Smoke,
+merge, push, and deployment boundaries in the linked runbook as standing rules.
 Do not ask the user to restate or confirm them.
 
 Before claiming PASS, READY, deployed, or healthy, verify evidence for the
@@ -26,6 +26,21 @@ Start every implementation or repository-change task from freshly fetched
 GitHub `main`; never integrate task branches or create delivery commits there.
 Do not use an unrelated or dirty checkout. Code and behavior changes require a concrete plan and explicit user
 approval; follow the global worker and TDD contract after approval.
+
+## Plans and handoffs
+
+Before requesting plan approval, explain the current problem, intended behavior,
+key tradeoff or risk, and focused validation in plain language. Once approved,
+continue within that scope without repeated approval requests; material scope
+or risk changes and the existing action-specific approval boundaries still apply.
+
+For review and delivery, lead with what behavior changed and why. Tie claims to
+the exact SHA and evidence links; distinguish verified, failed, unrun, and unknown
+checks. Name any specific next action that needs approval and what it entails.
+Use diagrams or interactive explanations only when they materially reduce the
+cost of understanding; they supplement, never replace, tests and independent
+review. Keep key principles and runbook links here, with detailed procedures in
+the linked runbooks rather than repeated across instruction files.
 
 ## Verification routing
 

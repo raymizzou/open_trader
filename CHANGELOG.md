@@ -5,6 +5,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-02
 
+- 补充 AGENTS 计划与交付说明：先讲当前问题、预期行为、关键风险与聚焦验证，
+  审查/交付绑定精确 SHA 和证据，区分已验证、失败、未运行及未知，并明确待批准动作。
+  已批准范围内继续执行，现有授权边界不变；按需可视化不能替代测试或独立审查。
+  保留关键原则与 runbook 入口，修正旧 Docker Dev 名称为 Development Verification。
+  本地核验文档链接、差异范围和空白；完整后台 CI 结果以本 PR 精确 SHA 的记录为准。
+
 - 调整开发与 CI 分工：本地使用已有 Python 环境和当前 worktree 源码，只跑直接受影响
   或新增的测试；共享模块覆盖相关消费者并集，不再要求本地整服务测试或推送前 Docker。
   每次分支 push、PR-to-main 合并候选及合并后的 main push 均运行四个后台服务，统一
