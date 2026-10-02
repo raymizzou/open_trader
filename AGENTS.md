@@ -15,9 +15,12 @@ merge, push, and deployment boundaries in the linked runbook as standing rules.
 Do not ask the user to restate or confirm them.
 
 Before claiming PASS, READY, deployed, or healthy, verify evidence for the
-exact current SHA. Evidence from another SHA or an earlier session does not
-transfer. If evidence is unavailable, report UNKNOWN; do not run an expensive
-or external gate solely to fill the gap unless the current request requires it.
+exact current SHA. Evidence from another SHA does not transfer. Prior-session
+static or CI evidence may be reused after rechecking its SHA, scope, environment,
+and recorded result. Refresh host, runtime, and external-state evidence before
+current readiness or health claims. If evidence is unavailable, report UNKNOWN;
+do not run an expensive or external gate solely to fill the gap unless the current
+request requires it.
 
 ## Worktree and approval
 
@@ -102,17 +105,21 @@ require explicit user approval. Follow the detailed
 
 ## Review and merge
 
-Before review, update the dated operator-facing entry in `CHANGELOG.md`, then
-stage only the exact task files. The reviewer target is `git diff --cached`.
+Before pre-commit review, update the dated operator-facing entry in `CHANGELOG.md`,
+then stage only the exact task files. The reviewer target is `git diff --cached`.
+For an existing PR, pin the base and head SHAs and review
+`git diff <base>...<head>`; read-only PR review requires no staging or file edits.
 After any post-review change, restage only the exact task files, rerun relevant
 verification, and obtain a fresh review.
 Use a fresh independent reviewer for the initial review; reuse that reviewer
 for in-scope repairs after restaging and rerunning relevant verification. A
 new reviewer is needed when scope or architecture changes. If GitHub `main`
 advances, fetch and rebase task commits onto `origin/main`, then rerun required
-worktree checks and review. Conflicts or behavior changes require a new approved
-plan. Publish only the reviewed tree to the authorized task branch, open a
-Draft PR targeting `main`, and inspect the latest exact-SHA CI evidence. Require
+worktree checks and review. A rebase or conflict resolution that changes behavior,
+scope, risk, or architecture requires a new approved plan. Mechanical resolutions
+that preserve these may proceed within approved scope, with required checks and
+independent review. Publish only the reviewed tree to the authorized task branch,
+open a Draft PR targeting `main`, and inspect the latest exact-SHA CI evidence. Require
 the `required` check from GitHub Actions, then obtain explicit user approval
 before merging on GitHub. Do not integrate through local `main` or direct push.
 See [CI identity](docs/operations/ci.md) and the
