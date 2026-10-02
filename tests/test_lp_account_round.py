@@ -593,11 +593,15 @@ def test_registered_service_trade_rejects_before_publication(tmp_path) -> None:
             }
         )
     )
+    first_validated = threading.Event()
     validator_entered = threading.Event()
     validator_release = threading.Event()
 
     def validator(session, snapshot):
-        if str(session.get("session_id")) == "session-02":
+        if str(session.get("session_id")) == "session-01":
+            first_validated.set()
+        elif str(session.get("session_id")) == "session-02":
+            assert first_validated.wait(timeout=2)
             validator_entered.set()
             assert validator_release.wait(timeout=2)
 

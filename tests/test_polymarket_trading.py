@@ -1576,9 +1576,12 @@ def test_lp_account_snapshot_shared_single_flight_and_ttl(request) -> None:
         polymarket_trading.time = original_realtime  # type: ignore[misc]
 
 
-def test_guarded_sdk_timestamps_survive_shared_account_cache(monkeypatch):
+@pytest.mark.parametrize('trade_generation', [None, 7])
+def test_guarded_sdk_timestamps_survive_shared_account_cache(monkeypatch, trade_generation):
     from polymarket.models import OpenOrder, ClobTrade
-    from open_trader.prediction_read_only import PolymarketReadOnlyGuard, guard_polymarket_client, ReadOnlyViolation
+    from open_trader.prediction_read_only import PolymarketReadOnlyGuard, guard_polymarket_client
+    from copy import deepcopy
+    from pydantic import ValidationError
     stamp = '2026-09-30T16:01:02.123456+05:30'
     expected = datetime.fromisoformat(stamp).astimezone(UTC)
     condition = '0x' + 'ab'*32
@@ -1589,7 +1592,9 @@ def test_guarded_sdk_timestamps_survive_shared_account_cache(monkeypatch):
     trade = ClobTrade.model_validate(dict(id='trade-1', market=condition, asset_id='123',
         owner='owner', maker_address=WALLET, taker_order_id='order-1', side='BUY',
         trader_side='TAKER', price='0.5', size='1', outcome='YES', status='MATCHED',
-        fee_rate_bps='0', bucket_index=0, transaction_hash='0x'+'cd'*32, maker_orders=[],
+        fee_rate_bps='0', bucket_index=0, transaction_hash='0x'+'cd'*32, maker_orders=[dict(
+            order_id='maker-1', asset_id='123', maker_address=WALLET, owner='owner',
+            side='BUY', price='0.5', matched_amount='1', outcome='YES')],
         match_time=stamp, last_update=stamp))
     sdk = FakeClient()
     monkeypatch.setattr(sdk, 'list_open_orders', lambda **kwargs: [order])
@@ -1599,8 +1604,9 @@ def test_guarded_sdk_timestamps_survive_shared_account_cache(monkeypatch):
     monkeypatch.setattr(adapter, 'lp_market_metadata', lambda ids: {})
     guard = PolymarketReadOnlyGuard()
     with guard_polymarket_client(adapter, guard):
-        first = adapter.lp_account_snapshot_shared()
-        second = adapter.lp_account_snapshot_shared()
+        provider = None if trade_generation is None else lambda: trade_generation
+        first = adapter.lp_account_snapshot_shared(trade_generation_provider=provider)
+        second = adapter.lp_account_snapshot_shared(trade_generation_provider=provider)
         for field in ('created_at', 'expiration'):
             assert type(first['open_orders'][0][field]) is datetime
             assert first['open_orders'][0][field] == (expected if field == 'created_at'
@@ -1615,14 +1621,37 @@ def test_guarded_sdk_timestamps_survive_shared_account_cache(monkeypatch):
         assert second['open_orders'][0]['price'] == Decimal('0.5')
         assert second['account_trades'][0]['price'] == Decimal('0.5')
         assert guard.attempts == []
-        # Raw execution-round models remain protected, never deepcopy-compatible.
-        account_round = adapter.lp_account_round_begin()
+        account_round = adapter.lp_account_round_begin(lambda: 7)
         try:
-            with pytest.raises(ReadOnlyViolation):
-                adapter.lp_open_orders_for_round(account_round)
+            assert adapter.lp_open_orders_for_round(account_round)[0]['order_id'] == 'order-1'
+            rounded = adapter.lp_account_snapshot(account_round=account_round)
+            follower = adapter.lp_account_snapshot(account_round=account_round)
+            copied = deepcopy(deepcopy(rounded))
+            raw = copied['raw_trades'][0]
+            assert isinstance(raw, ClobTrade)
+            assert isinstance(raw.model_dump()['matched_at'], datetime)
+            assert datetime.fromisoformat(raw.model_dump()['matched_at'].isoformat()) == expected
+            assert raw.model_dump()['maker_orders'][0]['matched_amount'] == Decimal('1')
+            assert raw is not follower['raw_trades'][0]
+            assert raw.maker_orders[0] is not follower['raw_trades'][0].maker_orders[0]
+            with pytest.raises(ValidationError, match='frozen'):
+                raw.maker_orders[0].matched_amount = Decimal('9')
+            with pytest.raises(ValidationError, match='frozen'):
+                raw.price = Decimal('0.1')
+            assert follower['raw_trades'][0].model_dump()['price'] == Decimal('0.5')
+            assert rounded['raw_trades'][0].model_dump()['maker_orders'][0]['matched_amount'] == Decimal('1')
+            assert trade.price == Decimal('0.5')
+            assert trade.maker_orders[0].matched_amount == Decimal('1')
+            assert copied['trade_generation'] == follower['trade_generation'] == 7
+            if trade_generation is not None:
+                with pytest.raises(ValidationError, match='frozen'):
+                    first['raw_trades'][0].price = Decimal('0.2')
+                third = adapter.lp_account_snapshot_shared(trade_generation_provider=provider)
+                assert second['raw_trades'][0].model_dump()['price'] == Decimal('0.5')
+                assert third['raw_trades'][0].model_dump()['price'] == Decimal('0.5')
         finally:
             adapter.lp_account_round_end(account_round)
-        assert guard.attempts[-1]['method'] == 'raw_internal'
+        assert guard.attempts == []
 
 
 @pytest.mark.parametrize('selected', [False, True])
@@ -6890,3 +6919,48 @@ def test_display_account_trades_keep_malformed_rows_unknown_without_poisoning_tr
     assert snapshot['account_trades_total'] == 2
     assert snapshot['account_trades'][0]['trade_id'] == 'trade-1'
     assert 'raw_trades' not in snapshot
+
+
+def test_authenticated_paused_shadow_copies_sdk_account_facts_without_stopping(tmp_path, monkeypatch):
+    from open_trader.prediction_runtime import PredictionRuntime
+    from open_trader.prediction_read_only import ReadOnlyViolation
+    import open_trader.prediction_runtime as runtime_module
+    from tests.test_polymarket_lp import _SDKAccountClient, _SDKPublicClient
+
+    now = datetime.now(UTC)
+    sdk = _SDKAccountClient(now)
+    wallet = '0x' + '3' * 40
+    adapter = PolymarketTradingClient(TradingConfig(wallet, wallet), sdk,
+        public_client_factory=lambda: _SDKPublicClient(now))
+    monkeypatch.setattr(adapter, 'lp_market_metadata', lambda ids: {})
+    monkeypatch.setenv('OPEN_TRADER_CREDENTIAL_BACKEND', 'file')
+    monkeypatch.setattr(runtime_module, 'load_trading_config', lambda _: adapter.config)
+    monkeypatch.setattr(PolymarketTradingClient, 'from_keychain', lambda *a, **k: adapter)
+    # Exercise the real paused runtime and guard offline, driving reads explicitly.
+    for name in ('_start_history_monitor', '_start_candidate_scan_monitor',
+        '_start_candidate_maintenance_monitor', '_start_candidate_competition_monitor',
+        '_start_lp_dashboard_monitor', '_start_reward_monitor', '_start_book_sampler'):
+        monkeypatch.setattr(PredictionRuntime, name, lambda *a, **k: None)
+    runtime = PredictionRuntime(data_dir=tmp_path, prediction_config_path=tmp_path/'unused.json',
+        dashboard_url='http://127.0.0.1:8766/', mode='shadow', n_leg_paused=True)
+    runtime.start()
+    try:
+        for _ in range(3):
+            account = adapter.lp_account_snapshot_shared(
+                trade_generation_provider=runtime.store.lp_trade_generation)
+            assert account['pagination_complete'] is True
+            assert account['raw_trades'][0].id == 'trade-1'
+            dashboard = runtime.execution.refresh_lp_dashboard_snapshot()
+            assert dashboard['state'] == 'ready', dashboard
+            assert len(dashboard['orders']) == 1
+        assert runtime.state == 'RUNNING'
+        assert runtime.production_owner is False
+        assert runtime.shadow_evidence['guard_attempts'] == []
+        assert runtime.shadow_evidence['first_violation'] is None
+        with pytest.raises(ReadOnlyViolation):
+            adapter.cancel_all()
+        assert runtime.poll_shadow_failure()['method'] == 'cancel_all'
+        assert runtime.state == 'STOPPED'
+    finally:
+        runtime.stop()
+    assert runtime.state == 'STOPPED'
