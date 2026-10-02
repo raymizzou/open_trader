@@ -317,9 +317,15 @@ def test_make_acceptance_excludes_external_prediction_live_registry() -> None:
         "8769",
     )
 
-    assert '-k "not LIVE"' in normalized
-    assert '-m "not pressure and not browser"' in normalized
-    assert all(token not in normalized for token in forbidden)
+    portable = subprocess.run(
+        ["make", "-n", "test-ci-portable"], cwd=repo_root, check=True,
+        capture_output=True, text=True,
+    ).stdout
+    assert "scripts/deployment_preflight.py" in normalized
+    assert "pytest" not in normalized and "docker" not in normalized
+    assert '-k "not LIVE"' in portable
+    assert '-m "not pressure and not browser"' in portable
+    assert all(token not in normalized and token not in portable for token in forbidden)
 
 
 def test_make_acceptance_never_refreshes_or_mutates_runtime() -> None:
@@ -334,10 +340,11 @@ def test_make_acceptance_never_refreshes_or_mutates_runtime() -> None:
 
     normalized = " ".join(re.sub(r"\\\s*\n", " ", plan).split())
 
-    assert normalized.count("docker build") == 1
-    assert normalized.count("docker run") == 1
-    assert '-m "not pressure and not browser"' in normalized
-    assert 'acceptance/test_prediction_arbitrage_scenarios.py -k "not LIVE"' in normalized
+    assert normalized.count("docker build") == 0
+    assert normalized.count("docker run") == 0
+    assert normalized.count("scripts/deployment_preflight.py") == 1
+    assert "pytest" not in normalized
+    assert "--expected-sha" in normalized and "--release-root" in normalized
     assert all(
         token not in normalized
         for token in (
@@ -370,7 +377,7 @@ def test_default_gates_run_backend_suite_and_keep_explicit_pressure_and_browser_
             capture_output=True,
             text=True,
         ).stdout
-        for target in ("test", "acceptance", "test-pressure")
+        for target in ("test", "acceptance", "test-ci-portable", "test-pressure", "browser-test")
     }
     normalized = {
         target: " ".join(re.sub(r"\\\s*\n", " ", plan).split())
@@ -404,10 +411,14 @@ def test_default_gates_run_backend_suite_and_keep_explicit_pressure_and_browser_
         and "tests/test_dashboard_acceptance.py" in normalized["test"]
         and "tests/test_frontend_gateway.py" not in normalized["test"]
         and "tests/test_prediction_service.py" not in normalized["test"]
-        and '-m "not pressure and not browser"' in normalized["acceptance"]
+        and "scripts/deployment_preflight.py" in normalized["acceptance"]
+        and "pytest" not in normalized["acceptance"]
+        and '-m "not pressure and not browser"' in normalized["test-ci-portable"]
         and 'acceptance/test_prediction_arbitrage_scenarios.py -k "not LIVE"'
-        in normalized["acceptance"]
+        in normalized["test-ci-portable"]
         and '-m pressure' in normalized["test-pressure"]
+        and '-m browser' in normalized["browser-test"]
+        and "playwright" in normalized["browser-test"]
         and collected
         == [
             "tests/test_relation_incremental_activation.py::"
