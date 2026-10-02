@@ -3,6 +3,16 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-02
+
+- 调整开发与 CI 分工：本地使用已有 Python 环境和当前 worktree 源码，只跑直接受影响
+  或新增的测试；共享模块覆盖相关消费者并集，不再要求本地整服务测试或推送前 Docker。
+  每次分支 push、PR-to-main 合并候选及合并后的 main push 均运行四个后台服务，统一
+  `TEST_N_LEG=1`，文档、LP、趋势及缺失 diff 不再缩减覆盖；排除 pressure/browser。
+  push head 与 PR merge 分别绑定各自 SHA；required 聚合保持 fail-closed。
+  同步中英文开发文档及保护规则设计；具体测试结果以本 PR 精确 SHA 的验证记录为准。
+  Candidate Acceptance、Host Readiness、Smoke、审查、合并与部署授权边界不变。
+
 ## 2026-10-01
 
 - Smoke 暂停 N-leg 负向检查补齐 split 模式 Air 身份同步：先排空切页读取，

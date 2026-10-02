@@ -43,10 +43,14 @@ Target only `refs/heads/main` and require:
 
 Confirm the actual UI/API representation and selected enforcement mode during
 implementation. Do not require a guessed `CI / required` context or all
-individual service checks: routed jobs can legitimately be skipped while the
-fail-closed aggregate succeeds. Test that stale/missing/failed aggregate evidence
-blocks merge and that an up-to-date documentation-only PR can satisfy the
-aggregate under the existing routing. Do not alter CI routes to satisfy a rule.
+individual service checks: the aggregate enforces success of all four backend
+services with `TEST_N_LEG=1` and requires the retained standalone trend-curve job
+to be skipped because legacy includes its tests. Test that stale/missing/failed
+aggregate evidence blocks merge and that an up-to-date documentation-only PR
+satisfies the aggregate only after the same full backend checks. Every branch
+push, PR-to-main merge candidate and merged-main push receives this coverage;
+push-head and PR-merge runs intentionally verify distinct SHA identities. Do not
+weaken CI coverage to satisfy a rule.
 
 ## Proposed tag controls: creation versus immutability
 
