@@ -10,14 +10,17 @@ and configuration-only tasks may use the stated exemption.
 
 On the first repository action of each session, silently verify the repository
 root, current worktree, branch, HEAD SHA, and working-tree status. Treat the
-Docker Dev, Candidate Acceptance, Host Readiness, Production Smoke, merge,
-push, and deployment boundaries in the linked runbook as standing rules.
+Development Verification, Candidate Acceptance, Host Readiness, Production Smoke,
+merge, push, and deployment boundaries in the linked runbook as standing rules.
 Do not ask the user to restate or confirm them.
 
 Before claiming PASS, READY, deployed, or healthy, verify evidence for the
-exact current SHA. Evidence from another SHA or an earlier session does not
-transfer. If evidence is unavailable, report UNKNOWN; do not run an expensive
-or external gate solely to fill the gap unless the current request requires it.
+exact current SHA. Evidence from another SHA does not transfer. Prior-session
+static or CI evidence may be reused after rechecking its SHA, scope, environment,
+and recorded result. Refresh host, runtime, and external-state evidence before
+current readiness or health claims. If evidence is unavailable, report UNKNOWN;
+do not run an expensive or external gate solely to fill the gap unless the current
+request requires it.
 
 ## Worktree and approval
 
@@ -26,6 +29,34 @@ Start every implementation or repository-change task from freshly fetched
 GitHub `main`; never integrate task branches or create delivery commits there.
 Do not use an unrelated or dirty checkout. Code and behavior changes require a concrete plan and explicit user
 approval; follow the global worker and TDD contract after approval.
+
+## Plans and handoffs
+
+Before requesting plan approval, explain the current problem, intended behavior,
+key tradeoff or risk, and focused validation in plain language. Once approved,
+continue within that scope without repeated approval requests; material scope
+or risk changes and the existing action-specific approval boundaries still apply.
+
+For review and delivery, lead with what behavior changed and why. Tie claims to
+the exact SHA and evidence links; distinguish verified, failed, unrun, and unknown
+checks. Name any specific next action that needs approval and what it entails.
+Use diagrams or interactive explanations only when they materially reduce the
+cost of understanding; they supplement, never replace, tests and independent
+review. Keep key principles and runbook links here, with detailed procedures in
+the linked runbooks rather than repeated across instruction files.
+
+## Writing language
+
+For English output, apply [ASD-STE100 writing principles](https://www.asd-ste100.org/about_STE.html):
+short, clear sentences, consistent terms, and explicit actions. Do not claim
+strict ASD-STE100 compliance without checking the full standard and dictionary.
+For Chinese output, use academic-paper rigor: lead with a concise summary,
+define key terms, support conclusions with evidence, and distinguish facts,
+inferences, and uncertainty. Adapt STE's clarity, concision, and consistent
+terminology to Chinese; do not treat its English dictionary as a Chinese standard.
+Use data, comparisons, or figures when they help substantiate the argument.
+Never invent evidence or citations. Match length and structure to the task;
+simple answers do not need a full paper format or unnecessary formality.
 
 ## Verification routing
 
@@ -74,17 +105,21 @@ require explicit user approval. Follow the detailed
 
 ## Review and merge
 
-Before review, update the dated operator-facing entry in `CHANGELOG.md`, then
-stage only the exact task files. The reviewer target is `git diff --cached`.
+Before pre-commit review, update the dated operator-facing entry in `CHANGELOG.md`,
+then stage only the exact task files. The reviewer target is `git diff --cached`.
+For an existing PR, pin the base and head SHAs and review
+`git diff <base>...<head>`; read-only PR review requires no staging or file edits.
 After any post-review change, restage only the exact task files, rerun relevant
 verification, and obtain a fresh review.
 Use a fresh independent reviewer for the initial review; reuse that reviewer
 for in-scope repairs after restaging and rerunning relevant verification. A
 new reviewer is needed when scope or architecture changes. If GitHub `main`
 advances, fetch and rebase task commits onto `origin/main`, then rerun required
-worktree checks and review. Conflicts or behavior changes require a new approved
-plan. Publish only the reviewed tree to the authorized task branch, open a
-Draft PR targeting `main`, and inspect the latest exact-SHA CI evidence. Require
+worktree checks and review. A rebase or conflict resolution that changes behavior,
+scope, risk, or architecture requires a new approved plan. Mechanical resolutions
+that preserve these may proceed within approved scope, with required checks and
+independent review. Publish only the reviewed tree to the authorized task branch,
+open a Draft PR targeting `main`, and inspect the latest exact-SHA CI evidence. Require
 the `required` check from GitHub Actions, then obtain explicit user approval
 before merging on GitHub. Do not integrate through local `main` or direct push.
 See [CI identity](docs/operations/ci.md) and the

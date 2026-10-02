@@ -221,9 +221,10 @@ The delivery path is isolated branch/worktree from freshly fetched
 → latest CI success → explicit user approval → GitHub merge. Local `main` is
 only a synchronized copy of GitHub `main`, never an integration or repair path.
 When the base advances, fetch/rebase, rerun focused checks and independent
-review, and inspect fresh CI; conflicts or behavior changes require a new
-approved plan. Never force-push `main`. A reviewed branch rewrite also requires
-authorized publication; do not discard another worker's commits.
+review, and inspect fresh CI. Rebase and conflict-resolution approval follows
+[AGENTS.md](../../AGENTS.md#review-and-merge). Never force-push `main`.
+A reviewed branch rewrite also requires authorized publication; do not discard
+another worker's commits.
 
 There are three distinct identities: the reviewed PR head; GitHub's synthetic
 PR merge commit (`github.sha` for PR CI); and the final GitHub `main` commit
