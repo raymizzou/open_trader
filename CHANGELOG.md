@@ -5,6 +5,11 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-03
 
+- #232 scoring 后交易代次 fence 测试改用同一受控业务时钟生成 SDK/adapter receipt 并验证 LP 事实。
+  时钟只作用于该 adapter 的读取线程，保留真实线程、原 Event watchdog、旧代拒绝、UNKNOWN 和无 scoring_checked_at 断言；
+  生产 freshness 与超时不变。历史串行 94 passed / 1 failed 的具体原因仍 UNKNOWN，后续 trace 95 passed 不覆盖失败。
+
+
 - #232：共享只读代理直接复制 Pydantic 数据存储，避免 SDK 账户事实 deepcopy 误触
   `raw_internal` 并停止 authenticated paused Shadow。保留模型字段、frozen 约束和快照隔离；
   任意 capability、raw internal、下单撤单、transport 写入及通知仍受保护。

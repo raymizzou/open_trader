@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import threading
@@ -637,8 +638,32 @@ def test_registered_service_trade_rejects_before_publication(tmp_path) -> None:
         worker.join(timeout=2)
 
 
-def test_trade_after_scoring_blocks_old_bundle_apply(tmp_path) -> None:
+def test_trade_after_scoring_blocks_old_bundle_apply(tmp_path, monkeypatch) -> None:
+    from open_trader import polymarket_trading
     now = datetime.now(UTC)
+    receipt_scope = threading.local()
+
+    class ClockMeta(type):
+        def __instancecheck__(cls, value):
+            return isinstance(value, datetime)
+
+    class Clock(datetime, metaclass=ClockMeta):
+        @classmethod
+        def now(cls, tz=None):
+            if getattr(receipt_scope, "active", False):
+                return now.astimezone(tz) if tz is not None else now.replace(tzinfo=None)
+            return datetime.now(tz)
+
+    @contextmanager
+    def receipt_clock():
+        previous = getattr(receipt_scope, "active", False)
+        receipt_scope.active = True
+        try:
+            yield
+        finally:
+            receipt_scope.active = previous
+
+    monkeypatch.setattr(polymarket_trading, "datetime", Clock)
     account = _ScoringGatedAccountClient(now)
     public = _TwoMarketPublicClient(now)
     wallet = str(account.open_order.owner)
@@ -647,6 +672,20 @@ def test_trade_after_scoring_blocks_old_bundle_apply(tmp_path) -> None:
         account,
         public_client_factory=lambda: public,
     )
+    account_facts = adapter._lp_account_facts
+    public_client = adapter._lp_snapshot_public_client
+
+    def read_account(**kwargs):
+        with receipt_clock():
+            return account_facts(**kwargs)
+
+    @contextmanager
+    def read_public():
+        with receipt_clock(), public_client() as client:
+            yield client
+
+    monkeypatch.setattr(adapter, "_lp_account_facts", read_account)
+    monkeypatch.setattr(adapter, "_lp_snapshot_public_client", read_public)
     store = PredictionArbitrageStore(tmp_path)
     for index in (1, 2):
         store.lp_create_session(
@@ -655,7 +694,7 @@ def test_trade_after_scoring_blocks_old_bundle_apply(tmp_path) -> None:
             state="entry_open",
             payload=_request(now, index=index),
         )
-    service = PolymarketLPService(store, adapter)
+    service = PolymarketLPService(store, adapter, clock=lambda: now)
     engine = PredictionExecutionService(
         store=store,
         monitor=SimpleNamespace(),
@@ -712,6 +751,7 @@ def test_trade_after_scoring_blocks_old_bundle_apply(tmp_path) -> None:
     finally:
         account.release_scoring.set()
         worker.join(timeout=2)
+        adapter.close()
 
 
 def test_exact_order_newer_evidence_advances_shared_fence(tmp_path, caplog) -> None:
