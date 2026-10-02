@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from copy import deepcopy
+from datetime import UTC, datetime
+from decimal import Decimal
 from types import SimpleNamespace
 from collections.abc import Mapping
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, PrivateAttr, RootModel
 
 import pytest
 
@@ -390,3 +393,159 @@ def test_predict_guard_blocks_nested_raw_transaction_before_delivery() -> None:
     assert guard.mutation_calls == 1
     assert guard.attempts[0]["method"] == "send_raw_transaction"
     assert "secret-signed-transaction" not in str(guard.attempts[0])
+
+
+def test_guarded_deepcopy_preserves_nested_model_storage_and_container_values() -> None:
+    class Maker(BaseModel):
+        amount: Decimal
+
+    class Facts(BaseModel):
+        model_config = ConfigDict(extra="allow")
+        makers: tuple[Maker, ...]
+        metadata: list[dict[str, object]]
+        _notes: list[str] = PrivateAttr(default_factory=lambda: ["original"])
+
+        def __deepcopy__(self, memo):
+            raise AssertionError("raw model copy hook executed")
+
+    stamp = datetime(2026, 10, 3, 1, 2, 3, 123456, tzinfo=UTC)
+    raw = Facts(makers=(Maker(amount=Decimal("1")),),
+                metadata=[{"stamp": stamp, "values": ("yes", None)}], extra_values=["extra"])
+    guard = PolymarketReadOnlyGuard()
+    original = guard.wrap(raw)
+    memo = {}
+    first = deepcopy(original, memo)
+    second = deepcopy(first)
+    assert first is not second and first is not original
+    assert memo[id(original)] is first
+    assert isinstance(second, Facts)
+    assert isinstance(second.makers, tuple) and isinstance(second.makers[0], Maker)
+    assert isinstance(second.metadata, list) and isinstance(second.metadata[0], dict)
+    raw.metadata[0]["values"] = ("raw-change", None)
+    assert first.metadata[0]["values"][0] == second.metadata[0]["values"][0] == "yes"
+    assert datetime.fromisoformat(second.metadata[0]["stamp"].isoformat()) == stamp
+    assert set(second.__pydantic_fields_set__) == {"makers", "metadata", "extra_values"}
+    second.makers[0].amount = Decimal("9")
+    second.metadata.append({"values": ("copy-change", None)})
+    second.extra_values.append("changed")
+    second._notes.append("changed")
+    assert first.makers[0].amount == raw.makers[0].amount == Decimal("1")
+    assert len(second.metadata) == 2
+    assert len(first.metadata) == len(raw.metadata) == 1
+    assert list(first.extra_values) == raw.extra_values == ["extra"]
+    assert list(first._notes) == raw._notes == ["original"]
+    assert guard.attempts == []
+
+
+@pytest.mark.parametrize("location", ["root", "field", "extra", "private", "callable", "model_disguise"])
+def test_guarded_deepcopy_rejects_capabilities_without_executing_copy_hooks(location) -> None:
+    calls = []
+
+    class Capability:
+        def __deepcopy__(self, memo):
+            calls.append("raw-copy")
+            return self
+
+        def post_order(self):
+            calls.append("post")
+
+    class Facts(BaseModel):
+        model_config = ConfigDict(extra="allow")
+        payload: object = None
+        _client: object = PrivateAttr(default=None)
+
+    class ModelDisguise(Capability):
+        @property
+        def __class__(self):
+            calls.append("raw-class")
+            return Facts
+
+    capability = ModelDisguise() if location == "model_disguise" else Capability()
+    if location in {"root", "model_disguise"}:
+        raw = capability
+    elif location == "callable":
+        raw = {"callback": capability.post_order}
+    else:
+        raw = Facts()
+        if location == "field":
+            raw.payload = [{"client": capability}]
+        elif location == "extra":
+            raw.client = capability
+        else:
+            raw._client = capability
+    guard = PolymarketReadOnlyGuard()
+    with pytest.raises(ReadOnlyViolation):
+        deepcopy(guard.wrap(raw))
+    assert calls == []
+    assert guard.attempts[-1]["method"] == "raw_internal"
+
+
+@pytest.mark.parametrize("action", ["_value", "_guard", "callable", "client", "post_order", "cancel_order", "transport", "notification"])
+def test_guarded_deepcopy_keeps_model_methods_and_internals_protected(action) -> None:
+    calls = []
+
+    class Facts(BaseModel):
+        size: str = "1"
+
+        def post_order(self):
+            calls.append("post")
+
+        def cancel_order(self):
+            calls.append("cancel")
+
+        def request(self, method):
+            calls.append(method)
+
+        def send(self):
+            calls.append("notification")
+
+        def read_client(self):
+            return SimpleNamespace(post_order=lambda: calls.append("nested-post"))
+
+    guard = PolymarketReadOnlyGuard()
+    copied = deepcopy(deepcopy(guard.wrap(Facts(), notification_scope=True)))
+    with pytest.raises(ReadOnlyViolation):
+        if action in {"_value", "_guard"}:
+            getattr(copied, action)
+        elif action == "callable":
+            copied.read_client._function
+        elif action == "client":
+            copied.read_client().post_order()
+        elif action == "transport":
+            copied.request("POST")
+        elif action == "notification":
+            copied.send()
+        else:
+            getattr(copied, action)()
+    assert calls == []
+    assert len(guard.attempts) == 1
+    assert guard.live_notifications == (1 if action == "notification" else 0)
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["root", "nested"])
+def test_guarded_deepcopy_preserves_root_model_values_and_snapshot_isolation(nested) -> None:
+    class Rows(RootModel[list[dict[str, list[str]]]]):
+        pass
+
+    class Facts(BaseModel):
+        rows: Rows
+
+    original_rows = Rows([{"labels": ["yes"]}])
+    original = Facts(rows=original_rows) if nested else original_rows
+    guard = PolymarketReadOnlyGuard()
+    first = deepcopy(guard.wrap(original))
+    second = deepcopy(first)
+    first_rows = first.rows if nested else first
+    second_rows = second.rows if nested else second
+    assert isinstance(first_rows, Rows) and isinstance(second_rows, Rows)
+    assert first_rows is not second_rows
+    original_rows.root[0]["labels"].append("original-change")
+    second_rows.root[0]["labels"].append("copy-change")
+    second_rows.root.append({"labels": ["new"]})
+    assert list(first_rows.root[0]["labels"]) == ["yes"]
+    assert list(second_rows.root[0]["labels"]) == ["yes", "copy-change"]
+    assert original_rows.root[0]["labels"] == ["yes", "original-change"]
+    assert len(first_rows.root) == len(original_rows.root) == 1
+    assert len(second_rows.root) == 2
+    assert list(first_rows.model_dump()[0]["labels"]) == ["yes"]
+    assert guard.attempts == []

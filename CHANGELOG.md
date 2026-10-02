@@ -3,6 +3,22 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-03
+
+- #232 scoring 后交易代次 fence 测试改用同一受控业务时钟生成 SDK/adapter receipt 并验证 LP 事实。
+  时钟只作用于该 adapter 的读取线程，保留真实线程、原 Event watchdog、旧代拒绝、UNKNOWN 和无 scoring_checked_at 断言；
+  生产 freshness 与超时不变。历史串行 94 passed / 1 failed 的具体原因仍 UNKNOWN，后续 trace 95 passed 不覆盖失败。
+
+
+- #232：共享只读代理直接复制 Pydantic 数据存储，避免 SDK 账户事实 deepcopy 误触
+  `raw_internal` 并停止 authenticated paused Shadow。保留模型字段、frozen 约束和快照隔离；
+  任意 capability、raw internal、下单撤单、transport 写入及通知仍受保护。
+  验证覆盖真实 ClobTrade/maker、账户 round、共享缓存多次复制和离线 Shadow 读取；
+  支持 RootModel 缺失的标准 storage，补根模型及嵌套值的复制隔离回归。
+  账户 round 竞态测试明确等待两会话都取得旧代事实再推进交易代次，保留单次读取、
+  下一轮重读及 UNKNOWN/拒绝旧代发布断言；原/current guard 的受控对照确认旧有同步缺口。
+  generation fence、UNKNOWN、筛选及交易契约不变。未启动真实服务或部署。
+
 ## 2026-10-02
 
 - 将重复的部署前全量后台测试移至复用可信 CI 证据的轻量预检；CI 纳入非 LIVE

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from collections.abc import Mapping
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 import traceback
 from types import MethodType
@@ -246,6 +247,56 @@ class _GuardedPolymarketValue:
             "notifier", "_notifier", "notification", "_notification"
         }
         return guard.protect(value, notification_scope=child_scope)
+
+    def __deepcopy__(self, memo: dict[int, object]) -> object:
+        """Copy data storage, never dispatch a raw SDK/capability copy hook."""
+        guard = object.__getattribute__(self, "_guard")
+        # Keep raw clones out of the caller's memo: only guarded results escape.
+        data_memo: dict[int, object] = {}
+
+        def copy_data(value: object) -> object:
+            if value is None or type(value) in (
+                str, bytes, bool, int, float, Decimal, date, datetime, time, timedelta,
+            ):
+                return value
+            if id(value) in data_memo:
+                return data_memo[id(value)]
+            if issubclass(type(value), BaseModel):
+                copied = object.__new__(type(value))
+                data_memo[id(value)] = copied
+                for name in (
+                    "__dict__", "__pydantic_extra__", "__pydantic_fields_set__",
+                    "__pydantic_private__",
+                ):
+                    storage = BaseModel.__dict__[name]
+                    try:
+                        stored = storage.__get__(value)
+                    except AttributeError:
+                        continue
+                    storage.__set__(copied, copy_data(stored))
+            elif type(value) is dict:
+                copied = {}
+                data_memo[id(value)] = copied
+                for key, item in value.items():
+                    copied[copy_data(key)] = copy_data(item)
+            elif type(value) is list:
+                copied = []
+                data_memo[id(value)] = copied
+                copied.extend(copy_data(item) for item in value)
+            elif type(value) in (tuple, set, frozenset, bytearray):
+                items = [copy_data(item) for item in value]
+                copied = data_memo.get(id(value), type(value)(items))
+            else:
+                guard.violation("raw_internal")
+            data_memo[id(value)] = copied
+            return copied
+
+        copied = guard.wrap(
+            copy_data(object.__getattribute__(self, "_value")),
+            notification_scope=object.__getattribute__(self, "_notification_scope"),
+        )
+        memo[id(self)] = copied
+        return copied
 
     def __setattr__(self, name: str, value: object) -> None:
         if name in {"_value", "_guard"}:
