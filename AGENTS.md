@@ -29,19 +29,23 @@ approval; follow the global worker and TDD contract after approval.
 
 ## Verification routing
 
-Pure documentation and configuration changes do not run `make test`. Standalone
-trend-curve collector, backtester, CLI, storage, and dedicated-test changes use
-`make test-trend-curve` and do not require the full suite, Candidate Acceptance,
-Host Readiness, or Production Smoke; shared modules/dependencies,
-Dashboard/backend runtime, reports, trading, or wider production paths use the
-normal gates. Read the linked runbook before selecting a non-exempt gate.
+Local development runs only directly affected or newly added test nodeids, using
+an existing Python environment against this worktree's source, for example
+`PYTHONPATH=src python -m pytest tests/path.py::test_name`. Test-only changes run
+the changed tests; shared test helpers also require their directly affected
+consumers. Shared production changes run the union of relevant consumer tests,
+not whole service suites. Pure documentation/configuration changes need no local
+backend run unless they affect a testable contract. Report missing dependencies
+or blocked focused checks rather than claiming success. Docker is optional for
+focused diagnosis and is not a prerequisite to pushing a reviewed branch.
 
-For production-code changes covered by the normal gates, run
-`make test SERVICE=<gateway|legacy|account|prediction>` for the affected backend
-service. Use multiple service names for shared changes and `TEST=...` for a
-narrower seam. Do not run the full backend suite during development. After
-known repairs and any required rebase, complete affected-service checks and
-independent review before publishing the task branch and opening a Draft PR.
+GitHub CI runs all four backend services (`gateway`, `legacy`, `account`,
+`prediction`) with `TEST_N_LEG=1` on every branch push and every PR targeting
+`main`, including the final merged-main push. Documentation-only, LP-only,
+trend-only, and missing-diff cases have the same full backend coverage, excluding
+`pressure` and `browser`. Push-head and PR-merge runs intentionally test distinct
+SHA identities. Before authorized publication, complete focused local checks
+and independent review; inspect exact-SHA CI before requesting merge approval.
 Candidate Acceptance runs only for the final GitHub `main` SHA selected for an
 explicitly authorized deployment, after GitHub PR merge. Do not run it during
 development, review, before merge, or automatically after merge. It is not a PR

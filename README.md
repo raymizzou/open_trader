@@ -181,14 +181,20 @@ release/tag creation or deployment. See the binding
 
 Use four explicit stages with exact-SHA evidence:
 
-1. **Docker dev** — `make test SERVICE=prediction` or
-   `make test TEST='tests/path.py::test_name'` builds the worktree-specific
-   Python/backend image and runs only the selected backend tests with
-   `-m 'not pressure and not browser'`. Use space-separated service names for
-   shared changes; unscoped `make test` fails. The image includes the Node runtime
-   and `procps`, but excludes npm, Python/JS Playwright, Chromium/browser assets,
-   host mounts, network, published ports, Docker socket, home directory, and
-   credentials. It has zero browser cost.
+1. **Development verification** — locally run only directly affected/new test
+   nodeids with `PYTHONPATH=src python -m pytest tests/path.py::test_name` in an
+   existing Python environment against this worktree. Test-only changes run the
+   changed tests; shared test helpers add their directly affected consumers.
+   Shared production changes run the union of relevant consumer tests, not whole
+   services. Docker is optional for focused diagnosis, not a prerequisite to push.
+   GitHub CI runs all four backend services (`gateway`, `legacy`, `account`,
+   `prediction`) with `TEST_N_LEG=1` on every branch push and PR targeting `main`,
+   including merged-main pushes and docs-only, LP-only or trend-only changes.
+   Full backend CI excludes `pressure` and `browser`. Push-head and PR-merge runs
+   intentionally test distinct SHA identities; legacy already covers trend tests.
+   CI uses the locked Docker dev image and offline test containers without host
+   mounts, forwarded credentials, Docker socket or published ports. It does not
+   run any of the three deployment gates below.
 2. **Predeployment Candidate Acceptance** — only after GitHub PR merge when
    preparing an explicitly authorized deployment, run `make candidate-acceptance`
    for the selected final GitHub `main` SHA. PR head and synthetic PR merge SHA
@@ -1237,11 +1243,14 @@ data/latest/US/decision_facts.json
 
 ## Development
 
-Run the test suite:
+Run directly affected/new test nodeids locally (use your existing environment):
 
 ```bash
-.venv/bin/python -m pytest
+PYTHONPATH=src python -m pytest tests/path.py::test_name
 ```
+
+GitHub CI runs the full existing backend suite on every branch push and PR to
+`main`; see the [verification runbook](docs/operations/agent-verification.md).
 
 Project entrypoint:
 

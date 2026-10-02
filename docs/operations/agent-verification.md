@@ -7,57 +7,72 @@ merge, or deployment. Documentation and configuration-only work does not run
 
 ## Development verification
 
-`make test SERVICE=prediction` builds only the `dev` target of the
-worktree-specific `Dockerfile.dev` image and runs that service's backend test
-files with `-m "not pressure and not browser"`. Valid services are `gateway`,
-`legacy`, `account`, and `prediction`; space-separated names cover shared
-changes, for example `SERVICE='gateway prediction'`. `TEST='path::test_name'`
-selects a narrower seam instead. Unscoped `make test` fails before building.
-While N-leg arbitrage is paused, service-scoped development tests default to
-`TEST_N_LEG=0`: the dedicated N-leg execution, validation, solver, resolver,
-selection and scheduler files listed in Makefile `N_LEG_TESTS` are omitted.
-LP, shared models/storage/runtime/service, release and pause-protection tests
-remain active. This is a temporary test-selection policy, independent of the
-production `N_LEG_PAUSED` setting. Set `TEST_N_LEG=1` to restore the complete
-service suite; explicit `TEST=...` always runs the requested tests. Changes to
-an omitted N-leg component must use its explicit `TEST` selection or
-`TEST_N_LEG=1`. Run the complete Prediction suite before re-enabling N-leg.
-Candidate Acceptance keeps its complete backend coverage regardless of this
-development-only switch.
-Scopes containing `prediction` default to six pytest-xdist workers with
-`--dist=loadgroup`, distributing individual tests across workers. Solver
-benchmark tests share one worker to reuse their full-handoff fixture cache.
-Set `TEST_WORKERS=4` on a busy host or `TEST_WORKERS=1` for serial diagnosis;
-tune `TEST_WORKERS` to available capacity.
-Other services and explicit `TEST=...` selections default to serial execution;
-they also accept `TEST_WORKERS`. Candidate Acceptance remains serial.
-Python bytecode is cached under `/tmp/open-trader-bytecache` inside each test
-container, reducing repeated interpreter startup without changing source trees.
-Gateway contains `frontend_gateway` tests; Legacy contains Dashboard and the
-remaining shared backend test files. Update the Makefile prefixes when adding
-a service-specific test family. During
-development and PR review, run only the affected service tests. Candidate
-Acceptance owns complete backend coverage only when preparing an explicitly
-authorized deployment, after GitHub PR merge, for the selected final GitHub
-`main` SHA. Do not run it during development, review, before merge, or
-automatically after merge. The image includes Node and `procps`, and excludes npm,
-Python/JS Playwright, Chromium/browser assets, host mounts, network, published
-ports, the Docker socket, the home directory, and credentials. The approved
-pytest-xdist dependency is pinned in the development extras and consumed from
-`uv.lock` by the dev image. See [dependency reproducibility](dependency-reproducibility.md)
-for the locked Python/build-tool baseline and clean-build evidence.
+Run only directly affected or newly added test nodeids locally, in an existing
+Python environment with the current worktree's source explicitly selected:
+
+```sh
+PYTHONPATH=src python -m pytest tests/path.py::test_name
+```
+
+Use that environment's Python executable (for example `.venv/bin/python`) when
+needed; do not accidentally test an installed copy from another checkout.
+Test-only changes run the changed tests. Shared test helpers also require their
+directly affected consumer tests. Shared production modules require the union
+of relevant consumer tests across services, not entire services. Standalone
+trend-curve changes follow the same focused-nodeid rule. Record the selected
+nodeids and why they cover the change, exact SHA, command, environment and results.
+Pure documentation/configuration changes need no local backend run unless they
+affect a testable contract; CI planner/workflow contracts need focused regression
+checks. Missing dependencies or unavailable environments are blockers to report,
+not passing evidence. Keep TDD, relevant stability checks and independent review.
+
+Docker is not a prerequisite to push a reviewed branch. Optional focused Docker
+diagnosis can use `make test TEST='tests/path.py::test_name'`; local development
+does not require whole-service or full-backend suites. GitHub CI owns the full
+existing backend test suite on every branch push and every PR targeting `main`,
+including the final merged-main push: `gateway`, `legacy`, `account`, and
+`prediction`, always with `TEST_N_LEG=1`, excluding `pressure` and `browser`.
+Documentation-only, LP-only, trend-only and unavailable/empty diff cases all run
+that same coverage. Push CI tests the branch head; PR CI tests the synthetic merge
+candidate. These intentionally separate runs cover distinct SHA identities.
+See [CI identity and execution](ci.md). CI does not run Candidate Acceptance,
+Host Readiness or Production Smoke.
+
+### Existing Docker test mechanics
+
+CI reuses `make test SERVICE=<service>` and the worktree-specific `Dockerfile.dev`
+image. Valid service names are `gateway`, `legacy`, `account`, and `prediction`;
+unscoped `make test` fails before building. Gateway contains `frontend_gateway`
+tests; Legacy contains Dashboard and remaining shared backend test files,
+including standalone trend-curve tests. Keep Makefile prefixes current when
+adding service-specific test families. The retained standalone trend-curve CI
+job is not selected because legacy already includes its tests.
+
+Makefile's service-scoped default `TEST_N_LEG=0` omits the dedicated N-leg files
+listed in `N_LEG_TESTS`; CI explicitly overrides it with `TEST_N_LEG=1` for every
+service. Explicit `TEST=...` always runs the requested tests, including N-leg
+nodeids. Test selection never changes production `N_LEG_PAUSED`.
+The Makefile's Prediction service default remains six pytest-xdist workers with
+`--dist=loadgroup`, distributing individual tests across workers; solver benchmark
+tests share one worker to reuse their full-handoff fixture cache. CI overrides
+this to two workers for Prediction. `TEST_WORKERS=4` can reduce busy-host load and
+`TEST_WORKERS=1` supports serial diagnosis. Non-Prediction services and explicit
+`TEST=...` selections default to serial, and also accept `TEST_WORKERS`.
+Candidate Acceptance remains serial.
+The development image includes Node and `procps`, but excludes npm, Python/JS
+Playwright and Chromium/browser assets. Test containers have no host mounts,
+network, published ports, Docker socket, home directory or credentials.
+Python bytecode is cached under `/tmp/open-trader-bytecache` inside the container.
+The approved pytest-xdist dependency is pinned in development extras and consumed
+from `uv.lock`; see [dependency reproducibility](dependency-reproducibility.md).
 The 2026-09-29 approved cloud credential exception permits only the optional
 `cloud-ssm` extra (pinned Tencent SSM SDK and common SDK); Docker development
 installs it for offline SDK transport tests. Do not add other dependencies or
-weaken existing skips/xfails. Playwright is a host-only
-Production Smoke prerequisite; ordinary development and Candidate Acceptance
-have zero browser cost.
-
-Changes confined to the standalone trend-curve collector, backtester, CLI,
-storage, and their dedicated tests use `make test-trend-curve`; they do not
-require the full suite, Candidate Acceptance, Host Readiness, or Production
-Smoke. Changes to shared modules or dependencies, Dashboard/backend runtime,
-reports, trading behavior, or wider production paths use the normal gates.
+weaken existing skips/xfails. Playwright remains a host-only Production Smoke
+prerequisite; ordinary development and Candidate Acceptance have zero browser
+cost. Candidate Acceptance runs only for the selected final GitHub `main` SHA
+when preparing an explicitly authorized deployment after PR merge, never during
+development/review, before merge or automatically after merge.
 
 ## Test design and stability
 
@@ -124,7 +139,7 @@ they do not change the scope-specific verification routes above.
 
 ## Four separate gates
 
-The results are independent: Docker development, Candidate Acceptance,
+The results are independent: development verification, Candidate Acceptance,
 Host Readiness, and Production Smoke. Each result applies only to the exact
 SHA named by its gate.
 
@@ -201,11 +216,11 @@ receive any development validation relevant to their own scope.
 ## Merge, live processes, and deployment
 
 The delivery path is isolated branch/worktree from freshly fetched
-`origin/main` → affected-scope development checks → staged independent review
+`origin/main` → focused local development checks → staged independent review
 (including a dated `CHANGELOG.md` entry) → authorized branch push → Draft PR
 → latest CI success → explicit user approval → GitHub merge. Local `main` is
 only a synchronized copy of GitHub `main`, never an integration or repair path.
-When the base advances, fetch/rebase, rerun affected checks and independent
+When the base advances, fetch/rebase, rerun focused checks and independent
 review, and inspect fresh CI; conflicts or behavior changes require a new
 approved plan. Never force-push `main`. A reviewed branch rewrite also requires
 authorized publication; do not discard another worker's commits.

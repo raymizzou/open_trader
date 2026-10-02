@@ -4,13 +4,13 @@ on:
   pull_request:
     branches: [main]
   push:
-    branches: [main]
+    branches: ['**']
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -27,7 +27,7 @@ jobs:
           persist-credentials: false
       - name: Test routing and fail-closed aggregation
         run: python3 -m unittest discover -s tests -p 'test_ci_*.py' -v
-      - name: Route changed paths
+      - name: Plan full backend checks
         id: route
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
@@ -159,7 +159,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Require every selected job to succeed
+      - name: Require all backend services and N-leg coverage
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
