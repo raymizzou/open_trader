@@ -42,6 +42,19 @@ cost of understanding; they supplement, never replace, tests and independent
 review. Keep key principles and runbook links here, with detailed procedures in
 the linked runbooks rather than repeated across instruction files.
 
+## Writing language
+
+For English output, apply [ASD-STE100 writing principles](https://www.asd-ste100.org/about_STE.html):
+short, clear sentences, consistent terms, and explicit actions. Do not claim
+strict ASD-STE100 compliance without checking the full standard and dictionary.
+For Chinese output, use academic-paper rigor: lead with a concise summary,
+define key terms, support conclusions with evidence, and distinguish facts,
+inferences, and uncertainty. Adapt STE's clarity, concision, and consistent
+terminology to Chinese; do not treat its English dictionary as a Chinese standard.
+Use data, comparisons, or figures when they help substantiate the argument.
+Never invent evidence or citations. Match length and structure to the task;
+simple answers do not need a full paper format or unnecessary formality.
+
 ## Verification routing
 
 Local development runs only directly affected or newly added test nodeids, using

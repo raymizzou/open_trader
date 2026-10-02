@@ -9,6 +9,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
   审查/交付绑定精确 SHA 和证据，区分已验证、失败、未运行及未知，并明确待批准动作。
   已批准范围内继续执行，现有授权边界不变；按需可视化不能替代测试或独立审查。
   保留关键原则与 runbook 入口，修正旧 Docker Dev 名称为 Development Verification。
+  英文输出采用 ASD-STE100 写作原则，未经完整标准与词典校验不声称严格合规；
+  中文采用学术论文的严谨性，摘要先行、术语明确、结论有证据，区分事实、推断和不确定性，
+  并参考 STE 的清晰简洁原则；不得编造证据或引用，简单回答无需套用完整论文格式。
   本地核验文档链接、差异范围和空白；完整后台 CI 结果以本 PR 精确 SHA 的记录为准。
 
 - 调整开发与 CI 分工：本地使用已有 Python 环境和当前 worktree 源码，只跑直接受影响
