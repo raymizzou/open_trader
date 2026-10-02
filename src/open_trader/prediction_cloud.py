@@ -40,6 +40,7 @@ class CloudConfig:
     n_leg_paused: int
     credential_backend: str | None = None
     credentials_file: str = ''
+    memory_max_bytes: int = 768 * 1024 * 1024
 
     @property
     def record(self):
@@ -122,6 +123,8 @@ def trusted_layout(c: CloudConfig) -> None:
 
 
 def render_unit(c: CloudConfig) -> str:
+    if type(c.memory_max_bytes) is not int or not 64 * 1024**2 < c.memory_max_bytes <= 1_000_000_000:
+        raise ValueError('cloud memory budget must exceed 64MiB and be at most 1GB')
     for path in (c.release_root, c.runtime_root, c.python):
         if not path.is_absolute() or not re.fullmatch(r'/[A-Za-z0-9_./-]+', str(path)) or '..' in path.parts:
             raise ValueError('absolute paths without whitespace or systemd specifiers required')
@@ -169,6 +172,10 @@ def render_unit(c: CloudConfig) -> str:
             f'Environment=OPEN_TRADER_SSM_VERSION={c.version}\n',
             f'Environment=OPEN_TRADER_SSM_ROLE={c.role}\n',
         ])
+    guarded = c.mode == 'shadow' and c.n_leg_paused == 1
+    resources = (f'Environment=OPEN_TRADER_SHADOW_MEMORY_MAX_BYTES={c.memory_max_bytes}\n'
+                 f'MemoryAccounting=yes\nMemoryMax={c.memory_max_bytes}\n'
+                 'CPUAccounting=yes\nCPUQuota=100%\nTasksAccounting=yes\nTasksMax=96\n') if guarded else ''
     return f'''[Unit]
 Description=OpenTrader Prediction
 After=network-online.target
@@ -190,10 +197,10 @@ Environment=GIT_CONFIG_VALUE_0={c.release_root}
 {credential_env}Environment=OPEN_TRADER_NLEG_PAUSED={c.n_leg_paused}
 Environment=OPEN_TRADER_NLEG_PAUSED={c.n_leg_paused}
 ExecStart={c.python} -m open_trader prediction-service --mode {c.mode} --data-dir {c.runtime_root}/data --config {c.runtime_root}/config/prediction_arbitrage.json --host 127.0.0.1 --port 8769 --release-manifest {c.release_root}/ops/prediction-service-release.json
-Restart=on-failure
+{resources}Restart={'no' if guarded else 'on-failure'}
 RestartSec=30
-TimeoutStopSec=90
-SendSIGKILL=no
+TimeoutStopSec={20 if guarded else 90}
+SendSIGKILL={'yes' if guarded else 'no'}
 KillMode=control-group
 UMask=0077
 LimitCORE=0
@@ -524,6 +531,9 @@ def operate(c: CloudConfig, action: str) -> dict:
         if action == 'start':
             if unit_state()['MainPID'] != '0':
                 return operate(c, 'status')
+            if c.mode == 'shadow' and c.n_leg_paused == 1:
+                from .prediction_shadow_resources import require_host_headroom
+                require_host_headroom(c.memory_max_bytes)
             preflight(c)
             verified_record(c, ('stopped',))
             record(c, 'maintenance')

@@ -1,0 +1,82 @@
+{
+  "baseline_sha": "4fbddaae061e95cbbbb3db4d5793e40e33ec2cae",
+  "steps": [
+    {
+      "step": "initial",
+      "sha256": "9240ccfc9a3ae9a898168c3453c86b19e0695274e39243650835470385eeb6a4",
+      "ranked_conditions": [
+        "condition-M01",
+        "condition-M02",
+        "condition-M03"
+      ],
+      "ranked_yields": [
+        "1.200",
+        "1.200",
+        "0.800"
+      ]
+    },
+    {
+      "step": "yield_drop",
+      "sha256": "5f006eace62ab61b1d87fbdbe3d550ea4442d66d8028c529e8367dee61864448",
+      "ranked_conditions": [
+        "condition-M02",
+        "condition-M03",
+        "condition-M01"
+      ],
+      "ranked_yields": [
+        "1.200",
+        "0.800",
+        "0.500"
+      ]
+    },
+    {
+      "step": "unknown_yield",
+      "sha256": "bc08be76c45f419c8bbf1aceefa408d7f827d5b91464aed5569a1ed70297813d",
+      "ranked_conditions": [
+        "condition-M03",
+        "condition-M01",
+        "condition-M02"
+      ],
+      "ranked_yields": [
+        "0.800",
+        "0.500",
+        null
+      ]
+    },
+    {
+      "step": "book_failure",
+      "sha256": "063e4c53463cd06da9513ad39f0fb8dc2c1ba3702c31c6ced02436dd9fa459d5",
+      "ranked_conditions": [
+        "condition-M03",
+        "condition-M01",
+        "condition-M02"
+      ],
+      "ranked_yields": [
+        "0.800",
+        "0.500",
+        null
+      ]
+    },
+    {
+      "step": "expiry",
+      "sha256": "4170ac2076e948747639a935146e17e6b58353c048e45cc9fcf37688dfbee8b1",
+      "ranked_conditions": [],
+      "ranked_yields": []
+    },
+    {
+      "step": "reentry",
+      "sha256": "91ef6a49dbace37b8e9554ba909dd282aef06bc6556028dfaf307498f830e9a4",
+      "ranked_conditions": [
+        "condition-M02",
+        "condition-M03",
+        "condition-M01"
+      ],
+      "ranked_yields": [
+        "1.200",
+        "0.800",
+        "0.500"
+      ]
+    }
+  ],
+  "backfill_sha256": "d3c321aa804e7f347419152498ef729baca0cbb78040ce52c9a82586356ef304"
+}

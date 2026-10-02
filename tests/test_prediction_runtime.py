@@ -2938,6 +2938,9 @@ def test_lp_observations_refresh_without_dashboard_and_stop_with_runtime(
         def reconcile_startup(self) -> dict[str, object]:
             return {"state": "ready"}
 
+        def lp_auto_scheduled_check(self) -> dict[str, object]:
+            return {"state": "disabled"}
+
         def refresh_lp_observations(
             self, *, stop_event: threading.Event | None = None
         ) -> dict[str, object]:
@@ -3059,6 +3062,8 @@ def test_lp_observations_refresh_without_dashboard_and_stop_with_runtime(
             self.order_writes = 0
             self.cancellations = 0
             self.close_called = threading.Event()
+            self.monitor_ticks = 0
+            self.monitor_cycles_finished = threading.Event()
             self.active_reads = 0
             self._lock = threading.Lock()
 
@@ -3136,7 +3141,7 @@ def test_lp_observations_refresh_without_dashboard_and_stop_with_runtime(
                     "positions": [],
                     "raw_trades": (),
                     "balance_complete": True,
-                        "open_orders_complete": True,
+                    "open_orders_complete": True,
                     "positions_complete": True,
                     "trades_complete": True,
                     "pagination_complete": True,
@@ -3148,11 +3153,35 @@ def test_lp_observations_refresh_without_dashboard_and_stop_with_runtime(
             finally:
                 isolation_probe.read_finished()
 
+        def lp_snapshot(self, request: Mapping[str, object]) -> dict[str, object]:
+            # The real protection monitor needs the same complete facts as
+            # the observation lane; a missing reader models a data outage.
+            assert request["token_id"] == isolation_order["token_id"]
+            account = self.lp_account_snapshot()
+            return {
+                "account": account,
+                "market": {
+                    **{key: isolation_order[key] for key in (
+                        "market_id", "condition_id", "token_id", "outcome"
+                    )},
+                    "accepting_orders": True,
+                    "minimum_order_size": Decimal("1"),
+                    "tick_size": Decimal("0.01"),
+                    "fees_enabled": False,
+                    "fee": Decimal("0"),
+                    "taker_fee_rate": Decimal("0"),
+                },
+                "book": self.lp_order_books(("yes-token",))["yes-token"],
+                "orders": account["open_orders"],
+                "trades": [],
+            }
+
         def get_order_scoring(self, _order_id: str) -> bool:
             return True
 
         def lp_reward_snapshot(
-            self, reward_date: str, condition_id: str
+            self, reward_date: str, condition_id: str,
+            *, stop_event: threading.Event | None = None,
         ) -> dict[str, object]:
             return {
                 "state": "known",
@@ -3194,8 +3223,9 @@ def test_lp_observations_refresh_without_dashboard_and_stop_with_runtime(
                     "token_id": token,
                     "received_at": checked_at,
                     "bids": [
-                        {"price": Decimal("0.51"), "size": Decimal("20")},
-                        {"price": Decimal("0.50"), "size": Decimal("100")},
+                        # 200 external shares keep the queue ratio above 50%;
+                        # removing this best level still gives 12% stress loss.
+                        {"price": Decimal("0.50"), "size": Decimal("300")},
                         {"price": Decimal("0.44"), "size": Decimal("1000")},
                     ],
                     "asks": [],
@@ -3269,8 +3299,19 @@ def test_lp_observations_refresh_without_dashboard_and_stop_with_runtime(
             ),
         )
     )
+
+    class IsolationExecution(PredictionExecutionService):
+        def lp_tick(self) -> dict[str, object]:
+            had_session = bool(self._store.lp_active_sessions())
+            result = super().lp_tick()
+            if had_session:
+                isolation_probe.monitor_ticks += 1
+                if isolation_probe.monitor_ticks >= 12:
+                    isolation_probe.monitor_cycles_finished.set()
+            return result
+
     monkeypatch.setattr(runtime_module, "PolymarketLPService", RealLPService)
-    monkeypatch.setattr(runtime_module, "PredictionExecutionService", PredictionExecutionService)
+    monkeypatch.setattr(runtime_module, "PredictionExecutionService", IsolationExecution)
     monkeypatch.setattr(
         runtime_module,
         "PolymarketTradingClient",
@@ -3306,6 +3347,11 @@ def test_lp_observations_refresh_without_dashboard_and_stop_with_runtime(
                 isolation_probe.observation_cycle.clear()
         assert len(checked_at_values) >= 2
         assert isolation_probe.notification_sent.wait(timeout=2)
+        # Cover repeated protection ticks, not a race against the first tick.
+        assert isolation_probe.monitor_cycles_finished.wait(timeout=2)
+        sessions = isolated.store.lp_active_sessions()  # type: ignore[union-attr]
+        assert len(sessions) == 1
+        assert sessions[0]["queue_protection"]["data_failures"] == 0
         observations = isolated.store.lp_observations(account_id)  # type: ignore[union-attr]
         observation = observations["condition-1"]
         assert Decimal(str(observation["occupied_capital_usd"])) == Decimal("50")
