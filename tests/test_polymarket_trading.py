@@ -1117,6 +1117,60 @@ def test_lp_catalog_reads_all_reward_pages_without_double_counting() -> None:
     assert incomplete["error_type"] == "RuntimeError"
 
 
+def test_lp_catalog_releases_sdk_rows_while_reading_all_pages() -> None:
+    """The public read must not hold earlier SDK pages until conversion ends."""
+    import weakref
+
+    live = weakref.WeakSet()
+    observed_live: list[int] = []
+
+    class Reward:
+        def __init__(self, index):
+            self.index = index
+            live.add(self)
+
+        def model_dump(self, **kwargs):
+            return {
+                "condition_id": f"condition-{self.index}",
+                "rewards_config": [{
+                    "id": self.index,
+                    "asset_address": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+                    "start_date": "2024-03-01", "end_date": "2500-12-31",
+                    "rate_per_day": "1",
+                }],
+            }
+
+    class Pages:
+        def iter_items(self):
+            for index in range(40):
+                observed_live.append(len(live))
+                yield Reward(index)
+
+    class Public:
+        closed = False
+
+        def list_current_rewards(self, *, sponsored):
+            return () if sponsored else Pages()
+
+        def close(self):
+            self.closed = True
+
+    public = Public()
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET), client=FakeClient(),
+        public_client_factory=lambda: public,
+    )
+    result = adapter.lp_reward_catalog()
+
+    assert result["state"] == "known" and result["complete"] is True
+    assert [row["condition_id"] for row in result["markets"]] == [
+        f"condition-{index}" for index in range(40)
+    ]
+    assert result["daily_pool_usd"] == Decimal("40")
+    assert public.closed and not live
+    assert max(observed_live) <= 2
+
+
 def test_lp_selected_reward_facts_preserve_identity_time_and_failures() -> None:
     native_asset = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
     sponsored_asset = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
@@ -5838,6 +5892,38 @@ def test_lp_metadata_cache_hit_within_ttl(
         len(probe.get_event_calls),
         len(probe.clients),
     ) == before
+
+
+class _TrackedLPMetadata(dict):
+    """Weak-referenceable, otherwise ordinary metadata for lifetime probes."""
+
+
+def test_lp_metadata_cache_releases_objects_without_losing_cached_facts(monkeypatch):
+    import gc
+    import weakref
+    from copy import deepcopy
+
+    probe = _LpMetadataProbe()
+    condition = "0x" + "a" * 64
+    probe.market_rows[condition] = _lp_cache_market(condition, slug="release")
+    _lp_cache_clock(monkeypatch, datetime(2026, 9, 17, 12, tzinfo=UTC))
+    adapter = _lp_cache_adapter(probe)
+    fetch = adapter._fetch_lp_market_metadata
+    references = []
+
+    def observe(*args, **kwargs):
+        markets, failures, absent = fetch(*args, **kwargs)
+        tracked = {key: _TrackedLPMetadata(row) for key, row in markets.items()}
+        references.extend(weakref.ref(row) for row in tracked.values())
+        return tracked, failures, absent
+
+    monkeypatch.setattr(adapter, "_fetch_lp_market_metadata", observe)
+    expected = deepcopy(adapter.lp_market_metadata((condition,)))
+    calls = len(probe.market_queries)
+    gc.collect()
+    assert references and all(ref() is None for ref in references)
+    assert adapter.lp_market_metadata((condition,)) == expected
+    assert len(probe.market_queries) == calls
 
 
 def test_expire_lp_metadata_cache_forces_refetch(

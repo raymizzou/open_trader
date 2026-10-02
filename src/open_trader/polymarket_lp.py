@@ -15,6 +15,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_c
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, cast
+from types import MappingProxyType
 from zoneinfo import ZoneInfo
 
 from .polymarket_lp_risk import (
@@ -39,6 +40,7 @@ from .polymarket_lp_risk import (
     first_observation_baseline,
 )
 from .polymarket_lp_errors import LpObservationWait
+from .polymarket_lp_scratch import LPReadRows, LPReadScratch
 from .prediction_arbitrage_store import (
     LP_RESERVED_MANUAL_SESSION_ID,
     PredictionArbitrageStore,
@@ -946,7 +948,7 @@ class PolymarketLPService:
     ) -> None:
         raw_markets = catalog.get("markets")
         if (
-            isinstance(raw_markets, (list, tuple))
+            isinstance(raw_markets, (list, tuple, LPReadRows))
             and not raw_markets
             and not (
                 catalog.get("state") == "known"
@@ -954,11 +956,19 @@ class PolymarketLPService:
             )
         ):
             return
-        # Copy and encode before taking the publication lock.  A large catalog
-        # must never make candidate readers wait for the network-sized copy.
+        # Private copies preserve the exact generation and receipt stamps, but
+        # do not keep the whole universe's detailed Python objects resident.
+        # Encode before the publication lock so readers never wait on disk I/O.
         prepared = {
-            "catalog": deepcopy(dict(catalog)),
-            "metadata": deepcopy(dict(metadata)),
+            "catalog": MappingProxyType({
+                **deepcopy({key: value for key, value in catalog.items() if key != "markets"}),
+                "markets": deepcopy(raw_markets) if isinstance(raw_markets, LPReadRows)
+                else LPReadRows(row for row in (raw_markets or ()) if isinstance(row, Mapping)),
+            }),
+            "metadata": MappingProxyType(
+                deepcopy(metadata) if isinstance(metadata, LPReadScratch)
+                else LPReadScratch(metadata)
+            ),
             "state": state,
         }
         with self._candidate_state_lock:
@@ -971,7 +981,9 @@ class PolymarketLPService:
     def _prepared_input_snapshot(self) -> dict[str, object] | None:
         with self._candidate_state_lock:
             prepared = self._prepared_inputs
-        return deepcopy(prepared) if isinstance(prepared, Mapping) else None
+        # Published maps are read-only and each lookup decodes a private value.
+        # Holding these references also keeps an old generation alive for a reader.
+        return dict(prepared) if isinstance(prepared, Mapping) else None
 
     def _preparation_priority_order(
         self, condition_ids: Sequence[str]
@@ -2702,13 +2714,15 @@ class PolymarketLPService:
                     if value is not None:
                         catalog_error_details[field] = value
                 raw_markets = catalog.get("markets")
-                if not isinstance(raw_markets, (list, tuple)):
+                if not isinstance(raw_markets, (list, tuple, LPReadRows)):
                     catalog_failure_error = catalog_error_details
                     raise ValueError("history_catalog_unknown")
                 if catalog.get("state") != "known":
                     catalog_failure_error = catalog_error_details
                     raise ValueError("history_catalog_unknown")
-                market_rows = [row for row in raw_markets if isinstance(row, Mapping)]
+                market_rows = LPReadRows(row for row in raw_markets if isinstance(row, Mapping))
+                catalog = {**catalog, "markets": market_rows}
+                del raw_markets
                 if catalog.get("complete") is not True:
                     if not market_rows:
                         catalog_failure_error = catalog_error_details
@@ -2819,7 +2833,7 @@ class PolymarketLPService:
             metadata_failure_facts: dict[str, Mapping[str, object]] = {}
             successful_metadata_retry_conditions: set[str] = set()
             if callable(metadata_batch_reader):
-                metadata_by_condition: dict[str, object] = {}
+                metadata_by_condition: MutableMapping[str, object] = LPReadScratch()
                 self._save_preparation(
                     {
                         "stage": "metadata",
@@ -3055,6 +3069,8 @@ class PolymarketLPService:
                     display_state="unknown",
                     alert_pending=failed.get("alert_claimed_now") is True,
                 )
+            if not isinstance(metadata_value, LPReadScratch):
+                metadata_value = LPReadScratch(metadata_value)
             metadata_retry_completion_candidates = set(claimed_condition_ids)
             metadata_retry_completion_candidates.update(
                 condition_id
@@ -3650,11 +3666,13 @@ class PolymarketLPService:
                     }
 
                 retry_identities: list[tuple[str, str]] = []
-                updated_metadata = dict(metadata_value)
+                updated_metadata = deepcopy(metadata_value)
+                requested_conditions = set(requested)
                 reward_by_condition = {
                     str(row.get("condition_id") or ""): row
                     for row in market_rows
                     if isinstance(row, Mapping)
+                    and str(row.get("condition_id") or "") in requested_conditions
                 }
                 for condition_id in requested:
                     failure = failed_ids.get(condition_id)
@@ -4399,16 +4417,12 @@ class PolymarketLPService:
         raw_markets = (
             catalog.get("markets") if isinstance(catalog, Mapping) else None
         )
-        if not isinstance(raw_markets, (list, tuple)):
+        if not isinstance(raw_markets, (list, tuple, LPReadRows)):
             return None
-        market_rows = [dict(row) for row in raw_markets if isinstance(row, Mapping)]
+        market_rows = raw_markets
         if not isinstance(metadata_value, Mapping):
             return None
-        metadata_by_condition = {
-            str(key): value
-            for key, value in metadata_value.items()
-            if isinstance(key, str) and isinstance(value, Mapping)
-        }
+        metadata_by_condition = metadata_value
         catalog_reader = getattr(self.exchange, "lp_reward_catalog", None)
         account_reader = getattr(
             self.exchange, "lp_account_snapshot_shared", None
@@ -4427,7 +4441,7 @@ class PolymarketLPService:
         missing_metadata_condition_ids = tuple(
             condition_id
             for condition_id in condition_ids
-            if condition_id not in metadata_by_condition
+            if not isinstance(metadata_by_condition.get(condition_id), Mapping)
         )
         account: Mapping[str, object] | None = None
         if market_rows:
@@ -4459,7 +4473,8 @@ class PolymarketLPService:
             if isinstance(saved_confirmations, Mapping)
             else {}
         )
-        direction_facts: list[dict[str, object]] = []
+        direction_facts = LPReadScratch()
+        direction_index = 0
         complete = (
             isinstance(catalog, Mapping)
             and catalog.get("state") == "known"
@@ -4492,11 +4507,11 @@ class PolymarketLPService:
                 batch_value = {}
             if isinstance(batch_value, Mapping):
                 cached_summaries = batch_value
-        reward_market_by_condition: dict[str, Mapping[str, object]] = {}
+        reward_market_by_condition = LPReadScratch()
         for reward_market in market_rows:
             condition_id = str(reward_market.get("condition_id") or "").strip()
             market_meta = metadata_by_condition.get(condition_id)
-            if market_meta is None:
+            if not isinstance(market_meta, Mapping):
                 complete = False
                 continue
             raw_outcomes = market_meta.get("outcomes")
@@ -4535,20 +4550,19 @@ class PolymarketLPService:
                         cached = None
                     if isinstance(cached, Mapping):
                         summary = cached
-                direction_facts.append(
-                    _lp_direction_fact(
-                        market_meta,
-                        reward_market,
-                        condition_id=condition_id,
-                        token_id=token_id,
-                        outcome=str(raw_outcome.get("label") or outcome_key).upper(),
-                        reward_checked_at=catalog.get("checked_at"),
-                        reward_guidance_deadline=reward_deadline,
-                        event_end_confirmation=confirmation,
-                        history_summary=summary,
-                        account=account,
-                    )
+                direction_facts[str(direction_index)] = _lp_direction_fact(
+                    market_meta,
+                    reward_market,
+                    condition_id=condition_id,
+                    token_id=token_id,
+                    outcome=str(raw_outcome.get("label") or outcome_key).upper(),
+                    reward_checked_at=catalog.get("checked_at"),
+                    reward_guidance_deadline=reward_deadline,
+                    event_end_confirmation=confirmation,
+                    history_summary=summary,
+                    account=account,
                 )
+                direction_index += 1
 
         from .polymarket_lp_views import lp_trial_candidates
 
@@ -4569,7 +4583,7 @@ class PolymarketLPService:
                         adjusted_balance, adjusted_allowance
                     )
         trial = lp_trial_candidates(
-            direction_facts,
+            direction_facts.values(),
             competition=self._competition_entries(),
             account_budget_facts=available_facts,
             now=checked_at,
@@ -4587,15 +4601,16 @@ class PolymarketLPService:
             for row in (trial.get("queue_backup") or ())
             if isinstance(row, Mapping)
         ]
+        queue_condition_ids = {str(row.get("condition_id") or "") for row in (*queue_normal, *queue_backup)}
         directions_by_condition: dict[str, list[Mapping[str, object]]] = {}
-        for direction in direction_facts:
+        for direction in direction_facts.values():
             if not isinstance(direction, Mapping):
                 continue
             market = direction.get("market")
             if not isinstance(market, Mapping):
                 continue
             direction_condition = str(market.get("condition_id") or "").strip()
-            if direction_condition:
+            if direction_condition in queue_condition_ids:
                 directions_by_condition.setdefault(
                     direction_condition, []
                 ).append(direction)
@@ -4640,9 +4655,15 @@ class PolymarketLPService:
             "reservation_signature": reservation_signature,
             "queue_normal": queue_normal,
             "queue_backup": queue_backup,
-            "directions_by_condition": directions_by_condition,
-            "metadata_by_condition": metadata_by_condition,
-            "reward_market_by_condition": reward_market_by_condition,
+            "directions_by_condition": {
+                cid: directions_by_condition[cid] for cid in queue_condition_ids
+            },
+            "metadata_by_condition": {
+                cid: metadata_by_condition[cid] for cid in queue_condition_ids
+            },
+            "reward_market_by_condition": {
+                cid: reward_market_by_condition[cid] for cid in queue_condition_ids
+            },
             "catalog_checked_at": catalog.get("checked_at"),
             "catalog_is_known": (
                 isinstance(catalog, Mapping)

@@ -1629,12 +1629,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--notifier-config", type=Path)
     args = parser.parse_args(argv)
     _configure_entry_logging()
-    return serve_prediction_service(
-        data_dir=args.data_dir,
-        prediction_config_path=args.config,
-        host=args.host,
-        port=args.port,
-        mode=args.mode,
-        release_manifest_path=args.release_manifest,
-        notifier_config_path=args.notifier_config,
-    )
+    from .prediction_shadow_resources import shadow_resource_guard
+    with shadow_resource_guard(args.mode):
+        return serve_prediction_service(
+            data_dir=args.data_dir,
+            prediction_config_path=args.config,
+            host=args.host,
+            port=args.port,
+            mode=args.mode,
+            release_manifest_path=args.release_manifest,
+            notifier_config_path=args.notifier_config,
+        )

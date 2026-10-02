@@ -398,6 +398,77 @@ workflow. Air Prediction and its runtime/owner remain running. No page switch,
 writer failover, balance alignment, order overlay or missing-history marker is
 introduced; selected cloud content is displayed as returned.
 
+## #226: bounded Shadow startup before the 24-hour run
+
+The agreed capacity target is the current complete market universe, with Air
+remaining the trading owner and cloud N-leg paused. The entire cloud Prediction
+cgroup, including children and charged file cache, must stay within **1 GB
+(1,000,000,000 bytes)**, including startup and refresh peaks. This is a target
+requiring live evidence, not a claim that the release already meets it. Do not
+truncate discovery, candidates or backup queues to meet the budget.
+
+Paused Shadow units now set `MemoryAccounting=yes`, `CPUQuota=100%` (one core),
+`TasksMax=96` and `Restart=no`. The default `MemoryMax` is 768 MiB; the optional
+non-secret cloud config field `memory_max_bytes` can lower it or raise it up to
+1 GB. Before `start`, the helper requires at least that budget plus 350 MiB of
+host `MemAvailable` and no used swap. A protected startup independently checks
+the effective kernel memory, CPU and PID limits before starting the runtime.
+Missing/contradictory resource evidence blocks startup. These settings apply to
+paused Shadow only; existing production ownership and restart policy remain.
+
+The guard checks cgroup usage and host availability each second. At 64 MiB below
+the actual cgroup ceiling, below 350 MiB host availability, used swap, a kernel
+memory-limit event or unreadable resource evidence, it logs only resource
+counters and a fixed reason, then sends SIGTERM to its own process. An
+unresponsive process receives SIGKILL after 20 seconds. There is no automatic
+retry loop. Inspect `shadow_resource_guard_verified` / `shadow_resource_guard_stop`
+in the unit journal; after confirming the listener and runtime lock are absent,
+the existing `stop` command can record the stopped state. Keep the runtime and
+failure evidence. This never signals Air or another CVM service.
+
+The 2026-10-01 read-only observation found 1,182,699,520 bytes available, zero
+swap, an inactive Prediction service and no installed resource caps. This is
+not future capacity evidence. A first profile of `memory_max_bytes: 738197504`
+(704 MiB) leaves more host margin than the default, but must pass a new headroom
+check. Install the exact reviewed unit through the normal authorized workflow;
+changing repository code alone does not protect an already installed unit.
+
+Validation is deliberately staged:
+
+1. On the accepted, authorized release, record SHA, mode, PID/cgroup, actual
+   limits, host availability, swap, peak/current cgroup usage and source counts.
+   Complete first full catalog/metadata/history preparation and a complete
+   candidate traversal, followed by continuing fresh account/display updates.
+   Check actual traversal progress: `candidate_pending_count=0` alone only
+   proves no never-tried queue members remain, not that a warm queue was fully
+   refreshed this round. HTTP 200, a first batch or a guard-enforced restart is
+   not startup acceptance. Resource protection, incomplete inputs or missing
+   identity evidence ends this attempt as failed/UNKNOWN; fix before retrying.
+2. Only after startup acceptance, observe at least 24 hours, including the
+   12-hour metadata refresh and subsequent complete processing. Require no
+   OOM/restart/swap pressure, continued host/management availability and unchanged
+   freshness/completeness requirements. Keep the guard active throughout.
+
+LP scratch copies use private temporary SQLite databases with a bounded page
+cache. They preserve Python value types and receipt times, and disappear on
+connection/process close. They do not replace or prune durable history, audit,
+orders or recovery facts. Published inputs are immutable; an old reader retains
+its own generation. Queue detail is retained for the full normal and backup
+queues, with other complete input facts reloadable for later reevaluation.
+SQLite documents the [temporary-database lifetime and spill behavior](https://www.sqlite.org/inmemorydb.html#temporary_databases).
+Disk I/O, file-cache charges and refresh latency must be included in live
+measurement; lower Python allocation or RSS alone is insufficient.
+
+Offline verification uses the frozen six-step business trace from baseline
+`4fbddaae061e95cbbbb3db4d5793e40e33ec2cae`, object-lifetime checks, existing
+ranking/backfill/recovery tests, and `tests/lp_memory_replay.py` for serial
+old/new Docker measurements. The synthetic replay explicitly reports its
+market and retained counts; it is not a live-data capacity certificate.
+Measured results and failed attempts are recorded in the
+[#226 validation report](issue-226-memory-validation.md).
+Candidate Acceptance, cloud Host Readiness, Smoke and explicit deployment
+authorization still apply; no probe bypasses those gates.
+
 ## Two-host gates
 
 Use these additional targets for this topology, retaining the ordinary macOS

@@ -3318,6 +3318,12 @@ class PredictionArbitrageStore:
         expiry stamp; a ``None`` payload marks a confirmed-missing row.
         """
 
+        return dict(self.lp_metadata_cache_items(now=now))
+
+    def lp_metadata_cache_items(
+        self, *, now: datetime | None = None,
+    ) -> Iterator[tuple[str, tuple[float, dict[str, object] | None]]]:
+        """Stream warm-cache rows without materializing the entire universe."""
         self._ensure_lp_metadata_cache_schema()
         horizon = self._lp_metadata_cache_horizon(now)
         with self._read_connection() as connection:
@@ -3328,21 +3334,19 @@ class PredictionArbitrageStore:
                 WHERE expires_at > ?
                 """,
                 (horizon,),
-            ).fetchall()
-        result: dict[str, tuple[float, dict[str, object] | None]] = {}
-        for row in rows:
-            condition_id = str(row["condition_id"])
-            expires_at = float(row["expires_at"])
-            try:
-                payload = _load_payload(str(row["payload"]))
-            except ValueError:
-                continue
-            if not int(row["present"]):
-                if payload.get("closed_checked") is True:
-                    result[condition_id] = (expires_at, None)
-                continue
-            result[condition_id] = (expires_at, payload)
-        return result
+            )
+            for row in rows:
+                condition_id = str(row["condition_id"])
+                expires_at = float(row["expires_at"])
+                try:
+                    payload = _load_payload(str(row["payload"]))
+                except ValueError:
+                    continue
+                if not int(row["present"]):
+                    if payload.get("closed_checked") is True:
+                        yield condition_id, (expires_at, None)
+                    continue
+                yield condition_id, (expires_at, payload)
 
     def lp_metadata_cache_store_entries(
         self,

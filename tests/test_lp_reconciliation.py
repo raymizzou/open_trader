@@ -4,7 +4,7 @@ import pytest
 
 from decimal import Decimal
 from concurrent.futures import ThreadPoolExecutor
-from threading import Event, Thread
+from threading import Event, Thread, get_ident
 
 from tests.test_lp_auto_pool import setup
 
@@ -1433,9 +1433,13 @@ def test_market_read_capacity_remains_fail_fast_for_shared_snapshot_callers(tmp_
         with pytest.raises(ValueError, match='market_read_capacity'):
             with _lp_read_stage('facts_read'):
                 lp._read_snapshot(dict(condition_id='m02', token_id='m02'))
-        assert 'lp_read_wait stage=facts_read' in caplog.text
-        assert 'reason=market_read_capacity' in caplog.text
-        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        # This synchronous capacity refusal owns the caller's records. Other
+        # reconciliation publishers can legitimately log their own failures.
+        records = [r for r in caplog.records if r.thread == get_ident()]
+        messages = '\n'.join(r.getMessage() for r in records)
+        assert 'lp_read_wait stage=facts_read' in messages
+        assert 'reason=market_read_capacity' in messages
+        assert not [r for r in records if r.levelno >= logging.WARNING]
     finally:
         lp._facts_owner.session_id = None
         release.set()
