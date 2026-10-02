@@ -10,7 +10,7 @@ and configuration-only tasks may use the stated exemption.
 
 On the first repository action of each session, silently verify the repository
 root, current worktree, branch, HEAD SHA, and working-tree status. Treat the
-Development Verification, Candidate Acceptance, Host Readiness, Production Smoke,
+Development Verification, Deployment Preflight, Host Readiness, Production Smoke,
 merge, push, and deployment boundaries in the linked runbook as standing rules.
 Do not ask the user to restate or confirm them.
 
@@ -77,15 +77,17 @@ trend-only, and missing-diff cases have the same full backend coverage, excludin
 `pressure` and `browser`. Push-head and PR-merge runs intentionally test distinct
 SHA identities. Before authorized publication, complete focused local checks
 and independent review; inspect exact-SHA CI before requesting merge approval.
-Candidate Acceptance runs only for the final GitHub `main` SHA selected for an
-explicitly authorized deployment, after GitHub PR merge. Do not run it during
-development, review, before merge, or automatically after merge. It is not a PR
-merge gate. If a deployment candidate fails, audit every reported failure and
-its downstream dependencies, batch the in-scope repairs on an isolated branch,
-then repeat focused checks, review, Draft PR, CI, and authorized GitHub merge
-before rerunning Candidate Acceptance for the new final deployment SHA.
-Exact-SHA evidence, rebase, exception, and deployment rules still apply as
-described in the runbook.
+Deployment Preflight runs only for a selected final GitHub `main` SHA during an
+explicitly authorized deployment. It reuses trusted exact-SHA main-push CI and
+checks immutable source/lock/runtime identity; it never reruns backend tests.
+CI also runs the non-LIVE portable prediction scenarios and proves backend
+collection coverage. `candidate-acceptance` and `acceptance` are compatibility
+aliases for this lightweight check, not another test stage. Use the supported
+forward wrapper in [deployment-preflight.md](docs/operations/deployment-preflight.md),
+with fresh Host Readiness before installation and Production Smoke afterward.
+Missing or mismatched evidence blocks deployment; no automatic full-test retry.
+Existing authorized compatible rollback procedures remain separate.
+Exact-SHA evidence, rebase, exception, and deployment rules still apply.
 
 ## Test design and stability
 
@@ -131,7 +133,7 @@ documented settings are not evidence that protection is enabled.
 Branch push, Draft PR, GitHub merge, release/tag creation, and deployment are
 separate actions requiring their applicable explicit authorization. A merged PR
 does not release or deploy. Neither PR-head checks nor GitHub's synthetic PR
-merge SHA substitute for Candidate evidence on the final GitHub `main` SHA.
+merge SHA substitute for trusted main-push CI evidence on the selected final GitHub `main` SHA.
 
 Screenshots are optional unless requested. Clean up only after GitHub merge,
 user confirmation, and a clean worktree; never delete a dirty worktree.

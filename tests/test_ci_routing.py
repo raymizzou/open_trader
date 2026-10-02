@@ -30,13 +30,13 @@ class RoutingTests(unittest.TestCase):
                      'tests/test_new_family.py', 'unknown\nfile.txt']:
             with self.subTest(path=path):
                 plan = ci.route([path])
-                self.assertEqual(plan['scopes'], list(ci.SCOPES[:4]))
+                self.assertEqual(plan['scopes'], list(ci.REQUIRED_SCOPES))
                 self.assertEqual(plan['test_n_leg'], '1')
                 self.assertNotIn('exemption', plan['reason'])
 
     def test_empty_and_mixed_paths_cannot_reduce_coverage(self):
         full = ci.route([])
-        self.assertEqual(full['scopes'], list(ci.SCOPES[:4]))
+        self.assertEqual(full['scopes'], list(ci.REQUIRED_SCOPES))
         self.assertEqual(full['test_n_leg'], '1')
         for paths in [['README.md'], ['tests/test_account_api.py',
                       'src/open_trader/frontend_gateway.py', 'README.md']]:
@@ -118,7 +118,7 @@ class RoutingTests(unittest.TestCase):
                                          cwd=tmp, env=env, text=True, capture_output=True)
                     self.assertEqual(run.returncode, 0, run.stderr)
                     plan = json.loads(run.stdout)
-                    self.assertEqual(plan['scopes'], list(ci.SCOPES[:4]))
+                    self.assertEqual(plan['scopes'], list(ci.REQUIRED_SCOPES))
                     self.assertEqual(plan['test_n_leg'], '1')
                     self.assertEqual(plan['sha'], head)
                     self.assertEqual(plan['base_sha'], before)
@@ -148,7 +148,7 @@ class RequiredTests(unittest.TestCase):
         self.assertIn('all backend', reason)
 
     def test_failure_cancellation_skip_missing_fail_closed(self):
-        for scope in ci.SCOPES[:4]:
+        for scope in ci.REQUIRED_SCOPES:
             for result in ['failure', 'cancelled', 'skipped', '', None]:
                 needs = self.needs(['README.md'])
                 needs[scope]['result'] = result
@@ -167,6 +167,7 @@ class RequiredTests(unittest.TestCase):
     def test_partial_paused_duplicate_and_exempt_plans_fail_closed(self):
         for changes in [{'scopes': []}, {'scopes': ['account']},
                         {'scopes': list(ci.SCOPES)},
+                        {'scopes': list(ci.BACKEND_SCOPES)},
                         {'scopes': ['gateway', 'legacy', 'account', 'account']},
                         {'test_n_leg': '0'}, {'test_n_leg': 1}, {'reason': ''}]:
             needs = self.needs(['README.md'])

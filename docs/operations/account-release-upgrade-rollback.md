@@ -3,9 +3,12 @@
 This is the #24 operator procedure. It treats Account Sync Worker and Account
 API as one Account release and proves the module can be upgraded and rolled
 back without restarting Gateway, Legacy Dashboard, Trend controllers,
-Research, or Prediction processes. Only the final `make acceptance` result
-from the committed candidate can be `PASS`; this procedure is the operational
-proof that feeds it.
+Research, or Prediction processes. Forward upgrades use the
+[source-release wrapper](deployment-preflight.md) with the `account` kind after
+fresh Host Readiness; Production Smoke remains mandatory afterward.
+`make acceptance` is now a lightweight trusted-CI/identity preflight, not a
+full test rerun or operational health verdict. Existing authorized rollback
+procedures below retain their compatible-release checks.
 
 ## Fixed topology
 
@@ -60,7 +63,7 @@ git -C "$RELEASE_ROOT" status --short
 git -C "$RELEASE_ROOT" rev-parse HEAD
 test -x "$OPEN_TRADER_PYTHON"
 PYTHONPATH="$RELEASE_ROOT:$RELEASE_ROOT/src" \
-  "$OPEN_TRADER_PYTHON" -c 'import open_trader'
+  "$OPEN_TRADER_PYTHON" -B -c 'import open_trader'
 ```
 
 Stop if the release checkout is dirty, the SHA cannot be resolved, or the
@@ -76,10 +79,11 @@ that API and Worker publish the same Git SHA.
 ```bash
 "$RELEASE_ROOT/scripts/install_account_release.sh" --dry-run \
   --repo-root "$RELEASE_ROOT" --runtime-root "$RUNTIME_ROOT"
-"$RELEASE_ROOT/scripts/install_account_release.sh" \
-  --repo-root "$RELEASE_ROOT" --runtime-root "$RUNTIME_ROOT" \
+"$OPEN_TRADER_PYTHON" -B "$RELEASE_ROOT/scripts/deploy_release.py" \
+  --expected-sha "$(git -C "$RELEASE_ROOT" rev-parse HEAD)" \
+  --release-root "$RELEASE_ROOT" --runtime-root "$RUNTIME_ROOT" \
   --python "$OPEN_TRADER_PYTHON" \
-  --evidence-out "$RUNTIME_ROOT/logs/account_release/upgrade.json"
+  account --evidence-out "$RUNTIME_ROOT/logs/account_release/upgrade.json"
 ```
 
 After the install, prove the other modules were not part of the release:
@@ -131,7 +135,7 @@ job is gone and its lock is free.
 
 ## Acceptance gate
 
-`make acceptance` validates process identity, frozen-artifact contracts, and
+Production Smoke and this operational drill validate process identity, frozen-artifact contracts, and
 truthful display of whatever state exists. It never requires today's report,
 an allocation terminal state, or a controller first success; those are
 deterministic pytest concerns and daily operator monitoring, not gate inputs.

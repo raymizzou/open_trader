@@ -8,6 +8,8 @@
   <string>OPEN_TRADER_REPO</string>
   <key>EnvironmentVariables</key>
   <dict>
+    <key>PYTHONDONTWRITEBYTECODE</key>
+    <string>1</string>
     <key>PYTHONPATH</key>
     <string>OPEN_TRADER_REPO/src</string>
   </dict>

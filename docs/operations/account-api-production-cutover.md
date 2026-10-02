@@ -3,14 +3,17 @@
 This is the #23 operator procedure. It moves active Account consumers to the
 read-only Account HTTP contract, leaves Legacy responsible only for non-Account
 module data, and disables the unused Premarket/T-signal entrypoints. It is not
-an acceptance claim: only the final `make acceptance` result from the committed
-candidate can be `PASS`.
+an acceptance claim. Forward installation uses the
+[source-release wrapper](deployment-preflight.md) after fresh Host Readiness;
+Production Smoke verifies the installed release. `make acceptance` is now the
+lightweight trusted-CI/identity preflight, not a backend rerun.
 
 ## Candidate and preflight
 
 Deploy one clean detached checkout. Account API and Account Sync Worker are a
-matched pair at that SHA; Gateway, Legacy Dashboard and active Trend controllers
-then use the same SHA. Do not combine #23 consumers with the older #22 Account
+matched pair at that SHA; Gateway and Legacy Dashboard then use the same SHA.
+Keep active Trend controller identities unchanged in this forward path. Moving
+them to this SHA applies only to the separately authorized historical migration. Do not combine #23 consumers with the older #22 Account
 release, and do not add a raw-read or dual-read fallback.
 
 ```bash
@@ -19,7 +22,11 @@ CUTOVER_SHA="$(git -C "$CANDIDATE_WORKTREE" rev-parse HEAD)"
 git -C "$CANDIDATE_WORKTREE" status --short
 git worktree add --detach /absolute/path/to/open-trader-r4 "$CUTOVER_SHA"
 export CUTOVER_ROOT=/absolute/path/to/open-trader-r4
-export OPEN_TRADER_PYTHON="${OPEN_TRADER_PYTHON:-$(command -v python3)}"
+# Existing isolated Python 3.12 release environment; command -v python3 alone
+# does not establish the required lock-consistent virtual environment.
+export OPEN_TRADER_PYTHON=/absolute/release-python/bin/python
+export RUNTIME_ROOT=/absolute/shared-runtime
+export PYTHONDONTWRITEBYTECODE=1
 test -n "$OPEN_TRADER_PYTHON"
 test -x "$OPEN_TRADER_PYTHON"
 export PYTHONPATH="$CUTOVER_ROOT:$CUTOVER_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
@@ -41,8 +48,9 @@ scripts/install_account_api_launchd.sh --dry-run --mode production --repo-root "
 scripts/install_dashboard_launchd.sh --dry-run --repo-root "$CUTOVER_ROOT"
 
 # 1. Account writer and API — one matched release pair.
-scripts/install_account_sync_launchd.sh --repo-root "$CUTOVER_ROOT"
-scripts/install_account_api_launchd.sh --mode production --repo-root "$CUTOVER_ROOT"
+"$OPEN_TRADER_PYTHON" -B scripts/deploy_release.py --expected-sha "$CUTOVER_SHA" \
+  --release-root "$CUTOVER_ROOT" --runtime-root "$RUNTIME_ROOT" \
+  --python "$OPEN_TRADER_PYTHON" --extra browser account
 
 # 2. Verify the two Account production reads before starting consumers.
 curl -fsS -H 'X-Open-Trader-Account-Route: production' \
@@ -54,15 +62,13 @@ curl -fsS -H 'X-Open-Trader-Account-Route: production' \
   'http://127.0.0.1:8768/api/v1/account/statements/BROKER/GENERATION/trade-facts'
 
 # 3. Gateway and Legacy Dashboard at CUTOVER_SHA.
-scripts/install_dashboard_launchd.sh --repo-root "$CUTOVER_ROOT"
+"$OPEN_TRADER_PYTHON" -B scripts/deploy_release.py --expected-sha "$CUTOVER_SHA" \
+  --release-root "$CUTOVER_ROOT" --runtime-root "$RUNTIME_ROOT" \
+  --python "$OPEN_TRADER_PYTHON" --extra browser dashboard --mode stack
 
-# 4. Restart all three active Trend controllers from the same checkout.
-scripts/install_daily_premarket_launchd.sh --trend-only --market CN \
-  --config "$CUTOVER_ROOT/config/daily_premarket.env"
-scripts/install_daily_premarket_launchd.sh --trend-only --market HK \
-  --config "$CUTOVER_ROOT/config/daily_premarket.env"
-scripts/install_daily_premarket_launchd.sh --trend-only --market US \
-  --config "$CUTOVER_ROOT/config/daily_premarket.env"
+# 4. The historical #23 Trend-controller migration is a separate operation.
+# Do not restart those controllers as part of this Account/Gateway forward path.
+# Any still-needed migration requires its own authorized, identity-bound plan.
 
 # 5. Disabled paths must stay absent. Do not run a Premarket/T-signal dry run.
 launchctl list | rg 'com\.open-trader\.premarket(\.|$)' && exit 1 || true
@@ -79,8 +85,11 @@ dry-run is part of this cutover.
 
 ## Runtime proof before the final gate
 
-Verify the candidate process identities and fresh logs. Every PID, working
-directory and Git SHA must resolve to `$CUTOVER_ROOT` and `$CUTOVER_SHA`.
+Verify the selected Account, Gateway and Legacy process identities and fresh
+logs against `$CUTOVER_ROOT` and `$CUTOVER_SHA`. Trend controllers are outside
+this forward path: compare their PIDs, roots and SHAs with the recorded
+pre-cutover values and require them unchanged. Only a separately authorized
+historical Trend migration uses the new cutover identity for those controllers.
 
 ```bash
 launchctl print gui/$(id -u)/com.open-trader.account-sync-controller
@@ -88,12 +97,7 @@ launchctl print gui/$(id -u)/com.open-trader.account-api
 launchctl print gui/$(id -u)/com.open-trader.frontend-gateway
 launchctl print gui/$(id -u)/com.open-trader.legacy-dashboard
 for market in cn hk us; do
-  market_upper="$(printf '%s' "$market" | tr '[:lower:]' '[:upper:]')"
   launchctl print gui/$(id -u)/com.open-trader.trend-market-controller."$market"
-  rg '"working_directory"[[:space:]]*:[[:space:]]*"'"$CUTOVER_ROOT"'"' \
-    data/trend_controller/"$market_upper"/status.json
-  rg '"git_sha"[[:space:]]*:[[:space:]]*"'"$CUTOVER_SHA"'"' \
-    data/trend_controller/"$market_upper"/status.json
   tail -n 100 "logs/daily_premarket/launchd-trend-controller-$market.out.log"
   tail -n 100 "logs/daily_premarket/launchd-trend-controller-$market.err.log"
 done
@@ -146,13 +150,14 @@ After no source or data changes remain, run the gate once with the verified
 shared interpreter:
 
 ```bash
-PYTHON_BIN="$OPEN_TRADER_PYTHON" make acceptance
+PYTHON_BIN="$OPEN_TRADER_PYTHON" make acceptance EXPECTED_SHA=<40hex>
 ```
 
-Only `PASS` is acceptance. After `PASS`, redeploy the exact accepted SHA in the
-same dependency order and recheck fresh PID/cwd/SHA/log evidence plus HTTP 200
-at [http://127.0.0.1:8766/](http://127.0.0.1:8766/). Do not capture screenshots
-unless the operator asks.
+Preflight success is not a live-health verdict. For a forward deployment, use
+`scripts/deploy_release.py` with the `account` kind, then the current Production
+Smoke gate for the selected SHA and service set. Do not repeat a deployment just
+to obtain a second acceptance label. Recheck fresh PID/cwd/SHA/log evidence;
+HTTP 200 alone is insufficient. Retain the rollback procedure below.
 
 Rollback #23 as one whole release to the retained prior accepted checkout:
 stop the candidate Account API, replace the Worker only after its writer lock

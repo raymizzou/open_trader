@@ -119,8 +119,10 @@ trading resumes. Stopping the service does not cancel exchange orders.
 Development uses affected-service Docker checks and independent staged review.
 Use the [PR-first delivery flow](agent-verification.md): reviewed branch, Draft
 PR, exact CI evidence, user-approved GitHub merge. Local `main` only synchronizes
-the remote. Candidate Acceptance runs only after GitHub merge, on the selected
-final GitHub `main` SHA for an explicitly authorized deployment. PR-head or
+the remote. Deployment Preflight reuses trusted main-push CI for the selected final GitHub
+`main` SHA during an explicitly authorized deployment; it does not repeat pytest.
+Use [the forward wrapper](deployment-preflight.md) for systemd install/start and
+local Gateway installation. PR-head or
 synthetic PR merge checks cannot be reused as final-SHA Candidate evidence;
 fixes return through a new PR. The old macOS launchd gate is not evidence for systemd.
 Production verification must include the remote systemd PID, `/proc` cwd and
@@ -209,8 +211,15 @@ venv Python, the operator can run:
 ```sh
 scripts/prediction-systemd.sh render
 scripts/prediction-systemd.sh preflight
-scripts/prediction-systemd.sh install
-scripts/prediction-systemd.sh start
+# Forward install/start: after explicit authorization and fresh cloud READY.
+"$OPEN_TRADER_PYTHON" -B scripts/deploy_release.py --expected-sha <40hex> \
+  --release-root /opt/open-trader/releases/<40hex> \
+  --runtime-root /var/lib/open-trader/prediction --python "$OPEN_TRADER_PYTHON" \
+  prediction-systemd --config /etc/open-trader/prediction-cloud.json --action install
+"$OPEN_TRADER_PYTHON" -B scripts/deploy_release.py --expected-sha <40hex> \
+  --release-root /opt/open-trader/releases/<40hex> \
+  --runtime-root /var/lib/open-trader/prediction --python "$OPEN_TRADER_PYTHON" \
+  prediction-systemd --config /etc/open-trader/prediction-cloud.json --action start
 scripts/prediction-systemd.sh status
 scripts/prediction-systemd.sh stop
 ```
@@ -466,7 +475,7 @@ old/new Docker measurements. The synthetic replay explicitly reports its
 market and retained counts; it is not a live-data capacity certificate.
 Measured results and failed attempts are recorded in the
 [#226 validation report](issue-226-memory-validation.md).
-Candidate Acceptance, cloud Host Readiness, Smoke and explicit deployment
+Deployment Preflight, cloud Host Readiness, Smoke and explicit deployment
 authorization still apply; no probe bypasses those gates.
 
 ## Two-host gates
@@ -524,6 +533,6 @@ Cloud Smoke checks release identity, process, pause and read-only state; it
 does not turn a `PARTIAL` API report into a complete #204 feed or Dashboard
 acceptance.
 Neither target installs a browser, starts a fixture server,
-mutates an account or restarts services. Candidate Acceptance remains separate
+mutates an account or restarts services. Deployment Preflight remains separate
 and required before an authorized deployment. Report real cloud validation as
 UNKNOWN until these gates run on the actual accepted release.
