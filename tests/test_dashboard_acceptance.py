@@ -475,34 +475,18 @@ def serialized_trend_position() -> dict[str, object]:
     }
 
 
-def test_candidate_acceptance_owns_container_backend_gate() -> None:
+def test_candidate_acceptance_reuses_trusted_ci_without_backend_rerun() -> None:
     makefile = (Path(__file__).parents[1] / "Makefile").read_text(encoding="utf-8")
-
-    assert "WORKTREE_ROOT := $(CURDIR)" in makefile
-    assert "REPOSITORY_ROOT :=" in makefile
-    assert "candidate-acceptance:" in makefile
     assert "acceptance: candidate-acceptance" in makefile
-    candidate_recipe = makefile.split("candidate-acceptance:", 1)[1].split(
-        "test-pressure:", 1
-    )[0]
-    assert "BACKEND_PYTEST :=" in makefile
-    assert "$(DOCKER_RUN) $(BACKEND_PYTEST) $(if $(strip $(TEST))" in makefile
-    assert candidate_recipe.count("$(DOCKER_BUILD)") == 1
-    assert candidate_recipe.count("$(DOCKER_RUN)") == 1
-    assert "$(MAKE) test" not in candidate_recipe
-    assert candidate_recipe.count("$(BACKEND_PYTEST)") == 2
-    assert "sh -c" in candidate_recipe
-    assert 'acceptance/test_prediction_arbitrage_scenarios.py -k "not LIVE"' in candidate_recipe
-    first_backend = candidate_recipe.index("$(BACKEND_PYTEST)")
-    separator = candidate_recipe.index("&&")
-    second_backend = candidate_recipe.rindex("$(BACKEND_PYTEST)")
-    assert first_backend < separator < second_backend
-    assert "--init" in makefile
+    assert "candidate-acceptance: deployment-preflight" in makefile
+    recipe = makefile.split("deployment-preflight:", 1)[1].split("test-pressure:", 1)[0]
+    assert "scripts/deployment_preflight.py" in recipe
+    assert '--expected-sha "$(EXPECTED_SHA)"' in recipe
+    assert '--release-root "$(WORKTREE_ROOT)"' in recipe
+    assert '--python "$(PYTHON_BIN)"' in recipe
+    assert all(token not in recipe for token in ("DOCKER_BUILD", "DOCKER_RUN", "BACKEND_PYTEST", "pytest", "launchctl"))
     assert "--network none" in makefile
     assert "--cap-drop ALL" in makefile
-    assert "--security-opt no-new-privileges" in makefile
-    assert "OPEN_TRADER_SMOKE_URL" not in candidate_recipe
-    assert "launchd" not in candidate_recipe
 
 
 def test_browser_ignores_unattributed_http_errors_checked_by_response_handler() -> None:

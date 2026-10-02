@@ -54,8 +54,9 @@ def test_acceptance_gate_is_backend_only_and_production_smoke_owns_playwright() 
     )
 
     assert "acceptance: candidate-acceptance" in normalized
-    assert '-m "not pressure and not browser"' in normalized_acceptance
-    assert 'acceptance/test_prediction_arbitrage_scenarios.py -k "not LIVE"' in normalized_acceptance
+    assert "scripts/deployment_preflight.py" in normalized_acceptance
+    assert "--expected-sha" in normalized_acceptance
+    assert "pytest" not in normalized_acceptance
     assert all(
         token not in normalized_acceptance
         for token in (
