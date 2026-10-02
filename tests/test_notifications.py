@@ -24,6 +24,7 @@ from open_trader.notifications import (
     NotificationError,
     XiaoaiSSHNotifier,
     XiaoaiVoiceSuppressed,
+    notification_delivery_episode,
     render_feishu_order_review,
     render_prediction_opportunity_notification,
     render_yes_no_signal_notification,
@@ -508,6 +509,151 @@ def test_feishu_app_notifier_raises_on_token_error() -> None:
 
     with pytest.raises(NotificationError, match="Feishu token error 999"):
         notifier.notify("Open Trader", "hello")
+
+
+def test_feishu_app_notifier_reuses_uuid_for_explicit_episode_retry() -> None:
+    message_payloads: list[dict[str, object]] = []
+
+    def fake_post(
+        url: str,
+        payload: dict[str, object],
+        _headers: dict[str, str],
+        _timeout_seconds: float,
+    ) -> dict[str, object]:
+        if url.endswith("/auth/v3/tenant_access_token/internal"):
+            return {"code": 0, "tenant_access_token": "tenant-token"}
+        message_payloads.append(payload)
+        return {"code": 0}
+
+    notifier = FeishuAppNotifier(
+        app_id="cli_test",
+        app_secret="secret",
+        receive_id_type="email",
+        receive_id="ray@example.com",
+        post_json=fake_post,
+    )
+
+    with notification_delivery_episode("lp-episode-1"):
+        notifier.notify("first title", "first body")
+        notifier.notify("retry title", "retry body")
+
+    assert len(message_payloads) == 2
+    assert message_payloads[0]["uuid"] == message_payloads[1]["uuid"]
+
+
+def test_feishu_app_notifier_uuid_changes_for_episode_and_recipient() -> None:
+    message_payloads: list[dict[str, object]] = []
+
+    def fake_post(
+        url: str,
+        payload: dict[str, object],
+        _headers: dict[str, str],
+        _timeout_seconds: float,
+    ) -> dict[str, object]:
+        if url.endswith("/auth/v3/tenant_access_token/internal"):
+            return {"code": 0, "tenant_access_token": "tenant-token"}
+        message_payloads.append(payload)
+        return {"code": 0}
+
+    def notifier(receive_id: str) -> FeishuAppNotifier:
+        return FeishuAppNotifier(
+            app_id="cli_test",
+            app_secret="secret",
+            receive_id_type="email",
+            receive_id=receive_id,
+            post_json=fake_post,
+        )
+
+    with notification_delivery_episode("lp-episode-1"):
+        notifier("ray@example.com").notify("title", "body")
+        notifier("other@example.com").notify("title", "body")
+    with notification_delivery_episode("lp-episode-2"):
+        notifier("ray@example.com").notify("title", "body")
+
+    uuids = [payload["uuid"] for payload in message_payloads]
+    assert len(set(uuids)) == 3
+
+
+def test_notification_delivery_episode_restores_context_after_exception() -> None:
+    message_payloads: list[dict[str, object]] = []
+
+    def fake_post(
+        url: str,
+        payload: dict[str, object],
+        _headers: dict[str, str],
+        _timeout_seconds: float,
+    ) -> dict[str, object]:
+        if url.endswith("/auth/v3/tenant_access_token/internal"):
+            return {"code": 0, "tenant_access_token": "tenant-token"}
+        message_payloads.append(payload)
+        return {"code": 0}
+
+    notifier = FeishuAppNotifier(
+        app_id="cli_test",
+        app_secret="secret",
+        receive_id_type="email",
+        receive_id="ray@example.com",
+        post_json=fake_post,
+    )
+
+    with pytest.raises(RuntimeError, match="stop"):
+        with notification_delivery_episode("lp-episode-1"):
+            notifier.notify("inside", "body")
+            raise RuntimeError("stop")
+    notifier.notify("outside", "body")
+
+    assert "uuid" in message_payloads[0]
+    assert "uuid" not in message_payloads[1]
+
+
+def test_notification_delivery_episode_is_thread_local() -> None:
+    message_payloads: list[dict[str, object]] = []
+    payload_lock = threading.Lock()
+
+    def fake_post(
+        url: str,
+        payload: dict[str, object],
+        _headers: dict[str, str],
+        _timeout_seconds: float,
+    ) -> dict[str, object]:
+        if url.endswith("/auth/v3/tenant_access_token/internal"):
+            return {"code": 0, "tenant_access_token": "tenant-token"}
+        with payload_lock:
+            message_payloads.append(payload)
+        return {"code": 0}
+
+    notifier = FeishuAppNotifier(
+        app_id="cli_test",
+        app_secret="secret",
+        receive_id_type="email",
+        receive_id="ray@example.com",
+        post_json=fake_post,
+    )
+    barrier = threading.Barrier(2, timeout=5)
+
+    def send_from_thread() -> None:
+        barrier.wait()
+        notifier.notify("thread", "body")
+
+    with notification_delivery_episode("lp-episode-1"):
+        worker = threading.Thread(target=send_from_thread)
+        worker.start()
+        try:
+            barrier.wait()
+            notifier.notify("main", "body")
+        except BaseException:
+            barrier.abort()
+            raise
+        finally:
+            worker.join(5)
+        assert not worker.is_alive()
+
+    payload_by_title = {
+        json.loads(payload["content"])["text"].split("\n\n", 1)[0]: payload
+        for payload in message_payloads
+    }
+    assert "uuid" in payload_by_title["main"]
+    assert "uuid" not in payload_by_title["thread"]
 
 
 def test_xiaoai_voice_notifier_runs_native_tts_over_ssh(tmp_path: Path) -> None:

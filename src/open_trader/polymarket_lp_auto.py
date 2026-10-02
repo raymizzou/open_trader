@@ -24,7 +24,8 @@ from .polymarket_lp_risk import (
     TERMINAL_ORDER_STATES, _account_after_reservations, _decimal as _money, _freshness, _levels,
     _maybe_decimal, _timestamp, evaluate_lp_entry, estimate_lp_target_share_yield,
 )
-from .daily_premarket import send_notification_with_results
+from .daily_premarket import _notifier_channel, send_notification_with_results
+from .notifications import CompositeNotifier, notification_delivery_episode
 
 ZERO = Decimal('0')
 
@@ -148,6 +149,9 @@ class LPAutoPool:
         self._reconcile_jobs = {}
         self._reconcile_jobs_lock = threading.Lock()
         self._attention_delivery_lock = threading.Lock()
+        self._attention_delivery_results = {}
+        self.lp._facts_attention_summary = self.state
+        self.lp._facts_attention_verifier = self.reconcile_attention
 
     def _begin_account_round(self) -> _AccountRoundLease | None:
         begin = getattr(self.lp.exchange, 'lp_account_round_begin', None)
@@ -689,81 +693,149 @@ class LPAutoPool:
         return reason
 
     def _deliver_attention(self, intent_id: str, *, recovery: bool = False) -> None:
-        """Send one persisted episode notice; delivery is explicit, not assumed."""
-        # One process-wide delivery lock prevents duplicate sends. It never
-        # guards fact reads, SQLite publication, or trading.
+        """Batch a persisted reason and retain successful results until DB ack."""
         with self._attention_delivery_lock:
-            document=self._read()
-            intent=document['intents'].get(intent_id)
-            if intent is None:
+            document = self._read()
+            selected = document['intents'].get(intent_id)
+            due = 'attention_recovery_due' if recovery else 'attention_due'
+            if not selected or selected.get('account_baseline_archive') or not selected.get(due):
                 return
-            now=self._now()
-            retry_at=intent.get('attention_send_retry_at')
-            if retry_at and now < _timestamp(retry_at,name='attention_send_retry_at'):
+            reason = selected.get('reconcile_error') or selected.get('reconcile_reason') or 'unknown'
+            if not recovery and self.lp._attention_internal_wait(reason):
                 return
-            if recovery:
-                if not intent.get('attention_recovery_due'):
-                    return
-                episode=intent.get('attention_episode') or intent.get('attention_since')
-                title, message='LP 核对已恢复', 'LP 资金核对已恢复，自动调度保持原运行/暂停设置。'
-            else:
-                if not intent.get('attention_due'):
-                    return
-                episode=intent.get('attention_episode') or intent.get('attention_since')
-                reason=intent.get('reconcile_error') or intent.get('reconcile_reason') or 'unknown'
-                title='LP 核对持续失败'
-                message=f'LP 核对已连续 5 分钟无有效进展：{reason}。系统继续只读核对并保留资金边界。'
-            if not episode:
-                return
-            # Persist the attempt before network I/O so restart cannot reset
-            # the episode and immediately repeat it.
-            def claim(d):
-                current=d['intents'].get(intent_id)
-                if current is None or (current.get('attention_episode') or current.get('attention_since')) != str(episode):
-                    return False
+            group_key = 'attention_recovery_delivery_group' if recovery else 'attention_delivery_group'
+            group = selected.get(group_key)
+            rows = []
+            for intent in document['intents'].values():
+                if intent.get('account_baseline_archive') or not intent.get(due) or not (intent.get('attention_episode') or intent.get('attention_since')):
+                    continue
+                if group and intent.get(group_key) != group:
+                    continue
+                if not group and intent.get(group_key):
+                    continue
+                if not recovery and (intent.get('reconcile_error') or intent.get('reconcile_reason') or 'unknown') != reason:
+                    continue
+                retry = intent.get('attention_send_retry_at')
+                if retry and self._now() < _timestamp(retry, name='attention_retry'):
+                    continue
                 if recovery:
-                    if not current.get('attention_recovery_due'):
-                        return False
-                elif not current.get('attention_due'):
-                    return False
-                current.update(
-                    attention_episode=str(episode),
-                    attention_sending=True,
-                    attention_send_retry_at=(now+timedelta(seconds=60)).isoformat(),
-                )
-                return True
-            if not self._update(claim):
+                    known = intent.get('financial_status') == 'known' and not intent.get('reconcile_error') and not intent.get('reconcile_reason')
+                    proof = self.store.lp_session(intent['session_id']) or {}
+                    observation = {**intent, **{k: v for k, v in proof.items() if k.startswith('attention_verif')}}
+                    ready, patch = self.lp._attention_recovery_ready(observation, prefix='attention', financial_known=known)
+                    if patch:
+                        def remember(d):
+                            current = d['intents'].get(intent['intent_id'])
+                            if current and not current.get('account_baseline_archive') and current.get('attention_episode') == intent.get('attention_episode'):
+                                current.update(patch)
+                        self._update(remember)
+                    if not ready:
+                        continue
+                rows.append(intent)
+            if not rows:
                 return
-            fault_key, recovery_key=('attention_attempted_channels','attention_recovery_attempted_channels')
-            attempted={str(v) for v in (intent.get(recovery_key if recovery else fault_key) or ())}
-            if recovery and not attempted:
-                attempted.update(intent.get('attention_delivered_channels') or ())
-            delivered_channels={str(v) for v in (intent.get(
-                'attention_recovery_delivered_channels' if recovery
-                else 'attention_delivered_channels') or ())}
-            missing=(attempted-delivered_channels) if attempted else None
-            delivery_unknown=False
-            try:
-                attempts=send_notification_with_results(
-                    self.execution._notifier,title,message,channels=missing)
-            except Exception:
-                # The remote result is unknown, not failed or delivered. A
-                # future retry may duplicate; that is safer than losing the
-                # only notice while reservations remain held.
-                attempts=()
-                delivery_unknown=True
-            attempted.update(str(a.channel) for a in attempts)
-            delivered_channels.update(
-                str(a.channel) for a in attempts if a.success)
-            delivered=bool(attempted) and delivered_channels >= attempted
-            attempted_key=('attention_recovery_attempted_channels' if recovery
-                           else 'attention_attempted_channels')
-            delivered_key=('attention_recovery_delivered_channels' if recovery
-                           else 'attention_delivered_channels')
-            def apply(d):
-                intent=d['intents'].get(intent_id)
-                if intent is None or intent.get('attention_episode') != str(episode):
-                    return
+            group = group or uuid.uuid5(uuid.NAMESPACE_URL, str(recovery) + ':' + ':'.join(
+                sorted(str(i['intent_id']) + ':' + str(i.get('attention_episode') or i.get('attention_since')) for i in rows)
+            )).hex
+            def claim(d):
+                claimed = []
+                for before in rows:
+                    current = d['intents'].get(before['intent_id'])
+                    episode = before.get('attention_episode') or before.get('attention_since')
+                    if (not current or current.get('account_baseline_archive') or not current.get(due)
+                            or (current.get('attention_episode') or current.get('attention_since')) != episode):
+                        continue
+                    if recovery and (current.get('financial_status') != 'known' or current.get('reconcile_error') or current.get('reconcile_reason')):
+                        continue
+                    if recovery and current.get('settled'):
+                        proof = self.store.lp_session(current['session_id']) or {}
+                        observation = {**current, **{k: v for k, v in proof.items() if k.startswith('attention_verif')}}
+                        ready, _ = self.lp._attention_recovery_ready(observation, prefix='attention', financial_known=True)
+                        if proof.get('account_baseline_archive') or not ready:
+                            continue
+                    if not recovery and (current.get('reconcile_error') or current.get('reconcile_reason') or 'unknown') != reason:
+                        continue
+                    if not recovery and self.lp._attention_internal_wait(current.get('reconcile_error') or current.get('reconcile_reason')):
+                        continue
+                    current.update(attention_episode=str(episode), attention_sending=True,
+                        attention_send_retry_at=(self._now()+timedelta(seconds=60)).isoformat())
+                    current[group_key] = group
+                    claimed.append(deepcopy(current))
+                return claimed
+            rows = self._update(claim)
+            if not rows:
+                return
+            outcomes = {}
+            missing = set()
+            all_channels = False
+            for intent in rows:
+                episode = str(intent['attention_episode'])
+                key = (intent['intent_id'], recovery, episode)
+                attempt_key = 'attention_recovery_attempted_channels' if recovery else 'attention_attempted_channels'
+                success_key = 'attention_recovery_delivered_channels' if recovery else 'attention_delivered_channels'
+                attempted = set(intent.get(attempt_key) or ())
+                delivered = set(intent.get(success_key) or ())
+                cached = self._attention_delivery_results.get(key)
+                if recovery:
+                    notifier = self.execution._notifier
+                    targets = notifier._notifiers if isinstance(notifier, CompositeNotifier) else (notifier,)
+                    # Expand only legacy unknown channel sets. A known fault's
+                    # channels fence both persisted and cached recovery results.
+                    attempted = set(intent.get('attention_delivered_channels') or attempted
+                        or (cached[0] if cached else ()) or {_notifier_channel(target) for target in targets})
+                    delivered.intersection_update(attempted)
+                    if cached:
+                        delivered.update(cached[1] & attempted)
+                elif cached:
+                    attempted.update(cached[0]); delivered.update(cached[1])
+                all_channels = all_channels or not attempted
+                missing.update(attempted-delivered)
+                outcomes[key] = (attempted, delivered)
+            for key, outcome in outcomes.items():
+                self._attention_delivery_results[key] = outcome
+            sessions = {i['intent_id']: {**i, **(self.store.lp_session(i['session_id']) or {})} for i in rows}
+            batches = {}
+            if all_channels:
+                batches[tuple(i['intent_id'] for i in rows)] = None
+            else:
+                for channel in sorted(missing):
+                    recipients = tuple(i['intent_id'] for i in rows
+                        if channel in outcomes[(i['intent_id'], recovery, str(i['attention_episode']))][0]
+                        and channel not in outcomes[(i['intent_id'], recovery, str(i['attention_episode']))][1])
+                    batches.setdefault(recipients, set()).add(channel)
+            delivery_unknown = False
+            for recipients, channels in batches.items():
+                title, message, _ = self.lp._attention_notice(
+                    [sessions[iid] for iid in recipients], recovery=recovery, reason=reason, funds=True)
+                if not recovery and len(recipients) == 1:
+                    title = 'LP 核对持续失败'
+                attempts = ()
+                try:
+                    with notification_delivery_episode('lp-auto:' + group):
+                        attempts = send_notification_with_results(self.execution._notifier, title, message, channels=channels)
+                except Exception:
+                    delivery_unknown = True
+                for key, (attempted, delivered_channels) in outcomes.items():
+                    if key[0] not in recipients:
+                        continue
+                    relevant = [a for a in attempts if not recovery or not attempted or a.channel in attempted]
+                    attempted.update(a.channel for a in relevant)
+                    delivered_channels.update(a.channel for a in relevant if a.success)
+                    self._attention_delivery_results[key] = (attempted, delivered_channels)
+            self._finish_attention_delivery(outcomes, recovery=recovery, delivery_unknown=delivery_unknown)
+
+    def _finish_attention_delivery(self, outcomes, *, recovery, delivery_unknown=False):
+        def apply(d):
+            for (current_id, _, episode), (attempted, delivered_channels) in outcomes.items():
+                attempted_key = 'attention_recovery_attempted_channels' if recovery else 'attention_attempted_channels'
+                delivered_key = 'attention_recovery_delivered_channels' if recovery else 'attention_delivered_channels'
+                intent=d['intents'].get(current_id)
+                if intent is None or intent.get('account_baseline_archive') or intent.get('attention_episode') != str(episode):
+                    continue
+                if recovery and intent.get('attention_delivered_channels'):
+                    attempted = set(intent['attention_delivered_channels'])
+                    delivered_channels = delivered_channels & attempted
+                delivered = bool(attempted) and delivered_channels >= attempted
                 intent['attention_sending']=False
                 intent[attempted_key]=sorted(attempted)
                 intent[delivered_key]=sorted(delivered_channels)
@@ -777,7 +849,9 @@ class LPAutoPool:
                                     'attention_delivery_unknown',
                                     'attention_attempted_channels','attention_delivered_channels',
                                     'attention_recovery_attempted_channels','attention_recovery_delivered_channels',
-                                    'attention_recovered_at'):
+                                    'attention_recovered_at', 'attention_delivery_group',
+                                    'attention_recovery_delivery_group', 'attention_recovery_ready_since',
+                                    'attention_recovery_first_checked_at'):
                             intent.pop(key,None)
                     else:
                         intent['attention_send_error']='notification_delivery_failed'
@@ -786,7 +860,7 @@ class LPAutoPool:
                         intent['attention_due']=False
                         intent['attention_recovery_due']=bool(delivered_channels)
                         intent.pop('attention_send_retry_at',None)
-                        return
+                        continue
                     intent['attention_due']=not delivered
                     if delivered:
                         intent['attention_notified']=True
@@ -801,13 +875,30 @@ class LPAutoPool:
                     else:
                         intent['attention_notified']=False
                         intent['attention_send_error']='notification_delivery_failed'
-            self._update(apply)
+        self._update(apply)
+        for key in outcomes:
+            self._attention_delivery_results.pop(key, None)
 
     def flush_attention(self, session_id: str | None = None) -> None:
         """Deliver persisted notices only after their fact transaction commits."""
         document=self._read()
+        acknowledged = False
+        for key, result in list(self._attention_delivery_results.items()):
+            intent_id, recovery, episode = key
+            current = document['intents'].get(intent_id)
+            if not current or current.get('account_baseline_archive') or current.get('attention_episode') != episode:
+                self._attention_delivery_results.pop(key, None)
+                continue
+            if session_id is not None and current.get('session_id') != session_id:
+                continue
+            retry = current.get('attention_send_retry_at')
+            if not retry or self._now() >= _timestamp(retry, name='attention_ack_retry'):
+                self._finish_attention_delivery({key: result}, recovery=recovery)
+                acknowledged = True
+        if acknowledged:
+            document=self._read()
         intents=document['intents'].values()
-        selected=[i for i in intents if session_id is None or i.get('session_id')==session_id]
+        selected=[i for i in intents if not i.get('account_baseline_archive') and (session_id is None or i.get('session_id')==session_id)]
         for intent in selected:
             if intent.get('attention_recovery_due'):
                 self._deliver_attention(intent['intent_id'],recovery=True)
@@ -832,7 +923,9 @@ class LPAutoPool:
                 'attention_attempted_channels', 'attention_delivered_channels',
                 'attention_recovery_attempted_channels',
                 'attention_recovery_delivered_channels',
-                'attention_recovered_at',
+                'attention_recovered_at', 'attention_delivery_group',
+                'attention_recovery_delivery_group', 'attention_recovery_ready_since',
+                'attention_recovery_first_checked_at',
             ):
                 i.pop(key, None)
             i['attention_since'] = now.isoformat()
@@ -877,7 +970,7 @@ class LPAutoPool:
             send_retry=i.get('attention_send_retry_at')
             due_now = not i.get('attention_notified') and (
                 not send_retry or now >= _timestamp(send_retry,name='attention_send_retry_at'))
-            i['attention_due']=bool(due_now or i.get('attention_sending'))
+            i['attention_due']=bool(due_now or i.get('attention_sending')) and not self.lp._attention_internal_wait(reason)
 
     def _record_session(self, intent_id, session, *, error=None, connection=None):
         if connection is None:
@@ -1075,7 +1168,8 @@ class LPAutoPool:
         d=self._read()
         if not d['account_id'] or d['account_id']!=self.execution._lp_account_id():
             return self._projection(d)
-        intents = [i for i in d['intents'].values() if not i.get('settled')]
+        intents = [i for i in d['intents'].values() if not i.get('account_baseline_archive')
+                   and (not i.get('settled') or i.get('attention_recovery_due'))]
         if bounded:
             # Persistent per-intent jobs: a slow read never owns the auto-round
             # barrier, and later rounds cannot stack workers for that session.
@@ -1140,6 +1234,19 @@ class LPAutoPool:
         self._update(finish)
         return self.state()
 
+    def reconcile_attention(self, *, apply_lock=None, session_id=None):
+        d = self._read()
+        if not d['account_id'] or d['account_id'] != self.execution._lp_account_id():
+            return
+        for intent in d['intents'].values():
+            if intent.get('settled') and intent.get('attention_recovery_due') and not intent.get('account_baseline_archive'):
+                if session_id is None:
+                    self.lp._schedule_session_attention(intent['session_id'], apply_lock=apply_lock)
+                elif intent['session_id'] == session_id:
+                    self.lp.verify_session_recovery(session_id, apply_lock=apply_lock or (
+                        self.execution._acquire_global_lock, self.execution._release_global_lock))
+                    return
+
     def reconcile_reports(self):
         # Reuse the natural-day report worker. One historical read at a time
         # leaves the other shared read slot available to active sessions.
@@ -1154,8 +1261,16 @@ class LPAutoPool:
                     self._reconcile_intent(intent, reuse=True)
         finally:
             self.lp._report_lock.release()
+            self.reconcile_attention(apply_lock=(self.execution._acquire_global_lock, self.execution._release_global_lock))
 
     def _reconcile_intent(self, i, *, reuse, account_round=None):
+        if i.get('account_baseline_archive'):
+            return
+        if i.get('settled') and i.get('attention_recovery_due'):
+            self.lp.verify_session_recovery(i['session_id'], account_round=account_round,
+                apply_lock=(self.execution._acquire_global_lock, self.execution._release_global_lock))
+            if not i.get('report_pending'):
+                return
         if i['state'] in ('aborted','rejected'):
             return
         session=self.store.lp_session(i['session_id'])

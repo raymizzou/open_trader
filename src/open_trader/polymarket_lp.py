@@ -45,7 +45,7 @@ from .prediction_arbitrage_store import (
     LP_RESERVED_MANUAL_SESSION_ID,
     PredictionArbitrageStore,
 )
-from .notifications import beijing_clock
+from .notifications import beijing_clock, notification_delivery_episode
 from .polymarket_trading import (
     LpAccountReadError,
     LpAccountRoundInvalid,
@@ -810,9 +810,12 @@ class PolymarketLPService:
         ] = {}
         self._facts_capacity = threading.BoundedSemaphore(2)
         self._facts_attention_flusher = None
+        self._facts_attention_summary = None
+        self._facts_attention_verifier = None
         self._attention_queue_lock = threading.Lock()
         self._attention_delivery_lock = threading.Lock()
-        self._attention_pending: set[str] = set()
+        self._attention_delivery_results: dict[tuple[str, bool, str], dict[str, bool]] = {}
+        self._attention_pending: dict[str, object] = {}
         self._attention_thread: threading.Thread | None = None
         self._market_reads_lock = threading.Lock()
         self._market_reads = {}
@@ -10208,10 +10211,10 @@ class PolymarketLPService:
 
         return self._tick()
 
-    def _schedule_session_attention(self, session_id: str) -> None:
+    def _schedule_session_attention(self, session_id: str, *, apply_lock=None) -> None:
         """Hand durable notices to one finite background delivery lane."""
         with self._attention_queue_lock:
-            self._attention_pending.add(session_id)
+            self._attention_pending[session_id] = apply_lock or self._attention_pending.get(session_id)
             start = self._attention_thread is None
             if start:
                 self._attention_thread = threading.Thread(
@@ -10227,8 +10230,15 @@ class PolymarketLPService:
                 if not self._attention_pending:
                     self._attention_thread = None
                     return
-                session_id = self._attention_pending.pop()
+                session_id, apply_lock = self._attention_pending.popitem()
             try:
+                verifier = self._facts_attention_verifier
+                if callable(verifier):
+                    verifier(session_id=session_id, apply_lock=apply_lock)
+                row = self.store.lp_session(session_id)
+                if (row and row.get('needs_attention_recovery_due')
+                        and not self.store.lp_auto_owns_session(session_id)):
+                    self.verify_session_recovery(session_id, apply_lock=apply_lock)
                 callback = self._facts_attention_flusher
                 if callback is not None:
                     callback(session_id)
@@ -10243,6 +10253,27 @@ class PolymarketLPService:
             callback(session_id)
         self.flush_session_attention(session_id)
         self.flush_session_recovery(session_id)
+
+    def verify_session_recovery(self, session_id, *, apply_lock=None, account_round=None):
+        """Observe terminal facts for notifications without reopening settlement."""
+        session = self.store.lp_session(session_id)
+        if not session or session.get('account_baseline_archive') or session.get('state') not in {'complete', 'entry_rejected'}:
+            return False
+        last = session.get('attention_verification_attempted_at') or session.get('facts_checked_at')
+        if last and (self._now() - _timestamp(last)).total_seconds() < 60:
+            return False
+        if not self._report_lock.acquire(blocking=False):
+            return False
+        try:
+            self.store.lp_update_session(session_id, patch={
+                'attention_verification_attempted_at': self._now(),
+                'attention_verification_error': 'verification_pending',
+            })
+            self.reconcile_facts(session_id, report_only=True, verify_recovery=True,
+                                 apply_lock=apply_lock, account_round=account_round)
+            return True
+        finally:
+            self._report_lock.release()
 
     def _publish_facts_wait(self, session_id: str, reason: str) -> None:
         row = self.store.lp_session_with_revision(session_id, trading=True)
@@ -10265,6 +10296,7 @@ class PolymarketLPService:
         *,
         apply_lock=None,
         report_only=False,
+        verify_recovery=False,
         monitor=False,
         account_round=None,
     ):
@@ -10278,8 +10310,9 @@ class PolymarketLPService:
             flight = self._facts_inflight.get(session_id)
             owner = flight is None
             if owner:
-                flight = self._facts_inflight[session_id] = dict(future=Future(), monitor=False)
-            if monitor:
+                flight = self._facts_inflight[session_id] = dict(future=Future(), monitor=False, notification_only=verify_recovery)
+            # Joining monitors cannot upgrade a notification-only owner.
+            if monitor and not flight['notification_only']:
                 flight.update(monitor=True, apply_lock=apply_lock)
             future = flight['future']
         if not owner:
@@ -10301,6 +10334,7 @@ class PolymarketLPService:
                     session_id,
                     apply_lock=apply_lock,
                     report_only=report_only,
+                    verify_recovery=verify_recovery,
                     timings=timings,
                     account_round=account_round,
                 )
@@ -10316,7 +10350,8 @@ class PolymarketLPService:
                     # Finish atomically with request registration, so a joining
                     # tick is either included or starts the next operation.
                     self._facts_inflight.pop(session_id)
-                    future.set_result((*result, None))
+                    status = self._status_payload(self.store.lp_session(session_id) or result[0]) if flight['notification_only'] else None
+                    future.set_result((*result, status))
                     return future.result()
             status = self._apply_tick_snapshot(
                 *result,
@@ -10435,6 +10470,7 @@ class PolymarketLPService:
         *,
         apply_lock,
         report_only,
+        verify_recovery=False,
         timings=None,
         account_round=None,
     ):
@@ -10448,7 +10484,7 @@ class PolymarketLPService:
         )
         if session.get('order_identity_conflict'):
             return session, None, revision, 'order_identity_conflict'
-        late_receipts = [
+        late_receipts = [] if verify_recovery else [
             action
             for action in self.store.lp_actions(session_id)
             if action.get('state') == 'accepted'
@@ -10579,6 +10615,9 @@ class PolymarketLPService:
             self._facts_apply_lock.release()
             raise
         if apply_lock and lock is None:
+            if verify_recovery:
+                self._facts_apply_lock.release()
+                return session, snapshot, revision, 'execution_lock'
             try:
                 if snapshot is not None and observed_trade_generation is not None:
                     self._retain_pending_facts(
@@ -10612,7 +10651,7 @@ class PolymarketLPService:
                 self._mutex.acquire()
             try:
                 current, current_revision = self.store.lp_session_with_revision(session_id, trading=True)
-                if current_revision != revision:
+                if current_revision != revision or (verify_recovery and current.get('account_baseline_archive')):
                     return session, snapshot, revision, "session_changed"
                 patch, state = {}, None
                 if not error and self._facts_validator is not None:
@@ -10621,15 +10660,36 @@ class PolymarketLPService:
                     except ValueError as exc:
                         error = str(exc) or "account_facts_stale"
                 if report_only:
-                    if not error:
-                        patch['trade_events'] = self._merge_report_trade_events(current, snapshot)
-                    patch.update(report_checked_at=self._now(), report_error=error)
+                    if verify_recovery:
+                        try:
+                            if error:
+                                raise ValueError(error)
+                            account = snapshot.get('account') or {}
+                            stamp = snapshot.get('account_checked_at') or account.get('checked_at')
+                            _freshness(stamp, self._now(), 'recovery_facts', max_age=60)
+                            if (account.get('authenticated') is not True
+                                    or account.get('open_orders_complete') is not True
+                                    or account.get('positions_complete') is not True):
+                                raise ValueError('account_facts_incomplete')
+                            observed = {**current, **self._order_history_patch(current, snapshot)}
+                            observed.update(self._fill_patch(observed, snapshot))
+                            if self._completion_patch(observed) is None or observed.get('financial_block_reason'):
+                                raise ValueError('terminal_recovery_unverified')
+                            patch.update(attention_verified_at=stamp,
+                                         attention_verified_trade_generation=observed_trade_generation)
+                        except ValueError as exc:
+                            error = str(exc)
+                        patch['attention_verification_error'] = error
+                    else:
+                        if not error:
+                            patch['trade_events'] = self._merge_report_trade_events(current, snapshot)
+                        patch.update(report_checked_at=self._now(), report_error=error)
                     try:
                         with _lp_read_stage("facts_report_publish", timings):
                             current, _ = self.store.lp_publish_facts(
                                 session_id, revision, patch=patch,
                                 trade_generation=observed_trade_generation,
-                                publish=self._facts_publisher)
+                                publish=None if verify_recovery else self._facts_publisher)
                     except ValueError as exc:
                         if str(exc) not in {'account_round_invalid', 'session_changed'}:
                             raise
@@ -10650,6 +10710,8 @@ class PolymarketLPService:
                         completion = self._completion_patch(current)
                         if completion is not None:
                             patch.update(completion)
+                            if current.get('state') == 'needs_attention':
+                                patch.update(self._needs_attention_recovery_patch(current))
                             state = 'complete'
                         patch['facts_checked_at'] = snapshot.get('account_checked_at') or (snapshot.get('account') or {}).get('checked_at') or self._now()
                     except ValueError as exc:
@@ -10734,6 +10796,17 @@ class PolymarketLPService:
         # they must not own the common publication mutex or execution lock.
         with self._first_seen_apply_lock:
             self._apply_first_seen_protections()
+
+        verifier = self._facts_attention_verifier
+        if callable(verifier):
+            try:
+                verifier(apply_lock=apply_lock)
+            except Exception:
+                logger.exception("lp_terminal_attention_schedule_failed")
+        for session in self.store.lp_sessions():
+            if (session.get('state') in {'complete', 'entry_rejected'} and session.get('needs_attention_recovery_due')
+                    and not self.store.lp_auto_owns_session(str(session['session_id']))):
+                self._schedule_session_attention(str(session['session_id']), apply_lock=apply_lock)
 
         active_reader = getattr(
             self.store, "lp_active_sessions_with_revisions", None
@@ -11719,51 +11792,7 @@ class PolymarketLPService:
             session = self.store.lp_update_session(
                 str(session["session_id"]),
                 state=resume_state,
-                patch={
-                    "reconciliation": None,
-                    "resume_state": None,
-                    "needs_attention_since": None,
-                    "needs_attention_notified": False,
-                    "needs_attention_due": False,
-                    "needs_attention_channel_status": {},
-                    "needs_attention_send_error": None,
-                    "needs_attention_sending": False,
-                    "needs_attention_send_retry_at": None,
-                    "needs_attention_recovery_due": bool(
-                        session.get("needs_attention_notified")
-                        or (
-                            isinstance(
-                                session.get("needs_attention_channel_status"),
-                                Mapping,
-                            )
-                            and any(
-                                bool(value)
-                                for value in session[
-                                    "needs_attention_channel_status"
-                                ].values()
-                            )
-                        )
-                    ),
-                    "needs_attention_recovery_episode": str(
-                        session.get("needs_attention_episode") or ""
-                    ),
-                    "needs_attention_verified_recovery_episode": str(
-                        session.get("needs_attention_episode") or ""
-                    ),
-                    "needs_attention_recovery_channels": sorted(
-                        {"feishu", "xiaoai"}
-                        if session.get("needs_attention_notified")
-                        else {
-                            str(key)
-                            for key, value in (
-                                session.get("needs_attention_channel_status") or {}
-                            ).items()
-                            if value
-                        }
-                    ),
-                    "needs_attention_recovery_channel_status": {},
-                    "needs_attention_recovery_retry_at": None,
-                },
+                patch=self._needs_attention_recovery_patch(session),
             )
             state = resume_state
         # Issue 152: queue protection runs inside the existing one-second
@@ -12716,6 +12745,19 @@ class PolymarketLPService:
     ) -> tuple[str, str]:
         """Return durable operator copy for the current reconciliation reason."""
         code = str(reconciliation or "")
+        if code in {"market_read_capacity", "facts_read_capacity"}:
+            return ("本地读取容量已占满，系统等待空闲后继续核对。", "等待读取容量")
+        if code in {"market_read_in_progress", "facts_read_in_progress"}:
+            return ("本次读取尚在进行，系统等待结果后继续核对。", "读取进行中")
+        if code == "missing_reliable_order_id":
+            return (
+                "历史提交缺少可靠订单编号，占资和名额仍待核清。需要对照历史订单、成交与当前持仓核对。",
+                "历史订单身份需要核对",
+            )
+        if code in {"submission_unknown", "order_receipt_unknown"}:
+            return ("订单结果尚未核清，系统保留占资并继续只读核对。", "订单结果待核对")
+        if code in {"financial_facts_unknown", "trade_fee_unknown", "position_mismatch"}:
+            return ("成交、费用或持仓尚未核清，受影响资金继续隔离，系统继续只读核对。", "资金事实待核对")
         if code == "unowned_target_order":
             return (
                 "账户里有一张挂在本市场、但不归本组管理的单（常见：手工挂的单）。"
@@ -12724,8 +12766,7 @@ class PolymarketLPService:
             )
         if code in {
             "external_snapshot_unknown", "book_unknown", "book_freshness_unknown",
-            "market_read_timeout", "market_read_in_progress",
-            "market_read_cooling_down", "market_read_capacity",
+            "market_read_timeout", "market_read_cooling_down",
         }:
             return ("市场/账户数据连续读取失败，系统自动重试中。", "数据读取连续失败")
         if code in {"account_facts_stale", "account_facts_incomplete"}:
@@ -12758,6 +12799,10 @@ class PolymarketLPService:
         if state != "needs_attention" or since_raw is None:
             return {
                 "needs_attention_episode": uuid.uuid4().hex,
+                "needs_attention_delivery_group": None,
+                "needs_attention_recovery_delivery_group": None,
+                "needs_attention_recovery_ready_since": None,
+                "needs_attention_recovery_first_checked_at": None,
                 "needs_attention_verified_recovery_episode": None,
                 "needs_attention_since": now.isoformat(),
                 "needs_attention_notified": False,
@@ -12788,110 +12833,220 @@ class PolymarketLPService:
             return {}
         return {"needs_attention_due": True}
 
+    @staticmethod
+    def _attention_internal_wait(reason: object) -> bool:
+        return str(reason or "") in {
+            "market_read_capacity", "market_read_in_progress", "execution_lock",
+            "facts_read_capacity", "facts_read_in_progress", "account_round_invalid",
+        }
+
+    @staticmethod
+    def _attention_session_reason(session: Mapping[str, object]) -> object:
+        return session.get("facts_error") or session.get("reconcile_reason") or session.get("reconciliation")
+
+    def _attention_notice(self, rows, *, recovery: bool, reason=None, funds=False):
+        identities = [self._queue_protection_identity(row) for row in rows]
+        names = [identity["title"] for identity in identities]
+        label = names[0] if len(names) == 1 else f"{len(names)} 个市场"
+        scope = "标的资金" if funds else "会话"
+        title = f"LP {scope}核对恢复 · {label}" if recovery else f"LP 需要核对 · {label}"
+        main, voice = self._needs_attention_reason_copy(reason)
+        voice = "LP 需要核对，" + voice
+        if recovery:
+            main, voice = f"本次 {scope}核对恢复：{len(rows)} 个市场。", f"LP {scope}核对恢复"
+        details = []
+        for row, identity in zip(rows, identities):
+            line = f"- {identity['title']} {identity['outcome']}\n  {identity['url']}"
+            protection = row.get("queue_protection")
+            failures = _queue_group_failures_int(protection.get("data_failures") if isinstance(protection, Mapping) else 0)
+            if not recovery and failures > 0:
+                line += f"\n  数据读取失败 {failures}/10，满 10 次将保护性撤单。"
+            details.append(line)
+        message = main + "\n\n市场：\n" + "\n".join(details)
+        summary = self._facts_attention_summary
+        if callable(summary):
+            try:
+                state = summary()
+                slots = state["slots"]
+                active, target = slots["active"], state["target_buy_count"]
+                pending = slots.get("pending_review", 0)
+                occupied = slots.get("occupied", active + pending)
+                blocked = bool(state.get("admission_block_reasons")) or (active < target and occupied >= target)
+                mode = "已暂停新增" if not state["desired_running"] else "新增受阻" if blocked else "继续检查"
+                reserved = state["funds"].get("pending_reserved_usd", "未知")
+                message += f"\n\n自动池：{mode}；有效 BUY {active}/{target}，待核对 {pending} 笔，未核清占资 {reserved} USDC。"
+                if state["funds"].get("status") == "unknown":
+                    message += " 资金事实仍未全部核清。"
+            except Exception:
+                message += "\n\n自动池：状态未核实。"
+        else:
+            message += "\n\n自动池：状态未核实。"
+        if not recovery:
+            message += "\n系统继续核对并保留受影响资金；详情见 Dashboard。"
+        return title, message, voice
+
+    def _needs_attention_recovery_patch(self, session):
+        channels = {str(key) for key, value in (session.get("needs_attention_channel_status") or {}).items() if value}
+        episode = str(session.get("needs_attention_episode") or "")
+        return {
+            "reconciliation": None, "resume_state": None,
+            "needs_attention_since": None, "needs_attention_notified": False,
+            "needs_attention_due": False, "needs_attention_channel_status": {},
+            "needs_attention_send_error": None, "needs_attention_sending": False,
+            "needs_attention_send_retry_at": None,
+            "needs_attention_recovery_due": bool(session.get("needs_attention_notified") or channels),
+            "needs_attention_recovery_episode": episode,
+            "needs_attention_verified_recovery_episode": episode,
+            "needs_attention_recovery_channels": sorted({"feishu", "xiaoai"} if session.get("needs_attention_notified") else channels),
+            "needs_attention_recovery_channel_status": {},
+            "needs_attention_recovery_retry_at": None,
+        }
+
+    def _attention_recovery_ready(self, session, *, prefix="needs_attention", financial_known=None):
+        since_key, checked_key = prefix + "_recovery_ready_since", prefix + "_recovery_first_checked_at"
+        terminal = session.get("settled") or session.get("state") in {"complete", "entry_rejected"}
+        checked = (session.get("attention_verified_at") if terminal else None) or session.get("facts_checked_at") or session.get("checked_at")
+        if terminal and session.get("attention_verification_error") == "verification_pending":
+            return False, {}
+        if terminal and (session.get("attention_verification_error") or (
+                session.get("attention_verified_at") and session.get("attention_verified_trade_generation") != self.store.lp_trade_generation())):
+            return False, {since_key: None, checked_key: None}
+        if financial_known is None:
+            financial_known = session.get("position_reconciled") is True and not self._has_unresolved_submission(session)
+        if (not financial_known or session.get("state") == "needs_attention"
+                or session.get("facts_error") or session.get("financial_block_reason")
+                or session.get("position_reconciled") is False or not checked):
+            return False, {since_key: None, checked_key: None}
+        try:
+            stamp = _timestamp(checked, name="recovery_facts")
+            _freshness(stamp, self._now(), "recovery_facts", max_age=60)
+            since = session.get(since_key)
+            if not since:
+                return False, {since_key: self._now().isoformat(), checked_key: stamp.isoformat()}
+            ready = (stamp - _timestamp(session[checked_key], name="first_recovery_facts")).total_seconds() >= 60
+            return ready, {}
+        except (ValueError, KeyError):
+            return False, {}
+
     def flush_session_attention(self, session_id: str) -> None:
-        """Deliver one persisted session episode outside every critical section."""
-        with self._attention_delivery_lock:
-            session = self.store.lp_session(session_id)
-            if session is None or str(session.get("state")) != "needs_attention":
-                return
-            now = self._now()
-            retry = session.get("needs_attention_send_retry_at")
-            if retry and now < _timestamp(retry, name="needs_attention_send_retry_at"):
-                return
-            if not session.get("needs_attention_due"):
-                return
-            episode = str(session.get("needs_attention_episode") or "")
-            view = session.get("queue_protection")
-            failures = _queue_group_failures_int(
-                view.get("data_failures") if isinstance(view, Mapping) else 0
-            )
-            main, xiaoai_reason = self._needs_attention_reason_copy(
-                session.get("reconciliation")
-            )
-            identity = _text(session.get("market_title")) or str(
-                session.get("condition_id") or ""
-            )[:12]
-            message = main + (
-                f" 数据读取失败 {failures}/10，满 10 次将保护性撤单。"
-                if failures > 0
-                else ""
-            )
-            self.store.lp_update_session(session_id, patch={
-                "needs_attention_sending": True,
-                "needs_attention_send_retry_at": (
-                    now + timedelta(seconds=60)
-                ).isoformat(),
-            })
-            prior_status = (
-                session.get("needs_attention_channel_status")
-                if isinstance(session.get("needs_attention_channel_status"), Mapping)
-                else {}
-            )
-            pending = {
-                channel
-                for channel, delivered in (
-                    (str(key), bool(value)) for key, value in prior_status.items()
-                )
-                if channel in {"feishu", "xiaoai"} and not delivered
-            } or {"feishu", "xiaoai"}
-            results = self._deliver_protection_details(
-                f"LP 需要核对 · {identity}",
-                message,
-                f"LP 需要核对，{xiaoai_reason}",
-                channels=pending,
-            )
-            self.store.lp_finish_attention_notification(
-                session_id, recovery=False, episode=episode, results=results
-            )
+        self._flush_attention_notices(session_id, recovery=False)
 
     def flush_session_recovery(self, session_id: str) -> None:
-        """Deliver the one recovery notice after the recovery transaction."""
+        self._flush_attention_notices(session_id, recovery=True)
+
+    def _flush_attention_notices(self, session_id: str, *, recovery: bool) -> None:
+        """Batch one reason; retry confirmed delivery bookkeeping without I/O."""
         with self._attention_delivery_lock:
-            session = self.store.lp_session(session_id)
-            if session is None or not session.get("needs_attention_recovery_due"):
+            selected = self.store.lp_session(session_id)
+            for key, results in list(self._attention_delivery_results.items()):
+                sid, cached_recovery, episode = key
+                if sid != session_id:
+                    continue
+                episode_key = "needs_attention_recovery_episode" if cached_recovery else "needs_attention_episode"
+                if not selected or selected.get("account_baseline_archive") or str(selected.get(episode_key)) != episode:
+                    self._attention_delivery_results.pop(key, None)
+                    continue
+                retry_key = "needs_attention_recovery_retry_at" if cached_recovery else "needs_attention_send_retry_at"
+                retry = selected.get(retry_key)
+                if not retry or self._now() >= _timestamp(retry, name="attention_ack_retry"):
+                    self.store.lp_finish_attention_notification(sid, recovery=cached_recovery, episode=episode, results=results)
+                    self._attention_delivery_results.pop(key, None)
+                    selected = self.store.lp_session(session_id)
+            due_key = "needs_attention_recovery_due" if recovery else "needs_attention_due"
+            if selected is None or selected.get("account_baseline_archive") or not selected.get(due_key):
                 return
-            episode = str(session.get("needs_attention_recovery_episode") or "")
-            now = self._now()
-            retry = session.get("needs_attention_recovery_retry_at")
-            if retry and now < _timestamp(
-                retry, name="needs_attention_recovery_retry_at"
-            ):
+            if self.store.lp_auto_owns_session(session_id):
                 return
-            self.store.lp_update_session(session_id, patch={
-                "needs_attention_sending": True,
-                "needs_attention_recovery_retry_at": (
-                    now + timedelta(seconds=60)
-                ).isoformat(),
-            })
-            prior_status = (
-                session.get("needs_attention_recovery_channel_status")
-                if isinstance(
-                    session.get("needs_attention_recovery_channel_status"), Mapping
-                )
-                else {}
-            )
-            raw_channels = session.get("needs_attention_recovery_channels")
-            requested = {
-                str(value)
-                for value in _items(raw_channels)
-                if str(value) in {"feishu", "xiaoai"}
-            } or {"feishu", "xiaoai"}
-            pending = requested - {
-                channel
-                for channel, delivered in (
-                    (str(key), bool(value)) for key, value in prior_status.items()
-                )
-                if delivered
-            }
-            results = self._deliver_protection_details(
-                "LP 需要核对已恢复",
-                "LP 会话核对已恢复；自动运行/暂停设置保持不变。",
-                "LP 需要核对已恢复",
-                channels=pending,
-            )
-            self.store.lp_finish_attention_notification(
-                session_id, recovery=True, episode=episode, results=results
-            )
+            reason = self._attention_session_reason(selected)
+            if not recovery and self._attention_internal_wait(reason):
+                return
+            group_key = "needs_attention_recovery_delivery_group" if recovery else "needs_attention_delivery_group"
+            episode_key = "needs_attention_recovery_episode" if recovery else "needs_attention_episode"
+            status_key = "needs_attention_recovery_channel_status" if recovery else "needs_attention_channel_status"
+            retry_key = "needs_attention_recovery_retry_at" if recovery else "needs_attention_send_retry_at"
+            group = selected.get(group_key)
+            rows = []
+            fences = {}
+            for row in self.store.lp_sessions():
+                if row.get("account_baseline_archive") or not row.get(due_key) or not row.get(episode_key):
+                    continue
+                trade_generation = self.store.lp_trade_generation()
+                snapshot = self.store.lp_session_with_revision(row["session_id"])
+                if snapshot is None or snapshot[0].get(episode_key) != row.get(episode_key):
+                    continue
+                row, revision = snapshot
+                if row.get("account_baseline_archive") or not row.get(due_key):
+                    continue
+                if self.store.lp_auto_owns_session(row["session_id"]):
+                    continue
+                if group and row.get(group_key) != group:
+                    continue
+                if not group and row.get(group_key):
+                    continue
+                if not recovery and (row.get("state") != "needs_attention" or self._attention_session_reason(row) != reason):
+                    continue
+                retry = row.get(retry_key)
+                if retry and self._now() < _timestamp(retry, name="attention_retry"):
+                    continue
+                if recovery:
+                    ready, patch = self._attention_recovery_ready(row)
+                    if patch:
+                        self.store.lp_update_session(row["session_id"], patch=patch)
+                    if not ready:
+                        continue
+                rows.append(row)
+                fences[row["session_id"]] = (revision, trade_generation)
+            if not rows:
+                return
+            group = group or uuid.uuid5(uuid.NAMESPACE_URL, str(recovery) + ":" + ":".join(
+                sorted(str(row["session_id"]) + ":" + str(row[episode_key]) for row in rows)
+            )).hex
+            pending = set()
+            statuses = {}
+            claimed = []
+            for row in rows:
+                sid, episode = str(row["session_id"]), str(row[episode_key])
+                key = (sid, recovery, episode)
+                requested = set(row.get("needs_attention_recovery_channels") or ("feishu", "xiaoai")) if recovery else {"feishu", "xiaoai"}
+                prior = row.get(status_key) or {}
+                cached = self._attention_delivery_results.get(key, {})
+                status = {channel: bool(prior.get(channel) or cached.get(channel)) for channel in requested}
+                claim = self.store.lp_claim_attention_notification(sid, recovery=recovery,
+                    episode=episode, revision=fences[sid][0], trade_generation=fences[sid][1], patch={
+                    "needs_attention_sending": True,
+                    group_key: group,
+                    retry_key: (self._now() + timedelta(seconds=60)).isoformat(),
+                })
+                if claim is None:
+                    continue
+                claimed.append(claim)
+                statuses[key] = status
+                pending.update(channel for channel, delivered in status.items() if not delivered)
+            if not claimed:
+                return
+            for key, status in statuses.items():
+                self._attention_delivery_results[key] = status
+            batches = {}
+            for channel in sorted(pending):
+                recipients = tuple(row["session_id"] for row in claimed
+                    if channel in statuses[(str(row["session_id"]), recovery, str(row[episode_key]))]
+                    and not statuses[(str(row["session_id"]), recovery, str(row[episode_key]))][channel])
+                batches.setdefault(recipients, set()).add(channel)
+            for recipients, channels in batches.items():
+                title, message, voice = self._attention_notice(
+                    [row for row in claimed if row["session_id"] in recipients], recovery=recovery, reason=reason)
+                with notification_delivery_episode("lp-session:" + group):
+                    results = self._deliver_protection_details(title, message, voice, channels=channels)
+                for key, status in statuses.items():
+                    if key[0] in recipients:
+                        status.update({channel: bool(results.get(channel)) for channel in channels})
+                        self._attention_delivery_results[key] = status
+            # Cache every recipient before the first ack: a later DB failure
+            # must not re-send the batch members whose acknowledgement failed.
+            for key, status in statuses.items():
+                sid, _, episode = key
+                self.store.lp_finish_attention_notification(sid, recovery=recovery, episode=episode, results=status)
+                self._attention_delivery_results.pop(key, None)
 
     def _queue_protection_identity(
         self, session: Mapping[str, object]
