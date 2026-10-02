@@ -5,6 +5,19 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-02
 
+- #226 部署前验收发现 runtime 观察测试缺少保护监控事实，且原盘口会触发正常队列撤单。
+  补齐测试快照与安全队列，明确等待 12 轮真实监控；保留 12% 告警、零交易和停止清理断言。
+  runtime 文件 74 passed；观察误撤单、读取故障及 50% 队列边界的负向检查均拒绝。
+  Candidate 仍 FAIL（另有本地 Docker 磁盘不足）；云端仅准备依赖，未启动，24 小时验证未开始。
+
+- #226：奖励目录逐页转换并释放原始 SDK 对象；目录、方向明细、准备快照和元数据缓存逐项存入进程私有临时 SQLite，
+  保留原始事实类型、有效期与代次，筛选后的详细队列只保留完整候选/备选集合。筛选和收益排序规则未改。
+  云端暂停 N-leg 的 Shadow 增加 cgroup 资源上限、整机余量检查和触线自停，禁止自动重启；
+  离线 1.8 万市场三轮完整结果一致，峰值 RSS 266→230MiB；受影响聚焦检查 603 passed、1 既有 skip。
+  验收先完成受限启动与首轮完整供数，再做 24 小时观察；真实云端仍 UNKNOWN，详见 [验证记录](docs/operations/issue-226-memory-validation.md)。
+
+- 将本 PR 重放到最新 main，保留双方变更日志及完整后台 CI 规则；仅解决日志冲突，原功能和交易行为不变。
+
 - 调整开发与 CI 分工：本地使用已有 Python 环境和当前 worktree 源码，只跑直接受影响
   或新增的测试；共享模块覆盖相关消费者并集，不再要求本地整服务测试或推送前 Docker。
   每次分支 push、PR-to-main 合并候选及合并后的 main push 均运行四个后台服务，统一

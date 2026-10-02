@@ -18,7 +18,7 @@ def test_systemd_unit_pins_all_code_paths_and_keeps_secrets_out(tmp_path):
     assert '--host 127.0.0.1 --port 8769' in unit
     assert 'OPEN_TRADER_CREDENTIAL_BACKEND=disabled' in unit
     assert 'OPEN_TRADER_SSM_' not in unit
-    assert 'LimitCORE=0' in unit and 'SendSIGKILL=no' in unit
+    assert 'LimitCORE=0' in unit and 'SendSIGKILL=yes' in unit
     assert 'Environment=GIT_CONFIG_KEY_0=safe.directory' in unit
     assert f'Environment=GIT_CONFIG_VALUE_0={cfg.release_root}' in unit
     assert 'User=prediction' in unit and 'OPEN_TRADER_NLEG_PAUSED=1' in unit
