@@ -7,16 +7,17 @@ import re
 import subprocess
 import sys
 
-SCOPES = ('gateway', 'legacy', 'account', 'prediction', 'trend-curve')
-BACKEND_SCOPES = SCOPES[:4]
+BACKEND_SCOPES = ('gateway', 'legacy', 'account', 'prediction')
+REQUIRED_SCOPES = BACKEND_SCOPES + ('portable',)
+SCOPES = REQUIRED_SCOPES + ('trend-curve',)
 
 
 def route(paths):
     # Paths remain diagnostic evidence only: every branch/PR/main candidate
     # receives the complete backend partition, including paused N-leg tests.
     # Legacy includes trend-curve, so its standalone job remains unselected.
-    return {'scopes': list(BACKEND_SCOPES), 'test_n_leg': '1',
-            'reason': 'full backend coverage for every CI candidate'}
+    return {'scopes': list(REQUIRED_SCOPES), 'test_n_leg': '1',
+            'reason': 'full backend and portable coverage for every CI candidate'}
 
 
 def changed_paths(base, head, cwd=None):
@@ -31,7 +32,7 @@ def required(needs):
             return False, 'plan did not succeed'
         plan = json.loads(needs['plan']['outputs']['plan'])
         scopes = plan['scopes']
-        if (scopes != list(BACKEND_SCOPES) or plan['test_n_leg'] != '1'
+        if (scopes != list(REQUIRED_SCOPES) or plan['test_n_leg'] != '1'
                 or not isinstance(plan['reason'], str) or not plan['reason']):
             return False, 'invalid full-backend plan'
         for scope in SCOPES:
@@ -39,7 +40,7 @@ def required(needs):
             expected = 'success' if scope in scopes else 'skipped'
             if result != expected:
                 return False, f'{scope}: expected {expected}, got {result}'
-        return True, 'all backend service checks succeeded with N-leg coverage'
+        return True, 'all backend and portable checks succeeded with N-leg coverage'
     except (KeyError, TypeError, ValueError):
         return False, 'missing or malformed plan/job results'
 

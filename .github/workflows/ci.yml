@@ -51,7 +51,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ci-gateway-${{ github.sha }}
+          name: ci-gateway-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/ci-evidence
           retention-days: 3
           if-no-files-found: error
@@ -74,7 +74,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ci-legacy-${{ github.sha }}
+          name: ci-legacy-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/ci-evidence
           retention-days: 3
           if-no-files-found: error
@@ -97,7 +97,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ci-account-${{ github.sha }}
+          name: ci-account-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/ci-evidence
           retention-days: 3
           if-no-files-found: error
@@ -120,7 +120,30 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ci-prediction-${{ github.sha }}
+          name: ci-prediction-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci-evidence
+          retention-days: 3
+          if-no-files-found: error
+
+  portable:
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.plan).scopes, 'portable')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Run offline portable development tests
+        env:
+          TEST_N_LEG: ${{ fromJSON(needs.plan.outputs.plan).test_n_leg }}
+        run: bash scripts/run_ci_service.sh "portable" "$TEST_N_LEG" "${{ runner.temp }}/ci-evidence"
+      - name: Preserve exact-SHA test and dependency evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ci-portable-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/ci-evidence
           retention-days: 3
           if-no-files-found: error
@@ -143,7 +166,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ci-trend-curve-${{ github.sha }}
+          name: ci-trend-curve-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/ci-evidence
           retention-days: 3
           if-no-files-found: error
@@ -151,7 +174,7 @@ jobs:
   required:
     name: required
     if: always()
-    needs: [plan, gateway, legacy, account, prediction, trend_curve]
+    needs: [plan, gateway, legacy, account, prediction, portable, trend_curve]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -159,7 +182,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Require all backend services and N-leg coverage
+      - name: Require all backend, portable and partition checks
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
         run: |

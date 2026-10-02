@@ -24,6 +24,7 @@ def test_template_runs_only_the_loopback_shadow_service() -> None:
     assert payload["EnvironmentVariables"] == {
         "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
         "PYTHONPATH": "OPEN_TRADER_REPO/src",
+        "PYTHONDONTWRITEBYTECODE": "1",
         "OPEN_TRADER_NLEG_PAUSED": "OPEN_TRADER_NLEG_PAUSED_VALUE",
     }
     assert payload["ProgramArguments"] == [

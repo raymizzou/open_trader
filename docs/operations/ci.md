@@ -4,8 +4,9 @@
 `main`, including documentation-only changes and the final merged-main push.
 Every run selects all four existing backend services: `gateway`, `legacy`,
 `account`, and `prediction`, with `TEST_N_LEG=1`. Full backend coverage excludes
-`pressure` and `browser`; it does not include Candidate Acceptance, Host Readiness
-or Production Smoke.
+`pressure` and `browser`; it does not include Deployment Preflight, Host Readiness
+or Production Smoke. Non-LIVE portable prediction scenarios run in a separate
+serial job and are required by the aggregate.
 
 The stable aggregate appears as **CI / required** in the UI (workflow `CI`, job
 `required`), but its exact API check-run/context name is **`required`**, emitted
@@ -26,7 +27,8 @@ Record the PR head, base, tested SHA, event and Actions run together. Any head/b
 change needs fresh applicable verification; stale or cancelled runs do not qualify.
 After authorized GitHub merge, inspect the main-push run for that exact final SHA.
 Only the selected final main SHA is eligible for separately authorized
-predeployment Candidate Acceptance; CI never substitutes for it.
+predeployment identity and evidence checks; see [Deployment Preflight](deployment-preflight.md).
+Deployment no longer repeats the backend suite.
 
 Changed paths and diff availability do not narrow CI. Documentation-only, isolated
 LP, standalone trend-curve, shared, unknown, deleted/renamed, empty-diff and
@@ -49,7 +51,7 @@ Prediction uses two xdist workers appropriate for a standard Linux runner.
 Image builds can download locked dependencies; tests use the existing
 network-disabled container, no host mounts, forwarded credentials, Docker socket
 or published ports. There are no real account credentials, trading requests,
-Candidate Acceptance, host readiness or production Smoke steps.
+Deployment Preflight, host readiness or production Smoke steps.
 
 The workflow uses standard `ubuntu-24.04` runners, `contents: read`, commit-pinned
 Actions and checkouts without persisted credentials. Each service times out after
@@ -57,9 +59,9 @@ Actions and checkouts without persisted credentials. Each service times out afte
 same PR or branch; push and PR concurrency groups remain separate. Cancellation
 is not success; inspect the latest exact-SHA run.
 
-The aggregate always evaluates the planner and all five fixed job results. All
-four backend services must succeed, and the retained trend-curve job must be
-skipped. Failure, cancellation, an unexpectedly skipped service, missing result,
+The aggregate always evaluates the planner and all fixed job results. All
+four backend services and the portable scenario job must succeed; the retained
+trend-curve job must be skipped. Failure, cancellation, an unexpectedly skipped service, missing result,
 malformed or narrowed plan, disabled N-leg coverage, or a claimed documentation
 exemption fails closed. Documentation-only changes receive no CI exemption.
 Planner/aggregation contract tests exercise these cases and verify nonzero CLI
@@ -85,5 +87,16 @@ Follow the [PR-first verification runbook](agent-verification.md): focused local
 checks, independent staged review, authorized branch push, Draft PR, latest
 exact-SHA `required` success, and explicit user approval before GitHub merge.
 Local main only synchronizes the remote. Merge remains separate from release/tag
-creation, Candidate Acceptance and deployment; no CI job grants production or
+creation, Deployment Preflight and deployment; no CI job grants production or
 trading authorization.
+
+## Collection and execution semantics
+
+CI proves that the four selected service collections cover the full backend
+collection without gaps or overlaps under `not pressure and not browser` and
+`TEST_N_LEG=1`. Portable scenarios are separately selected with `not LIVE`.
+Gateway, Legacy and Account keep serial execution. Prediction preserves its
+explicit xdist shared-port and solver-cache groups; portable scenarios are serial.
+This does not recreate the former arbitrary global cross-service serial ordering.
+There is no duplicated full-backend pass. Trusted per-attempt evidence binds
+test selection, collection proof, lock and test environment to the run.

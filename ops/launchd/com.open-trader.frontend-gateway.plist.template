@@ -13,6 +13,8 @@
   <dict>
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PYTHONDONTWRITEBYTECODE</key>
+    <string>1</string>
     <key>PYTHONPATH</key>
     <string>OPEN_TRADER_REPO/src</string>
   </dict>

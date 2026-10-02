@@ -5,6 +5,8 @@
   <key>WorkingDirectory</key><string>OPEN_TRADER_REPO</string>
   <key>EnvironmentVariables</key><dict>
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PYTHONDONTWRITEBYTECODE</key>
+    <string>1</string>
     <key>PYTHONPATH</key><string>OPEN_TRADER_REPO/src</string>
     <key>OPEN_TRADER_NLEG_PAUSED</key><string>OPEN_TRADER_NLEG_PAUSED_VALUE</string>
   </dict>

@@ -1,7 +1,7 @@
 # Agent Verification and Delivery
 
 This runbook is binding with `AGENTS.md` and the global agent instructions.
-Read it before selecting or running development gates, Candidate Acceptance,
+Read it before selecting or running development gates, Deployment Preflight,
 merge, or deployment. Documentation and configuration-only work does not run
 `make test`; other exemptions below remain scope-specific.
 
@@ -35,8 +35,8 @@ including the final merged-main push: `gateway`, `legacy`, `account`, and
 Documentation-only, LP-only, trend-only and unavailable/empty diff cases all run
 that same coverage. Push CI tests the branch head; PR CI tests the synthetic merge
 candidate. These intentionally separate runs cover distinct SHA identities.
-See [CI identity and execution](ci.md). CI does not run Candidate Acceptance,
-Host Readiness or Production Smoke.
+See [CI identity and execution](ci.md). CI also runs the non-LIVE portable prediction scenarios. It does not run
+Deployment Preflight, Host Readiness or Production Smoke.
 
 ### Existing Docker test mechanics
 
@@ -58,7 +58,9 @@ tests share one worker to reuse their full-handoff fixture cache. CI overrides
 this to two workers for Prediction. `TEST_WORKERS=4` can reduce busy-host load and
 `TEST_WORKERS=1` supports serial diagnosis. Non-Prediction services and explicit
 `TEST=...` selections default to serial, and also accept `TEST_WORKERS`.
-Candidate Acceptance remains serial.
+Portable scenarios run serially in CI. Known Prediction shared-port and cached
+fixture groups retain their xdist grouping; global cross-service serial ordering
+is not a separate deployment requirement. CI proves backend collection coverage.
 The development image includes Node and `procps`, but excludes npm, Python/JS
 Playwright and Chromium/browser assets. Test containers have no host mounts,
 network, published ports, Docker socket, home directory or credentials.
@@ -69,10 +71,9 @@ The 2026-09-29 approved cloud credential exception permits only the optional
 `cloud-ssm` extra (pinned Tencent SSM SDK and common SDK); Docker development
 installs it for offline SDK transport tests. Do not add other dependencies or
 weaken existing skips/xfails. Playwright remains a host-only Production Smoke
-prerequisite; ordinary development and Candidate Acceptance have zero browser
-cost. Candidate Acceptance runs only for the selected final GitHub `main` SHA
-when preparing an explicitly authorized deployment after PR merge, never during
-development/review, before merge or automatically after merge.
+prerequisite; ordinary backend CI and Deployment Preflight have zero browser cost. Deployment
+Preflight reuses trusted main-push evidence for the selected final GitHub `main`
+SHA when preparing an explicitly authorized deployment. It does not rerun tests.
 
 ## Test design and stability
 
@@ -137,15 +138,17 @@ they do not change the scope-specific verification routes above.
    Restage the exact changes and obtain independent review before publication;
    existing exact-SHA, rebase, CI, and approval requirements still apply.
 
-## Four separate gates
+## Verification and deployment boundaries
 
-The results are independent: development verification, Candidate Acceptance,
-Host Readiness, and Production Smoke. Each result applies only to the exact
-SHA named by its gate.
+Development verification, trusted CI, Deployment Preflight, Host Readiness, and
+Production Smoke have distinct evidence. Each result applies only to its exact SHA.
+See [the source-release preflight runbook](deployment-preflight.md) for the supported
+forward-deployment wrapper, trust checks, environment limits and rollback path.
 
-- `make candidate-acceptance` must end with `Candidate Acceptance: PASS` or
-  `FAIL`. It is backend-only, excludes `pressure` and `browser`, and excludes
-  only `LIVE-*` scenarios from the portable prediction suite.
+- `make deployment-preflight EXPECTED_SHA=<40hex> PYTHON_BIN=<release-python>`
+  checks trusted exact-SHA CI and source/lock/runtime identity. Success exits zero;
+  missing or mismatched evidence exits nonzero. It runs no backend pytest or Docker
+  build. CI owns the four backend services and non-LIVE portable scenarios.
 - `make host-readiness` is read-only and must end with `READY` or `BLOCKED`.
   On a fresh host with no Open Trader launchd agent or selected-service
   listener, use `FIRST_DEPLOY=1`. This checks that no managed agent or selected
@@ -180,9 +183,9 @@ SHA named by its gate.
   non-read-only requests before navigation. Smoke checks the selected
   Prediction N_LEG contract before the browser run according to
   `N_LEG_PAUSED` and never downloads a browser or starts the fixture server.
-- `make acceptance` is the non-mutating Docker Candidate Acceptance alias. It
-  never installs launchd, performs an outage check, reads production, or
-  submits orders.
+- `make candidate-acceptance` and `make acceptance` are compatibility aliases
+  for Deployment Preflight. They read GitHub and the selected local environment;
+  they never install services, build images, rerun tests or submit orders.
 
 Both readiness and Smoke accept a nonempty whitespace-separated
 `RELEASE_SERVICES` list containing only `gateway`, `legacy`, `account`, and
@@ -231,11 +234,10 @@ PR merge commit (`github.sha` for PR CI); and the final GitHub `main` commit
 after merge. Record the PR head, base and tested merge SHA with the Actions run.
 Inspect the exact check-run name `required` from GitHub Actions (app ID 15368),
 not only a green UI label; see [ci.md](ci.md). PR CI success never establishes
-Candidate Acceptance for a different final SHA. Recheck CI for the final main
-SHA, and run Candidate Acceptance only for that selected final GitHub `main`
-SHA when preparing an explicitly authorized deployment. It is not a PR merge
-gate, and merging alone never starts it. A later SHA invalidates earlier
-exact-SHA acceptance evidence.
+deployment evidence for a different final SHA. Deployment Preflight requires
+successful main-push CI for the selected final SHA, retained in main history.
+A later tip does not erase that evidence; changing the selected release SHA does.
+It is not a PR merge gate, and merging alone never deploys or starts a preflight.
 
 Branch/tag settings in [repository-protection.md](repository-protection.md)
 are a proposed, separately approved next stage, not active enforcement. Older
@@ -252,30 +254,28 @@ timestamped logs before claiming that live behavior changed.
 Before the first deployment, manually move production once to a clean,
 immutable detached release checkout. `make`, acceptance, readiness, and Smoke
 never perform that migration. After explicit deployment authorization, deploy
-only the exact Candidate-accepted SHA using the existing release runbook, then
-run Smoke against that detached checkout. Smoke reads selected-service health,
+only the exact CI-verified SHA through `scripts/deploy_release.py` and the existing
+release runbook, then run Smoke against that detached checkout. Smoke reads selected-service health,
 process/listener, logs, the selected Prediction N_LEG/LP contract, and browser evidence; it never deploys,
 restarts, rolls back, or submits. `ROLLBACK` is evidence only.
 
-Candidate `FAIL` or Host `BLOCKED` blocks deployment. For a Candidate failure,
-first complete one read-only audit of every reported error and its downstream
-dependencies. Then make one batched fix-forward, rerun focused checks and
-independent review, submit a repair PR, pass CI, obtain user merge approval,
-and merge on GitHub. Rerun Candidate Acceptance for the resulting final main
-deployment SHA; do not mutate production. Stop without edits for a
-business-rule or architecture decision, an external credentials/services/
-market/browser/data blocker, a dirty or invalid candidate checkout, a candidate
-SHA not verified as the selected final GitHub main commit, a changed SHA, a
-non-reproducible failure, or any repair requiring test weakening or scope
-expansion. An isolated repair branch and a clean detached immutable release
-checkout are expected; neither is required to be named `main`.
+Failed Deployment Preflight or Host `BLOCKED` blocks forward deployment. Missing,
+expired, cancelled or mismatched CI evidence is not a reason to rerun local full
+pytest. Report the missing check and obtain fresh trusted CI evidence through the
+approved process. A real test failure returns through focused diagnosis, approved
+in-scope repair, independent review, Draft PR, CI and separately authorized merge.
+Do not weaken tests, invent attestations, provision credentials or expand scope to
+turn an unknown result into success.
 
-Deployment requires the exact-SHA Candidate `PASS`, Host `READY`, and explicit
+Deployment requires exact-SHA preflight success, fresh Host `READY`, and explicit
 user authorization. Production Smoke must report `HEALTHY` for that same SHA.
 Branch push, Draft PR, GitHub merge, release/tag creation and deployment remain
-separate authorization boundaries. Do not infer release or deployment permission
-from push or merge approval. Preserve the exact accepted SHA, immutable root,
-`code_root`, service owner and rollback evidence throughout the handoff.
+separate authorization boundaries. Preserve the exact selected SHA, immutable
+root, `code_root`, service owner and rollback evidence throughout the handoff.
+Existing authorized rollback uses the recorded compatible release and retained
+environment; it is not blocked by expired forward CI artifacts. Low-level helpers
+retain their rollback semantics and are not a substitute for the supported
+forward-deployment wrapper.
 
 ## Prediction-only Linux cloud topology
 
@@ -284,6 +284,6 @@ For CVM Prediction with a local Prediction-only Gateway, use the additional
 in [prediction-cloud.md](prediction-cloud.md). They retain the exact-SHA,
 read-only browser and independent ownership requirements across both machines.
 The systemd helper's `PRECHECK_OK` and `BACKEND_SMOKE_OK` are component results,
-not substitutes for READY and HEALTHY. Candidate Acceptance timing, deployment
-and trading authorization remain unchanged. Operator handoff, metadata isolation
+not substitutes for READY and HEALTHY. Deployment and trading authorization remain separate. Trusted preflight replaces
+the former duplicate Candidate tests; cloud host/runtime checks remain fresh. Operator handoff, metadata isolation
 and shared-host resource evidence must be explicit; the gate does not invent it.
