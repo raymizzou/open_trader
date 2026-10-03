@@ -3,6 +3,12 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-04
+
+- #240 的只读候选刷新回归在检查 dashboard 漏斗前，等待对应候选轮次发布到页面快照，
+  消除候选工作已完成而页面仍为待发布状态的时序依赖；保留刷新延迟、鉴权、无交易写入、
+  目录读取不重叠及未知候选不展示的断言。生产交易和页面行为不变，验证及失败记录见 PR。
+
 ## 2026-10-03
 
 - LP 元数据读取将 Gamma 事件批次从 100 缩至 10，在读取线程内仅保留事件身份、链接、状态和时间，
