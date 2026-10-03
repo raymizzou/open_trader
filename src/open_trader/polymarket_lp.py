@@ -39,6 +39,9 @@ from .polymarket_lp_risk import (
     evaluate_lp_entry,
     first_observation_baseline,
 )
+from .polymarket_lp_accounting import (
+    build_account_financial_facts, reservation_is_covered,
+)
 from .polymarket_lp_errors import LpObservationWait
 from .polymarket_lp_notification_batches import (
     ChannelStatuses,
@@ -6568,8 +6571,24 @@ class PolymarketLPService:
 
     def _candidate_reservations(self, *, ignore_session_id=None) -> tuple[dict[str, object], ...]:
         reservations: list[dict[str, object]] = []
+        account_id = str(getattr(getattr(self.exchange, "config", None), "wallet_address", "") or "").strip().casefold()
         for session in self.store.lp_active_sessions():
             if session.get("session_id") == ignore_session_id:
+                continue
+            if reservation_is_covered(session, account_id):
+                # The original entry request remains an UNKNOWN audit record,
+                # but its temporary hold was replaced by full account facts.
+                # Candidate account snapshots already count actual open IDs.
+                # A later independent BUY must never inherit entry coverage.
+                for action in self.store.lp_actions(str(session["session_id"])):
+                    if (str(action.get("side") or "").upper() == "BUY"
+                            and action.get("role") != "entry"
+                            and action.get("state") in {"pending", "unknown"}
+                            and "cancel" not in str(action.get("action_key") or "")):
+                        reservations.append({
+                            "order_id": str(action.get("order_id") or f"lp-action:{action['action_id']}"),
+                            "amount": None,
+                        })
                 continue
             order_id = str(session.get("entry_order_id") or "").strip()
             if not order_id:
@@ -8198,86 +8217,123 @@ class PolymarketLPService:
             str(_field(row, "order_id", _field(row, "id", "")) or "") for row in raw_orders
         }
         rows = [*raw_orders, *(row for row in owned_fills if str(row.get("order_id")) not in known_ids)]
-        if not rows:
-            return {"state": "registered", "tokens": [], "created": 0, "joined": 0}
         groups: dict[str, list[Mapping[str, object]]] = {}
         for row in rows:
             token = str(_field(row, "token_id", _field(row, "asset_id", "")) or "")
             if not token:
                 return {"state": "failed", "reason": "account_order_identity_unknown"}
             groups.setdefault(token, []).append(row)
-        created = joined = 0
-        token_results: list[dict[str, object]] = []
+
+        def revisions(connection):
+            # Preparing baselines can perform network reads. Fence any changed
+            # ownership/trading state before the single account-wide commit.
+            return {
+                str(row["session_id"]): int(row["revision"] or 0)
+                for row in connection.execute(
+                    "SELECT session_id,json_extract(payload,'$._lp_trade_revision') AS revision "
+                    "FROM lp_sessions WHERE lower(trim(coalesce(json_extract(payload,'$.account_id'),''))) IN ('',?)",
+                    (account_id,),
+                ).fetchall()
+            }
+
+        with self.store._read_connection() as connection:
+            expected_revisions = revisions(connection)
+        prepared = []
         owned_ids = {
             order_id
             for session in self.store.lp_sessions()
             if str(session.get("account_id") or "").strip().casefold() in {"", account_id}
             for order_id in self._session_order_ids(session)
         }
-        for token, token_rows in groups.items():
-            try:
+        try:
+            for token, token_rows in groups.items():
                 self._prepare_sync_queue_baselines(token, token_rows)
                 existing = self._existing_token_session(token)
                 candidate = None
                 unknown_rows = [
-                    row
-                    for row in token_rows
-                    if str(_field(row, "order_id", _field(row, "id", "")) or "")
-                    not in owned_ids
+                    row for row in token_rows
+                    if str(_field(row, "order_id", _field(row, "id", "")) or "") not in owned_ids
                 ]
                 episode = next(
-                    (
-                        item
-                        for item in self.store.lp_active_first_seen_episodes()
-                        if str(item.get("token_id") or "") == token
-                    ),
-                    None,
+                    (item for item in self.store.lp_active_first_seen_episodes()
+                     if str(item.get("token_id") or "") == token), None,
                 )
                 if existing is None and unknown_rows:
-                    candidate = self._create_sync_session(
-                        snapshot, token, unknown_rows, episode
-                    )
+                    candidate = self._create_sync_session(snapshot, token, unknown_rows, episode)
                     if candidate is None:
-                        token_results.append(
-                            {"token_id": token, "state": "failed", "reason": "baseline_unknown"}
-                        )
-                        continue
+                        raise ValueError("baseline_unknown")
                 elif existing is not None and episode is not None:
-                    candidate = {
-                        "session_id": existing["session_id"],
-                        "_first_seen_episode_id": episode["episode_id"],
-                    }
-                with self._first_seen_apply_lock:
-                    result = self.store.lp_register_exchange_orders(
-                        account_id,
-                        token,
-                        token_rows,
-                        session=candidate,
+                    candidate = {"session_id": existing["session_id"],
+                                 "_first_seen_episode_id": episode["episode_id"]}
+                prepared.append((token, token_rows, candidate))
+
+            # Economics, identities and all endpoint-completeness flags are
+            # validated before the transaction. Unknown economics stay UNKNOWN
+            # and retain temporary holds; missing structure cannot publish.
+            financial_facts = build_account_financial_facts(
+                snapshot, now=self._now(), expected_account_id=account_id,
+            )
+            if "trade_fee_unknown" in financial_facts.get("reason_codes", ()):
+                # Reuse the existing verified fee rules only when raw
+                # execution evidence did not already establish its fees.
+                # Unavailable fee metadata blocks spending, not ID adoption.
+                metadata_reader = getattr(self.exchange, "lp_market_metadata", None)
+                conditions = tuple(dict.fromkeys(
+                    str(row.get("condition_id") or "") for row in rows if row.get("condition_id")
+                ))
+                try:
+                    metadata = metadata_reader(conditions) if callable(metadata_reader) and conditions else {}
+                except LpAccountRoundInvalid:
+                    raise
+                except Exception:
+                    metadata = {}
+                fee_metadata = {}
+                for row in (*rows, *snapshot.get("positions", ())):
+                    token = str(row.get("token_id") or row.get("asset_id") or "")
+                    market = metadata.get(str(row.get("condition_id") or "")) if isinstance(metadata, Mapping) else None
+                    if token and isinstance(market, Mapping):
+                        fee_metadata[token] = market
+                if fee_metadata:
+                    financial_facts = build_account_financial_facts(
+                        {**snapshot, "fee_metadata_by_token": fee_metadata},
+                        now=self._now(), expected_account_id=account_id,
+                    )
+            token_results = []
+            created = joined = 0
+            with self._first_seen_apply_lock:
+                with self.store._transaction() as connection:
+                    observed = connection.execute(
+                        "SELECT generation FROM lp_trade_generation WHERE singleton=1"
+                    ).fetchone()
+                    if observed is None or int(observed["generation"]) != generation:
+                        raise LpObservationWait("account_round_invalid")
+                    if revisions(connection) != expected_revisions:
+                        raise LpObservationWait("account_round_invalid")
+                    _freshness(read_ended, self._now(), "account_freshness")
+                    for token, token_rows, candidate in prepared:
+                        result = self.store.lp_register_exchange_orders(
+                            account_id, token, token_rows, session=candidate,
+                            expected_generation=generation, connection=connection,
+                        )
+                        state = "created" if result["created"] else "joined"
+                        created += int(result["created"])
+                        joined += int(not result["created"])
+                        token_results.append({"token_id": token, "state": state,
+                                              "session_id": result["session"]["session_id"]})
+                    # The empty-account case uses the same fenced transaction:
+                    # it is evidence of zero occupancy, not an early return.
+                    self.store.lp_publish_account_financial_facts(
+                        financial_facts, connection=connection,
                         expected_generation=generation,
                     )
-                # The canonical account identity is already fixed above.  The
-                # Store rechecks ownership inside the transaction; this short
-                # apply lane keeps legacy first-seen conversion serialized.
-                if existing is not None:
-                    joined += 1
-                    token_results.append({"token_id": token, "state": "joined"})
-                else:
-                    created += 1
-                    token_results.append(
-                        {
-                            "token_id": token,
-                            "state": "created",
-                            "session_id": result["session"]["session_id"],
-                        }
-                    )
-            except ValueError as exc:
-                token_results.append({"token_id": token, "state": "failed", "reason": str(exc)})
-        return {
-            "state": "registered" if all(item["state"] != "failed" for item in token_results) else "partial",
-            "tokens": token_results,
-            "created": created,
-            "joined": joined,
-        }
+            return {"state": "registered", "tokens": token_results,
+                    "created": created, "joined": joined}
+        except ValueError as exc:
+            if isinstance(exc, LpObservationWait):
+                return {"state": "skipped", "reason": "account_round_invalid",
+                        "wait_reason": str(exc), "tokens": [], "created": 0, "joined": 0}
+            return {"state": "failed", "reason": str(exc),
+                    "tokens": [], "created": 0, "joined": 0}
 
     def register_account_snapshot(
         self, snapshot: Mapping[str, object]
@@ -10708,7 +10764,9 @@ class PolymarketLPService:
                         patch.update(self._fill_patch(current, snapshot))
                         current = {**current, **patch}
                         receipt = self._order_history(current).get(str(current.get('entry_order_id')), {})
-                        if receipt.get('status') not in (None, '', 'UNKNOWN') and current.get('submit_status') in ('unknown','accepted_without_order_id',None):
+                        if (not reservation_is_covered(current)
+                                and receipt.get('status') not in (None, '', 'UNKNOWN')
+                                and current.get('submit_status') in ('unknown','accepted_without_order_id',None)):
                             patch.update(submit_status='accepted',resume_state=None)
                             current.update(patch)
                             state = 'review' if current.get('stop_requested') else 'entry_open'
@@ -16522,14 +16580,21 @@ class PolymarketLPService:
     def _has_unresolved_submission(session: Mapping[str, object]) -> bool:
         """Return whether any durable submit intent still lacks a terminal receipt."""
 
-        if str(session.get("state") or "") == "entry_submit_pending":
+        # Account coverage replaces only the ended original entry hold. Its
+        # UNKNOWN audit is not an independent in-flight SELL and must not
+        # prevent management of the actual orders/inventory in this group.
+        covered = reservation_is_covered(session)
+        if covered and str(session.get("submit_stage") or "") in {"preparing", "sending"}:
             return True
-        if str(session.get("submit_status") or "") in {
-            "pending",
-            "unknown",
-            "accepted_without_order_id",
-        }:
-            return True
+        if not covered:
+            if str(session.get("state") or "") == "entry_submit_pending":
+                return True
+            if str(session.get("submit_status") or "") in {
+                "pending",
+                "unknown",
+                "accepted_without_order_id",
+            }:
+                return True
         return any(
             str(session.get(key) or "")
             in {"pending", "unknown", "accepted_without_order_id"}

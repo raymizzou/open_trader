@@ -4874,9 +4874,23 @@ class PredictionArbitrageStore:
         # lower cumulative fill overwrite the durable higher value.
         old_price = _maybe_decimal(base.get("price"))
         new_price = _maybe_decimal(incoming.get("price"))
-        base["price"] = old_price if old_price is not None else new_price
         old_quantity = _maybe_decimal(base.get("quantity"))
         new_quantity = _maybe_decimal(incoming.get("quantity"))
+        if old_quantity is not None and new_quantity is not None:
+            if old_quantity != new_quantity:
+                raise ValueError("order_original_quantity_conflict")
+            if old_price is not None and new_price is not None and old_price != new_price:
+                raise ValueError("order_limit_price_conflict")
+        # Trade-only discovery uses execution average in price while original
+        # size is unknown. An actual order may establish its distinct limit;
+        # the execution average remains in average_price. Conversely a later
+        # fill-only row must never replace a known (or missing) original limit.
+        if old_quantity is None and new_quantity is not None:
+            base["price"] = new_price
+        elif old_quantity is not None and new_quantity is None:
+            base["price"] = old_price
+        else:
+            base["price"] = old_price if old_price is not None else new_price
         base["quantity"] = old_quantity if old_quantity is not None else new_quantity
         old_matched = _maybe_decimal(base.get("size_matched"))
         new_matched = _maybe_decimal(incoming.get("size_matched"))
@@ -5095,6 +5109,27 @@ class PredictionArbitrageStore:
                 if unknown and candidate_is_active:
                     active_id = candidate_id
                     active = candidate_item
+                elif unknown and active_id is None and expected_generation is None:
+                    from .polymarket_lp_accounting import reservation_is_covered
+                    retired = candidate_payload.get("account_coverage_retired")
+                    covered_candidate = {**candidate_payload, "session_id": candidate_id}
+                    if (str(candidate_item[0]["state"]) == "complete"
+                            and reservation_is_covered(covered_candidate, canonical_account)
+                            and isinstance(retired, Mapping)
+                            and retired.get("reason") == "account_observation_no_exposure"
+                            and not self._lp_owned_session_ids(candidate_payload)):
+                        # A late explicit exchange receipt may arrive after a
+                        # covered empty container retired. Reuse that container
+                        # only when no newer active token owner exists; keep
+                        # the original audit and one-way coverage intact.
+                        candidate_payload["account_id"] = canonical_account
+                        candidate_payload["resume_state"] = "entry_open"
+                        candidate_payload["account_coverage_reactivated"] = dict(
+                            reason="late_exchange_receipt", order_ids=sorted(record["order_id"] for record in unknown),
+                            observed_at=_utc_now())
+                        tx.execute("UPDATE lp_sessions SET state='entry_open' WHERE session_id=?", (candidate_id,))
+                        active_id = candidate_id
+                        active = candidate_item
             if unknown and active_id is not None:
                 routed.setdefault(active_id, []).extend(unknown)
                 routed_rows[active_id] = active[0]
@@ -6165,10 +6200,12 @@ class PredictionArbitrageStore:
         payload["facts_error"] = payload.get("facts_error") or "trade_change_pending"
         pool = connection.execute("SELECT payload FROM lp_auto_pool WHERE singleton=1").fetchone()
         if pool:
+            from .polymarket_lp_accounting import reservation_is_covered
             document = _load_payload(str(pool[0]))
             changed = False
             for intent in document.get("intents", {}).values():
-                if intent.get("session_id") == session_id and intent.get("state") != "reserved":
+                if (intent.get("session_id") == session_id and intent.get("state") != "reserved"
+                        and not reservation_is_covered(intent, document.get("account_id"))):
                     intent.update(financial_status="unknown", reconcile_reason="trade_change_pending", settled=False)
                     changed = True
             if changed:
@@ -6224,6 +6261,279 @@ class PredictionArbitrageStore:
         if listener is None:
             return
         listener(session_id)
+
+    def lp_publish_account_financial_facts(
+        self, facts: Mapping[str, object], *, connection: sqlite3.Connection | None = None,
+        expected_generation: int | None = None,
+    ) -> dict[str, object]:
+        """Publish one account snapshot and its ended-send coverage atomically.
+
+        Callers registering exchange IDs pass the same transaction. Facts do
+        not rewrite request outcomes, infer request/order identity, or advance
+        the trade generation. The supplied generation is the current fence.
+        """
+        from .polymarket_lp_accounting import (
+            account_cancel_is_pending, account_position_quantity,
+            can_resume_covered_management, default_account_pool_document,
+            ended_reservation_evidence, reservation_is_covered,
+        )
+        value = _load_payload(_dump_execution_payload(facts))
+        account = str(value.get("account_id") or "").strip().casefold()
+        pool_account = hashlib.sha256(account.encode()).hexdigest()
+        if not account or value.get("pool_account_id") != pool_account:
+            raise ValueError("account_identity_mismatch")
+        started = _parse_timestamp(value.get("read_started_at"))
+        ended = _parse_timestamp(value.get("read_ended_at"))
+        checked = _parse_timestamp(value.get("checked_at"))
+        if not started <= checked <= ended or not value.get("snapshot_id"):
+            raise ValueError("account_read_order_invalid")
+        if value.get("financial_status") not in {"known", "unknown"}:
+            raise ValueError("account_financial_facts_unknown")
+        with (self._transaction() if connection is None else nullcontext(connection)) as tx:
+            generation_row = tx.execute(
+                "SELECT generation FROM lp_trade_generation WHERE singleton=1"
+            ).fetchone()
+            generation = int(generation_row["generation"]) if generation_row is not None else None
+            expected = value.get("trade_generation") if expected_generation is None else expected_generation
+            if type(expected) is not int or generation != expected:
+                raise LpObservationWait("account_round_invalid")
+            row = tx.execute("SELECT payload FROM lp_auto_pool WHERE singleton=1").fetchone()
+            document = (_load_payload(str(row["payload"])) if row else
+                default_account_pool_document(self.path, pool_account, checked))
+            if document.get("account_id") != pool_account:
+                raise ValueError("account_identity_mismatch")
+            previous = document.get("account_financial_facts")
+            if isinstance(previous, Mapping):
+                if previous.get("account_id") != account:
+                    raise ValueError("account_identity_mismatch")
+                if any(_parse_timestamp(value.get(key)) < _parse_timestamp(previous.get(key))
+                       for key in ("read_started_at", "read_ended_at", "checked_at")):
+                    raise LpObservationWait("account_snapshot_superseded")
+                # Reapply the same observation against current exact-ID
+                # terminal receipts without refreshing any source timestamp.
+                if (previous.get("snapshot_id") != value["snapshot_id"]
+                        and previous.get("read_started_at") == value.get("read_started_at")
+                        and previous.get("read_ended_at") == value.get("read_ended_at")):
+                    raise LpObservationWait("account_snapshot_conflict")
+            # A complete-list flag does not prove the API retained its full
+            # historical window. Known confirmed economics are immutable: a
+            # disappearing or changed fill cannot erase a previously paid loss.
+            frontier = {(item["trade_id"], item["order_id"]): item["fingerprint"]
+                for item in document.get("account_confirmed_fill_facts", ())}
+            current_confirmed = {(item["trade_id"], item["order_id"]): item["fingerprint"]
+                for item in value.get("confirmed_fill_facts", ())}
+            missing = set(frontier) - set(current_confirmed)
+            conflicts = {key for key in set(frontier) & set(current_confirmed)
+                         if frontier[key] != current_confirmed[key]}
+            if missing or conflicts:
+                value["financial_status"] = "unknown"
+                history_reasons = set(value.get("reason_codes") or ())
+                if missing:
+                    history_reasons.add("account_trade_history_incomplete")
+                if conflicts:
+                    history_reasons.add("account_trade_history_conflict")
+                value["reason_codes"] = sorted(history_reasons)
+                value["inventory_cost_usd"] = None
+                value["realized_pnl_usd"] = None
+            for identity, fingerprint in current_confirmed.items():
+                frontier.setdefault(identity, fingerprint)
+            document["account_confirmed_fill_facts"] = [dict(trade_id=identity[0], order_id=identity[1],
+                fingerprint=fingerprint) for identity, fingerprint in sorted(frontier.items())]
+            loaded = [(row, _load_payload(str(row["payload"]))) for row in tx.execute(
+                "SELECT * FROM lp_sessions ORDER BY session_id"
+            ).fetchall()]
+            sessions = {str(row["session_id"]): (row, payload) for row, payload in loaded}
+            owners = {}
+            for row, payload in loaded:
+                if str(payload.get("account_id") or "").strip().casefold() != account:
+                    continue
+                for oid in self._lp_owned_session_ids(payload):
+                    if oid in owners and owners[oid][0]["session_id"] != row["session_id"]:
+                        raise ValueError("order_identity_conflict")
+                    owners[oid] = (row, payload)
+            # The raw trade window must also cover cumulative fills proven
+            # by exact order receipts, including receipts whose execution fee
+            # was not yet known and therefore never entered the fill frontier.
+            # Generic receipt merges remain monotonic; only account financial
+            # publication is blocked by this lower-coverage observation.
+            observed_fills = value.get("order_fills") or {}
+            if any((_maybe_decimal((payload.get("order_history") or {}).get(oid, {}).get("size_matched")) or Decimal(0))
+                   > (_maybe_decimal(observed_fills.get(oid)) or Decimal(0))
+                   for oid, (_row, payload) in owners.items()):
+                value["financial_status"] = "unknown"
+                value["reason_codes"] = sorted(set(value.get("reason_codes") or ()) | {"account_order_fill_history_incomplete"})
+                value["inventory_cost_usd"] = None
+                value["realized_pnl_usd"] = None
+            buys = [dict(buy) for buy in value.get("buys", ())]
+            actions_by_session = {}
+            for buy in buys:
+                owner = owners.get(str(buy.get("order_id") or ""))
+                if owner is None:
+                    raise ValueError("account_order_owner_unknown")
+                row, payload = owner
+                sid = str(row["session_id"])
+                buy["session_id"] = sid
+                for key in ("condition_id", "market_id", "outcome"):
+                    if not buy.get(key):
+                        buy[key] = payload.get(key)
+                actions = actions_by_session.setdefault(sid, self.lp_actions(sid, connection=tx))
+                if account_cancel_is_pending(payload, actions, buy["order_id"]):
+                    buy["state"] = "canceling"
+            # Absence from an open list does not acknowledge a pending cancel.
+            # Keep its actual BUY slot until an exact-ID terminal fact arrives.
+            actual_ids = {buy["order_id"] for buy in buys}
+            for oid, (row, payload) in owners.items():
+                history = payload.get("order_history") or {}
+                record = history.get(oid, {})
+                if (oid in actual_ids or record.get("side") != "BUY"
+                        or str(record.get("status") or "").upper() in TERMINAL_ORDER_STATES):
+                    continue
+                sid = str(row["session_id"])
+                actions = actions_by_session.setdefault(sid, self.lp_actions(sid, connection=tx))
+                if not account_cancel_is_pending(payload, actions, oid):
+                    continue
+                original = _maybe_decimal(record.get("quantity", record.get("original_size")))
+                filled = _maybe_decimal(record.get("size_matched"))
+                price = _maybe_decimal(record.get("price"))
+                remaining = max(Decimal(0), original - filled) if original is not None and filled is not None else None
+                buys.append(dict(order_id=oid, session_id=sid, condition_id=payload.get("condition_id"),
+                    token_id=payload.get("token_id"), market_id=payload.get("market_id"), outcome=payload.get("outcome"),
+                    price=str(price) if price is not None else None,
+                    quantity=str(remaining) if remaining is not None else None,
+                    original_quantity=str(original) if original is not None else None,
+                    filled_quantity=str(filled) if filled is not None else None,
+                    reserved_usd=str(price * remaining) if price is not None and remaining is not None else None,
+                    state="canceling", financial_status="unknown", checked_at=value["checked_at"]))
+                value["financial_status"] = "unknown"
+                value["reason_codes"] = sorted(set(value.get("reason_codes") or ()) | {"cancel_terminal_unknown"})
+            value["buys"] = sorted(buys, key=lambda buy: buy["order_id"])
+            value["trade_generation"] = generation
+            intents = document.get("intents") or {}
+            session_bindings = {}
+            for intent in intents.values():
+                session_bindings.setdefault(str(intent.get("session_id") or ""), []).append(intent)
+            # A round begun during a separate BUY submission cannot price
+            # its future exposure. Keep account admission blocked even when
+            # this session's original entry reservation was already covered.
+            for sid, (row, payload) in sessions.items():
+                explicit = str(payload.get("account_id") or "").strip().casefold()
+                bindings = session_bindings.get(sid, ())
+                legacy_owned = (not explicit and len(bindings) == 1 and
+                    row["idempotency_key"] == "lp-auto:" + str(bindings[0].get("intent_id") or ""))
+                if explicit != account and not legacy_owned:
+                    continue
+                actions = actions_by_session.setdefault(sid, self.lp_actions(sid, connection=tx))
+                for action in actions:
+                    is_entry = action.get("role") == "entry" or str(action.get("action_key") or "").endswith("entry-submit")
+                    if (action.get("side") != "BUY" or (is_entry and bindings)
+                            or "cancel" in str(action.get("action_key") or "")
+                            or action.get("state") not in {"pending", "unknown"}):
+                        continue
+                    end = action.get("submit_finished_at") or action.get("submit_receipt_at") or action.get("updated_at")
+                    try:
+                        ended_before = _parse_timestamp(end) < started
+                    except ValueError:
+                        ended_before = False
+                    if (action.get("state") == "pending" or not ended_before
+                            or action.get("submit_stage") in {"preparing", "sending"}):
+                        value["financial_status"] = "unknown"
+                        value["reason_codes"] = sorted(set(value.get("reason_codes") or ()) | {"account_send_inflight"})
+            retained = []
+            if value["financial_status"] == "known":
+                for intent_id, intent in intents.items():
+                    if reservation_is_covered(intent, pool_account):
+                        continue
+                    sid = str(intent.get("session_id") or "")
+                    entry = sessions.get(sid)
+                    if entry is None or len(session_bindings[sid]) != 1:
+                        retained.append(intent_id)
+                        continue
+                    row, payload = entry
+                    session = {**payload, "session_id": sid, "idempotency_key": row["idempotency_key"]}
+                    actions = actions_by_session.setdefault(sid, self.lp_actions(sid, connection=tx))
+                    evidence = ended_reservation_evidence(intent, session, actions, account_id=account,
+                        pool_account_id=pool_account, read_started_at=started)
+                    if evidence is None:
+                        retained.append(intent_id)
+                        continue
+                    marker = dict(version=1, state="covered", account_id=account, pool_account_id=pool_account,
+                        snapshot_id=value["snapshot_id"], session_id=sid, intent_id=intent_id,
+                        read_started_at=value["read_started_at"], read_ended_at=value["read_ended_at"],
+                        checked_at=value["checked_at"], original_reserved_usd=intent.get("reserved_usd"), **evidence)
+                    intent["reservation_coverage"] = marker
+                    payload["reservation_coverage"] = marker
+                    payload["_lp_revision"] = self._lp_payload_revision(payload) + 1
+                    tx.execute("UPDATE lp_sessions SET payload=? WHERE session_id=?",
+                        (_dump_execution_payload(payload), sid))
+            else:
+                retained = [key for key, intent in intents.items() if not reservation_is_covered(intent, pool_account)]
+            value["retained_reservation_ids"] = sorted(retained)
+            if value["financial_status"] == "known":
+                for intent in intents.values():
+                    if not reservation_is_covered(intent, pool_account):
+                        continue
+                    sid = str(intent.get("session_id") or "")
+                    entry = sessions.get(sid)
+                    if entry is None:
+                        continue
+                    row, payload = entry
+                    actions = actions_by_session.setdefault(sid, self.lp_actions(sid, connection=tx))
+                    managed = {**payload, "session_id": sid, "state": row["state"]}
+                    if can_resume_covered_management(managed, actions, value):
+                        payload["resume_state"] = "entry_open"
+                        payload["account_coverage_management"] = dict(reason="account_observation_owned_exposure",
+                            snapshot_id=value["snapshot_id"], checked_at=value["checked_at"])
+                        payload["_lp_revision"] = self._lp_payload_revision(payload) + 1
+                        tx.execute("UPDATE lp_sessions SET state='entry_open',payload=? WHERE session_id=?",
+                            (_dump_execution_payload(payload), sid))
+                        continue
+                    token = str(payload.get("token_id") or "")
+                    if (not token or self._lp_owned_session_ids(payload)
+                            or token in value.get("open_order_tokens", ())
+                            or account_position_quantity(value, token) != 0):
+                        continue
+                    actions = actions_by_session.setdefault(sid, self.lp_actions(sid, connection=tx))
+                    if any(a.get("state") in {"pending", "unknown"}
+                           and a.get("role") != "entry"
+                           and not str(a.get("action_key") or "").endswith("entry-submit")
+                           for a in actions):
+                        continue
+                    if row["state"] == "complete":
+                        continue
+                    # Retire only the empty management container. The original
+                    # request/action remains UNKNOWN and no order is assigned.
+                    payload["account_coverage_retired"] = dict(reason="account_observation_no_exposure",
+                        snapshot_id=value["snapshot_id"], checked_at=value["checked_at"])
+                    payload["_lp_revision"] = self._lp_payload_revision(payload) + 1
+                    tx.execute("UPDATE lp_sessions SET state='complete',payload=? WHERE session_id=?",
+                        (_dump_execution_payload(payload), sid))
+            if value["financial_status"] == "known":
+                lifetime_pnl = _maybe_decimal(value.get("realized_pnl_usd"))
+                if lifetime_pnl is None:
+                    raise ValueError("account_realized_pnl_unknown")
+                baseline = _maybe_decimal(document.get("account_realized_pnl_baseline_usd"))
+                if baseline is None:
+                    carried_pnl = Decimal(0)
+                    if document.get("allocations") or document.get("ever_enabled"):
+                        for intent in intents.values():
+                            if not reservation_is_covered(intent, pool_account):
+                                continue
+                            pnl = _maybe_decimal(intent.get("realized_pnl_usd"))
+                            if pnl is not None and (pnl < 0 or intent.get("financial_status") == "known"):
+                                carried_pnl += pnl
+                    # The first observation must not turn historical account
+                    # profits into new allocation. Preserve already-accounted
+                    # automatic PnL when its request hold is replaced.
+                    baseline = lifetime_pnl - carried_pnl
+                    document["account_realized_pnl_baseline_usd"] = str(baseline)
+                value["lifetime_realized_pnl_usd"] = str(lifetime_pnl)
+                value["realized_pnl_usd"] = str(lifetime_pnl - baseline)
+                value["realized_pnl_basis"] = "account_allocation_boundary"
+            document["account_financial_facts"] = value
+            tx.execute("INSERT INTO lp_auto_pool(singleton,payload) VALUES(1,?) "
+                "ON CONFLICT(singleton) DO UPDATE SET payload=excluded.payload",
+                (_dump_execution_payload(document),))
+            return value
 
     def lp_publish_facts(self, session_id, revision, *, patch=None, state=None,
                          publish=None, error=None, resolved_cancels=(),
