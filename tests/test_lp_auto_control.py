@@ -165,20 +165,19 @@ console.log(JSON.stringify({before, draft, running, unconfirmed, calls}));
 
 
 def test_old_dashboard_poll_cannot_overwrite_confirmed_manual_pause():
-    from tests.test_dashboard_web import run_dashboard_js
+    from tests.test_dashboard_web import _LP162_INTERACTIVE, run_dashboard_js
 
-    result = json.loads(run_dashboard_js(r'''
-state.workspaceView = "prediction_market";
-state.predictionMarket.activeTab = "lp";
-state.predictionMarket.csrfToken = "csrf";
-renderPredictionMarket = () => {};
-predictionRequestUrl = path => path;
-let finishOld;
-fetch = () => new Promise(resolve => { finishOld = resolve; });
+    result = json.loads(run_dashboard_js(_LP162_INTERACTIVE + r'''
+enterLpView();
+const oldRead = deferResponse(dashboardMatch);
+const freshRead = deferResponse(dashboardMatch);
+deferResponse((u, m) => m === "POST" && u.endsWith("/lp/auto/pause"))
+  .respond(jsonResponse({desired_running: false, pause_confirmed: true}));
 const oldPoll = fetchPredictionLpDashboard();
-predictionPost = async () => ({desired_running: false, pause_confirmed: true});
-await controlLpAuto("pause");
-finishOld({ok: true, json: async () => ({auto: {desired_running: true, pause_confirmed: false}})});
+const pause = controlLpAuto("pause");
+freshRead.respond(jsonResponse(buildDashboard({auto: {desired_running: false, pause_confirmed: true}})));
+await pause;
+oldRead.respond(jsonResponse(buildDashboard({auto: {desired_running: true, pause_confirmed: false}})));
 await oldPoll;
 console.log(JSON.stringify(state.predictionMarket.lpDashboard.auto));
 '''))
