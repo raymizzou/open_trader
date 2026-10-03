@@ -2161,7 +2161,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.prediction_command == "wallet" and args.wallet_command == "status":
             try:
                 config = load_trading_config(args.config.expanduser())
-                client = PolymarketTradingClient.from_keychain(config)
+                client = PolymarketTradingClient.from_keychain(config, read_only=True)
                 snapshot = client.account_snapshot()
                 geoblock = client.geoblock_allowed()
                 print(f"wallet: {config.wallet_address[:6]}...{config.wallet_address[-4:]}")
