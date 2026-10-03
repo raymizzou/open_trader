@@ -63,6 +63,10 @@ const state = {
     historyKind: "signals",
     error: "",
     lpCancelSummary: "",
+    lpCancelFeedback: null,
+    lpCancelFeedbackTimer: null,
+    lpCancelInFlight: false,
+    lpCancelRequestSeq: 0,
     lpAutoDraft: null,
     lpAutoBusy: false,
     lpAutoMessage: "",
@@ -3660,6 +3664,119 @@ function lpDashboardTodayMarketOrder(groups, observations) {
   });
 }
 
+// Cancellation receipts stay visible independently of the confirmation modal.
+// A replacement receipt owns its expiry; an older timer cannot clear it.
+function clearLpCancelFeedback() {
+  const prediction = state.predictionMarket;
+  if (prediction.lpCancelFeedbackTimer !== null) window.clearTimeout(prediction.lpCancelFeedbackTimer);
+  prediction.lpCancelFeedbackTimer = null;
+  prediction.lpCancelFeedback = null;
+}
+
+function showLpCancelFeedback(feedback, expires = true) {
+  clearLpCancelFeedback();
+  state.predictionMarket.lpCancelFeedback = feedback;
+  if (expires) {
+    state.predictionMarket.lpCancelFeedbackTimer = window.setTimeout(() => {
+      if (state.predictionMarket.lpCancelFeedback !== feedback) return;
+      clearLpCancelFeedback();
+      renderPredictionMarket();
+    }, 15000);
+  }
+}
+
+function lpCancelReasonLabel(reason) {
+  const value = String(reason || "").trim();
+  if (value === "unknown_order") return "订单已不在当前委托中";
+  if (value === "not_active") return "订单已无可撤份额";
+  return value || "服务端未提供原因";
+}
+
+function setLpCancelFeedback(result) {
+  if (!result || !Array.isArray(result.canceled) || !Array.isArray(result.skipped)
+    || !result.not_canceled || typeof result.not_canceled !== "object" || Array.isArray(result.not_canceled)) {
+    throw new Error("服务端未返回完整撤单结果");
+  }
+  const canceled = result.canceled;
+  const skipped = result.skipped;
+  const failures = Object.entries(result.not_canceled);
+  const count = canceled.length + skipped.length + failures.length;
+  const requested = result.requested;
+  const validOrderId = (value) => typeof value === "string" && value.trim().length > 0;
+  if (!Number.isSafeInteger(requested) || requested < 0 || requested !== count
+    || canceled.some((orderId) => !validOrderId(orderId))
+    || skipped.some((row) => !row || !validOrderId(row.order_id) || typeof row.reason !== "string")
+    || failures.some(([orderId, reason]) => !validOrderId(orderId) || typeof reason !== "string")) {
+    throw new Error("服务端撤单结果不完整或数量不一致");
+  }
+  const title = failures.length ? "撤单未全部成功" : skipped.length ? "撤单结果 · 含跳过"
+    : canceled.length ? "撤单成功" : "无可撤委托";
+  showLpCancelFeedback({
+    title,
+    tone: failures.length ? "danger" : skipped.length ? "warning" : canceled.length ? "success" : "info",
+    summary: `请求 ${requested} 笔 · 成功 ${canceled.length} 笔 · 跳过 ${skipped.length} 笔 · 失败 ${failures.length} 笔`,
+    details: [
+      ...skipped.map((row) => `跳过 · ${String(row.order_id || "订单编号未返回")}：${lpCancelReasonLabel(row.reason)}`),
+      ...failures.map(([orderId, reason]) => `失败 · ${orderId}：${lpCancelReasonLabel(reason)}`),
+    ],
+  });
+}
+
+function lpCancelFeedbackMarkup() {
+  const feedback = state.predictionMarket.lpCancelFeedback;
+  if (!feedback) return "";
+  const details = (feedback.details || []).map((line) => `<li>${escapeHtml(line)}</li>`).join("");
+  return `<section class="pm-alert ${feedback.tone} lp-cancel-feedback" role="status" aria-live="polite" aria-atomic="true" tabindex="-1"><div class="pm-alert-body"><strong>${escapeHtml(feedback.title)}</strong><p>${escapeHtml(feedback.summary)}</p>${details ? `<ul>${details}</ul>` : ""}</div></section>`;
+}
+
+async function confirmLpCancel() {
+  const prediction = state.predictionMarket;
+  if (prediction.lpCancelInFlight) return;
+  const modalEpoch = predictionModal.epoch;
+  const ownsModal = () => predictionModal.epoch === modalEpoch && predictionModal.kind === "lp_cancel";
+  const data = predictionModal.data || {};
+  const orders = Array.isArray(data.orders) ? data.orders : [];
+  const body = {confirm: true};
+  if (data.scope === "order") body.order_ids = orders.map((row) => String(row.order_id || ""));
+  else if (data.scope === "market") body.condition_id = String(data.conditionId || "");
+  else body.scope = "all";
+  const requestSeq = ++prediction.lpCancelRequestSeq;
+  prediction.lpCancelInFlight = true;
+  setPredictionModalBusy(true);
+  showLpCancelFeedback({title: "正在撤单", tone: "info", summary: "等待服务端结果，请勿重复提交。关闭弹窗不会中止已发送的请求。"}, false);
+  renderPredictionMarket();
+  try {
+    const result = await predictionPost("/api/prediction-arbitrage/lp/orders/cancel", body);
+    if (requestSeq !== prediction.lpCancelRequestSeq) return;
+    setLpCancelFeedback(result);
+  } catch (error) {
+    if (requestSeq !== prediction.lpCancelRequestSeq) return;
+    showLpCancelFeedback({
+      title: "撤单结果待核对", tone: "warning",
+      summary: "未收到完整撤单回执，不能确认成功或失败。请核对刷新后的委托列表；系统不会自动重试。",
+      details: [error instanceof Error ? error.message : String(error)],
+    });
+  } finally {
+    if (requestSeq === prediction.lpCancelRequestSeq) {
+      prediction.lpCancelInFlight = false;
+      const showResult = ownsModal();
+      if (showResult) closePredictionModal();
+      // A reopened confirmation may have been disabled by the pending request.
+      // Do not redraw it, change its selection, focus it, or affect other modals.
+      if (predictionModal.kind === "lp_cancel" && !predictionModal.busy) {
+        const confirm = elements["prediction-market-modal-root"].querySelector("[data-modal-action='lp-cancel-confirm']");
+        if (confirm) confirm.disabled = predictionWritesBlocked();
+      }
+      // Show the receipt before waiting for the independently fallible refresh.
+      renderPredictionMarket();
+      if (showResult && state.workspaceView === "prediction_market" && prediction.activeTab === "lp") {
+        elements["prediction-market-root"]?.querySelector(".lp-cancel-feedback")?.focus();
+      }
+      await fetchPredictionLpDashboard({force: true});
+    }
+  }
+}
+
 function lpDashboardCancelButton(kind, target) {
   const cancelAll = kind === "all";
   const source = target && typeof target === "object" ? target : {};
@@ -3670,7 +3787,7 @@ function lpDashboardCancelButton(kind, target) {
       + escapeHtml(String(source.orderId || "")) + "\"";
   return "<button class=\"pm-button lp-cancel" + (cancelAll ? "-all" : "")
     + "\" type=\"button\" " + targetAttribute + " title=\"撤单即时生效\""
-    + (predictionWritesBlocked() ? " disabled" : "") + ">"
+    + (predictionWritesBlocked() || state.predictionMarket.lpCancelInFlight ? " disabled" : "") + ">"
     + (cancelAll ? "撤全部" : "撤单") + "</button>";
 }
 
@@ -4806,10 +4923,11 @@ function predictionLpCard(payload) {
     + "<button class=\"pm-button\" type=\"button\" data-action=\"lp-dashboard-refresh\""
     + (predictionWritesBlocked() || predictionLpDisplayBusy() || state.predictionMarket.lpPreparationRecoveryInFlight || !state.predictionMarket.csrfToken ? " disabled" : "") + ">立即刷新</button>"
     + "<button class=\"pm-button danger\" type=\"button\" data-action=\"lp-cancel-all\""
-    + (predictionWritesBlocked() || predictionLpDisplayBusy() || state.predictionMarket.lpPreparationRecoveryInFlight || !state.predictionMarket.csrfToken ? " disabled" : "") + ">撤全部</button></div></header>"
+    + (predictionWritesBlocked() || state.predictionMarket.lpCancelInFlight || predictionLpDisplayBusy() || state.predictionMarket.lpPreparationRecoveryInFlight || !state.predictionMarket.csrfToken ? " disabled" : "") + ">撤全部</button></div></header>"
     + readonlyLpUnavailable
     + errorMarkup
     + cancelSummaryMarkup
+    + lpCancelFeedbackMarkup()
     + lpSubmitToastsMarkup()
     + snapshotPendingMarkup
     + budgetLineMarkup
@@ -6144,9 +6262,11 @@ function renderPredictionMarket() {
   // reason/typed note survives instead of silently resetting.
   const decision = relationDecisionSnapshot(root);
   const lpSnapshot = lpRenderFidelitySnapshot(root);
+  const cancelFeedbackFocused = document.activeElement?.matches?.(".lp-cancel-feedback");
   root.innerHTML = predictionWorkspacePage();
   restoreRelationDecision(root, decision);
   lpRenderFidelityRestore(root, lpSnapshot);
+  if (cancelFeedbackFocused) root.querySelector(".lp-cancel-feedback")?.focus({preventScroll: true});
 }
 
 function lpRenderFidelitySnapshot(root) {
@@ -6364,13 +6484,14 @@ function invalidatePredictionNLegReads() {
   // （轮询路径走 closeNLegDomainPredictionModal，离开视图走全量关闭）。
 }
 
-async function fetchPredictionLpDashboard() {
+async function fetchPredictionLpDashboard({force = false} = {}) {
   if (predictionSplit()) fetchPredictionLpAutoState();
   if (state.workspaceView !== "prediction_market" || state.predictionMarket.activeTab !== "lp"
-    || state.predictionMarket.lpDashboardRequestInFlight || state.predictionMarket.lpAutoBusy) return;
+    || (!force && (state.predictionMarket.lpDashboardRequestInFlight || state.predictionMarket.lpAutoBusy))) return;
   const requestSeq = (state.predictionMarket.lpDashboardRequestSeq || 0) + 1;
   state.predictionMarket.lpDashboardRequestSeq = requestSeq;
   state.predictionMarket.lpDashboardRequestInFlight = true;
+  state.predictionMarket.lpDashboardPendingSeq = requestSeq;
   try {
     const response = await fetch(predictionRequestUrl("/api/prediction-arbitrage/lp/dashboard"), {
       cache: "no-store",
@@ -6394,6 +6515,7 @@ async function fetchPredictionLpDashboard() {
       error: state.predictionMarket.lpDashboardError,
     };
   } finally {
+    if (state.predictionMarket.lpDashboardPendingSeq !== requestSeq) return;
     state.predictionMarket.lpDashboardRequestInFlight = false;
     if (state.workspaceView === "prediction_market" && state.predictionMarket.activeTab === "lp") {
       renderPredictionMarket();
@@ -7299,7 +7421,7 @@ function predictionModalHtml(kind, data = {}) {
       const quantity = lpDashboardTodayOrderQuantity(row);
       return sum + (Number.isFinite(quantity) ? quantity : 0);
     }, 0);
-    return `<section class="pm-modal" role="dialog" aria-modal="true" aria-labelledby="pm-dialog-title" tabindex="-1"><header class="pm-modal-header"><h2 id="pm-dialog-title">确认撤单</h2><p>${escapeHtml(scopeLabel)} · ${orders.length} 笔 · 合计 ${escapeHtml(formatDisplayNumber(String(totalShares)))} 份。撤单即时生效;已成交部分不可撤。</p></header><div class="pm-check-list">${orderRows || "<div class=\"pm-check\"><span>没有可撤委托</span><strong>-</strong></div>"}</div><div class="pm-risk-note" role="note"><strong>撤单即时生效</strong><p>撤单后该委托不再参与计分；已成交部分不可撤；确认时服务端会用最新账户数据重新核对每一笔。</p></div><footer class="pm-modal-actions"><button class="pm-button" type="button" data-modal-action="cancel">取消</button><button class="pm-button danger" type="button" data-modal-action="lp-cancel-confirm">确认撤单 · ${orders.length} 笔</button></footer></section>`;
+    return `<section class="pm-modal" role="dialog" aria-modal="true" aria-labelledby="pm-dialog-title" tabindex="-1"><header class="pm-modal-header"><h2 id="pm-dialog-title">确认撤单</h2><p>${escapeHtml(scopeLabel)} · ${orders.length} 笔 · 合计 ${escapeHtml(formatDisplayNumber(String(totalShares)))} 份。撤单即时生效;已成交部分不可撤。</p></header><div class="pm-check-list">${orderRows || "<div class=\"pm-check\"><span>没有可撤委托</span><strong>-</strong></div>"}</div><div class="pm-risk-note" role="note"><strong>撤单即时生效</strong><p>撤单后该委托不再参与计分；已成交部分不可撤；确认时服务端会用最新账户数据重新核对每一笔。请求发送后，关闭弹窗不会中止撤单。</p></div><footer class="pm-modal-actions"><button class="pm-button" type="button" data-modal-action="cancel">取消</button><button class="pm-button danger" type="button" data-modal-action="lp-cancel-confirm"${state.predictionMarket.lpCancelInFlight ? " disabled" : ""}>确认撤单 · ${orders.length} 笔</button></footer></section>`;
   }
   const reset = kind === "reset";
   const cleanup = kind === "allowance_cleanup";
@@ -7376,6 +7498,12 @@ function closePredictionModal() {
 
 function setPredictionModalBusy(busy) {
   predictionModal.busy = busy;
+  if (predictionModal.kind === "lp_cancel") {
+    const confirm = elements["prediction-market-modal-root"].querySelector("[data-modal-action='lp-cancel-confirm']");
+    if (confirm && busy) confirm.textContent = "正在撤单…";
+    const cancel = elements["prediction-market-modal-root"].querySelector("[data-modal-action='cancel']");
+    if (cancel && busy) cancel.textContent = "关闭";
+  }
   // Issue 162（定案 4）：LP 三类弹窗 busy 期间保留「取消」可点——转圈也允许
   // 放弃；关闭即 epoch 递增，迟到响应按过期静默丢弃。
   const keepCancel = busy && LP_MODAL_KINDS.has(predictionModal.kind || "");
@@ -7946,6 +8074,10 @@ async function handlePredictionModalClick(event) {
   // Issue 162（定案 6）：动作-kind 匹配守卫——映射内动作必须命中当前 kind，
   // 未登记动作视为不匹配；一律 return，不发请求、不进 busy。
   if (PREDICTION_MODAL_ACTION_KINDS[action] !== predictionModal.kind) return;
+  if (action === "lp-cancel-confirm") {
+    await confirmLpCancel();
+    return;
+  }
   // Issue 163 定案 6/7：幂等键在确认点击时铸造；一次最终确认 = 立即关窗 +
   // 「正在提交」toast + 10 秒共享锁 + 恰一次 POST。回执无论多迟都按键归属
   // 自己那条 toast，与弹窗世代无关；HTTP 200 不等于成功——一律按 body.state 分支。
@@ -8070,45 +8202,6 @@ async function handlePredictionModalClick(event) {
       }
       closePredictionModal();
       await fetchPredictionState();
-      return;
-    }
-    if (action === "lp-cancel-confirm") {
-      const data = predictionModal.data && typeof predictionModal.data === "object"
-        ? predictionModal.data : {};
-      const orders = Array.isArray(data.orders) ? data.orders : [];
-      const body = {confirm: true};
-      if (data.scope === "order") {
-        body.order_ids = orders.map((row) => String(row.order_id || ""));
-      } else if (data.scope === "market") {
-        body.condition_id = String(data.conditionId || "");
-      } else {
-        body.scope = "all";
-      }
-      const result = await predictionPost(
-        "/api/prediction-arbitrage/lp/orders/cancel", body);
-      if (staleResponse()) {
-        // Issue 162（定案 3 例外）：迟到的撤单成功同样报信（摘要+重拉看板），
-        // 不碰当前弹窗；迟到失败静默丢弃。
-        const staleCanceled = Array.isArray(result?.canceled) ? result.canceled : [];
-        if (staleCanceled.length) {
-          state.predictionMarket.lpCancelSummary = `撤成 ${staleCanceled.length} 笔`;
-          await fetchPredictionLpDashboard();
-        }
-        return;
-      }
-      const canceled = Array.isArray(result?.canceled) ? result.canceled : [];
-      const notCanceled = result?.not_canceled
-        && typeof result.not_canceled === "object" ? result.not_canceled : {};
-      const failures = Object.entries(notCanceled);
-      state.predictionMarket.lpCancelSummary = canceled.length
-        ? `撤成 ${canceled.length} 笔` : "";
-      if (failures.length) {
-        state.predictionMarket.error = "撤单失败："
-          + failures.map(([orderId, reason]) => `${orderId} ${reason}`).join("；");
-      }
-      closePredictionModal();
-      await fetchPredictionLpDashboard();
-      renderPredictionMarket();
       return;
     }
     if (action === "nleg-confirm") {
