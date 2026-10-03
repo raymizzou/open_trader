@@ -403,11 +403,23 @@ def test_worker_promotes_newer_eastmoney_snapshot_with_replacement_cash(
         assert published["brokers"][broker]["positions"] == before["brokers"][broker]["positions"]
 
 
+@pytest.mark.parametrize("manual_offset", [1, 0, -1])
 def test_worker_prefers_later_manual_snapshot_on_same_data_date(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, manual_offset: int
 ) -> None:
     import open_trader.account_sync_worker as worker_module
     import open_trader.statement_import as statement_import
+
+    import open_trader.holding_snapshot_import as holding_snapshot_import
+    fixed_now = datetime.fromisoformat("2026-09-08T10:00:00+08:00")
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now.astimezone(tz) if tz is not None else fixed_now
+
+    monkeypatch.setattr(statement_import, "datetime", FixedDatetime)
+    monkeypatch.setattr(holding_snapshot_import, "datetime", FixedDatetime)
 
     class OfficialParser:
         broker = "phillips"
@@ -483,6 +495,7 @@ def test_worker_prefers_later_manual_snapshot_on_same_data_date(
     )
     write_json_atomic(data_dir / "latest/account_sync_state.json", accepted)
 
+    fixed_now += timedelta(seconds=manual_offset)
     manual = HoldingSnapshotImportService(data_dir=data_dir).stage_snapshot(
         "phillips",
         {
@@ -500,9 +513,9 @@ def test_worker_prefers_later_manual_snapshot_on_same_data_date(
             "cash": {"policy": "preserve"},
         },
     )
-    assert datetime.fromisoformat(str(manual["staged_at"])) > datetime.fromisoformat(
+    assert (datetime.fromisoformat(str(manual["staged_at"])) - datetime.fromisoformat(
         official_staged_at
-    )
+    )).total_seconds() == manual_offset
 
     _configure_sources(monkeypatch, worker_module)
     result = AccountSyncWorker(
@@ -525,9 +538,10 @@ def test_worker_prefers_later_manual_snapshot_on_same_data_date(
             "notes": "official",
         }
     ]
-    assert published["accepted_holding_generation"]["phillips"] == manual[
-        "holding_generation"
-    ]
+    assert published["brokers"]["phillips"]["positions"][0]["quantity"] == ("10" if manual_offset > 0 else "1")
+    assert published["accepted_holding_generation"]["phillips"] == (
+        manual["holding_generation"] if manual_offset > 0 else official["statement_generation"]
+    )
     assert published["accepted_statement_generation"]["phillips"] == official[
         "statement_generation"
     ]

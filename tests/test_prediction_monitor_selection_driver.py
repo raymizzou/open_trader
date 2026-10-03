@@ -240,6 +240,10 @@ def test_idle_gate_skips_processing_until_idle(tmp_path: Path) -> None:
 def test_failure_keeps_pending_and_blocks_immediate_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    import open_trader.prediction_monitor_selection_driver as driver_module
+
+    now = [100.0]
+    monkeypatch.setattr(driver_module, "time", SimpleNamespace(monotonic=lambda: now[0]))
     instance = driver(tmp_path, FakeCatalog({}, generation=3, fingerprint="fp-3"))
     monkeypatch.setattr(
         instance,
@@ -254,9 +258,19 @@ def test_failure_keeps_pending_and_blocks_immediate_retry(
     }
     instance._tick()
     assert instance.status()["selection_failures_consecutive"] == 1
-    instance._next_attempt_at = 0.0
+    assert instance._next_attempt_at == 105.0
+    now[0] = 104.999
+    instance._tick()
+    assert instance.status()["selection_failures_consecutive"] == 1
+    now[0] = 105.0
     instance._tick()
     assert instance.status()["selection_failures_consecutive"] == 2
+
+    assert instance._next_attempt_at == 110.0
+    now[0] = 110.001
+    instance._tick()
+    assert instance.status()["selection_failures_consecutive"] == 3
+    assert instance.status()["selection_pending"] == 1
 
 
 def test_pending_queue_is_distinct_and_bounded(tmp_path: Path) -> None:

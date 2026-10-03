@@ -1,73 +1,154 @@
 # Agent Verification and Delivery
 
 This runbook is binding with `AGENTS.md` and the global agent instructions.
-Read it before selecting or running development gates, Candidate Acceptance,
+Read it before selecting or running development gates, Deployment Preflight,
 merge, or deployment. Documentation and configuration-only work does not run
 `make test`; other exemptions below remain scope-specific.
 
 ## Development verification
 
-`make test SERVICE=prediction` builds only the `dev` target of the
-worktree-specific `Dockerfile.dev` image and runs that service's backend test
-files with `-m "not pressure and not browser"`. Valid services are `gateway`,
-`legacy`, `account`, and `prediction`; space-separated names cover shared
-changes, for example `SERVICE='gateway prediction'`. `TEST='path::test_name'`
-selects a narrower seam instead. Unscoped `make test` fails before building.
-While N-leg arbitrage is paused, service-scoped development tests default to
-`TEST_N_LEG=0`: the dedicated N-leg execution, validation, solver, resolver,
-selection and scheduler files listed in Makefile `N_LEG_TESTS` are omitted.
-LP, shared models/storage/runtime/service, release and pause-protection tests
-remain active. This is a temporary test-selection policy, independent of the
-production `N_LEG_PAUSED` setting. Set `TEST_N_LEG=1` to restore the complete
-service suite; explicit `TEST=...` always runs the requested tests. Changes to
-an omitted N-leg component must use its explicit `TEST` selection or
-`TEST_N_LEG=1`. Run the complete Prediction suite before re-enabling N-leg.
-Candidate Acceptance keeps its complete backend coverage regardless of this
-development-only switch.
-Scopes containing `prediction` default to six pytest-xdist workers with
-`--dist=loadgroup`, distributing individual tests across workers. Solver
-benchmark tests share one worker to reuse their full-handoff fixture cache.
-Set `TEST_WORKERS=4` on a busy host or `TEST_WORKERS=1` for serial diagnosis;
-tune `TEST_WORKERS` to available capacity.
-Other services and explicit `TEST=...` selections default to serial execution;
-they also accept `TEST_WORKERS`. Candidate Acceptance remains serial.
-Python bytecode is cached under `/tmp/open-trader-bytecache` inside each test
-container, reducing repeated interpreter startup without changing source trees.
-Gateway contains `frontend_gateway` tests; Legacy contains Dashboard and the
-remaining shared backend test files. Update the Makefile prefixes when adding
-a service-specific test family. During
-development and PR review, run only the affected service tests. Candidate
-Acceptance owns complete backend coverage only when preparing an explicitly
-authorized deployment, after GitHub PR merge, for the selected final GitHub
-`main` SHA. Do not run it during development, review, before merge, or
-automatically after merge. The image includes Node and `procps`, and excludes npm,
-Python/JS Playwright, Chromium/browser assets, host mounts, network, published
-ports, the Docker socket, the home directory, and credentials. The approved
-pytest-xdist dependency is pinned in the development extras and consumed from
-`uv.lock` by the dev image. See [dependency reproducibility](dependency-reproducibility.md)
-for the locked Python/build-tool baseline and clean-build evidence.
+Run only directly affected or newly added test nodeids locally, in an existing
+Python environment with the current worktree's source explicitly selected:
+
+```sh
+PYTHONPATH=src python -m pytest tests/path.py::test_name
+```
+
+Use that environment's Python executable (for example `.venv/bin/python`) when
+needed; do not accidentally test an installed copy from another checkout.
+Test-only changes run the changed tests. Shared test helpers also require their
+directly affected consumer tests. Shared production modules require the union
+of relevant consumer tests across services, not entire services. Standalone
+trend-curve changes follow the same focused-nodeid rule. Record the selected
+nodeids and why they cover the change, exact SHA, command, environment and results.
+Pure documentation/configuration changes need no local backend run unless they
+affect a testable contract; CI planner/workflow contracts need focused regression
+checks. Missing dependencies or unavailable environments are blockers to report,
+not passing evidence. Keep TDD, relevant stability checks and independent review.
+
+Docker is not a prerequisite to push a reviewed branch. Optional focused Docker
+diagnosis can use `make test TEST='tests/path.py::test_name'`; local development
+does not require whole-service or full-backend suites. GitHub CI owns the full
+existing backend test suite on every branch push and every PR targeting `main`,
+including the final merged-main push: `gateway`, `legacy`, `account`, and
+`prediction`, always with `TEST_N_LEG=1`, excluding `pressure` and `browser`.
+Documentation-only, LP-only, trend-only and unavailable/empty diff cases all run
+that same coverage. Push CI tests the branch head; PR CI tests the synthetic merge
+candidate. These intentionally separate runs cover distinct SHA identities.
+See [CI identity and execution](ci.md). CI also runs the non-LIVE portable prediction scenarios. It does not run
+Deployment Preflight, Host Readiness or Production Smoke.
+
+### Existing Docker test mechanics
+
+CI reuses `make test SERVICE=<service>` and the worktree-specific `Dockerfile.dev`
+image. Valid service names are `gateway`, `legacy`, `account`, and `prediction`;
+unscoped `make test` fails before building. Gateway contains `frontend_gateway`
+tests; Legacy contains Dashboard and remaining shared backend test files,
+including standalone trend-curve tests. Keep Makefile prefixes current when
+adding service-specific test families. The retained standalone trend-curve CI
+job is not selected because legacy already includes its tests.
+
+Makefile's service-scoped default `TEST_N_LEG=0` omits the dedicated N-leg files
+listed in `N_LEG_TESTS`; CI explicitly overrides it with `TEST_N_LEG=1` for every
+service. Explicit `TEST=...` always runs the requested tests, including N-leg
+nodeids. Test selection never changes production `N_LEG_PAUSED`.
+The Makefile's Prediction service default remains six pytest-xdist workers with
+`--dist=loadgroup`, distributing individual tests across workers; solver benchmark
+tests share one worker to reuse their full-handoff fixture cache. CI overrides
+this to two workers for Prediction. `TEST_WORKERS=4` can reduce busy-host load and
+`TEST_WORKERS=1` supports serial diagnosis. Non-Prediction services and explicit
+`TEST=...` selections default to serial, and also accept `TEST_WORKERS`.
+Portable scenarios run serially in CI. Known Prediction shared-port and cached
+fixture groups retain their xdist grouping; global cross-service serial ordering
+is not a separate deployment requirement. CI proves backend collection coverage.
+The development image includes Node and `procps`, but excludes npm, Python/JS
+Playwright and Chromium/browser assets. Test containers have no host mounts,
+network, published ports, Docker socket, home directory or credentials.
+Python bytecode is cached under `/tmp/open-trader-bytecache` inside the container.
+The approved pytest-xdist dependency is pinned in development extras and consumed
+from `uv.lock`; see [dependency reproducibility](dependency-reproducibility.md).
 The 2026-09-29 approved cloud credential exception permits only the optional
 `cloud-ssm` extra (pinned Tencent SSM SDK and common SDK); Docker development
 installs it for offline SDK transport tests. Do not add other dependencies or
-weaken existing skips/xfails. Playwright is a host-only
-Production Smoke prerequisite; ordinary development and Candidate Acceptance
-have zero browser cost.
+weaken existing skips/xfails. Playwright remains a host-only Production Smoke
+prerequisite; ordinary backend CI and Deployment Preflight have zero browser cost. Deployment
+Preflight reuses trusted main-push evidence for the selected final GitHub `main`
+SHA when preparing an explicitly authorized deployment. It does not rerun tests.
 
-Changes confined to the standalone trend-curve collector, backtester, CLI,
-storage, and their dedicated tests use `make test-trend-curve`; they do not
-require the full suite, Candidate Acceptance, Host Readiness, or Production
-Smoke. Changes to shared modules or dependencies, Dashboard/backend runtime,
-reports, trading behavior, or wider production paths use the normal gates.
+## Test design and stability
 
-## Four separate gates
+These principles apply to all tests, including new tests and stability repairs;
+they do not change the scope-specific verification routes above.
 
-The results are independent: Docker development, Candidate Acceptance,
-Host Readiness, and Production Smoke. Each result applies only to the exact
-SHA named by its gate.
+### Preserve the contract
 
-- `make candidate-acceptance` must end with `Candidate Acceptance: PASS` or
-  `FAIL`. It is backend-only, excludes `pressure` and `browser`, and excludes
-  only `LIVE-*` scenarios from the portable prediction suite.
+- State the behavior being protected before changing a test. Keep success,
+  boundary, and negative assertions: expired facts must still fail, and a
+  service must remain unavailable until all required recovery work completes.
+- Preserve production deadlines, fail-closed checks, ordering, cancellation,
+  and resource-cleanup guarantees. A stability repair must not silently change
+  business behavior; obtain explicit user approval for a contract change.
+- Do not skip/xfail failures, weaken assertions, inflate business deadlines or
+  test timeouts, remove coverage, or add retry-until-green logic merely to make
+  a run pass. Existing approved scope exemptions remain unchanged.
+
+### Separate business time from scheduling
+
+- Use an injected or narrowly scoped controllable clock for expiry, cooldown,
+  and other business-time boundaries; advance it deliberately across the
+  boundary and verify both sides. Do not make a valid fixture expire just
+  because startup, CI load, or worker scheduling consumed a tiny real budget.
+- Coordinate concurrent work with observable completion events, barriers, or
+  conditions tied to the actual state transition. Arbitrary sleeps are not
+  proof that work started or finished; bounded polling is acceptable when no
+  completion signal is available and checks the real condition.
+- Keep a bounded real-time watchdog independent of the controlled clock so
+  hangs still fail. Separate startup/synchronization budgets from the business
+  deadline being asserted; justify any watchdog adjustment with evidence while
+  preserving the original contract, rather than simply increasing a timeout.
+- Isolate clock overrides and restore them during teardown. Do not globally
+  patch shared clock functions in ways that affect unrelated threads, event
+  loops, subprocess supervision, or watchdogs. Release waiters and reclaim
+  threads/processes/resources on failure as well as success.
+- Retain real integration and separate timeout, cancellation, and cleanup
+  tests. When elapsed time, scheduling, latency, or throughput is itself the
+  contract, test it with real time and justified bounds/environment assumptions;
+  controlled time must not replace that evidence. Fake clocks are not required
+  for tests that do not benefit from them.
+
+### Diagnose and verify repairs
+
+1. Keep the original failure, exact SHA, command, environment, worker count,
+   and logs. Reproduce and distinguish a product defect, invalid fixture,
+   scheduling dependency, or environmental blocker before choosing a repair.
+   A tight timeout or one green rerun alone does not prove a test is flaky;
+   report an unconfirmed diagnosis as such.
+2. After an authorized repair, show regression/negative evidence that the test
+   still rejects the original wrong behavior. Where needed, use a temporary
+   targeted mutation or fault injection and verify that it fails; do not publish
+   the mutation. For example, accepting expired data or declaring readiness
+   before every recovery worker finishes must still fail the test.
+3. Repeat the affected tests with reproducible settings in serial and relevant
+   supported concurrency (including two workers for Prediction CI). Exercise
+   controlled scheduling delays/alternate interleavings, then run the required
+   affected-scope checks. Record repetition counts, settings, and every outcome;
+   a later pass does not erase a failed attempt, and repetition alone does not
+   prove correctness. Diagnostic retries must not turn failures into success.
+4. Report all failures and any remaining uncertainty or blocked verification.
+   Restage the exact changes and obtain independent review before publication;
+   existing exact-SHA, rebase, CI, and approval requirements still apply.
+
+## Verification and deployment boundaries
+
+Development verification, trusted CI, Deployment Preflight, Host Readiness, and
+Production Smoke have distinct evidence. Each result applies only to its exact SHA.
+See [the source-release preflight runbook](deployment-preflight.md) for the supported
+forward-deployment wrapper, trust checks, environment limits and rollback path.
+
+- `make deployment-preflight EXPECTED_SHA=<40hex> PYTHON_BIN=<release-python>`
+  checks trusted exact-SHA CI and source/lock/runtime identity. Success exits zero;
+  missing or mismatched evidence exits nonzero. It runs no backend pytest or Docker
+  build. CI owns the four backend services and non-LIVE portable scenarios.
 - `make host-readiness` is read-only and must end with `READY` or `BLOCKED`.
   On a fresh host with no Open Trader launchd agent or selected-service
   listener, use `FIRST_DEPLOY=1`. This checks that no managed agent or selected
@@ -102,9 +183,9 @@ SHA named by its gate.
   non-read-only requests before navigation. Smoke checks the selected
   Prediction N_LEG contract before the browser run according to
   `N_LEG_PAUSED` and never downloads a browser or starts the fixture server.
-- `make acceptance` is the non-mutating Docker Candidate Acceptance alias. It
-  never installs launchd, performs an outage check, reads production, or
-  submits orders.
+- `make candidate-acceptance` and `make acceptance` are compatibility aliases
+  for Deployment Preflight. They read GitHub and the selected local environment;
+  they never install services, build images, rerun tests or submit orders.
 
 Both readiness and Smoke accept a nonempty whitespace-separated
 `RELEASE_SERVICES` list containing only `gateway`, `legacy`, `account`, and
@@ -138,25 +219,25 @@ receive any development validation relevant to their own scope.
 ## Merge, live processes, and deployment
 
 The delivery path is isolated branch/worktree from freshly fetched
-`origin/main` → affected-scope development checks → staged independent review
+`origin/main` → focused local development checks → staged independent review
 (including a dated `CHANGELOG.md` entry) → authorized branch push → Draft PR
 → latest CI success → explicit user approval → GitHub merge. Local `main` is
 only a synchronized copy of GitHub `main`, never an integration or repair path.
-When the base advances, fetch/rebase, rerun affected checks and independent
-review, and inspect fresh CI; conflicts or behavior changes require a new
-approved plan. Never force-push `main`. A reviewed branch rewrite also requires
-authorized publication; do not discard another worker's commits.
+When the base advances, fetch/rebase, rerun focused checks and independent
+review, and inspect fresh CI. Rebase and conflict-resolution approval follows
+[AGENTS.md](../../AGENTS.md#review-and-merge). Never force-push `main`.
+A reviewed branch rewrite also requires authorized publication; do not discard
+another worker's commits.
 
 There are three distinct identities: the reviewed PR head; GitHub's synthetic
 PR merge commit (`github.sha` for PR CI); and the final GitHub `main` commit
 after merge. Record the PR head, base and tested merge SHA with the Actions run.
 Inspect the exact check-run name `required` from GitHub Actions (app ID 15368),
 not only a green UI label; see [ci.md](ci.md). PR CI success never establishes
-Candidate Acceptance for a different final SHA. Recheck CI for the final main
-SHA, and run Candidate Acceptance only for that selected final GitHub `main`
-SHA when preparing an explicitly authorized deployment. It is not a PR merge
-gate, and merging alone never starts it. A later SHA invalidates earlier
-exact-SHA acceptance evidence.
+deployment evidence for a different final SHA. Deployment Preflight requires
+successful main-push CI for the selected final SHA, retained in main history.
+A later tip does not erase that evidence; changing the selected release SHA does.
+It is not a PR merge gate, and merging alone never deploys or starts a preflight.
 
 Branch/tag settings in [repository-protection.md](repository-protection.md)
 are a proposed, separately approved next stage, not active enforcement. Older
@@ -173,30 +254,28 @@ timestamped logs before claiming that live behavior changed.
 Before the first deployment, manually move production once to a clean,
 immutable detached release checkout. `make`, acceptance, readiness, and Smoke
 never perform that migration. After explicit deployment authorization, deploy
-only the exact Candidate-accepted SHA using the existing release runbook, then
-run Smoke against that detached checkout. Smoke reads selected-service health,
+only the exact CI-verified SHA through `scripts/deploy_release.py` and the existing
+release runbook, then run Smoke against that detached checkout. Smoke reads selected-service health,
 process/listener, logs, the selected Prediction N_LEG/LP contract, and browser evidence; it never deploys,
 restarts, rolls back, or submits. `ROLLBACK` is evidence only.
 
-Candidate `FAIL` or Host `BLOCKED` blocks deployment. For a Candidate failure,
-first complete one read-only audit of every reported error and its downstream
-dependencies. Then make one batched fix-forward, rerun focused checks and
-independent review, submit a repair PR, pass CI, obtain user merge approval,
-and merge on GitHub. Rerun Candidate Acceptance for the resulting final main
-deployment SHA; do not mutate production. Stop without edits for a
-business-rule or architecture decision, an external credentials/services/
-market/browser/data blocker, a dirty or invalid candidate checkout, a candidate
-SHA not verified as the selected final GitHub main commit, a changed SHA, a
-non-reproducible failure, or any repair requiring test weakening or scope
-expansion. An isolated repair branch and a clean detached immutable release
-checkout are expected; neither is required to be named `main`.
+Failed Deployment Preflight or Host `BLOCKED` blocks forward deployment. Missing,
+expired, cancelled or mismatched CI evidence is not a reason to rerun local full
+pytest. Report the missing check and obtain fresh trusted CI evidence through the
+approved process. A real test failure returns through focused diagnosis, approved
+in-scope repair, independent review, Draft PR, CI and separately authorized merge.
+Do not weaken tests, invent attestations, provision credentials or expand scope to
+turn an unknown result into success.
 
-Deployment requires the exact-SHA Candidate `PASS`, Host `READY`, and explicit
+Deployment requires exact-SHA preflight success, fresh Host `READY`, and explicit
 user authorization. Production Smoke must report `HEALTHY` for that same SHA.
 Branch push, Draft PR, GitHub merge, release/tag creation and deployment remain
-separate authorization boundaries. Do not infer release or deployment permission
-from push or merge approval. Preserve the exact accepted SHA, immutable root,
-`code_root`, service owner and rollback evidence throughout the handoff.
+separate authorization boundaries. Preserve the exact selected SHA, immutable
+root, `code_root`, service owner and rollback evidence throughout the handoff.
+Existing authorized rollback uses the recorded compatible release and retained
+environment; it is not blocked by expired forward CI artifacts. Low-level helpers
+retain their rollback semantics and are not a substitute for the supported
+forward-deployment wrapper.
 
 ## Prediction-only Linux cloud topology
 
@@ -205,6 +284,6 @@ For CVM Prediction with a local Prediction-only Gateway, use the additional
 in [prediction-cloud.md](prediction-cloud.md). They retain the exact-SHA,
 read-only browser and independent ownership requirements across both machines.
 The systemd helper's `PRECHECK_OK` and `BACKEND_SMOKE_OK` are component results,
-not substitutes for READY and HEALTHY. Candidate Acceptance timing, deployment
-and trading authorization remain unchanged. Operator handoff, metadata isolation
+not substitutes for READY and HEALTHY. Deployment and trading authorization remain separate. Trusted preflight replaces
+the former duplicate Candidate tests; cloud host/runtime checks remain fresh. Operator handoff, metadata isolation
 and shared-host resource evidence must be explicit; the gate does not invent it.

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, Sequence, ValuesView
 from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal, ROUND_CEILING, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
+
+from .polymarket_lp_scratch import LPReadScratch
 
 from .polymarket_lp_risk import (
     _account_after_reservations,
@@ -132,7 +134,7 @@ def _lp_shortlist_rows(
 ) -> list[dict[str, object]]:
     """Build every market passing the light rules before the fixed cap."""
 
-    if not isinstance(direction_facts, (list, tuple)):
+    if not isinstance(direction_facts, (list, tuple, ValuesView)):
         return []
     checked_at = now.astimezone(UTC) if isinstance(now, datetime) and now.tzinfo else None
     markets: dict[str, dict[str, object]] = {}
@@ -918,7 +920,7 @@ def lp_trial_candidates(
     if not isinstance(now, datetime) or now.tzinfo is None:
         return result
     checked_at = now.astimezone(UTC)
-    if not isinstance(direction_facts, (list, tuple)):
+    if not isinstance(direction_facts, (list, tuple, ValuesView)):
         return result
     budget = (
         account_budget_facts
@@ -932,7 +934,7 @@ def lp_trial_candidates(
         if isinstance(key, str)
     } if isinstance(competition, Mapping) else {}
 
-    directions_by_condition: dict[str, list[dict[str, object]]] = {}
+    directions_by_condition = LPReadScratch()
     read_conditions: set[str] = set()
     for direction in direction_facts:
         if not isinstance(direction, Mapping):
@@ -944,7 +946,9 @@ def lp_trial_candidates(
         if not condition_id:
             continue
         read_conditions.add(condition_id)
-        directions_by_condition.setdefault(condition_id, []).append(dict(direction))
+        directions = directions_by_condition.get(condition_id, [])
+        directions.append(dict(direction))
+        directions_by_condition[condition_id] = directions
 
     funnel_reasons: dict[str, list[dict[str, object]]] = {
         "read": [],
@@ -965,7 +969,7 @@ def lp_trial_candidates(
 
     base_rows = _lp_shortlist_rows(direction_facts, now=checked_at)
     window_rejections = _lp_event_window_rejections(
-        [row for row in direction_facts if isinstance(row, Mapping)],
+        (row for row in direction_facts if isinstance(row, Mapping)),
         now=checked_at,
     )
     base_candidates: list[dict[str, object]] = []

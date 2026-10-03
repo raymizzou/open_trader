@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 from types import ModuleType, SimpleNamespace
@@ -316,9 +317,15 @@ def test_make_acceptance_excludes_external_prediction_live_registry() -> None:
         "8769",
     )
 
-    assert '-k "not LIVE"' in normalized
-    assert '-m "not pressure and not browser"' in normalized
-    assert all(token not in normalized for token in forbidden)
+    portable = subprocess.run(
+        ["make", "-n", "test-ci-portable"], cwd=repo_root, check=True,
+        capture_output=True, text=True,
+    ).stdout
+    assert "scripts/deployment_preflight.py" in normalized
+    assert "pytest" not in normalized and "docker" not in normalized
+    assert '-k "not LIVE"' in portable
+    assert '-m "not pressure and not browser"' in portable
+    assert all(token not in normalized and token not in portable for token in forbidden)
 
 
 def test_make_acceptance_never_refreshes_or_mutates_runtime() -> None:
@@ -333,10 +340,11 @@ def test_make_acceptance_never_refreshes_or_mutates_runtime() -> None:
 
     normalized = " ".join(re.sub(r"\\\s*\n", " ", plan).split())
 
-    assert normalized.count("docker build") == 1
-    assert normalized.count("docker run") == 1
-    assert '-m "not pressure and not browser"' in normalized
-    assert 'acceptance/test_prediction_arbitrage_scenarios.py -k "not LIVE"' in normalized
+    assert normalized.count("docker build") == 0
+    assert normalized.count("docker run") == 0
+    assert normalized.count("scripts/deployment_preflight.py") == 1
+    assert "pytest" not in normalized
+    assert "--expected-sha" in normalized and "--release-root" in normalized
     assert all(
         token not in normalized
         for token in (
@@ -369,7 +377,7 @@ def test_default_gates_run_backend_suite_and_keep_explicit_pressure_and_browser_
             capture_output=True,
             text=True,
         ).stdout
-        for target in ("test", "acceptance", "test-pressure")
+        for target in ("test", "acceptance", "test-ci-portable", "test-pressure", "browser-test")
     }
     normalized = {
         target: " ".join(re.sub(r"\\\s*\n", " ", plan).split())
@@ -403,10 +411,14 @@ def test_default_gates_run_backend_suite_and_keep_explicit_pressure_and_browser_
         and "tests/test_dashboard_acceptance.py" in normalized["test"]
         and "tests/test_frontend_gateway.py" not in normalized["test"]
         and "tests/test_prediction_service.py" not in normalized["test"]
-        and '-m "not pressure and not browser"' in normalized["acceptance"]
+        and "scripts/deployment_preflight.py" in normalized["acceptance"]
+        and "pytest" not in normalized["acceptance"]
+        and '-m "not pressure and not browser"' in normalized["test-ci-portable"]
         and 'acceptance/test_prediction_arbitrage_scenarios.py -k "not LIVE"'
-        in normalized["acceptance"]
+        in normalized["test-ci-portable"]
         and '-m pressure' in normalized["test-pressure"]
+        and '-m browser' in normalized["browser-test"]
+        and "playwright" in normalized["browser-test"]
         and collected
         == [
             "tests/test_relation_incremental_activation.py::"
@@ -474,34 +486,18 @@ def serialized_trend_position() -> dict[str, object]:
     }
 
 
-def test_candidate_acceptance_owns_container_backend_gate() -> None:
+def test_candidate_acceptance_reuses_trusted_ci_without_backend_rerun() -> None:
     makefile = (Path(__file__).parents[1] / "Makefile").read_text(encoding="utf-8")
-
-    assert "WORKTREE_ROOT := $(CURDIR)" in makefile
-    assert "REPOSITORY_ROOT :=" in makefile
-    assert "candidate-acceptance:" in makefile
     assert "acceptance: candidate-acceptance" in makefile
-    candidate_recipe = makefile.split("candidate-acceptance:", 1)[1].split(
-        "test-pressure:", 1
-    )[0]
-    assert "BACKEND_PYTEST :=" in makefile
-    assert "$(DOCKER_RUN) $(BACKEND_PYTEST) $(if $(strip $(TEST))" in makefile
-    assert candidate_recipe.count("$(DOCKER_BUILD)") == 1
-    assert candidate_recipe.count("$(DOCKER_RUN)") == 1
-    assert "$(MAKE) test" not in candidate_recipe
-    assert candidate_recipe.count("$(BACKEND_PYTEST)") == 2
-    assert "sh -c" in candidate_recipe
-    assert 'acceptance/test_prediction_arbitrage_scenarios.py -k "not LIVE"' in candidate_recipe
-    first_backend = candidate_recipe.index("$(BACKEND_PYTEST)")
-    separator = candidate_recipe.index("&&")
-    second_backend = candidate_recipe.rindex("$(BACKEND_PYTEST)")
-    assert first_backend < separator < second_backend
-    assert "--init" in makefile
+    assert "candidate-acceptance: deployment-preflight" in makefile
+    recipe = makefile.split("deployment-preflight:", 1)[1].split("test-pressure:", 1)[0]
+    assert "scripts/deployment_preflight.py" in recipe
+    assert '--expected-sha "$(EXPECTED_SHA)"' in recipe
+    assert '--release-root "$(WORKTREE_ROOT)"' in recipe
+    assert '--python "$(PYTHON_BIN)"' in recipe
+    assert all(token not in recipe for token in ("DOCKER_BUILD", "DOCKER_RUN", "BACKEND_PYTEST", "pytest", "launchctl"))
     assert "--network none" in makefile
     assert "--cap-drop ALL" in makefile
-    assert "--security-opt no-new-privileges" in makefile
-    assert "OPEN_TRADER_SMOKE_URL" not in candidate_recipe
-    assert "launchd" not in candidate_recipe
 
 
 def test_browser_ignores_unattributed_http_errors_checked_by_response_handler() -> None:
@@ -1205,6 +1201,11 @@ def test_production_smoke_validates_paused_n_leg_without_state_request(tmp_path:
     repo_root = Path(__file__).parents[1]
     expected_root = tmp_path / "release"
     expected_root.mkdir()
+    (expected_root / "scripts").mkdir()
+    shutil.copyfile(
+        repo_root / "scripts/check_production_log.py",
+        expected_root / "scripts/check_production_log.py",
+    )
     runtime_root = tmp_path / "runtime"
     (runtime_root / "logs/prediction_service").mkdir(parents=True)
     (runtime_root / "logs/prediction_service/launchd.err.log").write_text("clean\n", encoding="utf-8")
@@ -1255,7 +1256,14 @@ def test_production_smoke_validates_paused_n_leg_without_state_request(tmp_path:
     ps = fake_bin / "ps"
     ps.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     ripgrep = fake_bin / "rg"
-    ripgrep.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    ripgrep.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$#\" = 1 ] && [ \"$1\" = \"--version\" ] && [ \"${FAKE_RG_UNAVAILABLE:-0}\" = 0 ]; then\n"
+        "  echo 'ripgrep fixture'; exit 0\n"
+        "fi\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
     for command in (python_wrapper, curl, lsof, ps, ripgrep):
         command.chmod(0o755)
     playwright = expected_root / "node_modules/.bin/playwright"
@@ -1293,6 +1301,7 @@ def test_production_smoke_validates_paused_n_leg_without_state_request(tmp_path:
         *,
         missing_n_leg: bool = False,
         missing_lp: bool = False,
+        unavailable_rg: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         calls.unlink(missing_ok=True)
         return subprocess.run(
@@ -1314,6 +1323,7 @@ def test_production_smoke_validates_paused_n_leg_without_state_request(tmp_path:
                 "FAKE_NLEG_CODE": code,
                 "FAKE_NLEG_MISSING": "1" if missing_n_leg else "0",
                 "FAKE_LP_MISSING": "1" if missing_lp else "0",
+                "FAKE_RG_UNAVAILABLE": "1" if unavailable_rg else "0",
             },
             capture_output=True,
             text=True,
@@ -1353,6 +1363,15 @@ def test_production_smoke_validates_paused_n_leg_without_state_request(tmp_path:
     missing_lp = run_smoke("1", "paused", "N_LEG_PAUSED", missing_lp=True)
     assert missing_lp.returncode != 0
     assert "lp dashboard: BLOCKED" in missing_lp.stdout
+    assert not any(
+        path.endswith("/api/prediction-arbitrage/state")
+        for path in calls.read_text(encoding="utf-8").splitlines()
+    )
+
+    unavailable_rg = run_smoke("1", "paused", "N_LEG_PAUSED", unavailable_rg=True)
+    assert unavailable_rg.returncode != 0
+    assert "log checker unavailable" in unavailable_rg.stdout
+    assert "ROLLBACK" in unavailable_rg.stdout
     assert not any(
         path.endswith("/api/prediction-arbitrage/state")
         for path in calls.read_text(encoding="utf-8").splitlines()
@@ -9486,6 +9505,7 @@ def test_controlled_account_outage_waits_for_label_and_listener_before_probe(
     state = {"label_present": True, "listener_present": True}
     fetch_calls: list[str] = []
     sleep_calls = 0
+    clock = [0.0]
 
     monkeypatch.setattr(
         dashboard_acceptance,
@@ -9513,6 +9533,7 @@ def test_controlled_account_outage_waits_for_label_and_listener_before_probe(
     def sleep(_seconds: float) -> None:
         nonlocal sleep_calls
         sleep_calls += 1
+        clock[0] += _seconds
         assert fetch_calls == []
         if sleep_calls == 1:
             state["label_present"] = False
@@ -9520,7 +9541,9 @@ def test_controlled_account_outage_waits_for_label_and_listener_before_probe(
             state["listener_present"] = False
 
     monkeypatch.setattr(dashboard_acceptance.subprocess, "run", run)
-    monkeypatch.setattr(dashboard_acceptance.time, "sleep", sleep)
+    monkeypatch.setattr(dashboard_acceptance, "time", SimpleNamespace(
+        monotonic=lambda: clock[0], sleep=sleep,
+    ))
 
     def fetch(_url: str, path: str) -> tuple[int, object]:
         fetch_calls.append(path)
@@ -10349,3 +10372,48 @@ def test_acceptance_cli_has_no_test_only_config_or_expected_cn_options() -> None
 
     assert "config" not in destinations
     assert "expected_cn" not in destinations
+
+
+@pytest.mark.parametrize("absent_at_deadline", [True, False])
+def test_controlled_account_outage_uses_exact_deadline_and_never_probes_live_listener(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, absent_at_deadline: bool,
+) -> None:
+    clock = [0.0]
+    probes: list[str] = []
+    commands: list[list[str]] = []
+    deadline = dashboard_acceptance.ACCOUNT_API_OUTAGE_WAIT_SECONDS
+
+    def run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        commands.append(command)
+        if command[:2] == ["launchctl", "print"]:
+            return SimpleNamespace(returncode=113, stdout="", stderr="Could not find service")
+        if command[0] == "lsof":
+            absent = absent_at_deadline and clock[0] == deadline
+            return SimpleNamespace(returncode=1 if absent else 0, stdout="" if absent else "listener", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def sleep(_seconds: float) -> None:
+        assert probes == []
+        clock[0] = float(deadline)
+
+    def fetch(_url: str, path: str) -> tuple[int, object]:
+        probes.append(path)
+        assert absent_at_deadline and clock[0] == deadline
+        if path == dashboard_acceptance.ACCOUNT_SNAPSHOT_PATH:
+            return 503, {"code": "account_module_unavailable"}
+        if path == "/healthz":
+            return 200, {"prediction_route_mode": "service", "prediction_upstream_status": "ok", "legacy_upstream_status": "ok"}
+        return 200, {"holding_enrichment": []}
+
+    monkeypatch.setattr(dashboard_acceptance, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep))
+    monkeypatch.setattr(dashboard_acceptance, "subprocess", SimpleNamespace(run=run))
+    monkeypatch.setattr(dashboard_acceptance, "_project_data_dir", lambda _root: tmp_path / "runtime/data")
+    monkeypatch.setattr(dashboard_acceptance, "_fetch_status_payload", fetch)
+    errors = dashboard_acceptance._controlled_account_outage_errors("http://gateway.test", tmp_path)
+    if absent_at_deadline:
+        assert errors == []
+        assert probes
+    else:
+        assert probes == []
+        assert any("label/listener remained after bootout" in error for error in errors)
+    assert any("install_account_api_launchd.sh" in command[0] for command in commands)

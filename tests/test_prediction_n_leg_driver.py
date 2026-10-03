@@ -13,6 +13,8 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
+from timing_support import run_test_in_subprocess
+
 from test_prediction_n_leg_confirm import (
     AS_OF,
     _FakeTrading,
@@ -851,8 +853,10 @@ def test_f2_active_batch_beyond_timeout_is_a_visible_blocked_state(
 
 
 def test_f4_driver_execution_source_discards_stale_generation_build(
-    tmp_path: Path,
+    tmp_path: Path, request,
 ) -> None:
+    if run_test_in_subprocess(request, timeout=90):
+        return
     import threading
 
     from test_prediction_n_leg_fail_closed_e2e import _issue64_real_chain
@@ -876,10 +880,11 @@ def test_f4_driver_execution_source_discards_stale_generation_build(
     rotation_done = threading.Event()
     built: list[object] = []
     returned: list[object] = []
+    errors: list[BaseException] = []
 
     def gated_account_view():
         build_started.set()
-        assert rotation_done.wait(timeout=30)
+        rotation_done.wait()
         return original_account_view()
 
     def recording_build(arg_component_id):
@@ -894,18 +899,29 @@ def test_f4_driver_execution_source_discards_stale_generation_build(
     instance._sources.pop(component_id, None)
 
     def accessor() -> None:
-        returned.append(instance.driver_execution_source(component_id))
+        try:
+            returned.append(instance.driver_execution_source(component_id))
+        except BaseException as exc:
+            errors.append(exc)
 
     thread = threading.Thread(target=accessor)
     thread.start()
-    assert build_started.wait(timeout=30)
-    problem = instance._problem_map[component_id]
-    snapshot = instance._snapshot_for(instance._selection[component_id])
-    g2_books = instance._frozen_source_books(problem, snapshot)
-    assert g2_books is not None and g2_books is not g1_books
-    instance._source_books[component_id] = g2_books
-    rotation_done.set()
-    thread.join(timeout=30)
+    try:
+        assert build_started.wait(timeout=30)
+        problem = instance._problem_map[component_id]
+        snapshot = instance._snapshot_for(instance._selection[component_id])
+        g2_books = instance._frozen_source_books(problem, snapshot)
+        assert g2_books is not None and g2_books is not g1_books
+        instance._source_books[component_id] = g2_books
+        rotation_done.set()
+
+    finally:
+        rotation_done.set()
+        thread.join(timeout=30)
+        instance._account_view = original_account_view
+        instance._build_execution_source = original_build
+    assert not thread.is_alive(), "accessor did not finish after rotation release"
+    assert not errors, errors
 
     # The stale G1 build completed but must be discarded: not re-inserted,
     # not returned.

@@ -29,6 +29,7 @@ jobs:
     timeout-minutes: 45
     outputs:
       source_sha: ${{ steps.identity.outputs.source_sha }}
+      manifest_sha256: ${{ steps.package.outputs.manifest_sha256 }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -52,6 +53,7 @@ jobs:
           version: '0.12.19'
           enable-cache: false
       - name: Build once with trustworthy main CI evidence and locked installation
+        id: package
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_SHA: ${{ steps.identity.outputs.source_sha }}
@@ -59,6 +61,7 @@ jobs:
           set -euo pipefail
           python3 scripts/release_artifacts.py build --repository "$GITHUB_REPOSITORY" --tag "$SOURCE_TAG" --output "$RUNNER_TEMP/release-assets"
           python3 scripts/verify_release_artifacts.py "$RUNNER_TEMP/release-assets" --destination "$RUNNER_TEMP/recovered" --expected-sha "$SOURCE_SHA" | tee "$RUNNER_TEMP/restoration.json"
+          printf 'manifest_sha256=%s\n' "$(sha256sum "$RUNNER_TEMP/release-assets/release-manifest.json" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
       - name: Pass only completed verified assets to draft job
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -78,13 +81,16 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ needs.build.outputs.source_sha }}
+          ref: ${{ github.workflow_sha }}
           persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: source-release-assets
           path: ${{ runner.temp }}/release-assets
+      # Trusted workflow tooling only; downloaded source is data in this job.
       - name: Recheck identity and upload only a draft without overwrites
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/release_artifacts.py upload-draft --repository "$GITHUB_REPOSITORY" --output "$RUNNER_TEMP/release-assets"
+          EXPECTED_MANIFEST_SHA256: ${{ needs.build.outputs.manifest_sha256 }}
+          SOURCE_SHA: ${{ needs.build.outputs.source_sha }}
+        run: python3 scripts/release_artifacts.py upload-draft --repository "$GITHUB_REPOSITORY" --output "$RUNNER_TEMP/release-assets" --expected-manifest-sha256 "$EXPECTED_MANIFEST_SHA256" --expected-tag "$SOURCE_TAG" --expected-sha "$SOURCE_SHA"

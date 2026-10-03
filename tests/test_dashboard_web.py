@@ -54,8 +54,9 @@ def test_acceptance_gate_is_backend_only_and_production_smoke_owns_playwright() 
     )
 
     assert "acceptance: candidate-acceptance" in normalized
-    assert '-m "not pressure and not browser"' in normalized_acceptance
-    assert 'acceptance/test_prediction_arbitrage_scenarios.py -k "not LIVE"' in normalized_acceptance
+    assert "scripts/deployment_preflight.py" in normalized_acceptance
+    assert "--expected-sha" in normalized_acceptance
+    assert "pytest" not in normalized_acceptance
     assert all(
         token not in normalized_acceptance
         for token in (
@@ -3955,6 +3956,7 @@ console.log(JSON.stringify({
 
 def test_prediction_submit_failed_cleared_status_and_alert_render() -> None:
     output = run_dashboard_js(r'''
+Date.now = () => Date.parse("2026-09-15T04:00:00Z");
 const base = {
   status:"healthy", stale:false,
   health:{status:"healthy",degraded_reasons:[]},
@@ -3979,6 +3981,10 @@ console.log(JSON.stringify({
   completeLabel:predictionExecutionStatusLabel("complete"),
   emptyLabel:predictionExecutionStatusLabel(""),
   recentAlert:predictionExecutionAlert(recent),
+  beforeBoundary:predictionExecutionAlert({...base,last_execution:lastExecution(599.999/60)}),
+  atBoundary:predictionExecutionAlert({...base,last_execution:lastExecution(600/60)}),
+  afterBoundary:predictionExecutionAlert({...base,last_execution:lastExecution(600.001/60)}),
+  futureAlert:predictionExecutionAlert({...base,last_execution:lastExecution(-1)}),
   staleAlert:predictionExecutionAlert(stale),
 }));
 ''')
@@ -3997,6 +4003,10 @@ console.log(JSON.stringify({
     assert 'class="pm-pill watch">已自动恢复</span>' in rendered["recentAlert"]
     assert "已核实无成交" not in rendered["staleAlert"]
     assert "已自动恢复" not in rendered["staleAlert"]
+    assert "已自动恢复" in rendered["beforeBoundary"]
+    assert "已自动恢复" in rendered["atBoundary"]
+    assert "已自动恢复" not in rendered["afterBoundary"]
+    assert "已自动恢复" not in rendered["futureAlert"]
 
 
 def test_prediction_market_incomplete_opportunity_stays_visible_but_cannot_trade() -> None:
@@ -5231,6 +5241,7 @@ console.log(JSON.stringify({
 
 def test_prediction_cross_preview_uses_production_contract_and_fails_closed() -> None:
     output = run_dashboard_js(r'''
+Date.now = () => Date.parse("2026-09-15T04:00:00Z");
 const preview = {
   state:"previewed", preview_id:"cross-preview-real", market_type:"cross_venue_yes_no",
   question:"Will Bitcoin close above $100,000 on December 31, 2026?",
@@ -5265,6 +5276,9 @@ console.log(JSON.stringify({
   rejectDecision:predictionPreviewIsComplete({...preview,codex_approval:{...preview.codex_approval,decision:"REJECT"}}),
   invalidMapping:predictionPreviewIsComplete({...preview,codex_approval:{...preview.codex_approval,direct_outcome_mapping:{...preview.codex_approval.direct_outcome_mapping,polymarket_no:"YES"}}}),
   invalidCutoff:predictionPreviewIsComplete({...preview,canonical_cutoff:"not-a-date"}),
+  beforeCutoff:predictionPreviewIsComplete({...preview,canonical_cutoff:new Date(Date.now()+1).toISOString()}),
+  equalCutoff:predictionPreviewIsComplete({...preview,canonical_cutoff:new Date(Date.now()).toISOString()}),
+  afterCutoff:predictionPreviewIsComplete({...preview,canonical_cutoff:new Date(Date.now()-1).toISOString()}),
   expiredCutoff:predictionPreviewIsComplete({...preview,canonical_cutoff:"2020-01-01T00:00:00Z"}),
   dateOnlyCutoff:predictionPreviewIsComplete({...preview,canonical_cutoff:"2099-12-31"}),
   naiveCutoff:predictionPreviewIsComplete({...preview,canonical_cutoff:"2099-12-31T23:59:00"}),
@@ -5294,6 +5308,9 @@ console.log(JSON.stringify({
         "rejectDecision": False,
         "invalidMapping": False,
         "invalidCutoff": False,
+        "beforeCutoff": True,
+        "equalCutoff": False,
+        "afterCutoff": False,
         "expiredCutoff": False,
         "dateOnlyCutoff": False,
         "naiveCutoff": False,
@@ -5366,6 +5383,7 @@ console.log(JSON.stringify({readiness,safeguards,cleanup,order}));
 
 def test_prediction_cross_execution_mode_is_required_for_actions() -> None:
     output = run_dashboard_js(r'''
+Date.now = () => Date.parse("2026-09-15T04:00:00Z");
 const opportunity = {
   opportunity_id:"cross-mode-fixture",title:"Cross mode fixture",market_type:"cross_venue_yes_no",
   execution_mode:"manual_confirm",quantity:"5",net_quantity:"5",total_max_cost:"4.80",
@@ -5401,6 +5419,7 @@ console.log(JSON.stringify({
   impossibleDateCutoff:renderedCutoff("2099-02-30T23:59:00Z"),
   invalidLeapDayCutoff:renderedCutoff("2100-02-29T23:59:00Z"),
   validLeapDayCutoff:renderedCutoff("2096-02-29T23:59:00Z").includes('data-action="participate"'),
+  equalCutoff:renderedCutoff(new Date(Date.now()).toISOString()),
   expiredCutoff:renderedCutoff("2020-01-01T00:00:00Z"),
   dateOnlyCutoff:renderedCutoff("2099-12-31"),
   naiveCutoff:renderedCutoff("2099-12-31T23:59:00"),
@@ -5419,7 +5438,7 @@ console.log(JSON.stringify({
         assert 'data-action="participate"' not in rendered[mode]
         assert "执行模式未知" in rendered[mode]
     assert rendered["validFutureCutoff"] is True
-    for mode in ("expiredCutoff", "dateOnlyCutoff", "naiveCutoff", "offsetCutoff", "impossibleDateCutoff", "invalidLeapDayCutoff"):
+    for mode in ("equalCutoff", "expiredCutoff", "dateOnlyCutoff", "naiveCutoff", "offsetCutoff", "impossibleDateCutoff", "invalidLeapDayCutoff"):
         assert 'data-action="participate"' not in rendered[mode]
     assert rendered["validLeapDayCutoff"] is True
 
@@ -5491,7 +5510,7 @@ console.log(JSON.stringify({incomplete,complete:opened&&opened[2]}));
     assert "opportunity" not in rendered["complete"]
     assert "0xLIST…FAKE" not in json.dumps(rendered["complete"], ensure_ascii=False)
     assert "999" not in json.dumps(rendered["complete"], ensure_ascii=False)
-def run_dashboard_js(script: str) -> str:
+def run_dashboard_js(script: str, *, timeout: float = 10) -> str:
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is required for dashboard helper runtime checks")
@@ -5501,17 +5520,21 @@ const fs = require("fs");
 const vm = require("vm");
 const code = fs.readFileSync(process.argv[1], "utf8");
 const sandbox = { document: { addEventListener() {} }, console, URLSearchParams };
+// Keep unresolved promises alive so the independent Python watchdog sees hangs.
+const keepAlive = setInterval(() => {}, 1000);
 (async () => {
   vm.createContext(sandbox);
   vm.runInContext(code, sandbox);
   await vm.runInContext(`(async () => {${process.argv[2]}})()`, sandbox);
-})().catch((error) => { console.error(error); process.exitCode = 1; });
+})().catch((error) => { console.error(error); process.exitCode = 1; })
+  .finally(() => clearInterval(keepAlive));
 """
     result = subprocess.run(
         [node, "-e", runner, str(js_path), script],
         check=False,
         capture_output=True,
         text=True,
+        timeout=timeout,
     )
     assert result.returncode == 0, result.stderr + result.stdout
     return result.stdout
@@ -11705,13 +11728,15 @@ const scrolls=[];
 globalThis.window={scrollY:111,scrollTo(_x,y){scrolls.push(y);},location:{search:""}};
 let resolveHistory;
 let resolveRows;
+let enteredJson;
+const jsonEntered = new Promise(resolve => { enteredJson = resolve; });
 globalThis.fetch=()=>new Promise((resolve)=>{resolveHistory=resolve;});
 const renderPanel=renderAccountViewPanelOnly;
 let panelRenders=0;
 renderAccountViewPanelOnly=(broker)=>{panelRenders+=1;return renderPanel(broker);};
 const request=openTrendReportHistory("futu");
-resolveHistory({ok:true,json:()=>new Promise((resolve)=>{resolveRows=resolve;})});
-while(!resolveRows) await Promise.resolve();
+resolveHistory({ok:true,json:()=>new Promise((resolve)=>{resolveRows=resolve;enteredJson();})});
+await jsonEntered;
 showCurrentTrendReport("futu");
 const currentHtml=panel.innerHTML;
 panelRenders=0;
@@ -24441,3 +24466,10 @@ def test_lp_review_read_failures_never_show_internal_codes(reason):
     copy = json.loads(output)['main']
     assert reason not in copy
     assert '账户' in copy
+
+
+@pytest.mark.parametrize("body", ["await new Promise(() => {});", "while (true) {}"])
+def test_dashboard_js_watchdog_reclaims_nonterminating_harness(body: str) -> None:
+    with pytest.raises(subprocess.TimeoutExpired) as error:
+        run_dashboard_js('console.log("watchdog-fixture-entered");' + body, timeout=1)
+    assert b"watchdog-fixture-entered" in (error.value.stdout or b"")

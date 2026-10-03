@@ -25,6 +25,21 @@ const sandbox={document,window,console,URLSearchParams,AbortController,
   fetch:async (url)=>{requests.push(url); return {ok:true,json:async()=>({state:'ready',n_leg:{status:'paused',code:'N_LEG_PAUSED'},venues:[],orders:[],positions:[],recommendations:[]})};}};
 vm.createContext(sandbox);
 vm.runInContext(fs.readFileSync(process.argv[1],'utf8'),sandbox);
+vm.runInContext(`
+  const pending = new Set();
+  for (const name of ['loadDashboard', 'fetchPredictionVenues', 'fetchPredictionLpDashboard', 'fetchPredictionState']) {
+    const original = globalThis[name];
+    globalThis[name] = (...args) => {
+      const promise = original(...args);
+      pending.add(promise);
+      Promise.resolve(promise).finally(() => pending.delete(promise));
+      return promise;
+    };
+  }
+  globalThis.drainBootstrap = async () => {
+    while (pending.size) await Promise.all([...pending]);
+  };
+`, sandbox);
 boot();
 setImmediate(()=>{
   assert.equal(vm.runInContext('state.workspaceView',sandbox),'prediction_market');
@@ -35,7 +50,7 @@ setImmediate(()=>{
   assert.equal(nodes['return-to-portfolio'].hidden,true);
 });
 '''
-    result = subprocess.run(['node', '-e', script, str(js)], capture_output=True, text=True)
+    result = subprocess.run(['node', '-e', script, str(js)], capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
 
 
@@ -110,12 +125,28 @@ const sandbox={document,window,console,URLSearchParams,AbortController,
   }};
 vm.createContext(sandbox);
 vm.runInContext(fs.readFileSync(process.argv[1],'utf8'),sandbox);
+vm.runInContext(`
+  const pending = new Set();
+  for (const name of ['loadDashboard', 'fetchPredictionVenues', 'fetchPredictionLpDashboard', 'fetchPredictionState']) {
+    const original = globalThis[name];
+    globalThis[name] = (...args) => {
+      const promise = original(...args);
+      pending.add(promise);
+      Promise.resolve(promise).finally(() => pending.delete(promise));
+      return promise;
+    };
+  }
+  globalThis.drainBootstrap = async () => {
+    while (pending.size) await Promise.all([...pending]);
+  };
+`, sandbox);
 boot();
-setTimeout(async()=>{
-  await new Promise(resolve=>setImmediate(resolve));
+const keepAlive = setInterval(() => {}, 1000);
+(async()=>{
+  await sandbox.drainBootstrap();
   if (process.env.BODY_PREDICTION_ONLY !== 'true') {
     vm.runInContext('setWorkspaceView("prediction_market");',sandbox);
-    await new Promise(resolve=>setImmediate(resolve));
+    await sandbox.drainBootstrap();
   }
   vm.runInContext('renderPredictionMarket();',sandbox);
   const html=nodes['prediction-market-root'].innerHTML;
@@ -174,9 +205,10 @@ setTimeout(async()=>{
     assert.equal(requests.some(request=>request.method==='POST'),true);
   }
   process.exit(0);
-},10);
+})().catch(error => { console.error(error); process.exitCode = 1; })
+  .finally(() => clearInterval(keepAlive));
 '''
-    result = subprocess.run(['node', '-e', script, str(js)], capture_output=True, text=True, env={
+    result = subprocess.run(['node', '-e', script, str(js)], capture_output=True, text=True, timeout=10, env={
         **os.environ, 'SERVICE_MODE': service_mode, 'SERVICE_MUTATIONS': mutations,
         'N_LEG': n_leg, 'EXPECTED_STATE': expected_state,
         'BODY_PREDICTION_ONLY': body_prediction_only})
@@ -219,9 +251,25 @@ const sandbox={document,window,console,URLSearchParams,AbortController,
   }};
 vm.createContext(sandbox);
 vm.runInContext(fs.readFileSync(process.argv[1],'utf8'),sandbox);
+vm.runInContext(`
+  const pending = new Set();
+  for (const name of ['loadDashboard', 'fetchPredictionVenues', 'fetchPredictionLpDashboard', 'fetchPredictionState']) {
+    const original = globalThis[name];
+    globalThis[name] = (...args) => {
+      const promise = original(...args);
+      pending.add(promise);
+      Promise.resolve(promise).finally(() => pending.delete(promise));
+      return promise;
+    };
+  }
+  globalThis.drainBootstrap = async () => {
+    while (pending.size) await Promise.all([...pending]);
+  };
+`, sandbox);
 boot();
-setTimeout(async()=>{
-  await new Promise(resolve=>setImmediate(resolve));
+const keepAlive = setInterval(() => {}, 1000);
+(async()=>{
+  await sandbox.drainBootstrap();
   assert.equal(vm.runInContext('predictionServiceIdentity().state',sandbox),'production');
   vm.runInContext('state.predictionMarket.activeTab="multi_leg";',sandbox);
   await vm.runInContext('predictionPost("/api/prediction-arbitrage/mode",{mode:"auto"})',sandbox);
@@ -247,7 +295,91 @@ setTimeout(async()=>{
   await vm.runInContext('predictionPost("/api/prediction-arbitrage/mode",{mode:"auto"})',sandbox);
   assert.equal(requests.filter(request=>request.method==='POST').length,2);
   process.exit(0);
-},10);
+})().catch(error => { console.error(error); process.exitCode = 1; })
+  .finally(() => clearInterval(keepAlive));
 '''
-    result = subprocess.run(['node', '-e', script, str(js)], capture_output=True, text=True)
+    result = subprocess.run(['node', '-e', script, str(js)], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+
+
+def test_split_ui_keeps_air_identity_and_auto_state_when_cloud_fails():
+    js = Path(__file__).resolve().parents[1] / 'src/open_trader/dashboard_static/dashboard.js'
+    script = r'''
+const fs=require('fs'), vm=require('vm'), assert=require('assert');
+const sandbox={console,URLSearchParams,AbortController,
+ document:{body:{dataset:{predictionSplit:'true'}},addEventListener(){}},
+ window:{location:{search:''},setInterval(){return 1},clearInterval(){},setTimeout(){},clearTimeout(){}},
+ fetch:async()=>{throw Error('unconfigured')}};
+vm.createContext(sandbox); vm.runInContext(fs.readFileSync(process.argv[1],'utf8'),sandbox);
+vm.runInContext(`renderPredictionMarket=()=>{}; closeNLegDomainPredictionModal=()=>{};
+ state.workspaceView='prediction_market'; state.predictionMarket.activeTab='lp';`,sandbox);
+let cloudDown=false, airDown=false, holdDisplay=false, releaseDisplay;
+const requests=[];
+sandbox.fetch=async(url,options={})=>{
+ requests.push(url);
+ if(url === "/api/prediction-arbitrage/state") return {ok:true,json:async()=>({status:"ready",n_leg:{status:"running"},events:[],opportunities:[]})};
+ if(url.includes("/history?")) return {ok:true,json:async()=>({kind:"signals",items:[],total:0})};
+ if(url.endsWith('/execution/identity')) return {ok:!airDown,status:503,json:async()=>({mode:'production',mutations:'enabled',csrf_token:'air-csrf',n_leg:{status:'running'}})};
+ if(url.endsWith('/lp/auto/state')) return {ok:!airDown,status:503,json:async()=>({desired_running:true,scheduler_running:true,pause_confirmed:true,budget_usd:'10',funds:{total_usd:'25',available_usd:'17'},slots:{occupied:2},last_round:{reason:'air-round',candidate_count:1,candidates:[{condition_id:'air-condition'}]}})};
+ if(options.method==='POST') {assert.equal(options.headers['X-CSRF-Token'],'air-csrf');return {ok:true,json:async()=>({canceled:['air-order']})};}
+ if(holdDisplay) await new Promise(resolve=>releaseDisplay=resolve);
+ return {ok:!cloudDown,status:503,json:async()=>({mode:'shadow',mutations:'prohibited',csrf_token:'cloud-csrf',n_leg:{status:'paused'},stale:true,orders:[{order_id:'cloud-order'}],auto:{desired_running:false}})};
+};
+(async()=>{
+ await vm.runInContext('fetchPredictionExecutionIdentity()',sandbox);
+ await vm.runInContext('fetchPredictionVenues()',sandbox);
+ await vm.runInContext('fetchPredictionLpDashboard()',sandbox);
+ await vm.runInContext('fetchPredictionLpAutoState()',sandbox);
+ assert.equal(vm.runInContext('predictionServiceIdentity().state',sandbox),'production');
+ assert.equal(vm.runInContext('state.predictionMarket.csrfToken',sandbox),'air-csrf');
+ assert.equal(vm.runInContext('predictionLpAutoState().desired_running',sandbox),true);
+ const html=vm.runInContext('predictionLpCard({lp_dashboard:state.predictionMarket.lpDashboard})',sandbox);
+ assert(html.includes('air-round') && html.includes('air-condition') && html.includes('共占位 2'),html);
+ assert(html.includes('25.00') && html.includes('17.00'),html);
+
+ assert.equal(vm.runInContext('predictionWritesBlocked()',sandbox),false);
+ assert.equal(vm.runInContext('state.predictionMarket.nLegStatus',sandbox),'running');
+ assert(!vm.runInContext('predictionVenueSummary()',sandbox).includes('多腿套利已暂停'));
+ vm.runInContext('state.predictionMarket.activeTab="multi_leg"',sandbox);
+ const before=requests.length;
+ await vm.runInContext('fetchPredictionState()',sandbox);
+ await vm.runInContext('loadPredictionHistory("signals")',sandbox);
+ assert(requests.slice(before).some(url=>url.endsWith('/state')));
+ assert(requests.slice(before).some(url=>url.includes('/history?kind=signals')));
+ vm.runInContext('state.predictionMarket.activeTab="lp"',sandbox);
+
+ cloudDown=true;
+ await vm.runInContext('fetchPredictionVenues()',sandbox);
+ await vm.runInContext('fetchPredictionLpDashboard()',sandbox);
+ assert.equal(vm.runInContext('predictionWritesBlocked()',sandbox),false);
+ assert.equal(vm.runInContext('state.predictionMarket.nLegStatus',sandbox),'running');
+ assert(!vm.runInContext('predictionVenueSummary()',sandbox).includes('多腿套利已暂停'));
+ vm.runInContext('state.predictionMarket.activeTab="multi_leg"',sandbox);
+ const offlineBefore=requests.length;
+ await vm.runInContext('fetchPredictionState()',sandbox);
+ await vm.runInContext('loadPredictionHistory("signals")',sandbox);
+ assert(requests.slice(offlineBefore).some(url=>url.endsWith('/state')));
+ assert(requests.slice(offlineBefore).some(url=>url.includes('/history?kind=signals')));
+ vm.runInContext('state.predictionMarket.activeTab="lp"',sandbox);
+
+ holdDisplay=true; const pending=vm.runInContext('fetchPredictionLpDashboard()',sandbox);
+ assert.equal(vm.runInContext('predictionLpDisplayBusy()',sandbox),false);
+ const result=await vm.runInContext('predictionPost("/api/prediction-arbitrage/lp/orders/cancel",{order_ids:["air-order"]})',sandbox);
+ assert.equal(result.canceled[0],'air-order');
+ releaseDisplay();await pending;holdDisplay=false;cloudDown=false;airDown=true;
+ await vm.runInContext('fetchPredictionExecutionIdentity()',sandbox);
+ await vm.runInContext('fetchPredictionLpAutoState()',sandbox);
+ await vm.runInContext('fetchPredictionLpDashboard()',sandbox);
+ assert.equal(vm.runInContext('predictionWritesBlocked()',sandbox),true);
+ assert.equal(vm.runInContext('state.predictionMarket.nLegStatus',sandbox),'unknown');
+ assert.equal(vm.runInContext('predictionLpAutoState()',sandbox),null);
+ assert.equal(vm.runInContext('state.predictionMarket.lpDashboard.orders[0].order_id',sandbox),'cloud-order');
+ vm.runInContext('state.predictionMarket.nLegStatus="paused"',sandbox);
+ assert(vm.runInContext('predictionVenueSummary()',sandbox).includes('多腿套利已暂停'));
+ vm.runInContext('document.body.dataset.predictionSplit="false";state.predictionMarket.nLegStatus="running"',sandbox);
+ assert(vm.runInContext('predictionVenueSummary()',sandbox).includes('多腿套利已暂停'));
+
+})().catch(error=>{console.error(error);process.exitCode=1});
+'''
+    result = subprocess.run(['node', '-e', script, str(js)], capture_output=True, text=True, timeout=15)
     assert result.returncode == 0, result.stderr

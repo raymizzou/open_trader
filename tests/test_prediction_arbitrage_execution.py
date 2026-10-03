@@ -14,6 +14,9 @@ from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
+
+from timing_support import run_test_in_subprocess
 
 import pytest
 
@@ -38,6 +41,17 @@ from tests.test_polymarket_lp import _augment_preview_snapshot
 from tests.test_polymarket_lp import _queue_book_snapshot
 from tests.test_polymarket_lp import _request as lp_request
 from tests.test_polymarket_lp import _snapshot as lp_snapshot
+
+
+class _ProjectionOnlyLP(PolymarketLPService):
+    """Projection/legacy first-seen component tests; no account registrar.
+
+    These cases exercise pre-seeded Store state and the legacy first-seen
+    component.  Full registration-cycle coverage remains in
+    tests/test_lp_order_registration_contract.py with the real SDK boundary.
+    """
+
+    register_account_snapshot = None
 
 
 def _seed_lp_history(
@@ -5298,8 +5312,7 @@ def test_two_threshold_holdings_do_not_block_a_new_preview(tmp_path: Path) -> No
         "intent": service._intent_payload(_threshold_intent()),
     }
     for index in range(2):
-        preview_id = store.create_preview(payload, expires_at=(datetime.now(UTC) + timedelta(seconds=5)).isoformat())
-        execution = store.consume_preview_and_create_execution(preview_id, f"historical-{index}")
+        execution = _consume_historical_preview(store, payload, f"historical-{index}")
         store.transition_execution(
             str(execution["execution_id"]),
             state="holding_to_resolution",
@@ -5333,8 +5346,7 @@ def test_startup_recognizes_known_threshold_holdings_without_merge(tmp_path: Pat
         "market_type": "threshold_hedge",
         "intent": service._intent_payload(_threshold_intent()),
     }
-    preview_id = store.create_preview(payload, expires_at=(datetime.now(UTC) + timedelta(seconds=5)).isoformat())
-    execution = store.consume_preview_and_create_execution(preview_id, "known-holding")
+    execution = _consume_historical_preview(store, payload, "known-holding")
     store.transition_execution(str(execution["execution_id"]), state="holding_to_resolution", evidence={"phase": "holding_to_resolution"})
     trading.holding_positions = (
         {"condition_id": "condition-a", "token_id": "a-token", "size": "10"},
@@ -6432,6 +6444,14 @@ def test_reset_breaker_denies_directional_imbalance_without_orders(tmp_path: Pat
     assert trading.batch_calls == 0
 
 
+
+def _consume_historical_preview(store, payload, request_key):
+    now = datetime.now(UTC)
+    with patch("open_trader.prediction_arbitrage_store._utc_now", return_value=now.isoformat()):
+        preview_id = store.create_preview(payload, expires_at=(now + timedelta(seconds=5)).isoformat())
+        return store.consume_preview_and_create_execution(preview_id, request_key)
+
+
 def seed_threshold_holding(service: object, store: object, request_key: str) -> str:
     """Seed one holding_to_resolution threshold execution (a/b legs, 10 each)."""
     payload = {
@@ -6440,12 +6460,7 @@ def seed_threshold_holding(service: object, store: object, request_key: str) -> 
         "market_type": "threshold_hedge",
         "intent": service._intent_payload(_threshold_intent()),  # type: ignore[attr-defined]
     }
-    preview_id = store.create_preview(  # type: ignore[attr-defined]
-        payload, expires_at=(datetime.now(UTC) + timedelta(seconds=5)).isoformat()
-    )
-    execution = store.consume_preview_and_create_execution(  # type: ignore[attr-defined]
-        preview_id, request_key
-    )
+    execution = _consume_historical_preview(store, payload, request_key)
     execution_id = str(execution["execution_id"])
     store.transition_execution(  # type: ignore[attr-defined]
         execution_id,
@@ -7833,7 +7848,7 @@ def test_lp_dashboard_projects_queue_protection_anchor_and_summary(
             },
         },
     )
-    service._lp = PolymarketLPService(store, object())
+    service._lp = _ProjectionOnlyLP(store, object())
 
     payload = service.refresh_lp_dashboard_snapshot()
     rows = {row["order_id"]: row for row in payload["lp_orders_today"]}
@@ -7906,7 +7921,7 @@ def test_dashboard_today_rows_carry_owning_session_and_flags(
             },
         },
     )
-    service._lp = PolymarketLPService(store, object())
+    service._lp = _ProjectionOnlyLP(store, object())
 
     payload = service.refresh_lp_dashboard_snapshot()
     rows = {row["order_id"]: row for row in payload["lp_orders_today"]}
@@ -7987,7 +8002,7 @@ def test_lp167_dashboard_rows_carry_per_level_protection(tmp_path: Path) -> None
             },
         },
     )
-    service._lp = PolymarketLPService(store, object())
+    service._lp = _ProjectionOnlyLP(store, object())
 
     payload = service.refresh_lp_dashboard_snapshot()
     rows = {row["order_id"]: row for row in payload["lp_orders_today"]}
@@ -8068,7 +8083,7 @@ def test_dashboard_completed_latest_session_rows_keep_managed_marking_with_sessi
             "owned_order_ids": ["entry-done"],
         },
     )
-    service._lp = PolymarketLPService(store, object())
+    service._lp = _ProjectionOnlyLP(store, object())
 
     payload = service.refresh_lp_dashboard_snapshot()
     rows = {row["order_id"]: row for row in payload["lp_orders_today"]}
@@ -8179,7 +8194,7 @@ def _first_seen_service(
         notifier=ChannelNotifier("feishu"),
         lock_path=tmp_path / "first-seen.lock",
     )
-    service._lp = PolymarketLPService(
+    service._lp = _ProjectionOnlyLP(
         store,
         _FirstSeenBookExchange(levels, condition_by_token=condition_by_token),
     )
@@ -8321,7 +8336,7 @@ def test_first_seen_first_round_builds_baseline_and_survives_restart(
     )
     books = _FirstSeenBookExchange({token: "10000"})
     books.open_orders = [buy]
-    lp_restarted = PolymarketLPService(store, books)
+    lp_restarted = _ProjectionOnlyLP(store, books)
     restarted._lp = lp_restarted
 
     restarted.refresh_lp_dashboard_snapshot()
@@ -8527,7 +8542,7 @@ def test_lp_dashboard_session_summary_marked_submit_baseline(
         notifier=ChannelNotifier("feishu"),
         lock_path=tmp_path / "submit-mark.lock",
     )
-    service._lp = PolymarketLPService(store, object())
+    service._lp = _ProjectionOnlyLP(store, object())
     store.lp_create_session(
         "lp-submit-session",
         "lp-submit-key",
@@ -8658,9 +8673,61 @@ def test_lp166_lp_start_and_submit_entry_admit_per_market(tmp_path: Path) -> Non
     }
 
 
-def test_lp178_submit_entry_waits_for_lock_and_submits(tmp_path: Path) -> None:
-    """Issue 178 A1: 撞锁后 lp_submit_entry 最多等 _LP_SUBMIT_LOCK_WAIT_SECONDS——
-    占锁线程 0.1 秒后释放，提交应在等待窗内走完全程（结果非 busy）。"""
+
+def _submit_after_owner_release(execution, submit, monkeypatch):
+    held = execution._acquire_global_lock()
+    assert held is not None
+    attempted = threading.Event()
+    release_contender = threading.Event()
+    results, errors = [], []
+    original_once = execution._acquire_global_lock_once
+    original_acquire = execution._acquire_global_lock
+
+    def once():
+        result = original_once()
+        if result is None:
+            attempted.set()
+            release_contender.wait()
+        return result
+
+    def acquire(*, wait_seconds=0.0):
+        assert wait_seconds > 0
+        # This is a success-after-contention test. The separate A2 regression
+        # below retains the real timeout duration and warning contract.
+        with patch.object(prediction_arbitrage_execution_module, "time",
+                          SimpleNamespace(monotonic=lambda: 0.0, sleep=time.sleep)):
+            return original_acquire(wait_seconds=wait_seconds)
+
+    monkeypatch.setattr(execution, "_acquire_global_lock_once", once)
+    monkeypatch.setattr(execution, "_acquire_global_lock", acquire)
+
+    def run():
+        try:
+            results.append(submit())
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    try:
+        assert attempted.wait(5), "submit never tried the occupied real lock"
+        assert execution._process_lock.locked()
+        assert not results and not errors
+    finally:
+        execution._release_global_lock(held)
+        release_contender.set()
+        thread.join(timeout=5)
+    assert not thread.is_alive(), "submit did not finish after owner release"
+    assert not errors, errors
+    assert len(results) == 1
+    assert not execution._process_lock.locked()
+    return results[0]
+
+
+def test_lp178_submit_entry_waits_for_lock_and_submits(tmp_path: Path, monkeypatch, request) -> None:
+    """An occupied real lock is retried only after its owner releases it."""
+    if run_test_in_subprocess(request):
+        return
     now = datetime(2026, 9, 22, 12, 0, tzinfo=UTC)
     market_c = _lp166_identity(3)
     exchange = LPExchange()
@@ -8677,25 +8744,12 @@ def test_lp178_submit_entry_waits_for_lock_and_submits(tmp_path: Path) -> None:
         lp=lp,
     )
     execution._breaker_open = False
-    held = execution._acquire_global_lock()
-    assert held is not None
-    timer = threading.Timer(0.1, execution._release_global_lock, args=(held,))
-    timer.start()
-    started = time.monotonic()
-    try:
-        original_wait = getattr(
-            prediction_arbitrage_execution_module, "_LP_SUBMIT_LOCK_WAIT_SECONDS", 3.0
-        )
-        prediction_arbitrage_execution_module._LP_SUBMIT_LOCK_WAIT_SECONDS = 0.5
-        result = execution.lp_submit_entry(
+    result = _submit_after_owner_release(
+        execution, lambda: execution.lp_submit_entry(
             {**_lp166_entry_request(now, market_c), "idempotency_key": "lp178-a1"}
-        )
-    finally:
-        timer.join()
-        prediction_arbitrage_execution_module._LP_SUBMIT_LOCK_WAIT_SECONDS = original_wait
-    elapsed = time.monotonic() - started
+        ), monkeypatch
+    )
     assert result["state"] == "entry_open"
-    assert elapsed >= 0.1
 
 
 def test_lp178_submit_entry_lock_wait_times_out_with_warning(
@@ -8775,9 +8829,8 @@ def test_lp178_submit_entry_uncontended_leaves_lock_free(tmp_path: Path) -> None
     execution._release_global_lock(probe)
 
 
-def test_lp178_submit_entry_cheap_conflict_rejection_skips_wait(tmp_path: Path) -> None:
-    """Issue 178 A4: 同标的冲突是便宜拒绝，先于等锁——占锁期间仍立即返回
-    lp_session_market_active（<1 秒，默认 3 秒等待窗不生效）。"""
+def test_lp178_submit_entry_cheap_conflict_rejection_skips_wait(tmp_path: Path, monkeypatch) -> None:
+    """A same-market conflict is rejected before trying the global lock."""
     now = datetime(2026, 9, 22, 12, 0, tzinfo=UTC)
     market_a = _lp166_identity(1)
     exchange = LPExchange()
@@ -8799,22 +8852,25 @@ def test_lp178_submit_entry_cheap_conflict_rejection_skips_wait(tmp_path: Path) 
     assert started_a["state"] == "entry_open"
     held = execution._acquire_global_lock()
     assert held is not None
+    def forbidden_wait(**kwargs):
+        raise AssertionError("conflict must be rejected before waiting for the lock")
+
+    monkeypatch.setattr(execution, "_acquire_global_lock", forbidden_wait)
     try:
-        started = time.monotonic()
         result = execution.lp_submit_entry(
             {**_lp166_entry_request(now, market_a), "idempotency_key": "lp178-a4-c"}
         )
-        elapsed = time.monotonic() - started
     finally:
         execution._release_global_lock(held)
     assert result["state"] == "busy"
     assert result["reason"] == "lp_session_market_active"
-    assert elapsed < 1.0
+    assert result["session_id"] == started_a["session_id"]
 
 
-def test_lp178_submit_augment_waits_for_lock_and_submits(tmp_path: Path) -> None:
-    """Issue 178 A5: lp_submit_augment 与 A1 镜像——占锁线程 0.1 秒后释放，
-    加量应在等待窗内走完全程（结果非 busy）。"""
+def test_lp178_submit_augment_waits_for_lock_and_submits(tmp_path: Path, monkeypatch, request) -> None:
+    """An occupied real lock is retried only after its owner releases it."""
+    if run_test_in_subprocess(request):
+        return
     now = datetime(2026, 9, 22, 12, 0, tzinfo=UTC)
     exchange = LPExchange()
     exchange.snapshot_value = _queue_book_snapshot(now, Decimal("120"))
@@ -8837,30 +8893,13 @@ def test_lp178_submit_augment_waits_for_lock_and_submits(tmp_path: Path) -> None
     exchange.snapshot_value = _augment_preview_snapshot(
         now, level=Decimal("380"), own_original=Decimal("120")
     )
-    held = execution._acquire_global_lock()
-    assert held is not None
-    timer = threading.Timer(0.1, execution._release_global_lock, args=(held,))
-    timer.start()
-    started_at = time.monotonic()
-    try:
-        original_wait = getattr(
-            prediction_arbitrage_execution_module, "_LP_SUBMIT_LOCK_WAIT_SECONDS", 3.0
-        )
-        prediction_arbitrage_execution_module._LP_SUBMIT_LOCK_WAIT_SECONDS = 0.5
-        result = execution.lp_submit_augment(
-            {
-                "session_id": session_id,
-                "quantity": "20",
-                "price": "0.29",
-                "idempotency_key": "lp178-a5-aug",
-            }
-        )
-    finally:
-        timer.join()
-        prediction_arbitrage_execution_module._LP_SUBMIT_LOCK_WAIT_SECONDS = original_wait
-    elapsed = time.monotonic() - started_at
+    result = _submit_after_owner_release(
+        execution, lambda: execution.lp_submit_augment(
+            {"session_id": session_id, "quantity": "20", "price": "0.29",
+             "idempotency_key": "lp178-a5-aug"}
+        ), monkeypatch
+    )
     assert result["state"] == "entry_open"
-    assert elapsed >= 0.1
 
 
 def test_lp179_slow_snapshot_does_not_block_unrelated_submit(tmp_path: Path) -> None:
@@ -9229,7 +9268,7 @@ def test_lp166_dashboard_lists_all_group_views_and_attributes_rows(
         notifier=ChannelNotifier("feishu"),
         lock_path=tmp_path / "views.lock",
     )
-    service._lp = PolymarketLPService(store, object())
+    service._lp = _ProjectionOnlyLP(store, object())
     common = {
         "market_id": "market-x",
         "outcome": "YES",
@@ -9360,3 +9399,49 @@ def test_notify_monitor_timeout_recovery_copy(tmp_path: Path) -> None:
     assert "每 5 分钟自动探测恢复" in message
     assert "Prediction Service" in message
     assert "重试已停止" not in message
+
+
+def test_cloud_display_cache_publishes_failures_expiration_and_bounded_trades(tmp_path, monkeypatch):
+    import open_trader.prediction_arbitrage_execution as module
+    now = datetime.now(UTC)
+    class Trading(_CancelTrading):
+        complete = True
+        def lp_account_snapshot(self):
+            return {**super().lp_account_snapshot(), 'checked_at':now,
+                'open_orders_complete':self.complete, 'positions_complete':self.complete,
+                'balance':Decimal('12'), 'allowance':Decimal('10'),
+                'account_trades':tuple({'trade_id':str(i)} for i in range(102)),
+                'account_trades_total':102, 'display_trades_complete':True}
+    trading = Trading([])
+    service = PredictionExecutionService(store=PredictionArbitrageStore(tmp_path/'data'),
+        monitor=object(), trading=trading, notifier=ChannelNotifier("feishu"), lock_path=tmp_path/'lock')
+    service._display_only = True
+    service.refresh_lp_dashboard_snapshot()
+    assert service.lp_dashboard()['balance'] == Decimal('12')
+    assert service.lp_dashboard()['state'] == 'ready'
+    assert len(service.lp_account_trades_page(offset=0,limit=100)['items']) == 100
+    assert service.lp_account_trades_page(offset=100,limit=100)['items'] == [{'trade_id':'100'},{'trade_id':'101'}]
+    trading.complete = False
+    service.refresh_lp_dashboard_snapshot()
+    assert service.lp_dashboard()['state'] == 'unknown' and service.lp_dashboard()['stale'] is True
+    service._display_only = False
+    service.refresh_lp_dashboard_snapshot()
+    assert service.lp_dashboard()['state'] == 'ready' and service.lp_dashboard()['stale'] is False
+    assert service.lp_dashboard()['open_orders_complete'] is False
+    service._display_only = True
+    trading.complete = True
+    service.refresh_lp_dashboard_snapshot()
+    reads = trading.account_reads
+    for _ in range(2): service.lp_dashboard();service.lp_account_trades_page(offset=0,limit=1)
+    assert trading.account_reads == reads
+    monkeypatch.setattr(module, '_utc_now', lambda: now + timedelta(seconds=61))
+    assert service.lp_dashboard()['stale'] is True
+    assert service.lp_account_trades_page(offset=0,limit=1)['reason'] == 'account_snapshot_expired'
+    monkeypatch.setattr(module, '_utc_now', lambda: now)
+    trading.account_error = RuntimeError('lp_account_snapshot_unknown')
+    service.refresh_lp_dashboard_snapshot()
+    assert service.lp_dashboard()['state'] == 'stale'
+    assert service.lp_dashboard()['balance'] == Decimal('12')
+    assert service.lp_account_trades_page(offset=0,limit=1)['state'] == 'unknown'
+    for limit in (0,101):
+        with pytest.raises(ValueError): service.lp_account_trades_page(offset=0,limit=limit)

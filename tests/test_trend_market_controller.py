@@ -17,6 +17,9 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
+import open_trader.daily_premarket as daily_premarket_module
+from tests.contended_lock_support import observe_flock_contention
+from tests.timing_support import run_test_in_subprocess
 
 from open_trader import a_share_trend as a_share_trend
 from open_trader import a_share_trend_watch as share_watch
@@ -201,7 +204,7 @@ class BlockingProcessFeishu(FeishuWebhookNotifier):
             self.attempts.value += 1
         if self.entered is not None:
             self.entered.set()
-        self.release.wait(timeout=5)
+        self.release.wait()
 
 
 def test_controller_notification_retries_only_feishu_once(
@@ -406,7 +409,38 @@ def test_controller_notification_stops_after_one_retry(
     assert feishu.attempt_count == 2
 
 
-def test_concurrent_controller_retries_send_feishu_once(tmp_path: Path) -> None:
+def _record_report_futures(monkeypatch: pytest.MonkeyPatch):
+    futures = []
+
+    class RecordingExecutor(ThreadPoolExecutor):
+        def submit(self, fn, /, *args, **kwargs):
+            future = super().submit(fn, *args, **kwargs)
+            futures.append(future)
+            return future
+
+    monkeypatch.setattr(controller, "ThreadPoolExecutor", RecordingExecutor)
+    return futures
+
+
+def _join_test_process(process) -> None:
+    process.join(timeout=5)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=5)
+    if process.is_alive():
+        process.kill()
+        process.join(timeout=5)
+    assert not process.is_alive()
+
+
+def test_concurrent_controller_retries_send_feishu_once(
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+) -> None:
+    # Preserve the pre-existing spawn/barrier budget plus bounded child cleanup.
+    if run_test_in_subprocess(request, timeout=90):
+        return
+
     config = controller_config(tmp_path)
     context = multiprocessing.get_context("spawn")
     attempts = context.Value("i", 0)
@@ -458,15 +492,21 @@ def test_concurrent_controller_retries_send_feishu_once(tmp_path: Path) -> None:
     finally:
         release.set()
         for process in processes:
-            process.join(timeout=5)
+            _join_test_process(process)
 
     assert all(process.exitcode == 0 for process in processes)
     assert attempts.value == 1
 
 
 def test_direct_notification_retry_and_scanner_send_feishu_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
+    # Preserve the pre-existing spawn/barrier budget plus bounded child cleanup.
+    if run_test_in_subprocess(request, timeout=90):
+        return
+
     config = replace(controller_config(tmp_path), notifiers=("feishu",))
     context = multiprocessing.get_context("spawn")
     attempts = context.Value("i", 0)
@@ -549,15 +589,21 @@ def test_direct_notification_retry_and_scanner_send_feishu_once(
         release.set()
         if direct is not None:
             direct.join(timeout=5)
-        scanner.join(timeout=5)
+            assert not direct.is_alive()
+        _join_test_process(scanner)
 
     assert scanner.exitcode == 0
     assert attempts.value == 1
 
 
 def test_concurrent_first_controller_notifications_send_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
+    if run_test_in_subprocess(request):
+        return
+
     config = controller_config(tmp_path)
     sent: list[set[str]] = []
     first_non_feishu = threading.Event()
@@ -581,10 +627,10 @@ def test_concurrent_first_controller_notifications_send_once(
                 attempt = local_attempts
             if attempt == 1:
                 first_non_feishu.set()
-                assert release_first.wait(timeout=2)
+                release_first.wait()
             else:
                 second_non_feishu.set()
-                assert release_second.wait(timeout=2)
+                release_second.wait()
         sent.append(channels)
         channel = "feishu_app" if "feishu" in channels else "macos"
         return [SimpleNamespace(channel=channel, success=True)]
@@ -606,22 +652,19 @@ def test_concurrent_first_controller_notifications_send_once(
             "snapshot unavailable",
             key,
         )
-        assert first_non_feishu.wait(timeout=2)
-        second = pool.submit(
-            controller._notify_once,
-            "US 趋势控制器阻塞",
-            "snapshot unavailable",
-            key,
-        )
-        if second_non_feishu.wait(timeout=1):
+        try:
+            assert first_non_feishu.wait(timeout=2)
+            second = pool.submit(
+                controller._notify_once,
+                "US 趋势控制器阻塞", "snapshot unavailable", key,
+            )
+            # A duplicate must finish while the owner still holds the send lock.
+            assert second.result(timeout=2) is False
+            assert not second_non_feishu.is_set()
+        finally:
             release_first.set()
-            assert first.result(timeout=2) is True
             release_second.set()
-        else:
-            assert second.done()
-            release_first.set()
-            assert first.result(timeout=2) is True
-        second.result(timeout=2)
+        assert first.result(timeout=2) is True
 
     assert sent.count({"macos", "xiaoai"}) == 1
     assert sent.count({"feishu", "feishu_app"}) == 1
@@ -5779,8 +5822,14 @@ def test_close_review_recovery_completes_once_after_backoff(
 
 
 def test_failed_report_retry_uses_current_cycle_after_cycle_advances(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
+    if run_test_in_subprocess(request):
+        return
+
+    report_futures = _record_report_futures(monkeypatch)
     config = controller_config(tmp_path)
     monkeypatch.setattr(socket, "gethostname", lambda: "executor")
 
@@ -5834,7 +5883,7 @@ def test_failed_report_retry_uses_current_cycle_after_cycle_advances(
     monkeypatch.setattr(
         controller,
         "_run_protection_pass",
-        lambda *_args, **_kwargs: failed.wait(timeout=1),
+        lambda *_args, **_kwargs: protection_success(),
     )
     def capture_close(
         _config: DailyPremarketConfig,
@@ -5860,8 +5909,11 @@ def test_failed_report_retry_uses_current_cycle_after_cycle_advances(
         nonlocal sleeps
         sleeps += 1
         if sleeps == 1:
+            assert isinstance(report_futures[0].exception(timeout=1), RuntimeError)
+            assert report_futures[0].done()
             return
-        assert retried.wait(timeout=1)
+        report_futures[-1].result(timeout=1)
+        assert retried.is_set()
         raise RuntimeError("stop controller test")
 
     with pytest.raises(RuntimeError, match="stop controller test"):
@@ -6415,8 +6467,14 @@ def test_controller_directionless_abnormal_execution_uses_batch_failure(
 
 
 def test_report_future_crossing_cycle_never_executes_old_report(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
+    if run_test_in_subprocess(request):
+        return
+
+    report_futures = _record_report_futures(monkeypatch)
     config = replace(
         controller_config(tmp_path), trend_review_cn_simulate_acc_id=101
     )
@@ -6479,12 +6537,12 @@ def test_report_future_crossing_cycle_never_executes_old_report(
     ) -> None:
         runs.append(report_run_date)
         if report_run_date == "2026-07-17":
-            assert release.wait(timeout=1)
+            release.wait()
             write_generated_report(report_run_date)
             old_generated.set()
             return
         current_started.set()
-        assert current_release.wait(timeout=1)
+        current_release.wait()
         write_generated_report(report_run_date)
         current_generated.set()
 
@@ -6518,7 +6576,9 @@ def test_report_future_crossing_cycle_never_executes_old_report(
         sleeps += 1
         if sleeps == 1:
             release.set()
-            assert old_generated.wait(timeout=1)
+            report_futures[0].result(timeout=1)
+            assert report_futures[0].done()
+            assert old_generated.is_set()
             return
         if sleeps == 2:
             assert current_started.wait(timeout=1)
@@ -6526,10 +6586,22 @@ def test_report_future_crossing_cycle_never_executes_old_report(
         if sleeps == 3:
             assert not current_batch_path.exists()
             current_release.set()
+            report_futures[-1].result(timeout=1)
+            assert report_futures[-1].done()
             return
-        assert current_generated.wait(timeout=1)
+        assert current_generated.is_set()
         assert current_batch_path.exists()
         raise RuntimeError("stop controller test")
+
+    original_advance = advance
+
+    def advance(seconds: float) -> None:
+        try:
+            original_advance(seconds)
+        except BaseException:
+            release.set()
+            current_release.set()
+            raise
 
     with pytest.raises(RuntimeError, match="stop controller test"):
         run_trend_market_controller(
@@ -6572,8 +6644,14 @@ def test_report_future_crossing_cycle_never_executes_old_report(
 
 
 def test_same_logical_cycle_keeps_inflight_report_when_next_check_changes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
+    if run_test_in_subprocess(request):
+        return
+
+    report_futures = _record_report_futures(monkeypatch)
     config = replace(
         controller_config(tmp_path), trend_review_cn_simulate_acc_id=101
     )
@@ -6646,7 +6724,7 @@ def test_same_logical_cycle_keeps_inflight_report_when_next_check_changes(
     ) -> None:
         runs.append(report_run_date)
         started.set()
-        assert release.wait(timeout=1)
+        release.wait()
         report = valid_cn_report(
             as_of_date="2026-07-17", execution_date="2026-07-20"
         )
@@ -6672,8 +6750,10 @@ def test_same_logical_cycle_keeps_inflight_report_when_next_check_changes(
             return
         if sleeps == 2:
             release.set()
+            report_futures[0].result(timeout=1)
+            assert report_futures[0].done()
             return
-        assert generated.wait(timeout=1)
+        assert generated.is_set()
         assert current_batch_path.exists()
         assert list(
             (
@@ -6682,6 +6762,15 @@ def test_same_logical_cycle_keeps_inflight_report_when_next_check_changes(
             ).glob("*.json")
         )
         raise RuntimeError("stop controller test")
+
+    original_advance = advance
+
+    def advance(seconds: float) -> None:
+        try:
+            original_advance(seconds)
+        except BaseException:
+            release.set()
+            raise
 
     with pytest.raises(RuntimeError, match="stop controller test"):
         run_trend_market_controller(
@@ -13347,11 +13436,16 @@ def test_revision_request_waits_for_report_freeze_before_capturing_baseline(
     monkeypatch: pytest.MonkeyPatch,
     market: str,
     relative_lock: str,
+    request: pytest.FixtureRequest,
 ) -> None:
+    if run_test_in_subprocess(request):
+        return
+
     config = controller_config(tmp_path)
     cycle = replace(active_cn_cycle(), market=market)
     report_path = controller._report_dir(config, market) / "2026-07-17.json"
     report_lock = config.data_dir / relative_lock
+    contended = observe_flock_contention(monkeypatch, daily_premarket_module, report_lock)
     lock_held = threading.Event()
     release_report = threading.Event()
     baseline_checked = threading.Event()
@@ -13368,7 +13462,7 @@ def test_revision_request_waits_for_report_freeze_before_capturing_baseline(
     def freeze_base_report() -> None:
         with RunLock(report_lock):
             lock_held.set()
-            assert release_report.wait(timeout=2)
+            release_report.wait()
             report_path.parent.mkdir(parents=True, exist_ok=True)
             payload = (
                 valid_cn_report(
@@ -13386,7 +13480,8 @@ def test_revision_request_waits_for_report_freeze_before_capturing_baseline(
         assert lock_held.wait(timeout=1)
         request_future = pool.submit(controller._request_revision, config, cycle, NOW)
         try:
-            assert not baseline_checked.wait(timeout=0.1)
+            assert contended.wait(timeout=1)
+            assert not baseline_checked.is_set()
         finally:
             release_report.set()
         freeze_future.result(timeout=1)

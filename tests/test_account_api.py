@@ -52,13 +52,17 @@ def _running(server: ThreadingHTTPServer):
     try:
         yield
     finally:
-        server.shutdown()
+        shutdown = threading.Thread(target=server.shutdown, daemon=True)
+        shutdown.start()
+        shutdown.join(timeout=5)
+        assert not shutdown.is_alive(), "account API shutdown did not complete"
         server.server_close()
-        thread.join()
+        thread.join(timeout=5)
+        assert not thread.is_alive(), "account API server did not stop"
 
 
 def _get_json(url: str) -> dict[str, object]:
-    with urllib.request.urlopen(url) as response:
+    with urllib.request.urlopen(url, timeout=5) as response:
         return json.load(response)
 
 
@@ -228,7 +232,7 @@ def test_account_api_stages_confirmed_holding_snapshot_with_202(tmp_path: Path) 
                 "Content-Length": str(len(body)),
             },
         )
-        with urllib.request.urlopen(request) as response:
+        with urllib.request.urlopen(request, timeout=5) as response:
             assert response.status == HTTPStatus.ACCEPTED
             staged = json.load(response)
 
@@ -284,7 +288,7 @@ def test_account_api_rejects_unconfirmed_holding_snapshot_without_artifacts(
             },
         )
         with pytest.raises(urllib.error.HTTPError) as rejected:
-            urllib.request.urlopen(request)
+            urllib.request.urlopen(request, timeout=5)
 
     assert rejected.value.code == HTTPStatus.BAD_REQUEST
     assert json.load(rejected.value)["code"] == "holding_snapshot_rejected"
@@ -337,7 +341,7 @@ def test_account_api_rejects_holding_snapshot_in_shadow_mode_without_artifacts(
             },
         )
         with pytest.raises(urllib.error.HTTPError) as rejected:
-            urllib.request.urlopen(request)
+            urllib.request.urlopen(request, timeout=5)
 
     assert rejected.value.code == HTTPStatus.SERVICE_UNAVAILABLE
     assert json.load(rejected.value)["code"] == "account_api_shadow_only"
@@ -371,7 +375,7 @@ def test_account_api_health_snapshot_etag_and_not_found(tmp_path: Path) -> None:
         expected_code_root = str(Path(open_trader.__file__).resolve().parent.parent)
         assert health["code_root"] == expected_code_root
         assert health["worker_code_root"] == expected_code_root
-        with urllib.request.urlopen(base + "/api/v1/account/snapshot") as response:
+        with urllib.request.urlopen(base + "/api/v1/account/snapshot", timeout=5) as response:
             payload = json.load(response)
             etag = response.headers["ETag"]
             assert response.headers.get("Access-Control-Allow-Origin") is None
@@ -380,12 +384,12 @@ def test_account_api_health_snapshot_etag_and_not_found(tmp_path: Path) -> None:
             headers={"If-None-Match": etag},
         )
         with pytest.raises(urllib.error.HTTPError) as unchanged:
-            urllib.request.urlopen(request)
+            urllib.request.urlopen(request, timeout=5)
         assert unchanged.value.code == HTTPStatus.NOT_MODIFIED
         assert unchanged.value.read() == b""
         assert payload["snapshot_generation"].removeprefix("sha256:") in etag
         with pytest.raises(urllib.error.HTTPError) as missing:
-            urllib.request.urlopen(base + "/api/unknown")
+            urllib.request.urlopen(base + "/api/unknown", timeout=5)
         assert missing.value.code == HTTPStatus.NOT_FOUND
         assert json.load(missing.value)["code"] == "not_found"
 
@@ -410,7 +414,7 @@ def test_account_api_health_is_live_without_a_matching_worker_release(
         base = f"http://127.0.0.1:{server.server_address[1]}"
         assert _get_json(base + "/healthz")["release_match"] is False
         with pytest.raises(urllib.error.HTTPError) as snapshot:
-            urllib.request.urlopen(base + "/api/v1/account/snapshot")
+            urllib.request.urlopen(base + "/api/v1/account/snapshot", timeout=5)
         assert snapshot.value.code == HTTPStatus.SERVICE_UNAVAILABLE
 
 
@@ -601,7 +605,7 @@ def test_account_api_allows_direct_snapshot_requests_in_both_modes(
     )
     with _running(server):
         base = f"http://127.0.0.1:{server.server_address[1]}"
-        with urllib.request.urlopen(base + "/api/v1/account/snapshot") as response:
+        with urllib.request.urlopen(base + "/api/v1/account/snapshot", timeout=5) as response:
             assert response.status == HTTPStatus.OK
 
 
@@ -627,7 +631,7 @@ def test_account_api_shadow_rejects_production_marker_with_frozen_envelope(
             headers={"X-Open-Trader-Account-Route": "production"},
         )
         with pytest.raises(urllib.error.HTTPError) as rejected:
-            urllib.request.urlopen(request)
+            urllib.request.urlopen(request, timeout=5)
 
     assert rejected.value.code == HTTPStatus.SERVICE_UNAVAILABLE
     assert json.load(rejected.value) == {
@@ -666,7 +670,7 @@ def test_account_api_production_accepts_marker_and_preserves_etag(
             base + "/api/v1/account/snapshot",
             headers={"X-Open-Trader-Account-Route": "production"},
         )
-        with urllib.request.urlopen(request) as response:
+        with urllib.request.urlopen(request, timeout=5) as response:
             assert json.load(response)["schema_version"] == 1
             etag = response.headers["ETag"]
         unchanged = urllib.request.Request(
@@ -677,7 +681,7 @@ def test_account_api_production_accepts_marker_and_preserves_etag(
             },
         )
         with pytest.raises(urllib.error.HTTPError) as response:
-            urllib.request.urlopen(unchanged)
+            urllib.request.urlopen(unchanged, timeout=5)
 
     assert response.value.code == HTTPStatus.NOT_MODIFIED
     assert response.value.read() == b""
@@ -724,7 +728,7 @@ def test_account_api_statement_trade_facts_returns_only_public_contract(
             f"statements/phillips/{generation}/trade-facts",
             headers={"X-Open-Trader-Account-Route": "production"},
         )
-        with urllib.request.urlopen(request) as response:
+        with urllib.request.urlopen(request, timeout=5) as response:
             payload = json.load(response)
 
     assert payload == {
@@ -782,7 +786,7 @@ def test_account_api_statement_trade_facts_production_requires_route_marker(
             urllib.request.urlopen(
                 f"http://127.0.0.1:{server.server_address[1]}/api/v1/account/"
                 f"statements/phillips/{generation}/trade-facts"
-            )
+            , timeout=5)
 
     assert rejected.value.code == HTTPStatus.SERVICE_UNAVAILABLE
     assert json.load(rejected.value) == {
@@ -815,7 +819,7 @@ def test_account_api_statement_trade_facts_shadow_rejects_production_marker(
             headers={"X-Open-Trader-Account-Route": "production"},
         )
         with pytest.raises(urllib.error.HTTPError) as rejected:
-            urllib.request.urlopen(request)
+            urllib.request.urlopen(request, timeout=5)
 
     assert rejected.value.code == HTTPStatus.SERVICE_UNAVAILABLE
     assert json.load(rejected.value)["code"] == "account_api_shadow_only"
@@ -849,7 +853,7 @@ def test_account_api_statement_trade_facts_rejects_malformed_request(
             urllib.request.urlopen(
                 f"http://127.0.0.1:{server.server_address[1]}/api/v1/account/"
                 f"statements/{broker}/{generation}/trade-facts"
-            )
+            , timeout=5)
 
     assert rejected.value.code == HTTPStatus.BAD_REQUEST
     assert json.load(rejected.value)["code"] == "invalid_statement_facts_request"
@@ -887,7 +891,7 @@ def test_account_api_statement_trade_facts_rejects_replaced_generation_before_re
             headers={"X-Open-Trader-Account-Route": "production"},
         )
         with pytest.raises(urllib.error.HTTPError) as rejected:
-            urllib.request.urlopen(request)
+            urllib.request.urlopen(request, timeout=5)
 
     assert rejected.value.code == HTTPStatus.CONFLICT
     assert json.load(rejected.value)["code"] == "accepted_statement_generation_changed"
@@ -926,7 +930,7 @@ def test_account_api_statement_trade_facts_rejects_invalid_publication(
             headers={"X-Open-Trader-Account-Route": "production"},
         )
         with pytest.raises(urllib.error.HTTPError) as rejected:
-            urllib.request.urlopen(request)
+            urllib.request.urlopen(request, timeout=5)
 
     assert rejected.value.code == HTTPStatus.SERVICE_UNAVAILABLE
     payload = json.load(rejected.value)
@@ -972,7 +976,7 @@ def test_account_api_stages_statement_command_with_202_in_production(
             method="POST",
             headers={"Content-Type": "application/pdf"},
         )
-        with urllib.request.urlopen(request) as response:
+        with urllib.request.urlopen(request, timeout=5) as response:
             payload = json.load(response)
             status = response.status
 
@@ -1020,7 +1024,7 @@ def test_account_api_statement_command_fails_closed(
             headers={"Content-Type": content_type},
         )
         with pytest.raises(urllib.error.HTTPError) as rejected:
-            urllib.request.urlopen(request)
+            urllib.request.urlopen(request, timeout=5)
 
     assert rejected.value.code == status
     assert json.load(rejected.value)["code"] == code
@@ -1172,7 +1176,7 @@ def test_manual_source_survives_public_snapshot_and_parity(tmp_path: Path) -> No
 
     with _running(server):
         base = f"http://127.0.0.1:{server.server_address[1]}"
-        with urllib.request.urlopen(base + "/api/v1/account/snapshot") as response:
+        with urllib.request.urlopen(base + "/api/v1/account/snapshot", timeout=5) as response:
             payload = json.load(response)
         parity = account_api.check_account_api_parity(data_dir, base_url=base)
 

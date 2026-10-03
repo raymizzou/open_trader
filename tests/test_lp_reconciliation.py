@@ -4,9 +4,26 @@ import pytest
 
 from decimal import Decimal
 from concurrent.futures import ThreadPoolExecutor
-from threading import Event, Thread
+from threading import Event, Thread, get_ident
 
 from tests.test_lp_auto_pool import setup
+
+
+def _observe_facts_join(lp, monkeypatch):
+    """Observe selection of the existing lane, not just thread submission."""
+    with lp._facts_lock:
+        flights = tuple(lp._facts_inflight.values())
+    assert len(flights) == 1
+    future = flights[0]['future']
+    joined = Event()
+    original = future.result
+
+    def result(*args, **kwargs):
+        joined.set()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(future, 'result', result)
+    return joined
 
 
 def test_reward_refresh_during_account_read_does_not_invalidate_funds(tmp_path):
@@ -129,8 +146,8 @@ def test_rejected_account_identity_cannot_authorize_queue_cancel(
 
 
 @pytest.mark.parametrize("auto_first", [False, True])
-def test_tick_and_auto_share_one_inflight_venue_read(tmp_path, auto_first):
-    execution, exchange, _, _ = setup(tmp_path)
+def test_tick_and_auto_share_one_inflight_venue_read(tmp_path, auto_first, monkeypatch):
+    execution, exchange, lp, _ = setup(tmp_path)
     execution.lp_auto_configure(dict(budget_usd="100", target_buy_count=1))
     execution.lp_auto_set_desired_running(True)
     execution.lp_auto_run_once()
@@ -152,8 +169,10 @@ def test_tick_and_auto_share_one_inflight_venue_read(tmp_path, auto_first):
         tick = workers.submit(first)
         try:
             assert entered.wait(2)
+            joined = _observe_facts_join(lp, monkeypatch)
             automatic = workers.submit(second)
-            assert not duplicate.wait(.2), "two independent account reads raced"
+            assert joined.wait(2), "second consumer must join the in-flight lane"
+            assert not duplicate.is_set(), "two independent account reads raced"
         finally:
             release.set()
         tick.result(timeout=5)
@@ -161,6 +180,7 @@ def test_tick_and_auto_share_one_inflight_venue_read(tmp_path, auto_first):
     assert execution.lp_auto_state()["funds"]["status"] == "known"
     assert len(exchange.posts) == 1
     assert scored == ["o1"], "joining tick must still apply its monitoring work"
+    assert not duplicate.is_set(), "drained consumers must still have shared one read"
 
 
 def test_manual_cancel_invalidates_funds_before_network_and_fences_old_read(tmp_path):
@@ -1093,8 +1113,8 @@ def test_fresh_read_during_manual_cancel_cannot_restore_known_funds(tmp_path):
     assert len(exchange.posts) == 1
 
 
-def test_session_lane_stays_owned_through_post_read_monitoring(tmp_path):
-    execution, exchange, _, _ = setup(tmp_path)
+def test_session_lane_stays_owned_through_post_read_monitoring(tmp_path, monkeypatch):
+    execution, exchange, lp, _ = setup(tmp_path)
     execution.lp_auto_configure(dict(budget_usd='100', target_buy_count=1))
     execution.lp_auto_set_desired_running(True)
     execution.lp_auto_run_once()
@@ -1119,13 +1139,17 @@ def test_session_lane_stays_owned_through_post_read_monitoring(tmp_path):
         tick = workers.submit(execution.lp_tick)
         try:
             assert entered.wait(2)
+            joined = _observe_facts_join(lp, monkeypatch)
             automatic = workers.submit(execution.lp_auto_reconcile_unknown)
-            assert not duplicate.wait(.2), 'a second owner started before monitoring finished'
+            assert joined.wait(2), 'second consumer must reach the held lane'
+            assert not duplicate.is_set(), 'a second owner started before monitoring finished'
         finally:
             release.set()
         tick.result(timeout=5)
         automatic.result(timeout=5)
     assert len(exchange.posts) == 1
+    assert calls == ['m00'], 'drain must not hide a second venue read'
+    assert not duplicate.is_set()
 
 
 def test_flat_session_with_unknown_fees_stays_in_tick_reconciliation(tmp_path):
@@ -1378,7 +1402,10 @@ def test_failed_session_keeps_capital_but_allows_other_market_buy(tmp_path):
     assert Decimal(state['funds']['spendable_usd']) == 0
 
 
-def test_market_read_capacity_remains_fail_fast_for_shared_snapshot_callers(tmp_path):
+def test_market_read_capacity_remains_fail_fast_for_shared_snapshot_callers(tmp_path, caplog):
+    import logging
+    from open_trader.polymarket_trading import _lp_read_stage
+    caplog.set_level(logging.INFO, logger="open_trader.polymarket_trading")
     _, exchange, lp, _ = setup(tmp_path, 2)
     first_entered, second_entered = Event(), Event()
     release = Event()
@@ -1404,7 +1431,15 @@ def test_market_read_capacity_remains_fail_fast_for_shared_snapshot_callers(tmp_
     try:
         lp._facts_owner.session_id = 'test-session'
         with pytest.raises(ValueError, match='market_read_capacity'):
-            lp._read_snapshot(dict(condition_id='m02', token_id='m02'))
+            with _lp_read_stage('facts_read'):
+                lp._read_snapshot(dict(condition_id='m02', token_id='m02'))
+        # This synchronous capacity refusal owns the caller's records. Other
+        # reconciliation publishers can legitimately log their own failures.
+        records = [r for r in caplog.records if r.thread == get_ident()]
+        messages = '\n'.join(r.getMessage() for r in records)
+        assert 'lp_read_wait stage=facts_read' in messages
+        assert 'reason=market_read_capacity' in messages
+        assert not [r for r in records if r.levelno >= logging.WARNING]
     finally:
         lp._facts_owner.session_id = None
         release.set()
@@ -1412,38 +1447,71 @@ def test_market_read_capacity_remains_fail_fast_for_shared_snapshot_callers(tmp_
             read.join(2)
 
 
-def test_market_read_timeout_discards_late_result_and_preserves_other_capacity(tmp_path):
+def test_market_read_timeout_discards_late_result_and_preserves_other_capacity(tmp_path, caplog, monkeypatch):
+    import logging
+    from concurrent.futures import Future
+    from open_trader import polymarket_lp
+    from open_trader.polymarket_trading import _lp_read_stage
+    caplog.set_level(logging.INFO, logger="open_trader.polymarket_trading")
     _, exchange, lp, _ = setup(tmp_path, 2)
-    lp._market_read_timeout = .02
+    healthy_timeout = lp._market_read_timeout
     lp._facts_owner.session_id = 'test-session'
-    entered, release, finished = Event(), Event(), Event()
+    entered, release = Event(), Event()
     original = exchange.lp_snapshot
-    calls = []
+    calls, futures = [], []
+    clock = [100.0]
+    monkeypatch.setattr(polymarket_lp, 'monotonic', lambda: clock[0])
+
+    class ObservedFuture(Future):
+        def __init__(self):
+            super().__init__()
+            futures.append(self)
+
+        def result(self, timeout=None):
+            if self is futures[0] and not self.done():
+                assert entered.wait(2), 'timeout coverage must reach the blocked read'
+            return super().result(timeout=timeout)
+
+    monkeypatch.setattr(polymarket_lp, 'Future', ObservedFuture)
 
     def delayed(request):
         if request['token_id'] == 'm00':
             calls.append('m00')
             entered.set()
             assert release.wait(5)
-            finished.set()
         return original(request)
 
     exchange.lp_snapshot = delayed
     slow = dict(condition_id='m00', token_id='m00')
     try:
+        # Keep a real timeout against a definitely running blocked worker.
+        lp._market_read_timeout = .02
         with pytest.raises(ValueError, match='market_read_timeout'):
-            lp._read_snapshot(slow)
+            with _lp_read_stage('facts_read'):
+                lp._read_snapshot(slow)
+        assert 'lp_snapshot_stage stage=facts_read' in caplog.text
+        caplog.clear()
         assert entered.is_set()
+        lp._market_read_timeout = healthy_timeout
         with pytest.raises(ValueError, match='market_read_in_progress'):
-            lp._read_snapshot(slow)
+            with _lp_read_stage('facts_read'):
+                lp._read_snapshot(slow)
+        assert 'reason=market_read_in_progress' in caplog.text
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert lp._read_snapshot(dict(condition_id='m01', token_id='m01'))['market']['token_id'] == 'm01'
         assert calls == ['m00']
     finally:
         release.set()
-    assert finished.wait(2)
+        lp._market_read_timeout = healthy_timeout
+    # The worker's signal before returning is insufficient; await the real Future.
+    futures[0].result(timeout=2)
+    clock[0] = 159.999
     with pytest.raises(ValueError, match='market_read_cooling_down'):
-        lp._read_snapshot(slow)
-    lp._market_read_retry['m00'] = 0
+        with _lp_read_stage('facts_read'):
+            lp._read_snapshot(slow)
+    assert 'reason=market_read_cooling_down' in caplog.text
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    clock[0] = 160.0
     assert lp._read_snapshot(slow)['market']['token_id'] == 'm00'
     assert calls == ['m00', 'm00'], 'late abandoned result must not become fresh facts'
 
@@ -1644,7 +1712,7 @@ def test_review_late_fault_after_verified_recovery_notifies_once(tmp_path):
     calls = []
     def notify(title, message, voice, *, channels):
         calls.append(title)
-        if '已恢复' not in title:
+        if '核对恢复' not in title:
             entered.set(); assert release.wait(5)
         return {key: True for key in channels}
     lp.set_protection_notifier(notify)
@@ -1666,7 +1734,23 @@ def test_review_late_fault_after_verified_recovery_notifies_once(tmp_path):
             delivery.join(5)
     lp.flush_session_recovery('manual')
     lp.flush_session_recovery('manual')
-    assert len(calls) == 2 and '已恢复' in calls[1]
+    assert len(calls) == 1  # A late fault receipt cannot bypass stable recovery.
+    row = store.lp_session('manual')
+    assert row['needs_attention_recovery_due'] is True
+    assert row['needs_attention_recovery_channels'] == ['feishu', 'xiaoai']
+    assert row['needs_attention_recovery_ready_since'] == now.isoformat()
+    now += timedelta(seconds=60)
+    lp.flush_session_recovery('manual')
+    assert len(calls) == 1  # The same facts are still not a new observation.
+    exchange.snapshot_value = {**exchange.snapshot_value, 'checked_at': now}
+    lp.reconcile_facts('manual', monitor=True)
+    delivery = lp._attention_thread
+    if delivery is not None:
+        delivery.join(5)
+        assert not delivery.is_alive()
+    lp.flush_session_recovery('manual')
+    lp.flush_session_recovery('manual')
+    assert len(calls) == 2 and '核对恢复' in calls[1]
 
 
 @pytest.mark.parametrize('wait_reason', ['facts_read_capacity', 'facts_read_in_progress'])
@@ -1780,3 +1864,45 @@ def test_real_sdk_account_response_facts_survive_transport(tmp_path, monkeypatch
     finally:
         adapter.close()
         sdk.close()
+
+
+@pytest.mark.parametrize('conflict', ['revision', 'generation'])
+def test_store_publish_conflict_logs_wait_without_applying_facts(tmp_path, caplog, conflict):
+    import logging
+    from open_trader.polymarket_trading import _lp_read_stage
+    from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+    caplog.set_level(logging.INFO, logger="open_trader.polymarket_trading")
+    store = PredictionArbitrageStore(tmp_path)
+    store.lp_create_session('s', 's', state='entry_open', payload={'owned_order_ids': ['order'], 'reserved_usd': '8'})
+    before = store.lp_session('s')
+    reason = 'session_changed' if conflict == 'revision' else 'account_round_invalid'
+    with pytest.raises(ValueError, match=reason):
+        with _lp_read_stage('facts_publish'):
+            store.lp_publish_facts('s', 1 if conflict == 'revision' else 0,
+                                   trade_generation=1 if conflict == 'generation' else None,
+                                   patch={'reserved_usd': '0'}, state='complete')
+    assert store.lp_session('s') == before
+    assert store.lp_actions('s') == []
+    assert f'reason={reason}' in caplog.text
+    assert 'lp_read_wait stage=facts_publish' in caplog.text
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+@pytest.mark.parametrize('reason', ['session_changed', 'account_round_invalid', 'market_read_capacity', 'market_read_in_progress', 'market_read_cooling_down', 'market_closed'])
+def test_untyped_same_message_is_still_a_fault(reason, caplog):
+    from open_trader.polymarket_trading import _lp_read_stage
+    with pytest.raises(ValueError, match=reason):
+        with _lp_read_stage('facts_read'):
+            raise ValueError(reason)
+    assert 'lp_snapshot_stage stage=facts_read' in caplog.text
+    assert 'lp_read_wait' not in caplog.text
+
+
+def test_unlisted_typed_wait_reason_remains_fault(caplog):
+    from open_trader.polymarket_lp_errors import LpObservationWait
+    from open_trader.polymarket_trading import _lp_read_stage
+    with pytest.raises(LpObservationWait):
+        with _lp_read_stage('market'):
+            raise LpObservationWait('market_read_timeout')
+    assert 'lp_snapshot_stage stage=market' in caplog.text
+    assert 'lp_read_wait' not in caplog.text

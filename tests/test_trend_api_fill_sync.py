@@ -10,6 +10,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import open_trader.daily_premarket as daily_premarket_module
+from tests.contended_lock_support import observe_flock_contention
+from tests.timing_support import run_test_in_subprocess
 import open_trader.trend_api_stats as trend_api_stats_module
 
 from open_trader.kelly_order_execution import FutuOrderExecutionError
@@ -1387,7 +1390,7 @@ class BlockingCycleClient(RecordingCycleClient):
         )
         if len(self.calls) == 1:
             self.first_fetch_started.set()
-            assert self.release_first_fetch.wait(timeout=5)
+            self.release_first_fetch.wait()
         else:
             self.second_fetch_started.set()
         return result
@@ -1472,7 +1475,18 @@ def test_completed_cycle_is_not_recomputed_without_explicit_force(tmp_path: Path
     assert not (tmp_path / "data/trend_api_stats/missed").exists()
 
 
-def test_concurrent_same_cycle_fetches_and_publishes_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_concurrent_same_cycle_fetches_and_publishes_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    if run_test_in_subprocess(request):
+        return
+
+    contended = observe_flock_contention(
+        monkeypatch, daily_premarket_module,
+        trend_statistics_cycle_path(tmp_path / "data", "CN", "2026-08-08").with_suffix(".lock"),
+    )
     client = BlockingCycleClient()
     kwargs = cycle_kwargs(tmp_path, market="CN", futu_client=client)
     statistics_path = tmp_path / "data/latest/trend_api_stats.json"
@@ -1489,10 +1503,13 @@ def test_concurrent_same_cycle_fetches_and_publishes_once(tmp_path: Path, monkey
     monkeypatch.setattr(trend_api_stats_module, "_write_json_atomic", record_write)
     with ThreadPoolExecutor(max_workers=2) as pool:
         first = pool.submit(run_trend_statistics_cycle, **kwargs)
-        assert client.first_fetch_started.wait(timeout=5)
-        second = pool.submit(run_trend_statistics_cycle, **kwargs)
-        assert not client.second_fetch_started.wait(timeout=0.2)
-        client.release_first_fetch.set()
+        try:
+            assert client.first_fetch_started.wait(timeout=5)
+            second = pool.submit(run_trend_statistics_cycle, **kwargs)
+            assert contended.wait(timeout=5)
+            assert not client.second_fetch_started.is_set()
+        finally:
+            client.release_first_fetch.set()
         results = [first.result(timeout=5), second.result(timeout=5)]
 
     assert sorted(result["status"] for result in results) == ["already_completed", "completed"]
@@ -1668,13 +1685,24 @@ def test_failed_forced_refresh_preserves_completed_marker_and_audit(tmp_path: Pa
     assert len(client.calls) == 2
 
 
-def test_two_forced_refresh_attempts_have_distinct_durable_audit_ids(tmp_path: Path) -> None:
+def test_two_forced_refresh_attempts_have_distinct_durable_audit_ids(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     client = RecordingCycleClient()
     kwargs = cycle_kwargs(tmp_path, market="CN", futu_client=client)
     assert run_trend_statistics_cycle(**kwargs)["status"] == "completed"
     client.fail_once = True
 
-    before_first_terminal = datetime.now(UTC)
+    terminal_times = iter((
+        datetime.fromisoformat("2026-08-10T00:00:01+00:00"),
+        datetime.fromisoformat("2026-08-10T00:00:02+00:00"),
+    ))
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = next(terminal_times)
+            return value.astimezone(tz) if tz is not None else value.replace(tzinfo=None)
+
+    monkeypatch.setattr(trend_api_stats_module, "datetime", FixedDatetime)
     first = run_trend_statistics_cycle(
         **(kwargs | {"process_git_sha": "face001"}),
         force=True,
@@ -1710,7 +1738,8 @@ def test_two_forced_refresh_attempts_have_distinct_durable_audit_ids(tmp_path: P
         "face002",
     ]
     first_terminal = datetime.fromisoformat(events[1]["timestamp"])
-    assert before_first_terminal <= first_terminal <= datetime.now(UTC)
+    assert first_terminal == datetime.fromisoformat("2026-08-10T00:00:01+00:00")
+    assert datetime.fromisoformat(events[3]["timestamp"]) == datetime.fromisoformat("2026-08-10T00:00:02+00:00")
     assert events[1]["timestamp"] != events[0]["timestamp"]
 
 

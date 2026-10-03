@@ -1,4 +1,5 @@
 import { expect, test, type Request } from '@playwright/test';
+import { waitForPredictionPoll } from './prediction-poll-barrier.cjs';
 
 test('loads the dashboard and prediction workspace without mutations', async ({ page }) => {
   const unsafeMethods: string[] = [];
@@ -54,10 +55,43 @@ test('loads the dashboard and prediction workspace without mutations', async ({ 
   const venuesPayload = await venuesResponse.json() as {
     mode?: string; mutations?: string; n_leg?: { status?: string };
   };
-  const nLegStatus = venuesPayload.n_leg?.status;
+  const split = await page.evaluate(() => document.body?.dataset.predictionSplit === 'true');
+  let executionPayload = venuesPayload;
+  if (split) {
+    expect(venuesPayload.mode).toBe('shadow');
+    expect(venuesPayload.mutations).toBe('prohibited');
+    expect(venuesPayload.n_leg?.status).toBe('paused');
+    // This existing Gateway alias reads Air /venues; cloud owns no execution identity.
+    const execution = await page.evaluate(async () => {
+      const response = await fetch('/api/prediction-arbitrage/execution/identity', { cache: 'no-store' });
+      return { ok: response.ok, payload: response.ok ? await response.json() : null };
+    });
+    expect(execution.ok).toBe(true);
+    expect(execution.payload?.mode).toBe('production');
+    expect(execution.payload?.mutations).toBe('enabled');
+    executionPayload = execution.payload;
+    const display = await page.evaluate(async () => {
+      const response = await fetch('/api/prediction-arbitrage/lp/dashboard', { cache: 'no-store' });
+      return { ok: response.ok, payload: response.ok ? await response.json() : null };
+    });
+    expect(display.ok).toBe(true);
+    expect(display.payload?.authenticated).toBe(true);
+    expect(display.payload?.stale).toBe(false);
+    for (const key of ['orders', 'positions', 'recommendations']) {
+      expect(Array.isArray(display.payload?.[key])).toBe(true);
+    }
+    const age = Date.now() - Date.parse(display.payload?.checked_at);
+    expect(Number.isFinite(age)).toBe(true);
+    expect(age).toBeGreaterThanOrEqual(0);
+    expect(age).toBeLessThanOrEqual(60_000);
+    await expect(page.locator('[data-shadow-status]')).toHaveCount(0);
+    await expect(page.locator('[data-lp-realtime-status]')).toHaveCount(0);
+    await expect(page.locator('[data-service-identity-status]')).toHaveCount(0);
+  }
+  const nLegStatus = executionPayload.n_leg?.status;
   await expect(page.getByRole('tab', { name: 'LP 首页', exact: true })).toHaveAttribute('aria-selected', 'true');
-  const shadowPaused = venuesPayload.mode === 'shadow'
-    && venuesPayload.mutations === 'prohibited'
+  const shadowPaused = executionPayload.mode === 'shadow'
+    && executionPayload.mutations === 'prohibited'
     && nLegStatus === 'paused';
   if (shadowPaused) {
     await expect(page.locator('[data-shadow-status]')).toHaveText('Shadow 只读');
@@ -94,7 +128,10 @@ test('loads the dashboard and prediction workspace without mutations', async ({ 
     await expect(page.locator('.pm-lp-card').first()).toBeVisible();
     await page.getByRole('tab', { name: '多腿套利', exact: true }).click();
     await expect(page.getByRole('heading', { name: '多腿套利' })).toBeVisible();
-    await page.waitForTimeout(6500);
+    await waitForPredictionPoll(page, split);
+    // Check this cycle immediately; a later poll must not hide a caught body error.
+    expect(await page.evaluate(() => state.predictionMarket.nLegStatus)).toBe('paused');
+    await expect(page.getByRole('status').filter({ hasText: '多腿套利已暂停' })).toBeVisible();
     expect(nLegReadRequests).toEqual([]);
     expect(pendingNLegReads.size).toBe(0);
   }

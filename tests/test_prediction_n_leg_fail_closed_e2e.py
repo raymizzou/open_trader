@@ -778,6 +778,22 @@ LIVE_TEST_QUANTITY_CAP = 20
 LIVE_TEST_BOOK_DEPTH = 200
 
 
+
+@pytest.fixture(autouse=True)
+def _fixed_live_business_time(monkeypatch):
+    now = datetime.now(UTC)
+    original = datetime
+
+    class BusinessDatetime(original):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz is not None else now.replace(tzinfo=None)
+
+    # Only this fixture module's clock binding changes. Native solver budgets,
+    # HTTP, polling and parent process watchdogs all retain real time.
+    monkeypatch.setitem(globals(), "datetime", BusinessDatetime)
+
+
 class _LiveBooksMonitor:
     """Read-only book seam keyed to the resolver's 30s ``SNAPSHOT_FRESHNESS``
     harness window; production ``PolymarketMonitor.cross_venue_books`` omits
@@ -786,9 +802,10 @@ class _LiveBooksMonitor:
 
     def __init__(self, books: dict[str, ThresholdOrderBook]) -> None:
         self.books = dict(books)
+        self.now = datetime.now(UTC)
 
     def _fresh(self) -> dict[str, ThresholdOrderBook]:
-        now = datetime.now(UTC)
+        now = self.now
         return {
             token: book
             for token, book in self.books.items()
@@ -1142,9 +1159,11 @@ def _build_live_resolver(
         store=_LiveStore(),
         execution=execution if execution is not None else _LiveExecution(),
         poll_interval=0.01,
+        now_fn=lambda: monitor.now,
         budget=LIVE_TEST_BUDGET,
         limits=LIVE_TEST_LIMITS,
     )
+    resolver._scheduler._now_fn = lambda: monitor.now
     return resolver, [component.component_id for component in components]
 
 
@@ -2363,7 +2382,9 @@ def _issue64_real_chain(tmp_path: Path):
     """The real live resolver over a two-leg EXACTLY_ONE group, wired to a
     real caps-configured store (MANUAL_CANARY scope, ruling-5 caps write with
     loss caps that honestly bound the ~$8 worst one-leg partial fill of this
-    chain so the real #74 prover closes PARTIAL_FILL_SAFE)."""
+    chain so the real #74 prover closes PARTIAL_FILL_SAFE). The returned
+    monitor.now is the shared business clock, including for imported callers
+    which do not run this module's autouse clock fixture."""
     from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
     from open_trader.prediction_monitor_selection import (
         MonitorSelectionStore,
@@ -2378,8 +2399,9 @@ def _issue64_real_chain(tmp_path: Path):
         n_leg_upsert_scope,
     )
 
+    now = datetime.now(UTC)
     contract_ids = ["real-a", "real-b"]
-    release = datetime.now(UTC) + timedelta(days=20)
+    release = now + timedelta(days=20)
     payload = _exactly_one_payload(contract_ids, ["0.40", "0.40"], release_at=release)
     catalog, _ = _activate_relation(tmp_path / "catalog", payload)
 
@@ -2434,8 +2456,9 @@ def _issue64_real_chain(tmp_path: Path):
         }
     )
     monitor = _LiveBooksMonitor(
-        {c: _live_book(c, "0.40") for c in contract_ids}
+        {c: _live_book(c, "0.40", confirmed_at=now) for c in contract_ids}
     )
+    monitor.now = now
     resolver = PredictionLiveResolver(
         data_dir=tmp_path / "resolver",
         relation_catalog=catalog,
@@ -2445,9 +2468,11 @@ def _issue64_real_chain(tmp_path: Path):
         store=store,
         execution=_HealthyAccountExecution(),
         poll_interval=0.01,
+        now_fn=lambda: monitor.now,
         budget=LIVE_TEST_BUDGET,
         limits=LIVE_TEST_LIMITS,
     )
+    resolver._scheduler._now_fn = lambda: monitor.now
     resolver._tick()
     resolver._tick()
     return store, resolver, monitor, component.component_id
@@ -2496,7 +2521,7 @@ def test_issue64_real_resolver_chain_confirm_admit_submit_complete(
             component_id=component_id,
             max_total_unsettled_capital_units=200_000_000,
             total_unsettled_capital_units=0,
-            now=datetime.now(UTC),
+            now=monitor.now,
             fee=entry["fee"],
         )
         assert projection is not None
@@ -2527,7 +2552,7 @@ def test_issue64_real_resolver_chain_confirm_admit_submit_complete(
             component_id=component_id,
             displayed_fingerprint=displayed,
             idempotency_key="real-chain-1",
-            now=datetime.now(UTC),
+            now=monitor.now,
             partial_fill_proof=material["partial_fill_proof"],
             execution_source={
                 "market": material["market"],
@@ -2552,7 +2577,7 @@ def test_issue64_real_resolver_chain_confirm_admit_submit_complete(
 
         def recon_factory(batch_id):
             batch = store.n_leg_batch(batch_id)
-            now = datetime.now(UTC)
+            now = monitor.now
             account = replace(source.account_snapshot, captured_at=now)
             flows, holdings = [], []
             for leg in batch["legs"]:
@@ -2612,9 +2637,10 @@ def test_issue64_real_resolver_chain_confirm_admit_submit_complete(
         )
         # A fresh book refresh before the driver tick mirrors production.
         monitor.books = {
-            c: _live_book(c, "0.40") for c in ("real-a", "real-b")
+            c: _live_book(c, "0.40", confirmed_at=monitor.now)
+            for c in ("real-a", "real-b")
         }
-        summary = driver.tick(now=datetime.now(UTC))
+        summary = driver.tick(now=monitor.now)
 
         assert "abandoned" not in summary, summary
         assert len(trading.calls) == 2

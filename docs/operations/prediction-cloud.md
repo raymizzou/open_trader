@@ -6,9 +6,25 @@ outside the operation. Branch push, Draft PR, GitHub merge, release/tag creation
 cloud provisioning, deployment and
 trading authorization are separate. The client never starts the cloud backend.
 
-## Credentials: Tencent SSM and an instance role
+## Credentials: service-owned file or Tencent SSM
 
-Install the optional `cloud-ssm` extra in the release's Python 3.12 virtualenv.
+For the #202 paused Shadow API probe, use an operator-imported JSON bundle at
+`/var/lib/open-trader/prediction-credentials/polymarket.json`. The parent directory
+must be owned by `prediction` with mode `0700`; the regular file must be owned
+by `prediction` with mode `0600`. The reader rejects symlinks, invalid owners,
+permissions and fields. Keep the bundle outside Git, the release, logs and
+systemd environment; the unit contains only its path. The source credentials
+are in the Mac Keychain; `prediction_arbitrage.json` does not contain them.
+The operator performs the separate one-time private import. Do not run wallet
+setup or create, replace or revoke an API key for this probe.
+
+The file backend is explicit: `OPEN_TRADER_CREDENTIAL_BACKEND=file` and
+`OPEN_TRADER_CREDENTIAL_FILE=/var/lib/open-trader/prediction-credentials/polymarket.json`.
+Missing or invalid files fail closed with no fallback. The process only opens
+the file for reading. No instance role or metadata isolation attestation is
+needed for this file profile. Existing SSM profiles remain available:
+
+Install the optional `cloud-ssm` extra only for an SSM profile in the release's Python 3.12 virtualenv.
 The approved pins are `tencentcloud-sdk-python-ssm==3.1.160` and
 `tencentcloud-sdk-python-common==3.1.182`. Ordinary macOS use keeps Keychain.
 
@@ -69,7 +85,12 @@ Official references:
 - [SSM resource permissions](https://intl.cloud.tencent.com/zh/document/product/598/57154)
 - [Official Python SDK](https://github.com/TencentCloud/tencentcloud-sdk-python)
 
-## Ownership and backups before cutover
+## Ownership and backups before a future trading cutover
+
+The #202 paused Shadow probe uses a separate runtime, leaves the local
+production owner running and does not migrate its history or runtime data.
+The following handoff procedure applies only to a later authorized trading
+cutover under #203.
 
 A filesystem lock protects one host only. Before a new production owner starts,
 identify the old service, immutable SHA, wallet addresses and authoritative
@@ -98,8 +119,10 @@ trading resumes. Stopping the service does not cancel exchange orders.
 Development uses affected-service Docker checks and independent staged review.
 Use the [PR-first delivery flow](agent-verification.md): reviewed branch, Draft
 PR, exact CI evidence, user-approved GitHub merge. Local `main` only synchronizes
-the remote. Candidate Acceptance runs only after GitHub merge, on the selected
-final GitHub `main` SHA for an explicitly authorized deployment. PR-head or
+the remote. Deployment Preflight reuses trusted main-push CI for the selected final GitHub
+`main` SHA during an explicitly authorized deployment; it does not repeat pytest.
+Use [the forward wrapper](deployment-preflight.md) for systemd install/start and
+local Gateway installation. PR-head or
 synthetic PR merge checks cannot be reused as final-SHA Candidate evidence;
 fixes return through a new PR. The old macOS launchd gate is not evidence for systemd.
 Production verification must include the remote systemd PID, `/proc` cwd and
@@ -128,7 +151,7 @@ Release/config/venv paths and their ancestors must be root-owned and not
 group/world-writable; release symlinks are rejected. Venv symlinks, including
 the standard Python interpreter link, must resolve to trusted root-owned paths.
 Create a Python 3.12 venv outside the code checkout, install the accepted release
-with its `cloud-ssm` extra, and retain that environment with the release for
+(add `cloud-ssm` only for SSM), and retain that environment with the release for
 rollback. This is an operator-authorized provisioning step, not done by the gates.
 
 Create `/etc/open-trader/prediction-cloud.json` (root-owned `0600`, non-secret).
@@ -148,6 +171,20 @@ A credentialless paused-Shadow example is:
 }
 ```
 
+For the #202 same-wallet probe, add these non-secret fields to that paused
+Shadow config after the operator has privately imported the credential file:
+
+```json
+{
+  "credential_backend": "file",
+  "credentials_file": "/var/lib/open-trader/prediction-credentials/polymarket.json"
+}
+```
+
+These fields extend the complete example above; they are not a standalone
+config. File credentials are accepted only with `mode: shadow` and
+`n_leg_paused: 1`. The service remains read-only in an independent runtime.
+
 The cloud config requires an explicit `"mode": "production"` or
 `"mode": "shadow"`; a missing or unknown value fails closed. The selected mode
 is pinned into ExecStart and echoed by remote evidence. Modes never change
@@ -155,17 +192,18 @@ automatically, and selecting another mode requires the matching stopped-owner,
 credential, readiness and authorization gates. The helper also accepts simple
 alphanumeric/dash/underscore SSM references and absolute paths without spaces or
 systemd specifiers. Use those names when creating the dedicated credential.
-Production and non-paused Shadow require those four SSM references.
+Production and non-paused Shadow continue to require those four SSM references.
 Credentialless paused Shadow requires them to be omitted, pins
 `OPEN_TRADER_CREDENTIAL_BACKEND=disabled`, and never touches Keychain, SSM or
 instance metadata.
 Retain the prior N-leg pause policy explicitly; this example does not authorize
 enabling any trading strategy.
 
-Copy the authoritative non-secret `config/prediction_arbitrage.json` and data into
-the runtime only after the ownership handoff above. Notification and LLM provider
-configuration are not automatically imported from the Mac; verify the required
-features and their separate credentials before claiming functional parity.
+For #202, supply only the same-wallet non-secret
+`config/prediction_arbitrage.json` in the independent runtime; do not copy
+local history or trading runtime data. A later #203 trading cutover requires
+the ownership handoff and consistent data backup described above. Notification
+and LLM provider configuration are not automatically imported from the Mac.
 
 From the accepted release on CVM, with `OPEN_TRADER_PYTHON` set to that release's
 venv Python, the operator can run:
@@ -173,8 +211,15 @@ venv Python, the operator can run:
 ```sh
 scripts/prediction-systemd.sh render
 scripts/prediction-systemd.sh preflight
-scripts/prediction-systemd.sh install
-scripts/prediction-systemd.sh start
+# Forward install/start: after explicit authorization and fresh cloud READY.
+"$OPEN_TRADER_PYTHON" -B scripts/deploy_release.py --expected-sha <40hex> \
+  --release-root /opt/open-trader/releases/<40hex> \
+  --runtime-root /var/lib/open-trader/prediction --python "$OPEN_TRADER_PYTHON" \
+  prediction-systemd --config /etc/open-trader/prediction-cloud.json --action install
+"$OPEN_TRADER_PYTHON" -B scripts/deploy_release.py --expected-sha <40hex> \
+  --release-root /opt/open-trader/releases/<40hex> \
+  --runtime-root /var/lib/open-trader/prediction --python "$OPEN_TRADER_PYTHON" \
+  prediction-systemd --config /etc/open-trader/prediction-cloud.json --action start
 scripts/prediction-systemd.sh status
 scripts/prediction-systemd.sh stop
 ```
@@ -182,8 +227,27 @@ scripts/prediction-systemd.sh stop
 `render` prints the complete unit. `preflight` is read-only. It checks the
 immutable release, stopped owner, SDK, reader generation and storage and returns
 only `PRECHECK_OK`; that is not full Host Readiness. Explicit paused Shadow
-skips the wallet-status credential read; non-paused/production still requires
-wallet status as the service user.
+without credentials skips the wallet read. A credentialed profile runs
+`wallet read-auth` as the service user, separating GET-only credential
+derivation from complete authenticated account reads. The installed SDK's
+ordinary `create()` can create credentials or deploy a wallet, so it is not
+used by this read-only probe. Production and non-paused SSM Shadow preflight
+also passes `--require-trading-region`, retaining the existing geoblock gate;
+paused Shadow API probes omit the trading-region requirement.
+
+Using the accepted release's Python and non-secret runtime config as the
+`prediction` user, run `prediction-arb wallet read-auth --config <runtime-config>`
+and `prediction-arb data-check --config <runtime-config> --sample 5` with the
+same explicit backend/path environment as the unit. `read-auth` requires a
+complete same-wallet order, position, trade and balance/allowance read; it
+reports guard attempts separately. `data-check` reads the complete paginated
+reward catalog, then a bounded sample of its current markets, token books,
+24-hour price history and same-wallet reward/account categories. It reports
+scope, time, source, completeness and an unknown reason for each category.
+Its best result is `PARTIAL`: an API probe is not full product-pool coverage
+or the #204 continuous-feed acceptance. Investigate every `BLOCKED` category;
+do not treat empty rows or a successful public request as account proof.
+Record only the redacted JSON report, never SDK payloads or credentials.
 `install` requires root, verifies the unit with systemd-analyze, preserves the old
 unit, writes the complete unit and reloads systemd. It leaves the service stopped.
 `start` requires a matching installed/stopped record; production startup may
@@ -226,8 +290,9 @@ The client runtime must be private (`0700`) and separate from the release.
 The client requires explicit `mode: "production"` or `"mode": "shadow"` and
 verifies the same mode in health. Production must report
 `production_owner=true` and `mutations=enabled`; Shadow must report the reverse
-and a null `first_violation`. Every real Shadow UI is labeled read-only;
-paused Shadow additionally marks LP realtime data unavailable. All Shadow views
+and a null `first_violation`. A standalone Shadow UI is labeled read-only. Credentialless paused Shadow
+keeps its existing no-reader/LP-503 contract; explicit file credentials enable
+background LP display reads even with N-leg paused. All Shadow views
 disable order, augment, cancel and automatic controls while retaining
 read-model rows and details. If an already identified service or a
 Prediction-only view cannot refresh its venues identity, the UI fails closed as
@@ -254,6 +319,165 @@ changed PID blocks signaling. A broken connection reports BLOCKED; inspect
 `gateway.log` and `ssh.log` (replaced on each new client session), then stop the owned client and start it again.
 Closing the browser or stopping this client leaves the cloud service running.
 
+## #204: cloud display with Air execution
+
+The complete Air Dashboard can use a paused, authenticated cloud Shadow for
+selected display reads while the existing Air Prediction remains the sole
+production execution owner. Cloud uses #202's private file credentials; invalid
+or missing credentials fail startup without a public-only fallback. `disabled`
+retains no LP reader startup even when a prediction config exists.
+
+| Browser request | Owner |
+| --- | --- |
+| GET `/venues`, `/lp/dashboard`, `/lp/account/trades` | Cloud snapshots |
+| GET `/execution/identity` | Gateway alias to Air's existing `/venues` |
+| GET `/state`, `/lp/auto/state`, `/lp/sessions/current` | Air execution |
+| GET all N-leg history (signals/executions/incidents), relations, modes and reports | Air engine records/IDs |
+| All Prediction POSTs, including preflight, refresh and cancellation | Air |
+| Other Dashboard pages and APIs | Existing Legacy/Account connections |
+
+The display routes never forward browser Cookie, Authorization or CSRF to the
+cloud and never return cloud Set-Cookie to the browser. Cloud venues cannot
+replace Air identity or CSRF. The identity alias permits using the existing Air
+immutable release: no new Air API is required for split display. Air's current
+preflight, reservations, protection and recovery remain authoritative.
+
+For the split client add these non-secret fields to the configuration above:
+
+```json
+{
+  "mode": "shadow",
+  "gateway_port": 8766,
+  "tunnel_port": 8879,
+  "execution_port": 8769,
+  "execution_expected_sha": "<existing Air 40-character SHA>",
+  "cloud_expected_sha": "<cloud 40-character SHA>"
+}
+```
+
+`expected_sha` identifies the local immutable Gateway checkout; the other SHAs
+identify their respective services independently. Without `cloud_expected_sha`,
+the cloud SHA defaults to `expected_sha`. The split client defaults to 8766/8879
+and requires Shadow cloud health with N-leg paused. It starts the complete
+Gateway and its own independent SSH tunnel, never a Prediction backend. Start,
+status and stop use the same `prediction-client.sh` commands. Existing listeners
+block startup; replacing the managed Air Gateway requires its separately
+authorized deployment procedure. Do not stop Air Prediction to free a port.
+
+Status verifies local Gateway and cloud identities and reports Air execution
+identity separately. Air offline may report `CONNECTED` with
+`execution_status=unavailable`: cloud browsing continues, but the browser clears
+Air authorization and disables writers. A responding wrong Air SHA/mode is an
+identity failure. Cloud outage remains a display outage, with no fallback to Air
+snapshots and no automatic strategy stop/start. With healthy Air, display stale,
+failure or a pending cloud request does not block existing Air submissions or
+cancellations; Air still performs its own real-time checks. Auto controls and their existing funds/slots/round details
+poll the same Air payload independently and do not use cloud Dashboard `auto` data.
+Air identity also supplies the N-leg execution/pause state; cloud paused or
+offline cannot suppress healthy Air state/history reads. Cloud N-leg remains
+paused, so its history handler is not relaxed to serve Air-engine signal IDs.
+
+Cloud reuses the existing LP history, candidate scan/maintenance/competition,
+book sampling, reward/observation and Dashboard snapshot workers. History keeps
+its persisted retry scheduling but skips preparation notifications and their
+notification-only deadlines. No trading/protection tick, automatic scheduler,
+N-leg worker, report worker or share-watch notification loop starts. Snapshots
+retain genuine completeness, read errors and UNKNOWN; `usd_value_unknown`
+remains an accepted display limitation. The 60-second cloud account freshness
+boundary and bounded (maximum 100 rows) trade pages are checked without upstream
+HTTP reads in request handlers. Failed background reads publish stale snapshots.
+Cloud independently persists existing history/catalog/observation data; no Air
+SQLite migration or cross-host synchronization occurs.
+
+Cloud Smoke keeps disabled-profile LP 503 validation. Authenticated paused
+Shadow instead requires a real, fresh background account snapshot and records
+account, catalog, candidate, history and reward source evidence. It does not
+require every reward's derived USD value to be known. Two-host Smoke checks the
+configured independent cloud/local SHAs and a healthy exact Air execution SHA;
+its result does not grant live mutation authorization. Record both hosts' SHA,
+PID/root, connection ports, snapshot times/scope and measured resources in the
+operator evidence when an actual deployment is authorized. Development tests
+are offline evidence only, not proof of live supply or deployment.
+
+To return to local display, stop the client using its original saved config
+(first preserving its owned-process identity check), then restore the existing
+local Gateway configuration without `--prediction-display-upstream-port` and
+with `--prediction-upstream-port 8769` through the authorized Gateway deployment
+workflow. Air Prediction and its runtime/owner remain running. No page switch,
+writer failover, balance alignment, order overlay or missing-history marker is
+introduced; selected cloud content is displayed as returned.
+
+## #226: bounded Shadow startup before the 24-hour run
+
+The agreed capacity target is the current complete market universe, with Air
+remaining the trading owner and cloud N-leg paused. The entire cloud Prediction
+cgroup, including children and charged file cache, must stay within **1 GB
+(1,000,000,000 bytes)**, including startup and refresh peaks. This is a target
+requiring live evidence, not a claim that the release already meets it. Do not
+truncate discovery, candidates or backup queues to meet the budget.
+
+Paused Shadow units now set `MemoryAccounting=yes`, `CPUQuota=100%` (one core),
+`TasksMax=96` and `Restart=no`. The default `MemoryMax` is 768 MiB; the optional
+non-secret cloud config field `memory_max_bytes` can lower it or raise it up to
+1 GB. Before `start`, the helper requires at least that budget plus 350 MiB of
+host `MemAvailable` and no used swap. A protected startup independently checks
+the effective kernel memory, CPU and PID limits before starting the runtime.
+Missing/contradictory resource evidence blocks startup. These settings apply to
+paused Shadow only; existing production ownership and restart policy remain.
+
+The guard checks cgroup usage and host availability each second. At 64 MiB below
+the actual cgroup ceiling, below 350 MiB host availability, used swap, a kernel
+memory-limit event or unreadable resource evidence, it logs only resource
+counters and a fixed reason, then sends SIGTERM to its own process. An
+unresponsive process receives SIGKILL after 20 seconds. There is no automatic
+retry loop. Inspect `shadow_resource_guard_verified` / `shadow_resource_guard_stop`
+in the unit journal; after confirming the listener and runtime lock are absent,
+the existing `stop` command can record the stopped state. Keep the runtime and
+failure evidence. This never signals Air or another CVM service.
+
+The 2026-10-01 read-only observation found 1,182,699,520 bytes available, zero
+swap, an inactive Prediction service and no installed resource caps. This is
+not future capacity evidence. A first profile of `memory_max_bytes: 738197504`
+(704 MiB) leaves more host margin than the default, but must pass a new headroom
+check. Install the exact reviewed unit through the normal authorized workflow;
+changing repository code alone does not protect an already installed unit.
+
+Validation is deliberately staged:
+
+1. On the accepted, authorized release, record SHA, mode, PID/cgroup, actual
+   limits, host availability, swap, peak/current cgroup usage and source counts.
+   Complete first full catalog/metadata/history preparation and a complete
+   candidate traversal, followed by continuing fresh account/display updates.
+   Check actual traversal progress: `candidate_pending_count=0` alone only
+   proves no never-tried queue members remain, not that a warm queue was fully
+   refreshed this round. HTTP 200, a first batch or a guard-enforced restart is
+   not startup acceptance. Resource protection, incomplete inputs or missing
+   identity evidence ends this attempt as failed/UNKNOWN; fix before retrying.
+2. Only after startup acceptance, observe at least 24 hours, including the
+   12-hour metadata refresh and subsequent complete processing. Require no
+   OOM/restart/swap pressure, continued host/management availability and unchanged
+   freshness/completeness requirements. Keep the guard active throughout.
+
+LP scratch copies use private temporary SQLite databases with a bounded page
+cache. They preserve Python value types and receipt times, and disappear on
+connection/process close. They do not replace or prune durable history, audit,
+orders or recovery facts. Published inputs are immutable; an old reader retains
+its own generation. Queue detail is retained for the full normal and backup
+queues, with other complete input facts reloadable for later reevaluation.
+SQLite documents the [temporary-database lifetime and spill behavior](https://www.sqlite.org/inmemorydb.html#temporary_databases).
+Disk I/O, file-cache charges and refresh latency must be included in live
+measurement; lower Python allocation or RSS alone is insufficient.
+
+Offline verification uses the frozen six-step business trace from baseline
+`4fbddaae061e95cbbbb3db4d5793e40e33ec2cae`, object-lifetime checks, existing
+ranking/backfill/recovery tests, and `tests/lp_memory_replay.py` for serial
+old/new Docker measurements. The synthetic replay explicitly reports its
+market and retained counts; it is not a live-data capacity certificate.
+Measured results and failed attempts are recorded in the
+[#226 validation report](issue-226-memory-validation.md).
+Deployment Preflight, cloud Host Readiness, Smoke and explicit deployment
+authorization still apply; no probe bypasses those gates.
+
 ## Two-host gates
 
 Use these additional targets for this topology, retaining the ordinary macOS
@@ -263,14 +487,17 @@ local immutable release, with the local browser dependencies already installed.
 
 The operator evidence JSON contains `git_sha` and explicit attestations with
 corresponding `*_evidence` strings describing actual observations and their
-locations/timestamps. Production and non-paused Shadow require
-`old_owner_stopped`, `metadata_isolation_verified` and `resources_reviewed`
-(all true). Credentialless paused Shadow requires `resources_reviewed` and an
-exact `independent_runtime_root`; the gate separately rejects a remote component
+locations/timestamps. Production requires `old_owner_stopped`,
+`metadata_isolation_verified` and `resources_reviewed` (all true). Shadow
+requires `resources_reviewed` and an exact `independent_runtime_root`;
+SSM-backed Shadow additionally requires `metadata_isolation_verified`.
+The gate separately rejects a remote component
 whose mode, pause policy or credential backend differs. These are manual
 handoff/security/resource evidence, not claims manufactured by the gate. Review
 shared-host memory headroom under real load; 2 GiB total memory alone does not
 prove capacity. Never mark these true without the underlying observations.
+File-backed preflight additionally requires a complete service-user
+`read-auth`.
 
 ```sh
 make prediction-cloud-host-readiness \
@@ -294,10 +521,18 @@ regressions and the read-only browser scenario, adapting its Prediction-only ent
 without changing ordinary production smoke. Missing evidence ends
 BLOCKED or ROLLBACK. Client, service and remote evidence modes must match; a
 Shadow guard violation or unavailable backend cannot pass.
+In split mode the browser checks cloud `/venues` and a fresh read-only LP
+snapshot, while `/execution/identity` supplies Air's production identity and
+N-leg pause/running state. Both remote smoke observations validate the display
+evidence; only `display_snapshot` may change between them. Release, process,
+start time, roots, mode, pause and credential profile must remain identical.
 For credentialless paused Shadow, smoke also verifies the actual unit/process
 environment remains disabled and read-only; do not manufacture an owner-stop
 attestation or stop an unrelated local production process.
+Cloud Smoke checks release identity, process, pause and read-only state; it
+does not turn a `PARTIAL` API report into a complete #204 feed or Dashboard
+acceptance.
 Neither target installs a browser, starts a fixture server,
-mutates an account or restarts services. Candidate Acceptance remains separate
+mutates an account or restarts services. Deployment Preflight remains separate
 and required before an authorized deployment. Report real cloud validation as
 UNKNOWN until these gates run on the actual accepted release.

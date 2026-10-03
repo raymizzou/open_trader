@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import re
 import sys
-from release_artifacts import (HEX, SCHEMA, git, restore_bundle, sha256, validate_compatibility,
+from release_artifacts import (HEX, SCHEMA, JOBS, REPOSITORY, git, restore_bundle, sha256, validate_compatibility,
                                validate_tag, verify_checksums, verify_code_root, validate_evidence_zip)
 
 
@@ -32,13 +32,26 @@ def verify(directory, destination, *, execute_code=False, expected_sha=None):
     validate_compatibility(manifest['prediction_compatibility'])
     evidence=json.loads((directory/'ci-evidence.json').read_text())
     if evidence!=manifest['ci'] or evidence['source_sha']!=manifest['source_sha']:raise ValueError('CI manifest identity mismatch')
+    if (manifest.get('repository') != REPOSITORY or evidence.get('workflow_path') != '.github/workflows/ci.yml'
+            or evidence.get('event') != 'push' or evidence.get('branch') != 'main'
+            or evidence.get('required_app_id') != 15368
+            or any(type(evidence.get(key)) is not int or evidence[key] <= 0
+                   for key in ('run_id','run_attempt','workflow_id','check_suite_id','required_check_id','required_job_id'))):
+        raise ValueError('CI provenance record mismatch')
     core={'source.bundle','uv.lock','INSTALL.txt','ci-evidence.json','artifact-verification.json','installation.log','release-manifest.json','SHA256SUMS'}
     artifacts=[a['name'] for a in evidence['artifacts']]
     if len(artifacts)!=len(set(artifacts)) or set(artifacts)&core:raise ValueError('Duplicate artifact names')
     if {p.name for p in directory.iterdir()}!=core|set(artifacts):raise ValueError('Missing core or unexpected assets')
+    if (evidence.get('tested_scopes') != sorted(JOBS)
+            or sorted(a['scope'] for a in evidence['artifacts']) != sorted(JOBS)):
+        raise ValueError('Release requires all five CI scopes')
+    run = {'head_sha':manifest['source_sha'], 'id':evidence['run_id'], 'run_attempt':evidence['run_attempt']}
     for artifact in evidence['artifacts']:
+        expected_name = f"ci-{artifact['scope']}-{manifest['source_sha']}-{run['id']}-{run['run_attempt']}.zip"
+        if artifact['name'] != expected_name or artifact.get('digest') != 'sha256:'+artifact['sha256']:
+            raise ValueError('Evidence artifact name/digest identity mismatch')
         if artifact['name'] not in manifest['assets'] or artifact['sha256']!=manifest['assets'][artifact['name']]:raise ValueError('Evidence checksum mismatch')
-        validate_evidence_zip((directory/artifact['name']).read_bytes(),manifest['source_sha'],artifact['scope'],manifest['lock_sha256'])
+        validate_evidence_zip((directory/artifact['name']).read_bytes(),manifest['source_sha'],artifact['scope'],manifest['lock_sha256'],evidence['validation_context'],run)
     restore_bundle(directory/'source.bundle',destination,manifest['source_sha'])
     if git(destination,'rev-parse','HEAD^{tree}')!=manifest['tree_sha']:raise ValueError('Restored tree differs')
     verification=json.loads((directory/'artifact-verification.json').read_text())

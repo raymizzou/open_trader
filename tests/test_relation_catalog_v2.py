@@ -27,8 +27,10 @@ Store layout assumed by the tamper/migration tests:
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import pytest
+from timing_support import run_test_in_subprocess
 
 from open_trader.relation_catalog_v2 import RelationCatalogV2, _canonicalize  # noqa: F401 - RED: module does not exist yet
 from test_relation_catalog import compiled_problem
@@ -637,7 +639,9 @@ def test_v1_legacy_state_not_promoted_to_v2_current_generation(store) -> None:
 
 # Decision 9: single-write mutation and single-read atomic snapshot.
 
-def test_current_generation_observes_only_complete_generations_under_concurrency(store) -> None:
+def test_current_generation_observes_only_complete_generations_under_concurrency(store, request) -> None:
+    if run_test_in_subprocess(request):
+        return
     catalog = _catalog(store)
     g1_payloads = [
         _payload(
@@ -662,12 +666,16 @@ def test_current_generation_observes_only_complete_generations_under_concurrency
     snapshots: list[frozenset[str]] = []
     errors: list[BaseException] = []
 
+    start = Barrier(3)
+
     def writer() -> None:
+        start.wait(timeout=5)
         for _ in range(30):
             catalog.replace(g1_payloads, actor="auditor", git_sha="a" * 40)
             catalog.replace(g2_payloads, actor="auditor", git_sha="a" * 40)
 
     def reader() -> None:
+        start.wait(timeout=5)
         for _ in range(100):
             try:
                 snapshots.append(frozenset(catalog.current_generation()))

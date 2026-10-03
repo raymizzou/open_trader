@@ -37,6 +37,7 @@ class _Upstream(ThreadingHTTPServer):
         self.response_delay = 0.0
         self.block_path: str | None = None
         self.request_started = threading.Event()
+        self.response_finished = threading.Event()
         self.release_response = threading.Event()
         self.health_body: bytes | None = None
         super().__init__(("127.0.0.1", 0), _UpstreamHandler)
@@ -50,6 +51,15 @@ class _UpstreamHandler(BaseHTTPRequestHandler):
         self._respond()
 
     def _respond(self) -> None:
+        try:
+            self._respond_gated()
+        except (BrokenPipeError, ConnectionResetError):
+            # Expected after the gateway has already timed out a gated response.
+            pass
+        finally:
+            self.server.response_finished.set()
+
+    def _respond_gated(self) -> None:
         time.sleep(self.server.response_delay)
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length)
@@ -102,6 +112,7 @@ def _running(server: ThreadingHTTPServer) -> Iterator[ThreadingHTTPServer]:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+        assert not thread.is_alive(), "HTTP fixture server did not stop"
 
 
 def _write_static_files(static_dir: Path) -> dict[str, bytes]:
@@ -137,6 +148,15 @@ def _prediction_request(base: str, method: str, path: str) -> None:
     response.read()
     assert response.status == HTTPStatus.OK
     connection.close()
+
+
+@contextmanager
+def _unavailable_port() -> Iterator[int]:
+    # Reserve the port for the entire request. A closed ephemeral socket can be
+    # rebound by another test before the gateway connects.
+    with socket.socket() as holder:
+        holder.bind(("127.0.0.1", 0))
+        yield holder.getsockname()[1]
 
 
 @contextmanager
@@ -448,52 +468,60 @@ def test_prediction_route_change_drains_selected_request_and_rejects_new_work(
         timeout=10,
     ) as base:
         completed: list[int] = []
+        errors: list[BaseException] = []
 
         def post_selected_request() -> None:
+            # Client supervision outlives the gateway's real 10s upstream deadline.
             connection = http.client.HTTPConnection(
-                base.removeprefix("http://"), timeout=5
+                base.removeprefix("http://"), timeout=15
             )
-            connection.request(
-                "POST", "/api/prediction-arbitrage/executions", body=b"{}"
-            )
-            response = connection.getresponse()
-            response.read()
-            completed.append(response.status)
-            connection.close()
+            try:
+                connection.request(
+                    "POST", "/api/prediction-arbitrage/executions", body=b"{}"
+                )
+                response = connection.getresponse()
+                response.read()
+                completed.append(response.status)
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                connection.close()
 
         request = threading.Thread(target=post_selected_request)
         request.start()
-        assert legacy.request_started.wait(timeout=5)
+        try:
+            assert legacy.request_started.wait(timeout=5)
 
-        replacement = route.with_suffix(".tmp")
-        _write_route(replacement, "maintenance")
-        replacement.replace(route)
+            replacement = route.with_suffix(".tmp")
+            _write_route(replacement, "maintenance")
+            replacement.replace(route)
 
-        with urllib.request.urlopen(base + "/healthz", timeout=5) as response:
-            health_during = json.load(response)
-        maintenance = urllib.request.Request(
-            base + "/api/prediction-arbitrage/executions",
-            data=b"{}",
-            method="POST",
-        )
-        with pytest.raises(urllib.error.HTTPError) as error:
-            urllib.request.urlopen(maintenance, timeout=5)
+            with urllib.request.urlopen(base + "/healthz", timeout=5) as response:
+                health_during = json.load(response)
+            maintenance = urllib.request.Request(
+                base + "/api/prediction-arbitrage/executions",
+                data=b"{}",
+                method="POST",
+            )
+            with pytest.raises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(maintenance, timeout=5)
 
-        assert health_during["prediction_route_mode"] == "maintenance"
-        assert health_during["prediction_inflight_requests"] == 1
-        assert error.value.code == HTTPStatus.SERVICE_UNAVAILABLE
-        assert len(
-            [
-                item
-                for item in legacy.requests
-                if item["path"] == "/api/prediction-arbitrage/executions"
-            ]
-        ) == 1
-        assert prediction.requests == []
-
-        legacy.release_response.set()
-        request.join(timeout=5)
-        assert not request.is_alive()
+            assert health_during["prediction_route_mode"] == "maintenance"
+            assert health_during["prediction_inflight_requests"] == 1
+            assert error.value.code == HTTPStatus.SERVICE_UNAVAILABLE
+            assert len(
+                [
+                    item
+                    for item in legacy.requests
+                    if item["path"] == "/api/prediction-arbitrage/executions"
+                ]
+            ) == 1
+            assert prediction.requests == []
+        finally:
+            legacy.release_response.set()
+            request.join(timeout=5)
+            assert not request.is_alive(), "selected request did not finish"
+        assert errors == []
         with urllib.request.urlopen(base + "/healthz", timeout=5) as response:
             health_after = json.load(response)
 
@@ -727,16 +755,12 @@ def test_gateway_health_keeps_legacy_and_account_failures_independent(tmp_path: 
     assert shadow_payload["legacy_upstream_status"] == "ok"
     assert shadow_payload["account_upstream_status"] == "unavailable"
 
-    socket_holder = socket.socket()
-    socket_holder.bind(("127.0.0.1", 0))
-    unavailable_port = socket_holder.getsockname()[1]
-    socket_holder.close()
     account = _Upstream()
     account.health_body = json.dumps(
         {"module": "account_api", "mode": "production"}
     ).encode()
-    with _running(account), _gateway(
-        tmp_path / "static", unavailable_port, account.server_address[1], timeout=0.05
+    with _unavailable_port() as unavailable_port, _running(account), _gateway(
+        tmp_path / "static", unavailable_port, account.server_address[1]
     ) as base:
         with urllib.request.urlopen(base + "/healthz", timeout=5) as response:
             unavailable_payload = json.load(response)
@@ -745,12 +769,8 @@ def test_gateway_health_keeps_legacy_and_account_failures_independent(tmp_path: 
     assert unavailable_payload["account_upstream_status"] == "ok"
 
     legacy = _Upstream()
-    socket_holder = socket.socket()
-    socket_holder.bind(("127.0.0.1", 0))
-    unavailable_port = socket_holder.getsockname()[1]
-    socket_holder.close()
-    with _running(legacy), _gateway(
-        tmp_path / "static", legacy.server_address[1], unavailable_port, timeout=0.05
+    with _unavailable_port() as unavailable_port, _running(legacy), _gateway(
+        tmp_path / "static", legacy.server_address[1], unavailable_port
     ) as base:
         with urllib.request.urlopen(base + "/healthz", timeout=5) as response:
             unavailable_account_payload = json.load(response)
@@ -761,12 +781,8 @@ def test_gateway_health_keeps_legacy_and_account_failures_independent(tmp_path: 
 def test_gateway_returns_account_503_without_using_legacy(tmp_path: Path) -> None:
     _write_static_files(tmp_path / "static")
     legacy = _Upstream()
-    socket_holder = socket.socket()
-    socket_holder.bind(("127.0.0.1", 0))
-    unavailable_port = socket_holder.getsockname()[1]
-    socket_holder.close()
-    with _running(legacy), _gateway(
-        tmp_path / "static", legacy.server_address[1], unavailable_port, timeout=0.05
+    with _unavailable_port() as unavailable_port, _running(legacy), _gateway(
+        tmp_path / "static", legacy.server_address[1], unavailable_port
     ) as base:
         with pytest.raises(urllib.error.HTTPError) as error:
             urllib.request.urlopen(base + "/api/v1/account/snapshot", timeout=5)
@@ -987,11 +1003,7 @@ def test_gateway_returns_structured_503_when_upstream_is_unavailable(
     tmp_path: Path,
 ) -> None:
     _write_static_files(tmp_path / "static")
-    socket_holder = socket.socket()
-    socket_holder.bind(("127.0.0.1", 0))
-    unavailable_port = socket_holder.getsockname()[1]
-    socket_holder.close()
-    with _gateway(tmp_path / "static", unavailable_port, timeout=0.05) as base:
+    with _unavailable_port() as unavailable_port, _gateway(tmp_path / "static", unavailable_port) as base:
         with pytest.raises(urllib.error.HTTPError) as error:
             urllib.request.urlopen(base + "/api/state", timeout=5)
         payload = json.load(error.value)
@@ -1007,13 +1019,19 @@ def test_gateway_returns_structured_503_when_upstream_is_unavailable(
 def test_gateway_returns_503_when_upstream_times_out(tmp_path: Path) -> None:
     _write_static_files(tmp_path / "static")
     upstream = _Upstream()
-    upstream.response_delay = 0.2
+    upstream.block_path = "/api/state"
     with _running(upstream), _gateway(
         tmp_path / "static", upstream.server_address[1], timeout=0.01
     ) as base:
-        with pytest.raises(urllib.error.HTTPError) as error:
-            urllib.request.urlopen(base + "/api/state", timeout=5)
-        error.value.read()
+        try:
+            with pytest.raises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(base + "/api/state", timeout=5)
+            error.value.read()
+            assert upstream.request_started.wait(timeout=5)
+            assert not upstream.release_response.is_set()
+        finally:
+            upstream.release_response.set()
+            assert upstream.response_finished.wait(timeout=5)
 
     assert error.value.code == 503
 
@@ -1047,3 +1065,40 @@ def test_prediction_only_gateway_never_contacts_stock_backends(tmp_path):
                 urllib.request.urlopen(base + '/api/prediction-arbitrage/venues')
             assert error.value.code == 503
         assert stocks.requests == []
+
+
+def test_split_prediction_routes_responsibility_and_isolates_authorization(tmp_path):
+    static = tmp_path / 'static'
+    _write_static_files(static)
+    route = tmp_path / 'route.json'
+    _write_route(route, 'service')
+    air, cloud, legacy = _Upstream(), _Upstream(), _Upstream()
+    cloud.response_headers = [('Set-Cookie', 'ot_prediction_session=cloud')]
+    config = FrontendGatewayConfig(static_dir=static, prediction_route_path=route,
+        upstream_port=legacy.server_address[1], account_upstream_port=legacy.server_address[1],
+        prediction_upstream_port=air.server_address[1],
+        prediction_display_upstream_port=cloud.server_address[1])
+    server = create_frontend_gateway(config=config, host='127.0.0.1', port=0)
+    with _running(air), _running(cloud), _running(legacy), _running(server):
+        base = f'http://127.0.0.1:{server.server_address[1]}'
+        for path in ('/venues', '/lp/dashboard', '/lp/account/trades'):
+            request = urllib.request.Request(base+'/api/prediction-arbitrage'+path,
+                headers={'Cookie':'ot_prediction_session=air', 'X-CSRF-Token':'air-csrf'})
+            with urllib.request.urlopen(request) as response:
+                assert response.headers.get('Set-Cookie') is None
+        for method, path in (('GET','/lp/auto/state'), ('GET','/execution/identity'),
+                             ('GET','/state'), ('GET','/lp/sessions/current'),
+                             ('GET','/history?kind=signals'), ('GET','/history?kind=executions'), ('GET','/history?kind=incidents'),
+                             ('GET','/history?kind=signals&kind=executions'),
+                             ('GET','/relations/cloud-record'), ('GET','/n-leg/report'),
+                             ('POST','/lp/orders'), ('POST','/lp/orders/cancel')):
+            _prediction_request(base, method, '/api/prediction-arbitrage'+path)
+        _prediction_request(base, 'POST', '/api/prediction-arbitrage/lp/dashboard')
+        _prediction_request(base, 'GET', '/api/portfolio')
+    assert [row['path'] for row in cloud.requests] == [
+        '/api/prediction-arbitrage/venues', '/api/prediction-arbitrage/lp/dashboard',
+        '/api/prediction-arbitrage/lp/account/trades']
+    assert all('Cookie' not in row['headers'] and 'X-CSRF-Token' not in row['headers'] for row in cloud.requests)
+    assert len(air.requests) == 13
+    assert air.requests[1]['path'] == '/api/prediction-arbitrage/venues'
+    assert [row['path'] for row in legacy.requests] == ['/api/portfolio']

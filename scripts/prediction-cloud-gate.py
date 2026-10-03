@@ -21,6 +21,34 @@ def checked(command, *, cwd=None, env=None):
     return result.stdout
 
 
+def remote_identity(result, cloud, action):
+    """Validate each remote observation; only display snapshots may move."""
+    expected = dict(release_root=str(cloud.release_root), runtime_root=str(cloud.runtime_root),
+        mode=cloud.mode, git_sha=cloud.expected_sha, n_leg_paused=cloud.n_leg_paused,
+        credential_backend=credential_backend(cloud),
+        status='PRECHECK_OK' if action == 'preflight' else 'BACKEND_SMOKE_OK')
+    if any(key not in result or result[key] != value for key, value in expected.items()):
+        raise ValueError('remote gate evidence mismatch')
+    if action == 'smoke':
+        if (type(result.get('pid')) is not int or result['pid'] <= 0
+            or any(not isinstance(result.get(key), str) or not result[key]
+                   for key in ('started_at', 'systemd_started_at'))):
+            raise ValueError('remote process identity missing')
+        if cloud.mode == 'shadow' and cloud.n_leg_paused and credential_backend(cloud) != 'disabled':
+            from datetime import UTC, datetime
+            from decimal import Decimal
+            from open_trader.polymarket_lp_risk import _freshness
+            snapshot = result.get('display_snapshot')
+            if (not isinstance(snapshot, dict)
+                or any(not isinstance(snapshot.get(key), dict)
+                       for key in ('account', 'catalog', 'candidates', 'rewards'))
+                or 'history' not in snapshot):
+                raise ValueError('remote display snapshot evidence missing')
+            _freshness(snapshot['account'].get('checked_at'), datetime.now(UTC),
+                       'account_facts', max_age=Decimal(60))
+    return {key:value for key,value in result.items() if key != 'display_snapshot'}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['readiness','smoke'])
@@ -38,15 +66,15 @@ def main():
         if cloud.mode != local['mode']:
             raise ValueError('client and cloud service modes mismatch')
         evidence = json.loads(args.operator_evidence.read_text())
-        if cloud.expected_sha != local['expected_sha'] or evidence.get('git_sha') != cloud.expected_sha:
+        if cloud.expected_sha != local.get('cloud_expected_sha',local['expected_sha']) or evidence.get('git_sha') != cloud.expected_sha:
             raise ValueError('two-host SHA or operator evidence mismatch')
-        # These are explicit operator attestations, not automated proof. Credentialless
-        # paused Shadow replaces owner-cutover/metadata attestations with an exact
-        # independent-runtime match; the remote component profile is checked below.
-        if credential_backend(cloud) == 'disabled':
+        # Shadow reads never take trading ownership, even with SSM credentials.
+        if cloud.mode == 'shadow':
             if evidence.get('independent_runtime_root') != str(cloud.runtime_root):
                 raise ValueError('independent Shadow runtime evidence mismatch')
-            required_attestations = ('resources_reviewed',)
+            required_attestations = ('resources_reviewed',) + (
+                ('metadata_isolation_verified',) if credential_backend(cloud) == 'tencent-ssm' else ()
+            )
         else:
             required_attestations = ('old_owner_stopped', 'metadata_isolation_verified', 'resources_reviewed')
         for field in required_attestations:
@@ -56,7 +84,7 @@ def main():
             raise ValueError('absolute remote config required')
         release = Path(local['release_root'])
         identity = inspect_prediction_release_checkout(release)
-        if identity['git_sha'] != cloud.expected_sha or checked(['git','-C',str(release),'rev-parse','--abbrev-ref','HEAD']).strip() != 'HEAD':
+        if identity['git_sha'] != local['expected_sha'] or checked(['git','-C',str(release),'rev-parse','--abbrev-ref','HEAD']).strip() != 'HEAD':
             raise ValueError('local immutable release mismatch')
         action = 'preflight' if args.action == 'readiness' else 'smoke'
         remote = ('cd '+shlex.quote(str(cloud.release_root))+' && '+shlex.join([
@@ -65,13 +93,7 @@ def main():
         output = checked(['ssh','-o','BatchMode=yes','-o','StrictHostKeyChecking=yes','-o','ForwardAgent=no',
                           '-o','ConnectTimeout=10',local['ssh_alias'],remote])
         result = json.loads(output)
-        if result.get('release_root') != str(cloud.release_root) or result.get('runtime_root') != str(cloud.runtime_root):
-            raise ValueError('remote release/runtime root mismatch')
-        if (result.get('mode') != cloud.mode or result.get('git_sha') != cloud.expected_sha
-            or result.get('n_leg_paused') != cloud.n_leg_paused
-            or result.get('credential_backend') != credential_backend(cloud)
-            or result.get('status') != ('PRECHECK_OK' if action == 'preflight' else 'BACKEND_SMOKE_OK')):
-            raise ValueError('remote gate evidence mismatch')
+        identity_before = remote_identity(result, cloud, action)
         env = {**os.environ, 'PYTHONSAFEPATH':'1', 'PYTHONPATH':str(release)+':'+str(release/'src'),
                'NODE_PATH':str(args.browser_runtime/'node_modules'),
                'OPEN_TRADER_SMOKE_URL':f"http://127.0.0.1:{client_ports(local)[0]}/"}
@@ -84,6 +106,9 @@ def main():
             print('READY')
         else:
             before = client_operation(local,'status')
+            if 'execution_port' in local and (before.get('execution_status') != 'ok'
+                or before.get('execution_git_sha') != local['execution_expected_sha']):
+                raise ValueError('Air execution unavailable or identity mismatch')
             if before['status'] != 'CONNECTED':
                 raise ValueError('local client not connected')
             log = Path(local['runtime_root'])/'gateway.log'
@@ -96,7 +121,7 @@ def main():
                 raise ValueError('client changed during browser smoke')
             after = json.loads(checked(['ssh','-o','BatchMode=yes','-o','StrictHostKeyChecking=yes',
                 '-o','ForwardAgent=no','-o','ConnectTimeout=10',local['ssh_alias'],remote]))
-            if after != result:
+            if remote_identity(after, cloud, action) != identity_before:
                 raise ValueError('backend changed during browser smoke')
             client_release(local)
             print('HEALTHY')

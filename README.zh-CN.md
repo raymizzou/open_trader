@@ -209,13 +209,17 @@ watchlist 使用市场、标的和 Trend Animals 业务标识：
 
 四个阶段彼此独立，证据均绑定精确 SHA：
 
-1. **Docker 开发**：`make test SERVICE=prediction` 或
-   `make test TEST='tests/path.py::test_name'` 只构建当前 worktree 专属的 Python/backend 镜像，
-   并只运行所选服务的后台测试；跨服务改动可用空格分隔多个服务，不带范围的 `make test`
-   会直接失败。镜像包含 Node 运行时和 `procps`，但不包含
-   npm、Python/JS Playwright、Chromium/浏览器资产，也没有宿主机挂载、网络、发布端口、
-   Docker socket、home 目录或凭据。容器运行 `-m 'not pressure and not browser'` backend
-   pytest，浏览器成本为零。
+1. **开发验证**：本地只跑直接受影响或新增的 test nodeid，在已有 Python 环境中用
+   `PYTHONPATH=src python -m pytest tests/path.py::test_name` 显式加载当前 worktree 源码。
+   仅修改测试时跑改动的测试；共享测试 helper 还需覆盖直接受影响的消费者。
+   共享生产模块改动跑相关消费者测试的并集，不扩大到整个服务。
+   Docker 可用于定向诊断，但不是推送已审查分支的前置条件。
+   GitHub CI 在每次分支 push、每个目标为 `main` 的 PR 合并候选及合并后的 main push
+   上运行 `gateway`、`legacy`、`account`、`prediction` 四个服务，统一
+   `TEST_N_LEG=1`；纯文档、LP、趋势或缺失 diff 均不缩减覆盖。
+   全后台测试排除 `pressure` 和 `browser`；push head 与 PR merge 分别验证不同 SHA，
+   有意保留两次运行，legacy 已包含趋势测试。CI 使用锁定依赖的 Docker dev 镜像和
+   无网络、宿主挂载、转发凭据、Docker socket 或发布端口的测试容器，不运行下述部署门禁。
 2. **部署前 Candidate Acceptance**：仅在 GitHub PR 合并后准备明确授权的部署时，
    对选定的最终 GitHub `main` SHA 运行 `make candidate-acceptance`；PR head 和
    GitHub 合成 PR merge SHA 的证据不能转用，合并本身不会自动触发验收；
@@ -951,11 +955,14 @@ data/latest/US/decision_facts.json
 
 ## 开发
 
-运行测试：
+本地在已有 Python 环境中只运行直接受影响或新增的 test nodeid：
 
 ```bash
-.venv/bin/python -m pytest
+PYTHONPATH=src python -m pytest tests/path.py::test_name
 ```
+
+每次分支 push 和目标为 `main` 的 PR 均由 GitHub CI 运行完整现有后台测试；
+详见[验证手册](docs/operations/agent-verification.md)。
 
 项目入口：
 

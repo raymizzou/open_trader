@@ -2,11 +2,12 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from threading import Event
+from threading import Barrier, Event
 import time
 from types import SimpleNamespace
 
 import pytest
+from timing_support import run_test_in_subprocess
 
 from open_trader.polymarket_lp import PolymarketLPService
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
@@ -109,6 +110,22 @@ def setup(tmp_path, count=1):
     return engine,ex,lp,store
 
 
+def _fresh_registration_bundle(x, lp):
+    snapshot = x.lp_account_snapshot()
+    snapshot.update(
+        account_id='test-wallet',
+        read_started_at=NOW,
+        read_ended_at=NOW,
+        checked_at=NOW,
+        balance_complete=True,
+        trades_complete=True,
+        pagination_complete=True,
+        raw_trades=x.trades,
+        trade_generation=lp.store.lp_trade_generation(),
+    )
+    return snapshot
+
+
 def test_default_configure_enable_and_idempotent_round(tmp_path):
     e,x,lp,s=setup(tmp_path,5)
     assert e.lp_auto_state()['desired_running'] is False
@@ -148,6 +165,83 @@ def test_full_pool_manual_exclusion_unknown_isolated_and_restart(tmp_path):
     assert e2.lp_auto_state()['run_id']==r['run_id']
 
 
+def test_prepare_transport_error_is_determinate_not_sent(tmp_path):
+    from polymarket.errors import TransportError
+    from polymarket.models.clob import SignedOrder
+
+    def sdk_signed(**kwargs):
+        return SignedOrder(
+            builder='0x1', expiration=int(kwargs['expiration']), maker='0x2',
+            maker_amount=1, metadata='0x3', order_type='GTD', salt=1,
+            side='BUY', signature='0x4', signature_type=0, signer='0x5',
+            taker_amount=1, timestamp=1, token_id=str(kwargs['token_id']),
+            post_only=True,
+        )
+
+    def prepare_then_transport(**kwargs):
+        sdk_signed(**kwargs)
+        raise TransportError('private')
+
+    e,x,lp,s=setup(tmp_path)
+    e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
+    e.lp_auto_set_desired_running(True)
+    x.lp_create_limit_order=prepare_then_transport
+    r=e.lp_auto_run_once()
+    sid=r['intents'][0]['session_id']
+    session=s.lp_session(sid)
+    action=next(a for a in s.lp_actions(sid) if a['role']=='entry')
+    assert not x.posts
+    assert session['state']=='entry_rejected'
+    assert session['submit_status']=='rejected'
+    assert session['submit_stage']=='prepare_failed'
+    assert session['submit_post_started_at'] is None
+    assert session['submit_error_chain']==['TransportError']
+    assert action['state']=='rejected'
+    assert action['submit_error_chain']==['TransportError']
+    assert r['slots']['occupied']==0
+    assert r['funds']['status']=='known'
+    assert Decimal(r['funds']['buy_reserved_usd'])==0
+
+
+def test_post_timeout_keeps_one_temporary_reservation_without_retry(tmp_path):
+    e,x,lp,s=setup(tmp_path)
+    e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
+    e.lp_auto_set_desired_running(True)
+    def sdk_signed(**kwargs):
+        from polymarket.models.clob import SignedOrder
+        return SignedOrder(
+            builder='0x1', expiration=int(kwargs['expiration']), maker='0x2',
+            maker_amount=1, metadata='0x3', order_type='GTD', salt=1,
+            side='BUY', signature='0x4', signature_type=0, signer='0x5',
+            taker_amount=1, timestamp=1, token_id=str(kwargs['token_id']),
+            post_only=True,
+        )
+    x.lp_create_limit_order=sdk_signed
+    def timeout(signed):
+        x.posts.append(signed)
+        raise TimeoutError('private')
+    x.lp_post_order=timeout
+    r=e.lp_auto_run_once()
+    sid=r['intents'][0]['session_id']
+    session=s.lp_session(sid)
+    action=next(a for a in s.lp_actions(sid) if a['role']=='entry')
+    assert len(x.posts)==1
+    assert session['state']=='needs_attention'
+    assert session['submit_status']=='unknown'
+    assert session['submit_stage']=='send_unknown'
+    assert session['submit_post_started_at']
+    assert session['submit_finished_at']
+    assert session['submit_timeout'] is True
+    assert action['state']=='unknown'
+    assert action['post_started'] is True
+    e2=PredictionExecutionService(store=s,monitor=SimpleNamespace(),trading=x,
+                notifier=SimpleNamespace(),lock_path=tmp_path/'execution.lock',lp=lp)
+    e2._breaker_open=False
+    assert len(e2.lp_auto_run_once()['intents'])==1
+    assert len(x.posts)==1
+    assert r['slots']['occupied']==1
+
+
 def test_pause_during_signing_prevents_post(tmp_path):
     e,x,lp,s=setup(tmp_path)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
@@ -157,14 +251,163 @@ def test_pause_during_signing_prevents_post(tmp_path):
     assert not x.posts
     assert r['pause_confirmed'] is True
     assert r['slots']['occupied']==0
+    sid=r['intents'][0]['session_id']
+    session=s.lp_session(sid)
+    action=next(a for a in s.lp_actions(sid) if a['role']=='entry')
+    for fact in (session,action):
+        assert fact['submit_stage']=='pre_send_rejected'
+        assert fact['post_started'] is False
+        assert fact['submit_post_started_at'] is None
 
 
-def test_concurrent_rounds_single_reservation(tmp_path):
+def test_callback_read_failure_before_post_releases_reservation(tmp_path):
     e,x,lp,s=setup(tmp_path)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
     e.lp_auto_set_desired_running(True)
+    original=lp._read_candidate_snapshot
+    reads=0
+    def read(request,**kwargs):
+        nonlocal reads
+        reads+=1
+        if reads==1:
+            return original(request,**kwargs)
+        raise RuntimeError('private pre-send failure')
+    lp._read_candidate_snapshot=read
+    r=e.lp_auto_run_once()
+    sid=r['intents'][0]['session_id']
+    session=s.lp_session(sid)
+    action=next(a for a in s.lp_actions(sid) if a['role']=='entry')
+    assert reads==2 and not x.posts
+    assert session['state']=='entry_rejected'
+    assert session['submit_stage']=='prepare_failed'
+    assert session['submit_error_chain']==['RuntimeError']
+    assert session['post_started'] is False
+    assert action['submit_stage']=='prepare_failed'
+    assert r['slots']['occupied']==0
+    assert r['funds']['status']=='known'
+
+
+def test_callback_lock_failure_before_post_releases_reservation(tmp_path):
+    e,x,lp,s=setup(tmp_path)
+    e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
+    e.lp_auto_set_desired_running(True)
+    original=e._acquire_global_lock
+    granted=[]
+    def acquire():
+        lock=original()
+        if len(granted)==1:
+            if lock is not None:
+                e._release_global_lock(lock)
+            granted.append(False)
+            return None
+        granted.append(lock is not None)
+        if lock is not None:
+            return lock
+        return lock
+    e._acquire_global_lock=acquire
+    r=e.lp_auto_run_once()
+    sid=r['intents'][0]['session_id']
+    session=s.lp_session(sid)
+    action=next(a for a in s.lp_actions(sid) if a['role']=='entry')
+    assert granted==[True,False] and not x.posts
+    assert session['state']=='entry_rejected'
+    assert session['submit_stage']=='pre_send_rejected'
+    assert session['reason']=='execution_lock'
+    assert session['post_started'] is False
+    assert action['submit_stage']=='pre_send_rejected'
+    assert r['slots']['occupied']==0
+
+
+def test_second_mutation_guard_before_post_releases_reservation(tmp_path):
+    e,x,lp,s=setup(tmp_path)
+    e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
+    e.lp_auto_set_desired_running(True)
+    guards=0
+    original=lp._require_mutation
+    def guard():
+        nonlocal guards
+        guards+=1
+        if guards==2:
+            from open_trader.polymarket_lp import _MutationBlocked
+            raise _MutationBlocked('mutation_blocked')
+        original()
+    lp._require_mutation=guard
+    r=e.lp_auto_run_once()
+    sid=r['intents'][0]['session_id']
+    session=s.lp_session(sid)
+    action=next(a for a in s.lp_actions(sid) if a['role']=='entry')
+    assert guards==2 and not x.posts
+    assert session['state']=='entry_rejected'
+    assert session['submit_stage']=='prepare_failed'
+    assert session['submit_error_chain']==['_MutationBlocked']
+    assert session['post_started'] is False
+    assert action['submit_stage']=='prepare_failed'
+    assert r['slots']['occupied']==0
+    assert r['funds']['status']=='known'
+    assert Decimal(r['funds']['buy_reserved_usd'])==0
+
+
+def test_missing_post_adapter_before_post_releases_reservation(tmp_path):
+    e,x,lp,s=setup(tmp_path)
+    e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
+    e.lp_auto_set_desired_running(True)
+    x.lp_post_order=None
+    r=e.lp_auto_run_once()
+    sid=r['intents'][0]['session_id']
+    session=s.lp_session(sid)
+    action=next(a for a in s.lp_actions(sid) if a['role']=='entry')
+    assert not x.posts
+    assert session['state']=='entry_rejected'
+    assert session['submit_stage']=='prepare_failed'
+    assert session['submit_error_chain']==['RuntimeError']
+    assert session['post_started'] is False
+    assert action['submit_stage']=='prepare_failed'
+    assert r['slots']['occupied']==0
+    assert r['funds']['status']=='known'
+
+
+@pytest.mark.parametrize('accepted', [True, False])
+def test_terminal_receipt_facts_match_session_and_action(tmp_path,accepted):
+    e,x,lp,s=setup(tmp_path)
+    e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
+    e.lp_auto_set_desired_running(True)
+    if not accepted:
+        x.lp_post_order=lambda signed:x.posts.append(signed) or {
+            'accepted':False,'ok':False,'status':'REJECTED','order_id':'rejected-1'}
+    r=e.lp_auto_run_once()
+    sid=r['intents'][0]['session_id']
+    session=s.lp_session(sid)
+    action=next(a for a in s.lp_actions(sid) if a['role']=='entry')
+    expected_stage='receipt_received' if accepted else 'exchange_rejected'
+    assert session['state']==('entry_open' if accepted else 'entry_rejected')
+    assert session['submit_status']==('accepted' if accepted else 'rejected')
+    assert action['state']==('accepted' if accepted else 'rejected')
+    for name in ('submit_stage','post_started','submit_post_started_at',
+                 'submit_finished_at','submit_receipt_at','submit_timeout'):
+        assert session[name]==action[name]==({
+            'submit_stage':expected_stage,
+            'post_started':True,
+            'submit_post_started_at':session['submit_post_started_at'],
+            'submit_finished_at':session['submit_finished_at'],
+            'submit_receipt_at':session['submit_receipt_at'],
+            'submit_timeout':False,
+        }[name])
+    assert len(x.posts)==1
+    assert r['slots']['occupied']==(1 if accepted else 0)
+
+
+def test_concurrent_rounds_single_reservation(tmp_path, request):
+    if run_test_in_subprocess(request):
+        return
+    e,x,lp,s=setup(tmp_path)
+    e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
+    e.lp_auto_set_desired_running(True)
+    start = Barrier(2)
+    def run_round(_):
+        start.wait(timeout=5)
+        return e.lp_auto_run_once(round_id='same')
     with ThreadPoolExecutor(2) as pool:
-        list(pool.map(lambda _:e.lp_auto_run_once(round_id='same'), range(2)))
+        list(pool.map(run_round, range(2)))
     assert len(x.posts)==1
     assert len(e.lp_auto_state()['intents'])==1
 
@@ -248,31 +491,45 @@ def test_manual_origin_does_not_own_funds_and_unknown_fees_block(tmp_path):
     assert e.lp_auto_state()['slots']['occupied'] == 1
 
 
-def test_concurrent_configuration_is_atomic_target_total(tmp_path):
+def test_concurrent_configuration_is_atomic_target_total(tmp_path, request):
+    if run_test_in_subprocess(request):
+        return
     e,x,lp,s=setup(tmp_path)
+    start = Barrier(2)
+    def configure(_):
+        start.wait(timeout=5)
+        return e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
     with ThreadPoolExecutor(2) as pool:
-        list(pool.map(lambda _:e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1)),range(2)))
+        list(pool.map(configure, range(2)))
     assert e.lp_auto_state()['funds']['total_usd']=='100'
     assert e.lp_auto_state()['config_version']==2
 
 
-def test_unknown_with_reliable_id_reconciles_without_resubmit(tmp_path):
+def test_sync_manages_exchange_ids_without_precomputed_match(tmp_path):
     e,x,lp,s=setup(tmp_path,2)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=2))
     e.lp_auto_set_desired_running(True)
     create=x.lp_create_limit_order
-    x.lp_create_limit_order=lambda **kwargs:{**create(**kwargs),'order_id':'known-' + kwargs['token_id']}
+    x.lp_create_limit_order=lambda **kwargs:{**create(**kwargs),'order_id':'audit-' + kwargs['token_id']}
     x.fail=True
     r=e.lp_auto_run_once()
     assert len(x.posts)==2
     assert 'submission_unknown' in r['block_reasons']
     e.lp_auto_set_desired_running(False)
     for token in ('m00', 'm01'):
-        x.orders.append(dict(order_id='known-' + token,token_id=token,condition_id=token,side='BUY',status='LIVE',price='.4',original_size='20',size_matched='0'))
+        x.orders.append(dict(order_id='venue-' + token,token_id=token,condition_id=token,side='BUY',status='LIVE',price='.4',original_size='20',size_matched='0'))
     x.fail=False
-    r=e.lp_auto_run_once()
-    assert 'submission_unknown' not in r['block_reasons']
-    assert r['desired_running'] is False
+    first=lp.register_account_snapshot(_fresh_registration_bundle(x,lp))
+    assert first['state']=='registered', first
+    sessions=s.lp_active_sessions()
+    assert {session['token_id'] for session in sessions}=={'m00','m01'}
+    assert sorted(order_id for session in sessions for order_id in session['owned_order_ids'])==['venue-m00','venue-m01']
+    assert all('audit-' not in order_id for session in sessions for order_id in session['owned_order_ids'])
+    assert e.lp_auto_state()['funds']['status']=='unknown'
+    assert e.lp_auto_state()['desired_running'] is False
+    repeat=lp.register_account_snapshot(_fresh_registration_bundle(x,lp))
+    assert repeat['state']=='registered', repeat
+    assert len(s.lp_active_sessions())==2
     assert len(x.posts)==2
 
 
@@ -468,7 +725,7 @@ def test_account_switch_cannot_reconcile_another_wallets_pool(tmp_path):
 
 @pytest.mark.parametrize('stage',['snapshot','sign','post'])
 def test_slow_automatic_network_does_not_block_existing_session_cancel(tmp_path,stage):
-    from threading import Event
+    from threading import Barrier, Event
     e,x,lp,s=setup(tmp_path)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=2))
     e.lp_auto_set_desired_running(True)
@@ -585,13 +842,12 @@ def test_late_live_receipt_preserves_already_verified_fill(tmp_path):
     e,x,lp,s=setup(tmp_path)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
     e.lp_auto_set_desired_running(True)
-    create=x.lp_create_limit_order
-    x.lp_create_limit_order=lambda **kwargs:{**create(**kwargs),'order_id':'o1'}
     post=x.lp_post_order
     def delayed_receipt(signed):
         response=dict(post(signed))
         x.orders[0].update(status='FILLED',size_matched='20')
         x.positions=[dict(token_id='m00',condition_id='m00',size='20')]
+        assert lp.register_account_snapshot(_fresh_registration_bundle(x,lp))['state']=='registered'
         e.lp_tick()
         return response
     x.lp_post_order=delayed_receipt
@@ -609,7 +865,7 @@ def test_late_live_receipt_preserves_already_verified_fill(tmp_path):
 
 @pytest.mark.parametrize('signed_id',[False,True])
 def test_receipt_apply_respects_another_service_tick_lock(tmp_path,signed_id):
-    from threading import Event, Lock
+    from threading import Barrier, Event, Lock
     e,x,lp,s=setup(tmp_path)
     other_store=PredictionArbitrageStore(s.data_dir)
     other_lp=PolymarketLPService(other_store,x,clock=lambda:NOW)
@@ -663,23 +919,23 @@ def test_receipt_apply_respects_another_service_tick_lock(tmp_path,signed_id):
     assert Decimal(r['funds']['inventory_cost_usd'])==(8 if signed_id else 0)
 
 
-def test_conflicting_signed_and_receipt_ids_remain_unknown(tmp_path):
+def test_exchange_receipt_id_is_owner_when_signed_id_differs(tmp_path):
     e,x,lp,s=setup(tmp_path,2)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=2))
     e.lp_auto_set_desired_running(True)
     create=x.lp_create_limit_order
     x.lp_create_limit_order=lambda **kwargs:{**create(**kwargs),'order_id':'signed-id'}
     r=e.lp_auto_run_once()
-    assert 'submission_unknown' in r['block_reasons']
-    assert r['funds']['available_usd'] is None
-    assert len(x.posts)==1
-    session=s.lp_session(r['intents'][0]['session_id'])
-    assert session['order_identity_conflict']=={'prepared_order_id':'signed-id','response_order_id':'o1'}
-    assert 'o1' not in session['owned_order_ids']
-    x.orders.append(dict(order_id='signed-id',token_id='m00',condition_id='m00',side='BUY',status='LIVE',price='.4',original_size='20',size_matched='0'))
-    assert 'submission_unknown' in e.lp_auto_reconcile_unknown()['block_reasons']
+    assert 'submission_unknown' not in r['block_reasons']
+    assert len(x.posts)==2
+    sessions=[s.lp_session(row['session_id']) for row in r['intents']]
+    assert {row['session_id'] for row in r['intents']}=={row['session_id'] for row in sessions}
+    assert sorted(order_id for session in sessions for order_id in session['owned_order_ids'])==['o1','o2']
+    assert all('order_identity_conflict' not in session for session in sessions)
+    assert all('signed-id' not in session['owned_order_ids'] for session in sessions)
+    assert e.lp_auto_state()['slots']['occupied']==2
     e.lp_auto_run_once()
-    assert len(x.posts)==1
+    assert len(x.posts)==2
 
 
 def test_accepted_sell_missing_receipt_blocks_new_buys_until_exact_id_recovers(tmp_path):
@@ -734,7 +990,7 @@ def test_known_buy_receipt_uncertainty_resolves_and_reopens_without_new_intent(t
     assert len([v for v in events if v['kind']=='intent'])==1
 
 
-def test_conflicting_identity_stays_quarantined_in_public_tick_and_stop(tmp_path):
+def test_signed_id_does_not_quarantine_venue_order_in_public_tick_and_stop(tmp_path):
     e,x,lp,s=setup(tmp_path)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
     e.lp_auto_set_desired_running(True)
@@ -743,18 +999,20 @@ def test_conflicting_identity_stays_quarantined_in_public_tick_and_stop(tmp_path
     sid=e.lp_auto_run_once()['intents'][0]['session_id']
     cancellations=[]
     x.cancel_order=lambda oid:cancellations.append(oid) or {'canceled':[oid]}
-    assert e.lp_tick()['state']=='needs_attention'
-    x.orders=[dict(order_id='prepared-id',token_id='m00',condition_id='m00',side='BUY',status='LIVE',price='.4',original_size='20',size_matched='0')]
+    assert e.lp_tick()['state']=='entry_open'
+    session=s.lp_session(sid)
+    assert session['owned_order_ids']==['o1']
+    assert 'order_identity_conflict' not in session
     original=x.direction
     def depleted(n):
         d=original(n)
         d['book']['bids'][0]['size']='20'
         return d
     x.direction=depleted
-    assert e.lp_tick()['state']=='needs_attention'
-    assert s.lp_session(sid)['reconciliation']=='order_identity_conflict'
-    assert e.lp_stop(sid)['state']=='needs_attention'
-    assert not cancellations and len(x.posts)==1
+    assert e.lp_stop(sid)['state']=='review'
+    assert cancellations==['o1']
+    assert 'prepared-id' not in cancellations
+    assert len(x.posts)==1
 
 
 def test_slow_deadline_cancel_does_not_block_other_fact_publication(tmp_path):
@@ -816,7 +1074,7 @@ def test_publication_lock_wait_arms_durable_attention_progress(tmp_path, monkeyp
     from tests import test_lp_auto_pool as venue
     from copy import deepcopy
 
-    from threading import Event as ThreadEvent
+    from threading import Barrier, Event as ThreadEvent
     class Notifier:
         def __init__(self):
             self.calls=[]; self.done=ThreadEvent()
@@ -853,16 +1111,10 @@ def test_publication_lock_wait_arms_durable_attention_progress(tmp_path, monkeyp
     x.lp_snapshot=fresh
     result=lp.reconcile_facts(sid,monitor=True,apply_lock=locks)
     assert result[3]=='execution_lock'
-    assert notifier.done.wait(2)
-    for _ in range(50):
-        intent=e._auto_pool._read()['intents'][intent_id]
-        if intent.get('attention_due') is False:
-            break
-        time.sleep(.01)
     intent=e._auto_pool._read()['intents'][intent_id]
     assert intent['attention_due'] is False
-    assert intent['attention_notified'] is True
-    assert len(notifier.calls)==1
+    assert intent.get('attention_notified') is not True
+    assert notifier.calls == []
 
 
 def test_trade_claim_advances_both_fences_and_rejects_stale_claim(tmp_path):
@@ -889,7 +1141,7 @@ def test_trade_claim_advances_both_fences_and_rejects_stale_claim(tmp_path):
 
 
 def test_concurrent_monitor_and_manual_protected_sell_claim_one_intent(tmp_path):
-    from threading import Event
+    from threading import Barrier, Event
     e,x,lp,s=setup(tmp_path)
     sid='sell-session'; now=NOW; request=_manual_request(now)
     s.lp_create_session(sid,sid,state='stop_loss_exit',payload={
@@ -1058,13 +1310,26 @@ def test_reconciliation_attention_notifies_once_then_recovery_once(tmp_path, mon
     e.lp_auto_reconcile_unknown()
     assert len(notifier.calls)==1, 'a continuing episode must not repeat'
 
-    recovery_now=base_now+timedelta(seconds=303)
-    monkeypatch.setattr(venue,'NOW',recovery_now)
     def fresh_read(request):
         snapshot=deepcopy(read(request))
-        snapshot['account']['checked_at']=recovery_now
+        snapshot['account']['checked_at']=venue.NOW
         return snapshot
+
+    recovery_baseline=base_now+timedelta(seconds=302)
+    monkeypatch.setattr(venue,'NOW',recovery_baseline)
     x.lp_snapshot=fresh_read
+    e.lp_auto_reconcile_unknown()
+    thread = lp._attention_thread
+    if thread is not None:
+        thread.join(timeout=2)
+    d=e._auto_pool._read()['intents'][intent_id]
+    assert d['financial_status']=='known'
+    assert d['attention_recovery_due'] is True
+    assert d['attention_recovery_ready_since']==recovery_baseline.isoformat()
+    assert len(notifier.calls)==1
+
+    recovery_now=base_now+timedelta(seconds=362)
+    monkeypatch.setattr(venue,'NOW',recovery_now)
     e.lp_auto_reconcile_unknown()
     thread = lp._attention_thread
     if thread is not None:
@@ -1073,7 +1338,9 @@ def test_reconciliation_attention_notifies_once_then_recovery_once(tmp_path, mon
     assert d['financial_status']=='known'
     assert not d.get('attention_since') and not d.get('attention_notified')
     assert len(notifier.calls)==2
-    assert '恢复' in notifier.calls[1][1]
+    title, message = notifier.calls[1]
+    assert title.startswith('LP 标的资金核对恢复 · ')
+    assert '本次 标的资金核对恢复：1 个市场。' in message
 
 
 def test_reconciliation_attention_send_failure_retries_then_recovers(tmp_path, monkeypatch):
@@ -1124,16 +1391,27 @@ def test_reconciliation_attention_send_failure_retries_then_recovers(tmp_path, m
     e.lp_auto_reconcile_unknown(); wait_for_attention()
     assert len(notifier.calls)==2
 
-    recovery_now=base_now+timedelta(seconds=364)
-    monkeypatch.setattr(venue,'NOW',recovery_now)
     def fresh_read(request):
-        snapshot=deepcopy(read(request)); snapshot['account']['checked_at']=recovery_now
+        snapshot=deepcopy(read(request)); snapshot['account']['checked_at']=venue.NOW
         return snapshot
+
+    recovery_baseline=base_now+timedelta(seconds=364)
+    monkeypatch.setattr(venue,'NOW',recovery_baseline)
     x.lp_snapshot=fresh_read
     e.lp_auto_reconcile_unknown(); wait_for_attention()
     d=e._auto_pool._read()['intents'][intent_id]
+    assert d['financial_status']=='known'
+    assert d['attention_recovery_due'] is True
+    assert d['attention_recovery_ready_since']==recovery_baseline.isoformat()
+    assert len(notifier.calls)==2
+
+    recovery_now=base_now+timedelta(seconds=424)
+    monkeypatch.setattr(venue,'NOW',recovery_now)
+    e.lp_auto_reconcile_unknown(); wait_for_attention()
+    d=e._auto_pool._read()['intents'][intent_id]
     assert d['financial_status']=='known' and not d.get('attention_since')
-    assert len(notifier.calls)==3 and '恢复' in notifier.calls[2][1]
+    assert len(notifier.calls)==3
+    assert notifier.calls[2][0].startswith('LP 标的资金核对恢复 · ')
 
 
 def test_blocked_recovery_callback_cannot_overwrite_new_fault_episode(tmp_path, monkeypatch):
@@ -1164,21 +1442,31 @@ def test_blocked_recovery_callback_cannot_overwrite_new_fault_episode(tmp_path, 
     if thread is not None: thread.join(timeout=2)
     assert len(e._notifier.calls)==1
 
-    recovery_now=base_now+timedelta(seconds=302)
-    monkeypatch.setattr(venue,'NOW',recovery_now)
     def fresh_read(request):
-        snapshot=deepcopy(read(request)); snapshot['account']['checked_at']=recovery_now
+        snapshot=deepcopy(read(request)); snapshot['account']['checked_at']=venue.NOW
         return snapshot
+
+    recovery_baseline=base_now+timedelta(seconds=302)
+    monkeypatch.setattr(venue,'NOW',recovery_baseline)
     x.lp_snapshot=fresh_read
     e.lp_auto_reconcile_unknown()
+    thread=lp._attention_thread
+    if thread is not None: thread.join(timeout=2)
+    assert e._auto_pool._read()['intents'][intent_id]['attention_recovery_ready_since'] == recovery_baseline.isoformat()
+    assert not entered.is_set()
+
+    recovery_now=base_now+timedelta(seconds=362)
+    monkeypatch.setattr(venue,'NOW',recovery_now)
+    e.lp_auto_reconcile_unknown()
     assert entered.wait(2)
-    monkeypatch.setattr(venue,'NOW',base_now+timedelta(seconds=303))
+
+    monkeypatch.setattr(venue,'NOW',base_now+timedelta(seconds=363))
     x.lp_snapshot=fail
     e.lp_auto_reconcile_unknown()
     current=e._auto_pool._read()['intents'][intent_id]
     assert current['financial_status']=='unknown'
     assert not current.get('attention_recovery_due')
-    assert current['attention_since']==(base_now+timedelta(seconds=303)).isoformat()
+    assert current['attention_since']==(base_now+timedelta(seconds=363)).isoformat()
     assert current.get('attention_notified') is False
 
     thread=lp._attention_thread
@@ -1189,18 +1477,19 @@ def test_blocked_recovery_callback_cannot_overwrite_new_fault_episode(tmp_path, 
     assert after.get('attention_since')
     assert not after.get('attention_recovery_due')
 
-    monkeypatch.setattr(venue,'NOW',base_now+timedelta(seconds=604))
+    monkeypatch.setattr(venue,'NOW',base_now+timedelta(seconds=663))
     e.lp_auto_reconcile_unknown()
     thread=lp._attention_thread
     if thread is not None: thread.join(timeout=2)
     final=e._auto_pool._read()['intents'][intent_id]
-    assert [title for title,message in e._notifier.calls] == [
-        'LP 核对持续失败', 'LP 核对已恢复', 'LP 核对持续失败'
-    ]
-    assert final['attention_since']==(base_now+timedelta(seconds=303)).isoformat()
+    titles = [title for title,message in e._notifier.calls]
+    assert titles[0] == 'LP 核对持续失败'
+    assert titles[1].startswith('LP 标的资金核对恢复 · ')
+    assert titles[2] == 'LP 核对持续失败'
+    assert final['attention_since']==(base_now+timedelta(seconds=363)).isoformat()
     assert final['attention_notified'] is True and final['attention_due'] is False
 
-    monkeypatch.setattr(venue,'NOW',base_now+timedelta(seconds=605))
+    monkeypatch.setattr(venue,'NOW',base_now+timedelta(seconds=664))
     e.lp_auto_reconcile_unknown()
     thread=lp._attention_thread
     if thread is not None: thread.join(timeout=2)
@@ -1271,48 +1560,54 @@ def test_partial_fault_recovery_gives_new_fault_its_own_episode(
     assert calls == ["LP 核对持续失败"]
 
     voice.fail = False
-    recovery_now = base_now + timedelta(seconds=301)
-    monkeypatch.setattr(venue, "NOW", recovery_now)
-
     def fresh_read(request):
         snapshot = deepcopy(read(request))
-        snapshot["account"]["checked_at"] = recovery_now
+        snapshot["account"]["checked_at"] = venue.NOW
         return snapshot
 
+    recovery_baseline = base_now + timedelta(seconds=301)
+    monkeypatch.setattr(venue, "NOW", recovery_baseline)
     x.lp_snapshot = fresh_read
+    e.lp_auto_reconcile_unknown()
+    wait_for_calls(1)
+    baseline = e._auto_pool._read()["intents"][intent_id]
+    assert baseline["financial_status"] == "known"
+    assert baseline["attention_recovery_due"] is True
+
+    recovery_now = base_now + timedelta(seconds=361)
+    monkeypatch.setattr(venue, "NOW", recovery_now)
     e.lp_auto_reconcile_unknown()
     wait_for_calls(2)
     recovered = e._auto_pool._read()["intents"][intent_id]
     assert recovered["financial_status"] == "known"
     assert not recovered.get("attention_since")
-    assert calls == ["LP 核对持续失败", "LP 核对已恢复"]
+    assert calls[0] == "LP 核对持续失败"
+    assert calls[1].startswith("LP 标的资金核对恢复 · ")
 
-    monkeypatch.setattr(venue, "NOW", base_now + timedelta(seconds=302))
+    monkeypatch.setattr(venue, "NOW", base_now + timedelta(seconds=363))
     lp.clock = lambda: venue.NOW
     x.lp_snapshot = failed_read
     e.lp_auto_reconcile_unknown()
     renewed = e._auto_pool._read()["intents"][intent_id]
     assert renewed["attention_since"] == (
-        base_now + timedelta(seconds=302)
+        base_now + timedelta(seconds=363)
     ).isoformat()
     assert renewed["attention_notified"] is False
 
-    monkeypatch.setattr(venue, "NOW", base_now + timedelta(seconds=601))
+    monkeypatch.setattr(venue, "NOW", base_now + timedelta(seconds=662))
     e.lp_auto_reconcile_unknown()
-    assert calls == ["LP 核对持续失败", "LP 核对已恢复"]
+    assert calls == ["LP 核对持续失败", calls[1]]
 
-    monkeypatch.setattr(venue, "NOW", base_now + timedelta(seconds=602))
+    monkeypatch.setattr(venue, "NOW", base_now + timedelta(seconds=663))
     e.lp_auto_reconcile_unknown()
     wait_for_calls(4)
     final = e._auto_pool._read()["intents"][intent_id]
-    assert calls == [
-        "LP 核对持续失败",
-        "LP 核对已恢复",
+    assert calls[2:] == [
         "LP 核对持续失败",  # New episode reaches both channels once.
         "LP 核对持续失败",
     ]
     assert final["attention_since"] == (
-        base_now + timedelta(seconds=302)
+        base_now + timedelta(seconds=363)
     ).isoformat()
     assert final["attention_notified"] is True
 
@@ -1328,6 +1623,11 @@ def test_attention_worker_exception_is_restartable(tmp_path, monkeypatch):
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
     e.lp_auto_set_desired_running(True)
     r=e.lp_auto_run_once(); row=r['intents'][0]
+    startup = lp._attention_thread
+    if startup is not None:
+        startup.join(timeout=2)
+        assert not startup.is_alive()
+    assert lp._attention_thread is None
     pool=e._auto_pool
     pool._update(lambda d:d['intents'][row['intent_id']].update(
         attention_since=(NOW-timedelta(seconds=301)).isoformat(),
@@ -1409,12 +1709,24 @@ def test_recovery_during_fault_send_delivers_recovery_to_successful_channels(tmp
         exchange.lp_snapshot = recovered_snapshot
         engine.lp_auto_reconcile_unknown()
         assert engine._auto_pool._read()['intents'][intent_id]['financial_status'] == 'known'
+        assert not any('恢复' in title for _, title in calls)
     finally:
         release.set()
         thread = lp._attention_thread
         if thread is not None:
             thread.join(timeout=3)
+
+    monkeypatch.setattr(venue, 'NOW', base + timedelta(seconds=361))
+    engine.lp_auto_reconcile_unknown()
+    thread = lp._attention_thread
+    if thread is not None:
+        thread.join(timeout=3)
     channels = ['feishu'] if partial else ['feishu', 'xiaoai']
-    assert calls == [(channel, title) for title in ('LP 核对持续失败', 'LP 核对已恢复') for channel in channels]
+    recovery_title = calls[len(channels)][1]
+    assert recovery_title.startswith('LP 标的资金核对恢复 · ')
+    assert calls == (
+        [(channel, 'LP 核对持续失败') for channel in channels]
+        + [(channel, recovery_title) for channel in channels]
+    )
     intent = engine._auto_pool._read()['intents'][intent_id]
     assert not intent.get('attention_due') and not intent.get('attention_recovery_due')

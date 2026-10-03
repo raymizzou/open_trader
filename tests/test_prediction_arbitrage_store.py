@@ -8,10 +8,14 @@ from decimal import Decimal
 from pathlib import Path
 from threading import Barrier
 from zoneinfo import ZoneInfo
+from unittest.mock import patch
+
+from timing_support import run_test_in_subprocess
 
 import pytest
 
 from open_trader.polymarket_lp import PolymarketLPService
+import open_trader.prediction_arbitrage_store as store_module
 from open_trader.prediction_arbitrage_store import (
     LP_RESERVED_MANUAL_SESSION_ID,
     PredictionArbitrageStore,
@@ -24,6 +28,13 @@ from open_trader.prediction_n_leg_execution import (
 
 
 UTC = timezone.utc
+
+
+@pytest.fixture
+def store_clock(monkeypatch):
+    clock = [datetime(2026, 9, 22, 12, tzinfo=UTC)]
+    monkeypatch.setattr("open_trader.prediction_arbitrage_store._utc_now", lambda: iso(clock[0]))
+    return clock
 
 
 def iso(moment: datetime) -> str:
@@ -178,12 +189,13 @@ def create_execution(
     expires_at: str | None = None,
     idempotency_key: str = "request-1",
 ) -> tuple[PredictionArbitrageStore, dict[str, object]]:
-    current = datetime.now(UTC)
+    current = datetime.fromisoformat(store_module._utc_now().replace("Z", "+00:00"))
     db = store(tmp_path)
-    preview_id = db.create_preview(
-        preview_payload(), expires_at=expires_at or iso(current + timedelta(seconds=10))
-    )
-    return db, db.consume_preview_and_create_execution(preview_id, idempotency_key)
+    with patch("open_trader.prediction_arbitrage_store._utc_now", return_value=iso(current)):
+        preview_id = db.create_preview(
+            preview_payload(), expires_at=expires_at or iso(current + timedelta(seconds=10))
+        )
+        return db, db.consume_preview_and_create_execution(preview_id, idempotency_key)
 
 
 def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> None:
@@ -1138,33 +1150,34 @@ def test_observation_notification_is_independent_and_completes_after_close(
     assert db.reserve_notification_attempt(signal_id)["state"] == "closed"
 
 
-def test_preview_expires_after_ten_seconds_and_is_idempotent(tmp_path: Path) -> None:
+def test_preview_expires_after_ten_seconds_and_is_idempotent(tmp_path: Path, store_clock) -> None:
     db = store(tmp_path)
-    now = datetime.now(UTC)
-    preview_id = db.create_preview(
-        preview_payload(), expires_at=iso(now + timedelta(seconds=10))
-    )
+    now = store_clock[0]
+    preview_id = db.create_preview(preview_payload(), expires_at=iso(now + timedelta(seconds=10)))
+    boundary_id = db.create_preview(preview_payload(market_id="market-2"), expires_at=iso(now + timedelta(seconds=10)))
+    store_clock[0] = now + timedelta(seconds=10, microseconds=-1)
     execution = db.consume_preview_and_create_execution(preview_id, "request-1")
     assert execution["preview_id"] == preview_id
     assert db.consume_preview_and_create_execution(preview_id, "request-2") == execution
+    db.transition_execution(execution["execution_id"], state="complete", evidence={})
+    for offset in (timedelta(seconds=10), timedelta(seconds=10, microseconds=1)):
+        store_clock[0] = now + offset
+        with pytest.raises(ValueError, match="expired"):
+            db.consume_preview_and_create_execution(boundary_id, "request-expired")
 
-    expired_id = db.create_preview(preview_payload(market_id="market-2"), expires_at=iso(now - timedelta(microseconds=1)))
-    with pytest.raises(ValueError, match="expired"):
-        db.consume_preview_and_create_execution(expired_id, "request-3")
 
-
-def test_duplicate_idempotency_key_returns_existing_execution(tmp_path: Path) -> None:
+def test_duplicate_idempotency_key_returns_existing_execution(tmp_path: Path, store_clock) -> None:
     db = store(tmp_path)
-    now = datetime.now(UTC)
+    now = store_clock[0]
     preview_id = db.create_preview(preview_payload(), expires_at=iso(now + timedelta(seconds=10)))
     first = db.consume_preview_and_create_execution(preview_id, "same-request")
     second = db.consume_preview_and_create_execution("not-used", "same-request")
     assert second == first
 
 
-def test_only_one_nonterminal_execution_is_allowed(tmp_path: Path) -> None:
+def test_only_one_nonterminal_execution_is_allowed(tmp_path: Path, store_clock) -> None:
     db = store(tmp_path)
-    now = datetime.now(UTC)
+    now = store_clock[0]
     first_preview = db.create_preview(preview_payload(), expires_at=iso(now + timedelta(seconds=10)))
     db.consume_preview_and_create_execution(first_preview, "request-1")
     second_preview = db.create_preview(preview_payload(market_id="market-2"), expires_at=iso(now + timedelta(seconds=10)))
@@ -1178,10 +1191,10 @@ def test_only_one_nonterminal_execution_is_allowed(tmp_path: Path) -> None:
     assert db.consume_preview_and_create_execution(second_preview, "request-2")["state"] == "validating"
 
 
-def test_concurrent_instances_consume_preview_once(tmp_path: Path) -> None:
+def test_concurrent_instances_consume_preview_once(tmp_path: Path, store_clock) -> None:
     setup = store(tmp_path)
     preview_id = setup.create_preview(
-        preview_payload(), expires_at=iso(datetime.now(UTC) + timedelta(seconds=10))
+        preview_payload(), expires_at=iso(store_clock[0] + timedelta(seconds=10))
     )
     stores = [PredictionArbitrageStore(tmp_path / "data"), PredictionArbitrageStore(tmp_path / "data")]
 
@@ -1937,10 +1950,10 @@ def test_cross_release_sweep_requires_the_persisted_post_fill_baseline(
     assert db.cross_unsettled_principal() == Decimal("10.50")
 
 
-def test_legacy_preview_execution_payload_has_no_cross_reservation(tmp_path: Path) -> None:
+def test_legacy_preview_execution_payload_has_no_cross_reservation(tmp_path: Path, store_clock) -> None:
     db = store(tmp_path)
     preview_id = db.create_preview(
-        preview_payload(), expires_at=iso(datetime.now(UTC) + timedelta(seconds=10))
+        preview_payload(), expires_at=iso(store_clock[0] + timedelta(seconds=10))
     )
 
     execution = db.consume_preview_and_create_execution(preview_id, "legacy-request")
@@ -2362,15 +2375,16 @@ def test_llm_usage_prune_keeps_recent_calls_only(
     assert db2.llm_usage_24h()["cache_hits"] == 0
 
 
-def test_histories_are_newest_first_for_all_kinds(tmp_path: Path) -> None:
+def test_histories_are_newest_first_for_all_kinds(tmp_path: Path, store_clock) -> None:
     db = store(tmp_path)
-    now = datetime.now(UTC)
+    now = store_clock[0]
     db.upsert_signal(signal_payload("market-1", iso(now - timedelta(minutes=2))))
     db.upsert_signal(signal_payload("market-2", iso(now - timedelta(minutes=1))))
     assert db.histories("signals")[0]["market_id"] == "market-2"
     db2, execution = create_execution(tmp_path, idempotency_key="history-request")
     db2.transition_execution(execution["execution_id"], state="complete", evidence={"step": "done"})
     incident_1 = db2.open_incident(execution["execution_id"], {"kind": "merge"})
+    store_clock[0] += timedelta(microseconds=1)
     incident_2 = db2.open_incident(execution["execution_id"], {"kind": "restart"})
     assert db2.histories("executions")[0]["execution_id"] == execution["execution_id"]
     assert db2.histories("incidents")[0]["incident_id"] == incident_2
@@ -2792,7 +2806,9 @@ def _admission_batch_payload() -> dict[str, object]:
     }
 
 
-def test_lp_and_n_leg_admission_share_one_active_slot(tmp_path: Path) -> None:
+def test_lp_and_n_leg_admission_share_one_active_slot(tmp_path: Path, request) -> None:
+    if run_test_in_subprocess(request):
+        return
     lp_payload = {"market_id": "market-a", "outcome": "YES"}
     n_leg_payload = _admission_batch_payload()
 
@@ -2835,7 +2851,7 @@ def test_lp_and_n_leg_admission_share_one_active_slot(tmp_path: Path) -> None:
     barrier = Barrier(2)
 
     def admit_lp() -> str:
-        barrier.wait()
+        barrier.wait(timeout=5)
         try:
             lp_store.lp_create_session(
                 "lp-concurrent",
@@ -2848,7 +2864,7 @@ def test_lp_and_n_leg_admission_share_one_active_slot(tmp_path: Path) -> None:
             return str(exc)
 
     def admit_n_leg() -> str:
-        barrier.wait()
+        barrier.wait(timeout=5)
         try:
             n_leg_store.n_leg_create_batch(
                 {
@@ -3546,14 +3562,22 @@ def test_lp_active_sessions_lists_non_terminal_newest_first(tmp_path: Path) -> N
     assert db.lp_active_session() is None
 
 
-def test_lp_create_session_allows_one_group_per_market(tmp_path: Path) -> None:
-    """Issue 166: 唯一性从「全局最多一行活动组」改为「同 (condition_id, outcome)
-    最多一组」——不同标的的两个活动组并存；同标的+方向的第二个活动组拒绝
-    lp_session_market_active；同幂等键重放返回原行不视为冲突；终态行不占槽。"""
+@pytest.mark.parametrize("proof", ["{}", '{"closed_checked":false}', '{"closed_checked":1}', '{"closed_checked":"true"}', "bad-json"])
+def test_unproven_negative_metadata_cache_is_not_loaded(tmp_path: Path, proof: str) -> None:
+    db = store(tmp_path)
+    expiry = (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp()
+    db.lp_metadata_cache_store_entries({"missing": (expiry, None)})
+    with sqlite3.connect(db.path) as connection:
+        connection.execute("UPDATE lp_market_metadata_cache SET payload=? WHERE condition_id='missing'", (proof,))
+    assert db.lp_metadata_cache_entries() == {}
+
+
+def test_lp_create_session_allows_one_group_per_account_token(tmp_path: Path) -> None:
+    """Canonical account/token is unique; other accounts/tokens and terminal rows coexist."""
 
     db = store(tmp_path)
-    market_a = {"condition_id": "0xa", "outcome": "YES"}
-    market_b = {"condition_id": "0xb", "outcome": "YES"}
+    market_a = {"account_id": " Account-A ", "token_id": "token-a", "condition_id": "0xa", "outcome": "YES"}
+    market_b = {**market_a, "token_id": "token-b"}
 
     created_a = db.lp_create_session(
         "lp-a", "lp-key-a", state="entry_open", payload=market_a
@@ -3561,8 +3585,7 @@ def test_lp_create_session_allows_one_group_per_market(tmp_path: Path) -> None:
     created_b = db.lp_create_session(
         "lp-b", "lp-key-b", state="entry_open", payload=market_b
     )
-    # 不同标的的两个活动组并存（ Newest first: A 晚于 B 创建则 A 在前；
-    # 这里 A 先建，顺序为 [B, A]——只断言集合不弱化并存事实）。
+    # Different tokens coexist even with the same condition/outcome.
     assert {row["session_id"] for row in db.lp_active_sessions()} == {
         "lp-a",
         "lp-b",
@@ -3570,10 +3593,11 @@ def test_lp_create_session_allows_one_group_per_market(tmp_path: Path) -> None:
     assert created_a["session_id"] == "lp-a"
     assert created_b["session_id"] == "lp-b"
 
-    # 同标的+方向、不同幂等键 → 拒绝理由映射 lp_session_market_active。
+    # Whitespace/case variants cannot evade canonical identity uniqueness.
     with pytest.raises(ValueError, match="lp_session_market_active"):
         db.lp_create_session(
-            "lp-c", "lp-key-c", state="entry_open", payload=market_a
+            "lp-c", "lp-key-c", state="entry_open",
+            payload={**market_a, "account_id": "account-a", "token_id": " token-a ", "condition_id": "0xc"},
         )
 
     # 同幂等键重放 → 返回原行，不视为冲突。
@@ -3584,9 +3608,9 @@ def test_lp_create_session_allows_one_group_per_market(tmp_path: Path) -> None:
         == created_a
     )
 
-    # 同标的、不同方向 → 并存。
+    # An explicitly different account has its own token group.
     db.lp_create_session(
-        "lp-d", "lp-key-d", state="entry_open", payload={"condition_id": "0xa", "outcome": "NO"}
+        "lp-d", "lp-key-d", state="entry_open", payload={**market_a, "account_id": "account-b"}
     )
     assert {row["session_id"] for row in db.lp_active_sessions()} == {
         "lp-a",
@@ -3606,12 +3630,40 @@ def test_lp_create_session_allows_one_group_per_market(tmp_path: Path) -> None:
     }
 
 
+def test_lp_account_token_migration_rejects_duplicates_without_dropping_old_index(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    database = data_dir / "prediction_arbitrage/prediction_arbitrage.sqlite3"
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as connection:
+        connection.executescript("""
+            CREATE TABLE lp_sessions (
+                session_id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL, payload TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX one_active_lp_session_market
+            ON lp_sessions(json_extract(payload,'$.condition_id'), json_extract(payload,'$.outcome'))
+            WHERE state NOT IN ('complete', 'entry_rejected');
+        """)
+        for session_id, account, token in (("legacy-a", " ACCOUNT-A ", "token-a"), ("legacy-b", "account-a", " token-a ")):
+            connection.execute("INSERT INTO lp_sessions VALUES (?,?,?,?,?,?)", (
+                session_id, session_id, "needs_attention",
+                json.dumps({"condition_id": session_id, "outcome": "YES", "account_id": account,
+                            "token_id": token, "submit_status": "unknown"}),
+                "2026-10-01T00:00:00Z", "2026-10-01T00:00:00Z",
+            ))
+        before = connection.execute("SELECT * FROM lp_sessions ORDER BY session_id").fetchall()
+    with pytest.raises(sqlite3.IntegrityError, match="one_active_lp_session_account_token"):
+        PredictionArbitrageStore(data_dir)
+    with sqlite3.connect(database) as connection:
+        indexes = {row[1] for row in connection.execute("PRAGMA index_list('lp_sessions')")}
+        assert "one_active_lp_session_market" in indexes
+        assert "one_active_lp_session_account_token" not in indexes
+        assert connection.execute("SELECT * FROM lp_sessions ORDER BY session_id").fetchall() == before
+
+
 def test_legacy_lp_sessions_db_migrates_old_unique_index(tmp_path: Path) -> None:
-    """Issue 166 R3: 存量库迁移——含旧索引 one_active_lp_session 与一行活动
-    会话的库文件用新代码打开后：旧索引被 DROP、one_active_lp_session_market
-    存在、原行仍为活动；同 (condition_id, outcome) 第二组仍拒
-    lp_session_market_active；不同标的第二组可建（旧全局唯一索引若未迁移
-    则此处必然失败）。"""
+    """Startup replaces the legacy index without rewriting legacy identity or state."""
 
     data_dir = tmp_path / "data"
     database_dir = data_dir / "prediction_arbitrage"
@@ -3632,7 +3684,7 @@ def test_legacy_lp_sessions_db_migrates_old_unique_index(tmp_path: Path) -> None
         WHERE state NOT IN ('complete', 'entry_rejected');
         INSERT INTO lp_sessions VALUES (
             'lp-legacy', 'lp-key-legacy', 'entry_open',
-            '{"condition_id": "0xa", "outcome": "YES"}',
+            '{"condition_id": "0xa", "outcome": "YES", "token_id": "token-a"}',
             '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z'
         );
         """
@@ -3647,22 +3699,23 @@ def test_legacy_lp_sessions_db_migrates_old_unique_index(tmp_path: Path) -> None
             for row in check.execute("PRAGMA index_list('lp_sessions')")
         }
     assert "one_active_lp_session" not in indexes
-    assert "one_active_lp_session_market" in indexes
+    assert "one_active_lp_session_market" not in indexes
+    assert "one_active_lp_session_account_token" in indexes
 
     active = {row["session_id"] for row in db.lp_active_sessions()}
     assert active == {"lp-legacy"}
 
-    # 同 (condition_id, outcome) 第二组仍拒 lp_session_market_active。
+    # The empty-account legacy namespace remains unique for its token.
     with pytest.raises(ValueError, match="lp_session_market_active"):
         db.lp_create_session(
             "lp-same", "lp-key-same", state="entry_open",
-            payload={"condition_id": "0xa", "outcome": "YES"},
+            payload={"account_id": " ", "condition_id": "0xb", "outcome": "NO", "token_id": " token-a "},
         )
 
-    # 不同标的第二组可建——旧全局唯一索引若未迁移此处必然失败。
+    # A canonical account can register the same token independently.
     db.lp_create_session(
         "lp-other", "lp-key-other", state="entry_open",
-        payload={"condition_id": "0xb", "outcome": "YES"},
+        payload={"account_id": "account-a", "condition_id": "0xa", "outcome": "YES", "token_id": "token-a"},
     )
     assert {row["session_id"] for row in db.lp_active_sessions()} == {
         "lp-legacy",
@@ -3962,3 +4015,10 @@ def test_lp_register_fenced_actions_is_atomic(tmp_path: Path) -> None:
     assert db.lp_trade_generation() == 1
     _, revision = db.lp_session_with_revision(session_id, trading=True)
     assert revision == 1
+
+
+def test_incident_history_equal_timestamps_uses_descending_id(tmp_path: Path, store_clock):
+    db, execution = create_execution(tmp_path)
+    first = db.open_incident(execution["execution_id"], {"kind": "first"})
+    second = db.open_incident(execution["execution_id"], {"kind": "second"})
+    assert [row["incident_id"] for row in db.histories("incidents")] == sorted((first, second), reverse=True)

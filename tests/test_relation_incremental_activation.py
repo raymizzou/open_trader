@@ -17,6 +17,7 @@ import threading
 import time
 
 import pytest
+from timing_support import run_test_in_subprocess
 
 from open_trader.prediction_monitor_selection import relation_generation_problem
 from open_trader.relation_catalog import RelationCatalog
@@ -915,7 +916,7 @@ def test_r21_naive_or_unparseable_dates_block_inconsistent_and_preserve_batch(
     ]
 
 
-def test_r22_concurrent_approves_keep_guards_and_indexes_consistent(tmp_path) -> None:
+def test_r22_concurrent_approves_keep_guards_and_indexes_consistent(tmp_path, request) -> None:
     """R2.2: two threads approving independent relation sets concurrently
     (barrier start, 200 relations each, stale / marginal-stale / valuation-unit
     conflict shapes mixed in, reviewer-probe widening of the shared index
@@ -926,6 +927,8 @@ def test_r22_concurrent_approves_keep_guards_and_indexes_consistent(tmp_path) ->
     deterministically false on the unlocked code and deterministically true
     under the catalog-level index lock.
     """
+    if run_test_in_subprocess(request, timeout=120):
+        return
     catalog = RelationCatalog(str(tmp_path / "concurrent"))
 
     def relation(tag: str, index: int, kind: str) -> dict[str, object]:

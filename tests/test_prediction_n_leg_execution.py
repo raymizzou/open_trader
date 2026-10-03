@@ -7,6 +7,8 @@ from decimal import Decimal
 
 import pytest
 
+from timing_support import run_test_in_subprocess
+
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 from open_trader.prediction_executable_cost import ExecutionLegEvidence, ExecutionSolution
 from open_trader.prediction_n_leg import ActionQuantity, fingerprint
@@ -831,11 +833,20 @@ def test_partial_fill_gate_uses_proven_upper_loss_bound_not_principal(tmp_path) 
         )
 
 
-def test_concurrent_different_leg_receipts_do_not_lose_a_transition(tmp_path) -> None:
+def test_concurrent_different_leg_receipts_do_not_lose_a_transition(tmp_path, request) -> None:
+    if run_test_in_subprocess(request):
+        return
     current = service(tmp_path)
     enter(current)
+    from threading import Barrier
+    barrier = Barrier(2)
+
+    def apply(value):
+        barrier.wait(timeout=5)
+        return current.apply_receipt(value)
+
     with ThreadPoolExecutor(max_workers=2) as pool:
-        results = tuple(pool.map(current.apply_receipt, (
+        results = tuple(pool.map(apply, (
             receipt(leg="a", filled=10, state="FILLED", sequence=1),
             receipt(leg="b", filled=10, state="FILLED", sequence=1),
         )))
@@ -973,8 +984,10 @@ def test_d3_active_batch_and_lineage_lock_reject_admission(tmp_path) -> None:
 
 
 def test_d4_concurrent_admissions_exactly_one_wins_version_bumps_once(
-    tmp_path,
+    tmp_path, request,
 ) -> None:
+    if run_test_in_subprocess(request):
+        return
     import sqlite3
     import threading
 
@@ -983,21 +996,30 @@ def test_d4_concurrent_admissions_exactly_one_wins_version_bumps_once(
     barrier = threading.Barrier(2)
     outcomes: dict[str, str] = {}
 
+    errors: list[BaseException] = []
+
     def attempt(name: str) -> None:
-        barrier.wait()
         try:
+            barrier.wait(timeout=5)
             store.n_leg_create_batch(_minimal_batch_payload(name))
             outcomes[name] = "ok"
         except ValueError as exc:
             outcomes[name] = str(exc)
+        except BaseException as exc:
+            errors.append(exc)
 
     threads = [
         threading.Thread(target=attempt, args=(name,)) for name in ("a", "b")
     ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+        assert all(not thread.is_alive() for thread in threads), "contender did not finish"
+        assert not errors, errors
+    finally:
+        barrier.abort()
 
     assert sorted(outcomes.values()) == sorted(["ok", "N_LEG_ACTIVE_BATCH_EXISTS"]) or sorted(
         outcomes.values()

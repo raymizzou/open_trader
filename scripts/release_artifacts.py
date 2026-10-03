@@ -3,7 +3,7 @@
 import argparse
 from datetime import datetime, timedelta, timezone
 import hashlib
-import io
+import importlib.util
 import json
 import os
 import platform
@@ -15,7 +15,12 @@ import sys
 import tempfile
 import zipfile
 
-JOBS = ('gateway', 'legacy', 'account', 'prediction', 'trend_curve')
+JOBS = ('gateway', 'legacy', 'account', 'prediction', 'portable')
+REPOSITORY = 'raymizzou/open_trader'
+# Load only the trusted tooling sibling, never code from a recovered source bundle.
+_spec = importlib.util.spec_from_file_location('release_preflight_validation', Path(__file__).with_name('deployment_preflight.py'))
+preflight = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(preflight)
 SCHEMA = 'open_trader.source_release.v1'
 VERSION = r'v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-rc\.[1-9][0-9]*)?'
 HEX = r'[0-9a-f]{40}'
@@ -61,28 +66,41 @@ def validate_compatibility(value):
     return value
 
 
-def validate_ci(runs, checks, jobs, sha, now):
+def validate_ci(runs, checks, jobs, sha, now, repository=REPOSITORY):
     candidates = [r for r in runs if r.get('head_sha') == sha and r.get('event') == 'push'
                   and r.get('head_branch') == 'main' and r.get('path') == '.github/workflows/ci.yml']
     if not candidates:
         raise ValueError('No exact-SHA ci.yml push/main run')
     run = max(candidates, key=lambda r:(r['id'], r['run_attempt']))
-    stamp = datetime.fromisoformat(run['updated_at'].replace('Z','+00:00'))
+    stamp = preflight.timestamp(run['updated_at'])
     if (run.get('status') != 'completed' or run.get('conclusion') != 'success'
             or stamp > now or now-stamp >= timedelta(days=3)):
         raise ValueError('Latest main CI is unsuccessful, pending, or older than evidence retention')
-    required = [c for c in checks if c.get('name') == 'required' and c.get('app',{}).get('id') == 15368
-                and c.get('check_suite',{}).get('id') == run['check_suite_id']
-                and c.get('head_sha') == sha]
-    if len(required) != 1 or required[0].get('status') != 'completed' or required[0].get('conclusion') != 'success':
-        raise ValueError('Missing trustworthy exact-SHA required check')
-    names = [j.get('name') for j in jobs]
-    if sorted(names) != sorted(('plan','required',*JOBS)):
-        raise ValueError('Unexpected or missing CI jobs')
-    if any(j.get('conclusion') != 'success' for j in jobs if j['name'] in ('plan','required')):
-        raise ValueError('Planner or aggregate did not succeed')
-    if any(j.get('conclusion') not in ('success','skipped') for j in jobs):
-        raise ValueError('CI service job not successful/skipped')
+    if (repository != REPOSITORY or run.get('repository', {}).get('full_name') != repository
+            or run.get('head_repository', {}).get('full_name') != repository
+            or type(run.get('run_attempt')) is not int or run['run_attempt'] < 1):
+        raise ValueError('CI repository or attempt mismatch')
+    selected = {}
+    for name in ('plan', *JOBS, 'required'):
+        matches = [j for j in jobs if j.get('name') == name]
+        if len(matches) != 1:
+            raise ValueError('Missing or duplicate CI job: '+name)
+        job = matches[0]
+        if (job.get('run_id') != run['id'] or job.get('head_sha') != sha
+                or job.get('status') != 'completed' or job.get('conclusion') != 'success'):
+            raise ValueError('CI job not successful for selected run/SHA: '+name)
+        selected[name] = job
+    # The retained standalone trend job is redundant with legacy and may be skipped.
+    if any(j.get('name') not in (*selected, 'trend_curve') for j in jobs):
+        raise ValueError('Unexpected CI job')
+    required = [c for c in checks if c.get('name') == 'required']
+    if len(required) != 1:
+        raise ValueError('Missing or duplicate required check')
+    check = required[0]
+    if (check.get('app', {}).get('id') != 15368 or check.get('check_suite', {}).get('id') != run['check_suite_id']
+            or check.get('head_sha') != sha or check.get('status') != 'completed' or check.get('conclusion') != 'success'
+            or selected['required'].get('check_run_url') != f'https://api.github.com/repos/{repository}/check-runs/{check["id"]}'):
+        raise ValueError('Missing trustworthy exact-SHA required check/job linkage')
     return run
 
 
@@ -112,65 +130,100 @@ class GitHub:
         raise ValueError('Pagination limit exceeded; refusing incomplete evidence')
 
 
-def trusted_evidence(api, sha, repo, output, now=None):
-    now=now or datetime.now(timezone.utc)
-    runs=api.pages(f'actions/workflows/ci.yml/runs?head_sha={sha}&event=push','workflow_runs')
-    candidates=[r for r in runs if r.get('head_sha')==sha and r.get('event')=='push'
-                and r.get('head_branch')=='main' and r.get('path')=='.github/workflows/ci.yml']
-    if not candidates:raise ValueError('No exact-SHA main workflow')
-    latest=max(candidates,key=lambda r:(r['id'],r['run_attempt']))
-    # Fetch the latest attempt explicitly, never stale successful jobs from a prior attempt.
-    run=api.get(f'actions/runs/{latest["id"]}')
-    jobs=api.pages(f'actions/runs/{run["id"]}/attempts/{run["run_attempt"]}/jobs','jobs')
-    checks=api.pages(f'check-suites/{run["check_suite_id"]}/check-runs?filter=latest','check_runs')
-    run=validate_ci([run],checks,jobs,sha,now)
-    artifacts=api.pages(f'actions/runs/{run["id"]}/artifacts','artifacts')
-    scopes=[j['name'].replace('_','-') for j in jobs if j['name'] in JOBS and j['conclusion']=='success']
-    lock_hash=sha256(repo/'uv.lock')
-    evidence=[]
-    for scope in sorted(scopes):
-        name=f'ci-{scope}-{sha}'
-        matches=[a for a in artifacts if a['name']==name]
-        if len(matches)!=1:raise ValueError('Missing or ambiguous CI evidence: '+name)
-        artifact=matches[0]
-        expires=datetime.fromisoformat(artifact['expires_at'].replace('Z','+00:00'))
-        if artifact.get('expired') or expires<=now:raise ValueError('Expired CI evidence')
-        data=api.raw(f'actions/artifacts/{artifact["id"]}/zip')
-        validate_evidence_zip(data, sha, scope, lock_hash)
-        filename=name+'.zip'; (output/filename).write_bytes(data)
-        evidence.append({'name':filename,'artifact_id':artifact['id'],'scope':scope,'sha256':hashlib.sha256(data).hexdigest()})
-    # Fail closed if a rerun started while downloading artifacts.
-    final=api.get(f'actions/runs/{run["id"]}')
-    if any(final.get(k)!=run.get(k) for k in ('id','run_attempt','status','conclusion','updated_at')):
+def validation_context(repo):
+    """Source selection execution is confined to the read-only build job."""
+    return {'selections': {scope: preflight.expected_selection(scope, repo) for scope in JOBS},
+            'base_images': re.findall(r'^FROM (\S+)', (repo/'Dockerfile.dev').read_text(), re.MULTILINE)}
+
+
+def trusted_evidence(api, sha, repo, output, now=None, *, context=None):
+    now = now or datetime.now(timezone.utc)
+    if api.repository != REPOSITORY:
+        raise ValueError('Unexpected evidence repository')
+    # The writer MUST supply authenticated precomputed data. Only build resolves it.
+    if context is None:
+        context = validation_context(repo)
+    workflow = api.get('actions/workflows/ci.yml')
+    if workflow.get('path') != '.github/workflows/ci.yml' or workflow.get('state') != 'active':
+        raise ValueError('Trusted CI workflow unavailable')
+    runs_path = f'actions/workflows/ci.yml/runs?head_sha={sha}&event=push'
+    runs = api.pages(runs_path, 'workflow_runs')
+    candidates = [r for r in runs if r.get('head_sha') == sha and r.get('event') == 'push'
+                  and r.get('head_branch') == 'main' and r.get('path') == '.github/workflows/ci.yml']
+    if not candidates:
+        raise ValueError('No exact-SHA main workflow')
+    latest = max(candidates, key=lambda r:(r['id'], r['run_attempt']))
+    run = api.get(f'actions/runs/{latest["id"]}')
+    if run.get('workflow_id') != workflow['id']:
+        raise ValueError('CI workflow ID mismatch')
+    if (run['id'], run['run_attempt']) != (latest['id'], latest['run_attempt']):
+        raise ValueError('CI attempt changed before collection')
+    jobs = api.pages(f'actions/runs/{run["id"]}/attempts/{run["run_attempt"]}/jobs', 'jobs')
+    checks = api.pages(f'check-suites/{run["check_suite_id"]}/check-runs?filter=latest', 'check_runs')
+    validate_ci([run], checks, jobs, sha, now, api.repository)
+    artifacts = api.pages(f'actions/runs/{run["id"]}/artifacts', 'artifacts')
+    lock_hash = sha256(repo/'uv.lock')
+    evidence = []
+    for scope in sorted(JOBS):
+        name = f'ci-{scope}-{sha}-{run["id"]}-{run["run_attempt"]}'
+        matches = [a for a in artifacts if a['name'] == name]
+        if len(matches) != 1:
+            raise ValueError('Missing or ambiguous current-attempt CI evidence: '+name)
+        artifact = matches[0]
+        created, expires = preflight.timestamp(artifact['created_at']), preflight.timestamp(artifact['expires_at'])
+        if (artifact.get('expired') is not False or not created <= now < expires
+                or not timedelta(0) < expires-created <= timedelta(days=3)):
+            raise ValueError('Expired or invalid CI evidence retention')
+        lineage = artifact['workflow_run']
+        if lineage['id'] != run['id'] or lineage['head_sha'] != sha or lineage['head_branch'] != 'main':
+            raise ValueError('Artifact run/source mismatch')
+        data = api.raw(f'actions/artifacts/{artifact["id"]}/zip')
+        digest = hashlib.sha256(data).hexdigest()
+        if artifact.get('digest') != 'sha256:'+digest:
+            raise ValueError('Artifact digest mismatch or missing')
+        validate_evidence_zip(data, sha, scope, lock_hash, context, run)
+        filename = name+'.zip'
+        (output/filename).write_bytes(data)
+        evidence.append({'name':filename, 'artifact_id':artifact['id'], 'scope':scope,
+                         'sha256':digest, 'digest':artifact['digest']})
+    if api.get(f'actions/runs/{run["id"]}') != run:
         raise ValueError('CI changed while collecting evidence')
-    new_runs=api.pages(f'actions/workflows/ci.yml/runs?head_sha={sha}&event=push','workflow_runs')
-    selected=validate_ci(new_runs,checks,jobs,sha,now)
-    if (selected['id'],selected['run_attempt'])!=(run['id'],run['run_attempt']):raise ValueError('New CI run superseded evidence')
-    return {'run_id':run['id'],'run_attempt':run['run_attempt'],'workflow_path':run['path'],
-            'event':'push','branch':'main','source_sha':sha,'check_suite_id':run['check_suite_id'],
-            'required_app_id':15368,'completed_at':run['updated_at'],
+    selected = validate_ci(api.pages(runs_path, 'workflow_runs'), checks, jobs, sha, now, api.repository)
+    if (selected['id'], selected['run_attempt']) != (run['id'], run['run_attempt']):
+        raise ValueError('New CI run superseded evidence')
+    return {'run_id':run['id'], 'run_attempt':run['run_attempt'], 'workflow_path':run['path'],
+            'event':'push', 'branch':'main', 'source_sha':sha, 'check_suite_id':run['check_suite_id'],
+            'required_app_id':15368, 'completed_at':run['updated_at'],
+            'workflow_id':workflow['id'],
+            'required_check_id':next(c['id'] for c in checks if c['name'] == 'required'),
+            'required_job_id':next(j['id'] for j in jobs if j['name'] == 'required'),
             'url':f'https://github.com/{api.repository}/actions/runs/{run["id"]}',
-            'tested_scopes':sorted(scopes),'documentation_only':not scopes,'artifacts':evidence}
+            'tested_scopes':sorted(JOBS), 'validation_context':context, 'artifacts':evidence}
 
 
-def validate_evidence_zip(data, sha, scope, lock_hash):
-    with zipfile.ZipFile(io.BytesIO(data)) as archive:
-        names=archive.namelist()
-        required={'identity.txt','lock-sha256.txt','result.txt','dependency-manifest.json','image.json','test.log'}
-        if len(names)!=len(set(names)) or set(names)!=required:raise ValueError('Unexpected evidence archive contents')
-        if any(i.file_size>100_000_000 for i in archive.infolist()):raise ValueError('Evidence member too large')
-        identity=archive.read('identity.txt').decode()
-        if identity not in (f'source_sha={sha}\nscope={scope}\nTEST_N_LEG=0\n',f'source_sha={sha}\nscope={scope}\nTEST_N_LEG=1\n'):
-            raise ValueError('Evidence identity mismatch')
-        if archive.read('result.txt').decode()!=f'scope={scope} source_sha={sha} exit_status=0\n':
-            raise ValueError('Evidence does not prove successful test exit')
-        if archive.read('lock-sha256.txt').decode()!=f'{lock_hash}  uv.lock\n':raise ValueError('Evidence lock mismatch')
-        # Preserve the actual dependency manifest and test/image logs, not merely the aggregate label.
-        dependencies=json.loads(archive.read('dependency-manifest.json'))
-        if (not isinstance(dependencies,dict) or dependencies.get('source_sha')!=sha
-                or dependencies.get('source_state')!='clean' or dependencies.get('lock_sha256')!=lock_hash):
-            raise ValueError('Dependency manifest identity mismatch')
-        if not json.loads(archive.read('image.json')) or not archive.read('test.log'):raise ValueError('Missing build/test evidence')
+def validate_evidence_zip(data, sha, scope, lock_hash, context, run):
+    """Validate bytes only. Never import or execute bundled source or its Makefile."""
+    if scope not in JOBS or set(context['selections']) != set(JOBS):
+        raise ValueError('Incomplete CI scope/selection context')
+    files = preflight.read_archive(data)
+    required = {'identity.txt','lock-sha256.txt','result.txt','dependency-manifest.json',
+                'image.json','test.log','evidence.json'}
+    if scope == 'portable':
+        required |= {'partition.json','partition.log'}
+    if set(files) != required:
+        raise ValueError('Unexpected evidence archive contents')
+    if files['identity.txt'].decode() != f'source_sha={sha}\nscope={scope}\nTEST_N_LEG=1\n':
+        raise ValueError('Evidence identity mismatch')
+    if files['result.txt'].decode() != f'scope={scope} source_sha={sha} exit_status=0\n':
+        raise ValueError('Evidence does not prove successful test exit')
+    if files['lock-sha256.txt'].decode() != f'{lock_hash}  uv.lock\n':
+        raise ValueError('Evidence lock mismatch')
+    if not files['test.log']:
+        raise ValueError('Missing test log')
+    # partition.log is stderr and is normally empty on successful collection.
+    if run['head_sha'] != sha:
+        raise ValueError('Evidence run SHA mismatch')
+    preflight.validate_archive(data, scope, run, lock_hash, context['selections'][scope], context['base_images'])
 
 
 def validate_platform():
@@ -214,7 +267,7 @@ def validate_runtime(bundle, sha, output):
         return {'source_sha':sha,'clean':True,'git_identity_verified':True,'prediction_identity_verified':True,
                 'imported_code_root':'<restored>/src','code_root_verified':code_root==str(restored/'src'),
                 'python':platform.python_version(),'uv':'0.12.19','dependencies':dependencies,
-                'scope':'locked dependency installation and source identity; not Candidate Acceptance',
+                'scope':'locked dependency installation and source identity; not Deployment Preflight',
                 'excluded':['deployment','browser','production data','real trading']}
 
 
@@ -298,7 +351,7 @@ def build(repo, tag, output, api):
         'uv sync --python "$PYTHON_BIN" --locked --offline --no-default-groups --group build --extra dev --extra cloud-ssm --no-build-isolation\n'
         'Installation requires access to the locked registries; dependencies are not bundled.\n'
         'Run scripts/verify_release_artifacts.py from a trusted reviewed checkout first.\n'
-        'Artifact verification is not Candidate Acceptance, host readiness, production smoke or deployment approval.\n')
+        'Artifact verification is not Deployment Preflight, host readiness, production smoke or deployment approval.\n')
     write_json(output/'ci-evidence.json',evidence)
     manifest={'schema_version':SCHEMA,**identity,'repository':api.repository,'lock_sha256':sha256(output/'uv.lock'),
               'format':'git-bundle-with-full-target-history','platform':{'os':'linux','architecture':'x86_64','runner':'ubuntu-24.04'},
@@ -324,15 +377,27 @@ def asset_plan(existing, hashes, read_asset):
     return sorted(set(hashes)-seen)
 
 
-def upload_draft(directory, api):
-    # Called only by the separately permissioned workflow job after read-only verification.
+def upload_draft(directory, api, *, expected_manifest_sha256=None, expected_tag=None, expected_sha=None):
+    # Authenticated job output binds precomputed data before parsing/restoring artifacts.
+    if (not expected_manifest_sha256 or not re.fullmatch(r'[0-9a-f]{64}', expected_manifest_sha256)
+            or sha256(directory/'release-manifest.json') != expected_manifest_sha256):
+        raise ValueError('Writer requires trusted build manifest digest')
+    validate_tag(expected_tag)
+    if not expected_sha or not re.fullmatch(HEX, expected_sha):
+        raise ValueError('Writer requires independently resolved source SHA')
+    selected = json.loads((directory/'release-manifest.json').read_text())
+    if not isinstance(selected, dict) or selected.get('tag') != expected_tag or selected.get('source_sha') != expected_sha:
+        raise ValueError('Build manifest differs from requested tag/source SHA')
     from verify_release_artifacts import verify
     with tempfile.TemporaryDirectory() as tmp:manifest=verify(directory,Path(tmp)/'restored',execute_code=False)
     if manifest['repository']!=api.repository:raise ValueError('Artifact repository mismatch')
     remote_tag_matches(api,manifest)
+    context = manifest['ci'].get('validation_context')
+    if not isinstance(context, dict) or set(context.get('selections', {})) != set(JOBS):
+        raise ValueError('Writer requires authenticated precomputed CI context')
     # A later failed/running CI attempt invalidates an earlier build before any writes.
     with tempfile.TemporaryDirectory() as tmp:
-        current=trusted_evidence(api,manifest['source_sha'],directory,Path(tmp))
+        current=trusted_evidence(api,manifest['source_sha'],directory,Path(tmp), context=context)
     if current!=manifest['ci']:raise ValueError('CI evidence changed before upload')
     tag=manifest['tag']
     releases=api.pages('releases')
@@ -374,11 +439,14 @@ def main():
     parser.add_argument('command',choices=['build','upload-draft'])
     parser.add_argument('--repository',required=True)
     parser.add_argument('--tag')
+    parser.add_argument('--expected-manifest-sha256')
+    parser.add_argument('--expected-tag')
+    parser.add_argument('--expected-sha')
     parser.add_argument('--repo',type=Path,default=Path.cwd())
     parser.add_argument('--output',type=Path,required=True)
     args=parser.parse_args();api=GitHub(args.repository)
     if args.command=='build':build(args.repo,args.tag,args.output,api)
-    else:upload_draft(args.output.resolve(),api)
+    else:upload_draft(args.output.resolve(),api,expected_manifest_sha256=args.expected_manifest_sha256,expected_tag=args.expected_tag,expected_sha=args.expected_sha)
 
 
 if __name__=='__main__':

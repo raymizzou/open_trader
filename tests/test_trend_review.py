@@ -13,6 +13,8 @@ from threading import Event, Lock
 from types import SimpleNamespace
 
 import pytest
+from tests.contended_lock_support import observe_flock_contention
+from tests.timing_support import run_test_in_subprocess
 
 from open_trader import market_trend
 import open_trader.trend_review as trend_review
@@ -2212,8 +2214,7 @@ class BlockingSharedSimClient:
             order_id = f"SIM-{len(self.state.requests)}"
         if first:
             self.state.first_entered.set()
-            if not self.state.release_first.wait(timeout=5):
-                raise AssertionError("test did not release the first order")
+            self.state.release_first.wait()
         order = {
             **request,
             "order_id": order_id,
@@ -4150,7 +4151,16 @@ def test_v2_serialization_lock_is_account_and_symbol_scoped(
 
 def test_simulated_order_lock_serializes_formal_and_rotation_by_account_symbol(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
+    if run_test_in_subprocess(request):
+        return
+    contended = observe_flock_contention(
+        monkeypatch, trend_review,
+        trend_review._simulated_order_lock_path(tmp_path, "CN", 101, "SH.600001"),
+    )
+
     owner_entered = Event()
     release_owner = Event()
     same_symbol_entered = Event()
@@ -4163,19 +4173,22 @@ def test_simulated_order_lock_serializes_formal_and_rotation_by_account_symbol(
         ):
             entered.set()
             if entered is owner_entered:
-                release_owner.wait(timeout=5)
+                release_owner.wait()
 
     with ThreadPoolExecutor(max_workers=4) as pool:
         owner = pool.submit(hold, 101, "SH.600001", owner_entered)
-        assert owner_entered.wait(timeout=2)
-        same_symbol = pool.submit(hold, 101, "SH.600001", same_symbol_entered)
-        other_symbol = pool.submit(hold, 101, "SH.600002", other_symbol_entered)
-        other_account = pool.submit(hold, 202, "SH.600001", other_account_entered)
+        try:
+            assert owner_entered.wait(timeout=2)
+            same_symbol = pool.submit(hold, 101, "SH.600001", same_symbol_entered)
+            other_symbol = pool.submit(hold, 101, "SH.600002", other_symbol_entered)
+            other_account = pool.submit(hold, 202, "SH.600001", other_account_entered)
 
-        assert other_symbol_entered.wait(timeout=2)
-        assert other_account_entered.wait(timeout=2)
-        assert not same_symbol_entered.wait(timeout=0.1)
-        release_owner.set()
+            assert other_symbol_entered.wait(timeout=2)
+            assert other_account_entered.wait(timeout=2)
+            assert contended.wait(timeout=2)
+            assert not same_symbol_entered.is_set()
+        finally:
+            release_owner.set()
 
         owner.result(timeout=2)
         same_symbol.result(timeout=2)
@@ -4186,7 +4199,16 @@ def test_simulated_order_lock_serializes_formal_and_rotation_by_account_symbol(
 
 def test_simulated_order_lock_serializes_formal_opposite_directions(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
+    if run_test_in_subprocess(request):
+        return
+    contended = observe_flock_contention(
+        monkeypatch, trend_review,
+        trend_review._simulated_order_lock_path(tmp_path, "CN", 101, "SH.600001"),
+    )
+
     state = BlockingSharedSimState()
     buy_client = BlockingSharedSimClient(state)
     sell_client = BlockingSharedSimClient(
@@ -4220,11 +4242,14 @@ def test_simulated_order_lock_serializes_formal_opposite_directions(
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         first = pool.submit(run, buy_report, buy_client)
-        second = pool.submit(run, sell_report, sell_client)
-        assert state.first_entered.wait(timeout=2)
-        with state.lock:
-            assert len(state.requests) == 1
-        state.release_first.set()
+        try:
+            assert state.first_entered.wait(timeout=2)
+            second = pool.submit(run, sell_report, sell_client)
+            assert contended.wait(timeout=2)
+            with state.lock:
+                assert len(state.requests) == 1
+        finally:
+            state.release_first.set()
         first.result(timeout=2)
         second.result(timeout=2)
 
@@ -4233,7 +4258,16 @@ def test_simulated_order_lock_serializes_formal_opposite_directions(
 
 def test_simulated_order_lock_serializes_formal_and_rotation(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
+    if run_test_in_subprocess(request):
+        return
+    contended = observe_flock_contention(
+        monkeypatch, trend_review,
+        trend_review._simulated_order_lock_path(tmp_path, "CN", 101, "SH.600001"),
+    )
+
     state = BlockingSharedSimState()
     positions = full_rotation_positions()
     positions[0] = {
@@ -4285,11 +4319,14 @@ def test_simulated_order_lock_serializes_formal_and_rotation(
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         first = pool.submit(run_formal)
-        second = pool.submit(run_rotation)
-        assert state.first_entered.wait(timeout=2)
-        with state.lock:
-            assert len(state.requests) == 1
-        state.release_first.set()
+        try:
+            assert state.first_entered.wait(timeout=2)
+            second = pool.submit(run_rotation)
+            assert contended.wait(timeout=2)
+            with state.lock:
+                assert len(state.requests) == 1
+        finally:
+            state.release_first.set()
         first.result(timeout=2)
         second.result(timeout=2)
 
@@ -10977,8 +11014,18 @@ def test_contradictory_resolution_preserves_first_fact(tmp_path: Path) -> None:
 
 
 def test_concurrent_contradictory_resolutions_write_one_fact(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
+    if run_test_in_subprocess(request):
+        return
+    action_key = trend_review.trend_action_key("CN", "2026-07-20", "SH.600001", "buy")
+    contended = observe_flock_contention(
+        monkeypatch, trend_review,
+        tmp_path / "trend_review/ledgers/CN/actions/2026-07-20" / action_key / ".resolution.lock",
+    )
+
     make_uncertain_buy(tmp_path)
     original = trend_review._write_immutable
     entered = Event()
@@ -10995,7 +11042,7 @@ def test_concurrent_contradictory_resolutions_write_one_fact(
                 write_number = writes
             if write_number == 1:
                 entered.set()
-                assert release.wait(timeout=2)
+                release.wait()
             else:
                 second_entered.set()
         return original(path, body)
@@ -11025,12 +11072,15 @@ def test_concurrent_contradictory_resolutions_write_one_fact(
         first = pool.submit(
             resolve, "confirm-submitted", "2026-07-20T09:40:00+08:00"
         )
-        assert entered.wait(timeout=2)
-        second = pool.submit(
-            resolve, "abandon", "2026-07-20T09:41:00+08:00"
-        )
-        second_entered.wait(timeout=0.2)
-        release.set()
+        try:
+            assert entered.wait(timeout=2)
+            second = pool.submit(
+                resolve, "abandon", "2026-07-20T09:41:00+08:00"
+            )
+            assert contended.wait(timeout=2)
+            assert not second_entered.is_set()
+        finally:
+            release.set()
         results = [first.result(timeout=2), second.result(timeout=2)]
 
     paths = list(
@@ -13944,9 +13994,20 @@ def test_long_term_benchmark_cycle_uses_market_local_month(tmp_path: Path) -> No
 
 def test_long_term_benchmark_refresh_serializes_same_market_calls(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
+    if run_test_in_subprocess(request):
+        return
+    contended = observe_flock_contention(
+        monkeypatch, trend_review,
+        tmp_path / "trend_review/long_term_benchmarks/US/.refresh.lock",
+    )
+
     write_rates(tmp_path)
     state_lock = Lock()
+    entered = Event()
+    release = Event()
     active = 0
     maximum_active = 0
 
@@ -13956,24 +14017,29 @@ def test_long_term_benchmark_refresh_serializes_same_market_calls(
             with state_lock:
                 active += 1
                 maximum_active = max(maximum_active, active)
-            time.sleep(0.05)
+            entered.set()
+            release.wait()
             with state_lock:
                 active -= 1
             return super().get_daily_kline(symbol, start=start, end=end)
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        results = list(
-            pool.map(
-                lambda sha: trend_review.refresh_long_term_benchmark(
-                    tmp_path,
-                    "US",
-                    SlowQuote(),
-                    now=datetime(2026, 8, 9, 12, tzinfo=UTC),
-                    process_git_sha=sha,
-                ),
-                ("first", "second"),
-            )
+    def refresh(sha: str) -> dict[str, object]:
+        return trend_review.refresh_long_term_benchmark(
+            tmp_path, "US", SlowQuote(),
+            now=datetime(2026, 8, 9, 12, tzinfo=UTC), process_git_sha=sha,
         )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(refresh, "first")
+        try:
+            assert entered.wait(timeout=2)
+            second = pool.submit(refresh, "second")
+            assert contended.wait(timeout=2)
+            with state_lock:
+                assert active == maximum_active == 1
+        finally:
+            release.set()
+        results = [first.result(timeout=2), second.result(timeout=2)]
 
     assert sorted(result["status"] for result in results) == [
         "already_completed",

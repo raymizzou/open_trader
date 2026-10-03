@@ -3,6 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from datetime import UTC, datetime
+from http.cookies import SimpleCookie
+import threading
+from uuid import uuid4
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1165,9 +1169,27 @@ def _relation_review_fixture() -> dict[str, object]:
     }
 
 
+class FixtureServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, address):
+        self.sessions: dict[str, dict[str, str]] = {}
+        self.sessions_lock = threading.Lock()
+        super().__init__(address, Handler)
+
+
 class Handler(BaseHTTPRequestHandler):
-    prediction_scenario = os.environ.get("PREDICTION_FIXTURE_SCENARIO", "ready")
-    prediction_state_calls = 0
+    def _bind_session(self, *, new: bool = False, scenario: str = "") -> None:
+        cookies = SimpleCookie(self.headers.get("Cookie", ""))
+        cookie = cookies.get("fixture_session")
+        key = cookie.value if cookie is not None and not new else uuid4().hex
+        with self.server.sessions_lock:
+            self.session = self.server.sessions.setdefault(key, {
+                "scenario": scenario or os.environ.get("PREDICTION_FIXTURE_SCENARIO", "ready"),
+            })
+        self.set_session_cookie = new or cookie is None
+        self.session_cookie = f"fixture_session={key}; Path=/; HttpOnly; SameSite=Strict"
+
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -1175,10 +1197,25 @@ class Handler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query, keep_blank_values=True)
         if path == "/":
             requested_scenario = str(query.get("prediction_state", [""])[0] or "").strip()
-            if requested_scenario:
-                type(self).prediction_scenario = requested_scenario
-                type(self).prediction_state_calls = 0
-            self._send_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
+            self._bind_session(new=True, scenario=requested_scenario)
+            if self.session["scenario"].startswith("smoke-"):
+                body = (STATIC_DIR / "index.html").read_text().replace("<body>",
+                    '<body data-prediction-split="true">' if "split" in self.session["scenario"]
+                    else '<body data-prediction-only="true">')
+                if self.session["scenario"] == "smoke-split-mutation":
+                    body += "<script>fetch('/fixture-mutation', {method: 'POST'}).catch(() => {});</script>"
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body.encode())))
+                self.send_header("Set-Cookie", self.session_cookie)
+                self.end_headers()
+                self.wfile.write(body.encode())
+            else:
+                self._send_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
+            return
+        self._bind_session()
+        if path == "/healthz":
+            self._send_json({"status": "running"})
             return
         if path == "/static/dashboard.css":
             self._send_file(STATIC_DIR / "dashboard.css", "text/css; charset=utf-8")
@@ -1204,8 +1241,23 @@ class Handler(BaseHTTPRequestHandler):
                 }
             )
             return
-        if path == "/api/prediction-arbitrage/venues":
-            payload = _prediction_payload(type(self).prediction_scenario)
+        if path in {"/api/prediction-arbitrage/venues", "/api/prediction-arbitrage/execution/identity"}:
+            payload = _prediction_payload(self.session["scenario"])
+            scenario = self.session["scenario"]
+            smoke_identity = {}
+            if scenario.startswith("smoke-"):
+                if path.endswith("/execution/identity") and scenario == "smoke-split-air-missing":
+                    self.send_response(HTTPStatus.SERVICE_UNAVAILABLE)
+                    self.end_headers()
+                    return
+                cloud = "split" in scenario and path.endswith("/venues")
+                shadow = cloud or "shadow" in scenario
+                paused = cloud or scenario.endswith("paused")
+                smoke_identity = {"mode": "shadow" if shadow else "production",
+                    "mutations": "prohibited" if shadow else "enabled",
+                    "n_leg": {"status": "paused" if paused else "running"}}
+                if path.endswith("/execution/identity") and scenario == "smoke-split-air-unknown":
+                    smoke_identity = {"mode": "unknown", "mutations": "unknown"}
             self._send_json({
                 "venues": payload.get("venues", []),
                 "n_leg": payload.get("n_leg", {"status": "running", "code": "N_LEG_RUNNING"}),
@@ -1214,28 +1266,33 @@ class Handler(BaseHTTPRequestHandler):
                     "n_leg_cross_venue_token_count": 0,
                 },
                 "csrf_token": payload.get("csrf_token", ""),
+                **smoke_identity,
             })
             return
         if path == "/api/prediction-arbitrage/lp/dashboard":
+            if self.session["scenario"] == "smoke-shadow-paused":
+                self.send_response(HTTPStatus.SERVICE_UNAVAILABLE)
+                self.end_headers()
+                return
             self._send_json({
                 "state": "ready",
-                "stale": False,
+                "stale": self.session["scenario"] == "smoke-split-stale",
                 "complete": True,
-                "checked_at": "2026-07-28T08:17:40Z",
+                "checked_at": datetime.now(UTC).isoformat() if self.session["scenario"].startswith("smoke-") else "2026-07-28T08:17:40Z",
                 "orders": [],
                 "positions": [],
                 "market_rewards": [],
                 "candidates": [],
+                **({"authenticated": True, "recommendations": []}
+                   if self.session["scenario"].startswith("smoke-") else {}),
             })
             return
+        if path == "/api/prediction-arbitrage/lp/auto/state":
+            self._send_json({"state": "disabled", "slots": []})
+            return
         if path == "/api/prediction-arbitrage/state":
-            if type(self).prediction_scenario == "observation-fetch-error":
-                type(self).prediction_state_calls += 1
-                if type(self).prediction_state_calls > 1:
-                    self.send_response(HTTPStatus.SERVICE_UNAVAILABLE)
-                    self.end_headers()
-                    return
-            payload = _prediction_payload(type(self).prediction_scenario)
+            # Failure phases are explicitly controlled by the browser test.
+            payload = _prediction_payload(self.session["scenario"])
             self._send_json(payload)
             return
         if path == "/api/prediction-arbitrage/relations":
@@ -1247,14 +1304,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/prediction-arbitrage/history":
             kind = str(query.get("kind", ["signals"])[0] or "signals")
-            if type(self).prediction_scenario == "signal-error" and kind == "signals":
+            if self.session["scenario"] == "signal-error" and kind == "signals":
                 self.send_response(HTTPStatus.SERVICE_UNAVAILABLE)
                 self.end_headers()
                 return
-            items = _prediction_history_for_scenario(kind, type(self).prediction_scenario)
-            if type(self).prediction_scenario == "signal-closed" and kind == "signals":
+            items = _prediction_history_for_scenario(kind, self.session["scenario"])
+            if self.session["scenario"] == "signal-closed" and kind == "signals":
                 items = [{**items[0], "ended_at": "2026-08-01T02:00:10Z", "actionable_now": False, "live_profit": None}, *items[1:]]
-            if type(self).prediction_scenario in {"degraded", "unavailable", "unknown"} and kind == "signals":
+            if self.session["scenario"] in {"degraded", "unavailable", "unknown"} and kind == "signals":
                 items = [{**item, "actionable_now": False} for item in items]
             self._send_json({"kind": kind, "items": items, "total": len(items), "limit": 100, "offset": 0, "has_more": False})
             return
@@ -1263,6 +1320,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"not found")
 
     def do_POST(self) -> None:
+        self._bind_session()
         parsed = urlparse(self.path)
         path = parsed.path
         if path not in {
@@ -1278,9 +1336,9 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
         if path.endswith("/preview"):
-            if type(self).prediction_scenario == "preview-rejected":
+            if self.session["scenario"] == "preview-rejected":
                 self._send_json({"state": "rejected", "reason": "opportunity_unavailable"})
-            elif type(self).prediction_scenario == "preview-incomplete":
+            elif self.session["scenario"] == "preview-incomplete":
                 self._send_json({
                     "state": "previewed",
                     "preview_id": "preview-fixture",
@@ -1321,7 +1379,7 @@ class Handler(BaseHTTPRequestHandler):
                     "codex_approval": {"decision": "APPROVE", "summary": "两所规则确认同一截止时间，YES/NO 方向直接互补。", "reviewed_at": "2026-08-03T15:41:00Z", "direct_outcome_mapping": {"predict_yes": "YES", "predict_no": "NO", "polymarket_yes": "YES", "polymarket_no": "NO"}, "evidence": [{"exchange": "predict.fun", "field": "cutoff", "quote": "at 23:59 UTC on December 31, 2099"}, {"exchange": "polymarket", "field": "cutoff", "quote": "at 23:59 UTC on December 31, 2099"}]},
                     "balances": {"predict.fun": {"asset": "USDT", "wallet_address": "0xcE23…f435", "available_balance": "12.34", "allowance_ready": True}, "polymarket": {"asset": "pUSD", "wallet_address": "0x7A4E…91C2", "available_balance": "50.00", "allowance": "50.00"}},
                     "unsettled": {"current": "35.20", "after": "40.00", "limit": "100"},
-                    "policy_limits": {"max_normal_cost": "5" if type(self).prediction_scenario == "first-canary-cap5" else "20", "max_emergency_loss": "2", "max_cross_unsettled_principal": "100"},
+                    "policy_limits": {"max_normal_cost": "5" if self.session["scenario"] == "first-canary-cap5" else "20", "max_emergency_loss": "2", "max_cross_unsettled_principal": "100"},
                     "expires_at": "2026-08-03T12:00:00Z",
                 })
             else:
@@ -1345,30 +1403,30 @@ class Handler(BaseHTTPRequestHandler):
                     "policy_limits": {"max_wallet_balance": "65", "max_normal_cost": "20", "max_emergency_loss": "2", "min_estimated_profit": "1"},
                 })
         elif path.endswith("/executions"):
-            type(self).prediction_scenario = "success"
+            self.session["scenario"] = "success"
             self._send_json({"execution_id": "exec-fixture", "status": "executing"})
         elif path.endswith("/predict-allowance/cleanup"):
             if body != {"confirm": True}:
                 self.send_response(HTTPStatus.BAD_REQUEST)
                 self.end_headers()
                 return
-            if type(self).prediction_scenario == "cleanup-failure":
+            if self.session["scenario"] == "cleanup-failure":
                 self._send_json({"state": "rejected", "reason": "gas_unavailable", "before_allowance": "2.40", "after_allowance": "2.40", "usdt_moved": False})
             else:
-                type(self).prediction_scenario = "cleanup-success"
+                self.session["scenario"] = "cleanup-success"
                 self._send_json({"state": "ready", "before_allowance": "2.40", "after_allowance": "0", "usdt_moved": False})
         elif path.endswith("/cross-auto/pause"):
             if body != {"confirm": True}:
                 self.send_response(HTTPStatus.BAD_REQUEST)
                 self.end_headers()
                 return
-            type(self).prediction_scenario = "cross-auto-paused"
+            self.session["scenario"] = "cross-auto-paused"
             self._send_json({"armed": False, "reason": "operator_paused"})
         else:
-            if type(self).prediction_scenario == "reset-denied":
+            if self.session["scenario"] == "reset-denied":
                 self._send_json({"state": "rejected", "reason": "incident_unresolved"})
             else:
-                type(self).prediction_scenario = "ready"
+                self.session["scenario"] = "ready"
                 self._send_json({"status": "reset", "incident_id": body.get("incident_id", "incident-fixture")})
 
     def log_message(self, format: str, *args: object) -> None:
@@ -1379,6 +1437,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        if self.set_session_cookie:
+            self.send_header("Set-Cookie", self.session_cookie)
         self.end_headers()
         self.wfile.write(body)
 
@@ -1387,6 +1447,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        if self.set_session_cookie:
+            self.send_header("Set-Cookie", self.session_cookie)
         self.end_headers()
         self.wfile.write(body)
 
@@ -1396,9 +1458,12 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8766)
     args = parser.parse_args()
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"fixture_dashboard_url: http://{args.host}:{args.port}", flush=True)
-    server.serve_forever()
+    server = FixtureServer((args.host, args.port))
+    print(f"fixture_dashboard_url: http://{args.host}:{server.server_port}", flush=True)
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":

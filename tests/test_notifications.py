@@ -12,6 +12,9 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+import open_trader.notifications as notifications_module
+from tests.contended_lock_support import observe_flock_contention
+from tests.timing_support import run_test_in_subprocess
 
 from open_trader.daily_premarket import send_notification_with_results
 from open_trader.notifications import (
@@ -21,6 +24,7 @@ from open_trader.notifications import (
     NotificationError,
     XiaoaiSSHNotifier,
     XiaoaiVoiceSuppressed,
+    notification_delivery_episode,
     render_feishu_order_review,
     render_prediction_opportunity_notification,
     render_yes_no_signal_notification,
@@ -505,6 +509,151 @@ def test_feishu_app_notifier_raises_on_token_error() -> None:
 
     with pytest.raises(NotificationError, match="Feishu token error 999"):
         notifier.notify("Open Trader", "hello")
+
+
+def test_feishu_app_notifier_reuses_uuid_for_explicit_episode_retry() -> None:
+    message_payloads: list[dict[str, object]] = []
+
+    def fake_post(
+        url: str,
+        payload: dict[str, object],
+        _headers: dict[str, str],
+        _timeout_seconds: float,
+    ) -> dict[str, object]:
+        if url.endswith("/auth/v3/tenant_access_token/internal"):
+            return {"code": 0, "tenant_access_token": "tenant-token"}
+        message_payloads.append(payload)
+        return {"code": 0}
+
+    notifier = FeishuAppNotifier(
+        app_id="cli_test",
+        app_secret="secret",
+        receive_id_type="email",
+        receive_id="ray@example.com",
+        post_json=fake_post,
+    )
+
+    with notification_delivery_episode("lp-episode-1"):
+        notifier.notify("first title", "first body")
+        notifier.notify("retry title", "retry body")
+
+    assert len(message_payloads) == 2
+    assert message_payloads[0]["uuid"] == message_payloads[1]["uuid"]
+
+
+def test_feishu_app_notifier_uuid_changes_for_episode_and_recipient() -> None:
+    message_payloads: list[dict[str, object]] = []
+
+    def fake_post(
+        url: str,
+        payload: dict[str, object],
+        _headers: dict[str, str],
+        _timeout_seconds: float,
+    ) -> dict[str, object]:
+        if url.endswith("/auth/v3/tenant_access_token/internal"):
+            return {"code": 0, "tenant_access_token": "tenant-token"}
+        message_payloads.append(payload)
+        return {"code": 0}
+
+    def notifier(receive_id: str) -> FeishuAppNotifier:
+        return FeishuAppNotifier(
+            app_id="cli_test",
+            app_secret="secret",
+            receive_id_type="email",
+            receive_id=receive_id,
+            post_json=fake_post,
+        )
+
+    with notification_delivery_episode("lp-episode-1"):
+        notifier("ray@example.com").notify("title", "body")
+        notifier("other@example.com").notify("title", "body")
+    with notification_delivery_episode("lp-episode-2"):
+        notifier("ray@example.com").notify("title", "body")
+
+    uuids = [payload["uuid"] for payload in message_payloads]
+    assert len(set(uuids)) == 3
+
+
+def test_notification_delivery_episode_restores_context_after_exception() -> None:
+    message_payloads: list[dict[str, object]] = []
+
+    def fake_post(
+        url: str,
+        payload: dict[str, object],
+        _headers: dict[str, str],
+        _timeout_seconds: float,
+    ) -> dict[str, object]:
+        if url.endswith("/auth/v3/tenant_access_token/internal"):
+            return {"code": 0, "tenant_access_token": "tenant-token"}
+        message_payloads.append(payload)
+        return {"code": 0}
+
+    notifier = FeishuAppNotifier(
+        app_id="cli_test",
+        app_secret="secret",
+        receive_id_type="email",
+        receive_id="ray@example.com",
+        post_json=fake_post,
+    )
+
+    with pytest.raises(RuntimeError, match="stop"):
+        with notification_delivery_episode("lp-episode-1"):
+            notifier.notify("inside", "body")
+            raise RuntimeError("stop")
+    notifier.notify("outside", "body")
+
+    assert "uuid" in message_payloads[0]
+    assert "uuid" not in message_payloads[1]
+
+
+def test_notification_delivery_episode_is_thread_local() -> None:
+    message_payloads: list[dict[str, object]] = []
+    payload_lock = threading.Lock()
+
+    def fake_post(
+        url: str,
+        payload: dict[str, object],
+        _headers: dict[str, str],
+        _timeout_seconds: float,
+    ) -> dict[str, object]:
+        if url.endswith("/auth/v3/tenant_access_token/internal"):
+            return {"code": 0, "tenant_access_token": "tenant-token"}
+        with payload_lock:
+            message_payloads.append(payload)
+        return {"code": 0}
+
+    notifier = FeishuAppNotifier(
+        app_id="cli_test",
+        app_secret="secret",
+        receive_id_type="email",
+        receive_id="ray@example.com",
+        post_json=fake_post,
+    )
+    barrier = threading.Barrier(2, timeout=5)
+
+    def send_from_thread() -> None:
+        barrier.wait()
+        notifier.notify("thread", "body")
+
+    with notification_delivery_episode("lp-episode-1"):
+        worker = threading.Thread(target=send_from_thread)
+        worker.start()
+        try:
+            barrier.wait()
+            notifier.notify("main", "body")
+        except BaseException:
+            barrier.abort()
+            raise
+        finally:
+            worker.join(5)
+        assert not worker.is_alive()
+
+    payload_by_title = {
+        json.loads(payload["content"])["text"].split("\n\n", 1)[0]: payload
+        for payload in message_payloads
+    }
+    assert "uuid" in payload_by_title["main"]
+    assert "uuid" not in payload_by_title["thread"]
 
 
 def test_xiaoai_voice_notifier_runs_native_tts_over_ssh(tmp_path: Path) -> None:
@@ -1081,7 +1230,16 @@ def test_xiaoai_voice_notifier_reports_redacted_transport_failure(
     assert captured.value.__context__ is None
 
 
-def test_xiaoai_voice_notifier_serializes_process_playback(tmp_path: Path) -> None:
+def test_xiaoai_voice_notifier_serializes_process_playback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    if run_test_in_subprocess(request):
+        return
+
+    contended = observe_flock_contention(monkeypatch, notifications_module, tmp_path / "voice.lock")
+    errors: list[BaseException] = []
     entered: list[str] = []
     first_entered = threading.Event()
     release_first = threading.Event()
@@ -1090,28 +1248,36 @@ def test_xiaoai_voice_notifier_serializes_process_playback(tmp_path: Path) -> No
         entered.append(command[-1])
         if len(entered) == 1:
             first_entered.set()
-            assert release_first.wait(timeout=1)
+            release_first.wait()
         return subprocess.CompletedProcess(command, 0)
 
     def play(message: str) -> None:
-        XiaoaiSSHNotifier(
-            host="speaker.local",
-            ssh_key=tmp_path / "key",
-            run_command=fake_run,
-            lock_path=tmp_path / "voice.lock",
-            now_fn=ALLOWED_NOW,
-        ).notify("Open Trader 测试通知", message)
+        try:
+            XiaoaiSSHNotifier(
+                host="speaker.local",
+                ssh_key=tmp_path / "key",
+                run_command=fake_run,
+                lock_path=tmp_path / "voice.lock",
+                now_fn=ALLOWED_NOW,
+            ).notify("Open Trader 测试通知", message)
+        except BaseException as exc:
+            errors.append(exc)
 
     first = threading.Thread(target=play, args=("first",))
     second = threading.Thread(target=play, args=("second",))
     first.start()
-    assert first_entered.wait(timeout=1)
-    second.start()
-    time.sleep(0.05)
-    assert len(entered) == 1
-    release_first.set()
-    first.join(timeout=1)
-    second.join(timeout=1)
+    try:
+        assert first_entered.wait(timeout=1)
+        second.start()
+        assert contended.wait(timeout=1), "second playback never contended on the held lock"
+        assert len(entered) == 1
+    finally:
+        release_first.set()
+        first.join(timeout=1)
+        if second.ident is not None:
+            second.join(timeout=1)
+    assert not first.is_alive() and not second.is_alive()
+    assert errors == []
 
     assert [shlex.split(command)[1] for command in entered] == ["first", "second"]
 

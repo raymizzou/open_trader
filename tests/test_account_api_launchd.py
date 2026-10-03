@@ -23,7 +23,9 @@ def test_account_api_template_runs_mode_specific_command() -> None:
 
     assert payload["Label"] == LABEL
     assert payload["WorkingDirectory"] == "OPEN_TRADER_REPO"
-    assert payload["EnvironmentVariables"] == {"PYTHONPATH": "OPEN_TRADER_REPO/src"}
+    assert payload["EnvironmentVariables"] == {
+        "PYTHONPATH": "OPEN_TRADER_REPO/src", "PYTHONDONTWRITEBYTECODE": "1",
+    }
     assert payload["ProgramArguments"] == [
         "OPEN_TRADER_PYTHON", "-m", "open_trader", "account-api",
         "--data-dir", "OPEN_TRADER_DATA_DIR",

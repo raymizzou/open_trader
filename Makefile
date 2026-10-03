@@ -1,4 +1,4 @@
-.PHONY: acceptance candidate-acceptance test test-trend-curve test-pressure host-readiness browser-test production-smoke prediction-solver-envs prediction-solver-quick prediction-solver-full-macos prediction-solver-full-linux prediction-solver-report prediction-solver-verify-report
+.PHONY: acceptance candidate-acceptance deployment-preflight test test-trend-curve test-pressure host-readiness browser-test production-smoke prediction-solver-envs prediction-solver-quick prediction-solver-full-macos prediction-solver-full-linux prediction-solver-report prediction-solver-verify-report
 
 WORKTREE_ROOT := $(CURDIR)
 REPOSITORY_ROOT := $(shell git rev-parse --path-format=absolute --git-common-dir)/..
@@ -47,21 +47,24 @@ test:
 	$(DOCKER_BUILD)
 	$(DOCKER_RUN) $(BACKEND_PYTEST) $(if $(strip $(TEST)),$(TEST),$(filter-out $(if $(filter 0,$(TEST_N_LEG)),$(N_LEG_TESTS)),$(sort $(foreach service,$(SERVICE),$(SERVICE_TESTS_$(service)))))) $(if $(filter 1,$(TEST_WORKERS)),,-n $(TEST_WORKERS) --dist=loadgroup)
 
+# CI metadata and collection proof use the identical file partition as make test.
+.PHONY: ci-test-files test-ci-portable
+ci-test-files:
+	@printf '%s\n' 'gateway:$(sort $(SERVICE_TESTS_gateway))' 'legacy:$(sort $(SERVICE_TESTS_legacy))' 'account:$(sort $(SERVICE_TESTS_account))' 'prediction:$(sort $(SERVICE_TESTS_prediction))'
+
+# Preserve one serial session for the portable scenarios; LIVE alone is excluded.
+test-ci-portable:
+	$(DOCKER_BUILD)
+	$(DOCKER_RUN) $(BACKEND_PYTEST) acceptance/test_prediction_arbitrage_scenarios.py -k "not LIVE"
+
 test-trend-curve:
 	$(MAKE) test TEST='$(if $(TEST),$(TEST),tests/test_trend_curve_research.py tests/test_trend_curve_backtest.py tests/test_trend_curve_cli.py)'
 
-candidate-acceptance:
-	@status=0; \
-	if $(DOCKER_BUILD); then \
-		if $(DOCKER_RUN) sh -c '$(BACKEND_PYTEST) && $(BACKEND_PYTEST) acceptance/test_prediction_arbitrage_scenarios.py -k "not LIVE"'; then \
-			:; \
-		else \
-			status=$$?; \
-		fi; \
-	else \
-		status=$$?; \
-	fi; \
-	if [ $$status -eq 0 ]; then echo 'Candidate Acceptance: PASS'; else echo 'Candidate Acceptance: FAIL'; exit 1; fi
+# Compatibility names now reuse trusted CI; neither builds nor reruns pytest.
+candidate-acceptance: deployment-preflight
+
+deployment-preflight:
+	"$(PYTHON_BIN)" -B "$(WORKTREE_ROOT)/scripts/deployment_preflight.py" --expected-sha "$(EXPECTED_SHA)" --release-root "$(WORKTREE_ROOT)" --python "$(PYTHON_BIN)" $(foreach extra,$(RELEASE_EXTRAS),--extra "$(extra)")
 
 test-pressure:
 	"$(PYTHON_BIN)" -m pytest -q -m pressure
@@ -200,7 +203,7 @@ production-smoke:
 			if printf '%s' "$$state_payload" | "$(PYTHON_BIN)" -c 'import json,sys; p=json.load(sys.stdin); n_leg=p.get("n_leg") or {}; scopes=n_leg.get("execution_scopes") or {}; scope=scopes.get("SAME_EVENT_SAME_VENUE") or {}; rows=p.get("opportunities") or []; ok=(n_leg.get("contract_generation")==2 and n_leg.get("mode")=="MANUAL" and scope.get("capability")=="OBSERVE_ONLY" and all(row.get("engine_owner")=="N_LEG" for row in rows if isinstance(row,dict))); raise SystemExit(0 if ok else 1)' >/dev/null 2>&1; then echo "n-leg state: PASS"; else echo "n-leg state: BLOCKED"; status=1; fi; \
 		fi; \
 	fi; \
-	check_log() { log="$$1"; if [ ! -f "$$log" ]; then echo "log missing: $$log"; status=1; elif tail -n 200 "$$log" | rg -qi 'traceback|fatal|exception|error'; then echo "log error: $$log"; status=1; else echo "log clean: $$log"; fi; }; \
+	check_log() { log="$$1"; if ! command -v rg >/dev/null 2>&1 || ! rg --version >/dev/null 2>&1; then echo "log checker unavailable"; status=1; elif "$(PYTHON_BIN)" "$$expected_root/scripts/check_production_log.py" "$$log"; then echo "log clean: $$log"; else echo "log check blocked: $$log"; status=1; fi; }; \
 	if [ $$gateway_selected -eq 1 ]; then check_log "$$expected_root/logs/frontend_gateway/launchd.err.log"; fi; \
 	if [ $$legacy_selected -eq 1 ]; then check_log "$$expected_root/logs/legacy_dashboard/launchd.err.log"; fi; \
 	if [ $$account_selected -eq 1 ]; then check_log "$$expected_root/logs/account_api/launchd.err.log"; fi; \

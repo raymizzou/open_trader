@@ -2,7 +2,7 @@
 
 This runbook covers source artifacts and a reviewable GitHub Draft Release.
 Follow [agent verification](agent-verification.md) for development, review and
-GitHub merge. Artifact verification does not run Candidate Acceptance, install
+GitHub merge. Artifact verification does not run Deployment Preflight, install
 services, restart production, or authorize trading.
 
 ## Artifact contract
@@ -53,15 +53,19 @@ for that exact commit:
 - Its exact aggregate check name is `required`, from GitHub Actions app **15368**,
   and the check belongs to that same run and SHA
 - The run's retained evidence is present, downloadable and consistent with the
-  selected SHA and actual routed checks
+  selected SHA and all four backend services and the non-LIVE portable scenarios
 
 A same-named check from another app/workflow, a PR run, an earlier successful
 attempt, another SHA, missing evidence, failure, cancellation or an incomplete
 run fails closed. CI artifacts currently expire after three days. Copy verified
 evidence into the release assets while available; a URL to expired evidence is
 not a replacement. If evidence has expired, stop and report the blocker rather
-than claiming that unavailable checks passed. See [ci.md](ci.md) for routing and
-the documentation-only exemption; do not present routed CI as full acceptance.
+than claiming that unavailable checks passed. All five scopes must succeed, including
+for documentation-only changes. No skipped service or N-leg-disabled result qualifies.
+Each artifact name binds scope, SHA, run ID and attempt. Its GitHub digest, repository,
+workflow identity, selection, environment hashes, and portable collection partition
+must agree. The `required` check must link to the successful aggregate job, not only
+share its display name. See [ci.md](ci.md).
 
 ## Build, restore and review
 
@@ -78,9 +82,9 @@ that checkout so it stays clean. Do not read production data or credentials.
 
 The delivered set contains `source.bundle`, `uv.lock`, `INSTALL.txt`,
 `ci-evidence.json`, `artifact-verification.json`, `installation.log`,
-`release-manifest.json`, `SHA256SUMS`, and a `ci-<scope>-<SHA>.zip` for each
-successfully selected CI scope. A documentation-only CI run records its explicit
-exemption instead of inventing service-test artifacts. Follow `INSTALL.txt` for
+`release-manifest.json`, `SHA256SUMS`, and five
+`ci-<scope>-<SHA>-<run>-<attempt>.zip` archives. Each includes `evidence.json`;
+portable also includes collection partition metadata and its log. Follow `INSTALL.txt` for
 locked dependency installation in a new environment; network access is required
 to obtain dependencies.
 
@@ -113,8 +117,15 @@ authenticated GitHub release. A tampered manifest plus recomputed checksums
 cannot be detected by checksums alone.
 
 The write-permission job performs only non-executing checksum, Git and metadata
-verification: it never imports artifact code or installs dependencies. Executable
-restoration checks happen solely in the read-only build job.
+verification: it never imports artifact code, runs its Makefile, or installs dependencies.
+It checks out the immutable workflow SHA for its trusted verifier. The read-only
+build computes selection and base-image metadata; its manifest SHA-256 reaches
+the writer through a separate job output and is checked before asset processing.
+The writer also binds that manifest to the original requested tag and the source
+SHA resolved by the separate identity step, before any bundle restoration or API use.
+The writer revalidates fresh GitHub evidence using those authenticated data and
+pure archive validation. Executable restoration and source-selection checks happen
+solely in the read-only build job.
 
 The separate Draft Release job receives only the completed, verified artifact
 set and has the `contents: write` permission needed to create the draft and upload
@@ -138,14 +149,17 @@ suppression.
 
 ## Publication and deployment boundaries
 
-**Formal publication is blocked until repository protection and immutable
-release settings are activated and independently read back.** The 2026-09-30
-[protection baseline](repository-protection.md) reported `main` unprotected and
-no rulesets; #214 has not activated the proposed main/tag rules. The release
-creator is unselected, and release immutability is unverified. Documentation and
-workflow code do not activate those settings. Re-read current enforcement, exact
-`required`/app-15368 binding, tag creation actor and update/delete restrictions
-before publication. Treat unknown settings as blockers. GitHub's
+**Formal publication requires fresh protection verification and verified immutable
+release settings.** The 2026-10-03 readback confirmed three active rulesets:
+[main](https://github.com/raymizzou/open_trader/rules/24349214) requires a PR and
+strict `required` from app 15368 with no bypass;
+[tag immutability](https://github.com/raymizzou/open_trader/rules/24349247) blocks
+updates/deletions with no bypass; and
+[tag creation](https://github.com/raymizzou/open_trader/rules/24349295) permits only
+raymizzou (user 156103254) to bypass its creation restriction. Do not recreate
+these protections. Tag restrictions do not prove release-asset immutability, which
+is still unverified. Re-read current enforcement and release immutability before
+publication; unknown settings block it. GitHub's
 [immutability setting applies only to future releases](https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/establish-provenance-and-integrity/prevent-release-changes);
 enabling it later does not establish an earlier release's immutability.
 
@@ -157,13 +171,22 @@ creating or retrying a real draft, changing tags/settings, or publishing. After
 all assets and prerequisites are verified, an authorized operator publishes the
 draft manually. Do not publish first and plan to attach missing files afterward.
 
-An artifact-valid release is not a deployment candidate acceptance result.
-Candidate Acceptance remains restricted to the selected final GitHub `main` SHA
-after merge, only when preparing an explicitly authorized deployment. It is not
-a PR merge gate and never runs automatically after merge or release creation.
-An older commit being eligible for an artifact release does not waive that
-deployment requirement. Preserve separate exact-SHA Candidate `PASS`, Host
-Readiness `READY`, deployment authorization and Production Smoke `HEALTHY` under
-[agent verification](agent-verification.md) and the
-[deployment runbook](../../ops/release-deployment.md). Unknown or changed identity
-blocks deployment; release verification never authorizes rollback or retagging.
+Archived release CI is durable historical provenance for the exact source SHA and
+recorded test environment. After download, offline verification checks those
+preserved bytes without requiring their original temporary Actions artifacts to
+remain available. It does not claim current forward-deployment readiness.
+
+Deployment Preflight remains separate, for a selected final GitHub `main` SHA
+retained in main history during an explicitly authorized forward deployment. It
+requires fresh, available trusted main-push CI and checks the selected source,
+lock and existing runtime identity; it does not rerun backend tests. The aliases
+`candidate-acceptance` and `acceptance` invoke this lightweight gate. A later main
+tip alone does not invalidate the selected retained SHA. Release archives do not
+substitute for fresh forward-preflight evidence or current runtime checks.
+
+Preserve separate exact-SHA Preflight `PASS`, fresh Host Readiness `READY`, explicit
+deployment authorization and Production Smoke `HEALTHY` under
+[agent verification](agent-verification.md), [Deployment Preflight](deployment-preflight.md),
+and the [deployment runbook](../../ops/release-deployment.md). An existing authorized
+compatible rollback remains separate. Unknown or changed identity blocks forward
+deployment; release verification never authorizes rollback or retagging.

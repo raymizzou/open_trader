@@ -7,6 +7,9 @@ import os
 import plistlib
 import shutil
 import subprocess
+import signal
+
+from timing_support import supervised_process
 import sys
 import time
 from pathlib import Path
@@ -458,8 +461,8 @@ class ReleaseHarness:
         environment = self._env(checkout, release_manifest=release_manifest)
         if not owner_probe:
             environment.pop("OWNER_PROBE_BIN", None)
-        return subprocess.run(
-            command, check=check, capture_output=True, text=True,
+        return supervised_process(
+            command, check=check, timeout=30, combine_stderr=False,
             env=environment,
         )
 
@@ -476,23 +479,23 @@ class ReleaseHarness:
         ]
         return subprocess.Popen(
             command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, env=self._env(checkout),
+            text=True, env=self._env(checkout), start_new_session=True,
         )
 
     def uninstall(self, *, mode: str = "production") -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
+        return supervised_process(
             [
                 str(self.candidate.path / "scripts" / "uninstall_prediction_service_launchd.sh"),
                 "--mode", mode, "--runtime-root", str(self.runtime_root),
                 "--launch-agents-dir", str(self.agents), "--python", sys.executable,
             ],
-            capture_output=True, text=True, env=self._env(self.candidate),
+            timeout=30, combine_stderr=False, env=self._env(self.candidate),
         )
 
     def manager_install(
         self, checkout: ReleaseCheckout, *, inherited_pythonpath: Path,
     ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
+        return supervised_process(
             [
                 str(ROOT / "scripts" / "install_prediction_service_launchd.sh"),
                 "--mode", "production", "--repo-root", str(checkout.path),
@@ -501,22 +504,20 @@ class ReleaseHarness:
                 "--launch-agents-dir", str(self.agents), "--wait-seconds", "1",
                 "--release-manifest", str(checkout.path / "ops" / "prediction-service-release.json"),
             ],
-            capture_output=True,
-            text=True,
+            timeout=30, combine_stderr=False,
             env={**self._env(checkout), "PYTHONPATH": str(inherited_pythonpath)},
         )
 
     def manager_uninstall(
         self, *, inherited_pythonpath: Path,
     ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
+        return supervised_process(
             [
                 str(ROOT / "scripts" / "uninstall_prediction_service_launchd.sh"),
                 "--mode", "production", "--runtime-root", str(self.runtime_root),
                 "--launch-agents-dir", str(self.agents), "--python", sys.executable,
             ],
-            capture_output=True,
-            text=True,
+            timeout=30, combine_stderr=False,
             env={**self._env(self.candidate), "PYTHONPATH": str(inherited_pythonpath)},
         )
 
@@ -1747,7 +1748,12 @@ def test_release_operations_are_exclusive(
         assert data_sentinel.read_bytes() == b"keep"
     finally:
         release.touch()
-        stdout, stderr = process.communicate(timeout=10)
+        try:
+            stdout, stderr = process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            stdout, stderr = process.communicate(timeout=5)
+            raise AssertionError("installer did not stop after release:\n" + stdout + stderr)
         if process.returncode != 0:
             raise AssertionError(stdout + stderr)
 

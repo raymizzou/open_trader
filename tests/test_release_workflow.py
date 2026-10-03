@@ -25,6 +25,20 @@ class WorkflowContracts(unittest.TestCase):
         for line in text.splitlines():
             if '${{' in line:self.assertNotIn('run:',line)
 
+    def test_write_job_uses_trusted_workflow_code_and_authenticated_build_manifest(self):
+        text = (ROOT/'.github/workflows/release.yml').read_text()
+        build, draft = text.split('  draft:', 1)
+        self.assertIn('manifest_sha256:', build)
+        self.assertIn('release-manifest.json', build)
+        self.assertIn('GITHUB_OUTPUT', build)
+        self.assertIn('ref: ${{ github.workflow_sha }}', draft)
+        self.assertIn('EXPECTED_MANIFEST_SHA256: ${{ needs.build.outputs.manifest_sha256 }}', draft)
+        self.assertIn('--expected-manifest-sha256 "$EXPECTED_MANIFEST_SHA256"', draft)
+        self.assertIn('SOURCE_SHA: ${{ needs.build.outputs.source_sha }}', draft)
+        self.assertIn('--expected-tag "$SOURCE_TAG"', draft)
+        self.assertIn('--expected-sha "$SOURCE_SHA"', draft)
+        self.assertNotIn('ref: ${{ needs.build.outputs.source_sha }}', draft)
+
     def test_release_regressions_always_run_in_ci_plan(self):
         text=(ROOT/'.github/workflows/ci.yml').read_text()
         self.assertIn("python3 -m unittest discover -s tests -p 'test_release_*.py' -v",text)

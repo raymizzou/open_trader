@@ -311,10 +311,14 @@ Service health 必须匹配当前隔离模式（shadow）或生产模式（produ
 
 ## 生产验收与 exact-SHA 交付
 
-先运行本次改动的 focused Docker tests；Candidate Acceptance 已负责完整 backend
-coverage，发布前无需再紧邻它运行一次完整 `make test`。`make acceptance` 是该
-Candidate gate 的别名，不是第二个 gate。随后冻结候选 SHA，并在获得单独明确的部署授权
-后，按 `RELEASE_SERVICES` 选择的范围运行现有 installer 和 Smoke。
+开发时只运行相关 nodeid；完整后台和非 LIVE portable 场景由 GitHub CI 负责。
+发布前不重复运行全量 pytest。`make acceptance` 与 `candidate-acceptance` 现为
+轻量 Deployment Preflight 别名，须指定 `EXPECTED_SHA` 和实际 Python 环境；
+它们复用准确 main-push CI 并核对源码、锁文件和运行环境，不是主机健康证明。
+取得独立部署授权并完成新鲜 Host Readiness 后，使用
+[`scripts/deploy_release.py`](deployment-preflight.md) 正向部署入口；它在调用已有
+installer 前自动核对证据及身份，随后仍需运行 Smoke。下文的底层 installer
+说明不代表可绕过该正向入口；兼容回滚仍按原来的显式授权流程操作。
 
 例如，Gateway-only 使用 `RELEASE_SERVICES=gateway` 和
 `scripts/install_dashboard_launchd.sh --mode gateway`；Prediction-only 使用

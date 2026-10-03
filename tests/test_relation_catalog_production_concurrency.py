@@ -19,6 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from timing_support import run_test_in_subprocess
 
 from open_trader.prediction_live_resolver import PredictionLiveResolver
 from open_trader.prediction_monitor_selection import MonitorSelectionStore
@@ -61,8 +62,9 @@ def _distinct_relation(tag: str) -> object:
 
 
 def test_concurrent_resolver_driver_review_and_prepare_share_one_catalog(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request) -> None:
+    if run_test_in_subprocess(request):
+        return
     catalog = RelationCatalog(tmp_path)
 
     # The driver's discovery pass is solver work, not catalog work; #91 targets
@@ -109,7 +111,10 @@ def test_concurrent_resolver_driver_review_and_prepare_share_one_catalog(
     write_errors: list[BaseException] = []
     approved: list[str] = []
 
+    start = threading.Barrier(6)
+
     def review_loop() -> None:
+        start.wait(timeout=5)
         for _ in range(150):
             try:
                 catalog.review_rows()
@@ -119,6 +124,7 @@ def test_concurrent_resolver_driver_review_and_prepare_share_one_catalog(
                 read_errors.append(exc)
 
     def prepare_loop(prefix: str) -> None:
+        start.wait(timeout=5)
         for index in range(6):
             relation = _distinct_relation(f"{prefix}-{index}")
             try:
@@ -177,8 +183,9 @@ def test_concurrent_resolver_driver_review_and_prepare_share_one_catalog(
 
 
 def test_concurrent_over_budget_approvals_preserve_committed_generation(
-    tmp_path: Path,
-) -> None:
+    tmp_path: Path, request) -> None:
+    if run_test_in_subprocess(request):
+        return
     catalog = RelationCatalog(tmp_path)
     for index in range(6):
         left = f"condition-{index}"

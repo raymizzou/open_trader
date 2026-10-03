@@ -17,6 +17,7 @@ from urllib.request import ProxyHandler
 from uuid import uuid4
 
 import pytest
+from timing_support import run_test_in_subprocess
 from polymarket import PRODUCTION, PublicClient, SecureClient
 
 import open_trader.cli as cli
@@ -408,6 +409,326 @@ def test_from_keychain_uses_official_factory_without_redacted_credentials(
     assert captured["wallet"] == WALLET
     assert "private-sentinel" not in repr(captured["api_key"])
     assert "builder-secret-sentinel" not in repr(captured["api_key"])
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    ("allowed", "blocked", "malformed", "timeout", "initialization", "keychain", "account"),
+)
+def test_wallet_status_dispatch_is_read_only_and_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    outcome: str,
+) -> None:
+    config = TradingConfig(SIGNER, WALLET)
+    adapter, _ = make_adapter()
+    calls: list[str] = []
+    monkeypatch.setattr(cli, "load_trading_config", lambda _: config)
+
+    def initialize(actual_config: TradingConfig, *, read_only: bool = False):
+        assert actual_config is config
+        assert read_only is True, "wallet status must not select SDK create"
+        calls.append("initialize")
+        if outcome == "initialization":
+            raise polymarket_trading.PolymarketTradingError("auth")
+        if outcome == "keychain":
+            raise polymarket_trading.KeychainError("private-sentinel")
+        return adapter
+
+    def account_snapshot():
+        calls.append("account")
+        if outcome == "account":
+            raise polymarket_trading.PolymarketTradingError("network")
+        return SimpleNamespace(positions=("one",))
+
+    def region(request, *, timeout):
+        calls.append("region")
+        assert timeout == polymarket_trading.GEOBLOCK_TIMEOUT_SECONDS
+        if outcome == "timeout":
+            raise TimeoutError("private-sentinel")
+        payload = {"blocked": False} if outcome == "allowed" else {"blocked": True}
+        if outcome == "malformed":
+            payload = {"blocked": "false"}
+        return FakeResponse(payload)
+
+    monkeypatch.setattr(cli.PolymarketTradingClient, "from_keychain", initialize)
+    monkeypatch.setattr(adapter, "account_snapshot", account_snapshot)
+    monkeypatch.setattr(polymarket_trading, "urlopen", region)
+    result = cli.main(["prediction-arb", "wallet", "status", "--config", "unused.json"])
+    output = capsys.readouterr()
+    assert result == (0 if outcome == "allowed" else 2)
+    assert "private-sentinel" not in output.out + output.err
+    if outcome in {"initialization", "keychain", "account"}:
+        assert calls == (["initialize", "account"] if outcome == "account" else ["initialize"])
+        error_code = {"initialization": "auth", "keychain": "keychain_unavailable", "account": "network"}[outcome]
+        assert output.out == ""
+        assert output.err == f"result: BLOCKED\nerror_code: {error_code}\n"
+    else:
+        assert calls == ["initialize", "account", "region"]
+        assert output.err == ""
+        assert output.out == (
+            "wallet: 0x2222...2222\n"
+            f"geoblock: {'allowed' if outcome == 'allowed' else 'blocked'}\n"
+            "account_reads: pass (1 positions)\n"
+            f"result: {'PASS' if outcome == 'allowed' else 'BLOCKED'}\n"
+        )
+
+
+def test_read_only_auth_derives_existing_l2_without_sdk_create(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secrets = {"signing-private-key": "private-sentinel", "builder-key": "builder-key",
+               "builder-secret": "builder-secret", "builder-passphrase": "builder-passphrase"}
+    monkeypatch.setattr(polymarket_trading, "load_keychain_secret", lambda account, **_: secrets[account])
+    monkeypatch.setattr(polymarket_trading, "_derive_existing_clob_credentials",
+                        lambda private_key: "existing-l2")
+    captured = {}
+    def factory(**kwargs):
+        captured.update(kwargs)
+        return FakeClient()
+    PolymarketTradingClient.from_keychain(TradingConfig(SIGNER, WALLET),
+                                          client_factory=factory, read_only=True)
+    assert captured["credentials"] == "existing-l2"
+    assert "api_key" in captured
+
+
+def test_read_only_auth_real_sdk_never_creates_key_or_deploys_wallet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+    from eth_account import Account
+    from polymarket._internal.wallet import derive_beacon_deposit_wallet_address
+    from polymarket.clients._transport import SyncTransport
+
+    private_key = "0x" + "11" * 32
+    signer = Account.from_key(private_key).address
+    wallet = derive_beacon_deposit_wallet_address(signer, PRODUCTION.wallet_derivation)
+    secrets = {"signing-private-key": private_key, "builder-key": "builder-key",
+               "builder-secret": "builder-secret", "builder-passphrase": "builder-passphrase"}
+    monkeypatch.setattr(polymarket_trading, "load_keychain_secret", lambda account, **_: secrets[account])
+    requests = []
+    def request(self, method, path, **kwargs):
+        requests.append((method, path))
+        if method != "GET" or path != "/auth/derive-api-key":
+            raise AssertionError("read-only bootstrap attempted a non-derivation request")
+        # Structurally valid but revoked L2 material. A validation fallback
+        # would POST /auth/api-key; construction must not enter that path.
+        return httpx.Response(200, json={"apiKey":"revoked", "secret":"c2VjcmV0",
+                                         "passphrase":"revoked"}, request=httpx.Request("GET", "https://clob.polymarket.com" + path))
+    monkeypatch.setattr(SyncTransport, "_request", request)
+    monkeypatch.setattr(SecureClient, "_ensure_wallet_ready",
+                        lambda self: (_ for _ in ()).throw(AssertionError("wallet deployment path")))
+    adapter = PolymarketTradingClient.from_keychain(
+        TradingConfig(signer, wallet), read_only=True
+    )
+    try:
+        assert requests == [("GET", "/auth/derive-api-key")]
+        assert adapter.config.wallet_address == wallet
+    finally:
+        adapter.close()
+
+
+def test_file_credentials_require_private_owned_regular_bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    private.chmod(0o700)
+    bundle = private / "polymarket.json"
+    accounts = {account: f"value-{account}" for account in polymarket_trading.KEYCHAIN_ACCOUNTS}
+    bundle.write_text(json.dumps({KEYCHAIN_SERVICE: accounts}))
+    bundle.chmod(0o600)
+    monkeypatch.setenv("OPEN_TRADER_CREDENTIAL_BACKEND", "file")
+    monkeypatch.setenv("OPEN_TRADER_CREDENTIAL_FILE", str(bundle))
+    assert load_keychain_secret("builder-key") == "value-builder-key"
+    bundle.chmod(0o644)
+    with pytest.raises(Exception) as error:
+        load_keychain_secret("builder-key")
+    assert "value-builder-key" not in str(error.value)
+    bundle.chmod(0o600)
+    private.chmod(0o755)
+    with pytest.raises(Exception):
+        load_keychain_secret("builder-key")
+    private.chmod(0o700)
+    bundle.write_text(json.dumps({KEYCHAIN_SERVICE: {"builder-key": "only-one"}}))
+    with pytest.raises(Exception):
+        load_keychain_secret("builder-key")
+    bundle.write_text(json.dumps({KEYCHAIN_SERVICE: accounts}))
+    link = private / "linked.json"
+    link.symlink_to(bundle)
+    monkeypatch.setenv("OPEN_TRADER_CREDENTIAL_FILE", str(link))
+    with pytest.raises(Exception):
+        load_keychain_secret("builder-key")
+    directory_link = tmp_path / "linked-private"
+    directory_link.symlink_to(private, target_is_directory=True)
+    monkeypatch.setenv("OPEN_TRADER_CREDENTIAL_FILE", str(directory_link / "polymarket.json"))
+    with pytest.raises(Exception):
+        load_keychain_secret("builder-key")
+    monkeypatch.setenv("OPEN_TRADER_CREDENTIAL_FILE", str(bundle))
+    owner = polymarket_trading.os.geteuid()
+    monkeypatch.setattr(polymarket_trading.os, "geteuid", lambda: owner + 1)
+    with pytest.raises(Exception):
+        load_keychain_secret("builder-key")
+
+
+def test_file_credentials_never_fall_back_to_keychain(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPEN_TRADER_CREDENTIAL_BACKEND", "file")
+    monkeypatch.setenv("OPEN_TRADER_CREDENTIAL_FILE", str(tmp_path / "missing.json"))
+    with pytest.raises(Exception):
+        load_keychain_secret("builder-key", run=lambda *a, **k: pytest.fail("Keychain fallback"))
+
+
+@pytest.mark.parametrize("rate_market_unknown", (False, True))
+def test_data_check_samples_current_catalog_without_mixing_old_account_markets(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], rate_market_unknown: bool
+) -> None:
+    from contextlib import nullcontext
+
+    metadata_reads = []
+    class Reader:
+        def close(self): pass
+        def _lp_account_facts(self, **_):
+            return {"open_orders": ({"condition_id": "old"},), "positions": (), "raw_trades": (),
+                    "balance": Decimal("0"), "allowance": Decimal("0"), "open_orders_complete": True,
+                    "positions_complete": True, "trades_complete": True, "checked_at": datetime.now(UTC)}
+        def lp_reward_catalog(self):
+            return {"state": "known", "complete": True,
+                    "markets": ({"condition_id": "a"}, {"condition_id": "b"}),
+                    "checked_at": datetime.now(UTC)}
+        def lp_market_metadata_batch(self, ids):
+            metadata_reads.extend(ids)
+            return {"state": "known", "markets": {cid: {"outcomes": {"yes": {"token_id": cid+"-yes"}}} for cid in ids},
+                    "failed_ids": {}, "deferred_ids": (), "confirmed_absent_ids": ()}
+        def lp_order_books(self, ids): return {tid: {} for tid in ids}
+        def lp_price_history(self, ids, **_): return {"state": "known", "history": {tid: [] for tid in ids}, "unknown_token_ids": []}
+        def lp_account_trades(self, ids): return {"state": "known", "complete": True, "trades": {cid: () for cid in ids}}
+        def lp_reward_rates(self):
+            markets = ({"a": {"state": "unknown", "reason": "reward_share_missing"}}
+                       if rate_market_unknown else {})
+            return {"state": "known", "complete": True, "markets": markets}
+        def lp_reward_snapshots(self, day, ids): return {cid: {"state": "known"} for cid in ids}
+        def lp_reward_percentages(self): return {"state": "known", "percentages": {}}
+
+    monkeypatch.setattr(cli, "load_trading_config", lambda _: TradingConfig(SIGNER, WALLET))
+    monkeypatch.setattr(cli.PolymarketTradingClient, "from_keychain", lambda *_, **__: Reader())
+    monkeypatch.setattr(cli, "guard_polymarket_client", lambda *_, **__: nullcontext())
+    monkeypatch.setenv("OPEN_TRADER_CREDENTIAL_BACKEND", "keychain")
+    assert cli._prediction_data_check(Path("unused"), sample=1) == (2 if rate_market_unknown else 0)
+    sample = json.loads(capsys.readouterr().out)
+    assert sample["result"] == ("BLOCKED" if rate_market_unknown else "PARTIAL")
+    assert metadata_reads == ["a"]
+    assert sample["scope"]["market_sample_count"] == 1
+    assert sample["scope"]["history_window_utc"][1] - sample["scope"]["history_window_utc"][0] == 86400
+    assert sample["checks"]["reward_catalog"]["pagination"] == "complete"
+    assert sample["checks"]["account_trades"]["pagination"] == "complete"
+    assert sample["checks"]["market_rules"]["pagination"] == "not_reported"
+    assert all(row["scope"] and row["pagination"] for row in sample["checks"].values())
+    rates = sample["checks"]["reward_rates"]
+    assert rates["pagination"] == "complete"
+    assert rates["complete"] is True
+    assert rates["unknown_market_count"] == (1 if rate_market_unknown else 0)
+    if rate_market_unknown:
+        assert rates["status"] == "unknown"
+        assert rates["reason"] == "reward_market_facts_unknown"
+        assert rates["unknown_reason_counts"] == {"reward_share_missing": 1}
+    else:
+        assert rates["status"] == "ready"
+        assert rates["count"] == 0
+
+
+def test_data_check_requires_explicit_credential_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OPEN_TRADER_CREDENTIAL_BACKEND", raising=False)
+    monkeypatch.setattr(cli, "load_trading_config", lambda _: TradingConfig(SIGNER, WALLET))
+    monkeypatch.setattr(cli.PolymarketTradingClient, "from_keychain",
+                        lambda *a, **k: pytest.fail("implicit Keychain fallback"))
+    with pytest.raises(ValueError, match="credential_backend_unset"):
+        cli._prediction_data_check(Path("unused"), sample=1)
+
+
+def test_read_auth_separates_initialization_and_account_read(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from contextlib import nullcontext
+    class Reader:
+        def close(self): pass
+        def _lp_account_facts(self, **_):
+            return {"open_orders": ("one",), "positions": ("one",), "raw_trades": (),
+                    "balance": Decimal("0"), "allowance": Decimal("0"),
+                    "open_orders_complete": True, "positions_complete": True,
+                    "trades_complete": True, "checked_at": datetime.now(UTC)}
+    monkeypatch.setenv("OPEN_TRADER_CREDENTIAL_BACKEND", "file")
+    monkeypatch.setenv("OPEN_TRADER_CREDENTIAL_FILE", "/private/credentials.json")
+    monkeypatch.setattr(cli, "load_trading_config", lambda _: TradingConfig(SIGNER, WALLET))
+    monkeypatch.setattr(cli.PolymarketTradingClient, "from_keychain", lambda *_, **__: Reader())
+    monkeypatch.setattr(cli, "guard_polymarket_client", lambda *_, **__: nullcontext())
+    assert cli._prediction_read_auth(Path("unused")) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["initialization"]["status"] == "ready"
+    assert result["account_read"]["status"] == "ready"
+    assert result["guard"] == {"mutation_attempts": 0, "notification_attempts": 0}
+
+
+def test_read_auth_trading_region_is_optional_for_paused_shadow(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from contextlib import nullcontext
+    class Reader:
+        def close(self): pass
+        def geoblock_allowed(self): return False
+        def _lp_account_facts(self, **_):
+            return {"open_orders": (), "positions": (), "raw_trades": (),
+                    "balance": Decimal("0"), "allowance": Decimal("0"),
+                    "open_orders_complete": True, "positions_complete": True,
+                    "trades_complete": True, "checked_at": datetime.now(UTC)}
+    monkeypatch.setenv("OPEN_TRADER_CREDENTIAL_BACKEND", "keychain")
+    monkeypatch.setattr(cli, "load_trading_config", lambda _: TradingConfig(SIGNER, WALLET))
+    monkeypatch.setattr(cli.PolymarketTradingClient, "from_keychain", lambda *_, **__: Reader())
+    monkeypatch.setattr(cli, "guard_polymarket_client", lambda *_, **__: nullcontext())
+    assert cli._prediction_read_auth(Path("unused")) == 0
+    capsys.readouterr()
+    assert cli._prediction_read_auth(Path("unused"), require_trading_region=True) == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result["initialization"]["status"] == "ready"
+    assert result["account_read"]["status"] == "ready"
+    assert result["trading_region"] == {"status": "blocked", "reason": "geoblock_denied_or_unavailable"}
+
+
+@pytest.mark.parametrize("catalog_complete", (False, True))
+def test_data_check_empty_catalog_blocks_downstream_with_reasons_and_scope(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], catalog_complete: bool
+) -> None:
+    from contextlib import nullcontext
+    class Reader:
+        def close(self): pass
+        def _lp_account_facts(self, **_):
+            return {"open_orders": (), "positions": (), "raw_trades": (),
+                    "balance": None, "allowance": None, "open_orders_complete": False,
+                    "positions_complete": False, "trades_complete": False,
+                    "checked_at": datetime.now(UTC)}
+        def lp_reward_catalog(self):
+            return {"state": "known" if catalog_complete else "unknown", "complete": catalog_complete, "markets": (),
+                    "reason": "reward_catalog_read_failed", "checked_at": datetime.now(UTC)}
+        def lp_market_metadata_batch(self, ids):
+            pytest.fail("empty catalog must not read market metadata")
+        def lp_order_books(self, ids): return {}
+        def lp_price_history(self, ids, **_): return {"state": "unknown", "history": {}, "unknown_token_ids": []}
+        def lp_reward_rates(self): return {"complete": False, "markets": {}, "checked_at": datetime.now(UTC)}
+        def lp_reward_percentages(self): return {"state": "unknown", "percentages": {}, "checked_at": datetime.now(UTC)}
+        def lp_reward_snapshots(self, day, ids): return {}
+    monkeypatch.setenv("OPEN_TRADER_CREDENTIAL_BACKEND", "keychain")
+    monkeypatch.setattr(cli, "load_trading_config", lambda _: TradingConfig(SIGNER, WALLET))
+    monkeypatch.setattr(cli.PolymarketTradingClient, "from_keychain", lambda *_, **__: Reader())
+    monkeypatch.setattr(cli, "guard_polymarket_client", lambda *_, **__: nullcontext())
+    assert cli._prediction_data_check(Path("unused"), sample=1) == 2
+    report = json.loads(capsys.readouterr().out)
+    assert report["result"] == "BLOCKED"
+    assert report["checks"]["market_rules"]["status"] == "unknown"
+    assert report["checks"]["market_rules"]["reason"] == "reward_catalog_unavailable_or_empty"
+    if not catalog_complete:
+        assert report["checks"]["reward_catalog"]["reason"] == "reward_catalog_read_failed"
+    for name, row in report["checks"].items():
+        if row["status"] == "unknown":
+            assert row["reason"]
+        assert row["scope"]
+        assert row["pagination"]
 
 
 @pytest.mark.parametrize("identity", (False,))
@@ -859,6 +1180,60 @@ def test_lp_catalog_reads_all_reward_pages_without_double_counting() -> None:
     assert incomplete["error_type"] == "RuntimeError"
 
 
+def test_lp_catalog_releases_sdk_rows_while_reading_all_pages() -> None:
+    """The public read must not hold earlier SDK pages until conversion ends."""
+    import weakref
+
+    live = weakref.WeakSet()
+    observed_live: list[int] = []
+
+    class Reward:
+        def __init__(self, index):
+            self.index = index
+            live.add(self)
+
+        def model_dump(self, **kwargs):
+            return {
+                "condition_id": f"condition-{self.index}",
+                "rewards_config": [{
+                    "id": self.index,
+                    "asset_address": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+                    "start_date": "2024-03-01", "end_date": "2500-12-31",
+                    "rate_per_day": "1",
+                }],
+            }
+
+    class Pages:
+        def iter_items(self):
+            for index in range(40):
+                observed_live.append(len(live))
+                yield Reward(index)
+
+    class Public:
+        closed = False
+
+        def list_current_rewards(self, *, sponsored):
+            return () if sponsored else Pages()
+
+        def close(self):
+            self.closed = True
+
+    public = Public()
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET), client=FakeClient(),
+        public_client_factory=lambda: public,
+    )
+    result = adapter.lp_reward_catalog()
+
+    assert result["state"] == "known" and result["complete"] is True
+    assert [row["condition_id"] for row in result["markets"]] == [
+        f"condition-{index}" for index in range(40)
+    ]
+    assert result["daily_pool_usd"] == Decimal("40")
+    assert public.closed and not live
+    assert max(observed_live) <= 2
+
+
 def test_lp_selected_reward_facts_preserve_identity_time_and_failures() -> None:
     native_asset = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
     sponsored_asset = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
@@ -1172,9 +1547,14 @@ def test_lp_trial_selected_facts_preserve_identity_and_time() -> None:
     assert account["open_orders"][0]["condition_id"] == "condition-a"
 
 
-def test_lp_account_snapshot_shared_single_flight_and_ttl() -> None:
+def test_lp_account_snapshot_shared_single_flight_and_ttl(request) -> None:
     """Issue #146 A7: scan, maintenance, and dashboard snapshot share one
     account read per TTL window; concurrent callers coalesce into one read."""
+    if run_test_in_subprocess(request):
+        return
+
+    entered, release = threading.Event(), threading.Event()
+    attempted = threading.Event()
 
     class SharedAccountClient(FakeClient):
         def __init__(self) -> None:
@@ -1185,6 +1565,9 @@ def test_lp_account_snapshot_shared_single_flight_and_ttl() -> None:
         def list_open_orders(self, **kwargs: object) -> list[object]:
             with self._read_lock:
                 self.account_reads += 1
+            if self.account_reads == 1:
+                entered.set()
+                assert release.wait(5)
             return []
 
         def list_positions(self, **kwargs: object) -> list[object]:
@@ -1199,6 +1582,23 @@ def test_lp_account_snapshot_shared_single_flight_and_ttl() -> None:
         client=client,
         public_client_factory=PublicClient,
     )
+    real_lock = adapter._lp_account_shared_lock
+    attempts_lock = threading.Lock()
+    attempts = 0
+
+    class ObservedLock:
+        def __enter__(self):
+            nonlocal attempts
+            with attempts_lock:
+                attempts += 1
+                if attempts == 3:
+                    attempted.set()
+            return real_lock.__enter__()
+
+        def __exit__(self, *args):
+            return real_lock.__exit__(*args)
+
+    adapter._lp_account_shared_lock = ObservedLock()
     monotonic = {"now": 1000.0}
     original_realtime = polymarket_trading.time
 
@@ -1210,9 +1610,15 @@ def test_lp_account_snapshot_shared_single_flight_and_ttl() -> None:
     polymarket_trading.time = FakeTime  # type: ignore[misc]
     try:
         with ThreadPoolExecutor(max_workers=3) as pool:
-            concurrent = list(
-                pool.map(lambda _: adapter.lp_account_snapshot_shared(), range(3))
-            )
+            owner = pool.submit(adapter.lp_account_snapshot_shared)
+            try:
+                assert entered.wait(2)
+                joiners = [pool.submit(adapter.lp_account_snapshot_shared) for _ in range(2)]
+                assert attempted.wait(2), "both joiners must attempt the held cache lock"
+                assert client.account_reads == 1
+            finally:
+                release.set()
+            concurrent = [future.result(timeout=5) for future in [owner, *joiners]]
         sequential = [adapter.lp_account_snapshot_shared() for _ in range(3)]
         assert client.account_reads == 1
         assert all(row["authenticated"] is True for row in concurrent)
@@ -1229,7 +1635,171 @@ def test_lp_account_snapshot_shared_single_flight_and_ttl() -> None:
         adapter.lp_account_snapshot_shared(max_age_seconds=1.0)
         assert client.account_reads == 3
     finally:
+        release.set()
         polymarket_trading.time = original_realtime  # type: ignore[misc]
+
+
+@pytest.mark.parametrize('trade_generation', [None, 7])
+def test_guarded_sdk_timestamps_survive_shared_account_cache(monkeypatch, trade_generation):
+    from polymarket.models import OpenOrder, ClobTrade
+    from open_trader.prediction_read_only import PolymarketReadOnlyGuard, guard_polymarket_client
+    from copy import deepcopy
+    from pydantic import ValidationError
+    stamp = '2026-09-30T16:01:02.123456+05:30'
+    expected = datetime.fromisoformat(stamp).astimezone(UTC)
+    condition = '0x' + 'ab'*32
+    order = OpenOrder.model_validate(dict(id='order-1', market=condition, asset_id='123',
+        owner='owner', maker_address=WALLET, side='BUY', price='0.5', original_size='10',
+        size_matched='0', outcome='YES', order_type='GTD', status='LIVE',
+        created_at=stamp, expiration=int(expected.timestamp())))
+    trade = ClobTrade.model_validate(dict(id='trade-1', market=condition, asset_id='123',
+        owner='owner', maker_address=WALLET, taker_order_id='order-1', side='BUY',
+        trader_side='TAKER', price='0.5', size='1', outcome='YES', status='MATCHED',
+        fee_rate_bps='0', bucket_index=0, transaction_hash='0x'+'cd'*32, maker_orders=[dict(
+            order_id='maker-1', asset_id='123', maker_address=WALLET, owner='owner',
+            side='BUY', price='0.5', matched_amount='1', outcome='YES')],
+        match_time=stamp, last_update=stamp))
+    sdk = FakeClient()
+    monkeypatch.setattr(sdk, 'list_open_orders', lambda **kwargs: [order])
+    monkeypatch.setattr(sdk, 'list_account_trades', lambda **kwargs: [trade])
+    monkeypatch.setattr(sdk, 'list_positions', lambda **kwargs: [])
+    adapter = PolymarketTradingClient(TradingConfig(SIGNER, WALLET), sdk)
+    monkeypatch.setattr(adapter, 'lp_market_metadata', lambda ids: {})
+    guard = PolymarketReadOnlyGuard()
+    with guard_polymarket_client(adapter, guard):
+        provider = None if trade_generation is None else lambda: trade_generation
+        first = adapter.lp_account_snapshot_shared(trade_generation_provider=provider)
+        second = adapter.lp_account_snapshot_shared(trade_generation_provider=provider)
+        for field in ('created_at', 'expiration'):
+            assert type(first['open_orders'][0][field]) is datetime
+            assert first['open_orders'][0][field] == (expected if field == 'created_at'
+                else expected.replace(microsecond=0))
+        for field in ('matched_at', 'updated_at'):
+            assert type(first['account_trades'][0][field]) is datetime
+            assert first['account_trades'][0][field] == expected
+        assert first['open_orders_complete'] is True and first['positions_complete'] is True
+        assert first['display_trades_complete'] is True
+        first['open_orders'][0]['price'] = Decimal('0.1')
+        first['account_trades'][0]['price'] = Decimal('0.1')
+        assert second['open_orders'][0]['price'] == Decimal('0.5')
+        assert second['account_trades'][0]['price'] == Decimal('0.5')
+        assert guard.attempts == []
+        account_round = adapter.lp_account_round_begin(lambda: 7)
+        try:
+            assert adapter.lp_open_orders_for_round(account_round)[0]['order_id'] == 'order-1'
+            rounded = adapter.lp_account_snapshot(account_round=account_round)
+            follower = adapter.lp_account_snapshot(account_round=account_round)
+            copied = deepcopy(deepcopy(rounded))
+            raw = copied['raw_trades'][0]
+            assert isinstance(raw, ClobTrade)
+            assert isinstance(raw.model_dump()['matched_at'], datetime)
+            assert datetime.fromisoformat(raw.model_dump()['matched_at'].isoformat()) == expected
+            assert raw.model_dump()['maker_orders'][0]['matched_amount'] == Decimal('1')
+            assert raw is not follower['raw_trades'][0]
+            assert raw.maker_orders[0] is not follower['raw_trades'][0].maker_orders[0]
+            with pytest.raises(ValidationError, match='frozen'):
+                raw.maker_orders[0].matched_amount = Decimal('9')
+            with pytest.raises(ValidationError, match='frozen'):
+                raw.price = Decimal('0.1')
+            assert follower['raw_trades'][0].model_dump()['price'] == Decimal('0.5')
+            assert rounded['raw_trades'][0].model_dump()['maker_orders'][0]['matched_amount'] == Decimal('1')
+            assert trade.price == Decimal('0.5')
+            assert trade.maker_orders[0].matched_amount == Decimal('1')
+            assert copied['trade_generation'] == follower['trade_generation'] == 7
+            if trade_generation is not None:
+                with pytest.raises(ValidationError, match='frozen'):
+                    first['raw_trades'][0].price = Decimal('0.2')
+                third = adapter.lp_account_snapshot_shared(trade_generation_provider=provider)
+                assert second['raw_trades'][0].model_dump()['price'] == Decimal('0.5')
+                assert third['raw_trades'][0].model_dump()['price'] == Decimal('0.5')
+        finally:
+            adapter.lp_account_round_end(account_round)
+        assert guard.attempts == []
+
+
+@pytest.mark.parametrize('selected', [False, True])
+@pytest.mark.parametrize('empty_page', [False, True])
+def test_reward_catalog_cancels_at_sdk_page_boundary(selected, empty_page):
+    from polymarket.pagination import Page, Paginator
+    stop = threading.Event()
+    fetched = []
+    clients = []
+    class Public:
+        def __init__(self):
+            self.closed = False
+            clients.append(self)
+        def rewards(self, sponsored):
+            def fetch(cursor):
+                fetched.append((sponsored, cursor))
+                if cursor is not None:
+                    return Page(items=(), has_more=False)
+                stop.set()
+                return Page(items=() if empty_page else ({'condition_id':'condition-a'},),
+                            has_more=True, next_cursor='next')
+            return Paginator(fetch)
+        def list_current_rewards(self, *, sponsored):
+            return self.rewards(sponsored)
+        def list_market_rewards(self, *, condition_id, sponsored):
+            return self.rewards(sponsored)
+        def close(self):
+            self.closed = True
+    adapter = PolymarketTradingClient(TradingConfig(SIGNER, WALLET), FakeClient(),
+                                     public_client_factory=Public)
+    # One worker keeps the selected-source cancellation boundary deterministic.
+    from unittest.mock import patch
+    with patch.object(polymarket_trading, 'LP_REWARD_SELECTED_MAX_CONCURRENCY', 1):
+        result = adapter.lp_reward_catalog(stop_event=stop,
+            **({'condition_ids':('condition-a',)} if selected else {}))
+    assert fetched == [(False, None)]
+    assert all(client.closed for client in clients)
+    assert result['state'] == 'unknown' and result['complete'] is False
+    if selected:
+        assert 'reward_read_cancelled' in result['markets'][0]['reason_codes']
+    else:
+        assert result['reason'] == 'cancelled'
+
+
+def test_guarded_sdk_book_timestamp_copies_as_scalar():
+    from copy import deepcopy
+    from polymarket.models import OrderBook
+    from open_trader.prediction_read_only import PolymarketReadOnlyGuard
+    book = OrderBook.model_validate(dict(market='0x'+'ab'*32, asset_id='123',
+        timestamp='1790750000123', bids=[], asks=[], min_order_size='5', tick_size='0.01',
+        neg_risk=False, hash='book-hash'))
+    guard = PolymarketReadOnlyGuard()
+    normalized = polymarket_trading._lp_book(guard.protect(book))
+    copied = deepcopy(normalized)
+    assert type(copied['timestamp']) is datetime
+    assert type(copied['source_timestamp']) is datetime
+    assert copied['timestamp'] == book.timestamp
+    assert copied['source_timestamp'] == book.timestamp
+    assert guard.attempts == []
+
+
+@pytest.mark.parametrize('reader', ['iter_items', 'all', 'pages_without_iter'])
+def test_reward_catalog_cancellation_keeps_legacy_iterator_compatibility(reader):
+    stop = threading.Event()
+    closed = []
+    class Rows:
+        def items(self):
+            stop.set()
+            yield {'condition_id':'condition-a'}
+            raise AssertionError('cancelled iterator advanced')
+    setattr(Rows, 'all' if reader == 'all' else 'iter_items', Rows.items)
+    if reader == 'pages_without_iter':
+        Rows.first_page = lambda self: (_ for _ in ()).throw(AssertionError('unexpected first_page'))
+    class Public:
+        def list_current_rewards(self, *, sponsored):
+            assert not sponsored
+            return Rows()
+        def close(self):
+            closed.append(True)
+    adapter = PolymarketTradingClient(TradingConfig(SIGNER, WALLET), FakeClient(),
+                                     public_client_factory=Public)
+    result = adapter.lp_reward_catalog(stop_event=stop)
+    assert result['state'] == 'unknown' and result['complete'] is False
+    assert result['reason'] == 'cancelled'
+    assert closed == [True]
 
 
 def test_lp_reward_snapshot_preserves_identity_assets_and_scope() -> None:
@@ -1502,6 +2072,20 @@ def test_lp_reward_snapshots_reads_account_total_once_for_multiple_conditions() 
     market_calls = [params for path, params in calls if path == "/rewards/user"]
     assert {params["sponsored"] for params in market_calls} == {False, True}
     assert all(params["maker_address"] == WALLET for _, params in calls)
+
+
+def test_lp_reward_snapshot_failure_reports_only_safe_reason() -> None:
+    class FailingTransport:
+        def get_json(self, path, *, params):
+            raise ValueError("secret-sentinel")
+    class RewardClient(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self._ctx = SimpleNamespace(wallet_type="EOA", secure_clob=FailingTransport())
+    adapter = PolymarketTradingClient(TradingConfig(SIGNER, WALLET), RewardClient())
+    result = adapter.lp_reward_snapshots("2026-09-29", ("condition-one",))
+    assert result["condition-one"]["reason"] == "ValueError"
+    assert "secret-sentinel" not in repr(result)
 
 
 def test_lp_reward_rates_use_current_scoped_percentages() -> None:
@@ -1977,6 +2561,118 @@ def test_lp_reward_rates_zero_component_needs_no_share_and_isolates_failures() -
     assert markets[pool_failure]["reason"] == "reward_read_failed"
     assert markets[healthy]["state"] == "known"
     assert markets[healthy]["hourly_reward_usd"] == Decimal("0.05")
+
+
+def test_lp_reward_rates_keep_returned_share_when_embedded_config_inactive() -> None:
+    """#202: a returned row's ``earning_percentage`` is authoritative for its
+    sponsored scope; an inactive embedded ``rewards_config`` window must not
+    drop it.  Genuine upstream absence still stays UNKNOWN."""
+
+    condition_id = "condition-inactive-config"
+    today = datetime.now(UTC).date()
+    expired_window = {
+        "start_date": (today - timedelta(days=2)).isoformat(),
+        "end_date": (today - timedelta(days=1)).isoformat(),
+    }
+    native_share = "24"
+
+    def build_adapter(*, native_row: bool) -> PolymarketTradingClient:
+        native_rows = (
+            [
+                {
+                    "condition_id": condition_id,
+                    "earning_percentage": native_share,
+                    "rewards_config": [
+                        {
+                            "id": "native-expired",
+                            "asset_address": _LP_RATES_USDC_ASSET,
+                            "rate_per_day": "1",
+                            **expired_window,
+                        }
+                    ],
+                }
+            ]
+            if native_row
+            else []
+        )
+        sponsored_rows = [
+            {
+                "condition_id": condition_id,
+                "earning_percentage": "0",
+                "rewards_config": [
+                    {
+                        "id": "sponsored-active",
+                        "asset_address": _LP_RATES_USDC_ASSET,
+                        "rate_per_day": "0",
+                        **_LP_RATES_WINDOW,
+                    }
+                ],
+            }
+        ]
+
+        class Transport:
+            def get_json(self, path: str, *, params: dict[str, object]) -> object:
+                assert path == "/rewards/user/markets"
+                data = (
+                    native_rows
+                    if params["sponsored"] is False
+                    else sponsored_rows
+                )
+                return {"data": data, "next_cursor": "LTE="}
+
+        class PublicRewards:
+            def list_market_rewards(
+                self, *, condition_id: str, sponsored: bool | None = None
+            ):
+                assert sponsored is not None
+                # N=$1/day and T=$1/day, so S=0 — the #202 pool shape.
+                return (
+                    {
+                        "condition_id": condition_id,
+                        "rewards_config": [
+                            {
+                                "id": f"pub-{sponsored}",
+                                "asset_address": _LP_RATES_USDC_ASSET,
+                                "rate_per_day": "1",
+                                **_LP_RATES_WINDOW,
+                            }
+                        ],
+                    },
+                )
+
+            def close(self) -> None:
+                return None
+
+        class RewardClient(FakeClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self._ctx = SimpleNamespace(
+                    wallet_type="EOA", secure_clob=Transport()
+                )
+
+        return PolymarketTradingClient(
+            TradingConfig(SIGNER, WALLET),
+            RewardClient(),
+            public_client_factory=lambda: PublicRewards(),
+        )
+
+    # Confirmed #202 safety shape: genuine native absence stays UNKNOWN.
+    missing = build_adapter(native_row=False).lp_reward_rates()["markets"][condition_id]
+    assert missing["state"] == "unknown"
+    assert missing["hourly_reward_usd"] is None
+    assert missing["reason"] == "reward_share_missing"
+    assert missing["sources"] == ("sponsored",)
+
+    # Confirmed parser defect: the returned native share must survive even
+    # though its embedded config window ended yesterday.
+    dropped = build_adapter(native_row=True).lp_reward_rates()["markets"][condition_id]
+    assert dropped["state"] == "known"
+    assert dropped["hourly_reward_usd"] == Decimal("0.01")
+    assert dropped["sources"] == ("native", "sponsored")
+    assert dropped["native"]["state"] == "known"
+    assert dropped["native"]["earning_percentage"] == Decimal(native_share)
+    assert dropped["native"]["hourly_reward_usd"] == Decimal("0.01")
+    assert dropped["sponsored"]["earning_percentage"] == Decimal("0")
 
 
 def test_lp_rewards_preserve_raw_accrual_when_usd_value_is_unknown() -> None:
@@ -4485,6 +5181,7 @@ class _LpMetadataProbe:
                 *,
                 condition_ids: tuple[str, ...],
                 page_size: int | None = None,
+                closed: bool | None = None,
             ) -> tuple[object, ...]:
                 assert self.closed is False
                 requested_ids = tuple(condition_ids)
@@ -4751,6 +5448,57 @@ def _lp_market_page_response(request, rows, *, next_cursor=None):
     if next_cursor is not None:
         payload["next_cursor"] = next_cursor
     return httpx.Response(200, json=payload, request=request)
+
+
+@pytest.mark.parametrize("fallback", ["failed", "absent", "cancelled"])
+def test_lp_metadata_closed_fallback_preserves_known_and_only_caches_proven_absence(fallback) -> None:
+    import httpx
+
+    present, missing = "0x" + "a" * 64, "0x" + "b" * 64
+    stop = threading.Event()
+    requests = []
+    backing = _LpMetadataBackingStore({})
+
+    def handler(request):
+        assert request.method == "GET"
+        assert request.url.path == "/markets/keyset"
+        closed = request.url.params.get("closed") == "true"
+        requests.append(closed)
+        if closed:
+            if fallback == "failed":
+                raise httpx.ReadTimeout("offline closed lookup timeout", request=request)
+            if fallback == "cancelled":
+                stop.set()
+            return _lp_market_page_response(request, ())
+        return _lp_market_page_response(request, (_lp_market_payload(present),))
+
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET), client=object(),
+        public_client_factory=lambda: _lp_mock_public_client(handler), metadata_cache=backing,
+    )
+    result = adapter.lp_market_metadata_batch((present, missing), stop_event=stop)
+    assert requests == [False, True]
+    assert set(result["markets"]) == {present}
+    assert present in backing.rows
+    if fallback == "absent":
+        assert result["state"] == "known"
+        assert result["confirmed_absent_ids"] == (missing,)
+        assert backing.rows[missing][1] is None
+        assert result["failed_ids"] == {}
+    else:
+        assert result["confirmed_absent_ids"] == ()
+        assert missing not in backing.rows
+        if fallback == "failed":
+            assert result["state"] == "partial"
+            assert set(result["failed_ids"]) == {missing}
+        else:
+            assert result["state"] == "cancelled"
+            assert result["deferred_ids"] == (missing,)
+    previous_reads = len(requests)
+    stop.clear()
+    again = adapter.lp_market_metadata_batch((present, missing), stop_event=stop)
+    assert set(again["markets"]) == {present}
+    assert requests[previous_reads:] == ([] if fallback == "absent" else [False, True])
 
 
 def test_lp_metadata_continues_until_requested_ids_are_accounted() -> None:
@@ -5238,6 +5986,38 @@ def test_lp_metadata_cache_hit_within_ttl(
     ) == before
 
 
+class _TrackedLPMetadata(dict):
+    """Weak-referenceable, otherwise ordinary metadata for lifetime probes."""
+
+
+def test_lp_metadata_cache_releases_objects_without_losing_cached_facts(monkeypatch):
+    import gc
+    import weakref
+    from copy import deepcopy
+
+    probe = _LpMetadataProbe()
+    condition = "0x" + "a" * 64
+    probe.market_rows[condition] = _lp_cache_market(condition, slug="release")
+    _lp_cache_clock(monkeypatch, datetime(2026, 9, 17, 12, tzinfo=UTC))
+    adapter = _lp_cache_adapter(probe)
+    fetch = adapter._fetch_lp_market_metadata
+    references = []
+
+    def observe(*args, **kwargs):
+        markets, failures, absent = fetch(*args, **kwargs)
+        tracked = {key: _TrackedLPMetadata(row) for key, row in markets.items()}
+        references.extend(weakref.ref(row) for row in tracked.values())
+        return tracked, failures, absent
+
+    monkeypatch.setattr(adapter, "_fetch_lp_market_metadata", observe)
+    expected = deepcopy(adapter.lp_market_metadata((condition,)))
+    calls = len(probe.market_queries)
+    gc.collect()
+    assert references and all(ref() is None for ref in references)
+    assert adapter.lp_market_metadata((condition,)) == expected
+    assert len(probe.market_queries) == calls
+
+
 def test_expire_lp_metadata_cache_forces_refetch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5344,7 +6124,7 @@ def test_lp_metadata_negative_ttl_requeries_after_expiry(
     first = adapter.lp_market_metadata((condition_present, condition_absent))
     assert set(first) == {condition_present}
     queries_after_first = len(probe.market_queries)
-    assert queries_after_first == 1
+    assert queries_after_first == 2
 
     read_at["value"] = read_at["value"] + timedelta(
         seconds=polymarket_trading.LP_METADATA_NEGATIVE_TTL_SECONDS - 1
@@ -5522,6 +6302,7 @@ def test_lp_metadata_batches_preserve_success_and_distinguish_absence_from_failu
             *,
             condition_ids: tuple[str, ...],
             page_size: int | None = None,
+            closed: bool | None = None,
         ) -> tuple[object, ...]:
             assert self.closed is False
             assert page_size == 100
@@ -5711,14 +6492,18 @@ def test_lp_metadata_cache_keeps_original_twelve_hour_expiry(
         (condition_present, condition_absent)
     )
     assert set(after_negative_expiry) == {condition_present}
-    assert len(probe.market_queries) == queries_after_warm + 1
+    # Absence after expiry requires complete default and closed reads.
+    assert len(probe.market_queries) == queries_after_warm + 2
+    assert probe.market_queries[queries_after_warm:] == [
+        ((condition_absent,), 100), ((condition_absent,), 100),
+    ]
     assert backing.rows[condition_absent][0] == clock_at["value"].timestamp() + 3600
     assert backing.rows[condition_absent][1] is None
 
     clock_at["value"] = read_at + timedelta(seconds=43199)
     before_positive_expiry = rebuilt.lp_market_metadata((condition_present,))
     assert set(before_positive_expiry) == {condition_present}
-    assert len(probe.market_queries) == queries_after_warm + 1
+    assert len(probe.market_queries) == queries_after_warm + 2
 
     stored_before_failure = len(backing.stored)
     probe.fail_market_reads = True
@@ -6178,3 +6963,67 @@ def test_lp_metadata_event_read_failure_not_cached(
         for condition_id in ids
     }
     assert direct_re_queried == {condition_direct}
+
+
+def test_display_account_trades_keep_malformed_rows_unknown_without_poisoning_trading(monkeypatch):
+    adapter = PolymarketTradingClient(TradingConfig(SIGNER, WALLET), client=object())
+    raw = {'id':'trade-1','asset_id':'token-1','market':'condition-1','status':'CONFIRMED',
+        'side':'BUY','trader_side':'TAKER','taker_order_id':'order-1','price':'0.4','size':'20',
+        'match_time':'2026-09-30T00:00:00Z','maker_orders':[]}
+    monkeypatch.setattr(adapter, '_lp_account_facts', lambda **kwargs:{
+        'authenticated':True,'checked_at':datetime.now(UTC),'open_orders':(), 'positions':(),
+        'trades':(), 'trades_complete':True,'raw_trades':(raw, {'bad':'row'}),
+        'balance':Decimal('12'), 'allowance':Decimal('10')})
+    monkeypatch.setattr(adapter, 'lp_market_metadata', lambda _: {})
+    snapshot = adapter.lp_account_snapshot()
+    assert snapshot['trades_complete'] is True
+    assert snapshot['trades'] == ()
+    assert snapshot['display_trades_complete'] is False
+    assert snapshot['account_trades_total'] == 2
+    assert snapshot['account_trades'][0]['trade_id'] == 'trade-1'
+    assert 'raw_trades' not in snapshot
+
+
+def test_authenticated_paused_shadow_copies_sdk_account_facts_without_stopping(tmp_path, monkeypatch):
+    from open_trader.prediction_runtime import PredictionRuntime
+    from open_trader.prediction_read_only import ReadOnlyViolation
+    import open_trader.prediction_runtime as runtime_module
+    from tests.test_polymarket_lp import _SDKAccountClient, _SDKPublicClient
+
+    now = datetime.now(UTC)
+    sdk = _SDKAccountClient(now)
+    wallet = '0x' + '3' * 40
+    adapter = PolymarketTradingClient(TradingConfig(wallet, wallet), sdk,
+        public_client_factory=lambda: _SDKPublicClient(now))
+    monkeypatch.setattr(adapter, 'lp_market_metadata', lambda ids: {})
+    monkeypatch.setenv('OPEN_TRADER_CREDENTIAL_BACKEND', 'file')
+    monkeypatch.setattr(runtime_module, 'load_trading_config', lambda _: adapter.config)
+    monkeypatch.setattr(PolymarketTradingClient, 'from_keychain', lambda *a, **k: adapter)
+    # Exercise the real paused runtime and guard offline, driving reads explicitly.
+    for name in ('_start_history_monitor', '_start_candidate_scan_monitor',
+        '_start_candidate_maintenance_monitor', '_start_candidate_competition_monitor',
+        '_start_lp_dashboard_monitor', '_start_reward_monitor', '_start_book_sampler'):
+        monkeypatch.setattr(PredictionRuntime, name, lambda *a, **k: None)
+    runtime = PredictionRuntime(data_dir=tmp_path, prediction_config_path=tmp_path/'unused.json',
+        dashboard_url='http://127.0.0.1:8766/', mode='shadow', n_leg_paused=True)
+    runtime.start()
+    try:
+        for _ in range(3):
+            account = adapter.lp_account_snapshot_shared(
+                trade_generation_provider=runtime.store.lp_trade_generation)
+            assert account['pagination_complete'] is True
+            assert account['raw_trades'][0].id == 'trade-1'
+            dashboard = runtime.execution.refresh_lp_dashboard_snapshot()
+            assert dashboard['state'] == 'ready', dashboard
+            assert len(dashboard['orders']) == 1
+        assert runtime.state == 'RUNNING'
+        assert runtime.production_owner is False
+        assert runtime.shadow_evidence['guard_attempts'] == []
+        assert runtime.shadow_evidence['first_violation'] is None
+        with pytest.raises(ReadOnlyViolation):
+            adapter.cancel_all()
+        assert runtime.poll_shadow_failure()['method'] == 'cancel_all'
+        assert runtime.state == 'STOPPED'
+    finally:
+        runtime.stop()
+    assert runtime.state == 'STOPPED'

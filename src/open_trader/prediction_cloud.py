@@ -38,6 +38,9 @@ class CloudConfig:
     role: str
     mode: str
     n_leg_paused: int
+    credential_backend: str | None = None
+    credentials_file: str = ''
+    memory_max_bytes: int = 768 * 1024 * 1024
 
     @property
     def record(self):
@@ -53,9 +56,11 @@ def load_config(path: Path) -> CloudConfig:
     if data.get('mode') not in {'production', 'shadow'}:
         raise ValueError('cloud service mode must be explicit production or shadow')
     credential_fields = ('region', 'secret', 'version', 'role')
-    if data.get('mode') == 'shadow' and data.get('n_leg_paused') == 1:
-        if any(field in data for field in credential_fields):
-            raise ValueError('credentialless paused Shadow must omit credential references')
+    if data.get('credential_backend') == 'file':
+        data.update({field: data.get(field, '') for field in credential_fields})
+    elif data.get('mode') == 'shadow' and data.get('n_leg_paused') == 1 and not any(
+        field in data for field in credential_fields
+    ):
         data.update({field:'' for field in credential_fields})
     elif any(field not in data for field in credential_fields):
         raise ValueError('credential references are required for this mode')
@@ -67,7 +72,11 @@ def load_config(path: Path) -> CloudConfig:
 
 
 def credential_backend(c: CloudConfig) -> str:
-    return 'disabled' if c.mode == 'shadow' and c.n_leg_paused == 1 else 'tencent-ssm'
+    if c.credential_backend is not None:
+        return c.credential_backend
+    return 'disabled' if c.mode == 'shadow' and c.n_leg_paused == 1 and not any(
+        (c.region, c.secret, c.version, c.role)
+    ) else 'tencent-ssm'
 
 
 def trusted_root_path(path: Path) -> None:
@@ -114,6 +123,8 @@ def trusted_layout(c: CloudConfig) -> None:
 
 
 def render_unit(c: CloudConfig) -> str:
+    if type(c.memory_max_bytes) is not int or not 64 * 1024**2 < c.memory_max_bytes <= 1_000_000_000:
+        raise ValueError('cloud memory budget must exceed 64MiB and be at most 1GB')
     for path in (c.release_root, c.runtime_root, c.python):
         if not path.is_absolute() or not re.fullmatch(r'/[A-Za-z0-9_./-]+', str(path)) or '..' in path.parts:
             raise ValueError('absolute paths without whitespace or systemd specifiers required')
@@ -128,23 +139,43 @@ def render_unit(c: CloudConfig) -> str:
         raise ValueError('cloud service mode must be explicit production or shadow')
     if not re.fullmatch(r'[0-9a-f]{40}', c.expected_sha) or type(c.n_leg_paused) is not int or c.n_leg_paused not in (0, 1):
         raise ValueError('exact SHA and explicit N-leg setting required')
-    if credential_backend(c) == 'disabled':
+    backend = credential_backend(c)
+    if backend not in {'disabled', 'tencent-ssm', 'file'}:
+        raise ValueError('unsupported credential backend')
+    if backend == 'disabled':
         if any((c.region, c.secret, c.version, c.role)):
             raise ValueError('credentialless paused Shadow must not configure credential references')
-        credential_env = f'Environment=OPEN_TRADER_CREDENTIAL_BACKEND={credential_backend(c)}\n'
+        if c.mode != 'shadow' or c.n_leg_paused != 1 or c.credentials_file:
+            raise ValueError('disabled backend requires credentialless paused Shadow')
+        credential_env = 'Environment=OPEN_TRADER_CREDENTIAL_BACKEND=disabled\n'
+    elif backend == 'file':
+        path = Path(c.credentials_file)
+        if (c.mode != 'shadow' or c.n_leg_paused != 1 or any((c.region, c.secret, c.version, c.role))
+            or not path.is_absolute() or '..' in path.parts
+            or not re.fullmatch(r'/[A-Za-z0-9_./-]+', str(path))
+            or path.is_relative_to(c.release_root)):
+            raise ValueError('file backend requires a separate paused Shadow credential path')
+        credential_env = ('Environment=OPEN_TRADER_CREDENTIAL_BACKEND=file\n'
+                          f'Environment=OPEN_TRADER_CREDENTIAL_FILE={path}\n')
     else:
+        if c.credentials_file:
+            raise ValueError('SSM backend cannot use a credential file')
         for value in (c.region, c.secret, c.version, c.role):
             if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', value):
                 raise ValueError('invalid cloud reference')
         if c.version == 'SSM_Current':
             raise ValueError('dedicated user and pinned secret version required')
-        credential_env = f'Environment=OPEN_TRADER_CREDENTIAL_BACKEND={credential_backend(c)}\n'
+        credential_env = 'Environment=OPEN_TRADER_CREDENTIAL_BACKEND=tencent-ssm\n'
         credential_env += ''.join([
             f'Environment=OPEN_TRADER_SSM_REGION={c.region}\n',
             f'Environment=OPEN_TRADER_SSM_SECRET={c.secret}\n',
             f'Environment=OPEN_TRADER_SSM_VERSION={c.version}\n',
             f'Environment=OPEN_TRADER_SSM_ROLE={c.role}\n',
         ])
+    guarded = c.mode == 'shadow' and c.n_leg_paused == 1
+    resources = (f'Environment=OPEN_TRADER_SHADOW_MEMORY_MAX_BYTES={c.memory_max_bytes}\n'
+                 f'MemoryAccounting=yes\nMemoryMax={c.memory_max_bytes}\n'
+                 'CPUAccounting=yes\nCPUQuota=100%\nTasksAccounting=yes\nTasksMax=96\n') if guarded else ''
     return f'''[Unit]
 Description=OpenTrader Prediction
 After=network-online.target
@@ -166,10 +197,10 @@ Environment=GIT_CONFIG_VALUE_0={c.release_root}
 {credential_env}Environment=OPEN_TRADER_NLEG_PAUSED={c.n_leg_paused}
 Environment=OPEN_TRADER_NLEG_PAUSED={c.n_leg_paused}
 ExecStart={c.python} -m open_trader prediction-service --mode {c.mode} --data-dir {c.runtime_root}/data --config {c.runtime_root}/config/prediction_arbitrage.json --host 127.0.0.1 --port 8769 --release-manifest {c.release_root}/ops/prediction-service-release.json
-Restart=on-failure
+{resources}Restart={'no' if guarded else 'on-failure'}
 RestartSec=30
-TimeoutStopSec=90
-SendSIGKILL=no
+TimeoutStopSec={20 if guarded else 90}
+SendSIGKILL={'yes' if guarded else 'no'}
 KillMode=control-group
 UMask=0077
 LimitCORE=0
@@ -343,7 +374,7 @@ def preflight(c: CloudConfig) -> None:
     absent(c)
     trusted_layout(c)
     run(str(c.python), '-c', 'import sys; assert sys.version_info >= (3,12)' +
-        ('' if credential_backend(c) == 'disabled' else '; import tencentcloud.ssm.v20190923.ssm_client'))
+        ('; import tencentcloud.ssm.v20190923.ssm_client' if credential_backend(c) == 'tencent-ssm' else ''))
     from .prediction_arbitrage_store import read_minimum_reader_generation
     if read_minimum_reader_generation(c.runtime_root/'data') > release_identity(c)['reader_generation']:
         raise ValueError('release cannot read this database')
@@ -352,12 +383,11 @@ def preflight(c: CloudConfig) -> None:
                   if line.startswith('Environment=')]
     if run('runuser', '-u', c.user, '--', 'env', *references, 'git', '-C', str(c.release_root), 'rev-parse', 'HEAD') != c.expected_sha:
         raise ValueError('service user cannot verify release SHA')
-    # Paused Shadow initializes neither execution nor LP and therefore must not
-    # make a credential request merely to prove a read-only startup.
-    if c.mode != 'shadow' or not c.n_leg_paused:
+    if credential_backend(c) != 'disabled':
         run('runuser', '-u', c.user, '--', 'env', *references, str(c.python), '-m', 'open_trader',
-            'prediction-arb', 'wallet', 'status', '--config',
-            str(c.runtime_root/'config/prediction_arbitrage.json'), timeout=60)
+            'prediction-arb', 'wallet', 'read-auth', '--config',
+            str(c.runtime_root/'config/prediction_arbitrage.json'),
+            *(['--require-trading-region'] if c.mode == 'production' or not c.n_leg_paused else []), timeout=60)
     if os.statvfs(c.runtime_root).f_bavail * os.statvfs(c.runtime_root).f_frsize < 1024**3:
         raise ValueError('less than 1 GiB free runtime storage')
 
@@ -380,6 +410,29 @@ def verified_record(c: CloudConfig, states: tuple[str, ...]) -> dict:
     return saved
 
 
+def display_snapshot_evidence(snapshot: dict) -> dict:
+    """Prove a published background read without requiring derived USD facts."""
+    from datetime import UTC, datetime
+    from decimal import Decimal
+    from .polymarket_lp_risk import _freshness
+    if (snapshot.get("authenticated") is not True or snapshot.get("stale") is not False
+        or any(not isinstance(snapshot.get(key), list) for key in ("orders", "positions", "recommendations"))):
+        raise ValueError("cloud display account snapshot unavailable or stale")
+    _freshness(snapshot.get("checked_at"), datetime.now(UTC), "account_facts", max_age=Decimal(60))
+    rewards = snapshot.get("market_rewards") or {}
+    return {
+        "account": {key:snapshot.get(key) for key in
+            ("checked_at", "last_success_at", "open_orders_complete", "positions_complete", "trades_complete")},
+        "catalog": {"complete":snapshot.get("catalog_complete")},
+        "candidates": {key:snapshot.get(key) for key in
+            ("candidate_state", "candidate_checked_at", "candidate_last_success_at", "candidate_stale",
+             "missing_metadata_condition_ids", "missing_book_token_ids")},
+        "history": snapshot.get("preparation"),
+        "rewards": {condition:{key:row.get(key) for key in ("state", "reason", "checked_at")}
+            for condition,row in rewards.items() if isinstance(row,dict)},
+    }
+
+
 def operate(c: CloudConfig, action: str) -> dict:
     if action == 'preflight':
         preflight(c)
@@ -393,13 +446,17 @@ def operate(c: CloudConfig, action: str) -> dict:
     if action in ('status', 'smoke'):
         verified_record(c, ('ready',))
         evidence = live_identity(c)
+        display_evidence = {}
         if action == 'smoke':
             health = read_json(8769)
             nleg = health.get('n_leg', {})
             if c.n_leg_paused:
                 if nleg.get('status') != 'paused' or nleg.get('code') != 'N_LEG_PAUSED':
                     raise ValueError('N-leg pause contract mismatch')
-                if c.mode == 'shadow':
+                if c.mode == 'shadow' and credential_backend(c) != 'disabled':
+                    display_evidence = display_snapshot_evidence(
+                        read_json(8769, '/api/prediction-arbitrage/lp/dashboard'))
+                elif c.mode == 'shadow':
                     if read_status(8769, '/api/prediction-arbitrage/lp/dashboard') != 503:
                         raise ValueError('paused Shadow LP read model must be unavailable')
                 else:
@@ -426,7 +483,7 @@ def operate(c: CloudConfig, action: str) -> dict:
         component = {'mode': c.mode, 'n_leg_paused': c.n_leg_paused,
                      'credential_backend': credential_backend(c)}
         return {'status': 'RUNNING' if action == 'status' else 'BACKEND_SMOKE_OK',
-                **evidence, **component}
+                **evidence, **component, **({'display_snapshot':display_evidence} if display_evidence else {})}
     if os.geteuid() != 0:
         raise ValueError('systemd mutations require root')
     # Same global lock for all runtime roots/configurations of this unit.
@@ -474,6 +531,9 @@ def operate(c: CloudConfig, action: str) -> dict:
         if action == 'start':
             if unit_state()['MainPID'] != '0':
                 return operate(c, 'status')
+            if c.mode == 'shadow' and c.n_leg_paused == 1:
+                from .prediction_shadow_resources import require_host_headroom
+                require_host_headroom(c.memory_max_bytes)
             preflight(c)
             verified_record(c, ('stopped',))
             record(c, 'maintenance')

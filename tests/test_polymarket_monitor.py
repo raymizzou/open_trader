@@ -45,6 +45,83 @@ THRESHOLD_RULES = (
 )
 
 
+# These are real watchdogs, separate from any controlled business clock.
+# They bound synchronization, not service latency or the production deadline.
+_TEST_WATCHDOG_SECONDS = 2.0
+_REAL_MONOTONIC = time.monotonic
+
+
+class _ModuleProxy:
+    """Override only this module's reference, never shared time/asyncio globals."""
+
+    def __init__(self, module, **overrides):
+        self._module = module
+        self.__dict__.update(overrides)
+
+    def __getattr__(self, name):
+        return getattr(self._module, name)
+
+
+async def _finish_task(task):
+    assert task is not None, "Expected background work to have been scheduled"
+    return await asyncio.wait_for(task, timeout=_TEST_WATCHDOG_SECONDS)
+
+
+async def _drain_notification(monitor, attribute="_notification_task"):
+    task = getattr(monitor, attribute)
+    if task is not None:
+        await _finish_task(task)
+
+
+async def _cancel_task(task):
+    if task is not None:
+        if not task.done():
+            task.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(task, return_exceptions=True),
+            timeout=_TEST_WATCHDOG_SECONDS,
+        )
+
+
+def _isolate_functional_deadlines(monkeypatch):
+    """Functional tests use a watchdog; dedicated tests exercise real deadlines."""
+    import open_trader.polymarket_monitor as module
+
+    async def wait_for_completion(operation, timeout):
+        del timeout
+        return await asyncio.wait_for(operation, timeout=_TEST_WATCHDOG_SECONDS)
+
+    monkeypatch.setattr(module, "asyncio", _ModuleProxy(asyncio, wait_for=wait_for_completion))
+
+
+def _stage_deadline(monkeypatch, elapsed, expire):
+    """Cancel only the universe operation when the test reaches its target stage."""
+    import open_trader.polymarket_monitor as module
+
+    enabled = [True]
+
+    async def controlled_wait(operation, timeout):
+        if getattr(getattr(operation, "cr_code", None), "co_name", None) != "_refresh_universe":
+            return await asyncio.wait_for(operation, timeout)
+        assert timeout == 0.05
+        if not enabled[0]:
+            return await asyncio.wait_for(operation, _TEST_WATCHDOG_SECONDS)
+        task = asyncio.create_task(operation)
+        try:
+            await asyncio.wait_for(expire.wait(), _TEST_WATCHDOG_SECONDS)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await _finish_task(task)
+            raise TimeoutError
+        finally:
+            await _cancel_task(task)
+
+    monkeypatch.setattr(module, "time", _ModuleProxy(time, monotonic=lambda: elapsed[0]))
+    monkeypatch.setattr(module, "asyncio", _ModuleProxy(asyncio, wait_for=controlled_wait))
+    monkeypatch.setattr(module, "PUBLIC_REFRESH_TIMEOUT_SECONDS", 0.05)
+    return enabled
+
+
 def ns(**values: object) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
@@ -786,54 +863,53 @@ def test_snapshot_uses_metrics_refreshed_outside_monitor_lock(tmp_path: Path) ->
     assert summary_calls == 2
 
 
-def test_concurrent_snapshot_metric_refresh_coalesces_after_expiry(
-    tmp_path: Path,
-) -> None:
+def test_concurrent_snapshot_metric_refresh_coalesces_after_expiry(tmp_path: Path) -> None:
     monitor = make_monitor(tmp_path)
     monotonic = [0.0]
     summary_calls = 0
     priming = True
-    first_entered = threading.Event()
-    second_entered = threading.Event()
+    first_entered, contending, release = (threading.Event() for _ in range(3))
+    lock = monitor._snapshot_metrics_refresh_lock
 
-    def usage() -> dict[str, int]:
-        return {
-            "calls": 0,
-            "successes": 0,
-            "failures": 0,
-            "cache_hits": 0,
-            "input_tokens": 0,
-            "cached_input_tokens": 0,
-            "output_tokens": 0,
-            "reasoning_output_tokens": 0,
-        }
+    class ObservedLock:
+        def __enter__(self):
+            # Signal the second request at the actual lock contention point.
+            if not lock.acquire(blocking=False):
+                contending.set()
+                assert lock.acquire(timeout=_TEST_WATCHDOG_SECONDS)
+            return self
+
+        def __exit__(self, *args):
+            lock.release()
 
     def summary() -> dict[str, object]:
         nonlocal summary_calls
         summary_calls += 1
-        if priming:
-            return {"signals_24h": 1, "annualized_yields": {"7d": [], "30d": []}}
-        if summary_calls == 2:
+        if not priming:
             first_entered.set()
-            second_entered.wait(timeout=0.5)
-        else:
-            second_entered.set()
+            assert release.wait(timeout=_TEST_WATCHDOG_SECONDS)
         return {"signals_24h": 1, "annualized_yields": {"7d": [], "30d": []}}
 
     monitor._monotonic = lambda: monotonic[0]
-    monitor._store.llm_usage_24h = usage  # type: ignore[method-assign]
+    monitor._snapshot_metrics_refresh_lock = ObservedLock()
+    monitor._store.llm_usage_24h = lambda: {}  # type: ignore[method-assign]
     monitor._store.llm_usage_24h_by_provider = lambda: {}  # type: ignore[method-assign]
     monitor._store.signal_metric_summary = summary  # type: ignore[method-assign]
-
     monitor.refresh_snapshot_metrics()
     priming = False
     monotonic[0] = 61.0
     with ThreadPoolExecutor(max_workers=2) as workers:
-        futures = [workers.submit(monitor.refresh_snapshot_metrics) for _ in range(2)]
-        assert first_entered.wait(timeout=1)
-        for future in futures:
-            future.result(timeout=2)
-
+        first = workers.submit(monitor.refresh_snapshot_metrics)
+        try:
+            assert first_entered.wait(timeout=_TEST_WATCHDOG_SECONDS)
+            second = workers.submit(monitor.refresh_snapshot_metrics)
+            assert contending.wait(timeout=_TEST_WATCHDOG_SECONDS)
+            assert summary_calls == 2
+            assert not first.done() and not second.done()
+        finally:
+            release.set()
+        first.result(timeout=_TEST_WATCHDOG_SECONDS)
+        second.result(timeout=_TEST_WATCHDOG_SECONDS)
     assert summary_calls == 2
 
 
@@ -1070,6 +1146,7 @@ def test_observation_replenishment_is_bounded_and_keeps_stream_live(
     """Observation REST recovery stays bounded and cannot pause WS delivery."""
 
     clock = [NOW]
+    cadence = [0.0]
     assert PUBLIC_REFRESH_TIMEOUT_SECONDS == 30.0
 
     class LiveStream:
@@ -1140,7 +1217,7 @@ def test_observation_replenishment_is_bounded_and_keeps_stream_live(
             return [self.status_rows[key] for key in sorted(requested) if key in self.status_rows]
 
         async def get_order_books(self, *, token_ids: list[str]) -> list[object]:
-            call = (time.monotonic(), tuple(token_ids))
+            call = (cadence[0], tuple(token_ids))
             self.book_calls.append(call)
             observation_call = any(token.startswith("obs-") for token in token_ids)
             if observation_call:
@@ -1195,6 +1272,10 @@ def test_observation_replenishment_is_bounded_and_keeps_stream_live(
     monitor.set_cross_venue_tokens(("cross-b", "overlap"))
     monitor.set_observation_tokens(observation_tokens)
     monitor.set_observation_conditions(observation_conditions)
+    # Freeze only observation cadence. Each phase explicitly advances one
+    # five-second slot; scheduler load cannot add an unplanned fifth batch.
+    # The separate real-cadence test below retains wall-clock rate-limit proof.
+    monitor._monotonic = lambda: cadence[0]
     monitor.start()
     stopped = False
     try:
@@ -1270,7 +1351,7 @@ def test_observation_replenishment_is_bounded_and_keeps_stream_live(
         client.book_tick = Decimal("0.02")
         clock[0] = NOW + timedelta(seconds=301)
         client.block_books.set()
-        time.sleep(5.1)
+        cadence[0] += 5.1
         client.stream.push(
             ns(
                 type="price_change",
@@ -1318,11 +1399,15 @@ def test_observation_replenishment_is_bounded_and_keeps_stream_live(
         assert "obs-29" in restored
         assert restored["obs-0"]["tick_size"] == Decimal("0.02")
         assert restored["obs-0"]["fresh"] is True
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and monitor._observation_source_status_task is not None:
+            time.sleep(0.01)
+        assert monitor._observation_source_status_task is None
 
         # A blocked external refresh is bounded by the public deadline.  The
         # stream remains installed while that one task times out, and a later
         # setter-triggered refresh cannot create a second in-flight batch.
-        time.sleep(5.1)
+        cadence[0] += 5.1
         monkeypatch.setattr(
             "open_trader.polymarket_monitor.PUBLIC_REFRESH_TIMEOUT_SECONDS", 0.1
         )
@@ -1344,6 +1429,11 @@ def test_observation_replenishment_is_bounded_and_keeps_stream_live(
         assert client.book_refresh_started.is_set()
         assert monitor.snapshot()["observation"]["source_status_error"]
         assert client.max_active_observation_books <= 1
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and monitor._observation_source_status_task is not None:
+            time.sleep(0.01)
+        assert monitor._observation_source_status_task is None
+        assert client.active_observation_books == 0
         monkeypatch.setattr(
             "open_trader.polymarket_monitor.PUBLIC_REFRESH_TIMEOUT_SECONDS", 30.0
         )
@@ -1354,13 +1444,15 @@ def test_observation_replenishment_is_bounded_and_keeps_stream_live(
         # the external REST call to finish.
         client.book_refresh_started.clear()
         client.release_books.clear()
-        time.sleep(5.1)
+        cadence[0] += 5.1
         clock[0] = NOW + timedelta(seconds=320)
         assert client.book_refresh_started.wait(2)
         stopped_at = time.monotonic()
         monitor.stop()
         stopped = True
         assert time.monotonic() - stopped_at < 4
+        assert monitor._thread is not None and not monitor._thread.is_alive()
+        assert client.active_observation_books == 0
     finally:
         client.release_books.set()
         if not stopped:
@@ -1371,7 +1463,7 @@ def test_observation_replenishment_is_bounded_and_keeps_stream_live(
         for started, tokens in client.book_calls
         if any(token.startswith("obs-") for token in tokens)
     ]
-    assert len(observation_calls) <= 4
+    assert len(observation_calls) == 4
     assert len(client.status_calls) <= 4
     assert len(client.status_calls) % 2 == 0
     for offset in range(0, len(client.status_calls), 2):
@@ -2371,7 +2463,15 @@ def test_regular_refresh_prepares_distinct_three_way_groups(tmp_path: Path) -> N
     assert "football-00-dropped" not in prepared_event_ids
     assert prepared_event_ids == {"football-one"}
     assert len(FakePublicClient.list_events_calls) == 1
-    assert len(FakePublicClient.book_calls) == 6
+    assert len(FakePublicClient.book_calls) == 1
+    first_tokens = {
+        outcome["token_id"]
+        for row in (first_event, bad_event)
+        for raw_market in row["markets"][:3]
+        for outcome in raw_market["outcomes"]
+    }
+    assert len(first_tokens) == 12
+    assert FakePublicClient.book_calls[0] == sorted(first_tokens)
 
     set_raw_events([first_event, second_event])
     second_snapshot = monitor.refresh_once()
@@ -2385,7 +2485,15 @@ def test_regular_refresh_prepares_distinct_three_way_groups(tmp_path: Path) -> N
         for endpoint in row["endpoints"]
     } == {"football-one", "football-two"}
     assert len(FakePublicClient.list_events_calls) == 2
-    assert len(FakePublicClient.book_calls) == 12
+    assert len(FakePublicClient.book_calls) == 2
+    second_tokens = {
+        outcome["token_id"]
+        for row in (first_event, second_event)
+        for raw_market in row["markets"]
+        for outcome in raw_market["outcomes"]
+    }
+    assert len(second_tokens) == 12
+    assert FakePublicClient.book_calls[1] == sorted(second_tokens)
 
     class FailingCatalog:
         def prepared_relation_identities(self) -> set[str]:
@@ -2971,8 +3079,13 @@ def test_background_monitor_refreshes_top_twenty_while_bulk_scan_is_running(
         async def blocked_bulk_scan() -> None:
             await asyncio.Event().wait()
 
-        monitor._activity_scan_task = asyncio.create_task(blocked_bulk_scan())
-        await monitor.run_forever()
+        bulk = asyncio.create_task(blocked_bulk_scan())
+        monitor._activity_scan_task = bulk
+        try:
+            await _finish_task(monitor.run_forever())
+            assert bulk.done()
+        finally:
+            await _cancel_task(bulk)
 
     monkeypatch.setattr(monitor, "_refresh_universe_bounded", refresh_universe)
     monkeypatch.setattr(monitor, "_maybe_schedule_full_scan", schedule_full)
@@ -3130,16 +3243,23 @@ def test_due_full_scan_runs_before_activity_catchup(
             monitor._run_activity_scan(FakePublicClient())
         )
         monitor._activity_scan_task = activity
-        await entered.wait()
-        monitor._activity_catchup_requested = True
-        monitor._maybe_schedule_full_scan(FakePublicClient())
-        assert monitor._full_scan_pending is True
-        assert monitor._full_scan_task is None
-        release.set()
-        await activity
-        assert monitor._full_scan_task is not None
-        assert monitor._activity_scan_task is None
-        await monitor._full_scan_task
+        try:
+            await asyncio.wait_for(entered.wait(), _TEST_WATCHDOG_SECONDS)
+            monitor._activity_catchup_requested = True
+            monitor._maybe_schedule_full_scan(FakePublicClient())
+            assert monitor._full_scan_pending is True
+            assert monitor._full_scan_task is None
+            release.set()
+            await _finish_task(activity)
+            assert monitor._full_scan_task is not None
+            assert monitor._activity_scan_task is None
+            await _finish_task(monitor._full_scan_task)
+        finally:
+            release.set()
+            monitor._full_scan_pending = False
+            monitor._activity_catchup_requested = False
+            await _cancel_task(activity)
+            await _cancel_task(monitor._full_scan_task)
 
     asyncio.run(exercise())
 
@@ -3309,10 +3429,14 @@ def test_activity_scan_does_not_mark_daily_catalog_scanning(tmp_path: Path) -> N
 
     async def exercise() -> None:
         task = asyncio.create_task(monitor._refresh_relation_activity(FakePublicClient()))
-        await entered.wait()
-        assert monitor.snapshot()["relation_discovery"]["catalog"]["status"] == "healthy"
-        release.set()
-        await task
+        try:
+            await asyncio.wait_for(entered.wait(), _TEST_WATCHDOG_SECONDS)
+            assert monitor.snapshot()["relation_discovery"]["catalog"]["status"] == "healthy"
+            release.set()
+            await _finish_task(task)
+        finally:
+            release.set()
+            await _cancel_task(task)
 
     asyncio.run(exercise())
 
@@ -3439,7 +3563,7 @@ def test_qualified_yes_no_schedules_ready_before_nonblocking_shadow(
                 "estimated_profit": Decimal("0.11"),
             }
         )
-        await asyncio.sleep(0.01)
+        await _drain_notification(monitor)
         monitor._reap_notification_task()
         assert signal_id
         return events, shadow_calls, signal_id
@@ -3569,10 +3693,10 @@ def test_ready_observer_is_called_once_for_order_ready_episode(tmp_path: Path) -
         await monitor._refresh_relation_activity(client)
         await monitor._drain_relation_validation(client)
         await monitor._refresh_relation_opportunities(client, set(monitor._active_relation_ids))
-        await asyncio.sleep(0.05)
+        await _drain_notification(monitor)
         monitor._reap_notification_task()
         await monitor._refresh_relation_opportunities(client, set(monitor._active_relation_ids))
-        await asyncio.sleep(0.01)
+        await _drain_notification(monitor)
         monitor._reap_notification_task()
         return calls
 
@@ -3619,7 +3743,7 @@ def test_observation_alert_delivered_after_actionable_signal_closes(
         signal_id = str(monitor._store.open_signal_history()[0]["signal_id"])
         market_id = str(monitor._store.signal(signal_id)["market_id"])
         monitor._close_signal(market_id, "data_unavailable")
-        await asyncio.sleep(0.05)
+        await _drain_notification(monitor)
         monitor._reap_notification_task()
         return calls, monitor._store.signal(signal_id)
 
@@ -3669,12 +3793,12 @@ def test_observation_alert_then_order_ready_both_fire_once_per_episode(
         await monitor._refresh_relation_opportunities(
             client, set(monitor._active_relation_ids)
         )
-        await asyncio.sleep(0.05)
+        await _drain_notification(monitor)
         monitor._reap_notification_task()
         await monitor._refresh_relation_opportunities(
             client, set(monitor._active_relation_ids)
         )
-        await asyncio.sleep(0.01)
+        await _drain_notification(monitor)
         monitor._reap_notification_task()
         return observations, ready
 
@@ -3717,7 +3841,7 @@ def test_schedule_ready_notification_calls_standard_without_rule_or_codex(
                 "actionable": True,
             },
         )
-        await asyncio.sleep(0.01)
+        await _drain_notification(monitor)
         monitor._reap_notification_task()
         return calls
 
@@ -3987,6 +4111,7 @@ def test_activity_scheduler_marks_lagging_and_runs_one_catchup(
     monitor._clock = lambda: now[0]
     entered = asyncio.Event()
     release = asyncio.Event()
+    catchup_entered, catchup_release = asyncio.Event(), asyncio.Event()
     starts = 0
 
     async def blocked_activity(
@@ -3995,8 +4120,12 @@ def test_activity_scheduler_marks_lagging_and_runs_one_catchup(
         del client, resubscribe
         nonlocal starts
         starts += 1
-        entered.set()
-        await release.wait()
+        if starts == 1:
+            entered.set()
+            await release.wait()
+        else:
+            catchup_entered.set()
+            await catchup_release.wait()
 
     monitor._refresh_relation_activity = blocked_activity  # type: ignore[method-assign]
     monitor._activity_next_scan_at = NOW
@@ -4004,20 +4133,30 @@ def test_activity_scheduler_marks_lagging_and_runs_one_catchup(
     async def exercise() -> None:
         client = FakePublicClient()
         await monitor._tick_relation_activity(client)
-        await entered.wait()
-        now[0] = NOW + timedelta(seconds=61)
-        await monitor._tick_relation_activity(client)
-        await monitor._tick_relation_activity(client)
-        assert starts == 1
-        assert monitor.snapshot()["relation_discovery"]["activity"]["status"] == "lagging"
-        release.set()
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
-        assert starts == 2
-        release.set()
-        task = monitor._activity_scan_task
-        if task is not None:
-            await task
+        first = monitor._activity_scan_task
+        catchup = None
+        try:
+            await asyncio.wait_for(entered.wait(), _TEST_WATCHDOG_SECONDS)
+            now[0] = NOW + timedelta(seconds=61)
+            await monitor._tick_relation_activity(client)
+            await monitor._tick_relation_activity(client)
+            assert starts == 1
+            assert monitor.snapshot()["relation_discovery"]["activity"]["status"] == "lagging"
+            release.set()
+            await _finish_task(first)
+            await asyncio.wait_for(catchup_entered.wait(), _TEST_WATCHDOG_SECONDS)
+            assert starts == 2
+            catchup = monitor._activity_scan_task
+            catchup_release.set()
+            await _finish_task(catchup)
+            assert starts == 2
+            assert monitor._activity_catchup_requested is False
+        finally:
+            release.set()
+            catchup_release.set()
+            monitor._activity_catchup_requested = False
+            await _cancel_task(first)
+            await _cancel_task(catchup or monitor._activity_scan_task)
 
     asyncio.run(exercise())
 
@@ -4051,18 +4190,20 @@ def test_activity_scheduler_does_not_treat_its_own_due_time_as_lagging(
     async def exercise() -> None:
         client = FakePublicClient()
         await monitor._tick_relation_activity(client)
-        await entered.wait()
-        await monitor._tick_relation_activity(client)
-
-        assert starts == 1
-        assert monitor._activity_catchup_requested is False
-        assert monitor.snapshot()["relation_discovery"]["activity"]["status"] != "lagging"
-
-        release.set()
         task = monitor._activity_scan_task
-        assert task is not None
-        await task
-        assert starts == 1
+        try:
+            await asyncio.wait_for(entered.wait(), _TEST_WATCHDOG_SECONDS)
+            await monitor._tick_relation_activity(client)
+            assert starts == 1
+            assert monitor._activity_catchup_requested is False
+            assert monitor.snapshot()["relation_discovery"]["activity"]["status"] != "lagging"
+            release.set()
+            await _finish_task(task)
+            assert starts == 1
+        finally:
+            release.set()
+            monitor._activity_catchup_requested = False
+            await _cancel_task(task)
 
     asyncio.run(exercise())
 
@@ -4105,7 +4246,7 @@ def test_codex_worker_selects_highest_edge_then_reaps_one_at_a_time(
         # past the window before the next rescan can start a second verdict.
         now[0] = NOW + timedelta(seconds=3)
         await monitor._poll_relation_validation(client)
-        await asyncio.sleep(0.01)
+        await _finish_task(monitor._codex_task)
         assert len(validator.relation_ids) == 2
         assert validator.relation_ids[0] == expected
 
@@ -4208,7 +4349,7 @@ def test_transient_codex_failure_retries_once_at_the_retry_boundary(
         # (which rescanned at +59 s), so the retry becomes due at +61 s.
         now[0] = NOW + timedelta(seconds=61)
         await monitor._poll_relation_validation(client)
-        await asyncio.sleep(0.01)
+        await _finish_task(monitor._codex_task)
         assert validator.calls == 2
 
     asyncio.run(tick())
@@ -4280,7 +4421,7 @@ def test_validation_task_exception_marks_error_without_failure_notification(
         with pytest.raises(sqlite3.OperationalError):
             await task
         await monitor._poll_relation_validation(None)
-        await asyncio.sleep(0.01)
+        assert monitor._llm_failure_notification_task is None
         monitor._reap_llm_failure_notification_task()
 
     asyncio.run(exercise())
@@ -4324,7 +4465,7 @@ def test_llm_provider_failure_notifies_observer_with_provider_reason_codes(
         assert monitor._codex_task is not None
         await monitor._codex_task
         await monitor._poll_relation_validation(client)
-        await asyncio.sleep(0.01)
+        await _finish_task(monitor._llm_failure_notification_task)
         monitor._reap_llm_failure_notification_task()
 
     asyncio.run(exercise())
@@ -4364,7 +4505,7 @@ def test_llm_unavailable_notifies_failure_observer_once_and_resets_on_success(
         assert monitor._codex_task is not None
         await monitor._codex_task
         await monitor._poll_relation_validation(client)
-        await asyncio.sleep(0.01)
+        await _finish_task(monitor._llm_failure_notification_task)
         monitor._reap_llm_failure_notification_task()
         assert len(calls) == 1
         assert calls[0]["component"] == "llm_validation"
@@ -4391,7 +4532,7 @@ def test_llm_unavailable_notifies_failure_observer_once_and_resets_on_success(
         assert monitor._codex_task is not None
         await monitor._codex_task
         await monitor._poll_relation_validation(client)
-        await asyncio.sleep(0.01)
+        await _finish_task(monitor._llm_failure_notification_task)
         monitor._reap_llm_failure_notification_task()
         assert len(calls) == 2
 
@@ -4856,11 +4997,17 @@ def test_apr_target_anomaly_preserves_last_pool_and_blocks_relation_actions(
 def test_codex_worker_does_not_block_activity_or_price_refresh(tmp_path: Path) -> None:
     setup_public([threshold_event()])
     setup_threshold_books(low_ask="0.50", high_no_ask="0.51")
-    validator = FakeRelationValidator()
-    validator.block = threading.Event()
+    entered, release = threading.Event(), threading.Event()
+
+    class GatedValidator(FakeRelationValidator):
+        def validate(self, relation):
+            entered.set()
+            assert release.wait(timeout=5), "Test did not release the validator"
+            return super().validate(relation)
+
+    validator = GatedValidator()
     monitor = make_monitor(
-        tmp_path,
-        relation_discovery=discover_threshold_relations,
+        tmp_path, relation_discovery=discover_threshold_relations,
         relation_validator=validator,
     )
     client = FakePublicClient()
@@ -4870,20 +5017,22 @@ def test_codex_worker_does_not_block_activity_or_price_refresh(tmp_path: Path) -
 
     async def exercise() -> None:
         await monitor._poll_relation_validation(client)
-        assert monitor._codex_task is not None
-        await asyncio.sleep(0.01)
-        await asyncio.gather(
-            monitor._refresh_relation_activity(client),
-            monitor._process_stream_event(
-                client,
-                ns(
+        task = monitor._codex_task
+        assert task is not None
+        try:
+            assert await asyncio.to_thread(entered.wait, _TEST_WATCHDOG_SECONDS)
+            await asyncio.wait_for(asyncio.gather(
+                monitor._refresh_relation_activity(client),
+                monitor._process_stream_event(client, ns(
                     type="price_change",
                     payload=ns(asset_id=relation.buy_leg_a.token_id, price_changes=()),
-                ),
-            ),
-        )
-        validator.block.set()
-        await monitor._codex_task
+                )),
+            ), _TEST_WATCHDOG_SECONDS)
+            assert not task.done()
+            assert not release.is_set()
+        finally:
+            release.set()
+            await _finish_task(task)
         await monitor._poll_relation_validation(client)
 
     asyncio.run(exercise())
@@ -5428,10 +5577,10 @@ def test_only_execution_eligible_active_binary_markets_are_subscribed(
     snapshot = monitor.snapshot()
 
     assert FakePublicClient.book_calls == [
-        ["yes-good", "no-good"],
-        ["yes-fee", "no-fee"],
-        ["yes-unknown", "no-unknown"],
-        ["yes-neg", "no-neg"],
+        sorted([
+            "yes-good", "no-good", "yes-fee", "no-fee",
+            "yes-unknown", "no-unknown", "yes-neg", "no-neg",
+        ]),
     ]
     assert tuple(FakePublicClient.subscribe_specs[-1].token_ids) == (
         "no-good",
@@ -5584,11 +5733,16 @@ def test_subscription_keeps_dirty_when_tokens_change_during_connect(
 
     async def exercise() -> None:
         task = asyncio.create_task(monitor._subscribe(DelayedClient()))
-        await entered.wait()
-        monitor._relation_by_token = {"new-relation-token": {"relation"}}
-        monitor._subscription_dirty = True
-        release.set()
-        await task
+        try:
+            await asyncio.wait_for(entered.wait(), _TEST_WATCHDOG_SECONDS)
+            monitor._relation_by_token = {"new-relation-token": {"relation"}}
+            monitor._subscription_dirty = True
+            release.set()
+            await _finish_task(task)
+        finally:
+            release.set()
+            await _cancel_task(task)
+            await monitor._close_stream()
 
     asyncio.run(exercise())
 
@@ -5654,6 +5808,7 @@ def test_targeted_standard_refresh_rechecks_live_market_metadata(
     monitor = make_monitor(tmp_path)
     monitor.refresh_once()
     assert monitor.opportunity("e:m") is not None
+    FakePublicClient.book_calls.clear()
     monitor._subscription_dirty = False
     FakePublicClient.get_event_calls.clear()
     FakePublicClient.events = [
@@ -5664,6 +5819,7 @@ def test_targeted_standard_refresh_rechecks_live_market_metadata(
 
     assert refreshed is None
     assert FakePublicClient.get_event_calls == ["e"]
+    assert FakePublicClient.book_calls == [["yes-1", "no-1"]]
     assert monitor.opportunity("e:m") is None
     assert monitor._market_by_token == {}
     assert monitor._subscription_dirty is True
@@ -5887,38 +6043,76 @@ def test_healthy_quiet_is_distinct_from_degraded_and_runtime_is_throttled(tmp_pa
 
 
 def test_background_monitor_refreshes_readiness_before_it_becomes_stale(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import open_trader.polymarket_monitor as monitor_module
+
+    interval = monitor_module.READINESS_REFRESH_SECONDS
+    freshness = monitor_module.READINESS_FRESHNESS_SECONDS
+    assert (interval, freshness) == (30, 60)
+    elapsed = [0.0]
+    now = [NOW]
+    checked_at: list[datetime] = []
 
     class LiveTrading(FakeTrading):
         def readiness_snapshot(self) -> dict[str, object]:
             value = super().readiness_snapshot()
-            value["checked_at"] = datetime.now(UTC)
+            value["checked_at"] = now[0]
+            checked_at.append(now[0])
             return value
 
-    class LiveStream(FakeStream):
+    class SteppedStream(FakeStream):
+        def __init__(self):
+            super().__init__()
+            self.requests = asyncio.Queue()
+            self.messages = asyncio.Queue()
+
         async def __anext__(self) -> object:
-            await asyncio.sleep(0.005)
-            return object()
+            self.requests.put_nowait(None)
+            return await self.messages.get()
 
-    monkeypatch.setattr(monitor_module, "READINESS_FRESHNESS_SECONDS", 0.04)
-    monkeypatch.setattr(
-        monitor_module,
-        "READINESS_REFRESH_SECONDS",
-        0.01,
-        raising=False,
-    )
+    monkeypatch.setattr(monitor_module, "time", _ModuleProxy(time, monotonic=lambda: elapsed[0]))
     setup_public([event("e", markets=(market("m"),))])
-    FakePublicClient.streams = [LiveStream()]
-    monitor = make_monitor(tmp_path, trading=LiveTrading())
-    monitor._clock = lambda: datetime.now(UTC)
+    stream = SteppedStream()
+    FakePublicClient.streams = [stream]
+    monitor = make_monitor(tmp_path, trading=LiveTrading(), clock=lambda: now[0])
 
-    with pytest.raises(asyncio.TimeoutError):
-        asyncio.run(asyncio.wait_for(monitor.run_forever(), timeout=0.08))
+    async def scenario():
+        task = asyncio.create_task(monitor.run_forever())
+        try:
+            await asyncio.wait_for(stream.requests.get(), _TEST_WATCHDOG_SECONDS)
+            assert checked_at == [NOW]
+            steps = (
+                (interval - 1, (0,)),
+                (interval, (0, interval)),
+                (interval + 1, (0, interval)),
+                (2 * interval + 1, (0, interval, 2 * interval + 1)),
+                (3 * interval + 1, (0, interval, 2 * interval + 1, 3 * interval + 1)),
+            )
+            for seconds, calls in steps:
+                elapsed[0] = seconds
+                now[0] = NOW + timedelta(seconds=seconds)
+                for book in FakePublicClient.books.values():
+                    book.timestamp = now[0]
+                stream.messages.put_nowait(ns(token_id="yes-1"))
+                await asyncio.wait_for(stream.requests.get(), _TEST_WATCHDOG_SECONDS)
+                assert checked_at == [NOW + timedelta(seconds=value) for value in calls]
+                snapshot = monitor.snapshot()
+                assert snapshot["readiness"]["checked_at"] == checked_at[-1]
+                assert snapshot["health"]["status"] == "healthy"
+            assert elapsed[0] > freshness
+            assert monitor.snapshot()["health"]["readiness_age_seconds"] == 0
+            monitor._stop_event.set()
+            stream.messages.put_nowait(ns(token_id="yes-1"))
+            await _finish_task(task)
+            assert stream.closed is True
+        finally:
+            await _cancel_task(task)
+        now[0] += timedelta(seconds=freshness + 1)
+        assert "readiness_stale" in monitor.snapshot()["health"]["degraded_reasons"]
 
-    assert monitor.snapshot()["health"]["status"] == "healthy"
+    asyncio.run(scenario())
+
 
 
 def test_connected_quiet_stream_does_not_degrade_monitor_health(tmp_path: Path) -> None:
@@ -5972,9 +6166,10 @@ def test_start_stop_owns_one_daemon_async_thread(tmp_path: Path) -> None:
     assert monitor._thread.daemon is True
 
 
-def test_monitor_once_diagnostic_is_public_and_non_mutating() -> None:
+def test_monitor_once_diagnostic_is_public_and_non_mutating(monkeypatch: pytest.MonkeyPatch) -> None:
     from open_trader.polymarket_monitor import monitor_once_diagnostic
 
+    _isolate_functional_deadlines(monkeypatch)
     setup_public([event(f"event-{i:02d}", markets=(market(f"m-{i:02d}"),)) for i in range(20)])
     FakePublicClient.streams = [FakeStream([object()])]
     report = monitor_once_diagnostic(timeout=0.2, public_client_factory=FakePublicClient)
@@ -5989,9 +6184,10 @@ def test_monitor_once_diagnostic_is_public_and_non_mutating() -> None:
     }
 
 
-def test_monitor_once_accepts_fewer_events_than_the_limit() -> None:
+def test_monitor_once_accepts_fewer_events_than_the_limit(monkeypatch: pytest.MonkeyPatch) -> None:
     from open_trader.polymarket_monitor import monitor_once_diagnostic
 
+    _isolate_functional_deadlines(monkeypatch)
     setup_public([
         event(f"event-{i:02d}", markets=(market(f"m-{i:02d}"),))
         for i in range(18)
@@ -6019,18 +6215,30 @@ def test_monitor_once_diagnostic_converts_public_failures_to_blocked() -> None:
 def test_monitor_once_diagnostic_applies_total_timeout() -> None:
     from open_trader.polymarket_monitor import monitor_once_diagnostic
 
+    entered, cancelled, finished = [], [], []
+
     class SlowPublicClient(FakePublicClient):
         async def list_events(self, **kwargs: object) -> list[object]:
             del kwargs
-            await asyncio.sleep(0.2)
-            return []
+            entered.append(True)
+            try:
+                # A missing production timeout must fail, not hang the suite.
+                await asyncio.wait_for(asyncio.Event().wait(), _TEST_WATCHDOG_SECONDS)
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+            finally:
+                finished.append(True)
 
     started = time.monotonic()
     report = monitor_once_diagnostic(
         timeout=0.01, public_client_factory=SlowPublicClient
     )
 
+    # Retain the existing real 100ms responsiveness envelope. This is a local
+    # offline latency check, separate from the proof of deadline cancellation.
     assert time.monotonic() - started < 0.1
+    assert entered == cancelled == finished == [True]
     assert report["result"] == "BLOCKED"
     assert report["mutations"] == 0
 
@@ -6041,11 +6249,20 @@ def test_runtime_refresh_applies_total_timeout(
     from open_trader import polymarket_monitor
     from open_trader.polymarket_monitor import PolymarketMonitor
 
+    entered, cancelled, finished = [], [], []
+
     class SlowPublicClient(FakePublicClient):
         async def list_events(self, **kwargs: object) -> list[object]:
             del kwargs
-            await asyncio.sleep(0.2)
-            return []
+            entered.append(True)
+            try:
+                # A missing production timeout must fail, not hang the suite.
+                await asyncio.wait_for(asyncio.Event().wait(), _TEST_WATCHDOG_SECONDS)
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+            finally:
+                finished.append(True)
 
     monkeypatch.setattr(polymarket_monitor, "PUBLIC_REFRESH_TIMEOUT_SECONDS", 0.01)
     monitor = PolymarketMonitor(
@@ -6057,31 +6274,36 @@ def test_runtime_refresh_applies_total_timeout(
     started = time.monotonic()
     snapshot = monitor.refresh_once()
 
+    # Retain the existing real 100ms responsiveness envelope. This is a local
+    # offline latency check, separate from the proof of deadline cancellation.
     assert time.monotonic() - started < 0.1
+    assert entered == cancelled == finished == [True]
     assert snapshot["health"]["actionable"] is False
     assert snapshot["diagnostics"]["last_error"] == "universe:TimeoutError"
 
 
-def test_runtime_confirms_books_with_bounded_concurrency(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from open_trader import polymarket_monitor
-    from open_trader.polymarket_monitor import PolymarketMonitor
-
-    class SlowBookClient(FakePublicClient):
-        active = 0
-        max_active = 0
+def test_universe_batches_unique_tokens_with_bounded_concurrency(tmp_path: Path) -> None:
+    class BarrierBookClient(FakePublicClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.active = 0
+            self.max_active = 0
+            self.entered = asyncio.Queue()
+            self.release = asyncio.Queue()
+            self.finished = asyncio.Queue()
 
         async def get_order_books(
             self, *, token_ids: list[str]
         ) -> tuple[object, ...]:
-            type(self).active += 1
-            type(self).max_active = max(type(self).max_active, type(self).active)
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
             try:
-                await asyncio.sleep(0.02)
+                self.entered.put_nowait(tuple(token_ids))
+                await self.release.get()
                 return await super().get_order_books(token_ids=token_ids)
             finally:
-                type(self).active -= 1
+                self.active -= 1
+                self.finished.put_nowait(None)
 
     rows = tuple(
         market(
@@ -6090,22 +6312,182 @@ def test_runtime_confirms_books_with_bounded_concurrency(
             no=f"no-{i:02d}",
             fees_enabled=True,
         )
-        for i in range(20)
-    )
+        for i in range(450)
+    ) + (market("duplicate-pair", yes="yes-00", no="no-00", fees_enabled=True),)
     setup_public([event("e", markets=rows)])
-    monkeypatch.setattr(polymarket_monitor, "PUBLIC_REFRESH_TIMEOUT_SECONDS", 0.15)
-    monitor = PolymarketMonitor(
-        store=PredictionArbitrageStore(tmp_path / "data"),
-        trading=FakeTrading(),
-        public_client_factory=SlowBookClient,
-        clock=lambda: NOW,
-    )
+    monitor = make_monitor(tmp_path, relation_discovery=None)
+    client = BarrierBookClient()
 
-    snapshot = monitor.refresh_once()
+    async def scenario():
+        task = asyncio.create_task(monitor._refresh_universe_bounded(client))
+        try:
+            for batch in (8, 1):
+                for _ in range(batch):
+                    await asyncio.wait_for(client.entered.get(), _TEST_WATCHDOG_SECONDS)
+                assert client.active == batch
+                assert client.entered.empty(), "A ninth concurrent batch bypassed the limiter"
+                for _ in range(batch):
+                    client.release.put_nowait(None)
+                for _ in range(batch):
+                    await asyncio.wait_for(client.finished.get(), _TEST_WATCHDOG_SECONDS)
+            await _finish_task(task)
+        finally:
+            await _cancel_task(task)
+
+    asyncio.run(scenario())
+    snapshot = monitor.snapshot()
 
     assert snapshot["health"]["status"] == "healthy", snapshot["health"]
-    assert SlowBookClient.max_active == 8
-    assert len(SlowBookClient.book_calls) == 20
+    assert len(client.book_calls) == 9
+    assert all(len(chunk) <= 100 for chunk in client.book_calls)
+    assert sorted(token for chunk in client.book_calls for token in chunk) == sorted(FakePublicClient.books)
+    assert client.max_active == 8
+    assert client.active == 0
+    confirmed = snapshot["events"][0]["markets"]
+    assert len(confirmed) == 451
+    assert all(row["confirmed_at"] == NOW for row in confirmed)
+    assert all(row["gross_upper_bound"] == Decimal("0.07") for row in confirmed)
+    assert all(row["eligibility_reason"] == "fee_unverified_or_enabled" for row in confirmed)
+
+
+@pytest.mark.parametrize("failure", ["missing", "chunk", "timeout", "empty"])
+def test_universe_partial_books_do_not_reuse_old_confirmation(
+    tmp_path: Path, failure: str,
+) -> None:
+    rows = tuple(
+        market(f"m-{i:03d}", yes=f"yes-{i:03d}", no=f"no-{i:03d}")
+        for i in range(51)
+    )
+    setup_public([event("e", markets=rows)])
+    monitor = make_monitor(tmp_path, relation_discovery=None)
+    asyncio.run(monitor._refresh_universe(FakePublicClient()))
+    assert len(monitor.snapshot()["opportunities"]) == 51
+    FakePublicClient.book_calls.clear()
+
+    class PartialClient(FakePublicClient):
+        async def get_order_books(self, *, token_ids: list[str]) -> tuple[object, ...]:
+            self.book_calls.append(list(token_ids))
+            if failure in {"chunk", "timeout"} and "yes-050" in token_ids:
+                raise (ConnectionError if failure == "chunk" else TimeoutError)("sentinel book failure")
+            if failure == "empty":
+                return ()
+            return tuple(
+                self.books[token] for token in reversed(token_ids)
+                if failure != "missing" or token != "yes-050"
+            )
+
+    asyncio.run(monitor._refresh_universe(PartialClient()))
+    snapshot = monitor.snapshot()
+    assert len(FakePublicClient.book_calls) == 2
+    assert sorted(token for chunk in FakePublicClient.book_calls for token in chunk) == sorted(FakePublicClient.books)
+    missing = (
+        {"m-050"} if failure == "missing" else
+        {"m-049", "m-050"} if failure in {"chunk", "timeout"} else
+        {f"m-{i:03d}" for i in range(51)}
+    )
+    for row in snapshot["events"][0]["markets"]:
+        if row["market_id"] in missing:
+            assert row["eligibility_reason"] == "book_token_mismatch"
+            assert row["actionable"] is False
+            assert row.get("confirmed_at") is None
+        else:
+            assert row["actionable"] is True
+            assert row["confirmed_at"] == NOW
+    assert {row["market_id"] for row in snapshot["opportunities"]} == {f"m-{i:03d}" for i in range(51)} - missing
+    assert snapshot["diagnostics"]["last_error"] == (
+        "books:ConnectionError" if failure == "chunk" else
+        "books:TimeoutError" if failure == "timeout" else None
+    )
+    assert set(FakePublicClient.subscribe_specs[-1].token_ids) == set(FakePublicClient.books)
+
+
+def test_universe_bulk_mapping_preserves_sdk_book_facts(tmp_path: Path) -> None:
+    row = market("m")
+    row.trading.minimum_order_size = None
+    row.trading.minimum_tick_size = None
+    setup_public([event("e", markets=(row,))])
+    FakePublicClient.books["yes-1"].min_order_size = Decimal("5")
+    FakePublicClient.books["yes-1"].tick_size = Decimal("0.001")
+    FakePublicClient.books["yes-1"].timestamp = NOW - timedelta(minutes=1)
+    for book in FakePublicClient.books.values():
+        del book.token_id
+        del book.asset_id
+
+    class MappingClient(FakePublicClient):
+        async def get_order_books(self, *, token_ids: list[str]) -> Mapping[str, object]:
+            self.book_calls.append(list(token_ids))
+            return {token: self.books[token] for token in reversed(token_ids)}
+
+    monitor = make_monitor(tmp_path, relation_discovery=None)
+    asyncio.run(monitor._refresh_universe(MappingClient()))
+    opportunity = monitor.opportunity("e:m")
+    assert opportunity is not None
+    assert opportunity["actionable"] is True
+    assert opportunity["tick_size"] == Decimal("0.001")
+    assert opportunity["quantity"] >= Decimal("5")
+    assert opportunity["book_timestamp_a"] == NOW - timedelta(minutes=1)
+    assert opportunity["book_timestamp_b"] == NOW
+    assert opportunity["yes_max_price"] == Decimal("0.45")
+    assert opportunity["no_max_price"] == Decimal("0.48")
+    FakePublicClient.books["yes-1"].min_order_size = Decimal("1000")
+    asyncio.run(monitor._refresh_universe(MappingClient()))
+    assert monitor.opportunity("e:m") is None
+    assert monitor.snapshot()["events"][0]["markets"][0]["eligibility_reason"] == "no_threshold_candidate"
+
+
+@pytest.mark.parametrize("failure", ["cancel", "deadline"])
+def test_universe_bulk_cancellation_and_timeout_do_not_publish_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    from open_trader import polymarket_monitor
+
+    setup_public([event("e", markets=tuple(
+        market(f"m-{i}", yes=f"yes-{i}", no=f"no-{i}", fees_enabled=True)
+        for i in range(450)
+    ))])
+    monitor = make_monitor(tmp_path, relation_discovery=None)
+    previous = NOW - timedelta(minutes=11)
+    monitor._universe_at = previous
+
+    class InterruptedClient(FakePublicClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+            self.active = 0
+            self.cancelled = 0
+
+        async def get_order_books(self, *, token_ids: list[str]) -> tuple[object, ...]:
+            del token_ids
+            self.active += 1
+            if self.active == 8:
+                self.started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.active -= 1
+                self.cancelled += 1
+
+    if failure == "deadline":
+        monkeypatch.setattr(polymarket_monitor, "PUBLIC_REFRESH_TIMEOUT_SECONDS", 0.05)
+
+    async def exercise() -> None:
+        client = InterruptedClient()
+        refresh = asyncio.create_task(monitor._refresh_universe_bounded(client))
+        await asyncio.wait_for(client.started.wait(), timeout=1)
+        if failure == "cancel":
+            refresh.cancel()
+        with pytest.raises(asyncio.CancelledError if failure == "cancel" else TimeoutError):
+            await refresh
+        assert client.active == 0
+        assert client.cancelled == 8
+        assert monitor._universe_at == previous
+        assert monitor.snapshot()["diagnostics"]["universe_refresh"]["stage"] == "books"
+        assert monitor.snapshot()["health"]["actionable"] is False
+        assert FakePublicClient.subscribe_specs == []
+        if failure == "deadline":
+            assert monitor.snapshot()["diagnostics"]["last_error"] == "universe:TimeoutError"
+
+    asyncio.run(exercise())
 
 
 def test_title_translation_worker_is_fifo_and_does_not_block_english_snapshot(
@@ -6305,7 +6687,7 @@ def test_universe_failure_observer_is_scheduled_once_on_attempt_five(
             next_refresh, _succeeded = await monitor._refresh_universe_if_due(
                 object(), current=current, next_refresh=next_refresh
             )
-        await asyncio.sleep(0.01)
+        await _finish_task(monitor._universe_failure_notification_task)
         monitor._reap_universe_failure_notification_task()
 
     asyncio.run(scenario())
@@ -6409,12 +6791,11 @@ def _crash_injection(monitor: PolymarketMonitor, plan):
 
 
 async def _wait_until(predicate, *, timeout: float = 10.0) -> bool:
-    waited = 0.0
-    while waited < timeout:
+    deadline = _REAL_MONOTONIC() + timeout
+    while _REAL_MONOTONIC() < deadline:
         if predicate():
             return True
-        await asyncio.sleep(0.01)
-        waited += 0.01
+        await asyncio.sleep(min(0.01, max(0, deadline - _REAL_MONOTONIC())))
     return bool(predicate())
 
 
@@ -6570,14 +6951,34 @@ def test_recovery_notification_fires_after_universe_refresh(
 
 
 def test_run_forever_external_cancellation_is_not_a_crash(tmp_path: Path) -> None:
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+
+    class WaitingStream(FakeStream):
+        async def __anext__(self):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
     setup_public([threshold_event()])
+    FakePublicClient.streams = [WaitingStream()]
     monitor = make_monitor(tmp_path)
     payloads: list[dict[str, object]] = []
     monitor.set_failure_observer(lambda payload: payloads.append(dict(payload)))
 
-    with pytest.raises(asyncio.TimeoutError):
-        asyncio.run(asyncio.wait_for(monitor.run_forever(), timeout=0.05))
+    async def scenario():
+        task = asyncio.create_task(monitor.run_forever())
+        try:
+            await asyncio.wait_for(entered.wait(), _TEST_WATCHDOG_SECONDS)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await _finish_task(task)
+            assert cancelled.is_set()
+        finally:
+            await _cancel_task(task)
 
+    asyncio.run(scenario())
     assert payloads == []
     assert monitor.snapshot()["thread"]["restarts"] == 0
 
@@ -6936,43 +7337,53 @@ def test_universe_timeout_recovers_after_exhaustion(tmp_path, monkeypatch):
 def test_universe_timeout_reports_stage_without_advancing_success(
     tmp_path, monkeypatch, stage, method, caplog,
 ):
-    from open_trader import polymarket_monitor
-
     setup_public([event('event-1', markets=(market('market-1'),))])
     monitor = make_monitor(tmp_path, relation_discovery=None, relation_validator=None)
     client = FakePublicClient()
     previous = NOW - timedelta(minutes=11)
     monitor._universe_at = previous
-    cancelled = []
+    entered, expire = asyncio.Event(), asyncio.Event()
+    elapsed, cancelled = [0.0], []
+    _stage_deadline(monkeypatch, elapsed, expire)
 
     async def blocked(*args, **kwargs):
+        entered.set()
         try:
             await asyncio.Event().wait()
         finally:
             cancelled.append(True)
 
     monkeypatch.setattr(client if stage == 'events' else monitor, method, blocked)
-    monkeypatch.setattr(polymarket_monitor, 'PUBLIC_REFRESH_TIMEOUT_SECONDS', 0.05)
 
     async def scenario():
-        with pytest.raises(TimeoutError):
-            await monitor._refresh_universe_bounded(client, block_observation_status=False)
-        assert cancelled == [True]
-        assert monitor._universe_at == previous
-        assert monitor._universe_failed
-        assert 'universe_stale' in monitor.snapshot()['health']['degraded_reasons']
-        progress = monitor.snapshot()['diagnostics']['universe_refresh']
-        assert progress['stage'] == stage
-        assert progress['error_type'] == 'TimeoutError'
-        assert progress['elapsed_seconds'] >= 0.05
-        assert f'stage={stage}' in caplog.text
+        task = asyncio.create_task(monitor._refresh_universe_bounded(
+            client, block_observation_status=False,
+        ))
+        try:
+            await asyncio.wait_for(entered.wait(), _TEST_WATCHDOG_SECONDS)
+            assert not task.done()
+            assert monitor._universe_at == previous
+            elapsed[0] = 0.05
+            expire.set()
+            with pytest.raises(TimeoutError):
+                await _finish_task(task)
+            assert cancelled == [True]
+            assert monitor._universe_at == previous
+            assert monitor._universe_failed
+            assert 'universe_stale' in monitor.snapshot()['health']['degraded_reasons']
+            progress = monitor.snapshot()['diagnostics']['universe_refresh']
+            assert progress['stage'] == stage
+            assert progress['error_type'] == 'TimeoutError'
+            assert progress['elapsed_seconds'] >= 0.05
+            assert f'stage={stage}' in caplog.text
+        finally:
+            expire.set()
+            await _cancel_task(task)
 
     asyncio.run(scenario())
 
 
 def test_universe_recovery_probe_requires_complete_refresh(tmp_path, monkeypatch):
-    from open_trader import polymarket_monitor
-
     setup_public([event('event-1', markets=(market('market-1'),))])
     monitor = make_monitor(tmp_path, relation_discovery=None, relation_validator=None)
     client = FakePublicClient()
@@ -6981,25 +7392,63 @@ def test_universe_recovery_probe_requires_complete_refresh(tmp_path, monkeypatch
     monitor._universe_retry_pending = True
     monitor._universe_failed = True
     subscribe = monitor._refresh_subscription_if_dirty
-    monkeypatch.setattr(polymarket_monitor, 'PUBLIC_REFRESH_TIMEOUT_SECONDS', 0.05)
+    entered, release, expire = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    elapsed = [0.0]
+    deadline_enabled = _stage_deadline(monkeypatch, elapsed, expire)
+    cancelled = []
 
     async def blocked(*args, **kwargs):
-        await asyncio.Event().wait()
+        entered.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+        await subscribe(*args, **kwargs)
+
+    monkeypatch.setattr(monitor, '_refresh_subscription_if_dirty', blocked)
 
     async def scenario():
-        monkeypatch.setattr(monitor, '_refresh_subscription_if_dirty', blocked)
-        due, succeeded = await monitor._refresh_universe_if_due(client, current=0, next_refresh=0)
-        assert not succeeded
-        assert monitor._universe_at is None
-        assert monitor._universe_retry_exhausted
-        assert not monitor.snapshot()['health']['actionable']
-        monkeypatch.setattr(monitor, '_refresh_subscription_if_dirty', subscribe)
-        _, succeeded = await monitor._refresh_universe_if_due(client, current=due, next_refresh=due)
-        assert succeeded
-        assert monitor._universe_at == NOW
-        assert not monitor._universe_retry_exhausted
-        assert monitor.snapshot()['health']['actionable']
-        await monitor._close_stream()
+        task = asyncio.create_task(monitor._refresh_universe_if_due(
+            client, current=0, next_refresh=0,
+        ))
+        try:
+            await asyncio.wait_for(entered.wait(), _TEST_WATCHDOG_SECONDS)
+            assert not task.done()
+            assert monitor._universe_at is None
+            assert monitor._universe_retry_exhausted
+            assert not monitor.snapshot()['health']['actionable']
+            elapsed[0] = 0.05
+            expire.set()
+            due, succeeded = await _finish_task(task)
+            assert not succeeded
+            assert cancelled == [True]
+            assert monitor._universe_at is None
+            assert monitor._universe_retry_exhausted
+            assert not monitor.snapshot()['health']['actionable']
+            # Recovery is a full operation, held at its final prerequisite.
+            # Its success is independent of the intentional 50ms failure budget.
+            entered.clear()
+            deadline_enabled[0] = False
+            task = asyncio.create_task(monitor._refresh_universe_if_due(
+                client, current=due, next_refresh=due,
+            ))
+            await asyncio.wait_for(entered.wait(), _TEST_WATCHDOG_SECONDS)
+            assert not task.done()
+            assert monitor._universe_at is None
+            assert monitor._universe_retry_exhausted
+            assert not monitor.snapshot()['health']['actionable']
+            release.set()
+            _, succeeded = await _finish_task(task)
+            assert succeeded
+            assert monitor._universe_at == NOW
+            assert not monitor._universe_retry_exhausted
+            assert monitor.snapshot()['health']['actionable']
+        finally:
+            release.set()
+            expire.set()
+            await _cancel_task(task)
+            await monitor._close_stream()
 
     asyncio.run(scenario())
 
@@ -7152,21 +7601,657 @@ def test_cleanup_reports_stalled_task_without_starting_replacement(tmp_path, mon
         async def fail(_client):
             raise RuntimeError('readiness failed')
 
-        monitor._full_scan_task = asyncio.create_task(stubborn())
-        await entered.wait()
-        monitor._poll_relation_validation = fail
-        task = asyncio.create_task(monitor._run_forever_once())
+        stubborn_task = asyncio.create_task(stubborn())
+        monitor._full_scan_task = stubborn_task
+        task = None
         try:
+            await asyncio.wait_for(entered.wait(), _TEST_WATCHDOG_SECONDS)
+            monitor._poll_relation_validation = fail
+            task = asyncio.create_task(monitor._run_forever_once())
             assert await _wait_until(lambda: monitor._thread_status == 'cleanup_blocked')
             assert not task.done()
             assert monitor._diagnostics['cleanup_pending_tasks'] == 1
             assert monitor._thread_restarts == 0
             assert not monitor.snapshot()['health']['actionable']
             assert 'monitor_recovering' in monitor.snapshot()['health']['degraded_reasons']
+            release.set()
+            with pytest.raises(RuntimeError, match='readiness failed'):
+                await _finish_task(task)
+            assert 'cleanup_pending_tasks' not in monitor._diagnostics
         finally:
             release.set()
-        with pytest.raises(RuntimeError, match='readiness failed'):
-            await asyncio.wait_for(task, 2)
-        assert 'cleanup_pending_tasks' not in monitor._diagnostics
+            await _cancel_task(task)
+            await _cancel_task(stubborn_task)
 
     asyncio.run(scenario())
+
+
+def test_observation_replenishment_retains_real_five_second_cadence(tmp_path: Path) -> None:
+    """Offline integration: an expired book cannot bypass the real 5s limiter."""
+    monitor = make_monitor(tmp_path, relation_discovery=None, relation_validator=None)
+    calls = []
+    decision_times = []
+
+    def decision_clock():
+        # Observe the real timestamp used by the production scheduling decision.
+        # Neither task startup nor descheduling across the boundary changes it.
+        decision_times.append(_REAL_MONOTONIC())
+        return decision_times[-1]
+
+    async def refresh(_client, *, force=False):
+        calls.append(_REAL_MONOTONIC())
+
+    monitor._monotonic = decision_clock
+    monitor._refresh_observation_network_bounded = refresh
+    monitor._observation_books_need_refresh = lambda now=None: True
+
+    async def scenario():
+        try:
+            monitor._schedule_observation_source_status(object())
+            first_scheduled = decision_times[-1]
+            deadline = monitor._observation_source_status_next_allowed
+            assert deadline == first_scheduled + 5.0
+            await _finish_task(monitor._observation_source_status_task)
+            assert len(calls) == 1
+            # Use the timestamp sampled inside each scheduling decision. A
+            # pre-call clock check could cross the deadline while descheduled.
+            while True:
+                previous_samples = len(decision_times)
+                monitor._schedule_observation_source_status(object())
+                assert len(decision_times) == previous_samples + 1
+                scheduled_at = decision_times[-1]
+                task = monitor._observation_source_status_task
+                if scheduled_at < deadline:
+                    assert len(calls) == 1
+                    assert task is None
+                    await asyncio.sleep(min(0.01, max(0, deadline - _REAL_MONOTONIC())))
+                    continue
+                assert scheduled_at - first_scheduled >= 5.0
+                assert monitor._observation_source_status_next_allowed == scheduled_at + 5.0
+                await _finish_task(task)
+                assert len(calls) == 2
+                break
+        finally:
+            await _cancel_task(monitor._observation_source_status_task)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('retained', [None, 'books:TimeoutError', 'relations:ConnectionError', 'stream:TransportError', 'auth:RequestRejectedError', 'universe_other:TimeoutError'])
+def test_complete_universe_recovery_clears_only_its_current_fault(tmp_path, monkeypatch, caplog, retained):
+    from open_trader import polymarket_monitor
+
+    class RecoveringClient(FakePublicClient):
+        stalled = True
+
+        async def list_events(self, **kwargs):
+            if self.stalled:
+                await asyncio.sleep(.1)
+            return await super().list_events(**kwargs)
+
+    setup_public([event('e', markets=(market('m'),))])
+    monkeypatch.setattr(polymarket_monitor, 'PUBLIC_REFRESH_TIMEOUT_SECONDS', .01)
+    monitor = make_monitor(tmp_path, relation_discovery=None)
+    client = RecoveringClient()
+
+    async def exercise():
+        with pytest.raises(TimeoutError):
+            await monitor._refresh_universe_bounded(client)
+        assert monitor.snapshot()['diagnostics']['last_error'] == 'universe:TimeoutError'
+        assert monitor.snapshot()['diagnostics']['universe_refresh']['stage'] != 'complete'
+        # Another failed round must retain the fault until full publication.
+        with pytest.raises(TimeoutError):
+            await monitor._refresh_universe_bounded(client)
+        assert monitor.snapshot()['diagnostics']['last_error'] == 'universe:TimeoutError'
+        if retained is not None:
+            monitor._diagnostics['last_error'] = retained
+        client.stalled = False
+        monkeypatch.setattr(polymarket_monitor, 'PUBLIC_REFRESH_TIMEOUT_SECONDS', 30)
+        await monitor._refresh_universe_bounded(client)
+
+    asyncio.run(exercise())
+    snapshot = monitor.snapshot()
+    assert snapshot['diagnostics']['universe_refresh']['stage'] == 'complete'
+    assert snapshot['diagnostics']['last_error'] == retained
+    assert snapshot['health']['status'] == 'healthy'
+    assert 'prediction_universe_refresh_failed' in caplog.text
+
+
+def test_complete_activity_recovery_clears_its_fault_and_keeps_scan_history(tmp_path):
+    setup_public([threshold_event()])
+    setup_threshold_books(low_ask="0.50", high_no_ask="0.51")
+    monitor = make_monitor(tmp_path, relation_validator=FakeRelationValidator())
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    FakePublicClient.fail_get_order_books = True
+    asyncio.run(monitor._run_activity_scan(client))
+    assert monitor.snapshot()["diagnostics"]["last_error"] == "relations:ConnectionError"
+
+    FakePublicClient.fail_get_order_books = False
+    asyncio.run(monitor._run_activity_scan(client))
+
+    snapshot = monitor.snapshot()
+    assert snapshot["relation_discovery"]["activity"]["status"] == "healthy"
+    assert snapshot["diagnostics"]["last_error"] is None
+    assert any(row.get("reason") == "ConnectionError" for row in monitor._relation_scan_logs)
+
+
+@pytest.mark.parametrize("operation", ["catalog_load", "full", "event", "rules"])
+def test_complete_relation_operation_recovers_only_after_fresh_success(tmp_path, monkeypatch, operation):
+    setup_public([threshold_event()])
+    setup_threshold_books(low_ask="0.40", high_no_ask="0.48")
+    validator = FakeRelationValidator()
+    monitor = make_monitor(tmp_path, relation_validator=validator)
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    relation = next(iter(monitor._relations.values()))
+    load = monitor._store.load_relation_state
+
+    def fail_load():
+        raise ConnectionError("catalog read failed")
+
+    async def run(failed):
+        if operation == "catalog_load":
+            monkeypatch.setattr(monitor._store, "load_relation_state", fail_load if failed else load)
+            monitor._load_relation_catalog()
+        elif operation == "full":
+            FakePublicClient.fail_list_events = failed
+            await monitor._run_full_relation_scan(client)
+        elif operation == "event":
+            FakePublicClient.fail_get_event = failed
+            await monitor._refresh_relation_event(client, relation.event_id)
+        elif operation == "rules":
+            FakePublicClient.fail_get_event = failed
+            await monitor._verify_relation_rules(client, relation)
+    async def exercise():
+        await run(True)
+        assert monitor.snapshot()["diagnostics"]["last_error"] == "relations:ConnectionError"
+        await run(False)
+        assert monitor.snapshot()["diagnostics"]["last_error"] is None
+
+    asyncio.run(exercise())
+
+
+def test_activity_transport_recovery_accepts_legitimate_unavailable_books(tmp_path):
+    setup_public([threshold_event()])
+    monitor = make_monitor(tmp_path, relation_validator=FakeRelationValidator())
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    FakePublicClient.fail_get_order_books = True
+    asyncio.run(monitor._refresh_relation_activity(client))
+    assert monitor.snapshot()["diagnostics"]["last_error"] == "relations:ConnectionError"
+
+    class UnavailableClient(FakePublicClient):
+        async def get_order_books(self, **kwargs):
+            return ()
+
+    FakePublicClient.fail_get_order_books = False
+    asyncio.run(monitor._refresh_relation_activity(UnavailableClient()))
+    snapshot = monitor.snapshot()
+    assert snapshot["relation_discovery"]["activity"]["status"] == "healthy"
+    assert snapshot["relation_discovery"]["activity"]["rejection_counts"]["book_unavailable"] > 0
+    assert snapshot["diagnostics"]["last_error"] is None
+
+
+@pytest.mark.parametrize("new_fault", ["same", "stream", "apr"])
+def test_inflight_activity_recovery_keeps_every_later_fault(tmp_path, monkeypatch, new_fault):
+    from open_trader import polymarket_monitor
+
+    setup_public([threshold_event()])
+    setup_threshold_books()
+    monitor = make_monitor(tmp_path, relation_validator=FakeRelationValidator())
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    FakePublicClient.fail_get_order_books = True
+    asyncio.run(monitor._refresh_relation_activity(client))
+    FakePublicClient.fail_get_order_books = False
+
+    async def exercise():
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        class BlockingClient(FakePublicClient):
+            async def get_order_books(self, **kwargs):
+                entered.set()
+                await release.wait()
+                return await super().get_order_books(**kwargs)
+
+        task = asyncio.create_task(monitor._refresh_relation_activity(BlockingClient()))
+        await entered.wait()
+        assert monitor.snapshot()["diagnostics"]["last_error"] == "relations:ConnectionError"
+        if new_fault == "same":
+            FakePublicClient.fail_get_order_books = True
+            await monitor._refresh_relation_activity(client)
+            FakePublicClient.fail_get_order_books = False
+            expected = "relations:ConnectionError"
+        elif new_fault == "stream":
+            monitor._disconnect_stream(ConnectionError("new stream fault"))
+            expected = "stream:ConnectionError"
+        else:
+            limit = polymarket_monitor.RELATION_APR_TARGET_LIMIT
+            monkeypatch.setattr(polymarket_monitor, "RELATION_APR_TARGET_LIMIT", 0)
+            await monitor._refresh_relation_activity(client)
+            monkeypatch.setattr(polymarket_monitor, "RELATION_APR_TARGET_LIMIT", limit)
+            expected = "relations:apr_target_limit"
+        assert monitor.snapshot()["diagnostics"]["last_error"] == expected
+        release.set()
+        await task
+        assert monitor.snapshot()["diagnostics"]["last_error"] == expected
+
+    asyncio.run(exercise())
+
+
+def test_activity_wrapper_preserves_swallowed_rules_failure_then_recovers(tmp_path):
+    setup_public([threshold_event()])
+    setup_threshold_books()
+    monitor = make_monitor(tmp_path, relation_validator=FakeRelationValidator())
+
+    class PhasedClient(FakePublicClient):
+        calls = 0
+        fail_second_book = True
+        fail_rules = False
+
+        async def get_order_books(self, **kwargs):
+            self.calls += 1
+            if self.fail_second_book and self.calls == 2:
+                raise ConnectionError("opportunity read failed")
+            return await super().get_order_books(**kwargs)
+
+        async def get_event(self, **kwargs):
+            if self.fail_rules:
+                raise ConnectionError("rules read failed")
+            return await super().get_event(**kwargs)
+
+    client = PhasedClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+
+    async def exercise():
+        await monitor._run_activity_scan(client)
+        assert monitor.snapshot()["diagnostics"]["last_error"] == "relations:ConnectionError"
+        client.fail_second_book = False
+        client.fail_rules = True
+        await monitor._run_activity_scan(client)
+        assert monitor.snapshot()["relation_discovery"]["activity"]["status"] == "healthy"
+        assert not monitor.snapshot()["opportunities"]
+        assert monitor.snapshot()["diagnostics"]["last_error"] == "relations:ConnectionError"
+        client.fail_rules = False
+        await monitor._run_activity_scan(client)
+        assert monitor.snapshot()["opportunities"]
+        assert monitor.snapshot()["diagnostics"]["last_error"] is None
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("operation", ["event", "rules"])
+def test_relation_recovery_is_scoped_to_exact_event_or_relation(tmp_path, operation):
+    setup_public([
+        threshold_event(event_id="event-a", token_prefix="a-"),
+        threshold_event(event_id="event-b", token_prefix="b-"),
+    ])
+    monitor = make_monitor(tmp_path, relation_validator=FakeRelationValidator())
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    a, b = monitor._relations.values()
+
+    async def run(relation):
+        if operation == "event":
+            await monitor._refresh_relation_event(client, relation.event_id)
+        else:
+            await monitor._verify_relation_rules(client, relation)
+
+    async def exercise():
+        FakePublicClient.fail_get_event = True
+        await run(a)
+        FakePublicClient.fail_get_event = False
+        await run(b)
+        assert monitor.snapshot()["diagnostics"]["last_error"] == "relations:ConnectionError"
+        await run(a)
+        assert monitor.snapshot()["diagnostics"]["last_error"] is None
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("failed_operation", ["activity", "catalog_load", "full"])
+def test_relation_sibling_success_does_not_clear_another_operation(tmp_path, monkeypatch, failed_operation):
+    setup_public([threshold_event()])
+    monitor = make_monitor(tmp_path, relation_validator=FakeRelationValidator())
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    load = monitor._store.load_relation_state
+
+    def fail_load():
+        raise ConnectionError("catalog read failed")
+
+    async def exercise():
+        if failed_operation == "activity":
+            FakePublicClient.fail_get_order_books = True
+            await monitor._refresh_relation_activity(client)
+            FakePublicClient.fail_get_order_books = False
+            await monitor._run_full_relation_scan(client)
+            monitor._load_relation_catalog()
+        elif failed_operation == "catalog_load":
+            monkeypatch.setattr(monitor._store, "load_relation_state", fail_load)
+            monitor._load_relation_catalog()
+            monkeypatch.setattr(monitor._store, "load_relation_state", load)
+            await monitor._run_full_relation_scan(client)
+            await monitor._refresh_relation_activity(client)
+        else:
+            FakePublicClient.fail_list_events = True
+            await monitor._run_full_relation_scan(client)
+            FakePublicClient.fail_list_events = False
+            monitor._load_relation_catalog()
+            await monitor._refresh_relation_activity(client)
+        assert monitor.snapshot()["diagnostics"]["last_error"] == "relations:ConnectionError"
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("operation", ["full", "event", "activity"])
+def test_relation_recovery_keeps_failed_publication_diagnostics(tmp_path, monkeypatch, operation):
+    setup_public([threshold_event()])
+    setup_threshold_books()
+    monitor = make_monitor(tmp_path, relation_validator=FakeRelationValidator())
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    event_id = next(iter(monitor._relations.values())).event_id
+    record = monitor._store.record_relation_scan
+
+    def fail_record(**kwargs):
+        raise sqlite3.OperationalError("scan publication failed")
+
+    async def run():
+        if operation == "full":
+            await monitor._run_full_relation_scan(client)
+        elif operation == "event":
+            await monitor._refresh_relation_event(client, event_id)
+        else:
+            await monitor._refresh_relation_activity(client)
+
+    async def exercise():
+        FakePublicClient.fail_list_events = True
+        FakePublicClient.fail_get_event = True
+        FakePublicClient.fail_get_order_books = True
+        await run()
+        assert monitor.snapshot()["diagnostics"]["last_error"] == "relations:ConnectionError"
+        FakePublicClient.fail_list_events = False
+        FakePublicClient.fail_get_event = False
+        FakePublicClient.fail_get_order_books = False
+        monkeypatch.setattr(monitor._store, "record_relation_scan", fail_record)
+        await run()
+        assert monitor.snapshot()["diagnostics"]["last_error"] == "store:OperationalError"
+        monkeypatch.setattr(monitor._store, "record_relation_scan", record)
+        await run()
+        # Successful relation publication does not claim store-component recovery.
+        assert monitor.snapshot()["diagnostics"]["last_error"] == "store:OperationalError"
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("operation", ["full", "event"])
+def test_relation_recovery_does_not_clear_at_intermediate_catalog_publication(tmp_path, monkeypatch, operation):
+    setup_public([threshold_event()])
+    monitor = make_monitor(tmp_path, relation_validator=FakeRelationValidator())
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    event_id = next(iter(monitor._relations.values())).event_id
+    record = monitor._store.record_relation_scan
+    seen = []
+
+    def inspect_publication(**kwargs):
+        seen.append(monitor.snapshot()["diagnostics"]["last_error"])
+        return record(**kwargs)
+
+    async def run():
+        if operation == "full":
+            await monitor._run_full_relation_scan(client)
+        else:
+            await monitor._refresh_relation_event(client, event_id)
+
+    async def exercise():
+        FakePublicClient.fail_list_events = FakePublicClient.fail_get_event = True
+        await run()
+        FakePublicClient.fail_list_events = FakePublicClient.fail_get_event = False
+        monkeypatch.setattr(monitor._store, "record_relation_scan", inspect_publication)
+        await run()
+        assert seen == ["relations:ConnectionError"]
+        assert monitor.snapshot()["diagnostics"]["last_error"] is None
+
+    asyncio.run(exercise())
+
+
+def test_catalog_load_keeps_fault_on_missing_state_or_failed_history(tmp_path, monkeypatch):
+    setup_public([threshold_event()])
+    monitor = make_monitor(tmp_path)
+    asyncio.run(monitor._run_full_relation_scan(FakePublicClient()))
+    load = monitor._store.load_relation_state
+    history = monitor._store.relation_scan_history
+
+    def fail(**kwargs):
+        raise ConnectionError("catalog read failed")
+
+    monkeypatch.setattr(monitor._store, "load_relation_state", fail)
+    monitor._load_relation_catalog()
+    monkeypatch.setattr(monitor._store, "load_relation_state", lambda: None)
+    monitor._load_relation_catalog()
+    assert monitor.snapshot()["diagnostics"]["last_error"] == "relations:ConnectionError"
+    monkeypatch.setattr(monitor._store, "load_relation_state", load)
+    monkeypatch.setattr(monitor._store, "relation_scan_history", fail)
+    monitor._load_relation_catalog()
+    assert monitor.snapshot()["diagnostics"]["last_error"] == "relations:ConnectionError"
+    monkeypatch.setattr(monitor._store, "relation_scan_history", history)
+    monitor._load_relation_catalog()
+    assert monitor.snapshot()["diagnostics"]["last_error"] is None
+
+
+def test_activity_apr_limit_clears_only_after_valid_limit_recovery(tmp_path, monkeypatch):
+    from open_trader import polymarket_monitor
+
+    setup_public([threshold_event()])
+    setup_threshold_books()
+    monitor = make_monitor(tmp_path, relation_validator=FakeRelationValidator())
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    limit = polymarket_monitor.RELATION_APR_TARGET_LIMIT
+    monkeypatch.setattr(polymarket_monitor, "RELATION_APR_TARGET_LIMIT", 0)
+    for _ in range(2):
+        asyncio.run(monitor._run_activity_scan(client))
+        assert monitor.snapshot()["diagnostics"]["last_error"] == "relations:apr_target_limit"
+        assert monitor.snapshot()["relation_discovery"]["activity"]["status"] == "degraded"
+    monkeypatch.setattr(polymarket_monitor, "RELATION_APR_TARGET_LIMIT", limit)
+    asyncio.run(monitor._run_activity_scan(client))
+    assert monitor.snapshot()["diagnostics"]["last_error"] is None
+
+
+def test_rules_cache_does_not_claim_recovery_from_failed_metadata_persistence(tmp_path, monkeypatch):
+    setup_public([threshold_event()])
+    monitor = make_monitor(tmp_path, relation_validator=FakeRelationValidator())
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    relation = next(iter(monitor._relations.values()))
+    FakePublicClient.fail_get_event = True
+    asyncio.run(monitor._verify_relation_rules(client, relation))
+    FakePublicClient.fail_get_event = False
+    FakePublicClient.events[0].metrics.volume_24hr = Decimal("500")
+    save = monitor._store.save_relation_state
+
+    def fail_save(*args, **kwargs):
+        raise sqlite3.OperationalError("metadata persistence failed")
+
+    monkeypatch.setattr(monitor._store, "save_relation_state", fail_save)
+    assert asyncio.run(monitor._verify_relation_rules(client, relation)) is not None
+    assert monitor.snapshot()["diagnostics"]["last_error"] == "store:OperationalError"
+    monkeypatch.setattr(monitor._store, "save_relation_state", save)
+    calls = len(FakePublicClient.get_event_calls)
+    assert asyncio.run(monitor._verify_relation_rules(client, monitor._relations[relation.relation_id])) is not None
+    assert len(FakePublicClient.get_event_calls) == calls
+    assert monitor.snapshot()["diagnostics"]["last_error"] == "store:OperationalError"
+
+
+def test_terminal_validation_refresh_fault_is_retained_by_normal_scheduler(tmp_path):
+    setup_public([threshold_event()])
+    setup_threshold_books()
+    validator = FakeRelationValidator()
+    monitor = make_monitor(tmp_path, relation_validator=validator)
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    asyncio.run(monitor._refresh_relation_activity(client))
+
+    async def exercise():
+        await monitor._poll_relation_validation(client)
+        assert monitor._codex_task is not None
+        await monitor._codex_task
+        FakePublicClient.fail_get_order_books = True
+        await monitor._poll_relation_validation(client)
+        assert monitor.snapshot()["diagnostics"]["last_error"] == "relations:ConnectionError"
+        FakePublicClient.fail_get_order_books = False
+        # Activity completes, but the terminal validation no longer has a retry task.
+        await monitor._run_activity_scan(client)
+        await monitor._poll_relation_validation(client)
+        assert monitor._codex_task is None
+        assert monitor.snapshot()["relation_discovery"]["activity"]["status"] == "healthy"
+        assert monitor.snapshot()["opportunities"]
+        assert monitor.snapshot()["diagnostics"]["last_error"] == "relations:ConnectionError"
+
+    asyncio.run(exercise())
+
+
+def test_validation_retry_recovers_own_opportunity_fault_through_normal_scheduler(tmp_path):
+    now = [NOW]
+    setup_public([threshold_event()])
+    setup_threshold_books()
+    validator = FakeRelationValidator(status="llm_unavailable")
+    monitor = make_monitor(tmp_path, relation_validator=validator, clock=lambda: now[0])
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    asyncio.run(monitor._refresh_relation_activity(client))
+
+    async def exercise():
+        await monitor._poll_relation_validation(client)
+        assert monitor._codex_task is not None
+        await monitor._codex_task
+        FakePublicClient.fail_get_order_books = True
+        await monitor._poll_relation_validation(client)
+        assert monitor.snapshot()["diagnostics"]["last_error"] == "relations:ConnectionError"
+        FakePublicClient.fail_get_order_books = False
+        now[0] = max(monitor._codex_retry_at.values()) + timedelta(seconds=1)
+        validator.status = "approved"
+        await monitor._refresh_relation_activity(client)
+        await monitor._poll_relation_validation(client)
+        assert monitor._codex_task is not None
+        await monitor._codex_task
+        await monitor._poll_relation_validation(client)
+        assert monitor.snapshot()["opportunities"]
+        assert monitor.snapshot()["diagnostics"]["last_error"] is None
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("operation", ["event", "activity"])
+def test_relation_recovery_keeps_subscription_failure(tmp_path, operation):
+    setup_public([threshold_event()])
+    setup_threshold_books()
+    monitor = make_monitor(tmp_path, relation_validator=FakeRelationValidator())
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    event_id = next(iter(monitor._relations.values())).event_id
+
+    class FailingStreamClient(FakePublicClient):
+        def subscribe(self, spec):
+            raise ConnectionError("subscription failed")
+
+    async def run(client):
+        if operation == "event":
+            await monitor._refresh_relation_event(client, event_id)
+        else:
+            await monitor._refresh_relation_activity(client)
+
+    async def exercise():
+        FakePublicClient.fail_get_event = FakePublicClient.fail_get_order_books = True
+        await run(client)
+        assert monitor.snapshot()["diagnostics"]["last_error"] == "relations:ConnectionError"
+        FakePublicClient.fail_get_event = FakePublicClient.fail_get_order_books = False
+        # A previous successful activity makes the exact event subscribe to live tokens.
+        if operation == "event":
+            await monitor._refresh_relation_activity(client)
+        monitor._subscription_dirty = True
+        await run(FailingStreamClient())
+        assert monitor.snapshot()["diagnostics"]["last_error"] == "stream:ConnectionError"
+        await run(client)
+        assert monitor.snapshot()["diagnostics"]["last_error"] == "stream:ConnectionError"
+
+    asyncio.run(exercise())
+
+
+def test_full_catalog_recovery_retains_fault_after_swallowed_lifecycle_failure(tmp_path):
+    setup_public([threshold_event()])
+    monitor = make_monitor(tmp_path)
+    client = FakePublicClient()
+    FakePublicClient.fail_list_events = True
+    asyncio.run(monitor._run_full_relation_scan(client))
+    FakePublicClient.fail_list_events = False
+
+    def fail_lifecycle():
+        raise ConnectionError("lifecycle publication failed")
+
+    monitor.set_relation_lifecycle_observer(fail_lifecycle)
+    asyncio.run(monitor._run_full_relation_scan(client))
+    assert monitor.snapshot()["relation_discovery"]["catalog"]["status"] == "healthy"
+    assert monitor.snapshot()["diagnostics"]["last_error"] == "relations:ConnectionError"
+    monitor.set_relation_lifecycle_observer(lambda: {})
+    asyncio.run(monitor._run_full_relation_scan(client))
+    assert monitor.snapshot()["diagnostics"]["last_error"] is None
+
+
+@pytest.mark.parametrize("old_count", [1, 2])
+def test_cached_validation_publication_does_not_clear_a_different_target_set(tmp_path, old_count):
+    now = [NOW]
+    initial = [threshold_event(event_id=f"event-{i}", token_prefix=f"{i}-") for i in range(old_count)]
+    setup_public(initial)
+    for i in range(old_count):
+        setup_threshold_books(token_prefix=f"{i}-")
+    validator = FakeRelationValidator()
+    monitor = make_monitor(tmp_path, relation_validator=validator, clock=lambda: now[0])
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    asyncio.run(monitor._refresh_relation_activity(client))
+    for relation in monitor._relations.values():
+        validator.validate(relation)
+
+    async def exercise():
+        FakePublicClient.fail_get_order_books = True
+        await monitor._poll_relation_validation(client)
+        assert monitor._codex_task is None
+        assert monitor.snapshot()["diagnostics"]["last_error"] == "relations:ConnectionError"
+        FakePublicClient.fail_get_order_books = False
+        FakePublicClient.events.append(threshold_event(event_id="new-event", token_prefix="new-"))
+        setup_threshold_books(token_prefix="new-")
+        now[0] += timedelta(seconds=3)
+        await monitor._run_full_relation_scan(client)
+        new_relation = next(r for r in monitor._relations.values() if r.event_id == "new-event")
+        validator.validate(new_relation)
+        await monitor._refresh_relation_activity(client)
+        await monitor._poll_relation_validation(client)
+        assert monitor._codex_task is None
+        assert any(row["relation_id"] == new_relation.relation_id for row in monitor.snapshot()["opportunities"])
+        assert monitor.snapshot()["diagnostics"]["last_error"] == "relations:ConnectionError"
+
+    asyncio.run(exercise())
+
+
+def test_event_recovery_rejects_malformed_sdk_identity(tmp_path):
+    setup_public([threshold_event()])
+    monitor = make_monitor(tmp_path)
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    event_id = next(iter(monitor._relations.values())).event_id
+    FakePublicClient.fail_get_event = True
+    assert asyncio.run(monitor._refresh_relation_event(client, event_id)) is False
+    FakePublicClient.fail_get_event = False
+
+    class WrongEventClient(FakePublicClient):
+        async def get_event(self, **kwargs):
+            return threshold_event(event_id="wrong-event")
+
+    assert asyncio.run(monitor._refresh_relation_event(WrongEventClient(), event_id)) is False
+    assert monitor.snapshot()["diagnostics"]["last_error"] == "relations:RuntimeError"
+    assert asyncio.run(monitor._refresh_relation_event(client, event_id)) is True
+    assert monitor.snapshot()["diagnostics"]["last_error"] is None
