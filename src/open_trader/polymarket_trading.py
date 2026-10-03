@@ -98,6 +98,9 @@ LP_METADATA_CACHE_TTL_SECONDS = 43200.0
 LP_METADATA_CACHE_JITTER_SECONDS = 0.0
 LP_METADATA_NEGATIVE_TTL_SECONDS = 3600.0
 LP_METADATA_MAX_REFRESH_IDS_PER_CALL = 1500
+# Each Gamma event can contain hundreds of full child markets. Bound SDK
+# parsing separately from the lightweight, 100-ID market metadata reads.
+LP_METADATA_EVENT_BATCH_SIZE = 10
 LP_REWARD_ASSET_USD_ADDRESSES = frozenset(
     {
         # Both contracts are identified by the official Polymarket contracts
@@ -1097,7 +1100,7 @@ def _collect(
 
 
 def _iter_reward_items(value: object, stop_event: threading.Event | None):
-    """Consume SDK pages without retaining previous raw reward objects."""
+    """Stream SDK reward/event pages with cancellation and no raw-result cache."""
     def checked(items):
         iterator = iter(items)
         while True:
@@ -1190,6 +1193,18 @@ def _address_from_client(client: object, name: str) -> str | None:
     if not isinstance(value, str) or not _ADDRESS_RE.fullmatch(value):
         return None
     return value
+
+
+def _lp_event_facts(value: object) -> Mapping[str, object] | None:
+    """Keep LP event evidence without serializing the unused child markets."""
+    fields = {"id", "slug", "state", "schedule"}
+    if isinstance(value, Mapping):
+        return {key: value[key] for key in fields if key in value}
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        facts = model_dump(include=fields)
+        return facts if isinstance(facts, Mapping) else None
+    return None
 
 
 def _model_dict(value: object) -> Mapping[str, object] | None:
@@ -3174,8 +3189,13 @@ class PolymarketTradingClient:
             if not unresolved_numeric_ids:
                 break
             event_batches = tuple(
-                (unresolved_numeric_ids[offset : offset + 100], closed)
-                for offset in range(0, len(unresolved_numeric_ids), 100)
+                (
+                    unresolved_numeric_ids[offset : offset + LP_METADATA_EVENT_BATCH_SIZE],
+                    closed,
+                )
+                for offset in range(
+                    0, len(unresolved_numeric_ids), LP_METADATA_EVENT_BATCH_SIZE
+                )
             )
 
             def read_event_batch(
@@ -3192,10 +3212,26 @@ class PolymarketTradingClient:
                     mark_event_failure(batch, reason)
                     return (), reason
                 try:
+                    # Project inside the reader so completed futures retain
+                    # only LP facts, never the full SDK event/market trees.
                     return (
-                        _collect(list_events(ids=batch, closed=is_closed, page_size=100)),
+                        tuple(
+                            facts
+                            for value in _iter_reward_items(
+                                list_events(
+                                    ids=batch, closed=is_closed,
+                                    page_size=LP_METADATA_EVENT_BATCH_SIZE,
+                                ),
+                                stop_event,
+                            )
+                            if (facts := _lp_event_facts(value)) is not None
+                        ),
                         None,
                     )
+                except _RewardReadCancelled:
+                    reason = "event_read_cancelled"
+                    mark_event_failure(batch, reason)
+                    return (), reason
                 except Exception as exc:
                     reason = _safe_read_failure("event", exc)
                     mark_event_failure(batch, reason)
@@ -3247,7 +3283,7 @@ class PolymarketTradingClient:
             if not callable(get_event):
                 return event_id, None, "event_read_unavailable"
             try:
-                event = _model_dict(get_event(id=event_id))
+                event = _lp_event_facts(get_event(id=event_id))
             except Exception as exc:
                 return event_id, None, _safe_read_failure("event", exc)
             if event is None or str(event.get("id") or "") != event_id:

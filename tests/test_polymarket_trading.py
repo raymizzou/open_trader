@@ -4971,7 +4971,7 @@ def test_lp_metadata_preserves_event_evidence_and_market_links(
                 event_queries.append((requested_ids, closed, page_size))
             if len(requested_ids) > 100:
                 raise InvalidURL("URL component 'query' too long")
-            assert page_size == 100
+            assert page_size == 10
             assert len(requested_ids) == len(set(requested_ids))
             return PagedRows(
                 tuple(
@@ -5045,10 +5045,10 @@ def test_lp_metadata_preserves_event_evidence_and_market_links(
     assert len(queried_market_ids) == 201
     assert set(queried_market_ids) == set(requested_conditions)
     assert event_queries
-    assert all(0 < len(ids) <= 100 for ids, _closed, _page_size in event_queries)
-    assert all(page_size == 100 for _ids, _closed, page_size in event_queries)
+    assert all(0 < len(ids) <= 10 for ids, _closed, _page_size in event_queries)
+    assert all(page_size == 10 for _ids, _closed, page_size in event_queries)
     assert {closed for _ids, closed, _page_size in event_queries} == {False, True}
-    assert len(event_queries) <= 4
+    assert len(event_queries) == 21  # 20 open batches, one unresolved closed batch.
     queried_event_ids_by_mode = {
         closed: [
             event_id
@@ -5448,6 +5448,202 @@ def _lp_market_page_response(request, rows, *, next_cursor=None):
     if next_cursor is not None:
         payload["next_cursor"] = next_cursor
     return httpx.Response(200, json=payload, request=request)
+
+
+@pytest.mark.parametrize("guarded", [False, True])
+def test_lp_metadata_bounds_event_pages_and_releases_completed_sdk_trees(
+    monkeypatch: pytest.MonkeyPatch, guarded: bool,
+) -> None:
+    import gc
+    import weakref
+    from types import SimpleNamespace
+
+    import httpx
+    from polymarket.models.gamma.event import Event
+    from open_trader.prediction_read_only import PolymarketReadOnlyGuard
+
+    condition_ids = tuple(f"0x{index:064x}" for index in range(101))
+    references = []
+    live_counts: list[int] = []
+    queries: list[tuple[tuple[str, ...], int]] = []
+    lock = threading.Lock()
+    parse_event = Event.parse_response
+
+    def observed_parse(cls, payload):
+        event = parse_event(payload)
+        with lock:
+            references.append(weakref.ref(event))
+            live_counts.append(sum(ref() is not None for ref in references))
+        return event
+
+    monkeypatch.setattr(Event, "parse_response", classmethod(observed_parse))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        if request.url.path == "/markets/keyset":
+            return _lp_market_page_response(request, (
+                dict(_lp_market_payload(condition), events=[{
+                    "id": str(int(condition, 16) + 1), "slug": "reference-slug",
+                }])
+                for condition in request.url.params.get_list("condition_ids")
+            ))
+        assert request.url.path == "/events/keyset"
+        assert request.url.params["closed"] == "false"
+        ids = tuple(request.url.params.get_list("id"))
+        with lock:
+            queries.append((ids, int(request.url.params["limit"])))
+        return httpx.Response(200, json={"events": [{
+            "id": event_id, "slug": f"event-{event_id}", "ended": True,
+            "startTime": None if guarded else "2026-09-17T15:00:00Z",
+            "finishedTimestamp": None if guarded else "2026-09-17T16:00:00Z",
+            # Real Gamma events contain full child markets, not just references.
+            "markets": [_lp_market_payload(f"0x{index:064x}") for index in range(5)],
+        } for event_id in ids]}, request=request)
+
+    guard = PolymarketReadOnlyGuard()
+
+    def factory():
+        public = _lp_mock_public_client(handler)
+        if not guarded:
+            return public
+        return SimpleNamespace(
+            list_markets=public.list_markets,
+            list_events=lambda **kwargs: guard.protect(public.list_events(**kwargs)),
+            close=public.close,
+        )
+
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET), client=object(), public_client_factory=factory,
+    )
+    result = adapter.lp_market_metadata_batch(condition_ids)
+
+    assert result["state"] == "known"
+    assert set(result["markets"]) == set(condition_ids)
+    assert result["failed_ids"] == {}
+    assert result["deferred_ids"] == result["confirmed_absent_ids"] == ()
+    assert sorted(int(value) for ids, _ in queries for value in ids) == list(range(1, 102))
+    assert all(0 < len(ids) <= 10 and page_size == 10 for ids, page_size in queries)
+    # At most eight in-flight pages; completed futures must release SDK trees.
+    assert len(references) == 101
+    assert max(live_counts) <= 80
+    gc.collect()
+    assert all(ref() is None for ref in references)
+    assert guard.attempts == []
+    for index, condition_id in enumerate(condition_ids):
+        facts = result["markets"][condition_id]
+        assert facts["event_id"] == str(index + 1)
+        assert facts["event_ended"] is True
+        assert facts["event_start_time"] == (
+            None if guarded else datetime(2026, 9, 17, 15, tzinfo=UTC)
+        )
+        assert facts["event_finished_at"] == (
+            None if guarded else datetime(2026, 9, 17, 16, tzinfo=UTC)
+        )
+        assert facts["market_url"] == (
+            f"https://polymarket.com/event/event-{index + 1}/market-{condition_id[-8:]}"
+        )
+
+
+@pytest.mark.parametrize("event_id", ["42", "event-42"])
+def test_lp_metadata_does_not_serialize_event_child_markets(event_id) -> None:
+    from polymarket.models.gamma.event import Event
+    from pydantic import field_serializer
+
+    serialized_children = []
+
+    class ObservedEvent(Event):
+        @field_serializer("markets")
+        def serialize_children(self, markets):
+            serialized_children.append(len(markets))
+            return [market.model_dump() for market in markets]
+
+    condition = "0x" + "a" * 64
+    probe = _LpMetadataProbe()
+    probe.market_rows[condition] = _lp_cache_market_with_event(
+        condition, slug="child", event_id=event_id,
+    )
+    probe.event_rows[event_id] = ObservedEvent.parse_response({
+        "id": event_id, "slug": "parent", "ended": False,
+        "startTime": "2026-09-17T15:00:00Z",
+        "markets": [_lp_market_payload(condition)],
+    })
+    result = _lp_cache_adapter(probe).lp_market_metadata_batch((condition,))
+
+    assert result["state"] == "known"
+    assert result["failed_ids"] == {}
+    assert result["markets"][condition]["event_id"] == event_id
+    assert result["markets"][condition]["event_ended"] is False
+    assert result["markets"][condition]["event_start_time"] == datetime(
+        2026, 9, 17, 15, tzinfo=UTC
+    )
+    assert result["markets"][condition]["market_url"] == (
+        "https://polymarket.com/event/parent/child"
+    )
+    assert serialized_children == []
+
+
+@pytest.mark.parametrize("outcome", ["complete", "failed", "cancelled"])
+def test_lp_metadata_event_pagination_preserves_failure_and_cancellation(outcome) -> None:
+    import httpx
+
+    condition_ids = ("0x" + "a" * 64, "0x" + "b" * 64)
+    stop_event = threading.Event()
+    event_reads = []
+    current_outcome = outcome
+
+    def handler(request):
+        if request.url.path == "/markets/keyset":
+            return _lp_market_page_response(request, (
+                dict(_lp_market_payload(condition), events=[{"id": str(index + 1)}])
+                for index, condition in enumerate(condition_ids)
+            ))
+        assert request.url.path == "/events/keyset"
+        closed = request.url.params["closed"] == "true"
+        cursor = request.url.params.get("after_cursor")
+        event_reads.append((closed, cursor))
+        if current_outcome == "failed" and (cursor or closed):
+            return httpx.Response(400, json={"error": "unavailable"}, request=request)
+        if current_outcome == "cancelled":
+            stop_event.set()
+        payload = {"events": [{
+            "id": "2" if cursor else "1", "slug": "parent", "ended": True,
+            "markets": [_lp_market_payload(condition_ids[0])],
+        }]}
+        if not cursor:
+            payload["next_cursor"] = "second"
+        return httpx.Response(200, json=payload, request=request)
+
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET), client=object(),
+        public_client_factory=lambda: _lp_mock_public_client(handler),
+    )
+    result = adapter.lp_market_metadata_batch(condition_ids, stop_event=stop_event)
+
+    assert set(result["markets"]) == set(condition_ids)
+    assert result["confirmed_absent_ids"] == result["deferred_ids"] == ()
+    if outcome == "complete":
+        assert result["state"] == "known"
+        assert result["failed_ids"] == {}
+        assert all(facts["event_ended"] is True for facts in result["markets"].values())
+        assert event_reads == [(False, None), (False, "second")]
+    else:
+        reason = (
+            "event_read_cancelled" if outcome == "cancelled"
+            else "event_read_RequestRejectedError"
+        )
+        assert result["state"] == ("cancelled" if outcome == "cancelled" else "unknown")
+        assert result["failed_ids"] == dict.fromkeys(condition_ids, reason)
+        assert all(facts["event_ended"] is None for facts in result["markets"].values())
+        assert event_reads == ([(False, None)] if outcome == "cancelled" else [
+            (False, None), (False, "second"), (True, None),
+        ])
+        # An incomplete page read must not poison the metadata cache.
+        stop_event.clear()
+        current_outcome = "complete"
+        recovered = adapter.lp_market_metadata_batch(condition_ids)
+        assert recovered["state"] == "known"
+        assert recovered["failed_ids"] == {}
+        assert all(facts["event_ended"] is True for facts in recovered["markets"].values())
 
 
 @pytest.mark.parametrize("fallback", ["failed", "absent", "cancelled"])
