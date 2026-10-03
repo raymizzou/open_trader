@@ -27,6 +27,8 @@ jobs:
           persist-credentials: false
       - name: Test routing and fail-closed aggregation
         run: python3 -m unittest discover -s tests -p 'test_ci_*.py' -v
+      - name: Test offline release artifact contracts
+        run: python3 -m unittest discover -s tests -p 'test_release_*.py' -v
       - name: Plan full backend checks
         id: route
         env:

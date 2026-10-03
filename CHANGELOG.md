@@ -3,6 +3,15 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-03 — source release evidence
+
+- #215 / #221：源码发布要求四个后台服务及 portable 全部成功，并绑定准确的 main
+  SHA、CI run/attempt、required job/app 15368、证据摘要、测试选择和环境；拒绝跳过服务、
+  N-leg=0、过期批次及不完整 partition。保留源码 bundle、原始锁文件与独立清单；
+  高权限上传只使用工作流固定工具及构建阶段认证的元数据，不执行归档源码或 Makefile。
+  发布归档是历史来源证据，不替代未来部署的最新 Preflight/Host/Smoke 检查。既有三个
+  保护规则不变；未创建 tag/Release、上传资产、修改设置或部署。新增离线反例与边界回归。
+
 ## 2026-10-03
 
 - LP 自动池及手动会话通知将渠道消息 ID、正文和原始成员 episode 一起持久化；
