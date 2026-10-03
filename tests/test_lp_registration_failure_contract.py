@@ -1,4 +1,5 @@
 """A failed order import is visible and cannot authorize another BUY."""
+from datetime import timedelta
 from decimal import Decimal
 
 import pytest
@@ -64,6 +65,19 @@ def test_failed_registration_blocks_auto_buy_before_or_during_sign(tmp_path, dur
     assert Decimal(blocked["funds"]["buy_reserved_usd"]) == 0
 
     exchange.before_sign = None
-    assert lp.register_account_snapshot(_fresh_registration_bundle(exchange, lp))["state"] == "registered"
+    # Recovery and the subsequent send each need a new complete, fenced
+    # account round. The old test adapter had only an unfenced display read.
+    now = [lp._now()]
+    lp.clock = lambda: now[0]
+    def complete_account_round(*, max_age_seconds=0, trade_generation_provider=None):
+        del max_age_seconds
+        now[0] += timedelta(microseconds=1)
+        snapshot = _fresh_registration_bundle(exchange, lp)
+        snapshot.update(read_started_at=now[0], read_ended_at=now[0], checked_at=now[0])
+        if trade_generation_provider is not None:
+            snapshot['trade_generation'] = trade_generation_provider()
+        return snapshot
+    exchange.lp_account_snapshot_shared = complete_account_round
+    assert lp.register_account_snapshot(complete_account_round())["state"] == "registered"
     execution.lp_auto_run_once()
     assert len(exchange.posts) == 1

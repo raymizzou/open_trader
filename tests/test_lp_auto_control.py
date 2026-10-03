@@ -55,6 +55,9 @@ def test_dashboard_omits_intents_without_materializing_detail_projection(tmp_pat
     before = engine._lp_auto_pool()._read()
     expected = runtime.lp_auto_state()
     assert expected.pop("intents") and len(exchange.posts) == 1
+    # Detailed actual-order rows follow the same compact dashboard boundary
+    # as request audit rows; aggregate funds and slot fields remain present.
+    assert expected.pop("account_buys") == []
     monkeypatch.setattr(engine, "lp_dashboard", lambda: {"state": "ready"})
     copy = polymarket_lp_auto.deepcopy
 
