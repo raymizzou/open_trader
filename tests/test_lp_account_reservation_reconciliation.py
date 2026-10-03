@@ -91,7 +91,7 @@ def runtime(tmp_path, monkeypatch):
         adapter.close()
 
 
-def _seed_unknowns(store, execution, *, count=2, ownership=True, stage="legacy", explicit_account=False):
+def _seed_unknowns(store, execution, *, count=2, ownership=True, stage="legacy", explicit_account=False, amounts=None):
     """Recreate durable pre-206 rows without inventing an exchange order ID.
 
     A legacy row has no wallet field. Its exact original lp-auto idempotency
@@ -103,12 +103,13 @@ def _seed_unknowns(store, execution, *, count=2, ownership=True, stage="legacy",
     intents = []
     for index in range(count):
         iid, sid = f"old-round:{index}", f"legacy-unknown-{index}"
+        amount = Decimal(amounts[index]) if amounts is not None else Decimal("8")
         facts = {
             "market_id": "market-1" if index == 0 else f"legacy-market-{index}",
             "condition_id": CONDITION_ID if index == 0 else f"0x{index + 0x20:064x}",
             "token_id": TOKEN_ID if index == 0 else f"0x{index + 0x10:064x}",
             "outcome": "YES", "price": "0.40",
-            "quantity": "20", "buy_filled_quantity": "0", "buy_cost": "0",
+            "quantity": str(amount / Decimal("0.40")), "buy_filled_quantity": "0", "buy_cost": "0",
             "sold_quantity": "0", "sold_revenue": "0", "residual_quantity": "0",
             "fees": "0", "fee_status": "unknown", "entry_order_id": None,
             "owned_order_ids": [], "order_history": {}, "submit_status": "unknown",
@@ -137,7 +138,7 @@ def _seed_unknowns(store, execution, *, count=2, ownership=True, stage="legacy",
         intent = {
             "intent_id": iid, "session_id": sid, "order_id": None,
             "config_version": document["config_version"], "state": "unknown",
-            "reserved_usd": "8", "inventory_cost_usd": "0", "realized_pnl_usd": "0",
+            "reserved_usd": str(amount), "inventory_cost_usd": "0", "realized_pnl_usd": "0",
             "financial_status": "unknown", "created_at": execution._lp._now().isoformat(),
             "checked_at": execution._lp._now().isoformat(),
             **{key: facts[key] for key in ("market_id", "condition_id", "token_id", "outcome", "price", "quantity")},
@@ -839,3 +840,143 @@ def test_real_account_same_token_overcapacity_cancels_one_id_and_waits_for_termi
     assert_survivor_protected()
     assert account.cancels == [("rank-b",)]
     assert account.posts == account.market_orders == []
+
+
+def _refill_identity(index):
+    if index == 1:
+        return "market-1", CONDITION_ID, TOKEN_ID
+    return f"market-{index}", f"0x{index + 100:064x}", f"0x{index + 200:064x}"
+
+
+class _FiveMarketPublic(_CandidateSDKPublic):
+    def __init__(self, clock):
+        super().__init__(clock[0])
+        self.clock = clock
+
+    def get_market(self, *, id):
+        index = int(id.removeprefix("market-"))
+        market_id, condition, token = _refill_identity(index)
+        market = super().get_market(id="market-1")
+        return market.model_copy(update={
+            "id": market_id, "condition_id": condition,
+            "outcomes": market.outcomes.model_copy(update={
+                "yes": market.outcomes.yes.model_copy(update={"token_id": token}),
+                "no": market.outcomes.no.model_copy(update={"token_id": f"0x{index + 300:064x}"}),
+            }),
+        })
+
+    def get_order_book(self, *, token_id):
+        index = next(i for i in range(1, 7)
+                     if token_id in {_refill_identity(i)[2], f"0x{i + 300:064x}"})
+        book = super().get_order_book(token_id=TOKEN_ID)
+        return book.model_copy(update={"token_id": token_id,
+            "market": _refill_identity(index)[1], "condition_id": _refill_identity(index)[1], "timestamp": self.clock[0]})
+
+    def list_markets(self, **kwargs):
+        return [self.get_market(id=f"market-{i}") for i in range(1, 7)]
+
+    def list_market_rewards(self, *, condition_id, sponsored):
+        reward = super().list_market_rewards(condition_id=CONDITION_ID, sponsored=sponsored)[0]
+        return (reward.model_copy(update={"condition_id": condition_id}),)
+
+
+@pytest.mark.parametrize("budget, expected_buys", [("100", 5), ("8", 0)],
+                         ids=["target-five", "inventory-exhausts-budget"])
+def test_five_historical_holds_sync_then_refill_with_inventory_and_restart(runtime, budget, expected_buys):
+    from polymarket.models.clob import SignedOrder
+
+    _, inventory_condition, inventory_token = _refill_identity(6)
+    maker = _maker_order("inventory-buy", "BUY", "20", "0.40").model_copy(update={"token_id": inventory_token})
+    fill = _trade("inventory-fill", maker, size="20").model_copy(update={
+        "token_id": inventory_token, "market": inventory_condition, "condition_id": inventory_condition,
+    })
+    position = _position().model_copy(update={"token_id": inventory_token, "condition_id": inventory_condition})
+    public = _FiveMarketPublic(runtime.clock)
+    store, adapter, account, lp, execution = runtime(public_client=public, trades=(fill,), positions=(position,))
+    execution.lp_auto_configure({"budget_usd": budget, "target_buy_count": 5})
+    originals = _seed_unknowns(store, execution, count=5, amounts=("12", "17.46", "5.8", "14", "34"))
+    assert _amount(execution.lp_auto_state(), "buy_reserved_usd") == Decimal("83.26")
+    assert execution.lp_auto_state()["slots"]["occupied"] == 5
+    audit = {row["session_id"]: store.lp_actions(row["session_id"]) for row in originals}
+    _advance(runtime)
+    assert execution.refresh_lp_dashboard_snapshot()["state"] == "ready"
+    synced = execution.lp_auto_state()
+    assert synced["funds"]["status"] == "known", synced
+    assert _amount(synced, "buy_reserved_usd") == 0
+    assert _amount(synced, "inventory_cost_usd") == 8
+    assert _amount(synced, "available_usd") == Decimal(budget) - 8
+    assert synced["slots"]["occupied"] == 0
+    assert account.position_reads == 1, "One valid synchronization covers all five holds"
+    markers = {row["session_id"]: store.lp_session(row["session_id"])["reservation_coverage"] for row in originals}
+    for index in range(1, 6):
+        market, condition, token = _refill_identity(index)
+        facts = lp._read_candidate_facts({"market_id": market, "condition_id": condition, "token_id": token, "outcome": "YES"})
+        lp._candidate_pool_record_success(condition, {"condition_id": condition}, judged_at=lp._now(),
+            facts={"directions": [facts["direction"]], "account": facts["account"]})
+        store.lp_save_price_history(condition, token, [], {
+            "state": "known", "amplitude": Decimal(".005"), "checked_at": lp._now(),
+            "valid_until": lp._now() + timedelta(days=1),
+        })
+    assert len(execution._auto_pool.candidates()) == 5
+
+    def signed_order(**kwargs):
+        assert kwargs["price"] == Decimal(".40")
+        assert kwargs["size"] == Decimal("20")
+        _advance(runtime)
+        return SignedOrder(builder="0x1", expiration=kwargs["expiration"], maker=WALLET,
+            maker_amount=8000000, metadata="0x3", order_type="GTD", salt=1,
+            side="BUY", signature="0x4", signature_type=0, signer=WALLET,
+            taker_amount=20000000, timestamp=1, token_id=str(kwargs["token_id"]), post_only=True)
+
+    def accepted_post(signed):
+        _advance(runtime)
+        account.posts.append(signed)
+        index = next(i for i in range(1, 6) if _refill_identity(i)[2] == signed.token_id)
+        market, condition, token = _refill_identity(index)
+        oid = f"refill-{index}"
+        order = _open_order(oid, "BUY", price="0.40", original="20", token_id=token).model_copy(update={"market": condition, "condition_id": condition})
+        account.orders += (order,)
+        return {"order_id": oid, "status": "LIVE", "accepted": True, "size_matched": "0"}
+
+    account.create_limit_order = signed_order
+    account.post_order = accepted_post
+    execution.lp_auto_set_desired_running(True)
+    # Each accepted send invalidates account facts. Normal later rounds read
+    # the new generation before admitting the next BUY; no forced known funds.
+    for turn in range(max(1, expected_buys)):
+        _advance(runtime)
+        refilled = execution.lp_auto_run_once(round_id=f"five-historical-refill-{turn}")
+    assert len(account.posts) == expected_buys, str(refilled["last_round"])
+    if expected_buys:
+        assert refilled["funds"]["status"] == "unknown"
+        assert refilled["funds"]["available_usd"] is None
+        _advance(runtime)
+        refilled = execution.lp_auto_run_once(round_id="five-historical-confirm")
+        assert len(account.posts) == 5
+    assert refilled["funds"]["status"] == "known", refilled
+    assert refilled["slots"]["active"] == expected_buys
+    assert refilled["slots"]["occupied"] == expected_buys
+    assert _amount(refilled, "buy_reserved_usd") == expected_buys * 8
+    assert _amount(refilled, "inventory_cost_usd") == 8
+    assert _amount(refilled, "available_usd") == Decimal(budget) - 8 - expected_buys * 8
+    assert account.cancels == account.market_orders == []
+    if not expected_buys:
+        assert refilled["last_round"]["reason"] == "candidates_or_funds_insufficient"
+    # A repeated account publication and a real Store/adapter restart retain
+    # exact markers, original actions and actual capital without restoring holds.
+    orders = account.orders
+    adapter.close()
+    _advance(runtime)
+    store, adapter, account, lp, execution = runtime(public_client=public, orders=orders, trades=(fill,), positions=(position,))
+    for _ in range(2):
+        assert execution.refresh_lp_dashboard_snapshot()["state"] == "ready"
+        state = execution.lp_auto_state()
+        assert state["slots"]["occupied"] == expected_buys
+        assert _amount(state, "buy_reserved_usd") == expected_buys * 8
+        assert _amount(state, "inventory_cost_usd") == 8
+        for row in originals:
+            assert store.lp_actions(row["session_id"]) == audit[row["session_id"]]
+            assert store.lp_session(row["session_id"])["reservation_coverage"] == markers[row["session_id"]]
+        _assert_unknown_audit(store, execution, originals)
+        _advance(runtime)
+    assert account.posts == account.cancels == account.market_orders == []

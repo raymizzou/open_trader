@@ -1482,7 +1482,7 @@ class LPAutoPool:
         intent=updated['intents'][intent['intent_id']]
         return not error and before != identity(intent)
 
-    def _refresh_account_facts(self):
+    def _refresh_account_facts(self, *, account_round=None):
         from .polymarket_lp import LpAccountRoundInvalid, LpObservationWait
         reader = getattr(self.lp.exchange, 'lp_account_snapshot_shared', None)
         if not callable(reader):
@@ -1506,7 +1506,9 @@ class LPAutoPool:
             return False
 
         try:
-            snapshot = reader(max_age_seconds=0, trade_generation_provider=self.store.lp_trade_generation)
+            snapshot = (self.lp.exchange.lp_account_snapshot(account_round=account_round)
+                        if account_round is not None else
+                        reader(max_age_seconds=0, trade_generation_provider=self.store.lp_trade_generation))
             with self._account_refresh_lock:
                 if attempt != self._account_refresh_attempt:
                     return False
@@ -1527,7 +1529,16 @@ class LPAutoPool:
             return failed('account_order_sync_unknown')
 
     def _reconcile_unknown(self, *, reuse=False, bounded=False):
-        refreshed = self._refresh_account_facts()
+        lease = self._begin_account_round()
+        try:
+            return self._reconcile_unknown_in_round(reuse=reuse, bounded=bounded, lease=lease)
+        finally:
+            # Launched jobs retain the round until their own publication ends.
+            if lease is not None:
+                lease.release()
+
+    def _reconcile_unknown_in_round(self, *, reuse, bounded, lease):
+        refreshed = self._refresh_account_facts(account_round=lease.token if lease is not None else None)
         d=self._read()
         if not d['account_id'] or d['account_id']!=self.execution._lp_account_id():
             return self._projection(d)
@@ -1538,58 +1549,46 @@ class LPAutoPool:
             # barrier, and later rounds cannot stack workers for that session.
             deadline = monotonic() + 1.0
             remaining = sorted(intents, key=lambda i: i.get('checked_at') or i['created_at'])
-            lease = self._begin_account_round()
-            try:
-                while remaining or self._reconcile_jobs:
-                    with self._reconcile_jobs_lock:
-                        self._reconcile_jobs = {key: job for key, job in self._reconcile_jobs.items() if not job.done()}
-                        remaining = [i for i in remaining if i['intent_id'] not in self._reconcile_jobs]
-                        while remaining and len(self._reconcile_jobs) < 2:
-                            intent = remaining.pop(0)
-                            future = Future()
-                            self._reconcile_jobs[intent['intent_id']] = future
-                            if lease is not None:
-                                lease.retain()
-                            def reconcile(i=intent, result=future, round_lease=lease):
-                                try:
-                                    token = round_lease.token if round_lease is not None else None
-                                    self._reconcile_intent(i, reuse=reuse, account_round=token)
-                                except Exception as exc:
-                                    session = self.store.lp_session(i['session_id'])
-                                    if session:
-                                        self._record_session(i['intent_id'], session, error=type(exc).__name__)
-                                finally:
-                                    result.set_result(None)
-                                    if round_lease is not None:
-                                        round_lease.release()
-                            threading.Thread(target=reconcile, daemon=True, name='lp-auto-facts').start()
-                        futures = list(self._reconcile_jobs.values())
-                    if not futures or monotonic() >= deadline:
-                        break
-                    wait(futures, timeout=max(0, deadline - monotonic()), return_when=FIRST_COMPLETED)
-            finally:
-                # The caller drops its reference now; jobs launched by this
-                # batch each hold another reference until their result lands.
-                if lease is not None:
-                    lease.release()
+            while remaining or self._reconcile_jobs:
+                with self._reconcile_jobs_lock:
+                    self._reconcile_jobs = {key: job for key, job in self._reconcile_jobs.items() if not job.done()}
+                    remaining = [i for i in remaining if i['intent_id'] not in self._reconcile_jobs]
+                    while remaining and len(self._reconcile_jobs) < 2:
+                        intent = remaining.pop(0)
+                        future = Future()
+                        self._reconcile_jobs[intent['intent_id']] = future
+                        if lease is not None:
+                            lease.retain()
+                        def reconcile(i=intent, result=future, round_lease=lease):
+                            try:
+                                token = round_lease.token if round_lease is not None else None
+                                self._reconcile_intent(i, reuse=reuse, account_round=token)
+                            except Exception as exc:
+                                session = self.store.lp_session(i['session_id'])
+                                if session:
+                                    self._record_session(i['intent_id'], session, error=type(exc).__name__)
+                            finally:
+                                result.set_result(None)
+                                if round_lease is not None:
+                                    round_lease.release()
+                        threading.Thread(target=reconcile, daemon=True, name='lp-auto-facts').start()
+                    futures = list(self._reconcile_jobs.values())
+                if not futures or monotonic() >= deadline:
+                    break
+                wait(futures, timeout=max(0, deadline - monotonic()), return_when=FIRST_COMPLETED)
         else:
-            lease = self._begin_account_round()
-            try:
-                with ThreadPoolExecutor(max_workers=2) as workers:
-                    futures = [
-                        workers.submit(
-                            self._reconcile_intent,
-                            i,
-                            reuse=reuse,
-                            account_round=lease.token if lease is not None else None,
-                        )
-                        for i in intents
-                    ]
-                    for future in futures:
-                        future.result()
-            finally:
-                if lease is not None:
-                    lease.release()
+            with ThreadPoolExecutor(max_workers=2) as workers:
+                futures = [
+                    workers.submit(
+                        self._reconcile_intent,
+                        i,
+                        reuse=reuse,
+                        account_round=lease.token if lease is not None else None,
+                    )
+                    for i in intents
+                ]
+                for future in futures:
+                    future.result()
         def finish(doc):
             doc['last_checked_at']=self._stamp()
             if all(i.get('financial_status')=='known' and i['state']!='unknown' for i in doc['intents'].values()):

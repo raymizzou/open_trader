@@ -868,20 +868,24 @@ def test_share_watch_distinguishes_missing_orders_from_empty_orders(tmp_path, ra
 
 
 @pytest.mark.parametrize('trade_kind', ['missing_status', 'missing_attribution', 'bad_maker', 'mined', 'failed'])
-def test_production_trade_structure_preserves_funds_until_reconciled(tmp_path, monkeypatch, trade_kind):
-    from datetime import datetime
+@pytest.mark.parametrize('recovery_lane', ['explicit', 'monitor'])
+def test_production_trade_structure_preserves_funds_until_reconciled(tmp_path, monkeypatch, trade_kind, recovery_lane):
+    from datetime import datetime, timedelta
     from types import SimpleNamespace
     from tests.test_lp_auto_pool import NOW
     from open_trader import polymarket_trading
     from open_trader.polymarket_trading import PolymarketTradingClient, TradingConfig
 
+    current = [NOW]
+
     class Clock(datetime):
         @classmethod
         def now(cls, tz=None):
-            return NOW
+            return current[0]
 
     monkeypatch.setattr(polymarket_trading, 'datetime', Clock)
     execution, exchange, lp, store = setup(tmp_path)
+    lp.clock = lambda: current[0]
     execution.lp_auto_configure(dict(budget_usd='100', target_buy_count=1))
     execution.lp_auto_set_desired_running(True)
     sid = execution.lp_auto_run_once()['intents'][0]['session_id']
@@ -908,7 +912,7 @@ def test_production_trade_structure_preserves_funds_until_reconciled(tmp_path, m
     adapter = PolymarketTradingClient(TradingConfig('signer', 'test-wallet'), sdk,
                                     public_client_factory=lambda: public)
     adapter._account_read_facts = lambda: (
-        Decimal(1000), Decimal(1000), [], [], NOW, (trade,), True
+        Decimal(1000), Decimal(1000), [], [], current[0], (trade,), True
     )
     lp.exchange = adapter
     result = execution.lp_auto_reconcile_unknown()
@@ -920,10 +924,27 @@ def test_production_trade_structure_preserves_funds_until_reconciled(tmp_path, m
         if trade_kind == 'mined':
             assert store.lp_session(sid)['facts_error'] == 'trade_not_confirmed'
     # A reliable failed trade and zero-fill terminal receipt can settle safely.
+    audit_before = store.lp_actions(sid)
+    current[0] += timedelta(seconds=1)
     trade.clear()
     trade.update(id='t1', token_id='m00', taker_order_id='o1', status='FAILED')
     result = execution.lp_auto_reconcile_unknown()
+    assert result['funds']['status'] == 'known'
+    assert store.lp_session(sid)['reservation_coverage']['state'] == 'covered'
+    if trade_kind == 'mined':
+        assert store.lp_session(sid)['state'] == 'entry_open'
+        assert store.lp_session(sid)['facts_error'] == 'trade_not_confirmed'
+    # Account-wide coverage releases funds; the independent LP lane still
+    # owns the accepted session's terminal recovery (as in the normal tick).
+    if recovery_lane == 'explicit':
+        lp.reconcile_facts(sid)
+    else:
+        execution.lp_tick()
     assert store.lp_session(sid)['state'] == 'complete'
+    assert store.lp_session(sid)['facts_error'] is None
+    assert not execution._auto_pool._excluded('m00')
+    assert store.lp_session(sid)['submit_status'] == 'accepted'
+    assert store.lp_actions(sid) == audit_before
     assert result['funds']['status'] == 'known'
     assert Decimal(result['funds']['buy_reserved_usd']) == 0
     assert Decimal(result['funds']['inventory_cost_usd']) == 0
@@ -1906,3 +1927,23 @@ def test_unlisted_typed_wait_reason_remains_fault(caplog):
             raise LpObservationWait('market_read_timeout')
     assert 'lp_snapshot_stage stage=market' in caplog.text
     assert 'lp_read_wait' not in caplog.text
+
+
+def test_null_account_auto_state_and_round_preserve_disabled_identity(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    execution, exchange, lp, store = setup(tmp_path)
+    monkeypatch.setattr(exchange, "config", SimpleNamespace(wallet_address=None))
+    first = execution.lp_auto_state()
+    assert first['account_id'] is None
+    assert first['desired_running'] is False
+    assert first['runtime_state'] == 'paused'
+    assert 'account_identity_unknown' in first['admission_block_reasons']
+    assert first['funds']['spendable_usd'] is None
+    result = execution.lp_auto_run_once(round_id='null-account')
+    assert result['account_id'] is None
+    assert result['run_id'] == first['run_id']
+    assert result['slots']['occupied'] == 0
+    assert store.lp_sessions() == []
+    assert exchange.posts == []
+    with pytest.raises(ValueError, match='account_identity_mismatch'):
+        execution.lp_auto_set_desired_running(True)

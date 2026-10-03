@@ -19,8 +19,8 @@ from .polymarket_trading import _lp_maker_order_is_self, _lp_trade, _model_dict
 ZERO = Decimal('0')
 
 
-def default_account_pool_document(path, pool_account_id: str, now: datetime) -> dict[str, object]:
-    return dict(run_id=uuid.uuid5(uuid.NAMESPACE_URL, str(Path(path).resolve()) + pool_account_id).hex,
+def default_account_pool_document(path, pool_account_id: str | None, now: datetime) -> dict[str, object]:
+    return dict(run_id=uuid.uuid5(uuid.NAMESPACE_URL, str(Path(path).resolve()) + str(pool_account_id)).hex,
         account_id=pool_account_id, config_version=0, desired_running=False, ever_enabled=False,
         enabled_at=None, target_buy_count=0, budget_usd=None, allocations=[], intents={}, events={},
         rounds={}, last_round={}, last_reconciled_at=None, updated_at=now.isoformat())
