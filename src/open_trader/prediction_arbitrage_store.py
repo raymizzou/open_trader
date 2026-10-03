@@ -22,6 +22,7 @@ from typing import Any, Callable, Iterable, Iterator, Literal, Mapping
 from zoneinfo import ZoneInfo
 
 from .polymarket_lp_errors import LpObservationWait
+from .polymarket_lp_notification_batches import matching_batch_channels
 from open_trader.llm_providers import DEFAULT_PROVIDER, PROVIDER_IDS
 from open_trader.prediction_arbitrage import MAX_CROSS_UNSETTLED_PRINCIPAL
 from open_trader.prediction_n_leg import fingerprint as canonical_fingerprint
@@ -6459,6 +6460,70 @@ class PredictionArbitrageStore:
             assert updated is not None
             return self._lp_row_result(updated)
 
+    def lp_finalize_attention_notification_batch(
+        self,
+        *,
+        recovery: bool,
+        claims: Mapping[str, tuple[str, int]],
+        trade_generation: int,
+        patches: Mapping[str, Mapping[str, object]],
+        guards: Mapping[str, int],
+    ) -> bool:
+        """Persist immutable notice bodies only while every member is fenced."""
+        if not claims or not set(patches).issubset(set(guards) | set(claims)):
+            return False
+        if any(
+            not str(key).startswith("needs_attention_")
+            for patch in patches.values() for key in patch
+        ):
+            raise ValueError("attention_notification_patch_invalid")
+        prefix = "needs_attention_recovery" if recovery else "needs_attention"
+        with self._transaction() as connection:
+            generation = connection.execute(
+                "SELECT generation FROM lp_trade_generation WHERE singleton=1"
+            ).fetchone()
+            if generation is None or int(generation[0]) != trade_generation:
+                return False
+            pool = connection.execute(
+                "SELECT payload FROM lp_auto_pool WHERE singleton=1"
+            ).fetchone()
+            owned = {
+                str(intent.get("session_id") or "")
+                for intent in (json.loads(pool[0]).get("intents", {}).values() if pool else ())
+            }
+            checked = {}
+            for sid in set(guards) | set(claims):
+                row = connection.execute(
+                    "SELECT * FROM lp_sessions WHERE session_id=?", (str(sid),)
+                ).fetchone()
+                if row is None or sid in owned:
+                    return False
+                payload = _load_payload(str(row["payload"]))
+                revision = self._lp_payload_revision(payload)
+                if (payload.get("account_baseline_archive")
+                        or str(row["state"]) == "account_baseline_archived"
+                        or (sid in guards and revision != guards[sid])):
+                    return False
+                if sid in claims:
+                    episode, expected_revision = claims[sid]
+                    if (revision != expected_revision
+                            or str(payload.get(prefix + "_episode") or "") != episode
+                            or not payload.get(prefix + "_due")
+                            or (not recovery and str(row["state"]) != "needs_attention")
+                            or (recovery and str(row["state"]) == "needs_attention")):
+                        return False
+                checked[sid] = payload, revision
+            now = _utc_now()
+            for sid, patch in patches.items():
+                payload, revision = checked[sid]
+                payload.update(patch)
+                payload["_lp_revision"] = revision + 1
+                connection.execute(
+                    "UPDATE lp_sessions SET payload=?,updated_at=? WHERE session_id=?",
+                    (_dump_execution_payload(payload), now, str(sid)),
+                )
+            return True
+
     def lp_finish_attention_notification(
         self,
         session_id: str,
@@ -6478,7 +6543,13 @@ class PredictionArbitrageStore:
             payload = _load_payload(str(row["payload"]))
             if row["state"] == "account_baseline_archived" or payload.get("account_baseline_archive"):
                 return self._lp_row_result(row)
-            incoming = {str(key): bool(value) for key, value in results.items()}
+            batch_key = ("needs_attention_recovery" if recovery else "needs_attention") + "_delivery_batches"
+            batches = payload.get(batch_key)
+            matching = matching_batch_channels(results, batches if isinstance(batches, Mapping) else {})
+            incoming = {str(key): bool(value) for key, value in results.items()
+                        if matching is None or key in matching}
+            if not incoming:
+                return self._lp_row_result(row)
             if recovery:
                 if str(payload.get("needs_attention_recovery_episode") or "") != str(episode):
                     return self._lp_row_result(row)
