@@ -758,10 +758,14 @@ def test_mixed_legacy_recovery_defaults_keep_known_channels_through_restart(tmp_
     state = pool._read()['intents']
     assert not state[a].get('attention_recovery_due') and not state[b].get('attention_recovery_due')
     for channel, message, native_uuid in calls[2:]:
-        assert '市场乙' in message and '市场甲' not in message
-        if channel == 'feishu_app': assert native_uuid == feishu[2]
+        assert '市场乙' in message
+        if channel == 'feishu_app':
+            assert native_uuid == feishu[2]
+            assert message == feishu[1]  # The original UUID owns the full immutable body.
+        else:
+            assert '市场甲' not in message
     # Durable partial-channel ACK and a completed cached ACK retry need only
-    # voice after restart; lost, unacknowledged B success may retry B alone.
+    # voice after restart; lost B acknowledgement retries the full Feishu event.
     assert [call[0] for call in calls[2:]] == (['feishu_app', 'xiaoai'] if restart == 'partial_sqlite_ack' else ['xiaoai'])
     pool.flush_attention()
     assert len(calls) == (4 if restart == 'partial_sqlite_ack' else 3)

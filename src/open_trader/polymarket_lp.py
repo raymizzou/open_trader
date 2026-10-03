@@ -40,6 +40,11 @@ from .polymarket_lp_risk import (
     first_observation_baseline,
 )
 from .polymarket_lp_errors import LpObservationWait
+from .polymarket_lp_notification_batches import (
+    ChannelStatuses,
+    matching_batch_channels,
+    plan_notification_batches,
+)
 from .polymarket_lp_scratch import LPReadRows, LPReadScratch
 from .prediction_arbitrage_store import (
     LP_RESERVED_MANUAL_SESSION_ID,
@@ -12943,7 +12948,9 @@ class PolymarketLPService:
                 if sid != session_id:
                     continue
                 episode_key = "needs_attention_recovery_episode" if cached_recovery else "needs_attention_episode"
-                if not selected or selected.get("account_baseline_archive") or str(selected.get(episode_key)) != episode:
+                if (not selected or selected.get("account_baseline_archive")
+                        or selected.get("state") == "account_baseline_archived"
+                        or str(selected.get(episode_key)) != episode):
                     self._attention_delivery_results.pop(key, None)
                     continue
                 retry_key = "needs_attention_recovery_retry_at" if cached_recovery else "needs_attention_send_retry_at"
@@ -12953,7 +12960,8 @@ class PolymarketLPService:
                     self._attention_delivery_results.pop(key, None)
                     selected = self.store.lp_session(session_id)
             due_key = "needs_attention_recovery_due" if recovery else "needs_attention_due"
-            if selected is None or selected.get("account_baseline_archive") or not selected.get(due_key):
+            if (selected is None or selected.get("account_baseline_archive")
+                    or selected.get("state") == "account_baseline_archived" or not selected.get(due_key)):
                 return
             if self.store.lp_auto_owns_session(session_id):
                 return
@@ -12964,18 +12972,22 @@ class PolymarketLPService:
             episode_key = "needs_attention_recovery_episode" if recovery else "needs_attention_episode"
             status_key = "needs_attention_recovery_channel_status" if recovery else "needs_attention_channel_status"
             retry_key = "needs_attention_recovery_retry_at" if recovery else "needs_attention_send_retry_at"
+            prefix = "needs_attention_recovery" if recovery else "needs_attention"
+            batches_key = prefix + "_delivery_batches"
             group = selected.get(group_key)
             rows = []
             fences = {}
             for row in self.store.lp_sessions():
-                if row.get("account_baseline_archive") or not row.get(due_key) or not row.get(episode_key):
+                if (row.get("account_baseline_archive") or row.get("state") == "account_baseline_archived"
+                        or not row.get(due_key) or not row.get(episode_key)):
                     continue
                 trade_generation = self.store.lp_trade_generation()
                 snapshot = self.store.lp_session_with_revision(row["session_id"])
                 if snapshot is None or snapshot[0].get(episode_key) != row.get(episode_key):
                     continue
                 row, revision = snapshot
-                if row.get("account_baseline_archive") or not row.get(due_key):
+                if (row.get("account_baseline_archive") or row.get("state") == "account_baseline_archived"
+                        or not row.get(due_key)):
                     continue
                 if self.store.lp_auto_owns_session(row["session_id"]):
                     continue
@@ -13010,6 +13022,9 @@ class PolymarketLPService:
                 requested = set(row.get("needs_attention_recovery_channels") or ("feishu", "xiaoai")) if recovery else {"feishu", "xiaoai"}
                 prior = row.get(status_key) or {}
                 cached = self._attention_delivery_results.get(key, {})
+                matching = matching_batch_channels(cached, row.get(batches_key) or {})
+                cached = {channel: sent for channel, sent in cached.items()
+                          if matching is None or channel in matching}
                 status = {channel: bool(prior.get(channel) or cached.get(channel)) for channel in requested}
                 claim = self.store.lp_claim_attention_notification(sid, recovery=recovery,
                     episode=episode, revision=fences[sid][0], trade_generation=fences[sid][1], patch={
@@ -13024,23 +13039,117 @@ class PolymarketLPService:
                 pending.update(channel for channel, delivered in status.items() if not delivered)
             if not claimed:
                 return
-            for key, status in statuses.items():
-                self._attention_delivery_results[key] = status
-            batches = {}
-            for channel in sorted(pending):
-                recipients = tuple(row["session_id"] for row in claimed
-                    if channel in statuses[(str(row["session_id"]), recovery, str(row[episode_key]))]
-                    and not statuses[(str(row["session_id"]), recovery, str(row[episode_key]))][channel])
-                batches.setdefault(recipients, set()).add(channel)
-            for recipients, channels in batches.items():
-                title, message, voice = self._attention_notice(
-                    [row for row in claimed if row["session_id"] in recipients], recovery=recovery, reason=reason)
-                with notification_delivery_episode("lp-session:" + group):
-                    results = self._deliver_protection_details(title, message, voice, channels=channels)
-                for key, status in statuses.items():
-                    if key[0] in recipients:
-                        status.update({channel: bool(results.get(channel)) for channel in channels})
-                        self._attention_delivery_results[key] = status
+            current = {
+                str(row["session_id"]): (row, fences[str(row["session_id"])][0] + 1)
+                for row in claimed
+            }
+
+            def member_for(row):
+                identity = self._queue_protection_identity(row)
+                protection = row.get("queue_protection")
+                return {
+                    "id": str(row["session_id"]),
+                    "session_id": str(row["session_id"]),
+                    "episode": str(row[episode_key]),
+                    "fault_episode": str(row.get("needs_attention_episode") or ""),
+                    "account_id": str(row.get("account_id") or ""),
+                    "condition_id": str(row.get("condition_id") or ""),
+                    "token_id": str(row.get("token_id") or ""),
+                    "reason": self._attention_session_reason(row),
+                    "render": {
+                        "condition_id": identity["condition_id"],
+                        "token_id": identity["token_id"],
+                        "market_title": identity["title"],
+                        "market_url": identity["url"],
+                        "outcome": identity["outcome"],
+                        "queue_protection": {
+                            "data_failures": protection.get("data_failures", 0)
+                            if isinstance(protection, Mapping) else 0,
+                        },
+                    },
+                }
+
+            def member_state(member, batch, channel):
+                sid = str(member["id"])
+                if sid not in current:
+                    current[sid] = self.store.lp_session_with_revision(sid)
+                snapshot = current[sid]
+                if snapshot is None:
+                    return "retire"
+                row = snapshot[0]
+                if (row.get("account_baseline_archive")
+                        or row.get("state") == "account_baseline_archived"
+                        or self.store.lp_auto_owns_session(sid)
+                        or (str(row.get(episode_key) or "") != member["episode"]
+                            and (row.get(episode_key) or row.get(due_key) or not recovery))
+                        or str(row.get("needs_attention_episode") or "") != member["fault_episode"]
+                        or any(str(row.get(key) or "") != member[key]
+                               for key in ("account_id", "condition_id", "token_id"))):
+                    return "retire"
+                if recovery:
+                    if row.get("state") == "needs_attention":
+                        return "retire"
+                elif (row.get("state") != "needs_attention"
+                        or self._attention_session_reason(row) != member["reason"]):
+                    return "retire"
+                # An acknowledged original member is historical context. Only
+                # recipients still owing this channel need fresh recovery proof.
+                prior = row.get(status_key) or {}
+                cached = self._attention_delivery_results.get((sid, recovery, member["episode"]), {})
+                matching = matching_batch_channels(cached, row.get(batches_key) or {})
+                if prior.get(channel) or (cached.get(channel) and (matching is None or channel in matching)):
+                    return "acknowledged"
+                if not row.get(due_key):
+                    return "acknowledged" if recovery else "retire"
+                if recovery and not self._attention_recovery_ready(row)[0]:
+                    return "defer"
+                return "valid"
+
+            deliveries, assignments = plan_notification_batches(
+                rows={str(row["session_id"]): row for row in claimed},
+                pending={key[0]: {channel for channel, sent in status.items() if not sent}
+                         for key, status in statuses.items()},
+                stored={str(row["session_id"]): row.get(batches_key) or {} for row in claimed},
+                member_for=member_for,
+                member_state=member_state,
+                render=lambda members: self._attention_notice(
+                    [member["render"] for member in members], recovery=recovery, reason=reason),
+            )
+            if not deliveries and pending:
+                return
+            patches = {}
+            for sid, channel_batches in assignments.items():
+                row = current[sid][0]
+                merged = {**(row.get(batches_key) or {}), **channel_batches}
+                if merged != row.get(batches_key):
+                    patches[sid] = {batches_key: merged}
+            claims = {
+                str(row["session_id"]): (str(row[episode_key]), fences[str(row["session_id"])][0] + 1)
+                for row in claimed
+            }
+            if not self.store.lp_finalize_attention_notification_batch(
+                    recovery=recovery, claims=claims,
+                    trade_generation=fences[str(claimed[0]["session_id"])][1],
+                    patches=patches, guards={sid: current[sid][1] for sid in assignments}):
+                return
+            for key, status in list(statuses.items()):
+                saved = patches.get(key[0], {}).get(batches_key, current[key[0]][0].get(batches_key) or {})
+                batch_ids = {
+                    channel: batch["id"] for channel, batch in saved.items()
+                    if channel in status and isinstance(batch, Mapping) and batch.get("id")
+                }
+                statuses[key] = ChannelStatuses(status, batch_ids=batch_ids) if batch_ids else status
+                self._attention_delivery_results[key] = statuses[key]
+            for delivery in deliveries:
+                batch, channels = delivery["batch"], delivery["channels"]
+                with notification_delivery_episode("lp-session:" + batch["id"]):
+                    results = self._deliver_protection_details(
+                        batch["title"], batch["message"], batch["voice"], channels=channels)
+                for channel, recipients in delivery["recipients"].items():
+                    for sid in recipients:
+                        key = (sid, recovery, str(current[sid][0][episode_key]))
+                        statuses[key][channel] = bool(results.get(channel))
+                        self._attention_delivery_results[key] = statuses[key]
             # Cache every recipient before the first ack: a later DB failure
             # must not re-send the batch members whose acknowledgement failed.
             for key, status in statuses.items():
