@@ -481,6 +481,52 @@ console.log(JSON.stringify({afterReceipt, afterOldRead, countAfterRoutine,
     assert result["finalReading"] is False
 
 
+@pytest.mark.parametrize("old_finishes_first", [False, True], ids=["old-last", "old-first"])
+@pytest.mark.parametrize("old_fails", [False, True], ids=["old-success", "old-error"])
+def test_lp_cancel_refresh_survives_concurrent_manual_pause(
+    old_finishes_first: bool, old_fails: bool,
+) -> None:
+    result = _run("const oldFinishesFirst = " + json.dumps(old_finishes_first)
+        + "; const oldFails = " + json.dumps(old_fails) + r''';
+state.predictionMarket.lpDashboard.auto = {desired_running: true, scheduler_running: true};
+const post = deferResponse(cancelMatch);
+const pause = deferResponse((u, m) => m === "POST" && u.endsWith("/lp/auto/pause"));
+const oldRead = deferResponse(dashboardMatch);
+const freshRead = deferResponse(dashboardMatch);
+openCancel();
+const cancelOperation = confirmCancel();
+await drain();
+await modalClick({modalAction: "cancel"});
+const pauseOperation = controlLpAuto("pause");
+post.respond(jsonResponse({requested: 1, canceled: ["sys-order-1"], skipped: [], not_canceled: {}}));
+await drain();
+pause.respond(jsonResponse({desired_running: false, pause_confirmed: true}));
+await drain();
+const finishOld = () => oldRead.respond(oldFails ? new Error("superseded read failed")
+  : jsonResponse(buildDashboard({lp_orders_today: [sessionRow], auto: {desired_running: true}})));
+if (oldFinishesFirst) {
+  finishOld();
+  await cancelOperation;
+  // The old request must not release the replacement read's in-flight guard.
+  await fetchPredictionLpDashboard();
+}
+freshRead.respond(jsonResponse(buildDashboard({
+  auto: {desired_running: false, pause_confirmed: true, scheduler_running: true},
+})));
+await pauseOperation;
+if (!oldFinishesFirst) finishOld();
+await cancelOperation;
+await drain();
+console.log(JSON.stringify({html: renderedHtml(), reads: dashCount(),
+  posts: postCount(), error: state.predictionMarket.lpDashboardError}));
+''')
+    assert 'data-order-id="sys-order-1"' not in result["html"]
+    assert "人工意愿：暂停" in _text(result["html"])
+    assert "撤单成功" in _text(_feedback(result["html"]))
+    assert result["error"] == ""
+    assert result["posts"] == result["reads"] == 2
+
+
 def test_lp_cancel_older_refresh_and_expiry_cannot_replace_newer_receipt() -> None:
     result = _run(r'''
 const postA = deferResponse(cancelMatch);

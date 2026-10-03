@@ -4664,7 +4664,8 @@ async function controlLpAuto(action) {
     prediction.lpAutoMessage = `操作未确认：${error instanceof Error ? error.message : String(error)}`;
   } finally {
     prediction.lpAutoBusy = false;
-    await fetchPredictionLpDashboard();
+    // Replace any read invalidated by this operation, including a cancel refresh.
+    await fetchPredictionLpDashboard({force: true});
     renderPredictionMarket();
   }
 }
