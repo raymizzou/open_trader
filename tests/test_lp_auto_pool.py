@@ -1111,16 +1111,10 @@ def test_publication_lock_wait_arms_durable_attention_progress(tmp_path, monkeyp
     x.lp_snapshot=fresh
     result=lp.reconcile_facts(sid,monitor=True,apply_lock=locks)
     assert result[3]=='execution_lock'
-    assert notifier.done.wait(2)
-    for _ in range(50):
-        intent=e._auto_pool._read()['intents'][intent_id]
-        if intent.get('attention_due') is False:
-            break
-        time.sleep(.01)
     intent=e._auto_pool._read()['intents'][intent_id]
     assert intent['attention_due'] is False
-    assert intent['attention_notified'] is True
-    assert len(notifier.calls)==1
+    assert intent.get('attention_notified') is not True
+    assert notifier.calls == []
 
 
 def test_trade_claim_advances_both_fences_and_rejects_stale_claim(tmp_path):
@@ -1316,13 +1310,26 @@ def test_reconciliation_attention_notifies_once_then_recovery_once(tmp_path, mon
     e.lp_auto_reconcile_unknown()
     assert len(notifier.calls)==1, 'a continuing episode must not repeat'
 
-    recovery_now=base_now+timedelta(seconds=303)
-    monkeypatch.setattr(venue,'NOW',recovery_now)
     def fresh_read(request):
         snapshot=deepcopy(read(request))
-        snapshot['account']['checked_at']=recovery_now
+        snapshot['account']['checked_at']=venue.NOW
         return snapshot
+
+    recovery_baseline=base_now+timedelta(seconds=302)
+    monkeypatch.setattr(venue,'NOW',recovery_baseline)
     x.lp_snapshot=fresh_read
+    e.lp_auto_reconcile_unknown()
+    thread = lp._attention_thread
+    if thread is not None:
+        thread.join(timeout=2)
+    d=e._auto_pool._read()['intents'][intent_id]
+    assert d['financial_status']=='known'
+    assert d['attention_recovery_due'] is True
+    assert d['attention_recovery_ready_since']==recovery_baseline.isoformat()
+    assert len(notifier.calls)==1
+
+    recovery_now=base_now+timedelta(seconds=362)
+    monkeypatch.setattr(venue,'NOW',recovery_now)
     e.lp_auto_reconcile_unknown()
     thread = lp._attention_thread
     if thread is not None:
@@ -1331,7 +1338,9 @@ def test_reconciliation_attention_notifies_once_then_recovery_once(tmp_path, mon
     assert d['financial_status']=='known'
     assert not d.get('attention_since') and not d.get('attention_notified')
     assert len(notifier.calls)==2
-    assert '恢复' in notifier.calls[1][1]
+    title, message = notifier.calls[1]
+    assert title.startswith('LP 标的资金核对恢复 · ')
+    assert '本次 标的资金核对恢复：1 个市场。' in message
 
 
 def test_reconciliation_attention_send_failure_retries_then_recovers(tmp_path, monkeypatch):
@@ -1382,16 +1391,27 @@ def test_reconciliation_attention_send_failure_retries_then_recovers(tmp_path, m
     e.lp_auto_reconcile_unknown(); wait_for_attention()
     assert len(notifier.calls)==2
 
-    recovery_now=base_now+timedelta(seconds=364)
-    monkeypatch.setattr(venue,'NOW',recovery_now)
     def fresh_read(request):
-        snapshot=deepcopy(read(request)); snapshot['account']['checked_at']=recovery_now
+        snapshot=deepcopy(read(request)); snapshot['account']['checked_at']=venue.NOW
         return snapshot
+
+    recovery_baseline=base_now+timedelta(seconds=364)
+    monkeypatch.setattr(venue,'NOW',recovery_baseline)
     x.lp_snapshot=fresh_read
     e.lp_auto_reconcile_unknown(); wait_for_attention()
     d=e._auto_pool._read()['intents'][intent_id]
+    assert d['financial_status']=='known'
+    assert d['attention_recovery_due'] is True
+    assert d['attention_recovery_ready_since']==recovery_baseline.isoformat()
+    assert len(notifier.calls)==2
+
+    recovery_now=base_now+timedelta(seconds=424)
+    monkeypatch.setattr(venue,'NOW',recovery_now)
+    e.lp_auto_reconcile_unknown(); wait_for_attention()
+    d=e._auto_pool._read()['intents'][intent_id]
     assert d['financial_status']=='known' and not d.get('attention_since')
-    assert len(notifier.calls)==3 and '恢复' in notifier.calls[2][1]
+    assert len(notifier.calls)==3
+    assert notifier.calls[2][0].startswith('LP 标的资金核对恢复 · ')
 
 
 def test_blocked_recovery_callback_cannot_overwrite_new_fault_episode(tmp_path, monkeypatch):
@@ -1422,21 +1442,31 @@ def test_blocked_recovery_callback_cannot_overwrite_new_fault_episode(tmp_path, 
     if thread is not None: thread.join(timeout=2)
     assert len(e._notifier.calls)==1
 
-    recovery_now=base_now+timedelta(seconds=302)
-    monkeypatch.setattr(venue,'NOW',recovery_now)
     def fresh_read(request):
-        snapshot=deepcopy(read(request)); snapshot['account']['checked_at']=recovery_now
+        snapshot=deepcopy(read(request)); snapshot['account']['checked_at']=venue.NOW
         return snapshot
+
+    recovery_baseline=base_now+timedelta(seconds=302)
+    monkeypatch.setattr(venue,'NOW',recovery_baseline)
     x.lp_snapshot=fresh_read
     e.lp_auto_reconcile_unknown()
+    thread=lp._attention_thread
+    if thread is not None: thread.join(timeout=2)
+    assert e._auto_pool._read()['intents'][intent_id]['attention_recovery_ready_since'] == recovery_baseline.isoformat()
+    assert not entered.is_set()
+
+    recovery_now=base_now+timedelta(seconds=362)
+    monkeypatch.setattr(venue,'NOW',recovery_now)
+    e.lp_auto_reconcile_unknown()
     assert entered.wait(2)
-    monkeypatch.setattr(venue,'NOW',base_now+timedelta(seconds=303))
+
+    monkeypatch.setattr(venue,'NOW',base_now+timedelta(seconds=363))
     x.lp_snapshot=fail
     e.lp_auto_reconcile_unknown()
     current=e._auto_pool._read()['intents'][intent_id]
     assert current['financial_status']=='unknown'
     assert not current.get('attention_recovery_due')
-    assert current['attention_since']==(base_now+timedelta(seconds=303)).isoformat()
+    assert current['attention_since']==(base_now+timedelta(seconds=363)).isoformat()
     assert current.get('attention_notified') is False
 
     thread=lp._attention_thread
@@ -1447,18 +1477,19 @@ def test_blocked_recovery_callback_cannot_overwrite_new_fault_episode(tmp_path, 
     assert after.get('attention_since')
     assert not after.get('attention_recovery_due')
 
-    monkeypatch.setattr(venue,'NOW',base_now+timedelta(seconds=604))
+    monkeypatch.setattr(venue,'NOW',base_now+timedelta(seconds=663))
     e.lp_auto_reconcile_unknown()
     thread=lp._attention_thread
     if thread is not None: thread.join(timeout=2)
     final=e._auto_pool._read()['intents'][intent_id]
-    assert [title for title,message in e._notifier.calls] == [
-        'LP 核对持续失败', 'LP 核对已恢复', 'LP 核对持续失败'
-    ]
-    assert final['attention_since']==(base_now+timedelta(seconds=303)).isoformat()
+    titles = [title for title,message in e._notifier.calls]
+    assert titles[0] == 'LP 核对持续失败'
+    assert titles[1].startswith('LP 标的资金核对恢复 · ')
+    assert titles[2] == 'LP 核对持续失败'
+    assert final['attention_since']==(base_now+timedelta(seconds=363)).isoformat()
     assert final['attention_notified'] is True and final['attention_due'] is False
 
-    monkeypatch.setattr(venue,'NOW',base_now+timedelta(seconds=605))
+    monkeypatch.setattr(venue,'NOW',base_now+timedelta(seconds=664))
     e.lp_auto_reconcile_unknown()
     thread=lp._attention_thread
     if thread is not None: thread.join(timeout=2)
@@ -1529,48 +1560,54 @@ def test_partial_fault_recovery_gives_new_fault_its_own_episode(
     assert calls == ["LP 核对持续失败"]
 
     voice.fail = False
-    recovery_now = base_now + timedelta(seconds=301)
-    monkeypatch.setattr(venue, "NOW", recovery_now)
-
     def fresh_read(request):
         snapshot = deepcopy(read(request))
-        snapshot["account"]["checked_at"] = recovery_now
+        snapshot["account"]["checked_at"] = venue.NOW
         return snapshot
 
+    recovery_baseline = base_now + timedelta(seconds=301)
+    monkeypatch.setattr(venue, "NOW", recovery_baseline)
     x.lp_snapshot = fresh_read
+    e.lp_auto_reconcile_unknown()
+    wait_for_calls(1)
+    baseline = e._auto_pool._read()["intents"][intent_id]
+    assert baseline["financial_status"] == "known"
+    assert baseline["attention_recovery_due"] is True
+
+    recovery_now = base_now + timedelta(seconds=361)
+    monkeypatch.setattr(venue, "NOW", recovery_now)
     e.lp_auto_reconcile_unknown()
     wait_for_calls(2)
     recovered = e._auto_pool._read()["intents"][intent_id]
     assert recovered["financial_status"] == "known"
     assert not recovered.get("attention_since")
-    assert calls == ["LP 核对持续失败", "LP 核对已恢复"]
+    assert calls[0] == "LP 核对持续失败"
+    assert calls[1].startswith("LP 标的资金核对恢复 · ")
 
-    monkeypatch.setattr(venue, "NOW", base_now + timedelta(seconds=302))
+    monkeypatch.setattr(venue, "NOW", base_now + timedelta(seconds=363))
     lp.clock = lambda: venue.NOW
     x.lp_snapshot = failed_read
     e.lp_auto_reconcile_unknown()
     renewed = e._auto_pool._read()["intents"][intent_id]
     assert renewed["attention_since"] == (
-        base_now + timedelta(seconds=302)
+        base_now + timedelta(seconds=363)
     ).isoformat()
     assert renewed["attention_notified"] is False
 
-    monkeypatch.setattr(venue, "NOW", base_now + timedelta(seconds=601))
+    monkeypatch.setattr(venue, "NOW", base_now + timedelta(seconds=662))
     e.lp_auto_reconcile_unknown()
-    assert calls == ["LP 核对持续失败", "LP 核对已恢复"]
+    assert calls == ["LP 核对持续失败", calls[1]]
 
-    monkeypatch.setattr(venue, "NOW", base_now + timedelta(seconds=602))
+    monkeypatch.setattr(venue, "NOW", base_now + timedelta(seconds=663))
     e.lp_auto_reconcile_unknown()
     wait_for_calls(4)
     final = e._auto_pool._read()["intents"][intent_id]
-    assert calls == [
-        "LP 核对持续失败",
-        "LP 核对已恢复",
+    assert calls[2:] == [
         "LP 核对持续失败",  # New episode reaches both channels once.
         "LP 核对持续失败",
     ]
     assert final["attention_since"] == (
-        base_now + timedelta(seconds=302)
+        base_now + timedelta(seconds=363)
     ).isoformat()
     assert final["attention_notified"] is True
 
@@ -1586,6 +1623,11 @@ def test_attention_worker_exception_is_restartable(tmp_path, monkeypatch):
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
     e.lp_auto_set_desired_running(True)
     r=e.lp_auto_run_once(); row=r['intents'][0]
+    startup = lp._attention_thread
+    if startup is not None:
+        startup.join(timeout=2)
+        assert not startup.is_alive()
+    assert lp._attention_thread is None
     pool=e._auto_pool
     pool._update(lambda d:d['intents'][row['intent_id']].update(
         attention_since=(NOW-timedelta(seconds=301)).isoformat(),
@@ -1667,12 +1709,24 @@ def test_recovery_during_fault_send_delivers_recovery_to_successful_channels(tmp
         exchange.lp_snapshot = recovered_snapshot
         engine.lp_auto_reconcile_unknown()
         assert engine._auto_pool._read()['intents'][intent_id]['financial_status'] == 'known'
+        assert not any('恢复' in title for _, title in calls)
     finally:
         release.set()
         thread = lp._attention_thread
         if thread is not None:
             thread.join(timeout=3)
+
+    monkeypatch.setattr(venue, 'NOW', base + timedelta(seconds=361))
+    engine.lp_auto_reconcile_unknown()
+    thread = lp._attention_thread
+    if thread is not None:
+        thread.join(timeout=3)
     channels = ['feishu'] if partial else ['feishu', 'xiaoai']
-    assert calls == [(channel, title) for title in ('LP 核对持续失败', 'LP 核对已恢复') for channel in channels]
+    recovery_title = calls[len(channels)][1]
+    assert recovery_title.startswith('LP 标的资金核对恢复 · ')
+    assert calls == (
+        [(channel, 'LP 核对持续失败') for channel in channels]
+        + [(channel, recovery_title) for channel in channels]
+    )
     intent = engine._auto_pool._read()['intents'][intent_id]
     assert not intent.get('attention_due') and not intent.get('attention_recovery_due')

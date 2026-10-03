@@ -9,15 +9,32 @@ import shlex
 import subprocess
 import urllib.error
 import urllib.request
+import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime, time
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
-from typing import Callable, Iterable, Mapping, Protocol
+from typing import Callable, Iterable, Iterator, Mapping, Protocol
 from zoneinfo import ZoneInfo
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 HONG_KONG = ZoneInfo("Asia/Hong_Kong")
+
+
+_notification_delivery_episode: ContextVar[str | None] = ContextVar(
+    "notification_delivery_episode", default=None
+)
+
+
+@contextmanager
+def notification_delivery_episode(key: str | None) -> Iterator[None]:
+    token = _notification_delivery_episode.set(key)
+    try:
+        yield
+    finally:
+        _notification_delivery_episode.reset(token)
 
 
 def beijing_clock(value: object, *, seconds: bool = False) -> str | None:
@@ -142,19 +159,32 @@ class FeishuAppNotifier:
 
     def notify(self, title: str, message: str) -> None:
         token = self._tenant_access_token()
+        payload: dict[str, object] = {
+            "receive_id": self.receive_id,
+            "msg_type": "text",
+            "content": json.dumps(
+                {"text": f"{title}\n\n{message}"},
+                ensure_ascii=False,
+            ),
+        }
+        episode = _notification_delivery_episode.get()
+        if episode is not None:
+            payload["uuid"] = str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    json.dumps(
+                        [episode, self.app_id, self.receive_id_type, self.receive_id],
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                )
+            )
         response = self._post_json(
             (
                 "https://open.feishu.cn/open-apis/im/v1/messages"
                 f"?receive_id_type={self.receive_id_type}"
             ),
-            {
-                "receive_id": self.receive_id,
-                "msg_type": "text",
-                "content": json.dumps(
-                    {"text": f"{title}\n\n{message}"},
-                    ensure_ascii=False,
-                ),
-            },
+            payload,
             {"Authorization": f"Bearer {token}"},
             self.timeout_seconds,
         )

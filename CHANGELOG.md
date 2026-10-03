@@ -5,6 +5,13 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-03
 
+- PR #229 机械同步已合并 #234 的 main `6bf450ff`，保留 SDK guarded deepcopy 修复及双方测试。
+  混合历史渠道恢复 ACK 测试先排空首次下单的通知通道再注入回执夹具，保留全部渠道、重启、
+  SQLite 异常及无重复发送断言；通知生产 patch 与 `a1f0d892` 完全一致，UNKNOWN、资金及交易合同不变。
+  三参数受控启动交错通过，错误渠道 guard 和成功缓存丢失的负向检查分别拒绝 2 项及 1 项。
+  原 213 项加 5 项直接 SDK/account 消费者，218 项串行及双 worker 各一轮通过；首次 1 failed / 217 passed
+  及诊断记录保留。未发布、合并或部署，独立复审由主 pane 协调。
+
 - #232 scoring 后交易代次 fence 测试改用同一受控业务时钟生成 SDK/adapter receipt 并验证 LP 事实。
   时钟只作用于该 adapter 的读取线程，保留真实线程、原 Event watchdog、旧代拒绝、UNKNOWN 和无 scoring_checked_at 断言；
   生产 freshness 与超时不变。历史串行 94 passed / 1 failed 的具体原因仍 UNKNOWN，后续 trace 95 passed 不覆盖失败。
@@ -18,6 +25,21 @@ operator-facing: what changed, which workflow is affected, and what was verified
   账户 round 竞态测试明确等待两会话都取得旧代事实再推进交易代次，保留单次读取、
   下一轮重读及 UNKNOWN/拒绝旧代发布断言；原/current guard 的受控对照确认旧有同步缺口。
   generation fence、UNKNOWN、筛选及交易契约不变。未启动真实服务或部署。
+
+- PR #229 机械同步 #233 main `7f52bbbc` 后，缓存恢复 ACK 测试先排空首次下单的通知通道，
+  再注入回执夹具，避免后台发送完成后的状态混入首次 ACK 快照；生产通知与交易代码未改。
+  保留异渠成功不能抵扣飞书、首次缓存回执仍欠账及后续只发送一次的断言。
+  两项受控启动交错通过，移除原故障渠道 guard 的负向检查仍为 2 failed；
+  同一 focused 213 项串行与双 worker 各一轮通过，旧 base 的并发失败与全部历史证据保留。
+
+- PR #229 复审修复：终态恢复通知复核交给既有有界 attention 通道，慢读取及单条异常不再阻挡活动订单巡检。
+  通知专用 single-flight 保留 owner 模式，旧排队 monitor 加入也不能把通知结果用于业务状态更新；
+  普通 monitor/report 合并读取语义保持。归档状态或归档 metadata 均在 SQLite 回执事务内早返回，
+  迟到及缓存 fault/recovery ACK 保留完整归档行、payload 和 revision。
+  延迟读取测试整段复用既有子进程 watchdog，保留 Event 放行、清理及资金/占资/代次/零交易断言。
+  main `f2307662` 上最新源码 focused 213 项串行和双 worker 各两轮通过；旧实现与两项错误 flight 模式变异均被拒绝。
+  10-02 的 186 项证据仅属于旧树 `63bcebb7`；本轮夹具错误、启动阶段竞争、RED 与环境诊断全部保留。
+  未执行生产操作、整服务或部署门禁；冻结暂存区交主 panel 独立复审及授权发布。
 
 ## 2026-10-02
 
@@ -59,6 +81,25 @@ operator-facing: what changed, which workflow is affected, and what was verified
   push head 与 PR merge 分别绑定各自 SHA；required 聚合保持 fail-closed。
   同步中英文开发文档及保护规则设计；具体测试结果以本 PR 精确 SHA 的验证记录为准。
   Candidate Acceptance、Host Readiness、Smoke、审查、合并与部署授权边界不变。
+
+- LP 飞书通知按故障原因合并，区分内部等待、标的核对恢复与自动池实际 BUY 数；
+  恢复需相隔至少 60 秒的两次新鲜核对，保留 UNKNOWN 占资和五分钟故障提醒。
+  成功发送后的 SQLite 回执重试复用结果，飞书消息使用同一故障批次 UUID；
+  已归档账户基线不再发送历史通知。覆盖重复发送、部分渠道、迟到回执与恢复边界；
+  发送 claim 事务内核验归档、episode、会话版本及账户交易 generation，保留保护性撤单计数；
+  当前内部等待覆盖旧故障文案，auto claim 核验当前原因，迟到回执按 episode 入账。
+  原 head `5872a514` 的 Docker 定向 89 项及错误 claim 变异记录保留；
+  旧 SDK 日志目录冲突与云存储保护失败也保留，不作为本轮验证证据。
+  PR #229 三项 P2 修复以事实时间戳之间的 60 秒间隔为准；已结清的 complete/entry_rejected 和手动会话
+  通过现有有界只读通道补齐通知复核，真实账户 stamp、完整事实和交易代次验证后才通知，
+  不使用日报墙钟充当事实，也不因通知失败改变已结清资金、占资或业务准入。
+  异构渠道仅收到自己已接收原故障的市场恢复文案；旧 schema 默认集合按已有 notifier 配置展开，
+  已知故障渠道约束 payload、缓存及 SQLite ACK，部分回执重启不扩散其他市场文案，批次 UUID 保持稳定。
+  完整改动干净重放到最新 main `f2307662`，保留 #228/#231 与 CI 政策；旧树证据不转移。
+  新 base 宿主 focused 186 项串行及双 worker 各两轮通过，覆盖普通飞书发送、渠道选择/静默时段、
+  迟到回执、缓存、归档/身份/代次 fence
+  与 Event 屏障控制的读写交错；原错误源码负向验证和全部失败史单独保留。
+  本地未跑整服务或部署门禁；GitHub CI、独立复审及发布由主 panel 接续，未改生产账户。
 
 ## 2026-10-01
 

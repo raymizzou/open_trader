@@ -6416,6 +6416,49 @@ class PredictionArbitrageStore:
             for row in registered
         ]
 
+    def lp_claim_attention_notification(
+        self,
+        session_id: str,
+        *,
+        recovery: bool,
+        episode: str,
+        revision: int,
+        trade_generation: int,
+        patch: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        """Claim the same unarchived session image before notification I/O."""
+        prefix = "needs_attention_recovery" if recovery else "needs_attention"
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM lp_sessions WHERE session_id=?", (str(session_id),)
+            ).fetchone()
+            if row is None:
+                return None
+            payload = _load_payload(str(row["payload"]))
+            generation = connection.execute(
+                "SELECT generation FROM lp_trade_generation WHERE singleton=1"
+            ).fetchone()
+            if (payload.get("account_baseline_archive")
+                    or str(row["state"]) == "account_baseline_archived"
+                    or self._lp_payload_revision(payload) != revision
+                    or generation is None or int(generation[0]) != trade_generation
+                    or str(payload.get(prefix + "_episode") or "") != episode
+                    or not payload.get(prefix + "_due")
+                    or (not recovery and str(row["state"]) != "needs_attention")
+                    or (recovery and str(row["state"]) == "needs_attention")):
+                return None
+            payload.update(patch)
+            payload["_lp_revision"] = revision + 1
+            connection.execute(
+                "UPDATE lp_sessions SET payload=?,updated_at=? WHERE session_id=?",
+                (_dump_execution_payload(payload), _utc_now(), str(session_id)),
+            )
+            updated = connection.execute(
+                "SELECT * FROM lp_sessions WHERE session_id=?", (str(session_id),)
+            ).fetchone()
+            assert updated is not None
+            return self._lp_row_result(updated)
+
     def lp_finish_attention_notification(
         self,
         session_id: str,
@@ -6433,6 +6476,8 @@ class PredictionArbitrageStore:
             if row is None:
                 return None
             payload = _load_payload(str(row["payload"]))
+            if row["state"] == "account_baseline_archived" or payload.get("account_baseline_archive"):
+                return self._lp_row_result(row)
             incoming = {str(key): bool(value) for key, value in results.items()}
             if recovery:
                 if str(payload.get("needs_attention_recovery_episode") or "") != str(episode):

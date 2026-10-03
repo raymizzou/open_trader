@@ -1712,7 +1712,7 @@ def test_review_late_fault_after_verified_recovery_notifies_once(tmp_path):
     calls = []
     def notify(title, message, voice, *, channels):
         calls.append(title)
-        if '已恢复' not in title:
+        if '核对恢复' not in title:
             entered.set(); assert release.wait(5)
         return {key: True for key in channels}
     lp.set_protection_notifier(notify)
@@ -1734,7 +1734,23 @@ def test_review_late_fault_after_verified_recovery_notifies_once(tmp_path):
             delivery.join(5)
     lp.flush_session_recovery('manual')
     lp.flush_session_recovery('manual')
-    assert len(calls) == 2 and '已恢复' in calls[1]
+    assert len(calls) == 1  # A late fault receipt cannot bypass stable recovery.
+    row = store.lp_session('manual')
+    assert row['needs_attention_recovery_due'] is True
+    assert row['needs_attention_recovery_channels'] == ['feishu', 'xiaoai']
+    assert row['needs_attention_recovery_ready_since'] == now.isoformat()
+    now += timedelta(seconds=60)
+    lp.flush_session_recovery('manual')
+    assert len(calls) == 1  # The same facts are still not a new observation.
+    exchange.snapshot_value = {**exchange.snapshot_value, 'checked_at': now}
+    lp.reconcile_facts('manual', monitor=True)
+    delivery = lp._attention_thread
+    if delivery is not None:
+        delivery.join(5)
+        assert not delivery.is_alive()
+    lp.flush_session_recovery('manual')
+    lp.flush_session_recovery('manual')
+    assert len(calls) == 2 and '核对恢复' in calls[1]
 
 
 @pytest.mark.parametrize('wait_reason', ['facts_read_capacity', 'facts_read_in_progress'])

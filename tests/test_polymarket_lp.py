@@ -14378,6 +14378,9 @@ def test_lp_needs_attention_notification_five_minute_once(tmp_path) -> None:
 
         def lp_snapshot(self, request: dict[str, object]) -> dict[str, object]:
             snapshot = super().lp_snapshot(request)
+            account = snapshot.get("account")
+            if isinstance(account, dict):
+                account["checked_at"] = current[0]
             book = snapshot.get("book")
             if isinstance(book, dict):
                 book["timestamp"] = current[0]
@@ -14435,10 +14438,13 @@ def test_lp_needs_attention_notification_five_minute_once(tmp_path) -> None:
     assert len(notifications) == 1
     title, message, xiaoai = notifications[0]
     assert "LP 需要核对" in title
-    assert message == (
+    assert message.split("\n\n", 1)[0] == (
         "账户里有一张挂在本市场、但不归本组管理的单（常见：手工挂的单）。"
         "系统已暂停本组自动管理，追加暂不可用；那张单撤掉或成交后自动恢复，无需操作。"
     )
+    assert "市场：" in message
+    assert "自动池：" in message
+    assert "详情见 Dashboard。" in message
     assert xiaoai == "LP 需要核对，本市场有不归系统管理的挂单"
     assert store.lp_session(session_id)["needs_attention_notified"] is True
 
@@ -14461,6 +14467,9 @@ def test_lp_needs_attention_notification_resets_after_recovery(tmp_path) -> None
 
         def lp_snapshot(self, request: dict[str, object]) -> dict[str, object]:
             snapshot = super().lp_snapshot(request)
+            account = snapshot.get("account")
+            if isinstance(account, dict):
+                account["checked_at"] = current[0]
             book = snapshot.get("book")
             if isinstance(book, dict):
                 book["timestamp"] = current[0]
@@ -14516,6 +14525,7 @@ def test_lp_needs_attention_notification_resets_after_recovery(tmp_path) -> None
 
     # 移除触发单（快照回到干净）→ tick 恢复 entry_open，补一条恢复通知。
     exchange.snapshot_value = clean
+    current[0] = now + timedelta(seconds=300)
     recovered = service.tick()
     assert recovered["state"] == "entry_open"
     _wait_for_lp_attention(service)
@@ -14523,8 +14533,16 @@ def test_lp_needs_attention_notification_resets_after_recovery(tmp_path) -> None
     assert stored["state"] == "entry_open"
     assert stored["needs_attention_since"] is None
     assert stored["needs_attention_notified"] is False
+    assert stored["needs_attention_recovery_due"] is True
+    assert len(notifications) == 1
+
+    current[0] = now + timedelta(seconds=360)
+    service.tick()
+    _wait_for_lp_attention(service)
+    stored = store.lp_session(session_id)
     assert stored["needs_attention_recovery_due"] is False
     assert len(notifications) == 2
+    assert notifications[1][0].startswith("LP 会话核对恢复 · ")
 
     # 第二次 episode：再进入 → 满 5 分钟再推异常通知（累计 3），之后不再推。
     exchange.snapshot_value = trigger
@@ -14553,6 +14571,9 @@ def test_lp_manual_attention_retries_failed_channel_and_fences_old_recovery(
     class _ClockFreshExchange(_Exchange):
         def lp_snapshot(self, request: dict[str, object]) -> dict[str, object]:
             snapshot = super().lp_snapshot(request)
+            account = snapshot.get("account")
+            if isinstance(account, dict):
+                account["checked_at"] = current[0]
             book = snapshot.get("book")
             if isinstance(book, dict):
                 book["timestamp"] = current[0]
@@ -14630,9 +14651,15 @@ def test_lp_manual_attention_retries_failed_channel_and_fences_old_recovery(
     exchange.snapshot_value = clean
     current[0] = now + timedelta(seconds=361)
     assert service.tick()["state"] == "entry_open"
+    _wait_for_lp_attention(service)
+    assert store.lp_session(session_id)["needs_attention_recovery_ready_since"] == current[0].isoformat()
+    assert not recovery_entered.is_set()
+
+    current[0] = now + timedelta(seconds=421)
+    assert service.tick()["state"] == "entry_open"
     assert recovery_entered.wait(5)
     exchange.snapshot_value = trigger
-    current[0] = now + timedelta(seconds=362)
+    current[0] = now + timedelta(seconds=422)
     assert service.tick()["state"] == "needs_attention"
     new_fault = store.lp_session(session_id)
     assert new_fault["needs_attention_episode"] != first_episode
@@ -14647,11 +14674,11 @@ def test_lp_manual_attention_retries_failed_channel_and_fences_old_recovery(
         assert fenced["needs_attention_episode"] != first_episode
         assert fenced["needs_attention_notified"] is False
 
-        current[0] = now + timedelta(seconds=662)
+        current[0] = now + timedelta(seconds=722)
         service.tick()
         _wait_for_lp_attention(service)
         assert store.lp_session(session_id)["needs_attention_notified"] is True
-        current[0] = now + timedelta(seconds=663)
+        current[0] = now + timedelta(seconds=723)
         service.tick()
         _wait_for_lp_attention(service)
     finally:
