@@ -1,0 +1,96 @@
+name: Source release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to retry; never creates a tag
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  checks: read
+
+concurrency:
+  group: source-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_TAG: ${{ inputs.tag || github.ref_name }}
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      source_sha: ${{ steps.identity.outputs.source_sha }}
+      manifest_sha256: ${{ steps.package.outputs.manifest_sha256 }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve existing version tag on main history
+        id: identity
+        run: |
+          set -euo pipefail
+          python3 -c 'import os,re; assert re.fullmatch(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-rc\.[1-9][0-9]*)?",os.environ["SOURCE_TAG"])'
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          sha=$(git rev-parse --verify "refs/tags/$SOURCE_TAG^{commit}")
+          git merge-base --is-ancestor "$sha" refs/remotes/origin/main
+          git checkout --detach "$sha"
+          printf 'source_sha=%s\n' "$sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12.14'
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: '0.12.19'
+          enable-cache: false
+      - name: Build once with trustworthy main CI evidence and locked installation
+        id: package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.identity.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release_artifacts.py build --repository "$GITHUB_REPOSITORY" --tag "$SOURCE_TAG" --output "$RUNNER_TEMP/release-assets"
+          python3 scripts/verify_release_artifacts.py "$RUNNER_TEMP/release-assets" --destination "$RUNNER_TEMP/recovered" --expected-sha "$SOURCE_SHA" | tee "$RUNNER_TEMP/restoration.json"
+          printf 'manifest_sha256=%s\n' "$(sha256sum "$RUNNER_TEMP/release-assets/release-manifest.json" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - name: Pass only completed verified assets to draft job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: source-release-assets
+          path: ${{ runner.temp }}/release-assets
+          if-no-files-found: error
+          retention-days: 3
+
+  draft:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      actions: read
+      checks: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: source-release-assets
+          path: ${{ runner.temp }}/release-assets
+      # Trusted workflow tooling only; downloaded source is data in this job.
+      - name: Recheck identity and upload only a draft without overwrites
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_MANIFEST_SHA256: ${{ needs.build.outputs.manifest_sha256 }}
+          SOURCE_SHA: ${{ needs.build.outputs.source_sha }}
+        run: python3 scripts/release_artifacts.py upload-draft --repository "$GITHUB_REPOSITORY" --output "$RUNNER_TEMP/release-assets" --expected-manifest-sha256 "$EXPECTED_MANIFEST_SHA256" --expected-tag "$SOURCE_TAG" --expected-sha "$SOURCE_SHA"

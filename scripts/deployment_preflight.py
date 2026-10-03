@@ -131,25 +131,16 @@ def timestamp(value):
     return result
 
 
-def verify_artifact(api, artifact, scope, run, root, now):
+def validate_archive(data, scope, run, lock_hash, selection, bases):
+    """Pure data validation shared by preflight and the non-executing release writer."""
     sha = run['head_sha']
-    require(artifact.get('expired') is False, f'{scope} artifact expired or expiration unknown')
-    created, expires = timestamp(artifact['created_at']), timestamp(artifact['expires_at'])
-    require(created <= now < expires and timedelta(0) < expires-created <= timedelta(days=3),
-            f'{scope} artifact is expired or exceeds three-day retention')
-    identity = artifact['workflow_run']
-    require(identity['id'] == run['id'] and identity['head_sha'] == sha and identity['head_branch'] == 'main',
-            f'{scope} artifact run/source mismatch')
-    data = api.download(artifact['id'])
-    require(artifact.get('digest') == f'sha256:{sha256(data)}', f'{scope} artifact digest mismatch or missing')
     files = read_archive(data)
     metadata = json.loads(files['evidence.json'])
-    lock_hash = sha256((root/'uv.lock').read_bytes())
     fixed = dict(schema_version=1, source_sha=sha, repository=REPOSITORY,
                  workflow_ref=f'{REPOSITORY}/{WORKFLOW}@refs/heads/main', event_name='push', ref='refs/heads/main',
                  run_id=str(run['id']), run_attempt=str(run['run_attempt']), scope=scope, test_n_leg='1',
                  workers=2 if scope == 'prediction' else 1, lock_sha256=lock_hash, status='success', exit_status=0,
-                 evidence_role='test-only', selection=expected_selection(scope, root))
+                 evidence_role='test-only', selection=selection)
     require(all(metadata.get(key) == value and type(metadata.get(key)) is type(value)
                 for key, value in fixed.items()), f'{scope} test metadata mismatch')
     require(metadata['environment'].get('runner_os') == 'Linux'
@@ -161,7 +152,6 @@ def verify_artifact(api, artifact, scope, run, root, now):
     require(manifest.get('role') == 'test-only; synthetic Git snapshot is not a release SHA'
             and manifest.get('source_sha') == sha and manifest.get('source_state') == 'clean'
             and manifest.get('lock_sha256') == lock_hash, f'{scope} test environment identity mismatch')
-    bases = re.findall(r'^FROM (\S+)', (root/'Dockerfile.dev').read_text(), re.MULTILINE)
     require(bases and all('@sha256:' in base for base in bases) and manifest.get('base_images') == bases,
             f'{scope} test base-image identity mismatch')
     require(manifest.get('python') == '3.12.14' and manifest.get('platform') == 'Linux/x86_64'
@@ -184,6 +174,22 @@ def verify_artifact(api, artifact, scope, run, root, now):
                 and partition['complete_count'] == partition['partition_count'] == sum(counts.values())
                 and bool(re.fullmatch('[0-9a-f]{64}', partition['complete_sha256']))
                 and partition['complete_sha256'] == partition['partition_sha256'], 'Incomplete backend partition evidence')
+
+
+def verify_artifact(api, artifact, scope, run, root, now):
+    sha = run['head_sha']
+    require(artifact.get('expired') is False, f'{scope} artifact expired or expiration unknown')
+    created, expires = timestamp(artifact['created_at']), timestamp(artifact['expires_at'])
+    require(created <= now < expires and timedelta(0) < expires-created <= timedelta(days=3),
+            f'{scope} artifact is expired or exceeds three-day retention')
+    identity = artifact['workflow_run']
+    require(identity['id'] == run['id'] and identity['head_sha'] == sha and identity['head_branch'] == 'main',
+            f'{scope} artifact run/source mismatch')
+    data = api.download(artifact['id'])
+    require(artifact.get('digest') == f'sha256:{sha256(data)}', f'{scope} artifact digest mismatch or missing')
+    validate_archive(data, scope, run, sha256((root/'uv.lock').read_bytes()),
+                     expected_selection(scope, root),
+                     re.findall(r'^FROM (\S+)', (root/'Dockerfile.dev').read_text(), re.MULTILINE))
     return {'scope':scope, 'id':artifact['id'], 'digest':artifact['digest']}
 
 
