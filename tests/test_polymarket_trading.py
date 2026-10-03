@@ -411,6 +411,69 @@ def test_from_keychain_uses_official_factory_without_redacted_credentials(
     assert "builder-secret-sentinel" not in repr(captured["api_key"])
 
 
+@pytest.mark.parametrize(
+    "outcome",
+    ("allowed", "blocked", "malformed", "timeout", "initialization", "keychain", "account"),
+)
+def test_wallet_status_dispatch_is_read_only_and_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    outcome: str,
+) -> None:
+    config = TradingConfig(SIGNER, WALLET)
+    adapter, _ = make_adapter()
+    calls: list[str] = []
+    monkeypatch.setattr(cli, "load_trading_config", lambda _: config)
+
+    def initialize(actual_config: TradingConfig, *, read_only: bool = False):
+        assert actual_config is config
+        assert read_only is True, "wallet status must not select SDK create"
+        calls.append("initialize")
+        if outcome == "initialization":
+            raise polymarket_trading.PolymarketTradingError("auth")
+        if outcome == "keychain":
+            raise polymarket_trading.KeychainError("private-sentinel")
+        return adapter
+
+    def account_snapshot():
+        calls.append("account")
+        if outcome == "account":
+            raise polymarket_trading.PolymarketTradingError("network")
+        return SimpleNamespace(positions=("one",))
+
+    def region(request, *, timeout):
+        calls.append("region")
+        assert timeout == polymarket_trading.GEOBLOCK_TIMEOUT_SECONDS
+        if outcome == "timeout":
+            raise TimeoutError("private-sentinel")
+        payload = {"blocked": False} if outcome == "allowed" else {"blocked": True}
+        if outcome == "malformed":
+            payload = {"blocked": "false"}
+        return FakeResponse(payload)
+
+    monkeypatch.setattr(cli.PolymarketTradingClient, "from_keychain", initialize)
+    monkeypatch.setattr(adapter, "account_snapshot", account_snapshot)
+    monkeypatch.setattr(polymarket_trading, "urlopen", region)
+    result = cli.main(["prediction-arb", "wallet", "status", "--config", "unused.json"])
+    output = capsys.readouterr()
+    assert result == (0 if outcome == "allowed" else 2)
+    assert "private-sentinel" not in output.out + output.err
+    if outcome in {"initialization", "keychain", "account"}:
+        assert calls == (["initialize", "account"] if outcome == "account" else ["initialize"])
+        error_code = {"initialization": "auth", "keychain": "keychain_unavailable", "account": "network"}[outcome]
+        assert output.out == ""
+        assert output.err == f"result: BLOCKED\nerror_code: {error_code}\n"
+    else:
+        assert calls == ["initialize", "account", "region"]
+        assert output.err == ""
+        assert output.out == (
+            "wallet: 0x2222...2222\n"
+            f"geoblock: {'allowed' if outcome == 'allowed' else 'blocked'}\n"
+            "account_reads: pass (1 positions)\n"
+            f"result: {'PASS' if outcome == 'allowed' else 'BLOCKED'}\n"
+        )
+
+
 def test_read_only_auth_derives_existing_l2_without_sdk_create(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

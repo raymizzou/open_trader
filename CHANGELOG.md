@@ -12,6 +12,11 @@ operator-facing: what changed, which workflow is affected, and what was verified
   回归覆盖接收端拒绝/已接收但回执丢失、部分渠道、重启、成员变化和业务状态隔离；
   订单、资金、名额和交易准入不变，完整验证以本次精确提交的 CI 为准，未合并或部署。
 
+- 钱包 `status` 显式使用只读初始化，仅派生已有 L2 凭据，避免 Host 钱包检查进入
+  创建 API key 或部署钱包的初始化路径。保留身份核验、账户读取、地区限制、输出与失败关闭语义。
+  实际 CLI 分发覆盖成功、认证/Keychain/账户失败、地区拒绝、格式异常和超时；结合既有
+  真实 SDK 零创建路径回归验证。网络/DNS 原因及真实 Host READY 仍须独立核实，未执行生产操作。
+
 - PR #229 机械同步已合并 #234 的 main `6bf450ff`，保留 SDK guarded deepcopy 修复及双方测试。
   混合历史渠道恢复 ACK 测试先排空首次下单的通知通道再注入回执夹具，保留全部渠道、重启、
   SQLite 异常及无重复发送断言；通知生产 patch 与 `a1f0d892` 完全一致，UNKNOWN、资金及交易合同不变。
