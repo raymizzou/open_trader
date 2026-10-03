@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -134,14 +134,16 @@ class _RegistrationExchange(_Exchange):
         }
 
 
-def _sync_snapshot() -> dict[str, object]:
+def _sync_snapshot(now=NOW) -> dict[str, object]:
     return {
         "authenticated": True,
         "wallet_address": WALLET,
         "account_id": WALLET.casefold(),
-        "read_started_at": NOW,
-        "read_ended_at": NOW,
-        "checked_at": NOW,
+        "read_started_at": now,
+        "read_ended_at": now,
+        "checked_at": now,
+        "balance": Decimal("1000"),
+        "allowance": Decimal("1000"),
         "pagination_complete": True,
         "balance_complete": True,
         "open_orders_complete": True,
@@ -258,7 +260,8 @@ def test_new_exchange_id_does_not_advance_shared_account_generation(tmp_path) ->
 
 def test_known_terminal_owner_is_updated_while_new_id_creates_active_group(tmp_path) -> None:
     exchange = _RegistrationExchange()
-    service = PolymarketLPService(PredictionArbitrageStore(tmp_path), exchange, clock=lambda: NOW)
+    current = [NOW]
+    service = PolymarketLPService(PredictionArbitrageStore(tmp_path), exchange, clock=lambda: current[0])
     history = _sync_snapshot()
     history["open_orders"][0].update(
         order_id="done-buy", status="FILLED", size_matched=Decimal("10"),
@@ -270,7 +273,8 @@ def test_known_terminal_owner_is_updated_while_new_id_creates_active_group(tmp_p
     session_id = service.store.lp_active_sessions()[0]["session_id"]
     service.store.lp_update_session(str(session_id), state="complete")
 
-    mixed = _sync_snapshot()
+    current[0] += timedelta(seconds=1)
+    mixed = _sync_snapshot(current[0])
     done = dict(mixed["open_orders"][0])
     done.update(
         order_id="done-buy", status="FILLED", size_matched=Decimal("10"),
@@ -683,3 +687,44 @@ def test_dashboard_sync_view_marks_discovered_order_managed(tmp_path) -> None:
     assert order_history["order-open"]["side"] == "SELL"
     assert "taker-1" not in order_history
     assert "taker-1" not in store.lp_active_sessions()[0]["augment_order_ids"]
+
+
+def test_changed_order_at_identical_read_timestamps_cannot_replace_account_truth(tmp_path):
+    store = PredictionArbitrageStore(tmp_path)
+    current = [NOW]
+    exchange = _RegistrationExchange()
+    service = PolymarketLPService(store, exchange, clock=lambda: current[0])
+    engine = PredictionExecutionService(
+        store=store, monitor=SimpleNamespace(), trading=exchange,
+        notifier=SimpleNamespace(), lock_path=tmp_path / "execution.lock", lp=service,
+    )
+    first = _sync_snapshot()
+    assert service.register_account_snapshot(_generation_snapshot(store, first))["state"] == "registered"
+    original = store.lp_sessions()
+    original_state = engine.lp_auto_state()
+    conflicting = _sync_snapshot()
+    # A new exchange ID changes account truth without changing any existing
+    # order's immutable terms. It must reach the snapshot publication fence.
+    conflicting["open_orders"].append(dict(conflicting["open_orders"][0], order_id="manual-buy-b"))
+    result = service.register_account_snapshot(_generation_snapshot(store, conflicting))
+    assert result["state"] != "registered", result
+    assert result["state"] == "skipped", result
+    assert result["reason"] == "account_round_invalid", result
+    assert result["wait_reason"] == "account_snapshot_conflict", result
+    assert store.lp_sessions() == original
+    assert engine.lp_auto_state() == original_state
+
+    # The exact same order observation is valid once it has a later read time.
+    current[0] += timedelta(seconds=1)
+    conflicting.update(read_started_at=current[0], read_ended_at=current[0], checked_at=current[0])
+    later = service.register_account_snapshot(_generation_snapshot(store, conflicting))
+    assert later["state"] == "registered", later
+    sessions = store.lp_sessions()
+    assert len(sessions) == 1
+    assert sessions[0]["session_id"] == original[0]["session_id"]
+    assert sessions[0]["owned_order_ids"] == ["manual-buy", "manual-buy-b"]
+    assert Decimal(str(sessions[0]["quantity"])) == Decimal("20")
+    published = engine.lp_auto_state()
+    assert published["slots"]["occupied"] == 2
+    assert Decimal(published["funds"]["buy_reserved_usd"]) == Decimal("6")
+    assert published["funds"]["as_of"] != original_state["funds"]["as_of"]
