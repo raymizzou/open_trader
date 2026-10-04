@@ -8267,37 +8267,11 @@ class PolymarketLPService:
                                  "_first_seen_episode_id": episode["episode_id"]}
                 prepared.append((token, token_rows, candidate))
 
-            # Economics, identities and all endpoint-completeness flags are
-            # validated before the transaction. Unknown economics stay UNKNOWN
-            # and retain temporary holds; missing structure cannot publish.
+            # Validate current exposure before publication. Historical report
+            # gaps cannot veto API positions or create additional reservations.
             financial_facts = build_account_financial_facts(
                 snapshot, now=self._now(), expected_account_id=account_id,
             )
-            if "trade_fee_unknown" in financial_facts.get("reason_codes", ()):
-                # Reuse the existing verified fee rules only when raw
-                # execution evidence did not already establish its fees.
-                # Unavailable fee metadata blocks spending, not ID adoption.
-                metadata_reader = getattr(self.exchange, "lp_market_metadata", None)
-                conditions = tuple(dict.fromkeys(
-                    str(row.get("condition_id") or "") for row in rows if row.get("condition_id")
-                ))
-                try:
-                    metadata = metadata_reader(conditions) if callable(metadata_reader) and conditions else {}
-                except LpAccountRoundInvalid:
-                    raise
-                except Exception:
-                    metadata = {}
-                fee_metadata = {}
-                for row in (*rows, *snapshot.get("positions", ())):
-                    token = str(row.get("token_id") or row.get("asset_id") or "")
-                    market = metadata.get(str(row.get("condition_id") or "")) if isinstance(metadata, Mapping) else None
-                    if token and isinstance(market, Mapping):
-                        fee_metadata[token] = market
-                if fee_metadata:
-                    financial_facts = build_account_financial_facts(
-                        {**snapshot, "fee_metadata_by_token": fee_metadata},
-                        now=self._now(), expected_account_id=account_id,
-                    )
             token_results = []
             created = joined = 0
             with self._first_seen_apply_lock:
@@ -12343,6 +12317,18 @@ class PolymarketLPService:
         account_round: object | None = None,
     ):
         snapshot_request = dict(request)
+        snapshot_request.pop("_lp_terminal_orders", None)
+        session_id = str(request.get("session_id") or "")
+        saved = self.store.lp_session(session_id) if session_id else None
+        if saved and all(saved.get(key) == request.get(key)
+                         for key in ("condition_id", "token_id")):
+            # Reuse durable terminal receipts across ticks and restarts. Only
+            # persisted facts can suppress reads, never request-supplied history.
+            snapshot_request["_lp_terminal_orders"] = {
+                oid: row for oid, row in self._order_history(saved).items()
+                if str(row.get("status") or "").upper() in TERMINAL_ORDER_STATES
+                and row.get("token_id") == request.get("token_id")
+            }
         if account_round is not None:
             snapshot_request["_lp_account_round"] = account_round
         for name in ("lp_snapshot", "snapshot"):
@@ -15815,16 +15801,15 @@ class PolymarketLPService:
             raise ValueError("opening_quantity_unknown")
         if sold_quantity > quantity:
             raise ValueError("sold_quantity_exceeded")
-        expected_residual = quantity - sold_quantity
-        position_reconciled = fills_known and residual == expected_residual
+        # A complete current account read owns inventory quantity. Historical
+        # fills remain reporting evidence, not a veto over that position.
+        position_reconciled = True
         inventory_valuation_known = residual == 0 or residual_value is not None
         financial_block_reason = None
         if not fills_known:
             financial_block_reason = "owned_fill_quantity_unknown"
         elif not historical_fees_known:
             financial_block_reason = "trade_fee_unknown"
-        elif not position_reconciled:
-            financial_block_reason = "position_mismatch"
         elif not inventory_valuation_known:
             financial_block_reason = "inventory_valuation_unknown"
         patch: dict[str, object] = {
@@ -15849,8 +15834,8 @@ class PolymarketLPService:
             "financial_block_reason": financial_block_reason,
             "orders_terminal": bool(session.get("orders_terminal")),
         }
-        if not position_reconciled:
-            patch["reconciliation"] = "position_mismatch" if fills_known else "owned_fill_quantity_unknown"
+        if session.get("reconciliation") == "position_mismatch":
+            patch["reconciliation"] = None
         reward = snapshot.get("reward_status")
         if reward in {"known", "unknown"}:
             patch["reward_status"] = reward

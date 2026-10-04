@@ -2225,7 +2225,7 @@ def test_protected_pending_restart_and_confirmed_portions(tmp_path) -> None:
 
 
 @pytest.mark.parametrize("mismatch", ["sale_first", "position_first"])
-def test_protected_exit_waits_for_matching_trade_and_position(tmp_path, mismatch) -> None:
+def test_protected_exit_keeps_pending_fill_guard_with_api_positions(tmp_path, mismatch) -> None:
     now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
     token_id = "0x" + "1" * 64
     exchange = _Exchange()
@@ -2299,7 +2299,7 @@ def test_protected_exit_waits_for_matching_trade_and_position(tmp_path, mismatch
         )
     exchange.snapshot_value = mismatch_snapshot
     blocked = service.tick()
-    assert blocked["position_reconciled"] is False
+    assert blocked["position_reconciled"] is True
     assert blocked["protected_exit_order_id"] == "stop-1"
     assert blocked["residual_quantity"] == (
         Decimal("100") if mismatch == "sale_first" else Decimal("60")
@@ -12938,6 +12938,11 @@ def test_lp166_stop_loss_isolated_per_group(tmp_path, monkeypatch) -> None:
     }
     exchange.by_token[token_a] = filled_a
     first = service.tick()
+    # A's initial exit submission can invalidate B's concurrent first read.
+    # Establish B's last-good fact explicitly before testing the later race.
+    baseline_b, _, _, baseline_error, _ = service.reconcile_facts(session_b)
+    assert baseline_error is None
+    assert baseline_b['facts_checked_at']
     exchange.by_token[token_a] = trigger_a
     b_read = threading.Event()
     a_changed = threading.Event()

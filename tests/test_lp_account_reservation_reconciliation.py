@@ -381,13 +381,13 @@ def test_actual_inventory_keeps_verified_cost_without_a_buy_slot(runtime):
     assert account.posts == account.cancels == []
 
 
-@pytest.mark.parametrize("uncertainty", ["fee", "inventory-basis"])
-def test_unknown_fee_or_inventory_basis_never_releases_legacy_holds(runtime, uncertainty):
+@pytest.mark.parametrize("uncertainty", ["fee", "missing-history", "quantity-difference"])
+def test_api_position_cost_replaces_legacy_holds_without_historical_fill_proof(runtime, uncertainty):
     maker = _maker_order("filled-buy", "BUY", "20", "0.40")
     if uncertainty == "fee":
         maker = maker.model_copy(update={"fee_rate_bps": None})
     fill = _trade("unknown-fee-fill", maker, size="20").model_copy(update={"fee_rate_bps": None})
-    trades = (fill,) if uncertainty == "fee" else ()
+    trades = () if uncertainty == "missing-history" else (fill,)
 
     class UnknownFeePublic(sdk._SDKPublicClient):
         def get_market(self, *, id):
@@ -397,19 +397,53 @@ def test_unknown_fee_or_inventory_basis_never_releases_legacy_holds(runtime, unc
             })})
 
     store, adapter, account, lp, execution = runtime(
-        trades=trades, positions=(_position(),), public_client=UnknownFeePublic(NOW),
+        trades=trades, positions=(_position(size="25"),), public_client=UnknownFeePublic(NOW),
     )
     execution.lp_auto_configure({"budget_usd": "100", "target_buy_count": 5})
     originals = _seed_unknowns(store, execution)
     _advance(runtime)
     execution.refresh_lp_dashboard_snapshot()
     state = execution.lp_auto_state()
-    assert state["funds"]["status"] == "unknown", state
-    assert state["funds"]["available_usd"] is None
-    assert state["funds"]["spendable_usd"] is None
-    assert _amount(state, "buy_reserved_usd") >= 16
+    assert state["funds"]["status"] == "known", state
+    assert _amount(state, "inventory_cost_usd") == 10
+    assert _amount(state, "available_usd") == 90
+    assert _amount(state, "spendable_usd") == 90
+    assert _amount(state, "buy_reserved_usd") == 0
     for original in originals:
-        assert not store.lp_session(original["session_id"]).get("reservation_coverage")
+        assert store.lp_session(original["session_id"])["reservation_coverage"]["state"] == "covered"
+    assert account.posts == account.cancels == []
+
+
+def test_session_uses_api_position_quantity_when_trade_history_differs(runtime):
+    fill = _trade("inventory-fill", _maker_order("filled-buy", "BUY", "20", "0.40"), size="20")
+    store, adapter, account, lp, execution = runtime(trades=(fill,), positions=(_position("25"),))
+    assert execution.refresh_lp_dashboard_snapshot()["state"] == "ready"
+    session = next(row for row in store.lp_sessions() if row.get("token_id") == TOKEN_ID)
+    lp.reconcile_facts(session["session_id"])
+    current = store.lp_session(session["session_id"])
+    assert Decimal(current["residual_quantity"]) == 25
+    assert current["position_reconciled"] is True
+    assert current.get("financial_block_reason") != "position_mismatch"
+    assert current.get("reconciliation") != "position_mismatch"
+    assert account.posts == account.cancels == []
+
+
+@pytest.mark.parametrize('redeemable,value,price,initial,expected', [
+    (True, '0', '0', '8', '0'), (False, '0', '0', '8', '8'),
+    (True, '20', '1', '8', '8'), (False, '20', '1', '9', '9'),
+])
+def test_only_api_confirmed_zero_value_settlement_releases_position_cost(runtime, redeemable, value, price, initial, expected):
+    position = _position().model_copy(update={
+        'initial_value': Decimal(initial), 'current_value': Decimal(value),
+        'cur_price': Decimal(price), 'redeemable': redeemable,
+    })
+    store, adapter, account, lp, execution = runtime(positions=(position,))
+    execution.lp_auto_configure({'budget_usd': '100', 'target_buy_count': 5})
+    assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    state = execution.lp_auto_state()
+    assert state['funds']['status'] == 'known'
+    assert _amount(state, 'inventory_cost_usd') == Decimal(expected)
+    assert _amount(state, 'spendable_usd') == 100 - Decimal(expected)
     assert account.posts == account.cancels == []
 
 
@@ -545,7 +579,7 @@ def test_partial_buy_counts_remaining_reserve_and_filled_inventory_once(runtime)
     assert account.posts == account.cancels == []
 
 
-def test_unknown_cancel_missing_from_open_list_retains_slot_until_exact_terminal(runtime):
+def test_unknown_cancel_missing_from_fresh_open_list_releases_actual_slot(runtime):
     from open_trader.polymarket_trading import PolymarketTradingError
 
     order = _open_order("cancel-buy", "BUY", price="0.40", original="20")
@@ -565,11 +599,11 @@ def test_unknown_cancel_missing_from_open_list_retains_slot_until_exact_terminal
     _advance(runtime)
     assert execution.refresh_lp_dashboard_snapshot()["state"] == "ready"
     uncertain = execution.lp_auto_state()
-    assert uncertain["funds"]["status"] == "unknown", uncertain
-    assert uncertain["funds"]["available_usd"] is None
-    assert _amount(uncertain, "buy_reserved_usd") == 8
-    assert uncertain["slots"]["occupied"] == uncertain["slots"]["canceling"] == 1
-    assert "cancel_terminal_unknown" in uncertain["block_reasons"]
+    assert uncertain["funds"]["status"] == "known", uncertain
+    assert _amount(uncertain, "available_usd") == 100
+    assert _amount(uncertain, "buy_reserved_usd") == 0
+    assert uncertain["slots"]["occupied"] == uncertain["slots"]["canceling"] == 0
+    assert not uncertain["admission_block_reasons"]
 
     receipt_reads = []
 
@@ -757,7 +791,7 @@ def test_late_same_generation_snapshot_waits_without_overwriting_newer_account_t
 
 
 @pytest.mark.parametrize("reverse_input", [False, True], ids=["survivor-is-anchor", "victim-is-anchor"])
-def test_real_account_same_token_overcapacity_cancels_one_id_and_waits_for_terminal(runtime, reverse_input):
+def test_real_account_same_token_overcapacity_cancels_one_id_and_uses_fresh_account(runtime, reverse_input):
     orders = (
         _open_order("rank-a", "BUY", price="0.40", original="20"),
         _open_order("rank-b", "BUY", price="0.40", original="20"),
@@ -803,15 +837,16 @@ def test_real_account_same_token_overcapacity_cancels_one_id_and_waits_for_termi
     assert rotating["intents"] == []
     assert_survivor_protected()
 
-    # Cancellation acknowledgment plus absence is not an exact terminal fact.
+    # Current complete account facts release the absent order's slot without
+    # inventing a terminal receipt for the historical cancel audit.
     account.orders = tuple(order for order in orders if order.id == "rank-a")
     _advance(runtime)
     absent = execution.lp_auto_run_once(round_id="cancel-absent")
-    assert absent["slots"]["occupied"] == 2, absent
-    assert absent["slots"]["canceling"] == 1
-    assert _amount(absent, "buy_reserved_usd") == 16
-    assert absent["funds"]["available_usd"] is None
-    assert "cancel_terminal_unknown" in absent["block_reasons"]
+    assert absent["slots"]["occupied"] == 1, absent
+    assert absent["slots"]["canceling"] == 0
+    assert _amount(absent, "buy_reserved_usd") == 8
+    assert _amount(absent, "available_usd") == 8
+    assert not absent["admission_block_reasons"]
     assert account.cancels == [("rank-b",)]
     assert account.posts == account.market_orders == []
     assert absent["intents"] == []
@@ -882,17 +917,20 @@ class _FiveMarketPublic(_CandidateSDKPublic):
 
 @pytest.mark.parametrize("budget, expected_buys", [("100", 5), ("8", 0)],
                          ids=["target-five", "inventory-exhausts-budget"])
-def test_five_historical_holds_sync_then_refill_with_inventory_and_restart(runtime, budget, expected_buys):
+@pytest.mark.parametrize('history', ['matching', 'missing', 'different-quantity'])
+def test_five_historical_holds_sync_then_refill_with_inventory_and_restart(runtime, budget, expected_buys, history):
     from polymarket.models.clob import SignedOrder
 
     _, inventory_condition, inventory_token = _refill_identity(6)
-    maker = _maker_order("inventory-buy", "BUY", "20", "0.40").model_copy(update={"token_id": inventory_token})
-    fill = _trade("inventory-fill", maker, size="20").model_copy(update={
+    historical_quantity = '10' if history == 'different-quantity' else '20'
+    maker = _maker_order("inventory-buy", "BUY", historical_quantity, "0.40").model_copy(update={"token_id": inventory_token})
+    fill = _trade("inventory-fill", maker, size=historical_quantity).model_copy(update={
         "token_id": inventory_token, "market": inventory_condition, "condition_id": inventory_condition,
     })
     position = _position().model_copy(update={"token_id": inventory_token, "condition_id": inventory_condition})
     public = _FiveMarketPublic(runtime.clock)
-    store, adapter, account, lp, execution = runtime(public_client=public, trades=(fill,), positions=(position,))
+    trades = () if history == 'missing' else (fill,)
+    store, adapter, account, lp, execution = runtime(public_client=public, trades=trades, positions=(position,))
     execution.lp_auto_configure({"budget_usd": budget, "target_buy_count": 5})
     originals = _seed_unknowns(store, execution, count=5, amounts=("12", "17.46", "5.8", "14", "34"))
     assert _amount(execution.lp_auto_state(), "buy_reserved_usd") == Decimal("83.26")
@@ -967,7 +1005,7 @@ def test_five_historical_holds_sync_then_refill_with_inventory_and_restart(runti
     orders = account.orders
     adapter.close()
     _advance(runtime)
-    store, adapter, account, lp, execution = runtime(public_client=public, orders=orders, trades=(fill,), positions=(position,))
+    store, adapter, account, lp, execution = runtime(public_client=public, orders=orders, trades=trades, positions=(position,))
     for _ in range(2):
         assert execution.refresh_lp_dashboard_snapshot()["state"] == "ready"
         state = execution.lp_auto_state()

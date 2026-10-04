@@ -3002,3 +3002,98 @@ def test_old_live_history_is_not_current_positive_cancel_evidence(tmp_path, lane
     finally:
         adapter.lp_account_round_end(token)
         adapter.close()
+
+
+@pytest.mark.parametrize('terminal_reference', [
+    'owned_order_ids', 'entry_order_id', 'passive_exit_order_id',
+    'protected_exit_order_id', 'augment_order_ids',
+])
+def test_reconciliation_reads_only_unfinished_orders_after_repeated_replacement(tmp_path, terminal_reference):
+    engine, service, adapter, account, store = _historical_cancel_service(tmp_path)
+    session = store.lp_session('historical')
+    history = {
+        f'old-{index:02d}': {
+            'order_id': f'old-{index:02d}', 'side': 'SELL',
+            'token_id': session['token_id'], 'status': 'CANCELED',
+            'price': '0.30', 'quantity': '100', 'original_size': '100',
+            'size_matched': '0',
+        }
+        for index in range(12)
+    }
+    for oid, side in [('unknown-buy', 'BUY'), ('unknown-sell', 'SELL')]:
+        history[oid] = {'order_id': oid, 'side': side, 'token_id': session['token_id'],
+                        'status': 'UNKNOWN', 'quantity': '100', 'size_matched': '0'}
+    store.lp_update_session('historical', patch={
+        'entry_order_id': 'unknown-buy', 'passive_exit_order_id': 'unknown-sell',
+        'augment_order_ids': [], 'owned_order_ids': list(history), 'order_history': history,
+    })
+    if terminal_reference != 'owned_order_ids':
+        if terminal_reference in {'entry_order_id', 'augment_order_ids'}:
+            history['old-00']['side'] = 'BUY'
+        store.lp_update_session('historical', patch={
+            terminal_reference: ['old-00'] if terminal_reference == 'augment_order_ids' else 'old-00',
+            'order_history': history,
+        })
+    reads = []
+
+    def read_order(*, order_id):
+        reads.append(order_id)
+        return OpenOrder.parse_response(None)
+
+    account.get_order = read_order
+    try:
+        service.reconcile_facts('historical')
+        assert reads == ['unknown-buy', 'unknown-sell']
+        saved = store.lp_session('historical')
+        assert len(saved['owned_order_ids']) == 14
+        assert all(saved['order_history'][f'old-{index:02d}']['status'] == 'CANCELED'
+                   for index in range(12))
+        assert saved['orders_terminal'] is False
+        assert Decimal(saved['residual_quantity']) == Decimal('100')
+        # Reopening both consumers proves this is durable fact reuse, not an
+        # in-memory cache whose benefit disappears after a service restart.
+        adapter.close()
+        adapter = PolymarketTradingClient(adapter.config, account,
+            public_client_factory=adapter._public_client_factory)
+        service = PolymarketLPService(PredictionArbitrageStore(tmp_path), adapter)
+        reads.clear()
+        service.reconcile_facts('historical')
+        assert reads == ['unknown-buy', 'unknown-sell']
+        assert len(store.lp_session('historical')['owned_order_ids']) == 14
+    finally:
+        adapter.close()
+
+
+def test_terminal_receipt_reuse_keeps_exact_order_trade_validation(tmp_path):
+    engine, service, adapter, account, store = _historical_cancel_service(tmp_path)
+    history = store.lp_session('historical')['order_history']
+    history['order-1']['status'] = 'CANCELED'
+    store.lp_update_session('historical', patch={'order_history': history})
+    # The exact owned maker ID is the remaining relevance evidence when a
+    # historical response has a conflicting market and no top-level token.
+    trade = _history_trade(market='0x' + '9' * 64, asset_id='')
+    account.list_account_trades = lambda **kwargs: [trade]
+    try:
+        service.reconcile_facts('historical')
+        assert store.lp_session('historical')['facts_error'] == 'external_snapshot_unknown'
+    finally:
+        adapter.close()
+
+
+def test_current_open_order_overrides_reused_terminal_receipt(tmp_path):
+    engine, service, adapter, account, store = _historical_cancel_service(tmp_path)
+    history = store.lp_session('historical')['order_history']
+    history['order-1']['status'] = 'CANCELED'
+    store.lp_update_session('historical', patch={'order_history': history})
+    account.live = account.open_order.model_copy(update={
+        'id': 'order-1', 'side': 'BUY', 'status': 'LIVE', 'original_size': Decimal('200'),
+        'size_matched': Decimal('100'),
+    })
+    account.in_open_list = True
+    try:
+        service.reconcile_facts('historical')
+        saved = store.lp_session('historical')
+        assert saved['order_history']['order-1']['status'] == 'LIVE'
+        assert saved['orders_terminal'] is False
+    finally:
+        adapter.close()

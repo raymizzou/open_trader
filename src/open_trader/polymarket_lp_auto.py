@@ -280,8 +280,7 @@ class LPAutoPool:
             reasons.append('account_financial_facts_changed')
         if facts.get('financial_status') != 'known':
             reasons.extend(facts.get('reason_codes') or ['account_financial_facts_unknown'])
-        if any(_maybe_decimal(facts.get(key)) is None
-               for key in ('inventory_cost_usd', 'realized_pnl_usd')):
+        if _maybe_decimal(facts.get('inventory_cost_usd')) is None:
             reasons.append('account_financial_facts_unknown')
         buys = []
         seen = set()
@@ -357,7 +356,9 @@ class LPAutoPool:
         reserved = sum((_maybe_decimal(i.get('reserved_usd')) or ZERO for i in occupied), ZERO)
         reserved_unknown = any(_maybe_decimal(i.get('reserved_usd')) is None for i in occupied)
         allocated = sum((_decimal(a['amount_usd']) for a in d['allocations']), ZERO)
-        total = allocated + pnl
+        # The configured budget caps current exposure. Realized PnL is report
+        # data and never expands or shrinks the next order's spending limit.
+        total = _decimal(d['budget_usd']) if d['budget_usd'] is not None else ZERO
         uncertain = [i for i in intents if i.get('financial_status') == 'unknown'
                      or not self._funds_fresh(i) or i['state'] == 'unknown' or i.get('submission_unknown')]
         financial_unknown = bool(uncertain or account_reasons)
@@ -366,7 +367,7 @@ class LPAutoPool:
         # Unconfirmed proceeds/profits cannot increase the spendable lower bound.
         extra_hold = sum((max(ZERO, _decimal(i['price']) * _decimal(i['quantity'])
                             - _decimal(i.get('inventory_cost_usd', 0)) - _decimal(i['reserved_usd']))
-                          + max(ZERO, _decimal(i.get('realized_pnl_usd', 0))) for i in isolated), ZERO)
+                          for i in isolated), ZERO)
         spendable = max(ZERO, total - inventory - reserved - extra_hold)
 
         reasons = list(account_reasons)

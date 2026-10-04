@@ -261,8 +261,9 @@ def test_paused_inventory_exit_continues_and_confirmed_proceeds_fund_next_buy(tm
     assert exchange.posts[-1]["side"] == "BUY"
     assert exchange.posts[-1]["token_id"] == "m01"
     state = execution.lp_auto_state()
-    assert Decimal(state["funds"]["total_usd"]) == Decimal("8.20")
-    assert Decimal(state["funds"]["available_usd"]) == Decimal("0.20")
+    assert Decimal(state["funds"]["realized_pnl_usd"]) == Decimal("0.20")
+    assert Decimal(state["funds"]["total_usd"]) == Decimal("8")
+    assert Decimal(state["funds"]["available_usd"]) == Decimal("0")
 
 
 def test_existing_lp_card_keeps_real_auto_trading_controls_without_daily_summary(tmp_path):

@@ -54,10 +54,9 @@ def test_financial_facts_count_manual_partial_and_canceling_buys_once():
 
 
 @pytest.mark.parametrize('patch, reason', [
-    ({'positions': [dict(token_id='token', size='3', average_price='0.4')]}, 'position_cost_unknown'),
-    ({'positions': [dict(token_id='token', size='3')], 'raw_trades': [trade(fee=None)]}, 'trade_fee_unknown'),
-    ({'raw_trades': [trade()]}, 'position_mismatch'),
-    ({'open_orders': [order(size_matched='3')]}, 'order_fill_coverage_unknown'),
+    ({'positions': [dict(token_id='token', size='3')]}, 'account_position_cost_unknown'),
+    ({'positions': [dict(token_id='token', size='3', average_price='NaN')]}, 'account_position_cost_unknown'),
+    ({'positions': [dict(token_id='token', size='3', initial_value='-1')]}, 'account_position_cost_unknown'),
     ({'open_orders': [order(status='FILLED')]}, 'order_fill_coverage_unknown'),
 ])
 def test_uncertain_economics_never_publish_zero_cost(patch, reason):
@@ -65,14 +64,13 @@ def test_uncertain_economics_never_publish_zero_cost(patch, reason):
     assert facts['financial_status'] == 'unknown'
     assert reason in facts['reason_codes']
     assert facts['inventory_cost_usd'] is None
-    assert facts['realized_pnl_usd'] is None
 
 
 def test_realized_pnl_releases_chronological_cost_once():
     fills = [trade('buy', size='10'), trade('sell', oid='sell', side='SELL', size='4', price='0.6', at=NOW-timedelta(minutes=1))]
-    facts = build(raw_trades=fills, positions=[dict(token_id='token', size='6')])
+    facts = build(raw_trades=fills, positions=[dict(token_id='token', size='6', average_price='0.5')])
     assert facts['financial_status'] == 'known'
-    assert Decimal(facts['inventory_cost_usd']) == Decimal('2.4')
+    assert Decimal(facts['inventory_cost_usd']) == Decimal('3.0')
     assert Decimal(facts['realized_pnl_usd']) == Decimal('0.8')
 
 
@@ -178,15 +176,16 @@ def test_account_pnl_boundary_excludes_historical_profit_preserves_existing_pnl(
 
 def test_fresh_market_fee_metadata_matches_existing_maker_fee_rules():
     fill = trade(fee='100')
-    position = dict(token_id='token', size='3')
+    position = dict(token_id='token', size='3', average_price='0.4')
     facts = build(raw_trades=[fill], positions=[position], fee_metadata_by_token={
         'token': dict(fees_checked_at=NOW, fees_enabled=True, fee='0')})
     assert facts['financial_status'] == 'known'
     assert Decimal(facts['inventory_cost_usd']) == Decimal('1.2')
     stale = build(raw_trades=[fill], positions=[position], fee_metadata_by_token={
         'token': dict(fees_checked_at=NOW-timedelta(minutes=1), fees_enabled=True, fee='0')})
-    assert stale['financial_status'] == 'unknown'
-    assert 'trade_fee_unknown' in stale['reason_codes']
+    assert stale['financial_status'] == 'known'
+    assert stale['report_status'] == 'unknown'
+    assert 'trade_fee_unknown' in stale['report_reason_codes']
 
 
 def test_coverage_does_not_follow_changed_session_account_or_late_trade_callback(tmp_path):
@@ -269,7 +268,7 @@ def test_covered_unknown_request_resumes_real_owned_exposure_without_rewriting_a
     real = order('actual-order', original_size='3', size_matched='3' if inventory_only else '0',
                  status='FILLED' if inventory_only else 'LIVE')
     store.lp_register_exchange_orders(WALLET, 'token', [real], expected_generation=0)
-    facts = (build(raw_trades=[trade(oid='actual-order')], positions=[dict(token_id='token', size='3')])
+    facts = (build(raw_trades=[trade(oid='actual-order')], positions=[dict(token_id='token', size='3', average_price='0.4')])
              if inventory_only else build(open_orders=[real]))
     store.lp_publish_account_financial_facts(facts, expected_generation=0)
     session = store.lp_session('session')
@@ -360,7 +359,7 @@ def test_late_explicit_receipt_reuses_retired_empty_owner_without_restoring_hold
 
 
 @pytest.mark.parametrize('request_field', ['augment_cancel_requested', 'owned_cancel_requested', None])
-def test_accepted_nonentry_cancel_absence_keeps_slot_until_exact_terminal(tmp_path, request_field):
+def test_accepted_nonentry_cancel_absence_uses_current_account_buys(tmp_path, request_field):
     store = PredictionArbitrageStore(tmp_path / 'ledger.sqlite')
     seed(store)
     orders = [order('first'), order('victim')]
@@ -375,12 +374,9 @@ def test_accepted_nonentry_cancel_absence_keeps_slot_until_exact_terminal(tmp_pa
     facts = build(open_orders=[orders[0]], trade_generation=generation,
         read_started_at=NOW-timedelta(seconds=1), checked_at=NOW, read_ended_at=NOW)
     published = store.lp_publish_account_financial_facts(facts, expected_generation=generation)
-    assert len(published['buys']) == 2
-    victim = next(row for row in published['buys'] if row['order_id'] == 'victim')
-    assert victim['state'] == 'canceling'
-    assert Decimal(victim['reserved_usd']) == 4
-    assert published['financial_status'] == 'unknown'
-    assert 'cancel_terminal_unknown' in published['reason_codes']
+    assert [row['order_id'] for row in published['buys']] == ['first']
+    assert published['financial_status'] == 'known'
+    assert store.lp_actions('session')[-1]['state'] == 'accepted'
     store.lp_register_exchange_orders(WALLET, 'token', [order('victim', status='CANCELED')],
         expected_generation=generation)
     published = store.lp_publish_account_financial_facts(facts, expected_generation=generation)
@@ -389,20 +385,22 @@ def test_accepted_nonentry_cancel_absence_keeps_slot_until_exact_terminal(tmp_pa
 
 
 @pytest.mark.parametrize('trader_side', ['MAKER', 'TAKER'])
-def test_ambiguous_maker_ownership_cannot_prove_empty_account_or_release_hold(tmp_path, trader_side):
+def test_ambiguous_historical_maker_does_not_override_current_account_exposure(tmp_path, trader_side):
     store = PredictionArbitrageStore(tmp_path / 'ledger.sqlite')
     seed(store)
     raw = trade()
     raw['trader_side'] = trader_side
     raw['fee_rate_bps'] = '0'
     raw['maker_orders'][0].pop('maker_address')
-    facts = build(raw_trades=[raw], positions=[dict(token_id='token', size='3')] if trader_side == 'TAKER' else [])
-    assert facts['financial_status'] == 'unknown'
-    assert 'trade_ownership_unknown' in facts['reason_codes']
+    facts = build(raw_trades=[raw], positions=[dict(token_id='token', size='3', average_price='0.4')] if trader_side == 'TAKER' else [])
+    assert facts['financial_status'] == 'known'
+    assert facts['report_status'] == 'unknown'
+    assert 'trade_ownership_unknown' in facts['report_reason_codes']
+    assert Decimal(facts['inventory_cost_usd']) == (Decimal('1.2') if trader_side == 'TAKER' else 0)
     store.lp_publish_account_financial_facts(facts, expected_generation=0)
-    assert 'reservation_coverage' not in read_pool(store)['intents']['intent']
+    assert 'reservation_coverage' in read_pool(store)['intents']['intent']
     assert read_pool(store)['intents']['intent']['reserved_usd'] == '4'
-    assert store.lp_session('session')['state'] == 'needs_attention'
+    assert read_pool(store)['intents']['intent']['state'] == 'unknown'
 
 
 def test_explicit_foreign_maker_rows_are_excluded_from_account_economics():
@@ -445,9 +443,10 @@ def test_disappearing_confirmed_history_cannot_erase_closed_account_loss(tmp_pat
     elif change == 'fee':
         changed[0]['maker_orders'][0]['fee'] = '0'
     incomplete = observe(NOW+timedelta(seconds=10), changed)
-    assert incomplete['financial_status'] == 'unknown'
+    assert incomplete['financial_status'] == 'known'
+    assert incomplete['report_status'] == 'unknown'
     reason = 'account_trade_history_incomplete' if change == 'missing' else 'account_trade_history_conflict'
-    assert reason in incomplete['reason_codes']
+    assert reason in incomplete['report_reason_codes']
     assert incomplete['realized_pnl_usd'] is None
     assert read_pool(store)['account_realized_pnl_baseline_usd'] == baseline
     restored = observe(NOW+timedelta(seconds=15), trades)

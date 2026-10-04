@@ -6322,8 +6322,8 @@ class PredictionArbitrageStore:
                         and previous.get("read_ended_at") == value.get("read_ended_at")):
                     raise LpObservationWait("account_snapshot_conflict")
             # A complete-list flag does not prove the API retained its full
-            # historical window. Known confirmed economics are immutable: a
-            # disappearing or changed fill cannot erase a previously paid loss.
+            # historical window. Preserve reporting uncertainty when a known
+            # fill disappears or changes, without overriding current exposure.
             frontier = {(item["trade_id"], item["order_id"]): item["fingerprint"]
                 for item in document.get("account_confirmed_fill_facts", ())}
             current_confirmed = {(item["trade_id"], item["order_id"]): item["fingerprint"]
@@ -6332,14 +6332,13 @@ class PredictionArbitrageStore:
             conflicts = {key for key in set(frontier) & set(current_confirmed)
                          if frontier[key] != current_confirmed[key]}
             if missing or conflicts:
-                value["financial_status"] = "unknown"
-                history_reasons = set(value.get("reason_codes") or ())
+                value["report_status"] = "unknown"
+                history_reasons = set(value.get("report_reason_codes") or ())
                 if missing:
                     history_reasons.add("account_trade_history_incomplete")
                 if conflicts:
                     history_reasons.add("account_trade_history_conflict")
-                value["reason_codes"] = sorted(history_reasons)
-                value["inventory_cost_usd"] = None
+                value["report_reason_codes"] = sorted(history_reasons)
                 value["realized_pnl_usd"] = None
             for identity, fingerprint in current_confirmed.items():
                 frontier.setdefault(identity, fingerprint)
@@ -6360,15 +6359,14 @@ class PredictionArbitrageStore:
             # The raw trade window must also cover cumulative fills proven
             # by exact order receipts, including receipts whose execution fee
             # was not yet known and therefore never entered the fill frontier.
-            # Generic receipt merges remain monotonic; only account financial
-            # publication is blocked by this lower-coverage observation.
+            # Generic receipt merges remain monotonic; this affects reporting,
+            # while the current API positions still determine exposure.
             observed_fills = value.get("order_fills") or {}
             if any((_maybe_decimal((payload.get("order_history") or {}).get(oid, {}).get("size_matched")) or Decimal(0))
                    > (_maybe_decimal(observed_fills.get(oid)) or Decimal(0))
                    for oid, (_row, payload) in owners.items()):
-                value["financial_status"] = "unknown"
-                value["reason_codes"] = sorted(set(value.get("reason_codes") or ()) | {"account_order_fill_history_incomplete"})
-                value["inventory_cost_usd"] = None
+                value["report_status"] = "unknown"
+                value["report_reason_codes"] = sorted(set(value.get("report_reason_codes") or ()) | {"account_order_fill_history_incomplete"})
                 value["realized_pnl_usd"] = None
             buys = [dict(buy) for buy in value.get("buys", ())]
             actions_by_session = {}
@@ -6385,33 +6383,8 @@ class PredictionArbitrageStore:
                 actions = actions_by_session.setdefault(sid, self.lp_actions(sid, connection=tx))
                 if account_cancel_is_pending(payload, actions, buy["order_id"]):
                     buy["state"] = "canceling"
-            # Absence from an open list does not acknowledge a pending cancel.
-            # Keep its actual BUY slot until an exact-ID terminal fact arrives.
-            actual_ids = {buy["order_id"] for buy in buys}
-            for oid, (row, payload) in owners.items():
-                history = payload.get("order_history") or {}
-                record = history.get(oid, {})
-                if (oid in actual_ids or record.get("side") != "BUY"
-                        or str(record.get("status") or "").upper() in TERMINAL_ORDER_STATES):
-                    continue
-                sid = str(row["session_id"])
-                actions = actions_by_session.setdefault(sid, self.lp_actions(sid, connection=tx))
-                if not account_cancel_is_pending(payload, actions, oid):
-                    continue
-                original = _maybe_decimal(record.get("quantity", record.get("original_size")))
-                filled = _maybe_decimal(record.get("size_matched"))
-                price = _maybe_decimal(record.get("price"))
-                remaining = max(Decimal(0), original - filled) if original is not None and filled is not None else None
-                buys.append(dict(order_id=oid, session_id=sid, condition_id=payload.get("condition_id"),
-                    token_id=payload.get("token_id"), market_id=payload.get("market_id"), outcome=payload.get("outcome"),
-                    price=str(price) if price is not None else None,
-                    quantity=str(remaining) if remaining is not None else None,
-                    original_quantity=str(original) if original is not None else None,
-                    filled_quantity=str(filled) if filled is not None else None,
-                    reserved_usd=str(price * remaining) if price is not None and remaining is not None else None,
-                    state="canceling", financial_status="unknown", checked_at=value["checked_at"]))
-                value["financial_status"] = "unknown"
-                value["reason_codes"] = sorted(set(value.get("reason_codes") or ()) | {"cancel_terminal_unknown"})
+            # Current complete open-order facts determine occupancy. Historical
+            # cancel audit is retained, but never invents an absent BUY slot.
             value["buys"] = sorted(buys, key=lambda buy: buy["order_id"])
             value["trade_generation"] = generation
             intents = document.get("intents") or {}
@@ -6513,7 +6486,7 @@ class PredictionArbitrageStore:
                     payload["_lp_revision"] = self._lp_payload_revision(payload) + 1
                     tx.execute("UPDATE lp_sessions SET state='complete',payload=? WHERE session_id=?",
                         (_dump_execution_payload(payload), sid))
-            if value["financial_status"] == "known":
+            if value["financial_status"] == "known" and value.get("realized_pnl_usd") is not None:
                 lifetime_pnl = _maybe_decimal(value.get("realized_pnl_usd"))
                 if lifetime_pnl is None:
                     raise ValueError("account_realized_pnl_unknown")

@@ -71,7 +71,7 @@ def test_fill_only_execution_average_can_upgrade_to_actual_limit_and_original_si
     assert account.posts == account.cancels == []
 
 
-def test_public_empty_history_cannot_erase_durable_exact_receipt_fills(runtime):
+def test_api_empty_account_releases_exposure_without_rewriting_durable_fills(runtime):
     store, adapter, account, lp, execution = runtime(orders=(
         _open_order('receipt-buy', 'BUY', price='0.40', original='20'),))
     execution.lp_auto_configure({'budget_usd': '100', 'target_buy_count': 5})
@@ -87,8 +87,11 @@ def test_public_empty_history_cannot_erase_durable_exact_receipt_fills(runtime):
     result = lp.register_account_snapshot(fresh_snapshot(runtime, adapter, store))
     assert result['state'] == 'registered', result
     state = execution.lp_auto_state()
-    assert state['funds']['status'] == 'unknown'
-    assert state['funds']['available_usd'] is None
-    assert 'account_order_fill_history_incomplete' in state['block_reasons']
+    assert state['funds']['status'] == 'known'
+    assert Decimal(state['funds']['available_usd']) == 100
+    assert Decimal(state['funds']['inventory_cost_usd']) == 0
+    report = execution._auto_pool._read()['account_financial_facts']
+    assert report['report_status'] == 'unknown'
+    assert 'account_order_fill_history_incomplete' in report['report_reason_codes']
     assert Decimal(store.lp_session(sid)['order_history']['receipt-buy']['size_matched']) == 5
     assert account.posts == account.cancels == []
