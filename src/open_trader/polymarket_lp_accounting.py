@@ -55,6 +55,26 @@ def reservation_is_covered(row: Mapping[str, object], account_id: str | None = N
     return bool(marker.get('snapshot_id') and marker.get('read_started_at'))
 
 
+def reservation_is_manually_released(row: Mapping[str, object], account_id: str | None = None) -> bool:
+    """An operator waiver is local authority, never an account observation."""
+    marker = row.get('manual_reservation_release')
+    if not isinstance(marker, Mapping) or marker.get('version') != 1 or marker.get('state') != 'released':
+        return False
+    wallet = str(marker.get('account_id') or '').strip().casefold()
+    pool_account = hashlib.sha256(wallet.encode()).hexdigest()
+    return bool(wallet and marker.get('pool_account_id') == pool_account
+        and marker.get('session_id') == row.get('session_id')
+        and marker.get('released_at') and marker.get('reason')
+        and all(str(row.get(key) or '').strip().casefold() in {'', wallet, pool_account}
+                for key in ('account_id', 'wallet_address'))
+        and ('intent_id' not in row or marker.get('intent_id') == row.get('intent_id'))
+        and (account_id is None or str(account_id).strip().casefold() in {wallet, pool_account}))
+
+
+def reservation_is_released(row: Mapping[str, object], account_id: str | None = None) -> bool:
+    return reservation_is_covered(row, account_id) or reservation_is_manually_released(row, account_id)
+
+
 def _account_trade_report(snapshot, orders, positions, *, wallet, now):
     """Historical reporting can be incomplete without changing current exposure."""
     reasons: set[str] = set()
@@ -404,7 +424,7 @@ def can_resume_covered_management(session, actions, facts) -> bool:
     Account ownership can prove exposure without resolving which request made
     it. Stop decisions, exit uncertainty and unrelated attention remain intact.
     """
-    if (not reservation_is_covered(session, facts.get('account_id'))
+    if (not reservation_is_released(session, facts.get('account_id'))
             or facts.get('financial_status') != 'known'
             or session.get('state') not in {'needs_attention', 'entry_submit_pending'}
             or session.get('submit_status') not in {'unknown', 'accepted_without_order_id'}

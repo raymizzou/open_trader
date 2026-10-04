@@ -40,7 +40,7 @@ from .polymarket_lp_risk import (
     first_observation_baseline,
 )
 from .polymarket_lp_accounting import (
-    build_account_financial_facts, reservation_is_covered,
+    build_account_financial_facts, reservation_is_manually_released, reservation_is_released,
 )
 from .polymarket_lp_errors import LpObservationWait
 from .polymarket_lp_notification_batches import (
@@ -805,6 +805,8 @@ class PolymarketLPService:
             listener(self._invalidate_lp_account_round)
         self._protection_notifier: Callable[..., object] | None = None
         self._mutex = threading.RLock()
+        self._entry_sends: set[str] = set()
+        self._entry_sends_lock = threading.Lock()
         self._facts_owner = threading.local()
         self._facts_lock = threading.Lock()
         self._facts_apply_lock = threading.Lock()
@@ -6575,9 +6577,9 @@ class PolymarketLPService:
         for session in self.store.lp_active_sessions():
             if session.get("session_id") == ignore_session_id:
                 continue
-            if reservation_is_covered(session, account_id):
+            if reservation_is_released(session, account_id):
                 # The original entry request remains an UNKNOWN audit record,
-                # but its temporary hold was replaced by full account facts.
+                # its temporary hold was replaced by account facts or waived locally.
                 # Candidate account snapshots already count actual open IDs.
                 # A later independent BUY must never inherit entry coverage.
                 for action in self.store.lp_actions(str(session["session_id"])):
@@ -8830,7 +8832,24 @@ class PolymarketLPService:
                 expiration=expiration,
             )
 
-    def _entry_execute(
+    def entry_send_inflight(self, session_id: str) -> bool:
+        with self._entry_sends_lock:
+            return session_id in self._entry_sends
+
+    def _entry_execute(self, **kwargs) -> dict[str, object]:
+        # A durable legacy "sending" field is not proof of a live process.
+        # Track the real lane through receipt application and clean up on error.
+        session_id = kwargs.get('session_id') or uuid.uuid4().hex
+        kwargs['session_id'] = session_id
+        with self._entry_sends_lock:
+            self._entry_sends.add(session_id)
+        try:
+            return self._entry_execute_in_lane(**kwargs)
+        finally:
+            with self._entry_sends_lock:
+                self._entry_sends.discard(session_id)
+
+    def _entry_execute_in_lane(
         self,
         *,
         request: dict[str, object],
@@ -10738,7 +10757,7 @@ class PolymarketLPService:
                         patch.update(self._fill_patch(current, snapshot))
                         current = {**current, **patch}
                         receipt = self._order_history(current).get(str(current.get('entry_order_id')), {})
-                        if (not reservation_is_covered(current)
+                        if (not reservation_is_released(current)
                                 and receipt.get('status') not in (None, '', 'UNKNOWN')
                                 and current.get('submit_status') in ('unknown','accepted_without_order_id',None)):
                             patch.update(submit_status='accepted',resume_state=None)
@@ -16565,11 +16584,12 @@ class PolymarketLPService:
     def _has_unresolved_submission(session: Mapping[str, object]) -> bool:
         """Return whether any durable submit intent still lacks a terminal receipt."""
 
-        # Account coverage replaces only the ended original entry hold. Its
-        # UNKNOWN audit is not an independent in-flight SELL and must not
-        # prevent management of the actual orders/inventory in this group.
-        covered = reservation_is_covered(session)
-        if covered and str(session.get("submit_stage") or "") in {"preparing", "sending"}:
+        # Account coverage or an operator waiver removes only the original
+        # entry hold. Its UNKNOWN audit is not an independent in-flight SELL
+        # and must not prevent management of actual orders/inventory.
+        covered = reservation_is_released(session)
+        if (covered and not reservation_is_manually_released(session)
+                and str(session.get("submit_stage") or "") in {"preparing", "sending"}):
             return True
         if not covered:
             if str(session.get("state") or "") == "entry_submit_pending":

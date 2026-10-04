@@ -883,6 +883,17 @@ class PredictionExecutionService:
         from .polymarket_lp_risk import _freshness
         _freshness(account.get('checked_at'), self._lp._now(), 'account_facts', max_age=Decimal(60))
 
+    def lp_auto_reservations(self):
+        return self._lp_auto_pool().reservations()
+
+    def lp_auto_release_reservations(self, payload, *, audit=None):
+        result = self._lp_auto_pool().release_reservations(payload, audit=audit)
+        if result['released'] and result['state']['desired_running']:
+            scheduler = getattr(self._lp_auto_scheduler, 'request_check', None)
+            if callable(scheduler):
+                scheduler()
+        return result
+
     def lp_auto_configure(self, payload, *, audit=None):
         return self._lp_auto_pool().configure(payload, audit=audit)
 

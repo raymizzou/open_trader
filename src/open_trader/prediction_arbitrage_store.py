@@ -4753,6 +4753,33 @@ class PredictionArbitrageStore:
             assert row is not None
             return self._lp_row_result(row)
 
+    def _lp_manual_retirement_state(self, connection, session_id, payload, state):
+        """A late local callback cannot reopen a waived empty request container."""
+        from .polymarket_lp_accounting import reservation_is_manually_released
+        retired = payload.get("manual_release_retired")
+        account_retired = payload.get("account_coverage_retired")
+        api_retired = (isinstance(account_retired, Mapping)
+            and account_retired.get("reason") == "account_observation_no_exposure"
+            and account_retired.get("snapshot_id") and account_retired.get("checked_at"))
+        # Prior container retirement is durable. Current capital admission still
+        # checks fresh account facts; stale local fill audit cannot reopen it.
+        if (not api_retired and (not isinstance(retired, Mapping)
+                                 or retired.get("reason") != "operator_waived_provisional_hold")
+                or not reservation_is_manually_released({**payload, "session_id": str(session_id)})
+                or self._lp_owned_session_ids(payload)
+                or not api_retired and any((_maybe_decimal(payload.get(key)) or Decimal(0)) > 0
+                       for key in ("residual_quantity", "buy_filled_quantity"))
+                or any(payload.get(key) in {"pending", "unknown", "accepted_without_order_id"}
+                       for key in ("passive_exit_attempt_state", "protected_exit_attempt_state"))):
+            return state
+        if any(action.get("state") in {"pending", "unknown", "accepted_without_order_id"}
+               and ("cancel" in str(action.get("action_key") or "")
+                    or action.get("role") != "entry"
+                    and not str(action.get("action_key") or "").endswith("entry-submit"))
+               for action in self.lp_actions(str(session_id), connection=connection)):
+            return state
+        return "complete"
+
     def lp_update_session(
         self,
         session_id: str,
@@ -4770,7 +4797,7 @@ class PredictionArbitrageStore:
             payload = _load_payload(str(row["payload"]))
             if patch:
                 payload.update(patch)
-            next_state = str(state or row["state"])
+            next_state = self._lp_manual_retirement_state(connection, session_id, payload, str(state or row["state"]))
             try:
                 revision = int(payload.get("_lp_revision", 0))
             except (TypeError, ValueError):
@@ -5116,13 +5143,13 @@ class PredictionArbitrageStore:
                     active_id = candidate_id
                     active = candidate_item
                 elif unknown and active_id is None and expected_generation is None:
-                    from .polymarket_lp_accounting import reservation_is_covered
-                    retired = candidate_payload.get("account_coverage_retired")
+                    from .polymarket_lp_accounting import reservation_is_released
+                    retired = candidate_payload.get("account_coverage_retired") or candidate_payload.get("manual_release_retired")
                     covered_candidate = {**candidate_payload, "session_id": candidate_id}
                     if (str(candidate_item[0]["state"]) == "complete"
-                            and reservation_is_covered(covered_candidate, canonical_account)
+                            and reservation_is_released(covered_candidate, canonical_account)
                             and isinstance(retired, Mapping)
-                            and retired.get("reason") == "account_observation_no_exposure"
+                            and retired.get("reason") in {"account_observation_no_exposure", "operator_waived_provisional_hold"}
                             and not self._lp_owned_session_ids(candidate_payload)):
                         # A late explicit exchange receipt may arrive after a
                         # covered empty container retired. Reuse that container
@@ -6206,12 +6233,12 @@ class PredictionArbitrageStore:
         payload["facts_error"] = payload.get("facts_error") or "trade_change_pending"
         pool = connection.execute("SELECT payload FROM lp_auto_pool WHERE singleton=1").fetchone()
         if pool:
-            from .polymarket_lp_accounting import reservation_is_covered
+            from .polymarket_lp_accounting import reservation_is_released
             document = _load_payload(str(pool[0]))
             changed = False
             for intent in document.get("intents", {}).values():
                 if (intent.get("session_id") == session_id and intent.get("state") != "reserved"
-                        and not reservation_is_covered(intent, document.get("account_id"))):
+                        and not reservation_is_released(intent, document.get("account_id"))):
                     intent.update(financial_status="unknown", reconcile_reason="trade_change_pending", settled=False)
                     changed = True
             if changed:
@@ -6281,7 +6308,7 @@ class PredictionArbitrageStore:
         from .polymarket_lp_accounting import (
             account_cancel_is_pending, account_position_quantity,
             can_resume_covered_management, default_account_pool_document,
-            ended_reservation_evidence, reservation_is_covered,
+            ended_reservation_evidence, reservation_is_covered, reservation_is_released,
         )
         value = _load_payload(_dump_execution_payload(facts))
         account = str(value.get("account_id") or "").strip().casefold()
@@ -6420,7 +6447,7 @@ class PredictionArbitrageStore:
             retained = []
             if value["financial_status"] == "known":
                 for intent_id, intent in intents.items():
-                    if reservation_is_covered(intent, pool_account):
+                    if reservation_is_released(intent, pool_account):
                         continue
                     sid = str(intent.get("session_id") or "")
                     entry = sessions.get(sid)
@@ -6445,11 +6472,11 @@ class PredictionArbitrageStore:
                     tx.execute("UPDATE lp_sessions SET payload=? WHERE session_id=?",
                         (_dump_execution_payload(payload), sid))
             else:
-                retained = [key for key, intent in intents.items() if not reservation_is_covered(intent, pool_account)]
+                retained = [key for key, intent in intents.items() if not reservation_is_released(intent, pool_account)]
             value["retained_reservation_ids"] = sorted(retained)
             if value["financial_status"] == "known":
                 for intent in intents.values():
-                    if not reservation_is_covered(intent, pool_account):
+                    if not reservation_is_released(intent, pool_account):
                         continue
                     sid = str(intent.get("session_id") or "")
                     entry = sessions.get(sid)
@@ -6495,10 +6522,10 @@ class PredictionArbitrageStore:
                     carried_pnl = Decimal(0)
                     if document.get("allocations") or document.get("ever_enabled"):
                         for intent in intents.values():
-                            if not reservation_is_covered(intent, pool_account):
+                            if not reservation_is_released(intent, pool_account):
                                 continue
                             pnl = _maybe_decimal(intent.get("realized_pnl_usd"))
-                            if pnl is not None and (pnl < 0 or intent.get("financial_status") == "known"):
+                            if pnl is not None and (pnl < 0 or reservation_is_covered(intent, pool_account) and intent.get("financial_status") == "known"):
                                 carried_pnl += pnl
                     # The first observation must not turn historical account
                     # profits into new allocation. Preserve already-accounted
@@ -6544,7 +6571,8 @@ class PredictionArbitrageStore:
             payload["_lp_revision"] = self._lp_payload_revision(payload) + 1
             connection.execute(
                 "UPDATE lp_sessions SET state=?,payload=?,updated_at=? WHERE session_id=?",
-                (state or row["state"], _dump_execution_payload(payload), _utc_now(), str(session_id)),
+                (self._lp_manual_retirement_state(connection, session_id, payload, state or row["state"]),
+                 _dump_execution_payload(payload), _utc_now(), str(session_id)),
             )
             row = connection.execute(
                 "SELECT * FROM lp_sessions WHERE session_id=?", (str(session_id),)

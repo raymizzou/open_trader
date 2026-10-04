@@ -13,6 +13,7 @@ import uuid
 import threading
 from time import monotonic
 from contextlib import contextmanager, nullcontext
+from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
@@ -20,7 +21,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Mapping
 
-from .polymarket_lp_accounting import default_account_pool_document, reservation_is_covered
+from .polymarket_lp_accounting import account_position_quantity, default_account_pool_document, reservation_is_covered, reservation_is_manually_released, reservation_is_released
 from .polymarket_lp_risk import (
     TERMINAL_ORDER_STATES, _account_after_reservations, _decimal as _money, _freshness, _levels,
     _maybe_decimal, _timestamp, evaluate_lp_entry, estimate_lp_target_share_yield,
@@ -249,7 +250,9 @@ class LPAutoPool:
         # Only the original bounded BUY belongs to this automatic allocation.
         # Additional BUY actions or identity conflicts need account-wide review.
         session = self.store.lp_session(intent['session_id'])
-        if (not session or session.get('order_identity_conflict')
+        if (_maybe_decimal(intent.get('inventory_cost_usd', 0)) is None
+                or _maybe_decimal(intent.get('reserved_usd')) is None
+                or not session or session.get('order_identity_conflict')
                 or intent.get('order_identity_conflict')
                 or 'identity' in str(intent.get('reconcile_reason') or '')
                 or intent.get('reconcile_reason') in {'owned_order_token_mismatch', 'owned_order_side_mismatch'}):
@@ -264,7 +267,8 @@ class LPAutoPool:
         wait_reason = waiting['reason'] if waiting else None
         reasons = []
         if facts is None:
-            return None, [], [wait_reason] if wait_reason else []
+            return None, [], ([wait_reason] if wait_reason else
+                ['account_financial_facts_unknown'] if any(reservation_is_manually_released(i, d['account_id']) for i in d['intents'].values()) else [])
         if not isinstance(facts, Mapping):
             return {}, [], [*([wait_reason] if wait_reason else []), 'account_financial_facts_unknown']
         wallet = str(facts.get('account_id') or '').strip().casefold()
@@ -339,7 +343,7 @@ class LPAutoPool:
         audit_intents = list(d['intents'].values())
         # Coverage is a one-way replacement, not a new interpretation of the
         # original submission. Its audit survives late callbacks unchanged.
-        intents = [i for i in audit_intents if not reservation_is_covered(i, d['account_id'])]
+        intents = [i for i in audit_intents if not reservation_is_released(i, d['account_id'])]
         account, account_buys, account_reasons = self._account_projection_facts(d)
         occupied = [i for i in intents if i['state'] not in ('terminal','rejected','aborted')]
         occupied += account_buys
@@ -347,7 +351,17 @@ class LPAutoPool:
         pending_review = [i for i in pending if i['state']=='unknown']
         canceling = [i for i in occupied if i['state']=='canceling']
         pnl = sum((_decimal(i.get('realized_pnl_usd',0)) for i in intents), ZERO)
-        inventory = sum((_decimal(i.get('inventory_cost_usd',0)) for i in intents), ZERO)
+        inventory_unknown = any(_maybe_decimal(i.get('inventory_cost_usd', 0)) is None for i in intents)
+        inventory = sum((_maybe_decimal(i.get('inventory_cost_usd', 0)) or ZERO for i in intents), ZERO)
+        manual_inventory_unknown = account is None and any(
+            reservation_is_manually_released(i, d['account_id']) and _maybe_decimal(i.get('inventory_cost_usd')) is None
+            for i in audit_intents)
+        if account is None:
+            # Historical loss audit stays report data; the configured budget is fixed.
+            pnl += sum((min(ZERO, _maybe_decimal(i.get('realized_pnl_usd')) or ZERO) for i in audit_intents
+                        if reservation_is_manually_released(i, d['account_id'])), ZERO)
+            inventory += sum((_maybe_decimal(i.get('inventory_cost_usd')) or ZERO for i in audit_intents
+                              if reservation_is_manually_released(i, d['account_id'])), ZERO)
         if account is not None:
             # Unknown components remain unknown; zeros here are display-only
             # lower bounds and cannot reach either spendability field.
@@ -361,7 +375,7 @@ class LPAutoPool:
         total = _decimal(d['budget_usd']) if d['budget_usd'] is not None else ZERO
         uncertain = [i for i in intents if i.get('financial_status') == 'unknown'
                      or not self._funds_fresh(i) or i['state'] == 'unknown' or i.get('submission_unknown')]
-        financial_unknown = bool(uncertain or account_reasons)
+        financial_unknown = bool(uncertain or account_reasons or inventory_unknown)
         isolated = [i for i in uncertain if self._isolatable(i)]
         # Hold the entire original principal even if old receipts released it.
         # Unconfirmed proceeds/profits cannot increase the spendable lower bound.
@@ -371,6 +385,8 @@ class LPAutoPool:
         spendable = max(ZERO, total - inventory - reserved - extra_hold)
 
         reasons = list(account_reasons)
+        if inventory_unknown:
+            reasons.append('inventory_cost_unknown')
         sync_error = getattr(self.lp, '_account_order_sync_error', None)
         if sync_error:
             reasons.append(sync_error)
@@ -394,7 +410,7 @@ class LPAutoPool:
             admission_reasons.append('unbounded_financial_uncertainty')
         funds = dict(spendable_usd=str(spendable) if not admission_reasons else None,
                      isolated_reserved_usd=str(extra_hold), total_usd=str(total), available_usd=None if financial_unknown else str(max(ZERO,total-inventory-reserved)),
-                     inventory_cost_usd=(None if account is not None and _maybe_decimal(account.get('inventory_cost_usd')) is None else str(inventory)),
+                     inventory_cost_usd=(None if inventory_unknown or manual_inventory_unknown or account is not None and _maybe_decimal(account.get('inventory_cost_usd')) is None else str(inventory)),
                      buy_reserved_usd=None if reserved_unknown else str(reserved),
                      pending_reserved_usd=(None if any(_maybe_decimal(i.get('reserved_usd')) is None for i in pending)
                          else str(sum((_decimal(i['reserved_usd']) for i in pending), ZERO))),
@@ -420,6 +436,165 @@ class LPAutoPool:
     def state(self, *, include_intents=True):
         return self._projection(self._read(), include_intents=include_intents)
 
+    def _manual_current_account_empty(self, document, session):
+        """Current API evidence can retire a waived container, not its audit."""
+        facts, _, reasons = self._account_projection_facts(document)
+        token = str(session.get('token_id') or '')
+        return (bool(token) and facts is not None and not reasons
+            and not getattr(self.lp, '_account_order_sync_error', None)
+            and facts.get('version') == 2 and facts.get('inventory_basis') == 'api_positions'
+            and bool(facts.get('snapshot_id')) and account_position_quantity(facts, token) == ZERO
+            and token not in facts.get('open_order_tokens', ()))
+
+    def _manual_reservations(self, document, connection):
+        wallet = str(getattr(getattr(self.lp.exchange, 'config', None), 'wallet_address', '') or '').strip().casefold()
+        rows = []
+        bindings = Counter(str(i.get('session_id') or '') for i in document['intents'].values())
+        for iid, intent in document['intents'].items():
+            sid = str(intent.get('session_id') or '')
+            raw = connection.execute('SELECT * FROM lp_sessions WHERE session_id=?', (sid,)).fetchone()
+            session = self.store._lp_row_result(raw) if raw else {}
+            actions = self.store.lp_actions(sid, connection=connection) if raw else []
+            marker = intent.get('manual_reservation_release')
+            reason = None
+            if (not wallet or document['account_id'] != self.execution._lp_account_id()
+                    or hashlib.sha256(wallet.encode()).hexdigest() != document['account_id']):
+                reason = 'account_identity_unknown'
+            elif any(str(row.get(key) or '').strip().casefold() not in {'', wallet, document['account_id']}
+                     for row in (intent, session) for key in ('account_id', 'wallet_address')):
+                reason = 'foreign_account'
+            elif reservation_is_manually_released(intent, document['account_id']):
+                reason = 'already_released'
+            elif reservation_is_covered(intent, document['account_id']):
+                reason = 'account_covered'
+            elif not raw:
+                reason = 'session_missing'
+            elif self.lp.entry_send_inflight(sid):
+                reason = 'send_inflight'
+            elif bindings[sid] != 1:
+                reason = 'session_binding_conflict'
+            elif (intent.get('state') not in {'unknown', 'reserved', 'sending'}
+                  or session.get('submit_status') not in {None, '', 'pending', 'unknown', 'accepted_without_order_id'}):
+                reason = 'not_unknown_entry'
+            elif (intent.get('order_id') or self.store._lp_owned_session_ids(session)
+                  or any(action.get('order_id') for action in actions if action.get('role') == 'entry')):
+                reason = 'order_identity_known'
+            elif (any(session.get(key) in {'pending', 'unknown', 'accepted_without_order_id'}
+                      for key in ('passive_exit_attempt_state', 'protected_exit_attempt_state'))
+                  or any(action.get('state') in {'pending', 'unknown', 'accepted_without_order_id'}
+                     and ('cancel' in str(action.get('action_key') or '')
+                          or action.get('role') != 'entry'
+                          and not str(action.get('action_key') or '').endswith('entry-submit')) for action in actions)):
+                reason = 'independent_action_unresolved'
+            amount = _maybe_decimal(intent.get('reserved_usd'))
+            if reason is None and intent.get('reserved_usd') is not None and (amount is None or amount < ZERO):
+                reason = 'reservation_amount_unknown'
+            event = document['events'].get(f'{iid}:unknown', {})
+            rows.append(dict(intent_id=iid, session_id=sid,
+                amount_usd=str(amount) if amount is not None else None,
+                **{key: intent.get(key) for key in ('market_id', 'condition_id', 'token_id')},
+                original_unknown_reason=event.get('reason') or intent.get('reconcile_reason') or session.get('facts_error') or 'submission_unknown',
+                eligible=reason is None, exclusion_reason=reason,
+                manual_reservation_release=deepcopy(marker),
+                reservation_version=hashlib.sha256(json.dumps({key: intent.get(key) for key in
+                    ('session_id', 'created_at', 'config_version', 'state', 'reserved_usd', 'price', 'quantity', 'order_id', 'account_id')},
+                    sort_keys=True, default=_json).encode()).hexdigest(),
+                session_revision=int(json.loads(raw['payload']).get('_lp_revision', 0)) if raw else None))
+        return rows
+
+    def reservations(self):
+        # Selection and its session fences come from one read-only snapshot.
+        with self.store._read_connection() as connection:
+            connection.execute('BEGIN')
+            row = connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()
+            document = json.loads(row[0]) if row else self._default()
+            reservations = self._manual_reservations(document, connection)
+        return dict(reservations=reservations, account_id=document['account_id'], desired_running=document['desired_running'])
+
+    def release_reservations(self, payload, *, audit=None):
+        single = 'intent_id' in payload
+        expected = {'confirm', 'reason', 'intent_id' if single else 'all_releasable'}
+        if set(payload) != expected or payload.get('confirm') is not True:
+            raise ValueError('manual_release_selection_or_confirmation_invalid')
+        if single:
+            if not isinstance(payload['intent_id'], str) or not payload['intent_id'].strip():
+                raise ValueError('intent_id_invalid')
+        elif payload['all_releasable'] is not True:
+            raise ValueError('all_releasable_must_be_true')
+        reason = payload['reason']
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 500:
+            raise ValueError('manual_release_reason_invalid')
+        selection = self.reservations()['reservations']
+        selected = {row['intent_id']: row for row in selection
+                    if not single or row['intent_id'] == payload['intent_id']}
+        released, already, skipped = [], [], []
+        if single and not selected:
+            skipped.append(dict(intent_id=payload['intent_id'], reason='intent_not_found', amount_usd=None))
+        wallet = str(getattr(getattr(self.lp.exchange, 'config', None), 'wallet_address', '') or '').strip().casefold()
+        # Same lock order as auto entry admission; no network or venue action.
+        with self._send_barrier():
+            lock = self.execution._acquire_global_lock()
+            if lock is None:
+                raise ValueError('execution_lock')
+            try:
+                with self.lp._mutex, self.store._transaction() as connection:
+                    def apply(document):
+                        current = {row['intent_id']: row for row in self._manual_reservations(document, connection)}
+                        for iid, chosen in selected.items():
+                            row = current.get(iid)
+                            result = {key: (row or chosen).get(key) for key in ('intent_id', 'session_id', 'amount_usd')}
+                            if row and row['exclusion_reason'] == 'already_released':
+                                already.append(result)
+                                continue
+                            exclusion = chosen['exclusion_reason'] or (row['exclusion_reason'] if row else 'intent_not_found')
+                            if exclusion is None and (row['session_id'], row['session_revision']) != (chosen['session_id'], chosen['session_revision']):
+                                exclusion = 'session_changed'
+                            if exclusion is None and row['reservation_version'] != chosen['reservation_version']:
+                                exclusion = 'reservation_changed'
+                            if exclusion:
+                                skipped.append(dict(**result, reason=exclusion))
+                                continue
+                            intent = document['intents'][iid]
+                            marker = dict(version=1, state='released', intent_id=iid, session_id=row['session_id'],
+                                account_id=wallet, pool_account_id=document['account_id'], released_at=self._stamp(),
+                                amount_usd=row['amount_usd'], original_reserved_usd=intent.get('reserved_usd'),
+                                original_unknown_reason=row['original_unknown_reason'], reason=reason.strip(),
+                                selection={'intent_id': iid} if single else {'all_releasable': True},
+                                actor=deepcopy(audit or {'actor': 'local_operator'}))
+                            intent['manual_reservation_release'] = marker
+                            raw = connection.execute('SELECT * FROM lp_sessions WHERE session_id=?', (row['session_id'],)).fetchone()
+                            session = json.loads(raw['payload'])
+                            marker['original_session_state'] = raw['state']
+                            marker['original_submit_status'] = session.get('submit_status')
+                            marker['original_entry_actions'] = [a for a in self.store.lp_actions(row['session_id'], connection=connection)
+                                if a.get('role') == 'entry' or str(a.get('action_key') or '').endswith('entry-submit')]
+                            session['manual_reservation_release'] = marker
+                            session['_lp_revision'] = int(session.get('_lp_revision', 0)) + 1
+                            session['_lp_trade_revision'] = int(session.get('_lp_trade_revision', 0)) + 1
+                            state = raw['state']
+                            local_empty = not any((_maybe_decimal(session.get(key)) or ZERO) > ZERO
+                                for key in ('residual_quantity', 'buy_filled_quantity'))
+                            api_empty = self._manual_current_account_empty(document, session)
+                            if local_empty or api_empty:
+                                # Retire only the request container; preserve all
+                                # quantities and reuse only real published API facts.
+                                session['manual_release_retired'] = dict(reason='operator_waived_provisional_hold', released_at=marker['released_at'])
+                                if api_empty and not local_empty:
+                                    facts = document['account_financial_facts']
+                                    session['account_coverage_retired'] = dict(reason='account_observation_no_exposure',
+                                        snapshot_id=facts['snapshot_id'], checked_at=facts['checked_at'])
+                                state = 'complete'
+                            connection.execute('UPDATE lp_sessions SET state=?,payload=? WHERE session_id=?',
+                                (state, json.dumps(session, default=_json), row['session_id']))
+                            self._event(document, intent, 'manual_reservation_release', **marker)
+                            released.append(result)
+                    self._update(apply, connection=connection)
+            finally:
+                self.execution._release_global_lock(lock)
+        return dict(released=released, already_released=already, skipped=skipped,
+                    released_amount_usd=(None if any(row['amount_usd'] is None for row in released)
+                        else str(sum((Decimal(row['amount_usd']) for row in released), ZERO))), state=self.state())
+
     def configure(self, payload, *, audit=None):
         if not isinstance(payload, dict) or set(payload)-{'budget_usd','target_buy_count','expected_config_version'}:
             raise ValueError('auto_config_invalid')
@@ -434,7 +609,7 @@ class LPAutoPool:
             initial_account_setup = (d['config_version'] == 0 and d['budget_usd'] is None
                 and not d['ever_enabled'] and d.get('account_financial_facts') is not None
                 and not any(i['state'] not in ('terminal', 'rejected', 'aborted')
-                    and not reservation_is_covered(i, d['account_id']) for i in d['intents'].values()))
+                    and not reservation_is_released(i, d['account_id']) for i in d['intents'].values()))
             if d['desired_running'] or (state['slots']['occupied'] and not initial_account_setup):
                 raise ValueError('pause_and_finish_automatic_buys_before_configuring')
             if payload.get('expected_config_version',d['config_version'])!=d['config_version']:
@@ -467,6 +642,21 @@ class LPAutoPool:
         for session in self.store.lp_sessions():
             if session.get('session_id')==ignore or session.get('condition_id')!=condition_id:
                 continue
+            if (reservation_is_manually_released(session, self.execution._lp_account_id())
+                    and not self.lp._session_order_ids(session)
+                    and not self.lp._has_unresolved_submission(session)):
+                local_empty = session.get('manual_release_retired') and not any(
+                    (_maybe_decimal(session.get(key)) or ZERO) > ZERO
+                    for key in ('residual_quantity', 'buy_filled_quantity'))
+                account_empty = False
+                if session.get('state') == 'complete' and session.get('account_coverage_retired'):
+                    account_empty = self._manual_current_account_empty(self._read(), session)
+                independent = any(a.get('state') in {'pending', 'unknown', 'accepted_without_order_id'}
+                    and ('cancel' in str(a.get('action_key') or '') or a.get('role') != 'entry'
+                         and not str(a.get('action_key') or '').endswith('entry-submit'))
+                    for a in self.store.lp_actions(str(session['session_id'])))
+                if (local_empty or account_empty) and not independent:
+                    continue
             if session.get('state') not in ('complete','entry_rejected'):
                 history=self.lp._order_history(session)
                 buys=[h for h in history.values() if h.get('side')=='BUY']
@@ -543,7 +733,7 @@ class LPAutoPool:
 
     def _ranked_buys(self, state):
         """Rank actual BUY IDs and candidates on the same yield basis."""
-        active = [i for i in state['intents'] if not reservation_is_covered(i, state['account_id'])
+        active = [i for i in state['intents'] if not reservation_is_released(i, state['account_id'])
                   and i['state'] not in ('terminal', 'rejected', 'aborted')]
         active += state.get('account_buys', [])
         if len(active) < state['target_buy_count']:
@@ -705,7 +895,7 @@ class LPAutoPool:
                     released_ids = {self._buy_identity(r) for r in [*victims, *targets] if self._resting_buy(r)}
                     available = _decimal(state['funds']['spendable_usd']) + sum(
                         (_decimal(i['reserved_usd']) for i in [*state['intents'], *state.get('account_buys', [])]
-                         if not reservation_is_covered(i, state['account_id']) and self._buy_identity(i) in released_ids), ZERO)
+                         if not reservation_is_released(i, state['account_id']) and self._buy_identity(i) in released_ids), ZERO)
                     if capital > available:
                         raise ValueError('top_yield_funds_insufficient')
                     def record(d):
@@ -851,7 +1041,7 @@ class LPAutoPool:
         def apply(d):
             reason = None
             for intent in d['intents'].values():
-                if reservation_is_covered(intent, d['account_id']):
+                if reservation_is_released(intent, d['account_id']):
                     if intent.get('rotation_requested_at') and not intent.get('rotation_settled_at') and intent.get('order_id'):
                         # Preserve an already requested exact-ID cancellation
                         # when its financial reservation becomes covered.
@@ -910,7 +1100,7 @@ class LPAutoPool:
             selected = document['intents'].get(intent_id)
             due = 'attention_recovery_due' if recovery else 'attention_due'
             if (not selected or selected.get('account_baseline_archive')
-                    or reservation_is_covered(selected, document['account_id']) or not selected.get(due)):
+                    or reservation_is_released(selected, document['account_id']) or not selected.get(due)):
                 return
             reason = selected.get('reconcile_error') or selected.get('reconcile_reason') or 'unknown'
             if not recovery and self.lp._attention_internal_wait(reason):
@@ -946,7 +1136,7 @@ class LPAutoPool:
                 return key, attempted, delivered
             rows = []
             for intent in document['intents'].values():
-                if (intent.get('account_baseline_archive') or reservation_is_covered(intent, document['account_id'])
+                if (intent.get('account_baseline_archive') or reservation_is_released(intent, document['account_id'])
                         or not intent.get(due) or not (intent.get('attention_episode') or intent.get('attention_since'))):
                     continue
                 if group and intent.get(group_key) != group:
@@ -966,7 +1156,7 @@ class LPAutoPool:
                     if patch:
                         def remember(d):
                             current = d['intents'].get(intent['intent_id'])
-                            if (current and not current.get('account_baseline_archive') and not reservation_is_covered(current, d['account_id'])
+                            if (current and not current.get('account_baseline_archive') and not reservation_is_released(current, d['account_id'])
                                     and current.get('attention_episode') == intent.get('attention_episode')):
                                 current.update(patch)
                         self._update(remember)
@@ -990,7 +1180,7 @@ class LPAutoPool:
                 for before in rows:
                     current = d['intents'].get(before['intent_id'])
                     episode = before.get('attention_episode') or before.get('attention_since')
-                    if (not current or current.get('account_baseline_archive') or reservation_is_covered(current, d['account_id']) or not current.get(due)
+                    if (not current or current.get('account_baseline_archive') or reservation_is_released(current, d['account_id']) or not current.get(due)
                             or (current.get('attention_episode') or current.get('attention_since')) != episode
                             or any(current.get(name) != before.get(name) for name in ('session_id', 'condition_id', 'token_id'))):
                         continue
@@ -1042,7 +1232,7 @@ class LPAutoPool:
                 def member_state(member, batch, channel):
                     current = d['intents'].get(member['id'])
                     proof = session_proof(member['session_id'])
-                    if (not current or not proof or current.get('account_baseline_archive') or reservation_is_covered(current, d['account_id']) or proof.get('account_baseline_archive')
+                    if (not current or not proof or current.get('account_baseline_archive') or reservation_is_released(current, d['account_id']) or proof.get('account_baseline_archive')
                             or proof.get('state') == 'account_baseline_archived'
                             or d['account_id'] != member['account_id']
                             or self.execution._lp_account_id() != member['account_id']
@@ -1138,7 +1328,7 @@ class LPAutoPool:
                 attempted_key = 'attention_recovery_attempted_channels' if recovery else 'attention_attempted_channels'
                 delivered_key = 'attention_recovery_delivered_channels' if recovery else 'attention_delivered_channels'
                 intent=d['intents'].get(current_id)
-                if (intent is None or intent.get('account_baseline_archive') or reservation_is_covered(intent, d['account_id'])
+                if (intent is None or intent.get('account_baseline_archive') or reservation_is_released(intent, d['account_id'])
                         or intent.get('attention_episode') != str(episode)):
                     continue
                 batch_key = 'attention_recovery_delivery_batches' if recovery else 'attention_delivery_batches'
@@ -1201,7 +1391,7 @@ class LPAutoPool:
         for key, result in list(self._attention_delivery_results.items()):
             intent_id, recovery, episode = key
             current = document['intents'].get(intent_id)
-            if (not current or current.get('account_baseline_archive') or reservation_is_covered(current, document['account_id'])
+            if (not current or current.get('account_baseline_archive') or reservation_is_released(current, document['account_id'])
                     or current.get('attention_episode') != episode):
                 self._attention_delivery_results.pop(key, None)
                 continue
@@ -1214,7 +1404,7 @@ class LPAutoPool:
         if acknowledged:
             document=self._read()
         intents=document['intents'].values()
-        selected=[i for i in intents if not i.get('account_baseline_archive') and not reservation_is_covered(i, document['account_id'])
+        selected=[i for i in intents if not i.get('account_baseline_archive') and not reservation_is_released(i, document['account_id'])
                   and (session_id is None or i.get('session_id')==session_id)]
         for intent in selected:
             if intent.get('attention_recovery_due'):
@@ -1305,7 +1495,7 @@ class LPAutoPool:
             return result
         def apply(d):
             i=d['intents'][intent_id]
-            if reservation_is_covered(i, d['account_id']):
+            if reservation_is_released(i, d['account_id']):
                 return
             now=self._now()
             if error:
@@ -1543,7 +1733,7 @@ class LPAutoPool:
         d=self._read()
         if not d['account_id'] or d['account_id']!=self.execution._lp_account_id():
             return self._projection(d)
-        intents = [i for i in d['intents'].values() if not i.get('account_baseline_archive') and not reservation_is_covered(i, d['account_id'])
+        intents = [i for i in d['intents'].values() if not i.get('account_baseline_archive') and not reservation_is_released(i, d['account_id'])
                    and (not i.get('settled') or i.get('attention_recovery_due'))]
         if bounded:
             # Persistent per-intent jobs: a slow read never owns the auto-round
@@ -1608,7 +1798,7 @@ class LPAutoPool:
             return
         for intent in d['intents'].values():
             if (intent.get('settled') and intent.get('attention_recovery_due') and not intent.get('account_baseline_archive')
-                    and not reservation_is_covered(intent, d['account_id'])):
+                    and not reservation_is_released(intent, d['account_id'])):
                 if session_id is None:
                     self.lp._schedule_session_attention(intent['session_id'], apply_lock=apply_lock)
                 elif intent['session_id'] == session_id:
@@ -1633,7 +1823,7 @@ class LPAutoPool:
             self.reconcile_attention(apply_lock=(self.execution._acquire_global_lock, self.execution._release_global_lock))
 
     def _reconcile_intent(self, i, *, reuse, account_round=None):
-        if i.get('account_baseline_archive') or reservation_is_covered(i, self.execution._lp_account_id()):
+        if i.get('account_baseline_archive') or reservation_is_released(i, self.execution._lp_account_id()):
             return
         if i.get('settled') and i.get('attention_recovery_due'):
             self.lp.verify_session_recovery(i['session_id'], account_round=account_round,
