@@ -478,6 +478,114 @@ Measured results and failed attempts are recorded in the
 Deployment Preflight, cloud Host Readiness, Smoke and explicit deployment
 authorization still apply; no probe bypasses those gates.
 
+## Offline recovery of a stopped LP preparation cycle
+
+A persisted `lp_preparation` pause remains paused after restart. Fixing the
+failure does not itself re-arm that cycle. In Shadow, all Prediction mutation
+POSTs remain prohibited, including the production dashboard's
+`manual_recovery` request. Do not change mode or bypass the HTTP guard.
+
+The supported `recover-preparation` action is an explicit offline operation.
+It requires a stopped authenticated **file-backed Shadow with N-leg paused**,
+the official `/etc/open-trader/prediction-cloud.json`, a matching installed
+unit and stopped release record, and the selected clean detached immutable
+source plus its actual lock-consistent Python 3.12 venv. The executing source
+and venv must match that config. Missing identity, active/unknown ownership,
+boot enabled, Restart/CPU/Tasks/memory policy drift, or an incompatible reader
+fence blocks recovery. No credentials or network APIs are read by this action;
+fresh complete read authentication remains a separate Host Readiness check.
+
+Use it only under explicit recovery/deployment authorization, after trusted
+exact-main Deployment Preflight, fresh Cloud Host `READY` and wrapper install
+have selected the new release and left it stopped. Refresh all evidence;
+a previous stopped snapshot or an earlier release's gates do not transfer.
+Inspect the **current** preparation generation/state through a read-only
+connection as the service user. Never use a mutable `Store` constructor merely
+to inspect the database, or clear rows/paused flags with manual SQL.
+
+From the selected immutable release on CVM:
+
+```sh
+# Use the actual existing paths and freshly inspected generation.
+CLOUD_SHA=<accepted-40-character-final-main-SHA>
+CLOUD_PYTHON=/opt/open-trader/venvs/<retained-lock-matched-venv>/bin/python
+CLOUD_GENERATION=<current-paused-preparation-generation>
+CLOUD_PATH=/var/tmp/issue232-deploy-tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Parent must already be root-owned, canonical and 0700, outside runtime,
+# release and the credential directory. The helper creates a unique child.
+CLOUD_BACKUPS=/var/backups/open-trader/<authorized-deployment-evidence-directory>
+env PATH="$CLOUD_PATH" OPEN_TRADER_PYTHON="$CLOUD_PYTHON" PYTHONDONTWRITEBYTECODE=1 \
+  scripts/prediction-systemd.sh recover-preparation \
+  --config /etc/open-trader/prediction-cloud.json \
+  --expected-sha "$CLOUD_SHA" --expected-generation "$CLOUD_GENERATION" \
+  --backup-root "$CLOUD_BACKUPS"
+```
+
+The helper holds the same global operation lock as install/start/stop, plus
+exclusive runtime and preparation locks. It never steals a live lock or retries.
+Before the transaction it makes a private, hash-verified and synced backup of:
+
+- `config/prediction_arbitrage.json` (the non-secret runtime config).
+- The complete `prediction_arbitrage.sqlite3`, WAL/SHM when present, and the
+  existing runtime/preparation lock files.
+- The stopped release record and existing `unit-backup-*.service` files.
+- The official non-secret cloud config and installed unit.
+
+The helper **does not recursively copy runtime**. It excludes the actual
+credential file and credential directory, and ignores all unlisted runtime
+files. Symlinks, hardlinks or a credential alias in a required path fail closed.
+Official config, unit and stopped record are opened with `O_NOFOLLOW`, checked
+for a single link before any read, and held by descriptor. Their original inode,
+owner/mode and contents remain fixed through backup and the final identity gate.
+Backup sources use the validated descriptors, with inode/hash checks before and
+after copying; a pathname replacement is never reopened or accepted.
+A separate consistent SQLite backup must pass `integrity_check`; its manifest
+includes original non-secret file hashes and owner/mode metadata. Partial
+backups remain for audit on failure; none are deleted or applied automatically.
+
+Recovery uses an existing database without schema initialization, forced WAL checkpoint
+or LLM audit pruning. In one existing Store transaction it requires the explicit
+current generation and a globally paused cycle. It applies the existing default
+recovery semantics: select only paused, unrecovered preparation items, increment
+the cycle generation and re-arm preparation. Default `waiting_retry` items with
+`paused=0` are untouched, including their retry budget. SQLite authorization
+denies trigger writes and any direct writes outside the preparation tables.
+The original production recovery call without this new boundary is unchanged.
+
+The helper pins existing WAL/SHM inode identities before its first SQLite read.
+It holds one read-only SQLite transaction throughout backup and recovery, so
+normal last-close cleanup cannot delete/recreate those sidecars during that
+operation. If sidecars were absent, the initial SQLite read creates them; their
+canonical regular-file identities are pinned before backup or recovery begins.
+The final gate rechecks these identities before opening another SQLite
+connection. Identity failure does not reread the database through unknown paths.
+
+After closing that held reader, and while the three locks remain held, the
+helper restores retained sidecars through their original descriptors to the
+configured service UID/GID and 0600 on success or failure. Normal SQLite close
+may remove an observed sidecar only when its original descriptor is now
+unlinked; a rename or a replacement inode is `BLOCKED` before chown. A later
+explicit operation may observe SQLite-created new sidecars as a new lifecycle;
+no replacement is accepted within the current lifecycle. The helper never
+unlinks/recreates sidecars or forces a checkpoint, and never scans process fds.
+Unknown/replaced identity or an ownership/mode repair failure is `BLOCKED`.
+Inspect that evidence before another action; do not start with unusable sidecars.
+
+Success reports `PREPARATION_RECOVERED`, exact SHA, redacted before/after
+state/generation, backup path, recovered item count, commit status and observed
+sidecar metadata. A transaction failure rolls back all preparation updates.
+A later ownership/inspection failure can occur **after commit**: `BLOCKED` then
+reports `recovery_committed=true` and the actual post-commit state. Do not claim
+rollback or blindly reuse the old generation. The stopped release record,
+N-leg/automatic trading settings, orders, reservations, coverage and credentials
+are not changed. Recovery does not start a service or a preparation worker.
+
+After successful recovery, use the formal wrapper start within the authorized
+deployment and with fresh gates. Begin the 1Hz resource/journal observation before start; require
+complete catalog/metadata/history and a real complete candidate traversal,
+then Cloud Smoke `HEALTHY`, before the 24-hour observation. Recovery, wrapper
+`RUNNING` and HTTP 200 are not startup or health acceptance.
+
 ## Two-host gates
 
 Use these additional targets for this topology, retaining the ordinary macOS

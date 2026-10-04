@@ -16,6 +16,15 @@ operator-facing: what changed, which workflow is affected, and what was verified
   用于恢复 Polymarket SDK 初始化时的直连超时；聚焦回归覆盖参数传递、非法地址、保留/关闭和同版本重启。
   部署包装器测试规范化 macOS 临时目录的符号链接路径，保留原路径与身份断言。
 
+- 已停止的 authenticated paused Shadow Prediction 新增受控离线 LP 准备恢复入口：
+  核验精确源码、venv、配置/unit/record、资源与禁开机策略，持有 operation/runtime/preparation 三锁，
+  完成数据库和非秘密运维白名单备份后，按明确 generation 事务恢复准备周期。
+  凭据及未知 runtime 文件不读取、不备份；默认 waiting_retry 范围、交易状态和 Shadow HTTP guard 不变。
+  成功或失败仅恢复已核验 WAL/SHM 的服务用户所有权和 0600，权限失败则阻断；不自动启动或重试。
+  聚焦回归覆盖 17,445 个未暂停等待项、身份/锁/备份/事务拒绝及真实 Linux 文件权限；未部署。
+  独立审查补强控制文件读取前 hardlink 拒绝、O_NOFOLLOW 固定 fd 备份与替换检查；
+  持有只读 SQLite 事务稳定 sidecar 生命周期，未知 inode 替换在 SQLite 重读/chown 前阻断。
+
 ## 2026-10-04
 
 - LP 固定预算修复的 CI 补齐三处旧测试合同：恢复夹具提供 API 持仓成本，盈利仍进报表但不扩大预算，
