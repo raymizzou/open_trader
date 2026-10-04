@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass
 import fcntl
 import grp
+import hashlib
 import http.client
 import json
 import os
@@ -12,16 +14,20 @@ from pathlib import Path
 import pwd
 import re
 import shlex
+import shutil
+import sqlite3
 import subprocess
 import stat
 import sys
 import tempfile
 import time
 
-from .prediction_release import RELEASE_SCHEMA, inspect_prediction_release_checkout, write_prediction_runtime_record, load_prediction_runtime_record
+from .prediction_release import RUNTIME_SCHEMA, RELEASE_SCHEMA, inspect_prediction_release_checkout, write_prediction_runtime_record, load_prediction_runtime_record
 
 UNIT = 'open-trader-prediction.service'
 UNIT_PATH = Path('/etc/systemd/system') / UNIT
+CONFIG_PATH = Path('/etc/open-trader/prediction-cloud.json')
+OPERATION_LOCK = Path('/run/open-trader-prediction-operation.lock')
 _HEALTH_MISSING = object()
 
 
@@ -51,8 +57,8 @@ class CloudConfig:
         return self.runtime_root / 'data/prediction_arbitrage/runtime.lock'
 
 
-def load_config(path: Path) -> CloudConfig:
-    data = json.loads(path.read_text())
+def load_config(path: Path, *, contents: bytes | None = None) -> CloudConfig:
+    data = json.loads(path.read_text() if contents is None else contents)
     if data.get('mode') not in {'production', 'shadow'}:
         raise ValueError('cloud service mode must be explicit production or shadow')
     credential_fields = ('region', 'secret', 'version', 'role')
@@ -97,7 +103,7 @@ def service_user(c: CloudConfig):
 
 def trusted_config(path: Path) -> None:
     trusted_root_path(path)
-    if not path.is_file() or stat.S_IMODE(path.stat().st_mode) != 0o600:
+    if not path.is_file() or path.stat().st_nlink != 1 or stat.S_IMODE(path.stat().st_mode) != 0o600:
         raise ValueError('cloud config must be a root-owned mode 0600 regular file')
 
 
@@ -305,9 +311,10 @@ def read_status(port: int, path: str) -> int:
         connection.close()
 
 
-def installed_unit(c: CloudConfig) -> None:
+def installed_unit(c: CloudConfig, *, contents: bytes | None = None) -> None:
     trusted_root_path(UNIT_PATH)
-    if UNIT_PATH.is_symlink() or UNIT_PATH.read_text() != render_unit(c):
+    if (not stat.S_ISREG(UNIT_PATH.lstat().st_mode) or UNIT_PATH.lstat().st_nlink != 1
+        or (UNIT_PATH.read_text() if contents is None else contents.decode()) != render_unit(c)):
         raise ValueError('managed unit does not match requested release/config')
     state = unit_state()
     expected_env = {line.removeprefix('Environment=') for line in render_unit(c).splitlines() if line.startswith('Environment=')}
@@ -401,9 +408,9 @@ def record(c: CloudConfig, state: str, **extra):
         candidate=candidate, previous_release=old, unit_text=render_unit(c), **extra))
 
 
-def verified_record(c: CloudConfig, states: tuple[str, ...]) -> dict:
-    saved = load_prediction_runtime_record(c.record)
-    if (not saved or saved.get('manager') != 'systemd' or saved.get('state') not in states
+def verified_record(c: CloudConfig, states: tuple[str, ...], *, contents: bytes | None = None) -> dict:
+    saved = load_prediction_runtime_record(c.record) if contents is None else json.loads(contents)
+    if (not isinstance(saved, dict) or saved.get('schema_version') != RUNTIME_SCHEMA or saved.get('manager') != 'systemd' or saved.get('state') not in states
         or saved.get('candidate') != {'checkout':str(c.release_root),'git_sha':c.expected_sha}
         or saved.get('unit_text') != render_unit(c)):
         raise ValueError('managed release transition record not verified')
@@ -431,6 +438,380 @@ def display_snapshot_evidence(snapshot: dict) -> dict:
         "rewards": {condition:{key:row.get(key) for key in ("state", "reason", "checked_at")}
             for condition,row in rewards.items() if isinstance(row,dict)},
     }
+
+
+class PreparationRecoveryBlocked(ValueError):
+    """Only redacted operation evidence may cross the command boundary."""
+
+    def __init__(self, *, phase, backup=None, before=None, after=None,
+                 committed=False, recovered_item_count=0):
+        super().__init__('stopped preparation recovery blocked')
+        self.evidence = dict(phase=phase, backup=str(backup) if backup else None,
+                             before=before, after=after, recovery_committed=committed,
+                             recovered_item_count=recovered_item_count)
+
+
+@contextmanager
+def _recovery_lock(path: Path, owner: int, *, create: bool = False):
+    if create:
+        trusted_root_path(path.parent)
+    fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | (os.O_CREAT if create else 0), 0o600)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != owner
+            or info.st_mode & (0o022 if create else 0o077)):
+            raise ValueError('private canonical recovery lock required')
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield fd
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def _recovery_file(path: Path, *, owner=None, mode=None):
+    before = path.lstat()
+    if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+        or owner is not None and before.st_uid != owner
+        or mode is not None and stat.S_IMODE(before.st_mode) != mode):
+        raise ValueError('canonical recovery file required before open')
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        pin = (fd, info)
+        _check_recovery_file(path, pin)
+        if ((before.st_dev, before.st_ino) != (info.st_dev, info.st_ino)
+            or owner is not None and info.st_uid != owner
+            or mode is not None and stat.S_IMODE(info.st_mode) != mode):
+            raise ValueError('recovery file changed before open')
+        yield pin
+    finally:
+        os.close(fd)
+
+
+def _check_recovery_file(path: Path, pin) -> None:
+    fd, expected = pin
+    for observed in (os.fstat(fd), path.lstat()):
+        if (not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1
+            or (observed.st_dev, observed.st_ino) != (expected.st_dev, expected.st_ino)):
+            raise ValueError('recovery file identity changed')
+
+
+def _control_contents(path: Path, control) -> bytes:
+    pin, expected = control
+    _check_recovery_file(path, pin)
+    current = os.fstat(pin[0])
+    if (current.st_uid, current.st_gid, current.st_mode) != (pin[1].st_uid, pin[1].st_gid, pin[1].st_mode):
+        raise ValueError('recovery control trust changed')
+    actual = os.pread(pin[0], current.st_size, 0)
+    _check_recovery_file(path, pin)
+    if expected is not None and actual != expected:
+        raise ValueError('recovery control contents changed')
+    return actual
+
+
+def _preparation_projection(store) -> dict:
+    value = store.lp_preparation()
+    if value is None:
+        raise ValueError('existing paused preparation required')
+    result = dict(generation=value.get('generation'), paused=value.get('paused')
+                  if type(value.get('paused')) is bool else None)
+    for key, allowed in [('state', {'idle','ready','paused','partial','preparing','waiting_retry'}),
+                         ('stage', {'idle','catalog','metadata','history','complete'})]:
+        raw = value.get(key)
+        result[key] = raw if isinstance(raw, str) and raw in allowed else 'unknown'
+    return result
+
+
+def _recovery_paths(c: CloudConfig) -> list[Path]:
+    """Only database, ownership records and known non-secret operations files."""
+    names = ['config/prediction_arbitrage.json', 'prediction-systemd-release.json',
+             'data/prediction_arbitrage/prediction_arbitrage.sqlite3',
+             'data/prediction_arbitrage/prediction_arbitrage.sqlite3-wal',
+             'data/prediction_arbitrage/prediction_arbitrage.sqlite3-shm',
+             'data/prediction_arbitrage/runtime.lock', 'data/prediction_arbitrage/lp-preparation.lock']
+    return [c.runtime_root/name for name in names] + sorted(c.runtime_root.glob('unit-backup-*.service'))
+
+
+def _backup_stopped_preparation(c: CloudConfig, config: Path, backup_root: Path, controls) -> Path:
+    if not backup_root.is_absolute():
+        raise ValueError('absolute backup directory required')
+    trusted_root_path(backup_root)
+    if not backup_root.is_dir() or backup_root.stat().st_mode & 0o077:
+        raise ValueError('private backup directory required')
+    credential = Path(c.credentials_file)
+    if any(path.resolve().is_relative_to(credential.parent.resolve()) for path in (config, UNIT_PATH)):
+        raise ValueError('credential directory cannot supply backup control files')
+    if any(backup_root.is_relative_to(path) or path.is_relative_to(backup_root)
+           for path in (c.runtime_root, c.release_root, credential.parent)):
+        raise ValueError('independent backup directory required')
+    backup = Path(tempfile.mkdtemp(prefix='lp-preparation-', dir=backup_root))
+    try:
+        _recovery_files(c)
+        files = []
+        with ExitStack() as opened:
+            sources = [(path, backup/'runtime'/path.relative_to(c.runtime_root))
+                       for path in _recovery_paths(c) if path.exists()]
+            sources += [(config, backup/'cloud.json'), (UNIT_PATH, backup/'prediction.service')]
+            for source, target in sources:
+                control = controls.get(source)
+                pin = control[0] if control else opened.enter_context(_recovery_file(source))
+                _check_recovery_file(source, pin)
+                if control:
+                    _control_contents(source, control)
+                target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                # Copy the validated descriptor, never reopen a source path.
+                with os.fdopen(os.dup(pin[0]), 'rb') as handle, target.open('xb') as output:
+                    handle.seek(0)
+                    shutil.copyfileobj(handle, output)
+                target.chmod(0o600)
+                _check_recovery_file(source, pin)
+                digest = hashlib.sha256(target.read_bytes()).hexdigest()
+                source_hash = hashlib.sha256()
+                with os.fdopen(os.dup(pin[0]), 'rb') as handle:
+                    handle.seek(0)
+                    for chunk in iter(lambda: handle.read(1024*1024), b''):
+                        source_hash.update(chunk)
+                _check_recovery_file(source, pin)
+                if digest != source_hash.hexdigest():
+                    raise ValueError('stopped backup changed during copy')
+                info = pin[1]
+                files.append(dict(path=str(target.relative_to(backup)), sha256=digest,
+                                  uid=info.st_uid, gid=info.st_gid, mode=stat.S_IMODE(info.st_mode)))
+        # Retain the byte-for-byte stopped snapshot, including WAL/SHM, and verify
+        # a separate consistent SQLite copy without opening a mutable Store.
+        database = c.runtime_root/'data/prediction_arbitrage/prediction_arbitrage.sqlite3'
+        consistent = backup/'consistent.sqlite3'
+        with closing(sqlite3.connect(database.as_uri()+'?mode=ro', uri=True)) as source:
+            with closing(sqlite3.connect(consistent)) as target:
+                source.backup(target)
+                if target.execute('PRAGMA integrity_check').fetchall() != [('ok',)]:
+                    raise ValueError('backup database integrity failed')
+        consistent.chmod(0o600)
+        files.append(dict(path='consistent.sqlite3', sha256=hashlib.sha256(consistent.read_bytes()).hexdigest()))
+        manifest = backup/'manifest.json'
+        manifest.write_text(json.dumps(dict(status='COMPLETE', git_sha=c.expected_sha,
+                                           sqlite_integrity='ok', files=files)))
+        manifest.chmod(0o600)
+        for path in [manifest, *[backup/item['path'] for item in files]]:
+            with path.open('rb') as handle:
+                os.fsync(handle.fileno())
+        for path in (backup_root, backup, *[p for p in backup.rglob('*') if p.is_dir()]):
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        return backup
+    except Exception:
+        raise PreparationRecoveryBlocked(phase='backup', backup=backup) from None
+
+
+
+def _recovery_files(c: CloudConfig) -> None:
+    # SQLite also opens WAL/SHM: reject aliases before its first read.
+    credential_directory = Path(c.credentials_file).parent.resolve()
+    for path in _recovery_paths(c):
+        if path.resolve().is_relative_to(credential_directory):
+            raise ValueError('credential paths cannot enter the recovery backup')
+        if not path.exists() and not path.is_symlink():
+            continue
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise ValueError('runtime recovery requires canonical unlinked files')
+
+
+def _stopped_recovery_policy(c: CloudConfig, config: Path, controls) -> None:
+    trusted_config(config)
+    if load_config(config, contents=_control_contents(config, controls[config])) != c:
+        raise ValueError('recovery configuration changed')
+    installed_unit(c, contents=_control_contents(UNIT_PATH, controls[UNIT_PATH]))
+    verified_record(c, ('stopped',), contents=_control_contents(c.record, controls[c.record]))
+    state = dict(line.split('=', 1) for line in run('systemctl', 'show', UNIT,
+        '-p', 'UnitFileState', '-p', 'Restart', '-p', 'MemoryMax', '-p', 'CPUQuotaPerSecUSec',
+        '-p', 'TasksMax', '-p', 'MainPID', '-p', 'ActiveState').splitlines())
+    expected = dict(UnitFileState='disabled', Restart='no', MemoryMax=str(c.memory_max_bytes),
+                    CPUQuotaPerSecUSec='1s', TasksMax='96', MainPID='0', ActiveState='inactive')
+    if any(state.get(key) != value for key, value in expected.items()) or listener_pids():
+        raise ValueError('stopped resource and boot policy mismatch')
+
+
+
+def _restore_recovery_sidecars(c: CloudConfig, user, directory_identity, pins) -> list[dict]:
+    """Never unlink/checkpoint a WAL retained by a concurrent read-only client."""
+    directory = c.runtime_root/'data/prediction_arbitrage'
+    info = directory.lstat()
+    if (not stat.S_ISDIR(info.st_mode) or (info.st_dev, info.st_ino) !=
+        (directory_identity.st_dev, directory_identity.st_ino)):
+        raise ValueError('recovery storage directory changed')
+    observed = []
+    for suffix in ('-wal', '-shm'):
+        path = directory/('prediction_arbitrage.sqlite3'+suffix)
+        pin = pins.get(path)
+        if not path.exists() and not path.is_symlink():
+            # Closing the held SQLite reader can legitimately unlink its own
+            # sidecars. A rename (still linked) or a new inode is not that case.
+            if pin is not None and os.fstat(pin[0]).st_nlink != 0:
+                raise ValueError('recovery sidecar disappeared with unknown ownership')
+            observed.append(dict(name=path.name, exists=False))
+            continue
+        if pin is None:
+            raise ValueError('unobserved recovery sidecar')
+        _check_recovery_file(path, pin)
+        fd, info = pin
+        actual = os.fstat(fd)
+        if actual.st_uid not in (0, user.pw_uid):
+            raise ValueError('unknown recovery sidecar owner')
+        os.fchown(fd, user.pw_uid, user.pw_gid)
+        os.fchmod(fd, 0o600)
+        os.fsync(fd)
+        _check_recovery_file(path, pin)
+        actual = os.fstat(fd)
+        if (actual.st_uid, actual.st_gid, stat.S_IMODE(actual.st_mode)) != (user.pw_uid, user.pw_gid, 0o600):
+            raise ValueError('recovery sidecar ownership not restored')
+        observed.append(dict(name=path.name, exists=True, uid=actual.st_uid,
+                             gid=actual.st_gid, mode=stat.S_IMODE(actual.st_mode)))
+    return observed
+
+
+def recover_stopped_preparation(config: Path, *, expected_sha: str,
+                                expected_generation: int, backup_root: Path) -> dict:
+    """Offline operator recovery; never authenticates, starts or reads a wallet."""
+    if os.geteuid() != 0:
+        raise ValueError('stopped preparation recovery requires root')
+    if config != CONFIG_PATH:
+        raise ValueError('official managed recovery configuration required')
+    with ExitStack() as locks:
+        trusted_config(config)
+        controls = {}
+        config_pin = locks.enter_context(_recovery_file(config, owner=0, mode=0o600))
+        controls[config] = (config_pin, _control_contents(config, (config_pin, None)))
+        c = load_config(config, contents=controls[config][1])
+        if (c.mode != 'shadow' or c.n_leg_paused != 1 or credential_backend(c) != 'file'
+            or c.expected_sha != expected_sha or type(expected_generation) is not int
+            or expected_generation < 1 or '..' in Path(c.credentials_file).parts
+            or Path(c.credentials_file).resolve().is_relative_to(c.runtime_root)):
+            raise ValueError('exact authenticated paused Shadow recovery profile required')
+        if (Path(sys.executable).resolve() != c.python.resolve()
+            or Path(sys.prefix).resolve() != c.python.parent.parent.resolve()
+            or any(os.environ.get(key) for key in ('PYTHONHOME', 'PYTHONUSERBASE'))
+            or Path(__file__).resolve() != c.release_root/'src/open_trader/prediction_cloud.py'):
+            raise ValueError('recovery must use the selected release source and interpreter')
+        held = [(OPERATION_LOCK, locks.enter_context(_recovery_lock(OPERATION_LOCK, 0, create=True)))]
+        trusted_layout(c)
+        release_identity(c)
+        # The selected preflight implementation verifies source/lock/runtime
+        # locally. Its GitHub client and network preflight are not invoked.
+        run(str(c.python), '-I', '-B', '-c',
+            'import runpy,sys; n=runpy.run_path(sys.argv[1]); '
+            'n["verify_checkout"](sys.argv[2],sys.argv[3]); '
+            'n["inspect_runtime"](sys.argv[2],[])',
+            str(c.release_root/'scripts/deployment_preflight.py'), str(c.release_root), c.expected_sha,
+            timeout=120)
+        _recovery_files(c)
+        for path, mode in ((UNIT_PATH, 0o644), (c.record, 0o600)):
+            if path == UNIT_PATH:
+                trusted_root_path(path)
+            if path.resolve().is_relative_to(Path(c.credentials_file).parent.resolve()):
+                raise ValueError('credential alias in recovery controls')
+            pin = locks.enter_context(_recovery_file(path, owner=0, mode=mode))
+            controls[path] = (pin, _control_contents(path, (pin, None)))
+        installed_unit(c, contents=_control_contents(UNIT_PATH, controls[UNIT_PATH]))
+        absent(c)
+        verified_record(c, ('stopped',), contents=_control_contents(c.record, controls[c.record]))
+        user = service_user(c)
+        directory = c.runtime_root/'data/prediction_arbitrage'
+        _recovery_files(c)
+        for path in (c.runtime_root/'data', directory, directory/'prediction_arbitrage.sqlite3'):
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode) or info.st_uid != user.pw_uid or info.st_mode & 0o077:
+                raise ValueError('private service-owned recovery database required')
+        for path in (c.runtime_lock, directory/'lp-preparation.lock'):
+            held.append((path, locks.enter_context(_recovery_lock(path, user.pw_uid))))
+        _stopped_recovery_policy(c, config, controls)
+        before = after = backup = None
+        committed = False
+        recovered = []
+        directory_identity = directory.stat()
+        sidecar_pins = {}
+        reader = None
+        try:
+            # Pin existing identities before SQLite opens them. A held read
+            # transaction then prevents normal last-close sidecar churn while
+            # backup and recovery use their existing short-lived connections.
+            sidecar_paths = [directory/('prediction_arbitrage.sqlite3'+suffix) for suffix in ('-wal','-shm')]
+            for path in sidecar_paths:
+                if path.exists():
+                    sidecar_pins[path] = locks.enter_context(_recovery_file(path))
+            reader = sqlite3.connect((directory/'prediction_arbitrage.sqlite3').as_uri()+'?mode=ro', uri=True)
+            if reader.execute('PRAGMA journal_mode').fetchone() != ('wal',):
+                raise ValueError('existing WAL recovery database required')
+            reader.execute('BEGIN')
+            reader.execute('SELECT generation FROM lp_preparation WHERE singleton=1').fetchall()
+            for path in sidecar_paths:
+                if path not in sidecar_pins:
+                    # SQLite's initial read creates missing WAL/SHM. Observe
+                    # them now, before backup or any recovery transaction.
+                    sidecar_pins[path] = locks.enter_context(_recovery_file(path))
+                _check_recovery_file(path, sidecar_pins[path])
+            from .prediction_arbitrage_store import PredictionArbitrageStore, read_minimum_reader_generation
+            if read_minimum_reader_generation(c.runtime_root/'data') > release_identity(c)['reader_generation']:
+                raise ValueError('release cannot read recovery database')
+            store = PredictionArbitrageStore(c.runtime_root/'data', initialize=False)
+            database_identity = store.path.stat()
+            before = _preparation_projection(store)
+            if before['generation'] != expected_generation or before['paused'] is not True or before['state'] != 'paused':
+                raise ValueError('paused preparation generation mismatch')
+            try:
+                backup = _backup_stopped_preparation(c, config, backup_root, controls)
+            except PreparationRecoveryBlocked as error:
+                error.evidence.update(before=before, after=before)
+                backup = Path(error.evidence['backup']) if error.evidence['backup'] else None
+                raise
+            except Exception:
+                raise PreparationRecoveryBlocked(phase='backup', before=before, after=before) from None
+            # Revalidate before another SQLite connection can touch a replaced
+            # sidecar; failed identity checks do not attempt a state reread.
+            _stopped_recovery_policy(c, config, controls)
+            _recovery_files(c)
+            for path, pin in sidecar_pins.items():
+                _check_recovery_file(path, pin)
+            for path, fd in [*held, (store.path, None)]:
+                observed = path.stat()
+                expected = os.fstat(fd) if fd is not None else database_identity
+                if (observed.st_dev, observed.st_ino) != (expected.st_dev, expected.st_ino):
+                    raise ValueError('recovery owner or database identity changed')
+            try:
+                recovered = store.lp_recover_preparation_items(expected_generation=expected_generation)
+                committed = True
+                after = _preparation_projection(store)
+            except Exception:
+                try:
+                    after = _preparation_projection(store)
+                except Exception:
+                    after = None
+                raise PreparationRecoveryBlocked(phase='transaction', backup=backup, before=before,
+                    after=after, committed=committed, recovered_item_count=len(recovered)) from None
+            result = dict(status='PREPARATION_RECOVERED', git_sha=c.expected_sha, before=before,
+                        after=after, backup=str(backup), recovery_committed=True,
+                        recovered_item_count=len(recovered))
+        except PreparationRecoveryBlocked:
+            raise
+        except Exception:
+            raise PreparationRecoveryBlocked(phase='validation', backup=backup, before=before,
+                after=after, committed=committed, recovered_item_count=len(recovered)) from None
+        finally:
+            active_error = sys.exc_info()[1]
+            try:
+                if reader is not None:
+                    reader.close()
+                sidecars = _restore_recovery_sidecars(c, user, directory_identity, sidecar_pins)
+            except Exception:
+                raise PreparationRecoveryBlocked(phase='storage_ownership', backup=backup, before=before,
+                    after=after, committed=committed, recovered_item_count=len(recovered)) from None
+            if isinstance(active_error, PreparationRecoveryBlocked):
+                active_error.evidence['sidecars'] = sidecars
+        return {**result, 'sidecars': sidecars}
+
 
 
 def operate(c: CloudConfig, action: str) -> dict:
@@ -487,7 +868,7 @@ def operate(c: CloudConfig, action: str) -> dict:
     if os.geteuid() != 0:
         raise ValueError('systemd mutations require root')
     # Same global lock for all runtime roots/configurations of this unit.
-    with open('/run/open-trader-prediction-operation.lock', 'a') as lock:
+    with OPERATION_LOCK.open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         if action == 'install':
             preflight(c)
@@ -553,10 +934,23 @@ def operate(c: CloudConfig, action: str) -> dict:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['render','preflight','install','start','status','stop','smoke'])
-    parser.add_argument('--config', type=Path, default=Path('/etc/open-trader/prediction-cloud.json'))
+    parser.add_argument('action', choices=['render','preflight','install','start','status','stop','smoke','recover-preparation'])
+    parser.add_argument('--config', type=Path, default=CONFIG_PATH)
+    parser.add_argument('--expected-sha')
+    parser.add_argument('--expected-generation', type=int)
+    parser.add_argument('--backup-root', type=Path)
     args = parser.parse_args(argv)
     try:
+        if args.action != 'recover-preparation' and any(
+            value is not None for value in (args.expected_sha, args.expected_generation, args.backup_root)
+        ):
+            raise ValueError('recovery arguments require recover-preparation')
+        if args.action == 'recover-preparation':
+            if args.expected_sha is None or args.expected_generation is None or args.backup_root is None:
+                raise ValueError('explicit SHA, generation and backup root required')
+            print(json.dumps(recover_stopped_preparation(args.config, expected_sha=args.expected_sha,
+                             expected_generation=args.expected_generation, backup_root=args.backup_root)))
+            return 0
         if args.action != 'render':
             trusted_config(args.config)
         config = load_config(args.config)
@@ -568,6 +962,9 @@ def main(argv=None):
                               'release_root': str(config.release_root),
                               'runtime_root': str(config.runtime_root)}))
         return 0
+    except PreparationRecoveryBlocked as error:
+        print(json.dumps({'status': 'BLOCKED', 'action': args.action, **error.evidence}))
+        return 2
     except Exception:
         # Never expose config/credential values via an unexpected exception chain.
         print(json.dumps({'status': 'BLOCKED', 'action': args.action,

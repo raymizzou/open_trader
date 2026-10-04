@@ -386,13 +386,18 @@ def load_relation_state_readonly(data_dir: Path) -> dict[str, object] | None:
 class PredictionArbitrageStore:
     """Direct sqlite3 persistence with one short-lived connection per action."""
 
-    def __init__(self, data_dir: Path) -> None:
+    def __init__(self, data_dir: Path, *, initialize: bool = True) -> None:
         self.data_dir = Path(data_dir)
         self.path = self.data_dir / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._read_connection() as connection:
-            connection.execute("PRAGMA journal_mode=WAL")
-            self._create_schema(connection)
+        if type(initialize) is not bool:
+            raise ValueError("initialize must be a boolean")
+        if initialize:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self._read_connection() as connection:
+                connection.execute("PRAGMA journal_mode=WAL")
+                self._create_schema(connection)
+        elif not self.path.is_file():
+            raise ValueError("existing recovery database required")
         self._cache_hits: dict[str, int] = {}
         self._cache_hits_lock = threading.Lock()
         self._lp_preparation_owner_handle: Any | None = None
@@ -401,8 +406,9 @@ class PredictionArbitrageStore:
         self._lp_metadata_cache_schema_lock = threading.Lock()
         self._lp_trade_change_listener: Callable[[str], None] | None = None
         self._lp_trade_change_listener_lock = threading.Lock()
-        self.prune_llm_usage()
-        self._truncate_wal()
+        if initialize:
+            self.prune_llm_usage()
+            self._truncate_wal()
 
     def _truncate_wal(self) -> None:
         """Best-effort startup `wal_checkpoint(TRUNCATE)`.
@@ -4202,8 +4208,13 @@ class PredictionArbitrageStore:
         return cleared
 
     def lp_recover_preparation_items(
-        self, condition_ids: Iterable[str] | None = None
+        self, condition_ids: Iterable[str] | None = None,
+        *, expected_generation: int | None = None,
     ) -> list[dict[str, object]]:
+        if expected_generation is not None and (
+            type(expected_generation) is not int or expected_generation < 1
+        ):
+            raise ValueError("positive expected preparation generation required")
         identities = None if condition_ids is None else tuple(
             dict.fromkeys(
                 str(value).strip() for value in condition_ids if str(value).strip()
@@ -4214,9 +4225,33 @@ class PredictionArbitrageStore:
                 "SELECT generation,payload FROM lp_preparation WHERE singleton=1"
             ).fetchone()
             if singleton is None:
+                if expected_generation is not None:
+                    raise ValueError("paused preparation generation mismatch")
                 return []
             current_generation = int(singleton["generation"])
             payload = _load_payload(str(singleton["payload"]))
+            if expected_generation is not None and (
+                current_generation != expected_generation
+                or payload.get("paused") is not True
+                or payload.get("state") != "paused"
+            ):
+                raise ValueError("paused preparation generation mismatch")
+            if expected_generation is not None:
+                # Offline recovery cannot let triggers mutate trading/audit
+                # tables. Default production recovery remains unchanged.
+                def preparation_writes_only(action, table, column, database, trigger):
+                    if trigger is not None and action in {
+                        sqlite3.SQLITE_INSERT, sqlite3.SQLITE_DELETE, sqlite3.SQLITE_UPDATE
+                    }:
+                        return sqlite3.SQLITE_DENY
+                    if action in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_DELETE):
+                        return sqlite3.SQLITE_DENY
+                    if action == sqlite3.SQLITE_UPDATE and table not in {
+                        "lp_preparation", "lp_preparation_items"
+                    }:
+                        return sqlite3.SQLITE_DENY
+                    return sqlite3.SQLITE_OK
+                connection.set_authorizer(preparation_writes_only)
             if identities is None:
                 rows = connection.execute(
                     """
