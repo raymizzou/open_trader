@@ -12343,6 +12343,18 @@ class PolymarketLPService:
         account_round: object | None = None,
     ):
         snapshot_request = dict(request)
+        snapshot_request.pop("_lp_terminal_orders", None)
+        session_id = str(request.get("session_id") or "")
+        saved = self.store.lp_session(session_id) if session_id else None
+        if saved and all(saved.get(key) == request.get(key)
+                         for key in ("condition_id", "token_id")):
+            # Reuse durable terminal receipts across ticks and restarts. Only
+            # persisted facts can suppress reads, never request-supplied history.
+            snapshot_request["_lp_terminal_orders"] = {
+                oid: row for oid, row in self._order_history(saved).items()
+                if str(row.get("status") or "").upper() in TERMINAL_ORDER_STATES
+                and row.get("token_id") == request.get("token_id")
+            }
         if account_round is not None:
             snapshot_request["_lp_account_round"] = account_round
         for name in ("lp_snapshot", "snapshot"):

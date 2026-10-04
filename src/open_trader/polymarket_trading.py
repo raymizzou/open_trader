@@ -5035,6 +5035,13 @@ class PolymarketTradingClient:
                     *_collect(request.get("owned_order_ids")),
                 ) if value
             }
+            # The service supplies durable terminal receipts separately from
+            # identity. Keep every owned ID for trade attribution, and let a
+            # current open-order observation override historical state.
+            for order_id, receipt in request.get("_lp_terminal_orders", {}).items():
+                if order_id in order_ids and order_id not in known_ids:
+                    order_facts.append(receipt)
+                    known_ids.add(order_id)
             raw_trades = account.get("raw_trades", ())
             trades = tuple(
                 trade
