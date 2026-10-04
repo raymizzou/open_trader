@@ -220,21 +220,31 @@ def client_operation(c, action):
                        '--prediction-route-state',str(route),'--static-dir',c['release_root']+'/src/open_trader/dashboard_static'],
         }
         state = {'config':c}
-        children = []
+        children = {}
         try:
             for key, command in commands.items():
+                deadline = time.monotonic()+15
                 with (root/f'{key}.log').open('wb') as log:
                     process = subprocess.Popen(command, cwd=c['release_root'], stdin=subprocess.DEVNULL,
                         stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
                         env={**os.environ, 'PYTHONPATH':c['release_root']+'/src', 'PYTHONDONTWRITEBYTECODE':'1'})
-                children.append(process)
+                children[key] = process
                 identity = process_identity(process.pid)
                 if identity is None:
                     raise ValueError('child exited during startup')
+                birth = identity.split(None, 5)[:5]
+                # During exec, macOS ps can expose only "(python3.12)".
+                # Wait for args while we still own the unreaped child.
+                while len(identity.split(None, 6)) != 7:
+                    if process.poll() is not None or time.monotonic() >= deadline:
+                        raise ValueError('child identity unavailable during startup')
+                    time.sleep(.05)
+                    identity = process_identity(process.pid)
+                    if identity is None or identity.split(None, 5)[:5] != birth:
+                        raise ValueError('child identity changed during startup')
                 state[key] = {'pid':process.pid,'identity':identity}
                 save(path,state)
                 if key == 'ssh':
-                    deadline = time.monotonic()+15
                     while True:
                         try:
                             health = read_json(tunnel_port)
@@ -245,18 +255,34 @@ def client_operation(c, action):
                             if time.monotonic() >= deadline or process.poll() is not None:
                                 raise ValueError('SSH/backend not ready') from None
                             time.sleep(.2)
-            deadline = time.monotonic()+15
             while True:
                 try:
-                    return status(c,state)
-                except (OSError,ValueError):
+                    for key, child in children.items():
+                        if child.poll() is not None:
+                            raise ValueError('child exited during startup')
+                        identity = process_identity(child.pid)
+                        before = state[key]['identity'].split(None, 6)
+                        after = identity.split(None, 6) if identity is not None else []
+                        # A still-owned Popen child may exec its interpreter
+                        # launcher. Only argv[0] may change; birth and args stay fixed.
+                        if (len(before) != 7 or len(after) != 7
+                            or before[:5] != after[:5] or before[6] != after[6]):
+                            raise ValueError('child identity changed during startup')
+                        state[key]['identity'] = identity
+                    result = status(c,state)
+                    if any(child.poll() is not None or not same_process(state[key])
+                           for key, child in children.items()):
+                        raise ValueError('child exited during verification')
+                    save(path,state)  # Pin the verified final exec identity for status/stop.
+                    return result
+                except (OSError,ValueError) as exc:
                     if time.monotonic() >= deadline:
-                        raise ValueError('Gateway not ready') from None
+                        raise ValueError('Gateway not ready') from exc
                     time.sleep(.2)
         except Exception:
             # Popen objects still belong to this invocation, so reaping these
             # children is safe even when recording their identity failed.
-            for child in reversed(children):
+            for child in reversed(children.values()):
                 if child.poll() is None:
                     child.terminate()
                 child.wait(timeout=10)
