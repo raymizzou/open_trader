@@ -865,9 +865,10 @@ def test_late_live_receipt_preserves_already_verified_fill(tmp_path):
     assert r['funds']['status']=='unknown'  # A SELL changed the trading generation before the late BUY reply.
     assert r['slots']['occupied']==1
     assert Decimal(session['buy_filled_quantity']) == 20
-    # The new account ledger cannot value inventory from a matched receipt
-    # without confirmed trade/fee basis, even when the session knew its fill.
+    # A matched receipt does not supply the missing API position cost.
     assert r['funds']['inventory_cost_usd'] is None
+    assert 'account_position_cost_unknown' in r['admission_block_reasons']
+    x.positions[0]['average_price'] = '.40'
     x.trades = [dict(id='late-fill', asset_id='m00', status='CONFIRMED',
         trader_side='MAKER', taker_order_id='other-account', side='BUY',
         price='.40', size='20', match_time=NOW, fee_rate_bps='0',

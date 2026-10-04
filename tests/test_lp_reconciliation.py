@@ -1223,7 +1223,8 @@ def test_publish_compare_and_swap_conflict_is_a_retry_not_a_failed_round(tmp_pat
     assert len(exchange.posts) == 1
 
 
-def test_filled_submit_receipt_without_account_fill_facts_keeps_reservation(tmp_path):
+@pytest.mark.parametrize('positions_complete', [True, False])
+def test_filled_receipt_uses_current_positions_only_when_complete(tmp_path, positions_complete):
     execution, exchange, _, store = setup(tmp_path)
     execution.lp_auto_configure(dict(budget_usd='100', target_buy_count=1))
     execution.lp_auto_set_desired_running(True)
@@ -1235,11 +1236,20 @@ def test_filled_submit_receipt_without_account_fill_facts_keeps_reservation(tmp_
         return receipt
     exchange.lp_post_order = matched
     sid = execution.lp_auto_run_once()['intents'][0]['session_id']
+    read = exchange.lp_account_snapshot
+    exchange.lp_account_snapshot = lambda: {**read(), 'positions_complete': positions_complete}
     result = execution.lp_auto_reconcile_unknown()
     assert store.lp_session(sid)['state'] != 'complete'
-    assert result['funds']['status'] == 'unknown'
-    assert Decimal(result['funds']['buy_reserved_usd']) == 8
-    assert result['slots']['occupied'] == 1
+    if positions_complete:
+        assert result['funds']['status'] == 'known'
+        assert Decimal(result['funds']['buy_reserved_usd']) == 0
+        assert Decimal(result['funds']['available_usd']) == 100
+        assert result['slots']['occupied'] == 0
+    else:
+        assert result['funds']['status'] == 'unknown'
+        assert Decimal(result['funds']['buy_reserved_usd']) == 8
+        assert result['funds']['available_usd'] is None
+        assert result['slots']['occupied'] == 1
     assert len(exchange.posts) == 1
 
 
