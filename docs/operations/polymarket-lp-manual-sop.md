@@ -163,6 +163,16 @@ python -m open_trader prediction-arb lp-auto pause --url http://127.0.0.1:8769 -
 
 服务路由为：`POST /api/prediction-arbitrage/lp/preview`、`POST /api/prediction-arbitrage/lp/sessions`、`GET /api/prediction-arbitrage/lp/sessions/current` 和 `POST /api/prediction-arbitrage/lp/sessions/{id}/stop`。只读或 shadow 模式可展示持久化风险，但不允许 LP 写入；查询不到会话与查询失败要分别记录。
 
+### 6.1 历史 UNKNOWN 请求的显式本地豁免
+
+自动账户同步仍按完整性、时效、账户和版本证据覆盖预留。若旧临时请求缺少归属或发送时间，
+操作者可使用 [历史预留 API](polymarket-lp-reservation-api.md) 列出原因，并显式确认释放一笔
+intent ID 或本次全部可释放记录。该手动决定只取消本地临时占位，不猜测原订单身份，
+不改原 UNKNOWN 审计，也不取消真实订单。实际发送中的请求和已知订单仍排除。
+旧空请求容器可因本地豁免退役，这与账户零库存证明不同。
+启用池由原调度按真实剩余预算补位；暂停池不被启用。迟到订单仍补录和重算，可能短暂超额。
+实现、测试或本 SOP 均不授权执行生产释放；请求/响应及认证方式见上述 API 文档。
+
 ## 7. 来源
 
 - [Polymarket Liquidity Rewards](https://docs.polymarket.com/programs/liquidity-rewards)：奖励规则、发放时间、最低支付和相对评分。

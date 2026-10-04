@@ -563,6 +563,7 @@ def create_prediction_server(
                 "/api/prediction-arbitrage/n-leg/report",
                 "/api/prediction-arbitrage/lp/dashboard",
                 "/api/prediction-arbitrage/lp/auto/state",
+                "/api/prediction-arbitrage/lp/auto/reservations",
                 "/api/prediction-arbitrage/lp/sessions/current",
             }:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -659,6 +660,18 @@ def create_prediction_server(
                 except ValueError as exc:
                     self._send_error(HTTPStatus.BAD_REQUEST, exc)
                 except (AttributeError, sqlite3.Error, OSError, RuntimeError) as exc:
+                    self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+                return
+            if parsed.path == "/api/prediction-arbitrage/lp/auto/reservations":
+                try:
+                    reader = getattr(getattr(runtime, "execution", None), "lp_auto_reservations", None)
+                    if not callable(reader):
+                        raise RuntimeError("LP reservation API is unavailable")
+                    result = reader()
+                    self._send_json(HTTPStatus.OK, _lp_projection_safe_value(result))
+                except ValueError as exc:
+                    self._send_error(HTTPStatus.BAD_REQUEST, exc)
+                except (sqlite3.Error, OSError, RuntimeError) as exc:
                     self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
                 return
             if parsed.path == "/api/prediction-arbitrage/lp/auto/state":
@@ -911,7 +924,7 @@ def create_prediction_server(
             lp_sessions_prefix = "/api/prediction-arbitrage/lp/sessions/"
             lp_start_path = "/api/prediction-arbitrage/lp/sessions"
             lp_auto_prefix = "/api/prediction-arbitrage/lp/auto/"
-            lp_auto_paths = {lp_auto_prefix + action for action in ("config", "enable", "pause", "resume")}
+            lp_auto_paths = {lp_auto_prefix + action for action in ("config", "enable", "pause", "resume", "reservations/release")}
             lp_stop_session: str | None = None
             if path.startswith(lp_sessions_prefix) and path.endswith("/stop"):
                 candidate = path[len(lp_sessions_prefix) : -len("/stop")]
@@ -962,7 +975,9 @@ def create_prediction_server(
                     else self._audit_context()
                 )
                 if path in lp_auto_paths:
-                    if path == lp_auto_prefix + "config":
+                    if path == lp_auto_prefix + "reservations/release":
+                        result = execution.lp_auto_release_reservations(payload, audit=audit)
+                    elif path == lp_auto_prefix + "config":
                         expected = {"budget_usd", "target_buy_count"}
                         if "expected_config_version" in payload:
                             expected.add("expected_config_version")
@@ -1362,7 +1377,11 @@ def create_prediction_server(
                     and result.get("state") == "busy"
                 ):
                     status = HTTPStatus.CONFLICT
-                safe_result = _prediction_safe_value(result)
+                safe_result = (
+                    _lp_projection_safe_value(result)
+                    if path == lp_auto_prefix + "reservations/release"
+                    else _prediction_safe_value(result)
+                )
                 if not isinstance(safe_result, Mapping):
                     raise RuntimeError("prediction mutation result is invalid")
                 self._send_json(status, safe_result)
