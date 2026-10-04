@@ -505,7 +505,7 @@ def test_concurrent_configuration_is_atomic_target_total(tmp_path, request):
     assert e.lp_auto_state()['config_version']==2
 
 
-def test_sync_manages_exchange_ids_without_precomputed_match(tmp_path):
+def test_sync_manages_exchange_ids_without_precomputed_match(tmp_path, monkeypatch):
     e,x,lp,s=setup(tmp_path,2)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=2))
     e.lp_auto_set_desired_running(True)
@@ -519,14 +519,22 @@ def test_sync_manages_exchange_ids_without_precomputed_match(tmp_path):
     for token in ('m00', 'm01'):
         x.orders.append(dict(order_id='venue-' + token,token_id=token,condition_id=token,side='BUY',status='LIVE',price='.4',original_size='20',size_matched='0'))
     x.fail=False
+    # A qualifying round begins strictly after both sends ended. The old
+    # expectation kept missing-ID holds forever; account coverage replaces
+    # those holds while preserving the UNKNOWN original request audit.
+    monkeypatch.setitem(globals(), 'NOW', NOW + timedelta(seconds=1))
     first=lp.register_account_snapshot(_fresh_registration_bundle(x,lp))
     assert first['state']=='registered', first
     sessions=s.lp_active_sessions()
     assert {session['token_id'] for session in sessions}=={'m00','m01'}
     assert sorted(order_id for session in sessions for order_id in session['owned_order_ids'])==['venue-m00','venue-m01']
     assert all('audit-' not in order_id for session in sessions for order_id in session['owned_order_ids'])
-    assert e.lp_auto_state()['funds']['status']=='unknown'
-    assert e.lp_auto_state()['desired_running'] is False
+    covered = e.lp_auto_state()
+    assert covered['funds']['status']=='known'
+    assert Decimal(covered['funds']['buy_reserved_usd']) == 16
+    assert covered['slots']['occupied'] == 2
+    assert all(i['state'] == 'unknown' and i['order_id'] is None and i['reservation_coverage'] for i in covered['intents'])
+    assert covered['desired_running'] is False
     repeat=lp.register_account_snapshot(_fresh_registration_bundle(x,lp))
     assert repeat['state']=='registered', repeat
     assert len(s.lp_active_sessions())==2
@@ -856,7 +864,26 @@ def test_late_live_receipt_preserves_already_verified_fill(tmp_path):
     assert session['order_history']['o1']['status']=='FILLED'
     assert r['funds']['status']=='unknown'  # A SELL changed the trading generation before the late BUY reply.
     assert r['slots']['occupied']==1
-    assert Decimal(r['funds']['inventory_cost_usd'])==8
+    assert Decimal(session['buy_filled_quantity']) == 20
+    # The new account ledger cannot value inventory from a matched receipt
+    # without confirmed trade/fee basis, even when the session knew its fill.
+    assert r['funds']['inventory_cost_usd'] is None
+    x.trades = [dict(id='late-fill', asset_id='m00', status='CONFIRMED',
+        trader_side='MAKER', taker_order_id='other-account', side='BUY',
+        price='.40', size='20', match_time=NOW, fee_rate_bps='0',
+        maker_orders=[dict(order_id='o1', token_id='m00', maker_address='test-wallet',
+            side='BUY', matched_amount='20', price='.40', fee_rate_bps='0')])]
+    now = [NOW]
+    lp.clock = lambda: now[0]
+    def complete_account_round(*, max_age_seconds=0, trade_generation_provider=None):
+        del max_age_seconds
+        now[0] += timedelta(microseconds=1)
+        snapshot = _fresh_registration_bundle(x, lp)
+        snapshot.update(read_started_at=now[0], read_ended_at=now[0], checked_at=now[0])
+        if trade_generation_provider is not None:
+            snapshot['trade_generation'] = trade_generation_provider()
+        return snapshot
+    x.lp_account_snapshot_shared = complete_account_round
     recovered=e.lp_auto_reconcile_unknown()
     assert recovered['funds']['status']=='known'
     assert recovered['slots']['occupied']==0

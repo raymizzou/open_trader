@@ -9159,9 +9159,29 @@ def test_lp_refresh_queues_work_without_trading_or_waiting_for_catalog(
             assert preparation_snapshot.get("last_attempt_at") != preparation_attempt
             assert preparation_snapshot.get("scanning") is False
 
-            dashboard_status, dashboard = _response(
-                base + "/api/prediction-arbitrage/lp/dashboard", timeout=2
-            )
+            # Candidate work and dashboard publication use separate workers.
+            # Publish and observe this attempt before checking its diagnostics;
+            # the read-only endpoint may legitimately still serve a pending
+            # snapshot while an earlier publisher is in flight.
+            deadline = time.monotonic() + 2
+            while True:
+                # Startup reconciliation may have published newer account
+                # facts than the shared TTL snapshot. Read this fake account
+                # afresh rather than waiting for the production cache TTL.
+                runtime.lp.exchange.lp_account_snapshot_shared(
+                    max_age_seconds=0,
+                    trade_generation_provider=runtime.store.lp_trade_generation,
+                )
+                runtime.execution.refresh_lp_dashboard_snapshot()
+                dashboard_status, dashboard = _response(
+                    base + "/api/prediction-arbitrage/lp/dashboard", timeout=2
+                )
+                if dashboard.get("candidate_last_attempt_at") == (
+                    preparation_snapshot["last_attempt_at"]
+                ):
+                    break
+                assert time.monotonic() < deadline, dashboard
+                time.sleep(0.01)
             assert dashboard_status == 200
             saved_rows = dashboard["recommendations"]
             assert saved_rows == []
