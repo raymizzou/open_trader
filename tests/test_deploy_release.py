@@ -17,7 +17,7 @@ class DeploymentWiringTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         (self.root / 'scripts').mkdir()
         self.python = self.root / 'venv/bin/python'
         self.runtime = self.root / 'runtime'
@@ -93,11 +93,13 @@ class DeploymentWiringTests(unittest.TestCase):
         run.return_value.returncode = 0
         config = self.root / 'config with spaces.json'
         self.assertEqual(MODULE.main(self.args('prediction-launchd', '--mode', 'shadow',
-                                              '--config', str(config), '--n-leg-paused', '1')), 0)
+                                              '--config', str(config), '--n-leg-paused', '1',
+                                              '--https-proxy', 'http://127.0.0.1:1082')), 0)
         command = run.call_args.args[0]
         self.assertIn(str(config), command)
         self.assertEqual(command[command.index('--expected-sha') + 1], self.sha)
         self.assertEqual(command[command.index('--n-leg-paused') + 1], '1')
+        self.assertEqual(command[command.index('--https-proxy') + 1], 'http://127.0.0.1:1082')
 
     @patch.object(MODULE.subprocess, 'run')
     def test_preflight_uses_selected_release_python(self, run):
