@@ -424,7 +424,7 @@ def test_three_to_five_and_no_infinite_refill(tmp_path):
     assert len(x.posts)==5
 
 
-def test_recycled_pnl_partial_sale_late_stream_and_restart(tmp_path):
+def test_fixed_budget_partial_sale_late_stream_and_restart(tmp_path):
     e,x,lp,s=setup(tmp_path)
     e.lp_auto_configure(dict(budget_usd='100',target_buy_count=1))
     e.lp_auto_set_desired_running(True)
@@ -443,12 +443,12 @@ def test_recycled_pnl_partial_sale_late_stream_and_restart(tmp_path):
     r=e.lp_auto_reconcile_unknown()
     assert Decimal(r['funds']['realized_pnl_usd'])==Decimal('-1.20')
     assert Decimal(r['funds']['inventory_cost_usd'])==Decimal('4.80')
-    assert Decimal(r['funds']['available_usd'])==94
+    assert Decimal(r['funds']['available_usd'])==Decimal('95.20')
     x.orders[1].update(status='FILLED',size_matched='20')
     x.positions=[]
     r=e.lp_auto_reconcile_unknown()
-    assert Decimal(r['funds']['total_usd'])==97
-    assert Decimal(r['funds']['available_usd'])==97
+    assert Decimal(r['funds']['total_usd'])==100
+    assert Decimal(r['funds']['available_usd'])==100
     x.trades=[dict(trade_id=f't{side}',status='CONFIRMED',matched_at=NOW.isoformat(),
               maker_orders=[dict(order_id=oid,token_id='m00',side=side,matched_amount='20',price=price,fee='0')])
               for side,oid,price in [('BUY','o1','.40'),('SELL','sell1','.25')]]
@@ -460,12 +460,12 @@ def test_recycled_pnl_partial_sale_late_stream_and_restart(tmp_path):
     e._lp_auto_pool().reconcile_reports()
     e._lp_auto_pool().reconcile_reports()
     r=e.lp_auto_state()
-    assert Decimal(r['funds']['total_usd'])==97
+    assert Decimal(r['funds']['total_usd'])==100
     fills=[f for f in e.lp_auto_report_facts()['events'] if f['kind']=='fill']
     assert len(fills)==2
     assert all(f['occurred_at'] for f in fills)
     e.lp_auto_set_desired_running(False)
-    assert e.lp_auto_configure(dict(budget_usd='120',target_buy_count=1))['funds']['total_usd']=='120.00'
+    assert Decimal(e.lp_auto_configure(dict(budget_usd='120',target_buy_count=1))['funds']['total_usd'])==120
 
 
 def test_manual_origin_does_not_own_funds_and_unknown_fees_block(tmp_path):

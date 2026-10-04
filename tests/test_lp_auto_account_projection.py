@@ -42,16 +42,17 @@ def old_intent(**updates):
             'read_started_at': pool.NOW.isoformat(), 'checked_at': pool.NOW.isoformat()}, **updates)
 
 
-def test_account_projection_counts_order_ids_inventory_and_covered_audit_once(tmp_path):
-    engine, _, _, _ = covered_pool(tmp_path, buys=[buy('a'), buy('b')], inventory='12', pnl='3')
+@pytest.mark.parametrize('pnl', ['3', '-20', None])
+def test_account_projection_counts_order_ids_inventory_and_covered_audit_once(tmp_path, pnl):
+    engine, _, _, _ = covered_pool(tmp_path, buys=[buy('a'), buy('b')], inventory='12', pnl=pnl)
     intent = old_intent()
     engine._auto_pool._update(lambda d: d['intents'].update(old=intent))
     state = engine.lp_auto_state()
     assert state['slots'] == dict(active=2, pending=0, pending_review=0, canceling=0, occupied=2)
     assert Decimal(state['funds']['buy_reserved_usd']) == 16
     assert Decimal(state['funds']['inventory_cost_usd']) == 12
-    assert Decimal(state['funds']['total_usd']) == 103
-    assert Decimal(state['funds']['spendable_usd']) == 75
+    assert Decimal(state['funds']['total_usd']) == 100
+    assert Decimal(state['funds']['spendable_usd']) == 72
     assert Decimal(state['funds']['isolated_reserved_usd']) == 0
     assert state['funds']['status'] == 'known'
     assert state['intents'] == [intent]

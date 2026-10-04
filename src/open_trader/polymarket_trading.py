@@ -1463,7 +1463,10 @@ def _lp_position(value: object) -> dict[str, object] | None:
         "outcome": row.get("outcome"),
         "size": _lp_decimal(row.get("size", row.get("quantity"))),
         "average_price": _lp_decimal(row.get("average_price", row.get("avg_price"))),
+        "initial_value": _lp_decimal(row.get("initial_value")),
         "current_value": _lp_decimal(row.get("current_value")),
+        "current_price": _lp_decimal(row.get("cur_price")),
+        "redeemable": row.get("redeemable"),
     }
 
 

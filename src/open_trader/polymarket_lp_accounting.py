@@ -55,80 +55,10 @@ def reservation_is_covered(row: Mapping[str, object], account_id: str | None = N
     return bool(marker.get('snapshot_id') and marker.get('read_started_at'))
 
 
-def build_account_financial_facts(
-    snapshot: Mapping[str, object], *, now: datetime, expected_account_id: str | None = None,
-) -> dict[str, object]:
-    """Validate an authenticated round and price actual account exposure once.
-
-    Positive positions require complete own fills and known execution fees.
-    Display marks and position average prices are not acquisition-cost proof.
-    Nonzero fee rates alone lack the applicable fee schedule and stay unknown.
-    """
-    if snapshot.get('authenticated') is not True:
-        raise ValueError('account_snapshot_unknown')
-    required = ('balance_complete', 'open_orders_complete', 'positions_complete',
-                'trades_complete', 'pagination_complete')
-    if any(snapshot.get(key) is not True for key in required):
-        raise ValueError('account_snapshot_incomplete')
-    wallet = str(snapshot.get('wallet_address') or '').strip().casefold()
-    if (not wallet or str(snapshot.get('account_id') or '').strip().casefold() != wallet
-            or expected_account_id is not None and str(expected_account_id).strip().casefold() != wallet):
-        raise ValueError('account_identity_mismatch')
-    generation = snapshot.get('trade_generation')
-    if type(generation) is not int or generation < 0:
-        raise ValueError('account_round_invalid')
-    started = _timestamp(snapshot.get('read_started_at'), name='read_started_at')
-    checked = _timestamp(snapshot.get('checked_at'), name='checked_at')
-    ended = _timestamp(snapshot.get('read_ended_at'), name='read_ended_at')
-    if not started <= checked <= ended:
-        raise ValueError('account_read_order_invalid')
-    _freshness(checked, now, 'account_freshness')
-    _freshness(ended, now, 'account_freshness')
-    for name in ('open_orders', 'positions', 'raw_trades'):
-        if not isinstance(snapshot.get(name), (tuple, list)):
-            raise ValueError('account_' + name + '_unknown')
-    balance = _number(snapshot.get('balance'), 'account_balance_unknown')
-    allowance = _number(snapshot.get('allowance'), 'account_allowance_unknown')
+def _account_trade_report(snapshot, orders, positions, *, wallet, now):
+    """Historical reporting can be incomplete without changing current exposure."""
     reasons: set[str] = set()
-    orders: dict[str, dict[str, object]] = {}
-    for raw in snapshot['open_orders']:
-        if not isinstance(raw, Mapping):
-            raise ValueError('account_order_identity_unknown')
-        oid = str(raw.get('order_id') or raw.get('id') or '').strip()
-        token = str(raw.get('token_id') or raw.get('asset_id') or '').strip()
-        side = str(raw.get('side') or '').upper()
-        status = str(raw.get('status') or '').upper()
-        if not oid or not token or side not in {'BUY', 'SELL'} or not status:
-            raise ValueError('account_order_identity_unknown')
-        price = _number(raw.get('price'), 'order_price_unknown', positive=True)
-        if price > 1:
-            raise ValueError('order_price_unknown')
-        quantity = _number(raw.get('original_size', raw.get('quantity')), 'order_quantity_unknown')
-        filled = _number(raw.get('size_matched'), 'order_fill_unknown')
-        if filled > quantity:
-            raise ValueError('order_fill_exceeds_quantity')
-        remaining = quantity - filled
-        if status in {'FILLED', 'MATCHED'} and (quantity == ZERO or filled != quantity):
-            reasons.add('order_fill_coverage_unknown')
-        if raw.get('remaining_size') is not None and _number(raw['remaining_size'], 'order_remaining_unknown') != remaining:
-            raise ValueError('order_remaining_conflict')
-        record = dict(order_id=oid, token_id=token, condition_id=str(raw.get('condition_id') or raw.get('market') or ''),
-            side=side, status=status, price=str(price), quantity=str(remaining),
-            original_quantity=str(quantity), filled_quantity=str(filled))
-        if oid in orders and orders[oid] != record:
-            raise ValueError('order_identity_conflict')
-        orders[oid] = record
-    positions: dict[str, Decimal] = {}
-    for raw in snapshot['positions']:
-        if not isinstance(raw, Mapping):
-            raise ValueError('account_position_unknown')
-        token = str(raw.get('token_id') or raw.get('asset_id') or raw.get('asset') or '').strip()
-        if not token:
-            raise ValueError('account_position_unknown')
-        quantity = _number(raw.get('size', raw.get('quantity')), 'account_position_unknown')
-        if token in positions and positions[token] != quantity:
-            raise ValueError('account_position_conflict')
-        positions[token] = quantity
+    started = _timestamp(snapshot['read_started_at'], name='read_started_at')
     fills: dict[tuple[str, str], dict[str, object]] = {}
     fill_identities = {}
     for raw in snapshot['raw_trades']:
@@ -214,8 +144,6 @@ def build_account_financial_facts(
         for fill in fills.values():
             if fill['order_id'] == oid and (fill['token_id'] != row['token_id'] or fill['side'] != row['side']):
                 raise ValueError('order_identity_conflict')
-    totals = {}
-    inventory = ZERO
     realized = ZERO
     for token in set(positions) | {fill['token_id'] for fill in fills.values()}:
         token_fills = [fill for fill in fills.values() if fill['token_id'] == token]
@@ -250,9 +178,127 @@ def build_account_financial_facts(
         position = positions.get(token, ZERO)
         if position != quantity:
             reasons.add('position_cost_unknown' if position > 0 and not token_fills else 'position_mismatch')
-        totals[token] = dict(quantity=str(position), inventory_cost_usd=str(cost), realized_pnl_usd=str(pnl))
-        inventory += cost
         realized += pnl
+    confirmed = []
+    for (trade_id, order_id), fill in sorted(fills.items()):
+        if fill['status'] != 'CONFIRMED' or fill['fee'] is None:
+            continue
+        economics = {key: ('0' if fill[key] == ZERO else str(fill[key].normalize()))
+                     for key in ('quantity', 'price', 'fee')}
+        economics.update(token_id=fill['token_id'], side=fill['side'])
+        confirmed.append(dict(trade_id=trade_id, order_id=order_id,
+            fingerprint=hashlib.sha256(json.dumps(economics, sort_keys=True, separators=(',', ':')).encode()).hexdigest()))
+    return dict(
+        realized_pnl_usd=str(realized) if not reasons else None,
+        report_status='unknown' if reasons else 'known', report_reason_codes=sorted(reasons),
+        confirmed_fill_facts=confirmed,
+        order_fills={oid: str(sum((fill['quantity'] for fill in fills.values()
+            if fill['order_id'] == oid), ZERO)) for oid in set(orders) | {fill['order_id'] for fill in fills.values()}},
+    )
+
+
+def build_account_financial_facts(
+    snapshot: Mapping[str, object], *, now: datetime, expected_account_id: str | None = None,
+) -> dict[str, object]:
+    """Validate an authenticated round and price actual account exposure once.
+
+    Current positions and open orders are authoritative for exposure. Trade
+    history supplies reports only; gaps never veto a complete current snapshot.
+    """
+    if snapshot.get('authenticated') is not True:
+        raise ValueError('account_snapshot_unknown')
+    required = ('balance_complete', 'open_orders_complete', 'positions_complete',
+                'trades_complete', 'pagination_complete')
+    if any(snapshot.get(key) is not True for key in required):
+        raise ValueError('account_snapshot_incomplete')
+    wallet = str(snapshot.get('wallet_address') or '').strip().casefold()
+    if (not wallet or str(snapshot.get('account_id') or '').strip().casefold() != wallet
+            or expected_account_id is not None and str(expected_account_id).strip().casefold() != wallet):
+        raise ValueError('account_identity_mismatch')
+    generation = snapshot.get('trade_generation')
+    if type(generation) is not int or generation < 0:
+        raise ValueError('account_round_invalid')
+    started = _timestamp(snapshot.get('read_started_at'), name='read_started_at')
+    checked = _timestamp(snapshot.get('checked_at'), name='checked_at')
+    ended = _timestamp(snapshot.get('read_ended_at'), name='read_ended_at')
+    if not started <= checked <= ended:
+        raise ValueError('account_read_order_invalid')
+    _freshness(checked, now, 'account_freshness')
+    _freshness(ended, now, 'account_freshness')
+    for name in ('open_orders', 'positions', 'raw_trades'):
+        if not isinstance(snapshot.get(name), (tuple, list)):
+            raise ValueError('account_' + name + '_unknown')
+    balance = _number(snapshot.get('balance'), 'account_balance_unknown')
+    allowance = _number(snapshot.get('allowance'), 'account_allowance_unknown')
+    reasons: set[str] = set()
+    orders: dict[str, dict[str, object]] = {}
+    for raw in snapshot['open_orders']:
+        if not isinstance(raw, Mapping):
+            raise ValueError('account_order_identity_unknown')
+        oid = str(raw.get('order_id') or raw.get('id') or '').strip()
+        token = str(raw.get('token_id') or raw.get('asset_id') or '').strip()
+        side = str(raw.get('side') or '').upper()
+        status = str(raw.get('status') or '').upper()
+        if not oid or not token or side not in {'BUY', 'SELL'} or not status:
+            raise ValueError('account_order_identity_unknown')
+        price = _number(raw.get('price'), 'order_price_unknown', positive=True)
+        if price > 1:
+            raise ValueError('order_price_unknown')
+        quantity = _number(raw.get('original_size', raw.get('quantity')), 'order_quantity_unknown')
+        filled = _number(raw.get('size_matched'), 'order_fill_unknown')
+        if filled > quantity:
+            raise ValueError('order_fill_exceeds_quantity')
+        remaining = quantity - filled
+        if status in {'FILLED', 'MATCHED'} and (quantity == ZERO or filled != quantity):
+            reasons.add('order_fill_coverage_unknown')
+        if raw.get('remaining_size') is not None and _number(raw['remaining_size'], 'order_remaining_unknown') != remaining:
+            raise ValueError('order_remaining_conflict')
+        record = dict(order_id=oid, token_id=token, condition_id=str(raw.get('condition_id') or raw.get('market') or ''),
+            side=side, status=status, price=str(price), quantity=str(remaining),
+            original_quantity=str(quantity), filled_quantity=str(filled))
+        if oid in orders and orders[oid] != record:
+            raise ValueError('order_identity_conflict')
+        orders[oid] = record
+    positions: dict[str, Decimal] = {}
+    position_costs: dict[str, Decimal | None] = {}
+    for raw in snapshot['positions']:
+        if not isinstance(raw, Mapping):
+            raise ValueError('account_position_unknown')
+        token = str(raw.get('token_id') or raw.get('asset_id') or raw.get('asset') or '').strip()
+        if not token:
+            raise ValueError('account_position_unknown')
+        quantity = _number(raw.get('size', raw.get('quantity')), 'account_position_unknown')
+        if token in positions and positions[token] != quantity:
+            raise ValueError('account_position_conflict')
+        cost = None
+        try:
+            if quantity == ZERO:
+                cost = ZERO
+            elif (raw.get('redeemable') is True
+                  and raw.get('current_price') is not None and raw.get('current_value') is not None
+                  and _number(raw['current_price'], 'account_position_cost_unknown') == ZERO
+                  and _number(raw['current_value'], 'account_position_cost_unknown') == ZERO):
+                # Redeemable zero-payout tokens can remain in the API position
+                # list after resolution. They no longer tie up strategy capital.
+                cost = ZERO
+            elif raw.get('initial_value') is not None:
+                cost = _number(raw['initial_value'], 'account_position_cost_unknown')
+            else:
+                average = _number(raw.get('average_price'), 'account_position_cost_unknown')
+                if average > 1:
+                    raise ValueError('account_position_cost_unknown')
+                cost = quantity * average
+        except ValueError:
+            reasons.add('account_position_cost_unknown')
+        if token in position_costs and position_costs[token] != cost:
+            raise ValueError('account_position_conflict')
+        positions[token] = quantity
+        position_costs[token] = cost
+    try:
+        report = _account_trade_report(snapshot, orders, positions, wallet=wallet, now=now)
+    except ValueError as exc:
+        report = dict(realized_pnl_usd=None, report_status='unknown',
+                      report_reason_codes=[str(exc)], confirmed_fill_facts=[], order_fills={})
     buys = []
     for row in orders.values():
         if row['status'] in TERMINAL_ORDER_STATES or row['side'] != 'BUY' or Decimal(row['quantity']) == ZERO:
@@ -265,29 +311,18 @@ def build_account_financial_facts(
             'reserved_usd': str(Decimal(row['quantity']) * Decimal(row['price'])),
             'financial_status': 'known' if state != 'unknown' else 'unknown'})
     known = not reasons
-    confirmed = []
-    for (trade_id, order_id), fill in sorted(fills.items()):
-        if fill['status'] != 'CONFIRMED' or fill['fee'] is None:
-            continue
-        economics = {key: ('0' if fill[key] == ZERO else str(fill[key].normalize()))
-                     for key in ('quantity', 'price', 'fee')}
-        economics.update(token_id=fill['token_id'], side=fill['side'])
-        confirmed.append(dict(trade_id=trade_id, order_id=order_id,
-            fingerprint=hashlib.sha256(json.dumps(economics, sort_keys=True, separators=(',', ':')).encode()).hexdigest()))
-    result = dict(version=1, account_id=wallet, pool_account_id=hashlib.sha256(wallet.encode()).hexdigest(),
+    result = dict(version=2, inventory_basis="api_positions", account_id=wallet, pool_account_id=hashlib.sha256(wallet.encode()).hexdigest(),
         checked_at=checked.isoformat(), read_started_at=started.isoformat(), read_ended_at=ended.isoformat(),
         trade_generation=generation, balance_usd=str(balance), allowance_usd=str(allowance),
         financial_status='known' if known else 'unknown', reason_codes=sorted(reasons),
-        inventory_cost_usd=str(inventory) if known else None,
-        realized_pnl_usd=str(realized) if known else None,
-        confirmed_fill_facts=confirmed,
+        inventory_cost_usd=str(sum(position_costs.values(), ZERO)) if known else None,
+        **report,
         buys=sorted(buys, key=lambda row: row['order_id']),
         open_order_tokens=sorted({row['token_id'] for row in orders.values()
             if row['status'] not in TERMINAL_ORDER_STATES and Decimal(row['quantity']) > ZERO}),
-        order_fills={oid: str(sum((fill['quantity'] for fill in fills.values()
-            if fill['order_id'] == oid), ZERO)) for oid in set(orders) | {fill['order_id'] for fill in fills.values()}},
-        positions=([{'token_id': token, **totals[token]} for token in sorted(totals)] if known else
-            [{'token_id': token, 'quantity': str(positions[token])} for token in sorted(positions)]))
+        positions=[dict(token_id=token, quantity=str(positions[token]),
+            inventory_cost_usd=str(position_costs[token]) if position_costs[token] is not None else None)
+            for token in sorted(positions)])
     result['snapshot_id'] = hashlib.sha256(json.dumps(result, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     return result
 
