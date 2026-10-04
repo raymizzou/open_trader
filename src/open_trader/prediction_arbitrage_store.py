@@ -4104,17 +4104,23 @@ class PredictionArbitrageStore:
                         """
                     ).fetchall()
                 else:
-                    placeholders = ",".join("?" for _ in identities)
-                    rows = connection.execute(
-                        f"""
-                        SELECT * FROM lp_preparation_items
-                        WHERE state != 'recovered'
-                          AND paused=0 AND retry_used=0 AND next_retry_at IS NOT NULL
-                          AND condition_id IN ({placeholders})
-                        ORDER BY next_retry_at, condition_id
-                        """,
-                        identities,
-                    ).fetchall()
+                    # Older deployed SQLite builds allow only 999 parameters.
+                    # Keep every batch and retry spend in this one transaction.
+                    batch_size = max(1, connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER))
+                    rows = []
+                    for offset in range(0, len(identities), batch_size):
+                        batch = identities[offset : offset + batch_size]
+                        placeholders = ",".join("?" for _ in batch)
+                        rows.extend(connection.execute(
+                            f"""
+                            SELECT * FROM lp_preparation_items
+                            WHERE state != 'recovered'
+                              AND paused=0 AND retry_used=0 AND next_retry_at IS NOT NULL
+                              AND condition_id IN ({placeholders})
+                            """,
+                            batch,
+                        ).fetchall())
+                    rows.sort(key=lambda row: (row["next_retry_at"], row["condition_id"]))
                 for row in rows:
                     try:
                         due = _parse_timestamp(row["next_retry_at"])

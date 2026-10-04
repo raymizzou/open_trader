@@ -3243,6 +3243,141 @@ def test_lp_price_history_cache_survives_restart_without_fabricating_books(
     ) == []
 
 
+@pytest.mark.parametrize("variable_limit", [999, 31])
+def test_lp_retry_claim_exceeds_sqlite_limit_without_losing_order_or_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variable_limit: int,
+) -> None:
+    db = store(tmp_path)
+    now = datetime(2026, 10, 4, 1, tzinfo=UTC)
+    conditions = tuple(f"condition-{index:04d}" for index in range(1001))
+    for index, condition in enumerate(conditions):
+        db.lp_record_preparation_failure(
+            condition, generation=3, stage="metadata", error="TransportError",
+            failed_at=now - timedelta(seconds=600 if index % 2 else 300),
+        )
+    for condition, error, failed_at in (
+        ("future", "TransportError", now),
+        ("paused", "RequestRejectedError", now - timedelta(hours=1)),
+        ("spent", "TransportError", now - timedelta(hours=1)),
+        ("unselected", "TransportError", now - timedelta(hours=1)),
+    ):
+        db.lp_record_preparation_failure(
+            condition, generation=3, stage="metadata", error=error, failed_at=failed_at,
+        )
+    assert len(db.lp_claim_preparation_retries(now=now, condition_ids=["spent"])) == 1
+    before = {item["condition_id"]: item for item in db.lp_preparation_items()}
+
+    connect = sqlite3.connect
+
+    def limited_connect(*args, **kwargs):
+        connection = connect(*args, **kwargs)
+        connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, variable_limit)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", limited_connect)
+    requested = (*reversed(conditions), "future", "paused", "spent", "missing",
+                 "", f" {conditions[0]} ", conditions[-1])
+    claimed = db.lp_claim_preparation_retries(now=now, condition_ids=requested)
+
+    # Global deadline order, then condition ID, regardless of input/chunk order.
+    assert [item["condition_id"] for item in claimed] == [
+        *conditions[1::2], *conditions[::2],
+    ]
+    assert all(item["generation"] == 3 and item["retry_used"] is True
+               and item["state"] == "retrying" and item["next_retry_at"] is None
+               and item["retry_started_at"] == iso(now) for item in claimed)
+    after = {item["condition_id"]: item for item in db.lp_preparation_items()}
+    assert {key: after[key] for key in ("future", "paused", "spent", "unselected")} == {
+        key: before[key] for key in ("future", "paused", "spent", "unselected")
+    }
+    assert db.lp_claim_preparation_retries(now=now, condition_ids=requested) == []
+    assert [item["condition_id"] for item in db.lp_claim_preparation_retries(
+        now=now + timedelta(seconds=300), condition_ids=requested,
+    )] == ["future"]
+
+
+def test_lp_retry_claim_rolls_back_all_batches_on_late_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = store(tmp_path)
+    now = datetime(2026, 10, 4, 1, tzinfo=UTC)
+    conditions = tuple(f"condition-{index:02d}" for index in range(32))
+    for condition in conditions:
+        db.lp_record_preparation_failure(
+            condition, generation=1, stage="metadata", error="TransportError",
+            failed_at=now - timedelta(minutes=5),
+        )
+    before = db.lp_preparation_items()
+    connect = sqlite3.connect
+    with connect(db.path) as connection:
+        connection.execute("""
+            CREATE TRIGGER fail_late_retry BEFORE UPDATE ON lp_preparation_items
+            WHEN NEW.condition_id='condition-31' AND NEW.retry_used=1
+            BEGIN SELECT RAISE(ABORT, 'injected late claim failure'); END
+        """)
+
+    def limited_connect(*args, **kwargs):
+        connection = connect(*args, **kwargs)
+        connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 10)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", limited_connect)
+    with pytest.raises(sqlite3.IntegrityError, match="injected late claim failure"):
+        db.lp_claim_preparation_retries(now=now, condition_ids=conditions)
+    assert db.lp_preparation_items() == before
+    with connect(db.path) as connection:
+        connection.execute("DROP TRIGGER fail_late_retry")
+    reopened = PredictionArbitrageStore(db.data_dir)
+    assert [item["condition_id"] for item in reopened.lp_claim_preparation_retries(
+        now=now, condition_ids=conditions,
+    )] == list(conditions)
+
+
+def test_lp_retry_claim_keeps_owner_and_visibility_across_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from threading import Event
+
+    db = store(tmp_path)
+    contender = PredictionArbitrageStore(db.data_dir)
+    now = datetime(2026, 10, 4, 1, tzinfo=UTC)
+    conditions = tuple(f"condition-{index:02d}" for index in range(32))
+    for condition in conditions:
+        db.lp_record_preparation_failure(
+            condition, generation=1, stage="metadata", error="TransportError",
+            failed_at=now - timedelta(minutes=5),
+        )
+    before = db.lp_preparation_items()
+    update_started, release_update = Event(), Event()
+    connect = sqlite3.connect
+
+    def authorize(action, table, column, database, trigger):
+        if action == sqlite3.SQLITE_UPDATE and table == "lp_preparation_items":
+            update_started.set()
+            assert release_update.wait(5), "test controller did not release claim"
+        return sqlite3.SQLITE_OK
+
+    def limited_connect(*args, **kwargs):
+        connection = connect(*args, **kwargs)
+        connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 10)
+        connection.set_authorizer(authorize)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", limited_connect)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(db.lp_claim_preparation_retries, now=now, condition_ids=conditions)
+        try:
+            assert update_started.wait(5), "claim never reached its write transaction"
+            assert contender.lp_preparation_items() == before
+            assert contender.lp_claim_preparation_retries(now=now, condition_ids=conditions) == []
+        finally:
+            release_update.set()
+        assert [item["condition_id"] for item in future.result(timeout=5)] == list(conditions)
+    assert contender.lp_claim_preparation_retries(now=now, condition_ids=conditions) == []
+    assert contender.lp_try_acquire_preparation_owner()
+    contender.lp_release_preparation_owner()
+
+
 def test_lp_recovery_fences_only_recovered_condition(tmp_path: Path) -> None:
     data_dir = tmp_path / "recovery-fence"
     failed_at = datetime(2026, 9, 18, 12, 0, tzinfo=UTC)
