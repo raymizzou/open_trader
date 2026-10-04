@@ -49,6 +49,7 @@ def main(argv=None):
     prediction.add_argument('--mode', required=True, choices=['production', 'shadow'])
     prediction.add_argument('--config', type=absolute_path)
     prediction.add_argument('--n-leg-paused', choices=['0', '1'])
+    prediction.add_argument('--https-proxy')
     cloud = kinds.add_parser('prediction-systemd')
     cloud.add_argument('--config', required=True, type=absolute_path)
     cloud.add_argument('--action', choices=['install', 'start'], default='install')
@@ -82,6 +83,8 @@ def main(argv=None):
                 command.extend(['--config', str(args.config)])
             if args.n_leg_paused is not None:
                 command.extend(['--n-leg-paused', args.n_leg_paused])
+            if args.https_proxy is not None:
+                command.extend(['--https-proxy', args.https_proxy])
         run_preflight(args)
         if config_bytes is not None and args.config.read_bytes() != config_bytes:
             raise ValueError('cloud config changed during preflight')

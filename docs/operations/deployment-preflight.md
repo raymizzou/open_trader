@@ -99,8 +99,15 @@ Supported kinds are `dashboard --mode gateway|legacy|stack`, `account [--evidenc
 `prediction-systemd --config /absolute/cloud.json --action install|start`.
 The cloud config must bind the exact same SHA, release root, runtime root and
 interpreter; the existing systemd helper retains its trusted-path and ownership
-checks. The launchd Prediction option accepts an explicit `--config` and
-`--n-leg-paused 0|1`. Set the common `--extra cloud-ssm` or `--extra browser`
+checks. The launchd Prediction option accepts an explicit `--config`,
+`--n-leg-paused 0|1`, and `--https-proxy http://127.0.0.1:1082`.
+The proxy must be an existing loopback HTTP proxy without credentials or a path.
+It is written only into the Prediction plist; loopback requests bypass it.
+Omitting the option preserves the managed service's setting, and
+`--https-proxy ''` explicitly disables it. The caller's shell proxy variables
+are not copied into the service. A changed proxy restarts even the same release
+through the existing identity, ownership and readiness checks.
+Set the common `--extra cloud-ssm` or `--extra browser`
 before the kind when needed.
 
 Host Readiness and Smoke remain separate fresh checks with their existing host,

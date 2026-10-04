@@ -21,9 +21,11 @@ PS_BIN="${PS_BIN:-/bin/ps}"
 WAIT_SECONDS="${PREDICTION_SERVICE_LAUNCHD_WAIT_SECONDS:-90}"
 LABEL="com.open-trader.prediction-service"
 N_LEG_PAUSED_OVERRIDE="${OPEN_TRADER_NLEG_PAUSED:-}"
+HTTPS_PROXY_REQUESTED=0
+HTTPS_PROXY_OVERRIDE=""
 
 usage() {
-  echo "usage: $0 --runtime-root PATH [--dry-run] [--preflight] [--mode shadow|production] [--n-leg-paused 0|1] [--repo-root PATH] [--python PATH] [--config PATH] [--notifier-config PATH] [--launch-agents-dir PATH] [--wait-seconds N] [--release-manifest PATH] [--expected-sha SHA]" >&2
+  echo "usage: $0 --runtime-root PATH [--dry-run] [--preflight] [--mode shadow|production] [--n-leg-paused 0|1] [--https-proxy URL] [--repo-root PATH] [--python PATH] [--config PATH] [--notifier-config PATH] [--launch-agents-dir PATH] [--wait-seconds N] [--release-manifest PATH] [--expected-sha SHA]" >&2
 }
 
 fail() {
@@ -37,6 +39,7 @@ while [[ $# -gt 0 ]]; do
     --preflight) PREFLIGHT=1; shift ;;
     --mode) [[ $# -ge 2 ]] || { usage; exit 2; }; MODE="$2"; shift 2 ;;
     --n-leg-paused) [[ $# -ge 2 ]] || { usage; exit 2; }; N_LEG_PAUSED_OVERRIDE="$2"; shift 2 ;;
+    --https-proxy) [[ $# -ge 2 ]] || { usage; exit 2; }; HTTPS_PROXY_REQUESTED=1; HTTPS_PROXY_OVERRIDE="$2"; shift 2 ;;
     --runtime-root) [[ $# -ge 2 ]] || { usage; exit 2; }; RUNTIME_ROOT="$2"; shift 2 ;;
     --repo-root) [[ $# -ge 2 ]] || { usage; exit 2; }; REPO_ROOT="$2"; shift 2 ;;
     --python) [[ $# -ge 2 ]] || { usage; exit 2; }; PYTHON_BIN="$2"; shift 2 ;;
@@ -111,6 +114,36 @@ if [[ -n "$N_LEG_PAUSED_REQUESTED" \
   N_LEG_PAUSED_CHANGED=1
 fi
 
+PROXY_SETTINGS="$("$PYTHON_BIN" - "$PLIST_PATH" "$HTTPS_PROXY_REQUESTED" "$HTTPS_PROXY_OVERRIDE" <<'PY'
+import plistlib
+import sys
+from pathlib import Path
+from urllib.parse import urlsplit
+
+try:
+    path = Path(sys.argv[1])
+    previous = (plistlib.loads(path.read_bytes()).get("EnvironmentVariables", {}).get("HTTPS_PROXY", "")
+                if path.exists() else "")
+    value = sys.argv[3] if sys.argv[2] == "1" else previous
+    for proxy in (previous, value):
+        if not isinstance(proxy, str):
+            raise ValueError()
+        if not proxy:
+            continue
+        parsed = urlsplit(proxy)
+        if (any(char.isspace() for char in proxy) or parsed.scheme != "http"
+                or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+                or not parsed.port or parsed.username is not None or parsed.password is not None
+                or parsed.path or parsed.query or parsed.fragment):
+            raise ValueError()
+    print(f"{int(value != previous)} {value}")
+except (OSError, ValueError, TypeError, AttributeError):
+    raise SystemExit("HTTPS proxy must be a loopback HTTP URL without credentials or a path")
+PY
+)"
+HTTPS_PROXY_CHANGED="${PROXY_SETTINGS%% *}"
+HTTPS_PROXY_VALUE="${PROXY_SETTINGS#* }"
+
 sed_escape() {
   printf '%s' "$1" | sed 's/[\\&|]/\\&/g'
 }
@@ -123,6 +156,7 @@ render_plist() {
     -e "s|OPEN_TRADER_NOTIFIER_CONFIG|$(sed_escape "$NOTIFIER_CONFIG")|g" \
     -e "s|OPEN_TRADER_PREDICTION_MODE|$(sed_escape "$MODE")|g" \
     -e "s|OPEN_TRADER_NLEG_PAUSED_VALUE|$(sed_escape "$N_LEG_PAUSED")|g" \
+    -e "s|OPEN_TRADER_HTTPS_PROXY_VALUE|$(sed_escape "$HTTPS_PROXY_VALUE")|g" \
     -e "s|OPEN_TRADER_RELEASE_MANIFEST|$(sed_escape "$RELEASE_MANIFEST")|g" \
     -e "s|OPEN_TRADER_RUNTIME_ROOT|$(sed_escape "$RUNTIME_ROOT")|g" \
     -e "s|OPEN_TRADER_REPO|$(sed_escape "$REPO_ROOT")|g" \
@@ -981,7 +1015,7 @@ fi
 
 if [[ "$MANAGED_OLD" -eq 1 \
   && "$CANDIDATE_JSON" == "$OBSERVED_RELEASE_FOR_RECORD" \
-  && "$N_LEG_PAUSED_CHANGED" -eq 0 ]] && record_matches_observed \
+  && "$N_LEG_PAUSED_CHANGED" -eq 0 && "$HTTPS_PROXY_CHANGED" -eq 0 ]] && record_matches_observed \
   && record_ready_matches_observed; then
   echo "prediction release already ready: $ACTUAL_SHA"
   exit 0
@@ -1181,7 +1215,7 @@ if [[ "$MANAGED_OLD" -eq 1 && "$RECORD_CANDIDATE_OBSERVED" -eq 0 ]]; then
   archive_record "$OBSERVED_RECOVERY_REASON" \
     || fail "prediction runtime record recovery archive could not be written"
 fi
-if [[ "$TARGET_CANDIDATE_OBSERVED" -eq 1 && "$N_LEG_PAUSED_CHANGED" -eq 0 ]]; then
+if [[ "$TARGET_CANDIDATE_OBSERVED" -eq 1 && "$N_LEG_PAUSED_CHANGED" -eq 0 && "$HTTPS_PROXY_CHANGED" -eq 0 ]]; then
   RECORD_STATE="$("$PYTHON_BIN" - "$CURRENT_RECORD_JSON" <<'PY'
 import json
 import sys

@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "scripts" / "install_prediction_service_launchd.sh"
@@ -26,6 +28,8 @@ def test_template_runs_only_the_loopback_shadow_service() -> None:
         "PYTHONPATH": "OPEN_TRADER_REPO/src",
         "PYTHONDONTWRITEBYTECODE": "1",
         "OPEN_TRADER_NLEG_PAUSED": "OPEN_TRADER_NLEG_PAUSED_VALUE",
+        "HTTPS_PROXY": "OPEN_TRADER_HTTPS_PROXY_VALUE",
+        "NO_PROXY": "127.0.0.1,localhost,::1",
     }
     assert payload["ProgramArguments"] == [
         "OPEN_TRADER_PYTHON", "-m", "open_trader", "prediction-service",
@@ -103,7 +107,43 @@ def test_installer_preserves_explicit_n_leg_pause(tmp_path: Path) -> None:
     assert "OPEN_TRADER_NLEG_PAUSED must be 0 or 1" in rejected.stderr
 
 
-def test_production_installer_applies_n_leg_pause_on_same_release(tmp_path: Path) -> None:
+def test_installer_proxy_is_explicit_preserved_and_can_be_disabled(tmp_path: Path) -> None:
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    common = [str(INSTALLER), "--dry-run", "--runtime-root", str(tmp_path / "runtime"),
+              "--repo-root", str(ROOT), "--python", sys.executable,
+              "--launch-agents-dir", str(agents)]
+    environment = {**os.environ, "HTTPS_PROXY": "http://127.0.0.1:9999"}
+    def render(*args):
+        result = subprocess.run(common + list(args), check=True, capture_output=True,
+                                text=True, env=environment)
+        return plistlib.loads(result.stdout.encode())
+    assert render()["EnvironmentVariables"]["HTTPS_PROXY"] == ""
+    enabled = render("--https-proxy", "http://127.0.0.1:1082")
+    assert enabled["EnvironmentVariables"]["HTTPS_PROXY"] == "http://127.0.0.1:1082"
+    assert enabled["EnvironmentVariables"]["NO_PROXY"] == "127.0.0.1,localhost,::1"
+    (agents / f"{LABEL}.plist").write_bytes(plistlib.dumps(enabled))
+    assert render()["EnvironmentVariables"]["HTTPS_PROXY"] == "http://127.0.0.1:1082"
+    assert render("--https-proxy", "")["EnvironmentVariables"]["HTTPS_PROXY"] == ""
+
+
+@pytest.mark.parametrize("proxy", ["http://example.com:1082", "http://user:secret@127.0.0.1:1082",
+                                    "http://127.0.0.1:1082/path", "http://127.0.0.1:1082/",
+                                    "http://127.0.0.1:0", "bad"])
+def test_installer_rejects_invalid_proxy_before_writing(tmp_path: Path, proxy: str) -> None:
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    result = subprocess.run([str(INSTALLER), "--dry-run", "--runtime-root", str(tmp_path / "runtime"),
+                             "--repo-root", str(ROOT), "--python", sys.executable,
+                             "--launch-agents-dir", str(agents), "--https-proxy", proxy],
+                            capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "HTTPS proxy must be a loopback HTTP URL" in result.stderr
+    assert "secret" not in result.stderr
+    assert not tuple(agents.iterdir())
+
+
+def test_production_installer_applies_explicit_startup_settings_on_same_release(tmp_path: Path) -> None:
     repo = _copy_repo(tmp_path)
     (repo / "src/open_trader").mkdir(parents=True)
     shutil.copy2(ROOT / "src/open_trader/prediction_release.py", repo / "src/open_trader/prediction_release.py")
@@ -191,6 +231,7 @@ def test_production_installer_applies_n_leg_pause_on_same_release(tmp_path: Path
         "    current['loaded'] = True\n"
         "    current['pid'] = int(current.get('pid', 4241)) + 1\n"
         "    current['pause'] = env.get('OPEN_TRADER_NLEG_PAUSED', '0')\n"
+        "    current['proxy'] = env.get('HTTPS_PROXY', '')\n"
         "    current['started_at'] = 'start-' + str(current['pid'])\n"
         "    state_path.write_text(json.dumps(current), encoding='utf-8')\n"
         "    raise SystemExit(0)\n"
@@ -327,6 +368,7 @@ def test_production_installer_applies_n_leg_pause_on_same_release(tmp_path: Path
     assert "launchctl bootstrap" in first_calls
     assert health_log.read_text(encoding="utf-8").splitlines()[-1] == "1"
 
+
     call_count = len(first_calls.splitlines())
     preserved = subprocess.run(command, capture_output=True, text=True, env=environment)
     assert preserved.returncode == 0, preserved.stderr
@@ -349,6 +391,25 @@ def test_production_installer_applies_n_leg_pause_on_same_release(tmp_path: Path
     assert "recovered managed prediction release" not in recovery.stdout
     assert plistlib.loads(plist.read_bytes())["EnvironmentVariables"]["OPEN_TRADER_NLEG_PAUSED"] == "1"
     assert health_log.read_text(encoding="utf-8").splitlines()[-1] == "1"
+
+    before_proxy = len(calls.read_text().splitlines())
+    proxy = subprocess.run(command + ["--https-proxy", "http://127.0.0.1:1082"],
+                           capture_output=True, text=True, env=environment)
+    assert proxy.returncode == 0, proxy.stderr
+    proxy_calls = calls.read_text().splitlines()[before_proxy:]
+    assert any("launchctl bootout" in row for row in proxy_calls)
+    assert any("launchctl bootstrap" in row for row in proxy_calls)
+    assert json.loads(state.read_text())["proxy"] == "http://127.0.0.1:1082"
+    before_preserve = len(calls.read_text().splitlines())
+    preserved_proxy = subprocess.run(command, capture_output=True, text=True, env=environment)
+    assert preserved_proxy.returncode == 0, preserved_proxy.stderr
+    assert "already ready" in preserved_proxy.stdout
+    assert not any("launchctl bootout" in row or "launchctl bootstrap" in row
+                   for row in calls.read_text().splitlines()[before_preserve:])
+    disabled_proxy = subprocess.run(command + ["--https-proxy", ""], capture_output=True,
+                                    text=True, env=environment)
+    assert disabled_proxy.returncode == 0, disabled_proxy.stderr
+    assert json.loads(state.read_text())["proxy"] == ""
 
 
 
