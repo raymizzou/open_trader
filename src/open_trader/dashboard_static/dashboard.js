@@ -4470,11 +4470,8 @@ function lpTrialStatusCell(row, isCurrent) {
 }
 
 function lpTrialQueryRateCell(row) {
-  // Issue #138 round 2: the candidate table shows the estimated hourly
-  // yield of holding a 5% official reward share, with the hypothetical
-  // target plan and the minimum trial plan on separate sub-lines.  A
-  // missing estimate stays 待测 — never zero, never a whole-pool fallback.
-  const cell = "<td data-label=\"5% 奖励份额 · 预计收益率/小时\" class=\"num\">";
+  // Recommendation and auto BUY share the actual minimum scoring order.
+  const cell = "<td data-label=\"最小计奖挂单 · 预计收益率/小时\" class=\"num\">";
   const hasEstimate = String(row?.estimate_state || "") === "known"
     && predictionHasValue(row?.estimated_yield_pct_per_hour);
   const targetCapital = predictionHasValue(row?.estimated_target_capital_usd)
@@ -4492,7 +4489,7 @@ function lpTrialQueryRateCell(row) {
       + "<span class=\"sub\">估值缺失，不回退奖池上限</span></td>";
   }
   return cell + "<span>≈" + escapeHtml(String(row.estimated_yield_pct_per_hour)) + "%/小时</span>"
-    + "<span class=\"sub\">目标占资 " + escapeHtml(targetCapital)
+    + "<span class=\"sub\">挂单占资 " + escapeHtml(targetCapital)
     + "（" + escapeHtml(targetQuantity) + " 份）</span>"
     + "<span class=\"sub\">最小试挂 " + escapeHtml(minTrial) + "</span></td>";
 }
@@ -4883,10 +4880,10 @@ function predictionLpCard(payload) {
     + competitionObservationMarkup
     + "<div class=\"pm-table-wrap\"><table class=\"pm-table pm-lp-candidate-table\">"
     + "<thead><tr><th scope=\"col\">市场与方向</th><th scope=\"col\">官方竞争 · 密度</th><th scope=\"col\">日奖池</th>"
-    + "<th scope=\"col\">5% 奖励份额 · 预计收益率/小时</th><th scope=\"col\">拟挂方案（价 × 份 = 实际占资）</th>"
+    + "<th scope=\"col\">最小计奖挂单 · 预计收益率/小时</th><th scope=\"col\">拟挂方案（价 × 份 = 实际占资）</th>"
     + "<th scope=\"col\">压力退出损失（金额 / 比例）</th><th scope=\"col\">检查时间与状态</th><th scope=\"col\">操作</th></tr></thead>"
     + "<tbody>" + candidateRowsHtml + "</tbody></table></div>"
-    + "<p class=\"sub\">候选为持续滚动的候选池：探索线程按基础筛选队列分批轮转（每批最多 10 个市场、一次盘口读），估值成功即入池、每行自带 5 分钟有效期、到期自动让位；维护线程持续为当前展示前十续命；表内按目标 5% 官方奖励份额的预计收益率/小时降序，并列按估值时间新→旧、再按市场身份，第 1 名为当前推荐、退出由下一名自动补位；刷新失败的行保留至原到期并标注，值为上次成功估值；预计收益率为估值时盘口的估算、非保证收益，缺值显示待测、不回退奖池上限；未检查的市场不代表劣于已展示者；已有委托或持仓的市场不重复推荐；拟挂占资超过可用资金（已扣委托占用）的候选不进入队列；参考价有 1 小时新鲜门，过期进入备用队列；官方竞争按密度分档筛选，仅保留轻（[1,30)）中（[30,300)）两档，重度/过薄/零竞争/无数据市场整行排除并计入排除数；链接为普通跳转，实际下单前以 Polymarket 页面实时事实为准。</p></section>";
+    + "<p class=\"sub\">候选为持续滚动的候选池：探索线程按基础筛选队列分批轮转（每批最多 10 个市场、一次盘口读），估值成功即入池、每行自带 5 分钟有效期、到期自动让位；维护线程持续为当前展示前十续命；表内按实际最小合法/计奖挂单的预计收益率/小时降序，并列按估值时间新→旧、再按市场身份，第 1 名为当前推荐、退出由下一名自动补位；刷新失败的行保留至原到期并标注，值为上次成功估值；预计收益率为估值时盘口的估算、非保证收益，缺值显示待测、不回退奖池上限；未检查的市场不代表劣于已展示者；已有委托或持仓的市场不重复推荐；拟挂占资超过可用资金（已扣委托占用）的候选不进入队列；参考价有 1 小时新鲜门，过期进入备用队列；官方竞争按密度分档筛选，仅保留轻（[1,30)）中（[30,300)）两档，重度/过薄/零竞争/无数据市场整行排除并计入排除数；链接为普通跳转，实际下单前以 Polymarket 页面实时事实为准。</p></section>";
   // Issue 166: 一组沿用原标题；多组标题改「活动组 · N」，卡序=服务端顺序
   //（最新在前），完结组沉底照常显示。
   const sessionSummary = sessionList.length > 1

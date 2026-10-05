@@ -1281,6 +1281,50 @@ def estimate_lp_target_share_yield(
 LP_QUEUE_PROTECTION_THRESHOLD = Decimal("0.5")
 
 
+def minimum_order_estimate(direction, guidance, now, *, resting_quantity=Decimal(0)):
+    """Reuse reward weights, recompute the share at the actual legal quantity."""
+    ZERO = Decimal(0)
+    market = direction['market']
+    estimate = estimate_lp_target_share_yield(
+        direction['book'], price=_decimal(guidance['price'], 'money'),
+        reward_min_size=market['reward_min_size'],
+        reward_max_spread=market['reward_max_spread'],
+        daily_pool_usd=direction.get('daily_pool_usd'), now=now,
+    )
+    price, quantity = _decimal(guidance['price'], 'money'), _decimal(guidance['quantity'], 'money')
+    # Callers already validate fresh, complete current entry facts. Only these
+    # conclusive failures of the actual resting quote mean zero, not unknown.
+    if resting_quantity and ((estimate['state'] == 'known' and quantity < _decimal(market['reward_min_size'], 'money'))
+            or set(estimate.get('reason_codes', [])) in ({'reward_distance_invalid'}, {'reward_score_zero'})):
+        return dict(state='known', basis='resting_non_scoring_order', quantity=quantity,
+                    price=price, capital_usd=price*quantity, hourly_reward_usd=ZERO,
+                    yield_pct_per_hour=ZERO, checked_at=now)
+    if estimate['state'] != 'known':
+        return estimate
+    weight = (1 - abs(price - estimate['midpoint']) / _decimal(market['reward_max_spread'], 'money')) ** 2
+    competition = estimate['competition_upper_bound']
+    if resting_quantity:
+        bids = _levels(direction['book'].get('bids'), 'bids')
+        if sum((size for p, size in bids if p == price), ZERO) < resting_quantity:
+            return dict(state='unknown', reason_codes=['own_order_depth_unknown'])
+        # Keep the observed reward midpoint; remove our score from competition,
+        # since public depth already contains this resting order.
+        scores = []
+        for side in ('bids', 'asks'):
+            scores.append(sum((size * (1 - abs(p - estimate['midpoint']) /
+                _decimal(market['reward_max_spread'], 'money')) ** 2
+                for p, size in _levels(direction['book'].get(side), side)
+                if abs(p - estimate['midpoint']) < _decimal(market['reward_max_spread'], 'money')), ZERO))
+        scores[0] -= resting_quantity * weight
+        competition = min(scores) + abs(scores[0] - scores[1]) / 3
+    own_score = quantity * weight / 3
+    share = own_score / (competition + own_score)
+    reward = _decimal(direction['daily_pool_usd'], 'money') * share / 24
+    return dict(state='known', basis='resting_scoring_order' if resting_quantity else 'minimum_scoring_order', quantity=quantity,
+                price=price, capital_usd=price*quantity, hourly_reward_usd=reward,
+                yield_pct_per_hour=reward/(price*quantity)*100, checked_at=now)
+
+
 def estimate_lp_queue_position(
     book: object,
     *,

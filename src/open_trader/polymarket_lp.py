@@ -37,6 +37,7 @@ from .polymarket_lp_risk import (
     estimate_lp_queue_position,
     estimate_lp_target_share_yield,
     evaluate_lp_entry,
+    minimum_order_estimate,
     first_observation_baseline,
 )
 from .polymarket_lp_accounting import (
@@ -576,27 +577,18 @@ def _lp_direction_estimate(
     *,
     now: datetime,
 ) -> dict[str, object]:
-    """Run the 5% target-share estimator for one evaluated direction.
-
-    Shared by the batch scan and the 60-second maintenance path so both
-    publish the same estimate for the same book.  The inputs mirror
-    ``evaluate_lp_entry``: the direction's own book (complementary YES/NO
-    mirrors are never summed), its reward rules and pool, and the guidance
-    price (the live best bid the trial would quote).
-    """
-
-    market = direction.get("market")
-    book = direction.get("book")
-    if not isinstance(market, Mapping) or not isinstance(book, Mapping):
+    """Use the same actual minimum scoring order as automatic BUY ranking."""
+    if not isinstance(direction.get("market"), Mapping) or not isinstance(direction.get("book"), Mapping):
         return {"state": "unknown", "reason_codes": ["market_facts_unknown"]}
-    return estimate_lp_target_share_yield(
-        book,
-        price=cast(Decimal, guidance.get("price")),
-        reward_min_size=cast(Decimal, market.get("reward_min_size")),
-        reward_max_spread=cast(Decimal, market.get("reward_max_spread")),
-        daily_pool_usd=cast(Decimal, direction.get("daily_pool_usd")),
-        now=now,
-    )
+    estimate = minimum_order_estimate(direction, guidance, now)
+    if estimate['state'] != 'known':
+        return estimate
+    # Keep the published field names for existing API consumers. These now
+    # describe the actual legal minimum, not a hypothetical reward-share goal.
+    return {**estimate, 'target_quantity': estimate['quantity'],
+            'target_capital_usd': estimate['capital_usd'],
+            'yield_pct_per_hour_display': estimate['yield_pct_per_hour'].quantize(
+                Decimal('0.000001'), rounding=ROUND_HALF_UP)}
 
 
 def _direction_estimate_raw(result: Mapping[str, object]) -> Decimal | None:
@@ -618,6 +610,7 @@ def _apply_row_estimate_fields(
     """
 
     if isinstance(estimate, Mapping):
+        row["estimate_basis"] = estimate.get("basis")
         row["estimate_state"] = (
             "known" if estimate.get("state") == "known" else "unknown"
         )
@@ -635,6 +628,7 @@ def _apply_row_estimate_fields(
             else None
         )
     else:
+        row["estimate_basis"] = None
         row["estimate_state"] = "unknown"
         row["estimated_yield_raw"] = None
         row["estimated_yield_pct_per_hour"] = None
@@ -704,7 +698,7 @@ def _candidate_pool_row_expired(row: Mapping[str, object], now: datetime) -> boo
 def _candidate_yield_sort_key(
     row: Mapping[str, object],
 ) -> tuple[int, Decimal, int, Decimal, str]:
-    """Published-table order (issue #157): estimated target-share yield
+    """Published-table order (issue #157): estimated minimum-order yield
     descending first; UNKNOWN estimates rank after known ones — never as
     zero; the estimate judgment time (newest first) breaks those ties and
     the condition id keeps the order stable.  Competition and actual
@@ -4365,6 +4359,10 @@ class PolymarketLPService:
             key = str(condition_id or "").strip()
             if key and isinstance(row, Mapping):
                 restored_pool[key] = dict(row)
+                if row.get('estimate_basis') != 'minimum_scoring_order':
+                    # Do not relabel a prior release's 5% estimate. Keep its
+                    # original validity times; refresh supplies the new basis.
+                    _apply_row_estimate_fields(restored_pool[key], None)
         raw_rotation = saved.get("rotation")
         restored_rotation: dict[str, dict[str, object]] = {}
         if isinstance(raw_rotation, Mapping):
@@ -6225,7 +6223,7 @@ class PolymarketLPService:
                         result["guidance"], Mapping
                     ):
                         # Issue #138 round 2: every eligible direction
-                        # carries its 5% target-share estimate for the
+                        # carries its minimum-order estimate for the
                         # yield comparison.
                         result["estimate"] = _lp_direction_estimate(
                             maintenance_direction,
@@ -6808,17 +6806,17 @@ class PolymarketLPService:
         }
 
     def _read_candidate_facts(
-        self, identity: Mapping[str, object], *, wait_for_capacity: bool = False
+        self, identity: Mapping[str, object], *, wait_for_capacity: bool = False, account=None
     ) -> dict[str, object]:
         """Read market facts shared by entry qualification and resting BUY ranking."""
 
         return self._market_read(
             identity,
-            lambda: self._fetch_candidate_facts(identity),
+            lambda: self._fetch_candidate_facts(identity, account=account),
             wait_for_capacity=wait_for_capacity,
         )
 
-    def _fetch_candidate_facts(self, identity):
+    def _fetch_candidate_facts(self, identity, *, account=None):
         condition_id = str(identity.get("condition_id") or "").strip()
         token_id = str(identity.get("token_id") or "").strip()
         outcome = str(identity.get("outcome") or "").upper()
@@ -6834,7 +6832,7 @@ class PolymarketLPService:
         ):
             raise ValueError("candidate_readers_unavailable")
         try:
-            account = account_reader()
+            account = account_reader() if account is None else account
         except Exception as exc:
             raise ValueError("account_unknown") from exc
         if not isinstance(account, Mapping):
@@ -6950,9 +6948,9 @@ class PolymarketLPService:
         return {"account": dict(account), "direction": direction}
 
     def _read_candidate_snapshot(
-        self, identity: Mapping[str, object], *, now: datetime, ignore_session_id=None
+        self, identity: Mapping[str, object], *, now: datetime, ignore_session_id=None, account=None
     ) -> dict[str, object]:
-        facts = self._read_candidate_facts(identity)
+        facts = self._read_candidate_facts(identity, account=account)
         account, direction = facts["account"], facts["direction"]
         evaluation_now = self._now()
         evaluated = evaluate_lp_entry(
@@ -6977,6 +6975,7 @@ class PolymarketLPService:
             "market": direction["market"],
             "book": dict(direction["book"]),
             "candidate_evaluation": evaluated,
+            "candidate_direction": direction,
         }
 
 

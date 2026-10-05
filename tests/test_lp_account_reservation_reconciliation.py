@@ -979,18 +979,15 @@ def test_five_historical_holds_sync_then_refill_with_inventory_and_restart(runti
     account.create_limit_order = signed_order
     account.post_order = accepted_post
     execution.lp_auto_set_desired_running(True)
-    # Each accepted send invalidates account facts. Normal later rounds read
-    # the new generation before admitting the next BUY; no forced known funds.
-    for turn in range(max(1, expected_buys)):
-        _advance(runtime)
-        refilled = execution.lp_auto_run_once(round_id=f"five-historical-refill-{turn}")
+    reads_before = account.position_reads
+    _advance(runtime)
+    refilled = execution.lp_auto_run_once(round_id="five-historical-refill")
     assert len(account.posts) == expected_buys, str(refilled["last_round"])
     if expected_buys:
-        assert refilled["funds"]["status"] == "unknown"
-        assert refilled["funds"]["available_usd"] is None
-        _advance(runtime)
-        refilled = execution.lp_auto_run_once(round_id="five-historical-confirm")
+        assert account.position_reads - reads_before <= 12, "No duplicate complete account reconstruction per send"
+        repeated = execution.lp_auto_run_once(round_id="five-historical-refill")
         assert len(account.posts) == 5
+        assert repeated["slots"]["occupied"] == 5
     assert refilled["funds"]["status"] == "known", refilled
     assert refilled["slots"]["active"] == expected_buys
     assert refilled["slots"]["occupied"] == expected_buys

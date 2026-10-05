@@ -24,7 +24,7 @@ from typing import Mapping
 from .polymarket_lp_accounting import account_position_quantity, default_account_pool_document, reservation_is_covered, reservation_is_manually_released, reservation_is_released
 from .polymarket_lp_risk import (
     TERMINAL_ORDER_STATES, _account_after_reservations, _decimal as _money, _freshness, _levels,
-    _maybe_decimal, _timestamp, evaluate_lp_entry, estimate_lp_target_share_yield,
+    _maybe_decimal, _timestamp, evaluate_lp_entry, minimum_order_estimate,
 )
 from .daily_premarket import _notifier_channel, send_notification_with_results
 from .notifications import CompositeNotifier, notification_delivery_episode
@@ -102,49 +102,6 @@ def _reconcile_retry_plan(
     return now + timedelta(seconds=60), "fallback_minute"
 
 
-def minimum_order_estimate(direction, guidance, now, *, resting_quantity=ZERO):
-    """Reuse reward weights, recompute the share at the actual legal quantity."""
-    market = direction['market']
-    estimate = estimate_lp_target_share_yield(
-        direction['book'], price=_decimal(guidance['price']),
-        reward_min_size=_decimal(market['reward_min_size']),
-        reward_max_spread=_decimal(market['reward_max_spread']),
-        daily_pool_usd=_decimal(direction.get('daily_pool_usd')), now=now,
-    )
-    price, quantity = _decimal(guidance['price']), _decimal(guidance['quantity'])
-    # Callers already validate fresh, complete current entry facts. Only these
-    # conclusive failures of the actual resting quote mean zero, not unknown.
-    if resting_quantity and ((estimate['state'] == 'known' and quantity < _decimal(market['reward_min_size']))
-            or set(estimate.get('reason_codes', [])) in ({'reward_distance_invalid'}, {'reward_score_zero'})):
-        return dict(state='known', basis='resting_non_scoring_order', quantity=quantity,
-                    price=price, capital_usd=price*quantity, hourly_reward_usd=ZERO,
-                    yield_pct_per_hour=ZERO, checked_at=now)
-    if estimate['state'] != 'known':
-        return estimate
-    weight = (1 - abs(price - estimate['midpoint']) / _decimal(market['reward_max_spread'])) ** 2
-    competition = estimate['competition_upper_bound']
-    if resting_quantity:
-        bids = _levels(direction['book'].get('bids'), 'bids')
-        if sum((size for p, size in bids if p == price), ZERO) < resting_quantity:
-            return dict(state='unknown', reason_codes=['own_order_depth_unknown'])
-        # Keep the observed reward midpoint; remove our score from competition,
-        # since public depth already contains this resting order.
-        scores = []
-        for side in ('bids', 'asks'):
-            scores.append(sum((size * (1 - abs(p - estimate['midpoint']) /
-                _decimal(market['reward_max_spread'])) ** 2
-                for p, size in _levels(direction['book'].get(side), side)
-                if abs(p - estimate['midpoint']) < _decimal(market['reward_max_spread'])), ZERO))
-        scores[0] -= resting_quantity * weight
-        competition = min(scores) + abs(scores[0] - scores[1]) / 3
-    own_score = quantity * weight / 3
-    share = own_score / (competition + own_score)
-    reward = _decimal(direction['daily_pool_usd']) * share / 24
-    return dict(state='known', basis='resting_scoring_order' if resting_quantity else 'minimum_scoring_order', quantity=quantity,
-                price=price, capital_usd=price*quantity, hourly_reward_usd=reward,
-                yield_pct_per_hour=reward/(price*quantity)*100, checked_at=now)
-
-
 class LPAutoPool:
     def __init__(self, execution):
         self.execution = execution
@@ -158,6 +115,7 @@ class LPAutoPool:
         self._account_refresh_lock = threading.RLock()
         self._account_refresh_attempt = 0
         self._account_facts_wait = None
+        self._current_account = None
         self.lp._facts_attention_summary = self.state
         self.lp._facts_attention_verifier = self.reconcile_attention
 
@@ -345,6 +303,11 @@ class LPAutoPool:
         # original submission. Its audit survives late callbacks unchanged.
         intents = [i for i in audit_intents if not reservation_is_released(i, d['account_id'])]
         account, account_buys, account_reasons = self._account_projection_facts(d)
+        # Exact current API BUY IDs replace their known receipt projection,
+        # even when the clock cannot distinguish receipt and next read stamps.
+        current_ids = {(b['order_id'], b.get('token_id')) for b in account_buys}
+        intents = [i for i in intents if not (i.get('financial_status') == 'known'
+            and (i.get('order_id'), i.get('token_id')) in current_ids)]
         occupied = [i for i in intents if i['state'] not in ('terminal','rejected','aborted')]
         occupied += account_buys
         pending = [i for i in occupied if i['state'] in ('reserved','sending','unknown')]
@@ -670,16 +633,17 @@ class LPAutoPool:
 
     def candidates(self, *, releasing=()):
         """Consume the entire qualified pool before exclusion, never the UI top ten."""
-        from .polymarket_lp import _candidate_pool_row_expired
+        from .polymarket_lp import _candidate_pool_row_expired, _candidate_yield_sort_key
         with self.lp._candidate_state_lock:
             facts={key:deepcopy(value) for key,value in self.lp._candidate_qualification_facts.items()
                    if key in self.lp._candidate_pool and not _candidate_pool_row_expired(self.lp._candidate_pool[key], self._now())}
+            updated_at = {key:self.lp._candidate_pool[key].get('updated_at') for key in facts}
         result=[]
         for condition_id,cached in facts.items():
             if self._excluded(condition_id):
                 continue
             for direction in cached.get('directions',[]):
-                evaluated=evaluate_lp_entry(direction,account=self._ranking_account(cached.get('account') or {}, releasing),
+                evaluated=evaluate_lp_entry(direction,account=self._ranking_account(self._current_account or cached.get('account') or {}, releasing),
                     now=self._now(),reservations=self._ranking_reservations(releasing),candidate=True)
                 if evaluated.get('state')!='eligible':
                     continue
@@ -687,8 +651,10 @@ class LPAutoPool:
                 estimate=minimum_order_estimate(direction,guidance,self._now())
                 if estimate['state']!='known':
                     continue
-                result.append({**guidance,'minimum_order_estimate':estimate})
-        return sorted(result,key=lambda r:(-_decimal(r['minimum_order_estimate']['yield_pct_per_hour']),str(r['condition_id']),str(r['token_id'])))
+                result.append({**guidance,'minimum_order_estimate':estimate,
+                    'estimated_yield_raw':estimate['yield_pct_per_hour'],
+                    'updated_at':updated_at[condition_id]})
+        return sorted(result,key=lambda r:(*_candidate_yield_sort_key(r), str(r['token_id'])))
 
     def _ranking_account(self, account, releasing):
         if not isinstance(account.get('open_orders'), (list, tuple)):
@@ -1710,6 +1676,7 @@ class LPAutoPool:
                     reason = result.get('reason') or 'account_order_sync_unknown'
                     return failed(reason, waiting=reason in ('account_round_invalid', 'session_changed'))
                 self._account_facts_wait = None
+                self._current_account = snapshot
                 return True
         except (LpAccountRoundInvalid, LpObservationWait) as exc:
             # The next scheduled read or a newer valid dashboard publication
@@ -1899,12 +1866,37 @@ class LPAutoPool:
         wallet=str(snapshot['account'].get('wallet_address') or '').strip().casefold()
         if not wallet or hashlib.sha256(wallet.encode()).hexdigest()!=d['account_id']:
             raise ValueError('account_identity_mismatch')
+        generation = snapshot['account'].get('trade_generation')
+        if generation is not None and generation != self.store.lp_trade_generation():
+            raise ValueError('account_financial_facts_changed')
         _freshness(snapshot['account'].get('checked_at'),self._now(),'account_freshness',max_age=60)
         _freshness(snapshot['book'].get('received_at'),self._now(),'book_freshness',max_age=60)
 
-    def _submit(self, row, round_id, index, version):
+    def _check_candidate_rank(self, row, snapshot, peers):
+        direction = snapshot['candidate_direction']
+        estimate = minimum_order_estimate(direction, snapshot['candidate_evaluation']['guidance'], self._now())
+        if estimate['state'] != 'known':
+            raise ValueError('ranking_yield_unknown')
+        from .polymarket_lp import _candidate_yield_sort_key
+        previous_key = _candidate_yield_sort_key({**row,
+            'estimated_yield_raw':row['minimum_order_estimate']['yield_pct_per_hour']})
+        current_key = _candidate_yield_sort_key({**row, 'estimated_yield_raw':estimate['yield_pct_per_hour']})
+        for peer in peers:
+            if peer['condition_id'] == row['condition_id']:
+                continue
+            peer_key = _candidate_yield_sort_key({**peer,
+                'estimated_yield_raw':peer['minimum_order_estimate']['yield_pct_per_hour']})
+            if (previous_key < peer_key) != (current_key < peer_key):
+                raise ValueError('candidate_rank_changed')
+
+    def _submit(self, row, round_id, index, version, *, peers=()):
         # Network preparation never owns the existing protection/apply lane.
-        snapshot=self.lp._read_candidate_snapshot(row,now=self._now())
+        if self._refresh_account_facts() is False:
+            raise ValueError((self.state()["admission_block_reasons"] or ["account_unknown"])[0])
+        state = self.state()
+        if state['slots']['occupied'] >= state['target_buy_count']:
+            raise ValueError('target_filled')
+        snapshot=self.lp._read_candidate_snapshot(row,now=self._now(),account=self._current_account)
         lock=self.execution._acquire_global_lock()
         if lock is None:
             raise ValueError('execution_lock')
@@ -1917,19 +1909,20 @@ class LPAutoPool:
                 self.lp._mutex.release()
                 self.execution._release_global_lock(lock)
         try:
-            return self._submit_prepared(row,round_id,index,version,snapshot,release)
+            return self._submit_prepared(row,round_id,index,version,snapshot,release,peers=peers)
         finally:
             release()
 
-    def _submit_prepared(self, row, round_id, index, version, snapshot, release):
+    def _submit_prepared(self, row, round_id, index, version, snapshot, release, *, peers=()):
         from .polymarket_lp import expiration_for_review
         from .polymarket_lp_views import _next_review_at
         if self.store.active_execution() is not None:
             raise ValueError('active_execution')
+        self._check_candidate_rank(row, snapshot, peers)
         fresh=self.lp._fresh_candidate_row(row,snapshot,now=self._now())
         request=self.lp._normalize_request({**fresh,'candidate_policy':'best_bid_minimum','review_at':_next_review_at(self._now())})
         facts=self.lp._validate_snapshot(request,snapshot,now=self._now(),reservations=self.lp._candidate_reservations())
-        self.lp._require_lp_history(request,now=self._now())
+        self.lp._require_lp_history(request, now=self._now())
         if self._excluded(str(row['condition_id'])):
             raise ValueError('market_already_participating')
         intent_id=f'{round_id}:{index}'
@@ -1954,14 +1947,17 @@ class LPAutoPool:
         def post(signed, mark_post_started):
             from .polymarket_lp import AutoEntryNotSent
             try:
-                latest = self.lp._read_candidate_snapshot(request, now=self._now(), ignore_session_id=session_id)
+                if self._refresh_account_facts() is False:
+                    raise ValueError((self.state()["admission_block_reasons"] or ["account_unknown"])[0])
+                latest = self.lp._read_candidate_snapshot(request, now=self._now(), ignore_session_id=session_id,
+                    account=self._current_account)
+                self._check_candidate_rank(row, latest, peers)
                 eligible = self.lp._fresh_candidate_row(request, latest, now=self._now())
                 if any(_decimal(eligible[k]) != request[k] for k in ('price','quantity')):
                     raise ValueError('candidate_changed')
                 self.lp._validate_snapshot(request, latest, now=self._now(),
                     reservations=self.lp._candidate_reservations(ignore_session_id=session_id))
                 self.lp._require_lp_history(request, now=self._now())
-                self._refresh_account_facts()
             except ValueError as exc:
                 raise AutoEntryNotSent(str(exc)) from exc
             with self._send_barrier():
@@ -2018,7 +2014,12 @@ class LPAutoPool:
             return self._run_once(round_id=round_id, reuse_facts=reuse_facts)
 
     def _run_once(self, *, round_id=None, reuse_facts=False):
-        self._reconcile_unknown(reuse=reuse_facts, bounded=True)
+        if callable(getattr(self.lp.exchange, 'lp_account_snapshot_shared', None)):
+            # Current complete API exposure owns admission. Session history and
+            # notifications reconcile in their existing lanes, outside refill.
+            self._refresh_account_facts()
+        else:
+            self._reconcile_unknown(reuse=reuse_facts, bounded=True)
         rotation_reason = self._settle_rotations()
         d=self._read()
         round_id=round_id or uuid.uuid4().hex
@@ -2027,7 +2028,6 @@ class LPAutoPool:
         if round_id in d['rounds']:
             return self.state()
         state=self._projection(d)
-        deficit=max(0,d['target_buy_count']-state['slots']['occupied'])
         actions=[]
         candidates=[]
         targets=[]
@@ -2044,25 +2044,35 @@ class LPAutoPool:
                     reason = 'rotation_awaiting_reconciliation'
             except ValueError as exc:
                 reason = str(exc)
-            submitted=0
             seen=set()
             for index,row in enumerate(targets if not reason else []):
-                if submitted>=deficit:
-                    break
                 if self._resting_buy(row):
                     continue
                 if row['condition_id'] in seen:
                     continue
-                if not self.state()['desired_running'] or self.state()['admission_block_reasons']:
+                if not self.state()['desired_running']:
+                    reason = 'manually_paused'
                     break
+                seen.add(row['condition_id'])
                 try:
-                    result=self._submit(row,round_id,index,d['config_version'])
+                    result=self._submit(row,round_id,index,d['config_version'],peers=targets[:index]+targets[index+1:])
                     actions.append({'condition_id':row['condition_id'],**result})
-                    if result.get('session_id') and result.get('state')!='entry_rejected':
-                        submitted+=1
-                        seen.add(row['condition_id'])
+                    blockers = [r for r in self.state()['admission_block_reasons']
+                                if r != 'account_financial_facts_changed']
+                    if blockers:
+                        reason = blockers[0]
+                        break
                 except ValueError as exc:
+                    if str(exc) == 'target_filled':
+                        reason = 'target_filled'
+                        break
                     actions.append(dict(condition_id=row['condition_id'],state='rejected',reason=str(exc)))
+                    if self.state()['admission_block_reasons']:
+                        reason = self.state()['admission_block_reasons'][0]
+                        break
+            if actions:
+                self._refresh_account_facts()
+                reason = (self.state()['admission_block_reasons'] or [reason])[0]
         self._update(lambda doc:doc.update(last_round=dict(round_id=round_id,checked_at=self._stamp(),actions=actions,
             candidates=[{k: r[k] for k in ('condition_id','token_id','outcome','price','quantity','minimum_order_estimate')}
                         for r in candidates[:10]],candidate_count=len(candidates),

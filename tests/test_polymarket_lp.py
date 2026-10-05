@@ -6574,10 +6574,9 @@ def test_scan_checks_past_ten_passers_and_ranks_by_target_share_yield(tmp_path) 
     """C1: the scan no longer stops at ten passers; the 11th checked market
     with the higher estimated yield enters first place with estimate fields.
 
-    Independent arithmetic: identical books give every market target
-    q_display 20.00 shares (q ≈ 19.95 < min 20) at 20×0.34 = $6.80, so
-    yields track pools; M11's pool 150 gives hourly $150×5%/24 = $0.3125 and
-    yield 0.3125/6.80×100 = 4.595588…% — above the others' pool-100 figure.
+    Independent arithmetic: own score 20*.9**2/3 = 5.4; competition
+    81+64/3. Capital is 20*.34 = $6.80. Pool 150 gives approximately
+    $.313274/hour and 4.606963%/hour, above the pool-100 markets.
     """
 
     now = datetime(2026, 9, 20, 4, tzinfo=UTC)
@@ -6607,9 +6606,9 @@ def test_scan_checks_past_ten_passers_and_ranks_by_target_share_yield(tmp_path) 
     assert head["estimate_state"] == "known"
     assert Decimal(str(head["estimated_target_quantity"])) == Decimal("20.00")
     assert Decimal(str(head["estimated_target_capital_usd"])) == Decimal("6.80")
-    assert Decimal(str(head["estimated_hourly_reward_usd"])) == Decimal("0.3125")
-    assert Decimal(str(head["estimated_yield_pct_per_hour"])) == Decimal("4.595588")
-    assert Decimal(str(head["estimated_yield_raw"])) > Decimal("4.595588")
+    assert Decimal(str(head["estimated_hourly_reward_usd"])).quantize(Decimal(".000001")) == Decimal(".313274")
+    assert Decimal(str(head["estimated_yield_pct_per_hour"])) == Decimal("4.606963")
+    assert Decimal(str(head["estimated_yield_raw"])) > Decimal("4.606963")
     assert head["estimate_checked_at"]
     assert "realtime_query_rate_upper_bound" not in head
     # M10 is trimmed: its yield ties with M01..M09 but its competition value
@@ -6722,8 +6721,8 @@ def test_maintenance_refreshes_all_rows_and_reranks_by_new_yield(tmp_path) -> No
     ]
     reads_after_scan = len(exchange.book_token_reads)
 
-    # Deepen M01's book: its target quantity explodes (capital ≈ $613) and
-    # its yield collapses below M02/M03, so the whole table re-ranks.
+    # Deepen M01's book: capital remains the actual minimum $6.80, while
+    # its smaller reward share lowers yield below M02/M03.
     deep = ([("0.34", "11400"), ("0.33", "100")], [("0.36", "11400")])
     exchange.books_by_token["token-condition-M01-yes"] = deep
     exchange.books_by_token["token-condition-M01-no"] = deep
@@ -6744,7 +6743,7 @@ def test_maintenance_refreshes_all_rows_and_reranks_by_new_yield(tmp_path) -> No
     ]
     deep_row = reranked[2]
     assert deep_row["market_id"] == "market-M01"
-    assert Decimal(str(deep_row["estimated_target_capital_usd"])) > Decimal("600")
+    assert Decimal(str(deep_row["estimated_target_capital_usd"])) == Decimal("6.80")
     assert deep_row["estimate_updated"] is True
     # Every refreshed row carries the maintenance clock on its estimate.
     for row in reranked:
@@ -6771,7 +6770,7 @@ def test_maintenance_refreshes_all_rows_and_reranks_by_new_yield(tmp_path) -> No
     stale_row = rows[1]
     assert stale_row["market_id"] == "market-M03"
     assert stale_row["refresh_failed"] is True
-    assert Decimal(str(stale_row["estimated_yield_pct_per_hour"])) == Decimal("2.450980")
+    assert Decimal(str(stale_row["estimated_yield_pct_per_hour"])) == Decimal("2.457047")
     assert Decimal(str(stale_row["estimated_target_capital_usd"])) == Decimal("6.80")
     assert failed_row_round["recommendations"][0]["market_id"] == "market-M02"
 
@@ -9095,8 +9094,8 @@ def test_candidate_pool_replaces_dropped_estimate_and_unknown_last(tmp_path) -> 
         "market-M01", "market-M02", "market-M03",
     ]
 
-    # M01's pool drops 57.6 → 24.0: the new estimate is exactly 0.5%/h, so
-    # the previously top-ranked market sinks below M03's 0.8.
+    # M01's pool drops 57.6 → 24.0: minimum-order yield becomes .501238%/h,
+    # below M03's .801980%/h.
     exchange.pool_override = {"condition-M01": Decimal("24.0")}
     current["now"] = now + timedelta(seconds=65)
     exchange.now = current["now"]
@@ -9107,7 +9106,7 @@ def test_candidate_pool_replaces_dropped_estimate_and_unknown_last(tmp_path) -> 
         "market-M02", "market-M03", "market-M01",
     ]
     dropped_m01 = dropped["candidates"][2]
-    assert Decimal(str(dropped_m01["estimated_yield_raw"])) == Decimal("0.5")
+    assert Decimal(str(dropped_m01["estimated_yield_raw"])).quantize(Decimal(".000001")) == Decimal(".501238")
 
     # M02's refreshed metadata reports its reward minimum as a raw string:
     # the eligibility gate parses it, but the estimator requires Decimal
@@ -9127,9 +9126,7 @@ def test_candidate_pool_replaces_dropped_estimate_and_unknown_last(tmp_path) -> 
     assert unknown_m02["estimate_state"] == "unknown"
     assert unknown_m02["estimated_yield_raw"] is None
     assert unknown_m02["state"] == "eligible"
-    assert Decimal(str(unknown["candidates"][0]["estimated_yield_raw"])) == Decimal(
-        "0.8"
-    )
+    assert Decimal(str(unknown["candidates"][0]["estimated_yield_raw"])).quantize(Decimal(".000001")) == Decimal(".801980")
 
 
 def test_candidate_pool_validity_boundary_and_autobackfill(tmp_path) -> None:
