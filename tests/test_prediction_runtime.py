@@ -7242,7 +7242,7 @@ def test_lp_metadata_warmup_advances_beyond_one_batch(
         ) -> list[object]:
             assert page_size == 100
             batch = tuple(str(value) for value in condition_ids)  # type: ignore[arg-type]
-            assert 1 <= len(batch) <= 100
+            assert 1 <= len(batch) <= 50
             should_fail = False
             should_hold = False
             with request_lock:
@@ -7437,11 +7437,12 @@ def test_lp_metadata_warmup_advances_beyond_one_batch(
         assert preparation["total_count"] == 0
         with request_lock:
             retry_requests = tuple(metadata_requests)
-        assert len(retry_requests) == 18
+        # 30 initial batches, one closed lookup, one failure and its retry.
+        assert len(retry_requests) == 33
         assert retry_requests[-1] == (failed_id,)
         assert sum(len(batch) for batch in retry_requests) == 1503
         assert sum(failed_id in batch for batch in retry_requests) == 2
-        assert all(len(batch) <= 100 for batch in retry_requests)
+        assert all(len(batch) <= 50 for batch in retry_requests)
         assert all(
             sum(condition_id in batch for batch in retry_requests) == 1
             for condition_id in positive_ids

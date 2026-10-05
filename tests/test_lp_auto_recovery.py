@@ -3410,7 +3410,7 @@ def test_concurrent_metadata_batches_keep_response_facts_isolated() -> None:
         assert request.url.path == "/markets/keyset"
         requested = tuple(request.url.params.get_list("condition_ids"))
         requests.append(requested)
-        if len(requested) == 100:
+        if len(requested) == 50:
             return httpx.Response(
                 401,
                 headers={"content-type": "application/json"},
@@ -3448,7 +3448,7 @@ def test_concurrent_metadata_batches_keep_response_facts_isolated() -> None:
     )
     result = adapter.lp_market_metadata_batch(condition_ids)
 
-    assert sorted(map(len, requests)) == [1, 100]
+    assert sorted(map(len, requests)) == [1, 50, 50]
     assert set(result["failed_ids"]) == set(condition_ids)
     failure_facts = result["failure_facts"]
     assert isinstance(failure_facts, dict)
