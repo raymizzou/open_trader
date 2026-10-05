@@ -25,9 +25,10 @@ def remote_identity(result, cloud, action):
     """Validate each remote observation; only display snapshots may move."""
     expected = dict(release_root=str(cloud.release_root), runtime_root=str(cloud.runtime_root),
         mode=cloud.mode, git_sha=cloud.expected_sha, n_leg_paused=cloud.n_leg_paused,
-        credential_backend=credential_backend(cloud),
+        credential_backend=credential_backend(cloud), candidate_exclusions=cloud.candidate_exclusions,
         status='PRECHECK_OK' if action == 'preflight' else 'BACKEND_SMOKE_OK')
-    if any(key not in result or result[key] != value for key, value in expected.items()):
+    if (type(result.get('candidate_exclusions')) is not bool
+        or any(key not in result or result[key] != value for key, value in expected.items())):
         raise ValueError('remote gate evidence mismatch')
     if action == 'smoke':
         if (type(result.get('pid')) is not int or result['pid'] <= 0

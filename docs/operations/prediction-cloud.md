@@ -6,6 +6,88 @@ outside the operation. Branch push, Draft PR, GitHub merge, release/tag creation
 cloud provisioning, deployment and
 trading authorization are separate. The client never starts the cloud backend.
 
+## Optional LP candidate exclusion cooldowns
+
+The first release is an opt-in cloud optimization. Add the strictly boolean,
+non-secret field to the complete formal cloud JSON configuration:
+
+```json
+{
+  "candidate_exclusions": true
+}
+```
+
+This fragment extends the complete cloud example below; it is not a standalone
+config. A missing field defaults to `false`; integers, strings and null are
+rejected. Only `true` makes the existing wrapper render
+`Environment=OPEN_TRADER_LP_CANDIDATE_EXCLUSIONS=1`. False keeps the original unit
+text and remains compatible with existing stopped release records. Set `false`
+or omit the field to restore scanning after an authorized install/reload; durable
+exclusion rows keep their original deadlines. The Mac default remains off.
+
+Use the existing `deploy_release.py prediction-systemd` path with the matching
+JSON configuration for installation/start. Unit text, loaded systemd environment
+and effective process environment must agree. Extra environment entries, manual
+unit changes, drop-ins, inherited enablement with a disabled config, and ambiguous
+duplicate process switches cannot bypass identity checks. Preflight reports the
+selected boolean; smoke verifies the running value. The two-host gate requires
+a strictly boolean, matching `candidate_exclusions` field in remote evidence.
+This option does not enable trading or alter ownership/readiness requirements.
+
+Only a definite rejection under the existing candidate conditions creates a row
+in `lp_market_exclusions`. Its key is `(condition_id, token_id)`; an empty token
+means the whole market. Times are UTC. There are no new thresholds or manual bans.
+
+| Existing reason | Fixed cooldown |
+| --- | --- |
+| Reward inactive or zero pool | 30 minutes |
+| Not accepting orders | 5 minutes |
+| Explicit zero, thin or crowded competition | 30 minutes |
+| 24-hour amplitude exceeds the existing limit | 1 hour for that token |
+| Event starting soon or in progress | 5 minutes |
+| Confirmed event finish, recovery incomplete | Actual finish plus 1 hour |
+
+Missing/unknown facts, HTTP 400/429, timeouts, funds, authorization, participation,
+and a rank outside the top five do not create exclusions. A direction exclusion
+does not suppress its eligible opposite. While all current known directions
+cool, the shared metadata preparation also waits; after expiry normal metadata
+refresh can discover changes. Public catalog/competition pagination still runs,
+but it does not wake excluded candidates or extend their deadlines.
+
+Preparation, scan renewal, candidate maintenance/preview, automatic candidate
+ranking and the legacy sampler filter candidate targets before additional reads.
+Candidate-only metadata, queues, pool rows and qualification facts are evicted;
+metadata warm start filters in SQLite. Indexed target queries use at most 601
+parameters. No full exclusion dictionary stays resident in Python. The underlying
+SQLite/OS caches still exist. A publication revision rejects late reads after an
+exclusion was inserted or cleared, including after its deadline has elapsed.
+Active-order ranking, positions, pending operations, cancellations and reservations
+keep their existing management reads and safety checks.
+
+At the exact deadline the row stops filtering. Normal candidate/preparation
+scheduling deletes at most 300 expired rows per call. The history scheduler also
+waits for the earliest active cooldown deadline, using its existing bounded
+preparation path; paused/UNKNOWN recovery gates still apply. Expiry permits the normal
+batched scan; it does not declare the market qualified. Repeated observations
+within cooldown do not change the reason or deadline. Official `closed=true` or
+`resolved=true` observed in existing public pages, normal metadata reads or required
+management reads clears the exclusion. There is no extra termination probe.
+Reward `end_date`, `event_ended` and `accepting_orders=false` are not terminal proof.
+The actual cloud SQLite 3.26 runtime has not been exercised by local verification;
+the SQL uses features supported by 3.26 and keeps below its 999-parameter limit.
+
+`candidate_snapshot.candidate_exclusions` reports active counts by reason when
+enabled; these are skipped rejections, not qualified candidates or completed
+UNKNOWN reads. Preparation retries remain in their separate existing table.
+
+The repeatable offline comparison uses 16 fixed markets (15 explicitly zero
+competition), two preparation/scan rounds and temporary SQLite. Enabled versus
+disabled: metadata identifiers 2 versus 32, history tokens 1 versus 16, prepared
+metadata cache rows 1 versus 16. Both retain one eligible pool row and read its book
+twice. These are cache rows and request targets, not an RSS measurement or proof
+that a 704 MiB limit will be met. Tests are in
+[`test_lp_candidate_exclusions.py`](../../tests/test_lp_candidate_exclusions.py).
+
 ## Credentials: service-owned file or Tencent SSM
 
 For the #202 paused Shadow API probe, use an operator-imported JSON bundle at
@@ -167,7 +249,8 @@ A credentialless paused-Shadow example is:
   "user": "prediction",
   "expected_sha": "<SHA>",
   "mode": "shadow",
-  "n_leg_paused": 1
+  "n_leg_paused": 1,
+  "candidate_exclusions": true
 }
 ```
 

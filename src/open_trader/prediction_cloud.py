@@ -47,6 +47,7 @@ class CloudConfig:
     credential_backend: str | None = None
     credentials_file: str = ''
     memory_max_bytes: int = 768 * 1024 * 1024
+    candidate_exclusions: bool = False
 
     @property
     def record(self):
@@ -129,6 +130,8 @@ def trusted_layout(c: CloudConfig) -> None:
 
 
 def render_unit(c: CloudConfig) -> str:
+    if type(c.candidate_exclusions) is not bool:
+        raise ValueError("candidate_exclusions must be a boolean")
     if type(c.memory_max_bytes) is not int or not 64 * 1024**2 < c.memory_max_bytes <= 1_000_000_000:
         raise ValueError('cloud memory budget must exceed 64MiB and be at most 1GB')
     for path in (c.release_root, c.runtime_root, c.python):
@@ -178,6 +181,7 @@ def render_unit(c: CloudConfig) -> str:
             f'Environment=OPEN_TRADER_SSM_VERSION={c.version}\n',
             f'Environment=OPEN_TRADER_SSM_ROLE={c.role}\n',
         ])
+    exclusions_env = 'Environment=OPEN_TRADER_LP_CANDIDATE_EXCLUSIONS=1\n' if c.candidate_exclusions else ''
     guarded = c.mode == 'shadow' and c.n_leg_paused == 1
     resources = (f'Environment=OPEN_TRADER_SHADOW_MEMORY_MAX_BYTES={c.memory_max_bytes}\n'
                  f'MemoryAccounting=yes\nMemoryMax={c.memory_max_bytes}\n'
@@ -200,7 +204,7 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=GIT_CONFIG_COUNT=1
 Environment=GIT_CONFIG_KEY_0=safe.directory
 Environment=GIT_CONFIG_VALUE_0={c.release_root}
-{credential_env}Environment=OPEN_TRADER_NLEG_PAUSED={c.n_leg_paused}
+{exclusions_env}{credential_env}Environment=OPEN_TRADER_NLEG_PAUSED={c.n_leg_paused}
 Environment=OPEN_TRADER_NLEG_PAUSED={c.n_leg_paused}
 ExecStart={c.python} -m open_trader prediction-service --mode {c.mode} --data-dir {c.runtime_root}/data --config {c.runtime_root}/config/prediction_arbitrage.json --host 127.0.0.1 --port 8769 --release-manifest {c.release_root}/ops/prediction-service-release.json
 {resources}Restart={'no' if guarded else 'on-failure'}
@@ -342,7 +346,12 @@ def live_identity(c: CloudConfig) -> dict:
         line = next(line for line in process_status if line.startswith(field))
         if set(map(int,line.split()[1:])) != {expected}:
             raise ValueError('service user/group mismatch')
-    environment = dict(item.split('=',1) for item in (process/'environ').read_bytes().decode().split('\0') if '=' in item)
+    process_environment = (process/'environ').read_bytes().decode().split('\0')
+    environment = dict(item.split('=',1) for item in process_environment if '=' in item)
+    effective_exclusions = environment.get('OPEN_TRADER_LP_CANDIDATE_EXCLUSIONS') == '1'
+    if (sum(item.startswith('OPEN_TRADER_LP_CANDIDATE_EXCLUSIONS=') for item in process_environment) > 1
+        or effective_exclusions != c.candidate_exclusions):
+        raise ValueError('running candidate exclusion environment mismatch')
     for line in render_unit(c).splitlines():
         if line.startswith('Environment='):
             key, value = line.removeprefix('Environment=').split('=',1)
@@ -372,7 +381,8 @@ def live_identity(c: CloudConfig) -> dict:
     if unit_state()['MainPID'] != str(pid):
         raise ValueError('owner changed during inspection')
     release_identity(c)  # Recheck after process and API observations.
-    return {'pid': pid, 'git_sha': c.expected_sha, 'started_at': health.get('started_at'),
+    return {'pid': pid, 'git_sha': c.expected_sha, 'candidate_exclusions': effective_exclusions,
+            'started_at': health.get('started_at'),
             'systemd_started_at': state.get('ExecMainStartTimestamp')}
 
 
@@ -818,12 +828,13 @@ def operate(c: CloudConfig, action: str) -> dict:
     if action == 'preflight':
         preflight(c)
         return {'status': 'PRECHECK_OK', 'git_sha': c.expected_sha, 'mode': c.mode,
-                'n_leg_paused': c.n_leg_paused, 'credential_backend': credential_backend(c)}
+                'n_leg_paused': c.n_leg_paused, 'credential_backend': credential_backend(c),
+                'candidate_exclusions': c.candidate_exclusions}
     if action == 'status' and unit_state()['MainPID'] == '0':
         absent(c)
         installed_unit(c)
         verified_record(c, ('stopped',))
-        return {'status': 'STOPPED', 'git_sha': c.expected_sha}
+        return {'status': 'STOPPED', 'git_sha': c.expected_sha, 'candidate_exclusions': c.candidate_exclusions}
     if action in ('status', 'smoke'):
         verified_record(c, ('ready',))
         evidence = live_identity(c)
@@ -862,7 +873,7 @@ def operate(c: CloudConfig, action: str) -> dict:
             if live_identity(c) != evidence:
                 raise ValueError('owner changed during smoke')
         component = {'mode': c.mode, 'n_leg_paused': c.n_leg_paused,
-                     'credential_backend': credential_backend(c)}
+                     'credential_backend': credential_backend(c), 'candidate_exclusions': c.candidate_exclusions}
         return {'status': 'RUNNING' if action == 'status' else 'BACKEND_SMOKE_OK',
                 **evidence, **component, **({'display_snapshot':display_evidence} if display_evidence else {})}
     if os.geteuid() != 0:
@@ -958,7 +969,7 @@ def main(argv=None):
             print(render_unit(config), end='')
         else:
             print(json.dumps({**operate(config, args.action),
-                              'mode': config.mode,
+                              'mode': config.mode, 'candidate_exclusions': config.candidate_exclusions,
                               'release_root': str(config.release_root),
                               'runtime_root': str(config.runtime_root)}))
         return 0

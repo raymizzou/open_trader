@@ -538,6 +538,7 @@ class PredictionRuntime:
         self._book_sampler_thread: threading.Thread | None = None
         self._history_stop_event = threading.Event()
         self._history_wakeup_event = threading.Event()
+        self._history_exclusion_deadline_event = threading.Event()
         self._history_initial_done = threading.Event()
         self._history_thread: threading.Thread | None = None
         self._reward_stop_event = threading.Event()
@@ -1456,12 +1457,20 @@ class PredictionRuntime:
         self._history_stop_event.clear()
         self._history_initial_done.clear()
         self._history_wakeup_event.clear()
+        self._history_exclusion_deadline_event.clear()
+        register = getattr(self.lp, "set_candidate_preparation_wakeup", None)
+        if callable(register):
+            register(self._history_exclusion_deadline_event.set)
 
         def wait_for_history(seconds: float) -> bool:
             if self._history_waiter is not None:
                 return bool(self._history_waiter(self._history_stop_event, seconds))
             deadline = time.monotonic() + max(0.0, seconds)
             while not self._history_stop_event.is_set():
+                if self._history_exclusion_deadline_event.is_set():
+                    self._history_exclusion_deadline_event.clear()
+                    next_cooldown = self.lp.candidate_exclusion_wait_seconds() if self.lp is not None else None
+                    deadline = min(deadline, time.monotonic() + (next_cooldown or 0))
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return False
@@ -1647,6 +1656,13 @@ class PredictionRuntime:
                             wait_seconds = retry_delay(result)
                     else:
                         wait_seconds = _LP_HISTORY_SECONDS
+                    exclusion_wait = getattr(lp, "candidate_exclusion_wait_seconds", None)
+                    if callable(exclusion_wait) and (
+                        not isinstance(result, Mapping) or result.get("preparation_outcome") != "paused"
+                    ):
+                        cooldown_seconds = exclusion_wait()
+                        if isinstance(cooldown_seconds, (int, float)) and cooldown_seconds > 0:
+                            wait_seconds = min(wait_seconds, cooldown_seconds)
                     if wait_for_history(wait_seconds):
                         return
             finally:

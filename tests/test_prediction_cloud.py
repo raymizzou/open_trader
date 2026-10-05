@@ -209,6 +209,7 @@ print(json.dumps({{
     'runtime_root': os.environ['GATE_REMOTE_RUNTIME'],
     'n_leg_paused': int(os.environ.get('GATE_REMOTE_NLEG', '1')),
     'credential_backend': os.environ.get('GATE_REMOTE_BACKEND', 'disabled'),
+    'candidate_exclusions': json.loads(os.environ.get('GATE_REMOTE_EXCLUSIONS', 'false')),
     'status': 'PRECHECK_OK',
 }}))
 ''')
@@ -229,9 +230,9 @@ print(json.dumps({{
     evidence = tmp_path/'evidence.json'; evidence.write_text(json.dumps({
         'git_sha':sha, 'independent_runtime_root':str(remote_runtime),
         'resources_reviewed':True, 'resources_reviewed_evidence':'observed'}))
-    def write_configs(client_mode, service_mode, *, file_profile=False):
+    def write_configs(client_mode, service_mode, *, file_profile=False, candidate_exclusions=False):
         client.write_text(json.dumps({**client_base, 'mode':client_mode}))
-        cloud.write_text(json.dumps({**cloud_base, 'mode':service_mode, **(
+        cloud.write_text(json.dumps({**cloud_base, 'mode':service_mode, 'candidate_exclusions':candidate_exclusions, **(
             {'credential_backend':'file', 'credentials_file':'/var/lib/open-trader/prediction-credentials/polymarket.json'}
             if file_profile else {})}))
     fake_python = fakebin/'python'; fake_python.write_text('''#!/bin/sh
@@ -259,11 +260,12 @@ exit 0
         evidence.write_text(json.dumps({
             'git_sha':sha, 'independent_runtime_root':str(remote_runtime),
             'resources_reviewed':True, 'resources_reviewed_evidence':'observed'}))
-    def run(client_mode, service_mode, remote_mode, remote_backend='disabled', *, file_profile=False):
+    def run(client_mode, service_mode, remote_mode, remote_backend='disabled', *, file_profile=False, candidate_exclusions=False, remote_exclusions=False):
         (tmp_path/'ssh-count').unlink(missing_ok=True)
         (tmp_path/'remote-mode').write_text(remote_mode)
         monkeypatch.setenv('GATE_REMOTE_BACKEND',remote_backend)
-        write_configs(client_mode, service_mode, file_profile=file_profile)
+        monkeypatch.setenv('GATE_REMOTE_EXCLUSIONS', json.dumps(remote_exclusions))
+        write_configs(client_mode, service_mode, file_profile=file_profile, candidate_exclusions=candidate_exclusions)
         return subprocess.run([sys.executable,str(gate),'readiness','--client-config',str(client),
             '--service-config',str(cloud),'--remote-config','/etc/open-trader/cloud.json',
             '--operator-evidence',str(evidence),'--browser-runtime',str(tmp_path)],
@@ -289,6 +291,11 @@ exit 0
     result = run('shadow','shadow','production')
     assert result.returncode == 2 and result.stdout.endswith('BLOCKED\n')
     assert (tmp_path/'ssh-count').exists(), result.stdout + result.stderr
+    assert (tmp_path/'ssh-count').read_text() == '1'
+    result = run('shadow','shadow','shadow', candidate_exclusions=True, remote_exclusions=True)
+    assert result.returncode == 0 and result.stdout.endswith('READY\n'), result.stdout + result.stderr
+    result = run('shadow','shadow','shadow', candidate_exclusions=True, remote_exclusions=False)
+    assert result.returncode == 2 and result.stdout.endswith('BLOCKED\n')
     assert (tmp_path/'ssh-count').read_text() == '1'
 
 
@@ -575,6 +582,7 @@ def test_cloud_display_smoke_accepts_reward_usd_unknown_and_records_source_evide
     'missing_pid', 'missing_started_at', 'missing_systemd_started_at',
     'missing_git_sha', 'missing_mode', 'missing_release_root', 'missing_runtime_root',
     'missing_n_leg_paused', 'missing_credential_backend', 'missing_status',
+    'candidate_exclusions', 'missing_candidate_exclusions',
     'missing_display_snapshot', 'stale_display_snapshot', 'missing_snapshot_account',
     'missing_snapshot_time', 'changed_extra_identity',
 ])
@@ -609,7 +617,7 @@ def test_two_host_smoke_revalidates_refresh_and_stable_identity(tmp_path, monkey
     before = dict(status='BACKEND_SMOKE_OK', pid=123, started_at='process-start',
         systemd_started_at='systemd-start', git_sha=cfg.expected_sha, mode='shadow',
         release_root=str(cfg.release_root), runtime_root=str(cfg.runtime_root),
-        n_leg_paused=1, credential_backend='file', display_snapshot=dict(
+        n_leg_paused=1, credential_backend='file', candidate_exclusions=False, display_snapshot=dict(
             account={'checked_at':datetime.now(UTC).isoformat()}, catalog={'complete':True},
             candidates={'candidate_state':'unknown'}, history=None,
             rewards={'condition':{'state':'unknown','reason':'usd_value_unknown'}}))
@@ -645,3 +653,161 @@ def test_two_host_smoke_revalidates_refresh_and_stable_identity(tmp_path, monkey
     early_rejection = observation == 'before' and change not in {
         'refresh', 'pid', 'started_at', 'systemd_started_at', 'changed_extra_identity'}
     assert len(ssh_calls) == (1 if early_rejection else 2)
+
+
+def test_cloud_candidate_exclusions_config_is_strict_and_disabled_unit_compatible():
+    from dataclasses import replace
+    from hashlib import sha256
+    data = dict(release_root='/opt/open-trader/releases/'+'a'*40,
+        runtime_root='/var/lib/open-trader/prediction', python='/opt/open-trader/venv/bin/python',
+        user='prediction', expected_sha='a'*40, mode='shadow', n_leg_paused=1)
+    def load(**extra):
+        return load_config(Path('/unused-offline-config'), contents=json.dumps({**data, **extra}).encode())
+    missing, disabled = load(), load(candidate_exclusions=False)
+    assert missing.candidate_exclusions is disabled.candidate_exclusions is False
+    # Captured from reviewed tree e0634685, before the new CloudConfig field.
+    legacy_unit_hash = '7d48d248d9846811b723d3487ccf60449cf3c9b4d0253bcbf9a4e6d64415b9e8'
+    for config in (missing, disabled):
+        assert sha256(render_unit(config).encode()).hexdigest() == legacy_unit_hash
+    import open_trader.prediction_cloud as cloud
+    old_record = dict(schema_version=cloud.RUNTIME_SCHEMA, manager='systemd', state='stopped',
+        candidate={'checkout':str(missing.release_root), 'git_sha':missing.expected_sha}, unit_text=render_unit(missing))
+    assert cloud.verified_record(missing, ('stopped',), contents=json.dumps(old_record).encode()) == old_record
+    enabled = load(candidate_exclusions=True)
+    line = 'Environment=OPEN_TRADER_LP_CANDIDATE_EXCLUSIONS=1\n'
+    assert render_unit(enabled).count(line) == 1
+    assert sha256(render_unit(enabled).replace(line, '').encode()).hexdigest() == legacy_unit_hash
+    for invalid in (None, 0, 1, 'true', 'false', '1', '0', [], {}):
+        with pytest.raises(ValueError, match='candidate_exclusions must be a boolean'):
+            load(candidate_exclusions=invalid)
+        with pytest.raises(ValueError, match='candidate_exclusions must be a boolean'):
+            render_unit(replace(missing, candidate_exclusions=invalid))
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_cloud_candidate_exclusions_installed_unit_requires_exact_environment(tmp_path, monkeypatch, enabled):
+    import open_trader.prediction_cloud as cloud
+    config = CloudConfig(tmp_path/'release', tmp_path/'runtime', tmp_path/'python',
+        'prediction', 'a'*40, '', '', '', '', 'shadow', 1, candidate_exclusions=enabled)
+    text = render_unit(config)
+    unit = tmp_path/'fixture.service'; unit.write_text(text)
+    monkeypatch.setattr(cloud, 'UNIT_PATH', unit)
+    monkeypatch.setattr(cloud, 'trusted_root_path', lambda path: None)
+    env = {line.removeprefix('Environment=') for line in text.splitlines() if line.startswith('Environment=')}
+    state = dict(NeedDaemonReload='no', Environment=' '.join(sorted(env)),
+        User=config.user, Group=config.user, WorkingDirectory=str(config.release_root),
+        FragmentPath=str(unit), DropInPaths='')
+    monkeypatch.setattr(cloud, 'unit_state', lambda: state)
+    cloud.installed_unit(config)
+    flag = 'OPEN_TRADER_LP_CANDIDATE_EXCLUSIONS=1'
+    original = state['Environment']
+    state['Environment'] = original.replace(flag, '') if enabled else original+' '+flag
+    with pytest.raises(ValueError, match='loaded unit configuration mismatch'):
+        cloud.installed_unit(config)
+    state['Environment'] = original
+    with pytest.raises(ValueError, match='managed unit does not match'):
+        cloud.installed_unit(config, contents=(text+'Environment='+flag+'\n').encode())
+    state['DropInPaths'] = '/offline/fixture.service.d/override.conf'
+    with pytest.raises(ValueError, match='unknown unit source or drop-in'):
+        cloud.installed_unit(config)
+
+
+@pytest.mark.parametrize('enabled, process_flag, accepted', [
+    (False, None, True), (False, '0', True), (False, '1', False),
+    (True, '1', True), (True, None, False), (True, '0', False),
+    (False, ('1', '0'), False), (True, ('0', '1'), False),
+])
+def test_cloud_candidate_exclusions_live_identity_checks_effective_process_switch(
+    tmp_path, monkeypatch, enabled, process_flag, accepted,
+):
+    from types import SimpleNamespace
+    import open_trader.prediction_cloud as cloud
+    config = CloudConfig(tmp_path/'release', tmp_path/'runtime', tmp_path/'python',
+        'prediction', 'a'*40, '', '', '', '', 'shadow', 1, candidate_exclusions=enabled)
+    config.release_root.mkdir()
+    unit = tmp_path/'fixture.service'; unit.write_text(render_unit(config))
+    monkeypatch.setattr(cloud, 'UNIT_PATH', unit)
+    monkeypatch.setattr(cloud, 'trusted_root_path', lambda path: None)
+    pid, uid, gid = 321, 1234, 5678
+    process = tmp_path/'offline-proc'/str(pid); process.mkdir(parents=True)
+    (process/'cwd').symlink_to(config.release_root)
+    (process/'status').write_text(f'Uid:\t{uid} {uid} {uid} {uid}\nGid:\t{gid} {gid} {gid} {gid}\n')
+    env = dict(line.removeprefix('Environment=').split('=',1) for line in render_unit(config).splitlines()
+        if line.startswith('Environment='))
+    flag = 'OPEN_TRADER_LP_CANDIDATE_EXCLUSIONS'
+    loaded_env = ' '.join(f'{key}={value}' for key, value in env.items())
+    env.pop(flag, None)
+    process_environment = [f'{key}={value}' for key, value in env.items()]
+    if isinstance(process_flag, tuple):
+        process_environment.extend(f'{flag}={value}' for value in process_flag)
+    elif process_flag is not None:
+        process_environment.append(f'{flag}={process_flag}')
+    (process/'environ').write_bytes(('\0'.join(process_environment)+'\0').encode())
+    args = render_unit(config).split('ExecStart=',1)[1].splitlines()[0].split()
+    (process/'cmdline').write_bytes(('\0'.join(args)+'\0').encode())
+    path = Path
+    monkeypatch.setattr(cloud, 'Path', lambda value: tmp_path/'offline-proc' if str(value)=='/proc' else path(value))
+    monkeypatch.setattr(cloud, 'service_user', lambda cfg: SimpleNamespace(pw_uid=uid, pw_gid=gid))
+    monkeypatch.setattr(cloud, 'release_identity', lambda cfg: dict(reader_generation=2, contract_generation=2))
+    monkeypatch.setattr(cloud, 'listener_pids', lambda: {pid})
+    monkeypatch.setattr(cloud, 'lock_pids', lambda cfg: {pid})
+    state = dict(ActiveState='active', MainPID=str(pid), NeedDaemonReload='no', Environment=loaded_env,
+        User=config.user, Group=config.user, WorkingDirectory=str(config.release_root),
+        FragmentPath=str(unit), DropInPaths='', ExecMainStartTimestamp='fixture-systemd-start')
+    monkeypatch.setattr(cloud, 'unit_state', lambda: state)
+    health = dict(module='prediction_service', schema_version='open_trader.prediction_service.health.v1',
+        pid=pid, git_sha=config.expected_sha, source_state='clean', cwd=str(config.release_root), status='running',
+        mode='shadow', production_owner=False, mutations='prohibited', first_violation=None,
+        release_schema_version=cloud.RELEASE_SCHEMA, reader_generation=2, contract_generation=2,
+        started_at='fixture-process-start', code_root=str(config.release_root/'src'))
+    monkeypatch.setattr(cloud, 'read_json', lambda port: health)
+    if accepted:
+        identity = cloud.live_identity(config)
+        assert identity['pid'] == pid
+        assert identity['candidate_exclusions'] is enabled
+        config.runtime_root.mkdir()
+        cloud.record(config, 'ready', ready=identity)
+        health['n_leg'] = dict(status='paused', code='N_LEG_PAUSED')
+        monkeypatch.setattr(cloud, 'read_status', lambda port, path: 503)
+        monkeypatch.setattr(cloud, 'run', lambda *args: 'prediction_runtime_state state=RUNNING')
+        smoke = cloud.operate(config, 'smoke')
+        assert smoke['status'] == 'BACKEND_SMOKE_OK'
+        assert smoke['candidate_exclusions'] is enabled
+    else:
+        with pytest.raises(ValueError, match='running .*environment mismatch'):
+            cloud.live_identity(config)
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+@pytest.mark.parametrize('action', ['preflight', 'smoke'])
+def test_cloud_candidate_exclusions_remote_evidence_is_required_and_strict(tmp_path, enabled, action):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('cloud_gate_candidate_exclusions',
+        Path(__file__).resolve().parents[1]/'scripts/prediction-cloud-gate.py')
+    gate = importlib.util.module_from_spec(spec); spec.loader.exec_module(gate)
+    config = CloudConfig(tmp_path/'release', tmp_path/'runtime', tmp_path/'python',
+        'prediction', 'a'*40, '', '', '', '', 'shadow', 1, candidate_exclusions=enabled)
+    result = dict(release_root=str(config.release_root), runtime_root=str(config.runtime_root),
+        mode='shadow', git_sha=config.expected_sha, n_leg_paused=1, credential_backend='disabled',
+        status='PRECHECK_OK' if action=='preflight' else 'BACKEND_SMOKE_OK', candidate_exclusions=enabled,
+        pid=321, started_at='fixture-process-start', systemd_started_at='fixture-systemd-start')
+    assert gate.remote_identity(result, config, action) == result
+    missing = {key: value for key, value in result.items() if key!='candidate_exclusions'}
+    with pytest.raises(ValueError, match='remote gate evidence mismatch'):
+        gate.remote_identity(missing, config, action)
+    for invalid in (None, int(enabled), str(int(enabled)), not enabled):
+        with pytest.raises(ValueError, match='remote gate evidence mismatch'):
+            gate.remote_identity({**result, 'candidate_exclusions':invalid}, config, action)
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_cloud_candidate_exclusions_preflight_evidence_binds_requested_value(tmp_path, monkeypatch, enabled):
+    import open_trader.prediction_cloud as cloud
+    config = CloudConfig(tmp_path/'release', tmp_path/'runtime', tmp_path/'python',
+        'prediction', 'a'*40, '', '', '', '', 'shadow', 1, candidate_exclusions=enabled)
+    # Existing focused preflight tests prove its checks; this boundary exercises
+    # the operation response that the two-host wrapper consumes.
+    monkeypatch.setattr(cloud, 'preflight', lambda cfg: None)
+    result = cloud.operate(config, 'preflight')
+    assert result['status'] == 'PRECHECK_OK'
+    assert result['candidate_exclusions'] is enabled

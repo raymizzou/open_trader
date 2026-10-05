@@ -944,6 +944,17 @@ class PredictionArbitrageStore:
                 PRIMARY KEY(condition_id, token_id)
             );
 
+            CREATE TABLE IF NOT EXISTS lp_market_exclusions (
+                condition_id TEXT NOT NULL,
+                token_id TEXT NOT NULL DEFAULT '',
+                reason_code TEXT NOT NULL,
+                checked_at TEXT NOT NULL,
+                cooldown_until TEXT NOT NULL,
+                PRIMARY KEY(condition_id, token_id)
+            );
+            CREATE INDEX IF NOT EXISTS lp_market_exclusions_expiry
+            ON lp_market_exclusions(cooldown_until);
+
             CREATE TABLE IF NOT EXISTS lp_screening_snapshot (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 payload TEXT NOT NULL,
@@ -3330,6 +3341,141 @@ class PredictionArbitrageStore:
             )
         return result
 
+    def lp_record_market_exclusion(
+        self, condition_id: str, token_id: str, reason_code: str, *,
+        checked_at: datetime, cooldown_until: datetime, now: datetime,
+    ) -> bool:
+        """Insert one fixed deadline; an active row never changes or extends."""
+        if not condition_id or reason_code not in {
+            "reward_inactive", "reward_pool_empty", "market_not_accepting_orders",
+            "competition_empty", "competition_too_thin", "competition_too_crowded",
+            "history_amplitude_exceeded", "event_starting_soon", "event_in_progress",
+            "event_recovery_pending",
+        }:
+            raise ValueError("lp_market_exclusion_invalid")
+        checked, until, current = map(_canonical_timestamp, (checked_at, cooldown_until, now))
+        if checked > current or until <= current or until <= checked:
+            return False
+        with self._transaction() as connection:
+            return bool(connection.execute(
+                """INSERT INTO lp_market_exclusions VALUES (?,?,?,?,?)
+                ON CONFLICT(condition_id,token_id) DO UPDATE SET
+                    reason_code=excluded.reason_code, checked_at=excluded.checked_at,
+                    cooldown_until=excluded.cooldown_until
+                WHERE lp_market_exclusions.cooldown_until <= excluded.checked_at
+                  AND lp_market_exclusions.checked_at < excluded.checked_at""",
+                (condition_id, token_id, reason_code, checked, until),
+            ).rowcount)
+
+    def lp_candidate_allowed(
+        self, identities: Sequence[tuple[str, str]], *, now: datetime,
+    ) -> tuple[tuple[str, str], ...]:
+        """Indexed filtering of bounded caller batches, never a blacklist dump."""
+        current = _canonical_timestamp(now)
+        allowed = []
+        with self._read_connection() as connection:
+            for offset in range(0, len(identities), 300):
+                batch = identities[offset:offset + 300]
+                values = ",".join("(?,?)" for _ in batch)
+                rows = connection.execute(
+                    f"""WITH targets(condition_id,token_id) AS (VALUES {values})
+                    SELECT condition_id,token_id FROM targets t WHERE NOT EXISTS (
+                        SELECT 1 FROM lp_market_exclusions e
+                        WHERE e.condition_id=t.condition_id AND e.token_id IN ('',t.token_id)
+                          AND e.cooldown_until > ?)
+                    """, [part for pair in batch for part in pair] + [current],
+                )
+                allowed.extend((str(row[0]), str(row[1])) for row in rows)
+        return tuple(allowed)
+
+    def lp_candidate_conditions(
+        self, condition_ids: Sequence[str], *, now: datetime,
+    ) -> tuple[str, ...]:
+        """Skip shared metadata when all current directions are cooling."""
+        current = _canonical_timestamp(now)
+        self._ensure_lp_metadata_cache_schema()
+        result = []
+        with self._read_connection() as connection:
+            for condition in condition_ids:
+                if connection.execute(
+                    "SELECT 1 FROM lp_market_exclusions WHERE condition_id=? AND token_id='' AND cooldown_until>?",
+                    (condition, current),
+                ).fetchone():
+                    continue
+                if not connection.execute(
+                    "SELECT 1 FROM lp_market_exclusions WHERE condition_id=? AND cooldown_until>? LIMIT 1",
+                    (condition, current),
+                ).fetchone():
+                    result.append(condition)
+                    continue
+                cached = connection.execute(
+                    "SELECT payload FROM lp_market_metadata_cache WHERE condition_id=? AND present=1",
+                    (condition,),
+                ).fetchone()
+                tokens = ()
+                if cached:
+                    try:
+                        payload = _load_payload(str(cached[0]))
+                    except ValueError:
+                        payload = {}
+                    outcomes = payload.get("outcomes")
+                    if isinstance(outcomes, Mapping):
+                        tokens = tuple(str(value.get("token_id") or "") for key, value in outcomes.items()
+                            if str(key).lower() in {"yes", "no"} and isinstance(value, Mapping) and value.get("token_id"))
+                if tokens:
+                    # Metadata gives the current token identities. An unrelated old
+                    # history token must not wake a completely excluded market.
+                    allowed = any(not connection.execute(
+                        "SELECT 1 FROM lp_market_exclusions WHERE condition_id=? AND token_id=? AND cooldown_until>?",
+                        (condition, token, current),
+                    ).fetchone() for token in tokens)
+                else:
+                    allowed = not connection.execute(
+                        "SELECT 1 FROM lp_price_history_cache WHERE condition_id=? LIMIT 1", (condition,),
+                    ).fetchone() or connection.execute(
+                        """SELECT 1 FROM lp_price_history_cache h WHERE h.condition_id=?
+                        AND NOT EXISTS (SELECT 1 FROM lp_market_exclusions e
+                          WHERE e.condition_id=h.condition_id AND e.token_id=h.token_id
+                            AND e.cooldown_until>?) LIMIT 1""", (condition, current),
+                    ).fetchone()
+                if allowed:
+                    result.append(condition)
+        return tuple(result)
+
+    def lp_next_market_exclusion_expiry(self, *, now: datetime) -> datetime | None:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT cooldown_until FROM lp_market_exclusions WHERE cooldown_until>? ORDER BY cooldown_until LIMIT 1",
+                (_canonical_timestamp(now),),
+            ).fetchone()
+        return _parse_timestamp(row[0]) if row else None
+
+    def lp_market_exclusion_counts(self, *, now: datetime) -> dict[str, int]:
+        with self._read_connection() as connection:
+            return {str(row[0]): int(row[1]) for row in connection.execute(
+                "SELECT reason_code,count(*) FROM lp_market_exclusions WHERE cooldown_until>? GROUP BY reason_code",
+                (_canonical_timestamp(now),),
+            )}
+
+    def lp_prune_market_exclusions(self, *, now: datetime, limit: int = 300) -> int:
+        """Delete a due batch atomically; a concurrent replacement remains intact."""
+        if type(limit) is not int or not 1 <= limit <= 300:
+            raise ValueError("lp_market_exclusion_prune_limit_invalid")
+        with self._transaction() as connection:
+            return connection.execute(
+                """DELETE FROM lp_market_exclusions WHERE rowid IN (
+                    SELECT rowid FROM lp_market_exclusions WHERE cooldown_until<=?
+                    ORDER BY cooldown_until LIMIT ?)""",
+                (_canonical_timestamp(now), limit),
+            ).rowcount
+
+    def lp_clear_ended_market_exclusions(self, condition_id: str, *, checked_at: datetime) -> int:
+        with self._transaction() as connection:
+            return connection.execute(
+                "DELETE FROM lp_market_exclusions WHERE condition_id=? AND checked_at<=?",
+                (condition_id, _canonical_timestamp(checked_at)),
+            ).rowcount
+
     def _ensure_lp_metadata_cache_schema(self) -> None:
         """Create `lp_market_metadata_cache` on first use.
 
@@ -3377,7 +3523,7 @@ class PredictionArbitrageStore:
         return dict(self.lp_metadata_cache_items(now=now))
 
     def lp_metadata_cache_items(
-        self, *, now: datetime | None = None,
+        self, *, now: datetime | None = None, exclude_candidates: bool = False,
     ) -> Iterator[tuple[str, tuple[float, dict[str, object] | None]]]:
         """Stream warm-cache rows without materializing the entire universe."""
         self._ensure_lp_metadata_cache_schema()
@@ -3385,14 +3531,22 @@ class PredictionArbitrageStore:
         with self._read_connection() as connection:
             rows = connection.execute(
                 """
-                SELECT condition_id, payload, expires_at, present
-                FROM lp_market_metadata_cache
-                WHERE expires_at > ?
+                SELECT condition_id, payload, expires_at, present,
+                  CASE WHEN ?=1 THEN EXISTS (
+                    SELECT 1 FROM lp_market_exclusions e WHERE e.condition_id=m.condition_id
+                      AND e.token_id<>'' AND e.cooldown_until>?) ELSE 0 END AS token_exclusion
+                FROM lp_market_metadata_cache m
+                WHERE expires_at > ? AND (?=0 OR NOT EXISTS (
+                  SELECT 1 FROM lp_market_exclusions e WHERE e.condition_id=m.condition_id
+                    AND e.token_id='' AND e.cooldown_until>?))
                 """,
-                (horizon,),
+                (int(exclude_candidates), _canonical_timestamp(now or datetime.now(timezone.utc)),
+                 horizon, int(exclude_candidates), _canonical_timestamp(now or datetime.now(timezone.utc))),
             )
             for row in rows:
                 condition_id = str(row["condition_id"])
+                if row["token_exclusion"] and not self.lp_candidate_conditions((condition_id,), now=now or datetime.now(timezone.utc)):
+                    continue
                 expires_at = float(row["expires_at"])
                 try:
                     payload = _load_payload(str(row["payload"]))
@@ -4653,6 +4807,14 @@ class PredictionArbitrageStore:
                 encoded,
             )
         return len(encoded)
+
+    def lp_competitiveness_entry(self, condition_id: str):
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT value,checked_at FROM lp_market_competitiveness WHERE condition_id=?",
+                (condition_id,),
+            ).fetchone()
+        return (Decimal(str(row[0])), _parse_timestamp(row[1])) if row else None
 
     def lp_competitiveness_map(self) -> dict[str, tuple[Decimal, datetime]]:
         """Read every persisted competition value back keyed by condition_id."""
