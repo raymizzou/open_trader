@@ -5439,6 +5439,8 @@ def test_lp_runtime_stops_obsolete_sampling_and_keeps_exposure_risk(
     history_started = threading.Event()
     release_history = threading.Event()
     history_finished = threading.Event()
+    history_published = threading.Event()
+    release_history_monitor = threading.Event()
     sampler_book_calls: list[tuple[str, ...]] = []
     history_calls: list[dict[str, object]] = []
 
@@ -5451,6 +5453,7 @@ def test_lp_runtime_stops_obsolete_sampling_and_keeps_exposure_risk(
     class FakeTrading:
         def __init__(self) -> None:
             self.lp_snapshot_calls = 0
+            self.closed = False
 
         def account_snapshot(self) -> dict[str, object]:
             return {
@@ -5620,7 +5623,7 @@ def test_lp_runtime_stops_obsolete_sampling_and_keeps_exposure_risk(
             }
 
         def close(self) -> None:
-            return None
+            self.closed = True
 
     class FakeMonitor:
         def __init__(self, **_: object) -> None:
@@ -5665,6 +5668,16 @@ def test_lp_runtime_stops_obsolete_sampling_and_keeps_exposure_risk(
     monkeypatch.setattr(runtime_module, "LlmRelationValidator", lambda *_a, **_k: object())
     monkeypatch.setattr(runtime_module, "LlmTitleTranslator", lambda *_a, **_k: object())
     real_lp_service = runtime_module.PolymarketLPService
+    real_refresh_history = real_lp_service.refresh_price_history
+
+    def held_history_refresh(self: object, **kwargs: object) -> object:
+        result = real_refresh_history(self, **kwargs)
+        # Publication precedes monitor exit. Hold that gap deterministically.
+        history_published.set()
+        assert release_history_monitor.wait(timeout=5), "history monitor was not released"
+        return result
+
+    monkeypatch.setattr(real_lp_service, "refresh_price_history", held_history_refresh)
     monkeypatch.setattr(
         runtime_module,
         "PolymarketLPService",
@@ -5762,6 +5775,8 @@ def test_lp_runtime_stops_obsolete_sampling_and_keeps_exposure_risk(
         assert runtime.execution is not None
         assert runtime._prediction_trading is trading
         assert runtime.store is not None
+        assert not trading.closed
+        assert runtime._owner.held
         release_history.set()
         assert history_finished.wait(timeout=2)
         assert history_calls and history_calls[0]["token_ids"] == ("history-token",)
@@ -5775,17 +5790,44 @@ def test_lp_runtime_stops_obsolete_sampling_and_keeps_exposure_risk(
                 time.sleep(0.01)
         assert history_summary is not None
         assert history_summary["state"] == "known"
+        assert history_published.wait(timeout=2)
+        assert runtime._history_thread is not None
+        assert runtime._history_thread.is_alive()
         assert runtime.store.lp_book_samples(
             "outside-candidate-condition",
             "outside-candidate-token",
             since=now - timedelta(minutes=1),
             until=now + timedelta(minutes=1),
         ) == []
+        # A published summary still does not permit closing live collaborators.
+        with pytest.raises(RuntimeError, match="history monitor thread did not stop"):
+            runtime.stop()
+        assert runtime.state == "STOPPING"
+        assert runtime.lp is not None
+        assert runtime.execution is not None
+        assert runtime._prediction_trading is trading
+        assert runtime.store is not None
+        assert not trading.closed
+        assert runtime._owner.held
+        release_history_monitor.set()
+        runtime._history_thread.join(timeout=2)
+        assert not runtime._history_thread.is_alive(), "history monitor did not exit"
         runtime.stop()
         assert runtime.state == "STOPPED"
+        assert runtime._history_thread is None
+        assert trading.closed
+        assert not runtime._owner.held
+        assert runtime._prediction_trading is None
 
     finally:
+        runtime._history_stop_event.set()
+        runtime._history_wakeup_event.set()
         release_history.set()
+        release_history_monitor.set()
+        history_thread = runtime._history_thread
+        if history_thread is not None:
+            history_thread.join(timeout=5)
+            assert not history_thread.is_alive(), "history monitor did not exit"
         if runtime.state not in {"NEW", "STOPPED"}:
             runtime.stop()
 
