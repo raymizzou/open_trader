@@ -539,3 +539,269 @@ def test_uncovered_unknown_keeps_its_budget_and_slot_across_refill_and_restart(r
     assert not next(i for i in state['intents'] if i['session_id'] == original['session_id']).get('reservation_coverage')
     assert store.lp_actions(original['session_id']) == audit
     assert restarted_account.posts == restarted_account.cancels == []
+
+
+def _historical_api_buy_intents(runtime):
+    """Persist old exact-ID receipt rows whose history cannot be rebuilt."""
+    from copy import deepcopy
+    store, adapter, account, lp, execution, public = prepare(runtime, budget='40')
+    account.orders = tuple(_open_order(f'current-{i}', 'BUY', price='.40', original='20',
+        token_id=_refill_identity(i)[2]).model_copy(update={'market': _refill_identity(i)[1],
+            'condition_id': _refill_identity(i)[1]}) for i in range(1, 4))
+    _advance(runtime)
+    assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    originals = []
+    for i in (1, 3):
+        market, condition, token = _refill_identity(i)
+        session = next(s for s in store.lp_sessions() if s['token_id'] == token)
+        originals.append(dict(intent_id=f'historical-{i}', session_id=session['session_id'],
+            order_id=f'current-{i}', config_version=execution.lp_auto_state()['config_version'],
+            state='active', financial_status='unknown', submission_unknown=False,
+            reconcile_reason='market_read_capacity', reserved_usd='8', inventory_cost_usd='0',
+            realized_pnl_usd='0', price='.40', quantity='20', market_id=market,
+            condition_id=condition, token_id=token, outcome='YES',
+            created_at=lp._now().isoformat(), checked_at=lp._now().isoformat()))
+    execution._auto_pool._update(lambda d: d['intents'].update(
+        {i['intent_id']: deepcopy(i) for i in originals}))
+    _advance(runtime)
+    assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    return store, adapter, account, lp, execution, public, originals
+
+
+def test_current_api_buys_replace_unknown_history_once_and_refill_after_restart(runtime):
+    store, adapter, account, _, execution, public, originals = _historical_api_buy_intents(runtime)
+    state = execution.lp_auto_state()
+    assert state['slots']['occupied'] == 3, state
+    assert Decimal(state['funds']['buy_reserved_usd']) == 24
+    assert Decimal(state['funds']['spendable_usd']) == 16
+    assert state['funds']['status'] == 'known'
+    assert not state['admission_block_reasons']
+    assert state['intents'] == originals, 'Projection must retain UNKNOWN receipt audit'
+    assert not any(i.get('reservation_coverage') for i in state['intents'])
+    audit = {i['session_id']: store.lp_actions(i['session_id']) for i in originals}
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    entered, release = Event(), Event()
+    original_sign = account.create_limit_order
+    def delayed_sign(**kwargs):
+        entered.set()
+        assert release.wait(5), 'Independent real-time watchdog'
+        return original_sign(**kwargs)
+    account.create_limit_order = delayed_sign
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        pending = worker.submit(execution.lp_auto_run_once, round_id='unknown-history-three-to-five')
+        try:
+            assert entered.wait(5)
+            concurrent = execution.lp_auto_run_once(round_id='concurrent-history-refill')
+            assert concurrent['round_reason'] == 'round_in_progress'
+            assert account.posts == []
+        finally:
+            release.set()
+        state = pending.result(timeout=5)
+    assert [p.token_id for p in account.posts] == [_refill_identity(i)[2] for i in (4, 5)], state['last_round']
+    assert state['slots']['occupied'] == 5
+    assert Decimal(state['funds']['buy_reserved_usd']) == 40
+    assert Decimal(state['funds']['spendable_usd']) == 0
+    assert [i for i in state['intents'] if i['intent_id'].startswith('historical-')] == originals
+    assert all(store.lp_actions(i['session_id']) == audit[i['session_id']] for i in originals)
+    execution.lp_auto_run_once(round_id='unknown-history-three-to-five')
+    assert len(account.posts) == 2
+    assert account.cancels == []
+    orders = account.orders
+    adapter.close()
+    _advance(runtime)
+    store, _, restarted_account, _, restarted = runtime(public_client=public, orders=orders)
+    assert restarted.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    state = restarted.lp_auto_run_once(round_id='unknown-history-three-to-five')
+    assert state['slots']['occupied'] == 5
+    assert Decimal(state['funds']['buy_reserved_usd']) == 40
+    assert [i for i in state['intents'] if i['intent_id'].startswith('historical-')] == originals
+    assert all(store.lp_actions(i['session_id']) == audit[i['session_id']] for i in originals)
+    assert restarted_account.posts == restarted_account.cancels == []
+
+
+@pytest.mark.parametrize('invalid', ['stale', 'identity', 'generation', 'financial-unknown',
+    'malformed', 'duplicate-conflict', 'missing-token', 'wrong-side'])
+def test_invalid_api_facts_do_not_replace_unknown_exact_id_holds(runtime, invalid):
+    store, _, account, lp, execution, _, originals = _historical_api_buy_intents(runtime)
+    def invalidate(d):
+        facts = d['account_financial_facts']
+        if invalid == 'stale':
+            facts['checked_at'] = (lp._now() - timedelta(seconds=61)).isoformat()
+        elif invalid == 'identity':
+            facts['account_id'] = '0x' + 'b' * 40
+        elif invalid == 'generation':
+            facts['trade_generation'] += 1
+        elif invalid == 'financial-unknown':
+            facts.update(financial_status='unknown', reason_codes=['account_position_cost_unknown'])
+        elif invalid == 'malformed':
+            facts['buys'] = None
+        elif invalid == 'duplicate-conflict':
+            facts['buys'].append({**facts['buys'][0], 'reserved_usd': '100'})
+        elif invalid == 'missing-token':
+            facts['buys'][0]['token_id'] = ''
+        else:
+            facts['buys'][0]['side'] = 'SELL'
+    execution._auto_pool._update(invalidate)
+    state = execution.lp_auto_state()
+    assert state['funds']['status'] == 'unknown'
+    assert state['funds']['spendable_usd'] is None
+    assert state['admission_block_reasons']
+    assert state['slots']['occupied'] >= 2
+    assert Decimal(state['funds']['buy_reserved_usd']) >= 16
+    assert state['intents'] == originals
+    # A failing real SDK completeness read cannot replace the invalid facts.
+    account.list_positions = lambda **kwargs: (object(),)
+    state = execution.lp_auto_run_once(round_id=f'invalid-exact-id-{invalid}')
+    assert state['admission_block_reasons']
+    assert state['intents'] == originals
+    assert account.posts == account.cancels == []
+
+
+@pytest.mark.parametrize('mismatch', ['order', 'token', 'side', 'missing-order', 'missing-token', 'submission-unknown', 'sending'])
+def test_unmatched_unknown_receipt_keeps_full_budget_and_slot(runtime, mismatch):
+    _, _, _, _, execution, _, originals = _historical_api_buy_intents(runtime)
+    def mismatch_one(d):
+        intent = d['intents'][originals[0]['intent_id']]
+        if mismatch == 'order':
+            intent['order_id'] = 'not-in-api'
+        elif mismatch == 'token':
+            intent['token_id'] = _refill_identity(2)[2]
+        elif mismatch == 'side':
+            intent['side'] = 'SELL'
+        elif mismatch in ('submission-unknown', 'sending'):
+            intent.update(state='unknown' if mismatch == 'submission-unknown' else 'sending', submission_unknown=True)
+        else:
+            intent['order_id' if mismatch == 'missing-order' else 'token_id'] = None
+    execution._auto_pool._update(mismatch_one)
+    state = execution.lp_auto_state()
+    assert state['slots']['occupied'] == 4
+    assert Decimal(state['funds']['buy_reserved_usd']) == 32
+    assert Decimal(state['funds']['spendable_usd']) == 8
+    assert state['funds']['status'] == 'unknown'
+    assert next(i for i in state['intents'] if i['intent_id'] == originals[0]['intent_id'])['financial_status'] == 'unknown'
+
+
+@pytest.mark.parametrize('side, action_state', [('BUY', 'unknown'), ('BUY', 'pending'),
+    ('SELL', 'unknown'), ('SELL', 'accepted_without_order_id'), ('SELL', 'accepted')])
+def test_matching_api_buy_keeps_independent_unresolved_action_risk(runtime, side, action_state):
+    store, _, account, _, execution, _, originals = _historical_api_buy_intents(runtime)
+    original = originals[0]
+    store.lp_upsert_action(original['session_id'], f"{original['session_id']}:extra-submit",
+        state=action_state, payload={'role': 'augment' if side == 'BUY' else 'passive_exit',
+            'side': side, 'token_id': original['token_id'], 'quantity': '20'})
+    audit_intents = execution.lp_auto_state()['intents']
+    audit_actions = store.lp_actions(original['session_id'])
+    _advance(runtime)
+    assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    state = execution.lp_auto_state()
+    # A pending extra BUY invalidates account admission itself, retaining both
+    # historical holds. Ended/SELL uncertainty still retains its entire hold.
+    expected = 5 if side == 'BUY' and action_state == 'pending' else 4
+    assert state['slots']['occupied'] == expected
+    assert Decimal(state['funds']['buy_reserved_usd']) == 8 * expected
+    assert state['funds']['status'] == 'unknown'
+    assert state['intents'] == audit_intents
+    assert store.lp_actions(original['session_id']) == audit_actions
+    assert state['admission_block_reasons']
+    assert state['funds']['spendable_usd'] is None
+    execution.lp_auto_run_once(round_id=f'independent-{side}-{action_state}')
+    assert account.posts == account.cancels == []
+    assert not next(i for i in state['intents'] if i['intent_id'] == original['intent_id']).get('reservation_coverage')
+
+
+@pytest.mark.parametrize('invalid', ['incomplete', 'failed'])
+def test_failed_current_api_read_retains_matching_unknown_holds_until_recovery(runtime, invalid):
+    _, _, account, _, execution, _, originals = _historical_api_buy_intents(runtime)
+    positions = account.list_positions
+    def invalid_positions(**kwargs):
+        if invalid == 'failed':
+            raise TimeoutError('offline positions read failed')
+        return (object(),)
+    account.list_positions = invalid_positions
+    state = execution.lp_auto_run_once(round_id=f'failed-current-api-{invalid}')
+    assert state['slots']['occupied'] == 5
+    assert Decimal(state['funds']['buy_reserved_usd']) == 40
+    assert state['funds']['spendable_usd'] is None
+    assert state['funds']['status'] == 'unknown'
+    assert state['intents'] == originals
+    assert account.posts == account.cancels == []
+    account.list_positions = positions
+    _advance(runtime)
+    state = execution.lp_auto_run_once(round_id=f'recovered-current-api-{invalid}')
+    assert len(account.posts) == 2, state['last_round']
+    assert state['slots']['occupied'] == 5
+    assert Decimal(state['funds']['buy_reserved_usd']) == 40
+    assert state['funds']['status'] == 'known'
+    assert not state['admission_block_reasons']
+
+
+@pytest.mark.parametrize('history', ['rejected-buy', 'terminal-buy', 'unknown-amounts', 'accepted-legacy-sending'])
+def test_current_api_buy_replaces_ended_history_and_unknown_report_amounts(runtime, history):
+    store, _, account, _, execution, _, originals = _historical_api_buy_intents(runtime)
+    original = originals[0]
+    if history == 'unknown-amounts':
+        execution._auto_pool._update(lambda d: d['intents'][original['intent_id']].update(
+            reserved_usd=None, inventory_cost_usd=None))
+    elif history == 'accepted-legacy-sending':
+        store.lp_update_session(original['session_id'], state='complete', patch={
+            'submit_status': 'accepted', 'submit_stage': 'sending'})
+        store.lp_upsert_action(original['session_id'], f"{original['session_id']}:entry-submit",
+            state='accepted', payload={'role': 'entry', 'side': 'BUY', 'order_id': original['order_id'],
+                'token_id': original['token_id']})
+    else:
+        store.lp_upsert_action(original['session_id'], f"{original['session_id']}:historical-buy",
+            state='rejected' if history == 'rejected-buy' else 'complete',
+            payload={'role': 'augment', 'side': 'BUY', 'token_id': original['token_id'], 'quantity': '20'})
+    audit_intents = execution.lp_auto_state()['intents']
+    audit_actions = store.lp_actions(original['session_id'])
+    _advance(runtime)
+    assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    state = execution.lp_auto_state()
+    assert state['slots']['occupied'] == 3
+    assert Decimal(state['funds']['buy_reserved_usd']) == 24
+    assert Decimal(state['funds']['inventory_cost_usd']) == 0
+    assert Decimal(state['funds']['spendable_usd']) == 16
+    assert state['funds']['status'] == 'known'
+    assert not state['admission_block_reasons']
+    assert state['intents'] == audit_intents
+    assert store.lp_actions(original['session_id']) == audit_actions
+    if history == 'accepted-legacy-sending':
+        assert store.lp_session(original['session_id'])['submit_stage'] == 'sending'
+        assert not execution._lp.entry_send_inflight(original['session_id'])
+    state = execution.lp_auto_run_once(round_id=f'ended-history-{history}')
+    assert [p.token_id for p in account.posts] == [_refill_identity(i)[2] for i in (4, 5)], state['last_round']
+    assert state['slots']['occupied'] == 5
+    assert Decimal(state['funds']['buy_reserved_usd']) == 40
+    assert Decimal(state['funds']['spendable_usd']) == 0
+    assert [i for i in state['intents'] if i['intent_id'].startswith('historical-')] == audit_intents
+    assert store.lp_actions(original['session_id']) == audit_actions
+
+
+@pytest.mark.parametrize('side', ['BUY', 'SELL'])
+def test_known_matching_intent_with_accepted_idless_extra_action_blocks_new_buys(runtime, side):
+    store, _, account, _, execution, _, originals = _historical_api_buy_intents(runtime)
+    original = originals[0]
+    store.lp_upsert_action(original['session_id'], f"{original['session_id']}:accepted-extra-submit",
+        state='accepted', payload={'role': 'augment' if side == 'BUY' else 'passive_exit',
+            'side': side, 'token_id': original['token_id'], 'quantity': '200'})
+    _advance(runtime)
+    assert execution.refresh_lp_dashboard_snapshot()['state'] == 'ready'
+    execution._auto_pool._update(lambda d: d['intents'][original['intent_id']].update(financial_status='known'))
+    audit_intents = execution.lp_auto_state()['intents']
+    audit_actions = store.lp_actions(original['session_id'])
+    facts, _, reasons = execution._auto_pool._account_projection_facts(execution._auto_pool._read())
+    assert facts['financial_status'] == 'known' and not reasons
+    assert facts['trade_generation'] == store.lp_trade_generation()
+    state = execution.lp_auto_state()
+    assert state['funds']['status'] == 'unknown'
+    assert state['funds']['spendable_usd'] is None
+    assert 'unbounded_financial_uncertainty' in state['admission_block_reasons']
+    assert state['slots']['occupied'] == 4
+    assert state['intents'] == audit_intents
+    state = execution.lp_auto_run_once(round_id=f'known-idless-extra-{side}')
+    assert 'unbounded_financial_uncertainty' in state['admission_block_reasons']
+    assert state['funds']['spendable_usd'] is None
+    assert account.posts == account.cancels == []
+    assert state['intents'] == audit_intents
+    assert store.lp_actions(original['session_id']) == audit_actions

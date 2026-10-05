@@ -21,7 +21,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Mapping
 
-from .polymarket_lp_accounting import account_position_quantity, default_account_pool_document, reservation_is_covered, reservation_is_manually_released, reservation_is_released
+from .polymarket_lp_accounting import account_position_quantity, default_account_pool_document, has_independent_unresolved_action, reservation_is_covered, reservation_is_manually_released, reservation_is_released
 from .polymarket_lp_risk import (
     TERMINAL_ORDER_STATES, _account_after_reservations, _decimal as _money, _freshness, _levels,
     _maybe_decimal, _timestamp, evaluate_lp_entry, minimum_order_estimate,
@@ -254,7 +254,8 @@ class LPAutoPool:
                 reasons.append('account_buy_facts_unknown')
                 continue
             order_id = row.get('order_id')
-            if not order_id or order_id in seen:
+            if (not order_id or not str(row.get('token_id') or '').strip() or row.get('side') != 'BUY'
+                    or order_id in seen):
                 reasons.append('account_buy_facts_unknown')
                 continue
             seen.add(order_id)
@@ -297,17 +298,42 @@ class LPAutoPool:
             newer = newer or current > previous
         return newer
 
+    def _unrepresented_intents(self, intents, account_buys, *, account_valid):
+        """Keep audit rows, projecting only exposure not already priced by the API."""
+        current_ids = {(b['order_id'], b['token_id']) for b in account_buys
+                       if b.get('order_id') and b.get('token_id') and b.get('side') == 'BUY'} if account_valid and not getattr(self.lp, '_account_order_sync_error', None) else set()
+        result = []
+        independent_unknown = False
+        for intent in intents:
+            represented = (intent.get('order_id'), intent.get('token_id')) in current_ids
+            if represented and intent.get('side', 'BUY') == 'BUY':
+                session = self.store.lp_session(intent['session_id'])
+                actions = self.store.lp_actions(intent['session_id'])
+                independent = session is not None and has_independent_unresolved_action(session, actions)
+                independent_unknown = independent_unknown or independent
+                represented = (intent['state'] in ('active', 'canceling')
+                    and not intent.get('submission_unknown')
+                    and session is not None and not session.get('order_identity_conflict')
+                    and not intent.get('order_identity_conflict')
+                    and 'identity' not in str(intent.get('reconcile_reason') or '')
+                    and intent.get('reconcile_reason') not in {'owned_order_token_mismatch', 'owned_order_side_mismatch'}
+                    and not self.lp.entry_send_inflight(intent['session_id'])
+                    and not self.lp._has_unresolved_submission(session)
+                    and not independent)
+            else:
+                represented = False
+            if not represented:
+                result.append(intent)
+        return result, independent_unknown
+
     def _projection(self, d, *, include_intents=True):
         audit_intents = list(d['intents'].values())
         # Coverage is a one-way replacement, not a new interpretation of the
         # original submission. Its audit survives late callbacks unchanged.
         intents = [i for i in audit_intents if not reservation_is_released(i, d['account_id'])]
         account, account_buys, account_reasons = self._account_projection_facts(d)
-        # Exact current API BUY IDs replace their known receipt projection,
-        # even when the clock cannot distinguish receipt and next read stamps.
-        current_ids = {(b['order_id'], b.get('token_id')) for b in account_buys}
-        intents = [i for i in intents if not (i.get('financial_status') == 'known'
-            and (i.get('order_id'), i.get('token_id')) in current_ids)]
+        intents, independent_unknown = self._unrepresented_intents(intents, account_buys,
+            account_valid=account is not None and account.get('financial_status') == 'known' and not account_reasons)
         occupied = [i for i in intents if i['state'] not in ('terminal','rejected','aborted')]
         occupied += account_buys
         pending = [i for i in occupied if i['state'] in ('reserved','sending','unknown')]
@@ -338,7 +364,7 @@ class LPAutoPool:
         total = _decimal(d['budget_usd']) if d['budget_usd'] is not None else ZERO
         uncertain = [i for i in intents if i.get('financial_status') == 'unknown'
                      or not self._funds_fresh(i) or i['state'] == 'unknown' or i.get('submission_unknown')]
-        financial_unknown = bool(uncertain or account_reasons or inventory_unknown)
+        financial_unknown = bool(uncertain or account_reasons or inventory_unknown or independent_unknown)
         isolated = [i for i in uncertain if self._isolatable(i)]
         # Hold the entire original principal even if old receipts released it.
         # Unconfirmed proceeds/profits cannot increase the spendable lower bound.
@@ -369,7 +395,7 @@ class LPAutoPool:
         if d['account_id'] != self.execution._lp_account_id() or not d['account_id']:
             reasons.append('account_identity_unknown')
         admission_reasons = [r for r in reasons if r not in ('submission_unknown', 'financial_facts_unknown')]
-        if len(isolated) != len(uncertain):
+        if independent_unknown or len(isolated) != len(uncertain):
             admission_reasons.append('unbounded_financial_uncertainty')
         funds = dict(spendable_usd=str(spendable) if not admission_reasons else None,
                      isolated_reserved_usd=str(extra_hold), total_usd=str(total), available_usd=None if financial_unknown else str(max(ZERO,total-inventory-reserved)),
@@ -699,7 +725,10 @@ class LPAutoPool:
 
     def _ranked_buys(self, state):
         """Rank actual BUY IDs and candidates on the same yield basis."""
-        active = [i for i in state['intents'] if not reservation_is_released(i, state['account_id'])
+        account, account_buys, account_reasons = self._account_projection_facts(self._read())
+        intents, _ = self._unrepresented_intents(state['intents'], account_buys,
+            account_valid=account is not None and account.get('financial_status') == 'known' and not account_reasons)
+        active = [i for i in intents if not reservation_is_released(i, state['account_id'])
                   and i['state'] not in ('terminal', 'rejected', 'aborted')]
         active += state.get('account_buys', [])
         if len(active) < state['target_buy_count']:
@@ -2057,11 +2086,14 @@ class LPAutoPool:
                 try:
                     result=self._submit(row,round_id,index,d['config_version'],peers=targets[:index]+targets[index+1:])
                     actions.append({'condition_id':row['condition_id'],**result})
-                    blockers = [r for r in self.state()['admission_block_reasons']
-                                if r != 'account_financial_facts_changed']
-                    if blockers:
-                        reason = blockers[0]
-                        break
+                    # A receipt changes the account generation. The next
+                    # real-adapter submission (or final refresh) must reprice
+                    # current API exposure before testing admission again.
+                    if not callable(getattr(self.lp.exchange, 'lp_account_snapshot_shared', None)):
+                        blockers = self.state()['admission_block_reasons']
+                        if blockers:
+                            reason = blockers[0]
+                            break
                 except ValueError as exc:
                     if str(exc) == 'target_filled':
                         reason = 'target_filled'

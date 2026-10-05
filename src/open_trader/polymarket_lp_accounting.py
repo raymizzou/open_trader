@@ -418,6 +418,21 @@ def account_position_quantity(facts, token: str) -> Decimal:
     return _number(quantity, 'account_position_unknown')
 
 
+def has_independent_unresolved_action(session, actions) -> bool:
+    """Keep exit/extra-action uncertainty separate from the original entry."""
+    if any(session.get(key) in {'pending', 'unknown', 'accepted_without_order_id'}
+           for key in ('passive_exit_attempt_state', 'protected_exit_attempt_state')):
+        return True
+    for action in actions:
+        if action.get('role') == 'entry' or str(action.get('action_key') or '').endswith('entry-submit'):
+            continue
+        if (action.get('state') in {'pending', 'unknown', 'accepted_without_order_id'}
+                or action.get('state') == 'accepted' and action.get('side') in {'BUY', 'SELL'}
+                and not action.get('order_id') and 'cancel' not in str(action.get('action_key') or '')):
+            return True
+    return False
+
+
 def can_resume_covered_management(session, actions, facts) -> bool:
     """Resume only management blocked by the original covered entry receipt.
 
@@ -438,16 +453,8 @@ def can_resume_covered_management(session, actions, facts) -> bool:
     if (session.get('facts_error') not in original_uncertainty
             or session.get('reconciliation') not in original_uncertainty):
         return False
-    if any(session.get(key) in {'pending', 'unknown', 'accepted_without_order_id'}
-           for key in ('passive_exit_attempt_state', 'protected_exit_attempt_state')):
+    if has_independent_unresolved_action(session, actions):
         return False
-    for action in actions:
-        if action.get('role') == 'entry' or str(action.get('action_key') or '').endswith('entry-submit'):
-            continue
-        if (action.get('state') in {'pending', 'unknown', 'accepted_without_order_id'}
-                or action.get('state') == 'accepted' and action.get('side') in {'BUY', 'SELL'}
-                and not action.get('order_id') and 'cancel' not in str(action.get('action_key') or '')):
-            return False
     history = session.get('order_history') or {}
     if any(row.get('side') == 'SELL' and str(row.get('status') or 'UNKNOWN').upper() == 'UNKNOWN'
            for row in history.values()):
