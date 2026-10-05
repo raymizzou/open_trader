@@ -22,6 +22,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
   仅 true 写入受管 unit，false 保持旧 unit/停止记录兼容。安装环境、实际进程开关与
   preflight/smoke/two-host 证据绑定，拒绝缺失、错值、非布尔证据和环境绕过；沿既有部署 wrapper，
   不增加 extra_env、drop-in 或发布通路。配置、unit/proc 身份与远端证据均做 focused RED/GREEN。
+  CI 回归修复：恢复已发布准备输入的只读契约，排除候选时用临时 SQLite 原生备份发布新代次，
+  旧 reader 保持原代次且不常驻详细 Python 对象；迟到结果继续受 exclusion revision 拦截。
+  Schema 测试保留精确表集合，并校验新表列、复合主键、到期索引及 SQLite 安全 pragma。
+  两项 runtime 回归改用逐轮事件握手完成 12 次真实保护 tick，并等待重试/通知落库后由
+  `runtime.stop()` 停止线程；生产调度、业务截止与退出逻辑不变，测试原 100ms grace 保留。
+  定点延迟、in-flight 取消/超时及资源保留负断言继续验证，不以加大 timeout 或重试换取通过。
 
 - #249 后续补位修复：完整、有效的当前账户 API 已确认同一精确 BUY 订单/token 时，
   本地历史资金 UNKNOWN、已结束额外 BUY 或报告金额缺失不再重复占款/占位；审计保持原样。

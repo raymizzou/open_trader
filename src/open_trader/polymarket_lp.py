@@ -1073,13 +1073,28 @@ class PolymarketLPService:
                 metadata = inputs["metadata"]
                 ids = (condition_id,) if condition_id else tuple(metadata)
                 allowed = set(self._candidate_conditions(ids))
+                filtered = None
                 for cid in ids:
-                    row = metadata.get(cid)
                     if cid not in allowed:
-                        metadata.pop(cid, None)
-                    elif isinstance(row, Mapping) and isinstance(row.get("outcomes"), Mapping):
-                        metadata[cid] = {**row, "outcomes": {key: value for key, value in row["outcomes"].items()
-                            if isinstance(value, Mapping) and self._candidate_allowed(((cid, str(value.get("token_id") or "")),))}}
+                        if cid in metadata:
+                            if filtered is None:
+                                filtered = deepcopy(metadata)
+                            filtered.pop(cid, None)
+                        continue
+                    row = metadata.get(cid)
+                    if isinstance(row, Mapping) and isinstance(row.get("outcomes"), Mapping):
+                        outcomes = {key: value for key, value in row["outcomes"].items()
+                            if isinstance(value, Mapping) and self._candidate_allowed(((cid, str(value.get("token_id") or "")),))}
+                        if len(outcomes) != len(row["outcomes"]):
+                            if filtered is None:
+                                filtered = deepcopy(metadata)
+                            filtered[cid] = {**row, "outcomes": outcomes}
+                if filtered is not None:
+                    # Native scratch backup keeps values off the Python heap.
+                    # Publish a new generation; captured readers retain their old map.
+                    self._prepared_inputs = {**inputs, "metadata": filtered}
+                    self._prepared_inputs_version += 1
+                    self._candidate_queue_state = None
             evict = getattr(self.exchange, "evict_lp_candidate_metadata", None)
             if callable(evict) and (condition_id or prepared):
                 evict(condition_ids=(condition_id,) if condition_id else None, now=self._now())
@@ -1182,9 +1197,7 @@ class PolymarketLPService:
     def _prepared_input_snapshot(self) -> dict[str, object] | None:
         with self._candidate_state_lock:
             prepared = self._prepared_inputs
-        # Scratch lookups decode private values. Exclusions remove candidate
-        # metadata under the state lock, including from an older reader's map.
-        return dict(prepared) if isinstance(prepared, Mapping) else None
+            return {**prepared, "metadata": MappingProxyType(prepared["metadata"])} if isinstance(prepared, Mapping) else None
 
     def _preparation_priority_order(
         self, condition_ids: Sequence[str]

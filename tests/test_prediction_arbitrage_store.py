@@ -231,6 +231,31 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
             "SELECT payload FROM signals WHERE market_id=? ORDER BY started_at DESC",
             ("market-1",),
         ).fetchall()
+        assert connection.execute("PRAGMA table_info(lp_market_exclusions)").fetchall() == [
+            (0, "condition_id", "TEXT", 1, None, 1),
+            (1, "token_id", "TEXT", 1, "''", 2),
+            (2, "reason_code", "TEXT", 1, None, 0),
+            (3, "checked_at", "TEXT", 1, None, 0),
+            (4, "cooldown_until", "TEXT", 1, None, 0),
+        ]
+        exclusion_indexes = {row[1]:tuple(row[2:]) for row in connection.execute(
+            "PRAGMA index_list(lp_market_exclusions)")}
+        assert exclusion_indexes == {
+            "lp_market_exclusions_expiry": (0, "c", 0),
+            "sqlite_autoindex_lp_market_exclusions_1": (1, "pk", 0),
+        }
+        assert [row[2] for row in connection.execute(
+            "PRAGMA index_info(lp_market_exclusions_expiry)")] == ["cooldown_until"]
+        assert [row[2] for row in connection.execute(
+            "PRAGMA index_info(sqlite_autoindex_lp_market_exclusions_1)")] == ["condition_id", "token_id"]
+        expiry_plan = connection.execute("EXPLAIN QUERY PLAN SELECT condition_id,token_id "
+            "FROM lp_market_exclusions WHERE cooldown_until<=? ORDER BY cooldown_until LIMIT 300",
+            ("2026-09-17T00:00:00+00:00",)).fetchall()
+        assert any("lp_market_exclusions_expiry" in row[3] for row in expiry_plan)
+    with db._read_connection() as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert connection.execute("PRAGMA busy_timeout").fetchone()[0] > 0
     assert names == {
         "service_flags",
         "signals",
@@ -272,6 +297,7 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
         "lp_screening_snapshot",
         "lp_market_observations",
         "lp_market_competitiveness",
+        "lp_market_exclusions",
             "lp_preparation",
             "lp_preparation_items",
             "lp_trade_generation",
