@@ -21392,7 +21392,7 @@ console.log(JSON.stringify({
 
 
 def test_lp_candidate_estimate_column_and_badge_contract() -> None:
-    """Seam 4 (#138 round 2): the candidate table renders the 5% target-share
+    """Seam 4 (#138 round 2): the candidate table renders the minimum-order
     yield column with the target plan and minimum trial on separate sub-lines,
     shows 待测 without falling back to the pool upper bound, carries the new
     scan-stop footnote, and the current-recommendation badge follows the
@@ -21412,7 +21412,7 @@ const mkRow = (overrides) => ({
   estimate_state: "known", estimate_updated: true,
   estimated_yield_raw: "0.00881557",
   estimated_yield_pct_per_hour: "0.881557",
-  estimated_target_quantity: "98.70", estimated_target_capital_usd: "16.78",
+  estimated_target_quantity: "60", estimated_target_capital_usd: "10.20",
   estimated_hourly_reward_usd: "0.147917", estimate_checked_at: checkedAt,
   updated_at: checkedAt, expires_at: "2026-09-20T17:05:00Z",
   refresh_failed: false,
@@ -21494,10 +21494,10 @@ const rowHtml = (conditionId) => {
   return html.slice(index, html.indexOf("</tr>", index));
 };
 console.log(JSON.stringify({
-  header: table.includes("5% 奖励份额 · 预计收益率/小时")
+  header: table.includes("最小计奖挂单 · 预计收益率/小时")
     && !table.includes("假设上限/小时"),
   mainLine: html.includes("≈0.881557%/小时"),
-  targetPlan: html.includes("目标占资 $16.78（98.70 份）"),
+  targetPlan: html.includes("挂单占资 $10.20（60 份）"),
   minTrial: html.includes("最小试挂 $10.20（60 份）"),
   pendingCell: rowHtml("condition-L3").includes("待测")
     && rowHtml("condition-L3").includes("估值缺失，不回退奖池上限")
@@ -21546,7 +21546,7 @@ const row = (overrides) => ({
   estimate_state: "known", estimate_updated: true,
   estimated_yield_raw: "2.0833332",
   estimated_yield_pct_per_hour: "2.083333",
-  estimated_target_quantity: "46.00", estimated_target_capital_usd: "20.70",
+  estimated_target_quantity: "20", estimated_target_capital_usd: "9.00",
   estimated_hourly_reward_usd: "0.431429", estimate_checked_at: checkedAt,
   updated_at: checkedAt, expires_at: "2026-09-19T12:05:00Z",
   refresh_failed: false,
@@ -21563,7 +21563,7 @@ const second = row({
   token_id: "token-condition-R2-no", outcome: "YES",
   realtime_price: "0.40", realtime_capital: "8.00",
   estimated_yield_pct_per_hour: "1.822917",
-  estimated_target_quantity: "46.00", estimated_target_capital_usd: "18.40",
+  estimated_target_quantity: "20", estimated_target_capital_usd: "8.00",
   selected_direction: selected("YES", "0.40", "8.00", "0.80", "0.10"),
   competition: {state: "unknown", value: null, raw_value: null, checked_at: null, stale: false, updated: null},
 });
@@ -21615,13 +21615,13 @@ console.log(JSON.stringify({
     && !freshHtml.includes("停止原因"),
   eightColumns: (table(freshHtml).match(/<th scope="col">/g) || []).length === 8
     && table(freshHtml).includes("市场与方向")
-    && table(freshHtml).includes("5% 奖励份额 · 预计收益率/小时")
+    && table(freshHtml).includes("最小计奖挂单 · 预计收益率/小时")
     && !table(freshHtml).includes("假设上限/小时")
     && table(freshHtml).includes("拟挂方案（价 × 份 = 实际占资）")
     && table(freshHtml).includes("压力退出损失（金额 / 比例）")
     && table(freshHtml).includes("估值时间与状态"),
   estimateCells: freshHtml.includes("≈2.083333%/小时")
-    && freshHtml.includes("目标占资 $20.70（46.00 份）")
+    && freshHtml.includes("挂单占资 $9.00（20 份）")
     && freshHtml.includes("最小试挂 $9.00（20 份）")
     && freshHtml.includes("≈1.822917%/小时")
     && freshHtml.includes("最小试挂 $8.00（20 份）"),

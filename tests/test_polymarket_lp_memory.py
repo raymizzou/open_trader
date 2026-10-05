@@ -43,20 +43,73 @@ class MemoryExchange(_LPCandidateQueryExchange):
         return result
 
 
-def test_complete_ranking_trace_matches_unmodified_baseline(tmp_path):
-    baseline = json.loads((Path(__file__).parent/'fixtures/lp_memory_ranking_4fbddaae.json').read_text())
-    assert baseline['baseline_sha'] == '4fbddaae061e95cbbbb3db4d5793e40e33ec2cae'
-    for actual, expected in zip(ranking_trace(tmp_path), baseline['steps'], strict=True):
-        assert [row['condition_id'] for row in actual['candidates']] == expected['ranked_conditions']
+def _unchanged_contract(value, *, estimate=False):
+    """Audit only #249's known-estimate fields out of the historical trace.
+
+    All other fields, including UNKNOWN reasons, ranks, deadlines and
+    traversal counters, must retain their independently replayed old hash.
+    The new full hashes below also protect every removed estimate field.
+    """
+    if isinstance(value, list):
+        return [_unchanged_contract(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    row = {key: _unchanged_contract(item, estimate=key == 'estimate') for key, item in value.items()}
+    if estimate and row.get('state') == 'known':
+        for key in ('basis', 'price', 'quantity', 'capital_usd', 'midpoint', 'competition_upper_bound',
+                    'hourly_reward_usd', 'yield_pct_per_hour', 'yield_pct_per_hour_display'):
+            row.pop(key, None)
+        if row.get('reason_codes') == []:
+            row.pop('reason_codes')
+    if 'estimate_state' in row:
+        row.pop('estimate_basis', None)
+        if row['estimate_state'] == 'known':
+            for key in ('estimated_hourly_reward_usd', 'estimated_yield_raw', 'estimated_yield_pct_per_hour'):
+                row.pop(key, None)
+    return row
+
+
+def _trace_hash(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def test_complete_ranking_trace_matches_issue249_minimum_order_contract(tmp_path):
+    fixtures = Path(__file__).parent / 'fixtures'
+    historical = json.loads((fixtures / 'lp_memory_ranking_4fbddaae.json').read_text())
+    contract = json.loads((fixtures / 'lp_memory_ranking_minimum_order_issue249.json').read_text())
+    assert historical['baseline_sha'] == contract['historical_baseline_sha'] == '4fbddaae061e95cbbbb3db4d5793e40e33ec2cae'
+    assert contract['contract_version'] == 'issue249_minimum_order_v1'
+    assert contract['source_sha'] == '17e59970dd8cbb9732470a49c17ebf952640878b'
+    for index, (actual, expected, old) in enumerate(zip(ranking_trace(tmp_path), contract['steps'], historical['steps'], strict=True)):
+        assert [row['condition_id'] for row in actual['candidates']] == expected['ranked_conditions'] == old['ranked_conditions']
         assert [row.get('estimated_yield_raw') for row in actual['candidates']] == expected['ranked_yields']
-        encoded = json.dumps(actual, sort_keys=True, separators=(',', ':'))
-        assert hashlib.sha256(encoded.encode()).hexdigest() == expected['sha256'], (expected['step'], actual)
+        for row in actual['candidates']:
+            if row['estimate_state'] == 'known':
+                # The replay changes M01 pool 57.6 -> 24 after its first step;
+                # displayed catalog metadata intentionally remains unchanged.
+                pool = Decimal(24) if index > 0 and row['condition_id'] == 'condition-M01' else Decimal(row['daily_pool_usd'])
+                assert Decimal(row['estimated_target_quantity']) == 20
+                assert Decimal(row['estimated_target_capital_usd']) == 10
+                assert Decimal(row['estimated_yield_pct_per_hour']) == (pool * Decimal(81) / (24 * 1616 * 10) * 100).quantize(Decimal('.000001'))
+        assert _trace_hash(_unchanged_contract(actual)) == expected['unchanged_contract_sha256'], expected['step']
+        assert _trace_hash(actual) == expected['sha256'], (expected['step'], actual)
 
 
-def test_full_normal_and_backup_traversal_matches_unmodified_baseline(tmp_path):
-    baseline = json.loads((Path(__file__).parent/'fixtures/lp_memory_ranking_4fbddaae.json').read_text())
-    actual = json.dumps(backfill_trace(tmp_path), sort_keys=True, separators=(',', ':'))
-    assert hashlib.sha256(actual.encode()).hexdigest() == baseline['backfill_sha256']
+def test_full_normal_and_backup_traversal_matches_issue249_minimum_order_contract(tmp_path):
+    contract = json.loads((Path(__file__).parent / 'fixtures/lp_memory_ranking_minimum_order_issue249.json').read_text())
+    trace = backfill_trace(tmp_path)  # Also asserts all 52 distinct tokens were read.
+    expected = contract['backfill_invariants']
+    assert [step['candidate_valid_count'] for step in trace] == expected['valid'] == [8, 17, 23]
+    assert [step['candidate_pending_count'] for step in trace] == expected['pending'] == [16, 6, 0]
+    for field, counts in [('unknown', [1, 1, 1]), ('rejected', [1, 2, 3]), ('backup_read', [0, 6, 12])]:
+        assert [step['funnel'][field] for step in trace] == expected[field] == counts
+    for step in trace:
+        for row in step['candidates']:
+            assert Decimal(row['estimated_target_quantity']) == 20
+            assert Decimal(row['estimated_target_capital_usd']) == Decimal('6.80')
+            assert Decimal(row['estimated_yield_pct_per_hour']) == (Decimal(100) * 81 / (24 * 1616 * Decimal('6.80')) * 100).quantize(Decimal('.000001'))
+    assert _trace_hash(_unchanged_contract(trace)) == contract['backfill_unchanged_contract_sha256']
+    assert _trace_hash(trace) == contract['backfill_sha256']
 
 
 def test_preparation_and_rejected_queue_details_are_released_and_can_reenter(tmp_path):
