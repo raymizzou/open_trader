@@ -704,6 +704,7 @@ class LPAutoPool:
     def candidates(self, *, releasing=(), diagnostics=None):
         """Consume the entire qualified pool before exclusion, never the UI top ten."""
         from .polymarket_lp import _candidate_pool_row_expired, _candidate_yield_sort_key
+        self.lp._evict_excluded_candidates()
         with self.lp._candidate_state_lock:
             facts={}
             expired=set()
@@ -758,6 +759,8 @@ class LPAutoPool:
             if diagnostics is not None:
                 counts['evaluated_markets'] += 1
             for direction in cached.get('directions',[]):
+                if not self.lp._candidate_allowed(((condition_id, str(direction.get('market', {}).get('token_id') or '')),)):
+                    continue
                 current_account = self._current_account
                 account = current_account or cached.get('account') or {}
                 source = 'current' if current_account else 'candidate' if account else 'unknown'

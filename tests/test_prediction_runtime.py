@@ -3326,6 +3326,8 @@ def test_lp_observations_refresh_without_dashboard_and_stop_with_runtime(
         solver_server_factory=lambda: object(),
         enable_n_leg_background=False,
     )
+    protection_wait = _ControlledRuntimeEvent()
+    isolated._lp_stop_event = protection_wait
     isolated.start()
     account_id = hashlib.sha256(
         isolation_trading.config.wallet_address.casefold().encode("utf-8")
@@ -3347,8 +3349,16 @@ def test_lp_observations_refresh_without_dashboard_and_stop_with_runtime(
                 isolation_probe.observation_cycle.clear()
         assert len(checked_at_values) >= 2
         assert isolation_probe.notification_sent.wait(timeout=2)
-        # Cover repeated protection ticks, not a race against the first tick.
+        # Each wait acknowledges a completed real tick. Drive twelve reconciliations
+        # without imposing a two-second throughput contract on SQLite/scheduling.
+        # The existing wait helper supplies an independent per-round watchdog.
+        for wait_count in range(1, 14):
+            protection_wait.wait_until_waiting(wait_count)
+            if isolation_probe.monitor_ticks >= 12:
+                break
+            protection_wait.expire()
         assert isolation_probe.monitor_cycles_finished.wait(timeout=2)
+        assert isolation_probe.monitor_ticks == 12
         sessions = isolated.store.lp_active_sessions()  # type: ignore[union-attr]
         assert len(sessions) == 1
         assert sessions[0]["queue_protection"]["data_failures"] == 0
@@ -6153,7 +6163,7 @@ def test_lp_partial_preparation_uses_item_retry_deadline(
     notification_done = threading.Event()
     history_wait_called = threading.Event()
     hourly_wait = threading.Event()
-    release_hourly = threading.Event()
+    history_bookkeeping_done = threading.Event()
 
     class FakeTrading:
         def attach_metadata_cache(self, _store: object) -> None:
@@ -6373,12 +6383,12 @@ def test_lp_partial_preparation_uses_item_retry_deadline(
     def history_wait(stop_event: threading.Event, seconds: float) -> bool:
         history_wait_calls.append(seconds)
         history_wait_called.set()
+        if notification_done.is_set():
+            history_bookkeeping_done.set()
+            return stop_event.wait()
         if seconds >= 3600:
             hourly_wait.set()
-            while not release_hourly.wait(timeout=0.01):
-                if stop_event.is_set():
-                    return True
-            return stop_event.is_set()
+            return stop_event.wait()
         if 0 < seconds < 3600:
             retry_deadline = datetime(2026, 9, 18, 12, 5, tzinfo=UTC)
             if (
@@ -6462,9 +6472,16 @@ def test_lp_partial_preparation_uses_item_retry_deadline(
         assert not hourly_wait.is_set() or any(
             seconds == pytest.approx(1) for seconds in history_wait_calls
         )
+        # notify() signals delivery before finish_preparation_alert commits it.
+        # The next scheduler wait proves retry/alert bookkeeping really finished.
+        assert history_bookkeeping_done.wait(timeout=2), "history scheduler did not finish bookkeeping"
+        failed_item = next(item for item in runtime.store.lp_preparation_items()
+            if item["condition_id"] == "condition-b" and item["token_id"] == "token-b"
+            and item["stage"] == "history")
+        assert failed_item["state"] == "waiting_retry"
+        assert runtime.lp.preparation_snapshot()["fault_alert_state"] == "sent"
     finally:
         release_299.set()
-        release_hourly.set()
         if runtime_started and runtime.state not in {"STOPPED", "FAILED"}:
             runtime.stop()
         assert runtime.state == "STOPPED"

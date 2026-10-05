@@ -11,6 +11,24 @@ operator-facing: what changed, which workflow is affected, and what was verified
   初筛合格方向与轮换复核移除分别计数，不新增读取/资格判定，也不改变原收益率排序或轮次原因优先级。
   真实适配器/SQLite 离线定向回归验证恢复、并发、账户门禁、过滤计数、读取次数及既有摘要；未部署或操作真实订单。
 
+- 云端可显式启用 LP 候选冷却排除（本机默认关闭）：复用现有奖励、接单、竞争、振幅与事件条件，
+  首个明确不合格即停止后续候选取数；UNKNOWN、取数失败、账户/资金/已参与状态与排名不入表。
+  SQLite 持久化市场/方向的固定 UTC 截止时间，不续期；到期分批删除，官方明确结束时提前清理。
+  准备、扫描、维护、预览、自动池与遗留 sampler 入口过滤，移除候选专用重数据并阻止迟到发布；
+  订单、持仓与预留管理沿原路径执行。受控时钟、真实临时 SQLite、并发与本机关闭回归验证；
+  16 市场两轮离线负载 metadata 标的读取 32→2、history token 读取 16→1，准备 metadata 缓存行 16→1。
+  未测生产 RSS，不保证解决 704 MiB 超限；未启用线上配置、未部署。
+  独立审查 P1 接线修复：正式 cloud JSON 增加严格布尔 `candidate_exclusions`，缺失默认关闭；
+  仅 true 写入受管 unit，false 保持旧 unit/停止记录兼容。安装环境、实际进程开关与
+  preflight/smoke/two-host 证据绑定，拒绝缺失、错值、非布尔证据和环境绕过；沿既有部署 wrapper，
+  不增加 extra_env、drop-in 或发布通路。配置、unit/proc 身份与远端证据均做 focused RED/GREEN。
+  CI 回归修复：恢复已发布准备输入的只读契约，排除候选时用临时 SQLite 原生备份发布新代次，
+  旧 reader 保持原代次且不常驻详细 Python 对象；迟到结果继续受 exclusion revision 拦截。
+  Schema 测试保留精确表集合，并校验新表列、复合主键、到期索引及 SQLite 安全 pragma。
+  两项 runtime 回归改用逐轮事件握手完成 12 次真实保护 tick，并等待重试/通知落库后由
+  `runtime.stop()` 停止线程；生产调度、业务截止与退出逻辑不变，测试原 100ms grace 保留。
+  定点延迟、in-flight 取消/超时及资源保留负断言继续验证，不以加大 timeout 或重试换取通过。
+
 - #249 后续补位修复：完整、有效的当前账户 API 已确认同一精确 BUY 订单/token 时，
   本地历史资金 UNKNOWN、已结束额外 BUY 或报告金额缺失不再重复占款/占位；审计保持原样。
   身份冲突、真实在途发送与无对应 API 的 UNKNOWN 仍保留，失效账户仍拒绝新增；

@@ -139,12 +139,14 @@ def test_preparation_and_rejected_queue_details_are_released_and_can_reenter(tmp
     assert {row["condition"] for row in Detail.live} <= {exchange.kept}
 
 
-def test_prepared_reader_keeps_its_generation_without_retaining_objects(tmp_path, monkeypatch):
+@pytest.mark.parametrize("enabled", [False, True])
+def test_prepared_reader_keeps_its_generation_without_retaining_objects(tmp_path, monkeypatch, enabled):
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event
 
     exchange = MemoryExchange(datetime(2026, 9, 20, 8, tzinfo=UTC), {'M00': Decimal('57.6')})
-    service = PolymarketLPService(PredictionArbitrageStore(tmp_path), exchange, clock=lambda: exchange.now)
+    service = PolymarketLPService(PredictionArbitrageStore(tmp_path), exchange,
+        clock=lambda: exchange.now, exclusions_enabled=enabled)
     service.refresh_price_history()
     captured = service._prepared_input_snapshot()
     old_time = exchange.now
@@ -178,6 +180,42 @@ def test_prepared_reader_keeps_its_generation_without_retaining_objects(tmp_path
     assert captured['catalog']['markets'][0]['condition_id'] == 'condition-M00'
     with pytest.raises(TypeError):
         captured['metadata']['condition-M00'] = {}
+
+
+@pytest.mark.parametrize("scope", ["market", "direction"])
+def test_prepared_reader_keeps_generation_when_current_metadata_is_excluded(tmp_path, scope):
+    class TwoDirectionExchange(MemoryExchange):
+        def lp_market_metadata(self, *args, **kwargs):
+            rows = super().lp_market_metadata(*args, **kwargs)
+            for row in rows.values():
+                row["outcomes"]["no"] = {"label": "NO", "token_id": "opposite-token"}
+            return rows
+
+    exchange = TwoDirectionExchange(datetime(2026, 9, 20, 8, tzinfo=UTC), {"M00": Decimal("57.6")})
+    service = PolymarketLPService(PredictionArbitrageStore(tmp_path), exchange,
+        clock=lambda: exchange.now, exclusions_enabled=True)
+    assert service.refresh_price_history()["state"] == "known"
+    captured = service._prepared_input_snapshot()
+    condition = "condition-M00"
+    tokens = {key:value["token_id"] for key,value in captured["metadata"][condition]["outcomes"].items()}
+    key = next(iter(tokens))
+    gc.collect()
+    assert not Detail.live, "captured prepared reader retained detailed Python objects"
+    assert service._exclude_candidate(condition, "" if scope == "market" else tokens[key],
+        "market_not_accepting_orders" if scope == "market" else "history_amplitude_exceeded",
+        checked_at=exchange.now)
+    current = service._prepared_input_snapshot()
+    assert set(captured["metadata"][condition]["outcomes"]) == set(tokens)
+    if scope == "market":
+        assert condition not in current["metadata"]
+    else:
+        assert key not in current["metadata"][condition]["outcomes"]
+        assert set(current["metadata"][condition]["outcomes"]) == set(tokens)-{key}
+    for reader in (captured, current):
+        with pytest.raises(TypeError):
+            reader["metadata"][condition] = {}
+    gc.collect()
+    assert not Detail.live, "exclusion eviction retained detailed Python objects"
 
 
 def test_scratch_preserves_datetime_value_without_keeping_a_clock_class():

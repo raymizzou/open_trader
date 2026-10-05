@@ -2109,6 +2109,7 @@ class PolymarketTradingClient:
         self._lp_public_reads: dict[str, Future] = {}
         self._lp_public_read_retry: dict[str, tuple[float, dict[str, object]]] = {}
         self._metadata_cache = metadata_cache
+        self._candidate_exclusions_enabled = False
         self._metadata_entries: MutableMapping[
             str, tuple[float, dict[str, object] | None]
         ] = LPReadScratch()
@@ -2343,6 +2344,21 @@ class PolymarketTradingClient:
 
         with self._metadata_lock:
             self._metadata_cache = cache
+
+    def configure_lp_candidate_exclusions(self, enabled: bool) -> None:
+        self._candidate_exclusions_enabled = enabled
+        if enabled:
+            self.evict_lp_candidate_metadata(now=datetime.now(UTC))
+
+    def evict_lp_candidate_metadata(self, *, condition_ids=None, now: datetime) -> None:
+        if not self._candidate_exclusions_enabled or self._metadata_cache is None:
+            return
+        with self._metadata_lock:
+            ids = tuple(self._metadata_entries) if condition_ids is None else tuple(condition_ids)
+            allowed = set(self._metadata_cache.lp_candidate_conditions(ids, now=now))
+            for cid in ids:
+                if cid not in allowed:
+                    self._metadata_entries.pop(cid, None)
 
     def expire_lp_metadata_cache(self) -> None:
         """Drop all cached LP market metadata so the next read re-fetches."""
@@ -3274,7 +3290,7 @@ class PolymarketTradingClient:
         try:
             reader = getattr(cache_store, "lp_metadata_cache_items", None)
             if callable(reader):
-                items = reader(now=now)
+                items = reader(now=now, exclude_candidates=True) if self._candidate_exclusions_enabled else reader(now=now)
             else:
                 warm = cache_store.lp_metadata_cache_entries(now=now)
                 if not isinstance(warm, Mapping):
@@ -3351,6 +3367,9 @@ class PolymarketTradingClient:
                 updated[condition_id] = (expires_at, value)
             elif condition_id in confirmed_absent_ids:
                 updated[condition_id] = (negative_expires_at, None)
+        if self._candidate_exclusions_enabled and self._metadata_cache is not None:
+            allowed = set(self._metadata_cache.lp_candidate_conditions(tuple(updated), now=datetime.now(UTC)))
+            updated = {cid: row for cid, row in updated.items() if cid in allowed}
         if not updated:
             return
         with self._metadata_lock:
@@ -3674,6 +3693,8 @@ class PolymarketTradingClient:
                     else None
                 ),
                 "accepting_orders": state.get("accepting_orders"),
+                "closed": state.get("closed"),
+                "resolved": state.get("resolved"),
                 "exchange_type": "CLOB",
                 "tick_size": _lp_decimal(trading.get("minimum_tick_size")),
                 "minimum_order_size": _lp_decimal(
@@ -4351,7 +4372,8 @@ class PolymarketTradingClient:
                 for condition_id in requested
             )
         tokens: list[str] = []
-        for market in cached:
+        identities: list[tuple[str, str]] = []
+        for condition_id, market in zip(requested, cached):
             if not isinstance(market, Mapping):
                 continue
             outcomes = market.get("outcomes")
@@ -4363,6 +4385,10 @@ class PolymarketTradingClient:
                 token_id = value.get("token_id", value.get("tokenId"))
                 if isinstance(token_id, str) and token_id.strip():
                     tokens.append(token_id.strip())
+                    identities.append((condition_id, token_id.strip()))
+        if self._candidate_exclusions_enabled and self._metadata_cache is not None:
+            allowed = self._metadata_cache.lp_candidate_allowed(tuple(identities), now=now)
+            tokens = [token for _cid, token in allowed]
         return tuple(dict.fromkeys(tokens))
 
     def lp_preparation_probe(
@@ -5027,6 +5053,7 @@ class PolymarketTradingClient:
         """
 
         checked_at = datetime.now(UTC)
+        ended_condition_ids: list[str] = []
         previous_map: dict[str, tuple[Decimal, datetime]] = {}
         if isinstance(previous, Mapping):
             for key, value in previous.items():
@@ -5055,6 +5082,7 @@ class PolymarketTradingClient:
                 "competitiveness": merged,
                 "not_updated": sorted(key for key in previous_map if key not in updated),
                 "resume_cursor": resume_cursor,
+                "ended_condition_ids": tuple(ended_condition_ids),
             }
 
         merged: dict[str, tuple[Decimal, datetime]] = {}
@@ -5128,6 +5156,10 @@ class PolymarketTradingClient:
                     condition_id = row.get("condition_id")
                     if not isinstance(condition_id, str) or not condition_id.strip():
                         continue
+                    state = row.get("state")
+                    state = state if isinstance(state, Mapping) else {}
+                    if any(source.get(key) is True for source in (row, state) for key in ("closed", "resolved")):
+                        ended_condition_ids.append(condition_id)
                     value = _lp_decimal(row.get("market_competitiveness"))
                     if value is None or value < 0:
                         continue
@@ -5157,6 +5189,7 @@ class PolymarketTradingClient:
                 "competitiveness": merged,
                 "not_updated": sorted(key for key in previous_map if key not in updated),
                 "resume_cursor": None,
+                "ended_condition_ids": tuple(ended_condition_ids),
             }
         except _RewardReadCancelled:
             for key, value in previous_map.items():
