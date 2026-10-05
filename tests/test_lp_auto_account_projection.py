@@ -24,7 +24,7 @@ def covered_pool(tmp_path, *, buys=(), inventory='0', pnl='0'):
 
 
 def buy(order_id, *, token='m00', reserved='8', state='active'):
-    return dict(order_id=order_id, session_id='account-session', condition_id=token,
+    return dict(order_id=order_id, side='BUY', session_id='account-session', condition_id=token,
         token_id=token, market_id=token, outcome='YES', price='.4', quantity='20',
         original_quantity='20', filled_quantity='0', reserved_usd=reserved,
         state=state, financial_status='known', checked_at=pool.NOW.isoformat())
