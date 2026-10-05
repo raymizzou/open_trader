@@ -3,6 +3,14 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-06
+
+- LP Gamma 市场 metadata 请求改为每批最多 50 个 condition ID，缩短约 8 KiB 的查询 URL，
+  降低云端共享 HTTP/2 并发读取中已复现的 Cloudflare 400/协议错误触发风险。
+  HTTP/2、8 路并发上限、每页 100 条及事件批次不变；开放/关闭市场共用拆批，仍遍历全部输入。
+  真实 SDK 离线请求回归覆盖 49/50/51/101 个 ID、分页、失败 UNKNOWN、缓存与取消；
+  旧实现对超 50 个 ID 的四项边界回归失败，修改后通过。云端完整启动与 Smoke 尚待部署验证。
+
 ## 2026-10-05
 
 - #253 自动 BUY 账户读取失效时，仅当前 attempt 撤销旧排名账户缓存；较新的有效发布恢复后可继续补位，
