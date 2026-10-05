@@ -34,6 +34,50 @@ from .polymarket_lp_notification_batches import (
 
 ZERO = Decimal('0')
 
+# Fixed codes only; arbitrary external reasons never enter round diagnostics.
+_CANDIDATE_FILTER_REASONS = frozenset('''candidate_pool_expired qualification_facts_missing participating_market
+screen_time_unknown market_facts_unknown market_identity_unknown market_metadata_time_unknown market_metadata_stale
+market_fees_time_unknown market_fees_stale reward_time_unknown reward_data_stale reward_deadline_unknown reward_expired
+reward_inactive reward_status_unknown reward_pool_unknown reward_pool_empty market_not_accepting_orders market_status_unknown
+book_identity_mismatch book_freshness_stale book_freshness_unknown account_freshness_stale account_freshness_unknown
+account_facts_unknown book_invalid book_crossed market_rules_unknown market_rules_invalid price_off_tick midpoint_unknown
+midpoint_out_of_range reward_distance_invalid reward_score_zero account_auth_unknown account_identity_unknown
+account_identity_mismatch market_already_participating account_funds_unknown balance_insufficient exit_liquidity_insufficient
+exit_fee_unknown stress_loss_threshold book_unknown estimate_time_unknown entry_terms_invalid competition_upper_bound_nonpositive
+ranking_changed ranking_yield_unknown history_summary_unknown history_summary_expired history_amplitude_exceeded
+history_identity_mismatch event_in_progress event_recovery_pending event_start_time_unknown event_end_time_unknown
+event_end_time_in_future post_event_screening_unknown market_read_capacity market_read_timeout market_read_cooling_down
+market_read_in_progress event_timing_unknown event_starting_soon event_status_unknown
+book_freshness_invalid account_freshness_invalid stress_loss_exceeded history_latest_refresh_failed
+history_time_unknown history_amplitude_unknown ranking_freshness_invalid ranking_freshness_stale'''.split())
+
+
+def _candidate_filter_reasons(diagnostics, codes, *, field='reasons'):
+    if diagnostics is None:
+        return
+    reasons = diagnostics[field]
+    for code in codes[:32]:
+        code = code if type(code) is str and code in _CANDIDATE_FILTER_REASONS else 'other'
+        if code not in reasons and len(reasons) >= 31:
+            code = 'other'
+        reasons[code] = reasons.get(code, 0) + 1
+
+
+def _candidate_filter_range(diagnostics, name, value, *, generation=False):
+    if diagnostics is None:
+        return
+    bucket = diagnostics['facts'].setdefault(name, dict(min=None, max=None, unknown=0))
+    if generation:
+        value = value if type(value) is int and 0 <= value <= 2**63 - 1 else None
+    else:
+        stamp = _maybe_datetime(value)
+        value = stamp.astimezone(UTC).isoformat() if stamp is not None else None
+    if value is None:
+        bucket['unknown'] += 1
+    else:
+        bucket['min'] = value if bucket['min'] is None else min(bucket['min'], value)
+        bucket['max'] = value if bucket['max'] is None else max(bucket['max'], value)
+
 
 class _AccountRoundLease:
     """Keep one round alive until its caller and every launched job release it."""
@@ -657,29 +701,105 @@ class LPAutoPool:
                 return True
         return False
 
-    def candidates(self, *, releasing=()):
+    def candidates(self, *, releasing=(), diagnostics=None):
         """Consume the entire qualified pool before exclusion, never the UI top ten."""
         from .polymarket_lp import _candidate_pool_row_expired, _candidate_yield_sort_key
         with self.lp._candidate_state_lock:
-            facts={key:deepcopy(value) for key,value in self.lp._candidate_qualification_facts.items()
-                   if key in self.lp._candidate_pool and not _candidate_pool_row_expired(self.lp._candidate_pool[key], self._now())}
+            facts={}
+            expired=set()
+            pool_checked_at = None
+            pool_check_min = pool_check_max = None
+            for key,value in self.lp._candidate_qualification_facts.items():
+                if key not in self.lp._candidate_pool:
+                    continue
+                pool_checked_at = self._now()
+                if diagnostics is not None:
+                    pool_check_min = pool_checked_at if pool_check_min is None else min(pool_check_min, pool_checked_at)
+                    pool_check_max = pool_checked_at if pool_check_max is None else max(pool_check_max, pool_checked_at)
+                if _candidate_pool_row_expired(self.lp._candidate_pool[key], pool_checked_at):
+                    expired.add(key)
+                else:
+                    facts[key] = deepcopy(value)
             updated_at = {key:self.lp._candidate_pool[key].get('updated_at') for key in facts}
+            pool_times = {key: {field: row.get(field) for field in ('updated_at', 'expires_at')}
+                          for key,row in self.lp._candidate_pool.items()} if diagnostics is not None else {}
+        if diagnostics is not None:
+            if pool_check_min is not None:
+                _candidate_filter_range(diagnostics, 'pool_checked_at', pool_check_min)
+                _candidate_filter_range(diagnostics, 'pool_checked_at', pool_check_max)
+            # Missing-facts rows have no original expiry check. Inventory them
+            # at this snapshot's existing reference time, without admitting any.
+            reference = pool_checked_at or _maybe_datetime(diagnostics['round_started_at'])
+            diagnostics['state'] = 'evaluated'
+            diagnostics['counts'] = dict.fromkeys(('pool_total', 'pool_expired', 'pool_unexpired', 'missing_facts', 'facts_present',
+                'participating_markets', 'evaluated_markets', 'evaluated_directions', 'qualification_rejected',
+                'qualification_unknown', 'eligible_directions', 'estimate_unknown', 'qualified_directions', 'recheck_removed'), 0)
+            counts = diagnostics['counts']
+            counts['pool_total'] = len(pool_times)
+            for key,row in pool_times.items():
+                _candidate_filter_range(diagnostics, 'pool_updated_at', row['updated_at'])
+                _candidate_filter_range(diagnostics, 'pool_expires_at', row['expires_at'])
+                if key in expired or key not in facts and reference is not None and _candidate_pool_row_expired(row, reference):
+                    counts['pool_expired'] += 1
+                    _candidate_filter_reasons(diagnostics, ['candidate_pool_expired'])
+                elif key not in facts:
+                    counts['missing_facts'] += 1
+                    _candidate_filter_reasons(diagnostics, ['qualification_facts_missing'])
+                else:
+                    counts['facts_present'] += 1
+            counts['pool_unexpired'] = counts['pool_total'] - counts['pool_expired']
         result=[]
         for condition_id,cached in facts.items():
             if self._excluded(condition_id):
+                if diagnostics is not None:
+                    counts['participating_markets'] += 1
+                    _candidate_filter_reasons(diagnostics, ['participating_market'])
                 continue
+            if diagnostics is not None:
+                counts['evaluated_markets'] += 1
             for direction in cached.get('directions',[]):
-                evaluated=evaluate_lp_entry(direction,account=self._ranking_account(self._current_account or cached.get('account') or {}, releasing),
-                    now=self._now(),reservations=self._ranking_reservations(releasing),candidate=True)
+                current_account = self._current_account
+                account = current_account or cached.get('account') or {}
+                source = 'current' if current_account else 'candidate' if account else 'unknown'
+                ranking_account = self._ranking_account(account, releasing)
+                now = self._now()
+                reservations = self._ranking_reservations(releasing)
+                evaluated=evaluate_lp_entry(direction,account=ranking_account,
+                    now=now,reservations=reservations,candidate=True)
+                if diagnostics is not None:
+                    counts['evaluated_directions'] += 1
+                    diagnostics['account_sources'][source] += 1
+                    _candidate_filter_range(diagnostics, 'evaluation_used_at', now)
+                    _candidate_filter_range(diagnostics, 'account_at', account.get('checked_at'))
+                    _candidate_filter_range(diagnostics, 'account_generation', account.get('trade_generation'), generation=True)
+                    market = direction.get('market') if isinstance(direction, Mapping) else None
+                    book = direction.get('book') if isinstance(direction, Mapping) else None
+                    for field,value in (('reward_at', direction.get('reward_checked_at') if isinstance(direction, Mapping) else None),
+                        ('metadata_at', market.get('metadata_checked_at') if isinstance(market, Mapping) else None),
+                        ('fees_at', market.get('fees_checked_at') if isinstance(market, Mapping) else None),
+                        ('book_at', book.get('received_at') if isinstance(book, Mapping) else None)):
+                        _candidate_filter_range(diagnostics, field, value)
                 if evaluated.get('state')!='eligible':
+                    if diagnostics is not None:
+                        counts['qualification_rejected' if evaluated.get('state') == 'rejected' else 'qualification_unknown'] += 1
+                        _candidate_filter_reasons(diagnostics, evaluated.get('reason_codes') or ['other'])
                     continue
+                if diagnostics is not None:
+                    counts['eligible_directions'] += 1
                 guidance=evaluated['guidance']
-                estimate=minimum_order_estimate(direction,guidance,self._now())
+                estimate_at = self._now()
+                estimate=minimum_order_estimate(direction,guidance,estimate_at)
+                _candidate_filter_range(diagnostics, 'estimate_used_at', estimate_at)
                 if estimate['state']!='known':
+                    if diagnostics is not None:
+                        counts['estimate_unknown'] += 1
+                        _candidate_filter_reasons(diagnostics, estimate.get('reason_codes') or ['other'])
                     continue
                 result.append({**guidance,'minimum_order_estimate':estimate,
                     'estimated_yield_raw':estimate['yield_pct_per_hour'],
                     'updated_at':updated_at[condition_id]})
+        if diagnostics is not None:
+            counts['qualified_directions'] = len(result)
         return sorted(result,key=lambda r:(*_candidate_yield_sort_key(r), str(r['token_id'])))
 
     def _ranking_account(self, account, releasing):
@@ -723,7 +843,7 @@ class LPAutoPool:
             raise ValueError('rotation_protection_active')
         return session
 
-    def _ranked_buys(self, state):
+    def _ranked_buys(self, state, *, diagnostics=None):
         """Rank actual BUY IDs and candidates on the same yield basis."""
         account, account_buys, account_reasons = self._account_projection_facts(self._read())
         intents, _ = self._unrepresented_intents(state['intents'], account_buys,
@@ -732,7 +852,7 @@ class LPAutoPool:
                   and i['state'] not in ('terminal', 'rejected', 'aborted')]
         active += state.get('account_buys', [])
         if len(active) < state['target_buy_count']:
-            candidates = self.candidates()
+            candidates = self.candidates(diagnostics=diagnostics)
             return candidates, [], candidates, []
         occupied_count = len(active)
         blocked = []
@@ -800,7 +920,7 @@ class LPAutoPool:
                 # exact-ID rotation lane even with no replacement capacity.
                 return [], rows, [], blocked
             return [], [], [], blocked
-        candidates = self.candidates(releasing=active)
+        candidates = self.candidates(releasing=active, diagnostics=diagnostics)
         rows.extend(candidates)
         refreshed = {(r['condition_id'], r['token_id']) for r in rows if self._resting_buy(r)}
         while True:
@@ -825,6 +945,9 @@ class LPAutoPool:
                     if evaluated.get('state') == 'rejected':
                         rows.remove(pending)
                         candidates.remove(pending)
+                        if diagnostics is not None:
+                            diagnostics['counts']['recheck_removed'] += 1
+                            _candidate_filter_reasons(diagnostics, evaluated.get('reason_codes') or ['other'], field='recheck_reasons')
                         continue
                     raise ValueError('ranking_changed')
                 self.lp._require_lp_history(pending, now=self._now())
@@ -841,6 +964,9 @@ class LPAutoPool:
                 blocked.append({'condition_id': pending['condition_id'], 'token_id': pending['token_id'], 'reason': str(exc)})
                 rows.remove(pending)
                 candidates.remove(pending)
+                if diagnostics is not None:
+                    diagnostics['counts']['recheck_removed'] += 1
+                    _candidate_filter_reasons(diagnostics, [str(exc)], field='recheck_reasons')
         for row in targets:
             self._ranking_fresh(row)
         selected = {self._buy_identity(t) for t in targets if self._resting_buy(t)}
@@ -1683,6 +1809,7 @@ class LPAutoPool:
         def failed(reason, *, waiting=False):
             with self._account_refresh_lock:
                 if attempt == self._account_refresh_attempt:
+                    self._current_account = None
                     if waiting:
                         # Immutable state lets read-only projections compare
                         # durable publication without waiting for network I/O.
@@ -2070,11 +2197,16 @@ class LPAutoPool:
         candidates=[]
         targets=[]
         blocked=[]
+        diagnostics = dict(state='not_evaluated', counts={}, reasons={}, recheck_reasons={}, facts={},
+                           account_sources=dict(current=0, candidate=0, unknown=0))
         reason=(state['admission_block_reasons'] or [None])[0] or (rotation_reason if rotation_reason == 'rotation_filled' else None)
-        self._update(lambda doc:doc['rounds'].update({round_id:dict(started_at=self._stamp())}))
+        def start_round(doc):
+            diagnostics['round_started_at'] = self._stamp()
+            doc['rounds'][round_id] = dict(started_at=diagnostics['round_started_at'])
+        self._update(start_round)
         if state['desired_running'] and not reason and not state['admission_block_reasons'] and self.execution.lp_mutation_allowed():
             try:
-                targets, victims, candidates, blocked = self._ranked_buys(state)
+                targets, victims, candidates, blocked = self._ranked_buys(state, diagnostics=diagnostics)
                 if not targets and blocked:
                     reason = blocked[0]['reason']
                 if victims:
@@ -2124,7 +2256,7 @@ class LPAutoPool:
             } for action in actions) else None
         self._update(lambda doc:doc.update(last_round=dict(round_id=round_id,checked_at=self._stamp(),actions=actions,
             candidates=[{k: r[k] for k in ('condition_id','token_id','outcome','price','quantity','minimum_order_estimate')}
-                        for r in candidates[:10]],candidate_count=len(candidates),
+                        for r in candidates[:10]],candidate_count=len(candidates),candidate_filter=diagnostics,
             targets=[{k: r[k] for k in ('condition_id','token_id','price','quantity','minimum_order_estimate')}
                      for r in targets[:d['target_buy_count']]],
             reason=reason or rotation_reason or (read_reason or 'candidates_or_funds_insufficient' if self._projection(doc)['slots']['occupied']<doc['target_buy_count'] else 'target_filled'),blocked=blocked)))
