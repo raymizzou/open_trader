@@ -79,7 +79,11 @@ def test_transaction_cleanup_preserves_original_failure(tmp_path, monkeypatch, c
                 raise original
     assert caught.value is original
     if phase == "rollback":
-        assert "injected rollback failure" in caplog.text
+        assert "prediction_store_rollback_failed" in caplog.text
+        assert "sqlite_error=OperationalError" in caplog.text
+        assert "injected rollback failure" not in caplog.text
+        assert "Rollback failed: OperationalError" in original.__notes__
+        assert any(record.levelno == logging.ERROR for record in caplog.records)
     with sqlite3.connect(store.path) as reader:
         assert reader.execute("SELECT name FROM sqlite_master WHERE name='uncommitted'").fetchone() is None
     with pytest.raises(sqlite3.ProgrammingError, match="closed"):
@@ -100,8 +104,20 @@ def test_transaction_cancel_rolls_back_without_losing_cancellation(tmp_path):
 
 def test_slow_transaction_reports_wait_separately_from_hold(tmp_path, monkeypatch, caplog):
     store = PredictionArbitrageStore(tmp_path)
-    ticks = iter([10.0, 10.25, 11.5])
-    monkeypatch.setattr(store_module, "monotonic", lambda: next(ticks))
+    clock = [10.0]
+    monkeypatch.setattr(store_module, "monotonic", lambda: clock[0])
+
+    class Connection(sqlite3.Connection):
+        def execute(self, sql, *args):
+            result = super().execute(sql, *args)
+            if sql == "BEGIN IMMEDIATE":
+                clock[0] += 0.25
+            elif sql == "CREATE TABLE committed(value)":
+                clock[0] += 1.25
+            return result
+
+    connection = sqlite3.connect(store.path, isolation_level=None, factory=Connection)
+    monkeypatch.setattr(store, "_connection", lambda: connection)
     with store._transaction() as connection:
         connection.execute("CREATE TABLE committed(value)")
     assert "operation=test_slow_transaction_reports_wait_separately_from_hold" in caplog.text

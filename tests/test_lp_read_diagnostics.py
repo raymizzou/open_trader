@@ -843,7 +843,9 @@ def test_nested_account_task_defers_lock_log_until_owning_future_completes(tmp_p
     monkeypatch.setattr(polymarket_trading, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
     monkeypatch.setattr(polymarket_trading.logger, 'warning', slow_log)
     monkeypatch.setattr(polymarket_lp, 'Future', MarketFuture)
-    adapter = PolymarketTradingClient(TradingConfig('offline-wallet', 'offline-funder'), client)
+    # Account orders trigger display metadata through the public snapshot entry.
+    adapter = PolymarketTradingClient(TradingConfig('offline-wallet', 'offline-funder'), client,
+        public_client_factory=lambda: SimpleNamespace(list_markets=lambda **kwargs: [], close=lambda: None))
     adapter._lp_account_read_lock = TimedLock()
     token = adapter.lp_account_round_begin()
     lp = PolymarketLPService(PredictionArbitrageStore(tmp_path), adapter)
@@ -930,7 +932,9 @@ def test_shared_snapshot_publishes_and_returns_before_blocked_diagnostics(tmp_pa
         return []
     monkeypatch.setattr(client, 'list_positions', positions)
     monkeypatch.setattr(polymarket_trading, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
-    adapter = PolymarketTradingClient(TradingConfig('offline-wallet', 'offline-funder'), client)
+    # Account orders trigger display metadata through the public snapshot entry.
+    adapter = PolymarketTradingClient(TradingConfig('offline-wallet', 'offline-funder'), client,
+        public_client_factory=lambda: SimpleNamespace(list_markets=lambda **kwargs: [], close=lambda: None))
     adapter._lp_account_read_lock = TimedLock()
     handler = BlockingHandler()
     monkeypatch.setattr(polymarket_trading.logger, 'level', logging.INFO)
