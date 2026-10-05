@@ -1,0 +1,148 @@
+{
+  "contract_version": "issue249_minimum_order_v1",
+  "historical_baseline_sha": "4fbddaae061e95cbbbb3db4d5793e40e33ec2cae",
+  "source_sha": "17e59970dd8cbb9732470a49c17ebf952640878b",
+  "issue": "249",
+  "estimate_basis": "minimum_scoring_order",
+  "provenance": {
+    "legacy_fixture": "lp_memory_ranking_4fbddaae.json",
+    "replay": "tests/lp_memory_replay.py",
+    "baseline_validation": "Original complete ranking and backfill hashes reproduced from git archive 4fbddaae src with unchanged replay inputs.",
+    "arithmetic": "share=81/1616 for 20 legal shares; hourly reward=pool*81/(24*1616); percent/hour=reward/capital*100. Amounts and UNKNOWN rules checked before recording hashes.",
+    "migration_scope": "Only known estimate amounts/geometry and row estimate_basis marker differ. Full normalized snapshots are identical; all ordering, counts, times, reasons and UNKNOWN evidence retained."
+  },
+  "audit": {
+    "changed_leaves": 2494,
+    "changed_fields": {
+      "basis": 213,
+      "capital_usd": 213,
+      "competition_upper_bound": 213,
+      "estimate_basis": 94,
+      "estimated_hourly_reward_usd": 90,
+      "estimated_yield_pct_per_hour": 90,
+      "estimated_yield_raw": 90,
+      "hourly_reward_usd": 213,
+      "midpoint": 213,
+      "price": 213,
+      "quantity": 213,
+      "reason_codes": 213,
+      "yield_pct_per_hour": 213,
+      "yield_pct_per_hour_display": 213
+    },
+    "outside_estimate_changes": 0
+  },
+  "steps": [
+    {
+      "step": "initial",
+      "sha256": "7d4eae4612a6395fe4105017b9004e57962fe06b257ac4a045685c0570ba6c21",
+      "ranked_conditions": [
+        "condition-M01",
+        "condition-M02",
+        "condition-M03"
+      ],
+      "ranked_yields": [
+        "1.202970297029702970297029703",
+        "1.202970297029702970297029703",
+        "0.8019801980198019801980198021"
+      ],
+      "unchanged_contract_sha256": "afad1f9b7a0644848e047bb279f5ec09862510e29699d8c6e8ea573c2361f0a1"
+    },
+    {
+      "step": "yield_drop",
+      "sha256": "39d7f1e47def97c1ad10b44c117d472098256ace250e306caf30af504e0fdb49",
+      "ranked_conditions": [
+        "condition-M02",
+        "condition-M03",
+        "condition-M01"
+      ],
+      "ranked_yields": [
+        "1.202970297029702970297029703",
+        "0.8019801980198019801980198021",
+        "0.5012376237623762376237623762"
+      ],
+      "unchanged_contract_sha256": "955d769a45cf8dd1d219135cf8b61b26d1a52d464d0a6cd599d4e7dcdb81e90e"
+    },
+    {
+      "step": "unknown_yield",
+      "sha256": "a52ca97dd19f7e9b993d36635d62b70c54b96e7fb0aae96549c85fe0ecfc67ff",
+      "ranked_conditions": [
+        "condition-M03",
+        "condition-M01",
+        "condition-M02"
+      ],
+      "ranked_yields": [
+        "0.8019801980198019801980198021",
+        "0.5012376237623762376237623762",
+        null
+      ],
+      "unchanged_contract_sha256": "c37afdea351645bf6919683ec508b064366001cee5982d78e22df3d04ec9d65d"
+    },
+    {
+      "step": "book_failure",
+      "sha256": "429bb850b0c8c6e55b7ec138862b5e7ae6dc5c23824a16cf956cbc307d84ba39",
+      "ranked_conditions": [
+        "condition-M03",
+        "condition-M01",
+        "condition-M02"
+      ],
+      "ranked_yields": [
+        "0.8019801980198019801980198021",
+        "0.5012376237623762376237623762",
+        null
+      ],
+      "unchanged_contract_sha256": "658d646b5bd13b8dbb72fd7962e766a8c1bbe8d3da4dd4501aaf56488bc5f942"
+    },
+    {
+      "step": "expiry",
+      "sha256": "4170ac2076e948747639a935146e17e6b58353c048e45cc9fcf37688dfbee8b1",
+      "ranked_conditions": [],
+      "ranked_yields": [],
+      "unchanged_contract_sha256": "4170ac2076e948747639a935146e17e6b58353c048e45cc9fcf37688dfbee8b1"
+    },
+    {
+      "step": "reentry",
+      "sha256": "bea1d49184184fb6789769ec2f46e021433315248e00697c2005c4687cf7341a",
+      "ranked_conditions": [
+        "condition-M02",
+        "condition-M03",
+        "condition-M01"
+      ],
+      "ranked_yields": [
+        "1.202970297029702970297029703",
+        "0.8019801980198019801980198021",
+        "0.5012376237623762376237623762"
+      ],
+      "unchanged_contract_sha256": "a931b5e0f89242222afeba744c88d49860a0f84951b34df115fbe9d657246b2e"
+    }
+  ],
+  "backfill_invariants": {
+    "valid": [
+      8,
+      17,
+      23
+    ],
+    "pending": [
+      16,
+      6,
+      0
+    ],
+    "unknown": [
+      1,
+      1,
+      1
+    ],
+    "rejected": [
+      1,
+      2,
+      3
+    ],
+    "backup_read": [
+      0,
+      6,
+      12
+    ],
+    "traversed_tokens": 52
+  },
+  "backfill_sha256": "3186d92369743116bd94cfd7216d6bb7df92e5b06c19338af3905b0d46190025",
+  "backfill_unchanged_contract_sha256": "fabaf4d54318d20a853cddec500e1465a8b8b22bbf9272f957f94c6d29bff5f4"
+}

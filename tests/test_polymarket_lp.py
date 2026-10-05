@@ -5153,7 +5153,7 @@ def test_candidate_qualification_facts_writes_hold_state_lock() -> None:
 def test_batch_refresh_ranks_passers_by_actual_capital_and_maintains_top_one(
     tmp_path,
 ) -> None:
-    """S5 (#138 round 2): batches merge by estimated target-share yield;
+    """S5 (#138 round 2): batches merge by actual minimum-order yield;
     the 60-second maintenance refreshes all published rows in one batch."""
     now = datetime(2026, 9, 19, 9, tzinfo=UTC)
     current = {"now": now}
@@ -5229,19 +5229,16 @@ def test_batch_refresh_ranks_passers_by_actual_capital_and_maintains_top_one(
         "market-A01", "market-A02", "market-A03", "market-A04",
         "market-A05", "market-A06", "market-A07", "market-A08",
     ]
-    # Independent arithmetic for the #138 round-2 estimate: identical books
-    # give every market the min-dominated target 20.00 shares, so the hourly
-    # $480×5%/24 = $1.00 divides by 20×bid capital:
-    #   Z1 20×0.30 = 6.00  → 16.666667%/h (checked in batch two)
-    #   B1 20×0.34 = 6.80  → 14.705882%/h (backup, batch one)
-    #   A01..A08 20×0.50 = 10.00 → 10.000000%/h, ties fall to competition
-    #   then token_id (A05 before A06 share competition 5); A09 rejects.
+    # Independent minimum-order arithmetic: quote weight .9² = .81,
+    # external competition 81+64/3 and own score 20*.81/3 give share 81/1616.
+    # Hourly reward = (480/24)*(81/1616) = 405/404 USD; capital 20*bid:
+    # Z1 $6 -> 16.707921%/h; B1 $6.80 -> 14.742283%/h.
     assert Decimal(
         str(candidates[0]["estimated_yield_pct_per_hour"])
-    ) == Decimal("16.666667")
+    ) == Decimal("16.707921")
     assert Decimal(
         str(candidates[1]["estimated_yield_pct_per_hour"])
-    ) == Decimal("14.705882")
+    ) == Decimal("14.742283")
     assert snapshot["recommendations"][0]["market_id"] == "market-Z1"
 
     # Immediately after the scan the 30-second lead window is still open
@@ -5281,7 +5278,7 @@ def test_batch_refresh_ranks_passers_by_actual_capital_and_maintains_top_one(
 
 def test_maintenance_recomputes_upper_bound_from_new_capital(tmp_path) -> None:
     """Reviewer fix 4 (#138 round 2): when 60-second maintenance refreshes a
-    row's live price, the 5% target-share estimate is recomputed from the
+    row's live price, the actual minimum-order estimate is recomputed from the
     new book — the target capital and hourly yield follow the new bid."""
     now = datetime(2026, 9, 19, 9, tzinfo=UTC)
     current = {"now": now}
@@ -5328,19 +5325,18 @@ def test_maintenance_recomputes_upper_bound_from_new_capital(tmp_path) -> None:
     snapshot = lp.refresh_candidates(force=True)
 
     assert snapshot["recommendations"][0]["market_id"] == "market-Z1"
-    # Independent arithmetic: pool 480, hourly gross reward 480×5%/24 =
-    # $1.00; at bid 0.30 the min-dominated target is 20.00 shares for
-    # 6.00 capital → 1/6×100 = 16.666667%/h.
+    # The same minimum-order geometry gives hourly reward 405/404 USD.
+    # Bid .30 costs 20*.30 = $6 -> 16.707921%/h.
     assert Decimal(
         str(snapshot["candidates"][0]["estimated_yield_pct_per_hour"])
-    ) == Decimal("16.666667")
+    ) == Decimal("16.707921")
     assert Decimal(
         str(snapshot["candidates"][0]["estimated_target_capital_usd"])
     ) == Decimal("6.00")
 
     # The live bid moves before the maintenance tick: the min-dominated
     # target becomes 20 × 0.45 = 9.00 capital and the yield must follow the
-    # new book (1/9×100 = 11.111111%/h), not the stale scan value.
+    # new book ((405/404)/9×100 = 11.138614%/h), not the stale scan value.
     exchange.bid_by_suffix["Z1"] = Decimal("0.45")
     current["now"] = now + timedelta(seconds=65)
     exchange.now = current["now"]
@@ -5355,7 +5351,7 @@ def test_maintenance_recomputes_upper_bound_from_new_capital(tmp_path) -> None:
     ) == Decimal("9.00")
     assert Decimal(
         str(maintained["candidates"][0]["estimated_yield_pct_per_hour"])
-    ) == Decimal("11.111111")
+    ) == Decimal("11.138614")
 
 
 def test_batch_scan_cadence_and_shared_round_protection(tmp_path) -> None:
@@ -5740,12 +5736,8 @@ def test_trial_refresh_qualifies_head_and_selects_lowest_capital(tmp_path) -> No
     assert len(unknown_direction["recommendations"]) == 1
     assert "condition-M02" not in unknown_direction["recommendations"][0]["condition_id"]
 
-    # Direction choice (issue #138 round 2) follows the higher estimated
-    # target-share yield first; the token id only breaks full estimate ties.
-    # tie_loss: both directions need the same 20×0.50 = $10.00 trial, but
-    # YES's thinner far side (0.48 bid) shrinks its competition bound C, so
-    # its 5% target (≈37.95 × 0.50 = $18.98) beats NO's (≈40.97 × 0.50 =
-    # $20.49) on capital yield.
+    # Direction choice follows the minimum-order hourly yield, then token
+    # identity for equal yields. A thinner far-side book favors YES here.
     exchange.phase = "tie_loss"
     tie_loss = lp.refresh_candidates(force=True)
     assert tie_loss["recommendations"][0]["selected_direction"]["outcome"] == "YES"
@@ -5755,19 +5747,16 @@ def test_trial_refresh_qualifies_head_and_selects_lowest_capital(tmp_path) -> No
     assert Decimal(
         str(tie_loss["recommendations"][0]["directions"]["NO"]["required_capital"])
     ) == Decimal("10.00")
-    assert Decimal(
-        str(
-            tie_loss["recommendations"][0]["directions"]["YES"]["estimate"][
-                "target_capital_usd"
-            ]
-        )
-    ) < Decimal(
-        str(
-            tie_loss["recommendations"][0]["directions"]["NO"]["estimate"][
-                "target_capital_usd"
-            ]
-        )
-    )
+    # Equal actual capital does not imply equal reward share. YES has
+    # own share 81/3001; NO has 162/6467. With pool 200 and capital $10,
+    # hourly percent yields are 6750/3001 and 13500/6467 respectively.
+    yes = tie_loss["recommendations"][0]["directions"]["YES"]["estimate"]
+    no = tie_loss["recommendations"][0]["directions"]["NO"]["estimate"]
+    assert Decimal(str(yes["target_capital_usd"])) == Decimal("10.00")
+    assert Decimal(str(no["target_capital_usd"])) == Decimal("10.00")
+    assert Decimal(str(yes["yield_pct_per_hour"])).quantize(Decimal(".000001")) == (Decimal(6750)/3001).quantize(Decimal(".000001"))
+    assert Decimal(str(no["yield_pct_per_hour"])).quantize(Decimal(".000001")) == (Decimal(13500)/6467).quantize(Decimal(".000001"))
+    assert Decimal(str(yes["yield_pct_per_hour"])) > Decimal(str(no["yield_pct_per_hour"]))
 
     # Identical books give identical estimates: the token id fallback keeps
     # the NO direction ("-no" < "-yes").

@@ -239,6 +239,7 @@ class _BlockingTwoMarketPublicClient(_TwoMarketPublicClient):
         self.lock = threading.Lock()
         self.books_entered: list[str] = []
         self.both_books_started = threading.Barrier(2)
+        self.books_started = threading.Event()
         self.release_books = threading.Event()
 
     def get_order_book(self, *, token_id: str) -> dict[str, object]:
@@ -246,6 +247,8 @@ class _BlockingTwoMarketPublicClient(_TwoMarketPublicClient):
             self.active_books += 1
             self.max_active_books = max(self.max_active_books, self.active_books)
             self.books_entered.append(token_id)
+            if self.active_books == 2:
+                self.books_started.set()
         try:
             self.both_books_started.wait(timeout=5)
             assert self.release_books.wait(timeout=5)
@@ -1933,8 +1936,22 @@ def test_newer_exact_receipt_invalidates_shared_bundle() -> None:
         adapter.lp_snapshot(request)
 
 
-def test_auto_bounded_round_waits_for_launched_jobs(tmp_path) -> None:
-    now = datetime.now(UTC)
+def test_auto_bounded_round_waits_for_launched_jobs(tmp_path, monkeypatch, request) -> None:
+    """The runtime LP tick joins financial jobs, not blocked public reads.
+
+    #249 separated this owner from automatic refill. Preserve concurrency,
+    account-round cleanup and shared reads through the production tick seam.
+    """
+    from open_trader import polymarket_trading
+    now = NOW
+    class ClockMeta(type):
+        def __instancecheck__(cls, value):
+            return isinstance(value, datetime)
+    class Clock(datetime, metaclass=ClockMeta):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz is not None else now.replace(tzinfo=None)
+    monkeypatch.setattr(polymarket_trading, 'datetime', Clock)
     account = _TwoSessionAccountClient(now)
     public = _BlockingTwoMarketPublicClient(now)
     wallet = str(account.open_order.owner)
@@ -1943,6 +1960,7 @@ def test_auto_bounded_round_waits_for_launched_jobs(tmp_path) -> None:
         account,
         public_client_factory=lambda: public,
     )
+    request.addfinalizer(adapter.close)
     store = PredictionArbitrageStore(tmp_path)
     for index in (1, 2):
         store.lp_create_session(
@@ -1951,7 +1969,7 @@ def test_auto_bounded_round_waits_for_launched_jobs(tmp_path) -> None:
             state="entry_open",
             payload=_request(now, index=index),
         )
-    lp = PolymarketLPService(store, adapter)
+    lp = PolymarketLPService(store, adapter, clock=lambda: now)
     engine = PredictionExecutionService(
         store=store,
         monitor=SimpleNamespace(),
@@ -1997,11 +2015,10 @@ def test_auto_bounded_round_waits_for_launched_jobs(tmp_path) -> None:
     pool._update(seed)
     result_container: list[object] = []
     run_errors: list[BaseException] = []
-    started = time.monotonic()
 
     def run():
         try:
-            result_container.append(engine.lp_auto_run_once())
+            result_container.append(engine.lp_tick())
         except BaseException as exc:
             run_errors.append(exc)
             raise
@@ -2009,15 +2026,16 @@ def test_auto_bounded_round_waits_for_launched_jobs(tmp_path) -> None:
     worker = threading.Thread(target=run)
     worker.start()
     try:
+        assert public.books_started.wait(timeout=5), "Both SDK jobs must start before checking their owner"
         worker.join(timeout=1.2)
         assert not worker.is_alive()
-        assert time.monotonic() - started < 2.0
         assert public.max_active_books == 2
         assert len(public.books_entered) == 2
 
         # Public reads retain their own jobs; financial publication and its
         # shared-account round finish without waiting for either book.
-        assert all(future.done() for future in pool._reconcile_jobs.values())
+        assert not lp._lp_account_rounds, 'Tick must join financial workers before closing their shared round'
+        assert not public.release_books.is_set(), 'Tick must finish without releasing slow public reads'
         assert all(intent['financial_status'] == 'known' for intent in pool.state()['intents'])
         futures = tuple(adapter._lp_public_reads.values())
         assert len(futures) == 2
@@ -2049,7 +2067,9 @@ def test_auto_bounded_round_waits_for_launched_jobs(tmp_path) -> None:
     ]
     assert public.max_active_books == 2
     state = pool.state()
-    assert all(future.done() for future in pool._reconcile_jobs.values())
+    assert public.active_books == 0
+    assert all(future.done() for future in futures)
+    assert not lp._lp_account_rounds
     intents = {intent["intent_id"]: intent for intent in state["intents"]}
     for intent_id in ("intent-01", "intent-02"):
         intent = intents[intent_id]
@@ -2057,6 +2077,15 @@ def test_auto_bounded_round_waits_for_launched_jobs(tmp_path) -> None:
         session = store.lp_session(intent["session_id"])
         assert session is not None
         assert session["facts_error"] is None
+
+    # Automatic refill consumes current account facts; it must not launch
+    # this independent history/public-read lane, even with two managed intents.
+    before_books = list(public.book_calls)
+    account.calls = dict.fromkeys(account.calls, 0)
+    engine.lp_auto_run_once(round_id='tick-does-not-couple-refill')
+    assert public.book_calls == before_books
+    assert pool._reconcile_jobs == {}
+    assert account.calls == dict.fromkeys(account.calls, 1)
 
 
 def test_provider_failure_completes_round_waiters(monkeypatch) -> None:
