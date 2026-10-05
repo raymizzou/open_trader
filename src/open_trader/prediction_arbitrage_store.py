@@ -445,45 +445,94 @@ class PredictionArbitrageStore:
             connection.close()
 
     @contextmanager
-    def _transaction(self, *, immediate: bool = True) -> Iterator[sqlite3.Connection]:
+    def _transaction(self, *, immediate: bool = True, prepared_at: float | None = None,
+                     diagnostics: dict | None = None, prepare_seconds: float = 0.0) -> Iterator[sqlite3.Connection]:
+        started = monotonic()
         connection = self._connection()
         operation = sys._getframe(2).f_code.co_qualname
-        started = monotonic()
-        acquired = None
+        begin_at = monotonic()
+        acquired = body_end = commit_end = None
+        try:
+            changes_before = connection.total_changes
+        except Exception:
+            changes_before = None
         phase = "begin"
+        failed = False
+        wait_failure = False
         try:
             connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
             acquired = monotonic()
             phase = "body"
             yield connection
+            body_end = monotonic()
             phase = "commit"
             connection.execute("COMMIT")
+            commit_end = monotonic()
             phase = "complete"
         except BaseException as error:
+            failed = True
+            wait_failure = isinstance(error, LpObservationWait) and str(error) in {
+                'session_changed', 'account_round_invalid', 'account_snapshot_superseded', 'account_snapshot_conflict',
+            }
+            if phase == "body":
+                body_end = monotonic()
+            if phase == "commit":
+                commit_end = monotonic()
             if isinstance(error, sqlite3.Error):
-                logger.warning(
-                    "prediction_store_transaction_failed operation=%s phase=%s sqlite_error=%s thread=%s",
-                    operation, phase, getattr(error, "sqlite_errorname", type(error).__name__),
-                    threading.current_thread().name,
-                )
+                try:
+                    logger.warning(
+                        "prediction_store_transaction_failed operation=%s phase=%s sqlite_error=%s thread=%s",
+                        operation, phase, getattr(error, "sqlite_errorname", type(error).__name__),
+                        threading.get_ident(),
+                    )
+                except Exception:
+                    pass
             if connection.in_transaction:
                 try:
                     connection.execute("ROLLBACK")
                 except sqlite3.Error as rollback_error:
                     error.add_note(f"Rollback failed: {type(rollback_error).__name__}")
-                    logger.exception("prediction_store_rollback_failed operation=%s", operation)
+                    try:
+                        logger.error("prediction_store_rollback_failed operation=%s sqlite_error=%s thread=%s",
+                                     operation, getattr(rollback_error, 'sqlite_errorname', type(rollback_error).__name__),
+                                     threading.get_ident())
+                    except Exception:
+                        pass
             raise
         finally:
             finished = monotonic()
+            try:
+                # SQLite counts attempted changes, including triggers and
+                # writes later rolled back; this is not committed-row count.
+                changes = connection.total_changes - changes_before if changes_before is not None else 'unknown'
+            except Exception:
+                changes = 'unknown'
             connection.close()
-            if finished - started >= _SLOW_TRANSACTION_SECONDS:
-                logger.warning(
-                    "prediction_store_transaction_slow operation=%s phase=%s wait_seconds=%.3f hold_seconds=%.3f thread=%s",
-                    operation, phase,
-                    (acquired if acquired is not None else finished) - started,
-                    finished - acquired if acquired is not None else 0.0,
-                    threading.current_thread().name,
-                )
+            try:
+                if finished - begin_at >= _SLOW_TRANSACTION_SECONDS:
+                    logger.warning(
+                        "prediction_store_transaction_slow operation=%s phase=%s wait_seconds=%.3f hold_seconds=%.3f thread=%s",
+                        operation, phase,
+                        (acquired if acquired is not None else finished) - begin_at,
+                        finished - acquired if acquired is not None else 0.0,
+                        threading.get_ident(),
+                    )
+                if failed or prepare_seconds + finished - (prepared_at if prepared_at is not None else started) >= _SLOW_TRANSACTION_SECONDS:
+                    metrics = {key: value for key, value in (diagnostics or {}).items()
+                        if key in {'input_rows', 'account_input_rows', 'registration_input_rows', 'publish_input_buys',
+                                   'session_scan_calls', 'session_rows_scanned', 'actions_query_calls', 'apply_lock_wait_seconds'}
+                        and type(value) in {int, float} and math.isfinite(value) and value >= 0}
+                    emit = logger.info if wait_failure else logger.warning
+                    emit(
+                        "prediction_store_transaction_timing operation=%s phase=%s prepare_seconds=%.3f wait_seconds=%.3f body_seconds=%.3f commit_seconds=%.3f sqlite_changes=%s sqlite_changes_scope=attempted_including_triggers scan_scope=instrumented_calls metrics=%s thread=%s",
+                        operation, phase, prepare_seconds + begin_at - (prepared_at if prepared_at is not None else started),
+                        (acquired if acquired is not None else finished) - begin_at,
+                        (body_end - acquired) if acquired is not None and body_end is not None else 0.0,
+                        (commit_end - body_end) if commit_end is not None and body_end is not None else 0.0,
+                        changes, metrics, threading.get_ident(),
+                    )
+            except Exception:
+                pass
 
     @staticmethod
     def _create_schema(connection: sqlite3.Connection) -> None:
@@ -4577,6 +4626,7 @@ class PredictionArbitrageStore:
         its previous value and checked_at instead of stacking a second row.
         """
 
+        prepared_at = monotonic()
         encoded: list[tuple[str, str, str]] = []
         for condition_id, value, checked_at in entries:
             condition = str(condition_id).strip()
@@ -4593,7 +4643,7 @@ class PredictionArbitrageStore:
             )
         if not encoded:
             return 0
-        with self._transaction() as connection:
+        with self._transaction(prepared_at=prepared_at, diagnostics={"input_rows": len(encoded)}) as connection:
             connection.executemany(
                 """
                 INSERT OR REPLACE INTO lp_market_competitiveness
@@ -5037,6 +5087,7 @@ class PredictionArbitrageStore:
         session: Mapping[str, object] | None = None,
         connection: sqlite3.Connection | None = None,
         expected_generation: int | None = None,
+        diagnostics: dict | None = None,
     ) -> dict[str, object]:
         """Atomically adopt exchange IDs into their canonical LP owners.
 
@@ -5047,6 +5098,8 @@ class PredictionArbitrageStore:
         and rollback.
         """
 
+        prepared_at = monotonic()
+        diagnostics = {} if diagnostics is None else diagnostics
         by_id: dict[str, dict[str, object]] = {}
         for raw in (orders if isinstance(orders, (list, tuple)) else []):
             if not isinstance(raw, Mapping):
@@ -5059,6 +5112,7 @@ class PredictionArbitrageStore:
                 else record
             )
         records = list(by_id.values())
+        diagnostics["registration_input_rows"] = diagnostics.get("registration_input_rows", 0) + len(records)
         if not records:
             raise ValueError("orders_empty")
         canonical_account = str(account_id or "").strip().casefold()
@@ -5068,7 +5122,7 @@ class PredictionArbitrageStore:
         if any(record["token_id"] != canonical_token for record in records):
             raise ValueError("order_identity_conflict")
 
-        cm = self._transaction() if connection is None else nullcontext(connection)
+        cm = self._transaction(prepared_at=prepared_at, diagnostics=diagnostics) if connection is None else nullcontext(connection)
         with cm as tx:
             if expected_generation is not None:
                 generation = tx.execute(
@@ -5083,6 +5137,8 @@ class PredictionArbitrageStore:
                     "SELECT * FROM lp_sessions ORDER BY updated_at,session_id"
                 ).fetchall()
             ]
+            diagnostics["session_scan_calls"] = diagnostics.get("session_scan_calls", 0) + 1
+            diagnostics["session_rows_scanned"] = diagnostics.get("session_rows_scanned", 0) + len(loaded)
             explicit_owners: dict[tuple[str, str], tuple[sqlite3.Row, dict[str, object]]] = {}
             legacy_owners: dict[str, tuple[sqlite3.Row, dict[str, object]]] = {}
             for row, payload in loaded:
@@ -6333,6 +6389,7 @@ class PredictionArbitrageStore:
     def lp_publish_account_financial_facts(
         self, facts: Mapping[str, object], *, connection: sqlite3.Connection | None = None,
         expected_generation: int | None = None,
+        diagnostics: dict | None = None,
     ) -> dict[str, object]:
         """Publish one account snapshot and its ended-send coverage atomically.
 
@@ -6345,6 +6402,8 @@ class PredictionArbitrageStore:
             can_resume_covered_management, default_account_pool_document,
             ended_reservation_evidence, reservation_is_covered, reservation_is_released,
         )
+        prepared_at = monotonic()
+        diagnostics = {} if diagnostics is None else diagnostics
         value = _load_payload(_dump_execution_payload(facts))
         account = str(value.get("account_id") or "").strip().casefold()
         pool_account = hashlib.sha256(account.encode()).hexdigest()
@@ -6357,7 +6416,7 @@ class PredictionArbitrageStore:
             raise ValueError("account_read_order_invalid")
         if value.get("financial_status") not in {"known", "unknown"}:
             raise ValueError("account_financial_facts_unknown")
-        with (self._transaction() if connection is None else nullcontext(connection)) as tx:
+        with (self._transaction(prepared_at=prepared_at, diagnostics=diagnostics) if connection is None else nullcontext(connection)) as tx:
             generation_row = tx.execute(
                 "SELECT generation FROM lp_trade_generation WHERE singleton=1"
             ).fetchone()
@@ -6409,6 +6468,9 @@ class PredictionArbitrageStore:
             loaded = [(row, _load_payload(str(row["payload"]))) for row in tx.execute(
                 "SELECT * FROM lp_sessions ORDER BY session_id"
             ).fetchall()]
+            diagnostics["session_scan_calls"] = diagnostics.get("session_scan_calls", 0) + 1
+            diagnostics["session_rows_scanned"] = diagnostics.get("session_rows_scanned", 0) + len(loaded)
+            diagnostics["publish_input_buys"] = len(value.get("buys", ()))
             sessions = {str(row["session_id"]): (row, payload) for row, payload in loaded}
             owners = {}
             for row, payload in loaded:
@@ -6432,6 +6494,12 @@ class PredictionArbitrageStore:
                 value["realized_pnl_usd"] = None
             buys = [dict(buy) for buy in value.get("buys", ())]
             actions_by_session = {}
+
+            def session_actions(sid):
+                if sid not in actions_by_session:
+                    diagnostics["actions_query_calls"] = diagnostics.get("actions_query_calls", 0) + 1
+                    actions_by_session[sid] = self.lp_actions(sid, connection=tx)
+                return actions_by_session[sid]
             for buy in buys:
                 owner = owners.get(str(buy.get("order_id") or ""))
                 if owner is None:
@@ -6442,7 +6510,7 @@ class PredictionArbitrageStore:
                 for key in ("condition_id", "market_id", "outcome"):
                     if not buy.get(key):
                         buy[key] = payload.get(key)
-                actions = actions_by_session.setdefault(sid, self.lp_actions(sid, connection=tx))
+                actions = session_actions(sid)
                 if account_cancel_is_pending(payload, actions, buy["order_id"]):
                     buy["state"] = "canceling"
             # Current complete open-order facts determine occupancy. Historical
@@ -6463,7 +6531,7 @@ class PredictionArbitrageStore:
                     row["idempotency_key"] == "lp-auto:" + str(bindings[0].get("intent_id") or ""))
                 if explicit != account and not legacy_owned:
                     continue
-                actions = actions_by_session.setdefault(sid, self.lp_actions(sid, connection=tx))
+                actions = session_actions(sid)
                 for action in actions:
                     is_entry = action.get("role") == "entry" or str(action.get("action_key") or "").endswith("entry-submit")
                     if (action.get("side") != "BUY" or (is_entry and bindings)
@@ -6491,7 +6559,7 @@ class PredictionArbitrageStore:
                         continue
                     row, payload = entry
                     session = {**payload, "session_id": sid, "idempotency_key": row["idempotency_key"]}
-                    actions = actions_by_session.setdefault(sid, self.lp_actions(sid, connection=tx))
+                    actions = session_actions(sid)
                     evidence = ended_reservation_evidence(intent, session, actions, account_id=account,
                         pool_account_id=pool_account, read_started_at=started)
                     if evidence is None:
@@ -6518,7 +6586,7 @@ class PredictionArbitrageStore:
                     if entry is None:
                         continue
                     row, payload = entry
-                    actions = actions_by_session.setdefault(sid, self.lp_actions(sid, connection=tx))
+                    actions = session_actions(sid)
                     managed = {**payload, "session_id": sid, "state": row["state"]}
                     if can_resume_covered_management(managed, actions, value):
                         payload["resume_state"] = "entry_open"
@@ -6533,7 +6601,7 @@ class PredictionArbitrageStore:
                             or token in value.get("open_order_tokens", ())
                             or account_position_quantity(value, token) != 0):
                         continue
-                    actions = actions_by_session.setdefault(sid, self.lp_actions(sid, connection=tx))
+                    actions = session_actions(sid)
                     if any(a.get("state") in {"pending", "unknown"}
                            and a.get("role") != "entry"
                            and not str(a.get("action_key") or "").endswith("entry-submit")

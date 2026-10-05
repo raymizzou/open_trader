@@ -2118,12 +2118,16 @@ class LPAutoPool:
             if actions:
                 self._refresh_account_facts()
                 reason = account_read_failure or (self.state()['admission_block_reasons'] or [reason])[0]
+        read_reason = actions[0]['reason'] if actions and not blocked and all(
+            action.get('state') == 'rejected' and action.get('reason') in {
+                'market_read_capacity', 'market_read_timeout', 'market_read_cooling_down', 'market_read_in_progress',
+            } for action in actions) else None
         self._update(lambda doc:doc.update(last_round=dict(round_id=round_id,checked_at=self._stamp(),actions=actions,
             candidates=[{k: r[k] for k in ('condition_id','token_id','outcome','price','quantity','minimum_order_estimate')}
                         for r in candidates[:10]],candidate_count=len(candidates),
             targets=[{k: r[k] for k in ('condition_id','token_id','price','quantity','minimum_order_estimate')}
                      for r in targets[:d['target_buy_count']]],
-            reason=reason or rotation_reason or ('candidates_or_funds_insufficient' if self._projection(doc)['slots']['occupied']<doc['target_buy_count'] else 'target_filled'),blocked=blocked)))
+            reason=reason or rotation_reason or (read_reason or 'candidates_or_funds_insufficient' if self._projection(doc)['slots']['occupied']<doc['target_buy_count'] else 'target_filled'),blocked=blocked)))
         return self.state()
 
     def report_facts(self, period_start=None, period_end=None):

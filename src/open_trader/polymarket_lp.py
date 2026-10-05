@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import logging
 import math
+import sys
 import threading
 import uuid
 from time import monotonic
@@ -61,6 +62,10 @@ from .polymarket_trading import (
     LpNewerAccountFacts,
     _lp_maker_order_is_self,
     _lp_read_stage,
+    _lp_read_task,
+    _lp_flush_read_logs,
+    _lp_read_lock,
+    _lp_market_read_diagnostic,
     _lp_trade,
     _safe_read_error_chain,
 )
@@ -8153,6 +8158,8 @@ class PolymarketLPService:
         session instead of creating a second seller for the same inventory.
         """
 
+        prepared_at = monotonic()
+        diagnostics = {}
         if not isinstance(snapshot, Mapping) or snapshot.get("authenticated") is not True:
             return {"state": "skipped", "reason": "account_snapshot_unknown"}
         required = (
@@ -8218,6 +8225,7 @@ class PolymarketLPService:
             str(_field(row, "order_id", _field(row, "id", "")) or "") for row in raw_orders
         }
         rows = [*raw_orders, *(row for row in owned_fills if str(row.get("order_id")) not in known_ids)]
+        diagnostics["account_input_rows"] = len(rows)
         groups: dict[str, list[Mapping[str, object]]] = {}
         for row in rows:
             token = str(_field(row, "token_id", _field(row, "asset_id", "")) or "")
@@ -8228,21 +8236,24 @@ class PolymarketLPService:
         def revisions(connection):
             # Preparing baselines can perform network reads. Fence any changed
             # ownership/trading state before the single account-wide commit.
-            return {
-                str(row["session_id"]): int(row["revision"] or 0)
-                for row in connection.execute(
-                    "SELECT session_id,json_extract(payload,'$._lp_trade_revision') AS revision "
-                    "FROM lp_sessions WHERE lower(trim(coalesce(json_extract(payload,'$.account_id'),''))) IN ('',?)",
-                    (account_id,),
-                ).fetchall()
-            }
+            scanned = connection.execute(
+                "SELECT session_id,json_extract(payload,'$._lp_trade_revision') AS revision "
+                "FROM lp_sessions WHERE lower(trim(coalesce(json_extract(payload,'$.account_id'),''))) IN ('',?)",
+                (account_id,),
+            ).fetchall()
+            diagnostics["session_scan_calls"] = diagnostics.get("session_scan_calls", 0) + 1
+            diagnostics["session_rows_scanned"] = diagnostics.get("session_rows_scanned", 0) + len(scanned)
+            return {str(row["session_id"]): int(row["revision"] or 0) for row in scanned}
 
         with self.store._read_connection() as connection:
             expected_revisions = revisions(connection)
         prepared = []
+        owned_sessions = self.store.lp_sessions()
+        diagnostics["session_scan_calls"] = diagnostics.get("session_scan_calls", 0) + 1
+        diagnostics["session_rows_scanned"] = diagnostics.get("session_rows_scanned", 0) + len(owned_sessions)
         owned_ids = {
             order_id
-            for session in self.store.lp_sessions()
+            for session in owned_sessions
             if str(session.get("account_id") or "").strip().casefold() in {"", account_id}
             for order_id in self._session_order_ids(session)
         }
@@ -8275,8 +8286,11 @@ class PolymarketLPService:
             )
             token_results = []
             created = joined = 0
-            with self._first_seen_apply_lock:
-                with self.store._transaction() as connection:
+            prepare_seconds = monotonic() - prepared_at
+            lock_started = monotonic()
+            with _lp_read_lock(self._first_seen_apply_lock, "account_registration_apply_lock_wait"):
+                diagnostics["apply_lock_wait_seconds"] = round(monotonic() - lock_started, 3)
+                with self.store._transaction(prepare_seconds=prepare_seconds, diagnostics=diagnostics) as connection:
                     observed = connection.execute(
                         "SELECT generation FROM lp_trade_generation WHERE singleton=1"
                     ).fetchone()
@@ -8288,7 +8302,7 @@ class PolymarketLPService:
                     for token, token_rows, candidate in prepared:
                         result = self.store.lp_register_exchange_orders(
                             account_id, token, token_rows, session=candidate,
-                            expected_generation=generation, connection=connection,
+                            expected_generation=generation, connection=connection, diagnostics=diagnostics,
                         )
                         state = "created" if result["created"] else "joined"
                         created += int(result["created"])
@@ -8299,7 +8313,7 @@ class PolymarketLPService:
                     # it is evidence of zero occupancy, not an early return.
                     self.store.lp_publish_account_financial_facts(
                         financial_facts, connection=connection,
-                        expected_generation=generation,
+                        expected_generation=generation, diagnostics=diagnostics,
                     )
             return {"state": "registered", "tokens": token_results,
                     "created": created, "joined": joined}
@@ -8320,7 +8334,8 @@ class PolymarketLPService:
             attempt = self._account_registration_attempt
 
         try:
-            result = self._register_account_snapshot(snapshot)
+            with _lp_read_task("account_registration"), _lp_read_stage("account_registration"):
+                result = self._register_account_snapshot(snapshot)
         except LpAccountRoundInvalid:
             raise
         except Exception:
@@ -10433,9 +10448,12 @@ class PolymarketLPService:
             future.set_exception(exc)
             raise
         finally:
-            if failed or sum(timings.values()) >= 60:
-                logger.warning("lp_facts_timing outcome=%s stages=%s thread=%s",
-                               "failed" if failed else "slow", timings, threading.get_ident())
+            try:
+                if failed or sum(timings.values()) >= 60:
+                    logger.warning("lp_facts_timing outcome=%s stages=%s thread=%s",
+                                   "failed" if failed else "slow", timings, threading.get_ident())
+            except Exception:
+                pass
             self._facts_owner.session_id = None
             with self._facts_lock:
                 if self._facts_inflight.get(session_id) is flight:
@@ -12267,39 +12285,65 @@ class PolymarketLPService:
         deadline = monotonic() + self._market_read_timeout
         while True:
             blockers = None
+            refusal = None
+            diagnostic_jobs = ()
             with self._market_reads_lock:
                 existing = self._market_reads.get(key)
                 if existing is not None:
                     if not existing.done():
-                        raise LpObservationWait('market_read_in_progress')
-                    self._market_reads.pop(key)
-                if monotonic() < self._market_read_retry.get(key, 0):
-                    raise LpObservationWait('market_read_cooling_down')
+                        refusal = 'market_read_in_progress'
+                    else:
+                        self._market_reads.pop(key)
+                if refusal is None and monotonic() < self._market_read_retry.get(key, 0):
+                    refusal = 'market_read_cooling_down'
                 unfinished = [job for job in self._market_reads.values() if not job.done()]
-                if len(unfinished) >= 2:
-                    if not wait_for_capacity:
-                        raise LpObservationWait('market_read_capacity')
-                    blockers = tuple(unfinished)
-                else:
-                    future = Future()
-                    self._market_reads[key] = future
-                    break
-            done, _ = wait(
-                blockers,
-                timeout=max(0, deadline - monotonic()),
-                return_when=FIRST_COMPLETED,
-            )
+                if refusal is None:
+                    if len(unfinished) >= 2:
+                        if not wait_for_capacity:
+                            refusal = 'market_read_capacity'
+                        else:
+                            blockers = tuple(unfinished)
+                    else:
+                        future = Future()
+                        try:
+                            future.lp_diagnostic = dict(task_id=uuid.uuid4().hex,
+                                entry=sys._getframe(1).f_code.co_name, budget=self._market_read_timeout)
+                        except Exception:
+                            pass
+                        self._market_reads[key] = future
+                        break
+                if refusal == 'market_read_capacity' and monotonic() >= getattr(self, '_market_read_diagnostic_at', float('-inf')):
+                    self._market_read_diagnostic_at = monotonic() + 60
+                    diagnostic_jobs = tuple(unfinished)
+            if refusal:
+                if diagnostic_jobs:
+                    try:
+                        _lp_market_read_diagnostic(refusal, diagnostic_jobs)
+                    except Exception:
+                        pass
+                raise LpObservationWait(refusal)
+            with _lp_read_stage('market_capacity_wait'):
+                done, _ = wait(
+                    blockers,
+                    timeout=max(0, deadline - monotonic()),
+                    return_when=FIRST_COMPLETED,
+                )
             if not done:
+                self._market_read_diagnostics('market_read_capacity')
                 raise LpObservationWait('market_read_capacity')
         owner_session = getattr(self._facts_owner, 'session_id', None)
         def run():
+            pending_logs = []
             self._facts_owner.session_id = owner_session
             try:
-                future.set_result(read())
+                with _lp_read_task('market_read', task=getattr(future, 'lp_diagnostic', None), deferred_logs=pending_logs):
+                    result = read()
+                future.set_result(result)
             except BaseException as exc:
                 future.set_exception(exc)
             finally:
                 self._facts_owner.session_id = None
+                _lp_flush_read_logs(pending_logs)
         threading.Thread(target=run, daemon=True, name='lp-market-read').start()
         try:
             return future.result(timeout=self._market_read_timeout)
@@ -12314,11 +12358,30 @@ class PolymarketLPService:
         except TimeoutError as exc:
             with self._market_reads_lock:
                 self._market_read_retry[key] = monotonic() + 60
+                task = getattr(future, 'lp_diagnostic', None)
+                if task is not None:
+                    task['caller_timed_out'] = True
+            self._market_read_diagnostics('market_read_timeout', timed_out=future)
             raise ValueError('market_read_timeout') from exc
         finally:
             with self._market_reads_lock:
                 if future.done() and self._market_reads.get(key) is future:
                     self._market_reads.pop(key)
+
+    def _market_read_diagnostics(self, reason, *, timed_out=None):
+        try:
+            with self._market_reads_lock:
+                if timed_out is None:
+                    now = monotonic()
+                    if now < getattr(self, '_market_read_diagnostic_at', float('-inf')):
+                        return
+                    self._market_read_diagnostic_at = now + 60
+                jobs = tuple(job for job in self._market_reads.values() if not job.done())
+                if timed_out is not None and timed_out not in jobs:
+                    jobs += (timed_out,)
+            _lp_market_read_diagnostic(reason, jobs, stack=timed_out is not None)
+        except Exception:
+            pass
 
     def market_read_retry_at(self, condition_id: str) -> datetime | None:
         """Expose the actual local read backoff as a wall-clock deadline."""

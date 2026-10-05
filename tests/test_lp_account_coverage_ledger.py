@@ -101,6 +101,46 @@ def read_pool(store):
         return json.loads(connection.execute('SELECT payload FROM lp_auto_pool WHERE singleton=1').fetchone()[0])
 
 
+@pytest.mark.parametrize('owned_buy', [False, True])
+def test_publish_queries_each_sessions_actions_once_and_keeps_atomic_audit(tmp_path, monkeypatch, owned_buy):
+    store = PredictionArbitrageStore(tmp_path / 'ledger.sqlite')
+    document = seed(store)
+    if owned_buy:
+        store.lp_register_exchange_orders(WALLET, 'token', [order()], expected_generation=0)
+    session = store.lp_session('session')
+    queries = []
+    read_actions = store.lp_actions
+
+    def counted(sid, **kwargs):
+        queries.append(sid)
+        return read_actions(sid, **kwargs)
+
+    monkeypatch.setattr(store, 'lp_actions', counted)
+    with pytest.raises(RuntimeError, match='rollback'):
+        with store._transaction() as connection:
+            store.lp_publish_account_financial_facts(build(open_orders=[order()] if owned_buy else []), connection=connection, expected_generation=0)
+            raise RuntimeError('rollback')
+    assert queries == ['session']
+    assert read_pool(store) == document
+    assert store.lp_session('session') == session
+    queries.clear()
+    facts = store.lp_publish_account_financial_facts(build(open_orders=[order()] if owned_buy else []), expected_generation=0)
+    assert queries == ['session']
+    assert facts['financial_status'] == 'known'
+    assert facts['inventory_cost_usd'] == '0'
+    assert len(facts['buys']) == int(owned_buy)
+    if owned_buy:
+        assert facts['buys'][0]['reserved_usd'] == '4.0'
+        assert facts['buys'][0]['state'] == 'active'
+    saved = read_pool(store)
+    assert saved['events'] == document['events']
+    assert saved['intents']['intent']['state'] == 'unknown'
+    assert saved['intents']['intent']['reserved_usd'] == '4'
+    assert saved['intents']['intent']['reservation_coverage']['state'] == 'covered'
+    assert store.lp_session('session')['state'] == ('entry_open' if owned_buy else 'complete')
+    assert store.lp_session('session')['submit_status'] == 'unknown'
+
+
 def test_coverage_is_atomic_durable_idempotent_and_preserves_unknown_audit(tmp_path):
     store = PredictionArbitrageStore(tmp_path / 'ledger.sqlite')
     document = seed(store)
