@@ -428,7 +428,9 @@ def test_service_preserves_wait_semantics_for_an_ended_real_round(tmp_path, capl
     assert all(row.levelno == logging.INFO for row in records)
     assert any("lp_read_wait stage=account" in row.getMessage() for row in records)
     assert any("lp_read_wait stage=facts_read" in row.getMessage() for row in records)
-    assert all("reason=account_round_invalid" in row.getMessage() for row in records)
+    wait_records = [row for row in records if row.getMessage().startswith("lp_read_wait ")]
+    assert all("reason=account_round_invalid" in row.getMessage() for row in wait_records)
+    assert all(row.getMessage().startswith(("lp_read_wait ", "lp_read_task_end ")) for row in records)
 
 
 def test_service_preserves_wait_semantics_for_round_invalidated_while_reading(

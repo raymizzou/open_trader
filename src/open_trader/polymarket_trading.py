@@ -12,8 +12,11 @@ import logging
 import math
 import os
 import pty
+import queue
 import re
 import stat
+import sys
+import uuid
 import subprocess
 import threading
 import time
@@ -638,72 +641,290 @@ def _null_order_response(exc: BaseException) -> bool:
     )
 
 
+_lp_read_local = threading.local()
+# ponytail: one process-local daemon and 32 records; overflow is counted, never queued.
+# The consumer has no business state, I/O slots, or business locks. Business
+# shutdown does not join it; buffered output is not guaranteed before process exit.
+_lp_read_log_lock = threading.Lock()
+_lp_read_log_queue = queue.Queue(maxsize=32)
+_lp_read_log_dropped = 0
+_lp_read_log_failed = 0
+
+
+def _lp_run_read_logs():
+    global _lp_read_log_dropped, _lp_read_log_failed
+    while True:
+        record = _lp_read_log_queue.get()
+        try:
+            try:
+                record()
+            except Exception:
+                with _lp_read_log_lock:
+                    _lp_read_log_failed = min(sys.maxsize, _lp_read_log_failed + 1)
+            with _lp_read_log_lock:
+                dropped, failed = _lp_read_log_dropped, _lp_read_log_failed
+                _lp_read_log_dropped = _lp_read_log_failed = 0
+            if dropped or failed:
+                try:
+                    logger.info('lp_read_log_limited scope=best_effort pending_limit=32 consumer_limit=1 dropped=%s output_errors=%s count_scope=since_last_report count_saturation=%s', dropped, failed, sys.maxsize)
+                except Exception:
+                    with _lp_read_log_lock:
+                        _lp_read_log_dropped = min(sys.maxsize, _lp_read_log_dropped + dropped)
+                        _lp_read_log_failed = min(sys.maxsize, _lp_read_log_failed + failed + 1)
+        finally:
+            _lp_read_log_queue.task_done()
+
+
+# Start outside all business operations/locks, exactly once on module import.
+_lp_read_log_thread = threading.Thread(target=_lp_run_read_logs, daemon=True, name='lp-read-diagnostics')
+try:
+    _lp_read_log_thread.start()
+except Exception:
+    pass  # Failed diagnostic startup must not prevent the trading module loading.
+
+
+def _lp_capture_read_log(emit, deferred=None):
+    global _lp_read_log_dropped
+    try:
+        if deferred is None:
+            _lp_read_log_queue.put_nowait(emit)
+        elif len(deferred) < 32:
+            deferred.append(emit)
+        else:
+            raise queue.Full
+    except queue.Full:
+        with _lp_read_log_lock:
+            _lp_read_log_dropped = min(sys.maxsize, _lp_read_log_dropped + 1)
+    except Exception:
+        pass
+
+
+def _lp_read_count(**counts):
+    """Only numeric aggregates; never retain business identifiers."""
+    try:
+        task = getattr(_lp_read_local, "task", None)
+        if task is not None:
+            stage_counts = task["counts"].setdefault(task["stage"], {})
+            for key, value in counts.items():
+                stage_counts[key] = stage_counts.get(key, 0) + value
+    except Exception:
+        pass
+
+
 @contextmanager
-def _lp_read_stage(stage: str, timings: dict[str, float] | None = None):
+def _lp_read_task(entry, *, task=None, deferred_logs=None):
+    previous = getattr(_lp_read_local, "task", None)
+    previous_logs = getattr(_lp_read_local, "deferred_logs", None)
+    if previous is not None:
+        if previous_logs is None:
+            _lp_read_local.deferred_logs = deferred_logs
+        try:
+            yield previous
+        finally:
+            _lp_read_local.deferred_logs = previous_logs
+        return
+    owns_logs = deferred_logs is None and previous_logs is None
+    deferred_logs = previous_logs if previous_logs is not None else deferred_logs
+    if owns_logs:
+        deferred_logs = []
+    try:
+        task = task if task is not None else dict(task_id=uuid.uuid4().hex, entry=entry)
+        task.update(thread=threading.get_ident(), started_at=datetime.now(UTC).isoformat(),
+                    started=time.monotonic(), stage="start", timings={}, counts={})
+        _lp_read_local.task = task
+    except Exception:
+        task = None
+    _lp_read_local.deferred_logs = deferred_logs
+    failed = False
+    try:
+        yield task
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        _lp_read_local.task = previous
+        _lp_read_local.deferred_logs = previous_logs
+        try:
+            if task is not None:
+                task.update(ended_at=datetime.now(UTC).isoformat(), ended=time.monotonic(), stage="ended")
+                elapsed = task["ended"] - task["started"]
+                if failed or task.get("diagnose") or elapsed >= task.get("budget", 60):
+                    def emit():
+                        logger.info(
+                            "lp_read_task_end task_id=%s entry=%s parent_task_id=%s thread=%s started_at=%s ended_at=%s elapsed_seconds=%.3f caller_timed_out=%s failed=%s timings=%s http_count_scope=installed_thread_hooks records_scope=completed_lists unobserved_counts=unknown counts=%s",
+                            task["task_id"], task["entry"], task.get("parent_task_id"), task["thread"], task["started_at"], task["ended_at"],
+                            elapsed, bool(task.get("caller_timed_out")), failed, task["timings"], task["counts"],
+                        )
+                    _lp_capture_read_log(emit, deferred_logs)
+        except Exception:
+            pass
+        if owns_logs:
+            _lp_flush_read_logs(deferred_logs)
+
+
+def _lp_flush_read_logs(logs):
+    """Transfer to the outermost scope or non-blocking diagnostic queue."""
+    deferred = getattr(_lp_read_local, 'deferred_logs', None)
+    for record in logs:
+        _lp_capture_read_log(record, deferred)
+    logs.clear()
+
+
+@contextmanager
+def _lp_read_lock(lock, stage):
+    pending = []
+    previous_logs = getattr(_lp_read_local, 'deferred_logs', None)
+    _lp_read_local.deferred_logs = previous_logs if previous_logs is not None else pending
+    acquired = False
+    try:
+        with _lp_read_stage(stage, deferred_logs=pending):
+            lock.__enter__()
+            acquired = True
+        yield
+    finally:
+        try:
+            if acquired:
+                lock.__exit__(*sys.exc_info())
+        finally:
+            _lp_read_local.deferred_logs = previous_logs
+            _lp_flush_read_logs(pending)
+
+
+def _lp_market_read_diagnostic(reason, jobs, *, stack=False):
+    """Snapshot only the related workers; format/log outside the scheduler lock."""
+    try:
+        tasks = []
+        for job in jobs:
+            task = getattr(job, "lp_diagnostic", None)
+            if task is not None:
+                task["diagnose"] = True
+                tasks.append(task)
+        now = time.monotonic()
+        rows = [dict(task_id=t["task_id"], entry=t["entry"], parent_task_id=t.get("parent_task_id"), thread=t.get("thread"),
+                     started_at=t.get("started_at"), ended_at=t.get("ended_at"),
+                     age_seconds=round(now-t["started"], 3) if "started" in t else None,
+                     stage=t.get("stage", "queued"), ended=job.done())
+                for job in jobs if (t := getattr(job, "lp_diagnostic", None)) is not None]
+        emit = logger.warning if reason == "market_read_timeout" else logger.info
+        inflight = sum(not job.done() for job in jobs)
+        _lp_capture_read_log(lambda: emit("lp_market_read_diagnostic reason=%s inflight=%s tasks=%s", reason, inflight, rows))
+        if stack:
+            frames = sys._current_frames()
+            try:
+                for task in tasks:
+                    if task.get("stack_captured"):
+                        continue
+                    task["stack_captured"] = True
+                    frame = frames.get(task.get("thread")) if not task.get("ended_at") else None
+                    locations = []
+                    for _ in range(12):
+                        if frame is None:
+                            break
+                        locations.append((Path(frame.f_code.co_filename).name, frame.f_code.co_name, frame.f_lineno))
+                        frame = frame.f_back
+                    task_id, thread = task["task_id"], task.get("thread")
+                    _lp_capture_read_log(lambda task_id=task_id, thread=thread, locations=locations:
+                        logger.info("lp_market_read_stack task_id=%s thread=%s locations=%s", task_id, thread, locations))
+                    del frame
+            finally:
+                del frames
+    except Exception:
+        pass
+
+
+@contextmanager
+def _lp_read_stage(stage: str, timings: dict[str, float] | None = None, *, deferred_logs=None):
     """Log failed or minute-long reads without messages, payloads or identities.
 
     SDK pagination includes transport and decoding; its exception class chain
     distinguishes those failures. Thread identity links nested stage timings.
     """
     started = time.monotonic()
+    task = getattr(_lp_read_local, "task", None)
+    previous_stage = task.get("stage") if task is not None else None
+    if task is not None:
+        task["stage"] = stage
+    if stage in {"account_balance", "account_orders", "account_trades", "account_positions", "market", "book", "market_rewards", "required_order"}:
+        _lp_read_count(logical_reads=1)
     error_types = ()
     wait_reason = None
     details = ""
     try:
         yield
     except Exception as exc:
-        error_types = _safe_read_error_chain(exc)
-        if any(isinstance(error, (LpAccountRoundInvalid, LpNewerAccountFacts)) for error in _read_exception_chain(exc)):
-            wait_reason = "account_round_invalid"
-        elif typed_wait := next((
-            str(error) for error in _read_exception_chain(exc)
-            if isinstance(error, LpObservationWait) and str(error) in {
-                "session_changed", "account_round_invalid", "market_read_in_progress",
-                "market_read_cooling_down", "market_read_capacity", "market_closed",
-            }
-        ), None):
-            wait_reason = typed_wait
-        elif stage == "required_order" and _null_order_response(exc):
-            wait_reason = "order_lookup_unavailable"
-        else:
-            try:
-                facts = _safe_history_response_facts(exc)
-                response_facts = getattr(exc, "response_facts", None)
-                if isinstance(response_facts, Mapping):
-                    facts.update({key: response_facts[key] for key in (
-                        "status", "retry_after_seconds", "retry_after_at",
-                    ) if key in response_facts})
-                status = facts.get("status")
-                if type(status) is int and 100 <= status <= 599:
-                    details += f" status={status}"
-                retry = facts.get("retry_after_seconds")
-                if type(retry) in {int, float} and math.isfinite(retry) and retry >= 0:
-                    details += f" retry_after_seconds={retry}"
-                retry_at = facts.get("retry_after_at")
-                if isinstance(retry_at, datetime) and retry_at.tzinfo is not None:
-                    details += f" retry_after_at={retry_at.isoformat()}"
-            except Exception:
-                details = ""
+        try:
+            error_types = _safe_read_error_chain(exc)
+            if any(isinstance(error, (LpAccountRoundInvalid, LpNewerAccountFacts)) for error in _read_exception_chain(exc)):
+                wait_reason = "account_round_invalid"
+            elif typed_wait := next((
+                str(error) for error in _read_exception_chain(exc)
+                if isinstance(error, LpObservationWait) and str(error) in {
+                    "session_changed", "account_round_invalid", "market_read_in_progress",
+                    "market_read_cooling_down", "market_read_capacity", "market_closed",
+                }
+            ), None):
+                wait_reason = typed_wait
+            elif stage == "required_order" and _null_order_response(exc):
+                wait_reason = "order_lookup_unavailable"
+            else:
+                try:
+                    facts = _safe_history_response_facts(exc)
+                    response_facts = getattr(exc, "response_facts", None)
+                    if isinstance(response_facts, Mapping):
+                        facts.update({key: response_facts[key] for key in (
+                            "status", "retry_after_seconds", "retry_after_at",
+                        ) if key in response_facts})
+                    status = facts.get("status")
+                    if type(status) is int and 100 <= status <= 599:
+                        details += f" status={status}"
+                    retry = facts.get("retry_after_seconds")
+                    if type(retry) in {int, float} and math.isfinite(retry) and retry >= 0:
+                        details += f" retry_after_seconds={retry}"
+                    retry_at = facts.get("retry_after_at")
+                    if isinstance(retry_at, datetime) and retry_at.tzinfo is not None:
+                        details += f" retry_after_at={retry_at.isoformat()}"
+                except Exception:
+                    details = ""
+        except Exception:
+            pass
         raise
     finally:
-        elapsed = time.monotonic() - started
-        if timings is not None:
-            timings[stage] = round(elapsed, 3)
-        if wait_reason is not None:
-            logger.info(
-                "lp_read_wait stage=%s elapsed_seconds=%.3f reason=%s thread=%s",
-                stage, elapsed, wait_reason, threading.get_ident(),
-            )
-        elif error_types:
-            logger.warning(
-                "lp_snapshot_stage stage=%s elapsed_seconds=%.3f error_types=%s thread=%s%s",
-                stage, elapsed, ">".join(error_types), threading.get_ident(), details,
-            )
-        elif elapsed >= 60:
-            logger.warning(
-                "lp_read_slow stage=%s elapsed_seconds=%.3f thread=%s",
-                stage, elapsed, threading.get_ident(),
-            )
+        try:
+            elapsed = time.monotonic() - started
+            if task is not None:
+                task["stage"] = previous_stage
+                task["timings"][stage] = round(task["timings"].get(stage, 0) + elapsed, 3)
+                details += f' task_id={task["task_id"]}'
+            if timings is not None:
+                timings[stage] = round(elapsed, 3)
+            thread = threading.get_ident()
+            def emit():
+                if wait_reason is not None:
+                    logger.info(
+                        "lp_read_wait stage=%s elapsed_seconds=%.3f reason=%s thread=%s%s",
+                        stage, elapsed, wait_reason, thread, details,
+                    )
+                elif error_types:
+                    logger.warning(
+                        "lp_snapshot_stage stage=%s elapsed_seconds=%.3f error_types=%s thread=%s%s",
+                        stage, elapsed, ">".join(error_types), thread, details,
+                    )
+                elif elapsed >= 60:
+                    logger.warning(
+                        "lp_read_slow stage=%s elapsed_seconds=%.3f thread=%s%s",
+                        stage, elapsed, thread, details,
+                    )
+            if error_types or wait_reason is not None:
+                # Preserve the original real error/wait logging path and level.
+                emit()
+            elif elapsed >= 60:
+                deferred = deferred_logs if deferred_logs is not None else getattr(_lp_read_local, 'deferred_logs', None)
+                if deferred is None and task is None:
+                    emit()  # Preserve existing standalone stage logging.
+                else:
+                    _lp_capture_read_log(emit, deferred)
+        except Exception:
+            pass
 
 
 def _safe_history_response_facts(exc: BaseException) -> dict[str, object]:
@@ -970,6 +1191,7 @@ def _install_lp_response_fact_hook(
         )
         http_client = getattr(transport, "_client")
         response_hooks = getattr(http_client, "event_hooks").get("response")
+        request_hooks = getattr(http_client, "event_hooks").get("request")
     except Exception:
         return None
     if not isinstance(response_hooks, list):
@@ -977,66 +1199,86 @@ def _install_lp_response_fact_hook(
 
     owner_thread = threading.get_ident()
 
+    def on_request(request: object) -> None:
+        try:
+            if threading.get_ident() == owner_thread and getattr(getattr(request, "url", None), "path", None) == path:
+                _lp_read_count(http_requests=1)
+        except Exception:
+            pass
+
     def on_response(response: object) -> None:
-        if threading.get_ident() != owner_thread:
-            return
-        url = getattr(getattr(response, "request", None), "url", None)
-        if getattr(url, "path", None) != path:
-            return
-        for field in ("status", "retry_after_seconds", "retry_after_at"):
-            facts.pop(field, None)
-        status = getattr(response, "status_code", None)
-        if type(status) is int:
-            facts["status"] = status
-        headers = getattr(response, "headers", None)
-        retry_after = headers.get("retry-after") if headers is not None else None
-        if retry_after is None:
-            return
         try:
-            retry_seconds = float(str(retry_after).strip())
-        except (TypeError, ValueError):
-            retry_seconds = math.nan
-        if math.isfinite(retry_seconds) and retry_seconds >= 0:
-            facts["retry_after_seconds"] = (
-                int(retry_seconds)
-                if retry_seconds.is_integer()
-                else retry_seconds
-            )
-            return
-        try:
-            retry_at = parsedate_to_datetime(str(retry_after).strip())
-            if retry_at.tzinfo is None:
-                retry_at = retry_at.replace(tzinfo=UTC)
-            facts["retry_after_at"] = retry_at
-            response_date = (
-                headers.get("date") if headers is not None else None
-            )
-            if response_date is None:
+            if threading.get_ident() != owner_thread:
                 return
-            response_at = parsedate_to_datetime(str(response_date).strip())
-            if response_at.tzinfo is None:
-                response_at = response_at.replace(tzinfo=UTC)
-            retry_delta = (retry_at - response_at).total_seconds()
-        except (TypeError, ValueError, OverflowError):
-            return
-        if math.isfinite(retry_delta) and retry_delta >= 0:
-            facts["retry_after_seconds"] = (
-                int(retry_delta)
-                if retry_delta.is_integer()
-                else retry_delta
-            )
-
-    response_hooks.append(on_response)
-
-    def remove() -> None:
-        try:
-            for index, hook in enumerate(response_hooks):
-                if hook is on_response:
-                    del response_hooks[index]
-                    break
+            url = getattr(getattr(response, "request", None), "url", None)
+            if getattr(url, "path", None) != path:
+                return
+            _lp_read_count(http_responses=1)
+            for field in ("status", "retry_after_seconds", "retry_after_at"):
+                facts.pop(field, None)
+            status = getattr(response, "status_code", None)
+            if type(status) is int:
+                facts["status"] = status
+                if 200 <= status < 300 and path in {"/data/orders", "/data/trades", "/positions"}:
+                    _lp_read_count(http_pages=1)
+            headers = getattr(response, "headers", None)
+            retry_after = headers.get("retry-after") if headers is not None else None
+            if retry_after is None:
+                return
+            try:
+                retry_seconds = float(str(retry_after).strip())
+            except (TypeError, ValueError):
+                retry_seconds = math.nan
+            if math.isfinite(retry_seconds) and retry_seconds >= 0:
+                facts["retry_after_seconds"] = (
+                    int(retry_seconds)
+                    if retry_seconds.is_integer()
+                    else retry_seconds
+                )
+                return
+            try:
+                retry_at = parsedate_to_datetime(str(retry_after).strip())
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=UTC)
+                facts["retry_after_at"] = retry_at
+                response_date = (
+                    headers.get("date") if headers is not None else None
+                )
+                if response_date is None:
+                    return
+                response_at = parsedate_to_datetime(str(response_date).strip())
+                if response_at.tzinfo is None:
+                    response_at = response_at.replace(tzinfo=UTC)
+                retry_delta = (retry_at - response_at).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                return
+            if math.isfinite(retry_delta) and retry_delta >= 0:
+                facts["retry_after_seconds"] = (
+                    int(retry_delta)
+                    if retry_delta.is_integer()
+                    else retry_delta
+                )
         except Exception:
             return
 
+    def remove() -> None:
+        for hooks, callback in ((response_hooks, on_response), (request_hooks, on_request)):
+            try:
+                if isinstance(hooks, list):
+                    for index, hook in enumerate(hooks):
+                        if hook is callback:
+                            del hooks[index]
+                            break
+            except Exception:
+                continue
+
+    try:
+        response_hooks.append(on_response)
+        if isinstance(request_hooks, list):
+            request_hooks.append(on_request)
+    except Exception:
+        remove()
+        return None
     return remove
 
 
@@ -1991,16 +2233,31 @@ class PolymarketTradingClient:
                 if fresh:
                     return market_model, book_model, received_at, None
             if len([job for job in self._lp_public_reads.values() if not job.done()]) >= 2:
-                return None, None, None, {
-                    "error_type": "market_read_capacity",
-                    "stage": "market_book",
-                }
-            future: Future = Future()
-            self._lp_public_reads[key] = future
+                future = None
+                now = time.monotonic()
+                report_capacity = now >= getattr(self, '_lp_public_diagnostic_at', float('-inf'))
+                if report_capacity:
+                    self._lp_public_diagnostic_at = now + 60
+                jobs = tuple(job for job in self._lp_public_reads.values() if not job.done())
+            else:
+                future = Future()
+                try:
+                    parent = getattr(_lp_read_local, 'task', None)
+                    future.lp_diagnostic = dict(task_id=uuid.uuid4().hex, entry='public_snapshot',
+                        parent_task_id=parent['task_id'] if parent is not None else None,
+                        budget=self._lp_public_read_timeout)
+                except Exception:
+                    pass
+                self._lp_public_reads[key] = future
+        if future is None:
+            if report_capacity:
+                _lp_market_read_diagnostic('market_read_capacity', jobs)
+            return None, None, None, {'error_type': 'market_read_capacity', 'stage': 'market_book'}
 
         def run():
+            pending_logs = []
             try:
-                with self._lp_snapshot_public_client() as public:
+                with _lp_read_task("public_snapshot", task=getattr(future, "lp_diagnostic", None), deferred_logs=pending_logs), self._lp_snapshot_public_client() as public:
                     with _lp_read_stage("market"):
                         market_model = public.get_market(id=market_id)
                         market = _model_dict(market_model) or {}
@@ -2026,6 +2283,8 @@ class PolymarketTradingClient:
                 with self._lp_public_reads_lock:
                     self._lp_public_error_at_deadline_locked(key, error, create=True)
                 future.set_exception(exc)
+            finally:
+                _lp_flush_read_logs(pending_logs)
 
         threading.Thread(target=run, daemon=True, name=f"lp-public-read:{key}").start()
         if not wait:
@@ -2034,10 +2293,19 @@ class PolymarketTradingClient:
                 "stage": "market_book",
             }
         try:
-            _, _, market_model, book_model, received_at = future.result(
-                timeout=self._lp_public_read_timeout
-            )
+            with _lp_read_stage("public_future_wait"):
+                _, _, market_model, book_model, received_at = future.result(
+                    timeout=self._lp_public_read_timeout
+                )
         except FuturesTimeoutError:
+            task = getattr(future, 'lp_diagnostic', None)
+            if task is not None:
+                task['caller_timed_out'] = True
+            with self._lp_public_reads_lock:
+                jobs = tuple(job for job in self._lp_public_reads.values() if not job.done())
+            if future not in jobs:
+                jobs += (future,)
+            _lp_market_read_diagnostic('market_read_timeout', jobs, stack=True)
             return None, None, None, {
                 "error_type": "TimeoutError",
                 "stage": "market_book",
@@ -2155,7 +2423,7 @@ class PolymarketTradingClient:
             return False
 
     def _account_read_facts(self):
-        with self._lp_account_read_lock:
+        with _lp_read_task("account_read_facts"), _lp_read_lock(self._lp_account_read_lock, "account_lock_wait"):
             retry = self._lp_account_read_retry
             if retry is not None and time.monotonic() < retry[0]:
                 raise PolymarketTradingError("network", response_facts=self._lp_public_retry_projection(retry))
@@ -2192,10 +2460,13 @@ class PolymarketTradingClient:
                 ("secure_clob", "/data/trades"),
                 ("data", "/positions"),
             ):
-                remove = _install_lp_response_fact_hook(
-                    self._client, path=path, facts=response_facts,
-                    transport_name=transport_name,
-                )
+                try:
+                    remove = _install_lp_response_fact_hook(
+                        self._client, path=path, facts=response_facts,
+                        transport_name=transport_name,
+                    )
+                except Exception:
+                    remove = None
                 if remove is not None:
                     remove_hooks.append(remove)
             with _lp_read_stage("account_balance"):
@@ -2206,6 +2477,7 @@ class PolymarketTradingClient:
                 if raw_orders is None:
                     raise ValueError("open_orders_unknown")
                 orders = tuple(_collect(raw_orders))
+                _lp_read_count(records=len(orders))
             # This read is intentionally performed even though the snapshot only
             # formerly discarded it; the round now preserves the complete list.
             with _lp_read_stage("account_trades"):
@@ -2213,11 +2485,13 @@ class PolymarketTradingClient:
                 if raw_trades is None:
                     raise ValueError("account_trades_unknown")
                 trades = tuple(_collect(raw_trades))
+                _lp_read_count(records=len(trades))
             with _lp_read_stage("account_positions"):
                 raw_positions = self._client.list_positions()
                 if raw_positions is None:
                     raise ValueError("positions_unknown")
                 positions = tuple(_collect(raw_positions))
+                _lp_read_count(records=len(positions))
             return (
                 p_usd_balance,
                 p_usd_allowance,
@@ -2236,7 +2510,10 @@ class PolymarketTradingClient:
             ) from None
         finally:
             for remove in reversed(remove_hooks):
-                remove()
+                try:
+                    remove()
+                except Exception:
+                    pass
 
     def account_snapshot(self) -> AccountSnapshot:
         (
@@ -2287,7 +2564,7 @@ class PolymarketTradingClient:
         have passed. An underlying read failure is not cached.
         """
 
-        with self._lp_account_shared_lock:
+        with _lp_read_task("account_snapshot_shared"), _lp_read_lock(self._lp_account_shared_lock, "account_shared_lock_wait"):
             cached = self._lp_account_shared_cache
             if isinstance(cached, Mapping):
                 fetched_at = cached.get("fetched_at")
@@ -2328,44 +2605,45 @@ class PolymarketTradingClient:
         self, account_round: object | None = None
     ) -> dict[str, object]:
         """Return current account orders and holdings for the read-only LP panel."""
-        if account_round is None:
-            account = self._lp_account_facts(include_raw_trades=True)
-        else:
-            account = dict(self._lp_account_snapshot_for_round(account_round)[0])
-        raw_trades = account.get("raw_trades", ())
-        normalized_trades = []
-        complete = account.get("trades_complete") is True
-        for raw in raw_trades:
-            row = _lp_trade(raw)
-            if row is None:
-                complete = False
-                continue
-            row["maker_orders"] = [maker for maker in row["maker_orders"]
-                if _lp_maker_order_is_self(maker, self.config.wallet_address)]
-            if not row["taker_order_id"] and not row["maker_orders"]:
-                complete = False
-                continue
-            normalized_trades.append(row)
-        account.update(account_trades=tuple(normalized_trades),
-            display_trades_complete=complete, account_trades_total=len(raw_trades))
-        if account_round is None:
-            # Raw own-fill evidence is internal to a fenced registration round.
-            account.pop("raw_trades", None)
-        order_rows, position_rows = account['open_orders'], account['positions']
-        condition_ids = tuple(
-            dict.fromkeys(
-                str(row.get("condition_id") or "")
-                for row in (*order_rows, *position_rows)
-                if row.get("condition_id")
+        with _lp_read_task("account_snapshot"):
+            if account_round is None:
+                account = self._lp_account_facts(include_raw_trades=True)
+            else:
+                account = dict(self._lp_account_snapshot_for_round(account_round)[0])
+            raw_trades = account.get("raw_trades", ())
+            normalized_trades = []
+            complete = account.get("trades_complete") is True
+            for raw in raw_trades:
+                row = _lp_trade(raw)
+                if row is None:
+                    complete = False
+                    continue
+                row["maker_orders"] = [maker for maker in row["maker_orders"]
+                    if _lp_maker_order_is_self(maker, self.config.wallet_address)]
+                if not row["taker_order_id"] and not row["maker_orders"]:
+                    complete = False
+                    continue
+                normalized_trades.append(row)
+            account.update(account_trades=tuple(normalized_trades),
+                display_trades_complete=complete, account_trades_total=len(raw_trades))
+            if account_round is None:
+                # Raw own-fill evidence is internal to a fenced registration round.
+                account.pop("raw_trades", None)
+            order_rows, position_rows = account['open_orders'], account['positions']
+            condition_ids = tuple(
+                dict.fromkeys(
+                    str(row.get("condition_id") or "")
+                    for row in (*order_rows, *position_rows)
+                    if row.get("condition_id")
+                )
             )
-        )
-        metadata = self.lp_market_metadata(condition_ids)
-        for row in (*order_rows, *position_rows):
-            market = metadata.get(str(row.get("condition_id") or ""))
-            if market is not None:
-                row.update(market)
-                row["condition_id"] = market.get("condition_id")
-        return account
+            metadata = self.lp_market_metadata(condition_ids)
+            for row in (*order_rows, *position_rows):
+                market = metadata.get(str(row.get("condition_id") or ""))
+                if market is not None:
+                    row.update(market)
+                    row["condition_id"] = market.get("condition_id")
+            return account
 
     def lp_account_round_begin(
         self, trade_generation_provider: Callable[[], int] | None = None
@@ -2419,42 +2697,48 @@ class PolymarketTradingClient:
                 token.future = future
                 owner = True
         if owner:
-            provider = token.trade_generation_provider
+            pending_logs = []
             try:
-                before_generation = provider() if callable(provider) else None
-                snapshot: Mapping[str, object] = deepcopy(
-                    self._lp_account_facts(include_raw_trades=True)
-                )
-                after_generation = provider() if callable(provider) else before_generation
-            except BaseException as exc:
-                with token.lock:
-                    if token.future is future:
-                        token.future = None
-                future.set_exception(exc)
-                raise
-            if before_generation != after_generation:
-                with token.lock:
-                    if token.future is future:
-                        token.future = None
-                future.set_exception(LpAccountRoundInvalid("lp_account_round_invalid"))
-                raise LpAccountRoundInvalid("lp_account_round_invalid")
-            snapshot = {
-                **snapshot,
-                "trade_generation": after_generation,
-            }
-            with token.lock:
-                future.set_result((snapshot, after_generation))
-                if token.future is future:
-                    token.trade_generation = after_generation
-                if (
-                    token.future is future
-                    and (not token.active or token.generation != generation)
-                ):
-                    token.future = None
-            if not token.active or token.generation != generation:
-                raise LpAccountRoundInvalid("lp_account_round_invalid")
-            return snapshot, generation, after_generation
-        snapshot, trade_generation = future.result()
+                with _lp_read_task('account_round', deferred_logs=pending_logs):
+                    provider = token.trade_generation_provider
+                    try:
+                        before_generation = provider() if callable(provider) else None
+                        snapshot: Mapping[str, object] = deepcopy(
+                            self._lp_account_facts(include_raw_trades=True)
+                        )
+                        after_generation = provider() if callable(provider) else before_generation
+                    except BaseException as exc:
+                        with token.lock:
+                            if token.future is future:
+                                token.future = None
+                        future.set_exception(exc)
+                        raise
+                    if before_generation != after_generation:
+                        with token.lock:
+                            if token.future is future:
+                                token.future = None
+                        future.set_exception(LpAccountRoundInvalid("lp_account_round_invalid"))
+                        raise LpAccountRoundInvalid("lp_account_round_invalid")
+                    snapshot = {
+                        **snapshot,
+                        "trade_generation": after_generation,
+                    }
+                    with token.lock:
+                        future.set_result((snapshot, after_generation))
+                        if token.future is future:
+                            token.trade_generation = after_generation
+                        if (
+                            token.future is future
+                            and (not token.active or token.generation != generation)
+                        ):
+                            token.future = None
+                    if not token.active or token.generation != generation:
+                        raise LpAccountRoundInvalid("lp_account_round_invalid")
+                    return snapshot, generation, after_generation
+            finally:
+                _lp_flush_read_logs(pending_logs)
+        with _lp_read_stage("account_future_wait"):
+            snapshot, trade_generation = future.result()
         with token.lock:
             if not token.active or token.generation != generation:
                 raise LpAccountRoundInvalid("lp_account_round_invalid")

@@ -1521,6 +1521,13 @@ def test_market_read_timeout_discards_late_result_and_preserves_other_capacity(t
             with _lp_read_stage('facts_read'):
                 lp._read_snapshot(slow)
         assert 'lp_snapshot_stage stage=facts_read' in caplog.text
+        # New diagnostics have a dedicated consumer; finish this timeout's
+        # output before testing that the next typed wait emits no WARNING.
+        from open_trader.polymarket_trading import _lp_read_log_queue
+        with _lp_read_log_queue.all_tasks_done:
+            assert _lp_read_log_queue.all_tasks_done.wait_for(
+                lambda: _lp_read_log_queue.unfinished_tasks == 0, timeout=2,
+            ), 'independent diagnostic watchdog'
         caplog.clear()
         assert entered.is_set()
         lp._market_read_timeout = healthy_timeout

@@ -145,6 +145,72 @@ def test_default_configure_enable_and_idempotent_round(tmp_path):
         e.lp_auto_configure(dict(budget_usd='120',target_buy_count=5))
 
 
+@pytest.mark.parametrize('reasons, expected', [
+    (['market_read_capacity'], 'market_read_capacity'),
+    (['market_read_timeout'], 'market_read_timeout'),
+    (['market_read_cooling_down'], 'market_read_cooling_down'),
+    (['market_read_in_progress'], 'market_read_in_progress'),
+    (['market_read_capacity', 'market_read_timeout'], 'market_read_capacity'),
+    (['market_read_capacity', 'strategy_funds_insufficient'], 'candidates_or_funds_insufficient'),
+    (['market_read_capacity', None], 'target_filled'),
+    (['market_read_capacity', None, 'market_read_timeout'], 'candidates_or_funds_insufficient'),
+])
+def test_round_summary_preserves_read_refusals_without_hiding_other_outcomes(tmp_path, monkeypatch, reasons, expected):
+    e, exchange, _, _ = setup(tmp_path, len(reasons))
+    e.lp_auto_configure(dict(budget_usd='100', target_buy_count=1 if expected == 'target_filled' else len(reasons)))
+    e.lp_auto_set_desired_running(True)
+    pool = e._lp_auto_pool()
+    submit = pool._submit
+    attempted = []
+
+    def controlled(row, *args, **kwargs):
+        reason = reasons[len(attempted)]
+        attempted.append(row['condition_id'])
+        if reason is not None:
+            raise ValueError(reason)
+        return submit(row, *args, **kwargs)
+
+    monkeypatch.setattr(pool, '_submit', controlled)
+    state = e.lp_auto_run_once(round_id='read-summary')
+    assert len(attempted) == len(reasons)
+    assert state['last_round']['reason'] == expected
+    assert [a.get('reason') for a in state['last_round']['actions'] if a['state'] == 'rejected'] == [r for r in reasons if r]
+    assert len(exchange.posts) == reasons.count(None)
+
+
+@pytest.mark.parametrize('case, expected', [
+    ('empty', 'candidates_or_funds_insufficient'),
+    ('funds', 'candidates_or_funds_insufficient'),
+    ('account', 'account_unknown'),
+    ('filled', 'target_filled'),
+])
+def test_round_summary_keeps_existing_admission_and_empty_reasons(tmp_path, case, expected):
+    e, exchange, lp, _ = setup(tmp_path, 0 if case == 'empty' else 1)
+    e.lp_auto_configure(dict(budget_usd='1' if case == 'funds' else '100', target_buy_count=1))
+    e.lp_auto_set_desired_running(True)
+    if case == 'account':
+        lp._account_order_sync_error = 'account_unknown'
+    if case == 'filled':
+        assert e.lp_auto_run_once(round_id='fill')['slots']['occupied'] == 1
+    state = e.lp_auto_run_once(round_id='summary')
+    assert state['last_round']['reason'] == expected
+    assert state['last_round']['actions'] == ([dict(condition_id='m00', state='rejected', reason='strategy_funds_insufficient')] if case == 'funds' else [])
+
+
+def test_account_blocker_after_read_refusal_has_summary_priority(tmp_path, monkeypatch):
+    e, _, lp, _ = setup(tmp_path, 2)
+    e.lp_auto_configure(dict(budget_usd='100', target_buy_count=2))
+    e.lp_auto_set_desired_running(True)
+    def reject(*args, **kwargs):
+        lp._account_order_sync_error = 'account_unknown'
+        raise ValueError('market_read_capacity')
+    monkeypatch.setattr(e._lp_auto_pool(), '_submit', reject)
+    state = e.lp_auto_run_once()
+    assert state['last_round']['reason'] == 'account_unknown'
+    assert len(state['last_round']['actions']) == 1
+    assert state['last_round']['actions'][0]['reason'] == 'market_read_capacity'
+
+
 def test_full_pool_manual_exclusion_unknown_isolated_and_restart(tmp_path):
     e,x,lp,s=setup(tmp_path,13)
     x.orders=[dict(order_id=f'manual{i}',condition_id=f'm{i:02}',token_id=f'm{i:02}',side='BUY',

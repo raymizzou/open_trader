@@ -6150,16 +6150,15 @@ def test_lp_candidate_preview_rechecks_best_bid_before_confirmation(
     }
     clock_state = {"now": datetime.now(UTC)}
 
-    class AdapterDateTime(datetime):
-        calls = 0
+    # Age the prepared catalog and the first account read by business phase,
+    # independent of how many timestamps diagnostics collect.
+    adapter_clock = {"offset": timedelta(seconds=200)}
 
+    class AdapterDateTime(datetime):
         @classmethod
         def now(cls, tz: object = None) -> datetime:
-            cls.calls += 1
-            moment = clock_state["now"]
-            if cls.calls == 2:
-                moment -= timedelta(seconds=200)
-            return moment.astimezone(tz) if tz is not None else moment.replace(tzinfo=None)  # type: ignore[arg-type]
+            moment = clock_state["now"] - adapter_clock["offset"]
+            return cls.fromtimestamp(moment.timestamp(), tz=tz)  # type: ignore[arg-type]
 
     monkeypatch.setattr(polymarket_trading_module, "datetime", AdapterDateTime)
 
@@ -6177,6 +6176,7 @@ def test_lp_candidate_preview_rechecks_best_bid_before_confirmation(
 
         def get_balance_allowance(self, **_kwargs: object) -> object:
             self.balance_reads += 1
+            adapter_clock["offset"] = timedelta(0)
             return SimpleNamespace(
                 balance=self.balance_units,
                 allowances={"standard-exchange": self.balance_units},
@@ -6393,15 +6393,13 @@ def test_lp_candidate_preview_rechecks_best_bid_before_confirmation(
     lp = PolymarketLPService(store, trading, clock=lambda: clock_state["now"])
     prepared = lp.refresh_price_history()
     assert prepared["state"] == "known"
-    AdapterDateTime.calls = 0
     trading.expire_lp_metadata_cache()
     scanned = lp.refresh_candidates(force=True)
     assert scanned["state"] == "ready"
     assert scanned["complete"] is True
-    # Issue #143 repair 2: receipts cached with the 200-second offset (the
-    # prepared reward catalog and the first account read) are renewed once,
-    # targeted at the scanned condition, and the market is judged live and
-    # published; the preview path below still rechecks fresh facts directly.
+    # The prepared reward receipt is 200 seconds old and is renewed only for
+    # this condition. The first account read starts at that old time but its
+    # balance receipt and completion are current. Preview still rechecks facts.
     assert scanned["funnel"]["checked"] == 1
     assert scanned["funnel"]["passed"] == 1
     assert scanned["funnel"]["unknown"] == 0
