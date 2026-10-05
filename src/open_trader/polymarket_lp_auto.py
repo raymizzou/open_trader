@@ -1918,10 +1918,16 @@ class LPAutoPool:
             if (previous_key < peer_key) != (current_key < peer_key):
                 raise ValueError('candidate_rank_changed')
 
+    def _account_refresh_failure_reason(self):
+        return (getattr(self.lp, '_account_order_sync_error', None)
+            or (self._account_facts_wait or {}).get('reason')
+            or (self.state()['admission_block_reasons'] or ['account_unknown'])[0])
+
     def _submit(self, row, round_id, index, version, *, peers=()):
         # Network preparation never owns the existing protection/apply lane.
         if self._refresh_account_facts() is False:
-            raise ValueError((self.state()["admission_block_reasons"] or ["account_unknown"])[0])
+            reason = self._account_refresh_failure_reason()
+            return {"state": "rejected", "reason": reason}, reason
         state = self.state()
         if state['slots']['occupied'] >= state['target_buy_count']:
             raise ValueError('target_filled')
@@ -1973,11 +1979,14 @@ class LPAutoPool:
             d['intents'][intent_id]=i
             self._event(d,i,'intent',occurred_at=self._stamp(),quantity=i['quantity'],price=i['price'])
         self._update(reserve)
+        account_read_failure = None
         def post(signed, mark_post_started):
+            nonlocal account_read_failure
             from .polymarket_lp import AutoEntryNotSent
             try:
                 if self._refresh_account_facts() is False:
-                    raise ValueError((self.state()["admission_block_reasons"] or ["account_unknown"])[0])
+                    account_read_failure = self._account_refresh_failure_reason()
+                    raise ValueError(account_read_failure)
                 latest = self.lp._read_candidate_snapshot(request, now=self._now(), ignore_session_id=session_id,
                     account=self._current_account)
                 self._check_candidate_rank(row, latest, peers)
@@ -2014,7 +2023,7 @@ class LPAutoPool:
             self._record_session(intent_id,session)
         else:
             self._update(lambda d:d['intents'][intent_id].update(state='aborted',reserved_usd='0'))
-        return result
+        return result, account_read_failure
 
     @contextmanager
     def _round_barrier(self):
@@ -2074,6 +2083,7 @@ class LPAutoPool:
             except ValueError as exc:
                 reason = str(exc)
             seen=set()
+            account_read_failure = None
             for index,row in enumerate(targets if not reason else []):
                 if self._resting_buy(row):
                     continue
@@ -2084,8 +2094,11 @@ class LPAutoPool:
                     break
                 seen.add(row['condition_id'])
                 try:
-                    result=self._submit(row,round_id,index,d['config_version'],peers=targets[:index]+targets[index+1:])
+                    result, account_read_failure = self._submit(row,round_id,index,d['config_version'],peers=targets[:index]+targets[index+1:])
                     actions.append({'condition_id':row['condition_id'],**result})
+                    if account_read_failure:
+                        reason = account_read_failure
+                        break
                     # A receipt changes the account generation. The next
                     # real-adapter submission (or final refresh) must reprice
                     # current API exposure before testing admission again.
@@ -2104,7 +2117,7 @@ class LPAutoPool:
                         break
             if actions:
                 self._refresh_account_facts()
-                reason = (self.state()['admission_block_reasons'] or [reason])[0]
+                reason = account_read_failure or (self.state()['admission_block_reasons'] or [reason])[0]
         self._update(lambda doc:doc.update(last_round=dict(round_id=round_id,checked_at=self._stamp(),actions=actions,
             candidates=[{k: r[k] for k in ('condition_id','token_id','outcome','price','quantity','minimum_order_estimate')}
                         for r in candidates[:10]],candidate_count=len(candidates),

@@ -805,3 +805,36 @@ def test_known_matching_intent_with_accepted_idless_extra_action_blocks_new_buys
     assert account.posts == account.cancels == []
     assert state['intents'] == audit_intents
     assert store.lp_actions(original['session_id']) == audit_actions
+
+
+def test_presend_account_failure_cause_survives_a_different_final_refresh_failure(runtime):
+    from open_trader.polymarket_trading import TradingConfig
+    public = RefillPublic(runtime.clock)
+    public.rates = {1: '48', 2: '24'}
+    _, adapter, account, _, execution, _ = prepare(runtime, count=2, target=2, public=public)
+    original_sign, positions = account.create_limit_order, account.list_positions
+    reads = []
+    signs = []
+    def read_positions(**kwargs):
+        reads.append(True)
+        if len(reads) == 1:
+            raise TimeoutError('offline initial presend account failure')
+        # The final read is allowed to update the UI with a different failure.
+        adapter.config = TradingConfig('0x' + 'b' * 40, '0x' + 'b' * 40)
+        return positions(**kwargs)
+    def sign(**kwargs):
+        signs.append(kwargs['token_id'])
+        signed = original_sign(**kwargs)
+        account.list_positions = read_positions
+        return signed
+    account.create_limit_order = sign
+    state = execution.lp_auto_run_once(round_id='latched-account-failure')
+    assert len(reads) == 2, 'Only failed presend and existing final account reads'
+    assert signs == [_refill_identity(1)[2]]
+    assert account.posts == account.cancels == []
+    assert state['last_round']['reason'] == 'account_order_sync_unknown'
+    assert state['last_round']['actions'][0]['state'] == 'entry_rejected'
+    assert state['last_round']['actions'][0]['reason'] == 'account_order_sync_unknown'
+    assert len(state['last_round']['actions']) == 1
+    assert 'account_identity_mismatch' in state['admission_block_reasons']
+    assert state['slots']['occupied'] == 0
