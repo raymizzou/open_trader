@@ -6,6 +6,7 @@ import inspect
 import logging
 import math
 import os
+import sqlite3
 import sys
 import threading
 import uuid
@@ -70,10 +71,21 @@ from .polymarket_trading import (
     _lp_market_read_diagnostic,
     _lp_trade,
     _safe_read_error_chain,
+    _safe_sqlite_error_facts,
 )
 
 
 STOP_LOSS = Decimal("5")
+
+
+class _PreparationDatabaseFailure(Exception):
+    """Carry redacted adapter database facts to the global preparation boundary."""
+
+    def __init__(self, facts: Mapping[str, object]) -> None:
+        self.facts = facts
+        super().__init__("preparation_database_failure")
+
+
 SCORING_STALE_SECONDS = Decimal("15")
 # Issue 163 定案 8 / Issue 166: an augment can only land on ``entry_open``.
 # Every other non-terminal state maps to its real rejection reason; the two
@@ -1158,6 +1170,7 @@ class PolymarketLPService:
         *,
         state: str,
         exclusion_revision: int | None = None,
+        generation: int | None = None,
     ) -> bool:
         raw_markets = catalog.get("markets")
         if (
@@ -1181,8 +1194,12 @@ class PolymarketLPService:
             "metadata": deepcopy(metadata) if isinstance(metadata, LPReadScratch)
                 else LPReadScratch(metadata),
             "state": state,
+            "preparation_generation": generation,
         }
         with self._candidate_state_lock:
+            global_fence = self.preparation_snapshot().get("global_recovery_generation") if generation is not None else None
+            if type(global_fence) is int and generation is not None and global_fence > generation:
+                return False
             if self.exclusions_enabled and exclusion_revision != self._candidate_exclusion_revision:
                 return False
             self._prepared_inputs = prepared
@@ -1197,6 +1214,10 @@ class PolymarketLPService:
     def _prepared_input_snapshot(self) -> dict[str, object] | None:
         with self._candidate_state_lock:
             prepared = self._prepared_inputs
+            if isinstance(prepared, Mapping) and prepared.get("preparation_generation") is not None:
+                global_fence = self.preparation_snapshot().get("global_recovery_generation")
+                if type(global_fence) is int and global_fence > prepared["preparation_generation"]:
+                    return None
             return {**prepared, "metadata": MappingProxyType(prepared["metadata"])} if isinstance(prepared, Mapping) else None
 
     def _preparation_priority_order(
@@ -1573,6 +1594,12 @@ class PolymarketLPService:
 
         raw_chain: list[object] = []
         status: int | None = None
+        if isinstance(value, BaseException):
+            value = {
+                "error_type": type(value).__name__,
+                "error_chain": _safe_read_error_chain(value),
+                **_safe_sqlite_error_facts(value),
+            }
         if isinstance(value, Mapping):
             raw_chain_value = value.get("error_chain", value.get("error_types"))
             if isinstance(raw_chain_value, Sequence) and not isinstance(
@@ -1657,6 +1684,13 @@ class PolymarketLPService:
                     "http5",
                 )
             )
+        sqlite_code = _safe_sqlite_error_facts(value).get("sqlite_errorcode")
+        if sqlite_code is not None:
+            automatically_recoverable = (sqlite_code & 0xff) in {
+                sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED
+            }
+        elif any(name in chain for name in ("OperationalError", "DatabaseError", "IntegrityError")):
+            automatically_recoverable = False
         automatically_recoverable = automatically_recoverable and not operator_blocker
         category = (
             "operator_attention"
@@ -1670,6 +1704,18 @@ class PolymarketLPService:
         """Return whether a safe read result can be retried automatically."""
 
         return cls._preparation_error_details(value)[1]
+
+    @classmethod
+    def _raise_preparation_database_failure(cls, value: object) -> None:
+        error, _, chain, status, _ = cls._preparation_error_details(value)
+        sqlite_facts = _safe_sqlite_error_facts(value)
+        if sqlite_facts or any(name in chain for name in (
+            "OperationalError", "DatabaseError", "IntegrityError"
+        )):
+            raise _PreparationDatabaseFailure({
+                "error_type": error, "error_chain": chain, "status": status,
+                **sqlite_facts,
+            })
 
     @staticmethod
     def _retry_after_deadline(
@@ -1895,10 +1941,11 @@ class PolymarketLPService:
                     reasons.append(code)
         return reasons
 
-    def _begin_preparation(self, now: datetime) -> dict[str, object]:
+    def _begin_preparation(self, now: datetime, *, generation: int) -> dict[str, object]:
         current = self.preparation_snapshot()
-        generation = current.get("generation")
-        generation = generation if type(generation) is int and generation >= 1 else 1
+        global_fence = current.get("global_recovery_generation")
+        if type(global_fence) is int and global_fence > generation:
+            return current
         attempt = current.get("attempt")
         attempt = attempt if type(attempt) is int and attempt >= 0 else 0
         failures = current.get("failure_count")
@@ -1924,8 +1971,12 @@ class PolymarketLPService:
         *,
         stage: str,
         error_type: object,
+        expected_generation: int | None = None,
     ) -> dict[str, object]:
         current = self.preparation_snapshot()
+        global_fence = current.get("global_recovery_generation")
+        if type(global_fence) is int and expected_generation is not None and global_fence > expected_generation:
+            return current
         generation = current.get("generation")
         generation = generation if type(generation) is int and generation >= 1 else 1
         failures = current.get("failure_count")
@@ -1998,6 +2049,8 @@ class PolymarketLPService:
                 "last_error_chain": error_chain,
                 "last_error_status": error_status,
                 "last_error_category": error_category,
+                "last_sqlite_errorcode": _safe_sqlite_error_facts(error_type).get("sqlite_errorcode"),
+                "last_sqlite_errorname": _safe_sqlite_error_facts(error_type).get("sqlite_errorname"),
                 "next_retry_at": retry_at,
                 "next_probe_at": probe_at,
                 "retry_after_seconds": retry_after_seconds,
@@ -2073,11 +2126,30 @@ class PolymarketLPService:
             "recovery_alert_sent_at": None,
         }
 
-    def recover_preparation(self) -> dict[str, object]:
+    def recover_preparation(
+        self, *, scope: str = "all", expected_generation: int | None = None
+    ) -> dict[str, object]:
         """Explicitly re-arm a paused preparation cycle."""
 
+        if not isinstance(scope, str) or scope not in {"all", "global"}:
+            raise ValueError("preparation recovery scope must be all or global")
+        if scope == "global" and (
+            type(expected_generation) is not int or expected_generation < 1
+        ):
+            raise ValueError("positive expected preparation generation required")
+        if scope == "all" and expected_generation is not None:
+            raise ValueError("expected generation requires global recovery scope")
         current = self.preparation_snapshot()
         item_recoverer = getattr(self.store, "lp_recover_preparation_items", None)
+        if scope == "global":
+            if not callable(item_recoverer):
+                raise RuntimeError("durable preparation recovery is unavailable")
+            with self._candidate_state_lock:
+                item_recoverer((), expected_generation=expected_generation)
+                self._prepared_inputs = None
+                self._prepared_inputs_version += 1
+                self._candidate_queue_state = None
+            return {**self.preparation_snapshot(), "recovered_condition_ids": []}
         recovered_items = item_recoverer() if callable(item_recoverer) else ()
         recovered_condition_ids = [
             str(item.get("condition_id"))
@@ -2667,12 +2739,17 @@ class PolymarketLPService:
 
         if type(manual_recovery) is not bool:
             raise ValueError("manual_recovery must be a boolean")
+        generation: int | None = None
         if not self._price_history_refresh_lock.acquire(blocking=False):
             return self._preparation_result(
                 self.preparation_snapshot(), outcome="busy", display_state="busy"
             )
         preparation_owner_acquired = False
         try:
+            # Pin the attempt before any owner, item, or initial writer can fail.
+            preparation = self.preparation_snapshot()
+            generation = preparation.get("generation")
+            generation = generation if type(generation) is int and generation >= 1 else 1
             owner_acquirer = getattr(
                 self.store, "lp_try_acquire_preparation_owner", None
             )
@@ -2769,6 +2846,8 @@ class PolymarketLPService:
                         preparation, outcome="ignored", display_state="unknown"
                     )
                 preparation = self.recover_preparation()
+                generation = preparation.get("generation")
+                generation = generation if type(generation) is int and generation >= 1 else 1
             elif preparation.get("paused") is True:
                 return self._preparation_result(
                     preparation,
@@ -2864,7 +2943,13 @@ class PolymarketLPService:
                         reason="retry_not_due",
                         display_state="unknown",
                     )
-            preparation = self._begin_preparation(now)
+            preparation = self._begin_preparation(now, generation=generation)
+            global_fence = preparation.get("global_recovery_generation")
+            if type(global_fence) is int and global_fence > generation:
+                return self._preparation_result(
+                    preparation, outcome="superseded", reason="preparation_generation_changed",
+                    display_state="unknown",
+                )
             if preparation.get("state") == "paused":
                 return self._preparation_result(
                 preparation,
@@ -2873,8 +2958,6 @@ class PolymarketLPService:
                 display_state="unknown",
                 alert_pending=preparation.get("alert_claimed_now") is True,
             )
-            generation = preparation.get("generation")
-            generation = generation if type(generation) is int and generation >= 1 else 1
             preparation_retry_claimer = getattr(
                 self.store, "lp_claim_preparation_retries", None
             )
@@ -2899,7 +2982,7 @@ class PolymarketLPService:
             history_reader = getattr(self.exchange, "lp_price_history", None)
             if not callable(catalog_reader):
                 failed = self._preparation_failure(
-                    self._now(), stage="catalog", error_type="history_readers_unavailable"
+                    self._now(), expected_generation=generation, stage="catalog", error_type="history_readers_unavailable"
                 )
                 return self._preparation_result(
                     failed,
@@ -2933,6 +3016,8 @@ class PolymarketLPService:
                 for field in (
                     "error_chain",
                     "error_types",
+                    "sqlite_errorcode",
+                    "sqlite_errorname",
                     "status",
                     "retry_after_seconds",
                     "retry_after_at",
@@ -3047,9 +3132,9 @@ class PolymarketLPService:
                             and str(item.get("condition_id") or "").strip()
                         }
             except Exception as exc:
-                error_type = catalog_failure_error or type(exc).__name__
+                error_type = catalog_failure_error or exc
                 failed = self._preparation_failure(
-                    self._now(), stage="catalog", error_type=error_type
+                    self._now(), expected_generation=generation, stage="catalog", error_type=error_type
                 )
                 return self._preparation_result(
                     failed,
@@ -3063,7 +3148,7 @@ class PolymarketLPService:
             )
             if not callable(metadata_reader) and not callable(metadata_batch_reader):
                 failed = self._preparation_failure(
-                    self._now(), stage="metadata", error_type="history_readers_unavailable"
+                    self._now(), expected_generation=generation, stage="metadata", error_type="history_readers_unavailable"
                 )
                 return self._preparation_result(
                     failed,
@@ -3133,6 +3218,8 @@ class PolymarketLPService:
                             metadata_batch_ids, stop_event=stop_event
                         )
                     except Exception as exc:
+                        if isinstance(exc, sqlite3.Error):
+                            raise
                         error_type = self._safe_error_type(type(exc).__name__)
                         metadata_failures.update(
                             {
@@ -3225,6 +3312,7 @@ class PolymarketLPService:
                             else None
                         )
                         failure_value = facts if isinstance(facts, Mapping) else failure
+                        self._raise_preparation_database_failure(failure_value)
                         metadata_failures[condition_id] = batch_failure_code(
                             failure_value
                         )
@@ -3294,7 +3382,7 @@ class PolymarketLPService:
                     )  # type: ignore[misc]
                 except Exception as exc:
                     failed = self._preparation_failure(
-                        self._now(), stage="metadata", error_type=type(exc).__name__
+                        self._now(), expected_generation=generation, stage="metadata", error_type=exc
                     )
                     return self._preparation_result(
                         failed,
@@ -3305,7 +3393,7 @@ class PolymarketLPService:
                     )
             if not isinstance(metadata_value, Mapping):
                 failed = self._preparation_failure(
-                    self._now(), stage="metadata", error_type="history_metadata_unknown"
+                    self._now(), expected_generation=generation, stage="metadata", error_type="history_metadata_unknown"
                 )
                 return self._preparation_result(
                     failed,
@@ -3337,7 +3425,7 @@ class PolymarketLPService:
             )
             if not callable(history_reader):
                 failed = self._preparation_failure(
-                    self._now(), stage="history", error_type="history_readers_unavailable"
+                    self._now(), expected_generation=generation, stage="history", error_type="history_readers_unavailable"
                 )
                 return self._preparation_result(
                     failed,
@@ -3454,13 +3542,14 @@ class PolymarketLPService:
                     catalog,
                     metadata_value,
                     state=prepared_state,
-                    exclusion_revision=preparation_exclusion_revision,
+                    exclusion_revision=preparation_exclusion_revision, generation=generation,
                 ):
                     return self._preparation_result(self.preparation_snapshot(),
                         outcome="superseded", reason="candidate_exclusions_changed", display_state="partial")
                 if catalog_failure is not None:
                     failed = self._preparation_failure(
                         self._now(),
+                        expected_generation=generation,
                         stage=catalog_failure[0],
                         error_type=catalog_failure[1],
                     )
@@ -3602,7 +3691,7 @@ class PolymarketLPService:
 
             if not self._publish_prepared_inputs(
                 catalog, metadata_value, state="preparing",
-                exclusion_revision=preparation_exclusion_revision,
+                exclusion_revision=preparation_exclusion_revision, generation=generation,
             ):
                 return self._preparation_result(self.preparation_snapshot(),
                     outcome="superseded", reason="candidate_exclusions_changed", display_state="partial")
@@ -3727,6 +3816,8 @@ class PolymarketLPService:
                     )
                     return identities, value, None
                 except Exception as exc:
+                    if isinstance(exc, sqlite3.Error):
+                        raise
                     return identities, None, type(exc).__name__
 
             def parse_samples(
@@ -3945,6 +4036,7 @@ class PolymarketLPService:
                             for condition_id in requested
                         }
                 except Exception as exc:
+                    self._raise_preparation_database_failure(exc)
                     failed_ids = {
                         condition_id: self._safe_error_type(type(exc).__name__)
                         for condition_id in requested
@@ -3967,6 +4059,7 @@ class PolymarketLPService:
                         else None
                     )
                     failure_value = facts if isinstance(facts, Mapping) else failure
+                    self._raise_preparation_database_failure(failure_value)
                     if isinstance(failure_value, Mapping):
                         metadata_failure_facts[condition_id] = dict(failure_value)
                     market = returned_markets.get(condition_id)
@@ -4042,7 +4135,7 @@ class PolymarketLPService:
                     metadata_value = updated_metadata
                     if not self._publish_prepared_inputs(
                         catalog, metadata_value, state="preparing",
-                        exclusion_revision=preparation_exclusion_revision,
+                        exclusion_revision=preparation_exclusion_revision, generation=generation,
                     ):
                         return self._preparation_result(self.preparation_snapshot(),
                             outcome="superseded", reason="candidate_exclusions_changed", display_state="partial")
@@ -4216,10 +4309,13 @@ class PolymarketLPService:
                         try:
                             returned_identities, payload, error = future.result()
                         except Exception as exc:
+                            if isinstance(exc, sqlite3.Error):
+                                raise
                             returned_identities, payload, error = identities, None, type(exc).__name__
                         if self.exclusions_enabled and preparation_exclusion_revision != self._candidate_exclusion_revision:
                             return self._preparation_result(self.preparation_snapshot(),
                                 outcome="superseded", reason="candidate_exclusions_changed", display_state="partial")
+                        self._raise_preparation_database_failure(payload)
                         if error is not None and error != "cancelled":
                             operational_failure = (
                                 "history", self._safe_error_type(error)
@@ -4428,7 +4524,7 @@ class PolymarketLPService:
                 else "unknown"
             )
             if not self._publish_prepared_inputs(catalog, metadata_value, state=state,
-                    exclusion_revision=preparation_exclusion_revision):
+                    exclusion_revision=preparation_exclusion_revision, generation=generation):
                 return self._preparation_result(self.preparation_snapshot(),
                     outcome="superseded", reason="candidate_exclusions_changed", display_state="partial")
             if operational_failure is None:
@@ -4497,7 +4593,7 @@ class PolymarketLPService:
                         result["preparation"].update(deepcopy(dict(item_alert)))
                     return result
                 failed = self._preparation_failure(
-                    self._now(), stage=stage, error_type=error_type
+                    self._now(), expected_generation=generation, stage=stage, error_type=error_type
                 )
                 result = self._preparation_result(
                     failed,
@@ -4590,6 +4686,17 @@ class PolymarketLPService:
                 }
             )
             return result
+        except (sqlite3.Error, _PreparationDatabaseFailure) as exc:
+            current = self.preparation_snapshot()
+            failed = self._preparation_failure(
+                self._now(), stage=str(current.get("stage") or "catalog"),
+                error_type=exc.facts if isinstance(exc, _PreparationDatabaseFailure) else exc,
+                expected_generation=generation,
+            )
+            return self._preparation_result(
+                failed, outcome="failure", reason=str(failed.get("last_error") or "unknown_error"),
+                display_state="unknown", alert_pending=failed.get("alert_claimed_now") is True,
+            )
         finally:
             if preparation_owner_acquired:
                 owner_releaser = getattr(

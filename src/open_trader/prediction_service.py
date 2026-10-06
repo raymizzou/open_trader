@@ -1051,10 +1051,22 @@ def create_prediction_server(
                         raise RuntimeError("LP execution service is unavailable")
                     result = lp_cancel(payload)
                 elif path == lp_candidate_refresh_path:
-                    if set(payload) - {"manual_recovery"}:
+                    if set(payload) - {"manual_recovery", "recovery_scope", "expected_generation"}:
                         raise ValueError("prediction request fields are invalid")
                     if "manual_recovery" in payload and type(payload["manual_recovery"]) is not bool:
                         raise ValueError("manual_recovery must be a boolean")
+                    recovery_scope = payload.get("recovery_scope", "all")
+                    expected_generation = payload.get("expected_generation")
+                    if not isinstance(recovery_scope, str) or recovery_scope not in {"all", "global"}:
+                        raise ValueError("recovery_scope must be all or global")
+                    if {"recovery_scope", "expected_generation"} & set(payload) and payload.get("manual_recovery") is not True:
+                        raise ValueError("recovery scope requires manual_recovery")
+                    if recovery_scope == "global" and (
+                        type(expected_generation) is not int or expected_generation < 1
+                    ):
+                        raise ValueError("positive expected preparation generation required")
+                    if recovery_scope == "all" and "expected_generation" in payload:
+                        raise ValueError("expected generation requires global recovery scope")
                     if payload.get("manual_recovery") is True:
                         recover = getattr(runtime, "recover_lp_preparation", None)
                         if not callable(recover):
@@ -1063,7 +1075,10 @@ def create_prediction_server(
                                 {"error": "LP preparation recovery is unavailable"},
                             )
                             return
-                        result = recover()
+                        result = (
+                            recover() if recovery_scope == "all"
+                            else recover(scope="global", expected_generation=expected_generation)
+                        )
                         safe_result = _lp_projection_safe_value(result)
                         if not isinstance(safe_result, Mapping):
                             raise RuntimeError("LP preparation recovery result is invalid")
