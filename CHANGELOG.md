@@ -15,6 +15,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
   真实 adapter/SQLite、历史提交交错、原子性负向与 #257 两轮补位及新增六参数定向检查：
   串行/n2 各 504 passed，源码路径/hash 已核验；原 498 检查同样包含真实 adapter 用例并保留。
   同负载 profile/非 profile 性能分别保留；线上剩余争用、账户变旧与 N-leg 超时因果仍 UNKNOWN，未部署。
+  CI 日志断言修复：受控阻塞实际诊断 consumer，先证明真实发布锁与服务锁释放，再等待日志完成；
+  保留精确 61.000 秒、错误摘要与脱敏断言，生产非阻塞日志合同不变。
+  原断言受控 RED、缺失 warning 与持锁负向对照均失败；相关串行/n2 各 69 passed，
+  两种模式各固定三次受控延迟复验通过；旧 PR/push CI 失败完整保留，新 CI 尚待交付后验证。
 
 - #257 将重复保护撤单—补位回归纳入主线：真实适配器与隔离 SQLite 验证两次 5→3→5，
   完整账户 API 确认仅剩三笔后恢复目标，并校验每笔必要账户读取。
