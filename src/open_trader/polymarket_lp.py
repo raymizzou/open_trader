@@ -1098,6 +1098,9 @@ class PolymarketLPService:
                 if cid not in allowed_conditions or (row and not self._candidate_allowed(((cid, str(selected.get("token_id") or "")),))):
                     self._candidate_pool.pop(cid, None)
                     self._candidate_qualification_facts.pop(cid, None)
+                elif row and isinstance(row.get("directions"), Mapping):
+                    row["directions"] = {key: direction for key, direction in row["directions"].items()
+                        if self._candidate_allowed(((cid, str(direction.get("token_id") or "")),))}
                 if cid not in allowed_conditions:
                     self._candidate_rotation.pop(cid, None)
                 cached = self._candidate_qualification_facts.get(cid)
@@ -1138,33 +1141,9 @@ class PolymarketLPService:
                         row.clear()
                         row.update(replacements[0])
                     self._candidate_queue_state = None
-            inputs = self._prepared_inputs
-            if isinstance(inputs, Mapping) and (condition_id or prepared):
-                metadata = inputs["metadata"]
-                ids = (condition_id,) if condition_id else tuple(metadata)
-                allowed = set(self._candidate_conditions(ids))
-                filtered = None
-                for cid in ids:
-                    if cid not in allowed:
-                        if cid in metadata:
-                            if filtered is None:
-                                filtered = deepcopy(metadata)
-                            filtered.pop(cid, None)
-                        continue
-                    row = metadata.get(cid)
-                    if isinstance(row, Mapping) and isinstance(row.get("outcomes"), Mapping):
-                        outcomes = {key: value for key, value in row["outcomes"].items()
-                            if isinstance(value, Mapping) and self._candidate_allowed(((cid, str(value.get("token_id") or "")),))}
-                        if len(outcomes) != len(row["outcomes"]):
-                            if filtered is None:
-                                filtered = deepcopy(metadata)
-                            filtered[cid] = {**row, "outcomes": outcomes}
-                if filtered is not None:
-                    # Native scratch backup keeps values off the Python heap.
-                    # Publish a new generation; captured readers retain their old map.
-                    self._prepared_inputs = {**inputs, "metadata": filtered}
-                    self._prepared_inputs_version += 1
-                    self._candidate_queue_state = None
+            if condition_id:
+                # Rebuild derived directions lazily; raw prepared facts stay immutable.
+                self._candidate_queue_state = None
             evict = getattr(self.exchange, "evict_lp_candidate_metadata", None)
             if callable(evict) and (condition_id or prepared):
                 evict(condition_ids=(condition_id,) if condition_id else None, now=self._now())
@@ -3525,7 +3504,6 @@ class PolymarketLPService:
                                     exclusion_revision=preparation_exclusion_revision):
                                 preparation_exclusion_revision = self._candidate_exclusion_revision
                 allowed = set(self._candidate_conditions(tuple(metadata_value), now=now))
-                metadata_value = LPReadScratch((cid, row) for cid, row in metadata_value.items() if cid in allowed)
                 market_rows = LPReadRows(row for row in market_rows if str(row.get("condition_id") or "") in allowed)
                 catalog = {**catalog, "markets": market_rows}
             targets: list[tuple[str, str]] = []

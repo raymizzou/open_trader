@@ -35,6 +35,13 @@ operator-facing: what changed, which workflow is affected, and what was verified
   证据见 `docs/operations/issue-263-metadata-lifetime-validation.md`。未部署。
   2026-10-07 同步 main 的 #264/#262，保留双方 CHANGELOG；生产补丁不变，定向 120 项及恢复代次/历史发布联动 9 项通过。
 
+- #263 PR B 将普通候选资格排除与 prepared metadata 原始事实分开：保留持久固定冷却，
+  仅失效候选缓存并过滤展示/准入，不再逐条生成整份 SQLite metadata backup 或新准备版本。
+  原始事实与旧 reader 保持只读隔离；单方向排除保留另一方向，到期经原准备/扫描路径重新评估。
+  定向离线回归覆盖零复制、展示、自动候选与手动准入、并发排除、迟到结果、重启和停止/恢复边界；
+  5,000 行/20 次排除对照 backup 20→0，过滤后资格与持久排除完整 hash 相同。
+  保留真实 metadata 刷新发布和全局 recovery generation；未验证生产文件驻留、cgroup 或 704 MiB 容量。
+
 - #257 将重复保护撤单—补位回归纳入主线：真实适配器与隔离 SQLite 验证两次 5→3→5，
   完整账户 API 确认仅剩三笔后恢复目标，并校验每笔必要账户读取。
   覆盖账户超时、余额不足、无合格候选和并发新发布/旧读取迟到失效；保留拒绝新增及资源清理断言。

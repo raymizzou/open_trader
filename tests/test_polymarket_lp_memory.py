@@ -183,12 +183,19 @@ def test_prepared_reader_keeps_its_generation_without_retaining_objects(tmp_path
 
 
 @pytest.mark.parametrize("scope", ["market", "direction"])
-def test_prepared_reader_keeps_generation_when_current_metadata_is_excluded(tmp_path, scope):
+def test_prepared_reader_keeps_generation_when_current_metadata_is_excluded(tmp_path, monkeypatch, scope):
     class TwoDirectionExchange(MemoryExchange):
         def lp_market_metadata(self, *args, **kwargs):
             rows = super().lp_market_metadata(*args, **kwargs)
             for row in rows.values():
                 row["outcomes"]["no"] = {"label": "NO", "token_id": "opposite-token"}
+            return rows
+
+        def lp_order_books(self, tokens, **kwargs):
+            rows = super().lp_order_books(tokens, **kwargs)
+            for token, row in rows.items():
+                if token == "opposite-token":
+                    row["condition_id"] = "condition-M00"
             return rows
 
     exchange = TwoDirectionExchange(datetime(2026, 9, 20, 8, tzinfo=UTC), {"M00": Decimal("57.6")})
@@ -201,21 +208,41 @@ def test_prepared_reader_keeps_generation_when_current_metadata_is_excluded(tmp_
     key = next(iter(tokens))
     gc.collect()
     assert not Detail.live, "captured prepared reader retained detailed Python objects"
+    from open_trader.polymarket_lp_scratch import LPReadScratch
+    backups = []
+    backup = LPReadScratch.__deepcopy__
+    def counted_backup(scratch, memo):
+        backups.append(len(scratch))
+        return backup(scratch, memo)
+    monkeypatch.setattr(LPReadScratch, "__deepcopy__", counted_backup)
+    version = service._prepared_inputs_version
     assert service._exclude_candidate(condition, "" if scope == "market" else tokens[key],
         "market_not_accepting_orders" if scope == "market" else "history_amplitude_exceeded",
         checked_at=exchange.now)
+    assert backups == [], "ordinary qualification exclusion copied prepared metadata"
     current = service._prepared_input_snapshot()
-    assert set(captured["metadata"][condition]["outcomes"]) == set(tokens)
-    if scope == "market":
-        assert condition not in current["metadata"]
-    else:
-        assert key not in current["metadata"][condition]["outcomes"]
-        assert set(current["metadata"][condition]["outcomes"]) == set(tokens)-{key}
+    assert service._prepared_inputs_version == version
+    identities = tuple((condition, token) for token in tokens.values())
+    expected = () if scope == "market" else tuple(pair for pair in identities if pair[1] != tokens[key])
+    assert service._candidate_allowed(identities) == expected
     for reader in (captured, current):
+        assert set(reader["metadata"][condition]["outcomes"]) == set(tokens)
+        read = reader["metadata"][condition]
+        read["outcomes"].clear()
+        assert set(reader["metadata"][condition]["outcomes"]) == set(tokens)
         with pytest.raises(TypeError):
             reader["metadata"][condition] = {}
+    del read
     gc.collect()
     assert not Detail.live, "exclusion eviction retained detailed Python objects"
+    service.refresh_competition_cache()
+    snapshot = service.refresh_candidates()
+    assert [row["selected_direction"]["token_id"] for row in snapshot["candidates"]] == [pair[1] for pair in expected]
+    identity = {"market_id": "market-M00", "condition_id": condition, "token_id": tokens[key], "outcome": key.upper()}
+    assert service.preview_candidate(identity) == {"state": "rejected", "reason": "candidate_cooling_down"}
+    assert backups == []
+    gc.collect()
+    assert {row["condition"] for row in Detail.live} <= ({condition} if expected else set())
 
 
 def test_scratch_preserves_datetime_value_without_keeping_a_clock_class():

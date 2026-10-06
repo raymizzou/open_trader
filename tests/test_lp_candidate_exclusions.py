@@ -455,7 +455,8 @@ def test_candidate_preview_cannot_query_cooled_sides_or_continue_after_reward_re
     exchange.two_sides = True
     exchange.amplitudes['token-condition-m'] = '.55'
     exchange.lp_market_metadata_fresh = exchange.lp_market_metadata
-    service = PolymarketLPService(PredictionArbitrageStore(tmp_path), exchange,
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange,
         clock=lambda: exchange.now, exclusions_enabled=True)
     service.refresh_competition_cache()
     service.refresh_price_history()
@@ -471,6 +472,9 @@ def test_candidate_preview_cannot_query_cooled_sides_or_continue_after_reward_re
     reads = len(exchange.metadata_reads), len(exchange.book_token_reads)
     assert service.preview_candidate(other) == {'state': 'rejected', 'reason': 'reward_inactive'}
     assert (len(exchange.metadata_reads), len(exchange.book_token_reads)) == reads
+    assert service.start(preview_id=preview['preview_id'], idempotency_key='cooled-preview') == {
+        'state': 'rejected', 'reason': 'candidate_cooling_down'}
+    assert store.lp_active_sessions() == []
 
 
 @pytest.mark.parametrize('insert_first', [True, False])
@@ -648,3 +652,108 @@ def test_excluding_cached_queue_representative_keeps_opposite_and_drops_old_iden
     assert snapshot['candidates'][0]['selected_direction']['token_id'] == 'token-condition-m'
     assert snapshot['candidates'][0]['token_id'] == 'token-condition-m'
     assert exchange.book_token_reads[-1] == ('token-condition-m',)
+
+
+def test_preparation_rejection_keeps_raw_metadata_and_rechecks_at_deadline(tmp_path):
+    now = datetime(2026, 10, 5, tzinfo=UTC)
+    exchange = ExclusionExchange(now, {'m': Decimal(20)})
+    exchange.two_sides = True
+    exchange.not_accepting.add('condition-m')
+    service = PolymarketLPService(PredictionArbitrageStore(tmp_path), exchange,
+        clock=lambda: exchange.now, exclusions_enabled=True)
+    service.refresh_competition_cache()
+    assert service.refresh_price_history()['state'] == 'known'
+    captured = service._prepared_input_snapshot()
+    assert captured['metadata']['condition-m']['accepting_orders'] is False
+    assert set(captured['metadata']['condition-m']['outcomes']) == {'yes', 'no'}
+    assert service.refresh_candidates()['candidates'] == []
+    exchange.not_accepting.clear()
+    exchange.now = now + timedelta(seconds=299)
+    assert service.refresh_price_history()['state'] == 'known'
+    assert exchange.metadata_reads == ['condition-m']
+    assert service.candidate_snapshot()['candidates'] == []
+    exchange.now = now + timedelta(seconds=300)
+    assert service.refresh_price_history()['state'] == 'known'
+    assert exchange.metadata_reads == ['condition-m', 'condition-m']
+    assert captured['metadata']['condition-m']['accepting_orders'] is False
+    assert service._prepared_input_snapshot()['metadata']['condition-m']['accepting_orders'] is True
+    assert service.refresh_competition_cache()['state'] == 'known'
+    assert service.refresh_candidates()['candidates'][0]['condition_id'] == 'condition-m'
+    assert service.store.lp_market_exclusion_counts(now=exchange.now) == {}
+
+
+def test_direction_exclusion_filters_display_and_auto_pool_without_copy(tmp_path, monkeypatch):
+    from open_trader.prediction_arbitrage_execution import PredictionExecutionService
+    from open_trader.polymarket_lp_scratch import LPReadScratch
+    now = datetime(2026, 10, 5, tzinfo=UTC)
+    exchange = ExclusionExchange(now, {'m': Decimal(20)})
+    exchange.two_sides = True
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: exchange.now, exclusions_enabled=True)
+    service.refresh_competition_cache()
+    service.refresh_price_history()
+    row = service.refresh_candidates()['candidates'][0]
+    assert row['selected_direction']['token_id'] == 'no-condition-m'
+    assert set(row['directions']) == {'YES', 'NO'}
+    backups = []
+    backup = LPReadScratch.__deepcopy__
+    def counted_backup(scratch, memo):
+        backups.append(len(scratch))
+        return backup(scratch, memo)
+    monkeypatch.setattr(LPReadScratch, '__deepcopy__', counted_backup)
+    assert service._exclude_candidate('condition-m', 'token-condition-m', 'history_amplitude_exceeded', checked_at=now)
+    displayed = service.candidate_snapshot()['candidates'][0]
+    assert set(displayed['directions']) == {'NO'}
+    assert displayed['selected_direction']['token_id'] == 'no-condition-m'
+    execution = PredictionExecutionService(store=store, monitor=object(), trading=exchange,
+        notifier=object(), lock_path=tmp_path / "execution.lock", lp=service)
+    auto = execution._auto_pool
+    assert [row['token_id'] for row in auto.candidates()] == ['no-condition-m']
+    assert backups == []
+
+
+def test_concurrent_direction_exclusions_keep_raw_reader_and_fixed_deadlines(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from open_trader.polymarket_lp_scratch import LPReadScratch
+    now = datetime(2026, 10, 5, tzinfo=UTC)
+    exchange = ExclusionExchange(now, {'m': Decimal(20), 'other': Decimal(30)})
+    exchange.two_sides = True
+    service = PolymarketLPService(PredictionArbitrageStore(tmp_path), exchange,
+        clock=lambda: exchange.now, exclusions_enabled=True)
+    service.refresh_competition_cache()
+    service.refresh_price_history()
+    assert len(service.refresh_candidates()['candidates']) == 2
+    captured = service._prepared_input_snapshot()
+    version = service._prepared_inputs_version
+    backups = []
+    backup = LPReadScratch.__deepcopy__
+    def counted_backup(scratch, memo):
+        backups.append(len(scratch))
+        return backup(scratch, memo)
+    monkeypatch.setattr(LPReadScratch, '__deepcopy__', counted_backup)
+    ready = Barrier(2)
+    def exclude(token):
+        ready.wait(timeout=5)
+        return service._exclude_candidate('condition-m', token, 'history_amplitude_exceeded', checked_at=now)
+    tokens = ('token-condition-m', 'no-condition-m')
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = [executor.submit(exclude, token) for token in tokens]
+        assert all(result.result(timeout=5) for result in results)
+    assert backups == []
+    assert service._prepared_inputs_version == version
+    assert set(captured['metadata']['condition-m']['outcomes']) == {'yes', 'no'}
+    assert set(service._prepared_input_snapshot()['metadata']['condition-m']['outcomes']) == {'yes', 'no'}
+    assert [row['condition_id'] for row in service.candidate_snapshot()['candidates']] == ['condition-other']
+    exchange.now += timedelta(minutes=1)
+    for token in tokens:
+        assert not service._exclude_candidate('condition-m', token, 'history_amplitude_exceeded', checked_at=exchange.now)
+    restarted = PolymarketLPService(PredictionArbitrageStore(tmp_path), exchange,
+        clock=lambda: exchange.now, exclusions_enabled=True)
+    assert [row['condition_id'] for row in restarted.candidate_snapshot()['candidates']] == ['condition-other']
+    assert restarted.store.lp_candidate_allowed(tuple(('condition-m', token) for token in tokens),
+        now=now + timedelta(hours=1) - timedelta(microseconds=1)) == ()
+    exchange.now = now + timedelta(hours=1)
+    assert restarted.refresh_price_history()['state'] == 'known'
+    assert restarted.refresh_competition_cache()['state'] == 'known'
+    assert {row['condition_id'] for row in restarted.refresh_candidates()['candidates']} == {'condition-m', 'condition-other'}
