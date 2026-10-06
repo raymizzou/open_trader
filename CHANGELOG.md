@@ -3,6 +3,15 @@
 Every PR merged into GitHub `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-10-07
+
+- #270 后台核对不再把本进程尚未 POST 的自动 BUY 准备意图误改为 UNKNOWN，避免补位被自身发送前校验拒绝。
+  仅在同一事务确认 reserved、活动入场 lane 与精确 pending/preparing entry action 时保留原预留及名额；
+  同时检查 session 的 POST 标志，已发送、无本进程 lane、身份冲突和独立未决动作仍按原 UNKNOWN 规则处理。
+  真实 adapter/SQLite、受控 Event 验证签名及发送前账户读取期间两笔补位 3→5、重放防重、停止/配置栅栏与迟到回执；
+  旧逻辑两个重叠用例 RED，移除 session POST 检查的负向对照 RED；定向串行及双 worker 各 65 项通过。
+  未部署或操作真实交易；慢读取、线上目标数量及自然撤单后的持续恢复仍需独立运行验收。
+
 ## 2026-10-06
 
 - #264 历史批次成功提交后刷新筛选队列版本，已完成批次无需等待全目录结束即可重新筛选。

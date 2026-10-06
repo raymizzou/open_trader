@@ -1659,6 +1659,22 @@ class LPAutoPool:
                 self._event(d,i,'rejected',occurred_at=session.get('submit_receipt_at'))
                 return
             if not order_id:
+                actions=self.store.lp_actions(str(session['session_id']), connection=connection)
+                entry=next((a for a in actions if a['action_key']==self.lp._action_key(
+                    str(session['session_id']), 'entry-submit')), {})
+                # No venue ID is expected while this process still prepares
+                # the exact entry. The action can lag the session's POST marker.
+                if (i['state']=='reserved' and session['session_id']==i['session_id']
+                        and self.lp.entry_send_inflight(i['session_id'])
+                        and session.get('state')=='entry_submit_pending'
+                        and session.get('post_started') in (None, False)
+                        and session.get('submit_stage') in (None, 'preparing')
+                        and entry.get('state')=='pending' and entry.get('role')=='entry'
+                        and entry.get('side')=='BUY' and not entry.get('order_id')
+                        and entry.get('token_id')==session.get('token_id')==i['token_id']
+                        and entry.get('submit_stage')=='preparing' and entry.get('post_started') is False
+                        and not has_independent_unresolved_action(session, actions)):
+                    return
                 i.update(state='unknown',financial_status='unknown',reconcile_reason='missing_reliable_order_id')
                 self._mark_attention(i,'missing_reliable_order_id',session,now)
                 self._event(d,i,'unknown')
