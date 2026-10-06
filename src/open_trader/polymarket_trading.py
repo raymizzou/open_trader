@@ -11,6 +11,7 @@ import importlib.metadata
 import logging
 import math
 import os
+import sqlite3
 import pty
 import queue
 import re
@@ -585,6 +586,7 @@ def _safe_metadata_failure(
     facts: dict[str, object] = {
         "error_type": _safe_read_failure(stage, exc),
         "error_chain": _safe_read_error_chain(exc),
+        **_safe_sqlite_error_facts(exc),
     }
     if response_facts:
         facts.update(
@@ -630,6 +632,25 @@ def _safe_read_error_chain(exc: BaseException) -> tuple[str, ...]:
         name for error in _read_exception_chain(exc)
         if (name := type(error).__name__).replace("_", "").isalnum()
     ))
+
+
+def _safe_sqlite_error_facts(value: object) -> dict[str, object]:
+    """Keep SQLite result codes, never SQL, parameters, or exception text."""
+    if isinstance(value, BaseException):
+        value = next((error for error in _read_exception_chain(value)
+                      if isinstance(error, sqlite3.Error)), None)
+        code = getattr(value, "sqlite_errorcode", None)
+        name = getattr(value, "sqlite_errorname", None)
+    elif isinstance(value, Mapping):
+        code, name = value.get("sqlite_errorcode"), value.get("sqlite_errorname")
+    else:
+        return {}
+    facts: dict[str, object] = {}
+    if type(code) is int and 0 < code <= 65535:
+        facts["sqlite_errorcode"] = code
+    if isinstance(name, str) and name.startswith("SQLITE_") and type(code) is int and getattr(sqlite3, name, None) == code:
+        facts["sqlite_errorname"] = name
+    return facts
 
 
 def _null_order_response(exc: BaseException) -> bool:
@@ -935,6 +956,7 @@ def _safe_history_response_facts(exc: BaseException) -> dict[str, object]:
     facts: dict[str, object] = {
         "error_chain": _safe_read_error_chain(exc),
         "error_type": type(exc).__name__,
+        **_safe_sqlite_error_facts(exc),
     }
     status = getattr(exc, "code", None)
     if type(status) is not int:
@@ -3161,7 +3183,7 @@ class PolymarketTradingClient:
                     tuple(refresh_ids), public=public, stop_event=stop_event
                 )
             except Exception as exc:
-                reason = _safe_read_failure("market", exc)
+                reason = _safe_metadata_failure("market", exc)
                 failed_ids.update(
                     (condition_id, reason) for condition_id in refresh_ids
                 )
@@ -3397,7 +3419,7 @@ class PolymarketTradingClient:
 
         metadata_checked_at = datetime.now(UTC)
         event_facts: dict[str, Mapping[str, object] | None] = {}
-        event_failures: dict[str, str] = {}
+        event_failures: dict[str, str | Mapping[str, object]] = {}
         event_failures_lock = threading.Lock()
         rows: list[object] = []
         completed_market_ids: set[str] = set()
@@ -3488,7 +3510,9 @@ class PolymarketTradingClient:
             else:
                 direct_event_ids.append(event_id)
 
-        def mark_event_failure(event_ids: Sequence[object], reason: str) -> None:
+        def mark_event_failure(
+            event_ids: Sequence[object], reason: str | Mapping[str, object]
+        ) -> None:
             with event_failures_lock:
                 event_failures.update((str(value).strip(), reason) for value in event_ids)
 
@@ -3508,7 +3532,7 @@ class PolymarketTradingClient:
 
             def read_event_batch(
                 query: tuple[tuple[int, ...], bool],
-            ) -> tuple[tuple[object, ...], str | None]:
+            ) -> tuple[tuple[object, ...], str | Mapping[str, object] | None]:
                 batch, is_closed = query
                 if stop_event is not None and stop_event.is_set():
                     reason = "event_read_cancelled"
@@ -3541,7 +3565,7 @@ class PolymarketTradingClient:
                     mark_event_failure(batch, reason)
                     return (), reason
                 except Exception as exc:
-                    reason = _safe_read_failure("event", exc)
+                    reason = _safe_metadata_failure("event", exc)
                     mark_event_failure(batch, reason)
                     return (), reason
 
@@ -3584,7 +3608,7 @@ class PolymarketTradingClient:
 
         def read_direct_event(
             event_id: str,
-        ) -> tuple[str, Mapping[str, object] | None, str | None]:
+        ) -> tuple[str, Mapping[str, object] | None, str | Mapping[str, object] | None]:
             if stop_event is not None and stop_event.is_set():
                 return event_id, None, "event_read_cancelled"
             get_event = getattr(public, "get_event", None)
@@ -3593,7 +3617,7 @@ class PolymarketTradingClient:
             try:
                 event = _lp_event_facts(get_event(id=event_id))
             except Exception as exc:
-                return event_id, None, _safe_read_failure("event", exc)
+                return event_id, None, _safe_metadata_failure("event", exc)
             if event is None or str(event.get("id") or "") != event_id:
                 return event_id, None, None
             return event_id, event, None
@@ -4355,6 +4379,7 @@ class PolymarketTradingClient:
             unknown["reason"] = "reward_catalog_read_failed"
             unknown["error_type"] = type(exc).__name__
             unknown["error_chain"] = _safe_read_error_chain(exc)
+            unknown.update(_safe_sqlite_error_facts(exc))
             unknown.update(response_facts)
             return unknown
 
@@ -4462,6 +4487,8 @@ class PolymarketTradingClient:
                     "retry_after_seconds",
                     "retry_after_at",
                     "error_chain",
+                    "sqlite_errorcode",
+                    "sqlite_errorname",
                 ):
                     if isinstance(history, Mapping) and history.get(field) is not None:
                         result[field] = history[field]
@@ -4519,6 +4546,7 @@ class PolymarketTradingClient:
         except Exception as exc:
             result["error_type"] = _safe_read_failure("reward_probe", exc)
             result["error_chain"] = _safe_read_error_chain(exc)
+            result.update(_safe_sqlite_error_facts(exc))
         finally:
             if remove_response_hook is not None:
                 remove_response_hook()

@@ -3150,6 +3150,12 @@ class PredictionArbitrageStore:
         )
         with self._transaction() as connection:
             persisted = 0
+            singleton = connection.execute(
+                "SELECT payload FROM lp_preparation WHERE singleton=1"
+            ).fetchone()
+            global_fence = _load_payload(str(singleton["payload"])).get("global_recovery_generation") if singleton is not None else None
+            if type(global_fence) is int and expected_generation is not None and global_fence > expected_generation:
+                return 0
             for row in encoded:
                 if expected_generation is not None:
                     fence = connection.execute(
@@ -4140,6 +4146,12 @@ class PredictionArbitrageStore:
         retry_started_at: str | None = None
         with self._transaction() as connection:
             request_generation = max(1, int(generation))
+            singleton = connection.execute(
+                "SELECT payload FROM lp_preparation WHERE singleton=1"
+            ).fetchone()
+            global_fence = _load_payload(str(singleton["payload"])).get("global_recovery_generation") if singleton is not None else None
+            if type(global_fence) is int and global_fence > request_generation:
+                return None
             existing = connection.execute(
                 "SELECT * FROM lp_preparation_items WHERE condition_id=?",
                 (condition,),
@@ -4376,6 +4388,12 @@ class PredictionArbitrageStore:
             expected_generation = (
                 generation if type(generation) is int and generation >= 1 else None
             )
+            singleton = connection.execute(
+                "SELECT payload FROM lp_preparation WHERE singleton=1"
+            ).fetchone()
+            global_fence = _load_payload(str(singleton["payload"])).get("global_recovery_generation") if singleton is not None else None
+            if type(global_fence) is int and expected_generation is not None and global_fence > expected_generation:
+                return 0
             for condition_id in identities:
                 row = connection.execute(
                     "SELECT generation,state FROM lp_preparation_items WHERE condition_id=?",
@@ -4501,6 +4519,24 @@ class PredictionArbitrageStore:
                 if selected and payload.get("state") != "paused"
                 else "ready"
             )
+            if expected_generation is not None and identities == ():
+                payload["global_recovery_generation"] = new_generation
+                # The old error is unknown: retain its audit, re-arm only the
+                # global task, and let the normal reader prove recovery.
+                payload["recovery_history"] = [
+                    *payload.get("recovery_history", []),
+                    {
+                        **{key: payload.get(key) for key in (
+                            "state", "stage", "last_error", "last_error_chain",
+                            "last_error_status", "last_error_category",
+                            "last_sqlite_errorcode", "last_sqlite_errorname",
+                            "last_failure_at", "attempt", "failure_count",
+                        )},
+                        "generation": current_generation,
+                        "scope": "global",
+                        "recovered_at": _utc_now(),
+                    },
+                ]
             payload.update(
                 {
                     "state": recovered_state,
@@ -4512,6 +4548,10 @@ class PredictionArbitrageStore:
                     "alert_state": None,
                     "last_error": None,
                     "next_retry_at": None,
+                    "next_probe_at": None,
+                    "last_probe_at": None,
+                    "last_probe_state": None,
+                    "retry_after_seconds": None,
                     "fault_started_at": None,
                     "fault_alert_attempts": 0,
                     "fault_alert_state": None,

@@ -5,12 +5,13 @@ import fcntl
 import inspect
 import logging
 import os
+import sqlite3
 import sys
 import threading
 import time
 from collections.abc import Mapping
 from contextlib import ExitStack
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Callable, Literal
 
@@ -586,14 +587,19 @@ class PredictionRuntime:
     def n_leg_paused(self) -> bool:
         return self._n_leg_paused
 
-    def recover_lp_preparation(self) -> dict[str, object]:
+    def recover_lp_preparation(
+        self, *, scope: str = "all", expected_generation: int | None = None
+    ) -> dict[str, object]:
         """Explicitly re-arm a paused LP preparation task and wake its worker."""
 
         lp = self.lp
         recover = getattr(lp, "recover_preparation", None) if lp is not None else None
         if not callable(recover):
             return {"state": "unknown", "reason": "lp_unavailable"}
-        result = recover()
+        result = (
+            recover() if scope == "all" and expected_generation is None
+            else recover(scope=scope, expected_generation=expected_generation)
+        )
         self._history_wakeup_event.set()
         self._lp_candidate_refresh_requested.set()
         return result if isinstance(result, Mapping) else {"state": "unknown"}
@@ -1604,6 +1610,24 @@ class PredictionRuntime:
                                 stop_event=self._history_stop_event
                             )
                             business_refresh_completed = True
+                        except sqlite3.Error as exc:
+                            # BUSY can prevent even the failure snapshot from
+                            # being saved. Keep the existing worker paced until
+                            # SQLite is writable; do not report durable success.
+                            logger.warning(
+                                "prediction_lp_history_database_failed sqlite_errorcode=%s sqlite_errorname=%s",
+                                getattr(exc, "sqlite_errorcode", None),
+                                getattr(exc, "sqlite_errorname", None),
+                            )
+                            result = None
+                            if PolymarketLPService._automatic_recovery_error(exc):
+                                result = {
+                                    "preparation_outcome": "waiting_retry",
+                                    "preparation": {
+                                        "state": "waiting_retry",
+                                        "next_retry_at": self._history_clock() + timedelta(seconds=60),
+                                    },
+                                }
                         except Exception:
                             result = None
                             logger.exception("prediction_lp_history_refresh_failed")
