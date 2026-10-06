@@ -101,8 +101,10 @@ LP_METADATA_CACHE_TTL_SECONDS = 43200.0
 LP_METADATA_CACHE_JITTER_SECONDS = 0.0
 LP_METADATA_NEGATIVE_TTL_SECONDS = 3600.0
 LP_METADATA_MAX_REFRESH_IDS_PER_CALL = 1500
+# Keep Gamma condition-ID query URLs near 4 KiB under shared HTTP/2 reads.
+LP_METADATA_MARKET_BATCH_SIZE = 50
 # Each Gamma event can contain hundreds of full child markets. Bound SDK
-# parsing separately from the lightweight, 100-ID market metadata reads.
+# parsing separately from the lightweight market metadata reads.
 LP_METADATA_EVENT_BATCH_SIZE = 10
 LP_REWARD_ASSET_USD_ADDRESSES = frozenset(
     {
@@ -3421,8 +3423,8 @@ class PolymarketTradingClient:
             )
 
         market_batches = tuple(
-            requested[offset : offset + 100]
-            for offset in range(0, len(requested), 100)
+            requested[offset : offset + LP_METADATA_MARKET_BATCH_SIZE]
+            for offset in range(0, len(requested), LP_METADATA_MARKET_BATCH_SIZE)
         )
         response_facts_by_condition_ids = {
             frozenset(batch): {} for batch in market_batches

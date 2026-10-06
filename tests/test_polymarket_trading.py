@@ -4947,7 +4947,7 @@ def test_lp_metadata_preserves_event_evidence_and_market_links(
             requested_ids = tuple(condition_ids)
             with query_lock:
                 market_queries.append((requested_ids, page_size))
-            if len(requested_ids) > 100:
+            if len(requested_ids) > 50:
                 raise InvalidURL("URL component 'query' too long")
             assert page_size == 100
             return PagedRows(
@@ -5037,7 +5037,7 @@ def test_lp_metadata_preserves_event_evidence_and_market_links(
         "01001",
     }
     assert market_queries
-    assert all(0 < len(ids) <= 100 for ids, _page_size in market_queries)
+    assert all(0 < len(ids) <= 50 for ids, _page_size in market_queries)
     assert all(page_size == 100 for _ids, page_size in market_queries)
     queried_market_ids = [
         condition_id for ids, _page_size in market_queries for condition_id in ids
@@ -5450,6 +5450,61 @@ def _lp_market_page_response(request, rows, *, next_cursor=None):
     return httpx.Response(200, json=payload, request=request)
 
 
+@pytest.mark.parametrize("count", [49, 50, 51, 101])
+@pytest.mark.parametrize("closed", [False, True])
+def test_lp_metadata_limits_market_request_ids_and_preserves_pages(
+    count: int, closed: bool,
+) -> None:
+    condition_ids = tuple(f"0x{index:064x}" for index in range(count))
+    requests = []
+    lock = threading.Lock()
+
+    def handler(request):
+        assert request.method == "GET"
+        assert request.url.path == "/markets/keyset"
+        ids = tuple(request.url.params.get_list("condition_ids"))
+        cursor = request.url.params.get("after_cursor")
+        is_closed = request.url.params.get("closed") == "true"
+        with lock:
+            requests.append((ids, is_closed, cursor, len(str(request.url).encode())))
+        assert int(request.url.params["limit"]) == 100
+        if closed and not is_closed:
+            return _lp_market_page_response(request, ())
+        assert is_closed is closed
+        if cursor is None:
+            return _lp_market_page_response(
+                request, (_lp_market_payload(value) for value in ids[:-1]),
+                next_cursor="last",
+            )
+        assert cursor == "last"
+        return _lp_market_page_response(
+            request, (_lp_market_payload(ids[-1]),), next_cursor="unnecessary",
+        )
+
+    result = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET), client=object(),
+        public_client_factory=lambda: _lp_mock_public_client(handler),
+    ).lp_market_metadata_batch(condition_ids)
+
+    assert result["state"] == "known"
+    assert set(result["markets"]) == set(condition_ids)
+    assert result["failed_ids"] == {}
+    assert result["confirmed_absent_ids"] == result["deferred_ids"] == ()
+    assert all(0 < len(ids) <= 50 for ids, *_ in requests)
+    # 50 normal condition IDs produce a roughly 4 KiB URL, including a cursor.
+    assert all(url_bytes < 4300 for *_, url_bytes in requests)
+    for mode in ([False, True] if closed else [False]):
+        first_pages = [
+            ids for ids, value, cursor, _ in requests
+            if value == mode and cursor is None
+        ]
+        assert sorted(value for ids in first_pages for value in ids) == list(condition_ids)
+        assert sorted(map(len, first_pages)) == sorted(
+            [50] * (count // 50) + ([count % 50] if count % 50 else [])
+        )
+    assert sum(cursor == "last" for _, _, cursor, _ in requests) == (count + 49) // 50
+
+
 @pytest.mark.parametrize("guarded", [False, True])
 def test_lp_metadata_bounds_event_pages_and_releases_completed_sdk_trees(
     monkeypatch: pytest.MonkeyPatch, guarded: bool,
@@ -5700,7 +5755,7 @@ def test_lp_metadata_closed_fallback_preserves_known_and_only_caches_proven_abse
 def test_lp_metadata_continues_until_requested_ids_are_accounted() -> None:
     import httpx
 
-    condition_ids = tuple(f"0x{index:064x}" for index in range(100))
+    condition_ids = tuple(f"0x{index:064x}" for index in range(50))
     first_rows = tuple(
         _lp_market_payload(condition_id) for condition_id in condition_ids[:-2]
     ) + (
@@ -5764,7 +5819,7 @@ def test_lp_metadata_continues_until_requested_ids_are_accounted() -> None:
 def test_lp_metadata_stops_after_all_requested_ids() -> None:
     import httpx
 
-    condition_ids = tuple(f"0x{index:064x}" for index in range(100))
+    condition_ids = tuple(f"0x{index:064x}" for index in range(50))
     requests: list[str | None] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -5802,7 +5857,7 @@ def test_lp_metadata_stops_after_all_requested_ids() -> None:
 def test_lp_metadata_missing_id_continuation_failure_stays_unknown() -> None:
     import httpx
 
-    condition_ids = tuple(f"0x{index:064x}" for index in range(100))
+    condition_ids = tuple(f"0x{index:064x}" for index in range(50))
     first_rows = tuple(
         _lp_market_payload(condition_id) for condition_id in condition_ids[:-2]
     ) + (
@@ -5846,7 +5901,7 @@ def test_lp_metadata_error_response_diagnostics_are_bounded_and_redacted(
 ) -> None:
     import httpx
 
-    condition_ids = tuple(f"0x{index:064x}" for index in range(100))
+    condition_ids = tuple(f"0x{index:064x}" for index in range(50))
     first_rows = tuple(
         _lp_market_payload(condition_id) for condition_id in condition_ids[:-2]
     ) + (
@@ -5963,7 +6018,7 @@ def test_lp_metadata_error_response_diagnostics_are_bounded_and_redacted(
         diagnostic = diagnostic_messages[0]
         assert f"status={status_code}" in diagnostic
         assert f"page={'continuation' if continuation else 'first'}" in diagnostic
-        assert "requested_ids=100" in diagnostic
+        assert "requested_ids=50" in diagnostic
         assert "url_bytes=" in diagnostic
         assert "content_type=" in diagnostic
         assert "server=cloudflare" in diagnostic
@@ -6146,7 +6201,7 @@ def test_lp_metadata_shares_one_public_client_per_call(
     assert len(result) == 201
     assert len(probe.clients) == 1
     assert probe.clients[0].closed is True
-    assert len(probe.market_queries) == 3
+    assert len(probe.market_queries) == 5
 
 
 def test_lp_metadata_cache_hit_within_ttl(
@@ -6462,7 +6517,7 @@ def test_lp_metadata_batches_preserve_success_and_distinguish_absence_from_failu
     condition_ids = tuple(f"0x{index:064x}" for index in range(201))
     cached_id = condition_ids[0]
     absent_id = condition_ids[99]
-    failed_ids = condition_ids[101:]
+    failed_ids = condition_ids[101:151]
     failed_batch_id = condition_ids[101]
     read_at = datetime(2026, 9, 18, 12, 0, tzinfo=UTC)
     old_checked_at = read_at - timedelta(hours=1)
@@ -6609,8 +6664,8 @@ def test_lp_metadata_batches_preserve_success_and_distinguish_absence_from_failu
     assert capped["confirmed_absent_ids"] == ()
     assert capped["failed_ids"] == {}
     assert set(capped["markets"]) == set(cap_ids[:-1])
-    assert len(cap_queries) == 15
-    assert all(len(batch) <= 100 for batch in cap_queries)
+    assert len(cap_queries) == 30
+    assert all(len(batch) <= 50 for batch in cap_queries)
 
 
 def test_lp_metadata_cache_keeps_original_twelve_hour_expiry(
