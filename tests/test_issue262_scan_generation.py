@@ -12,7 +12,9 @@ from types import SimpleNamespace
 import pytest
 
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+from open_trader.polymarket_lp import PolymarketLPService
 from tests.test_lp_account_reservation_reconciliation import runtime, _refill_identity
+from tests.test_lp_candidate_exclusions import ExclusionExchange
 from tests.test_lp_auto_refill_contract import RefillPublic, prepare
 
 
@@ -209,3 +211,81 @@ def test_screening_snapshot_store_fences_stale_global_generation(tmp_path):
         }
     )
     assert saved["pool"]["fresh"]["condition_id"] == "fresh"
+
+
+@pytest.mark.parametrize("recover", [False, True])
+def test_maintenance_reward_rejection_respects_global_recovery_cutoff(
+    tmp_path, recover
+):
+    from datetime import UTC, datetime
+
+    now = datetime(2026, 10, 6, tzinfo=UTC)
+    exchange = ExclusionExchange(now, {"m": Decimal("20")})
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(
+        store,
+        exchange,
+        clock=lambda: exchange.now,
+        exclusions_enabled=True,
+    )
+    service.refresh_competition_cache()
+    assert service.refresh_price_history()["state"] == "known"
+    assert service.refresh_candidates()["candidates"]
+    assert len(service._candidate_pool) == len(service._candidate_qualification_facts) == 1
+
+    exchange.inactive.add("condition-m")
+    exchange.now += timedelta(seconds=61)
+    entered, release = threading.Event(), threading.Event()
+    read_rewards = exchange.lp_reward_catalog
+
+    def delayed_rewards(**kwargs):
+        entered.set()
+        assert release.wait(5), "Independent maintenance reward watchdog"
+        return read_rewards(**kwargs)
+
+    if recover:
+        exchange.lp_reward_catalog = delayed_rewards
+        results, errors = [], []
+
+        def maintain():
+            try:
+                results.append(service.refresh_candidate_recommendations())
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=maintain)
+        worker.start()
+        try:
+            assert entered.wait(5), "Maintenance did not reach reward read"
+            paused = {
+                **service.preparation_snapshot(),
+                "state": "paused",
+                "paused": True,
+                "last_error": "OperationalError",
+            }
+            store.lp_save_preparation(paused)
+            recovered = service.recover_preparation(
+                scope="global", expected_generation=paused["generation"]
+            )
+            assert recovered["generation"] == paused["generation"] + 1
+            release.set()
+            worker.join(5)
+            assert not worker.is_alive() and not errors, errors
+            assert len(service._candidate_pool) == 1
+            assert len(service._candidate_qualification_facts) == 1
+            assert store.lp_market_exclusion_counts(now=exchange.now) == {}
+            exchange.inactive.clear()
+            assert service.refresh_price_history()["preparation_outcome"] == "success"
+            assert service.refresh_candidates()["candidates"]
+        finally:
+            release.set()
+            worker.join(5)
+            assert not worker.is_alive(), "Maintenance cleanup watchdog"
+    else:
+        result = service.refresh_candidate_recommendations()
+        assert result["candidates"] == []
+        assert store.lp_market_exclusion_counts(now=exchange.now) == {
+            "reward_inactive": 1
+        }
+        assert not service._candidate_pool
+        assert not service._candidate_qualification_facts

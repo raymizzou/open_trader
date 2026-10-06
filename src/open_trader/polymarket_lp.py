@@ -6705,7 +6705,8 @@ class PolymarketLPService:
                     reason = self._candidate_market_rejection(reward, market, now=self._now())
                     if reason:
                         if self._exclude_candidate(cid, "", reason, checked_at=now, market=market,
-                                exclusion_revision=exclusion_revision):
+                                exclusion_revision=exclusion_revision,
+                                global_recovery_generation=global_recovery_generation):
                             exclusion_revision = self._candidate_exclusion_revision
                 refresh_conditions = self._candidate_conditions(refresh_conditions)
 
