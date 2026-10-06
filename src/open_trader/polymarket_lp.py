@@ -69,6 +69,7 @@ from .polymarket_trading import (
     _lp_flush_read_logs,
     _lp_read_lock,
     _lp_market_read_diagnostic,
+    _lp_causal_event,
     _lp_trade,
     _safe_read_error_chain,
     _safe_sqlite_error_facts,
@@ -896,6 +897,7 @@ class PolymarketLPService:
         self._candidate_pool_last_saved_at: datetime | None = None
         self._prepared_inputs: dict[str, object] | None = None
         self._prepared_inputs_version = 0
+        self._candidate_history_version = 0
         self._candidate_snapshot: dict[str, object] = {
             "state": "unknown",
             "complete": False,
@@ -3841,7 +3843,10 @@ class PolymarketLPService:
                 if not rows:
                     return
                 if callable(batch_writer):
-                    batch_writer(rows, generation=generation)
+                    written = batch_writer(rows, generation=generation)
+                    if written:
+                        with self._candidate_state_lock:
+                            self._candidate_history_version += 1
                     if self.exclusions_enabled:
                         for row in rows:
                             if self._lp_history_fact(row["condition_id"], row["token_id"], now=self._now())[1] == "history_amplitude_exceeded":
@@ -3857,6 +3862,8 @@ class PolymarketLPService:
                             row["samples"],
                             row["summary"],
                         )
+                    with self._candidate_state_lock:
+                        self._candidate_history_version += 1
 
             updated_count = 0
             unknown_count = 0
@@ -4809,10 +4816,12 @@ class PolymarketLPService:
         )
         with self._candidate_state_lock:
             version = self._prepared_inputs_version
+            history_version = self._candidate_history_version
             cached = self._candidate_queue_state
         if (
             cached is not None
             and cached.get("version") == version
+            and cached.get("history_version") == history_version
             and cached.get("reservation_signature") == reservation_signature
         ):
             return cached
@@ -5085,6 +5094,7 @@ class PolymarketLPService:
         queue_funnel = _pool_published_value(queue_funnel)
         state = {
             "version": version,
+            "history_version": history_version,
             "reservation_signature": reservation_signature,
             "queue_normal": queue_normal,
             "queue_backup": queue_backup,
@@ -5117,12 +5127,15 @@ class PolymarketLPService:
             "built_at": checked_at,
         }
         with self._candidate_state_lock:
+            if version != self._prepared_inputs_version:
+                return None
             if self.exclusions_enabled and build_revision != self._candidate_exclusion_revision:
                 return None
             current = self._candidate_queue_state
             if (
                 current is None
                 or current.get("version") != version
+                or current.get("history_version") != history_version
                 or current.get("reservation_signature")
                 != reservation_signature
             ):
@@ -8860,10 +8873,12 @@ class PolymarketLPService:
             token_results = []
             created = joined = 0
             prepare_seconds = monotonic() - prepared_at
+            _lp_causal_event("account_publish_ready", account=snapshot, prepare_seconds=prepare_seconds)
             lock_started = monotonic()
             with _lp_read_lock(self._first_seen_apply_lock, "account_registration_apply_lock_wait"):
                 diagnostics["apply_lock_wait_seconds"] = round(monotonic() - lock_started, 3)
                 with self.store._transaction(prepare_seconds=prepare_seconds, diagnostics=diagnostics) as connection:
+                    _lp_causal_event("account_publish_begin", account=snapshot, prepare_seconds=prepare_seconds)
                     observed = connection.execute(
                         "SELECT generation FROM lp_trade_generation WHERE singleton=1"
                     ).fetchone()
@@ -8872,10 +8887,12 @@ class PolymarketLPService:
                     if revisions(connection) != expected_revisions:
                         raise LpObservationWait("account_round_invalid")
                     _freshness(read_ended, self._now(), "account_freshness")
+                    session_cache = {}
                     for token, token_rows, candidate in prepared:
                         result = self.store.lp_register_exchange_orders(
                             account_id, token, token_rows, session=candidate,
                             expected_generation=generation, connection=connection, diagnostics=diagnostics,
+                            _session_cache=session_cache,
                         )
                         state = "created" if result["created"] else "joined"
                         created += int(result["created"])
@@ -8902,6 +8919,7 @@ class PolymarketLPService:
     ) -> dict[str, object]:
         """Publish the latest completed account-registration outcome."""
 
+        _lp_causal_event("account_publish_wait", account=snapshot)
         with self._first_seen_apply_lock:
             self._account_registration_attempt += 1
             attempt = self._account_registration_attempt
@@ -8910,8 +8928,10 @@ class PolymarketLPService:
             with _lp_read_task("account_registration"), _lp_read_stage("account_registration"):
                 result = self._register_account_snapshot(snapshot)
         except LpAccountRoundInvalid:
+            _lp_causal_event("account_publish_end", account=snapshot, outcome="skipped")
             raise
         except Exception:
+            _lp_causal_event("account_publish_end", account=snapshot, outcome="failed")
             with self._first_seen_apply_lock:
                 if self._account_registration_attempt == attempt:
                     self._account_order_sync_error = "account_order_sync_unknown"
@@ -8933,6 +8953,7 @@ class PolymarketLPService:
                     self._account_order_sync_error = None
                 else:
                     self._account_order_sync_error = "account_order_sync_unknown"
+        _lp_causal_event("account_publish_end", account=snapshot, outcome=result.get("state"))
         return result
 
     def _create_sync_session(
@@ -10931,7 +10952,14 @@ class PolymarketLPService:
             if str(exc) != "session_changed":
                 raise
 
-    def reconcile_facts(
+    def reconcile_facts(self, session_id, *, apply_lock=None, report_only=False,
+                        verify_recovery=False, monitor=False, account_round=None):
+        with _lp_read_task("session_facts"):
+            return self._reconcile_facts(session_id, apply_lock=apply_lock,
+                report_only=report_only, verify_recovery=verify_recovery,
+                monitor=monitor, account_round=account_round)
+
+    def _reconcile_facts(
         self,
         session_id,
         *,
