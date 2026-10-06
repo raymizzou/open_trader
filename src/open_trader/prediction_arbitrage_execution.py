@@ -9,6 +9,7 @@ import importlib.metadata
 import logging
 import re
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -36,6 +37,8 @@ from .polymarket_trading import (
     ThresholdHedgeSubmission,
     ThresholdLegResult,
     _submit_error_detail,
+    _lp_causal_event,
+    _lp_read_local,
 )
 from .polymarket_lp_risk import (
     TERMINAL_ORDER_STATES,
@@ -153,6 +156,7 @@ TERMINAL_STATES = {
     "merge_incident",
 }
 _PROCESS_LOCK = threading.Lock()
+_PROCESS_LOCK_OWNER = None
 ExecutionIntent = PairIntent | ThresholdHedgeIntent | CrossVenueIntent
 
 
@@ -11542,7 +11546,12 @@ class PredictionExecutionService:
         return not self._breaker_is_open()
 
     def _acquire_global_lock_once(self) -> tuple[threading.Lock, Any] | None:
+        global _PROCESS_LOCK_OWNER
+        observed_owner = _PROCESS_LOCK_OWNER
         if not self._process_lock.acquire(False):
+            # A handoff during the failed attempt cannot identify its holder.
+            owner = observed_owner if observed_owner is _PROCESS_LOCK_OWNER else None
+            _lp_causal_event("execution_lock_busy", owner=owner, outcome="process_busy")
             return None
         try:
             self._lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -11552,7 +11561,15 @@ class PredictionExecutionService:
             except (BlockingIOError, OSError):
                 handle.close()
                 self._process_lock.release()
+                _lp_causal_event("execution_lock_busy", outcome="file_busy")
                 return None
+            try:
+                _PROCESS_LOCK_OWNER = dict(id=uuid.uuid4().hex, thread=threading.get_ident(),
+                    started=time.monotonic(), entry=sys._getframe(2).f_code.co_name,
+                    task=getattr(_lp_read_local, "task", None))
+                _lp_causal_event("execution_lock_acquired", owner=_PROCESS_LOCK_OWNER)
+            except Exception:
+                _PROCESS_LOCK_OWNER = None  # Missing evidence cannot reject an acquired lock.
             return self._process_lock, handle
         except Exception:
             self._process_lock.release()
@@ -11575,12 +11592,16 @@ class PredictionExecutionService:
 
     @staticmethod
     def _release_global_lock(lock: tuple[threading.Lock, Any]) -> None:
+        global _PROCESS_LOCK_OWNER
         process_lock, handle = lock
+        owner = _PROCESS_LOCK_OWNER
+        _PROCESS_LOCK_OWNER = None
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         finally:
             handle.close()
             process_lock.release()
+            _lp_causal_event("execution_lock_released", owner=owner)
 
 
 __all__ = ["PredictionExecutionService"]

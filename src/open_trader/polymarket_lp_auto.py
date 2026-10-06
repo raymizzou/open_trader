@@ -32,6 +32,8 @@ from .polymarket_lp_notification_batches import (
     ChannelDeliveryResult, matching_batch_channels, plan_notification_batches,
 )
 
+from .polymarket_trading import _lp_causal_event, _lp_read_task
+
 ZERO = Decimal('0')
 
 # Fixed codes only; arbitrary external reasons never enter round diagnostics.
@@ -2061,7 +2063,9 @@ class LPAutoPool:
         state = self.state()
         if state['slots']['occupied'] >= state['target_buy_count']:
             raise ValueError('target_filled')
-        snapshot=self.lp._read_candidate_snapshot(row,now=self._now(),account=self._current_account)
+        account = self._current_account
+        _lp_causal_event("auto_presend_account_use", account=account, used_at=self._now())
+        snapshot=self.lp._read_candidate_snapshot(row,now=self._now(),account=account)
         lock=self.execution._acquire_global_lock()
         if lock is None:
             raise ValueError('execution_lock')
@@ -2117,8 +2121,10 @@ class LPAutoPool:
                 if self._refresh_account_facts() is False:
                     account_read_failure = self._account_refresh_failure_reason()
                     raise ValueError(account_read_failure)
+                account = self._current_account
+                _lp_causal_event("auto_send_account_use", account=account, used_at=self._now())
                 latest = self.lp._read_candidate_snapshot(request, now=self._now(), ignore_session_id=session_id,
-                    account=self._current_account)
+                    account=account)
                 self._check_candidate_rank(row, latest, peers)
                 eligible = self.lp._fresh_candidate_row(request, latest, now=self._now())
                 if any(_decimal(eligible[k]) != request[k] for k in ('price','quantity')):
@@ -2176,7 +2182,7 @@ class LPAutoPool:
             return self._reconcile_unknown() if locked else {**self.state(),'round_reason':'round_in_progress'}
 
     def run_once(self, *, round_id=None, reuse_facts=False):
-        with self._round_barrier() as locked:
+        with _lp_read_task("auto_round"), self._round_barrier() as locked:
             if not locked:
                 return {**self.state(),'round_reason':'round_in_progress'}
             return self._run_once(round_id=round_id, reuse_facts=reuse_facts)
@@ -2190,6 +2196,7 @@ class LPAutoPool:
             self._reconcile_unknown(reuse=reuse_facts, bounded=True)
         rotation_reason = self._settle_rotations()
         d=self._read()
+        _lp_causal_event("auto_account_use", account=d.get("account_financial_facts"), used_at=self._now())
         round_id=round_id or uuid.uuid4().hex
         if not isinstance(round_id,str) or not round_id or len(round_id)>128:
             raise ValueError('round_id_invalid')

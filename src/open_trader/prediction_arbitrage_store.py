@@ -5290,6 +5290,7 @@ class PredictionArbitrageStore:
         connection: sqlite3.Connection | None = None,
         expected_generation: int | None = None,
         diagnostics: dict | None = None,
+        _session_cache: dict | None = None,
     ) -> dict[str, object]:
         """Atomically adopt exchange IDs into their canonical LP owners.
 
@@ -5301,6 +5302,8 @@ class PredictionArbitrageStore:
         """
 
         prepared_at = monotonic()
+        if _session_cache is not None and (connection is None or expected_generation is None):
+            raise ValueError("registration_cache_requires_fenced_transaction")
         diagnostics = {} if diagnostics is None else diagnostics
         by_id: dict[str, dict[str, object]] = {}
         for raw in (orders if isinstance(orders, (list, tuple)) else []):
@@ -5333,14 +5336,21 @@ class PredictionArbitrageStore:
                 if generation is None or int(generation["generation"]) != int(expected_generation):
                     raise LpObservationWait("account_round_invalid")
 
-            loaded = [
-                (row, _load_payload(str(row["payload"])))
-                for row in tx.execute(
-                    "SELECT * FROM lp_sessions ORDER BY updated_at,session_id"
-                ).fetchall()
-            ]
-            diagnostics["session_scan_calls"] = diagnostics.get("session_scan_calls", 0) + 1
-            diagnostics["session_rows_scanned"] = diagnostics.get("session_rows_scanned", 0) + len(loaded)
+            # The account caller owns this cache only for its single write
+            # transaction. Refresh changed rows below before the next token.
+            if not _session_cache:
+                loaded = [
+                    (row, _load_payload(str(row["payload"])))
+                    for row in tx.execute(
+                        "SELECT * FROM lp_sessions ORDER BY updated_at,session_id"
+                    ).fetchall()
+                ]
+                diagnostics["session_scan_calls"] = diagnostics.get("session_scan_calls", 0) + 1
+                diagnostics["session_rows_scanned"] = diagnostics.get("session_rows_scanned", 0) + len(loaded)
+                if _session_cache is not None:
+                    _session_cache.update((str(row["session_id"]), (row, payload)) for row, payload in loaded)
+            else:
+                loaded = list(_session_cache.values())
             explicit_owners: dict[tuple[str, str], tuple[sqlite3.Row, dict[str, object]]] = {}
             legacy_owners: dict[str, tuple[sqlite3.Row, dict[str, object]]] = {}
             for row, payload in loaded:
@@ -5502,6 +5512,8 @@ class PredictionArbitrageStore:
                 ).fetchone()
                 assert refreshed is not None
                 updated.append(self._lp_row_result(refreshed))
+                if _session_cache is not None:
+                    _session_cache[session_id] = (refreshed, _load_payload(str(refreshed["payload"])))
 
             episode_id = str((session or {}).get("_first_seen_episode_id") or "")
             episode_target_id = active_id or next(iter(routed), None)
@@ -5549,6 +5561,8 @@ class PredictionArbitrageStore:
                             if item.get("session_id") != episode_target_id
                         ]
                         updated.append(self._lp_row_result(refreshed))
+                        if _session_cache is not None:
+                            _session_cache[episode_target_id] = (refreshed, _load_payload(str(refreshed["payload"])))
                         changed_any = True
                     converted = tx.execute(
                         "UPDATE lp_first_seen_episodes "
@@ -5629,6 +5643,8 @@ class PredictionArbitrageStore:
                 ).fetchone()
                 assert result is not None
                 created_session = self._lp_row_result(result)
+                if _session_cache is not None:
+                    _session_cache[session_id] = (result, _load_payload(str(result["payload"])))
 
             primary = created_session
             if primary is None and not unknown and first_owner_id is not None:
@@ -6627,6 +6643,7 @@ class PredictionArbitrageStore:
             if type(expected) is not int or generation != expected:
                 raise LpObservationWait("account_round_invalid")
             row = tx.execute("SELECT payload FROM lp_auto_pool WHERE singleton=1").fetchone()
+            pool_exists = row is not None
             document = (_load_payload(str(row["payload"])) if row else
                 default_account_pool_document(self.path, pool_account, checked))
             if document.get("account_id") != pool_account:
@@ -6841,9 +6858,21 @@ class PredictionArbitrageStore:
                 value["realized_pnl_usd"] = str(lifetime_pnl - baseline)
                 value["realized_pnl_basis"] = "account_allocation_boundary"
             document["account_financial_facts"] = value
-            tx.execute("INSERT INTO lp_auto_pool(singleton,payload) VALUES(1,?) "
-                "ON CONFLICT(singleton) DO UPDATE SET payload=excluded.payload",
-                (_dump_execution_payload(document),))
+            if pool_exists:
+                # Existing audit/history is already persisted JSON. Sanitize
+                # only changed accounting fields, preserving every other key.
+                fields = ("account_financial_facts", "account_confirmed_fill_facts",
+                          "intents", "account_realized_pnl_baseline_usd")
+                changes = [("$." + key, _dump_execution_payload({key: document[key]}))
+                           for key in fields if key in document]
+                tx.execute(
+                    "UPDATE lp_auto_pool SET payload=json_set(payload," +
+                    ",".join("?,json_extract(?,?)" for _ in changes) + ") WHERE singleton=1",
+                    tuple(item for path, encoded in changes for item in (path, encoded, path)),
+                )
+            else:
+                tx.execute("INSERT INTO lp_auto_pool(singleton,payload) VALUES(1,?)",
+                           (_dump_execution_payload(document),))
             return value
 
     def lp_publish_facts(self, session_id, revision, *, patch=None, state=None,

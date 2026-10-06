@@ -14916,6 +14916,9 @@ def test_healthy_snapshot_diagnostics_remain_quiet(tmp_path, caplog):
 
 def test_slow_publication_diagnostics_release_locks(tmp_path, monkeypatch, caplog):
     from open_trader import polymarket_trading
+    from tests.test_lp_read_diagnostics import wait_read_logs
+
+    wait_read_logs()
 
     now = datetime.now(UTC)
     store = PredictionArbitrageStore(tmp_path)
@@ -14932,23 +14935,42 @@ def test_slow_publication_diagnostics_release_locks(tmp_path, monkeypatch, caplo
         return publish(*args, **kwargs)
     monkeypatch.setattr(store, 'lp_publish_facts', delayed_publish)
 
-    result = service.reconcile_facts('session-secret', report_only=True)
-    assert result[3] is None
-    assert 'lp_read_slow stage=facts_report_publish elapsed_seconds=61.000' in caplog.text
-    assert 'error_types=none' not in caplog.text
-    assert 'outcome=slow' in caplog.text
-    assert 'secret' not in caplog.text
-    assert service._facts_apply_lock.acquire(blocking=False)
-    service._facts_apply_lock.release()
-    acquired = []
-    def acquire_from_other_thread():
-        acquired.append(service._mutex.acquire(blocking=False))
-        if acquired[-1]:
-            service._mutex.release()
-    worker = threading.Thread(target=acquire_from_other_thread)
-    worker.start()
-    worker.join(timeout=2)
-    assert acquired == [True]
+    logging_started, logging_release = threading.Event(), threading.Event()
+    warning = polymarket_trading.logger.warning
+    def gated_warning(message, *args, **kwargs):
+        if message.startswith('lp_read_slow') and args[0] == 'facts_report_publish':
+            logging_started.set()
+            assert logging_release.wait(5), 'independent diagnostic consumer watchdog'
+        return warning(message, *args, **kwargs)
+    monkeypatch.setattr(polymarket_trading.logger, 'warning', gated_warning)
+
+    try:
+        result = service.reconcile_facts('session-secret', report_only=True)
+        assert result[3] is None
+        assert logging_started.wait(2), 'independent diagnostic arrival watchdog'
+        assert service._facts_apply_lock.acquire(blocking=False)
+        service._facts_apply_lock.release()
+        acquired = []
+        def acquire_from_other_thread():
+            acquired.append(service._mutex.acquire(blocking=False))
+            if acquired[-1]:
+                service._mutex.release()
+        worker = threading.Thread(target=acquire_from_other_thread)
+        worker.start()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert acquired == [True]
+        # Prove both real locks are free while the diagnostic sink is gated.
+        logging_release.set()
+        wait_read_logs()
+        assert 'lp_read_slow stage=facts_report_publish elapsed_seconds=61.000' in caplog.text
+        assert 'error_types=none' not in caplog.text
+        assert 'outcome=slow' in caplog.text
+        assert 'secret' not in caplog.text
+
+    finally:
+        logging_release.set()
+        wait_read_logs()
 
 
 @pytest.mark.parametrize('wrapped', [False, True])

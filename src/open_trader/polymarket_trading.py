@@ -722,6 +722,49 @@ def _lp_capture_read_log(emit, deferred=None):
         pass
 
 
+def _lp_causal_event(event, *, account=None, owner=None, outcome=None, used_at=None, **counts):
+    """Snapshot causal facts into Queue32; never format or call a sink here.
+
+    Timestamps join the same API read across caches/publication/automatic use.
+    Owner evidence is process-local; an external flock holder stays unknown.
+    """
+    try:
+        task = getattr(_lp_read_local, "task", None) or {}
+        facts = dict(at=datetime.now(UTC).isoformat(), monotonic=time.monotonic(),
+                     thread=threading.get_ident(), task_id=task.get("task_id"),
+                     entry=task.get("entry"), stage=task.get("stage"))
+        for key in ("read_started_at", "read_ended_at", "checked_at"):
+            stamp = (account or {}).get(key)
+            if isinstance(stamp, str):
+                try:
+                    stamp = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+                except ValueError:
+                    stamp = None
+            if isinstance(stamp, datetime) and stamp.tzinfo is not None:
+                facts[key] = stamp.astimezone(UTC).isoformat()
+        generation = (account or {}).get("trade_generation")
+        if type(generation) is int:
+            facts["trade_generation"] = generation
+        if isinstance(used_at, datetime) and used_at.tzinfo is not None:
+            facts["used_at"] = used_at.astimezone(UTC).isoformat()
+        if outcome in {"complete", "failed", "registered", "skipped", "process_busy", "file_busy"}:
+            facts["outcome"] = outcome
+        if owner:
+            owner_task = owner.get("task") or {}
+            facts.update(owner_scope="process_local", owner_id=owner["id"],
+                         owner_thread=owner["thread"], owner_started=owner["started"],
+                         owner_entry=owner["entry"], owner_task_id=owner_task.get("task_id"),
+                         owner_stage=owner_task.get("stage"))
+        else:
+            facts["owner_scope"] = "unknown"
+        facts.update({key: value for key, value in counts.items()
+                      if key in {"prepare_seconds", "begin_wait_seconds", "body_seconds", "commit_seconds"}
+                      and type(value) in {int, float} and math.isfinite(value) and value >= 0})
+        _lp_capture_read_log(lambda: logger.info("lp_causal_event event=%s facts=%s", event, facts))
+    except Exception:
+        pass
+
+
 def _lp_read_count(**counts):
     """Only numeric aggregates; never retain business identifiers."""
     try:
@@ -863,10 +906,13 @@ def _lp_read_stage(stage: str, timings: dict[str, float] | None = None, *, defer
     distinguishes those failures. Thread identity links nested stage timings.
     """
     started = time.monotonic()
+    causal = stage in {"account_shared_lock_wait", "account_lock_wait", "account_future_wait", "facts_apply_wait", "facts_mutex_wait", "facts_publish", "facts_report_publish", "facts_failure_publish"}
     task = getattr(_lp_read_local, "task", None)
     previous_stage = task.get("stage") if task is not None else None
     if task is not None:
         task["stage"] = stage
+    if causal:
+        _lp_causal_event(stage + "_begin")
     if stage in {"account_balance", "account_orders", "account_trades", "account_positions", "market", "book", "market_rewards", "required_order"}:
         _lp_read_count(logical_reads=1)
     error_types = ()
@@ -912,6 +958,8 @@ def _lp_read_stage(stage: str, timings: dict[str, float] | None = None, *, defer
             pass
         raise
     finally:
+        if causal:
+            _lp_causal_event(stage + "_end", outcome="failed" if error_types else "complete")
         try:
             elapsed = time.monotonic() - started
             if task is not None:
@@ -2493,6 +2541,8 @@ class PolymarketTradingClient:
         response_facts: dict[str, object] = {}
         remove_hooks = []
         read_started_at = datetime.now(UTC)
+        read_ended_at = None
+        _lp_causal_event("account_read_begin", account={"read_started_at": read_started_at})
         try:
             for transport_name, path in (
                 ("secure_clob", "/balance-allowance"),
@@ -2532,6 +2582,7 @@ class PolymarketTradingClient:
                     raise ValueError("positions_unknown")
                 positions = tuple(_collect(raw_positions))
                 _lp_read_count(records=len(positions))
+            read_ended_at = datetime.now(UTC)
             return (
                 p_usd_balance,
                 p_usd_allowance,
@@ -2541,7 +2592,7 @@ class PolymarketTradingClient:
                 trades,
                 True,
                 read_started_at,
-                datetime.now(UTC),
+                read_ended_at,
             )
         except Exception as exc:
             code = _safe_error_code(exc)
@@ -2549,6 +2600,9 @@ class PolymarketTradingClient:
                 code, response_facts={**_safe_history_response_facts(exc), **response_facts}
             ) from None
         finally:
+            _lp_causal_event("account_read_end", account={"read_started_at": read_started_at,
+                "read_ended_at": read_ended_at or datetime.now(UTC)},
+                outcome="complete" if read_ended_at is not None else "failed")
             for remove in reversed(remove_hooks):
                 try:
                     remove()
