@@ -10,10 +10,11 @@ serial job and are required by the aggregate.
 
 The stable aggregate appears as **CI / required** in the UI (workflow `CI`, job
 `required`), but its exact API check-run/context name is **`required`**, emitted
-by **GitHub Actions**, app ID **15368**. A future required-check rule must bind
+by **GitHub Actions**, app ID **15368**. The active main ruleset binds
 that exact name and source, not the display string or an arbitrary same-named
-status. No repository settings are changed by this workflow. The
-[repository protection design](repository-protection.md) is proposed, not active.
+status. No repository settings are changed by this workflow. See the dated
+[repository protection record](repository-protection.md) for settings evidence
+and verification limits.
 
 ## Identity and coverage
 

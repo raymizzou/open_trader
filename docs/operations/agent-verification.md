@@ -239,8 +239,9 @@ successful main-push CI for the selected final SHA, retained in main history.
 A later tip does not erase that evidence; changing the selected release SHA does.
 It is not a PR merge gate, and merging alone never deploys or starts a preflight.
 
-Branch/tag settings in [repository-protection.md](repository-protection.md)
-are a proposed, separately approved next stage, not active enforcement. Older
+The dated read-only record in [repository-protection.md](repository-protection.md)
+documents active branch/tag rulesets and verification limits. Settings changes
+still need separate approval. Older
 dated plans, reports and changelog entries describing local-main-first delivery
 are historical evidence; this runbook supersedes their delivery instructions.
 Host Readiness is separate and read-only; it does not mutate launchd, data, or
