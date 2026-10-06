@@ -5,6 +5,11 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-06
 
+- #257 将重复保护撤单—补位回归纳入主线：真实适配器与隔离 SQLite 验证两次 5→3→5，
+  完整账户 API 确认仅剩三笔后恢复目标，并校验每笔必要账户读取。
+  覆盖账户超时、余额不足、无合格候选和并发新发布/旧读取迟到失效；保留拒绝新增及资源清理断言。
+  本次仅交付回归测试，不代表线上持续恢复；生产验收由 #264 继续跟踪。
+
 - LP Gamma 市场 metadata 请求改为每批最多 50 个 condition ID，缩短约 8 KiB 的查询 URL，
   降低云端共享 HTTP/2 并发读取中已复现的 Cloudflare 400/协议错误触发风险。
   HTTP/2、8 路并发上限、每页 100 条及事件批次不变；开放/关闭市场共用拆批，仍遍历全部输入。
