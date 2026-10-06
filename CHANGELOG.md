@@ -5,6 +5,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-10-06
 
+- Document the active main and version-tag rulesets for #214, including the exact
+  required-check source and the creation-only release-owner allowance. Preserve
+  the 2026-09-30 baseline and distinguish rule inspection from unrun rejection
+  probes. Read-only rules and completed PR/CI evidence were verified on 2026-10-06;
+  this documentation update changes no settings, CI coverage or deployment gates.
+
 - LP Gamma 市场 metadata 请求改为每批最多 50 个 condition ID，缩短约 8 KiB 的查询 URL，
   降低云端共享 HTTP/2 并发读取中已复现的 Cloudflare 400/协议错误触发风险。
   HTTP/2、8 路并发上限、每页 100 条及事件批次不变；开放/关闭市场共用拆批，仍遍历全部输入。

@@ -125,7 +125,7 @@ open a Draft PR targeting `main`, and inspect the latest exact-SHA CI evidence. 
 the `required` check from GitHub Actions, then obtain explicit user approval
 before merging on GitHub. Do not integrate through local `main` or direct push.
 See [CI identity](docs/operations/ci.md) and the
-[proposed repository protections](docs/operations/repository-protection.md);
+[verified repository protections](docs/operations/repository-protection.md);
 documented settings are not evidence that protection is enabled.
 
 ## Delivery boundaries
