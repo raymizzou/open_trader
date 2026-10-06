@@ -107,6 +107,23 @@ def test_global_recovery_discards_inflight_candidate_scan(
         assert current_scan["state"] == "ready"
         assert len(lp._candidate_pool) == 6
         assert len(lp._candidate_qualification_facts) == 6
+        public = lp.candidate_snapshot()
+        for field in ("candidates", "recommendations", "selected_results"):
+            assert public[field]
+            assert all(
+                "global_recovery_generation" not in row for row in public[field]
+            )
+        global_generation = lp.preparation_snapshot()[
+            "global_recovery_generation"
+        ]
+        assert all(
+            row["global_recovery_generation"] == global_generation
+            for row in lp._candidate_pool.values()
+        )
+        assert all(
+            facts["global_recovery_generation"] == global_generation
+            for facts in lp._candidate_qualification_facts.values()
+        )
     finally:
         release.set()
         worker.join(5)

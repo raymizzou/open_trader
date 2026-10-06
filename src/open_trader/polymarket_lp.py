@@ -2446,9 +2446,11 @@ class PolymarketLPService:
                 continue
             valid_rows.append(row)
         valid_rows.sort(key=_candidate_yield_sort_key)
-        published = [
-            deepcopy(dict(row)) for row in valid_rows[:LP_TRIAL_CANDIDATE_LIMIT]
-        ]
+        published = []
+        for row in valid_rows[:LP_TRIAL_CANDIDATE_LIMIT]:
+            public_row = deepcopy(dict(row))
+            public_row.pop("global_recovery_generation", None)
+            published.append(public_row)
         valid_count = len(valid_rows)
         failed_count = sum(
             1 for row in valid_rows if row.get("refresh_failed") is True
