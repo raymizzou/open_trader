@@ -20,6 +20,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
   原断言受控 RED、缺失 warning 与持锁负向对照均失败；相关串行/n2 各 69 passed，
   两种模式各固定三次受控延迟复验通过；旧 PR/push CI 失败完整保留，新 CI 尚待交付后验证。
 
+- #262 后续修复候选扫描的全局恢复代次竞态：旧队列的成功、失败、拒绝和完成状态不能覆盖恢复后的状态；旧 worker 收尾会清理遗留扫描标志，维护两阶段 reward/metadata/history screening 都跳过旧资格事实和旧 exclusion，自动池同样受保护，SQLite 快照写入在同一事务内复核代次。公共候选 projection 隐藏内部代次标签，保留现有 pool、轮换和审计；恢复后新一代重新读取后可正常发布。真实适配器、临时 SQLite、受控时钟及 fresh/cached 队列、ranking hash 和 stale reward rejection 回归通过；未部署或操作真实交易。
+
 - #257 将重复保护撤单—补位回归纳入主线：真实适配器与隔离 SQLite 验证两次 5→3→5，
   完整账户 API 确认仅剩三笔后恢复目标，并校验每笔必要账户读取。
   覆盖账户超时、余额不足、无合格候选和并发新发布/旧读取迟到失效；保留拒绝新增及资源清理断言。

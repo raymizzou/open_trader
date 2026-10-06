@@ -3350,6 +3350,7 @@ class PredictionArbitrageStore:
     def lp_record_market_exclusion(
         self, condition_id: str, token_id: str, reason_code: str, *,
         checked_at: datetime, cooldown_until: datetime, now: datetime,
+        global_recovery_generation: int | None = None,
     ) -> bool:
         """Insert one fixed deadline; an active row never changes or extends."""
         if not condition_id or reason_code not in {
@@ -3363,6 +3364,19 @@ class PredictionArbitrageStore:
         if checked > current or until <= current or until <= checked:
             return False
         with self._transaction() as connection:
+            if type(global_recovery_generation) is int and global_recovery_generation >= 0:
+                preparation = connection.execute(
+                    "SELECT payload FROM lp_preparation WHERE singleton=1"
+                ).fetchone()
+                current_generation = (
+                    _load_payload(str(preparation["payload"])).get(
+                        "global_recovery_generation"
+                    )
+                    if preparation is not None
+                    else None
+                )
+                if type(current_generation) is int and current_generation > global_recovery_generation:
+                    return False
             return bool(connection.execute(
                 """INSERT INTO lp_market_exclusions VALUES (?,?,?,?,?)
                 ON CONFLICT(condition_id,token_id) DO UPDATE SET
@@ -3475,8 +3489,27 @@ class PredictionArbitrageStore:
                 (_canonical_timestamp(now), limit),
             ).rowcount
 
-    def lp_clear_ended_market_exclusions(self, condition_id: str, *, checked_at: datetime) -> int:
+    def lp_clear_ended_market_exclusions(
+        self,
+        condition_id: str,
+        *,
+        checked_at: datetime,
+        global_recovery_generation: int | None = None,
+    ) -> int:
         with self._transaction() as connection:
+            if type(global_recovery_generation) is int and global_recovery_generation >= 0:
+                preparation = connection.execute(
+                    "SELECT payload FROM lp_preparation WHERE singleton=1"
+                ).fetchone()
+                current_generation = (
+                    _load_payload(str(preparation["payload"])).get(
+                        "global_recovery_generation"
+                    )
+                    if preparation is not None
+                    else None
+                )
+                if type(current_generation) is int and current_generation > global_recovery_generation:
+                    return 0
             return connection.execute(
                 "DELETE FROM lp_market_exclusions WHERE condition_id=? AND checked_at<=?",
                 (condition_id, _canonical_timestamp(checked_at)),
@@ -3624,12 +3657,27 @@ class PredictionArbitrageStore:
 
     def lp_save_screening_snapshot(
         self, payload: Mapping[str, object]
-    ) -> dict[str, object]:
-        """Save screening facts unless a later-started scan already won."""
+    ) -> dict[str, object] | None:
+        """Save screening facts unless a later scan or recovery already won."""
 
         encoded = _dump_relation_payload(payload)
         updated_at = _utc_now()
+        expected_global_generation = payload.get("global_recovery_generation")
+        if type(expected_global_generation) is not int or expected_global_generation < 0:
+            expected_global_generation = None
         with self._transaction() as connection:
+            preparation = connection.execute(
+                "SELECT payload FROM lp_preparation WHERE singleton=1"
+            ).fetchone()
+            if preparation is not None and expected_global_generation is not None:
+                current_global_generation = _load_payload(
+                    str(preparation["payload"])
+                ).get("global_recovery_generation")
+                if (
+                    type(current_global_generation) is int
+                    and current_global_generation > expected_global_generation
+                ):
+                    return None
             current = connection.execute(
                 "SELECT payload FROM lp_screening_snapshot WHERE singleton=1"
             ).fetchone()

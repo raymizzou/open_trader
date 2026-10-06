@@ -712,8 +712,17 @@ class LPAutoPool:
             expired=set()
             pool_checked_at = None
             pool_check_min = pool_check_max = None
+            global_recovery_generation = self.lp._current_candidate_global_generation()
             for key,value in self.lp._candidate_qualification_facts.items():
                 if key not in self.lp._candidate_pool:
+                    continue
+                if (
+                    global_recovery_generation is None
+                    or self.lp._candidate_global_generation(
+                        value.get("global_recovery_generation")
+                    )
+                    != global_recovery_generation
+                ):
                     continue
                 pool_checked_at = self._now()
                 if diagnostics is not None:
