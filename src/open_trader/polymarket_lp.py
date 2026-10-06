@@ -3326,6 +3326,7 @@ class PolymarketLPService:
                                 for condition_id in metadata_batch_ids
                             }
                         )
+                        del batch_value
                         continue
                     if str(batch_value.get("state") or "").lower() in {
                         "cancelled",
@@ -3344,6 +3345,7 @@ class PolymarketLPService:
                                 for condition_id in metadata_batch_ids
                             }
                         )
+                        del batch_value, raw_markets
                         continue
                     requested = set(metadata_batch_ids)
                     returned_markets = {
@@ -3402,6 +3404,10 @@ class PolymarketLPService:
                     for condition_id in requested - resolved:
                         metadata_failures[condition_id] = "metadata_batch_incomplete"
                     metadata_by_condition.update(returned_markets)
+                    # Scratch owns serialized facts now; release the HTTP batch
+                    # before progress writes, the next batch, or history reads.
+                    del batch_value, raw_markets, returned_markets
+                    del raw_absent, raw_failed, raw_failure_facts, raw_deferred
                     self._save_preparation(
                         {
                             "stage": "metadata",
