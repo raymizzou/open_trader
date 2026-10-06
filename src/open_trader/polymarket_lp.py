@@ -1033,7 +1033,9 @@ class PolymarketLPService:
         pool = _maybe_decimal(reward.get("daily_pool_usd"))
         if pool is not None and pool <= 0:
             return "reward_pool_empty"
-        if market.get("accepting_orders") is False:
+        if market.get("accepting_orders") is False and not _candidate_source_expired(
+            market.get("metadata_checked_at"), self._now()
+        ):
             return "market_not_accepting_orders"
         from .polymarket_lp_views import (
             _lp_competition_entry, LP_COMPETITION_DENSITY_THIN_FLOOR,
@@ -1054,6 +1056,9 @@ class PolymarketLPService:
                 return "competition_too_thin"
             if value >= LP_COMPETITION_DENSITY_MID_MAX:
                 return "competition_too_crowded"
+        # Retained raw facts cannot create a new cooldown after their receipt expires.
+        if _candidate_source_expired(market.get("metadata_checked_at"), self._now()):
+            return None
         state, reason, _, _ = _event_window_check({}, market, now)
         return reason if state == "rejected" and reason in {
             "event_starting_soon", "event_in_progress", "event_recovery_pending"
@@ -1098,6 +1103,9 @@ class PolymarketLPService:
                 if cid not in allowed_conditions or (row and not self._candidate_allowed(((cid, str(selected.get("token_id") or "")),))):
                     self._candidate_pool.pop(cid, None)
                     self._candidate_qualification_facts.pop(cid, None)
+                elif row and isinstance(row.get("directions"), Mapping):
+                    row["directions"] = {key: direction for key, direction in row["directions"].items()
+                        if self._candidate_allowed(((cid, str(direction.get("token_id") or "")),))}
                 if cid not in allowed_conditions:
                     self._candidate_rotation.pop(cid, None)
                 cached = self._candidate_qualification_facts.get(cid)
@@ -1138,33 +1146,9 @@ class PolymarketLPService:
                         row.clear()
                         row.update(replacements[0])
                     self._candidate_queue_state = None
-            inputs = self._prepared_inputs
-            if isinstance(inputs, Mapping) and (condition_id or prepared):
-                metadata = inputs["metadata"]
-                ids = (condition_id,) if condition_id else tuple(metadata)
-                allowed = set(self._candidate_conditions(ids))
-                filtered = None
-                for cid in ids:
-                    if cid not in allowed:
-                        if cid in metadata:
-                            if filtered is None:
-                                filtered = deepcopy(metadata)
-                            filtered.pop(cid, None)
-                        continue
-                    row = metadata.get(cid)
-                    if isinstance(row, Mapping) and isinstance(row.get("outcomes"), Mapping):
-                        outcomes = {key: value for key, value in row["outcomes"].items()
-                            if isinstance(value, Mapping) and self._candidate_allowed(((cid, str(value.get("token_id") or "")),))}
-                        if len(outcomes) != len(row["outcomes"]):
-                            if filtered is None:
-                                filtered = deepcopy(metadata)
-                            filtered[cid] = {**row, "outcomes": outcomes}
-                if filtered is not None:
-                    # Native scratch backup keeps values off the Python heap.
-                    # Publish a new generation; captured readers retain their old map.
-                    self._prepared_inputs = {**inputs, "metadata": filtered}
-                    self._prepared_inputs_version += 1
-                    self._candidate_queue_state = None
+            if condition_id:
+                # Rebuild derived directions lazily; raw prepared facts stay immutable.
+                self._candidate_queue_state = None
             evict = getattr(self.exchange, "evict_lp_candidate_metadata", None)
             if callable(evict) and (condition_id or prepared):
                 evict(condition_ids=(condition_id,) if condition_id else None, now=self._now())
@@ -3525,7 +3509,6 @@ class PolymarketLPService:
                                     exclusion_revision=preparation_exclusion_revision):
                                 preparation_exclusion_revision = self._candidate_exclusion_revision
                 allowed = set(self._candidate_conditions(tuple(metadata_value), now=now))
-                metadata_value = LPReadScratch((cid, row) for cid, row in metadata_value.items() if cid in allowed)
                 market_rows = LPReadRows(row for row in market_rows if str(row.get("condition_id") or "") in allowed)
                 catalog = {**catalog, "markets": market_rows}
             targets: list[tuple[str, str]] = []
