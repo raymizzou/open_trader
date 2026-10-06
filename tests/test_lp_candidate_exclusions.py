@@ -757,3 +757,133 @@ def test_concurrent_direction_exclusions_keep_raw_reader_and_fixed_deadlines(tmp
     assert restarted.refresh_price_history()['state'] == 'known'
     assert restarted.refresh_competition_cache()['state'] == 'known'
     assert {row['condition_id'] for row in restarted.refresh_candidates()['candidates']} == {'condition-m', 'condition-other'}
+
+
+@pytest.mark.parametrize('fresh', ['eligible', 'rejected', 'unknown'])
+@pytest.mark.parametrize('restart', [False, True])
+def test_expired_event_exclusion_revalidates_before_reservation_rebuild_can_recool(tmp_path, monkeypatch, fresh, restart):
+    now = datetime(2026, 10, 5, tzinfo=UTC)
+    exchange = ExclusionExchange(now, {'m': Decimal(20)})
+    exchange.events['condition-m'] = {'event_ended': False, 'event_start_time': now + timedelta(minutes=31)}
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: exchange.now, exclusions_enabled=True)
+    assert service.refresh_competition_cache()['state'] == 'known'
+    assert service.refresh_price_history()['state'] == 'known'
+    assert exchange.metadata_reads == ['condition-m']
+    store.lp_create_session('other', 'other', state='entry_open', payload={
+        'condition_id': 'condition-other', 'token_id': 'token-other', 'price': '.1', 'quantity': '1'})
+    exchange.now = now + timedelta(minutes=1)
+    assert service.refresh_candidates()['candidates'] == []
+    assert store.lp_market_exclusion_counts(now=exchange.now) == {'event_starting_soon': 1}
+    assert store.lp_next_market_exclusion_expiry(now=exchange.now) == now + timedelta(minutes=6)
+    exchange.now = now + timedelta(minutes=2)
+    assert service.refresh_candidates()['candidates'] == []
+    exchange.events['condition-m']['event_start_time'] = now + timedelta(hours=2)
+    exchange.now = now + timedelta(minutes=6)
+    store.lp_update_session('other', state='complete')
+    if restart:
+        store = PredictionArbitrageStore(tmp_path)
+        service = PolymarketLPService(store, exchange, clock=lambda: exchange.now, exclusions_enabled=True)
+    from open_trader.polymarket_lp_scratch import LPReadScratch
+    backups = []
+    backup = LPReadScratch.__deepcopy__
+    def counted_backup(scratch, memo):
+        backups.append(len(scratch))
+        return backup(scratch, memo)
+    monkeypatch.setattr(LPReadScratch, '__deepcopy__', counted_backup)
+    # Public scan runs before preparation after the unrelated reservation changes.
+    assert service.refresh_candidates()['candidates'] == []
+    assert store.lp_market_exclusion_counts(now=exchange.now) == {}
+    assert exchange.metadata_reads == ['condition-m']
+    assert backups == []
+    monkeypatch.setattr(LPReadScratch, '__deepcopy__', backup)
+    if fresh == 'rejected':
+        exchange.events['condition-m']['event_start_time'] = now + timedelta(minutes=20)
+    elif fresh == 'unknown':
+        metadata = exchange.lp_market_metadata
+        def failed_metadata(ids, **kwargs):
+            metadata(ids, **kwargs)  # Record the attempted public read.
+            raise TimeoutError('offline metadata timeout')
+        exchange.lp_market_metadata = failed_metadata
+    prepared = service.refresh_price_history()
+    assert exchange.metadata_reads == ['condition-m', 'condition-m']
+    assert service.refresh_competition_cache()['state'] == 'known'
+    candidates = service.refresh_candidates()['candidates']
+    if fresh == 'eligible':
+        assert prepared['state'] == 'known'
+        assert [row['condition_id'] for row in candidates] == ['condition-m']
+        assert store.lp_market_exclusion_counts(now=exchange.now) == {}
+    elif fresh == 'rejected':
+        assert candidates == []
+        assert store.lp_market_exclusion_counts(now=exchange.now) == {'event_starting_soon': 1}
+        assert store.lp_next_market_exclusion_expiry(now=exchange.now) == now + timedelta(minutes=11)
+    else:
+        assert prepared['state'] != 'known'
+        assert candidates == []
+        assert store.lp_market_exclusion_counts(now=exchange.now) == {}
+
+
+@pytest.mark.parametrize('receipt', ['expired', 'missing', 'future'])
+@pytest.mark.parametrize('reason', ['event', 'accepting_orders'])
+def test_candidate_preview_invalid_metadata_receipt_stays_unknown_without_cooldown(tmp_path, receipt, reason):
+    now = datetime(2026, 10, 5, tzinfo=UTC)
+    exchange = ExclusionExchange(now, {'m': Decimal(20)})
+    if reason == 'event':
+        exchange.events['condition-m'] = {'event_ended': False, 'event_start_time': now + timedelta(minutes=20)}
+    else:
+        exchange.not_accepting.add('condition-m')
+    metadata = exchange.lp_market_metadata
+    stamps = {'expired': now - timedelta(seconds=61), 'missing': None, 'future': now + timedelta(seconds=1)}
+    def stale_metadata(ids, **kwargs):
+        rows = metadata(ids, **kwargs)
+        for row in rows.values():
+            row['metadata_checked_at'] = stamps[receipt]
+        return rows
+    exchange.lp_market_metadata_fresh = stale_metadata
+    store = PredictionArbitrageStore(tmp_path)
+    service = PolymarketLPService(store, exchange, clock=lambda: exchange.now, exclusions_enabled=True)
+    identity = {'market_id': 'market-m', 'condition_id': 'condition-m', 'token_id': 'token-condition-m', 'outcome': 'YES'}
+    assert service.preview_candidate(identity) == {'state': 'rejected', 'reason': (
+        'market_metadata_time_unknown' if receipt == 'missing' else 'market_metadata_stale')}
+    assert store.lp_market_exclusion_counts(now=now) == {}
+    assert store.lp_active_sessions() == []
+
+
+@pytest.mark.parametrize('delay_stage', ['metadata', 'competition_lookup'])
+def test_delayed_preparation_metadata_cannot_recool_after_receipt_expires(tmp_path, delay_stage):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    now = datetime(2026, 10, 5, tzinfo=UTC)
+    exchange = ExclusionExchange(now, {'m': Decimal(20)})
+    exchange.events['condition-m'] = {'event_ended': False, 'event_start_time': now + timedelta(minutes=20)}
+    entered, release, metadata_seen = Event(), Event(), Event()
+    metadata = exchange.lp_market_metadata
+    def delayed_metadata(ids, **kwargs):
+        rows = metadata(ids, **kwargs)
+        metadata_seen.set()
+        if delay_stage == 'metadata':
+            entered.set()
+            assert release.wait(5), 'independent metadata-read watchdog'
+        return rows
+    exchange.lp_market_metadata = delayed_metadata
+    store = PredictionArbitrageStore(tmp_path)
+    competition = store.lp_competitiveness_entry
+    def delayed_competition(cid):
+        row = competition(cid)
+        if delay_stage == 'competition_lookup' and metadata_seen.is_set():
+            entered.set()
+            assert release.wait(5), 'independent competition-read watchdog'
+        return row
+    store.lp_competitiveness_entry = delayed_competition
+    service = PolymarketLPService(store, exchange, clock=lambda: exchange.now, exclusions_enabled=True)
+    with ThreadPoolExecutor(1) as workers:
+        job = workers.submit(service.refresh_price_history)
+        try:
+            assert entered.wait(5), 'preparation did not reach metadata'
+            exchange.now += timedelta(seconds=61)
+        finally:
+            release.set()
+        job.result(timeout=5)
+    assert store.lp_market_exclusion_counts(now=exchange.now) == {}
+    assert exchange.metadata_reads == ['condition-m']
+    assert service.refresh_candidates()['candidates'] == []

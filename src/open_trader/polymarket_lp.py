@@ -1033,7 +1033,9 @@ class PolymarketLPService:
         pool = _maybe_decimal(reward.get("daily_pool_usd"))
         if pool is not None and pool <= 0:
             return "reward_pool_empty"
-        if market.get("accepting_orders") is False:
+        if market.get("accepting_orders") is False and not _candidate_source_expired(
+            market.get("metadata_checked_at"), self._now()
+        ):
             return "market_not_accepting_orders"
         from .polymarket_lp_views import (
             _lp_competition_entry, LP_COMPETITION_DENSITY_THIN_FLOOR,
@@ -1054,6 +1056,9 @@ class PolymarketLPService:
                 return "competition_too_thin"
             if value >= LP_COMPETITION_DENSITY_MID_MAX:
                 return "competition_too_crowded"
+        # Retained raw facts cannot create a new cooldown after their receipt expires.
+        if _candidate_source_expired(market.get("metadata_checked_at"), self._now()):
+            return None
         state, reason, _, _ = _event_window_check({}, market, now)
         return reason if state == "rejected" and reason in {
             "event_starting_soon", "event_in_progress", "event_recovery_pending"

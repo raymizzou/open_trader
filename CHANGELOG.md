@@ -41,6 +41,14 @@ operator-facing: what changed, which workflow is affected, and what was verified
   定向离线回归覆盖零复制、展示、自动候选与手动准入、并发排除、迟到结果、重启和停止/恢复边界；
   5,000 行/20 次排除对照 backup 20→0，过滤后资格与持久排除完整 hash 相同。
   保留真实 metadata 刷新发布和全局 recovery generation；未验证生产文件驻留、cgroup 或 704 MiB 容量。
+  P2 审查修复：资格拒绝复用 60 秒 receipt 保护，在作出拒绝时检查 metadata；
+  过期、缺失或未来的接单/事件事实不能再次开启冷却，保留首次第 1 分钟的合法拒绝与固定截止时间。
+  到期空队列因预留变化而重建、扫描先于准备、fresh 仍不合格/读取失败、重启与迟到读取均做定向回归；
+  保留原始事实与零复制、UNKNOWN、方向及持仓职责，reward 与竞争库存回退资格合同不变。
+  原复现、迟到 receipt 与库存查询交错各 1 项 RED；最终未修复 rebased 源码对照 11 failed/3 passed，
+  修复后定向 57 passed，启用 exclusions 的历史逐批发布 3 passed；受控用例三次串行与两个隔离进程各 20 passed。
+  指定 venv 缺 xdist，未安装依赖；完整命令、RED/PASS 与身份记录留作审查证据，未部署。
+  2026-10-07 同步 main 的 #262 和已合并的 PR #268，保留双方 CHANGELOG；零复制与 receipt 修复补丁不变，两项修复的组合定向 173 项及恢复代次/历史发布联动 9 项通过。
 
 - #257 将重复保护撤单—补位回归纳入主线：真实适配器与隔离 SQLite 验证两次 5→3→5，
   完整账户 API 确认仅剩三笔后恢复目标，并校验每笔必要账户读取。
