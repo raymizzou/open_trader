@@ -370,6 +370,36 @@ def test_lp_runtime_notification_reports_each_channel() -> None:
     ) == {"feishu": False}
 
 
+@pytest.mark.parametrize("feishu_result", ["false", "timeout", "lost_response"])
+def test_lp_cancel_runtime_logs_unconfirmed_and_continues_voice(feishu_result, caplog):
+    calls = []
+    class Voice(XiaoaiSSHNotifier):
+        def notify(self, title, message):
+            calls.append("voice")
+    def deliver(*args):
+        calls.append("feishu")
+        if feishu_result != "false":
+            raise TimeoutError("https://secret-webhook/token")
+        return False
+    execution = SimpleNamespace(_deliver_feishu_notification=deliver)
+    voice = CompositeNotifier([Voice(host="fake", ssh_key=Path("/not-used"))])
+    assert _deliver_lp_protection_with_runtime(
+        execution, voice, "title", "message", "voice", one_shot=True
+    ) == {"feishu": False, "xiaoai": True}
+    assert calls == ["feishu", "voice"]
+    assert "channel=feishu" in caplog.text
+    assert ("delivery_unconfirmed" if feishu_result == "false" else "TimeoutError") in caplog.text
+    assert "secret-webhook" not in caplog.text
+
+
+def test_lp_cancel_runtime_skips_unconfigured_voice_without_failure(caplog):
+    execution = SimpleNamespace(_deliver_feishu_notification=lambda *args: True)
+    assert _deliver_lp_protection_with_runtime(
+        execution, NullNotifier(), "title", "message", "voice", one_shot=True
+    ) == {"feishu": True}
+    assert "xiaoai" not in caplog.text
+
+
 def test_runtime_wires_lp_auto_scheduler_to_execution(tmp_path: Path) -> None:
     checked = threading.Event()
 

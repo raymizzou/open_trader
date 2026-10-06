@@ -334,16 +334,26 @@ def _deliver_lp_protection_with_runtime(
     xiaoai_text: str,
     *,
     channels: set[str] | None = None,
+    one_shot: bool = False,
 ) -> dict[str, bool]:
     results: dict[str, bool] = {}
     deliver = getattr(execution, "_deliver_feishu_notification", None)
     if callable(deliver) and (channels is None or "feishu" in channels):
         try:
-            results["feishu"] = deliver(title, message) is True
-        except Exception:
+            feishu_target = getattr(execution, "_feishu_target", None) if one_shot else None
+            if not one_shot or not callable(feishu_target) or feishu_target() is not None:
+                results["feishu"] = deliver(title, message) is True
+                if one_shot and not results["feishu"]:
+                    logger.warning("lp_protection_cancel_channel_failed channel=feishu error_type=delivery_unconfirmed")
+        except Exception as exc:
             results["feishu"] = False
-            logger.warning("lp_protection_feishu_delivery_failed", exc_info=True)
+            if one_shot:
+                logger.warning("lp_protection_cancel_channel_failed channel=feishu error_type=%s", type(exc).__name__)
+            else:
+                logger.warning("lp_protection_feishu_delivery_failed", exc_info=True)
     if notifier is None:
+        if one_shot:
+            return results
         if channels is None:
             results.setdefault("xiaoai", False)
             results.setdefault("feishu", False)
@@ -353,7 +363,7 @@ def _deliver_lp_protection_with_runtime(
             results.setdefault("feishu", False)
         return results
     if channels is not None and "xiaoai" not in channels:
-        if "feishu" in channels:
+        if "feishu" in channels and not one_shot:
             results.setdefault("feishu", False)
         return results
     try:
@@ -363,14 +373,22 @@ def _deliver_lp_protection_with_runtime(
             xiaoai_text,
             channels={"xiaoai"} if channels is None else channels & {"xiaoai"},
         )
-    except Exception:
-        logger.warning("lp_protection_xiaoai_delivery_failed", exc_info=True)
+    except Exception as exc:
+        if one_shot:
+            logger.warning("lp_protection_cancel_channel_failed channel=xiaoai error_type=%s", type(exc).__name__)
+        else:
+            logger.warning("lp_protection_xiaoai_delivery_failed", exc_info=True)
         results["xiaoai"] = False
     else:
-        results["xiaoai"] = bool(attempts) and all(
-            attempt.success for attempt in attempts
-        )
-    if channels is None or "feishu" in channels:
+        if attempts or not one_shot:
+            results["xiaoai"] = bool(attempts) and all(
+                attempt.success for attempt in attempts
+            )
+        if one_shot:
+            for attempt in attempts:
+                if not attempt.success:
+                    logger.warning("lp_protection_cancel_channel_failed channel=xiaoai error_type=%s", attempt.error_type)
+    if not one_shot and (channels is None or "feishu" in channels):
         results.setdefault("feishu", False)
     return results
 
@@ -826,7 +844,7 @@ class PredictionRuntime:
             set_protection_notifier = getattr(self.lp, "set_protection_notifier", None)
             if callable(set_protection_notifier):
                 set_protection_notifier(
-                    lambda title, message, voice, channels=None: (
+                    lambda title, message, voice, channels=None, one_shot=False: (
                         _deliver_lp_protection_with_runtime(
                             self.execution,
                             self._notifier,
@@ -834,6 +852,7 @@ class PredictionRuntime:
                             message,
                             voice,
                             channels=channels,
+                            one_shot=one_shot,
                         )
                     )
                 )

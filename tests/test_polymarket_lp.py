@@ -8463,8 +8463,341 @@ def test_queue_protection_cancels_manual_same_price_buy_only(tmp_path) -> None:
     assert protection["cancel_targets"] == ["order-1", "manual-2"]
 
 
-def test_queue_protection_notification_success_template_once(tmp_path) -> None:
-    """T26: 成功模板一次（N 张/M 手动/数字格式），置位后不重发；xiaoai 短句。"""
+def _observe_cancel_jobs(service, monkeypatch):
+    """Control the enqueue seam, including jobs that never execute."""
+    jobs = []
+    lock = threading.Lock()
+    def enqueue(*args):
+        with lock:
+            jobs.append(args)
+    monkeypatch.setattr(service, "_start_protection_cancel_notice", enqueue)
+    return jobs
+
+
+def _cancel_notice_completion(service, monkeypatch):
+    """Drain real notification jobs, including any erroneously queued jobs."""
+    launch = service._start_protection_cancel_notice
+    enqueued = threading.Event()
+    workers = []
+
+    def enqueue(*args):
+        worker = launch(*args)
+        assert worker is not None and worker.daemon
+        workers.append(worker)
+        enqueued.set()
+        return worker
+
+    monkeypatch.setattr(service, "_start_protection_cancel_notice", enqueue)
+
+    def wait():
+        assert enqueued.wait(2)
+        for worker in workers:
+            worker.join(2)
+            assert not worker.is_alive()
+        return True
+
+    return wait
+
+
+@pytest.mark.parametrize("drop", ["after_commit", "before_execution", "during_send"])
+def test_protection_cancel_restart_drops_jobs_and_old_episodes(tmp_path, monkeypatch, drop):
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _queue_running_service(tmp_path, now, key="drop-notice")
+    jobs = _observe_cancel_jobs(service, monkeypatch)
+    calls = []
+    service.set_protection_notifier(lambda *args: calls.append(args) or True)
+    live = _queue_receipt("order-1")
+    exchange.snapshot_value = _queue_runtime_snapshot(now, bid_size="4000", orders=[live])
+    if drop == "after_commit":
+        # Simulate death before notification scheduling sees the committed state.
+        monkeypatch.setattr(service, "_notify_committed_protection_cancels", lambda *args, **kwargs: None)
+    service.tick()
+    assert exchange.cancels == ["order-1"]
+    assert len(jobs) == (0 if drop == "after_commit" else 1)
+    if drop == "during_send":
+        # The boundary accepted it but the response was lost before result logging.
+        def lost_response(*args):
+            calls.append(args)
+            raise TimeoutError("secret must stay private")
+        service.set_protection_notifier(lost_response)
+        worker = PolymarketLPService._start_protection_cancel_notice(service, *jobs[0])
+        worker.join(2)
+        assert not worker.is_alive()
+    restarted = PolymarketLPService(store, exchange, clock=lambda: now)
+    restored_jobs = _observe_cancel_jobs(restarted, monkeypatch)
+    restarted.set_protection_notifier(lambda *args: calls.append(args) or True)
+    exchange.snapshot_value = _queue_runtime_snapshot(now, bid_size="4000", orders=[_queue_receipt("order-1", status="CANCELED")])
+    assert restarted.tick()["queue_protection"]["state"] == "canceled"
+    restarted.tick()
+    assert restored_jobs == []
+    assert len(calls) == (1 if drop == "during_send" else 0)
+    assert exchange.cancels == ["order-1"]
+    # A genuinely new order after restart has its own action and notice.
+    exchange.snapshot_value = _queue_runtime_snapshot(now, bid_size="10000")
+    preview = restarted.preview({**_request(now), "quantity": Decimal("2000")})
+    new = restarted.start(str(preview["preview_id"]), "new-after-restart")
+    order_id = str(new["entry_order_id"])
+    assert order_id != "order-1"
+    exchange.snapshot_value = _queue_runtime_snapshot(now, bid_size="4000", orders=[_queue_receipt(order_id)])
+    restarted.tick()
+    assert len(restored_jobs) == 1
+    assert exchange.cancels == ["order-1", order_id]
+
+
+@pytest.mark.parametrize("reader", ["lp_sessions", "lp_actions", "lp_active_first_seen_episodes"])
+def test_protection_cancel_restore_read_failure_disables_notifications(tmp_path, monkeypatch, reader, caplog):
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _queue_running_service(tmp_path, now, key="restore-failure")
+    original = getattr(store, reader)
+    def fail(*args):
+        raise OSError("secret webhook")
+    monkeypatch.setattr(store, reader, fail)
+    restarted = PolymarketLPService(store, exchange, clock=lambda: now)
+    monkeypatch.setattr(store, reader, original)
+    jobs = _observe_cancel_jobs(restarted, monkeypatch)
+    exchange.snapshot_value = _queue_runtime_snapshot(now, bid_size="4000", orders=[_queue_receipt("order-1")])
+    restarted.tick()
+    assert exchange.cancels == ["order-1"]
+    assert jobs == []
+    assert "notifications_disabled" in caplog.text
+    assert "OSError" in caplog.text
+    assert "secret webhook" not in caplog.text
+
+
+@pytest.mark.parametrize("delay_first", [False, True])
+def test_protection_cancel_concurrent_ticks_enqueue_once(tmp_path, monkeypatch, delay_first):
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _queue_running_service(tmp_path, now, key="concurrent-notice")
+    jobs = _observe_cancel_jobs(service, monkeypatch)
+    exchange.snapshot_value = _queue_runtime_snapshot(now, bid_size="4000", orders=[_queue_receipt("order-1")])
+    barrier = threading.Barrier(3)
+    release, first_ready, second_done = (threading.Event() for _ in range(3))
+    errors = []
+    def tick(first):
+        try:
+            barrier.wait(2)
+            if first and delay_first:
+                first_ready.set()
+                assert release.wait(2)
+            service.tick()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            if not first:
+                second_done.set()
+                release.set()
+    workers = [threading.Thread(target=tick, args=(first,)) for first in (True, False)]
+    for worker in workers:
+        worker.start()
+    try:
+        barrier.wait(2)
+        if delay_first:
+            assert first_ready.wait(2)
+            assert second_done.wait(2)
+        for worker in workers:
+            worker.join(2)
+            assert not worker.is_alive()
+    finally:
+        release.set()
+        for worker in workers:
+            worker.join(2)
+            assert not worker.is_alive()
+    assert not errors
+    assert len(jobs) == 1
+    assert exchange.cancels == ["order-1"]
+    # Clear unrelated fact caches: the action remains consumed for this process.
+    service._pending_facts.clear()
+    service.tick()
+    assert len(jobs) == 1
+
+
+def test_protection_cancel_failed_business_publish_never_enqueues(tmp_path, monkeypatch):
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _queue_running_service(tmp_path, now, key="publish-failure")
+    jobs = _observe_cancel_jobs(service, monkeypatch)
+    def fail_publish(*args, **kwargs):
+        raise OSError("fake SQLite write failure")
+    monkeypatch.setattr(store, "lp_merge_queue_protection_bucket", fail_publish)
+    monkeypatch.setattr(store, "lp_merge_queue_protection", fail_publish)
+    exchange.snapshot_value = _queue_runtime_snapshot(now, bid_size="4000", orders=[_queue_receipt("order-1")])
+    service.tick()
+    assert jobs == []
+    stored = store.lp_session(str(started["session_id"]))
+    assert not stored["queue_protection"]["levels"]["0.30"].get("canceled_order_ids")
+    # The real action receipt can outlive the failed bucket publication.
+    assert any(action.get("role") == "entry-protection-cancel" for action in store.lp_actions(str(started["session_id"])))
+    restarted = PolymarketLPService(store, exchange, clock=lambda: now)
+    assert restarted._protection_cancel_events  # Startup sees the committed action.
+
+
+def test_protection_cancel_restored_pending_action_retries_business_only(tmp_path, monkeypatch):
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _queue_running_service(tmp_path, now, key="pending-restart")
+    jobs = _observe_cancel_jobs(service, monkeypatch)
+    exchange.snapshot_value = _queue_runtime_snapshot(now, bid_size="4000", orders=[_queue_receipt("order-1")])
+    exchange.cancel_responses = [{"not_canceled": {"order-1": "venue_busy"}}]
+    first = service.tick()
+    assert first["queue_protection"]["cancel_failed"] == ["order-1"]
+    assert jobs == []
+    restarted = PolymarketLPService(store, exchange, clock=lambda: now)
+    restored_jobs = _observe_cancel_jobs(restarted, monkeypatch)
+    restarted.tick()
+    assert exchange.cancels == ["order-1", "order-1"]
+    assert restored_jobs == []
+    exchange.snapshot_value = _queue_runtime_snapshot(now, bid_size="4000", orders=[_queue_receipt("order-1", status="CANCELED")])
+    restarted.tick()
+    assert restored_jobs == []
+
+
+def test_protection_cancel_competing_event_consumers_use_one_lock(tmp_path, monkeypatch):
+    """Force an interleaving between the duplicate check and consumption."""
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _queue_running_service(tmp_path, now, key="event-race")
+    jobs = _observe_cancel_jobs(service, monkeypatch)
+    exchange.snapshot_value = _queue_runtime_snapshot(now, bid_size="4000", orders=[_queue_receipt("order-1")])
+    service.tick()
+    committed = store.lp_session(str(started["session_id"]))
+    jobs.clear()
+    checked, competitor, release = (threading.Event() for _ in range(3))
+    errors = []
+    real_lock = threading.Lock()
+    class ObservableLock:
+        def __enter__(self):
+            if checked.is_set():
+                competitor.set()
+            real_lock.acquire()
+        def __exit__(self, *args):
+            real_lock.release()
+    class PausedConsumption(set):
+        def __contains__(self, value):
+            if not checked.is_set():
+                checked.set()
+                assert release.wait(2)
+            return super().__contains__(value)
+    monkeypatch.setattr(service, "_protection_cancel_lock", ObservableLock())
+    monkeypatch.setattr(service, "_protection_cancel_events", PausedConsumption())
+    def consume():
+        try:
+            service._notify_committed_protection_cancels(committed)
+        except BaseException as exc:
+            errors.append(exc)
+    workers = [threading.Thread(target=consume) for _ in range(2)]
+    try:
+        workers[0].start()
+        assert checked.wait(2)
+        workers[1].start()
+        assert competitor.wait(2)
+        release.set()
+        for worker in workers:
+            worker.join(2)
+            assert not worker.is_alive()
+        assert not errors
+        assert len(jobs) == 1
+    finally:
+        release.set()
+        for worker in workers:
+            if worker.ident is not None:
+                worker.join(2)
+                assert not worker.is_alive()
+
+
+@pytest.mark.parametrize("acknowledged", [True, False])
+def test_first_seen_cancel_restart_suppresses_old_but_not_new_episode(tmp_path, monkeypatch, acknowledged):
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    store, exchange, service = _first_seen_running_service(
+        tmp_path, now, episode_id="old-first-seen", level_total="4000",
+        open_orders=[_queue_receipt("m-1")],
+    )
+    old_jobs = _observe_cancel_jobs(service, monkeypatch)
+    if not acknowledged:
+        exchange.cancel_responses = [{"not_canceled": {"m-1": "response_lost"}}]
+    service.tick()
+    assert len(old_jobs) == int(acknowledged)
+    restarted = PolymarketLPService(store, exchange, clock=lambda: now)
+    jobs = _observe_cancel_jobs(restarted, monkeypatch)
+    exchange.account_open_orders = []
+    restarted.tick()
+    restarted.tick()
+    assert store.lp_first_seen_episode("old-first-seen")["state"] == "canceled"
+    assert jobs == []
+    _first_seen_episode(store, "new-first-seen", anchors=("m-2",))
+    exchange.account_open_orders = [_queue_receipt("m-2")]
+    restarted.tick()
+    assert len(jobs) == 1
+    assert exchange.cancels == ["m-1", "m-2"]
+
+
+@pytest.mark.parametrize("voice_mode", ["success", "failure", "absent"])
+def test_queue_protection_cancel_channels_attempt_once(tmp_path, voice_mode, monkeypatch, caplog) -> None:
+    """Real tick/runtime boundary: channel results never replay a real cancel."""
+    from types import SimpleNamespace
+    from open_trader.notifications import CompositeNotifier, NullNotifier, XiaoaiSSHNotifier
+    from open_trader.prediction_runtime import _deliver_lp_protection_with_runtime
+
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    store, exchange, service, started = _queue_running_service(
+        tmp_path, now, key="notify-once"
+    )
+    calls = {"feishu": [], "xiaoai": []}
+    finished = threading.Event()
+
+    class Voice(XiaoaiSSHNotifier):
+        def notify(self, title, message):
+            calls["xiaoai"].append(message)
+            if voice_mode == "failure":
+                raise TimeoutError("secret webhook must never enter logs")
+
+    voice = (NullNotifier() if voice_mode == "absent" else
+             CompositeNotifier([Voice(host="fake", ssh_key=Path("/not-used"))]))
+    execution = SimpleNamespace(_deliver_feishu_notification=lambda title, message:
+                                calls["feishu"].append(message) or True)
+
+    def send(title, message, text, **kwargs):
+        try:
+            return _deliver_lp_protection_with_runtime(
+                execution, voice, title, message, text, **kwargs
+            )
+        finally:
+            finished.set()
+
+    service.set_protection_notifier(send)
+    queued = []
+    launch = service._start_protection_cancel_notice
+    monkeypatch.setattr(service, "_start_protection_cancel_notice", lambda *args: queued.append(args))
+    live = _queue_receipt("order-1")
+    exchange.snapshot_value = _queue_runtime_snapshot(now, bid_size="4000", orders=[live])
+    assert service.tick()["queue_protection"]["state"] == "canceling"
+    assert len(queued) == 1
+    worker = launch(*queued[0])
+    assert finished.wait(2)
+    worker.join(2)
+    assert not worker.is_alive()
+    exchange.snapshot_value = _queue_runtime_snapshot(
+        now, bid_size="4000", orders=[_queue_receipt("order-1", status="CANCELED")]
+    )
+    assert service.tick()["queue_protection"]["state"] == "canceled"
+    service.tick()
+    restarted = PolymarketLPService(store, exchange, clock=lambda: now)
+    restarted.set_protection_notifier(send)
+    monkeypatch.setattr(restarted, "_start_protection_cancel_notice", lambda *args: queued.append(args))
+    restarted.tick()
+    assert len(queued) == 1  # Includes duplicate jobs that have not executed.
+    assert "secret webhook" not in caplog.text
+    if voice_mode == "failure":
+        failures = [record.getMessage() for record in caplog.records
+                    if "lp_protection_cancel_notice" in record.getMessage()]
+        assert len(failures) == 1
+        assert all(field in failures[0] for field in (
+            "event=", "channel=xiaoai", "at=", "outcome=unconfirmed",
+            "error_type=delivery_unconfirmed",
+        ))
+    assert exchange.cancels == ["order-1"]
+    assert len(calls["feishu"]) == 1
+    assert len(calls["xiaoai"]) == (0 if voice_mode == "absent" else 1)
+
+
+def test_queue_protection_notification_success_template_once(tmp_path, monkeypatch) -> None:
+    """T26: 成功模板一次（N 张/M 手动/数字格式），消费后不重发；xiaoai 短句。"""
     now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
     store, exchange, service, started = _queue_running_service(
         tmp_path, now, key="lp-queue-t26"
@@ -8490,7 +8823,9 @@ def test_queue_protection_notification_success_template_once(tmp_path) -> None:
     )
     exchange.snapshots = [trigger, trigger, cancelled]
     exchange.snapshot_calls = 0
+    completed = _cancel_notice_completion(service, monkeypatch)
     service.tick()
+    assert completed()
     assert len(notifications) == 1
     title, message, xiaoai = notifications[0]
     assert title == "YES 0.3 位置保护已触发撤单"
@@ -8507,71 +8842,77 @@ def test_queue_protection_notification_success_template_once(tmp_path) -> None:
     )
     service.tick()
     restarted.tick()
+    assert completed()
     assert len(notifications) == 1
 
 
 @pytest.mark.parametrize("delivered", [True, False])
-def test_queue_protection_notification_does_not_hold_apply_mutex(
-    tmp_path, delivered: bool
-) -> None:
-    """收敛通知在锁外投递；成功才去重，失败保持可重试。"""
+def test_queue_protection_notification_does_not_hold_apply_mutex(tmp_path, delivered, monkeypatch) -> None:
+    """Blocked sends cannot delay tick, hold locks, or rearm a cancel notice."""
     now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
-    store, exchange, service, started = _queue_running_service(
-        tmp_path, now, key="lp-queue-notify-lock"
-    )
-    entered, release = threading.Event(), threading.Event()
-    notes: list[tuple[str, str, str]] = []
+    store, exchange, service, started = _queue_running_service(tmp_path, now, key="notify-async")
+    entered, release, finished, tick_done = (threading.Event() for _ in range(4))
+    calls, queued, errors, notice_workers = [], [], [], []
+    launch = service._start_protection_cancel_notice
 
-    def notify(title: str, message: str, xiaoai: str) -> bool:
+    def enqueue(*args):
+        committed = store.lp_session(str(started["session_id"]))
+        assert committed["entry_cancel_requested"] is True
+        assert committed["queue_protection"]["levels"]["0.30"]["canceled_order_ids"] == ["order-1"]
+        queued.append(args)
+        notice_workers.append(launch(*args))
+
+    monkeypatch.setattr(service, "_start_protection_cancel_notice", enqueue)
+
+    def notify(title, message, voice):
+        calls.append(title)
         entered.set()
-        assert release.wait(2)
-        notes.append((title, message, xiaoai))
-        return delivered
+        try:
+            assert release.wait(5)
+            return delivered
+        finally:
+            finished.set()
+
+    def tick():
+        try:
+            service.tick()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            tick_done.set()
 
     service.set_protection_notifier(notify)
-    open_orders = [
-        _queue_receipt("order-1"),
-        _queue_receipt("manual-2", original="1000"),
-    ]
-    trigger = _queue_runtime_snapshot(now, bid_size="4000", open_orders=open_orders)
-    cancelled = _queue_runtime_snapshot(
-        now,
-        bid_size="4000",
-        open_orders=open_orders,
-        orders=[
-            _queue_receipt("order-1", status="CANCELED"),
-            _queue_receipt("manual-2", status="CANCELED", original="1000"),
-        ],
-    )
-    exchange.snapshot_value = trigger
-    assert service.tick()["queue_protection"]["state"] == "canceling"
-    exchange.snapshot_value = cancelled
-    tick_results: list[dict[str, object]] = []
-    worker = threading.Thread(target=lambda: tick_results.append(service.tick()))
+    exchange.snapshot_value = _queue_runtime_snapshot(now, bid_size="4000", orders=[_queue_receipt("order-1")])
+    worker = threading.Thread(target=tick)
     worker.start()
     try:
         assert entered.wait(2)
-        deadline = time.monotonic() + 1
-        while time.monotonic() < deadline:
-            if service._mutex.acquire(blocking=False):
-                service._mutex.release()
-                break
-            time.sleep(0.01)
-        else:
-            raise AssertionError("notification network wait held the LP apply mutex")
+        assert tick_done.wait(2), "tick waits for the notification"
+        assert service._mutex.acquire(blocking=False)
+        service._mutex.release()
+        assert service._facts_apply_lock.acquire(blocking=False)
+        service._facts_apply_lock.release()
+        exchange.snapshot_value = _queue_runtime_snapshot(now, bid_size="4000", orders=[_queue_receipt("order-1", status="CANCELED")])
+        service.tick()
+        service.tick()
+        assert len(queued) == 1
+        assert calls == ["YES 0.3 位置保护已触发撤单"]
+        assert exchange.cancels == ["order-1"]
+        assert not errors
     finally:
         release.set()
         worker.join(2)
-    assert len(notes) == 1
-    assert tick_results[0]["queue_protection"]["notification_sent"] is delivered
-    protection = store.lp_session(str(started["session_id"]))["queue_protection"]
-    assert protection["levels"]["0.30"]["notification_sent"] is delivered
+        assert finished.wait(2)
+        assert not worker.is_alive()
+        for notice_worker in notice_workers:
+            notice_worker.join(2)
+            assert not notice_worker.is_alive()
 
 
 def test_queue_protection_notification_mark_preserves_sibling_and_episode(
-    tmp_path,
+    tmp_path, monkeypatch,
 ) -> None:
-    """延迟通知写回不能覆盖 sibling bucket 或新一代保护 episode。"""
+    """投递完成只记日志，不覆盖 sibling bucket 或新一代保护 episode。"""
 
     now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
     store, exchange, service, started = _queue_running_service(
@@ -8586,6 +8927,7 @@ def test_queue_protection_notification_mark_preserves_sibling_and_episode(
         return True
 
     service.set_protection_notifier(notify)
+    completed = _cancel_notice_completion(service, monkeypatch)
     open_orders = [
         _queue_receipt("order-1"),
         _queue_receipt("manual-2", original="1000"),
@@ -8632,6 +8974,7 @@ def test_queue_protection_notification_mark_preserves_sibling_and_episode(
         release.set()
         worker.join(2)
     assert not worker.is_alive()
+    assert completed()
     protection = store.lp_session(session_id)["queue_protection"]
     assert protection["levels"]["0.30"]["notification_episode"] == "new-episode"
     assert protection["levels"]["0.30"]["notification_sent"] is False
@@ -8639,7 +8982,7 @@ def test_queue_protection_notification_mark_preserves_sibling_and_episode(
     assert protection["levels"]["0.40"]["notification_sent"] is False
 
 
-def test_queue_protection_retry_success_notifies_full_episode_once(tmp_path) -> None:
+def test_queue_protection_retry_success_notifies_full_episode_once(tmp_path, monkeypatch) -> None:
     """R5(F2): entry 撤成+manual 失败 → 重试成功后恰一条通知，按全量 2 张/合计余量 3000 报告；
     cancel_targets/canceled_order_ids 跨重试保持并集。"""
     now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
@@ -8664,6 +9007,7 @@ def test_queue_protection_retry_success_notifies_full_episode_once(tmp_path) -> 
         {"canceled": ["manual-2"], "status": "CANCELED"},
     ]
 
+    completed = _cancel_notice_completion(service, monkeypatch)
     first = service.tick()
     protection = first["queue_protection"]
     assert protection["state"] == "canceling"
@@ -8681,6 +9025,7 @@ def test_queue_protection_retry_success_notifies_full_episode_once(tmp_path) -> 
     assert protection["cancel_targets"] == [entry_id, "manual-2"]
     assert protection["canceled_order_ids"] == [entry_id, "manual-2"]
     assert Decimal(str(protection["canceled_remaining"])) == Decimal("3000")
+    assert completed()
     assert len(notifications) == 1
     title, message, xiaoai = notifications[0]
     assert title == "YES 0.3 位置保护已触发撤单"
@@ -8689,7 +9034,7 @@ def test_queue_protection_retry_success_notifies_full_episode_once(tmp_path) -> 
 
 
 def test_queue_protection_converge_keeps_fill_and_cancel_remaining_apart(
-    tmp_path,
+    tmp_path, monkeypatch,
 ) -> None:
     """R6(F2): 部分成交（filled=300）收敛：通知合计余量=各单撤单时点余量之和
     2000+1000=3000（review fix 口径：manual-2 回执撤但未获确认也按请求时点余量计），
@@ -8716,6 +9061,7 @@ def test_queue_protection_converge_keeps_fill_and_cancel_remaining_apart(
         {"not_canceled": {"manual-2": "venue_busy"}},
     ]
 
+    completed = _cancel_notice_completion(service, monkeypatch)
     first = service.tick()
     protection = first["queue_protection"]
     assert protection["state"] == "canceling"
@@ -8755,6 +9101,7 @@ def test_queue_protection_converge_keeps_fill_and_cancel_remaining_apart(
     assert protection["state"] == "partially_filled"
     assert Decimal(str(protection["partially_filled_quantity"])) == Decimal("300")
     assert Decimal(str(protection["canceled_remaining"])) == Decimal("3000")
+    assert completed()
     assert len(notifications) == 1
     title, message, xiaoai = notifications[0]
     assert title == "YES 0.3 位置保护已触发撤单"
@@ -8764,7 +9111,7 @@ def test_queue_protection_converge_keeps_fill_and_cancel_remaining_apart(
 
 
 def test_queue_protection_unknown_request_time_remaining_reports_unknown_total(
-    tmp_path,
+    tmp_path, monkeypatch,
 ) -> None:
     """R10: 某 target 在请求时点取不到余量（rows 缺 remaining 字段）→ 持久化 null
     （UNKNOWN，不记 0）；撤单未获确认、下一 tick 回执收敛后通知
@@ -8783,6 +9130,7 @@ def test_queue_protection_unknown_request_time_remaining_reports_unknown_total(
     exchange.snapshot_value = None
     exchange.snapshots = []
     exchange.snapshot_calls = 0
+    completed = _cancel_notice_completion(service, monkeypatch)
     for expected in range(1, 10):
         result = service.tick()
         assert Decimal(str(result["queue_protection"]["data_failures"])) == expected
@@ -8828,6 +9176,7 @@ def test_queue_protection_unknown_request_time_remaining_reports_unknown_total(
     protection = final["queue_protection"]
     assert protection["state"] == "canceled"
     assert protection["canceled_remaining"] is None
+    assert completed()
     assert len(notifications) == 1
     title, message, xiaoai = notifications[0]
     assert title == "YES 0.3 位置保护已触发撤单"
@@ -8838,7 +9187,7 @@ def test_queue_protection_unknown_request_time_remaining_reports_unknown_total(
 
 
 def test_queue_protection_unacknowledged_cancels_converge_with_request_time_remaining(
-    tmp_path,
+    tmp_path, monkeypatch,
 ) -> None:
     """R9: 两张撤单请求均未获确认（not_canceled），下一 tick 回执双双 CANCELED 收敛：
     通知按请求时点持久化余量报「已撤 2 张买单合计余量 3000 份 @ 0.3（含 1 张手动）」，
@@ -8865,6 +9214,7 @@ def test_queue_protection_unacknowledged_cancels_converge_with_request_time_rema
         {"not_canceled": {"manual-2": "venue_busy"}},
     ]
 
+    completed = _cancel_notice_completion(service, monkeypatch)
     first = service.tick()
     protection = first["queue_protection"]
     assert protection["state"] == "canceling"
@@ -8907,6 +9257,7 @@ def test_queue_protection_unacknowledged_cancels_converge_with_request_time_rema
         "manual-2": "1000",
     }
     assert Decimal(str(protection["canceled_remaining"])) == Decimal("3000")
+    assert completed()
     assert len(notifications) == 1
     title, message, xiaoai = notifications[0]
     assert title == "YES 0.3 位置保护已触发撤单"
@@ -10600,7 +10951,7 @@ def test_first_seen_conservative_cancel_after_ten_book_outages(
 
 
 def test_first_seen_cancel_episode_closes_with_receipts_and_notice(
-    tmp_path,
+    tmp_path, monkeypatch,
 ) -> None:
     """E6(闭环): 触发 → 每目标先 lp_actions pending 再撤；撤中再成交 →
     partially_filled 如实记账；重复 tick 不重复撤、不扩量；回执后一次性
@@ -10618,6 +10969,7 @@ def test_first_seen_cancel_episode_closes_with_receipts_and_notice(
         open_orders=[anchor, manual_same], anchors=("m-1",),
         notifier=collect,
     )
+    completed = _cancel_notice_completion(service, monkeypatch)
     service.tick()
 
     # 每目标先 pending（意图）再撤，回执 accepted。
@@ -10648,6 +11000,7 @@ def test_first_seen_cancel_episode_closes_with_receipts_and_notice(
     assert len(exchange.posts) == 0
 
     # 一次性通知：恰一条成功通知，文案含「首见基线」。
+    assert completed()
     assert len(notes) == 1
     title, message, xiaoai_text = notes[0]
     assert "首见基线" in title
@@ -10655,7 +11008,7 @@ def test_first_seen_cancel_episode_closes_with_receipts_and_notice(
 
 
 def test_first_seen_notice_identifies_orders_and_plain_language_lifetime(
-    tmp_path,
+    tmp_path, monkeypatch,
 ) -> None:
     """The first-seen success notice explains shares, orders, and lifetime."""
 
@@ -10736,9 +11089,11 @@ def test_first_seen_notice_identifies_orders_and_plain_language_lifetime(
         unrelated_price,
         unrelated_sell,
     ]
+    completed = _cancel_notice_completion(service, monkeypatch)
     service.tick()
 
     assert exchange.cancels == ["notice-anchor", "notice-second", "notice-third"]
+    assert completed()
     assert len(notes) == 1
     title, message, voice = notes[0]
     assert "Treasury yield below 4.20%?" in message
@@ -10780,11 +11135,12 @@ def test_first_seen_notice_identifies_orders_and_plain_language_lifetime(
     restarted.set_protection_notifier(lambda title, message, voice: notes.append((title, message, voice)) or True)
     restarted.tick()
     assert exchange.cancels == ["notice-anchor", "notice-second", "notice-third"]
+    assert completed()
     assert len(notes) == 1
 
 
 def test_legacy_first_seen_notice_uses_local_identity_and_observed_lifetime(
-    tmp_path,
+    tmp_path, monkeypatch,
 ) -> None:
     """An old episode uses only the non-expired local identity cache."""
 
@@ -10837,10 +11193,12 @@ def test_legacy_first_seen_notice_uses_local_identity_and_observed_lifetime(
         }
     )
 
+    completed = _cancel_notice_completion(service, monkeypatch)
     service.tick()
 
     assert exchange.cancels == ["m-1"]
     assert exchange.external_metadata_calls == 0
+    assert completed()
     assert len(notes) == 1
     _, message, _ = notes[0]
     assert "Treasury yield below 4.20%?" in message
@@ -10854,7 +11212,7 @@ def test_legacy_first_seen_notice_uses_local_identity_and_observed_lifetime(
 
 @pytest.mark.parametrize("placement_kind", ("missing", "invalid", "future"))
 def test_protection_notice_missing_facts_stays_explicit(
-    tmp_path, placement_kind: str
+    tmp_path, monkeypatch, placement_kind: str
 ) -> None:
     """Receipt convergence keeps missing identity, quantity, and time explicit."""
 
@@ -10911,6 +11269,7 @@ def test_protection_notice_missing_facts_stays_explicit(
     # Existing outage protection reaches the same cancel seam without using
     # the unavailable per-order remaining field.
     exchange.books.clear()
+    completed = _cancel_notice_completion(service, monkeypatch)
     for _ in range(9):
         service.tick()
     episode = store.lp_first_seen_episode("ep-case6")
@@ -10927,6 +11286,7 @@ def test_protection_notice_missing_facts_stays_explicit(
     service.tick()
 
     assert exchange.external_metadata_calls == 0
+    assert completed()
     assert len(notes) == 1
     _, message, _ = notes[0]
     assert f"condition_id={condition}" in message
@@ -10945,7 +11305,7 @@ def test_protection_notice_missing_facts_stays_explicit(
 
 
 def test_registered_notice_retry_uses_last_confirmation_and_persisted_order_times(
-    tmp_path,
+    tmp_path, monkeypatch,
 ) -> None:
     """A retry keeps the first placement and latest successful acknowledgement."""
 
@@ -11033,6 +11393,7 @@ def test_registered_notice_retry_uses_last_confirmation_and_persisted_order_time
         ) or True
     )
 
+    completed = _cancel_notice_completion(service, monkeypatch)
     first = service.tick()
     protection = first["queue_protection"]
     assert protection["state"] == "canceling"
@@ -11047,7 +11408,7 @@ def test_registered_notice_retry_uses_last_confirmation_and_persisted_order_time
     assert notes == []
 
     # The entry has disappeared from open orders; its terminal receipt lets
-    # the restarted service converge the completed target and retry manual.
+    # the same process converge the completed target and retry manual.
     clock_cell[0] = final_ack
     exchange.snapshot_value = _queue_runtime_snapshot(
         final_ack,
@@ -11056,22 +11417,16 @@ def test_registered_notice_retry_uses_last_confirmation_and_persisted_order_time
         open_orders=[manual],
     )
     exchange.snapshot_value["scoring"] = True
-    restarted = PolymarketLPService(
-        store, exchange, clock=lambda: clock_cell[0]
-    )
-    restarted.set_protection_notifier(
-        lambda notice_title, message, voice: notes.append(
-            (notice_title, message, voice)
-        ) or True
-    )
+    restarted = service  # Retry this live episode; startup deliberately drops old notices.
     final = restarted.tick()
     assert exchange.cancels == [entry_id, manual_id, manual_id]
     assert final["queue_protection"]["state"] == "canceling"
-    assert final["queue_protection"]["notification_sent"] is True
+    assert final["queue_protection"]["notification_sent"] is False
     assert final["queue_protection"]["order_cancel_confirmed_at"] == {
         entry_id: "2026-09-21T11:00:00.000000Z",
         manual_id: "2026-09-21T11:08:11.000000Z",
     }
+    assert completed()
     assert len(notes) == 1
     _, message, _ = notes[0]
     assert title in message and url in message and "BUY YES" in message
@@ -11103,12 +11458,13 @@ def test_registered_notice_retry_uses_last_confirmation_and_persisted_order_time
     )
     restarted.tick()
     assert exchange.cancels == [entry_id, manual_id, manual_id]
+    assert completed()
     assert len(notes) == 1
 
 
 @pytest.mark.parametrize("path", ("first_seen", "submit"))
 def test_protection_notice_does_not_report_filled_targets_as_canceled(
-    tmp_path, path: str
+    tmp_path, monkeypatch, path: str
 ) -> None:
     """A filled target after an unacknowledged cancel is not reported as canceled."""
 
@@ -11200,6 +11556,7 @@ def test_protection_notice_does_not_report_filled_targets_as_canceled(
     exchange.cancel_responses = [
         {"not_canceled": {order_id: "venue_busy"}},
     ]
+    completed = _cancel_notice_completion(service, monkeypatch)
     first = service.tick()
     if path == "first_seen":
         episode = store.lp_first_seen_episode(episode_id)
@@ -13277,13 +13634,14 @@ def _lp167_maker_trade(
     }
 
 
-def test_lp167_s7_any_level_fill_collects_whole_group(tmp_path) -> None:
+def test_lp167_s7_any_level_fill_collects_whole_group(tmp_path, monkeypatch) -> None:
     """S7: 任一价位成交 → 立即撤组内全部自有 BUY；0.40 桶随组收单落 canceled；
     不补买。"""
     now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
     store, exchange, service, session_id = _lp167_two_level_group(
         tmp_path, now, key="lp167-s7"
     )
+    jobs = _observe_cancel_jobs(service, monkeypatch)
 
     filling = _lp167_book(
         now,
@@ -13339,6 +13697,10 @@ def test_lp167_s7_any_level_fill_collects_whole_group(tmp_path) -> None:
     assert levels["0.40"]["cancel_reason"] == "group_fill_collect"
     # 不补买：BUY 始终只有最初两张。
     assert len([item for item in exchange.posts if item["side"] == "BUY"]) == 2
+
+    service.tick()
+    assert jobs == []  # Also detects duplicate jobs that have not executed.
+    assert all(bucket["notification_sent"] is True for bucket in levels.values())
 
 
 def test_lp167_s8_cross_level_cost_and_single_stop_loss_latch(tmp_path) -> None:
@@ -13478,7 +13840,7 @@ def test_lp167_s10_outage_conservative_cancel_covers_both_levels(tmp_path) -> No
     assert levels["0.42"]["cancel_targets"] == ["order-1", "manual-m"]
 
 
-def test_lp167_s9_review_deadline_collects_both_levels(tmp_path) -> None:
+def test_lp167_s9_review_deadline_collects_both_levels(tmp_path, monkeypatch) -> None:
     """S9: 复核截止（首单 review_at）——一次收掉两价位自有 BUY，桶落 canceling→canceled，
     会话进 awaiting_reconciliation。"""
     now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
@@ -13507,6 +13869,7 @@ def test_lp167_s9_review_deadline_collects_both_levels(tmp_path) -> None:
         current = now
 
     service2 = PolymarketLPService(store, exchange, clock=lambda: _Clock.current)
+    jobs = _observe_cancel_jobs(service2, monkeypatch)
     _Clock.current = now + timedelta(minutes=11)
     # 盘口时间戳跟随当前时钟，避免新鲜度门先行拦截。
     live = _queue_book_snapshot(_Clock.current, Decimal("10000"))
@@ -13554,6 +13917,10 @@ def test_lp167_s9_review_deadline_collects_both_levels(tmp_path) -> None:
     assert levels["0.30"]["state"] == "canceled"
     assert levels["0.29"]["state"] == "canceled"
     assert store.lp_session(session_id)["review_status"] == "awaiting_reconciliation"
+
+    service2.tick()
+    assert jobs == []  # Deadline sweeps settle receipts without protection alerts.
+    assert all(bucket["notification_sent"] is True for bucket in levels.values())
 
 
 def test_lp167_s5_augment_state_gate_six_states_with_price(tmp_path) -> None:
